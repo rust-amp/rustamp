@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rustamp-core",
+    "crates/rustamp-audio",
+    "crates/rustamp-decoders",
+    "crates/rustamp-dsp",
+    "crates/rustamp-output",
+    "crates/rustamp-meta",
+    "crates/rustamp-playlist",
+    "crates/rustamp-skin",
+    "crates/rustamp-gfx",
+    "crates/rustamp-ui",
+    "crates/rustamp-vis",
+    "crates/rustamp-milkdrop",
+    "crates/rustamp-plugin-abi",
+    "crates/rustamp-ipc",
+    "crates/rustamp-plughost",
+    "crates/rustamp-platform",
+    "crates/rustamp-prefs",
+    "crates/rustamp-library",
+    "crates/rustamp-app",
+    "crates/rustamp-testkit",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/rustamp/rustamp"
+authors = ["The Rustamp contributors"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal
+rustamp-core = { path = "crates/rustamp-core" }
+rustamp-audio = { path = "crates/rustamp-audio" }
+rustamp-decoders = { path = "crates/rustamp-decoders" }
+rustamp-dsp = { path = "crates/rustamp-dsp" }
+rustamp-output = { path = "crates/rustamp-output" }
+rustamp-meta = { path = "crates/rustamp-meta" }
+rustamp-playlist = { path = "crates/rustamp-playlist" }
+rustamp-skin = { path = "crates/rustamp-skin" }
+rustamp-gfx = { path = "crates/rustamp-gfx" }
+rustamp-ui = { path = "crates/rustamp-ui" }
+rustamp-vis = { path = "crates/rustamp-vis" }
+rustamp-milkdrop = { path = "crates/rustamp-milkdrop" }
+rustamp-plugin-abi = { path = "crates/rustamp-plugin-abi" }
+rustamp-ipc = { path = "crates/rustamp-ipc" }
+rustamp-platform = { path = "crates/rustamp-platform" }
+rustamp-prefs = { path = "crates/rustamp-prefs" }
+rustamp-library = { path = "crates/rustamp-library" }
+rustamp-testkit = { path = "crates/rustamp-testkit" }
+# external
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+crossbeam-channel = "0.5"
+toml = "0.9"
+png = { version = "0.18", default-features = false }
+tempfile = "3"
+windows = "0.62"

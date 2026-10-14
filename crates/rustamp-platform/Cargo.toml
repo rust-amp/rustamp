@@ -1,0 +1,12 @@
+[package]
+name = "rustamp-platform"
+description = "Rustamp: Platform layer: single instance and command-line forwarding, media keys, taskbar integration, file associations and the external-control window. Win32 first; macOS/Linux stubs later."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true

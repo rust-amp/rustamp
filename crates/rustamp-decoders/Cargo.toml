@@ -1,0 +1,18 @@
+[package]
+name = "rustamp-decoders"
+description = "Rustamp: Concrete Decoder implementations (symphonia and FFI decoders ported from DeaDBeeF) registered into the core DecoderRegistry."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true
+symphonia = { version = "0.5.5", default-features = false, features = ["mp1", "mp2", "mp3", "flac", "ogg", "vorbis", "wav", "pcm", "aiff", "caf", "isomp4", "aac", "alac", "adpcm", "mkv"] }
+
+[dev-dependencies]
+hound = "3.5.1"
+tempfile.workspace = true
+rustamp-core = { workspace = true, features = ["mock"] }

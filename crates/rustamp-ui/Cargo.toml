@@ -1,0 +1,12 @@
+[package]
+name = "rustamp-ui"
+description = "Rustamp: Window components and widgets, hit testing, docking and snapping, windowshade, double-size, easy-move and menus."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true

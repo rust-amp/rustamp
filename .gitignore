@@ -1,0 +1,19 @@
+# Build output
+target/
+*.pdb
+
+# IDE and editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Clean-room and reference material (never commit)
+/research/
+/third_party_binaries/
+/refskins/
+
+# Original-skin goldens are never committed
+/tests/golden/classic-base/

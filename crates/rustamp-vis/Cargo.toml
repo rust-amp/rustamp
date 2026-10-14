@@ -1,0 +1,12 @@
+[package]
+name = "rustamp-vis"
+description = "Rustamp: Built-in spectrum analyzer and oscilloscope (spec S08), the vis window host, and conversion from the core VisFrame to Winamp-style plugin data."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true

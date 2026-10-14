@@ -1,0 +1,18 @@
+[package]
+name = "rustamp-plughost"
+description = "Rustamp: 32-bit plugin host process (rustamp-plughost32.exe)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rustamp-plughost32"
+path = "src/main.rs"
+
+[dependencies]
+rustamp-core.workspace = true
+rustamp-ipc.workspace = true
+rustamp-plugin-abi.workspace = true

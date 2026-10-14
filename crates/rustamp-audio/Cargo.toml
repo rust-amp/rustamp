@@ -1,0 +1,12 @@
+[package]
+name = "rustamp-audio"
+description = "Rustamp: Engine threads, transport, gapless playback, ReplayGain, crossfade and fades, and the visualization tap (decode -> DSP -> output)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true

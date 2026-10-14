@@ -1,0 +1,12 @@
+[package]
+name = "rustamp-milkdrop"
+description = "Rustamp: Native MilkDrop 2 port (butterchurn-derived): presets, expression engine, warp/comp shaders and blending on wgpu."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true

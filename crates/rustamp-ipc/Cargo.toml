@@ -1,0 +1,17 @@
+[package]
+name = "rustamp-ipc"
+description = "Rustamp: protocol and transports between rustamp.exe (x64) and rustamp-plughost32.exe (i686)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true
+rustamp-plugin-abi.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+postcard.workspace = true
+crossbeam-channel.workspace = true

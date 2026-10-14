@@ -1,0 +1,31 @@
+[package]
+name = "rustamp-app"
+description = "Rustamp: the application binary that wires all crates together"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rustamp"
+path = "src/main.rs"
+
+[dependencies]
+rustamp-core.workspace = true
+rustamp-audio.workspace = true
+rustamp-decoders.workspace = true
+rustamp-dsp.workspace = true
+rustamp-output.workspace = true
+rustamp-meta.workspace = true
+rustamp-playlist.workspace = true
+rustamp-skin.workspace = true
+rustamp-gfx.workspace = true
+rustamp-ui.workspace = true
+rustamp-vis.workspace = true
+rustamp-milkdrop.workspace = true
+rustamp-ipc.workspace = true
+rustamp-platform.workspace = true
+rustamp-prefs.workspace = true
+rustamp-library.workspace = true

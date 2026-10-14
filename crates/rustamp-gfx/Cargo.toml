@@ -1,0 +1,12 @@
+[package]
+name = "rustamp-gfx"
+description = "Rustamp: CPU pixel compositor, blits, bitmap fonts (text.bmp, numbers) and system-font text rendering."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true

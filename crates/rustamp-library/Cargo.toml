@@ -1,0 +1,12 @@
+[package]
+name = "rustamp-library"
+description = "Rustamp: Media Library (2.9x gen_ml-like), SQLite-backed. Later milestone."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true

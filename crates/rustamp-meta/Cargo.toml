@@ -1,0 +1,12 @@
+[package]
+name = "rustamp-meta"
+description = "Rustamp: Tag reading (ID3v1/v2 and others) and Winamp 2 title formatting (spec S14), producing TrackMetadata."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true
