@@ -14,7 +14,6 @@
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use rustamp_core::audio::{
@@ -117,27 +116,25 @@ impl DecoderFactory for SymphoniaDecoderFactory {
 // Byte source adapter
 // ---------------------------------------------------------------------------
 
-/// Adapts a `Send` reader to symphonia's `Send + Sync` source trait.
+/// Adapts a [`ReadSeek`] reader to symphonia's `MediaSource` trait.
+///
+/// `ReadSeek` requires `Send + Sync` (RFC 0002, C2), which is exactly what
+/// symphonia's `MediaSource` needs, so the reader can be held directly; the
+/// former `Mutex` wrapper is gone.
 struct ReaderSource {
-    inner: Mutex<Box<dyn ReadSeek>>,
+    inner: Box<dyn ReadSeek>,
     len: Option<u64>,
 }
 
 impl Read for ReaderSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .read(buf)
+        self.inner.read(buf)
     }
 }
 
 impl Seek for ReaderSource {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.inner
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .seek(pos)
+        self.inner.seek(pos)
     }
 }
 
@@ -201,10 +198,7 @@ impl SymphoniaDecoder {
             MediaSource::Reader { mut reader, .. } => {
                 let len = reader.seek(SeekFrom::End(0)).ok();
                 reader.seek(SeekFrom::Start(0))?;
-                let src = ReaderSource {
-                    inner: Mutex::new(reader),
-                    len,
-                };
+                let src = ReaderSource { inner: reader, len };
                 let mss =
                     MediaSourceStream::new(Box::new(src), MediaSourceStreamOptions::default());
                 (mss, len)

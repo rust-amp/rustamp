@@ -4,10 +4,12 @@
 //! * `golden [--bless] [--skin <name>]` - run golden image tests.
 //! * `capture [--list] [--class C] [--title T] [--out F.png] [--client-only]`
 //!   - generic Windows window capture.
+//! * `ring-cross` - 32-bit/64-bit shared-memory ring check.
 //! * `plughost [--release]` - build the 32-bit plugin host.
 //! * `package` - not implemented yet.
 
 mod capture;
+mod ring_cross;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -18,6 +20,7 @@ usage: cargo xtask <command>
 commands:
   golden [--bless] [--skin <name>]   run golden tests (test fns named `golden_*`)
   capture [options]                  capture a window to PNG (Windows only); see `capture --help`
+  ring-cross                         cross-bitness shared-memory ring check (Windows only)
   plughost [--release]               build rustamp-plughost for i686-pc-windows-msvc
   package                            (not implemented)";
 
@@ -28,6 +31,7 @@ fn main() -> ExitCode {
     let result = match cmd.as_deref() {
         Some("golden") => golden(&rest),
         Some("capture") => capture::run(&rest),
+        Some("ring-cross") => ring_cross::run(&rest),
         Some("plughost") => plughost(&rest),
         // TODO(M2+): NSIS installer packaging.
         Some("package") => {
@@ -52,11 +56,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn cargo() -> Command {
+pub(crate) fn cargo() -> Command {
     Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
 }
 
-fn run_status(cmd: &mut Command) -> Result<(), String> {
+pub(crate) fn run_status(cmd: &mut Command) -> Result<(), String> {
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn {cmd:?}: {e}"))?;

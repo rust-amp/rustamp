@@ -18,9 +18,20 @@ Behaviour the core contract leaves open, and what the symphonia decoder does:
 
 ## Proposals
 
-1. `Decoder` could expose a decode-error/skip counter (`fn skipped_packets(&self) -> u64`
+All three were accepted by RFC 0002 (`docs/rfc/0002-audio-contracts.md`); item 2
+is in effect here.
+
+1. `Decoder` exposes a decode-error/skip counter (`fn skipped_packets(&self) -> u64`
    with default 0) so the engine can show or log damage without downcasting.
-2. `MediaSource::Reader` requires only `Send`; symphonia needs `Sync`, so the
-   reader is wrapped in a `Mutex`. Making `ReadSeek: Send + Sync` would avoid it.
+   *Accepted in core (RFC 0002, C1): the trait method exists. This crate's count
+   is still the inherent `SymphoniaDecoder::skipped_packets` and is not wired to
+   the trait method yet, so a `dyn Decoder` call returns the default 0
+   (follow-up).*
+2. `ReadSeek` requires `Send + Sync` (RFC 0002, C2), which is what symphonia
+   needs, so the reader is held directly and no `Mutex` wrapper is required.
+   *Done (RFC 0002, C2): `ReaderSource` holds the `Box<dyn ReadSeek>` itself.*
 3. A way to report "format changed mid-stream" (e.g. `Error::FormatChanged`
-   or an `Event`) would let the engine chain the remainder as a new track.
+   or an `Event`) would let the engine react to new parameters.
+   *Accepted in core (RFC 0002, C3/C4) as `Error::FormatChanged`; this crate
+   still ends the stream on a sample-rate change, so implementing it here is a
+   follow-up.*
