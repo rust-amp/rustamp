@@ -103,11 +103,11 @@ mod tests {
     use std::io::Cursor;
     use std::path::PathBuf;
 
-    use rustamp_core::command::{Command, SelectOp};
-    use rustamp_core::playlist::{EntryId, MediaLocation, SortKey};
-    use rustamp_core::state::WindowId;
-    use rustamp_core::vis::VisFrame;
     use rustamp_plugin_abi::PluginKind;
+    use rustamp_proto::command::{Command, SelectOp};
+    use rustamp_proto::playlist::{EntryId, MediaLocation, SortKey};
+    use rustamp_proto::state::WindowId;
+    use rustamp_proto::vis::VisFrame;
 
     use super::*;
     use crate::message::VisFrameWire;

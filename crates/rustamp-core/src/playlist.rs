@@ -1,5 +1,9 @@
 //! Playlist data model with stable entry ids.
 //!
+//! The wire types ([`EntryId`], [`MediaLocation`], [`SortKey`],
+//! [`PlaylistChangeKind`]) live in `rustamp-proto` (RFC 0004) and are
+//! re-exported here at their original paths, so existing callers do not change.
+//!
 //! [`Playlist`] is a plain, single-threaded data structure: the app state
 //! owner mutates it and publishes `PlaylistChanged` events. Behaviors such as
 //! shuffle order (S15), randomize, and file formats live in `rustamp-playlist`.
@@ -9,43 +13,10 @@
 //! refer to entries by id so they stay valid while indices shift.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Stable, never-reused identifier of a playlist entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct EntryId(pub u64);
-
-/// Where a piece of media lives.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum MediaLocation {
-    /// A local file.
-    File(PathBuf),
-    /// A network stream or other URL.
-    Url(String),
-}
-
-impl MediaLocation {
-    /// Final path component / URL tail, for display and sorting.
-    pub fn file_name(&self) -> String {
-        match self {
-            MediaLocation::File(p) => p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            MediaLocation::Url(u) => u.rsplit('/').next().unwrap_or(u).to_owned(),
-        }
-    }
-
-    /// Lossy string form of the full location.
-    pub fn to_display_string(&self) -> String {
-        match self {
-            MediaLocation::File(p) => p.to_string_lossy().into_owned(),
-            MediaLocation::Url(u) => u.clone(),
-        }
-    }
-}
+pub use rustamp_proto::playlist::{EntryId, MediaLocation, PlaylistChangeKind, SortKey};
 
 /// One playlist row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,38 +29,6 @@ pub struct PlaylistEntry {
     pub title: Option<String>,
     /// Cached duration in ms, if known.
     pub duration_ms: Option<u64>,
-}
-
-/// Sort keys for `Command::Sort`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SortKey {
-    /// By displayed title (case-insensitive).
-    Title,
-    /// By file name only.
-    FileName,
-    /// By full path then file name.
-    PathAndFileName,
-    /// By duration (unknown first).
-    Duration,
-}
-
-/// What changed in a playlist, carried by `Event::PlaylistChanged`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PlaylistChangeKind {
-    /// Entries were inserted.
-    Inserted,
-    /// Entries were removed.
-    Removed,
-    /// Entries were moved.
-    Moved,
-    /// The playlist was cleared.
-    Cleared,
-    /// The whole order changed (sort, reverse, randomize).
-    Reordered,
-    /// The selection changed.
-    SelectionChanged,
-    /// Cached title/duration of an entry was updated.
-    EntryUpdated,
 }
 
 /// The playlist model.
@@ -382,6 +321,8 @@ impl<'a> IntoIterator for &'a Playlist {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn f(n: &str) -> MediaLocation {

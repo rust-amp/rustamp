@@ -4,7 +4,7 @@
 We are building **Rustamp**, a new media player that looks, feels and behaves like **Winamp 2.95** on Windows. It is written in Rust on a modern audio and graphics stack, runs classic Winamp 2.x plugins (above all visualizations such as MilkDrop 2 and AVS), and will ship for Linux and macOS later, with Wine running the legacy plugins there. The repo `D:\code\Rustamp` is empty, so this is a greenfield project. Many LLM agents will do the work in parallel, so the plan is built around **contracts first, then parallel lanes**, with a strict **clean-room** process for anything taken from Winamp itself.
 
 Decisions already made:
-- **License: GPL-3.0.** This means we may take code from DeaDBeeF (its zlib core and its GPL/LGPL plugins), webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib) and libopenmpt (BSD).
+- **License: GPL-3.0, split by RFC 0004.** The player and every crate except the plugin-facing ones stay **GPL-3.0-or-later**; the plugin-facing crates (`rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`) are **MIT OR Apache-2.0**, so the process that loads plugin DLLs imposes no copyleft on a plugin of any license, and the GPL crates that contain only our own code carry a GPL-3.0 §7 plugin exception ([docs/rfc/0004-plugin-licensing.md](rfc/0004-plugin-licensing.md), [PLUGIN-EXCEPTION.md](../PLUGIN-EXCEPTION.md)). This keeps the decoder sources the plan depends on available: we may take code from DeaDBeeF (its zlib core and its GPL/LGPL plugins), webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib) and libopenmpt (BSD).
 - **Skins.**
   - The bundled default is a **look-alike skin**: newly drawn artwork that closely mimics the classic base skin's layout, colors and style, without copying any pixels.
   - The **original base skin** (taken from webamp's `base-2.91`) is offered as a **separate, optional download** with its own repo and package. It is never bundled in the installer.
@@ -49,6 +49,21 @@ rustamp.exe (x64)                                     rustamp-plughost32.exe (i6
  ├ "Winamp v1.x" compatible window (external control)
  └ platform layer (Win32 now, mac/Linux later)  ◄──── shm rings + control pipe/socket ────►
 ```
+
+### Licensing
+
+The player keeps its copyleft; the plugin edge does not have any. Per
+[RFC 0004](rfc/0004-plugin-licensing.md): the player and all crates other than
+the plugin-facing ones are **GPL-3.0-or-later**; `rustamp-proto` (the wire
+types), `rustamp-plugin-abi`, `rustamp-ipc` and `rustamp-plughost` are
+**MIT OR Apache-2.0**. The host binary `rustamp-plughost32.exe` — the process
+that actually loads plugin DLLs — therefore links no GPL code, so no copyleft
+reaches a plugin of any license (including GPL-2.0-only plugins, which are
+incompatible with GPL-3.0). The GPL crates that contain only our own code carry
+a GPL-3.0 §7 plugin-combination additional permission
+([PLUGIN-EXCEPTION.md](../PLUGIN-EXCEPTION.md)) covering the player ↔ host edge
+for our code. `rustamp-core` re-exports the wire types at their original paths,
+so no caller changes.
 
 ### Tech stack
 - **Windowing:** `winit` 0.30, plus a raw-handle platform shim (`windows` crate) for `SetWindowRgn` (region.txt), skinned cursors, and layered or always-on-top windows.

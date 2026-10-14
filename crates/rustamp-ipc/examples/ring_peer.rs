@@ -60,11 +60,11 @@ mod imp {
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
-    use rustamp_core::vis::{VIS_CHANNELS, VIS_SAMPLES};
     use rustamp_ipc::shm::{
         NamedRegion, RING_DATA_OFFSET, RingConsumer, RingExpect, RingKind, RingProducer,
         VIS_SLOT_SIZE, VisSlot,
     };
+    use rustamp_proto::vis::{VIS_CHANNELS, VIS_SAMPLES};
 
     /// How long the consumer retries opening the ring while the producer starts.
     const OPEN_TIMEOUT: Duration = Duration::from_secs(10);

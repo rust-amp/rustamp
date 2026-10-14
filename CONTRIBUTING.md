@@ -10,6 +10,20 @@ Thanks for helping. Please read this file and [CLEANROOM.md](CLEANROOM.md) befor
 - **Contract changes go through an RFC.** Changes to shared contracts (`rustamp-core` types and traits, the `rustamp-ipc` protocol, public plugin ABI structs) need a short RFC in `docs/rfc/` first. The integration lead approves it.
 - **CI must be green** before merge. The `windows` job is required. The `linux` job is informational until the cross-platform milestone.
 
+## Licensing of contributions (inbound = outbound)
+
+By submitting a contribution you license it under the license of the crate you
+contribute to — **inbound = outbound**. Most crates are
+**GPL-3.0-or-later**; the plugin-facing crates `rustamp-proto`,
+`rustamp-plugin-abi`, `rustamp-ipc` and `rustamp-plughost` are
+**MIT OR Apache-2.0** ([RFC 0004](docs/rfc/0004-plugin-licensing.md)). Do not
+contribute code you cannot license under the target crate's license, and say so
+if a contribution is meant to carry a different license.
+
+This statement must hold before the first external contribution: once code from
+outside has arrived under a crate's license, relicensing that crate needs every
+contributor's consent.
+
 ## Coding standards
 
 - **Formatting:** `cargo fmt --all`. The config is in `rustfmt.toml`.

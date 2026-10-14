@@ -1598,6 +1598,7 @@ name = "rustamp-core"
 version = "0.0.1"
 dependencies = [
  "crossbeam-channel",
+ "rustamp-proto",
  "serde",
  "thiserror 2.0.21",
  "toml",
@@ -1634,8 +1635,8 @@ version = "0.0.1"
 dependencies = [
  "crossbeam-channel",
  "postcard",
- "rustamp-core",
  "rustamp-plugin-abi",
+ "rustamp-proto",
  "serde",
  "thiserror 2.0.21",
  "windows",
@@ -1691,9 +1692,9 @@ dependencies = [
 name = "rustamp-plughost"
 version = "0.0.1"
 dependencies = [
- "rustamp-core",
  "rustamp-ipc",
  "rustamp-plugin-abi",
+ "rustamp-proto",
 ]
 
 [[package]]
@@ -1708,6 +1709,13 @@ name = "rustamp-prefs"
 version = "0.0.1"
 dependencies = [
  "rustamp-core",
+]
+
+[[package]]
+name = "rustamp-proto"
+version = "0.0.1"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

@@ -18,6 +18,10 @@
 //! **Not here yet:** the semantics of `WinampIpc` messages are defined by spec
 //! S10; `Message::Vis` remains the small-frame fallback path next to the vis
 //! ring.
+//!
+//! Licensed `MIT OR Apache-2.0` (RFC 0004); see `LICENSE-MIT` and
+//! `LICENSE-APACHE` at the repository root. This crate contains no third-party
+//! code.
 
 pub mod framing;
 pub mod message;

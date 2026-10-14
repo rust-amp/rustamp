@@ -11,7 +11,7 @@
 use core::mem::{align_of, offset_of, size_of};
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 
-use rustamp_core::vis::{VIS_CHANNELS, VIS_SAMPLES, VisFrame};
+use rustamp_proto::vis::{VIS_CHANNELS, VIS_SAMPLES, VisFrame};
 
 /// Header magic, the bytes `R S T R` read as a little-endian `u32`.
 pub const RING_MAGIC: u32 = 0x5254_5352;

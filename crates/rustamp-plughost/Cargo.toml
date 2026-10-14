@@ -3,7 +3,9 @@ name = "rustamp-plughost"
 description = "Rustamp: 32-bit plugin host process (rustamp-plughost32.exe)"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Permissive on purpose (RFC 0004): this process loads plugin DLLs, so its
+# license must impose no copyleft on any plugin, of any license.
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
@@ -13,6 +15,6 @@ name = "rustamp-plughost32"
 path = "src/main.rs"
 
 [dependencies]
-rustamp-core.workspace = true
 rustamp-ipc.workspace = true
 rustamp-plugin-abi.workspace = true
+rustamp-proto.workspace = true

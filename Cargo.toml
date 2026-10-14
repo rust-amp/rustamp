@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/rustamp-core",
+    "crates/rustamp-proto",
     "crates/rustamp-audio",
     "crates/rustamp-decoders",
     "crates/rustamp-dsp",
@@ -35,6 +36,7 @@ rust-version = "1.99"
 [workspace.dependencies]
 # internal
 rustamp-core = { path = "crates/rustamp-core" }
+rustamp-proto = { path = "crates/rustamp-proto" }
 rustamp-audio = { path = "crates/rustamp-audio" }
 rustamp-decoders = { path = "crates/rustamp-decoders" }
 rustamp-dsp = { path = "crates/rustamp-dsp" }

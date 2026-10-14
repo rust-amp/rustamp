@@ -1,9 +1,9 @@
 //! The protocol message enum.
 
-use rustamp_core::command::Command;
-use rustamp_core::state::PlayerState;
-use rustamp_core::vis::{VIS_CHANNELS, VIS_SAMPLES, VisFrame};
 use rustamp_plugin_abi::PluginKind;
+use rustamp_proto::command::Command;
+use rustamp_proto::state::PlayerState;
+use rustamp_proto::vis::{VIS_CHANNELS, VIS_SAMPLES, VisFrame};
 use serde::{Deserialize, Serialize};
 
 use crate::shm::{RingDirection, RingExpect, RingKind, RingRefuseReason};

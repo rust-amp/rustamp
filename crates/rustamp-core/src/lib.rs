@@ -7,8 +7,9 @@
 //! [`DspStage`](audio::DspStage)), the playlist model, metadata, typed
 //! configuration, the in-process message bus and the error type.
 //!
-//! This crate depends on **no other internal crate** and is kept small so it
-//! also builds for `i686-pc-windows-msvc`. Its public API is frozen by
+//! This crate depends only on the permissive `rustamp-proto` crate (RFC 0004),
+//! which holds the wire types it re-exports, and is kept small so it also
+//! builds for `i686-pc-windows-msvc`. Its public API is frozen by
 //! `docs/rfc/0001-core-contracts.md`: changes require a new RFC.
 //!
 //! Conventions used throughout:

@@ -6,6 +6,10 @@
 //! plugins, embed-window frames, and the DSP round-trip.
 //!
 //! M0: stub on every target; it prints its protocol version and exits.
+//!
+//! Licensed `MIT OR Apache-2.0` (RFC 0004); see `LICENSE-MIT` and
+//! `LICENSE-APACHE` at the repository root. The host binary is a separate
+//! program from the GPL player and imposes no copyleft on the plugins it loads.
 
 fn main() {
     println!(

@@ -802,7 +802,7 @@ mod tests {
     use super::*;
     use crate::shm::header::{RING_DATA_OFFSET, RING_HEADER_SIZE, VIS_SLOT_SIZE};
     use crate::shm::region::AnonymousRegion;
-    use rustamp_core::vis::VisFrame;
+    use rustamp_proto::vis::VisFrame;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
     use std::time::{Duration, Instant};

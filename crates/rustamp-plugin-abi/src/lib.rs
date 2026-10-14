@@ -12,6 +12,10 @@
 //! (`extern "C"`, S09 section 1).
 //!
 //! Unresolved spec ambiguities are listed in `OPEN_QUESTIONS.md`.
+//!
+//! Licensed `MIT OR Apache-2.0` (RFC 0004); see `LICENSE-MIT` and
+//! `LICENSE-APACHE` at the repository root. Plugin authors may reuse this crate
+//! under those terms. It contains no third-party code.
 
 pub mod common;
 pub mod dsp;

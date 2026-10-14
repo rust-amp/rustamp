@@ -14,6 +14,7 @@ default = []
 mock = []
 
 [dependencies]
+rustamp-proto.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 crossbeam-channel.workspace = true

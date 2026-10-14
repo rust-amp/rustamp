@@ -18,6 +18,8 @@ Rustamp re-implements a product whose source code is not free. We keep Winamp's 
 
 "Dirty" sources are those that may only be read in the dirty room. "Free" sources are open-licensed projects that may be read and, with attribution, copied.
 
+Rustamp's **own** license is split by [RFC 0004](docs/rfc/0004-plugin-licensing.md): the player stays GPL-3.0-or-later, while the plugin-facing crates (`rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`) are MIT OR Apache-2.0 and the GPL crates that contain only our own code carry a GPL-3.0 §7 plugin exception ([PLUGIN-EXCEPTION.md](PLUGIN-EXCEPTION.md)). This changes nothing in this file: the source table above and the copying and attribution rules in section 7 apply to every crate, whatever that crate's own license is.
+
 ## 2. Roles
 
 **Dirty room (R-agents, research repo).** They read the dirty sources and write specs. They run and automate Winamp 2.95, capture screenshots and timings, and disassemble binaries. The research repo is `rustamp-research`. It is private and is never pushed to `rustamp`.

@@ -1,8 +1,13 @@
 //! Error type shared by all crates.
-
-use serde::{Deserialize, Serialize};
+//!
+//! [`Error`] and [`Result`] stay here; the serializable wire description
+//! ([`ErrorInfo`]/[`ErrorKind`]) lives in `rustamp-proto` (RFC 0004) and is
+//! re-exported at its original paths. The conversion from [`Error`] to
+//! [`ErrorInfo`] stays with [`Error`], which owns the classification.
 
 use crate::audio::AudioSpec;
+
+pub use rustamp_proto::error::{ErrorInfo, ErrorKind};
 
 /// Result alias using [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -53,33 +58,6 @@ pub enum Error {
     /// Anything else.
     #[error("{0}")]
     Other(String),
-}
-
-/// Coarse classification of an [`Error`], carried in events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ErrorKind {
-    /// I/O failure.
-    Io,
-    /// Unsupported format.
-    UnsupportedFormat,
-    /// Decode failure.
-    Decode,
-    /// Output device failure.
-    Output,
-    /// Anything else.
-    Other,
-    /// The stream changed format mid-stream (RFC 0002, C4). Appended at the end
-    /// so existing serialized values keep their index.
-    FormatChanged,
-}
-
-/// Serializable description of an error, used by `Event::Error`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrorInfo {
-    /// Classification.
-    pub kind: ErrorKind,
-    /// Human-readable message.
-    pub message: String,
 }
 
 impl From<&Error> for ErrorInfo {
