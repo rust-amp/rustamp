@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! # rustamp-library
 //!
 //! Media Library (2.9x gen_ml-like), SQLite-backed. Later milestone.

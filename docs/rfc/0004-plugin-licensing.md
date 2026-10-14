@@ -122,3 +122,26 @@ Rules:
    source edit to keep compiling.
 6. The license files are the canonical texts and `PLUGIN-EXCEPTION.md` names the
    interfaces and the GPL version it applies under.
+
+## 7. Errata (2026-10-14, after the implementation)
+
+Written by the integration lead; these correct the text above, which stays as
+the record of what was decided.
+
+- **§3 lists `state::RepeatMode`, which does not exist.** The codebase carries a
+  `TransportState` and a `repeat: bool` field; the wire carries
+  `TransportState`. Nothing was invented: the implementation moved what is
+  actually there. Read the §3 table as "the state types the protocol uses".
+- **§4 says `CLEANROOM.md` §1 states the project is GPL-3.0.** §1 is the source
+  table; the split note was added there as intended, but the sentence was
+  wrong about what §1 contains.
+- **The §7 exception is attached to the repository, not yet to each crate
+  root.** `PLUGIN-EXCEPTION.md` exists at the root and is referenced from
+  `README.md`; the per-crate reference was left out of the first implementation
+  because those crates were outside the task card's owned paths. The reference
+  is being added to each GPL crate root as a follow-up.
+- **Two crates are deliberately excluded from the exception**, and the reason
+  is narrower than "third-party code": `rustamp-decoders` (third-party decoder
+  material) and `rustamp-skin` (webamp MIT tables). Only the copyright holder
+  of a piece of code may grant the exception for it, so the exclusion list must
+  be reviewed whenever third-party material enters a crate.

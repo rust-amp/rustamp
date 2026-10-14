@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! # rustamp-output
 //!
 //! Concrete [`OutputDevice`](rustamp_core::audio::OutputDevice)

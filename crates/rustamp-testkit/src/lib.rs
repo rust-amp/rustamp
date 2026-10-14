@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! Test helpers for headless rendering: RGBA images, PNG I/O, pixel
 //! comparison and golden-image assertions.
 //!

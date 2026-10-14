@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! # rustamp-gfx
 //!
 //! The CPU pixel compositor behind Rustamp's skin rendering.

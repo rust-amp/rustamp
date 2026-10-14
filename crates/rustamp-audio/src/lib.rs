@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! # rustamp-audio
 //!
 //! The audio engine: decode thread -> lock-free ring -> output callback, with

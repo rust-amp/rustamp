@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! # rustamp-platform
 //!
 //! Platform layer: single instance and command-line forwarding, media keys,

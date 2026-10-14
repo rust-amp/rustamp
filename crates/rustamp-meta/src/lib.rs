@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! # rustamp-meta
 //!
 //! Tag reading and writing for Rustamp, mapped onto the frozen

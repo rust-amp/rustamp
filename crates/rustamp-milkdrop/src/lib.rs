@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! # rustamp-milkdrop
 //!
 //! Native MilkDrop 2 port (butterchurn-derived): presets, expression engine,

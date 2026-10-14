@@ -43,4 +43,22 @@ Please read [CONTRIBUTING.md](CONTRIBUTING.md) and [CLEANROOM.md](CLEANROOM.md) 
 
 ## License
 
-Rustamp is licensed under the **GNU General Public License v3.0**. See [LICENSE](LICENSE). Third-party code and its licenses are listed in the THIRD_PARTY notice.
+Rustamp is **split-licensed**, because the process that loads classic plugin
+DLLs must not carry copyleft onto plugins of other licenses:
+
+| Part | License |
+|---|---|
+| `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost` | **MIT OR Apache-2.0** |
+| everything else (the player and its crates) | **GPL-3.0-or-later**, with an additional permission |
+
+The GPL crates carry a GPL-3.0 §7 additional permission so that combining them
+with modules that speak the documented plugin ABI or the documented IPC protocol
+needs no further grant: see [PLUGIN-EXCEPTION.md](PLUGIN-EXCEPTION.md). The
+decision and its reasoning are in
+[docs/rfc/0004-plugin-licensing.md](docs/rfc/0004-plugin-licensing.md) and
+[docs/notes/L-licensing-plugins.md](docs/notes/L-licensing-plugins.md); the
+Winamp plugin SDK's own terms are read in
+[docs/notes/SDK-licensing.md](docs/notes/SDK-licensing.md). The GPL text is in
+[LICENSE](LICENSE), the permissive texts in
+[LICENSE-MIT](LICENSE-MIT)/[LICENSE-APACHE](LICENSE-APACHE). Third-party code
+and its licenses are listed in the THIRD_PARTY notice.

@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! # rustamp-vis
 //!
 //! Built-in spectrum analyzer and oscilloscope (spec S08), the vis window

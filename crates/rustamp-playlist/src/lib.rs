@@ -1,3 +1,4 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! # rustamp-playlist
 //!
 //! Playlist file I/O and one-shot reordering, on top of the frozen
