@@ -222,7 +222,7 @@ mod imp {
                         blit_from_screen(hwnd, client_only, rect, screen, mem, w, h)?;
                     }
                     let mut rgba = Vec::with_capacity(len);
-                    for px in buf.chunks_exact(4) {
+                    for px in buf.as_chunks::<4>().0 {
                         rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
                     }
                     SelectObject(mem, old);

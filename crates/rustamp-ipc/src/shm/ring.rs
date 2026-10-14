@@ -88,7 +88,7 @@ fn check_layout(kind: RingKind, frame_size: u32, capacity: u32) -> Result<u64, R
     }
     match kind {
         RingKind::Pcm => {
-            if frame_size % 4 != 0 {
+            if !frame_size.is_multiple_of(4) {
                 return Err(RingError::InvalidLayout);
             }
         }
@@ -382,7 +382,7 @@ impl<R: MappedRegion> RingProducer<R> {
         self.require_kind(RingKind::Pcm)?;
         self.require_live()?;
         let samples_per_frame = (self.meta.frame_size / 4) as usize;
-        if samples.len() % samples_per_frame != 0 {
+        if !samples.len().is_multiple_of(samples_per_frame) {
             return Err(RingError::NotFrameAligned {
                 samples: samples.len(),
                 samples_per_frame,
@@ -635,7 +635,7 @@ impl<R: MappedRegion> RingConsumer<R> {
     pub fn read_into(&mut self, out: &mut [f32]) -> Result<usize, RingError> {
         self.require_kind(RingKind::Pcm)?;
         let samples_per_frame = (self.meta.frame_size / 4) as usize;
-        if out.len() % samples_per_frame != 0 {
+        if !out.len().is_multiple_of(samples_per_frame) {
             return Err(RingError::NotFrameAligned {
                 samples: out.len(),
                 samples_per_frame,

@@ -93,14 +93,14 @@ pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
                         push_track(&mut entries, finished, &base);
                     }
                     track_base = None;
-                } else if let Some(field) = capture {
-                    if field.matches(&local) {
-                        if let Some(open) = &mut track {
-                            field.assign(open, unescape(&buffer));
-                        }
-                        capture = None;
-                        buffer.clear();
+                } else if let Some(field) = capture
+                    && field.matches(&local)
+                {
+                    if let Some(open) = &mut track {
+                        field.assign(open, unescape(&buffer));
                     }
+                    capture = None;
+                    buffer.clear();
                 }
             }
             Event::Text(text) => {

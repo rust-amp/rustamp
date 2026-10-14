@@ -82,16 +82,18 @@ impl ArchiveSource {
         let archive = zip::ZipArchive::new(Cursor::new(bytes))?;
         let mut index = Vec::new();
         for i in 0..archive.len() {
-            let Some(entry_name) = archive.name_for_index(i) else {
+            // zip 9 makes the entry name fallible: an undecodable name cannot
+            // be looked up, so the entry is skipped exactly like an unsafe one.
+            let Some(Ok(entry_name)) = archive.name_for_index(i) else {
                 continue;
             };
             if entry_name.ends_with('/') {
                 continue;
             }
-            if !is_safe_entry_name(entry_name) {
+            if !is_safe_entry_name(&entry_name) {
                 continue;
             }
-            index.push((basename_lowercase(entry_name), i));
+            index.push((basename_lowercase(&entry_name), i));
         }
         Ok(Self {
             archive,
@@ -126,13 +128,17 @@ impl SkinSource for ArchiveSource {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).ok()?;
         Some(SkinFile {
-            name: file.name().to_string(),
+            name: file.name().map(|n| n.into_owned()).unwrap_or_default(),
             bytes,
         })
     }
 
     fn list(&self) -> Vec<String> {
-        self.archive.file_names().map(str::to_string).collect()
+        self.archive
+            .file_names()
+            .filter_map(|n| n.ok())
+            .map(|n| n.into_owned())
+            .collect()
     }
 
     fn describe(&self) -> String {
@@ -181,10 +187,10 @@ fn collect_files(dir: &Path, index: &mut Vec<(String, PathBuf)>, depth: u32) -> 
         }
         if metadata.is_dir() {
             collect_files(&path, index, depth + 1)?;
-        } else if metadata.is_file() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                index.push((name.to_ascii_lowercase(), path));
-            }
+        } else if metadata.is_file()
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+        {
+            index.push((name.to_ascii_lowercase(), path));
         }
     }
     Ok(())

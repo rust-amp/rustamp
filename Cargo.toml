@@ -30,7 +30,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/rustamp/rustamp"
 authors = ["The Rustamp contributors"]
-rust-version = "1.85"
+rust-version = "1.99"
 
 [workspace.dependencies]
 # internal
@@ -64,5 +64,5 @@ windows = "0.62"
 rtrb = "0.4"
 cpal = "0.18"
 wasapi = "0.26"
-zip = { version = "7.2", default-features = false, features = ["deflate"] }
-lofty = "0.24"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+lofty = "0.25"

@@ -214,7 +214,7 @@ fn decode_uncompressed(
 }
 
 fn decode_indexed_row(bpp: usize, src: &[u8], palette: &[[u8; 3]], dst: &mut [u8]) {
-    for (x, pixel) in dst.chunks_exact_mut(4).enumerate() {
+    for (x, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let index = match bpp {
             1 => (src[x / 8] >> (7 - (x % 8))) & 1,
             4 => (src[x / 2] >> (if x % 2 == 0 { 4 } else { 0 })) & 0xF,
@@ -229,7 +229,13 @@ fn decode_indexed_row(bpp: usize, src: &[u8], palette: &[[u8; 3]], dst: &mut [u8
 fn decode_rgb555(width: usize, src: &[u8], dst: &mut [u8]) {
     // BI_RGB at 16 bpp is the documented 5-5-5 layout (X1R5G5B5).
     let expand = |v: u8| (v << 3) | (v >> 2);
-    for (x, pixel) in dst.chunks_exact_mut(4).take(width).enumerate() {
+    for (x, pixel) in dst
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .take(width)
+        .enumerate()
+    {
         let value = u16::from_le_bytes([src[x * 2], src[x * 2 + 1]]);
         let r = expand(((value >> 10) & 0x1F) as u8);
         let g = expand(((value >> 5) & 0x1F) as u8);
@@ -239,7 +245,13 @@ fn decode_rgb555(width: usize, src: &[u8], dst: &mut [u8]) {
 }
 
 fn decode_bgr24(width: usize, src: &[u8], dst: &mut [u8]) {
-    for (x, pixel) in dst.chunks_exact_mut(4).take(width).enumerate() {
+    for (x, pixel) in dst
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .take(width)
+        .enumerate()
+    {
         let b = src[x * 3];
         let g = src[x * 3 + 1];
         let r = src[x * 3 + 2];
@@ -250,7 +262,13 @@ fn decode_bgr24(width: usize, src: &[u8], dst: &mut [u8]) {
 fn decode_bgra32(width: usize, src: &[u8], dst: &mut [u8]) -> Result<(), String> {
     // First pass: does the image use its alpha channel at all?
     let any_alpha = (0..width).any(|x| src[x * 4 + 3] != 0);
-    for (x, pixel) in dst.chunks_exact_mut(4).take(width).enumerate() {
+    for (x, pixel) in dst
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .take(width)
+        .enumerate()
+    {
         let b = src[x * 4];
         let g = src[x * 4 + 1];
         let r = src[x * 4 + 2];

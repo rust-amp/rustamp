@@ -343,7 +343,7 @@ fn volume_and_balance_reach_the_render_callback() {
 
     let mut rec = Vec::new();
     h.clock.pump_record(256, &mut rec);
-    for frame in rec.chunks_exact(2) {
+    for frame in rec.as_chunks::<2>().0 {
         assert_eq!(frame[1], 0.0, "balance -127 mutes the right channel");
     }
     assert!(rec[0] != 0.0, "the left channel still carries audio");

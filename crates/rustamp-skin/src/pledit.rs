@@ -73,10 +73,10 @@ impl PlaylistStyle {
         if let Some(value) = section.get("mbbg").and_then(|v| parse_color(v)) {
             style.menu_bar_bg = Some(value);
         }
-        if let Some(value) = section.get("font") {
-            if !value.is_empty() {
-                style.font = Some(value.clone());
-            }
+        if let Some(value) = section.get("font")
+            && !value.is_empty()
+        {
+            style.font = Some(value.clone());
         }
         style
     }

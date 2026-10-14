@@ -189,7 +189,7 @@ impl Image {
 
     /// Fills the whole image with one colour.
     pub fn clear(&mut self, rgba: [u8; 4]) {
-        for chunk in self.data.chunks_exact_mut(4) {
+        for chunk in self.data.as_chunks_mut::<4>().0 {
             chunk.copy_from_slice(&rgba);
         }
     }
@@ -202,7 +202,7 @@ impl Image {
         for y in area.y..area.bottom() {
             let start = (y as usize * self.width as usize + area.x as usize) * 4;
             let end = start + area.width as usize * 4;
-            for chunk in self.data[start..end].chunks_exact_mut(4) {
+            for chunk in self.data[start..end].as_chunks_mut::<4>().0 {
                 chunk.copy_from_slice(&rgba);
             }
         }

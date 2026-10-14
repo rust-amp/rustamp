@@ -447,7 +447,12 @@ fn write_available(
     }
     let n = available * channels;
     render(&mut samples[..n]);
-    for (dst, src) in bytes[..n * 4].chunks_exact_mut(4).zip(samples[..n].iter()) {
+    for (dst, src) in bytes[..n * 4]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(samples[..n].iter())
+    {
         dst.copy_from_slice(&src.to_le_bytes());
     }
     if render_client

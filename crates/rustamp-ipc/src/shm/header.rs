@@ -210,7 +210,7 @@ impl core::fmt::Debug for VisSlot {
 const _: () = {
     assert!(size_of::<RingHeader>() == RING_HEADER_SIZE);
     assert!(align_of::<RingHeader>() >= RING_MIN_ALIGN);
-    assert!(RING_HEADER_SIZE % 64 == 0);
+    assert!(RING_HEADER_SIZE.is_multiple_of(64));
 
     assert!(offset_of!(RingHeader, magic) == 0x00);
     assert!(offset_of!(RingHeader, version) == 0x04);

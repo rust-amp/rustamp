@@ -13,6 +13,7 @@ Thanks for helping. Please read this file and [CLEANROOM.md](CLEANROOM.md) befor
 ## Coding standards
 
 - **Formatting:** `cargo fmt --all`. The config is in `rustfmt.toml`.
+- **Toolchain and MSRV:** stable Rust, currently **1.99**. The workspace declares `rust-version = "1.99"` so that current crate releases stay installable; raise it together with the toolchain instead of pinning older dependencies. Note that raising the MSRV *activates* MSRV-gated Clippy lints that were previously suppressed (`as_chunks`, `is_multiple_of`, `collapsible_if` with let-chains); expect mechanical fallout and run `cargo clippy --fix --allow-dirty` for the machine-applicable ones.
 - **Lints:** `cargo clippy --workspace --all-targets --all-features -- -D warnings`. No warnings are allowed; fix them or justify a narrow `#[allow]` in the code with a comment.
 - **Audio thread:** no heap allocations, no locks (`Mutex`, `RwLock`), no blocking I/O and no logging on the audio thread. Communicate through the lock-free rings in `rtrb`.
 - **`unsafe`:** every `unsafe` block or `unsafe fn` must be preceded by a `// SAFETY:` comment that states the invariant that makes it sound. PRs without it are rejected.

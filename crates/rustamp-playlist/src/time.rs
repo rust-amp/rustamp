@@ -60,7 +60,7 @@ pub fn parse_leading_seconds_ms(text: &str) -> Option<u64> {
 /// This is the exact inverse of [`parse_seconds_ms`] for values below 2^53 ms,
 /// which is what makes write → read round-trips lossless.
 pub fn format_seconds(ms: u64) -> String {
-    if ms % 1000 == 0 {
+    if ms.is_multiple_of(1000) {
         (ms / 1000).to_string()
     } else {
         format!("{}.{:03}", ms / 1000, ms % 1000)
