@@ -66,7 +66,7 @@ Tools available: Rust 1.99 stable with the targets `x86_64-pc-windows-msvc` and 
 
 ## 4. What exists (M0 complete, M1 well started)
 
-Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resolver 3. **295 tests green** (`cargo test --workspace --all-features`); fmt and clippy (`-D warnings`) are clean, the i686 tests of `rustamp-ipc` and `rustamp-plugin-abi` pass, and the i686 build of the plugin host works.
+Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resolver 3. **320 tests green** (`cargo test --workspace --all-features`); fmt and clippy (`-D warnings`) are clean, the i686 tests of `rustamp-ipc` and `rustamp-plugin-abi` pass, and the i686 build of the plugin host works. The workspace declares `rust-version = "1.99"` (see `CONTRIBUTING.md`).
 
 | Crate | Status |
 |---|---|
@@ -79,9 +79,10 @@ Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resol
 | `rustamp-skin` | **Loader**: `.wsz`/`.zip`/folder, BMP 1/4/8/16/24/32 bpp incl. `BI_RLE8`, `pledit.txt`, `viscolor.txt`, `region.txt`, cursors, per-file fallback with a substitution report, sprite table. Sprite rects and default colours are ported from webamp (MIT) and marked provisional until S01/S17. `CONTRACT_NOTES.md` in the crate |
 | `rustamp-gfx` | RGBA canvas with clipped blits, integer 2× scaling, `text.bmp` and `numbers`/`nums_ex` bitmap fonts |
 | `rustamp-playlist` | **I/O**: M3U/M3U8/PLS/XSPF read and write, content sniffing, relative-path resolution, Windows-1252 fallback, seeded `randomize`/`shuffle` helpers. B4S unsupported (no public format description available); the shuffle sequence (S15) and title formatting (S14) are open. `CONTRACT_NOTES.md` in the crate |
+| `rustamp-meta` | **Tags (M1)**: reads and writes tags through `lofty` 0.25 onto `TrackMetadata` with a fixed precedence (primary tag, then ID3v2, Vorbis comments, MP4 ilst, APE, ID3v1, RIFF info, AIFF text), the track/disc pair forms, best-attempt parsing so malformed tag bytes never panic, artwork as a raw-bytes side channel, and a batch scan returning one result per path. Properties are deliberately not scanned, so `duration_ms`/`bitrate_kbps` stay `None` for the decoder to fill. Winamp title formatting is deferred to S14. `CONTRACT_NOTES.md` in the crate |
 | `rustamp-testkit` | PNG load and save, `compare`/`Diff`, `write_diff_image`, the `Snapshot` trait, `assert_golden` (bless via `RUSTAMP_BLESS=1`). The `lookalike` skin namespace is in the repo; `classic-base` comes from `$RUSTAMP_TESTDATA` and is skipped when that variable is unset |
-| `xtask` | `cargo xtask golden [--bless] [--skin]`, `cargo xtask capture --list / --class / --title / --out / --client-only` (generic Win32 window capture), `cargo xtask plughost [--release]`; `package` is still a stub |
-| everything else | Stubs (a `lib.rs` with doc comments only): dsp, meta, ui, vis, milkdrop, platform, prefs, library; app and plughost are `main` stubs |
+| `xtask` | `cargo xtask golden [--bless] [--skin]`, `cargo xtask capture --list / --class / --title / --out / --client-only` (generic Win32 window capture), `cargo xtask ring-cross` (32-bit vs 64-bit shared-memory ring check), `cargo xtask plughost [--release]`; `package` is still a stub |
+| everything else | Stubs (a `lib.rs` with doc comments only): dsp, ui, vis, milkdrop, platform, prefs, library; app and plughost are `main` stubs |
 
 **Docs:**
 - `specs/S09-plugin-abi.md`: audited, statically validated; runtime confirmation against 2.95 is still pending. The other specs (S01–S20) are not started; see `specs/README.md`.
@@ -98,6 +99,7 @@ Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resol
    - `rustamp-playlist` (`CONTRACT_NOTES.md`): `PlaylistEntry` has no field for `#EXTART`/`#EXTALBUM`/XSPF `<creator>` — decide together with S14 whether to add fields or an `extra` map; confirm that non-`http` schemes become `MediaLocation::Url`.
    - `rustamp-ipc` (RFC 0003, Q1–Q5): a blocking consumer (event or semaphore), a private DACL or `Global\`-scoped name, folding `RingError` into `IpcError`, a late-joiner consumer that starts at the newest frame, and a compact header.
    - **Verification gap closed:** `cargo xtask ring-cross` runs a 32-bit producer against a 64-bit consumer and the reverse, for both ring kinds. Remaining RFC 0003 open questions: Q1–Q5.
+   - `rustamp-meta` (`CONTRACT_NOTES.md`): add `disc_total: Option<u32>` to `TrackMetadata` (today it goes into `extra["DISCTOTAL"]`), and decide a contract for artwork — a side-channel type rather than bytes inside `TrackMetadata`, which would be heavy to clone.
    - `rustamp-audio`: if the engine must expose playlist `EntryId`s (`TrackChanged.id` is `None` today), that is a public-surface change and needs an RFC.
 3. **Unicode paths over IPC.** A `PathBuf` that is not valid UTF-8 cannot be encoded yet (the fix would be WTF-8 or u16).
 4. **`WindowId::Gen(u32)`** still has no numbering scheme.

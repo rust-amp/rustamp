@@ -7,7 +7,6 @@
 use std::path::{Path, PathBuf};
 
 use lofty::config::ParseOptions;
-use lofty::error::{ErrorKind as LoftyErrorKind, LoftyError};
 use lofty::file::{TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, Tag, TagType};
@@ -139,13 +138,35 @@ fn load(path: &Path, read_cover_art: bool) -> Result<TaggedFile> {
         .map_err(map_lofty)
 }
 
-/// Maps a [`LoftyError`] onto the shared [`Error`] type.
-pub(crate) fn map_lofty(error: LoftyError) -> Error {
-    match error.kind() {
-        LoftyErrorKind::UnknownFormat => Error::UnsupportedFormat(error.to_string()),
-        LoftyErrorKind::Io(io) => Error::Io(std::io::Error::new(io.kind(), io.to_string())),
-        _ => Error::Other(error.to_string()),
+/// Maps a `lofty` error onto the shared [`Error`] type.
+///
+/// Generic over the error type because `lofty` 0.25 replaced its single error
+/// enum with per-operation types (`FileParseError`, `TagEncodingError`, ...).
+/// The unknown-format marker and any I/O error are looked up in the error's
+/// source chain, which is where `lofty` carries them.
+pub(crate) fn map_lofty<E>(error: E) -> Error
+where
+    E: std::error::Error + 'static,
+{
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut unknown_format = false;
+    let mut io = None;
+    while let Some(current) = source {
+        unknown_format |= current.is::<lofty::error::UnknownFormatError>();
+        if io.is_none()
+            && let Some(inner) = current.downcast_ref::<std::io::Error>()
+        {
+            io = Some(std::io::Error::new(inner.kind(), inner.to_string()));
+        }
+        source = current.source();
     }
+    if unknown_format {
+        return Error::UnsupportedFormat(error.to_string());
+    }
+    if let Some(io) = io {
+        return Error::Io(io);
+    }
+    Error::Other(error.to_string())
 }
 
 /// The file's tags, highest precedence first.
