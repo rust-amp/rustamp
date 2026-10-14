@@ -61,3 +61,7 @@ toml = "0.9"
 png = { version = "0.18", default-features = false }
 tempfile = "3"
 windows = "0.62"
+rtrb = "0.4"
+cpal = "0.18"
+wasapi = "0.26"
+zip = { version = "7.2", default-features = false, features = ["deflate"] }

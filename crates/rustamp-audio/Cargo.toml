@@ -10,3 +10,9 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+rtrb.workspace = true
+cpal.workspace = true
+wasapi.workspace = true
+
+[dev-dependencies]
+rustamp-decoders.workspace = true
