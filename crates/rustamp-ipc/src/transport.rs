@@ -111,6 +111,7 @@ mod tests {
 
     use super::*;
     use crate::message::VisFrameWire;
+    use crate::shm::{RingDirection, RingKind, RingRefuseReason};
 
     fn samples() -> Vec<Message> {
         let mut vis = VisFrame {
@@ -156,6 +157,20 @@ mod tests {
                 gain_db: -2.5,
             }),
             Message::Vis(Box::new(VisFrameWire::from(&vis))),
+            Message::RingOffer {
+                name: "rustamp-pcm-1-0000000000000002".into(),
+                kind: RingKind::Pcm,
+                frame_size: 8,
+                capacity: 4096,
+                size: 0xC0 + 4096 * 8,
+                generation: 2,
+                direction: RingDirection::HostToMain,
+            },
+            Message::RingReady {
+                kind: RingKind::Vis,
+                generation: 7,
+            },
+            Message::ring_refused(RingKind::Vis, 7, RingRefuseReason::Stale),
             Message::Shutdown,
             Message::WinampIpc {
                 msg_id: 0x400 + 104,

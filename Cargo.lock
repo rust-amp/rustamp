@@ -825,6 +825,7 @@ dependencies = [
  "rustamp-plugin-abi",
  "serde",
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]

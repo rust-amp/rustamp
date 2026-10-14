@@ -15,3 +15,12 @@ serde.workspace = true
 thiserror.workspace = true
 postcard.workspace = true
 crossbeam-channel.workspace = true
+
+# The cross-process transport needs the Win32 file-mapping API. `rtrb` is not
+# used: the ring has to live in shared memory, which `rtrb` does not support.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+] }

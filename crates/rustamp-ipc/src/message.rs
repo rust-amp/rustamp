@@ -6,9 +6,15 @@ use rustamp_core::vis::{VIS_CHANNELS, VIS_SAMPLES, VisFrame};
 use rustamp_plugin_abi::PluginKind;
 use serde::{Deserialize, Serialize};
 
+use crate::shm::{RingDirection, RingExpect, RingKind, RingRefuseReason};
+
 /// Protocol version spoken by this build. Bumped on any incompatible change
 /// to [`Message`]; peers compare it in `Hello`.
-pub const PROTOCOL_VERSION: u32 = 0;
+///
+/// * `0`: `Hello`, `Ping`/`Pong`, `LoadPlugin`, `PluginLoaded`/`PluginError`,
+///   `PlayerStateUpdate`, `CommandFromPlugin`, `Vis`, `Shutdown`, `WinampIpc`.
+/// * `1`: adds `RingOffer`, `RingReady`, `RingRefused` (RFC 0003).
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Wire form of [`VisFrame`] (flat vectors, `channel-major`: all samples of
 /// channel 0, then channel 1). Each vector has `VIS_CHANNELS * VIS_SAMPLES` values.
@@ -97,6 +103,40 @@ pub enum Message {
     CommandFromPlugin(Command),
     /// M: latest visualization frame (fallback path; see crate docs).
     Vis(Box<VisFrameWire>),
+    /// Both: the sender created a shared-memory ring and wants the peer to open
+    /// it (RFC 0003). The peer answers `RingReady` or `RingRefused`.
+    RingOffer {
+        /// Mapping name, opaque to the transport (see `shm::ring_name`).
+        name: String,
+        /// Which payload the ring carries.
+        kind: RingKind,
+        /// Bytes per slot.
+        frame_size: u32,
+        /// Number of slots.
+        capacity: u32,
+        /// Total mapping size in bytes.
+        size: u64,
+        /// Generation (epoch) the creator wrote into the header.
+        generation: u64,
+        /// Which way data flows; tells the peer which end it is.
+        direction: RingDirection,
+    },
+    /// Both: the ring is open and validated; data may flow.
+    RingReady {
+        /// Which ring this acknowledges.
+        kind: RingKind,
+        /// Generation that was validated.
+        generation: u64,
+    },
+    /// Both: the ring could not be opened, or it is stale/foreign.
+    RingRefused {
+        /// Which ring this refuses.
+        kind: RingKind,
+        /// Generation that was offered.
+        generation: u64,
+        /// Why it was refused.
+        reason: RingRefuseReason,
+    },
     /// M: ask the host to exit cleanly.
     Shutdown,
     /// Both: opaque classic-Winamp window message
@@ -119,6 +159,30 @@ impl Message {
         Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             pid: std::process::id(),
+        }
+    }
+
+    /// If this is a [`Message::RingOffer`], what an opener validates the ring
+    /// against (RFC 0003 section 9).
+    pub fn ring_expect(&self) -> Option<RingExpect> {
+        match self {
+            Message::RingOffer {
+                kind,
+                frame_size,
+                capacity,
+                generation,
+                ..
+            } => Some(RingExpect::new(*kind, *frame_size, *capacity, *generation)),
+            _ => None,
+        }
+    }
+
+    /// A refusal for an offer that could not be satisfied.
+    pub fn ring_refused(kind: RingKind, generation: u64, reason: RingRefuseReason) -> Message {
+        Message::RingRefused {
+            kind,
+            generation,
+            reason,
         }
     }
 }
