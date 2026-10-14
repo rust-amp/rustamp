@@ -1,0 +1,369 @@
+//! Playlist formats: the [`PlaylistFormat`] enum, extension mapping and
+//! content sniffing.
+//!
+//! Detection is deliberately two-step and deterministic:
+//!
+//! 1. **Content markers** decide first. They are strong signals that a file is
+//!    not what its extension says: an XML root (`<playlist` → XSPF, `<winamp`
+//!    → B4S), a `[playlist]` section or a `FileN=` key (PLS), `#EXTM3U` (M3U).
+//! 2. Otherwise the **file name extension** decides between the two M3U
+//!    encodings (`.m3u` vs `.m3u8`).
+//! 3. Text that does not start an XML document is treated as M3U, so M3U
+//!    content in a file named `.pls` still parses.
+//! 4. Anything else falls back to the extension's format, or is rejected when
+//!    there is no extension hint either.
+//!
+//! See [`detect`] for the exact order.
+
+use std::path::Path;
+
+/// A playlist container format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlaylistFormat {
+    /// `#EXTM3U` style text file, historically Windows-1252 on Windows.
+    M3u,
+    /// The same text format, UTF-8 by definition.
+    M3u8,
+    /// `[playlist]` / `FileN=` / `TitleN=` / `LengthN=`.
+    Pls,
+    /// XML shareable playlist format.
+    Xspf,
+    /// Winamp's own XML playlist. **Not implemented**, see
+    /// [`PlaylistFormat::is_supported`].
+    B4s,
+}
+
+impl PlaylistFormat {
+    /// Every format this crate knows about.
+    pub const ALL: [PlaylistFormat; 5] = [
+        PlaylistFormat::M3u,
+        PlaylistFormat::M3u8,
+        PlaylistFormat::Pls,
+        PlaylistFormat::Xspf,
+        PlaylistFormat::B4s,
+    ];
+
+    /// The conventional file extension, without the dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            PlaylistFormat::M3u => "m3u",
+            PlaylistFormat::M3u8 => "m3u8",
+            PlaylistFormat::Pls => "pls",
+            PlaylistFormat::Xspf => "xspf",
+            PlaylistFormat::B4s => "b4s",
+        }
+    }
+
+    /// Whether this crate can read and write the format.
+    ///
+    /// B4S is recognized (so callers can report a useful message) but not
+    /// implemented: it is a Winamp-specific XML dialect with no published
+    /// format description and no free reference implementation available in
+    /// this repository. See `CONTRACT_NOTES.md`.
+    pub fn is_supported(self) -> bool {
+        !matches!(self, PlaylistFormat::B4s)
+    }
+
+    /// Maps a file extension (with or without a leading dot, any case) to a
+    /// format.
+    pub fn from_extension(ext: &str) -> Option<PlaylistFormat> {
+        let ext = ext.strip_prefix('.').unwrap_or(ext);
+        match ext.to_ascii_lowercase().as_str() {
+            "m3u" => Some(PlaylistFormat::M3u),
+            "m3u8" => Some(PlaylistFormat::M3u8),
+            "pls" => Some(PlaylistFormat::Pls),
+            "xspf" => Some(PlaylistFormat::Xspf),
+            "b4s" => Some(PlaylistFormat::B4s),
+            _ => None,
+        }
+    }
+
+    /// Maps a path's extension to a format.
+    pub fn from_path(path: &Path) -> Option<PlaylistFormat> {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .and_then(PlaylistFormat::from_extension)
+    }
+}
+
+impl std::fmt::Display for PlaylistFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.extension())
+    }
+}
+
+/// Number of leading bytes examined by [`sniff`] and [`looks_like_text`].
+const SNIFF_LIMIT: usize = 4096;
+
+/// Looks for a content marker that identifies the format regardless of the
+/// file name. Returns `None` when the content carries no marker.
+///
+/// Markers, in the order they are tested:
+/// * an XML root element (`<winamp…` → B4S, `<playlist…` → XSPF),
+/// * a `[playlist]` section line or a `FileN=` key (PLS),
+/// * `#EXTM3U` (M3U).
+pub fn sniff(bytes: &[u8]) -> Option<PlaylistFormat> {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
+    let head = &bytes[..bytes.len().min(SNIFF_LIMIT)];
+    let text = crate::cp1252::decode_text(head);
+
+    if text.trim_start().starts_with('<')
+        && let Some(root) = xml_root(&text)
+    {
+        let root = root.to_ascii_lowercase();
+        if root.starts_with("winamp") {
+            return Some(PlaylistFormat::B4s);
+        }
+        if root.starts_with("playlist") {
+            return Some(PlaylistFormat::Xspf);
+        }
+        // Some other XML document: not a playlist format we know.
+        return None;
+    }
+
+    for line in text.split(['\r', '\n']) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("[playlist]") {
+            return Some(PlaylistFormat::Pls);
+        }
+        if is_pls_key_line(line) {
+            return Some(PlaylistFormat::Pls);
+        }
+        if line
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("#EXTM3U"))
+        {
+            return Some(PlaylistFormat::M3u);
+        }
+    }
+    None
+}
+
+/// Detects the format from the content, with an optional file path used as a
+/// hint (for the extension).
+///
+/// The precedence, in order:
+///
+/// 1. a **content marker** (see [`sniff`]) wins, even over a contradicting
+///    extension; `#EXTM3U` is refined to M3U8 by a `.m3u8` extension,
+/// 2. a `.m3u`/`.m3u8` extension,
+/// 3. text that does not start an XML document is treated as M3U (the
+///    universal fallback for a bare list of paths, e.g. M3U content in a file
+///    named `.pls`),
+/// 4. otherwise the extension's format (so an empty `.xspf` still selects
+///    XSPF), or `None` when there is no hint either.
+pub fn detect(bytes: &[u8], path_hint: Option<&Path>) -> Option<PlaylistFormat> {
+    let hint = path_hint.and_then(PlaylistFormat::from_path);
+    if let Some(format) = sniff(bytes) {
+        return Some(match (format, hint) {
+            (PlaylistFormat::M3u, Some(PlaylistFormat::M3u8)) => PlaylistFormat::M3u8,
+            _ => format,
+        });
+    }
+    if matches!(hint, Some(PlaylistFormat::M3u) | Some(PlaylistFormat::M3u8)) {
+        return hint;
+    }
+    if looks_like_m3u(bytes) {
+        return Some(PlaylistFormat::M3u);
+    }
+    hint
+}
+
+/// Whether the bytes look like a bare list of paths (M3U without any marker).
+fn looks_like_m3u(bytes: &[u8]) -> bool {
+    if !looks_like_text(bytes) {
+        return false;
+    }
+    let head = &bytes[..bytes.len().min(SNIFF_LIMIT)];
+    let text = crate::cp1252::decode_text(head);
+    let trimmed = text.trim_start_matches(['\u{FEFF}', ' ', '\t', '\r', '\n']);
+    !trimmed.starts_with('<')
+}
+
+/// Whether the first few KiB look like text rather than binary.
+///
+/// True when there is no NUL byte and control characters other than tab, CR
+/// and LF make up less than 10 % of the sample. This keeps a binary blob from
+/// being "parsed" as a list of file names.
+pub fn looks_like_text(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let sample = &bytes[..bytes.len().min(SNIFF_LIMIT)];
+    let mut controls = 0usize;
+    for &b in sample {
+        match b {
+            0x00 => return false,
+            0x09 | 0x0A | 0x0D => {}
+            0x01..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F => controls += 1,
+            _ => {}
+        }
+    }
+    controls * 10 < sample.len()
+}
+
+/// `true` for a `FileN=` line (case-insensitive, `N` decimal).
+fn is_pls_key_line(line: &str) -> bool {
+    let Some((key, _)) = line.split_once('=') else {
+        return false;
+    };
+    let key = key.trim().to_ascii_lowercase();
+    let Some(digits) = key.strip_prefix("file") else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The root element name of an XML document, skipping the declaration,
+/// comments and the DOCTYPE. `None` when no element can be found.
+fn xml_root(text: &str) -> Option<&str> {
+    let mut rest = text.trim_start_matches(['\u{FEFF}', ' ', '\t', '\r', '\n']);
+    // A handful of prologue constructs is enough; anything else means the file
+    // is malformed and we bail out.
+    for _ in 0..8 {
+        if let Some(after) = rest.strip_prefix("<?") {
+            let end = after.find("?>")?;
+            rest = after[end + 2..].trim_start();
+        } else if let Some(after) = rest.strip_prefix("<!--") {
+            let end = after.find("-->")?;
+            rest = after[end + 3..].trim_start();
+        } else if let Some(after) = rest.strip_prefix("<!") {
+            let end = after.find('>')?;
+            rest = after[end + 1..].trim_start();
+        } else {
+            break;
+        }
+    }
+    let after = rest.strip_prefix('<')?;
+    let name = element_name(after.trim_start());
+    (!name.is_empty()).then_some(name)
+}
+
+/// The element name at the start of `s` (up to whitespace, `/` or `>`).
+fn element_name(s: &str) -> &str {
+    let end = s
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn extension_mapping_is_case_insensitive() {
+        assert_eq!(
+            PlaylistFormat::from_extension("M3U"),
+            Some(PlaylistFormat::M3u)
+        );
+        assert_eq!(
+            PlaylistFormat::from_extension(".M3u8"),
+            Some(PlaylistFormat::M3u8)
+        );
+        assert_eq!(
+            PlaylistFormat::from_extension("pls"),
+            Some(PlaylistFormat::Pls)
+        );
+        assert_eq!(
+            PlaylistFormat::from_extension("xspf"),
+            Some(PlaylistFormat::Xspf)
+        );
+        assert_eq!(
+            PlaylistFormat::from_extension("b4s"),
+            Some(PlaylistFormat::B4s)
+        );
+        assert_eq!(PlaylistFormat::from_extension("mp3"), None);
+        assert_eq!(
+            PlaylistFormat::from_path(&PathBuf::from("C:/a/b.XSPF")),
+            Some(PlaylistFormat::Xspf)
+        );
+    }
+
+    #[test]
+    fn sniffs_content_markers() {
+        assert_eq!(
+            sniff(b"#EXTM3U\r\n#EXTINF:1,x\r\na.mp3\r\n"),
+            Some(PlaylistFormat::M3u)
+        );
+        assert_eq!(
+            sniff(b"[playlist]\r\nFile1=a.mp3\r\n"),
+            Some(PlaylistFormat::Pls)
+        );
+        assert_eq!(
+            sniff(b"NumberOfEntries=1\nFile1=a.mp3\n"),
+            Some(PlaylistFormat::Pls)
+        );
+        assert_eq!(
+            sniff(b"<?xml version=\"1.0\"?>\n<playlist version=\"1\">"),
+            Some(PlaylistFormat::Xspf)
+        );
+        assert_eq!(sniff(b"<WinampXML><playlist>"), Some(PlaylistFormat::B4s));
+        assert_eq!(sniff(b"a.mp3\nb.mp3\n"), None);
+        assert_eq!(sniff(b"<html><body>no</body></html>"), None);
+    }
+
+    #[test]
+    fn content_marker_beats_a_wrong_extension() {
+        let xspf = b"<?xml version=\"1.0\"?><playlist version=\"1\"></playlist>";
+        assert_eq!(
+            detect(xspf, Some(Path::new("misnamed.m3u"))),
+            Some(PlaylistFormat::Xspf)
+        );
+    }
+
+    #[test]
+    fn extension_refines_m3u_to_m3u8() {
+        assert_eq!(
+            detect(b"#EXTM3U\r\na.mp3\r\n", Some(Path::new("p.m3u8"))),
+            Some(PlaylistFormat::M3u8)
+        );
+        assert_eq!(
+            detect(b"#EXTM3U\r\na.mp3\r\n", Some(Path::new("p.m3u"))),
+            Some(PlaylistFormat::M3u)
+        );
+    }
+
+    #[test]
+    fn plain_text_without_marker_falls_back_to_m3u() {
+        assert_eq!(detect(b"a.mp3\nb.mp3\n", None), Some(PlaylistFormat::M3u));
+        assert_eq!(
+            detect(b"a.mp3\n", Some(Path::new("misnamed.pls"))),
+            Some(PlaylistFormat::M3u)
+        );
+    }
+
+    #[test]
+    fn binary_blob_is_not_a_playlist() {
+        let mut blob = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        blob.extend((0u16..4096).map(|i| (i % 251) as u8));
+        assert_eq!(detect(&blob, None), None);
+        assert_eq!(detect(&blob, Some(Path::new("no-extension"))), None);
+        assert!(!looks_like_text(&blob));
+    }
+
+    #[test]
+    fn empty_input_is_not_a_playlist() {
+        assert_eq!(detect(b"", None), None);
+        assert_eq!(detect(b"", Some(Path::new("x.mp3"))), None);
+    }
+
+    #[test]
+    fn extension_alone_still_selects_a_known_format() {
+        assert_eq!(
+            detect(b"", Some(Path::new("x.m3u"))),
+            Some(PlaylistFormat::M3u)
+        );
+    }
+
+    #[test]
+    fn non_ascii_keys_do_not_panic() {
+        assert!(!is_pls_key_line("\u{20AC}\u{00E4}=x"));
+        assert!(is_pls_key_line("FILE7=C:\\a.mp3"));
+        assert!(!is_pls_key_line("Filex=1"));
+    }
+}
