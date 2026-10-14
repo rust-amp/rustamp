@@ -812,6 +812,7 @@ name = "rustamp-gfx"
 version = "0.0.1"
 dependencies = [
  "rustamp-core",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -899,6 +900,9 @@ name = "rustamp-skin"
 version = "0.0.1"
 dependencies = [
  "rustamp-core",
+ "rustamp-gfx",
+ "tempfile",
+ "thiserror 2.0.21",
  "zip",
 ]
 
