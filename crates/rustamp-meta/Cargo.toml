@@ -10,3 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+lofty.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

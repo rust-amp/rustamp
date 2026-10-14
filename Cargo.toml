@@ -65,3 +65,4 @@ rtrb = "0.4"
 cpal = "0.18"
 wasapi = "0.26"
 zip = { version = "7.2", default-features = false, features = ["deflate"] }
+lofty = "0.24"
