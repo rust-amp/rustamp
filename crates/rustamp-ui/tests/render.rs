@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use rustamp_gfx::{Image, Rect};
 use rustamp_skin::{BuiltinDefaultSkin, MemorySource, PLACEHOLDER_RGBA, Skin};
 use rustamp_ui::{
-    MainWindowLayout, MainWindowState, TransportButton, TransportState, Widget, frame_size,
-    hit_test, render_main_window,
+    MainWindowLayout, MainWindowState, MonoStereo, TransportButton, TransportState, Widget,
+    WindowButton, frame_size, hit_test, render_main_window,
 };
 
 // Distinctive colours painted into the synthetic sheets.
@@ -28,7 +28,20 @@ const CLUTTER_BG: [u8; 3] = [8, 9, 10];
 const CLUTTER_A: [u8; 3] = [160, 170, 180];
 const POS_THUMB: [u8; 3] = [190, 200, 210];
 const GLYPH_A: [u8; 3] = [220, 230, 240];
+const GLYPH_B: [u8; 3] = [46, 47, 48];
 const SHADE: [u8; 3] = [5, 6, 7];
+// The window-button body colour and the four pressed cells (S02 §7).
+const TITLE_BAR_BODY: [u8; 3] = [25, 26, 27];
+const OPTIONS_DEPRESSED: [u8; 3] = [31, 32, 33];
+const MINIMIZE_DEPRESSED: [u8; 3] = [34, 35, 36];
+const SHADE_DEPRESSED: [u8; 3] = [37, 38, 39];
+const CLOSE_DEPRESSED: [u8; 3] = [40, 41, 42];
+const POS_THUMB_PRESSED: [u8; 3] = [43, 44, 45];
+// The lit and dim mono/stereo labels (S02 §6).
+const STEREO_LIT: [u8; 3] = [50, 51, 52];
+const STEREO_DIM: [u8; 3] = [53, 54, 55];
+const MONO_LIT: [u8; 3] = [56, 57, 58];
+const MONO_DIM: [u8; 3] = [59, 60, 61];
 
 /// Encodes an uncompressed 24-bit BMP (bottom-up rows, BGR, 4-byte padded).
 fn bmp_24(width: u32, height: u32, pixels: &[[u8; 3]]) -> Vec<u8> {
@@ -131,24 +144,56 @@ fn synthetic_skin() -> Skin {
             87,
             [0, 0, 0],
             &[
+                (27, 0, 275, 14, TITLE_BAR_BODY),
                 (304, 0, 8, 43, CLUTTER_BG),
                 (316, 55, 4, 6, CLUTTER_A),
                 (27, 29, 275, 14, SHADE),
+                // The four pressed window-button cells (S02 §7).
+                (0, 9, 9, 9, OPTIONS_DEPRESSED),
+                (9, 9, 9, 9, MINIMIZE_DEPRESSED),
+                (18, 9, 9, 9, CLOSE_DEPRESSED),
+                (9, 18, 9, 9, SHADE_DEPRESSED),
             ],
         ),
     );
     source.add(
         "posbar.bmp",
-        sheet(307, 10, [0, 0, 0], &[(246, 0, 29, 10, POS_THUMB)]),
+        sheet(
+            307,
+            10,
+            [0, 0, 0],
+            &[
+                (246, 0, 29, 10, POS_THUMB),
+                (278, 0, 29, 10, POS_THUMB_PRESSED),
+            ],
+        ),
     );
     source.add(
         "text.bmp",
-        sheet(155, 18, [0, 0, 0], &[(0, 0, 5, 6, GLYPH_A)]),
+        sheet(
+            155,
+            18,
+            [0, 0, 0],
+            &[(0, 0, 5, 6, GLYPH_A), (5, 0, 5, 6, GLYPH_B)],
+        ),
     );
     source.add("shufrep.bmp", sheet(92, 85, [0, 0, 0], &[]));
     source.add("volume.bmp", sheet(68, 433, [0, 0, 0], &[]));
     source.add("balance.bmp", sheet(68, 433, [0, 0, 0], &[]));
-    source.add("monoster.bmp", sheet(58, 24, [0, 0, 0], &[]));
+    source.add(
+        "monoster.bmp",
+        sheet(
+            58,
+            24,
+            [0, 0, 0],
+            &[
+                (0, 0, 29, 12, STEREO_LIT),
+                (0, 12, 29, 12, STEREO_DIM),
+                (29, 0, 27, 12, MONO_LIT),
+                (29, 12, 27, 12, MONO_DIM),
+            ],
+        ),
+    );
     source.add("playpaus.bmp", sheet(42, 9, [0, 0, 0], &[]));
     Skin::from_source(&mut source, &BuiltinDefaultSkin).expect("synthetic skin loads")
 }
@@ -229,6 +274,122 @@ fn pressed_transport_button_uses_the_active_sprite() {
     state.pressed = Some(TransportButton::Play);
     let frame = render_main_window(&state, &skin, &layout);
     assert_eq!(rgb(&frame, 39, 88), PLAY_BUTTON_ACTIVE);
+}
+
+#[test]
+fn pressed_window_buttons_draw_from_the_small_cells() {
+    let skin = synthetic_skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let mut state = playing_state();
+
+    // Normal state: the four buttons are part of the title-bar body sprite
+    // (S01 §2.1/S02 §7), so the pressed cells must not appear.
+    let normal = render_main_window(&state, &skin, &layout);
+    for (x, y) in [(6, 3), (244, 3), (254, 3), (264, 3)] {
+        assert_eq!(
+            rgb(&normal, x, y),
+            TITLE_BAR_BODY,
+            "normal button at ({x},{y})"
+        );
+    }
+
+    for (button, (x, y), colour) in [
+        (WindowButton::Menu, (6, 3), OPTIONS_DEPRESSED),
+        (WindowButton::Minimize, (244, 3), MINIMIZE_DEPRESSED),
+        (WindowButton::Shade, (254, 3), SHADE_DEPRESSED),
+        (WindowButton::Close, (264, 3), CLOSE_DEPRESSED),
+    ] {
+        state.pressed_window_button = Some(button);
+        let frame = render_main_window(&state, &skin, &layout);
+        assert_eq!(rgb(&frame, x, y), colour, "{button:?} pressed cell");
+        state.pressed_window_button = None;
+    }
+
+    // The normal state is unchanged.
+    let again = render_main_window(&playing_state(), &skin, &layout);
+    assert_eq!(normal, again);
+}
+
+#[test]
+fn position_thumb_uses_the_pressed_sprite_while_held() {
+    let skin = synthetic_skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let mut state = playing_state();
+    let normal = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&normal, 16, 72), POS_THUMB);
+
+    state.position_thumb_pressed = true;
+    let pressed = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&pressed, 16, 72), POS_THUMB_PRESSED);
+}
+
+#[test]
+fn mono_stereo_labels_follow_transport_and_channels() {
+    let skin = synthetic_skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let mut state = playing_state();
+
+    state.channels = MonoStereo::Stereo;
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&frame, 239, 41), STEREO_LIT);
+    assert_eq!(rgb(&frame, 212, 41), MONO_DIM);
+
+    state.channels = MonoStereo::Mono;
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&frame, 212, 41), MONO_LIT);
+    assert_eq!(rgb(&frame, 239, 41), STEREO_DIM);
+
+    // Stopped dims both labels (S02 §6).
+    state.channels = MonoStereo::Stereo;
+    state.transport = TransportState::Stopped;
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&frame, 239, 41), STEREO_DIM);
+    assert_eq!(rgb(&frame, 212, 41), MONO_DIM);
+
+    // No stream info dims both too.
+    state.transport = TransportState::Playing;
+    state.channels = MonoStereo::Unknown;
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&frame, 239, 41), STEREO_DIM);
+    assert_eq!(rgb(&frame, 212, 41), MONO_DIM);
+}
+
+#[test]
+fn marquee_offset_shifts_the_text() {
+    let skin = synthetic_skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let mut state = playing_state();
+    state.title = "ab".to_string();
+
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&frame, 111, 27), GLYPH_A);
+    assert_eq!(rgb(&frame, 116, 27), GLYPH_B);
+
+    state.marquee_offset = 5;
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&frame, 111, 27), GLYPH_B);
+}
+
+#[test]
+fn a_blank_time_display_draws_nothing() {
+    let skin = synthetic_skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let mut state = MainWindowState {
+        time_seconds: 83,
+        ..MainWindowState::default()
+    };
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&frame, 48, 26), NO_DIGIT);
+
+    // The blink-off phase and stopped are blank (S02 §4).
+    state.time_visible = false;
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&frame, 48, 26), MAIN_BG);
+
+    // The remaining-time minus sign is blank too.
+    state.time_remaining = true;
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!(rgb(&frame, 38, 32), MAIN_BG);
 }
 
 #[test]
@@ -342,17 +503,38 @@ fn corpus_skins_render_a_frame_without_panicking() {
     playing.balance = 0;
     playing.time_remaining = true;
 
+    // A third state that exercises the D2 render fields: a scrolling marquee,
+    // a held window button, the pressed position thumb and a blank readout.
+    let mut extras = playing_state();
+    extras.title = "A much longer title that will scroll across the marquee".to_string();
+    extras.marquee_offset = 10;
+    extras.position_thumb_pressed = true;
+    extras.channels = MonoStereo::Unknown;
+    extras.time_visible = false;
+
+    let states = [&stopped, &playing, &extras];
+    let window_buttons = [
+        None,
+        Some(WindowButton::Menu),
+        Some(WindowButton::Minimize),
+        Some(WindowButton::Shade),
+        Some(WindowButton::Close),
+    ];
+
     let mut rendered = 0usize;
     for path in &files {
         let skin = Skin::load(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        for state in [&stopped, &playing] {
+        for state in states {
             for windowshade in [false, true] {
                 for double_size in [false, true] {
-                    let mut state = state.clone();
-                    state.windowshade = windowshade;
-                    state.double_size = double_size;
-                    let frame = render_main_window(&state, &skin, &layout);
-                    assert_eq!(frame_size(&state), (frame.width(), frame.height()));
+                    for pressed_window_button in window_buttons {
+                        let mut state = state.clone();
+                        state.windowshade = windowshade;
+                        state.double_size = double_size;
+                        state.pressed_window_button = pressed_window_button;
+                        let frame = render_main_window(&state, &skin, &layout);
+                        assert_eq!(frame_size(&state), (frame.width(), frame.height()));
+                    }
                 }
             }
         }

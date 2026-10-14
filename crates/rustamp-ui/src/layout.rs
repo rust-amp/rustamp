@@ -11,6 +11,8 @@
 
 use rustamp_gfx::Rect;
 
+use crate::state::WindowButton;
+
 /// Width of the classic main window at 1x (S01 §1, verified).
 pub const WINDOW_WIDTH: u32 = 275;
 /// Height of the classic main window at 1x (S01 §1, verified).
@@ -25,15 +27,30 @@ pub const DOUBLE_HEIGHT: u32 = WINDOW_HEIGHT * 2;
 /// Every rectangle the classic main window draws, in one place.
 ///
 /// The values in [`MainWindowLayout::CLASSIC`] are S01 §2.1/§2.2 destinations
-/// plus a handful of clearly-marked provisional additions (the marquee and
-/// kbps/kHz field widths, the slider thumbs and the windowshade internals) that
-/// S01 does not pin down.
+/// plus clearly-marked additions S01 does not pin down: the marquee and
+/// kbps/kHz field widths, the slider thumbs and the windowshade internals
+/// (webamp-provisional), the time-display click band from S02 §4 and the four
+/// window-button window positions (S02 §7 gives the pressed cells but not where
+/// the buttons sit, so the positions stay webamp-provisional).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MainWindowLayout {
     /// The opaque window background: `main.bmp` at (0,0) (S01 §2.1, verified).
     pub background: Rect,
     /// The title-bar band, focused and unfocused alike (S01 §2.1, verified).
     pub title_bar: Rect,
+    /// The menu window button at (6,3), 9 x 9. **Provisional**: S02 §7 gives
+    /// the sheet cell but not the window position; this position is the webamp
+    /// cross-check.
+    pub window_menu: Rect,
+    /// The minimize window button at (244,3), 9 x 9 (S02 §7 cell; position
+    /// provisional, webamp cross-check).
+    pub window_minimize: Rect,
+    /// The windowshade window button at (254,3), 9 x 9 (S02 §7 cell; position
+    /// provisional, webamp cross-check).
+    pub window_shade: Rect,
+    /// The close window button at (264,3), 9 x 9 (S02 §7 cell; position
+    /// provisional, webamp cross-check).
+    pub window_close: Rect,
     /// The windowshade title-bar band, 275 x 14 (S01 §1/§2.1, provisional).
     pub shade_title_bar: Rect,
     /// The clutter-bar background, `titlebar.bmp` (304,0,8,43) at (10,22)
@@ -85,6 +102,9 @@ pub struct MainWindowLayout {
     pub time_digits: [Rect; 4],
     /// The remaining-time minus sign at (38,32), 5 x 1 (S01 §2.1, verified).
     pub minus_sign: Rect,
+    /// The time display's click band at (36,26), 60 x 13 (S02 §4: the click area
+    /// is the band around x = 36-96, y = 26-39).
+    pub time_display: Rect,
     /// The play/pause/stop indicator at (26,28), 9 x 9 (S01 §2.1, verified).
     pub play_indicator: Rect,
     /// The decoder-active/idle indicator at (24,28), 3 x 9 (S01 §2.1, verified).
@@ -113,6 +133,10 @@ impl MainWindowLayout {
     pub const CLASSIC: MainWindowLayout = MainWindowLayout {
         background: Rect::new(0, 0, 275, 116),
         title_bar: Rect::new(0, 0, 275, 14),
+        window_menu: Rect::new(6, 3, 9, 9),
+        window_minimize: Rect::new(244, 3, 9, 9),
+        window_shade: Rect::new(254, 3, 9, 9),
+        window_close: Rect::new(264, 3, 9, 9),
         shade_title_bar: Rect::new(0, 0, 275, 14),
         clutter_bar: Rect::new(10, 22, 8, 43),
         clutter_o: Rect::new(14, 25, 4, 6),
@@ -141,6 +165,7 @@ impl MainWindowLayout {
             Rect::new(90, 26, 9, 13),
         ],
         minus_sign: Rect::new(38, 32, 5, 1),
+        time_display: Rect::new(36, 26, 60, 13),
         play_indicator: Rect::new(26, 28, 9, 9),
         decoder_indicator: Rect::new(24, 28, 3, 9),
         stereo: Rect::new(239, 41, 29, 12),
@@ -159,6 +184,19 @@ impl MainWindowLayout {
     /// The windowshade bounds (S01 §1, verified height).
     pub const fn shade_window() -> Rect {
         Rect::new(0, 0, WINDOW_WIDTH, SHADE_HEIGHT)
+    }
+
+    /// The window position of a title-bar window button (S02 §7).
+    ///
+    /// The pressed-state **sheet cells** are verified in S02 §7; the window
+    /// positions are not in S02, so they stay provisional (webamp cross-check).
+    pub const fn window_button(&self, button: WindowButton) -> Rect {
+        match button {
+            WindowButton::Menu => self.window_menu,
+            WindowButton::Minimize => self.window_minimize,
+            WindowButton::Shade => self.window_shade,
+            WindowButton::Close => self.window_close,
+        }
     }
 
     /// The position-bar thumb rectangle for a 0..=100 position.
@@ -213,9 +251,9 @@ impl MainWindowLayout {
 
 /// The volume/balance thumb size, 14 x 11 (S01 §2.1/open question 4,
 /// provisional).
-const VOLUME_THUMB_SIZE: (u32, u32) = (14, 11);
+pub const VOLUME_THUMB_SIZE: (u32, u32) = (14, 11);
 /// The balance thumb size, 14 x 11 (S01 §2.1/open question 4, provisional).
-const BALANCE_THUMB_SIZE: (u32, u32) = (14, 11);
+pub const BALANCE_THUMB_SIZE: (u32, u32) = (14, 11);
 
 #[cfg(test)]
 mod tests {
@@ -291,10 +329,26 @@ mod tests {
             assert_eq!(got, expected, "layout rectangle {name}");
         }
         assert_eq!(l.mono, Rect::new(212, 41, 27, 12));
+        assert_eq!(l.time_display, Rect::new(36, 26, 60, 13));
         assert_eq!(l.marquee, Rect::new(111, 27, 154, 6));
         assert_eq!(l.kbps, Rect::new(111, 43, 15, 6));
         assert_eq!(l.khz, Rect::new(156, 43, 10, 6));
         assert_eq!(l.shade_position, Rect::new(226, 4, 17, 7));
+        // S02 §7 window buttons: the sheet cells are verified, the window
+        // positions are provisional (webamp cross-check).
+        assert_eq!(l.window_button(WindowButton::Menu), Rect::new(6, 3, 9, 9));
+        assert_eq!(
+            l.window_button(WindowButton::Minimize),
+            Rect::new(244, 3, 9, 9)
+        );
+        assert_eq!(
+            l.window_button(WindowButton::Shade),
+            Rect::new(254, 3, 9, 9)
+        );
+        assert_eq!(
+            l.window_button(WindowButton::Close),
+            Rect::new(264, 3, 9, 9)
+        );
     }
 
     #[test]

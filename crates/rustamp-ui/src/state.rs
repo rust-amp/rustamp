@@ -1,26 +1,19 @@
 //! What the main window is asked to draw.
 //!
 //! [`MainWindowState`] is a plain data struct: it describes a *state*, never a
-//! transition. There is no click handling, no timer and no marquee timing here
-//! — those belong to spec S02 and later cards. This module only says which
-//! sprite variants a single frame should use.
+//! transition. The transitions, the timers and the click handling live in
+//! [`crate::behaviour`]; this module only says which sprite variants a single
+//! frame should use.
+//!
+//! The transport state is the **core** [`rustamp_core::state::TransportState`],
+//! re-exported here so the UI never keeps a parallel copy (task card D2).
 
-/// The transport state the play/pause/stop indicator reflects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TransportState {
-    /// Nothing is playing: the stop indicator is drawn.
-    #[default]
-    Stopped,
-    /// Playing: the play indicator is drawn.
-    Playing,
-    /// Paused: the pause indicator is drawn.
-    Paused,
-}
+pub use rustamp_core::state::TransportState;
 
 /// A transport button that can be drawn in its pressed variant.
 ///
-/// The pressed states are **provisional** in S01 §2.1 (they were never
-/// captured); this card renders them but does not decide when they apply.
+/// S02 §7 verifies the pressed sprites (the S01 §2.1 rows are provisional);
+/// the behaviour module decides when one applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportButton {
     /// The previous button.
@@ -37,14 +30,35 @@ pub enum TransportButton {
     Eject,
 }
 
+/// One of the four window buttons in the title bar.
+///
+/// S02 §7: while a button is held it is drawn from a 9 x 9 `titlebar.bmp` cell;
+/// in the normal state the four buttons are part of the title-bar body sprite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowButton {
+    /// The menu button (top-left).
+    Menu,
+    /// The minimize button.
+    Minimize,
+    /// The windowshade button.
+    Shade,
+    /// The close button (top-right).
+    Close,
+}
+
 /// The channel mode shown by the mono/stereo indicator.
+///
+/// S02 §6 lights exactly one label while a track is playing or paused and dims
+/// both when stopped; `Unknown` (no stream info) also dims both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MonoStereo {
     /// Mono (the `mono` sprite is lit).
     Mono,
     /// Stereo (the `stereo` sprite is lit).
-    #[default]
     Stereo,
+    /// No stream info: both labels are dim (S02 §6).
+    #[default]
+    Unknown,
 }
 
 /// Everything a single main-window frame needs.
@@ -57,6 +71,10 @@ pub struct MainWindowState {
     pub transport: TransportState,
     /// The transport button currently held down, if any.
     pub pressed: Option<TransportButton>,
+    /// The window button currently held down, if any (S02 §7).
+    pub pressed_window_button: Option<WindowButton>,
+    /// Whether the position-bar thumb is held and drawn pressed (S02 §7).
+    pub position_thumb_pressed: bool,
     /// Whether the window is focused (picks the focused title bar).
     pub title_bar_focused: bool,
     /// Whether the window is drawn in windowshade form.
@@ -83,10 +101,16 @@ pub struct MainWindowState {
     pub playlist_open: bool,
     /// The time to display, in seconds.
     pub time_seconds: u32,
+    /// Whether the time display is drawn at all (S02 §4: stopped and the
+    /// blink-off phase are blank).
+    pub time_visible: bool,
     /// Whether the time is remaining (`true`) or elapsed (`false`).
     pub time_remaining: bool,
-    /// The marquee title.
+    /// The marquee text to draw. When the title scrolls this already includes
+    /// the separator and a second copy (S02 §3).
     pub title: String,
+    /// Pixels the marquee text is shifted to the left (S02 §3).
+    pub marquee_offset: i32,
     /// The bitrate shown next to `kbps`, if known.
     pub kbps: Option<u32>,
     /// The sample rate shown next to `kHz`, if known.
@@ -106,6 +130,8 @@ impl Default for MainWindowState {
         Self {
             transport: TransportState::Stopped,
             pressed: None,
+            pressed_window_button: None,
+            position_thumb_pressed: false,
             title_bar_focused: true,
             windowshade: false,
             double_size: false,
@@ -119,11 +145,13 @@ impl Default for MainWindowState {
             eq_open: false,
             playlist_open: false,
             time_seconds: 0,
+            time_visible: true,
             time_remaining: false,
             title: String::new(),
+            marquee_offset: 0,
             kbps: None,
             khz: None,
-            channels: MonoStereo::Stereo,
+            channels: MonoStereo::Unknown,
             position: 0,
             volume: 50,
             balance: 50,
@@ -136,9 +164,10 @@ impl MainWindowState {
     /// tens of seconds, seconds.
     ///
     /// `None` is the "no digit" cell (S01 §2.3, cell 10). **Provisional rule:**
-    /// S01 does not say when the leading cell is blank; this renders the tens of
-    /// minutes as the "no digit" cell while the track is under ten minutes. That
-    /// choice is an S02 question and is not a verified S01 fact.
+    /// S01 does not say when the leading cell is blank and S02 §4 does not
+    /// settle it; this renders the tens of minutes as the "no digit" cell while
+    /// the track is under ten minutes. The boundaries are exercised in the
+    /// behaviour tests.
     pub fn time_cells(&self) -> [Option<u8>; 4] {
         let total = self.time_seconds;
         let minutes = (total / 60).min(99);
@@ -160,7 +189,7 @@ impl MainWindowState {
     ///
     /// **Provisional:** S01 §2.1/§2.4 identifies the two decoder sprites but not
     /// the condition that lights the active one; this ties it to playback, which
-    /// is an S02 question.
+    /// S02 does not settle.
     pub fn decoder_active(&self) -> bool {
         self.transport == TransportState::Playing
     }
@@ -168,6 +197,11 @@ impl MainWindowState {
     /// Whether the given transport button is drawn pressed.
     pub fn is_pressed(&self, button: TransportButton) -> bool {
         self.pressed == Some(button)
+    }
+
+    /// Whether the given window button is drawn pressed (S02 §7).
+    pub fn is_window_button_pressed(&self, button: WindowButton) -> bool {
+        self.pressed_window_button == Some(button)
     }
 }
 
@@ -211,5 +245,14 @@ mod tests {
         state.pressed = Some(TransportButton::Play);
         assert!(state.is_pressed(TransportButton::Play));
         assert!(!state.is_pressed(TransportButton::Stop));
+    }
+
+    #[test]
+    fn window_button_pressed_matches_only_the_held_button() {
+        let mut state = MainWindowState::default();
+        assert!(!state.is_window_button_pressed(WindowButton::Close));
+        state.pressed_window_button = Some(WindowButton::Close);
+        assert!(state.is_window_button_pressed(WindowButton::Close));
+        assert!(!state.is_window_button_pressed(WindowButton::Shade));
     }
 }

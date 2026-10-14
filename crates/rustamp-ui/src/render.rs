@@ -8,14 +8,15 @@
 //!
 //! Provisional choices that S01 does not settle are called out in comments and
 //! in the module doc: the marquee/kbps/kHz field widths, the volume/balance
-//! frame-to-value mapping, the leading "no digit" rule and the decoder-active
-//! condition.
+//! frame-to-value mapping, the leading "no digit" rule, the decoder-active
+//! condition and the window-button window positions (S02 §7 gives the pressed
+//! sheet cells but not where the buttons sit).
 
 use rustamp_gfx::{BitmapFont, GlyphMap, Image, Rect};
 use rustamp_skin::{Sheet, Skin, webamp};
 
 use crate::layout::{MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH};
-use crate::state::{MainWindowState, MonoStereo, TransportButton, TransportState};
+use crate::state::{MainWindowState, MonoStereo, TransportButton, TransportState, WindowButton};
 
 /// The digit sprite names for `numbers.bmp`, indexed by digit value.
 const DIGIT_NAMES: [&str; 10] = [
@@ -185,6 +186,7 @@ fn render_1x(state: &MainWindowState, skin: &Skin, layout: &MainWindowLayout) ->
     );
 
     draw_clutter_bar(&mut canvas, &sheets, skin, layout, state);
+    draw_window_buttons(&mut canvas, &sheets, skin, layout, state);
     draw_transport(&mut canvas, &sheets, skin, layout, state);
     draw_toggles(&mut canvas, &sheets, skin, layout, state);
     draw_position(&mut canvas, &sheets, skin, layout, state);
@@ -287,6 +289,41 @@ fn draw_clutter_bar(
             blit_named(canvas, sheets, skin, name, rect.x, rect.y);
         }
     }
+}
+
+/// The pressed window-button sprite names (S02 §7).
+fn window_button_sprite(button: WindowButton) -> &'static str {
+    match button {
+        WindowButton::Menu => "MAIN_OPTIONS_BUTTON_DEPRESSED",
+        WindowButton::Minimize => "MAIN_MINIMIZE_BUTTON_DEPRESSED",
+        WindowButton::Shade => "MAIN_SHADE_BUTTON_DEPRESSED",
+        WindowButton::Close => "MAIN_CLOSE_BUTTON_DEPRESSED",
+    }
+}
+
+/// Draws the held window button from its 9 x 9 `titlebar.bmp` cell (S02 §7).
+///
+/// In the normal state the four buttons come from the title-bar body sprite and
+/// nothing is drawn here (S01 §2.1/S02 §7); only the held state is overlaid.
+fn draw_window_buttons(
+    canvas: &mut Image,
+    sheets: &Sheets,
+    skin: &Skin,
+    layout: &MainWindowLayout,
+    state: &MainWindowState,
+) {
+    let Some(button) = state.pressed_window_button else {
+        return;
+    };
+    let rect = layout.window_button(button);
+    blit_named(
+        canvas,
+        sheets,
+        skin,
+        window_button_sprite(button),
+        rect.x,
+        rect.y,
+    );
 }
 
 fn button_sprites(button: TransportButton) -> (&'static str, &'static str) {
@@ -402,14 +439,12 @@ fn draw_position(
         layout.position_track.y,
     );
     let thumb = layout.position_thumb_at(state.position);
-    blit_named(
-        canvas,
-        sheets,
-        skin,
-        "MAIN_POSITION_SLIDER_THUMB",
-        thumb.x,
-        thumb.y,
-    );
+    let thumb_sprite = if state.position_thumb_pressed {
+        "MAIN_POSITION_SLIDER_THUMB_SELECTED"
+    } else {
+        "MAIN_POSITION_SLIDER_THUMB"
+    };
+    blit_named(canvas, sheets, skin, thumb_sprite, thumb.x, thumb.y);
 }
 
 /// The volume frame index for a 0..=100 value.
@@ -503,6 +538,10 @@ fn draw_time(
     layout: &MainWindowLayout,
     state: &MainWindowState,
 ) {
+    // S02 §4: stopped and the blink-off phase draw a blank display.
+    if !state.time_visible {
+        return;
+    }
     let nums_ex = uses_nums_ex(skin);
     let names = if nums_ex { DIGIT_NAMES_EX } else { DIGIT_NAMES };
     let blank = if nums_ex {
@@ -568,13 +607,16 @@ fn draw_indicators(
         layout.decoder_indicator.x,
         layout.decoder_indicator.y,
     );
-    let mono = if state.channels == MonoStereo::Mono {
+    // S02 §6: the lit label follows the channel mode, but stopped (or nothing
+    // loaded) dims both labels.
+    let lit = state.transport != TransportState::Stopped;
+    let mono = if lit && state.channels == MonoStereo::Mono {
         "MAIN_MONO_SELECTED"
     } else {
         "MAIN_MONO"
     };
     blit_named(canvas, sheets, skin, mono, layout.mono.x, layout.mono.y);
-    let stereo = if state.channels == MonoStereo::Stereo {
+    let stereo = if lit && state.channels == MonoStereo::Stereo {
         "MAIN_STEREO_SELECTED"
     } else {
         "MAIN_STEREO"
@@ -632,8 +674,13 @@ fn draw_marquee(
     };
     let mut scratch = Image::new(layout.marquee.width, layout.marquee.height);
     // The classic font has no lowercase; lowercase letters select the uppercase
-    // glyphs (S01 §2.2).
-    font.render_text(&mut scratch, 0, 0, &state.title.to_ascii_lowercase());
+    // glyphs (S01 §2.2). The offset is the marquee scroll (S02 §3).
+    font.render_text(
+        &mut scratch,
+        -state.marquee_offset,
+        0,
+        &state.title.to_ascii_lowercase(),
+    );
     canvas.blit_alpha(
         &scratch,
         scratch.bounds(),

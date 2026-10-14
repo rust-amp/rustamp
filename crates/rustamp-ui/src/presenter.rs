@@ -1,25 +1,31 @@
 //! A thin `winit` + `softbuffer` presenter for the classic main window.
 //!
-//! The presenter is deliberately small: it owns a [`Skin`] and a
-//! [`MainWindowState`], renders one frame with [`render_main_window`] and blits
-//! it to a `softbuffer` surface. It handles no input beyond closing the window,
-//! so the app lane can drive it later (change the state, call
-//! [`MainWindowPresenter::set_state`] and request a redraw).
+//! The presenter owns a [`Skin`] and a headless [`MainWindow`] behaviour, reads
+//! the wall clock, injects it into the machine ([`MainWindow::refresh`]) and
+//! blits one frame to a `softbuffer` surface. The clock lives **here**, never in
+//! the behaviour module, so the machine stays deterministic.
+//!
+//! It forwards the left mouse button to the machine's [`MainWindow::mouse_down`]
+//! / [`MainWindow::mouse_move`] / [`MainWindow::mouse_up`] so the example is
+//! interactive; the commands the machine emits have no engine to reach yet, so
+//! they are dropped (the machine applies its own S02 prediction).
 //!
 //! Tests never call [`MainWindowPresenter::run`]; only the `main_window`
 //! example does, on an explicit manual run.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rustamp_gfx::Image;
 use rustamp_skin::Skin;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
+use crate::behaviour::MainWindow;
 use crate::layout::MainWindowLayout;
 use crate::render::{frame_size, render_main_window};
 use crate::state::MainWindowState;
@@ -38,46 +44,63 @@ pub enum PresenterError {
     Surface(#[from] softbuffer::SoftBufferError),
 }
 
-/// Owns the window state and paints frames.
+/// Owns the behaviour state and paints frames.
 pub struct MainWindowPresenter {
     skin: Skin,
-    state: MainWindowState,
+    window: MainWindow,
     layout: MainWindowLayout,
-    window: Option<Arc<Window>>,
+    started: Option<Instant>,
+    cursor: (i32, i32),
+    left_down: bool,
+    window_handle: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
 }
 
 impl MainWindowPresenter {
-    /// Creates a presenter for `skin`, starting from `state`.
-    pub fn new(skin: Skin, state: MainWindowState) -> Self {
+    /// Creates a presenter for `skin` and the behaviour `window`.
+    pub fn new(skin: Skin, window: MainWindow) -> Self {
         Self {
             skin,
-            state,
+            window,
             layout: MainWindowLayout::CLASSIC,
-            window: None,
+            started: None,
+            cursor: (0, 0),
+            left_down: false,
+            window_handle: None,
             surface: None,
         }
     }
 
+    /// Creates a presenter that starts from a single render state.
+    pub fn from_state(skin: Skin, state: MainWindowState) -> Self {
+        Self::new(skin, MainWindow::from_state(state))
+    }
+
+    /// The behaviour machine, for feeding events and commands.
+    pub fn window(&self) -> &MainWindow {
+        &self.window
+    }
+
+    /// The behaviour machine, mutably.
+    pub fn window_mut(&mut self) -> &mut MainWindow {
+        &mut self.window
+    }
+
     /// The state that will be painted on the next redraw.
     pub fn state(&self) -> &MainWindowState {
-        &self.state
+        self.window.state()
     }
 
-    /// Replaces the state. The window is not repainted until the platform
-    /// requests a redraw (or [`Self::request_redraw`] is called).
-    pub fn set_state(&mut self, state: MainWindowState) {
-        self.state = state;
-    }
-
-    /// Renders the current state to an RGBA frame.
-    pub fn render(&self) -> Image {
-        render_main_window(&self.state, &self.skin, &self.layout)
+    /// Renders the current state to an RGBA frame, refreshing the time-driven
+    /// parts with the elapsed clock first.
+    pub fn render(&mut self) -> Image {
+        self.window.refresh(self.elapsed_ms());
+        render_main_window(self.window.state(), &self.skin, &self.layout)
     }
 
     /// Asks the platform for a redraw.
     pub fn request_redraw(&self) {
-        if let Some(window) = &self.window {
+        if let Some(window) = &self.window_handle {
             window.request_redraw();
         }
     }
@@ -92,13 +115,28 @@ impl MainWindowPresenter {
         Ok(())
     }
 
+    fn elapsed_ms(&self) -> u64 {
+        self.started
+            .map(|started| started.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Converts a physical cursor position to the layout's 1x coordinates.
+    fn to_layout(&self, position: PhysicalPosition<f64>) -> (i32, i32) {
+        let scale = if self.window.state().double_size {
+            2.0
+        } else {
+            1.0
+        };
+        ((position.x / scale) as i32, (position.y / scale) as i32)
+    }
+
     fn paint(&mut self) {
-        let (width, height) = frame_size(&self.state);
+        let image = self.render();
+        let (width, height) = frame_size(self.window.state());
         let (Some(width), Some(height)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
             return;
         };
-        // Render before borrowing the surface, so `self` is not borrowed twice.
-        let image = self.render();
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
@@ -117,12 +155,12 @@ impl MainWindowPresenter {
 
 impl ApplicationHandler for MainWindowPresenter {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.window_handle.is_some() {
             return;
         }
-        let (width, height) = frame_size(&self.state);
+        let (width, height) = frame_size(self.window.state());
         let attributes = Window::default_attributes()
-            .with_title("Rustamp - main window (D1)")
+            .with_title("Rustamp - main window (D2)")
             .with_inner_size(PhysicalSize::new(width, height))
             .with_resizable(false);
         let window = match event_loop.create_window(attributes) {
@@ -152,7 +190,8 @@ impl ApplicationHandler for MainWindowPresenter {
         if let (Some(width), Some(height)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
             let _ = surface.resize(width, height);
         }
-        self.window = Some(window);
+        self.started = Some(Instant::now());
+        self.window_handle = Some(window);
         self.surface = Some(surface);
         self.request_redraw();
     }
@@ -161,6 +200,34 @@ impl ApplicationHandler for MainWindowPresenter {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.paint(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = self.to_layout(position);
+                if self.left_down {
+                    let now = self.elapsed_ms();
+                    let (x, y) = self.cursor;
+                    let _ = self.window.mouse_move(x, y, now);
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let now = self.elapsed_ms();
+                let (x, y) = self.cursor;
+                match state {
+                    ElementState::Pressed => {
+                        self.left_down = true;
+                        let _ = self.window.mouse_down(x, y, now);
+                    }
+                    ElementState::Released => {
+                        self.left_down = false;
+                        let _ = self.window.mouse_up(x, y, now);
+                    }
+                }
+                self.request_redraw();
+            }
             _ => {}
         }
     }

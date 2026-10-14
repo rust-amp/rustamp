@@ -45,6 +45,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rustamp-ui main_window: painting {} (close the window to exit)",
         skin.source_description()
     );
-    MainWindowPresenter::new(skin, state).run()?;
+    MainWindowPresenter::from_state(skin, state).run()?;
     Ok(())
 }

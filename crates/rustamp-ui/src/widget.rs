@@ -9,13 +9,21 @@
 //! so they are drawn but not returned here.
 
 use crate::layout::MainWindowLayout;
+use crate::state::{TransportButton, WindowButton};
 use rustamp_gfx::Rect;
 
 /// A hit-testable widget of the classic main window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Widget {
-    /// The title-bar band (drag target; the window buttons are inside its
-    /// sprite and are not split out — S01 open question 1).
+    /// The title-bar menu window button (S02 §7).
+    WindowMenu,
+    /// The title-bar minimize window button (S02 §7).
+    WindowMinimize,
+    /// The title-bar windowshade button (S02 §7).
+    WindowShade,
+    /// The title-bar close window button (S02 §7).
+    WindowClose,
+    /// The title-bar band (drag target; the window buttons sit inside it).
     TitleBar,
     /// Clutter-bar letter `O`.
     ClutterO,
@@ -65,7 +73,14 @@ pub enum Widget {
 
 impl Widget {
     /// Every hit-testable widget, in a stable order.
+    ///
+    /// The window buttons come first so [`hit_test`] returns them before the
+    /// title-bar band they sit inside.
     pub const ALL: &'static [Widget] = &[
+        Widget::WindowMenu,
+        Widget::WindowMinimize,
+        Widget::WindowShade,
+        Widget::WindowClose,
         Widget::TitleBar,
         Widget::ClutterO,
         Widget::ClutterA,
@@ -100,6 +115,10 @@ impl Widget {
     /// button, which is drawn on top.
     pub fn rect(self, layout: &MainWindowLayout) -> Rect {
         match self {
+            Widget::WindowMenu => layout.window_button(WindowButton::Menu),
+            Widget::WindowMinimize => layout.window_button(WindowButton::Minimize),
+            Widget::WindowShade => layout.window_button(WindowButton::Shade),
+            Widget::WindowClose => layout.window_button(WindowButton::Close),
             Widget::TitleBar => layout.title_bar,
             Widget::ClutterO => layout.clutter_o,
             Widget::ClutterA => layout.clutter_a,
@@ -124,16 +143,43 @@ impl Widget {
             Widget::PositionSlider => layout.position_track,
             Widget::VolumeSlider => layout.volume_track,
             Widget::BalanceSlider => layout.balance_track,
-            Widget::TimeDisplay => Rect::new(
-                layout.time_digits[0].x,
-                layout.time_digits[0].y,
-                (layout.time_digits[3].right() - layout.time_digits[0].x) as u32,
-                layout.time_digits[0].height,
-            ),
+            Widget::TimeDisplay => layout.time_display,
             Widget::Marquee => layout.marquee,
             Widget::Mono => layout.mono,
             Widget::Stereo => layout.stereo,
         }
+    }
+
+    /// The transport button this widget is, if any.
+    pub const fn transport_button(self) -> Option<TransportButton> {
+        match self {
+            Widget::Previous => Some(TransportButton::Previous),
+            Widget::Play => Some(TransportButton::Play),
+            Widget::Pause => Some(TransportButton::Pause),
+            Widget::Stop => Some(TransportButton::Stop),
+            Widget::Next => Some(TransportButton::Next),
+            Widget::Eject => Some(TransportButton::Eject),
+            _ => None,
+        }
+    }
+
+    /// The window button this widget is, if any (S02 §7).
+    pub const fn window_button(self) -> Option<WindowButton> {
+        match self {
+            Widget::WindowMenu => Some(WindowButton::Menu),
+            Widget::WindowMinimize => Some(WindowButton::Minimize),
+            Widget::WindowShade => Some(WindowButton::Shade),
+            Widget::WindowClose => Some(WindowButton::Close),
+            _ => None,
+        }
+    }
+
+    /// Whether this widget is one of the three continuous sliders.
+    pub const fn is_slider(self) -> bool {
+        matches!(
+            self,
+            Widget::PositionSlider | Widget::VolumeSlider | Widget::BalanceSlider
+        )
     }
 }
 
@@ -190,6 +236,13 @@ mod tests {
         let l = layout();
         for (i, &a) in Widget::ALL.iter().enumerate() {
             for &b in &Widget::ALL[i + 1..] {
+                // The four window buttons are nested inside the title-bar band
+                // (S02 §7); every other pair must be disjoint.
+                let nested = (a == Widget::TitleBar && b.window_button().is_some())
+                    || (b == Widget::TitleBar && a.window_button().is_some());
+                if nested {
+                    continue;
+                }
                 assert_eq!(
                     a.rect(&l).intersect(&b.rect(&l)),
                     None,
@@ -197,6 +250,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn window_buttons_sit_inside_the_title_bar_and_win_the_hit_test() {
+        let l = layout();
+        for button in [
+            WindowButton::Menu,
+            WindowButton::Minimize,
+            WindowButton::Shade,
+            WindowButton::Close,
+        ] {
+            let r = l.window_button(button);
+            assert_eq!(
+                r.intersect(&l.title_bar),
+                Some(r),
+                "{button:?} must be inside the title bar"
+            );
+        }
+        // The window buttons take priority over the band they sit in.
+        assert_eq!(hit_test(&l, 10, 7), Some(Widget::WindowMenu));
+        assert_eq!(hit_test(&l, 248, 7), Some(Widget::WindowMinimize));
+        assert_eq!(hit_test(&l, 258, 7), Some(Widget::WindowShade));
+        assert_eq!(hit_test(&l, 268, 7), Some(Widget::WindowClose));
+        assert_eq!(hit_test(&l, 137, 7), Some(Widget::TitleBar));
     }
 
     #[test]
