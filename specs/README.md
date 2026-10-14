@@ -9,8 +9,8 @@ Specs reach this directory only after the Spec Auditor has signed off. Each file
 | ID | Title | Status |
 |---|---|---|
 | S01 | Window geometry, sprite rects and pixel layout deltas | audited |
-| S02 | Main window behaviors (clutterbar, title marquee, time display, kbps/kHz, mono/stereo, button states) | not started |
-| S03 | Keyboard and mouse shortcut table, per window | not started |
+| S02 | Main window behaviors (clutterbar, title marquee, time display, kbps/kHz, mono/stereo, button states) | audited |
+| S03 | Keyboard and mouse shortcut table, per window | audited |
 | S04 | Menu trees (main, right-click, playlist buttons, EQ presets) | not started |
 | S05 | Docking and snapping rules | not started |
 | S06 | Playlist editor (selection, drag-reorder, scrolling, search, resize steps) | not started |
