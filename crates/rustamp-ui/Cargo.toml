@@ -10,3 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+rustamp-skin.workspace = true
+rustamp-gfx.workspace = true
+winit.workspace = true
+softbuffer.workspace = true
