@@ -1,6 +1,6 @@
 # Handoff: Rustamp project takeover
 
-Status as of **2026-10-14**, end of the first session (Claude Code orchestrator). This document is everything a new agent needs to continue the work. Read it completely before you do anything.
+Status as of **2026-10-14**, after the second session (OpenCode orchestrator): lanes A (audio engine), C (skin/gfx), E (playlist I/O) and G (shared-memory rings) are integrated on `main`, and the dirty room is capturing 2.95 references for S01/S17. This document is everything a new agent needs to continue the work. Read it completely before you do anything.
 
 ---
 
@@ -64,45 +64,55 @@ Tools available: Rust 1.99 stable with the targets `x86_64-pc-windows-msvc` and 
 
 ---
 
-## 4. What exists (milestone M0 complete, M1 started)
+## 4. What exists (M0 complete, M1 well started)
 
-Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resolver 3. **55 tests green**; fmt and clippy (`-D warnings`) are clean, and the i686 build of the plugin host works.
+Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resolver 3. **295 tests green** (`cargo test --workspace --all-features`); fmt and clippy (`-D warnings`) are clean, the i686 tests of `rustamp-ipc` and `rustamp-plugin-abi` pass, and the i686 build of the plugin host works.
 
 | Crate | Status |
 |---|---|
-| `rustamp-core` | **Contracts frozen** (see [RFC 0001](rfc/0001-core-contracts.md)): `Command`, `Event`, `PlayerState`, `EqState`, `WindowId`, `Decoder`/`DecoderFactory`/`DecoderRegistry`, a pull-based `OutputDevice` (`open` → `start(RenderFn)`), `DspStage`, `VisFrame` (2×576 waveform and spectrum), the concrete `Playlist` with stable `EntryId`s, `TrackMetadata`, `Config` (serde/TOML), the bus (`command_channel`, `EventBus`), and the `mock` feature (MockDecoder, NullOutput, MockDsp). Units: ms as `u64`, volume `u8` 0–255, balance `i8`, EQ in dB as `f32`. **Contract changes only through a new RFC in `docs/rfc/`** |
-| `rustamp-ipc` | Protocol v0 (`Message` enum, postcard), `Transport` trait, `MemoryTransport`, `StreamTransport`, u32-LE length framing (16 MiB cap). Shared-memory rings for PCM and vis data are still missing |
+| `rustamp-core` | **Contracts frozen** (see [RFC 0001](rfc/0001-core-contracts.md)): `Command`, `Event`, `PlayerState`, `EqState`, `WindowId`, `Decoder`/`DecoderFactory`/`DecoderRegistry`, a pull-based `OutputDevice` (`open` → `start(RenderFn)`), `DspStage`, `VisFrame` (2×576 waveform and spectrum), the concrete `Playlist` with stable `EntryId`s, `TrackMetadata`, `Config` (serde/TOML), the bus (`command_channel`, `EventBus`), and the `mock` feature (MockDecoder, NullOutput, MockDsp). Units: ms as `u64`, volume `u8` 0–255, balance `i8`, EQ in dB as `f32`. **Contract changes only through a new RFC in `docs/rfc/`.** [RFC 0002](rfc/0002-audio-contracts.md) (accepted) added `Decoder::skipped_packets()`, `ReadSeek: Send + Sync` and `Error::FormatChanged` + `ErrorKind::FormatChanged`. `Playlist::apply_order`/`insert_many` are linear now (internal) |
+| `rustamp-ipc` | Protocol **v1** (`Message`, postcard; `RingOffer`/`RingReady`/`RingRefused` added), `Transport` trait, `MemoryTransport`, `StreamTransport`, u32-LE length framing (16 MiB cap), and **shared-memory SPSC rings** for PCM and vis data per [RFC 0003](rfc/0003-shm-rings.md): byte-identical layout on x86/x86_64, lock-free, allocation-free, generation-guarded. RFC 0003's open questions Q1–Q5 are follow-ups |
 | `rustamp-plugin-abi` | **Done, per S09**: `#[repr(C)]` types `InModule`/`InModuleExt`, `OutModule`, `VisHeader`/`VisModule`, `DspHeader`/`DspHeader5x`/`DspModule`, `GeneralPlugin`, constants and export names. 116 layout asserts (x86). Open points are in `crates/rustamp-plugin-abi/OPEN_QUESTIONS.md` |
 | `rustamp-decoders` | **Done**: symphonia 0.5.5 for MP3, FLAC, Vorbis, WAV, AIFF, CAF, AAC and ALAC (MP4), and MKA. Gapless, sample-accurate seeking (4096-frame pre-roll), skips corrupt packets, metadata, `default_registry()`, 25 tests. **No Opus** (needs libopus via FFI). Contract proposals are in `crates/rustamp-decoders/CONTRACT_NOTES.md` |
+| `rustamp-audio` | **Engine (M1)**: decode thread → `rtrb` ring → output callback with no allocation or lock on the render path, transport from `Command`, events on the bus, gapless, frame-accurate seek, volume/balance gain, format conversion, raw vis tap. CLI: `cargo run -p rustamp-audio --example play -- <file>` (`--null`, `--output`, `--volume`). Resampler is linear interpolation; the EQ/DSP chain and `rubato` come with S07/M2 |
+| `rustamp-output` | `NullOutput` with a driveable clock (test double), WASAPI **shared** mode, cpal fallback, `default_output()`. Exclusive mode, device-change recovery and `out_disk` come later |
+| `rustamp-skin` | **Loader**: `.wsz`/`.zip`/folder, BMP 1/4/8/16/24/32 bpp incl. `BI_RLE8`, `pledit.txt`, `viscolor.txt`, `region.txt`, cursors, per-file fallback with a substitution report, sprite table. Sprite rects and default colours are ported from webamp (MIT) and marked provisional until S01/S17. `CONTRACT_NOTES.md` in the crate |
+| `rustamp-gfx` | RGBA canvas with clipped blits, integer 2× scaling, `text.bmp` and `numbers`/`nums_ex` bitmap fonts |
+| `rustamp-playlist` | **I/O**: M3U/M3U8/PLS/XSPF read and write, content sniffing, relative-path resolution, Windows-1252 fallback, seeded `randomize`/`shuffle` helpers. B4S unsupported (no public format description available); the shuffle sequence (S15) and title formatting (S14) are open. `CONTRACT_NOTES.md` in the crate |
 | `rustamp-testkit` | PNG load and save, `compare`/`Diff`, `write_diff_image`, the `Snapshot` trait, `assert_golden` (bless via `RUSTAMP_BLESS=1`). The `lookalike` skin namespace is in the repo; `classic-base` comes from `$RUSTAMP_TESTDATA` and is skipped when that variable is unset |
 | `xtask` | `cargo xtask golden [--bless] [--skin]`, `cargo xtask capture --list / --class / --title / --out / --client-only` (generic Win32 window capture), `cargo xtask plughost [--release]`; `package` is still a stub |
-| everything else | Stubs (a `lib.rs` with doc comments only): audio, dsp, output, meta, playlist, skin, gfx, ui, vis, milkdrop, platform, prefs, library; app and plughost are `main` stubs |
+| everything else | Stubs (a `lib.rs` with doc comments only): dsp, meta, ui, vis, milkdrop, platform, prefs, library; app and plughost are `main` stubs |
 
 **Docs:**
 - `specs/S09-plugin-abi.md`: audited, statically validated; runtime confirmation against 2.95 is still pending. The other specs (S01–S20) are not started; see `specs/README.md`.
 - `docs/notes/W-wacup-changelog.md`: WACUP digest. A sample of only 9 out of ~300 entries.
+- `docs/rfc/0002-audio-contracts.md` and `docs/rfc/0003-shm-rings.md`: accepted.
+- `docs/tasks/`: the task cards of waves 1 and 2 (`A1`, `C1`, `E1`, `G1`), each with goal, owned paths, allowed and forbidden sources, spec dependencies, contract and acceptance tests.
 
 ---
 
 ## 5. Open points
 
-1. **RFC 0002 (core contracts).** Bundle these three changes:
-   - Add `Decoder::skipped_packets()`, defaulting to 0.
-   - Make `ReadSeek` require `Send + Sync`. The decoder currently wraps its reader in a `Mutex`.
-   - Add a signal for a format change mid-stream (an error variant or event).
-2. **Unicode paths over IPC.** A `PathBuf` that is not valid UTF-8 cannot be encoded yet (the fix would be WTF-8 or u16).
-3. **`WindowId::Gen(u32)`** still has no numbering scheme.
-4. **Value ranges.** The EQ (±12 dB), volume and balance ranges are provisional until S02 and S07 exist.
-5. **S09 open items**, to be checked at runtime against the real 2.95:
+1. **RFC 0002 is done and accepted.** Follow-up for the decoders lane: drop the now-redundant `Mutex` in the decoder's reader wrapper (the `Sync` bound makes it unnecessary) and fix the wording in its `CONTRACT_NOTES.md`.
+2. **Contract questions raised by the lanes.**
+   - `rustamp-playlist` (`CONTRACT_NOTES.md`): `PlaylistEntry` has no field for `#EXTART`/`#EXTALBUM`/XSPF `<creator>` — decide together with S14 whether to add fields or an `extra` map; confirm that non-`http` schemes become `MediaLocation::Url`.
+   - `rustamp-ipc` (RFC 0003, Q1–Q5): a blocking consumer (event or semaphore), a private DACL or `Global\`-scoped name, folding `RingError` into `IpcError`, a late-joiner consumer that starts at the newest frame, and a compact header.
+   - **Verification gap:** there is no end-to-end cross-bitness ring test (32-bit producer against 64-bit consumer). It needs a small `xtask`/test-kit helper binary.
+   - `rustamp-audio`: if the engine must expose playlist `EntryId`s (`TrackChanged.id` is `None` today), that is a public-surface change and needs an RFC.
+3. **Unicode paths over IPC.** A `PathBuf` that is not valid UTF-8 cannot be encoded yet (the fix would be WTF-8 or u16).
+4. **`WindowId::Gen(u32)`** still has no numbering scheme.
+5. **Value ranges.** The EQ (±12 dB), volume and balance ranges are provisional until S02 and S07 exist. The engine's provisional volume/balance laws live in `rustamp-audio/src/gain.rs`, the vis derivation is deliberately left at "raw last 576 samples, spectrum zero" until S08.
+6. **S09 open items**, to be checked at runtime against the real 2.95:
    - The vis-plugin thread model.
    - The sign and scaling of the 576-sample data.
    - The order of DSP and EQ.
    - Which callbacks may be null.
    - Version acceptance.
    - The full WM_COMMAND ID table.
-6. **MilkDrop 2 needs a 5.x host.** It requires several 5.x IPC calls and the HWND entry point, so the plugin host must emulate a partial 5.x IPC surface (relevant for S10).
-7. **AVS 2.81d** has not been found as a separate installer; AVS ships with Winamp 5.66. **MilkDrop 1.04** returns a 404. **in_vgm, in_sid, a DSP plugin and a scrobbler gen plugin** have not been found yet.
-8. CI (`.github/workflows/ci.yml`) has not run yet: there is no GitHub remote.
+7. **Spec requests collected from the lanes:** S06 (exact Sort/Randomize menu entries, sort stability, remembering the loaded format), S14 (is `PlaylistEntry::title` the formatted or the raw title; which fields feed `%1`–`%7`), S15 (when is the shuffle sequence built and invalidated; does the current entry stay current; where does the seed come from), S08 (waveform/spectrum derivation, publish cadence, `timestamp_us`), S02/S07 (volume slider law, balance law), S18 (fades/prebuffering), and a public description of **B4S**.
+8. **MilkDrop 2 needs a 5.x host.** It requires several 5.x IPC calls and the HWND entry point, so the plugin host must emulate a partial 5.x IPC surface (relevant for S10).
+9. **AVS 2.81d** has not been found as a separate installer; AVS ships with Winamp 5.66. **MilkDrop 1.04** returns a 404. **in_vgm, in_sid, a DSP plugin and a scrobbler gen plugin** have not been found yet.
+10. CI (`.github/workflows/ci.yml`) has not run yet: there is no GitHub remote.
 
 ---
 
@@ -110,25 +120,16 @@ Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resol
 
 Each task is a task card (template: `.github/ISSUE_TEMPLATE/task-card.md`): goal, lane, owned paths, allowed and forbidden sources, specs, contract, acceptance tests. Two parallel agents must have **disjoint owned paths**, and the root `Cargo.toml` belongs to one agent at most.
 
-**Wave 1 (recommended to start next):**
-1. **Lane A, audio engine** (`rustamp-audio`, `rustamp-output`; also does RFC 0002 in core):
-   - Decode thread, then an `rtrb` ring, then the output callback, with no allocations or locks in the real-time path.
-   - Transport commands from `Command`, events onto the `EventBus`.
-   - Gapless track transitions; position from `played_frames`.
-   - WASAPI shared output (`wasapi` crate), with `cpal` as fallback; a `NullOutput` test.
-   - Volume and balance; a vis tap that fills `VisFrame` with the raw form for now (the S08 derivation comes later).
-   - Goal: a CLI example that plays a file.
-2. **Lane C, skin parser** (`rustamp-skin`, `rustamp-gfx`):
-   - Load .wsz, .zip or folders.
-   - Read BMPs at every bit depth, case-insensitive file names, `pledit.txt`, `viscolor.txt`, `region.txt`, cursors.
-   - Port the **sprite tables from webamp** (MIT, `skinSprites`/`skinParser`) with attribution in `THIRD_PARTY.md`.
-   - Fall back to the default skin when files are missing.
-   - Compositor with blit, integer scaling and bitmap fonts (`text.bmp`, `numbers`/`nums_ex`).
-   - Test against a corpus of real skins (the webamp skin museum; ask the user before downloading).
+**Now running (2026-10-14, second session):** the dirty room is installing Winamp 2.95 into a sandbox and capturing references with the original base skin, then writing **S01** and **S17**, followed by S02/S03/S07 as budget allows; drafts go to `rustamp-research` and only reach `specs/` after the Spec Auditor's PASS. The clean lanes have no free slot until then. Candidate follow-ups when a slot frees: the cross-bitness ring helper (see open point 2), `rustamp-meta` (needs a `lofty` dependency decision), the `rustamp-core` follow-ups from RFC 0002, and Lane D's main window (blocked on S01/S02).
+
+**Wave 1 — DONE and integrated on `main`:**
+1. **Lane A, audio engine** (`rustamp-audio`, `rustamp-output`, RFC 0002 in core): decode thread, `rtrb` ring, output callback, transport, gapless, WASAPI shared, cpal fallback, `NullOutput`, volume/balance, raw vis tap, CLI example. **Integrated as `c73d33d`; RFC 0002 accepted.**
+2. **Lane C, skin parser** (`rustamp-skin`, `rustamp-gfx`): `.wsz`/`.zip`/folder loading, BMP at every bit depth, `pledit.txt`/`viscolor.txt`/`region.txt`, cursors, per-file fallback, webamp sprite tables with attribution, compositor with blits, integer scaling and bitmap fonts. **Integrated as `cee2782`; the sprite tables stay provisional until S01/S17.**
 
 **Wave 2:**
-3. **Lane E, playlist** (`rustamp-playlist`): M3U, M3U8, PLS, B4S and XSPF I/O, sort and randomize. `rustamp-meta`: tags via `lofty` and title formatting (wait for S14).
-4. **Dirty room, separate agent:** install Winamp 2.95 into a **sandbox folder** (**ask the user first**), drive it with `cargo xtask capture`, and capture reference screenshots of every window and state with the original skin. Then write **S01** (geometry), **S02** (main window behavior), **S03** (shortcuts) and **S07** (EQ: band frequencies, filter design, slider mapping; render sweeps through `out_disk`). Every spec then goes through the Spec Auditor before it is exported.
+3. **Lane E, playlist** (`rustamp-playlist`): **I/O done** — M3U, M3U8, PLS and XSPF, sort and randomize. **Integrated as `3178813`.** Still open: B4S (needs a public format description), the shuffle sequence (S15) and title formatting. `rustamp-meta`: tags via `lofty` and title formatting (wait for S14).
+4. **Lane G, shared-memory rings** (`rustamp-ipc`): PCM and vis rings, RFC 0003. **Integrated as `881b776`; RFC 0003 accepted.**
+5. **Dirty room, separate agent:** install Winamp 2.95 into a **sandbox folder** (**ask the user first**), drive it with `cargo xtask capture`, and capture reference screenshots of every window and state with the original skin. Then write **S01** (geometry), **S02** (main window behavior), **S03** (shortcuts) and **S07** (EQ: band frequencies, filter design, slider mapping; render sweeps through `out_disk`). Every spec then goes through the Spec Auditor before it is exported. **In progress.**
 
 **After that (M1/M2):**
 - Lane D, UI windows with `winit` + `softbuffer`. Order: main window, EQ, playlist, then docking/snapping, windowshade and double-size. This needs S01–S06.
@@ -146,6 +147,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test -p rustamp-plugin-abi --target i686-pc-windows-msvc
+cargo test -p rustamp-ipc --target i686-pc-windows-msvc
 cargo build -p rustamp-plughost --target i686-pc-windows-msvc
 cargo xtask golden
 ```
