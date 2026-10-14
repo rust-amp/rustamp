@@ -1737,6 +1737,7 @@ dependencies = [
  "rustamp-gfx",
  "rustamp-skin",
  "softbuffer",
+ "thiserror 2.0.21",
  "winit",
 ]
 
