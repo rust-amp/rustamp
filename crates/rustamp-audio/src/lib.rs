@@ -1,7 +1,58 @@
 //! # rustamp-audio
 //!
-//! Engine threads, transport, gapless playback, ReplayGain, crossfade and
-//! fades, and the visualization tap (decode -> DSP -> output).
+//! The audio engine: decode thread -> lock-free ring -> output callback, with
+//! transport, gapless playback, volume/balance and the visualization tap.
 //!
-//! Skeleton (milestone M0). Codes against the frozen contracts in
-//! [`rustamp_core`]; see `docs/rfc/0001-core-contracts.md`.
+//! ```no_run
+//! use rustamp_audio::{Engine, EngineConfig};
+//! use rustamp_core::bus::EventBus;
+//! use rustamp_output::default_output;
+//! # fn main() -> rustamp_core::Result<()> {
+//! let engine = Engine::new(
+//!     rustamp_decoders::default_registry(),
+//!     default_output(),
+//!     EventBus::new(),
+//!     EngineConfig::default(),
+//! )?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Pipeline
+//!
+//! ```text
+//! decode thread:  Decoder -> [DspStage]* -> FormatConverter -> rtrb::Producer
+//! output thread:  rtrb::Consumer -> volume/balance -> OutputDevice
+//! caller thread:  Engine (commands, events, audio clock, vis tap)
+//! ```
+//!
+//! The ring is a lock-free SPSC buffer; the render callback fills the whole
+//! device buffer, writes silence on underrun and neither allocates nor locks
+//! nor logs. Position comes from [`rustamp_core::audio::OutputDevice::played_frames`].
+//!
+//! Modules:
+//!
+//! * [`engine`] — [`Engine`], transport, events, the audio clock.
+//! * [`decode`] — the decode thread and the [`TrackSource`] queue.
+//! * [`ring`] — the ring and the seek/flush handshake.
+//! * [`convert`] — engine format -> device format (rate and channels).
+//! * [`gain`] — the single place where volume/balance become gains.
+//! * [`vistap`] — [`VisTap`], the 2 x 576 waveform tap (spectrum: spec S08).
+//!
+//! See `docs/rfc/0002-audio-contracts.md` for the `rustamp-core` changes this
+//! crate needs.
+
+#![warn(missing_docs)]
+
+pub mod convert;
+pub mod decode;
+pub mod engine;
+pub mod gain;
+pub mod ring;
+pub mod vistap;
+
+pub use convert::FormatConverter;
+pub use decode::TrackSource;
+pub use engine::{Engine, EngineConfig};
+pub use ring::{GainState, RingSync};
+pub use vistap::VisTap;

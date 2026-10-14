@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::AudioSpec;
+
 /// Result alias using [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -26,6 +28,16 @@ pub enum Error {
     /// The operation is not supported (e.g. seeking in a live stream).
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
+    /// The stream changed format mid-stream (RFC 0002, C3). The decoder has
+    /// already switched: [`Decoder::spec`](crate::audio::Decoder::spec) reports
+    /// `to`, and `read` may be called again to continue.
+    #[error("stream format changed: {from:?} -> {to:?}")]
+    FormatChanged {
+        /// Format before the change.
+        from: AudioSpec,
+        /// Format after the change.
+        to: AudioSpec,
+    },
     /// An argument was out of range or otherwise invalid.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
@@ -56,6 +68,9 @@ pub enum ErrorKind {
     Output,
     /// Anything else.
     Other,
+    /// The stream changed format mid-stream (RFC 0002, C4). Appended at the end
+    /// so existing serialized values keep their index.
+    FormatChanged,
 }
 
 /// Serializable description of an error, used by `Event::Error`.
@@ -74,11 +89,31 @@ impl From<&Error> for ErrorInfo {
             Error::UnsupportedFormat(_) => ErrorKind::UnsupportedFormat,
             Error::Decode(_) => ErrorKind::Decode,
             Error::Output(_) => ErrorKind::Output,
+            Error::FormatChanged { .. } => ErrorKind::FormatChanged,
             _ => ErrorKind::Other,
         };
         ErrorInfo {
             kind,
             message: e.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_changed_keeps_its_kind_and_specs() {
+        // RFC 0002, C3/C4: the engine can tell a format change from a decode
+        // failure and can name both formats.
+        let e = Error::FormatChanged {
+            from: AudioSpec::new(44100, 2),
+            to: AudioSpec::new(48000, 1),
+        };
+        let info = ErrorInfo::from(&e);
+        assert_eq!(info.kind, ErrorKind::FormatChanged);
+        assert!(info.message.contains("48000"), "{}", info.message);
+        assert!(info.message.contains("44100"), "{}", info.message);
     }
 }

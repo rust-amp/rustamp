@@ -58,8 +58,13 @@ impl AudioSpec {
 // ---------------------------------------------------------------------------
 
 /// A readable, seekable byte stream.
-pub trait ReadSeek: Read + Seek + Send {}
-impl<T: Read + Seek + Send> ReadSeek for T {}
+///
+/// `Sync` is required as well (RFC 0002, C2): symphonia's `MediaSource` is
+/// `Send + Sync`, and a plain `Send` bound forced the decoder crate to wrap
+/// the reader in a `Mutex`. A reader that is not `Sync` has to be wrapped by
+/// the caller.
+pub trait ReadSeek: Read + Seek + Send + Sync {}
+impl<T: Read + Seek + Send + Sync> ReadSeek for T {}
 
 /// Where a decoder reads from.
 pub enum MediaSource {
@@ -69,7 +74,7 @@ pub enum MediaSource {
     Url(String),
     /// An already-open byte stream (archives, tests, HTTP buffers).
     Reader {
-        /// The stream, positioned at 0.
+        /// The stream, positioned at 0. `Send + Sync` (RFC 0002, C2).
         reader: Box<dyn ReadSeek>,
         /// File extension hint without dot (e.g. `"mp3"`).
         extension: Option<String>,
@@ -131,12 +136,20 @@ impl MediaSource {
 /// `Sync`. `read` may block on I/O but must not block indefinitely on live
 /// streams without returning data or an error.
 pub trait Decoder: Send {
-    /// Output format. Fixed for the lifetime of the decoder.
+    /// Output format.
+    ///
+    /// Fixed for the lifetime of the decoder, with one exception: after `read`
+    /// returned `Err(Error::FormatChanged { .. })` (RFC 0002, C3) this reports
+    /// the new format and further `read` calls continue in it.
     fn spec(&self) -> AudioSpec;
 
     /// Fill `out` with whole frames; `out.len()` must be a multiple of
     /// `spec().channels`. Returns the number of **frames** written; `Ok(0)`
     /// means end of stream. May return fewer frames than requested.
+    ///
+    /// `Err(Error::FormatChanged { .. })` means the stream changed format
+    /// (RFC 0002, C3): no frames were written, `spec()` reports the new format,
+    /// and the caller may call `read` again to continue.
     fn read(&mut self, out: &mut [f32]) -> Result<usize>;
 
     /// Seek to `to`; returns the position actually reached (which may differ
@@ -164,6 +177,15 @@ pub trait Decoder: Send {
     /// Whether [`Decoder::seek`] is expected to work.
     fn is_seekable(&self) -> bool {
         self.duration().is_some()
+    }
+
+    /// Number of packets/units skipped because they could not be decoded since
+    /// the stream was opened (RFC 0002, C1). A damage counter, not an error:
+    /// `0` for a clean stream and for decoders that cannot tell.
+    ///
+    /// Not reset by [`Decoder::seek`].
+    fn skipped_packets(&self) -> u64 {
+        0
     }
 }
 
@@ -383,5 +405,29 @@ mod tests {
         assert_eq!(s.samples_for(10), 20);
         assert_eq!(s.frames_in(20), 10);
         assert_eq!(s.duration_of(44100), Duration::from_secs(1));
+    }
+
+    /// Minimal decoder used to check the provided trait methods.
+    struct Minimal;
+
+    impl Decoder for Minimal {
+        fn spec(&self) -> AudioSpec {
+            AudioSpec::new(8000, 1)
+        }
+        fn read(&mut self, _out: &mut [f32]) -> Result<usize> {
+            Ok(0)
+        }
+        fn seek(&mut self, _to: Duration) -> Result<Duration> {
+            Ok(Duration::ZERO)
+        }
+        fn duration(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    #[test]
+    fn skipped_packets_defaults_to_zero() {
+        // RFC 0002, C1: a decoder that cannot tell reports no damage.
+        assert_eq!(Minimal.skipped_packets(), 0);
     }
 }

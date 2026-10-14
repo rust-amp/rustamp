@@ -773,11 +773,11 @@ dependencies = [
 name = "rustamp-audio"
 version = "0.0.1"
 dependencies = [
- "cpal",
  "rtrb",
  "rustamp-core",
  "rustamp-decoders",
- "wasapi",
+ "rustamp-output",
+ "tempfile",
 ]
 
 [[package]]
@@ -853,7 +853,6 @@ name = "rustamp-output"
 version = "0.0.1"
 dependencies = [
  "cpal",
- "rtrb",
  "rustamp-core",
  "wasapi",
 ]
