@@ -66,7 +66,7 @@ Tools available: Rust 1.99 stable with the targets `x86_64-pc-windows-msvc` and 
 
 ## 4. What exists (M0 complete, M1 well started)
 
-Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resolver 3. **320 tests green** (`cargo test --workspace --all-features`); fmt and clippy (`-D warnings`) are clean, the i686 tests of `rustamp-ipc` and `rustamp-plugin-abi` pass, and the i686 build of the plugin host works. The workspace declares `rust-version = "1.99"` (see `CONTRIBUTING.md`).
+Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resolver 3. **348 tests green** (`cargo test --workspace --all-features`); fmt and clippy (`-D warnings`) are clean, the i686 tests of `rustamp-ipc` and `rustamp-plugin-abi` pass, `cargo xtask ring-cross` passes all four combinations, and the i686 build of the plugin host works. The workspace declares `rust-version = "1.99"` (see `CONTRIBUTING.md`).
 
 | Crate | Status |
 |---|---|
@@ -80,9 +80,10 @@ Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resol
 | `rustamp-gfx` | RGBA canvas with clipped blits, integer 2× scaling, `text.bmp` and `numbers`/`nums_ex` bitmap fonts |
 | `rustamp-playlist` | **I/O**: M3U/M3U8/PLS/XSPF read and write, content sniffing, relative-path resolution, Windows-1252 fallback, seeded `randomize`/`shuffle` helpers. B4S unsupported (no public format description available); the shuffle sequence (S15) and title formatting (S14) are open. `CONTRACT_NOTES.md` in the crate |
 | `rustamp-meta` | **Tags (M1)**: reads and writes tags through `lofty` 0.25 onto `TrackMetadata` with a fixed precedence (primary tag, then ID3v2, Vorbis comments, MP4 ilst, APE, ID3v1, RIFF info, AIFF text), the track/disc pair forms, best-attempt parsing so malformed tag bytes never panic, artwork as a raw-bytes side channel, and a batch scan returning one result per path. Properties are deliberately not scanned, so `duration_ms`/`bitrate_kbps` stay `None` for the decoder to fill. Winamp title formatting is deferred to S14. `CONTRACT_NOTES.md` in the crate |
+| `rustamp-ui` | **Main window (M1)**: `MainWindowLayout` with every S01 rectangle in one place, a plain `MainWindowState` (transport, clutterbar, shuffle/repeat, shade, double-size, time, title, kbps/kHz, mono/stereo, slider values — **no** transitions), a renderer that paints a frame through `rustamp-gfx`, `hit_test` over 23 widgets, and a `winit` + `softbuffer` presenter with integer 2× double-size. Example: `cargo run -p rustamp-ui --example main_window -- <skin>`. Behaviour (state machine, clicks, timers) waits for S02 |
 | `rustamp-testkit` | PNG load and save, `compare`/`Diff`, `write_diff_image`, the `Snapshot` trait, `assert_golden` (bless via `RUSTAMP_BLESS=1`). The `lookalike` skin namespace is in the repo; `classic-base` comes from `$RUSTAMP_TESTDATA` and is skipped when that variable is unset |
 | `xtask` | `cargo xtask golden [--bless] [--skin]`, `cargo xtask capture --list / --class / --title / --out / --client-only` (generic Win32 window capture), `cargo xtask ring-cross` (32-bit vs 64-bit shared-memory ring check), `cargo xtask plughost [--release]`; `package` is still a stub |
-| everything else | Stubs (a `lib.rs` with doc comments only): dsp, ui, vis, milkdrop, platform, prefs, library; app and plughost are `main` stubs |
+| everything else | Stubs (a `lib.rs` with doc comments only): dsp, vis, milkdrop, platform, prefs, library; app and plughost are `main` stubs |
 
 **Docs:**
 - `specs/S09-plugin-abi.md`: audited, statically validated; runtime confirmation against 2.95 is still pending. The other specs (S01–S20) are not started; see `specs/README.md`.
@@ -112,6 +113,7 @@ Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resol
    - Version acceptance.
    - The full WM_COMMAND ID table.
 7. **Spec requests collected from the lanes:** S06 (exact Sort/Randomize menu entries, sort stability, remembering the loaded format), S14 (is `PlaylistEntry::title` the formatted or the raw title; which fields feed `%1`–`%7`), S15 (when is the shuffle sequence built and invalidated; does the current entry stay current; where does the seed come from), S08 (waveform/spectrum derivation, publish cadence, `timestamp_us`), S02/S07 (volume slider law, balance law), S18 (fades/prebuffering), and a public description of **B4S**.
+8. **Open rendering questions the UI lane exposed** (all S01/S02 gaps, not bugs): the `nums_ex.bmp` cell layout is still unmeasured (S01 open question 6, S17 §3) so `nums_ex` skins draw at the `numbers.bmp` positions; the `text.bmp` opacity rule (colour key vs. opaque blit) is ambiguous in S01; the shade internals and the marquee/kbps/kHz field widths are webamp-provisional; and the rendering rules for the leading "no digit" cell, the decoder-active condition and the volume/balance frame mapping are provisional guesses that S02 must settle.
 8. **MilkDrop 2 needs a 5.x host.** It requires several 5.x IPC calls and the HWND entry point, so the plugin host must emulate a partial 5.x IPC surface (relevant for S10).
 9. **AVS 2.81d** has not been found as a separate installer; AVS ships with Winamp 5.66. **MilkDrop 1.04** returns a 404. **in_vgm, in_sid, a DSP plugin and a scrobbler gen plugin** have not been found yet.
 10. CI (`.github/workflows/ci.yml`) has not run yet: there is no GitHub remote.

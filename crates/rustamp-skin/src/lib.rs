@@ -15,12 +15,14 @@
 //! [`Substitution`]). `nums_ex.bmp` falls back to `numbers.bmp`, and a missing
 //! main-window sheet falls back to the default skin.
 //!
-//! ## Provisional tables
+//! ## Sprite tables
 //!
-//! The sprite rectangles and default colours in [`webamp`] are ported from
-//! webamp (MIT) and are **provisional** until specs **S01** (geometry) and
-//! **S17** (skin quirks) exist. Every value carries a
-//! `// provisional: webamp, pending S01/S17` marker.
+//! The sprite rectangles and default colours in [`webamp`] were ported from
+//! webamp (MIT) and are now **reconciled with the audited spec S01**
+//! (`specs/S01-window-geometry.md`): every value cites the S01 section that
+//! measured it, and the rows S01 still calls provisional keep a
+//! `// provisional: webamp, pending S01/S17` marker. Fallback behaviour follows
+//! the audited spec S17.
 //!
 //! Codes against the frozen core contract in [`rustamp_core`]; see
 //! `docs/rfc/0001-core-contracts.md`.
