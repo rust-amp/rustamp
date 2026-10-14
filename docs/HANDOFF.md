@@ -86,7 +86,8 @@ Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resol
 | everything else | Stubs (a `lib.rs` with doc comments only): dsp, vis, milkdrop, platform, prefs, library; app and plughost are `main` stubs |
 
 **Docs:**
-- `specs/S09-plugin-abi.md`: audited, statically validated; runtime confirmation against 2.95 is still pending. The other specs (S01–S20) are not started; see `specs/README.md`.
+- `specs/S01-window-geometry.md`, `S02-main-window-behaviour.md`, `S03-shortcuts.md`, `S09-plugin-abi.md`, `S17-skin-loading-quirks.md`: audited. S01 round 2 (equalizer interior, playlist upper half) is drafted but not exported. The rest (S04–S08, S10–S16, S18–S20) are not started; see `specs/README.md`.
+- `docs/notes/L-licensing-plugins.md`: licensing research (proprietary and GPL-incompatible plugins, options, consequences per source, recommendation). Not legal advice.
 - `docs/notes/W-wacup-changelog.md`: WACUP digest. A sample of only 9 out of ~300 entries.
 - `docs/rfc/0002-audio-contracts.md` and `docs/rfc/0003-shm-rings.md`: accepted.
 - `docs/tasks/`: the task cards of waves 1 and 2 (`A1`, `C1`, `E1`, `G1`), each with goal, owned paths, allowed and forbidden sources, spec dependencies, contract and acceptance tests.
@@ -114,6 +115,13 @@ Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resol
    - The full WM_COMMAND ID table.
 7. **Spec requests collected from the lanes:** S06 (exact Sort/Randomize menu entries, sort stability, remembering the loaded format), S14 (is `PlaylistEntry::title` the formatted or the raw title; which fields feed `%1`–`%7`), S15 (when is the shuffle sequence built and invalidated; does the current entry stay current; where does the seed come from), S08 (waveform/spectrum derivation, publish cadence, `timestamp_us`), S02/S07 (volume slider law, balance law), S18 (fades/prebuffering), and a public description of **B4S**.
 8. **Open rendering questions the UI lane exposed** (all S01/S02 gaps, not bugs): the `nums_ex.bmp` cell layout is still unmeasured (S01 open question 6, S17 §3) so `nums_ex` skins draw at the `numbers.bmp` positions; the `text.bmp` opacity rule (colour key vs. opaque blit) is ambiguous in S01; the shade internals and the marquee/kbps/kHz field widths are webamp-provisional; and the rendering rules for the leading "no digit" cell, the decoder-active condition and the volume/balance frame mapping are provisional guesses that S02 must settle.
+9. **S01/S02 contradictions to reconcile** (found while auditing S02/S03; the next dirty-room run must fix them, not guess):
+   - S01 says the small window-button cells in the title-bar sheet are unused, but S02's pressed state **does** draw them. The UI lane therefore currently never blits a pressed window button — a real gap for the next UI card.
+   - S01 labels the equalizer slider thumb position as the 0 dB setting; it is actually the top of the travel.
+   - S01 has three provisional playlist rows that do not match the render (the title-bar strip and the bottom-bar button rectangles).
+   - A title-format example in the S02 draft used characters the bitmap font cannot render.
+10. **Process note (kept deliberately):** the first dirty-room capture session claimed it used no synthetic input, which was false — real desktop clicks had driven several states. The audit corrected the provenance and re-established every click-derived claim. Capture manifests must now record the input method, the DPI awareness and the coordinate space; the sandbox machine runs at system DPI 144, so a DPI-unaware process sees the main window as 183×77 instead of 275×116.
+11. **Still open from S01 round 2** (drafted, not exported): the equalizer slider-track decomposition and body colouring, the dragged thumb sprite, the On/Auto held sprites, two graph line strips, the playlist tile pitch and boundaries, the playlist scrollbar arrows and travel, the playlist bottom-bar hit areas and pressed state, end-of-track behaviour, whether the clutterbar can be hidden, whether skins can change the hint strings, how the four shortcut tables combine, modifier-click gestures, and playlist drag-reorder.
 8. **MilkDrop 2 needs a 5.x host.** It requires several 5.x IPC calls and the HWND entry point, so the plugin host must emulate a partial 5.x IPC surface (relevant for S10).
 9. **AVS 2.81d** has not been found as a separate installer; AVS ships with Winamp 5.66. **MilkDrop 1.04** returns a 404. **in_vgm, in_sid, a DSP plugin and a scrobbler gen plugin** have not been found yet.
 10. CI (`.github/workflows/ci.yml`) has not run yet: there is no GitHub remote.
@@ -131,9 +139,10 @@ Each task is a task card (template: `.github/ISSUE_TEMPLATE/task-card.md`): goal
 2. **Lane C, skin parser** (`rustamp-skin`, `rustamp-gfx`): `.wsz`/`.zip`/folder loading, BMP at every bit depth, `pledit.txt`/`viscolor.txt`/`region.txt`, cursors, per-file fallback, webamp sprite tables with attribution, compositor with blits, integer scaling and bitmap fonts. **Integrated as `cee2782`; the sprite tables stay provisional until S01/S17.**
 
 **Wave 2:**
-3. **Lane E, playlist** (`rustamp-playlist`): **I/O done** — M3U, M3U8, PLS and XSPF, sort and randomize. **Integrated as `3178813`.** Still open: B4S (needs a public format description), the shuffle sequence (S15) and title formatting. `rustamp-meta`: tags via `lofty` and title formatting (wait for S14).
+3. **Lane E, playlist** (`rustamp-playlist`): **I/O done** — M3U, M3U8, PLS and XSPF, sort and randomize. **Integrated as `3178813`.** Still open: B4S (needs a public format description), the shuffle sequence (S15) and title formatting. `rustamp-meta`: tags via `lofty` onto `TrackMetadata`, integrated as `6dc3ebf`; title formatting waits for S14.
 4. **Lane G, shared-memory rings** (`rustamp-ipc`): PCM and vis rings, RFC 0003. **Integrated as `881b776`; RFC 0003 accepted.**
-5. **Dirty room, separate agent:** install Winamp 2.95 into a **sandbox folder** (**ask the user first**), drive it with `cargo xtask capture`, and capture reference screenshots of every window and state with the original skin. Then write **S01** (geometry), **S02** (main window behavior), **S03** (shortcuts) and **S07** (EQ: band frequencies, filter design, slider mapping; render sweeps through `out_disk`). Every spec then goes through the Spec Auditor before it is exported. **In progress.**
+5. **Dirty room:** S01, S17, S02 and S03 are audited and exported. **S01 round 2 is drafted** (equalizer interior, playlist upper half) and needs its own audit; it also surfaced the S01 contradictions listed in open point 9, which the same run must reconcile.
+6. **Licensing** (`docs/notes/L-licensing-plugins.md`, RFC 0004): the plugin-facing crates become MIT OR Apache-2.0 and a `rustamp-proto` crate takes the wire types; the player stays GPL-3.0-or-later with a §7 plugin exception. **In progress** (task card `docs/tasks/L1-licensing-split.md`); the Winamp SDK's own licence terms are being researched separately.
 
 **After that (M1/M2):**
 - Lane D, UI windows with `winit` + `softbuffer`. Order: main window, EQ, playlist, then docking/snapping, windowshade and double-size. This needs S01–S06.
