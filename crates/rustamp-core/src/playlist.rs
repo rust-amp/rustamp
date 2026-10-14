@@ -8,7 +8,7 @@
 //! whole lifetime and never reused, even after removal. Commands and events
 //! refer to entries by id so they stay valid while indices shift.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -170,15 +170,28 @@ impl Playlist {
     }
 
     /// Insert several locations contiguously at `index`.
+    ///
+    /// Ids are allocated in iteration order, exactly as if [`Playlist::insert`]
+    /// had been called once per location, but the entries are spliced into
+    /// place in one step (O(k + n) instead of O(k * n)).
     pub fn insert_many<I>(&mut self, index: usize, locations: I) -> Vec<EntryId>
     where
         I: IntoIterator<Item = MediaLocation>,
     {
         let start = index.min(self.entries.len());
+        let mut new = Vec::new();
         let mut ids = Vec::new();
-        for (offset, loc) in locations.into_iter().enumerate() {
-            ids.push(self.insert(start + offset, loc));
+        for location in locations {
+            let id = self.alloc_id();
+            ids.push(id);
+            new.push(PlaylistEntry {
+                id,
+                location,
+                title: None,
+                duration_ms: None,
+            });
         }
+        self.entries.splice(start..start, new);
         ids
     }
 
@@ -231,15 +244,20 @@ impl Playlist {
     /// Reorder to exactly `order` (a permutation of the current ids). Ids not
     /// listed are appended in their previous order; unknown ids are ignored.
     /// Used by sort/reverse/randomize.
+    ///
+    /// Runs in O(n + m) for `n` entries and `m` ids in `order`; a quadratic
+    /// scan here made randomizing a large playlist take minutes.
     pub fn apply_order(&mut self, order: &[EntryId]) {
         let mut old: Vec<Option<PlaylistEntry>> = self.entries.drain(..).map(Some).collect();
+        let index: HashMap<EntryId, usize> = old
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|e| (e.id, i)))
+            .collect();
         let mut out = Vec::with_capacity(old.len());
         for id in order {
-            if let Some(slot) = old
-                .iter_mut()
-                .find(|s| s.as_ref().is_some_and(|e| e.id == *id))
-            {
-                out.extend(slot.take());
+            if let Some(&i) = index.get(id) {
+                out.extend(old[i].take());
             }
         }
         out.extend(old.into_iter().flatten());
@@ -428,5 +446,65 @@ mod tests {
         p.invert_selection();
         assert_eq!(p.selected_in_order(), vec![ids[1], ids[2]]);
         assert!(!p.set_current(Some(EntryId(99))));
+    }
+
+    #[test]
+    fn insert_many_matches_repeated_insert() {
+        let mut batched = Playlist::new();
+        batched.push(f("first"));
+        let batch_ids = batched.insert_many(1, [f("a"), f("b"), f("c")]);
+
+        let mut stepwise = Playlist::new();
+        stepwise.push(f("first"));
+        let step_ids: Vec<EntryId> = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(offset, n)| stepwise.insert(1 + offset, f(n)))
+            .collect();
+
+        assert_eq!(batch_ids, step_ids);
+        assert_eq!(names(&batched), names(&stepwise));
+        assert_eq!(names(&batched), ["first", "a", "b", "c"]);
+
+        // An index past the end clamps, like `insert`.
+        let ids = batched.insert_many(99, [f("z")]);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(names(&batched), ["first", "a", "b", "c", "z"]);
+    }
+
+    #[test]
+    fn apply_order_handles_duplicates_and_unknown_ids() {
+        let mut p = Playlist::new();
+        let ids = p.insert_many(0, [f("a"), f("b"), f("c")]);
+        // `c` twice, an unknown id, and `b` missing: `b` is appended in its
+        // previous relative order, the second `c` is ignored.
+        p.apply_order(&[ids[2], EntryId(999), ids[2], ids[0]]);
+        assert_eq!(names(&p), ["c", "a", "b"]);
+        assert_eq!(p.len(), 3);
+    }
+
+    /// Guards against a quadratic `apply_order`: the previous implementation
+    /// needed minutes for a playlist of this size (lane E measured it).
+    #[test]
+    fn apply_order_is_not_quadratic() {
+        const N: usize = 20_000;
+        let mut p = Playlist::new();
+        let ids: Vec<EntryId> = p.insert_many(
+            0,
+            (0..N).map(|i| MediaLocation::File(PathBuf::from(format!("{i}.mp3")))),
+        );
+        assert_eq!(ids.len(), N);
+
+        let reversed: Vec<EntryId> = ids.iter().rev().copied().collect();
+        let started = std::time::Instant::now();
+        p.apply_order(&reversed);
+        let elapsed = started.elapsed();
+
+        assert_eq!(p.get_index(0).unwrap().id, ids[N - 1]);
+        assert_eq!(p.get_index(N - 1).unwrap().id, ids[0]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "apply_order took {elapsed:?} for {N} entries"
+        );
     }
 }
