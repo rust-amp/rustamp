@@ -371,6 +371,13 @@ impl Decoder for SymphoniaDecoder {
         self.spec
     }
 
+    /// Forwards to the inherent method so that a `Box<dyn Decoder>` sees the
+    /// real count instead of the trait default. Without this override the
+    /// engine always reported zero skipped packets.
+    fn skipped_packets(&self) -> u64 {
+        self.skipped
+    }
+
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         let ch = usize::from(self.spec.channels.max(1));
         let want = out.len() / ch * ch;

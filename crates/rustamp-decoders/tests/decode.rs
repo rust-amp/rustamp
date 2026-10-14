@@ -440,6 +440,17 @@ fn corrupt_packets_are_skipped_and_counted() {
     assert!(frames > FIXTURE_FRAMES / 4, "only {frames} frames");
 }
 
+/// The count must also be visible through the trait object the engine holds.
+/// An inherent method alone silently returned the trait default of zero.
+#[test]
+fn skipped_packets_are_visible_through_the_decoder_trait() {
+    let (_, d) = corrupt_decode("sine_alac.m4a", "m4a");
+    let expected = d.skipped_packets();
+    assert!(expected > 0, "fixture did not produce a skip");
+    let boxed: Box<dyn Decoder> = Box::new(d);
+    assert_eq!(boxed.skipped_packets(), expected);
+}
+
 #[test]
 fn corrupt_flac_and_mp3_keep_playing() {
     // The container readers resynchronise by themselves; no error may escape.

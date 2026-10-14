@@ -23,10 +23,10 @@ is in effect here.
 
 1. `Decoder` exposes a decode-error/skip counter (`fn skipped_packets(&self) -> u64`
    with default 0) so the engine can show or log damage without downcasting.
-   *Accepted in core (RFC 0002, C1): the trait method exists. This crate's count
-   is still the inherent `SymphoniaDecoder::skipped_packets` and is not wired to
-   the trait method yet, so a `dyn Decoder` call returns the default 0
-   (follow-up).*
+   *Accepted in core (RFC 0002, C1): the trait method exists, and
+   `SymphoniaDecoder` overrides it, so a `dyn Decoder` call sees the real count.
+   The inherent method stays as a convenience for callers that hold the concrete
+   type; both read the same field.*
 2. `ReadSeek` requires `Send + Sync` (RFC 0002, C2), which is what symphonia
    needs, so the reader is held directly and no `Mutex` wrapper is required.
    *Done (RFC 0002, C2): `ReaderSource` holds the `Box<dyn ReadSeek>` itself.*

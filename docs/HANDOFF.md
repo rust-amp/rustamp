@@ -97,7 +97,7 @@ Workspace: 21 members (20 crates in `crates/` plus `xtask`), edition 2024, resol
 2. **Contract questions raised by the lanes.**
    - `rustamp-playlist` (`CONTRACT_NOTES.md`): `PlaylistEntry` has no field for `#EXTART`/`#EXTALBUM`/XSPF `<creator>` — decide together with S14 whether to add fields or an `extra` map; confirm that non-`http` schemes become `MediaLocation::Url`.
    - `rustamp-ipc` (RFC 0003, Q1–Q5): a blocking consumer (event or semaphore), a private DACL or `Global\`-scoped name, folding `RingError` into `IpcError`, a late-joiner consumer that starts at the newest frame, and a compact header.
-   - **Verification gap:** there is no end-to-end cross-bitness ring test (32-bit producer against 64-bit consumer). It needs a small `xtask`/test-kit helper binary.
+   - **Verification gap closed:** `cargo xtask ring-cross` runs a 32-bit producer against a 64-bit consumer and the reverse, for both ring kinds. Remaining RFC 0003 open questions: Q1–Q5.
    - `rustamp-audio`: if the engine must expose playlist `EntryId`s (`TrackChanged.id` is `None` today), that is a public-surface change and needs an RFC.
 3. **Unicode paths over IPC.** A `PathBuf` that is not valid UTF-8 cannot be encoded yet (the fix would be WTF-8 or u16).
 4. **`WindowId::Gen(u32)`** still has no numbering scheme.
@@ -149,6 +149,7 @@ cargo test --workspace --all-features
 cargo test -p rustamp-plugin-abi --target i686-pc-windows-msvc
 cargo test -p rustamp-ipc --target i686-pc-windows-msvc
 cargo build -p rustamp-plughost --target i686-pc-windows-msvc
+cargo xtask ring-cross
 cargo xtask golden
 ```
 
