@@ -1,0 +1,99 @@
+# Compile and stage on the host (unelevated), run the tests in the guest.
+#
+#   powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-tests.ps1 -Filter rustamp_app
+#   powershell ... -Reset            # restore base-provisioned first
+#
+# The division of labour is deliberate and security-relevant:
+#   * HERE (unelevated): compile and stage. Compiling runs build scripts from
+#     the repository, so it must never happen with administrator rights.
+#   * THE BROKER (elevated, session 0): only touches the VM - eject the DVD,
+#     start, copy in over PowerShell Direct, run an allow-listed guest script.
+#
+# Why the guest can run the binaries unchanged: the tests resolve the repository,
+# the fixtures and the built binary through compile-time paths
+# (D:\code\Rustamp\...), and the guest script does `subst D: C:\rustamp`, so
+# those exact paths exist in the guest too. The install DVD is ejected first,
+# because it would otherwise hold D: in the guest.
+
+[CmdletBinding()]
+param(
+    [string]$Filter = '',
+    [switch]$Reset,
+    [string]$Baseline = 'base-provisioned',
+    [string]$RepoRoot = 'D:\code\Rustamp',
+    [string]$Stage = 'D:\code\rustamp-vm\staging\code\Rustamp',
+    [switch]$SkipBuild
+)
+
+$ErrorActionPreference = 'Stop'
+$broker = Join-Path $PSScriptRoot 'vm-broker\invoke-broker.ps1'
+
+function Step($t) { Write-Host "--- $t" }
+
+# --- 1. compile on the host (builds, does not run) ---------------------------
+if (-not $SkipBuild) {
+    Step 'compiling on the host (cargo test --no-run; nothing is executed)'
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $json = & cargo test --workspace --all-features --no-run --message-format=json 2>$null
+    $ErrorActionPreference = $previous
+    $testExes = @()
+    foreach ($line in $json) {
+        if ($line -isnot [string]) { continue }
+        try { $msg = $line | ConvertFrom-Json } catch { continue }
+        if ($msg.reason -eq 'compiler-artifact' -and $msg.executable -and $msg.profile.test) { $testExes += $msg.executable }
+    }
+    if (-not $testExes) { throw 'no test binaries were produced' }
+    Write-Host ("    {0} test binaries" -f $testExes.Count)
+} else {
+    Step 'skipping the build (-SkipBuild)'
+    $listPath = Join-Path $Stage 'target\debug\test-list.json'
+    if (-not (Test-Path $listPath)) { throw "no staged test list at $listPath" }
+    $testExes = @(Get-Content $listPath -Raw | ConvertFrom-Json)
+}
+
+# --- 2. stage ----------------------------------------------------------------
+Step "staging into $Stage"
+if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'target\debug\deps')
+foreach ($exe in $testExes) { Copy-Item $exe (Join-Path $Stage 'target\debug\deps') -Force }
+$debugDir = Join-Path $RepoRoot 'target\debug'
+foreach ($dll in Get-ChildItem -Path (Join-Path $debugDir 'deps') -Filter '*.dll' -ErrorAction SilentlyContinue) {
+    Copy-Item $dll.FullName (Join-Path $Stage 'target\debug\deps') -Force
+}
+if (Test-Path (Join-Path $debugDir 'rustamp.exe')) { Copy-Item (Join-Path $debugDir 'rustamp.exe') (Join-Path $Stage 'target\debug') -Force }
+foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
+    $p = Join-Path $env:SystemRoot "System32\$crt"
+    if (Test-Path $p) { Copy-Item $p (Join-Path $Stage 'target\debug') -Force }
+}
+Copy-Item (Join-Path $RepoRoot 'crates') (Join-Path $Stage 'crates') -Recurse -Force
+$testExes | ConvertTo-Json | Set-Content (Join-Path $Stage 'target\debug\test-list.json') -Encoding UTF8
+Write-Host ("    staged {0} MB" -f [math]::Round(((Get-ChildItem $Stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1))
+
+# --- 3. optional reset, then start (the broker ejects the DVD) --------------
+if ($Reset) {
+    Step "restoring $Baseline"
+    & $broker -Op restore -Name $Baseline -TimeoutSeconds 900 | Out-Null
+} else {
+    Step 'starting the guest (the broker ejects the install DVD so the guest gets D:)'
+    & $broker -Op start -TimeoutSeconds 900 | Out-Null
+}
+
+# --- 4. copy in and run ------------------------------------------------------
+Step 'copying the staged tree into the guest'
+& $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\code\Rustamp' -TimeoutSeconds 1800 | Out-Null
+
+Step 'running the tests in the guest'
+$guestArgs = @()
+if ($Filter) { $guestArgs = @('-Filter', $Filter) }
+$result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $guestArgs -TimeoutSeconds 3600
+
+# --- 5. results --------------------------------------------------------------
+Write-Host ''
+Write-Host ("guest {0} as {1}; subst resolved: {2}; ran {3}, failed {4}" -f $result.host, $result.user, $result.subst, $result.ran, $result.failed)
+$result.results | ForEach-Object {
+    $status = if ($_.exit -eq 0) { 'ok  ' } else { 'FAIL' }
+    Write-Host ("  [{0}] {1,-46} {2}" -f $status, $_.exe, $_.summary)
+    foreach ($f in $_.failed) { Write-Host ("         $f") }
+}
+if ($result.failed -ne 0) { exit 1 }

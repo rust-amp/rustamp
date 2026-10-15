@@ -1,20 +1,19 @@
 # Client for the RustampVmBroker task.  Runs unelevated, from the orchestrator.
 #
+# The broker runs elevated, so it only ever touches the VM: eject-dvd, start,
+# stop, checkpoint, restore, list, copyin, guest. It NEVER builds or stages -
+# compiling would execute build scripts from the repository with administrator
+# rights, which is a privilege-escalation hole. Building belongs here, on the
+# unelevated host side.
+#
 # Flat parameters on purpose: a hashtable cannot survive `powershell -File`
 # (PowerShell passes it as a string there), so every op takes named switches.
-#
-#   .\invoke-broker.ps1 -Op probe
-#   .\invoke-broker.ps1 -Op checkpoint -Name base-provisioned
-#   .\invoke-broker.ps1 -Op restore   -Name base-provisioned
-#   .\invoke-broker.ps1 -Op guest     -Script run-tests.ps1 -GuestArgs '-Filter','rustamp-app'
-#   .\invoke-broker.ps1 -Op copyin    -Source D:\code\rustamp-vm\staging\x -Dest C:\rustamp\x
-#
-# It writes request.json, starts the task, waits for response.json and returns
-# the result as an object. Every operation is allow-listed inside vm-broker.ps1.
+# Every request carries a nonce and the client waits for the response that
+# echoes it, so a stale response can never be mistaken for a fresh one.
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('probe', 'start', 'stop', 'checkpoint', 'restore', 'list', 'guest', 'copyin')]
+    [Parameter(Mandatory)][ValidateSet('probe', 'eject-dvd', 'start', 'stop', 'checkpoint', 'restore', 'list', 'guest', 'copyin')]
     [string]$Op,
     [string]$Name,
     [string]$Script,
@@ -33,7 +32,8 @@ $ResponsePath = Join-Path $Root 'response.json'
 
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
 
-$arguments = @{}
+$nonce = [guid]::NewGuid().ToString('N')
+$arguments = @{ nonce = $nonce }
 if ($PSBoundParameters.ContainsKey('Name')) { $arguments['name'] = $Name }
 if ($PSBoundParameters.ContainsKey('Script')) { $arguments['script'] = $Script }
 if ($PSBoundParameters.ContainsKey('GuestArgs')) { $arguments['guestArgs'] = @($GuestArgs) }
@@ -43,13 +43,20 @@ if ($PSBoundParameters.ContainsKey('Dest')) { $arguments['dest'] = $Dest }
 @{ op = $Op; args = $arguments } | ConvertTo-Json -Depth 6 | Set-Content -Path $RequestPath -Encoding UTF8
 Remove-Item -Path $ResponsePath -ErrorAction SilentlyContinue
 
+# Trigger now instead of waiting for the one-minute schedule. This is an
+# unelevated cmdlet call; the orchestrator's shells are not on the interactive
+# desktop, so nothing appears on the owner's screen.
 Start-ScheduledTask -TaskName $TaskName
 
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-while ((Get-Date) -lt $deadline -and -not (Test-Path $ResponsePath)) { Start-Sleep -Seconds 3 }
+$response = $null
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 3
+    if (-not (Test-Path $ResponsePath)) { continue }
+    try { $candidate = Get-Content -Path $ResponsePath -Raw | ConvertFrom-Json } catch { continue }
+    if ($candidate.nonce -eq $nonce) { $response = $candidate; break }
+}
 
-if (-not (Test-Path $ResponsePath)) { throw "no response from $TaskName within $TimeoutSeconds s (see $Root\broker.log)" }
-
-$response = Get-Content -Path $ResponsePath -Raw | ConvertFrom-Json
+if (-not $response) { throw "no response with nonce $nonce from $TaskName within $TimeoutSeconds s (see $Root\broker.log)" }
 if (-not $response.ok) { throw "broker op '$Op' failed: $($response.error) (see $Root\broker.log)" }
 $response.result

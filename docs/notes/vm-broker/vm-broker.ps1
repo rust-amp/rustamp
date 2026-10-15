@@ -132,28 +132,10 @@ function Invoke-GuestScript {
 }
 
 function Get-CargoPath {
-    # The broker runs in session 0 (S4U), where the user's PATH is minimal and
-    # rustup's environment is usually missing. Resolve cargo explicitly instead
-    # of hoping it is on PATH - the first run failed with "no test binaries"
-    # precisely because it was not.
-    $profileDir = [Environment]::GetFolderPath('UserProfile')
-    if (-not $profileDir) { $profileDir = $env:USERPROFILE }
-    if ($env:RUSTUP_HOME -eq $null -and $profileDir) { $env:RUSTUP_HOME = Join-Path $profileDir '.rustup' }
-    if ($env:CARGO_HOME -eq $null -and $profileDir) { $env:CARGO_HOME = Join-Path $profileDir '.cargo' }
-    $candidates = @()
-    $onPath = Get-Command cargo -ErrorAction SilentlyContinue
-    if ($onPath) { $candidates += $onPath.Source }
-    if ($profileDir) { $candidates += (Join-Path $profileDir '.cargo\bin\cargo.exe') }
-    foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path $candidate)) {
-            Write-Log ("cargo: {0} (RUSTUP_HOME={1} CARGO_HOME={2})" -f $candidate, $env:RUSTUP_HOME, $env:CARGO_HOME)
-            return $candidate
-        }
-    }
-    throw "cargo not found. Looked at PATH and $profileDir\.cargo\bin. RUSTUP_HOME=$env:RUSTUP_HOME CARGO_HOME=$env:CARGO_HOME"
+    throw 'the broker never builds: compiling executes build scripts from the repository, which must never happen with elevated rights. Build on the host side, unelevated.'
 }
 
-$response = [ordered]@{ ok = $false; op = $null; result = $null; error = $null }
+$response = [ordered]@{ ok = $false; op = $null; nonce = $null; result = $null; error = $null }
 try {
     if (-not (Test-Path $RequestPath)) { exit 0 }
 
@@ -168,6 +150,8 @@ try {
     $response.op = $request.op
     # NOT `$args`: that is an automatic PowerShell variable.
     $arguments = $request.args
+    # The nonce is echoed so a client can tell its own response from an older one.
+    if ($arguments -and $arguments.nonce) { $response.nonce = $arguments.nonce }
     Write-Log ("op={0} args={1}" -f $request.op, ($arguments | ConvertTo-Json -Compress -ErrorAction SilentlyContinue))
 
     switch ($request.op) {
@@ -240,51 +224,14 @@ try {
             $response.result = [ordered]@{ copied = $true; source = $fullSource; dest = $destFull }
         }
         'run-tests' {
-            # The whole pipeline, inline: the orchestrator writes one request and
-            # reads the result. Compiling happens here (host, no window), the
-            # binaries run in the guest.
-            $filter = [string]$arguments.filter
-            if ($arguments.reset) {
-                Write-Log "restoring $($arguments.baseline)"
-                if ((Get-VM -Name $VmName).State -ne 'Off') { Stop-GuestCleanly }
-                Restore-VMSnapshot -VMName $VmName -Name ([string]$arguments.baseline) -Confirm:$false
-            }
-            Eject-Dvd
-            if ((Get-VM -Name $VmName).State -ne 'Running') { Start-VM -Name $VmName }
-            if (-not (Wait-PowerShellDirect)) { throw 'PowerShell Direct did not come up' }
-
-            Write-Log 'cargo test --no-run on the host'
-            $cargo = Get-CargoPath
-            $previous = $ErrorActionPreference
-            $ErrorActionPreference = 'Continue'
-            $cargoErr = Join-Path $Root 'cargo.err.txt'
-            $json = & $cargo test --workspace --all-features --no-run --message-format=json 2>$cargoErr
-            $ErrorActionPreference = $previous
-            $testExes = @()
-            foreach ($line in $json) {
-                if ($line -isnot [string]) { continue }
-                try { $msg = $line | ConvertFrom-Json } catch { continue }
-                if ($msg.reason -eq 'compiler-artifact' -and $msg.executable -and $msg.profile.test) { $testExes += $msg.executable }
-            }
-            if (-not $testExes) {
-                $tail = ''
-                if (Test-Path $cargoErr) { $tail = (Get-Content $cargoErr -Tail 5) -join ' | ' }
-                throw "no test binaries were produced (cargo=$cargo; stderr tail: $tail)"
-            }
-            Write-Log ("{0} test binaries" -f $testExes.Count)
-
-            $stage = Stage-Tree -TestExes $testExes
-            Write-Log "staged $stage"
-            Copy-TreeToGuest -Stage $stage
-            Write-Log 'copied into the guest'
-
-            $guestArgs = @()
-            if ($filter) { $guestArgs = @('-Filter', $filter) }
-            $guestResult = Invoke-GuestScript -ScriptName 'run-tests.ps1' -ScriptArgs $guestArgs
-            $response.result = [ordered]@{
-                binaries = $testExes.Count
-                guest    = $guestResult
-            }
+            # DELIBERATELY REFUSED. The broker runs with elevated rights, and
+            # compiling would execute build scripts from the repository as
+            # administrator - arbitrary code with admin rights, i.e. a
+            # privilege-escalation hole. Building and staging are not privileged
+            # and belong to the unelevated host side (docs\notes\vm-run-tests.ps1).
+            # The broker only touches the VM: eject-dvd, start, stop, checkpoint,
+            # restore, list, copyin, guest.
+            throw 'the broker never builds. Compile and stage on the host side, unelevated, then use eject-dvd/start/copyin/guest.'
         }
         default { throw "unknown op '$($request.op)'" }
     }
