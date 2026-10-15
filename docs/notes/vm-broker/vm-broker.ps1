@@ -131,6 +131,28 @@ function Invoke-GuestScript {
     Invoke-Command -VMName $VmName -Credential $cred -FilePath $scriptPath -ArgumentList $guestArgs
 }
 
+function Get-CargoPath {
+    # The broker runs in session 0 (S4U), where the user's PATH is minimal and
+    # rustup's environment is usually missing. Resolve cargo explicitly instead
+    # of hoping it is on PATH - the first run failed with "no test binaries"
+    # precisely because it was not.
+    $profileDir = [Environment]::GetFolderPath('UserProfile')
+    if (-not $profileDir) { $profileDir = $env:USERPROFILE }
+    if ($env:RUSTUP_HOME -eq $null -and $profileDir) { $env:RUSTUP_HOME = Join-Path $profileDir '.rustup' }
+    if ($env:CARGO_HOME -eq $null -and $profileDir) { $env:CARGO_HOME = Join-Path $profileDir '.cargo' }
+    $candidates = @()
+    $onPath = Get-Command cargo -ErrorAction SilentlyContinue
+    if ($onPath) { $candidates += $onPath.Source }
+    if ($profileDir) { $candidates += (Join-Path $profileDir '.cargo\bin\cargo.exe') }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) {
+            Write-Log ("cargo: {0} (RUSTUP_HOME={1} CARGO_HOME={2})" -f $candidate, $env:RUSTUP_HOME, $env:CARGO_HOME)
+            return $candidate
+        }
+    }
+    throw "cargo not found. Looked at PATH and $profileDir\.cargo\bin. RUSTUP_HOME=$env:RUSTUP_HOME CARGO_HOME=$env:CARGO_HOME"
+}
+
 $response = [ordered]@{ ok = $false; op = $null; result = $null; error = $null }
 try {
     if (-not (Test-Path $RequestPath)) { exit 0 }
@@ -232,9 +254,11 @@ try {
             if (-not (Wait-PowerShellDirect)) { throw 'PowerShell Direct did not come up' }
 
             Write-Log 'cargo test --no-run on the host'
+            $cargo = Get-CargoPath
             $previous = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
-            $json = & cargo test --workspace --all-features --no-run --message-format=json 2>$null
+            $cargoErr = Join-Path $Root 'cargo.err.txt'
+            $json = & $cargo test --workspace --all-features --no-run --message-format=json 2>$cargoErr
             $ErrorActionPreference = $previous
             $testExes = @()
             foreach ($line in $json) {
@@ -242,7 +266,11 @@ try {
                 try { $msg = $line | ConvertFrom-Json } catch { continue }
                 if ($msg.reason -eq 'compiler-artifact' -and $msg.executable -and $msg.profile.test) { $testExes += $msg.executable }
             }
-            if (-not $testExes) { throw 'no test binaries were produced' }
+            if (-not $testExes) {
+                $tail = ''
+                if (Test-Path $cargoErr) { $tail = (Get-Content $cargoErr -Tail 5) -join ' | ' }
+                throw "no test binaries were produced (cargo=$cargo; stderr tail: $tail)"
+            }
             Write-Log ("{0} test binaries" -f $testExes.Count)
 
             $stage = Stage-Tree -TestExes $testExes
