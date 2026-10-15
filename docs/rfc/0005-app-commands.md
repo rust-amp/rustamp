@@ -53,7 +53,7 @@ volume-key step is a placeholder (§8).
 | F5 | `PlayerState` carries transport, position, duration, volume, balance, shuffle, repeat, current index/id, playlist length, stream info and `eq`; it has no stop-after-current flag, no vis-plugin field, no easy-move flag and no bookmark list | `rustamp-proto/src/state.rs` |
 | F6 | `Event` already has `SkinChanged(Option<PathBuf>)` (`None` = built-in default), `WindowVisibilityChanged { window, visible }`, `PlaylistEnded` and `Quit` | `rustamp-proto/src/event.rs` |
 | F7 | The dispatch maps 18 actions to commands, returns `Handled` for `ToggleTimeRemaining` (40242) and `Unhandled(action)` for the rest; the 30 main-table unhandled ids are pinned by a test | `crates/rustamp-ui/src/shortcuts.rs` |
-| F8 | `VOLUME_STEP: u8 = 10` in `crates/rustamp-ui/src/shortcuts.rs` is a placeholder ("provisional: step size not in S02/S03"); `SEEK_STEP_MS: i64 = 5000` by contrast is an S03 fact ("Rewind 5 seconds") | `crates/rustamp-ui/src/shortcuts.rs`, S03 §1 |
+| F8 | `VOLUME_STEP` measured **4** (core units `0..=255`) on 2026-10-15 (dirty-room memo `notes/2026-10-15-wm-command-o5-o6-o7-o10-o15.md`): 40058/40059 move 0→4→8…, saturate at 0/255 with partial end steps; `SEEK_STEP_MS: i64 = 5000` by contrast is an S03 fact ("Rewind 5 seconds") | measurement memo, `crates/rustamp-ui/src/shortcuts.rs`, S03 §1 |
 | F9 | The wire is postcard inside a `u32`-LE length prefix, `MAX_FRAME_LEN` = 16 MiB; `PROTOCOL_VERSION = 1`; peers compare it in `Hello`; the comparison is not implemented yet (both processes are stubs) | `crates/rustamp-ipc/src/{message,framing,transport}.rs` |
 | F10 | postcard encodes enums by variant index (declaration order) and structs (and struct variants) positionally | postcard, via `framing.rs` |
 | F11 | `Message` carries `CommandFromPlugin(Command)` host→main; there is no main→host command message | `crates/rustamp-ipc/src/message.rs` |
@@ -128,7 +128,7 @@ main-window bindings; several actions have several.
 | Open directory | 40187 | new `OpenMedia { kind: Directory, play: true }` | app (dialog → `AddItems`) | forwards 40187 |
 | Minimize | 40334 | new `Minimize` | app/platform | forwards 40334 |
 | Start a new instance | 40305 | **app-local, no variant** (§10) | platform (lane F / S13) | never sees it |
-| Visualization options | 40317 | new `OpenVisOptions` | app (dialog/popup, S04) | forwards 40317 |
+| Visualization options | 40317 | new `OpenPrefsPage(PrefsPage::VisOptions)` (measured §7) | app (prefs at page) | forwards 40317 |
 | Skin browser | 40219 | new `OpenSkinBrowser` | app (dialog → `LoadSkin`) | forwards 40219 |
 | Toggle minibrowser | 40298 | **deferred** (§11.1) | — | — |
 | Stop after current track | 40157 | new `ToggleStopAfterCurrent` | engine (transport mode) | forwards 40157 |
@@ -151,7 +151,7 @@ main-window bindings; several actions have several.
 | Minibrowser command (unconfirmed) | 40309 | **deferred** (§11.1) | — | — |
 | End of list (Ctrl+click next, S03 §5; no id recorded) | — | new `PlayLast` | engine | never (no public id, O15) |
 
-Tally: 21 new variants, 2 actions reusing existing commands, 1 app-local,
+Tally: 20 new variants, 2 actions reusing existing commands, 1 app-local,
 1 UI-local (not in this table, §9), 9 deferred (7 minibrowser, video
 fullscreen, playlist search), 1 mouse-only action covered by `PlayLast`.
 
@@ -261,10 +261,10 @@ bookmark list. No payload (current entry). The bookmark store does not exist
 yet (O12); the variant is proposed so the tables are complete, and the handling
 lands with the bookmark feature (M2-era), in-memory first.
 
-**`Command::OpenVisOptions`** — for 40317 (Alt+O). Open the
-visualization-options UI. No payload. S03 annotates 40191 as opening the
-Preferences dialog but says nothing for 40317, so this RFC treats it as its own
-UI with content per S04 (O7).
+**`Command::OpenVisOptions` — removed after measurement.** 40317 was
+provisionally given its own UI; the 2026-10-15 measurement shows it opens the
+same Preferences dialog at the Options > Visualization page, so it is
+`OpenPrefsPage(PrefsPage::VisOptions)` (§7). No separate variant.
 
 ### 5.3 App — window management
 
@@ -375,9 +375,11 @@ visualization-plug-in page, not the dialog in general. The proposal:
   remembered page.
 - Add **`Command::OpenPrefsPage(PrefsPage)`**; 40191 →
   `OpenPrefsPage(PrefsPage::VisPlugin)`.
-- `PrefsPage` is a **new enum in `rustamp-proto`**, provisional, with only
-  `VisPlugin` defined now. The full page list is S04's (not started); growing
-  the enum later follows the same append rule.
+- `PrefsPage` is a **new enum in `rustamp-proto`**, provisional, with
+  `VisPlugin` (40191, measured: dialog at Plug-ins > Visualization) and
+  `VisOptions` (40317, measured: same dialog at Options > Visualization) defined
+  now. The full page list is S04's (not started); growing the enum later follows
+  the same append rule.
 
 Rejected: changing `OpenPrefs` to `OpenPrefs { page: Option<PrefsPage> }` —
 that changes an existing variant's wire shape (a unit variant gains a payload;
@@ -385,19 +387,17 @@ old peers mis-decode, F10) and touches every existing caller for a change only
 one action needs. The host maps 40012 → `OpenPrefs` and 40191 →
 `OpenPrefsPage(PrefsPage::VisPlugin)`.
 
-Open (O6/O7): which page 40191 opens exactly, whether 40317 (Alt+O,
-"Visualization options") is also a preferences page or its own dialog — S03
-annotates 40191 as opening the Preferences dialog but says nothing for 40317,
-so this RFC treats 40317 as its own UI (`OpenVisOptions`).
+Open (O6/O7, both settled by the 2026-10-15 measurement): 40191 opens the
+dialog at Plug-ins > Visualization and 40317 at Options > Visualization, so
+both are `OpenPrefsPage` values and no separate vis-options UI exists.
 
-## 8. The volume-step placeholder
+## 8. The volume step: measured 4
 
-`VOLUME_STEP: u8 = 10` (core units, `0..=255`) in
-`crates/rustamp-ui/src/shortcuts.rs` is a placeholder; neither S02 nor S03
-states the step (F8), and HANDOFF open point 18 says the dirty room must
-measure it. **This RFC does not invent a value**: the constant stays named,
-provisional, in the UI crate, and the measurement is a separate dirty-room
-task (O10).
+`VOLUME_STEP` was a placeholder (`10`, "provisional: step size not in S02/S03").
+The 2026-10-15 dirty-room measurement settled it: posting 40058/40059 moves the
+2.95 volume in steps of **4** core units (`0→4→8…`, saturating at 0/255 with
+partial end steps `253→255`, `2→0`; `IPC_SETVOLUME` write path cross-checked).
+The implementation lane sets `VOLUME_STEP: u8 = 4` and keeps the name.
 
 The design around it is ratified: the step is applied by the UI machine
 (`volume_command`), which converts the machine's percent volume to core units
@@ -507,9 +507,9 @@ handling deferred to M3.
 
 ## 12. Wire and IPC impact
 
-**What changes on the wire:** only `Command` grows — 21 new variants appended
+**What changes on the wire:** only `Command` grows — 20 new variants appended
 after `OpenPrefs`, plus three new enums (`OpenMediaKind`, `JumpTarget`,
-`PrefsPage`). No existing variant changes shape or index. One `Message`-level
+`PrefsPage` with `VisPlugin`/`VisOptions`). No existing variant changes shape or index. One `Message`-level
 addition is proposed for M3: `Message::CommandToHost(Command)`, mirroring
 `CommandFromPlugin`, for the player→host direction of §5.4.
 
@@ -594,8 +594,8 @@ agreement.
    comparison (M3) rejects mixed pairs.
 5. The host's id table covers every public id in §4 that has a variant; ids
    without variants are logged and dropped.
-6. `VOLUME_STEP` is still a named, provisional constant; no measured value is
-   invented; the dirty-room measurement is scheduled as its own task.
+6. `VOLUME_STEP` is `4` per the 2026-10-15 measurement (O10 settled); the
+   dirty-room memo is the provenance.
 7. Each new variant has a dispatch test in `shortcuts.rs` in the existing
    style (action → expected `Command`), and the UI machine's prediction table
    gains entries for the commands with an S02-visible effect
@@ -633,8 +633,8 @@ agreement.
 ## 17. Owner decisions (2026-10-15)
 
 The project owner decided all decision-relevant questions. Status is now:
-**accepted in substance** — the four measurements below and S15 (O9) may adjust
-details without re-approval.
+**accepted in substance** — O5/O15 (still open, exact follow-ups recorded) and
+S15 (O9) may adjust details without re-approval.
 
 | ID | Decision | Consequence for the implementation lane |
 |---|---|---|
@@ -642,16 +642,16 @@ details without re-approval.
 | O2 | The video window is **not** `WindowId::Vis` — add **`WindowId::Video`** | Additive enum addition with the same version story (§5.5); host maps 40328 to `ToggleWindow(WindowId::Video)`; fullscreen (deferred) targets it |
 | O3 | Closing the main window **quits** | `CloseFocusedWindow` on main → `Quit` |
 | O4 | Alt+M minimizes the **main** window | `Minimize` targets main |
-| O5 | **Measure in 2.95** whether the playlist add commands play | Dirty-room task; `play: false` stands until measured |
-| O6/O7 | **Verify in 2.95** which page 40191 opens and what 40317 opens | Dirty-room task; `OpenPrefsPage(VisPlugin)` + `OpenVisOptions` stand until verified |
+| O5 | **Measure in 2.95** whether the playlist add commands play — **still open**: 1032/1036/1039 posted to the main window are a no-op (playlist-window ids); completing the add flow needs the dialog confirmed with a file pick (playlist-editor window or real input) | Dirty-room follow-up with the exact setup in the memo |
+| O6/O7 | **Verified in 2.95**: 40191 opens Prefs at Plug-ins > Visualization, 40317 at Options > Visualization — both are `OpenPrefsPage` values, `OpenVisOptions` removed | Settled 2026-10-15 |
 | O8 | Stop-after-current is a toggle **with a `PlayerState` field** | Wire change riding the same v2 bump (§5.1 deliberately did not propose it; the owner overruled — add the field) |
 | O9 | Deferred to **S15** | `SkipBy` order follows the shuffle-sequence decision |
-| O10 | Dirty-room measurement stands | `VOLUME_STEP` stays placeholder |
+| O10 | Dirty-room measurement stands | **Settled 2026-10-15: step is 4** (see §8); implementation sets the constant |
 | O11 | Provisional constants (default adopted) | As proposed |
 | O12 | Bookmark handling lands with the feature (default adopted) | As proposed |
 | O13 | **`Message::CommandToHost(Command)`** (default adopted) | As proposed; overlap with `WinampIpc` resolved with S10 |
 | O14 | Persist the elapsed/remaining preference when config I/O lands | Noted for the config lane |
-| O15 | **Measure** whether 2.95 has an end-of-list id | Dirty-room task; `PlayLast` stays id-less until measured |
+| O15 | **Measure** whether 2.95 has an end-of-list id | **Still open**: intercepting it needs a cross-process message spy or the real gesture — both outside the allowed method; memo records the exact follow-up |
 | O16 | `NewInstance` stays app-local (default adopted) | As proposed; revisit with S13 |
 | O17 | Minibrowser stays deferred (default adopted) | No spec task |
 | O18 | Noted (default adopted) | As proposed |
