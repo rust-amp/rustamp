@@ -1,10 +1,11 @@
 ---
 Spec ID: S-01
 Title: Window geometry, sprite rectangles and pixel layout deltas
-Sources consulted (category only): dirty room: binary behaviour capture; dirty room: shipped skin assets (test input); dirty room: synthetic test skin (own bitmap, round 2); free: webamp (cross-check only)
-Author agent: R-agent (dirty room, capture session 2026-10-14); dirty-room capture agents (round-2 sessions 2026-10-15)
+Sources consulted (category only): dirty room: binary behaviour capture; dirty room: sandboxed binary behaviour capture (round 3); dirty room: shipped skin assets (test input); dirty room: synthetic test skin (own bitmap, round 2); free: webamp (cross-check only)
+Author agent: R-agent (dirty room, capture session 2026-10-14); dirty-room capture agents (round-2 sessions 2026-10-15); dirty-room capture agent (round-3 sandbox session 2026-10-16)
 Auditor: Spec Auditor (dirty room)
-Audit date: 2026-10-14; round-2 audits 2026-10-15 (three passes), verdict PASS WITH CORRECTIONS
+Audit date: 2026-10-14; round-2 audits 2026-10-15 (three passes); round-3 audit 2026-10-16 (one pass), verdict PASS WITH CORRECTIONS
+Export run (round 3): sandbox measurement run 20261016-003014 (Windows Sandbox capture host; frozen job s01r2-open.json, 136/136 steps ok)
 Winamp version validated against: 2.95 (winamp.exe SHA-256 bca7a9fe1626b487d1b47bb5210670cf572d1a4cce23062076641d583b268561, extracted from winamp295.exe SHA-256 ef1423999cbefd4f2a3a98acee2b194a4260268cb4517abda9f12963e866b7e5)
 Status: audited
 ---
@@ -16,7 +17,8 @@ sheet, and where each sprite is drawn. Everything marked **verified** was measur
 renders of the real 2.95 binary or read from the skin files. Everything marked
 **provisional** is a candidate that this session did not confirm against 2.95; treat
 provisional rows as unconfirmed and do not rely on them. Rows and passages added by the
-round-2 sessions of 2026-10-15 are marked **(round 2)**.
+round-2 sessions of 2026-10-15 are marked **(round 2)**; rows and passages added or
+changed by the round-3 session of 2026-10-16 are marked **(round 3)**.
 
 Measurement method (for provenance): a screenshot of a window is compared pixel by pixel
 against a rectangle of a skin sheet; a rectangle is accepted only when the mean
@@ -25,6 +27,19 @@ per-channel difference over the rectangle is exactly zero. Positions are window-
 use the same comparison and add one controlled input for the playlist tile pitch: a
 self-made synthetic skin whose `PLEDIT.BMP` gives every sheet column a distinct colour, so
 a render column names the sheet column it came from (see §4.1).
+
+(round 3) The round-3 facts come from the export run named in the header (a Windows
+Sandbox capture host, frozen job `s01r2-open.json`, 136/136 steps ok). On that host every
+capture asserts the 275x116 landmark (invariant region 0,49,275,67, zero differing
+pixels), so its coordinate space is comparable with the recorded evidence. The guest was
+launched with the 60-entry reference playlist; it lists all 60 entries although their
+files are not mapped into the guest, so the listed content is the playlist, not the media.
+The window settles 15.1 s after a playlist launch, and **13** independent fresh-launch
+state captures are byte-identical to one another (and the smoke twins are byte-identical
+and 0-pixel-identical to the landmark region). The round-3 host recorded `dpi=144 (150%)`,
+a 3050x1668 screen and a per-monitor-v2 process; the round-2 sessions recorded `240 (250%)`
+on their own machine. These are **different machines**, so a row measured in one states
+which environment it is from, and no single DPI figure applies to the whole spec.
 
 All numbers below are for the **original Winamp base skin** (the `.wsz` that ships with
 webamp as `base-2.91`), loaded into a sandboxed 2.95. Pixel tables are skin data, not
@@ -328,7 +343,20 @@ are not sprite rows are collected here.
   states with zero differing pixels; `autoload_eq` toggles exactly the AUTO indicator
   cell at client (44–46, 22–23). The ON indicator's cell at client (18–20, 22–23) is
   associated with `use_eq` in the same file, but that link was not independently
-  re-verified (provisional).
+  re-verified (provisional; carried as an open item **(round 3)**, §7.22).
+- **(round 3) Fresh-launch reproducibility.** A fresh launch with `eq_data=31` (x10) and
+  `preamp=31` renders the flat equalizer identical to the recorded flat capture
+  `s01r2d_o8_flat_eq.png` except for **6 of 31900 pixels**, all inside the AUTO indicator
+  cell at client (44–46, 22–23) — the `autoload_eq` marker of the bullet above, i.e. a
+  state difference, not a geometry difference.
+- **(round 3) Preamp drag — negative result.** A fresh real drag of the preamp thumb from
+  its flat centre (27,68) to above the track top (27,30), clamped to maximum, does **not**
+  reproduce the recorded real-drag capture `s01r2d_realinput_eq_ondrag_after_eq.png`:
+  **95 of 31900 pixels** differ, all in the preamp column (bounds (18,22)-(32,50)). The
+  cause is not established; this is a provenance caveat on that one recorded capture and
+  is carried as an open item (§7.20), not as a reproduction. Both drags clamp to the
+  maximum (the recorded drag target was (27,45)), so the residual is not a different
+  final value.
 
 ---
 
@@ -401,7 +429,8 @@ names the sheet column it came from. The skin is our own bitmap, not reference m
   matches because the sprite's border is uniform; the two are the same drawn handle. The
   arrow pair is `PLEDIT.BMP` (261,72,8,10), fixed at (260,78) in every captured state,
   and has **no pressed sprite** (a held arrow differs only in an unrelated text element).
-  The arrow **step size stays open** (see §7).
+  The arrow step size was **open** in round 2 and is **measured in round 3** as one page of
+  four rows per click (round 3; see §4.2 and §7.14).
 - **Bottom-bar buttons.** The button sprites come from `PLEDIT.BMP` **y = 86** and are
   drawn at **window y = 92–109**. This refutes S01's y = 111 source rows and its window
   y = 86 positions. The x origins are ambiguous by ±3 px because the leading columns are
@@ -411,9 +440,60 @@ names the sheet column it came from. The skin is our own bitmap, not reference m
 - **Bottom-bar hit areas.** Established by probing with posted client-relative clicks at
   window y ≈ 92: ADD ≈ x 14–35, MISC ≈ x 102–121 and LIST OPTS ≈ x 232–251. ADD and
   LIST OPTS open a file dialog and MISC opens a popup menu; the probe's positive points
-  are the dialog/menu windows it opened. REM and SEL hit areas are **open** (no popup
-  action on the tested list). Whether a **real** click fires these buttons is **open** as
-  well (see §7).
+  are the dialog/menu windows it opened. **(round 3)** The three posted positives
+  reproduce: (24,92) opens the ADD `#32770` file dialog, (112,92) the MISC `#32768` popup
+  menu and (242,92) the LIST OPTS `#32770` file dialog. REM and SEL **left edges** are now
+  measured (round 3, §4.2); their **right edges** stay open (§7.12). Whether a **real**
+  click fires these buttons was **open** in round 2 and is **resolved in round 3**
+  (§4.2, §7.13).
+
+### 4.2 Playlist editor — round-3 measurements
+
+The round-3 sandbox session (2026-10-16) re-measured the playlist editor's bottom-bar
+interaction with posted and with real input; every capture asserts the 275x116 landmark
+(the export run named in the header). The facts below are **(round 3)**.
+
+- **The `WinampVis` child window at y = 92.** At window y = 92 the client region
+  **x 52–122** resolves to a child window of class `WinampVis` whose root ancestor is the
+  playlist editor. The **left edge** is bracketed to **{51, 52}** (x=50 is `Winamp PE`,
+  x=52 is `WinampVis`); the **right edge** is bracketed only to **{123, 124, 125}** —
+  x=123 and x=125 were not probed and x=124 resolves to the `#32768` MISC popup menu that
+  an earlier posted MISC click left open, so the child window may extend under it. x ≥ 126
+  is the playlist window itself. The measured coverage is therefore **52–122**; the exact
+  right edge stays open (§7.17).
+- **Posted clicks fire the bottom bar.** A posted client-relative click at (24,92) opens
+  the ADD `#32770` file dialog, at (112,92) the MISC `#32768` popup menu and at (242,92)
+  the LIST OPTS `#32770` file dialog. Which of the two clicks of a positive probe fired is
+  not separable; the posted path is proven.
+- **Real clicks fire the same five buttons.** With real input (`SetCursorPos` plus the
+  legacy `mouse_event`), ADD at (23,92) and at (23,100) opens the `#32770` file dialog;
+  MISC at (110,92) and (110,100) opens the `#32768` menu; LIST OPTS at (242,92) opens the
+  `#32770` file dialog; REM at (46,92) removes the selected entry (the list renumbers;
+  4863 differing pixels against the selection state) and SEL at (74,92) selects all
+  visible rows (10673 differing pixels). The **second** real click is the one that fires —
+  the first real click on a non-foreground window is consumed by activation. **On REM and
+  SEL the first real click additionally opens a four-item dropdown menu** over the bottom
+  bar (REM: `REM Misc / REM ALL / CROP / REM SEL`; SEL: `INV SEL / SEL ZERO / SEL ALL /
+  …`); the posted grid clicks open no such menu. The nature of that menu is open (§7.21).
+- **Posted grid context.** On a fresh launch with the list at the bottom and its first
+  visible row selected, a posted click at y = 92 acts at **x = 46** (REM) and **x = 74**
+  (SEL) and at none of the other 34 probed points (x = 8, 12, 36–44, 48–72, 76–102, 130,
+  150, 190, 226, 258). The two positives changed the window (x=46 removed the selected
+  entry; x=74 then selected all visible rows); every other probed point was a no-op.
+  **Qualification:** this holds in the cumulative grid launch; its even-indexed clicks are
+  weakened by the documented "every second probe fails to fire" artefact, so a negative at
+  an even-indexed point cannot be read as "no hit" — the same reason the REM/SEL
+  right-edge probes stay open (§7.12).
+- **Context qualification of the left edges.** The x=46 and x=74 positives are the *grid*
+  context, not the first bottom-bar click of a fresh launch; a fresh-launch candidate
+  click can be swallowed by activation. Whether the same x acts as the first click of a
+  fresh launch stays open (§7.12).
+- **Scrollbar arrow step.** One click on a scrollbar arrow scrolls the playlist by **one
+  page = four rows** (the four visible rows). Up and down are symmetric: the first visible
+  row reads 25→29→33→29 (down, down, up), and eight up-clicks from the bottom page
+  (rows 57–60) land exactly on rows 25–28. This closes the round-2 conflict (§7.14) in
+  favour of one page per click and refutes the "one line per press" reading; the
+  "one **hold** per arrow" (auto-repeat) half is not measured.
 
 ---
 
@@ -499,8 +579,9 @@ sprites) are never read. The pale cyan is filler in unblitted areas, not a key.
    layout, which stays provisional.
 8. **Playlist top half.** Round 2 resolved the tile pitch (25 px), the title-band
    composition, the strip position and the bottom-bar button source rows and window
-   positions (§4.1). Still open: the right rail's tiling, the REM and SEL hit areas, and
-   the scrollbar arrow step size.
+   positions (§4.1). **(round 3)** Round 3 measured the scrollbar arrow step (one page of
+   four rows, §7.14) and the REM/SEL left edges (§7.12). Still open: the right rail's
+   tiling and the REM/SEL right edges (§7.12).
 9. **`gen.bmp` / `genex.bmp`** sprite tables are out of scope here (S11).
 10. The `Winamp MB` and `Winamp Video` window sheets (`mb.bmp`, `video.bmp`) were not
     analysed.
@@ -508,18 +589,30 @@ sprites) are never read. The pale cyan is filler in unblitted areas, not a key.
     colour, and a uniform colour matches anywhere, so its use as a drawn sprite cannot be
     shown from a render. It stays open. Needs: a state where that colour appears as a
     distinctive line that cannot be a coincidence, or source evidence.
-12. **Playlist REM and SEL hit areas (round 2).** Not established: neither produced a
-    popup on the tested list. Needs: a probe grid over the REM/SEL region on a list with
-    a selection, recording each popup or dialog, with both posted and real input.
-13. **Does a real click fire the playlist bottom-bar buttons? (round 2)** Contested and
-    unverified. Two runs used different window y (92 and 100), both inside the drawn
-    button (window y 92–109), and the positive claim has no capture. Needs: one run with
-    a real press-and-release at both y values for each of the five buttons (clicked
-    twice, because the first click on a non-foreground window is consumed by
-    activation), capturing the dialog/menu window and the child-window state per point.
-14. **Playlist scrollbar arrow step size (round 2).** Open: one run reported one page per
-    click and another one line per press. Needs: one session with the entry count recorded
-    and one press versus one hold per arrow, reading the handle position after each.
+12. **Playlist REM and SEL hit areas (round 2; partially closed in round 3).** **(round 3)**
+    The **left edges** are measured in the grid context: REM acts at x=46 and SEL at x=74
+    (the drawn bodies span 43–63 and 72–92). The **right edges** stay **open**: the
+    round-3 one-launch-per-candidate design clicks each candidate only once, and a
+    swallowed click cannot be told from a miss, so its all-zero results are uninformative.
+    Needs: one launch per candidate x above 46 (REM) and above 74 (SEL), **clicked twice**
+    (or a launch with a known-positive click before the candidate), capturing the
+    post-click list; the discriminator captures are the grid positives at x=46 (REM) and
+    x=74 (SEL). Also open: whether x=46/74 act as the *first* bottom-bar click of a fresh
+    launch — the grid is a cumulative launch, and the same run can settle it. **(round 3)**
+13. **Does a real click fire the playlist bottom-bar buttons? (round 2) — resolved in
+    round 3.** **(round 3)** Yes: real input fires all five buttons — ADD at (23,92) and
+    (23,100) opens the ADD dialog, MISC at (110,92) and (110,100) opens the MISC menu,
+    LIST OPTS at (242,92) opens the LIST OPTS dialog, REM at (46,92) removes the selected
+    entry and SEL at (74,92) selects all visible rows; the **second** real click is the one
+    that fires, and on REM and SEL the first real click opens a four-item dropdown menu
+    (§4.2). Still open: real clicks at **y=100** for REM, SEL and LIST OPTS (round 3
+    measured y=100 only for ADD and MISC) — §7.18. **(round 3)**
+14. **Playlist scrollbar arrow step size (round 2) — resolved in round 3.** **(round 3)**
+    One click scrolls **one page of four rows** (the four visible rows); up and down are
+    symmetric (the first visible row reads 25→29→33→29), and eight up-clicks from the
+    bottom page (rows 57–60) land on rows 25–28. The "one line per press" reading is
+    refuted. The "one **hold** per arrow" (auto-repeat) half is not measured and stays
+    open. **(round 3)**
 15. **Full slider-track single-blit tiling (round 2).** The track is not one blit; the
     per-band body colouring is captured, but the tiling decomposition is S07's.
 16. **The round-2 original captures' saved-state setter record (round 2).** The EQ values
@@ -527,3 +620,34 @@ sprites) are never read. The pale cyan is filler in unblitted areas, not a key.
     original record of which script or key produced the round-2 `min`/`flat`/`max`
     captures is not in any capture record. Needs: a manifest sentence, or the three rows
     marked provisional.
+17. **`WinampVis` child window edges (round 3).** At window y = 92 the class `WinampVis`
+    covers client x 52–122; the left edge is bracketed to {51, 52} and the right edge only
+    to {123, 124, 125} (x=124 was masked by an open `#32768` MISC menu, x=123/125
+    unprobed). Needs: one launch with a 1-px grid over x=51 and over x=123–125 **with no
+    MISC click open** (do not click x ≥ 102 in the same launch), recording the guard
+    `class=` per point. **(round 3)**
+18. **Real clicks at y=100 for REM, SEL and LIST OPTS (round 3).** The round-3 real-click
+    run measured y=100 only for ADD and MISC; REM, SEL and LIST OPTS were measured at
+    y=92 only. Needs: the same real-click design (two real clicks plus a popup capture) at
+    (46,100), (74,100) and (242,100). **(round 3)**
+19. **MISC's posted hit area reaching x=122 (round 3, provisional).** The grid pre-flights
+    at x=104…122 all read `WinampVis` (no menu) and the x=124 pre-flight reads `#32768`;
+    the last click before it is x=122, so the menu was opened by the x=122 click and MISC's
+    *posted* hit area reaches x=122. The evidence is that single guard line (the menu is
+    not rendered in any playlist capture), so the reading is provisional. Needs: one launch
+    that posts (122,92) and then captures the `#32768` menu window directly, or records the
+    guard line at x=123/124. **(round 3)**
+20. **The 95-px preamp residual (round 3).** A fresh real preamp-to-max drag does not
+    reproduce the recorded real-drag capture `s01r2d_realinput_eq_ondrag_after_eq.png`
+    (95 of 31900 pixels differ, in the preamp column, bounds (18,22)-(32,50)); the cause is
+    not established. Needs: a manifest sentence naming the recorded capture's exact drag
+    path and state, or a fresh capture of the recorded state for comparison. **(round 3)**
+21. **The nature of the REM/SEL click-#1 dropdown menu (round 3).** The first real click on
+    REM and on SEL opens a four-item menu over the bottom bar; whether it is the button's
+    own dropdown or another window is not established. Needs: one capture of the menu
+    window opened by the real click #1 (the playlist render shows it; a `#32768`-class
+    capture would name it). **(round 3)**
+22. **The ON-indicator `use_eq` link (round 2; unchanged).** §3.1 records the ON
+    indicator's cell at client (18–20, 22–23) as associated with `use_eq`, but the link was
+    not independently re-verified (both round-2 autoload captures had `use_eq=1`). Needs:
+    one restart with `use_eq` toggled and nothing else changed, then a capture. **(round 3)**
