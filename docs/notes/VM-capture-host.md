@@ -170,7 +170,16 @@ Verdict: promising for deterministic 100 % captures, but not yet verified end to
 - **`SendInput` is silently dropped on the host** (returns `n=1`, `err=0`, cursor does not move) while `SetCursorPos` + legacy `mouse_event` work. Cause unexplained; record it in every manifest.
 - **Locale trap:** an unquoted `-Down 6,3` under the host's `de-AT` culture is parsed as `63`. The harness now parses points from text.
 
-## 11. Migration
+## 12. Only one sandbox at a time, and the pre-launch guard
+
+Measured 2026-10-15: Windows Sandbox allows **one instance at a time**. A second launch is refused with the dialog *"Es darf nur eine Instanz der Windows-Sandbox ausgeführt werden."* (`Only one instance of Windows Sandbox may be executed.`) and `WindowsSandbox.exe` exits with code 0 while leaving no session — which is exactly what made several earlier runs look like a broken feature.
+
+Two consequences:
+
+- **A sandbox stays open until it is closed.** A `LogonCommand` that finishes does **not** end it. Every run must therefore close its own sandbox when done (the bootstrap logs off inside it) — and a run that deliberately skips that (a probe) leaves one open for the next launch to trip over.
+- **Check before launching, never launch blind.** The host side must look for an open sandbox first (`WindowsSandboxClient` / `WindowsSandboxRemoteSession` processes) and, if one is open, stop and tell the owner instead of launching into the refusal dialog. The agent cannot close it: the window lives on the interactive desktop, which the agent's process cannot see (measured: its window enumeration returns zero windows while a sandbox is plainly open).
+
+## 13. Migration
 
 Once the guest passes the smoke test, the dirty room moves there and the host
 sandbox is retired — **after asking the owner**, since removing it is not
