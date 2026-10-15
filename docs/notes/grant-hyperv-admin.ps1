@@ -14,9 +14,19 @@
 
 $ErrorActionPreference = 'Stop'
 
-# The group's name is localised; find it by its well-known SID suffix (-2352).
-$group = Get-LocalGroup | Where-Object { $_.SID.Value -like '*-2352' } | Select-Object -First 1
-if (-not $group) { throw 'Hyper-V Administrators group not found on this machine.' }
+# The group's name is localised; find it by its well-known RID instead: the
+# Hyper-V Administrators group is S-1-5-32-578 (the Administrators group is -544).
+$group = Get-LocalGroup | Where-Object { $_.SID.Value -like '*-578' } | Select-Object -First 1
+if (-not $group) {
+    # Fall back to a name match, and say what was actually there so a failure is
+    # diagnosable instead of mysterious.
+    $group = Get-LocalGroup | Where-Object { $_.Name -like '*Hyper-V*' } | Select-Object -First 1
+}
+if (-not $group) {
+    Write-Host 'local groups on this machine:'
+    Get-LocalGroup | Sort-Object SID | Format-Table -AutoSize Name, SID
+    throw 'Hyper-V Administrators group not found (looked for SID *-578 and a name matching *Hyper-V*).'
+}
 
 $me = "$env:USERDOMAIN\$env:USERNAME"
 $members = Get-LocalGroupMember -Group $group | ForEach-Object { $_.Name }

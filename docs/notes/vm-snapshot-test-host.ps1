@@ -31,6 +31,7 @@ param(
     [Parameter(ParameterSetName = 'Remove', Mandatory)][string]$Remove,
     [Parameter(ParameterSetName = 'List')][switch]$List,
     [string]$VmName = 'rustamp-test',
+    [PSCredential]$Credential,
     [switch]$Force
 )
 
