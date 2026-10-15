@@ -48,7 +48,7 @@ pub use presenter::{MainWindowPresenter, PresenterError};
 pub use render::{frame_size, render_main_window};
 pub use shortcuts::{
     Binding, GLOBAL_TABLE, Key, MAIN_TABLE, Modifiers, ShortcutAction, ShortcutOutcome,
-    ShortcutWindow, VOLUME_STEP, lookup,
+    ShortcutWindow, TEN_TRACK_STEP, VOLUME_STEP, lookup,
 };
 pub use state::{MainWindowState, MonoStereo, TransportButton, TransportState, WindowButton};
 pub use widget::{Widget, hit_test};

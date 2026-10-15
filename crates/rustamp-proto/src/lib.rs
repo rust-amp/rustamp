@@ -13,8 +13,8 @@
 //!
 //! Nothing here encodes anything by itself: the `postcard` encoding and the
 //! length-prefixed framing live in `rustamp-ipc`. The `serde` derives are part
-//! of the frozen wire format (protocol version 1); changing them changes the
-//! wire and needs a new RFC.
+//! of the frozen wire format (protocol version 2, RFC 0005); changing them
+//! changes the wire and needs a new RFC.
 //!
 //! Conventions kept from `rustamp-core`:
 //! * Positions and durations on the wire are `u64` milliseconds.

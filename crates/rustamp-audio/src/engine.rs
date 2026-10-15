@@ -52,7 +52,7 @@ use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::{EqState, PlayerState, StreamInfo, TransportState};
 use rustamp_core::vis::VisFrame;
 
-use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, spawn};
+use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, clamped_index, spawn};
 use crate::ring::{GainState, RingSync, make_render};
 
 /// Engine configuration.
@@ -121,6 +121,8 @@ pub struct Engine {
     transport: TransportState,
     volume: u8,
     balance: i8,
+    /// "Stop after current track" is armed (RFC 0005 O8).
+    stop_after_current: bool,
 
     clock_origin: u64,
     timeline_origin: u64,
@@ -186,6 +188,7 @@ impl Engine {
             transport: TransportState::Stopped,
             volume: 255,
             balance: 0,
+            stop_after_current: false,
             clock_origin: 0,
             timeline_origin: 0,
             track_start: 0,
@@ -342,7 +345,13 @@ impl Engine {
             playlist_len: self.queue.len() as u32,
             stream: self.stream,
             eq: EqState::default(),
+            stop_after_current: self.stop_after_current,
         }
+    }
+
+    /// Whether "stop after current track" is armed (RFC 0005 O8).
+    pub fn stop_after_current(&self) -> bool {
+        self.stop_after_current
     }
 
     /// Newest vis frame, if one was published since the last call. Older frames
@@ -388,6 +397,9 @@ impl Engine {
             Command::SetVolume(v) => self.set_volume(*v),
             Command::SetBalance(b) => self.set_balance(*b),
             Command::PlayIndex(index) => self.play_index(*index),
+            Command::SkipBy { delta } => self.skip_by(*delta),
+            Command::PlayLast => self.play_last(),
+            Command::ToggleStopAfterCurrent => self.toggle_stop_after_current(),
             _ => Ok(()),
         }
     }
@@ -489,6 +501,57 @@ impl Engine {
             return self.play_index(prev);
         }
         self.send(DecodeMsg::Prev);
+        Ok(())
+    }
+
+    /// Move the current entry by `delta` positions in the order
+    /// [`Engine::next_track`]/[`Engine::prev_track`] follow, clamped to the
+    /// queue (RFC 0005 `Command::SkipBy`, ids 40195 / 40197).
+    ///
+    /// `delta = 0` and an empty queue are no-ops. S02 §1: changing the entry
+    /// while stopped does **not** start playback, so the stopped case only moves
+    /// the current index — unlike [`Engine::next_track`], which starts a run
+    /// there. The moved index is observable through
+    /// [`PlayerState::current_index`]; no event is published, because the entry
+    /// is not opened (there is no metadata to report). Play order (shuffle) vs
+    /// playlist order is open (RFC 0005 O9 / S15); this follows the queue order,
+    /// like `Next`/`Prev`.
+    pub fn skip_by(&mut self, delta: i32) -> Result<()> {
+        if delta == 0 || self.queue.is_empty() {
+            return Ok(());
+        }
+        if self.transport == TransportState::Stopped || self.to_decode.is_none() {
+            self.current = Some(clamped_index(
+                self.current.unwrap_or(0),
+                delta,
+                self.queue.len(),
+            ));
+            return Ok(());
+        }
+        self.send(DecodeMsg::SkipBy(delta));
+        Ok(())
+    }
+
+    /// Play the last queue entry (RFC 0005 `Command::PlayLast`); a no-op when
+    /// the queue is empty. Mirrors [`Engine::play_index`]`(0)` for the other end
+    /// of the list: the engine resolves the last entry, so the caller needs no
+    /// length.
+    pub fn play_last(&mut self) -> Result<()> {
+        match self.queue.len().checked_sub(1) {
+            Some(last) => self.play_index(last as u32),
+            None => Ok(()),
+        }
+    }
+
+    /// Toggle "stop after current track" (RFC 0005 O8, id 40157). While armed,
+    /// the end of the current track ends the run instead of advancing.
+    ///
+    /// The mode is a persistent toggle (the RFC's `Toggle*` convention); whether
+    /// the reference player clears it after it fires is unmeasured, and the mode
+    /// is observable through [`PlayerState::stop_after_current`].
+    pub fn toggle_stop_after_current(&mut self) -> Result<()> {
+        self.stop_after_current = !self.stop_after_current;
+        self.send(DecodeMsg::SetStopAfterCurrent(self.stop_after_current));
         Ok(())
     }
 
@@ -669,7 +732,20 @@ impl Engine {
             position_ms: 0,
             duration_ms: self.duration_ms,
         });
-        self.bus.publish(Event::PlaylistEnded);
+        // "Stop after current track" (RFC 0005 O8) halts the run at the end of
+        // the current track instead of advancing; that is a stop, not the end
+        // of the playlist. `PlaylistEnded` fires iff the queue was actually
+        // exhausted — the entry that just ended is the last one — so arming
+        // the mode on the last track still ends the playlist. The RFC leaves
+        // the exact interaction open (it rides on S02 open question 5); this
+        // is the implemented reading.
+        let queue_exhausted = self
+            .current
+            .map(|index| index as usize + 1 >= self.queue.len())
+            .unwrap_or(true);
+        if queue_exhausted {
+            self.bus.publish(Event::PlaylistEnded);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -707,6 +783,7 @@ impl Engine {
             sync: Arc::clone(&self.sync),
             vis_enabled: self.cfg.vis_enabled,
             vis_capacity: self.cfg.vis_capacity,
+            stop_after_current: self.stop_after_current,
         };
         let dsp = std::mem::take(&mut self.dsp);
         let (handle, vis_rx) = spawn(cfg, dsp, ring, index, start_at, ctl_rx, out_tx);

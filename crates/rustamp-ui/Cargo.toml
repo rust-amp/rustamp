@@ -10,6 +10,11 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+# The RFC 0005 `Command` payload enums (`OpenMediaKind`, `JumpTarget`,
+# `PrefsPage`) are not in `rustamp-core`'s explicit re-export list; importing
+# them from the permissive `rustamp-proto` avoids a `rustamp-core` contract
+# change (reported as a finding in task card I1).
+rustamp-proto.workspace = true
 rustamp-platform.workspace = true
 rustamp-skin.workspace = true
 rustamp-gfx.workspace = true

@@ -390,3 +390,226 @@ fn unknown_queue_index_is_an_error() {
     assert!(h.engine.play_index(0).is_ok());
     assert_eq!(h.engine.state().playlist_len, 1);
 }
+
+// ----- RFC 0005 commands -----
+
+#[test]
+fn play_index_zero_starts_the_first_entry() {
+    // RFC 0005 §5.5: "start of list" (40154) is the existing `PlayIndex(0)`.
+    let mut h = Harness::new(&[LONG_A, LONG_B]);
+    let (tx, rx) = command_channel();
+    tx.send(Command::PlayIndex(0)).unwrap();
+    assert_eq!(h.engine.drain_commands(&rx).unwrap(), 1);
+    assert!(h.wait_track(0), "index 0 must open");
+    assert_eq!(h.engine.current_index(), Some(0));
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+}
+
+#[test]
+fn play_last_plays_the_last_entry() {
+    let mut h = Harness::new(&[LONG_A, LONG_B]);
+    let (tx, rx) = command_channel();
+    tx.send(Command::PlayLast).unwrap();
+    assert_eq!(h.engine.drain_commands(&rx).unwrap(), 1);
+    assert!(h.wait_track(1), "the last entry must open");
+    assert_eq!(h.engine.current_index(), Some(1));
+    assert_eq!(h.engine.state().current_index, Some(1));
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+}
+
+#[test]
+fn play_last_on_an_empty_queue_is_a_no_op() {
+    let mut h = Harness::new(&[]);
+    assert!(h.engine.apply(&Command::PlayLast).is_ok());
+    assert_eq!(h.engine.current_index(), None);
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+    // `PlayIndex` stays strict: an out-of-range index is an error.
+    assert!(h.engine.apply(&Command::PlayIndex(0)).is_err());
+}
+
+#[test]
+fn skip_by_moves_the_entry_in_queue_order_and_clamps() {
+    let mut h = Harness::new(&[LONG_A, LONG_B, LONG_A]);
+    let (tx, rx) = command_channel();
+    tx.send(Command::PlayIndex(0)).unwrap();
+    h.engine.drain_commands(&rx).unwrap();
+    assert!(h.wait_track(0));
+
+    // Ten tracks forward from 0 is clamped to the last entry.
+    tx.send(Command::SkipBy { delta: 10 }).unwrap();
+    h.engine.drain_commands(&rx).unwrap();
+    assert!(h.wait_track(2), "clamped at the last entry");
+
+    // Two back, then ten back (clamped to the first).
+    tx.send(Command::SkipBy { delta: -2 }).unwrap();
+    h.engine.drain_commands(&rx).unwrap();
+    assert!(h.wait_track(0), "two entries back");
+
+    tx.send(Command::SkipBy { delta: -10 }).unwrap();
+    h.engine.drain_commands(&rx).unwrap();
+    assert!(h.wait_track(0), "clamped at the first entry");
+
+    // One forward again, to prove the move works both ways.
+    tx.send(Command::SkipBy { delta: 1 }).unwrap();
+    h.engine.drain_commands(&rx).unwrap();
+    assert!(h.wait_track(1), "one entry forward");
+}
+
+#[test]
+fn a_zero_skip_is_a_no_op_on_an_empty_and_a_loaded_queue() {
+    let mut h = Harness::new(&[LONG_A, LONG_B]);
+    h.engine.play_index(1).unwrap();
+    assert!(h.wait_track(1));
+    let before = h.engine.duration_frames();
+    h.engine.apply(&Command::SkipBy { delta: 0 }).unwrap();
+    assert_eq!(
+        h.engine.current_index(),
+        Some(1),
+        "delta 0 must not re-open the track"
+    );
+    assert_eq!(h.engine.duration_frames(), before);
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+
+    let mut empty = Harness::new(&[]);
+    assert!(empty.engine.apply(&Command::SkipBy { delta: 5 }).is_ok());
+    assert_eq!(empty.engine.current_index(), None);
+    assert_eq!(empty.engine.transport(), TransportState::Stopped);
+}
+
+#[test]
+fn skip_by_while_stopped_moves_without_starting_playback() {
+    // RFC 0005 §5.1 / S02 §1: changing the entry while stopped does not start
+    // playback.
+    let mut h = Harness::new(&[LONG_A, LONG_B, LONG_A]);
+    h.engine.stop().unwrap();
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+
+    h.engine.apply(&Command::SkipBy { delta: 2 }).unwrap();
+    assert_eq!(
+        h.engine.transport(),
+        TransportState::Stopped,
+        "no playback starts"
+    );
+    assert_eq!(h.engine.current_index(), Some(2), "the current entry moved");
+    assert_eq!(h.engine.state().current_index, Some(2));
+
+    // A later play starts from the moved entry.
+    h.engine.play().unwrap();
+    assert!(h.wait_track(2));
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+}
+
+#[test]
+fn stop_after_current_halts_at_the_end_of_the_track() {
+    let mut h = Harness::new(&[TRACK_A, TRACK_B]);
+    h.engine.apply(&Command::ToggleStopAfterCurrent).unwrap();
+    assert!(h.engine.stop_after_current());
+    assert!(
+        h.engine.state().stop_after_current,
+        "the mode is observable through PlayerState"
+    );
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    let total = track_frames(TRACK_A);
+    assert!(
+        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        "the run must stop at the end of the first track"
+    );
+    assert_eq!(
+        h.engine.current_index(),
+        Some(0),
+        "the second track must not be opened"
+    );
+    let events = h.drain_events();
+    assert!(
+        events.contains(&Event::StateChanged(TransportState::Stopped)),
+        "{events:?}"
+    );
+    assert!(
+        !events.contains(&Event::PlaylistEnded),
+        "the queue did not end; it was halted: {events:?}"
+    );
+    assert!(
+        h.engine.stop_after_current(),
+        "the mode stays armed (it is a toggle)"
+    );
+
+    // Toggling it off again lets the next run advance again.
+    h.engine.apply(&Command::ToggleStopAfterCurrent).unwrap();
+    assert!(!h.engine.stop_after_current());
+    assert!(!h.engine.state().stop_after_current);
+}
+
+#[test]
+fn arming_stop_after_current_mid_track_reaches_the_running_decode_thread() {
+    // The long tracks keep the decode thread inside the first one, so arming the
+    // mode is not a race: it travels as a control message to a live worker.
+    let mut h = Harness::new(&[LONG_A, LONG_B]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    h.engine.apply(&Command::ToggleStopAfterCurrent).unwrap();
+    assert!(h.engine.stop_after_current());
+
+    let total = track_frames(LONG_A);
+    assert!(
+        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        "the run must stop at the end of the first track"
+    );
+    assert_eq!(h.engine.current_index(), Some(0));
+    let events = h.drain_events();
+    assert!(!events.contains(&Event::PlaylistEnded), "{events:?}");
+}
+
+#[test]
+fn stop_after_current_on_the_last_track_still_ends_the_playlist() {
+    // RFC 0005 O8 leaves the `PlaylistEnded` interaction open; the implemented
+    // reading: the event fires iff the queue was actually exhausted. Arming the
+    // mode while the last entry plays therefore still ends the playlist — the
+    // halt is a stop instead of an advance only when a next entry exists.
+    let mut h = Harness::new(&[TRACK_A, TRACK_B]);
+    h.engine.apply(&Command::ToggleStopAfterCurrent).unwrap();
+    h.engine.play_index(1).unwrap();
+    assert!(h.wait_track(1));
+    let total = track_frames(TRACK_B);
+    assert!(
+        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        "the run must stop at the end of the last track"
+    );
+    assert_eq!(h.engine.current_index(), Some(1), "no next entry exists");
+    let events = h.drain_events();
+    assert!(
+        events.contains(&Event::PlaylistEnded),
+        "the queue was exhausted: {events:?}"
+    );
+    assert!(
+        events.contains(&Event::StateChanged(TransportState::Stopped)),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn the_engine_ignores_the_app_level_commands() {
+    // The app/window commands are not engine mutations; applying them must not
+    // disturb the transport (RFC 0005 §3).
+    let mut h = Harness::new(&[LONG_A]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    for command in [
+        Command::OpenFileInfo,
+        Command::OpenAbout,
+        Command::OpenSkinBrowser,
+        Command::RefreshSkin,
+        Command::Minimize,
+        Command::FocusNextWindow,
+        Command::ShowMainWindow,
+        Command::CloseFocusedWindow,
+        Command::OpenMainMenu,
+        Command::ConfigureVisPlugin,
+        Command::ToggleVisPlugin,
+    ] {
+        assert!(h.engine.apply(&command).is_ok(), "{command:?}");
+    }
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+    assert_eq!(h.engine.current_index(), Some(0));
+}

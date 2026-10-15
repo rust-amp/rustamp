@@ -1746,6 +1746,7 @@ dependencies = [
  "rustamp-core",
  "rustamp-gfx",
  "rustamp-platform",
+ "rustamp-proto",
  "rustamp-skin",
  "softbuffer",
  "thiserror 2.0.21",

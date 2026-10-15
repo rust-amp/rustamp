@@ -14,7 +14,14 @@ use crate::shm::{RingDirection, RingExpect, RingKind, RingRefuseReason};
 /// * `0`: `Hello`, `Ping`/`Pong`, `LoadPlugin`, `PluginLoaded`/`PluginError`,
 ///   `PlayerStateUpdate`, `CommandFromPlugin`, `Vis`, `Shutdown`, `WinampIpc`.
 /// * `1`: adds `RingOffer`, `RingReady`, `RingRefused` (RFC 0003).
-pub const PROTOCOL_VERSION: u32 = 1;
+/// * `2`: adds the RFC 0005 app-level `Command` variants, `WindowId::Video`,
+///   the `PlayerState::stop_after_current` field and [`Message::CommandToHost`]
+///   (RFC 0005). The command surface is part of the protocol: a v1-only peer
+///   cannot decode a `CommandFromPlugin` carrying a new variant, so the bump
+///   turns a mixed-version pair into a clean `Hello` rejection instead of a
+///   postcard decode error (RFC 0003 §9's reasoning for the 0 -> 1 bump).
+///   RFC 0006 takes this to 3 when it lands (sequential bumps).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Wire form of [`VisFrame`] (flat vectors, `channel-major`: all samples of
 /// channel 0, then channel 1). Each vector has `VIS_CHANNELS * VIS_SAMPLES` values.
@@ -151,6 +158,16 @@ pub enum Message {
         /// Second argument, zero-extended to 64 bits.
         lparam: u64,
     },
+    /// M: the player asks the host to do something that only the host can do —
+    /// the player -> host direction of RFC 0005 §5.4
+    /// (`ConfigureVisPlugin`/`ToggleVisPlugin`, which the app applies *through*
+    /// the host because the plug-in runs in `rustamp-plughost32.exe`).
+    ///
+    /// Appended at the end of the enum so every earlier `Message` keeps its
+    /// variant index (and its bytes). **Placeholder overlap:** how this relates
+    /// to `WinampIpc` is S10's to resolve (RFC 0005 O13); the handling lands
+    /// with M3.
+    CommandToHost(Command),
 }
 
 impl Message {

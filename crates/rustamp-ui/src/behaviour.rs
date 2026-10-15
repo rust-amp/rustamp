@@ -67,11 +67,19 @@ pub fn transport_transition(from: TransportState, command: &Command) -> Option<T
             TransportState::Stopped => None,
         },
         Command::Stop | Command::StopWithFadeout => Some(TransportState::Stopped),
-        // Previous/next change the playlist entry but not the transport state;
-        // seeking while stopped has no effect on it (S02 §1).
-        Command::Next | Command::Prev | Command::Seek { .. } | Command::SeekRelative { .. } => {
-            Some(from)
+        // Playing an entry starts playback (RFC 0005 §5.1/§5.5; owner decision
+        // O1: start and end of list play).
+        Command::PlayIndex(_) | Command::PlayEntry(_) | Command::PlayLast => {
+            Some(TransportState::Playing)
         }
+        // Previous/next change the playlist entry but not the transport state;
+        // seeking while stopped has no effect on it (S02 §1). `SkipBy` is the
+        // same kind of move (RFC 0005 §5.1).
+        Command::Next
+        | Command::Prev
+        | Command::SkipBy { .. }
+        | Command::Seek { .. }
+        | Command::SeekRelative { .. } => Some(from),
         _ => None,
     }
 }
@@ -1378,5 +1386,84 @@ mod tests {
         assert!(machine.state().position_thumb_pressed);
         machine.mouse_up(x, y, 0);
         assert!(!machine.state().position_thumb_pressed);
+    }
+
+    // ----- RFC 0005 predictions -----
+
+    #[test]
+    fn playing_an_entry_predicts_the_playing_state() {
+        use TransportState::{Paused, Playing, Stopped};
+        // Owner decision O1: start and end of list play.
+        for from in [Stopped, Playing, Paused] {
+            for command in [
+                Command::PlayIndex(0),
+                Command::PlayIndex(7),
+                Command::PlayEntry(EntryId(1)),
+                Command::PlayLast,
+            ] {
+                assert_eq!(
+                    transport_transition(from, &command),
+                    Some(Playing),
+                    "{from:?} + {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_skip_by_moves_the_entry_without_changing_the_transport() {
+        use TransportState::{Paused, Playing, Stopped};
+        // S02 §1: changing the entry while stopped does not start playback.
+        for from in [Stopped, Playing, Paused] {
+            for delta in [10, -10, 0] {
+                assert_eq!(
+                    transport_transition(from, &Command::SkipBy { delta }),
+                    Some(from),
+                    "{from:?} + {delta}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_rfc_0005_app_commands_are_not_part_of_the_transport_machine() {
+        for command in [
+            Command::ToggleStopAfterCurrent,
+            Command::OpenFileInfo,
+            Command::OpenMedia {
+                kind: rustamp_proto::command::OpenMediaKind::Files,
+                play: true,
+            },
+            Command::RefreshSkin,
+            Command::Minimize,
+        ] {
+            assert_eq!(
+                transport_transition(TransportState::Playing, &command),
+                None,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_machine_follows_the_playing_predictions() {
+        let mut machine = MainWindow::new();
+        machine.handle_command(&Command::PlayIndex(0), 0);
+        assert_eq!(machine.state().transport, TransportState::Playing);
+
+        machine.handle_event(&Event::StateChanged(TransportState::Stopped), 0);
+        machine.handle_command(&Command::PlayLast, 0);
+        assert_eq!(machine.state().transport, TransportState::Playing);
+
+        machine.handle_event(&Event::StateChanged(TransportState::Stopped), 0);
+        machine.handle_command(&Command::PlayEntry(EntryId(1)), 0);
+        assert_eq!(machine.state().transport, TransportState::Playing);
+
+        // A skip leaves the transport alone (S02 §1).
+        machine.handle_command(&Command::SkipBy { delta: 10 }, 0);
+        assert_eq!(machine.state().transport, TransportState::Playing);
+        machine.handle_event(&Event::StateChanged(TransportState::Stopped), 0);
+        machine.handle_command(&Command::SkipBy { delta: 10 }, 0);
+        assert_eq!(machine.state().transport, TransportState::Stopped);
     }
 }

@@ -7,7 +7,9 @@
 //!
 //! Gapless: when a track ends the loop simply opens the next queue entry and
 //! keeps writing, so the ring never runs dry at the seam and the timeline stays
-//! continuous. Nothing is dropped and no silence is inserted.
+//! continuous. Nothing is dropped and no silence is inserted. The one exception
+//! is the "stop after current track" mode (RFC 0005 O8): when it is armed the
+//! run ends at the end of the current track instead of opening the next entry.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -97,6 +99,12 @@ pub(crate) enum DecodeMsg {
     Next,
     /// Abandon the current track and restart the previous one.
     Prev,
+    /// Abandon the current track and jump `delta` entries (RFC 0005
+    /// `Command::SkipBy`); the target is clamped to the queue.
+    SkipBy(i32),
+    /// Arm/disarm "stop after current track" (RFC 0005 O8): when armed, the run
+    /// ends at the end of the current track instead of advancing.
+    SetStopAfterCurrent(bool),
 }
 
 /// Reports, decode thread -> engine.
@@ -172,6 +180,10 @@ pub(crate) struct Config {
     pub sync: Arc<RingSync>,
     pub vis_enabled: bool,
     pub vis_capacity: usize,
+    /// The engine's "stop after current track" mode at the moment the run
+    /// started (RFC 0005 O8); later toggles arrive as
+    /// [`DecodeMsg::SetStopAfterCurrent`].
+    pub stop_after_current: bool,
 }
 
 /// Start the decode thread. Returns its handle and the vis consumer.
@@ -185,6 +197,7 @@ pub(crate) fn spawn(
     tx: Sender<DecodeOut>,
 ) -> (JoinHandle<()>, Consumer<VisFrame>) {
     let (vis, vis_rx) = VisTap::new(cfg.vis_capacity);
+    let stop_after_current = cfg.stop_after_current;
     let mut worker = Worker {
         cfg,
         ring,
@@ -201,6 +214,7 @@ pub(crate) fn spawn(
         paused: false,
         quitting: false,
         stopped: false,
+        stop_after_current,
         pending_seek: None,
         pending_skip: None,
         drain_epoch: None,
@@ -226,10 +240,21 @@ enum Outcome {
     SkipNext,
     /// The engine asked for the previous track.
     SkipPrev,
+    /// The engine asked to move `delta` entries (`Command::SkipBy`).
+    SkipBy(i32),
     /// Playback was stopped.
     Stop,
     /// The engine is shutting down.
     Quit,
+}
+
+/// The queue index `delta` entries away from `index`, clamped to `0..len`.
+///
+/// `len` is never zero here: the run loop has already returned when the queue is
+/// empty.
+pub(crate) fn clamped_index(index: u32, delta: i32, len: usize) -> u32 {
+    let last = len.saturating_sub(1) as i64;
+    (i64::from(index) + i64::from(delta)).clamp(0, last) as u32
 }
 
 struct Worker {
@@ -253,6 +278,9 @@ struct Worker {
     paused: bool,
     quitting: bool,
     stopped: bool,
+    /// "Stop after current track" is armed (RFC 0005 O8): the run ends at the
+    /// end of the current track instead of advancing.
+    stop_after_current: bool,
     pending_seek: Option<(Duration, u64, u32)>,
     pending_skip: Option<Outcome>,
     /// Ring epoch the consumer still has to drain before post-seek frames may
@@ -287,9 +315,22 @@ impl Worker {
                 self.apply_seek(&mut decoder, to, frames, seq);
             }
             let outcome = self.track_loop(&mut decoder);
+            if outcome == Outcome::Ended && self.stop_after_current {
+                // "Stop after current track" (RFC 0005 O8): the run ends here
+                // instead of opening the next entry. Reporting the end of the
+                // stream is what lets the engine stop the transport and park the
+                // device, exactly as it does at the end of the queue.
+                let _ = self.tx.send(DecodeOut::EndOfStream {
+                    timeline_end: self.timeline,
+                });
+                break;
+            }
             match outcome {
                 Outcome::Ended | Outcome::SkipNext => index = index.saturating_add(1),
                 Outcome::SkipPrev => index = index.saturating_sub(1),
+                Outcome::SkipBy(delta) => {
+                    index = clamped_index(index, delta, self.cfg.queue.len());
+                }
                 Outcome::Stop | Outcome::Quit => break,
             }
         }
@@ -462,6 +503,11 @@ impl Worker {
                     self.pending_skip = Some(Outcome::SkipPrev);
                     return true;
                 }
+                Ok(DecodeMsg::SkipBy(delta)) => {
+                    self.pending_skip = Some(Outcome::SkipBy(delta));
+                    return true;
+                }
+                Ok(DecodeMsg::SetStopAfterCurrent(armed)) => self.stop_after_current = armed,
                 Ok(DecodeMsg::Seek {
                     to,
                     track_frames,

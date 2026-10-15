@@ -25,6 +25,12 @@
 
 use rustamp_core::command::Command;
 use rustamp_core::state::WindowId;
+// `rustamp-core` re-exports the RFC 0005 `Command` *variants* through `Command`
+// automatically, but its `command` module re-exports an explicit item list, so
+// the three new *types* are not reachable there. They come straight from the
+// permissive `rustamp-proto` instead of editing `rustamp-core` (a contract
+// change). Reported as a finding.
+use rustamp_proto::command::{JumpTarget, OpenMediaKind, PrefsPage};
 
 use crate::behaviour::{MainWindow, core_volume};
 
@@ -32,12 +38,24 @@ use crate::behaviour::{MainWindow, core_volume};
 /// (S03 §1: "Rewind 5 seconds" / "Forward 5 seconds").
 pub const SEEK_STEP_MS: i64 = 5000;
 
+/// The step of the `Num1`/`Num3` keys ("10 tracks back" / "10 tracks
+/// forward", S03 §1), carried on the wire as `Command::SkipBy { delta }`
+/// (RFC 0005 §5.1: the step stays in the tables that already carry the ids, so
+/// the engine has one generic code path).
+pub const TEN_TRACK_STEP: i32 = 10;
+
 /// The volume change of one `Up`/`Down`/`Num8`/`Num2` key press, in core
 /// volume units (`0..=255`).
 ///
-/// **provisional: step size not in S02/S03.** S03 §1 only records "Volume up"
-/// and "Volume down" (themselves provisional); the step is a placeholder.
-pub const VOLUME_STEP: u8 = 10;
+/// **Provenance (measured, 2026-10-15):** posting `40058`/`40059` to the
+/// reference 2.95 player moves its volume in steps of **4** core units
+/// (`0 -> 4 -> 8 ...`), saturating at `0`/`255` with partial end steps
+/// (`253 -> 255`, `2 -> 0`); cross-checked through the volume write path. The
+/// measurement memo is `notes/2026-10-15-wm-command-o5-o6-o7-o10-o15.md`
+/// (dirty room) and RFC 0005 §8 (O10 settled). The keys themselves stay
+/// provisional rows of S03 §1, and the step never crosses IPC: the wire carries
+/// the absolute [`Command::SetVolume`] only.
+pub const VOLUME_STEP: u8 = 4;
 
 /// A key, independent of any windowing library.
 ///
@@ -938,6 +956,10 @@ impl MainWindow {
     }
 
     /// Dispatches one action (S03 §1) against the machine.
+    ///
+    /// The match is exhaustive on purpose: a new [`ShortcutAction`] must be
+    /// given a verdict here (a `Command`, `Handled` or `Unhandled` with a
+    /// reason) instead of falling into a catch-all.
     pub fn dispatch_shortcut(&mut self, action: ShortcutAction, now_ms: u64) -> ShortcutOutcome {
         use ShortcutAction as A;
         let commands = match action {
@@ -968,7 +990,79 @@ impl MainWindow {
                 self.toggle_time_remaining(now_ms);
                 return ShortcutOutcome::Handled;
             }
-            other => return ShortcutOutcome::Unhandled(other),
+
+            // ----- RFC 0005: actions that reuse an existing command -----
+            // Start/end of list play (owner decision O1); `PlayLast` is the
+            // engine's job for the mouse-only "end of list" action (S03 §5).
+            A::StartOfList => vec![Command::PlayIndex(0)],
+            A::ToggleVideoWindow => vec![Command::ToggleWindow(WindowId::Video)],
+
+            // ----- RFC 0005: new engine commands -----
+            A::StopAfterCurrent => vec![Command::ToggleStopAfterCurrent],
+            A::TenTracksForward => vec![Command::SkipBy {
+                delta: TEN_TRACK_STEP,
+            }],
+            A::TenTracksBack => vec![Command::SkipBy {
+                delta: -TEN_TRACK_STEP,
+            }],
+
+            // ----- RFC 0005: new app commands (dialogs) -----
+            A::OpenFiles => vec![Command::OpenMedia {
+                kind: OpenMediaKind::Files,
+                play: true,
+            }],
+            A::OpenLocation => vec![Command::OpenMedia {
+                kind: OpenMediaKind::Location,
+                play: true,
+            }],
+            A::OpenDirectory => vec![Command::OpenMedia {
+                kind: OpenMediaKind::Directory,
+                play: true,
+            }],
+            A::JumpToFile => vec![Command::OpenJump {
+                target: JumpTarget::File,
+            }],
+            A::JumpToTime => vec![Command::OpenJump {
+                target: JumpTarget::Time,
+            }],
+            A::ViewFileInfo => vec![Command::OpenFileInfo],
+            A::SelectVisPlugin => vec![Command::OpenPrefsPage(PrefsPage::VisPlugin)],
+            A::VisOptions => vec![Command::OpenPrefsPage(PrefsPage::VisOptions)],
+            A::About => vec![Command::OpenAbout],
+            A::SkinBrowser => vec![Command::OpenSkinBrowser],
+            A::RefreshSkin => vec![Command::RefreshSkin],
+            A::EditBookmarks => vec![Command::OpenBookmarkEditor],
+            A::AddBookmark => vec![Command::AddBookmark],
+
+            // ----- RFC 0005: new app commands (window management) -----
+            A::ToggleEasyMove => vec![Command::ToggleEasyMove],
+            A::Minimize => vec![Command::Minimize],
+            A::NextWindow => vec![Command::FocusNextWindow],
+            A::ShowMainWindow => vec![Command::ShowMainWindow],
+            A::CloseFocusedWindow => vec![Command::CloseFocusedWindow],
+            A::OpenMainMenu => vec![Command::OpenMainMenu],
+
+            // ----- RFC 0005: app -> host bridge (handling deferred to M3) -----
+            A::ConfigureVisPlugin => vec![Command::ConfigureVisPlugin],
+            A::ToggleVisPlugin => vec![Command::ToggleVisPlugin],
+
+            // Deferred (RFC 0005 §11): the minibrowser, the video-fullscreen
+            // mode and the playlist search have no window, menu or plug-in
+            // bridge yet, so there is nothing to send. The host logs and drops
+            // these ids.
+            A::ToggleMinibrowser
+            | A::MinibrowserAltRight
+            | A::MinibrowserAltLeft
+            | A::MinibrowserCtrlR
+            | A::MinibrowserCtrlL
+            | A::MinibrowserCtrlO
+            | A::MinibrowserCtrlAltR
+            | A::PlaylistSearch
+            | A::ToggleVideoFullscreen
+            // App-local (RFC 0005 §10): the effect is a new process, entirely
+            // outside the player, so there is deliberately no variant. The
+            // platform layer consumes this `Unhandled` action.
+            | A::NewInstance => return ShortcutOutcome::Unhandled(action),
         };
         for command in &commands {
             self.handle_command(command, now_ms);
@@ -1314,28 +1408,170 @@ mod tests {
         assert!(!m.state().time_remaining);
     }
 
-    // ----- Unhandled -----
+    // ----- Unhandled (RFC 0005 §10/§11) -----
+
+    /// The actions with no `Command`: the deferred ones and the app-local one.
+    fn deferred_actions() -> Vec<ShortcutAction> {
+        vec![
+            // Minibrowser (RFC 0005 §11.1): no window, no owning spec.
+            ShortcutAction::ToggleMinibrowser,
+            ShortcutAction::MinibrowserAltRight,
+            ShortcutAction::MinibrowserAltLeft,
+            ShortcutAction::MinibrowserCtrlR,
+            ShortcutAction::MinibrowserCtrlL,
+            ShortcutAction::MinibrowserCtrlO,
+            ShortcutAction::MinibrowserCtrlAltR,
+            // Video fullscreen (§11.2) and playlist search (§11.3).
+            ShortcutAction::ToggleVideoFullscreen,
+            ShortcutAction::PlaylistSearch,
+            // App-local (§10): a new process, outside the player.
+            ShortcutAction::NewInstance,
+        ]
+    }
+
+    /// Every distinct `ShortcutAction`, written out independently of the table.
+    fn all_actions() -> Vec<ShortcutAction> {
+        vec![
+            ShortcutAction::Preferences,
+            ShortcutAction::ToggleAlwaysOnTop,
+            ShortcutAction::ToggleRepeat,
+            ShortcutAction::ToggleShuffle,
+            ShortcutAction::OpenFiles,
+            ShortcutAction::ToggleEqualizer,
+            ShortcutAction::TogglePlaylistEditor,
+            ShortcutAction::About,
+            ShortcutAction::OpenMainMenu,
+            ShortcutAction::PreviousTrack,
+            ShortcutAction::Play,
+            ShortcutAction::PauseUnpause,
+            ShortcutAction::Stop,
+            ShortcutAction::NextTrack,
+            ShortcutAction::VolumeUp,
+            ShortcutAction::VolumeDown,
+            ShortcutAction::Forward5s,
+            ShortcutAction::Rewind5s,
+            ShortcutAction::NextWindow,
+            ShortcutAction::ToggleWindowShade,
+            ShortcutAction::StopWithFadeout,
+            ShortcutAction::StartOfList,
+            ShortcutAction::StopAfterCurrent,
+            ShortcutAction::ToggleDoubleSize,
+            ShortcutAction::OpenLocation,
+            ShortcutAction::ToggleEasyMove,
+            ShortcutAction::OpenDirectory,
+            ShortcutAction::ViewFileInfo,
+            ShortcutAction::SelectVisPlugin,
+            ShortcutAction::ToggleVisPlugin,
+            ShortcutAction::JumpToTime,
+            ShortcutAction::JumpToFile,
+            ShortcutAction::TenTracksForward,
+            ShortcutAction::TenTracksBack,
+            ShortcutAction::SkinBrowser,
+            ShortcutAction::ConfigureVisPlugin,
+            ShortcutAction::CloseFocusedWindow,
+            ShortcutAction::ToggleTimeRemaining,
+            ShortcutAction::ShowMainWindow,
+            ShortcutAction::RefreshSkin,
+            ShortcutAction::ToggleMinibrowser,
+            ShortcutAction::MinibrowserAltRight,
+            ShortcutAction::MinibrowserAltLeft,
+            ShortcutAction::MinibrowserCtrlR,
+            ShortcutAction::MinibrowserCtrlL,
+            ShortcutAction::MinibrowserCtrlO,
+            ShortcutAction::NewInstance,
+            ShortcutAction::MinibrowserCtrlAltR,
+            ShortcutAction::VisOptions,
+            ShortcutAction::PlaylistSearch,
+            ShortcutAction::EditBookmarks,
+            ShortcutAction::AddBookmark,
+            ShortcutAction::ToggleVideoWindow,
+            ShortcutAction::Minimize,
+            ShortcutAction::ToggleVideoFullscreen,
+        ]
+    }
 
     #[test]
-    fn actions_without_a_command_are_unhandled_with_their_id() {
-        let expected_unhandled = [
-            40188, 40186, 40043, 40321, 40320, 40194, 40193, 40191, 40221, 40192, 40029, 40185,
-            40187, 40334, 40305, 40317, 40219, 40298, 40157, 40328, 40041, 40318, 40224, 40291,
-            40197, 40195, 40337, 40063, 40258, 40154,
-        ];
-        let mut seen = Vec::new();
+    fn there_are_exactly_the_s03_action_count() {
+        let actions = all_actions();
+        assert_eq!(actions.len(), 55);
+        let distinct: std::collections::BTreeSet<_> =
+            actions.iter().map(|a| a.command_id()).collect();
+        assert_eq!(distinct.len(), 55, "the ids are distinct");
+        let deferred: std::collections::BTreeSet<_> =
+            deferred_actions().iter().map(|a| a.command_id()).collect();
+        assert_eq!(deferred.len(), 10);
+    }
+
+    #[test]
+    fn unhandled_is_exactly_the_deferred_set_and_new_instance() {
+        let deferred = deferred_actions();
+        for action in all_actions() {
+            let mut m = MainWindow::new();
+            let outcome = m.dispatch_shortcut(action, 0);
+            let is_unhandled = matches!(outcome, ShortcutOutcome::Unhandled(_));
+            assert_eq!(
+                is_unhandled,
+                deferred.contains(&action),
+                "{action:?} -> {outcome:?}"
+            );
+            if is_unhandled {
+                assert_eq!(outcome, ShortcutOutcome::Unhandled(action));
+            }
+        }
+    }
+
+    #[test]
+    fn the_deferred_and_app_local_actions_leave_the_machine_untouched() {
+        for action in deferred_actions() {
+            let mut m = MainWindow::new();
+            let before = m.state().clone();
+            assert_eq!(
+                m.dispatch_shortcut(action, 0),
+                ShortcutOutcome::Unhandled(action),
+                "{action:?}"
+            );
+            assert_eq!(m.state(), &before, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn every_other_action_produces_a_command_or_is_handled() {
+        let deferred = deferred_actions();
+        for action in all_actions() {
+            if deferred.contains(&action) {
+                continue;
+            }
+            let mut m = MainWindow::new();
+            match m.dispatch_shortcut(action, 0) {
+                ShortcutOutcome::Commands(commands) => {
+                    assert!(!commands.is_empty(), "{action:?}");
+                }
+                ShortcutOutcome::Handled => {
+                    // Only the UI-local elapsed/remaining toggle (RFC 0005 §9).
+                    assert_eq!(action, ShortcutAction::ToggleTimeRemaining);
+                }
+                other => panic!("{action:?} -> {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_main_table_rows_that_were_unhandled_now_map_or_stay_deferred() {
+        let deferred_ids: std::collections::BTreeSet<u32> =
+            deferred_actions().iter().map(|a| a.command_id()).collect();
+        let mut unhandled = Vec::new();
         for (key, mods, id) in s03_main_rows() {
             let mut m = MainWindow::new();
             if let Some(ShortcutOutcome::Unhandled(action)) = press(&mut m, key, mods) {
                 assert_eq!(action.command_id(), id);
-                seen.push(id);
+                assert!(deferred_ids.contains(&id), "id {id} must not be unhandled");
+                unhandled.push(id);
             }
         }
-        for id in expected_unhandled {
-            assert!(seen.contains(&id), "{id} should be unhandled");
-        }
-        let distinct: std::collections::BTreeSet<_> = seen.iter().collect();
-        assert_eq!(distinct.len(), expected_unhandled.len());
+        // Reachable from the main table: the minibrowser toggle, the app-local
+        // new instance, the playlist search and the video fullscreen.
+        let distinct: std::collections::BTreeSet<u32> = unhandled.iter().copied().collect();
+        assert_eq!(distinct, [40298, 40305, 40318, 40337].into_iter().collect());
     }
 
     #[test]
@@ -1343,10 +1579,205 @@ mod tests {
         let mut m = MainWindow::new();
         let before = m.state().clone();
         assert_eq!(
-            press(&mut m, k('J'), Modifiers::NONE),
-            Some(ShortcutOutcome::Unhandled(ShortcutAction::JumpToFile))
+            press(&mut m, Key::F(3), Modifiers::NONE),
+            Some(ShortcutOutcome::Unhandled(ShortcutAction::PlaylistSearch))
         );
         assert_eq!(m.state(), &before);
+    }
+
+    // ----- RFC 0005 dispatch -----
+
+    #[test]
+    fn the_rfc_0005_actions_emit_their_commands() {
+        let cases: [(ShortcutAction, Command); 26] = [
+            (ShortcutAction::ViewFileInfo, Command::OpenFileInfo),
+            (ShortcutAction::ToggleEasyMove, Command::ToggleEasyMove),
+            (ShortcutAction::OpenMainMenu, Command::OpenMainMenu),
+            (ShortcutAction::AddBookmark, Command::AddBookmark),
+            (ShortcutAction::EditBookmarks, Command::OpenBookmarkEditor),
+            (
+                ShortcutAction::JumpToFile,
+                Command::OpenJump {
+                    target: JumpTarget::File,
+                },
+            ),
+            (
+                ShortcutAction::JumpToTime,
+                Command::OpenJump {
+                    target: JumpTarget::Time,
+                },
+            ),
+            (
+                ShortcutAction::SelectVisPlugin,
+                Command::OpenPrefsPage(PrefsPage::VisPlugin),
+            ),
+            (
+                ShortcutAction::VisOptions,
+                Command::OpenPrefsPage(PrefsPage::VisOptions),
+            ),
+            (
+                ShortcutAction::ConfigureVisPlugin,
+                Command::ConfigureVisPlugin,
+            ),
+            (ShortcutAction::ToggleVisPlugin, Command::ToggleVisPlugin),
+            (
+                ShortcutAction::OpenFiles,
+                Command::OpenMedia {
+                    kind: OpenMediaKind::Files,
+                    play: true,
+                },
+            ),
+            (
+                ShortcutAction::OpenLocation,
+                Command::OpenMedia {
+                    kind: OpenMediaKind::Location,
+                    play: true,
+                },
+            ),
+            (
+                ShortcutAction::OpenDirectory,
+                Command::OpenMedia {
+                    kind: OpenMediaKind::Directory,
+                    play: true,
+                },
+            ),
+            (ShortcutAction::Minimize, Command::Minimize),
+            (ShortcutAction::SkinBrowser, Command::OpenSkinBrowser),
+            (
+                ShortcutAction::StopAfterCurrent,
+                Command::ToggleStopAfterCurrent,
+            ),
+            (
+                ShortcutAction::ToggleVideoWindow,
+                Command::ToggleWindow(WindowId::Video),
+            ),
+            (ShortcutAction::About, Command::OpenAbout),
+            (
+                ShortcutAction::CloseFocusedWindow,
+                Command::CloseFocusedWindow,
+            ),
+            (ShortcutAction::RefreshSkin, Command::RefreshSkin),
+            (
+                ShortcutAction::TenTracksBack,
+                Command::SkipBy { delta: -10 },
+            ),
+            (
+                ShortcutAction::TenTracksForward,
+                Command::SkipBy { delta: 10 },
+            ),
+            (ShortcutAction::NextWindow, Command::FocusNextWindow),
+            (ShortcutAction::ShowMainWindow, Command::ShowMainWindow),
+            (ShortcutAction::StartOfList, Command::PlayIndex(0)),
+        ];
+        for (action, expected) in cases {
+            let mut m = MainWindow::new();
+            assert_eq!(
+                m.dispatch_shortcut(action, 0),
+                ShortcutOutcome::Commands(vec![expected]),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rfc_0005_actions_are_reachable_from_their_s03_keys() {
+        let cases: [(Key, Modifiers, Command); 18] = [
+            (Key::Digit(3), Modifiers::ALT, Command::OpenFileInfo),
+            (k('E'), Modifiers::CTRL, Command::ToggleEasyMove),
+            (k('F'), Modifiers::ALT, Command::OpenMainMenu),
+            (k('I'), Modifiers::ALT, Command::AddBookmark),
+            (
+                k('I'),
+                Modifiers::CTRL.union(Modifiers::ALT),
+                Command::OpenBookmarkEditor,
+            ),
+            (
+                k('J'),
+                Modifiers::NONE,
+                Command::OpenJump {
+                    target: JumpTarget::File,
+                },
+            ),
+            (
+                k('J'),
+                Modifiers::CTRL,
+                Command::OpenJump {
+                    target: JumpTarget::Time,
+                },
+            ),
+            (
+                k('K'),
+                Modifiers::CTRL,
+                Command::OpenPrefsPage(PrefsPage::VisPlugin),
+            ),
+            (k('K'), Modifiers::ALT, Command::ConfigureVisPlugin),
+            (
+                k('K'),
+                Modifiers::CTRL.union(Modifiers::SHIFT),
+                Command::ToggleVisPlugin,
+            ),
+            (
+                k('L'),
+                Modifiers::NONE,
+                Command::OpenMedia {
+                    kind: OpenMediaKind::Files,
+                    play: true,
+                },
+            ),
+            (
+                k('L'),
+                Modifiers::CTRL,
+                Command::OpenMedia {
+                    kind: OpenMediaKind::Location,
+                    play: true,
+                },
+            ),
+            (
+                k('L'),
+                Modifiers::SHIFT,
+                Command::OpenMedia {
+                    kind: OpenMediaKind::Directory,
+                    play: true,
+                },
+            ),
+            (k('M'), Modifiers::ALT, Command::Minimize),
+            (
+                k('O'),
+                Modifiers::ALT,
+                Command::OpenPrefsPage(PrefsPage::VisOptions),
+            ),
+            (k('S'), Modifiers::ALT, Command::OpenSkinBrowser),
+            (k('V'), Modifiers::CTRL, Command::ToggleStopAfterCurrent),
+            (
+                k('V'),
+                Modifiers::ALT,
+                Command::ToggleWindow(WindowId::Video),
+            ),
+        ];
+        for (key, mods, expected) in cases {
+            let mut m = MainWindow::new();
+            assert_eq!(cmds(&mut m, key, mods), vec![expected], "{key:?} {mods:?}");
+        }
+    }
+
+    #[test]
+    fn the_remaining_new_keys_emit_their_commands() {
+        let n = Modifiers::NONE;
+        let c = Modifiers::CTRL;
+        let cases: [(Key, Modifiers, Command); 8] = [
+            (Key::F(1), n, Command::OpenAbout),
+            (Key::F(4), c, Command::CloseFocusedWindow),
+            (Key::F(5), n, Command::RefreshSkin),
+            (Key::Numpad(1), n, Command::SkipBy { delta: -10 }),
+            (Key::Numpad(3), n, Command::SkipBy { delta: 10 }),
+            (Key::Tab, c, Command::FocusNextWindow),
+            (k('W'), Modifiers::ALT, Command::ShowMainWindow),
+            (k('Z'), c, Command::PlayIndex(0)),
+        ];
+        for (key, mods, expected) in cases {
+            let mut m = MainWindow::new();
+            assert_eq!(cmds(&mut m, key, mods), vec![expected], "{key:?} {mods:?}");
+        }
     }
 
     // ----- volume -----
@@ -1359,14 +1790,17 @@ mod tests {
     }
 
     #[test]
-    fn volume_keys_use_the_provisional_step() {
-        // provisional: step size not in S02/S03.
+    fn volume_step_is_the_measured_four() {
+        // Measured on 2026-10-15 (RFC 0005 §8, O10 settled).
+        assert_eq!(VOLUME_STEP, 4);
         let base = core_volume(50);
+        assert_eq!(base, 128, "50% is core volume 128");
         for key in [Key::Up, Key::Numpad(8)] {
             let mut m = machine_with_volume(50);
             assert_eq!(
                 cmds(&mut m, key, Modifiers::NONE),
-                vec![Command::SetVolume(base + VOLUME_STEP)]
+                vec![Command::SetVolume(132)],
+                "one press is exactly +4 core units"
             );
             assert!(m.state().volume > 50);
         }
@@ -1374,14 +1808,17 @@ mod tests {
             let mut m = machine_with_volume(50);
             assert_eq!(
                 cmds(&mut m, key, Modifiers::NONE),
-                vec![Command::SetVolume(base - VOLUME_STEP)]
+                vec![Command::SetVolume(124)],
+                "one press is exactly -4 core units"
             );
             assert!(m.state().volume < 50);
         }
     }
 
     #[test]
-    fn volume_keys_clamp_at_the_ends() {
+    fn volume_keys_clamp_at_the_ends_with_a_partial_end_step() {
+        // Saturation at 255/0, with a partial final step (the measurement saw
+        // 253 -> 255 and 2 -> 0).
         let mut top = machine_with_volume(100);
         assert_eq!(
             cmds(&mut top, Key::Up, Modifiers::NONE),
@@ -1392,10 +1829,43 @@ mod tests {
             cmds(&mut bottom, Key::Down, Modifiers::NONE),
             vec![Command::SetVolume(0)]
         );
-        let mut near_top = machine_with_volume(98);
+        // 99% is core volume 252: +4 would be 256, so the press lands on 255
+        // (a partial step of 3).
+        let mut near_top = machine_with_volume(99);
+        assert_eq!(core_volume(99), 252);
         assert_eq!(
             cmds(&mut near_top, Key::Up, Modifiers::NONE),
             vec![Command::SetVolume(255)]
+        );
+        // 1% is core volume 3: -4 saturates at 0 (a partial step of 3).
+        let mut near_bottom = machine_with_volume(1);
+        assert_eq!(core_volume(1), 3);
+        assert_eq!(
+            cmds(&mut near_bottom, Key::Down, Modifiers::NONE),
+            vec![Command::SetVolume(0)]
+        );
+    }
+
+    #[test]
+    fn repeated_presses_drift_because_the_machine_holds_a_percentage() {
+        // Exposed by the RFC 0005 §8 measurement, not fixed here: the machine's
+        // volume is the S02 display percentage, so `core_volume` re-quantises
+        // between presses and the emitted deltas are 4, 5, 5, 3 ... instead of
+        // exactly 4 each. Each press still applies the step to the core value it
+        // reads; the state it reads is rounded. Reported as an open point.
+        let mut m = machine_with_volume(0);
+        let emitted: Vec<Command> = (0..4)
+            .map(|_| cmds(&mut m, Key::Up, Modifiers::NONE))
+            .map(|commands| commands[0].clone())
+            .collect();
+        assert_eq!(
+            emitted,
+            vec![
+                Command::SetVolume(4),
+                Command::SetVolume(9),
+                Command::SetVolume(14),
+                Command::SetVolume(17),
+            ]
         );
     }
 

@@ -21,6 +21,15 @@ pub enum WindowId {
     Vis,
     /// Generic / plugin window (`gen_*` plugins, library, ...), by number.
     Gen(u32),
+    /// Video window (RFC 0005 owner decision O2: the 2.95 video window is *not*
+    /// the visualization window).
+    ///
+    /// Appended after [`WindowId::Gen`] on purpose: `postcard` encodes an enum
+    /// by its declaration index, so inserting it next to [`WindowId::Vis`]
+    /// would change the bytes of `Gen`. It therefore sorts after `Gen` in the
+    /// `Ord` order that [`Command::FocusNextWindow`](crate::command::Command)
+    /// follows.
+    Video,
 }
 
 /// Transport state.
@@ -103,6 +112,14 @@ pub struct PlayerState {
     pub stream: Option<StreamInfo>,
     /// Equalizer state.
     pub eq: EqState,
+    /// "Stop after current track" is armed (RFC 0005 O8): when the current
+    /// track ends the transport stops instead of advancing.
+    ///
+    /// Appended at the **end** of the struct on purpose: `postcard` encodes a
+    /// struct positionally, so every field declared before it keeps its bytes.
+    /// The struct itself is still a wire change (an old peer cannot decode the
+    /// longer form) — that is what the RFC 0005 v2 bump covers.
+    pub stop_after_current: bool,
 }
 
 impl Default for PlayerState {
@@ -120,6 +137,7 @@ impl Default for PlayerState {
             playlist_len: 0,
             stream: None,
             eq: EqState::default(),
+            stop_after_current: false,
         }
     }
 }

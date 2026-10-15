@@ -1,9 +1,15 @@
-//! The [`Command`] enum: every user or plugin intent that mutates the player.
+//! The [`Command`] enum: every user or plugin intent that mutates the player or
+//! its windows and dialogs.
 //!
 //! Commands are *requests*; the app/engine applies them and answers with
 //! [`Event`](crate::event::Event)s. They are `serde`-serializable so that the
 //! plugin host can forward them over IPC. Indices are `u32`; entries are
 //! referenced by stable [`EntryId`](crate::playlist::EntryId) where possible.
+//!
+//! **Append rule** (RFC 0005 §3): new variants go at the **end** of [`Command`],
+//! never into the logical sections, because `postcard` encodes an enum by its
+//! declaration index — appending keeps every existing variant's wire bytes
+//! unchanged.
 
 use std::path::PathBuf;
 
@@ -25,6 +31,46 @@ pub enum SelectOp {
     None,
     /// Invert.
     Invert,
+}
+
+/// Which kind of media [`Command::OpenMedia`] asks the user for.
+///
+/// Provisional (RFC 0005 §5.2): exactly the three kinds S03 records a public
+/// command id for; the full dialog list belongs to S04 (not started).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenMediaKind {
+    /// A file picker ("Open file(s)", command id 40029).
+    Files,
+    /// A URL entry ("Open location", command id 40185).
+    Location,
+    /// A directory picker ("Open directory", command id 40187).
+    Directory,
+}
+
+/// Which jump dialog [`Command::OpenJump`] opens.
+///
+/// Confirming the dialog produces an existing command: [`Command::PlayEntry`]
+/// for [`JumpTarget::File`], [`Command::Seek`] for [`JumpTarget::Time`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JumpTarget {
+    /// Jump to a playlist entry (command id 40194).
+    File,
+    /// Jump to a playback position (command id 40193).
+    Time,
+}
+
+/// A preferences page [`Command::OpenPrefsPage`] opens.
+///
+/// Provisional: the full page list belongs to S04 (not started); the two values
+/// defined now are the ones S03 records command ids for. Both are measured
+/// (2026-10-15): 40191 opens the dialog at Plug-ins > Visualization, 40317 at
+/// Options > Visualization. Growing the enum follows the append rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrefsPage {
+    /// Plug-ins > Visualization ("Select visualization plug-in", id 40191).
+    VisPlugin,
+    /// Options > Visualization ("Visualization options", id 40317).
+    VisOptions,
 }
 
 /// A command to the player.
@@ -134,4 +180,90 @@ pub enum Command {
     Quit,
     /// Open the preferences dialog.
     OpenPrefs,
+
+    // ----- RFC 0005 app-level additions (append-only; see the module docs) -----
+    //
+    // The ids in the doc lines are the public `WM_COMMAND` ids S03 records;
+    // they are interoperability facts and are also the plugin host's id table.
+    /// Move the current entry by `delta` positions in the order `Next`/`Prev`
+    /// follow, clamped to the playlist; `delta = 0` and an empty playlist are
+    /// no-ops. While stopped the current entry moves without starting playback
+    /// (S02 §1). Ids 40195 (+10) and 40197 (-10). The play order (shuffle) vs
+    /// playlist order question is open (RFC 0005 O9 / S15).
+    SkipBy {
+        /// Signed step in entries; `+10` = "10 tracks forward", `-10` = back.
+        delta: i32,
+    },
+    /// Play the last entry of the playlist; a no-op on an empty playlist. The
+    /// engine resolves the last entry, so the caller needs no length. This is
+    /// the S03 §5 mouse action "end of list" (Ctrl+click the next button); S03
+    /// records no command id for it, so the plugin host never sees it (O15).
+    PlayLast,
+    /// Toggle "stop after current track": when the current track ends the
+    /// transport stops instead of advancing to the next entry. Id 40157.
+    ToggleStopAfterCurrent,
+    /// Open the player's open-file / open-location / open-directory dialog; on
+    /// confirmation the app adds the chosen media with [`Command::AddItems`].
+    /// Ids 40029 (files), 40185 (location), 40187 (directory).
+    OpenMedia {
+        /// Which dialog to open.
+        kind: OpenMediaKind,
+        /// Start playing the first added entry. `true` for the main-window
+        /// actions; the playlist-window add commands (1032/1036/1039) are
+        /// deferred and their value is unmeasured (RFC 0005 O5).
+        play: bool,
+    },
+    /// Open the jump dialog (to a playlist entry or to a position). Ids 40194
+    /// (file) and 40193 (time).
+    OpenJump {
+        /// Which jump dialog.
+        target: JumpTarget,
+    },
+    /// Open the file-info box for the current track. Id 40188. No payload: the
+    /// target is always the current entry, which the app resolves from state.
+    OpenFileInfo,
+    /// Open the preferences dialog at a specific page. Id 40191 (visualization
+    /// plug-in) and 40317 (visualization options); see [`PrefsPage`].
+    OpenPrefsPage(PrefsPage),
+    /// Open the about box. Id 40041.
+    OpenAbout,
+    /// Open the skin browser; the user's pick becomes a [`Command::LoadSkin`].
+    /// Id 40219.
+    OpenSkinBrowser,
+    /// Re-apply the skin the app last reported through
+    /// [`Event::SkinChanged`](crate::event::Event::SkinChanged). No payload:
+    /// the app already tracks the current skin to render it, and the UI machine
+    /// does not know the path. Id 40291.
+    RefreshSkin,
+    /// Open the bookmark-management dialog. Id 40320. The bookmark store does
+    /// not exist yet (RFC 0005 O12); the handling lands with that feature.
+    OpenBookmarkEditor,
+    /// Add the current track to the bookmark list. Id 40321. Same open point as
+    /// [`Command::OpenBookmarkEditor`].
+    AddBookmark,
+    /// Toggle easy-move (a larger drag target for moving the player's windows).
+    /// Id 40186. Symmetric with [`Command::ToggleAlwaysOnTop`]; the platform
+    /// layer applies it.
+    ToggleEasyMove,
+    /// Minimize the player's **main** window (owner decision O4). Id 40334.
+    Minimize,
+    /// Move keyboard focus to the next player window, in [`WindowId`] order.
+    /// Id 40063.
+    FocusNextWindow,
+    /// Show (un-minimize, raise) and focus the main window. Id 40258.
+    /// Deliberately one-way: [`Command::ToggleWindow`] would *hide* it.
+    ShowMainWindow,
+    /// Close whichever player window has focus. Id 40224. The equalizer and
+    /// playlist windows hide (they are toggle windows); closing the main window
+    /// quits (owner decision O3).
+    CloseFocusedWindow,
+    /// Open the main-menu popup. Id 40043. Handling is deferred to S04.
+    OpenMainMenu,
+    /// Ask the loaded visualization plug-in to show its configuration. Id
+    /// 40221. Applied by the app *through* the plugin host, so it travels to the
+    /// host as a `Message::CommandToHost` — handling is deferred to M3.
+    ConfigureVisPlugin,
+    /// Start/stop the visualization plug-in (whether vis data flows). Id 40192.
+    /// Same host bridge and deferral as [`Command::ConfigureVisPlugin`].
+    ToggleVisPlugin,
 }

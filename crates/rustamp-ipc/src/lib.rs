@@ -3,7 +3,7 @@
 //! Transport-agnostic protocol between `rustamp.exe` (x64) and
 //! `rustamp-plughost32.exe` (i686).
 //!
-//! * [`Message`] - the protocol enum (v1), encoded with `postcard`.
+//! * [`Message`] - the protocol enum (v2), encoded with `postcard`.
 //! * [`Transport`] - send/receive framed messages. Implementations: the
 //!   in-memory [`MemoryTransport`] (tests) and [`StreamTransport`] over any
 //!   `Read`/`Write` pair (named pipes, sockets, stdio) using the
