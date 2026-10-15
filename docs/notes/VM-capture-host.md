@@ -133,7 +133,24 @@ facts from one drifted state.
    against the recorded `base-eq-focused` evidence.
 4. Only after all three pass is the guest accepted as the capture host.
 
-## 8. Migration
+## 9. Windows Sandbox: measured 2026-10-15
+
+The feature is enabled (`Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All`, `RestartNeeded: False`) and a probe ran inside a guest. Measured inside the sandbox:
+
+- **`DPI_FOR_SYSTEM` = 96 (100 %)**, screen 1011×644 — a guest pinned to 100 % removes the whole 250 %/144/110×46 confusion.
+- `INPUT_DESKTOP` = AVAILABLE, `SendInput` returned 3 events with `err=0`, and the cursor moved to the exact target (220,160) — **real input is accepted inside the sandbox**, unlike on the host where `SendInput` is silently dropped.
+- The first click did not reach our own window: the window had no foreground (`FOREGROUND_BEFORE` = 0) and the click was consumed by activation. The corrected probe (activate, then click) did not produce output — one more debug pass is needed before the sandbox route is trusted.
+- **Two sandboxes cannot map the same host folder at the same time**; close one before starting the next, or the `LogonCommand` never sees the mapped files.
+
+Verdict: promising for deterministic 100 % captures, but not yet verified end to end. The host now delivers real input through `SetCursorPos` + legacy `mouse_event`, so the sandbox is not on the critical path for S01 round 2.
+
+## 10. Operational hazards found while capturing
+
+- **Our own browser window steals the foreground.** A full-screen OpenCode/Chrome window occluded all three Winamp windows and re-took the foreground about a second after any raise. The capture harness's guard correctly refused to act; every future run must re-raise Winamp and re-verify the guard before each action, and never send input to the browser.
+- **`SendInput` is silently dropped on the host** (returns `n=1`, `err=0`, cursor does not move) while `SetCursorPos` + legacy `mouse_event` work. Cause unexplained; record it in every manifest.
+- **Locale trap:** an unquoted `-Down 6,3` under the host's `de-AT` culture is parsed as `63`. The harness now parses points from text.
+
+## 11. Migration
 
 Once the guest passes the smoke test, the dirty room moves there and the host
 sandbox is retired — **after asking the owner**, since removing it is not
