@@ -292,8 +292,15 @@ fn all_rfc_0006_variants_roundtrip() {
         },
     ];
 
-    // Verify we have exactly 13 variants
-    assert_eq!(messages.len(), RFC_0006_VARIANT_COUNT);
+    // The array lists `DecoderOpen` twice on purpose (a file location and a URL),
+    // so it has one more entry than there are RFC 0006 variants. What matters is
+    // that it covers every one of them.
+    let distinct: std::collections::BTreeSet<u8> = messages.iter().map(|m| encode(m)[0]).collect();
+    assert_eq!(
+        distinct.len(),
+        RFC_0006_VARIANT_COUNT,
+        "every RFC 0006 variant must appear in this round-trip list"
+    );
 
     for msg in messages {
         let bytes = encode(&msg);
