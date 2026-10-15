@@ -261,14 +261,21 @@ mod tests {
         match init_dpi_awareness() {
             Ok(awareness) => assert_eq!(awareness, DpiAwareness::PerMonitorV2),
             Err(error) => {
-                let interactive = std::env::var_os("SESSIONNAME").is_some();
+                // Session 0 is where the PowerShell Direct test host runs: it has
+                // no desktop to be aware of, and Windows names that session
+                // "Services". A console or RDP session names itself otherwise.
+                let session_name = std::env::var("SESSIONNAME").unwrap_or_default();
+                let interactive =
+                    !session_name.is_empty() && !session_name.eq_ignore_ascii_case("Services");
                 assert!(
                     !interactive,
-                    "DPI awareness failed in an interactive session: {error}"
+                    "DPI awareness failed in an interactive session \
+                     (SESSIONNAME={session_name:?}): {error}"
                 );
                 eprintln!(
-                    "note: no DPI awareness in this non-interactive session ({error}); \
-                     session 0 has no desktop, which is where the test host runs"
+                    "note: no DPI awareness in this non-interactive session \
+                     (SESSIONNAME={session_name:?}, {error}); there is no desktop here, \
+                     which is where the test host runs"
                 );
             }
         }
