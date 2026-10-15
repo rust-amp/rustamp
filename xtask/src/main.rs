@@ -56,8 +56,28 @@ fn main() -> ExitCode {
     }
 }
 
+/// `CreateProcess` flag: run the child with a console but **no console window**.
+///
+/// A console-subsystem child spawned without it gets a console window of its
+/// own when the parent has no console — and a window on the owner's desktop is
+/// a rule violation (`docs/HANDOFF.md`, the GUI rule), even when it is "only" a
+/// console. Nothing graphical may run on the host.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// A [`Command`] for `program` that cannot raise a window.
+pub(crate) fn no_window_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 pub(crate) fn cargo() -> Command {
-    Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    no_window_command(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
 }
 
 pub(crate) fn run_status(cmd: &mut Command) -> Result<(), String> {

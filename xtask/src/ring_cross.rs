@@ -19,7 +19,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use crate::{cargo, run_status};
+use crate::{cargo, no_window_command, run_status};
 
 /// The two targets the check compares.
 const X64: &str = "x86_64-pc-windows-msvc";
@@ -176,7 +176,7 @@ fn run_once(
     kind: &str,
     name: &str,
 ) -> Result<RunStats, String> {
-    let mut producer = Command::new(producer_exe)
+    let mut producer = no_window_command(producer_exe)
         .args([
             "produce",
             "--name",
@@ -240,7 +240,7 @@ fn drive(
         ));
     }
 
-    let mut consumer = Command::new(consumer_exe)
+    let mut consumer = no_window_command(consumer_exe)
         .args([
             "consume",
             "--name",
