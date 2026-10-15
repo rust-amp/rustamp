@@ -9,6 +9,7 @@
 //! * `package` - not implemented yet.
 
 mod capture;
+mod package;
 mod ring_cross;
 
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ commands:
   capture [options]                  capture a window to PNG (Windows only); see `capture --help`
   ring-cross                         cross-bitness shared-memory ring check (Windows only)
   plughost [--release]               build rustamp-plughost for i686-pc-windows-msvc
-  package                            (not implemented)";
+  package [options]                  package player (x86_64) and plugin host (i686) separately";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -33,11 +34,7 @@ fn main() -> ExitCode {
         Some("capture") => capture::run(&rest),
         Some("ring-cross") => ring_cross::run(&rest),
         Some("plughost") => plughost(&rest),
-        // TODO(M2+): NSIS installer packaging.
-        Some("package") => {
-            eprintln!("xtask package: not implemented yet");
-            Ok(())
-        }
+        Some("package") => package::run(&rest),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
