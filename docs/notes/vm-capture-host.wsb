@@ -1,0 +1,40 @@
+<Configuration>
+  <!--
+    Rustamp dirty-room capture inside Windows Sandbox.
+    See docs/notes/VM-capture-host.md for why and how.
+
+    Every boot is a pristine, identical Windows: that is the strongest baseline
+    provenance we can get ("every capture started from a freshly booted
+    sandbox"). There are no mid-run snapshots - each baseline is a fresh boot
+    plus the setup actions the bootstrap performs.
+
+    Launch from the host (after the feature is enabled and the machine has been
+    restarted):  WindowsSandbox.exe D:\code\Rustamp\docs\notes\vm-capture-host.wsb
+  -->
+  <MappedFolders>
+    <!-- Writable: the harness writes captures and manifests back here. -->
+    <MappedFolder>
+      <HostFolder>D:\code\rustamp-research</HostFolder>
+      <SandboxFolder>C:\rustamp-research</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+    <!-- Read-only: the already-extracted reference copy, never modified. -->
+    <MappedFolder>
+      <HostFolder>D:\code\rustamp-sandbox\winamp295</HostFolder>
+      <SandboxFolder>C:\winamp295</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+
+  <!-- Offline: the reference copy is mapped in, so nothing needs the network. -->
+  <Networking>Disable</Networking>
+  <MemoryInMB>4096</MemoryInMB>
+  <!-- Software rendering on purpose: one less source of pixel variation. -->
+  <vGPU>Disable</vGPU>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+
+  <!-- Runs once at logon, in the sandbox's own interactive session. -->
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\rustamp-research\tools\vm-capture\sandbox-bootstrap.ps1</Command>
+  </LogonCommand>
+</Configuration>

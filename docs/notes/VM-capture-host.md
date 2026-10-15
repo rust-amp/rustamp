@@ -8,6 +8,21 @@ derived from Winamp source, the SDK or the binary. The VM itself is
 dirty-room territory, exactly like the current sandbox — the clean-room rules in
 [CLEANROOM.md](../../CLEANROOM.md) are unchanged.
 
+## 0. Two routes, and when to use which
+
+| | **Windows Sandbox** | **Hyper-V guest** |
+|---|---|---|
+| Setup | one `Enable-WindowsOptionalFeature` plus a restart; payload is already present | Windows ISO, install, auto-logon, ~10–20 min |
+| Baseline | **pristine and identical on every boot** — the strongest provenance we can state | snapshot catalogue, restored in seconds |
+| Mid-run states | none: a baseline means a fresh boot plus the setup actions | freeze and restore any state |
+| Driven from the host | only through the `.wsb` `LogonCommand`; everything must be scripted inside | full PowerShell control (`Start-VM`, `Checkpoint-VM`, `Restore-VMSnapshot`) |
+| Persistence | none — wiped on close | persistent, copy files in and out |
+| Best for | the immediate capture work and "does it work at all" | M3 plugin work, long capture campaigns, reproducible golden images |
+
+The prepared sandbox configuration is `vm-capture-host.wsb` next to this file.
+Both routes need an **elevated** shell for their host-side steps; the
+orchestrator shell is not elevated.
+
 ## 1. Why a VM (and why not "because it is faster")
 
 Winamp 2.95 is a 1999 program; any VM is overpowered for it. Speed is not the
