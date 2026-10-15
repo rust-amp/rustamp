@@ -28,11 +28,14 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
     -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
 
 # A repeating trigger instead of on-demand: the orchestrator then never starts a
-# process on the host. It writes request.json; this task picks it up within 30 s,
-# runs it, and writes response.json. Combined with S4U (session 0) that means no
-# window can appear, whoever triggers what.
+# process on the host. It writes request.json; this task picks it up within a
+# minute, runs it, and writes response.json. Combined with S4U (session 0) that
+# means no window can appear, whoever triggers what.
+#
+# The Task Scheduler refuses a repetition interval shorter than one minute
+# ("Interval:PT30S" is out of range), so it is one minute.
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-    -RepetitionInterval (New-TimeSpan -Seconds 30) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal `
