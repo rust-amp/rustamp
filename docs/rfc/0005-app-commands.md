@@ -1,7 +1,8 @@
 # RFC 0005: The missing app-level `Command`s (M1/M2)
 
-Status: **Proposed** (draft for the project owner's decision; not accepted,
-nothing implemented).
+Status: **Accepted in substance** on 2026-10-15 by the project owner (all
+decision-relevant questions answered; the four dirty-room measurements and S15
+may adjust details without re-approval). Was: Proposed.
 Owner: Lane R (RFC planning). Written by: task card
 [`docs/tasks/R5-rfc-app-commands.md`](../tasks/R5-rfc-app-commands.md).
 Requires: RFC 0001 (core contracts), RFC 0004 (plugin-licensing split and the
@@ -131,7 +132,7 @@ main-window bindings; several actions have several.
 | Skin browser | 40219 | new `OpenSkinBrowser` | app (dialog → `LoadSkin`) | forwards 40219 |
 | Toggle minibrowser | 40298 | **deferred** (§11.1) | — | — |
 | Stop after current track | 40157 | new `ToggleStopAfterCurrent` | engine (transport mode) | forwards 40157 |
-| Toggle video window | 40328 | existing `ToggleWindow(WindowId::Vis)` (O2) | app | forwards 40328 |
+| Toggle video window | 40328 | new `WindowId::Video` + `ToggleWindow(WindowId::Video)` (decided §17) | app | forwards 40328 |
 | About box | 40041 | new `OpenAbout` | app (dialog) | forwards 40041 |
 | Playlist search (unconfirmed) | 40318 | **deferred** (§11.3) | — | — |
 | Close the focused window | 40224 | new `CloseFocusedWindow` | app (window mgmt) | forwards 40224 |
@@ -197,10 +198,10 @@ fullscreen, playlist search), 1 mouse-only action covered by `PlayLast`.
   it; the enum's convention for such single actions is `Toggle*`
   (`ToggleShuffle`, `ToggleRepeat`). The set-form (`SetStopAfterCurrent(bool)`)
   stays available if measurement shows a checked menu item.
-- `PlayerState`: no field today (F5). The mode stays engine-internal until
-  S10/S02-5 demand observability; adding a field is a positional postcard
-  struct change (F10) and would ride the same version bump. Deliberately not
-  proposed here (O8).
+- `PlayerState`: no field today (F5). **Owner decision O8 (§17): add a
+  stop-after-current field** — a positional postcard struct change riding the
+  same v2 bump. The mode is still engine-internal in behaviour; the field makes
+  it observable.
 
 ### 5.2 App — dialogs
 
@@ -325,12 +326,10 @@ visualization plug-in (whether vis data flows).
   the current entry (as `Prev`/`Next` do while stopped, S02 §1), the mapping
   changes to a move-current variant; this RFC adopts "play" as the default
   reading. Host: forwards 40154 → `PlayIndex(0)`.
-- **ToggleVideoWindow (40328, Alt+V) → `Command::ToggleWindow(WindowId::Vis)`.**
-  `WindowId::Vis` is the only video-ish window (F4), and S03 records no
-  separate vis-window toggle command. Open (O2): if the 2.95 video window and
-  the visualization window are different windows, a `WindowId::Video` variant
-  is needed instead — an additive enum addition with the same version story.
-  Host: forwards 40328.
+- **ToggleVideoWindow (40328, Alt+V) → `Command::ToggleWindow(WindowId::Video)`.**
+  `WindowId` gains a `Video` variant (owner decision O2, §17 — the 2.95 video
+  window is not the visualization window). Additive enum addition with the same
+  version story. Host: forwards 40328.
 
 ## 6. The `LoadSkin`-path problem
 
@@ -630,3 +629,29 @@ agreement.
 | O16 | `NewInstance`: revisit a variant once S13/lane F define single-instance semantics. |
 | O17 | Minibrowser: in scope at all? (Unconfirmed commands; no owning spec.) |
 | O18 | Non-UTF-8 skin paths over IPC (RFC 0001 known limitation) — `RefreshSkin` avoids it for the common case. |
+
+## 17. Owner decisions (2026-10-15)
+
+The project owner decided all decision-relevant questions. Status is now:
+**accepted in substance** — the four measurements below and S15 (O9) may adjust
+details without re-approval.
+
+| ID | Decision | Consequence for the implementation lane |
+|---|---|---|
+| O1 | Start/end of list **play** (default adopted) | `PlayIndex(0)` / `PlayLast` as proposed |
+| O2 | The video window is **not** `WindowId::Vis` — add **`WindowId::Video`** | Additive enum addition with the same version story (§5.5); host maps 40328 to `ToggleWindow(WindowId::Video)`; fullscreen (deferred) targets it |
+| O3 | Closing the main window **quits** | `CloseFocusedWindow` on main → `Quit` |
+| O4 | Alt+M minimizes the **main** window | `Minimize` targets main |
+| O5 | **Measure in 2.95** whether the playlist add commands play | Dirty-room task; `play: false` stands until measured |
+| O6/O7 | **Verify in 2.95** which page 40191 opens and what 40317 opens | Dirty-room task; `OpenPrefsPage(VisPlugin)` + `OpenVisOptions` stand until verified |
+| O8 | Stop-after-current is a toggle **with a `PlayerState` field** | Wire change riding the same v2 bump (§5.1 deliberately did not propose it; the owner overruled — add the field) |
+| O9 | Deferred to **S15** | `SkipBy` order follows the shuffle-sequence decision |
+| O10 | Dirty-room measurement stands | `VOLUME_STEP` stays placeholder |
+| O11 | Provisional constants (default adopted) | As proposed |
+| O12 | Bookmark handling lands with the feature (default adopted) | As proposed |
+| O13 | **`Message::CommandToHost(Command)`** (default adopted) | As proposed; overlap with `WinampIpc` resolved with S10 |
+| O14 | Persist the elapsed/remaining preference when config I/O lands | Noted for the config lane |
+| O15 | **Measure** whether 2.95 has an end-of-list id | Dirty-room task; `PlayLast` stays id-less until measured |
+| O16 | `NewInstance` stays app-local (default adopted) | As proposed; revisit with S13 |
+| O17 | Minibrowser stays deferred (default adopted) | No spec task |
+| O18 | Noted (default adopted) | As proposed |

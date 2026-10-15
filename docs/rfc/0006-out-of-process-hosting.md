@@ -1,6 +1,7 @@
 # RFC 0006: Out-of-process decoder and DSP hosting (draft)
 
-Status: **Draft** (proposed by the integration lead on 2026-10-15; not accepted).
+Status: **Accepted** on 2026-10-15 by the project owner. Implementation waits
+for RFC 0003 Q1 (lossless delivery) and HANDOFF-3 (non-UTF-8 paths).
 Owner: audio/engine lane + licensing. Implementation (later card): `rustamp-ipc`
 (new `Message` variants), `rustamp-proto` (wire types), one new crate
 `rustamp-mediahost` (binaries `rustamp-dechost`, `rustamp-dsphost`), engine-side
