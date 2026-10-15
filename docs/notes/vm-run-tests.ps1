@@ -94,5 +94,6 @@ $result.results | ForEach-Object {
     $status = if ($_.exit -eq 0) { 'ok  ' } else { 'FAIL' }
     Write-Host ("  [{0}] {1,-46} {2}" -f $status, $_.exe, $_.summary)
     foreach ($f in $_.failed) { Write-Host ("         $f") }
+    foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
 }
 if ($result.failed -ne 0) { exit 1 }

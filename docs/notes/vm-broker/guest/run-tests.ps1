@@ -47,11 +47,17 @@ foreach ($exe in $exes) {
     $lines = $raw -split "`r?`n"
     $summary = ($lines | Where-Object { $_ -match '^test result:' } | Select-Object -Last 1)
     $failedNames = @($lines | Where-Object { $_ -match '^test .* FAILED$' } | ForEach-Object { $_.Trim() })
+    # When a binary produces no test summary it did not run its tests at all
+    # (usually it could not start), so keep the first output lines: without them
+    # a failure like this is a mystery.
+    $diagnostic = @()
+    if (-not $summary) { $diagnostic = @($lines | Where-Object { $_ -and $_.Trim() } | Select-Object -First 5) }
     $results += [pscustomobject]@{
-        exe     = $name
-        exit    = $exit
-        summary = $summary
-        failed  = $failedNames
+        exe        = $name
+        exit       = $exit
+        summary    = $summary
+        failed     = $failedNames
+        diagnostic = $diagnostic
     }
 }
 
