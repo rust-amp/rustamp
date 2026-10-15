@@ -40,6 +40,6 @@
 
   <!-- Runs once at logon, in the sandbox's own interactive session. -->
   <LogonCommand>
-    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\rustamp-research\tools\vm-capture\sandbox-bootstrap.ps1</Command>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\rustamp-research\tools\vm-capture\sandbox-bootstrap.ps1 -Job C:\rustamp-research\tools\vm-capture\jobs\example.json</Command>
   </LogonCommand>
 </Configuration>
