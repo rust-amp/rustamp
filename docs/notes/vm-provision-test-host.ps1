@@ -51,5 +51,6 @@ Show 'computer' $env:COMPUTERNAME
 Show 'os' (Get-CimInstance Win32_OperatingSystem).Caption
 Show 'build' (Get-CimInstance Win32_OperatingSystem).BuildNumber
 Show 'powershell' $PSVersionTable.PSVersion.ToString()
-Show 'cargo on PATH' (Get-Command cargo -ErrorAction SilentlyContinue | ForEach-Object { $_.Source } ?? 'none (expected: the host compiles)')
+$cargo = Get-Command cargo -ErrorAction SilentlyContinue
+if ($cargo) { Show 'cargo on PATH' $cargo.Source } else { Show 'cargo on PATH' 'none (expected: the host compiles)' }
 Write-Output 'provisioning done - reboot the guest once so auto-logon and the scale take effect'
