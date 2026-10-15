@@ -1580,6 +1580,10 @@ dependencies = [
  "rustamp-skin",
  "rustamp-ui",
  "rustamp-vis",
+ "softbuffer",
+ "tempfile",
+ "toml",
+ "winit",
 ]
 
 [[package]]

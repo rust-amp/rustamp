@@ -29,3 +29,13 @@ rustamp-ipc.workspace = true
 rustamp-platform.workspace = true
 rustamp-prefs.workspace = true
 rustamp-library.workspace = true
+# The app owns the OS window and the event loop, so it drives `winit` and
+# `softbuffer` directly (the `rustamp-ui` presenter is a manual example and
+# drops the commands the machine emits).
+winit.workspace = true
+softbuffer.workspace = true
+# Config file I/O (the core crate only defines the types; see RFC 0001).
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
