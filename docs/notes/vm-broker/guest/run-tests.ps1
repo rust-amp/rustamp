@@ -24,9 +24,14 @@ if (-not (Test-Path 'D:\code\Rustamp')) {
 $repo = 'D:\code\Rustamp'
 if (-not (Test-Path $repo)) { throw "the repository is not staged at $repo" }
 
-$listPath = Join-Path $repo 'target\debug\test-list.json'
-if (-not (Test-Path $listPath)) { throw "no test list at $listPath - did the host stage it?" }
-$exes = @(Get-Content $listPath -Raw | ConvertFrom-Json)
+# Enumerate the staged test binaries instead of reading a list file: the host
+# stages exactly the test executables into target\debug\deps, and a list file is
+# one more thing that can go stale (it did: an old list containing a joined
+# string made this script try to run all 34 paths as one command).
+$deps = Join-Path $repo 'target\debug\deps'
+if (-not (Test-Path $deps)) { throw "no staged binaries at $deps" }
+$exes = @(Get-ChildItem -Path $deps -Filter '*.exe' | Sort-Object Name | Select-Object -ExpandProperty FullName)
+if (-not $exes) { throw "no test binaries in $deps" }
 
 $filter = ''
 if ($GuestArgs -and $GuestArgs.Count -ge 2 -and $GuestArgs[0] -eq '-Filter') { $filter = $GuestArgs[1] }

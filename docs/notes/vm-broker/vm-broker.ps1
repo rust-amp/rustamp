@@ -214,12 +214,18 @@ try {
                 throw "copyin destination must live under $GuestRoot (got $destFull)"
             }
             $cred = Get-GuestCredential
+            # Clear the destination and copy the CONTENTS: copying a directory
+            # into an existing directory nests it (…\Rustamp\Rustamp\…), which is
+            # exactly the bug that left a stale test list behind and made the
+            # guest run a joined string as a command.
             Invoke-Command -VMName $VmName -Credential $cred -ScriptBlock {
-                param($d) New-Item -ItemType Directory -Force -Path $d | Out-Null
+                param($d)
+                if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+                New-Item -ItemType Directory -Force -Path $d | Out-Null
             } -ArgumentList $destFull
             $session = New-PSSession -VMName $VmName -Credential $cred
             try {
-                Copy-Item -Path $fullSource -Destination $destFull -ToSession $session -Recurse -Force
+                Copy-Item -Path (Join-Path $fullSource '*') -Destination $destFull -ToSession $session -Recurse -Force
             } finally { Remove-PSSession $session }
             $response.result = [ordered]@{ copied = $true; source = $fullSource; dest = $destFull }
         }

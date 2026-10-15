@@ -46,10 +46,10 @@ if (-not $SkipBuild) {
     if (-not $testExes) { throw 'no test binaries were produced' }
     Write-Host ("    {0} test binaries" -f $testExes.Count)
 } else {
-    Step 'skipping the build (-SkipBuild)'
-    $listPath = Join-Path $Stage 'target\debug\test-list.json'
-    if (-not (Test-Path $listPath)) { throw "no staged test list at $listPath" }
-    $testExes = @(Get-Content $listPath -Raw | ConvertFrom-Json)
+    Step 'skipping the build (-SkipBuild); the previously staged binaries are reused'
+    $stagedDeps = Join-Path $Stage 'target\debug\deps'
+    if (-not (Test-Path $stagedDeps)) { throw "nothing staged at $stagedDeps" }
+    $testExes = @(Get-ChildItem -Path $stagedDeps -Filter '*.exe' | Select-Object -ExpandProperty FullName)
 }
 
 # --- 2. stage ----------------------------------------------------------------
@@ -67,7 +67,6 @@ foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
     if (Test-Path $p) { Copy-Item $p (Join-Path $Stage 'target\debug') -Force }
 }
 Copy-Item (Join-Path $RepoRoot 'crates') (Join-Path $Stage 'crates') -Recurse -Force
-$testExes | ConvertTo-Json | Set-Content (Join-Path $Stage 'target\debug\test-list.json') -Encoding UTF8
 Write-Host ("    staged {0} MB" -f [math]::Round(((Get-ChildItem $Stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1))
 
 # --- 3. optional reset, then start (the broker ejects the DVD) --------------
