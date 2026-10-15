@@ -40,6 +40,7 @@ contributor's consent.
 - **Property tests** where they fit (playlist operations, shuffle, title formatting, parsers).
 - **Golden tests** (image and audio comparisons) run later via `cargo xtask golden`. Every window or renderer change should add or update a golden case once the harness exists. Golden tests run with both the original base skin and the look-alike default skin.
 - Run `cargo test --workspace --all-features` before you open a PR. Put the results in the PR's test evidence section.
+- **`RUSTAMP_TESTDATA`** points at a directory holding the `classic-base` skin used by the golden tests. **It is unset by default, and the `classic-base` cases skip silently when it is** — set it locally to run them. The free webamp checkout contains the original base skin (`base-2.91`); point the variable at its parent directory. A skipped golden case is not a passed one: if your change touches the renderer, run the golden tests with the variable set and say so in the PR.
 
 ## Provenance (required)
 
