@@ -19,7 +19,7 @@ fn decode(bytes: &[u8]) -> Message {
 
 /// The pre-0006 protocol had 15 variants (0..=14), with `CommandToHost` at index 14.
 /// RFC 0006 appends 13 new variants (indices 15..=27).
-const RFC_0006_VARIANT_COUNT: usize = 13;
+const RFC_0006_VARIANT_COUNT: usize = 12;
 
 #[test]
 fn protocol_version_is_three() {
@@ -364,8 +364,8 @@ fn rfc_0006_variant_indices_are_sequential_after_rfc_0005() {
 #[test]
 fn total_message_variant_count() {
     // Pre-0006: 15 variants (0..14)
-    // RFC 0006: 13 variants (15..27)
-    // Total: 28 variants (0..27)
+    // RFC 0006: 12 variants (15..26) - eight decoder, four DSP
+    // Total: 27 variants (0..26)
     let all_indices: std::collections::BTreeSet<u8> = [
         Message::Hello {
             protocol_version: 3,
@@ -465,7 +465,7 @@ fn total_message_variant_count() {
     .map(|msg| encode(msg)[0])
     .collect();
 
-    assert_eq!(all_indices.len(), 28, "exactly 28 variants (0..27)");
+    assert_eq!(all_indices.len(), 27, "exactly 27 variants (0..26)");
     assert_eq!(all_indices.iter().next(), Some(&0x00));
-    assert_eq!(all_indices.iter().next_back(), Some(&0x1b));
+    assert_eq!(all_indices.iter().next_back(), Some(&0x1a));
 }

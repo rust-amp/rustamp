@@ -363,12 +363,15 @@ fn command_to_host_is_appended_to_the_end_of_message() {
 }
 
 #[test]
-fn the_protocol_version_is_two() {
-    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 2);
+fn the_protocol_version_is_three() {
+    // RFC 0005 took the protocol to 2; RFC 0006 appended its hosting messages and
+    // took it to 3, because a v2 peer would mis-decode them (the project rule is
+    // a clean Hello rejection rather than a decode error).
+    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 3);
     assert_eq!(
         rustamp_ipc::Message::hello(),
         rustamp_ipc::Message::Hello {
-            protocol_version: 2,
+            protocol_version: 3,
             pid: std::process::id(),
         }
     );
