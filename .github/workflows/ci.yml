@@ -9,6 +9,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  licenses:
+    name: Permissive crates stay GPL-free (required)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # RFC 0004 acceptance 4, the load-bearing invariant of the licensing
+      # split: rustamp-proto, rustamp-plugin-abi, rustamp-ipc and
+      # rustamp-plughost are MIT OR Apache-2.0, so no copyleft crate may enter
+      # their dependency closure. The script uses cargo only (cargo tree), for
+      # all four crates on both Windows targets. `cargo tree --target` resolves
+      # the graph and never builds, so the i686 target's std is not needed here.
+      - name: Check the permissive crates' dependency closures
+        shell: bash
+        run: bash .github/scripts/check-permissive-licenses.sh
+
   windows:
     name: Windows (required)
     runs-on: windows-latest
