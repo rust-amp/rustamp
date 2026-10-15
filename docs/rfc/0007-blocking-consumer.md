@@ -1,7 +1,29 @@
 # RFC 0007: Blocking consumer and producer for the shm rings (RFC 0003 Q1)
 
-Status: **Proposed** (draft; *not* accepted — acceptance is the project owner's
-decision). It proposes an answer to RFC 0003 open question **Q1**.
+Status: **Accepted** on 2026-10-15 by the project owner. Implementation waits
+for the RFC 0006 card (this RFC exists to unblock it).
+
+### Owner decisions (2026-10-15)
+
+- **Accepted as proposed.** The five load-bearing open questions are settled with
+  the recommended defaults and may be revisited at the implementation card:
+  the wake mode is **not** announced on the wire (no `Message` change); a
+  dedicated `WakeUnavailable` refusal reason rather than reusing
+  `MappingUnavailable`; the hosting path waits with **no timeout** and relies on
+  the liveness ping; Q2's access control must cover the **events** as well as the
+  section.
+- **O4 resolved — `WaitOnAddress`/`WakeByAddressSingle` is permitted.** The
+  minimum supported Windows version is **Windows 10 25H2**; anything older is out
+  of scope, which removes the OS-floor objection that made this RFC prefer two
+  named events. The implementation card chooses between that mechanism and the
+  two-event design of §4; the rejected-alternatives reasoning in §4.2 stands
+  either way.
+- **New open item O13 — a Linux/macOS wake mechanism for M6.** The cross-platform
+  milestone needs an equivalent (futex/eventfd on Linux, `pthread_cond`/`kqueue`
+  on macOS) behind the same check-then-wait contract. Not designed here.
+- **New open item O14 — the owner accepts the §7 "or later" risk** (see the
+  licensing note): the exception is worded for GPL-3.0 *or later*; if that ever
+  fails for a recipient, staying on version 3 remains available.
 Owner: Lane R (RFC planning). Written by: task card
 [`docs/tasks/R6-rfc-blocking-consumer.md`](../tasks/R6-rfc-blocking-consumer.md).
 Requires: RFC 0003 (shared-memory rings), RFC 0006 (out-of-process hosting).
