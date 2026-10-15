@@ -3,9 +3,13 @@ name = "rustamp-mediahost"
 description = "Rustamp: out-of-process decoder and DSP host binaries (RFC 0006)"
 version.workspace = true
 edition.workspace = true
-# GPL-3.0-or-later WITHOUT the §7 exception (RFC 0006 §8):
-# this crate exists to link code the exception cannot cover (copyleft decoders/DSP).
-license = "GPL-3.0-or-later"
+# MIT OR Apache-2.0: this is only the PROTOCOL FRAMEWORK (the message loop and
+# supervision) and links no decoder at all. A per-resident crate
+# (`rustamp-mediahost-<decoder>`) carries the resident's own license - the
+# sidplayfp host is GPL because sidplayfp is, a symphonia host is permissive
+# because symphonia is. That keeps the copyleft in the resident crate instead of
+# in the framework, and keeps this crate inside the permissive set.
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true

@@ -211,10 +211,30 @@ flowing through `plughost32` exactly as before.
 
 ## 8. Processes, licenses, crash behaviour
 
-- New crate `rustamp-mediahost`, license **GPL-3.0-or-later, no §7 exception**
-  (it exists to link code the exception cannot cover). Binaries
-  `rustamp-dechost` and `rustamp-dsphost`; both 64-bit (their residents are
-  native 64-bit libraries — unlike classic plugins, nothing here needs i686).
+**Erratum (2026-10-16, owner decision).** This section originally licensed the
+whole helper crate GPL-3.0-or-later without the §7 exception. The owner split it:
+**`rustamp-mediahost` is only the protocol framework** (the message loop and
+supervision) and links no decoder, so it is **MIT OR Apache-2.0** and belongs to
+the permissive set. **Each resident gets its own crate and binary**
+(`rustamp-mediahost-<resident>`, e.g. `rustamp-mediahost-sidplayfp`), and that
+crate carries **the resident's license**: a sidplayfp host is GPL because
+sidplayfp is, a symphonia host would be permissive because symphonia is. The
+copyleft therefore sits in the resident crate rather than in the framework, and
+the permissive closure of the framework stays GPL-free (it depends only on
+`rustamp-ipc`, `rustamp-proto` and `thiserror`).
+
+Consequences of the erratum:
+
+- The **permissive set is five crates**, not four: `rustamp-proto`,
+  `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost` and
+  `rustamp-mediahost`. The RFC 0004 acceptance check covers all five.
+- A **resident crate carries no §7 exception**: only the copyright holder of the
+  covered code may grant one, and a resident crate links someone else's. The same
+  rule already excludes `rustamp-decoders` and `rustamp-skin`.
+- Nothing else in this section changes: the helper is still spawned, supervised
+  and killed by the engine, talks only over the documented protocol plus shared
+  memory, and its death fails the track, never the player.
+
 - Dependency direction is one-way: the helper depends on `rustamp-ipc` +
   `rustamp-proto` (permissive) plus whatever decoder/DSP code it hosts. No
   permissive crate ever depends on the helper. The player talks to it only over

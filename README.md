@@ -48,8 +48,9 @@ DLLs must not carry copyleft onto plugins of other licenses:
 
 | Part | License |
 |---|---|
-| `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost` | **MIT OR Apache-2.0** |
+| `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`, `rustamp-mediahost` | **MIT OR Apache-2.0** |
 | everything else (the player and its crates) | **GPL-3.0-or-later**, with an additional permission |
+| a per-resident helper crate (`rustamp-mediahost-<resident>`) | **the resident's own license** — the sidplayfp host is GPL because sidplayfp is, a symphonia host is permissive because symphonia is |
 
 The GPL crates carry a GPL-3.0 §7 additional permission so that combining them
 with modules that speak the documented plugin ABI or the documented IPC protocol

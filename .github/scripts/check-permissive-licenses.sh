@@ -44,8 +44,11 @@
 
 set -euo pipefail
 
-# The four MIT OR Apache-2.0 crates (RFC 0004 section 1).
-read -r -a crates <<< "${RUSTAMP_LICENSE_CRATES:-rustamp-proto rustamp-plugin-abi rustamp-ipc rustamp-plughost}"
+# The four MIT OR Apache-2.0 crates (RFC 0004 section 1) plus the media host
+# framework (RFC 0006 section 8 erratum: the framework links no decoder and is
+# permissive; a per-resident crate carries the resident's own license).
+# The permissive set is therefore five crates.
+read -r -a crates <<< "${RUSTAMP_LICENSE_CRATES:-rustamp-proto rustamp-plugin-abi rustamp-ipc rustamp-plughost rustamp-mediahost}"
 
 # The targets the permissive crates must build for (RFC 0004 section 3). The
 # closure is resolved per target, because a target-specific dependency only
@@ -132,4 +135,4 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
-printf '\nOK: the four permissive crates stay GPL-free on every target above.\n'
+printf '\nOK: the five permissive crates stay GPL-free on every target above.\n'

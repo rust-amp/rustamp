@@ -128,6 +128,12 @@ Rules:
 Written by the integration lead; these correct the text above, which stays as
 the record of what was decided.
 
+- **The permissive set is five crates, not four** (2026-10-16). RFC 0006's §8
+  erratum made `rustamp-mediahost` the permissive protocol framework (it links no
+  decoder; a per-resident crate carries the resident's own license), so it joins
+  `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc` and `rustamp-plughost`.
+  The acceptance check covers all five.
+
 - **§3 lists `state::RepeatMode`, which does not exist.** The codebase carries a
   `TransportState` and a `repeat: bool` field; the wire carries
   `TransportState`. Nothing was invented: the implementation moved what is
