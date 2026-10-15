@@ -73,6 +73,13 @@ foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
     }
 }
 Copy-Item (Join-Path $RepoRoot 'crates') (Join-Path $Stage 'crates') -Recurse -Force
+# The workspace root files too: `rustamp-testkit`'s golden test walks up from its
+# manifest directory looking for the workspace root, and without Cargo.toml it
+# fails with "workspace root not found" (staged crates alone are not enough).
+foreach ($rootFile in 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') {
+    $p = Join-Path $RepoRoot $rootFile
+    if (Test-Path $p) { Copy-Item $p (Join-Path $Stage $rootFile) -Force }
+}
 Write-Host ("    staged {0} MB" -f [math]::Round(((Get-ChildItem $Stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1))
 
 # --- 3. optional reset, then start (the broker ejects the DVD) --------------
