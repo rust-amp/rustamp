@@ -258,15 +258,28 @@ mod tests {
         // there. In that case the contract is a typed error and no panic; the V2
         // assertion belongs to an interactive session, and the test host runs
         // the suite in session 0 by design (see docs/HANDOFF.md, the test host).
+        // Session 0 is where the PowerShell Direct test host runs: it has no
+        // desktop to be aware of, and Windows names that session "Services". A
+        // console or RDP session names itself otherwise.
+        let session_name = std::env::var("SESSIONNAME").unwrap_or_default();
+        let interactive =
+            !session_name.is_empty() && !session_name.eq_ignore_ascii_case("Services");
+
         match init_dpi_awareness() {
-            Ok(awareness) => assert_eq!(awareness, DpiAwareness::PerMonitorV2),
+            Ok(awareness) => {
+                if interactive {
+                    assert_eq!(awareness, DpiAwareness::PerMonitorV2);
+                } else {
+                    // No desktop: the call may succeed at a lesser level. Report
+                    // what it was instead of pretending the strong assertion held.
+                    eprintln!(
+                        "note: DPI awareness is {awareness:?} in this non-interactive \
+                         session (SESSIONNAME={session_name:?}); V2 is asserted only where \
+                         there is a desktop"
+                    );
+                }
+            }
             Err(error) => {
-                // Session 0 is where the PowerShell Direct test host runs: it has
-                // no desktop to be aware of, and Windows names that session
-                // "Services". A console or RDP session names itself otherwise.
-                let session_name = std::env::var("SESSIONNAME").unwrap_or_default();
-                let interactive =
-                    !session_name.is_empty() && !session_name.eq_ignore_ascii_case("Services");
                 assert!(
                     !interactive,
                     "DPI awareness failed in an interactive session \
