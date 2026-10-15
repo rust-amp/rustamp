@@ -19,6 +19,13 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $ConfirmPreference = 'None'
 
+# Instrumentation, deliberately the FIRST thing: if this file does not grow, the
+# task never started the broker at all (a scheduling/S4U problem), which is a
+# completely different fault from the script exiting early.
+try {
+    Add-Content -Path 'D:\code\rustamp-vm\broker\started.log' -Value ('{0} start pid={1} user={2} cwd={3}' -f (Get-Date -Format o), $PID, $env:USERNAME, (Get-Location))
+} catch { }
+
 $VmName        = 'rustamp-test'
 $Root          = 'D:\code\rustamp-vm\broker'
 $RequestPath   = Join-Path $Root 'request.json'
