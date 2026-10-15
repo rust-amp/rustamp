@@ -13,7 +13,7 @@
 # Nothing graphical is involved: the test binaries are console programs, and
 # this runs in a PowerShell Direct session (no desktop).
 
-param([string[]]$GuestArgs)
+param([string]$Filter = '')
 
 $ErrorActionPreference = 'Continue'
 
@@ -33,8 +33,7 @@ if (-not (Test-Path $deps)) { throw "no staged binaries at $deps" }
 $exes = @(Get-ChildItem -Path $deps -Filter '*.exe' | Sort-Object Name | Select-Object -ExpandProperty FullName)
 if (-not $exes) { throw "no test binaries in $deps" }
 
-$filter = ''
-if ($GuestArgs -and $GuestArgs.Count -ge 2 -and $GuestArgs[0] -eq '-Filter') { $filter = $GuestArgs[1] }
+$filter = $Filter
 
 $results = @()
 foreach ($exe in $exes) {

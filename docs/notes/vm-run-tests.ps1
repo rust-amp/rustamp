@@ -64,7 +64,13 @@ foreach ($dll in Get-ChildItem -Path (Join-Path $debugDir 'deps') -Filter '*.dll
 if (Test-Path (Join-Path $debugDir 'rustamp.exe')) { Copy-Item (Join-Path $debugDir 'rustamp.exe') (Join-Path $Stage 'target\debug') -Force }
 foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
     $p = Join-Path $env:SystemRoot "System32\$crt"
-    if (Test-Path $p) { Copy-Item $p (Join-Path $Stage 'target\debug') -Force }
+    if (Test-Path $p) {
+        # Windows searches the DLLs in the EXE's own directory first, and the
+        # test binaries live in deps\ - so the runtime has to be there too, not
+        # only next to rustamp.exe. Missing it is 0xC0000135.
+        Copy-Item $p (Join-Path $Stage 'target\debug') -Force
+        Copy-Item $p (Join-Path $Stage 'target\debug\deps') -Force
+    }
 }
 Copy-Item (Join-Path $RepoRoot 'crates') (Join-Path $Stage 'crates') -Recurse -Force
 Write-Host ("    staged {0} MB" -f [math]::Round(((Get-ChildItem $Stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1))
@@ -83,9 +89,9 @@ Step 'copying the staged tree into the guest'
 & $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\code\Rustamp' -TimeoutSeconds 1800 | Out-Null
 
 Step 'running the tests in the guest'
-$guestArgs = @()
-if ($Filter) { $guestArgs = @('-Filter', $Filter) }
-$result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $guestArgs -TimeoutSeconds 3600
+# A single positional argument: `-ArgumentList` with an array binds only the
+# first element to the script's parameter, which silently dropped the filter.
+$result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $Filter -TimeoutSeconds 3600
 
 # --- 5. results --------------------------------------------------------------
 Write-Host ''
