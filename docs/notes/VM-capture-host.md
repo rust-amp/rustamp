@@ -133,7 +133,25 @@ facts from one drifted state.
    against the recorded `base-eq-focused` evidence.
 4. Only after all three pass is the guest accepted as the capture host.
 
-## 9. Windows Sandbox: measured 2026-10-15
+## 9. Tools inside the sandbox
+
+The owner authorised installing whatever the capture work needs **inside the
+sandbox** — PowerShell 7, helpers, anything. The sandbox has network access for
+that (`<Networking>Enable</Networking>` in `vm-capture-host.wsb`), and the
+reference copy stays a local read-only mapping, so nothing about the reference
+material depends on the network.
+
+Two consequences to design around:
+
+- **The sandbox is wiped on close**, so an install is *per boot*. The bootstrap
+  either scripts the install (and pays the download every run) or sticks to the
+  built-in Windows PowerShell 5.1 — which is what the probes ran on, and it was
+  sufficient.
+- Anything the bootstrap installs must be reproducible from a script in the
+  research repo, never a hand-made state, or the next boot silently differs and
+  the capture provenance is worthless.
+
+## 10. Windows Sandbox: measured 2026-10-15
 
 The feature is enabled (`Enable-WindowsOptionalFeature -Online -FeatureName Containers-DisposableClientVM -All`, `RestartNeeded: False`) and a probe ran inside a guest. Measured inside the sandbox:
 

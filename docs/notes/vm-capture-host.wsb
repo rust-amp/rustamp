@@ -26,8 +26,13 @@
     </MappedFolder>
   </MappedFolders>
 
-  <!-- Offline: the reference copy is mapped in, so nothing needs the network. -->
-  <Networking>Disable</Networking>
+  <!--
+    Network is ON because the owner authorised installing tools inside the
+    sandbox (PowerShell 7, whatever the bootstrap needs). The sandbox is wiped
+    on close, so an install is per boot: the bootstrap must script it or fall
+    back to the built-in Windows PowerShell 5.1, which is what the probes ran on.
+  -->
+  <Networking>Enable</Networking>
   <MemoryInMB>4096</MemoryInMB>
   <!-- Software rendering on purpose: one less source of pixel variation. -->
   <vGPU>Disable</vGPU>
