@@ -52,10 +52,24 @@ switch ($PSCmdlet.ParameterSetName) {
         }
         if ((Get-VM -Name $VmName).State -ne 'Off') {
             Write-Host "shutting $VmName down cleanly for a consistent baseline"
-            Stop-VM -Name $VmName -Shutdown -Force:$Force
-            $deadline = (Get-Date).AddMinutes(3)
+            if ($Credential) {
+                # `Stop-VM` has no `-Shutdown` parameter on this build (that was a
+                # real failure). The clean way is to ask the guest itself, over
+                # PowerShell Direct.
+                Invoke-Command -VMName $VmName -Credential $Credential -ScriptBlock { Stop-Computer -Force } -ErrorAction SilentlyContinue | Out-Null
+            } elseif (-not $Force) {
+                throw 'the guest is running and no -Credential was given: pass the guest credential so it can be shut down cleanly, or -Force to turn it off (which is not a clean baseline).'
+            } else {
+                Write-Host 'turning the guest off - not a clean shutdown, the baseline will look like a power loss'
+                Stop-VM -Name $VmName -Force
+            }
+            $deadline = (Get-Date).AddMinutes(4)
             while ((Get-VM -Name $VmName).State -ne 'Off' -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 3 }
-            if ((Get-VM -Name $VmName).State -ne 'Off') { throw "guest did not shut down; use -Force" }
+            if ((Get-VM -Name $VmName).State -ne 'Off') {
+                if (-not $Force) { throw 'the guest did not shut down; pass -Force to turn it off' }
+                Stop-VM -Name $VmName -Force
+                Start-Sleep -Seconds 5
+            }
         }
         Checkpoint-VM -Name $VmName -SnapshotName $Create
         Write-Host "checkpoint '$Create' created"

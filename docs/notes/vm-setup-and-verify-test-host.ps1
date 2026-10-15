@@ -82,7 +82,7 @@ if (-not (Wait-GuestReady)) { throw 'the guest did not come back after the reboo
 Write-Host 'guest is back'
 
 Write-Host '--- 4. baseline checkpoint ---'
-& (Join-Path $PSScriptRoot 'vm-snapshot-test-host.ps1') -Create base-provisioned
+& (Join-Path $PSScriptRoot 'vm-snapshot-test-host.ps1') -Create base-provisioned -Credential $Credential
 
 Write-Host @'
 
