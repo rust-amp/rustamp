@@ -118,9 +118,11 @@ impl DecoderFactory for SymphoniaDecoderFactory {
 
 /// Adapts a [`ReadSeek`] reader to symphonia's `MediaSource` trait.
 ///
-/// `ReadSeek` requires `Send + Sync` (RFC 0002, C2), which is exactly what
-/// symphonia's `MediaSource` needs, so the reader can be held directly; the
-/// former `Mutex` wrapper is gone.
+/// The reader is held directly and needs no interior synchronisation: the
+/// `Send + Sync` requirement of [`ReadSeek`] (RFC 0002, C2) is what symphonia's
+/// `MediaSource` asks for, and `ReaderSource` inherits both auto traits from
+/// `Box<dyn ReadSeek>`. That bound — not a lock — carries the thread-safety
+/// guarantee; the tests at the bottom of this file pin it.
 struct ReaderSource {
     inner: Box<dyn ReadSeek>,
     len: Option<u64>,
@@ -555,5 +557,71 @@ fn apply_tags(m: &mut TrackMetadata, rev: &MetadataRevision) {
                 m.extra.insert(tag.key.to_ascii_uppercase(), v);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use symphonia::core::io::MediaSource as _;
+
+    /// Compile-time proof for the `Send + Sync` requirement of symphonia's
+    /// `MediaSource` (RFC 0002, C2). `ReaderSource` satisfies it through
+    /// `Box<dyn ReadSeek>`, because `ReadSeek` itself requires `Send + Sync`;
+    /// nothing else contributes to it.
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    fn reader_source(len: usize) -> ReaderSource {
+        let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
+        ReaderSource {
+            inner: Box::new(Cursor::new(bytes)),
+            len: Some(len as u64),
+        }
+    }
+
+    #[test]
+    fn reader_source_is_send_and_sync() {
+        assert_send_sync::<ReaderSource>();
+        // The boxed trait object the wrapper holds carries the same bounds.
+        assert_send_sync::<Box<dyn ReadSeek>>();
+    }
+
+    /// The shared-`&` case: several threads use the same wrapper at the same
+    /// time. This is the guarantee the wrapper's `Sync` bound has to give, and
+    /// the test stops compiling if `ReaderSource` (or the `ReadSeek` bound)
+    /// loses `Sync`.
+    #[test]
+    fn reader_source_is_shared_by_several_threads_at_once() {
+        let src = reader_source(256);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    assert!(src.is_seekable());
+                    assert_eq!(src.byte_len(), Some(256));
+                });
+            }
+        });
+    }
+
+    /// The other half, `Send`: the wrapper is moved to another thread and read
+    /// and seeked there.
+    #[test]
+    fn reader_source_is_moved_to_another_thread() {
+        let mut src = reader_source(256);
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 8];
+            src.read_exact(&mut buf).expect("read");
+            assert_eq!(src.seek(SeekFrom::End(0)).expect("seek"), 256);
+            buf
+        });
+        assert_eq!(
+            handle.join().expect("decode thread"),
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
     }
 }

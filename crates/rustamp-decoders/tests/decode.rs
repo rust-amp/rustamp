@@ -474,3 +474,16 @@ fn partial_reads_return_whole_frames() {
     }
     assert_eq!(total, FIXTURE_FRAMES);
 }
+
+/// The engine opens a source on one thread and decodes on another, so a decoder
+/// built from `MediaSource::Reader` — and with it the reader wrapper inside —
+/// must be `Send`. The decoder is opened here and only then moved to the
+/// worker, so this stops compiling if that chain loses `Send` (RFC 0002, C2).
+#[test]
+fn reader_source_decoder_decodes_on_another_thread() {
+    let mut d = open_bytes(std::fs::read(fixture("sine.flac")).unwrap(), Some("flac"));
+    let decoded: u64 = std::thread::spawn(move || (read_all(d.as_mut()).len() / 2) as u64)
+        .join()
+        .expect("decode thread");
+    assert_eq!(decoded, FIXTURE_FRAMES);
+}

@@ -27,9 +27,13 @@ is in effect here.
    `SymphoniaDecoder` overrides it, so a `dyn Decoder` call sees the real count.
    The inherent method stays as a convenience for callers that hold the concrete
    type; both read the same field.*
-2. `ReadSeek` requires `Send + Sync` (RFC 0002, C2), which is what symphonia
-   needs, so the reader is held directly and no `Mutex` wrapper is required.
-   *Done (RFC 0002, C2): `ReaderSource` holds the `Box<dyn ReadSeek>` itself.*
+2. `ReadSeek` requires `Send + Sync` (RFC 0002, C2), which is what symphonia's
+   `MediaSource` needs, so the reader is held directly and needs no interior
+   synchronisation.
+   *Done (RFC 0002, C2): `ReaderSource` holds the `Box<dyn ReadSeek>` itself.
+   The `ReadSeek` bound is what carries the guarantee: the wrapper inherits
+   `Send + Sync` from the boxed reader, and the crate's tests pin concurrent
+   shared access and the move to another thread.*
 3. A way to report "format changed mid-stream" (e.g. `Error::FormatChanged`
    or an `Event`) would let the engine react to new parameters.
    *Accepted in core (RFC 0002, C3/C4) as `Error::FormatChanged`; this crate
