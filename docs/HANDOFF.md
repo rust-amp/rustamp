@@ -10,7 +10,7 @@ Status as of **2026-10-15**, after the second session (OpenCode orchestrator): l
 
 - **Windows first.** Linux and macOS come later (milestone M6). Classic plugins will run there under Wine.
 - **The player is 64-bit only** (`rustamp.exe`, x86_64). Only the separate **plugin host `rustamp-plughost32.exe` is 32-bit** (i686), so it can load classic 32-bit Winamp 2.x plugins: `in_`, `out_`, `vis_`, `dsp_` and `gen_`. MilkDrop 2, AVS and Geiss have priority.
-- **License: GPL-3.0-or-later.**
+- **License: split** (RFC 0004). The player and most crates are GPL-3.0-or-later with a §7 plugin exception; `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc` and `rustamp-plughost` are MIT OR Apache-2.0. See `THIRD_PARTY.md` and `README.md`.
 - **Skins.**
   - The installer bundles a newly drawn **look-alike default skin**: classic layout and colors, but no copied pixels.
   - The **original Winamp base skin** (from webamp `base-2.91`) is offered only as a **separate optional download**.
@@ -57,7 +57,7 @@ The binding rules are in **[CLEANROOM.md](../CLEANROOM.md)**. In short:
 |---|---|---|
 | `D:\code\Rustamp` | This repo (clean, GPL). Branch `main` | clean |
 | `D:\code\rustamp-research` | Private dirty-room repo: `drafts/` (S09 draft), `notes/S10-seed.md` (first WM_WA_IPC/WM_COMMAND list), `inventory/binaries.md`, `audits/S09-audit.md`, `tools/` (Python PE and NSIS parsers), `extracted/` (unpacked installers, Winamp 5.x source; git-ignored). Not committed | **dirty, never read it yourself** |
-| `D:\code\rustamp-refbin` | Downloaded reference binaries plus `MANIFEST.md` with SHA-256 hashes: Winamp 2.95 (stock, md5/sha1 match archive.org), 2.95 full noaod, Winamp 5.66 full, Geiss 4.29, Geiss 2, MilkDrop 2.25c source zip, libopenmpt 0.8.9 (with in_openmpt.dll). Never run anything; nothing installed | dirty (binaries) |
+| `D:\code\rustamp-refbin` | Downloaded reference binaries plus `MANIFEST.md` with SHA-256 hashes: Winamp 2.95 (stock, md5/sha1 match archive.org), 2.95 full noaod, Winamp 5.66 full, Geiss 4.29, Geiss 2, MilkDrop 2.25c source zip, libopenmpt 0.8.9 (with in_openmpt.dll). Winamp 2.95 was installed by the dirty room into a sandbox for reference captures; the clean room never runs these files | dirty (binaries) |
 | `C:\Tools\ghidra_12.1.4_PUBLIC` | Ghidra (for dirty agents) | |
 
 Tools available: Rust 1.99 stable with the targets `x86_64-pc-windows-msvc` and `i686-pc-windows-msvc`, git, gh, ffmpeg, 7-Zip, Python 3.14, VS 2022 (dumpbin, not on PATH).
@@ -128,9 +128,11 @@ Workspace: 22 members (21 crates in `crates/` plus `xtask`), edition 2024, resol
 10. **DPI and window sizing (lane F / S05).** The example presenter is DPI-unaware, so on the sandbox machine (system DPI 144) its client area is 183×77 and the 275×116 layout is blitted into a smaller area; double-size resizes the softbuffer surface but not the OS window. Neither is a layout bug, but both must be fixed when the platform lane makes the process per-monitor DPI aware and owns window sizing.
 11. **Process note (kept deliberately):** the first dirty-room capture session claimed it used no synthetic input, which was false — real desktop clicks had driven several states. The audit corrected the provenance and re-established every click-derived claim. Capture manifests must now record the input method, the DPI awareness and the coordinate space; the sandbox machine runs at system DPI 144, so a DPI-unaware process sees the main window as 183×77 instead of 275×116.
 12. **Still open from S01 round 2** (drafted, not exported): the equalizer slider-track decomposition and body colouring, the dragged thumb sprite, the On/Auto held sprites, two graph line strips, the playlist tile pitch and boundaries, the playlist scrollbar arrows and travel, the playlist bottom-bar hit areas and pressed state, end-of-track behaviour, whether the clutterbar can be hidden, whether skins can change the hint strings, how the four shortcut tables combine, modifier-click gestures, and playlist drag-reorder.
-8. **MilkDrop 2 needs a 5.x host.** It requires several 5.x IPC calls and the HWND entry point, so the plugin host must emulate a partial 5.x IPC surface (relevant for S10).
-9. **AVS 2.81d** has not been found as a separate installer; AVS ships with Winamp 5.66. **MilkDrop 1.04** returns a 404. **in_vgm, in_sid, a DSP plugin and a scrobbler gen plugin** have not been found yet.
-10. CI (`.github/workflows/ci.yml`) has not run yet: there is no GitHub remote.
+13. **MilkDrop 2 needs a 5.x host.** It requires several 5.x IPC calls and the HWND entry point, so the plugin host must emulate a partial 5.x IPC surface (relevant for S10).
+14. **AVS 2.81d** has not been found as a separate installer; AVS ships with Winamp 5.66. **MilkDrop 1.04** returns a 404. **in_vgm, in_sid, a DSP plugin and a scrobbler gen plugin** have not been found yet.
+15. CI (`.github/workflows/ci.yml`) has not run yet: there is no GitHub remote. An optional CI check that the four permissive crates stay GPL-free does not exist yet.
+16. **sidplayfp is not linked.** `rustamp-decoders` only wraps symphonia today. sidplayfp (GPL-2.0+) is a planned decoder; linking it in-process would be a residual licensing risk (see `docs/notes/L-licensing-plugins.md`), so decide between dropping it, a permissive replacement or a separate decoder-host process before adding it.
+17. **Merged worktrees.** Nine detached worktrees under `C:\Users\micro\.local\share\opencode\worktree\26de0e\` (`wave1-audio` to `wave7-ui-behaviour`) are fully merged into `main` and clean; each carries its own `target/` (several GB). Ask the user before removing them.
 
 ---
 
@@ -138,7 +140,7 @@ Workspace: 22 members (21 crates in `crates/` plus `xtask`), edition 2024, resol
 
 Each task is a task card (template: `.github/ISSUE_TEMPLATE/task-card.md`): goal, lane, owned paths, allowed and forbidden sources, specs, contract, acceptance tests. Two parallel agents must have **disjoint owned paths**, and the root `Cargo.toml` belongs to one agent at most.
 
-**Now running (2026-10-14, second session):** the dirty room is installing Winamp 2.95 into a sandbox and capturing references with the original base skin, then writing **S01** and **S17**, followed by S02/S03/S07 as budget allows; drafts go to `rustamp-research` and only reach `specs/` after the Spec Auditor's PASS. The clean lanes have no free slot until then. Candidate follow-ups when a slot frees: the cross-bitness ring helper (see open point 2), `rustamp-meta` (needs a `lofty` dependency decision), the `rustamp-core` follow-ups from RFC 0002, and Lane D's main window (blocked on S01/S02).
+**Status of the dirty room:** S01, S02, S03, S09 and S17 are audited and exported. S01 round 2 (equalizer interior, playlist upper half) is drafted in `rustamp-research` but not audited or exported; S07 and the other specs are not started. Candidate next lanes: S03 keyboard shortcuts in `rustamp-ui` (card `docs/tasks/D3-shortcuts.md`), platform/DPI (lane F), the S01 round 2 audit with the four S01 contradictions.
 
 **Wave 1 — DONE and integrated on `main`:**
 1. **Lane A, audio engine** (`rustamp-audio`, `rustamp-output`, RFC 0002 in core): decode thread, `rtrb` ring, output callback, transport, gapless, WASAPI shared, cpal fallback, `NullOutput`, volume/balance, raw vis tap, CLI example. **Integrated as `c73d33d`; RFC 0002 accepted.**
