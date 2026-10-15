@@ -16,6 +16,8 @@
 //!   spec **S02**: transport, clutterbar, marquee, time display, hints and mouse
 //!   dispatch, driven by [`rustamp_core::command::Command`] and
 //!   [`rustamp_core::event::Event`]. Time is a parameter, never a clock.
+//! * [`shortcuts`] maps key presses to the S03 main-window actions and
+//!   dispatches them on [`behaviour::MainWindow`] (task card D3).
 //! * [`render::render_main_window`] paints one RGBA frame through
 //!   [`rustamp_gfx`], falling back per spec **S17** when a skin lacks a sheet.
 //! * [`widget::hit_test`] maps a window-relative point to a [`widget::Widget`].
@@ -31,6 +33,7 @@ pub mod behaviour;
 pub mod layout;
 pub mod presenter;
 pub mod render;
+pub mod shortcuts;
 pub mod state;
 pub mod widget;
 
@@ -43,5 +46,9 @@ pub use layout::{
 };
 pub use presenter::{MainWindowPresenter, PresenterError};
 pub use render::{frame_size, render_main_window};
+pub use shortcuts::{
+    Binding, GLOBAL_TABLE, Key, MAIN_TABLE, Modifiers, ShortcutAction, ShortcutOutcome,
+    ShortcutWindow, VOLUME_STEP, lookup,
+};
 pub use state::{MainWindowState, MonoStereo, TransportButton, TransportState, WindowButton};
 pub use widget::{Widget, hit_test};

@@ -274,6 +274,14 @@ impl MainWindow {
         self.refresh(now_ms);
     }
 
+    /// Toggles the elapsed/remaining time display (S02 §4, S03 §1 `Ctrl+T`).
+    ///
+    /// UI-local: there is no core command for it.
+    pub fn toggle_time_remaining(&mut self, now_ms: u64) {
+        self.state.time_remaining = !self.state.time_remaining;
+        self.refresh(now_ms);
+    }
+
     /// A press at window-relative `(x, y)`. Returns the commands the press
     /// produces (sliders jump on press).
     pub fn mouse_down(&mut self, x: i32, y: i32, now_ms: u64) -> Vec<Command> {

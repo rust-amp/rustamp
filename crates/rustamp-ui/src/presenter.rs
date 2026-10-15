@@ -10,6 +10,11 @@
 //! interactive; the commands the machine emits have no engine to reach yet, so
 //! they are dropped (the machine applies its own S02 prediction).
 //!
+//! Keyboard events are mapped here (and only here) from `winit` types into the
+//! headless [`Key`] / [`Modifiers`] of [`crate::shortcuts`], dispatched with
+//! [`MainWindow::key_down`], and the outcome is printed to stdout. A held key
+//! repeats: each OS key-repeat event dispatches the action again.
+//!
 //! Tests never call [`MainWindowPresenter::run`]; only the `main_window`
 //! example does, on an explicit manual run.
 
@@ -21,13 +26,15 @@ use rustamp_gfx::Image;
 use rustamp_skin::Skin;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::behaviour::MainWindow;
 use crate::layout::MainWindowLayout;
 use crate::render::{frame_size, render_main_window};
+use crate::shortcuts::{Key, Modifiers, ShortcutOutcome};
 use crate::state::MainWindowState;
 
 /// A failure while opening or driving the window.
@@ -52,6 +59,7 @@ pub struct MainWindowPresenter {
     started: Option<Instant>,
     cursor: (i32, i32),
     left_down: bool,
+    modifiers: ModifiersState,
     window_handle: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
 }
@@ -66,6 +74,7 @@ impl MainWindowPresenter {
             started: None,
             cursor: (0, 0),
             left_down: false,
+            modifiers: ModifiersState::empty(),
             window_handle: None,
             surface: None,
         }
@@ -129,6 +138,34 @@ impl MainWindowPresenter {
             1.0
         };
         ((position.x / scale) as i32, (position.y / scale) as i32)
+    }
+
+    /// Dispatches one keyboard event through the shortcut table.
+    fn key_event(&mut self, event: &KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let Some(key) = map_key(event) else {
+            return;
+        };
+        let modifiers = map_modifiers(self.modifiers);
+        let now = self.elapsed_ms();
+        match self.window.key_down(key, modifiers, now) {
+            Some(ShortcutOutcome::Commands(commands)) => {
+                println!("rustamp-ui: shortcut {key:?} -> {commands:?}");
+            }
+            Some(ShortcutOutcome::Handled) => {
+                println!("rustamp-ui: shortcut {key:?} handled locally");
+            }
+            Some(ShortcutOutcome::Unhandled(action)) => {
+                println!(
+                    "rustamp-ui: shortcut {key:?} -> {action:?} (command id {}, no Command yet)",
+                    action.command_id()
+                );
+            }
+            None => return,
+        }
+        self.request_redraw();
     }
 
     fn paint(&mut self) {
@@ -200,6 +237,8 @@ impl ApplicationHandler for MainWindowPresenter {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.paint(),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. } => self.key_event(&event),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = self.to_layout(position);
                 if self.left_down {
@@ -230,5 +269,110 @@ impl ApplicationHandler for MainWindowPresenter {
             }
             _ => {}
         }
+    }
+}
+
+/// Converts `winit` modifier state into the headless [`Modifiers`].
+fn map_modifiers(state: ModifiersState) -> Modifiers {
+    Modifiers::new(state.control_key(), state.alt_key(), state.shift_key())
+}
+
+/// Maps a physical key code to a [`Key`] (keys whose position, not their
+/// character, matters: keypad, navigation and function keys, digits, grave).
+fn map_key_code(code: KeyCode) -> Option<Key> {
+    Some(match code {
+        KeyCode::Numpad0 => Key::Numpad(0),
+        KeyCode::Numpad1 => Key::Numpad(1),
+        KeyCode::Numpad2 => Key::Numpad(2),
+        KeyCode::Numpad3 => Key::Numpad(3),
+        KeyCode::Numpad4 => Key::Numpad(4),
+        KeyCode::Numpad5 => Key::Numpad(5),
+        KeyCode::Numpad6 => Key::Numpad(6),
+        KeyCode::Numpad7 => Key::Numpad(7),
+        KeyCode::Numpad8 => Key::Numpad(8),
+        KeyCode::Numpad9 => Key::Numpad(9),
+        KeyCode::NumpadDecimal => Key::NumDecimal,
+        KeyCode::NumpadAdd => Key::NumAdd,
+        KeyCode::NumpadSubtract => Key::NumSubtract,
+        KeyCode::Digit0 => Key::Digit(0),
+        KeyCode::Digit1 => Key::Digit(1),
+        KeyCode::Digit2 => Key::Digit(2),
+        KeyCode::Digit3 => Key::Digit(3),
+        KeyCode::Digit4 => Key::Digit(4),
+        KeyCode::Digit5 => Key::Digit(5),
+        KeyCode::Digit6 => Key::Digit(6),
+        KeyCode::Digit7 => Key::Digit(7),
+        KeyCode::Digit8 => Key::Digit(8),
+        KeyCode::Digit9 => Key::Digit(9),
+        KeyCode::F1 => Key::F(1),
+        KeyCode::F2 => Key::F(2),
+        KeyCode::F3 => Key::F(3),
+        KeyCode::F4 => Key::F(4),
+        KeyCode::F5 => Key::F(5),
+        KeyCode::F6 => Key::F(6),
+        KeyCode::F7 => Key::F(7),
+        KeyCode::F8 => Key::F(8),
+        KeyCode::F9 => Key::F(9),
+        KeyCode::F10 => Key::F(10),
+        KeyCode::F11 => Key::F(11),
+        KeyCode::F12 => Key::F(12),
+        KeyCode::ArrowUp => Key::Up,
+        KeyCode::ArrowDown => Key::Down,
+        KeyCode::ArrowLeft => Key::Left,
+        KeyCode::ArrowRight => Key::Right,
+        KeyCode::Insert => Key::Insert,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Enter | KeyCode::NumpadEnter => Key::Enter,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Backquote => Key::Grave,
+        KeyCode::Space => Key::Space,
+        KeyCode::Escape => Key::Escape,
+        _ => return None,
+    })
+}
+
+/// Maps a `winit` key event to a [`Key`]: letters by their (layout-aware)
+/// character, everything else by physical key code.
+fn map_key(event: &KeyEvent) -> Option<Key> {
+    if let WinitKey::Character(text) = &event.logical_key {
+        let mut chars = text.chars();
+        if let (Some(c), None) = (chars.next(), chars.next())
+            && let Some(letter) = Key::letter(c)
+            && !matches!(event.physical_key, PhysicalKey::Code(code) if map_key_code(code).is_some_and(|k| matches!(k, Key::Numpad(_))))
+        {
+            return Some(letter);
+        }
+    }
+    match event.physical_key {
+        PhysicalKey::Code(code) => map_key_code(code),
+        PhysicalKey::Unidentified(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_codes_map_to_headless_keys() {
+        assert_eq!(map_key_code(KeyCode::Numpad7), Some(Key::Numpad(7)));
+        assert_eq!(map_key_code(KeyCode::NumpadDecimal), Some(Key::NumDecimal));
+        assert_eq!(map_key_code(KeyCode::ArrowLeft), Some(Key::Left));
+        assert_eq!(map_key_code(KeyCode::F5), Some(Key::F(5)));
+        assert_eq!(map_key_code(KeyCode::Digit3), Some(Key::Digit(3)));
+        assert_eq!(map_key_code(KeyCode::Backquote), Some(Key::Grave));
+        assert_eq!(map_key_code(KeyCode::KeyA), None);
+    }
+
+    #[test]
+    fn modifier_state_maps_to_the_headless_set() {
+        let state = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(map_modifiers(state), Modifiers::CTRL | Modifiers::SHIFT);
+        assert_eq!(map_modifiers(ModifiersState::empty()), Modifiers::NONE);
+        assert_eq!(map_modifiers(ModifiersState::ALT), Modifiers::ALT);
     }
 }
