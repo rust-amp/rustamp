@@ -1,7 +1,7 @@
 # RFC 0008: Re-export the RFC 0005 payload enums from `rustamp-core`
 
-Status: **Draft** (proposed 2026-10-15; owner approved writing it, acceptance
-pending).
+Status: **Accepted** on 2026-10-16 (owner approved writing it; implemented and
+verified the same day).
 Owner: Lane I (contracts). Depends on: RFC 0001 (core contracts), RFC 0004
 (`rustamp-proto` is the permissive wire-type crate), RFC 0005 (which added the
 three enums).
