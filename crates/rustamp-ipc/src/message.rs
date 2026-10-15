@@ -2,6 +2,8 @@
 
 use rustamp_plugin_abi::PluginKind;
 use rustamp_proto::command::Command;
+use rustamp_proto::host::{DspStageDesc, MediaLocationWire, PcmSpecWire};
+use rustamp_proto::meta::TrackMetadata;
 use rustamp_proto::state::PlayerState;
 use rustamp_proto::vis::{VIS_CHANNELS, VIS_SAMPLES, VisFrame};
 use serde::{Deserialize, Serialize};
@@ -20,8 +22,11 @@ use crate::shm::{RingDirection, RingExpect, RingKind, RingRefuseReason};
 ///   cannot decode a `CommandFromPlugin` carrying a new variant, so the bump
 ///   turns a mixed-version pair into a clean `Hello` rejection instead of a
 ///   postcard decode error (RFC 0003 §9's reasoning for the 0 -> 1 bump).
-///   RFC 0006 takes this to 3 when it lands (sequential bumps).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// * `3`: adds the RFC 0006 hosting messages (`DecoderOpen`…`DspError`) and
+///   the RFC 0007 wake events (`rustamp-ipc`-local, no `Message` change).
+///   RFC 0005 shipped v2 first; RFC 0006/0007 therefore take v3 to avoid
+///   breaking existing v2 peers that would mis-decode the new variants.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Wire form of [`VisFrame`] (flat vectors, `channel-major`: all samples of
 /// channel 0, then channel 1). Each vector has `VIS_CHANNELS * VIS_SAMPLES` values.
@@ -168,6 +173,76 @@ pub enum Message {
     /// to `WinampIpc` is S10's to resolve (RFC 0005 O13); the handling lands
     /// with M3.
     CommandToHost(Command),
+
+    // ==== RFC 0006: out-of-process decoder hosting ====
+    /// M: open a decoder in the helper. Answers: `DecoderOpened` | `DecoderError`.
+    DecoderOpen {
+        /// Media location (UTF-8 path or URL).
+        location: MediaLocationWire,
+        /// Ring capacity hint (frames).
+        prefetch_frames: u32,
+    },
+    /// H: the decoder is open; a `RingOffer` for its PCM follows.
+    DecoderOpened {
+        /// Stream specification.
+        spec: PcmSpecWire,
+        /// Duration in milliseconds, if known.
+        duration_ms: Option<u64>,
+        /// Whether the stream is seekable.
+        seekable: bool,
+        /// Track metadata.
+        metadata: TrackMetadata,
+    },
+    /// M: seek the open decoder. Answer: `DecoderSeeked` (after the new `RingOffer`).
+    DecoderSeek {
+        /// Target position in milliseconds.
+        to_ms: u64,
+    },
+    /// H: seek done, `reached_ms` is what the decoder reports.
+    DecoderSeeked {
+        /// Actual position reached in milliseconds.
+        reached_ms: u64,
+    },
+    /// H: the stream changed format; a new `RingOffer` follows (RFC 0002 C3).
+    DecoderFormat {
+        /// New stream specification.
+        spec: PcmSpecWire,
+    },
+    /// H: damage/bitrate telemetry, on change only.
+    DecoderStats {
+        /// Cumulative skipped packets.
+        skipped_packets: u64,
+        /// Current bitrate in kbps, if known.
+        bitrate_kbps: Option<u32>,
+    },
+    /// H: end of stream; the ring is drained, then closed.
+    DecoderEos,
+    /// Either: `DecoderOpen`/`DecoderSeek` failed, or the decoder died.
+    DecoderError {
+        /// Error description.
+        message: String,
+    },
+
+    // ==== RFC 0006: out-of-process DSP hosting ====
+    /// M: (re)configure the DSP chain. Answers: `DspReady` | `DspError`.
+    DspConfigure {
+        /// Stream specification.
+        spec: PcmSpecWire,
+        /// Ordered list of stages.
+        stages: Vec<DspStageDesc>,
+    },
+    /// H: chain is live; both rings are offered; engine compensates this latency.
+    DspReady {
+        /// Total latency in frames reported by the chain.
+        latency_frames: u32,
+    },
+    /// M: clear stage state; rings untouched.
+    DspReset,
+    /// Either: configure failed, a stage died, or the chain broke.
+    DspError {
+        /// Error description.
+        message: String,
+    },
 }
 
 impl Message {

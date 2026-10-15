@@ -1654,6 +1654,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustamp-mediahost"
+version = "0.0.1"
+dependencies = [
+ "rustamp-ipc",
+ "rustamp-proto",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rustamp-meta"
 version = "0.0.1"
 dependencies = [
@@ -1721,6 +1730,7 @@ dependencies = [
 name = "rustamp-proto"
 version = "0.0.1"
 dependencies = [
+ "postcard",
  "serde",
 ]
 

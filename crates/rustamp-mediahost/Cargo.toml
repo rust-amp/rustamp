@@ -1,0 +1,29 @@
+[package]
+name = "rustamp-mediahost"
+description = "Rustamp: out-of-process decoder and DSP host binaries (RFC 0006)"
+version.workspace = true
+edition.workspace = true
+# GPL-3.0-or-later WITHOUT the §7 exception (RFC 0006 §8):
+# this crate exists to link code the exception cannot cover (copyleft decoders/DSP).
+license = "GPL-3.0-or-later"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-ipc = { workspace = true }
+rustamp-proto = { workspace = true }
+thiserror = { workspace = true }
+
+# Only 64-bit hosts; the residents are native 64-bit libraries.
+# Unlike classic plugins, nothing here needs i686.
+[target.'cfg(not(target_pointer_width = "64"))'.dependencies]
+# Empty: this crate only builds for x86_64.
+
+[[bin]]
+name = "rustamp-dechost"
+path = "src/bin/dechost.rs"
+
+[[bin]]
+name = "rustamp-dsphost"
+path = "src/bin/dsphost.rs"

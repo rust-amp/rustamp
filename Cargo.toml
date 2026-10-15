@@ -22,6 +22,7 @@ members = [
     "crates/rustamp-library",
     "crates/rustamp-app",
     "crates/rustamp-testkit",
+    "crates/rustamp-mediahost",
     "xtask",
 ]
 
@@ -50,6 +51,7 @@ rustamp-vis = { path = "crates/rustamp-vis" }
 rustamp-milkdrop = { path = "crates/rustamp-milkdrop" }
 rustamp-plugin-abi = { path = "crates/rustamp-plugin-abi" }
 rustamp-ipc = { path = "crates/rustamp-ipc" }
+rustamp-mediahost = { path = "crates/rustamp-mediahost" }
 rustamp-platform = { path = "crates/rustamp-platform" }
 rustamp-prefs = { path = "crates/rustamp-prefs" }
 rustamp-library = { path = "crates/rustamp-library" }

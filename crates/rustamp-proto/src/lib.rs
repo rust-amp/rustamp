@@ -25,6 +25,7 @@
 pub mod command;
 pub mod error;
 pub mod event;
+pub mod host;
 pub mod meta;
 pub mod playlist;
 pub mod state;
