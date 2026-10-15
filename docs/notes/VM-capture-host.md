@@ -1,0 +1,125 @@
+# The VM capture host (Hyper-V)
+
+Why we run reference captures in a virtual machine, what has to be configured,
+and how a capture is taken so that its provenance is beyond doubt.
+
+This document is **process**, not reference knowledge: it contains nothing
+derived from Winamp source, the SDK or the binary. The VM itself is
+dirty-room territory, exactly like the current sandbox — the clean-room rules in
+[CLEANROOM.md](../../CLEANROOM.md) are unchanged.
+
+## 1. Why a VM (and why not "because it is faster")
+
+Winamp 2.95 is a 1999 program; any VM is overpowered for it. Speed is not the
+reason. Four things are:
+
+1. **A genuinely interactive desktop.** Every capture failure on the host has
+   the same shape: the agent processes are not on the interactive desktop
+   (`GetForegroundWindow()` = 0, `SendInput` returns `ACCESS_DENIED`, screen
+   capture fails), even while the session reports `Aktiv`. In a guest with
+   **auto-logon at the console** the console session is interactive, and a
+   process inside the guest can inject real input.
+2. **Snapshots.** Captures stop being one-shot: restore a baseline, perform
+   *one* action, capture, restore. Each fact gets an atomic, repeatable
+   provenance ("snapshot `base-eq-unfocused`"), instead of "the state drifted
+   between runs" or "the skin-load method is unrecorded" — both of which really
+   happened on the host.
+3. **A fixed display scale.** The host runs at 250 % with a stale registry
+   `AppliedDPI` of 144, so a DPI-unaware observer reads 110×46 for a window
+   that is 275×116. A guest pinned to 100 % makes `GetClientRect == 275×116`
+   unambiguous.
+4. **Isolation.** Input automation hits a disposable guest, never the owner's
+   desktop. That is the direct answer to the incident where a capture session
+   claimed it had used no synthetic input while real clicks had driven states.
+
+It is also the right home for milestone M3, where real 32-bit plugin DLLs must
+be loaded and allowed to crash: snapshot, load, observe, roll back.
+
+## 2. Host facts (measured 2026-10-15)
+
+| Item | Value |
+|---|---|
+| Machine | Lenovo 82JQ, Ryzen 7 5800H, 16 logical CPUs, 31.9 GB RAM |
+| Hypervisor | **active** (`HypervisorPresent` = True, `vmms` running) |
+| Hyper-V PowerShell module | 2.0.0.0 — `New-VM`, `Checkpoint-VM`, `Restore-VMSnapshot`, `Get-VM`, `Get-VMSnapshot`, `Start-VM` present |
+| VMware Workstation | installed, but **not** the recommended path here: with Hyper-V active it only runs in the WHP compatibility mode |
+| Elevation | the orchestrator shell is **not** elevated; VM creation and snapshot restore need an admin shell (or Hyper-V Administrators) |
+
+## 3. Guest configuration checklist
+
+Create the VM in an elevated shell.
+
+- **Generation 2**, 4 GB RAM, 2 vCPUs, 60 GB dynamically expanding VHDX. Winamp
+  needs none of that; the headroom is for Windows itself.
+- **No network after setup.** The reference copy is copied in, so the guest can
+  be offline; fewer moving parts.
+- Install Windows, then set a local account with **auto-logon at the console**
+  (the `AutoAdminLogon` registry values or `netplwiz`). This is the whole point
+  of the exercise: the console session must be interactive without anyone
+  logging in.
+- **Disable lock screen, screen saver and sleep.** A locked session has no input
+  desktop, which is exactly the failure we are escaping.
+- **Display scale 100 %**, fixed resolution (1024×768 or 1280×1024).
+- **Do not use RDP and do not enable Enhanced Session Mode** for the capture
+  work: both reintroduce the disconnected-desktop problem. The basic console
+  session (`vmconnect.exe`) is what the automation expects.
+- Copy the already-extracted Winamp 2.95 sandbox
+  (`D:\code\rustamp-sandbox\winamp295`) into the guest. **This runs the
+  reference binary in a new location and needs the owner's confirmation** — the
+  existing approval covers the host sandbox, not automatically a guest.
+- Copy the capture harness and its manifest writer (dirty-room tooling; see
+  §5).
+- Optional but useful: a Defender exclusion for the capture directory, so a
+  capture is never delayed by a scan.
+
+## 4. Snapshot catalogue
+
+Baselines are created once and then restored before every capture. Names are
+lower-case and stable, because they end up in manifests.
+
+| Snapshot | State |
+|---|---|
+| `base-flat-main` | main window, no track loaded, nothing focused |
+| `base-eq-unfocused` | EQ visible, main focused |
+| `base-eq-focused` | EQ visible and focused |
+| `base-pe-unfocused` | playlist visible, main focused |
+| `base-pe-focused` | playlist visible and focused |
+| `base-playlist-empty` / `-6` / `-30` / `-100` | playlist populated with that many entries, scrolled to top |
+| `base-skin-<name>` | a named skin loaded |
+
+**Capture rule:** restore a baseline, perform exactly **one** action, capture,
+restore again. The manifest names the snapshot and the action. Never take two
+facts from one drifted state.
+
+## 5. What lives where
+
+| Artifact | Location | Clean? |
+|---|---|---|
+| This runbook | `D:\code\Rustamp\docs\notes\` | clean (our own process) |
+| Capture harness, manifests, captures, snapshots of evidence | `D:\code\rustamp-research\` | **dirty** |
+| The existing generic capture tool | `cargo xtask capture` in the repo | clean, reusable (it is a plain Win32 window grab with no Winamp knowledge) |
+
+## 6. Manifest schema (every capture)
+
+- `snapshot` — the baseline restored before the action
+- `action` — what was done, in one line
+- `input_method` — `real-mouse` or `posted-message` (never implied, always
+  stated)
+- `dpi_awareness` — of the measuring process, and the guest's scale
+- `coordinate_space` — window-relative client pixels or screen pixels
+- `harness` — harness name and version
+- `verdict` — the zero-difference comparison against the baseline
+
+## 7. Smoke test before the VM is trusted
+
+1. Restore `base-flat-main`, capture twice with no action in between.
+2. The two captures must be **byte-identical** (that proves determinism).
+3. Restore, perform one known action (e.g. focus the EQ), capture, and compare
+   against the recorded `base-eq-focused` evidence.
+4. Only after all three pass is the guest accepted as the capture host.
+
+## 8. Migration
+
+Once the guest passes the smoke test, the dirty room moves there and the host
+sandbox is retired — **after asking the owner**, since removing it is not
+reversible without the original archive.
