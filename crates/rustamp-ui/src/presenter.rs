@@ -365,13 +365,13 @@ impl ApplicationHandler for MainWindowPresenter {
 }
 
 /// Converts `winit` modifier state into the headless [`Modifiers`].
-fn map_modifiers(state: ModifiersState) -> Modifiers {
+pub fn map_modifiers(state: ModifiersState) -> Modifiers {
     Modifiers::new(state.control_key(), state.alt_key(), state.shift_key())
 }
 
 /// Maps a physical key code to a [`Key`] (keys whose position, not their
 /// character, matters: keypad, navigation and function keys, digits, grave).
-fn map_key_code(code: KeyCode) -> Option<Key> {
+pub fn map_key_code(code: KeyCode) -> Option<Key> {
     Some(match code {
         KeyCode::Numpad0 => Key::Numpad(0),
         KeyCode::Numpad1 => Key::Numpad(1),
@@ -429,7 +429,7 @@ fn map_key_code(code: KeyCode) -> Option<Key> {
 
 /// Maps a `winit` key event to a [`Key`]: letters by their (layout-aware)
 /// character, everything else by physical key code.
-fn map_key(event: &KeyEvent) -> Option<Key> {
+pub fn map_key(event: &KeyEvent) -> Option<Key> {
     if let WinitKey::Character(text) = &event.logical_key {
         let mut chars = text.chars();
         if let (Some(c), None) = (chars.next(), chars.next())

@@ -160,7 +160,9 @@ impl Engine {
             .saturating_mul(usize::from(device.channels.max(1)));
         let (producer, consumer) = RingBuffer::<f32>::new(ring_samples);
         let sync = Arc::new(RingSync::new());
-        let gain = Arc::new(GainState::new(cfg.volume, cfg.balance));
+        let initial_volume = cfg.volume;
+        let initial_balance = cfg.balance;
+        let gain = Arc::new(GainState::new(initial_volume, initial_balance));
         let render = make_render(
             consumer,
             Arc::clone(&sync),
@@ -186,8 +188,8 @@ impl Engine {
             queue: Vec::new(),
             current: None,
             transport: TransportState::Stopped,
-            volume: 255,
-            balance: 0,
+            volume: initial_volume,
+            balance: initial_balance,
             stop_after_current: false,
             clock_origin: 0,
             timeline_origin: 0,
@@ -723,13 +725,15 @@ impl Engine {
         let _ = self.output.pause();
         self.join_decode();
         self.transport = TransportState::Stopped;
+        // Keep the timeline at the final position so callers can report how
+        // much played. Re-base the clock to the current played_frames so
+        // timeline_frames() stops advancing but returns the final value.
         self.clock_origin = self.output.played_frames();
-        self.timeline_origin = 0;
-        self.track_start = 0;
+        // timeline_origin and track_start keep their final values.
         self.bus
             .publish(Event::StateChanged(TransportState::Stopped));
         self.bus.publish(Event::PositionChanged {
-            position_ms: 0,
+            position_ms: self.position_ms(),
             duration_ms: self.duration_ms,
         });
         // "Stop after current track" (RFC 0005 O8) halts the run at the end of

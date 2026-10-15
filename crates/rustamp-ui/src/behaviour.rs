@@ -157,6 +157,11 @@ impl MainWindow {
         &self.layout
     }
 
+    /// Sets whether the window is focused (drives the title-bar focus variant).
+    pub fn set_focused(&mut self, focused: bool) {
+        self.state.title_bar_focused = focused;
+    }
+
     /// Whether the marquee autoscrolls (S02 §3).
     pub fn autoscroll(&self) -> bool {
         self.autoscroll
@@ -1431,7 +1436,7 @@ mod tests {
             Command::ToggleStopAfterCurrent,
             Command::OpenFileInfo,
             Command::OpenMedia {
-                kind: rustamp_proto::command::OpenMediaKind::Files,
+                kind: rustamp_core::command::OpenMediaKind::Files,
                 play: true,
             },
             Command::RefreshSkin,

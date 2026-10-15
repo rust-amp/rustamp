@@ -44,7 +44,7 @@ pub use behaviour::{
 pub use layout::{
     DOUBLE_HEIGHT, DOUBLE_WIDTH, MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH,
 };
-pub use presenter::{MainWindowPresenter, PresenterError};
+pub use presenter::{MainWindowPresenter, PresenterError, map_key, map_key_code, map_modifiers};
 pub use render::{frame_size, render_main_window};
 pub use shortcuts::{
     Binding, GLOBAL_TABLE, Key, MAIN_TABLE, Modifiers, ShortcutAction, ShortcutOutcome,

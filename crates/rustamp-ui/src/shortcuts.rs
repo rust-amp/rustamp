@@ -25,12 +25,9 @@
 
 use rustamp_core::command::Command;
 use rustamp_core::state::WindowId;
-// `rustamp-core` re-exports the RFC 0005 `Command` *variants* through `Command`
-// automatically, but its `command` module re-exports an explicit item list, so
-// the three new *types* are not reachable there. They come straight from the
-// permissive `rustamp-proto` instead of editing `rustamp-core` (a contract
-// change). Reported as a finding.
-use rustamp_proto::command::{JumpTarget, OpenMediaKind, PrefsPage};
+// The RFC 0005 payload enums are now reachable through `rustamp_core::command`
+// (RFC 0008).
+use rustamp_core::command::{JumpTarget, OpenMediaKind, PrefsPage};
 
 use crate::behaviour::{MainWindow, core_volume};
 
