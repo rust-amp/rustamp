@@ -10,3 +10,12 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+]

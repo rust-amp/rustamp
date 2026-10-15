@@ -1679,6 +1679,8 @@ name = "rustamp-platform"
 version = "0.0.1"
 dependencies = [
  "rustamp-core",
+ "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]
@@ -1743,6 +1745,7 @@ version = "0.0.1"
 dependencies = [
  "rustamp-core",
  "rustamp-gfx",
+ "rustamp-platform",
  "rustamp-skin",
  "softbuffer",
  "thiserror 2.0.21",

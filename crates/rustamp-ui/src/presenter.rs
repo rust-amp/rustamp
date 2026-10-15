@@ -15,6 +15,29 @@
 //! [`MainWindow::key_down`], and the outcome is printed to stdout. A held key
 //! repeats: each OS key-repeat event dispatches the action again.
 //!
+//! # Window sizing and DPI (task card F1)
+//!
+//! The layout is fixed in physical pixels (275x116, 550x232 double-sized; see
+//! `specs/S01-window-geometry.md`). [`MainWindowPresenter::run`] makes the
+//! process per-monitor-V2 DPI aware (via `rustamp-platform`) before the
+//! `winit` event loop exists, then sizes the OS window by its **client area**:
+//! every size request goes through `request_inner_size` with the exact layout
+//! pixels, and `winit` translates that to an outer size with the real window
+//! chrome (`AdjustWindowRect` on Windows). The pure chrome math
+//! (`rustamp_platform::outer_size_for_client`) takes numbers, not a window,
+//! and is unit-tested in `rustamp-platform`; `winit` does not expose per-side
+//! chrome insets before the window is shown, so there is nothing more precise
+//! to request up front.
+//!
+//! Toggling double-size (or windowshade) resizes the OS window through the
+//! same path and the softbuffer surface follows on the next paint. On a DPI
+//! change while running (`ScaleFactorChanged`) the presenter re-asserts the
+//! exact layout size in physical pixels via the size writer, and on any resize
+//! that would leave the client area smaller than the layout it re-requests
+//! the layout size; the window therefore never settles below the layout. It
+//! keeps its pixel size across monitors (smaller-looking on high DPI);
+//! logical-size preservation belongs to the app layer or S05.
+//!
 //! Tests never call [`MainWindowPresenter::run`]; only the `main_window`
 //! example does, on an explicit manual run.
 
@@ -23,6 +46,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rustamp_gfx::Image;
+use rustamp_platform::init_dpi_awareness;
 use rustamp_skin::Skin;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -62,6 +86,9 @@ pub struct MainWindowPresenter {
     modifiers: ModifiersState,
     window_handle: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// The client size last requested from the OS window, so repeat requests
+    /// for an unchanged size are skipped.
+    applied_client: Option<(u32, u32)>,
 }
 
 impl MainWindowPresenter {
@@ -77,6 +104,7 @@ impl MainWindowPresenter {
             modifiers: ModifiersState::empty(),
             window_handle: None,
             surface: None,
+            applied_client: None,
         }
     }
 
@@ -114,11 +142,45 @@ impl MainWindowPresenter {
         }
     }
 
+    /// The client area the OS window must have right now, in physical pixels
+    /// (the S01 layout size, doubled when double-sized).
+    fn desired_client_size(&self) -> (u32, u32) {
+        frame_size(self.window.state())
+    }
+
+    /// Resizes the OS window so its client area is exactly
+    /// [`Self::desired_client_size`], unless that size was already requested.
+    ///
+    /// The request names the client area, so window chrome needs no manual
+    /// inset here; the softbuffer surface follows on the next paint. This is
+    /// what makes toggling double-size (or windowshade) resize the OS window
+    /// instead of only the painted surface.
+    fn sync_window_size(&mut self) {
+        let desired = self.desired_client_size();
+        if self.applied_client == Some(desired) {
+            return;
+        }
+        if let Some(window) = &self.window_handle {
+            let _ = window.request_inner_size(PhysicalSize::new(desired.0, desired.1));
+            self.applied_client = Some(desired);
+        }
+    }
+
     /// Opens the window and runs the event loop until it is closed.
     ///
     /// This blocks and must run on the main thread. It never opens a window
     /// during `cargo test` because no test calls it.
+    ///
+    /// The process is made per-monitor-V2 DPI aware before the event loop is
+    /// created, so the client area comes up in physical pixels. If that fails
+    /// the window still opens (`winit` retries awareness itself) with a
+    /// warning on stderr; the size is then whatever the OS virtualizes.
     pub fn run(mut self) -> Result<(), PresenterError> {
+        if let Err(error) = init_dpi_awareness() {
+            eprintln!(
+                "rustamp-ui: DPI awareness unavailable ({error}); the client area may be virtualized"
+            );
+        }
         let event_loop = EventLoop::new()?;
         event_loop.run_app(&mut self)?;
         Ok(())
@@ -165,6 +227,9 @@ impl MainWindowPresenter {
             }
             None => return,
         }
+        // A shortcut may have toggled double-size or windowshade, which
+        // changes the client size the OS window must have.
+        self.sync_window_size();
         self.request_redraw();
     }
 
@@ -230,6 +295,9 @@ impl ApplicationHandler for MainWindowPresenter {
         self.started = Some(Instant::now());
         self.window_handle = Some(window);
         self.surface = Some(surface);
+        // The creation attributes already name the client area; re-assert it
+        // once the window exists in case the OS virtualized the request.
+        self.sync_window_size();
         self.request_redraw();
     }
 
@@ -237,8 +305,29 @@ impl ApplicationHandler for MainWindowPresenter {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.paint(),
-            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::Resized(size) => {
+                let (width, height) = self.desired_client_size();
+                if size.width < width || size.height < height {
+                    // Never settle for less than the layout (the DPI-change
+                    // floor); forget what was applied so the request repeats.
+                    self.applied_client = None;
+                    self.sync_window_size();
+                }
+                self.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged {
+                mut inner_size_writer,
+                ..
+            } => {
+                // A monitor/DPI change suggests a scaled size; decline it and
+                // keep the exact layout size in physical pixels.
+                let (width, height) = self.desired_client_size();
+                let _ = inner_size_writer.request_inner_size(PhysicalSize::new(width, height));
+                self.applied_client = Some((width, height));
+                self.request_redraw();
+            }
             WindowEvent::KeyboardInput { event, .. } => self.key_event(&event),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = self.to_layout(position);
                 if self.left_down {
@@ -265,6 +354,9 @@ impl ApplicationHandler for MainWindowPresenter {
                         let _ = self.window.mouse_up(x, y, now);
                     }
                 }
+                // A click may have toggled double-size (the clutter-bar `D`),
+                // which changes the client size the OS window must have.
+                self.sync_window_size();
                 self.request_redraw();
             }
             _ => {}
