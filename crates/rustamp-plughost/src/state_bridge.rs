@@ -76,23 +76,7 @@ use crate::ipc::{EQ_BAND_COUNT, IpcSurface};
 use rustamp_ipc::Message;
 use rustamp_proto::state::{PlayerState, TransportState};
 
-/// Convert one equalizer gain from the protocol domain (dB, nominally
-/// `-12.0..=12.0`) to the classic surface domain (`0..=63`, `i32`).
-///
-/// Anchor points from spec S09 (audited): `0 = +12 dB`, `31 = 0 dB`,
-/// `63 = -12 dB`. The linear law through the endpoints is
-/// `(12 - db) * 63 / 24`, which is exactly `31.5` at `0 dB`; the `floor`
-/// quantizes the centre down to the documented `31` so all three anchors hold
-/// exactly. Out-of-range gains saturate to `0`/`63`. Non-finite input cannot
-/// be mapped honestly and yields the flat value `31`.
-pub fn eq_classic_from_db(db: f32) -> i32 {
-    if !db.is_finite() {
-        return 31;
-    }
-    ((12.0_f32 - db) * 63.0_f32 / 24.0_f32)
-        .floor()
-        .clamp(0.0, 63.0) as i32
-}
+pub use rustamp_proto::state::eq_classic_from_db;
 
 /// Map the protocol transport to the classic playing value the surface stores
 /// (S10/`src/ipc.rs`: 0 stopped, 1 playing, 3 paused; read by id 104).

@@ -4,5 +4,5 @@
 //! at their original paths, so existing callers do not change.
 
 pub use rustamp_proto::state::{
-    EQ_BANDS, EqState, PlayerState, StreamInfo, TransportState, WindowId,
+    EQ_BANDS, EqState, PlayerState, StreamInfo, TransportState, WindowId, eq_classic_from_db,
 };

@@ -1625,7 +1625,7 @@ name = "rustamp-dsp"
 version = "0.0.1"
 dependencies = [
  "rustamp-core",
- "rustamp-plughost",
+ "rustamp-proto",
 ]
 
 [[package]]

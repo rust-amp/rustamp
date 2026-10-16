@@ -12,6 +12,8 @@ rust-version.workspace = true
 rustamp-core.workspace = true
 
 [dev-dependencies]
-# The S09 anchor tests reuse the measured dB -> 0..63 conversion of the state
-# bridge instead of restating it (in-workspace, no new external crate).
-rustamp-plughost = { path = "../rustamp-plughost" }
+# The S09 anchor tests reuse the measured dB -> 0..63 conversion, which now
+# lives beside `EqState` in `rustamp-proto` (RFC 0011) instead of in the
+# plugin host. Test-only, so it stays a dev-dependency.
+rustamp-proto.workspace = true
+

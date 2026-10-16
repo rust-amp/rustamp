@@ -7,7 +7,7 @@
 //! * the value domain: [`EqState`] carries gains in dB, nominally
 //!   `-12.0..=12.0` ([`EqState::MAX_GAIN_DB`]); the classic 0..63 slider scale
 //!   maps onto it through the S09 anchors `0 = +12 dB`, `31 = 0 dB`,
-//!   `63 = -12 dB` (the state bridge's `eq_classic_from_db` is the one
+//!   `63 = -12 dB` (`rustamp_proto::state::eq_classic_from_db` is the one
 //!   conversion; this stage only ever sees dB);
 //! * the chain position (S07 §10): the equalizer runs on the decoded PCM,
 //!   **before** the output scaling that implements the volume and balance
@@ -484,7 +484,7 @@ impl DspStage for Equalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustamp_plughost::state_bridge::eq_classic_from_db;
+    use rustamp_proto::state::eq_classic_from_db;
 
     const FS: u32 = 48_000;
 
