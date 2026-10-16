@@ -1,0 +1,624 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
+//! Loopback verification: the decoded samples really reach the audio device.
+//! **VM-only, `#[ignore]`d.**
+//!
+//! `real_playback.rs` proves the device opens, the clock advances and the ring
+//! drains, but not what the samples *are*. This test closes that gap with the
+//! VB-Audio Virtual Cable installed in the headless test VM: its render
+//! endpoint ("CABLE Input") is permanently wired to its capture endpoint
+//! ("CABLE Output"). The engine plays the repo's 1.5 s, 440 Hz FLAC fixture
+//! to "CABLE Input" — selected **by name**, never the system default — while
+//! the test records "CABLE Output" at the same time, and the recording must
+//! contain the fixture's tone.
+//!
+//! ## Step by step
+//!
+//! 1. The VM gate, before any device exists.
+//! 2. Both cable endpoints are opened by name; a missing one fails loudly,
+//!    naming the device (never a skip, never a vacuous pass). The opened
+//!    playback device must be the cable, not the default device.
+//! 3. The capture stream starts first and records a silent **pre-roll**
+//!    before playback starts (see "Synchronization").
+//! 4. The engine plays the fixture to its end (`Playing` → `Stopped`, no
+//!    error, ring drained), and the capture keeps recording a tail after it.
+//! 5. The recording is analysed in 50 ms windows (see "Metric"): the pre-roll
+//!    holds no tone; after the play mark the tone appears within a latency
+//!    bound, lasts as long as the fixture without a dropout, does not last
+//!    longer, and arrives at a plausible level on every compared channel.
+//!
+//! ## Synchronization (record vs. play)
+//!
+//! The capture stream is started and must deliver [`PRE_ROLL`] of audio
+//! *before* the engine is told to play. That makes the capture provably live
+//! before the first sample is rendered, so the tone's onset cannot be lost,
+//! and it splits the recording at a known index (the "play mark": the frames
+//! captured when `play` was called). The metric is alignment-free, so no
+//! sample-exact sync is needed; the play mark only proves causality — no
+//! tone before it, the tone within [`MAX_ONSET`] after it. After the engine
+//! reports `Stopped` the capture records [`TAIL`] more, which covers the
+//! render and capture latency, so the tone's end is inside the recording.
+//!
+//! ## Metric and tolerance
+//!
+//! Tone detection with a Goertzel filter at 440 Hz over consecutive 50 ms
+//! windows, per channel. For each window it yields the 440 Hz amplitude and
+//! the share of the window's power that sits at 440 Hz (`ratio`, 1.0 for a
+//! pure tone). Why this metric:
+//!
+//! * It needs no alignment (cross-correlation would need the device latency)
+//!   and no reference decode, and it is independent of the endpoint volume
+//!   (an RMS envelope comparison is not, and cannot tell a tone from noise).
+//! * 50 ms is exactly 22 cycles of 440 Hz at *any* sample rate, so a clean
+//!   tone fills its bin with no leakage whatever rate the cable runs at.
+//! * It fails on silence (amplitude below the floor), on garbage or noise
+//!   (power spread across the spectrum: `ratio` ≈ 2/N ≈ 0.001), on a wrong
+//!   frequency, including a sample-rate mismatch (48 kHz played as 44.1 kHz
+//!   is 404 Hz, almost two 20 Hz bins away: `ratio` ≈ 0), and on dropouts or
+//!   glitches (a broken window falls below the `ratio` threshold and breaks
+//!   the contiguous run).
+//!
+//! A window counts as *tonal* when `ratio >= 0.9` and its amplitude is at
+//! least [`MIN_AMPLITUDE`]. A clean digital cable gives `ratio` ≈ 1.0 (16-bit
+//! quantization noise sits ~80 dB below the tone), so 0.9 passes
+//! deterministically yet rejects anything that is not a dominant 440 Hz tone.
+//! The assertions: at least [`MIN_RUN_SECONDS`] of contiguous tonal windows
+//! (1.2 of the fixture's 1.5 s: the onset and the end each cost at most one
+//! straddling window, the rest is margin), at most [`MAX_TONE_SECONDS`] of
+//! tonal windows in total (the fixture plus its two straddling windows: a
+//! looping or stuck buffer would play longer), no tonal window in the
+//! pre-roll, and every tonal amplitude inside
+//! [[`MIN_AMPLITUDE`], [`MAX_AMPLITUDE`]] (the fixture is ffmpeg's default
+//! 1/8 amplitude; the floor tolerates an endpoint volume down to -20 dB, the
+//! ceiling catches a gain or conversion bug).
+//!
+//! ## Format negotiation
+//!
+//! Playback goes through the production `CpalOutput` (by name). The engine
+//! requests its default 44.1 kHz stereo; `CpalOutput` grants the closest
+//! `f32` configuration the cable offers and the engine converts to it. The
+//! test accepts any granted rate and 1–2 channels. Capture requests `f32` at
+//! the playback's granted rate and accepts any rate and channel count the
+//! cable offers in `f32` or `i16` (converted to `f32`), preferring `f32` and
+//! the matching rate; the analysis uses the rate actually granted. It
+//! compares the first `min(playback, capture)` channels, at most two.
+//!
+//! ## What this test cannot prove
+//!
+//! * The production *default* path: `default_output()` opens the default
+//!   endpoint through WASAPI, which cannot select a device by name; this test
+//!   uses the `cpal` fallback, which shares the engine, ring, gain and
+//!   converter but not the WASAPI render loop. `real_playback.rs` covers that
+//!   loop's clock and drain.
+//! * Bit exactness: the endpoint volume, the Windows mixer and any resampling
+//!   in the shared-mode path are allowed to change samples within tolerance.
+//! * That a speaker plays it: the cable stops at a capture endpoint.
+//! * Channel order and separation: the fixture carries the same tone on both
+//!   channels, so swapped channels would pass.
+//! * Gapless joins, seeking and other content: one track, one tone.
+//!
+//! The VB-Audio cable is not connected to any speaker, so this test plays
+//! **no audible sound**. It opens **no window**: the engine is driven
+//! in-process. Run it only inside the headless test VM:
+//!
+//! ```text
+//! cargo test -p rustamp-app --test loopback -- --ignored
+//! ```
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rustamp_audio::{Engine, EngineConfig, TrackSource};
+use rustamp_core::bus::EventBus;
+use rustamp_core::state::TransportState;
+use rustamp_output::CpalOutput;
+
+/// The cable's render endpoint: playback target. Matched as a
+/// case-insensitive substring of the device name; it must match exactly one
+/// device.
+const PLAYBACK_DEVICE: &str = "CABLE Input";
+
+/// The cable's capture endpoint, wired to [`PLAYBACK_DEVICE`].
+const CAPTURE_DEVICE: &str = "CABLE Output";
+
+/// The fixture's tone (see `crates/rustamp-decoders/tests/fixtures/FIXTURES.txt`).
+const TONE_HZ: f64 = 440.0;
+
+/// The fixture's length.
+const FIXTURE_SECONDS: f64 = 1.5;
+
+/// The fixture's peak amplitude: ffmpeg's `sine` source defaults to 1/8.
+const FIXTURE_AMPLITUDE: f64 = 0.125;
+
+/// Analysis window: 22 whole cycles of [`TONE_HZ`], at any sample rate.
+const WINDOW_SECONDS: f64 = 0.05;
+
+/// Share of a window's power that must sit at [`TONE_HZ`] for it to be tonal.
+const MIN_TONE_RATIO: f64 = 0.9;
+
+/// Lowest accepted tone amplitude: the fixture at -20 dB.
+const MIN_AMPLITUDE: f64 = FIXTURE_AMPLITUDE * 0.1;
+
+/// Highest accepted tone amplitude: the fixture at +6 dB.
+const MAX_AMPLITUDE: f64 = FIXTURE_AMPLITUDE * 2.0;
+
+/// Shortest accepted contiguous run of tonal windows.
+const MIN_RUN_SECONDS: f64 = 1.2;
+
+/// Longest accepted total of tonal windows: the fixture plus two windows.
+const MAX_TONE_SECONDS: f64 = FIXTURE_SECONDS + 2.0 * WINDOW_SECONDS;
+
+/// Audio the capture must deliver before playback starts.
+const PRE_ROLL: Duration = Duration::from_millis(250);
+
+/// Latest accepted tone onset after the play mark.
+const MAX_ONSET: Duration = Duration::from_secs(1);
+
+/// Capture kept running after the engine stopped (render + capture latency).
+const TAIL: Duration = Duration::from_millis(500);
+
+/// How long each phase may take on a loaded VM.
+const DEADLINE: Duration = Duration::from_secs(30);
+
+/// Pump interval while waiting.
+const PUMP_INTERVAL: Duration = Duration::from_millis(10);
+
+fn fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("rustamp-decoders")
+        .join("tests")
+        .join("fixtures")
+        .join("sine.flac")
+}
+
+/// What the capture callback has recorded so far (interleaved).
+#[derive(Default)]
+struct Recording {
+    samples: Vec<f32>,
+    error: Option<String>,
+}
+
+/// The one input device whose name contains `wanted` (case-insensitive).
+/// Panics, naming the device and listing the available ones, otherwise.
+fn find_input_device(host: &cpal::Host, wanted: &str) -> cpal::Device {
+    let devices = host
+        .input_devices()
+        .unwrap_or_else(|e| panic!("listing capture devices while looking for \"{wanted}\": {e}"));
+    let needle = wanted.to_lowercase();
+    let mut names = Vec::new();
+    let mut found = Vec::new();
+    for device in devices {
+        let name = device
+            .description()
+            .map(|d| d.name().to_owned())
+            .unwrap_or_default();
+        if name.to_lowercase().contains(&needle) {
+            found.push(device);
+        }
+        names.push(name);
+    }
+    match found.len() {
+        1 => found.remove(0),
+        0 => panic!(
+            "MISSING CABLE: no capture endpoint named like \"{wanted}\" (available: {names:?}). \
+             This test needs the VB-Audio Virtual Cable in the headless test VM. It fails \
+             loudly by design: without the cable there is nothing to verify."
+        ),
+        n => panic!(
+            "{n} capture endpoints are named like \"{wanted}\" (available: {names:?}); the \
+             name is ambiguous, so the test cannot know which one is wired to the cable"
+        ),
+    }
+}
+
+/// The capture configuration: `f32` preferred over `i16`, then the rate
+/// `want_rate`, then more channels. Any other sample format is refused.
+fn pick_capture_config(
+    device: &cpal::Device,
+    want_rate: u32,
+) -> (cpal::StreamConfig, cpal::SampleFormat) {
+    let usable =
+        |f: cpal::SampleFormat| matches!(f, cpal::SampleFormat::F32 | cpal::SampleFormat::I16);
+    let mut best: Option<((bool, bool, u16), cpal::StreamConfig, cpal::SampleFormat)> = None;
+    let mut offered = Vec::new();
+    if let Ok(ranges) = device.supported_input_configs() {
+        for range in ranges {
+            offered.push(format!(
+                "{:?} {}-{} Hz {} ch",
+                range.sample_format(),
+                range.min_sample_rate(),
+                range.max_sample_rate(),
+                range.channels()
+            ));
+            if !usable(range.sample_format()) {
+                continue;
+            }
+            let rate = want_rate.clamp(range.min_sample_rate(), range.max_sample_rate());
+            let score = (
+                range.sample_format() == cpal::SampleFormat::F32,
+                rate == want_rate,
+                range.channels(),
+            );
+            if best.as_ref().is_none_or(|(s, _, _)| score > *s) {
+                let config = cpal::StreamConfig {
+                    channels: range.channels(),
+                    sample_rate: rate,
+                    buffer_size: cpal::BufferSize::Default,
+                };
+                best = Some((score, config, range.sample_format()));
+            }
+        }
+    }
+    if let Some((_, config, format)) = best {
+        return (config, format);
+    }
+    let default = device.default_input_config().unwrap_or_else(|e| {
+        panic!("\"{CAPTURE_DEVICE}\" offers no capture configuration ({e}); offered: {offered:?}")
+    });
+    assert!(
+        usable(default.sample_format()),
+        "\"{CAPTURE_DEVICE}\" captures only {:?}; the test accepts f32 or i16 (offered: {offered:?})",
+        default.sample_format()
+    );
+    let format = default.sample_format();
+    (default.into(), format)
+}
+
+/// Starts recording `device` into `recording`.
+fn start_capture(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    format: cpal::SampleFormat,
+    recording: &Arc<Mutex<Recording>>,
+) -> cpal::Stream {
+    let on_error = {
+        let recording = Arc::clone(recording);
+        move |e: cpal::Error| {
+            if let Ok(mut r) = recording.lock() {
+                r.error.get_or_insert_with(|| e.to_string());
+            }
+        }
+    };
+    let sink = Arc::clone(recording);
+    let built = match format {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if let Ok(mut r) = sink.lock() {
+                    r.samples.extend_from_slice(data);
+                }
+            },
+            on_error,
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            config,
+            move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                if let Ok(mut r) = sink.lock() {
+                    r.samples
+                        .extend(data.iter().map(|&s| f32::from(s) / 32768.0));
+                }
+            },
+            on_error,
+            None,
+        ),
+        other => unreachable!("pick_capture_config never picks {other:?}"),
+    };
+    let stream = built
+        .unwrap_or_else(|e| panic!("building the capture stream on \"{CAPTURE_DEVICE}\": {e}"));
+    stream
+        .play()
+        .unwrap_or_else(|e| panic!("starting the capture stream on \"{CAPTURE_DEVICE}\": {e}"));
+    stream
+}
+
+/// Frames recorded so far.
+fn recorded_frames(recording: &Mutex<Recording>, channels: usize) -> usize {
+    recording.lock().map(|r| r.samples.len()).unwrap_or(0) / channels
+}
+
+/// The 440 Hz content of one analysis window.
+#[derive(Debug, Clone, Copy)]
+struct ToneWindow {
+    /// First frame of the window in the recording.
+    start: usize,
+    /// Amplitude of the [`TONE_HZ`] component.
+    amplitude: f64,
+    /// Share of the window's power at [`TONE_HZ`]: 1.0 for a pure tone.
+    ratio: f64,
+}
+
+impl ToneWindow {
+    fn is_tonal(&self) -> bool {
+        self.ratio >= MIN_TONE_RATIO && self.amplitude >= MIN_AMPLITUDE
+    }
+}
+
+/// Goertzel detection of `freq` in `x` (one channel, `rate` Hz).
+///
+/// Returns the amplitude of the `freq` component (`2 |X(freq)| / N`) and its
+/// share of the window's mean power (`(A² / 2) / mean(x²)`), which is 1.0 for
+/// a pure sinusoid filling whole cycles and ≈ 2/N for white noise. An
+/// all-zero window yields `(0, 0)`.
+fn tone_in_window(x: &[f32], rate: f64, freq: f64) -> (f64, f64) {
+    let n = x.len() as f64;
+    if x.is_empty() {
+        return (0.0, 0.0);
+    }
+    let coeff = 2.0 * (2.0 * std::f64::consts::PI * freq / rate).cos();
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+    let mut energy = 0.0f64;
+    for &v in x {
+        let v = f64::from(v);
+        let s = v + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s;
+        energy += v * v;
+    }
+    let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0);
+    let amplitude = 2.0 * power.sqrt() / n;
+    let mean_power = energy / n;
+    let ratio = if mean_power > 0.0 {
+        (amplitude * amplitude / 2.0) / mean_power
+    } else {
+        0.0
+    };
+    (amplitude, ratio)
+}
+
+/// Channel `channel` of the interleaved `samples`, cut into consecutive
+/// [`WINDOW_SECONDS`] windows (a trailing partial window is dropped).
+fn analyse(samples: &[f32], channels: usize, channel: usize, rate: u32) -> Vec<ToneWindow> {
+    let mono: Vec<f32> = samples
+        .chunks_exact(channels)
+        .map(|frame| frame[channel])
+        .collect();
+    let len = (f64::from(rate) * WINDOW_SECONDS).round() as usize;
+    mono.chunks_exact(len.max(1))
+        .enumerate()
+        .map(|(i, window)| {
+            let (amplitude, ratio) = tone_in_window(window, f64::from(rate), TONE_HZ);
+            ToneWindow {
+                start: i * len,
+                amplitude,
+                ratio,
+            }
+        })
+        .collect()
+}
+
+/// One line per window, for failure messages.
+fn describe(windows: &[ToneWindow]) -> String {
+    windows
+        .iter()
+        .map(|w| {
+            format!(
+                "{}{}: a={:.4} r={:.3}",
+                if w.is_tonal() { "*" } else { " " },
+                w.start,
+                w.amplitude,
+                w.ratio
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Plays the fixture into the cable and finds its tone in the recording.
+///
+/// Honest by construction: with no cable both lookups fail; with silence,
+/// noise, a wrong frequency or rate, a dropout, or a tone that was already
+/// there before playback, an assertion below fails.
+#[test]
+#[ignore = "VM-only: needs the VB-Audio Virtual Cable; run inside the headless test VM"]
+fn the_cable_carries_the_fixture_tone() {
+    // The gate, before any device exists.
+    rustamp_app::window::require_test_vm();
+
+    let fixture = fixture();
+    assert!(
+        fixture.exists(),
+        "missing fixture {} (generated with ffmpeg; see crates/rustamp-decoders/tests/fixtures/FIXTURES.txt)",
+        fixture.display()
+    );
+
+    // Playback endpoint, by name: never the default device.
+    let output = Box::new(CpalOutput::with_device_name(PLAYBACK_DEVICE));
+    let mut engine = match Engine::new(
+        rustamp_decoders::default_registry(),
+        output,
+        EventBus::new(),
+        EngineConfig::default(),
+    ) {
+        Ok(engine) => engine,
+        Err(error) => panic!(
+            "MISSING CABLE: the playback endpoint \"{PLAYBACK_DEVICE}\" could not be opened \
+             ({error}). This test needs the VB-Audio Virtual Cable in the headless test VM. \
+             It fails loudly by design: without the cable there is nothing to verify."
+        ),
+    };
+    let name = engine.output_name().to_owned();
+    assert!(
+        name.to_lowercase()
+            .contains(&PLAYBACK_DEVICE.to_lowercase()),
+        "the engine opened \"{name}\", not the cable's \"{PLAYBACK_DEVICE}\""
+    );
+    let granted = engine.device_spec();
+    assert!(
+        granted.sample_rate > 0 && (1..=2).contains(&granted.channels),
+        "\"{name}\" granted an unusable format: {} Hz, {} ch",
+        granted.sample_rate,
+        granted.channels
+    );
+
+    // Capture endpoint, by name, started first.
+    let host = cpal::default_host();
+    let capture = find_input_device(&host, CAPTURE_DEVICE);
+    let (config, format) = pick_capture_config(&capture, granted.sample_rate);
+    let rate = config.sample_rate;
+    let channels = usize::from(config.channels);
+    assert!(
+        rate > 0 && channels > 0,
+        "\"{CAPTURE_DEVICE}\" offers an unusable format: {rate} Hz, {channels} ch"
+    );
+    let recording = Arc::new(Mutex::new(Recording {
+        samples: Vec::with_capacity(rate as usize * channels * 10),
+        error: None,
+    }));
+    let stream = start_capture(&capture, config, format, &recording);
+
+    // Pre-roll: the capture is live before the first sample is rendered.
+    let pre_roll_frames = (f64::from(rate) * PRE_ROLL.as_secs_f64()) as usize;
+    let start = Instant::now();
+    while recorded_frames(&recording, channels) < pre_roll_frames {
+        assert!(
+            start.elapsed() < DEADLINE,
+            "\"{CAPTURE_DEVICE}\" delivered {} of {pre_roll_frames} pre-roll frames within \
+             {DEADLINE:?}: the capture stream is not running",
+            recorded_frames(&recording, channels)
+        );
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    let play_mark = recorded_frames(&recording, channels);
+
+    // Play the fixture to its end.
+    engine.set_queue(vec![TrackSource::path(fixture.clone())]);
+    engine
+        .play_index(0)
+        .expect("starting playback on the cable");
+    assert_eq!(engine.transport(), TransportState::Playing);
+    let start = Instant::now();
+    while engine.transport() != TransportState::Stopped {
+        engine
+            .poll()
+            .expect("polling the engine while the cable plays");
+        assert!(
+            start.elapsed() < DEADLINE,
+            "\"{name}\" never finished the 1.5 s fixture within {DEADLINE:?} (transport {:?}, \
+             played {} frames, last error {:?})",
+            engine.transport(),
+            engine.played_frames(),
+            engine.last_error()
+        );
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    engine.poll().expect("draining the final events");
+    assert!(
+        engine.last_error().is_none(),
+        "the decode failed: {:?}",
+        engine.last_error()
+    );
+    assert!(engine.played_frames() > 0, "\"{name}\" consumed no frames");
+    assert_eq!(
+        engine.buffered_frames(),
+        0,
+        "the ring still holds frames: they were decoded but never rendered"
+    );
+
+    // Tail: the tone's end crosses the render and capture latency.
+    std::thread::sleep(TAIL);
+    drop(stream);
+    let recording = std::mem::take(&mut *recording.lock().expect("the capture lock"));
+    if let Some(error) = &recording.error {
+        panic!("the capture stream on \"{CAPTURE_DEVICE}\" failed: {error}");
+    }
+    let total_frames = recording.samples.len() / channels;
+    let fixture_frames = (f64::from(rate) * FIXTURE_SECONDS) as usize;
+    assert!(
+        total_frames >= play_mark + fixture_frames,
+        "recorded {total_frames} frames, fewer than the pre-roll ({play_mark}) plus the \
+         fixture ({fixture_frames}): the capture stalled"
+    );
+
+    // The comparison, per channel.
+    let window_frames = (f64::from(rate) * WINDOW_SECONDS).round() as usize;
+    let max_onset_frames = (f64::from(rate) * MAX_ONSET.as_secs_f64()) as usize;
+    let min_run = (MIN_RUN_SECONDS / WINDOW_SECONDS).round() as usize;
+    let max_tonal = (MAX_TONE_SECONDS / WINDOW_SECONDS).round() as usize;
+    let compared = channels.min(usize::from(granted.channels)).min(2);
+    for channel in 0..compared {
+        let windows = analyse(&recording.samples, channels, channel, rate);
+        let context = || {
+            format!(
+                "channel {channel} of \"{CAPTURE_DEVICE}\" @ {rate} Hz/{channels} ch \
+                 ({format:?}), playback \"{name}\" @ {} Hz/{} ch, play mark at frame \
+                 {play_mark}, windows of {window_frames} frames (* = tonal):\n{}",
+                granted.sample_rate,
+                granted.channels,
+                describe(&windows)
+            )
+        };
+
+        // Nothing at 440 Hz before playback started.
+        let (before, after): (Vec<ToneWindow>, Vec<ToneWindow>) = windows
+            .iter()
+            .partition(|w| w.start + window_frames <= play_mark);
+        assert!(
+            before.len() >= 4,
+            "only {} pre-roll windows: the pre-roll cannot prove the cable was quiet; {}",
+            before.len(),
+            context()
+        );
+        assert!(
+            !before.iter().any(ToneWindow::is_tonal),
+            "the cable carried a 440 Hz tone before playback started, so the recording \
+             cannot be attributed to this playback; {}",
+            context()
+        );
+
+        // The tone starts within the latency bound after the play mark.
+        let first = after.iter().find(|w| w.is_tonal()).unwrap_or_else(|| {
+            panic!(
+                "no 440 Hz tone in the recording: the decoded samples did not reach the \
+                 cable (silence, noise or a wrong frequency/rate); {}",
+                context()
+            )
+        });
+        assert!(
+            first.start <= play_mark + max_onset_frames,
+            "the tone started {} frames after the play mark, later than {MAX_ONSET:?}; {}",
+            first.start - play_mark.min(first.start),
+            context()
+        );
+
+        // It lasts as long as the fixture, without a dropout, and no longer.
+        let longest_run = after
+            .iter()
+            .fold((0usize, 0usize), |(run, best), w| {
+                let run = if w.is_tonal() { run + 1 } else { 0 };
+                (run, best.max(run))
+            })
+            .1;
+        assert!(
+            longest_run >= min_run,
+            "the longest uninterrupted tone is {longest_run} windows, fewer than {min_run} \
+             ({MIN_RUN_SECONDS} s of the {FIXTURE_SECONDS} s fixture): a dropout or a \
+             truncated playback; {}",
+            context()
+        );
+        let tonal = after.iter().filter(|w| w.is_tonal()).count();
+        assert!(
+            tonal <= max_tonal,
+            "{tonal} tonal windows, more than {max_tonal} ({MAX_TONE_SECONDS} s): the tone \
+             lasted longer than the fixture; {}",
+            context()
+        );
+
+        // At a plausible level.
+        for w in after.iter().filter(|w| w.is_tonal()) {
+            assert!(
+                w.amplitude <= MAX_AMPLITUDE,
+                "tone amplitude {:.4} at frame {} exceeds {MAX_AMPLITUDE} (fixture \
+                 {FIXTURE_AMPLITUDE}): a gain or conversion bug; {}",
+                w.amplitude,
+                w.start,
+                context()
+            );
+        }
+    }
+
+    engine.stop().expect("stopping the engine after the run");
+    assert_eq!(engine.transport(), TransportState::Stopped);
+}

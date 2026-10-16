@@ -14,6 +14,10 @@
 //!   not been rendered yet, which is what a seek needs.
 //! * The stream is created in `start`, not in `open`: `open` only negotiates the
 //!   format, which keeps the render callback out of a lock.
+//! * Device: the host's default output device, or — with
+//!   [`CpalOutput::with_device_name`] — the one output device whose name
+//!   contains the given text. A named device that is absent or ambiguous fails
+//!   `open`; it never falls back to the default device.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,6 +44,9 @@ pub struct CpalOutput {
     stream: Option<cpal::Stream>,
     spec: Option<AudioSpec>,
     device_name: String,
+    /// `Some`: open the output device whose name contains this text instead of
+    /// the default one.
+    wanted: Option<String>,
     shared: Arc<Shared>,
 }
 
@@ -58,6 +65,7 @@ impl CpalOutput {
             stream: None,
             spec: None,
             device_name: "cpal".into(),
+            wanted: None,
             shared: Arc::new(Shared {
                 played: AtomicU64::new(0),
                 failed: AtomicBool::new(false),
@@ -65,9 +73,51 @@ impl CpalOutput {
         }
     }
 
+    /// Not opened yet; [`OutputDevice::open`] opens the one output device
+    /// whose name contains `name` (case-insensitive), never the default one.
+    ///
+    /// `open` fails, naming the wanted device and listing the available
+    /// ones, when no output device or more than one matches.
+    pub fn with_device_name(name: impl Into<String>) -> Self {
+        CpalOutput {
+            wanted: Some(name.into()),
+            ..Self::new()
+        }
+    }
+
     /// Name of the opened device, once open.
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+}
+
+/// The one output device of `host` whose name contains `wanted`
+/// (case-insensitive).
+fn find_output_device(host: &cpal::Host, wanted: &str) -> Result<cpal::Device> {
+    let devices = host
+        .output_devices()
+        .map_err(|e| Error::Output(format!("cpal: listing output devices: {e}")))?;
+    let needle = wanted.to_lowercase();
+    let mut names = Vec::new();
+    let mut found = Vec::new();
+    for device in devices {
+        let name = device
+            .description()
+            .map(|d| d.name().to_owned())
+            .unwrap_or_default();
+        if name.to_lowercase().contains(&needle) {
+            found.push(device);
+        }
+        names.push(name);
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(Error::Output(format!(
+            "cpal: no output device named like \"{wanted}\" (available: {names:?})"
+        ))),
+        n => Err(Error::Output(format!(
+            "cpal: {n} output devices named like \"{wanted}\"; the name is ambiguous              (available: {names:?})"
+        ))),
     }
 }
 
@@ -128,9 +178,12 @@ impl OutputDevice for CpalOutput {
 
     fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| Error::Output("cpal: no default output device".into()))?;
+        let device = match &self.wanted {
+            Some(wanted) => find_output_device(&host, wanted)?,
+            None => host
+                .default_output_device()
+                .ok_or_else(|| Error::Output("cpal: no default output device".into()))?,
+        };
         self.device_name = device
             .description()
             .map(|d| d.name().to_owned())
