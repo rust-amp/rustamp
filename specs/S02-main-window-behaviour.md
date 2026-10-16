@@ -66,6 +66,105 @@ back:
   also loaded (and shown in the marquee) when it is passed while stopped. Command-line
   behaviour itself is S13.
 
+### 1.1 End of the list
+
+When the **last entry of the list is consumed**, the player stops. This is the
+open-error skip path (a 3-entry playlist whose entries point at absent files;
+no track ever plays to a natural end — see the caveat below), measured in run
+`20261016-055602` (17/17 steps ok, landmark gate passed). The end-of-list
+state is the **ordinary stopped state**: `IPC_ISPLAYING` (step 003,
+`ipc_isplaying_after_list`) returns 0 and the observable indicator, time, kbps/kHz
+and mono/stereo regions all report stopped (below).
+
+Facts, each with the step or capture it rests on:
+
+- **End state is stopped.** The state indicator is the stopped square: 0 px of
+  difference against the recorded stopped capture `captures\m06_main_stopped_main.png`
+  in the indicator region (24, 28, 11, 9), but 38 px against the recorded playing
+  capture `m04_main_playing_main.png` and 35 px against the recorded paused capture
+  `m05_main_paused_main.png`. `IPC_ISPLAYING = 0` (`ipc_isplaying_after_list`, 003).
+  Evidence: `eol_state` (001). Cross-check: `playpaus.bmp` stopped sprite at
+  (18, 0, 9, 9) (§1).
+- **Static and reproducible.** `eol_stable` (002) is byte-identical to `eol_state`
+  (001) (0 differing pixels). The run took one shot per step and every post-list
+  launch produced the same window: `eol_state`, `eol_stable`,
+  `ipc_isplaying_after_list`, `eol_next_back`, `eol_play_after`, `sac_before`,
+  `sac_arm`, `sac_unarm`, `sac_arm2`, `sac_ctl_base`, `repeat_base` share one
+  SHA-256 (`D25CE145F8DD26D2…`), and the twin gate probes (`smoke\a_main.png` /
+  `smoke\b_main.png`) are byte-identical too. The whole run yields only **three**
+  distinct window frames.
+- **Ends on the last entry.** The window title reads `3. s02r2 cc - Winamp
+  [Stopped]` at every post-list step (`eol_state`, `eol_play_after`, `sac_before`,
+  `sac_ctl_base`, `repeat_base`). All three entries are present: `eol_prev` (004)
+  moved 3→2 and `eol_next_back` (005) moved 2→3.
+- **Only the marquee row differs from a recorded stopped capture.** Whole-window
+  difference between `eol_state` (001) and `m06_main_stopped_main.png` is 95 px,
+  all of them inside (111, 27)–(167, 32), the marquee row.
+- **Prev / next at the end move the marquee only.** `eol_prev` (004) differs
+  from `eol_state` (001) by 22 px, bounds (111, 27)–(164, 32) — the marquee
+  row only; entry 3→2; the indicator (24, 28) is untouched. `eol_next_back`
+  (005) differs from `eol_prev` (004) by the same 22 px and the resulting window
+  is byte-identical to `eol_state` (001). Playlist position (`WM_WA_IPC` 125)
+  moves by one; transport stays stopped.
+- **Play at the end blinks the indicator and re-stops.** `eol_play` (006) differs
+  from `eol_next_back` (005) by 38 px, all inside the indicator box
+  (24, 28)–(34, 36); the indicator region compares at 0 px to the recorded
+  playing capture `m04_main_playing_main.png`. `eol_play_after` (007) is
+  byte-identical to `eol_state` (001). The current entry is not reset (title stays
+  `3. s02r2 cc …`).
+- **Time display, kbps/kHz, mono/stereo.** At the end of the list they read as in
+  the stopped state: time digits blank (band (46, 26, 53, 13) 0 px against `m06`,
+  218 px against `m04`), kbps/kHz blank (band (111, 38, 70, 12) 0 px against
+  `m06`), mono and stereo both dim (band (212, 38, 40, 10) 0 px against `m06`).
+  Evidence: `eol_state` (001). Whether the elapsed/remaining display mode changed on
+  the way to the end is **provisional** (no minus sign is present in the post-list
+  state, but the run never toggles the mode and never captures the pre-end state) —
+  see open question 10.
+- **Stop-after-current has no visible indicator.** Posting `WM_COMMAND` 40157
+  (`sac_arm`, 009) produces a window **0 / 31900 px** identical to `sac_before`
+  (008) — whole window, including the transport row and the repeat/shuffle LEDs.
+  That this means "no visible indicator" and not "command ignored" is **decided**
+  by the delivery control: `sac_ctl_repeat` (013) posts `WM_COMMAND` 40022
+  (`&Repeat`) down the same posted path after the same restart and differs from
+  `sac_ctl_base` (012) by **6 / 31900 px**, bounds (216, 94)–(218, 95) (the
+  repeat LED), all six pixels (16, 90, 0) → (0, 214, 0); the bootstrap recorded
+  `expect_change=true satisfied`. Posted `WM_COMMAND` is therefore handled in this
+  reference, and 40157's 0-px identity is the mode's (absent) indicator. The three
+  reproduction steps are byte-identical to their named references with
+  `expect_same` satisfied: `sac_before` (008) = `eol_state`, `sac_unarm` (010) =
+  `sac_before`, `sac_arm2` (011) = `sac_arm`. Whether stop-after-current is a
+  toggle (arming twice returns to off) or a one-shot, whether any menu checkmark
+  exists, and whether it has any effect at a real track end, are **open** — see
+  open questions 8 and below. Evidence: `sac_before`/`sac_arm`/`sac_unarm`/
+  `sac_arm2` (008–011), `sac_ctl_base`/`sac_ctl_repeat` (012/013).
+- **Nothing persists across a restart.** `sac_before` (008) is byte-identical to
+  `eol_state` (001); a `restart` force-kills Winamp, so `winamp.ini` is not
+  rewritten and no toggle carries over. Evidence: `sac_before` vs `eol_state`.
+- **Repeat can be armed by a posted click.** The re-aimed click at body centre
+  (223, 96) on the repeat button lit the LED: `repeat_arm` (015) differs from
+  `repeat_base` (014) by 6 / 31900 px, bounds (216, 94)–(218, 95), (16, 90, 0)
+  → (0, 214, 0). The earlier 0-px result at (210, 89) was a point-placement
+  error (clicking the sprite's top-left corner), not a negative capability.
+  Evidence: `repeat_base` (014), `repeat_arm` (015).
+- **Repeat wrapping stays open.** `repeat_play` (016) differs from `repeat_arm`
+  (015) by 38 px (indicator box only) and then `repeat_after` (017) differs from
+  it by 73 px, bounds (24, 27)–(164, 48); the window was still changing at capture
+  time, the LED stayed lit (0, 214, 0), and the title read `3. s02r2 cc - Winamp
+  [Stopped]`. Whether repeat wraps to the first entry at the end of the list is
+  therefore **not settled**. Evidence: `repeat_play` (016), `repeat_after` (017).
+  Follow-up: a media-enabled run plus a job `landmark_region` excluding the
+  position bar at client (16, 72, 248, 10).
+
+Caveat: the measurement reaches only the **open-error skip** path. The fixture's
+three entries point at `C:\s02r2-media\*.mp3`, which does not exist in the
+guest, so every entry takes the open-error → advance path and no track ever plays
+to a natural end. The natural end of a played track, the intermediate skip
+captures, and stop-after-current's effect on a track end are **not measured** here
+(see open questions 5 and 8). Whether the reference skips a dead entry and
+continues rather than stopping at it is likewise **provisional** (the
+`r_o4_60.m3u` precedent shows the skip directly; this run shows only its
+consequence — the list ended on entry 3 with all three entries dead).
+
 ---
 
 ## 2. Clutterbar
@@ -262,9 +361,88 @@ matched the named sheet rectangle with zero difference.
    (§3), but the ratio of drag distance to scroll distance was not determined.
 4. **Bitrate/sample-rate click.** Withdrawn as a claim; the area behaved as
    non-interactive in this audit (§5).
-5. **End-of-track behaviour.** What the indicator and the marquee do at the end of a
-   track (auto-advance) was not measured.
+5. **End-of-track behaviour.** The end-of-list *state* is now settled and is the
+   ordinary stopped state (§1.1): indicator stopped, `IPC_ISPLAYING = 0`, time,
+   kbps/kHz and mono/stereo all stopped, on the last entry, via the open-error
+   skip path (`eol_state`, `ipc_isplaying_after_list`, `eol_stable`,
+   `eol_next_back`). Still open:
+   - **Natural end of a played track.** No entry in that measurement could be
+     opened, so only the open-error advance path is reachable; whether a track
+     that actually played stops the same way is **not determined** (cannot be
+     measured with this harness). Follow-up: map a media folder into the sandbox,
+     or ship a small guest-local file, **and** declare a job `landmark_region`
+     excluding the position bar — the posbar track sits at client (16, 72),
+     248 x 10, inside the default region rows 49–115 — e.g. rows 49–71.
+   - **Repeat wrapping at the end of the list** (item 9 below).
+   - **Stop-after-current's effect on a track end** (item 8 below).
 6. **Hint strings for other skins.** The hint strings in §2.1 are the base skin's
    strings; whether a skin can change them is not known.
 7. **Time-display blink exactness.** The blink period is about 2.60 s; the exact frame
    at which it flips relative to playback position was not determined.
+8. **Stop-after-current (mode, indicator, persistence, effect).** The mode is reached
+   by `WM_COMMAND` 40157 (`ToggleStopAfterCurrent`, RFC 0005 §5.1). Findings of
+   §1.1: arming changes **no visible on-screen control** — `sac_arm` (009) is 0 /
+   31900 px identical to `sac_before` (008), whole window; delivery is **decided**
+   (not "command ignored") because the control `sac_ctl_repeat` (013) posts
+   `WM_COMMAND` 40022 down the same path after the same restart and lights the
+   repeat LED at (216, 94)–(218, 95), 6 / 31900 px, (16, 90, 0) → (0, 214, 0).
+   - `sac_before` (008) ≡ `eol_state` (001); `sac_unarm` (010) ≡ `sac_before`
+     (008); `sac_arm2` (011) ≡ `sac_arm` (009) — `expect_same` satisfied on all
+     three.
+   - **Open — toggle vs one-shot.** Arming twice round-trips to byte-identical
+     captures (all four states ≡ `D25CE145…`), which is the expected result for a
+     toggle with no indicator **but also what "the command did nothing" looks
+     like** without the delivery control. The three steps assert identity only;
+     they do **not** prove the toggle. RFC 0005's `Toggle*` convention is not
+     evidenced by this run.
+   - **Open — on-screen / menu checkmark.** The main menu was never opened in this
+     audit; a right-click of the stop button (its context menu carries
+     `Stop after &current`, id 40157) was not exercised (no right-button gesture in
+     the harness). S-04 owns the menu.
+   - **Open — effect on a track end.** No track ends naturally in this measurement;
+     arming, unarming and the indicator are measured, the effect is not.
+     **Cannot be measured with this harness** (§1.1 caveat).
+   - **Settled — no persistence.** `sac_before` (008) is byte-identical to
+     `eol_state` (001): a `restart` force-kills Winamp, `winamp.ini` is not
+     rewritten, nothing carries over.
+   - **Settled — no `PlayerState` IPC id.** The reference exposes no IPC id for the
+     mode; S-10 owns that surface.
+9. **Repeat wrapping at the end of the list.** A posted click at (223, 96) **does**
+   arm repeat (`repeat_arm` (015): 6 / 31900 px, bounds (216, 94)–(218, 95),
+   (16, 90, 0) → (0, 214, 0); the earlier 0-px reading at (210, 89) was a
+   point-placement error). But the final capture `repeat_after` (017) was still
+   changing vs `repeat_play` (016) (73 px, bounds (24, 27)–(164, 48)) and the title
+   still read `3. s02r2 cc - Winamp [Stopped]`, so repeat wrapping is **not
+   decidable** from this run. Open also:
+   - **Whether a posted `WM_COMMAND` 40022 is the right id for repeat in this
+     binary.** The id comes from the resource tables (S-03/S-04, S-03 binds `R`
+     to repeat); the step proves that id lights the LED on this posted path, but
+     the internal Repeat mode bit is not confirmed by any menu state (still pixel
+     evidence, not a menu state — the pixels at (216, 94)-(218, 95) are the
+     recorded shuffle/repeat sprite, `captures\m11_main_shuffle_repeat_main.png`).
+   - Whether an on-screen/menu checkmark exists (main menu never opened).
+   - **Not tested here:** real (`SendInput` / `mouse_event`) clicks; all inputs
+     were posted messages. Real-input confirmation is a separate claim.
+   - Follow-up: the same media-enabled run as item 5, or a mid-run arm primitive.
+10. **Elapsed/remaining time mode at the end.** No minus sign is present in the
+    post-list state, and the minus-sign area (36, 30)–(46, 36) is part of the
+    region in which `eol_state` and `m06` agree. Whether the mode changed on the
+    way to the end is **provisional**: the run never toggles the display mode and
+    never captures the pre-end state. Settle with a two-step probe (command 40242,
+    or a click in the display band x = 36–96, y = 26–39). Evidence: `eol_state`
+    (001).
+11. **Open-error skip as a captured transition.** This run consumed lists of dead
+    entries; the skip itself was never captured, only its consequence (the list
+    ended on entry 3 with all three entries dead, and 3→2→3 walked all present
+    entries). Whether the reference skips a dead entry and continues (rather than
+    stopping) is therefore **provisional** on the reference side, from the
+    `r_o4_60.m3u` precedent. Cannot be measured with post-list captures.
+    Evidence: `eol_state`, `eol_prev`, `eol_next_back`; `r_o4_60.m3u` runs
+    20261015-160722 / -163106.
+12. **Real-mouse confirmation.** Every input in the runs above was a posted
+    message; a real-input (`SendInput` / `mouse_event`) confirmation is a separate
+    claim, recorded here so it is not re-opened (no run performed one).
+13. **End-of-list IPC event.** Whether the reference exposes an IPC id for the
+    end-of-list event is unowned (RFC 0005 O15, still open); this audit contributes
+    no IPC read beyond `IPC_ISPLAYING = 0` as a cross-check (`ipc_isplaying_after_list`,
+    step 003). S-10 owns that surface.
