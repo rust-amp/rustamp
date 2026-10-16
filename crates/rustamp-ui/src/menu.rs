@@ -3,41 +3,57 @@
 //!
 //! The popup is the `#32768` window the menu button (and `Alt+F`, S03 §1 id
 //! 40043) opens. Its client size (**323 x 569**) and the check-mark cell
-//! (**x = 16-29**) are lane task-card measurements that still await the S04
-//! spec export (`specs/S04-*` does not exist yet; the spec task card is
-//! `docs/tasks/S04-menus.md`). Every value taken from the task card is marked
-//! as such below; everything else cites the audited spec or RFC it comes
-//! from.
+//! (**x = 16-29**) are **settled** measurements from spec **S04** (audited
+//! 2026-10-16; run `20261016-011612`):
+//!
+//! * popup inventory, client sizes and class: S04 §1, §8;
+//! * the main menu's 15 rows in order and its 4 separator rules: S04 §2;
+//! * the three checked rows and their bboxes: S04 §3.1;
+//! * the six submenu arrows and their column: S04 §3.2, §8;
+//! * the six `Alt+*` hints and their column: S04 §3.3;
+//! * the `View file info` hint geometry without an asserted label: S04 §3.4.
 //!
 //! Provenance rules used in this module:
 //!
 //! * Row **labels and command ids** come from spec **S03**, whose §1 preamble
 //!   states the action texts are taken from the program's own menu resources.
-//!   Each row cites its S03 section and id.
-//! * The **15-row / 4-separator / 6-submenu shape** and the **checkable set**
-//!   (Main Window, Playlist Editor, Equalizer, plus the Time elapsed / Time
-//!   remaining pair) are the task-card measurement summary.
-//! * The **row order, the separator positions, the submenu grouping and the
-//!   group labels** (`Playback`, `Open`, …) are provisional: S03 records
-//!   actions, not menu trees, so the grouping is ours until S04 settles it.
-//!   The table is kept in one place precisely so it can be compared with the
-//!   reading line by line.
-//! * The **row bands** are a provisional split, not a measurement: 11 item
-//!   rows of 47 px and 4 separator rows of 13 px fill 323 x 569 exactly
-//!   (`11 * 47 + 4 * 13 = 569`). S04 must replace them with the measured
-//!   bands.
+//!   Each row cites its S03 section and id, plus the S04 §2 row it matches.
+//! * The **15-item / 4-separator / 6-submenu shape** is the S04 §2
+//!   measurement. The earlier task-card shape (11 items built from the S03
+//!   action texts, with `Playback`/`Open`/`Time elapsed`/`Time remaining`
+//!   groupings) was provisional and is replaced below row by row.
+//! * **Submenu contents** stay provisional: S04 §9 states no submenu was ever
+//!   opened (two-`#32768` refusal), so the entry arrays keep their S03-backed
+//!   actions grouped under our own headings until S04 settles them.
+//! * The **row bands** are a provisional split, not a measurement: 15 item
+//!   rows of 35 px and 4 separator rows of 11 px fill 323 x 569 exactly
+//!   (`15 * 35 + 4 * 11 = 569`). S04 §8 leaves item height, separator
+//!   height and padding open, but the split is consistent with every measured
+//!   y value (separator rules at y = 40/156/377/528, the §3.1 check bboxes
+//!   and the §3.2 arrow bands all fall inside their row's band).
 //! * The **rendering** (face colour, label origin, separator etching, submenu
 //!   arrow, check-mark strokes) is our own look-alike drawing, documented
 //!   per item. It is not claimed pixel-exact: the reference popup is a native
-//!   menu, not a skinned surface.
+//!   menu, not a skinned surface. Measured placements the renderer honours:
+//!   check cell x = 16-29 (S04 §3.1), arrow column x = 297-303 (S04 §3.2),
+//!   hint column x ≈ 239-293 (S04 §3.3), separator rules 303 px wide
+//!   (S04 §2), label text zone x ≈ 45-235 (S04 §3.5).
 //!
 //! Every leaf row maps to a [`ShortcutAction`](crate::shortcuts::ShortcutAction),
 //! so activating a menu item runs exactly the same dispatch as pressing the
-//! corresponding key (see [`crate::shortcuts`]). The elapsed/remaining toggle
-//! (S03 §1 id 40242) stays UI-local per RFC 0005 §9: both time rows map to
-//! `ShortcutAction::ToggleTimeRemaining`, which flips
-//! [`MainWindowState::time_remaining`](crate::state::MainWindowState) with no
-//! core command.
+//! corresponding key (see [`crate::shortcuts`]). Rows the spec measures but
+//! S03 gives no command (the title row, `Library`, `Exit`; S04 §2 notes `Exit`
+//! has no S03 row) carry [`MenuAction::NoAction`]: S04 §9 explicitly does not
+//! cover click-through, so no behaviour is invented for them. `Minibrowser`
+//! likewise carries no dispatch: its action (`Alt+T`, S03 §1 id 40298) is
+//! deferred with no window bridge yet (RFC 0005 §11) and the dispatcher drops
+//! it.
+//!
+//! The elapsed/remaining toggle (S03 §1 id 40242) stays UI-local per RFC 0005
+//! §9, but its rows live in the **Options popup** (S04 §4.1), not on the main
+//! menu (S04 §2): [`MenuCheck::TimeElapsed`] / [`MenuCheck::TimeRemaining`]
+//! still resolve from [`MainWindowState::time_remaining`](crate::state::MainWindowState)
+//! for that popup's future use.
 
 use std::ops::Range;
 
@@ -47,37 +63,50 @@ use rustamp_skin::{Sheet, Skin, webamp};
 use crate::shortcuts::ShortcutAction;
 use crate::state::MainWindowState;
 
-/// Window class of the menu popup (task-card measurement, pending S04).
+/// Window class of the menu popup (settled: S04 §1, every popup).
 pub const MAIN_MENU_CLASS: &str = "#32768";
 
-/// Client size of the main-menu popup (task-card measurement, pending S04).
+/// Client size of the main-menu popup (settled: S04 §1 row 1, §8).
 pub const MAIN_MENU_CLIENT_SIZE: (u32, u32) = (323, 569);
 
-/// Horizontal cell the check mark lives in (task-card measurement: the
-/// checked/unchecked difference is confined to x = 16-29, pending S04).
+/// Horizontal cell the check mark lives in (settled: S04 §3.1, §8 — the
+/// checked/unchecked difference is confined to x = 16-29).
 pub const CHECK_CELL_X: Range<u32> = 16..30;
 
-/// How many rows the main menu has, separators included (task card).
-pub const MAIN_MENU_ROWS: usize = 15;
-/// How many of the rows are separators (task card).
+/// How many rows the main menu has, separators included (settled: 15 item
+/// rows per S04 §2 plus 4 separator rules).
+pub const MAIN_MENU_ROWS: usize = 19;
+/// How many of the rows are separators (settled: S04 §2, rules at y = 40,
+/// 156, 377 and 528).
 pub const MAIN_MENU_SEPARATORS: usize = 4;
-/// How many rows carry a submenu arrow (task card).
+/// How many rows carry a submenu arrow (settled: S04 §3.2 — `Play`,
+/// `Bookmarks`, `Options`, `Playback`, `Visualization`, `Skins`).
 pub const MAIN_MENU_SUBMENUS: usize = 6;
 
-/// Provisional item-row height (see the module docs: fills 569 with
-/// [`MAIN_MENU_SEPARATOR_HEIGHT_PX`], pending S04).
-pub const MAIN_MENU_ITEM_HEIGHT_PX: u32 = 47;
-/// Provisional separator-row height (see the module docs, pending S04).
-pub const MAIN_MENU_SEPARATOR_HEIGHT_PX: u32 = 13;
+/// Provisional item-row height: fills 569 with
+/// [`MAIN_MENU_SEPARATOR_HEIGHT_PX`] (see the module docs; S04 §8 leaves
+/// item height open, but every measured y in §§2-3 falls inside its band).
+pub const MAIN_MENU_ITEM_HEIGHT_PX: u32 = 35;
+/// Provisional separator-row height (see the module docs, S04 §8 open).
+pub const MAIN_MENU_SEPARATOR_HEIGHT_PX: u32 = 11;
 
-/// Label origin: right of the check cell plus a margin (our choice).
-const LABEL_X: i32 = 40;
-/// Right margin for the shortcut hints (our choice).
-const HINT_MARGIN_RIGHT: u32 = 10;
-/// Submenu-arrow column (our choice).
-const ARROW_X: i32 = 304;
+/// Label origin: the left edge of the measured text zone (S04 §3.5 scans
+/// text in x = 45-235; the exact origin is provisional, S04 §8 open).
+const LABEL_X: i32 = 45;
+/// Right edge of the shortcut-hint column (measured hint column x ≈ 239-293,
+/// S04 §3.3; exact alignment is provisional — our bitmap font is not the
+/// system menu font).
+const HINT_RIGHT_X: i32 = 293;
+/// Submenu-arrow column (settled: x = 297-303, S04 §3.2, §8).
+const ARROW_X: i32 = 297;
 
 /// What can carry a check mark.
+///
+/// Which rows show these is settled per popup: the main menu shows only
+/// [`MenuCheck::MainWindow`], [`MenuCheck::PlaylistEditor`] and
+/// [`MenuCheck::Equalizer`] (S04 §3.1); the `TimeElapsed` / `TimeRemaining`
+/// pair and [`MenuCheck::EasyMove`] belong to the Options popup (S04 §4.1);
+/// the remaining flags back the provisional submenu entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MenuCheck {
     /// Never checked.
@@ -158,33 +187,47 @@ pub enum MenuAction {
     Shortcut(ShortcutAction),
     /// A parent: opens the submenu.
     Submenu(SubmenuId),
+    /// A measured row with no dispatch behind it in this tree: the title row,
+    /// `Library` and `Exit` have no S03 command (S04 §2 notes `Exit` has no
+    /// S03 row), and `Minibrowser`'s action is deferred with no bridge yet
+    /// (RFC 0005 §11). S04 §9 explicitly does not cover click-through, so no
+    /// behaviour is invented: the row draws its label and never dispatches.
+    NoAction,
 }
 
-/// Identity of a top-level row.
+/// Identity of a top-level row (settled order and labels: S04 §2 rows 1-15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MainMenuId {
-    /// Transport and play-order submenu (provisional grouping).
-    Playback,
-    /// File-access submenu (provisional grouping).
-    Open,
-    /// Bookmark submenu (provisional grouping).
+    /// Title row `Nullsoft Winamp...` (S04 §2 row 1; visual reading).
+    Title,
+    /// `Play` submenu (S04 §2 row 2).
+    Play,
+    /// `View file info` leaf (S04 §2 row 3; S03 §1 id 40188).
+    ViewFileInfo,
+    /// `Bookmarks` submenu (S04 §2 row 4).
     Bookmarks,
-    /// Window, mode and dialog submenu (provisional grouping).
-    Options,
-    /// Visualization submenu (provisional grouping).
-    Visualization,
-    /// Skin submenu (provisional grouping).
-    Skins,
-    /// Checkable: the main window is open.
+    /// Checkable: the main window is open (S04 §2 row 5, §3.1).
     MainWindow,
-    /// Checkable: the playlist editor is open.
+    /// Checkable: the playlist editor is open (S04 §2 row 6, §3.1).
     PlaylistEditor,
-    /// Checkable: the equalizer window is open.
+    /// Checkable: the equalizer window is open (S04 §2 row 7, §3.1).
     Equalizer,
-    /// Checkable: elapsed time is shown.
-    TimeElapsed,
-    /// Checkable: remaining time is shown.
-    TimeRemaining,
+    /// `Library` (S04 §2 row 8; hint `Alt+L`, S04 §3.3; no S03 command).
+    Library,
+    /// `Minibrowser` (S04 §2 row 9; hint `Alt+T`, S04 §3.3; S03 §1 id 40298).
+    Minibrowser,
+    /// `Video` (S04 §2 row 10; hint `Alt+V`, S04 §3.3; S03 §1 id 40328).
+    Video,
+    /// `Options` submenu (S04 §2 row 11).
+    Options,
+    /// `Playback` submenu (S04 §2 row 12).
+    Playback,
+    /// `Visualization` submenu (S04 §2 row 13).
+    Visualization,
+    /// `Skins` submenu (S04 §2 row 14).
+    Skins,
+    /// `Exit` (S04 §2 row 15; no S03 row).
+    Exit,
 }
 
 /// One top-level row of the main menu.
@@ -192,14 +235,18 @@ pub enum MainMenuId {
 pub struct MainMenuItem {
     /// Stable identity.
     pub id: MainMenuId,
-    /// Row label (S03 action text for leaves, task-card name for the time
-    /// pair, our group name for parents).
+    /// Row label: the S04 §2 visual reading for main-menu rows (S03 action
+    /// text where the row has a command).
     pub label: &'static str,
-    /// Key hint shown right-aligned (S03 key, where the row has one).
+    /// Key hint shown right-aligned (settled S04 §3.3 readings on the six
+    /// window rows; the `View file info` hint is provisional — S04 §3.4
+    /// records its geometry but asserts no label, so the S03 §1 key stands
+    /// in, marked as such).
     pub shortcut: Option<&'static str>,
-    /// Check state source.
+    /// Check state source (settled: only the three window rows, S04 §3.1).
     pub check: MenuCheck,
-    /// What activation does.
+    /// What activation does (S04 §9: click-through unmeasured — leaf actions
+    /// are the pre-existing key dispatches, nothing new).
     pub action: MenuAction,
 }
 
@@ -225,46 +272,57 @@ pub struct SubmenuItem {
     pub action: ShortcutAction,
 }
 
-/// Identity of a submenu (one per arrow row, in row order).
+/// Identity of a submenu (one per arrow row, in row order: S04 §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubmenuId {
-    /// Transport and play order.
+    /// The `Play` submenu (S04 §2 row 2; contents provisional, S04 §9).
+    Play,
+    /// Transport and play order (S04 §2 row 12; contents provisional, S04 §9).
     Playback,
-    /// File access.
-    Open,
-    /// Bookmarks.
+    /// Bookmarks (S04 §2 row 4; contents provisional, S04 §9).
     Bookmarks,
-    /// Windows, modes and dialogs.
+    /// Windows, modes and dialogs (S04 §2 row 11; contents provisional, S04 §9).
     Options,
-    /// Visualization.
+    /// Visualization (S04 §2 row 13; contents provisional, S04 §9).
     Visualization,
-    /// Skins.
+    /// Skins (S04 §2 row 14; contents provisional, S04 §9).
     Skins,
 }
 
-/// The main menu, top to bottom: 11 items and 4 separators (task card).
+/// The main menu, top to bottom: 15 items and 4 separators (settled: S04 §2).
 ///
-/// Order, separator positions and grouping are provisional pending S04; the
-/// per-row sources are cited so each line can be checked against the reading.
+/// Every row cites the S04 §2 row it matches. Leaf actions are the
+/// pre-existing key dispatches (S04 §9 covers no click-through, so nothing
+/// new is added); submenu contents stay provisional (S04 §9).
 pub const MAIN_MENU: [MenuRow; MAIN_MENU_ROWS] = [
-    // S03 §1 transport block (ids 40044-40048, 40154, 40195, 40197).
+    // S04 §2 row 1: title row (visual reading, y≈11-28).
     MenuRow::Item(MainMenuItem {
-        id: MainMenuId::Playback,
-        label: "Playback",
+        id: MainMenuId::Title,
+        label: "Nullsoft Winamp...",
         shortcut: None,
         check: MenuCheck::None,
-        action: MenuAction::Submenu(SubmenuId::Playback),
+        action: MenuAction::NoAction,
     }),
+    // S04 §2 separator at y=40.
     MenuRow::Separator,
-    // S03 §1 file block (ids 40029, 40185, 40187, 40193, 40194, 40188).
+    // S04 §2 row 2: `Play` submenu (arrow S04 §3.2, y 57-68).
     MenuRow::Item(MainMenuItem {
-        id: MainMenuId::Open,
-        label: "Open",
+        id: MainMenuId::Play,
+        label: "Play",
         shortcut: None,
         check: MenuCheck::None,
-        action: MenuAction::Submenu(SubmenuId::Open),
+        action: MenuAction::Submenu(SubmenuId::Play),
     }),
-    // S03 §1 bookmark block (ids 40320, 40321).
+    // S04 §2 row 3: `View file info` (S03 §1 id 40188; hint provisional,
+    // S04 §3.4).
+    MenuRow::Item(MainMenuItem {
+        id: MainMenuId::ViewFileInfo,
+        label: "View file info",
+        shortcut: Some("Alt+3"),
+        check: MenuCheck::None,
+        action: MenuAction::Shortcut(ShortcutAction::ViewFileInfo),
+    }),
+    // S04 §2 row 4: `Bookmarks` submenu (arrow S04 §3.2, y 127-138).
     MenuRow::Item(MainMenuItem {
         id: MainMenuId::Bookmarks,
         label: "Bookmarks",
@@ -272,9 +330,64 @@ pub const MAIN_MENU: [MenuRow; MAIN_MENU_ROWS] = [
         check: MenuCheck::None,
         action: MenuAction::Submenu(SubmenuId::Bookmarks),
     }),
+    // S04 §2 separator at y=156.
     MenuRow::Separator,
-    // S03 §1 window/mode/dialog block (ids 40012, 40019, 40063, 40064,
-    // 40157, 40186, 40224, 40258, 40291, 40334, 40041).
+    // S04 §2 row 5: `Main Window` (S03 §1 id 40258; hint S04 §3.3; check
+    // bbox 16,174-29,183 per S04 §3.1).
+    MenuRow::Item(MainMenuItem {
+        id: MainMenuId::MainWindow,
+        label: "Main Window",
+        shortcut: Some("Alt+W"),
+        check: MenuCheck::MainWindow,
+        action: MenuAction::Shortcut(ShortcutAction::ShowMainWindow),
+    }),
+    // S04 §2 row 6: `Playlist Editor` (S03 §1 id 40040; hint S04 §3.3;
+    // check bbox y 209-218 per S04 §3.1).
+    MenuRow::Item(MainMenuItem {
+        id: MainMenuId::PlaylistEditor,
+        label: "Playlist Editor",
+        shortcut: Some("Alt+E"),
+        check: MenuCheck::PlaylistEditor,
+        action: MenuAction::Shortcut(ShortcutAction::TogglePlaylistEditor),
+    }),
+    // S04 §2 row 7: `Equalizer` (S03 §1 id 40036; hint S04 §3.3; check bbox
+    // y 244-253 per S04 §3.1).
+    MenuRow::Item(MainMenuItem {
+        id: MainMenuId::Equalizer,
+        label: "Equalizer",
+        shortcut: Some("Alt+G"),
+        check: MenuCheck::Equalizer,
+        action: MenuAction::Shortcut(ShortcutAction::ToggleEqualizer),
+    }),
+    // S04 §2 row 8: `Library` (hint `Alt+L`, S04 §3.3; no S03 command, so
+    // no dispatch — S04 §9).
+    MenuRow::Item(MainMenuItem {
+        id: MainMenuId::Library,
+        label: "Library",
+        shortcut: Some("Alt+L"),
+        check: MenuCheck::None,
+        action: MenuAction::NoAction,
+    }),
+    // S04 §2 row 9: `Minibrowser` (hint `Alt+T`, S04 §3.3; S03 §1 id 40298,
+    // but the dispatcher drops it — RFC 0005 §11 — so no dispatch).
+    MenuRow::Item(MainMenuItem {
+        id: MainMenuId::Minibrowser,
+        label: "Minibrowser",
+        shortcut: Some("Alt+T"),
+        check: MenuCheck::None,
+        action: MenuAction::NoAction,
+    }),
+    // S04 §2 row 10: `Video` (hint `Alt+V`, S04 §3.3; S03 §1 id 40328).
+    MenuRow::Item(MainMenuItem {
+        id: MainMenuId::Video,
+        label: "Video",
+        shortcut: Some("Alt+V"),
+        check: MenuCheck::None,
+        action: MenuAction::Shortcut(ShortcutAction::ToggleVideoWindow),
+    }),
+    // S04 §2 separator at y=377.
+    MenuRow::Separator,
+    // S04 §2 row 11: `Options` submenu (arrow S04 §3.2, y 394-405).
     MenuRow::Item(MainMenuItem {
         id: MainMenuId::Options,
         label: "Options",
@@ -282,7 +395,15 @@ pub const MAIN_MENU: [MenuRow; MAIN_MENU_ROWS] = [
         check: MenuCheck::None,
         action: MenuAction::Submenu(SubmenuId::Options),
     }),
-    // S03 §1 visualization block (ids 40191, 40192, 40221, 40317).
+    // S04 §2 row 12: `Playback` submenu (arrow S04 §3.2, y 429-440).
+    MenuRow::Item(MainMenuItem {
+        id: MainMenuId::Playback,
+        label: "Playback",
+        shortcut: None,
+        check: MenuCheck::None,
+        action: MenuAction::Submenu(SubmenuId::Playback),
+    }),
+    // S04 §2 row 13: `Visualization` submenu (arrow S04 §3.2, y 464-475).
     MenuRow::Item(MainMenuItem {
         id: MainMenuId::Visualization,
         label: "Visualization",
@@ -290,7 +411,7 @@ pub const MAIN_MENU: [MenuRow; MAIN_MENU_ROWS] = [
         check: MenuCheck::None,
         action: MenuAction::Submenu(SubmenuId::Visualization),
     }),
-    // S03 §1 skin block (ids 40219, 40291).
+    // S04 §2 row 14: `Skins` submenu (arrow S04 §3.2, y 499-510).
     MenuRow::Item(MainMenuItem {
         id: MainMenuId::Skins,
         label: "Skins",
@@ -298,49 +419,23 @@ pub const MAIN_MENU: [MenuRow; MAIN_MENU_ROWS] = [
         check: MenuCheck::None,
         action: MenuAction::Submenu(SubmenuId::Skins),
     }),
+    // S04 §2 separator at y=528.
     MenuRow::Separator,
-    // Task card: checkable window rows (Main Window: S03 §1 id 40258;
-    // Playlist Editor: S03 §1 id 40040; Equalizer: S03 §1 id 40036).
+    // S04 §2 row 15: `Exit` (no S03 row, so no dispatch — S04 §9).
     MenuRow::Item(MainMenuItem {
-        id: MainMenuId::MainWindow,
-        label: "Main Window",
+        id: MainMenuId::Exit,
+        label: "Exit",
         shortcut: None,
-        check: MenuCheck::MainWindow,
-        action: MenuAction::Shortcut(ShortcutAction::ShowMainWindow),
-    }),
-    MenuRow::Item(MainMenuItem {
-        id: MainMenuId::PlaylistEditor,
-        label: "Playlist Editor",
-        shortcut: None,
-        check: MenuCheck::PlaylistEditor,
-        action: MenuAction::Shortcut(ShortcutAction::TogglePlaylistEditor),
-    }),
-    MenuRow::Item(MainMenuItem {
-        id: MainMenuId::Equalizer,
-        label: "Equalizer",
-        shortcut: None,
-        check: MenuCheck::Equalizer,
-        action: MenuAction::Shortcut(ShortcutAction::ToggleEqualizer),
-    }),
-    MenuRow::Separator,
-    // Task card: the time-display pair (S03 §1 id 40242, RFC 0005 §9
-    // UI-local). Both rows flip the same flag; the check moves between them.
-    MenuRow::Item(MainMenuItem {
-        id: MainMenuId::TimeElapsed,
-        label: "Time elapsed",
-        shortcut: None,
-        check: MenuCheck::TimeElapsed,
-        action: MenuAction::Shortcut(ShortcutAction::ToggleTimeRemaining),
-    }),
-    MenuRow::Item(MainMenuItem {
-        id: MainMenuId::TimeRemaining,
-        label: "Time remaining",
-        shortcut: None,
-        check: MenuCheck::TimeRemaining,
-        action: MenuAction::Shortcut(ShortcutAction::ToggleTimeRemaining),
+        check: MenuCheck::None,
+        action: MenuAction::NoAction,
     }),
 ];
 
+/// Transport entries shown under the `Playback` submenu.
+///
+/// Provisional grouping (see [`PLAY_ENTRIES`]): S04 §9 leaves submenu
+/// contents unmeasured; the actions are S03 §1 (ids 40044-40048, 40154,
+/// 40195, 40197).
 const PLAYBACK_ENTRIES: [SubmenuItem; 8] = [
     SubmenuItem {
         // S03 §1 id 40045.
@@ -400,7 +495,13 @@ const PLAYBACK_ENTRIES: [SubmenuItem; 8] = [
     },
 ];
 
-const OPEN_ENTRIES: [SubmenuItem; 6] = [
+/// File-access entries shown under the `Play` submenu.
+///
+/// Provisional grouping: S04 §9 states no submenu was ever opened, so which
+/// entries the measured `Play` submenu holds is unmeasured. The actions
+/// themselves are S03-backed (ids cited per entry); only the placement under
+/// `Play` is ours.
+const PLAY_ENTRIES: [SubmenuItem; 6] = [
     SubmenuItem {
         // S03 §1 id 40029.
         label: "Open file(s)",
@@ -445,6 +546,9 @@ const OPEN_ENTRIES: [SubmenuItem; 6] = [
     },
 ];
 
+/// Bookmark entries shown under the `Bookmarks` submenu.
+///
+/// Provisional grouping (see [`PLAY_ENTRIES`]): S03 §1 ids 40320, 40321.
 const BOOKMARKS_ENTRIES: [SubmenuItem; 2] = [
     SubmenuItem {
         // S03 §1 id 40321.
@@ -462,6 +566,11 @@ const BOOKMARKS_ENTRIES: [SubmenuItem; 2] = [
     },
 ];
 
+/// Window, mode and dialog entries shown under the `Options` submenu.
+///
+/// Provisional grouping (see [`PLAY_ENTRIES`]): S03 §1 window/mode/dialog
+/// block (ids 40012, 40019, 40063, 40064, 40157, 40186, 40224, 40258, 40291,
+/// 40334, 40041).
 const OPTIONS_ENTRIES: [SubmenuItem; 11] = [
     SubmenuItem {
         // S03 §1 id 40012.
@@ -542,6 +651,10 @@ const OPTIONS_ENTRIES: [SubmenuItem; 11] = [
     },
 ];
 
+/// Visualization entries shown under the `Visualization` submenu.
+///
+/// Provisional grouping (see [`PLAY_ENTRIES`]): S03 §1 ids 40191, 40192,
+/// 40221, 40317.
 const VISUALIZATION_ENTRIES: [SubmenuItem; 4] = [
     SubmenuItem {
         // S03 §1 id 40191.
@@ -573,6 +686,9 @@ const VISUALIZATION_ENTRIES: [SubmenuItem; 4] = [
     },
 ];
 
+/// Skin entries shown under the `Skins` submenu.
+///
+/// Provisional grouping (see [`PLAY_ENTRIES`]): S03 §1 ids 40219, 40291.
 const SKINS_ENTRIES: [SubmenuItem; 2] = [
     SubmenuItem {
         // S03 §1 id 40219.
@@ -590,12 +706,15 @@ const SKINS_ENTRIES: [SubmenuItem; 2] = [
     },
 ];
 
-/// The entries of a submenu, top to bottom (contents S03-backed; the grouping
-/// itself is provisional pending S04).
+/// The entries of a submenu, top to bottom.
+///
+/// Provisional throughout: S04 §9 states no submenu was ever opened, so the
+/// grouping under each parent is ours; only the actions (S03 ids) are
+/// spec-backed.
 pub fn submenu_entries(id: SubmenuId) -> &'static [SubmenuItem] {
     match id {
+        SubmenuId::Play => &PLAY_ENTRIES,
         SubmenuId::Playback => &PLAYBACK_ENTRIES,
-        SubmenuId::Open => &OPEN_ENTRIES,
         SubmenuId::Bookmarks => &BOOKMARKS_ENTRIES,
         SubmenuId::Options => &OPTIONS_ENTRIES,
         SubmenuId::Visualization => &VISUALIZATION_ENTRIES,
@@ -616,7 +735,8 @@ pub fn top_level(id: MainMenuId) -> Option<&'static MainMenuItem> {
 // ---------------------------------------------------------------------------
 
 /// The `(top, bottom)` pixel band of every top-level row under the
-/// provisional 47/13 split (pending S04).
+/// provisional 35/11 split (S04 §8 leaves the bands open; every measured y
+/// in S04 §§2-3 falls inside its row's band — see the bands test).
 pub fn row_bands() -> [(u32, u32); MAIN_MENU_ROWS] {
     let mut bands = [(0, 0); MAIN_MENU_ROWS];
     let mut y = 0;
@@ -668,10 +788,9 @@ fn menu_font(skin: &Skin) -> Option<BitmapFont> {
 
 /// Draws one check mark centred in the check cell of an item band.
 ///
-/// Our own drawing: two 3-px strokes forming a tick. It stays inside
-/// [`CHECK_CELL_X`]; the task card states each measured check mark is a
-/// 40-px difference confined to that cell, which this renderer mirrors only
-/// in placement, not in pixels.
+/// Our own drawing: two small strokes forming a tick. It stays inside the
+/// measured [`CHECK_CELL_X`] (S04 §3.1); the 40-px measured glyph shape is
+/// not reproduced — the reference popup is a native menu.
 fn draw_check(canvas: &mut Image, band_top: u32) {
     let mid = band_top as i32 + (MAIN_MENU_ITEM_HEIGHT_PX / 2) as i32;
     // Short arm: (19, mid+1) to (23, mid+5).
@@ -682,12 +801,13 @@ fn draw_check(canvas: &mut Image, band_top: u32) {
     canvas.fill_rect(Rect::new(25, mid - 7, 3, 10), MENU_INK);
 }
 
-/// Draws a right-pointing submenu arrow (our own drawing).
+/// Draws a right-pointing submenu arrow (our own drawing) inside the
+/// measured arrow column x = 297-303, about 12 px tall (S04 §3.2).
 fn draw_arrow(canvas: &mut Image, band_top: u32) {
     let mid = band_top as i32 + (MAIN_MENU_ITEM_HEIGHT_PX / 2) as i32;
-    for (i, width) in [9, 9, 7, 7, 5, 5, 3, 3].iter().enumerate() {
+    for (i, width) in [6, 6, 4, 4, 2, 2].iter().enumerate() {
         canvas.fill_rect(
-            Rect::new(ARROW_X, mid - 8 + i as i32 * 2, *width, 2),
+            Rect::new(ARROW_X, mid - 6 + i as i32 * 2, *width, 2),
             MENU_INK,
         );
     }
@@ -711,8 +831,12 @@ fn draw_item(
         font.render_text(canvas, LABEL_X, baseline, &label.to_ascii_lowercase());
         if let Some(hint) = shortcut {
             let width = font.width_of(&hint.to_ascii_lowercase());
-            let x = MAIN_MENU_CLIENT_SIZE.0 as i32 - HINT_MARGIN_RIGHT as i32 - width as i32;
-            font.render_text(canvas, x, baseline, &hint.to_ascii_lowercase());
+            font.render_text(
+                canvas,
+                HINT_RIGHT_X - width as i32,
+                baseline,
+                &hint.to_ascii_lowercase(),
+            );
         }
     }
     if has_submenu {
@@ -731,9 +855,11 @@ pub fn render_main_menu(skin: &Skin, state: &MainWindowState, flags: &MenuFlags)
     for (row, (top, bottom)) in MAIN_MENU.iter().zip(row_bands()) {
         match row {
             MenuRow::Separator => {
+                // Measured 303-px full-width rule (S04 §2); the dark/light
+                // etching itself is our choice.
                 let mid = (top + bottom) / 2;
-                canvas.fill_rect(Rect::new(4, mid as i32, width - 8, 1), SEPARATOR_DARK);
-                canvas.fill_rect(Rect::new(4, mid as i32 + 1, width - 8, 1), SEPARATOR_LIGHT);
+                canvas.fill_rect(Rect::new(10, mid as i32, 303, 1), SEPARATOR_DARK);
+                canvas.fill_rect(Rect::new(10, mid as i32 + 1, 303, 1), SEPARATOR_LIGHT);
             }
             MenuRow::Item(item) => {
                 let has_submenu = matches!(item.action, MenuAction::Submenu(_));
@@ -753,8 +879,10 @@ pub fn render_main_menu(skin: &Skin, state: &MainWindowState, flags: &MenuFlags)
 }
 
 /// Client size of a submenu popup: one item band per entry; the width fits
-/// the longest label plus its hint (our layout helper — submenu sizes are
-/// unmeasured, pending S04).
+/// the longest label plus its hint.
+///
+/// Our layout helper only: S04 §9 states no submenu was ever opened, so
+/// submenu sizes are unmeasured.
 pub fn submenu_client_size(id: SubmenuId, skin: &Skin) -> (u32, u32) {
     let entries = submenu_entries(id);
     let height = entries.len() as u32 * MAIN_MENU_ITEM_HEIGHT_PX;
@@ -773,7 +901,8 @@ pub fn submenu_client_size(id: SubmenuId, skin: &Skin) -> (u32, u32) {
                 })
                 .max()
                 .unwrap_or(0);
-            content + HINT_MARGIN_RIGHT + 24
+            // Provisional right margin (submenu geometry unmeasured, S04 §9).
+            content + 10 + 24
         }
     };
     (width, height)
@@ -821,20 +950,81 @@ mod tests {
     }
 
     #[test]
-    fn the_table_has_fifteen_rows_with_four_separators() {
+    fn the_table_has_nineteen_rows_with_four_separators() {
+        // Settled shape: 15 item rows (S04 §2 rows 1-15) plus 4 separator
+        // rules (S04 §2, y = 40/156/377/528).
         assert_eq!(MAIN_MENU.len(), MAIN_MENU_ROWS);
-        assert_eq!(MAIN_MENU.len(), 15);
+        assert_eq!(MAIN_MENU.len(), 19);
         let separators = MAIN_MENU
             .iter()
             .filter(|row| matches!(row, MenuRow::Separator))
             .count();
         assert_eq!(separators, MAIN_MENU_SEPARATORS);
         assert_eq!(separators, 4);
-        assert_eq!(item_rows().len(), 11);
+        assert_eq!(item_rows().len(), 15);
     }
 
     #[test]
-    fn separators_sit_between_the_groups() {
+    fn the_items_match_the_measured_row_order() {
+        // Settled labels top to bottom (S04 §2 table).
+        let labels: Vec<&str> = item_rows().iter().map(|item| item.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Nullsoft Winamp...",
+                "Play",
+                "View file info",
+                "Bookmarks",
+                "Main Window",
+                "Playlist Editor",
+                "Equalizer",
+                "Library",
+                "Minibrowser",
+                "Video",
+                "Options",
+                "Playback",
+                "Visualization",
+                "Skins",
+                "Exit",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_window_rows_carry_the_measured_alt_hints() {
+        // Settled visual readings (S04 §3.3; the `View file info` hint is
+        // provisional — S04 §3.4 asserts no label, so the S03 §1 key stands
+        // in — and the submenu/title/`Exit` rows carry none).
+        let hints: Vec<(MainMenuId, Option<&str>)> = item_rows()
+            .iter()
+            .map(|item| (item.id, item.shortcut))
+            .collect();
+        assert_eq!(
+            hints,
+            [
+                (MainMenuId::Title, None),
+                (MainMenuId::Play, None),
+                (MainMenuId::ViewFileInfo, Some("Alt+3")),
+                (MainMenuId::Bookmarks, None),
+                (MainMenuId::MainWindow, Some("Alt+W")),
+                (MainMenuId::PlaylistEditor, Some("Alt+E")),
+                (MainMenuId::Equalizer, Some("Alt+G")),
+                (MainMenuId::Library, Some("Alt+L")),
+                (MainMenuId::Minibrowser, Some("Alt+T")),
+                (MainMenuId::Video, Some("Alt+V")),
+                (MainMenuId::Options, None),
+                (MainMenuId::Playback, None),
+                (MainMenuId::Visualization, None),
+                (MainMenuId::Skins, None),
+                (MainMenuId::Exit, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn separators_sit_between_the_measured_groups() {
+        // S04 §2: after the title row, after `Bookmarks`, after `Video` and
+        // after `Skins`.
         let at: Vec<usize> = MAIN_MENU
             .iter()
             .enumerate()
@@ -843,11 +1033,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(at, [1, 4, 8, 12]);
+        assert_eq!(at, [1, 5, 12, 17]);
     }
 
     #[test]
     fn six_rows_carry_submenus_and_each_has_entries() {
+        // Settled arrow set in row order (S04 §3.2); contents provisional
+        // (S04 §9).
         let parents: Vec<(MainMenuId, SubmenuId)> = item_rows()
             .iter()
             .filter_map(|item| match item.action {
@@ -859,10 +1051,10 @@ mod tests {
         assert_eq!(
             parents,
             [
-                (MainMenuId::Playback, SubmenuId::Playback),
-                (MainMenuId::Open, SubmenuId::Open),
+                (MainMenuId::Play, SubmenuId::Play),
                 (MainMenuId::Bookmarks, SubmenuId::Bookmarks),
                 (MainMenuId::Options, SubmenuId::Options),
+                (MainMenuId::Playback, SubmenuId::Playback),
                 (MainMenuId::Visualization, SubmenuId::Visualization),
                 (MainMenuId::Skins, SubmenuId::Skins),
             ]
@@ -873,7 +1065,9 @@ mod tests {
     }
 
     #[test]
-    fn the_checkable_set_is_the_windows_plus_the_time_pair_plus_modes() {
+    fn the_checkable_set_is_the_three_window_rows() {
+        // Settled: three checked rows (S04 §3.1); every other main-menu row
+        // is unchecked.
         let checked: Vec<(MainMenuId, MenuCheck)> = item_rows()
             .iter()
             .filter(|item| item.check != MenuCheck::None)
@@ -885,8 +1079,6 @@ mod tests {
                 (MainMenuId::MainWindow, MenuCheck::MainWindow),
                 (MainMenuId::PlaylistEditor, MenuCheck::PlaylistEditor),
                 (MainMenuId::Equalizer, MenuCheck::Equalizer),
-                (MainMenuId::TimeElapsed, MenuCheck::TimeElapsed),
-                (MainMenuId::TimeRemaining, MenuCheck::TimeRemaining),
             ]
         );
         // The mode checks live in the Options submenu.
@@ -908,20 +1100,25 @@ mod tests {
     }
 
     #[test]
-    fn every_menu_action_runs_the_key_dispatch() {
-        // No menu row may reference an action the dispatcher drops: leaves
-        // must yield commands (or the handled time flip), never `Unhandled`.
+    fn every_dispatched_menu_action_runs_the_key_dispatch() {
+        // No dispatched menu row may reference an action the dispatcher
+        // drops: `Shortcut` leaves must yield commands (or a handled flip),
+        // never `Unhandled`. [`MenuAction::NoAction`] rows (title, Library,
+        // Minibrowser, Exit) draw only and are skipped here.
         let mut machine = MainWindow::default();
         let mut leaves = Vec::new();
+        let mut undrawn = 0;
         for item in item_rows() {
             match item.action {
                 MenuAction::Shortcut(action) => leaves.push((item.label, action)),
                 MenuAction::Submenu(_) => {}
+                MenuAction::NoAction => undrawn += 1,
             }
         }
+        assert_eq!(undrawn, 4);
         for entry in [
             &PLAYBACK_ENTRIES[..],
-            &OPEN_ENTRIES[..],
+            &PLAY_ENTRIES[..],
             &BOOKMARKS_ENTRIES[..],
             &OPTIONS_ENTRIES[..],
             &VISUALIZATION_ENTRIES[..],
@@ -942,22 +1139,17 @@ mod tests {
     }
 
     #[test]
-    fn the_time_pair_shares_the_ui_local_flip() {
-        let elapsed = top_level(MainMenuId::TimeElapsed).unwrap();
-        let remaining = top_level(MainMenuId::TimeRemaining).unwrap();
-        assert_eq!(elapsed.action, remaining.action);
-        assert_eq!(
-            elapsed.action,
-            MenuAction::Shortcut(ShortcutAction::ToggleTimeRemaining)
-        );
-        // The check moves between the two rows when the flag flips.
+    fn the_time_pair_resolves_oppositely_from_live_state() {
+        // The elapsed/remaining rows live in the Options popup (S04 §4.1),
+        // not on the main menu (S04 §2); the pair still resolves from
+        // `time_remaining`, which the Options popup will read.
         let flags = MenuFlags::default();
         let mut state = MainWindowState::default();
-        assert!(check_state(elapsed.check, &state, &flags));
-        assert!(!check_state(remaining.check, &state, &flags));
+        assert!(check_state(MenuCheck::TimeElapsed, &state, &flags));
+        assert!(!check_state(MenuCheck::TimeRemaining, &state, &flags));
         state.time_remaining = true;
-        assert!(!check_state(elapsed.check, &state, &flags));
-        assert!(check_state(remaining.check, &state, &flags));
+        assert!(!check_state(MenuCheck::TimeElapsed, &state, &flags));
+        assert!(check_state(MenuCheck::TimeRemaining, &state, &flags));
     }
 
     #[test]
@@ -1040,14 +1232,59 @@ mod tests {
     #[test]
     fn row_at_y_resolves_every_pixel_to_its_row() {
         assert_eq!(row_at_y(0), Some(0));
-        assert_eq!(row_at_y(46), Some(0));
-        assert_eq!(row_at_y(47), Some(1));
-        assert_eq!(row_at_y(568), Some(14));
+        assert_eq!(row_at_y(34), Some(0));
+        assert_eq!(row_at_y(35), Some(1));
+        assert_eq!(row_at_y(568), Some(18));
         assert_eq!(row_at_y(569), None);
         // Every band maps back to its own index.
         for (index, (top, bottom)) in row_bands().iter().enumerate() {
             assert_eq!(row_at_y(*top), Some(index));
             assert_eq!(row_at_y(bottom - 1), Some(index));
         }
+    }
+
+    #[test]
+    fn the_provisional_bands_contain_the_measured_marks() {
+        // The 35/11 split is provisional (S04 §8 open), but it must stay
+        // consistent with every measured y: the separator rules (S04 §2),
+        // the check bboxes (S04 §3.1) and the arrow bands (S04 §3.2).
+        let bands = row_bands();
+        let contains = |index: usize, y: u32| {
+            let (top, bottom) = bands[index];
+            assert!(
+                y >= top && y < bottom,
+                "measured y={y} falls outside band {index} ({top}..{bottom})"
+            );
+        };
+        // Separator rules at y = 40/156/377/528 sit in bands 1/5/12/17.
+        for (index, y) in [(1, 40), (5, 156), (12, 377), (17, 528)] {
+            contains(index, y);
+        }
+        // Check bboxes: Main Window 174-183, Playlist Editor 209-218,
+        // Equalizer 244-253.
+        for y in [174, 183] {
+            contains(6, y);
+        }
+        for y in [209, 218] {
+            contains(7, y);
+        }
+        for y in [244, 253] {
+            contains(8, y);
+        }
+        // Arrow bands on the six submenu rows.
+        for (index, top, bottom) in [
+            (2, 57, 68),
+            (4, 127, 138),
+            (13, 394, 405),
+            (14, 429, 440),
+            (15, 464, 475),
+            (16, 499, 510),
+        ] {
+            contains(index, top);
+            contains(index, bottom - 1);
+        }
+        // Title row text zone (y≈11-28, S04 §2 row 1).
+        contains(0, 11);
+        contains(0, 27);
     }
 }

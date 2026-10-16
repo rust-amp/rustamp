@@ -6,11 +6,14 @@
 //! unambiguous. No real skin, reference capture or window is used here. What
 //! the tests pin:
 //!
-//! * the frame is exactly the measured client size (323 x 569);
+//! * the frame is exactly the measured client size (323 x 569, S04 §1/§8);
 //! * labels draw through the skin's `text.bmp` font;
 //! * separators etch their band;
-//! * flipping a check changes pixels only inside the check cell (x = 16-29)
-//!   of that row's band — the confinement the task-card measurement states.
+//! * flipping a check changes pixels only inside the check cell (x = 16-29,
+//!   S04 §3.1) of that row's band;
+//! * flipping the time flag changes no main-menu pixel: the elapsed/remaining
+//!   checks live in the Options popup (S04 §4.1), not on the main menu
+//!   (S04 §2).
 
 use rustamp_skin::{BuiltinDefaultSkin, MemorySource, Skin};
 use rustamp_ui::menu::{
@@ -126,10 +129,11 @@ fn labels_draw_through_the_skin_font() {
     let skin = synthetic_skin();
     let frame = render_main_menu(&skin, &MainWindowState::default(), &MenuFlags::default());
     let background = face(&skin);
-    // Row 0 ("Playback", x = 40.., band 0..47) holds two `a` cells.
+    // Row 0 (the `Nullsoft Winamp...` title, S04 §2 row 1, band 0..35,
+    // labels at x = 45 per the S04 §3.5 text zone) holds `a` cells.
     let mut glyph_pixels = 0;
-    for y in 0..47 {
-        for x in 40..200 {
+    for y in 0..35 {
+        for x in 45..200 {
             let pixel = frame.pixel(x, y).unwrap();
             if [pixel[0], pixel[1], pixel[2]] == GLYPH_A {
                 glyph_pixels += 1;
@@ -149,11 +153,12 @@ fn separators_etch_their_band() {
     let skin = synthetic_skin();
     let frame = render_main_menu(&skin, &MainWindowState::default(), &MenuFlags::default());
     let background = face(&skin);
-    // First separator band is 47..60; the etched pair sits mid-band.
-    assert_eq!(frame.pixel(100, 47).unwrap(), background);
-    assert_ne!(frame.pixel(100, 53).unwrap(), background);
-    assert_ne!(frame.pixel(100, 54).unwrap(), background);
-    assert_eq!(frame.pixel(100, 59).unwrap(), background);
+    // First separator band is 35..46 (the measured y = 40 rule, S04 §2);
+    // the etched pair sits mid-band.
+    assert_eq!(frame.pixel(100, 35).unwrap(), background);
+    assert_ne!(frame.pixel(100, 40).unwrap(), background);
+    assert_ne!(frame.pixel(100, 41).unwrap(), background);
+    assert_eq!(frame.pixel(100, 45).unwrap(), background);
 }
 
 #[test]
@@ -171,9 +176,10 @@ fn a_check_flip_only_touches_the_check_cell_of_its_row() {
     );
     let changed = diff(&plain, &checked);
     assert!(!changed.is_empty(), "the Equalizer check drew nothing");
-    // The Equalizer row is index 11; the check cell is x = 16-29.
+    // The Equalizer row is index 8 (S04 §2 row 7); the check cell is the
+    // measured x = 16-29 (S04 §3.1).
     let bands = row_bands();
-    let (top, bottom) = bands[11];
+    let (top, bottom) = bands[8];
     assert_eq!(
         top_level(MainMenuId::Equalizer).unwrap().check,
         menu::MenuCheck::Equalizer
@@ -195,7 +201,11 @@ fn a_check_flip_only_touches_the_check_cell_of_its_row() {
 }
 
 #[test]
-fn the_time_check_moves_between_the_two_rows() {
+fn the_time_flip_touches_no_main_menu_pixel() {
+    // The elapsed/remaining checks live in the Options popup (S04 §4.1),
+    // not on the main menu (S04 §2: no time rows), so flipping the flag
+    // must not change the rendered main menu — while the check pair itself
+    // still resolves oppositely from live state.
     let skin = synthetic_skin();
     let flags = MenuFlags::default();
     let elapsed = render_main_menu(&skin, &MainWindowState::default(), &flags);
@@ -207,30 +217,17 @@ fn the_time_check_moves_between_the_two_rows() {
         },
         &flags,
     );
-    let changed = diff(&elapsed, &remaining);
-    assert!(!changed.is_empty(), "the time flip drew nothing");
-    let bands = row_bands();
-    let time_bands = [bands[13], bands[14]];
-    for (x, y) in &changed {
-        assert!(
-            (16..30).contains(x),
-            "time-check pixel outside the check cell: ({x}, {y})"
-        );
-        assert!(
-            time_bands
-                .iter()
-                .any(|(top, bottom)| (*top..*bottom).contains(y)),
-            "time-check pixel outside the time bands: ({x}, {y})"
-        );
-    }
-    // The checks resolve opposite ways on the two states.
+    assert!(
+        diff(&elapsed, &remaining).is_empty(),
+        "the time flip must not redraw the main menu"
+    );
     assert!(check_state(
-        top_level(MainMenuId::TimeElapsed).unwrap().check,
+        menu::MenuCheck::TimeElapsed,
         &MainWindowState::default(),
         &flags
     ));
     assert!(check_state(
-        top_level(MainMenuId::TimeRemaining).unwrap().check,
+        menu::MenuCheck::TimeRemaining,
         &MainWindowState {
             time_remaining: true,
             ..MainWindowState::default()
@@ -243,8 +240,8 @@ fn the_time_check_moves_between_the_two_rows() {
 fn submenu_frames_hold_one_band_per_entry() {
     let skin = synthetic_skin();
     for id in [
+        SubmenuId::Play,
         SubmenuId::Playback,
-        SubmenuId::Open,
         SubmenuId::Bookmarks,
         SubmenuId::Options,
         SubmenuId::Visualization,
@@ -253,7 +250,7 @@ fn submenu_frames_hold_one_band_per_entry() {
         let entries = submenu_entries(id);
         assert!(!entries.is_empty());
         let (width, height) = submenu_client_size(id, &skin);
-        assert_eq!(height, entries.len() as u32 * 47, "{id:?}");
+        assert_eq!(height, entries.len() as u32 * 35, "{id:?}");
         let frame = render_submenu(
             &skin,
             id,

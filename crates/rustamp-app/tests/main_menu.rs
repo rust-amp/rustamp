@@ -14,9 +14,10 @@
 //!
 //! What the headless tests pin:
 //!
-//! * the time rows are a real toggle wired to the existing UI-local flip
-//!   (RFC 0005 §9): the check moves between *Time elapsed* and
-//!   *Time remaining*;
+//! * the time toggle is wired to the existing UI-local flip (RFC 0005 §9):
+//!   activating it flips the flag and the elapsed/remaining check pair
+//!   (S04 §4.1) moves with it — those rows live in the Options popup, not on
+//!   the main menu (S04 §2);
 //! * the check state comes from live app state (the Equalizer/Playlist rows
 //!   reflect what is actually on);
 //! * leaves emit the app's existing commands and notes: dialog requests keep
@@ -45,37 +46,27 @@ fn headless_app() -> App {
 }
 
 #[test]
-fn the_time_rows_are_a_real_toggle() {
+fn the_time_toggle_is_wired_to_the_ui_local_flip() {
+    // The elapsed/remaining rows live in the Options popup (S04 §4.1), not
+    // on the main menu (S04 §2), so there is no top-level time row to
+    // activate: drive the same UI-local flip (RFC 0005 §9) directly and pin
+    // that the check pair moves with it.
     let mut app = headless_app();
     assert!(!app.state().time_remaining);
     assert!(app.menu_check(MenuCheck::TimeElapsed));
     assert!(!app.menu_check(MenuCheck::TimeRemaining));
 
-    let elapsed = top_level(MainMenuId::TimeElapsed).unwrap();
     let outcome = app
-        .activate_menu_item(
-            elapsed.label,
-            match elapsed.action {
-                rustamp_ui::MenuAction::Shortcut(action) => action,
-                _ => panic!("the time row is a leaf"),
-            },
-        )
+        .activate_menu_item("Time elapsed", ShortcutAction::ToggleTimeRemaining)
         .expect("activation submits");
     assert_eq!(outcome, MenuOutcome::TimeDisplay(true));
     assert!(app.state().time_remaining);
     assert!(!app.menu_check(MenuCheck::TimeElapsed));
     assert!(app.menu_check(MenuCheck::TimeRemaining));
 
-    // The sibling row flips it back: the check moves between the two.
-    let remaining = top_level(MainMenuId::TimeRemaining).unwrap();
+    // Flipping back restores the elapsed check.
     let outcome = app
-        .activate_menu_item(
-            remaining.label,
-            match remaining.action {
-                rustamp_ui::MenuAction::Shortcut(action) => action,
-                _ => panic!("the time row is a leaf"),
-            },
-        )
+        .activate_menu_item("Time remaining", ShortcutAction::ToggleTimeRemaining)
         .expect("activation submits");
     assert_eq!(outcome, MenuOutcome::TimeDisplay(false));
     assert!(!app.state().time_remaining);
@@ -155,7 +146,7 @@ fn an_action_without_a_command_notes_the_item_by_name() {
 
 /// Opens the real main-menu popup and checks its client size.
 ///
-/// The size is the task-card measurement (323 x 569, pending S04); the
+/// The size is the settled S04 measurement (323 x 569, S04 §1/§8); the
 /// position is probe-only (the popup anchor is unmeasured). It creates no
 /// softbuffer surface and paints nothing; painting is covered by the headless
 /// render tests.
