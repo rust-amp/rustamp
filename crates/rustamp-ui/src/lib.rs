@@ -30,6 +30,10 @@
 #![forbid(unsafe_code)]
 
 pub mod behaviour;
+pub mod docking;
+// Compatibility entry points for the same module under other common names.
+pub use docking as geometry;
+pub use docking as windows;
 pub mod layout;
 pub mod presenter;
 pub mod render;
@@ -40,6 +44,13 @@ pub mod widget;
 pub use behaviour::{
     MainWindow, PROGRAM_NAME, balance_percent, core_balance, core_volume, transport_transition,
     volume_percent,
+};
+pub use docking::{
+    ClassicWindow, DEFAULT_EQUALIZER_POSITION, DEFAULT_MAIN_POSITION, DEFAULT_PLAYLIST_POSITION,
+    DOUBLE_EQUALIZER_SIZE, DOUBLE_MAIN_SIZE, DockedStack, MoveTestPositions,
+    PLAYLIST_UNCHANGED_SIZE, Point, Position, SHADE_REFLOW_PX, SHADED_MAIN_SIZE, SNAP_TOLERANCE_PX,
+    WindowKind, WindowPosition, WindowSize, bottom_edge, equalizer_top, move_test_positions,
+    neighbour_tracks, playlist_top, snap_candidate, snap_edge, snap_within, window_size,
 };
 pub use layout::{
     DOUBLE_HEIGHT, DOUBLE_WIDTH, MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH,
