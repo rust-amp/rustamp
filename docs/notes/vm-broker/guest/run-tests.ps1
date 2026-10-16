@@ -60,6 +60,13 @@ foreach ($exe in $exes) {
     # a failure like this is a mystery.
     $diagnostic = @()
     if (-not $summary) { $diagnostic = @($lines | Where-Object { $_ -and $_.Trim() } | Select-Object -First 5) }
+    # A failing test's own output is the only way to see *why* from the runner, and
+    # a test that panics says so in one line. Keep those lines (with a little
+    # context) so the failure is diagnosable without a second round trip.
+    if ($failedNames.Count -gt 0) {
+        $interesting = @($lines | Where-Object { $_ -match 'panicked|assertion|FAILED|BLOCKED|left:|right:|Error|error:' } | Select-Object -First 14)
+        if ($interesting) { $diagnostic = @($diagnostic + $interesting) }
+    }
     $results += [pscustomobject]@{
         exe        = $name
         exit       = $exit
