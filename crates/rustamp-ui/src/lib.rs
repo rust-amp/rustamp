@@ -87,9 +87,9 @@ pub use layout::{
 pub use menu::{
     CHECK_CELL_X, MAIN_MENU, MAIN_MENU_CLASS, MAIN_MENU_CLIENT_SIZE, MAIN_MENU_ITEM_HEIGHT_PX,
     MAIN_MENU_ROWS, MAIN_MENU_SEPARATOR_HEIGHT_PX, MAIN_MENU_SEPARATORS, MAIN_MENU_SUBMENUS,
-    MainMenuId, MainMenuItem, MenuAction, MenuCheck, MenuFlags, MenuRow, SubmenuId, SubmenuItem,
-    check_state, render_main_menu, render_submenu, row_at_y, row_bands, submenu_client_size,
-    submenu_entries, top_level,
+    MENU_BUTTON_POINT, MainMenuId, MainMenuItem, MenuAction, MenuCheck, MenuFlags, MenuRow,
+    SubmenuId, SubmenuItem, check_state, menu_item_at, menu_popup_origin, render_main_menu,
+    render_submenu, row_at_y, row_bands, submenu_client_size, submenu_entries, top_level,
 };
 pub use playlist::{
     ADD_DIALOG_TITLE, BUTTON_BAND_BOTTOM, BUTTON_BAND_TOP, LIST_SELECT_POINT, LOAD_DIALOG_TITLE,

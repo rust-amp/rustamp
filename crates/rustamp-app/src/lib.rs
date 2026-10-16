@@ -20,8 +20,9 @@
 //!   assembling [`rustamp_core::state::PlayerState`] snapshots and publishing
 //!   them as [`rustamp_ipc::Message::PlayerStateUpdate`] over the existing
 //!   control channel (RFC 0006).
-//! * [`menu`] — main-menu check flags and leaf activation (wave21b) on top of
-//!   the [`rustamp_ui::menu`] table. Opens no window.
+//! * [`menu`] — main-menu check flags, leaf activation (wave21b) and the
+//!   popup's open state and click routing on top of [`rustamp_ui::menu`].
+//!   Headless; the OS window lives in [`window`].
 //! * [`supervise`] — spawn and supervision for `rustamp-plughost32`: finding
 //!   the i686 host binary, starting it with `CREATE_NO_WINDOW` over piped
 //!   stdio, and re-attaching (or restarting) it when it dies — off the audio

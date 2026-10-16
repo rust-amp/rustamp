@@ -122,6 +122,9 @@ pub struct App {
     /// skin browser, preferences); owned here, rendered by `dialogs.rs`,
     /// hosted by `window.rs`.
     pub(crate) dialogs: DialogManager,
+    /// Whether the main-menu popup is open (owned here, rendered by
+    /// `menu.rs`, hosted by `window.rs`; S04).
+    pub(crate) main_menu_open: bool,
     notes: Vec<String>,
     /// The app's end of the player-state bridge to the plugin host
     /// (see [`crate::host`]): detached until a supervisor attaches a
@@ -210,6 +213,7 @@ impl App {
             next_entry_id: 0,
             playlist: PlaylistWindow::new(),
             dialogs: DialogManager::new(),
+            main_menu_open: false,
             notes: Vec::new(),
             host: HostStateLink::detached(),
             host_supervisor: None,
@@ -979,11 +983,14 @@ impl App {
                 // window for these, so no note is recorded.
                 self.open_dialog_for(command);
             }
-            C::OpenMedia { .. } | C::OpenBookmarkEditor | C::AddBookmark | C::OpenMainMenu => {
+            C::OpenMedia { .. } | C::OpenBookmarkEditor | C::AddBookmark => {
                 self.note(format!(
                     "{command:?} needs a dialog that is not implemented yet"
                 ));
             }
+            // The main-menu popup (S04): the app owns the open state, the
+            // presenter hosts the OS window for it.
+            C::OpenMainMenu => self.open_main_menu(),
             C::FocusNextWindow | C::ShowMainWindow => {
                 self.note(format!("{command:?} is not implemented yet"));
             }
@@ -1703,14 +1710,16 @@ mod tests {
 
     #[test]
     fn the_remaining_dialog_commands_still_record_their_note() {
-        // The main menu stays unimplemented (so do the media pickers and
-        // bookmarks, covered elsewhere); About, file info, jump, load
-        // playlist, the skin browser and preferences open real windows now.
+        // The media pickers and bookmarks stay unimplemented (About, file
+        // info, jump, load playlist, the skin browser and preferences open
+        // real windows now; the main menu opens its popup, covered in
+        // `menu.rs`).
         let (mut app, _dir) = app_with_file(None);
-        app.submit(Command::OpenMainMenu).unwrap();
+        app.submit(Command::AddBookmark).unwrap();
         let notes = app.drain_notes();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(app.dialog_open_kind().is_none());
+        assert!(!app.main_menu_is_open());
     }
 
     #[test]

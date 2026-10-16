@@ -62,13 +62,14 @@ use rustamp_platform::init_dpi_awareness;
 use rustamp_ui::{
     DEFAULT_MAIN_POSITION, DialogKind, Key, Modifiers, PLAYLIST_WINDOW_SIZE, ShortcutOutcome,
     docking::DockedStack,
+    menu::{MAIN_MENU_CLIENT_SIZE, menu_popup_origin},
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowId, WindowLevel};
+use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
 use crate::app::App;
 
@@ -225,8 +226,19 @@ struct Windowed {
     dialog_id: Option<WindowId>,
     /// Which dialog the OS window above shows (`None` while it is closed).
     dialog_kind: Option<DialogKind>,
+    /// The main-menu popup window (S04): at most one is open, created by the
+    /// same shell and rail as the main window. The client size is the measured
+    /// 323 x 569 ([`MAIN_MENU_CLIENT_SIZE`], S04 §§1,8); the reference class
+    /// `#32768` (S04 §1) is not reproduced — `winit` cannot set a window
+    /// class — so this is an ordinary small window hosting the rendered menu
+    /// model. Placement, dismissal and keyboard handling are own choices:
+    /// S04 §9 leaves popup placement and the OS popup's behaviour unmeasured.
+    menu_window: Option<Arc<Window>>,
+    menu_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    menu_id: Option<WindowId>,
     cursor: (i32, i32),
     eq_cursor: (i32, i32),
+    menu_cursor: (i32, i32),
     left_down: bool,
     eq_left_down: bool,
     playlist_cursor: (i32, i32),
@@ -263,8 +275,12 @@ impl Windowed {
             dialog_surface: None,
             dialog_id: None,
             dialog_kind: None,
+            menu_window: None,
+            menu_surface: None,
+            menu_id: None,
             cursor: (0, 0),
             eq_cursor: (0, 0),
+            menu_cursor: (0, 0),
             left_down: false,
             eq_left_down: false,
             playlist_cursor: (0, 0),
@@ -717,6 +733,194 @@ impl Windowed {
         }
     }
 
+    /// Window attributes for the main-menu popup at screen `origin`.
+    ///
+    /// The client size is the measured 323 x 569 (S04 §§1,8). The reference
+    /// popup is a `#32768` system menu (settled, S04 §1); `winit` cannot set a
+    /// window class, so this is an ordinary non-resizable window hosting the
+    /// rendered menu model — the class itself is not reproduced.
+    fn menu_window_attributes(origin: (i32, i32)) -> WindowAttributes {
+        Window::default_attributes()
+            .with_title("Rustamp Menu")
+            .with_position(PhysicalPosition::new(origin.0, origin.1))
+            .with_inner_size(PhysicalSize::new(
+                MAIN_MENU_CLIENT_SIZE.0,
+                MAIN_MENU_CLIENT_SIZE.1,
+            ))
+            .with_resizable(false)
+    }
+
+    /// Creates or closes the menu popup's OS window so it matches the app's
+    /// popup state ([`App::main_menu_is_open`]).
+    ///
+    /// Creation needs the event loop, so this runs wherever the loop is
+    /// available (`resumed`, `about_to_wait`, the menu close paths). A failed
+    /// creation is reported and skipped: the main window is unaffected. The
+    /// window opens anchored at the measured menu-button point
+    /// ([`menu_popup_origin`]); it is not re-placed afterwards — popups do
+    /// not follow the main window, and S04 §9 leaves placement unmeasured.
+    fn sync_menu_window(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.app.main_menu_is_open() {
+            if self.menu_window.is_some() {
+                self.menu_window = None;
+                self.menu_surface = None;
+                self.menu_id = None;
+            }
+            return;
+        }
+        if self.menu_window.is_some() {
+            return;
+        }
+        let main_outer = self
+            .window
+            .as_ref()
+            .and_then(|window| window.outer_position().ok())
+            .map(|pos| (pos.x, pos.y))
+            .unwrap_or((DEFAULT_MAIN_POSITION.x, DEFAULT_MAIN_POSITION.y));
+        let attributes = Self::menu_window_attributes(menu_popup_origin(main_outer));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                eprintln!("rustamp: could not create the menu popup window: {error}");
+                return;
+            }
+        };
+        let context = match softbuffer::Context::new(Arc::clone(&window)) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("rustamp: could not create the menu softbuffer context: {error}");
+                return;
+            }
+        };
+        let mut surface = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(error) => {
+                eprintln!("rustamp: could not create the menu softbuffer surface: {error}");
+                return;
+            }
+        };
+        if let (Some(width), Some(height)) = (
+            NonZeroU32::new(MAIN_MENU_CLIENT_SIZE.0),
+            NonZeroU32::new(MAIN_MENU_CLIENT_SIZE.1),
+        ) {
+            let _ = surface.resize(width, height);
+        }
+        self.menu_id = Some(window.id());
+        self.menu_window = Some(window);
+        self.menu_surface = Some(surface);
+        self.request_menu_redraw();
+    }
+
+    /// True when `id` is the menu popup's id.
+    fn is_menu_window(&self, id: WindowId) -> bool {
+        self.menu_id == Some(id)
+    }
+
+    fn request_menu_redraw(&self) {
+        if let Some(window) = &self.menu_window {
+            window.request_redraw();
+        }
+    }
+
+    /// Blits the menu frame ([`App::render_menu`]) to its surface.
+    fn paint_menu(&mut self) {
+        let image = self.app.render_menu();
+        let (Some(width), Some(height)) = (
+            NonZeroU32::new(image.width()),
+            NonZeroU32::new(image.height()),
+        ) else {
+            return;
+        };
+        let Some(surface) = self.menu_surface.as_mut() else {
+            return;
+        };
+        if surface.resize(width, height).is_err() {
+            return;
+        }
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        for (pixel, rgba) in buffer.iter_mut().zip(image.as_rgba().as_chunks::<4>().0) {
+            *pixel = (u32::from(rgba[0]) << 16) | (u32::from(rgba[1]) << 8) | u32::from(rgba[2]);
+        }
+        let _ = buffer.present();
+    }
+
+    /// A key press while the menu popup is focused.
+    ///
+    /// Own choice, stated plainly: S04 §9 leaves the OS popup's dismissal and
+    /// keyboard behaviour unmeasured, so `Escape` closes the popup and every
+    /// other key is ignored (no measured navigation to implement).
+    fn menu_key_event(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let Some(key) = map_key(event) else {
+            return;
+        };
+        if key == Key::Escape {
+            self.app.close_main_menu();
+            self.sync_menu_window(event_loop);
+        }
+    }
+
+    /// Events for the menu popup window, in popup-client coordinates.
+    ///
+    /// A left press on a row goes through [`App::menu_click`] (leaf rows
+    /// activate through the key-dispatch path and close the popup; submenu
+    /// parents open nothing and keep it open; separators are ignored); a leaf
+    /// that opened a dialog is synced so the dialog window appears. Losing
+    /// focus closes the popup — the click-outside dismissal, an own choice
+    /// (S04 §9 unmeasured): a press anywhere else moves focus off first.
+    /// Closing the window closes the popup (it never quits the player).
+    fn menu_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                self.app.close_main_menu();
+                self.sync_menu_window(event_loop);
+            }
+            WindowEvent::RedrawRequested => self.paint_menu(),
+            WindowEvent::Resized(size) => {
+                let (width, height) = MAIN_MENU_CLIENT_SIZE;
+                if (size.width != width || size.height != height)
+                    && let Some(window) = &self.menu_window
+                {
+                    let _ = window.request_inner_size(PhysicalSize::new(width, height));
+                }
+                self.request_menu_redraw();
+            }
+            WindowEvent::Focused(false) => {
+                self.app.close_main_menu();
+                self.sync_menu_window(event_loop);
+            }
+            WindowEvent::Focused(true) => {}
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.menu_key_event(event_loop, &event);
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.menu_cursor = (position.x as i32, position.y as i32);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.menu_cursor;
+                if let Err(error) = self.app.menu_click(x, y) {
+                    eprintln!("rustamp: menu click failed: {error}");
+                }
+                self.sync_menu_window(event_loop);
+                // A leaf may have opened a dialog or flipped a check mark.
+                self.sync_dialog_window(event_loop);
+                self.request_dialog_redraw();
+                self.request_menu_redraw();
+                self.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
     /// Creates the playlist editor window with the same shell as the main
     /// window (S06, S01 §4): a non-resizable `winit` window with its own
     /// `softbuffer` surface, sized to the spec'd 275 x 116 client area
@@ -900,6 +1104,8 @@ impl ApplicationHandler for Windowed {
         self.request_redraw_eq();
         self.sync_dialog_window(event_loop);
         self.request_dialog_redraw();
+        self.sync_menu_window(event_loop);
+        self.request_menu_redraw();
         self.open_playlist_window(event_loop);
     }
 
@@ -913,6 +1119,10 @@ impl ApplicationHandler for Windowed {
         }
         if self.is_dialog_window(id) {
             self.dialog_event(event_loop, event);
+            return;
+        }
+        if self.is_menu_window(id) {
+            self.menu_event(event_loop, event);
             return;
         }
         if self
@@ -987,6 +1197,15 @@ impl ApplicationHandler for Windowed {
                 button: MouseButton::Left,
                 ..
             } => {
+                // A press anywhere else dismisses the open menu popup instead
+                // of reaching the main window. Own choice, stated plainly:
+                // S04 §9 leaves the OS popup's dismissal unmeasured.
+                if state == ElementState::Pressed && self.app.main_menu_is_open() {
+                    self.left_down = false;
+                    self.app.close_main_menu();
+                    self.sync_menu_window(event_loop);
+                    return;
+                }
                 let (x, y) = self.cursor;
                 let result = match state {
                     ElementState::Pressed => {
@@ -1031,6 +1250,11 @@ impl ApplicationHandler for Windowed {
         // closed by Escape, Enter or the window's close button).
         self.sync_dialog_window(event_loop);
         self.request_dialog_redraw();
+        // The menu popup follows the app's popup state (opened by the
+        // window-menu button or Alt+F, closed by selection, Escape, a press
+        // elsewhere or its own close box).
+        self.sync_menu_window(event_loop);
+        self.request_menu_redraw();
         // The docked playlist tracks the main window (moves and shade reflow).
         self.sync_playlist_position();
         self.request_playlist_redraw();
@@ -1224,5 +1448,40 @@ mod tests {
         assert_eq!(map_modifiers(state), Modifiers::CTRL | Modifiers::SHIFT);
         assert_eq!(map_modifiers(ModifiersState::empty()), Modifiers::NONE);
         assert_eq!(map_modifiers(ModifiersState::ALT), Modifiers::ALT);
+    }
+
+    /// Opens the real menu popup window. **VM-only, `#[ignore]`d by default,
+    /// and gated on the test VM.**
+    ///
+    /// GUI must never run on the host. Run this only inside the headless test
+    /// VM (the only host for anything graphical):
+    ///
+    /// ```text
+    /// cargo test -p rustamp-app -- --ignored menu_popup
+    /// ```
+    ///
+    /// Outside the test VM it refuses before any window exists
+    /// ([`require_test_vm`]).
+    #[test]
+    #[ignore = "VM-only: opens the menu popup window; run inside the headless test VM"]
+    #[allow(deprecated)]
+    fn the_menu_popup_opens_at_the_measured_size() {
+        // The gate, before any window exists.
+        require_test_vm();
+
+        let event_loop = EventLoop::new().expect("event loop");
+        // Deprecated on purpose: outside `run_app` there is no
+        // `ActiveEventLoop`, and this VM-only test just needs one window.
+        let window = event_loop
+            .create_window(Windowed::menu_window_attributes(menu_popup_origin((
+                100, 100,
+            ))))
+            .expect("menu popup window");
+        let size = window.inner_size();
+        assert_eq!(
+            (size.width, size.height),
+            MAIN_MENU_CLIENT_SIZE,
+            "the popup client area must be the measured 323 x 569 (S04 §§1,8)"
+        );
     }
 }

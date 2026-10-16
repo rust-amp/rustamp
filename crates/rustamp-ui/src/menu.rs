@@ -933,6 +933,48 @@ pub fn render_submenu(
     canvas
 }
 
+// ---------------------------------------------------------------------------
+// Popup placement and hit-testing
+// ---------------------------------------------------------------------------
+
+/// The client point whose click opens the main menu: the window-menu button
+/// (settled: S04 §1 row 1, posted left click at client (6,3)).
+pub const MENU_BUTTON_POINT: (i32, i32) = (6, 3);
+
+/// Where the popup opens, given the main window's outer (screen) origin.
+///
+/// Own choice, stated plainly: S04 settles the opening click (client (6,3),
+/// §1 row 1), the class (`#32768`, §1) and the client size (323 x 569, §§1,8)
+/// but no screen position — popup placement is unmeasured (S04 §9), and the
+/// non-client border is open (§8), so the client-exact offset under the
+/// button cannot be computed. The popup's top-left anchors at the measured
+/// click point, so it drops over the button it came from.
+pub fn menu_popup_origin(main_outer: (i32, i32)) -> (i32, i32) {
+    (
+        main_outer.0 + MENU_BUTTON_POINT.0,
+        main_outer.1 + MENU_BUTTON_POINT.1,
+    )
+}
+
+/// The top-level item at popup-client `(x, y)`, if the point is on an item
+/// row.
+///
+/// Separators and points outside the [`MAIN_MENU_CLIENT_SIZE`] client area
+/// yield `None`: a separator click is not a selection (S04 §9 leaves
+/// click-through unmeasured, so it is ignored, never activated). Dismissal on
+/// a click outside the popup is the presenter's job — only it sees presses on
+/// other windows — so out-of-bounds points are likewise `None` here.
+pub fn menu_item_at(x: i32, y: i32) -> Option<&'static MainMenuItem> {
+    let (width, height) = MAIN_MENU_CLIENT_SIZE;
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return None;
+    }
+    match &MAIN_MENU[row_at_y(y as u32)?] {
+        MenuRow::Item(item) => Some(item),
+        MenuRow::Separator => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1286,5 +1328,50 @@ mod tests {
         // Title row text zone (y≈11-28, S04 §2 row 1).
         contains(0, 11);
         contains(0, 27);
+    }
+
+    #[test]
+    fn the_popup_anchors_at_the_measured_button_point() {
+        // The opening click is client (6,3) (S04 §1 row 1); placement beyond
+        // that anchor is unmeasured (S04 §9), so the origin is exactly the
+        // main outer origin plus the button point.
+        assert_eq!(MENU_BUTTON_POINT, (6, 3));
+        assert_eq!(menu_popup_origin((100, 200)), (106, 203));
+        assert_eq!(menu_popup_origin((0, 0)), (6, 3));
+    }
+
+    #[test]
+    fn the_popup_size_and_class_are_the_measured_values() {
+        // Settled: 323 x 569 (S04 §1 row 1, §8), class `#32768` (S04 §1).
+        assert_eq!(MAIN_MENU_CLIENT_SIZE, (323, 569));
+        assert_eq!(MAIN_MENU_CLASS, "#32768");
+    }
+
+    #[test]
+    fn every_item_band_hits_its_row_and_separators_hit_nothing() {
+        // Each item band's middle resolves to its own row; every separator
+        // band resolves to `None` (not a selection).
+        for (index, row) in MAIN_MENU.iter().enumerate() {
+            let (top, bottom) = row_bands()[index];
+            let middle = ((top + bottom) / 2) as i32;
+            match row {
+                MenuRow::Item(item) => {
+                    assert_eq!(menu_item_at(10, middle), Some(item));
+                    assert_eq!(menu_item_at(322, middle), Some(item));
+                }
+                MenuRow::Separator => {
+                    assert_eq!(menu_item_at(10, middle), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn points_outside_the_client_hit_nothing() {
+        assert_eq!(menu_item_at(-1, 10), None);
+        assert_eq!(menu_item_at(10, -1), None);
+        assert_eq!(menu_item_at(323, 10), None);
+        assert_eq!(menu_item_at(10, 569), None);
+        assert_eq!(menu_item_at(500, 500), None);
     }
 }

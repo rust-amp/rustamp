@@ -1,15 +1,20 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! The main-menu popup wiring (task card wave21b).
+//! The main-menu popup wiring (task card wave21b, popup wave26).
 //!
-//! [`rustamp_ui::menu`] owns the table (rows, separators, submenus, checks);
-//! this module is the app side: it builds the [`MenuFlags`] from live app
-//! state, resolves check marks, and activates menu leaves through the same
-//! key-dispatch the shortcuts use. It opens no window: the OS popup that
-//! hosts the rendered menu belongs to the presenter (`window.rs`, S04).
+//! [`rustamp_ui::menu`] owns the table (rows, separators, submenus, checks),
+//! the renderer and the pure popup geometry (placement anchor, hit-testing);
+//! this module is the app side: it owns the popup's open state, builds the
+//! [`MenuFlags`] from live app state, resolves check marks, and activates
+//! menu leaves through the same key-dispatch the shortcuts use. The OS window
+//! itself is created by the presenter (`window.rs`): it opens at the measured
+//! client size (323 x 569, S04 §§1,8), renders [`render_menu`](App::render_menu),
+//! and routes presses and keys back into [`App::menu_click`] /
+//! [`App::close_main_menu`].
 
 use rustamp_core::command::Command;
 use rustamp_core::error::Result;
-use rustamp_ui::menu::{MenuCheck, MenuFlags, check_state};
+use rustamp_gfx::Image;
+use rustamp_ui::menu::{MenuAction, MenuCheck, MenuFlags, check_state, menu_item_at};
 use rustamp_ui::{ShortcutAction, ShortcutOutcome};
 
 use crate::app::App;
@@ -27,6 +32,28 @@ pub enum MenuOutcome {
     /// The leaf has no command yet; the app kept its "not implemented" note
     /// naming the item (see [`routing::unhandled_message`]).
     Noted,
+}
+
+/// What a click on the open popup did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MenuClickOutcome {
+    /// A leaf row was chosen and the popup closed: `Some` carries the
+    /// activation outcome for a `Shortcut` leaf (through
+    /// [`App::activate_menu_item`); `None` for a `NoAction` row (the title
+    /// row, `Library`, `Minibrowser`, `Exit`), which keeps its draw-only
+    /// treatment — S04 §9 explicitly does not cover click-through, so no
+    /// behaviour is invented for these rows.
+    Activated(Option<MenuOutcome>),
+    /// A submenu parent was clicked: nothing opens (S04 §9 — submenu
+    /// contents were never measured), so the popup stays open and a note
+    /// names the submenu instead of inventing its entries.
+    SubmenuDeferred(rustamp_ui::menu::SubmenuId),
+    /// A separator or an out-of-bounds point: ignored, the popup stays open.
+    /// A separator click is not a selection, and S04 §9 leaves its effect
+    /// unmeasured. Dismissal on a click *outside* the popup is the
+    /// presenter's job — only it sees presses on other windows — so
+    /// out-of-bounds points are likewise ignored here.
+    Ignored,
 }
 
 impl App {
@@ -47,6 +74,61 @@ impl App {
     pub fn menu_check(&self, check: MenuCheck) -> bool {
         let flags = self.menu_flags();
         check_state(check, self.state(), &flags)
+    }
+
+    /// Opens the main-menu popup (`Command::OpenMainMenu`, S03 §1 id 40043:
+    /// Alt+F and the window-menu button). The presenter creates the OS window
+    /// for this state; opening twice keeps it open.
+    pub fn open_main_menu(&mut self) {
+        self.main_menu_open = true;
+    }
+
+    /// Closes the main-menu popup, if open. The presenter drops the OS window
+    /// for this state.
+    pub fn close_main_menu(&mut self) {
+        self.main_menu_open = false;
+    }
+
+    /// Whether the main-menu popup is open.
+    pub fn main_menu_is_open(&self) -> bool {
+        self.main_menu_open
+    }
+
+    /// Renders one frame of the main-menu popup at the measured client size
+    /// (323 x 569, S04 §§1,8) with live check marks.
+    pub fn render_menu(&self) -> Image {
+        rustamp_ui::menu::render_main_menu(self.skin.skin(), self.state(), &self.menu_flags())
+    }
+
+    /// A left-button press at popup-client `(x, y)` on the open popup.
+    ///
+    /// Leaf rows go through the existing activation path
+    /// ([`App::activate_menu_item`]) — no second path is invented — and close
+    /// the popup; submenu parents open nothing (S04 §9) and keep it open with
+    /// a note; separators and out-of-bounds points are ignored.
+    pub fn menu_click(&mut self, x: i32, y: i32) -> Result<MenuClickOutcome> {
+        let Some(item) = menu_item_at(x, y) else {
+            return Ok(MenuClickOutcome::Ignored);
+        };
+        match item.action {
+            MenuAction::Shortcut(action) => {
+                let outcome = self.activate_menu_item(item.label, action)?;
+                self.close_main_menu();
+                Ok(MenuClickOutcome::Activated(Some(outcome)))
+            }
+            MenuAction::NoAction => {
+                self.close_main_menu();
+                Ok(MenuClickOutcome::Activated(None))
+            }
+            MenuAction::Submenu(id) => {
+                self.note(format!(
+                    "main menu \"{}\": no submenu opens \
+                     (S04 §9 leaves submenu contents unmeasured)",
+                    item.label
+                ));
+                Ok(MenuClickOutcome::SubmenuDeferred(id))
+            }
+        }
     }
 
     /// Activates one menu leaf: runs the shortcut dispatch for `action` and
@@ -79,5 +161,142 @@ impl App {
                 Ok(MenuOutcome::Noted)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustamp_core::audio::DecoderRegistry;
+    use rustamp_core::config::Config;
+    use rustamp_ui::menu::{MAIN_MENU, MainMenuId, MenuRow, row_bands};
+
+    use crate::app::AppOptions;
+    use crate::cli::OutputChoice;
+
+    fn test_app() -> App {
+        let options = AppOptions {
+            config: Config::default(),
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            file: None,
+            seconds: None,
+        };
+        App::with_registry(options, DecoderRegistry::new()).unwrap()
+    }
+
+    /// The popup-client middle of the band carrying `id`.
+    fn row_middle(id: MainMenuId) -> (i32, i32) {
+        let index = MAIN_MENU
+            .iter()
+            .position(|row| matches!(row, MenuRow::Item(item) if item.id == id))
+            .unwrap();
+        let (top, bottom) = row_bands()[index];
+        (10, ((top + bottom) / 2) as i32)
+    }
+
+    #[test]
+    fn opening_and_closing_tracks_the_popup_state() {
+        let mut app = test_app();
+        assert!(!app.main_menu_is_open());
+        app.open_main_menu();
+        assert!(app.main_menu_is_open());
+        // Opening twice keeps it open.
+        app.open_main_menu();
+        assert!(app.main_menu_is_open());
+        app.close_main_menu();
+        assert!(!app.main_menu_is_open());
+        // Closing twice stays closed.
+        app.close_main_menu();
+        assert!(!app.main_menu_is_open());
+    }
+
+    #[test]
+    fn the_open_command_opens_the_popup_without_a_note() {
+        let mut app = test_app();
+        app.submit(Command::OpenMainMenu).unwrap();
+        assert!(app.main_menu_is_open());
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn clicking_a_leaf_activates_through_the_key_path_and_closes() {
+        // `View file info` (S03 §1 id 40188) emits `OpenFileInfo`, which the
+        // app's dialog arm opens — the same effect as pressing Alt+3.
+        let mut app = test_app();
+        app.open_main_menu();
+        let (x, y) = row_middle(MainMenuId::ViewFileInfo);
+        let outcome = app.menu_click(x, y).unwrap();
+        assert!(matches!(
+            outcome,
+            MenuClickOutcome::Activated(Some(MenuOutcome::Commands(_)))
+        ));
+        assert!(!app.main_menu_is_open());
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::FileInfo));
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn clicking_a_no_action_row_closes_without_dispatching() {
+        // `Exit` has no S03 row (S04 §2) and keeps its draw-only treatment:
+        // the popup closes, nothing is submitted, no note is recorded.
+        let mut app = test_app();
+        app.open_main_menu();
+        let (x, y) = row_middle(MainMenuId::Exit);
+        let outcome = app.menu_click(x, y).unwrap();
+        assert_eq!(outcome, MenuClickOutcome::Activated(None));
+        assert!(!app.main_menu_is_open());
+        assert!(app.drain_notes().is_empty());
+        assert!(!app.quit(), "closing the popup must not quit the player");
+    }
+
+    #[test]
+    fn clicking_a_submenu_parent_opens_nothing_and_keeps_the_popup() {
+        // S04 §9: submenu contents were never measured, so `Play` opens
+        // nothing and says so; the popup stays open.
+        let mut app = test_app();
+        app.open_main_menu();
+        let (x, y) = row_middle(MainMenuId::Play);
+        let outcome = app.menu_click(x, y).unwrap();
+        assert_eq!(
+            outcome,
+            MenuClickOutcome::SubmenuDeferred(rustamp_ui::menu::SubmenuId::Play)
+        );
+        assert!(app.main_menu_is_open());
+        let notes = app.drain_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("\"Play\""), "{notes:?}");
+    }
+
+    #[test]
+    fn clicking_a_separator_or_outside_point_is_ignored() {
+        let mut app = test_app();
+        app.open_main_menu();
+        // The first separator band (S04 §2, rule at y=40).
+        let (top, bottom) = row_bands()[1];
+        let middle = ((top + bottom) / 2) as i32;
+        assert_eq!(
+            app.menu_click(10, middle).unwrap(),
+            MenuClickOutcome::Ignored
+        );
+        assert!(app.main_menu_is_open());
+        // Out-of-bounds points are ignored here; dismissal outside the popup
+        // is the presenter's path (it alone sees other windows).
+        for (x, y) in [(-1, 10), (10, -1), (323, 10), (10, 569)] {
+            assert_eq!(app.menu_click(x, y).unwrap(), MenuClickOutcome::Ignored);
+        }
+        assert!(app.main_menu_is_open());
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn the_menu_frame_renders_at_the_measured_size() {
+        let app = test_app();
+        let image = app.render_menu();
+        assert_eq!(
+            (image.width(), image.height()),
+            rustamp_ui::menu::MAIN_MENU_CLIENT_SIZE
+        );
     }
 }

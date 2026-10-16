@@ -437,6 +437,10 @@ impl MainWindow {
             Widget::PlaylistToggle => Some(Command::ToggleWindow(WindowId::Playlist)),
             Widget::ClutterA => Some(Command::ToggleAlwaysOnTop),
             Widget::ClutterD => Some(Command::ToggleDoubleSize),
+            // The window-menu button opens the main-menu popup (S04 §1 row 1:
+            // posted left click at client (6,3)); the popup itself is the
+            // app presenter's window, opened from this command.
+            Widget::WindowMenu => Some(Command::OpenMainMenu),
             Widget::TimeDisplay => {
                 // Clicking the time display toggles elapsed/remaining (S02 §4).
                 // There is no core command or persisted field for it, so it is
@@ -814,7 +818,6 @@ mod tests {
     #[test]
     fn widgets_without_a_core_command_emit_nothing() {
         for widget in [
-            Widget::WindowMenu,
             Widget::WindowMinimize,
             Widget::WindowShade,
             Widget::WindowClose,
@@ -831,6 +834,17 @@ mod tests {
             playing(&mut machine, 0);
             assert_eq!(click(&mut machine, widget, 0), [], "{widget:?}");
         }
+    }
+
+    #[test]
+    fn the_window_menu_button_opens_the_main_menu() {
+        // S04 §1 row 1: the main menu opens from the window-menu button
+        // (client (6,3)); the click emits `OpenMainMenu`, which the app turns
+        // into the popup window.
+        let mut machine = MainWindow::new();
+        let (x, y) = centre(Widget::WindowMenu);
+        machine.mouse_down(x, y, 0);
+        assert_eq!(machine.mouse_up(x, y, 0), [Command::OpenMainMenu]);
     }
 
     #[test]
