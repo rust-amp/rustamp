@@ -45,6 +45,11 @@ if ($filter -like '--ignored*') {
 }
 
 $results = @()
+# Real test media: the host runner stages read-only copies at C:\rustamp\testmedia
+# when the owner's archive copy exists on the host. Point the documented
+# RUSTAMP_TESTDATA variable at it so media-dependent tests opt in; without it
+# they skip, exactly as on a machine without the archive.
+if (Test-Path 'C:\rustamp\testmedia') { $env:RUSTAMP_TESTDATA = 'C:\rustamp\testmedia' }
 foreach ($exe in $exes) {
     $name = Split-Path $exe -Leaf
     if ($filter -and $name -notlike "*$filter*") { continue }

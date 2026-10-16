@@ -130,6 +130,18 @@ if ($Reset) {
 Step 'copying the staged tree into the guest'
 & $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\code\Rustamp' -TimeoutSeconds 1800 | Out-Null
 
+# Real test media (copied once from the owner's archive, never modified there):
+# if the directory exists on the host it is staged as-is, so tests that opt in
+# via RUSTAMP_TESTDATA find real decodable files in the guest. Absent means
+# those tests skip, exactly as on a machine without the archive.
+$mediaDir = 'D:\code\rustamp-testmedia'
+if (Test-Path $mediaDir) {
+    Step 'copying real test media into the guest (read-only copies)'
+    & $broker -Op copyin -Source $mediaDir -Dest 'C:\rustamp\testmedia' -TimeoutSeconds 600 | Out-Null
+} else {
+    Write-Host '    no real test media on the host; media-dependent tests will skip'
+}
+
 Step 'running the tests in the guest'
 # A single positional argument: `-ArgumentList` with an array binds only the
 # first element to the script's parameter, which silently dropped the filter.

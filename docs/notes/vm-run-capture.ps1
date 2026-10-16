@@ -114,6 +114,18 @@ Copy-Item (Join-Path $RefDir '*') (Join-Path $Stage 'winamp295') -Recurse -Force
 Step 'copying the staged capture tree into the guest'
 & $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\capture' -TimeoutSeconds 1800 | Out-Null
 
+# Real media for jobs that need a playing track (the owner's archive copy on
+# the host, never modified there): staged as-is so a job can load a guest path
+# like C:\rustamp\testmedia\jingle-rockdown.mp3. Absent means jobs that need
+# media refuse loudly instead of measuring an empty list.
+$mediaDir = 'D:\code\rustamp-testmedia'
+if (Test-Path $mediaDir) {
+    Step 'copying real test media into the guest (read-only copies)'
+    & $broker -Op copyin -Source $mediaDir -Dest 'C:\rustamp\testmedia' -TimeoutSeconds 600 | Out-Null
+} else {
+    Write-Host '    no real test media on the host; media-dependent jobs will refuse'
+}
+
 Step "running capture job '$Job' in the guest"
 $result = & $broker -Op guest -Script 'run-capture.ps1' -GuestArgs $Job -TimeoutSeconds $TimeoutSeconds
 
