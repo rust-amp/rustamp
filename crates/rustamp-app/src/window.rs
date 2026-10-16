@@ -1,10 +1,20 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! The windowed presenter: a `winit` + `softbuffer` shell around [`App`].
+//! The windowed presenter: `winit` + `softbuffer` shells around [`App`].
 //!
 //! The app owns the OS and the clock (task card N1): this module creates the
-//! window, forwards OS input into [`App`], pumps the app on a ~60 Hz timer so
+//! windows, forwards OS input into [`App`], pumps the app on a ~60 Hz timer so
 //! the engine's events reach the UI machine and the marquee/time animate, and
-//! blits the frame [`App::render`] produces.
+//! blits the frames [`App::render`] and [`App::render_eq`] produce.
+//!
+//! Two OS windows exist when the equalizer is open (specs **S07** + **S05**):
+//! the main window and the equalizer window (`Winamp EQ`, 275 x 116 at rest,
+//! 550 x 232 double-sized; `specs/S01-window-geometry.md`, `specs/S05-docking.md`).
+//! The equalizer is a **docked neighbour**: it is placed below the main
+//! window's outer frame and re-placed whenever the main moves or resizes, so it
+//! follows the main and tracks its bottom edge (S05 §4.2, §3.3). The client
+//! geometry (sizes, the 102 px shade reflow, the same-delta move) is the
+//! existing [`rustamp_ui::docking::DockedStack`], not new arithmetic; the one
+//! approximation is documented on [`Windowed::place_eq_below_main`].
 //!
 //! # Window sizing (task card F1's contract)
 //!
@@ -46,8 +56,10 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rustamp_core::command::Command;
+use rustamp_core::state::WindowId as CoreWindowId;
 use rustamp_platform::init_dpi_awareness;
-use rustamp_ui::{Key, Modifiers, ShortcutOutcome};
+use rustamp_ui::{Key, Modifiers, ShortcutOutcome, docking::DockedStack};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -119,11 +131,13 @@ pub fn ensure_gui_allowed() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Opens the main window and runs until it is closed.
+/// Opens the main window (and the equalizer window when it is open) and runs
+/// until the main window is closed.
 ///
 /// Blocks and must run on the main thread. Never called by a test, except the
 /// `#[ignore]`d, sandbox-only one. Returns an error without opening anything
-/// when [`NO_GUI_ENV`] is set.
+/// when [`NO_GUI_ENV`] is set. Both windows share this rail: the gate runs
+/// before either window exists.
 pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {
     ensure_gui_allowed()?;
     if let Err(error) = init_dpi_awareness() {
@@ -141,13 +155,29 @@ struct Windowed {
     app: App,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    main_id: Option<WindowId>,
+    /// The equalizer's OS window (S07; `None` while the EQ window is closed).
+    eq_window: Option<Arc<Window>>,
+    eq_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    eq_id: Option<WindowId>,
     cursor: (i32, i32),
+    eq_cursor: (i32, i32),
     left_down: bool,
+    eq_left_down: bool,
     modifiers: ModifiersState,
     /// The client size last requested, so repeat requests are skipped.
     applied_client: Option<(u32, u32)>,
+    /// The equalizer's client size last requested.
+    applied_eq_client: Option<(u32, u32)>,
     /// The always-on-top level last applied to the OS window.
     applied_on_top: bool,
+    /// The docked stack model (S05 §3.3, §4.2, §5): shade/double-size flags
+    /// and same-delta moves go through this instead of new arithmetic. Its
+    /// absolute positions are the S05 default model; OS placement reads the
+    /// live outer frame (see `place_eq_below_main`).
+    stack: DockedStack,
+    /// The main window's last seen outer position, for same-delta tracking.
+    last_main_outer: Option<PhysicalPosition<i32>>,
 }
 
 impl Windowed {
@@ -157,16 +187,27 @@ impl Windowed {
             app,
             window: None,
             surface: None,
+            main_id: None,
+            eq_window: None,
+            eq_surface: None,
+            eq_id: None,
             cursor: (0, 0),
+            eq_cursor: (0, 0),
             left_down: false,
+            eq_left_down: false,
             modifiers: ModifiersState::empty(),
             applied_client: None,
+            applied_eq_client: None,
             applied_on_top,
+            stack: DockedStack::default_launch(),
+            last_main_outer: None,
         }
     }
 
     /// Resizes the OS window so its client area is exactly the layout size, and
-    /// applies the always-on-top and minimize requests.
+    /// applies the always-on-top and minimize requests. Also keeps the docked
+    /// stack model in step with the main window's shade/double-size flags
+    /// (S05 §3.3, §5: the 102 px reflow lives in the stack, not here).
     fn sync_window_state(&mut self) {
         let desired = self.app.frame_size();
         if self.applied_client != Some(desired)
@@ -174,6 +215,14 @@ impl Windowed {
         {
             let _ = window.request_inner_size(PhysicalSize::new(desired.0, desired.1));
             self.applied_client = Some(desired);
+        }
+        let shaded = self.app.state().windowshade;
+        if shaded != self.stack.main.shaded {
+            self.stack.set_main_shaded(shaded);
+        }
+        let double_size = self.app.state().double_size;
+        if double_size != self.stack.main.double_size {
+            self.stack.set_main_double_size(double_size);
         }
         if let Some(window) = &self.window {
             if self.app.always_on_top() != self.applied_on_top {
@@ -188,6 +237,108 @@ impl Windowed {
                 window.set_minimized(true);
             }
         }
+    }
+
+    /// Creates, resizes or closes the equalizer's OS window so it matches
+    /// `eq_open` and [`App::eq_frame_size`].
+    ///
+    /// Creation needs the event loop, so this runs wherever the loop is
+    /// available (`resumed`, `about_to_wait`, the EQ close path). A failed EQ
+    /// creation is reported and skipped: the main window is unaffected.
+    fn sync_eq_window(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.app.eq_open() {
+            if self.eq_window.is_some() {
+                self.eq_window = None;
+                self.eq_surface = None;
+                self.eq_id = None;
+                self.applied_eq_client = None;
+            }
+            return;
+        }
+        if self.eq_window.is_none() {
+            let (width, height) = self.app.eq_frame_size();
+            let attributes = Window::default_attributes()
+                .with_title("Rustamp Equalizer")
+                .with_inner_size(PhysicalSize::new(width, height))
+                .with_resizable(false);
+            let window = match event_loop.create_window(attributes) {
+                Ok(window) => Arc::new(window),
+                Err(error) => {
+                    eprintln!("rustamp: could not create the equalizer window: {error}");
+                    return;
+                }
+            };
+            self.eq_id = Some(window.id());
+            let context = match softbuffer::Context::new(Arc::clone(&window)) {
+                Ok(context) => context,
+                Err(error) => {
+                    eprintln!(
+                        "rustamp: could not create the equalizer softbuffer context: {error}"
+                    );
+                    self.eq_id = None;
+                    return;
+                }
+            };
+            let mut surface = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    eprintln!(
+                        "rustamp: could not create the equalizer softbuffer surface: {error}"
+                    );
+                    self.eq_id = None;
+                    return;
+                }
+            };
+            if let (Some(width), Some(height)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
+                let _ = surface.resize(width, height);
+            }
+            self.eq_window = Some(window);
+            self.eq_surface = Some(surface);
+            self.applied_eq_client = Some((width, height));
+            self.place_eq_below_main();
+        }
+        let desired = self.app.eq_frame_size();
+        if self.applied_eq_client != Some(desired)
+            && let Some(window) = &self.eq_window
+        {
+            let _ = window.request_inner_size(PhysicalSize::new(desired.0, desired.1));
+            self.applied_eq_client = Some(desired);
+        }
+    }
+
+    /// Places the equalizer window directly below the main window's outer
+    /// frame, at the same x (the docked neighbour of S05 §3.3/§4.2).
+    ///
+    /// Approximation, stated plainly: the reference stacks *client* edges
+    /// gap-free, but `winit` does not expose per-side chrome insets before or
+    /// after the window is shown (the same reason the presenter never adjusts
+    /// for chrome), so the client-edge-exact offset cannot be computed. The
+    /// outer-frame-to-outer-frame placement keeps the frames touching and
+    /// still tracks the main window's bottom edge through every move and
+    /// resize; a shaded (shorter) main pulls the equalizer up with it.
+    fn place_eq_below_main(&mut self) {
+        let (Some(main), Some(eq)) = (self.window.as_ref(), self.eq_window.as_ref()) else {
+            return;
+        };
+        if let Ok(pos) = main.outer_position() {
+            let size = main.outer_size();
+            eq.set_outer_position(PhysicalPosition::new(
+                pos.x,
+                pos.y.saturating_add(size.height as i32),
+            ));
+        }
+    }
+
+    /// Converts a physical cursor position to the equalizer layout's 1x
+    /// coordinates (S05 §2.1: the flag reaches the equalizer, so its scale
+    /// mirrors the main window's).
+    fn to_eq_layout(&self, position: PhysicalPosition<f64>) -> (i32, i32) {
+        let scale = if self.app.eq_state().double_size {
+            2.0
+        } else {
+            1.0
+        };
+        ((position.x / scale) as i32, (position.y / scale) as i32)
     }
 
     /// Converts a physical cursor position to the layout's 1x coordinates.
@@ -228,8 +379,32 @@ impl Windowed {
         self.request_redraw();
     }
 
+    /// A key press while the equalizer window is focused (S03 §3 via S07 §1).
+    fn eq_key_event(&mut self, event: &KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let Some(key) = map_key(event) else {
+            return;
+        };
+        let modifiers = map_modifiers(self.modifiers);
+        match self.app.eq_key_down(key, modifiers) {
+            Ok(commands) if commands.is_empty() => {}
+            Ok(commands) => println!("rustamp: equalizer shortcut {key:?} -> {commands:?}"),
+            Err(error) => eprintln!("rustamp: equalizer shortcut dispatch failed: {error}"),
+        }
+        self.sync_window_state();
+        self.request_redraw_eq();
+    }
+
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn request_redraw_eq(&self) {
+        if let Some(window) = &self.eq_window {
             window.request_redraw();
         }
     }
@@ -255,6 +430,35 @@ impl Windowed {
             *pixel = (u32::from(rgba[0]) << 16) | (u32::from(rgba[1]) << 8) | u32::from(rgba[2]);
         }
         let _ = buffer.present();
+    }
+
+    /// Blits the equalizer frame ([`App::render_eq`]) to its surface.
+    fn paint_eq(&mut self) {
+        let image = self.app.render_eq();
+        let (Some(width), Some(height)) = (
+            NonZeroU32::new(image.width()),
+            NonZeroU32::new(image.height()),
+        ) else {
+            return;
+        };
+        let Some(surface) = self.eq_surface.as_mut() else {
+            return;
+        };
+        if surface.resize(width, height).is_err() {
+            return;
+        }
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        for (pixel, rgba) in buffer.iter_mut().zip(image.as_rgba().as_chunks::<4>().0) {
+            *pixel = (u32::from(rgba[0]) << 16) | (u32::from(rgba[1]) << 8) | u32::from(rgba[2]);
+        }
+        let _ = buffer.present();
+    }
+
+    /// True when `id` is the equalizer window's id.
+    fn is_eq_window(&self, id: WindowId) -> bool {
+        self.eq_id == Some(id)
     }
 }
 
@@ -297,15 +501,39 @@ impl ApplicationHandler for Windowed {
         }
         self.window = Some(window);
         self.surface = Some(surface);
+        if let Some(window) = &self.window {
+            self.main_id = Some(window.id());
+        }
         self.sync_window_state();
+        self.sync_eq_window(event_loop);
         self.request_redraw();
+        self.request_redraw_eq();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // The equalizer window routes to the EQ machine; everything else is
+        // the main window's.
+        if self.is_eq_window(id) {
+            self.eq_window_event(event_loop, event);
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.app.request_quit();
                 event_loop.exit();
+            }
+            WindowEvent::Moved(position) => {
+                // A docked neighbour follows the main window by the same delta
+                // (S05 §4.2): the model moves through the stack geometry, then
+                // the EQ window is re-placed below the live outer frame.
+                if let Some(last) = self.last_main_outer {
+                    self.stack.move_main(
+                        position.x.saturating_sub(last.x),
+                        position.y.saturating_sub(last.y),
+                    );
+                }
+                self.last_main_outer = Some(position);
+                self.place_eq_below_main();
             }
             WindowEvent::RedrawRequested => self.paint(),
             WindowEvent::Resized(size) => {
@@ -315,6 +543,9 @@ impl ApplicationHandler for Windowed {
                     self.applied_client = None;
                     self.sync_window_state();
                 }
+                // A main resize (windowshade, double-size) re-flows the stack
+                // (S05 §3.3, §5): the equalizer tracks the new bottom edge.
+                self.place_eq_below_main();
                 self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged {
@@ -381,8 +612,95 @@ impl ApplicationHandler for Windowed {
             return;
         }
         self.sync_window_state();
+        self.sync_eq_window(event_loop);
+        // A main resize (shade, double-size) moves the docked neighbour with
+        // it (S05 §3.3, §5).
+        self.place_eq_below_main();
         self.request_redraw();
+        self.request_redraw_eq();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
+    }
+}
+
+impl Windowed {
+    /// Events for the equalizer window (S07): input goes to the EQ machine,
+    /// closing it toggles the window off, and resizes never settle below the
+    /// layout — the same rails as the main window.
+    fn eq_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                // Closing the equalizer window toggles it off (the main
+                // window's close still quits the player).
+                if let Err(error) = self
+                    .app
+                    .submit(Command::ToggleWindow(CoreWindowId::Equalizer))
+                {
+                    eprintln!("rustamp: equalizer close failed: {error}");
+                }
+                self.sync_eq_window(event_loop);
+                self.request_redraw_eq();
+            }
+            WindowEvent::RedrawRequested => self.paint_eq(),
+            WindowEvent::Resized(size) => {
+                let (width, height) = self.app.eq_frame_size();
+                if size.width < width || size.height < height {
+                    self.applied_eq_client = None;
+                    self.sync_eq_window(event_loop);
+                }
+                self.request_redraw_eq();
+            }
+            WindowEvent::ScaleFactorChanged {
+                mut inner_size_writer,
+                ..
+            } => {
+                let (width, height) = self.app.eq_frame_size();
+                let _ = inner_size_writer.request_inner_size(PhysicalSize::new(width, height));
+                self.applied_eq_client = Some((width, height));
+                self.request_redraw_eq();
+            }
+            WindowEvent::Focused(focused) => {
+                self.app.set_eq_focused(focused);
+                self.request_redraw_eq();
+            }
+            WindowEvent::KeyboardInput { event, .. } => self.eq_key_event(&event),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.eq_cursor = self.to_eq_layout(position);
+                if self.eq_left_down {
+                    let (x, y) = self.eq_cursor;
+                    if let Err(error) = self.app.eq_mouse_move(x, y) {
+                        eprintln!("rustamp: equalizer pointer move failed: {error}");
+                    }
+                    self.request_redraw_eq();
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.eq_cursor;
+                let result = match state {
+                    ElementState::Pressed => {
+                        self.eq_left_down = true;
+                        self.app.eq_mouse_down(x, y)
+                    }
+                    ElementState::Released => {
+                        self.eq_left_down = false;
+                        self.app.eq_mouse_up(x, y)
+                    }
+                };
+                if let Err(error) = result {
+                    eprintln!("rustamp: equalizer pointer input failed: {error}");
+                }
+                // A press may have armed a held sprite; a release may have
+                // toggled double-size through the main window.
+                self.sync_window_state();
+                self.sync_eq_window(event_loop);
+                self.request_redraw_eq();
+            }
+            _ => {}
+        }
     }
 }
 

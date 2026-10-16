@@ -44,8 +44,9 @@ use rustamp_gfx::Image;
 use rustamp_ipc::{Message, Transport};
 use rustamp_output::{NullClock, NullOutput, default_output};
 use rustamp_ui::{
-    Key, MainWindow, MainWindowLayout, MainWindowState, Modifiers, PlaylistDialog, ShortcutOutcome,
-    frame_size, render_main_window, volume_percent,
+    EqMenuRequest, EqualizerLayout, EqualizerWindow, Key, MainWindow, MainWindowLayout,
+    MainWindowState, Modifiers, PlaylistDialog, ShortcutOutcome, eq_frame_size, frame_size,
+    render_equalizer_window, render_main_window, volume_percent,
 };
 
 use crate::cli::OutputChoice;
@@ -78,6 +79,10 @@ pub struct App {
     engine: Engine,
     ui: MainWindow,
     layout: MainWindowLayout,
+    /// The equalizer's headless behaviour (S07; the engine stage is M2 future
+    /// work, so this is the UI's own prediction state).
+    eq: EqualizerWindow,
+    eq_layout: EqualizerLayout,
     skin: LoadedSkin,
     config: Config,
 
@@ -174,6 +179,8 @@ impl App {
             engine,
             ui: MainWindow::from_state(initial),
             layout: MainWindowLayout::CLASSIC,
+            eq: EqualizerWindow::new(),
+            eq_layout: EqualizerLayout::CLASSIC,
             skin: options.skin,
             config: options.config,
             bus,
@@ -227,6 +234,22 @@ impl App {
         &self.ui
     }
 
+    /// The equalizer's headless behaviour (S07).
+    pub fn eq(&self) -> &EqualizerWindow {
+        &self.eq
+    }
+
+    /// The equalizer's current render state.
+    pub fn eq_state(&self) -> &rustamp_ui::EqualizerState {
+        self.eq.state()
+    }
+
+    /// Whether the equalizer window is open (the main window's `eq_open` flag,
+    /// flipped by its EQ toggle button).
+    pub fn eq_open(&self) -> bool {
+        self.ui.state().eq_open
+    }
+
     /// The headless UI machine, mutably (tests and the presenter).
     pub fn ui_mut(&mut self) -> &mut MainWindow {
         &mut self.ui
@@ -277,6 +300,13 @@ impl App {
         frame_size(self.ui.state())
     }
 
+    /// The client area the equalizer's OS window must have right now (S05
+    /// §2.1: 275 x 116, 550 x 232 double-sized; the shade size follows the
+    /// existing docking geometry, S05 §1.5 open).
+    pub fn eq_frame_size(&self) -> (u32, u32) {
+        eq_frame_size(self.eq.state())
+    }
+
     /// Takes the pending "minimize the main window" request, if any.
     pub fn take_minimize_request(&mut self) -> bool {
         std::mem::take(&mut self.minimize_requested)
@@ -302,6 +332,23 @@ impl App {
         title
     }
 
+    /// Asks the app to open the equalizer's presets popup (S07 §4.2).
+    ///
+    /// The spec settles the popup's existence (window class `#32768`), size
+    /// and top-level entries (Load/Save/Delete) and fixes nothing beyond that,
+    /// so this records the request through the existing dialog-stub path and
+    /// opens no window: menu internals, submenu contents and load/save
+    /// semantics are intentionally not implemented here (S07 §12 O12, S04).
+    /// Returns the entries the real popup must carry.
+    pub fn request_eq_presets_menu(&mut self, request: EqMenuRequest) -> &'static [&'static str] {
+        let entries = request.entries();
+        self.note(format!(
+            "open presets popup {request:?} ({}): the menu is not implemented yet",
+            entries.join("/")
+        ));
+        entries
+    }
+
     /// Asks the app to exit (the window's close button).
     pub fn request_quit(&mut self) {
         self.quit = true;
@@ -324,6 +371,21 @@ impl App {
         let mut state = self.ui.state().clone();
         state.title_bar_focused = self.focused;
         render_main_window(&state, self.skin.skin(), &self.layout)
+    }
+
+    /// Renders one frame of the equalizer window (S01 §3, S07).
+    ///
+    /// The equalizer has no time-driven parts, so no refresh is needed; the
+    /// focus variant follows the window's own focus flag, which the presenter
+    /// keeps via [`App::set_eq_focused`].
+    pub fn render_eq(&self) -> Image {
+        render_equalizer_window(self.eq.state(), self.skin.skin(), &self.eq_layout)
+    }
+
+    /// Records the equalizer window's focus state (S01 §3: the focused title
+    /// bar is the window's active render).
+    pub fn set_eq_focused(&mut self, focused: bool) {
+        self.eq.set_focused(focused);
     }
 
     /// Sends a command into the command channel and processes it immediately.
@@ -390,6 +452,12 @@ impl App {
         }
         if !from_ui {
             self.ui.handle_command(command, self.now_ms());
+        }
+        // S05 §2.1: the double-size flag reaches the equalizer, so the EQ
+        // machine mirrors the main window's flag (its size follows from
+        // `eq_frame_size`; shading the main never resizes it, S05 §3.2).
+        if matches!(command, Command::ToggleDoubleSize) {
+            self.eq.set_double_size(self.ui.state().double_size);
         }
     }
 
@@ -617,6 +685,56 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Equalizer-window input (the EQ window forwards OS input here)
+    // -----------------------------------------------------------------------
+
+    /// A left-button press at equalizer-window-relative `(x, y)`.
+    pub fn eq_mouse_down(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+        let commands = self.eq.mouse_down(x, y);
+        self.forward_eq(&commands)?;
+        Ok(commands)
+    }
+
+    /// A pointer move over the equalizer window (drag).
+    pub fn eq_mouse_move(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+        let commands = self.eq.mouse_move(x, y);
+        self.forward_eq(&commands)?;
+        Ok(commands)
+    }
+
+    /// A left-button release at equalizer-window-relative `(x, y)`.
+    pub fn eq_mouse_up(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+        let commands = self.eq.mouse_up(x, y);
+        self.forward_eq(&commands)?;
+        Ok(commands)
+    }
+
+    /// A key press while the equalizer window is focused (S03 §3 via S07 §1:
+    /// `N`/`A` toggles, `S` opens the presets menu; band/preamp steps are
+    /// open per S07 §9 and stay unwired).
+    pub fn eq_key_down(&mut self, key: Key, modifiers: Modifiers) -> Result<Vec<Command>> {
+        let commands = self.eq.key_down(key, modifiers);
+        self.forward_eq(&commands)?;
+        Ok(commands)
+    }
+
+    /// Sends equalizer-produced commands into the channel and processes them.
+    ///
+    /// The equalizer machine has already applied its S07 prediction, so these
+    /// go straight to the engine and the app (no second prediction) — the
+    /// same shape as [`App::forward`]. A pending presets-menu request is
+    /// recorded through the dialog-stub path, which opens no window.
+    fn forward_eq(&mut self, commands: &[Command]) -> Result<()> {
+        for command in commands {
+            self.apply_from(command, true);
+        }
+        if let Some(request) = self.eq.take_menu_request() {
+            self.request_eq_presets_menu(request);
+        }
+        self.pump()
+    }
+
+    // -----------------------------------------------------------------------
     // Headless playback (the `--null` mode)
     // -----------------------------------------------------------------------
 
@@ -790,6 +908,14 @@ impl App {
                 // The UI machine has already applied its S02 prediction; the
                 // presenter reads the new size from `frame_size`.
             }
+            C::ToggleWindow(WindowId::Equalizer) => {
+                self.note(
+                    "Equalizer window toggled (the render state drives the OS window); \
+                     the presets submenu contents and load/save semantics are not \
+                     implemented yet (S07 §12 O12, S04)"
+                        .to_string(),
+                );
+            }
             C::ToggleWindow(window) => {
                 self.note(format!(
                     "{window:?} window is not implemented yet (the toggle is applied to the \
@@ -806,7 +932,11 @@ impl App {
             }
             C::AddItems { items, at, play } => self.add_items(items, *at, *play),
             C::SetBand { .. } | C::SetPreamp(_) | C::SetEqEnabled(_) | C::SetEqAuto(_) => {
-                self.note("the equalizer is not implemented yet (S07/M2)".to_string());
+                self.note(
+                    "the equalizer engine stage is not implemented yet (S07/M2; the window \
+                     prediction stands)"
+                        .to_string(),
+                );
             }
             C::Remove(_)
             | C::Clear
@@ -1409,5 +1539,95 @@ mod tests {
         assert!(!app.host_attached());
         app.stop_host();
         assert!(!app.host_attached());
+    }
+
+    // ----- the equalizer window (S07; headless, no window opened) -----
+
+    #[test]
+    fn rendering_the_equalizer_produces_a_frame_of_the_layout_size() {
+        let (app, _dir) = app_with_file(None);
+        let image = app.render_eq();
+        assert_eq!(
+            (image.width(), image.height()),
+            (
+                rustamp_ui::EQUALIZER_WINDOW_SIZE.0,
+                rustamp_ui::EQUALIZER_WINDOW_SIZE.1
+            )
+        );
+        assert_eq!((image.width(), image.height()), app.eq_frame_size());
+        assert!(
+            image
+                .as_rgba()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] != 0),
+            "the frame is empty"
+        );
+    }
+
+    #[test]
+    fn clicking_on_in_the_eq_window_toggles_the_engine_note_and_the_state() {
+        let (mut app, _dir) = app_with_file(None);
+        assert!(app.eq_state().enabled);
+        // On held rect (14,18,25,12): press arms, release inside toggles.
+        assert!(app.eq_mouse_down(20, 24).unwrap().is_empty());
+        let commands = app.eq_mouse_up(20, 24).unwrap();
+        assert_eq!(commands, vec![Command::SetEqEnabled(false)]);
+        assert!(!app.eq_state().enabled);
+        // The engine stage is M2 future work, so the command is noted, and
+        // the app keeps running.
+        let notes = app.drain_notes();
+        assert!(notes.iter().any(|n| n.contains("equalizer")), "{notes:?}");
+        assert!(!app.quit());
+    }
+
+    #[test]
+    fn presets_in_the_eq_window_records_the_menu_request_and_opens_nothing() {
+        // S07 §4.2: the spec fixes the popup (class, size, Load/Save/Delete)
+        // and nothing beyond it, so the app records the request and opens no
+        // window.
+        let (mut app, _dir) = app_with_file(None);
+        assert!(app.eq_mouse_down(239, 24).unwrap().is_empty());
+        assert!(app.eq_mouse_up(239, 24).unwrap().is_empty());
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|n| n.contains("Load/Save/Delete")),
+            "{notes:?}"
+        );
+        assert_eq!(
+            app.request_eq_presets_menu(rustamp_ui::EqMenuRequest::Presets),
+            &["Load", "Save", "Delete"]
+        );
+    }
+
+    #[test]
+    fn double_size_reaches_the_equalizer_window() {
+        // S05 §2.1: the flag resizes the equalizer to 550 x 232.
+        let (mut app, _dir) = app_with_file(None);
+        assert_eq!(app.eq_frame_size(), (275, 116));
+        app.submit(Command::ToggleDoubleSize).unwrap();
+        assert_eq!(app.eq_frame_size(), (550, 232));
+        assert_eq!(
+            app.eq_frame_size(),
+            (
+                rustamp_ui::DOUBLE_EQUALIZER_SIZE.0,
+                rustamp_ui::DOUBLE_EQUALIZER_SIZE.1
+            )
+        );
+        app.submit(Command::ToggleDoubleSize).unwrap();
+        assert_eq!(app.eq_frame_size(), (275, 116));
+    }
+
+    #[test]
+    fn toggling_the_equalizer_window_is_noted_and_flips_the_flag() {
+        let (mut app, _dir) = app_with_file(None);
+        assert!(!app.eq_open());
+        app.submit(Command::ToggleWindow(WindowId::Equalizer))
+            .unwrap();
+        assert!(app.eq_open());
+        let notes = app.drain_notes();
+        assert!(notes.iter().any(|n| n.contains("Equalizer")), "{notes:?}");
+        assert!(!app.quit(), "toggling the EQ window must not quit the app");
     }
 }

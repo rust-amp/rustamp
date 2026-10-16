@@ -34,6 +34,8 @@
 
 pub mod behaviour;
 pub mod docking;
+pub mod eq_render;
+pub mod equalizer;
 // Compatibility entry points for the same module under other common names.
 pub use docking as geometry;
 pub use docking as windows;
@@ -55,6 +57,17 @@ pub use docking::{
     PLAYLIST_UNCHANGED_SIZE, Point, Position, SHADE_REFLOW_PX, SHADED_MAIN_SIZE, SNAP_TOLERANCE_PX,
     WindowKind, WindowPosition, WindowSize, bottom_edge, equalizer_top, move_test_positions,
     neighbour_tracks, playlist_top, snap_candidate, snap_edge, snap_within, window_size,
+};
+pub use eq_render::{eq_frame_size, render_equalizer_window};
+pub use equalizer::{
+    BALANCE_CENTRE_LEFT, BALANCE_LEFT_EXTREME, BALANCE_RIGHT_EXTREME, BALANCE_THUMB_WIDTH,
+    BALANCE_TRACK_LEFT, BALANCE_TRACK_WIDTH, BAND_COUNT, BAND_PITCH, BAND_X0,
+    EQUALIZER_WINDOW_SIZE, EqMenuRequest, EqSlider, EqWidget, EqualizerLayout, EqualizerState,
+    EqualizerWindow, FLAT_VALUE, MAX_VALUE, PREAMP_X, PRESETS_MENU_ENTRIES,
+    PRESETS_POPUP_CLIENT_SIZE, PRESETS_POPUP_WINDOW_SIZE, THUMB_BOTTOM_Y, THUMB_FLAT_Y, THUMB_SIZE,
+    THUMB_TOP_Y, VOLUME_THUMB_WIDTH, VOLUME_TRAVEL_LEFT, VOLUME_TRAVEL_RIGHT,
+    balance_hint_for_thumb, hit_test as eq_hit_test, saved_to_gain_db, thumb_y_for_value,
+    value_for_thumb_y, volume_core_from_click, volume_display_percent,
 };
 pub use layout::{
     DOUBLE_HEIGHT, DOUBLE_WIDTH, MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH,
