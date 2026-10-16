@@ -74,13 +74,17 @@
 //!   card"). This lane therefore establishes the first spawn/supervision
 //!   pattern in the tree; media-host supervision should reuse
 //!   [`HostBackend`]/[`Supervisor`] rather than invent a second one.
-//! * **F2 — the handshake now exists on both ends.** The host speaks it from
-//!   `rustamp-plughost/src/control.rs` (one startup `Hello`, one same-token
-//!   `Pong` per `Ping`, clean exit on close) and the app reads it here: the
-//!   link greets and probes from [`HostStateLink::poll`](crate::host::HostStateLink::poll),
-//!   and a missed `Pong` detaches exactly like a dead child. What is still
-//!   open is the non-blocking send: a live-but-not-reading host can fill the
-//!   pipe and stall a send until liveness detaches it (finding F3 in
+//! * **F2 — the handshake now exists on both ends, and the send cannot
+//!   stall.** The host speaks it from `rustamp-plughost/src/control.rs`
+//!   (one startup `Hello`, one same-token `Pong` per `Ping`, clean exit on
+//!   close) and the app reads it here: the link greets and probes from
+//!   [`HostStateLink::poll`](crate::host::HostStateLink::poll), a missed
+//!   `Pong` detaches exactly like a dead child, and a foreign `Hello`
+//!   detaches for replacement (finding F2 in [`crate::host`]). Publishing
+//!   cannot stall the pump either: the link's `send` hands to the bounded
+//!   writer-thread queue below and never touches a blocking pipe, so a
+//!   live-but-not-reading host fills the queue and detaches within the
+//!   liveness timeout instead of stalling a write (finding F3 in
 //!   [`crate::host`]).
 //! * **F3 — restart policy.** A dead host is retried forever, gated only by
 //!   the cooldown. Give-up/backoff policy is undecided by the RFCs and is
@@ -88,7 +92,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -274,23 +278,74 @@ fn spawn_host_reader(transport: impl Transport + 'static) -> mpsc::Receiver<Mess
     handover
 }
 
-/// The app's end of a real host child: the stdin write half plus the reader
-/// thread's handover for the stdout read half.
+/// How many outbound frames the writer thread queues for a slow host (see
+/// [`spawn_host_writer`]).
 ///
-/// Splitting is what keeps the pump non-blocking: the link sends
-/// (`PlayerStateUpdate`, `Hello`, `Ping`) on the app thread through `writer`,
-/// while [`spawn_host_reader`] blocks in `recv` on its own thread and hands
-/// inbound frames (`Hello`, `Pong`) to [`Transport::try_recv`] here. `recv`
-/// exists only for [`Transport`] completeness — the app side never calls it;
-/// it would block the caller on the handover.
+/// A pump step queues at most two small frames (one `Hello`/`Ping` from the
+/// link's poll, one `PlayerStateUpdate` from its publish), and a live host
+/// drains them at pipe speed — so a full queue means the host stopped
+/// reading, and the next `send` detaches rather than stalls. Sixteen frames
+/// bound the handover to a few kilobytes while absorbing any same-step
+/// burst.
+const HOST_SEND_QUEUE: usize = 16;
+
+/// Run one host's stdin to the end, sending whatever the app thread queues.
+///
+/// This is the writer-thread half of the app side, mirroring
+/// [`spawn_host_reader`]: blocking pipe writes cannot run on the pump, so
+/// they run here — off the audio path — while the app thread keeps only the
+/// [`mpsc::SyncSender`] handover and queues through a non-blocking
+/// `try_send` (see `ProcessLink`). The thread exits when the link drops the
+/// handover or when a write fails (the pipe broke); either way the link has
+/// already detached or detaches on the next failed `send`, so the supervisor
+/// replaces the host. A blocked writer (a host that stopped reading) stays
+/// parked until its child is reaped — killing the child closes the pipe and
+/// unblocks the write — exactly like a blocked reader. Even spawning the
+/// thread cannot fail the supervisor: if it cannot be spawned the handover
+/// is already disconnected, which reads as a dead host.
+fn spawn_host_writer(writer: impl Transport + 'static) -> mpsc::SyncSender<Message> {
+    let (outbox, queue) = mpsc::sync_channel(HOST_SEND_QUEUE);
+    let _ = std::thread::Builder::new()
+        .name("rustamp-host-writer".to_owned())
+        .spawn(move || {
+            let mut writer = writer;
+            for message in queue {
+                if writer.send(&message).is_err() {
+                    return;
+                }
+            }
+        });
+    outbox
+}
+
+/// The app's end of a real host child: a bounded handover to the writer
+/// thread for stdin plus the reader thread's handover for the stdout read
+/// half.
+///
+/// Splitting both directions is what keeps the pump non-blocking: the link
+/// queues (`PlayerStateUpdate`, `Hello`, `Ping`) through a `try_send` that
+/// never touches the pipe, while [`spawn_host_writer`] blocks in `send` on
+/// its own thread, and inbound frames (`Hello`, `Pong`) arrive through
+/// [`spawn_host_reader`] the same way (see
+/// [`HostStateLink::poll`](crate::host::HostStateLink::poll)). A full outbox
+/// means the host stopped reading: `send` reports [`IpcError::WouldBlock`] —
+/// which the link turns into a detach like any failed send — instead of
+/// stalling the player. `recv` exists only for [`Transport`] completeness —
+/// the app side never calls it; it would block the caller on the handover.
 pub struct ProcessLink {
-    writer: StreamTransport<io::Empty, ChildStdin>,
+    outbox: mpsc::SyncSender<Message>,
     events: mpsc::Receiver<Message>,
 }
 
 impl Transport for ProcessLink {
     fn send(&mut self, msg: &Message) -> Result<(), IpcError> {
-        self.writer.send(msg)
+        // Never blocks: `try_send` queues at most one small frame, and a
+        // full queue is a stalled host, not a reason to stall the player.
+        match self.outbox.try_send(msg.clone()) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(IpcError::WouldBlock),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(IpcError::Closed),
+        }
     }
     fn recv(&mut self) -> Result<Message, IpcError> {
         self.events.recv().map_err(|_| IpcError::Closed)
@@ -354,12 +409,13 @@ impl HostBackend for ProcessBackend {
         let mut child = command.spawn()?;
         match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => {
-                // The read half moves to the reader thread; the link keeps
-                // the write half and polls the handover (see `ProcessLink`).
+                // Both halves move to background threads; the link keeps
+                // only non-blocking handovers (see `ProcessLink`).
                 let reader = StreamTransport::new(stdout, io::sink());
                 let events = spawn_host_reader(reader);
                 let writer = StreamTransport::new(io::empty(), stdin);
-                Ok((ProcessLink { writer, events }, ChildHost { child }))
+                let outbox = spawn_host_writer(writer);
+                Ok((ProcessLink { outbox, events }, ChildHost { child }))
             }
             _ => {
                 let _ = child.kill();
@@ -638,6 +694,77 @@ mod tests {
             link.publish(&PlayerState::default()),
             crate::host::PublishOutcome::Detached
         );
+    }
+
+    /// A writer-side transport whose `send` parks until released: stands in
+    /// for a pipe whose reader stopped (a full kernel buffer that never
+    /// drains).
+    struct GatedWriter {
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Transport for GatedWriter {
+        fn send(&mut self, _msg: &Message) -> Result<(), IpcError> {
+            self.release.recv().map_err(|_| IpcError::Closed)?;
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Message, IpcError> {
+            Err(IpcError::Closed)
+        }
+    }
+
+    /// The writer thread owns the blocking handle, so the link's `send`
+    /// stays non-blocking even against a host that stopped reading.
+    #[test]
+    fn a_stalled_host_fills_the_outbox_without_stalling_the_send() {
+        let (release, gate) = mpsc::channel();
+        let outbox = spawn_host_writer(GatedWriter { release: gate });
+        // The inbound half is not under test; keep its sender alive so the
+        // handover reads as empty rather than closed.
+        let (_stray, events) = mpsc::channel();
+        let mut link = ProcessLink { outbox, events };
+
+        // The writer takes the first frame and parks in it forever, so the
+        // queue holds everything after: the first `HOST_SEND_QUEUE` sends
+        // always fit (at most one was taken), and every send returns — a
+        // blocking `send` would hang this test instead.
+        for _ in 0..HOST_SEND_QUEUE {
+            link.send(&Message::Ping(1)).expect("the queue has room");
+        }
+        // One filler covers the race where the writer already took the first
+        // frame: after this the queue is full either way (the writer never
+        // drains), so every further send reports it instead of blocking.
+        drop(link.send(&Message::Ping(1)));
+        // Past the queue's capacity the handover is full and stays full
+        // (the writer never drains), so the send reports it instead of
+        // blocking — and the link turns that into a detach like any failed
+        // send.
+        for _ in 0..HOST_SEND_QUEUE {
+            assert!(matches!(
+                link.send(&Message::Ping(1)),
+                Err(IpcError::WouldBlock)
+            ));
+        }
+        // Release the parked writer so its thread exits cleanly.
+        drop(release);
+        drop(link);
+    }
+
+    #[test]
+    fn the_writer_thread_forwards_in_order() {
+        let (writer_end, mut peer) = MemoryTransport::pair();
+        let outbox = spawn_host_writer(writer_end);
+        let (_stray, events) = mpsc::channel();
+        let mut link = ProcessLink { outbox, events };
+        link.send(&Message::Ping(1)).unwrap();
+        link.send(&Message::Ping(2)).unwrap();
+        link.send(&Message::hello()).unwrap();
+        // The peer blocks in `recv` until the writer delivers; order is the
+        // queue's FIFO, so the host sees `Hello` before `Ping` before state,
+        // exactly as with a direct write.
+        assert_eq!(peer.recv().unwrap(), Message::Ping(1));
+        assert_eq!(peer.recv().unwrap(), Message::Ping(2));
+        assert!(matches!(peer.recv().unwrap(), Message::Hello { .. }));
     }
 
     #[test]

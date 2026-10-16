@@ -561,9 +561,9 @@ impl App {
     ///
     /// Best-effort by contract like [`publish_host_state`](App::publish_host_state):
     /// [`App::pump`] calls it before publishing and ignores the outcome. A
-    /// missed `Pong` or a dead channel detaches the link here, so the publish
-    /// right after degrades to detached and the supervisor replaces the host
-    /// on its next step.
+    /// missed `Pong`, a foreign `Hello` or a dead channel detaches the link
+    /// here, so the publish right after degrades to detached and the
+    /// supervisor replaces the host on its next step.
     pub fn poll_host(&mut self) -> PollOutcome {
         self.host.poll()
     }

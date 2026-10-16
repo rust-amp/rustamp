@@ -130,21 +130,30 @@
 //!
 //! # Findings (decisions the specs and RFCs do not make)
 //!
-//! * **F2 — a foreign greeting is noticed, not rejected.**
+//! * **F2 — a foreign greeting is rejected (decided).**
 //!   [`poll`](HostStateLink::poll) records the host's version and pid
-//!   ([`HostStateLink::greeting`]), and
-//!   [`version_mismatch`](HostStateLink::version_mismatch) reports a version
-//!   we do not speak — but the link stays attached. RFC 0006 §10 demands a
-//!   clean `Hello`-rejection test for the media hosts, yet sets no rejection
-//!   rule for the plugin host; refusing to run against a mismatched helper is
-//!   engine policy for a later card, not something this lane invents.
-//! * **F3 — a non-reading host is detected, not pre-empted.** A host that
-//!   stops reading fills the pipe's kernel buffer and a `send` into it can
-//!   block; bounding that stall needs OS-specific non-blocking writes, which
-//!   `std` does not offer. Liveness bounds the damage instead — a host that
-//!   stopped reading also stops answering `Ping`, so the link detaches at
-//!   most [`PONG_TIMEOUT`] after the last answer and the supervisor replaces
-//!   it. A truly non-blocking send belongs to the M3 control-pipe card.
+//!   ([`HostStateLink::greeting`]), and a greeting we do not speak
+//!   ([`version_mismatch`](HostStateLink::version_mismatch)) detaches the
+//!   link with [`PollOutcome::VersionMismatch`] — before our own greeting
+//!   or any probe goes out — so the supervisor replaces the host. RFC 0006
+//!   §8 puts the `Hello`/`Ping` liveness on the engine and turns a bad
+//!   handshake into a failure (never a stall), and §10 demands a clean
+//!   `Hello`-rejection test: running against a mismatched helper risks
+//!   mis-decoded frames in both directions, so replacing it is the safe
+//!   failure, not an invented policy. A persistently foreign binary
+//!   therefore respawns on the cooldown — the same retry-forever policy as
+//!   any dead host (see F3 in [`crate::supervise`]).
+//! * **F3 — a non-reading host cannot stall the pump (bounded).** The pump
+//!   never touches a blocking write handle: [`MemoryTransport`](rustamp_ipc::MemoryTransport)
+//!   queues in memory, and the production pipe is split — the link keeps a
+//!   bounded handover to a writer thread that owns the pipe's write half
+//!   (see [`crate::supervise`]), mirroring the reader thread. A `send`
+//!   therefore either queues or reports a full queue, never blocks; a full
+//!   queue detaches like any failed send, and liveness replaces the host
+//!   within [`PONG_TIMEOUT`]. A truly non-blocking OS write is impossible
+//!   with `std` alone on the host platform (`ChildStdin` offers no
+//!   non-blocking mode; overlapped I/O would need new dependencies), so the
+//!   handover — not a syscall flag — is the bound.
 
 use std::time::{Duration, Instant};
 
@@ -197,6 +206,10 @@ pub enum PollOutcome {
     /// missed-`Pong` failure. The link detached itself; the supervisor
     /// replaces the host.
     MissedPong,
+    /// The host greeted with a foreign protocol version: the RFC 0006 §8 bad
+    /// handshake. The link detached itself before greeting or probing; the
+    /// supervisor replaces the host (finding F2 in the module docs).
+    VersionMismatch,
 }
 
 /// The host's startup [`Message::Hello`], as recorded by
@@ -210,10 +223,10 @@ pub struct HostGreeting {
 }
 
 impl HostGreeting {
-    /// Whether the host speaks our protocol version. A mismatch is recorded
-    /// and reported (see [`HostStateLink::version_mismatch`]) but never acted
-    /// on here: rejecting a peer is a decision the RFC does not make
-    /// (finding F2 in the module docs).
+    /// Whether the host speaks our protocol version. A mismatch detaches
+    /// the link in [`poll_at`](HostStateLink::poll_at): running against a
+    /// helper we cannot decode is the RFC 0006 §8 bad handshake, not a
+    /// warning (finding F2 in the module docs).
     pub fn is_supported(&self) -> bool {
         self.protocol_version == PROTOCOL_VERSION
     }
@@ -248,8 +261,8 @@ pub enum PublishOutcome {
 /// (see [`poll`](HostStateLink::poll)).
 ///
 /// A detached link (the initial state, and the state after
-/// [`PublishOutcome::HostGone`], [`PollOutcome::HostGone`] or
-/// [`PollOutcome::MissedPong`]) makes [`publish`](HostStateLink::publish) a
+/// [`PublishOutcome::HostGone`], [`PollOutcome::HostGone`],
+/// [`PollOutcome::MissedPong`] or [`PollOutcome::VersionMismatch`]) makes [`publish`](HostStateLink::publish) a
 /// no-op, so the player runs identically with and without a host.
 pub struct HostStateLink {
     transport: Option<Box<dyn Transport>>,
@@ -286,6 +299,11 @@ impl HostStateLink {
     /// Attaching forgets the last sent snapshot, so the next
     /// [`publish`](HostStateLink::publish) sends unconditionally and the host
     /// starts from the real state rather than from a stale one.
+    ///
+    /// The pump calls `send` on this transport, so attach a handover-backed
+    /// one ([`MemoryTransport`](rustamp_ipc::MemoryTransport), or the
+    /// supervisor's split pipe link): a raw blocking pipe would stall
+    /// `publish` on a stalled host (finding F3 in the module docs).
     pub fn attach(&mut self, transport: impl Transport + 'static) {
         self.transport = Some(Box::new(transport));
         self.last_sent = None;
@@ -323,9 +341,11 @@ impl HostStateLink {
         self.greeting
     }
 
-    /// Whether the recorded greeting speaks a foreign protocol version. This
-    /// is noticed, never acted on: the link stays attached (see finding F2 in
-    /// the module docs).
+    /// Whether the recorded greeting speaks a foreign protocol version.
+    /// [`poll_at`](HostStateLink::poll_at) detaches on this with
+    /// [`PollOutcome::VersionMismatch`] (see finding F2 in the module docs);
+    /// detaching forgets the greeting, so this reads `false` again
+    /// afterwards.
     pub fn version_mismatch(&self) -> bool {
         self.greeting
             .is_some_and(|greeting| !greeting.is_supported())
@@ -375,6 +395,13 @@ impl HostStateLink {
                     return PollOutcome::HostGone;
                 }
             }
+        }
+        // A foreign greeting is the RFC 0006 §8 bad handshake (finding F2):
+        // detach before greeting or probing, so the supervisor replaces a
+        // host neither side can trust instead of running against it.
+        if self.version_mismatch() {
+            self.detach();
+            return PollOutcome::VersionMismatch;
         }
         // A probe that outlived its deadline is the RFC 0006 §8 failure: the
         // host stopped answering. Detach so the supervisor replaces it.
@@ -456,7 +483,10 @@ impl HostStateLink {
     ///
     /// Never blocks the player: with no host it returns
     /// [`PublishOutcome::Detached`], and a failed send detaches the link and
-    /// returns [`PublishOutcome::HostGone`] instead of an error.
+    /// returns [`PublishOutcome::HostGone`] instead of an error. "Never
+    /// blocks" holds through a handover-backed transport (see
+    /// [`attach`](HostStateLink::attach)): the send either queues or fails,
+    /// so a stalled host costs a detach, never a stall.
     pub fn publish(&mut self, state: &PlayerState) -> PublishOutcome {
         let Some(transport) = self.transport.as_mut() else {
             return PublishOutcome::Detached;
@@ -799,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn a_foreign_greeting_version_is_noticed_not_ignored() {
+    fn a_foreign_greeting_version_detaches_for_replacement() {
         use rustamp_ipc::MemoryTransport;
 
         let (app_end, mut host_end) = MemoryTransport::pair();
@@ -812,17 +842,26 @@ mod tests {
             })
             .unwrap();
 
-        // Noticed...
-        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Healthy);
-        let greeting = link.greeting().expect("the Hello is consumed");
-        assert_eq!(greeting.protocol_version, PROTOCOL_VERSION + 1000);
-        assert_eq!(greeting.pid, 7);
-        assert!(!greeting.is_supported());
-        assert!(link.version_mismatch());
-        // ...but not acted on: rejecting a mismatched helper is undecided
-        // engine policy (finding F2), so the link stays attached.
-        assert!(link.is_attached());
-        assert!(matches!(host_end.recv().unwrap(), Message::Hello { .. }));
+        // A foreign version is the RFC 0006 §8 bad handshake (finding F2):
+        // the link detaches so the supervisor replaces the host instead of
+        // running against frames neither side can trust.
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::VersionMismatch);
+        assert!(!link.is_attached());
+        // Detaching forgets the handshake, so the report reads clean and the
+        // next step is the ordinary no-host path.
+        assert!(link.greeting().is_none());
+        assert!(!link.version_mismatch());
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Detached);
+        // Nothing went out to the rejected peer: the drain runs before the
+        // greeting, so not even our own `Hello` was sent. After `detach`
+        // the peer's write end is gone, so the read may legitimately report
+        // the closed end rather than an empty queue — but it must never
+        // yield a message.
+        match host_end.try_recv() {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("a rejected host must not be greeted"),
+            Err(_) => {} // the peer end was dropped by `detach`, which is the point
+        }
     }
 
     #[test]

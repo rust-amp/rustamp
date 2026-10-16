@@ -27,6 +27,10 @@ pub enum IpcError {
     /// non-blocking read. A [`StreamTransport`] over blocking stdio always
     /// reports this; its read half belongs to a reader thread that blocks in
     /// [`Transport::recv`] instead (see [`StreamTransport`]).
+    ///
+    /// The same variant reports a non-blocking send whose bounded queue is
+    /// full (see `rustamp-app/src/supervise.rs`): the peer stopped reading,
+    /// and the sender must detach rather than stall.
     #[error("no message available")]
     WouldBlock,
 }
