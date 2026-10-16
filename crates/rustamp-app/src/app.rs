@@ -328,12 +328,18 @@ impl App {
     /// Asks the app to open one of the playlist window's dialogs (S06 §4).
     ///
     /// The spec settles the dialogs' existence and titles and fixes no dialog
-    /// behaviour beyond that, so this records the spec'd title through the
-    /// existing dialog-stub path and opens no window: dialog internals are
-    /// intentionally not implemented here. Returns the title the real dialog
-    /// must carry.
+    /// behaviour beyond that. When the dialog's opening command maps to a real
+    /// dialog ([`App::open_dialog_for`]), the dialog opens and no note is
+    /// recorded; otherwise the spec'd title goes through the existing
+    /// dialog-stub path and opens no window. Returns the title the real
+    /// dialog must carry.
     pub fn request_playlist_dialog(&mut self, dialog: PlaylistDialog) -> &'static str {
         let title = dialog.title();
+        if let Some(command) = dialog.opening_command()
+            && self.open_dialog_for(&command).is_some()
+        {
+            return title;
+        }
         self.note(format!(
             "open dialog \"{title}\" ({dialog:?}): the dialog is not implemented yet"
         ));
@@ -961,7 +967,11 @@ impl App {
                     "the playlist model is not wired to the app yet (S06/S14/S15)".to_string(),
                 );
             }
-            C::OpenAbout | C::OpenFileInfo | C::OpenJump { .. } => {
+            C::OpenAbout
+            | C::OpenFileInfo
+            | C::OpenJump { .. }
+            | C::OpenPlaylist
+            | C::OpenSkinBrowser => {
                 // Simple modal dialogs (`dialogs.rs`): the app opens a real
                 // window for these, so no note is recorded.
                 self.open_dialog_for(command);
@@ -969,11 +979,9 @@ impl App {
             C::OpenPrefs
             | C::OpenPrefsPage(_)
             | C::OpenMedia { .. }
-            | C::OpenSkinBrowser
             | C::OpenBookmarkEditor
             | C::AddBookmark
-            | C::OpenMainMenu
-            | C::OpenPlaylist => {
+            | C::OpenMainMenu => {
                 self.note(format!(
                     "{command:?} needs a dialog that is not implemented yet"
                 ));
@@ -1003,6 +1011,18 @@ impl App {
                 .map(PathBuf::from)
         };
         self.skin = loaded;
+        self.publish_skin();
+    }
+
+    /// Loads the built-in default skin (the skin browser's built-in row).
+    ///
+    /// The same tail as [`load_skin`](App::load_skin) without a path: the
+    /// built-in skin always loads, so there is no fallback and the current
+    /// skin becomes "no path", which [`RefreshSkin`](Command::RefreshSkin)
+    /// already reads that way.
+    pub(crate) fn load_builtin_skin(&mut self) {
+        self.skin = crate::skin::builtin();
+        self.current_skin = None;
         self.publish_skin();
     }
 
@@ -1498,9 +1518,11 @@ mod tests {
     }
 
     #[test]
-    fn playlist_dialog_requests_carry_the_spec_titles_and_open_no_window() {
+    fn playlist_dialog_requests_carry_the_spec_titles() {
         // S06 §4: the spec fixes the dialog titles and no dialog behaviour
-        // beyond that, so the app records the request and opens nothing.
+        // beyond that. ADD still records its title through the dialog-stub
+        // path; LIST OPTS opens the real load-playlist dialog (RFC 0010), so
+        // only ADD leaves a note.
         let (mut app, _dir) = app_with_file(None);
         assert_eq!(
             app.request_playlist_dialog(PlaylistDialog::AddFiles),
@@ -1510,25 +1532,22 @@ mod tests {
             app.request_playlist_dialog(PlaylistDialog::LoadPlaylist),
             "Load Playlist"
         );
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::LoadPlaylist));
         let notes = app.drain_notes();
-        assert_eq!(notes.len(), 2);
+        assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("Add file(s) to playlist"), "{notes:?}");
-        assert!(notes[1].contains("Load Playlist"), "{notes:?}");
     }
 
     #[test]
-    fn open_playlist_is_an_app_owned_dialog_request_that_opens_no_window() {
+    fn open_playlist_is_an_app_owned_command_that_opens_its_dialog() {
         // RFC 0010: LIST OPTS opens the `Load Playlist` dialog (S06 §4). The
-        // spec fixes the title only, so the app records the request through
-        // the dialog-stub path and implements no dialog behaviour.
+        // spec fixes the title only, so the app opens the real window and
+        // implements no dialog behaviour beyond it — in particular no note.
         let (mut app, _dir) = app_with_file(None);
         assert!(crate::routing::app_owns(&Command::OpenPlaylist));
         app.submit(Command::OpenPlaylist).unwrap();
-        let notes = app.drain_notes();
-        assert!(
-            notes.iter().any(|n| n.contains("OpenPlaylist")),
-            "{notes:?}"
-        );
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::LoadPlaylist));
+        assert!(app.drain_notes().is_empty());
         assert!(!app.quit(), "a dialog request must not quit the app");
     }
 
@@ -1647,8 +1666,8 @@ mod tests {
     // ----- the simple modal dialogs (About, file info, jump-to) -----
 
     #[test]
-    fn about_file_info_and_jump_open_real_dialogs_with_no_note() {
-        // These three commands open a real window now (`dialogs.rs`), so no
+    fn the_implemented_dialogs_open_real_windows_with_no_note() {
+        // These five commands open a real window now (`dialogs.rs`), so no
         // "not implemented yet" note may be recorded for them.
         use rustamp_core::command::JumpTarget;
         use rustamp_ui::DialogKind;
@@ -1663,6 +1682,10 @@ mod tests {
         })
         .unwrap();
         assert!(app.dialog_is_open(DialogKind::Jump(JumpTarget::Time)));
+        app.submit(Command::OpenPlaylist).unwrap();
+        assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
+        app.submit(Command::OpenSkinBrowser).unwrap();
+        assert!(app.dialog_is_open(DialogKind::SkinBrowser));
         let notes = app.drain_notes();
         assert!(
             !notes.iter().any(|n| n.contains("not implemented yet")),
@@ -1672,19 +1695,15 @@ mod tests {
 
     #[test]
     fn the_remaining_dialog_commands_still_record_their_note() {
-        // Preferences, the media pickers, the skin browser, bookmarks, the
-        // main menu and the playlist loader stay unimplemented.
+        // Preferences and the main menu stay unimplemented (so do the media
+        // pickers and bookmarks, covered elsewhere); About, file info, jump,
+        // load playlist and the skin browser open real windows now.
         let (mut app, _dir) = app_with_file(None);
-        for command in [
-            Command::OpenPrefs,
-            Command::OpenSkinBrowser,
-            Command::OpenMainMenu,
-            Command::OpenPlaylist,
-        ] {
+        for command in [Command::OpenPrefs, Command::OpenMainMenu] {
             app.submit(command.clone()).unwrap();
         }
         let notes = app.drain_notes();
-        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(app.dialog_open_kind().is_none());
     }
 
@@ -1733,7 +1752,10 @@ mod tests {
 
     #[test]
     fn rendering_a_dialog_produces_a_frame_of_the_dialog_size() {
-        use rustamp_ui::{ABOUT_CLIENT_SIZE, DialogKind, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE};
+        use rustamp_ui::{
+            ABOUT_CLIENT_SIZE, DialogKind, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE,
+            LOAD_PLAYLIST_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE,
+        };
 
         let (app, _dir) = app_with_file(None);
         for (dialog, size) in [
@@ -1743,6 +1765,8 @@ mod tests {
                 DialogKind::Jump(rustamp_core::command::JumpTarget::Time),
                 JUMP_CLIENT_SIZE,
             ),
+            (DialogKind::LoadPlaylist, LOAD_PLAYLIST_CLIENT_SIZE),
+            (DialogKind::SkinBrowser, SKIN_BROWSER_CLIENT_SIZE),
         ] {
             let image = app.render_dialog(dialog);
             assert_eq!((image.width(), image.height()), size, "{dialog:?}");
@@ -1756,5 +1780,168 @@ mod tests {
                 "the {dialog:?} frame is empty"
             );
         }
+    }
+
+    #[test]
+    fn the_skin_browser_lists_what_the_app_can_load() {
+        // No skin search path exists in the project, so the browser lists the
+        // built-in default plus the current skin when it came from disk.
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenSkinBrowser).unwrap();
+        assert!(app.dialog_is_open(DialogKind::SkinBrowser));
+        let entries = app.browser_entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, None);
+
+        // An empty folder is a valid (if sparse) skin, so loading it makes it
+        // the current skin without any fallback involved.
+        let dir = tempfile::tempdir().unwrap();
+        app.submit(Command::LoadSkin(dir.path().to_owned()))
+            .unwrap();
+        assert_eq!(app.current_skin(), Some(&dir.path().to_owned()));
+        let entries = app.browser_entries();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[1].path, Some(dir.path().to_owned()));
+    }
+
+    #[test]
+    fn confirming_the_skin_browser_loads_the_pick_and_closes() {
+        use rustamp_ui::Key;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::LoadSkin(dir.path().to_owned()))
+            .unwrap();
+
+        // Down to the file row, Enter loads it through the existing skin
+        // path and closes the dialog.
+        app.submit(Command::OpenSkinBrowser).unwrap();
+        assert!(app.dialog_key(Key::Down));
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+        assert_eq!(app.current_skin(), Some(&dir.path().to_owned()));
+        assert!(
+            app.skin_description()
+                .contains(dir.path().to_str().unwrap()),
+            "{}",
+            app.skin_description()
+        );
+
+        // Enter on the built-in row loads the built-in default instead.
+        app.submit(Command::OpenSkinBrowser).unwrap();
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+        assert_eq!(app.current_skin(), None);
+        assert_eq!(app.skin_description(), "built-in default skin");
+    }
+
+    #[test]
+    fn leaving_the_skin_browser_loads_nothing() {
+        use rustamp_ui::{DialogKind, Key};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::LoadSkin(dir.path().to_owned()))
+            .unwrap();
+
+        // Escape closes without loading; the focused-window close does too,
+        // and neither quits the player.
+        app.submit(Command::OpenSkinBrowser).unwrap();
+        assert!(app.dialog_key(Key::Down));
+        assert!(app.dialog_key(Key::Escape));
+        assert_eq!(app.dialog_open_kind(), None);
+        assert_eq!(app.current_skin(), Some(&dir.path().to_owned()));
+
+        app.submit(Command::OpenSkinBrowser).unwrap();
+        assert!(app.dialog_is_open(DialogKind::SkinBrowser));
+        app.submit(Command::CloseFocusedWindow).unwrap();
+        assert_eq!(app.dialog_open_kind(), None);
+        assert!(!app.quit(), "closing a dialog must not quit the app");
+    }
+
+    #[test]
+    fn the_skin_browser_opens_from_the_menu_and_the_shortcut_path() {
+        // The main menu's skin-browser leaf and Alt+S (S03) both funnel
+        // through the shortcut dispatch into the same dialog.
+        use rustamp_ui::{DialogKind, Key, Modifiers, ShortcutAction};
+
+        let (mut app, _dir) = app_with_file(None);
+        let outcome = app
+            .activate_menu_item("Skin browser", ShortcutAction::SkinBrowser)
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::menu::MenuOutcome::Commands(ref commands)
+                    if commands == &[Command::OpenSkinBrowser]
+            ),
+            "{outcome:?}"
+        );
+        assert!(app.dialog_is_open(DialogKind::SkinBrowser));
+        app.submit(Command::CloseFocusedWindow).unwrap();
+
+        let outcome = app
+            .key_down(Key::letter('S').unwrap(), Modifiers::ALT)
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Some(rustamp_ui::ShortcutOutcome::Commands(ref commands))
+                    if commands == &[Command::OpenSkinBrowser]
+            ),
+            "{outcome:?}"
+        );
+        assert!(app.dialog_is_open(DialogKind::SkinBrowser));
+    }
+
+    #[test]
+    fn the_load_playlist_dialog_keeps_its_confirmation_open() {
+        // RFC 0010: no confirmation semantics. Enter is consumed and changes
+        // nothing; Escape closes; the focused-window close does too.
+        use rustamp_ui::{DialogKind, Key};
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenPlaylist).unwrap();
+        assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
+        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
+        assert!(app.drain_notes().is_empty());
+        assert!(app.dialog_key(Key::Escape));
+        assert_eq!(app.dialog_open_kind(), None);
+
+        app.submit(Command::OpenPlaylist).unwrap();
+        app.submit(Command::CloseFocusedWindow).unwrap();
+        assert_eq!(app.dialog_open_kind(), None);
+        assert!(!app.quit(), "closing a dialog must not quit the app");
+    }
+
+    /// Pins the OS window parameters the two new dialogs must carry (titles
+    /// and client sizes) for the run that does open them. **VM-only,
+    /// `#[ignore]`d by default, and gated on the test VM**: GUI must never
+    /// run on the host.
+    ///
+    /// ```text
+    /// cargo test -p rustamp-app -- --ignored dialogs
+    /// ```
+    #[ignore = "VM-only: pins dialog window parameters; run inside the headless test VM"]
+    #[test]
+    fn the_new_dialogs_pin_their_os_window_parameters() {
+        // The gate, before anything else. This test opens no window itself;
+        // it pins the parameters the presenter (`window.rs`) builds the real
+        // OS windows from.
+        crate::window::require_test_vm();
+        use rustamp_ui::{DialogKind, LOAD_PLAYLIST_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE};
+        assert_eq!(DialogKind::LoadPlaylist.title(), "Load Playlist");
+        assert_eq!(
+            DialogKind::LoadPlaylist.client_size(),
+            LOAD_PLAYLIST_CLIENT_SIZE
+        );
+        assert_eq!(DialogKind::SkinBrowser.title(), "Skin browser");
+        assert_eq!(
+            DialogKind::SkinBrowser.client_size(),
+            SKIN_BROWSER_CLIENT_SIZE
+        );
     }
 }

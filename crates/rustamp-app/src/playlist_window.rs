@@ -23,8 +23,9 @@
 //! * the title bar has no window-menu button (S06 §1), so a click at (6,3)
 //!   does nothing; Close/Shade record a note (hiding and shading the playlist
 //!   are open) and MISC records a note (the `#32768` popup's contents are a
-//!   visual reading, S06 §4); the ADD/LIST OPTS dialogs record their spec'd
-//!   titles through [`App::request_playlist_dialog`] and open no window.
+//!   visual reading, S06 §4); the ADD dialog records its spec'd title through
+//!   [`App::request_playlist_dialog`] and opens no window, while LIST OPTS
+//!   opens the real load-playlist dialog through the same call (RFC 0010).
 //!
 //! Placement: [`App::playlist_window_origin`] replays the main window's shade
 //! and double-size state through [`DockedStack`](rustamp_ui::DockedStack), so
@@ -323,8 +324,10 @@ mod tests {
     }
 
     #[test]
-    fn add_and_list_opts_emit_their_commands_and_record_their_titles() {
-        // S06 §4 (titles) + RFC 0010 (LIST OPTS maps to OpenPlaylist).
+    fn add_and_list_opts_emit_their_commands_with_their_titles() {
+        // S06 §4 (titles) + RFC 0010 (LIST OPTS maps to OpenPlaylist). ADD
+        // still records its title through the dialog-stub path; LIST OPTS
+        // opens the real load-playlist dialog, so only ADD leaves a note.
         let mut app = test_app();
         add_entries(&mut app, 3);
         let commands = app.playlist_mouse_down(24, 92).expect("ADD applies");
@@ -337,15 +340,10 @@ mod tests {
         );
         let commands = app.playlist_mouse_down(242, 92).expect("LIST OPTS applies");
         assert_eq!(commands, vec![Command::OpenPlaylist]);
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::LoadPlaylist));
         let notes = app.drain_notes();
-        assert!(
-            notes.iter().any(|n| n.contains("Add file(s) to playlist")),
-            "{notes:?}"
-        );
-        assert!(
-            notes.iter().any(|n| n.contains("Load Playlist")),
-            "{notes:?}"
-        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("Add file(s) to playlist"), "{notes:?}");
     }
 
     #[test]

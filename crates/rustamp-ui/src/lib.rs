@@ -59,7 +59,8 @@ pub use behaviour::{
 };
 pub use dialogs::{
     ABOUT_CLIENT_SIZE, DialogKind, DialogManager, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE,
-    MAX_JUMP_LEN, dialog_for_command, opening_command, parse_jump_time_ms, render_dialog,
+    LOAD_PLAYLIST_CLIENT_SIZE, MAX_JUMP_LEN, SKIN_BROWSER_CLIENT_SIZE, SkinEntry,
+    dialog_for_command, opening_command, parse_jump_time_ms, render_dialog, skin_entries,
 };
 pub use docking::{
     ClassicWindow, DEFAULT_EQUALIZER_POSITION, DEFAULT_MAIN_POSITION, DEFAULT_PLAYLIST_POSITION,

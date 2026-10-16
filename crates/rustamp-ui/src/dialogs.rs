@@ -1,5 +1,7 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! Simple modal dialogs: About, file info and jump-to (spec S03 actions).
+//! Simple modal dialogs: About, file info, jump-to (S03 actions), the
+//! load-playlist dialog (S06 §4 LIST OPTS, RFC 0010) and the skin browser
+//! (S03 id 40219, RFC 0005).
 //!
 //! [`DialogKind`] is the headless dialog model: which [`Command`] opens which
 //! dialog, each dialog's title and client size, and the open/close state. Like
@@ -11,15 +13,29 @@
 //! dialog geometry or contents — S04 is not started):
 //!
 //! * Titles, client sizes, colours and the exact body lines are **own
-//!   choices**, not reference facts. They stay fixed here so tests pin them.
+//!   choices**, not reference facts — except the load-playlist title, which
+//!   S06 §4 settles as `Load Playlist` (shared with the playlist model as
+//!   [`crate::playlist::LOAD_DIALOG_TITLE`]). They stay fixed here so tests
+//!   pin them.
 //! * Only one dialog is open at a time: opening a second one replaces the
 //!   first. The reference may stack them; that is open.
 //! * The jump box takes **digits only** (seconds): the [`Key`] model has no
 //!   colon key, so `m:ss` cannot be typed yet. [`parse_jump_time_ms`] still
 //!   accepts `m:ss` and `h:mm:ss` for programmatic input and for the day the
 //!   key model grows one.
+//! * The load-playlist dialog has **no file picker and no confirmation
+//!   command**: RFC 0010 leaves replace-versus-append (and the file filter)
+//!   open, so `Enter` is consumed and does nothing. The dialog opens, shows
+//!   its spec'd title, and closes.
+//! * The skin browser lists exactly the skins the app can load today — the
+//!   built-in default plus the current skin when it came from disk — because
+//!   the project has no skin search path (no skins-directory concept: the CLI
+//!   takes one `--skin` path, the config holds one `ui.skin` path).
+//!   Confirming a row loads it through the app's existing skin path.
 //! * Rendering uses the `text.bmp` bitmap font as a stand-in (the same choice
 //!   as the playlist rows; the reference's real dialog font is unknown).
+
+use std::path::{Path, PathBuf};
 
 use rustamp_core::command::{Command, JumpTarget};
 use rustamp_gfx::{BitmapFont, GlyphMap, Image};
@@ -36,16 +52,25 @@ pub enum DialogKind {
     FileInfo,
     /// A jump box (S03 "Jump to file/time", ids 40194/40193).
     Jump(JumpTarget),
+    /// The load-playlist dialog (S06 §4 LIST OPTS, RFC 0010
+    /// `Command::OpenPlaylist`).
+    LoadPlaylist,
+    /// The skin browser (S03 "Skin browser", id 40219, RFC 0005
+    /// `Command::OpenSkinBrowser`).
+    SkinBrowser,
 }
 
 impl DialogKind {
-    /// The window title. Own choice: no spec fixes dialog titles (S04 open).
+    /// The window title. Own choice, except the load-playlist title, which
+    /// S06 §4 settles (S04 open for the rest).
     pub const fn title(self) -> &'static str {
         match self {
             DialogKind::About => "About Rustamp",
             DialogKind::FileInfo => "File info",
             DialogKind::Jump(JumpTarget::File) => "Jump to file",
             DialogKind::Jump(JumpTarget::Time) => "Jump to time",
+            DialogKind::LoadPlaylist => crate::playlist::LOAD_DIALOG_TITLE,
+            DialogKind::SkinBrowser => "Skin browser",
         }
     }
 
@@ -56,6 +81,8 @@ impl DialogKind {
             DialogKind::About => ABOUT_CLIENT_SIZE,
             DialogKind::FileInfo => FILE_INFO_CLIENT_SIZE,
             DialogKind::Jump(_) => JUMP_CLIENT_SIZE,
+            DialogKind::LoadPlaylist => LOAD_PLAYLIST_CLIENT_SIZE,
+            DialogKind::SkinBrowser => SKIN_BROWSER_CLIENT_SIZE,
         }
     }
 }
@@ -66,17 +93,26 @@ pub const ABOUT_CLIENT_SIZE: (u32, u32) = (260, 110);
 pub const FILE_INFO_CLIENT_SIZE: (u32, u32) = (300, 140);
 /// Client size of either jump box. Own choice (see the module docs).
 pub const JUMP_CLIENT_SIZE: (u32, u32) = (220, 90);
+/// Client size of the load-playlist dialog. Own choice (see the module docs).
+pub const LOAD_PLAYLIST_CLIENT_SIZE: (u32, u32) = (300, 100);
+/// Client size of the skin browser. Own choice: room for the title strip plus
+/// the browser rows (built-in plus at most one file row, see
+/// [`skin_entries`]).
+pub const SKIN_BROWSER_CLIENT_SIZE: (u32, u32) = (300, 140);
 
 /// Which dialog `command` opens, when it opens one.
 ///
-/// Covers the three dialog commands the shortcuts already emit
-/// ([`crate::shortcuts`] maps the S03 keys to them); every other command
-/// opens nothing.
+/// Covers the dialog commands the shortcuts already emit
+/// ([`crate::shortcuts`] maps the S03 keys to them, and the playlist window's
+/// LIST OPTS button emits [`Command::OpenPlaylist`] via
+/// [`crate::playlist::PlaylistDialog`]); every other command opens nothing.
 pub fn dialog_for_command(command: &Command) -> Option<DialogKind> {
     match command {
         Command::OpenAbout => Some(DialogKind::About),
         Command::OpenFileInfo => Some(DialogKind::FileInfo),
         Command::OpenJump { target } => Some(DialogKind::Jump(*target)),
+        Command::OpenPlaylist => Some(DialogKind::LoadPlaylist),
+        Command::OpenSkinBrowser => Some(DialogKind::SkinBrowser),
         _ => None,
     }
 }
@@ -88,6 +124,8 @@ pub fn opening_command(dialog: DialogKind) -> Command {
         DialogKind::About => Command::OpenAbout,
         DialogKind::FileInfo => Command::OpenFileInfo,
         DialogKind::Jump(target) => Command::OpenJump { target },
+        DialogKind::LoadPlaylist => Command::OpenPlaylist,
+        DialogKind::SkinBrowser => Command::OpenSkinBrowser,
     }
 }
 
@@ -134,12 +172,46 @@ pub fn parse_jump_time_ms(input: &str) -> Option<u64> {
     Some(seconds.saturating_mul(1000))
 }
 
+/// One row of the skin browser: the skins the app can load today.
+///
+/// The project has no skin search path (no skins-directory concept: the CLI
+/// takes one `--skin` path, the config holds one `ui.skin` path), so the
+/// browser lists exactly what the app knows: the built-in default skin and,
+/// when the current skin came from disk, that file. `path` is `None` for the
+/// built-in row; confirming it loads the built-in default skin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkinEntry {
+    /// The row text. The built-in row reuses the loader's own description
+    /// (`built-in default skin`); a file row is the full path, losslessly, so
+    /// two skins with the same file name stay distinct.
+    pub name: String,
+    /// The skin file or folder, when the row came from disk.
+    pub path: Option<PathBuf>,
+}
+
+/// Builds the skin browser's rows: the built-in default first, then `current`
+/// when it came from disk. Pure function so the app and tests share it.
+pub fn skin_entries(current: Option<&Path>) -> Vec<SkinEntry> {
+    let mut entries = vec![SkinEntry {
+        name: "built-in default skin".to_string(),
+        path: None,
+    }];
+    if let Some(path) = current {
+        entries.push(SkinEntry {
+            name: path.display().to_string(),
+            path: Some(path.to_owned()),
+        });
+    }
+    entries
+}
+
 /// The headless dialog state: which dialog (if any) is open, plus the jump
-/// box's input text.
+/// box's input text and the skin browser's selected row.
 #[derive(Debug, Clone, Default)]
 pub struct DialogManager {
     open: Option<DialogKind>,
     jump_text: String,
+    skin_index: usize,
 }
 
 impl DialogManager {
@@ -148,10 +220,12 @@ impl DialogManager {
         Self::default()
     }
 
-    /// Opens `dialog`, replacing whatever is open. Clears the jump input.
+    /// Opens `dialog`, replacing whatever is open. Clears the jump input and
+    /// resets the skin selection to the first row.
     pub fn open(&mut self, dialog: DialogKind) {
         self.open = Some(dialog);
         self.jump_text.clear();
+        self.skin_index = 0;
     }
 
     /// Closes `dialog` when it is the open one; otherwise a no-op.
@@ -159,6 +233,7 @@ impl DialogManager {
         if self.open == Some(dialog) {
             self.open = None;
             self.jump_text.clear();
+            self.skin_index = 0;
         }
     }
 
@@ -166,6 +241,7 @@ impl DialogManager {
     pub fn close_any(&mut self) {
         self.open = None;
         self.jump_text.clear();
+        self.skin_index = 0;
     }
 
     /// The open dialog, if any.
@@ -191,7 +267,8 @@ impl DialogManager {
     /// Handles one key for the open dialog.
     ///
     /// Returns `true` when the key was consumed: digits append to the jump
-    /// input (jump dialogs only), `Enter` and `Escape` are consumed by any
+    /// input (jump dialogs only), `Up`/`Down` move the skin browser's
+    /// selection (skin browser only), `Enter` and `Escape` are consumed by any
     /// open dialog so the app can confirm or close it. Everything else falls
     /// through (`false`).
     pub fn key(&mut self, key: Key) -> bool {
@@ -203,6 +280,22 @@ impl DialogManager {
                     if self.jump_text.len() < MAX_JUMP_LEN {
                         self.jump_text.push((b'0' + digit) as char);
                     }
+                    true
+                } else {
+                    false
+                }
+            }
+            Key::Up => {
+                if matches!(self.open, Some(DialogKind::SkinBrowser)) {
+                    self.select_prev_skin();
+                    true
+                } else {
+                    false
+                }
+            }
+            Key::Down => {
+                if matches!(self.open, Some(DialogKind::SkinBrowser)) {
+                    self.select_next_skin();
                     true
                 } else {
                     false
@@ -220,6 +313,50 @@ impl DialogManager {
             return None;
         }
         parse_jump_time_ms(&self.jump_text).map(|to_ms| Command::Seek { to_ms })
+    }
+
+    /// The skin browser's selected row index. Unbounded while moving (the
+    /// manager never sees the row count); clamped when read through
+    /// [`selected_skin`](Self::selected_skin).
+    pub fn skin_index(&self) -> usize {
+        self.skin_index
+    }
+
+    /// Moves the skin browser's selection one row down. A no-op unless the
+    /// skin browser is open.
+    pub fn select_next_skin(&mut self) {
+        if matches!(self.open, Some(DialogKind::SkinBrowser)) {
+            self.skin_index = self.skin_index.saturating_add(1);
+        }
+    }
+
+    /// Moves the skin browser's selection one row up. A no-op unless the skin
+    /// browser is open.
+    pub fn select_prev_skin(&mut self) {
+        if matches!(self.open, Some(DialogKind::SkinBrowser)) {
+            self.skin_index = self.skin_index.saturating_sub(1);
+        }
+    }
+
+    /// The selected skin-browser row, or `None` when the skin browser is not
+    /// open or there are no rows. An overrun index clamps to the last row, so
+    /// holding `Down` past the end keeps the last row selected.
+    pub fn selected_skin<'a>(&self, entries: &'a [SkinEntry]) -> Option<&'a SkinEntry> {
+        if self.open != Some(DialogKind::SkinBrowser) {
+            return None;
+        }
+        entries.get(self.skin_index).or(entries.last())
+    }
+
+    /// Confirms the load-playlist dialog: always `None`.
+    ///
+    /// RFC 0010 leaves replace-versus-append (and the file filter) open, and
+    /// no spec fixes the dialog beyond its title, so there is deliberately no
+    /// confirmation command yet — confirming must not silently decide
+    /// append semantics by emitting `AddItems`. `Enter` stays consumed (see
+    /// [`key`](Self::key)) and the dialog stays open.
+    pub fn confirm_load_playlist(&self) -> Option<Command> {
+        None
     }
 }
 
@@ -284,6 +421,8 @@ mod tests {
             DialogKind::FileInfo,
             DialogKind::Jump(JumpTarget::File),
             DialogKind::Jump(JumpTarget::Time),
+            DialogKind::LoadPlaylist,
+            DialogKind::SkinBrowser,
         ] {
             let command = opening_command(dialog);
             assert_eq!(dialog_for_command(&command), Some(dialog), "{command:?}");
@@ -296,9 +435,7 @@ mod tests {
             Command::Play,
             Command::Quit,
             Command::OpenPrefs,
-            Command::OpenSkinBrowser,
             Command::OpenMainMenu,
-            Command::OpenPlaylist,
         ] {
             assert_eq!(dialog_for_command(&command), None, "{command:?}");
         }
@@ -312,9 +449,34 @@ mod tests {
             DialogKind::Jump(JumpTarget::Time).client_size(),
             JUMP_CLIENT_SIZE
         );
-        for size in [ABOUT_CLIENT_SIZE, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE] {
+        assert_eq!(
+            DialogKind::LoadPlaylist.client_size(),
+            LOAD_PLAYLIST_CLIENT_SIZE
+        );
+        assert_eq!(
+            DialogKind::SkinBrowser.client_size(),
+            SKIN_BROWSER_CLIENT_SIZE
+        );
+        for size in [
+            ABOUT_CLIENT_SIZE,
+            FILE_INFO_CLIENT_SIZE,
+            JUMP_CLIENT_SIZE,
+            LOAD_PLAYLIST_CLIENT_SIZE,
+            SKIN_BROWSER_CLIENT_SIZE,
+        ] {
             assert!(size.0 > 0 && size.1 > 0, "{size:?}");
         }
+    }
+
+    #[test]
+    fn the_load_playlist_title_is_the_spec_title() {
+        // S06 §4 settles the title from window metadata; it is shared with the
+        // playlist model so the two cannot drift.
+        assert_eq!(DialogKind::LoadPlaylist.title(), "Load Playlist");
+        assert_eq!(
+            DialogKind::LoadPlaylist.title(),
+            crate::playlist::LOAD_DIALOG_TITLE
+        );
     }
 
     #[test]
@@ -384,5 +546,86 @@ mod tests {
         manager.open(DialogKind::About);
         assert!(!manager.key(Key::Digit(1)));
         assert!(manager.key(Key::Escape));
+    }
+
+    #[test]
+    fn the_browser_lists_builtin_first_and_the_current_skin_after_it() {
+        let builtin_only = skin_entries(None);
+        assert_eq!(builtin_only.len(), 1);
+        assert_eq!(builtin_only[0].name, "built-in default skin");
+        assert_eq!(builtin_only[0].path, None);
+
+        let current = std::path::Path::new("skins/base.wsz");
+        let entries = skin_entries(Some(current));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, None);
+        assert_eq!(entries[1].path, Some(current.to_owned()));
+        assert_eq!(entries[1].name, current.display().to_string());
+    }
+
+    #[test]
+    fn the_browser_selection_moves_and_clamps_to_the_last_row() {
+        let entries = skin_entries(Some(std::path::Path::new("skins/base.wsz")));
+        let mut manager = DialogManager::new();
+        // No selection without the browser open.
+        assert_eq!(manager.selected_skin(&entries), None);
+        manager.open(DialogKind::SkinBrowser);
+        assert_eq!(manager.skin_index(), 0);
+        assert_eq!(manager.selected_skin(&entries), Some(&entries[0]));
+        manager.select_next_skin();
+        assert_eq!(manager.selected_skin(&entries), Some(&entries[1]));
+        // Holding Down past the end keeps the last row (clamped on read).
+        manager.select_next_skin();
+        manager.select_next_skin();
+        assert_eq!(manager.selected_skin(&entries), Some(&entries[1]));
+        manager.select_prev_skin();
+        assert_eq!(manager.selected_skin(&entries), Some(&entries[0]));
+        // Up at the top stays at the top (saturating).
+        manager.select_prev_skin();
+        assert_eq!(manager.skin_index(), 0);
+        // Reopening resets to the first row.
+        manager.select_next_skin();
+        manager.open(DialogKind::SkinBrowser);
+        assert_eq!(manager.skin_index(), 0);
+        // Another dialog open selects nothing.
+        manager.open(DialogKind::About);
+        assert_eq!(manager.selected_skin(&entries), None);
+    }
+
+    #[test]
+    fn arrows_move_only_the_skin_browser_and_digits_never_type_there() {
+        let mut manager = DialogManager::new();
+        assert!(!manager.key(Key::Up));
+        assert!(!manager.key(Key::Down));
+        manager.open(DialogKind::Jump(JumpTarget::Time));
+        assert!(!manager.key(Key::Up));
+        assert!(!manager.key(Key::Down));
+        manager.open(DialogKind::SkinBrowser);
+        assert!(manager.key(Key::Down));
+        assert_eq!(manager.skin_index(), 1);
+        assert!(manager.key(Key::Up));
+        assert_eq!(manager.skin_index(), 0);
+        assert!(manager.key(Key::Enter));
+        assert!(manager.key(Key::Escape));
+        // No typing into either new dialog.
+        assert!(!manager.key(Key::Digit(1)));
+        manager.open(DialogKind::LoadPlaylist);
+        assert!(!manager.key(Key::Digit(1)));
+        assert!(!manager.key(Key::Up));
+        assert!(manager.key(Key::Enter));
+        assert!(manager.key(Key::Escape));
+    }
+
+    #[test]
+    fn confirming_the_load_playlist_dialog_decides_nothing() {
+        // RFC 0010 leaves replace-versus-append open, so confirmation must
+        // not emit a command (in particular not `AddItems`, which would
+        // assert append semantics the spec does not contain).
+        let mut manager = DialogManager::new();
+        assert_eq!(manager.confirm_load_playlist(), None);
+        manager.open(DialogKind::LoadPlaylist);
+        assert_eq!(manager.confirm_load_playlist(), None);
+        manager.open(DialogKind::Jump(JumpTarget::Time));
+        assert_eq!(manager.confirm_load_playlist(), None);
     }
 }
