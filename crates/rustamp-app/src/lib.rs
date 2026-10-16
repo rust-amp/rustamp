@@ -17,6 +17,8 @@
 //!   assembling [`rustamp_core::state::PlayerState`] snapshots and publishing
 //!   them as [`rustamp_ipc::Message::PlayerStateUpdate`] over the existing
 //!   control channel (RFC 0006).
+//! * [`menu`] — main-menu check flags and leaf activation (wave21b) on top of
+//!   the [`rustamp_ui::menu`] table. Opens no window.
 //! * [`supervise`] — spawn and supervision for `rustamp-plughost32`: finding
 //!   the i686 host binary, starting it with `CREATE_NO_WINDOW` over piped
 //!   stdio, and re-attaching (or restarting) it when it dies — off the audio
@@ -43,6 +45,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod host;
+pub mod menu;
 pub mod playlist_window;
 pub mod routing;
 pub mod skin;

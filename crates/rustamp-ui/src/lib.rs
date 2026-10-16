@@ -18,6 +18,9 @@
 //!   [`rustamp_core::event::Event`]. Time is a parameter, never a clock.
 //! * [`shortcuts`] maps key presses to the S03 main-window actions and
 //!   dispatches them on [`behaviour::MainWindow`] (task card D3).
+//! * [`menu`] holds the main-menu popup model (wave21b): the measured rows in
+//!   one table, the check-state mapping and the popup renderer. Row order and
+//!   grouping stay provisional until the S04 spec exports.
 //! * [`render::render_main_window`] paints one RGBA frame through
 //!   [`rustamp_gfx`], falling back per spec **S17** when a skin lacks a sheet.
 //! * [`widget::hit_test`] maps a window-relative point to a [`widget::Widget`].
@@ -40,6 +43,7 @@ pub mod equalizer;
 pub use docking as geometry;
 pub use docking as windows;
 pub mod layout;
+pub mod menu;
 pub mod playlist;
 pub mod playlist_window;
 pub mod presenter;
@@ -72,6 +76,13 @@ pub use equalizer::{
 };
 pub use layout::{
     DOUBLE_HEIGHT, DOUBLE_WIDTH, MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH,
+};
+pub use menu::{
+    CHECK_CELL_X, MAIN_MENU, MAIN_MENU_CLASS, MAIN_MENU_CLIENT_SIZE, MAIN_MENU_ITEM_HEIGHT_PX,
+    MAIN_MENU_ROWS, MAIN_MENU_SEPARATOR_HEIGHT_PX, MAIN_MENU_SEPARATORS, MAIN_MENU_SUBMENUS,
+    MainMenuId, MainMenuItem, MenuAction, MenuCheck, MenuFlags, MenuRow, SubmenuId, SubmenuItem,
+    check_state, render_main_menu, render_submenu, row_at_y, row_bands, submenu_client_size,
+    submenu_entries, top_level,
 };
 pub use playlist::{
     ADD_DIALOG_TITLE, BUTTON_BAND_BOTTOM, BUTTON_BAND_TOP, LIST_SELECT_POINT, LOAD_DIALOG_TITLE,
