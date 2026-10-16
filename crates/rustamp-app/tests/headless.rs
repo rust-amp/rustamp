@@ -11,8 +11,8 @@
 //!
 //! # GUI rule: no spawned child may raise a window
 //!
-//! GUI must never run on the host (the reference Winamp is driven inside a
-//! Windows Sandbox on this machine). **A console window counts as a window on
+//! GUI must never run on the host (everything graphical runs in the
+//! disposable headless test VM). **A console window counts as a window on
 //! the host**, so every child spawned here goes through [`no_window`], which
 //! sets `CREATE_NO_WINDOW`; a console-subsystem child (`rustamp.exe`) otherwise
 //! gets a console window of its own when the parent has no console.
@@ -22,10 +22,10 @@
 //! * every spawn carries `RUSTAMP_NO_GUI=1` (see [`isolate`]), so a test that
 //!   loses `--null` fails instead of opening the app's window;
 //! * the one test that does open the app's window,
-//!   [`the_windowed_player_opens_a_window_inside_the_sandbox`], is `#[ignore]`d
-//!   **and** refuses unless it can prove it runs as the sandbox user
-//!   `WDAGUtilityAccount`. An ignored test that can open a window on the host
-//!   is a loaded gun; it must not be runnable by accident.
+//!   [`the_windowed_player_opens_a_window_inside_the_test_vm`], is `#[ignore]`d
+//!   **and** refuses unless it can prove it runs inside the headless test VM
+//!   ([`rustamp_app::window::require_test_vm`]). An ignored test that can open
+//!   a window on the host is a loaded gun; it must not be runnable by accident.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -205,7 +205,7 @@ fn the_gui_rail_refuses_to_open_a_window() {
         "the windowed run must fail under the GUI rail\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("Windows Sandbox"),
+        stderr.contains("test VM"),
         "the rail message must name the rule; stderr:\n{stderr}"
     );
     assert!(
@@ -214,42 +214,27 @@ fn the_gui_rail_refuses_to_open_a_window() {
     );
 }
 
-/// The Windows Sandbox account. Everything inside the sandbox runs as this
-/// user, which is the marker that proves a run is not on the host.
-const SANDBOX_USER: &str = "WDAGUtilityAccount";
+// The shared test-VM gate lives in `rustamp_app::window::require_test_vm`:
+// this file keeps no copy of it.
 
-/// Refuses unless this process provably runs inside the Windows Sandbox.
+/// Opens the real window. **VM-only, `#[ignore]`d by default, and gated on
+/// the test VM.**
 ///
-/// There is deliberately **no** override: the test below opens the app's
-/// window, and an ignored test that can do that on the host is a loaded gun.
-fn require_windows_sandbox() {
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    assert!(
-        user.eq_ignore_ascii_case(SANDBOX_USER),
-        "refusing to open a GUI window: this test is sandbox-only, but the user is {user:?} \
-         rather than {SANDBOX_USER:?}. GUI must never run on the host; run it inside the \
-         Windows Sandbox (see crates/rustamp-app/README.md)."
-    );
-}
-
-/// Opens the real window. **Sandbox-only, `#[ignore]`d by default, and gated on
-/// the sandbox user.**
-///
-/// GUI must never run on the host. Run this only inside the Windows Sandbox
-/// (the same place the reference captures run), with an audio endpoint
+/// GUI must never run on the host. Run this only inside the headless test VM
+/// (the only host for anything graphical), with an audio endpoint
 /// available:
 ///
 /// ```text
 /// cargo test -p rustamp-app -- --ignored
 /// ```
 ///
-/// Outside the sandbox it refuses before spawning anything
-/// ([`require_windows_sandbox`]).
+/// Outside the test VM it refuses before spawning anything
+/// ([`rustamp_app::window::require_test_vm`]).
 #[test]
-#[ignore = "sandbox-only: opens the GUI window; run inside the Windows Sandbox"]
-fn the_windowed_player_opens_a_window_inside_the_sandbox() {
+#[ignore = "VM-only: opens the GUI window; run inside the headless test VM"]
+fn the_windowed_player_opens_a_window_inside_the_test_vm() {
     // The gate, before any process exists.
-    require_windows_sandbox();
+    rustamp_app::window::require_test_vm();
 
     let dir = tempfile::tempdir().unwrap();
     let mut command = binary(); // no console window (CREATE_NO_WINDOW)

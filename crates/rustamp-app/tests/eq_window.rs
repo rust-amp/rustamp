@@ -1,11 +1,10 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! The equalizer window, opened for real: **sandbox-only, `#[ignore]`d**.
+//! The equalizer window, opened for real: **VM-only, `#[ignore]`d**.
 //!
-//! GUI must never run on the host (the reference Winamp is driven inside a
-//! Windows Sandbox on this machine), so this test refuses unless it can prove
-//! it runs as the sandbox user `WDAGUtilityAccount` — the same gate as
-//! `tests/headless.rs`. There is deliberately **no** override. Run it only
-//! inside the Windows Sandbox:
+//! GUI must never run on the host, so this test refuses unless it can prove
+//! it runs inside the headless test VM — the shared gate in
+//! [`rustamp_app::window::require_test_vm`]. There is deliberately **no**
+//! override. Run it only inside the headless test VM:
 //!
 //! ```text
 //! cargo test -p rustamp-app --test eq_window -- --ignored
@@ -24,24 +23,9 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-/// The Windows Sandbox account. Everything inside the sandbox runs as this
-/// user, which is the marker that proves a run is not on the host.
-const SANDBOX_USER: &str = "WDAGUtilityAccount";
-
-/// Refuses unless this process provably runs inside the Windows Sandbox.
-///
-/// There is deliberately **no** override: the test below opens the app's
-/// equalizer window, and an ignored test that can do that on the host is a
-/// loaded gun.
-fn require_windows_sandbox() {
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    assert!(
-        user.eq_ignore_ascii_case(SANDBOX_USER),
-        "refusing to open a GUI window: this test is sandbox-only, but the user is {user:?} \
-         rather than {SANDBOX_USER:?}. GUI must never run on the host; run it inside the \
-         Windows Sandbox (see crates/rustamp-app/README.md)."
-    );
-}
+// The shared test-VM gate lives in `rustamp_app::window::require_test_vm`:
+// this file keeps no copy of it (an ignored test that can open a window on
+// the host is a loaded gun, so the gate has deliberately **no** override).
 
 /// Opens the real equalizer window and checks its client size.
 ///
@@ -49,10 +33,10 @@ fn require_windows_sandbox() {
 /// §3.1 docked default ((26,145), one main-window height below the main
 /// window at (26,29)) — the same values the player uses in `window.rs`.
 #[test]
-#[ignore = "sandbox-only: opens the equalizer window; run inside the Windows Sandbox"]
+#[ignore = "VM-only: opens the equalizer window; run inside the headless test VM"]
 fn the_equalizer_window_opens_at_its_docked_size_and_position() {
     // The gate, before any window exists.
-    require_windows_sandbox();
+    rustamp_app::window::require_test_vm();
 
     let (width, height) =
         rustamp_ui::docking::window_size(rustamp_ui::WindowKind::Equalizer, false, false);

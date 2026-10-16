@@ -344,10 +344,13 @@ mod tests {
 
     /// Really creates the host window. **VM-only and `#[ignore]`d:** it owns a
     /// real (hidden) window and must never run as part of the ordinary suite.
+    /// Gated on the test VM ([`crate::host_window::require_test_vm`]), before
+    /// any window exists.
     #[test]
     #[ignore = "creates a real window; VM-only, never part of the default suite"]
     #[cfg(windows)]
     fn creates_the_real_host_window_vm_only() {
+        crate::host_window::require_test_vm();
         let mut surface = IpcSurface::new();
         let window = crate::host_window::HostWindow::create(&mut surface)
             .expect("the VM creates the host window");

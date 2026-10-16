@@ -42,6 +42,54 @@ pub fn host_window_class_wide() -> Vec<u16> {
     v
 }
 
+/// Computer name of the disposable headless test VM, as last reported by the
+/// test runner.
+///
+/// This mirrors the canonical rule in `rustamp-app/src/window.rs` (same
+/// constant, same marker, same predicate). It is duplicated rather than
+/// shared because this crate is MIT OR Apache-2.0 by design (RFC 0004) and
+/// cannot depend on the GPL application crate: the rule is implemented once
+/// per license domain with identical semantics. Keep the two in step.
+pub const TEST_VM_COMPUTER: &str = "DESKTOP-UL3J9H6";
+
+/// Path the test runner stages the repository tree to inside the guest
+/// (`docs/notes/vm-run-tests.ps1` copies the staged tree to
+/// `C:\rustamp\code\Rustamp`). The host never has this path, so its presence
+/// proves the process runs inside the disposable headless test VM. This is
+/// the primary signal in [`is_test_vm`]: unlike a computer name it survives
+/// a VM rebuild.
+pub const TEST_VM_MARKER: &str = r"C:\rustamp\code\Rustamp";
+
+/// True when this process provably runs inside the disposable headless test
+/// VM, the only host for anything graphical.
+///
+/// Either signal counts: the runner's staged tree ([`TEST_VM_MARKER`]) or the
+/// VM's computer name ([`TEST_VM_COMPUTER`]). Neither is a wildcard — a plain
+/// developer machine has neither — and there is deliberately **no**
+/// environment-variable override.
+pub fn is_test_vm() -> bool {
+    if std::path::Path::new(TEST_VM_MARKER).exists() {
+        return true;
+    }
+    std::env::var("COMPUTERNAME").is_ok_and(|name| name.eq_ignore_ascii_case(TEST_VM_COMPUTER))
+}
+
+/// Refuses unless this process provably runs inside the disposable headless
+/// test VM.
+///
+/// The single gate window-creating tests in this crate share: call this
+/// before any window exists. There is deliberately **no** override. GUI must
+/// never run on the host.
+pub fn require_test_vm() {
+    assert!(
+        is_test_vm(),
+        "refusing to create a window: this test is VM-only, but this machine is neither the \
+         headless test VM ({TEST_VM_COMPUTER}) nor carries the runner's staged tree \
+         ({TEST_VM_MARKER}). GUI must never run on the host; run it inside the headless test \
+         VM."
+    );
+}
+
 #[derive(Debug)]
 pub enum HostWindowError {
     Message(String),

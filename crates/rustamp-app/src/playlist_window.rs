@@ -406,8 +406,8 @@ mod tests {
     /// Opening the playlist window needs an OS window, so this never runs in
     /// the headless suite: it pins the creation parameters the real window
     /// must carry (275 x 116 client area, docked below the main window) for
-    /// the sandbox run that does open it.
-    #[ignore = "opens an OS window; run manually inside the Windows Sandbox only"]
+    /// the test-VM run that does open it.
+    #[ignore = "opens an OS window; run manually inside the headless test VM only"]
     #[test]
     fn opening_the_playlist_window_needs_an_os_window() {
         assert_eq!(App::playlist_window_size(), (275, 116));

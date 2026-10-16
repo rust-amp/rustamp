@@ -27,7 +27,7 @@
 //!
 //! [`run`] is the entry point the `rustamp` binary calls.
 //!
-//! # GUI rule: the window only runs inside the Windows Sandbox
+//! # GUI rule: the window only runs inside the headless test VM
 //!
 //! [`run`] opens a window only for [`cli::OutputChoice::Default`]. With
 //! [`cli::OutputChoice::Null`] it plays headless through
@@ -37,7 +37,7 @@
 //! which the app's test harness always does. A spawned child must not create a
 //! window either — **a console window counts as a window on the host** — so
 //! test and tool code passes `CREATE_NO_WINDOW`. See `crates/rustamp-app/README.md`
-//! for how to run the windowed player (sandbox only).
+//! for how to run the windowed player (test VM only).
 
 #![forbid(unsafe_code)]
 

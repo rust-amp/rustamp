@@ -4,9 +4,9 @@
 //! GUI must never run on the host, so every test here drives [`App`] with the
 //! null output and opens **no window** — except
 //! [`the_main_menu_popup_opens_at_the_measured_client_size`], which is
-//! `#[ignore]`d **and** refuses unless it can prove it runs as the sandbox
-//! user `WDAGUtilityAccount`, exactly like `tests/eq_window.rs`. There is
-//! deliberately **no** override. Run it only inside the Windows Sandbox:
+//! `#[ignore]`d **and** refuses unless it can prove it runs inside the
+//! headless test VM, exactly like `tests/eq_window.rs`. There is
+//! deliberately **no** override. Run it only inside the headless test VM:
 //!
 //! ```text
 //! cargo test -p rustamp-app --test main_menu -- --ignored
@@ -148,23 +148,10 @@ fn an_action_without_a_command_notes_the_item_by_name() {
     );
 }
 
-/// The Windows Sandbox account. Everything inside the sandbox runs as this
-/// user, which is the marker that proves a run is not on the host.
-const SANDBOX_USER: &str = "WDAGUtilityAccount";
-
-/// Refuses unless this process provably runs inside the Windows Sandbox.
-///
-/// There is deliberately **no** override: the test below opens the menu
-/// popup, and an ignored test that can do that on the host is a loaded gun.
-fn require_windows_sandbox() {
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    assert!(
-        user.eq_ignore_ascii_case(SANDBOX_USER),
-        "refusing to open a GUI window: this test is sandbox-only, but the user is {user:?} \
-         rather than {SANDBOX_USER:?}. GUI must never run on the host; run it inside the \
-         Windows Sandbox (see crates/rustamp-app/README.md)."
-    );
-}
+// The shared test-VM gate lives in `rustamp_app::window::require_test_vm`:
+// this file keeps no copy of it. There is deliberately **no** override:
+// the test below opens the menu popup, and an ignored test that can do that
+// on the host is a loaded gun.
 
 /// Opens the real main-menu popup and checks its client size.
 ///
@@ -173,7 +160,7 @@ fn require_windows_sandbox() {
 /// softbuffer surface and paints nothing; painting is covered by the headless
 /// render tests.
 #[test]
-#[ignore = "sandbox-only: opens the main-menu popup; run inside the Windows Sandbox"]
+#[ignore = "VM-only: opens the main-menu popup; run inside the headless test VM"]
 fn the_main_menu_popup_opens_at_the_measured_client_size() {
     use std::sync::{Arc, Mutex};
 
@@ -184,7 +171,7 @@ fn the_main_menu_popup_opens_at_the_measured_client_size() {
     use winit::window::{Window, WindowId};
 
     // The gate, before any window exists.
-    require_windows_sandbox();
+    rustamp_app::window::require_test_vm();
 
     let (width, height) = rustamp_ui::menu::MAIN_MENU_CLIENT_SIZE;
     assert_eq!((width, height), (323, 569));

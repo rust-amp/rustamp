@@ -33,24 +33,24 @@
 //! drives `winit` itself and duplicates the (short) physical-key mapping; see
 //! the findings in the task card report.
 //!
-//! # GUI rule: the window may only run inside the Windows Sandbox
+//! # GUI rule: the window may only run inside the headless test VM
 //!
 //! Opening this window is a GUI run. Per the project rule, GUI must never run
-//! on the host: the reference Winamp is driven inside a Windows Sandbox on this
-//! machine, and a second window on the host would interfere with those
-//! captures. The default `cargo test --workspace --all-features` therefore
-//! **never** reaches [`run`]: the app's tests use `--null` (see
+//! on the host: everything graphical runs in the disposable Hyper-V test VM
+//! (`rustamp-test`, pinned to 100 % scale), and a window on the host would
+//! break that rule. The default `cargo test --workspace --all-features`
+//! therefore **never** reaches [`run`]: the app's tests use `--null` (see
 //! [`crate::app::App::run_headless`]), and this function refuses to open a
 //! window when [`NO_GUI_ENV`] is set, which the test harness always does. The
-//! one test that does open a window is `#[ignore]`d, sandbox-only, and refuses
-//! unless it runs as the sandbox user
+//! one test that does open a window is `#[ignore]`d, VM-only, and refuses
+//! unless it runs inside the test VM
 //! (`crates/rustamp-app/tests/headless.rs`). See `crates/rustamp-app/README.md`.
 //!
 //! **A spawned child must not create a window either — a console window counts
 //! as a window on the host.** Test and tool code that spawns a process passes
 //! `CREATE_NO_WINDOW`; `tests/headless.rs` centralises that in `no_window`.
 //!
-//! No test calls [`run`] outside that ignored, sandbox-gated case.
+//! No test calls [`run`] outside that ignored, VM-gated case.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -81,19 +81,67 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// a test that accidentally loses `--null` fails loudly instead of opening a
 /// window. It is a safety rail for automated runs, not a product switch: a
 /// human running the player normally does not set it. GUI runs belong inside
-/// the Windows Sandbox.
+/// the headless test VM.
 pub const NO_GUI_ENV: &str = "RUSTAMP_NO_GUI";
 
 /// Opt-in that lets a debug build open a window anyway.
 ///
-/// The rail below is **fail-closed**: a debug run refuses unless it runs as the
-/// sandbox account or sets this. Release builds are unaffected, so the shipped
-/// player behaves normally.
+/// The rail below is **fail-closed**: a debug run refuses unless it runs
+/// inside the test VM or sets this. Release builds are unaffected, so the
+/// shipped player behaves normally.
 pub const ALLOW_GUI_ENV: &str = "RUSTAMP_ALLOW_GUI";
 
-/// The Windows Sandbox account. Everything inside the sandbox runs as this user,
-/// which is the marker that a run is not on the host.
-pub const SANDBOX_USER: &str = "WDAGUtilityAccount";
+/// Computer name of the disposable headless test VM, as last reported by the
+/// test runner.
+///
+/// This is the fallback signal in [`is_test_vm`]: the primary signal is the
+/// runner's staging tree ([`TEST_VM_MARKER`]), which survives a VM rebuild or
+/// rename, while this name pins the VM as observed today. Either one proves
+/// the run is not on the host.
+pub const TEST_VM_COMPUTER: &str = "DESKTOP-UL3J9H6";
+
+/// Path the test runner stages the repository tree to inside the guest
+/// (`docs/notes/vm-run-tests.ps1` copies the staged tree to
+/// `C:\rustamp\code\Rustamp` and maps it to `D:\code\Rustamp` via `subst`).
+///
+/// The host never has this path (its repository lives at `D:\code\Rustamp`
+/// and its staging area elsewhere), so its presence proves the process runs
+/// inside the disposable headless test VM. This is the primary signal in
+/// [`is_test_vm`]: unlike a computer name it survives a VM rebuild.
+pub const TEST_VM_MARKER: &str = r"C:\rustamp\code\Rustamp";
+
+/// True when this process provably runs inside the disposable headless test
+/// VM, the only host for anything graphical.
+///
+/// Either signal counts: the runner's staged tree ([`TEST_VM_MARKER`]) or the
+/// VM's computer name ([`TEST_VM_COMPUTER`]). Neither is a wildcard — a plain
+/// developer machine has neither — and there is deliberately **no**
+/// environment-variable override: this is the predicate the window-opening
+/// tests gate on, and an overridable test gate is a loaded gun. (The
+/// [`ensure_gui_allowed`] rail keeps its own explicit [`ALLOW_GUI_ENV`]
+/// opt-in for deliberate manual runs.)
+pub fn is_test_vm() -> bool {
+    if std::path::Path::new(TEST_VM_MARKER).exists() {
+        return true;
+    }
+    std::env::var("COMPUTERNAME").is_ok_and(|name| name.eq_ignore_ascii_case(TEST_VM_COMPUTER))
+}
+
+/// Refuses unless this process provably runs inside the disposable headless
+/// test VM.
+///
+/// The single gate all window-opening tests share (instead of a copy in
+/// each): call this before anything graphical exists. There is deliberately
+/// **no** override. GUI must never run on the host.
+pub fn require_test_vm() {
+    assert!(
+        is_test_vm(),
+        "refusing to open a GUI window: this test is VM-only, but this machine is neither the \
+         headless test VM ({TEST_VM_COMPUTER}) nor carries the runner's staged tree \
+         ({TEST_VM_MARKER}). GUI must never run on the host; run it inside the headless test \
+         VM (see crates/rustamp-app/README.md)."
+    );
+}
 
 /// Fails when [`NO_GUI_ENV`] is set.
 ///
@@ -102,8 +150,8 @@ pub const SANDBOX_USER: &str = "WDAGUtilityAccount";
 /// Fails unless this process may open a window.
 ///
 /// **Fail-closed in debug builds.** A development or test run may only open a
-/// window when it provably runs inside the Windows Sandbox (the sandbox account
-/// is [`SANDBOX_USER`]) or when it opted in with [`ALLOW_GUI_ENV`]. On the
+/// window when it provably runs inside the headless test VM (see
+/// [`is_test_vm`]) or when it opted in with [`ALLOW_GUI_ENV`]. On the
 /// owner's desktop a debug run therefore **cannot** put a window up, whatever
 /// started it — a test, a stray `cargo run`, an agent. The shipped (release)
 /// player is unaffected and opens its window normally.
@@ -114,19 +162,17 @@ pub fn ensure_gui_allowed() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os(NO_GUI_ENV).is_some() {
         return Err(format!(
             "the windowed player is disabled by {NO_GUI_ENV} (GUI runs only inside the \
-             Windows Sandbox)"
+             headless test VM)"
         )
         .into());
     }
     #[cfg(debug_assertions)]
     {
-        let in_sandbox =
-            std::env::var("USERNAME").is_ok_and(|user| user.eq_ignore_ascii_case(SANDBOX_USER));
-        if !in_sandbox && std::env::var_os(ALLOW_GUI_ENV).is_none() {
+        if !is_test_vm() && std::env::var_os(ALLOW_GUI_ENV).is_none() {
             return Err(format!(
                 "refusing to open a window: this is a debug build on the host, and GUI runs \
-                 only inside the Windows Sandbox. Run it there (the sandbox account is \
-                 {SANDBOX_USER}), or set {ALLOW_GUI_ENV}=1 if you really mean it."
+                 only inside the headless test VM. Run it there, or set {ALLOW_GUI_ENV}=1 if \
+                 you really mean it."
             )
             .into());
         }
@@ -138,7 +184,7 @@ pub fn ensure_gui_allowed() -> Result<(), Box<dyn std::error::Error>> {
 /// playlist window) and runs until the main window is closed.
 ///
 /// Blocks and must run on the main thread. Never called by a test, except the
-/// `#[ignore]`d, sandbox-only one. Returns an error without opening anything
+/// `#[ignore]`d, VM-only one. Returns an error without opening anything
 /// when [`NO_GUI_ENV`] is set. Both windows share this rail: the gate runs
 /// before either window exists.
 pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {

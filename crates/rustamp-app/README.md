@@ -24,7 +24,7 @@ the mode the tests use (`tests/headless.rs` plays the repo's own 1.5 s FLAC
 fixture and checks the exit code). `--seconds <n>` bounds a run; `--null` with
 no file exits immediately.
 
-## Windowed mode — Windows Sandbox only
+## Windowed mode — headless test VM only
 
 ```text
 cargo run -p rustamp-app -- <file>
@@ -33,12 +33,12 @@ cargo run -p rustamp-app -- <file>
 Without `--null` the app opens the main window and plays on the best device for
 the host.
 
-> **GUI must never run outside the Windows Sandbox.**
+> **GUI must never run on the host.**
 >
-> The reference Winamp 2.95 is driven inside a Windows Sandbox on this machine,
-> and a second window on the host would interfere with those captures. Run the
-> windowed player only inside the sandbox. Everything else (builds, `cargo
-> test`, headless `--null` runs) is safe on the host.
+> Everything graphical runs inside the disposable headless test VM, and a
+> window on the host would break that rule. Run the windowed player only
+> inside the test VM. Everything else (builds, `cargo test`, headless
+> `--null` runs) is safe on the host.
 
 ### A spawned child must never create a window either
 
@@ -64,13 +64,13 @@ is set (`window::NO_GUI_ENV`), and `rustamp_app::run` checks the same rail
 opening a window. `tests/headless.rs` sets it on every binary it spawns, so a
 test that accidentally loses `--null` fails loudly rather than starting a GUI.
 
-The one test that does open a window is `#[ignore]`d and sandbox-only:
+The one test that does open a window is `#[ignore]`d and VM-only:
 
 ```text
 cargo test -p rustamp-app -- --ignored
 ```
 
-Run it **inside the Windows Sandbox** with an audio endpoint available. It
+Run it **inside the headless test VM** with an audio endpoint available. It
 spawns the player, waits three seconds, checks that it is still running (the
 window opened and the event loop is live) and kills it.
 
