@@ -21,15 +21,24 @@
 //!
 //! * every spawn carries `RUSTAMP_NO_GUI=1` (see [`isolate`]), so a test that
 //!   loses `--null` fails instead of opening the app's window;
-//! * the one test that does open the app's window,
-//!   [`the_windowed_player_opens_a_window_inside_the_test_vm`], is `#[ignore]`d
-//!   **and** refuses unless it can prove it runs inside the headless test VM
+//! * the tests that do open the app's windows,
+//!   [`the_windowed_player_opens_a_window_inside_the_test_vm`] (plus the
+//!   playlist, equalizer and menu probes), are `#[ignore]`d
+//!   **and** refuse unless they can prove they run inside the headless test VM
 //!   ([`rustamp_app::window::require_test_vm`]). An ignored test that can open
 //!   a window on the host is a loaded gun; it must not be runnable by accident.
+//!   In-process probes build their loop off the main thread on purpose
+//!   ([`rustamp_app::window::build_event_loop`]); the spawned player builds
+//!   its own on its main thread.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+// OS geometry of a spawned player's windows (VM-only window tests).
+#[cfg(windows)]
+#[path = "child_windows/mod.rs"]
+mod child_windows;
 
 /// `CreateProcess` flag: run the child with a console but **no console window**
 /// (`CREATE_NO_WINDOW`).
@@ -229,7 +238,15 @@ fn the_gui_rail_refuses_to_open_a_window() {
 /// ```
 ///
 /// Outside the test VM it refuses before spawning anything
-/// ([`rustamp_app::window::require_test_vm`]).
+/// ([`rustamp_app::window::require_test_vm`]). Inside, it checks the player
+/// stays up (the window opened and the event loop is live), reads back the
+/// main window's OS geometry — client 275 x 116 (S01 §4), visible — and
+/// kills the player.
+///
+/// The spawned child builds its loop on its own main thread, so it needs no
+/// opt-in: the off-main-thread mode
+/// ([`rustamp_app::window::build_event_loop`]) is only for the in-process
+/// probes, which run on harness worker threads.
 #[test]
 #[ignore = "VM-only: opens the GUI window; run inside the headless test VM"]
 fn the_windowed_player_opens_a_window_inside_the_test_vm() {
@@ -246,6 +263,7 @@ fn the_windowed_player_opens_a_window_inside_the_test_vm() {
     command.env("RUSTAMP_CONFIG", dir.path().join("rustamp.toml"));
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.arg(fixture()).spawn().expect("spawn rustamp");
+    let pid = child.id();
 
     // If it is still running after three seconds, the window opened and the
     // event loop is live. If it exited, the smoke test failed (no endpoint?).
@@ -257,6 +275,28 @@ fn the_windowed_player_opens_a_window_inside_the_test_vm() {
              --- stdout ---\n{}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The main window's OS geometry. Windows-only: the headless test VM is
+    // Windows. The product does not fix the main window's absolute position
+    // (no `with_position`; the OS places it), so the test pins what the
+    // specs fix — the S01 rest client size — plus visibility and a readable,
+    // non-degenerate outer frame. Absolute docked positions belong to the
+    // neighbours: the equalizer probe (`eq_window.rs`) and the
+    // docked-relative check in `playlist_window.rs`.
+    #[cfg(windows)]
+    {
+        let main = child_windows::find_window(pid, "Rustamp", Duration::from_secs(10));
+        assert_eq!(
+            child_windows::client_size(main),
+            (275, 116),
+            "the main window client area must be the S01 rest size"
+        );
+        let (left, top, right, bottom) = child_windows::outer_rect(main);
+        assert!(
+            right > left && bottom > top,
+            "the main window outer frame must be non-degenerate, got \
+             ({left},{top})-({right},{bottom})"
         );
     }
     child.kill().expect("kill the windowed player");

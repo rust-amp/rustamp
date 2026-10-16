@@ -144,12 +144,17 @@ fn an_action_without_a_command_notes_the_item_by_name() {
 // the test below opens the menu popup, and an ignored test that can do that
 // on the host is a loaded gun.
 
-/// Opens the real main-menu popup and checks its client size.
+/// Opens the real main-menu popup and checks its client size and position.
 ///
 /// The size is the settled S04 measurement (323 x 569, S04 §1/§8); the
-/// position is probe-only (the popup anchor is unmeasured). It creates no
+/// position is probe-only (the popup anchor is unmeasured, so the test asks
+/// for (50,50) and checks the window opened there). It creates no
 /// softbuffer surface and paints nothing; painting is covered by the headless
 /// render tests.
+///
+/// The loop is built off the main thread on purpose: tests run on harness
+/// worker threads, so `EventLoop::new()` would panic. See
+/// [`rustamp_app::window::build_event_loop`].
 #[test]
 #[ignore = "VM-only: opens the main-menu popup; run inside the headless test VM"]
 fn the_main_menu_popup_opens_at_the_measured_client_size() {
@@ -158,7 +163,7 @@ fn the_main_menu_popup_opens_at_the_measured_client_size() {
     use winit::application::ApplicationHandler;
     use winit::dpi::{PhysicalPosition, PhysicalSize};
     use winit::event::WindowEvent;
-    use winit::event_loop::{ActiveEventLoop, EventLoop};
+    use winit::event_loop::ActiveEventLoop;
     use winit::window::{Window, WindowId};
 
     // The gate, before any window exists.
@@ -169,6 +174,7 @@ fn the_main_menu_popup_opens_at_the_measured_client_size() {
 
     struct Probe {
         seen: Arc<Mutex<Option<(u32, u32)>>>,
+        seen_pos: Arc<Mutex<Option<(i32, i32)>>>,
     }
 
     impl ApplicationHandler for Probe {
@@ -185,6 +191,8 @@ fn the_main_menu_popup_opens_at_the_measured_client_size() {
                 .expect("create the main-menu popup");
             let size = window.inner_size();
             *self.seen.lock().unwrap() = Some((size.width, size.height));
+            let pos = window.outer_position().expect("read the popup position");
+            *self.seen_pos.lock().unwrap() = Some((pos.x, pos.y));
             event_loop.exit();
         }
 
@@ -198,10 +206,20 @@ fn the_main_menu_popup_opens_at_the_measured_client_size() {
     }
 
     let seen = Arc::new(Mutex::new(None));
+    let seen_pos = Arc::new(Mutex::new(None));
     let mut probe = Probe {
         seen: Arc::clone(&seen),
+        seen_pos: Arc::clone(&seen_pos),
     };
-    let event_loop = EventLoop::new().expect("create the event loop");
+    // Off the main thread on purpose: this test runs on a harness worker
+    // thread, so `EventLoop::new()` would panic. The product keeps the
+    // default; see `rustamp_app::window::build_event_loop`.
+    let event_loop = rustamp_app::window::build_event_loop(true).expect("create the event loop");
     event_loop.run_app(&mut probe).expect("run the event loop");
     assert_eq!(*seen.lock().unwrap(), Some((323, 569)));
+    assert_eq!(
+        *seen_pos.lock().unwrap(),
+        Some((50, 50)),
+        "the popup must open where it was asked to (probe-only anchor)"
+    );
 }

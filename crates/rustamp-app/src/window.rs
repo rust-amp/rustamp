@@ -42,15 +42,15 @@
 //! therefore **never** reaches [`run`]: the app's tests use `--null` (see
 //! [`crate::app::App::run_headless`]), and this function refuses to open a
 //! window when [`NO_GUI_ENV`] is set, which the test harness always does. The
-//! one test that does open a window is `#[ignore]`d, VM-only, and refuses
-//! unless it runs inside the test VM
+//! tests that do open windows are `#[ignore]`d, VM-only, and refuse
+//! unless they run inside the test VM
 //! (`crates/rustamp-app/tests/headless.rs`). See `crates/rustamp-app/README.md`.
 //!
 //! **A spawned child must not create a window either — a console window counts
 //! as a window on the host.** Test and tool code that spawns a process passes
 //! `CREATE_NO_WINDOW`; `tests/headless.rs` centralises that in `no_window`.
 //!
-//! No test calls [`run`] outside that ignored, VM-gated case.
+//! No test calls [`run`] outside those ignored, VM-gated cases.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -181,11 +181,45 @@ pub fn ensure_gui_allowed() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Builds the `winit` event loop, with an explicit off-main-thread opt-in.
+///
+/// `any_thread` selects `EventLoopBuilderExtWindows::with_any_thread` on
+/// Windows (the function the `winit` panic itself names; elsewhere the flag
+/// does not exist and the argument is ignored). Pass `true` only from the
+/// VM-gated window tests: the test harness runs every test on a worker
+/// thread, so a test that builds a loop cannot be on the main thread, and
+/// `EventLoop::new()` would panic there. Every other caller — in particular
+/// the shipped player in [`run`], which owns the main thread — passes
+/// `false`, which is exactly `EventLoop::new()` (`winit` implements `new()`
+/// as `builder().build()` with the flag at its default off), so the product
+/// keeps the cross-platform main-thread guarantee the panic protects.
+///
+/// Why an explicit parameter and not an environment variable: an env var is
+/// process-global state invisible at the construction site — a leaked
+/// variable would silently flip the product into the hazardous mode. A
+/// parameter names the mode at every call site, and the default call reads
+/// as today's behaviour. This does not weaken the GUI rails: the tests still
+/// call [`require_test_vm`] before anything graphical exists, and
+/// [`ensure_gui_allowed`] still refuses the product off-VM.
+pub fn build_event_loop(any_thread: bool) -> Result<EventLoop<()>, winit::error::EventLoopError> {
+    let mut builder = EventLoop::builder();
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows as _;
+        builder.with_any_thread(any_thread);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = any_thread;
+    }
+    builder.build()
+}
+
 /// Opens the main window (plus the equalizer window when it is open and the
 /// playlist window) and runs until the main window is closed.
 ///
 /// Blocks and must run on the main thread. Never called by a test, except the
-/// `#[ignore]`d, VM-only one. Returns an error without opening anything
+/// `#[ignore]`d, VM-only ones. Returns an error without opening anything
 /// when [`NO_GUI_ENV`] is set. Both windows share this rail: the gate runs
 /// before either window exists.
 pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {
@@ -196,7 +230,10 @@ pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let mut presenter = Windowed::new(app);
-    let event_loop = EventLoop::new()?;
+    // The product owns the main thread, so the default mode: exactly
+    // `EventLoop::new()`. The off-main-thread opt-in (`true`) exists only
+    // for the VM-gated window tests, which run on harness worker threads.
+    let event_loop = build_event_loop(false)?;
     event_loop.run_app(&mut presenter)?;
     Ok(())
 }
@@ -1469,19 +1506,27 @@ mod tests {
         // The gate, before any window exists.
         require_test_vm();
 
-        let event_loop = EventLoop::new().expect("event loop");
+        // Off the main thread on purpose: unit tests run on harness worker
+        // threads, so `EventLoop::new()` would panic here. See
+        // [`build_event_loop`].
+        let event_loop = build_event_loop(true).expect("event loop");
         // Deprecated on purpose: outside `run_app` there is no
         // `ActiveEventLoop`, and this VM-only test just needs one window.
+        let origin = menu_popup_origin((100, 100));
         let window = event_loop
-            .create_window(Windowed::menu_window_attributes(menu_popup_origin((
-                100, 100,
-            ))))
+            .create_window(Windowed::menu_window_attributes(origin))
             .expect("menu popup window");
         let size = window.inner_size();
         assert_eq!(
             (size.width, size.height),
             MAIN_MENU_CLIENT_SIZE,
             "the popup client area must be the measured 323 x 569 (S04 §§1,8)"
+        );
+        let pos = window.outer_position().expect("read the popup position");
+        assert_eq!(
+            (pos.x, pos.y),
+            origin,
+            "the popup must open where it was asked to (probe-only anchor; S04 §9 leaves placement unmeasured)"
         );
     }
 }

@@ -11,16 +11,20 @@
 //! ```
 //!
 //! It opens the equalizer window at its docked size and position (S07 + S05
-//! §3.1: 275 x 116 at (26,145)), reads back the client size and exits. It
-//! creates no softbuffer surface and plays nothing; painting is covered by the
-//! headless render tests.
+//! §3.1: 275 x 116 at (26,145)), reads back the client size and the outer
+//! position, and exits. It creates no softbuffer surface and plays nothing;
+//! painting is covered by the headless render tests.
+//!
+//! The loop is built off the main thread on purpose: tests run on harness
+//! worker threads, so `EventLoop::new()` would panic. See
+//! [`rustamp_app::window::build_event_loop`].
 
 use std::sync::{Arc, Mutex};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
 // The shared test-VM gate lives in `rustamp_app::window::require_test_vm`:
@@ -46,6 +50,7 @@ fn the_equalizer_window_opens_at_its_docked_size_and_position() {
 
     struct Probe {
         seen: Arc<Mutex<Option<(u32, u32)>>>,
+        seen_pos: Arc<Mutex<Option<(i32, i32)>>>,
     }
 
     impl ApplicationHandler for Probe {
@@ -64,6 +69,8 @@ fn the_equalizer_window_opens_at_its_docked_size_and_position() {
                 .expect("create the equalizer window");
             let size = window.inner_size();
             *self.seen.lock().unwrap() = Some((size.width, size.height));
+            let pos = window.outer_position().expect("read the window position");
+            *self.seen_pos.lock().unwrap() = Some((pos.x, pos.y));
             event_loop.exit();
         }
 
@@ -77,10 +84,20 @@ fn the_equalizer_window_opens_at_its_docked_size_and_position() {
     }
 
     let seen = Arc::new(Mutex::new(None));
+    let seen_pos = Arc::new(Mutex::new(None));
     let mut probe = Probe {
         seen: Arc::clone(&seen),
+        seen_pos: Arc::clone(&seen_pos),
     };
-    let event_loop = EventLoop::new().expect("create the event loop");
+    // Off the main thread on purpose: this test runs on a harness worker
+    // thread, so `EventLoop::new()` would panic. The product keeps the
+    // default; see `rustamp_app::window::build_event_loop`.
+    let event_loop = rustamp_app::window::build_event_loop(true).expect("create the event loop");
     event_loop.run_app(&mut probe).expect("run the event loop");
     assert_eq!(*seen.lock().unwrap(), Some((275, 116)));
+    assert_eq!(
+        *seen_pos.lock().unwrap(),
+        Some((26, 145)),
+        "the equalizer must open at its S05 §3.1 docked position"
+    );
 }

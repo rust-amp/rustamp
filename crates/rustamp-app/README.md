@@ -64,15 +64,22 @@ is set (`window::NO_GUI_ENV`), and `rustamp_app::run` checks the same rail
 opening a window. `tests/headless.rs` sets it on every binary it spawns, so a
 test that accidentally loses `--null` fails loudly rather than starting a GUI.
 
-The one test that does open a window is `#[ignore]`d and VM-only:
+The tests that open windows are `#[ignore]`d and VM-only
+(`tests/headless.rs`, `tests/playlist_window.rs`, `tests/eq_window.rs`,
+`tests/main_menu.rs`, and the menu unit test in `src/window.rs`):
 
 ```text
 cargo test -p rustamp-app -- --ignored
 ```
 
-Run it **inside the headless test VM** with an audio endpoint available. It
-spawns the player, waits three seconds, checks that it is still running (the
-window opened and the event loop is live) and kills it.
+Run them **inside the headless test VM** with an audio endpoint available. They
+spawn the player (or probe in-process), wait three seconds, check that it is
+still running (the window opened and the event loop is live), read back the
+windows' OS geometry — main 275 x 116, equalizer 275 x 116 at its docked
+position, playlist 275 x 116 docked below the main window, menu popup
+323 x 569 — and kill the player. In-process probes build their event loop
+off the main thread on purpose (`window::build_event_loop(true)`), because
+tests run on harness worker threads; the product keeps the default.
 
 ## Windows of this crate
 
