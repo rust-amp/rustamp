@@ -34,6 +34,15 @@ $exes = @(Get-ChildItem -Path $deps -Filter '*.exe' | Sort-Object Name | Select-
 if (-not $exes) { throw "no test binaries in $deps" }
 
 $filter = $Filter
+$extra = @()
+# An `--ignored` prefix asks the binaries to run their ignored tests as well.
+# Those are exactly the tests that open a window or spawn a process: they are
+# ignored by default because the host must stay windowless, and they may only
+# run here, in the guest. `--ignored:name` also filters by binary name.
+if ($filter -like '--ignored*') {
+    $extra = @('--ignored')
+    $filter = ($filter -replace '^--ignored:?', '')
+}
 
 $results = @()
 foreach ($exe in $exes) {
@@ -41,7 +50,7 @@ foreach ($exe in $exes) {
     if ($filter -and $name -notlike "*$filter*") { continue }
     if (-not (Test-Path $exe)) { $results += [pscustomobject]@{ exe = $name; exit = -1; summary = 'MISSING BINARY'; failed = @() }; continue }
 
-    $raw = & $exe 2>&1 | Out-String
+    $raw = & $exe @extra 2>&1 | Out-String
     $exit = $LASTEXITCODE
     $lines = $raw -split "`r?`n"
     $summary = ($lines | Where-Object { $_ -match '^test result:' } | Select-Object -Last 1)
