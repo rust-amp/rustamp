@@ -52,6 +52,7 @@ use crate::cli::OutputChoice;
 use crate::host::{HostStateLink, PublishOutcome, player_state_message};
 use crate::routing;
 use crate::skin::{LoadedSkin, SkinChoice, load as load_skin};
+use crate::supervise::Supervisor;
 
 /// How many "not implemented yet" notes the app keeps for the caller to print.
 const MAX_NOTES: usize = 64;
@@ -114,6 +115,12 @@ pub struct App {
     /// (see [`crate::host`]): detached until a supervisor attaches a
     /// control-channel transport, so publishing without a host is a no-op.
     host: HostStateLink,
+    /// The plugin host's spawn and supervision (see [`crate::supervise`).
+    ///
+    /// `None` is the unmanaged default: the link stays detached and the
+    /// player runs identically with and without a host. [`run`](crate::run)
+    /// installs one; tests leave it off so no process is ever spawned.
+    host_supervisor: Option<Supervisor>,
 }
 
 impl App {
@@ -189,6 +196,7 @@ impl App {
             next_entry_id: 0,
             notes: Vec::new(),
             host: HostStateLink::detached(),
+            host_supervisor: None,
         };
         app.shuffle = app.config.playlist.shuffle;
         app.repeat = app.config.playlist.repeat;
@@ -347,6 +355,13 @@ impl App {
         }
 
         self.ui.refresh(self.now_ms());
+        // Supervise the plugin host before mirroring state to it (see
+        // `crate::supervise`): non-blocking by contract, so a missing or dead
+        // host only costs a cooldown-gated spawn attempt and the mirror below
+        // degrades to detached. Unmanaged by default (no spawns in tests).
+        if let Some(supervisor) = self.host_supervisor.as_mut() {
+            supervisor.supervise(&mut self.host);
+        }
         // Mirror the player state to the plugin host (see `crate::host`):
         // best-effort by contract, so the outcome is ignored — a detached or
         // dead host neither fails nor blocks the pump.
@@ -494,8 +509,8 @@ impl App {
 
     /// Attach the host's control-channel transport (see
     /// [`HostStateLink::attach`](crate::host::HostStateLink::attach)).
-    /// Process supervision is a later card; until it lands the link stays
-    /// detached.
+    /// Hand-attaching bypasses the supervisor: a managed app re-establishes
+    /// its own transport on the next pump (see [`App::manage_host`]).
     pub fn attach_host(&mut self, transport: impl Transport + 'static) {
         self.host.attach(transport);
     }
@@ -508,6 +523,25 @@ impl App {
     /// Whether a host transport is currently attached.
     pub fn host_attached(&self) -> bool {
         self.host.is_attached()
+    }
+
+    /// Install the plugin host supervisor (see [`crate::supervise`]).
+    ///
+    /// From the next [`pump`](App::pump) on, the supervisor starts
+    /// `rustamp-plughost32` when it is missing and re-attaches (or restarts)
+    /// it when it dies — off the audio path, degrading to detached. Pass
+    /// [`Supervisor::from_search`](crate::supervise::Supervisor::from_search)
+    /// for the normal binary resolution.
+    pub fn manage_host(&mut self, supervisor: Supervisor) {
+        self.host_supervisor = Some(supervisor);
+    }
+
+    /// Stop supervising the host: kill the managed child (best-effort,
+    /// without waiting) and detach the link without sending anything.
+    pub fn stop_host(&mut self) {
+        if let Some(supervisor) = self.host_supervisor.as_mut() {
+            supervisor.stop(&mut self.host);
+        }
     }
 
     /// Publish the current snapshot to the host under the cadence rules (see
@@ -1323,5 +1357,27 @@ mod tests {
         assert_eq!(notes.len(), 2);
         assert!(notes[0].contains("Add file(s) to playlist"), "{notes:?}");
         assert!(notes[1].contains("Load Playlist"), "{notes:?}");
+    }
+
+    #[test]
+    fn a_managed_but_missing_host_keeps_pumping_detached() {
+        use crate::supervise::Supervisor;
+
+        let (mut app, _dir) = app_with_file(None);
+        // A real backend pointed at nothing that exists: resolving it fails
+        // without spawning any process, which is exactly the degraded path.
+        app.manage_host(Supervisor::with_cooldown(
+            crate::supervise::ProcessBackend::with_path(PathBuf::from(
+                "no-such-dir/rustamp-plughost32",
+            )),
+            Duration::ZERO,
+        ));
+        app.pump().unwrap();
+        assert!(!app.host_attached());
+        // Repeated pumps stay detached instead of stalling or failing.
+        app.pump().unwrap();
+        assert!(!app.host_attached());
+        app.stop_host();
+        assert!(!app.host_attached());
     }
 }

@@ -17,13 +17,18 @@
 //! memory. The control channel is a framed [`Message`] stream over any
 //! `Read`/`Write` pair (piped stdio, a named pipe, a socket) via
 //! [`StreamTransport`](rustamp_ipc::StreamTransport); the media hosts already
-//! speak exactly that on stdin/stdout, and the plugin host's binary names the
-//! control pipe as its end. [`HostStateLink`] therefore publishes through
-//! [`Transport::send`] — the same path — and takes the transport as an
-//! injected dependency. Spawning and supervising `rustamp-plughost32.exe`
-//! (finding the binary, `CREATE_NO_WINDOW`, `Hello` handshake, restart policy)
-//! is a later card, like the media-host supervision; until it lands the link
-//! stays detached and publishing is a no-op (see [`PublishOutcome::Detached]).
+//! speak exactly that on stdin/stdout. The plugin host's binary does not name
+//! a control pipe yet (its `main` is still a stub), so the supervisor (see
+//! [`crate::supervise`]) uses the other documented transport — piped stdio.
+//! [`HostStateLink`] therefore publishes through [`Transport::send`] — the
+//! same path — and takes the transport as an injected dependency. Spawning
+//! and supervising `rustamp-plughost32.exe` (finding the binary,
+//! `CREATE_NO_WINDOW`, restart policy) lives in [`crate::supervise`], which
+//! drives this link: it starts the host, attaches the fresh transport, and
+//! re-attaches (or restarts) when the host dies. Until a supervisor is
+//! installed (see [`App::manage_host`](crate::app::App::manage_host)) the
+//! link stays detached and publishing is a no-op (see
+//! [`PublishOutcome::Detached]).
 //!
 //! # Mapping (app source -> message field -> bridge surface + measured id)
 //!
@@ -206,7 +211,7 @@ impl HostStateLink {
             Err(_) => {
                 // A stalled or dead host must never block the player and must
                 // never wedge the link on a broken transport: drop it and let
-                // the supervisor (a later card) re-attach a live one.
+                // the supervisor (see `crate::supervise`) re-attach a live one.
                 self.transport = None;
                 self.last_sent = None;
                 PublishOutcome::HostGone

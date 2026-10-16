@@ -17,6 +17,10 @@
 //!   assembling [`rustamp_core::state::PlayerState`] snapshots and publishing
 //!   them as [`rustamp_ipc::Message::PlayerStateUpdate`] over the existing
 //!   control channel (RFC 0006).
+//! * [`supervise`] — spawn and supervision for `rustamp-plughost32`: finding
+//!   the i686 host binary, starting it with `CREATE_NO_WINDOW` over piped
+//!   stdio, and re-attaching (or restarting) it when it dies — off the audio
+//!   path, degrading to detached.
 //! * [`window`] — the `winit`/`softbuffer` shell for the real player.
 //!
 //! [`run`] is the entry point the `rustamp` binary calls.
@@ -41,6 +45,7 @@ pub mod config;
 pub mod host;
 pub mod routing;
 pub mod skin;
+pub mod supervise;
 pub mod window;
 
 use rustamp_core::command::Command;
@@ -90,6 +95,10 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         seconds: args.seconds,
     };
     let mut app = App::new(options)?;
+    // Start the plugin host when it is resolvable (see `crate::supervise`):
+    // best-effort by contract, so a missing binary only means the player runs
+    // detached — it never fails startup and never opens a window.
+    app.manage_host(crate::supervise::Supervisor::from_search());
 
     match args.output {
         // ----- headless test mode: no window -----
