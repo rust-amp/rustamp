@@ -136,7 +136,16 @@ if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 $null = New-Item -ItemType Directory -Force -Path $OutDir
 & $broker -Op copyout -Source 'C:\rustamp\out\gui-session' -Dest $OutDir -TimeoutSeconds 600 | Out-Null
 
+# `copyout` puts the source directory *inside* the destination, so the files
+# arrive one level deeper than the naive path. Accept both layouts.
 $proofPath = Join-Path $OutDir 'session-proof.json'
+if (-not (Test-Path $proofPath)) {
+    $nested = Join-Path $OutDir 'gui-session\session-proof.json'
+    if (Test-Path $nested) {
+        $OutDir = Join-Path $OutDir 'gui-session'
+        $proofPath = $nested
+    }
+}
 if (-not (Test-Path $proofPath)) { throw 'no session-proof.json came back: the guest run did not finish its proof step; nothing is promoted' }
 $proof = Get-Content -Path $proofPath -Raw | ConvertFrom-Json
 if ($proof.session -eq 0) { throw 'the guest run landed in session 0, which has no desktop; this run proves nothing' }

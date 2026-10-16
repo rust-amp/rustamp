@@ -146,8 +146,21 @@ if ($screen.Width -le 0 -or $screen.Height -le 0) {
 $cases = '__CASES__' | ConvertFrom-Json
 $results = @()
 foreach ($c in $cases) {
-    $exe = Get-ChildItem -Path $deps -Filter ($c.stem + '-*.exe') -ErrorAction SilentlyContinue |
-        Sort-Object Name | Select-Object -First 1 -ExpandProperty FullName
+    # Several crates can produce a binary with the same stem (both `rustamp-app`
+    # and `rustamp-ui` ship a `playlist_window` test binary, for example), and
+    # only one of them contains the ignored test. Pick the binary whose `--list`
+    # output names it, so a stem collision cannot silently run zero tests and
+    # still report a pass.
+    $candidates = @(Get-ChildItem -Path $deps -Filter ($c.stem + '-*.exe') -ErrorAction SilentlyContinue |
+        Sort-Object Name)
+    $exe = $null
+    foreach ($cand in $candidates) {
+        $listed = @(& $cand.FullName --list 2>&1 | ForEach-Object { $_.ToString().Trim() })
+        if ($listed | Where-Object { $_ -like ($c.test + ':*') }) {
+            $exe = $cand.FullName
+            break
+        }
+    }
     if (-not $exe) {
         $results += [pscustomobject]@{ stem = $c.stem; test = $c.test; exit = -1; summary = 'MISSING BINARY'; log = $null }
         continue
