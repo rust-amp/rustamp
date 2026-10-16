@@ -171,7 +171,9 @@ fn title_band_buttons_and_bottom_bar_come_from_their_sprites() {
     assert_eq!(rgb(&frame, 5, 5), CORNER);
     assert_eq!(rgb(&frame, 90, 5), STRIP);
     assert_eq!(rgb(&frame, 50, 5), TILE);
-    assert_eq!(rgb(&frame, 260, 5), RCORNER);
+    // The right corner is 25 px wide, so it starts at 275 - 25 = 250 (S01 §4.1
+    // puts it at 250,0); 260 is the scroll handle's x, not the corner's.
+    assert_eq!(rgb(&frame, 250, 5), RCORNER);
     // Close/shade cells (S01 §4, provisional).
     assert_eq!(rgb(&frame, 264, 3), CLOSEC);
     assert_eq!(rgb(&frame, 254, 3), SHADEC);
