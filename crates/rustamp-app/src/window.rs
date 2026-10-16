@@ -1266,6 +1266,11 @@ impl ApplicationHandler for Windowed {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // A `--no-audio` run has no device pulling on its own thread, so the
+        // virtual clock is driven here, once per frame, exactly as
+        // `run_headless` drives it headless. With a real device this is a
+        // no-op.
+        self.app.drive_null_clock();
         if let Err(error) = self.app.pump() {
             eprintln!("rustamp: pump failed: {error}");
         }

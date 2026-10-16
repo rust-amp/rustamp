@@ -1,11 +1,11 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! Command-line parsing for the `rustamp` binary (task card N1).
 //!
-//! The card's CLI is `<file> [--null] [--volume <0..=255>] [--skin <path>]`.
-//! Two additional switches exist for the headless test mode: `--seconds <n>`
-//! bounds a run (the same aid the `rustamp-audio` `play` example has) and
-//! `--help`/`-h` prints the usage. Parsing is a pure function of the argument
-//! list, so it is unit-tested without opening anything.
+//! The card's CLI is `<file> [--null] [--no-audio] [--volume <0..=255>]
+//! [--skin <path>]`. Two additional switches exist for the headless test mode:
+//! `--seconds <n>` bounds a run (the same aid the `rustamp-audio` `play`
+//! example has) and `--help`/`-h` prints the usage. Parsing is a pure function
+//! of the argument list, so it is unit-tested without opening anything.
 
 use std::fmt;
 
@@ -22,6 +22,13 @@ pub enum OutputChoice {
     /// device's clock is driven in real time by the app and **no window is
     /// opened** (so the binary can run in a headless test).
     Null,
+    /// The deterministic null device, but the window still opens. This is the
+    /// silent windowed mode (`--no-audio`): playback runs without any audio
+    /// hardware (a headless VM has no endpoint), so the window tests can prove
+    /// the window opened without depending on a device. The virtual clock is
+    /// driven once per frame by the windowed presenter, exactly as
+    /// [`crate::app::App::run_headless`] drives it headless.
+    NoAudio,
 }
 
 /// The parsed command line.
@@ -45,10 +52,11 @@ pub struct Args {
 
 /// The usage text (`--help`).
 pub const USAGE: &str = "\
-usage: rustamp [<file>] [--null] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
+usage: rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
 
   <file>            media file to load and play (optional)
   --null            use the deterministic null output and run headless (no window)
+  --no-audio        open the window but play on the null output (silent; no audio device needed)
   --volume <0..=255> initial volume (default: the config's audio.volume)
   --skin <path>     skin folder, .wsz or .zip (default: config's ui.skin, then built-in)
   --seconds <n>     stop after n seconds of playback (test aid)
@@ -99,6 +107,7 @@ where
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--null" => parsed.output = OutputChoice::Null,
+            "--no-audio" => parsed.output = OutputChoice::NoAudio,
             "--volume" => {
                 let value = it.next().ok_or(CliError::MissingValue("--volume"))?;
                 parsed.volume = Some(value.parse::<u8>().map_err(|_| CliError::BadValue {
@@ -154,6 +163,13 @@ mod tests {
     fn null_selects_the_test_output() {
         let args = parse_args(&["--null", "music.flac"]).unwrap();
         assert_eq!(args.output, OutputChoice::Null);
+        assert_eq!(args.file, Some(PathBuf::from("music.flac")));
+    }
+
+    #[test]
+    fn no_audio_selects_the_silent_windowed_output() {
+        let args = parse_args(&["--no-audio", "music.flac"]).unwrap();
+        assert_eq!(args.output, OutputChoice::NoAudio);
         assert_eq!(args.file, Some(PathBuf::from("music.flac")));
     }
 
@@ -235,7 +251,14 @@ mod tests {
 
     #[test]
     fn the_usage_text_names_every_option() {
-        for option in ["--null", "--volume", "--skin", "--seconds", "--help"] {
+        for option in [
+            "--null",
+            "--no-audio",
+            "--volume",
+            "--skin",
+            "--seconds",
+            "--help",
+        ] {
             assert!(USAGE.contains(option), "usage does not mention {option}");
         }
     }

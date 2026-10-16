@@ -4,12 +4,13 @@
 //! GUI must never run on the host, so this test is `#[ignore]`d **and** gated
 //! on the headless test VM, exactly like
 //! `headless::the_windowed_player_opens_a_window_inside_the_test_vm`. It
-//! spawns the real binary in windowed mode (no `--null`, GUI rail off), which
-//! opens both the main window and the playlist editor (`Winamp PE`, 275 x 116,
-//! docked below the main window). A console window counts as a window on the
+//! spawns the real binary in the silent windowed mode (`--no-audio`, GUI rail
+//! off), which opens both the main window and the playlist editor (`Winamp PE`,
+//! 275 x 116, docked below the main window) on the null output — so it needs
+//! **no audio endpoint**. A console window counts as a window on the
 //! host, so the child goes through the same `CREATE_NO_WINDOW` guard.
 //!
-//! Run inside the headless test VM with an audio endpoint available:
+//! Run inside the headless test VM; no audio endpoint is needed:
 //!
 //! ```text
 //! cargo test -p rustamp-app -- --ignored playlist_window
@@ -79,17 +80,26 @@ fn the_playlist_window_opens_docked_below_the_main_window() {
     // test. The config is isolated so the test never reads real user state.
     command.env("RUSTAMP_CONFIG", dir.path().join("rustamp.toml"));
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.arg(fixture()).spawn().expect("spawn rustamp");
+    // The silent windowed mode: the windows open, but playback runs on the
+    // null output, so the test needs no audio endpoint. The subject is the
+    // docked geometry, not the device.
+    let mut child = command
+        .arg("--no-audio")
+        .arg(fixture())
+        .spawn()
+        .expect("spawn rustamp");
     let pid = child.id();
 
     // If it is still running after three seconds, the windows opened and the
-    // event loop is live. If it exited, the smoke test failed (no endpoint?).
+    // event loop is live. If it exited, the smoke test failed (and
+    // `--no-audio` rules out a missing audio endpoint as the cause).
     std::thread::sleep(Duration::from_secs(3));
     if let Some(status) = child.try_wait().expect("try_wait") {
         let output = child.wait_with_output().expect("wait_with_output");
         panic!(
-            "the windowed player exited early ({status}); is there an audio endpoint?\n\
-             --- stdout ---\n{}\n--- stderr ---\n{}",
+            "the windowed player exited early ({status}); it runs silent (`--no-audio`), \
+             so this is not a missing audio endpoint\n\
+              --- stdout ---\n{}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -125,7 +135,7 @@ fn the_playlist_window_opens_docked_below_the_main_window() {
     let output = child.wait_with_output().expect("wait_with_output");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("output "),
-        "the player never reported its device; stdout:\n{stdout}"
+        stdout.contains("output null"),
+        "the player never reported the silent device; stdout:\n{stdout}"
     );
 }

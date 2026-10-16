@@ -91,10 +91,16 @@ pub struct App {
     commands: CommandSender,
     command_rx: CommandReceiver,
 
-    /// The virtual clock, when the null output is in use.
+    /// The virtual clock, when the null output is in use (`--null` headless or
+    /// `--no-audio` windowed).
     clock: Option<NullClock>,
     started: Instant,
     seconds: Option<u64>,
+    /// Last time [`App::drive_null_clock`] ran (windowed `--no-audio` only).
+    last_null_tick: Instant,
+    /// Sub-frame remainder for [`App::drive_null_clock`], mirroring the
+    /// accumulator in [`App::run_headless`].
+    pending_null_frames: f64,
 
     // ----- application-level state (not the engine's, not the UI machine's) -----
     shuffle: bool,
@@ -151,7 +157,7 @@ impl App {
         let (commands, command_rx) = command_channel();
 
         let (output, clock): (Box<dyn OutputDevice>, Option<NullClock>) = match options.output {
-            OutputChoice::Null => {
+            OutputChoice::Null | OutputChoice::NoAudio => {
                 let (output, clock) = NullOutput::pair();
                 (Box::new(output), Some(clock))
             }
@@ -200,6 +206,8 @@ impl App {
             clock,
             started: Instant::now(),
             seconds: options.seconds,
+            last_null_tick: Instant::now(),
+            pending_null_frames: 0.0,
             shuffle: false,
             repeat: false,
             always_on_top: false,
@@ -288,7 +296,9 @@ impl App {
         self.quit
     }
 
-    /// Whether the app was started in the headless (null-output) mode.
+    /// Whether the app uses the null output (`--null` headless or `--no-audio`
+    /// windowed). This reports the device, not the presentation: a
+    /// `--no-audio` run still opens the window.
     pub fn headless(&self) -> bool {
         self.clock.is_some()
     }
@@ -756,6 +766,44 @@ impl App {
     // -----------------------------------------------------------------------
     // Headless playback (the `--null` mode)
     // -----------------------------------------------------------------------
+
+    /// Pumps the null output's virtual clock by `frames` frames.
+    ///
+    /// This is the deterministic half of the silent windowed mode
+    /// (`--no-audio`): it moves the audio clock without any hardware, so a
+    /// windowed run plays silently instead of stalling on a full ring. With a
+    /// real device there is no virtual clock and this is a no-op (the device
+    /// pulls on its own thread).
+    pub fn advance_null_clock(&mut self, frames: u64) {
+        if let Some(clock) = self.clock.as_ref() {
+            clock.pump(frames);
+        }
+    }
+
+    /// Advances the null output's virtual clock by the real time elapsed since
+    /// the previous drive.
+    ///
+    /// The windowed presenter calls this once per frame so a `--no-audio` run
+    /// plays silently in real time, exactly as [`App::run_headless`] drives
+    /// the same clock headless. With a real device this is a no-op.
+    pub fn drive_null_clock(&mut self) {
+        if self.clock.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_null_tick);
+        self.last_null_tick = now;
+        let rate = self.engine.device_spec().sample_rate;
+        if rate == 0 {
+            return;
+        }
+        self.pending_null_frames += elapsed.as_secs_f64() * f64::from(rate);
+        let frames = self.pending_null_frames.floor() as u64;
+        self.pending_null_frames -= frames as f64;
+        if frames > 0 {
+            self.advance_null_clock(frames);
+        }
+    }
 
     /// Plays the queue to its end (or to `--seconds`) on a virtual device whose
     /// clock this loop drives in real time. No window is opened.
@@ -1353,6 +1401,37 @@ mod tests {
         let notes = app.drain_notes();
         assert!(notes.iter().any(|n| n.contains("Equalizer")), "{notes:?}");
         assert!(!app.quit(), "an unimplemented window must not quit the app");
+    }
+
+    #[test]
+    fn advancing_the_null_clock_moves_playback_without_a_device() {
+        // The deterministic half of the silent windowed mode (`--no-audio`):
+        // driving the virtual clock pulls decoded frames through the engine
+        // with no hardware and no window involved.
+        let dir = tempfile::tempdir().unwrap();
+        let file = track(&dir, "track1_44100.tst");
+        let (mut app, _dir) = app_with_file(Some(file));
+        app.submit(Command::Play).unwrap();
+        let mut moved = false;
+        for _ in 0..2000 {
+            app.advance_null_clock(1024);
+            app.pump().unwrap();
+            if app.engine().timeline_frames() > 0 {
+                moved = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            moved,
+            "driving the null clock never moved the timeline (transport {:?})",
+            app.engine().transport()
+        );
+        assert!(
+            app.engine().last_error().is_none(),
+            "the silent run errored: {:?}",
+            app.engine().last_error()
+        );
     }
 
     // ----- event routing: events update the UI state -----

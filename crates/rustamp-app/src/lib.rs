@@ -33,8 +33,9 @@
 //!
 //! # GUI rule: the window only runs inside the headless test VM
 //!
-//! [`run`] opens a window only for [`cli::OutputChoice::Default`]. With
-//! [`cli::OutputChoice::Null`] it plays headless through
+//! [`run`] opens a window for [`cli::OutputChoice::Default`] and for
+//! [`cli::OutputChoice::NoAudio`] (the silent windowed mode, `--no-audio`).
+//! With [`cli::OutputChoice::Null`] it plays headless through
 //! [`app::App::run_headless`] and **never** calls [`window::run`], so the
 //! default `cargo test --workspace --all-features` opens no window. As a second
 //! rail, [`window::run`] refuses to start when [`window::NO_GUI_ENV`] is set,
@@ -66,12 +67,15 @@ use crate::config::ConfigSource;
 /// Runs the player for a parsed command line.
 ///
 /// With [`OutputChoice::Null`] the app uses the deterministic null output and
-/// runs headless (no window); otherwise it opens the main window and plays on
-/// the best device for the host.
+/// runs headless (no window); with [`OutputChoice::NoAudio`] it uses the same
+/// null output but still opens the main window (silent windowed playback, no
+/// audio device needed); otherwise it opens the main window and plays on the
+/// best device for the host.
 pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
-    // GUI rail first: with the default output a window will be opened, so a
-    // mis-run must fail before the audio device or the event loop exists.
-    if args.output == OutputChoice::Default {
+    // GUI rail first: a windowed run (the default output or `--no-audio`)
+    // opens a window, so a mis-run must fail before the audio device or the
+    // event loop exists. `--null` stays headless and needs no rail.
+    if args.output != OutputChoice::Null {
         window::ensure_gui_allowed()?;
     }
 
@@ -120,13 +124,20 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         // ----- the real player: window + device -----
-        OutputChoice::Default => {
-            println!(
-                "rustamp: output {} @ {} Hz, {} ch",
-                app.engine().output_name(),
-                app.engine().device_spec().sample_rate,
-                app.engine().device_spec().channels
-            );
+        OutputChoice::Default | OutputChoice::NoAudio => {
+            if args.output == OutputChoice::Default {
+                println!(
+                    "rustamp: output {} @ {} Hz, {} ch",
+                    app.engine().output_name(),
+                    app.engine().device_spec().sample_rate,
+                    app.engine().device_spec().channels
+                );
+            } else {
+                // The silent windowed mode: the null device needs no hardware,
+                // so this line is also what the window tests pin to prove the
+                // run reached the windowed path without a device.
+                println!("rustamp: output null (windowed; silent, no audio device)");
+            }
             if args.file.is_some() {
                 // S02 §1: a file given on the command line starts playing.
                 app.submit(Command::Play)?;

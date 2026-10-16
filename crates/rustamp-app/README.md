@@ -9,7 +9,7 @@ the modules and `docs/tasks/N1-app-wiring.md` for the task card.
 The binary is `rustamp`:
 
 ```text
-rustamp [<file>] [--null] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
+rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
 ```
 
 ## Headless mode — safe to run anywhere
@@ -31,7 +31,9 @@ cargo run -p rustamp-app -- <file>
 ```
 
 Without `--null` the app opens the main window and plays on the best device for
-the host.
+the host. With `--no-audio` it opens the same window but plays silently on the
+null output, so it needs **no audio endpoint** (a Hyper-V VM has none) — this
+is the mode the window tests use.
 
 > **GUI must never run on the host.**
 >
@@ -72,12 +74,16 @@ The tests that open windows are `#[ignore]`d and VM-only
 cargo test -p rustamp-app -- --ignored
 ```
 
-Run them **inside the headless test VM** with an audio endpoint available. They
-spawn the player (or probe in-process), wait three seconds, check that it is
-still running (the window opened and the event loop is live), read back the
-windows' OS geometry — main 275 x 116, equalizer 275 x 116 at its docked
-position, playlist 275 x 116 docked below the main window, menu popup
-323 x 569 — and kill the player. In-process probes build their event loop
+Run them **inside the headless test VM**. The main-window and playlist-window
+tests spawn the player with `--no-audio`, so they need no audio endpoint; the
+in-process probes never touch audio either. Only `tests/real_playback.rs`
+needs a real endpoint (a virtual audio device or the Hyper-V audio
+redirection) — it exercises the production device path and fails loudly
+without one. The spawned player is waited on for three seconds to check that
+it is still running (the window opened and the event loop is live), then the
+windows' OS geometry is read back — main 275 x 116, equalizer 275 x 116 at its
+docked position, playlist 275 x 116 docked below the main window, menu popup
+323 x 569 — and the player is killed. In-process probes build their event loop
 off the main thread on purpose (`window::build_event_loop(true)`), because
 tests run on harness worker threads; the product keeps the default.
 

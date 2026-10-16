@@ -6,12 +6,14 @@
 //! routes commands and events between the headless UI machine and the engine.
 //!
 //! ```text
-//! rustamp [<file>] [--null] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
+//! rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
 //! ```
 //!
 //! With `--null` the app uses the deterministic null output and runs
 //! **headless** (no window), so the binary can be exercised in a headless test;
-//! with the default output it opens the main window.
+//! with `--no-audio` it uses the same null output but still opens the main
+//! window (silent windowed playback, no audio device needed); with the default
+//! output it opens the main window and plays on the best device for the host.
 
 #![forbid(unsafe_code)]
 

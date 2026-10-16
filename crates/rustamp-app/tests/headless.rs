@@ -230,8 +230,10 @@ fn the_gui_rail_refuses_to_open_a_window() {
 /// the test VM.**
 ///
 /// GUI must never run on the host. Run this only inside the headless test VM
-/// (the only host for anything graphical), with an audio endpoint
-/// available:
+/// (the only host for anything graphical). It needs **no audio endpoint**: it
+/// spawns the player with `--no-audio` (the silent windowed mode — the null
+/// output with the window open), so a Hyper-V VM without a device can still
+/// prove the window opened.
 ///
 /// ```text
 /// cargo test -p rustamp-app -- --ignored
@@ -241,7 +243,8 @@ fn the_gui_rail_refuses_to_open_a_window() {
 /// ([`rustamp_app::window::require_test_vm`]). Inside, it checks the player
 /// stays up (the window opened and the event loop is live), reads back the
 /// main window's OS geometry — client 275 x 116 (S01 §4), visible — and
-/// kills the player.
+/// kills the player. The final assertion pins `output null`: the run must
+/// have taken the silent path, never a real device.
 ///
 /// The spawned child builds its loop on its own main thread, so it needs no
 /// opt-in: the off-main-thread mode
@@ -262,16 +265,25 @@ fn the_windowed_player_opens_a_window_inside_the_test_vm() {
     command.env_remove(rustamp_app::window::NO_GUI_ENV);
     command.env("RUSTAMP_CONFIG", dir.path().join("rustamp.toml"));
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.arg(fixture()).spawn().expect("spawn rustamp");
+    // The silent windowed mode: the window opens, but playback runs on the
+    // null output, so the test needs no audio endpoint (a Hyper-V VM has
+    // none). The subject is the window, not the device.
+    let mut child = command
+        .arg("--no-audio")
+        .arg(fixture())
+        .spawn()
+        .expect("spawn rustamp");
     let pid = child.id();
 
     // If it is still running after three seconds, the window opened and the
-    // event loop is live. If it exited, the smoke test failed (no endpoint?).
+    // event loop is live. If it exited, the smoke test failed (and
+    // `--no-audio` rules out a missing audio endpoint as the cause).
     std::thread::sleep(Duration::from_secs(3));
     if let Some(status) = child.try_wait().expect("try_wait") {
         let output = child.wait_with_output().expect("wait_with_output");
         panic!(
-            "the windowed player exited early ({status}); is there an audio endpoint?\n\
+            "the windowed player exited early ({status}); it runs silent (`--no-audio`), \
+             so this is not a missing audio endpoint\n\
              --- stdout ---\n{}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -303,8 +315,41 @@ fn the_windowed_player_opens_a_window_inside_the_test_vm() {
     let output = child.wait_with_output().expect("wait_with_output");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("output "),
-        "the player never reported its device; stdout:\n{stdout}"
+        stdout.contains("output null"),
+        "the player never reported the silent device; stdout:\n{stdout}"
+    );
+}
+
+/// The GUI rail covers the silent windowed mode too.
+///
+/// `--no-audio` would open a window, so with `RUSTAMP_NO_GUI=1` it must refuse
+/// before the audio device or the event loop exists — exactly like the default
+/// windowed run. This refuses fast without opening anything, so it runs
+/// anywhere (no `#[ignore]`, no VM gate): it proves the new flag cannot slip
+/// past the rail.
+#[test]
+fn the_gui_rail_refuses_the_silent_windowed_mode_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = binary();
+    isolate(&mut command, &dir); // sets RUSTAMP_NO_GUI=1
+    let output = command
+        .arg("--no-audio")
+        .arg(fixture())
+        .output()
+        .expect("spawn rustamp");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the silent windowed run must fail under the GUI rail\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("test VM"),
+        "the rail message must name the rule; stderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("output "),
+        "the run must stop before the audio device is opened; stdout:\n{stdout}"
     );
 }
 
