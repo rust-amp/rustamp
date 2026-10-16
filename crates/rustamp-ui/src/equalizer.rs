@@ -68,13 +68,25 @@ pub fn value_for_thumb_y(y: i32) -> u8 {
 
 /// A saved value `0..=63` as a gain in dB, clamped to ±12.
 ///
-/// **Provisional.** S07 §7.2 leaves the value-to-gain function open (only the
-/// axis labels `+12db`/`+0db`/`-12db` and the flat point 31 = 0 dB are in S01
-/// §3); this is the linear reading of those endpoints. Whether preamp and
-/// bands share one ramp is likewise open (S07 §7.2), so both use this map.
+/// Anchors from spec S09 (audited) and S01 §3:
+/// `0 = +12 dB`, `31 = 0 dB` (flat), `63 = -12 dB`.
+///
+/// The conversion uses a piecewise-linear law that hits all three anchors exactly:
+/// - for `value <= 31`: `db = (31 - value) * 12 / 31` (so 0 -> +12 dB, 31 -> 0 dB)
+/// - for `value >= 31`: `db = (31 - value) * 12 / 32` (so 31 -> 0 dB, 63 -> -12 dB)
+///
+/// The three anchors and the measured conversion in `rustamp-proto`
+/// (`eq_classic_from_db`) are fixed; the intermediate law between the anchors
+/// is an own choice (the spec leaves it open). This piecewise law ensures that
+/// `eq_classic_from_db(saved_to_gain_db(v)) == v` for every `v in 0..=63`,
+/// eliminating the dead zone at the bottom of the slider travel.
 pub fn saved_to_gain_db(value: u8) -> f32 {
-    let value = f32::from(value.min(MAX_VALUE));
-    ((31.0 - value) * 12.0 / 31.0).clamp(-12.0, 12.0)
+    let value = value.min(MAX_VALUE);
+    if value <= FLAT_VALUE {
+        (f32::from(FLAT_VALUE) - f32::from(value)) * 12.0 / f32::from(FLAT_VALUE)
+    } else {
+        (f32::from(FLAT_VALUE) - f32::from(value)) * 12.0 / 32.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +645,36 @@ mod tests {
         }
         assert_eq!(value_for_thumb_y(0), 0);
         assert_eq!(value_for_thumb_y(1000), 63);
+    }
+
+    #[test]
+    fn saved_to_gain_db_anchors_and_round_trip() {
+        use rustamp_proto::state::eq_classic_from_db;
+
+        // Three measured anchors from spec S09 (audited) and S01 §3:
+        // 0 -> +12 dB, 31 -> 0 dB (flat), 63 -> -12 dB.
+        assert_eq!(saved_to_gain_db(0), 12.0);
+        assert_eq!(saved_to_gain_db(31), 0.0);
+        assert_eq!(saved_to_gain_db(63), -12.0);
+
+        // Anchors mapped back through eq_classic_from_db.
+        assert_eq!(eq_classic_from_db(saved_to_gain_db(0)), 0);
+        assert_eq!(eq_classic_from_db(saved_to_gain_db(31)), 31);
+        assert_eq!(eq_classic_from_db(saved_to_gain_db(63)), 63);
+
+        // The intermediate law between the anchors is an own choice (the spec leaves
+        // it open), while the three anchors and the measured conversion are fixed.
+        // The round trip eq_classic_from_db(saved_to_gain_db(v)) == v must hold for
+        // every single slider value in 0..=63 without dead zones.
+        for value in 0..=63u8 {
+            let db = saved_to_gain_db(value);
+            let classic = eq_classic_from_db(db);
+            assert_eq!(
+                classic,
+                i32::from(value),
+                "round trip failed for value {value}: db = {db}, classic = {classic}"
+            );
+        }
     }
 
     #[test]
