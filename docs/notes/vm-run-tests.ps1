@@ -62,6 +62,27 @@ foreach ($dll in Get-ChildItem -Path (Join-Path $debugDir 'deps') -Filter '*.dll
     Copy-Item $dll.FullName (Join-Path $Stage 'target\debug\deps') -Force
 }
 if (Test-Path (Join-Path $debugDir 'rustamp.exe')) { Copy-Item (Join-Path $debugDir 'rustamp.exe') (Join-Path $Stage 'target\debug') -Force }
+
+# The plugin host is built for i686 — the app is 64-bit and the host 32-bit by
+# design (RFC 0006 §8) — so a plain workspace test build produces none and the
+# supervisor finds nothing to spawn. Build it and stage it where the resolver
+# looks first, next to the binary that will run, so the ignored end-to-end test
+# can exercise the whole chain here, in the guest, which is the only place it
+# may run. A missing host is reported, not hidden: the test then fails loudly
+# rather than passing vacuously.
+Step 'building the i686 plugin host for the end-to-end test'
+$prevPref = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& cargo build -p rustamp-plughost --target i686-pc-windows-msvc 2>$null | Out-Null
+$ErrorActionPreference = $prevPref
+$hostExe = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\rustamp-plughost32.exe'
+if (Test-Path $hostExe) {
+    Copy-Item $hostExe (Join-Path $Stage 'target\debug\deps') -Force
+    Copy-Item $hostExe (Join-Path $Stage 'target\debug') -Force
+    Write-Host '    staged the i686 plugin host beside the binaries'
+} else {
+    Write-Host '    WARNING: no i686 plugin host was built; the end-to-end test will report it blocked'
+}
 foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
     $p = Join-Path $env:SystemRoot "System32\$crt"
     if (Test-Path $p) {
