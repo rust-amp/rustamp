@@ -624,7 +624,7 @@ mod tests {
         assert!(!manager.key(Key::Up));
         assert!(!manager.key(Key::Down));
         manager.open(DialogKind::SkinBrowser);
-        manager.set_skin_rows(entries.len());
+        manager.set_skin_rows(2);
         assert!(manager.key(Key::Down));
         assert_eq!(manager.skin_index(), 1);
         assert!(manager.key(Key::Up));
