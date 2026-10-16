@@ -341,8 +341,11 @@ mod tests {
         let commands = app.playlist_mouse_down(242, 92).expect("LIST OPTS applies");
         assert_eq!(commands, vec![Command::OpenPlaylist]);
         assert!(app.dialog_is_open(rustamp_ui::DialogKind::LoadPlaylist));
+        // ADD emits its command and records that its dialog is not implemented,
+        // so two notes are expected; LIST OPTS now opens a real dialog and adds
+        // none of its own.
         let notes = app.drain_notes();
-        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[0].contains("Add file(s) to playlist"), "{notes:?}");
     }
 

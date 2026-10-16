@@ -212,6 +212,13 @@ pub struct DialogManager {
     open: Option<DialogKind>,
     jump_text: String,
     skin_index: usize,
+    /// How many rows the skin browser has, told to the manager when it opens.
+    ///
+    /// The manager cannot know the list itself, and without the count a held
+    /// Down key would run the index far past the end, so a following Up would
+    /// appear to do nothing for several presses. Zero means "not told" and the
+    /// moves stay unbounded, which is what the read-side clamp then handles.
+    skin_rows: usize,
 }
 
 impl DialogManager {
@@ -323,10 +330,24 @@ impl DialogManager {
     }
 
     /// Moves the skin browser's selection one row down. A no-op unless the
-    /// skin browser is open.
+    /// skin browser is open. Clamped to the last row when the row count is
+    /// known (see [`set_skin_rows`](Self::set_skin_rows)).
     pub fn select_next_skin(&mut self) {
         if matches!(self.open, Some(DialogKind::SkinBrowser)) {
             self.skin_index = self.skin_index.saturating_add(1);
+            if self.skin_rows > 0 {
+                self.skin_index = self.skin_index.min(self.skin_rows - 1);
+            }
+        }
+    }
+
+    /// Tells the manager how many rows the skin browser has, so that moving the
+    /// selection saturates at the last row instead of overrunning it. Call it
+    /// when opening the browser; `0` means "unknown" and leaves moves unbounded.
+    pub fn set_skin_rows(&mut self, rows: usize) {
+        self.skin_rows = rows;
+        if rows > 0 && self.skin_index >= rows {
+            self.skin_index = rows - 1;
         }
     }
 
@@ -570,6 +591,7 @@ mod tests {
         // No selection without the browser open.
         assert_eq!(manager.selected_skin(&entries), None);
         manager.open(DialogKind::SkinBrowser);
+        manager.set_skin_rows(entries.len());
         assert_eq!(manager.skin_index(), 0);
         assert_eq!(manager.selected_skin(&entries), Some(&entries[0]));
         manager.select_next_skin();
@@ -586,6 +608,7 @@ mod tests {
         // Reopening resets to the first row.
         manager.select_next_skin();
         manager.open(DialogKind::SkinBrowser);
+        manager.set_skin_rows(entries.len());
         assert_eq!(manager.skin_index(), 0);
         // Another dialog open selects nothing.
         manager.open(DialogKind::About);
@@ -601,6 +624,7 @@ mod tests {
         assert!(!manager.key(Key::Up));
         assert!(!manager.key(Key::Down));
         manager.open(DialogKind::SkinBrowser);
+        manager.set_skin_rows(entries.len());
         assert!(manager.key(Key::Down));
         assert_eq!(manager.skin_index(), 1);
         assert!(manager.key(Key::Up));

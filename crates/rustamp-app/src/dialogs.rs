@@ -49,6 +49,12 @@ impl App {
     pub fn open_dialog_for(&mut self, command: &Command) -> Option<DialogKind> {
         let dialog = dialog_for_command(command)?;
         self.dialogs.open(dialog);
+        // The browser moves its selection with the arrow keys, and without the
+        // row count a held Down would overrun the end and a following Up would
+        // appear dead. Tell the manager how many rows it is looking at.
+        if dialog == DialogKind::SkinBrowser {
+            self.dialogs.set_skin_rows(self.browser_entries().len());
+        }
         Some(dialog)
     }
 
