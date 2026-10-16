@@ -24,6 +24,29 @@ This statement must hold before the first external contribution: once code from
 outside has arrived under a crate's license, relicensing that crate needs every
 contributor's consent.
 
+## Dependencies
+
+- **Prefer a well-maintained crate over a self-implementation** (owner rule,
+  2026-10-17). Reach for an established, actively maintained crate instead of
+  writing the algorithm yourself. Hand-rolling is the better choice only when no
+  suitable crate exists, the crate is unmaintained, or it cannot meet a hard
+  constraint here (the audio thread's no-allocation/no-lock rule, the MSRV, or a
+  contract we must not change).
+- **The license must be compatible, and it decides who may depend on what.**
+  For the GPL crates (GPL-3.0-or-later with the §7 plugin exception) any
+  GPL-compatible license works. For the four permissive crates
+  (`rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`)
+  only a permissive license is allowed, because they must stay GPL-free — the
+  `licenses` CI job enforces exactly that. Check the license before adding, and
+  check the crate's own manifest rather than a directory API: `rubato`, for
+  example, has an empty license field on crates.io and `NOASSERTION` on GitHub,
+  but declares `MIT OR Apache-2.0` in its `Cargo.toml`.
+- **Adding a Rust dependency no longer needs a per-crate owner approval**
+  (owner rule, 2026-10-17), but the license check and the record are not
+  optional: **record every new dependency** in `THIRD_PARTY.md` with its license
+  and what it is used for, and add it to the permissive-license check's closure
+  if it lands in a permissive crate.
+
 ## Coding standards
 
 - **Formatting:** `cargo fmt --all`. The config is in `rustfmt.toml`.

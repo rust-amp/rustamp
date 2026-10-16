@@ -12,5 +12,5 @@ Read these first, in this order:
 - Talk to the user in German. Code, comments and docs are in English.
 - Implement only from `specs/` and from freely licensed sources. Contract changes in `rustamp-core` require a new RFC in `docs/rfc/`.
 - The player is 64-bit. Only `rustamp-plughost` is built for i686.
-- Ask the user before downloads, before installing or running reference binaries, and before committing.
+- Ask the user before downloads, before installing or running reference binaries, and before committing — **except adding a Rust dependency**: a well-maintained crate with a compatible license may be added without asking (owner rule, 2026-10-17); prefer it over a self-implementation, check the license, and record it in `THIRD_PARTY.md`. See `CONTRIBUTING.md` §Dependencies.
 - Before reporting done, run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo test --workspace --all-features`.
