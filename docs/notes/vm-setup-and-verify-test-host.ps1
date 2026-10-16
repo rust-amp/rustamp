@@ -58,7 +58,11 @@ if ((Get-VM -Name $VmName).State -ne 'Running') { Start-VM -Name $VmName }
 if (-not (Wait-PowerShellDirect)) { throw 'PowerShell Direct did not come up. Is the guest a Windows guest with this local account?' }
 
 Write-Host '--- 2. provisioning ---'
-Invoke-Command -VMName $VmName -Credential $Credential -FilePath (Join-Path $PSScriptRoot 'vm-provision-test-host.ps1')
+# The credential travels as an object over the encrypted PowerShell Direct
+# channel so the provision script can write Winlogon's DefaultPassword: that
+# value is the load-bearing half of auto-logon, and the checkpoint baked
+# without it is exactly why the guest had no interactive session.
+Invoke-Command -VMName $VmName -Credential $Credential -FilePath (Join-Path $PSScriptRoot 'vm-provision-test-host.ps1') -ArgumentList $Credential
 
 Write-Host '--- 2b. guest facts ---'
 Invoke-Command -VMName $VmName -Credential $Credential -ScriptBlock {
@@ -81,7 +85,31 @@ Start-Sleep -Seconds 20
 if (-not (Wait-GuestReady)) { throw 'the guest did not come back after the reboot' }
 Write-Host 'guest is back'
 
+Write-Host '--- 3b. proving the interactive session (the check this script was missing) ---'
+# An earlier revision rebooted and went straight to the checkpoint: the reg
+# value said auto-logon was on while no session ever existed. Now the session
+# itself is the gate - explorer running, an Active console row, a non-empty
+# desktop - and a checkpoint is only taken past this point.
+$assertPath = Join-Path $PSScriptRoot 'vm-broker\guest\assert-interactive-session.ps1'
+$deadline = (Get-Date).AddMinutes(10)
+$proven = $false
+while ((Get-Date) -lt $deadline) {
+    try {
+        Invoke-Command -VMName $VmName -Credential $Credential -FilePath $assertPath -ErrorAction Stop | Format-List
+        $proven = $true
+        break
+    } catch {
+        Write-Host ("    not yet: {0}" -f $_.Exception.Message)
+        Start-Sleep -Seconds 15
+    }
+}
+if (-not $proven) { throw 'no interactive session within 10 minutes of the reboot; no checkpoint is taken and nothing is promoted' }
+Write-Host 'interactive session proven'
+
 Write-Host '--- 4. baseline checkpoint ---'
+if (Get-VMSnapshot -VMName $VmName -Name 'base-provisioned' -ErrorAction SilentlyContinue) {
+    throw "checkpoint 'base-provisioned' already exists and holds the state from before this fix (no auto-logon password, no session); remove it first: .\vm-snapshot-test-host.ps1 -Remove base-provisioned"
+}
 & (Join-Path $PSScriptRoot 'vm-snapshot-test-host.ps1') -Create base-provisioned -Credential $Credential
 
 Write-Host @'

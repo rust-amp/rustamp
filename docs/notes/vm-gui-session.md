@@ -4,14 +4,29 @@ Why the window tests needed a second path, and the exact steps from
 "orchestrator runs one command" to "proof back on the host". Process only -
 nothing here is derived from Winamp source, the SDK or the binary.
 
+## 0. Provisioning correction (2026-10-16)
+
+§1 below assumed the guest holds an auto-logon interactive session. It did
+not: `vm-provision-test-host.ps1` wrote `AutoAdminLogon`/`DefaultUserName`/
+`DefaultDomainName` but never Winlogon's `DefaultPassword`, without which
+Winlogon stops at the logon screen and no session is ever created. The
+provision script now takes the guest credential and writes `DefaultPassword`
+(plus `AutoLogonCount` removal and password-never-expires), the setup script
+passes it and proves the session with the new allow-listed guest script
+`vm-broker/guest/assert-interactive-session.ps1` before taking the checkpoint,
+and the old `base-provisioned` checkpoint (baked without the password) must
+be removed and re-taken. Until that re-take, this document's session
+assumption does not hold.
+
 ## 1. The finding
 
 The broker's guest scripts run as the S4U user in **session 0**, which has no
 desktop. The plugin host's plain Win32 window and the end-to-end test pass
 there, but every ignored winit window test **panics inside winit** when run
 through the normal runner (`docs/notes/vm-run-tests.ps1`), because winit
-needs a desktop. The VM (`rustamp-test`) has an **auto-logon interactive
-session** (see `vm-provision-test-host.ps1` §1); the code already gates GUI
+needs a desktop. The VM (`rustamp-test`) is provisioned with an **auto-logon
+interactive session** (see `vm-provision-test-host.ps1` §1, and §0 above on
+the correction that made this true); the code already gates GUI
 work on the test VM (`rustamp_app::window::require_test_vm` and the
 `rustamp-plughost` copy: staged-tree marker or the machine name), so the four
 window tests are ready to run - they just need to be **started in that

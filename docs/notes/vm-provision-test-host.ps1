@@ -4,10 +4,22 @@
 # so nothing appears on the owner's desktop:
 #
 #   $c = Get-Credential            # the guest's local account, e.g. rustamp
-#   Invoke-Command -VMName rustamp-test -Credential $c -FilePath docs\notes\vm-provision-test-host.ps1
+#   Invoke-Command -VMName rustamp-test -Credential $c -FilePath docs\notes\vm-provision-test-host.ps1 -ArgumentList $c
 #
 # It sets the guest up so that test runs are headless, reproducible and
 # window-free, and it prints the facts the manifests need.
+
+param(
+    # The guest's own logon credential (the same one PowerShell Direct uses).
+    # Auto-logon NEEDS the plaintext password in Winlogon's DefaultPassword:
+    # without it Winlogon stops at the logon screen, no interactive session is
+    # created, explorer.exe never starts, and every window test has no desktop.
+    # That missing value is exactly why the guest once showed no Active console.
+    # The caller passes the credential it already holds, over the encrypted
+    # PowerShell Direct channel - the password must NEVER travel through the
+    # broker's request.json (the broker logs its args).
+    [PSCredential]$GuestCredential
+)
 
 $ErrorActionPreference = 'Continue'
 
@@ -24,6 +36,30 @@ Set-ItemProperty -Path $winlogon -Name AutoAdminLogon   -Value '1'
 Set-ItemProperty -Path $winlogon -Name DefaultUserName  -Value $user
 Set-ItemProperty -Path $winlogon -Name DefaultDomainName -Value $domain
 Show 'auto-logon user' $user
+
+# The password is the load-bearing half of auto-logon: Winlogon will not log on
+# without DefaultPassword, and an earlier revision of this script never wrote
+# it - which is why the guest booted to the logon screen with no session.
+if ($GuestCredential) {
+    $credUser = ($GuestCredential.UserName -split '\\')[-1]
+    if ($credUser -ne $user) { Write-Warning ("credential user '{0}' differs from provisioning user '{1}'; auto-logon is set for '{1}'" -f $credUser, $user) }
+    $plain = $GuestCredential.GetNetworkCredential().Password
+    if ([string]::IsNullOrEmpty($plain)) { throw 'the supplied credential carries no password; auto-logon cannot work without one' }
+    Set-ItemProperty -Path $winlogon -Name DefaultPassword -Value $plain
+    Show 'auto-logon password' 'set (DefaultPassword)'
+} else {
+    Write-Warning 'no -GuestCredential was passed, so DefaultPassword was NOT written; auto-logon will NOT work and the guest will boot to the logon screen with no interactive session'
+}
+# A lingering AutoLogonCount would switch auto-logon back off after N boots;
+# the checkpoint must survive unlimited restores and reboots.
+Remove-ItemProperty -Path $winlogon -Name AutoLogonCount -ErrorAction SilentlyContinue
+# An expired password stops auto-logon with no visible error; pin it.
+try {
+    Set-LocalUser -Name $user -PasswordNeverExpires $true -ErrorAction Stop
+    Show 'password expiry' 'never (auto-logon survives reboots)'
+} catch {
+    Write-Warning ("could not pin password expiry: {0}" -f $_.Exception.Message)
+}
 
 # --- 2. fixed display, 100 % scaling ----------------------------------------
 # The whole point of this VM: the display is OURS. It must not follow the

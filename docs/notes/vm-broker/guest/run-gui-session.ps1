@@ -7,8 +7,9 @@
 # Why this script exists: the broker's PowerShell Direct sessions land in
 # session 0 as the S4U user, which has no desktop. The plugin host's plain
 # Win32 window and the end-to-end test pass there, but every winit window test
-# panics inside winit without a desktop. The guest DOES have an auto-logon
-# interactive session (see docs\notes\vm-provision-test-host.ps1), so this
+# panics inside winit without a desktop. The guest is provisioned to hold an
+# auto-logon interactive session (see docs\notes\vm-provision-test-host.ps1 §1,
+# which must have written Winlogon's DefaultPassword for that to be true), so this
 # script registers a one-shot Scheduled Task that runs as the interactive user
 # with LogonType Interactive - i.e. in that session, on its desktop - and waits
 # for it. The task-registration shape follows the precedent of
