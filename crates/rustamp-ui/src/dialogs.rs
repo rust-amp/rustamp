@@ -1,7 +1,8 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! Simple modal dialogs: About, file info, jump-to (S03 actions), the
-//! load-playlist dialog (S06 §4 LIST OPTS, RFC 0010) and the skin browser
-//! (S03 id 40219, RFC 0005).
+//! load-playlist dialog (S06 §4 LIST OPTS, RFC 0010), the skin browser
+//! (S03 id 40219, RFC 0005) and the preferences frame (S03 ids 40012, 40191,
+//! 40317, RFC 0005 §7).
 //!
 //! [`DialogKind`] is the headless dialog model: which [`Command`] opens which
 //! dialog, each dialog's title and client size, and the open/close state. Like
@@ -32,13 +33,18 @@
 //!   the project has no skin search path (no skins-directory concept: the CLI
 //!   takes one `--skin` path, the config holds one `ui.skin` path).
 //!   Confirming a row loads it through the app's existing skin path.
+//! * The preferences dialog is a **frame**: the reference's pages,
+//!   controls and layout are unmeasured (S04 open), so it shows the requested
+//!   page's name and nothing else. The page list, names and default live in
+//!   `rustamp-prefs`; only the two measured pages exist.
 //! * Rendering uses the `text.bmp` bitmap font as a stand-in (the same choice
 //!   as the playlist rows; the reference's real dialog font is unknown).
 
 use std::path::{Path, PathBuf};
 
-use rustamp_core::command::{Command, JumpTarget};
+use rustamp_core::command::{Command, JumpTarget, PrefsPage};
 use rustamp_gfx::{BitmapFont, GlyphMap, Image};
+use rustamp_prefs::DEFAULT_PAGE;
 use rustamp_skin::{Sheet, Skin, webamp};
 
 use crate::Key;
@@ -58,6 +64,15 @@ pub enum DialogKind {
     /// The skin browser (S03 "Skin browser", id 40219, RFC 0005
     /// `Command::OpenSkinBrowser`).
     SkinBrowser,
+    /// The preferences dialog (S03 "Preferences", id 40012, RFC 0005
+    /// `Command::OpenPrefs` / `Command::OpenPrefsPage`).
+    ///
+    /// Frame only: the reference's pages, controls and layout are unmeasured
+    /// (S04 open), so the dialog shows the requested page's name and nothing
+    /// else. The payload is the page the command asked for; a bare
+    /// `OpenPrefs` shows `rustamp-prefs`' default page, which is an own
+    /// choice.
+    Preferences(PrefsPage),
 }
 
 impl DialogKind {
@@ -71,6 +86,10 @@ impl DialogKind {
             DialogKind::Jump(JumpTarget::Time) => "Jump to time",
             DialogKind::LoadPlaylist => crate::playlist::LOAD_DIALOG_TITLE,
             DialogKind::SkinBrowser => "Skin browser",
+            // Own choice, grounded in the measured menu label (S03 id 40012;
+            // the menu row reads `Preferences...`, the submenu row
+            // `Preferences`): no spec fixes the dialog's title (S04 open).
+            DialogKind::Preferences(_) => "Preferences",
         }
     }
 
@@ -83,6 +102,7 @@ impl DialogKind {
             DialogKind::Jump(_) => JUMP_CLIENT_SIZE,
             DialogKind::LoadPlaylist => LOAD_PLAYLIST_CLIENT_SIZE,
             DialogKind::SkinBrowser => SKIN_BROWSER_CLIENT_SIZE,
+            DialogKind::Preferences(_) => PREFS_CLIENT_SIZE,
         }
     }
 }
@@ -99,6 +119,10 @@ pub const LOAD_PLAYLIST_CLIENT_SIZE: (u32, u32) = (300, 100);
 /// the browser rows (built-in plus at most one file row, see
 /// [`skin_entries`]).
 pub const SKIN_BROWSER_CLIENT_SIZE: (u32, u32) = (300, 140);
+/// Client size of the preferences frame. Own choice: room for the title strip
+/// plus the page name (see the module docs; no spec fixes dialog geometry,
+/// S04 open).
+pub const PREFS_CLIENT_SIZE: (u32, u32) = (320, 200);
 
 /// Which dialog `command` opens, when it opens one.
 ///
@@ -113,6 +137,10 @@ pub fn dialog_for_command(command: &Command) -> Option<DialogKind> {
         Command::OpenJump { target } => Some(DialogKind::Jump(*target)),
         Command::OpenPlaylist => Some(DialogKind::LoadPlaylist),
         Command::OpenSkinBrowser => Some(DialogKind::SkinBrowser),
+        // A bare `OpenPrefs` shows the page model's own-choice default; a
+        // page-carrying command shows the page it names (RFC 0005 §7).
+        Command::OpenPrefs => Some(DialogKind::Preferences(DEFAULT_PAGE)),
+        Command::OpenPrefsPage(page) => Some(DialogKind::Preferences(*page)),
         _ => None,
     }
 }
@@ -126,6 +154,9 @@ pub fn opening_command(dialog: DialogKind) -> Command {
         DialogKind::Jump(target) => Command::OpenJump { target },
         DialogKind::LoadPlaylist => Command::OpenPlaylist,
         DialogKind::SkinBrowser => Command::OpenSkinBrowser,
+        // The page-carrying command round-trips; a bare `OpenPrefs` (which
+        // opens the default page) has no exact inverse and maps back here.
+        DialogKind::Preferences(page) => Command::OpenPrefsPage(page),
     }
 }
 
@@ -369,6 +400,30 @@ impl DialogManager {
         entries.get(self.skin_index).or(entries.last())
     }
 
+    /// The preferences dialog's current page, when it is open.
+    pub fn prefs_page(&self) -> Option<PrefsPage> {
+        match self.open {
+            Some(DialogKind::Preferences(page)) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Switches the open preferences dialog to `page`.
+    ///
+    /// Returns whether a preferences dialog was open (and now shows `page`).
+    /// A page-carrying command for an already-open dialog funnels here through
+    /// the app, so menu, shortcut and command paths all switch the same
+    /// state; opening replaces the dialog either way (see
+    /// [`open`](Self::open)).
+    pub fn select_prefs_page(&mut self, page: PrefsPage) -> bool {
+        if matches!(self.open, Some(DialogKind::Preferences(_))) {
+            self.open = Some(DialogKind::Preferences(page));
+            true
+        } else {
+            false
+        }
+    }
+
     /// Confirms the load-playlist dialog: always `None`.
     ///
     /// RFC 0010 leaves replace-versus-append (and the file filter) open, and
@@ -444,6 +499,8 @@ mod tests {
             DialogKind::Jump(JumpTarget::Time),
             DialogKind::LoadPlaylist,
             DialogKind::SkinBrowser,
+            DialogKind::Preferences(PrefsPage::VisPlugin),
+            DialogKind::Preferences(PrefsPage::VisOptions),
         ] {
             let command = opening_command(dialog);
             assert_eq!(dialog_for_command(&command), Some(dialog), "{command:?}");
@@ -451,13 +508,25 @@ mod tests {
     }
 
     #[test]
+    fn prefs_commands_open_the_prefs_dialog_on_their_page() {
+        // A bare `OpenPrefs` shows the page model's own-choice default; a
+        // page-carrying command shows the page it names (RFC 0005 §7).
+        assert_eq!(
+            dialog_for_command(&Command::OpenPrefs),
+            Some(DialogKind::Preferences(DEFAULT_PAGE))
+        );
+        for page in [PrefsPage::VisPlugin, PrefsPage::VisOptions] {
+            assert_eq!(
+                dialog_for_command(&Command::OpenPrefsPage(page)),
+                Some(DialogKind::Preferences(page)),
+                "{page:?}"
+            );
+        }
+    }
+
+    #[test]
     fn non_dialog_commands_open_nothing() {
-        for command in [
-            Command::Play,
-            Command::Quit,
-            Command::OpenPrefs,
-            Command::OpenMainMenu,
-        ] {
+        for command in [Command::Play, Command::Quit, Command::OpenMainMenu] {
             assert_eq!(dialog_for_command(&command), None, "{command:?}");
         }
     }
@@ -478,15 +547,30 @@ mod tests {
             DialogKind::SkinBrowser.client_size(),
             SKIN_BROWSER_CLIENT_SIZE
         );
+        assert_eq!(
+            DialogKind::Preferences(PrefsPage::VisPlugin).client_size(),
+            PREFS_CLIENT_SIZE
+        );
         for size in [
             ABOUT_CLIENT_SIZE,
             FILE_INFO_CLIENT_SIZE,
             JUMP_CLIENT_SIZE,
             LOAD_PLAYLIST_CLIENT_SIZE,
             SKIN_BROWSER_CLIENT_SIZE,
+            PREFS_CLIENT_SIZE,
         ] {
             assert!(size.0 > 0 && size.1 > 0, "{size:?}");
         }
+    }
+
+    #[test]
+    fn the_prefs_title_is_the_measured_menu_label() {
+        // Own choice, grounded in the measured menu label (S03 id 40012; no
+        // spec fixes the dialog's title, S04 open).
+        assert_eq!(
+            DialogKind::Preferences(PrefsPage::VisPlugin).title(),
+            "Preferences"
+        );
     }
 
     #[test]
@@ -651,5 +735,41 @@ mod tests {
         assert_eq!(manager.confirm_load_playlist(), None);
         manager.open(DialogKind::Jump(JumpTarget::Time));
         assert_eq!(manager.confirm_load_playlist(), None);
+    }
+
+    #[test]
+    fn the_prefs_page_is_the_open_dialog_and_switches() {
+        let mut manager = DialogManager::new();
+        assert_eq!(manager.prefs_page(), None);
+        // Switching with no preferences dialog open switches nothing.
+        assert!(!manager.select_prefs_page(PrefsPage::VisOptions));
+        manager.open(DialogKind::Preferences(PrefsPage::VisPlugin));
+        assert_eq!(manager.prefs_page(), Some(PrefsPage::VisPlugin));
+        assert!(manager.select_prefs_page(PrefsPage::VisOptions));
+        assert_eq!(manager.prefs_page(), Some(PrefsPage::VisOptions));
+        assert!(manager.is_open(DialogKind::Preferences(PrefsPage::VisOptions)));
+        // Another dialog open carries no page and switches nothing.
+        manager.open(DialogKind::About);
+        assert_eq!(manager.prefs_page(), None);
+        assert!(!manager.select_prefs_page(PrefsPage::VisPlugin));
+        // Closing clears the page with the dialog.
+        manager.open(DialogKind::Preferences(PrefsPage::VisPlugin));
+        manager.close_any();
+        assert_eq!(manager.prefs_page(), None);
+    }
+
+    #[test]
+    fn prefs_keys_consume_enter_and_escape_and_type_nothing() {
+        // The frame has no controls yet (contents unmeasured), so digits and
+        // arrows go nowhere; Enter stays consumed without confirming and
+        // Escape closes, like the load-playlist dialog.
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::Preferences(PrefsPage::VisPlugin));
+        assert!(!manager.key(Key::Digit(1)));
+        assert!(!manager.key(Key::Up));
+        assert!(!manager.key(Key::Down));
+        assert!(manager.key(Key::Enter));
+        assert_eq!(manager.prefs_page(), Some(PrefsPage::VisPlugin));
+        assert!(manager.key(Key::Escape));
     }
 }

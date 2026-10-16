@@ -10,6 +10,9 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+# The page list, names, default page and command mapping behind the
+# preferences dialog (`DialogKind::Preferences`).
+rustamp-prefs.workspace = true
 # The RFC 0005 `Command` payload enums (`OpenMediaKind`, `JumpTarget`,
 # `PrefsPage`) are not in `rustamp-core`'s explicit re-export list; importing
 # them from the permissive `rustamp-proto` avoids a `rustamp-core` contract

@@ -1,7 +1,8 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! Simple modal dialogs: About, file info, jump-to (S03 actions), the
-//! load-playlist dialog (S06 §4 LIST OPTS, RFC 0010) and the skin browser
-//! (S03 id 40219, RFC 0005).
+//! load-playlist dialog (S06 §4 LIST OPTS, RFC 0010), the skin browser
+//! (S03 id 40219, RFC 0005) and the preferences frame (S03 ids 40012, 40191,
+//! 40317, RFC 0005 §7).
 //!
 //! The headless state ([`rustamp_ui::DialogManager`]) lives in `rustamp-ui`;
 //! this module is the app glue: opening a dialog for a [`Command`], closing
@@ -30,11 +31,17 @@
 //!   marked. `Enter` loads the selected skin through the existing skin path
 //!   (`Command::LoadSkin` for a file row, the built-in loader otherwise) and
 //!   closes the dialog.
+//! * Preferences: the frame shows the requested page's own-choice name
+//!   (`rustamp-prefs`) and nothing else — the reference's page contents are
+//!   unmeasured (S04 open), so there are no controls to draw, type into or
+//!   confirm. `Enter` stays consumed and keeps the dialog open; `Escape` (or
+//!   the window's close button) closes it.
 
 use std::path::PathBuf;
 
-use rustamp_core::command::{Command, JumpTarget};
+use rustamp_core::command::{Command, JumpTarget, PrefsPage};
 use rustamp_gfx::Image;
+use rustamp_prefs::page_name;
 use rustamp_ui::{DialogKind, Key, SkinEntry, dialog_for_command, render_dialog, skin_entries};
 
 use crate::app::App;
@@ -42,7 +49,7 @@ use crate::app::App;
 impl App {
     /// Opens the dialog `command` asks for, when it asks for one the app now
     /// implements (About, file info, either jump box, load playlist, skin
-    /// browser).
+    /// browser, preferences).
     ///
     /// Returns the opened dialog, or `None` when the command opens no
     /// implemented dialog (the caller keeps its existing note path then).
@@ -68,6 +75,17 @@ impl App {
         self.dialogs.is_open(dialog)
     }
 
+    /// The preferences dialog's current page, when it is open.
+    pub fn prefs_page(&self) -> Option<PrefsPage> {
+        self.dialogs.prefs_page()
+    }
+
+    /// Switches the open preferences dialog to `page`. Returns whether a
+    /// preferences dialog was open (and now shows `page`).
+    pub fn select_prefs_page(&mut self, page: PrefsPage) -> bool {
+        self.dialogs.select_prefs_page(page)
+    }
+
     /// Closes `dialog` when it is open.
     pub fn close_dialog(&mut self, dialog: DialogKind) {
         self.dialogs.close(dialog);
@@ -86,7 +104,9 @@ impl App {
     /// [`Command::Seek`]) or loads the skin browser's selected skin;
     /// `Escape` closes the open dialog; digits type into the jump box and
     /// arrows move the skin selection. `Enter` on the load-playlist dialog is
-    /// consumed and does nothing (RFC 0010 leaves its confirmation open).
+    /// consumed and does nothing (RFC 0010 leaves its confirmation open), as
+    /// it is on the preferences frame (whose contents are unmeasured, S04
+    /// open, so there is nothing to confirm).
     /// Returns `true` when the key was consumed.
     pub fn dialog_key(&mut self, key: Key) -> bool {
         let consumed = self.dialogs.key(key);
@@ -144,6 +164,10 @@ impl App {
             // the same box shape as the jump dialogs.
             DialogKind::LoadPlaylist => vec!["Playlist file:".to_string(), String::new()],
             DialogKind::SkinBrowser => self.skin_browser_lines(),
+            // Frame only: the reference's page contents are unmeasured (S04
+            // open), so the page shows its own-choice name and nothing else —
+            // no controls, no copied text.
+            DialogKind::Preferences(page) => vec![page_name(page).to_string()],
         }
     }
 

@@ -1761,6 +1761,7 @@ dependencies = [
  "rustamp-core",
  "rustamp-gfx",
  "rustamp-platform",
+ "rustamp-prefs",
  "rustamp-proto",
  "rustamp-skin",
  "softbuffer",

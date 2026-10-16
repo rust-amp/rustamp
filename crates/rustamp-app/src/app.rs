@@ -118,8 +118,9 @@ pub struct App {
     /// The playlist editor's behaviour model (S06); owned here, rendered and
     /// fed by `playlist_window.rs`, synced from `entry_ids`.
     pub(crate) playlist: PlaylistWindow,
-    /// The simple modal dialogs (About, file info, jump-to); owned here,
-    /// rendered by `dialogs.rs`, hosted by `window.rs`.
+    /// The simple modal dialogs (About, file info, jump-to, load playlist,
+    /// skin browser, preferences); owned here, rendered by `dialogs.rs`,
+    /// hosted by `window.rs`.
     pub(crate) dialogs: DialogManager,
     notes: Vec<String>,
     /// The app's end of the player-state bridge to the plugin host
@@ -971,17 +972,14 @@ impl App {
             | C::OpenFileInfo
             | C::OpenJump { .. }
             | C::OpenPlaylist
+            | C::OpenPrefs
+            | C::OpenPrefsPage(_)
             | C::OpenSkinBrowser => {
                 // Simple modal dialogs (`dialogs.rs`): the app opens a real
                 // window for these, so no note is recorded.
                 self.open_dialog_for(command);
             }
-            C::OpenPrefs
-            | C::OpenPrefsPage(_)
-            | C::OpenMedia { .. }
-            | C::OpenBookmarkEditor
-            | C::AddBookmark
-            | C::OpenMainMenu => {
+            C::OpenMedia { .. } | C::OpenBookmarkEditor | C::AddBookmark | C::OpenMainMenu => {
                 self.note(format!(
                     "{command:?} needs a dialog that is not implemented yet"
                 ));
@@ -1667,9 +1665,9 @@ mod tests {
 
     #[test]
     fn the_implemented_dialogs_open_real_windows_with_no_note() {
-        // These five commands open a real window now (`dialogs.rs`), so no
+        // These commands open a real window now (`dialogs.rs`), so no
         // "not implemented yet" note may be recorded for them.
-        use rustamp_core::command::JumpTarget;
+        use rustamp_core::command::{JumpTarget, PrefsPage};
         use rustamp_ui::DialogKind;
 
         let (mut app, _dir) = app_with_file(None);
@@ -1686,6 +1684,16 @@ mod tests {
         assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
         app.submit(Command::OpenSkinBrowser).unwrap();
         assert!(app.dialog_is_open(DialogKind::SkinBrowser));
+        // A bare `OpenPrefs` shows the page model's own-choice default; a
+        // page-carrying command shows the page it names (RFC 0005 §7).
+        app.submit(Command::OpenPrefs).unwrap();
+        assert_eq!(
+            app.dialog_open_kind(),
+            Some(DialogKind::Preferences(rustamp_prefs::DEFAULT_PAGE))
+        );
+        app.submit(Command::OpenPrefsPage(PrefsPage::VisOptions))
+            .unwrap();
+        assert!(app.dialog_is_open(DialogKind::Preferences(PrefsPage::VisOptions)));
         let notes = app.drain_notes();
         assert!(
             !notes.iter().any(|n| n.contains("not implemented yet")),
@@ -1695,16 +1703,125 @@ mod tests {
 
     #[test]
     fn the_remaining_dialog_commands_still_record_their_note() {
-        // Preferences and the main menu stay unimplemented (so do the media
-        // pickers and bookmarks, covered elsewhere); About, file info, jump,
-        // load playlist and the skin browser open real windows now.
+        // The main menu stays unimplemented (so do the media pickers and
+        // bookmarks, covered elsewhere); About, file info, jump, load
+        // playlist, the skin browser and preferences open real windows now.
         let (mut app, _dir) = app_with_file(None);
-        for command in [Command::OpenPrefs, Command::OpenMainMenu] {
-            app.submit(command.clone()).unwrap();
-        }
+        app.submit(Command::OpenMainMenu).unwrap();
         let notes = app.drain_notes();
-        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(app.dialog_open_kind().is_none());
+    }
+
+    #[test]
+    fn open_prefs_shows_the_default_page_and_page_commands_switch_it() {
+        // `OpenPrefs` carries no page, so it shows the page model's
+        // own-choice default; a page-carrying command switches the open frame
+        // to the page it names (RFC 0005 §7) — with no note either way.
+        use rustamp_core::command::PrefsPage;
+
+        let (mut app, _dir) = app_with_file(None);
+        assert_eq!(app.prefs_page(), None);
+        app.submit(Command::OpenPrefs).unwrap();
+        assert_eq!(app.prefs_page(), Some(rustamp_prefs::DEFAULT_PAGE));
+        assert!(app.drain_notes().is_empty());
+
+        app.submit(Command::OpenPrefsPage(PrefsPage::VisOptions))
+            .unwrap();
+        assert_eq!(app.prefs_page(), Some(PrefsPage::VisOptions));
+        assert!(app.drain_notes().is_empty());
+
+        // The direct switch does the same when the frame is open and reports
+        // when it is not.
+        assert!(app.select_prefs_page(PrefsPage::VisPlugin));
+        assert_eq!(app.prefs_page(), Some(PrefsPage::VisPlugin));
+        app.submit(Command::CloseFocusedWindow).unwrap();
+        assert_eq!(app.prefs_page(), None);
+        assert!(!app.select_prefs_page(PrefsPage::VisPlugin));
+        assert!(!app.quit(), "a dialog request must not quit the app");
+    }
+
+    #[test]
+    fn the_prefs_frame_keeps_enter_open_and_closes_on_escape() {
+        // The frame has no controls yet (contents unmeasured), so `Enter`
+        // stays consumed without confirming; `Escape` and the focused-window
+        // close shut the frame, and none of it quits the player.
+        use rustamp_core::command::PrefsPage;
+        use rustamp_ui::{DialogKind, Key};
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenPrefsPage(PrefsPage::VisPlugin))
+            .unwrap();
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.prefs_page(), Some(PrefsPage::VisPlugin));
+        assert!(app.dialog_key(Key::Escape));
+        assert_eq!(app.dialog_open_kind(), None);
+
+        app.submit(Command::OpenPrefs).unwrap();
+        assert!(app.dialog_is_open(DialogKind::Preferences(rustamp_prefs::DEFAULT_PAGE)));
+        app.submit(Command::CloseFocusedWindow).unwrap();
+        assert_eq!(app.dialog_open_kind(), None);
+        assert!(!app.quit(), "closing a dialog must not quit the app");
+    }
+
+    #[test]
+    fn the_prefs_dialog_opens_from_the_menu_and_the_shortcut_path() {
+        // Options > Preferences (Ctrl+P, id 40012) and the Visualization
+        // leaves (Ctrl+K id 40191, Alt+O id 40317) all funnel through the
+        // shortcut dispatch into the same frame, on their own page.
+        use rustamp_core::command::PrefsPage;
+        use rustamp_ui::{DialogKind, Key, Modifiers, ShortcutAction};
+
+        let (mut app, _dir) = app_with_file(None);
+        let outcome = app
+            .activate_menu_item("Preferences", ShortcutAction::Preferences)
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::menu::MenuOutcome::Commands(ref commands)
+                    if commands == &[Command::OpenPrefs]
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            app.dialog_open_kind(),
+            Some(DialogKind::Preferences(rustamp_prefs::DEFAULT_PAGE))
+        );
+        app.submit(Command::CloseFocusedWindow).unwrap();
+
+        let outcome = app
+            .key_down(Key::letter('P').unwrap(), Modifiers::CTRL)
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Some(rustamp_ui::ShortcutOutcome::Commands(ref commands))
+                    if commands == &[Command::OpenPrefs]
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            app.dialog_open_kind(),
+            Some(DialogKind::Preferences(rustamp_prefs::DEFAULT_PAGE))
+        );
+        app.submit(Command::CloseFocusedWindow).unwrap();
+
+        let outcome = app
+            .key_down(Key::letter('K').unwrap(), Modifiers::CTRL)
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Some(rustamp_ui::ShortcutOutcome::Commands(ref commands))
+                    if commands == &[Command::OpenPrefsPage(PrefsPage::VisPlugin)]
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            app.dialog_open_kind(),
+            Some(DialogKind::Preferences(PrefsPage::VisPlugin))
+        );
     }
 
     #[test]
@@ -1752,9 +1869,10 @@ mod tests {
 
     #[test]
     fn rendering_a_dialog_produces_a_frame_of_the_dialog_size() {
+        use rustamp_core::command::PrefsPage;
         use rustamp_ui::{
             ABOUT_CLIENT_SIZE, DialogKind, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE,
-            LOAD_PLAYLIST_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE,
+            LOAD_PLAYLIST_CLIENT_SIZE, PREFS_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE,
         };
 
         let (app, _dir) = app_with_file(None);
@@ -1767,6 +1885,10 @@ mod tests {
             ),
             (DialogKind::LoadPlaylist, LOAD_PLAYLIST_CLIENT_SIZE),
             (DialogKind::SkinBrowser, SKIN_BROWSER_CLIENT_SIZE),
+            (
+                DialogKind::Preferences(PrefsPage::VisPlugin),
+                PREFS_CLIENT_SIZE,
+            ),
         ] {
             let image = app.render_dialog(dialog);
             assert_eq!((image.width(), image.height()), size, "{dialog:?}");
@@ -1932,7 +2054,10 @@ mod tests {
         // it pins the parameters the presenter (`window.rs`) builds the real
         // OS windows from.
         crate::window::require_test_vm();
-        use rustamp_ui::{DialogKind, LOAD_PLAYLIST_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE};
+        use rustamp_core::command::PrefsPage;
+        use rustamp_ui::{
+            DialogKind, LOAD_PLAYLIST_CLIENT_SIZE, PREFS_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE,
+        };
         assert_eq!(DialogKind::LoadPlaylist.title(), "Load Playlist");
         assert_eq!(
             DialogKind::LoadPlaylist.client_size(),
@@ -1942,6 +2067,14 @@ mod tests {
         assert_eq!(
             DialogKind::SkinBrowser.client_size(),
             SKIN_BROWSER_CLIENT_SIZE
+        );
+        assert_eq!(
+            DialogKind::Preferences(PrefsPage::VisPlugin).title(),
+            "Preferences"
+        );
+        assert_eq!(
+            DialogKind::Preferences(PrefsPage::VisPlugin).client_size(),
+            PREFS_CLIENT_SIZE
         );
     }
 }
