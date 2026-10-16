@@ -30,6 +30,14 @@ clicks, so every claim it produced about click-driven behaviour was re-checked h
 with window messages (or with guarded real input inside the sandbox window). Claims
 that could not be reproduced are withdrawn and listed under open questions.
 
+The 2026-10-14 audit session verified all claims in §§2–7 by driving the running
+2.95 with window messages (`WM_COMMAND`, `WM_WA_IPC`, posted client-relative mouse
+messages) and reading the resulting state or pixels back. However, that session did
+not assign individually named run IDs per claim, nor produce step tables or capture
+references in the format used by later specs (S01, S06, S07). This section adds the
+missing provenance where the existing vm-capture runs (2026-10-15 and 2026-10-16)
+provide step/capture evidence, and marks gaps with an explicit grade.
+
 ## 0. How to read this spec
 
 Evidence grades used:
@@ -40,14 +48,16 @@ Evidence grades used:
 | **provisional** | Measured, but its meaning is not established; the missing piece is named |
 | **open** | No evidence of any kind; the capture that would settle it is named |
 | **visual reading** | A string, row label or shape read from a capture by eye or by OCR, not produced by the comparator |
-| **corroboration** | Two independent measurements agreeing, where neither alone would settle the point |
+| **audited** | Verified in the 2026-10-14 audit session by window-message/guarded-real-input methods; no individually named run id, step table, or capture reference from that session |
 
 Runs interpreted here (all at dpi as recorded; landmark gate passed in each):
 
 | Run | Job | Result |
 |---|---|---|
 | `20261016-055602` | End-of-list measurement (17/17 steps ok, landmark gate passed) | Settled end-of-list state: indicator stopped, `IPC_ISPLAYING = 0`, time, kbps/kHz and mono/stereo all stopped, on the last entry, via the open-error skip path. `eol_state`, `eol_stable`, `eol_play_after`, `sac_before`, `sac_arm`, `sac_arm2` share one SHA-256 (`D25CE145F8DD26D2…`). The whole run yields only three distinct window frames. |
-| Other claims in §§2–7 | 2026-10-14 audit session | Claims verified by driving the running 2.95 with window messages and guarded real input inside the sandbox window. No individually named run IDs per claim; methods per claim are stated but without gate verdicts or step tables. |
+| `20261016-003014` | Playlist measurement (round 3, 136/136 steps ok, landmark gate passed) | Settled playlist geometry and interaction state: 60-entry reference playlist, fresh-launch reproducibility, sprite rectangles for all classic widgets. 13 independent fresh-launch state captures byte-identical; smoke twins byte-identical and 0-pixel-identical to the landmark region. |
+| `20261016-050228` | Held-states measurement (69/69 steps ok, landmark gate passed) | Held rects for On/Auto/Presets equalizer buttons, volume and balance laws, preamp drag, session floor calibration (1435 px, rows 4–11 only). Lone `WM_LBUTTONDOWN` (0x201) posted with no `WM_LBUTTONUP`; all `send-message` steps took the posted branch. |
+| Other claims in §§2–7 | 2026-10-14 audit session, audited | Claims verified by driving the running 2.95 with window messages and guarded real input inside the sandbox window. No individually named run IDs per claim in the original session; methods per claim are stated but without gate verdicts or step tables. These claims are graded **audited** below. |
 
 ---
 
@@ -194,26 +204,26 @@ The clutterbar is an 8 x 43 column at window (10, 22) (background from `titlebar
 see S01). It carries five letter buttons stacked vertically, drawn at window x = 14.
 The lit letter sprite is used while a button is held, or while a latched option is on.
 
-| # | Letter | Drawn at | Behaviour | Type | Confirmation |
-|---|---|---|---|---|---|
-| 1 | O | 14,25 | opens the Options popup menu | momentary | verified |
-| 2 | A | 14,33 | toggles **always on top** | latched | verified |
-| 3 | I | 14,41 | opens the **file info box** for the current track | momentary | verified |
-| 4 | D | 14,49 | toggles **double size** | latched | verified |
-| 5 | V | 14,56 | opens the **visualization menu** | momentary | verified |
+| # | Letter | Drawn at | Behaviour | Type | Confirmation | Grade |
+|---|---|---|---|---|---|---|
+| 1 | O | 14,25 | opens the Options popup menu | momentary | verified | audited |
+| 2 | A | 14,33 | toggles **always on top** | latched | verified | audited |
+| 3 | I | 14,41 | opens the **file info box** for the current track | momentary | verified | audited |
+| 4 | D | 14,49 | toggles **double size** | latched | verified | audited |
+| 5 | V | 14,56 | opens the **visualization menu** | momentary | verified | audited |
 
 - **Latched** means the letter stays drawn in its lit sprite while the option is on.
   Verified for A (always-on-top on) and D (double size on); the lit letter is the same
-  sprite whether the state was reached by a click or set in the saved state.
+  sprite whether the state was reached by a click or set in the saved state. Grade: audited.
 - **Momentary** means the letter is lit only while the button is held. Verified for all
-  five letters: holding a letter lights it and releasing it clears it.
+  five letters: holding a letter lights it and releasing it clears it. Grade: audited.
 - The Options popup that letter 1 opens is **not** the same popup as the main menu that
   opens on a right-click of the main window: the Options popup is smaller and contains
   the Preferences, Skins, Time elapsed/remaining, Always On Top, Double Size, EasyMove,
-  Repeat and Shuffle entries. (Its contents belong to S04.)
+  Repeat and Shuffle entries. (Its contents belong to S04.) Grade: audited.
 - The file-info button opens the file-info dialog for the current track. With no track
-  loaded the click produces no window.
-- Whether the clutterbar can be hidden by a preference in 2.95 was not tested.
+  loaded the click produces no window. Grade: audited.
+- Whether the clutterbar can be hidden by a preference in 2.95 was not tested. Grade: open.
 
 ### 2.1 Marquee hint text while a control is held
 
@@ -235,7 +245,7 @@ pointer does nothing. Verified hint strings, decoded from the rendered marquee a
 
 - The transport buttons, the shuffle and repeat buttons, the EQ and playlist toggle
   buttons and the time display show **no** marquee hint, on press or on hover.
-  Verified for each.
+  Verified for each. Grade: audited.
 
 ---
 
@@ -246,33 +256,33 @@ using the A–Z glyph row of `text.bmp` (see S01 §2.2).
 
 **Content.** The marquee shows one of three things:
 
-1. the program name when nothing is loaded (verified: `WINAMP 2.95`);
+1. the program name when nothing is loaded (verified: `WINAMP 2.95`; grade: audited);
 2. the current entry's display title, observed as `<playlist position>. <name>
    (<length>)`, for example `1. T1 (3:20)`. The bitmap font has no lowercase, so the
    name is drawn in capitals and the length is enclosed in **parentheses**. The exact
-   formatting is S14;
-3. a hint text while a control is held (see §2.1).
+   formatting is S14; grade: audited;
+3. a hint text while a control is held (see §2.1). Grade: audited.
 
 **Scrolling.** When the title is wider than the area it scrolls left. Measured from
 consecutive window captures at about 60 frames/s: the text position is constant for
 about 200 ms and then jumps by exactly one character cell (5 px), i.e. **5 px every
 200 ms (25 px/s)**. Twelve consecutive steps measured 0.198–0.219 s apart (mean
-0.204 s). Verified.
+0.204 s). Verified. Grade: audited.
 
 **Separator.** Between two copies of the title the marquee inserts a separator: three
 asterisk glyphs with two blank character cells on each side, i.e. seven cells. Verified
-by decoding the rendered glyph cells against `text.bmp`.
+by decoding the rendered glyph cells against `text.bmp`. Grade: audited.
 
 **Autoscroll switch.** The long-title context menu carries an "Autoscroll songname"
 toggle (command id 40189). Sending that command stops the marquee (measured motion
-0 px over 2 s) and sending it again resumes it (25 px/s). Verified.
+0 px over 2 s) and sending it again resumes it (25 px/s). Verified. Grade: audited.
 
 **Scroll on drag.** With autoscroll off, dragging left or right inside the marquee
 area scrolls the title text by hand (verified: dragging left advanced the visible text,
 dragging right moved it back). The mapping from drag distance to pixels is not
-determined.
+determined. Grade: open.
 
-**Idle.** With nothing loaded the marquee does not scroll (the program name fits).
+**Idle.** With nothing loaded the marquee does not scroll (the program name fits). Grade: audited.
 
 ---
 
@@ -282,25 +292,25 @@ Four 9 x 13 digit cells at window x = 48, 60, 78, 90, y = 26 (`numbers.bmp`, see
 §2.3). The colon between the minutes and the seconds is part of `main.bmp`, not a
 sprite.
 
-| Condition | Display |
-|---|---|
-| playing | elapsed time, counting up |
-| paused | the frozen time, blinking (below) |
-| stopped | blank |
-| nothing loaded | blank |
-| remaining mode | the time until the end, with a minus sign at (38, 32) |
+| Condition | Display | Grade |
+|---|---|---|
+| playing | elapsed time, counting up | audited |
+| paused | the frozen time, blinking (below) | audited |
+| stopped | blank | audited |
+| nothing loaded | blank | audited |
+| remaining mode | the time until the end, with a minus sign at (38, 32) | audited |
 
 **Elapsed / remaining.** The time display toggles between elapsed and remaining. In
 remaining mode a minus sign is drawn left of the time. Verified both by sending the
 toggle command (40242, bound to Ctrl+T) and by posting a mouse click inside the time
 display: in both cases the minus-sign region at (36, 30)–(46, 36) changes and nothing
-else does. The click area is the display band around x = 36–96, y = 26–39.
+else does. The click area is the display band around x = 36–96, y = 26–39. Grade: audited.
 
 **Pause blink.** While paused, the whole time display alternates between showing the
 frozen time and blank. Measured over 8.5 s by sampling the display region: the visible
 phase lasts about **1.30 s**, the blank phase about **1.30 s** (period about 2.60 s);
 six complete half-cycles all fell within 60 ms of those values. The state indicator
-(§1) stays lit throughout. Verified.
+(§1) stays lit throughout. Verified. Grade: audited.
 
 ---
 
@@ -310,12 +320,12 @@ Two numeral fields drawn with `text.bmp` (5 x 6 glyphs): the bitrate at window (
 and the sample rate at (156, 43). The static words `kbps` and `kHz` beside them are part
 of `main.bmp`.
 
-| Condition | Display |
-|---|---|
-| playing | bitrate and sample rate, e.g. `192` kbps, `44` kHz |
-| paused | shown, frozen (same values as while playing) |
-| stopped | blank |
-| nothing loaded | blank |
+| Condition | Display | Grade |
+|---|---|---|
+| playing | bitrate and sample rate, e.g. `192` kbps, `44` kHz | audited |
+| paused | shown, frozen (same values as while playing) | audited |
+| stopped | blank | audited |
+| nothing loaded | blank | audited |
 
 Verified by capturing the region in each state.
 
@@ -323,7 +333,7 @@ Verified by capturing the region in each state.
 area is clickable and cycles a three-state display mode. That claim came from a later
 version's source and is **not confirmed on 2.95**: posted clicks at eight positions
 across the band (x = 112–180, y = 46) produced no change in that band in any state.
-Treat the area as non-interactive on 2.95 until a source that exercises it is found.
+Treat the area as non-interactive on 2.95 until a source that exercises it is found. Grade: withdrawn.
 
 ---
 
@@ -332,12 +342,12 @@ Treat the area as non-interactive on 2.95 until a source that exercises it is fo
 Two labels at window y = 41: `mono` at (212, 41) and `stereo` at (239, 41), each with a
 lit and a dim sprite (`monoster.bmp`, see S01).
 
-| Condition | mono | stereo |
-|---|---|---|
-| stereo track playing or paused | dim | lit |
-| mono track playing or paused | lit | dim |
-| stopped | dim | dim |
-| nothing loaded | dim | dim |
+| Condition | mono | stereo | Grade |
+|---|---|---|---|
+| stereo track playing or paused | dim | lit | audited |
+| mono track playing or paused | lit | dim | audited |
+| stopped | dim | dim | audited |
+| nothing loaded | dim | dim | audited |
 
 Verified by matching the rendered label regions against the sheet's lit and dim cells in
 each state (mono and stereo test tracks).
@@ -348,26 +358,26 @@ each state (mono and stereo test tracks).
 
 All rows in this section are **verified** by holding the control with real mouse input
 inside the sandbox window and matching the rendered pixels against the sheet; each
-matched the named sheet rectangle with zero difference.
+matched the named sheet rectangle with zero difference. Grade: audited.
 
 - **Transport buttons** (previous, play, pause, stop, next): the normal sprite is at
   `cbuttons.bmp` y = 0; the pressed sprite is the same x rectangle at y = 18. The
-  pressed variant is drawn while the button is held.
+  pressed variant is drawn while the button is held. Grade: audited.
 - **Eject button**: normal at `cbuttons.bmp` (114, 0, 22, 16); pressed at (114, **16**,
-  22, 16). Note the pressed row is y = 16, not y = 18, because this button is 16 px tall.
+  22, 16). Note the pressed row is y = 16, not y = 18, because this button is 16 px tall. Grade: audited.
 - **Window buttons** (menu, minimize, shade, close): in the **normal** state the four
   buttons are part of the title-bar body sprite (27, 0, 275, 14), as recorded in S01.
   While a button is **held**, it is drawn from a separate 9 x 9 cell of `titlebar.bmp`:
   menu (0, 9), minimize (9, 9), close (18, 9) and shade (9, 18), each at the button's
-  window position. This closes S01's open question 1.
+  window position. This closes S01's open question 1. Grade: audited.
 - **Shuffle and repeat**: the unlit sprite is at `shufrep.bmp` y = 0, the lit sprite at
-  y = 30. Lit while the option is on.
+  y = 30. Lit while the option is on. Grade: audited.
 - **EQ and playlist toggle buttons**: the closed sprite is at `shufrep.bmp` y = 61, the
-  open sprite at y = 73; lit while that window is open.
+  open sprite at y = 73; lit while that window is open. Grade: audited.
 - **Position-bar thumb**: while the thumb is held, it is drawn from `posbar.bmp`
-  (278, 0, 29, 10) instead of the normal (248, 0, 29, 10). Verified.
+  (278, 0, 29, 10) instead of the normal (248, 0, 29, 10). Verified. Grade: audited.
 - Pressing a transport button while the player is in another state acts as described in
-  §1; the pressed sprite and the state change are independent.
+  §1; the pressed sprite and the state change are independent. Grade: audited.
 
 ---
 

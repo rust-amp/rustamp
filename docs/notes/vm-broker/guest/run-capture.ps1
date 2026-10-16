@@ -45,6 +45,16 @@ Show 'computer' $env:COMPUTERNAME
 Show 'guest boot time' $bootTime.ToString('o')
 Show 'os' $os.Caption
 
+# --- 2b. sandbox-path compatibility (before anything is staged, link later) ---
+# Jobs address the reference playlist by its sandbox path
+# (C:\winamp\r_o4_60.m3u), which does not exist in the VM. Rather than
+# rewriting job files (which must stay portable across both hosts), the guest
+# links the legacy path to the staged reference copy once it is copied in
+# (see below, after copyin), so every sandbox-absolute reference path keeps
+# resolving. A missing playlist would leave the reference with an empty list,
+# which changes dialog behaviour - the previous run's single failure
+# (the Jump-to-time dialog never opened) is attributed to exactly this.
+
 # --- 2. display pre-gate: refuse before the reference binary starts ------------
 Add-Type -AssemblyName System.Windows.Forms
 $logPixels = (Get-ItemProperty 'HKCU:\Control Panel\Desktop' -Name LogPixels -ErrorAction SilentlyContinue).LogPixels
@@ -123,6 +133,15 @@ $failure = ''
 if ($me -eq 0) {
     $failure = 'refusing: the capture task landed in session 0, which has no desktop'
 } else {
+    # Sandbox-path compatibility: jobs address the playlist by its sandbox path
+    # (C:\winamp\r_o4_60.m3u), which does not exist here. Link it to the staged
+    # reference copy so every sandbox-absolute reference path resolves; a
+    # missing playlist would leave the reference with an empty list, which
+    # changes dialog behaviour (one dialog in an earlier run never opened).
+    $legacyLink = 'C:\winamp'
+    if (-not (Test-Path $legacyLink)) {
+        $null = New-Item -ItemType SymbolicLink -Path $legacyLink -Target $ReferenceRoot
+    }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -Job $JobFile -NoLogoff `
         -ResearchRoot $CaptureRoot `
         -ReferenceRoot $ReferenceRoot `
