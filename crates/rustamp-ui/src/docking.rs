@@ -14,7 +14,7 @@
 //! * Moving the main window moves every docked neighbour by the same delta
 //!   (S05 §4.2, §4.3).
 //! * Resizing the main (a windowshade) re-flows the stack (S05 §3.3, §5).
-//! * The double-size and shade size changes (S05 §1.1, §2.1, §5).
+//! * The double-size and shade size changes (S05 §1.1, §2.1, §2.3, §5).
 
 use crate::layout::{DOUBLE_HEIGHT, DOUBLE_WIDTH, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH};
 
@@ -191,10 +191,10 @@ impl DockedStack {
     }
 
     /// Toggles the main window's double-size and re-flows the stack (S05 §2.1,
-    /// §5). The size change is a state change, not a render. The shaded-plus-
-    /// double-size size is open (see [`window_size`); S05 never measures the
-    /// combination), so the shaded size scales too and the stored rectangle
-    /// always matches [`window_size`].
+    /// §2.3, §5). The size change is a state change, not a render. The
+    /// shaded-plus-double-size size is measured at 550 x 28 in both orders
+    /// (see [`window_size`]; S05 §2.3, run 20261016-091412), and the stored
+    /// rectangle always matches [`window_size`].
     pub fn set_main_double_size(&mut self, double_size: bool) {
         self.main.double_size = double_size;
         let (w, h) = window_size(WindowKind::Main, self.main.shaded, double_size);
@@ -244,21 +244,18 @@ impl DockedStack {
 /// * Windowshade height for the equalizer/playlist is 14 px per S01 §1, but their
 ///   shade drawings are open (S05 §1.5); the size is stated, the pixels are not.
 ///
-/// S05 never measures shade and double-size together (the shade size in §1.1 is
-/// measured at 1x, the double-size sizes in §2.1 are measured unshaded, and §9
-/// lists no probe for the combination), so the shaded-plus-double-size main size
-/// below is **open**, not settled: it preserves the renderer's long-standing
-/// scaled-shade behaviour (the 275 × 14 shade frame scaled 2x to 550 × 28) so
-/// that the docked size and the painted frame agree. A capture that would settle
-/// it: shade the main window while double-size is on (or toggle double-size
-/// while shaded) and read the re-resolved client size, mirroring the `b1`/`e1`
-/// probes of §8.1.
+/// Shade and double-size together are measured at 550 × 28 in both orders
+/// (S05 §2.3, settled by run 20261016-091412: `a3_dsize_act` re-resolved
+/// 275x14 to 550x28 shade-first, `b3_shade_act` re-resolved 550x232 to 550x28
+/// double-size-first): the 275 × 14 shade frame scaled 2x, so the docked size
+/// and the painted frame agree.
 pub fn window_size(kind: WindowKind, shaded: bool, double_size: bool) -> (u32, u32) {
     match kind {
         WindowKind::Main => {
             if shaded {
                 if double_size {
-                    // Open (S05 silent on the combination): scaled shade, kept so
+                    // Measured (S05 §2.3, run 20261016-091412 steps
+                    // `a3_dsize_act`/`b3_shade_act`): scaled shade, kept so
                     // `render::frame_size` matches the painted frame.
                     (DOUBLE_WIDTH, SHADE_HEIGHT * 2) // 550 x 28
                 } else {
@@ -364,8 +361,9 @@ pub const DEFAULT_PLAYLIST_POSITION: WindowPosition = WindowPosition { x: 26, y:
 
 /// Classic window sizes (S05 §1.1, §2.1, S01 §1).
 pub const SHADED_MAIN_SIZE: (u32, u32) = (WINDOW_WIDTH, SHADE_HEIGHT); // 275 x 14
-/// Main window shaded *and* double-sized: the scaled shade (S05 silent on the
-/// combination; kept so the docked size matches the painted frame).
+/// Main window shaded *and* double-sized: the scaled shade (S05 §2.3, measured
+/// 550 x 28 in both orders by run 20261016-091412; kept so the docked size
+/// matches the painted frame).
 pub const SHADED_DOUBLE_MAIN_SIZE: (u32, u32) = (DOUBLE_WIDTH, SHADE_HEIGHT * 2); // 550 x 28
 pub const DOUBLE_MAIN_SIZE: (u32, u32) = (DOUBLE_WIDTH, DOUBLE_HEIGHT); // 550 x 232
 pub const DOUBLE_EQUALIZER_SIZE: (u32, u32) = (DOUBLE_WIDTH, DOUBLE_HEIGHT); // 550 x 232
