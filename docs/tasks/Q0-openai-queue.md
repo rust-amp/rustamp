@@ -24,25 +24,28 @@ audit-grade verification. Nothing that a free lane can do just as well.
    robustness findings (shutdown, error paths, lifetime) with tests. Owned
    paths: `crates/rustamp-plughost/src/**`,
    `crates/rustamp-app/src/{host,supervise}.rs`.
-3. **Engine lifecycle review (post-`d9fbdcd`).**
-   Goal: review `rustamp-audio`'s run lifecycle for the *class* of bug just
-   fixed — every place that re-bases `clock_origin`, `timeline_origin`,
-   `track_start`, `sync.written` or `sync.active` on stop/pause/seek/finish,
-   and prove the invariants (`buffered_frames()`, `position_frames()`,
-   `timeline_frames()`) hold across every transition. Deliverable: findings
-   with `file:line` plus tests for any hole. This is review-grade and exactly
-   what a strong model adds.
-4. **`rustamp-dsp` remainder: the limiter (and a ReplayGain hook).**
+3. **`rustamp-dsp` remainder: the limiter (and a ReplayGain hook).**
    Goal: the crate's own doc promises a resampler and a limiter; the
-   resampler lives in `rustamp-audio/src/convert.rs`. Design and implement the
-   limiter as a `DspStage` from `specs/S07-eq-dsp.md` (and the S18 card), with
-   the same "measured vs own choice" discipline the EQ stage documents.
-   Contract-free (no `rustamp-core` change).
-5. **DSP layering RFC.**
-   Goal: draft the RFC that moves the measured `eq_classic_from_db` conversion
-   out of `rustamp-plughost` into `rustamp-core`/`rustamp-proto`, so
-   `rustamp-dsp` can drop its dev-dependency on the plugin host. Small, but
-   it touches a contract crate, so it needs the RFC first.
+   resampler lives in `rustamp-audio/src/convert.rs`. Prefer a maintained
+   crate over a self-implementation (`CONTRIBUTING.md` §Dependencies), and
+   implement what is left as a `DspStage` from `specs/S07-eq-dsp.md` (and the
+   S18 card), with the same "measured vs own choice" discipline the EQ stage
+   documents. Contract-free (no `rustamp-core` change).
+4. **A second engine-lifecycle pass, now that F2 is fixed.**
+   Goal: re-run the invariant audit of `docs/tasks/A3-engine-lifecycle-review.md`
+   against the post-F2 code and close what is still open (the three
+   "could not verify" items: a concurrent finish_run/stop race, an mpsc
+   disconnect, and hardware `played_frames` monotonicity).
+
+## Done since this card was written (do not queue again)
+
+- **Engine lifecycle review** — done by `wave33-engine-lifecycle` (`adbc81f`),
+  F1 fixed, F2 handed to `wave35-ring-drain`.
+- **DSP layering RFC** — done as **RFC 0011** (`7b69f92`): the measured
+  dB↔0..63 conversion moved to `rustamp-proto`; `rustamp-dsp` no longer depends
+  on `rustamp-plughost` at all.
+- **The EQ slider dead zone** (S07R1 finding 3) — done as `b39fb7f`.
+- **The EQ UI desync** (S07R1 finding 2) — `wave35-eq-ui-sync`, in flight.
 
 ## Not ready (do not queue yet)
 
