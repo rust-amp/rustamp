@@ -1,16 +1,24 @@
 # Stage one capture job on the host (unelevated), run it in the guest, bring the
 # captures back and verify them.
 #
-#   powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-capture.ps1 -Job <name> [-Baseline base-flat-main]
+#   powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-capture.ps1 -Job <name> [-Baseline base-flat-main] [-DisplayPin Set1024]
 #
 # The division of labour is deliberate and security-relevant, same as
 # vm-run-tests.ps1:
 #   * HERE (unelevated): stage the harness directory, the one job file and the
 #     reference copy. These are copied blindly, never inspected.
 #   * THE BROKER (elevated, session 0): restore the baseline checkpoint, start,
-#     copy in over PowerShell Direct, run the allow-listed guest script
-#     `run-capture.ps1`, copy the results back out with the allow-listed
-#     `copyout` op.
+#     pin the virtual display (allow-listed `set-vdd-mode.ps1`), copy in over
+#     PowerShell Direct, run the allow-listed guest script `run-capture.ps1`,
+#     copy the results back out with the allow-listed `copyout` op.
+#
+# The display step is mandatory, not cosmetic: the checkpoints carry the
+# virtual display driver at its 800x600 default, which extends the desktop to
+# 1824x768, while the harness one-to-one gate expects 1024x768. The size step
+# runs right after the restore (a restore brings the wrong size back) and
+# verifies the size before anything is staged; the guest pre-gate inside
+# run-capture.ps1 re-checks it right before the reference binary starts.
+# -DisplayPin Off disables the virtual display instead of resizing it.
 #
 # The broker never builds, and this script never writes into the research
 # tree: verified captures land in <staging>\out\<job>\ with hashes.json and
@@ -21,6 +29,7 @@
 param(
     [Parameter(Mandatory)][string]$Job,
     [string]$Baseline = 'base-provisioned',
+    [ValidateSet('Set1024', 'Off')][string]$DisplayPin = 'Set1024',
     [string]$HarnessDir = 'D:\code\rustamp-research\tools\vm-capture',
     [string]$RefDir = 'D:\code\rustamp-sandbox\winamp295',
     [string]$StageRoot = 'D:\code\rustamp-vm\staging',
@@ -48,7 +57,19 @@ Step "restoring $Baseline (discards everything since the checkpoint)"
 & $broker -Op restore -Name $Baseline -TimeoutSeconds 900 | Out-Null
 $restoreStamp = (Get-Date).ToString('o')
 
-# --- 3. stage the harness, the job and the reference copy (blind copies) -------
+# --- 3. pin the virtual display, then verify it (before anything is staged) ----
+# The restore above brought the checkpoint's display back with it - the
+# virtual monitor at its 800x600 default, i.e. an 1824x768 desktop - so the
+# size step runs on every run, not once. set-vdd-mode.ps1 applies the mode
+# and refuses itself unless the screen settles at 1024x768; a refusal here
+# aborts before staging, with the measured values in the broker error.
+Step "pinning the virtual display to 1024x768 (mode: $DisplayPin)"
+$display = & $broker -Op guest -Script 'set-vdd-mode.ps1' -GuestArgs $DisplayPin -TimeoutSeconds 600
+$displaySetAt = (Get-Date).ToString('o')
+Write-Host ("    screen {0} (logpixels {1})" -f $display.screen, $display.logPixels)
+foreach ($s in @($display.screens)) { Write-Host ("    monitor {0}" -f $s) }
+
+# --- 4. stage the harness, the job and the reference copy (blind copies) -------
 Step "staging into $Stage"
 if (-not (Test-Path $HarnessDir)) { throw "harness directory not found: $HarnessDir" }
 $jobFile = Join-Path $HarnessDir ("jobs\" + $Job + ".json")
@@ -60,20 +81,20 @@ Copy-Item (Join-Path $HarnessDir '*') (Join-Path $Stage 'tools\vm-capture') -Rec
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'winamp295')
 Copy-Item (Join-Path $RefDir '*') (Join-Path $Stage 'winamp295') -Recurse -Force
 
-# --- 4. copy in and run one job -------------------------------------------------
+# --- 5. copy in and run one job -------------------------------------------------
 Step 'copying the staged capture tree into the guest'
 & $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\capture' -TimeoutSeconds 1800 | Out-Null
 
 Step "running capture job '$Job' in the guest"
 $result = & $broker -Op guest -Script 'run-capture.ps1' -GuestArgs $Job -TimeoutSeconds $TimeoutSeconds
 
-# --- 5. copy out ----------------------------------------------------------------
+# --- 6. copy out ----------------------------------------------------------------
 Step 'copying the captures back to the host'
 if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 $null = New-Item -ItemType Directory -Force -Path $OutDir
 & $broker -Op copyout -Source ("C:\rustamp\out\" + $Job) -Dest $OutDir -TimeoutSeconds 1800 | Out-Null
 
-# --- 6. verify: recompute every hash, compare against the guest manifest --------
+# --- 7. verify: recompute every hash, compare against the guest manifest --------
 Step 'verifying hashes (byte-identical or refused)'
 $manifestPath = Join-Path $OutDir 'hashes.json'
 if (-not (Test-Path $manifestPath)) { throw 'no hashes.json came back: the guest run did not finish its manifest step; nothing is promoted' }
@@ -88,16 +109,25 @@ foreach ($entry in $manifest.PSObject.Properties) {
 }
 if ($checked -eq 0) { throw 'manifest is empty: a capture job with no outputs is a failed job, not an empty success' }
 
-# --- 7. provenance ---------------------------------------------------------------
+# --- 8. provenance ---------------------------------------------------------------
+# Guest scripts whose result the host parses emit exactly one object (their
+# progress lives in guest-transcript.txt inside the outputs, not on stdout),
+# so $result and $display below are single objects with readable fields.
 $provenance = [ordered]@{
     job               = $Job
     baseline          = $Baseline
     baselineCreated   = $baselineCreated
     restoreStamp      = $restoreStamp
+    displayPin        = $DisplayPin
+    displaySetAt      = $displaySetAt
+    displaySet        = [string]$display.screen
+    displaySetScreens = @($display.screens)
+    setLogPixels      = $display.logPixels
     guestBootTime     = [string]$result.bootTime
     guest             = [string]$result.host
     guestUser         = [string]$result.user
     displayFacts      = [string]$result.screen
+    displayScreens    = @($result.screens)
     logPixels         = $result.logPixels
     harnessExit       = $result.harnessExit
     files             = $checked

@@ -8,6 +8,19 @@
 # Order inside: prove the baseline, check the display pre-gate, run one job
 # through the harness entry point, hash every output. A gate failure refuses:
 # non-zero exit, no success manifest, measured values in the failure record.
+#
+# The display SIZE step runs before this script, ordered by the host runner
+# (`set-vdd-mode.ps1` via the broker: virtual display to 1024x768 or off,
+# self-verified). The pre-gate below is the FINAL refusal, read again right
+# before the reference binary starts, so drift between the size step and the
+# job cannot produce captures that quietly fail the harness gate.
+#
+# Result contract: this script's result is parsed by the host runner, so it
+# emits EXACTLY ONE object (the summary at the end) and nothing else on the
+# output stream. The human-readable transcript goes to
+# guest-transcript.txt inside the output directory instead, where it is
+# hash-covered and comes back with the captures. Extra Write-Output lines
+# would come back as a mixed array and break the host's field reads.
 
 param([string]$Job = '')
 
@@ -20,7 +33,8 @@ $CaptureRoot = 'C:\rustamp\capture'
 $OutRoot     = 'C:\rustamp\out'
 $OutDir      = Join-Path $OutRoot $Job
 
-function Show($label, $value) { Write-Output ("{0,-22} {1}" -f $label, $value) }
+$transcript = New-Object System.Collections.Generic.List[string]
+function Show($label, $value) { $transcript.Add(("{0,-22} {1}" -f $label, $value)) }
 
 # --- 1. baseline facts (the host restored the checkpoint; the guest proves it) --
 $os = Get-CimInstance Win32_OperatingSystem
@@ -35,11 +49,13 @@ Show 'os' $os.Caption
 Add-Type -AssemblyName System.Windows.Forms
 $logPixels = (Get-ItemProperty 'HKCU:\Control Panel\Desktop' -Name LogPixels -ErrorAction SilentlyContinue).LogPixels
 $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$screens = @([System.Windows.Forms.Screen]::AllScreens | ForEach-Object { ("{0} primary={1} bounds={2}" -f $_.DeviceName, $_.Primary, $_.Bounds) })
 Show 'logpixels (want 96)' $logPixels
 Show 'virtual screen (want 1024x768)' $screen.ToString()
+foreach ($s in $screens) { Show 'monitor' $s }
 if ($logPixels -ne 96) { throw "display pre-gate refused: LogPixels is $logPixels, want 96 (100 % scale)" }
 if ($screen.Width -ne 1024 -or $screen.Height -ne 768) {
-    throw ("display pre-gate refused: virtual screen is {0}x{1}, want 1024x768" -f $screen.Width, $screen.Height)
+    throw ("display pre-gate refused: virtual screen is {0}x{1}, want 1024x768 (screens: {2})" -f $screen.Width, $screen.Height, ($screens -join ' | '))
 }
 
 # --- 3. one job through the harness entry point --------------------------------
@@ -59,6 +75,9 @@ Show 'harness exit' 'running...'
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrap -Job $jobFile
 $harnessExit = $LASTEXITCODE
 Show 'harness exit' $harnessExit
+# The transcript is written before the refusal below, so a later diagnostic
+# pass over the guest can still read what this run saw.
+$transcript | Set-Content -Path (Join-Path $OutDir 'guest-transcript.txt') -Encoding UTF8
 if ($harnessExit -ne 0) { throw "harness refused or failed with exit $harnessExit (see its failure record; nothing is promoted)" }
 
 # --- 4. hash every output (the host re-verifies these after copyout) -----------
@@ -76,6 +95,7 @@ $hashes | ConvertTo-Json | Set-Content -Path (Join-Path $OutDir 'hashes.json') -
     bootTime   = $bootTime.ToString('o')
     logPixels  = $logPixels
     screen     = $screen.ToString()
+    screens    = @($screens)
     harnessExit = $harnessExit
     files      = $hashes.Count
     outDir     = $OutDir

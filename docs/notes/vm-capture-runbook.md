@@ -60,17 +60,31 @@ instead of "the state drifted between runs".
 | Step | Where | Elevation | What |
 |---|---|---|---|
 | Compile/stage | host | **unelevated** | `vm-run-capture.ps1`: stage the harness directory, the one job file and the reference copy under `D:\code\rustamp-vm\staging\` — copied blindly, never inspected |
+| Display pin | **broker** | elevated, session 0 | the allow-listed `set-vdd-mode.ps1`: virtual display to 1024×768 (or off), self-verified — refuses unless the screen settles at 1024×768 |
 | VM control | **broker** | elevated, session 0 | restore the baseline checkpoint, start, `copyin`, run the allow-listed guest script, **`copyout`** (new, §3) |
 | Capture | guest | console session | the allow-listed `run-capture.ps1`: prove the baseline, check the display gate, run **one** job through the harness entry point, hash every output |
 | Verify | host | unelevated | recompute SHA-256 over the copied-out files and compare against the guest-written manifest — equal hashes mean byte-identical |
+
+Result contract for guest scripts the host parses (`set-vdd-mode.ps1`,
+`run-capture.ps1`): such a script emits **exactly one object** and nothing
+else on stdout. Its progress lives in the run's transcript instead
+(`guest-transcript.txt` for the capture; the host echoes the size step's
+fields to its own console). Extra output lines would come back as a mixed
+array and break the host's field reads — this path had never been run, so
+the contract is enforced here before the first run, not discovered by it.
 
 The broker **never builds** (compiling would execute repository build scripts
 as administrator). The guest script is allow-listed by plain filename, same
 as `run-tests.ps1`. The orchestrator runs one command:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-capture.ps1 -Job <name> [-Baseline base-flat-main]
+powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-capture.ps1 -Job <name> [-Baseline base-flat-main] [-DisplayPin Set1024]
 ```
+
+`-DisplayPin Set1024` (the default) resizes the virtual monitor to 1024×768;
+`-DisplayPin Off` disables the virtual display device instead, so the desktop
+falls back to the synthetic adapter's mode. Either way the run refuses unless
+the screen verifies at 1024×768 (§5).
 
 and gets back: the captures plus manifests in
 `D:\code\rustamp-vm\staging\out\<name>\`, verified hash-equal, with
@@ -108,7 +122,8 @@ finding in §7.
 ## 4. Integrity: byte-identical, with manifests
 
 1. In the guest, `run-capture.ps1` writes every capture and manifest under
-   `C:\rustamp\out\<job>\`, then writes `hashes.json`: relative path →
+   `C:\rustamp\out\<job>\` — including `guest-transcript.txt`, the run's own
+   human-readable log — then writes `hashes.json`: relative path →
    SHA-256 for every file except itself and `run-provenance.json`.
 2. `copyout` copies that tree to `<staging>\out\<job>\`.
 3. On the host, `vm-run-capture.ps1` recomputes SHA-256 over every received
@@ -116,8 +131,10 @@ finding in §7.
    (or a missing manifest) fails the run loudly — nothing is promoted into
    the research tree.
 4. `run-provenance.json` (checkpoint name + creation time, restore
-   timestamp, guest boot time, display facts, harness exit, job name) travels
-   with the captures and is stored with them in the research tree.
+   timestamp, guest boot time, the requested display mode plus the display
+   facts from BOTH the size step and the capture script, harness exit, job
+   name) travels with the captures and is stored with them in the research
+   tree.
 
 ## 5. The 1:1 requirement (pinned, gated, refused on mismatch)
 
@@ -126,12 +143,30 @@ The VM's display is pinned, not inherited: provisioned at **100 % scale**
 `base-provisioned` — unlike the sandbox, which followed the host's
 laptop/dock/monitor state (96 dpi vs 144 dpi across runs).
 
-Two layers enforce 1:1, and both refuse instead of comparing wrongly:
+Since then the guest gained a signed virtual display driver, and it changes
+what a restore brings back: the checkpoints carry the virtual monitor at its
+**800×600 default**, which extends the desktop to **1824×768** (observed
+2026-10-16: pinned 1024×768 plus the driver's 800×600). A capture run must
+therefore re-pin the size on EVERY run — the restore is what brings the wrong
+size back, so baking the size in once is not enough until the baselines are
+re-created with the driver already at 1024×768 (open hardening, §7).
 
-1. **Guest pre-gate** (`run-capture.ps1`, before the reference binary
+Three layers enforce 1:1, and all refuse instead of comparing wrongly:
+
+1. **Size step** (`set-vdd-mode.ps1`, ordered by the host runner right after
+   the restore, before anything is staged): writes the driver's 1024×768
+   setting and restarts the device (`Set1024`, the default), or disables the
+   virtual display so the desktop falls back to the synthetic adapter (`Off`,
+   via `-DisplayPin Off`). Then it polls the virtual screen for up to ~90 s
+   and throws with the measured values unless the screen settles at exactly
+   1024×768. A refusal here aborts the run before staging.
+2. **Guest pre-gate** (`run-capture.ps1`, before the reference binary
    starts): asserts `LogPixels` = 96 and the virtual screen = 1024×768. On
-   mismatch it exits non-zero with the measured values and runs nothing.
-2. **Harness gate** (unchanged, inside the harness as before): asserts the
+   mismatch it exits non-zero with the measured values (plus the per-monitor
+   bounds, so an 1824-wide desktop names its extra monitor) and runs nothing.
+   This is the final refusal: it re-reads the size right before the job, so
+   drift between the size step and the capture cannot slip through.
+3. **Harness gate** (unchanged, inside the harness as before): asserts the
    physical client rect is exactly 275×116, the capture is 275×116, and a
    known sprite matches at 1:1 with zero differing pixels (twin pixel **plus
    SHA-256** identity). A smoke test that compares two captures against each
@@ -139,19 +174,25 @@ Two layers enforce 1:1, and both refuse instead of comparing wrongly:
    both are wrong — so the gate compares against the reference, and a
    failure aborts loudly with the measured values in the failure record.
 
-Every manifest records the display facts per run; captures from runs with
-different display facts are never compared.
+Every manifest records the display facts per run (the size step's reading
+AND the capture script's reading, with per-monitor bounds); captures from
+runs with different display facts are never compared.
 
 ## 6. Smoke test before the VM is trusted for captures
 
-1. Restore the capture baseline, capture twice with no action in between —
+1. Restore the capture baseline, run the display size step
+   (`broker -Op guest -Script set-vdd-mode.ps1 -GuestArgs Set1024`), and
+   confirm the reported screen is 1024×768 with one monitor — this is the
+   step the 1824×768 desktop needs, and it must pass before any capture.
+2. Restore the capture baseline, capture twice with no action in between —
    the two captures must be **byte-identical**.
-2. Restore, perform one known action, capture, and compare against the
+3. Restore, perform one known action, capture, and compare against the
    recorded evidence for the matching named checkpoint.
-3. Run one staged job end to end through `vm-run-capture.ps1`, including the
-   `copyout` + hash verification, and confirm the provenance file's boot
-   time is after the restore timestamp.
-4. Only after all three pass is the guest accepted as the capture host, and
+4. Run one staged job end to end through `vm-run-capture.ps1`, including the
+   size step, the `copyout` + hash verification, and confirm the provenance
+   file's boot time is after the restore timestamp AND its two display
+   readings agree at 1024×768.
+5. Only after all four pass is the guest accepted as the capture host, and
    only then does the dirty room move its campaigns there.
 
 ## 8. The ignored winit window tests run in the interactive session
@@ -172,7 +213,10 @@ via the existing `copyout` op. A run that lands in session 0 fails loudly.
 - **Broker registration is the owner's step.** The `copyout` op is written
   and waiting in `vm-broker/`; it runs only once integrated into the
   canonical tree, and the elevated worker change should be reviewed before
-  the task next fires.
+  the task next fires. **This lane needs no new broker op**: the size step
+  runs through the existing `guest` op (any `.ps1` in the guest directory is
+  allow-listed by filename), so wiring the display in requires no
+  re-registration beyond what `copyout` already needs.
 - **Harness entry point in the VM is unconfirmed.** The guest script invokes
   the same bootstrap entry point the sandbox `LogonCommand` used, with the
   staged paths remapped — but the harness tree itself was never opened here
@@ -182,16 +226,42 @@ via the existing `copyout` op. A run that lands in session 0 fails loudly.
   orchestrator/dirty room to check. If the harness needs a VM mode (a
   `-NoLogoff` flag, a VM job directory), that change belongs to the harness
   in the research tree, not to this lane.
-- **Resolution pinning needs a one-time scripted step.** The provision
-  script pins the scale (100 %); the 1024×768 resolution must be set once in
-  the guest by script and baked into `base-provisioned`, otherwise the
-  checkpoint inherits a hand-set value. Until that step exists and the
-  checkpoint is re-created from it, the pre-gate's resolution check is the
-  only guard.
+- **Resolution pinning is now a runtime step, not a bake-in (2026-10-16).**
+  The earlier plan — set 1024×768 once and bake it into `base-provisioned` —
+  is superseded: the checkpoints carry the virtual display driver at its
+  800×600 default, so every restore brings the 1824×768 desktop back and the
+  size step (`set-vdd-mode.ps1`, ordered by the host runner after each
+  restore) is mandatory per run. Remaining hardening, optional: re-create the
+  capture baselines with the driver already at 1024×768, which would turn the
+  size step from the fix into belt-and-braces. Until then, a run that skips
+  the size step is a run that refuses at the pre-gate — by design.
 - **Running the reference copy in the guest needs the owner's
   confirmation.** The existing approval covers the host sandbox, not
   automatically the guest (same reservation as `VM-capture-host.md` §3).
+- **Guest scripts the host parses emit one object (fixed before the first
+  run, 2026-10-16).** `run-capture.ps1` used to `Write-Output` its progress
+  lines AND return a summary object; over PowerShell Direct that comes back
+  as a mixed array, and the host's field reads (`$result.bootTime`, …) would
+  have broken on the very first run. It now writes its transcript to
+  `guest-transcript.txt` inside the outputs (hash-covered, copied back with
+  the captures) and emits only the summary object; `set-vdd-mode.ps1` follows
+  the same contract. Any future guest script the host parses must do the
+  same; scripts nobody parses (diagnostics, installers) are unaffected.
+- **`LogPixels` is read in session 0 (pre-existing assumption, unchanged).**
+  The pre-gate and the size step read `HKCU:\Control Panel\Desktop` from the
+  broker's PowerShell Direct session, i.e. the broker-credential user's hive
+  — not necessarily the interactive user's. If those two hives ever disagree
+  on scale, the session-0 reading says 96 while captures could still be off;
+  the harness 1:1 gate (client rect plus landmark SHA-256) is the backstop
+  that would catch it. Worth one explicit check on the first run: compare the
+  guest-transcript `logpixels` line against the interactive user's value.
 - **Nothing here was executed.** No broker invocation, no guest script, no
   capture, no VM or sandbox launch, no test run, no commit — all scripts and
-  this runbook are written, not run. The smoke test (§6) is the
+  this runbook are written, not run. In particular unverified without a run:
+  the `pnputil /restart-device` settle time (the 90 s poll is a budget, not a
+  measurement), the `Off` mode (disabling the only virtual monitor may leave
+  a different fallback size than 1024×768 — the step refuses loudly if so),
+  and the positional binding of `-GuestArgs Set1024/Off` through the
+  invoke-broker → broker → `Invoke-Command -FilePath` chain (the single-string
+  precedent is `run-capture.ps1`'s job name). The smoke test (§6) is the
   orchestrator's first execution.
