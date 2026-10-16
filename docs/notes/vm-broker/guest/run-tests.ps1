@@ -60,6 +60,16 @@ foreach ($exe in $exes) {
     $lines = $raw -split "`r?`n"
     $summary = ($lines | Where-Object { $_ -match '^test result:' } | Select-Object -Last 1)
     $failedNames = @($lines | Where-Object { $_ -match '^test .* FAILED$' } | ForEach-Object { $_.Trim() })
+    # A panic's values live on the lines AFTER the FAILED line (multi-line
+    # assertion messages), so keep a window behind each failure: without it a
+    # failure like "timeline stopped at X of Y frames" keeps its verdict but
+    # loses X and Y, and every diagnosis costs another guest round trip.
+    $failureWindows = @()
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^test .* FAILED$|panicked at') {
+            $failureWindows += @($lines | Select-Object -Skip $i -First 10)
+        }
+    }
     # When a binary produces no test summary it did not run its tests at all
     # (usually it could not start), so keep the first output lines: without them
     # a failure like this is a mystery.
@@ -71,6 +81,7 @@ foreach ($exe in $exes) {
     if ($failedNames.Count -gt 0) {
         $interesting = @($lines | Where-Object { $_ -match 'panicked|assertion|FAILED|BLOCKED|left:|right:|Error|error:' } | Select-Object -First 14)
         if ($interesting) { $diagnostic = @($diagnostic + $interesting) }
+        if ($failureWindows) { $diagnostic = @($diagnostic + @($failureWindows | Select-Object -First 20)) }
     }
     $results += [pscustomobject]@{
         exe        = $name
