@@ -99,7 +99,7 @@ fn the_window_checks_follow_what_is_actually_on() {
 }
 
 #[test]
-fn dialog_leaves_keep_the_existing_not_implemented_note() {
+fn the_preferences_leaf_opens_the_dialog_instead_of_noting_it() {
     let mut app = headless_app();
     let preferences = submenu_entries(SubmenuId::Options)
         .iter()
@@ -109,12 +109,12 @@ fn dialog_leaves_keep_the_existing_not_implemented_note() {
         .activate_menu_item(preferences.label, preferences.action)
         .expect("activation submits");
     assert_eq!(outcome, MenuOutcome::Commands(vec![Command::OpenPrefs]));
+    // The dialog really opens now, so the old "not implemented" note is gone.
+    assert!(app.dialog_open_kind().is_some(), "a dialog is open");
     let notes = app.drain_notes();
     assert!(
-        notes
-            .iter()
-            .any(|note| note.contains("OpenPrefs") && note.contains("not implemented yet")),
-        "the existing dialog note is kept: {notes:?}"
+        !notes.iter().any(|note| note.contains("OpenPrefs")),
+        "an implemented dialog records no note: {notes:?}"
     );
 }
 
