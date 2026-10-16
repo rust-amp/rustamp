@@ -41,6 +41,7 @@ use rustamp_core::event::Event;
 use rustamp_core::playlist::{EntryId, MediaLocation};
 use rustamp_core::state::{PlayerState, TransportState, WindowId};
 use rustamp_gfx::Image;
+use rustamp_ipc::{Message, Transport};
 use rustamp_output::{NullClock, NullOutput, default_output};
 use rustamp_ui::{
     Key, MainWindow, MainWindowLayout, MainWindowState, Modifiers, ShortcutOutcome, frame_size,
@@ -48,6 +49,7 @@ use rustamp_ui::{
 };
 
 use crate::cli::OutputChoice;
+use crate::host::{HostStateLink, PublishOutcome, player_state_message};
 use crate::routing;
 use crate::skin::{LoadedSkin, SkinChoice, load as load_skin};
 
@@ -108,6 +110,10 @@ pub struct App {
     entry_ids: Vec<EntryId>,
     next_entry_id: u64,
     notes: Vec<String>,
+    /// The app's end of the player-state bridge to the plugin host
+    /// (see [`crate::host`]): detached until a supervisor attaches a
+    /// control-channel transport, so publishing without a host is a no-op.
+    host: HostStateLink,
 }
 
 impl App {
@@ -182,6 +188,7 @@ impl App {
             entry_ids: Vec::new(),
             next_entry_id: 0,
             notes: Vec::new(),
+            host: HostStateLink::detached(),
         };
         app.shuffle = app.config.playlist.shuffle;
         app.repeat = app.config.playlist.repeat;
@@ -325,6 +332,10 @@ impl App {
         }
 
         self.ui.refresh(self.now_ms());
+        // Mirror the player state to the plugin host (see `crate::host`):
+        // best-effort by contract, so the outcome is ignored — a detached or
+        // dead host neither fails nor blocks the pump.
+        let _ = self.publish_host_state();
         Ok(())
     }
 
@@ -435,6 +446,64 @@ impl App {
         self.repeat = state.repeat;
         self.always_on_top = self.config.ui.always_on_top;
         self.ui.refresh(now);
+    }
+
+    /// Assemble the snapshot the plugin host mirrors (sources per field are in
+    /// [`crate::host`]).
+    ///
+    /// The engine owns transport, position, duration, volume, balance, the
+    /// queue (length and current index), the stream and stop-after-current;
+    /// the app owns shuffle/repeat (the engine deliberately reports `false`)
+    /// and the stable entry ids (the engine reports `None`). The equalizer is
+    /// the flat default until S07/M2 gives the engine a stage (finding F1 in
+    /// [`crate::host`]).
+    pub fn host_player_state(&mut self) -> PlayerState {
+        let mut state = self.engine.state();
+        // App-owned modes: the engine does not track them (RFC 0001 / S15).
+        state.shuffle = self.shuffle;
+        state.repeat = self.repeat;
+        // Stable entry id for the engine's current index (the engine has no
+        // playlist ids; a `None` index yields `None` without allocating).
+        state.current_id = self.entry_id_for(state.current_index);
+        state
+    }
+
+    /// Build the one protocol message that feeds the host's state bridge.
+    ///
+    /// This is the single construction site: every `PlayerStateUpdate` the app
+    /// sends passes through here, so the field-by-field audit in
+    /// [`crate::host`] stays checkable in one place.
+    pub fn player_state_update(&mut self) -> Message {
+        player_state_message(self.host_player_state())
+    }
+
+    /// Attach the host's control-channel transport (see
+    /// [`HostStateLink::attach`](crate::host::HostStateLink::attach)).
+    /// Process supervision is a later card; until it lands the link stays
+    /// detached.
+    pub fn attach_host(&mut self, transport: impl Transport + 'static) {
+        self.host.attach(transport);
+    }
+
+    /// Drop the host transport without sending anything.
+    pub fn detach_host(&mut self) {
+        self.host.detach();
+    }
+
+    /// Whether a host transport is currently attached.
+    pub fn host_attached(&self) -> bool {
+        self.host.is_attached()
+    }
+
+    /// Publish the current snapshot to the host under the cadence rules (see
+    /// [`crate::host`]).
+    ///
+    /// Best-effort by contract: a detached or dead host is reported, never
+    /// raised — [`App::pump`] ignores the outcome, so state publishing can
+    /// neither fail playback nor block it.
+    pub fn publish_host_state(&mut self) -> PublishOutcome {
+        let state = self.host_player_state();
+        self.host.publish(&state)
     }
 
     // -----------------------------------------------------------------------

@@ -1,0 +1,430 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
+//! App side of the player-state bridge (RFC 0006 out-of-process hosting).
+//!
+//! The app (64-bit) owns the real player; the host (i686) owns the fake
+//! `Winamp v1.x` window that plugins query through its answering surface. The
+//! only state channel the [`rustamp_ipc::Message`] protocol provides in that
+//! direction is [`Message::PlayerStateUpdate`], which carries a
+//! [`PlayerState`] snapshot; the host's `state_bridge` copies that snapshot
+//! into its surface fields. This module is the sending side: it assembles the
+//! snapshot from the app's state and publishes it over the **existing**
+//! [`Transport`] control channel. It invents no channel, spawns no process and
+//! changes no protocol message.
+//!
+//! # Path (RFC 0006 §8)
+//!
+//! The helper talks to the player only over the documented protocol plus shared
+//! memory. The control channel is a framed [`Message`] stream over any
+//! `Read`/`Write` pair (piped stdio, a named pipe, a socket) via
+//! [`StreamTransport`](rustamp_ipc::StreamTransport); the media hosts already
+//! speak exactly that on stdin/stdout, and the plugin host's binary names the
+//! control pipe as its end. [`HostStateLink`] therefore publishes through
+//! [`Transport::send`] — the same path — and takes the transport as an
+//! injected dependency. Spawning and supervising `rustamp-plughost32.exe`
+//! (finding the binary, `CREATE_NO_WINDOW`, `Hello` handshake, restart policy)
+//! is a later card, like the media-host supervision; until it lands the link
+//! stays detached and publishing is a no-op (see [`PublishOutcome::Detached]).
+//!
+//! # Mapping (app source -> message field -> bridge surface + measured id)
+//!
+//! One place builds the message
+//! ([`crate::app::App::player_state_update`]), one row per
+//! field, auditable against `rustamp-plughost/src/state_bridge.rs`:
+//!
+//! * `engine.transport()` -> `state.transport` -> `surface.is_playing`
+//!   (id 104 `IPC_ISPLAYING`; 0 stopped, 1 playing, 3 paused).
+//! * `engine.position_ms()` -> `state.position_ms` ->
+//!   `surface.output_position_ms` (id 105 mode 0).
+//! * `engine` duration -> `state.duration_ms` -> `surface.output_length_ms`
+//!   (id 105 modes 1/2; `None` means unknown, stored as 0).
+//! * `engine` volume -> `state.volume` -> `surface.volume` (id 122, unsigned).
+//! * `engine` balance -> `state.balance` -> `surface.pan` (id 123, signed).
+//! * `engine` queue length -> `state.playlist_len` -> `surface.playlist_len`
+//!   (id 124).
+//! * `engine.current_index()` -> `state.current_index` -> `surface.playlist_pos`
+//!   (id 125; `None` means no current entry, stored as 0).
+//! * `engine` stream sample rate -> `state.stream.sample_rate_hz` ->
+//!   `surface.sample_rate` (id 126 mode 0; `None` stream means 0).
+//! * `engine` stream bitrate -> `state.stream.bitrate_kbps` -> `surface.bitrate`
+//!   (id 126 mode 1; `None` stream or `None` bitrate means 0).
+//! * `engine` stream channels -> `state.stream.channels` -> `surface.channels`
+//!   (id 126 mode 2; `None` stream means 0).
+//! * [`EqState::default`] (flat 0 dB; finding F1 below) -> `state.eq.bands` ->
+//!   `surface.eq_bands` (id 127 selectors 0..=9).
+//! * [`EqState::default`] preamp -> `state.eq.preamp` -> `surface.eq_preamp`
+//!   (id 127 selector 10).
+//! * [`EqState::default`] disabled -> `state.eq.enabled` -> `surface.eq_enabled`
+//!   (id 127 selector 11).
+//! * [`EqState::default`] no autoload -> `state.eq.auto` ->
+//!   `surface.eq_autoload` (id 127 selector 12).
+//! * `App::shuffle` (app-owned; the engine deliberately reports `false`, RFC
+//!   0001 / S15) -> `state.shuffle` -> `surface.shuffle` (ids 250/252).
+//! * `App::repeat` (same) -> `state.repeat` -> `surface.repeat` (ids 251/253).
+//! * `engine.stop_after_current()` -> `state.stop_after_current` -> ignored by
+//!   the bridge (no surface field, no measured id reads it).
+//! * `App::entry_ids` via [`App::entry_id_for`](crate::app::App::entry_id_for)
+//!   (the engine reports `None`) -> `state.current_id` -> carried, but the
+//!   bridge maps no surface field from it and no measured id reads it.
+//!
+//! Finding F1: the app cannot supply real equalizer state yet. The engine has
+//! no EQ stage until S07/M2 (the app logs EQ commands as unimplemented), so
+//! the snapshot carries [`EqState::default`] — flat 0 dB bands and preamp,
+//! disabled, no autoload — which the bridge renders as the flat classic value
+//! 31. Those are the honest defaults, not invented values, and they need no
+//! protocol change (the fields exist).
+//!
+//! # Cadence and cost
+//!
+//! [`App::pump`](crate::app::App::pump) attempts a publication on every pass
+//! (about 60 Hz windowed, every 5 ms headless), but the link sends only when
+//! the snapshot changed since the last send: a discrete change (transport,
+//! track, volume, modes, stream, EQ, stop-after-current) goes out immediately,
+//! while a position-only drift — the only continuously moving field — goes out
+//! at most every [`STATE_PUBLISH_INTERVAL`]. That interval mirrors the engine's
+//! own `position_interval` (200 ms), so the host's time readout tracks the same
+//! currency the UI machine already sees. Steady-state cost while playing is one
+//! small postcard frame a few dozen bytes long at 5 Hz plus one frame per
+//! discrete event; idle cost is a snapshot comparison per pump.
+//!
+//! Publishing is never on the audio path: it runs on the app thread inside
+//! `pump`, touches only the engine's already-published snapshot accessors and
+//! the app's own mode flags, and never takes a lock or allocates on the decode
+//! or output threads. A stalled or absent host cannot block the player either:
+//! with no transport attached publishing returns [`PublishOutcome::Detached`]
+//! and does nothing, and a failed send detaches the link and reports
+//! [`PublishOutcome::HostGone`] instead of propagating an error — `pump`
+//! ignores the outcome outright.
+
+use std::time::{Duration, Instant};
+
+use rustamp_core::state::PlayerState;
+use rustamp_ipc::{Message, Transport};
+
+/// Maximum rate of position-only publications (see the module docs).
+///
+/// The value mirrors the engine's `position_interval`: the host's time readout
+/// moves at the same currency as the UI machine's, and anything faster would
+/// spend pipe bandwidth on milliseconds no plugin polls that often.
+pub const STATE_PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// What one [`HostStateLink::publish`] attempt did.
+///
+/// None of these is an error: the player treats them all as information, and
+/// [`App::pump`](crate::app::App::pump) ignores the outcome. A dead host
+/// becomes [`PublishOutcome::Detached`] on the next attempt (see
+/// [`PublishOutcome::HostGone`]), never a failure the player must handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The snapshot went out on the transport.
+    Sent,
+    /// The snapshot equals the last one sent; nothing went out.
+    Unchanged,
+    /// Only `position_ms` moved and [`STATE_PUBLISH_INTERVAL`] has not elapsed
+    /// since the last send; nothing went out.
+    Throttled,
+    /// No transport is attached; nothing went out and nothing was touched.
+    Detached,
+    /// The send failed (stalled or dead host). The link detached itself, so
+    /// the next attempt reports [`PublishOutcome::Detached`]; the player was
+    /// not blocked and saw no error.
+    HostGone,
+}
+
+/// The app's end of the state bridge: an optional control-channel transport
+/// plus the change detection that keeps publishing cheap.
+///
+/// A detached link (the initial state, and the state after [`PublishOutcome::HostGone`])
+/// makes [`publish`](HostStateLink::publish) a no-op, so the player runs
+/// identically with and without a host.
+pub struct HostStateLink {
+    transport: Option<Box<dyn Transport>>,
+    last_sent: Option<PlayerState>,
+    last_send: Instant,
+}
+
+impl HostStateLink {
+    /// A link with no host: every [`publish`](HostStateLink::publish) returns
+    /// [`PublishOutcome::Detached`] until [`attach`](HostStateLink::attach).
+    pub fn detached() -> Self {
+        HostStateLink {
+            transport: None,
+            last_sent: None,
+            last_send: Instant::now(),
+        }
+    }
+
+    /// Attach the control-channel transport (the RFC 0006 path: a framed
+    /// [`Message`] stream, e.g. [`StreamTransport`](rustamp_ipc::StreamTransport)
+    /// over piped stdio or the control pipe, or
+    /// [`MemoryTransport`](rustamp_ipc::MemoryTransport) in tests).
+    ///
+    /// Attaching forgets the last sent snapshot, so the next
+    /// [`publish`](HostStateLink::publish) sends unconditionally and the host
+    /// starts from the real state rather than from a stale one.
+    pub fn attach(&mut self, transport: impl Transport + 'static) {
+        self.transport = Some(Box::new(transport));
+        self.last_sent = None;
+    }
+
+    /// Drop the transport without sending anything. The next
+    /// [`publish`](HostStateLink::publish) returns [`PublishOutcome::Detached`].
+    pub fn detach(&mut self) {
+        self.transport = None;
+        self.last_sent = None;
+    }
+
+    /// Whether a transport is currently attached.
+    pub fn is_attached(&self) -> bool {
+        self.transport.is_some()
+    }
+
+    /// Publish `state` when the cadence rules say so (see the module docs).
+    ///
+    /// Never blocks the player: with no host it returns
+    /// [`PublishOutcome::Detached`], and a failed send detaches the link and
+    /// returns [`PublishOutcome::HostGone`] instead of an error.
+    pub fn publish(&mut self, state: &PlayerState) -> PublishOutcome {
+        let Some(transport) = self.transport.as_mut() else {
+            return PublishOutcome::Detached;
+        };
+        if self.last_sent.as_ref() == Some(state) {
+            return PublishOutcome::Unchanged;
+        }
+        let position_only = self
+            .last_sent
+            .as_ref()
+            .is_some_and(|last| position_only_change(last, state));
+        if position_only && self.last_send.elapsed() < STATE_PUBLISH_INTERVAL {
+            return PublishOutcome::Throttled;
+        }
+        match transport.send(&player_state_message(state.clone())) {
+            Ok(()) => {
+                self.last_sent = Some(state.clone());
+                self.last_send = Instant::now();
+                PublishOutcome::Sent
+            }
+            Err(_) => {
+                // A stalled or dead host must never block the player and must
+                // never wedge the link on a broken transport: drop it and let
+                // the supervisor (a later card) re-attach a live one.
+                self.transport = None;
+                self.last_sent = None;
+                PublishOutcome::HostGone
+            }
+        }
+    }
+}
+
+/// Whether `after` differs from `before` in `position_ms` only.
+///
+/// `position_ms` is the one continuously moving field, so it gets the
+/// throttled cadence while every other change goes out immediately.
+fn position_only_change(before: &PlayerState, after: &PlayerState) -> bool {
+    let mut settled_before = before.clone();
+    let mut settled_after = after.clone();
+    settled_before.position_ms = 0;
+    settled_after.position_ms = 0;
+    settled_before == settled_after
+}
+
+/// Wrap a snapshot in the single protocol message the bridge reads.
+///
+/// This is the only construction site: every `PlayerStateUpdate` the app sends
+/// passes through here, so the field-by-field audit in the module docs stays
+/// checkable in one place. The protocol change rule holds — the variant
+/// already exists and is untouched.
+pub fn player_state_message(state: PlayerState) -> Message {
+    Message::PlayerStateUpdate(Box::new(state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustamp_core::command::Command;
+    use rustamp_core::config::Config;
+    use rustamp_core::playlist::EntryId;
+    use rustamp_core::state::{EqState, StreamInfo, TransportState};
+
+    use crate::app::{App, AppOptions};
+    use crate::cli::OutputChoice;
+
+    fn sample_state() -> PlayerState {
+        PlayerState {
+            transport: TransportState::Playing,
+            position_ms: 12_345,
+            duration_ms: Some(200_000),
+            volume: 200,
+            balance: -10,
+            shuffle: true,
+            repeat: true,
+            current_index: Some(7),
+            current_id: Some(EntryId(9)),
+            playlist_len: 60,
+            stream: Some(StreamInfo {
+                bitrate_kbps: Some(128),
+                sample_rate_hz: 44_100,
+                channels: 2,
+            }),
+            eq: EqState {
+                bands: [12.0, -12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                preamp: 1.5,
+                enabled: true,
+                auto: true,
+            },
+            stop_after_current: true,
+        }
+    }
+
+    fn headless_app(volume: u8) -> App {
+        let options = AppOptions {
+            config: Config::default(),
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume,
+            file: None,
+            seconds: None,
+        };
+        App::new(options).expect("headless app builds without media")
+    }
+
+    #[test]
+    fn construction_carries_every_message_field() {
+        let state = sample_state();
+        let Message::PlayerStateUpdate(boxed) = player_state_message(state.clone()) else {
+            panic!("the app builds PlayerStateUpdate, nothing else");
+        };
+        // The whole snapshot first, then each field by name so a dropped field
+        // fails loudly against the bridge audit in the module docs.
+        assert_eq!(*boxed, state);
+        assert_eq!(boxed.transport, TransportState::Playing);
+        assert_eq!(boxed.position_ms, 12_345);
+        assert_eq!(boxed.duration_ms, Some(200_000));
+        assert_eq!(boxed.volume, 200);
+        assert_eq!(boxed.balance, -10);
+        assert!(boxed.shuffle);
+        assert!(boxed.repeat);
+        assert_eq!(boxed.current_index, Some(7));
+        assert_eq!(boxed.current_id, Some(EntryId(9)));
+        assert_eq!(boxed.playlist_len, 60);
+        assert_eq!(
+            boxed.stream,
+            Some(StreamInfo {
+                bitrate_kbps: Some(128),
+                sample_rate_hz: 44_100,
+                channels: 2,
+            })
+        );
+        assert_eq!(boxed.eq.bands[0], 12.0);
+        assert_eq!(boxed.eq.bands[1], -12.0);
+        assert_eq!(boxed.eq.preamp, 1.5);
+        assert!(boxed.eq.enabled);
+        assert!(boxed.eq.auto);
+        assert!(boxed.stop_after_current);
+    }
+
+    #[test]
+    fn the_assembled_snapshot_merges_engine_and_app_state() {
+        let mut app = headless_app(200);
+        app.submit(Command::SetShuffle(true))
+            .expect("shuffle is app-owned");
+        app.submit(Command::SetRepeat(true))
+            .expect("repeat is app-owned");
+        let snapshot = app.host_player_state();
+        // Engine-owned: configured volume, stopped transport, empty queue.
+        assert_eq!(snapshot.volume, 200);
+        assert_eq!(snapshot.balance, 0);
+        assert_eq!(snapshot.transport, TransportState::Stopped);
+        assert_eq!(snapshot.playlist_len, 0);
+        assert_eq!(snapshot.current_index, None);
+        // App-owned: the modes the engine deliberately reports as false...
+        assert!(snapshot.shuffle);
+        assert!(snapshot.repeat);
+        // ...and no invented entry id for an empty queue.
+        assert_eq!(snapshot.current_id, None);
+        // No EQ stage yet (finding F1): honest flat defaults.
+        assert_eq!(snapshot.eq, EqState::default());
+        // The message built from the app carries exactly that snapshot.
+        let Message::PlayerStateUpdate(boxed) = app.player_state_update() else {
+            panic!("the app builds PlayerStateUpdate, nothing else");
+        };
+        assert_eq!(*boxed, snapshot);
+    }
+
+    #[test]
+    fn detached_link_sends_nothing_and_never_fails() {
+        let mut link = HostStateLink::detached();
+        assert!(!link.is_attached());
+        assert_eq!(link.publish(&sample_state()), PublishOutcome::Detached);
+        assert!(!link.is_attached());
+        // The app-level path is a no-op too, and the player keeps pumping.
+        let mut app = headless_app(200);
+        assert!(!app.host_attached());
+        assert_eq!(app.publish_host_state(), PublishOutcome::Detached);
+        app.pump()
+            .expect("publishing without a host never fails pump");
+    }
+
+    #[test]
+    fn attached_link_sends_once_and_throttles_position_only() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        assert!(link.is_attached());
+
+        let mut state = sample_state();
+        assert_eq!(link.publish(&state), PublishOutcome::Sent);
+        // The peer decodes the real codec bytes into the same message.
+        assert_eq!(
+            host_end.recv().expect("one framed message"),
+            player_state_message(state.clone())
+        );
+        // An unchanged snapshot sends nothing.
+        assert_eq!(link.publish(&state), PublishOutcome::Unchanged);
+        assert!(host_end.try_recv().expect("codec reads").is_none());
+
+        // Position-only drift inside the interval is throttled...
+        state.position_ms += 30;
+        assert_eq!(link.publish(&state), PublishOutcome::Throttled);
+        assert!(host_end.try_recv().expect("codec reads").is_none());
+
+        // ...but a discrete change (volume) goes out immediately.
+        state.volume = state.volume.saturating_sub(1);
+        assert_eq!(link.publish(&state), PublishOutcome::Sent);
+        let received = host_end.recv().expect("the discrete change");
+        let Message::PlayerStateUpdate(boxed) = received else {
+            panic!("the app builds PlayerStateUpdate, nothing else");
+        };
+        assert_eq!(boxed.volume, state.volume);
+        assert_eq!(boxed.position_ms, state.position_ms);
+    }
+
+    #[test]
+    fn a_dead_host_detaches_instead_of_blocking() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, host_end) = MemoryTransport::pair();
+        drop(host_end);
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        // The failed send is absorbed: the link detaches and says so.
+        assert_eq!(link.publish(&sample_state()), PublishOutcome::HostGone);
+        assert!(!link.is_attached());
+        // From here on it is the ordinary no-host path.
+        assert_eq!(link.publish(&sample_state()), PublishOutcome::Detached);
+    }
+
+    #[test]
+    fn detaching_stops_publication_without_a_send() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        link.detach();
+        assert!(!link.is_attached());
+        assert_eq!(link.publish(&sample_state()), PublishOutcome::Detached);
+        assert!(host_end.try_recv().expect("codec reads").is_none());
+    }
+}

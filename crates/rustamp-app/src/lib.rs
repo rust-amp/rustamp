@@ -13,6 +13,10 @@
 //! * [`routing`] — which layer owns a [`rustamp_core::command::Command`].
 //! * [`app`] — [`app::App`]: engine + headless UI machine + command/event
 //!   routing. Fully headless and unit-tested.
+//! * [`host`] — the app side of the player-state bridge to `rustamp-plughost32`:
+//!   assembling [`rustamp_core::state::PlayerState`] snapshots and publishing
+//!   them as [`rustamp_ipc::Message::PlayerStateUpdate`] over the existing
+//!   control channel (RFC 0006).
 //! * [`window`] — the `winit`/`softbuffer` shell for the real player.
 //!
 //! [`run`] is the entry point the `rustamp` binary calls.
@@ -34,6 +38,7 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod host;
 pub mod routing;
 pub mod skin;
 pub mod window;
