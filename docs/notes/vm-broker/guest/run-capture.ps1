@@ -58,33 +58,112 @@ if ($screen.Width -ne 1024 -or $screen.Height -ne 768) {
     throw ("display pre-gate refused: virtual screen is {0}x{1}, want 1024x768 (screens: {2})" -f $screen.Width, $screen.Height, ($screens -join ' | '))
 }
 
-# --- 3. one job through the harness entry point --------------------------------
-# Same bootstrap command the sandbox LogonCommand ran, with the staged paths
-# remapped from the sandbox mappings to the VM staging root: the harness
-# defaults to C:\rustamp-research, C:\winamp295 and C:\winamp, none of which
-# exists here, so without these switches it dies with an environment failure
-# before creating a run directory. The harness itself performs the 1:1 gate
-# (client rect 275x116, capture 275x116, 0-px landmark plus SHA-256) and
-# refuses on mismatch; this script does not second-guess it, it records the
-# outcome. -OutDir points straight at this run's output directory, so the
-# captures, the manifest and DONE.json land where the hashing step and the
-# broker copyout expect them; -NoLogoff because there is no host folder
-# mapping to release in the VM (results return via copyout, not via a share).
-if (-not (Test-Path $CaptureRoot)) { throw "nothing staged at $CaptureRoot" }
-$bootstrap = Join-Path $CaptureRoot 'tools\vm-capture\sandbox-bootstrap.ps1'
-$jobFile = Join-Path $CaptureRoot ("tools\vm-capture\jobs\" + $Job + ".json")
-if (-not (Test-Path $bootstrap)) { throw "harness entry point not staged: $bootstrap" }
-if (-not (Test-Path $jobFile)) { throw "job file not staged: $jobFile" }
-if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
-$null = New-Item -ItemType Directory -Force -Path $OutDir
-Show 'harness exit' 'running...'
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrap -Job $jobFile -NoLogoff `
-    -ResearchRoot $CaptureRoot `
-    -ReferenceRoot (Join-Path $CaptureRoot 'winamp295') `
-    -InstallRoot 'C:\rustamp\winamp' `
-    -OutDir $OutDir
-$harnessExit = $LASTEXITCODE
+# --- 3. one job through the harness entry point, INSIDE the interactive session -
+# The broker's PowerShell Direct sessions land in session 0, which has no
+# desktop: the reference binary starts there but never shows a window (its
+# process lingers windowless while the harness waits 60 s and fails). So the
+# harness runs the way the window tests do: a one-shot scheduled task as the
+# console user with an Interactive logon, whose payload runs the bootstrap and
+# always leaves a done sentinel. Session 0 then only polls for that sentinel
+# and refuses loudly if the task landed anywhere but the interactive session.
+$taskName = 'RustampCaptureSession'
+$innerPath = Join-Path $CaptureRoot ("inner-" + $Job + ".ps1")
+$innerDone = Join-Path $OutDir 'inner-done.json'
+
+# Find the interactive session: explorer owns the console desktop, so its
+# session is the interactive one and its owner is the auto-logon user.
+# Fallback: `query session` looking for the Active console row. No hardcoded
+# user: either signal follows whoever provisioned the guest.
+$interactiveSession = $null
+$interactiveUser = $null
+$interactiveDomain = $null
+$explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($explorer) {
+    $interactiveSession = $explorer.SessionId
+    $owner = (Get-CimInstance Win32_Process -Filter ("ProcessId = " + $explorer.Id) | Invoke-CimMethod -MethodName GetOwner)
+    $interactiveUser = $owner.User
+    $interactiveDomain = $owner.Domain
+    Show 'interactive session' ("{0} via explorer (user {1}\{2})" -f $interactiveSession, $interactiveDomain, $interactiveUser)
+} else {
+    Show 'interactive session' 'no explorer; falling back to `query session`'
+    foreach ($line in (query session 2>$null)) {
+        if ($line -match '^\s*>?\s*console\s+(\S+)\s+(\d+)\s+Active') {
+            $interactiveUser = $Matches[1]
+            $interactiveSession = [int]$Matches[2]
+            $interactiveDomain = $env:COMPUTERNAME
+            break
+        }
+    }
+}
+if ($null -eq $interactiveSession) { throw 'no interactive session found: explorer is not running and `query session` shows no Active console; the reference has no desktop to appear on' }
+if ($interactiveSession -eq 0) { throw 'the "interactive" session resolved to session 0, which has no desktop; refusing instead of reporting a pass' }
+if ([string]::IsNullOrWhiteSpace($interactiveUser)) { throw 'interactive session found but its user could not be resolved; refusing' }
+
+# The payload is a fixed local path the task runs; nothing expands at write
+# time except the three paths below (single-quoted here-string otherwise).
+$bootstrapPath = Join-Path $CaptureRoot 'tools\vm-capture\sandbox-bootstrap.ps1'
+$jobPath = Join-Path $CaptureRoot ("tools\vm-capture\jobs\" + $Job + ".json")
+$installPath = 'C:\rustamp\winamp'
+$referencePath = Join-Path $CaptureRoot 'winamp295'
+$inner = @'
+$ErrorActionPreference = 'Continue'
+$InnerDone = '__INNERDONE__'
+$Bootstrap = '__BOOTSTRAP__'
+$JobFile = '__JOBFILE__'
+$CaptureRoot = '__CAPTUREROOT__'
+$OutDir = '__OUTDIR__'
+$InstallRoot = '__INSTALLROOT__'
+$ReferenceRoot = '__REFERENCEROOT__'
+
+# Fail loudly in session 0: the reference cannot show a window there, and a
+# pass from there would be a lie.
+$me = (Get-Process -Id $PID).SessionId
+$harnessExit = -1
+$failure = ''
+if ($me -eq 0) {
+    $failure = 'refusing: the capture task landed in session 0, which has no desktop'
+} else {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -Job $JobFile -NoLogoff `
+        -ResearchRoot $CaptureRoot `
+        -ReferenceRoot $ReferenceRoot `
+        -InstallRoot $InstallRoot `
+        -OutDir $OutDir
+    $harnessExit = $LASTEXITCODE
+    if ($harnessExit -ne 0) { $failure = ("harness exit {0}" -f $harnessExit) }
+}
+@{ session = $me; user = $env:USERNAME; computer = $env:COMPUTERNAME; harnessExit = $harnessExit; failure = $failure } |
+    ConvertTo-Json | Set-Content -Path $InnerDone -Encoding UTF8
+exit 0
+'@
+$inner = $inner.Replace('__INNERDONE__', $innerDone).Replace('__BOOTSTRAP__', $bootstrapPath).Replace('__JOBFILE__', $jobPath).Replace('__CAPTUREROOT__', $CaptureRoot).Replace('__OUTDIR__', $OutDir).Replace('__INSTALLROOT__', $installPath).Replace('__REFERENCEROOT__', $referencePath)
+$inner | Set-Content -Path $innerPath -Encoding UTF8
+
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $innerPath)
+$principal = New-ScheduledTaskPrincipal -UserId ("{0}\{1}" -f $interactiveDomain, $interactiveUser) `
+    -LogonType Interactive -RunLevel Limited
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal `
+    -Trigger $trigger -Force | Out-Null
+Show 'capture task' ("registered '{0}' as {1}\{2} (Interactive, session {3})" -f $taskName, $interactiveDomain, $interactiveUser, $interactiveSession)
+Start-ScheduledTask -TaskName $taskName
+$deadline = (Get-Date).AddMinutes(30)
+$innerDoneObj = $null
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 5
+    if (Test-Path $innerDone) {
+        try { $innerDoneObj = Get-Content -Path $innerDone -Raw | ConvertFrom-Json } catch { continue }
+        break
+    }
+}
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+if (-not $innerDoneObj) { throw 'the capture task produced no done sentinel within 30 minutes; refusing instead of reporting a pass' }
+if ($innerDoneObj.session -eq 0) { throw ("the capture task ran in session 0 ({0}); refusing" -f $innerDoneObj.failure) }
+if ($innerDoneObj.session -ne $interactiveSession) { throw ("the capture task ran in session {0}, not the interactive session {1}; refusing" -f $innerDoneObj.session, $interactiveSession) }
+$harnessExit = [int]$innerDoneObj.harnessExit
 Show 'harness exit' $harnessExit
+Show 'harness session' ("{0} as {1}" -f $innerDoneObj.session, $innerDoneObj.user)
 # The transcript is written before the refusal below, so a later diagnostic
 # pass over the guest can still read what this run saw.
 $transcript | Set-Content -Path (Join-Path $OutDir 'guest-transcript.txt') -Encoding UTF8
