@@ -3,10 +3,10 @@ Spec ID: S-04
 Title: Menu popups (main menu, Options, visualization, equalizer presets, playlist MISC — rendered rows, checks, arrows, hints, geometry)
 Sources consulted (category only): dirty room: binary behaviour capture (sandbox run 20261016-011612); dirty room: offline capture reading (OCR + pixel arithmetic); dirty room: existing audited specs S03 (shortcuts), S06 (playlist), S02 (main-window behaviour); harness: tools/vm-capture README (method and limits)
 Author agent: S04 spec editor (dirty room, lane s04x, 2026-10-16; no sandbox started by this session)
-Auditor:
-Audit date:
+Auditor: Spec Auditor (dirty room)
+Audit date: 2026-10-16
 Winamp version validated against: 2.95 (winamp.exe SHA-256 bca7a9fe1626b487d1b47bb5210670cf572d1a4cce23062076641d583b268561, extracted from winamp295.exe SHA-256 ef1423999cbefd4f2a3a98acee2b194a4260268cb4517abda9f12963e866b7e5)
-Status: draft
+Status: audited
 ---
 
 # S04 — Menu popups
@@ -85,7 +85,9 @@ All popups are ordinary operating-system popup windows of class **`#32768`**
 - The EQ/playlist title-bar probes (`s04_eqtitle_popup_posted`,
   `s04_pltitle_popup_posted`, steps 25/27) exited 3: no `#32768` popup follows
   a posted click at (6,3) on `Winamp EQ` / `Winamp PE` (Verified by DONE.json).
-  This agrees with the S06 title-bar finding (S06 §1).
+  This agrees with the S06 title-bar finding (S06 §1) for `Winamp PE` only;
+  S06 §1 settles only `Winamp PE`, so the `Winamp EQ` (6,3) negative stands
+  on this run's exit-3 step alone.
 - The `s04_eqp_open_real2` real-click step exited 4 (pre-action size gate),
   yet `s04_eqp_popup_real` still produced `018`, identical in OCR to `015`
   (Verified by DONE.json and the reading §5).
@@ -99,10 +101,10 @@ second capture is byte-identical to the first, and the twin step's
 
 | Popup | Captures (steps) | Result |
 |---|---|---|
-| Main menu | `003` (`s04_mm_popup_posted`) vs `004` (`s04_mm_popup_posted_twin`) | byte-identical OCR; 0 differing pixels (Verified by DONE.json failure line and the reading §1) |
-| Options popup | `009` (`s04_opt_popup_posted`) vs `010` (`s04_opt_popup_posted_twin`) | identical (Verified by DONE.json and the reading §2) |
-| Visualization menu | `012` (`s04_vis_popup_posted`) vs `013` (`s04_vis_popup_posted_twin`) | identical (Verified by DONE.json and the reading §4) |
-| EQ presets, posted vs real | `015` (`s04_eqp_popup_posted`) vs `018` (`s04_eqp_popup_real`) | identical OCR; no rendering difference between posted and real-input paths (Verified by the reading §5) |
+| Main menu | `003` (`s04_mm_popup_posted`) vs `004` (`s04_mm_popup_posted_twin`) | SHA-256 byte-identical (auditor's hashes); 0 differing pixels (Verified by DONE.json failure line and the reading §1) |
+| Options popup | `009` (`s04_opt_popup_posted`) vs `010` (`s04_opt_popup_posted_twin`) | SHA-256 byte-identical (auditor's hashes; Verified by DONE.json and the reading §2) |
+| Visualization menu | `012` (`s04_vis_popup_posted`) vs `013` (`s04_vis_popup_posted_twin`) | SHA-256 byte-identical (auditor's hashes; Verified by DONE.json and the reading §4) |
+| EQ presets, posted vs real | `015` (`s04_eqp_popup_posted`) vs `018` (`s04_eqp_popup_real`) | SHA-256 byte-identical (auditor's hashes); no rendering difference between posted and real-input paths (identical OCR per the reading §5) |
 
 The playlist MISC popup has no twin: only the real-input capture `023`
 exists (no posted twin was produced).
@@ -214,9 +216,13 @@ capture draws. See open question 1.
 
 ### 3.5 Greyed rows: none
 
-**Settled**: no main-menu row is greyed — every row has strong black text
-cores (52–210 px/row) and zero mid-grey cores in x=45–235 (Verified by the
-reading's grey test on `003`, step `s04_mm_popup_posted`). This is the
+**Settled**: no main-menu row is greyed — every row shows strong black-core
+text (core-black threshold sum<150; 52–210 black-core px/row in x=45–235)
+(Verified by the reading's grey test on `003`, step
+`s04_mm_popup_posted`). A naive mid-grey (sum∈[300,600]) count finds 52–133
+such px/row (antialiased edges), so "zero mid-grey" is
+definition-dependent and is not relied on — the conclusion rests on
+black-core presence, not on the zero-mid-grey phrasing. This is the
 fresh-launch, nothing-loaded state only; the loaded-state comparison is open
 (see §10).
 
@@ -241,8 +247,10 @@ Rows in order (Verified by the reading §2: full pass plus twin agreement on
 | 8 | `Repeat` | single glyph at x≈328–336, y=290–302, eye-read `R` — **provisional** (see §4.3) | unchecked | — |
 | 9 | `Shuffle` | single glyph at x≈328–336, y=325–337, single-pass OCR `s` + eye shape agree — **provisional** (see §4.3) | unchecked | — |
 
-No selection highlight is present in `009`. Greyed rows: none (black cores
-52–216/row, zero mid-grey) (Verified by the reading's grey test on `009`).
+No selection highlight is present in `009`. Greyed rows: none (black-core
+text, core-black threshold sum<150, 52–216 black-core px/row; the naive
+mid-grey count is definition-dependent and not relied on — see §3.5)
+(Verified by the reading's grey test on `009`).
 
 Correspondence to S03: `Preferences...` (Ctrl+P), `Always On Top` (Ctrl+A),
 `Double Size` (Ctrl+D), `EasyMove` (Ctrl+E), `Repeat` (R), `Shuffle` (S) all
@@ -255,16 +263,21 @@ have S03 §1 rows; `Time elapsed` / `Time remaining` name the Ctrl+T toggle
 Between `009` (step `s04_opt_popup_posted`) and `030`
 (`030_opt_popup_after_toggle_menu.png`, step `s04_opt_popup_after_toggle`,
 opened after the posted time-display click `s04_timerem_posted` at (60,32)):
-the pixel difference (12 640 px total per DONE.json; 12 640 px per the
-reading) is confined to exactly two things (Verified by the reading §3):
+the pixel difference is **exactly 12 640 px** (DONE.json
+`change_differing_pixels` 12640; the auditor's 009-vs-030 re-measurement
+agrees), partitioned as **80 px in the two check cells** (x=16–29, y=90–110
+and y=120–140) **+ 12 560 px in x=5–365, y=278–312, with 0 px anywhere
+else** (Verified by the auditor's diff and the reading §3):
 
 1. the check cells at x=16–29 only — 40 px at y=90–110 (check **removed**
    from `Time elapsed`, cell now empty) plus 40 px at y=120–140 (check
    **added** on `Time remaining`, bbox **16,128–29,137**); the `EasyMove`
    check is unchanged (16,244–29,253 in both captures);
-2. a hover-selection band x=5–365, y=278–312 filled `(240,240,240)` over the
-   `Repeat` row, absent in `009` — a mouse-hover artifact, **not** a state
-   change; the `Repeat` text is still black-core and checkless.
+2. a hover-selection band x=5–365, y=278–312 filled `(240,240,240)` (vs
+   `(249,249,249)` in `009`) over the `Repeat` row — a mouse-hover artifact,
+   **not** a state change: the `Repeat` text black-core count in x=45–300 is
+   130 in both captures, and the `Repeat` gutter black-core count is 0 in
+   both; the text is unchanged and checkless in both.
 
 **Settled: the toggled row is `Time elapsed` → `Time remaining`; no other
 row changed.** OCR text output is identical on `009` and `030` (check marks
@@ -290,30 +303,37 @@ Rows in order (Verified by the reading §4: full pass plus twin agreement on
 
 | # | Row (**visual reading**) | Hint (**visual reading**) | Separator after |
 |---|---|---|---|
-| 1 | `Visualization options...` | `Alt+K` is drawn per the earlier draft but **not** confirmed by this reading — see note | separator at y=40 |
-| 2 | `Start/Stop plug-in` | `Ctrl+Shift+K` | — |
-| 3 | `Configure plug-in...` | `Alt+K` | — |
-| 4 | `Select plug-in...` | `Ctrl+K` | — |
+| 1 | `Visualization options...` | no text hint; unidentified colour icon pixels at x≈318–365, y≈11–24 (**open** — see note) | separator at y=40 |
+| 2 | `Start/Stop plug-in` | `Ctrl+Shift+K` (**settled** visual reading, WORD[270,57,96,14]) | — |
+| 3 | `Configure plug-in...` | `Alt+K` (**settled** visual reading, WORD[322,92,44,14]) | — |
+| 4 | `Select plug-in...` | `Ctrl+K` (**settled** visual reading, WORD[318,127,48,14]) | — |
 
-Note on hints: the reading confirms the five row labels verbatim but does not
-transcribe per-row hint boxes for this menu the way it does for the main and
-Options popups; the hint strings above for rows 2–4 are carried from the
-offline draft's resource-table rows (S03 §1 binds all three keys) and are
-**provisional as rendered facts** until a hint-box transcription names them.
-Checks: none (gutter x=8–44 empty except the y=40 rule). Submenu arrows:
-none. Greyed rows: none.
+Note on hints: the four row labels are verbatim, and the auditor's
+full-image OCR on `012` (step `s04_vis_popup_posted`) transcribes the rows
+2–4 hint boxes above with word boxes — **settled visual readings** (S03 §1
+binds all three keys, but the strings stand on the OCR boxes, not on S03).
+Row 1's right side holds non-text colour pixels at x≈318–365, y≈11–24
+(palette `(177,100,0)`, `(0,56,140)`, `(56,140,214)`…; ASCII dump shows a
+small icon shape; OCR reads no text there) — recorded as unidentified icon
+pixels, no label asserted (**open**; the earlier draft's row-1 hint cell had
+no pixel basis and is withdrawn). Checks: none (gutter x=8–44 empty except
+the y=40 rule). Submenu arrows: none. Greyed rows: none.
 
 Correspondence to S03 §1: `Visualization options` (Alt+O), `Start/Stop
 plug-in` (Ctrl+Shift+K), `Configure plug-in` (Alt+K), `Select plug-in`
 (Ctrl+K). Whether a plug-in list is appended below `Select plug-in...` when a
 visualization plug-in is installed is **open** (the run had no vis plug-in
-loaded). **Click-through is not measured** (see §9).
+loaded). The job's own manifest action for this capture expected "five
+rows" but the capture renders the four rows above — a refuted expectation
+(Verified by the manifest action row for step `s04_vis_popup_posted`).
+**Click-through is not measured** (see §9).
 
 ---
 
 ## 6. Equalizer presets menu
 
-Rows (Verified by the reading §5: identical OCR on
+Rows (Verified by the reading §5 — identical OCR on both captures — and by
+the auditor's SHA-256 byte-identity of the two files — on
 `015_eqp_popup_posted_menu.png`, step `s04_eqp_popup_posted`, and
 `018_eqp_popup_real_menu.png`, step `s04_eqp_popup_real`):
 
@@ -323,8 +343,13 @@ Rows (Verified by the reading §5: identical OCR on
 | 2 | `Save` |
 | 3 | `Delete` |
 
-No checks, no submenu arrows, no separators, none greyed (black cores
-67–109/row). Posted vs real-input rendering: no difference. The contents of
+No checks, no separators, none greyed (black cores
+67–109/row). Each of `Load` / `Save` / `Delete` carries a submenu arrow ▶ at
+x=150–156 (bboxes y=11–22/46–57/81–92, 42 px each — the same size as the
+main-menu arrows; ASCII dump shows the ▶ shape) (Verified by the auditor's
+zone scans of `015`, step `s04_eqp_popup_posted`; this agrees with S07 §4.2,
+which states each entry carries a submenu arrow, against this spec's earlier
+"no arrows" wording). Posted vs real-input rendering: no difference. The contents of
 the `Load` / `Save` / `Delete` submenus, their labels beyond these three
 top-level entries, and the load/save path behaviour are **open** (opening a
 submenu leaves two `#32768` windows and the harness refuses the pair; no
@@ -348,13 +373,16 @@ no posted twin exists (§1).
 
 Relationship to the playlist window (S06): the popup is opened by the MISC
 bottom-bar button of `Winamp PE` (real clicks at (110,92); the posted probe at
-the same point exited 3 — see §1). S06 §4 records the same 474 x 81 capture
-with the same two rows and the same shortcut hints, read through a
+the same point exited 3 — see §1). S06 §4 records an independent capture of
+the same popup (run `20261016-081527`, file `019_pe_misc_popup.png`) with
+the same two rows and the same shortcut hints, read through a
 single-engine OCR pass with an attached confidence caveat; this spec's
-row-crop agreement corroborates that reading. The capture-plan expectation
+row-crop agreement corroborates that reading (corroboration grade stands).
+The capture-plan expectation
 of sort/randomise entries in the MISC popup is **refuted for this capture**:
 `023` holds the two rows above and no sort/randomise text (Verified by the
-reading §6 and S06 §4). Sort/randomise effects and per-item menu semantics
+reading §6 and S06 §4) — of the same class as the §5 five-rows-vs-four
+refutation above. Sort/randomise effects and per-item menu semantics
 stay open (S06 §8). **Click-through is not measured** (see §9).
 
 ---
@@ -382,6 +410,8 @@ steps named in §§2–4):
   is corrected: a narrower gutter search misses the glyph.
 - Main-menu submenu arrows: x=**297–303**, ~12 px tall (§3.2).
 - Options `Skins` arrow: x=**345–351**, y=46–57.
+- EQ presets submenu arrows: x=**150–156** on `Load` / `Save` / `Delete`
+  (y=11–22/46–57/81–92), 42 px each (§6; agrees with S07 §4.2).
 - Separators: full-width rules — main menu 303 non-background px at
   y=40/156/377/528; MISC 454 non-background px at y=40; visualization and
   Options rules at the y values of §§4–5.
@@ -430,9 +460,11 @@ steps named in §§2–4):
    eye, both with 0-line crop OCR (**provisional**, §4.3). Settle with the
    same higher-resolution `009`-class capture plus confirmed crop
    transcriptions at (320,288,345,305)@3× and (320,322,345,340)@3×.
-3. **Visualization-menu drawn hints.** Row labels settled; per-row hint-box
-   transcription missing (**provisional**, §5). Settle with a hint-box OCR
-   pass over a `012`-class capture.
+3. **Visualization-menu row-1 right-side icon.** Rows 2–4 hints settled
+   with word boxes (§5); row 1 carries no text hint — unidentified colour
+   icon pixels at x≈318–365, y≈11–24 (**open**, §5). Settle with a
+   higher-resolution `012`-class capture plus a confirmed
+   transcription/identification of that icon region.
 4. **What the main-menu checks mean.** Three checks at x=16–29 settled as
    rendered facts; their binding to window-open state not established here.
    Settle with a toggle-then-recapture pair (e.g. close a window, recapture
