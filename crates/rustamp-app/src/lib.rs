@@ -11,8 +11,11 @@
 //! * [`skin`] — skin selection with a clear fallback to the repo's built-in
 //!   default (look-alike) skin.
 //! * [`routing`] — which layer owns a [`rustamp_core::command::Command`].
-//! * [`app`] — [`app::App`]: engine + headless UI machine + command/event
+//! * [`app`] - [`app::App`]: engine + headless UI machine + command/event
 //!   routing. Fully headless and unit-tested.
+//! * [`dialogs`] - the simple modal dialogs (About, file info, jump-to) on
+//!   top of [`rustamp_ui::DialogManager`]: opening, closing, jump input and
+//!   the body lines. Headless; the OS window lives in [`window`].
 //! * [`host`] — the app side of the player-state bridge to `rustamp-plughost32`:
 //!   assembling [`rustamp_core::state::PlayerState`] snapshots and publishing
 //!   them as [`rustamp_ipc::Message::PlayerStateUpdate`] over the existing
@@ -44,6 +47,7 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod dialogs;
 pub mod host;
 pub mod menu;
 pub mod playlist_window;

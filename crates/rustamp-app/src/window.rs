@@ -60,7 +60,7 @@ use rustamp_core::command::Command;
 use rustamp_core::state::WindowId as CoreWindowId;
 use rustamp_platform::init_dpi_awareness;
 use rustamp_ui::{
-    DEFAULT_MAIN_POSITION, Key, Modifiers, PLAYLIST_WINDOW_SIZE, ShortcutOutcome,
+    DEFAULT_MAIN_POSITION, DialogKind, Key, Modifiers, PLAYLIST_WINDOW_SIZE, ShortcutOutcome,
     docking::DockedStack,
 };
 use winit::application::ApplicationHandler;
@@ -215,6 +215,15 @@ struct Windowed {
     /// Created by the same shell and rail as the main window.
     playlist_window: Option<Arc<Window>>,
     playlist_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// The simple modal dialog window (About, file info, jump-to; see
+    /// `dialogs.rs`): at most one is open, created by the same shell and
+    /// rail as the main window. Sizes and contents are own choices (no spec
+    /// covers dialog geometry; S04 is not started).
+    dialog_window: Option<Arc<Window>>,
+    dialog_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    dialog_id: Option<WindowId>,
+    /// Which dialog the OS window above shows (`None` while it is closed).
+    dialog_kind: Option<DialogKind>,
     cursor: (i32, i32),
     eq_cursor: (i32, i32),
     left_down: bool,
@@ -249,6 +258,10 @@ impl Windowed {
             eq_id: None,
             playlist_window: None,
             playlist_surface: None,
+            dialog_window: None,
+            dialog_surface: None,
+            dialog_id: None,
+            dialog_kind: None,
             cursor: (0, 0),
             eq_cursor: (0, 0),
             left_down: false,
@@ -548,6 +561,158 @@ impl Windowed {
     fn is_eq_window(&self, id: WindowId) -> bool {
         self.eq_id == Some(id)
     }
+    /// Creates or closes the dialog OS window so it matches the app's open
+    /// dialog ([`App::dialog_open_kind`]).
+    ///
+    /// Creation needs the event loop, so this runs wherever the loop is
+    /// available (`resumed`, `about_to_wait`). A failed creation is reported
+    /// and skipped: the main window is unaffected. The window is left at the
+    /// OS default position (cascading it off the main window is open).
+    fn sync_dialog_window(&mut self, event_loop: &ActiveEventLoop) {
+        let open = self.app.dialog_open_kind();
+        if open == self.dialog_kind && open.is_some() {
+            return;
+        }
+        if self.dialog_kind != open {
+            self.dialog_window = None;
+            self.dialog_surface = None;
+            self.dialog_id = None;
+            self.dialog_kind = None;
+        }
+        let Some(kind) = open else {
+            return;
+        };
+        let (width, height) = kind.client_size();
+        let attributes = Window::default_attributes()
+            .with_title(kind.title())
+            .with_inner_size(PhysicalSize::new(width, height))
+            .with_resizable(false);
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                eprintln!("rustamp: could not create the dialog window: {error}");
+                return;
+            }
+        };
+        let context = match softbuffer::Context::new(Arc::clone(&window)) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("rustamp: could not create the dialog softbuffer context: {error}");
+                return;
+            }
+        };
+        let mut surface = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(error) => {
+                eprintln!("rustamp: could not create the dialog softbuffer surface: {error}");
+                return;
+            }
+        };
+        if let (Some(width), Some(height)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
+            let _ = surface.resize(width, height);
+        }
+        self.dialog_id = Some(window.id());
+        self.dialog_window = Some(window);
+        self.dialog_surface = Some(surface);
+        self.dialog_kind = Some(kind);
+        self.request_dialog_redraw();
+    }
+
+    /// True when `id` is the dialog window's id.
+    fn is_dialog_window(&self, id: WindowId) -> bool {
+        self.dialog_id == Some(id)
+    }
+
+    fn request_dialog_redraw(&self) {
+        if let Some(window) = &self.dialog_window {
+            window.request_redraw();
+        }
+    }
+
+    /// Blits the dialog frame ([`App::render_dialog`]) to its surface.
+    fn paint_dialog(&mut self) {
+        let Some(kind) = self.dialog_kind else {
+            return;
+        };
+        let image = self.app.render_dialog(kind);
+        let (Some(width), Some(height)) = (
+            NonZeroU32::new(image.width()),
+            NonZeroU32::new(image.height()),
+        ) else {
+            return;
+        };
+        let Some(surface) = self.dialog_surface.as_mut() else {
+            return;
+        };
+        if surface.resize(width, height).is_err() {
+            return;
+        }
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        for (pixel, rgba) in buffer.iter_mut().zip(image.as_rgba().as_chunks::<4>().0) {
+            *pixel = (u32::from(rgba[0]) << 16) | (u32::from(rgba[1]) << 8) | u32::from(rgba[2]);
+        }
+        let _ = buffer.present();
+    }
+
+    /// A key press while the dialog window is focused.
+    ///
+    /// The dialog consumes `Enter` (confirm the jump box), `Escape` (close)
+    /// and digits (type into the jump box); the window closes itself when the
+    /// app reports no open dialog afterwards.
+    fn dialog_key_event(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let Some(key) = map_key(event) else {
+            return;
+        };
+        let modifiers = map_modifiers(self.modifiers);
+        // Modified keys stay global (the same key-event path as the main
+        // window); plain keys go to the dialog first.
+        if modifiers != Modifiers::NONE {
+            self.key_event(event);
+            return;
+        }
+        if self.app.dialog_key(key) {
+            self.sync_dialog_window(event_loop);
+            self.request_dialog_redraw();
+        }
+    }
+
+    /// Events for the dialog window.
+    ///
+    /// Closing the window closes the dialog (it never quits the player);
+    /// the dialog has no buttons, so pointer input is ignored.
+    fn dialog_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                if let Some(kind) = self.dialog_kind {
+                    self.app.close_dialog(kind);
+                }
+                self.sync_dialog_window(event_loop);
+            }
+            WindowEvent::RedrawRequested => self.paint_dialog(),
+            WindowEvent::Resized(size) => {
+                if let Some(kind) = self.dialog_kind {
+                    let (width, height) = kind.client_size();
+                    if (size.width != width || size.height != height)
+                        && let Some(window) = &self.dialog_window
+                    {
+                        let _ = window.request_inner_size(PhysicalSize::new(width, height));
+                    }
+                }
+                self.request_dialog_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.dialog_key_event(event_loop, &event);
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            _ => {}
+        }
+    }
+
     /// Creates the playlist editor window with the same shell as the main
     /// window (S06, S01 §4): a non-resizable `winit` window with its own
     /// `softbuffer` surface, sized to the spec'd 275 x 116 client area
@@ -729,14 +894,21 @@ impl ApplicationHandler for Windowed {
         self.sync_eq_window(event_loop);
         self.request_redraw();
         self.request_redraw_eq();
+        self.sync_dialog_window(event_loop);
+        self.request_dialog_redraw();
         self.open_playlist_window(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         // The equalizer window routes to the EQ machine, the playlist window
-        // to the playlist machine; everything else is the main window's.
+        // to the playlist machine, the dialog window to the dialog manager;
+        // everything else is the main window's.
         if self.is_eq_window(id) {
             self.eq_window_event(event_loop, event);
+            return;
+        }
+        if self.is_dialog_window(id) {
+            self.dialog_event(event_loop, event);
             return;
         }
         if self
@@ -851,6 +1023,10 @@ impl ApplicationHandler for Windowed {
         self.place_eq_below_main();
         self.request_redraw();
         self.request_redraw_eq();
+        // Dialogs follow the app's open dialog (opened by menu or shortcut,
+        // closed by Escape, Enter or the window's close button).
+        self.sync_dialog_window(event_loop);
+        self.request_dialog_redraw();
         // The docked playlist tracks the main window (moves and shade reflow).
         self.sync_playlist_position();
         self.request_playlist_redraw();

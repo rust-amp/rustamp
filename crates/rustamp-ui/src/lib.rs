@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 pub mod behaviour;
+pub mod dialogs;
 pub mod docking;
 pub mod eq_render;
 pub mod equalizer;
@@ -55,6 +56,10 @@ pub mod widget;
 pub use behaviour::{
     MainWindow, PROGRAM_NAME, balance_percent, core_balance, core_volume, transport_transition,
     volume_percent,
+};
+pub use dialogs::{
+    ABOUT_CLIENT_SIZE, DialogKind, DialogManager, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE,
+    MAX_JUMP_LEN, dialog_for_command, opening_command, parse_jump_time_ms, render_dialog,
 };
 pub use docking::{
     ClassicWindow, DEFAULT_EQUALIZER_POSITION, DEFAULT_MAIN_POSITION, DEFAULT_PLAYLIST_POSITION,

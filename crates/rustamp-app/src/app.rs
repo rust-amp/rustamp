@@ -44,9 +44,9 @@ use rustamp_gfx::Image;
 use rustamp_ipc::{Message, Transport};
 use rustamp_output::{NullClock, NullOutput, default_output};
 use rustamp_ui::{
-    EqMenuRequest, EqualizerLayout, EqualizerWindow, Key, MainWindow, MainWindowLayout,
-    MainWindowState, Modifiers, PlaylistDialog, PlaylistWindow, ShortcutOutcome, eq_frame_size,
-    frame_size, render_equalizer_window, render_main_window, volume_percent,
+    DialogManager, EqMenuRequest, EqualizerLayout, EqualizerWindow, Key, MainWindow,
+    MainWindowLayout, MainWindowState, Modifiers, PlaylistDialog, PlaylistWindow, ShortcutOutcome,
+    eq_frame_size, frame_size, render_equalizer_window, render_main_window, volume_percent,
 };
 
 use crate::cli::OutputChoice;
@@ -118,6 +118,9 @@ pub struct App {
     /// The playlist editor's behaviour model (S06); owned here, rendered and
     /// fed by `playlist_window.rs`, synced from `entry_ids`.
     pub(crate) playlist: PlaylistWindow,
+    /// The simple modal dialogs (About, file info, jump-to); owned here,
+    /// rendered by `dialogs.rs`, hosted by `window.rs`.
+    pub(crate) dialogs: DialogManager,
     notes: Vec<String>,
     /// The app's end of the player-state bridge to the plugin host
     /// (see [`crate::host`]): detached until a supervisor attaches a
@@ -205,6 +208,7 @@ impl App {
             entry_ids: Vec::new(),
             next_entry_id: 0,
             playlist: PlaylistWindow::new(),
+            dialogs: DialogManager::new(),
             notes: Vec::new(),
             host: HostStateLink::detached(),
             host_supervisor: None,
@@ -904,9 +908,12 @@ impl App {
             C::Minimize => self.minimize_requested = true,
             // Closing the focused window quits when that window is the main one
             // (RFC 0005 owner decision O3); it is the only window today.
+            // An open dialog closes first instead of quitting the player.
             C::CloseFocusedWindow => {
-                self.quit = true;
-                self.bus.publish(Event::Quit);
+                if !self.close_open_dialog() {
+                    self.quit = true;
+                    self.bus.publish(Event::Quit);
+                }
             }
             C::ToggleDoubleSize | C::ToggleWindowShade(WindowId::Main) => {
                 // The UI machine has already applied its S02 prediction; the
@@ -954,12 +961,14 @@ impl App {
                     "the playlist model is not wired to the app yet (S06/S14/S15)".to_string(),
                 );
             }
+            C::OpenAbout | C::OpenFileInfo | C::OpenJump { .. } => {
+                // Simple modal dialogs (`dialogs.rs`): the app opens a real
+                // window for these, so no note is recorded.
+                self.open_dialog_for(command);
+            }
             C::OpenPrefs
             | C::OpenPrefsPage(_)
             | C::OpenMedia { .. }
-            | C::OpenJump { .. }
-            | C::OpenFileInfo
-            | C::OpenAbout
             | C::OpenSkinBrowser
             | C::OpenBookmarkEditor
             | C::AddBookmark
@@ -1633,5 +1642,119 @@ mod tests {
         let notes = app.drain_notes();
         assert!(notes.iter().any(|n| n.contains("Equalizer")), "{notes:?}");
         assert!(!app.quit(), "toggling the EQ window must not quit the app");
+    }
+
+    // ----- the simple modal dialogs (About, file info, jump-to) -----
+
+    #[test]
+    fn about_file_info_and_jump_open_real_dialogs_with_no_note() {
+        // These three commands open a real window now (`dialogs.rs`), so no
+        // "not implemented yet" note may be recorded for them.
+        use rustamp_core::command::JumpTarget;
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenAbout).unwrap();
+        assert!(app.dialog_is_open(DialogKind::About));
+        app.submit(Command::OpenFileInfo).unwrap();
+        assert!(app.dialog_is_open(DialogKind::FileInfo));
+        app.submit(Command::OpenJump {
+            target: JumpTarget::Time,
+        })
+        .unwrap();
+        assert!(app.dialog_is_open(DialogKind::Jump(JumpTarget::Time)));
+        let notes = app.drain_notes();
+        assert!(
+            !notes.iter().any(|n| n.contains("not implemented yet")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn the_remaining_dialog_commands_still_record_their_note() {
+        // Preferences, the media pickers, the skin browser, bookmarks, the
+        // main menu and the playlist loader stay unimplemented.
+        let (mut app, _dir) = app_with_file(None);
+        for command in [
+            Command::OpenPrefs,
+            Command::OpenSkinBrowser,
+            Command::OpenMainMenu,
+            Command::OpenPlaylist,
+        ] {
+            app.submit(command.clone()).unwrap();
+        }
+        let notes = app.drain_notes();
+        assert_eq!(notes.len(), 4, "{notes:?}");
+        assert!(app.dialog_open_kind().is_none());
+    }
+
+    #[test]
+    fn closing_the_focused_window_closes_the_dialog_first() {
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenAbout).unwrap();
+        app.submit(Command::CloseFocusedWindow).unwrap();
+        assert!(app.dialog_open_kind().is_none());
+        assert!(!app.quit(), "closing a dialog must not quit the app");
+        app.submit(Command::CloseFocusedWindow).unwrap();
+        assert!(app.quit(), "with no dialog open the main window closes");
+    }
+
+    #[test]
+    fn escape_closes_the_dialog_and_digits_type_into_the_jump_box() {
+        use rustamp_core::command::JumpTarget;
+        use rustamp_ui::{DialogKind, Key};
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenJump {
+            target: JumpTarget::Time,
+        })
+        .unwrap();
+        assert!(app.dialog_key(Key::Digit(9)));
+        assert!(app.dialog_key(Key::Digit(0)));
+        assert_eq!(app.jump_text(), "90");
+        // Enter confirms: a Seek for 90 s is submitted (the empty queue turns
+        // it into an error event, which must not take the app down).
+        assert!(app.dialog_key(Key::Enter));
+        assert!(!app.quit());
+        assert!(app.dialog_key(Key::Escape));
+        assert_eq!(app.dialog_open_kind(), None);
+        // With no dialog open no key is consumed.
+        assert!(!app.dialog_key(Key::Escape));
+        let _ = DialogKind::About;
+    }
+
+    #[test]
+    fn file_info_with_no_track_says_so() {
+        let (app, _dir) = app_with_file(None);
+        let lines = app.file_info_lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "no track loaded");
+    }
+
+    #[test]
+    fn rendering_a_dialog_produces_a_frame_of_the_dialog_size() {
+        use rustamp_ui::{ABOUT_CLIENT_SIZE, DialogKind, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE};
+
+        let (app, _dir) = app_with_file(None);
+        for (dialog, size) in [
+            (DialogKind::About, ABOUT_CLIENT_SIZE),
+            (DialogKind::FileInfo, FILE_INFO_CLIENT_SIZE),
+            (
+                DialogKind::Jump(rustamp_core::command::JumpTarget::Time),
+                JUMP_CLIENT_SIZE,
+            ),
+        ] {
+            let image = app.render_dialog(dialog);
+            assert_eq!((image.width(), image.height()), size, "{dialog:?}");
+            assert!(
+                image
+                    .as_rgba()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] != 0),
+                "the {dialog:?} frame is empty"
+            );
+        }
     }
 }
