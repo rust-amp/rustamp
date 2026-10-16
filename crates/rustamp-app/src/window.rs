@@ -59,7 +59,10 @@ use std::time::{Duration, Instant};
 use rustamp_core::command::Command;
 use rustamp_core::state::WindowId as CoreWindowId;
 use rustamp_platform::init_dpi_awareness;
-use rustamp_ui::{Key, Modifiers, ShortcutOutcome, docking::DockedStack};
+use rustamp_ui::{
+    DEFAULT_MAIN_POSITION, Key, Modifiers, PLAYLIST_WINDOW_SIZE, ShortcutOutcome,
+    docking::DockedStack,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -131,8 +134,8 @@ pub fn ensure_gui_allowed() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Opens the main window (and the equalizer window when it is open) and runs
-/// until the main window is closed.
+/// Opens the main window (plus the equalizer window when it is open and the
+/// playlist window) and runs until the main window is closed.
 ///
 /// Blocks and must run on the main thread. Never called by a test, except the
 /// `#[ignore]`d, sandbox-only one. Returns an error without opening anything
@@ -160,10 +163,17 @@ struct Windowed {
     eq_window: Option<Arc<Window>>,
     eq_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     eq_id: Option<WindowId>,
+    /// The playlist editor window (`Winamp PE`, 275 x 116 at rest; S06, S01
+    /// §4): a docked neighbour that follows the main window's bottom edge
+    /// through the S05 geometry (see [`Windowed::sync_playlist_position`]).
+    /// Created by the same shell and rail as the main window.
+    playlist_window: Option<Arc<Window>>,
+    playlist_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     cursor: (i32, i32),
     eq_cursor: (i32, i32),
     left_down: bool,
     eq_left_down: bool,
+    playlist_cursor: (i32, i32),
     modifiers: ModifiersState,
     /// The client size last requested, so repeat requests are skipped.
     applied_client: Option<(u32, u32)>,
@@ -191,10 +201,13 @@ impl Windowed {
             eq_window: None,
             eq_surface: None,
             eq_id: None,
+            playlist_window: None,
+            playlist_surface: None,
             cursor: (0, 0),
             eq_cursor: (0, 0),
             left_down: false,
             eq_left_down: false,
+            playlist_cursor: (0, 0),
             modifiers: ModifiersState::empty(),
             applied_client: None,
             applied_eq_client: None,
@@ -409,6 +422,12 @@ impl Windowed {
         }
     }
 
+    fn request_playlist_redraw(&self) {
+        if let Some(window) = &self.playlist_window {
+            window.request_redraw();
+        }
+    }
+
     fn paint(&mut self) {
         let image = self.app.render();
         let (Some(width), Some(height)) = (
@@ -456,9 +475,165 @@ impl Windowed {
         let _ = buffer.present();
     }
 
+    fn paint_playlist(&mut self) {
+        let image = self.app.render_playlist();
+        let (Some(width), Some(height)) = (
+            NonZeroU32::new(image.width()),
+            NonZeroU32::new(image.height()),
+        ) else {
+            return;
+        };
+        let Some(surface) = self.playlist_surface.as_mut() else {
+            return;
+        };
+        if surface.resize(width, height).is_err() {
+            return;
+        }
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        for (pixel, rgba) in buffer.iter_mut().zip(image.as_rgba().as_chunks::<4>().0) {
+            *pixel = (u32::from(rgba[0]) << 16) | (u32::from(rgba[1]) << 8) | u32::from(rgba[2]);
+        }
+        let _ = buffer.present();
+    }
+
     /// True when `id` is the equalizer window's id.
     fn is_eq_window(&self, id: WindowId) -> bool {
         self.eq_id == Some(id)
+    }
+    /// Creates the playlist editor window with the same shell as the main
+    /// window (S06, S01 §4): a non-resizable `winit` window with its own
+    /// `softbuffer` surface, sized to the spec'd 275 x 116 client area
+    /// ([`PLAYLIST_WINDOW_SIZE`]), under the same [`ensure_gui_allowed`] rail
+    /// (checked once in [`run`], before either window exists).
+    fn open_playlist_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.playlist_window.is_some() {
+            return;
+        }
+        let (width, height) = PLAYLIST_WINDOW_SIZE;
+        let attributes = Window::default_attributes()
+            .with_title("Rustamp Playlist")
+            .with_inner_size(PhysicalSize::new(width, height))
+            .with_resizable(false);
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                eprintln!("rustamp: could not create the playlist window: {error}");
+                return;
+            }
+        };
+        let context = match softbuffer::Context::new(Arc::clone(&window)) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("rustamp: could not create the playlist softbuffer context: {error}");
+                return;
+            }
+        };
+        let mut surface = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(error) => {
+                eprintln!("rustamp: could not create the playlist softbuffer surface: {error}");
+                return;
+            }
+        };
+        if let (Some(width), Some(height)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
+            let _ = surface.resize(width, height);
+        }
+        self.playlist_window = Some(window);
+        self.playlist_surface = Some(surface);
+        self.sync_playlist_position();
+        self.request_playlist_redraw();
+    }
+
+    /// Keeps the playlist window docked: its screen position is the main
+    /// window's position plus the S05 docked offset (playlist origin minus the
+    /// main default position), so it follows the main window's bottom edge
+    /// through [`App::playlist_window_origin`] — including shade reflow.
+    /// Best-effort: a window whose position cannot be read keeps its own.
+    /// Undocking by dragging the playlist itself stays open (S05 §7.8).
+    fn sync_playlist_position(&self) {
+        let (Some(main), Some(playlist)) = (self.window.as_ref(), self.playlist_window.as_ref())
+        else {
+            return;
+        };
+        let Ok(main_pos) = main.outer_position() else {
+            return;
+        };
+        let (ox, oy) = self.app.playlist_window_origin();
+        let target = PhysicalPosition::new(
+            main_pos.x + ox - DEFAULT_MAIN_POSITION.x,
+            main_pos.y + oy - DEFAULT_MAIN_POSITION.y,
+        );
+        if playlist.outer_position().ok() != Some(target) {
+            playlist.set_outer_position(target);
+        }
+    }
+
+    /// Events for the playlist editor window, in playlist-window coordinates.
+    ///
+    /// Input routes to [`App::playlist_mouse_down`] /
+    /// [`App::playlist_mouse_up`]; keyboard shortcuts stay global (the same
+    /// key-event path as the main window — S06 leaves playlist keys open).
+    /// Closing the playlist keeps it open: hiding and reopening are open
+    /// (S05 §7.8), so this records a note instead of quitting the player.
+    fn playlist_event(&mut self, _event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                eprintln!("rustamp: playlist close is not implemented yet; the window stays open");
+                self.request_playlist_redraw();
+            }
+            WindowEvent::RedrawRequested => self.paint_playlist(),
+            WindowEvent::Resized(size) => {
+                // The playlist never double-sizes (S05 §2.1): its client area
+                // is always exactly the spec'd 275 x 116.
+                let (width, height) = PLAYLIST_WINDOW_SIZE;
+                if (size.width != width || size.height != height)
+                    && let Some(window) = &self.playlist_window
+                {
+                    let _ = window.request_inner_size(PhysicalSize::new(width, height));
+                }
+                self.request_playlist_redraw();
+            }
+            WindowEvent::ScaleFactorChanged {
+                mut inner_size_writer,
+                ..
+            } => {
+                let (width, height) = PLAYLIST_WINDOW_SIZE;
+                let _ = inner_size_writer.request_inner_size(PhysicalSize::new(width, height));
+                self.request_playlist_redraw();
+            }
+            WindowEvent::Focused(_) => {
+                // Per-window activation is open, so the playlist shares the
+                // main focus flag (see `App::render_playlist`).
+                self.request_playlist_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } => self.key_event(&event),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                // No double-size scale: the playlist ignores it (S05 §2.1).
+                self.playlist_cursor = (position.x as i32, position.y as i32);
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.playlist_cursor;
+                // Drags are open (S06 Q6: reorder vs selection block), so only
+                // the press/release pair is routed; moves are not forwarded.
+                let result = match state {
+                    ElementState::Pressed => self.app.playlist_mouse_down(x, y),
+                    ElementState::Released => self.app.playlist_mouse_up(x, y),
+                };
+                if let Err(error) = result {
+                    eprintln!("rustamp: playlist pointer input failed: {error}");
+                }
+                self.sync_playlist_position();
+                self.request_playlist_redraw();
+            }
+            _ => {}
+        }
     }
 }
 
@@ -508,13 +683,22 @@ impl ApplicationHandler for Windowed {
         self.sync_eq_window(event_loop);
         self.request_redraw();
         self.request_redraw_eq();
+        self.open_playlist_window(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        // The equalizer window routes to the EQ machine; everything else is
-        // the main window's.
+        // The equalizer window routes to the EQ machine, the playlist window
+        // to the playlist machine; everything else is the main window's.
         if self.is_eq_window(id) {
             self.eq_window_event(event_loop, event);
+            return;
+        }
+        if self
+            .playlist_window
+            .as_ref()
+            .is_some_and(|window| window.id() == id)
+        {
+            self.playlist_event(event_loop, event);
             return;
         }
         match event {
@@ -534,6 +718,7 @@ impl ApplicationHandler for Windowed {
                 }
                 self.last_main_outer = Some(position);
                 self.place_eq_below_main();
+                self.sync_playlist_position();
             }
             WindowEvent::RedrawRequested => self.paint(),
             WindowEvent::Resized(size) => {
@@ -544,8 +729,10 @@ impl ApplicationHandler for Windowed {
                     self.sync_window_state();
                 }
                 // A main resize (windowshade, double-size) re-flows the stack
-                // (S05 §3.3, §5): the equalizer tracks the new bottom edge.
+                // (S05 §3.3, §5): the equalizer tracks the new bottom edge,
+                // and so does the playlist.
                 self.place_eq_below_main();
+                self.sync_playlist_position();
                 self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged {
@@ -618,6 +805,9 @@ impl ApplicationHandler for Windowed {
         self.place_eq_below_main();
         self.request_redraw();
         self.request_redraw_eq();
+        // The docked playlist tracks the main window (moves and shade reflow).
+        self.sync_playlist_position();
+        self.request_playlist_redraw();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
     }
 }

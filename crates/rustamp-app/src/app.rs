@@ -45,8 +45,8 @@ use rustamp_ipc::{Message, Transport};
 use rustamp_output::{NullClock, NullOutput, default_output};
 use rustamp_ui::{
     EqMenuRequest, EqualizerLayout, EqualizerWindow, Key, MainWindow, MainWindowLayout,
-    MainWindowState, Modifiers, PlaylistDialog, ShortcutOutcome, eq_frame_size, frame_size,
-    render_equalizer_window, render_main_window, volume_percent,
+    MainWindowState, Modifiers, PlaylistDialog, PlaylistWindow, ShortcutOutcome, eq_frame_size,
+    frame_size, render_equalizer_window, render_main_window, volume_percent,
 };
 
 use crate::cli::OutputChoice;
@@ -83,7 +83,7 @@ pub struct App {
     /// work, so this is the UI's own prediction state).
     eq: EqualizerWindow,
     eq_layout: EqualizerLayout,
-    skin: LoadedSkin,
+    pub(crate) skin: LoadedSkin,
     config: Config,
 
     bus: EventBus,
@@ -101,7 +101,7 @@ pub struct App {
     repeat: bool,
     always_on_top: bool,
     easy_move: bool,
-    focused: bool,
+    pub(crate) focused: bool,
     current_skin: Option<PathBuf>,
     quit: bool,
     minimize_requested: bool,
@@ -113,8 +113,11 @@ pub struct App {
     /// `id.is_some()` to tell "a track is loaded" from "nothing loaded". The
     /// app is the state owner, so it allocates the ids and normalises the event
     /// on its way to the UI. See the findings in the task card report.
-    entry_ids: Vec<EntryId>,
+    pub(crate) entry_ids: Vec<EntryId>,
     next_entry_id: u64,
+    /// The playlist editor's behaviour model (S06); owned here, rendered and
+    /// fed by `playlist_window.rs`, synced from `entry_ids`.
+    pub(crate) playlist: PlaylistWindow,
     notes: Vec<String>,
     /// The app's end of the player-state bridge to the plugin host
     /// (see [`crate::host`]): detached until a supervisor attaches a
@@ -201,6 +204,7 @@ impl App {
             playlist_ended: false,
             entry_ids: Vec::new(),
             next_entry_id: 0,
+            playlist: PlaylistWindow::new(),
             notes: Vec::new(),
             host: HostStateLink::detached(),
             host_supervisor: None,
@@ -849,7 +853,7 @@ impl App {
         self.entry_ids.get(index).copied()
     }
 
-    fn note(&mut self, message: String) {
+    pub(crate) fn note(&mut self, message: String) {
         if self.notes.len() < MAX_NOTES {
             self.notes.push(message);
         }

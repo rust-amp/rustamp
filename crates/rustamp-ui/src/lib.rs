@@ -41,6 +41,7 @@ pub use docking as geometry;
 pub use docking as windows;
 pub mod layout;
 pub mod playlist;
+pub mod playlist_window;
 pub mod presenter;
 pub mod render;
 pub mod shortcuts;
@@ -76,6 +77,14 @@ pub use playlist::{
     ADD_DIALOG_TITLE, BUTTON_BAND_BOTTOM, BUTTON_BAND_TOP, LIST_SELECT_POINT, LOAD_DIALOG_TITLE,
     PAGE_STEP_ROWS, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog, PlaylistWindow,
     ScrollDirection, VISIBLE_ROWS, button_hit_range, has_window_menu_button, hit_test_button,
+};
+pub use playlist_window::{
+    BOTTOM_BAR_RECT, BUTTON_SRC_Y, CLOSE_BUTTON_RECT, LIST_BOTTOM, LIST_LEFT, LIST_OPTS_SRC_X,
+    LIST_RIGHT, LIST_TOP, PlaylistTitleButton, ROW_PITCH, SCROLL_ARROWS_RECT, SCROLL_ARROWS_SRC,
+    SCROLL_HANDLE_SRC, SCROLL_HANDLE_X, SCROLL_SPLIT_Y, SCROLL_TOP_Y, SCROLL_TRAVEL_PX,
+    SHADE_BUTTON_RECT, TITLE_BAR_HEIGHT, TITLE_STRIP_WIDTH, TITLE_STRIP_X, TITLE_TILE_WIDTH,
+    button_rect, hit_test_list_row, hit_test_scroll, hit_test_title_bar, in_list_area, list_area,
+    render_playlist_window, row_rect, scroll_handle_y,
 };
 pub use presenter::{MainWindowPresenter, PresenterError, map_key, map_key_code, map_modifiers};
 pub use render::{frame_size, render_main_window};

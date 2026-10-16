@@ -43,6 +43,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod host;
+pub mod playlist_window;
 pub mod routing;
 pub mod skin;
 pub mod supervise;

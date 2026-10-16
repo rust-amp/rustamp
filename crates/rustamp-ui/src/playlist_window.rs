@@ -1,0 +1,595 @@
+//! The playlist editor window: layout, hit-testing and rendering.
+//!
+//! [`PlaylistWindow`](crate::playlist::PlaylistWindow) (spec **S06**) is the
+//! headless behaviour model; this module is the window around it. Everything
+//! here is headless: layout is arithmetic on the S01 rectangles, hit-testing
+//! reuses the settled S01/S06 points, and rendering paints one RGBA frame from
+//! a [`Skin`] through `rustamp-gfx`. No `winit`, no clock, no window.
+//!
+//! Provenance per element (see `specs/S01-window-geometry.md` §4 and
+//! `specs/S06-playlist.md`):
+//!
+//! * Client size 275 x 116: S06 scope / S01 §1, verified. The playlist editor
+//!   is not affected by double-size mode (S05 §2.1, settled).
+//! * Title bar: the 25 px corners, the 100 px strip blitted once at x = 87 and
+//!   the 25 px tile pitch (S01 §4.1, round 2, verified). Focused rows are sheet
+//!   y 0-19, unfocused rows y 21-40 (S01 §4.1, round 2, verified).
+//! * **No window-menu button** (S06 §1, settled with qualification): only Close
+//!   at (264,3) and Shade at (254,3), 9 x 9 each (S01 §4, provisional).
+//! * List band bbox (12,23)-(254,93) (S06 §2, settled: the single-click change).
+//!   Rows at 13 px pitch (S01 §4.2: the captured list "shows four rows at 13 px
+//!   pitch"). The band below the fourth row is list background (own reading).
+//! * Selection fill: the `SelectedBG` colour from `pledit.txt` over the list
+//!   area (S01 §4, verified by diff); entry text in the `Normal` colour
+//!   (`#00FF00` in the base skin).
+//! * Scrollbar handle `PLEDIT.BMP` (52,53,7,17) at (260,y) with y = 20 at the
+//!   scroll top, 40 in the middle and 60 at the bottom (S01 §4.2, round 2,
+//!   verified); the arrow pair `PLEDIT.BMP` (261,72,8,10) fixed at (260,78)
+//!   (S01 §4.2, verified). Arrow click points (263,81) up / (263,87) down and
+//!   the one-page step (S06 §3, settled).
+//! * Bottom bar blocks (0,72,125,38) at (0,78) and (126,72,150,38) at (125,78)
+//!   (S01 §4, verified with a small residual). Buttons from sheet y = 86 drawn
+//!   at window y = 92-109, x ≈ 11/43/72/101/228, widths ≈ 22-25 px (S01 §4.1,
+//!   verified; x origins ambiguous by ±3 px, so every button rect here is
+//!   **provisional**). Behavioural hit-testing uses the settled
+//!   [`crate::playlist::hit_test_button`] ranges, not these rects.
+//!
+//! Deliberate simplifications (the spec leaves these open, so they are kept
+//! simple and named):
+//!
+//! * The tiled title band clips whole 25 px tiles at the band edges instead of
+//!   the measured partial anchor pieces (S01 §4.1); the pixels differ where a
+//!   partial piece would start.
+//! * Entry text is drawn with the `text.bmp` bitmap font as a stand-in. S01 §4
+//!   settles that 2.95 uses a real font here, whose identity is open, so no
+//!   stand-in can match it; the colour follows `pledit.txt`.
+//! * The up/down split of the arrow pair (at y = 83) is an own choice; only
+//!   the two click points are settled.
+//! * The handle-y interpolation between the three settled points is an own
+//!   linear choice.
+//! * MISC popup contents, sort/randomise, double-click, drag, keyboard and
+//!   message exposure stay open (S06 §8) and are not rendered or wired here.
+
+use rustamp_gfx::{BitmapFont, GlyphMap, Image, Rect};
+use rustamp_skin::{Sheet, Skin, webamp};
+
+use crate::playlist::{
+    PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistWindow, ScrollDirection, VISIBLE_ROWS,
+};
+
+// ---------------------------------------------------------------------------
+// Title bar (S01 §4.1; S06 §1: no window-menu button)
+// ---------------------------------------------------------------------------
+
+/// Height of the playlist title band (S01 §4.1: sheet rows 0-19).
+pub const TITLE_BAR_HEIGHT: i32 = 20;
+
+/// Left edge of the 100 px title strip, blitted exactly once (S01 §4.1).
+pub const TITLE_STRIP_X: i32 = 87;
+
+/// Width of the title strip (S01 §4.1).
+pub const TITLE_STRIP_WIDTH: u32 = 100;
+
+/// Width of the title corners and the tile pitch (S01 §4.1, 25 px).
+pub const TITLE_TILE_WIDTH: u32 = 25;
+
+/// Close button rect (S01 §4, provisional: 9 x 9 at (264,3)).
+pub const CLOSE_BUTTON_RECT: Rect = Rect::new(264, 3, 9, 9);
+
+/// Shade button rect (S01 §4, provisional: 9 x 9 at (254,3)).
+pub const SHADE_BUTTON_RECT: Rect = Rect::new(254, 3, 9, 9);
+
+/// The playlist title bar's buttons.
+///
+/// There is deliberately no menu variant: S06 §1 settles that the playlist
+/// title bar carries no window-menu button, so nothing may offer one here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaylistTitleButton {
+    /// Close (S01 §4, provisional rect).
+    Close,
+    /// Shade (S01 §4, provisional rect).
+    Shade,
+}
+
+/// Which title-bar button (if any) a click at window-relative `(x, y)` hits.
+///
+/// Close and shade rects are S01 §4 (provisional); (6,3) — where a
+/// window-menu button would sit — hits nothing (S06 §1, settled).
+pub fn hit_test_title_bar(x: i32, y: i32) -> Option<PlaylistTitleButton> {
+    if !(0..TITLE_BAR_HEIGHT).contains(&y) {
+        return None;
+    }
+    if in_rect(x, y, CLOSE_BUTTON_RECT) {
+        return Some(PlaylistTitleButton::Close);
+    }
+    if in_rect(x, y, SHADE_BUTTON_RECT) {
+        return Some(PlaylistTitleButton::Shade);
+    }
+    None
+}
+
+fn in_rect(x: i32, y: i32, rect: Rect) -> bool {
+    x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+}
+
+// ---------------------------------------------------------------------------
+// List area (S06 §2; S01 §4.2)
+// ---------------------------------------------------------------------------
+
+/// Left edge of the list band (S06 §2, settled bbox (12,23)-(254,93)).
+pub const LIST_LEFT: i32 = 12;
+
+/// Top edge of the list band (S06 §2, settled).
+pub const LIST_TOP: i32 = 23;
+
+/// Right edge (exclusive) of the list band (S06 §2, settled).
+pub const LIST_RIGHT: i32 = 254;
+
+/// Bottom edge (exclusive) of the list band (S06 §2, settled).
+pub const LIST_BOTTOM: i32 = 93;
+
+/// Row pitch in pixels (S01 §4.2: "four rows at 13 px pitch").
+pub const ROW_PITCH: i32 = 13;
+
+/// The settled list band as a rectangle (S06 §2).
+pub fn list_area() -> Rect {
+    Rect::new(
+        LIST_LEFT,
+        LIST_TOP,
+        (LIST_RIGHT - LIST_LEFT) as u32,
+        (LIST_BOTTOM - LIST_TOP) as u32,
+    )
+}
+
+/// The rectangle of visible row `row` (0-based).
+///
+/// Returns `None` past [`VISIBLE_ROWS`]: rows below the fourth band are list
+/// background (own reading; the spec fixes the band and the pitch only).
+pub fn row_rect(row: usize) -> Option<Rect> {
+    if row >= VISIBLE_ROWS {
+        return None;
+    }
+    Some(Rect::new(
+        LIST_LEFT,
+        LIST_TOP + row as i32 * ROW_PITCH,
+        (LIST_RIGHT - LIST_LEFT) as u32,
+        ROW_PITCH as u32,
+    ))
+}
+
+/// Whether `(x, y)` is inside the settled list band (S06 §2).
+pub fn in_list_area(x: i32, y: i32) -> bool {
+    in_rect(x, y, list_area())
+}
+
+/// Which visible row (if any) a click at `(x, y)` lands on.
+///
+/// Rows are the 13 px bands from [`row_rect`]; the band below the fourth row
+/// is background and hits nothing. Callers that implement the S06 §2 click
+/// map any hit to the model's first-visible-row selection (a single click
+/// selects the first visible row, whatever row was clicked).
+pub fn hit_test_list_row(x: i32, y: i32) -> Option<usize> {
+    if !(LIST_LEFT..LIST_RIGHT).contains(&x) || y < LIST_TOP {
+        return None;
+    }
+    let row = ((y - LIST_TOP) / ROW_PITCH) as usize;
+    if row < VISIBLE_ROWS { Some(row) } else { None }
+}
+
+// ---------------------------------------------------------------------------
+// Scrollbar (S01 §4.2; S06 §3)
+// ---------------------------------------------------------------------------
+
+/// Scrollbar handle x (S01 §4.2, verified: drawn at (260,y)).
+pub const SCROLL_HANDLE_X: i32 = 260;
+
+/// Handle y at the scroll top (S01 §4.2, verified).
+pub const SCROLL_TOP_Y: i32 = 20;
+
+/// Handle travel in pixels: 20 at the top, 40 in the middle, 60 at the bottom
+/// (S01 §4.2, verified).
+pub const SCROLL_TRAVEL_PX: i32 = 40;
+
+/// The arrow pair rect: `PLEDIT.BMP` (261,72,8,10) at (260,78) (S01 §4.2,
+/// verified; no pressed sprite).
+pub const SCROLL_ARROWS_RECT: Rect = Rect::new(260, 78, 8, 10);
+
+/// Source rect of the handle in `PLEDIT.BMP` (S01 §4.2, verified: 7 x 17).
+pub const SCROLL_HANDLE_SRC: Rect = Rect::new(52, 53, 7, 17);
+
+/// Source rect of the arrow pair in `PLEDIT.BMP` (S01 §4.2, verified).
+pub const SCROLL_ARROWS_SRC: Rect = Rect::new(261, 72, 8, 10);
+
+/// Up/down split inside the arrow pair.
+///
+/// Own choice: only the (263,81) up and (263,87) down points are settled
+/// (S06 §3); the split between them is not.
+pub const SCROLL_SPLIT_Y: i32 = 83;
+
+/// Handle y for a scroll offset of `first_visible` in a list of `len`.
+///
+/// The three S01 §4.2 points (20 top, 40 middle, 60 bottom) are pinned; the
+/// linear interpolation between them is an own choice. A list that fits the
+/// four-row page shows the handle at the top.
+pub fn scroll_handle_y(first_visible: usize, len: usize) -> i32 {
+    if len <= VISIBLE_ROWS {
+        return SCROLL_TOP_Y;
+    }
+    let max_first = len.saturating_sub(VISIBLE_ROWS);
+    let clamped = first_visible.min(max_first);
+    SCROLL_TOP_Y + (SCROLL_TRAVEL_PX as usize * clamped / max_first.max(1)) as i32
+}
+
+/// Which scroll direction (if any) a click at `(x, y)` requests.
+///
+/// The settled points are (263,81) up and (263,87) down (S06 §3); the split
+/// at [`SCROLL_SPLIT_Y`] is an own choice.
+pub fn hit_test_scroll(x: i32, y: i32) -> Option<ScrollDirection> {
+    if !in_rect(x, y, SCROLL_ARROWS_RECT) {
+        return None;
+    }
+    if y < SCROLL_SPLIT_Y {
+        Some(ScrollDirection::Up)
+    } else {
+        Some(ScrollDirection::Down)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bottom bar (S01 §4, §4.1; S06 §4)
+// ---------------------------------------------------------------------------
+
+/// The bottom bar background: two blocks at (0,78) and (125,78), 38 px tall
+/// (S01 §4, verified with a small residual).
+pub const BOTTOM_BAR_RECT: Rect = Rect::new(0, 78, 275, 38);
+
+/// Source sheet row of the bottom-bar buttons (S01 §4.1, verified: y = 86).
+pub const BUTTON_SRC_Y: i32 = 86;
+
+/// Source x of the LIST OPTS button (S01 §4.1: sheet x = 229, one pixel right
+/// of the drawn x = 228).
+pub const LIST_OPTS_SRC_X: i32 = 229;
+
+/// The drawn rectangle of `button`.
+///
+/// Provisional throughout (S01 §4.1: x origins ≈ 11/43/72/101/228 ambiguous
+/// by ±3 px, widths ≈ 22-25 px). Behavioural hit-testing must use the settled
+/// [`hit_test_button`] ranges, never these rects.
+pub fn button_rect(button: PlaylistButton) -> Rect {
+    match button {
+        PlaylistButton::Add => Rect::new(11, 92, 23, 18),
+        PlaylistButton::Rem => Rect::new(43, 92, 24, 18),
+        PlaylistButton::Sel => Rect::new(72, 92, 24, 18),
+        PlaylistButton::Misc => Rect::new(101, 92, 24, 18),
+        PlaylistButton::ListOpts => Rect::new(228, 92, 24, 18),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// Renders one 275 x 116 playlist frame.
+///
+/// `labels[i]` is the text of `window.visible_ids()[i]`; a missing label
+/// renders as an empty row. `focused` selects the title band variant. A
+/// missing sprite or sheet is skipped (the loader has already substituted the
+/// built-in default per S17), so a skin without a sheet still produces a
+/// frame instead of panicking.
+pub fn render_playlist_window(
+    skin: &Skin,
+    window: &PlaylistWindow,
+    labels: &[String],
+    focused: bool,
+) -> Image {
+    let (width, height) = PLAYLIST_WINDOW_SIZE;
+    let style = skin.pledit();
+    let mut canvas = Image::filled(
+        width,
+        height,
+        [
+            style.normal_bg[0],
+            style.normal_bg[1],
+            style.normal_bg[2],
+            255,
+        ],
+    );
+    let pledit = load_sheet(skin, Sheet::Pledit);
+    draw_title_bar(&mut canvas, pledit.as_ref(), skin, focused);
+    draw_side_rails(&mut canvas, pledit.as_ref(), skin);
+    draw_bottom_bar(&mut canvas, pledit.as_ref(), skin);
+    draw_rows(&mut canvas, skin, window, labels);
+    draw_scrollbar(&mut canvas, pledit.as_ref(), window);
+    canvas
+}
+
+fn load_sheet(skin: &Skin, sheet: Sheet) -> Option<Image> {
+    let raster = skin.sheet(sheet)?;
+    Image::from_rgba(raster.width(), raster.height(), raster.as_rgba().to_vec()).ok()
+}
+
+fn blit_sprite(
+    canvas: &mut Image,
+    pledit: Option<&Image>,
+    skin: &Skin,
+    name: &str,
+    dx: i32,
+    dy: i32,
+) {
+    let Some(def) = skin.sprite(name) else {
+        return;
+    };
+    if def.sheet != Sheet::Pledit {
+        return;
+    }
+    let Some(src) = pledit else {
+        return;
+    };
+    canvas.blit_rect(
+        src,
+        Rect::new(def.x as i32, def.y as i32, def.width, def.height),
+        dx,
+        dy,
+    );
+}
+
+fn blit_region(canvas: &mut Image, pledit: Option<&Image>, src: Rect, dx: i32, dy: i32) {
+    if let Some(image) = pledit {
+        canvas.blit_rect(image, src, dx, dy);
+    }
+}
+
+fn draw_title_bar(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin, focused: bool) {
+    // Focused vs unfocused rows (S01 §4.1, verified); the SELECTED-means-focused
+    // reading follows the main-window convention in `render::render_1x`.
+    let (corner, strip, tile, right) = if focused {
+        (
+            "PLAYLIST_TOP_LEFT_SELECTED",
+            "PLAYLIST_TITLE_BAR_SELECTED",
+            "PLAYLIST_TOP_TILE_SELECTED",
+            "PLAYLIST_TOP_RIGHT_CORNER_SELECTED",
+        )
+    } else {
+        (
+            "PLAYLIST_TOP_LEFT_CORNER",
+            "PLAYLIST_TITLE_BAR",
+            "PLAYLIST_TOP_TILE",
+            "PLAYLIST_TOP_RIGHT_CORNER",
+        )
+    };
+    blit_sprite(canvas, pledit, skin, corner, 0, 0);
+    // Tiled bands at 25 px pitch, clipped at the band edges (whole tiles; the
+    // measured partial anchor pieces of S01 §4.1 are an owned simplification).
+    // The tiles go down first so the strip and the corners cover the overflow.
+    let mut dx = TITLE_TILE_WIDTH as i32;
+    while dx < TITLE_STRIP_X {
+        blit_sprite(canvas, pledit, skin, tile, dx, 0);
+        dx += TITLE_TILE_WIDTH as i32;
+    }
+    let mut dx = TITLE_STRIP_X + TITLE_STRIP_WIDTH as i32;
+    while dx < 250 {
+        blit_sprite(canvas, pledit, skin, tile, dx, 0);
+        dx += TITLE_TILE_WIDTH as i32;
+    }
+    blit_sprite(canvas, pledit, skin, strip, TITLE_STRIP_X, 0);
+    blit_sprite(canvas, pledit, skin, right, 250, 0);
+    // Close/shade from the raw sheet rects (S01 §4, provisional); the webamp
+    // table only names the pressed cells, so no sprite name is used.
+    blit_region(canvas, pledit, Rect::new(52, 42, 9, 9), 264, 3);
+    blit_region(canvas, pledit, Rect::new(62, 42, 9, 9), 254, 3);
+}
+
+fn draw_side_rails(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin) {
+    // Left rail tiles from y = 20 (S01 §4.1, verified); the right rail stays
+    // provisional there but is drawn the same way. Tiles stop at the bottom
+    // bar (y = 78).
+    let mut dy = LIST_TOP - 3;
+    while dy + 29 <= BOTTOM_BAR_RECT.y {
+        blit_sprite(canvas, pledit, skin, "PLAYLIST_LEFT_TILE", 0, dy);
+        blit_sprite(canvas, pledit, skin, "PLAYLIST_RIGHT_TILE", 255, dy);
+        dy += 29;
+    }
+}
+
+fn draw_bottom_bar(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin) {
+    blit_sprite(canvas, pledit, skin, "PLAYLIST_BOTTOM_LEFT_CORNER", 0, 78);
+    blit_sprite(
+        canvas,
+        pledit,
+        skin,
+        "PLAYLIST_BOTTOM_RIGHT_CORNER",
+        125,
+        78,
+    );
+    // Button faces from sheet y = 86 at the drawn destinations (S01 §4.1).
+    // No bottom-bar button draws a pressed sprite (S01 §4.1, round 2).
+    for button in PlaylistButton::ALL {
+        let dst = button_rect(*button);
+        let src_x = match button {
+            PlaylistButton::ListOpts => LIST_OPTS_SRC_X,
+            _ => dst.x,
+        };
+        blit_region(
+            canvas,
+            pledit,
+            Rect::new(src_x, BUTTON_SRC_Y, dst.width, dst.height),
+            dst.x,
+            dst.y,
+        );
+    }
+}
+
+/// The `text.bmp` bitmap font, as a stand-in for the playlist's real font.
+///
+/// S01 §4 settles that 2.95 draws the list with a real font (identity open),
+/// so this stand-in cannot match it; see the module docs. The helper mirrors
+/// `render::text_font` (same glyph map, opaque blits).
+fn text_font(skin: &Skin) -> Option<BitmapFont> {
+    let raster = skin.sheet(Sheet::Text)?;
+    let image =
+        Image::from_rgba(raster.width(), raster.height(), raster.as_rgba().to_vec()).ok()?;
+    let mut glyphs = GlyphMap::new(webamp::TEXT_CELL.0, webamp::TEXT_CELL.1);
+    for (ch, col, row) in webamp::TEXT_GLYPHS {
+        glyphs.insert(*ch, *col, *row);
+    }
+    Some(BitmapFont::new(image, glyphs, None, 0))
+}
+
+fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &[String]) {
+    let style = skin.pledit();
+    let selected = [
+        style.selected_bg[0],
+        style.selected_bg[1],
+        style.selected_bg[2],
+        255,
+    ];
+    let font = text_font(skin);
+    let visible = window.visible_ids();
+    let selected_ids = window.selected_ids();
+    for (i, id) in visible.iter().enumerate().take(VISIBLE_ROWS) {
+        let Some(rect) = row_rect(i) else {
+            continue;
+        };
+        if selected_ids.contains(id) {
+            canvas.fill_rect(rect, selected);
+        }
+        let text = labels.get(i).map(String::as_str).unwrap_or("");
+        if text.is_empty() {
+            continue;
+        }
+        if let Some(font) = font.as_ref() {
+            // Scratch-clipped like the main-window marquee, so text cannot
+            // spill past the row or into the scrollbar.
+            let mut scratch = Image::new(rect.width, rect.height);
+            font.render_text(&mut scratch, 0, 0, text);
+            canvas.blit_alpha(&scratch, scratch.bounds(), rect.x, rect.y);
+        }
+    }
+}
+
+fn draw_scrollbar(canvas: &mut Image, pledit: Option<&Image>, window: &PlaylistWindow) {
+    // Verified raw rects (S01 §4.2) rather than the webamp 8x18 handle name.
+    blit_region(
+        canvas,
+        pledit,
+        SCROLL_HANDLE_SRC,
+        SCROLL_HANDLE_X,
+        scroll_handle_y(window.first_visible(), window.len()),
+    );
+    blit_region(
+        canvas,
+        pledit,
+        SCROLL_ARROWS_SRC,
+        SCROLL_ARROWS_RECT.x,
+        SCROLL_ARROWS_RECT.y,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_size_is_275x116_at_rest() {
+        // S06 scope / S01 §1, verified; double-size leaves it unchanged.
+        assert_eq!(PLAYLIST_WINDOW_SIZE, (275, 116));
+    }
+
+    #[test]
+    fn title_bar_has_no_window_menu_button() {
+        // S06 §1: no `#32768` popup after the (6,3) click, so no button.
+        assert_eq!(hit_test_title_bar(6, 3), None);
+        assert_eq!(hit_test_title_bar(264, 3), Some(PlaylistTitleButton::Close));
+        assert_eq!(hit_test_title_bar(254, 3), Some(PlaylistTitleButton::Shade));
+        // Outside the 20 px band nothing hits.
+        assert_eq!(hit_test_title_bar(264, 20), None);
+        assert_eq!(hit_test_title_bar(0, 21), None);
+    }
+
+    #[test]
+    fn list_rows_follow_the_settled_band_and_pitch() {
+        // S06 §2 bbox (12,23)-(254,93); S01 §4.2 13 px pitch, four rows.
+        assert_eq!(list_area(), Rect::new(12, 23, 242, 70));
+        assert_eq!(row_rect(0), Some(Rect::new(12, 23, 242, 13)));
+        assert_eq!(row_rect(3), Some(Rect::new(12, 62, 242, 13)));
+        assert_eq!(row_rect(4), None);
+    }
+
+    #[test]
+    fn list_hit_testing_maps_rows_and_background() {
+        assert_eq!(hit_test_list_row(60, 28), Some(0));
+        assert_eq!(hit_test_list_row(12, 23), Some(0));
+        assert_eq!(hit_test_list_row(253, 74), Some(3));
+        // Below the fourth row is background (own reading).
+        assert_eq!(hit_test_list_row(60, 75), None);
+        assert_eq!(hit_test_list_row(60, 92), None);
+        // Outside the band horizontally.
+        assert_eq!(hit_test_list_row(11, 28), None);
+        assert_eq!(hit_test_list_row(254, 28), None);
+        assert!(in_list_area(60, 92));
+        assert!(!in_list_area(60, 93));
+    }
+
+    #[test]
+    fn scroll_handle_pins_the_three_settled_points() {
+        // S01 §4.2: y = 20 top, 40 middle, 60 bottom (60-entry list).
+        assert_eq!(scroll_handle_y(0, 60), 20);
+        assert_eq!(scroll_handle_y(28, 60), 40);
+        assert_eq!(scroll_handle_y(56, 60), 60);
+        // A list that fits the page stays at the top.
+        assert_eq!(scroll_handle_y(0, 4), 20);
+        assert_eq!(scroll_handle_y(0, 0), 20);
+        // Clamped past the end.
+        assert_eq!(scroll_handle_y(1000, 60), 60);
+    }
+
+    #[test]
+    fn scroll_arrows_split_at_the_settled_points() {
+        // S06 §3: (263,81) up, (263,87) down; the split is an own choice.
+        assert_eq!(hit_test_scroll(263, 81), Some(ScrollDirection::Up));
+        assert_eq!(hit_test_scroll(263, 87), Some(ScrollDirection::Down));
+        assert_eq!(hit_test_scroll(260, 78), Some(ScrollDirection::Up));
+        assert_eq!(hit_test_scroll(260, 87), Some(ScrollDirection::Down));
+        assert_eq!(hit_test_scroll(259, 81), None);
+        assert_eq!(hit_test_scroll(260, 88), None);
+    }
+
+    #[test]
+    fn button_rects_stay_inside_the_button_band() {
+        // S01 §4.1: drawn at window y 92-109. Behavioural hit-testing uses
+        // `hit_test_button`, never these provisional rects.
+        for button in PlaylistButton::ALL {
+            let rect = button_rect(*button);
+            assert!(rect.y >= 92 && rect.bottom() <= 110, "{button:?}");
+        }
+        assert_eq!(button_rect(PlaylistButton::ListOpts).x, 228);
+    }
+
+    #[test]
+    fn settled_bottom_bar_points_hit_their_buttons() {
+        // S01 §4.2 posted positives at y = 92 route through the model ranges.
+        use crate::playlist::{PlaylistButton, hit_test_button};
+        assert_eq!(hit_test_button(24, 92), Some(PlaylistButton::Add));
+        assert_eq!(hit_test_button(46, 92), Some(PlaylistButton::Rem));
+        assert_eq!(hit_test_button(74, 92), Some(PlaylistButton::Sel));
+        assert_eq!(hit_test_button(112, 92), Some(PlaylistButton::Misc));
+        assert_eq!(hit_test_button(242, 92), Some(PlaylistButton::ListOpts));
+    }
+
+    #[test]
+    fn row_index_maps_to_the_model_view() {
+        // The row-to-model mapping: visible row i is `visible_ids()[i]`.
+        use crate::playlist::PlaylistWindow;
+        use rustamp_core::playlist::EntryId;
+
+        let mut model = PlaylistWindow::new();
+        model.set_entries((0..60u64).map(EntryId).collect());
+        model.scroll_to(56);
+        let visible = model.visible_ids();
+        assert_eq!(visible.len(), VISIBLE_ROWS);
+        for (row, id) in visible.iter().enumerate() {
+            assert_eq!(hit_test_list_row(60, 23 + row as i32 * 13), Some(row));
+            assert_eq!(*id, EntryId(56 + row as u64));
+        }
+    }
+}
