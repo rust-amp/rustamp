@@ -853,10 +853,12 @@ impl Engine {
         self.current = Some(index);
         let start_at = self.start_at.take();
         self.clock_origin = self.output.played_frames();
-        // The timeline starts at zero for a new run; an initial seek is applied
-        // by the decode thread, which reports the new timeline position and
-        // re-bases the clock (see `DecodeOut::Seeked`).
-        self.timeline_origin = 0;
+        // A run without an initial seek starts at zero. With one, keep the
+        // target that `seek_frames` published while stopped, so the position
+        // does not dip to zero between `play` and the decode thread's `Seeked`
+        // (which re-bases the clock and reports the true position a moment
+        // later). See the F1 finding in docs/tasks/A3-engine-lifecycle-review.md.
+        self.timeline_origin = start_at.as_ref().map(|(frames, _)| *frames).unwrap_or(0);
         self.track_start = 0;
         self.end_of_stream = None;
         self.pending_seek = None;

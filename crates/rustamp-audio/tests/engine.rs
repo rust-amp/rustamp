@@ -781,3 +781,92 @@ fn installed_dsp_chain_survives_consecutive_runs() {
         "DSP stage must have survived and processed identical sample count in the second run"
     );
 }
+
+// ----- Engine lifecycle correctness findings -----
+
+#[test]
+fn timeline_does_not_dip_after_seek_before_play() {
+    // Finding F1: verify position_frames() does NOT briefly read 0 after
+    // play() following seek_frames() while stopped.
+    let mut h = Harness::new(&[TRACK_A]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    // Stop (resets position to 0).
+    h.engine.stop().unwrap();
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+    assert_eq!(h.engine.position_frames(), 0);
+
+    // Seek while stopped sets the target immediately.
+    h.engine.seek_frames(1500).unwrap();
+    assert_eq!(h.engine.position_frames(), 1500);
+
+    // Now play: the decode thread needs a moment to open and seek.
+    // We verify position_frames() stays at the target, never drops to 0.
+    h.engine.play().unwrap();
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+
+    // Immediately poll without pumping the clock — the decode thread hasn't
+    // sent Seeked yet, but position_frames() must still read 1500 (not 0).
+    h.engine.poll().unwrap();
+    assert_eq!(
+        h.engine.position_frames(),
+        1500,
+        "position must stay at seek target before Seeked; actual: {}",
+        h.engine.position_frames()
+    );
+
+    // Settle the seek fully.
+    assert!(h.settle_seek(1500), "seek did not land on frame 1500");
+    assert_eq!(h.engine.position_frames(), 1500);
+
+    // Advance a bit more to verify continuous playback.
+    h.clock.pump(100);
+    h.engine.poll().unwrap();
+    assert_eq!(h.engine.position_frames(), 1600);
+}
+
+#[test]
+fn finish_run_frozes_at_content_end_not_device_position() {
+    // Finding F2: verify finish_run() freezes timeline at the decode-side
+    // end_of_stream, not at the (possibly larger) device position.
+    let mut h = Harness::new(&[TRACK_A]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    let track_len = track_frames(TRACK_A);
+
+    // Wait for the decode thread to buffer everything.
+    assert!(h.wait_buffered(), "track must be buffered");
+
+    // Pump past the track length so the device catches up and plays
+    // silence (underrun). We advance far enough that the device position
+    // exceeds the content length.
+    let extra = 1024;
+    h.clock.pump(track_len + extra);
+    h.engine.poll().unwrap();
+
+    // The decode thread should have finished and signaled EndOfStream.
+    assert!(
+        h.wait_until(
+            |e| e.transport() == TransportState::Stopped,
+            track_len + 8192
+        ),
+        "run must have ended"
+    );
+
+    // position_frames() must NOT exceed the track length.
+    assert!(
+        h.engine.position_frames() <= track_len,
+        "position must not exceed track length; got {} (track = {})",
+        h.engine.position_frames(),
+        track_len
+    );
+
+    // buffered_frames() must be 0 after the run ends.
+    assert_eq!(
+        h.engine.buffered_frames(),
+        0,
+        "buffered must be 0 after run ends"
+    );
+}
