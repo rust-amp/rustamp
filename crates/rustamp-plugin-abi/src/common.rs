@@ -68,7 +68,10 @@ pub const WM_WA_MPEG_EOF: u32 = WM_USER + 2;
 /// IPC number 0, version query (S09 section 8, item 3).
 pub const IPC_GETVERSION: u32 = 0;
 /// Value returned by the version query in Winamp 2.95 (S09 section 8, item 3).
-pub const WINAMP_VERSION_295: u32 = 0x2095;
+/// Measured 0x2905 in two independent S10 sandbox runs; previously 0x2095 (SDK-derived, never measured).
+/// The old value sits below the 0x2900 plugin threshold, causing plugins to take the wrong branch.
+/// RFC 0009 corrects this.
+pub const WINAMP_VERSION_295: u32 = 0x2905;
 /// Threshold plugins compare the version against to detect 2.9+ IPCs
 /// (S09 section 8, item 3).
 pub const WINAMP_VERSION_2_9X_THRESHOLD: u32 = 0x2900;
