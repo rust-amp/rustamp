@@ -89,15 +89,24 @@ $displaySetAt = (Get-Date).ToString('o')
 Write-Host ("    screen {0} (logpixels {1})" -f $display.screen, $display.logPixels)
 foreach ($s in @($display.screens)) { Write-Host ("    monitor {0}" -f $s) }
 
-# --- 4. stage the harness, the job and the reference copy (blind copies) -------
+# --- 4. stage the harness, the landmark captures, the job and the reference ---
+# Blind copies, never inspected. The landmark captures live beside the harness
+# in the research tree (<root>\captures) and the harness reads them from
+# <ResearchRoot>\captures, so they must be staged too: without them the 1:1
+# gate cannot compare and refuses before any job step (which is exactly what
+# happened on the first VM run that got as far as the gate).
 Step "staging into $Stage"
 if (-not (Test-Path $HarnessDir)) { throw "harness directory not found: $HarnessDir" }
 $jobFile = Join-Path $HarnessDir ("jobs\" + $Job + ".json")
 if (-not (Test-Path $jobFile)) { throw "job file not found: $jobFile" }
 if (-not (Test-Path $RefDir)) { throw "reference copy not found: $RefDir (running the reference in the guest needs the owner's confirmation)" }
+$landmarkDir = Join-Path (Split-Path (Split-Path $HarnessDir)) 'captures'
+if (-not (Test-Path $landmarkDir)) { throw "landmark capture directory not found: $landmarkDir" }
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'tools\vm-capture')
 Copy-Item (Join-Path $HarnessDir '*') (Join-Path $Stage 'tools\vm-capture') -Recurse -Force
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'captures')
+Copy-Item (Join-Path $landmarkDir '*') (Join-Path $Stage 'captures') -Recurse -Force
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'winamp295')
 Copy-Item (Join-Path $RefDir '*') (Join-Path $Stage 'winamp295') -Recurse -Force
 
