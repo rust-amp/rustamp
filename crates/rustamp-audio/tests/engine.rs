@@ -238,6 +238,12 @@ fn gapless_join_has_no_silence_and_no_dropped_frames() {
     let events = h.drain_events();
     assert!(events.contains(&Event::PlaylistEnded), "{events:?}");
     assert!(events.contains(&Event::StateChanged(TransportState::Stopped)));
+    // The final timeline survives the stop: the run froze where it ended, so
+    // the position stays at the end of the last track and nothing is reported
+    // as still buffered (the re-based clock must not reset the timeline).
+    assert_eq!(h.engine.timeline_frames(), total);
+    assert_eq!(h.engine.position_frames(), b);
+    assert_eq!(h.engine.buffered_frames(), 0);
 }
 
 #[test]

@@ -809,10 +809,14 @@ impl Engine {
         self.join_decode();
         self.transport = TransportState::Stopped;
         // Keep the timeline at the final position so callers can report how
-        // much played. Re-base the clock to the current played_frames so
-        // timeline_frames() stops advancing but returns the final value.
+        // much played. Freeze it by folding the elapsed device frames into the
+        // origin **before** re-basing the clock: re-basing alone would reset
+        // `timeline_frames()` to the origin (zero for a run without a seek),
+        // which would report a full track as unplayed — `position_frames()`
+        // back at 0 and `buffered_frames()` back at the whole stream.
+        self.timeline_origin = self.timeline_frames();
         self.clock_origin = self.output.played_frames();
-        // timeline_origin and track_start keep their final values.
+        // track_start keeps its final value.
         self.bus
             .publish(Event::StateChanged(TransportState::Stopped));
         self.bus.publish(Event::PositionChanged {
