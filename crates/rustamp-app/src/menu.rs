@@ -63,14 +63,7 @@ impl App {
             ShortcutOutcome::Commands(commands) => {
                 let emitted = commands.clone();
                 for command in &emitted {
-                    // The dispatch has already applied everything the UI owns -
-                    // its own comment says so for the window toggles - so only
-                    // the commands another layer owns may be submitted here.
-                    // Submitting a UI-owned one would apply it twice and toggle
-                    // a window back to where it started.
-                    if routing::app_owns(command) {
-                        self.submit(command.clone())?;
-                    }
+                    self.submit(command.clone())?;
                 }
                 Ok(MenuOutcome::Commands(emitted))
             }
