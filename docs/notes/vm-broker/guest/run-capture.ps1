@@ -72,7 +72,7 @@ if (-not (Test-Path $jobFile)) { throw "job file not staged: $jobFile" }
 if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 $null = New-Item -ItemType Directory -Force -Path $OutDir
 Show 'harness exit' 'running...'
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrap -Job $jobFile
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrap -Job $jobFile -NoLogoff
 $harnessExit = $LASTEXITCODE
 Show 'harness exit' $harnessExit
 # The transcript is written before the refusal below, so a later diagnostic
