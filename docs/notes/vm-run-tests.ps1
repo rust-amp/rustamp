@@ -73,7 +73,15 @@ if (Test-Path (Join-Path $debugDir 'rustamp.exe')) { Copy-Item (Join-Path $debug
 Step 'building the i686 plugin host for the end-to-end test'
 $prevPref = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
+# The host links the C runtime statically here. It is a 32-bit binary that must
+# sit beside a 64-bit application, and the two cannot share CRT DLLs in one
+# directory (same name, different architecture), so a self-contained host is the
+# only layout that works. Without this the host dies the moment it starts and the
+# end-to-end test sees the channel close.
+$prevRustflags = $env:RUSTFLAGS
+$env:RUSTFLAGS = '-C target-feature=+crt-static'
 & cargo build -p rustamp-plughost --target i686-pc-windows-msvc 2>$null | Out-Null
+if ($null -eq $prevRustflags) { Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue } else { $env:RUSTFLAGS = $prevRustflags }
 $ErrorActionPreference = $prevPref
 $hostExe = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\rustamp-plughost32.exe'
 if (Test-Path $hostExe) {
