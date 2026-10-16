@@ -128,10 +128,13 @@ pub fn handle_message(
             Ok(()) => ControlStep::Continue,
             Err(_) => ControlStep::Shutdown,
         },
-        Message::Hello { .. } => match transport.send(&Message::hello()) {
-            Ok(()) => ControlStep::Continue,
-            Err(_) => ControlStep::Shutdown,
-        },
+        // The host announces itself once at startup: `run_reader` sends the
+        // greeting before it reads anything. An incoming `Hello` is the peer's
+        // announcement, and answering it with a second greeting would make two
+        // peers greet each other forever, so this arm does not reply. Version
+        // rejection belongs to the engine side (RFC 0006 section 8), which
+        // already knows our version from the startup greeting.
+        Message::Hello { .. } => ControlStep::Continue,
         Message::Shutdown => ControlStep::Shutdown,
         _ => ControlStep::Continue,
     }
@@ -291,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn version_mismatch_still_answers_with_our_hello() {
+    fn an_incoming_hello_is_not_answered_with_another_hello() {
         let (mut app_end, mut host_end) = MemoryTransport::pair();
         assert_eq!(
             handle_message(
@@ -304,15 +307,11 @@ mod tests {
             ),
             ControlStep::Continue
         );
-        // The peer learns our version from the reply and decides itself;
-        // rejecting the mismatch is the app's job (see the module docs).
-        assert_eq!(
-            app_end.recv().unwrap(),
-            Message::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                pid: std::process::id(),
-            }
-        );
+        // The peer's greeting is not answered: our own greeting already went out
+        // at startup (`run_reader`), and a reply would let two peers greet each
+        // other forever. Rejecting a version mismatch is the engine's job
+        // (RFC 0006 section 8), so nothing is written here.
+        assert!(app_end.try_recv().unwrap().is_none());
     }
 
     #[test]
