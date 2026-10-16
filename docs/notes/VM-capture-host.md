@@ -3,6 +3,14 @@
 Why we run reference captures in a virtual machine, what has to be configured,
 and how a capture is taken so that its provenance is beyond doubt.
 
+> **Superseded for the procedure:** the Windows Sandbox is forbidden
+> (owner rule, 2026-10-16) and is never launched again. The capture
+> procedure now lives in [`vm-capture-runbook.md`](vm-capture-runbook.md)
+> (checkpoint restore to `base-provisioned`, broker `copyout` return path).
+> This file stays as the record of what was built and measured for the
+> sandbox, and for the guest configuration checklist (§3) and snapshot
+> catalogue (§4), which carry over.
+
 This document is **process**, not reference knowledge: it contains nothing
 derived from Winamp source, the SDK or the binary. The VM itself is
 dirty-room territory, exactly like the current sandbox — the clean-room rules in

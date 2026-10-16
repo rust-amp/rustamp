@@ -37,6 +37,8 @@ $GuestScripts  = Join-Path $PSScriptRoot 'guest'    # allow-listed guest scripts
 $GuestRoot     = 'C:\rustamp'                       # guest-side destination root
 $RepoRoot      = 'D:\code\Rustamp'
 $GuestRepo     = 'C:\rustamp\code\Rustamp'
+$GuestOut      = 'C:\rustamp\out'                # guest-side capture results root
+$StagingOut    = Join-Path $Staging 'out'         # host-side capture results root
 
 function Write-Log([string]$message) {
     try { Add-Content -Path $LogPath -Value ('{0} {1}' -f (Get-Date -Format o), $message) } catch { }
@@ -229,6 +231,34 @@ try {
             } finally { Remove-PSSession $session }
             $response.result = [ordered]@{ copied = $true; source = $fullSource; dest = $destFull }
         }
+        'copyout' {
+            # The return path for reference captures (docs\notes\vm-capture-runbook.md):
+            # the guest tree under C:\rustamp\out comes back to the host over the
+            # same PowerShell Direct session mechanism, binary-safe. Constraints
+            # mirror copyin, reversed: the source cannot escape the guest results
+            # root (no exfiltration of arbitrary guest paths) and the destination
+            # cannot escape the host results root (no overwrite of staged code or
+            # anything else). Integrity is checked host-side by vm-run-capture.ps1
+            # (SHA-256 recompute against the guest-written hashes.json), not here.
+            $source = [string]$arguments.source
+            $dest   = [string]$arguments.dest
+            if ([string]::IsNullOrWhiteSpace($source) -or [string]::IsNullOrWhiteSpace($dest)) { throw 'copyout needs args.source and args.dest' }
+            if (-not ($source.StartsWith($GuestOut + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+                      $source.StartsWith($GuestOut + '/', [System.StringComparison]::OrdinalIgnoreCase))) {
+                throw "copyout source must live under $GuestOut (got $source)"
+            }
+            $fullDest = [System.IO.Path]::GetFullPath($dest)
+            if (-not $fullDest.StartsWith([System.IO.Path]::GetFullPath($StagingOut), [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "copyout destination must live under $StagingOut (got $fullDest)"
+            }
+            $cred = Get-GuestCredential
+            $session = New-PSSession -VMName $VmName -Credential $cred
+            try {
+                if (-not (Test-Path $fullDest)) { $null = New-Item -ItemType Directory -Force -Path $fullDest }
+                Copy-Item -Path $source -Destination $fullDest -FromSession $session -Recurse -Force
+            } finally { Remove-PSSession $session }
+            $response.result = [ordered]@{ copied = $true; source = $source; dest = $fullDest }
+        }
         'run-tests' {
             # DELIBERATELY REFUSED. The broker runs with elevated rights, and
             # compiling would execute build scripts from the repository as
@@ -236,7 +266,7 @@ try {
             # privilege-escalation hole. Building and staging are not privileged
             # and belong to the unelevated host side (docs\notes\vm-run-tests.ps1).
             # The broker only touches the VM: eject-dvd, start, stop, checkpoint,
-            # restore, list, copyin, guest.
+            # restore, list, copyin, copyout, guest.
             throw 'the broker never builds. Compile and stage on the host side, unelevated, then use eject-dvd/start/copyin/guest.'
         }
         default { throw "unknown op '$($request.op)'" }

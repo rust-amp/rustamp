@@ -1,7 +1,7 @@
 # Client for the RustampVmBroker task.  Runs unelevated, from the orchestrator.
 #
 # The broker runs elevated, so it only ever touches the VM: eject-dvd, start,
-# stop, checkpoint, restore, list, copyin, guest. It NEVER builds or stages -
+# stop, checkpoint, restore, list, copyin, copyout, guest. It NEVER builds or stages -
 # compiling would execute build scripts from the repository with administrator
 # rights, which is a privilege-escalation hole. Building belongs here, on the
 # unelevated host side.
@@ -13,7 +13,7 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('probe', 'eject-dvd', 'start', 'stop', 'checkpoint', 'restore', 'list', 'guest', 'copyin')]
+    [Parameter(Mandatory)][ValidateSet('probe', 'eject-dvd', 'start', 'stop', 'checkpoint', 'restore', 'list', 'guest', 'copyin', 'copyout')]
     [string]$Op,
     [string]$Name,
     [string]$Script,
