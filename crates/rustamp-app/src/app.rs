@@ -1695,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_on_in_the_eq_window_toggles_the_engine_note_and_the_state() {
+    fn clicking_on_in_the_eq_window_reaches_the_engine_stage() {
         let (mut app, _dir) = app_with_file(None);
         assert!(app.eq_state().enabled);
         // On held rect (14,18,25,12): press arms, release inside toggles.
@@ -1703,10 +1703,20 @@ mod tests {
         let commands = app.eq_mouse_up(20, 24).unwrap();
         assert_eq!(commands, vec![Command::SetEqEnabled(false)]);
         assert!(!app.eq_state().enabled);
-        // The engine stage is M2 future work, so the command is noted, and
-        // the app keeps running.
+        // The engine owns the S07 stage now, so the same commands are
+        // forwarded and change the engine's published equalizer state instead
+        // of being noted as unimplemented.
+        app.submit(Command::SetEqEnabled(true)).unwrap();
+        app.submit(Command::SetBand {
+            band: 4,
+            gain_db: 6.0,
+        })
+        .unwrap();
+        let eq = app.host_player_state().eq;
+        assert!(eq.enabled);
+        assert_eq!(eq.bands[4], 6.0);
         let notes = app.drain_notes();
-        assert!(notes.iter().any(|n| n.contains("equalizer")), "{notes:?}");
+        assert!(!notes.iter().any(|n| n.contains("equalizer")), "{notes:?}");
         assert!(!app.quit());
     }
 
