@@ -122,6 +122,41 @@ const PLAYBACK_DEVICE: &str = "CABLE Input";
 /// The cable's capture endpoint, wired to [`PLAYBACK_DEVICE`].
 const CAPTURE_DEVICE: &str = "CABLE Output";
 
+/// Locale-proof needle for both cable endpoints: the OS names the render
+/// endpoint per UI language (English "CABLE Input", German "Lautsprecher
+/// (VB-Audio Virtual Cable)"), but every name contains "cable". Both device
+/// lists are searched separately (outputs vs inputs) and the exactly-one-match
+/// discipline stays: none or several matches fail loudly, never a default.
+const CABLE_MATCH: &str = "cable";
+
+/// Whether a device name belongs to the virtual cable, in any OS language.
+/// Pure function so the locale rule is pinnable without hardware.
+fn is_cable_device(name: &str) -> bool {
+    name.to_lowercase().contains(CABLE_MATCH)
+}
+
+#[test]
+fn cable_matching_survives_os_locales() {
+    // English render/capture names and the German render name seen in the
+    // headless test VM, plus decoys that must never match.
+    for name in [
+        "CABLE Input",
+        "CABLE Output (VB-Audio Virtual Cable)",
+        "Lautsprecher (VB-Audio Virtual Cable)",
+        "CABLE Output",
+    ] {
+        assert!(is_cable_device(name), "{name:?} must match");
+    }
+    for name in [
+        "Realtek High Definition Audio",
+        "Microphone Array (Realtek)",
+        "Speakers",
+        "",
+    ] {
+        assert!(!is_cable_device(name), "{name:?} must not match");
+    }
+}
+
 /// The fixture's tone (see `crates/rustamp-decoders/tests/fixtures/FIXTURES.txt`).
 const TONE_HZ: f64 = 440.0;
 
@@ -424,8 +459,9 @@ fn the_cable_carries_the_fixture_tone() {
         fixture.display()
     );
 
-    // Playback endpoint, by name: never the default device.
-    let output = Box::new(CpalOutput::with_device_name(PLAYBACK_DEVICE));
+    // Playback endpoint, by cable name and never the default device: the OS
+    // names it per UI language, so match the locale-proof needle instead.
+    let output = Box::new(CpalOutput::with_device_name(CABLE_MATCH));
     let mut engine = match Engine::new(
         rustamp_decoders::default_registry(),
         output,
@@ -441,9 +477,8 @@ fn the_cable_carries_the_fixture_tone() {
     };
     let name = engine.output_name().to_owned();
     assert!(
-        name.to_lowercase()
-            .contains(&PLAYBACK_DEVICE.to_lowercase()),
-        "the engine opened \"{name}\", not the cable's \"{PLAYBACK_DEVICE}\""
+        is_cable_device(&name),
+        "the engine opened \"{name}\", not the cable (matched by \"{CABLE_MATCH}\")"
     );
     let granted = engine.device_spec();
     assert!(
@@ -453,9 +488,9 @@ fn the_cable_carries_the_fixture_tone() {
         granted.channels
     );
 
-    // Capture endpoint, by name, started first.
+    // Capture endpoint, by cable name, started first.
     let host = cpal::default_host();
-    let capture = find_input_device(&host, CAPTURE_DEVICE);
+    let capture = find_input_device(&host, CABLE_MATCH);
     let (config, format) = pick_capture_config(&capture, granted.sample_rate);
     let rate = config.sample_rate;
     let channels = usize::from(config.channels);
