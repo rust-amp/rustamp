@@ -1710,6 +1710,7 @@ dependencies = [
  "rustamp-ipc",
  "rustamp-plugin-abi",
  "rustamp-proto",
+ "windows",
 ]
 
 [[package]]
