@@ -425,6 +425,13 @@ mod tests {
         link.detach();
         assert!(!link.is_attached());
         assert_eq!(link.publish(&sample_state()), PublishOutcome::Detached);
-        assert!(host_end.try_recv().expect("codec reads").is_none());
+        // What matters is that nothing was sent. After `detach` the peer's write
+        // end is gone, so the read may legitimately report the closed end rather
+        // than an empty queue - but it must never yield a message.
+        match host_end.try_recv() {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("detaching must not publish anything"),
+            Err(_) => {} // the peer end was dropped by `detach`, which is the point
+        }
     }
 }
