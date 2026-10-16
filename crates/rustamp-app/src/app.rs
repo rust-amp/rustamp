@@ -816,7 +816,8 @@ impl App {
             | C::OpenSkinBrowser
             | C::OpenBookmarkEditor
             | C::AddBookmark
-            | C::OpenMainMenu => {
+            | C::OpenMainMenu
+            | C::OpenPlaylist => {
                 self.note(format!(
                     "{command:?} needs a dialog that is not implemented yet"
                 ));
@@ -1357,6 +1358,22 @@ mod tests {
         assert_eq!(notes.len(), 2);
         assert!(notes[0].contains("Add file(s) to playlist"), "{notes:?}");
         assert!(notes[1].contains("Load Playlist"), "{notes:?}");
+    }
+
+    #[test]
+    fn open_playlist_is_an_app_owned_dialog_request_that_opens_no_window() {
+        // RFC 0010: LIST OPTS opens the `Load Playlist` dialog (S06 §4). The
+        // spec fixes the title only, so the app records the request through
+        // the dialog-stub path and implements no dialog behaviour.
+        let (mut app, _dir) = app_with_file(None);
+        assert!(crate::routing::app_owns(&Command::OpenPlaylist));
+        app.submit(Command::OpenPlaylist).unwrap();
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|n| n.contains("OpenPlaylist")),
+            "{notes:?}"
+        );
+        assert!(!app.quit(), "a dialog request must not quit the app");
     }
 
     #[test]

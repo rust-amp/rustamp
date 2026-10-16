@@ -86,7 +86,8 @@ pub fn app_owns(command: &Command) -> bool {
         | C::CloseFocusedWindow
         | C::OpenMainMenu
         | C::ConfigureVisPlugin
-        | C::ToggleVisPlugin => true,
+        | C::ToggleVisPlugin
+        | C::OpenPlaylist => true,
     }
 }
 
@@ -151,6 +152,7 @@ mod tests {
             Command::OpenFileInfo,
             Command::OpenAbout,
             Command::RefreshSkin,
+            Command::OpenPlaylist,
             Command::ToggleEasyMove,
             Command::Minimize,
             Command::ShowMainWindow,

@@ -139,16 +139,16 @@ impl PlaylistDialog {
     /// ADD maps to [`Command::OpenMedia`] with [`OpenMediaKind::Files`]; the
     /// `play` value is unmeasured for the playlist-window add path (RFC 0005
     /// O5), so this uses `false` and the finding is reported by the caller.
-    /// LIST OPTS has **no** core command (there is no load/save-playlist
-    /// dialog command; adding one needs an RFC per AGENTS.md), so this
-    /// returns `None` — reported as a finding, not invented here.
+    /// LIST OPTS maps to [`Command::OpenPlaylist`] (RFC 0010): the spec fixes
+    /// the dialog's title only, so the app records the request and implements
+    /// no dialog behaviour beyond it.
     pub const fn opening_command(self) -> Option<Command> {
         match self {
             PlaylistDialog::AddFiles => Some(Command::OpenMedia {
                 kind: OpenMediaKind::Files,
                 play: false,
             }),
-            PlaylistDialog::LoadPlaylist => None,
+            PlaylistDialog::LoadPlaylist => Some(Command::OpenPlaylist),
         }
     }
 }
@@ -283,8 +283,9 @@ impl PlaylistWindow {
     }
 
     /// LIST OPTS opens the load-playlist dialog (S06 §4); the spec fixes no
-    /// dialog behaviour beyond the title, and there is no core command for
-    /// it, so this returns the dialog request for the app to open.
+    /// dialog behaviour beyond the title, so this returns the dialog request
+    /// for the app to open. The request's opening command is
+    /// [`Command::OpenPlaylist`] (RFC 0010).
     pub fn press_list_opts(&self) -> PlaylistDialog {
         PlaylistDialog::LoadPlaylist
     }
@@ -473,6 +474,35 @@ mod tests {
         assert_eq!(window.press_list_opts(), PlaylistDialog::LoadPlaylist);
         assert_eq!(PlaylistDialog::AddFiles.title(), "Add file(s) to playlist");
         assert_eq!(PlaylistDialog::LoadPlaylist.title(), "Load Playlist");
+    }
+
+    #[test]
+    fn list_opts_maps_to_the_open_playlist_command() {
+        // RFC 0010: LIST OPTS opens the `Load Playlist` dialog (S06 §4), so its
+        // opening command is the new app-level variant — not `None`, and not
+        // the media-opening command (whose confirmation is `AddItems` with
+        // append semantics the spec does not state for this dialog).
+        assert_eq!(
+            PlaylistDialog::LoadPlaylist.opening_command(),
+            Some(Command::OpenPlaylist)
+        );
+        let window = PlaylistWindow::new();
+        let dialog = window.press_list_opts();
+        assert_eq!(dialog, PlaylistDialog::LoadPlaylist);
+        assert_eq!(dialog.title(), "Load Playlist");
+        assert_eq!(dialog.opening_command(), Some(Command::OpenPlaylist));
+    }
+
+    #[test]
+    fn every_playlist_dialog_has_an_opening_command() {
+        // Both S06 §4 dialogs are core commands now; the app opens the OS
+        // window for either (RFC 0010).
+        for dialog in [PlaylistDialog::AddFiles, PlaylistDialog::LoadPlaylist] {
+            assert!(
+                dialog.opening_command().is_some(),
+                "{dialog:?} has no opening command"
+            );
+        }
     }
 
     #[test]

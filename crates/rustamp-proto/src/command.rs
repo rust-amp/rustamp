@@ -266,4 +266,10 @@ pub enum Command {
     /// Start/stop the visualization plug-in (whether vis data flows). Id 40192.
     /// Same host bridge and deferral as [`Command::ConfigureVisPlugin`].
     ToggleVisPlugin,
+    /// Open the load-playlist dialog (S06 §4, LIST OPTS button); on
+    /// confirmation the app loads the chosen playlist file. No payload: the
+    /// path comes from the user's pick, inside the app (RFC 0010). The spec
+    /// fixes the dialog's title only, so replace-vs-append and every other
+    /// confirmation semantic stays open.
+    OpenPlaylist,
 }
