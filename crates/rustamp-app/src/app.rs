@@ -847,12 +847,23 @@ impl App {
     }
 
     /// Grows the app's entry-id table to the engine queue's length.
+    ///
+    /// The table mirrors the queue: when it grows, the playlist window's
+    /// model grows with it ([`App::sync_playlist_entries`]), so the window
+    /// reflects an add without waiting for the next button press. The sync
+    /// fires only on growth (the queue-length change is the signal, not a
+    /// poll), and selection of live entries and the scroll offset survive
+    /// it ([`PlaylistWindow::set_entries`](rustamp_ui::PlaylistWindow::set_entries)).
     fn sync_entry_ids(&mut self) {
+        let before = self.entry_ids.len();
         let len = self.engine.queue().len();
         while self.entry_ids.len() < len {
             let id = EntryId(self.next_entry_id);
             self.next_entry_id += 1;
             self.entry_ids.push(id);
+        }
+        if self.entry_ids.len() != before {
+            self.sync_playlist_entries();
         }
     }
 
@@ -860,10 +871,14 @@ impl App {
     fn entry_id_for(&mut self, index: Option<u32>) -> Option<EntryId> {
         let index = index? as usize;
         self.sync_entry_ids();
+        let before = self.entry_ids.len();
         while self.entry_ids.len() <= index {
             let id = EntryId(self.next_entry_id);
             self.next_entry_id += 1;
             self.entry_ids.push(id);
+        }
+        if self.entry_ids.len() != before {
+            self.sync_playlist_entries();
         }
         self.entry_ids.get(index).copied()
     }

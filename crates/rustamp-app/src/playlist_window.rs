@@ -75,7 +75,11 @@ impl App {
     /// Syncs the model's entry order from the app's stable entry ids.
     ///
     /// The app is the state owner; selection of live entries and the scroll
-    /// offset survive the sync ([`PlaylistWindow::set_entries`]).
+    /// offset survive the sync ([`PlaylistWindow::set_entries`]). This runs
+    /// whenever the id table grows (an add, a startup file) and before
+    /// playlist input is routed, so the model never lags the queue: the
+    /// engine queue is the source of truth, the id table mirrors it, and
+    /// this mirrors the table.
     pub fn sync_playlist_entries(&mut self) {
         let entries = self.entry_ids.clone();
         self.playlist.set_entries(entries);
@@ -364,10 +368,63 @@ mod tests {
         app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
         assert!(app.dialog_key(Key::Enter));
         assert_eq!(app.dialog_open_kind(), None);
-        // The engine queue is the source of truth for the add (the playlist
-        // model re-syncs on the next button press, as with any `AddItems`).
+        // The engine queue is the source of truth for the add; the id-table
+        // growth re-syncs the playlist model at once, with no button press.
         assert_eq!(app.engine().queue().len(), 4);
+        assert_eq!(app.playlist().len(), 4);
+        assert_eq!(
+            app.playlist().visible_ids(),
+            vec![EntryId(0), EntryId(1), EntryId(2), EntryId(3)]
+        );
         assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn adding_items_syncs_the_model_with_no_button_press() {
+        // The source-of-truth path: `AddItems` grows the engine queue, the
+        // id table and the playlist model together (no dialog, no click).
+        let mut app = test_app();
+        assert!(app.playlist().is_empty());
+        add_entries(&mut app, 2);
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.playlist().len(), 2);
+        assert_eq!(app.playlist().visible_ids(), vec![EntryId(0), EntryId(1)]);
+        // An empty add changes nothing and stays silent.
+        app.submit(Command::AddItems {
+            items: Vec::new(),
+            at: None,
+            play: false,
+        })
+        .expect("empty AddItems applies");
+        assert_eq!(app.playlist().len(), 2);
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn playlist_sync_is_idempotent_and_keeps_the_selection() {
+        // Re-syncing changes nothing: same entries, same selection, same view.
+        let mut app = test_app();
+        add_entries(&mut app, 6);
+        app.playlist_mouse_down(60, 28).expect("stage a selection");
+        let selected = app.playlist().selected_ids();
+        assert_eq!(selected, vec![EntryId(0)]);
+        app.sync_playlist_entries();
+        app.sync_playlist_entries();
+        assert_eq!(app.playlist().len(), 6);
+        assert_eq!(app.playlist().selected_ids(), selected);
+        assert_eq!(app.playlist().first_visible(), 0);
+    }
+
+    #[test]
+    fn an_empty_queue_syncs_to_an_empty_model() {
+        // A fresh app shows nothing; syncing the empty table is a no-op.
+        let mut app = test_app();
+        assert_eq!(app.engine().queue().len(), 0);
+        assert!(app.playlist().is_empty());
+        assert!(app.playlist().visible_ids().is_empty());
+        app.sync_playlist_entries();
+        assert!(app.playlist().is_empty());
+        assert!(app.playlist().selected_ids().is_empty());
     }
 
     #[test]
