@@ -1,7 +1,7 @@
 ---
 Spec ID: S-05
 Title: Docking, snapping, windowshade and double-size
-Sources consulted (category only): audited specs S01 (window geometry), S02 (main-window behaviour), S03 (shortcuts); dirty-room DPI/window-sizing findings (docs/HANDOFF.md §5); dirty-room capture harness (tools/vm-capture/README.md) for method and limits; runs 20261016-012641 and 20261016-020932 with the job tools/vm-capture/jobs/s05-docking.json
+Sources consulted (category only): audited specs S01 (window geometry), S02 (main-window behaviour), S03 (shortcuts); dirty-room DPI/window-sizing findings (docs/HANDOFF.md §5); dirty-room capture harness (tools/vm-capture/README.md) for method and limits; runs 20261016-012641 and 20261016-020932 with the job tools/vm-capture/jobs/s05-docking.json; run 20261016-091412 with the job tools/vm-capture/jobs/s05-shade-double.json (shade-plus-double-size combination, both orders, §2.3)
 Author agent: S05 dirty-room spec agent (draft revision 3, 2026-10-16)
 Auditor: Spec Auditor (dirty room)
 Audit date: 2026-10-16
@@ -66,6 +66,11 @@ never ran. **Run 20261016-020932** (job revision 2, the same 28 steps) is fully
 green: every step exit 0, every step's capture in the manifest, and the docking
 test executed. This spec is written from the green run; where revision 1 is still
 the only source of a fact, the cell says so.
+
+A third run, **20261016-091412** (job `tools/vm-capture/jobs/s05-shade-double.json`),
+is fully green (20 of 20 steps exit 0, landmark gate passed) and measures the
+shade-plus-double-size combination in both orders (§2.3, §8.3), at the same
+dpi 144 (150%) display facts.
 
 Both runs were at **dpi 144 (150%)**, screen 3050x1668, per-monitor-v2, unchanged
 from start to end of each run. The guest inherits the host's display, so the
@@ -262,6 +267,46 @@ not) is unmeasured. The shade case *is* measured (§3.3), and it shows that the
 stack re-flows; the double-size case needs the same four position probes added to
 the double-size group (§9).
 
+### 2.3 Shade and double-size together -- settled
+
+The main window's client size when it is **both** shaded and double-sized is
+**550 x 28**, in both orders (run 20261016-091412, job
+`tools/vm-capture/jobs/s05-shade-double.json`):
+
+| Order | Step | Re-resolved client size | Evidence |
+|---|---|---|---|
+| shade first | `a1_shade_act` | 275x14 (was 275x116) | **settled** -- step stdout `size change: re-resolved client=275x14 (was 275x116)`; manifest row `client_size` 275x14 |
+| shade first, then double-size | `a3_dsize_act` | **550x28** (was 275x14) | **settled** -- step stdout `size change: re-resolved client=550x28 (was 275x14)`; manifest row `client_size` 550x28 |
+| double-size first | `b1_dsize_act` | 550x232 (was 275x116) | **settled** -- step stdout `size change: re-resolved client=550x232 (was 275x116)`; manifest row `client_size` 550x232 |
+| double-size first, then shade | `b3_shade_act` | **550x28** (was 550x232) | **settled** -- step stdout `size change: re-resolved client=550x28 (was 550x232)`; manifest row `client_size` 550x28 |
+
+The no-action steps `a4_combined_state` and `b4_combined_state` then each resolve
+and capture the same 550x28 window, so the combination is **order-independent**:
+shade-first and double-size-first both settle at 550x28, arithmetically twice the
+275x14 shade in each dimension and exactly the size the implementation renders.
+
+The toggle delivery differs by order for a measured reason: in order A the
+clutterbar letter D at (14,49) is not clickable in the 14 px strip, so
+`a3_dsize_act` sends `WM_COMMAND` 40165 (`Ctrl+D`) instead of clicking; in order
+B the shade button is clicked at the doubled point (508,6) = 2 x (254,3). Both
+toggles landed, per the re-resolved sizes above.
+
+**Provenance:** all four sizes are step-stdout re-resolved `client=WxH (was WxH)`
+lines with matching manifest `client_size` rows (§8.3). The run is fully green
+(20 of 20 steps exit 0, landmark gate passed) at dpi 144 (150%), the same scale
+as §6.
+
+The neighbours in the combined state keep their double-size behaviour from
+§2.1: the equalizer is 550x232 (the flag reaches it while the main is shaded --
+steps `a4_eq`, `b4_eq`) and the playlist editor is unchanged at 275x116 (steps
+`a4_pe`, `b4_pe`). The stack still tracks the main window's bottom edge in that
+state: the main at (26,29) and 550x28 ends at 57, the equalizer sits at (26,57),
+and the playlist editor sits at (26,289), which is the equalizer's bottom edge
+(57 + 232) -- read in both orders from `a5_main_pos`, `a5_eq_pos`, `a5_pe_pos`
+and `b5_main_pos`, `b5_eq_pos`, `b5_pe_pos` (§8.3). So the stack re-flows for
+this resize as it does for shade (§3.3); the 102 px datum of §3.3 is the 1x-shade
+case (116 - 14), while here the main is 28 px tall.
+
 ---
 
 ## 3. Window positions and persistence
@@ -419,6 +464,10 @@ The measured behavioural contract, from §3.3 and §4.2:
 * Double-size resizes the main and the equalizer to 550x232 and leaves the
   playlist editor at 275x116 (§2.1); what the stack's *positions* do in that state
   is not measured (§2.2).
+* Shade plus double-size together is 550x28 in both orders (§2.3), and the stack
+  re-flows for that resize as it does for shade: the equalizer's top still
+  follows the main's bottom edge and the playlist editor's top still follows the
+  equalizer's bottom edge.
 
 **Open:** the snap rules themselves (§4.1) -- which edges, what tolerance, and
 whether a drag that ends near an edge repositions the window. This follows from
@@ -466,9 +515,10 @@ across monitors is app-layer work.
 3. **Equalizer and playlist editor windowshade.** Their shade-button positions are
    unmeasured, so neither window was shaded. Needs one of their title-bar button
    positions first (§9).
-4. **The stack's positions in the double-size state.** The sizes are measured; the
-   positions are not (§2.2). Needs four position probes in the double-size group
-   (§9).
+4. **The stack's positions in the plain double-size (unshaded) state.** The sizes
+   are measured; the positions are not (§2.2). Needs four position probes in the
+   double-size group (§9). The *combined* shade-plus-double-size positions are
+   settled (§2.3) and are not part of this item.
 5. **Minibrowser and video double-size.** Out of scope for the classic-window
    docking spec.
 6. **Shade and double-size sizes at a scale other than 150%.** Not settable from
@@ -478,6 +528,13 @@ across monitors is app-layer work.
 8. **Docked set on close, and undocking.** No capture planned.
 9. **Menu / Minimize / Close hit-testing inside the shade strip** (§1.3). Drawn,
    not clicked.
+
+Answered since draft revision 3, no longer open: the main window's client size
+when shaded and double-sized together -- previously unmeasured (the spec carried
+the 1x shade size and the unshaded double-size size but never the two together)
+-- is now settled at **550x28, order-independent** (§2.3, run 20261016-091412).
+The spec records no "silent" caveat about the combination; it was simply absent,
+and §2.3 now carries it.
 
 ---
 
@@ -559,6 +616,48 @@ focused/unfocused title band (all in rows 0-11), and the region is exactly rows
 difference. Comparison F is the strongest of the set because it needs no 1x
 reference at all: if every 2x2 block of the double-size capture is uniform, the
 render is a doubling by construction, whatever the window's state.
+
+### 8.3 Run record -- run 20261016-091412 (job s05-shade-double.json)
+
+Guest: Windows Sandbox, user F9937E0A-ADB2-4\WDAGUtilityAccount, dpi 144 (150%),
+screen 3050x1668, per-monitor-v2, unchanged start to end. Shell PowerShell 5.1,
+harness vm-capture 1.2.0, install `C:\winamp`, reference `C:\winamp295`
+(read-only mapping). **Landmark gate: PASSED** --
+`region=0,49,275,67 differing_pixels=0 total_pixels=18425 size=275x116
+identical=True`, twins byte-identical, whole-window count 0, settle stable after
+1.3 s. Status `ok`, exit code 0, 20 of 20 steps exit 0, 0 skipped, `failures: []`.
+Order A (steps `a0`-`a5`) shades first and then double-sizes; order B (steps
+`b0`-`b5`) double-sizes first and then shades, after a `restart`.
+
+Every step produced a manifest-listed capture; no `baseline_path` was bound, so
+every verdict is `no-baseline` and every combined state is a new measurement.
+The position column is the client origin derived from the step's pre-flight
+`screen=(x,y)` line (§0); a step with `input_method: none` prints no pre-flight
+line. Combined-state steps declare `expect_client_size: none` on purpose: their
+sizes are the measurement.
+
+| Step | Exit | Capture | Client size | Position read | Settles |
+|---|---|---|---|---|---|
+| `a0_base_main` | 0 | 001_a0_base_main.png | 275x116 | — | 1x base, launch A |
+| `a1_shade_act` | 0 | 002_a1_shade_act.png | **275x14** (re-resolved, was 275x116) | main (26,29) | shade size (§2.3) |
+| `a2_shade_state` | 0 | 003_a2_shade_state.png | 275x14 | — | the 1x shade pixels |
+| `a3_dsize_act` | 0 | 004_a3_dsize_act.png | **550x28** (re-resolved, was 275x14) | — | shade-first combination (§2.3) |
+| `a4_combined_state` | 0 | 005_a4_combined_state.png | 550x28 | — | shade-first combination confirmed |
+| `a4_eq` | 0 | 006_a4_eq.png | 550x232 | — | the flag reaches the equalizer while the main is shaded |
+| `a4_pe` | 0 | 007_a4_pe.png | 275x116 | — | the playlist unchanged in the combined state |
+| `a5_main_pos` | 0 | 008_a5_main_pos.png | 550x28 | main (26,29) | combined-state main position |
+| `a5_eq_pos` | 0 | 009_a5_eq_pos.png | 550x232 | EQ (26,57) | **EQ top = main bottom (57) -- tracks** |
+| `a5_pe_pos` | 0 | 010_a5_pe_pos.png | 275x116 | PE (26,289) | **PE top = EQ bottom (289) -- tracks** |
+| `b0_base_main` | 0 | 011_b0_base_main.png | 275x116 | — | 1x base, launch B |
+| `b1_dsize_act` | 0 | 012_b1_dsize_act.png | **550x232** (re-resolved, was 275x116) | main (26,29) | double-size size (§2.3) |
+| `b2_dsize_state` | 0 | 013_b2_dsize_state.png | 550x232 | — | the doubled pixels |
+| `b3_shade_act` | 0 | 014_b3_shade_act.png | **550x28** (re-resolved, was 550x232) | main (26,29) | double-size-first combination (§2.3) |
+| `b4_combined_state` | 0 | 015_b4_combined_state.png | 550x28 | — | double-size-first combination confirmed |
+| `b4_eq` | 0 | 016_b4_eq.png | 550x232 | — | the flag reaches the equalizer in this order too |
+| `b4_pe` | 0 | 017_b4_pe.png | 275x116 | — | the playlist unchanged in this order too |
+| `b5_main_pos` | 0 | 018_b5_main_pos.png | 550x28 | main (26,29) | combined-state main position |
+| `b5_eq_pos` | 0 | 019_b5_eq_pos.png | 550x232 | EQ (26,57) | **EQ top = main bottom (57) -- tracks** |
+| `b5_pe_pos` | 0 | 020_b5_pe_pos.png | 275x116 | PE (26,289) | **PE top = EQ bottom (289) -- tracks** |
 
 ---
 
