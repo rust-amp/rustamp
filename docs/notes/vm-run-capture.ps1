@@ -46,11 +46,31 @@ $Stage = Join-Path $StageRoot 'capture'
 $OutDir = Join-Path $StageRoot ("out\" + $Job)
 
 # --- 1. baseline provenance (recorded before the restore) ---------------------
+# Two traps live here, both learned the hard way. First, the broker runs as a
+# CHILD powershell.exe, so its stdout is formatted TEXT, not objects: the
+# snapshot names must be parsed out of the text (a line that starts with a
+# non-space token), because $_.Name on a string is always empty. Second,
+# PowerShell variables are case-INsensitive, so a local called $baseline would
+# overwrite the $Baseline parameter; the locals below are named so they cannot
+# collide with any parameter.
 Step "reading checkpoint catalogue (baseline: $Baseline)"
-$snaps = & $broker -Op list -TimeoutSeconds 300
-$baseline = @($snaps | Where-Object { $_.Name -eq $Baseline })
-if (-not $baseline) { throw "no checkpoint named '$Baseline' (broker knows: $(($snaps | Select-Object -ExpandProperty Name) -join ', '))" }
-$baselineCreated = [string]$baseline[0].CreationTime
+$listText = & $broker -Op list -TimeoutSeconds 300 | Out-String
+$knownNames = @(
+    ($listText -split "`r?`n") |
+        Where-Object { $_ -match '^\s*(\S+)\s' } |
+        ForEach-Object { $Matches[1] } |
+        Where-Object { $_ -ne 'Name' -and $_ -notmatch '^-+$' }
+)
+if ($knownNames -notcontains $Baseline) { throw "no checkpoint named '$Baseline' (broker knows: $($knownNames -join ', '))" }
+# The creation time is provenance, not a gate: parse it from the same text row
+# that carried the name, and record it verbatim rather than pretending the
+# child process returned an object. If the row cannot be parsed, say so.
+$baselineRow = @(($listText -split "`r?`n") | Where-Object { $_ -match ('^\s*' + [regex]::Escape($Baseline) + '\b') } | Select-Object -First 1)
+$baselineCreated = 'unknown (unparsed list row)'
+if ($baselineRow) {
+    $rest = [regex]::Replace($baselineRow, ('^\s*' + [regex]::Escape($Baseline) + '\s+\S+\s+'), '')
+    if ($rest.Trim()) { $baselineCreated = $rest.Trim() }
+}
 
 # --- 2. restore the baseline: this is what "freshly booted" now means ---------
 Step "restoring $Baseline (discards everything since the checkpoint)"
