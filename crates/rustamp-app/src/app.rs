@@ -976,14 +976,17 @@ impl App {
             | C::OpenFileInfo
             | C::OpenJump { .. }
             | C::OpenPlaylist
+            | C::OpenMedia { .. }
             | C::OpenPrefs
             | C::OpenPrefsPage(_)
             | C::OpenSkinBrowser => {
                 // Simple modal dialogs (`dialogs.rs`): the app opens a real
-                // window for these, so no note is recorded.
+                // window for these, so no note is recorded. The open-media
+                // faces confirm to `AddItems` with the opening command's
+                // `play` flag carried through untouched (RFC 0005 O5).
                 self.open_dialog_for(command);
             }
-            C::OpenMedia { .. } | C::OpenBookmarkEditor | C::AddBookmark => {
+            C::OpenBookmarkEditor | C::AddBookmark => {
                 self.note(format!(
                     "{command:?} needs a dialog that is not implemented yet"
                 ));
@@ -1525,9 +1528,8 @@ mod tests {
     #[test]
     fn playlist_dialog_requests_carry_the_spec_titles() {
         // S06 §4: the spec fixes the dialog titles and no dialog behaviour
-        // beyond that. ADD still records its title through the dialog-stub
-        // path; LIST OPTS opens the real load-playlist dialog (RFC 0010), so
-        // only ADD leaves a note.
+        // beyond that. Both ADD and LIST OPTS now open a real dialog
+        // (`dialogs.rs`), so neither leaves a note.
         let (mut app, _dir) = app_with_file(None);
         assert_eq!(
             app.request_playlist_dialog(PlaylistDialog::AddFiles),
@@ -1538,9 +1540,7 @@ mod tests {
             "Load Playlist"
         );
         assert!(app.dialog_is_open(rustamp_ui::DialogKind::LoadPlaylist));
-        let notes = app.drain_notes();
-        assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("Add file(s) to playlist"), "{notes:?}");
+        assert!(app.drain_notes().is_empty());
     }
 
     #[test]
@@ -1674,7 +1674,7 @@ mod tests {
     fn the_implemented_dialogs_open_real_windows_with_no_note() {
         // These commands open a real window now (`dialogs.rs`), so no
         // "not implemented yet" note may be recorded for them.
-        use rustamp_core::command::{JumpTarget, PrefsPage};
+        use rustamp_core::command::{JumpTarget, OpenMediaKind, PrefsPage};
         use rustamp_ui::DialogKind;
 
         let (mut app, _dir) = app_with_file(None);
@@ -1689,6 +1689,25 @@ mod tests {
         assert!(app.dialog_is_open(DialogKind::Jump(JumpTarget::Time)));
         app.submit(Command::OpenPlaylist).unwrap();
         assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
+        // Each open-media kind opens its own face; the playlist ADD path
+        // (`play: false`, RFC 0005 O5) opens the files face as sent.
+        for kind in [
+            OpenMediaKind::Files,
+            OpenMediaKind::Directory,
+            OpenMediaKind::Location,
+        ] {
+            app.submit(Command::OpenMedia { kind, play: true }).unwrap();
+            assert!(app.dialog_is_open(DialogKind::OpenMedia { kind, play: true }));
+        }
+        app.submit(Command::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        })
+        .unwrap();
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        }));
         app.submit(Command::OpenSkinBrowser).unwrap();
         assert!(app.dialog_is_open(DialogKind::SkinBrowser));
         // A bare `OpenPrefs` shows the page model's own-choice default; a
@@ -1710,9 +1729,9 @@ mod tests {
 
     #[test]
     fn the_remaining_dialog_commands_still_record_their_note() {
-        // The media pickers and bookmarks stay unimplemented (About, file
-        // info, jump, load playlist, the skin browser and preferences open
-        // real windows now; the main menu opens its popup, covered in
+        // Only the bookmarks stay unimplemented (About, file info, jump, load
+        // playlist, the open-media faces, the skin browser and preferences
+        // open real windows now; the main menu opens its popup, covered in
         // `menu.rs`).
         let (mut app, _dir) = app_with_file(None);
         app.submit(Command::AddBookmark).unwrap();
@@ -1720,6 +1739,121 @@ mod tests {
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(app.dialog_open_kind().is_none());
         assert!(!app.main_menu_is_open());
+    }
+
+    #[test]
+    fn confirming_the_files_dialog_adds_the_picks_and_closes() {
+        // `Enter` submits the staged picks through the existing `AddItems`
+        // path and closes the dialog; the queue grows by the picks.
+        use rustamp_core::command::OpenMediaKind;
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        })
+        .unwrap();
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        }));
+        let before = app.engine().queue().len();
+        app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+        assert_eq!(app.engine().queue().len(), before + 1);
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn confirming_the_location_dialog_adds_the_typed_url() {
+        // The URL arrives through the entry field (typing cannot produce
+        // punctuation yet, so the test sets the full text programmatically).
+        use rustamp_core::command::OpenMediaKind;
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: true,
+        })
+        .unwrap();
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: true,
+        }));
+        let before = app.engine().queue().len();
+        app.set_media_text("http://example.com/stream.mp3");
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+        assert_eq!(app.engine().queue().len(), before + 1);
+    }
+
+    #[test]
+    fn confirming_an_empty_open_media_dialog_keeps_it_open() {
+        // With nothing picked and a blank field there is nothing to add:
+        // `Enter` stays consumed and the dialog stays open for a retry.
+        use rustamp_core::command::OpenMediaKind;
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        })
+        .unwrap();
+        let before = app.engine().queue().len();
+        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        }));
+        assert_eq!(app.engine().queue().len(), before);
+    }
+
+    #[test]
+    fn cancelling_an_open_media_dialog_adds_nothing() {
+        // `Escape` closes the dialog and drops the field and picks, so the
+        // queue is unchanged.
+        use rustamp_core::command::OpenMediaKind;
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        })
+        .unwrap();
+        app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
+        assert!(app.dialog_key(Key::Escape));
+        assert_eq!(app.dialog_open_kind(), None);
+        assert!(app.drain_notes().is_empty());
+        assert!(app.engine().queue().is_empty());
+        assert!(!app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        }));
+    }
+
+    #[test]
+    fn the_playlist_add_path_keeps_its_unmeasured_play_flag() {
+        // The ADD button emits `OpenMedia { kind: Files, play: false }` and
+        // the value is reported, not decided: confirming adds without playing
+        // (RFC 0005 O5 stays open — a 2.95 capture of the playlist add still
+        // has to say whether it plays).
+        use rustamp_core::command::OpenMediaKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        })
+        .unwrap();
+        app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.engine().queue().len(), 1);
+        assert!(app.drain_notes().is_empty());
     }
 
     #[test]
@@ -1878,10 +2012,11 @@ mod tests {
 
     #[test]
     fn rendering_a_dialog_produces_a_frame_of_the_dialog_size() {
-        use rustamp_core::command::PrefsPage;
+        use rustamp_core::command::{OpenMediaKind, PrefsPage};
         use rustamp_ui::{
             ABOUT_CLIENT_SIZE, DialogKind, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE,
-            LOAD_PLAYLIST_CLIENT_SIZE, PREFS_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE,
+            LOAD_PLAYLIST_CLIENT_SIZE, OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE,
+            SKIN_BROWSER_CLIENT_SIZE,
         };
 
         let (app, _dir) = app_with_file(None);
@@ -1893,6 +2028,27 @@ mod tests {
                 JUMP_CLIENT_SIZE,
             ),
             (DialogKind::LoadPlaylist, LOAD_PLAYLIST_CLIENT_SIZE),
+            (
+                DialogKind::OpenMedia {
+                    kind: OpenMediaKind::Files,
+                    play: false,
+                },
+                OPEN_MEDIA_CLIENT_SIZE,
+            ),
+            (
+                DialogKind::OpenMedia {
+                    kind: OpenMediaKind::Directory,
+                    play: true,
+                },
+                OPEN_MEDIA_CLIENT_SIZE,
+            ),
+            (
+                DialogKind::OpenMedia {
+                    kind: OpenMediaKind::Location,
+                    play: true,
+                },
+                OPEN_MEDIA_CLIENT_SIZE,
+            ),
             (DialogKind::SkinBrowser, SKIN_BROWSER_CLIENT_SIZE),
             (
                 DialogKind::Preferences(PrefsPage::VisPlugin),
@@ -2063,15 +2219,35 @@ mod tests {
         // it pins the parameters the presenter (`window.rs`) builds the real
         // OS windows from.
         crate::window::require_test_vm();
-        use rustamp_core::command::PrefsPage;
+        use rustamp_core::command::{OpenMediaKind, PrefsPage};
         use rustamp_ui::{
-            DialogKind, LOAD_PLAYLIST_CLIENT_SIZE, PREFS_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE,
+            DialogKind, LOAD_PLAYLIST_CLIENT_SIZE, OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE,
+            SKIN_BROWSER_CLIENT_SIZE,
         };
         assert_eq!(DialogKind::LoadPlaylist.title(), "Load Playlist");
         assert_eq!(
             DialogKind::LoadPlaylist.client_size(),
             LOAD_PLAYLIST_CLIENT_SIZE
         );
+        assert_eq!(
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Files,
+                play: false,
+            }
+            .title(),
+            "Add file(s) to playlist"
+        );
+        for kind in [
+            OpenMediaKind::Files,
+            OpenMediaKind::Directory,
+            OpenMediaKind::Location,
+        ] {
+            assert_eq!(
+                DialogKind::OpenMedia { kind, play: true }.client_size(),
+                OPEN_MEDIA_CLIENT_SIZE,
+                "{kind:?}"
+            );
+        }
         assert_eq!(DialogKind::SkinBrowser.title(), "Skin browser");
         assert_eq!(
             DialogKind::SkinBrowser.client_size(),

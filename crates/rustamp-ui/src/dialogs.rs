@@ -1,8 +1,9 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! Simple modal dialogs: About, file info, jump-to (S03 actions), the
 //! load-playlist dialog (S06 §4 LIST OPTS, RFC 0010), the skin browser
-//! (S03 id 40219, RFC 0005) and the preferences frame (S03 ids 40012, 40191,
-//! 40317, RFC 0005 §7).
+//! (S03 id 40219, RFC 0005), the open-media dialogs (S03 ids 40029/40185/40187,
+//! RFC 0005 `Command::OpenMedia`) and the preferences frame (S03 ids 40012,
+//! 40191, 40317, RFC 0005 §7).
 //!
 //! [`DialogKind`] is the headless dialog model: which [`Command`] opens which
 //! dialog, each dialog's title and client size, and the open/close state. Like
@@ -16,7 +17,9 @@
 //! * Titles, client sizes, colours and the exact body lines are **own
 //!   choices**, not reference facts — except the load-playlist title, which
 //!   S06 §4 settles as `Load Playlist` (shared with the playlist model as
-//!   [`crate::playlist::LOAD_DIALOG_TITLE`]). They stay fixed here so tests
+//!   [`crate::playlist::LOAD_DIALOG_TITLE`]), and the open-media files title,
+//!   which reuses the settled ADD title `Add file(s) to playlist` (shared as
+//!   [`crate::playlist::ADD_DIALOG_TITLE`]). They stay fixed here so tests
 //!   pin them.
 //! * Only one dialog is open at a time: opening a second one replaces the
 //!   first. The reference may stack them; that is open.
@@ -28,6 +31,25 @@
 //!   command**: RFC 0010 leaves replace-versus-append (and the file filter)
 //!   open, so `Enter` is consumed and does nothing. The dialog opens, shows
 //!   its spec'd title, and closes.
+//! * The open-media dialogs have **no OS file picker**: the project may not
+//!   add a dependency, and a hand-written native-dialog binding (COM
+//!   `IFileOpenDialog` for the directory pick) would be large, unsafe and
+//!   untestable headless, while the reference's layout, filters and wording
+//!   are unmeasured anyway. Each kind therefore shows a plain entry face — a
+//!   file field, a directory field, or a location/URL field — built from this
+//!   same machinery. Picks arrive programmatically through
+//!   [`DialogManager::stage_media_paths`] (the stand-in for the OS picker's
+//!   result, which a later native picker can fill without changing the command
+//!   mapping) or by typing into the field; confirming produces
+//!   [`Command::AddItems`] with the opening command's `play` flag carried
+//!   through untouched. The reference's real layout, filters and wording stay
+//!   open (a capture would need the three dialogs' geometry, filter lists and
+//!   exact labels).
+//! * The open-media entry field takes **letters, digits and spaces only**: the
+//!   [`Key`] model has no punctuation keys, so a full path or URL (which needs
+//!   `:`, `/`, `.`) cannot be typed yet. [`DialogManager::set_media_text`]
+//!   takes the full text programmatically, the same way the jump box's
+//!   `m:ss` forms stay programmatic until the key model grows.
 //! * The skin browser lists exactly the skins the app can load today — the
 //!   built-in default plus the current skin when it came from disk — because
 //!   the project has no skin search path (no skins-directory concept: the CLI
@@ -42,7 +64,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rustamp_core::command::{Command, JumpTarget, PrefsPage};
+use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
 use rustamp_gfx::{BitmapFont, GlyphMap, Image};
 use rustamp_prefs::DEFAULT_PAGE;
 use rustamp_skin::{Sheet, Skin, webamp};
@@ -61,6 +83,17 @@ pub enum DialogKind {
     /// The load-playlist dialog (S06 §4 LIST OPTS, RFC 0010
     /// `Command::OpenPlaylist`).
     LoadPlaylist,
+    /// An open-media dialog (RFC 0005 `Command::OpenMedia`): a file picker
+    /// face, a directory picker face, or a location/URL entry field, per
+    /// `kind`.
+    ///
+    /// `play` is carried through from the opening command untouched (it
+    /// decides whether confirming starts the first added entry); the dialog
+    /// itself never invents it. The playlist ADD path opens
+    /// `{ kind: Files, play: false }` (RFC 0005 O5: the playlist add's `play`
+    /// value is unmeasured), the main-window actions open their kind with
+    /// `play: true`.
+    OpenMedia { kind: OpenMediaKind, play: bool },
     /// The skin browser (S03 "Skin browser", id 40219, RFC 0005
     /// `Command::OpenSkinBrowser`).
     SkinBrowser,
@@ -85,6 +118,21 @@ impl DialogKind {
             DialogKind::Jump(JumpTarget::File) => "Jump to file",
             DialogKind::Jump(JumpTarget::Time) => "Jump to time",
             DialogKind::LoadPlaylist => crate::playlist::LOAD_DIALOG_TITLE,
+            // The files face reuses the settled ADD title (S06 §4, shared so
+            // the two cannot drift); the directory/location titles are own
+            // choices — no spec fixes them (S04 open).
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Files,
+                ..
+            } => crate::playlist::ADD_DIALOG_TITLE,
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Directory,
+                ..
+            } => "Open directory",
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Location,
+                ..
+            } => "Open location",
             DialogKind::SkinBrowser => "Skin browser",
             // Own choice, grounded in the measured menu label (S03 id 40012;
             // the menu row reads `Preferences...`, the submenu row
@@ -101,6 +149,7 @@ impl DialogKind {
             DialogKind::FileInfo => FILE_INFO_CLIENT_SIZE,
             DialogKind::Jump(_) => JUMP_CLIENT_SIZE,
             DialogKind::LoadPlaylist => LOAD_PLAYLIST_CLIENT_SIZE,
+            DialogKind::OpenMedia { .. } => OPEN_MEDIA_CLIENT_SIZE,
             DialogKind::SkinBrowser => SKIN_BROWSER_CLIENT_SIZE,
             DialogKind::Preferences(_) => PREFS_CLIENT_SIZE,
         }
@@ -115,6 +164,9 @@ pub const FILE_INFO_CLIENT_SIZE: (u32, u32) = (300, 140);
 pub const JUMP_CLIENT_SIZE: (u32, u32) = (220, 90);
 /// Client size of the load-playlist dialog. Own choice (see the module docs).
 pub const LOAD_PLAYLIST_CLIENT_SIZE: (u32, u32) = (300, 100);
+/// Client size of each open-media dialog. Own choice: the same box shape as
+/// the load-playlist dialog (no spec fixes dialog geometry, S04 open).
+pub const OPEN_MEDIA_CLIENT_SIZE: (u32, u32) = (300, 100);
 /// Client size of the skin browser. Own choice: room for the title strip plus
 /// the browser rows (built-in plus at most one file row, see
 /// [`skin_entries`]).
@@ -127,8 +179,9 @@ pub const PREFS_CLIENT_SIZE: (u32, u32) = (320, 200);
 /// Which dialog `command` opens, when it opens one.
 ///
 /// Covers the dialog commands the shortcuts already emit
-/// ([`crate::shortcuts`] maps the S03 keys to them, and the playlist window's
-/// LIST OPTS button emits [`Command::OpenPlaylist`] via
+/// ([`crate::shortcuts`] maps the S03 keys to them, the playlist window's
+/// ADD button emits [`Command::OpenMedia`] and its LIST OPTS button emits
+/// [`Command::OpenPlaylist`] via
 /// [`crate::playlist::PlaylistDialog`]); every other command opens nothing.
 pub fn dialog_for_command(command: &Command) -> Option<DialogKind> {
     match command {
@@ -136,6 +189,14 @@ pub fn dialog_for_command(command: &Command) -> Option<DialogKind> {
         Command::OpenFileInfo => Some(DialogKind::FileInfo),
         Command::OpenJump { target } => Some(DialogKind::Jump(*target)),
         Command::OpenPlaylist => Some(DialogKind::LoadPlaylist),
+        // The `play` flag rides along untouched: confirming the dialog emits
+        // `AddItems` with this same value (RFC 0005 §5.2; the `false` of the
+        // playlist ADD path is unmeasured, O5, and stays as the caller sent
+        // it).
+        Command::OpenMedia { kind, play } => Some(DialogKind::OpenMedia {
+            kind: *kind,
+            play: *play,
+        }),
         Command::OpenSkinBrowser => Some(DialogKind::SkinBrowser),
         // A bare `OpenPrefs` shows the page model's own-choice default; a
         // page-carrying command shows the page it names (RFC 0005 §7).
@@ -153,6 +214,7 @@ pub fn opening_command(dialog: DialogKind) -> Command {
         DialogKind::FileInfo => Command::OpenFileInfo,
         DialogKind::Jump(target) => Command::OpenJump { target },
         DialogKind::LoadPlaylist => Command::OpenPlaylist,
+        DialogKind::OpenMedia { kind, play } => Command::OpenMedia { kind, play },
         DialogKind::SkinBrowser => Command::OpenSkinBrowser,
         // The page-carrying command round-trips; a bare `OpenPrefs` (which
         // opens the default page) has no exact inverse and maps back here.
@@ -203,6 +265,41 @@ pub fn parse_jump_time_ms(input: &str) -> Option<u64> {
     Some(seconds.saturating_mul(1000))
 }
 
+/// How many entry-field characters an open-media dialog keeps.
+///
+/// Own choice: long enough for a deep path or a URL with a query string; the
+/// reference's limits (if any) are unmeasured.
+pub const MAX_MEDIA_LEN: usize = 512;
+
+/// Maps staged file/directory picks to playlist locations.
+///
+/// One pick becomes one [`MediaLocation::File`], in order. A directory pick
+/// stays a plain file path: no enumerated expansion exists yet (the app adds
+/// the path as-is), which stays open with the reference's directory
+/// semantics. Pure function so the app and tests share it.
+pub fn media_items_for_paths(paths: &[PathBuf]) -> Vec<rustamp_core::playlist::MediaLocation> {
+    paths
+        .iter()
+        .map(|path| rustamp_core::playlist::MediaLocation::File(path.clone()))
+        .collect()
+}
+
+/// Maps a location-dialog entry to its playlist location.
+///
+/// The trimmed text becomes [`MediaLocation::Url`]; blank input is `None`
+/// (nothing to confirm). No validation beyond that: URL syntax is unmeasured,
+/// so anything non-blank is passed through. Pure function so the app and
+/// tests share it.
+pub fn media_item_for_url(text: &str) -> Option<rustamp_core::playlist::MediaLocation> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(rustamp_core::playlist::MediaLocation::Url(
+        trimmed.to_string(),
+    ))
+}
+
 /// One row of the skin browser: the skins the app can load today.
 ///
 /// The project has no skin search path (no skins-directory concept: the CLI
@@ -237,7 +334,8 @@ pub fn skin_entries(current: Option<&Path>) -> Vec<SkinEntry> {
 }
 
 /// The headless dialog state: which dialog (if any) is open, plus the jump
-/// box's input text and the skin browser's selected row.
+/// box's input text, the skin browser's selected row and the open-media
+/// dialog's entry field and staged picks.
 #[derive(Debug, Clone, Default)]
 pub struct DialogManager {
     open: Option<DialogKind>,
@@ -250,6 +348,11 @@ pub struct DialogManager {
     /// appear to do nothing for several presses. Zero means "not told" and the
     /// moves stay unbounded, which is what the read-side clamp then handles.
     skin_rows: usize,
+    /// The open-media dialog's entry field (typed path or URL text).
+    media_text: String,
+    /// The open-media dialog's staged picks (the stand-in for the OS picker's
+    /// result; see the module docs).
+    media_paths: Vec<PathBuf>,
 }
 
 impl DialogManager {
@@ -258,12 +361,15 @@ impl DialogManager {
         Self::default()
     }
 
-    /// Opens `dialog`, replacing whatever is open. Clears the jump input and
-    /// resets the skin selection to the first row.
+    /// Opens `dialog`, replacing whatever is open. Clears the jump input, the
+    /// open-media entry field and its staged picks, and resets the skin
+    /// selection to the first row.
     pub fn open(&mut self, dialog: DialogKind) {
         self.open = Some(dialog);
         self.jump_text.clear();
         self.skin_index = 0;
+        self.media_text.clear();
+        self.media_paths.clear();
     }
 
     /// Closes `dialog` when it is the open one; otherwise a no-op.
@@ -272,6 +378,8 @@ impl DialogManager {
             self.open = None;
             self.jump_text.clear();
             self.skin_index = 0;
+            self.media_text.clear();
+            self.media_paths.clear();
         }
     }
 
@@ -280,6 +388,8 @@ impl DialogManager {
         self.open = None;
         self.jump_text.clear();
         self.skin_index = 0;
+        self.media_text.clear();
+        self.media_paths.clear();
     }
 
     /// The open dialog, if any.
@@ -305,10 +415,13 @@ impl DialogManager {
     /// Handles one key for the open dialog.
     ///
     /// Returns `true` when the key was consumed: digits append to the jump
-    /// input (jump dialogs only), `Up`/`Down` move the skin browser's
-    /// selection (skin browser only), `Enter` and `Escape` are consumed by any
-    /// open dialog so the app can confirm or close it. Everything else falls
-    /// through (`false`).
+    /// input (jump dialogs only), letters/digits/spaces append to the
+    /// open-media entry field (open-media dialogs only; the [`Key`] model has
+    /// no punctuation, so full paths and URLs arrive through
+    /// [`set_media_text`](Self::set_media_text)), `Up`/`Down` move the skin
+    /// browser's selection (skin browser only), `Enter` and `Escape` are
+    /// consumed by any open dialog so the app can confirm or close it.
+    /// Everything else falls through (`false`).
     pub fn key(&mut self, key: Key) -> bool {
         match key {
             Key::Escape | Key::Enter => self.open.is_some(),
@@ -318,6 +431,28 @@ impl DialogManager {
                     if self.jump_text.len() < MAX_JUMP_LEN {
                         self.jump_text.push((b'0' + digit) as char);
                     }
+                    true
+                } else if matches!(self.open, Some(DialogKind::OpenMedia { .. })) {
+                    let digit = digit % 10;
+                    self.push_media_char((b'0' + digit) as char);
+                    true
+                } else {
+                    false
+                }
+            }
+            Key::Letter(letter) => {
+                // The key model stores letters upper-case, so typed text keeps
+                // that case; exact text arrives through `set_media_text`.
+                if matches!(self.open, Some(DialogKind::OpenMedia { .. })) {
+                    self.push_media_char(letter as char);
+                    true
+                } else {
+                    false
+                }
+            }
+            Key::Space => {
+                if matches!(self.open, Some(DialogKind::OpenMedia { .. })) {
+                    self.push_media_char(' ');
                     true
                 } else {
                     false
@@ -351,6 +486,102 @@ impl DialogManager {
             return None;
         }
         parse_jump_time_ms(&self.jump_text).map(|to_ms| Command::Seek { to_ms })
+    }
+
+    /// The open-media dialog's entry field text.
+    pub fn media_text(&self) -> &str {
+        &self.media_text
+    }
+
+    /// Replaces the open-media entry field (clamped to [`MAX_MEDIA_LEN`]
+    /// characters).
+    ///
+    /// This is how a full path or URL arrives: the [`Key`] model has no
+    /// punctuation keys, so typing can only append letters, digits and spaces
+    /// (see [`key`](Self::key)). A later native picker fills the staged picks
+    /// instead; both feed [`confirm_open_media`](Self::confirm_open_media).
+    pub fn set_media_text(&mut self, text: &str) {
+        self.media_text = text.chars().take(MAX_MEDIA_LEN).collect();
+    }
+
+    /// Stages open-media picks (the stand-in for the OS picker's result).
+    ///
+    /// A later native file/directory picker fills this instead of the entry
+    /// field; [`confirm_open_media`](Self::confirm_open_media) reads it first.
+    pub fn stage_media_paths(&mut self, paths: Vec<PathBuf>) {
+        self.media_paths = paths;
+    }
+
+    /// The staged open-media picks, if any.
+    pub fn staged_media_paths(&self) -> &[PathBuf] {
+        &self.media_paths
+    }
+
+    /// Appends one typed character to the open-media entry field, clamped to
+    /// [`MAX_MEDIA_LEN`] characters.
+    fn push_media_char(&mut self, ch: char) {
+        if self.media_text.chars().count() < MAX_MEDIA_LEN {
+            self.media_text.push(ch);
+        }
+    }
+
+    /// Confirms the open-media dialog: turns the staged picks or the entry
+    /// field into the resulting [`Command::AddItems`].
+    ///
+    /// * `Location` reads the entry field: trimmed non-blank text becomes one
+    ///   [`MediaLocation::Url`](rustamp_core::playlist::MediaLocation::Url).
+    /// * `Files` reads the staged picks in order (each a
+    ///   [`MediaLocation::File`](rustamp_core::playlist::MediaLocation::File)),
+    ///   falling back to the entry field as a single file path.
+    /// * `Directory` reads the first staged pick (or the entry field), as a
+    ///   single file path — no directory expansion exists yet (see
+    ///   [`media_items_for_paths`]).
+    ///
+    /// The command appends (`at: None`) and carries the opening command's
+    /// `play` flag untouched — in particular the playlist ADD path
+    /// (`play: false`, RFC 0005 O5) stays `false` here rather than being
+    /// decided by the dialog. `None` when no open-media dialog is open or
+    /// there is nothing to confirm (the dialog stays open so the user can
+    /// retry).
+    pub fn confirm_open_media(&self) -> Option<Command> {
+        let (kind, play) = match self.open {
+            Some(DialogKind::OpenMedia { kind, play }) => (kind, play),
+            _ => return None,
+        };
+        let items = match kind {
+            OpenMediaKind::Location => vec![media_item_for_url(&self.media_text)?],
+            OpenMediaKind::Files => {
+                if self.media_paths.is_empty() {
+                    let trimmed = self.media_text.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    vec![rustamp_core::playlist::MediaLocation::File(PathBuf::from(
+                        trimmed,
+                    ))]
+                } else {
+                    media_items_for_paths(&self.media_paths)
+                }
+            }
+            OpenMediaKind::Directory => {
+                if let Some(first) = self.media_paths.first() {
+                    vec![rustamp_core::playlist::MediaLocation::File(first.clone())]
+                } else {
+                    let trimmed = self.media_text.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    vec![rustamp_core::playlist::MediaLocation::File(PathBuf::from(
+                        trimmed,
+                    ))]
+                }
+            }
+        };
+        Some(Command::AddItems {
+            items,
+            at: None,
+            play,
+        })
     }
 
     /// The skin browser's selected row index. Unbounded while moving (the
@@ -498,6 +729,22 @@ mod tests {
             DialogKind::Jump(JumpTarget::File),
             DialogKind::Jump(JumpTarget::Time),
             DialogKind::LoadPlaylist,
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Files,
+                play: true,
+            },
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Files,
+                play: false,
+            },
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Directory,
+                play: true,
+            },
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Location,
+                play: true,
+            },
             DialogKind::SkinBrowser,
             DialogKind::Preferences(PrefsPage::VisPlugin),
             DialogKind::Preferences(PrefsPage::VisOptions),
@@ -543,6 +790,17 @@ mod tests {
             DialogKind::LoadPlaylist.client_size(),
             LOAD_PLAYLIST_CLIENT_SIZE
         );
+        for kind in [
+            OpenMediaKind::Files,
+            OpenMediaKind::Directory,
+            OpenMediaKind::Location,
+        ] {
+            assert_eq!(
+                DialogKind::OpenMedia { kind, play: true }.client_size(),
+                OPEN_MEDIA_CLIENT_SIZE,
+                "{kind:?}"
+            );
+        }
         assert_eq!(
             DialogKind::SkinBrowser.client_size(),
             SKIN_BROWSER_CLIENT_SIZE
@@ -556,6 +814,7 @@ mod tests {
             FILE_INFO_CLIENT_SIZE,
             JUMP_CLIENT_SIZE,
             LOAD_PLAYLIST_CLIENT_SIZE,
+            OPEN_MEDIA_CLIENT_SIZE,
             SKIN_BROWSER_CLIENT_SIZE,
             PREFS_CLIENT_SIZE,
         ] {
@@ -771,5 +1030,250 @@ mod tests {
         assert!(manager.key(Key::Enter));
         assert_eq!(manager.prefs_page(), Some(PrefsPage::VisPlugin));
         assert!(manager.key(Key::Escape));
+    }
+
+    #[test]
+    fn the_open_media_titles_are_kind_specific() {
+        // The files face reuses the settled ADD title (S06 §4); the other two
+        // are own choices (no spec fixes them, S04 open) and stay pinned here.
+        assert_eq!(
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Files,
+                play: true,
+            }
+            .title(),
+            "Add file(s) to playlist"
+        );
+        assert_eq!(
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Files,
+                play: true,
+            }
+            .title(),
+            crate::playlist::ADD_DIALOG_TITLE
+        );
+        assert_eq!(
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Directory,
+                play: true,
+            }
+            .title(),
+            "Open directory"
+        );
+        assert_eq!(
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Location,
+                play: true,
+            }
+            .title(),
+            "Open location"
+        );
+    }
+
+    #[test]
+    fn staged_paths_map_to_file_locations_in_order() {
+        use rustamp_core::playlist::MediaLocation;
+        let paths = vec![PathBuf::from("a.mp3"), PathBuf::from("b/c.mp3")];
+        assert_eq!(
+            media_items_for_paths(&paths),
+            vec![
+                MediaLocation::File(PathBuf::from("a.mp3")),
+                MediaLocation::File(PathBuf::from("b/c.mp3")),
+            ]
+        );
+        assert!(media_items_for_paths(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_location_entry_is_a_url_or_nothing() {
+        use rustamp_core::playlist::MediaLocation;
+        assert_eq!(
+            media_item_for_url("http://example.com/stream.mp3"),
+            Some(MediaLocation::Url(
+                "http://example.com/stream.mp3".to_string()
+            ))
+        );
+        // Surrounding whitespace is ignored, but the text is passed through
+        // otherwise (URL syntax is unmeasured).
+        assert_eq!(
+            media_item_for_url("  http://example.com/x  "),
+            Some(MediaLocation::Url("http://example.com/x".to_string()))
+        );
+        assert_eq!(media_item_for_url(""), None);
+        assert_eq!(media_item_for_url("   "), None);
+    }
+
+    #[test]
+    fn confirming_files_adds_the_staged_picks_with_the_play_flag() {
+        use rustamp_core::playlist::MediaLocation;
+        let mut manager = DialogManager::new();
+        assert_eq!(manager.confirm_open_media(), None);
+        // The main-window path plays; the playlist ADD path does not (RFC
+        // 0005 O5: the `play: false` value is unmeasured and rides through
+        // untouched — the dialog never decides it).
+        for play in [true, false] {
+            manager.open(DialogKind::OpenMedia {
+                kind: OpenMediaKind::Files,
+                play,
+            });
+            assert_eq!(manager.confirm_open_media(), None);
+            manager.stage_media_paths(vec![PathBuf::from("a.mp3"), PathBuf::from("b.mp3")]);
+            assert_eq!(
+                manager.confirm_open_media(),
+                Some(Command::AddItems {
+                    items: vec![
+                        MediaLocation::File(PathBuf::from("a.mp3")),
+                        MediaLocation::File(PathBuf::from("b.mp3")),
+                    ],
+                    at: None,
+                    play,
+                }),
+                "play = {play}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirming_files_without_picks_falls_back_to_the_typed_path() {
+        use rustamp_core::playlist::MediaLocation;
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        });
+        assert_eq!(manager.confirm_open_media(), None);
+        manager.set_media_text("typed.mp3");
+        assert_eq!(
+            manager.confirm_open_media(),
+            Some(Command::AddItems {
+                items: vec![MediaLocation::File(PathBuf::from("typed.mp3"))],
+                at: None,
+                play: false,
+            })
+        );
+    }
+
+    #[test]
+    fn confirming_a_directory_adds_one_path_without_expansion() {
+        // No directory expansion exists yet: the pick is added as-is (open
+        // with the reference's directory semantics).
+        use rustamp_core::playlist::MediaLocation;
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Directory,
+            play: true,
+        });
+        assert_eq!(manager.confirm_open_media(), None);
+        manager.stage_media_paths(vec![PathBuf::from("music"), PathBuf::from("other")]);
+        assert_eq!(
+            manager.confirm_open_media(),
+            Some(Command::AddItems {
+                items: vec![MediaLocation::File(PathBuf::from("music"))],
+                at: None,
+                play: true,
+            })
+        );
+        // Without a staged pick the typed field is the directory.
+        manager.stage_media_paths(Vec::new());
+        manager.set_media_text("typed-dir");
+        assert_eq!(
+            manager.confirm_open_media(),
+            Some(Command::AddItems {
+                items: vec![MediaLocation::File(PathBuf::from("typed-dir"))],
+                at: None,
+                play: true,
+            })
+        );
+    }
+
+    #[test]
+    fn confirming_a_location_adds_the_typed_url() {
+        use rustamp_core::playlist::MediaLocation;
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: true,
+        });
+        assert_eq!(manager.confirm_open_media(), None);
+        manager.set_media_text("http://example.com/stream.mp3");
+        assert_eq!(
+            manager.confirm_open_media(),
+            Some(Command::AddItems {
+                items: vec![MediaLocation::Url(
+                    "http://example.com/stream.mp3".to_string()
+                )],
+                at: None,
+                play: true,
+            })
+        );
+        // Blank input confirms nothing; the dialog stays open for a retry.
+        manager.set_media_text("   ");
+        assert_eq!(manager.confirm_open_media(), None);
+    }
+
+    #[test]
+    fn confirming_an_open_media_dialog_needs_that_dialog() {
+        // Another dialog open (or none) confirms nothing.
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::About);
+        manager.set_media_text("x.mp3");
+        assert_eq!(manager.confirm_open_media(), None);
+        manager.open(DialogKind::Jump(JumpTarget::Time));
+        assert_eq!(manager.confirm_open_media(), None);
+    }
+
+    #[test]
+    fn cancelling_an_open_media_dialog_drops_its_field_and_picks() {
+        // `Escape` (or closing) clears the entry field and the staged picks
+        // with the dialog, so a reopened dialog starts empty.
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        });
+        manager.set_media_text("x.mp3");
+        manager.stage_media_paths(vec![PathBuf::from("y.mp3")]);
+        manager.close_any();
+        assert_eq!(manager.media_text(), "");
+        assert!(manager.staged_media_paths().is_empty());
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        });
+        assert_eq!(manager.confirm_open_media(), None);
+    }
+
+    #[test]
+    fn open_media_keys_type_into_the_field_and_nothing_else() {
+        // Letters, digits and spaces append to the entry field (digits still
+        // type into the jump box too); arrows go nowhere on these dialogs.
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: true,
+        });
+        assert!(manager.key(Key::Digit(8)));
+        assert!(manager.key(Key::Numpad(0)));
+        assert!(manager.key(Key::Space));
+        assert!(!manager.key(Key::Up));
+        assert!(!manager.key(Key::Down));
+        assert_eq!(manager.media_text(), "80 ");
+        assert!(manager.key(Key::Enter));
+        assert!(manager.key(Key::Escape));
+        // The same keys type nothing on the neighbouring dialogs.
+        manager.open(DialogKind::About);
+        assert!(!manager.key(Key::Digit(1)));
+        assert!(!manager.key(Key::Space));
+        manager.open(DialogKind::LoadPlaylist);
+        assert!(!manager.key(Key::Digit(1)));
+        assert!(!manager.key(Key::Space));
+        // Letters keep the key model's upper case; exact text arrives through
+        // the setter.
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        });
+        assert!(manager.key(Key::Letter(b'H')));
+        assert_eq!(manager.media_text(), "H");
     }
 }

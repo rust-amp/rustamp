@@ -23,9 +23,11 @@
 //! * the title bar has no window-menu button (S06 §1), so a click at (6,3)
 //!   does nothing; Close/Shade record a note (hiding and shading the playlist
 //!   are open) and MISC records a note (the `#32768` popup's contents are a
-//!   visual reading, S06 §4); the ADD dialog records its spec'd title through
-//!   [`App::request_playlist_dialog`] and opens no window, while LIST OPTS
-//!   opens the real load-playlist dialog through the same call (RFC 0010).
+//!   visual reading, S06 §4); ADD and LIST OPTS open their real dialogs
+//!   through [`App::request_playlist_dialog`] (the files face of the
+//!   open-media dialog for ADD, with the playlist path's unmeasured
+//!   `play: false`, RFC 0005 O5; the load-playlist dialog for LIST OPTS,
+//!   RFC 0010).
 //!
 //! Placement: [`App::playlist_window_origin`] replays the main window's shade
 //! and double-size state through [`DockedStack`](rustamp_ui::DockedStack), so
@@ -326,8 +328,9 @@ mod tests {
     #[test]
     fn add_and_list_opts_emit_their_commands_with_their_titles() {
         // S06 §4 (titles) + RFC 0010 (LIST OPTS maps to OpenPlaylist). ADD
-        // still records its title through the dialog-stub path; LIST OPTS
-        // opens the real load-playlist dialog, so only ADD leaves a note.
+        // maps to the files face of the open-media dialog (RFC 0005) with the
+        // playlist path's unmeasured `play: false` (O5, kept as sent); both
+        // buttons open a real dialog now, so neither leaves a note.
         let mut app = test_app();
         add_entries(&mut app, 3);
         let commands = app.playlist_mouse_down(24, 92).expect("ADD applies");
@@ -338,15 +341,33 @@ mod tests {
                 play: false,
             }]
         );
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        }));
         let commands = app.playlist_mouse_down(242, 92).expect("LIST OPTS applies");
         assert_eq!(commands, vec![Command::OpenPlaylist]);
         assert!(app.dialog_is_open(rustamp_ui::DialogKind::LoadPlaylist));
-        // ADD emits its command and records that its dialog is not implemented,
-        // so two notes are expected; LIST OPTS now opens a real dialog and adds
-        // none of its own.
-        let notes = app.drain_notes();
-        assert_eq!(notes.len(), 2, "{notes:?}");
-        assert!(notes[0].contains("Add file(s) to playlist"), "{notes:?}");
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn confirming_the_add_dialog_appends_without_a_note() {
+        // The full playlist path: ADD opens the files face, a staged pick
+        // confirms through `AddItems`, the dialog closes and the model grows.
+        // `play: false` rides through untouched (RFC 0005 O5 stays open).
+        use rustamp_ui::Key;
+
+        let mut app = test_app();
+        add_entries(&mut app, 3);
+        app.playlist_mouse_down(24, 92).expect("ADD applies");
+        app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+        // The engine queue is the source of truth for the add (the playlist
+        // model re-syncs on the next button press, as with any `AddItems`).
+        assert_eq!(app.engine().queue().len(), 4);
+        assert!(app.drain_notes().is_empty());
     }
 
     #[test]

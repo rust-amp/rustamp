@@ -217,7 +217,7 @@ struct Windowed {
     playlist_window: Option<Arc<Window>>,
     playlist_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     /// The simple modal dialog window (About, file info, jump-to,
-    /// load-playlist, skin browser, preferences; see `dialogs.rs`): at most one is open,
+    /// load-playlist, open-media, skin browser, preferences; see `dialogs.rs`): at most one is open,
     /// created by the same shell and rail as the main window. Sizes and
     /// contents are own choices, except the load-playlist title (no spec
     /// covers dialog geometry; S04 is not started).
@@ -675,8 +675,8 @@ impl Windowed {
 
     /// A key press while the dialog window is focused.
     ///
-    /// The dialog consumes `Enter` (confirm the jump box or the skin
-    /// browser; a no-op on the load-playlist and preferences dialogs, whose
+    /// The dialog consumes `Enter` (confirm the jump box, the skin
+    /// browser or the open-media dialog; a no-op on the load-playlist and preferences dialogs, whose
     /// confirmation is open per RFC 0010 and whose contents are unmeasured), `Escape` (close) and the keys each dialog types
     /// or moves with (digits for the jump box, arrows for the skin browser);
     /// the window closes itself when the app reports no open dialog

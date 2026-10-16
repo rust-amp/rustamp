@@ -1,6 +1,8 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! Simple modal dialogs: About, file info, jump-to (S03 actions), the
-//! load-playlist dialog (S06 §4 LIST OPTS, RFC 0010), the skin browser
+//! load-playlist dialog (S06 §4 LIST OPTS, RFC 0010), the open-media dialogs
+//! (S03 ids 40029/40185/40187, RFC 0005 `Command::OpenMedia`; the playlist
+//! ADD button reaches the files face), the skin browser
 //! (S03 id 40219, RFC 0005) and the preferences frame (S03 ids 40012, 40191,
 //! 40317, RFC 0005 §7).
 //!
@@ -26,6 +28,14 @@
 //!   file picker yet and confirmation is deliberately unmapped: RFC 0010
 //!   leaves replace-versus-append (and the file filter) open, so `Enter`
 //!   does nothing and the dialog stays open.
+//! * Open media: a kind-specific face — the prompt plus the entry field for
+//!   the files and directory faces, the staged-pick summary when picks were
+//!   staged, or the typed URL for the location face. Confirming adds the
+//!   picks (`Enter` submits the resulting [`Command::AddItems`] and closes
+//!   the dialog); with nothing to confirm the dialog stays open. The
+//!   reference's layout, filters and wording are unmeasured, so prompts are
+//!   plain own choices. The `play` flag rides through untouched (RFC 0005
+//!   O5: the playlist ADD path's `false` is unmeasured).
 //! * Skin browser: the skins the app can load today (the built-in default,
 //!   plus the current skin when it came from disk), with the selected row
 //!   marked. `Enter` loads the selected skin through the existing skin path
@@ -39,7 +49,7 @@
 
 use std::path::PathBuf;
 
-use rustamp_core::command::{Command, JumpTarget, PrefsPage};
+use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
 use rustamp_gfx::Image;
 use rustamp_prefs::page_name;
 use rustamp_ui::{DialogKind, Key, SkinEntry, dialog_for_command, render_dialog, skin_entries};
@@ -48,8 +58,8 @@ use crate::app::App;
 
 impl App {
     /// Opens the dialog `command` asks for, when it asks for one the app now
-    /// implements (About, file info, either jump box, load playlist, skin
-    /// browser, preferences).
+    /// implements (About, file info, either jump box, load playlist, the
+    /// three open-media faces, skin browser, preferences).
     ///
     /// Returns the opened dialog, or `None` when the command opens no
     /// implemented dialog (the caller keeps its existing note path then).
@@ -101,8 +111,11 @@ impl App {
     /// A key press while a dialog is focused.
     ///
     /// `Enter` confirms the jump-to-time box (submitting the resulting
-    /// [`Command::Seek`]) or loads the skin browser's selected skin;
-    /// `Escape` closes the open dialog; digits type into the jump box and
+    /// [`Command::Seek`]), the skin browser's selected skin, or the
+    /// open-media dialog (submitting the resulting [`Command::AddItems`] and
+    /// closing it; with nothing to confirm the dialog stays open);
+    /// `Escape` closes the open dialog; digits type into the jump box (and
+    /// letters/digits/spaces into the open-media field) and
     /// arrows move the skin selection. `Enter` on the load-playlist dialog is
     /// consumed and does nothing (RFC 0010 leaves its confirmation open), as
     /// it is on the preferences frame (whose contents are unmeasured, S04
@@ -121,12 +134,36 @@ impl App {
                     let _ = self.submit(seek);
                 } else if self.dialogs.open_kind() == Some(DialogKind::SkinBrowser) {
                     self.confirm_skin_browser();
+                } else if let Some(add) = self.dialogs.confirm_open_media() {
+                    // A failed submit still consumed the key; the dialog closes
+                    // only on a real confirm so an empty pick cannot trap the
+                    // player and a confirmed one does not linger.
+                    if self.submit(add).is_ok() {
+                        self.dialogs.close_any();
+                    }
                 }
             }
             Key::Escape => self.dialogs.close_any(),
             _ => {}
         }
         true
+    }
+
+    /// The open-media dialog's entry field text.
+    pub fn media_text(&self) -> &str {
+        self.dialogs.media_text()
+    }
+
+    /// Replaces the open-media dialog's entry field (a full path or URL; see
+    /// [`rustamp_ui::DialogManager::set_media_text`](rustamp_ui::DialogManager::set_media_text)).
+    pub fn set_media_text(&mut self, text: &str) {
+        self.dialogs.set_media_text(text);
+    }
+
+    /// Stages the open-media dialog's picks (the stand-in for the OS picker's
+    /// result; see [`rustamp_ui::DialogManager::stage_media_paths`](rustamp_ui::DialogManager::stage_media_paths)).
+    pub fn stage_media_paths(&mut self, paths: Vec<PathBuf>) {
+        self.dialogs.stage_media_paths(paths);
     }
 
     /// The jump box's current input text.
@@ -163,11 +200,51 @@ impl App {
             // leaves the semantics open): the prompt plus an empty field,
             // the same box shape as the jump dialogs.
             DialogKind::LoadPlaylist => vec!["Playlist file:".to_string(), String::new()],
+            // Kind-specific faces with plain own-choice prompts (the
+            // reference's layout and wording are unmeasured, S04 open): the
+            // files/directory faces show the staged picks when the OS
+            // picker's stand-in filled them, else the typed field; the
+            // location face shows the typed URL.
+            DialogKind::OpenMedia { kind, .. } => self.open_media_lines(kind),
             DialogKind::SkinBrowser => self.skin_browser_lines(),
             // Frame only: the reference's page contents are unmeasured (S04
             // open), so the page shows its own-choice name and nothing else —
             // no controls, no copied text.
             DialogKind::Preferences(page) => vec![page_name(page).to_string()],
+        }
+    }
+
+    /// The open-media dialog's body lines for `kind`: the prompt plus the
+    /// staged picks (files/directory faces) or the typed field.
+    ///
+    /// Prompts are plain own choices (the reference's wording is unmeasured,
+    /// S04 open); the content lines come from live dialog state, never
+    /// hard-coded.
+    pub(crate) fn open_media_lines(&self, kind: OpenMediaKind) -> Vec<String> {
+        let staged = self.dialogs.staged_media_paths();
+        let field = self.dialogs.media_text();
+        match kind {
+            OpenMediaKind::Files | OpenMediaKind::Directory => {
+                let prompt = if kind == OpenMediaKind::Files {
+                    "File(s):"
+                } else {
+                    "Directory:"
+                };
+                let mut lines = vec![prompt.to_string()];
+                if staged.is_empty() {
+                    lines.push(if field.is_empty() {
+                        "(no file chosen)".to_string()
+                    } else {
+                        field.to_string()
+                    });
+                } else {
+                    lines.extend(staged.iter().map(|path| path.display().to_string()));
+                }
+                lines
+            }
+            OpenMediaKind::Location => {
+                vec!["Location (URL):".to_string(), field.to_string()]
+            }
         }
     }
 
