@@ -700,3 +700,84 @@ fn the_preamp_reaches_the_rendered_audio() {
         );
     }
 }
+
+/// A test DSP stage that counts how many frames it processed.
+struct CountingDspStage {
+    prepared_spec: Option<rustamp_core::audio::AudioSpec>,
+    processed_samples: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl rustamp_core::audio::DspStage for CountingDspStage {
+    fn name(&self) -> &str {
+        "counting-dsp"
+    }
+
+    fn prepare(&mut self, spec: rustamp_core::audio::AudioSpec) -> rustamp_core::error::Result<()> {
+        self.prepared_spec = Some(spec);
+        Ok(())
+    }
+
+    fn process(&mut self, buf: &mut [f32]) {
+        // Multiply by 0.5 and count samples processed
+        self.processed_samples
+            .fetch_add(buf.len(), std::sync::atomic::Ordering::SeqCst);
+        for s in buf {
+            *s *= 0.5;
+        }
+    }
+
+    fn reset(&mut self) {}
+}
+
+#[test]
+fn installed_dsp_chain_survives_consecutive_runs() {
+    let mut h = Harness::new(&[TRACK_A]);
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Install user DSP stage before first run
+    h.engine.set_dsp_chain(vec![Box::new(CountingDspStage {
+        prepared_spec: None,
+        processed_samples: std::sync::Arc::clone(&counter),
+    })]);
+
+    // First run: play index 0 to the end
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0), "track must open for first run");
+    assert!(
+        h.wait_buffered(),
+        "first run track must be buffered to end of stream"
+    );
+
+    // Pump clock until the track is finished playing
+    let total = track_frames(TRACK_A);
+    assert!(
+        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        "first run must complete and stop"
+    );
+
+    let first_run_samples = counter.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        first_run_samples > 0,
+        "DSP stage must have processed samples during the first run"
+    );
+
+    // Second run: play again and assert the DSP stage is still active and processing
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0), "track must open for second run");
+    assert!(
+        h.wait_buffered(),
+        "second run track must be buffered to end of stream"
+    );
+
+    assert!(
+        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        "second run must complete and stop"
+    );
+
+    let second_run_samples = counter.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        second_run_samples,
+        first_run_samples * 2,
+        "DSP stage must have survived and processed identical sample count in the second run"
+    );
+}

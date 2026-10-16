@@ -796,8 +796,9 @@ impl Engine {
             DecodeOut::Stopped => {
                 self.to_decode = None;
             }
-            DecodeOut::Returned(producer) => {
+            DecodeOut::Returned { producer, dsp } => {
                 self.producer = Some(producer);
+                self.dsp = dsp;
             }
         }
     }
@@ -914,7 +915,7 @@ impl Engine {
         }
     }
 
-    /// Join the decode thread and take the ring producer back.
+    /// Join the decode thread and take the ring producer and DSP chain back.
     fn join_decode(&mut self) {
         // A thread waiting for a ring drain must not block the join; nothing is
         // consuming the ring at this point anyway.
@@ -922,10 +923,15 @@ impl Engine {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        // Drain any remaining messages from the decode thread. If `Returned`
+        // was not handled in `poll`, recover both the ring producer and the
+        // installed DSP chain here. On shutdown (`Drop`), this ensures that
+        // stages are cleanly retrieved and dropped in order with the engine.
         if let Some(rx) = self.from_decode.take() {
             while let Ok(out) = rx.try_recv() {
-                if let DecodeOut::Returned(producer) = out {
+                if let DecodeOut::Returned { producer, dsp } = out {
                     self.producer = Some(producer);
+                    self.dsp = dsp;
                 }
             }
         }

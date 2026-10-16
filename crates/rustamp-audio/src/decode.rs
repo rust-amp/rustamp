@@ -108,7 +108,6 @@ pub(crate) enum DecodeMsg {
 }
 
 /// Reports, decode thread -> engine.
-#[derive(Debug)]
 pub(crate) enum DecodeOut {
     /// A track was opened and its first frame is about to be written.
     TrackStarted {
@@ -168,8 +167,76 @@ pub(crate) enum DecodeOut {
     },
     /// The thread has exited.
     Stopped,
-    /// The ring's write end, handed back so the engine can start another run.
-    Returned(Producer<f32>),
+    /// The ring's write end and the user-installed DSP chain, handed back so
+    /// the engine can start another run without losing installed stages.
+    Returned {
+        /// The ring's write end.
+        producer: Producer<f32>,
+        /// Installed DSP chain (with any per-run stages stripped).
+        dsp: Vec<Box<dyn DspStage>>,
+    },
+}
+
+impl std::fmt::Debug for DecodeOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeOut::TrackStarted {
+                index,
+                src,
+                duration_frames,
+                duration_ms,
+                metadata,
+                stream,
+                timeline_start,
+                seekable,
+            } => f
+                .debug_struct("TrackStarted")
+                .field("index", index)
+                .field("src", src)
+                .field("duration_frames", duration_frames)
+                .field("duration_ms", duration_ms)
+                .field("metadata", metadata)
+                .field("stream", stream)
+                .field("timeline_start", timeline_start)
+                .field("seekable", seekable)
+                .finish(),
+            DecodeOut::Seeked {
+                seq,
+                epoch,
+                timeline_pos,
+            } => f
+                .debug_struct("Seeked")
+                .field("seq", seq)
+                .field("epoch", epoch)
+                .field("timeline_pos", timeline_pos)
+                .finish(),
+            DecodeOut::TrackEnded { skipped, frames } => f
+                .debug_struct("TrackEnded")
+                .field("skipped", skipped)
+                .field("frames", frames)
+                .finish(),
+            DecodeOut::FormatChanged { from, to, stream } => f
+                .debug_struct("FormatChanged")
+                .field("from", from)
+                .field("to", to)
+                .field("stream", stream)
+                .finish(),
+            DecodeOut::EndOfStream { timeline_end } => f
+                .debug_struct("EndOfStream")
+                .field("timeline_end", timeline_end)
+                .finish(),
+            DecodeOut::Error { kind, message } => f
+                .debug_struct("Error")
+                .field("kind", kind)
+                .field("message", message)
+                .finish(),
+            DecodeOut::Stopped => write!(f, "Stopped"),
+            DecodeOut::Returned { dsp, .. } => f
+                .debug_struct("Returned")
+                .field("dsp_stages_len", &dsp.len())
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Everything the decode thread needs.
@@ -224,8 +291,11 @@ pub(crate) fn spawn(
         .spawn(move || {
             worker.run(start_index, start_at);
             let producer = worker.take_ring();
+            // Drop index 0 (the per-run Equalizer stage inserted by start_run) so
+            // only the caller's installed DSP stages are returned to the engine.
+            let dsp = worker.take_user_dsp();
             let _ = worker.tx.send(DecodeOut::Stopped);
-            let _ = worker.tx.send(DecodeOut::Returned(producer));
+            let _ = worker.tx.send(DecodeOut::Returned { producer, dsp });
         })
         .expect("spawning the decode thread");
     (handle, vis_rx)
@@ -339,6 +409,16 @@ impl Worker {
     /// Hand the ring's write end back (used when the thread exits).
     fn take_ring(&mut self) -> Producer<f32> {
         std::mem::replace(&mut self.ring, RingBuffer::<f32>::new(1).0)
+    }
+
+    /// Hand the user-installed DSP stages back, removing the per-run Equalizer
+    /// that was inserted at index 0 by `Engine::start_run`.
+    fn take_user_dsp(&mut self) -> Vec<Box<dyn DspStage>> {
+        let mut dsp = std::mem::take(&mut self.dsp);
+        if !dsp.is_empty() {
+            dsp.remove(0);
+        }
+        dsp
     }
 
     /// Configure the DSP chain, the converter and the tap for a new track.
