@@ -44,8 +44,8 @@ use rustamp_gfx::Image;
 use rustamp_ipc::{Message, Transport};
 use rustamp_output::{NullClock, NullOutput, default_output};
 use rustamp_ui::{
-    Key, MainWindow, MainWindowLayout, MainWindowState, Modifiers, ShortcutOutcome, frame_size,
-    render_main_window, volume_percent,
+    Key, MainWindow, MainWindowLayout, MainWindowState, Modifiers, PlaylistDialog, ShortcutOutcome,
+    frame_size, render_main_window, volume_percent,
 };
 
 use crate::cli::OutputChoice;
@@ -277,6 +277,21 @@ impl App {
     /// Drains the accumulated notes (unimplemented commands, fallbacks).
     pub fn drain_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
+    }
+
+    /// Asks the app to open one of the playlist window's dialogs (S06 §4).
+    ///
+    /// The spec settles the dialogs' existence and titles and fixes no dialog
+    /// behaviour beyond that, so this records the spec'd title through the
+    /// existing dialog-stub path and opens no window: dialog internals are
+    /// intentionally not implemented here. Returns the title the real dialog
+    /// must carry.
+    pub fn request_playlist_dialog(&mut self, dialog: PlaylistDialog) -> &'static str {
+        let title = dialog.title();
+        self.note(format!(
+            "open dialog \"{title}\" ({dialog:?}): the dialog is not implemented yet"
+        ));
+        title
     }
 
     /// Asks the app to exit (the window's close button).
@@ -1289,5 +1304,24 @@ mod tests {
         app.submit(Command::Quit).unwrap();
         let events: Vec<Event> = observer.try_iter().collect();
         assert!(events.contains(&Event::Quit), "{events:?}");
+    }
+
+    #[test]
+    fn playlist_dialog_requests_carry_the_spec_titles_and_open_no_window() {
+        // S06 §4: the spec fixes the dialog titles and no dialog behaviour
+        // beyond that, so the app records the request and opens nothing.
+        let (mut app, _dir) = app_with_file(None);
+        assert_eq!(
+            app.request_playlist_dialog(PlaylistDialog::AddFiles),
+            "Add file(s) to playlist"
+        );
+        assert_eq!(
+            app.request_playlist_dialog(PlaylistDialog::LoadPlaylist),
+            "Load Playlist"
+        );
+        let notes = app.drain_notes();
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("Add file(s) to playlist"), "{notes:?}");
+        assert!(notes[1].contains("Load Playlist"), "{notes:?}");
     }
 }

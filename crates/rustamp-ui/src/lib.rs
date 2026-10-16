@@ -21,6 +21,9 @@
 //! * [`render::render_main_window`] paints one RGBA frame through
 //!   [`rustamp_gfx`], falling back per spec **S17** when a skin lacks a sheet.
 //! * [`widget::hit_test`] maps a window-relative point to a [`widget::Widget`].
+//! * [`playlist::PlaylistWindow`] is the headless playlist-editor behaviour of
+//!   spec **S06**: list selection, page scrolling, REM removal and the
+//!   bottom-bar dialog requests (titles only, no dialog internals).
 //! * [`presenter::MainWindowPresenter`] is the thin `winit`/`softbuffer`
 //!   window used by the `main_window` example; it owns the clock.
 //!
@@ -35,6 +38,7 @@ pub mod docking;
 pub use docking as geometry;
 pub use docking as windows;
 pub mod layout;
+pub mod playlist;
 pub mod presenter;
 pub mod render;
 pub mod shortcuts;
@@ -54,6 +58,11 @@ pub use docking::{
 };
 pub use layout::{
     DOUBLE_HEIGHT, DOUBLE_WIDTH, MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH,
+};
+pub use playlist::{
+    ADD_DIALOG_TITLE, BUTTON_BAND_BOTTOM, BUTTON_BAND_TOP, LIST_SELECT_POINT, LOAD_DIALOG_TITLE,
+    PAGE_STEP_ROWS, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog, PlaylistWindow,
+    ScrollDirection, VISIBLE_ROWS, button_hit_range, has_window_menu_button, hit_test_button,
 };
 pub use presenter::{MainWindowPresenter, PresenterError, map_key, map_key_code, map_modifiers};
 pub use render::{frame_size, render_main_window};
