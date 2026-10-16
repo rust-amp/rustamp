@@ -15,6 +15,7 @@
 use rustamp_gfx::{BitmapFont, GlyphMap, Image, Rect};
 use rustamp_skin::{Sheet, Skin, webamp};
 
+use crate::docking::{WindowKind, window_size};
 use crate::layout::{MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH};
 use crate::state::{MainWindowState, MonoStereo, TransportButton, TransportState, WindowButton};
 
@@ -39,17 +40,13 @@ const DIGIT_NAMES_EX: [&str; 10] = [
 ];
 
 /// The frame size a state renders to, including the double-size scale.
+///
+/// Delegates to [`docking::window_size`] (single source of truth, S05 §1.1 and
+/// §2.1). The shaded-plus-double-size combination (550 × 28, the 275 × 14 shade
+/// frame scaled 2x) is open in S05, which never measures it; it is preserved
+/// here so the size matches the painted frame (see [`docking::window_size`]).
 pub fn frame_size(state: &MainWindowState) -> (u32, u32) {
-    let (w, h) = if state.windowshade {
-        (WINDOW_WIDTH, SHADE_HEIGHT)
-    } else {
-        (WINDOW_WIDTH, WINDOW_HEIGHT)
-    };
-    if state.double_size {
-        (w * 2, h * 2)
-    } else {
-        (w, h)
-    }
+    window_size(WindowKind::Main, state.windowshade, state.double_size)
 }
 
 /// Renders one RGBA frame for `state`.
@@ -722,5 +719,25 @@ mod tests {
         assert_eq!(frame_size(&state), (550, 28));
         state.windowshade = false;
         assert_eq!(frame_size(&state), (550, 232));
+    }
+
+    #[test]
+    fn shaded_double_size_matches_the_painted_frame_s05_silent() {
+        // S05 never measures shade plus double-size together (§1.1 is 1x, §2.1
+        // is unshaded): this pins the preserved scaled-shade behaviour (550 x
+        // 28) and the delegation, so the next lane cannot regress it silently.
+        // Agreement with the painted frame itself is covered by the corpus
+        // test (`frame_size == frame dimensions` for all four combinations).
+        use crate::docking::{WindowKind, window_size};
+        let state = MainWindowState {
+            windowshade: true,
+            double_size: true,
+            ..MainWindowState::default()
+        };
+        assert_eq!(frame_size(&state), (550, 28));
+        assert_eq!(
+            frame_size(&state),
+            window_size(WindowKind::Main, true, true)
+        );
     }
 }

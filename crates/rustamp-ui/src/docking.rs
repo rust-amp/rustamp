@@ -191,14 +191,15 @@ impl DockedStack {
     }
 
     /// Toggles the main window's double-size and re-flows the stack (S05 §2.1,
-    /// §5). The size change is a state change, not a render.
+    /// §5). The size change is a state change, not a render. The shaded-plus-
+    /// double-size size is open (see [`window_size`); S05 never measures the
+    /// combination), so the shaded size scales too and the stored rectangle
+    /// always matches [`window_size`].
     pub fn set_main_double_size(&mut self, double_size: bool) {
         self.main.double_size = double_size;
-        if !self.main.shaded {
-            let (w, h) = window_size(WindowKind::Main, false, double_size);
-            self.main.width = w;
-            self.main.height = h;
-        }
+        let (w, h) = window_size(WindowKind::Main, self.main.shaded, double_size);
+        self.main.width = w;
+        self.main.height = h;
         self.reflow();
     }
 
@@ -242,11 +243,27 @@ impl DockedStack {
 /// * Playlist editor double-size: 275 × 116, unchanged (S05 §2.1, settled).
 /// * Windowshade height for the equalizer/playlist is 14 px per S01 §1, but their
 ///   shade drawings are open (S05 §1.5); the size is stated, the pixels are not.
+///
+/// S05 never measures shade and double-size together (the shade size in §1.1 is
+/// measured at 1x, the double-size sizes in §2.1 are measured unshaded, and §9
+/// lists no probe for the combination), so the shaded-plus-double-size main size
+/// below is **open**, not settled: it preserves the renderer's long-standing
+/// scaled-shade behaviour (the 275 × 14 shade frame scaled 2x to 550 × 28) so
+/// that the docked size and the painted frame agree. A capture that would settle
+/// it: shade the main window while double-size is on (or toggle double-size
+/// while shaded) and read the re-resolved client size, mirroring the `b1`/`e1`
+/// probes of §8.1.
 pub fn window_size(kind: WindowKind, shaded: bool, double_size: bool) -> (u32, u32) {
     match kind {
         WindowKind::Main => {
             if shaded {
-                (WINDOW_WIDTH, SHADE_HEIGHT) // S05 §1.1: 275 x 14
+                if double_size {
+                    // Open (S05 silent on the combination): scaled shade, kept so
+                    // `render::frame_size` matches the painted frame.
+                    (DOUBLE_WIDTH, SHADE_HEIGHT * 2) // 550 x 28
+                } else {
+                    (WINDOW_WIDTH, SHADE_HEIGHT) // S05 §1.1: 275 x 14
+                }
             } else if double_size {
                 (DOUBLE_WIDTH, DOUBLE_HEIGHT) // S05 §2.1: 550 x 232
             } else {
@@ -347,6 +364,9 @@ pub const DEFAULT_PLAYLIST_POSITION: WindowPosition = WindowPosition { x: 26, y:
 
 /// Classic window sizes (S05 §1.1, §2.1, S01 §1).
 pub const SHADED_MAIN_SIZE: (u32, u32) = (WINDOW_WIDTH, SHADE_HEIGHT); // 275 x 14
+/// Main window shaded *and* double-sized: the scaled shade (S05 silent on the
+/// combination; kept so the docked size matches the painted frame).
+pub const SHADED_DOUBLE_MAIN_SIZE: (u32, u32) = (DOUBLE_WIDTH, SHADE_HEIGHT * 2); // 550 x 28
 pub const DOUBLE_MAIN_SIZE: (u32, u32) = (DOUBLE_WIDTH, DOUBLE_HEIGHT); // 550 x 232
 pub const DOUBLE_EQUALIZER_SIZE: (u32, u32) = (DOUBLE_WIDTH, DOUBLE_HEIGHT); // 550 x 232
 pub const PLAYLIST_UNCHANGED_SIZE: (u32, u32) = (WINDOW_WIDTH, WINDOW_HEIGHT); // 275 x 116
@@ -543,8 +563,27 @@ mod tests {
     #[test]
     fn window_shade_size_is_275_x_14_s05_1_1() {
         assert_eq!(window_size(WindowKind::Main, true, false), (275, 14));
-        assert_eq!(window_size(WindowKind::Main, true, true), (275, 14));
+        assert_eq!(window_size(WindowKind::Main, true, false), SHADED_MAIN_SIZE);
         assert_eq!(SHADE_HEIGHT, 14);
+    }
+
+    #[test]
+    fn shaded_plus_double_size_main_is_the_scaled_shade_s05_silent() {
+        // S05 never measures the combination (§1.1 is 1x, §2.1 is unshaded):
+        // this pins the preserved scaled-shade behaviour (550 x 28) so the
+        // docked size and the painted frame agree. A shaded-while-doubled
+        // client-size capture (S05 §9 method) would settle it.
+        assert_eq!(window_size(WindowKind::Main, true, true), (550, 28));
+        assert_eq!(
+            window_size(WindowKind::Main, true, true),
+            SHADED_DOUBLE_MAIN_SIZE
+        );
+        let mut stack = DockedStack::default_launch();
+        stack.set_main_double_size(true);
+        stack.set_main_shaded(true);
+        assert_eq!(stack.main.size(), (550, 28));
+        // The stack re-flows to the scaled shade's bottom edge (29 + 28 = 57).
+        assert_eq!(stack.equalizer.y, 57);
     }
 
     #[test]
