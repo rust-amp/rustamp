@@ -117,11 +117,16 @@ Step 'copying the staged capture tree into the guest'
 # Real media for jobs that need a playing track (the owner's archive copy on
 # the host, never modified there): staged as-is so a job can load a guest path
 # like C:\rustamp\testmedia\jingle-rockdown.mp3. Absent means jobs that need
-# media refuse loudly instead of measuring an empty list.
+# media refuse loudly instead of measuring an empty list. The broker only
+# copies from under the staging root, so the media passes through staging
+# first (a blind copy like everything else).
 $mediaDir = 'D:\code\rustamp-testmedia'
 if (Test-Path $mediaDir) {
     Step 'copying real test media into the guest (read-only copies)'
-    & $broker -Op copyin -Source $mediaDir -Dest 'C:\rustamp\testmedia' -TimeoutSeconds 600 | Out-Null
+    $mediaStage = Join-Path $StageRoot 'testmedia'
+    if (Test-Path $mediaStage) { Remove-Item -Recurse -Force $mediaStage }
+    Copy-Item $mediaDir $mediaStage -Recurse -Force
+    & $broker -Op copyin -Source $mediaStage -Dest 'C:\rustamp\testmedia' -TimeoutSeconds 600 | Out-Null
 } else {
     Write-Host '    no real test media on the host; media-dependent jobs will refuse'
 }

@@ -133,11 +133,16 @@ Step 'copying the staged tree into the guest'
 # Real test media (copied once from the owner's archive, never modified there):
 # if the directory exists on the host it is staged as-is, so tests that opt in
 # via RUSTAMP_TESTDATA find real decodable files in the guest. Absent means
-# those tests skip, exactly as on a machine without the archive.
+# those tests skip, exactly as on a machine without the archive. The broker
+# only copies from under the staging root, so the media passes through a
+# staging copy first (a blind copy like everything else).
 $mediaDir = 'D:\code\rustamp-testmedia'
 if (Test-Path $mediaDir) {
     Step 'copying real test media into the guest (read-only copies)'
-    & $broker -Op copyin -Source $mediaDir -Dest 'C:\rustamp\testmedia' -TimeoutSeconds 600 | Out-Null
+    $mediaStage = Join-Path (Split-Path $Stage) 'testmedia'
+    if (Test-Path $mediaStage) { Remove-Item -Recurse -Force $mediaStage }
+    Copy-Item $mediaDir $mediaStage -Recurse -Force
+    & $broker -Op copyin -Source $mediaStage -Dest 'C:\rustamp\testmedia' -TimeoutSeconds 600 | Out-Null
 } else {
     Write-Host '    no real test media on the host; media-dependent tests will skip'
 }
