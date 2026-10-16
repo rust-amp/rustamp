@@ -37,6 +37,22 @@ messages (and, for pressed and dragged states, with guarded real input inside th
 sandbox window); the rows that could not be reproduced are withdrawn or marked
 provisional below.
 
+Volume-key step (measured 2026-10-16, run `20261016-052152`, job
+`o5-o6-o7-o10-o15.json`, 61 steps / 58 ok): posted `WM_COMMAND` 40058 (up) and
+40059 (down) to `Winamp v1.x` change the volume by 4 core units on the `0..=255`
+scale, read back through `WM_USER` id 122 (`wParam = -666` query): five consecutive
+read-backs are `o10_readvol_4` = 4, `o10_readvol_8` = 8, `o10_readvol_12` = 12,
+`o10_readvol_8b` = 8 and `o10_readvol_4b` = 4; seeded at 253, `o10_readvol_255a`
+= 255 (+2, partial end step) and `o10_readvol_255b` = 255 (0, saturated); seeded
+at 2, `o10_readvol_0a` = 0 (-2, partial end step) and `o10_readvol_0b` = 0
+(saturated). Because posting carries no key press, this measures the command's
+effect; the key-to-id binding (Up/Num8 -> 40058, Down/Num2 -> 40059) is not
+re-measured by it and stays as the resource table has it. The shipped constant
+`VOLUME_STEP = 4` now rests on this measurement instead of the earlier claim,
+which carried no capture behind it (see `docs/rfc/0005-app-commands.md` section 8
+and section 17 (O10); `notes/2026-10-16-wm-command-o5-o6-o7-o10-o15-reconstructed.md`;
+audit `o5-o6-o7-o10-o15-remeasured.md`, section 1).
+
 The four tables are the main window, the playlist editor, the equalizer and a global
 set. Where a key appears in more than one table it maps to the same command, except for
 a small number of conflicts noted below. How the tables combine when a non-main window
@@ -82,7 +98,7 @@ conflict) is **provisional**.
 | Alt+V | 40328 | Toggle video window | menu |
 | Shift+V | 40147 | Stop with fadeout | menu |
 | Num. | 40194 | Jump to file | menu |
-| Down | 40059 | Volume down | provisional |
+| Down | 40059 | Volume down | command (step 4; binding not re-measured) |
 | F1 | 40041 | About box | menu |
 | F3 | 40318 | Playlist search (unconfirmed) | provisional |
 | Ctrl+F4 | 40224 | Close the focused window | provisional |
@@ -92,18 +108,18 @@ conflict) is **provisional**.
 | Num0 | 40029 | Open file(s) | menu |
 | Ctrl+Num0 | 40185 | Open location | menu |
 | Num1 | 40197 | 10 tracks back | menu |
-| Num2 | 40059 | Volume down | provisional |
+| Num2 | 40059 | Volume down | command (step 4; binding not re-measured) |
 | Num3 | 40195 | 10 tracks forward | menu |
 | Num4 | 40044 | Previous track | command |
 | Num5 | 40045 | Play | command |
 | Num6 | 40048 | Next track | command |
 | Num7 | 40061 | Rewind 5 seconds | menu |
-| Num8 | 40058 | Volume up | provisional |
+| Num8 | 40058 | Volume up | command (step 4; binding not re-measured) |
 | Num9 | 40060 | Forward 5 seconds | menu |
 | Alt+Enter | 40337 | Toggle video fullscreen | provisional |
 | Right | 40060 | Forward 5 seconds | menu |
 | Ctrl+Tab | 40063 | Switch to the next window | provisional |
-| Up | 40058 | Volume up | provisional |
+| Up | 40058 | Volume up | command (step 4; binding not re-measured) |
 | Ctrl+W | 40064 | Toggle windowshade | command |
 | Alt+W | 40258 | Show the main window | menu |
 | X | 40045 | Play | command |
@@ -189,13 +205,13 @@ conflict) is **provisional**.
 | Num0 | 1032 | Add file(s) | menu |
 | Ctrl+Num0 | 1039 | Add location | menu |
 | Num1 | 40197 | 10 tracks back | menu |
-| Num2 | 40059 | Volume down | provisional |
+| Num2 | 40059 | Volume down | command (step 4; binding not re-measured) |
 | Num3 | 40195 | 10 tracks forward | menu |
 | Num4 | 40044 | Previous track | command |
 | Num5 | 40045 | Play | command |
 | Num6 | 40048 | Next track | command |
 | Num7 | 40061 | Rewind 5 seconds | menu |
-| Num8 | 40058 | Volume up | provisional |
+| Num8 | 40058 | Volume up | command (step 4; binding not re-measured) |
 | Num9 | 40060 | Forward 5 seconds | menu |
 | Alt+Enter | 40337 | Toggle video fullscreen | provisional |
 | Ctrl+Tab | 40063 | Switch to the next window | provisional |
@@ -251,8 +267,8 @@ Ctrl/Alt combinations listed above; they are in the same table.
 | Alt+V | 40328 | Toggle video window | menu |
 | Shift+V | 40147 | Stop with fadeout | menu |
 | Num. | 40194 | Jump to file | menu |
-| Down | 40059 | Volume down | provisional |
-| Up | 40058 | Volume up | provisional |
+| Down | 40059 | Volume down | command (step 4; binding not re-measured) |
+| Up | 40058 | Volume up | command (step 4; binding not re-measured) |
 | F1 | 40041 | About box | menu |
 | F3 | 40318 | Playlist search (unconfirmed) | provisional |
 | Ctrl+F4 | 40224 | Close the equalizer | provisional |
