@@ -265,14 +265,7 @@ auditor re-measured):
    loaded multi-entry list (order, stability, selection after sort,
    duplicates/dead handling) was never driven. Settle with a posted click on
    a menu item inside a captured popup plus before/after list captures.
-2. **Q5 — Double-click semantics.** **Provisional, not settled.** R1 double
-   (step 24 vs 23: 4465 px, bbox (6,4)-(271,93), title band included) differs
-   unexplained from R2 double (step 27 vs 26: 3077 px, bbox (12,23)-(254,93),
-   list band only); the auditor cross-check (`027` vs `025` = 364 px, bounds
-   (12,25)-(68,70)) is consistent with the double clearing the single-click
-   highlight back near baseline, but whether a double click plays, edits or
-   opens file info is not established from counts alone. The reading's
-   row-level claims are OCR-uncertain.
+2. **Q5 — Double-click semantics.** S03 §5 claims the effect as **verified** (double-click a playlist entry → play that entry), based on resource-table and menu-label evidence. S06's pixel-count runs (R1: 4465 px via step 24 vs 23, R2: 3077 px via step 27 vs 26, bbox (12,23)-(254,93) list band only) differ unexplainedly and could not establish the playback action from counts alone; the auditor cross-check (`027` vs `025` = 364 px, bounds (12,25)-(68,70)) is consistent with the double clearing the single-click highlight back near baseline, but whether a double click plays, edits or opens file info is not established from counts alone. The row-level claims are OCR-uncertain. Following the evidence hierarchy, S03's resource-table-verified claim governs; S06 should cite S03 §5 for the double-click plays behaviour. What would overturn S03's verdict: a sandbox run that measures IPC playback state (`IPC_ISPLAYING`) in conjunction with the double-click.
 3. **Q6 — Drag semantics.** **Provisional, not settled.** Both drags (R1 step
    25, R2 step 28: 4932 px, bbox (6,4)-(271,93)) include the title band, so
    the capture mixes activation/focus with the drag effect — an

@@ -30,6 +30,27 @@ clicks, so every claim it produced about click-driven behaviour was re-checked h
 with window messages (or with guarded real input inside the sandbox window). Claims
 that could not be reproduced are withdrawn and listed under open questions.
 
+## 0. How to read this spec
+
+Evidence grades used:
+
+| Grade | Meaning |
+|---|---|
+| **settled** | Direct measurement in a sandboxed 2.95 run, with the step or capture named |
+| **provisional** | Measured, but its meaning is not established; the missing piece is named |
+| **open** | No evidence of any kind; the capture that would settle it is named |
+| **visual reading** | A string, row label or shape read from a capture by eye or by OCR, not produced by the comparator |
+| **corroboration** | Two independent measurements agreeing, where neither alone would settle the point |
+
+Runs interpreted here (all at dpi as recorded; landmark gate passed in each):
+
+| Run | Job | Result |
+|---|---|---|
+| `20261016-055602` | End-of-list measurement (17/17 steps ok, landmark gate passed) | Settled end-of-list state: indicator stopped, `IPC_ISPLAYING = 0`, time, kbps/kHz and mono/stereo all stopped, on the last entry, via the open-error skip path. `eol_state`, `eol_stable`, `eol_play_after`, `sac_before`, `sac_arm`, `sac_arm2` share one SHA-256 (`D25CE145F8DD26D2…`). The whole run yields only three distinct window frames. |
+| Other claims in §§2–7 | 2026-10-14 audit session | Claims verified by driving the running 2.95 with window messages and guarded real input inside the sandbox window. No individually named run IDs per claim; methods per claim are stated but without gate verdicts or step tables. |
+
+---
+
 ---
 
 ## 1. Transport state machine

@@ -3,10 +3,10 @@ Spec ID: S-07
 Title: Equalizer interior, value laws, presets, band steps and EQ/DSP chain order
 Sources consulted (category only): dirty room: binary behaviour capture (sandbox runs below); dirty room: shipped skin assets (test input); dirty room: existing audited specs S01 (rounds 2, 3, 3b, held-states run), S02 and S03; dirty room: audit note held-states-interpretation.md; docs/HANDOFF.md §§5 and 12 (12.12, 12.13, 12.15, 12.16); docs/rfc/0005-app-commands.md §16 (O10, O11); free: webamp (cross-check only)
 Author agent: dirty-room S-agent (draft) with spec-editor pass over the held-states run
-Auditor: pending (Spec Auditor pass not yet performed)
-Audit date: pending
+Auditor: Spec Auditor (dirty room)
+Audit date: 2026-10-16
 Winamp version validated against: 2.95 (winamp.exe SHA-256 bca7a9fe1626b487d1b47bb5210670cf572d1a4cce23062076641d583b268561, extracted from winamp295.exe SHA-256 ef1423999cbefd4f2a3a98acee2b194a4260268cb4517abda9f12963e866b7e5)
-Status: draft (held-states run 20261016-050228 interpreted; pending Spec Auditor pass)
+Status: audited
 ---
 
 # S07 — Equalizer interior, value laws, presets, band steps and chain order

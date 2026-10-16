@@ -726,8 +726,9 @@ sprites) are never read. The pale cyan is filler in unblitted areas, not a key.
 ## 7. Open questions
 
 1. **Window-button pressed states.** §2.4 and §6 establish that the buttons are part of
-   the title bar body sprite, but the pressed variant of each of the four buttons was not
-   captured; which pixels change while a button is held is open.
+   the title bar body sprite; which pixels change while a button is held **are resolved by
+   S02 §7**, which measures the held cells (menu (0,9), minimize (9,9), close (18,9), shade (9,18)),
+   closing this open question.
 2. **Which title bar is "focused".** Resolved for the main window (focused variant
    (27, 0), unfocused (27, 15)) and by round 2 for the equalizer ((0, 134) focused,
    (0, 149) unfocused) and the playlist (focused title band = sheet rows 0–19, unfocused

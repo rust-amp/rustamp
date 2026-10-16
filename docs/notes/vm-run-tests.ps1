@@ -36,7 +36,13 @@ if (-not $SkipBuild) {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $json = & cargo test --workspace --all-features --no-run --message-format=json 2>$null
+    $buildExit = $LASTEXITCODE
     $ErrorActionPreference = $previous
+    # A build that fails part way still emits artifacts for what it managed to
+    # compile, so a silent failure would quietly shrink the set of binaries that
+    # get run - and a run that covers fewer tests would still report "green".
+    # The build must therefore succeed, and the count must be plausible.
+    if ($buildExit -ne 0) { throw "cargo test --no-run failed with exit $buildExit; nothing is trustworthy until it builds" }
     $testExes = @()
     foreach ($line in $json) {
         if ($line -isnot [string]) { continue }
