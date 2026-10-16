@@ -8,6 +8,7 @@
 //! Licensed `MIT OR Apache-2.0` (RFC 0004).
 
 mod commands;
+pub mod control;
 pub mod host_window;
 pub mod ipc;
 pub mod message_loop;
