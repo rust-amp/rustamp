@@ -824,7 +824,7 @@ impl App {
     ///
     /// The UI machine has already applied its S02 prediction, so these go
     /// straight to the engine and the app (no second prediction).
-    fn forward(&mut self, commands: &[Command]) -> Result<()> {
+    pub(crate) fn forward(&mut self, commands: &[Command]) -> Result<()> {
         for command in commands {
             self.apply_from(command, true);
         }
