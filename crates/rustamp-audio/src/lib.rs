@@ -22,7 +22,7 @@
 //! ## Pipeline
 //!
 //! ```text
-//! decode thread:  Decoder -> [DspStage]* -> FormatConverter -> rtrb::Producer
+//! decode thread:  Decoder -> Equalizer (S07) -> [DspStage]* -> FormatConverter -> rtrb::Producer
 //! output thread:  rtrb::Consumer -> volume/balance -> OutputDevice
 //! caller thread:  Engine (commands, events, audio clock, vis tap)
 //! ```

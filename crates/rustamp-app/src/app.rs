@@ -582,9 +582,8 @@ impl App {
     /// The engine owns transport, position, duration, volume, balance, the
     /// queue (length and current index), the stream and stop-after-current;
     /// the app owns shuffle/repeat (the engine deliberately reports `false`)
-    /// and the stable entry ids (the engine reports `None`). The equalizer is
-    /// the flat default until S07/M2 gives the engine a stage (finding F1 in
-    /// [`crate::host`]).
+    /// and the stable entry ids (the engine reports `None`). The equalizer
+    /// state is the engine's, which owns the S07 stage.
     pub fn host_player_state(&mut self) -> PlayerState {
         let mut state = self.engine.state();
         // App-owned modes: the engine does not track them (RFC 0001 / S15).
@@ -1017,11 +1016,9 @@ impl App {
             }
             C::AddItems { items, at, play } => self.add_items(items, *at, *play),
             C::SetBand { .. } | C::SetPreamp(_) | C::SetEqEnabled(_) | C::SetEqAuto(_) => {
-                self.note(
-                    "the equalizer engine stage is not implemented yet (S07/M2; the window \
-                     prediction stands)"
-                        .to_string(),
-                );
+                // The window shows its own prediction; the signal side is the
+                // engine's equalizer stage, which receives the same command
+                // (every command is forwarded to `Engine::apply`).
             }
             C::Remove(_)
             | C::Clear

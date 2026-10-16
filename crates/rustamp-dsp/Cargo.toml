@@ -10,3 +10,8 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+
+[dev-dependencies]
+# The S09 anchor tests reuse the measured dB -> 0..63 conversion of the state
+# bridge instead of restating it (in-workspace, no new external crate).
+rustamp-plughost = { path = "../rustamp-plughost" }

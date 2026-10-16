@@ -4,5 +4,12 @@
 //! Winamp-style 10-band equalizer and preamp (spec S07), resampler and
 //! limiter, as DspStage implementations.
 //!
-//! Skeleton (milestone M0). Codes against the frozen contracts in
-//! [`rustamp_core`]; see `docs/rfc/0001-core-contracts.md`.
+//! Codes against the frozen contracts in [`rustamp_core`]; see
+//! `docs/rfc/0001-core-contracts.md`. The equalizer is [`eq::Equalizer`]; the
+//! resampler and the limiter are not implemented yet.
+
+#![warn(missing_docs)]
+
+pub mod eq;
+
+pub use eq::{BAND_CENTERS_HZ, BAND_Q, EqControl, Equalizer};

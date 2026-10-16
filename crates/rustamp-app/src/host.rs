@@ -54,14 +54,14 @@
 //!   (id 126 mode 1; `None` stream or `None` bitrate means 0).
 //! * `engine` stream channels -> `state.stream.channels` -> `surface.channels`
 //!   (id 126 mode 2; `None` stream means 0).
-//! * [`EqState::default`] (flat 0 dB; finding F1 below) -> `state.eq.bands` ->
-//!   `surface.eq_bands` (id 127 selectors 0..=9).
-//! * [`EqState::default`] preamp -> `state.eq.preamp` -> `surface.eq_preamp`
+//! * `engine` equalizer bands -> `state.eq.bands` -> `surface.eq_bands`
+//!   (id 127 selectors 0..=9).
+//! * `engine` equalizer preamp -> `state.eq.preamp` -> `surface.eq_preamp`
 //!   (id 127 selector 10).
-//! * [`EqState::default`] disabled -> `state.eq.enabled` -> `surface.eq_enabled`
+//! * `engine` equalizer enabled -> `state.eq.enabled` -> `surface.eq_enabled`
 //!   (id 127 selector 11).
-//! * [`EqState::default`] no autoload -> `state.eq.auto` ->
-//!   `surface.eq_autoload` (id 127 selector 12).
+//! * `engine` equalizer autoload -> `state.eq.auto` -> `surface.eq_autoload`
+//!   (id 127 selector 12).
 //! * `App::shuffle` (app-owned; the engine deliberately reports `false`, RFC
 //!   0001 / S15) -> `state.shuffle` -> `surface.shuffle` (ids 250/252).
 //! * `App::repeat` (same) -> `state.repeat` -> `surface.repeat` (ids 251/253).
@@ -71,12 +71,12 @@
 //!   (the engine reports `None`) -> `state.current_id` -> carried, but the
 //!   bridge maps no surface field from it and no measured id reads it.
 //!
-//! Finding F1: the app cannot supply real equalizer state yet. The engine has
-//! no EQ stage until S07/M2 (the app logs EQ commands as unimplemented), so
-//! the snapshot carries [`EqState::default`] — flat 0 dB bands and preamp,
-//! disabled, no autoload — which the bridge renders as the flat classic value
-//! 31. Those are the honest defaults, not invented values, and they need no
-//! protocol change (the fields exist).
+//! The equalizer mapping is live: the engine owns the S07 stage (see
+//! `rustamp_dsp::eq` and `rustamp_audio::Engine::eq`), so `state.eq` carries the
+//! real bands, preamp, enabled and autoload. The app forwards the `SetBand`,
+//! `SetPreamp`, `SetEqEnabled` and `SetEqAuto` commands to the engine and no
+//! longer logs them as unimplemented. An untouched player still publishes the
+//! flat, disabled default, which the bridge renders as the classic value 31.
 //!
 //! # Cadence and cost
 //!
@@ -645,7 +645,8 @@ mod tests {
         assert!(snapshot.repeat);
         // ...and no invented entry id for an empty queue.
         assert_eq!(snapshot.current_id, None);
-        // No EQ stage yet (finding F1): honest flat defaults.
+        // The engine's equalizer is untouched here, so its published state is
+        // still the honest flat, disabled default.
         assert_eq!(snapshot.eq, EqState::default());
         // The message built from the app carries exactly that snapshot.
         let Message::PlayerStateUpdate(boxed) = app.player_state_update() else {

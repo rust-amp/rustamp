@@ -12,7 +12,7 @@ use common::{Harness, SPEC, expected, pattern, track_frames};
 use rustamp_core::bus::command_channel;
 use rustamp_core::command::Command;
 use rustamp_core::event::Event;
-use rustamp_core::state::TransportState;
+use rustamp_core::state::{EqState, TransportState};
 
 const TRACK_A: &str = "track1_3000.tst";
 const TRACK_B: &str = "track2_3000.tst";
@@ -612,4 +612,85 @@ fn the_engine_ignores_the_app_level_commands() {
     }
     assert_eq!(h.engine.transport(), TransportState::Playing);
     assert_eq!(h.engine.current_index(), Some(0));
+}
+
+#[test]
+fn eq_commands_drive_the_published_state() {
+    let mut h = Harness::new(&[LONG_A]);
+    assert_eq!(h.engine.state().eq, EqState::default());
+    for command in [
+        Command::SetBand {
+            band: 0,
+            gain_db: 6.0,
+        },
+        // Clamped to the engine's +-12 dB.
+        Command::SetBand {
+            band: 3,
+            gain_db: 40.0,
+        },
+        // Out of range band: ignored.
+        Command::SetBand {
+            band: 10,
+            gain_db: 5.0,
+        },
+        Command::SetPreamp(-3.0),
+        // Non-finite: keeps the previous preamp.
+        Command::SetPreamp(f32::NAN),
+        Command::SetEqEnabled(true),
+        Command::SetEqAuto(true),
+    ] {
+        assert!(h.engine.apply(&command).is_ok(), "{command:?}");
+    }
+    let eq = h.engine.state().eq;
+    assert_eq!(
+        eq.bands,
+        [6.0, 0.0, 0.0, 12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    );
+    assert_eq!(eq.preamp, -3.0);
+    assert!(eq.enabled);
+    assert!(eq.auto);
+    assert_eq!(h.engine.eq(), eq);
+}
+
+/// Record `frames` left-channel frames of `LONG_A` from the start of a run,
+/// with the engine's EQ set to `eq` before playback.
+fn record_left_with_eq(eq: EqState, frames: u64) -> (u64, Vec<f32>) {
+    let mut h = Harness::new(&[LONG_A]);
+    h.engine.set_eq(eq);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    let p0 = h
+        .wait_refilled(4096)
+        .expect("the ring must fill at the start of the run");
+    let mut rec = Vec::new();
+    h.clock.pump_record(frames, &mut rec);
+    (p0, rec.iter().step_by(2).copied().collect())
+}
+
+#[test]
+fn flat_enabled_eq_is_bit_transparent_through_the_engine() {
+    let eq = EqState {
+        enabled: true,
+        ..EqState::default()
+    };
+    let (p0, left) = record_left_with_eq(eq, 1024);
+    assert_eq!(&left[..], &expected(1, p0, 1024)[..]);
+}
+
+#[test]
+fn the_preamp_reaches_the_rendered_audio() {
+    let eq = EqState {
+        preamp: -6.0,
+        enabled: true,
+        ..EqState::default()
+    };
+    let (p0, left) = record_left_with_eq(eq, 1024);
+    let factor = 10.0_f64.powf(-6.0 / 20.0);
+    for (got, source) in left.iter().zip(expected(1, p0, 1024)) {
+        let want = f64::from(source) * factor;
+        assert!(
+            (f64::from(*got) - want).abs() < 1e-6,
+            "got {got}, want {want}"
+        );
+    }
 }

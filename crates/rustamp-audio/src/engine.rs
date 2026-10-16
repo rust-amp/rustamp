@@ -28,12 +28,33 @@
 //! writes the first post-seek frame, so the position lands exactly on the
 //! target (frame-accurate, not time-rounded).
 //!
+//! # The equalizer (S07)
+//!
+//! The engine owns the equalizer state ([`EqState`], driven by the `SetBand`,
+//! `SetPreamp`, `SetEqEnabled` and `SetEqAuto` commands and published in
+//! [`PlayerState::eq`]) and a lock-free [`EqControl`] it writes that state
+//! into. Every run puts a fresh [`Equalizer`] reading that control **first** in
+//! the decode thread's DSP chain, so per block of decoded audio:
+//!
+//! ```text
+//! decoder -> preamp -> 10 bands -> [installed DspStage]* -> vis tap
+//!         -> FormatConverter -> ring -> volume/balance (render callback) -> device
+//! ```
+//!
+//! This is S07 §10's position "EQ on the decoded PCM before the final output
+//! scaling". That any further DSP stage sees the **post-EQ** stream, and that
+//! the vis tap sees the equalized signal, is the provisional choice named
+//! here (S07 O11 stays open). A change reaches the ear after the ring's
+//! buffered audio (the ring holds about 370 ms by default), because the stage
+//! runs on the producer side of the ring. The default state (flat, disabled)
+//! is a bit-exact bypass, so the stage is inert until the equalizer is used.
+//!
 //! # Not in this milestone
 //!
-//! EQ (S07), out_ds-style fades and prebuffering (S18), ReplayGain, crossfade,
-//! the S08 vis derivation, and the playlist model (the engine only holds a
-//! queue of re-openable sources and reports indices). See the task card and the
-//! report for task card A1.
+//! out_ds-style fades and prebuffering (S18), ReplayGain, crossfade, the S08
+//! vis derivation, and the playlist model (the engine only holds a queue of
+//! re-openable sources and reports indices). See the task card and the report
+//! for task card A1.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -49,8 +70,9 @@ use rustamp_core::command::Command;
 use rustamp_core::error::{Error, ErrorInfo, ErrorKind, Result};
 use rustamp_core::event::Event;
 use rustamp_core::meta::TrackMetadata;
-use rustamp_core::state::{EqState, PlayerState, StreamInfo, TransportState};
+use rustamp_core::state::{EQ_BANDS, EqState, PlayerState, StreamInfo, TransportState};
 use rustamp_core::vis::VisFrame;
+use rustamp_dsp::{EqControl, Equalizer};
 
 use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, clamped_index, spawn};
 use crate::ring::{GainState, RingSync, make_render};
@@ -109,6 +131,10 @@ pub struct Engine {
     started: bool,
     vis_rx: Option<Consumer<VisFrame>>,
     dsp: Vec<Box<dyn DspStage>>,
+    /// Equalizer state as published in [`PlayerState::eq`].
+    eq: EqState,
+    /// Where [`Engine::eq`] reaches the running [`Equalizer`] stage.
+    eq_control: Arc<EqControl>,
     /// The ring's write end, parked here while no run is active.
     producer: Option<Producer<f32>>,
 
@@ -181,6 +207,8 @@ impl Engine {
             started: false,
             vis_rx: None,
             dsp: Vec::new(),
+            eq: EqState::default(),
+            eq_control: Arc::new(EqControl::default()),
             producer: Some(producer),
             to_decode: None,
             from_decode: None,
@@ -346,9 +374,42 @@ impl Engine {
             current_id: None,
             playlist_len: self.queue.len() as u32,
             stream: self.stream,
-            eq: EqState::default(),
+            eq: self.eq,
             stop_after_current: self.stop_after_current,
         }
+    }
+
+    /// Current equalizer state.
+    pub fn eq(&self) -> EqState {
+        self.eq
+    }
+
+    /// Replace the whole equalizer state (for example a loaded preset).
+    ///
+    /// Gains are clamped to `±`[`EqState::MAX_GAIN_DB`]; a non-finite gain
+    /// keeps the previous value of that slot. The running stage picks the new
+    /// state up on its next block and slews to it (see `rustamp_dsp::eq`).
+    pub fn set_eq(&mut self, eq: EqState) {
+        let mut next = self.eq;
+        for (slot, gain) in next.bands.iter_mut().zip(eq.bands) {
+            *slot = clamp_gain(gain).unwrap_or(*slot);
+        }
+        next.preamp = clamp_gain(eq.preamp).unwrap_or(next.preamp);
+        next.enabled = eq.enabled;
+        next.auto = eq.auto;
+        self.eq = next;
+        self.eq_control.set(&self.eq);
+    }
+
+    /// Set one band's gain in dB (`band < EQ_BANDS`; others are ignored).
+    pub fn set_eq_band(&mut self, band: u8, gain_db: f32) -> Result<()> {
+        let band = usize::from(band);
+        if band < EQ_BANDS {
+            let mut eq = self.eq;
+            eq.bands[band] = gain_db;
+            self.set_eq(eq);
+        }
+        Ok(())
     }
 
     /// Whether "stop after current track" is armed (RFC 0005 O8).
@@ -372,7 +433,7 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     /// Apply one command. Commands that do not belong to the engine (playlist,
-    /// EQ, windows) are ignored.
+    /// windows) are ignored.
     pub fn apply(&mut self, command: &Command) -> Result<()> {
         match command {
             Command::Play => self.play(),
@@ -402,6 +463,28 @@ impl Engine {
             Command::SkipBy { delta } => self.skip_by(*delta),
             Command::PlayLast => self.play_last(),
             Command::ToggleStopAfterCurrent => self.toggle_stop_after_current(),
+            Command::SetBand { band, gain_db } => self.set_eq_band(*band, *gain_db),
+            Command::SetPreamp(gain_db) => {
+                self.set_eq(EqState {
+                    preamp: *gain_db,
+                    ..self.eq
+                });
+                Ok(())
+            }
+            Command::SetEqEnabled(enabled) => {
+                self.set_eq(EqState {
+                    enabled: *enabled,
+                    ..self.eq
+                });
+                Ok(())
+            }
+            Command::SetEqAuto(auto) => {
+                self.set_eq(EqState {
+                    auto: *auto,
+                    ..self.eq
+                });
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -789,7 +872,14 @@ impl Engine {
             vis_capacity: self.cfg.vis_capacity,
             stop_after_current: self.stop_after_current,
         };
-        let dsp = std::mem::take(&mut self.dsp);
+        // The equalizer runs first, on the decoded PCM (see the module docs).
+        // A fresh stage per run starts from clean filter history; the shared
+        // control carries the settings across runs.
+        let mut dsp = std::mem::take(&mut self.dsp);
+        dsp.insert(
+            0,
+            Box::new(Equalizer::with_control(Arc::clone(&self.eq_control))),
+        );
         let (handle, vis_rx) = spawn(cfg, dsp, ring, index, start_at, ctl_rx, out_tx);
         self.to_decode = Some(ctl_tx);
         self.from_decode = Some(out_rx);
@@ -856,6 +946,14 @@ impl Engine {
             duration_ms: self.duration_ms,
         });
     }
+}
+
+/// Clamp an equalizer gain to the engine's range; `None` for a non-finite
+/// gain, which cannot be applied honestly.
+fn clamp_gain(gain_db: f32) -> Option<f32> {
+    gain_db
+        .is_finite()
+        .then(|| gain_db.clamp(-EqState::MAX_GAIN_DB, EqState::MAX_GAIN_DB))
 }
 
 impl Drop for Engine {
