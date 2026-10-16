@@ -8,14 +8,23 @@ approved way to turn pixels into quoted labels.
 **Recommendation up front:** use the built-in Windows OCR API
 (`Windows.Media.Ocr`, WinRT) through the small `Ocr.exe` helper below.
 It is already present, works offline, needs no install, and is proven on
-real captures from this project (§1, §5). Anything else needs owner
-approval first (§1, §7).
+real captures from this project (§1, §5). The canonical binary is
+`D:\code\tools\ocr\Ocr.exe`, built from the repo source `tools/ocr/Ocr.cs`
+via `tools/ocr/Build-Ocr.ps1` (§2a). Text-Grab is installed now and tested
+(§2d): handy for a quick plain-text read, but it prints no word boxes, so
+lane reports still go through `Ocr.exe`.
 
 **Provenance of this document.** Every claim marked [RAN] was executed
 on 2026-10-16 against run `20261016-081527` with the commands in §2.
 Nothing was installed, downloaded, or run in a sandbox; no reference
 binary was executed; `rustamp-research\extracted\` and `rustamp-refbin`
 were not touched.
+
+**Update 2026-10-16.** The helper source now lives in the repo
+(`tools/ocr/Ocr.cs`, byte-identical to the former §A listing) and builds to
+the canonical `D:\code\tools\ocr\Ocr.exe` (6144 bytes) [RAN]; Text-Grab
+4.15.0's `--windowless` file CLI was verified on a locally rendered probe
+PNG (no research capture touched, no window opened) [RAN].
 
 ---
 
@@ -25,7 +34,7 @@ were not touched.
 |---|---|---|---|---|---|---|
 | Built-in `Windows.Media.Ocr` via `Ocr.exe` (§2) | No | Yes — OS API + Windows SDK `winmd` + .NET Framework `csc.exe` all present | Yes [RAN] | OCR language pack for the target language; `en-US` worked with no extra pack [RAN] | Yes: `Ocr.exe <png>` [RAN] | **Recommended** |
 | PowerToys Text Extractor (= PowerOCR module) | No (already installed) | Yes — PowerToys `v0.101.2362.0`, `PowerToys.PowerOCR.exe` + resources present, `TextExtractor` enabled in `%LOCALAPPDATA%\Microsoft\PowerToys\settings.json`, hotkey Win+Shift+T (settings file: `win:true, shift:true, code:84`) | Yes (same WinRT engine underneath) | Same as above | **No** — interactive screen-region grab to clipboard only; no CLI that takes a PNG file | Fallback for live-screen spot checks only, not for capture files |
-| Text-Grab | **Yes** — Microsoft Store / GitHub release / `scoop` / `choco` (per its README) | No (`Get-AppxPackage *TextGrab*` empty, no exe on `PATH`) | Yes, per README ("All OCR runs entirely on your device") | WinRT mode: Windows language packs; Tesseract mode: `tessdata` files; WinAI mode: Copilot+ PC + Store install | Yes — `Text-Grab.exe --windowless "file path"` and bulk folder mode, per README | Best fit **if** installed (same engine + real file CLI), but installing is forbidden to lanes → **ask the owner** (§7) |
+| Text-Grab 4.15.0 | No (already installed: `text-grab` on `PATH`, Store package `JosephFinney.Text-Grab`) | Yes | Yes (same WinRT engine; README: "All OCR runs entirely on your device") | WinRT mode: Windows language packs (`en-US` worked with no extra pack [RAN]) | Yes — `text-grab --windowless "<png>"` copies plain text to the clipboard, no window [RAN §2d] | Quick plain-text reads and spot checks; **not** a lane workflow — no stdout, no word boxes (§2d) |
 | MiniSnip | **Yes** — Store or portable exe from GitHub releases (per its README) | No | Yes ("never connects to the internet") | OCR language pack, e.g. admin `Add-WindowsCapability -Online -Name Language.OCR~~~en-US~0.0.1.0` (per its README) | **No** — hotkey `Ctrl+Shift+C` snip → clipboard or `Downloads\minisnip_OCR.txt` | Same engine, not scriptable → no advantage over §2; needs a download → **ask the owner** (§7) |
 | Standalone Tesseract | **Yes** | No (`where.exe tesseract` finds nothing) | Yes | `tessdata` files | Yes | Out of scope: install forbidden, and nothing in this project needs it |
 
@@ -37,11 +46,18 @@ Notes:
   Extractor"). None of them recognises anything the §2 helper cannot;
   they only differ in install cost and scriptability. That is why the
   built-in API wins: identical recognition, zero install, file-capable.
+- Text-Grab `--windowless` and `Ocr.exe` were run on the same locally
+  rendered probe PNG (474×81, two Arial 16 px lines) [RAN 2026-10-16]:
+  both read the text correctly, but Text-Grab copies only the plain
+  concatenated text to the clipboard (no stdout, no boxes) while `Ocr.exe`
+  prints `LINE:`/`WORD[…]` records to stdout. Same words, different
+  scriptability — which is why the recommendation stands (§2d).
 - What "already present" was verified with (all read-only): `Test-Path
   "$env:ProgramFiles\PowerToys"` → True; `PowerToys.PowerOCR.exe` and
   per-locale `PowerToys.PowerOCR.resources.dll` files listed;
-  TextExtractor settings read; `where.exe` misses for `tesseract` and
-  `Text-Grab`; `OcrEngine.TryCreateFromLanguage("en-US")` returned a
+  TextExtractor settings read; `where.exe` misses for `tesseract`;
+  `text-grab` resolves on `PATH` (Store package, version 4.15.0) [RAN
+  2026-10-16]; `OcrEngine.TryCreateFromLanguage("en-US")` returned a
   working engine [RAN — every OCR run below used it].
 - Prior art in this project: lane `s06r` (`rustamp-lanes\s06r\audits\S06-reading.md`)
   compiled `Ocr.cs` against `Windows.winmd` and read the MISC popup, the
@@ -64,31 +80,30 @@ New-Item -ItemType Directory -Force $Work | Out-Null
 
 ### 2a. Recommended: build the helper once, run it on any PNG
 
-The helper source (`Ocr.cs`, 6 KB, prints `TEXT_START…TEXT_END`,
-`LINE:` and `WORD[x,y,w,h]:` records) is reproduced verbatim in §A.
-Save it as `$Work\Ocr.cs`, then compile with the .NET Framework
-compiler that ships with Windows (no SDK project, no NuGet, no
-network) [RAN — exit 0, only a benign CS1701 version warning]:
+The helper source lives in the repo at `tools/ocr/Ocr.cs` (6 KB, prints
+`TEXT_START…TEXT_END`, `LINE:` and `WORD[x,y,w,h]:` records; formerly
+reproduced verbatim in §A). Build the canonical binary with the .NET
+Framework compiler that ships with Windows (no SDK project, no NuGet, no
+network) [RAN 2026-10-16 — exit 0, only the benign CS1701 version
+warning, `Ocr.exe` 6144 bytes]:
 
 ```powershell
-& "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /t:exe `
-  "/out:$Work\Ocr.exe" `
-  "/r:C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.19041.0\Windows.winmd" `
-  "/r:C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.7.2\Facades\System.Runtime.dll" `
-  "/r:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Runtime.WindowsRuntime.dll" `
-  "$Work\Ocr.cs"
+powershell -ExecutionPolicy Bypass -File tools\ocr\Build-Ocr.ps1
 ```
 
-Run it on a capture [RAN — output quoted in §5]:
+This writes `D:\code\tools\ocr\Ocr.exe` (created if missing; override with
+`-OutputDir`). The script fails loudly if the Windows SDK facade it needs
+is missing. Use the canonical binary for every lane read:
 
 ```powershell
-& "$Work\Ocr.exe" "$Cap\019_pe_misc_popup.png"
-& "$Work\Ocr.exe" "$Cap\007_pe_add_dialog.png"
-& "$Work\Ocr.exe" "$Cap\025_pe_list_single_before.png"
+& "D:\code\tools\ocr\Ocr.exe" "$Cap\019_pe_misc_popup.png"
+& "D:\code\tools\ocr\Ocr.exe" "$Cap\007_pe_add_dialog.png"
+& "D:\code\tools\ocr\Ocr.exe" "$Cap\025_pe_list_single_before.png"
 ```
 
-A freshly built binary reproduces the reference outputs byte-for-byte
-[RAN — §5 example 1 was re-run with a clean-room rebuild].
+(Output quoted in §5 [RAN].) A freshly built binary reproduces the
+reference outputs byte-for-byte [RAN — §5 example 1 was re-run with a
+clean-room rebuild].
 
 ### 2b. Crop + magnify, then OCR (small rows — always do this)
 
@@ -122,14 +137,23 @@ paste the clipboard result somewhere, and transcribe it by hand into
 the `verbatim / [uncertain]` format of §4. Prefer §2a/§2b whenever the
 file exists — which, for lanes, is always.
 
-### 2d. If the owner approves an install: Text-Grab (not tested here)
+### 2d. Text-Grab file CLI (installed, tested — spot checks only)
+
+Text-Grab 4.15.0 is installed (`text-grab` on `PATH`) and its file CLI was
+verified on a locally rendered probe PNG [RAN 2026-10-16 — the text landed
+on the clipboard, no window opened, nothing printed to stdout]:
 
 ```powershell
-Text-Grab.exe --windowless "D:\code\rustamp-research\tools\vm-capture\_runs\<run>\captures\<file>.png"
+text-grab --windowless "D:\code\rustamp-research\tools\vm-capture\_runs\<run>\captures\<file>.png"
+Get-Clipboard   # the recognised plain text is here, not on stdout
 ```
 
-Unverified on this machine (install forbidden to lanes). Approval
-question is in §7.
+Use it for a quick human spot check of one file. Do **not** use it for lane
+reads: it returns only the plain concatenated text (no `LINE:`/`WORD[…]`
+records, so no row attribution per §3/§4), and clipboard output is fragile
+in automation. Lane reports still go through §2a. Bulk folder mode
+(`Text-Grab.exe "<folder>"`) opens an Edit Text window — a GUI — so
+headless lanes must not use it.
 
 ---
 
@@ -311,18 +335,14 @@ mask instead (as `s06r` did for the selection block):
 
 ## 7. Anything the owner would have to approve
 
-1. **Installing Text-Grab** (Store / `scoop install text-grab` /
-   `choco install text-grab`) so lanes can use
-   `Text-Grab.exe --windowless "<png>"` and bulk folder OCR. It is the
-   only candidate that is both file-scriptable and more convenient
-   than §2a — same engine, less friction. MiniSnip and standalone
-   Tesseract add nothing over §2a and are **not** recommended even with
-   approval.
-2. **A shared home for the helper.** §2a builds `Ocr.exe` into each
-   lane's own `$env:TEMP` directory today. If lanes want one canonical
-   copy (e.g. next to the vm-capture harness), that is a repo-layout
-   decision for the owner — until then, every lane rebuilds from the
-   §A source, which is proven reproducible.
+1. **Text-Grab install** — done by the owner: 4.15.0 is on `PATH` and its
+   `--windowless` file CLI is tested (§2d). No approval needed for
+   `--windowless` spot checks; bulk folder OCR opens an Edit Text window,
+   so headless lanes must not use it. MiniSnip and standalone Tesseract
+   add nothing over §2a and are **not** recommended even with approval.
+2. **A shared home for the helper** — decided and done: the source and
+   build script live in the repo (`tools/ocr/`), the canonical binary is
+   `D:\code\tools\ocr\Ocr.exe` (§2a).
 
 Nothing in this document required installing, downloading, running a
 reference binary, starting a sandbox/VM, or reading
@@ -330,51 +350,9 @@ reference binary, starting a sandbox/VM, or reading
 
 ---
 
-## A. Helper source (`Ocr.cs`)
+## A. Helper source (`tools/ocr/Ocr.cs`)
 
-Compiled exactly as shown, per §2a [RAN]. Prints text plus per-word
-bounding boxes to stdout; first CLI argument is the PNG path.
-
-```csharp
-using System;
-using System.IO;
-using Windows.Graphics.Imaging;
-using Windows.Media.Ocr;
-using Windows.Globalization;
-using Windows.Storage.Streams;
-
-class Ocr {
-  static void Main(string[] args) {
-    byte[] bytes = File.ReadAllBytes(args[0]);
-    using (var stream = new InMemoryRandomAccessStream()) {
-      using (var writer = new DataWriter(stream)) {
-        writer.WriteBytes(bytes);
-        writer.StoreAsync().AsTask().Wait();
-        writer.DetachStream();
-      }
-      stream.Seek(0);
-      var decoderTask = BitmapDecoder.CreateAsync(stream).AsTask();
-      decoderTask.Wait();
-      var decoder = decoderTask.Result;
-      var bmpTask = decoder.GetSoftwareBitmapAsync().AsTask();
-      bmpTask.Wait();
-      var bmp = bmpTask.Result;
-      var engine = OcrEngine.TryCreateFromLanguage(new Language("en-US"));
-      if (engine == null) { Console.WriteLine("no engine"); return; }
-      var ocrTask = engine.RecognizeAsync(bmp).AsTask();
-      ocrTask.Wait();
-      var result = ocrTask.Result;
-      Console.WriteLine("TEXT_START");
-      Console.WriteLine(result.Text);
-      Console.WriteLine("TEXT_END");
-      Console.WriteLine("LINES: " + result.Lines.Count);
-      foreach (var line in result.Lines) {
-        Console.WriteLine("LINE: " + line.Text);
-        foreach (var w in line.Words) {
-            Console.WriteLine(string.Format("WORD[{0},{1},{2},{3}]: {4}", (int)w.BoundingRect.Left, (int)w.BoundingRect.Top, (int)w.BoundingRect.Width, (int)w.BoundingRect.Height, w.Text));
-        }
-      }
-    }
-  }
-}
-```
+The canonical source lives in the repo at `tools/ocr/Ocr.cs` — it is
+byte-identical to the listing formerly inlined here (verified [RAN
+2026-10-16]) and builds per §2a. Prints text plus per-word bounding boxes
+to stdout; first CLI argument is the PNG path.
