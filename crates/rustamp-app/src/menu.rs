@@ -62,9 +62,12 @@ impl App {
         match self.ui_mut().dispatch_shortcut(action, now) {
             ShortcutOutcome::Commands(commands) => {
                 let emitted = commands.clone();
-                for command in &emitted {
-                    self.submit(command.clone())?;
-                }
+                // Forward exactly as the key path does: `forward` hands each
+                // command to the layer that owns it (the UI machine for its own,
+                // the engine or the app for the rest). Submitting here instead
+                // sent every command down the app channel, so a UI-owned toggle
+                // never reached the UI and its check mark never moved.
+                self.forward(&emitted)?;
                 Ok(MenuOutcome::Commands(emitted))
             }
             ShortcutOutcome::Handled => Ok(MenuOutcome::TimeDisplay(self.state().time_remaining)),
