@@ -7,6 +7,7 @@ Auditor: Spec Auditor (dirty room)
 Audit date: 2026-10-14; round-2 audits 2026-10-15 (three passes); round-3 audit 2026-10-16 (one pass), verdict PASS WITH CORRECTIONS; round-3b audit 2026-10-16 (one pass), verdict PASS WITH CORRECTIONS
 Export run (round 3): sandbox measurement run 20261016-003014 (Windows Sandbox capture host; frozen job s01r2-open.json, 136/136 steps ok)
 Export run (round 3b): sandbox measurement run 20261016-013304 (Windows Sandbox capture host; frozen job s01r2-right-edges.json, 117/117 steps ok)
+Export run (held states): sandbox measurement run 20261016-050228 (Windows Sandbox capture host; frozen job held-states.json, 69/69 steps ok)
 Winamp version validated against: 2.95 (winamp.exe SHA-256 bca7a9fe1626b487d1b47bb5210670cf572d1a4cce23062076641d583b268561, extracted from winamp295.exe SHA-256 ef1423999cbefd4f2a3a98acee2b194a4260268cb4517abda9f12963e866b7e5)
 Status: audited
 ---
@@ -20,7 +21,9 @@ renders of the real 2.95 binary or read from the skin files. Everything marked
 provisional rows as unconfirmed and do not rely on them. Rows and passages added by the
 round-2 sessions of 2026-10-15 are marked **(round 2)**; rows and passages added or
 changed by the round-3 session of 2026-10-16 are marked **(round 3)**; rows and
-passages added by the round-3b session of 2026-10-16 are marked **(round 3b)**.
+passages added by the round-3b session of 2026-10-16 are marked **(round 3b)**; rows and
+passages added or changed by the held-states run of 2026-10-16 are marked **(held-states
+run)**.
 
 Measurement method (for provenance): a screenshot of a window is compared pixel by pixel
 against a rectangle of a skin sheet; a rectangle is accepted only when the mean
@@ -56,6 +59,15 @@ selection state **14** times (`baefcc984dc5…`) and the REM-removal state **10*
 (`6ac754b2c11a…`), so a "no change" result in this round is a byte identity, not a
 threshold.
 
+(held-states run) The held-state facts below come from the held-states export run named in
+the header (a Windows Sandbox capture host, frozen job `held-states.json`, 69/69 steps ok;
+landmark gate 0,49,275,67, 0 of 18425 pixels differing; the same environment as the round-3
+and round-3b runs, `dpi=144 (150%)`, a 3050x1668 screen, a per-monitor-v2 process). The
+guest was launched with the same 60-entry reference playlist. These captures settle the
+equalizer's four held rects and the Presets held question, and the volume/balance/preamp
+laws of §3.1 are refined by them; the ones that touch this spec are restated below and the
+still-open bounds stay open. Rows and passages added or changed by this run are marked
+**(held-states run)**.
 All numbers below are for the **original Winamp base skin** (the `.wsz` that ships with
 webamp as `base-2.91`), loaded into a sandboxed 2.95. Pixel tables are skin data, not
 Winamp data: a different skin will have different pixels but the same rectangles.
@@ -255,13 +267,13 @@ Sheets used: `eqmain.bmp`, `eq_ex.bmp`.
 | Shade-mode title bar, focused | eq_ex.bmp | 0,0,275,14 | 0,0 | provisional |
 | On button | eqmain.bmp | 10,119,25,12 | 14,18 | verified (round 2; 25 px wide, not 26) |
 | On button, engaged | eqmain.bmp | 69,119,25,12 | 14,18 | verified (round 2) |
-| On button, held, not engaged | eqmain.bmp | 128,119,25,12 | 14,18 | verified (round 2) |
-| On button, held and engaged | eqmain.bmp | 187,119,25,12 | 14,18 | verified (round 2) |
+| On button, held, not engaged | eqmain.bmp | 128,119,25,12 | 14,18 | verified (round 2; (held-states run) confirms (14,18,25,12), 300/300 px) |
+| On button, held and engaged | eqmain.bmp | 187,119,25,12 | 14,18 | verified (round 2; (held-states run) confirms (14,18,25,12), 300/300 px) |
 | Auto button | eqmain.bmp | 36,119,32,12 | 40,18 | verified (round 2) |
 | Auto button, engaged | eqmain.bmp | 95,119,32,12 | 40,18 | verified (round 2) |
-| Auto button, held, not engaged | eqmain.bmp | 154,119,32,12 | 40,18 | verified (round 2) |
-| Auto button, held and engaged | eqmain.bmp | 213,119,32,12 | 40,18 | verified (round 2) |
-| Presets button | eqmain.bmp | 224,164,44,12 | 217,18 | verified |
+| Auto button, held, not engaged | eqmain.bmp | 153,119,33,12 | 39,18 | verified (round 2; (held-states run) corrects the held window footprint to (39,18,33,12)) |
+| Auto button, held and engaged | eqmain.bmp | 212,119,33,12 | 39,18 | verified (round 2; (held-states run) corrects the held window footprint to (39,18,33,12)) |
+| Presets button | eqmain.bmp | 224,164,44,12 | 217,18 | verified (round 2; (held-states run) 528/528 px of the 44x12 footprint change on a lone down and back on release; reproduces `s01r2_eq_presets_pressed_eq.png` at 0 px; the 534-px whole-window figure is a post-release difference = 528 + 6 Auto cell) |
 | Presets button, engaged | eqmain.bmp | 224,176,44,12 | 217,18 | verified (round 2) |
 | Response graph background | eqmain.bmp | 0,294,113,19 | 86,17 | verified with an explained residual (round 2; see §3.1) |
 | Slider track area | eqmain.bmp | 13,164,209,129 | 13,17 | provisional; refuted as a single blit (round 2) |
@@ -274,7 +286,11 @@ The On and Auto rows above are the four held states the earlier S01 lacked: held
 not-engaged and held-and-engaged are separate sprites per button, and the four rects are
 all drawn (round 2). The On button's drawn region is **25 px** wide, not S01's earlier 26
 px; the 26th sheet column is the separator before the Auto button and is not drawn at the
-On button's window position. Auto is 32 px wide. (Round 2.)
+On button's window position. Auto is 32 px wide for the resting/engaged rows, and its held
+footprint is (39,18,33,12): the held rows extend one sheet column to the left, into the
+separator before the Auto body, whose 12 px at x=39 change under a hold. (Round 2;
+(held-states run) corrects the held Auto window footprint from (40,18,32,12) to
+(39,18,33,12).)
 
 The slider thumb row is corrected by round 2: the drawn thumb is `eqmain.bmp`
 **(0,164,11,11)**. S01's earlier `(13,229,11,11)` is **not** a thumb; it matches the empty
@@ -373,6 +389,50 @@ are not sprite rows are collected here.
   maximum (the recorded drag target was (27,45)), so the residual is not a different
   final value.
 
+- **(held-states run) Equalizer held rects.** Posted as a lone `WM_LBUTTONDOWN` (0x201)
+  with no `WM_LBUTTONUP`, so the control stays held while the capture runs (the earlier
+  runs released the button in a `finally` before capturing; see the method note below):
+  the On button's held window footprint is **(14,18,25,12)**, 300/300 px changed,
+  measured in both the engaged and the not-engaged held state, and it matches both
+  recorded round-2 held captures at 0 px inside the footprint; the Auto button's held
+  window footprint is **(39,18,33,12)**, 395/396 px changed, in both engagement
+  states. The Auto value supersedes the round-2 working value (40,18,32,12), which
+  was one column short on the left (12 px at x=39); the render is identical to the
+  recorded captures at 0 px, so it was a width error in the footprint, not a different
+  sprite. Engagement contributes 6 px only: On at (20,24)-(22,25) and Auto at
+  (45,24)-(47,25). Both held rects reproduce the recorded round-2 held captures at
+  0 px inside the footprint.
+- **(held-states run) The 300 / 401 / 534-px figures were post-release differences,
+  not held sprites.** Decoded from the same comparison (recorded held baseline minus a
+  frame taken after the release):
+  - On held: 300 px, bounds (14,18)-(38,29) = the On sprite absent from the post-release
+    frame; nothing else changes.
+  - Auto held: 401 px, bounds (18,18)-(71,29) = 395 (the Auto sprite at the corrected
+    33-px width) + 6 (the On indicator cell at the round-2 position).
+  - Presets held: 534 px, bounds (44,18)-(260,29) = 528 (the real held sprite, a 44x12
+    footprint at (217,18)) + 6 (the Auto cell). The recorded capture
+    `s01r2_eq_presets_pressed_eq.png` is a genuine held sprite: 528 of 528 px of the
+    footprint change on a lone down and the same 528 change back on the release, and the
+    held run reproduces it at 0 px. Against its own resting equalizer the earlier
+    run differs by 0 px inside (217,18,44,12).
+  The release-in-`finally` behaviour (method note below) explains all three: they
+  were measured after the button was already up.
+- **(held-states run) Calibration.** A whole-window verdict against a fresh state is
+  dominated by a session floor of 1435 px confined to rows 4-11 (the title band); rows
+  30-115 differ by exactly 0 in every held-versus-baseline comparison. A whole-window
+  count of roughly 1400-2000 px is therefore session noise, not a sprite: read the
+  bounding box and its row profile, never the total. (The earlier prediction of
+  1700-2000 px folded the round-2 sessions' own 6-px indicator-cell difference into
+  the floor.)
+- **(held-states run) Why the earlier claim could not be tested.** A real-mouse held
+  state cannot be captured with this harness: `Invoke-RealMouseAction` releases the
+  button in a `finally` before `Invoke-Capture.ps1` captures, so any hold-time effect
+  (a held sprite, a slider's `VOLUME: n%` hint) is already gone when the frame is
+  taken; two earlier runs failed on exactly this. The fix was to post a lone
+  `WM_LBUTTONDOWN` (0x201) with no `WM_LBUTTONUP` through the `send-message`
+  primitive, leaving the control held while the capture runs. Steps and captures:
+  `on_down_*`/`on_held_*` (00-09), `auto_down_*`/`auto_held_*` (10-19) and
+  `presets_down`/`presets_held`/`presets_up` (64-66).
 ---
 
 ## 4. Playlist editor (275 x 116)
