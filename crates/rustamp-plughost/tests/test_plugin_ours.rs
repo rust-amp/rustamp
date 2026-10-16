@@ -57,8 +57,10 @@ fn our_test_plugin_exercises_the_surface_end_to_end() {
         1
     );
 
-    // 5. Handle selector: IPC_GETWND with wParam 0 returns the main window
-    //    handle the host published.
+    // 5. Handle selector: IPC_GETWND's selector 0 is the **equalizer** window,
+    //    not the main one — that is the mapping the S10 steps measured
+    //    (`s10_260_getwnd_eq/pe/mb/video`), and the surface follows it.
+    surface.eq_hwnd = host_hwnd;
     assert_eq!(
         rustamp_plughost::HostWindow::dispatch_ipc(&mut surface, 0, IPC_GETWND),
         host_hwnd
