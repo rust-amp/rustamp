@@ -6,7 +6,8 @@
 //!   - generic Windows window capture.
 //! * `ring-cross` - 32-bit/64-bit shared-memory ring check.
 //! * `plughost [--release]` - build the 32-bit plugin host.
-//! * `package` - not implemented yet.
+//! * `package [options]` - package the player (x86_64) and the plugin host
+//!   (i686) as separate artefacts, bundling the host beside the player.
 
 mod capture;
 mod package;

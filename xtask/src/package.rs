@@ -1,11 +1,17 @@
 //! `cargo xtask package` - ship the GPL player and the permissive plugin host
-//! as separate artefacts.
+//! as separate artefacts, with the host also bundled beside the player.
 //!
 //! The packaging logic lives here so that the licensing split from RFC 0004 is
 //! reflected in the produced layout: `rustamp.exe` (x86_64, GPL-3.0-or-later
 //! plus `PLUGIN-EXCEPTION.md`) and `rustamp-plughost32.exe` (i686, MIT OR
-//! Apache-2.0) never end up in the same shippable item, and the host package
-//! carries no GPL binary. A manifest records what went where.
+//! Apache-2.0) stay packageable independently, and the host-only artefact
+//! carries no GPL binary. On top of that, the **player** artefact bundles a
+//! copy of the host binary **beside `rustamp.exe`** — the exact packaged
+//! layout RFC 0006 §8 requires and the first candidate `supervise.rs`
+//! resolves — so the packaged product supervises without a heuristic search.
+//! The bundled copy changes no licence file on either side: the player
+//! directory keeps exactly the GPL set, the host directory exactly the
+//! permissive set. A manifest records what went where.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -59,6 +65,31 @@ pub fn run(args: &[String]) -> Result<(), String> {
         println!("  player target:  {} ({})", PLAYER_TARGET, PLAYER_CRATE);
         println!("  host target:    {} ({})", HOST_TARGET, HOST_CRATE);
         println!("  GPL-free check: OK (host closure contains no copyleft crate)");
+        if !parsed.player_only && !parsed.host_only {
+            println!(
+                "  player bundles host: yes ({} beside {}: RFC 0006 §8, \
+                 the first `supervise.rs` candidate)",
+                binary_name(HOST_BIN),
+                binary_name(PLAYER_BIN)
+            );
+            println!(
+                "  host-only artefact: unchanged ({} + LICENSE-MIT/APACHE, \
+                 GPL-free proof as before)",
+                binary_name(HOST_BIN)
+            );
+        } else if parsed.player_only {
+            println!(
+                "  player bundles host: no (--player-only builds no host; the \
+                 supervisor falls back to the dev-tree heuristic and stays \
+                 detached when it cannot resolve)"
+            );
+        } else {
+            println!(
+                "  host-only artefact: unchanged ({} + LICENSE-MIT/APACHE, \
+                 GPL-free proof as before; no GPL side included)",
+                binary_name(HOST_BIN)
+            );
+        }
         return Ok(());
     }
 
@@ -105,12 +136,39 @@ pub fn run(args: &[String]) -> Result<(), String> {
             &dir.join("PLUGIN-EXCEPTION.md"),
         )?;
 
-        let per_package = serde_manifest_player(profile);
+        // RFC 0006 §8 packaged layout: the helper ships next to `rustamp.exe`,
+        // which is exactly the first candidate `supervise.rs` resolves. The
+        // copy changes no licence file on either side: this directory keeps
+        // exactly the GPL set (LICENSE + PLUGIN-EXCEPTION.md), and the
+        // host-only artefact below is untouched.
+        let mut bundled_host = false;
+        if let Some(host) = &host_src {
+            let dest_host = dir.join(binary_name(HOST_BIN));
+            fs::copy(host, &dest_host).map_err(|e| format!("copy bundled host binary: {e}"))?;
+            bundled_host = true;
+        }
+
+        let per_package = serde_manifest_player(profile, bundled_host);
         fs::write(dir.join("manifest.json"), per_package)
             .map_err(|e| format!("write player manifest: {e}"))?;
 
         manifest_items.push("player".to_string());
         println!("xtask package: player -> {}", dir.display());
+        if bundled_host {
+            println!(
+                "xtask package: player bundles {} beside {} \
+                 (RFC 0006 §8; the first `supervise.rs` candidate, \
+                 licence files unchanged)",
+                binary_name(HOST_BIN),
+                binary_name(PLAYER_BIN)
+            );
+        } else {
+            println!(
+                "xtask package: note: player has no bundled host \
+                 (--player-only); the supervisor falls back to the dev-tree \
+                 heuristic and stays detached when it cannot resolve"
+            );
+        }
     }
 
     if let Some(src) = &host_src {
@@ -134,7 +192,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 
     // Top-level manifest naming what went where.
-    let top = build_top_manifest(&out_dir, profile, build_player, build_host);
+    let bundled_host = player_src.is_some() && host_src.is_some();
+    let top = build_top_manifest(&out_dir, profile, build_player, build_host, bundled_host);
     fs::write(out_dir.join("manifest.json"), top).map_err(|e| format!("write manifest: {e}"))?;
 
     println!(
@@ -206,7 +265,11 @@ fn print_help() {
     println!(
         "usage: cargo xtask package [options]\n\n\
          Build and package the GPL player and the permissive plugin host as\n\
-         separate artefacts.\n\n\
+         separate artefacts, bundling the host beside the player.\n\n\
+         The player artefact carries a copy of the plugin host binary next\n\
+         to `rustamp.exe` (RFC 0006 §8: the first `supervise.rs` candidate),\n\
+         with the licence files of each side unchanged; the host-only\n\
+         artefact stays GPL-free and shippable alone.\n\n\
          options:\n  \
          --release               release build (default)\n  \
          --debug                 debug build\n  \
@@ -370,7 +433,13 @@ fn audit_host_dir_inner(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn build_top_manifest(out_dir: &Path, profile: &str, player: bool, host: bool) -> String {
+fn build_top_manifest(
+    out_dir: &Path,
+    profile: &str,
+    player: bool,
+    host: bool,
+    bundled_host: bool,
+) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("{".to_string());
     lines.push("  \"schema_version\": 1,".to_string());
@@ -383,6 +452,19 @@ fn build_top_manifest(out_dir: &Path, profile: &str, player: bool, host: bool) -
             "    \"binary\": \"player/{}\",",
             binary_name(PLAYER_BIN)
         ));
+        if bundled_host {
+            lines.push(format!(
+                "    \"bundled_host\": \"player/{}\",",
+                binary_name(HOST_BIN)
+            ));
+            lines.push(
+                "    \"host_resolution\": \"RFC 0006 §8: beside rustamp.exe \
+                 (the first supervise.rs candidate)\","
+                    .to_string(),
+            );
+        } else {
+            lines.push("    \"bundled_host\": null,".to_string());
+        }
         lines.push(format!("    \"crate\": \"{PLAYER_CRATE}\","));
         lines.push(format!("    \"target\": \"{PLAYER_TARGET}\","));
         lines.push("    \"license\": \"GPL-3.0-or-later\", ".to_string());
@@ -425,15 +507,26 @@ fn build_top_manifest(out_dir: &Path, profile: &str, player: bool, host: bool) -
     s
 }
 
-fn serde_manifest_player(profile: &str) -> String {
+fn serde_manifest_player(profile: &str, bundled_host: bool) -> String {
+    let bundled_line = if bundled_host {
+        format!(
+            "\n  \"bundled_host\": \"{bin}\",\n  \
+             \"host_resolution\": \"RFC 0006 §8: beside rustamp.exe \
+             (the first supervise.rs candidate)\",",
+            bin = binary_name(HOST_BIN),
+        )
+    } else {
+        "\n  \"bundled_host\": null,".to_string()
+    };
     format!(
         "{{\n  \"package\": \"rustamp-player\",\n  \"profile\": \"{profile}\",\n  \
-         \"binary\": \"{bin}\",\n  \"crate\": \"{crate_}\",\n  \
+         \"binary\": \"{bin}\",{bundled}\n  \"crate\": \"{crate_}\",\n  \
          \"target\": \"{target}\",\n  \"license\": \"GPL-3.0-or-later\",\n  \
          \"license_files\": [\"LICENSE\", \"PLUGIN-EXCEPTION.md\"],\n  \
          \"gpl\": true\n}}\n",
         profile = profile,
         bin = binary_name(PLAYER_BIN),
+        bundled = bundled_line,
         crate_ = PLAYER_CRATE,
         target = PLAYER_TARGET,
     )
@@ -452,4 +545,131 @@ fn serde_manifest_host(profile: &str) -> String {
         crate_ = HOST_CRATE,
         target = HOST_TARGET,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bundled copy lands exactly on the first `supervise.rs` candidate:
+    /// the host file name placed in the player directory, i.e. beside
+    /// `rustamp.exe` (RFC 0006 §8). No build is needed to pin this: the
+    /// production copy targets `dir.join(binary_name(HOST_BIN))` where `dir`
+    /// is the player directory, and this test pins both halves.
+    #[test]
+    fn bundled_host_name_matches_the_packaged_candidate() {
+        assert_eq!(binary_name(HOST_BIN), "rustamp-plughost32.exe");
+        assert_eq!(binary_name(PLAYER_BIN), "rustamp.exe");
+        let player_dir = Path::new("player");
+        let bundled = player_dir.join(binary_name(HOST_BIN));
+        assert_eq!(bundled, Path::new("player").join("rustamp-plughost32.exe"));
+        assert_ne!(binary_name(HOST_BIN), binary_name(PLAYER_BIN));
+    }
+
+    #[test]
+    fn player_manifest_records_the_bundled_host() {
+        let with = serde_manifest_player("release", true);
+        assert!(
+            with.contains("\"bundled_host\": \"rustamp-plughost32.exe\""),
+            "{with}"
+        );
+        assert!(with.contains("RFC 0006"), "{with}");
+        // The licence set of the player artefact is unchanged by the bundle.
+        assert!(
+            with.contains("\"license_files\": [\"LICENSE\", \"PLUGIN-EXCEPTION.md\"]"),
+            "{with}"
+        );
+        assert!(!with.contains("LICENSE-MIT"), "{with}");
+        assert!(!with.contains("LICENSE-APACHE"), "{with}");
+
+        let without = serde_manifest_player("release", false);
+        assert!(without.contains("\"bundled_host\": null"), "{without}");
+        assert!(!without.contains("rustamp-plughost32"), "{without}");
+    }
+
+    #[test]
+    fn host_manifest_stays_gpl_free_and_player_free() {
+        let manifest = serde_manifest_host("release");
+        assert!(
+            manifest.contains("\"contains_gpl_binary\": false"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("\"license_files\": [\"LICENSE-MIT\", \"LICENSE-APACHE\"]"),
+            "{manifest}"
+        );
+        assert!(!manifest.contains("rustamp.exe"), "{manifest}");
+        assert!(!manifest.contains("PLUGIN-EXCEPTION"), "{manifest}");
+    }
+
+    #[test]
+    fn top_manifest_names_the_bundled_host_only_when_bundled() {
+        let both = build_top_manifest(Path::new("out"), "release", true, true, true);
+        assert!(
+            both.contains("\"binary\": \"player/rustamp.exe\""),
+            "{both}"
+        );
+        assert!(
+            both.contains("\"bundled_host\": \"player/rustamp-plughost32.exe\""),
+            "{both}"
+        );
+        // The host-only block is unchanged by the bundle.
+        assert!(
+            both.contains("\"binary\": \"host/rustamp-plughost32.exe\""),
+            "{both}"
+        );
+
+        let player_only = build_top_manifest(Path::new("out"), "release", true, false, false);
+        assert!(
+            player_only.contains("\"bundled_host\": null"),
+            "{player_only}"
+        );
+        assert!(!player_only.contains("\"host\""), "{player_only}");
+
+        let host_only = build_top_manifest(Path::new("out"), "release", false, true, false);
+        assert!(!host_only.contains("rustamp.exe"), "{host_only}");
+        assert!(
+            host_only.contains("\"binary\": \"host/rustamp-plughost32.exe\""),
+            "{host_only}"
+        );
+        assert!(!host_only.contains("bundled_host"), "{host_only}");
+    }
+
+    #[test]
+    fn arg_scopes_stay_mutually_exclusive_with_sane_defaults() {
+        let parsed = parse_args(&[]).expect("empty args parse");
+        assert!(parsed.release);
+        assert!(!parsed.player_only && !parsed.host_only);
+        let player_only = parse_args(&["--player-only".to_string()]).expect("player-only parses");
+        assert!(player_only.player_only);
+        assert!(parse_args(&["--player-only".to_string(), "--host-only".to_string()]).is_err());
+    }
+
+    /// The host-side GPL-free proof is unchanged: a directory holding the
+    /// player binary (or any foreign executable) still fails the audit, while
+    /// a directory holding only the host binary passes. Filesystem-only, no
+    /// child is spawned and no window can appear.
+    #[test]
+    fn host_audit_still_rejects_any_gpl_side_binary() {
+        let base = std::env::temp_dir().join(format!(
+            "rustamp-package-audit-{}-{}",
+            std::process::id(),
+            "gpl-side"
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create temp audit dir");
+        fs::write(base.join(binary_name(HOST_BIN)), b"host").expect("write host stub");
+        assert!(audit_host_dir(&base).is_ok());
+        fs::write(base.join(binary_name(PLAYER_BIN)), b"player").expect("write player stub");
+        assert!(audit_host_dir(&base).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copyleft_probe_still_catches_gpl_without_flagging_permissive() {
+        assert!(is_copyleft("GPL-3.0-only"));
+        assert!(is_copyleft("Apache-2.0 AND GPL-2.0"));
+        assert!(!is_copyleft("MIT OR Apache-2.0"));
+        assert!(!is_copyleft("MIT"));
+    }
 }
