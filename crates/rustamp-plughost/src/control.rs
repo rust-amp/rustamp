@@ -351,11 +351,14 @@ mod tests {
     #[cfg(windows)]
     fn creates_the_real_host_window_vm_only() {
         crate::host_window::require_test_vm();
-        let mut surface = IpcSurface::new();
-        let window = crate::host_window::HostWindow::create(&mut surface)
+        let surface = IpcSurface::new();
+        let window = crate::host_window::HostWindow::create(surface)
             .expect("the VM creates the host window");
         assert_ne!(window.hwnd_raw(), 0);
-        assert_eq!(surface.main_hwnd, window.hwnd_raw() as u32);
+        assert_eq!(
+            window.snapshot().unwrap().main_hwnd,
+            window.hwnd_raw() as u32
+        );
         window.destroy();
     }
 }

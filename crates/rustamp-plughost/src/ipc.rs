@@ -463,7 +463,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: false,
         evidence_run: "R2/R3/B2",
         evidence_step: "s10_800_sadatafunc",
-        note: "Stable pointer 0x00434200 across three launches; meaning open (S10 3.9c, 5.12).",
+        note: "Reference-only address 0x00434200 recorded across three launches; never a host runtime pointer. Runtime unsupported (reply 1) until a host-owned implementation is audited (S10 5.3, 8.3, 13.3).",
     },
     IpcRow {
         id: 801,
@@ -885,7 +885,9 @@ impl IpcSurface {
             }
             502 => IpcAnswer::Value(1),
             666 => IpcAnswer::Value(1),
-            800 => IpcAnswer::Value(4_407_808),
+            // Recorded address belongs to the reference process; its meaning is
+            // unaudited. Never return it as a pointer into this host process.
+            800 => IpcAnswer::NeedsPluginDll { id },
             801 => IpcAnswer::Value(1),
             900 => IpcAnswer::Value(1),
             999 => IpcAnswer::Value(1),
@@ -954,6 +956,19 @@ mod tests {
         // The probes measured as unsupported also report 1.
         for id in [1u32, 9999, u32::MAX] {
             assert_eq!(lookup_table(id).unwrap().measured_value, Some(1));
+        }
+    }
+
+    #[test]
+    fn spectrum_entry_point_never_returns_the_reference_address() {
+        let row = lookup_table(800).expect("measured reference row");
+        assert_eq!(row.measured_value, Some(4_407_808));
+        let mut surface = IpcSurface::new();
+        for argument in [0, 1, -666, i64::MAX] {
+            let answer = surface.answer(800, argument);
+            assert_eq!(answer, IpcAnswer::NeedsPluginDll { id: 800 });
+            assert_eq!(answer.raw(), UNKNOWN_REPLY);
+            assert_ne!(Some(answer.raw()), row.measured_value);
         }
     }
 

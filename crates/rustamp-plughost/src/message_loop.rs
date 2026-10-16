@@ -2,9 +2,9 @@
 //!
 //! The surface (M3a) and the message loop (this module) are deliberately
 //! separate: the surface is a pure Rust answering table that needs no OS
-//! objects, so its unit tests construct one directly, and the tests for this
-//! module exercise [`dispatch_message`] / [`pump_once`] against a surface that
-//! never touches a real window handle.
+//! objects, so its unit tests construct one directly. Headless tests exercise
+//! [`dispatch_message`] against standalone state. Message-pump entry points
+//! take a shared [`HostWindow`] owner and hold no surface borrow during OS calls.
 //!
 //! ## Threading (S09 sections 3.6, 5.3, 7.2)
 //!
@@ -56,9 +56,11 @@ pub fn dispatch_message(
 
 /// Process at most one queued message without blocking.  Returns `true` while
 /// the loop should continue, `false` on `WM_QUIT` (or if a platform error
-/// occurs).  Intended for tests and for cooperative hosts.
+/// occurs). Intended for cooperative hosts. The UI-thread owner is shared;
+/// no mutable surface borrow spans PeekMessageW, TranslateMessage or dispatch,
+/// any of which can deliver reentrant window messages.
 #[cfg(windows)]
-pub fn pump_once(surface: &mut IpcSurface) -> bool {
+pub fn pump_once(_window: &HostWindow) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, TranslateMessage};
 
     let mut m = windows::Win32::UI::WindowsAndMessaging::MSG::default();
@@ -79,57 +81,51 @@ pub fn pump_once(surface: &mut IpcSurface) -> bool {
     if m.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
         return false;
     }
+    // SAFETY: m is initialized by PeekMessageW; no surface borrow is alive.
     unsafe {
         let _ = TranslateMessage(&m);
         DispatchMessageW(&m);
     }
-    // Keep the surface referenced even if no message used it, so the signature
-    // stays honest; GetMessage handling performs the actual mutation.
-    let _ = surface;
     true
 }
 
 #[cfg(not(windows))]
-pub fn pump_once(surface: &mut IpcSurface) -> bool {
-    let _ = surface;
+pub fn pump_once(_window: &HostWindow) -> bool {
     true
 }
 
-/// Blocking message loop.  Runs until `WM_QUIT`.  Call on the UI thread only.
+/// Blocking UI-thread message loop until `WM_QUIT`, without a surface borrow.
 #[cfg(windows)]
-pub fn run(surface: &mut IpcSurface) {
+pub fn run(_window: &HostWindow) {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, TranslateMessage,
     };
     let mut m = windows::Win32::UI::WindowsAndMessaging::MSG::default();
     loop {
+        // SAFETY: m is writable; the shared owner keeps state alive without a borrow.
         let ret = unsafe { GetMessageW(&mut m, None, 0, 0) };
         if ret.0 == 0 || ret.0 == -1 {
             break;
         }
+        // SAFETY: m holds the retrieved message; no surface borrow spans dispatch.
         unsafe {
             let _ = TranslateMessage(&m);
             let _ = DispatchMessageW(&m);
         }
     }
-    // Keep the surface alive across the loop so plugin-thread senders that
-    // reach its window procedure find it published.
-    let _ = surface;
 }
 
 #[cfg(not(windows))]
-pub fn run(surface: &mut IpcSurface) {
-    let _ = surface;
-}
+pub fn run(_window: &HostWindow) {}
 
 /// Run the loop once per queued message until it drains, without blocking.
 /// Useful in tests and in hosts that drive their own scheduler.
-pub fn drain(surface: &mut IpcSurface) {
+pub fn drain(window: &HostWindow) {
     // One pass only: this host library never busy-spins on an empty queue.
-    let _ = pump_once(surface);
+    let _ = pump_once(window);
 }
 
 /// Convenience alias the host binary uses.
-pub fn run_message_loop(surface: &mut IpcSurface) {
-    run(surface)
+pub fn run_message_loop(window: &HostWindow) {
+    run(window)
 }

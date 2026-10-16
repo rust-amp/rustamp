@@ -62,8 +62,6 @@ use rustamp_plughost::control::{self, ControlExit};
 #[cfg(windows)]
 use rustamp_plughost::message_loop;
 #[cfg(windows)]
-use rustamp_plughost::state_bridge;
-#[cfg(windows)]
 use rustamp_plughost::{HostWindow, IpcSurface};
 #[cfg(windows)]
 use rustamp_proto::state::PlayerState;
@@ -93,8 +91,8 @@ fn run() -> i32 {
 /// Create the host window, serve the control channel, run until shutdown.
 #[cfg(windows)]
 fn run_windows() -> i32 {
-    let mut surface = IpcSurface::new();
-    let _window = match HostWindow::create(&mut surface) {
+    let surface = IpcSurface::new();
+    let window = match HostWindow::create(surface) {
         Ok(window) => window,
         Err(error) => {
             eprintln!("rustamp-plughost32: cannot create host window: {error}");
@@ -118,7 +116,7 @@ fn run_windows() -> i32 {
         exit
     });
 
-    run_ui_loop(&mut surface, state_rx, &reader_done);
+    run_ui_loop(&window, state_rx, &reader_done);
 
     // The UI loop only leaves after the reader set the flag (nothing else
     // destroys the window), so the reader has returned and joining cannot
@@ -137,23 +135,27 @@ fn run_windows() -> i32 {
 /// the loop applies anything that arrived with the shutdown itself.
 #[cfg(windows)]
 fn run_ui_loop(
-    surface: &mut IpcSurface,
+    window: &HostWindow,
     state_rx: mpsc::Receiver<PlayerState>,
     reader_done: &AtomicBool,
 ) {
     loop {
         for state in state_rx.try_iter() {
-            state_bridge::apply_player_state(surface, &state);
+            window
+                .apply_player_state(&state)
+                .expect("UI state updates do not reenter surface access");
         }
         if reader_done.load(Ordering::SeqCst) {
             break;
         }
-        if !message_loop::pump_once(surface) {
+        if !message_loop::pump_once(window) {
             break;
         }
         std::thread::sleep(UI_POLL);
     }
     for state in state_rx.try_iter() {
-        state_bridge::apply_player_state(surface, &state);
+        window
+            .apply_player_state(&state)
+            .expect("UI state updates do not reenter surface access");
     }
 }
