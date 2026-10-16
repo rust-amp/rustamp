@@ -154,6 +154,19 @@ different display facts are never compared.
 4. Only after all three pass is the guest accepted as the capture host, and
    only then does the dirty room move its campaigns there.
 
+## 8. The ignored winit window tests run in the interactive session
+
+The capture path above is not the only GUI work the VM hosts. The four
+ignored winit window tests (`eq_window`, `main_menu`, `playlist_window`, the
+windowed `headless` case) panic in session 0, where the broker's guest
+sessions land - they need the auto-logon console desktop. That path is
+documented separately in [`vm-gui-session.md`](vm-gui-session.md): the host
+stages the same tree unelevated, the allow-listed guest script
+`run-gui-session.ps1` registers a one-shot Interactive-session task (the
+`register-broker-task.ps1` precedent, pointed at the console session), and
+the run proves its session id, user and window client sizes back to the host
+via the existing `copyout` op. A run that lands in session 0 fails loudly.
+
 ## 7. Findings (things this change needs from outside its owned paths)
 
 - **Broker registration is the owner's step.** The `copyout` op is written
