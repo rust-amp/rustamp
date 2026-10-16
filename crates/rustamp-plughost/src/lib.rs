@@ -11,6 +11,7 @@ mod commands;
 pub mod host_window;
 pub mod ipc;
 pub mod message_loop;
+pub mod state_bridge;
 
 pub use commands::{
     DROPPED, Disposition, PUBLIC_IDS, TABLE as WM_COMMAND_TABLE, command_for_id, disposition,
