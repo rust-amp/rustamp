@@ -60,10 +60,16 @@ if ($screen.Width -ne 1024 -or $screen.Height -ne 768) {
 
 # --- 3. one job through the harness entry point --------------------------------
 # Same bootstrap command the sandbox LogonCommand ran, with the staged paths
-# remapped from the sandbox mappings to the VM staging root. The harness
-# itself performs the 1:1 gate (client rect 275x116, capture 275x116, 0-px
-# landmark plus SHA-256) and refuses on mismatch; this script does not
-# second-guess it, it records the outcome.
+# remapped from the sandbox mappings to the VM staging root: the harness
+# defaults to C:\rustamp-research, C:\winamp295 and C:\winamp, none of which
+# exists here, so without these switches it dies with an environment failure
+# before creating a run directory. The harness itself performs the 1:1 gate
+# (client rect 275x116, capture 275x116, 0-px landmark plus SHA-256) and
+# refuses on mismatch; this script does not second-guess it, it records the
+# outcome. -OutDir points straight at this run's output directory, so the
+# captures, the manifest and DONE.json land where the hashing step and the
+# broker copyout expect them; -NoLogoff because there is no host folder
+# mapping to release in the VM (results return via copyout, not via a share).
 if (-not (Test-Path $CaptureRoot)) { throw "nothing staged at $CaptureRoot" }
 $bootstrap = Join-Path $CaptureRoot 'tools\vm-capture\sandbox-bootstrap.ps1'
 $jobFile = Join-Path $CaptureRoot ("tools\vm-capture\jobs\" + $Job + ".json")
@@ -72,7 +78,11 @@ if (-not (Test-Path $jobFile)) { throw "job file not staged: $jobFile" }
 if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 $null = New-Item -ItemType Directory -Force -Path $OutDir
 Show 'harness exit' 'running...'
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrap -Job $jobFile -NoLogoff
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrap -Job $jobFile -NoLogoff `
+    -ResearchRoot $CaptureRoot `
+    -ReferenceRoot (Join-Path $CaptureRoot 'winamp295') `
+    -InstallRoot 'C:\rustamp\winamp' `
+    -OutDir $OutDir
 $harnessExit = $LASTEXITCODE
 Show 'harness exit' $harnessExit
 # The transcript is written before the refusal below, so a later diagnostic
