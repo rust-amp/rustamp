@@ -1,13 +1,14 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! Spawn and supervision for `rustamp-plughost32` (RFC 0006 out-of-process hosting).
 //!
-//! [`crate::host::HostStateLink`] is the sending side of the player-state
-//! bridge: it publishes [`PlayerState`](rustamp_core::state::PlayerState)
-//! snapshots as [`Message::PlayerStateUpdate`](rustamp_ipc::Message) over the
-//! **existing** framed control channel, and it deliberately spawns nothing.
-//! This module is the process around that link: it finds the i686 host binary,
-//! starts it, connects its control channel to the link, and re-attaches (or
-//! restarts) when the host dies.
+//! [`crate::host::HostStateLink`] owns the player-state bridge and the
+//! `Hello`/`Ping` liveness: it publishes
+//! [`PlayerState`](rustamp_core::state::PlayerState) snapshots as
+//! [`Message::PlayerStateUpdate`](rustamp_ipc::Message) over the **existing**
+//! framed control channel, polls what the host writes back, and it
+//! deliberately spawns nothing. This module is the process around that link:
+//! it finds the i686 host binary, starts it, connects its control channel to
+//! the link, and re-attaches (or restarts) when the host dies.
 //!
 //! # Path (RFC 0006 §8)
 //!
@@ -31,10 +32,14 @@
 //! * **Never block the player.** [`Supervisor::supervise`] is called from
 //!   [`App::pump`](crate::app::App::pump), i.e. off the audio path. It only
 //!   ever calls the non-blocking [`Child::try_wait`], never a blocking read:
-//!   the link's transports are send-only from the app side (a failed send
-//!   detaches the link as [`PublishOutcome::HostGone`](crate::host::PublishOutcome),
-//!   never an error). A missing or crashing host therefore degrades to
-//!   "detached", never to a stall or a panic.
+//!   the link drains the host through the non-blocking
+//!   [`Transport::try_recv`](rustamp_ipc::Transport) (backed by the reader
+//!   thread below for real pipes), and a failed send detaches the link as
+//!   [`PublishOutcome::HostGone`](crate::host::PublishOutcome), never an
+//!   error. A missed [`Message::Pong`](rustamp_ipc::Message) detaches it the
+//!   same way (see [`HostStateLink::poll`](crate::host::HostStateLink::poll)).
+//!   A missing, crashed or wedged host therefore degrades to "detached",
+//!   never to a stall or a panic.
 //! * **Convergence, not reuse.** The invariant is "link attached if and only
 //!   if a live managed child exists". A dead child is reaped (dropping
 //!   [`ChildHost`] kills what is left without waiting) and replaced by a
@@ -69,22 +74,25 @@
 //!   card"). This lane therefore establishes the first spawn/supervision
 //!   pattern in the tree; media-host supervision should reuse
 //!   [`HostBackend`]/[`Supervisor`] rather than invent a second one.
-//! * **F2 — no handshake yet.** The host stub cannot answer `Hello`/`Ping`
-//!   (it prints its version and exits), so liveness is death-only
-//!   (`try_wait` plus the link's `HostGone` detach). A `Hello` handshake,
-//!   `Ping` liveness and a non-blocking send (a live-but-not-reading host
-//!   could otherwise fill the pipe and stall a send) belong to the M3
-//!   control-pipe card, which also has to define the host's pipe rendezvous.
+//! * **F2 — the handshake now exists on both ends.** The host speaks it from
+//!   `rustamp-plughost/src/control.rs` (one startup `Hello`, one same-token
+//!   `Pong` per `Ping`, clean exit on close) and the app reads it here: the
+//!   link greets and probes from [`HostStateLink::poll`](crate::host::HostStateLink::poll),
+//!   and a missed `Pong` detaches exactly like a dead child. What is still
+//!   open is the non-blocking send: a live-but-not-reading host can fill the
+//!   pipe and stall a send until liveness detaches it (finding F3 in
+//!   [`crate::host`]).
 //! * **F3 — restart policy.** A dead host is retried forever, gated only by
 //!   the cooldown. Give-up/backoff policy is undecided by the RFCs and is
 //!   reported, not chosen.
 
 use std::io;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use rustamp_ipc::{StreamTransport, Transport};
+use rustamp_ipc::{IpcError, Message, StreamTransport, Transport};
 
 use crate::host::HostStateLink;
 
@@ -234,12 +242,77 @@ impl Drop for ChildHost {
     }
 }
 
+/// Read one host's stdout to the end, forwarding every frame to the app thread.
+///
+/// This is the reader-thread half of the app side (see
+/// [`HostStateLink::poll`](crate::host::HostStateLink::poll) for the other
+/// half): blocking pipe reads cannot run on the pump, so they run here — off
+/// the audio path — while the app thread keeps the write half and polls this
+/// thread's handover through the same non-blocking `try_recv`. The thread
+/// exits when the pipe closes, when a frame corrupts, or when the link drops
+/// the handover; any of those detaches the link, so the supervisor replaces
+/// the host. Even spawning the thread cannot fail the supervisor: if it
+/// cannot be spawned the handover is already disconnected, which reads as a
+/// dead host.
+fn spawn_host_reader(transport: impl Transport + 'static) -> mpsc::Receiver<Message> {
+    let (events, handover) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("rustamp-host-reader".to_owned())
+        .spawn(move || {
+            let mut transport = transport;
+            loop {
+                match transport.recv() {
+                    Ok(message) => {
+                        if events.send(message).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    handover
+}
+
+/// The app's end of a real host child: the stdin write half plus the reader
+/// thread's handover for the stdout read half.
+///
+/// Splitting is what keeps the pump non-blocking: the link sends
+/// (`PlayerStateUpdate`, `Hello`, `Ping`) on the app thread through `writer`,
+/// while [`spawn_host_reader`] blocks in `recv` on its own thread and hands
+/// inbound frames (`Hello`, `Pong`) to [`Transport::try_recv`] here. `recv`
+/// exists only for [`Transport`] completeness — the app side never calls it;
+/// it would block the caller on the handover.
+pub struct ProcessLink {
+    writer: StreamTransport<io::Empty, ChildStdin>,
+    events: mpsc::Receiver<Message>,
+}
+
+impl Transport for ProcessLink {
+    fn send(&mut self, msg: &Message) -> Result<(), IpcError> {
+        self.writer.send(msg)
+    }
+    fn recv(&mut self) -> Result<Message, IpcError> {
+        self.events.recv().map_err(|_| IpcError::Closed)
+    }
+    fn try_recv(&mut self) -> Result<Option<Message>, IpcError> {
+        match self.events.try_recv() {
+            Ok(message) => Ok(Some(message)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(IpcError::Closed),
+        }
+    }
+}
+
 /// Starts the real `rustamp-plughost32` binary with piped stdio.
 ///
 /// The pipes carry the framed [`Message`](rustamp_ipc::Message) control
-/// channel (the RFC 0006 §8 stdio shape) via [`StreamTransport`]: the app
-/// writes, the host reads. `stderr` is inherited so host diagnostics stay
-/// visible; nothing is ever read on the app thread (see the module docs).
+/// channel (the RFC 0006 §8 stdio shape): the app writes stdin, the host
+/// reads it, and the host's stdout comes back through [`spawn_host_reader`]
+/// into the [`ProcessLink`] handover that
+/// [`HostStateLink::poll`](crate::host::HostStateLink::poll) drains.
+/// `stderr` is inherited so host diagnostics stay visible; nothing is ever
+/// read on the app thread (see the module docs).
 pub struct ProcessBackend {
     exe: Option<PathBuf>,
 }
@@ -261,7 +334,7 @@ impl ProcessBackend {
 }
 
 impl HostBackend for ProcessBackend {
-    type Link = StreamTransport<std::process::ChildStdout, std::process::ChildStdin>;
+    type Link = ProcessLink;
     type Process = ChildHost;
 
     fn spawn(&mut self) -> io::Result<(Self::Link, Self::Process)> {
@@ -281,8 +354,12 @@ impl HostBackend for ProcessBackend {
         let mut child = command.spawn()?;
         match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => {
-                let transport = StreamTransport::new(stdout, stdin);
-                Ok((transport, ChildHost { child }))
+                // The read half moves to the reader thread; the link keeps
+                // the write half and polls the handover (see `ProcessLink`).
+                let reader = StreamTransport::new(stdout, io::sink());
+                let events = spawn_host_reader(reader);
+                let writer = StreamTransport::new(io::empty(), stdin);
+                Ok((ProcessLink { writer, events }, ChildHost { child }))
             }
             _ => {
                 let _ = child.kill();
@@ -561,6 +638,24 @@ mod tests {
             link.publish(&PlayerState::default()),
             crate::host::PublishOutcome::Detached
         );
+    }
+
+    #[test]
+    fn the_reader_thread_forwards_until_the_channel_closes() {
+        let (mut app_end, host_end) = MemoryTransport::pair();
+        let handover = spawn_host_reader(host_end);
+        // Whatever the host writes arrives on the handover, in order...
+        app_end.send(&Message::hello()).unwrap();
+        app_end.send(&Message::Pong(11)).unwrap();
+        assert!(matches!(
+            handover.recv().expect("the greeting"),
+            Message::Hello { .. }
+        ));
+        assert_eq!(handover.recv().expect("the pong"), Message::Pong(11));
+        // ...and when the host end goes away the thread exits instead of
+        // hanging, so the handover disconnects and the link detaches.
+        drop(app_end);
+        assert!(handover.recv().is_err());
     }
 
     #[test]

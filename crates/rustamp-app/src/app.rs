@@ -49,7 +49,7 @@ use rustamp_ui::{
 };
 
 use crate::cli::OutputChoice;
-use crate::host::{HostStateLink, PublishOutcome, player_state_message};
+use crate::host::{HostStateLink, PollOutcome, PublishOutcome, player_state_message};
 use crate::routing;
 use crate::skin::{LoadedSkin, SkinChoice, load as load_skin};
 use crate::supervise::Supervisor;
@@ -365,6 +365,7 @@ impl App {
         // Mirror the player state to the plugin host (see `crate::host`):
         // best-effort by contract, so the outcome is ignored — a detached or
         // dead host neither fails nor blocks the pump.
+        let _ = self.poll_host();
         let _ = self.publish_host_state();
         Ok(())
     }
@@ -553,6 +554,18 @@ impl App {
     pub fn publish_host_state(&mut self) -> PublishOutcome {
         let state = self.host_player_state();
         self.host.publish(&state)
+    }
+
+    /// Run one `Hello`/`Ping` liveness step on the host channel (see
+    /// [`HostStateLink::poll`](crate::host::HostStateLink::poll)).
+    ///
+    /// Best-effort by contract like [`publish_host_state`](App::publish_host_state):
+    /// [`App::pump`] calls it before publishing and ignores the outcome. A
+    /// missed `Pong` or a dead channel detaches the link here, so the publish
+    /// right after degrades to detached and the supervisor replaces the host
+    /// on its next step.
+    pub fn poll_host(&mut self) -> PollOutcome {
+        self.host.poll()
     }
 
     // -----------------------------------------------------------------------

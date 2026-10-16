@@ -99,11 +99,57 @@
 //! and does nothing, and a failed send detaches the link and reports
 //! [`PublishOutcome::HostGone`] instead of propagating an error — `pump`
 //! ignores the outcome outright.
+//!
+//! # Reading and liveness (RFC 0006 §8)
+//!
+//! Publishing is only half of the control channel: the host greets once with
+//! [`Message::Hello`] at startup and answers every [`Message::Ping`] with a
+//! same-token [`Message::Pong`] (see `rustamp-plughost/src/control.rs`). The
+//! engine side of that handshake lives here, driven by [`HostStateLink::poll`],
+//! which [`App::pump`](crate::app::App::pump) calls on every pass next to
+//! [`publish`](HostStateLink::publish):
+//!
+//! * inbound traffic is drained through the non-blocking
+//!   [`Transport::try_recv`](rustamp_ipc::Transport::try_recv) — never a
+//!   blocking read, so the pump (and the player) cannot stall on it;
+//! * the first step greets with our own [`Message::hello`], then a `Ping`
+//!   goes out every [`PING_INTERVAL`] while no probe is outstanding;
+//! * a `Pong` clears the probe it answers (tokens must match; a stale token
+//!   is ignored rather than trusted); a probe unanswered for
+//!   [`PONG_TIMEOUT`] is the RFC's missed-`Pong` failure, and the link
+//!   detaches so the supervisor replaces the host.
+//!
+//! Which thread reads the real pipe depends on the transport, because a
+//! blocking pipe cannot be polled:
+//! [`MemoryTransport`](rustamp_ipc::MemoryTransport) answers `try_recv`
+//! directly (tests drain it on the pump with no thread involved), while the
+//! production pipe is split — the write half stays in the link and a reader
+//! thread owns the read half, handing what it reads back through the same
+//! `try_recv` (see [`crate::supervise`]). Either way reading and pinging stay
+//! on the app thread or the reader thread: never on the audio path.
+//!
+//! # Findings (decisions the specs and RFCs do not make)
+//!
+//! * **F2 — a foreign greeting is noticed, not rejected.**
+//!   [`poll`](HostStateLink::poll) records the host's version and pid
+//!   ([`HostStateLink::greeting`]), and
+//!   [`version_mismatch`](HostStateLink::version_mismatch) reports a version
+//!   we do not speak — but the link stays attached. RFC 0006 §10 demands a
+//!   clean `Hello`-rejection test for the media hosts, yet sets no rejection
+//!   rule for the plugin host; refusing to run against a mismatched helper is
+//!   engine policy for a later card, not something this lane invents.
+//! * **F3 — a non-reading host is detected, not pre-empted.** A host that
+//!   stops reading fills the pipe's kernel buffer and a `send` into it can
+//!   block; bounding that stall needs OS-specific non-blocking writes, which
+//!   `std` does not offer. Liveness bounds the damage instead — a host that
+//!   stopped reading also stops answering `Ping`, so the link detaches at
+//!   most [`PONG_TIMEOUT`] after the last answer and the supervisor replaces
+//!   it. A truly non-blocking send belongs to the M3 control-pipe card.
 
 use std::time::{Duration, Instant};
 
 use rustamp_core::state::PlayerState;
-use rustamp_ipc::{Message, Transport};
+use rustamp_ipc::{IpcError, Message, PROTOCOL_VERSION, Transport};
 
 /// Maximum rate of position-only publications (see the module docs).
 ///
@@ -111,6 +157,67 @@ use rustamp_ipc::{Message, Transport};
 /// moves at the same currency as the UI machine's, and anything faster would
 /// spend pipe bandwidth on milliseconds no plugin polls that often.
 pub const STATE_PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How often an attached host gets a [`Message::Ping`] while no probe is
+/// outstanding (see [`HostStateLink::poll`]).
+///
+/// Pipe round-trips are sub-millisecond locally, so one small frame a second
+/// is plenty of liveness evidence and stays noise next to the 5 Hz state
+/// postcards — while still noticing a wedged host within seconds.
+pub const PING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a [`Message::Ping`] may go unanswered before the host counts as
+/// failed (see [`HostStateLink::poll`]).
+///
+/// Three times [`PING_INTERVAL`]: orders of magnitude above any healthy
+/// scheduling stall on a local pipe, so a live host never trips it, but a
+/// host that stopped answering (wedged reader, deadlocked UI thread) is
+/// detached within seconds rather than left serving stale answers.
+pub const PONG_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// What one [`HostStateLink::poll`] step decided.
+///
+/// Like [`PublishOutcome`], none of these is an error the player must
+/// handle: [`App::pump`](crate::app::App::pump) ignores the outcome.
+/// Detaching outcomes converge through the supervisor: the next
+/// [`supervise`](crate::supervise::Supervisor::supervise) step sees a live
+/// child with a detached link (or a dead one) and replaces it after the
+/// restart cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollOutcome {
+    /// Attached and live: no probe is overdue. A `Ping` or the startup
+    /// `Hello` may have gone out on this step.
+    Healthy,
+    /// No transport is attached; nothing was read and nothing was sent.
+    Detached,
+    /// The channel is gone (closed pipe, failed send, corrupt frame). The
+    /// link detached itself; the supervisor replaces the host.
+    HostGone,
+    /// A `Ping` went unanswered for [`PONG_TIMEOUT`]: the RFC 0006 §8
+    /// missed-`Pong` failure. The link detached itself; the supervisor
+    /// replaces the host.
+    MissedPong,
+}
+
+/// The host's startup [`Message::Hello`], as recorded by
+/// [`HostStateLink::poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostGreeting {
+    /// The host's [`PROTOCOL_VERSION`](rustamp_ipc::PROTOCOL_VERSION).
+    pub protocol_version: u32,
+    /// The host's process id.
+    pub pid: u32,
+}
+
+impl HostGreeting {
+    /// Whether the host speaks our protocol version. A mismatch is recorded
+    /// and reported (see [`HostStateLink::version_mismatch`]) but never acted
+    /// on here: rejecting a peer is a decision the RFC does not make
+    /// (finding F2 in the module docs).
+    pub fn is_supported(&self) -> bool {
+        self.protocol_version == PROTOCOL_VERSION
+    }
+}
 
 /// What one [`HostStateLink::publish`] attempt did.
 ///
@@ -136,15 +243,23 @@ pub enum PublishOutcome {
 }
 
 /// The app's end of the state bridge: an optional control-channel transport
-/// plus the change detection that keeps publishing cheap.
+/// plus the change detection that keeps publishing cheap, and the
+/// `Hello`/`Ping` liveness state that keeps a wedged host from lingering
+/// (see [`poll`](HostStateLink::poll)).
 ///
-/// A detached link (the initial state, and the state after [`PublishOutcome::HostGone`])
-/// makes [`publish`](HostStateLink::publish) a no-op, so the player runs
-/// identically with and without a host.
+/// A detached link (the initial state, and the state after
+/// [`PublishOutcome::HostGone`], [`PollOutcome::HostGone`] or
+/// [`PollOutcome::MissedPong`]) makes [`publish`](HostStateLink::publish) a
+/// no-op, so the player runs identically with and without a host.
 pub struct HostStateLink {
     transport: Option<Box<dyn Transport>>,
     last_sent: Option<PlayerState>,
     last_send: Instant,
+    greeting: Option<HostGreeting>,
+    hello_sent: bool,
+    next_token: u64,
+    pending_pong: Option<(u64, Instant)>,
+    next_ping_at: Option<Instant>,
 }
 
 impl HostStateLink {
@@ -155,6 +270,11 @@ impl HostStateLink {
             transport: None,
             last_sent: None,
             last_send: Instant::now(),
+            greeting: None,
+            hello_sent: false,
+            next_token: 1,
+            pending_pong: None,
+            next_ping_at: None,
         }
     }
 
@@ -169,6 +289,7 @@ impl HostStateLink {
     pub fn attach(&mut self, transport: impl Transport + 'static) {
         self.transport = Some(Box::new(transport));
         self.last_sent = None;
+        self.reset_liveness();
     }
 
     /// Drop the transport without sending anything. The next
@@ -176,11 +297,159 @@ impl HostStateLink {
     pub fn detach(&mut self) {
         self.transport = None;
         self.last_sent = None;
+        self.reset_liveness();
+    }
+
+    /// Forget the handshake state: a fresh transport means a fresh peer, so
+    /// the next [`poll`](HostStateLink::poll) greets and probes from scratch.
+    /// The token counter keeps running — tokens only need to be fresh within
+    /// one peer's lifetime, and monotonicity across peers is the stronger
+    /// property.
+    fn reset_liveness(&mut self) {
+        self.greeting = None;
+        self.hello_sent = false;
+        self.pending_pong = None;
+        self.next_ping_at = None;
     }
 
     /// Whether a transport is currently attached.
     pub fn is_attached(&self) -> bool {
         self.transport.is_some()
+    }
+
+    /// The host's startup greeting, once [`poll`](HostStateLink::poll) has
+    /// read it. `None` until the first `Hello` arrives.
+    pub fn greeting(&self) -> Option<HostGreeting> {
+        self.greeting
+    }
+
+    /// Whether the recorded greeting speaks a foreign protocol version. This
+    /// is noticed, never acted on: the link stays attached (see finding F2 in
+    /// the module docs).
+    pub fn version_mismatch(&self) -> bool {
+        self.greeting
+            .is_some_and(|greeting| !greeting.is_supported())
+    }
+
+    /// One non-blocking liveness step: drain what the host wrote, greet and
+    /// probe it, and detach on a dead channel or a missed `Pong`.
+    ///
+    /// Drive it from the app thread (e.g. [`App::pump`](crate::app::App::pump),
+    /// next to [`publish`](HostStateLink::publish)): it only ever calls the
+    /// non-blocking [`Transport::try_recv`], never `recv`, and sends at most
+    /// one small frame, so it stays off the audio path and cannot stall the
+    /// player. A transport that cannot be polled (a stream's write half)
+    /// reports [`IpcError::WouldBlock`], which simply ends the drain — its
+    /// inbound traffic arrives through the reader thread's handover instead
+    /// (see [`crate::supervise`]), which surfaces through the same
+    /// `try_recv`.
+    pub fn poll(&mut self) -> PollOutcome {
+        self.poll_at(Instant::now())
+    }
+
+    /// [`poll`](HostStateLink::poll) against an explicit clock, so tests can
+    /// drive liveness deterministically without sleeping.
+    pub fn poll_at(&mut self, now: Instant) -> PollOutcome {
+        if self.transport.is_none() {
+            return PollOutcome::Detached;
+        }
+        // Drain everything the host wrote since the last step: the startup
+        // greeting and same-token pongs. Anything else is future traffic
+        // (plugin answers belong to a later card) and is ignored, never
+        // answered — answering an unknown variant would invent protocol.
+        loop {
+            let inbound = match self.transport.as_mut() {
+                Some(transport) => transport.try_recv(),
+                None => return PollOutcome::Detached,
+            };
+            match inbound {
+                Ok(Some(message)) => self.on_inbound(message),
+                Ok(None) => break,
+                Err(IpcError::WouldBlock) => break,
+                // Closed pipe, corrupt frame, wedged handover: the channel
+                // can no longer be trusted. Detach and let the supervisor
+                // replace the host, exactly as a failed send does in
+                // `publish`.
+                Err(_) => {
+                    self.detach();
+                    return PollOutcome::HostGone;
+                }
+            }
+        }
+        // A probe that outlived its deadline is the RFC 0006 §8 failure: the
+        // host stopped answering. Detach so the supervisor replaces it.
+        if self
+            .pending_pong
+            .is_some_and(|(_, deadline)| now >= deadline)
+        {
+            self.detach();
+            return PollOutcome::MissedPong;
+        }
+        // Greet once per attach, then probe on the cadence. At most one probe
+        // is ever outstanding: while one is unanswered the deadline above is
+        // the only thing that moves, so a struggling host is failed rather
+        // than flooded.
+        if !self.hello_sent {
+            if self.send(&Message::hello()).is_err() {
+                self.detach();
+                return PollOutcome::HostGone;
+            }
+            self.hello_sent = true;
+            self.next_ping_at = Some(now + PING_INTERVAL);
+        } else if self.pending_pong.is_none() && self.next_ping_at.is_some_and(|due| now >= due) {
+            let token = self.next_token;
+            self.next_token = self.next_token.wrapping_add(1);
+            if self.send(&Message::Ping(token)).is_err() {
+                self.detach();
+                return PollOutcome::HostGone;
+            }
+            self.pending_pong = Some((token, now + PONG_TIMEOUT));
+            self.next_ping_at = Some(now + PING_INTERVAL);
+        }
+        PollOutcome::Healthy
+    }
+
+    /// Route one message the host wrote.
+    ///
+    /// * `Hello` records the greeting (the first one wins: the host greets
+    ///   once at startup, and a fresh peer means a fresh transport).
+    /// * `Pong` clears the matching outstanding probe; a stale token is
+    ///   ignored rather than trusted.
+    /// * Anything else is ignored (see
+    ///   [`poll_at`](HostStateLink::poll_at)).
+    fn on_inbound(&mut self, message: Message) {
+        match message {
+            Message::Hello {
+                protocol_version,
+                pid,
+            } => {
+                if self.greeting.is_none() {
+                    self.greeting = Some(HostGreeting {
+                        protocol_version,
+                        pid,
+                    });
+                }
+            }
+            Message::Pong(token)
+                if self
+                    .pending_pong
+                    .is_some_and(|(pending, _)| pending == token) =>
+            {
+                self.pending_pong = None;
+            }
+            Message::Pong(_) => {}
+            _ => {}
+        }
+    }
+
+    /// Send one control message (`Hello`/`Ping`); the caller detaches on
+    /// failure. `None` when detached, which [`poll_at`](HostStateLink::poll_at)
+    /// rules out before calling.
+    fn send(&mut self, message: &Message) -> Result<(), IpcError> {
+        match self.transport.as_mut() {
+            Some(transport) => transport.send(message),
+            None => Err(IpcError::Closed),
+        }
     }
 
     /// Publish `state` when the cadence rules say so (see the module docs).
@@ -438,5 +707,162 @@ mod tests {
             Ok(Some(_)) => panic!("detaching must not publish anything"),
             Err(_) => {} // the peer end was dropped by `detach`, which is the point
         }
+    }
+
+    #[test]
+    fn a_healthy_host_stays_attached_across_hellos_and_pings() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        let t0 = Instant::now();
+
+        // The host greeted at startup; the first poll consumes it and answers
+        // with our own greeting.
+        host_end
+            .send(&Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                pid: 4321,
+            })
+            .unwrap();
+        assert_eq!(link.poll_at(t0), PollOutcome::Healthy);
+        assert!(link.is_attached());
+        let greeting = link.greeting().expect("the Hello is consumed");
+        assert_eq!(greeting.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(greeting.pid, 4321);
+        assert!(greeting.is_supported());
+        assert!(!link.version_mismatch());
+        assert!(matches!(host_end.recv().unwrap(), Message::Hello { .. }));
+
+        // No probe is due yet: silence on the channel.
+        assert!(host_end.try_recv().expect("codec reads").is_none());
+
+        // At the cadence a Ping goes out; its same-token Pong keeps the link
+        // attached, round after round.
+        assert_eq!(link.poll_at(t0 + PING_INTERVAL), PollOutcome::Healthy);
+        assert_eq!(host_end.recv().unwrap(), Message::Ping(1));
+        host_end.send(&Message::Pong(1)).unwrap();
+        assert_eq!(
+            link.poll_at(t0 + PING_INTERVAL + Duration::from_millis(10)),
+            PollOutcome::Healthy
+        );
+        assert!(link.is_attached());
+
+        assert_eq!(link.poll_at(t0 + 2 * PING_INTERVAL), PollOutcome::Healthy);
+        assert_eq!(host_end.recv().unwrap(), Message::Ping(2));
+        host_end.send(&Message::Pong(2)).unwrap();
+        assert_eq!(
+            link.poll_at(t0 + 2 * PING_INTERVAL + Duration::from_millis(10)),
+            PollOutcome::Healthy
+        );
+        assert!(link.is_attached());
+    }
+
+    #[test]
+    fn a_host_that_stops_ponging_detaches_after_the_timeout() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        let t0 = Instant::now();
+
+        assert_eq!(link.poll_at(t0), PollOutcome::Healthy);
+        assert!(matches!(host_end.recv().unwrap(), Message::Hello { .. }));
+
+        // The Ping goes out on cadence, but this host never answers it.
+        let ping_at = t0 + PING_INTERVAL;
+        assert_eq!(link.poll_at(ping_at), PollOutcome::Healthy);
+        assert_eq!(host_end.recv().unwrap(), Message::Ping(1));
+
+        // A stale token does not clear the probe: only the same-token Pong
+        // counts, per the RFC.
+        host_end.send(&Message::Pong(999)).unwrap();
+        assert_eq!(
+            link.poll_at(ping_at + PONG_TIMEOUT - Duration::from_millis(1)),
+            PollOutcome::Healthy
+        );
+        assert!(link.is_attached());
+
+        // Past the deadline the missed-Pong failure detaches the link, and
+        // the supervisor replaces the host on its next step.
+        assert_eq!(
+            link.poll_at(ping_at + PONG_TIMEOUT),
+            PollOutcome::MissedPong
+        );
+        assert!(!link.is_attached());
+        assert_eq!(
+            link.poll_at(ping_at + PONG_TIMEOUT + Duration::from_secs(1)),
+            PollOutcome::Detached
+        );
+    }
+
+    #[test]
+    fn a_foreign_greeting_version_is_noticed_not_ignored() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        host_end
+            .send(&Message::Hello {
+                protocol_version: PROTOCOL_VERSION + 1000,
+                pid: 7,
+            })
+            .unwrap();
+
+        // Noticed...
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Healthy);
+        let greeting = link.greeting().expect("the Hello is consumed");
+        assert_eq!(greeting.protocol_version, PROTOCOL_VERSION + 1000);
+        assert_eq!(greeting.pid, 7);
+        assert!(!greeting.is_supported());
+        assert!(link.version_mismatch());
+        // ...but not acted on: rejecting a mismatched helper is undecided
+        // engine policy (finding F2), so the link stays attached.
+        assert!(link.is_attached());
+        assert!(matches!(host_end.recv().unwrap(), Message::Hello { .. }));
+    }
+
+    #[test]
+    fn foreign_inbound_traffic_is_ignored_never_answered() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        // Traffic a later card owns: plugin answers the app never solicited.
+        host_end
+            .send(&Message::WinampIpc {
+                msg_id: 104,
+                wparam: 0,
+                lparam: 0,
+            })
+            .unwrap();
+        host_end.send(&Message::DecoderEos).unwrap();
+
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Healthy);
+        assert!(link.is_attached());
+        assert!(link.greeting().is_none());
+        // Only our own startup greeting went out: nothing was answered, so no
+        // protocol was invented.
+        assert!(matches!(host_end.recv().unwrap(), Message::Hello { .. }));
+        assert!(host_end.try_recv().expect("codec reads").is_none());
+    }
+
+    #[test]
+    fn a_closed_channel_detaches_without_a_panic() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, host_end) = MemoryTransport::pair();
+        drop(host_end);
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        // The peer is gone: the drain reports Closed, so the link detaches
+        // instead of panicking — and stays detached afterwards.
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::HostGone);
+        assert!(!link.is_attached());
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Detached);
     }
 }

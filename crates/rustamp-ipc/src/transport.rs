@@ -22,6 +22,13 @@ pub enum IpcError {
     /// The peer closed the connection.
     #[error("connection closed")]
     Closed,
+    /// No message is available right now, and this transport cannot say
+    /// whether one will arrive: only in-memory transports support a real
+    /// non-blocking read. A [`StreamTransport`] over blocking stdio always
+    /// reports this; its read half belongs to a reader thread that blocks in
+    /// [`Transport::recv`] instead (see [`StreamTransport`]).
+    #[error("no message available")]
+    WouldBlock,
 }
 
 /// A bidirectional, message-oriented connection.
@@ -30,6 +37,16 @@ pub trait Transport: Send {
     fn send(&mut self, msg: &Message) -> Result<(), IpcError>;
     /// Block until the next message arrives; `Err(Closed)` at end of stream.
     fn recv(&mut self) -> Result<Message, IpcError>;
+    /// Non-blocking receive: `Ok(None)` when nothing is queued right now.
+    ///
+    /// The default reports [`IpcError::WouldBlock`]: byte-stream transports
+    /// over blocking handles cannot peek without OS-specific support, so
+    /// polling them would either block (forbidden on the app thread) or lie.
+    /// Owners of such a transport read it on a reader thread and poll the
+    /// thread's handover instead.
+    fn try_recv(&mut self) -> Result<Option<Message>, IpcError> {
+        Err(IpcError::WouldBlock)
+    }
 }
 
 /// In-memory transport pair for tests. Messages pass through the real
@@ -52,12 +69,11 @@ impl MemoryTransport {
     }
 
     /// Non-blocking receive; `Ok(None)` if nothing is queued.
+    ///
+    /// Inherent so existing callers keep compiling; it is the trait's
+    /// [`Transport::try_recv`] for this transport.
     pub fn try_recv(&mut self) -> Result<Option<Message>, IpcError> {
-        match self.rx.try_recv() {
-            Ok(b) => decode(&b).map(Some),
-            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(IpcError::Closed),
-        }
+        Transport::try_recv(self)
     }
 }
 
@@ -69,6 +85,13 @@ impl Transport for MemoryTransport {
         let b = self.rx.recv().map_err(|_| IpcError::Closed)?;
         decode(&b)
     }
+    fn try_recv(&mut self) -> Result<Option<Message>, IpcError> {
+        match self.rx.try_recv() {
+            Ok(b) => decode(&b).map(Some),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(IpcError::Closed),
+        }
+    }
 }
 
 /// Transport over a byte-stream reader/writer pair using length-prefixed framing.
@@ -76,6 +99,12 @@ impl Transport for MemoryTransport {
 /// For a duplex pipe or socket, pass two handles to the same object (e.g.
 /// `try_clone`). Use separate threads for reading and writing if the
 /// protocol needs concurrent send/recv.
+///
+/// This transport keeps the [`Transport::try_recv`] default
+/// ([`IpcError::WouldBlock`]): a blocking handle cannot be polled, so the
+/// read half belongs to a reader thread that blocks in
+/// [`Transport::recv`], while the app thread keeps the write half and polls
+/// the reader's handover (see `rustamp-app/src/supervise.rs`).
 #[derive(Debug)]
 pub struct StreamTransport<R, W> {
     reader: R,
