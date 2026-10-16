@@ -237,9 +237,17 @@ unsafe extern "system" fn wnd_proc(
             // Classic IPC: the IPC id rides in LPARAM (the second parameter),
             // the argument in WPARAM.  S09 section 8 item 2.
             let ipc_id = lparam.0 as u32;
+            // `WPARAM` is unsigned and pointer-sized: a 32-bit `-666` query
+            // arrives as `0xFFFFFD66`, which a plain `as i64` would
+            // zero-extend to a large positive on a 32-bit host and miss the
+            // signed `-666` sentinels `answer` compares against (the C
+            // comparison runs in the unsigned domain, so it matches there).
+            // Reinterpret through `isize` before widening, so a query sent
+            // from either width reads back signed on either host.
+            let wparam = wparam.0 as isize as i64;
             let reply = unsafe {
                 let surface = &mut *surface_ptr;
-                surface.answer(ipc_id, wparam.0 as i64).raw() as isize
+                surface.answer(ipc_id, wparam).raw() as isize
             };
             LRESULT(reply)
         }
