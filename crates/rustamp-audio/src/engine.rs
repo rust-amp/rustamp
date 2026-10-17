@@ -678,11 +678,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Stop, reset the position and leave the device open but paused.
+    /// Stop, reset the position, drop the device buffer and leave the device
+    /// open but paused.
     pub fn stop(&mut self) -> Result<()> {
         self.send(DecodeMsg::Stop);
         self.sync.set_active(false);
         let _ = self.output.pause();
+        let _ = self.output.flush();
         self.join_decode();
         self.transport = TransportState::Stopped;
         self.clock_origin = self.output.played_frames();
@@ -813,6 +815,7 @@ impl Engine {
             self.timeline_origin = frames;
             self.track_start = 0;
             self.clock_origin = self.output.played_frames();
+            let _ = self.output.flush();
             self.publish_position(true);
             return Ok(());
         }
@@ -923,6 +926,9 @@ impl Engine {
                 // An initial seek's drain also drops a previous run's audio,
                 // and this re-base replaces the start's.
                 self.start_drain = None;
+                // Drop what the device still holds (pre-seek audio and the
+                // drain callback's silence) so the new timeline plays clean.
+                let _ = self.output.flush();
                 // Re-base the audio clock exactly at the drain: every frame the
                 // device plays from now on belongs to the new position.
                 self.clock_origin = self.output.played_frames();
@@ -988,6 +994,7 @@ impl Engine {
         self.start_drain = None;
         self.sync.set_active(false);
         let _ = self.output.pause();
+        let _ = self.output.flush();
         self.join_decode();
         self.transport = TransportState::Stopped;
         // Freeze the timeline at the content end, not at the device position.

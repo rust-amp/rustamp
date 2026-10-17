@@ -70,6 +70,7 @@ struct Shared {
     played: AtomicU64,
     paused: AtomicBool,
     running: AtomicBool,
+    flushes: AtomicU64,
 }
 
 /// The [`OutputDevice`] half of a null output. Pass it to the engine.
@@ -97,6 +98,7 @@ impl NullOutput {
             played: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             running: AtomicBool::new(false),
+            flushes: AtomicU64::new(0),
         });
         (
             NullOutput {
@@ -140,6 +142,7 @@ impl OutputDevice for NullOutput {
         self.shared.played.store(0, Ordering::Release);
         self.shared.paused.store(false, Ordering::Release);
         self.shared.running.store(false, Ordering::Release);
+        self.shared.flushes.store(0, Ordering::Release);
         drop(inner);
         Ok(OutputFormat {
             spec,
@@ -178,7 +181,9 @@ impl OutputDevice for NullOutput {
 
     fn flush(&mut self) -> Result<()> {
         // Nothing is buffered: the render callback pulls from the engine's ring
-        // on every `pump`, so a flush has nothing to drop.
+        // on every `pump`, so a flush has nothing to drop. Count the flush so
+        // headless tests can verify that the engine calls it when expected.
+        self.shared.flushes.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -241,6 +246,11 @@ impl NullClock {
     /// Total frames the device has consumed (the audio clock).
     pub fn frames(&self) -> u64 {
         self.shared.played.load(Ordering::Acquire)
+    }
+
+    /// Total number of times [`OutputDevice::flush`] was called on the output device.
+    pub fn flushes(&self) -> u64 {
+        self.shared.flushes.load(Ordering::Acquire)
     }
 
     /// Frames pulled per [`NullClock::pump`] callback. Affects the callback

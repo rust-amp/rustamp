@@ -614,10 +614,19 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
                 let _ = client.stop_stream();
                 streaming = false;
             }
+            if shared.flush.swap(false, Ordering::AcqRel) {
+                // Drop what the device still holds (seek / stop).
+                // Reset requires the stream to be stopped.
+                let _ = client.reset_stream();
+            }
             let _ = event.wait_for_event(EVENT_TIMEOUT_MS);
             continue;
         }
         if !streaming {
+            if shared.flush.swap(false, Ordering::AcqRel) {
+                // Reset requires the stream to be stopped.
+                let _ = client.reset_stream();
+            }
             match client.start_stream() {
                 Ok(()) => {
                     failures.reset();
@@ -658,7 +667,14 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
         }
         if shared.flush.swap(false, Ordering::AcqRel) {
             // Drop what the device still holds (seek / stop).
-            let _ = client.reset_stream();
+            // Reset requires the stream to be stopped.
+            if streaming {
+                let _ = client.stop_stream();
+                let _ = client.reset_stream();
+                streaming = client.start_stream().is_ok();
+            } else {
+                let _ = client.reset_stream();
+            }
         }
         write_available(
             &client,

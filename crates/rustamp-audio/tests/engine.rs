@@ -6,13 +6,15 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Harness, SPEC, TONE_AMPLITUDE, TONE_HZ, expected, pattern, track_frames};
 use rustamp_audio::EngineConfig;
-use rustamp_core::audio::AudioSpec;
+use rustamp_core::audio::{AudioSpec, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::bus::command_channel;
 use rustamp_core::command::Command;
+use rustamp_core::error::Result;
 use rustamp_core::event::Event;
 use rustamp_core::state::{EqState, TransportState};
 
@@ -2059,4 +2061,261 @@ fn a_restart_after_a_natural_end_needs_no_drain() {
     assert!(!h.engine.is_start_pending());
     assert!(!h.engine.is_drain_pending());
     assert!(h.wait_buffered(), "the run buffers without a callback");
+}
+
+/// A stopped run flushes the output device so that the device drops what
+/// was buffered below the ring (F3).
+#[test]
+fn stopped_run_flushes_output_device() {
+    let mut h = Harness::new(&[LONG_A]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    h.clock.pump(512);
+    h.engine.poll().unwrap();
+    assert_eq!(h.clock.flushes(), 0, "no flush during normal playback");
+
+    h.engine.stop().unwrap();
+    assert!(
+        h.clock.flushes() >= 1,
+        "stop() must flush the output device"
+    );
+}
+
+/// A seek drops what was buffered in the device before the seek target (F3).
+#[test]
+fn seek_flushes_output_device() {
+    let mut h = Harness::new(&[LONG_A]);
+    h.engine.set_limiter_enabled(false);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    h.clock.pump(512);
+    h.engine.poll().unwrap();
+    let flushes_before = h.clock.flushes();
+
+    h.engine.seek_frames(1500).unwrap();
+    assert!(h.settle_seek(1500));
+    assert!(
+        h.clock.flushes() > flushes_before,
+        "a seek must flush the output device on drain"
+    );
+}
+
+/// A seek while stopped flushes the output device so any stale buffer is dropped.
+#[test]
+fn seek_while_stopped_flushes_output_device() {
+    let mut h = Harness::new(&[LONG_A]);
+    assert_eq!(h.clock.flushes(), 0);
+    h.engine.seek_frames(500).unwrap();
+    assert_eq!(h.clock.flushes(), 1);
+}
+
+/// When a run ends naturally, the output device is flushed when entering Stopped state.
+#[test]
+fn natural_end_flushes_output_device() {
+    let mut h = Harness::new(&[TRACK_A]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered());
+    assert!(h.wait_until(
+        |e| e.transport() == TransportState::Stopped,
+        track_frames(TRACK_A) + 8192
+    ));
+    assert!(
+        h.clock.flushes() >= 1,
+        "finishing a run must flush the output device"
+    );
+}
+
+/// Simulates a device with an internal hardware/driver buffer (such as the WASAPI
+/// endpoint buffer) to prove headlessly that without `flush`, a stop followed
+/// by a play would replay old audio below the ring, and that calling `flush`
+/// on stop drops the device buffer.
+#[test]
+fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
+    struct BufferedDeviceInner {
+        spec: Option<AudioSpec>,
+        render: Option<RenderFn>,
+        device_buf: Vec<f32>,
+        paused: bool,
+        flushes: u64,
+        played: u64,
+    }
+
+    struct BufferedOutput {
+        inner: Arc<Mutex<BufferedDeviceInner>>,
+    }
+
+    struct BufferedClock {
+        inner: Arc<Mutex<BufferedDeviceInner>>,
+    }
+
+    impl OutputDevice for BufferedOutput {
+        fn name(&self) -> &str {
+            "buffered-mock"
+        }
+        fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
+            let mut g = self.inner.lock().unwrap();
+            g.spec = Some(spec);
+            g.device_buf.clear();
+            g.flushes = 0;
+            g.played = 0;
+            Ok(OutputFormat {
+                spec,
+                buffer_frames: 256,
+            })
+        }
+        fn start(&mut self, render: RenderFn) -> Result<()> {
+            let mut g = self.inner.lock().unwrap();
+            g.render = Some(render);
+            g.paused = false;
+            Ok(())
+        }
+        fn pause(&mut self) -> Result<()> {
+            let mut g = self.inner.lock().unwrap();
+            g.paused = true;
+            // Crucial: pause does NOT drop the device buffer (retained, like WASAPI)
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            let mut g = self.inner.lock().unwrap();
+            g.paused = false;
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<()> {
+            let mut g = self.inner.lock().unwrap();
+            g.flushes += 1;
+            g.device_buf.clear();
+            Ok(())
+        }
+        fn latency(&self) -> Duration {
+            Duration::from_millis(10)
+        }
+        fn played_frames(&self) -> u64 {
+            self.inner.lock().unwrap().played
+        }
+        fn close(&mut self) -> Result<()> {
+            let mut g = self.inner.lock().unwrap();
+            g.render = None;
+            Ok(())
+        }
+    }
+
+    impl BufferedClock {
+        /// Pull `frames` frames from the mock hardware buffer to the speaker.
+        /// If the buffer has fewer frames than requested, it pulls from `render`
+        /// to top it up (like WASAPI's render thread topping up its endpoint buffer).
+        fn pull_hardware(&self, frames: usize, out: &mut Vec<f32>) -> usize {
+            let mut g = self.inner.lock().unwrap();
+            if g.paused || g.render.is_none() {
+                return 0;
+            }
+            let channels = usize::from(g.spec.unwrap().channels);
+            let samples_wanted = frames * channels;
+            // Top up device buffer to at least samples_wanted
+            if g.device_buf.len() < samples_wanted {
+                let needed = samples_wanted - g.device_buf.len();
+                let mut scratch = vec![0.0; needed];
+                if let Some(render) = g.render.as_mut() {
+                    render(&mut scratch);
+                }
+                g.device_buf.extend_from_slice(&scratch);
+            }
+            let take_samples = samples_wanted.min(g.device_buf.len());
+            let taken: Vec<f32> = g.device_buf.drain(..take_samples).collect();
+            let frames_taken = taken.len() / channels;
+            g.played += frames_taken as u64;
+            out.extend_from_slice(&taken);
+            frames_taken
+        }
+    }
+
+    let inner = Arc::new(Mutex::new(BufferedDeviceInner {
+        spec: None,
+        render: None,
+        device_buf: Vec::new(),
+        paused: false,
+        flushes: 0,
+        played: 0,
+    }));
+    let output = BufferedOutput {
+        inner: Arc::clone(&inner),
+    };
+    let clock = BufferedClock {
+        inner: Arc::clone(&inner),
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path_a = dir.path().join("track1_44100.tst");
+    let path_b = dir.path().join("track2_44100.tst");
+    std::fs::write(&path_a, b"").unwrap();
+    std::fs::write(&path_b, b"").unwrap();
+    let mut reg = rustamp_core::audio::DecoderRegistry::new();
+    reg.register(common::TestFactory::arc());
+    let bus = rustamp_core::bus::EventBus::new();
+    let mut engine = rustamp_audio::Engine::new(
+        reg,
+        Box::new(output),
+        bus,
+        rustamp_audio::EngineConfig::default(),
+    )
+    .unwrap();
+    engine.set_limiter_enabled(false);
+    engine.set_queue(vec![
+        rustamp_audio::TrackSource::path(path_a.display().to_string()),
+        rustamp_audio::TrackSource::path(path_b.display().to_string()),
+    ]);
+
+    // 1. Play track 1
+    engine.play_index(0).unwrap();
+    while engine.current_index() != Some(0) || engine.duration_frames().is_none() {
+        engine.poll().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Pull 256 frames of track 1 audio through hardware
+    let mut rec1 = Vec::new();
+    assert_eq!(clock.pull_hardware(256, &mut rec1), 256);
+    engine.poll().unwrap();
+    // Device buffer now holds top-up audio of track 1:
+    {
+        let mut g = clock.inner.lock().unwrap();
+        let mut topup = vec![0.0; 256 * 2];
+        if let Some(render) = g.render.as_mut() {
+            render(&mut topup);
+        }
+        g.device_buf.extend_from_slice(&topup);
+        assert!(
+            !g.device_buf.is_empty(),
+            "device buffer holds track 1 audio"
+        );
+    }
+
+    // 2. Stop playback!
+    engine.stop().unwrap();
+    // Stop() called output.flush(), which cleared the device buffer!
+    assert_eq!(inner.lock().unwrap().flushes, 1);
+    assert!(
+        inner.lock().unwrap().device_buf.is_empty(),
+        "device buffer must be cleared by flush on stop"
+    );
+
+    // 3. Play track 2
+    engine.play_index(1).unwrap();
+    while engine.current_index() != Some(1) || engine.duration_frames().is_none() {
+        engine.poll().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Wait for decode thread to refill the ring
+    while engine.buffered_frames() < 1024 {
+        engine.poll().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Pull audio of track 2 from the device
+    let mut rec2 = Vec::new();
+    assert_eq!(clock.pull_hardware(256, &mut rec2), 256);
+    let left2: Vec<f32> = rec2.iter().step_by(2).copied().collect();
+
+    // Verify: the audio heard from the new run belongs to track 2, NOT track 1!
+    let track1_expected = expected(1, 0, 256);
+    let track2_expected = expected(2, 0, 256);
+    assert_ne!(left2, track1_expected, "must NOT replay track 1 audio!");
+    assert_eq!(left2, track2_expected, "must play track 2 audio cleanly!");
 }
