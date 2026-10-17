@@ -5,7 +5,8 @@ mod support;
 
 use rustamp_gfx::Image;
 use rustamp_skin::{
-    BuiltinDefaultSkin, MemorySource, PlaylistStyle, Sheet, Skin, SkinFallback, Substitute, webamp,
+    BuiltinDefaultSkin, CursorKind, MemorySource, PlaylistStyle, Sheet, Skin, SkinFallback,
+    Substitute, webamp,
 };
 use support::*;
 
@@ -387,4 +388,97 @@ fn paints_sheet_region_into_rgba_buffer() {
     assert_eq!(doubled.width(), 20);
     assert_eq!(doubled.pixel(2, 2), Some([1, 1, 0, 255]));
     assert_eq!(doubled.pixel(19, 19), Some([9, 9, 0, 255]));
+}
+
+/// A skin that carries no cursor at all still loads, and every cursor the
+/// built-in skin carries is filled in from it and reported — the same rule
+/// missing sheets follow.
+#[test]
+fn missing_cursors_fall_back_to_the_builtin_skin() {
+    let dir = tempfile::tempdir().unwrap();
+    write_folder(dir.path(), &synthetic_entries());
+    let skin = Skin::load(dir.path()).expect("a cursor-less skin must still load");
+
+    // The synthetic skin ships no cursors; the built-in default ships 11.
+    assert_eq!(skin.cursors().len(), 11);
+    let close = skin
+        .cursor("close.cur")
+        .expect("close.cur must come from the fallback");
+    assert_eq!(close.kind, CursorKind::Cur);
+    assert_eq!(
+        close.bytes,
+        rustamp_skin::rust_theme::cursor_bytes("close.cur").unwrap()
+    );
+    assert!(
+        skin.substitutions()
+            .iter()
+            .any(|s| { s.requested == "close.cur" && s.with == Substitute::DefaultSkin }),
+        "expected a default-skin substitution for close.cur, got {:?}",
+        skin.substitutions()
+    );
+}
+
+/// A cursor name the built-in skin does not carry either stays absent with
+/// no substitution — the same rule as a sheet the fallback has no size for.
+#[test]
+fn cursor_missing_from_both_skin_and_fallback_stays_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    write_folder(dir.path(), &synthetic_entries());
+    let skin = Skin::load(dir.path()).unwrap();
+
+    // 13 of the 24 loader-requested names are absent from the built-in skin.
+    assert!(rustamp_skin::rust_theme::cursor_bytes("eqclose.cur").is_none());
+    assert!(skin.cursor("eqclose.cur").is_none());
+    assert!(
+        !skin
+            .substitutions()
+            .iter()
+            .any(|s| s.requested == "eqclose.cur"),
+        "no substitution may be recorded for a cursor nobody supplies"
+    );
+}
+
+/// A cursor the skin ships itself is never shadowed by the fallback, and no
+/// substitution is recorded for it.
+#[test]
+fn shipped_cursor_is_never_shadowed_by_the_fallback() {
+    let mut entries = synthetic_entries();
+    entries.push(("close.cur".to_string(), b"shipped-close-cursor".to_vec()));
+    let dir = tempfile::tempdir().unwrap();
+    write_folder(dir.path(), &entries);
+    let skin = Skin::load(dir.path()).unwrap();
+
+    let close = skin
+        .cursor("close.cur")
+        .expect("the shipped close.cur must be kept");
+    assert_eq!(close.bytes, b"shipped-close-cursor");
+    assert!(
+        !skin
+            .substitutions()
+            .iter()
+            .any(|s| s.requested == "close.cur"),
+        "a shipped cursor must not record a substitution"
+    );
+}
+
+/// A skin that ships `posbar.ani` carries the `posbar.cur` slot, so the
+/// fallback must not add its own cursor alongside it.
+#[test]
+fn ani_variant_carries_the_cur_slot() {
+    let mut entries = synthetic_entries();
+    entries.push(("posbar.ani".to_string(), b"RIFF-shipped-ani".to_vec()));
+    let dir = tempfile::tempdir().unwrap();
+    write_folder(dir.path(), &entries);
+    let skin = Skin::load(dir.path()).unwrap();
+
+    // 10 fallback cursors plus the shipped .ani one; no posbar.cur fallback.
+    assert_eq!(skin.cursors().len(), 11);
+    assert!(skin.cursor("posbar.cur").is_none());
+    assert!(
+        !skin
+            .substitutions()
+            .iter()
+            .any(|s| s.requested == "posbar.cur"),
+        "an .ani-shipped slot must not record a substitution"
+    );
 }
