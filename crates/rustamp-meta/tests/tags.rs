@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use rustamp_core::meta::TrackMetadata;
 use rustamp_meta::{
-    Artwork, read_artwork, read_tags, scan_paths, supported_extensions, supports_extension,
-    write_tags,
+    ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, Artwork, R128_ALBUM_GAIN_KEY, R128_TRACK_GAIN_KEY,
+    REFERENCE_LOUDNESS_KEY, ReplayGainTags, read_artwork, read_tags, scan_paths,
+    supported_extensions, supports_extension, write_replaygain, write_tags, write_tags_report,
 };
 use tempfile::TempDir;
 
@@ -449,15 +450,17 @@ fn write_read_roundtrip_on_each_family() {
         assert_eq!(got.track_no, expected.track_no, "{name}: track no");
         assert_eq!(got.track_total, expected.track_total, "{name}: track total");
         assert_eq!(got.disc_no, expected.disc_no, "{name}: disc no");
-        // ReplayGain maps back in the ID3 and Vorbis families. MP4 has no
-        // plain-text key for it, so it is dropped there.
-        if name != "sine_aac.m4a" && name != "sine_alac.m4a" {
-            assert_eq!(
-                got.extra.get("REPLAYGAIN_TRACK_GAIN"),
-                expected.extra.get("REPLAYGAIN_TRACK_GAIN"),
-                "{name}: replaygain"
-            );
-        }
+        // The four classic ReplayGain keys round-trip in every family: ID3v2
+        // holds them as TXXX frames, Vorbis comments and APEv2 as plain
+        // keys, and MP4 ilst as freeform
+        // `----:com.apple.iTunes:replaygain_*` atoms (written by ItemKey,
+        // not by short key name — a short-name lookup finds nothing in the
+        // ilst map).
+        assert_eq!(
+            got.extra.get("REPLAYGAIN_TRACK_GAIN"),
+            expected.extra.get("REPLAYGAIN_TRACK_GAIN"),
+            "{name}: replaygain"
+        );
     }
 }
 
@@ -664,4 +667,186 @@ fn a_file_that_is_not_media_is_never_written_to() {
     let notes = write_file(&dir, "notes.txt", b"hello, this is not audio");
     assert!(write_tags(&notes, &full_metadata()).is_err());
     assert_eq!(std::fs::read(&notes).unwrap(), b"hello, this is not audio");
+}
+
+// ---------------------------------------------------------------------------
+// ReplayGain (task card E4)
+// ---------------------------------------------------------------------------
+
+/// A ReplayGain set that exercises every carried key.
+fn full_replaygain() -> ReplayGainTags {
+    ReplayGainTags {
+        track_gain_db: Some(-3.5),
+        track_peak: Some(0.987654),
+        album_gain_db: Some(-5.1),
+        album_peak: Some(0.999),
+        r128_track_gain_q8: Some(-1152),
+        r128_album_gain_q8: Some(-1280),
+    }
+}
+
+#[test]
+fn classic_replaygain_keys_roundtrip_on_every_family() {
+    let dir = TempDir::new().unwrap();
+    for name in [
+        "sine.flac",
+        "sine.mp3",
+        "sine.ogg",
+        "sine_aac.m4a",
+        "sine_alac.m4a",
+    ] {
+        let path = copy_fixture(&dir, name);
+        let expected = ReplayGainTags {
+            track_gain_db: Some(-3.5),
+            track_peak: Some(0.987654),
+            album_gain_db: Some(-5.1),
+            album_peak: Some(0.999),
+            r128_track_gain_q8: None,
+            r128_album_gain_q8: None,
+        };
+
+        let report = write_replaygain(&path, &expected).unwrap();
+        assert!(
+            report.is_complete(),
+            "{name}: skipped {:?}",
+            report.skipped_unsupported
+        );
+
+        let got = ReplayGainTags::from_metadata(&read_tags(&path).unwrap());
+        assert_eq!(got, expected, "{name}");
+    }
+}
+
+#[test]
+fn r128_keys_roundtrip_on_vorbis_and_are_refused_loudly_elsewhere() {
+    let dir = TempDir::new().unwrap();
+
+    for name in ["sine.flac", "sine.ogg"] {
+        let path = copy_fixture(&dir, name);
+        let tags = ReplayGainTags {
+            r128_track_gain_q8: Some(-1152),
+            r128_album_gain_q8: Some(-1280),
+            ..ReplayGainTags::default()
+        };
+        let report = write_replaygain(&path, &tags).unwrap();
+        assert!(
+            report.is_complete(),
+            "{name}: skipped {:?}",
+            report.skipped_unsupported
+        );
+        assert_eq!(
+            ReplayGainTags::from_metadata(&read_tags(&path).unwrap()),
+            tags,
+            "{name}"
+        );
+    }
+
+    // ID3v2 and MP4 ilst have no field for R128: the write lands the classic
+    // keys and reports the R128 ones instead of dropping them silently.
+    for name in ["sine.mp3", "sine_aac.m4a"] {
+        let path = copy_fixture(&dir, name);
+        let report = write_replaygain(&path, &full_replaygain()).unwrap();
+        assert!(!report.is_complete(), "{name}");
+        assert_eq!(
+            report.skipped_unsupported,
+            vec![
+                R128_TRACK_GAIN_KEY.to_owned(),
+                R128_ALBUM_GAIN_KEY.to_owned()
+            ],
+            "{name}"
+        );
+        // The classic keys still landed.
+        let got = ReplayGainTags::from_metadata(&read_tags(&path).unwrap());
+        assert_eq!(got.track_gain_db, Some(-3.5), "{name}");
+        assert!(got.r128_track_gain_q8.is_none(), "{name}");
+    }
+}
+
+#[test]
+fn reference_loudness_is_reported_as_skipped_not_dropped() {
+    // No tag format lofty 0.25.4 supports carries this key, so it is always
+    // reported — on every family — while the rest of the write still lands.
+    let dir = TempDir::new().unwrap();
+    for name in ["sine.flac", "sine.mp3", "sine_aac.m4a"] {
+        let path = copy_fixture(&dir, name);
+        let mut metadata = TrackMetadata {
+            title: Some("Loudness Title".into()),
+            ..TrackMetadata::default()
+        };
+        metadata
+            .extra
+            .insert(REFERENCE_LOUDNESS_KEY.into(), "89 dB SPL".into());
+
+        let report = write_tags_report(&path, &metadata).unwrap();
+        assert_eq!(
+            report.unwritten_extra,
+            vec![REFERENCE_LOUDNESS_KEY.to_owned()],
+            "{name}"
+        );
+
+        let got = read_tags(&path).unwrap();
+        assert_eq!(got.title.as_deref(), Some("Loudness Title"), "{name}");
+    }
+}
+
+#[test]
+fn writing_replaygain_leaves_other_tags_untouched() {
+    let dir = TempDir::new().unwrap();
+    let path = copy_fixture(&dir, "sine.mp3");
+    let before = read_tags(&path).unwrap();
+
+    let tags = ReplayGainTags {
+        track_gain_db: Some(-3.5),
+        track_peak: Some(0.987654),
+        ..ReplayGainTags::default()
+    };
+    let report = write_replaygain(&path, &tags).unwrap();
+    assert!(report.is_complete());
+    assert_eq!(
+        report.written,
+        vec![
+            "REPLAYGAIN_TRACK_GAIN".to_owned(),
+            "REPLAYGAIN_TRACK_PEAK".to_owned()
+        ]
+    );
+
+    let got = read_tags(&path).unwrap();
+    assert_eq!(got.title, before.title);
+    assert_eq!(got.artist, before.artist);
+    assert_eq!(got.album, before.album);
+    assert_eq!(got.track_no, before.track_no);
+    assert_eq!(got.track_total, before.track_total);
+    let replaygain = ReplayGainTags::from_metadata(&got);
+    assert_eq!(replaygain.track_gain_db, Some(-3.5));
+    assert_eq!(replaygain.track_peak, Some(0.987654));
+    assert!(replaygain.album_gain_db.is_none());
+}
+
+#[test]
+fn album_keys_and_full_metadata_share_one_roundtrip() {
+    // Album gain/peak travel through the same path; check them together with
+    // the plain `write_tags` entry point on an MP4 file (the family that used
+    // to lose these keys).
+    let dir = TempDir::new().unwrap();
+    let path = copy_fixture(&dir, "sine_alac.m4a");
+    let mut metadata = TrackMetadata::default();
+    metadata
+        .extra
+        .insert(ALBUM_GAIN_KEY.into(), "-5.10 dB".into());
+    metadata
+        .extra
+        .insert(ALBUM_PEAK_KEY.into(), "0.999000".into());
+
+    let report = write_tags_report(&path, &metadata).unwrap();
+    assert!(report.is_complete());
+
+    let got = read_tags(&path).unwrap();
+    assert_eq!(
+        got.extra.get(ALBUM_GAIN_KEY).map(String::as_str),
+        Some("-5.10 dB")
+    );
+    assert_eq!(
+        got.extra.get(ALBUM_PEAK_KEY).map(String::as_str),
+        Some("0.999000")
+    );
 }

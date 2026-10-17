@@ -39,6 +39,11 @@ const EXTRA_ITEMS: &[(ItemKey, &str)] = &[
     (ItemKey::ReplayGainTrackPeak, "REPLAYGAIN_TRACK_PEAK"),
     (ItemKey::ReplayGainAlbumGain, "REPLAYGAIN_ALBUM_GAIN"),
     (ItemKey::ReplayGainAlbumPeak, "REPLAYGAIN_ALBUM_PEAK"),
+    // The Opus/R128 loudness variants: carried by the Vorbis family only
+    // (see `replaygain` for the per-format table). Reading them here keeps
+    // them in `extra`, so they survive a read-write round trip there.
+    (ItemKey::R128TrackGain, "R128_TRACK_GAIN"),
+    (ItemKey::R128AlbumGain, "R128_ALBUM_GAIN"),
     (ItemKey::Isrc, "ISRC"),
     (ItemKey::Barcode, "BARCODE"),
     (ItemKey::CatalogNumber, "CATALOGNUMBER"),

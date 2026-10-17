@@ -43,7 +43,8 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   additive option; none is exposed yet.
 - **`extra`.** A fixed list of well-known items that have no
   `TrackMetadata` field is copied into `extra` under their conventional
-  upper-case name (ReplayGain, ISRC, MusicBrainz IDs, composer, label, ...).
+  upper-case name (ReplayGain, including the Vorbis-only `R128_*_GAIN`
+  loudness variants, ISRC, MusicBrainz IDs, composer, label, ...).
   `DISCTOTAL` is put there too, because there is no `disc_total` field yet.
 - **Pictures.** `TrackMetadata` has no field for cover art, so pictures are
   returned by `read_artwork` as `Artwork` values (picture type, MIME type,
@@ -106,5 +107,39 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   may read as empty metadata (`non_media_files_error_or_stay_default` accepts
   both outcomes). Making those errors needs a decision on strict parsing
   (`ParsingMode::Strict`) and a "report skipped items" API; no spec asks for it.
-- Round trip losses: see the `write_read_roundtrip_on_each_family` comment
-  (MP4 lacks a plain-text ReplayGain key); total/track strings are numbers only.
+- Round trip losses: total/track strings are numbers only.
+
+## Audit (card E4 — ReplayGain)
+
+- **MP4 loss fixed.** `extra` used to be written through
+  `ItemKey::from_key(tag_type, name)`, whose ilst table only knows the
+  freeform `----:com.apple.iTunes:replaygain_*` form, so the four classic
+  ReplayGain keys were silently dropped on MP4. They are now looked up in a
+  canonical table (`replaygain::EXTRA_ITEM_KEYS`) and inserted by `ItemKey`,
+  which writes exactly those freeform atoms; the round-trip test asserts all
+  four keys on all five fixture families.
+- **Silence is now opt-in, not default.** `write_tags` keeps its best-effort
+  signature (existing callers unchanged), but `write_tags_report` names every
+  refused `extra` key in `WriteReport::unwritten_extra`, and
+  `replaygain::write_replaygain` returns which keys landed and which were
+  skipped. Callers that must know whether a write happened use those.
+- **Per-format honest answers** (from `lofty` 0.25.4's key tables, verified by
+  reading them, not by guessing): the four classic keys read and write on
+  ID3v2 (MP3/AAC/AIFF/WAV via `TXXX`), Vorbis comments (FLAC/Ogg/Opus/Speex),
+  MP4 ilst (freeform) and APEv2 (APE/MPC/WavPack). `R128_TRACK_GAIN` /
+  `R128_ALBUM_GAIN` exist only in the Vorbis map, so they round-trip there
+  and are reported as skipped everywhere else. `REPLAYGAIN_REFERENCE_LOUDNESS`
+  has no `ItemKey` at all (unmapped keys are discarded on read), so the tag
+  layer cannot carry it on any format; it is a named constant
+  (`replaygain::REFERENCE_LOUDNESS_KEY`) and every write lists it as skipped.
+  RIFF INFO, AIFF text and ID3v1 carry no ReplayGain keys, and no file format
+  uses them as its primary (write-target) tag.
+- **Analysis is a documented estimator, not a reference implementation.**
+  `replaygain::analyze_replaygain` is pure (samples + channels + rate in,
+  gain + peak out, no I/O) with the 89 dB SPL pink-noise reference anchored
+  so a full-scale sine is 0 dB. It is RMS-only: no K-weighting, no gating,
+  no channel weights, no equal-loudness contour, and the rate argument is
+  validated but does not change the number. Silence measures 0 dB gain by
+  own choice; gain clamps at ±51 dB by own choice; non-finite samples and
+  ragged frames are refused loudly. Not EBU R128, not bit-identical to
+  mp3gain/metaflac/foobar2000/loudgain.
