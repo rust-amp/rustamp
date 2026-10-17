@@ -22,7 +22,9 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  golden [--bless] [--skin <name>]   run golden tests (test fns named `golden_*`)
+  golden [--bless] [--check] [--skin <name>]
+                                     run golden tests (test fns named `golden_*`)
+  golden-check [--skin <name>]       verify golden images match (exits non-zero on mismatch/missing)
   capture [options]                  capture a window to PNG (Windows only); see `capture --help`
   ring-cross                         cross-bitness shared-memory ring check (Windows only)
   wake-cross                         cross-bitness blocking wake check (RFC 0007, Windows only)
@@ -35,6 +37,7 @@ fn main() -> ExitCode {
     let rest: Vec<String> = args.collect();
     let result = match cmd.as_deref() {
         Some("golden") => golden(&rest),
+        Some("golden-check" | "check-golden" | "check-goldens") => golden_check(&rest),
         Some("capture") => capture::run(&rest),
         Some("ring-cross") => ring_cross::run(&rest),
         Some("wake-cross") => wake_cross::run(&rest),
@@ -114,7 +117,7 @@ fn plughost(args: &[String]) -> Result<(), String> {
     run_status(&mut cmd)
 }
 
-/// `cargo xtask golden [--bless] [--skin <name>]`
+/// `cargo xtask golden [--bless] [--check] [--skin <name>]`
 ///
 /// Convention: golden tests are ordinary `#[test]` functions whose names start
 /// with `golden_`. By convention they embed the skin namespace, i.e.
@@ -122,14 +125,22 @@ fn plughost(args: &[String]) -> Result<(), String> {
 /// narrows the libtest filter to `golden_<skin with '-' -> '_'>`.
 fn golden(args: &[String]) -> Result<(), String> {
     let mut bless = false;
+    let mut check = false;
     let mut skin: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--bless" => bless = true,
+            "--check" => check = true,
             "--skin" => skin = Some(it.next().ok_or("--skin needs a value")?.clone()),
             other => return Err(format!("unknown golden option `{other}`")),
         }
+    }
+    if check && bless {
+        return Err(
+            "--check and --bless are mutually exclusive; check mode refuses to overwrite goldens"
+                .to_string(),
+        );
     }
     let filter = match &skin {
         Some(s) => format!("golden_{}", s.replace('-', "_")),
@@ -145,11 +156,16 @@ fn golden(args: &[String]) -> Result<(), String> {
             "test",
             "--workspace",
             "--all-features",
+            "--tests",
             "--no-fail-fast",
             "--",
         ])
         .arg(&filter);
-    if bless {
+    if check {
+        cmd.env_remove("RUSTAMP_BLESS");
+        cmd.env("RUSTAMP_BLESS", "0");
+        println!("xtask golden: check mode (verifying committed images; blessing disabled)");
+    } else if bless {
         cmd.env("RUSTAMP_BLESS", "1");
         println!("xtask golden: blessing enabled (RUSTAMP_BLESS=1)");
     }
@@ -171,7 +187,29 @@ fn golden(args: &[String]) -> Result<(), String> {
     for f in &files {
         println!("  {}", f.strip_prefix(&root).unwrap_or(f).display());
     }
+
+    if check {
+        if result.is_err() || !files.is_empty() {
+            return Err(format!(
+                "golden check failed: {} mismatch artifact(s) found or test exited with error",
+                files.len()
+            ));
+        }
+        println!("xtask golden: check passed (all golden images matched)");
+        return Ok(());
+    }
+
     result
+}
+
+/// `cargo xtask golden-check [--skin <name>]`
+///
+/// Runs the golden comparison in non-mutating check mode and exits non-zero on
+/// any mismatch or missing image. Blessing is disallowed.
+fn golden_check(args: &[String]) -> Result<(), String> {
+    let mut check_args = vec!["--check".to_string()];
+    check_args.extend_from_slice(args);
+    golden(&check_args)
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -185,5 +223,28 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
         } else {
             out.push(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn golden_check_and_bless_are_mutually_exclusive() {
+        let err = golden(&["--check".to_string(), "--bless".to_string()]).unwrap_err();
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn golden_check_subcommand_rejects_bless() {
+        let err = golden_check(&["--bless".to_string()]).unwrap_err();
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn golden_unknown_option_fails() {
+        let err = golden(&["--invalid-flag".to_string()]).unwrap_err();
+        assert!(err.contains("unknown golden option"));
     }
 }

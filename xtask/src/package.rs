@@ -29,6 +29,14 @@ const HOST_CRATE: &str = "rustamp-plughost";
 const HOST_BIN: &str = "rustamp-plughost32";
 const HOST_TARGET: &str = "i686-pc-windows-msvc";
 
+const DECHOST_CRATE: &str = "rustamp-dechost";
+const DECHOST_BIN: &str = "rustamp-dechost-symphonia";
+const DECHOST_TARGET: &str = "x86_64-pc-windows-msvc";
+
+const DSPHOST_CRATE: &str = "rustamp-dsphost";
+const DSPHOST_BIN: &str = "rustamp-dsphost-stages";
+const DSPHOST_TARGET: &str = "x86_64-pc-windows-msvc";
+
 // Encoded flags take precedence over inherited RUSTFLAGS and Cargo target
 // rustflags. Own the complete package-build flags rather than allowing a caller
 // to silently negate the runtime policy. Explicit --target keeps these flags
@@ -74,16 +82,24 @@ pub fn run(args: &[String]) -> Result<(), String> {
             println!("  scope: player + host");
         }
         println!("  player target:  {} ({})", PLAYER_TARGET, PLAYER_CRATE);
+        println!("  decoder host:   {} ({})", DECHOST_TARGET, DECHOST_CRATE);
+        println!("  DSP host:       {} ({})", DSPHOST_TARGET, DSPHOST_CRATE);
         println!("  host target:    {} ({})", HOST_TARGET, HOST_CRATE);
         println!("  GPL-free check: OK (host closure contains no copyleft crate)");
-        println!(
-            "  runtime contract: OK (both targets: static MSVC CRT, no VC redist/DLL payload)"
-        );
+        println!("  runtime contract: OK (all targets: static MSVC CRT, no VC redist/DLL payload)");
         println!(
             "  prerequisites: Windows x64; WOW64 for the i686 host; system DLLs remain required"
         );
         println!("  output: generated QUICKSTART.md and runtime policy in all manifests");
         println!("  not proven: DLL imports or first launch on a clean OS");
+        if !parsed.host_only {
+            println!(
+                "  player ships residents: {} and {} beside {}",
+                binary_name(DECHOST_BIN),
+                binary_name(DSPHOST_BIN),
+                binary_name(PLAYER_BIN)
+            );
+        }
         if !parsed.player_only && !parsed.host_only {
             println!(
                 "  player bundles host: yes ({} beside {}: RFC 0006 §8, \
@@ -142,6 +158,28 @@ pub fn run(args: &[String]) -> Result<(), String> {
     } else {
         None
     };
+    let dechost_src = if build_player {
+        Some(build_artifact(
+            &root,
+            DECHOST_CRATE,
+            DECHOST_TARGET,
+            DECHOST_BIN,
+            parsed.release,
+        )?)
+    } else {
+        None
+    };
+    let dsphost_src = if build_player {
+        Some(build_artifact(
+            &root,
+            DSPHOST_CRATE,
+            DSPHOST_TARGET,
+            DSPHOST_BIN,
+            parsed.release,
+        )?)
+    } else {
+        None
+    };
     let host_src = if build_host {
         Some(build_artifact(
             &root,
@@ -161,6 +199,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
         fs::create_dir_all(&dir).map_err(|e| format!("create player dir: {e}"))?;
         let dest_bin = dir.join(binary_name(PLAYER_BIN));
         fs::copy(src, &dest_bin).map_err(|e| format!("copy player binary: {e}"))?;
+        if let Some(dechost) = &dechost_src {
+            let dest_dechost = dir.join(binary_name(DECHOST_BIN));
+            fs::copy(dechost, &dest_dechost)
+                .map_err(|e| format!("copy decoder resident binary: {e}"))?;
+        }
+        if let Some(dsphost) = &dsphost_src {
+            let dest_dsphost = dir.join(binary_name(DSPHOST_BIN));
+            fs::copy(dsphost, &dest_dsphost)
+                .map_err(|e| format!("copy DSP resident binary: {e}"))?;
+        }
         copy_file(&root.join("LICENSE"), &dir.join("LICENSE"))?;
         copy_file(
             &root.join("PLUGIN-EXCEPTION.md"),
@@ -190,6 +238,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
         manifest_items.push("player".to_string());
         println!("xtask package: player -> {}", dir.display());
+        println!(
+            "xtask package: player includes residents: {} and {} beside {}",
+            binary_name(DECHOST_BIN),
+            binary_name(DSPHOST_BIN),
+            binary_name(PLAYER_BIN)
+        );
         if bundled_host {
             println!(
                 "xtask package: player bundles {} beside {} \
@@ -543,6 +597,22 @@ fn build_top_manifest(
         lines.push(format!("    \"crate\": \"{PLAYER_CRATE}\","));
         lines.push(format!("    \"target\": \"{PLAYER_TARGET}\","));
         lines.push(format!("    \"runtime\": {RUNTIME_MANIFEST},"));
+        lines.push(format!(
+            "    \"decoder_host\": \"player/{}\",",
+            binary_name(DECHOST_BIN)
+        ));
+        lines.push(format!("    \"decoder_host_crate\": \"{DECHOST_CRATE}\","));
+        lines.push(format!(
+            "    \"decoder_host_target\": \"{DECHOST_TARGET}\","
+        ));
+        lines.push(format!("    \"decoder_host_runtime\": {RUNTIME_MANIFEST},"));
+        lines.push(format!(
+            "    \"dsp_host\": \"player/{}\",",
+            binary_name(DSPHOST_BIN)
+        ));
+        lines.push(format!("    \"dsp_host_crate\": \"{DSPHOST_CRATE}\","));
+        lines.push(format!("    \"dsp_host_target\": \"{DSPHOST_TARGET}\","));
+        lines.push(format!("    \"dsp_host_runtime\": {RUNTIME_MANIFEST},"));
         if bundled_host {
             lines.push(format!("    \"bundled_host_runtime\": {RUNTIME_MANIFEST},"));
             lines.push("    \"bundled_host_requires_wow64_on_x64\": true,".to_string());
@@ -604,7 +674,16 @@ fn serde_manifest_player(profile: &str, bundled_host: bool) -> String {
     };
     format!(
         "{{\n  \"package\": \"rustamp-player\",\n  \"profile\": \"{profile}\",\n  \
-         \"binary\": \"{bin}\",{bundled}\n  \"crate\": \"{crate_}\",\n  \
+         \"binary\": \"{bin}\",{bundled}\n  \
+         \"decoder_host\": \"{dechost_bin}\",\n  \
+         \"decoder_host_crate\": \"{dechost_crate}\",\n  \
+         \"decoder_host_target\": \"{dechost_target}\",\n  \
+         \"decoder_host_runtime\": {RUNTIME_MANIFEST},\n  \
+         \"dsp_host\": \"{dsphost_bin}\",\n  \
+         \"dsp_host_crate\": \"{dsphost_crate}\",\n  \
+         \"dsp_host_target\": \"{dsphost_target}\",\n  \
+         \"dsp_host_runtime\": {RUNTIME_MANIFEST},\n  \
+         \"crate\": \"{crate_}\",\n  \
          \"target\": \"{target}\",\n  \"license\": \"GPL-3.0-or-later\",\n  \
          \"runtime\": {RUNTIME_MANIFEST},\n  \"quickstart\": \"QUICKSTART.md\",\n  \
          \"license_files\": [\"LICENSE\", \"PLUGIN-EXCEPTION.md\"],\n  \
@@ -612,6 +691,12 @@ fn serde_manifest_player(profile: &str, bundled_host: bool) -> String {
         profile = profile,
         bin = binary_name(PLAYER_BIN),
         bundled = bundled_line,
+        dechost_bin = binary_name(DECHOST_BIN),
+        dechost_crate = DECHOST_CRATE,
+        dechost_target = DECHOST_TARGET,
+        dsphost_bin = binary_name(DSPHOST_BIN),
+        dsphost_crate = DSPHOST_CRATE,
+        dsphost_target = DSPHOST_TARGET,
         crate_ = PLAYER_CRATE,
         target = PLAYER_TARGET,
     )
@@ -679,7 +764,8 @@ GUI errors are not all visible yet; apparent playback is not proof of sound.
 
 No configuration file is needed. It reads %APPDATA%\Rustamp\rustamp.toml
 (or the RUSTAMP_CONFIG override); UI changes are not saved by this beta.
-The helper is not a user entry point; do not launch it directly.
+The helper binaries (rustamp-plughost32.exe, rustamp-dechost-symphonia.exe,
+rustamp-dsphost-stages.exe) are internal background processes, not user entry points.
 This folder is not an installer or a signed/externally cleared release.
 "#
     .to_string();
@@ -700,6 +786,8 @@ fn check_runtime_contract(root: &Path) -> Result<(), String> {
     for (crate_name, target, bin) in [
         (PLAYER_CRATE, PLAYER_TARGET, PLAYER_BIN),
         (HOST_CRATE, HOST_TARGET, HOST_BIN),
+        (DECHOST_CRATE, DECHOST_TARGET, DECHOST_BIN),
+        (DSPHOST_CRATE, DSPHOST_TARGET, DSPHOST_BIN),
     ] {
         for release in [false, true] {
             let cmd = artifact_command(root, crate_name, target, bin, release);
@@ -822,6 +910,8 @@ fn audit_package_layout(out: &Path, profile: &str, player: bool, host: bool) -> 
         dirs.push("player");
         let mut files = vec![
             "rustamp.exe",
+            "rustamp-dechost-symphonia.exe",
+            "rustamp-dsphost-stages.exe",
             "LICENSE",
             "PLUGIN-EXCEPTION.md",
             "manifest.json",
@@ -869,7 +959,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_package_commands_and_manifests_enforce_static_crt() {
+    fn all_four_package_commands_and_manifests_enforce_static_crt() {
         check_runtime_contract(Path::new("workspace")).expect("static CRT contract");
     }
 
@@ -899,7 +989,13 @@ mod tests {
                 (
                     player,
                     "player",
-                    &["rustamp.exe", "LICENSE", "PLUGIN-EXCEPTION.md"][..],
+                    &[
+                        "rustamp.exe",
+                        "rustamp-dechost-symphonia.exe",
+                        "rustamp-dsphost-stages.exe",
+                        "LICENSE",
+                        "PLUGIN-EXCEPTION.md",
+                    ][..],
                     serde_manifest_player("release", host),
                 ),
                 (
@@ -961,6 +1057,16 @@ mod tests {
     }
 
     #[test]
+    fn resident_binary_names_match_the_crates() {
+        assert_eq!(binary_name(DECHOST_BIN), "rustamp-dechost-symphonia.exe");
+        assert_eq!(binary_name(DSPHOST_BIN), "rustamp-dsphost-stages.exe");
+        assert_eq!(DECHOST_CRATE, "rustamp-dechost");
+        assert_eq!(DSPHOST_CRATE, "rustamp-dsphost");
+        assert_eq!(DECHOST_TARGET, "x86_64-pc-windows-msvc");
+        assert_eq!(DSPHOST_TARGET, "x86_64-pc-windows-msvc");
+    }
+
+    #[test]
     fn player_manifest_records_the_bundled_host() {
         let with = serde_manifest_player("release", true);
         assert!(
@@ -982,6 +1088,27 @@ mod tests {
     }
 
     #[test]
+    fn player_manifest_records_the_residents() {
+        let manifest = serde_manifest_player("release", true);
+        assert!(
+            manifest.contains("\"decoder_host\": \"rustamp-dechost-symphonia.exe\""),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("\"decoder_host_crate\": \"rustamp-dechost\""),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("\"dsp_host\": \"rustamp-dsphost-stages.exe\""),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("\"dsp_host_crate\": \"rustamp-dsphost\""),
+            "{manifest}"
+        );
+    }
+
+    #[test]
     fn host_manifest_stays_gpl_free_and_player_free() {
         let manifest = serde_manifest_host("release");
         assert!(
@@ -994,6 +1121,8 @@ mod tests {
         );
         assert!(!manifest.contains("rustamp.exe"), "{manifest}");
         assert!(!manifest.contains("PLUGIN-EXCEPTION"), "{manifest}");
+        assert!(!manifest.contains("rustamp-dechost"), "{manifest}");
+        assert!(!manifest.contains("rustamp-dsphost"), "{manifest}");
     }
 
     #[test]
@@ -1027,6 +1156,57 @@ mod tests {
             "{host_only}"
         );
         assert!(!host_only.contains("bundled_host"), "{host_only}");
+    }
+
+    #[test]
+    fn top_manifest_records_the_residents() {
+        let manifest = build_top_manifest(Path::new("out"), "release", true, true, true);
+        assert!(
+            manifest.contains("\"decoder_host\": \"player/rustamp-dechost-symphonia.exe\""),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("\"dsp_host\": \"player/rustamp-dsphost-stages.exe\""),
+            "{manifest}"
+        );
+    }
+
+    #[test]
+    fn layout_audit_rejects_missing_residents() {
+        let base = std::env::temp_dir().join(format!(
+            "rustamp-package-layout-missing-res-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let out = base.join("test");
+        fs::create_dir_all(out.join("player")).unwrap();
+        let guide = quickstart("release", true, true);
+        fs::write(out.join("QUICKSTART.md"), &guide).unwrap();
+        fs::write(out.join("player/QUICKSTART.md"), &guide).unwrap();
+        fs::write(
+            out.join("manifest.json"),
+            build_top_manifest(&out, "release", true, true, true),
+        )
+        .unwrap();
+        fs::write(
+            out.join("player/manifest.json"),
+            serde_manifest_player("release", true),
+        )
+        .unwrap();
+        for file in [
+            "rustamp.exe",
+            "rustamp-plughost32.exe",
+            "LICENSE",
+            "PLUGIN-EXCEPTION.md",
+        ] {
+            fs::write(out.join("player").join(file), b"stub").unwrap();
+        }
+        // Missing rustamp-dechost-symphonia.exe and rustamp-dsphost-stages.exe
+        assert!(audit_package_layout(&out, "release", true, true).is_err());
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
