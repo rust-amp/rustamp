@@ -344,11 +344,13 @@ impl DspStage for Limiter {
             let at = self.delay_pos * channels;
             for (sample, slot) in frame.iter_mut().zip(&mut self.delay[at..at + channels]) {
                 let delayed = std::mem::replace(slot, *sample);
-                *sample = if gain == 1.0 {
-                    delayed
-                } else {
-                    guard((f64::from(delayed) * gain) as f32, ceiling)
-                };
+                // Always guard, never bypass on `gain == 1.0`: the gain can be
+                // exactly 1.0 while the delayed sample is still hot (the attack
+                // ramp's fast path when nothing is currently below 1.0), and a
+                // bypass there would let a sample above the ceiling through.
+                // `clamp` is exact for a sample already inside the ceiling, so
+                // a quiet signal stays bit-exact.
+                *sample = guard((f64::from(delayed) * gain) as f32, ceiling);
             }
             self.delay_pos += 1;
             if self.delay_pos == self.lookahead {
