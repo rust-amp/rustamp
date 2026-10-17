@@ -131,12 +131,19 @@ mod backend {
         })
     }
 
-    /// Wait on the event (`WaitForSingleObject`).
-    pub(super) fn do_wait(
-        handle: &Handle,
-        timeout: Option<Duration>,
-    ) -> Result<WaitOutcome, RingError> {
-        let ms: u32 = match timeout {
+    /// Map a wait timeout to the `WaitForSingleObject` millisecond argument
+    /// (RFC 0007 §6.4): the duration is rounded up to whole milliseconds, so
+    /// a positive sub-millisecond duration becomes 1 ms. `Duration::ZERO`
+    /// maps to 0, which polls the event without blocking, and `None` maps to
+    /// `INFINITE`.
+    ///
+    /// This mapping is the mechanism's entire contribution to wait timing:
+    /// everything after it is the operating system's timer behaviour, which
+    /// the documented sub-clock-resolution caveat allows to expire early. It
+    /// is a pure function so the suite can pin it exactly (see the test in
+    /// this module) instead of inferring it from wall-clock measurements.
+    pub(super) fn timeout_ms(timeout: Option<Duration>) -> u32 {
+        match timeout {
             None => INFINITE,
             Some(d) => {
                 let base_ms = u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
@@ -152,7 +159,15 @@ mod backend {
                     rounded
                 }
             }
-        };
+        }
+    }
+
+    /// Wait on the event (`WaitForSingleObject`).
+    pub(super) fn do_wait(
+        handle: &Handle,
+        timeout: Option<Duration>,
+    ) -> Result<WaitOutcome, RingError> {
+        let ms = timeout_ms(timeout);
         // SAFETY: `handle` is a valid event handle owned by this `RingWake`.
         let result = unsafe { WaitForSingleObject(*handle, ms) };
         match result {
@@ -480,5 +495,44 @@ mod tests {
         );
         peer.close();
         peer.close(); // idempotent
+    }
+
+    /// The mechanism's own timing contract is exact and deterministic
+    /// (RFC 0007 §6.4): the timeout is rounded up to whole milliseconds
+    /// before it reaches `WaitForSingleObject`. This is the only part of
+    /// wait timing the implementation controls; everything after it is OS
+    /// timer behaviour (task G5).
+    #[cfg(windows)]
+    #[test]
+    fn timeout_ms_rounds_the_request_up_to_whole_milliseconds() {
+        // Whole milliseconds pass through unchanged.
+        assert_eq!(
+            super::backend::timeout_ms(Some(Duration::from_millis(10))),
+            10
+        );
+        assert_eq!(
+            super::backend::timeout_ms(Some(Duration::from_millis(1))),
+            1
+        );
+        // A fractional millisecond rounds up.
+        assert_eq!(
+            super::backend::timeout_ms(Some(Duration::from_micros(1500))),
+            2
+        );
+        // A positive sub-millisecond duration becomes 1 ms.
+        assert_eq!(
+            super::backend::timeout_ms(Some(Duration::from_micros(500))),
+            1
+        );
+        assert_eq!(super::backend::timeout_ms(Some(Duration::from_nanos(1))), 1);
+        // Zero polls the event without blocking.
+        assert_eq!(super::backend::timeout_ms(Some(Duration::ZERO)), 0);
+        // No timeout is infinite.
+        assert_eq!(super::backend::timeout_ms(None), u32::MAX); // INFINITE
+        // A duration past u32 milliseconds clamps instead of wrapping.
+        assert_eq!(
+            super::backend::timeout_ms(Some(Duration::from_secs(60 * 60 * 24 * 400))),
+            u32::MAX
+        );
     }
 }

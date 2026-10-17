@@ -1821,14 +1821,18 @@ mod tests {
     /// A timed-out wait returns `TimedOut` / `Ok(0)`, not `Err` or a hang
     /// (RFC 0007 §6.4, acceptance criterion 5).
     ///
-    /// The lower bound asserts that the wait actually blocked (elapsed >= 1 ms)
-    /// rather than returning immediately. On Windows with standard timer
-    /// resolution (~15.625 ms), a 10 ms wait evaluates against the kernel timer
-    /// tick and may expire in ~7–8 ms if invoked midway through a tick interval
-    /// (per Microsoft documentation for Win32 wait functions). An assertion of
-    /// `>= 8 ms` failed in the VM due to this tick quantization, not an IPC
-    /// defect. Detailed multi-duration tolerance is measured in
-    /// `blocking_timeout_accuracy_across_durations`.
+    /// The `>= 1 ms` lower bound is a smoke floor, not a precision
+    /// measurement: it proves the call entered the kernel wait and did not
+    /// return instantly. The earlier `>= 8 ms` bound failed in the VM, and
+    /// the documented Win32 caveat allows a wait shorter than the system
+    /// clock resolution to time out early, so no tighter wall-clock bound
+    /// follows from the mechanism. The tick-boundary explanation this
+    /// comment used to give (a tick 7–8 ms after the call expiring a 10 ms
+    /// timer) was self-inconsistent and is withdrawn; how early the kernel
+    /// actually expires a sub-tick wait is unmeasured in this tree. What the
+    /// mechanism does control exactly — the millisecond value handed to
+    /// `WaitForSingleObject` — is pinned by the `timeout_ms` test in
+    /// `wake.rs`. Task G5 records the rest.
     #[test]
     fn blocking_timeout_returns_timed_out() {
         let (_producer, mut consumer) = pcm_ring_with_wake(8, 2);
@@ -1847,7 +1851,9 @@ mod tests {
         );
     }
 
-    /// A timed-out `wait_readable` returns `TimedOut`.
+    /// A timed-out `wait_readable` returns `TimedOut`. The bounds are the same
+    /// smoke floor and hang guard as `blocking_timeout_returns_timed_out`
+    /// (task G5): `>= 1 ms` proves kernel entry, not precision.
     #[test]
     fn wait_readable_returns_timeout() {
         let (_producer, consumer) = pcm_ring_with_wake(8, 2);
@@ -1865,10 +1871,25 @@ mod tests {
         );
     }
 
-    /// Measure blocking wait timeout across several durations and multiple runs.
-    /// Fails if any wait returns materially early (task G3 / RFC 0007 §6.4).
+    /// The blocking wait honours its bounds across several durations and
+    /// multiple runs (task G3, made honest by task G5).
+    ///
+    /// This is a bounds check, not a precision measurement, and the old name
+    /// (`blocking_timeout_accuracy_across_durations`) overclaimed. The code
+    /// itself never returns early — `Ok(0)` is returned only when the kernel
+    /// reports `WAIT_TIMEOUT` — but the documented Win32 caveat allows a wait
+    /// shorter than the system clock resolution (~15.625 ms) to expire early,
+    /// so the only wall-clock assertion that follows from the mechanism is a
+    /// kernel-entry smoke floor. For the 10 ms case the lower bound below
+    /// proves the call entered the kernel and did not return instantly; it
+    /// cannot catch an early expiry of up to 9 ms, and no in-tree wall-clock
+    /// bound can — that would measure the OS, not the code. The mechanism's
+    /// own timing contract (the exact millisecond value passed to
+    /// `WaitForSingleObject`) is pinned deterministically by the `timeout_ms`
+    /// test in `wake.rs`; the OS behaviour itself is what the
+    /// `wake_timeout_probe` example measures (task G5).
     #[test]
-    fn blocking_timeout_accuracy_across_durations() {
+    fn blocking_timeout_bounds_hold_across_durations() {
         const RUNS: usize = 5;
         let durations = [
             Duration::from_millis(10),
@@ -1891,23 +1912,24 @@ mod tests {
                     "expected Ok(0) on timeout for {requested:?}, run {run}"
                 );
 
-                // Lower bound tolerance:
-                // Standard Windows kernel timer resolution is ~15.625ms (64 Hz).
-                // A timeout can expire up to one tick early if started midway through
-                // a timer interval (as documented by Microsoft for Win32 wait functions).
-                // For sub-tick intervals (<= 16ms), the wait can return on the next tick
-                // (e.g. 5-8ms), but must never return immediately (>= 1ms).
-                // For intervals > 16ms, the wait must not return before (requested - 16ms).
+                // Lower bound, derived rather than measured: the code returns
+                // Ok(0) only on the kernel's WAIT_TIMEOUT, and the documented
+                // Win32 caveat lets a sub-clock-resolution wait expire early,
+                // so the bound allows one tick of early expiry (requested − 16 ms)
+                // and clamps to the 1 ms kernel-entry floor for sub-tick requests.
+                // For 10 ms this catches an immediate return but not an early
+                // expiry of up to 9 ms; the OS behaviour itself is what
+                // `wake_timeout_probe` measures (task G5).
                 let min_expected = requested
                     .saturating_sub(Duration::from_millis(16))
                     .max(Duration::from_millis(1));
 
                 assert!(
                     elapsed >= min_expected,
-                    "wait returned materially early for {requested:?} on run {run}: elapsed {elapsed:?} < min {min_expected:?}"
+                    "wait returned earlier than the loosest safe bound for {requested:?} on run {run}: elapsed {elapsed:?} < min {min_expected:?}"
                 );
 
-                // Upper bound: bounded so the test cannot hang or stall.
+                // Upper bound: a hang guard, bounded so the test cannot stall.
                 // Generous tolerance (requested + 500ms) to tolerate loaded VM scheduling jitter.
                 assert!(
                     elapsed < requested + Duration::from_millis(500),

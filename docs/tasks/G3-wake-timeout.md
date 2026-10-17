@@ -5,6 +5,15 @@
 > returning `Ok(0)` in less than eight milliseconds on a ten millisecond timeout
 > represents a defect in `rustamp-ipc` or the documented behavior of the OS
 > kernel timer resolution.
+>
+> **G5 note (2026-10-18).** W10 finding F7 showed this card's measurement does
+> not settle the question it claims to settle: the sub-tick lower bound is a
+> 1 ms smoke floor, the tick mechanism in "The early return" below was
+> self-inconsistent, and the ~7.8 ms VM figure has no artefact in the tree.
+> The claim is narrowed in this card. Task card [G5](G5-wake-honesty.md)
+> records what is measured instead (a deterministic test of the mechanism's
+> own timing contract, plus a reproducible host probe), what the tests now
+> assert, and what remains unmeasured.
 
 **Goal**
 
@@ -50,14 +59,16 @@ not arguments:
    - If empty and open, calls `wake.wait(Wake::Data, timeout)?` (`ring.rs:949` / `890`).
 3. **Wake routing**:
    - `RingWake::wait(&self, which: Wake, timeout: Option<Duration>)`
-     (`crates/rustamp-ipc/src/shm/wake.rs:384`).
-   - Borrows handle `&self.data` and delegates to `backend::do_wait(h, timeout)` (`wake.rs:394`).
+     (`crates/rustamp-ipc/src/shm/wake.rs:409`).
+   - Borrows handle `&self.data` and delegates to `backend::do_wait(h, timeout)` (`wake.rs:419`).
 4. **Win32 wait backend**:
    - `backend::do_wait(handle: &Handle, timeout: Option<Duration>)`
-     (`crates/rustamp-ipc/src/shm/wake.rs:135`).
-   - Maps duration to millisecond `ms: u32` (`wake.rs:139–153`), rounding up fractional
-     milliseconds per RFC 0007 §6.4.
-   - Invokes syscall: `WaitForSingleObject(*handle, ms)` (`wake.rs:155`).
+     (`crates/rustamp-ipc/src/shm/wake.rs:166`).
+   - Maps duration to the millisecond `ms: u32` argument via `backend::timeout_ms`
+     (`wake.rs:145`), rounding up fractional milliseconds per RFC 0007 §6.4. The
+     mapping is pinned exactly by the
+     `timeout_ms_rounds_the_request_up_to_whole_milliseconds` test (`wake.rs:507`).
+   - Invokes syscall: `WaitForSingleObject(*handle, ms)` (`wake.rs:172`).
    - Maps `WAIT_OBJECT_0` to `Ok(WaitOutcome::Signaled)`, `WAIT_TIMEOUT` to
      `Ok(WaitOutcome::TimedOut)`.
 5. **Loop handling on return**:
@@ -77,38 +88,82 @@ not arguments:
   with `Ok(0)` / `TimedOut`.
 
 **The early return: analysis and verdict**
-- In the VM run, `read_into_blocking` with a 10 ms timeout returned `Ok(0)` in ~7.8 ms.
-- Verdict: **The wait implementation is correct; the return in ~7.8 ms is expected Windows OS behavior.**
-- Root cause: On Windows, the standard kernel timer resolution is 15.625 ms (64 timer ticks per second).
-  Microsoft's official documentation for Win32 wait functions (`WaitForSingleObject`, `Sleep`) explicitly notes:
+
+- In the VM run, `read_into_blocking` with a 10 ms timeout returned `Ok(0)` in ~7.8 ms
+  (reported 2026-10-17). **No run log, capture or manifest for this figure exists in
+  the tree**: it is a single, unevidenced observation that cannot be reproduced or
+  checked from the repository (W10 finding F7, G3-5).
+- Verdict: **the wait implementation is correct; whether the early return is expected
+  OS behaviour is plausible but unproven in this tree.** The implementation adds no
+  early return of its own: `Ok(0)` / `WaitOutcome::TimedOut` is returned only when the
+  kernel reports `WAIT_TIMEOUT` (see "Spurious signals" above).
+- The documented behaviour supports the conclusion: Microsoft's official documentation
+  for Win32 wait functions (`WaitForSingleObject`, `Sleep`) explicitly notes:
   > *"If the time-out interval is less than the resolution of the system clock, the wait may time out in less than the specified length of time."*
-- When a 10 ms timeout is requested, 10 ms is smaller than the system clock tick (15.625 ms).
-  If the call is made midway through a tick interval, the kernel timer interrupt fires at the
-  next tick boundary (~7–8 ms later), evaluating the timer as expired and returning `WAIT_TIMEOUT`.
-- The earlier assertion `elapsed >= Duration::from_millis(8)` failed because it assumed sub-tick timer
-  precision that the general-purpose Windows kernel scheduler does not guarantee for intervals under 16 ms.
+  A 10 ms request is below the standard 15.625 ms kernel timer resolution.
+- The mechanistic explanation this card previously gave is **withdrawn**: it said the
+  kernel timer interrupt fires at the next tick boundary (~7–8 ms after a mid-tick
+  call) and evaluates the 10 ms timer as expired there. That is self-inconsistent —
+  a tick boundary 7–8 ms after the call *precedes* the 10 ms expiry, so the timer
+  cannot be evaluated as expired at that boundary (W10 finding F7, G3-4). No in-tree
+  measurement shows how early the kernel actually expires a sub-tick wait, on the
+  host or in the VM.
+- What is measured instead: the mechanism's own timing contract — the exact
+  millisecond value handed to `WaitForSingleObject` (RFC 0007 §6.4) — is pinned
+  deterministically by the `timeout_ms` test in `crates/rustamp-ipc/src/shm/wake.rs:507`.
+  The OS behaviour itself is measured by the `wake_timeout_probe` example
+  (`crates/rustamp-ipc/examples/wake_timeout_probe.rs`) on any Windows machine; task
+  card [G5](G5-wake-honesty.md) records a host run and states what only the VM can
+  still add.
 
 **Measurement and tolerance**
-- New test: `blocking_timeout_accuracy_across_durations` in `crates/rustamp-ipc/src/shm/ring.rs`.
-- Durations tested: 10 ms (sub-tick), 30 ms (multi-tick), 60 ms (longer).
-- Runs: 5 iterations per duration.
-- Tolerance:
-  - Lower bound: `requested.saturating_sub(Duration::from_millis(16)).max(Duration::from_millis(1))`.
-    - For sub-tick intervals (<= 16 ms): asserts `elapsed >= 1 ms`, proving the thread entered the kernel
-      wait state and did not return immediately/spuriously.
-    - For multi-tick intervals (> 16 ms): asserts that the wait cannot expire more than 1 system clock tick
-      early (e.g. 30 ms must take >= 14 ms; 60 ms must take >= 44 ms).
-  - Upper bound: `requested + Duration::from_millis(500)` ensures the test fails instead of hanging,
-    while tolerating scheduling jitter in a loaded virtual machine.
-- Honest assertion in `blocking_timeout_returns_timed_out`: restored `assert!(elapsed >= Duration::from_millis(1))`
-  with documentation explaining why `>= 8 ms` failed in the VM.
 
-**What the measurement proves and what it cannot**
-- **What it proves**:
-  - `read_into_blocking` and `wait_readable` genuinely enter kernel blocking via `WaitForSingleObject`.
+- The mechanism's timing contract is exact and deterministic: `backend::timeout_ms`
+  (`wake.rs:145`) maps `Some(d)` to the `WaitForSingleObject` millisecond argument,
+  rounding up to whole milliseconds (a positive sub-millisecond duration becomes 1 ms;
+  `ZERO` polls; `None` is `INFINITE`). The
+  `timeout_ms_rounds_the_request_up_to_whole_milliseconds` test (`wake.rs:507`)
+  pins every case. This is the only part of wait timing the implementation controls.
+- `blocking_timeout_bounds_hold_across_durations` in
+  `crates/rustamp-ipc/src/shm/ring.rs:1892` (renamed from
+  `blocking_timeout_accuracy_across_durations` — it checks bounds, it does not measure
+  accuracy) runs 5 iterations at 10 ms (sub-tick), 30 ms and 60 ms (multi-tick) and
+  asserts, per run:
+  - the outcome is `Ok(0)`: the kernel reported `WAIT_TIMEOUT`;
+  - `elapsed >= max(requested − 16 ms, 1 ms)` — the loosest bound the documented OS
+    contract supports. One tick of early expiry is allowed for tick-quantized timers,
+    clamped to the 1 ms kernel-entry floor for sub-tick requests. For the 10 ms case
+    this proves the call entered the kernel and did not return instantly; it cannot
+    catch an early expiry of up to 9 ms, and no in-tree wall-clock bound can — that
+    would measure the OS, not the code;
+  - `elapsed < requested + 500 ms` — a hang guard, tolerating scheduling jitter in a
+    loaded virtual machine.
+- Honest assertion in `blocking_timeout_returns_timed_out` (`ring.rs:1837`):
+  `elapsed >= 1 ms` (kernel-entry smoke floor), with a doc comment that says exactly
+  that. The bound was weakened from `>= 8 ms` after the VM failed it; the weakening
+  is now documented as a property of the documented OS contract, not presented as a
+  tolerance the measurement earned.
+
+**What the tests prove and what they cannot**
+
+- **What they prove**:
+  - The exact millisecond value the mechanism hands to `WaitForSingleObject`
+    (deterministic, `wake.rs:507`).
+  - `read_into_blocking` and `wait_readable` genuinely enter kernel blocking via
+    `WaitForSingleObject` (the 1 ms smoke floor).
+  - A timeout returns `Ok(0)` / `WaitOutcome::TimedOut` without hanging, returning
+    instantly, or returning an error.
   - Auto-reset event latches are respected and properly consumed.
-  - The wait returns `Ok(0)` / `WaitOutcome::TimedOut` without hanging or returning immediately (no 0 ms return).
-  - Multi-tick durations are honored within the physical resolution of the operating system clock.
-- **What it cannot prove**:
-  - It cannot prove sub-millisecond precision for intervals shorter than the Windows system clock resolution (~15.625 ms) without activating global high-resolution timer periods (`timeBeginPeriod(1)`), which Microsoft discourages due to power and battery impact.
-  - It cannot prove deterministic execution times under extreme hypervisor scheduling delay or vCPU starvation on a loaded host.
+  - A wait never returns earlier than the loosest bound the documented contract
+    supports (one tick of early expiry), and never hangs.
+- **What they cannot prove**:
+  - How early the OS actually expires a sub-tick wait, on any given system. The
+    ~7.8 ms VM figure is an unevidenced single observation; the host probe in task
+    G5 measured the host (no early expiry beyond 0.115 ms in 250 runs), and only a
+    VM run of the same probe, with its per-run output committed, can measure the VM.
+  - Sub-millisecond precision for intervals shorter than the Windows system clock
+    resolution without activating global high-resolution timer periods
+    (`timeBeginPeriod(1)`), which Microsoft discourages due to power and battery
+    impact.
+  - Deterministic execution times under extreme hypervisor scheduling delay or vCPU
+    starvation on a loaded host.
