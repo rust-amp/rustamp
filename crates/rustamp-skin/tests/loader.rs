@@ -118,8 +118,8 @@ fn raw_sheet_bytes_are_kept_alongside_the_pixels() {
     assert_eq!(raw, original.as_slice());
 
     // A sheet that comes from the built-in skin carries the built-in skin's own
-    // bytes, not an empty buffer: the default is drawn artwork now, not a
-    // generated stand-in with no source.
+    // bytes, not an empty buffer: the built-in default is the Rust theme's drawn
+    // artwork now (the look-alike is a selectable skin, no longer the default).
     let mut entries = synthetic_entries();
     entries.retain(|(name, _)| name != "main.bmp");
     let dir2 = tempfile::tempdir().unwrap();
@@ -127,7 +127,7 @@ fn raw_sheet_bytes_are_kept_alongside_the_pixels() {
     let skin2 = Skin::load(dir2.path()).unwrap();
     assert_eq!(
         skin2.sheet_raw(Sheet::Main).unwrap(),
-        rustamp_skin::lookalike::sheet_bytes(Sheet::Main).unwrap()
+        rustamp_skin::rust_theme::sheet_bytes(Sheet::Main).unwrap()
     );
 }
 

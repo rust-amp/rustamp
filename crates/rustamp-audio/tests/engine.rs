@@ -2308,6 +2308,36 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
         engine.poll().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
+    // A8: the new run starts by draining what the stopped run left in the ring,
+    // and the drain callback is silent by design; the decode thread writes the
+    // new run only after it. Pulling that callback and proving it silent is the
+    // stronger half of this test's claim: a callback that still carried track 1
+    // audio would be exactly the stale replay the test exists to catch.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut drained = 0usize;
+    while engine.is_start_pending() {
+        let mut chunk = Vec::new();
+        assert_eq!(clock.pull_hardware(256, &mut chunk), 256);
+        assert!(
+            chunk.iter().all(|sample| *sample == 0.0),
+            "the start drain callback must be silent, never stale track 1 audio"
+        );
+        drained += chunk.len();
+        engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the start drain never settled"
+        );
+    }
+    assert!(
+        drained > 0,
+        "the stopped run left audio in the ring, so a start drain was due"
+    );
+    // Only now does the new run's own audio reach the device.
+    while engine.buffered_frames() < 256 {
+        engine.poll().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
     // Pull audio of track 2 from the device
     let mut rec2 = Vec::new();
     assert_eq!(clock.pull_hardware(256, &mut rec2), 256);

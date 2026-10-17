@@ -264,8 +264,19 @@ fn seek_inside_matches_direct_decode() {
     let reached = session.seek(1000, SEEK_WAIT).unwrap();
     assert_eq!(reached, 1000);
     let mut buf = [0.0f32; 200];
-    let frames = session.read(&mut buf, None).unwrap();
-    assert!(frames > 0);
+    // The ring is deliberately tiny (7 frames), so one read returns what is
+    // available and never the whole request: collect the same 100 frames that
+    // the direct decode produces in a single call.
+    let mut got: Vec<f32> = Vec::new();
+    while got.len() < 200 {
+        let frames = session.read(&mut buf, None).unwrap();
+        assert!(
+            frames > 0,
+            "a seek inside the file must keep yielding audio"
+        );
+        got.extend_from_slice(&buf[..frames * 2]);
+    }
+    got.truncate(200);
 
     let mut direct = rustamp_decoders::default_registry()
         .open(MediaSource::Path(path))
@@ -275,8 +286,11 @@ fn seek_inside_matches_direct_decode() {
         .expect("direct seek");
     let mut want = vec![0.0f32; 200];
     let direct_frames = direct.read(&mut want).expect("direct read");
-    assert_eq!(frames, direct_frames);
-    assert_eq!(&buf[..frames * 2], &want[..direct_frames * 2]);
+    assert_eq!(
+        direct_frames, 100,
+        "the direct read fills the whole request"
+    );
+    assert_eq!(got, want);
     finish_ok(session, done);
 }
 
@@ -293,9 +307,13 @@ fn garbage_and_empty_files_are_clean_errors_never_eos() {
             let _ = done.send(outcome);
         });
         let outcome = DecoderSession::open(client, NamedPcmRings, file_location(&path), 3);
+        let described = match &outcome {
+            Ok(_) => "Ok(session): the undecodable file was accepted".to_string(),
+            Err(error) => format!("Err({error:?})"),
+        };
         assert!(
             matches!(outcome, Err(MediaHostError::OperationFailed(_))),
-            "{name}: undecodable input must be a loud error, never EOS"
+            "{name}: undecodable input must be a loud error, never EOS (got {described})"
         );
         result
             .recv_timeout(JOIN_WAIT)
