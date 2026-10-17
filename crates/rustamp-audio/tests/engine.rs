@@ -1038,3 +1038,314 @@ fn second_run_resets_consumed_and_drains_correctly() {
     assert_eq!(h.engine.position_frames(), track_len);
     assert_eq!(h.engine.transport(), TransportState::Stopped);
 }
+
+/// Job 1: Equalizer state changes publish Event::EqChanged, and setting the
+/// same state twice does not produce a second event.
+#[test]
+fn eq_commands_publish_event_and_deduplicate_no_ops() {
+    let mut h = Harness::new(&[LONG_A]);
+    // Drain any startup events.
+    let _ = h.drain_events();
+
+    // 1. Command::SetBand: produces exactly one EqChanged event.
+    h.engine
+        .apply(&Command::SetBand {
+            band: 2,
+            gain_db: 3.5,
+        })
+        .unwrap();
+    let events = h.drain_events();
+    assert_eq!(
+        events.len(),
+        1,
+        "SetBand must publish exactly one event; got: {events:?}"
+    );
+    match &events[0] {
+        Event::EqChanged(eq) => {
+            assert!((eq.bands[2] - 3.5).abs() < 1e-6);
+        }
+        other => panic!("expected Event::EqChanged, got: {other:?}"),
+    }
+
+    // Setting the same band to the exact same gain produces NO event.
+    h.engine
+        .apply(&Command::SetBand {
+            band: 2,
+            gain_db: 3.5,
+        })
+        .unwrap();
+    let events = h.drain_events();
+    assert!(
+        events.is_empty(),
+        "Setting identical band gain must not publish: {events:?}"
+    );
+
+    // 2. Command::SetPreamp: produces exactly one EqChanged event.
+    h.engine.apply(&Command::SetPreamp(-2.0)).unwrap();
+    let events = h.drain_events();
+    assert_eq!(
+        events.len(),
+        1,
+        "SetPreamp must publish exactly one event; got: {events:?}"
+    );
+    match &events[0] {
+        Event::EqChanged(eq) => {
+            assert!((eq.preamp - (-2.0)).abs() < 1e-6);
+        }
+        other => panic!("expected Event::EqChanged, got: {other:?}"),
+    }
+
+    // Setting the same preamp produces NO event.
+    h.engine.apply(&Command::SetPreamp(-2.0)).unwrap();
+    let events = h.drain_events();
+    assert!(
+        events.is_empty(),
+        "Setting identical preamp must not publish: {events:?}"
+    );
+
+    // 3. Command::SetEqEnabled: produces exactly one EqChanged event.
+    h.engine.apply(&Command::SetEqEnabled(true)).unwrap();
+    let events = h.drain_events();
+    assert_eq!(
+        events.len(),
+        1,
+        "SetEqEnabled must publish exactly one event; got: {events:?}"
+    );
+    match &events[0] {
+        Event::EqChanged(eq) => {
+            assert!(eq.enabled);
+        }
+        other => panic!("expected Event::EqChanged, got: {other:?}"),
+    }
+
+    // Setting identical enabled state produces NO event.
+    h.engine.apply(&Command::SetEqEnabled(true)).unwrap();
+    let events = h.drain_events();
+    assert!(
+        events.is_empty(),
+        "Setting identical enabled state must not publish: {events:?}"
+    );
+
+    // 4. Command::SetEqAuto: produces exactly one EqChanged event.
+    h.engine.apply(&Command::SetEqAuto(true)).unwrap();
+    let events = h.drain_events();
+    assert_eq!(
+        events.len(),
+        1,
+        "SetEqAuto must publish exactly one event; got: {events:?}"
+    );
+    match &events[0] {
+        Event::EqChanged(eq) => {
+            assert!(eq.auto);
+        }
+        other => panic!("expected Event::EqChanged, got: {other:?}"),
+    }
+
+    // Setting identical auto state produces NO event.
+    h.engine.apply(&Command::SetEqAuto(true)).unwrap();
+    let events = h.drain_events();
+    assert!(
+        events.is_empty(),
+        "Setting identical auto state must not publish: {events:?}"
+    );
+
+    // 5. Engine::set_eq with whole state produces exactly one event.
+    let mut custom = h.engine.eq();
+    custom.bands[0] = 5.0;
+    h.engine.set_eq(custom);
+    let events = h.drain_events();
+    assert_eq!(
+        events.len(),
+        1,
+        "set_eq must publish exactly one event; got: {events:?}"
+    );
+    match &events[0] {
+        Event::EqChanged(eq) => {
+            assert!((eq.bands[0] - 5.0).abs() < 1e-6);
+        }
+        other => panic!("expected Event::EqChanged, got: {other:?}"),
+    }
+
+    // Setting identical whole state produces NO event.
+    h.engine.set_eq(custom);
+    let events = h.drain_events();
+    assert!(
+        events.is_empty(),
+        "set_eq with same state must not publish: {events:?}"
+    );
+
+    // 6. Polling must never publish EqChanged.
+    h.engine.poll().unwrap();
+    let events = h.drain_events();
+    assert!(
+        events.iter().all(|e| !matches!(e, Event::EqChanged(_))),
+        "poll must not publish EqChanged: {events:?}"
+    );
+
+    // 7. Clamped values that map to the same clamped value produce NO second event.
+    // Setting 15.0 dB clamps to 12.0 dB -> publishes once.
+    h.engine
+        .apply(&Command::SetBand {
+            band: 5,
+            gain_db: 15.0,
+        })
+        .unwrap();
+    let events = h.drain_events();
+    assert_eq!(events.len(), 1);
+    // Setting 18.0 dB also clamps to 12.0 dB -> no change -> no event.
+    h.engine
+        .apply(&Command::SetBand {
+            band: 5,
+            gain_db: 18.0,
+        })
+        .unwrap();
+    let events = h.drain_events();
+    assert!(
+        events.is_empty(),
+        "Clamped value with no effective change must not publish: {events:?}"
+    );
+
+    // 8. Out-of-bounds band index is ignored and produces NO event.
+    h.engine
+        .apply(&Command::SetBand {
+            band: 99,
+            gain_db: 5.0,
+        })
+        .unwrap();
+    let events = h.drain_events();
+    assert!(
+        events.is_empty(),
+        "Out-of-range band must not publish: {events:?}"
+    );
+}
+
+/// Job 2 Item (a): Interleaving between stop() and finish_run() in poll().
+/// Calling stop() when the stream is ready to finish cleanly transitions to
+/// Stopped at origin (0), and subsequent poll() does not trigger finish_run().
+#[test]
+fn stop_at_end_of_stream_prevents_duplicate_finish_run() {
+    let mut h = Harness::new(&[TRACK_A]);
+    let track_len = track_frames(TRACK_A);
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    assert!(h.wait_buffered());
+
+    // Pump all audio so consumed == written == end_of_stream.
+    h.clock.pump(track_len + 512);
+
+    // Instead of calling poll() (which would invoke finish_run()), call stop() directly!
+    h.engine.stop().unwrap();
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+    assert_eq!(h.engine.position_frames(), 0);
+    assert_eq!(h.engine.buffered_frames(), 0);
+
+    let stop_events = h.drain_events();
+    assert!(
+        stop_events
+            .iter()
+            .any(|e| matches!(e, Event::StateChanged(TransportState::Stopped))),
+        "stop must publish StateChanged(Stopped)"
+    );
+
+    // Now call poll(). Since transport is Stopped and end_of_stream was cleared by stop(),
+    // finish_run() must NOT fire. No duplicate StateChanged(Stopped) or PlaylistEnded!
+    h.engine.poll().unwrap();
+    let poll_events = h.drain_events();
+    assert!(
+        !poll_events
+            .iter()
+            .any(|e| matches!(e, Event::StateChanged(TransportState::Stopped))),
+        "poll() after stop() must not fire finish_run() again"
+    );
+    assert!(
+        !poll_events
+            .iter()
+            .any(|e| matches!(e, Event::PlaylistEnded)),
+        "poll() after explicit stop() must not fire PlaylistEnded"
+    );
+}
+
+/// Job 2 Item (a): Calling stop() immediately after finish_run() has stopped the run
+/// cleanly resets position to 0 without panics or double joins.
+#[test]
+fn stop_after_finish_run_resets_position_to_zero() {
+    let mut h = Harness::new(&[TRACK_A]);
+    let track_len = track_frames(TRACK_A);
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    assert!(h.wait_buffered());
+
+    // Pump to completion through wait_until (which runs poll() and invokes finish_run()).
+    assert!(
+        h.wait_until(
+            |e| e.transport() == TransportState::Stopped,
+            track_len + 8192
+        ),
+        "run must finish"
+    );
+    assert_eq!(h.engine.position_frames(), track_len);
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+
+    // User presses Stop on the completed track:
+    h.engine.stop().unwrap();
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+    assert_eq!(h.engine.position_frames(), 0);
+    assert_eq!(h.engine.buffered_frames(), 0);
+}
+
+/// Job 2: F2 Invariants hold across underruns, seeks, and completion:
+/// - consumed <= written at every point (buffered_frames() >= 0 and never underflows).
+/// - buffered_frames() is honest (reflects ring buffer backlog, not saturating to 0).
+/// - consumed is aligned on seek drain.
+#[test]
+fn f2_invariants_hold_across_underruns_and_seeks() {
+    let mut h = Harness::new(&[LONG_A]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    // 1. Initial state: buffered_frames is honest.
+    // Some audio should be buffered in the ring.
+    std::thread::sleep(Duration::from_millis(50));
+    h.engine.poll().unwrap();
+    let initial_buffered = h.engine.buffered_frames();
+    assert!(
+        initial_buffered > 0,
+        "decode thread must have buffered frames in ring"
+    );
+
+    // 2. Severe underrun: pump more frames than were buffered.
+    // Device plays silence; consumed must only advance by what was actually read.
+    h.clock.pump(initial_buffered + 4000);
+    h.engine.poll().unwrap();
+    // Invariant: buffered_frames() must not underflow.
+    assert_eq!(
+        h.engine.buffered_frames(),
+        0,
+        "ring should be drained to 0 during underrun, not underflow"
+    );
+    assert_eq!(
+        h.engine.transport(),
+        TransportState::Playing,
+        "underrun on long track must not end run prematurely"
+    );
+
+    // 3. Seek: seek to frame 5000.
+    h.engine.seek_frames(5000).unwrap();
+    assert!(h.settle_seek(5000), "seek must settle on frame 5000");
+
+    // 4. Seek drain alignment: post-seek frames are written.
+    h.engine.poll().unwrap();
+    let post_seek_buffered = h.engine.buffered_frames();
+    // Post-seek backlog must be honest and not wildly exceed ring capacity.
+    assert!(
+        post_seek_buffered <= 16384,
+        "buffered frames must be bounded by ring capacity: {post_seek_buffered}"
+    );
+
+    // 5. Clean stop: resets backlog to 0.
+    h.engine.stop().unwrap();
+    assert_eq!(h.engine.buffered_frames(), 0);
+    assert_eq!(h.engine.position_frames(), 0);
+}

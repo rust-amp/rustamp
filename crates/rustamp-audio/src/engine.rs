@@ -401,8 +401,11 @@ impl Engine {
         next.preamp = clamp_gain(eq.preamp).unwrap_or(next.preamp);
         next.enabled = eq.enabled;
         next.auto = eq.auto;
-        self.eq = next;
-        self.eq_control.set(&self.eq);
+        if next != self.eq {
+            self.eq = next;
+            self.eq_control.set(&self.eq);
+            self.bus.publish(Event::EqChanged(self.eq));
+        }
     }
 
     /// Set one band's gain in dB (`band < EQ_BANDS`; others are ignored).
