@@ -2,9 +2,12 @@
 
 ## Goal
 
-Extend the committed golden-image suite for the shipped look-alike default skin
-so four more states of the drawn chrome are pinned pixel by pixel, exactly
+Extend the committed golden-image suite for the look-alike skin so four more
+states of the drawn chrome are pinned pixel by pixel, exactly
 (tolerance 0), without touching any renderer.
+
+*(It was the shipped default when this card was written; the built-in default
+is now the Rust theme, task card J2. Corrected in the W11 docs sweep.)*
 
 Lane: goldens. Owned paths: `crates/rustamp-ui/tests/**`,
 `tests/golden/lookalike/**`, `tests/golden/README.md`, this card.

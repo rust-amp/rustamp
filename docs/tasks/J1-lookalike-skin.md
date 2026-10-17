@@ -52,10 +52,14 @@ Features drawn procedurally:
 
 ## 4. Wiring
 
+> **Superseded by task card J2 (Rust theme).** The built-in default is the Rust
+> theme now; the look-alike is selectable. The bullets record how J1 was wired
+> when it landed; the *Now* notes give the current code. *(W11 docs sweep.)*
+
 - **Asset Embedding**: The generated BMP files are placed in `crates/rustamp-skin/assets/lookalike/*.bmp` and embedded into `crates/rustamp-skin/src/lookalike.rs` using `include_bytes!`.
-- **Builtin Skin Implementation**: `BuiltinDefaultSkin::sheet_image(sheet)` in `crates/rustamp-skin/src/skin.rs` delegates to `lookalike::sheet_image(sheet)` which decodes the embedded BMP data using Rustamp's internal `bmp::decode`.
-- **Fallback Integrity**: `SkinFallback` continues to supply lookalike sheets when any individual sheet is missing from a loaded skin, fulfilling S17 §2.
-- **App Integration**: `rustamp_app::skin::builtin()` loads `Skin::from_source(&mut source, &BuiltinDefaultSkin)`, providing the lookalike skin on first run or when `--skin` is omitted.
+- **Builtin Skin Implementation (as of J1)**: `BuiltinDefaultSkin::sheet_image(sheet)` in `crates/rustamp-skin/src/skin.rs` delegated to `lookalike::sheet_image(sheet)` which decodes the embedded BMP data using Rustamp's internal `bmp::decode`. **Now** it delegates to `rust_theme::sheet_image(sheet)` (`crates/rustamp-skin/src/skin.rs:105-116`).
+- **Fallback Integrity**: `SkinFallback` supplies sheets when any individual sheet is missing from a loaded skin, fulfilling S17 §2. The default fallback is now `BuiltinDefaultSkin` (the Rust theme); `BuiltinLookalikeSkin` supplies the look-alike sheets (`crates/rustamp-skin/src/skin.rs:132-143`).
+- **App Integration (as of J1)**: `rustamp_app::skin::builtin()` loaded the look-alike on first run. **Now** it loads `BuiltinDefaultSkin::source()`, i.e. the Rust theme, on first run or when `--skin` is omitted (`crates/rustamp-app/src/skin.rs:85-100`; `choose(None, None) == SkinChoice::Builtin`, lines 30-36).
 
 ## 5. Own Choices
 

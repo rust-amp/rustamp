@@ -6,9 +6,9 @@ We are building **Rustamp**, a new media player that looks, feels and behaves li
 Decisions already made:
 - **License: GPL-3.0, split by RFC 0004 and its §7 erratum.** The player and every crate except the five permissive ones stay **GPL-3.0-or-later**; `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost` and `rustamp-mediahost` are **MIT OR Apache-2.0**, so the process that loads plugin DLLs imposes no copyleft on a plugin of any license. `rustamp-mediahost` is only the protocol framework; a resident helper carries its resident's license (RFC 0006 §8). The GPL crates in the scope of [PLUGIN-EXCEPTION.md](../PLUGIN-EXCEPTION.md) carry a GPL-3.0 §7 plugin exception for Rustamp's own code only ([RFC 0004](rfc/0004-plugin-licensing.md)). Third-party license compatibility and exception scope must be reviewed before copying or linking DeaDBeeF (zlib/GPL/LGPL), webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib) or libopenmpt (BSD) material; the exception grants no rights in their code.
 - **Skins.**
-  - The bundled default is a **look-alike skin**: newly drawn artwork that closely mimics the classic base skin's layout, colors and style, without copying any pixels.
+  - The bundled default is the newly drawn **Rust-themed** skin ([task card J2](tasks/J2-rust-theme-skin.md)): original artwork at the classic spec dimensions, without copying any pixels. The **look-alike skin** ([task card J1](tasks/J1-lookalike-skin.md)) is still shipped and stays selectable (`--skin lookalike` / `--skin builtin:lookalike`).
   - The **original base skin** (taken from webamp's `base-2.91`) is offered as a **separate, optional download** with its own repo and package. It is never bundled in the installer.
-  - **Tests run with both skins.** The original skin is used for pixel-exact comparison with real Winamp 2.95. The look-alike skin is used to check rendering and layout of what we actually ship.
+  - **Tests run with both skins.** The original base skin (`classic-base`, external `rustamp-testdata`) is used for pixel-exact comparison with real Winamp 2.95. The look-alike skin (`lookalike`, the committed goldens) is used to check rendering and layout. The built-in default is the Rust theme; it has no golden namespace yet (`crates/rustamp-testkit/src/golden.rs:7-10` defines only `SKIN_LOOKALIKE` and `SKIN_CLASSIC_BASE`).
 - **Reference binaries.** Agents find Winamp 2.95 and the classic plugins in archival sources (Internet Archive, winampheritage mirrors) and **ask the user before each download**. Binaries are stored outside both repos.
 
 ---
@@ -104,7 +104,7 @@ so no caller changes.
 | `rustamp-app` | Binary that wires everything together |
 | `xtask` | Build, i686 cross-build, packaging, golden-test runner, skin packaging |
 
-Separate repos: `rustamp-skin-default` (the look-alike default skin: newly drawn art, bundled in the installer), `rustamp-skin-classic-base` (the original base skin, optional separate download, used in tests), `rustamp-research` (dirty, private), `rustamp-testdata` (reference captures, audio fixtures).
+Separate repos: `rustamp-skin-default` (skin packaging: the bundled default is the Rust theme, task card J2, and the look-alike skin, task card J1, stays selectable), `rustamp-skin-classic-base` (the original base skin, optional separate download, used in tests), `rustamp-research` (dirty, private), `rustamp-testdata` (reference captures, audio fixtures).
 
 ---
 
@@ -148,7 +148,7 @@ Every work package is a task card containing: goal, allowed sources, the spec(s)
 | **G** Plugin host | 2 | plugin-abi, ipc, plughost | S09–S11 |
 | **H** Vis/MilkDrop | 2–3 | vis, milkdrop | audio vis tap, S08 |
 | **I** Prefs/dialogs | 1 | prefs | ui, S16 |
-| **J** Art and skin packaging | 1 (art) | look-alike default skin (new art, every sprite sheet), optional original-skin download package | S01 |
+| **J** Art and skin packaging | 1 (art) | built-in default skin (Rust theme, task J2) and selectable look-alike skin (task J1), optional original-skin download package | S01 |
 | **Q** QA harness | 1–2 | golden and differential test infrastructure | all |
 
 Integration Lead agent: owns `rustamp-core` and `rustamp-app`, merges, and resolves contract changes through RFCs in `docs/rfc/`.
@@ -199,7 +199,7 @@ Parallelism inside each milestone: one agent per crate or window, all coding aga
 - **Unit and property tests** for each crate: playlist operations, shuffle, title format, skin parsing on a corpus of ~200 real .wsz skins from the webamp skin museum (must not panic, sprite fallbacks correct).
 - **Golden image tests, run with both skins:**
   - *Original base skin:* headless rendering of every window, state and widget is compared pixel-for-pixel with captures R-bin takes from real Winamp 2.95. Captures live in `rustamp-testdata`, which is a reference, not shipped.
-  - *Look-alike default skin:* Rustamp's own approved snapshots, to catch regressions. Real Winamp 2.95 is also captured while running the look-alike skin (it is a valid .wsz), so the same pixel-for-pixel comparison works for it as well.
+  - *Look-alike skin:* Rustamp's own approved snapshots, to catch regressions. Real Winamp 2.95 is also captured while running the look-alike skin (it is a valid .wsz), so the same pixel-for-pixel comparison works for it as well. (The built-in default is the Rust theme, task card J2; it has no golden namespace yet.)
 - **Differential behavior tests:** both real Winamp and Rustamp expose the same `Winamp v1.x` IPC and `WM_COMMAND` surface, so **one script drives both** (key sequences, clicks, IPC queries) and compares the resulting state (position, playlist, EQ, window positions).
 - **Audio tests:**
   - Decoders are bit-exact against reference decoders.

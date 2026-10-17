@@ -96,7 +96,8 @@ sprite table in `rustamp-skin` is reconciled with S01 in the same pass.
   during `cargo test`.
 
 **A note on goldens**
-`tests/golden/lookalike/` is reserved for our shipped default skin, and that art
+`tests/golden/lookalike/` is reserved for the look-alike skin (the built-in
+default is now the Rust theme, task card J2), and that art
 (Lane J) does not exist yet. So: **prefer structural assertions** (exact
 rectangles, hit-test round trips, spot pixel checks against a skin you build in
 the test). If you do add a golden PNG, it must use a deterministic skin built in
