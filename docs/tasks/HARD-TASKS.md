@@ -17,6 +17,7 @@ until approval.
 | OpenAI | Worked before (`gpt-6.1-sol`); unused so far this wave. |
 | Subagents generally | A subagent lane **notifies**; an agy lane does not. Finished agy lanes sat unnoticed until the poll rule was written down. |
 | A subagent lane (ReplayGain, free tier) | Wrote into the **canonical tree** instead of its own worktree - one no-op edit to `crates/rustamp-meta/src/write.rs`, both branches doing the same thing - while its worktree stayed untouched. Reverted; the canonical tree is clean again. Rule: check a lane's worktree, not only its report, before believing either. |
+| Two lanes, two sources | Ended **silently with no work**: the Muse packaging lane left an empty worktree and no text, and a free-tier beta-reread lane reported only compliance boilerplate with an empty worktree. Both slots were refilled on other sources the same evening. Rule: a report without a worktree diff is not a report. |
 
 ## 2. The hard engineering, where models demonstrably got it wrong
 
