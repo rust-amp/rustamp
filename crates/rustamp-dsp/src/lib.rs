@@ -6,12 +6,13 @@
 //!
 //! Codes against the frozen contracts in [`rustamp_core`]; see
 //! `docs/rfc/0001-core-contracts.md`. The equalizer is [`eq::Equalizer`] and
-//! the look-ahead limiter is [`limiter::Limiter`], which the engine enables by
-//! default (owner decision, 2026-10-17): what the reference player does with
-//! overs is unmeasured, so that default is our own choice and it costs the
-//! look-ahead latency. A stage on its own is disabled, so a caller that builds
-//! one directly still gets a bit-exact bypass — except that a directly built
-//! [`Limiter`] defaults to enabled and must be switched off explicitly. The resampler is **not** here: it
+//! the look-ahead true-peak limiter is [`limiter::Limiter`], which the engine
+//! enables by default (owner decision, 2026-10-17): what the reference player
+//! does with overs is unmeasured, so that default is our own choice and it
+//! costs the look-ahead latency. A stage on its own is disabled, so a caller
+//! that builds one directly still gets a bit-exact bypass — except that a
+//! directly built [`Limiter`] defaults to enabled and must be switched off
+//! explicitly. The resampler is **not** here: it
 //! changes the frame count, which a `DspStage` cannot, so it lives in
 //! `rustamp-audio`'s converter.
 
