@@ -9,6 +9,10 @@ Read these first, in this order:
 
 ## Short rules
 
+- **File search: use `es.exe`, always** (`C:\Program Files\Everything 1.5a\es.exe`),
+  never a recursive directory walk. `es.exe <pattern>` prints full paths;
+  `es.exe -r <regex>` for a pattern. The owner's standing instruction
+  (2026-10-17).
 - Talk to the user in German. Code, comments and docs are in English.
 - Implement only from `specs/` and from freely licensed sources. Contract changes in `rustamp-core` require a new RFC in `docs/rfc/`.
 - The player is 64-bit. Only `rustamp-plughost` is built for i686.
