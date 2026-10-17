@@ -291,8 +291,9 @@ pub(crate) fn spawn(
         .spawn(move || {
             worker.run(start_index, start_at);
             let producer = worker.take_ring();
-            // Drop index 0 (the per-run Equalizer stage inserted by start_run) so
-            // only the caller's installed DSP stages are returned to the engine.
+            // Drop the per-run stages (Equalizer at index 0, Limiter at the end)
+            // inserted by start_run so only the caller's installed DSP stages are
+            // returned to the engine.
             let dsp = worker.take_user_dsp();
             let _ = worker.tx.send(DecodeOut::Stopped);
             let _ = worker.tx.send(DecodeOut::Returned { producer, dsp });
@@ -412,11 +413,15 @@ impl Worker {
     }
 
     /// Hand the user-installed DSP stages back, removing the per-run Equalizer
-    /// that was inserted at index 0 by `Engine::start_run`.
+    /// (inserted at index 0 by `Engine::start_run`) and Limiter (inserted at the
+    /// end of the chain by `Engine::start_run`).
     fn take_user_dsp(&mut self) -> Vec<Box<dyn DspStage>> {
         let mut dsp = std::mem::take(&mut self.dsp);
         if !dsp.is_empty() {
             dsp.remove(0);
+        }
+        if !dsp.is_empty() {
+            dsp.pop();
         }
         dsp
     }

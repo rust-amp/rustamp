@@ -1349,3 +1349,167 @@ fn f2_invariants_hold_across_underruns_and_seeks() {
     assert_eq!(h.engine.buffered_frames(), 0);
     assert_eq!(h.engine.position_frames(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Look-ahead brickwall limiter (DSP chain last stage)
+// ---------------------------------------------------------------------------
+
+/// A test DSP stage that scales all samples by a constant gain factor.
+struct GainBoostDspStage(f32);
+
+impl rustamp_core::audio::DspStage for GainBoostDspStage {
+    fn name(&self) -> &str {
+        "gain-boost-dsp"
+    }
+
+    fn prepare(
+        &mut self,
+        _spec: rustamp_core::audio::AudioSpec,
+    ) -> rustamp_core::error::Result<()> {
+        Ok(())
+    }
+
+    fn process(&mut self, buf: &mut [f32]) {
+        for s in buf {
+            *s *= self.0;
+        }
+    }
+
+    fn reset(&mut self) {}
+}
+
+#[test]
+fn default_engine_limiter_is_disabled_and_bit_exact() {
+    let mut h = Harness::new(&[LONG_A]);
+    // The engine's limiter must default to disabled so an untouched player is bit-transparent.
+    assert!(!h.engine.limiter_enabled());
+    assert!(!h.engine.limiter_control().enabled());
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    let p0 = h.wait_refilled(4096).expect("ring must fill with audio");
+    let mut rec = Vec::new();
+    h.clock.pump_record(1024, &mut rec);
+    let left: Vec<f32> = rec.iter().step_by(2).copied().collect();
+
+    // Default configuration: bit-exact to the synthetic source pattern.
+    assert_eq!(&left[..], &expected(1, p0, 1024)[..]);
+}
+
+#[test]
+fn limiter_limits_hot_signal_to_ceiling_and_disabling_returns_to_bit_exact() {
+    // The limiter sits as the LAST stage in the DSP chain (order: Equalizer,
+    // installed stages, Limiter). It must see everything earlier stages
+    // produced, and is the stage closest to the output.
+    //
+    // Note: Enabling the limiter is a product decision (the reference player's
+    // behaviour with overs is unmeasured) and costs look-ahead latency
+    // (LOOKAHEAD_SECONDS, 5 ms).
+    let mut h = Harness::new(&[LONG_A]);
+    let ceiling = h.engine.limiter_ceiling();
+
+    // Install a 2.0x boost stage so the signal is hot and definitely exceeds
+    // the ceiling (pattern samples 0.1..=1.1 become 0.2..=2.2).
+    h.engine
+        .set_dsp_chain(vec![Box::new(GainBoostDspStage(2.0))]);
+
+    // --- Phase 1: Default is disabled (bypass) ---
+    assert!(!h.engine.limiter_enabled());
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    let p0 = h.wait_refilled(4096).expect("refill run 1");
+    let mut rec_disabled = Vec::new();
+    h.clock.pump_record(2048, &mut rec_disabled);
+    let left_disabled: Vec<f32> = rec_disabled.iter().step_by(2).copied().collect();
+
+    // The un-limited hot signal has samples exceeding the ceiling.
+    let peak_disabled = left_disabled.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(
+        peak_disabled > ceiling,
+        "unlimited signal must exceed ceiling ({peak_disabled} > {ceiling})"
+    );
+    // Exact bypass: each sample is exactly 2.0 * source.
+    for (out, src) in left_disabled.iter().zip(expected(1, p0, 2048)) {
+        assert_eq!(*out, src * 2.0);
+    }
+    h.engine.stop().unwrap();
+
+    // --- Phase 2: Enable the limiter ---
+    h.engine.set_limiter_enabled(true);
+    assert!(h.engine.limiter_enabled());
+    assert!(h.engine.limiter_control().enabled());
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    let p0_enabled = h.wait_refilled(4096).expect("refill run 2");
+    assert_eq!(p0_enabled, p0);
+    let mut rec_enabled = Vec::new();
+    h.clock.pump_record(2048, &mut rec_enabled);
+    let left_enabled: Vec<f32> = rec_enabled.iter().step_by(2).copied().collect();
+
+    // Enabling changes the rendered audio.
+    assert_ne!(left_enabled, left_disabled);
+
+    // Because the limiter sits LAST in the DSP chain (after the 2.0x boost stage),
+    // it sees the hot audio and ensures no output sample exceeds the ceiling.
+    let peak_enabled = left_enabled.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(
+        peak_enabled <= ceiling,
+        "limiter overshoot: peak {peak_enabled} exceeds ceiling {ceiling}"
+    );
+    // The peak actually reached the ceiling (it limited the hot peaks, not muted).
+    assert!(
+        peak_enabled >= ceiling * 0.99,
+        "peak {peak_enabled} should be held close to ceiling {ceiling}"
+    );
+    h.engine.stop().unwrap();
+
+    // --- Phase 3: Disable the limiter again ---
+    h.engine.set_limiter_enabled(false);
+    assert!(!h.engine.limiter_enabled());
+    assert!(!h.engine.limiter_control().enabled());
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    let p0_disabled_again = h.wait_refilled(4096).expect("refill run 3");
+    assert_eq!(p0_disabled_again, p0);
+    let mut rec_disabled_again = Vec::new();
+    h.clock.pump_record(2048, &mut rec_disabled_again);
+    let left_disabled_again: Vec<f32> = rec_disabled_again.iter().step_by(2).copied().collect();
+
+    // Returns to bit-exact match with Phase 1.
+    assert_eq!(left_disabled_again, left_disabled);
+}
+
+#[test]
+fn limiter_toggle_latches_on_seek() {
+    let mut h = Harness::new(&[LONG_A]);
+    let ceiling = h.engine.limiter_ceiling();
+    h.engine
+        .set_dsp_chain(vec![Box::new(GainBoostDspStage(2.0))]);
+
+    // Start playback with limiter disabled.
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    let _p0 = h.wait_refilled(4096).expect("refill");
+    let mut rec = Vec::new();
+    h.clock.pump_record(1024, &mut rec);
+    let peak = rec.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(peak > ceiling);
+
+    // Toggle limiter on while playing.
+    h.engine.set_limiter_enabled(true);
+    assert!(h.engine.limiter_enabled());
+
+    // Seeking resets DSP stages, latching the enabled state into the limiter stage.
+    assert!(h.seek_and_settle(5000));
+    let p_after = h.wait_refilled(4096).expect("refill after seek");
+    let mut rec_after = Vec::new();
+    h.clock.pump_record(2048, &mut rec_after);
+    let peak_after = rec_after.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(
+        peak_after <= ceiling,
+        "limiter must be active after seek: peak {peak_after} <= {ceiling}"
+    );
+    assert_eq!(p_after, 5000);
+}

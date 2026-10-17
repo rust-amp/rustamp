@@ -49,6 +49,32 @@
 //! runs on the producer side of the ring. The default state (flat, disabled)
 //! is a bit-exact bypass, so the stage is inert until the equalizer is used.
 //!
+//! # The look-ahead brickwall limiter
+//!
+//! The engine owns an [`Arc<LimiterControl>`] that drives the optional
+//! look-ahead brickwall limiter ([`Limiter`]). Every run puts a fresh [`Limiter`]
+//! reading that control **last** in the decode thread's DSP chain, after any
+//! user-installed stages:
+//!
+//! ```text
+//! decoder -> Equalizer -> [installed DspStage]* -> Limiter -> vis tap
+//!         -> FormatConverter -> ring -> volume/balance (render callback) -> device
+//! ```
+//!
+//! The limiter is placed last because it must see everything earlier stages
+//! (such as EQ boosts or installed DSP plugins) produced, acting as the stage
+//! closest to the output to catch any overs before the format converter and
+//! the ring buffer.
+//!
+//! The limiter defaults to **disabled**, operating as a bit-exact bypass so
+//! that an untouched player remains bit-transparent. Enabling it is a product
+//! decision (the reference player's behaviour with overs is unmeasured) and
+//! costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`], 5 ms).
+//! Because [`PlayerState`] has no field for the limiter (and changing the wire
+//! contract requires an RFC), the control remains engine-side via
+//! [`Engine::limiter_enabled`], [`Engine::set_limiter_enabled`], and
+//! [`Engine::limiter_control`].
+//!
 //! # Not in this milestone
 //!
 //! out_ds-style fades and prebuffering (S18), ReplayGain, crossfade, the S08
@@ -72,7 +98,7 @@ use rustamp_core::event::Event;
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::{EQ_BANDS, EqState, PlayerState, StreamInfo, TransportState};
 use rustamp_core::vis::VisFrame;
-use rustamp_dsp::{EqControl, Equalizer};
+use rustamp_dsp::{EqControl, Equalizer, Limiter, LimiterControl};
 
 use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, clamped_index, spawn};
 use crate::ring::{GainState, RingSync, make_render};
@@ -135,6 +161,9 @@ pub struct Engine {
     eq: EqState,
     /// Where [`Engine::eq`] reaches the running [`Equalizer`] stage.
     eq_control: Arc<EqControl>,
+    /// Where [`Engine::limiter_enabled`] / [`Engine::set_limiter_enabled`] reaches
+    /// the running [`Limiter`] stage.
+    limiter_control: Arc<LimiterControl>,
     /// The ring's write end, parked here while no run is active.
     producer: Option<Producer<f32>>,
 
@@ -209,6 +238,7 @@ impl Engine {
             dsp: Vec::new(),
             eq: EqState::default(),
             eq_control: Arc::new(EqControl::default()),
+            limiter_control: Arc::new(LimiterControl::default()),
             producer: Some(producer),
             to_decode: None,
             from_decode: None,
@@ -417,6 +447,37 @@ impl Engine {
             self.set_eq(eq);
         }
         Ok(())
+    }
+
+    /// Whether the look-ahead brickwall limiter is enabled.
+    ///
+    /// The limiter defaults to disabled, so an untouched player is bit-transparent.
+    /// Enabling it is a product decision (the reference player's behaviour with
+    /// overs is unmeasured) and costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`]).
+    /// Because [`PlayerState`] has no field for the limiter (and changing the
+    /// wire contract requires an RFC), the control remains engine-side.
+    pub fn limiter_enabled(&self) -> bool {
+        self.limiter_control.enabled()
+    }
+
+    /// Enable or disable the look-ahead brickwall limiter.
+    ///
+    /// Enabling it is a product decision (the reference player's behaviour with
+    /// overs is unmeasured) and costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`]).
+    /// Takes effect at the stage's next track start or seek (prepare/reset).
+    pub fn set_limiter_enabled(&mut self, enabled: bool) {
+        self.limiter_control.set_enabled(enabled);
+    }
+
+    /// The limiter's control block, shared with the running limiter stage on
+    /// the decode thread.
+    pub fn limiter_control(&self) -> Arc<LimiterControl> {
+        Arc::clone(&self.limiter_control)
+    }
+
+    /// The output ceiling in linear amplitude below which limited samples are held.
+    pub fn limiter_ceiling(&self) -> f32 {
+        10.0_f64.powf(rustamp_dsp::limiter::CEILING_DB / 20.0) as f32
     }
 
     /// Whether "stop after current track" is armed (RFC 0005 O8).
@@ -910,6 +971,14 @@ impl Engine {
             0,
             Box::new(Equalizer::with_control(Arc::clone(&self.eq_control))),
         );
+        // The limiter runs last, after all installed stages (the order is:
+        // equalizer, installed stages, limiter). It must see everything earlier
+        // stages produced and is the stage closest to the output (see module docs).
+        // A fresh stage per run starts from clean filter history; the shared
+        // control carries the on/off state across runs.
+        dsp.push(Box::new(Limiter::with_control(Arc::clone(
+            &self.limiter_control,
+        ))));
         let (handle, vis_rx) = spawn(cfg, dsp, ring, index, start_at, ctl_rx, out_tx);
         self.to_decode = Some(ctl_tx);
         self.from_decode = Some(out_rx);
