@@ -279,6 +279,7 @@ struct Windowed {
     left_down: bool,
     eq_left_down: bool,
     playlist_cursor: (i32, i32),
+    last_playlist_click: Option<(Instant, (i32, i32))>,
     modifiers: ModifiersState,
     /// The client size last requested, so repeat requests are skipped.
     applied_client: Option<(u32, u32)>,
@@ -321,6 +322,7 @@ impl Windowed {
             left_down: false,
             eq_left_down: false,
             playlist_cursor: (0, 0),
+            last_playlist_click: None,
             modifiers: ModifiersState::empty(),
             applied_client: None,
             applied_eq_client: None,
@@ -1079,7 +1081,24 @@ impl Windowed {
                 // Drags are open (S06 Q6: reorder vs selection block), so only
                 // the press/release pair is routed; moves are not forwarded.
                 let result = match state {
-                    ElementState::Pressed => self.app.playlist_mouse_down(x, y),
+                    ElementState::Pressed => {
+                        let now = Instant::now();
+                        let is_double =
+                            if let Some((last_time, (lx, ly))) = self.last_playlist_click {
+                                now.duration_since(last_time) < Duration::from_millis(500)
+                                    && (x - lx).abs() <= 4
+                                    && (y - ly).abs() <= 4
+                            } else {
+                                false
+                            };
+                        if is_double {
+                            self.last_playlist_click = None;
+                            self.app.playlist_double_click(x, y)
+                        } else {
+                            self.last_playlist_click = Some((now, (x, y)));
+                            self.app.playlist_mouse_down(x, y)
+                        }
+                    }
                     ElementState::Released => self.app.playlist_mouse_up(x, y),
                 };
                 if let Err(error) = result {

@@ -244,6 +244,54 @@ impl PlaylistWindow {
         Some(Command::Select(SelectOp::Set(vec![first])))
     }
 
+    /// A double-click on visible row `row` plays that entry (S03 §5, S06 §8 Q5).
+    ///
+    /// Selects the entry and returns [`Command::PlayEntry`] with the entry's stable id.
+    pub fn double_click_row(&mut self, row: usize) -> Option<Command> {
+        let id = self.visible_ids().get(row).copied()?;
+        self.selected.clear();
+        self.selected.insert(id);
+        Some(Command::PlayEntry(id))
+    }
+
+    /// A double-click on entry `index` in the list (0-based) plays that entry.
+    pub fn double_click_index(&mut self, index: usize) -> Option<Command> {
+        let id = self.entries.get(index).copied()?;
+        self.selected.clear();
+        self.selected.insert(id);
+        Some(Command::PlayEntry(id))
+    }
+
+    /// Applies a selection operation to the window's selection set.
+    pub fn apply_select(&mut self, op: &SelectOp) {
+        match op {
+            SelectOp::Set(ids) => {
+                let live: BTreeSet<EntryId> = self.entries.iter().copied().collect();
+                self.selected = ids.iter().copied().filter(|id| live.contains(id)).collect();
+            }
+            SelectOp::Toggle(id) => {
+                if self.entries.contains(id) && !self.selected.remove(id) {
+                    self.selected.insert(*id);
+                }
+            }
+            SelectOp::All => {
+                self.selected = self.entries.iter().copied().collect();
+            }
+            SelectOp::None => {
+                self.selected.clear();
+            }
+            SelectOp::Invert => {
+                let mut inverted = BTreeSet::new();
+                for id in &self.entries {
+                    if !self.selected.contains(id) {
+                        inverted.insert(*id);
+                    }
+                }
+                self.selected = inverted;
+            }
+        }
+    }
+
     /// SEL selects all visible rows (S06 §2, settled: click2-vs-click1 12203
     /// px, bbox (12,23)-(254,93); "all" is a visual/blue-band inference
     /// consistent with the counts).
@@ -543,6 +591,50 @@ mod tests {
         assert_eq!(window.selected_ids(), vec![EntryId(56)]);
         assert_eq!(window.len(), 57);
         assert_eq!(window.first_visible(), 56);
+    }
+
+    #[test]
+    fn double_click_row_selects_and_emits_play_entry() {
+        let mut window = window_with(10);
+        let cmd = window.double_click_row(2);
+        assert_eq!(cmd, Some(Command::PlayEntry(EntryId(2))));
+        assert_eq!(window.selected_ids(), vec![EntryId(2)]);
+
+        // Out of bounds row returns None
+        assert_eq!(window.double_click_row(VISIBLE_ROWS), None);
+    }
+
+    #[test]
+    fn double_click_index_selects_and_emits_play_entry() {
+        let mut window = window_with(10);
+        let cmd = window.double_click_index(7);
+        assert_eq!(cmd, Some(Command::PlayEntry(EntryId(7))));
+        assert_eq!(window.selected_ids(), vec![EntryId(7)]);
+
+        // Out of bounds index returns None
+        assert_eq!(window.double_click_index(100), None);
+    }
+
+    #[test]
+    fn apply_select_handles_all_select_ops() {
+        let mut window = window_with(4);
+        window.apply_select(&SelectOp::All);
+        assert_eq!(
+            window.selected_ids(),
+            vec![EntryId(0), EntryId(1), EntryId(2), EntryId(3)]
+        );
+
+        window.apply_select(&SelectOp::None);
+        assert!(window.selected_ids().is_empty());
+
+        window.apply_select(&SelectOp::Set(vec![EntryId(1), EntryId(3)]));
+        assert_eq!(window.selected_ids(), vec![EntryId(1), EntryId(3)]);
+
+        window.apply_select(&SelectOp::Invert);
+        assert_eq!(window.selected_ids(), vec![EntryId(0), EntryId(2)]);
+
+        window.apply_select(&SelectOp::Toggle(EntryId(0)));
+        assert_eq!(window.selected_ids(), vec![EntryId(2)]);
     }
 
     /// Opening either dialog needs an OS window, so this never runs in the

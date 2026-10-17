@@ -28,6 +28,7 @@
 //! [`NullOutput`]; the windowed presenter in [`crate::window`] only adds the
 //! `winit`/`softbuffer` shell around it.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -917,19 +918,13 @@ impl App {
         }
     }
 
-    /// The stable id of queue entry `index`, allocating one if it is new.
+    /// The stable id of queue entry `index`.
     fn entry_id_for(&mut self, index: Option<u32>) -> Option<EntryId> {
         let index = index? as usize;
+        if index >= self.engine.queue().len() {
+            return None;
+        }
         self.sync_entry_ids();
-        let before = self.entry_ids.len();
-        while self.entry_ids.len() <= index {
-            let id = EntryId(self.next_entry_id);
-            self.next_entry_id += 1;
-            self.entry_ids.push(id);
-        }
-        if self.entry_ids.len() != before {
-            self.sync_playlist_entries();
-        }
         self.entry_ids.get(index).copied()
     }
 
@@ -1032,16 +1027,13 @@ impl App {
                 // EQ command (external, shortcut, or UI round-trip).
                 self.sync_eq_from_engine();
             }
-            C::Remove(_)
-            | C::Clear
-            | C::MoveEntries { .. }
-            | C::Select(_)
-            | C::PlayEntry(_)
-            | C::Sort(_)
-            | C::Randomize
-            | C::Reverse => {
+            C::PlayEntry(id) => self.play_entry(*id),
+            C::Remove(ids) => self.remove_entries(ids),
+            C::Clear => self.clear_entries(),
+            C::Select(op) => self.playlist.apply_select(op),
+            C::MoveEntries { .. } | C::Sort(_) | C::Randomize | C::Reverse => {
                 self.note(
-                    "the playlist model is not wired to the app yet (S06/S14/S15)".to_string(),
+                    "the playlist reordering is not wired to the app yet (S14/S15)".to_string(),
                 );
             }
             C::OpenAbout
@@ -1128,6 +1120,56 @@ impl App {
         {
             self.publish_error(&error);
         }
+    }
+
+    fn play_entry(&mut self, id: EntryId) {
+        if let Some(index) = self.entry_ids.iter().position(|entry| *entry == id) {
+            if let Err(error) = self.engine.play_index(index as u32) {
+                self.publish_error(&error);
+            }
+        } else {
+            self.note(format!("PlayEntry: unknown entry id {id:?}"));
+        }
+    }
+
+    fn remove_entries(&mut self, ids: &[EntryId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let ids_set: BTreeSet<_> = ids.iter().copied().collect();
+
+        // Check if the currently playing entry is being removed
+        let playing_id = self
+            .engine
+            .current_index()
+            .and_then(|idx| self.entry_ids.get(idx as usize))
+            .copied();
+        let playing_removed = playing_id.is_some_and(|id| ids_set.contains(&id));
+
+        if playing_removed && self.engine.transport() != TransportState::Stopped {
+            let _ = self.engine.stop();
+        }
+
+        let mut new_ids = Vec::with_capacity(self.entry_ids.len());
+        let mut new_queue = Vec::with_capacity(self.engine.queue().len());
+        for (id, track) in self.entry_ids.iter().zip(self.engine.queue()) {
+            if !ids_set.contains(id) {
+                new_ids.push(*id);
+                new_queue.push(track.clone());
+            }
+        }
+        self.entry_ids = new_ids;
+        self.engine.set_queue(new_queue);
+        self.sync_playlist_entries();
+    }
+
+    fn clear_entries(&mut self) {
+        if self.engine.transport() != TransportState::Stopped {
+            let _ = self.engine.stop();
+        }
+        self.entry_ids.clear();
+        self.engine.set_queue(Vec::new());
+        self.sync_playlist_entries();
     }
 }
 
@@ -2485,6 +2527,405 @@ mod tests {
         app.submit(Command::CloseFocusedWindow).unwrap();
         assert_eq!(app.dialog_open_kind(), None);
         assert!(!app.quit(), "closing a dialog must not quit the app");
+    }
+
+    // ----- Headless tests for GUI-driven playback chains (task card N3) -----
+
+    #[test]
+    fn chain1_opening_file_via_open_media_enqueues_and_playing_starts_playback() {
+        // Chain 1: Opening a file (the Open Media path) enqueues it and playing
+        // it starts playback: queue length, current index and engine transport all agree.
+        let (mut app, dir) = app_with_file(None);
+        let t1 = track(&dir, "track1.tst");
+
+        assert_eq!(app.engine().queue().len(), 0);
+        assert_eq!(app.engine().current_index(), None);
+        assert_eq!(app.engine().transport(), TransportState::Stopped);
+
+        // Open file via Open Media dialog with play: false (playlist ADD path)
+        app.submit(Command::OpenMedia {
+            kind: rustamp_core::command::OpenMediaKind::Files,
+            play: false,
+        })
+        .unwrap();
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::OpenMedia {
+            kind: rustamp_core::command::OpenMediaKind::Files,
+            play: false,
+        }));
+        app.stage_media_paths(vec![t1]);
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+
+        // Enqueued: queue and playlist model agree
+        assert_eq!(app.engine().queue().len(), 1);
+        assert_eq!(app.playlist().len(), 1);
+        assert_eq!(app.engine().transport(), TransportState::Stopped);
+
+        // Playing it starts playback
+        app.submit(Command::Play).unwrap();
+        assert!(
+            pump_until(
+                &mut app,
+                |app| app.engine().transport() == TransportState::Playing,
+                2000
+            ),
+            "playback did not start"
+        );
+        // All agree afterwards
+        assert_eq!(app.engine().queue().len(), 1);
+        assert_eq!(app.engine().current_index(), Some(0));
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+        assert_eq!(app.state().transport, TransportState::Playing);
+
+        // Also test Open Media with play: true (e.g. shortcut / location)
+        let t2 = track(&dir, "track2.tst");
+        app.submit(Command::OpenMedia {
+            kind: rustamp_core::command::OpenMediaKind::Files,
+            play: true,
+        })
+        .unwrap();
+        app.stage_media_paths(vec![t2]);
+        assert!(app.dialog_key(Key::Enter));
+        assert!(
+            pump_until(
+                &mut app,
+                |app| app.engine().current_index() == Some(1),
+                2000
+            ),
+            "play: true did not switch to new track"
+        );
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.engine().current_index(), Some(1));
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+    }
+
+    #[test]
+    fn chain2_double_clicking_playlist_entry_plays_that_entry() {
+        // Chain 2: Double-clicking a playlist entry plays that entry
+        // (the index the window reports reaches the engine).
+        let (mut app, dir) = app_with_file(None);
+        let t0 = track(&dir, "t0.tst");
+        let t1 = track(&dir, "t1.tst");
+        let t2 = track(&dir, "t2.tst");
+
+        app.submit(Command::AddItems {
+            items: vec![
+                MediaLocation::File(t0),
+                MediaLocation::File(t1),
+                MediaLocation::File(t2),
+            ],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+
+        assert_eq!(app.engine().transport(), TransportState::Stopped);
+
+        // Double-click row 1 (center of row 1 in playlist list band: y = 23 + 13 + 6 = 42, x = 60)
+        let commands = app.playlist_double_click(60, 42).unwrap();
+        assert_eq!(commands, vec![Command::PlayEntry(EntryId(1))]);
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(1)]);
+
+        // Engine starts playing index 1
+        assert!(
+            pump_until(
+                &mut app,
+                |app| app.engine().current_index() == Some(1)
+                    && app.engine().transport() == TransportState::Playing,
+                2000
+            ),
+            "double-clicking row 1 did not play entry at index 1"
+        );
+        assert_eq!(app.engine().current_index(), Some(1));
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+
+        // Double-click row 0 (y = 23 + 6 = 29, x = 60)
+        let commands = app.playlist_double_click(60, 29).unwrap();
+        assert_eq!(commands, vec![Command::PlayEntry(EntryId(0))]);
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+        assert!(
+            pump_until(
+                &mut app,
+                |app| app.engine().current_index() == Some(0)
+                    && app.engine().transport() == TransportState::Playing,
+                2000
+            ),
+            "double-clicking row 0 did not play entry at index 0"
+        );
+        assert_eq!(app.engine().current_index(), Some(0));
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+    }
+
+    #[test]
+    fn chain3_next_and_previous_move_through_queue_across_button_menu_key_and_ends() {
+        // Chain 3: Next/Previous (button, menu or key) move through the queue
+        // and the engine follows, including at the ends.
+        let (mut app, dir) = app_with_file(None);
+        let t0 = track(&dir, "track0.tst");
+        let t1 = track(&dir, "track1.tst");
+        let t2 = track(&dir, "track2.tst");
+
+        app.submit(Command::AddItems {
+            items: vec![
+                MediaLocation::File(t0),
+                MediaLocation::File(t1),
+                MediaLocation::File(t2),
+            ],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+
+        app.submit(Command::Play).unwrap();
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().current_index() == Some(0)
+                && app.engine().transport() == TransportState::Playing,
+            2000
+        ));
+
+        // 1. Previous at start (index 0) remains at index 0 across key, button, and menu:
+        // Key 'Z'
+        app.key_down(Key::letter('Z').unwrap(), Modifiers::NONE)
+            .unwrap();
+        assert_eq!(app.engine().current_index(), Some(0));
+
+        // Button Previous
+        let (px, py) = widget_centre(Widget::Previous);
+        app.mouse_down(px, py).unwrap();
+        app.mouse_up(px, py).unwrap();
+        assert_eq!(app.engine().current_index(), Some(0));
+
+        // Menu "Previous track"
+        app.activate_menu_item("Previous track", rustamp_ui::ShortcutAction::PreviousTrack)
+            .unwrap();
+        assert_eq!(app.engine().current_index(), Some(0));
+
+        // 2. Next via Button: moves 0 -> 1
+        let (nx, ny) = widget_centre(Widget::Next);
+        app.mouse_down(nx, ny).unwrap();
+        let commands = app.mouse_up(nx, ny).unwrap();
+        assert_eq!(commands, vec![Command::Next]);
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().current_index() == Some(1),
+            2000
+        ));
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+
+        // 3. Next via Key 'B': moves 1 -> 2
+        let outcome = app
+            .key_down(Key::letter('B').unwrap(), Modifiers::NONE)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Some(rustamp_ui::ShortcutOutcome::Commands(vec![Command::Next]))
+        );
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().current_index() == Some(2),
+            2000
+        ));
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+
+        // 4. Previous via Menu: moves 2 -> 1
+        let outcome = app
+            .activate_menu_item("Previous track", rustamp_ui::ShortcutAction::PreviousTrack)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::menu::MenuOutcome::Commands(vec![Command::Prev])
+        );
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().current_index() == Some(1),
+            2000
+        ));
+
+        // 5. Previous via Key 'Z': moves 1 -> 0
+        let outcome = app
+            .key_down(Key::letter('Z').unwrap(), Modifiers::NONE)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Some(rustamp_ui::ShortcutOutcome::Commands(vec![Command::Prev]))
+        );
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().current_index() == Some(0),
+            2000
+        ));
+
+        // 6. Next via Menu: moves 0 -> 1
+        let outcome = app
+            .activate_menu_item("Next track", rustamp_ui::ShortcutAction::NextTrack)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::menu::MenuOutcome::Commands(vec![Command::Next])
+        );
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().current_index() == Some(1),
+            2000
+        ));
+
+        // Advance to last track (2)
+        app.submit(Command::Next).unwrap();
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().current_index() == Some(2),
+            2000
+        ));
+
+        // 7. Next at the end: moves past the end of the queue, playback stops
+        app.key_down(Key::letter('B').unwrap(), Modifiers::NONE)
+            .unwrap();
+        assert!(
+            pump_until(
+                &mut app,
+                |app| app.engine().transport() == TransportState::Stopped,
+                2000
+            ),
+            "playback did not stop at end of queue"
+        );
+        assert!(app.playlist_ended);
+    }
+
+    #[test]
+    fn chain4_playlist_window_model_stays_in_step_with_engine_queue() {
+        // Chain 4: The playlist window's own model (its rows) stays in step with
+        // the engine's queue when entries are added or removed.
+        let (mut app, _dir) = app_with_file(None);
+
+        assert_eq!(app.engine().queue().len(), 0);
+        assert_eq!(app.playlist().len(), 0);
+        assert_eq!(app.entry_ids.len(), 0);
+
+        // Add 3 entries
+        let items = (0..3)
+            .map(|i| MediaLocation::File(PathBuf::from(format!("track{i}.mp3"))))
+            .collect::<Vec<_>>();
+        app.submit(Command::AddItems {
+            items,
+            at: None,
+            play: false,
+        })
+        .unwrap();
+
+        assert_eq!(app.engine().queue().len(), 3);
+        assert_eq!(app.playlist().len(), 3);
+        assert_eq!(app.entry_ids.len(), 3);
+        assert_eq!(app.playlist().visible_ids(), app.entry_ids);
+
+        // Remove row 1 via REM button
+        app.submit(Command::Select(rustamp_core::command::SelectOp::Set(vec![
+            EntryId(1),
+        ])))
+        .unwrap();
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(1)]);
+
+        let cmds = app.playlist_mouse_down(46, 92).unwrap();
+        assert_eq!(cmds, vec![Command::Remove(vec![EntryId(1)])]);
+
+        // Model, entry_ids, and engine queue all agree after removal
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.playlist().len(), 2);
+        assert_eq!(app.entry_ids.len(), 2);
+        assert_eq!(app.entry_ids, vec![EntryId(0), EntryId(2)]);
+        assert_eq!(app.playlist().visible_ids(), vec![EntryId(0), EntryId(2)]);
+
+        // Add 2 more entries
+        let items2 = vec![
+            MediaLocation::File(PathBuf::from("track3.mp3")),
+            MediaLocation::File(PathBuf::from("track4.mp3")),
+        ];
+        app.submit(Command::AddItems {
+            items: items2,
+            at: None,
+            play: false,
+        })
+        .unwrap();
+
+        assert_eq!(app.engine().queue().len(), 4);
+        assert_eq!(app.playlist().len(), 4);
+        assert_eq!(app.entry_ids.len(), 4);
+
+        // Remove via external Command::Remove
+        app.submit(Command::Remove(vec![EntryId(0), EntryId(3)]))
+            .unwrap();
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.playlist().len(), 2);
+        assert_eq!(app.entry_ids.len(), 2);
+        assert_eq!(app.entry_ids, vec![EntryId(2), EntryId(4)]);
+        assert_eq!(app.playlist().visible_ids(), vec![EntryId(2), EntryId(4)]);
+    }
+
+    #[test]
+    fn chain5_removing_playing_entry_or_clearing_leaves_defined_state() {
+        // Chain 5: Removing the playing entry, or clearing the list while playing,
+        // leaves the engine in a defined state (and say which).
+        //
+        // Defined state:
+        // - When the playing entry is removed: the engine stops (TransportState::Stopped),
+        //   position resets to 0 ms, and the queue & playlist model contain the remaining entries.
+        // - When the list is cleared while playing: the engine stops (TransportState::Stopped),
+        //   position resets to 0 ms, and the queue & playlist model are empty.
+        // - When a non-playing entry is removed while playing: playback continues (TransportState::Playing),
+        //   and the queue & playlist model update to the remaining entries.
+        let (mut app, dir) = app_with_file(None);
+        let t0 = track(&dir, "p0.tst");
+        let t1 = track(&dir, "p1.tst");
+        let t2 = track(&dir, "p2.tst");
+
+        app.submit(Command::AddItems {
+            items: vec![
+                MediaLocation::File(t0),
+                MediaLocation::File(t1),
+                MediaLocation::File(t2),
+            ],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+
+        // Subcase 5A: Removing a non-playing entry while playing keeps playback active
+        app.submit(Command::PlayEntry(EntryId(0))).unwrap();
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().transport() == TransportState::Playing
+                && app.engine().current_index() == Some(0),
+            2000
+        ));
+
+        // Remove track 2 (non-playing)
+        app.submit(Command::Remove(vec![EntryId(2)])).unwrap();
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.playlist().len(), 2);
+
+        // Subcase 5B: Removing the currently playing entry stops the engine
+        app.submit(Command::Remove(vec![EntryId(0)])).unwrap();
+        assert_eq!(app.engine().transport(), TransportState::Stopped);
+        assert_eq!(app.engine().position_ms(), 0);
+        assert_eq!(app.engine().queue().len(), 1);
+        assert_eq!(app.playlist().len(), 1);
+        assert_eq!(app.entry_ids, vec![EntryId(1)]);
+
+        // Subcase 5C: Clearing the playlist while playing stops the engine and empties queue & model
+        app.submit(Command::Play).unwrap();
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().transport() == TransportState::Playing,
+            2000
+        ));
+
+        app.submit(Command::Clear).unwrap();
+        assert_eq!(app.engine().transport(), TransportState::Stopped);
+        assert_eq!(app.engine().position_ms(), 0);
+        assert!(app.engine().queue().is_empty());
+        assert!(app.playlist().is_empty());
+        assert!(app.entry_ids.is_empty());
     }
 
     /// Pins the OS window parameters the two new dialogs must carry (titles

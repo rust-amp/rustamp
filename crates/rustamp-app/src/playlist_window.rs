@@ -42,7 +42,8 @@ use rustamp_core::playlist::EntryId;
 use rustamp_gfx::Image;
 use rustamp_ui::{
     DockedStack, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog, PlaylistTitleButton,
-    hit_test_button, hit_test_scroll, hit_test_title_bar, in_list_area, render_playlist_window,
+    hit_test_button, hit_test_list_row, hit_test_scroll, hit_test_title_bar, in_list_area,
+    render_playlist_window,
 };
 
 use crate::app::App;
@@ -125,6 +126,23 @@ impl App {
         Ok(Vec::new())
     }
 
+    /// A double-click at playlist-window-relative `(x, y)` (S03 §5, S06 §8 Q5).
+    ///
+    /// Double-clicking a visible row selects it and starts playback of that
+    /// entry ([`Command::PlayEntry`]).
+    pub fn playlist_double_click(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+        self.sync_playlist_entries();
+        if in_list_area(x, y)
+            && let Some(row) = hit_test_list_row(x, y)
+            && let Some(command) = self.playlist.double_click_row(row)
+        {
+            let commands = vec![command.clone()];
+            self.submit(command)?;
+            return Ok(commands);
+        }
+        Ok(Vec::new())
+    }
+
     /// Renders one frame of the playlist window.
     pub fn render_playlist(&mut self) -> Image {
         let ids = self.playlist.visible_ids();
@@ -177,17 +195,6 @@ impl App {
                 Ok(commands)
             }
             PlaylistButton::Rem => match self.playlist.press_rem() {
-                Some(Command::Remove(ids)) => {
-                    // The model dropped the entries from its own order; the
-                    // app drops their stable ids so the next sync agrees.
-                    // Removing the audio queue entries themselves is S14/S15
-                    // and stays on the existing note path below.
-                    self.entry_ids.retain(|id| !ids.contains(id));
-                    let command = Command::Remove(ids);
-                    let commands = vec![command.clone()];
-                    self.submit(command)?;
-                    Ok(commands)
-                }
                 Some(command) => {
                     let commands = vec![command.clone()];
                     self.submit(command)?;
@@ -316,7 +323,22 @@ mod tests {
         let commands = app.playlist_mouse_down(46, 92).expect("REM applies");
         assert_eq!(commands, vec![Command::Remove(vec![EntryId(0)])]);
         assert_eq!(app.playlist().len(), 59);
+        assert_eq!(app.engine().queue().len(), 59);
+        assert_eq!(app.entry_ids.len(), 59);
         assert!(app.playlist().selected_ids().is_empty());
+    }
+
+    #[test]
+    fn double_clicking_a_row_emits_play_entry() {
+        // S03 §5, S06 §8 Q5: double-clicking a playlist entry plays it.
+        let mut app = test_app();
+        add_entries(&mut app, 6);
+        // Row 1 (LIST_TOP + 13 + 6 = 42, x = 60 in list band)
+        let commands = app
+            .playlist_double_click(60, 42)
+            .expect("double click applies");
+        assert_eq!(commands, vec![Command::PlayEntry(EntryId(1))]);
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(1)]);
     }
 
     #[test]
