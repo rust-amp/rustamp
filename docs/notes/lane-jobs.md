@@ -14,16 +14,11 @@ slots looked busy.
 
 | job id | lane | started | task |
 |---|---|---|---|
-| `1792274442307450400-329938ab501dad8db908a2b4` | `wave67-ui-red` | 2026-10-18 00:00 | the UI crate's two red tests |
-| `1792275787154594800-4e2e53ae41539d26bcfe1730` | `wave68-audio-red2` | 2026-10-18 00:25 | the audio crate 7 red tests (the suite named them) |
-| `1792275787147659100-59848974900be88757e24681` | `wave68-dsp-red2` | 2026-10-18 00:25 | the DSP crate 4 red tests (true-peak premises) |
-| `1792276842015675500-f5eadeb8ec02fee9c8cc2907` | `wave68-resident-red` | 2026-10-18 00:40 | dsp_roundtrip 2 + real_decode 1 |
-| `1792276842015134300-3b37bdc891c092a2a2a0b729` | `wave68-app-platform` | 2026-10-18 00:40 | app 2 + platform 1 (machine-dependent?) |
-| `1792275634915581300-a67b54f150d0c18d3e9cd062` | `wave67-wave-review` | 2026-10-18 00:20 | adversarial review of tonight's wave (W14) |
+| `1792280424170544900-195524e8efc13fd8e4997a16` | `wave71-audio-rest` | 2026-10-18 01:40 | the audio crate's last two reds |
+| `1792280424172655100-54ea78b49bba824117e6ec29` | `wave71-dsp-rest` | 2026-10-18 01:40 | the DSP crate's last red |
 
-Running elsewhere (they notify, no ids needed here): `wave65-wake-honest` on
-Mistral (the wake-timeout claim).
-
+Running elsewhere (they notify, no ids needed here): `wave70-app-platform2`
+(Muse, app 2 + platform 1) and `wave70-ui-red2` (Mistral, the UI two).
 ## Done, merged
 
 | lane | outcome |
@@ -78,3 +73,16 @@ the worktree first, then launch.**
 binary. The two Rust-theme goldens were blessed and committed (`9600c95`), which
 closed the two golden failures. What is left, in jobs: audio 7, dsp 4,
 dsp_roundtrip 2 + real_decode 1, app 2 + platform 1, and the UI two (merged).
+## r39 (2026-10-18 01:20) - eleven red tests left, none hung
+
+`ran 79, failed 7, hung 0`, down from nine failed binaries. Closed since r38: the
+two Rust-theme goldens (blessed, `9600c95`), the `resident` binary, five of the
+audio seven and three of the DSP four. Closed since r39 by hand: the two
+`dsp_roundtrip` tests and the one `real_decode` (`c9b4266`). What is left, in
+jobs: audio 2, dsp 1, app 2 + platform 1, UI 2.
+
+## Gate discipline (learned twice tonight)
+
+Capture the tool's exit code into a variable **immediately** and gate on that
+variable - never on `$LASTEXITCODE` after another pipeline step has run, because
+that is how a red clippy was read as green and merged.
