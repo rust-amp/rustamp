@@ -47,6 +47,33 @@ Conventions:
   then names the state it broke.
 * PNG, 8-bit RGBA, comparison is exact (tolerance 0).
 
+### Equalizer renderer cases (`lookalike`)
+
+`crates/rustamp-ui/tests/golden_lookalike.rs` pins these EQ snapshots. All
+names below have the prefix `equalizer_window`:
+
+| Suffix | Dimensions | Coverage |
+|---|---|---|
+| (none), `_raised_band_preamp` | 275 x 116 | Existing cases updated for the curve, preamp line and slider bodies |
+| `_single_raised_band` | 275 x 116 | One raised band, otherwise flat |
+| `_minimum`, `_maximum`, `_alternating` | 275 x 116 | Saved-value endpoints 0/63, steep segments and fill endpoints |
+| `_preamp_minimum`, `_preamp_maximum` | 275 x 116 | Separate reference line at y35/y17 with flat bands |
+| `_mid_travel`, `_mid_travel_dragged`, `_preamp_held` | 275 x 116 | Values 15/46, band drag and lone-down preamp thumb |
+| `_on_held`, `_on_held_engaged`, `_auto_held`, `_auto_held_engaged` | 275 x 116 | S07 held cells, including the extra Auto column |
+| `_unfocused` | 275 x 116 | S01 focus variant |
+| `_double_size` | 550 x 232 | Exact 2x of the flat frame, also asserted in code |
+| `_shade`, `_shade_unfocused` | 275 x 14 | Existing provisional EQ shade bands |
+| `_shade_double_size` | 550 x 28 | Existing provisional shade-plus-scale composition |
+
+These are regression baselines for **our** drawing, not reference captures.
+S07 §7 leaves the curve and track recipe open: the renderer documents its
+own polyline, value-to-row, colour rounding, body width and track extent
+choices. Shade remains provisional under S05 §1.5. The pixel-contract case
+also checks the flat ramp samples, full horizontal strip and sheet track
+offsets; it reuses the existing flat PNG rather than adding a duplicate.
+Only the two existing EQ images above are intentionally re-blessed; existing
+main-window and playlist images must stay byte-identical.
+
 ## Workflow
 
 ```

@@ -207,16 +207,16 @@ impl DockedStack {
     /// affected.
     pub fn set_equalizer_double_size(&mut self, double_size: bool) {
         self.equalizer.double_size = double_size;
-        if !self.equalizer.shaded {
-            let (w, h) = window_size(WindowKind::Equalizer, self.equalizer.shaded, double_size);
-            self.equalizer.width = w;
-            self.equalizer.height = h;
-        }
+        // Keep stored geometry consistent with the renderer even when shaded
+        // (the EQ shade+2x composition is provisional, S05 §1.5).
+        let (w, h) = window_size(WindowKind::Equalizer, self.equalizer.shaded, double_size);
+        self.equalizer.width = w;
+        self.equalizer.height = h;
         self.reflow();
     }
 
-    /// Toggles windowshade for the equalizer. Size follows S01 §1 (14 px tall);
-    /// unmeasured for the equalizer (S05 §1.5) but stated there.
+    /// Toggles windowshade for the equalizer. The provisional 14-px shade
+    /// (S01 §1, unmeasured in S05 §1.5) scales with the renderer's 2x flag.
     pub fn set_equalizer_shaded(&mut self, shaded: bool) {
         self.equalizer.shaded = shaded;
         let (w, h) = window_size(WindowKind::Equalizer, shaded, self.equalizer.double_size);
@@ -249,6 +249,9 @@ impl DockedStack {
 /// 275x14 to 550x28 shade-first, `b3_shade_act` re-resolved 550x232 to 550x28
 /// double-size-first): the 275 × 14 shade frame scaled 2x, so the docked size
 /// and the painted frame agree.
+/// That combined-state measurement is for the main window only. For the EQ,
+/// scaling the provisional shade to 550 x 28 is an own choice (S05 §1.5),
+/// kept consistent with `eq_render`'s existing whole-frame 2x composition.
 pub fn window_size(kind: WindowKind, shaded: bool, double_size: bool) -> (u32, u32) {
     match kind {
         WindowKind::Main => {
@@ -269,7 +272,13 @@ pub fn window_size(kind: WindowKind, shaded: bool, double_size: bool) -> (u32, u
         }
         WindowKind::Equalizer => {
             if shaded {
-                (WINDOW_WIDTH, SHADE_HEIGHT) // S01 §1 (open in S05 §1.5)
+                if double_size {
+                    // Own choice, not measured for EQ (S05 §1.5): geometry
+                    // must match the renderer's already-scaled shade frame.
+                    (DOUBLE_WIDTH, SHADE_HEIGHT * 2)
+                } else {
+                    (WINDOW_WIDTH, SHADE_HEIGHT) // S01 §1 (open in S05 §1.5)
+                }
             } else if double_size {
                 (DOUBLE_WIDTH, DOUBLE_HEIGHT) // S05 §2.1: 550 x 232
             } else {
@@ -634,5 +643,26 @@ mod tests {
     fn shaded_equalizer_and_playlist_sizes_follow_s01() {
         assert_eq!(window_size(WindowKind::Equalizer, true, false), (275, 14));
         assert_eq!(window_size(WindowKind::Playlist, true, false), (275, 14));
+    }
+
+    #[test]
+    fn provisional_equalizer_shade_scale_matches_the_painted_frame() {
+        assert_eq!(window_size(WindowKind::Equalizer, true, true), (550, 28));
+        for shade_first in [true, false] {
+            let mut stack = DockedStack::default_launch();
+            if shade_first {
+                stack.set_equalizer_shaded(true);
+                stack.set_equalizer_double_size(true);
+            } else {
+                stack.set_equalizer_double_size(true);
+                stack.set_equalizer_shaded(true);
+            }
+            assert_eq!(stack.equalizer.size(), (550, 28));
+            assert_eq!((stack.equalizer.width, stack.equalizer.height), (550, 28));
+            assert_eq!(stack.playlist.y, stack.equalizer.y + 28);
+            stack.set_equalizer_double_size(false);
+            assert_eq!((stack.equalizer.width, stack.equalizer.height), (275, 14));
+            assert_eq!(stack.playlist.y, stack.equalizer.y + 14);
+        }
     }
 }

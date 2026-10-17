@@ -21,16 +21,18 @@
 //! (state-struct fields plus the window models' public methods); a state that
 //! would need a private field is left out and reported instead. The cases are:
 //! the default main window, it playing with a title/time/bitrate/stereo, the
-//! default main window at double size, the flat equalizer, a raised equalizer,
-//! the empty playlist window and the playlist window with a selection.
+//! default main window at double size, the equalizer's provisional curve and
+//! body at flat/raised/extreme/mid-travel values, held/dragged/focus/scale and
+//! provisional shade states, plus empty/selected playlists.
 
 use rustamp_core::command::SelectOp;
 use rustamp_core::playlist::EntryId;
 use rustamp_skin::{BuiltinDefaultSkin, MemorySource, Skin};
 use rustamp_testkit::{SKIN_LOOKALIKE, Snapshot, assert_golden};
+use rustamp_ui::equalizer::{EqSlider, EqWidget};
 use rustamp_ui::{
     EqualizerLayout, EqualizerState, MainWindowLayout, MainWindowState, MonoStereo, PlaylistWindow,
-    TransportState, frame_size, render_equalizer_window, render_main_window,
+    TransportState, eq_frame_size, frame_size, render_equalizer_window, render_main_window,
     render_playlist_window,
 };
 
@@ -141,9 +143,8 @@ fn golden_lookalike_main_window_double_size() {
 /// carry a raised/lowered profile, so every thumb lands off the flat row
 /// (S01 §3.1: saved value 0 -> y 38, 31 -> y 63, 63 -> y 89).
 ///
-/// The response *curve* is not drawn by the renderer (S07 §7.3/§7.4 leave it
-/// open), so this pins the graph background and the thumbs over it, not a
-/// curve.
+/// This pins the own-choice polyline and slider body recipe, not a measured
+/// classic response: S07 §7.1..§7.4 leave their exact laws open.
 #[test]
 fn golden_lookalike_equalizer_window_raised_band_and_preamp() {
     let skin = builtin_skin();
@@ -161,6 +162,158 @@ fn golden_lookalike_equalizer_window_raised_band_and_preamp() {
         SKIN_LOOKALIKE,
         &shot.render_image(),
     );
+}
+
+fn equalizer_golden(name: &str, state: &EqualizerState, dimensions: (u32, u32)) {
+    let skin = builtin_skin();
+    assert_eq!(eq_frame_size(state), dimensions);
+    let image = render_equalizer_window(state, &skin, &EqualizerLayout::CLASSIC);
+    assert_eq!((image.width(), image.height()), dimensions);
+    if state.double_size {
+        let single = EqualizerState {
+            double_size: false,
+            ..state.clone()
+        };
+        let single = render_equalizer_window(&single, &skin, &EqualizerLayout::CLASSIC);
+        assert_eq!(image, single.scaled(2), "exact whole-frame pixel doubling");
+    }
+    let shot = Shot(|| image.clone());
+    assert_golden(name, SKIN_LOOKALIKE, &shot.render_image());
+}
+
+/// Flat band control points occupy row8 (own choice); preamp independently
+/// occupies row9, sampled across the entire source strip rather than one colour.
+#[test]
+fn golden_lookalike_equalizer_window_curve_and_track_pixels() {
+    let skin = builtin_skin();
+    let sheet = skin.sheet(rustamp_skin::Sheet::EqMain).unwrap();
+    let sheet =
+        rustamp_gfx::Image::from_rgba(sheet.width(), sheet.height(), sheet.as_rgba().to_vec())
+            .unwrap();
+    let image =
+        render_equalizer_window(&EqualizerState::default(), &skin, &EqualizerLayout::CLASSIC);
+    for x in 0..113 {
+        assert_eq!(image.pixel(86 + x, 25), sheet.pixel(115, 302));
+        assert_eq!(image.pixel(86 + x, 26), sheet.pixel(x, 314));
+    }
+    for slider in EqSlider::ALL_BANDS {
+        let x = EqualizerLayout::slider_x(slider);
+        // Track sample at its unfilled left edge, body sample below the thumb.
+        assert_eq!(image.pixel(x, 50), sheet.pixel(13, 241));
+        assert_eq!(image.pixel(x + 2, 74), sheet.pixel(115, 303));
+    }
+    // The existing flat case owns the PNG; do not race its bless write here.
+}
+
+#[test]
+fn golden_lookalike_equalizer_window_single_raised_band() {
+    let mut state = EqualizerState::default();
+    state.bands[4] = 0;
+    equalizer_golden("equalizer_window_single_raised_band", &state, (275, 116));
+}
+
+#[test]
+fn golden_lookalike_equalizer_window_extremes() {
+    for (name, bands, preamp) in [
+        ("equalizer_window_minimum", [0; 10], 0),
+        ("equalizer_window_maximum", [63; 10], 63),
+        (
+            "equalizer_window_alternating",
+            [0, 63, 0, 63, 0, 63, 0, 63, 0, 63],
+            31,
+        ),
+        ("equalizer_window_preamp_minimum", [31; 10], 0),
+        ("equalizer_window_preamp_maximum", [31; 10], 63),
+    ] {
+        let state = EqualizerState {
+            bands,
+            preamp,
+            ..EqualizerState::default()
+        };
+        equalizer_golden(name, &state, (275, 116));
+    }
+}
+
+#[test]
+fn golden_lookalike_equalizer_window_mid_travel() {
+    let mut state = EqualizerState {
+        preamp: 15,
+        ..EqualizerState::default()
+    };
+    state.bands[4] = 46;
+    equalizer_golden("equalizer_window_mid_travel", &state, (275, 116));
+    state.held = Some(EqWidget::Slider(EqSlider::Band(4)));
+    state.thumb_dragged = true;
+    equalizer_golden("equalizer_window_mid_travel_dragged", &state, (275, 116));
+    // S07 §8.2: preamp's dragged sprite also applies on a lone down, before
+    // motion. Render the flat value to isolate that sprite from body movement.
+    state = EqualizerState {
+        held: Some(EqWidget::Slider(EqSlider::Preamp)),
+        thumb_dragged: true,
+        ..EqualizerState::default()
+    };
+    equalizer_golden("equalizer_window_preamp_held", &state, (275, 116));
+}
+
+#[test]
+fn golden_lookalike_equalizer_window_held_buttons() {
+    for (name, widget, engaged) in [
+        ("equalizer_window_on_held", EqWidget::On, false),
+        ("equalizer_window_on_held_engaged", EqWidget::On, true),
+        ("equalizer_window_auto_held", EqWidget::Auto, false),
+        ("equalizer_window_auto_held_engaged", EqWidget::Auto, true),
+    ] {
+        let state = EqualizerState {
+            held: Some(widget),
+            enabled: widget != EqWidget::On || engaged,
+            auto: widget == EqWidget::Auto && engaged,
+            ..EqualizerState::default()
+        };
+        equalizer_golden(name, &state, (275, 116));
+    }
+}
+
+#[test]
+fn golden_lookalike_equalizer_window_focus_scale_and_provisional_shade() {
+    for (name, focused, shade, double_size, dimensions) in [
+        (
+            "equalizer_window_unfocused",
+            false,
+            false,
+            false,
+            (275, 116),
+        ),
+        (
+            "equalizer_window_double_size",
+            true,
+            false,
+            true,
+            (550, 232),
+        ),
+        ("equalizer_window_shade", true, true, false, (275, 14)),
+        (
+            "equalizer_window_shade_unfocused",
+            false,
+            true,
+            false,
+            (275, 14),
+        ),
+        (
+            "equalizer_window_shade_double_size",
+            true,
+            true,
+            true,
+            (550, 28),
+        ),
+    ] {
+        let state = EqualizerState {
+            focused,
+            windowshade: shade,
+            double_size,
+            ..EqualizerState::default()
+        };
+        equalizer_golden(name, &state, dimensions);
+    }
 }
 
 /// The playlist at its bottom page with one row selected, so the selection
