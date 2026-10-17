@@ -41,6 +41,12 @@
 //!         -> FormatConverter -> ring -> volume/balance (render callback) -> device
 //! ```
 //!
+//! A track's ReplayGain correction, when the mode is not disabled, is a
+//! per-track constant scale on the raw decoder output, before the equalizer
+//! (see [`crate::replaygain`]): the limiter and the converter's final
+//! ceiling then see the normalized signal, and volume/balance keep their
+//! attenuate-only promise on the render side.
+//!
 //! This is S07 §10's position "EQ on the decoded PCM before the final output
 //! scaling". That any further DSP stage sees the **post-EQ** stream, and that
 //! the vis tap sees the equalized signal, is the provisional choice named
@@ -79,6 +85,24 @@
 //! What remains is that the limiter is reset at every track change (the
 //! `DspStage` contract), so its look-ahead never sees across a seam.
 //!
+//! # ReplayGain
+//!
+//! The engine owns a [`ReplayGainControl`](crate::replaygain::ReplayGainControl)
+//! that selects the per-track correction ([`ReplayGainMode`](crate::replaygain::ReplayGainMode)
+//! plus a preamp in dB). The decode thread snapshots it when it opens a
+//! track and scales the raw decoder output before the DSP chain, so the
+//! limiter (-0.3 dBFS ceiling) and the converter's final ±1.0 ceiling still
+//! bound the normalized signal (see [`crate::replaygain`] for the placement
+//! and the policy). The mode defaults to disabled — loudness never changes
+//! until the user asks — and a track without a usable tag plays unadjusted
+//! whatever the settings say.
+//!
+//! The settings live engine-side, like the limiter switch: [`PlayerState`]
+//! has no ReplayGain field, and changing the wire contract requires an RFC.
+//! There is no [`Command`] for them either (the command enum is a frozen
+//! `rustamp-core` contract); the application layer calls the setters below
+//! directly, as it does for [`Engine::set_limiter_enabled`].
+//!
 //! # Restarting with a non-empty ring (A8)
 //!
 //! A stopped run leaves its buffered audio in the ring. When a run starts with
@@ -111,7 +135,7 @@
 //!
 //! # Not in this milestone
 //!
-//! out_ds-style fades and prebuffering (S18), ReplayGain, crossfade, the S08
+//! out_ds-style fades and prebuffering (S18), crossfade, the S08
 //! vis derivation, and the playlist model (the engine only holds a queue of
 //! re-openable sources and reports indices). See the task card and the report
 //! for task card A1.
@@ -135,6 +159,7 @@ use rustamp_core::vis::VisFrame;
 use rustamp_dsp::{EqControl, Equalizer, Limiter, LimiterControl};
 
 use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, clamped_index, spawn};
+use crate::replaygain::{ReplayGainControl, ReplayGainMode};
 use crate::ring::{GainState, RingSync, make_render};
 
 /// Engine configuration.
@@ -208,6 +233,9 @@ pub struct Engine {
     /// Where [`Engine::limiter_enabled`] / [`Engine::set_limiter_enabled`] reaches
     /// the running [`Limiter`] stage.
     limiter_control: Arc<LimiterControl>,
+    /// Where [`Engine::set_replaygain_mode`] / [`Engine::set_replaygain_preamp_db`]
+    /// reaches the decode thread. Snapshotted once per track.
+    replaygain_control: Arc<ReplayGainControl>,
     /// The ring's write end, parked here while no run is active.
     producer: Option<Producer<f32>>,
 
@@ -288,6 +316,7 @@ impl Engine {
             eq: EqState::default(),
             eq_control: Arc::new(EqControl::default()),
             limiter_control: Arc::new(LimiterControl::default()),
+            replaygain_control: Arc::new(ReplayGainControl::default()),
             producer: Some(producer),
             to_decode: None,
             from_decode: None,
@@ -574,6 +603,46 @@ impl Engine {
     /// The output ceiling in linear amplitude below which limited samples are held.
     pub fn limiter_ceiling(&self) -> f32 {
         10.0_f64.powf(rustamp_dsp::limiter::CEILING_DB / 20.0) as f32
+    }
+
+    /// The ReplayGain mode: which tag normalizes a track, if any.
+    ///
+    /// Disabled by default (an own choice: loudness never changes until the
+    /// user asks). Because [`PlayerState`] has no field for it (and changing
+    /// the wire contract requires an RFC), the setting remains engine-side.
+    pub fn replaygain_mode(&self) -> ReplayGainMode {
+        self.replaygain_control.mode()
+    }
+
+    /// Select which ReplayGain value normalizes a track
+    /// ([`ReplayGainMode::Disabled`], [`ReplayGainMode::Track`] or
+    /// [`ReplayGainMode::Album`]).
+    ///
+    /// Takes effect from the next track (or seek): the decode thread
+    /// snapshots the setting when it opens a track.
+    pub fn set_replaygain_mode(&mut self, mode: ReplayGainMode) {
+        self.replaygain_control.set_mode(mode);
+    }
+
+    /// The ReplayGain preamp in dB: a user offset added on top of the
+    /// selected track/album gain (`0.0` by default).
+    ///
+    /// It only shifts a selected gain; a track without a usable tag plays
+    /// unadjusted whatever the preamp says. Engine-side, like the mode.
+    pub fn replaygain_preamp_db(&self) -> f32 {
+        self.replaygain_control.preamp_db()
+    }
+
+    /// Set the ReplayGain preamp in dB (clamped to
+    /// `±`[`crate::replaygain::MAX_PREAMP_DB`]; non-finite keeps the
+    /// previous value). Takes effect from the next track (or seek).
+    pub fn set_replaygain_preamp_db(&mut self, preamp_db: f32) {
+        self.replaygain_control.set_preamp_db(preamp_db);
+    }
+
+    /// The ReplayGain control block, shared with the decode thread.
+    pub fn replaygain_control(&self) -> Arc<ReplayGainControl> {
+        Arc::clone(&self.replaygain_control)
     }
 
     /// Whether "stop after current track" is armed (RFC 0005 O8).
@@ -1239,6 +1308,7 @@ impl Engine {
             vis_enabled: self.cfg.vis_enabled,
             vis_capacity: self.cfg.vis_capacity,
             stop_after_current: self.stop_after_current,
+            replay_gain: Arc::clone(&self.replaygain_control),
             start_epoch,
         };
         // The equalizer runs first, on the decoded PCM (see the module docs).

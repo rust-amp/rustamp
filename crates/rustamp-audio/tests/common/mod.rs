@@ -15,6 +15,7 @@ use rustamp_core::audio::{AudioSpec, Confidence, Decoder, DecoderFactory, MediaS
 use rustamp_core::bus::{EventBus, EventReceiver};
 use rustamp_core::error::Result;
 use rustamp_core::event::Event;
+use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::StreamInfo;
 use rustamp_output::{NullClock, NullOutput};
 
@@ -57,6 +58,12 @@ struct PatternDecoder {
     seed: u64,
     total: u64,
     pos: u64,
+    /// ReplayGain track gain in dB (`None` = untagged), for the ReplayGain
+    /// tests. Formatted into `extra` exactly the way `rustamp-meta` writes
+    /// it (`"+6.02 dB"`).
+    rg_track: Option<f32>,
+    /// ReplayGain album gain in dB (`None` = untagged).
+    rg_album: Option<f32>,
 }
 
 impl Decoder for PatternDecoder {
@@ -94,6 +101,21 @@ impl Decoder for PatternDecoder {
             sample_rate_hz: self.spec.sample_rate,
             channels: self.spec.channels,
         }
+    }
+
+    fn metadata(&self) -> TrackMetadata {
+        let mut metadata = TrackMetadata::default();
+        if let Some(gain) = self.rg_track {
+            metadata
+                .extra
+                .insert("REPLAYGAIN_TRACK_GAIN".to_owned(), format!("{gain:+.2} dB"));
+        }
+        if let Some(gain) = self.rg_album {
+            metadata
+                .extra
+                .insert("REPLAYGAIN_ALBUM_GAIN".to_owned(), format!("{gain:+.2} dB"));
+        }
+        metadata
     }
 
     fn skipped_packets(&self) -> u64 {
@@ -262,6 +284,32 @@ fn scripted(name: &str) -> Option<ScriptDecoder> {
     None
 }
 
+/// A ReplayGain-tagged synthetic track: `rg_<track>_<album>_<seed>_<frames>`,
+/// where `<track>`/`<album>` are gains in dB or `none` for untagged, e.g.
+/// `rg_-6.02_none_1_44100.tst` (track gain −6.02 dB, seed 1, one second).
+/// The samples are [`pattern`] for `seed`, exactly like an untagged track.
+fn parse_rg_name(name: &str) -> Option<(Option<f32>, Option<f32>, u64, u64)> {
+    let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let stem = stem.strip_suffix(".tst").unwrap_or(stem);
+    let rest = stem.strip_prefix("rg_")?;
+    let mut parts = rest.split('_');
+    let track = parts.next()?;
+    let album = parts.next()?;
+    let seed: u64 = parts.next()?.parse().ok()?;
+    let frames: u64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    fn gain(text: &str) -> Option<Option<f32>> {
+        if text == "none" {
+            Some(None)
+        } else {
+            text.parse().ok().map(Some)
+        }
+    }
+    Some((gain(track)?, gain(album)?, seed, frames))
+}
+
 /// Factory for `*.tst` paths.
 pub struct TestFactory;
 
@@ -298,11 +346,23 @@ impl DecoderFactory for TestFactory {
         if let Some(decoder) = scripted(&name) {
             return Ok(Box::new(decoder));
         }
+        if let Some((rg_track, rg_album, seed, total)) = parse_rg_name(&name) {
+            return Ok(Box::new(PatternDecoder {
+                spec: SPEC,
+                seed,
+                total,
+                pos: 0,
+                rg_track,
+                rg_album,
+            }));
+        }
         Ok(Box::new(PatternDecoder {
             spec: SPEC,
             seed: track_seed(&name),
             total: track_frames(&name),
             pos: 0,
+            rg_track: None,
+            rg_album: None,
         }))
     }
 }

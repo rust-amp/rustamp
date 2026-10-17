@@ -27,6 +27,9 @@
 //! caller thread:  Engine (commands, events, audio clock, vis tap)
 //! ```
 //!
+//! A track's ReplayGain correction, when enabled, scales the raw decoder
+//! output before the equalizer (see [`replaygain`]).
+//!
 //! The ring is a lock-free SPSC buffer; the render callback fills the whole
 //! device buffer, writes silence on underrun and neither allocates nor locks
 //! nor logs. Position comes from [`rustamp_core::audio::OutputDevice::played_frames`].
@@ -38,6 +41,7 @@
 //! * [`ring`] — the ring and the seek/flush handshake.
 //! * [`convert`] — engine format -> device format (rate and channels).
 //! * [`gain`] — the single place where volume/balance become gains.
+//! * [`replaygain`] — the ReplayGain track multiplier, applied before the DSP chain.
 //! * [`vistap`] — [`VisTap`], the 2 x 576 waveform tap (spectrum: spec S08).
 //!
 //! See `docs/rfc/0002-audio-contracts.md` for the `rustamp-core` changes this
@@ -49,6 +53,7 @@ pub mod convert;
 pub mod decode;
 pub mod engine;
 pub mod gain;
+pub mod replaygain;
 pub mod resident;
 pub mod ring;
 pub mod vistap;
@@ -56,6 +61,7 @@ pub mod vistap;
 pub use convert::FormatConverter;
 pub use decode::TrackSource;
 pub use engine::{Engine, EngineConfig};
+pub use replaygain::{ReplayGainControl, ReplayGainMode};
 #[cfg(windows)]
 pub use resident::ProcessDecoder;
 pub use resident::{HostDecoder, ResidentConfig, ResidentFactory};

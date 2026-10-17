@@ -5,6 +5,10 @@
 //! channels (control in, reports out) plus the atomics of
 //! [`crate::ring::RingSync`] for the seek handshake.
 //!
+//! The decode order per block is decoder -> ReplayGain scale ->
+//! DSP chain -> vis tap -> format converter -> ring (see
+//! [`crate::replaygain`] for why the gain sits before every stage).
+//!
 //! Gapless: when a track ends the loop simply opens the next queue entry and
 //! keeps writing, so the ring never runs dry at the seam and the timeline stays
 //! continuous. Nothing is dropped and no silence is inserted. The one exception
@@ -56,6 +60,7 @@ use rustamp_core::state::StreamInfo;
 use rustamp_core::vis::VisFrame;
 
 use crate::convert::FormatConverter;
+use crate::replaygain::ReplayGainControl;
 use crate::ring::RingSync;
 use crate::vistap::VisTap;
 
@@ -311,6 +316,9 @@ pub(crate) struct Config {
     /// started (RFC 0005 O8); later toggles arrive as
     /// [`DecodeMsg::SetStopAfterCurrent`].
     pub stop_after_current: bool,
+    /// The user's ReplayGain settings, snapshotted once per track (see
+    /// [`crate::replaygain`]).
+    pub replay_gain: Arc<ReplayGainControl>,
     /// Ring epoch the engine bumped at the start of the run because the ring
     /// still held a previous run's audio. The first write waits for its
     /// drain and the engine's clock re-base (see `crate::ring`).
@@ -348,6 +356,7 @@ pub(crate) fn spawn(
         paused: false,
         quitting: false,
         stopped: false,
+        rg_gain: 1.0,
         stop_after_current,
         pending_seek: None,
         pending_skip: None,
@@ -423,6 +432,11 @@ struct Worker {
     paused: bool,
     quitting: bool,
     stopped: bool,
+    /// The current track's ReplayGain multiplier (1.0 when the mode is
+    /// disabled or the track carries no usable tag). Snapshotted in
+    /// `prepare_track`; a seek keeps the track's gain, a new track reads
+    /// its own.
+    rg_gain: f32,
     /// "Stop after current track" is armed (RFC 0005 O8): the run ends at the
     /// end of the current track instead of advancing.
     stop_after_current: bool,
@@ -522,6 +536,11 @@ impl Worker {
     fn prepare_track(&mut self, index: u32, decoder: &dyn Decoder, continues: bool) {
         let src = decoder.spec();
         self.src = src;
+        // The track's ReplayGain multiplier, before every stage: the limiter
+        // and the converter ceiling below see the normalized signal, so a hot
+        // correction is limited and clamped like any other hot signal.
+        let metadata = decoder.metadata();
+        self.rg_gain = self.cfg.replay_gain.effective_gain(&metadata.extra);
         for stage in &mut self.dsp {
             let _ = stage.prepare(src);
         }
@@ -553,7 +572,7 @@ impl Worker {
             src,
             duration_frames,
             duration_ms: decoder.duration().map(|d| d.as_millis() as u64),
-            metadata: Box::new(decoder.metadata()),
+            metadata: Box::new(metadata),
             stream: Box::new(decoder.stream_info()),
             timeline_start: self.track_start,
             seekable: decoder.is_seekable(),
@@ -651,6 +670,12 @@ impl Worker {
     fn emit(&mut self, frames: usize) -> bool {
         let src_ch = usize::from(self.src.channels);
         let samples = frames * src_ch;
+        // ReplayGain first: a per-track constant scale on the raw decoder
+        // output, before the equalizer, every installed stage, the limiter
+        // and the converter (see `crate::replaygain`). A gain of 1.0 is a
+        // bit-exact no-op.
+        let rg_gain = self.rg_gain;
+        crate::replaygain::apply_gain(&mut self.in_buf[..samples], rg_gain);
         for stage in &mut self.dsp {
             stage.process(&mut self.in_buf[..samples]);
         }
