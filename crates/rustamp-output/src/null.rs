@@ -71,6 +71,7 @@ struct Shared {
     paused: AtomicBool,
     running: AtomicBool,
     flushes: AtomicU64,
+    failed: AtomicBool,
 }
 
 /// The [`OutputDevice`] half of a null output. Pass it to the engine.
@@ -99,6 +100,7 @@ impl NullOutput {
             paused: AtomicBool::new(false),
             running: AtomicBool::new(false),
             flushes: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
         });
         (
             NullOutput {
@@ -143,6 +145,7 @@ impl OutputDevice for NullOutput {
         self.shared.paused.store(false, Ordering::Release);
         self.shared.running.store(false, Ordering::Release);
         self.shared.flushes.store(0, Ordering::Release);
+        self.shared.failed.store(false, Ordering::Release);
         drop(inner);
         Ok(OutputFormat {
             spec,
@@ -204,6 +207,14 @@ impl OutputDevice for NullOutput {
         self.shared.played.load(Ordering::Acquire)
     }
 
+    fn stream_error(&self) -> Option<Error> {
+        if self.shared.failed.load(Ordering::Acquire) {
+            Some(Error::Output("null: simulated device failure".into()))
+        } else {
+            None
+        }
+    }
+
     fn close(&mut self) -> Result<()> {
         let mut inner = self
             .shared
@@ -253,6 +264,16 @@ impl NullClock {
         self.shared.flushes.load(Ordering::Acquire)
     }
 
+    /// Simulate a fatal hardware/stream failure mid-run.
+    pub fn fail(&self) {
+        self.shared.failed.store(true, Ordering::Release);
+    }
+
+    /// Whether a fatal device failure has been simulated.
+    pub fn is_failed(&self) -> bool {
+        self.shared.failed.load(Ordering::Acquire)
+    }
+
     /// Frames pulled per [`NullClock::pump`] callback. Affects the callback
     /// size the engine sees and therefore the granularity of a seek. Resizes
     /// the callback scratch buffer, so call it outside a real-time window.
@@ -291,6 +312,7 @@ impl NullClock {
     fn drive(&self, frames: u64, mut out: Option<&mut Vec<f32>>) -> u64 {
         if !self.shared.running.load(Ordering::Acquire)
             || self.shared.paused.load(Ordering::Acquire)
+            || self.shared.failed.load(Ordering::Acquire)
         {
             return 0;
         }
@@ -489,5 +511,36 @@ mod tests {
     fn latency_is_zero_before_open() {
         let (out, _clock) = output_and_clock();
         assert_eq!(out.latency(), Duration::ZERO);
+    }
+
+    #[test]
+    fn stream_error_returns_none_initially() {
+        let (out, _clock) = output_and_clock();
+        assert!(out.stream_error().is_none());
+    }
+
+    #[test]
+    fn stream_error_reflects_injected_failure() {
+        let (out, clock) = output_and_clock();
+        assert!(out.stream_error().is_none());
+        assert!(!clock.is_failed());
+        clock.fail();
+        assert!(clock.is_failed());
+        let err = out.stream_error().expect("stream error present");
+        assert!(
+            matches!(err, Error::Output(ref msg) if msg.contains("simulated device failure")),
+            "expected simulated device failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn open_clears_injected_failure() {
+        let (mut out, clock) = output_and_clock();
+        clock.fail();
+        assert!(out.stream_error().is_some());
+        let spec = AudioSpec::new(8000, 1);
+        out.open(spec).unwrap();
+        assert!(out.stream_error().is_none());
+        assert!(!clock.is_failed());
     }
 }

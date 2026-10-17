@@ -97,7 +97,7 @@ Where specifications left aesthetic details to implementation, the following cle
 The skin and its dimensions are verified in multiple independent ways:
 
 1. **Static Generator Check:**
-   `generate_skin.py::verify_static_dimensions` verifies all 30 graphical sheets and cursors against `EXPECTED_DIMENSIONS` at build time, failing loudly on any dimension discrepancy.
+   `generate_skin.py::verify_static_dimensions` verifies all 30 graphical sheets and cursors against `EXPECTED_DIMENSIONS` **when the generator is run by hand**, failing loudly on any dimension discrepancy. It is called from `main()` (`crates/rustamp-skin/generator/generate_skin.py:1450`) under `if __name__ == "__main__"` (line 1453) — it does **not** run at build time. `crates/rustamp-skin/` has no `build.rs`, and the committed assets are embedded at compile time with `include_bytes!`/`include_str!` (`crates/rustamp-skin/src/rust_theme.rs:14-50`). (Corrected in the W11 docs sweep; W10 finding J2-8.)
 2. **Static Test Suite:**
    `crates/rustamp-skin/tests/rust_theme.rs::static_sheet_dimensions_match_spec_exact` decodes all 19 sheets and asserts their pixel width and height against `SPEC_SHEET_SIZES`.
 3. **Cursor & Text Verification:**

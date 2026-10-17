@@ -24,7 +24,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use rustamp_core::config::Config;
-use rustamp_core::state::WindowId;
 
 /// Environment variable that overrides the config path (also the test seam).
 pub const CONFIG_ENV: &str = "RUSTAMP_CONFIG";
@@ -293,15 +292,16 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
         let mut windows_array = Vec::new();
         for w in &config.ui.windows {
             let mut win_table = toml::Table::new();
-            let id_str = match w.id {
-                WindowId::Main => "Main".to_string(),
-                WindowId::Equalizer => "Equalizer".to_string(),
-                WindowId::Playlist => "Playlist".to_string(),
-                WindowId::Vis => "Vis".to_string(),
-                WindowId::Video => "Video".to_string(),
-                WindowId::Gen(n) => format!("Gen({n})"),
-            };
-            win_table.insert("id".into(), toml::Value::String(id_str));
+            // The id must be written exactly the way the loader reads it back.
+            // `WindowId` is a wire type, so its serde form is what
+            // `toml::from_str` into the config expects; hand-rolling it as a
+            // string only worked for the unit variants. A generic window came
+            // out as `Gen(3)`, which the loader refuses, so a clean exit wrote
+            // a file the player itself could not read on the next launch
+            // (W10 finding F1).
+            let id_value = toml::Value::try_from(w.id)
+                .unwrap_or_else(|_| toml::Value::String("Main".to_string()));
+            win_table.insert("id".into(), id_value);
             win_table.insert("x".into(), toml::Value::Integer(i64::from(w.x)));
             win_table.insert("y".into(), toml::Value::Integer(i64::from(w.y)));
             win_table.insert("visible".into(), toml::Value::Boolean(w.visible));
@@ -364,6 +364,7 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use rustamp_core::config::WindowLayout;
+    use rustamp_core::state::WindowId;
 
     #[test]
     fn a_missing_file_is_all_defaults() {
@@ -435,6 +436,41 @@ mod tests {
         if let Some(path) = path {
             assert!(path.is_absolute() || std::env::var_os(CONFIG_ENV).is_some());
         }
+    }
+
+    #[test]
+    fn a_generic_window_id_survives_the_written_file() {
+        // W10 finding F1: the writer hand-rolled the id as a string, which is
+        // not the form the loader reads back for a generic window, so a clean
+        // exit wrote a file that the next launch refused. The round-trip test
+        // above only used unit variants, which is why it could not see it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("generic.toml");
+        let mut config = Config::default();
+        config.ui.windows = vec![
+            WindowLayout {
+                id: WindowId::Gen(3),
+                x: 1,
+                y: 2,
+                visible: true,
+                shaded: false,
+                width: Some(275),
+                height: Some(232),
+            },
+            WindowLayout {
+                id: WindowId::Main,
+                x: 0,
+                y: 0,
+                visible: true,
+                shaded: false,
+                width: None,
+                height: None,
+            },
+        ];
+
+        save(&config, &path).expect("save succeeds");
+        let loaded = load(Some(&path)).expect("a written file must load again");
+        assert_eq!(loaded.config.ui.windows, config.ui.windows);
     }
 
     #[test]

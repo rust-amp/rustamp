@@ -43,6 +43,39 @@ window may open on the host, so a smoke run has to happen inside the test VM —
 which needs a small job that launches the packaged player and proves it starts,
 shows its window and exits. That is the next step for this artefact.
 
+## Addendum 2026-10-17 — what has moved since the build (artefact bytes unchanged)
+
+The artefact above is frozen at source commit `f1b87b8`; `git log
+f1b87b8..HEAD` counts 72 commits since, none of which rebuilt it. For the full
+artefact-vs-tree inventory see `docs/tasks/BETA-what-is-in-it.md`. Four lines
+of this card need re-pointing, not rewriting:
+
+- *"The packaged binary has not been run"* (§"Not verified yet"): the blocking
+  job now exists — `docs/notes/vm-run-smoke.ps1` + guest `run-smoke.ps1`
+  (`docs/tasks/BETA-smoke.md`). It has run five times and found four
+  runner/staging defects (all fixed), but no run has yet recorded the full
+  green proof, so the packaged window still counts as never proven open.
+- *"the device-loss hook still being an RFC"*: RFC 0012 is now implemented
+  across `rustamp-core` / `rustamp-output` / `rustamp-audio` with a headless
+  suite (`docs/tasks/H5-output-error-hook.md`; `docs/tasks/BETA-readiness-2.md`
+  §2e). In the tree, not in these bytes.
+- *"no real plugin loading"*: the loader is now a verified-byte snapshot +
+  pre-execution preflight with an `approved_image` gate
+  (`docs/tasks/P5-dll-preflight.md`; `docs/tasks/BETA-readiness-2.md` §2c) —
+  still VM-acceptance-pending and with no production approval store. In the
+  tree, not in these bytes.
+- *"the stub platform layer"*: single instance + CLI forwarding (F2) predates
+  the build and IS in these bytes; the tray model + global-hotkey session (F3)
+  post-dates it and its two `window.rs` seams are still open, so six chords
+  register and none is delivered (`docs/tasks/F3-tray-hotkeys.md`;
+  `docs/tasks/BETA-readiness-2.md` §2f).
+
+Left as written: the layout table, the runtime paragraphs, and the suite
+counts — all true of the tree *at `f1b87b8`*. The ring-reuse line stays too:
+`docs/tasks/A8-ring-reuse.md` still records itself not fixed, while the
+neighbouring stop/flush behaviour has been re-specified by A12 (in these
+bytes) and A13 (fail-closed barrier, tree only).
+
 ## Known defects this build ships with
 
 Named honestly in the README beside the binaries: the ring-reuse defect after

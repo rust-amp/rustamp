@@ -1672,7 +1672,10 @@ dependencies = [
  "rustamp-core",
  "rustamp-decoders",
  "rustamp-dsp",
+ "rustamp-mediahost",
+ "rustamp-meta",
  "rustamp-output",
+ "rustamp-proto",
  "tempfile",
 ]
 
@@ -1685,6 +1688,16 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "toml",
+]
+
+[[package]]
+name = "rustamp-dechost"
+version = "0.0.1"
+dependencies = [
+ "rustamp-core",
+ "rustamp-decoders",
+ "rustamp-mediahost",
+ "rustamp-proto",
 ]
 
 [[package]]
@@ -1702,6 +1715,16 @@ name = "rustamp-dsp"
 version = "0.0.1"
 dependencies = [
  "rustamp-core",
+ "rustamp-proto",
+]
+
+[[package]]
+name = "rustamp-dsphost"
+version = "0.0.1"
+dependencies = [
+ "rustamp-core",
+ "rustamp-ipc",
+ "rustamp-mediahost",
  "rustamp-proto",
 ]
 

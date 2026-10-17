@@ -349,6 +349,28 @@ pub trait OutputDevice: Send {
     fn resume(&mut self) -> Result<()>;
 
     /// Drop everything buffered in the device (used on seek / stop).
+    ///
+    /// # What a backend must guarantee
+    ///
+    /// After a successful return, no frame that was already buffered can still
+    /// reach the speakers: the next frame heard belongs to whatever the engine
+    /// renders from then on.
+    ///
+    /// A backend that cannot do that portably - the cpal backend is the one we
+    /// have, because a shared endpoint buffer cannot be reset from here - must
+    /// **refuse** with [`Error::Unsupported`] rather than return `Ok` and let
+    /// stale audio play. A silent `Ok` is the one answer that is worse than a
+    /// failure, because the caller cannot tell the difference.
+    ///
+    /// # What a caller must assume
+    ///
+    /// The engine treats a refusal as terminal for the current output: it stops
+    /// the run and does not resume into an output it cannot clean, so the
+    /// caller (the application) has to recreate the engine and the output
+    /// before it can play again. There is no automatic recovery, and a
+    /// successful flush is not a promise that the hardware falls silent at that
+    /// instant - only that what was buffered will not be heard as the next
+    /// audio. (W10 finding F3, A13.)
     fn flush(&mut self) -> Result<()>;
 
     /// Current output latency (time between a frame being rendered and heard).
@@ -361,6 +383,21 @@ pub trait OutputDevice: Send {
     /// Device-level volume in `0.0..=1.0`. Default: unsupported (the engine applies volume itself).
     fn set_volume(&mut self, _volume: f32) -> Result<()> {
         Err(Error::Unsupported("device volume"))
+    }
+
+    /// Check if a fatal mid-stream error occurred on the output device.
+    ///
+    /// Real backends latch stream failures (e.g. endpoint removal, hardware
+    /// format revocation, buffer write streak exhaustion) asynchronously from
+    /// their audio/render callbacks.
+    ///
+    /// This method is called from the control/engine thread (e.g. in
+    /// `Engine::poll`). It must be non-blocking and lock-free.
+    ///
+    /// Returns `None` if the device is healthy or stopped, or `Some(err)`
+    /// describing the fatal failure that terminated output.
+    fn stream_error(&self) -> Option<Error> {
+        None
     }
 
     /// Stop and release the device.
@@ -444,5 +481,46 @@ mod tests {
     fn skipped_packets_defaults_to_zero() {
         // RFC 0002, C1: a decoder that cannot tell reports no damage.
         assert_eq!(Minimal.skipped_packets(), 0);
+    }
+
+    /// Minimal output used to check the provided trait methods.
+    struct MinimalOutput;
+
+    impl OutputDevice for MinimalOutput {
+        fn name(&self) -> &str {
+            "minimal"
+        }
+        fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
+            Ok(OutputFormat {
+                spec,
+                buffer_frames: 1024,
+            })
+        }
+        fn start(&mut self, _render: RenderFn) -> Result<()> {
+            Ok(())
+        }
+        fn pause(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn latency(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn played_frames(&self) -> u64 {
+            0
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_error_defaults_to_none() {
+        assert!(MinimalOutput.stream_error().is_none());
     }
 }

@@ -1,45 +1,24 @@
-//! `rustamp-dsphost` — out-of-process DSP host (RFC 0006).
-//!
-//! This binary hosts a DSP chain in a separate process. It speaks the control
-//! protocol over stdin/stdout (length-prefixed postcard frames) and transfers
-//! PCM through two shared-memory rings (RFC 0003): one inbound (main→host) and
-//! one outbound (host→main).
-//!
-//! **Stub implementation (M6 card):** only the control protocol skeleton is
-//! implemented. The actual DSP chain configuration, PCM ring handling, and
-//! process spawning are out of scope and belong to a later card.
+//! Framework entry point. A real DSP chain lives in a separately licensed
+//! resident binary using the same `serve_dsp` API, never in this permissive
+//! binary.
 
-use rustamp_ipc::{Message, StreamTransport, Transport};
-use rustamp_mediahost::{DspHost, MediaHost, MediaHostError, Result};
-use std::io::{stdin, stdout};
+#[cfg(windows)]
+fn main() -> rustamp_mediahost::Result<()> {
+    use rustamp_mediahost::control::{ControlPeer, Liveness};
+    use rustamp_mediahost::dsp::{UnavailableDspResident, serve_dsp};
+    use rustamp_mediahost::pcm::NamedPcmRings;
+    let peer = ControlPeer::start(
+        std::io::stdin(),
+        std::io::stdout(),
+        Liveness::default(),
+        true,
+    )?;
+    serve_dsp(&peer, &NamedPcmRings, &UnavailableDspResident)
+}
 
-fn main() -> Result<()> {
-    let mut host = DspHost::new();
-    let mut transport = StreamTransport::new(stdin(), stdout());
-
-    // Send our Hello immediately
-    transport
-        .send(&Message::hello())
-        .map_err(|e| MediaHostError::OperationFailed(format!("failed to send Hello: {e}")))?;
-
-    // Main message loop
-    loop {
-        let msg = match transport.recv() {
-            Ok(msg) => msg,
-            Err(rustamp_ipc::IpcError::Closed) => break Ok(()),
-            Err(e) => return Err(MediaHostError::OperationFailed(format!("recv error: {e}"))),
-        };
-
-        if matches!(msg, Message::Shutdown) {
-            break Ok(());
-        }
-        match host.handle_message(msg) {
-            Ok(Some(response)) => transport.send(&response),
-            Ok(None) => Ok(()),
-            Err(error) => transport.send(&Message::DspError {
-                message: error.to_string(),
-            }),
-        }
-        .map_err(|e| MediaHostError::OperationFailed(format!("failed to send response: {e}")))?;
-    }
+#[cfg(not(windows))]
+fn main() -> rustamp_mediahost::Result<()> {
+    Err(rustamp_mediahost::MediaHostError::NotImplemented(
+        "cross-process PCM mappings require Windows; M6 is deferred".into(),
+    ))
 }

@@ -84,6 +84,17 @@ pub trait SkinFallback {
     /// Returns a stand-in image for `sheet`, or `None` when the sheet has no
     /// known size.
     fn sheet_image(&self, sheet: Sheet) -> Option<RasterImage>;
+
+    /// Returns a stand-in cursor for `name` (e.g. `"close.cur"`), or `None`
+    /// when the fallback carries no cursor under that name.
+    ///
+    /// The default is `None`, so a fallback that only supplies sheets leaves
+    /// a missing cursor absent — the same rule sheets follow when the
+    /// fallback has no size for them.
+    fn cursor(&self, name: &str) -> Option<CursorFile> {
+        let _ = name;
+        None
+    }
 }
 
 /// The built-in default skin.
@@ -113,11 +124,27 @@ impl SkinFallback for BuiltinDefaultSkin {
         }
         Some(RasterImage::filled(width, height, [0x17, 0x18, 0x1C, 0xFF]))
     }
+
+    fn cursor(&self, name: &str) -> Option<CursorFile> {
+        let bytes = crate::rust_theme::cursor_bytes(name)?;
+        let kind = if bytes.starts_with(b"RIFF") {
+            CursorKind::Ani
+        } else {
+            CursorKind::Cur
+        };
+        Some(CursorFile {
+            name: name.to_string(),
+            bytes: bytes.to_vec(),
+            kind,
+        })
+    }
 }
 
 /// The classic lookalike fallback skin (task card J1).
 ///
 /// Supplies classic lookalike dark-metallic sheets when explicitly selected.
+/// It ships no cursors, so a missing cursor stays absent under this fallback
+/// (the [`SkinFallback::cursor`] default).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BuiltinLookalikeSkin;
 
@@ -264,6 +291,7 @@ impl Skin {
                 });
             }
         }
+        resolve_cursor_fallbacks(&mut cursors, fallback, &mut substitutions);
 
         Ok(Skin {
             source: source.describe(),
@@ -324,7 +352,9 @@ impl Skin {
         &self.region
     }
 
-    /// The cursors the skin ships.
+    /// The cursors the skin ships, plus any the fallback supplied for names
+    /// the skin does not carry (see [`SkinFallback::cursor`]). A name the
+    /// fallback does not carry either is simply absent.
     pub fn cursors(&self) -> &[CursorFile] {
         &self.cursors
     }
@@ -409,6 +439,51 @@ fn resolve_default_fallbacks(
                 requested: sheet.file_name().to_string(),
                 with: Substitute::DefaultSkin,
             });
+        }
+    }
+}
+
+/// The cursor file-name stem, ignoring a `.cur`/`.ani` suffix of either case.
+///
+/// A skin that ships `posbar.ani` carries the `posbar.cur` slot, so the
+/// fallback must never shadow it with a cursor of its own.
+fn cursor_stem(name: &str) -> &str {
+    for suffix in [".cur", ".ani"] {
+        if name.len() >= suffix.len()
+            && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        {
+            return &name[..name.len() - suffix.len()];
+        }
+    }
+    name
+}
+
+/// Fills any missing cursor from the fallback skin.
+///
+/// This is the same rule sheets follow ([`resolve_default_fallbacks`]): a
+/// cursor the skin does not carry is taken from the fallback's own cursor of
+/// the same name and reported as a [`Substitute::DefaultSkin`] substitution.
+/// A name the fallback does not carry either stays absent with no
+/// substitution, exactly like a sheet the fallback has no size for.
+fn resolve_cursor_fallbacks(
+    cursors: &mut Vec<CursorFile>,
+    fallback: &dyn SkinFallback,
+    substitutions: &mut Vec<Substitution>,
+) {
+    for name in webamp::CURSOR_NAMES {
+        let wanted = cursor_stem(name);
+        if cursors
+            .iter()
+            .any(|c| cursor_stem(&c.name).eq_ignore_ascii_case(wanted))
+        {
+            continue;
+        }
+        if let Some(cursor) = fallback.cursor(name) {
+            substitutions.push(Substitution {
+                requested: (*name).to_string(),
+                with: Substitute::DefaultSkin,
+            });
+            cursors.push(cursor);
         }
     }
 }

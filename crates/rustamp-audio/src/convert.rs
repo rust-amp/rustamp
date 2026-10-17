@@ -79,6 +79,19 @@
 //!   rubato's own state across those calls, so no frame is dropped or repeated
 //!   at a block seam.
 //! * **Precision:** the resampler runs in `f32`, the format of the whole path.
+//! * **Final ceiling (own choice).** On the resampled path every output frame
+//!   is passed through [`finish_sample`]: non-finite samples become silence,
+//!   subnormals become zero, and anything above full scale is clamped to
+//!   `±1.0` (0 dBFS). The limiter before the converter can only promise a
+//!   *sample*-peak ceiling at its own output, and the band-limited resampler
+//!   rebuilds inter-sample peaks above it (A6 finding 3: about +2.7 dBFS on a
+//!   simple tone, more on pathological sequences). Volume and balance after
+//!   the converter only attenuate (see `gain`), so this is the last point
+//!   that can raise the level — a bound here is a bound at the device, and the
+//!   ring never holds a sample above full scale. The bound is `1.0`, not the
+//!   limiter's −0.3 dB ceiling: the limiter's ceiling is a dynamics choice, and
+//!   legitimate near-full-scale peaks must not be touched by the safety net.
+//!   The equal-rate path is untouched, so its bit-exact promise stands.
 //!
 //! # Real-time safety
 //!
@@ -539,8 +552,26 @@ impl FormatConverter {
             in_ch,
             out_ch,
         );
+        // The final ceiling (see the module docs). This path only runs when
+        // resampling: the equal-rate path returns before reaching `run_block`
+        // and keeps its bit-exact promise for every input, including
+        // subnormals.
+        for s in &mut out[..n * out_ch] {
+            *s = finish_sample(*s);
+        }
         self.out_total += n as u64;
         n
+    }
+}
+
+/// The last level decision in the chain, on the resampled path only: silence
+/// for non-finite samples, zero for subnormals, and a hard clamp at full
+/// scale. Finite in-band samples pass through bit for bit.
+fn finish_sample(x: f32) -> f32 {
+    if !x.is_finite() || x.is_subnormal() {
+        0.0
+    } else {
+        x.clamp(-1.0, 1.0)
     }
 }
 
@@ -990,5 +1021,96 @@ mod tests {
         assert!((20.0 * (a / 0.5).log10()).abs() < 0.05, "level {a}");
         let residual = residual_db(y, 11_000, 1_000.0, 44_101, 0.5);
         assert!(residual < -60.0, "residual {residual:.1} dB");
+    }
+
+    /// A6 finding 3 at converter level, with numbers. The tone
+    /// `x[n] = S·sin(πn/2 + π/4)` at 44.1 kHz has samples of exactly
+    /// `±S·√2/2`. At 48 kHz the fs/4 tone (11.025 kHz, inside the passband) is
+    /// sampled near its true peak `S`, so the resampler rebuilds about
+    /// `√2 ≈ +3 dB` over the sample peak.
+    ///
+    /// With `S = 1.0` the samples (`±0.7071`) pass any sample-peak limiter
+    /// untouched, yet the output reaches `≈1.0`: a rebuild of over 40 % that
+    /// no sample-peak criterion before the resampler can see. The bound is
+    /// loose on purpose: the passband is flat to ±0.05 dB, so anything below
+    /// `0.99` would be the filter, not the test.
+    #[test]
+    fn resampling_rebuilds_inter_sample_peaks_above_the_sample_peak() {
+        let tone: Vec<f32> = (0..44_100)
+            .map(|n| {
+                (std::f64::consts::FRAC_PI_4 + std::f64::consts::PI * n as f64 / 2.0).sin() as f32
+            })
+            .collect();
+        let pre = tone.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(
+            (pre - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
+            "sample peak {pre}"
+        );
+        let out = resample(44_100, 48_000, &tone, 1024);
+        assert_eq!(out.len(), 48_000);
+        let post = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(post > 0.99, "rebuilt peak {post} (sample peak {pre})");
+        assert!(post / pre > 1.3, "rebuild ratio {}/{pre}", post);
+        // ... but the final ceiling holds: nothing above full scale.
+        assert!(post <= 1.0, "above 0 dBFS: {post}");
+    }
+
+    /// The A6 torture case end to end: samples at exactly the limiter ceiling
+    /// (`±0.966`, so a sample-peak limiter passes them bit for bit) rebuild to
+    /// about `+2.7 dBFS`, and the converter holds them at exactly full scale.
+    #[test]
+    fn torture_peaks_are_held_at_full_scale_after_resampling() {
+        let ceiling = 10.0_f64.powf(-0.3 / 20.0) as f32;
+        let tone: Vec<f32> = (0..44_100)
+            .map(|n| {
+                (1.3662
+                    * (std::f64::consts::FRAC_PI_4 + std::f64::consts::PI * n as f64 / 2.0).sin())
+                    as f32
+            })
+            .collect();
+        let pre = tone.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(
+            (pre - ceiling).abs() < 1e-3,
+            "sample peak {pre}, ceiling {ceiling}"
+        );
+        let out = resample(44_100, 48_000, &tone, 1024);
+        let post = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        // The rebuild happened (far above the ceiling) and was caught (at 1.0).
+        assert!(post > ceiling, "no rebuild observed: {post}");
+        assert!((post - 1.0).abs() < 1e-6, "post {post}, want exactly 1.0");
+        let clamped = out.iter().filter(|s| s.abs() == 1.0).count();
+        assert!(clamped > 0, "the safety net never engaged");
+    }
+
+    /// Subnormal inputs come out as silence on the resampled path (denormal
+    /// hygiene for the render thread). The equal-rate path is untouched by
+    /// `finish_sample` and keeps its bit-exact promise.
+    #[test]
+    fn resampled_subnormals_come_out_silent() {
+        let input: Vec<f32> = noise(4096).iter().map(|s| s * 1e-40).collect();
+        assert!(input.iter().all(|s| s.is_subnormal() || *s == 0.0));
+        let out = resample(44_100, 48_000, &input, 1024);
+        assert!(out.iter().all(|s| *s == 0.0), "subnormals must not pass");
+    }
+
+    /// Non-finite inputs come out as silence, not as spread NaNs: one NaN
+    /// through a band-limited filter would otherwise contaminate a whole FFT
+    /// block and its overlap.
+    #[test]
+    fn resampled_non_finite_comes_out_silent() {
+        let mut input = noise(4096);
+        input[0] = f32::NAN;
+        input[1000] = f32::INFINITY;
+        input[2000] = f32::NEG_INFINITY;
+        let out = resample(44_100, 48_000, &input, 1024);
+        assert!(
+            out.iter().all(|s| s.is_finite()),
+            "nothing non-finite leaves"
+        );
+        assert!(
+            out.iter()
+                .all(|s| *s == 0.0 || s.is_subnormal() || s.abs() <= 1.0),
+            "bounded output"
+        );
     }
 }

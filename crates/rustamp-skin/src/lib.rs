@@ -12,8 +12,10 @@
 //! * the cursors the skin ships ([`CursorFile`]).
 //!
 //! Missing files never fail the whole load: each one falls back per file (see
-//! [`Substitution`]). `nums_ex.bmp` falls back to `numbers.bmp`, and a missing
-//! main-window sheet falls back to the default skin.
+//! [`Substitution`]). `nums_ex.bmp` falls back to `numbers.bmp`, a missing
+//! sheet falls back to the default skin, and a missing cursor falls back to
+//! the default skin's own cursor of the same name — or stays absent when the
+//! default skin carries no cursor under that name.
 //!
 //! ## Sprite tables
 //!

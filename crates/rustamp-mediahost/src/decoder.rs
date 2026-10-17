@@ -91,12 +91,7 @@ fn command(message: Message) -> Result<Transition> {
 }
 
 fn wait_command(peer: &ControlPeer) -> Result<Message> {
-    loop {
-        match peer.recv(CONTROL_WAIT) {
-            Err(MediaHostError::TimedOut) => continue, // healthy idle peer
-            result => return result,
-        }
-    }
+    peer.recv_blocking()
 }
 
 fn pump<R: MappedRegion>(
@@ -417,7 +412,10 @@ impl<F: PcmRings> DecoderSession<F> {
         if let Some(message) = self.pending.pop_front() {
             return Ok(message);
         }
-        self.peer.recv(remaining(deadline)?.unwrap_or(CONTROL_WAIT))
+        match remaining(deadline)? {
+            Some(timeout) => self.peer.recv(timeout),
+            None => self.peer.recv_blocking(),
+        }
     }
 
     fn replace(&mut self, offer: Message, spec: PcmSpecWire) -> Result<()> {

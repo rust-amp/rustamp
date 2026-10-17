@@ -235,6 +235,82 @@ pub fn hit_test_scroll(x: i32, y: i32) -> Option<ScrollDirection> {
     }
 }
 
+/// The scrollbar track: the column the handle travels in, above the arrow
+/// pair (S01 §4.2: handle drawn at (260,y) with y = 20/40/60; arrows fixed at
+/// (260,78)).
+///
+/// Own choice, stated plainly: no spec fixes the track rectangle — only the
+/// three handle points and the arrow rect are settled — so the track is the
+/// 8 px column from the top settled point down to the arrow pair, wide enough
+/// to hold the 7 px handle and the 8 px arrows.
+pub const SCROLL_TRACK_RECT: Rect = Rect::new(260, 20, 8, 58);
+
+/// The handle rectangle for a scroll offset of `first_visible` in a list of
+/// `len` (S01 §4.2: `PLEDIT.BMP` (52,53,7,17) drawn at (260,y)).
+pub fn scroll_handle_rect(first_visible: usize, len: usize) -> Rect {
+    Rect::new(SCROLL_HANDLE_X, scroll_handle_y(first_visible, len), 7, 17)
+}
+
+/// The scroll offset for a handle-top position `y` in a list of `len`.
+///
+/// Own choice, stated plainly: S06 §3 settles only that a dragged handle
+/// "moves the view" (a visual reading toward the top of the list); no spec
+/// fixes the pixel-to-row mapping. This is the linear inverse of
+/// [`scroll_handle_y`] (which is itself an own-choice interpolation between
+/// the three settled S01 §4.2 points), clamped to the track ends and rounded
+/// to the nearest row, so every offset round-trips exactly.
+pub fn scroll_offset_for_handle_y(y: i32, len: usize) -> usize {
+    let max_first = len.saturating_sub(VISIBLE_ROWS);
+    if max_first == 0 {
+        return 0;
+    }
+    let clamped = y.clamp(SCROLL_TOP_Y, SCROLL_TOP_Y + SCROLL_TRAVEL_PX);
+    ((clamped - SCROLL_TOP_Y) as usize * max_first + (SCROLL_TRAVEL_PX as usize / 2))
+        / SCROLL_TRAVEL_PX as usize
+}
+
+/// Where on the scrollbar (if anywhere) a click at `(x, y)` lands.
+///
+/// Own choice, stated plainly: the spec settles the two arrow points only.
+/// A click on the handle is for dragging ([`scroll_offset_for_handle_y`]); a
+/// click on the track above the handle pages up and below it pages down
+/// (one page step each, via the model's `scroll_page`), the
+/// usual track behaviour. The arrow pair keeps its own path
+/// ([`hit_test_scroll`]) and returns `None` here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbarHit {
+    /// On the handle: drag it ([`scroll_offset_for_handle_y`]).
+    Handle,
+    /// On the track above the handle: page up.
+    TrackAbove,
+    /// On the track below the handle: page down.
+    TrackBelow,
+}
+
+/// Which scrollbar part (if any) a click at `(x, y)` hits, for a view showing
+/// `first_visible` in a list of `len`.
+pub fn hit_test_scrollbar(
+    x: i32,
+    y: i32,
+    first_visible: usize,
+    len: usize,
+) -> Option<ScrollbarHit> {
+    if in_rect(x, y, SCROLL_ARROWS_RECT) {
+        return None;
+    }
+    if !in_rect(x, y, SCROLL_TRACK_RECT) {
+        return None;
+    }
+    let handle = scroll_handle_rect(first_visible, len);
+    if in_rect(x, y, handle) {
+        Some(ScrollbarHit::Handle)
+    } else if y < handle.y {
+        Some(ScrollbarHit::TrackAbove)
+    } else {
+        Some(ScrollbarHit::TrackBelow)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bottom bar (S01 §4, §4.1; S06 §4)
 // ---------------------------------------------------------------------------
@@ -591,5 +667,51 @@ mod tests {
             assert_eq!(hit_test_list_row(60, 23 + row as i32 * 13), Some(row));
             assert_eq!(*id, EntryId(56 + row as u64));
         }
+    }
+
+    #[test]
+    fn handle_drag_mapping_round_trips_every_offset() {
+        // S06 §3 settles only that a dragged handle "moves the view"; the
+        // linear pixel-to-row mapping is an own choice, pinned here by the
+        // round-trip: every offset maps to a handle y and back to itself.
+        for offset in 0..=56usize {
+            let y = scroll_handle_y(offset, 60);
+            assert_eq!(scroll_offset_for_handle_y(y, 60), offset, "offset {offset}");
+        }
+        // Ends and clamps.
+        assert_eq!(scroll_offset_for_handle_y(20, 60), 0);
+        assert_eq!(scroll_offset_for_handle_y(60, 60), 56);
+        assert_eq!(scroll_offset_for_handle_y(0, 60), 0);
+        assert_eq!(scroll_offset_for_handle_y(100, 60), 56);
+        // The settled middle point (S01 §4.2: y = 40 for a 60-entry list).
+        assert_eq!(scroll_offset_for_handle_y(40, 60), 28);
+        // A list that fits one page never moves.
+        assert_eq!(scroll_offset_for_handle_y(60, 3), 0);
+    }
+
+    #[test]
+    fn scrollbar_hit_testing_separates_handle_track_and_arrows() {
+        // A 60-entry list at the bottom page: handle at y = 60..77.
+        assert_eq!(scroll_handle_rect(56, 60), Rect::new(260, 60, 7, 17));
+        assert_eq!(
+            hit_test_scrollbar(263, 65, 56, 60),
+            Some(ScrollbarHit::Handle)
+        );
+        // Track above the handle pages up, below it pages down (own choice).
+        assert_eq!(
+            hit_test_scrollbar(263, 30, 56, 60),
+            Some(ScrollbarHit::TrackAbove)
+        );
+        assert_eq!(
+            hit_test_scrollbar(263, 77, 0, 60),
+            Some(ScrollbarHit::TrackBelow)
+        );
+        // The arrow pair keeps its own path and is not a track hit.
+        assert_eq!(hit_test_scrollbar(263, 81, 56, 60), None);
+        assert_eq!(hit_test_scrollbar(263, 87, 56, 60), None);
+        // Outside the column nothing hits.
+        assert_eq!(hit_test_scrollbar(259, 30, 56, 60), None);
+        assert_eq!(hit_test_scrollbar(268, 30, 56, 60), None);
+        assert_eq!(hit_test_scrollbar(263, 19, 56, 60), None);
     }
 }

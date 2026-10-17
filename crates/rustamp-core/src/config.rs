@@ -145,11 +145,30 @@ impl Default for UiConfig {
 }
 
 /// Equalizer settings.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EqConfig {
     /// Last EQ state.
     pub state: EqState,
+}
+
+impl Default for EqConfig {
+    /// A fresh configuration starts with the equalizer **engaged and flat**.
+    ///
+    /// The fresh-launch engagement is spec-open (S07 §12 item 13: the On
+    /// cell's tie to `use_eq` was never re-verified), and the UI machine's
+    /// provisional default and the blessed equalizer renders both show it
+    /// engaged. Flat gains are unity, so this colours nothing until a band is
+    /// moved. The wire contract's own default ([`EqState::default`],
+    /// disengaged) stays what a bare `PlayerState` says without a config.
+    fn default() -> Self {
+        Self {
+            state: EqState {
+                enabled: true,
+                ..EqState::default()
+            },
+        }
+    }
 }
 
 /// Playlist settings.

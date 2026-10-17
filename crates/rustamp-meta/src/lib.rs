@@ -13,6 +13,12 @@
 //!   path so a single unreadable file never aborts a folder scan.
 //! * [`write_tags`] writes the common fields back, preserving whatever the
 //!   caller does not set.
+//! * [`write_tags_report`] is the honest form of [`write_tags`]: it names
+//!   every `extra` entry the target format could not store.
+//! * The [`replaygain`] module holds the ReplayGain keys, the
+//!   [`replaygain::ReplayGainTags`] value type, the pure headless analysis
+//!   ([`replaygain::analyze_replaygain`]) and an honest ReplayGain writer
+//!   ([`replaygain::write_replaygain`]).
 //! * [`supported_extensions`] and [`supports_extension`] describe the formats
 //!   [`lofty`] handles, next to the decoder registry in `rustamp-decoders`.
 //!
@@ -47,11 +53,20 @@
 
 mod artwork;
 mod read;
+pub mod replaygain;
 mod write;
 
 pub use artwork::Artwork;
 pub use read::{read_artwork, read_tags, scan_paths};
-pub use write::write_tags;
+pub use replaygain::{
+    ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, MAX_GAIN_DB, R128_ALBUM_GAIN_KEY, R128_STEPS_PER_DB,
+    R128_TRACK_GAIN_KEY, REFERENCE_LOUDNESS_KEY, REFERENCE_RMS, REPLAYGAIN_KEYS,
+    ReplayGainAnalysis, ReplayGainTags, ReplayGainWriteReport, TRACK_GAIN_KEY, TRACK_PEAK_KEY,
+    analyze_replaygain, db_to_r128_q8, format_gain_db, format_peak, parse_gain_db, parse_peak,
+    r128_q8_to_db, r128_supported_for_extension, replaygain_supported_for_extension,
+    replaygain_supported_for_tag_type, write_replaygain,
+};
+pub use write::{WriteReport, write_tags, write_tags_report};
 
 /// File extensions whose tags [`lofty`] can read.
 ///

@@ -65,6 +65,44 @@ never means waiting.
 | **OpenAI** | `subagent` with `openai/gpt-6.1-sol#high` | spend it until Sunday 2026-10-18, then stop until approved |
 | **Free** | `subagent` with `free-*` | `free-ling-3.1` and `free-muse-spark` were unavailable; `free-laguna`, `free-big-pickle` and `free-deepseek-v4.1` worked |
 
+## Polling (learned the hard way, 2026-10-17)
+
+**`agy` jobs do not notify.** A `subagent` lane reports back by itself, but an
+`agy_run` lane finishes silently, so the orchestrator must **poll** the job ids it
+holds (`agy_status`) after every batch — otherwise finished lanes sit unnoticed
+and the slots look empty while the work is done. The rule: after merging anything,
+poll every outstanding agy job, verify and merge what is done, and refill **before**
+starting new work. Six lanes were merged in one batch that way; before that, five
+finished lanes had gone unnoticed for a while.
+
+## Lane keeping (owner rule, 2026-10-17)
+
+**Refill automatically, on every completion.** The owner's instruction: keep free
+and Muse lanes running, and do the refilling by itself. The standing rule, applied
+whenever a lane reports or an agy job is found finished:
+
+1. **Verify, then merge** the finished lane (both trees, fmt/clippy, the suite).
+2. **Refill its slot immediately** from `docs/tasks/LANE-QUEUE.md` and
+   `docs/tasks/HARD-TASKS.md` - before starting anything else.
+3. **Targets:** two Muse lanes (the owner's floor until 2026-10-18 midday), at
+   least one free-tier lane, **one Claude lane through the Claude provider while
+   its quota lasts, and it takes the rather difficult work - never agy's Claude
+   bucket**, one Codex lane while its quota lasts, and agy filled to its cap of
+   four. Ten lanes is a healthy wave.
+4. **Match the source to the work:** ordering, threads, clocks, buffers, second
+   processes, numeric subtlety and anything whose proof needs the VM go to Codex;
+   well-specified, local, checkable-by-reading work goes to a free-tier lane;
+   everything in between goes to Muse.
+5. **Check the table, not the story:** `powershell -ExecutionPolicy Bypass -File
+   docs\notes\lanes.ps1` prints every worktree, how many files it has changed and
+   what it is based on, plus the canonical tree's cleanliness. A lane that reports
+   work its worktree does not contain is a dead lane; a lane that writes into the
+   canonical tree is a broken lane - both have happened.
+6. **Worktree first.** Create the worktree before launching the lane; two lanes
+   were launched into paths that did not exist yet.
+7. **Never wait on a source that failed.** Relaunch on another source
+   (`docs/tasks/HARD-TASKS.md` section 1 keeps the failure log).
+
 ## How a lane is started
 
 1. `worktree_create` with a name that says what it is (`waveNN-<topic>`).
@@ -73,3 +111,33 @@ never means waiting.
    downloads, no git writes, no window, no audio), and the owned paths.
 3. Report back with metadata only; the orchestrator verifies **both** trees,
    runs fmt/clippy, then the VM suite, then merges.
+
+## Ready from the reviews (2026-10-17)
+
+Two adversarial reviews landed. They are the source of the next wave, not prose
+to admire.
+
+**M14 — host framework, the two residents** (`docs/tasks/M14-host-framework-review.md`).
+19 claims are pinned by a test that can fail, 7 hold in one direction or one
+lane only, 5 are asserted in prose alone. Ready work, in the order it rates them:
+
+1. **RFC 0014 is drafted and merged** (`docs/rfc/0014-fallible-dsp-stage.md`,
+   `9708063`): a DSP stage must be able to fail loudly *with a message* instead
+   of panicking. The owner decides four things before code follows - stop or
+   bypass on a stage failure, whether the error earns its own kind, the resident
+   restart policy, and confirmation that no out-of-tree implementer exists.
+2. **A reset does not wake a worker blocked in an empty-ring read**
+   (`mediahost/src/dsp.rs:176`, `control.rs:191`); latent today because the host
+   only resets between runs.
+3. **A truncated file can still present as a clean short end of stream**
+   (`dechost/tests/real_decode.rs:326` accepts either terminal).
+4. **The prose-only gaps**: the URL refusal, an abrupt-player-loss mirror for
+   the decoder, a bounded-read timeout mirror for the DSP.
+5. **The test rings ignore the ring direction production refuses**
+   (`mediahost/tests/pcm_transfer.rs:121`).
+
+**W10 - the six-lane batch** (the review was running when this was written).
+
+**VM-only, and therefore not a lane's work:** both two-process spawn-and-kill
+tests, real resident runs, the engine-side adapters, latency compensation, and
+any contention behaviour.

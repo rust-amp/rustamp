@@ -131,6 +131,9 @@ pub struct App {
     /// skin browser, preferences); owned here, rendered by `dialogs.rs`,
     /// hosted by `window.rs`.
     pub(crate) dialogs: DialogManager,
+    pub(crate) playlist_dialog_text: String,
+    pub(crate) playlist_dialog_path: Option<PathBuf>,
+    pub(crate) last_playlist_report: Option<rustamp_playlist::PlaylistReport>,
     /// Whether the main-menu popup is open (owned here, rendered by
     /// `menu.rs`, hosted by `window.rs`; S04).
     pub(crate) main_menu_open: bool,
@@ -151,6 +154,16 @@ pub struct App {
     host_supervisor: Option<Supervisor>,
     /// Where configuration is persisted on clean exit, if known.
     config_path: Option<PathBuf>,
+}
+
+/// Whether `path` has a recognized playlist file extension.
+pub(crate) fn is_playlist_file(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    rustamp_playlist::PlaylistFormat::ALL
+        .iter()
+        .any(|fmt| fmt.extension().eq_ignore_ascii_case(ext))
 }
 
 impl App {
@@ -186,7 +199,9 @@ impl App {
         engine.set_volume(options.volume)?;
         engine.set_balance(options.config.audio.balance)?;
         engine.set_eq(options.config.eq.state);
-        if let Some(file) = &options.file {
+        if let Some(file) = &options.file
+            && !is_playlist_file(file)
+        {
             engine.set_queue(vec![TrackSource::path(file.clone())]);
         }
 
@@ -254,6 +269,9 @@ impl App {
             next_entry_id: 0,
             playlist: PlaylistWindow::new(),
             dialogs: DialogManager::new(),
+            playlist_dialog_text: String::new(),
+            playlist_dialog_path: None,
+            last_playlist_report: None,
             main_menu_open: false,
             notes: Vec::new(),
             last_error: None,
@@ -270,6 +288,11 @@ impl App {
         app.sync_eq_from_engine();
         // The engine's snapshot is the authoritative starting state.
         app.sync_entry_ids();
+        if let Some(file) = &options.file
+            && is_playlist_file(file)
+        {
+            let _ = app.load_playlist_file(file, false);
+        }
         let snapshot = app.engine.state();
         app.sync_from_player_state(&snapshot);
         Ok(app)
@@ -317,6 +340,11 @@ impl App {
     /// The last error surfaced to the user, if one is showing (BETA-04).
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// The outcome of the most recent playlist file load, if one has occurred.
+    pub fn last_playlist_report(&self) -> Option<&rustamp_playlist::PlaylistReport> {
+        self.last_playlist_report.as_ref()
     }
 
     /// The main window's native title: `Rustamp`, or `Rustamp - <error>`
@@ -1389,13 +1417,131 @@ impl App {
         self.publish_skin();
     }
 
+    /// Loads a playlist file from disk, replacing the current queue with the
+    /// surviving entries in order.
+    ///
+    /// If `play` is true and at least one entry survived, playback of the first
+    /// entry is started. If entries were skipped during parsing, the skip
+    /// report is recorded in `self.last_playlist_report` and surfaced as
+    /// informative notes (and printed to stderr in windowed mode).
+    ///
+    /// If the file is malformed, unrecognized, or cannot be read, the queue
+    /// remains unchanged, an error is recorded in `last_error` (surfaced in
+    /// [`App::window_title`]), a note is emitted, and `Err` is returned.
+    pub fn load_playlist_file(
+        &mut self,
+        path: &Path,
+        play: bool,
+    ) -> Result<rustamp_playlist::PlaylistReport, rustamp_playlist::PlaylistError> {
+        let report = match rustamp_playlist::load_playlist_file_report(path) {
+            Ok(report) => report,
+            Err(err) => {
+                let msg = format!("failed to load playlist {}: {}", path.display(), err);
+                self.note(format!("error: {msg}"));
+                self.last_error = Some(msg);
+                let core_err = match &err {
+                    rustamp_playlist::PlaylistError::Io(e) => {
+                        rustamp_core::error::Error::Io(std::io::Error::new(e.kind(), e.to_string()))
+                    }
+                    rustamp_playlist::PlaylistError::UnsupportedFormat(m) => {
+                        rustamp_core::error::Error::UnsupportedFormat(m.clone())
+                    }
+                    rustamp_playlist::PlaylistError::InvalidEntry(m) => {
+                        rustamp_core::error::Error::InvalidArgument(m.clone())
+                    }
+                };
+                self.publish_error(&core_err);
+                return Err(err);
+            }
+        };
+
+        if !report.is_clean() {
+            self.note(format!(
+                "loaded {} tracks, skipped {} malformed entries from {}",
+                report.entries.len(),
+                report.skip_count(),
+                path.display()
+            ));
+            for skip in &report.skips {
+                self.note(format!("  - skipped: {}", skip.reason));
+            }
+        }
+
+        let queue: Vec<TrackSource> = report
+            .entries
+            .iter()
+            .map(|entry| match &entry.location {
+                MediaLocation::File(p) => TrackSource::path(p.clone()),
+                MediaLocation::Url(u) => TrackSource::Url(u.clone()),
+            })
+            .collect();
+
+        self.engine.set_queue(queue);
+        self.sync_entry_ids();
+
+        if play
+            && !report.entries.is_empty()
+            && let Err(error) = self.engine.play_index(0)
+        {
+            self.publish_error(&error);
+        }
+
+        self.last_playlist_report = Some(report.clone());
+        Ok(report)
+    }
+
     fn add_items(&mut self, items: &[MediaLocation], at: Option<u32>, play: bool) {
         let first_new = self.engine.queue().len() as u32;
         let mut queue = self.engine.queue().to_vec();
-        queue.extend(items.iter().map(|location| match location {
-            MediaLocation::File(path) => TrackSource::path(path.clone()),
-            MediaLocation::Url(url) => TrackSource::Url(url.clone()),
-        }));
+        for location in items {
+            match location {
+                MediaLocation::File(path) if is_playlist_file(path) => {
+                    match rustamp_playlist::load_playlist_file_report(path) {
+                        Ok(report) => {
+                            if !report.is_clean() {
+                                self.note(format!(
+                                    "loaded {} tracks, skipped {} malformed entries from {}",
+                                    report.entries.len(),
+                                    report.skip_count(),
+                                    path.display()
+                                ));
+                                for skip in &report.skips {
+                                    self.note(format!("  - skipped: {}", skip.reason));
+                                }
+                            }
+                            queue.extend(report.entries.iter().map(|e| match &e.location {
+                                MediaLocation::File(p) => TrackSource::path(p.clone()),
+                                MediaLocation::Url(u) => TrackSource::Url(u.clone()),
+                            }));
+                            self.last_playlist_report = Some(report);
+                        }
+                        Err(err) => {
+                            let msg =
+                                format!("failed to load playlist {}: {}", path.display(), err);
+                            self.note(format!("error: {msg}"));
+                            self.last_error = Some(msg);
+                            let core_err = match &err {
+                                rustamp_playlist::PlaylistError::Io(e) => {
+                                    rustamp_core::error::Error::Io(std::io::Error::new(
+                                        e.kind(),
+                                        e.to_string(),
+                                    ))
+                                }
+                                rustamp_playlist::PlaylistError::UnsupportedFormat(m) => {
+                                    rustamp_core::error::Error::UnsupportedFormat(m.clone())
+                                }
+                                rustamp_playlist::PlaylistError::InvalidEntry(m) => {
+                                    rustamp_core::error::Error::InvalidArgument(m.clone())
+                                }
+                            };
+                            self.publish_error(&core_err);
+                        }
+                    }
+                }
+                MediaLocation::File(path) => queue.push(TrackSource::path(path.clone())),
+                MediaLocation::Url(url) => queue.push(TrackSource::Url(url.clone())),
+            }
+        }
         self.engine.set_queue(queue);
         self.sync_entry_ids();
         if let Some(at) = at
@@ -3378,5 +3524,188 @@ mod tests {
         assert_eq!(app.dialog_open_kind(), Some(DialogKind::About));
         app.close_dialog(DialogKind::About);
         assert_eq!(app.dialog_open_kind(), None);
+    }
+
+    #[test]
+    fn good_playlist_file_loads_and_plays() {
+        use rustamp_ui::DialogKind;
+
+        let (mut app, dir) = app_with_file(None);
+        let t1 = track(&dir, "track1.tst");
+        let t2 = track(&dir, "track2.tst");
+
+        let m3u_path = dir.path().join("good.m3u");
+        std::fs::write(
+            &m3u_path,
+            b"#EXTM3U\r\n#EXTINF:120,First Track\r\ntrack1.tst\r\n#EXTINF:180,Second Track\r\ntrack2.tst\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(app.engine().queue().len(), 0);
+        assert_eq!(app.engine().transport(), TransportState::Stopped);
+
+        // Open Load Playlist dialog
+        app.submit(Command::OpenPlaylist).unwrap();
+        assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
+
+        // Stage playlist file and confirm
+        app.stage_playlist_path(m3u_path);
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+
+        // Queue has surviving entries in order
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.playlist().len(), 2);
+        assert_eq!(app.engine().queue()[0], TrackSource::path(t1));
+        assert_eq!(app.engine().queue()[1], TrackSource::path(t2));
+
+        // First entry starts playback
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().transport() == TransportState::Playing
+                && app.engine().current_index() == Some(0),
+            2000
+        ));
+        assert_eq!(app.state().transport, TransportState::Playing);
+
+        // Clean report recorded
+        let report = app.last_playlist_report().expect("report recorded");
+        assert!(report.is_clean());
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.skip_count(), 0);
+        assert_eq!(app.last_error(), None);
+    }
+
+    #[test]
+    fn playlist_file_with_bad_entry_loads_surviving_and_reports_skips() {
+        use rustamp_ui::DialogKind;
+
+        let (mut app, dir) = app_with_file(None);
+        let t1 = track(&dir, "track1.tst");
+        let t2 = track(&dir, "track2.tst");
+
+        // Playlist with a dangling EXTINF (skipped by reader)
+        let m3u_path = dir.path().join("with_skips.m3u");
+        std::fs::write(
+            &m3u_path,
+            b"#EXTM3U\r\n#EXTINF:60,Dangling Track\r\n#EXTINF:120,Track One\r\ntrack1.tst\r\n#EXTINF:180,Track Two\r\ntrack2.tst\r\n",
+        )
+        .unwrap();
+
+        app.submit(Command::OpenPlaylist).unwrap();
+        assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
+
+        app.stage_playlist_path(m3u_path);
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+
+        // Surviving entries reach queue in order
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.playlist().len(), 2);
+        assert_eq!(app.engine().queue()[0], TrackSource::path(t1));
+        assert_eq!(app.engine().queue()[1], TrackSource::path(t2));
+
+        // First entry plays
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().transport() == TransportState::Playing
+                && app.engine().current_index() == Some(0),
+            2000
+        ));
+
+        // Skips are recorded on App and surfaced in notes
+        let report = app.last_playlist_report().expect("report recorded");
+        assert!(!report.is_clean());
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.skip_count(), 1);
+        assert!(report.skips[0].reason().contains("dangling EXTINF"));
+
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("loaded 2 tracks, skipped 1 malformed entries")),
+            "notes: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("skipped: dangling EXTINF")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_playlist_file_reports_error_and_changes_nothing() {
+        use rustamp_ui::DialogKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = track(&dir, "original.tst");
+        let (mut app, _d) = app_with_file(Some(t0.clone()));
+
+        // Start with 1 track in queue
+        assert_eq!(app.engine().queue().len(), 1);
+
+        // Write an unsupported/corrupted playlist file (invalid binary content with m3u extension)
+        let bad_path = dir.path().join("corrupted.m3u");
+        std::fs::write(&bad_path, b"\x00\x01\x02\x03\x04\x05").unwrap();
+
+        app.submit(Command::OpenPlaylist).unwrap();
+        assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
+
+        app.stage_playlist_path(bad_path.clone());
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+
+        // Queue is completely unchanged
+        assert_eq!(app.engine().queue().len(), 1);
+        assert_eq!(app.engine().queue()[0], TrackSource::path(t0));
+
+        // Error is surfaced visibly in last_error and window_title
+        let error = app.last_error().expect("last_error must be set");
+        assert!(
+            error.contains("failed to load playlist")
+                && error.contains("unrecognized playlist content"),
+            "error: {error}"
+        );
+        assert!(
+            app.window_title()
+                .starts_with("Rustamp - failed to load playlist")
+        );
+
+        // Error is also logged in notes
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|n| n.contains("failed to load playlist")),
+            "notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn load_playlist_dialog_text_input_and_display() {
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenPlaylist).unwrap();
+        assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
+
+        // Initial body lines: prompt, empty field, hint
+        let body = app.open_dialog_lines().expect("dialog open");
+        assert_eq!(body[0], "Playlist file:");
+        assert_eq!(body[1], "");
+        assert_eq!(body[2], crate::dialogs::OPEN_PLAYLIST_HINT);
+
+        // Type text into dialog
+        assert!(app.dialog_text("my_list.m3u"));
+        assert_eq!(app.playlist_text(), "my_list.m3u");
+
+        let body = app.open_dialog_lines().expect("dialog open");
+        assert_eq!(body[1], "my_list.m3u");
+
+        // Backspace
+        assert!(app.dialog_key(Key::Backspace));
+        assert_eq!(app.playlist_text(), "my_list.m3");
+
+        // Key letters/digits
+        assert!(app.dialog_key(Key::Letter(b'u')));
+        assert_eq!(app.playlist_text(), "my_list.m3u");
     }
 }

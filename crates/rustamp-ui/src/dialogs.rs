@@ -27,10 +27,15 @@
 //!   [`parse_jump_time_ms`]). Digits arrive as [`Key`]s; the colon has no
 //!   [`Key`], so it arrives as typed text through
 //!   [`DialogManager::type_text`].
-//! * The load-playlist dialog has **no file picker and no confirmation
-//!   command**: RFC 0010 leaves replace-versus-append (and the file filter)
-//!   open, so `Enter` is consumed and does nothing. The dialog opens, shows
-//!   its spec'd title, and closes.
+//! * The load-playlist dialog takes the playlist file the same way the
+//!   open-media faces take theirs: typing the full path (any printable
+//!   character through [`DialogManager::type_text`]; `Backspace` deletes),
+//!   dropping one file onto it, or a staged pick for a later native picker.
+//!   Reading the path does not read the file: `Enter` stays consumed and the
+//!   dialog stays open (RFC 0010 leaves replace-versus-append open), and the
+//!   app half turns the confirmed path into entries plus a skip report
+//!   (see [`confirm_load_playlist_path`](DialogManager::confirm_load_playlist_path)
+//!   and [`playlist_load_summary_lines`]).
 //! * The open-media dialogs have **no OS file picker**: the project may not
 //!   add a dependency, and a hand-written native-dialog binding (COM
 //!   `IFileOpenDialog` for the directory pick) would be large, unsafe and
@@ -356,6 +361,11 @@ pub struct DialogManager {
     /// The open-media dialog's staged picks (the stand-in for the OS picker's
     /// result; see the module docs).
     media_paths: Vec<PathBuf>,
+    /// The load-playlist dialog's entry field (a typed playlist path).
+    playlist_text: String,
+    /// The load-playlist dialog's staged pick (the stand-in for the OS
+    /// picker's result; a single playlist file).
+    playlist_paths: Vec<PathBuf>,
 }
 
 impl DialogManager {
@@ -365,7 +375,8 @@ impl DialogManager {
     }
 
     /// Opens `dialog`, replacing whatever is open. Clears the jump input, the
-    /// open-media entry field and its staged picks, and resets the skin
+    /// open-media entry field and its staged picks, the load-playlist field
+    /// and its staged pick, and resets the skin
     /// selection to the first row.
     pub fn open(&mut self, dialog: DialogKind) {
         self.open = Some(dialog);
@@ -373,6 +384,8 @@ impl DialogManager {
         self.skin_index = 0;
         self.media_text.clear();
         self.media_paths.clear();
+        self.playlist_text.clear();
+        self.playlist_paths.clear();
     }
 
     /// Closes `dialog` when it is the open one; otherwise a no-op.
@@ -383,6 +396,8 @@ impl DialogManager {
             self.skin_index = 0;
             self.media_text.clear();
             self.media_paths.clear();
+            self.playlist_text.clear();
+            self.playlist_paths.clear();
         }
     }
 
@@ -393,6 +408,8 @@ impl DialogManager {
         self.skin_index = 0;
         self.media_text.clear();
         self.media_paths.clear();
+        self.playlist_text.clear();
+        self.playlist_paths.clear();
     }
 
     /// The open dialog, if any.
@@ -436,6 +453,10 @@ impl DialogManager {
                 }
                 Some(DialogKind::OpenMedia { .. }) => {
                     self.media_text.pop();
+                    true
+                }
+                Some(DialogKind::LoadPlaylist) => {
+                    self.playlist_text.pop();
                     true
                 }
                 _ => false,
@@ -494,11 +515,14 @@ impl DialogManager {
     }
 
     /// Whether the open dialog has a text field [`type_text`](Self::type_text)
-    /// can type into (the jump boxes and the open-media faces).
+    /// can type into (the jump boxes, the open-media faces and the
+    /// load-playlist dialog).
     pub fn accepts_text(&self) -> bool {
         matches!(
             self.open,
-            Some(DialogKind::Jump(_) | DialogKind::OpenMedia { .. })
+            Some(DialogKind::Jump(_))
+                | Some(DialogKind::OpenMedia { .. })
+                | Some(DialogKind::LoadPlaylist)
         )
     }
 
@@ -508,15 +532,23 @@ impl DialogManager {
     /// Control characters (`Enter`'s `\r`, `Backspace`'s `\u{8}`, `Escape`,
     /// `Ctrl+letter` codes) are dropped: those keys take the [`key`](Self::key)
     /// path. The open-media field takes every other character, so a full path
-    /// such as `C:\Music\song.mp3` or a URL can be typed; the jump box takes
-    /// digits and `:` (its [`parse_jump_time_ms`] forms). Returns `true` when
-    /// at least one character was typed into a field.
+    /// such as `C:\Music\song.mp3` or a URL can be typed; the load-playlist
+    /// field takes every other character the same way, so a playlist path can
+    /// be typed; the jump box takes digits and `:` (its [`parse_jump_time_ms`]
+    /// forms). Returns `true` when at least one character was typed into a
+    /// field.
     pub fn type_text(&mut self, text: &str) -> bool {
         let mut typed = false;
         for ch in text.chars().filter(|ch| !ch.is_control()) {
             match self.open {
                 Some(DialogKind::OpenMedia { .. }) => {
                     self.push_media_char(ch);
+                    typed = true;
+                }
+                Some(DialogKind::LoadPlaylist) => {
+                    if self.playlist_text.chars().count() < MAX_MEDIA_LEN {
+                        self.playlist_text.push(ch);
+                    }
                     typed = true;
                 }
                 Some(DialogKind::Jump(_)) if ch.is_ascii_digit() || ch == ':' => {
@@ -594,6 +626,65 @@ impl DialogManager {
     /// The staged open-media picks, if any.
     pub fn staged_media_paths(&self) -> &[PathBuf] {
         &self.media_paths
+    }
+
+    /// The load-playlist dialog's entry field text (a typed playlist path).
+    pub fn playlist_text(&self) -> &str {
+        &self.playlist_text
+    }
+
+    /// Replaces the load-playlist entry field (clamped to [`MAX_MEDIA_LEN`]
+    /// characters).
+    ///
+    /// Typing goes through [`type_text`](Self::type_text) instead; this
+    /// replaces the whole field at once (embedding and tests).
+    pub fn set_playlist_text(&mut self, text: &str) {
+        self.playlist_text = text.chars().take(MAX_MEDIA_LEN).collect();
+    }
+
+    /// Stages the load-playlist pick (the stand-in for the OS picker's
+    /// result: a single playlist file).
+    ///
+    /// [`confirm_load_playlist_path`](Self::confirm_load_playlist_path)
+    /// reads it first.
+    pub fn stage_playlist_path(&mut self, path: PathBuf) {
+        self.playlist_paths = vec![path];
+    }
+
+    /// The staged load-playlist pick, if any.
+    pub fn staged_playlist_path(&self) -> Option<&PathBuf> {
+        self.playlist_paths.first()
+    }
+
+    /// Adds a file the user dropped onto the load-playlist dialog from the
+    /// shell (one drop event per file; the last drop wins — a single playlist
+    /// file). Returns whether the drop was taken.
+    pub fn drop_playlist_path(&mut self, path: PathBuf) -> bool {
+        if self.open != Some(DialogKind::LoadPlaylist) {
+            return false;
+        }
+        self.playlist_paths = vec![path];
+        true
+    }
+
+    /// Confirms the load-playlist dialog: the playlist file to read.
+    ///
+    /// The staged pick wins; otherwise the trimmed entry field is one path.
+    /// `None` when no load-playlist dialog is open or there is nothing to
+    /// confirm. Reading the file, appending versus replacing, and reporting
+    /// skips stay with the app (RFC 0010): this hands over the path only.
+    pub fn confirm_load_playlist_path(&self) -> Option<PathBuf> {
+        if self.open != Some(DialogKind::LoadPlaylist) {
+            return None;
+        }
+        if let Some(first) = self.playlist_paths.first() {
+            return Some(first.clone());
+        }
+        let trimmed = self.playlist_text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(trimmed))
     }
 
     /// Appends one typed character to the open-media entry field, clamped to
@@ -738,12 +829,34 @@ impl DialogManager {
     ///
     /// RFC 0010 leaves replace-versus-append (and the file filter) open, and
     /// no spec fixes the dialog beyond its title, so there is deliberately no
-    /// confirmation command yet — confirming must not silently decide
-    /// append semantics by emitting `AddItems`. `Enter` stays consumed (see
-    /// [`key`](Self::key)) and the dialog stays open.
+    /// confirmation *command* yet — confirming must not silently decide
+    /// append semantics by emitting `AddItems`. The path itself is confirmed
+    /// separately ([`confirm_load_playlist_path`](Self::confirm_load_playlist_path)):
+    /// the app reads the file, enqueues the surviving entries and reports the
+    /// skips (see [`playlist_load_summary_lines`]). `Enter` stays consumed
+    /// (see [`key`](Self::key)) and the dialog stays open.
     pub fn confirm_load_playlist(&self) -> Option<Command> {
         None
     }
+}
+
+/// The note lines the app surfaces after reading a playlist file.
+///
+/// `loaded` is the number of surviving entries, `skips` the per-entry skip
+/// reasons in order (the app passes `rustamp_playlist::SkippedEntry`
+/// `reason`s, which this crate must not name so it stays free of a playlist
+/// dependency). The first line always names the counts and the file; one
+/// `skipped: <reason>` line follows per skip. The app truncates through its
+/// own note cap when the list is long.
+pub fn playlist_load_summary_lines(path: &Path, loaded: usize, skips: &[String]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "loaded {loaded} track{} ({} skipped) from {}",
+        if loaded == 1 { "" } else { "s" },
+        skips.len(),
+        path.display()
+    )];
+    lines.extend(skips.iter().map(|reason| format!("skipped: {reason}")));
+    lines
 }
 
 /// Renders one dialog frame: a filled background, a title strip and the body
@@ -1396,12 +1509,10 @@ mod tests {
         assert_eq!(manager.jump_text(), "1:30");
         assert!(manager.key(Key::Backspace));
         assert_eq!(manager.jump_text(), "1:3");
-        // Dialogs without a field take no text and no Backspace.
-        for dialog in [
-            DialogKind::About,
-            DialogKind::LoadPlaylist,
-            DialogKind::SkinBrowser,
-        ] {
+        // Dialogs without a field take no text and no Backspace. The
+        // load-playlist dialog is not one of them: it takes a typed path
+        // through `type_text` (see the playlist-path tests below).
+        for dialog in [DialogKind::About, DialogKind::SkinBrowser] {
             manager.open(dialog);
             assert!(!manager.accepts_text(), "{dialog:?}");
             assert!(!manager.type_text("a"), "{dialog:?}");
@@ -1443,5 +1554,97 @@ mod tests {
             play: true,
         });
         assert!(!manager.drop_media_path(PathBuf::from("a.mp3")));
+    }
+
+    #[test]
+    fn a_playlist_path_can_be_typed_staged_or_dropped() {
+        // BETA-09 (UI half): the load-playlist dialog carries a path the app
+        // half turns into entries plus a skip report. Typing, staging and
+        // dropping all feed the same confirm; the staged pick wins.
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::LoadPlaylist);
+        assert!(manager.accepts_text());
+        for ch in r"C:\Music\mix.m3u8".chars() {
+            assert!(manager.type_text(&ch.to_string()), "{ch:?}");
+        }
+        assert!(manager.key(Key::Backspace));
+        assert_eq!(manager.playlist_text(), r"C:\Music\mix.m3u");
+        assert_eq!(
+            manager.confirm_load_playlist_path(),
+            Some(PathBuf::from(r"C:\Music\mix.m3u"))
+        );
+        // A staged pick wins over the typed field.
+        manager.stage_playlist_path(PathBuf::from("staged.xspf"));
+        assert_eq!(
+            manager.confirm_load_playlist_path(),
+            Some(PathBuf::from("staged.xspf"))
+        );
+        // A drop replaces the staged pick (last drop wins).
+        assert!(manager.drop_playlist_path(PathBuf::from("dropped.pls")));
+        assert_eq!(
+            manager.staged_playlist_path(),
+            Some(&PathBuf::from("dropped.pls"))
+        );
+        assert_eq!(
+            manager.confirm_load_playlist_path(),
+            Some(PathBuf::from("dropped.pls"))
+        );
+        // Control characters never land in the field.
+        assert!(!manager.type_text("\r"));
+        // No confirmation command: RFC 0010 leaves append-versus-replace open.
+        assert_eq!(manager.confirm_load_playlist(), None);
+        // Opening another dialog clears the field and the pick.
+        manager.open(DialogKind::About);
+        manager.open(DialogKind::LoadPlaylist);
+        assert_eq!(manager.confirm_load_playlist_path(), None);
+        assert!(manager.playlist_text().is_empty());
+    }
+
+    #[test]
+    fn a_playlist_path_needs_its_dialog_and_a_path() {
+        let mut manager = DialogManager::new();
+        // No dialog open: nothing to confirm, no drop taken.
+        assert_eq!(manager.confirm_load_playlist_path(), None);
+        assert!(!manager.drop_playlist_path(PathBuf::from("a.m3u")));
+        // The open-media dialog is a different face.
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        });
+        assert_eq!(manager.confirm_load_playlist_path(), None);
+        assert!(!manager.drop_playlist_path(PathBuf::from("a.m3u")));
+        // Blank text confirms nothing; surrounding whitespace is trimmed.
+        manager.open(DialogKind::LoadPlaylist);
+        manager.set_playlist_text("   ");
+        assert_eq!(manager.confirm_load_playlist_path(), None);
+        manager.set_playlist_text("  mix.m3u  ");
+        assert_eq!(
+            manager.confirm_load_playlist_path(),
+            Some(PathBuf::from("mix.m3u"))
+        );
+        // The key model has no punctuation, so full paths arrive through
+        // `type_text`, not `key` — but Backspace still corrects the field.
+        assert!(!manager.key(Key::Digit(1)));
+        assert!(!manager.key(Key::Space));
+        assert!(manager.key(Key::Backspace));
+        assert_eq!(manager.playlist_text(), "  mix.m3");
+    }
+
+    #[test]
+    fn the_load_summary_names_counts_and_every_skip() {
+        // BETA-09 (UI half): the lines the app surfaces for an E3 report —
+        // one count line plus one line per skip reason, in order.
+        let lines = playlist_load_summary_lines(
+            Path::new("mix.m3u"),
+            3,
+            &["dangling #EXTINF".to_string(), "empty File2".to_string()],
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "loaded 3 tracks (2 skipped) from mix.m3u");
+        assert_eq!(lines[1], "skipped: dangling #EXTINF");
+        assert_eq!(lines[2], "skipped: empty File2");
+        // A clean file still names its counts.
+        let lines = playlist_load_summary_lines(Path::new("clean.pls"), 1, &[]);
+        assert_eq!(lines, vec!["loaded 1 track (0 skipped) from clean.pls"]);
     }
 }

@@ -56,13 +56,13 @@ fn main() -> ExitCode {
 
 #[cfg(windows)]
 mod imp {
-    use std::io::Write;
+    use std::io::{BufRead, BufReader, Write};
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
     use rustamp_ipc::shm::{
-        NamedRegion, RING_DATA_OFFSET, RingConsumer, RingExpect, RingKind, RingProducer,
-        VIS_SLOT_SIZE, VisSlot,
+        NamedRegion, RING_DATA_OFFSET, RingConsumer, RingError, RingExpect, RingKind, RingProducer,
+        RingWake, VIS_SLOT_SIZE, VisSlot,
     };
     use rustamp_proto::vis::{VIS_CHANNELS, VIS_SAMPLES};
 
@@ -135,11 +135,18 @@ mod imp {
 
     fn parse_args(args: &[String]) -> Result<Args, String> {
         let mut it = args.iter();
+        let command = it
+            .next()
+            .ok_or("expected `produce`, `consume`, `wake-produce` or `wake-consume` as the first argument")?
+            .clone();
+        let default_kind = if command.starts_with("wake-") {
+            Some(RingKind::Pcm)
+        } else {
+            None
+        };
         let mut out = Args {
-            command: it
-                .next()
-                .ok_or("expected `produce` or `consume` as the first argument")?
-                .clone(),
+            command,
+            kind: default_kind,
             ..Args::default()
         };
         while let Some(flag) = it.next() {
@@ -197,6 +204,8 @@ mod imp {
         match args.command.as_str() {
             "produce" => produce(args),
             "consume" => consume(args),
+            "wake-produce" => wake_produce(args),
+            "wake-consume" => wake_consume(args),
             other => Err(format!("unknown command `{other}`")),
         }
     }
@@ -501,6 +510,377 @@ mod imp {
                         "vis frame {index} spectrum[{c}][{s}]: expected {want}, got {got}"
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn open_wake_with_retry(name: &str) -> Result<RingWake, String> {
+        let deadline = Instant::now() + OPEN_TIMEOUT;
+        loop {
+            match RingWake::open(name) {
+                Ok(wake) => return Ok(wake),
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "could not open wake `{name}` within {OPEN_TIMEOUT:?}: {e}"
+                        ));
+                    }
+                    std::thread::sleep(OPEN_RETRY);
+                }
+            }
+        }
+    }
+
+    fn wake_produce(args: Args) -> Result<(), String> {
+        let name = require(args.name, "--name")?;
+        let capacity = require(args.capacity, "--capacity")?;
+        let frame_size = frame_size_of(RingKind::Pcm, args.frame_size)?;
+        let size = RING_DATA_OFFSET + capacity as usize * frame_size as usize;
+
+        let region = NamedRegion::create(&name, size)
+            .map_err(|e| format!("could not create the mapping `{name}`: {e}"))?;
+        let producer = RingProducer::create(region, RingKind::Pcm, frame_size, capacity)
+            .map_err(|e| format!("could not create the ring: {e}"))?;
+        let wake = RingWake::create(&name)
+            .map_err(|e| format!("could not create wake for `{name}`: {e}"))?;
+        let mut producer = producer.with_wake(wake);
+
+        print_line(&format!(
+            "RING name={name} kind=pcm frame_size={frame_size} capacity={capacity} \
+             generation={} size={size}",
+            producer.generation()
+        ))?;
+
+        let channels = (frame_size / 4) as usize;
+        let mut current_index = 0u64;
+
+        let stdin = std::io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            if reader
+                .read_line(&mut line)
+                .map_err(|e| format!("stdin: {e}"))?
+                == 0
+            {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let mut parts = trimmed.split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            match cmd {
+                "PING" => {
+                    print_line("PONG")?;
+                }
+                "WRITE" => {
+                    let n: usize = parts
+                        .next()
+                        .ok_or("WRITE needs a count")?
+                        .parse()
+                        .map_err(|e| format!("invalid count: {e}"))?;
+                    let mut block = Vec::with_capacity(n * channels);
+                    for i in 0..n as u64 {
+                        for c in 0..channels {
+                            block.push(pcm_sample(current_index + i, c));
+                        }
+                    }
+                    let written = producer
+                        .write_from_blocking(&block, Some(PEER_TIMEOUT))
+                        .map_err(|e| format!("write_from_blocking failed: {e}"))?;
+                    if written != n {
+                        return Err(format!("write_from_blocking accepted {written} of {n}"));
+                    }
+                    current_index += n as u64;
+                    print_line(&format!("WROTE {n}"))?;
+                }
+                "FILL_AND_BLOCK" => {
+                    let extra: usize = parts
+                        .next()
+                        .ok_or("FILL_AND_BLOCK needs an extra count")?
+                        .parse()
+                        .map_err(|e| format!("invalid extra count: {e}"))?;
+                    let free = producer.free_frames() as usize;
+                    if free > 0 {
+                        let mut block = Vec::with_capacity(free * channels);
+                        for i in 0..free as u64 {
+                            for c in 0..channels {
+                                block.push(pcm_sample(current_index + i, c));
+                            }
+                        }
+                        let written = producer
+                            .write_from_blocking(&block, Some(PEER_TIMEOUT))
+                            .map_err(|e| format!("write_from_blocking fill failed: {e}"))?;
+                        if written != free {
+                            return Err(format!("fill accepted {written} of {free}"));
+                        }
+                        current_index += free as u64;
+                    }
+                    print_line("WRITER_BLOCKING")?;
+                    let mut extra_block = Vec::with_capacity(extra * channels);
+                    for i in 0..extra as u64 {
+                        for c in 0..channels {
+                            extra_block.push(pcm_sample(current_index + i, c));
+                        }
+                    }
+                    let written = producer
+                        .write_from_blocking(&extra_block, Some(PEER_TIMEOUT))
+                        .map_err(|e| format!("write_from_blocking extra failed: {e}"))?;
+                    if written != extra {
+                        return Err(format!("extra accepted {written} of {extra}"));
+                    }
+                    current_index += extra as u64;
+                    print_line(&format!("WRITER_WOKEN {extra}"))?;
+                }
+                "BULK_WRITE" => {
+                    let total: usize = parts
+                        .next()
+                        .ok_or("BULK_WRITE needs a total count")?
+                        .parse()
+                        .map_err(|e| format!("invalid total count: {e}"))?;
+                    let mut written_total = 0usize;
+                    let chunk = (producer.capacity() as usize).min(64);
+                    while written_total < total {
+                        let to_write = (total - written_total).min(chunk);
+                        let mut block = Vec::with_capacity(to_write * channels);
+                        for i in 0..to_write as u64 {
+                            for c in 0..channels {
+                                block.push(pcm_sample(current_index + i, c));
+                            }
+                        }
+                        let w = producer
+                            .write_from_blocking(&block, Some(PEER_TIMEOUT))
+                            .map_err(|e| format!("bulk write failed: {e}"))?;
+                        if w == 0 {
+                            return Err("bulk write timed out with ring full".to_string());
+                        }
+                        current_index += w as u64;
+                        written_total += w;
+                    }
+                    print_line(&format!("BULK_WROTE {total}"))?;
+                }
+                "CLOSE" => {
+                    producer.close();
+                    print_line("CLOSED")?;
+                }
+                "QUIT" => {
+                    break;
+                }
+                other => return Err(format!("unknown wake-produce command `{other}`")),
+            }
+        }
+        Ok(())
+    }
+
+    fn wake_consume(args: Args) -> Result<(), String> {
+        let name = require(args.name, "--name")?;
+        let frame_size = require(args.frame_size, "--frame-size")?;
+        let capacity = require(args.capacity, "--capacity")?;
+        let generation = require(args.generation, "--generation")?;
+        let size = require(args.size, "--size")?;
+        let expect = RingExpect::new(RingKind::Pcm, frame_size, capacity, generation);
+
+        let consumer = open_with_retry(&name, size, expect)?;
+        let wake = open_wake_with_retry(&name)?;
+        let mut consumer = consumer.with_wake(wake);
+
+        print_line("CONSUMER_READY")?;
+
+        let channels = (frame_size / 4) as usize;
+        let mut current_index = 0u64;
+
+        let stdin = std::io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            if reader
+                .read_line(&mut line)
+                .map_err(|e| format!("stdin: {e}"))?
+                == 0
+            {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let mut parts = trimmed.split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            match cmd {
+                "PING" => {
+                    print_line("PONG")?;
+                }
+                "TEST_TIMEOUT" => {
+                    let ms: u64 = parts
+                        .next()
+                        .ok_or("TEST_TIMEOUT needs a duration in ms")?
+                        .parse()
+                        .map_err(|e| format!("invalid ms: {e}"))?;
+                    let mut buf = vec![0.0f32; channels];
+                    let start = Instant::now();
+                    let read = consumer
+                        .read_into_blocking(&mut buf, Some(Duration::from_millis(ms)))
+                        .map_err(|e| format!("read_into_blocking failed: {e}"))?;
+                    let elapsed = start.elapsed();
+                    if read != 0 {
+                        return Err(format!(
+                            "timeout test expected 0 frames on empty ring, got {read}"
+                        ));
+                    }
+                    if elapsed < Duration::from_millis(1) {
+                        return Err(format!(
+                            "timeout returned prematurely in {elapsed:?} (< 1ms)"
+                        ));
+                    }
+                    if elapsed > Duration::from_millis(ms + 1000) {
+                        return Err(format!(
+                            "timeout took too long: {elapsed:?} (> {}ms)",
+                            ms + 1000
+                        ));
+                    }
+                    print_line(&format!("TIMEOUT_OK elapsed_ms={}", elapsed.as_millis()))?;
+                }
+                "READ_BLOCK" => {
+                    let n: usize = parts
+                        .next()
+                        .ok_or("READ_BLOCK needs a count")?
+                        .parse()
+                        .map_err(|e| format!("invalid count: {e}"))?;
+                    print_line("READER_BLOCKING")?;
+                    let mut buf = vec![0.0f32; n * channels];
+                    let mut read_total = 0usize;
+                    while read_total < n {
+                        let read = consumer
+                            .read_into_blocking(
+                                &mut buf[read_total * channels..],
+                                Some(PEER_TIMEOUT),
+                            )
+                            .map_err(|e| format!("read_into_blocking failed: {e}"))?;
+                        if read == 0 {
+                            return Err(format!(
+                                "read_into_blocking timed out after reading {read_total} of {n}"
+                            ));
+                        }
+                        for i in 0..read {
+                            let index = current_index + (read_total + i) as u64;
+                            for c in 0..channels {
+                                let got = buf[(read_total + i) * channels + c];
+                                let want = pcm_sample(index, c);
+                                if got != want {
+                                    return Err(format!(
+                                        "PCM frame {index} channel {c}: expected {want}, got {got}"
+                                    ));
+                                }
+                            }
+                        }
+                        read_total += read;
+                    }
+                    current_index += n as u64;
+                    print_line(&format!("READER_WOKEN {n}"))?;
+                }
+                "DRAIN" => {
+                    let n: usize = parts
+                        .next()
+                        .ok_or("DRAIN needs a count")?
+                        .parse()
+                        .map_err(|e| format!("invalid count: {e}"))?;
+                    let mut buf = vec![0.0f32; n * channels];
+                    let mut read_total = 0usize;
+                    while read_total < n {
+                        let read = consumer
+                            .read_into_blocking(
+                                &mut buf[read_total * channels..],
+                                Some(PEER_TIMEOUT),
+                            )
+                            .map_err(|e| format!("read_into_blocking failed: {e}"))?;
+                        if read == 0 {
+                            return Err(format!(
+                                "read_into_blocking timed out after reading {read_total} of {n}"
+                            ));
+                        }
+                        for i in 0..read {
+                            let index = current_index + (read_total + i) as u64;
+                            for c in 0..channels {
+                                let got = buf[(read_total + i) * channels + c];
+                                let want = pcm_sample(index, c);
+                                if got != want {
+                                    return Err(format!(
+                                        "PCM frame {index} channel {c}: expected {want}, got {got}"
+                                    ));
+                                }
+                            }
+                        }
+                        read_total += read;
+                    }
+                    current_index += n as u64;
+                    print_line(&format!("DRAINED {n}"))?;
+                }
+                "WAIT_CLOSE" => {
+                    print_line("WAITING_CLOSE")?;
+                    let mut buf = vec![0.0f32; channels];
+                    match consumer.read_into_blocking(&mut buf, Some(PEER_TIMEOUT)) {
+                        Err(RingError::Closed) => {
+                            print_line("CLOSED_OK")?;
+                        }
+                        Ok(0) => {
+                            return Err("expected Err(Closed), got timed out Ok(0)".to_string());
+                        }
+                        Ok(frames) => {
+                            return Err(format!(
+                                "expected Err(Closed), but read {frames} frames instead"
+                            ));
+                        }
+                        Err(other) => {
+                            return Err(format!("expected Err(Closed), got {other:?}"));
+                        }
+                    }
+                }
+                "BULK_READ" => {
+                    let total: usize = parts
+                        .next()
+                        .ok_or("BULK_READ needs a count")?
+                        .parse()
+                        .map_err(|e| format!("invalid count: {e}"))?;
+                    let mut read_total = 0usize;
+                    let mut buf = vec![0.0f32; 64 * channels];
+                    while read_total < total {
+                        let to_read = (total - read_total).min(64);
+                        let read = consumer
+                            .read_into_blocking(&mut buf[..to_read * channels], Some(PEER_TIMEOUT))
+                            .map_err(|e| format!("bulk read failed: {e}"))?;
+                        if read == 0 {
+                            return Err(format!(
+                                "bulk read timed out after {read_total} of {total} frames"
+                            ));
+                        }
+                        for i in 0..read {
+                            let index = current_index + (read_total + i) as u64;
+                            for c in 0..channels {
+                                let got = buf[i * channels + c];
+                                let want = pcm_sample(index, c);
+                                if got != want {
+                                    return Err(format!(
+                                        "PCM frame {index} channel {c}: expected {want}, got {got}"
+                                    ));
+                                }
+                            }
+                        }
+                        read_total += read;
+                    }
+                    current_index += total as u64;
+                    print_line(&format!("BULK_READ_OK {total}"))?;
+                }
+                "QUIT" => {
+                    break;
+                }
+                other => return Err(format!("unknown wake-consume command `{other}`")),
             }
         }
         Ok(())

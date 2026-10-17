@@ -5,6 +5,7 @@
 //! * `capture [--list] [--class C] [--title T] [--out F.png] [--client-only]`
 //!   - generic Windows window capture.
 //! * `ring-cross` - 32-bit/64-bit shared-memory ring check.
+//! * `wake-cross` - 32-bit/64-bit blocking wake check (RFC 0007).
 //! * `plughost [--release]` - build the 32-bit plugin host.
 //! * `package [options]` - package the player (x86_64) and the plugin host
 //!   (i686) as separate artefacts, bundling the host beside the player.
@@ -12,6 +13,7 @@
 mod capture;
 mod package;
 mod ring_cross;
+mod wake_cross;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -23,6 +25,7 @@ commands:
   golden [--bless] [--skin <name>]   run golden tests (test fns named `golden_*`)
   capture [options]                  capture a window to PNG (Windows only); see `capture --help`
   ring-cross                         cross-bitness shared-memory ring check (Windows only)
+  wake-cross                         cross-bitness blocking wake check (RFC 0007, Windows only)
   plughost [--release]               build rustamp-plughost for i686-pc-windows-msvc
   package [options]                  package player (x86_64) and plugin host (i686) separately";
 
@@ -34,6 +37,7 @@ fn main() -> ExitCode {
         Some("golden") => golden(&rest),
         Some("capture") => capture::run(&rest),
         Some("ring-cross") => ring_cross::run(&rest),
+        Some("wake-cross") => wake_cross::run(&rest),
         Some("plughost") => plughost(&rest),
         Some("package") => package::run(&rest),
         Some("-h" | "--help" | "help") => {

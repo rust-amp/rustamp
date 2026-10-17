@@ -21,6 +21,23 @@ use rustamp_plughost::loader::load_plugin;
 use rustamp_plughost::message_loop;
 use rustamp_plugin_abi::PluginKind;
 
+#[cfg(windows)]
+fn mapped_path(hinstance: *mut core::ffi::c_void) -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleFileNameW(module: *mut core::ffi::c_void, path: *mut u16, size: u32) -> u32;
+    }
+    let mut path = vec![0_u16; 32_768];
+    // SAFETY: instance belongs to our retained DLL, buffer is writable for size.
+    let len = unsafe { GetModuleFileNameW(hinstance, path.as_mut_ptr(), path.len() as u32) };
+    assert!(
+        len != 0 && (len as usize) < path.len(),
+        "mapped DLL path is missing/truncated"
+    );
+    PathBuf::from(std::ffi::OsString::from_wide(&path[..len as usize]))
+}
+
 /// Find `in_openmpt.dll` across environment and staged locations, or refuse loudly.
 fn find_in_openmpt_dll() -> PathBuf {
     // 1. Explicit environment variable (e.g. set by test runner)
@@ -82,6 +99,9 @@ fn loads_real_32bit_in_openmpt_dll_and_proves_host_interaction() {
 
     // 3. Locate the approved plugin binary or refuse loudly.
     let plugin_path = find_in_openmpt_dll();
+    // This VM-only acceptance runner trusts the owner-approved staged fixture.
+    // It is not a production approval policy for an arbitrary supplied pathname.
+    let approved_bytes = std::fs::read(&plugin_path).expect("approved VM fixture must be readable");
     assert!(
         plugin_path.is_file(),
         "plugin binary must exist at {}",
@@ -100,9 +120,29 @@ fn loads_real_32bit_in_openmpt_dll_and_proves_host_interaction() {
     // 5. Load the real 32-bit plugin DLL via the clean-room loader.
     // SAFETY: running inside the gated test VM on i686 with approved in_openmpt.dll.
     let mut loaded = unsafe {
-        load_plugin(&plugin_path, &window)
+        load_plugin(&plugin_path, &approved_bytes, &window)
             .expect("failed to load real 32-bit in_openmpt.dll into host")
     };
+
+    // P5: prove that the real mapping uses a different, protected snapshot whose
+    // complete bytes equal the approved source, not just its architecture header.
+    #[cfg(windows)]
+    {
+        let mapped = std::fs::canonicalize(mapped_path(loaded.hinstance())).unwrap();
+        let source = std::fs::canonicalize(&plugin_path).unwrap();
+        assert_eq!(loaded.path(), source);
+        assert_ne!(mapped, source, "loader must not map the original pathname");
+        assert_eq!(std::fs::read(&mapped).unwrap(), approved_bytes);
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&mapped)
+                .is_err(),
+            "mapped snapshot must remain write-locked"
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = approved_bytes;
 
     // 6. Prove the entry point ran:
     // - Kind must be Input.

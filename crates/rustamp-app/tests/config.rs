@@ -307,7 +307,17 @@ fn app_restores_eq_state_and_window_layouts_from_config() {
     let ui_eq = app.eq_state();
     assert!(ui_eq.enabled);
     assert!(ui_eq.auto);
-    assert!(ui_eq.preamp > 31);
+    // The window holds classic units `0..=63`, and the law is anchored at
+    // `0 = +12 dB`, `31 = 0 dB`, `63 = -12 dB` (RFC 0011, S09), so a *boosted*
+    // preamp sits *below* the flat centre: +7.5 dB is 11, not above 31.
+    assert_eq!(
+        ui_eq.preamp,
+        rustamp_core::state::eq_classic_from_db(7.5) as u8
+    );
+    assert!(
+        ui_eq.preamp < 31,
+        "a boosted preamp sits above the flat centre"
+    );
 
     // Assert window layout flags:
     assert!(app.state().windowshade, "main window is shaded from config");

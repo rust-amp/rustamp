@@ -45,6 +45,12 @@ if ($filter -like '--ignored*') {
 }
 
 $results = @()
+
+# Timeout per binary: the suite's slowest honest binary runs in couple of minutes.
+# 300 seconds (5 min) gives generous margin; a binary that outlives it is hung, not slow.
+# A hang is a finding about the code under test, not about the runner.
+$TestTimeoutSeconds = 300
+
 # Real test media: the host runner stages read-only copies at C:\rustamp\testmedia
 # when the owner's archive copy exists on the host. Point the documented
 # RUSTAMP_TESTDATA variable at it so media-dependent tests opt in; without it
@@ -55,14 +61,197 @@ if (Test-Path 'C:\rustamp\testmedia') { $env:RUSTAMP_TESTDATA = 'C:\rustamp\test
 # host. Point RUSTAMP_TESTSKINS at it so skin-dependent tests opt in; without it
 # they skip.
 if (Test-Path 'C:\rustamp\testskins') { $env:RUSTAMP_TESTSKINS = 'C:\rustamp\testskins' }
+
+# --- launch one test binary, bounded, and bring its output back as text -------
+#
+# Two rules this helper follows, both written down because the first version of
+# the timeout broke both of them:
+#
+# 1. EVERY value the launched binary needs arrives as a PARAMETER. The first
+#    version ran it as `Start-Job -ScriptBlock { & $exe @extra 2>&1 }`: a job
+#    body executes in its OWN runspace, where $exe and $extra do not exist, so
+#    `& $exe @extra` was `& $null @null` - which is precisely the guest's
+#    "invalid object after &" error, and no binary ran at all. Only two values
+#    were ever needed and both are explicit parameters here.
+# 2. The exit code comes from the process object this script started. A job's
+#    $LASTEXITCODE stays inside the job, so the version that read it in the
+#    parent was reading a stale value from an earlier native command - which is
+#    how a failing binary could come to be reported as a pass.
+#
+# Start-Process is not an option either: its -PassThru object loses the exit
+# code in Windows PowerShell 5.1 (it enables events on the object, which
+# releases the process handle), so `$proc.ExitCode` reads back $null. A
+# [Diagnostics.Process] started here belongs to this script - its ExitCode, its
+# bounded WaitForExit and its Kill all work - which is the same shape
+# run-smoke.ps1 already uses for the player.
+function Invoke-TestBinary {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Exe,
+        [string[]] $ArgList = @(),
+        [Parameter(Mandatory = $true)] [int] $TimeoutSeconds,
+        # Bounded wait for the redirected streams to run dry once the binary is
+        # gone. A child that leaves a grandchild holding the pipe would hold the
+        # read open forever, so this wait is bounded and its failure is reported.
+        [int] $DrainMs = 10000
+    )
+
+    $notes = @()
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    # ProcessStartInfo takes ONE command-line string, so the argument list has to
+    # be quoted per element and joined here. The only argument the runner passes
+    # today is the bare `--ignored` flag; the quoting is here so that a future
+    # argument containing a space cannot silently become two.
+    $psi.Arguments = ((@($ArgList) | ForEach-Object {
+            if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+        }) -join ' ')
+    # UseShellExecute=$false is what makes redirection (and therefore captured
+    # output) possible at all; CreateNoWindow keeps the run windowless.
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    # The child inherits this process's environment - RUSTAMP_TESTDATA and
+    # RUSTAMP_TESTSKINS, set just above - and the subst'd D:, because it is an
+    # ordinary child of this session: nothing is re-established in a new
+    # runspace, so nothing can go missing on the way.
+
+    $proc = $null
+    try {
+        $proc = [Diagnostics.Process]::Start($psi)
+    } catch {
+        # A binary that will not start is one finding, not the end of the run.
+        return [pscustomobject]@{
+            started = $false
+            hung     = $false
+            exit     = -1
+            stdout   = ''
+            stderr   = ''
+            notes    = @(('the binary could not be started: ' + $_.Exception.Message))
+        }
+    }
+
+    # Drain BOTH pipes on the thread pool from the first moment. A pipe holds
+    # only ~64 KB: a chatty child fills it, blocks on write and would be reported
+    # as hung although it is merely loud. ReadToEndAsync is why the bound below
+    # cannot be defeated by output volume.
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+
+    $hung = -not $proc.WaitForExit($TimeoutSeconds * 1000)
+    if ($hung) {
+        # The object here IS the hung binary, so no second mechanism is needed
+        # to reach it - a job or a cmd wrapper would have left the binary running
+        # after the runner had given up on it.
+        try { $proc.Kill() } catch { $notes += ('the hung binary could not be killed: ' + $_.Exception.Message) }
+        if (-not $proc.WaitForExit(10000)) {
+            $notes += 'the hung binary was still alive 10 s after Kill; it may still be running in the guest'
+        }
+    }
+
+    $exit = -1
+    if (-not $hung) {
+        # Never a default of 0: an unreadable exit code must not look like a pass.
+        try { $exit = $proc.ExitCode } catch { $notes += ('the exit code could not be read: ' + $_.Exception.Message) }
+    }
+
+    # Whatever the binary managed to print is kept either way - a hung binary's
+    # partial output is the only evidence of where it stopped. Wait() THROWS when
+    # the task faulted (a pipe broken by the kill, for instance), and a runner
+    # that dies on that would report nothing at all, so both drains are guarded.
+    $outText = ''
+    try {
+        if ($outTask.Wait($DrainMs)) { $outText = [string]$outTask.Result } else {
+            $notes += ("stdout was still open {0} ms after the binary ended (a child process is probably still holding it); only part of its output could be read" -f $DrainMs)
+        }
+    } catch {
+        $notes += ('stdout could not be read: ' + $_.Exception.Message)
+    }
+    $errText = ''
+    try {
+        if ($errTask.Wait($DrainMs)) { $errText = [string]$errTask.Result } else {
+            $notes += ("stderr was still open {0} ms after the binary ended (a child process is probably still holding it); only part of its output could be read" -f $DrainMs)
+        }
+    } catch {
+        $notes += ('stderr could not be read: ' + $_.Exception.Message)
+    }
+
+    $proc.Dispose()
+    return [pscustomobject]@{
+        started = $true
+        hung     = $hung
+        exit     = $exit
+        stdout   = $outText
+        stderr   = $errText
+        notes    = @($notes)
+    }
+}
+
 foreach ($exe in $exes) {
     $name = Split-Path $exe -Leaf
     if ($filter -and $name -notlike "*$filter*") { continue }
-    if (-not (Test-Path $exe)) { $results += [pscustomobject]@{ exe = $name; exit = -1; summary = 'MISSING BINARY'; failed = @() }; continue }
 
-    $raw = & $exe @extra 2>&1 | Out-String
-    $exit = $LASTEXITCODE
-    $lines = $raw -split "`r?`n"
+    # Progress line: WHICH binary is running right now. It has to come after
+    # $name exists and before the binary starts - the first version printed it
+    # once, above this loop, with an empty name.
+    Write-Host ("running: {0}" -f $name)
+
+    if (-not (Test-Path $exe)) {
+        $results += [pscustomobject]@{
+            exe            = $name
+            exit           = -1
+            summary        = 'MISSING BINARY'
+            failed         = @()
+            diagnostic     = @()
+            hung           = $false
+            timeoutSeconds = $TestTimeoutSeconds
+        }
+        continue
+    }
+
+    $run = Invoke-TestBinary -Exe $exe -ArgList $extra -TimeoutSeconds $TestTimeoutSeconds
+
+    if (-not $run.started) {
+        $results += [pscustomobject]@{
+            exe            = $name
+            exit           = -1
+            summary        = 'DID NOT START'
+            failed         = @()
+            diagnostic     = @($run.notes)
+            hung           = $false
+            timeoutSeconds = $TestTimeoutSeconds
+        }
+        continue
+    }
+
+    # stdout first, then stderr. The two are separate pipes now, so their lines
+    # cannot be interleaved the way the old `2>&1` merge appeared to; every match
+    # below is a whole-line match, and the panic block the test harness writes to
+    # stderr still gets its own window.
+    $lines = @()
+    foreach ($text in @($run.stdout, $run.stderr)) {
+        if ([string]::IsNullOrEmpty($text)) { continue }
+        $lines += @($text -split "`r?`n")
+    }
+
+    # Hung: record the stall with what it printed, and carry on with the rest.
+    if ($run.hung) {
+        # The TAIL is what matters - that is where it stopped - and an unbounded
+        # dump would bury every other finding in the report.
+        $diag = @($lines | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 25)
+        if (-not $diag) { $diag = @('no output captured: the binary printed nothing before the timeout') }
+        $results += [pscustomobject]@{
+            exe            = $name
+            exit           = -1
+            summary        = 'HUNG after timeout'
+            failed         = @()
+            diagnostic     = @($diag + @($run.notes))
+            hung           = $true
+            timeoutSeconds = $TestTimeoutSeconds
+        }
+        continue
+    }
+
     $summary = ($lines | Where-Object { $_ -match '^test result:' } | Select-Object -Last 1)
     $failedNames = @($lines | Where-Object { $_ -match '^test .* FAILED$' } | ForEach-Object { $_.Trim() })
     # A panic's values live on the lines AFTER the FAILED line (multi-line
@@ -88,12 +277,17 @@ foreach ($exe in $exes) {
         if ($interesting) { $diagnostic = @($diagnostic + $interesting) }
         if ($failureWindows) { $diagnostic = @($diagnostic + @($failureWindows | Select-Object -First 20)) }
     }
+    # Runner-level findings (a kill that did not land, an unreadable exit code)
+    # belong with the binary's own output: they explain the verdict above them.
+    if ($run.notes) { $diagnostic = @($diagnostic + @($run.notes)) }
     $results += [pscustomobject]@{
-        exe        = $name
-        exit       = $exit
-        summary    = $summary
-        failed     = $failedNames
-        diagnostic = $diagnostic
+        exe            = $name
+        exit           = $run.exit
+        summary        = $summary
+        failed         = $failedNames
+        diagnostic     = $diagnostic
+        hung           = $false
+        timeoutSeconds = $TestTimeoutSeconds
     }
 }
 

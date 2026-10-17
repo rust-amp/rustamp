@@ -37,4 +37,6 @@ register_golden_tests!(
     golden_lookalike_equalizer_window_held_buttons,
     golden_lookalike_equalizer_window_focus_scale_and_provisional_shade,
     golden_lookalike_playlist_window_selection,
+    golden_lookalike_playlist_window_mid_page,
+    golden_lookalike_dialog_load_playlist,
 );

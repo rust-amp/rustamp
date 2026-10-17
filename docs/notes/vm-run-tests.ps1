@@ -172,17 +172,46 @@ if (Test-Path $skinsDir) {
 }
 
 Step 'running the tests in the guest'
+# The guest bounds each binary at 300 s (`$TestTimeoutSeconds` in
+# docs\notes\vm-broker\guest\run-tests.ps1) and is meant to keep going after a
+# hung one. This bound has to cover every binary in that worst case, or a run
+# with several hangs would be cut off by the broker before the report exists -
+# which is the very "the run reports nothing at all" failure the per-binary
+# timeout exists to prevent. The two constants cannot share a value across the
+# host/guest boundary (that is what the allow-list is), so they are kept in step
+# by hand and named here.
+$PerBinaryTimeoutSeconds = 300
+$guestTimeoutSeconds = 60 + (($PerBinaryTimeoutSeconds + 60) * [math]::Max($testExes.Count, 1))
+Write-Host ("    per-binary timeout {0} s; broker bound {1} s for {2} binaries" -f $PerBinaryTimeoutSeconds, $guestTimeoutSeconds, $testExes.Count)
 # A single positional argument: `-ArgumentList` with an array binds only the
 # first element to the script's parameter, which silently dropped the filter.
-$result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $Filter -TimeoutSeconds 3600
+$result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $Filter -TimeoutSeconds $guestTimeoutSeconds
+# A guest run that produced no object produced no report at all: say which step
+# lost it instead of printing empty columns below.
+if (-not $result) { throw "STEP guest FAILED: the broker returned no result object for run-tests.ps1 (see D:\code\rustamp-vm\broker\broker.log)" }
+if ($null -eq $result.results) { throw "STEP guest FAILED: the guest result object carries no results (see D:\code\rustamp-vm\broker\broker.log)" }
 
 # --- 5. results --------------------------------------------------------------
+$hungCount = @($result.results | Where-Object { $_.hung }).Count
 Write-Host ''
-Write-Host ("guest {0} as {1}; subst resolved: {2}; ran {3}, failed {4}" -f $result.host, $result.user, $result.subst, $result.ran, $result.failed)
+Write-Host ("guest {0} as {1}; subst resolved: {2}; ran {3}, failed {4}, hung {5}" -f $result.host, $result.user, $result.subst, $result.ran, $result.failed, $hungCount)
 $result.results | ForEach-Object {
-    $status = if ($_.exit -eq 0) { 'ok  ' } else { 'FAIL' }
-    Write-Host ("  [{0}] {1,-46} {2}" -f $status, $_.exe, $_.summary)
-    foreach ($f in $_.failed) { Write-Host ("         $f") }
-    foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
+    # A hung binary must be impossible to mistake for a pass or for a missing binary.
+    if ($_.hung) {
+        # The seconds come from the result, not from $_.exit: the exit code of a
+        # killed binary is a kill artefact, and printing it as the timeout would
+        # name a timeout of "-1 seconds".
+        $bound = if ($_.timeoutSeconds) { 'timeout of {0} seconds' -f $_.timeoutSeconds } else { 'a timeout whose length the guest did not report' }
+        Write-Host ("  [HNG] {0,-46} {1}" -f $_.exe, $_.summary)
+        Write-Host ("         HUNG after {0} - binary was killed, last output captured" -f $bound)
+        foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
+    } else {
+        $status = if ($_.exit -eq 0) { 'ok  ' } else { 'FAIL' }
+        Write-Host ("  [{0}] {1,-46} {2}" -f $status, $_.exe, $_.summary)
+        foreach ($f in $_.failed) { Write-Host ("         $f") }
+        foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
+    }
 }
-if ($result.failed -ne 0) { exit 1 }
+# A stall must never be reported as a green run: the hung count is a second,
+# independent gate on the exit code, so a counting drift cannot hide a hang.
+if ($result.failed -ne 0 -or $hungCount -ne 0) { exit 1 }

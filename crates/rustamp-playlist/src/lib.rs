@@ -21,6 +21,14 @@
 //!   `insert_many`/`push` ([`append_loaded`], [`insert_loaded`]), so entry ids
 //!   stay stable and are never reused.
 //!
+//! * **Interacts**: the playlist editor's model gestures ([`interact`]) — a
+//!   single-click selection, a contiguous range selection, a ctrl-click toggle,
+//!   a block reorder and the `Delete`/`Ctrl+Delete` removals — as plain
+//!   functions over the core
+//!   [`Playlist`](rustamp_core::playlist::Playlist), handling current-entry
+//!   index shifting through the core's stable ids. The playlist *window* itself
+//!   (spec S06 chrome, hit-testing, scrolling, menus) stays with `rustamp-ui`.
+//!
 //! Everything is written from scratch: the Windows-1252 table
 //! ([`cp1252`]), the XML reader ([`xml`]) and the PRNG ([`rng`]). The crate has
 //! no dependency other than `rustamp-core`.
@@ -30,8 +38,9 @@
 //! * **Shuffle as a mode** (spec S15): only the one-shot [`randomize`] is here.
 //! * **Title formatting** `%1`–`%7` (spec S14): titles are taken from the file
 //!   verbatim.
-//! * **The playlist editor** (spec S06): no selection, drag, scroll or menu
-//!   behaviour, only model-level helpers.
+//! * **The playlist editor window** (spec S06): the [`interact`] selection,
+//!   reorder and delete helpers are here, but scrolling, hit-testing, the bottom
+//!   bar, menus and dialogs are the window half in `rustamp-ui`/`rustamp-app`.
 //! * **B4S**: recognized and rejected with a clear error, because it is a
 //!   Winamp-specific XML dialect with no published format description available
 //!   to this task. See `CONTRACT_NOTES.md`.
@@ -63,6 +72,7 @@ pub mod cp1252;
 pub mod entry;
 pub mod error;
 pub mod format;
+pub mod interact;
 pub mod io;
 pub mod location;
 pub mod m3u;
@@ -79,6 +89,10 @@ pub use entry::{
 };
 pub use error::{PlaylistError, Result};
 pub use format::{PlaylistFormat, detect, looks_like_text, sniff};
+pub use interact::{
+    click_select, crop_to_selected, move_selected, move_selected_down, move_selected_up, range_ids,
+    remove_selected, select_range, toggle_select_at,
+};
 pub use io::{
     load_playlist_file, load_playlist_file_report, read_playlist, read_playlist_as,
     read_playlist_path, read_playlist_report, read_playlist_report_as, read_playlist_report_path,

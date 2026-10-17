@@ -55,7 +55,7 @@ const MAX_NO_PROGRESS_PACKETS: u32 = 1 << 16;
 /// Frames of decoder lead-in decoded and discarded after a seek.
 const SEEK_PREROLL_FRAMES: u64 = 4096;
 
-/// Upper bound on a seek target in frames.
+/// Upper bound on a seek target in frames (shared with the wave decoder).
 ///
 /// [`Decoder::seek`] clamps the target to the track duration when that is known.
 /// A stream without a duration (a container that reports no frame count after a
@@ -64,7 +64,7 @@ const SEEK_PREROLL_FRAMES: u64 = 4096;
 /// directly. 2^53 is exact in `f64` and, at the lowest sample rate
 /// [`AudioSpec`] can carry, still far inside `Duration`'s range; at 44.1 kHz it
 /// is millions of years, so no real seek is affected.
-const MAX_SEEK_FRAMES: u64 = 1 << 53;
+pub(crate) const MAX_SEEK_FRAMES: u64 = 1 << 53;
 
 const EXTENSIONS: &[&str] = &[
     "mp3", "mp2", "mp1", "flac", "ogg", "oga", "wav", "wave", "aif", "aiff", "aifc", "caf", "m4a",
@@ -209,12 +209,14 @@ fn stream_err(e: SymError) -> Error {
 
 /// Frame index of `at` at `rate` Hz, saturating instead of overflowing.
 ///
+/// Shared with the wave decoder, which needs the same saturating conversion.
+///
 /// `rate` is a sample rate (`<= u32::MAX`) and `subsec_nanos() < 1e9`, so only
 /// the seconds term can overflow `u64` — which it does for the hostile
 /// `Duration::MAX` a caller can pass to a stream whose duration is unknown.
 /// A plain multiplication panics in a debug build and wraps in a release build;
 /// both are wrong, one of them loudly so.
-fn frames_at(rate: u64, at: Duration) -> u64 {
+pub(crate) fn frames_at(rate: u64, at: Duration) -> u64 {
     let secs = at.as_secs().saturating_mul(rate);
     let frac = u64::from(at.subsec_nanos()).saturating_mul(rate) / 1_000_000_000;
     secs.saturating_add(frac)

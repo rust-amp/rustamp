@@ -72,12 +72,14 @@ pub struct ControlPeer {
 
 impl ControlPeer {
     /// Start framed reader/writer threads and a Hello/Ping/Pong monitor.
-    /// `interrupt_seek` is true only on the decoder-host end.
+    /// `interrupt_reoffer` is true on resident ends (decoder host, DSP host):
+    /// a seek/reconfigure command then closes the supervised ring, so a worker
+    /// blocked in infinite PCM I/O wakes. `DspReset` never closes rings.
     pub fn start<R: Read + Send + 'static, W: Write + Send + 'static>(
         reader: R,
         writer: W,
         policy: Liveness,
-        interrupt_seek: bool,
+        interrupt_reoffer: bool,
     ) -> Result<Self> {
         if policy.interval.is_zero() || policy.timeout <= policy.interval {
             return Err(MediaHostError::InvalidMessage(
@@ -182,10 +184,18 @@ impl ControlPeer {
                         fail(format!("resident decoder failed: {message}"));
                         break;
                     }
+                    Ok(Ok(Message::DspError { message })) => {
+                        fail(format!("resident DSP failed: {message}"));
+                        break;
+                    }
                     Ok(Ok(message)) => {
                         let shutdown = matches!(message, Message::Shutdown);
                         if matches!(message, Message::Shutdown)
-                            || (interrupt_seek && matches!(message, Message::DecoderSeek { .. }))
+                            || (interrupt_reoffer
+                                && matches!(
+                                    message,
+                                    Message::DecoderSeek { .. } | Message::DspConfigure { .. }
+                                ))
                         {
                             monitor_state.lock().unwrap().close();
                         }
@@ -273,6 +283,17 @@ impl ControlPeer {
                     MediaHostError::Disconnected("control monitor stopped".into())
                 }
             }
+        })
+    }
+
+    /// Wait for a command or terminal failure, without a caller deadline.
+    /// Monitor exit disconnects the queue, so liveness failures still wake it.
+    pub fn recv_blocking(&self) -> Result<Message> {
+        self.check()?;
+        self.incoming.recv().map_err(|_| {
+            self.check()
+                .err()
+                .unwrap_or_else(|| MediaHostError::Disconnected("control monitor stopped".into()))
         })
     }
 

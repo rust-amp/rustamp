@@ -1494,9 +1494,14 @@ fn limiter_limits_hot_signal_to_ceiling_and_disabling_returns_to_bit_exact() {
         peak_enabled <= ceiling,
         "limiter overshoot: peak {peak_enabled} exceeds ceiling {ceiling}"
     );
-    // The peak actually reached the ceiling (it limited the hot peaks, not muted).
+    // A17: the limiter is a true-peak limiter, so this is a sample-peak
+    // assertion on a wideband signal. The linked true-peak estimate
+    // (kernel-L1 bound ~= 3.0) exceeds the sample peak (2.2), so the output
+    // sample peak can legitimately sit below 0.99·ceiling (analytic range ~=
+    // [0.71, 1.00]·ceiling). The lower bound is relaxed to 0.7·ceiling; the
+    // upper bound above is the exact guarantee.
     assert!(
-        peak_enabled >= ceiling * 0.99,
+        peak_enabled >= ceiling * 0.7,
         "peak {peak_enabled} should be held close to ceiling {ceiling}"
     );
 
@@ -1799,6 +1804,51 @@ fn a_non_finite_sample_never_reaches_the_device() {
             assert!(*s == 0.0 || *s == want, "frame {frame}: {s} != {want}");
         }
     }
+}
+
+// A14. With the default chain (limiter enabled) on a resampling device, a
+// hot signal stays within 0 dBFS end to end, at the exact length the duration
+// implies. The 4x boost runs before the limiter (the engine order is EQ ->
+// installed stages -> limiter), so the limiter brings the 2.0 sine down to
+// its ceiling and the resampler reconstructs it; the converter's final
+// ceiling is the bound asserted here.
+//
+// What it cannot prove: that the safety net engaged (a resampled sine never
+// exceeds its own amplitude, so nothing here reaches 1.0), or anything about
+// a real device. Engagement is pinned at converter and chain level.
+#[test]
+fn a_hot_resampled_run_with_the_limiter_holds_0dbfs() {
+    let mut h = harness_48k(&["tone0_22050.tst", "tone22050_22050.tst"]);
+    h.engine
+        .set_dsp_chain(vec![Box::new(GainBoostDspStage(4.0))]);
+    assert!(h.engine.limiter_enabled(), "the default chain limits");
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered(), "both tracks must be buffered");
+    let total = 48_000_u64;
+    assert_eq!(h.engine.end_of_stream(), Some(total));
+    let left = play_out(&mut h, total);
+    let peak = left.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(peak <= 1.0, "above 0 dBFS after resampling: {peak}");
+}
+
+// A14. The guarantee does not depend on the limiter switch: with the limiter
+// off, the same hot signal still never exceeds 0 dBFS, and the safety net
+// demonstrably engages (crest samples sit at exactly ±1.0).
+#[test]
+fn a_hot_resampled_run_without_the_limiter_holds_0dbfs() {
+    let mut h = harness_48k(&["tone0_22050.tst", "tone22050_22050.tst"]);
+    h.engine
+        .set_dsp_chain(vec![Box::new(GainBoostDspStage(4.0))]);
+    h.engine.set_limiter_enabled(false);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered(), "both tracks must be buffered");
+    let total = 48_000_u64;
+    assert_eq!(h.engine.end_of_stream(), Some(total));
+    let left = play_out(&mut h, total);
+    let peak = left.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(peak <= 1.0, "above 0 dBFS with the limiter off: {peak}");
+    let clamped = left.iter().filter(|s| s.abs() == 1.0).count();
+    assert!(clamped > 0, "the safety net never engaged");
 }
 
 /// A6 finding 2, second variant. A seek requested before the output runs
@@ -2266,8 +2316,16 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
 
     // 1. Play track 1
     engine.play_index(0).unwrap();
+    // Every wait in this test is a bounded condition (the file's Harness
+    // helpers use the same 5 s deadline): a condition that never becomes
+    // true must fail loudly with the step named, never spin forever.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while engine.current_index() != Some(0) || engine.duration_frames().is_none() {
         engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stall: track 1 never opened"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // Pull 256 frames of track 1 audio through hardware
@@ -2299,13 +2357,58 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
 
     // 3. Play track 2
     engine.play_index(1).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while engine.current_index() != Some(1) || engine.duration_frames().is_none() {
         engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stall: track 2 never opened"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // Wait for decode thread to refill the ring
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while engine.buffered_frames() < 1024 {
         engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stall: the ring never refilled after the restart"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // A8: the new run starts by draining what the stopped run left in the ring,
+    // and the drain callback is silent by design; the decode thread writes the
+    // new run only after it. Pulling that callback and proving it silent is the
+    // stronger half of this test's claim: a callback that still carried track 1
+    // audio would be exactly the stale replay the test exists to catch.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut drained = 0usize;
+    while engine.is_start_pending() {
+        let mut chunk = Vec::new();
+        assert_eq!(clock.pull_hardware(256, &mut chunk), 256);
+        assert!(
+            chunk.iter().all(|sample| *sample == 0.0),
+            "the start drain callback must be silent, never stale track 1 audio"
+        );
+        drained += chunk.len();
+        engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the start drain never settled"
+        );
+    }
+    assert!(
+        drained > 0,
+        "the stopped run left audio in the ring, so a start drain was due"
+    );
+    // Only now does the new run's own audio reach the device.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while engine.buffered_frames() < 256 {
+        engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stall: the decode thread wrote nothing after the start drain"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // Pull audio of track 2 from the device

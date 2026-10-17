@@ -1,6 +1,8 @@
 # Contract notes (rustamp-decoders)
 
-Behaviour the core contract leaves open, and what the symphonia decoder does:
+Behaviour the core contract leaves open, and what the decoders do.
+
+## Symphonia decoder
 
 - **Mid-stream format change.** A channel-count change is remapped to the opened
   count (mono duplicated, extras dropped, missing zero-filled). A **sample-rate**
@@ -33,21 +35,59 @@ Behaviour the core contract leaves open, and what the symphonia decoder does:
 - **Duration** is `None` when the container gives no frame count (e.g. MP3
   without a Xing/Info header, or any source whose length cannot be read).
 
+## Wave decoder (`wave_dec.rs`)
+
+The RIFF/WAVE PCM decoder is the second factory (see below). What it does where
+the core contract leaves room:
+
+- **Claimed formats.** `WAVE_FORMAT_PCM` (8-bit unsigned, 16/24/32-bit signed
+  little-endian), `WAVE_FORMAT_IEEE_FLOAT` (32/64-bit) and
+  `WAVE_FORMAT_EXTENSIBLE` whose KSDATAFORMAT sub-format GUID resolves to PCM or
+  IEEE float. Anything else - `RIFX` (big-endian), `RF64`/`BW64`, MS/IMA ADPCM,
+  µ-law/A-law, and any unknown tag - is refused with `Error::UnsupportedFormat`,
+  both at probe time (no signature match) and at open time (the tag is checked).
+- **Valid bits below the container.** `WAVE_FORMAT_EXTENSIBLE` may carry a
+  `wValidBitsPerSample` below the container width (e.g. 20 in 24). The sample is
+  left-justified in the container, so the decoder shifts the unused low bits off
+  before scaling. A float container with a smaller valid-bit count is refused
+  (there is no such encoding).
+- **Chunk walking.** `fmt ` must precede `data`; unknown chunks (`LIST`, `fact`,
+  `bext`, ...) are skipped with the RIFF pad byte that follows an odd size. The
+  RIFF size field itself is not trusted - the chunk walk is authoritative - so
+  trailing bytes after `data` are ignored rather than an error.
+- **`data` size.** A declared size that reaches past the end of the source is
+  clamped to the bytes that are really there (so even `duration()` stays honest
+  for a truncated file). The streaming marker `0xFFFFFFFF` means "to EOF"; in a
+  source that cannot report its length the duration is then `None`.
+- **Truncated tail.** A `data` size that is not a whole number of frames leaves a
+  partial frame. It is dropped and counted in `skipped_packets()`; the stream
+  ends cleanly (the same short-EOS shape as the symphonia path).
+- **Seek.** Sample exact: a byte offset from the start of the sample data, no
+  pre-roll. The target is clamped to the duration when that is known; half a
+  frame of slack makes a target derived from `duration_of(n)` land on frame `n`
+  rather than the frame before it.
+- **Bitrate** is the uncompressed sample format
+  (`rate * channels * container_bits`), not a file average.
+
 ## Named collapses
 
-Distinctions this decoder still cannot make, named so they are not mistaken for
+Distinctions the decoders still cannot make, named so they are not mistaken for
 correct behaviour:
 
-1. **A truncated stream is indistinguishable from a clean end.** By the time the
-   container stops handing out packets the decoder has a clean `Ok(0)`; the
-   caller cannot tell "the file ended" from "the file was cut short". Fixing it
-   would mean inventing a `Truncated` outcome for every container, which the
-   current `Decoder` contract does not carry (RFC 0002 has no such item).
+1. **A truncated stream is indistinguishable from a clean end** (both decoders).
+   By the time the container stops handing out packets the decoder has a clean
+   `Ok(0)`; the caller cannot tell "the file ended" from "the file was cut
+   short". Fixing it would mean inventing a `Truncated` outcome for every
+   container, which the current `Decoder` contract does not carry (RFC 0002 has
+   no such item). The wave decoder does count a half frame as a skipped unit,
+   which is the only trace it can leave.
 2. **A damaged file whose *content signature* matches is reported as
-   `UnsupportedFormat`.** The signature tells the factory to hand the file to
-   symphonia; when the probe then rejects the body, nothing is open yet, so
-   `open_err` can only say "not my format". Telling "signature matched but the
+   `UnsupportedFormat`** (symphonia). The signature tells the factory to hand the
+   file to symphonia; when the probe then rejects the body, nothing is open yet,
+   so `open_err` can only say "not my format". Telling "signature matched but the
    container is broken" apart from "no reader at all" needs a third error kind.
+   The wave decoder has the same shape: a `RIFF`/`WAVE` header whose `fmt ` chunk
+   is unusable is `UnsupportedFormat`.
 3. **A container we can read but whose codec we cannot** is folded into the same
    `UnsupportedFormat` (nothing was opened, so it is the closest honest kind).
 4. **The registry resolves ties by registration order (RFC 0013).**
@@ -56,11 +96,20 @@ correct behaviour:
    not refuse when two factories claim the same media with identical score.
    Content signatures strictly beat extension hints (`Confidence::CONTENT`
    outranks `Confidence::EXTENSION`), and unclaimed inputs are refused with
-   `Error::UnsupportedFormat`. The multi-factory selection guarantees are
-   proposed in RFC 0013 and pinned by integration tests in `tests/robustness.rs`.
-5. **Zero channels.** The conversion path and `read` use `channels.max(1)`, so a
-   hostile buffer cannot reach `chunks_exact(0)`; a stream that really carries no
-   audio is reported as `Error::Decode("stream contains no audio")`.
+   `Error::UnsupportedFormat`.
+   This is no longer dead policy: `default_registry` registers two real
+   claimants (`symphonia`, then `wave`) that both score `Confidence::CONTENT` on
+   a `RIFF`/`WAVE` signature and `Confidence::EXTENSION` on a `.wav`/`.wave`
+   name, so a real WAV file takes the tie-break. Symphonia is first on purpose:
+   for the media both claim it is the more complete decoder, so the default
+   behaviour for WAV is unchanged. The guarantees are pinned by
+   `tests/robustness.rs` (fake claimants, the rule itself) and
+   `tests/selection.rs` (the two real factories).
+5. **Zero channels** (symphonia). The conversion path and `read` use
+   `channels.max(1)`, so a hostile buffer cannot reach `chunks_exact(0)`; a
+   stream that really carries no audio is reported as
+   `Error::Decode("stream contains no audio")`. The wave decoder refuses a
+   `fmt ` chunk with zero channels at open time instead.
 
 ## Proposals
 
@@ -72,7 +121,8 @@ and item 3 are in effect here.
    *Accepted in core (RFC 0002, C1): the trait method exists, and
    `SymphoniaDecoder` overrides it, so a `dyn Decoder` call sees the real count.
    The inherent method stays as a convenience for callers that hold the concrete
-   type; both read the same field.*
+   type; both read the same field. `WaveDecoder` overrides it too (its counter is
+   a dropped partial frame).*
 2. `ReadSeek` requires `Send + Sync` (RFC 0002, C2), which is what symphonia's
    `MediaSource` needs, so the reader is held directly and needs no interior
    synchronisation.

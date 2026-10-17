@@ -1,7 +1,7 @@
 //! PCM ring allocation/opening, separate from residents and control messages.
 
 use rustamp_ipc::Message;
-use rustamp_ipc::shm::{MappedRegion, RingConsumer, RingProducer};
+use rustamp_ipc::shm::{MappedRegion, RingConsumer, RingDirection, RingProducer};
 use rustamp_proto::host::PcmSpecWire;
 
 use crate::control::RingAbort;
@@ -34,6 +34,41 @@ pub trait PcmRings: Send + 'static {
     fn create(&self, spec: PcmSpecWire, capacity: u32) -> Result<PcmOffer<Self::Region>>;
     /// Validate/open the ring and wake before returning RingReady.
     fn open(&self, offer: &Message, spec: PcmSpecWire) -> Result<PcmInput<Self::Region>>;
+
+    /// Direction-aware allocation. The default covers the decoder path
+    /// (`HostToMain`) through [`PcmRings::create`]; factories with a real
+    /// `MainToHost` mapping override it (the DSP in-ring, RFC 0006 §6).
+    fn create_directed(
+        &self,
+        spec: PcmSpecWire,
+        capacity: u32,
+        direction: RingDirection,
+    ) -> Result<PcmOffer<Self::Region>> {
+        if direction == RingDirection::HostToMain {
+            self.create(spec, capacity)
+        } else {
+            Err(MediaHostError::NotImplemented(
+                "MainToHost rings need a directed factory".into(),
+            ))
+        }
+    }
+
+    /// Direction-aware open. The default covers the decoder path through
+    /// [`PcmRings::open`]; see [`PcmRings::create_directed`].
+    fn open_directed(
+        &self,
+        offer: &Message,
+        spec: PcmSpecWire,
+        direction: RingDirection,
+    ) -> Result<PcmInput<Self::Region>> {
+        if direction == RingDirection::HostToMain {
+            self.open(offer, spec)
+        } else {
+            Err(MediaHostError::NotImplemented(
+                "MainToHost rings need a directed factory".into(),
+            ))
+        }
+    }
 }
 
 /// Validate a wire format before doing channel arithmetic or allocating.
@@ -55,6 +90,18 @@ impl<R: MappedRegion> RingAbort for CloseRing<R> {
     }
 }
 
+/// Close-only view over two rings. The DSP conversation holds an in-ring and
+/// a back-ring per generation, but the supervisor registers a single abort,
+/// so both directions wake on control loss, shutdown or reconfigure.
+pub struct ClosePair(pub Box<dyn RingAbort>, pub Box<dyn RingAbort>);
+
+impl RingAbort for ClosePair {
+    fn abort(&mut self) {
+        self.0.abort();
+        self.1.abort();
+    }
+}
+
 /// Windows shared-memory sections with two named auto-reset events per ring.
 #[cfg(windows)]
 #[derive(Clone, Copy, Default)]
@@ -65,9 +112,41 @@ impl PcmRings for NamedPcmRings {
     type Region = rustamp_ipc::shm::NamedRegion;
 
     fn create(&self, spec: PcmSpecWire, capacity: u32) -> Result<PcmOffer<Self::Region>> {
+        Self::create_impl(spec, capacity, RingDirection::HostToMain)
+    }
+
+    fn open(&self, offer: &Message, spec: PcmSpecWire) -> Result<PcmInput<Self::Region>> {
+        Self::open_impl(offer, spec, RingDirection::HostToMain)
+    }
+
+    fn create_directed(
+        &self,
+        spec: PcmSpecWire,
+        capacity: u32,
+        direction: RingDirection,
+    ) -> Result<PcmOffer<Self::Region>> {
+        Self::create_impl(spec, capacity, direction)
+    }
+
+    fn open_directed(
+        &self,
+        offer: &Message,
+        spec: PcmSpecWire,
+        direction: RingDirection,
+    ) -> Result<PcmInput<Self::Region>> {
+        Self::open_impl(offer, spec, direction)
+    }
+}
+
+#[cfg(windows)]
+impl NamedPcmRings {
+    fn create_impl(
+        spec: PcmSpecWire,
+        capacity: u32,
+        direction: RingDirection,
+    ) -> Result<PcmOffer<rustamp_ipc::shm::NamedRegion>> {
         use rustamp_ipc::shm::{
-            MAX_RING_BYTES, NamedRegion, RING_DATA_OFFSET, RingDirection, RingKind, RingWake,
-            ring_name,
+            MAX_RING_BYTES, NamedRegion, RING_DATA_OFFSET, RingKind, RingWake, ring_name,
         };
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -104,7 +183,7 @@ impl PcmRings for NamedPcmRings {
             capacity,
             size,
             generation: producer.generation(),
-            direction: RingDirection::HostToMain,
+            direction,
         };
         Ok(PcmOffer {
             producer,
@@ -113,10 +192,13 @@ impl PcmRings for NamedPcmRings {
         })
     }
 
-    fn open(&self, offer: &Message, spec: PcmSpecWire) -> Result<PcmInput<Self::Region>> {
+    fn open_impl(
+        offer: &Message,
+        spec: PcmSpecWire,
+        expected: RingDirection,
+    ) -> Result<PcmInput<rustamp_ipc::shm::NamedRegion>> {
         use rustamp_ipc::shm::{
-            MAX_RING_BYTES, NamedRegion, RING_DATA_OFFSET, RingDirection, RingError, RingKind,
-            RingWake,
+            MAX_RING_BYTES, NamedRegion, RING_DATA_OFFSET, RingError, RingKind, RingWake,
         };
         validate_spec(spec)?;
         let Message::RingOffer {
@@ -133,9 +215,9 @@ impl PcmRings for NamedPcmRings {
                 "expected PCM RingOffer".into(),
             ));
         };
-        if *kind != RingKind::Pcm || *direction != RingDirection::HostToMain {
+        if *kind != RingKind::Pcm || *direction != expected {
             return Err(MediaHostError::InvalidMessage(
-                "wrong decoder ring kind/direction".into(),
+                "wrong ring kind/direction".into(),
             ));
         }
         if *frame_size != spec.frame_size() {

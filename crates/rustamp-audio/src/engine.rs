@@ -41,6 +41,12 @@
 //!         -> FormatConverter -> ring -> volume/balance (render callback) -> device
 //! ```
 //!
+//! A track's ReplayGain correction, when the mode is not disabled, is a
+//! per-track constant scale on the raw decoder output, before the equalizer
+//! (see [`crate::replaygain`]): the limiter and the converter's final
+//! ceiling then see the normalized signal, and volume/balance keep their
+//! attenuate-only promise on the render side.
+//!
 //! This is S07 §10's position "EQ on the decoded PCM before the final output
 //! scaling". That any further DSP stage sees the **post-EQ** stream, and that
 //! the vis tap sees the equalized signal, is the provisional choice named
@@ -79,6 +85,24 @@
 //! What remains is that the limiter is reset at every track change (the
 //! `DspStage` contract), so its look-ahead never sees across a seam.
 //!
+//! # ReplayGain
+//!
+//! The engine owns a [`ReplayGainControl`](crate::replaygain::ReplayGainControl)
+//! that selects the per-track correction ([`ReplayGainMode`](crate::replaygain::ReplayGainMode)
+//! plus a preamp in dB). The decode thread snapshots it when it opens a
+//! track and scales the raw decoder output before the DSP chain, so the
+//! limiter (-0.3 dBFS ceiling) and the converter's final ±1.0 ceiling still
+//! bound the normalized signal (see [`crate::replaygain`] for the placement
+//! and the policy). The mode defaults to disabled — loudness never changes
+//! until the user asks — and a track without a usable tag plays unadjusted
+//! whatever the settings say.
+//!
+//! The settings live engine-side, like the limiter switch: [`PlayerState`]
+//! has no ReplayGain field, and changing the wire contract requires an RFC.
+//! There is no [`Command`] for them either (the command enum is a frozen
+//! `rustamp-core` contract); the application layer calls the setters below
+//! directly, as it does for [`Engine::set_limiter_enabled`].
+//!
 //! # Restarting with a non-empty ring (A8)
 //!
 //! A stopped run leaves its buffered audio in the ring. When a run starts with
@@ -88,10 +112,22 @@
 //! played and the drain's silent callback does not count as played time of the
 //! new run. See [`crate::ring`] for the ordering.
 //!
+//! Device-buffer invalidation is separate from that ring drain. A confirmed
+//! seek (decoder success + ring drain), stop/end or stopped-position change
+//! requires [`OutputDevice::flush`]; a refused seek and pause/resume do not.
+//! A flush refusal/failure closes the output and prevents another start on
+//! this engine: the caller must construct a new engine/output lifecycle. This
+//! is intentional for cpal, which has no portable endpoint reset; silently
+//! resuming its retained stream would replay stale audio. Flush-capable
+//! backends retain the existing paused-device stop/start lifecycle.
+//!
 //! The limiter's ceiling holds at its own output only. The resampler after it
-//! (when the device rate differs from the track's) can rebuild inter-sample
-//! peaks above the ceiling, and above full scale (A6 finding 3, not fixed
-//! here).
+//! (when the device rate differs from the track's) rebuilds inter-sample
+//! peaks above the ceiling, and above full scale on hostile signals (A6
+//! finding 3). The [`FormatConverter`] holds a final `±1.0` (0 dBFS) ceiling
+//! on the resampled path (A14), so the ring — and hence the device — never
+//! sees a sample above full scale however the equalizer and the limiter are
+//! set. Volume and balance after the converter only attenuate.
 //! Because [`PlayerState`] has no field for the limiter (and changing the wire
 //! contract requires an RFC), the control remains engine-side via
 //! [`Engine::limiter_enabled`], [`Engine::set_limiter_enabled`], and
@@ -99,7 +135,7 @@
 //!
 //! # Not in this milestone
 //!
-//! out_ds-style fades and prebuffering (S18), ReplayGain, crossfade, the S08
+//! out_ds-style fades and prebuffering (S18), crossfade, the S08
 //! vis derivation, and the playlist model (the engine only holds a queue of
 //! re-openable sources and reports indices). See the task card and the report
 //! for task card A1.
@@ -123,6 +159,8 @@ use rustamp_core::vis::VisFrame;
 use rustamp_dsp::{EqControl, Equalizer, Limiter, LimiterControl};
 
 use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, clamped_index, spawn};
+use crate::replaygain::{ReplayGainControl, ReplayGainMode};
+use crate::resident::DspFailureWatch;
 use crate::ring::{GainState, RingSync, make_render};
 
 /// Engine configuration.
@@ -189,6 +227,10 @@ pub struct Engine {
     started: bool,
     vis_rx: Option<Consumer<VisFrame>>,
     dsp: Vec<Box<dyn DspStage>>,
+    /// Failure watch of a resident-backed DSP stage (opt-in; see
+    /// [`Engine::resident_dsp_watch`]). Polled in [`Engine::poll`]; a latched
+    /// failure fails the track.
+    dsp_watch: Arc<DspFailureWatch>,
     /// Equalizer state as published in [`PlayerState::eq`].
     eq: EqState,
     /// Where [`Engine::eq`] reaches the running [`Equalizer`] stage.
@@ -196,6 +238,9 @@ pub struct Engine {
     /// Where [`Engine::limiter_enabled`] / [`Engine::set_limiter_enabled`] reaches
     /// the running [`Limiter`] stage.
     limiter_control: Arc<LimiterControl>,
+    /// Where [`Engine::set_replaygain_mode`] / [`Engine::set_replaygain_preamp_db`]
+    /// reaches the decode thread. Snapshotted once per track.
+    replaygain_control: Arc<ReplayGainControl>,
     /// The ring's write end, parked here while no run is active.
     producer: Option<Producer<f32>>,
 
@@ -229,6 +274,10 @@ pub struct Engine {
     skipped: u64,
     last_track_frames: u64,
     error: Option<ErrorInfo>,
+    /// A failed flush destroyed the output's render callback. Only a fresh
+    /// engine/output lifecycle may start again; stream_error alone is not a
+    /// barrier, since close may clear a backend's failure latch.
+    flush_failure: Option<String>,
 }
 
 impl Engine {
@@ -269,9 +318,11 @@ impl Engine {
             started: false,
             vis_rx: None,
             dsp: Vec::new(),
+            dsp_watch: Arc::new(DspFailureWatch::new()),
             eq: EqState::default(),
             eq_control: Arc::new(EqControl::default()),
             limiter_control: Arc::new(LimiterControl::default()),
+            replaygain_control: Arc::new(ReplayGainControl::default()),
             producer: Some(producer),
             to_decode: None,
             from_decode: None,
@@ -300,13 +351,33 @@ impl Engine {
             skipped: 0,
             last_track_frames: 0,
             error: None,
+            flush_failure: None,
         })
     }
 
     /// Install the DSP chain. Stages run on the decode thread; they are
     /// prepared for every track and on a mid-stream format change.
+    ///
+    /// To run the chain in a resident process (opt-in, RFC 0006 §6), build a
+    /// stage with [`resident::DspResidentConfig::open`] (or wrap a session in
+    /// [`resident::HostDspChain::new`]) using this engine's
+    /// [`Engine::resident_dsp_watch`] and install it here. The default chain
+    /// is empty and never spawns a process.
     pub fn set_dsp_chain(&mut self, dsp: Vec<Box<dyn DspStage>>) {
         self.dsp = dsp;
+    }
+
+    /// The failure watch a resident-backed DSP stage latches into.
+    ///
+    /// Pass this to [`resident::DspResidentConfig::open`] (or
+    /// [`resident::HostDspChain::new`]) and install the returned stage with
+    /// [`Engine::set_dsp_chain`]. The core `DspStage::process` contract is
+    /// infallible (M14 finding F1), so a resident that dies or wedges
+    /// mid-stream latches its first failure here and passes audio through
+    /// bit-exactly; [`Engine::poll`] takes the latch and fails the track —
+    /// the resident's death fails the track, never the player (RFC 0006 §8).
+    pub fn resident_dsp_watch(&self) -> Arc<DspFailureWatch> {
+        Arc::clone(&self.dsp_watch)
     }
 
     /// Replace the play queue. Entries must be re-openable (paths or URLs).
@@ -354,7 +425,7 @@ impl Engine {
         &self.metadata
     }
 
-    /// Last error reported by the decode thread, if any.
+    /// Last decoder or output error, if any.
     pub fn last_error(&self) -> Option<&ErrorInfo> {
         self.error.as_ref()
     }
@@ -559,6 +630,46 @@ impl Engine {
         10.0_f64.powf(rustamp_dsp::limiter::CEILING_DB / 20.0) as f32
     }
 
+    /// The ReplayGain mode: which tag normalizes a track, if any.
+    ///
+    /// Disabled by default (an own choice: loudness never changes until the
+    /// user asks). Because [`PlayerState`] has no field for it (and changing
+    /// the wire contract requires an RFC), the setting remains engine-side.
+    pub fn replaygain_mode(&self) -> ReplayGainMode {
+        self.replaygain_control.mode()
+    }
+
+    /// Select which ReplayGain value normalizes a track
+    /// ([`ReplayGainMode::Disabled`], [`ReplayGainMode::Track`] or
+    /// [`ReplayGainMode::Album`]).
+    ///
+    /// Takes effect from the next track (or seek): the decode thread
+    /// snapshots the setting when it opens a track.
+    pub fn set_replaygain_mode(&mut self, mode: ReplayGainMode) {
+        self.replaygain_control.set_mode(mode);
+    }
+
+    /// The ReplayGain preamp in dB: a user offset added on top of the
+    /// selected track/album gain (`0.0` by default).
+    ///
+    /// It only shifts a selected gain; a track without a usable tag plays
+    /// unadjusted whatever the preamp says. Engine-side, like the mode.
+    pub fn replaygain_preamp_db(&self) -> f32 {
+        self.replaygain_control.preamp_db()
+    }
+
+    /// Set the ReplayGain preamp in dB (clamped to
+    /// `±`[`crate::replaygain::MAX_PREAMP_DB`]; non-finite keeps the
+    /// previous value). Takes effect from the next track (or seek).
+    pub fn set_replaygain_preamp_db(&mut self, preamp_db: f32) {
+        self.replaygain_control.set_preamp_db(preamp_db);
+    }
+
+    /// The ReplayGain control block, shared with the decode thread.
+    pub fn replaygain_control(&self) -> Arc<ReplayGainControl> {
+        Arc::clone(&self.replaygain_control)
+    }
+
     /// Whether "stop after current track" is armed (RFC 0005 O8).
     pub fn stop_after_current(&self) -> bool {
         self.stop_after_current
@@ -649,9 +760,16 @@ impl Engine {
 
     /// Start or resume playback of the current track.
     pub fn play(&mut self) -> Result<()> {
+        if let Some(message) = &self.flush_failure {
+            return Err(Error::Output(message.clone()));
+        }
         match self.transport {
             TransportState::Playing => Ok(()),
             TransportState::Paused => {
+                if let Some(err) = self.output.stream_error() {
+                    self.handle_output_error(err);
+                    return Ok(());
+                }
                 self.send(DecodeMsg::Resume);
                 self.output.resume()?;
                 self.sync.set_active(true);
@@ -679,12 +797,13 @@ impl Engine {
     }
 
     /// Stop, reset the position, drop the device buffer and leave the device
-    /// open but paused.
+    /// open but paused. If flush is refused/fails, closes the output, reports
+    /// the error and requires a fresh engine before playback can start again.
     pub fn stop(&mut self) -> Result<()> {
         self.send(DecodeMsg::Stop);
         self.sync.set_active(false);
         let _ = self.output.pause();
-        let _ = self.output.flush();
+        let flushed = self.flush_output();
         self.join_decode();
         self.transport = TransportState::Stopped;
         self.clock_origin = self.output.played_frames();
@@ -705,7 +824,10 @@ impl Engine {
             position_ms: 0,
             duration_ms: self.duration_ms,
         });
-        Ok(())
+        if let Err(ref err) = flushed {
+            self.report_output_error(err);
+        }
+        flushed
     }
 
     /// Play the queue entry at `index`.
@@ -809,13 +931,19 @@ impl Engine {
         self.seek_seq = self.seek_seq.wrapping_add(1);
         let seq = self.seek_seq;
         if self.transport == TransportState::Stopped || self.to_decode.is_none() {
+            if let Err(err) = self.flush_output() {
+                // A decoder can already have exited while its buffered run is
+                // paused. A refused flush must stop that case too, not leave a
+                // Paused engine able to resume a now-closed stream.
+                self.handle_output_error(Error::Output(err.to_string()));
+                return Err(err);
+            }
             // Not running: remember the target and apply it when playback
             // starts. The displayed position moves to the target right away.
             self.start_at = Some((frames, seq));
             self.timeline_origin = frames;
             self.track_start = 0;
             self.clock_origin = self.output.played_frames();
-            let _ = self.output.flush();
             self.publish_position(true);
             return Ok(());
         }
@@ -858,15 +986,40 @@ impl Engine {
     /// Process everything the decode thread reported and publish the resulting
     /// events. Call this regularly (the CLI example does it every few ms).
     pub fn poll(&mut self) -> Result<()> {
+        // A resident-backed DSP stage latched a failure: fail the track
+        // (RFC 0006 §8), never the player.
+        if let Some(info) = self.dsp_watch.take() {
+            self.handle_dsp_failure(info);
+            return Ok(());
+        }
+        if self.transport == TransportState::Playing
+            && let Some(err) = self.output.stream_error()
+        {
+            self.handle_output_error(err);
+            return Ok(());
+        }
         if let Some(rx) = self.from_decode.take() {
+            let mut output_error = None;
             loop {
                 match rx.try_recv() {
-                    Ok(out) => self.on_decode_out(out),
+                    Ok(out) => {
+                        if let Err(err) = self.on_decode_out(out) {
+                            output_error = Some(err);
+                            break;
+                        }
+                    }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                 }
             }
             self.from_decode = Some(rx);
+            if let Some(err) = output_error {
+                // Restore the receiver before teardown so join_decode recovers
+                // Returned and does not leave queued seek reports to rebase a
+                // stopped run on the next poll.
+                self.handle_output_error(err);
+                return Ok(());
+            }
         }
         // Finish the run only when the ring is truly empty: every frame the
         // decode thread wrote has been consumed by the render callback. Using
@@ -885,7 +1038,7 @@ impl Engine {
         Ok(())
     }
 
-    fn on_decode_out(&mut self, out: DecodeOut) {
+    fn on_decode_out(&mut self, out: DecodeOut) -> Result<()> {
         match out {
             DecodeOut::TrackStarted {
                 index,
@@ -928,13 +1081,26 @@ impl Engine {
                 self.start_drain = None;
                 // Drop what the device still holds (pre-seek audio and the
                 // drain callback's silence) so the new timeline plays clean.
-                let _ = self.output.flush();
+                self.flush_output()?;
                 // Re-base the audio clock exactly at the drain: every frame the
                 // device plays from now on belongs to the new position.
                 self.clock_origin = self.output.played_frames();
                 self.timeline_origin = timeline_pos;
                 self.sync.ack_engine(epoch);
                 self.publish_position(true);
+            }
+            DecodeOut::SeekFailed { seq, initial } => {
+                if self.pending_seek.map(|p| p.seq) == Some(seq) {
+                    self.pending_seek = None;
+                }
+                if initial {
+                    // Undo only the optimistic stopped-seek target, not
+                    // elapsed playback or a pending previous-run drain.
+                    self.timeline_origin = self.track_start;
+                    self.publish_position(true);
+                }
+                // No flush, clock re-base, epoch ack or start-drain clear:
+                // neither the decoder nor its still-playable buffers moved.
             }
             DecodeOut::StartDrained {
                 epoch,
@@ -982,6 +1148,7 @@ impl Engine {
                 self.dsp = dsp;
             }
         }
+        Ok(())
     }
 
     fn finish_run(&mut self) {
@@ -994,7 +1161,7 @@ impl Engine {
         self.start_drain = None;
         self.sync.set_active(false);
         let _ = self.output.pause();
-        let _ = self.output.flush();
+        let flushed = self.flush_output();
         self.join_decode();
         self.transport = TransportState::Stopped;
         // Freeze the timeline at the content end, not at the device position.
@@ -1025,13 +1192,129 @@ impl Engine {
         if queue_exhausted {
             self.bus.publish(Event::PlaylistEnded);
         }
+        if let Err(err) = flushed {
+            self.report_output_error(&err);
+        }
+    }
+
+    /// Tear down playback after a fatal mid-run output device failure (RFC 0012).
+    ///
+    /// Stops decoding immediately, pauses and flushes the device, transitions
+    /// transport to [`TransportState::Stopped`], freezes the timeline position,
+    /// and publishes [`Event::StateChanged`], [`Event::PositionChanged`] and
+    /// [`Event::Error`].
+    fn handle_output_error(&mut self, err: Error) {
+        let frozen_timeline = self.timeline_frames();
+        self.send(DecodeMsg::Stop);
+        self.sync.set_active(false);
+        let _ = self.output.pause();
+        let _ = self.flush_output();
+        self.join_decode();
+        self.transport = TransportState::Stopped;
+        self.timeline_origin = frozen_timeline;
+        self.clock_origin = self.output.played_frames();
+        self.pending_seek = None;
+        self.start_drain = None;
+        self.end_of_stream = None;
+        self.sync.set_written(0);
+        self.sync.set_consumed(0);
+        self.bus
+            .publish(Event::StateChanged(TransportState::Stopped));
+        self.bus.publish(Event::PositionChanged {
+            position_ms: self.position_ms(),
+            duration_ms: self.duration_ms,
+        });
+        self.report_output_error(&err);
     }
 
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
 
+    /// Never mistake a ring drain or an unsupported flush for an endpoint
+    /// reset. Closing is fail-closed, not a claim to retract hardware audio.
+    fn flush_output(&mut self) -> Result<()> {
+        if let Some(message) = &self.flush_failure {
+            return Err(Error::Output(message.clone()));
+        }
+        if let Err(err) = self.output.flush() {
+            let frozen_timeline = self.timeline_frames();
+            self.sync.set_active(false);
+            let _ = self.output.pause();
+            let closed = self.output.close();
+            // close is not required to retain the device clock. Preserve the
+            // timeline across it even on an implementation that resets it.
+            self.timeline_origin = frozen_timeline;
+            self.clock_origin = self.output.played_frames();
+            let mut message = format!(
+                "{}: output flush failed: {err}; output closed; recreate the engine/output before playback",
+                self.output.name()
+            );
+            if let Err(close_err) = closed {
+                message.push_str(&format!("; closing output also failed: {close_err}"));
+            }
+            self.flush_failure = Some(message.clone());
+            return Err(Error::Output(message));
+        }
+        Ok(())
+    }
+
+    fn report_output_error(&mut self, err: &Error) {
+        let info = ErrorInfo {
+            kind: ErrorKind::Output,
+            message: err.to_string(),
+        };
+        self.error = Some(info.clone());
+        self.bus.publish(Event::Error(info));
+    }
+
+    /// Tear down the run after a resident-backed DSP stage latched a failure
+    /// (RFC 0006 §8: the resident's death fails the track, never the player).
+    ///
+    /// The stage has bypassed bit-exactly since the failure, so the audio
+    /// decoded up to it stays valid; the run stops, the remaining buffered
+    /// audio is dropped and the error is published — the same teardown as a
+    /// fatal output failure, except the output itself stays usable. The
+    /// decode thread is never blocked longer than the stage's bounded block
+    /// round-trip, so the join cannot hang.
+    fn handle_dsp_failure(&mut self, info: ErrorInfo) {
+        let frozen_timeline = self.timeline_frames();
+        self.send(DecodeMsg::Stop);
+        self.sync.set_active(false);
+        let _ = self.output.pause();
+        let _ = self.flush_output();
+        self.join_decode();
+        self.transport = TransportState::Stopped;
+        self.timeline_origin = frozen_timeline;
+        self.clock_origin = self.output.played_frames();
+        self.pending_seek = None;
+        self.start_drain = None;
+        self.end_of_stream = None;
+        self.sync.set_written(0);
+        self.sync.set_consumed(0);
+        self.error = Some(info.clone());
+        self.bus.publish(Event::Error(info));
+        self.bus
+            .publish(Event::StateChanged(TransportState::Stopped));
+        self.bus.publish(Event::PositionChanged {
+            position_ms: self.position_ms(),
+            duration_ms: self.duration_ms,
+        });
+    }
+
     fn start_run(&mut self) -> Result<()> {
+        if let Some(message) = &self.flush_failure {
+            return Err(Error::Output(message.clone()));
+        }
+        if let Some(err) = self.output.stream_error() {
+            let info = ErrorInfo {
+                kind: ErrorKind::Output,
+                message: err.to_string(),
+            };
+            self.error = Some(info.clone());
+            self.bus.publish(Event::Error(info));
+            return Err(err);
+        }
         let index = self.current.unwrap_or(0);
         if index as usize >= self.queue.len() {
             return Err(Error::NotFound(format!("queue index {index}")));
@@ -1048,7 +1331,7 @@ impl Engine {
         self.timeline_origin = start_at.as_ref().map(|(frames, _)| *frames).unwrap_or(0);
         self.track_start = 0;
         self.end_of_stream = None;
-        self.pending_seek = None;
+        self.pending_seek = start_at.map(|(_, seq)| PendingSeek { seq });
         self.sync.set_written(0);
         // Reset the consumer-side counter alongside written so the invariant
         // consumed <= written holds for the new run. The render callback will
@@ -1090,6 +1373,7 @@ impl Engine {
             vis_enabled: self.cfg.vis_enabled,
             vis_capacity: self.cfg.vis_capacity,
             stop_after_current: self.stop_after_current,
+            replay_gain: Arc::clone(&self.replaygain_control),
             start_epoch,
         };
         // The equalizer runs first, on the decoded PCM (see the module docs).
