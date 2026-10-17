@@ -173,6 +173,14 @@ pub(crate) enum DecodeOut {
         /// New absolute timeline position in device frames.
         timeline_pos: u64,
     },
+    /// The decoder refused the seek. No timeline, DSP, converter, ring or
+    /// device discontinuity occurred; only the matching request is completed.
+    SeekFailed {
+        /// Echo of the engine's sequence number.
+        seq: u32,
+        /// Undo the optimistic stopped target even if a newer request is pending.
+        initial: bool,
+    },
     /// A track reached its end; the next one (if any) follows seamlessly.
     TrackEnded {
         /// Packets the decoder skipped (RFC 0002, C1).
@@ -253,6 +261,11 @@ impl std::fmt::Debug for DecodeOut {
                 .field("seq", seq)
                 .field("epoch", epoch)
                 .field("timeline_pos", timeline_pos)
+                .finish(),
+            DecodeOut::SeekFailed { seq, initial } => f
+                .debug_struct("SeekFailed")
+                .field("seq", seq)
+                .field("initial", initial)
                 .finish(),
             DecodeOut::TrackEnded { skipped, frames } => f
                 .debug_struct("TrackEnded")
@@ -455,7 +468,7 @@ impl Worker {
             self.prepare_track(index, decoder.as_ref(), continues);
             if let Some((frames, seq)) = start_at.take() {
                 let to = self.frames_to_duration(frames);
-                self.apply_seek(&mut decoder, to, frames, seq);
+                self.apply_seek(&mut decoder, to, seq, true);
             }
             let outcome = self.track_loop(&mut decoder);
             carry = outcome == Outcome::Ended;
@@ -573,8 +586,8 @@ impl Worker {
             if let Some(skip) = self.pending_skip.take() {
                 return skip;
             }
-            if let Some((to, frames, seq)) = self.pending_seek.take() {
-                self.apply_seek(decoder, to, frames, seq);
+            if let Some((to, _frames, seq)) = self.pending_seek.take() {
+                self.apply_seek(decoder, to, seq, false);
                 continue;
             }
             if self.paused {
@@ -793,8 +806,8 @@ impl Worker {
         &mut self,
         decoder: &mut Box<dyn Decoder>,
         to: Duration,
-        track_frames: u64,
         seq: u32,
+        initial: bool,
     ) {
         match decoder.seek(to) {
             Ok(reached) => {
@@ -829,14 +842,11 @@ impl Worker {
                 }
             }
             Err(e) => {
-                // Keep playing from where we are; report and carry on.
-                let _ = self.tx.send(DecodeOut::Seeked {
-                    seq,
-                    epoch: self.cfg.sync.epoch(),
-                    timeline_pos: self.timeline,
-                });
+                // Only Ok above authorizes a discontinuity. In particular the
+                // producer's write cursor is NOT the audible position: rebasing
+                // to it on a refusal would skip the still-playable backlog.
+                let _ = self.tx.send(DecodeOut::SeekFailed { seq, initial });
                 self.report_error(&e);
-                let _ = track_frames;
             }
         }
     }

@@ -88,6 +88,15 @@
 //! played and the drain's silent callback does not count as played time of the
 //! new run. See [`crate::ring`] for the ordering.
 //!
+//! Device-buffer invalidation is separate from that ring drain. A confirmed
+//! seek (decoder success + ring drain), stop/end or stopped-position change
+//! requires [`OutputDevice::flush`]; a refused seek and pause/resume do not.
+//! A flush refusal/failure closes the output and prevents another start on
+//! this engine: the caller must construct a new engine/output lifecycle. This
+//! is intentional for cpal, which has no portable endpoint reset; silently
+//! resuming its retained stream would replay stale audio. Flush-capable
+//! backends retain the existing paused-device stop/start lifecycle.
+//!
 //! The limiter's ceiling holds at its own output only. The resampler after it
 //! (when the device rate differs from the track's) can rebuild inter-sample
 //! peaks above the ceiling, and above full scale (A6 finding 3, not fixed
@@ -229,6 +238,10 @@ pub struct Engine {
     skipped: u64,
     last_track_frames: u64,
     error: Option<ErrorInfo>,
+    /// A failed flush destroyed the output's render callback. Only a fresh
+    /// engine/output lifecycle may start again; stream_error alone is not a
+    /// barrier, since close may clear a backend's failure latch.
+    flush_failure: Option<String>,
 }
 
 impl Engine {
@@ -300,6 +313,7 @@ impl Engine {
             skipped: 0,
             last_track_frames: 0,
             error: None,
+            flush_failure: None,
         })
     }
 
@@ -354,7 +368,7 @@ impl Engine {
         &self.metadata
     }
 
-    /// Last error reported by the decode thread, if any.
+    /// Last decoder or output error, if any.
     pub fn last_error(&self) -> Option<&ErrorInfo> {
         self.error.as_ref()
     }
@@ -649,6 +663,9 @@ impl Engine {
 
     /// Start or resume playback of the current track.
     pub fn play(&mut self) -> Result<()> {
+        if let Some(message) = &self.flush_failure {
+            return Err(Error::Output(message.clone()));
+        }
         match self.transport {
             TransportState::Playing => Ok(()),
             TransportState::Paused => {
@@ -683,12 +700,13 @@ impl Engine {
     }
 
     /// Stop, reset the position, drop the device buffer and leave the device
-    /// open but paused.
+    /// open but paused. If flush is refused/fails, closes the output, reports
+    /// the error and requires a fresh engine before playback can start again.
     pub fn stop(&mut self) -> Result<()> {
         self.send(DecodeMsg::Stop);
         self.sync.set_active(false);
         let _ = self.output.pause();
-        let _ = self.output.flush();
+        let flushed = self.flush_output();
         self.join_decode();
         self.transport = TransportState::Stopped;
         self.clock_origin = self.output.played_frames();
@@ -709,7 +727,10 @@ impl Engine {
             position_ms: 0,
             duration_ms: self.duration_ms,
         });
-        Ok(())
+        if let Err(ref err) = flushed {
+            self.report_output_error(err);
+        }
+        flushed
     }
 
     /// Play the queue entry at `index`.
@@ -813,13 +834,19 @@ impl Engine {
         self.seek_seq = self.seek_seq.wrapping_add(1);
         let seq = self.seek_seq;
         if self.transport == TransportState::Stopped || self.to_decode.is_none() {
+            if let Err(err) = self.flush_output() {
+                // A decoder can already have exited while its buffered run is
+                // paused. A refused flush must stop that case too, not leave a
+                // Paused engine able to resume a now-closed stream.
+                self.handle_output_error(Error::Output(err.to_string()));
+                return Err(err);
+            }
             // Not running: remember the target and apply it when playback
             // starts. The displayed position moves to the target right away.
             self.start_at = Some((frames, seq));
             self.timeline_origin = frames;
             self.track_start = 0;
             self.clock_origin = self.output.played_frames();
-            let _ = self.output.flush();
             self.publish_position(true);
             return Ok(());
         }
@@ -869,14 +896,27 @@ impl Engine {
             return Ok(());
         }
         if let Some(rx) = self.from_decode.take() {
+            let mut output_error = None;
             loop {
                 match rx.try_recv() {
-                    Ok(out) => self.on_decode_out(out),
+                    Ok(out) => {
+                        if let Err(err) = self.on_decode_out(out) {
+                            output_error = Some(err);
+                            break;
+                        }
+                    }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                 }
             }
             self.from_decode = Some(rx);
+            if let Some(err) = output_error {
+                // Restore the receiver before teardown so join_decode recovers
+                // Returned and does not leave queued seek reports to rebase a
+                // stopped run on the next poll.
+                self.handle_output_error(err);
+                return Ok(());
+            }
         }
         // Finish the run only when the ring is truly empty: every frame the
         // decode thread wrote has been consumed by the render callback. Using
@@ -895,7 +935,7 @@ impl Engine {
         Ok(())
     }
 
-    fn on_decode_out(&mut self, out: DecodeOut) {
+    fn on_decode_out(&mut self, out: DecodeOut) -> Result<()> {
         match out {
             DecodeOut::TrackStarted {
                 index,
@@ -938,13 +978,26 @@ impl Engine {
                 self.start_drain = None;
                 // Drop what the device still holds (pre-seek audio and the
                 // drain callback's silence) so the new timeline plays clean.
-                let _ = self.output.flush();
+                self.flush_output()?;
                 // Re-base the audio clock exactly at the drain: every frame the
                 // device plays from now on belongs to the new position.
                 self.clock_origin = self.output.played_frames();
                 self.timeline_origin = timeline_pos;
                 self.sync.ack_engine(epoch);
                 self.publish_position(true);
+            }
+            DecodeOut::SeekFailed { seq, initial } => {
+                if self.pending_seek.map(|p| p.seq) == Some(seq) {
+                    self.pending_seek = None;
+                }
+                if initial {
+                    // Undo only the optimistic stopped-seek target, not
+                    // elapsed playback or a pending previous-run drain.
+                    self.timeline_origin = self.track_start;
+                    self.publish_position(true);
+                }
+                // No flush, clock re-base, epoch ack or start-drain clear:
+                // neither the decoder nor its still-playable buffers moved.
             }
             DecodeOut::StartDrained {
                 epoch,
@@ -992,6 +1045,7 @@ impl Engine {
                 self.dsp = dsp;
             }
         }
+        Ok(())
     }
 
     fn finish_run(&mut self) {
@@ -1004,7 +1058,7 @@ impl Engine {
         self.start_drain = None;
         self.sync.set_active(false);
         let _ = self.output.pause();
-        let _ = self.output.flush();
+        let flushed = self.flush_output();
         self.join_decode();
         self.transport = TransportState::Stopped;
         // Freeze the timeline at the content end, not at the device position.
@@ -1035,6 +1089,9 @@ impl Engine {
         if queue_exhausted {
             self.bus.publish(Event::PlaylistEnded);
         }
+        if let Err(err) = flushed {
+            self.report_output_error(&err);
+        }
     }
 
     /// Tear down playback after a fatal mid-run output device failure (RFC 0012).
@@ -1044,38 +1101,74 @@ impl Engine {
     /// and publishes [`Event::StateChanged`], [`Event::PositionChanged`] and
     /// [`Event::Error`].
     fn handle_output_error(&mut self, err: Error) {
+        let frozen_timeline = self.timeline_frames();
         self.send(DecodeMsg::Stop);
         self.sync.set_active(false);
         let _ = self.output.pause();
-        let _ = self.output.flush();
+        let _ = self.flush_output();
         self.join_decode();
         self.transport = TransportState::Stopped;
-        self.timeline_origin = self.timeline_frames();
+        self.timeline_origin = frozen_timeline;
         self.clock_origin = self.output.played_frames();
         self.pending_seek = None;
         self.start_drain = None;
         self.end_of_stream = None;
         self.sync.set_written(0);
         self.sync.set_consumed(0);
-        let info = ErrorInfo {
-            kind: ErrorKind::Output,
-            message: err.to_string(),
-        };
-        self.error = Some(info.clone());
         self.bus
             .publish(Event::StateChanged(TransportState::Stopped));
         self.bus.publish(Event::PositionChanged {
             position_ms: self.position_ms(),
             duration_ms: self.duration_ms,
         });
-        self.bus.publish(Event::Error(info));
+        self.report_output_error(&err);
     }
 
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
 
+    /// Never mistake a ring drain or an unsupported flush for an endpoint
+    /// reset. Closing is fail-closed, not a claim to retract hardware audio.
+    fn flush_output(&mut self) -> Result<()> {
+        if let Some(message) = &self.flush_failure {
+            return Err(Error::Output(message.clone()));
+        }
+        if let Err(err) = self.output.flush() {
+            let frozen_timeline = self.timeline_frames();
+            self.sync.set_active(false);
+            let _ = self.output.pause();
+            let closed = self.output.close();
+            // close is not required to retain the device clock. Preserve the
+            // timeline across it even on an implementation that resets it.
+            self.timeline_origin = frozen_timeline;
+            self.clock_origin = self.output.played_frames();
+            let mut message = format!(
+                "{}: output flush failed: {err}; output closed; recreate the engine/output before playback",
+                self.output.name()
+            );
+            if let Err(close_err) = closed {
+                message.push_str(&format!("; closing output also failed: {close_err}"));
+            }
+            self.flush_failure = Some(message.clone());
+            return Err(Error::Output(message));
+        }
+        Ok(())
+    }
+
+    fn report_output_error(&mut self, err: &Error) {
+        let info = ErrorInfo {
+            kind: ErrorKind::Output,
+            message: err.to_string(),
+        };
+        self.error = Some(info.clone());
+        self.bus.publish(Event::Error(info));
+    }
+
     fn start_run(&mut self) -> Result<()> {
+        if let Some(message) = &self.flush_failure {
+            return Err(Error::Output(message.clone()));
+        }
         if let Some(err) = self.output.stream_error() {
             let info = ErrorInfo {
                 kind: ErrorKind::Output,
@@ -1101,7 +1194,7 @@ impl Engine {
         self.timeline_origin = start_at.as_ref().map(|(frames, _)| *frames).unwrap_or(0);
         self.track_start = 0;
         self.end_of_stream = None;
-        self.pending_seek = None;
+        self.pending_seek = start_at.map(|(_, seq)| PendingSeek { seq });
         self.sync.set_written(0);
         // Reset the consumer-side counter alongside written so the invariant
         // consumed <= written holds for the new run. The render callback will

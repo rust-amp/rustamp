@@ -9,9 +9,14 @@
 //!   to the engine's [`RenderFn`]. **No allocation, no lock, no I/O there.**
 //! * `played_frames` counts the frames rendered to the callback; it is never
 //!   reset.
-//! * `flush` is a no-op: cpal offers no way to drop what the backend already
-//!   handed to the device. The engine's ring drain discards everything that has
-//!   not been rendered yet, which is what a seek needs.
+//! * [`OutputDevice::flush`] is explicitly unsupported: cpal has no portable
+//!   endpoint-buffer reset. A ring drain only drops frames not yet rendered;
+//!   it cannot remove a pre-seek/pre-stop tail already handed to the endpoint.
+//!   Callers requiring that discontinuity must close the stream and create a
+//!   fresh output lifecycle (`open` + `start` with a new render callback), not
+//!   resume the old stream. Even closing cannot retract audio already delivered
+//!   beyond the stream to the hardware; no portable instantaneous-silence
+//!   guarantee is made.
 //! * The stream is created in `start`, not in `open`: `open` only negotiates the
 //!   format, which keeps the render callback out of a lock.
 //! * Device: the host's default output device, or — with
@@ -22,8 +27,7 @@
 //!   fails the same way.
 //! * The stream's error callback latches a failure flag; `close` reports it
 //!   naming the device and [`CpalOutput::has_failed`] exposes it earlier. The
-//!   `OutputDevice` contract has no mid-run error hook yet, so the flag cannot
-//!   become an `Event::Error` without an RFC.
+//!   engine observes the same flag through [`OutputDevice::stream_error`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -369,8 +373,15 @@ impl OutputDevice for CpalOutput {
         }
     }
 
+    /// Refuse the trait's device-buffer drop: cpal exposes no endpoint reset.
+    ///
+    /// Nothing is discarded here, and the render clock/failure latch are left
+    /// intact. Close and start a fresh output lifecycle instead of resuming the
+    /// retained stream. A ring drain alone is not a device-buffer flush.
     fn flush(&mut self) -> Result<()> {
-        Ok(())
+        Err(Error::Unsupported(
+            "cpal endpoint-buffer flush; close and recreate the output stream instead",
+        ))
     }
 
     fn latency(&self) -> Duration {
@@ -489,5 +500,27 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("cpal"), "{msg}");
         assert!(msg.contains("fatal error or disconnected"), "{msg}");
+    }
+
+    #[test]
+    fn flush_refuses_without_claiming_a_drop_or_changing_the_clock() {
+        // No device is opened. The refusal is unconditional, not dependent on
+        // a host/device probe (and must not be replaced by an empty Ok).
+        let mut out = CpalOutput::new();
+        assert!(matches!(
+            OutputDevice::flush(&mut out),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(out.stream_error().is_none(), "a refusal is not device loss");
+        out.shared.played.store(128, Ordering::Release);
+        out.shared.failed.store(true, Ordering::Release);
+        let err = OutputDevice::flush(&mut out).expect_err("cpal cannot reset the endpoint");
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(err.to_string().contains("close and recreate"));
+        assert_eq!(out.played_frames(), 128);
+        assert!(
+            out.has_failed(),
+            "flush must not clear a fatal device error"
+        );
     }
 }
