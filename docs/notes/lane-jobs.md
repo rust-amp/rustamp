@@ -14,8 +14,8 @@ slots looked busy.
 
 | job id | lane | started | task |
 |---|---|---|---|
-| `1792273239098557400-ba97ed3413f7df05a3c24f3f` | `wave67-ui-red` | 2026-10-17 23:40 | the UI crate's two red tests |
-| `1792273239098557400-9f1338378cccccc6f6ea9b7d` | `wave67-config-class` | 2026-10-17 23:40 | the writer/loader drift as a class (N8 found the second instance) |
+| `1792274442307450400-329938ab501dad8db908a2b4` | `wave67-ui-red` | 2026-10-18 00:00 | the UI crate's two red tests |
+| `1792274442306928100-9c8a00d833b8690704d227b9` | `wave67-config-class` | 2026-10-18 00:00 | the writer/loader drift as a class (N8 found the second instance) |
 
 Running elsewhere (they notify, no ids needed here): `wave65-wake-honest` on
 Mistral (the wake-timeout claim).
@@ -55,3 +55,11 @@ Mistral (the wake-timeout claim).
 
 `es.exe` only: `C:\Program Files\Everything 1.5a\es.exe` (owner's standing
 instruction, in AGENTS.md).
+
+## Lesson the heartbeat caught (2026-10-18 00:00)
+
+Two jobs were launched **before their worktrees existed**, so both failed at
+once and their worktrees were never created - the same mistake the file already
+warned about, made again. The heartbeat found it inside twenty minutes, which is
+the whole point of it. Both were relaunched with the worktrees in place. **Create
+the worktree first, then launch.**
