@@ -61,6 +61,25 @@ if (Test-Path 'C:\rustamp\testmedia') { $env:RUSTAMP_TESTDATA = 'C:\rustamp\test
 # host. Point RUSTAMP_TESTSKINS at it so skin-dependent tests opt in; without it
 # they skip.
 if (Test-Path 'C:\rustamp\testskins') { $env:RUSTAMP_TESTSKINS = 'C:\rustamp\testskins' }
+# Real test plugins: staged read-only copies at C:\rustamp\testplugins when they
+# exist on the host. Point RUSTAMP_TESTPLUGINS at it so DLL acceptance tests find
+# the approved in_openmpt.dll plugin.
+if (Test-Path 'C:\rustamp\testplugins') { $env:RUSTAMP_TESTPLUGINS = 'C:\rustamp\testplugins' }
+
+# Mediahost resident fixture examples: set RUSTAMP_DECODER_FIXTURE and
+# RUSTAMP_DSP_FIXTURE when staged, enabling the two-process pcm_process and
+# dsp_process ignored tests.
+$decFixture = Join-Path $repo 'target\debug\examples\decoder_fixture.exe'
+if (-not (Test-Path $decFixture)) {
+    $decFixture = Join-Path $repo 'target\debug\decoder_fixture.exe'
+}
+if (Test-Path $decFixture) { $env:RUSTAMP_DECODER_FIXTURE = $decFixture }
+
+$dspFixture = Join-Path $repo 'target\debug\examples\dsp_fixture.exe'
+if (-not (Test-Path $dspFixture)) {
+    $dspFixture = Join-Path $repo 'target\debug\dsp_fixture.exe'
+}
+if (Test-Path $dspFixture) { $env:RUSTAMP_DSP_FIXTURE = $dspFixture }
 
 # --- launch one test binary, bounded, and bring its output back as text -------
 #
@@ -191,6 +210,42 @@ foreach ($exe in $exes) {
     $name = Split-Path $exe -Leaf
     if ($filter -and $name -notlike "*$filter*") { continue }
 
+    # Skip non-test helper binaries staged beside test binaries for candidate lookup
+    if ($name -eq 'rustamp-plughost32.exe' -or $name -eq 'rustamp.exe') { continue }
+
+    # Group E tests: real audio endpoint tests cannot run in headless VM without a
+    # hardware/VM redirection decision. When running a general --ignored pass (not
+    # specifically filtering for them), leave them out cleanly with diagnostic rather than
+    # failing on missing WASAPI device / VB-Audio cable.
+    if ($extra -contains '--ignored' -and (-not $filter -or ($filter -notlike '*real_playback*' -and $filter -notlike '*loopback*'))) {
+        if ($name -like '*real_playback*') {
+            $results += [pscustomobject]@{
+                exe            = $name
+                exit           = 0
+                summary        = 'LEFT OUT: requires VM audio endpoint decision (WASAPI default output)'
+                passed         = @()
+                failed         = @()
+                diagnostic     = @('left out per W12/Group E1: requires Hyper-V audio redirection or virtual audio endpoint decision')
+                hung           = $false
+                timeoutSeconds = $TestTimeoutSeconds
+            }
+            continue
+        }
+        if ($name -like '*loopback*') {
+            $results += [pscustomobject]@{
+                exe            = $name
+                exit           = 0
+                summary        = 'LEFT OUT: requires VB-Audio Virtual Cable installation in VM'
+                passed         = @()
+                failed         = @()
+                diagnostic     = @('left out per W12/Group E2: requires VB-Audio Virtual Cable (CABLE Input/Output) decision')
+                hung           = $false
+                timeoutSeconds = $TestTimeoutSeconds
+            }
+            continue
+        }
+    }
+
     # Progress line: WHICH binary is running right now. It has to come after
     # $name exists and before the binary starts - the first version printed it
     # once, above this loop, with an empty name.
@@ -201,6 +256,7 @@ foreach ($exe in $exes) {
             exe            = $name
             exit           = -1
             summary        = 'MISSING BINARY'
+            passed         = @()
             failed         = @()
             diagnostic     = @()
             hung           = $false
@@ -216,6 +272,7 @@ foreach ($exe in $exes) {
             exe            = $name
             exit           = -1
             summary        = 'DID NOT START'
+            passed         = @()
             failed         = @()
             diagnostic     = @($run.notes)
             hung           = $false
@@ -244,6 +301,7 @@ foreach ($exe in $exes) {
             exe            = $name
             exit           = -1
             summary        = 'HUNG after timeout'
+            passed         = @()
             failed         = @()
             diagnostic     = @($diag + @($run.notes))
             hung           = $true
@@ -253,7 +311,12 @@ foreach ($exe in $exes) {
     }
 
     $summary = ($lines | Where-Object { $_ -match '^test result:' } | Select-Object -Last 1)
-    $failedNames = @($lines | Where-Object { $_ -match '^test .* FAILED$' } | ForEach-Object { $_.Trim() })
+    $failedNames = @($lines | Where-Object { $_ -match '^test .* FAILED$' } | ForEach-Object {
+        (($_ -replace '^test\s+', '') -replace '\s+\.\.\.\s+FAILED$', '') -replace '\s+FAILED$', ''
+    })
+    $passedNames = @($lines | Where-Object { $_ -match '^test .* \.\.\. ok$' } | ForEach-Object {
+        ($_ -replace '^test\s+', '') -replace '\s+\.\.\.\s+ok$', ''
+    })
     # A panic's values live on the lines AFTER the FAILED line (multi-line
     # assertion messages), so keep a window behind each failure: without it a
     # failure like "timeline stopped at X of Y frames" keeps its verdict but
@@ -284,6 +347,7 @@ foreach ($exe in $exes) {
         exe            = $name
         exit           = $run.exit
         summary        = $summary
+        passed         = $passedNames
         failed         = $failedNames
         diagnostic     = $diagnostic
         hung           = $false

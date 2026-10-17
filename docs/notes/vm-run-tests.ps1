@@ -47,10 +47,23 @@ if (-not $SkipBuild) {
     foreach ($line in $json) {
         if ($line -isnot [string]) { continue }
         try { $msg = $line | ConvertFrom-Json } catch { continue }
-        if ($msg.reason -eq 'compiler-artifact' -and $msg.executable -and $msg.profile.test) { $testExes += $msg.executable }
+        if ($msg.reason -eq 'compiler-artifact' -and $msg.executable -and $msg.profile.test) {
+            # rustamp-plughost is an i686 crate by design (RFC 0006 §8); its tests
+            # are compiled for i686-pc-windows-msvc below to support 32-bit plugin DLL execution.
+            if ($msg.package_id -match 'rustamp-plughost') { continue }
+            $testExes += $msg.executable
+        }
     }
     if (-not $testExes) { throw 'no test binaries were produced' }
     Write-Host ("    {0} test binaries" -f $testExes.Count)
+
+    Step 'building mediahost resident fixture examples (decoder_fixture, dsp_fixture)'
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & cargo build --offline -p rustamp-mediahost --example decoder_fixture --example dsp_fixture 2>$null | Out-Null
+    $fixtureBuildExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevPref
+    if ($fixtureBuildExit -ne 0) { throw "cargo build examples decoder_fixture / dsp_fixture failed with exit $fixtureBuildExit" }
 } else {
     Step 'skipping the build (-SkipBuild); the previously staged binaries are reused'
     $stagedDeps = Join-Path $Stage 'target\debug\deps'
@@ -62,6 +75,7 @@ if (-not $SkipBuild) {
 Step "staging into $Stage"
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'target\debug\deps')
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'target\debug\examples')
 foreach ($exe in $testExes) { Copy-Item $exe (Join-Path $Stage 'target\debug\deps') -Force }
 $debugDir = Join-Path $RepoRoot 'target\debug'
 foreach ($dll in Get-ChildItem -Path (Join-Path $debugDir 'deps') -Filter '*.dll' -ErrorAction SilentlyContinue) {
@@ -69,34 +83,67 @@ foreach ($dll in Get-ChildItem -Path (Join-Path $debugDir 'deps') -Filter '*.dll
 }
 if (Test-Path (Join-Path $debugDir 'rustamp.exe')) { Copy-Item (Join-Path $debugDir 'rustamp.exe') (Join-Path $Stage 'target\debug') -Force }
 
+# Stage mediahost resident fixture examples (decoder_fixture, dsp_fixture)
+$decoderFixtureExe = Join-Path $debugDir 'examples\decoder_fixture.exe'
+$dspFixtureExe = Join-Path $debugDir 'examples\dsp_fixture.exe'
+if (Test-Path $decoderFixtureExe) {
+    Copy-Item $decoderFixtureExe (Join-Path $Stage 'target\debug\examples') -Force
+    Copy-Item $decoderFixtureExe (Join-Path $Stage 'target\debug') -Force
+    Write-Host '    staged decoder_fixture example'
+}
+if (Test-Path $dspFixtureExe) {
+    Copy-Item $dspFixtureExe (Join-Path $Stage 'target\debug\examples') -Force
+    Copy-Item $dspFixtureExe (Join-Path $Stage 'target\debug') -Force
+    Write-Host '    staged dsp_fixture example'
+}
+
 # The plugin host is built for i686 — the app is 64-bit and the host 32-bit by
 # design (RFC 0006 §8) — so a plain workspace test build produces none and the
-# supervisor finds nothing to spawn. Build it and stage it where the resolver
-# looks first, next to the binary that will run, so the ignored end-to-end test
-# can exercise the whole chain here, in the guest, which is the only place it
-# may run. A missing host is reported, not hidden: the test then fails loudly
-# rather than passing vacuously.
-Step 'building the i686 plugin host for the end-to-end test'
+# supervisor finds nothing to spawn. Build both the host binary and its test
+# executables for i686-pc-windows-msvc with static CRT so the ignored end-to-end
+# and DLL acceptance tests can exercise 32-bit plugin loading in the guest.
+Step 'building the i686 plugin host and plughost test binaries'
 $prevPref = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-# The host links the C runtime statically here. It is a 32-bit binary that must
-# sit beside a 64-bit application, and the two cannot share CRT DLLs in one
-# directory (same name, different architecture), so a self-contained host is the
-# only layout that works. Without this the host dies the moment it starts and the
-# end-to-end test sees the channel close.
 $prevRustflags = $env:RUSTFLAGS
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 & cargo build -p rustamp-plughost --target i686-pc-windows-msvc 2>$null | Out-Null
+$plughostTestJson = & cargo test -p rustamp-plughost --all-targets --all-features --no-run --target i686-pc-windows-msvc --message-format=json 2>$null
+$plughostTestExit = $LASTEXITCODE
 if ($null -eq $prevRustflags) { Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue } else { $env:RUSTFLAGS = $prevRustflags }
 $ErrorActionPreference = $prevPref
+if ($plughostTestExit -ne 0) { throw "cargo test -p rustamp-plughost --no-run --target i686-pc-windows-msvc failed with exit $plughostTestExit" }
+
 $hostExe = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\rustamp-plughost32.exe'
 if (Test-Path $hostExe) {
     Copy-Item $hostExe (Join-Path $Stage 'target\debug\deps') -Force
     Copy-Item $hostExe (Join-Path $Stage 'target\debug') -Force
+    $i686TargetDebug = Join-Path $Stage 'target\i686-pc-windows-msvc\debug'
+    $null = New-Item -ItemType Directory -Force -Path $i686TargetDebug
+    Copy-Item $hostExe $i686TargetDebug -Force
     Write-Host '    staged the i686 plugin host beside the binaries'
 } else {
     Write-Host '    WARNING: no i686 plugin host was built; the end-to-end test will report it blocked'
 }
+
+$i686TestExes = @()
+foreach ($line in $plughostTestJson) {
+    if ($line -isnot [string]) { continue }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.reason -eq 'compiler-artifact' -and $msg.executable -and $msg.profile.test) {
+        $i686TestExes += $msg.executable
+    }
+}
+$i686TargetDeps = Join-Path $Stage 'target\i686-pc-windows-msvc\debug\deps'
+$null = New-Item -ItemType Directory -Force -Path $i686TargetDeps
+foreach ($exe in $i686TestExes) {
+    Copy-Item $exe (Join-Path $Stage 'target\debug\deps') -Force
+    Copy-Item $exe $i686TargetDeps -Force
+}
+if ($i686TestExes.Count -gt 0) {
+    Write-Host ("    staged {0} i686 plughost test binaries beside the binaries" -f $i686TestExes.Count)
+}
+
 foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
     $p = Join-Path $env:SystemRoot "System32\$crt"
     if (Test-Path $p) {
@@ -105,6 +152,7 @@ foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
         # only next to rustamp.exe. Missing it is 0xC0000135.
         Copy-Item $p (Join-Path $Stage 'target\debug') -Force
         Copy-Item $p (Join-Path $Stage 'target\debug\deps') -Force
+        Copy-Item $p (Join-Path $Stage 'target\debug\examples') -Force
     }
 }
 Copy-Item (Join-Path $RepoRoot 'crates') (Join-Path $Stage 'crates') -Recurse -Force
@@ -171,6 +219,20 @@ if (Test-Path $skinsDir) {
     Write-Host '    no test skins on the host; skin-dependent tests will skip'
 }
 
+# Real test plugins: staged read-only copies of the owner's testplugins directory
+# (D:\code\rustamp-testplugins) into C:\rustamp\testplugins in the guest so
+# DLL acceptance tests find the approved in_openmpt.dll plugin.
+$pluginsDir = 'D:\code\rustamp-testplugins'
+if (Test-Path $pluginsDir) {
+    Step 'copying test plugins into the guest (read-only copies)'
+    $pluginsStage = Join-Path (Split-Path $Stage) 'testplugins'
+    if (Test-Path $pluginsStage) { Remove-Item -Recurse -Force $pluginsStage }
+    Copy-Item $pluginsDir $pluginsStage -Recurse -Force
+    & $broker -Op copyin -Source $pluginsStage -Dest 'C:\rustamp\testplugins' -TimeoutSeconds 600 | Out-Null
+} else {
+    Write-Host '    no test plugins on the host; plugin-dependent tests will skip/refuse'
+}
+
 Step 'running the tests in the guest'
 # The guest bounds each binary at 300 s (`$TestTimeoutSeconds` in
 # docs\notes\vm-broker\guest\run-tests.ps1) and is meant to keep going after a
@@ -181,8 +243,9 @@ Step 'running the tests in the guest'
 # host/guest boundary (that is what the allow-list is), so they are kept in step
 # by hand and named here.
 $PerBinaryTimeoutSeconds = 300
-$guestTimeoutSeconds = 60 + (($PerBinaryTimeoutSeconds + 60) * [math]::Max($testExes.Count, 1))
-Write-Host ("    per-binary timeout {0} s; broker bound {1} s for {2} binaries" -f $PerBinaryTimeoutSeconds, $guestTimeoutSeconds, $testExes.Count)
+$allBinariesCount = $testExes.Count + $i686TestExes.Count
+$guestTimeoutSeconds = 60 + (($PerBinaryTimeoutSeconds + 60) * [math]::Max($allBinariesCount, 1))
+Write-Host ("    per-binary timeout {0} s; broker bound {1} s for {2} binaries" -f $PerBinaryTimeoutSeconds, $guestTimeoutSeconds, $allBinariesCount)
 # A single positional argument: `-ArgumentList` with an array binds only the
 # first element to the script's parameter, which silently dropped the filter.
 $result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $Filter -TimeoutSeconds $guestTimeoutSeconds
@@ -206,12 +269,79 @@ $result.results | ForEach-Object {
         Write-Host ("         HUNG after {0} - binary was killed, last output captured" -f $bound)
         foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
     } else {
-        $status = if ($_.exit -eq 0) { 'ok  ' } else { 'FAIL' }
+        $status = if ($_.exit -eq 0) {
+            if ($_.summary -like 'LEFT OUT*') { 'SKIP' } else { 'ok  ' }
+        } else { 'FAIL' }
         Write-Host ("  [{0}] {1,-46} {2}" -f $status, $_.exe, $_.summary)
-        foreach ($f in $_.failed) { Write-Host ("         $f") }
+        foreach ($f in $_.failed) { Write-Host ("         FAIL: $f") }
         foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
     }
 }
+
+# --- 6. ignored tests summary (W12 inventory) -------------------------------
+if ($Filter -like '--ignored*') {
+    Write-Host ''
+    Write-Host '--- Ignored Tests Execution Summary (W12 Inventory) ---'
+
+    $inventory = @(
+        # Group A — VM GUI (8 tests)
+        [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'the_menu_popup_opens_at_the_measured_size' },
+        [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'the_windowed_player_opens_a_window_inside_the_test_vm' },
+        [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'the_equalizer_window_opens_at_its_docked_size_and_position' },
+        [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'the_main_menu_popup_opens_at_the_measured_client_size' },
+        [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'the_playlist_window_opens_docked_below_the_main_window' },
+        [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'the_new_dialogs_pin_their_os_window_parameters' },
+        [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'opening_the_playlist_window_needs_an_os_window' },
+        [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'opening_either_dialog_needs_an_os_window' },
+
+        # Group B — VM real-process (3 tests)
+        [pscustomobject]@{ Group = 'Group B (VM Real Process)'; Name = 'spawns_the_real_host_without_a_window' },
+        [pscustomobject]@{ Group = 'Group B (VM Real Process)'; Name = 'app_published_state_reaches_the_host_window' },
+        [pscustomobject]@{ Group = 'Group B (VM Real Process)'; Name = 'creates_the_real_host_window_vm_only' },
+
+        # Group C — VM two-process resident fixtures (4 tests)
+        [pscustomobject]@{ Group = 'Group C (Resident Fixtures)'; Name = 'named_pcm_two_process_transfer_and_seek' },
+        [pscustomobject]@{ Group = 'Group C (Resident Fixtures)'; Name = 'pcm_process::host_exits_mid_stream_and_infinite_read_survives'; Search = 'host_exits_mid_stream_and_infinite_read_survives'; Binary = 'pcm_process' },
+        [pscustomobject]@{ Group = 'Group C (Resident Fixtures)'; Name = 'named_dsp_two_process_gain_round_trip_then_sticky_eos' },
+        [pscustomobject]@{ Group = 'Group C (Resident Fixtures)'; Name = 'dsp_process::host_exits_mid_stream_and_infinite_read_survives'; Search = 'host_exits_mid_stream_and_infinite_read_survives'; Binary = 'dsp_process' },
+
+        # Group D — VM i686 plugin test + real approved DLL (2 tests)
+        [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'loads_real_32bit_in_openmpt_dll_and_proves_host_interaction' },
+        [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'approved_real_dll_maps_headlessly_from_verified_snapshot' },
+
+        # Group E — Real audio endpoint (2 tests - left out pending decision)
+        [pscustomobject]@{ Group = 'Group E (Real Audio Endpoint)'; Name = 'the_real_device_plays_a_reference_file_to_its_end'; Blocker = 'Real audio endpoint decision (WASAPI default device)' },
+        [pscustomobject]@{ Group = 'Group E (Real Audio Endpoint)'; Name = 'the_cable_carries_the_fixture_tone'; Blocker = 'VB-Audio Virtual Cable installation in VM' }
+    )
+
+    $ranCount = 0
+    $blockedCount = 0
+    foreach ($item in $inventory) {
+        $searchName = if ($item.Search) { $item.Search } else { $item.Name }
+        $passed = $false
+        $failed = $false
+        foreach ($r in $result.results) {
+            if ($item.Binary -and $r.exe -notlike "*$($item.Binary)*") { continue }
+            if ($r.passed -and ($r.passed | Where-Object { $_ -like "*$searchName*" })) { $passed = $true }
+            if ($r.failed -and ($r.failed | Where-Object { $_ -like "*$searchName*" })) { $failed = $true }
+        }
+
+        if ($passed) {
+            $ranCount++
+            Write-Host ("  [PASS] {0,-30} {1}" -f $item.Group, $item.Name)
+        } elseif ($failed) {
+            $ranCount++
+            Write-Host ("  [FAIL] {0,-30} {1}" -f $item.Group, $item.Name)
+        } elseif ($item.Blocker) {
+            $blockedCount++
+            Write-Host ("  [BLOCKED] {0,-27} {1} ({2})" -f $item.Group, $item.Name, $item.Blocker)
+        } else {
+            Write-Host ("  [NOT RUN] {0,-27} {1}" -f $item.Group, $item.Name)
+        }
+    }
+    Write-Host ("`nIgnored tests: {0} ran, {1} blocked pending host/VM decisions, {2} total in inventory" -f $ranCount, $blockedCount, $inventory.Count)
+}
+
 # A stall must never be reported as a green run: the hung count is a second,
 # independent gate on the exit code, so a counting drift cannot hide a hang.
 if ($result.failed -ne 0 -or $hungCount -ne 0) { exit 1 }
