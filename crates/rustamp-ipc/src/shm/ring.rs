@@ -1060,6 +1060,10 @@ unsafe impl<R: MappedRegion> Send for RingConsumer<R> {}
 
 #[cfg(test)]
 mod tests {
+    /// Every blocking wait in a test is bounded: a test must fail loudly
+    /// rather than hang the suite when a wake is lost (RFC 0007 §6.1).
+    const TEST_WAIT: Option<Duration> = Some(Duration::from_secs(10));
+
     use super::*;
     use crate::shm::header::{RING_DATA_OFFSET, RING_HEADER_SIZE, VIS_SLOT_SIZE};
     use crate::shm::region::{AnonymousRegion, ring_name};
@@ -1717,7 +1721,7 @@ mod tests {
                         buf[i * 2 + 1] = -v;
                     }
                     let written = producer
-                        .write_from_blocking(&buf[..frames * SPF], None)
+                        .write_from_blocking(&buf[..frames * SPF], TEST_WAIT)
                         .unwrap();
                     assert!(written > 0, "producer stalled with no data and no close");
                     index += written as u64;
@@ -1731,7 +1735,7 @@ mod tests {
                 let mut received = 0u64;
                 let mut previous: Option<f32> = None;
                 while received < TOTAL {
-                    let read = consumer.read_into_blocking(&mut out, None).unwrap();
+                    let read = consumer.read_into_blocking(&mut out, TEST_WAIT).unwrap();
                     for i in 0..read {
                         let v = out[i * 2];
                         if let Some(prev) = previous {
@@ -1768,10 +1772,10 @@ mod tests {
         producer.close();
 
         let mut out = [0.0f32; 2];
-        assert_eq!(consumer.read_into_blocking(&mut out, None).unwrap(), 1);
+        assert_eq!(consumer.read_into_blocking(&mut out, TEST_WAIT).unwrap(), 1);
         assert_eq!(out[0], 1.0);
         assert!(matches!(
-            consumer.read_into_blocking(&mut out, None),
+            consumer.read_into_blocking(&mut out, TEST_WAIT),
             Err(RingError::Closed)
         ));
     }
@@ -1783,14 +1787,14 @@ mod tests {
         let (mut producer, mut consumer) = pcm_ring_with_wake(1, 2);
 
         // Fill the ring (capacity 1).
-        producer.write_from_blocking(&[0.0f32, 0.0], None).unwrap();
+        producer.write_from_blocking(&[0.0f32, 0.0], TEST_WAIT).unwrap();
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let producer_handle = std::thread::spawn(move || {
             // Signal that the blocking call is about to start, then block.
             let _ = started_tx.send(());
-            let result = producer.write_from_blocking(&[1.0f32, 1.0], None);
+            let result = producer.write_from_blocking(&[1.0f32, 1.0], TEST_WAIT);
             let _ = result_tx.send(result);
         });
 
@@ -1872,11 +1876,11 @@ mod tests {
 
         let mut out = [0.0f32; 8];
         assert!(matches!(
-            consumer.read_into_blocking(&mut out, None),
+            consumer.read_into_blocking(&mut out, TEST_WAIT),
             Err(RingError::NoWakeObject)
         ));
         assert!(matches!(
-            producer.write_from_blocking(&[0.0f32; 2], None),
+            producer.write_from_blocking(&[0.0f32; 2], TEST_WAIT),
             Err(RingError::NoWakeObject)
         ));
         assert!(matches!(
@@ -1915,11 +1919,11 @@ mod tests {
         let mut out = [0.0f32; 4];
         // Vis ring → WrongRingKind (kind is checked before the wake check).
         assert!(matches!(
-            vis_consumer.read_into_blocking(&mut out, None),
+            vis_consumer.read_into_blocking(&mut out, TEST_WAIT),
             Err(RingError::WrongRingKind { .. })
         ));
         assert!(matches!(
-            vis_producer.write_from_blocking(&[0.0f32; 2], None),
+            vis_producer.write_from_blocking(&[0.0f32; 2], TEST_WAIT),
             Err(RingError::WrongRingKind { .. })
         ));
     }
@@ -1943,7 +1947,7 @@ mod tests {
                     let v = index as f32;
                     let buf = [v, -v];
                     loop {
-                        let written = producer.write_from_blocking(&buf, None).unwrap();
+                        let written = producer.write_from_blocking(&buf, TEST_WAIT).unwrap();
                         if written > 0 {
                             break;
                         }
@@ -1958,7 +1962,7 @@ mod tests {
                 let mut received = 0u64;
                 let mut last: Option<f32> = None;
                 while received < FRAMES {
-                    let read = consumer.read_into_blocking(&mut out, None).unwrap();
+                    let read = consumer.read_into_blocking(&mut out, TEST_WAIT).unwrap();
                     for i in 0..read {
                         let v = out[i * 2];
                         if let Some(prev) = last {
@@ -2004,7 +2008,7 @@ mod tests {
                         buf[i * 2 + 1] = -v;
                     }
                     let written = producer
-                        .write_from_blocking(&buf[..frames * SPF], None)
+                        .write_from_blocking(&buf[..frames * SPF], TEST_WAIT)
                         .unwrap();
                     assert!(written > 0, "producer stalled");
                     index += written as u64;
@@ -2018,7 +2022,7 @@ mod tests {
                 let mut received = 0u64;
                 let mut last: Option<f32> = None;
                 while received < TOTAL {
-                    let read = consumer.read_into_blocking(&mut out, None).unwrap();
+                    let read = consumer.read_into_blocking(&mut out, TEST_WAIT).unwrap();
                     for i in 0..read {
                         let v = out[i * 2];
                         if let Some(prev) = last {
