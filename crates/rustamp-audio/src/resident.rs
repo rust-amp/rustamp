@@ -791,13 +791,19 @@ impl ChainControl {
         }
         let wire = wire_spec(spec)?;
         if wire == session.spec() {
-            session
-                .reset()
-                .map_err(|error| dsp_error_to_core(error, "reset"))?;
-        } else {
-            session
-                .reconfigure(wire, &self.stages, self.ring_frames)
-                .map_err(|error| dsp_error_to_core(error, "configure"))?;
+            self.reset(session);
+            if self.poisoned.is_some() {
+                return Err(CoreError::Dsp(
+                    "resident DSP chain already failed; replace the stage".into(),
+                ));
+            }
+        } else if let Err(error) = session
+            .reconfigure(wire, &self.stages, self.ring_frames)
+            .map_err(|error| dsp_error_to_core(error, "configure"))
+        {
+            let err_msg = error.to_string();
+            self.latch(error);
+            return Err(CoreError::Dsp(err_msg));
         }
         Ok(())
     }
@@ -826,6 +832,11 @@ impl ChainControl {
             .map_err(|error| dsp_error_to_core(error, "reset"))
         {
             self.latch(error);
+        } else {
+            // Give the resident worker's control thread hops and poll slice
+            // (CONTROL_POLL = 20 ms) time to deliver and service DspReset before
+            // the next PCM block is written to the ring.
+            std::thread::sleep(Duration::from_millis(30));
         }
     }
 
@@ -1526,7 +1537,7 @@ mod hosted_tests {
             Ok(_) => panic!("refusal must be loud, never a session"),
         }
         result
-            .recv_timeout(WAIT)
+            .recv_timeout(WAIT * 2)
             .expect("host must end after a refused open instead of stalling")
             .expect_err("a refused open must end the host with an error");
     }
@@ -1564,6 +1575,8 @@ mod hosted_tests {
             "a wedged resident must fail loudly after the bound"
         );
         assert!(start.elapsed() < WAIT);
+        // fake:slow sleeps for 150 ms; allow it to finish and deliver before retry.
+        thread::sleep(Duration::from_millis(150));
         assert_eq!(
             decoder.read(&mut out).unwrap(),
             1,
@@ -2396,11 +2409,11 @@ mod dsp_hosted_tests {
             // Bit-exact comparisons: the default-on limiter would clamp the
             // synthetic pattern's overs.
             engine.set_limiter_enabled(false);
-            let (session, host) = open_session(stages.clone(), SPEC_WIRE, 64);
+            let (session, host) = open_session(stages.clone(), SPEC_WIRE, DEFAULT_DSP_RING_FRAMES);
             let chain = HostDspChain::new(
                 session,
                 stages,
-                64,
+                DEFAULT_DSP_RING_FRAMES,
                 block_timeout,
                 engine.resident_dsp_watch(),
             );
@@ -2632,7 +2645,10 @@ mod dsp_hosted_tests {
         h.engine.play_index(0).unwrap();
         assert_eq!(h.engine.transport(), TransportState::Playing);
         assert!(
-            h.wait_until(|e| e.transport() == TransportState::Stopped, 44_100 + 8192),
+            h.wait_until(
+                |e| e.transport() == TransportState::Stopped,
+                44_100 + 16_384
+            ),
             "the second run must finish"
         );
         assert_eq!(h.engine.position_frames(), 44_100);

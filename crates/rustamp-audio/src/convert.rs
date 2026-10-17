@@ -450,8 +450,10 @@ impl FormatConverter {
         while consumed < in_frames {
             let take = (self.chunk - self.fifo_frames).min(in_frames - consumed);
             let at = self.fifo_frames * in_ch;
-            self.fifo[at..at + take * in_ch]
-                .copy_from_slice(&input[consumed * in_ch..(consumed + take) * in_ch]);
+            let in_slice = &input[consumed * in_ch..(consumed + take) * in_ch];
+            for (dst, &s) in self.fifo[at..at + take * in_ch].iter_mut().zip(in_slice) {
+                *dst = if s.is_finite() { s } else { 0.0 };
+            }
             self.fifo_frames += take;
             self.in_total += take as u64;
             consumed += take;

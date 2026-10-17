@@ -422,7 +422,8 @@ fn resident_track_plays_bit_exact_to_sticky_eos() {
         h.wait_until(|e| e.transport() == TransportState::Stopped, 3000 + 8192),
         "the run must finish"
     );
-    assert_eq!(h.engine.position_frames(), 3000);
+    // With duration quantized to 2999 frames (M15), position_frames() clamps to duration.
+    assert_eq!(h.engine.position_frames(), 2999);
     assert_eq!(h.engine.buffered_frames(), 0);
     let events = h.drain_events();
     assert!(events.contains(&Event::PlaylistEnded), "{events:?}");
