@@ -28,6 +28,10 @@
 //! smaller than the layout. The window keeps its pixel size across monitors
 //! (it looks smaller on a high-DPI screen); logical-size preservation, if
 //! wanted, belongs to the app layer or S05.
+//!
+//! Monitor discovery, per-monitor scale factors, display-change reporting
+//! and re-clamping a saved window position onto a visible monitor live in
+//! [`displays`].
 
 use std::sync::OnceLock;
 
