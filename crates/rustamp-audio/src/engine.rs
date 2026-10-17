@@ -64,11 +64,11 @@
 //! The limiter is placed last because it must see everything earlier stages
 //! (such as EQ boosts or installed DSP plugins) produced, acting as the stage
 //! closest to the output to catch any overs before the format converter and
-//! the ring buffer.
-//!
-//! The limiter defaults to **disabled**, operating as a bit-exact bypass so
-//! that an untouched player remains bit-transparent. Enabling it is a product
-//! decision (the reference player's behaviour with overs is unmeasured). Its
+//! The limiter defaults to **enabled** (owner decision, 2026-10-17). Enabling
+//! it by default is our own product choice (what the reference player does
+//! with overs is unmeasured) and it costs look-ahead latency
+//! ([`rustamp_dsp::LOOKAHEAD_SECONDS`], 5 ms). When disabled via
+//! [`Engine::set_limiter_enabled`], it operates as a bit-exact bypass. Its
 //! look-ahead ([`rustamp_dsp::LOOKAHEAD_SECONDS`], 5 ms) is reported through
 //! `DspStage::latency_frames` and handled by the decode thread the way the
 //! converter's is: the stage's start-up frames are dropped and its tail is
@@ -207,6 +207,8 @@ pub struct Engine {
     skipped: u64,
     last_track_frames: u64,
     error: Option<ErrorInfo>,
+    start_drain_epoch: Option<u64>,
+    start_stale_frames: u64,
 }
 
 impl Engine {
@@ -277,6 +279,8 @@ impl Engine {
             skipped: 0,
             last_track_frames: 0,
             error: None,
+            start_drain_epoch: None,
+            start_stale_frames: 0,
         })
     }
 
@@ -395,9 +399,31 @@ impl Engine {
     /// render callback. During an underrun the device clock may run ahead of
     /// `written`, but this value correctly stays at whatever is still in the
     /// ring — it never saturates a real backlog to zero.
+    ///
+    /// While stopped or before a start-of-run drain acknowledgement, if the
+    /// ring holds unconsumed frames from a previous run (A8), this reports
+    /// that backlog honestly rather than reporting zero.
     pub fn buffered_frames(&self) -> u64 {
+        if let Some(producer) = &self.producer {
+            let ch = usize::from(self.device.channels.max(1));
+            let unread = (producer.buffer().capacity() - producer.slots()) / ch;
+            if unread > 0 {
+                return unread as u64;
+            }
+        }
+        if let Some(epoch) = self.start_drain_epoch
+            && !self.sync.drained(epoch)
+            && self.start_stale_frames > 0
+        {
+            return self.start_stale_frames;
+        }
         let (written, consumed) = self.sync.counters();
         written.saturating_sub(consumed)
+    }
+
+    /// Whether a ring drain is pending acknowledgment by the render callback.
+    pub fn is_drain_pending(&self) -> bool {
+        self.sync.is_drain_pending()
     }
 
     /// The raw ring counters `(written, consumed)` in device frames, loaded
@@ -471,9 +497,10 @@ impl Engine {
 
     /// Whether the look-ahead brickwall limiter is enabled.
     ///
-    /// The limiter defaults to disabled, so an untouched player is bit-transparent.
-    /// Enabling it is a product decision (the reference player's behaviour with
-    /// overs is unmeasured) and costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`]).
+    /// The limiter defaults to enabled (owner decision, 2026-10-17). Enabling it
+    /// by default is our own product choice (what the reference player does with
+    /// overs is unmeasured) and it costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`], 5 ms).
+    /// When disabled, it operates as a bit-exact bypass.
     /// Because [`PlayerState`] has no field for the limiter (and changing the
     /// wire contract requires an RFC), the control remains engine-side.
     pub fn limiter_enabled(&self) -> bool {
@@ -482,9 +509,11 @@ impl Engine {
 
     /// Enable or disable the look-ahead brickwall limiter.
     ///
-    /// Enabling it is a product decision (the reference player's behaviour with
-    /// overs is unmeasured) and costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`]).
-    /// Takes effect at the stage's next track start or seek (prepare/reset).
+    /// The limiter defaults to enabled (owner decision, 2026-10-17). Enabling it
+    /// is an own product choice (what the reference player does with overs is
+    /// unmeasured) and costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`]).
+    /// Disabling it restores bit-exact bypass. Takes effect at the stage's next
+    /// track start or seek (prepare/reset).
     pub fn set_limiter_enabled(&mut self, enabled: bool) {
         self.limiter_control.set_enabled(enabled);
     }
@@ -634,6 +663,8 @@ impl Engine {
         self.end_of_stream = None;
         self.sync.set_written(0);
         self.sync.set_consumed(0);
+        self.start_drain_epoch = None;
+        self.start_stale_frames = 0;
         self.bus
             .publish(Event::StateChanged(TransportState::Stopped));
         self.bus.publish(Event::PositionChanged {
@@ -815,6 +846,12 @@ impl Engine {
                 self.finish_run();
             }
         }
+        if let Some(epoch) = self.start_drain_epoch
+            && self.sync.drained(epoch)
+        {
+            self.start_drain_epoch = None;
+            self.start_stale_frames = 0;
+        }
         self.publish_position(false);
         Ok(())
     }
@@ -905,6 +942,8 @@ impl Engine {
         // played during underruns, so we must NOT freeze at timeline_frames().
         let frozen_end = self.end_of_stream;
         self.end_of_stream = None;
+        self.start_drain_epoch = None;
+        self.start_stale_frames = 0;
         self.sync.set_active(false);
         let _ = self.output.pause();
         self.join_decode();
@@ -966,6 +1005,22 @@ impl Engine {
         // consumed <= written holds for the new run. The render callback will
         // update it as it reads from the ring.
         self.sync.set_consumed(0);
+        let stale_frames = if let Some(producer) = &self.producer {
+            let ch = usize::from(self.device.channels.max(1));
+            ((producer.buffer().capacity() - producer.slots()) / ch) as u64
+        } else {
+            0
+        };
+        let drain_epoch = if stale_frames > 0 {
+            let epoch = self.sync.request_epoch();
+            self.start_drain_epoch = Some(epoch);
+            self.start_stale_frames = stale_frames;
+            Some(epoch)
+        } else {
+            self.start_drain_epoch = None;
+            self.start_stale_frames = 0;
+            None
+        };
         let ring = self
             .producer
             .take()
@@ -981,6 +1036,7 @@ impl Engine {
             vis_enabled: self.cfg.vis_enabled,
             vis_capacity: self.cfg.vis_capacity,
             stop_after_current: self.stop_after_current,
+            drain_epoch,
         };
         // The equalizer runs first, on the decoded PCM (see the module docs).
         // A fresh stage per run starts from clean filter history; the shared
