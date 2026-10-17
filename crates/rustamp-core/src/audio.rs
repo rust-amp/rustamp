@@ -349,6 +349,28 @@ pub trait OutputDevice: Send {
     fn resume(&mut self) -> Result<()>;
 
     /// Drop everything buffered in the device (used on seek / stop).
+    ///
+    /// # What a backend must guarantee
+    ///
+    /// After a successful return, no frame that was already buffered can still
+    /// reach the speakers: the next frame heard belongs to whatever the engine
+    /// renders from then on.
+    ///
+    /// A backend that cannot do that portably - the cpal backend is the one we
+    /// have, because a shared endpoint buffer cannot be reset from here - must
+    /// **refuse** with [`Error::Unsupported`] rather than return `Ok` and let
+    /// stale audio play. A silent `Ok` is the one answer that is worse than a
+    /// failure, because the caller cannot tell the difference.
+    ///
+    /// # What a caller must assume
+    ///
+    /// The engine treats a refusal as terminal for the current output: it stops
+    /// the run and does not resume into an output it cannot clean, so the
+    /// caller (the application) has to recreate the engine and the output
+    /// before it can play again. There is no automatic recovery, and a
+    /// successful flush is not a promise that the hardware falls silent at that
+    /// instant - only that what was buffered will not be heard as the next
+    /// audio. (W10 finding F3, A13.)
     fn flush(&mut self) -> Result<()>;
 
     /// Current output latency (time between a frame being rendered and heard).
