@@ -3,12 +3,15 @@
 //! window, no audio. Run in the Hyper-V test VM, never on the host.
 //!
 //! Waiting rule (see the M10 flakiness note): PCM reads wait on the condition
-//! (`None`: data, a drained close or a terminal failure wakes them), never on
-//! a wall-clock bound. Only joining the host thread or a woken outcome uses a
-//! generous 30 s bound, which a healthy host reaches in milliseconds; the
-//! message on expiry names the stall. `DspSession::open` and `reconfigure`
-//! inherit the framework's 5 s `CONTROL_WAIT` for a single handshake
-//! exchange.
+//! (data, a drained close or a terminal failure wakes them), never on a
+//! wall-clock bound that a healthy-but-slow schedule could trip. Every such
+//! wait still carries a generous stall escape (`STALL_WAIT`): only a wedged
+//! or dead host reaches it, and reaching it fails loudly with the step named
+//! — a stall is never reported as success. Only joining the host thread or a
+//! woken outcome uses the same generous bound (`JOIN_WAIT`), which a healthy
+//! host reaches in milliseconds; the message on expiry names the stall.
+//! `DspSession::open` and `reconfigure` inherit the framework's 5 s
+//! `CONTROL_WAIT` for a single handshake exchange.
 
 #![cfg(windows)]
 
@@ -27,6 +30,10 @@ use rustamp_mediahost::{MediaHostError, Result};
 use rustamp_proto::host::{DspStageDesc, PcmSpecWire};
 
 const JOIN_WAIT: Duration = Duration::from_secs(30);
+/// Stall bound for every PCM read (see the file docs): generous enough that
+/// only a real stall reaches it, and a timeout is a loud failure that names
+/// the step, never a pass.
+const STALL_WAIT: Duration = Duration::from_secs(30);
 const SPEC: PcmSpecWire = PcmSpecWire {
     sample_rate_hz: 44_100,
     channels: 2,
@@ -129,6 +136,11 @@ fn start(
 }
 
 fn write_sweep(session: &mut DspSession<NamedPcmRings>, frames: usize) {
+    // `DspSession::write` takes no timeout (its ring write is infinite by
+    // design), so this wait cannot be bounded from the test surface; the
+    // bounded-write variant is named as a src fix in
+    // docs/tasks/M18-hang-hunt.md (`rustamp-mediahost/src/dsp.rs`,
+    // `DspSession::write`).
     let mut block = Vec::with_capacity(257 * 2);
     let mut written = 0;
     while written < frames {
@@ -145,11 +157,31 @@ fn read_all(session: &mut DspSession<NamedPcmRings>, frames: usize) -> Vec<f32> 
     let mut received = Vec::with_capacity(frames * 2);
     let mut out = [0.0; 514];
     while received.len() < frames * 2 {
-        let count = session.read(&mut out, None).unwrap();
+        // Stall escape (see the file docs): a healthy host delivers within
+        // milliseconds; a timeout means it stopped answering without closing
+        // the ring, and that fails loudly instead of hanging the test.
+        let count = match session.read(&mut out, Some(STALL_WAIT)) {
+            Err(MediaHostError::TimedOut) => panic!(
+                "stall: the round trip received no PCM within {STALL_WAIT:?} \
+                 (the resident stopped delivering without a close or an error)"
+            ),
+            other => other.unwrap(),
+        };
         assert!(count > 0, "host must not end the stream early");
         received.extend_from_slice(&out[..count * 2]);
     }
     received
+}
+
+/// Sticky-EOS read with the same stall escape (see the file docs).
+fn read_sticky(session: &mut DspSession<NamedPcmRings>, out: &mut [f32], step: &str) -> usize {
+    match session.read(out, Some(STALL_WAIT)) {
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: {step} received no drained close within {STALL_WAIT:?} \
+             (the resident stopped answering without closing the ring)"
+        ),
+        other => other.unwrap(),
+    }
 }
 
 #[test]
@@ -169,8 +201,14 @@ fn passthrough_round_trip_is_bit_exact_and_eos_is_sticky() {
     assert_eq!(session.frames_dropped(), 0);
     // Sticky end of stream only after the drain.
     let mut out = [0.0; 2];
-    assert_eq!(session.read(&mut out, None).unwrap(), 0);
-    assert_eq!(session.read(&mut out, None).unwrap(), 0);
+    assert_eq!(
+        read_sticky(&mut session, &mut out, "the first sticky EOS read"),
+        0
+    );
+    assert_eq!(
+        read_sticky(&mut session, &mut out, "the second sticky EOS read"),
+        0
+    );
     drop(session);
     done.recv_timeout(JOIN_WAIT)
         .expect("graceful Shutdown must end the host")
@@ -191,7 +229,10 @@ fn gain_chain_changes_audio_measurably() {
     }
     assert_eq!(session.frames_dropped(), 0);
     let mut out = [0.0; 2];
-    assert_eq!(session.read(&mut out, None).unwrap(), 0);
+    assert_eq!(
+        read_sticky(&mut session, &mut out, "the sticky EOS read"),
+        0
+    );
     drop(session);
     done.recv_timeout(JOIN_WAIT)
         .expect("graceful Shutdown must end the host")
@@ -320,7 +361,10 @@ fn reconfigure_reoffers_both_rings_with_new_sound() {
         assert_eq!(*sample, sign * frame as f32 / 16.0, "frame {frame}");
     }
     let mut out = [0.0; 2];
-    assert_eq!(session.read(&mut out, None).unwrap(), 0);
+    assert_eq!(
+        read_sticky(&mut session, &mut out, "the sticky EOS read"),
+        0
+    );
     drop(session);
     done.recv_timeout(JOIN_WAIT)
         .expect("graceful Shutdown must end the host")
@@ -360,16 +404,27 @@ fn abrupt_player_loss_stops_the_host_without_hanging() {
         let outcome = serve_dsp(&host, &NamedPcmRings, &StageResident);
         let _ = done.send(outcome);
     });
-    assert_eq!(
-        player.recv().unwrap(),
-        Message::RingReady {
-            kind: rustamp_ipc::shm::RingKind::Pcm,
-            generation: in_generation,
+    // The host's ControlPeer queues its own Hello first; consume it (and
+    // answer pings) before the handshake replies, exactly like the decoder
+    // mirror in rustamp-mediahost's pcm_transfer suite.
+    let mut saw_in_ready = false;
+    let back = loop {
+        match player.recv().unwrap() {
+            Message::Hello { .. } => {}
+            Message::Ping(token) => player.send(&Message::Pong(token)).unwrap(),
+            Message::RingReady {
+                kind: rustamp_ipc::shm::RingKind::Pcm,
+                generation,
+            } => {
+                assert_eq!(generation, in_generation, "in-ring ready generation");
+                saw_in_ready = true;
+            }
+            offer @ Message::RingOffer { .. } => {
+                assert!(saw_in_ready, "back-ring offer before the in-ring was ready");
+                break offer;
+            }
+            message => panic!("unexpected handshake message: {message:?}"),
         }
-    );
-    let back = match player.recv().unwrap() {
-        offer @ Message::RingOffer { .. } => offer,
-        message => panic!("expected back-ring offer, got {message:?}"),
     };
     let mut back_input = NamedPcmRings
         .open_directed(&back, SPEC, RingDirection::HostToMain)
@@ -380,7 +435,13 @@ fn abrupt_player_loss_stops_the_host_without_hanging() {
             generation: back_input.consumer.generation(),
         })
         .unwrap();
-    assert!(matches!(player.recv().unwrap(), Message::DspReady { .. }));
+    loop {
+        match player.recv().unwrap() {
+            Message::Ping(token) => player.send(&Message::Pong(token)).unwrap(),
+            Message::DspReady { .. } => break,
+            message => panic!("unexpected post-handshake message: {message:?}"),
+        }
+    }
     let mut producer = offer.producer;
     producer
         .write_from_blocking(&sweep(0), Some(Duration::from_secs(5)))
@@ -452,7 +513,16 @@ fn abrupt_host_loss_is_loud_and_never_eos() {
     let mut session = DspSession::open(peer, NamedPcmRings, SPEC, &[gain(1.0)], 1).unwrap();
     session.write(&[0.25, -0.25]).unwrap();
     let mut out = [0.0; 2];
-    assert_eq!(session.read(&mut out, None).unwrap(), 1);
+    // Stall escape (see the file docs) on the first read: the fake host
+    // publishes its block before DspReady, so a timeout is a stall, not a
+    // slow schedule.
+    let first = match session.read(&mut out, Some(STALL_WAIT)) {
+        Err(MediaHostError::TimedOut) => {
+            panic!("stall: the fake host's first block never arrived within {STALL_WAIT:?}")
+        }
+        other => other.unwrap(),
+    };
+    assert_eq!(first, 1);
     assert_eq!(out, [0.5, -0.5]);
     die.send(()).unwrap();
     let (done, result) = mpsc::channel();

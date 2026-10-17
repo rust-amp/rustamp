@@ -17,6 +17,11 @@ const SPEC: PcmSpecWire = PcmSpecWire {
     channels: 2,
 };
 
+/// Stall bound for the functional PCM read: the fixture delivers within
+/// milliseconds, so a timeout means the helper stopped answering without a
+/// terminal signal — a stall that fails loudly, never a pass.
+const STALL_WAIT: Duration = Duration::from_secs(30);
+
 fn fixture() -> PathBuf {
     PathBuf::from(
         std::env::var_os("RUSTAMP_DSP_FIXTURE")
@@ -52,7 +57,15 @@ fn named_dsp_two_process_gain_round_trip_then_sticky_eos() {
     let mut received = Vec::new();
     let mut out = [0.0; 22];
     loop {
-        let frames = child.session().read(&mut out, None).unwrap();
+        // Stall escape (see STALL_WAIT): a timeout is a loud failure that
+        // names the step, never a pass.
+        let frames = match child.session().read(&mut out, Some(STALL_WAIT)) {
+            Err(MediaHostError::TimedOut) => panic!(
+                "stall: the fixture delivered no PCM within {STALL_WAIT:?} \
+                 (it stopped answering without a close or an error)"
+            ),
+            other => other.unwrap(),
+        };
         if frames == 0 {
             break;
         }
@@ -65,7 +78,14 @@ fn named_dsp_two_process_gain_round_trip_then_sticky_eos() {
         assert_eq!(*sample, sign * frame as f32 / 4.0);
     }
     assert_eq!(child.session().frames_dropped(), 0);
-    assert_eq!(child.session().read(&mut out, None).unwrap(), 0);
+    assert_eq!(
+        match child.session().read(&mut out, Some(STALL_WAIT)) {
+            Err(MediaHostError::TimedOut) =>
+                panic!("stall: the sticky EOS read never drained within {STALL_WAIT:?}"),
+            other => other.unwrap(),
+        },
+        0
+    );
 }
 
 #[test]

@@ -3,11 +3,14 @@
 //! Run in the Hyper-V test VM, never on the host.
 //!
 //! Waiting rule (see the M10 flakiness note): PCM reads wait on the condition
-//! (`None`: data, EOS or a terminal failure wakes them), never on a
-//! wall-clock bound. Only joining the host thread uses a generous 30 s bound,
-//! which a healthy host reaches in milliseconds; the message on expiry names
-//! the stall. `DecoderSession::open` and `seek` inherit the framework's 5 s
-//! `CONTROL_WAIT` for a single handshake exchange.
+//! (data, EOS or a terminal failure wakes them), never on a wall-clock bound
+//! that a healthy-but-slow schedule could trip. Every such wait still carries
+//! a generous stall escape (`STALL_WAIT`): only a wedged or dead resident
+//! reaches it, and reaching it fails loudly with the step named — a stall is
+//! never reported as success. Only joining the host thread uses the same
+//! generous bound (`JOIN_WAIT`), which a healthy host reaches in milliseconds;
+//! the message on expiry names the stall. `DecoderSession::open` and `seek`
+//! inherit the framework's 5 s `CONTROL_WAIT` for a single handshake exchange.
 
 #![cfg(windows)]
 
@@ -28,6 +31,10 @@ use rustamp_proto::host::MediaLocationWire;
 
 const JOIN_WAIT: Duration = Duration::from_secs(30);
 const SEEK_WAIT: Duration = Duration::from_secs(30);
+/// Stall bound for every PCM read (see the file docs): generous enough that
+/// only a real stall reaches it, and a timeout is a loud failure that names
+/// the step, never a pass.
+const STALL_WAIT: Duration = Duration::from_secs(30);
 
 fn repo_fixture(name: &str) -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -125,6 +132,23 @@ fn finish_ok(session: DecoderSession<NamedPcmRings>, done: mpsc::Receiver<Result
         .unwrap();
 }
 
+/// Read PCM with a stall escape (see the file docs): a healthy resident
+/// delivers within milliseconds, so a timeout means it stopped answering
+/// without EOS or an error — a stall that fails loudly, never a pass.
+fn read_pcm(
+    session: &mut DecoderSession<NamedPcmRings>,
+    buf: &mut [f32],
+    step: &str,
+) -> Result<usize> {
+    match session.read(buf, Some(STALL_WAIT)) {
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: {step} received no PCM within {STALL_WAIT:?} \
+             (the resident stopped delivering without EOS or an error)"
+        ),
+        other => other,
+    }
+}
+
 /// Decode the same file in-process for the bit-exact comparison.
 fn direct_decode(path: &Path) -> Vec<f32> {
     let mut decoder = rustamp_decoders::default_registry()
@@ -195,7 +219,7 @@ fn real_file_opens_with_format_handshake_and_decodes_bit_exact() {
     let mut received = Vec::new();
     let mut buf = [0.0f32; 2048];
     loop {
-        match session.read(&mut buf, None).unwrap() {
+        match read_pcm(&mut session, &mut buf, "the full-file transfer").unwrap() {
             0 => break,
             frames => received.extend_from_slice(&buf[..frames * 2]),
         }
@@ -209,7 +233,10 @@ fn real_file_opens_with_format_handshake_and_decodes_bit_exact() {
     );
     assert_eq!(session.frames_dropped(), 0);
     // EOS is sticky: a second read stays at zero.
-    assert_eq!(session.read(&mut buf, None).unwrap(), 0);
+    assert_eq!(
+        read_pcm(&mut session, &mut buf, "the sticky EOS read").unwrap(),
+        0
+    );
     finish_ok(session, done);
 }
 
@@ -221,7 +248,7 @@ fn end_of_stream_comes_only_after_the_ring_is_drained() {
     let mut received = Vec::new();
     let mut buf = [0.0f32; 64];
     loop {
-        match session.read(&mut buf, None).unwrap() {
+        match read_pcm(&mut session, &mut buf, "the drained transfer").unwrap() {
             0 => break,
             frames => received.extend_from_slice(&buf[..frames * 2]),
         }
@@ -235,7 +262,10 @@ fn end_of_stream_comes_only_after_the_ring_is_drained() {
         expected.len(),
         "no frame may be cut before EOS and none invented after it"
     );
-    assert_eq!(session.read(&mut buf, None).unwrap(), 0);
+    assert_eq!(
+        read_pcm(&mut session, &mut buf, "the sticky EOS read").unwrap(),
+        0
+    );
     finish_ok(session, done);
 }
 
@@ -250,7 +280,7 @@ fn seek_past_the_end_clamps_and_terminates() {
     );
     let mut buf = [0.0f32; 64];
     assert_eq!(
-        session.read(&mut buf, None).unwrap(),
+        read_pcm(&mut session, &mut buf, "the clamped-seek termination read").unwrap(),
         0,
         "a clamped seek to the end must terminate, not hang"
     );
@@ -269,7 +299,7 @@ fn seek_inside_matches_direct_decode() {
     // the direct decode produces in a single call.
     let mut got: Vec<f32> = Vec::new();
     while got.len() < 200 {
-        let frames = session.read(&mut buf, None).unwrap();
+        let frames = read_pcm(&mut session, &mut buf, "the post-seek read").unwrap();
         assert!(
             frames > 0,
             "a seek inside the file must keep yielding audio"
@@ -344,7 +374,9 @@ fn truncated_wav_preserves_backend_short_eos_not_an_integrity_guarantee() {
     let mut received = Vec::new();
     let mut buf = [0.0f32; 128];
     loop {
-        match session.read(&mut buf, None).expect("backend short EOS") {
+        match read_pcm(&mut session, &mut buf, "the truncated-file transfer")
+            .expect("backend short EOS")
+        {
             0 => break,
             frames => received.extend_from_slice(&buf[..frames]),
         }
@@ -359,7 +391,10 @@ fn truncated_wav_preserves_backend_short_eos_not_an_integrity_guarantee() {
             .map(|sample| sample.to_bits())
             .collect::<Vec<_>>()
     );
-    assert_eq!(session.read(&mut buf, None).unwrap(), 0);
+    assert_eq!(
+        read_pcm(&mut session, &mut buf, "the sticky EOS read").unwrap(),
+        0
+    );
     assert_eq!(session.frames_dropped(), 0);
     finish_ok(session, done);
     let _ = std::fs::remove_file(&path);
@@ -370,7 +405,10 @@ fn dropping_the_player_stops_the_host_cleanly() {
     let path = repo_fixture("sine.flac");
     let (mut session, done) = start(file_location(&path), 3);
     let mut buf = [0.0f32; 2];
-    assert_eq!(session.read(&mut buf, None).unwrap(), 1);
+    assert_eq!(
+        read_pcm(&mut session, &mut buf, "the first frame").unwrap(),
+        1
+    );
     // Player vanish modelled as session drop: the framework closes the ring
     // and delivers Shutdown, which must end the host rather than hang it.
     drop(session);

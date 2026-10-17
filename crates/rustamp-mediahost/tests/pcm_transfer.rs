@@ -24,6 +24,11 @@ use rustamp_mediahost::{MediaHostError, Result};
 use rustamp_proto::host::{MediaLocationWire, PcmSpecWire};
 
 const WAIT: Duration = Duration::from_secs(5);
+/// Stall bound for every wait that waits on the host worker: the M10
+/// flakiness note's sanctioned form — a bound so generous that only a real
+/// stall reaches it, with the message saying which. A timeout is always a
+/// loud failure that names the step, never a pass.
+const STALL_WAIT: Duration = Duration::from_secs(30);
 
 struct ByteReader {
     rx: mpsc::Receiver<Vec<u8>>,
@@ -203,7 +208,9 @@ impl ResidentDecoder for GatedDecoder {
 
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         if let Some(release) = self.release.take() {
-            release.recv().expect("test releases the first decode");
+            release
+                .recv_timeout(STALL_WAIT)
+                .expect("stall: the test never released the gated decode");
         }
         self.inner.read(out)
     }
@@ -215,9 +222,22 @@ impl ResidentDecoder for GatedDecoder {
 
 fn finish(session: DecoderSession<TestRings>, done: mpsc::Receiver<Result<()>>) {
     drop(session);
-    done.recv()
-        .expect("host worker must publish its shutdown outcome")
+    done.recv_timeout(STALL_WAIT)
+        .expect("stall: the host worker must publish its shutdown outcome instead of hanging")
         .unwrap();
+}
+
+/// Read PCM with a stall escape. A healthy host delivers within
+/// milliseconds, so a timeout means it stopped answering without EOS or an
+/// error; that is a stall and fails loudly, never a pass.
+fn read_pcm(session: &mut DecoderSession<TestRings>, out: &mut [f32], step: &str) -> Result<usize> {
+    match session.read(out, Some(STALL_WAIT)) {
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: {step} received no PCM within {STALL_WAIT:?} \
+             (the resident stopped delivering without EOS or an error)"
+        ),
+        other => other,
+    }
 }
 
 #[test]
@@ -226,7 +246,7 @@ fn stub_transfer_short_ring_is_exact_lossless_and_eos_is_drained() {
     let mut received = Vec::new();
     let mut out = [0.0; 22];
     loop {
-        let frames = session.read(&mut out, None).unwrap();
+        let frames = read_pcm(&mut session, &mut out, "the stub transfer").unwrap();
         if frames == 0 {
             break;
         }
@@ -241,7 +261,10 @@ fn stub_transfer_short_ring_is_exact_lossless_and_eos_is_drained() {
     );
     assert_eq!(session.frames_dropped(), 0);
     assert_eq!(session.stats(), (7, Some(128)));
-    assert_eq!(session.read(&mut out, None).unwrap(), 0);
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the sticky EOS read").unwrap(),
+        0
+    );
     finish(session, done);
 }
 
@@ -253,7 +276,7 @@ fn format_change_drains_old_pcm_before_new_channel_count() {
     let mut out = [0.0; 14];
     loop {
         let channels = usize::from(session.info().spec.channels);
-        match session.read(&mut out, None) {
+        match read_pcm(&mut session, &mut out, "the format-change drain") {
             Ok(0) => break,
             Ok(frames) => {
                 for samples in out[..frames * channels].chunks_exact(channels) {
@@ -284,7 +307,10 @@ fn seek_interrupts_full_ring_and_discards_prefetch() {
     let (mut session, done, rings) = start("fixture:plain", 1);
     assert_eq!(session.seek(29, WAIT).unwrap(), 29);
     let mut out = [0.0; 2];
-    assert_eq!(session.read(&mut out, None).unwrap(), 1);
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the post-seek read").unwrap(),
+        1
+    );
     assert_eq!(out, [29.0 / 8.0, -29.0 / 8.0]);
     assert_eq!(rings.0.lock().unwrap().len(), 2);
     finish(session, done);
@@ -301,7 +327,15 @@ fn bounded_read_timeout_is_not_eos_and_retry_delivers_pcm() {
         Err(MediaHostError::TimedOut)
     ));
     release.send(()).unwrap();
-    assert_eq!(session.read(&mut out, None).unwrap(), 1);
+    assert_eq!(
+        read_pcm(
+            &mut session,
+            &mut out,
+            "the retry after the bounded timeout"
+        )
+        .unwrap(),
+        1
+    );
     finish(session, done);
 }
 
@@ -310,7 +344,7 @@ fn decoder_error_is_loud_and_never_eos() {
     let (mut session, done, _) = start("fixture:fail", 3);
     let mut out = [0.0; 14];
     loop {
-        match session.read(&mut out, None) {
+        match read_pcm(&mut session, &mut out, "the failing decode") {
             Ok(0) => panic!("failure must not turn into EOS"),
             Ok(_) => {}
             Err(error) => {
@@ -323,7 +357,11 @@ fn decoder_error_is_loud_and_never_eos() {
         }
     }
     drop(session);
-    assert!(done.recv().unwrap().is_err());
+    assert!(
+        done.recv_timeout(STALL_WAIT)
+            .expect("stall: the failing host must publish its outcome instead of hanging")
+            .is_err()
+    );
 }
 
 #[test]
@@ -366,13 +404,16 @@ fn abrupt_player_loss_wakes_a_full_ring_decoder_writer() {
     };
     // Wait on publication, not a sleep: with no consumer, capacity one leaves
     // the decoder's remaining block waiting for space forever.
-    input.consumer.wait_readable(None).unwrap();
+    input
+        .consumer
+        .wait_readable(Some(STALL_WAIT))
+        .expect("stall: the decoder never published into the full ring");
     assert_eq!(input.consumer.frames_available(), 1);
     assert!(!input.consumer.is_closed());
     drop(player);
     let outcome = result
-        .recv()
-        .expect("host must publish its terminal outcome");
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the host must publish its terminal outcome instead of hanging");
     assert!(matches!(outcome, Err(MediaHostError::Disconnected(_))));
     assert!(input.consumer.is_closed(), "EOF must abort the full ring");
 }
@@ -415,9 +456,11 @@ fn abrupt_control_loss_wakes_infinite_pcm_wait_without_eos() {
                 Message::RingReady { .. } => {
                     let mut ring = offer.take().unwrap();
                     ring.producer
-                        .write_from_blocking(&[0.25, -0.25], None)
+                        .write_from_blocking(&[0.25, -0.25], Some(STALL_WAIT))
                         .unwrap();
-                    death.recv().unwrap();
+                    death
+                        .recv_timeout(STALL_WAIT)
+                        .expect("stall: the test never released the fake host");
                     // RingProducer::Drop does NOT close the ring.
                     break;
                 }
@@ -428,7 +471,10 @@ fn abrupt_control_loss_wakes_infinite_pcm_wait_without_eos() {
     let mut session =
         DecoderSession::open(peer, rings, MediaLocationWire::Url("fake".into()), 1).unwrap();
     let mut out = [0.0; 2];
-    assert_eq!(session.read(&mut out, None).unwrap(), 1);
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the fake host's first block").unwrap(),
+        1
+    );
     die.send(()).unwrap();
     let (done, result) = mpsc::channel();
     thread::spawn(move || {

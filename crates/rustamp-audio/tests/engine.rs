@@ -2311,8 +2311,16 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
 
     // 1. Play track 1
     engine.play_index(0).unwrap();
+    // Every wait in this test is a bounded condition (the file's Harness
+    // helpers use the same 5 s deadline): a condition that never becomes
+    // true must fail loudly with the step named, never spin forever.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while engine.current_index() != Some(0) || engine.duration_frames().is_none() {
         engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stall: track 1 never opened"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // Pull 256 frames of track 1 audio through hardware
@@ -2344,13 +2352,23 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
 
     // 3. Play track 2
     engine.play_index(1).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while engine.current_index() != Some(1) || engine.duration_frames().is_none() {
         engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stall: track 2 never opened"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // Wait for decode thread to refill the ring
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while engine.buffered_frames() < 1024 {
         engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stall: the ring never refilled after the restart"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // A8: the new run starts by draining what the stopped run left in the ring,
@@ -2379,8 +2397,13 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
         "the stopped run left audio in the ring, so a start drain was due"
     );
     // Only now does the new run's own audio reach the device.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while engine.buffered_frames() < 256 {
         engine.poll().unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stall: the decode thread wrote nothing after the start drain"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // Pull audio of track 2 from the device

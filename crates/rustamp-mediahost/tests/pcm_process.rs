@@ -12,6 +12,11 @@ use rustamp_mediahost::control::Liveness;
 use rustamp_mediahost::decoder::DecoderProcess;
 use rustamp_proto::host::MediaLocationWire;
 
+/// Stall bound for the functional PCM read: the fixture delivers within
+/// milliseconds, so a timeout means the helper stopped answering without a
+/// terminal signal — a stall that fails loudly, never a pass.
+const STALL_WAIT: Duration = Duration::from_secs(30);
+
 fn fixture() -> PathBuf {
     PathBuf::from(
         std::env::var_os("RUSTAMP_DECODER_FIXTURE")
@@ -37,7 +42,15 @@ fn named_pcm_two_process_transfer_and_seek() {
     let mut frame = 29;
     let mut out = [0.0; 22];
     loop {
-        let count = child.session().read(&mut out, None).unwrap();
+        // Stall escape (see STALL_WAIT): a timeout is a loud failure that
+        // names the step, never a pass.
+        let count = match child.session().read(&mut out, Some(STALL_WAIT)) {
+            Err(MediaHostError::TimedOut) => panic!(
+                "stall: the fixture delivered no PCM within {STALL_WAIT:?} \
+                 (it stopped answering without EOS or an error)"
+            ),
+            other => other.unwrap(),
+        };
         if count == 0 {
             break;
         }

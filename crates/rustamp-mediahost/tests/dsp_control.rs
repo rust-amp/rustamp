@@ -1,6 +1,10 @@
 //! Headless one-process control regressions; execute in the Hyper-V VM only.
-//! All functional waits are conditions. Only the explicit timeout test requests
-//! a PCM deadline; no wall-clock assertion decides whether work completed.
+//! All functional waits are conditions with a generous stall escape
+//! (`STALL_WAIT`): a healthy host answers within milliseconds, so only a
+//! wedged or dead host reaches the bound, and reaching it fails loudly with
+//! the step named — never a pass. Only the explicit timeout test requests a
+//! short PCM deadline; no wall-clock assertion decides whether work
+//! completed.
 
 #![cfg(windows)]
 
@@ -24,6 +28,11 @@ const SPEC: PcmSpecWire = PcmSpecWire {
     channels: 2,
 };
 
+/// Stall bound for every wait that waits on the host worker (see the file
+/// docs): generous enough that only a real stall reaches it, and a timeout is
+/// a loud failure that names the step, never a pass.
+const STALL_WAIT: Duration = Duration::from_secs(30);
+
 fn start(
     resident: impl DspResident + Send + 'static,
 ) -> (DspSession<NamedPcmRings>, mpsc::Receiver<Result<()>>) {
@@ -40,9 +49,20 @@ fn start(
 
 fn finish(session: DspSession<NamedPcmRings>, done: mpsc::Receiver<Result<()>>) {
     drop(session);
-    done.recv()
-        .expect("host must publish its shutdown outcome")
+    done.recv_timeout(STALL_WAIT)
+        .expect("stall: the host must publish its shutdown outcome instead of hanging")
         .unwrap();
+}
+
+/// Read PCM with a stall escape (see the file docs).
+fn read_pcm(session: &mut DspSession<NamedPcmRings>, out: &mut [f32], step: &str) -> Result<usize> {
+    match session.read(out, Some(STALL_WAIT)) {
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: {step} received no PCM within {STALL_WAIT:?} \
+             (the resident stopped delivering without a close or an error)"
+        ),
+        other => other,
+    }
 }
 
 struct StatefulResident {
@@ -85,7 +105,9 @@ impl ResidentChain for StatefulChain {
         self.count += 1;
         self.resets.send(self.count).unwrap();
         if let Some(release) = self.release_first.take() {
-            release.recv().expect("test releases the first reset");
+            release
+                .recv_timeout(STALL_WAIT)
+                .expect("stall: the test never released the first reset");
         }
     }
 }
@@ -100,22 +122,48 @@ fn idle_reset_lands_without_pcm_and_clears_history_before_the_next_block() {
     });
     let generations = session.generations();
     session.reset().unwrap();
-    assert_eq!(observed.recv().unwrap(), 1);
+    assert_eq!(
+        observed
+            .recv_timeout(STALL_WAIT)
+            .expect("stall: the host did not service the first reset instead of hanging"),
+        1
+    );
     // A second reset is queued while the first callback is held. The old
     // one-command-then-infinite-read loop could never service it without PCM.
     session.reset().unwrap();
     release.send(()).unwrap();
-    assert_eq!(observed.recv().unwrap(), 2);
+    assert_eq!(
+        observed
+            .recv_timeout(STALL_WAIT)
+            .expect("stall: the host did not service the second reset instead of hanging"),
+        2
+    );
     assert_eq!(session.generations(), generations);
 
     let mut out = [0.0; 2];
     session.write(&[0.25, -0.25]).unwrap();
-    assert_eq!(session.read(&mut out, None).unwrap(), 1);
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the block after the idle resets").unwrap(),
+        1
+    );
     assert_eq!(out, [0.25, -0.25]);
     session.reset().unwrap();
-    assert_eq!(observed.recv().unwrap(), 3);
+    assert_eq!(
+        observed
+            .recv_timeout(STALL_WAIT)
+            .expect("stall: the host did not service the mid-stream reset instead of hanging"),
+        3
+    );
     session.write(&[0.5, -0.5]).unwrap();
-    assert_eq!(session.read(&mut out, None).unwrap(), 1);
+    assert_eq!(
+        read_pcm(
+            &mut session,
+            &mut out,
+            "the block after the mid-stream reset"
+        )
+        .unwrap(),
+        1
+    );
     assert_eq!(
         out,
         [0.5, -0.5],
@@ -123,15 +171,23 @@ fn idle_reset_lands_without_pcm_and_clears_history_before_the_next_block() {
     );
 
     session.finish_writes().unwrap();
-    assert_eq!(session.read(&mut out, None).unwrap(), 0);
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the drained EOS read").unwrap(),
+        0
+    );
     session.reset().unwrap();
     assert_eq!(
-        observed.recv().unwrap(),
+        observed
+            .recv_timeout(STALL_WAIT)
+            .expect("stall: the host did not service the post-EOS reset instead of hanging"),
         4,
         "reset also lands after drained EOS"
     );
     assert_eq!(session.generations(), generations);
-    assert_eq!(session.read(&mut out, None).unwrap(), 0);
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the sticky EOS read").unwrap(),
+        0
+    );
     finish(session, done);
 }
 
@@ -146,10 +202,24 @@ fn bounded_dsp_read_timeout_is_not_eos_and_retry_delivers_pcm() {
         Err(MediaHostError::TimedOut)
     ));
     session.write(&[0.25, -0.5]).unwrap();
-    assert_eq!(session.read(&mut out, None).unwrap(), 1);
+    assert_eq!(
+        read_pcm(
+            &mut session,
+            &mut out,
+            "the retry after the bounded timeout"
+        )
+        .unwrap(),
+        1
+    );
     assert_eq!(out, [0.25, -0.5]);
     session.finish_writes().unwrap();
-    assert_eq!(session.read(&mut out, None).unwrap(), 0);
-    assert_eq!(session.read(&mut out, None).unwrap(), 0);
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the drained EOS read").unwrap(),
+        0
+    );
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the sticky EOS read").unwrap(),
+        0
+    );
     finish(session, done);
 }
