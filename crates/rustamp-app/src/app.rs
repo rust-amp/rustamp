@@ -501,6 +501,9 @@ impl App {
                 self.repeat = *repeat;
             }
             Event::PlaylistEnded => self.playlist_ended = true,
+            Event::EqChanged(eq) => {
+                self.eq.sync_from_eq_state(eq);
+            }
             _ => {}
         }
 
@@ -936,6 +939,13 @@ impl App {
         }
     }
 
+    /// Synchronizes the equalizer window machine's state from the authoritative
+    /// engine equalizer state.
+    fn sync_eq_from_engine(&mut self) {
+        let eq = self.engine.eq();
+        self.eq.sync_from_eq_state(&eq);
+    }
+
     fn publish_error(&self, error: &Error) {
         self.bus.publish(Event::Error(ErrorInfo::from(error)));
     }
@@ -1016,9 +1026,11 @@ impl App {
             }
             C::AddItems { items, at, play } => self.add_items(items, *at, *play),
             C::SetBand { .. } | C::SetPreamp(_) | C::SetEqEnabled(_) | C::SetEqAuto(_) => {
-                // The window shows its own prediction; the signal side is the
-                // engine's equalizer stage, which receives the same command
-                // (every command is forwarded to `Engine::apply`).
+                // S07/Wave 35: The engine owns the authoritative EqState.
+                // The equalizer window machine is driven directly from it so that
+                // on-screen sliders and lights stay strictly synchronized after any
+                // EQ command (external, shortcut, or UI round-trip).
+                self.sync_eq_from_engine();
             }
             C::Remove(_)
             | C::Clear
@@ -1715,9 +1727,170 @@ mod tests {
         let eq = app.host_player_state().eq;
         assert!(eq.enabled);
         assert_eq!(eq.bands[4], 6.0);
+        assert!(app.eq_state().enabled);
+        assert_eq!(
+            app.eq_state().bands[4],
+            rustamp_core::state::eq_classic_from_db(6.0) as u8
+        );
         let notes = app.drain_notes();
         assert!(!notes.iter().any(|n| n.contains("equalizer")), "{notes:?}");
         assert!(!app.quit());
+    }
+
+    #[test]
+    fn eq_command_applied_from_outside_updates_window_state() {
+        let (mut app, _dir) = app_with_file(None);
+
+        // SetEqEnabled external command updates window state.
+        app.submit(Command::SetEqEnabled(false)).unwrap();
+        assert!(!app.eq_state().enabled);
+        assert!(!app.engine().eq().enabled);
+
+        app.submit(Command::SetEqEnabled(true)).unwrap();
+        assert!(app.eq_state().enabled);
+        assert!(app.engine().eq().enabled);
+
+        // SetEqAuto external command updates window state.
+        app.submit(Command::SetEqAuto(true)).unwrap();
+        assert!(app.eq_state().auto);
+        assert!(app.engine().eq().auto);
+
+        app.submit(Command::SetEqAuto(false)).unwrap();
+        assert!(!app.eq_state().auto);
+        assert!(!app.engine().eq().auto);
+
+        // SetPreamp external command updates window state.
+        app.submit(Command::SetPreamp(4.5)).unwrap();
+        assert_eq!(
+            app.eq_state().preamp,
+            rustamp_core::state::eq_classic_from_db(4.5) as u8
+        );
+        assert_eq!(app.engine().eq().preamp, 4.5);
+
+        // SetBand external command updates window state.
+        app.submit(Command::SetBand {
+            band: 2,
+            gain_db: -8.0,
+        })
+        .unwrap();
+        assert_eq!(
+            app.eq_state().bands[2],
+            rustamp_core::state::eq_classic_from_db(-8.0) as u8
+        );
+        assert_eq!(app.engine().eq().bands[2], -8.0);
+
+        // Direct external apply() also synchronizes the window.
+        app.apply(&Command::SetBand {
+            band: 5,
+            gain_db: 3.5,
+        });
+        assert_eq!(
+            app.eq_state().bands[5],
+            rustamp_core::state::eq_classic_from_db(3.5) as u8
+        );
+        assert_eq!(app.engine().eq().bands[5], 3.5);
+
+        // Event::EqChanged also updates window state.
+        let mut custom_bands = [0.0; 10];
+        custom_bands[8] = -10.0;
+        let event_eq = rustamp_core::state::EqState {
+            bands: custom_bands,
+            preamp: 2.0,
+            enabled: false,
+            auto: true,
+        };
+        app.handle_event(&Event::EqChanged(event_eq));
+        assert_eq!(
+            app.eq_state().bands[8],
+            rustamp_core::state::eq_classic_from_db(-10.0) as u8
+        );
+        assert_eq!(
+            app.eq_state().preamp,
+            rustamp_core::state::eq_classic_from_db(2.0) as u8
+        );
+        assert!(!app.eq_state().enabled);
+        assert!(app.eq_state().auto);
+    }
+
+    #[test]
+    fn clicking_on_button_toggles_engine_and_window_state_together() {
+        let (mut app, _dir) = app_with_file(None);
+        assert!(app.eq_state().enabled);
+
+        // Click ON: toggles to false, both engine and window agree.
+        assert!(app.eq_mouse_down(20, 24).unwrap().is_empty());
+        let cmds = app.eq_mouse_up(20, 24).unwrap();
+        assert_eq!(cmds, vec![Command::SetEqEnabled(false)]);
+        assert!(!app.eq_state().enabled);
+        assert!(!app.engine().eq().enabled);
+        assert!(!app.host_player_state().eq.enabled);
+
+        // Click ON again: toggles to true, both engine and window agree.
+        assert!(app.eq_mouse_down(20, 24).unwrap().is_empty());
+        let cmds = app.eq_mouse_up(20, 24).unwrap();
+        assert_eq!(cmds, vec![Command::SetEqEnabled(true)]);
+        assert!(app.eq_state().enabled);
+        assert!(app.engine().eq().enabled);
+        assert!(app.host_player_state().eq.enabled);
+
+        // Third click: toggles back to false.
+        assert!(app.eq_mouse_down(20, 24).unwrap().is_empty());
+        let cmds = app.eq_mouse_up(20, 24).unwrap();
+        assert_eq!(cmds, vec![Command::SetEqEnabled(false)]);
+        assert!(!app.eq_state().enabled);
+        assert!(!app.engine().eq().enabled);
+        assert!(!app.host_player_state().eq.enabled);
+    }
+
+    #[test]
+    fn states_are_equal_after_band_and_preamp_changes() {
+        let (mut app, _dir) = app_with_file(None);
+
+        // 1. External band change.
+        app.submit(Command::SetBand {
+            band: 1,
+            gain_db: 7.2,
+        })
+        .unwrap();
+        let eng = app.engine().eq();
+        let win = app.eq_state();
+        assert_eq!(
+            win.bands[1],
+            rustamp_core::state::eq_classic_from_db(eng.bands[1]) as u8
+        );
+
+        // 2. UI-driven band change (click on band 6 track).
+        let band6_x = rustamp_ui::EqualizerLayout::slider_x(rustamp_ui::EqSlider::Band(6));
+        let cmds = app.eq_mouse_down(band6_x + 5, 45).unwrap();
+        assert_eq!(cmds.len(), 1);
+        let eng = app.engine().eq();
+        let win = app.eq_state();
+        assert_eq!(
+            win.bands[6],
+            rustamp_core::state::eq_classic_from_db(eng.bands[6]) as u8
+        );
+        let _ = app.eq_mouse_up(band6_x + 5, 45).unwrap();
+
+        // 3. External preamp change.
+        app.submit(Command::SetPreamp(-5.5)).unwrap();
+        let eng = app.engine().eq();
+        let win = app.eq_state();
+        assert_eq!(
+            win.preamp,
+            rustamp_core::state::eq_classic_from_db(eng.preamp) as u8
+        );
+
+        // 4. UI-driven preamp change (click on preamp track).
+        let preamp_x = rustamp_ui::EqualizerLayout::slider_x(rustamp_ui::EqSlider::Preamp);
+        let cmds = app.eq_mouse_down(preamp_x + 5, 80).unwrap();
+        assert_eq!(cmds.len(), 1);
+        let eng = app.engine().eq();
+        let win = app.eq_state();
+        assert_eq!(
+            win.preamp,
+            rustamp_core::state::eq_classic_from_db(eng.preamp) as u8
+        );
+        let _ = app.eq_mouse_up(preamp_x + 5, 80).unwrap();
     }
 
     #[test]

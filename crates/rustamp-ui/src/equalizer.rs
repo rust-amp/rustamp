@@ -19,6 +19,7 @@
 
 use rustamp_core::command::Command;
 use rustamp_gfx::Rect;
+use rustamp_proto::state::{EqState, eq_classic_from_db};
 
 use crate::shortcuts::{Key, Modifiers};
 
@@ -477,6 +478,22 @@ impl EqualizerWindow {
         self.state.focused = focused;
     }
 
+    /// Synchronizes the equalizer window state with an authoritative [`EqState`].
+    ///
+    /// Updates band gains, preamp gain, enabled flag and auto flag to match
+    /// the engine's state, while preserving UI interaction flags (held widget,
+    /// thumb dragging, focus, windowshade, double size).
+    pub fn sync_from_eq_state(&mut self, eq: &EqState) {
+        for (i, &gain_db) in eq.bands.iter().enumerate() {
+            if i < self.state.bands.len() {
+                self.state.bands[i] = eq_classic_from_db(gain_db) as u8;
+            }
+        }
+        self.state.preamp = eq_classic_from_db(eq.preamp) as u8;
+        self.state.enabled = eq.enabled;
+        self.state.auto = eq.auto;
+    }
+
     /// A press at window-relative `(x, y)`. Buttons arm their held sprite;
     /// sliders commit on the button down (S07 §5/§6 commit rule).
     pub fn mouse_down(&mut self, x: i32, y: i32) -> Vec<Command> {
@@ -835,5 +852,35 @@ mod tests {
                 .is_empty()
         );
         assert!(!window.state().enabled);
+    }
+
+    #[test]
+    fn sync_from_eq_state_updates_values_and_preserves_ui_flags() {
+        let mut window = EqualizerWindow::new();
+        window.set_focused(false);
+        window.set_double_size(true);
+
+        let mut bands = [0.0; 10];
+        bands[0] = 12.0;
+        bands[1] = -12.0;
+        bands[4] = 6.0;
+        let eq = EqState {
+            bands,
+            preamp: -6.0,
+            enabled: false,
+            auto: true,
+        };
+
+        window.sync_from_eq_state(&eq);
+
+        assert_eq!(window.state().bands[0], 0); // 12 dB -> 0
+        assert_eq!(window.state().bands[1], 63); // -12 dB -> 63
+        assert_eq!(window.state().bands[4], eq_classic_from_db(6.0) as u8);
+        assert_eq!(window.state().preamp, eq_classic_from_db(-6.0) as u8);
+        assert!(!window.state().enabled);
+        assert!(window.state().auto);
+        // Preserves UI-only flags:
+        assert!(!window.state().focused);
+        assert!(window.state().double_size);
     }
 }
