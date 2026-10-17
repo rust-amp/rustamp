@@ -96,7 +96,7 @@ $interactiveDomain = $null
 $explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($explorer) {
     $interactiveSession = $explorer.SessionId
-    $owner = (Get-CimInstance Win32_Process -Filter ("ProcessId = " + $explorer.Id) | Invoke-CimMethod -GetOwner)
+    $owner = (Get-CimInstance Win32_Process -Filter ("ProcessId = " + $explorer.Id) | Invoke-CimMethod -MethodName GetOwner)
     $interactiveUser = $owner.User
     $interactiveDomain = $owner.Domain
     Show 'interactive session' ("{0} via explorer (user {1}\{2})" -f $interactiveSession, $interactiveDomain, $interactiveUser)
