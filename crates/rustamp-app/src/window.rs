@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 
 use rustamp_core::command::Command;
 use rustamp_core::state::WindowId as CoreWindowId;
-use rustamp_platform::init_dpi_awareness;
+use rustamp_platform::{init_dpi_awareness, single_instance};
 use rustamp_ui::{
     DEFAULT_MAIN_POSITION, DialogKind, Key, Modifiers, PLAYLIST_WINDOW_SIZE, ShortcutOutcome,
     docking::DockedStack,
@@ -1404,6 +1404,15 @@ impl ApplicationHandler for Windowed {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Command lines a second launch handed over (F2) are applied here, on
+        // the UI thread, through the same command path the menu uses.
+        for request in single_instance::take_pending() {
+            for command in request.commands() {
+                if let Err(error) = self.app.submit(command) {
+                    eprintln!("rustamp: forwarded command failed: {error}");
+                }
+            }
+        }
         // A `--no-audio` run has no device pulling on its own thread, so the
         // virtual clock is driven here, once per frame, exactly as
         // `run_headless` drives it headless. With a real device this is a

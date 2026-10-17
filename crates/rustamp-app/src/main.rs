@@ -14,12 +14,22 @@
 //! with `--no-audio` it uses the same null output but still opens the main
 //! window (silent windowed playback, no audio device needed); with the default
 //! output it opens the main window and plays on the best device for the host.
+//!
+//! # Single instance (task card F2)
+//!
+//! A windowed launch (the default output or `--no-audio`) first claims the
+//! single-instance lock ([`rustamp_platform::single_instance`]). The first
+//! instance holds it and listens for forwarded command lines for its whole
+//! life; a second launch forwards its command line to the running player and
+//! exits without opening a second window. `--null` is the headless test mode
+//! and never claims the lock, so a test can run beside a normal player.
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 
-use rustamp_app::cli::{self, USAGE};
+use rustamp_app::cli::{self, OutputChoice, USAGE};
+use rustamp_platform::single_instance::{self, Claim, ForwardRequest, HandOff};
 
 fn main() -> ExitCode {
     let args = match cli::parse(std::env::args().skip(1)) {
@@ -34,11 +44,84 @@ fn main() -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+
+    // `--null` is the headless test mode: it never participates in the
+    // single-instance protocol (no window, no config-derived instance). Every
+    // other output mode is a real player and takes the lock.
+    if args.output == OutputChoice::Null {
+        return run_player(args, None);
+    }
+
+    // The key follows the resolved config path, so two normal launches share
+    // one instance while tests with their own `RUSTAMP_CONFIG` never collide.
+    let key = single_instance::instance_key(rustamp_app::config::default_path().as_deref());
+    match single_instance::claim(&key) {
+        Claim::First(instance) => run_player(args, Some(instance)),
+        Claim::AlreadyRunning => forward(&key, &args),
+    }
+}
+
+/// Runs the player, keeping `instance` (when present) alive for the whole run.
+fn run_player(args: cli::Args, _instance: Option<single_instance::Instance>) -> ExitCode {
     match rustamp_app::run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("rustamp: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Hands the second launch's command line to the running instance and exits.
+fn forward(key: &str, args: &cli::Args) -> ExitCode {
+    let request = forward_request(args);
+    // The running instance's output mode, skin and `--seconds` were fixed at
+    // its start-up; report each one we cannot apply rather than drop it.
+    for refusal in &request.refusals {
+        eprintln!("rustamp: {refusal}");
+    }
+    match single_instance::forward(key, &request) {
+        HandOff::Delivered => {
+            println!("rustamp: forwarded to the running instance");
+            ExitCode::SUCCESS
+        }
+        HandOff::Unreachable => {
+            // The lock is held but nobody answered: the holder is wedged (a
+            // start-up race would have been covered by the retry window).
+            // Report rather than open a second window.
+            eprintln!(
+                "rustamp: another instance holds the lock but did not accept the command \
+                 line; it appears unresponsive"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The part of a second launch's command line the running instance can apply.
+///
+/// A file and an initial volume still make sense; the output mode, the skin and
+/// the `--seconds` test aid were chosen when the first instance started, so
+/// they become refusals.
+fn forward_request(args: &cli::Args) -> ForwardRequest {
+    let mut refusals = Vec::new();
+    if args.output == OutputChoice::NoAudio {
+        refusals.push(
+            "--no-audio is ignored: the running instance fixed its output at start-up".to_owned(),
+        );
+    }
+    if args.skin.is_some() {
+        refusals
+            .push("--skin is ignored: the running instance chose its skin at start-up".to_owned());
+    }
+    if args.seconds.is_some() {
+        refusals.push(
+            "--seconds is ignored: it is a start-up test aid on the running instance".to_owned(),
+        );
+    }
+    ForwardRequest {
+        file: args.file.clone(),
+        volume: args.volume,
+        refusals,
     }
 }
