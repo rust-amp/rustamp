@@ -49,11 +49,15 @@ pub mod convert;
 pub mod decode;
 pub mod engine;
 pub mod gain;
+pub mod resident;
 pub mod ring;
 pub mod vistap;
 
 pub use convert::FormatConverter;
 pub use decode::TrackSource;
 pub use engine::{Engine, EngineConfig};
+#[cfg(windows)]
+pub use resident::ProcessDecoder;
+pub use resident::{HostDecoder, ResidentConfig, ResidentFactory};
 pub use ring::{GainState, RingSync};
 pub use vistap::VisTap;

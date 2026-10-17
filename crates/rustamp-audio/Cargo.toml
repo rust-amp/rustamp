@@ -11,6 +11,8 @@ rust-version.workspace = true
 [dependencies]
 rustamp-core.workspace = true
 rustamp-dsp.workspace = true
+rustamp-mediahost.workspace = true
+rustamp-proto.workspace = true
 rtrb.workspace = true
 rubato.workspace = true
 

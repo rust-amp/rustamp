@@ -1672,7 +1672,9 @@ dependencies = [
  "rustamp-core",
  "rustamp-decoders",
  "rustamp-dsp",
+ "rustamp-mediahost",
  "rustamp-output",
+ "rustamp-proto",
  "tempfile",
 ]
 
