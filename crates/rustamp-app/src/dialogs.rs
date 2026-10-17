@@ -86,6 +86,11 @@ impl App {
         self.dialogs.open_kind()
     }
 
+    /// The body lines of the open dialog, if any.
+    pub fn open_dialog_lines(&self) -> Option<Vec<String>> {
+        self.dialogs.open_kind().map(|d| self.dialog_body(d))
+    }
+
     /// Whether `dialog` is open.
     pub fn dialog_is_open(&self, dialog: DialogKind) -> bool {
         self.dialogs.is_open(dialog)
@@ -240,9 +245,12 @@ impl App {
             DialogKind::OpenMedia { kind, .. } => self.open_media_lines(kind),
             DialogKind::SkinBrowser => self.skin_browser_lines(),
             // Frame only: the reference's page contents are unmeasured (S04
-            // open), so the page shows its own-choice name and nothing else —
-            // no controls, no copied text.
-            DialogKind::Preferences(page) => vec![page_name(page).to_string()],
+            // open), so the page shows its own-choice name and explicitly states
+            // that settings are not applied yet so the UI does not mislead.
+            DialogKind::Preferences(page) => vec![
+                page_name(page).to_string(),
+                "Settings on this page are not applied yet.".to_string(),
+            ],
         }
     }
 

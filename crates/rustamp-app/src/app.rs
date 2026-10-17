@@ -29,14 +29,16 @@
 //! `winit`/`softbuffer` shell around it.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rustamp_audio::{Engine, EngineConfig, TrackSource};
 use rustamp_core::audio::{DecoderRegistry, OutputDevice};
 use rustamp_core::bus::{CommandReceiver, CommandSender, EventBus, EventReceiver, command_channel};
 use rustamp_core::command::Command;
-use rustamp_core::config::Config;
+use rustamp_core::config::{
+    AudioConfig, Config, EqConfig, PlaylistConfig, PluginsConfig, UiConfig, WindowLayout,
+};
 use rustamp_core::error::{Error, ErrorInfo, ErrorKind, Result};
 use rustamp_core::event::Event;
 use rustamp_core::playlist::{EntryId, MediaLocation};
@@ -147,6 +149,8 @@ pub struct App {
     /// player runs identically with and without a host. [`run`](crate::run)
     /// installs one; tests leave it off so no process is ever spawned.
     host_supervisor: Option<Supervisor>,
+    /// Where configuration is persisted on clean exit, if known.
+    config_path: Option<PathBuf>,
 }
 
 impl App {
@@ -181,14 +185,31 @@ impl App {
         // the reported state matches what the engine actually applies.
         engine.set_volume(options.volume)?;
         engine.set_balance(options.config.audio.balance)?;
+        engine.set_eq(options.config.eq.state);
         if let Some(file) = &options.file {
             engine.set_queue(vec![TrackSource::path(file.clone())]);
         }
 
-        // Seed the UI machine from the config and the engine's initial state.
-        // The presenter opens the playlist editor at launch, so the model says
-        // it is open: its toggle, its check mark and its own close button then
-        // hide the window that is actually there (BETA-06/07).
+        let main_layout = options
+            .config
+            .ui
+            .windows
+            .iter()
+            .find(|w| w.id == WindowId::Main);
+        let eq_layout = options
+            .config
+            .ui
+            .windows
+            .iter()
+            .find(|w| w.id == WindowId::Equalizer);
+        let pl_layout = options
+            .config
+            .ui
+            .windows
+            .iter()
+            .find(|w| w.id == WindowId::Playlist);
+
+        // Seed the UI machine from the config, window layouts, and the engine's initial state.
         let initial = MainWindowState {
             volume: volume_percent(options.volume),
             balance: rustamp_ui::balance_percent(options.config.audio.balance),
@@ -196,7 +217,9 @@ impl App {
             clutter_a: options.config.ui.always_on_top,
             shuffle: options.config.playlist.shuffle,
             repeat: options.config.playlist.repeat,
-            playlist_open: true,
+            windowshade: main_layout.map(|l| l.shaded).unwrap_or(false),
+            eq_open: eq_layout.map(|l| l.visible).unwrap_or(false),
+            playlist_open: pl_layout.map(|l| l.visible).unwrap_or(true),
             ..MainWindowState::default()
         };
 
@@ -208,6 +231,7 @@ impl App {
             eq_layout: EqualizerLayout::CLASSIC,
             skin: options.skin,
             config: options.config,
+            config_path: None,
             bus,
             events,
             commands,
@@ -242,6 +266,8 @@ impl App {
         app.easy_move = app.config.ui.easy_move;
         // A path skin remembers where it came from, so `RefreshSkin` can re-read it.
         app.current_skin = app.skin.path().map(PathBuf::from);
+        app.eq.set_double_size(app.ui.state().double_size);
+        app.sync_eq_from_engine();
         // The engine's snapshot is the authoritative starting state.
         app.sync_entry_ids();
         let snapshot = app.engine.state();
@@ -320,6 +346,152 @@ impl App {
     /// The loaded configuration.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Sets the path where configuration will be persisted on exit.
+    pub fn set_config_path(&mut self, path: Option<PathBuf>) {
+        self.config_path = path;
+    }
+
+    /// The path where configuration will be persisted, if set.
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
+    }
+
+    /// Returns the live configuration reflecting the player's current runtime state.
+    pub fn current_config(&self) -> Config {
+        let player_state = self.engine.state();
+        let volume = player_state.volume;
+        let balance = player_state.balance;
+
+        let mut windows = self.config.ui.windows.clone();
+        if let Some(main) = windows.iter_mut().find(|w| w.id == WindowId::Main) {
+            main.shaded = self.ui.state().windowshade;
+        } else {
+            windows.push(WindowLayout {
+                id: WindowId::Main,
+                x: 26,
+                y: 26,
+                visible: true,
+                shaded: self.ui.state().windowshade,
+                width: None,
+                height: None,
+            });
+        }
+        if let Some(eq) = windows.iter_mut().find(|w| w.id == WindowId::Equalizer) {
+            eq.visible = self.eq_open();
+        } else {
+            windows.push(WindowLayout {
+                id: WindowId::Equalizer,
+                x: 26,
+                y: 142,
+                visible: self.eq_open(),
+                shaded: false,
+                width: None,
+                height: None,
+            });
+        }
+        if let Some(pl) = windows.iter_mut().find(|w| w.id == WindowId::Playlist) {
+            pl.visible = self.playlist_open();
+        } else {
+            windows.push(WindowLayout {
+                id: WindowId::Playlist,
+                x: 26,
+                y: 258,
+                visible: self.playlist_open(),
+                shaded: false,
+                width: None,
+                height: None,
+            });
+        }
+
+        Config {
+            version: rustamp_core::config::CONFIG_VERSION,
+            audio: AudioConfig {
+                volume,
+                balance,
+                ..self.config.audio.clone()
+            },
+            ui: UiConfig {
+                skin: self.current_skin.clone(),
+                double_size: self.ui.state().double_size,
+                always_on_top: self.always_on_top,
+                easy_move: self.easy_move,
+                windows,
+                ..self.config.ui.clone()
+            },
+            eq: EqConfig {
+                state: self.engine.eq(),
+            },
+            playlist: PlaylistConfig::default(),
+            plugins: PluginsConfig::default(),
+        }
+    }
+
+    /// Saves the current configuration to the configured path, if one is set.
+    pub fn save_config(&self) -> Result<(), crate::config::ConfigError> {
+        let Some(path) = &self.config_path else {
+            return Ok(());
+        };
+        self.save_config_to(path)
+    }
+
+    /// Saves the current configuration to `path`.
+    pub fn save_config_to(&self, path: &Path) -> Result<(), crate::config::ConfigError> {
+        let config = self.current_config();
+        crate::config::save(&config, path)
+    }
+
+    /// Records a window's screen coordinates in the config.
+    pub fn set_window_position(&mut self, id: WindowId, x: i32, y: i32) {
+        if let Some(entry) = self.config.ui.windows.iter_mut().find(|w| w.id == id) {
+            entry.x = x;
+            entry.y = y;
+        } else {
+            self.config.ui.windows.push(WindowLayout {
+                id,
+                x,
+                y,
+                visible: true,
+                shaded: false,
+                width: None,
+                height: None,
+            });
+        }
+    }
+
+    /// Records a window's visibility state in the config.
+    pub fn set_window_visible(&mut self, id: WindowId, visible: bool) {
+        if let Some(entry) = self.config.ui.windows.iter_mut().find(|w| w.id == id) {
+            entry.visible = visible;
+        } else {
+            self.config.ui.windows.push(WindowLayout {
+                id,
+                x: 26,
+                y: 26,
+                visible,
+                shaded: false,
+                width: None,
+                height: None,
+            });
+        }
+    }
+
+    /// Records a window's shaded state in the config.
+    pub fn set_window_shaded(&mut self, id: WindowId, shaded: bool) {
+        if let Some(entry) = self.config.ui.windows.iter_mut().find(|w| w.id == id) {
+            entry.shaded = shaded;
+        } else {
+            self.config.ui.windows.push(WindowLayout {
+                id,
+                x: 26,
+                y: 26,
+                visible: true,
+                shaded,
+                width: None,
+                height: None,
+            });
+        }
     }
 
     /// A one-line description of the loaded skin.

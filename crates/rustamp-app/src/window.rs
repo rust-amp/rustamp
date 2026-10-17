@@ -234,8 +234,14 @@ pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {
     // `EventLoop::new()`. The off-main-thread opt-in (`true`) exists only
     // for the VM-gated window tests, which run on harness worker threads.
     let event_loop = build_event_loop(false)?;
-    event_loop.run_app(&mut presenter)?;
-    Ok(())
+    let run_res = event_loop.run_app(&mut presenter);
+    if run_res.is_ok() {
+        presenter.sync_window_layouts_to_app();
+        if let Err(error) = presenter.app.save_config() {
+            eprintln!("rustamp: {error}");
+        }
+    }
+    run_res.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 struct Windowed {
@@ -388,10 +394,20 @@ impl Windowed {
         }
         if self.eq_window.is_none() {
             let (width, height) = self.app.eq_frame_size();
-            let attributes = Window::default_attributes()
+            let mut attributes = Window::default_attributes()
                 .with_title("Rustamp Equalizer")
                 .with_inner_size(PhysicalSize::new(width, height))
                 .with_resizable(false);
+            let eq_layout = self
+                .app
+                .config()
+                .ui
+                .windows
+                .iter()
+                .find(|w| w.id == CoreWindowId::Equalizer);
+            if let Some(layout) = eq_layout {
+                attributes = attributes.with_position(PhysicalPosition::new(layout.x, layout.y));
+            }
             let window = match event_loop.create_window(attributes) {
                 Ok(window) => Arc::new(window),
                 Err(error) => {
@@ -426,7 +442,9 @@ impl Windowed {
             self.eq_window = Some(window);
             self.eq_surface = Some(surface);
             self.applied_eq_client = Some((width, height));
-            self.place_eq_below_main();
+            if eq_layout.is_none() {
+                self.place_eq_below_main();
+            }
         }
         let desired = self.app.eq_frame_size();
         if self.applied_eq_client != Some(desired)
@@ -457,6 +475,40 @@ impl Windowed {
                 pos.x,
                 pos.y.saturating_add(size.height as i32),
             ));
+        }
+    }
+
+    /// Synchronizes current live OS window positions, visibility, and shade states
+    /// into the app configuration so they are preserved on exit.
+    pub(crate) fn sync_window_layouts_to_app(&mut self) {
+        if let Some(window) = &self.window
+            && let Ok(pos) = window.outer_position()
+        {
+            self.app
+                .set_window_position(CoreWindowId::Main, pos.x, pos.y);
+        }
+        self.app
+            .set_window_shaded(CoreWindowId::Main, self.app.state().windowshade);
+        self.app.set_window_visible(CoreWindowId::Main, true);
+
+        let eq_visible = self.app.eq_open();
+        self.app
+            .set_window_visible(CoreWindowId::Equalizer, eq_visible);
+        if let Some(eq) = &self.eq_window
+            && let Ok(pos) = eq.outer_position()
+        {
+            self.app
+                .set_window_position(CoreWindowId::Equalizer, pos.x, pos.y);
+        }
+
+        let pl_visible = self.app.playlist_open();
+        self.app
+            .set_window_visible(CoreWindowId::Playlist, pl_visible);
+        if let Some(pl) = &self.playlist_window
+            && let Ok(pos) = pl.outer_position()
+        {
+            self.app
+                .set_window_position(CoreWindowId::Playlist, pos.x, pos.y);
         }
     }
 
@@ -1058,10 +1110,20 @@ impl Windowed {
             return;
         }
         let (width, height) = PLAYLIST_WINDOW_SIZE;
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title("Rustamp Playlist")
             .with_inner_size(PhysicalSize::new(width, height))
             .with_resizable(false);
+        let pl_layout = self
+            .app
+            .config()
+            .ui
+            .windows
+            .iter()
+            .find(|w| w.id == CoreWindowId::Playlist);
+        if let Some(layout) = pl_layout {
+            attributes = attributes.with_position(PhysicalPosition::new(layout.x, layout.y));
+        }
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -1132,6 +1194,10 @@ impl Windowed {
                 }
                 self.sync_playlist_window(event_loop);
                 self.request_redraw();
+            }
+            WindowEvent::Moved(position) => {
+                self.app
+                    .set_window_position(CoreWindowId::Playlist, position.x, position.y);
             }
             WindowEvent::RedrawRequested => self.paint_playlist(),
             WindowEvent::Resized(size) => {
@@ -1215,10 +1281,20 @@ impl ApplicationHandler for Windowed {
             return;
         }
         let (width, height) = self.app.frame_size();
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title("Rustamp")
             .with_inner_size(PhysicalSize::new(width, height))
             .with_resizable(false);
+        let main_layout = self
+            .app
+            .config()
+            .ui
+            .windows
+            .iter()
+            .find(|w| w.id == CoreWindowId::Main);
+        if let Some(layout) = main_layout {
+            attributes = attributes.with_position(PhysicalPosition::new(layout.x, layout.y));
+        }
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -1292,6 +1368,8 @@ impl ApplicationHandler for Windowed {
                 event_loop.exit();
             }
             WindowEvent::Moved(position) => {
+                self.app
+                    .set_window_position(CoreWindowId::Main, position.x, position.y);
                 // A docked neighbour follows the main window by the same delta
                 // (S05 §4.2): the model moves through the stack geometry, then
                 // the EQ window is re-placed below the live outer frame.
@@ -1472,6 +1550,10 @@ impl Windowed {
                 }
                 self.sync_eq_window(event_loop);
                 self.request_redraw_eq();
+            }
+            WindowEvent::Moved(position) => {
+                self.app
+                    .set_window_position(CoreWindowId::Equalizer, position.x, position.y);
             }
             WindowEvent::RedrawRequested => self.paint_eq(),
             WindowEvent::Resized(size) => {

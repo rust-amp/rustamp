@@ -81,8 +81,14 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // ----- configuration -----
     let config_path = config::default_path();
-    let loaded = config::load(config_path.as_deref());
-    if let Some(warning) = &loaded.warning {
+    let loaded = match config::load(config_path.as_deref()) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("rustamp: {error}");
+            return Err(Box::new(error));
+        }
+    };
+    for warning in &loaded.warnings {
         eprintln!("rustamp: {warning}");
     }
     if let ConfigSource::File(path) = &loaded.source {
@@ -108,6 +114,10 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         seconds: args.seconds,
     };
     let mut app = App::new(options)?;
+    app.set_config_path(config_path);
+    for warning in &loaded.warnings {
+        app.note(warning.clone());
+    }
     // Start the plugin host when it is resolvable (see `crate::supervise`):
     // best-effort by contract, so a missing binary only means the player runs
     // detached — it never fails startup and never opens a window.
@@ -121,6 +131,9 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
                 app.submit(Command::Play)?;
             }
             app.run_headless()?;
+            if let Err(error) = app.save_config() {
+                eprintln!("rustamp: {error}");
+            }
             Ok(())
         }
         // ----- the real player: window + device -----
