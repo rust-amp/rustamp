@@ -65,6 +65,16 @@ never means waiting.
 | **OpenAI** | `subagent` with `openai/gpt-6.1-sol#high` | spend it until Sunday 2026-10-18, then stop until approved |
 | **Free** | `subagent` with `free-*` | `free-ling-3.1` and `free-muse-spark` were unavailable; `free-laguna`, `free-big-pickle` and `free-deepseek-v4.1` worked |
 
+## Polling (learned the hard way, 2026-10-17)
+
+**`agy` jobs do not notify.** A `subagent` lane reports back by itself, but an
+`agy_run` lane finishes silently, so the orchestrator must **poll** the job ids it
+holds (`agy_status`) after every batch — otherwise finished lanes sit unnoticed
+and the slots look empty while the work is done. The rule: after merging anything,
+poll every outstanding agy job, verify and merge what is done, and refill **before**
+starting new work. Six lanes were merged in one batch that way; before that, five
+finished lanes had gone unnoticed for a while.
+
 ## How a lane is started
 
 1. `worktree_create` with a name that says what it is (`waveNN-<topic>`).
