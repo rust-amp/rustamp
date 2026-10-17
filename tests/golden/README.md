@@ -36,6 +36,15 @@ Conventions:
   on this prefix; `--skin classic-base` narrows it to `golden_classic_base`.
 * Case names are `snake_case`, e.g. `main_window_playing_clutterbar_o`. They
   may contain `/` for subfolders.
+* Reach the state under test only through the crate's public API (for
+  `rustamp-ui`: the state structs' public fields and the window models' public
+  methods). A state that would need a private field is left out and reported,
+  never forced by poking at internals.
+* One case per state worth pinning, named for it: `main_window_playing` (a
+  title, a time, a bitrate and a lit stereo label), `main_window_double_size`
+  (the same default state at the settled 550 x 232), a non-flat
+  `equalizer_window_*` and a `playlist_window_selection`. A renderer change
+  then names the state it broke.
 * PNG, 8-bit RGBA, comparison is exact (tolerance 0).
 
 ## Workflow
