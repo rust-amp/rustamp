@@ -130,8 +130,11 @@ impl App {
             Key::Enter => {
                 if let Some(seek) = self.dialogs.confirm_jump_time() {
                     // A failed submit still consumed the key: the dialog stays
-                    // open so the user can retry.
-                    let _ = self.submit(seek);
+                    // open so the user can retry. On success, close the dialog so
+                    // it does not linger or double-apply.
+                    if self.submit(seek).is_ok() {
+                        self.dialogs.close_any();
+                    }
                 } else if self.dialogs.open_kind() == Some(DialogKind::SkinBrowser) {
                     self.confirm_skin_browser();
                 } else if let Some(add) = self.dialogs.confirm_open_media() {

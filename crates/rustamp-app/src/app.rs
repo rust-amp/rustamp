@@ -2342,10 +2342,10 @@ mod tests {
         assert!(app.dialog_key(Key::Digit(0)));
         assert_eq!(app.jump_text(), "90");
         // Enter confirms: a Seek for 90 s is submitted (the empty queue turns
-        // it into an error event, which must not take the app down).
+        // it into an error event, which must not take the app down). The dialog
+        // closes on confirm so it does not linger or double-apply.
         assert!(app.dialog_key(Key::Enter));
         assert!(!app.quit());
-        assert!(app.dialog_key(Key::Escape));
         assert_eq!(app.dialog_open_kind(), None);
         // With no dialog open no key is consumed.
         assert!(!app.dialog_key(Key::Escape));
@@ -3012,5 +3012,80 @@ mod tests {
             DialogKind::Preferences(PrefsPage::VisPlugin).client_size(),
             PREFS_CLIENT_SIZE
         );
+    }
+
+    #[test]
+    fn clutter_i_opens_file_info_only_when_track_loaded() {
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        // With no track loaded, clicking clutter I emits nothing and opens no dialog (S02 §2).
+        let down_cmds = app.mouse_down(15, 43).unwrap();
+        assert!(down_cmds.is_empty());
+        let up_cmds = app.mouse_up(15, 43).unwrap();
+        assert!(up_cmds.is_empty());
+        assert_eq!(app.dialog_open_kind(), None);
+
+        // Load a track.
+        app.handle_event(&rustamp_core::event::Event::TrackChanged {
+            id: Some(rustamp_core::playlist::EntryId(1)),
+            index: Some(0),
+            metadata: None,
+            duration_ms: Some(180_000),
+        });
+
+        // Now clicking clutter I emits OpenFileInfo and opens the FileInfo dialog.
+        let down_cmds = app.mouse_down(15, 43).unwrap();
+        assert!(down_cmds.is_empty());
+        let up_cmds = app.mouse_up(15, 43).unwrap();
+        assert_eq!(up_cmds, vec![Command::OpenFileInfo]);
+        assert_eq!(app.dialog_open_kind(), Some(DialogKind::FileInfo));
+    }
+
+    #[test]
+    fn dialog_result_paths_cancelled_confirmed_and_os_close() {
+        use rustamp_core::command::JumpTarget;
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+
+        // 1. Cancelled dialog via Escape: changes nothing and closes dialog.
+        app.submit(Command::OpenJump {
+            target: JumpTarget::Time,
+        })
+        .unwrap();
+        assert_eq!(
+            app.dialog_open_kind(),
+            Some(DialogKind::Jump(JumpTarget::Time))
+        );
+        assert!(app.dialog_key(Key::Digit(4)));
+        assert!(app.dialog_key(Key::Digit(2)));
+        assert_eq!(app.jump_text(), "42");
+        assert!(app.dialog_key(Key::Escape));
+        assert_eq!(app.dialog_open_kind(), None);
+
+        // 2. Confirmed dialog via Enter: applies exactly once and closes.
+        app.submit(Command::OpenJump {
+            target: JumpTarget::Time,
+        })
+        .unwrap();
+        assert_eq!(
+            app.dialog_open_kind(),
+            Some(DialogKind::Jump(JumpTarget::Time))
+        );
+        assert!(app.dialog_key(Key::Digit(1)));
+        assert!(app.dialog_key(Key::Digit(0)));
+        assert_eq!(app.jump_text(), "10");
+        // Enter confirms: seek is submitted, dialog closes immediately.
+        assert!(app.dialog_key(Key::Enter));
+        assert_eq!(app.dialog_open_kind(), None);
+        // Pressing Enter again does NOT double-apply: no dialog is open.
+        assert!(!app.dialog_key(Key::Enter));
+
+        // 3. Closed by OS: close_dialog resets state cleanly without applying.
+        app.submit(Command::OpenAbout).unwrap();
+        assert_eq!(app.dialog_open_kind(), Some(DialogKind::About));
+        app.close_dialog(DialogKind::About);
+        assert_eq!(app.dialog_open_kind(), None);
     }
 }

@@ -437,6 +437,13 @@ impl MainWindow {
             Widget::PlaylistToggle => Some(Command::ToggleWindow(WindowId::Playlist)),
             Widget::ClutterA => Some(Command::ToggleAlwaysOnTop),
             Widget::ClutterD => Some(Command::ToggleDoubleSize),
+            Widget::ClutterI => {
+                if self.track_title.is_some() {
+                    Some(Command::OpenFileInfo)
+                } else {
+                    None
+                }
+            }
             // The window-menu button opens the main-menu popup (S04 §1 row 1:
             // posted left click at client (6,3)); the popup itself is the
             // app presenter's window, opened from this command.
@@ -942,13 +949,18 @@ mod tests {
         assert_eq!(machine.mouse_up(x, y, 0), [Command::ToggleAlwaysOnTop]);
         assert!(machine.state().clutter_a);
 
-        // I: momentary file-info.
+        // I: momentary file-info (S02 §2: opens file info box if a track is loaded).
         let mut machine = MainWindow::new();
         let (x, y) = centre(Widget::ClutterI);
         machine.mouse_down(x, y, 0);
         assert!(machine.state().clutter_i);
         assert_eq!(machine.hint().as_deref(), Some("FILE INFO BOX"));
         assert_eq!(machine.mouse_up(x, y, 0), []);
+        assert!(!machine.state().clutter_i);
+
+        load_track(&mut machine, "T1", 200_000, 0);
+        machine.mouse_down(x, y, 0);
+        assert_eq!(machine.mouse_up(x, y, 0), [Command::OpenFileInfo]);
         assert!(!machine.state().clutter_i);
 
         // D: latched double-size.
