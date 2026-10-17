@@ -7,10 +7,17 @@
 //! * Mid-stream **channel count** change: audio is remapped to the opened
 //!   channel count (mono is duplicated, extra channels dropped, missing ones
 //!   zero-filled).
-//! * Mid-stream **sample rate** change or a container reset (chained Ogg):
-//!   the stream ends (`read` returns `Ok(0)`); the engine can open the rest
-//!   as a new track if it wants chaining.
+//! * Mid-stream **sample rate** change: reported once as
+//!   [`Error::FormatChanged`] (RFC 0002, C3). The switch happens in the failing
+//!   `read` call, which writes no frames; the next call continues in the new
+//!   format.
+//! * A container reset (chained Ogg) cannot be continued, so the stream ends
+//!   (`read` returns `Ok(0)`) as C3.4 requires.
 //! * Corrupt packets are skipped; see [`SymphoniaDecoder::skipped_packets`].
+//! * Hostile input (truncated, empty, lying headers, noise) is rejected with a
+//!   defined error or degraded to a defined end of stream; the loop in
+//!   [`SymphoniaDecoder::fill_pending`] is bounded, so it cannot spin without
+//!   producing samples or ending the stream. See `tests/robustness.rs`.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -34,8 +41,30 @@ use symphonia::core::units::Time;
 /// Consecutive undecodable packets tolerated before giving up.
 const MAX_CONSECUTIVE_ERRORS: u32 = 512;
 
+/// Packets read in a row that yielded neither samples nor a counted skip before
+/// [`SymphoniaDecoder::fill_pending`] gives up.
+///
+/// Every other exit from that loop is bounded (end of stream, a counted error,
+/// or samples); this bounds the two `continue` arms (a packet of another track,
+/// a buffer that decodes to zero frames) so a source that keeps handing out
+/// packets we cannot use degrades to an error instead of spinning forever.
+/// Generously above anything a real multi-track container interleaves between
+/// two audio packets.
+const MAX_NO_PROGRESS_PACKETS: u32 = 1 << 16;
+
 /// Frames of decoder lead-in decoded and discarded after a seek.
 const SEEK_PREROLL_FRAMES: u64 = 4096;
+
+/// Upper bound on a seek target in frames.
+///
+/// [`Decoder::seek`] clamps the target to the track duration when that is known.
+/// A stream without a duration (a container that reports no frame count after a
+/// non-seekable probe, e.g. MP3 whose length could not be estimated) has no
+/// clamp, so a hostile or simply wrong `Duration` reaches the frame conversion
+/// directly. 2^53 is exact in `f64` and, at the lowest sample rate
+/// [`AudioSpec`] can carry, still far inside `Duration`'s range; at 44.1 kHz it
+/// is millions of years, so no real seek is affected.
+const MAX_SEEK_FRAMES: u64 = 1 << 53;
 
 const EXTENSIONS: &[&str] = &[
     "mp3", "mp2", "mp1", "flac", "ogg", "oga", "wav", "wave", "aif", "aiff", "aifc", "caf", "m4a",
@@ -149,12 +178,67 @@ impl symphonia::core::io::MediaSource for ReaderSource {
     }
 }
 
-fn dec_err(e: SymError) -> Error {
+/// Maps an error raised while **opening**: the container was not recognized, or
+/// it was recognized but this build has no codec for it.
+///
+/// `Unsupported` at this point is the one place where [`Error::UnsupportedFormat`]
+/// is the honest kind: nothing was opened, so "this is not something I handle"
+/// is what happened. (A container we can read but whose codec we cannot is
+/// folded into the same kind; telling those two apart needs a new error kind.)
+fn open_err(e: SymError) -> Error {
     match e {
         SymError::IoError(e) => Error::Io(e),
         SymError::Unsupported(m) => Error::UnsupportedFormat(m.to_owned()),
         other => Error::Decode(other.to_string()),
     }
+}
+
+/// Maps an error raised **after** a decoder exists (reading or seeking).
+///
+/// `Unsupported` from the container or the codec at this point does not mean
+/// "not my format": the container was already accepted, so a caller that saw
+/// [`Error::UnsupportedFormat`] would be told the wrong thing. Such an error is
+/// reported as damage instead, keeping the original message.
+fn stream_err(e: SymError) -> Error {
+    match e {
+        SymError::IoError(e) => Error::Io(e),
+        SymError::Unsupported(m) => Error::Decode(format!("mid-stream unsupported input: {m}")),
+        other => Error::Decode(other.to_string()),
+    }
+}
+
+/// Frame index of `at` at `rate` Hz, saturating instead of overflowing.
+///
+/// `rate` is a sample rate (`<= u32::MAX`) and `subsec_nanos() < 1e9`, so only
+/// the seconds term can overflow `u64` — which it does for the hostile
+/// `Duration::MAX` a caller can pass to a stream whose duration is unknown.
+/// A plain multiplication panics in a debug build and wraps in a release build;
+/// both are wrong, one of them loudly so.
+fn frames_at(rate: u64, at: Duration) -> u64 {
+    let secs = at.as_secs().saturating_mul(rate);
+    let frac = u64::from(at.subsec_nanos()).saturating_mul(rate) / 1_000_000_000;
+    secs.saturating_add(frac)
+}
+
+/// Queues a detected mid-stream format change.
+///
+/// `spec` is deliberately not switched here: RFC 0002 C3 has `spec()` report the
+/// new format only once the change has been reported through `read`, and a
+/// `read` that still writes frames of the old format must keep seeing it.
+fn queue_format_change(pending: &mut Option<AudioSpec>, to: AudioSpec) {
+    *pending = Some(to);
+}
+
+/// Applies a queued format change: switches `spec` and returns the error to
+/// raise. Returns `None` when nothing is queued.
+///
+/// Called by `read` only when that call has written no frames, which is what
+/// C3.2 requires of the failed call. The queue is cleared, so a change is
+/// reported exactly once.
+fn take_format_change(spec: &mut AudioSpec, pending: &mut Option<AudioSpec>) -> Option<Error> {
+    let to = pending.take()?;
+    let from = std::mem::replace(spec, to);
+    Some(Error::FormatChanged { from, to })
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +258,9 @@ pub struct SymphoniaDecoder {
     pending_pos: usize,
     /// Frames to drop after a seek (to reach the exact target).
     seek_target: Option<u64>,
+    /// A detected mid-stream format change, reported by the next `read` that
+    /// writes no frames (RFC 0002, C3).
+    pending_format_change: Option<AudioSpec>,
     skipped: u64,
     consecutive_errors: u32,
     finished: bool,
@@ -207,6 +294,14 @@ impl SymphoniaDecoder {
             }
         };
 
+        // An empty source can never hold a container. Naming that directly is
+        // more useful to a caller than the probe's "no suitable format reader
+        // found", and it is the one case where "the file itself is the problem"
+        // is certain.
+        if byte_len == Some(0) {
+            return Err(Error::Decode("empty source: 0 bytes to decode".into()));
+        }
+
         let mut hint = Hint::new();
         if let Some(e) = &ext {
             hint.with_extension(e);
@@ -217,7 +312,7 @@ impl SymphoniaDecoder {
         };
         let mut probed = symphonia::default::get_probe()
             .format(&hint, mss, &fmt_opts, &MetadataOptions::default())
-            .map_err(dec_err)?;
+            .map_err(open_err)?;
 
         let mut format = probed.format;
         let track = format
@@ -229,7 +324,7 @@ impl SymphoniaDecoder {
         let params = track.codec_params.clone();
         let codec = symphonia::default::get_codecs()
             .make(&params, &DecoderOptions::default())
-            .map_err(dec_err)?;
+            .map_err(open_err)?;
 
         // Container-level tags (e.g. ID3v2 ahead of the stream) first; the format's own
         // tags override.
@@ -253,6 +348,7 @@ impl SymphoniaDecoder {
             pending: Vec::new(),
             pending_pos: 0,
             seek_target: None,
+            pending_format_change: None,
             skipped: 0,
             consecutive_errors: 0,
             finished: false,
@@ -288,10 +384,17 @@ impl SymphoniaDecoder {
     }
 
     /// Decode packets until some samples are pending. `Ok(false)` at end of stream.
+    ///
+    /// Every iteration either produces samples, counts a skipped packet, or ends
+    /// the stream. The two arms that do none of those (`continue` for a foreign
+    /// track id, `continue` for an empty buffer) are bounded by
+    /// [`MAX_NO_PROGRESS_PACKETS`], so the loop cannot spin on a source that
+    /// keeps handing out packets without progress.
     fn fill_pending(&mut self) -> Result<bool> {
         if self.finished {
             return Ok(false);
         }
+        let mut no_progress = 0u32;
         loop {
             let packet = match self.format.next_packet() {
                 Ok(p) => p,
@@ -300,6 +403,9 @@ impl SymphoniaDecoder {
                     return Ok(false);
                 }
                 Err(SymError::ResetRequired) => {
+                    // A container reset (chained Ogg) cannot be continued in
+                    // place; RFC 0002 C3.4 says end the stream here rather than
+                    // report a format change.
                     self.finished = true;
                     return Ok(false);
                 }
@@ -307,9 +413,11 @@ impl SymphoniaDecoder {
                     self.note_skip()?;
                     continue;
                 }
-                Err(e) => return Err(dec_err(e)),
+                Err(e) => return Err(stream_err(e)),
             };
             if packet.track_id() != self.track_id {
+                no_progress += 1;
+                self.note_no_progress(no_progress)?;
                 continue;
             }
             let decoded = match self.codec.decode(&packet) {
@@ -322,10 +430,12 @@ impl SymphoniaDecoder {
                     self.finished = true;
                     return Ok(false);
                 }
-                Err(e) => return Err(dec_err(e)),
+                Err(e) => return Err(stream_err(e)),
             };
             self.consecutive_errors = 0;
             if decoded.frames() == 0 {
+                no_progress += 1;
+                self.note_no_progress(no_progress)?;
                 continue;
             }
             // After a seek, drop the frames before the target. Buffers are aligned by their
@@ -340,18 +450,29 @@ impl SymphoniaDecoder {
                     self.seek_target = None;
                 }
             }
-            let ok = convert(
+            match convert(
                 decoded,
                 &mut self.spec,
                 &mut self.sample_buf,
                 &mut self.pending,
                 skip,
-            );
-            self.pending_pos = 0;
-            if !ok {
-                self.finished = true;
-                return Ok(false);
+            ) {
+                Converted::Samples => {}
+                Converted::Unusable => {
+                    // Nothing to hand out and nothing to convert; stop instead
+                    // of looping on this source.
+                    self.finished = true;
+                    return Ok(false);
+                }
+                Converted::RateChanged(new_spec) => {
+                    // RFC 0002 C3.1: switch the format, but report it from a
+                    // `read` call that writes no frames (see `read`).
+                    queue_format_change(&mut self.pending_format_change, new_spec);
+                    self.finished = true;
+                    return Ok(false);
+                }
             }
+            self.pending_pos = 0;
             if self.pending_pos < self.pending.len() {
                 return Ok(true);
             }
@@ -363,6 +484,19 @@ impl SymphoniaDecoder {
         self.consecutive_errors += 1;
         if self.consecutive_errors > MAX_CONSECUTIVE_ERRORS {
             return Err(Error::Decode("too many consecutive corrupt packets".into()));
+        }
+        Ok(())
+    }
+
+    /// Counts an iteration of [`SymphoniaDecoder::fill_pending`] that produced
+    /// neither samples nor a counted skip, and fails once a source keeps
+    /// producing such packets: without this the loop would never reach an end of
+    /// stream and `read` would hang.
+    fn note_no_progress(&mut self, count: u32) -> Result<()> {
+        if count > MAX_NO_PROGRESS_PACKETS {
+            return Err(Error::Decode(
+                "no audio produced after many packets without progress".into(),
+            ));
         }
         Ok(())
     }
@@ -394,6 +528,16 @@ impl Decoder for SymphoniaDecoder {
             self.pending_pos += n;
             written += n;
         }
+        if written == 0
+            && let Some(e) = take_format_change(&mut self.spec, &mut self.pending_format_change)
+        {
+            // RFC 0002 C3.2: the failed call reports no frames. `spec()` already
+            // reports the new format, and the next call continues in it.
+            self.pending.clear();
+            self.pending_pos = 0;
+            self.finished = false;
+            return Err(e);
+        }
         Ok(written / ch)
     }
 
@@ -403,8 +547,10 @@ impl Decoder for SymphoniaDecoder {
         if let Some(d) = self.duration() {
             target = target.min(d);
         }
-        let target_frames =
-            target.as_secs() * rate + u64::from(target.subsec_nanos()) * rate / 1_000_000_000;
+        // A stream without a known duration has no clamp above, so the target is
+        // bounded here instead: `frames_at` saturates and MAX_SEEK_FRAMES keeps
+        // the frame count convertible back to a `Duration`.
+        let target_frames = frames_at(rate, target).min(MAX_SEEK_FRAMES);
         // Seek slightly early and discard the lead-in: overlapping transforms (MP3, Vorbis,
         // AAC) need previous blocks to reconstruct the first samples exactly.
         let pre = target_frames.min(SEEK_PREROLL_FRAMES);
@@ -425,13 +571,16 @@ impl Decoder for SymphoniaDecoder {
                 SymError::Unsupported(_) | SymError::SeekError(_) => {
                     Error::Unsupported("seek not supported for this stream")
                 }
-                other => dec_err(other),
+                other => stream_err(other),
             })?;
         self.codec.reset();
         self.pending.clear();
         self.pending_pos = 0;
         self.finished = false;
         self.consecutive_errors = 0;
+        // A seek restarts the packet walk, so a change detected before it is
+        // stale; the format of the reopened position is what matters.
+        self.pending_format_change = None;
         self.seek_target = Some(seeked.required_ts + pre);
         Ok(self.spec.duration_of(target_frames))
     }
@@ -458,21 +607,37 @@ impl Decoder for SymphoniaDecoder {
     }
 }
 
+/// What [`convert`] did with one decoded buffer.
+enum Converted {
+    /// The samples are in `pending`, in the decoder's current spec.
+    Samples,
+    /// The buffer could not be converted (the sample buffer could not be
+    /// created); the stream ends here.
+    Unusable,
+    /// The buffer's sample rate differs from the decoder's spec: the caller must
+    /// switch to this spec and report it (RFC 0002, C3).
+    RateChanged(AudioSpec),
+}
+
 /// Convert a decoded buffer into interleaved `pending` samples of the opened spec.
-/// Returns `false` on an unsupported mid-stream sample rate change.
+///
+/// A buffer whose sample count differs is remapped to the opened channel count
+/// (mono is duplicated, extra channels dropped, missing channels zero-filled);
+/// a buffer whose sample **rate** differs is reported back to the caller so it
+/// can switch specs and signal the change instead of silently ending the stream.
 fn convert(
     decoded: AudioBufferRef<'_>,
     spec: &mut AudioSpec,
     sample_buf: &mut Option<SampleBuffer<f32>>,
     pending: &mut Vec<f32>,
     skip: usize,
-) -> bool {
+) -> Converted {
     let sig = *decoded.spec();
     let ch = sig.channels.count();
     if spec.sample_rate == 0 {
         *spec = AudioSpec::new(sig.rate, ch as u16);
     } else if sig.rate != spec.sample_rate {
-        return false;
+        return Converted::RateChanged(AudioSpec::new(sig.rate, ch as u16));
     }
     let frames = decoded.frames();
     if sample_buf
@@ -482,12 +647,17 @@ fn convert(
         *sample_buf = Some(SampleBuffer::new(frames as u64, sig));
     }
     let Some(buf) = sample_buf.as_mut() else {
-        return false;
+        // Unreachable: the buffer is created just above. Reporting it as
+        // unusable rather than panicking keeps a hostile input from reaching a
+        // `panic!` inside the crate.
+        return Converted::Unusable;
     };
     buf.copy_interleaved_ref(decoded);
 
     pending.clear();
-    let out_ch = usize::from(spec.channels);
+    // `.max(1)` is defensive: `read` and `AudioSpec::samples_for` already guard
+    // a zero channel count, but `chunks_exact(0)` would panic here.
+    let out_ch = usize::from(spec.channels.max(1));
     let skip = skip.min(frames);
     let samples = &buf.samples()[skip * ch..];
     if ch == out_ch {
@@ -503,7 +673,7 @@ fn convert(
             }
         }
     }
-    true
+    Converted::Samples
 }
 
 // ---------------------------------------------------------------------------
@@ -567,7 +737,9 @@ fn apply_tags(m: &mut TrackMetadata, rev: &MetadataRevision) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use std::io::Cursor;
+    use symphonia::core::audio::{AudioBuffer, Channels, Signal, SignalSpec};
     use symphonia::core::io::MediaSource as _;
 
     /// Compile-time proof for the `Send + Sync` requirement of symphonia's
@@ -623,5 +795,185 @@ mod tests {
             handle.join().expect("decode thread"),
             [0, 1, 2, 3, 4, 5, 6, 7]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // B2: hostile input, error classification and format changes
+    // -----------------------------------------------------------------------
+
+    /// A decoded-buffer stand-in with `frames` frames and `channels` channels,
+    /// all silence. The first channel is what the `fill_*` helpers below write.
+    fn buffer(rate: u32, channels: Channels, frames: usize) -> AudioBuffer<f32> {
+        let mut b = AudioBuffer::<f32>::new(frames as u64, SignalSpec::new(rate, channels));
+        b.render_reserved(Some(frames));
+        b
+    }
+
+    fn as_ref(b: &AudioBuffer<f32>) -> AudioBufferRef<'_> {
+        AudioBufferRef::F32(Cow::Borrowed(b))
+    }
+
+    /// The seek target is a plain product today; a caller-supplied
+    /// `Duration::MAX` against a stream whose duration is unknown overflows it.
+    #[test]
+    fn frames_at_is_exact_and_saturates_at_the_extremes() {
+        assert_eq!(frames_at(44_100, Duration::ZERO), 0);
+        assert_eq!(frames_at(44_100, Duration::from_millis(1_500)), 66_150);
+        assert_eq!(frames_at(8_000, Duration::from_millis(1_250)), 10_000);
+        assert_eq!(frames_at(1, Duration::from_secs(3)), 3);
+        // Hostile: must saturate, not overflow (which panics in a debug build)
+        // and not wrap in release.
+        assert_eq!(frames_at(44_100, Duration::MAX), u64::MAX);
+        assert_eq!(frames_at(1, Duration::from_secs(u64::MAX)), u64::MAX);
+        // What `seek` actually derives from that: bounded and convertible to a
+        // `Duration`.
+        assert_eq!(
+            frames_at(44_100, Duration::MAX).min(MAX_SEEK_FRAMES),
+            MAX_SEEK_FRAMES
+        );
+        assert!(
+            frames_at(44_100, Duration::MAX).min(MAX_SEEK_FRAMES) < 1 << 54,
+            "the capped target stays exact in f64"
+        );
+    }
+
+    /// `open_err` is the "not my format" side, `stream_err` must not collapse a
+    /// post-open `Unsupported` into it (that would claim the file is foreign).
+    #[test]
+    fn unsupported_input_is_classified_by_the_phase_it_happened_in() {
+        let open = open_err(SymError::Unsupported("core (probe): nothing found"));
+        assert!(matches!(open, Error::UnsupportedFormat(m) if m.contains("probe")));
+
+        let stream = stream_err(SymError::Unsupported("mpa: free bit-rate"));
+        assert!(matches!(stream, Error::Decode(m) if m.contains("free bit-rate")));
+
+        // I/O keeps its own kind in both phases.
+        for e in [
+            open_err(SymError::IoError(io::Error::other("x"))),
+            stream_err(SymError::IoError(io::Error::other("x"))),
+        ] {
+            assert!(matches!(e, Error::Io(_)), "{e:?}");
+        }
+    }
+
+    /// RFC 0002 C3: the change must be reported through the error, and it must
+    /// be `spec()` that names the new format — but only once the change has been
+    /// reported, so a `read` that still writes old-format frames is consistent.
+    #[test]
+    fn a_queued_format_change_is_reported_exactly_once_and_switches_the_spec() {
+        let mut spec = AudioSpec::new(44_100, 2);
+        let mut pending = None;
+        assert!(take_format_change(&mut spec, &mut pending).is_none());
+        assert_eq!(spec, AudioSpec::new(44_100, 2));
+
+        queue_format_change(&mut pending, AudioSpec::new(48_000, 1));
+        assert_eq!(
+            spec,
+            AudioSpec::new(44_100, 2),
+            "queuing must not switch yet"
+        );
+        match take_format_change(&mut spec, &mut pending) {
+            Some(Error::FormatChanged { from, to }) => {
+                assert_eq!(from, AudioSpec::new(44_100, 2));
+                assert_eq!(to, AudioSpec::new(48_000, 1));
+            }
+            other => panic!("expected FormatChanged, got {other:?}"),
+        }
+        assert_eq!(spec, AudioSpec::new(48_000, 1));
+        assert!(
+            take_format_change(&mut spec, &mut pending).is_none(),
+            "reported once, not on every read"
+        );
+        assert_eq!(spec, AudioSpec::new(48_000, 1));
+    }
+
+    /// A mid-stream sample-rate change is a *change*, not an end of stream: the
+    /// caller gets the new spec back and can keep reading (RFC 0002, C3.1).
+    #[test]
+    fn convert_reports_a_sample_rate_change_instead_of_ending_the_stream() {
+        let mut spec = AudioSpec::new(44_100, 2);
+        let mut sample_buf = None;
+        let mut pending = vec![9.0f32];
+        let buf = buffer(48_000, Channels::FRONT_LEFT | Channels::FRONT_RIGHT, 4);
+
+        let out = convert(as_ref(&buf), &mut spec, &mut sample_buf, &mut pending, 0);
+        assert!(
+            matches!(out, Converted::RateChanged(s) if s == AudioSpec::new(48_000, 2)),
+            "expected the new spec back"
+        );
+        assert_eq!(
+            spec,
+            AudioSpec::new(44_100, 2),
+            "caller switches, not convert"
+        );
+        assert_eq!(pending, vec![9.0f32], "no frames are added by a change");
+    }
+
+    /// The channel remap the module doc promises: mono is duplicated to the
+    /// opened count, extra channels are dropped, missing ones zero-filled.
+    #[test]
+    fn convert_remaps_the_channel_count_to_the_opened_spec() {
+        // mono buffer, stereo decoder: every sample appears twice.
+        let mut spec = AudioSpec::new(44_100, 2);
+        let mut sample_buf = None;
+        let mut pending = Vec::new();
+        let mut mono = buffer(44_100, Channels::FRONT_LEFT, 3);
+        mono.chan_mut(0).copy_from_slice(&[1.0, 2.0, 3.0]);
+        assert!(matches!(
+            convert(as_ref(&mono), &mut spec, &mut sample_buf, &mut pending, 0),
+            Converted::Samples
+        ));
+        assert_eq!(pending, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+
+        // stereo buffer, mono decoder: the extra channel is dropped.
+        let mut spec = AudioSpec::new(44_100, 1);
+        let mut sample_buf = None;
+        let mut pending = Vec::new();
+        let mut stereo = buffer(44_100, Channels::FRONT_LEFT | Channels::FRONT_RIGHT, 2);
+        stereo.chan_mut(0).copy_from_slice(&[1.0, 2.0]);
+        stereo.chan_mut(1).copy_from_slice(&[-1.0, -2.0]);
+        assert!(matches!(
+            convert(as_ref(&stereo), &mut spec, &mut sample_buf, &mut pending, 0),
+            Converted::Samples
+        ));
+        assert_eq!(pending, vec![1.0, 2.0]);
+    }
+
+    /// The seek lead-in is dropped from the buffer that carries the target.
+    #[test]
+    fn convert_drops_the_requested_lead_in_frames() {
+        let mut spec = AudioSpec::new(44_100, 1);
+        let mut sample_buf = None;
+        let mut pending = Vec::new();
+        let mut b = buffer(44_100, Channels::FRONT_LEFT, 4);
+        b.chan_mut(0).copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        assert!(matches!(
+            convert(as_ref(&b), &mut spec, &mut sample_buf, &mut pending, 3),
+            Converted::Samples
+        ));
+        assert_eq!(pending, vec![4.0]);
+        // A skip beyond the buffer cannot panic; it yields nothing.
+        assert!(matches!(
+            convert(as_ref(&b), &mut spec, &mut sample_buf, &mut pending, 99),
+            Converted::Samples
+        ));
+        assert!(pending.is_empty());
+    }
+
+    /// Incomplete codec parameters (rate unknown at open time) are learned from
+    /// the first buffer instead of leaving a zero spec behind.
+    #[test]
+    fn convert_learns_the_spec_from_the_first_buffer() {
+        let mut spec = AudioSpec::new(0, 0);
+        let mut sample_buf = None;
+        let mut pending = Vec::new();
+        let mut b = buffer(8_000, Channels::FRONT_LEFT, 2);
+        b.chan_mut(0).copy_from_slice(&[0.5, -0.5]);
+        assert!(matches!(
+            convert(as_ref(&b), &mut spec, &mut sample_buf, &mut pending, 0),
+            Converted::Samples
+        ));
+        assert_eq!(spec, AudioSpec::new(8_000, 1));
+        assert_eq!(pending, vec![0.5, -0.5]);
     }
 }
