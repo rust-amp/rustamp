@@ -21,15 +21,27 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Python (standard library license auditor)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # A fresh checkout has a lockfile, not cached package manifests.
+      # This is the explicit network step; the actual audit stays offline.
+      - name: Fetch locked dependency manifests
+        run: cargo fetch --locked
+
       # RFC 0004 acceptance 4, the load-bearing invariant of the licensing
-      # split: rustamp-proto, rustamp-plugin-abi, rustamp-ipc and
-      # rustamp-plughost are MIT OR Apache-2.0, so no copyleft crate may enter
-      # their dependency closure. The script uses cargo only (cargo tree), for
-      # all four crates on both Windows targets. `cargo tree --target` resolves
-      # the graph and never builds, so the i686 target's std is not needed here.
+      # split: proto, plugin-abi, ipc, plughost and mediahost are permissive.
+      # Discover any additional permissive members; check normal closures with
+      # all features on both Windows targets and the complete lock inventory.
+      # Metadata never builds; the i686 target's std is not needed here.
       - name: Check the permissive crates' dependency closures
         shell: bash
         run: bash .github/scripts/check-permissive-licenses.sh
+
+      - name: Check license auditor failure paths (metadata fixtures only)
+        run: python .github/scripts/check-license-audit.py
 
   windows:
     name: Windows (required)

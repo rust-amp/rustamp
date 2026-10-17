@@ -4,7 +4,7 @@
 We are building **Rustamp**, a new media player that looks, feels and behaves like **Winamp 2.95** on Windows. It is written in Rust on a modern audio and graphics stack, runs classic Winamp 2.x plugins (above all visualizations such as MilkDrop 2 and AVS), and will ship for Linux and macOS later, with Wine running the legacy plugins there. The repo `D:\code\Rustamp` is empty, so this is a greenfield project. Many LLM agents will do the work in parallel, so the plan is built around **contracts first, then parallel lanes**, with a strict **clean-room** process for anything taken from Winamp itself.
 
 Decisions already made:
-- **License: GPL-3.0, split by RFC 0004.** The player and every crate except the plugin-facing ones stay **GPL-3.0-or-later**; the plugin-facing crates (`rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`) are **MIT OR Apache-2.0**, so the process that loads plugin DLLs imposes no copyleft on a plugin of any license, and the GPL crates that contain only our own code carry a GPL-3.0 §7 plugin exception ([docs/rfc/0004-plugin-licensing.md](rfc/0004-plugin-licensing.md), [PLUGIN-EXCEPTION.md](../PLUGIN-EXCEPTION.md)). This keeps the decoder sources the plan depends on available: we may take code from DeaDBeeF (its zlib core and its GPL/LGPL plugins), webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib) and libopenmpt (BSD).
+- **License: GPL-3.0, split by RFC 0004 and its §7 erratum.** The player and every crate except the five permissive ones stay **GPL-3.0-or-later**; `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost` and `rustamp-mediahost` are **MIT OR Apache-2.0**, so the process that loads plugin DLLs imposes no copyleft on a plugin of any license. `rustamp-mediahost` is only the protocol framework; a resident helper carries its resident's license (RFC 0006 §8). The GPL crates in the scope of [PLUGIN-EXCEPTION.md](../PLUGIN-EXCEPTION.md) carry a GPL-3.0 §7 plugin exception for Rustamp's own code only ([RFC 0004](rfc/0004-plugin-licensing.md)). Third-party license compatibility and exception scope must be reviewed before copying or linking DeaDBeeF (zlib/GPL/LGPL), webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib) or libopenmpt (BSD) material; the exception grants no rights in their code.
 - **Skins.**
   - The bundled default is a **look-alike skin**: newly drawn artwork that closely mimics the classic base skin's layout, colors and style, without copying any pixels.
   - The **original base skin** (taken from webamp's `base-2.91`) is offered as a **separate, optional download** with its own repo and package. It is never bundled in the installer.
@@ -55,7 +55,8 @@ rustamp.exe (x64)                                     rustamp-plughost32.exe (i6
 The player keeps its copyleft; the plugin edge does not have any. Per
 [RFC 0004](rfc/0004-plugin-licensing.md): the player and all crates other than
 the plugin-facing ones are **GPL-3.0-or-later**; `rustamp-proto` (the wire
-types), `rustamp-plugin-abi`, `rustamp-ipc` and `rustamp-plughost` are
+types), `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost` and the
+`rustamp-mediahost` protocol framework (RFC 0006 §8) are
 **MIT OR Apache-2.0**. The host binary `rustamp-plughost32.exe` — the process
 that actually loads plugin DLLs — therefore links no GPL code, so no copyleft
 reaches a plugin of any license (including GPL-2.0-only plugins, which are

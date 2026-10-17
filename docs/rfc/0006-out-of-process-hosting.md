@@ -218,7 +218,10 @@ supervision) and links no decoder, so it is **MIT OR Apache-2.0** and belongs to
 the permissive set. **Each resident gets its own crate and binary**
 (`rustamp-mediahost-<resident>`, e.g. `rustamp-mediahost-sidplayfp`), and that
 crate carries **the resident's license**: a sidplayfp host is GPL because
-sidplayfp is, a symphonia host would be permissive because symphonia is. The
+sidplayfp is. **License correction (2026-10-17):** Symphonia 0.5.5 declares
+**MPL-2.0**, a weak-copyleft license, not a permissive license. A future
+Symphonia resident must preserve those obligations; the permissive framework
+must not acquire it as a normal dependency. The
 copyleft therefore sits in the resident crate rather than in the framework, and
 the permissive closure of the framework stays GPL-free (it depends only on
 `rustamp-ipc`, `rustamp-proto` and `thiserror`).

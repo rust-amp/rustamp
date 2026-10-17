@@ -39,8 +39,8 @@ webamp MIT code, so it is not "only our own code"): only a copyright holder may
 grant this exception for their own code, so a crate that includes someone else's
 code cannot extend the permission to that code.
 
-The plugin-facing crates `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`
-and `rustamp-plughost` do **not** need this permission: they are licensed
+The five permissive crates `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`,
+`rustamp-plughost` and `rustamp-mediahost` do **not** need this permission: they are licensed
 `MIT OR Apache-2.0` and carry no copyleft at all (RFC 0004). The permission
 exists for the GPL player, so that the player ↔ plugin-host edge is covered for
 Rustamp's own code even under the strictest reading of the FSF's plugin and
@@ -52,6 +52,10 @@ shared-memory positions.
   who conveys a copy remove it, and modified versions need not carry it. The
   permissive license on the plugin-facing crates is the durable instrument; this
   permission is the companion for the player.
+* A GPL-compatible dependency is not automatically plugin-exception-compatible.
+  This permission cannot extend to third-party GPL code, whether copied or
+  linked. Review that combination before adding it; do not put copyleft in the
+  permissive host's dependency closure. See `CONTRIBUTING.md` §Dependencies.
 * Because the project is GPL-3.0-**or-later**, the permission is worded to apply
   under any version of the GPL the recipient elects.
 * This document is not legal advice. The FSF's own publications say the same of

@@ -14,6 +14,13 @@ decision, and it is what an implementer works from.
 
 ## 1. Decision
 
+**Current reading (2026-10-17):** the historical four-crate wording in §§1/4
+below is superseded by §7 and RFC 0006 §8: add `rustamp-mediahost` to make
+**five** permissive crates. Its per-resident helpers are separate. Acceptance 4
+now checks all workspace permissive roots, all features and both Windows
+targets against a permissive allowlist (not merely a GPL substring blacklist).
+Unknown/missing metadata fails; `THIRD_PARTY.md` covers the entire lockfile.
+
 1. A new crate **`rustamp-proto`** holds every type that crosses the process
    boundary between `rustamp.exe` and `rustamp-plughost32.exe`.
 2. **`rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc` and

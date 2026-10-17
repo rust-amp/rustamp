@@ -1,5 +1,11 @@
 # Task card L1 — Implement the plugin-facing licensing split (RFC 0004)
 
+**Historical card, updated reading (2026-10-17):** the four-crate implementation
+below predates RFC 0006 §8. The current set also includes `rustamp-mediahost`
+(protocol framework only), making five. Do not use this card's original list
+as the current licensing inventory; see `V3-license-readiness.md` and
+`THIRD_PARTY.md`. No implementation scope is reopened by this clarification.
+
 **Goal**
 Implement [RFC 0004](../../docs/rfc/0004-plugin-licensing.md): extract the
 wire types into a new permissive `rustamp-proto` crate, relicense the

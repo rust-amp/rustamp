@@ -1,5 +1,13 @@
 # Task card V1 — CI check: permissive crates stay GPL-free (M1)
 
+**Historical card, superseded (2026-10-17):** current requirements are in
+`V3-license-readiness.md`: five mandatory roots including `rustamp-mediahost`,
+automatic additional-root discovery, all features, both Windows targets,
+permissive allowlist and complete lockfile notices. The implementation now
+uses Cargo metadata plus Python >= 3.11 (stdlib), with explicit CI cache
+population before its offline/locked check. The original four-root,
+cargo-only/GPL-substring instructions below are not the current gate.
+
 **Goal**
 Add a CI job that fails the build if any GPL-licensed crate enters the
 dependency closure of `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc` or

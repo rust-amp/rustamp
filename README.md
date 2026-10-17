@@ -49,12 +49,15 @@ DLLs must not carry copyleft onto plugins of other licenses:
 | Part | License |
 |---|---|
 | `rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`, `rustamp-mediahost` | **MIT OR Apache-2.0** |
-| everything else (the player and its crates) | **GPL-3.0-or-later**, with an additional permission |
-| a per-resident helper crate (`rustamp-mediahost-<resident>`) | **the resident's own license** — the sidplayfp host is GPL because sidplayfp is, a symphonia host is permissive because symphonia is |
+| everything else (the player and its crates) | **GPL-3.0-or-later**; additional permission only within the scope below |
+| a future per-resident helper crate (`rustamp-mediahost-<resident>`) | **the resident's own license obligations** — the sidplayfp host is GPL; Symphonia is **MPL-2.0 (weak copyleft), not permissive** |
 
-The GPL crates carry a GPL-3.0 §7 additional permission so that combining them
+The GPL crates listed in the scope of `PLUGIN-EXCEPTION.md` carry a GPL-3.0 §7
+additional permission for Rustamp's own code only, so that combining them
 with modules that speak the documented plugin ABI or the documented IPC protocol
-needs no further grant: see [PLUGIN-EXCEPTION.md](PLUGIN-EXCEPTION.md). The
+needs no further grant for that covered code: see [PLUGIN-EXCEPTION.md](PLUGIN-EXCEPTION.md).
+It cannot grant rights in third-party copyleft material; `rustamp-decoders`,
+`rustamp-skin` and per-resident helpers are not covered by its scope. The
 decision and its reasoning are in
 [docs/rfc/0004-plugin-licensing.md](docs/rfc/0004-plugin-licensing.md) and
 [docs/notes/L-licensing-plugins.md](docs/notes/L-licensing-plugins.md); the

@@ -18,7 +18,7 @@ Rustamp re-implements a product whose source code is not free. We keep Winamp's 
 
 "Dirty" sources are those that may only be read in the dirty room. "Free" sources are open-licensed projects that may be read and, with attribution, copied.
 
-Rustamp's **own** license is split by [RFC 0004](docs/rfc/0004-plugin-licensing.md): the player stays GPL-3.0-or-later, while the plugin-facing crates (`rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`) are MIT OR Apache-2.0 and the GPL crates that contain only our own code carry a GPL-3.0 §7 plugin exception ([PLUGIN-EXCEPTION.md](PLUGIN-EXCEPTION.md)). This changes nothing in this file: the source table above and the copying and attribution rules in section 7 apply to every crate, whatever that crate's own license is.
+Rustamp's **own** license is split by [RFC 0004](docs/rfc/0004-plugin-licensing.md) and its §7 erratum: the player stays GPL-3.0-or-later, while the five permissive crates (`rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`, `rustamp-mediahost`) are MIT OR Apache-2.0. The last is only the media-host protocol framework, not a decoder resident. The GPL crates in the scope of [PLUGIN-EXCEPTION.md](PLUGIN-EXCEPTION.md) carry a GPL-3.0 §7 plugin exception for our own code only. This changes nothing in this file: the source table above and the copying and attribution rules in section 7 apply to every crate, whatever that crate's own license is.
 
 ## 2. Roles
 
@@ -81,6 +81,11 @@ Free-licensed code may be copied into Rustamp, with these requirements:
 3. Add an attribution comment at the top of the copied section if the license requires it (MIT, zlib and BSD all do).
 4. Sources in this category are DeaDBeeF, webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib), libopenmpt (BSD) and projectM (LGPL, reference only; do not copy from projectM without a separate review).
 5. A PR that copies third-party code must list it in the provenance checklist with the source, license and attribution added.
+
+Rust dependencies, including transitive and target/build/dev dependencies, are
+also recorded in `THIRD_PARTY.md` against `Cargo.lock`; see
+[CONTRIBUTING.md](CONTRIBUTING.md#dependencies). Registry dependencies are not
+copied-source ports, but their notices and license obligations still apply.
 
 Copying from a dirty source is never allowed, even if the code is later modified. Modifying Winamp 5.x source does not make it clean.
 

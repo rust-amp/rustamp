@@ -2,6 +2,14 @@
 
 Status: licensing research report, decision-ready. Research and analysis only — this report changes no code, no license file, no crate, no doc other than itself.
 
+**Historical snapshot (2026-10-14), current-state clarification 2026-10-17:**
+the proposals and dependency descriptions below precede implementation. The
+current permissive set is **five** crates: `rustamp-proto`, `rustamp-plugin-abi`,
+`rustamp-ipc`, `rustamp-plughost`, `rustamp-mediahost` (protocol framework only).
+RFC 0004 §7 and RFC 0006 §8 supersede older lists. Current manifests and
+`THIRD_PARTY.md`, not this research snapshot, define the implemented split;
+see `docs/tasks/V3-license-readiness.md` for the enforcement audit.
+
 - Written by: licensing research subagent (spawned session), 2026-10-14.
 - Question: can Rustamp (GPL-3.0-or-later) run **both proprietary and open-source classic Winamp 2.x plugins** (`in_`, `out_`, `vis_`, `dsp_`, `gen_`)?
 - Repo facts used: `docs/PLAN.md` (§1 source table, §2 architecture, milestones), `CLEANROOM.md` (§1, §4, §7), `THIRD_PARTY.md`, `docs/HANDOFF.md`, `LICENSE`, `Cargo.toml` (workspace + crates), `CONTRIBUTING.md`, git metadata (18 commits, one identity, no remote).

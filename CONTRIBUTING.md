@@ -15,7 +15,7 @@ Thanks for helping. Please read this file and [CLEANROOM.md](CLEANROOM.md) befor
 By submitting a contribution you license it under the license of the crate you
 contribute to — **inbound = outbound**. Most crates are
 **GPL-3.0-or-later**; the plugin-facing crates `rustamp-proto`,
-`rustamp-plugin-abi`, `rustamp-ipc` and `rustamp-plughost` are
+`rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost` and `rustamp-mediahost` are
 **MIT OR Apache-2.0** ([RFC 0004](docs/rfc/0004-plugin-licensing.md)). Do not
 contribute code you cannot license under the target crate's license, and say so
 if a contribution is meant to carry a different license.
@@ -33,19 +33,54 @@ contributor's consent.
   constraint here (the audio thread's no-allocation/no-lock rule, the MSRV, or a
   contract we must not change).
 - **The license must be compatible, and it decides who may depend on what.**
-  For the GPL crates (GPL-3.0-or-later with the §7 plugin exception) any
-  GPL-compatible license works. For the four permissive crates
-  (`rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`)
-  only a permissive license is allowed, because they must stay GPL-free — the
-  `licenses` CI job enforces exactly that. Check the license before adding, and
+  For GPL crates the dependency must be GPL-3.0-or-later compatible, **and must
+  not defeat the plugin exception**: our §7 permission cannot grant rights in
+  third-party GPL material (`PLUGIN-EXCEPTION.md`, permission and scope).
+  Review the resulting player/plugin combination before introducing third-party
+  copyleft, including through linking rather than copying; do not claim the
+  exception extends to that dependency. A plain GPL-2.0-only dependency is not
+  GPL-3.0 compatible. For the **five** permissive crates
+  (`rustamp-proto`, `rustamp-plugin-abi`, `rustamp-ipc`, `rustamp-plughost`,
+  `rustamp-mediahost`) only permissive licenses are allowed throughout their
+  normal dependency closures, including optional features and target-specific
+  dependencies. In particular, no dependency of the DLL-loading host may impose
+  copyleft on a plugin; our GPL exception cannot cure that. The `licenses` job
+  checks these closures for both Windows targets with all features against a
+  conservative license-identifier allowlist. Unknown, missing, malformed and
+  non-allowlisted licenses fail, even a copyleft branch in an `OR` expression.
+  A legitimate new permissive identifier needs a documented license review
+  before expanding the allowlist, not a per-crate owner approval. Check the
+  license before adding, and
   check the crate's own manifest rather than a directory API: `rubato`, for
   example, has an empty license field on crates.io and `NOASSERTION` on GitHub,
   but declares `MIT OR Apache-2.0` in its `Cargo.toml`.
 - **Adding a Rust dependency no longer needs a per-crate owner approval**
   (owner rule, 2026-10-17), but the license check and the record are not
-  optional: **record every new dependency** in `THIRD_PARTY.md` with its license
-  and what it is used for, and add it to the permissive-license check's closure
-  if it lands in a permissive crate.
+  optional: update the owning `Cargo.toml` (and root `[workspace.dependencies]`
+  when shared), include the resolved `Cargo.lock` in the change, and **record every new
+  dependency version**, including transitives, in `THIRD_PARTY.md`. Record the
+  direct dependency's purpose/consumer separately from the generated inventory.
+  Print the replacement inventory with
+  `python .github/scripts/license-audit.py --inventory`, review it, and replace
+  only its marked block. Then run
+  `bash .github/scripts/check-permissive-licenses.sh` from the checkout root
+  (Git Bash on Windows), or `python .github/scripts/license-audit.py` directly.
+  Root/closure discovery is automatic; do not add package names to a manual
+  closure or set coverage overrides. Requires Python >= 3.11, Cargo, a current
+  lockfile and cached manifests/index/sources. It is offline/locked and builds
+  nothing; a cold checkout needs an explicitly authorized `cargo fetch --locked`
+  first (ordinary dependency acquisition is covered by the owner rule above).
+  Report the exact name/version/license, manifest/license-file evidence,
+  direct/transitive lock delta, consumers/features/targets, inventory diff and
+  check exit/output. Run tests only through the Hyper-V test-VM workflow, never
+  on the host.
+- **The automatic check is not legal clearance.** It covers normal edges, not
+  build/dev edges, arbitrary native libraries linked by `build.rs`, copied code,
+  license-text correctness or GPL-side plugin-exception compatibility. Review
+  those explicitly, including generated code and all enabled feature variants;
+  preserve required notices and source obligations. Record that review in the
+  lane's evidence. A passing metadata check is not evidence that an upstream
+  declaration describes every bundled file or that an artifact is compliant.
 
 ## Coding standards
 
@@ -62,7 +97,7 @@ contributor's consent.
 - **Unit tests** are expected for every new module. Put them next to the code in `#[cfg(test)]` modules, or in `tests/` for integration tests.
 - **Property tests** where they fit (playlist operations, shuffle, title formatting, parsers).
 - **Golden tests** (image and audio comparisons) run later via `cargo xtask golden`. Every window or renderer change should add or update a golden case once the harness exists. Golden tests run with both the original base skin and the look-alike default skin.
-- Run `cargo test --workspace --all-features` before you open a PR. Put the results in the PR's test evidence section.
+- Run `cargo test --workspace --all-features` **in the Hyper-V test VM, never on the host**, before you open a PR. Put the VM results in the PR's test evidence section; a host compile/check is not a test run.
 - **`RUSTAMP_TESTDATA`** points at a directory holding the `classic-base` skin used by the golden tests. **It is unset by default, and the `classic-base` cases skip silently when it is** — set it locally to run them. The free webamp checkout contains the original base skin (`base-2.91`); point the variable at its parent directory. A skipped golden case is not a passed one: if your change touches the renderer, run the golden tests with the variable set and say so in the PR.
 
 ## Provenance (required)
