@@ -12,9 +12,12 @@
 //! The bundled copy changes no licence file on either side: the player
 //! directory keeps exactly the GPL set, the host directory exactly the
 //! permissive set. A manifest records what went where.
+//! Both packaged binaries use the static MSVC CRT; ordinary workspace builds
+//! are unaffected. Windows system DLLs (and WOW64 for the host) are still needed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::{cargo, run_status};
 
@@ -25,6 +28,13 @@ const PLAYER_TARGET: &str = "x86_64-pc-windows-msvc";
 const HOST_CRATE: &str = "rustamp-plughost";
 const HOST_BIN: &str = "rustamp-plughost32";
 const HOST_TARGET: &str = "i686-pc-windows-msvc";
+
+// Encoded flags take precedence over inherited RUSTFLAGS and Cargo target
+// rustflags. Own the complete package-build flags rather than allowing a caller
+// to silently negate the runtime policy. Explicit --target keeps these flags
+// off host-side proc macros/build scripts.
+const PACKAGE_RUSTFLAGS: &str = "-C\x1ftarget-feature=+crt-static";
+const RUNTIME_MANIFEST: &str = r#"{"crt":"msvc","crt_linkage":"static","rustflags":["-C","target-feature=+crt-static"],"vc_redist_required":false,"bundled_runtime_dlls":[],"system_dlls_required":true,"artifact_imports_verified":false}"#;
 
 // GPL closure check for the host runs against this crate list. Kept in sync
 // with `.github/scripts/check-permissive-licenses.sh`.
@@ -50,6 +60,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // Run it on every invocation, including dry runs, so the proof is always
     // exercised without needing a release build.
     check_host_closure(&root)?;
+    check_runtime_contract(&root)?;
 
     if parsed.dry_run || parsed.check {
         println!("xtask package: dry run (no files written)");
@@ -65,6 +76,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
         println!("  player target:  {} ({})", PLAYER_TARGET, PLAYER_CRATE);
         println!("  host target:    {} ({})", HOST_TARGET, HOST_CRATE);
         println!("  GPL-free check: OK (host closure contains no copyleft crate)");
+        println!(
+            "  runtime contract: OK (both targets: static MSVC CRT, no VC redist/DLL payload)"
+        );
+        println!(
+            "  prerequisites: Windows x64; WOW64 for the i686 host; system DLLs remain required"
+        );
+        println!("  output: generated QUICKSTART.md and runtime policy in all manifests");
+        println!("  not proven: DLL imports or first launch on a clean OS");
         if !parsed.player_only && !parsed.host_only {
             println!(
                 "  player bundles host: yes ({} beside {}: RFC 0006 §8, \
@@ -90,11 +109,23 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 binary_name(HOST_BIN)
             );
         }
+        if parsed.check && out_dir.exists() {
+            audit_package_layout(
+                &out_dir,
+                if parsed.release { "release" } else { "debug" },
+                !parsed.host_only,
+                !parsed.player_only,
+            )?;
+            println!("  existing layout: OK (files/manifests only; no binary executed)");
+        }
         return Ok(());
     }
 
     let profile = if parsed.release { "release" } else { "debug" };
 
+    // Never silently retain old CRT DLLs, wrong-side licences or a stale host.
+    // Refuse rather than delete somebody else's output.
+    require_empty_output(&out_dir)?;
     fs::create_dir_all(&out_dir).map_err(|e| format!("create output dir: {e}"))?;
 
     let build_player = !parsed.host_only;
@@ -151,6 +182,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let per_package = serde_manifest_player(profile, bundled_host);
         fs::write(dir.join("manifest.json"), per_package)
             .map_err(|e| format!("write player manifest: {e}"))?;
+        fs::write(
+            dir.join("QUICKSTART.md"),
+            quickstart(profile, true, bundled_host),
+        )
+        .map_err(|e| format!("write player quickstart: {e}"))?;
 
         manifest_items.push("player".to_string());
         println!("xtask package: player -> {}", dir.display());
@@ -195,6 +231,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let bundled_host = player_src.is_some() && host_src.is_some();
     let top = build_top_manifest(&out_dir, profile, build_player, build_host, bundled_host);
     fs::write(out_dir.join("manifest.json"), top).map_err(|e| format!("write manifest: {e}"))?;
+    fs::write(
+        out_dir.join("QUICKSTART.md"),
+        quickstart(profile, build_player, bundled_host),
+    )
+    .map_err(|e| format!("write quickstart: {e}"))?;
+    audit_package_layout(&out_dir, profile, build_player, build_host)?;
 
     println!(
         "xtask package: manifest -> {}",
@@ -274,10 +316,10 @@ fn print_help() {
          --release               release build (default)\n  \
          --debug                 debug build\n  \
          --dry-run               print the plan and run the GPL-free check, build nothing\n  \
-         --check                 run the GPL-free check only\n  \
+         --check                 check closure/runtime contract; audit output if present; build nothing\n  \
          --player-only           package only the GPL player\n  \
          --host-only             package only the permissive plugin host\n  \
-         --out <dir>            output directory (default: target/package)\n  \
+         --out <dir>            empty output directory (default: target/package)\n  \
          -h, --help             show this help"
     );
 }
@@ -293,17 +335,11 @@ fn build_artifact(
     bin: &str,
     release: bool,
 ) -> Result<PathBuf, String> {
-    let mut cmd = cargo();
-    cmd.current_dir(root);
-    cmd.args(["build", "-p", crate_name, "--target", target]);
-    if release {
-        cmd.arg("--release");
-    }
+    let mut cmd = artifact_command(root, crate_name, target, bin, release);
     run_status(&mut cmd)?;
 
     let profile = if release { "release" } else { "debug" };
-    let src = root
-        .join("target")
+    let src = package_build_dir(root)
         .join(target)
         .join(profile)
         .join(binary_name(bin));
@@ -311,6 +347,41 @@ fn build_artifact(
         return Err(format!("expected binary not found at {}", src.display()));
     }
     Ok(src)
+}
+
+fn package_build_dir(root: &Path) -> PathBuf {
+    // A separate cache prevents accidental staging of ordinary dynamic-CRT
+    // workspace outputs and ignores a caller's external CARGO_TARGET_DIR.
+    root.join("target").join("package-build")
+}
+
+fn artifact_command(
+    root: &Path,
+    crate_name: &str,
+    target: &str,
+    bin: &str,
+    release: bool,
+) -> Command {
+    let mut cmd = cargo();
+    cmd.current_dir(root);
+    cmd.args([
+        "build",
+        "--offline",
+        "--locked",
+        "-p",
+        crate_name,
+        "--bin",
+        bin,
+        "--target",
+        target,
+    ]);
+    cmd.env_remove("RUSTFLAGS");
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", PACKAGE_RUSTFLAGS);
+    cmd.env("CARGO_TARGET_DIR", package_build_dir(root));
+    if release {
+        cmd.arg("--release");
+    }
+    cmd
 }
 
 fn copy_file(src: &Path, dst: &Path) -> Result<(), String> {
@@ -327,6 +398,8 @@ fn check_host_closure(root: &Path) -> Result<(), String> {
     cmd.current_dir(root);
     cmd.args([
         "tree",
+        "--offline",
+        "--locked",
         "-p",
         "rustamp-plughost",
         "--target",
@@ -442,9 +515,11 @@ fn build_top_manifest(
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("{".to_string());
-    lines.push("  \"schema_version\": 1,".to_string());
+    lines.push("  \"schema_version\": 2,".to_string());
     lines.push("  \"generated_by\": \"cargo xtask package\",".to_string());
     lines.push(format!("  \"profile\": \"{profile}\","));
+    lines.push("  \"quickstart\": \"QUICKSTART.md\",".to_string());
+    lines.push(format!("  \"runtime\": {RUNTIME_MANIFEST},"));
     if player {
         lines.push("  \"player\": {".to_string());
         lines.push("    \"package_dir\": \"player\",".to_string());
@@ -467,6 +542,11 @@ fn build_top_manifest(
         }
         lines.push(format!("    \"crate\": \"{PLAYER_CRATE}\","));
         lines.push(format!("    \"target\": \"{PLAYER_TARGET}\","));
+        lines.push(format!("    \"runtime\": {RUNTIME_MANIFEST},"));
+        if bundled_host {
+            lines.push(format!("    \"bundled_host_runtime\": {RUNTIME_MANIFEST},"));
+            lines.push("    \"bundled_host_requires_wow64_on_x64\": true,".to_string());
+        }
         lines.push("    \"license\": \"GPL-3.0-or-later\", ".to_string());
         lines.push(
             "    \"license_files\": [\"player/LICENSE\", \"player/PLUGIN-EXCEPTION.md\"],"
@@ -485,6 +565,8 @@ fn build_top_manifest(
         ));
         lines.push(format!("    \"crate\": \"{HOST_CRATE}\","));
         lines.push(format!("    \"target\": \"{HOST_TARGET}\","));
+        lines.push(format!("    \"runtime\": {RUNTIME_MANIFEST},"));
+        lines.push("    \"requires_wow64_on_x64\": true,".to_string());
         lines.push("    \"license\": \"MIT OR Apache-2.0\", ".to_string());
         lines.push(
             "    \"license_files\": [\"host/LICENSE-MIT\", \"host/LICENSE-APACHE\"],".to_string(),
@@ -512,7 +594,9 @@ fn serde_manifest_player(profile: &str, bundled_host: bool) -> String {
         format!(
             "\n  \"bundled_host\": \"{bin}\",\n  \
              \"host_resolution\": \"RFC 0006 §8: beside rustamp.exe \
-             (the first supervise.rs candidate)\",",
+             (the first supervise.rs candidate)\",\n  \
+             \"bundled_host_runtime\": {RUNTIME_MANIFEST},\n  \
+             \"bundled_host_requires_wow64_on_x64\": true,",
             bin = binary_name(HOST_BIN),
         )
     } else {
@@ -522,6 +606,7 @@ fn serde_manifest_player(profile: &str, bundled_host: bool) -> String {
         "{{\n  \"package\": \"rustamp-player\",\n  \"profile\": \"{profile}\",\n  \
          \"binary\": \"{bin}\",{bundled}\n  \"crate\": \"{crate_}\",\n  \
          \"target\": \"{target}\",\n  \"license\": \"GPL-3.0-or-later\",\n  \
+         \"runtime\": {RUNTIME_MANIFEST},\n  \"quickstart\": \"QUICKSTART.md\",\n  \
          \"license_files\": [\"LICENSE\", \"PLUGIN-EXCEPTION.md\"],\n  \
          \"gpl\": true\n}}\n",
         profile = profile,
@@ -537,6 +622,7 @@ fn serde_manifest_host(profile: &str) -> String {
         "{{\n  \"package\": \"rustamp-plughost\",\n  \"profile\": \"{profile}\",\n  \
          \"binary\": \"{bin}\",\n  \"crate\": \"{crate_}\",\n  \
          \"target\": \"{target}\",\n  \"license\": \"MIT OR Apache-2.0\",\n  \
+         \"runtime\": {RUNTIME_MANIFEST},\n  \"requires_wow64_on_x64\": true,\n  \
          \"license_files\": [\"LICENSE-MIT\", \"LICENSE-APACHE\"],\n  \
          \"contains_gpl_binary\": false,\n  \
          \"gpl_free_check\": \"cargo tree -p rustamp-plughost --target i686-pc-windows-msvc -e normal\"\n}}\n",
@@ -547,9 +633,317 @@ fn serde_manifest_host(profile: &str) -> String {
     )
 }
 
+fn quickstart(profile: &str, player: bool, bundled_host: bool) -> String {
+    if !player {
+        return "# Rustamp plugin host\n\n\
+                This is the standalone i686 helper, not the player. Do not launch it directly.\n\
+                Use the full player package for listening to music.\n\n\
+                Runtime policy: static MSVC CRT; no VC++ redistributable or runtime DLLs\n\
+                are shipped or required by this policy. Windows system DLLs and WOW64\n\
+                on x64 Windows are still required. DLL imports and clean-OS launch\n\
+                must be verified by the release process. See host/manifest.json.\n"
+            .to_string();
+    }
+    let mut text = r#"# Rustamp beta quick start
+
+Use Windows 10/11 x64 (WOW64 is needed for the 32-bit helper). Package policy:
+packaged EXEs use the static MSVC CRT, so no VC++ redistributable installation or
+app-local CRT DLLs are needed. Windows system DLLs are still required. Final DLL
+imports and launch on a truly clean OS still need release validation.
+
+Open PowerShell in the folder containing rustamp.exe, then run:
+
+```powershell
+.\rustamp.exe "C:\Music\song.mp3"
+```
+
+One local media file is supported per launch; it is queued and played. With no
+file, the player starts empty. Use a known-good MP3, FLAC or WAV first; do not
+rely on the beta's unfinished file-opening dialogs or plugin/stream support.
+
+Two useful first-run switches:
+- `--skin "C:\Skins\example.wsz"`: a skin is classic player artwork/layout,
+  supplied as a .wsz/.zip archive or a folder. It is optional, not an audio codec.
+  No external skin is bundled; this beta's built-in fallback is placeholder art.
+- `--no-audio`: open the window without an audio device, intentionally silent.
+
+Example: `.\rustamp.exe "C:\Music\song.mp3" --skin "C:\Skins\example.wsz"`
+
+If nothing plays: check the file exists, Windows' default playback device and
+mixer volume; omit --no-audio/--null, and try `--volume 200`. Restart after a
+device change. Startup may fail before any window if no audio device is usable.
+Run from PowerShell with `2> rustamp-startup.log` appended and keep that log.
+For a no-window/no-sound decoder diagnostic, use:
+`.\rustamp.exe "C:\Music\song.mp3" --null --seconds 5`.
+GUI errors are not all visible yet; apparent playback is not proof of sound.
+
+No configuration file is needed. It reads %APPDATA%\Rustamp\rustamp.toml
+(or the RUSTAMP_CONFIG override); UI changes are not saved by this beta.
+The helper is not a user entry point; do not launch it directly.
+This folder is not an installer or a signed/externally cleared release.
+"#
+    .to_string();
+    if !bundled_host {
+        text.push_str(
+            "\nPlayer-only package: no helper is bundled; plugin supervision stays detached.\n",
+        );
+    }
+    if profile == "debug" {
+        text.push_str("\nDebug build: the GUI safety gate normally refuses outside the test VM.\nUse a release package for first-user launch; do not bypass the host GUI rule.\n");
+    }
+    text
+}
+
+/// Read-only headless guard, run even without artifacts by `package --check`.
+/// It checks the actual command factory and generated policy, not PE imports.
+fn check_runtime_contract(root: &Path) -> Result<(), String> {
+    for (crate_name, target, bin) in [
+        (PLAYER_CRATE, PLAYER_TARGET, PLAYER_BIN),
+        (HOST_CRATE, HOST_TARGET, HOST_BIN),
+    ] {
+        for release in [false, true] {
+            let cmd = artifact_command(root, crate_name, target, bin, release);
+            let env: Vec<_> = cmd.get_envs().collect();
+            let flags_ok = env.iter().any(|(key, value)| {
+                *key == "CARGO_ENCODED_RUSTFLAGS"
+                    && *value == Some(std::ffi::OsStr::new("-C\x1ftarget-feature=+crt-static"))
+            });
+            let cache = package_build_dir(root);
+            let cache_ok = env.iter().any(|(key, value)| {
+                *key == "CARGO_TARGET_DIR" && *value == Some(cache.as_os_str())
+            });
+            let args: Vec<_> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+            if !flags_ok
+                || !cache_ok
+                || !args.windows(2).any(|a| a == ["--target", target])
+                || !args.windows(2).any(|a| a == ["--bin", bin])
+            {
+                return Err(format!("static MSVC CRT build contract failed for {bin}"));
+            }
+        }
+    }
+    for manifest in [
+        serde_manifest_player("release", false),
+        serde_manifest_player("release", true),
+        serde_manifest_host("release"),
+        build_top_manifest(root, "release", true, true, true),
+        build_top_manifest(root, "release", true, false, false),
+        build_top_manifest(root, "release", false, true, false),
+    ] {
+        for required in [
+            "\"crt_linkage\":\"static\"",
+            "target-feature=+crt-static",
+            "\"vc_redist_required\":false",
+            "\"bundled_runtime_dlls\":[]",
+            "\"artifact_imports_verified\":false",
+        ] {
+            if !manifest.contains(required) {
+                return Err(format!("runtime manifest contract missing {required}"));
+            }
+        }
+    }
+    let guide = quickstart("release", true, true);
+    if !["--skin", "--no-audio", "--null", "static MSVC CRT"]
+        .iter()
+        .all(|required| guide.contains(required))
+    {
+        return Err("quickstart runtime/CLI contract failed".to_string());
+    }
+    Ok(())
+}
+
+fn require_empty_output(dir: &Path) -> Result<(), String> {
+    if dir.exists()
+        && fs::read_dir(dir)
+            .map_err(|e| format!("read output dir: {e}"))?
+            .next()
+            .is_some()
+    {
+        return Err(format!(
+            "output {} is not empty; choose a new --out directory (nothing removed)",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Exact allowlists preserve the licence split and reject stale runtime DLLs.
+/// No executable is loaded or run; non-empty files are only layout evidence.
+fn audit_directory(dir: &Path, files: &[&str], dirs: &[&str]) -> Result<(), String> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("read package entry: {e}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = entry.file_type().map_err(|e| format!("stat {name}: {e}"))?;
+        let expected = (kind.is_file() && files.contains(&name.as_str()))
+            || (kind.is_dir() && dirs.contains(&name.as_str()));
+        if !expected {
+            return Err(format!(
+                "unexpected package entry: {}",
+                entry.path().display()
+            ));
+        }
+        if kind.is_file()
+            && entry
+                .metadata()
+                .map_err(|e| format!("stat {name}: {e}"))?
+                .len()
+                == 0
+        {
+            return Err(format!("empty package file: {}", entry.path().display()));
+        }
+        found.push(name);
+    }
+    for name in files.iter().chain(dirs) {
+        if !found.iter().any(|f| f == name) {
+            return Err(format!(
+                "missing package entry: {}",
+                dir.join(name).display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn audit_text(path: &Path, expected: &str) -> Result<(), String> {
+    let actual = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if actual != expected {
+        return Err(format!(
+            "generated package metadata differs: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn audit_package_layout(out: &Path, profile: &str, player: bool, host: bool) -> Result<(), String> {
+    let mut dirs = Vec::new();
+    if player {
+        dirs.push("player");
+        let mut files = vec![
+            "rustamp.exe",
+            "LICENSE",
+            "PLUGIN-EXCEPTION.md",
+            "manifest.json",
+            "QUICKSTART.md",
+        ];
+        if host {
+            files.push("rustamp-plughost32.exe");
+        }
+        let dir = out.join("player");
+        audit_directory(&dir, &files, &[])?;
+        audit_text(
+            &dir.join("manifest.json"),
+            &serde_manifest_player(profile, host),
+        )?;
+        audit_text(&dir.join("QUICKSTART.md"), &quickstart(profile, true, host))?;
+    }
+    if host {
+        dirs.push("host");
+        let dir = out.join("host");
+        audit_directory(
+            &dir,
+            &[
+                "rustamp-plughost32.exe",
+                "LICENSE-MIT",
+                "LICENSE-APACHE",
+                "manifest.json",
+            ],
+            &[],
+        )?;
+        audit_text(&dir.join("manifest.json"), &serde_manifest_host(profile))?;
+    }
+    audit_directory(out, &["manifest.json", "QUICKSTART.md"], &dirs)?;
+    audit_text(
+        &out.join("manifest.json"),
+        &build_top_manifest(out, profile, player, host, player && host),
+    )?;
+    audit_text(
+        &out.join("QUICKSTART.md"),
+        &quickstart(profile, player, player && host),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_package_commands_and_manifests_enforce_static_crt() {
+        check_runtime_contract(Path::new("workspace")).expect("static CRT contract");
+    }
+
+    /// Filesystem-only fixtures: do not execute either stub binary.
+    #[test]
+    fn layout_check_rejects_missing_guide_stale_crt_and_wrong_licences() {
+        let base = std::env::temp_dir().join(format!(
+            "rustamp-package-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&base).unwrap();
+        for (player, host) in [(true, true), (true, false), (false, true)] {
+            let out = base.join(format!("{player}-{host}"));
+            fs::create_dir(&out).unwrap();
+            let guide = quickstart("release", player, player && host);
+            fs::write(out.join("QUICKSTART.md"), &guide).unwrap();
+            fs::write(
+                out.join("manifest.json"),
+                build_top_manifest(&out, "release", player, host, player && host),
+            )
+            .unwrap();
+            for (enabled, dir_name, files, manifest) in [
+                (
+                    player,
+                    "player",
+                    &["rustamp.exe", "LICENSE", "PLUGIN-EXCEPTION.md"][..],
+                    serde_manifest_player("release", host),
+                ),
+                (
+                    host,
+                    "host",
+                    &["rustamp-plughost32.exe", "LICENSE-MIT", "LICENSE-APACHE"][..],
+                    serde_manifest_host("release"),
+                ),
+            ] {
+                if enabled {
+                    let dir = out.join(dir_name);
+                    fs::create_dir(&dir).unwrap();
+                    for file in files {
+                        fs::write(dir.join(file), b"layout fixture, not executable").unwrap();
+                    }
+                    fs::write(dir.join("manifest.json"), manifest).unwrap();
+                }
+            }
+            if player {
+                fs::write(out.join("player/QUICKSTART.md"), &guide).unwrap();
+                if host {
+                    fs::write(out.join("player/rustamp-plughost32.exe"), b"host stub").unwrap();
+                }
+            }
+            assert!(audit_package_layout(&out, "release", player, host).is_ok());
+            assert!(require_empty_output(&out).is_err());
+            fs::remove_file(out.join("QUICKSTART.md")).unwrap();
+            assert!(audit_package_layout(&out, "release", player, host).is_err());
+            fs::write(out.join("QUICKSTART.md"), guide).unwrap();
+            let dir = out.join(if player { "player" } else { "host" });
+            for stale in ["vcruntime140.dll", "unexpected.exe", "LICENSE-GPL"] {
+                fs::write(dir.join(stale), b"stale").unwrap();
+                assert!(audit_package_layout(&out, "release", player, host).is_err());
+                fs::remove_file(dir.join(stale)).unwrap();
+            }
+            let wrong_licence = if player { "LICENSE-MIT" } else { "LICENSE" };
+            fs::write(dir.join(wrong_licence), b"wrong side").unwrap();
+            assert!(audit_package_layout(&out, "release", player, host).is_err());
+            fs::remove_file(dir.join(wrong_licence)).unwrap();
+            fs::write(dir.join("manifest.json"), b"dynamic CRT").unwrap();
+            assert!(audit_package_layout(&out, "release", player, host).is_err());
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
 
     /// The bundled copy lands exactly on the first `supervise.rs` candidate:
     /// the host file name placed in the player directory, i.e. beside
