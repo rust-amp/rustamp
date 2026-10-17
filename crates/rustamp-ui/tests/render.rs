@@ -436,14 +436,21 @@ fn a_skin_missing_sheets_still_renders() {
         &MainWindowLayout::CLASSIC,
     );
     assert_eq!((frame.width(), frame.height()), (275, 116));
-    // The title bar is the magenta placeholder.
-    assert_eq!(
+    // The title bar comes from the built-in skin, so it is the drawn title bar
+    // and no longer the magenta placeholder. The built-in skin must supply that
+    // sheet, and the rendered pixel must not be the placeholder colour.
+    assert!(
+        BuiltinDefaultSkin.sheet_image(Sheet::Titlebar).is_some(),
+        "the built-in skin must provide a title bar"
+    );
+    assert_ne!(
         rgb(&frame, 5, 5),
         [
             PLACEHOLDER_RGBA[0],
             PLACEHOLDER_RGBA[1],
             PLACEHOLDER_RGBA[2]
-        ]
+        ],
+        "the fallback title bar must be drawn artwork, not the placeholder"
     );
 }
 

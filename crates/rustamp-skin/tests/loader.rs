@@ -117,13 +117,18 @@ fn raw_sheet_bytes_are_kept_alongside_the_pixels() {
         .1;
     assert_eq!(raw, original.as_slice());
 
-    // A generated default sheet has no raw source bytes.
+    // A sheet that comes from the built-in skin carries the built-in skin's own
+    // bytes, not an empty buffer: the default is drawn artwork now, not a
+    // generated stand-in with no source.
     let mut entries = synthetic_entries();
     entries.retain(|(name, _)| name != "main.bmp");
     let dir2 = tempfile::tempdir().unwrap();
     write_folder(dir2.path(), &entries);
     let skin2 = Skin::load(dir2.path()).unwrap();
-    assert!(skin2.sheet_raw(Sheet::Main).unwrap().is_empty());
+    assert_eq!(
+        skin2.sheet_raw(Sheet::Main).unwrap(),
+        rustamp_skin::lookalike::sheet_bytes(Sheet::Main).unwrap()
+    );
 }
 
 #[test]

@@ -360,7 +360,11 @@ fn resolve_default_fallbacks(
     fallback: &dyn SkinFallback,
     substitutions: &mut Vec<Substitution>,
 ) {
-    for sheet in Sheet::required_main_window() {
+    // Every sheet the fallback can supply, not only the main window's: a skin
+    // that is missing, say, `nums_ex.bmp` should still get a legible one from the
+    // built-in skin rather than nothing at all. Sheets the fallback has no size
+    // for stay absent, exactly as the trait documents.
+    for sheet in Sheet::ALL {
         if sheets.contains_key(sheet) {
             continue;
         }
