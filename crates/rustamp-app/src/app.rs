@@ -1314,6 +1314,31 @@ mod tests {
         cond(app)
     }
 
+    /// Like [`pump_until`], but also advances the virtual clock, so a run can
+    /// actually drain and finish. The engine ends a run when the ring is
+    /// drained, not when the device clock passes the end, so a wait that only
+    /// pumps the app can never see the transport stop.
+    fn pump_until_drained(
+        app: &mut App,
+        mut cond: impl FnMut(&App) -> bool,
+        max_frames: u64,
+    ) -> bool {
+        if cond(app) {
+            return true;
+        }
+        let mut pumped = 0;
+        while pumped < max_frames {
+            app.advance_null_clock(1024);
+            app.pump().unwrap();
+            if cond(app) {
+                return true;
+            }
+            pumped += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        cond(app)
+    }
+
     // ----- command routing: a UI outcome reaches the engine -----
 
     #[test]
@@ -2778,11 +2803,13 @@ mod tests {
             2000
         ));
 
-        // 7. Next at the end: moves past the end of the queue, playback stops
+        // 7. Next at the end: moves past the end of the queue and the run ends
+        //    once the buffered audio has drained (the engine finishes on a
+        //    drained ring, so the clock has to advance here).
         app.key_down(Key::letter('B').unwrap(), Modifiers::NONE)
             .unwrap();
         assert!(
-            pump_until(
+            pump_until_drained(
                 &mut app,
                 |app| app.engine().transport() == TransportState::Stopped,
                 2000
