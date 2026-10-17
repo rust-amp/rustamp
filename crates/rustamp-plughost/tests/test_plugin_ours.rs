@@ -1,8 +1,11 @@
-// This test plugin is OUR OWN code, written for Rustamp.  It is not derived
-// from, copied from or based on any Winamp SDK sample, third-party plugin or
-// disassembly.  It exercises the host's answering surface (M3a) the way a
-// classic plug-in would, but entirely in-process, and asserts the replies a
-// plug-in can rely on (S09 / S10).
+//! Headless IPC surface tests: OUR OWN code, written for Rustamp, not derived
+//! from any Winamp SDK sample, third-party plugin or disassembly.
+//!
+//! Despite this file's historical name, there is no plugin here: no DLL, no
+//! export lookup, no ABI callback, no Win32 window and no window procedure.
+//! These are plain Rust calls with placeholder handles, not DLL acceptance or
+//! an in-process plugin cross-check. See `docs/tasks/P3-dll-acceptance.md` for
+//! the separate, blocked VM-only DLL acceptance design.
 
 use rustamp_plughost::{HOST_WINDOW_CLASS, IpcSurface, common, dispatch_message};
 use rustamp_plugin_abi::common::WINAMP_VERSION_295;
@@ -13,7 +16,7 @@ const IPC_SETVOLUME: u32 = 122;
 const IPC_GETWND: u32 = 260;
 
 #[test]
-fn our_test_plugin_exercises_the_surface_end_to_end() {
+fn headless_surface_answers_plain_rust_queries() {
     // The host window class is the one S09 fixes; we never invent one.
     assert_eq!(HOST_WINDOW_CLASS, "Winamp v1.x");
     let class_as_str =
@@ -70,7 +73,7 @@ fn our_test_plugin_exercises_the_surface_end_to_end() {
 }
 
 #[test]
-fn dispatch_message_routes_ipc() {
+fn headless_surface_dispatch_message_routes_ipc_without_a_wndproc() {
     let mut surface = IpcSurface::new();
     surface.main_hwnd = 7;
     let r = dispatch_message(

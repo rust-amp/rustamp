@@ -1,7 +1,10 @@
 //! # rustamp-plughost32
 //!
-//! The i686 helper process that loads classic Winamp plugin DLLs and talks to
-//! `rustamp.exe` over `rustamp-ipc`.
+//! The helper intended to load classic Winamp plugin DLLs in an i686 build.
+//! Currently it serves a window and talks to `rustamp.exe` over `rustamp-ipc`;
+//! no DLL loader or export invocation exists, and `LoadPlugin` is ignored.
+//! Surface tests do not prove DLL loading. The separate VM-only acceptance
+//! design is `docs/tasks/P3-dll-acceptance.md` (blocked; do not execute).
 //!
 //! The process owns exactly one window — the hidden fake `Winamp v1.x` main
 //! window that plugins query — and answers the app over the framed stdio

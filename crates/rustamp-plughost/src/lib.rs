@@ -4,6 +4,8 @@
 //! (`rustamp-plughost32`) is the host process itself; this crate library exists
 //! so the table-driven IPC answering surface can be unit tested and so other
 //! permissive crates can call it without depending on the binary target.
+//! No DLL-loading path exists yet. Headless surface tests are not DLL
+//! acceptance; `pe_preflight` only inspects bytes and executes no image.
 //!
 //! Licensed `MIT OR Apache-2.0` (RFC 0004).
 
@@ -12,6 +14,7 @@ pub mod control;
 pub mod host_window;
 pub mod ipc;
 pub mod message_loop;
+pub mod pe_preflight;
 pub mod state_bridge;
 
 pub use commands::{

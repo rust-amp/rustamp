@@ -216,7 +216,8 @@ impl HostWindow {
     }
 
     /// Dispatch a query against a standalone surface, without OS calls.
-    /// The window procedure and headless test plugin share this entry point.
+    /// The window procedure and headless surface tests share this entry point.
+    /// Calling it directly exercises neither a window procedure nor a DLL.
     pub fn dispatch_ipc(surface: &mut IpcSurface, wparam: i64, ipc_id: u32) -> u32 {
         surface.answer(ipc_id, wparam).raw()
     }
