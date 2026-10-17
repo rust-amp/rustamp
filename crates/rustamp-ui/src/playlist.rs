@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use rustamp_core::command::{Command, OpenMediaKind, SelectOp};
 use rustamp_core::playlist::EntryId;
 
+use crate::playlist_window::{LIST_TOP, ROW_PITCH, in_list_area};
 use crate::shortcuts::{Key, Modifiers};
 
 /// How many list rows are visible at once (S06 §3).
@@ -116,10 +117,9 @@ pub enum ScrollDirection {
 
 /// A playlist-editor key action (S03 §2, playlist editor table).
 ///
-/// Only the rows this window implements: the four provisional move/scroll
-/// rows, the two provisional jump rows and the menu-confirmed Enter row.
-/// Delete, Ctrl+A and Ctrl+I keep their existing app path
-/// (`App::playlist_key_down`) and are not part of this mapping.
+/// Implements the provisional move/scroll rows, the two provisional jump rows,
+/// the menu-confirmed Enter row, the provisional `Alt+Up`/`Alt+Down` block moves,
+/// and the menu-confirmed `Delete` and `Ctrl+Delete` (Crop) rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlaylistKeyAction {
     /// Up: move the selection up (`40289`, provisional).
@@ -136,30 +136,45 @@ pub enum PlaylistKeyAction {
     PageDown,
     /// Enter: play the selected item(s) (`40184`, menu-confirmed).
     PlaySelected,
+    /// Delete: remove the selected item(s) (`1034`, menu-confirmed, S06 §5).
+    Delete,
+    /// Ctrl+Delete: crop to the selected item(s) (`1035`, menu-confirmed).
+    Crop,
+    /// Alt+Up: move the selected block up (`40215`, provisional).
+    MoveBlockUp,
+    /// Alt+Down: move the selected block down (`40216`, provisional).
+    MoveBlockDown,
 }
 
 /// Maps a key press to the playlist editor's key action, if any.
 ///
 /// Covers the S03 §2 rows listed on [`PlaylistKeyAction`]: plain Up, Down,
-/// Home, End, PageUp, PageDown and Enter, each with no modifiers. Every other
-/// key — including Delete, Ctrl+A and Ctrl+I, which keep their existing app
-/// path, and the Alt/Ctrl/Shift playlist rows with no model support (crop,
-/// move-entry, clear, sort, reverse, randomise) — returns `None` and stays on
-/// the shared shortcut path. The provisional rows are implemented as own
-/// choices on the model (`move_selection_up`, `scroll_page`, ...); see each
-/// method for what was chosen.
+/// Home, End, PageUp, PageDown and Enter with no modifiers; `Alt+Up` and
+/// `Alt+Down` for moving the selected block; and `Ctrl+Delete` for cropping to
+/// the selection. Plain `Delete`, `Ctrl+A` and `Ctrl+I` return `None` here to
+/// preserve the existing app-side shortcut routing (`App::playlist_key_down`),
+/// while their actions can be dispatched directly via [`PlaylistWindow::handle_key_action`].
 pub fn playlist_key_action(key: Key, modifiers: Modifiers) -> Option<PlaylistKeyAction> {
-    if modifiers != Modifiers::NONE {
-        return None;
-    }
-    match key {
-        Key::Up => Some(PlaylistKeyAction::MoveSelectionUp),
-        Key::Down => Some(PlaylistKeyAction::MoveSelectionDown),
-        Key::Home => Some(PlaylistKeyAction::JumpToFirst),
-        Key::End => Some(PlaylistKeyAction::JumpToLast),
-        Key::PageUp => Some(PlaylistKeyAction::PageUp),
-        Key::PageDown => Some(PlaylistKeyAction::PageDown),
-        Key::Enter => Some(PlaylistKeyAction::PlaySelected),
+    match modifiers {
+        Modifiers::NONE => match key {
+            Key::Up => Some(PlaylistKeyAction::MoveSelectionUp),
+            Key::Down => Some(PlaylistKeyAction::MoveSelectionDown),
+            Key::Home => Some(PlaylistKeyAction::JumpToFirst),
+            Key::End => Some(PlaylistKeyAction::JumpToLast),
+            Key::PageUp => Some(PlaylistKeyAction::PageUp),
+            Key::PageDown => Some(PlaylistKeyAction::PageDown),
+            Key::Enter => Some(PlaylistKeyAction::PlaySelected),
+            _ => None,
+        },
+        Modifiers::ALT => match key {
+            Key::Up => Some(PlaylistKeyAction::MoveBlockUp),
+            Key::Down => Some(PlaylistKeyAction::MoveBlockDown),
+            _ => None,
+        },
+        Modifiers::CTRL => match key {
+            Key::Delete => Some(PlaylistKeyAction::Crop),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -219,6 +234,20 @@ pub const fn has_window_menu_button() -> bool {
     false
 }
 
+/// The ids a shift-click from `anchor` to `target` selects, over a bare entry list.
+///
+/// Replicates the clamped range rule from `rustamp_playlist::range_ids` so that
+/// `rustamp-ui` stays dependency-free of `rustamp-playlist`.
+pub fn range_ids(entries: &[EntryId], anchor: usize, target: usize) -> Vec<EntryId> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let a = anchor.min(entries.len() - 1);
+    let b = target.min(entries.len() - 1);
+    let (first, last) = if a <= b { (a, b) } else { (b, a) };
+    entries[first..=last].to_vec()
+}
+
 /// The playlist editor's headless behaviour: list view, selection and the
 /// S06-settled gestures.
 ///
@@ -230,6 +259,8 @@ pub struct PlaylistWindow {
     entries: Vec<EntryId>,
     first_visible: usize,
     selected: BTreeSet<EntryId>,
+    shift_anchor: Option<EntryId>,
+    current: Option<EntryId>,
 }
 
 impl PlaylistWindow {
@@ -246,6 +277,16 @@ impl PlaylistWindow {
         self.entries = entries;
         let live: BTreeSet<EntryId> = self.entries.iter().copied().collect();
         self.selected.retain(|id| live.contains(id));
+        if let Some(anchor) = self.shift_anchor {
+            if !live.contains(&anchor) {
+                self.shift_anchor = None;
+            }
+        }
+        if let Some(cur) = self.current {
+            if !live.contains(&cur) {
+                self.current = None;
+            }
+        }
         self.clamp_scroll();
     }
 
