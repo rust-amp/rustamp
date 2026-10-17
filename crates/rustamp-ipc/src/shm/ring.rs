@@ -10,13 +10,16 @@
 //! private helpers at the top of this module; the public API is safe.
 
 use core::sync::atomic::Ordering;
+use std::time::Duration;
 
 use super::RingError;
+use super::Wake;
 use super::header::{
     MAX_RING_BYTES, RING_DATA_OFFSET, RING_FLAG_CREATOR_32BIT, RING_HEADER_SIZE, RING_MAGIC,
     RING_STATE_CLOSED, RING_STATE_LIVE, RING_VERSION, RingHeader, RingKind, VIS_SLOT_SIZE, VisSlot,
 };
 use super::region::{MappedRegion, fresh_generation};
+use super::wake::{RingWake, WaitOutcome};
 
 /// What an opener expects to find in a ring header.
 ///
@@ -195,19 +198,27 @@ fn check_region<R: MappedRegion>(region: &R, expect: RingExpect) -> Result<RingM
 ///
 /// The producer owns `write_seq` and `dropped_seq` and only ever reads
 /// `read_seq`. It never blocks and never overwrites unread data (RFC 0003
-/// section 7).
+/// section 7). When a [`RingWake`] is attached via [`with_wake`], the producer
+/// signals the consumer on every publish (RFC 0007).
+///
+/// [`with_wake`]: RingProducer::with_wake
 pub struct RingProducer<R: MappedRegion> {
     region: R,
     meta: RingMeta,
+    wake: Option<RingWake>,
 }
 
 /// The reading end of a ring. Single consumer only.
 ///
 /// The consumer owns `read_seq` and only ever reads `write_seq` and
-/// `dropped_seq`.
+/// `dropped_seq`. When a [`RingWake`] is attached via [`with_wake`], the
+/// consumer signals the producer on every consume (RFC 0007).
+///
+/// [`with_wake`]: RingConsumer::with_wake
 pub struct RingConsumer<R: MappedRegion> {
     region: R,
     meta: RingMeta,
+    wake: Option<RingWake>,
 }
 
 impl<R: MappedRegion> RingProducer<R> {
@@ -286,13 +297,27 @@ impl<R: MappedRegion> RingProducer<R> {
                 capacity,
                 generation,
             },
+            wake: None,
         })
     }
 
     /// Attach to an existing ring and validate it against `expect`.
     pub fn attach(region: R, expect: RingExpect) -> Result<RingProducer<R>, RingError> {
         let meta = check_region(&region, expect)?;
-        Ok(RingProducer { region, meta })
+        Ok(RingProducer {
+            region,
+            meta,
+            wake: None,
+        })
+    }
+
+    /// Attach a [`RingWake`] to this ring (RFC 0007 §5.2).
+    ///
+    /// After this call the ring signals on every counter advance and supports
+    /// the blocking methods. Called by the creator before sending `RingOffer`.
+    pub fn with_wake(mut self, wake: RingWake) -> Self {
+        self.wake = Some(wake);
+        self
     }
 
     /// Ring kind.
@@ -361,10 +386,19 @@ impl<R: MappedRegion> RingProducer<R> {
     }
 
     /// Mark the ring closed so the peer stops treating "no data" as "not yet".
+    ///
+    /// On a wake ring this also signals both events so a blocked peer returns
+    /// `Err(RingError::Closed)` (RFC 0007 §6.5). On a wake-less ring `close`
+    /// is unchanged.
     pub fn close(&mut self) {
         let h = header_ptr(&self.region);
-        // SAFETY: `h` points to a live header; `state` is a whole atomic.
+        // SAFETY: `h` points to a live header; `state` is a whole atomic. The
+        // `Release` store happens-before the signals below.
         unsafe { (*h).state.store(RING_STATE_CLOSED, Ordering::Release) };
+        if let Some(wake) = &self.wake {
+            let _ = wake.signal(super::Wake::Data);
+            let _ = wake.signal(super::Wake::Space);
+        }
     }
 
     /// Re-check the header (magic, version, generation) after a long run.
@@ -378,6 +412,9 @@ impl<R: MappedRegion> RingProducer<R> {
     /// whole frames as fit, drops the rest and counts them, and returns how many
     /// frames were accepted. Never blocks, never allocates, never overwrites
     /// unread data.
+    ///
+    /// On a wake ring, signals `Wake::Data` when the write started from empty
+    /// (RFC 0007 §6.2), so a blocked consumer is woken.
     pub fn write_from(&mut self, samples: &[f32]) -> Result<usize, RingError> {
         self.require_kind(RingKind::Pcm)?;
         self.require_live()?;
@@ -395,14 +432,20 @@ impl<R: MappedRegion> RingProducer<R> {
 
         let write_seq = self.write_seq(Ordering::Relaxed);
         let dropped_seq = self.dropped_seq(Ordering::Relaxed);
-        let occupancy = write_seq.wrapping_sub(self.read_seq(Ordering::Acquire));
+        let read_seq = self.read_seq(Ordering::Acquire);
+        let occupancy = write_seq.wrapping_sub(read_seq);
         let free = u64::from(self.meta.capacity).saturating_sub(occupancy);
         let accepted = (offered as u64).min(free) as usize;
         let dropped = offered - accepted;
+        // A write that started from empty makes the ring newly readable.
+        let was_empty = occupancy == 0;
 
         if accepted > 0 {
             self.copy_into_slots(write_seq, samples.as_ptr(), accepted);
             self.store_write_seq(write_seq + accepted as u64);
+            if was_empty && let Some(wake) = &self.wake {
+                let _ = wake.signal(Wake::Data);
+            }
         }
         if dropped > 0 {
             self.store_dropped_seq(dropped_seq + dropped as u64);
@@ -415,13 +458,18 @@ impl<R: MappedRegion> RingProducer<R> {
     /// The ring overwrites `slot.seq` with the frame's offered index. Returns
     /// `true` when the slot was accepted, `false` when the ring was full (one
     /// drop is counted). Never blocks and never overwrites unread data.
+    ///
+    /// On a wake ring, signals `Wake::Data` when the write started from empty
+    /// (RFC 0007 §6.2).
     pub fn write_slot(&mut self, slot: &VisSlot) -> Result<bool, RingError> {
         self.require_kind(RingKind::Vis)?;
         self.require_live()?;
 
         let write_seq = self.write_seq(Ordering::Relaxed);
         let dropped_seq = self.dropped_seq(Ordering::Relaxed);
-        let occupancy = write_seq.wrapping_sub(self.read_seq(Ordering::Acquire));
+        let read_seq = self.read_seq(Ordering::Acquire);
+        let occupancy = write_seq.wrapping_sub(read_seq);
+        let was_empty = occupancy == 0;
         if occupancy >= u64::from(self.meta.capacity) {
             self.store_dropped_seq(dropped_seq + 1);
             return Ok(false);
@@ -436,9 +484,99 @@ impl<R: MappedRegion> RingProducer<R> {
         unsafe {
             let target = data_ptr(&self.region).cast::<VisSlot>().add(slot_index);
             (*target).seq = write_seq.wrapping_add(dropped_seq);
-        }
+        };
         self.store_write_seq(write_seq + 1);
+        if was_empty && let Some(wake) = &self.wake {
+            let _ = wake.signal(Wake::Data);
+        }
         Ok(true)
+    }
+
+    /// Wait for at least one free frame of space, or for the ring to close.
+    ///
+    /// Returns `Ok(WaitOutcome::Signaled)` when space is available (the caller
+    /// should re-check), `Ok(WaitOutcome::TimedOut)` when the timeout elapsed,
+    /// or `Err(Closed)` / `Err(Stale)` for a closed or stale ring. Never
+    /// succeeds on a ring without a wake ([`RingError::NoWakeObject`]).
+    pub fn wait_writable(&self, timeout: Option<Duration>) -> Result<WaitOutcome, RingError> {
+        let wake = self.wake.as_ref().ok_or(RingError::NoWakeObject)?;
+        loop {
+            self.validate()?;
+            if self.is_closed() {
+                return Err(RingError::Closed);
+            }
+            let write_seq = self.write_seq(Ordering::Relaxed);
+            let read_seq = self.read_seq(Ordering::Acquire);
+            let free =
+                u64::from(self.meta.capacity).saturating_sub(write_seq.wrapping_sub(read_seq));
+            if free > 0 {
+                return Ok(WaitOutcome::Signaled);
+            }
+            match wake.wait(Wake::Space, timeout)? {
+                WaitOutcome::Signaled => continue,
+                WaitOutcome::TimedOut => return Ok(WaitOutcome::TimedOut),
+            }
+        }
+    }
+
+    /// Write PCM frames, waiting for space instead of dropping (wake rings only).
+    ///
+    /// Behaves like [`write_from`] but blocks (up to `timeout`) when the ring is
+    /// full instead of dropping. Writes `min(offered, free)` whole frames and
+    /// returns the accepted count; it **never drops** and never advances
+    /// `dropped_seq`. `Ok(0)` means the timeout elapsed with the ring still full.
+    ///
+    /// On a ring without a wake this returns [`RingError::NoWakeObject`].
+    ///
+    /// [`write_from`]: RingProducer::write_from
+    pub fn write_from_blocking(
+        &mut self,
+        samples: &[f32],
+        timeout: Option<Duration>,
+    ) -> Result<usize, RingError> {
+        self.require_kind(RingKind::Pcm)?;
+        self.require_live()?;
+        let samples_per_frame = (self.meta.frame_size / 4) as usize;
+        if !samples.len().is_multiple_of(samples_per_frame) {
+            return Err(RingError::NotFrameAligned {
+                samples: samples.len(),
+                samples_per_frame,
+            });
+        }
+        let offered = samples.len() / samples_per_frame;
+        if offered == 0 {
+            return Ok(0);
+        }
+
+        let wake = self.wake.as_ref().ok_or(RingError::NoWakeObject)?;
+
+        // The check-then-wait loop (RFC 0007 §6.1): re-derive the condition from
+        // the counters after every wake. A signal is never evidence of data;
+        // only the counters are.
+        loop {
+            self.validate()?;
+            if self.is_closed() {
+                return Err(RingError::Closed);
+            }
+            let write_seq = self.write_seq(Ordering::Relaxed);
+            let read_seq = self.read_seq(Ordering::Acquire);
+            let occupancy = write_seq.wrapping_sub(read_seq);
+            let free = u64::from(self.meta.capacity).saturating_sub(occupancy);
+            if free > 0 {
+                let accepted = (offered as u64).min(free) as usize;
+                let was_empty = occupancy == 0;
+                self.copy_into_slots(write_seq, samples.as_ptr(), accepted);
+                self.store_write_seq(write_seq + accepted as u64);
+                if was_empty {
+                    let _ = wake.signal(Wake::Data);
+                }
+                return Ok(accepted);
+            }
+            match wake.wait(Wake::Space, timeout)? {
+                WaitOutcome::Signaled => continue,
+                WaitOutcome::TimedOut => return Ok(0),
+            }
+        }
     }
 
     fn require_kind(&self, expected: RingKind) -> Result<(), RingError> {
@@ -552,7 +690,20 @@ impl<R: MappedRegion> RingConsumer<R> {
     /// counter is touched; nothing here can read unmapped memory.
     pub fn attach(region: R, expect: RingExpect) -> Result<RingConsumer<R>, RingError> {
         let meta = check_region(&region, expect)?;
-        Ok(RingConsumer { region, meta })
+        Ok(RingConsumer {
+            region,
+            meta,
+            wake: None,
+        })
+    }
+
+    /// Attach a [`RingWake`] to this ring (RFC 0007 §5.2).
+    ///
+    /// After this call the ring signals on every counter advance and supports
+    /// the blocking methods. Called by the opener after the header validates.
+    pub fn with_wake(mut self, wake: RingWake) -> Self {
+        self.wake = Some(wake);
+        self
     }
 
     /// Ring kind.
@@ -616,10 +767,19 @@ impl<R: MappedRegion> RingConsumer<R> {
     }
 
     /// Mark the ring closed.
+    ///
+    /// On a wake ring this also signals both events so a blocked peer returns
+    /// `Err(RingError::Closed)` (RFC 0007 §6.5). On a wake-less ring `close`
+    /// is unchanged.
     pub fn close(&mut self) {
         let h = header_ptr(&self.region);
-        // SAFETY: `h` points to a live header; `state` is a whole atomic.
+        // SAFETY: `h` points to a live header; `state` is a whole atomic. The
+        // `Release` store happens-before the signals below.
         unsafe { (*h).state.store(RING_STATE_CLOSED, Ordering::Release) };
+        if let Some(wake) = &self.wake {
+            let _ = wake.signal(Wake::Data);
+            let _ = wake.signal(Wake::Space);
+        }
     }
 
     /// Re-check magic, version and generation (RFC 0003 section 8).
@@ -632,6 +792,9 @@ impl<R: MappedRegion> RingConsumer<R> {
     /// `out.len()` must be a multiple of the channel count. Reads
     /// `min(want, available)` whole frames, returns how many were read and never
     /// blocks. `Ok(0)` means "nothing available yet", not an error.
+    ///
+    /// On a wake ring, signals `Wake::Space` when the read started from a full
+    /// ring (RFC 0007 §6.2), so a blocked producer is woken.
     pub fn read_into(&mut self, out: &mut [f32]) -> Result<usize, RingError> {
         self.require_kind(RingKind::Pcm)?;
         let samples_per_frame = (self.meta.frame_size / 4) as usize;
@@ -653,9 +816,14 @@ impl<R: MappedRegion> RingConsumer<R> {
         if count == 0 {
             return Ok(0);
         }
+        // A read from a full ring frees slots for the producer.
+        let was_full = available == u64::from(self.meta.capacity);
 
         self.copy_out_of_slots(read_seq, out.as_mut_ptr(), count);
         self.store_read_seq(read_seq + count as u64);
+        if was_full && let Some(wake) = &self.wake {
+            let _ = wake.signal(Wake::Space);
+        }
         Ok(count)
     }
 
@@ -665,14 +833,20 @@ impl<R: MappedRegion> RingConsumer<R> {
     /// `false` when nothing is published; a slot that is not (yet) published is
     /// never delivered as data (RFC 0003 section 7). The slot's `seq` lets the
     /// caller detect frames skipped since the previous read.
+    ///
+    /// On a wake ring, signals `Wake::Space` when the read started from a full
+    /// ring (RFC 0007 §6.2).
     pub fn read_slot_into(&mut self, out: &mut VisSlot) -> Result<bool, RingError> {
         self.require_kind(RingKind::Vis)?;
 
         let write_seq = self.write_seq(Ordering::Acquire);
         let read_seq = self.read_seq(Ordering::Relaxed);
-        if write_seq.wrapping_sub(read_seq) == 0 {
+        let available = write_seq.wrapping_sub(read_seq);
+        if available == 0 {
             return Ok(false);
         }
+        // A read from a full ring frees a slot for the producer.
+        let was_full = available == u64::from(self.meta.capacity);
 
         let slot_index = (read_seq % u64::from(self.meta.capacity)) as usize;
         // SAFETY: the slot area holds `capacity` `VisSlot`s and `slot_index` is
@@ -689,7 +863,94 @@ impl<R: MappedRegion> RingConsumer<R> {
             );
         }
         self.store_read_seq(read_seq + 1);
+        if was_full && let Some(wake) = &self.wake {
+            let _ = wake.signal(Wake::Space);
+        }
         Ok(true)
+    }
+
+    /// Wait for at least one published frame, or for the ring to close.
+    ///
+    /// Returns `Ok(WaitOutcome::Signaled)` when data is available,
+    /// `Ok(WaitOutcome::TimedOut)` when the timeout elapsed, or `Err(Closed)` /
+    /// `Err(Stale)` for a closed or stale ring. Never succeeds on a ring without
+    /// a wake ([`RingError::NoWakeObject`]).
+    pub fn wait_readable(&self, timeout: Option<Duration>) -> Result<WaitOutcome, RingError> {
+        let wake = self.wake.as_ref().ok_or(RingError::NoWakeObject)?;
+        loop {
+            self.validate()?;
+            if self.is_closed() {
+                return Err(RingError::Closed);
+            }
+            let write_seq = self.write_seq(Ordering::Acquire);
+            let read_seq = self.read_seq(Ordering::Relaxed);
+            if write_seq.wrapping_sub(read_seq) > 0 {
+                return Ok(WaitOutcome::Signaled);
+            }
+            match wake.wait(Wake::Data, timeout)? {
+                WaitOutcome::Signaled => continue,
+                WaitOutcome::TimedOut => return Ok(WaitOutcome::TimedOut),
+            }
+        }
+    }
+
+    /// Read PCM frames, waiting for data instead of polling (wake rings only).
+    ///
+    /// Behaves like [`read_into`] but blocks (up to `timeout`) when the ring is
+    /// empty instead of returning `Ok(0)`. Reads `min(want, available)` whole
+    /// frames and returns the count. `Ok(0)` means the timeout elapsed with no
+    /// data. `Err(Closed)` ends the stream (after any remaining frames have been
+    /// drained).
+    ///
+    /// On a ring without a wake this returns [`RingError::NoWakeObject`].
+    ///
+    /// [`read_into`]: RingConsumer::read_into
+    pub fn read_into_blocking(
+        &mut self,
+        out: &mut [f32],
+        timeout: Option<Duration>,
+    ) -> Result<usize, RingError> {
+        self.require_kind(RingKind::Pcm)?;
+        let samples_per_frame = (self.meta.frame_size / 4) as usize;
+        if !out.len().is_multiple_of(samples_per_frame) {
+            return Err(RingError::NotFrameAligned {
+                samples: out.len(),
+                samples_per_frame,
+            });
+        }
+        let want = out.len() / samples_per_frame;
+        if want == 0 {
+            return Ok(0);
+        }
+
+        let wake = self.wake.as_ref().ok_or(RingError::NoWakeObject)?;
+
+        // Drain-then-close ordering: data available is checked *before* closed,
+        // so a peer that closes after publishing still hands its remaining frames
+        // over first, then yields Closed on the next call (RFC 0007 §6.5).
+        loop {
+            self.validate()?;
+            let write_seq = self.write_seq(Ordering::Acquire);
+            let read_seq = self.read_seq(Ordering::Relaxed);
+            let available = write_seq.wrapping_sub(read_seq);
+            if available > 0 {
+                let count = (want as u64).min(available) as usize;
+                let was_full = available == u64::from(self.meta.capacity);
+                self.copy_out_of_slots(read_seq, out.as_mut_ptr(), count);
+                self.store_read_seq(read_seq + count as u64);
+                if was_full {
+                    let _ = wake.signal(Wake::Space);
+                }
+                return Ok(count);
+            }
+            if self.is_closed() {
+                return Err(RingError::Closed);
+            }
+            match wake.wait(Wake::Data, timeout)? {
+                WaitOutcome::Signaled => continue,
+                WaitOutcome::TimedOut => return Ok(0),
+            }
+        }
     }
 
     fn require_kind(&self, expected: RingKind) -> Result<(), RingError> {
@@ -801,7 +1062,7 @@ unsafe impl<R: MappedRegion> Send for RingConsumer<R> {}
 mod tests {
     use super::*;
     use crate::shm::header::{RING_DATA_OFFSET, RING_HEADER_SIZE, VIS_SLOT_SIZE};
-    use crate::shm::region::AnonymousRegion;
+    use crate::shm::region::{AnonymousRegion, ring_name};
     use rustamp_proto::vis::VisFrame;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
@@ -1412,5 +1673,372 @@ mod tests {
             *worst_nanos = (*worst_nanos).max(delta);
         }
         *received += read as u64;
+    }
+
+    /// A PCM ring with a wake attached to both ends (for blocking tests).
+    fn pcm_ring_with_wake(
+        capacity: u32,
+        channels: u32,
+    ) -> (RingProducer<AnonymousRegion>, RingConsumer<AnonymousRegion>) {
+        let frame_size = channels * 4;
+        let region = region_for(frame_size, capacity);
+        let producer =
+            RingProducer::create(region.clone(), RingKind::Pcm, frame_size, capacity).unwrap();
+        let wake = RingWake::create(&ring_name(RingKind::Pcm, producer.generation())).unwrap();
+        let producer = producer.with_wake(wake.clone());
+        let consumer = RingConsumer::attach(region, producer.expect())
+            .unwrap()
+            .with_wake(wake);
+        (producer, consumer)
+    }
+
+    /// `write_from_blocking` + `read_into_blocking` deliver every frame exactly
+    /// once, in order, with zero drops (RFC 0007 acceptance criterion 2).
+    #[test]
+    fn blocking_delivers_every_frame_exactly_once() {
+        const CHANNELS: u32 = 2;
+        const CAPACITY: u32 = 16;
+        const TOTAL: u64 = 10_000;
+        const SPF: usize = CHANNELS as usize;
+
+        let (producer, consumer) = pcm_ring_with_wake(CAPACITY, CHANNELS);
+        let out_len = CAPACITY as usize * SPF;
+
+        let (written, dropped, received) = std::thread::scope(|scope| {
+            let p = scope.spawn(move || {
+                let mut producer = producer;
+                let mut buf = vec![0.0f32; CAPACITY as usize * SPF];
+                let mut index = 0u64;
+                while index < TOTAL {
+                    let frames = (TOTAL - index).min(CAPACITY as u64) as usize;
+                    for i in 0..frames {
+                        let v = (index + i as u64) as f32;
+                        buf[i * 2] = v;
+                        buf[i * 2 + 1] = -v;
+                    }
+                    let written = producer
+                        .write_from_blocking(&buf[..frames * SPF], None)
+                        .unwrap();
+                    assert!(written > 0, "producer stalled with no data and no close");
+                    index += written as u64;
+                }
+                (producer.frames_written(), producer.frames_dropped())
+            });
+
+            let c = scope.spawn(move || {
+                let mut consumer = consumer;
+                let mut out = vec![0.0f32; out_len];
+                let mut received = 0u64;
+                let mut previous: Option<f32> = None;
+                while received < TOTAL {
+                    let read = consumer.read_into_blocking(&mut out, None).unwrap();
+                    for i in 0..read {
+                        let v = out[i * 2];
+                        if let Some(prev) = previous {
+                            assert!(v > prev, "out of order: {v} after {prev}");
+                        }
+                        previous = Some(v);
+                        assert_eq!(out[i * 2 + 1], -v, "channel mismatch");
+                    }
+                    received += read as u64;
+                }
+                received
+            });
+
+            let (written, dropped) = p.join().unwrap();
+            let received = c.join().unwrap();
+            (written, dropped, received)
+        });
+
+        assert_eq!(written, TOTAL, "frames_written == TOTAL");
+        assert_eq!(dropped, 0, "frames_dropped == 0");
+        assert_eq!(received, TOTAL, "frames_read == TOTAL");
+    }
+
+    /// `close()` from the peer wakes a blocked `read_into_blocking` with
+    /// `Err(Closed)`, but only after delivering any in-flight data
+    /// (RFC 0007 §6.5, acceptance criterion 4).
+    #[test]
+    fn blocking_close_wakes_waiter_with_closed() {
+        let (mut producer, mut consumer) = pcm_ring_with_wake(4, 2);
+
+        // Producer writes one frame, then closes. The consumer should read it,
+        // then get `Closed` on the next call.
+        producer.write_from(&[1.0f32, -1.0]).unwrap();
+        producer.close();
+
+        let mut out = [0.0f32; 2];
+        assert_eq!(consumer.read_into_blocking(&mut out, None).unwrap(), 1);
+        assert_eq!(out[0], 1.0);
+        assert!(matches!(
+            consumer.read_into_blocking(&mut out, None),
+            Err(RingError::Closed)
+        ));
+    }
+
+    /// A producer blocked on a full ring is woken by a consumer `close()`
+    /// (RFC 0007 §6.5, acceptance criterion 4).
+    #[test]
+    fn blocking_close_wakes_blocked_producer() {
+        let (mut producer, mut consumer) = pcm_ring_with_wake(1, 2);
+
+        // Fill the ring (capacity 1).
+        producer.write_from_blocking(&[0.0f32, 0.0], None).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let producer_handle = std::thread::spawn(move || {
+            // Signal that the blocking call is about to start, then block.
+            let _ = started_tx.send(());
+            let result = producer.write_from_blocking(&[1.0f32, 1.0], None);
+            let _ = result_tx.send(result);
+        });
+
+        // Wait for the producer to start. Once it has started, `write_from_blocking`
+        // will either be in or about to enter its wait. A `close()` from the
+        // consumer wakes it either way:
+        //   - if the producer hasn't entered the wait yet, it sees `is_closed()`
+        //     on its first loop iteration;
+        //   - if it's already waiting, `close()` signals the event and the
+        //     waiter re-checks `is_closed()`.
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        consumer.close();
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(result, RingError::Closed));
+        producer_handle.join().unwrap();
+    }
+
+    /// A timed-out wait returns `TimedOut` / `Ok(0)`, not `Err` or a hang
+    /// (RFC 0007 §6.4, acceptance criterion 5).
+    #[test]
+    fn blocking_timeout_returns_timed_out() {
+        let (_producer, mut consumer) = pcm_ring_with_wake(8, 2);
+        let mut out = [0.0f32; 8];
+        let start = std::time::Instant::now();
+        let result = consumer.read_into_blocking(&mut out, Some(Duration::from_millis(10)));
+        let elapsed = start.elapsed();
+        assert_eq!(result.unwrap(), 0, "timeout should return Ok(0)");
+        assert!(
+            elapsed >= Duration::from_millis(8),
+            "should wait ~10ms, took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "should not take too long"
+        );
+    }
+
+    /// A timed-out `wait_readable` returns `TimedOut`.
+    #[test]
+    fn wait_readable_returns_timeout() {
+        let (_producer, consumer) = pcm_ring_with_wake(8, 2);
+        let result = consumer.wait_readable(Some(Duration::from_millis(10)));
+        assert_eq!(result.unwrap(), WaitOutcome::TimedOut);
+    }
+
+    /// A signal that races with the timeout is not lost: the next wait returns
+    /// immediately (RFC 0007 §6.4).
+    #[test]
+    fn blocking_signal_after_timeout_is_not_lost() {
+        let (mut producer, mut consumer) = pcm_ring_with_wake(8, 2);
+
+        // First: a wait that times out (ring is empty, producer hasn't written).
+        let mut out = [0.0f32; 16];
+        assert_eq!(
+            consumer
+                .read_into_blocking(&mut out, Some(Duration::from_millis(10)))
+                .unwrap(),
+            0
+        );
+
+        // Producer writes; the signal should have latched. The next wait should
+        // return immediately with data.
+        producer.write_from(&[42.0f32, -42.0]).unwrap();
+        let result = consumer.read_into_blocking(&mut out, Some(Duration::from_secs(1)));
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(out[0], 42.0);
+    }
+
+    /// Blocking on a ring without a wake returns `NoWakeObject` (RFC 0007 §9,
+    /// acceptance criterion 6).
+    #[test]
+    fn blocking_on_wake_less_ring_returns_no_wake_object() {
+        let (mut producer, mut consumer) = pcm_ring(8, 2);
+
+        let mut out = [0.0f32; 8];
+        assert!(matches!(
+            consumer.read_into_blocking(&mut out, None),
+            Err(RingError::NoWakeObject)
+        ));
+        assert!(matches!(
+            producer.write_from_blocking(&[0.0f32; 2], None),
+            Err(RingError::NoWakeObject)
+        ));
+        assert!(matches!(
+            consumer.wait_readable(None),
+            Err(RingError::NoWakeObject)
+        ));
+        assert!(matches!(
+            producer.wait_writable(None),
+            Err(RingError::NoWakeObject)
+        ));
+    }
+
+    /// The non-blocking path on a wake ring still works correctly — signaling
+    /// is a side effect, not a behavior change (RFC 0007 §12, acceptance
+    /// criterion 7).
+    #[test]
+    fn wake_ring_non_blocking_path_is_unchanged() {
+        let (mut producer, mut consumer) = pcm_ring_with_wake(8, 2);
+        let mut out = [0.0f32; 8];
+
+        producer.write_from(&[1.0f32, -1.0, 2.0, -2.0]).unwrap();
+        assert_eq!(consumer.read_into(&mut out).unwrap(), 2);
+        assert_eq!(&out[..4], &[1.0, -1.0, 2.0, -2.0]);
+        assert_eq!(producer.frames_dropped(), 0);
+        assert_eq!(consumer.frames_read(), 2);
+        // No wake-related allocation on the hot path.
+    }
+
+    /// A vis ring rejects PCM-only blocking methods with `WrongRingKind`
+    /// (checked before the wake check), so a vis ring can never block
+    /// (RFC 0007 §9, acceptance criterion 8).
+    #[test]
+    fn vis_ring_blocking_is_rejected() {
+        let (mut vis_producer, mut vis_consumer) = vis_ring(4);
+
+        let mut out = [0.0f32; 4];
+        // Vis ring → WrongRingKind (kind is checked before the wake check).
+        assert!(matches!(
+            vis_consumer.read_into_blocking(&mut out, None),
+            Err(RingError::WrongRingKind { .. })
+        ));
+        assert!(matches!(
+            vis_producer.write_from_blocking(&[0.0f32; 2], None),
+            Err(RingError::WrongRingKind { .. })
+        ));
+    }
+
+    /// No lost wakeup at the check/wait boundary: a stress test with one frame
+    /// per call and jitter must not deadlock (RFC 0007 §6.1, acceptance
+    /// criterion 3).
+    #[test]
+    fn blocking_no_lost_wakeup_under_jitter() {
+        const CHANNELS: u32 = 2;
+        const CAPACITY: u32 = 4;
+        const FRAMES: u64 = 5_000;
+
+        let (producer, consumer) = pcm_ring_with_wake(CAPACITY, CHANNELS);
+        let out_len = CAPACITY as usize * CHANNELS as usize;
+
+        std::thread::scope(|scope| {
+            let p = scope.spawn(move || {
+                let mut producer = producer;
+                for index in 0..FRAMES {
+                    let v = index as f32;
+                    let buf = [v, -v];
+                    loop {
+                        let written = producer.write_from_blocking(&buf, None).unwrap();
+                        if written > 0 {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+            });
+
+            let c = scope.spawn(move || {
+                let mut consumer = consumer;
+                let mut out = vec![0.0f32; out_len];
+                let mut received = 0u64;
+                let mut last: Option<f32> = None;
+                while received < FRAMES {
+                    let read = consumer.read_into_blocking(&mut out, None).unwrap();
+                    for i in 0..read {
+                        let v = out[i * 2];
+                        if let Some(prev) = last {
+                            assert!(v > prev, "out of order at {v} (prev {prev})");
+                        }
+                        last = Some(v);
+                    }
+                    received += read as u64;
+                    // Jitter: yield to increase the chance of the
+                    // check/wait race between the condition and the wait.
+                    std::thread::yield_now();
+                }
+            });
+
+            p.join().unwrap();
+            c.join().unwrap();
+        });
+    }
+
+    /// Two-thread lossless delivery via blocking calls: every frame arrives
+    /// exactly once, in order, with zero drops (RFC 0007 acceptance criterion 2).
+    /// Larger run than `blocking_delivers_every_frame_exactly_once`.
+    #[test]
+    fn blocking_two_thread_lossless_delivery() {
+        const CHANNELS: u32 = 2;
+        const CAPACITY: u32 = 8;
+        const TOTAL: u64 = 50_000;
+        const SPF: usize = CHANNELS as usize;
+
+        let (producer, consumer) = pcm_ring_with_wake(CAPACITY, CHANNELS);
+        let out_len = CAPACITY as usize * SPF;
+
+        let (written, dropped, received) = std::thread::scope(|scope| {
+            let p = scope.spawn(move || {
+                let mut producer = producer;
+                let mut buf = vec![0.0f32; CAPACITY as usize * SPF];
+                let mut index = 0u64;
+                while index < TOTAL {
+                    let frames = (TOTAL - index).min(CAPACITY as u64) as usize;
+                    for i in 0..frames {
+                        let v = (index + i as u64) as f32;
+                        buf[i * 2] = v;
+                        buf[i * 2 + 1] = -v;
+                    }
+                    let written = producer
+                        .write_from_blocking(&buf[..frames * SPF], None)
+                        .unwrap();
+                    assert!(written > 0, "producer stalled");
+                    index += written as u64;
+                }
+                (producer.frames_written(), producer.frames_dropped())
+            });
+
+            let c = scope.spawn(move || {
+                let mut consumer = consumer;
+                let mut out = vec![0.0f32; out_len];
+                let mut received = 0u64;
+                let mut last: Option<f32> = None;
+                while received < TOTAL {
+                    let read = consumer.read_into_blocking(&mut out, None).unwrap();
+                    for i in 0..read {
+                        let v = out[i * 2];
+                        if let Some(prev) = last {
+                            assert!(v > prev, "out of order at {v} (prev {prev})");
+                        }
+                        last = Some(v);
+                        assert_eq!(out[i * 2 + 1], -v, "channel mismatch at {v}");
+                    }
+                    received += read as u64;
+                }
+                received
+            });
+
+            let (written, dropped) = p.join().unwrap();
+            let received = c.join().unwrap();
+            (written, dropped, received)
+        });
+
+        assert_eq!(written, TOTAL);
+        assert_eq!(dropped, 0);
+        assert_eq!(received, TOTAL);
     }
 }

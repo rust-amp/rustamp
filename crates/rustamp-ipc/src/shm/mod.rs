@@ -61,6 +61,7 @@
 pub mod header;
 pub mod region;
 pub mod ring;
+pub mod wake;
 
 pub use header::{
     MAX_RING_BYTES, RING_DATA_OFFSET, RING_FLAG_CREATOR_32BIT, RING_HEADER_SIZE, RING_MAGIC,
@@ -71,6 +72,7 @@ pub use header::{
 pub use region::NamedRegion;
 pub use region::{AnonymousRegion, MappedRegion, ring_name};
 pub use ring::{RingConsumer, RingExpect, RingProducer};
+pub use wake::{RingWake, WaitOutcome, Wake, ring_wake_name};
 
 /// Why a ring could not be used.
 ///
@@ -180,6 +182,20 @@ pub enum RingError {
     /// The ring was closed by one of the participants.
     #[error("ring is closed")]
     Closed,
+    /// A blocking call was made on a ring that has no wake object attached.
+    ///
+    /// Only PCM rings that opt in via [`RingWake`] support blocking; vis rings
+    /// and rings without `with_wake` are always non-blocking.
+    #[error("ring has no wake object: blocking is not available on this ring")]
+    NoWakeObject,
+    /// A wake event syscall failed (create, open, set, or wait).
+    #[error("wake event {op} failed (code {code})")]
+    WakeOpenFailed {
+        /// Name of the failing operation.
+        op: &'static str,
+        /// `HRESULT`/Win32 error code.
+        code: i32,
+    },
 }
 
 impl RingError {
@@ -207,7 +223,9 @@ impl RingError {
             RingError::OutOfMemory
             | RingError::WrongRingKind { .. }
             | RingError::NotFrameAligned { .. }
-            | RingError::Closed => return None,
+            | RingError::Closed
+            | RingError::NoWakeObject => return None,
+            RingError::WakeOpenFailed { .. } => RingRefuseReason::WakeUnavailable,
         })
     }
 }
@@ -238,6 +256,8 @@ pub enum RingRefuseReason {
     RegionTooSmall,
     /// The announced layout itself is invalid.
     InvalidLayout,
+    /// The wake events for a wake ring could not be opened (RFC 0007).
+    WakeUnavailable,
 }
 
 #[cfg(test)]
@@ -263,6 +283,17 @@ mod tests {
             }
             .reason(),
             None
+        );
+        // RFC 0007: a blocking call on a wake-less ring is a local error.
+        assert_eq!(RingError::NoWakeObject.reason(), None);
+        // RFC 0007: a failed event syscall is reported to the peer as WakeUnavailable.
+        assert_eq!(
+            RingError::WakeOpenFailed {
+                op: "OpenEventW",
+                code: 0
+            }
+            .reason(),
+            Some(RingRefuseReason::WakeUnavailable)
         );
         assert_eq!(RING_MAGIC, 0x5254_5352);
         assert_eq!(RING_HEADER_SIZE, 0xC0);
