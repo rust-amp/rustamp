@@ -125,6 +125,8 @@ struct WindowState {
     surface: RefCell<IpcSurface>,
     #[cfg(any(windows, test))]
     window_alive: Cell<bool>,
+    ipc_queries: RefCell<Vec<(u32, i64, u32)>>,
+    window_messages: RefCell<Vec<(u32, usize, isize)>>,
 }
 
 impl WindowState {
@@ -133,6 +135,8 @@ impl WindowState {
         Self {
             surface: RefCell::new(surface),
             window_alive: Cell::new(false),
+            ipc_queries: RefCell::new(Vec::new()),
+            window_messages: RefCell::new(Vec::new()),
         }
     }
 
@@ -247,6 +251,16 @@ impl HostWindow {
         self.state.answer(wparam, ipc_id)
     }
 
+    /// Return a copy of all recorded IPC queries handled by this window.
+    pub fn recorded_ipc_queries(&self) -> Vec<(u32, i64, u32)> {
+        self.state.ipc_queries.borrow().clone()
+    }
+
+    /// Return a copy of all recorded non-IPC window messages handled by this window.
+    pub fn recorded_messages(&self) -> Vec<(u32, usize, isize)> {
+        self.state.window_messages.borrow().clone()
+    }
+
     /// Register the window class once. Idempotent across calls.
     #[cfg(windows)]
     pub fn register_class() -> Result<(), HostWindowError> {
@@ -279,6 +293,15 @@ impl HostWindow {
     /// Destroy the OS window on its owning UI thread.
     pub fn destroy(self) {
         drop(self)
+    }
+
+    /// Create an inert HostWindow for testing without creating an OS window.
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        Self {
+            hwnd: Default::default(),
+            state: Rc::new(WindowState::new(IpcSurface::new())),
+        }
     }
 }
 
@@ -423,6 +446,9 @@ unsafe fn handle_window_message(
             // Shared access uses RefCell's checked mutable borrow. message_reply
             // calls no OS/user code, so destruction cannot reenter this access.
             let reply = unsafe { (*state_ptr).message_reply(wparam, ipc_id) };
+            if let Ok(mut queries) = unsafe { (*state_ptr).ipc_queries.try_borrow_mut() } {
+                queries.push((ipc_id, wparam, reply));
+            }
             LRESULT(reply as isize)
         }
         WM_NCDESTROY => {
@@ -446,7 +472,16 @@ unsafe fn handle_window_message(
             LRESULT(0)
         }
         // SAFETY: forward original arguments without a surface borrow.
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        msg => {
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WindowState;
+            if let Some(state) = unsafe { state_ptr.as_ref() } {
+                let _ = state
+                    .window_messages
+                    .try_borrow_mut()
+                    .map(|mut msgs| msgs.push((msg, wparam.0, lparam.0)));
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
     }
 }
 

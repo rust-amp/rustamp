@@ -13,6 +13,7 @@ mod commands;
 pub mod control;
 pub mod host_window;
 pub mod ipc;
+pub mod loader;
 pub mod message_loop;
 pub mod pe_preflight;
 pub mod state_bridge;
@@ -23,5 +24,6 @@ pub use commands::{
 };
 pub use host_window::*;
 pub use ipc::*;
+pub use loader::{LoadedPlugin, PluginLoadError, load_plugin};
 pub use message_loop::*;
 pub use rustamp_plugin_abi::common;

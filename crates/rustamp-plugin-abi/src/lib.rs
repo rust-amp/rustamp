@@ -92,6 +92,24 @@ impl PluginKind {
             PluginKind::General => "gen_",
         }
     }
+
+    /// Detect kind from a file path based on conventional prefix (S09 section 2).
+    pub fn from_path(path: &std::path::Path) -> Option<PluginKind> {
+        let file_name = path.file_name()?.to_str()?.to_ascii_lowercase();
+        if file_name.starts_with("in_") {
+            Some(PluginKind::Input)
+        } else if file_name.starts_with("out_") {
+            Some(PluginKind::Output)
+        } else if file_name.starts_with("vis_") {
+            Some(PluginKind::Visualization)
+        } else if file_name.starts_with("dsp_") {
+            Some(PluginKind::Dsp)
+        } else if file_name.starts_with("gen_") {
+            Some(PluginKind::General)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +119,18 @@ mod tests {
     #[test]
     fn prefixes() {
         assert_eq!(PluginKind::Visualization.file_prefix(), "vis_");
+        assert_eq!(
+            PluginKind::from_path(std::path::Path::new("in_openmpt.dll")),
+            Some(PluginKind::Input)
+        );
+        assert_eq!(
+            PluginKind::from_path(std::path::Path::new("GEN_TRAY.DLL")),
+            Some(PluginKind::General)
+        );
+        assert_eq!(
+            PluginKind::from_path(std::path::Path::new("other.dll")),
+            None
+        );
     }
 
     #[test]
