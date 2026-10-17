@@ -83,3 +83,33 @@ finished lanes had gone unnoticed for a while.
    downloads, no git writes, no window, no audio), and the owned paths.
 3. Report back with metadata only; the orchestrator verifies **both** trees,
    runs fmt/clippy, then the VM suite, then merges.
+
+## Ready from the reviews (2026-10-17)
+
+Two adversarial reviews landed. They are the source of the next wave, not prose
+to admire.
+
+**M14 — host framework, the two residents** (`docs/tasks/M14-host-framework-review.md`).
+19 claims are pinned by a test that can fail, 7 hold in one direction or one
+lane only, 5 are asserted in prose alone. Ready work, in the order it rates them:
+
+1. **RFC 0014 is drafted and merged** (`docs/rfc/0014-fallible-dsp-stage.md`,
+   `9708063`): a DSP stage must be able to fail loudly *with a message* instead
+   of panicking. The owner decides four things before code follows - stop or
+   bypass on a stage failure, whether the error earns its own kind, the resident
+   restart policy, and confirmation that no out-of-tree implementer exists.
+2. **A reset does not wake a worker blocked in an empty-ring read**
+   (`mediahost/src/dsp.rs:176`, `control.rs:191`); latent today because the host
+   only resets between runs.
+3. **A truncated file can still present as a clean short end of stream**
+   (`dechost/tests/real_decode.rs:326` accepts either terminal).
+4. **The prose-only gaps**: the URL refusal, an abrupt-player-loss mirror for
+   the decoder, a bounded-read timeout mirror for the DSP.
+5. **The test rings ignore the ring direction production refuses**
+   (`mediahost/tests/pcm_transfer.rs:121`).
+
+**W10 - the six-lane batch** (the review was running when this was written).
+
+**VM-only, and therefore not a lane's work:** both two-process spawn-and-kill
+tests, real resident runs, the engine-side adapters, latency compensation, and
+any contention behaviour.
