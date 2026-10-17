@@ -2,9 +2,10 @@
 //! All functional waits are conditions with a generous stall escape
 //! (`STALL_WAIT`): a healthy host answers within milliseconds, so only a
 //! wedged or dead host reaches the bound, and reaching it fails loudly with
-//! the step named — never a pass. Only the explicit timeout test requests a
-//! short PCM deadline; no wall-clock assertion decides whether work
-//! completed.
+//! the step named — never a pass. Writes go through `write_pcm`
+//! (`write_timeout` with the same bound), so the producer side is closed
+//! too. Only the explicit timeout test requests a short PCM deadline; no
+//! wall-clock assertion decides whether work completed.
 
 #![cfg(windows)]
 
@@ -62,6 +63,19 @@ fn read_pcm(session: &mut DspSession<NamedPcmRings>, out: &mut [f32], step: &str
              (the resident stopped delivering without a close or an error)"
         ),
         other => other,
+    }
+}
+
+/// Write PCM with a stall escape (see the file docs): `write_timeout` bounds
+/// the whole call, so a resident that stops draining the in-ring fails
+/// loudly with the step named instead of hanging the test.
+fn write_pcm(session: &mut DspSession<NamedPcmRings>, buf: &[f32], step: &str) {
+    match session.write_timeout(buf, Some(STALL_WAIT)) {
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: {step} could not write within {STALL_WAIT:?} \
+             (the resident stopped draining the in-ring without a close or an error)"
+        ),
+        other => other.unwrap(),
     }
 }
 
@@ -141,7 +155,11 @@ fn idle_reset_lands_without_pcm_and_clears_history_before_the_next_block() {
     assert_eq!(session.generations(), generations);
 
     let mut out = [0.0; 2];
-    session.write(&[0.25, -0.25]).unwrap();
+    write_pcm(
+        &mut session,
+        &[0.25, -0.25],
+        "the block after the idle resets",
+    );
     assert_eq!(
         read_pcm(&mut session, &mut out, "the block after the idle resets").unwrap(),
         1
@@ -154,7 +172,11 @@ fn idle_reset_lands_without_pcm_and_clears_history_before_the_next_block() {
             .expect("stall: the host did not service the mid-stream reset instead of hanging"),
         3
     );
-    session.write(&[0.5, -0.5]).unwrap();
+    write_pcm(
+        &mut session,
+        &[0.5, -0.5],
+        "the block after the mid-stream reset",
+    );
     assert_eq!(
         read_pcm(
             &mut session,
@@ -201,7 +223,11 @@ fn bounded_dsp_read_timeout_is_not_eos_and_retry_delivers_pcm() {
         session.read(&mut out, Some(Duration::from_millis(10))),
         Err(MediaHostError::TimedOut)
     ));
-    session.write(&[0.25, -0.5]).unwrap();
+    write_pcm(
+        &mut session,
+        &[0.25, -0.5],
+        "the block after the bounded read timeout",
+    );
     assert_eq!(
         read_pcm(
             &mut session,

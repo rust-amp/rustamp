@@ -460,18 +460,23 @@ impl<F: PcmRings> DspSession<F> {
 
     /// Push whole frames toward the host. Infinite lossless wait; a closed
     /// ring with a healthy control channel is a loud disconnect, never data
-    /// loss. Misaligned or empty buffers are caller errors.
+    /// loss. Misaligned or empty buffers are caller errors. The bounded form
+    /// of the same write is [`DspSession::write_timeout`].
     pub fn write(&mut self, buf: &[f32]) -> Result<()> {
         self.write_timeout(buf, None)
     }
 
     /// Push whole frames toward the host, bounded by `timeout` for the whole
     /// call (not per chunk). `None` waits indefinitely, exactly like
-    /// [`DspSession::write`]; `Some` returns [`MediaHostError::TimedOut`] when
-    /// the resident has not made room in time — a bounded wait, never data
-    /// loss and never false EOS. The engine-side resident adapter uses this
-    /// so a wedged resident fails the track instead of hanging the decode
-    /// thread.
+    /// [`DspSession::write`]. `Some` returns [`MediaHostError::TimedOut`] when
+    /// the resident has not made room in time: a stall that fails loudly,
+    /// never false EOS and never a silent short write — `Ok(())` means the
+    /// whole buffer was accepted, and the return type carries no accepted
+    /// count, so a caller must treat the stream as stalled rather than
+    /// continue writing. Frames the ring accepted before the timeout stay
+    /// delivered; the timeout itself drops nothing. The engine-side resident
+    /// adapter uses this so a wedged resident fails the track instead of
+    /// hanging the decode thread.
     pub fn write_timeout(&mut self, buf: &[f32], timeout: Option<Duration>) -> Result<()> {
         self.peer.check()?;
         if self.input_closed {

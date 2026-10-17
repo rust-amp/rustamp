@@ -2,16 +2,22 @@
 //! pairs and real named rings in-process. Headless; one Windows process, no
 //! window, no audio. Run in the Hyper-V test VM, never on the host.
 //!
-//! Waiting rule (see the M10 flakiness note): PCM reads wait on the condition
-//! (data, a drained close or a terminal failure wakes them), never on a
-//! wall-clock bound that a healthy-but-slow schedule could trip. Every such
-//! wait still carries a generous stall escape (`STALL_WAIT`): only a wedged
-//! or dead host reaches it, and reaching it fails loudly with the step named
-//! — a stall is never reported as success. Only joining the host thread or a
-//! woken outcome uses the same generous bound (`JOIN_WAIT`), which a healthy
-//! host reaches in milliseconds; the message on expiry names the stall.
-//! `DspSession::open` and `reconfigure` inherit the framework's 5 s
-//! `CONTROL_WAIT` for a single handshake exchange.
+//! Round-trip shape (the rebuild of the M18 candidate-1 deadlock): the
+//! producer and the consumer run in lockstep — write one bounded chunk, read
+//! that chunk back, repeat — so neither direction can end up waiting on a
+//! ring the other side has stopped draining (see `round_trip`).
+//!
+//! Waiting rule (see the M10 flakiness note): PCM reads and writes wait on
+//! the condition (data, space, a drained close or a terminal failure wakes
+//! them), never on a wall-clock bound that a healthy-but-slow schedule
+//! could trip. Every such wait still carries a generous stall escape
+//! (`STALL_WAIT`): only a wedged or dead host reaches it, and reaching it
+//! fails loudly with the step named — a stall is never reported as success.
+//! Only joining the host thread or a woken outcome uses the same generous
+//! bound (`JOIN_WAIT`), which a healthy host reaches in milliseconds; the
+//! message on expiry names the stall. `DspSession::open` and `reconfigure`
+//! inherit the framework's 5 s `CONTROL_WAIT` for a single handshake
+//! exchange.
 
 #![cfg(windows)]
 
@@ -30,15 +36,20 @@ use rustamp_mediahost::{MediaHostError, Result};
 use rustamp_proto::host::{DspStageDesc, PcmSpecWire};
 
 const JOIN_WAIT: Duration = Duration::from_secs(30);
-/// Stall bound for every PCM read (see the file docs): generous enough that
-/// only a real stall reaches it, and a timeout is a loud failure that names
-/// the step, never a pass.
+/// Stall bound for every PCM read and write (see the file docs): generous
+/// enough that only a real stall reaches it, and a timeout is a loud
+/// failure that names the step, never a pass.
 const STALL_WAIT: Duration = Duration::from_secs(30);
 const SPEC: PcmSpecWire = PcmSpecWire {
     sample_rate_hz: 44_100,
     channels: 2,
 };
 const TOTAL: usize = 4099;
+/// Frames per lockstep step. While the producer runs ahead of the consumer
+/// the back-ring holds at most one chunk, so this bounds the frames the
+/// fixed 4096-frame back-ring must ever absorb without a reader (see
+/// `round_trip`).
+const CHUNK: usize = 257;
 
 fn gain(factor: f32) -> DspStageDesc {
     DspStageDesc {
@@ -135,40 +146,80 @@ fn start(
     (session, result)
 }
 
-fn write_sweep(session: &mut DspSession<NamedPcmRings>, frames: usize) {
-    // `DspSession::write` takes no timeout (its ring write is infinite by
-    // design), so this wait cannot be bounded from the test surface; the
-    // bounded-write variant is named as a src fix in
-    // docs/tasks/M18-hang-hunt.md (`rustamp-mediahost/src/dsp.rs`,
-    // `DspSession::write`).
-    let mut block = Vec::with_capacity(257 * 2);
-    let mut written = 0;
-    while written < frames {
-        block.clear();
-        for frame in written..(written + 257).min(frames) {
-            block.extend_from_slice(&sweep(frame));
-        }
-        session.write(&block).unwrap();
-        written += block.len() / 2;
+/// Write PCM with a stall escape (see the file docs): `write_timeout` bounds
+/// the whole call, so a resident that stops draining the in-ring fails
+/// loudly with the step named instead of hanging the test — the
+/// producer-side half of the deadlock this file once carried.
+fn write_pcm(session: &mut DspSession<NamedPcmRings>, buf: &[f32], step: &str) {
+    match session.write_timeout(buf, Some(STALL_WAIT)) {
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: {step} could not write within {STALL_WAIT:?} \
+             (the resident stopped draining the in-ring without a close or an error)"
+        ),
+        other => other.unwrap(),
     }
 }
 
-fn read_all(session: &mut DspSession<NamedPcmRings>, frames: usize) -> Vec<f32> {
-    let mut received = Vec::with_capacity(frames * 2);
-    let mut out = [0.0; 514];
-    while received.len() < frames * 2 {
-        // Stall escape (see the file docs): a healthy host delivers within
-        // milliseconds; a timeout means it stopped answering without closing
-        // the ring, and that fails loudly instead of hanging the test.
-        let count = match session.read(&mut out, Some(STALL_WAIT)) {
-            Err(MediaHostError::TimedOut) => panic!(
-                "stall: the round trip received no PCM within {STALL_WAIT:?} \
-                 (the resident stopped delivering without a close or an error)"
-            ),
-            other => other.unwrap(),
-        };
-        assert!(count > 0, "host must not end the stream early");
-        received.extend_from_slice(&out[..count * 2]);
+/// Read PCM with a stall escape (see the file docs): a healthy host delivers
+/// within milliseconds, so a timeout means it stopped answering without
+/// data, a close or an error — a stall that fails loudly, never a pass.
+fn read_pcm(session: &mut DspSession<NamedPcmRings>, out: &mut [f32], step: &str) -> usize {
+    match session.read(out, Some(STALL_WAIT)) {
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: {step} received no PCM within {STALL_WAIT:?} \
+             (the resident stopped delivering without a close or an error)"
+        ),
+        other => other.unwrap(),
+    }
+}
+
+/// One interleaved producer/consumer round trip over the frames
+/// `[from, to)`: write one bounded chunk, read that chunk back, repeat.
+/// Returns the samples that came back, in order.
+///
+/// This is the rebuild of the write-then-read split that hung the VM (see
+/// docs/tasks/M18-hang-hunt.md, candidate 1): the old `write_sweep` pushed
+/// every frame before `read_all` read a single one, so the player could
+/// block in `DspSession::write` on a full in-ring while the host waited on
+/// a full 4096-frame back-ring, nobody reading — the bounded-buffer
+/// deadlock, with `TOTAL = 4099 = 4096 + 3` leaving a 1–3-frame margin.
+///
+/// The invariant that now guarantees progress: **the producer never starts
+/// chunk n+1 before the consumer has drained chunk n.** The host processes
+/// strictly in order, so the frames a chunk's read-back waits for are
+/// exactly that chunk, and the frames in flight (written but not yet read
+/// back) never exceed one `CHUNK` (257). The back-ring therefore holds at
+/// most 257 frames — 3839 below its 4096 capacity — so the host never
+/// blocks on its back-ring write, never stops draining the in-ring, the
+/// producer's write always finds room and the consumer's read always finds
+/// data: neither wait can be permanent, and the deadlock boundary (4096 +
+/// in-ring capacity + the host's in-hand block) is unreachable by
+/// construction. The margin is no longer 1–3 frames but 3839, and the sweep
+/// still flows 4099 frames through the 4096-frame back-ring, so the
+/// longer-than-capacity, wrapping and lossless assertions keep their
+/// meaning. Every wait is bounded by `STALL_WAIT` on top, so even a wedged
+/// resident fails loudly with the step named instead of hanging the run.
+fn round_trip(session: &mut DspSession<NamedPcmRings>, from: usize, to: usize) -> Vec<f32> {
+    let mut received = Vec::with_capacity((to - from) * 2);
+    let mut out = [0.0; CHUNK * 2];
+    let mut next = from;
+    while next < to {
+        let end = (next + CHUNK).min(to);
+        let count = end - next;
+        let mut block = Vec::with_capacity(count * 2);
+        for frame in next..end {
+            block.extend_from_slice(&sweep(frame));
+        }
+        write_pcm(session, &block, "the lockstep write");
+        next = end;
+        // Read this chunk back; the host processes strictly in order.
+        let mut got = 0;
+        while got < count {
+            let frames = read_pcm(session, &mut out, "the lockstep read");
+            assert!(frames > 0, "host must not end the stream early");
+            received.extend_from_slice(&out[..frames * 2]);
+            got += frames;
+        }
     }
     received
 }
@@ -190,9 +241,8 @@ fn passthrough_round_trip_is_bit_exact_and_eos_is_sticky() {
     // Handshake pins the contract: the echoed spec and zero chain latency.
     assert_eq!(session.spec(), SPEC);
     assert_eq!(session.latency_frames(), 0);
-    write_sweep(&mut session, TOTAL);
+    let received = round_trip(&mut session, 0, TOTAL);
     session.finish_writes().unwrap();
-    let received = read_all(&mut session, TOTAL);
     let expected: Vec<f32> = (0..TOTAL).flat_map(sweep).collect();
     assert_eq!(
         received.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
@@ -219,9 +269,8 @@ fn passthrough_round_trip_is_bit_exact_and_eos_is_sticky() {
 fn gain_chain_changes_audio_measurably() {
     let (mut session, done) = start(vec![passthrough(), gain(2.0)], 7);
     assert_eq!(session.latency_frames(), 0);
-    write_sweep(&mut session, TOTAL);
+    let received = round_trip(&mut session, 0, TOTAL);
     session.finish_writes().unwrap();
-    let received = read_all(&mut session, TOTAL);
     let input: Vec<f32> = (0..TOTAL).flat_map(sweep).collect();
     assert_ne!(received, input, "a x2 gain must be measurable");
     for (index, sample) in received.iter().enumerate() {
@@ -306,19 +355,13 @@ fn gain_with_bad_params_is_refused() {
 fn reset_keeps_rings_and_continues() {
     let (mut session, done) = start(vec![gain(2.0)], 3);
     let before = session.generations();
-    write_sweep(&mut session, 1000);
+    let mut received = round_trip(&mut session, 0, 1000);
     session.reset().unwrap();
     assert_eq!(session.generations(), before, "reset must not touch rings");
     assert_eq!(session.latency_frames(), 0);
     // Continue the sweep where it stopped; the stream must stay exact.
-    let mut block = Vec::with_capacity(2);
-    for frame in 1000..TOTAL {
-        block.clear();
-        block.extend_from_slice(&sweep(frame));
-        session.write(&block).unwrap();
-    }
+    received.extend(round_trip(&mut session, 1000, TOTAL));
     session.finish_writes().unwrap();
-    let received = read_all(&mut session, TOTAL);
     for (index, sample) in received.iter().enumerate() {
         let frame = index / 2;
         let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
@@ -334,8 +377,7 @@ fn reset_keeps_rings_and_continues() {
 fn reconfigure_reoffers_both_rings_with_new_sound() {
     let (mut session, done) = start(vec![gain(2.0)], 3);
     let before = session.generations();
-    write_sweep(&mut session, 500);
-    let first = read_all(&mut session, 500);
+    let first = round_trip(&mut session, 0, 500);
     for (index, sample) in first.iter().enumerate() {
         let frame = index / 2;
         let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
@@ -347,14 +389,8 @@ fn reconfigure_reoffers_both_rings_with_new_sound() {
         before,
         "reconfigure must bump both rings"
     );
-    let mut block = Vec::with_capacity(2);
-    for frame in 500..TOTAL {
-        block.clear();
-        block.extend_from_slice(&sweep(frame));
-        session.write(&block).unwrap();
-    }
+    let rest = round_trip(&mut session, 500, TOTAL);
     session.finish_writes().unwrap();
-    let rest = read_all(&mut session, TOTAL - 500);
     for (index, sample) in rest.iter().enumerate() {
         let frame = index / 2 + 500;
         let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
@@ -511,17 +547,12 @@ fn abrupt_host_loss_is_loud_and_never_eos() {
         }
     });
     let mut session = DspSession::open(peer, NamedPcmRings, SPEC, &[gain(1.0)], 1).unwrap();
-    session.write(&[0.25, -0.25]).unwrap();
+    write_pcm(&mut session, &[0.25, -0.25], "the fake host's first block");
     let mut out = [0.0; 2];
     // Stall escape (see the file docs) on the first read: the fake host
     // publishes its block before DspReady, so a timeout is a stall, not a
     // slow schedule.
-    let first = match session.read(&mut out, Some(STALL_WAIT)) {
-        Err(MediaHostError::TimedOut) => {
-            panic!("stall: the fake host's first block never arrived within {STALL_WAIT:?}")
-        }
-        other => other.unwrap(),
-    };
+    let first = read_pcm(&mut session, &mut out, "the fake host's first block");
     assert_eq!(first, 1);
     assert_eq!(out, [0.5, -0.5]);
     die.send(()).unwrap();
