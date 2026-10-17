@@ -8,13 +8,16 @@
 //!
 //! Both are 64-bit only (their residents are native 64-bit libraries).
 //!
-//! **License:** GPL-3.0-or-later **without** the §7 plugin exception (RFC 0006 §8).
-//! This crate exists to link copyleft decoder/DSP code that the exception cannot cover.
-//! Nothing permissive may depend on this crate.
+//! **License:** MIT OR Apache-2.0 (RFC 0006 §8 erratum). Codec libraries belong
+//! in separately licensed resident crates, never in this framework.
 //!
-//! **Scope (M6 card):** stubs plus protocol only. The actual PCM transfer, ring wake
-//! implementation, opening a real decoder, and process spawning are out of scope
-//! and belong to a later card that requires the lossless-delivery work (RFC 0007).
+//! [`decoder`] implements the lossless decoder conversation and resident boundary;
+//! [`control`] supervises the control stream independently of blocking PCM I/O.
+//! Neither API belongs on an audio render callback. The DSP host remains a stub.
+
+pub mod control;
+pub mod decoder;
+pub mod pcm;
 
 use rustamp_ipc::Message;
 use thiserror::Error;
@@ -22,6 +25,21 @@ use thiserror::Error;
 /// Errors that can occur in the media host.
 #[derive(Debug, Error)]
 pub enum MediaHostError {
+    /// An IPC, liveness, timeout or ring failure; never interpreted as EOS.
+    #[error("media host disconnected or failed: {0}")]
+    Disconnected(String),
+
+    /// A resident changed the stream specification; retry with the new spec.
+    #[error("decoder format changed")]
+    FormatChanged,
+
+    /// A caller's explicit deadline elapsed without PCM or a control response.
+    #[error("media host wait timed out")]
+    TimedOut,
+
+    /// Ring validation or transfer failed.
+    #[error(transparent)]
+    Ring(#[from] rustamp_ipc::shm::RingError),
     /// The protocol message was not recognized or is invalid for this host.
     #[error("invalid protocol message: {0}")]
     InvalidMessage(String),
@@ -70,7 +88,9 @@ impl Default for DecoderHost {
 impl MediaHost for DecoderHost {
     fn handle_message(&mut self, msg: Message) -> Result<Option<Message>> {
         match msg {
-            Message::Hello { .. } => {
+            Message::Hello {
+                protocol_version, ..
+            } if protocol_version == rustamp_ipc::PROTOCOL_VERSION => {
                 // Respond with our Hello
                 Ok(Some(Message::hello()))
             }
@@ -87,10 +107,7 @@ impl MediaHost for DecoderHost {
             Message::DecoderSeek { .. } => Err(MediaHostError::NotImplemented(
                 "DecoderSeek not implemented in stub".into(),
             )),
-            Message::Shutdown => {
-                // Clean shutdown
-                std::process::exit(0);
-            }
+            Message::Shutdown => Ok(None),
             _ => Err(MediaHostError::InvalidMessage(format!(
                 "DecoderHost does not handle {:?}",
                 msg
@@ -126,7 +143,9 @@ impl Default for DspHost {
 impl MediaHost for DspHost {
     fn handle_message(&mut self, msg: Message) -> Result<Option<Message>> {
         match msg {
-            Message::Hello { .. } => Ok(Some(Message::hello())),
+            Message::Hello {
+                protocol_version, ..
+            } if protocol_version == rustamp_ipc::PROTOCOL_VERSION => Ok(Some(Message::hello())),
             Message::Ping(token) => Ok(Some(Message::Pong(token))),
             Message::DspConfigure { .. } => Err(MediaHostError::NotImplemented(
                 "DspConfigure not implemented in stub".into(),
@@ -134,9 +153,7 @@ impl MediaHost for DspHost {
             Message::DspReset => Err(MediaHostError::NotImplemented(
                 "DspReset not implemented in stub".into(),
             )),
-            Message::Shutdown => {
-                std::process::exit(0);
-            }
+            Message::Shutdown => Ok(None),
             _ => Err(MediaHostError::InvalidMessage(format!(
                 "DspHost does not handle {:?}",
                 msg
@@ -158,7 +175,7 @@ mod tests {
     fn decoder_host_hello_roundtrip() {
         let mut host = DecoderHost::new();
         let hello = Message::Hello {
-            protocol_version: 2,
+            protocol_version: rustamp_ipc::PROTOCOL_VERSION,
             pid: 1234,
         };
         let resp = host.handle_message(hello).unwrap().unwrap();
@@ -176,7 +193,7 @@ mod tests {
     fn dsp_host_hello_roundtrip() {
         let mut host = DspHost::new();
         let hello = Message::Hello {
-            protocol_version: 2,
+            protocol_version: rustamp_ipc::PROTOCOL_VERSION,
             pid: 5678,
         };
         let resp = host.handle_message(hello).unwrap().unwrap();

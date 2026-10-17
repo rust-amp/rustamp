@@ -30,10 +30,16 @@ fn main() -> Result<()> {
             Err(e) => return Err(MediaHostError::OperationFailed(format!("recv error: {e}"))),
         };
 
-        if let Some(response) = host.handle_message(msg)? {
-            transport.send(&response).map_err(|e| {
-                MediaHostError::OperationFailed(format!("failed to send response: {e}"))
-            })?;
+        if matches!(msg, Message::Shutdown) {
+            break Ok(());
         }
+        match host.handle_message(msg) {
+            Ok(Some(response)) => transport.send(&response),
+            Ok(None) => Ok(()),
+            Err(error) => transport.send(&Message::DspError {
+                message: error.to_string(),
+            }),
+        }
+        .map_err(|e| MediaHostError::OperationFailed(format!("failed to send response: {e}")))?;
     }
 }

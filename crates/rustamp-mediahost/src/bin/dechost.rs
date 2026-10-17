@@ -1,39 +1,23 @@
-//! `rustamp-dechost` — out-of-process decoder host (RFC 0006).
-//!
-//! This binary hosts a single decoder in a separate process. It speaks the
-//! control protocol over stdin/stdout (length-prefixed postcard frames) and
-//! transfers PCM through a shared-memory ring (RFC 0003).
-//!
-//! **Stub implementation (M6 card):** only the control protocol skeleton is
-//! implemented. The actual decoder opening, PCM ring handling, seek/format
-//! change/EOS logic, and process spawning are out of scope and belong to a
-//! later card.
+//! Framework entry point. A real codec lives in a separately licensed resident
+//! binary using the same `serve_decoder` API, never in this permissive binary.
 
-use rustamp_ipc::{Message, StreamTransport, Transport};
-use rustamp_mediahost::{DecoderHost, MediaHost, MediaHostError, Result};
-use std::io::{stdin, stdout};
+#[cfg(windows)]
+fn main() -> rustamp_mediahost::Result<()> {
+    use rustamp_mediahost::control::{ControlPeer, Liveness};
+    use rustamp_mediahost::decoder::{UnavailableResident, serve_decoder};
+    use rustamp_mediahost::pcm::NamedPcmRings;
+    let peer = ControlPeer::start(
+        std::io::stdin(),
+        std::io::stdout(),
+        Liveness::default(),
+        true,
+    )?;
+    serve_decoder(&peer, &NamedPcmRings, &UnavailableResident)
+}
 
-fn main() -> Result<()> {
-    let mut host = DecoderHost::new();
-    let mut transport = StreamTransport::new(stdin(), stdout());
-
-    // Send our Hello immediately
-    transport
-        .send(&Message::hello())
-        .map_err(|e| MediaHostError::OperationFailed(format!("failed to send Hello: {e}")))?;
-
-    // Main message loop
-    loop {
-        let msg = match transport.recv() {
-            Ok(msg) => msg,
-            Err(rustamp_ipc::IpcError::Closed) => break Ok(()),
-            Err(e) => return Err(MediaHostError::OperationFailed(format!("recv error: {e}"))),
-        };
-
-        if let Some(response) = host.handle_message(msg)? {
-            transport.send(&response).map_err(|e| {
-                MediaHostError::OperationFailed(format!("failed to send response: {e}"))
-            })?;
-        }
-    }
+#[cfg(not(windows))]
+fn main() -> rustamp_mediahost::Result<()> {
+    Err(rustamp_mediahost::MediaHostError::NotImplemented(
+        "cross-process PCM mappings require Windows; M6 is deferred".into(),
+    ))
 }
