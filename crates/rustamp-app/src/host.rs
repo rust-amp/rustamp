@@ -76,7 +76,8 @@
 //! real bands, preamp, enabled and autoload. The app forwards the `SetBand`,
 //! `SetPreamp`, `SetEqEnabled` and `SetEqAuto` commands to the engine and no
 //! longer logs them as unimplemented. An untouched player still publishes the
-//! flat, disabled default, which the bridge renders as the classic value 31.
+//! fresh configuration's flat, engaged default, which the bridge renders as
+//! the classic value 31.
 //!
 //! # Cadence and cost
 //!
@@ -646,8 +647,9 @@ mod tests {
         // ...and no invented entry id for an empty queue.
         assert_eq!(snapshot.current_id, None);
         // The engine's equalizer is untouched here, so its published state is
-        // still the honest flat, disabled default.
-        assert_eq!(snapshot.eq, EqState::default());
+        // still the fresh configuration's honest flat, engaged default
+        // (`EqConfig::default`, not the wire contract's disengaged default).
+        assert_eq!(snapshot.eq, Config::default().eq.state);
         // The message built from the app carries exactly that snapshot.
         let Message::PlayerStateUpdate(boxed) = app.player_state_update() else {
             panic!("the app builds PlayerStateUpdate, nothing else");

@@ -640,7 +640,15 @@ mod tests {
     #[test]
     fn a_saved_position_off_every_monitor_lands_wholly_inside_the_target() {
         let displays = two_monitors();
-        for (x, y) in [(-100, -100), (10_000, 10_000), (-1, -1), (12_345, -1)] {
+        // Every position below is genuinely orphaned (a 275 x 116 window
+        // there intersects no work area), so each one clamps onto the
+        // primary work area instead of being left alone.
+        for (x, y) in [
+            (-1000, -1000),
+            (10_000, 10_000),
+            (-2000, 5000),
+            (12_345, -1),
+        ] {
             let (cx, cy) = displays.clamp_position(x, y, 275, 116).expect("a clamp");
             let rect = ScreenRect {
                 x: cx,
