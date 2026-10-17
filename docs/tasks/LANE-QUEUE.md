@@ -23,6 +23,21 @@ model class it wants.
 | 8 | **ReplayGain** — the M2 item, with the scanner | `rustamp-audio`, `rustamp-meta` | `docs/PLAN.md` M2 | deep |
 | 9 | **The S10 probes** — run the five probes the card designed (dirty room, owner-approved) | research harness | `docs/tasks/S10-probes.md` | orchestrator |
 
+## Released by the owner (2026-10-17) — ready to start
+
+- **RFC 0012, the device-error hook** (`docs/tasks/H4-output-error-rfc.md`,
+  `docs/rfc/0012-output-error-hook.md`). The contract change is approved: the
+  engine must learn about a device failure. Owns `rustamp-core`,
+  `rustamp-output` and the engine's poll step in `rustamp-audio` — so it waits
+  for the audio crate to be free (the flush lane holds it right now).
+- **The plugin DLL acceptance** (`docs/tasks/P3-dll-acceptance.md`). Approved:
+  build the loader and run it against a **freely licensed** plugin (in_openmpt
+  is in the reference installation) **in the VM only**. Owns
+  `rustamp-plughost`, `rustamp-plugin-abi` and a VM-only test.
+- **The S08 measurement runs** (`docs/tasks/S08-vis.md`). The probe and the
+  three jobs are designed; the orchestrator runs them in the VM and the lane
+  fills the spec from the artefacts.
+
 ## Needs a decision first (do not start)
 
 - **BETA-05 / RFC 0012** — the device-error hook. The RFC is a draft; implementing
@@ -34,6 +49,21 @@ model class it wants.
 - **`xtask package` installer, signing, notices** — release-time work.
 - **The visualiser, MilkDrop, the media library, Linux/macOS** — later
   milestones.
+
+## Source rotation (owner rule, 2026-10-17)
+
+Spread the lanes over every source that has quota — **free models, OpenAI,
+Claude and Google** — instead of putting a whole wave on one provider. When a
+slot is refilled, prefer the source that is currently under-used. A source that
+refuses (unavailable model, rate limit) means the lane moves to another one; it
+never means waiting.
+
+| Source | How | Notes |
+|---|---|---|
+| **Google** | `agy_run` (`gemini-3.8-flash-high` / `-medium`) | reports its own quota; 82 % weekly at the last reading |
+| **Claude** | `subagent` with `claude-fast` / `claude-balanced` / `claude-deep` | through the **Claude provider** only, never agy's Claude bucket |
+| **OpenAI** | `subagent` with `openai/gpt-6.1-sol#high` | spend it until Sunday 2026-10-18, then stop until approved |
+| **Free** | `subagent` with `free-*` | `free-ling-3.1` and `free-muse-spark` were unavailable; `free-laguna`, `free-big-pickle` and `free-deepseek-v4.1` worked |
 
 ## How a lane is started
 
