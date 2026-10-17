@@ -6,9 +6,10 @@ edition.workspace = true
 # MIT OR Apache-2.0: this is only the PROTOCOL FRAMEWORK (the message loop and
 # supervision) and links no decoder at all. A per-resident crate
 # (`rustamp-mediahost-<decoder>`) carries the resident's own license - the
-# sidplayfp host is GPL because sidplayfp is, a symphonia host is permissive
-# because symphonia is. That keeps the copyleft in the resident crate instead of
-# in the framework, and keeps this crate inside the permissive set.
+# sidplayfp host is GPL because sidplayfp is, and a symphonia host would be
+# MPL-2.0 because symphonia is (weak copyleft, **not** permissive). That keeps
+# the copyleft in the resident crate instead of in the framework, and keeps this
+# crate inside the permissive set.
 license = "MIT OR Apache-2.0"
 repository.workspace = true
 authors.workspace = true
