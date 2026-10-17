@@ -433,14 +433,29 @@ fn a_clean_fixture_reaches_a_defined_end_of_stream() {
 }
 
 #[test]
-fn the_default_registry_has_one_claimant_so_ambiguity_is_unreachable_today() {
+fn the_default_registry_has_two_real_claimants_so_the_tie_rule_is_reachable() {
     let reg = default_registry();
+    let names: Vec<&str> = reg.factories().iter().map(|f| f.name()).collect();
     assert_eq!(
-        reg.factories().len(),
-        1,
-        "a second factory would make the tie-break below reachable"
+        names,
+        vec!["symphonia", "wave"],
+        "registration order is the RFC 0013 tie-break"
     );
-    assert_eq!(reg.factories()[0].name(), "symphonia");
+    // The tie-break is no longer dead policy: both real factories claim a
+    // `RIFF`/`WAVE` signature at `Confidence::CONTENT` and both claim `.wav` by
+    // extension, so the fake factories below only pin the *rule*, not its
+    // reachability. `tests/selection.rs` exercises it with the real pair.
+    let header = b"RIFF\x24\x00\x00\x00WAVEfmt ";
+    let hint = ProbeHint {
+        extension: Some("wav"),
+        header,
+    };
+    assert_eq!(reg.factories()[0].probe(&hint), Confidence::CONTENT);
+    assert_eq!(reg.factories()[1].probe(&hint), Confidence::CONTENT);
+    assert_eq!(
+        reg.probe(&hint).expect("both claim it").0.name(),
+        "symphonia"
+    );
 }
 
 /// Factory that claims every input at a fixed confidence and opens a short
