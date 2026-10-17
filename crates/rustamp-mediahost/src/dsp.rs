@@ -462,6 +462,17 @@ impl<F: PcmRings> DspSession<F> {
     /// ring with a healthy control channel is a loud disconnect, never data
     /// loss. Misaligned or empty buffers are caller errors.
     pub fn write(&mut self, buf: &[f32]) -> Result<()> {
+        self.write_timeout(buf, None)
+    }
+
+    /// Push whole frames toward the host, bounded by `timeout` for the whole
+    /// call (not per chunk). `None` waits indefinitely, exactly like
+    /// [`DspSession::write`]; `Some` returns [`MediaHostError::TimedOut`] when
+    /// the resident has not made room in time — a bounded wait, never data
+    /// loss and never false EOS. The engine-side resident adapter uses this
+    /// so a wedged resident fails the track instead of hanging the decode
+    /// thread.
+    pub fn write_timeout(&mut self, buf: &[f32], timeout: Option<Duration>) -> Result<()> {
         self.peer.check()?;
         if self.input_closed {
             return Err(MediaHostError::InvalidMessage(
@@ -475,6 +486,7 @@ impl<F: PcmRings> DspSession<F> {
         }
         let channels = usize::from(self.spec.channels);
         let frames = buf.len() / channels;
+        let deadline = timeout.map(|duration| Instant::now() + duration);
         let mut offset = 0;
         while offset < frames {
             if let Some(message) = self.peer.try_recv()? {
@@ -482,10 +494,11 @@ impl<F: PcmRings> DspSession<F> {
                     "unexpected DSP message while writing: {message:?}"
                 )));
             }
-            match self
-                .to_host
-                .write_from_blocking(&buf[offset * channels..frames * channels], None)
-            {
+            match self.to_host.write_from_blocking(
+                &buf[offset * channels..frames * channels],
+                remaining(deadline)?,
+            ) {
+                Ok(0) => return Err(MediaHostError::TimedOut),
                 Ok(written) => offset += written,
                 Err(RingError::Closed) => {
                     self.peer.check()?;
