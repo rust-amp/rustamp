@@ -24,3 +24,7 @@ rustamp-gfx.workspace = true
 thiserror.workspace = true
 winit.workspace = true
 softbuffer.workspace = true
+
+[dev-dependencies]
+# Golden images for the built-in skin (`tests/golden_lookalike.rs`).
+rustamp-testkit.workspace = true

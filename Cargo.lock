@@ -1844,6 +1844,7 @@ dependencies = [
  "rustamp-prefs",
  "rustamp-proto",
  "rustamp-skin",
+ "rustamp-testkit",
  "softbuffer",
  "thiserror 2.0.21",
  "winit",
