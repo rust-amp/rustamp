@@ -16,6 +16,7 @@ until approval.
 | agy (Google) | Reliable, but **four concurrent jobs** is a hard cap, and its job API hands back an empty result text: the worktree is the evidence, not the report. |
 | OpenAI | Worked before (`gpt-6.1-sol`); unused so far this wave. |
 | Subagents generally | A subagent lane **notifies**; an agy lane does not. Finished agy lanes sat unnoticed until the poll rule was written down. |
+| A subagent lane (ReplayGain, free tier) | Wrote into the **canonical tree** instead of its own worktree - one no-op edit to `crates/rustamp-meta/src/write.rs`, both branches doing the same thing - while its worktree stayed untouched. Reverted; the canonical tree is clean again. Rule: check a lane's worktree, not only its report, before believing either. |
 
 ## 2. The hard engineering, where models demonstrably got it wrong
 
