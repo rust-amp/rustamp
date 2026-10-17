@@ -30,7 +30,13 @@
 //!   does nothing and the dialog stays open.
 //! * Open media: a kind-specific face — the prompt plus the entry field for
 //!   the files and directory faces, the staged-pick summary when picks were
-//!   staged, or the typed URL for the location face. Confirming adds the
+//!   staged, or the typed URL for the location face, then a one-line hint.
+//!   The field takes the OS text of each key press ([`App::dialog_text`]),
+//!   so a full path is typeable, and files dropped from the shell become
+//!   picks ([`App::dialog_drop_file`]); a long field shows its tail. There
+//!   is no OS picker and no clipboard paste (both would need a new Win32
+//!   binding). This is the target of the main window's Eject and the
+//!   playlist's ADD (BETA-03). Confirming adds the
 //!   picks (`Enter` submits the resulting [`Command::AddItems`] and closes
 //!   the dialog); with nothing to confirm the dialog stays open. The
 //!   reference's layout, filters and wording are unmeasured, so prompts are
@@ -152,6 +158,29 @@ impl App {
         true
     }
 
+    /// Whether the open dialog has a text field (the presenter sends the OS
+    /// text of a key press there instead of the key, see
+    /// [`App::dialog_text`]).
+    pub fn dialog_accepts_text(&self) -> bool {
+        self.dialogs.accepts_text()
+    }
+
+    /// Text the OS produced for a key press while a dialog is focused
+    /// (layout-aware, with case and punctuation): types it into the open
+    /// field, so a full path such as `C:\Music\song.mp3` can be typed (see
+    /// [`rustamp_ui::DialogManager::type_text`]). Returns whether anything
+    /// was typed; control characters are left to [`App::dialog_key`].
+    pub fn dialog_text(&mut self, text: &str) -> bool {
+        self.dialogs.type_text(text)
+    }
+
+    /// A file dropped from the shell onto the dialog window: the open-media
+    /// file faces stage it as a pick (`Enter` still confirms). Returns
+    /// whether the open dialog took it.
+    pub fn dialog_drop_file(&mut self, path: PathBuf) -> bool {
+        self.dialogs.drop_media_path(path)
+    }
+
     /// The open-media dialog's entry field text.
     pub fn media_text(&self) -> &str {
         self.dialogs.media_text()
@@ -238,15 +267,29 @@ impl App {
                     lines.push(if field.is_empty() {
                         "(no file chosen)".to_string()
                     } else {
-                        field.to_string()
+                        field_tail(field)
                     });
                 } else {
-                    lines.extend(staged.iter().map(|path| path.display().to_string()));
+                    // Room for three lines between the prompt and the hint.
+                    let shown = if staged.len() > 3 { 2 } else { staged.len() };
+                    lines.extend(
+                        staged[..shown]
+                            .iter()
+                            .map(|path| field_tail(&path.display().to_string())),
+                    );
+                    if staged.len() > shown {
+                        lines.push(format!("(+{} more)", staged.len() - shown));
+                    }
                 }
+                lines.push(OPEN_MEDIA_HINT.to_string());
                 lines
             }
             OpenMediaKind::Location => {
-                vec!["Location (URL):".to_string(), field.to_string()]
+                vec![
+                    "Location (URL):".to_string(),
+                    field_tail(field),
+                    "Type the URL, Enter adds it.".to_string(),
+                ]
             }
         }
     }
@@ -323,5 +366,45 @@ impl App {
     }
 }
 
+/// The open-media file faces' last line: how to reach a file. Own wording
+/// (the reference dialog is an OS picker whose labels are unmeasured, S04
+/// open); paste is not offered because there is no clipboard binding.
+pub(crate) const OPEN_MEDIA_HINT: &str = "Type a path or drop files, Enter adds.";
+
+/// How many characters of a field fit on one dialog line: the open-media
+/// client width less both text pads, in `text.bmp` cells (5 px).
+const FIELD_CHARS: usize = (rustamp_ui::OPEN_MEDIA_CLIENT_SIZE.0 as usize
+    - 2 * rustamp_ui::dialogs::TEXT_PAD as usize)
+    / 5;
+
+/// The visible part of a field: the whole text when it fits, else `...` plus
+/// its tail, so the end of a long path (the part being typed, and the file
+/// name) stays on screen.
+pub(crate) fn field_tail(text: &str) -> String {
+    let count = text.chars().count();
+    if count <= FIELD_CHARS {
+        return text.to_string();
+    }
+    let keep = FIELD_CHARS - 3;
+    let tail: String = text.chars().skip(count - keep).collect();
+    format!("...{tail}")
+}
+
 /// The dialog manager type, re-exported for the presenter.
 pub use rustamp_ui::DialogManager as Dialogs;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_path_shows_its_tail() {
+        let short = r"C:\Music\song.mp3";
+        assert_eq!(field_tail(short), short);
+        let long = format!(r"C:\{}\song.mp3", "deep\\".repeat(20));
+        let shown = field_tail(&long);
+        assert!(shown.starts_with("..."), "{shown}");
+        assert!(shown.ends_with(r"\song.mp3"), "{shown}");
+        assert_eq!(shown.chars().count(), FIELD_CHARS);
+    }
+}

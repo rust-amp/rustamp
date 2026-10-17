@@ -37,7 +37,7 @@ use rustamp_core::audio::{DecoderRegistry, OutputDevice};
 use rustamp_core::bus::{CommandReceiver, CommandSender, EventBus, EventReceiver, command_channel};
 use rustamp_core::command::Command;
 use rustamp_core::config::Config;
-use rustamp_core::error::{Error, ErrorInfo, Result};
+use rustamp_core::error::{Error, ErrorInfo, ErrorKind, Result};
 use rustamp_core::event::Event;
 use rustamp_core::playlist::{EntryId, MediaLocation};
 use rustamp_core::state::{PlayerState, TransportState, WindowId};
@@ -133,6 +133,10 @@ pub struct App {
     /// `menu.rs`, hosted by `window.rs`; S04).
     pub(crate) main_menu_open: bool,
     notes: Vec<String>,
+    /// The last error the user should see (BETA-04): a failed open/decode or
+    /// a rejected command. Shown in the main window's native title bar
+    /// ([`App::window_title`]); cleared when a track starts.
+    last_error: Option<String>,
     /// The app's end of the player-state bridge to the plugin host
     /// (see [`crate::host`]): detached until a supervisor attaches a
     /// control-channel transport, so publishing without a host is a no-op.
@@ -182,6 +186,9 @@ impl App {
         }
 
         // Seed the UI machine from the config and the engine's initial state.
+        // The presenter opens the playlist editor at launch, so the model says
+        // it is open: its toggle, its check mark and its own close button then
+        // hide the window that is actually there (BETA-06/07).
         let initial = MainWindowState {
             volume: volume_percent(options.volume),
             balance: rustamp_ui::balance_percent(options.config.audio.balance),
@@ -189,6 +196,7 @@ impl App {
             clutter_a: options.config.ui.always_on_top,
             shuffle: options.config.playlist.shuffle,
             repeat: options.config.playlist.repeat,
+            playlist_open: true,
             ..MainWindowState::default()
         };
 
@@ -224,6 +232,7 @@ impl App {
             dialogs: DialogManager::new(),
             main_menu_open: false,
             notes: Vec::new(),
+            last_error: None,
             host: HostStateLink::detached(),
             host_supervisor: None,
         };
@@ -270,6 +279,32 @@ impl App {
     /// flipped by its EQ toggle button).
     pub fn eq_open(&self) -> bool {
         self.ui.state().eq_open
+    }
+
+    /// Whether the playlist editor window is open (the main window's
+    /// `playlist_open` flag; the presenter creates or drops the OS window to
+    /// match it, the same way as the equalizer's).
+    pub fn playlist_open(&self) -> bool {
+        self.ui.state().playlist_open
+    }
+
+    /// The last error surfaced to the user, if one is showing (BETA-04).
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// The main window's native title: `Rustamp`, or `Rustamp - <error>`
+    /// while an error is showing.
+    ///
+    /// Own choice, stated plainly: no spec gives the player a place for
+    /// error text. The native title bar is legible whatever the skin (the
+    /// built-in placeholder font is not, BETA-02), changes nothing the specs
+    /// measured inside the skinned window, and the presenter applies it.
+    pub fn window_title(&self) -> String {
+        match &self.last_error {
+            Some(error) => format!("Rustamp - {error}"),
+            None => "Rustamp".to_string(),
+        }
     }
 
     /// The headless UI machine, mutably (tests and the presenter).
@@ -505,6 +540,9 @@ impl App {
             Event::EqChanged(eq) => {
                 self.eq.sync_from_eq_state(eq);
             }
+            Event::Error(info) => self.surface_error(info),
+            // A track that actually opened clears the error it replaced.
+            Event::TrackChanged { index: Some(_), .. } => self.last_error = None,
             _ => {}
         }
 
@@ -691,6 +729,34 @@ impl App {
         let commands = self.ui.mouse_up(x, y, self.now_ms());
         self.forward(&commands)?;
         Ok(commands)
+    }
+
+    /// A right-button press at window-relative `(x, y)` (S03 §5).
+    ///
+    /// The EQ and PL buttons toggle their window ("menu" grade); the long
+    /// title, the time display and the seek bar have their own context menus,
+    /// whose contents are S04's and unmeasured, so they are noted and open
+    /// nothing; anywhere else opens the main-menu popup ("Right-click the main
+    /// window: main-menu popup", verified).
+    pub fn mouse_right_down(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+        let command = match rustamp_ui::hit_test(&self.layout, x, y) {
+            Some(rustamp_ui::Widget::EqToggle) => Command::ToggleWindow(WindowId::Equalizer),
+            Some(rustamp_ui::Widget::PlaylistToggle) => Command::ToggleWindow(WindowId::Playlist),
+            Some(
+                widget @ (rustamp_ui::Widget::Marquee
+                | rustamp_ui::Widget::TimeDisplay
+                | rustamp_ui::Widget::PositionSlider),
+            ) => {
+                self.note(format!(
+                    "right-click on {widget:?}: its context menu's contents are unmeasured (S04)"
+                ));
+                return Ok(Vec::new());
+            }
+            _ => Command::OpenMainMenu,
+        };
+        // Through the external path: the UI machine has not predicted it.
+        self.submit(command.clone())?;
+        Ok(vec![command])
     }
 
     /// A key press. Returns the machine's outcome so the caller can log an
@@ -945,6 +1011,55 @@ impl App {
         self.bus.publish(Event::Error(ErrorInfo::from(error)));
     }
 
+    /// Makes an [`Event::Error`] reach the user and leaves the transport in a
+    /// defined state (BETA-04).
+    ///
+    /// * A format change is a notice, not a failure (RFC 0002 C4): the run
+    ///   continues, so it is only noted.
+    /// * Any other error is noted (the presenter prints notes) and shown in
+    ///   the native title ([`App::window_title`]), naming the current entry.
+    /// * A running transport is stopped unless the run already reported its
+    ///   end of stream (it then finishes on its own). The engine's decode
+    ///   worker exits after an open failure without an end of stream, so
+    ///   without this the engine stays `Playing` over silence. The rule is
+    ///   deliberately broad: a mid-track read failure stops the run as well
+    ///   instead of advancing, which is a defined state, and Play retries.
+    /// * The UI's transport is re-synced to the engine's, so an optimistic
+    ///   Playing light (Play on an empty queue) goes out again.
+    fn surface_error(&mut self, info: &ErrorInfo) {
+        if info.kind == ErrorKind::FormatChanged {
+            self.note(format!("notice: {}", info.message));
+            return;
+        }
+        let entry = self
+            .engine
+            .current_index()
+            .and_then(|index| self.engine.queue().get(index as usize))
+            .map(|track| track.display());
+        let message = match entry {
+            Some(entry) if self.engine.transport() != TransportState::Stopped => {
+                format!("cannot play {entry}: {}", info.message)
+            }
+            // Play with nothing queued: the engine's "queue index 0" means
+            // nothing to a first user, so say what to do instead.
+            _ if info.kind == ErrorKind::Other && self.engine.queue().is_empty() => {
+                "nothing to play: the playlist is empty (Eject or ADD opens a file)".to_string()
+            }
+            _ => info.message.clone(),
+        };
+        self.note(format!("error: {message}"));
+        self.last_error = Some(message);
+        if self.engine.transport() != TransportState::Stopped
+            && self.engine.end_of_stream().is_none()
+            && let Err(error) = self.engine.stop()
+        {
+            self.note(format!("error: stopping after the failure failed: {error}"));
+        }
+        let transport = self.engine.transport();
+        self.ui
+            .handle_event(&Event::StateChanged(transport), self.now_ms());
+    }
+
     fn publish_modes(&self) {
         self.bus.publish(Event::ModesChanged {
             shuffle: self.shuffle,
@@ -1004,6 +1119,10 @@ impl App {
                      implemented yet (S07 §12 O12, S04)"
                         .to_string(),
                 );
+            }
+            C::ToggleWindow(WindowId::Playlist) => {
+                // The UI machine flipped `playlist_open`; the presenter
+                // creates or drops the playlist editor's OS window to match.
             }
             C::ToggleWindow(window) => {
                 self.note(format!(

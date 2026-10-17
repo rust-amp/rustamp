@@ -287,6 +287,8 @@ struct Windowed {
     applied_eq_client: Option<(u32, u32)>,
     /// The always-on-top level last applied to the OS window.
     applied_on_top: bool,
+    /// The main window title last applied ([`App::window_title`]).
+    applied_title: Option<String>,
     /// The docked stack model (S05 §3.3, §4.2, §5): shade/double-size flags
     /// and same-delta moves go through this instead of new arithmetic. Its
     /// absolute positions are the S05 default model; OS placement reads the
@@ -327,6 +329,7 @@ impl Windowed {
             applied_client: None,
             applied_eq_client: None,
             applied_on_top,
+            applied_title: None,
             stack: DockedStack::default_launch(),
             last_main_outer: None,
         }
@@ -646,6 +649,17 @@ impl Windowed {
         let _ = buffer.present();
     }
 
+    /// Applies [`App::window_title`] to the main window when it changed.
+    fn sync_title(&mut self) {
+        let title = self.app.window_title();
+        if self.applied_title.as_deref() != Some(title.as_str())
+            && let Some(window) = &self.window
+        {
+            window.set_title(&title);
+            self.applied_title = Some(title);
+        }
+    }
+
     /// True when `id` is the equalizer window's id.
     fn is_eq_window(&self, id: WindowId) -> bool {
         self.eq_id == Some(id)
@@ -749,12 +763,28 @@ impl Windowed {
     ///
     /// The dialog consumes `Enter` (confirm the jump box, the skin
     /// browser or the open-media dialog; a no-op on the load-playlist and preferences dialogs, whose
-    /// confirmation is open per RFC 0010 and whose contents are unmeasured), `Escape` (close) and the keys each dialog types
-    /// or moves with (digits for the jump box, arrows for the skin browser);
-    /// the window closes itself when the app reports no open dialog
-    /// afterwards.
+    /// confirmation is open per RFC 0010 and whose contents are unmeasured), `Escape` (close),
+    /// `Backspace`, typed text (the open-media field and the jump box, see
+    /// [`App::dialog_text`]) and the arrows of the skin browser; the window
+    /// closes itself when the app reports no open dialog afterwards.
     fn dialog_key_event(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
         if event.state != ElementState::Pressed {
+            return;
+        }
+        // A dialog with a text field takes the OS text of the press first:
+        // it is layout-aware and carries case and punctuation (`:`, `\`,
+        // `.`, AltGr characters), so an ordinary path can be typed (BETA-03).
+        // Control characters (Enter, Backspace, Escape, Ctrl+letter) are not
+        // text and fall through to the key path below. Ctrl or Alt alone is a
+        // shortcut, not text; both together are AltGr on Windows (the
+        // backslash on a German layout), which is text.
+        let shortcut_chord = self.modifiers.control_key() != self.modifiers.alt_key();
+        if !shortcut_chord
+            && self.app.dialog_accepts_text()
+            && let Some(text) = event.text.as_deref()
+            && self.app.dialog_text(text)
+        {
+            self.request_dialog_redraw();
             return;
         }
         let Some(key) = map_key(event) else {
@@ -770,15 +800,26 @@ impl Windowed {
         if self.app.dialog_key(key) {
             self.sync_dialog_window(event_loop);
             self.request_dialog_redraw();
+            // A confirmed open-media dialog adds (and may start) a track:
+            // the playlist and the main window show it at once.
+            self.request_playlist_redraw();
+            self.request_redraw();
         }
     }
 
     /// Events for the dialog window.
     ///
     /// Closing the window closes the dialog (it never quits the player);
-    /// the dialog has no buttons, so pointer input is ignored.
+    /// the dialog has no buttons, so pointer input is ignored. A file dropped
+    /// from the shell onto an open-media dialog becomes a pick
+    /// ([`App::dialog_drop_file`]; `winit` delivers one event per file).
     fn dialog_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
+            WindowEvent::DroppedFile(path) => {
+                if self.app.dialog_drop_file(path) {
+                    self.request_dialog_redraw();
+                }
+            }
             WindowEvent::CloseRequested => {
                 if let Some(kind) = self.dialog_kind {
                     self.app.close_dialog(kind);
@@ -993,6 +1034,20 @@ impl Windowed {
         }
     }
 
+    /// Creates or drops the playlist editor's OS window so it matches
+    /// [`App::playlist_open`], the way [`Windowed::sync_eq_window`] follows
+    /// the equalizer: the PL button, the menu row, the playlist's own Close
+    /// and its OS close box all flip that one flag.
+    fn sync_playlist_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.app.playlist_open() {
+            self.open_playlist_window(event_loop);
+        } else if self.playlist_window.is_some() {
+            self.playlist_surface = None;
+            self.playlist_window = None;
+            self.last_playlist_click = None;
+        }
+    }
+
     /// Creates the playlist editor window with the same shell as the main
     /// window (S06, S01 §4): a non-resizable `winit` window with its own
     /// `softbuffer` surface, sized to the spec'd 275 x 116 client area
@@ -1066,13 +1121,17 @@ impl Windowed {
     /// Input routes to [`App::playlist_mouse_down`] /
     /// [`App::playlist_mouse_up`]; keyboard shortcuts stay global (the same
     /// key-event path as the main window — S06 leaves playlist keys open).
-    /// Closing the playlist keeps it open: hiding and reopening are open
-    /// (S05 §7.8), so this records a note instead of quitting the player.
-    fn playlist_event(&mut self, _event_loop: &ActiveEventLoop, event: WindowEvent) {
+    /// Closing the playlist hides it ([`App::close_playlist_window`], the
+    /// same toggle as its skinned Close and the PL button) and never quits
+    /// the player; the PL button brings it back.
+    fn playlist_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                eprintln!("rustamp: playlist close is not implemented yet; the window stays open");
-                self.request_playlist_redraw();
+                if let Err(error) = self.app.close_playlist_window() {
+                    eprintln!("rustamp: playlist close failed: {error}");
+                }
+                self.sync_playlist_window(event_loop);
+                self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.paint_playlist(),
             WindowEvent::Resized(size) => {
@@ -1137,8 +1196,13 @@ impl Windowed {
                 if let Err(error) = result {
                     eprintln!("rustamp: playlist pointer input failed: {error}");
                 }
+                // The title-bar Close may have hidden the editor, ADD may
+                // have opened the open-media dialog.
+                self.sync_playlist_window(event_loop);
+                self.sync_dialog_window(event_loop);
                 self.sync_playlist_position();
                 self.request_playlist_redraw();
+                self.request_redraw();
             }
             _ => {}
         }
@@ -1195,7 +1259,7 @@ impl ApplicationHandler for Windowed {
         self.request_dialog_redraw();
         self.sync_menu_window(event_loop);
         self.request_menu_redraw();
-        self.open_playlist_window(event_loop);
+        self.sync_playlist_window(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -1309,8 +1373,30 @@ impl ApplicationHandler for Windowed {
                 if let Err(error) = result {
                     eprintln!("rustamp: pointer input failed: {error}");
                 }
-                // A click may have toggled double-size (the clutter-bar `D`).
+                // A click may have toggled double-size (the clutter-bar `D`),
+                // shaded or minimized the window, or opened the open-media
+                // dialog (Eject); a close is picked up in `about_to_wait`.
                 self.sync_window_state();
+                self.sync_dialog_window(event_loop);
+                self.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                // S03 §5: the main menu, or the EQ/PL toggle on those buttons.
+                if self.app.main_menu_is_open() {
+                    self.app.close_main_menu();
+                } else {
+                    let (x, y) = self.cursor;
+                    if let Err(error) = self.app.mouse_right_down(x, y) {
+                        eprintln!("rustamp: right-click failed: {error}");
+                    }
+                }
+                self.sync_menu_window(event_loop);
+                self.sync_eq_window(event_loop);
+                self.sync_playlist_window(event_loop);
                 self.request_redraw();
             }
             _ => {}
@@ -1349,9 +1435,13 @@ impl ApplicationHandler for Windowed {
         // elsewhere or its own close box).
         self.sync_menu_window(event_loop);
         self.request_menu_redraw();
-        // The docked playlist tracks the main window (moves and shade reflow).
+        // The playlist editor follows its open flag and, while open, tracks
+        // the main window (moves and shade reflow).
+        self.sync_playlist_window(event_loop);
         self.sync_playlist_position();
         self.request_playlist_redraw();
+        // An error the user must see goes to the native title (BETA-04).
+        self.sync_title();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
     }
 }
@@ -1499,6 +1589,7 @@ fn map_key_code(code: KeyCode) -> Option<Key> {
         KeyCode::Backquote => Key::Grave,
         KeyCode::Space => Key::Space,
         KeyCode::Escape => Key::Escape,
+        KeyCode::Backspace => Key::Backspace,
         _ => return None,
     })
 }

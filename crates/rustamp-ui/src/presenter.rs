@@ -423,6 +423,7 @@ pub fn map_key_code(code: KeyCode) -> Option<Key> {
         KeyCode::Backquote => Key::Grave,
         KeyCode::Space => Key::Space,
         KeyCode::Escape => Key::Escape,
+        KeyCode::Backspace => Key::Backspace,
         _ => return None,
     })
 }

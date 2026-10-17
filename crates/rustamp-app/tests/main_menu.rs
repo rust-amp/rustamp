@@ -76,7 +76,9 @@ fn the_time_toggle_is_wired_to_the_ui_local_flip() {
 fn the_window_checks_follow_what_is_actually_on() {
     let mut app = headless_app();
     assert!(app.menu_check(MenuCheck::MainWindow));
-    assert!(!app.menu_check(MenuCheck::PlaylistEditor));
+    // The presenter opens the playlist editor at launch, so it is checked
+    // (BETA-07: the check used to say closed while the window was up).
+    assert!(app.menu_check(MenuCheck::PlaylistEditor));
     assert!(!app.menu_check(MenuCheck::Equalizer));
 
     let editor = top_level(MainMenuId::PlaylistEditor).unwrap();
@@ -89,8 +91,8 @@ fn the_window_checks_follow_what_is_actually_on() {
             rustamp_core::state::WindowId::Playlist
         )])
     );
-    assert!(app.ui().state().playlist_open);
-    assert!(app.menu_check(MenuCheck::PlaylistEditor));
+    assert!(!app.ui().state().playlist_open);
+    assert!(!app.menu_check(MenuCheck::PlaylistEditor));
 
     let equalizer = top_level(MainMenuId::Equalizer).unwrap();
     app.activate_menu_item(equalizer.label, ShortcutAction::ToggleEqualizer)

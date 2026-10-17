@@ -103,6 +103,9 @@ pub enum Key {
     Space,
     /// Escape.
     Escape,
+    /// Backspace. No S03 row binds it; the dialogs' text fields use it to
+    /// delete the last typed character.
+    Backspace,
 }
 
 impl Key {

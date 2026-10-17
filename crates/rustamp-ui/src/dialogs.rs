@@ -23,10 +23,10 @@
 //!   pin them.
 //! * Only one dialog is open at a time: opening a second one replaces the
 //!   first. The reference may stack them; that is open.
-//! * The jump box takes **digits only** (seconds): the [`Key`] model has no
-//!   colon key, so `m:ss` cannot be typed yet. [`parse_jump_time_ms`] still
-//!   accepts `m:ss` and `h:mm:ss` for programmatic input and for the day the
-//!   key model grows one.
+//! * The jump box takes digits and `:` (seconds, `m:ss` or `h:mm:ss`, see
+//!   [`parse_jump_time_ms`]). Digits arrive as [`Key`]s; the colon has no
+//!   [`Key`], so it arrives as typed text through
+//!   [`DialogManager::type_text`].
 //! * The load-playlist dialog has **no file picker and no confirmation
 //!   command**: RFC 0010 leaves replace-versus-append (and the file filter)
 //!   open, so `Enter` is consumed and does nothing. The dialog opens, shows
@@ -37,19 +37,22 @@
 //!   untestable headless, while the reference's layout, filters and wording
 //!   are unmeasured anyway. Each kind therefore shows a plain entry face — a
 //!   file field, a directory field, or a location/URL field — built from this
-//!   same machinery. Picks arrive programmatically through
-//!   [`DialogManager::stage_media_paths`] (the stand-in for the OS picker's
-//!   result, which a later native picker can fill without changing the command
-//!   mapping) or by typing into the field; confirming produces
-//!   [`Command::AddItems`] with the opening command's `play` flag carried
-//!   through untouched. The reference's real layout, filters and wording stay
+//!   same machinery. A user reaches a file in one of two ways, both fed by the
+//!   OS through the presenter: **typing** the full path (any printable
+//!   character, through [`DialogManager::type_text`]; `Backspace` deletes) or
+//!   **dropping** files from the shell onto the dialog
+//!   ([`DialogManager::drop_media_path`], which stages them as picks).
+//!   [`DialogManager::stage_media_paths`] is the same staging for a later
+//!   native picker. Confirming produces [`Command::AddItems`] with the opening
+//!   command's `play` flag carried through untouched. Clipboard paste is not
+//!   supported: `winit` has no clipboard and a Win32 clipboard binding would
+//!   be a new dependency. The reference's real layout, filters and wording stay
 //!   open (a capture would need the three dialogs' geometry, filter lists and
 //!   exact labels).
-//! * The open-media entry field takes **letters, digits and spaces only**: the
-//!   [`Key`] model has no punctuation keys, so a full path or URL (which needs
-//!   `:`, `/`, `.`) cannot be typed yet. [`DialogManager::set_media_text`]
-//!   takes the full text programmatically, the same way the jump box's
-//!   `m:ss` forms stay programmatic until the key model grows.
+//! * Typed text keeps its case and punctuation (`C:\Music\song.mp3`); the
+//!   older [`Key`] path (letters, digits and spaces) still types upper-case
+//!   letters, because the [`Key`] model stores them that way.
+//!   [`DialogManager::set_media_text`] replaces the whole field.
 //! * The skin browser lists exactly the skins the app can load today — the
 //!   built-in default plus the current skin when it came from disk — because
 //!   the project has no skin search path (no skins-directory concept: the CLI
@@ -419,12 +422,24 @@ impl DialogManager {
     /// open-media entry field (open-media dialogs only; the [`Key`] model has
     /// no punctuation, so full paths and URLs arrive through
     /// [`set_media_text`](Self::set_media_text)), `Up`/`Down` move the skin
-    /// browser's selection (skin browser only), `Enter` and `Escape` are
-    /// consumed by any open dialog so the app can confirm or close it.
-    /// Everything else falls through (`false`).
+    /// browser's selection (skin browser only), `Backspace` deletes the last
+    /// character of the jump input or the open-media field, `Enter` and
+    /// `Escape` are consumed by any open dialog so the app can confirm or
+    /// close it. Everything else falls through (`false`).
     pub fn key(&mut self, key: Key) -> bool {
         match key {
             Key::Escape | Key::Enter => self.open.is_some(),
+            Key::Backspace => match self.open {
+                Some(DialogKind::Jump(_)) => {
+                    self.jump_text.pop();
+                    true
+                }
+                Some(DialogKind::OpenMedia { .. }) => {
+                    self.media_text.pop();
+                    true
+                }
+                _ => false,
+            },
             Key::Digit(digit) | Key::Numpad(digit) => {
                 if matches!(self.open, Some(DialogKind::Jump(_))) {
                     let digit = digit % 10;
@@ -478,6 +493,70 @@ impl DialogManager {
         }
     }
 
+    /// Whether the open dialog has a text field [`type_text`](Self::type_text)
+    /// can type into (the jump boxes and the open-media faces).
+    pub fn accepts_text(&self) -> bool {
+        matches!(
+            self.open,
+            Some(DialogKind::Jump(_) | DialogKind::OpenMedia { .. })
+        )
+    }
+
+    /// Types `text` into the open dialog's field, as the OS delivered it
+    /// (layout-aware, with case and punctuation).
+    ///
+    /// Control characters (`Enter`'s `\r`, `Backspace`'s `\u{8}`, `Escape`,
+    /// `Ctrl+letter` codes) are dropped: those keys take the [`key`](Self::key)
+    /// path. The open-media field takes every other character, so a full path
+    /// such as `C:\Music\song.mp3` or a URL can be typed; the jump box takes
+    /// digits and `:` (its [`parse_jump_time_ms`] forms). Returns `true` when
+    /// at least one character was typed into a field.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        let mut typed = false;
+        for ch in text.chars().filter(|ch| !ch.is_control()) {
+            match self.open {
+                Some(DialogKind::OpenMedia { .. }) => {
+                    self.push_media_char(ch);
+                    typed = true;
+                }
+                Some(DialogKind::Jump(_)) if ch.is_ascii_digit() || ch == ':' => {
+                    if self.jump_text.chars().count() < MAX_JUMP_LEN {
+                        self.jump_text.push(ch);
+                    }
+                    typed = true;
+                }
+                _ => {}
+            }
+        }
+        typed
+    }
+
+    /// Adds a file the user dropped onto the open-media dialog from the shell.
+    ///
+    /// The files face collects every drop as a staged pick (one drop event
+    /// per file), the directory face keeps the last drop as its single pick;
+    /// the location face takes no files. Returns whether the drop was taken.
+    /// Confirming still needs `Enter`, so a stray drop adds nothing.
+    pub fn drop_media_path(&mut self, path: PathBuf) -> bool {
+        match self.open {
+            Some(DialogKind::OpenMedia {
+                kind: OpenMediaKind::Files,
+                ..
+            }) => {
+                self.media_paths.push(path);
+                true
+            }
+            Some(DialogKind::OpenMedia {
+                kind: OpenMediaKind::Directory,
+                ..
+            }) => {
+                self.media_paths = vec![path];
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Confirms the jump-to-time box: parses the input and returns the
     /// resulting [`Command::Seek`]. `None` when no jump-to-time dialog is
     /// open or the input does not parse.
@@ -496,10 +575,10 @@ impl DialogManager {
     /// Replaces the open-media entry field (clamped to [`MAX_MEDIA_LEN`]
     /// characters).
     ///
-    /// This is how a full path or URL arrives: the [`Key`] model has no
-    /// punctuation keys, so typing can only append letters, digits and spaces
-    /// (see [`key`](Self::key)). A later native picker fills the staged picks
-    /// instead; both feed [`confirm_open_media`](Self::confirm_open_media).
+    /// Typing goes through [`type_text`](Self::type_text) instead; this
+    /// replaces the whole field at once (embedding and tests). Dropped files
+    /// and a later native picker fill the staged picks; all of them feed
+    /// [`confirm_open_media`](Self::confirm_open_media).
     pub fn set_media_text(&mut self, text: &str) {
         self.media_text = text.chars().take(MAX_MEDIA_LEN).collect();
     }
@@ -1275,5 +1354,94 @@ mod tests {
         });
         assert!(manager.key(Key::Letter(b'H')));
         assert_eq!(manager.media_text(), "H");
+    }
+
+    #[test]
+    fn a_full_windows_path_can_be_typed_and_corrected() {
+        // BETA-03: the OS text of each key press reaches the field with its
+        // case and punctuation, so an ordinary path is typeable; Backspace
+        // fixes a typo and control characters never land in the field.
+        use rustamp_core::playlist::MediaLocation;
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: true,
+        });
+        assert!(manager.accepts_text());
+        for ch in r"C:\Music\song.mp33".chars() {
+            assert!(manager.type_text(&ch.to_string()), "{ch:?}");
+        }
+        assert!(manager.key(Key::Backspace));
+        // Enter's and Ctrl+V's control characters are not text.
+        assert!(!manager.type_text("\r"));
+        assert!(!manager.type_text("\u{16}"));
+        assert_eq!(manager.media_text(), r"C:\Music\song.mp3");
+        assert_eq!(
+            manager.confirm_open_media(),
+            Some(Command::AddItems {
+                items: vec![MediaLocation::File(PathBuf::from(r"C:\Music\song.mp3"))],
+                at: None,
+                play: true,
+            })
+        );
+    }
+
+    #[test]
+    fn the_jump_box_takes_typed_digits_and_colons_only() {
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::Jump(JumpTarget::Time));
+        assert!(manager.type_text("1:3"));
+        assert!(!manager.type_text("x"));
+        assert!(manager.type_text("0"));
+        assert_eq!(manager.jump_text(), "1:30");
+        assert!(manager.key(Key::Backspace));
+        assert_eq!(manager.jump_text(), "1:3");
+        // Dialogs without a field take no text and no Backspace.
+        for dialog in [
+            DialogKind::About,
+            DialogKind::LoadPlaylist,
+            DialogKind::SkinBrowser,
+        ] {
+            manager.open(dialog);
+            assert!(!manager.accepts_text(), "{dialog:?}");
+            assert!(!manager.type_text("a"), "{dialog:?}");
+            assert!(!manager.key(Key::Backspace), "{dialog:?}");
+        }
+    }
+
+    #[test]
+    fn dropped_files_become_picks_on_the_file_faces_only() {
+        use rustamp_core::playlist::MediaLocation;
+        let mut manager = DialogManager::new();
+        assert!(!manager.drop_media_path(PathBuf::from("a.mp3")));
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        });
+        assert!(manager.drop_media_path(PathBuf::from("a.mp3")));
+        assert!(manager.drop_media_path(PathBuf::from("b.mp3")));
+        assert_eq!(
+            manager.confirm_open_media(),
+            Some(Command::AddItems {
+                items: vec![
+                    MediaLocation::File(PathBuf::from("a.mp3")),
+                    MediaLocation::File(PathBuf::from("b.mp3")),
+                ],
+                at: None,
+                play: false,
+            })
+        );
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Directory,
+            play: true,
+        });
+        assert!(manager.drop_media_path(PathBuf::from("one")));
+        assert!(manager.drop_media_path(PathBuf::from("two")));
+        assert_eq!(manager.staged_media_paths(), [PathBuf::from("two")]);
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: true,
+        });
+        assert!(!manager.drop_media_path(PathBuf::from("a.mp3")));
     }
 }

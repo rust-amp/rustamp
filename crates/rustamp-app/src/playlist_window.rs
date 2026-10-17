@@ -21,8 +21,9 @@
 //! * scrollbar arrows → [`PlaylistWindow::scroll_page`] (S06 §3: one step is
 //!   one page of four rows), no command;
 //! * the title bar has no window-menu button (S06 §1), so a click at (6,3)
-//!   does nothing; Close/Shade record a note (hiding and shading the playlist
-//!   are open) and MISC records a note (the `#32768` popup's contents are a
+//!   does nothing; Close hides the window (`ToggleWindow(Playlist)`, the PL
+//!   button reopens it), Shade records a note (the playlist editor's shade is
+//!   open, S05 §1.5) and MISC records a note (the `#32768` popup's contents are a
 //!   visual reading, S06 §4); ADD and LIST OPTS open their real dialogs
 //!   through [`App::request_playlist_dialog`] (the files face of the
 //!   open-media dialog for ADD, with the playlist path's unmeasured
@@ -39,6 +40,7 @@
 use rustamp_core::command::Command;
 use rustamp_core::error::Result;
 use rustamp_core::playlist::EntryId;
+use rustamp_core::state::WindowId;
 use rustamp_gfx::Image;
 use rustamp_ui::{
     DockedStack, Key, Modifiers, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog,
@@ -112,8 +114,7 @@ impl App {
             return Ok(Vec::new());
         }
         if let Some(button) = hit_test_title_bar(x, y) {
-            self.playlist_title_button(button);
-            return Ok(Vec::new());
+            return self.playlist_title_button(button);
         }
         Ok(Vec::new())
     }
@@ -257,11 +258,37 @@ impl App {
 
     /// One title-bar button press (S01 §4 rects, provisional).
     ///
-    /// Hiding and shading the playlist editor are open (S05 §1.5), so both
-    /// record a note and change nothing; in particular a (6,3) click never
-    /// reaches here ([`hit_test_title_bar`] returns `None`, S06 §1).
-    fn playlist_title_button(&mut self, button: PlaylistTitleButton) {
-        self.note(format!("playlist {button:?} button is not implemented yet"));
+    /// Close hides the playlist editor: it is a toggle window, and closing a
+    /// toggle window hides it (RFC 0005 `CloseFocusedWindow`; S03 §2 Ctrl+F4
+    /// "Close the playlist editor"), the same `ToggleWindow` the main
+    /// window's PL button and the menu row send, so all three agree and the
+    /// PL button reopens it. Shade records a note and changes nothing: the
+    /// playlist editor's windowshade size and drawing are open (S05 §1.5).
+    /// A (6,3) click never reaches here ([`hit_test_title_bar`] returns
+    /// `None`, S06 §1).
+    fn playlist_title_button(&mut self, button: PlaylistTitleButton) -> Result<Vec<Command>> {
+        match button {
+            PlaylistTitleButton::Close => self.close_playlist_window(),
+            PlaylistTitleButton::Shade => {
+                self.note(
+                    "playlist Shade button: the playlist editor's windowshade is open \
+                     (S05 §1.5), so nothing changes"
+                        .to_string(),
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Hides the playlist editor when it is open (its title-bar Close and its
+    /// OS close box). Returns the command it sent, if any.
+    pub fn close_playlist_window(&mut self) -> Result<Vec<Command>> {
+        if !self.playlist_open() {
+            return Ok(Vec::new());
+        }
+        let command = Command::ToggleWindow(WindowId::Playlist);
+        self.submit(command.clone())?;
+        Ok(vec![command])
     }
 }
 
@@ -505,17 +532,42 @@ mod tests {
 
     #[test]
     fn the_title_bar_has_no_window_menu_button() {
-        // S06 §1: a (6,3) click does nothing; Close notes without quitting.
+        // S06 §1: a (6,3) click does nothing.
         let mut app = test_app();
         add_entries(&mut app, 3);
         let commands = app.playlist_mouse_down(6, 3).expect("click applies");
         assert!(commands.is_empty());
         assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn the_title_bar_close_hides_the_editor_and_pl_reopens_it() {
+        // BETA-06: the playlist's own Close hides it (a toggle window, RFC
+        // 0005 `CloseFocusedWindow`) without quitting; the main window's PL
+        // toggle brings it back. The editor is open at launch.
+        let mut app = test_app();
+        assert!(app.playlist_open());
         let commands = app.playlist_mouse_down(264, 3).expect("close applies");
-        assert!(commands.is_empty());
+        assert_eq!(commands, vec![Command::ToggleWindow(WindowId::Playlist)]);
+        assert!(!app.playlist_open());
         assert!(!app.quit());
+        assert!(app.drain_notes().is_empty());
+        // Closing an already hidden editor sends nothing.
+        assert!(app.close_playlist_window().expect("no-op").is_empty());
+        app.submit(Command::ToggleWindow(WindowId::Playlist))
+            .expect("PL toggles");
+        assert!(app.playlist_open());
+    }
+
+    #[test]
+    fn the_title_bar_shade_says_why_it_does_nothing() {
+        // S05 §1.5: the playlist editor's windowshade is open.
+        let mut app = test_app();
+        let commands = app.playlist_mouse_down(254, 3).expect("shade applies");
+        assert!(commands.is_empty());
+        assert!(app.playlist_open());
         let notes = app.drain_notes();
-        assert!(notes.iter().any(|n| n.contains("Close")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("S05 §1.5")), "{notes:?}");
     }
 
     #[test]

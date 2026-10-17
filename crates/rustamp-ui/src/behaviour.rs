@@ -14,7 +14,7 @@
 //! click mapping, the marquee drag ratio and the window-button window positions)
 //! are marked **provisional** in the code.
 
-use rustamp_core::command::Command;
+use rustamp_core::command::{Command, OpenMediaKind};
 use rustamp_core::event::Event;
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::{StreamInfo, TransportState, WindowId};
@@ -420,10 +420,14 @@ impl MainWindow {
 
     /// The command a button produces when it is released, if any.
     ///
-    /// Eject opens the file dialog (S03 §5), for which there is no core
-    /// `Command`; the clutter-bar O/I/V open menus or a dialog (S04/app), and
-    /// the four window buttons open menus or act on the window (S03 §5/S04).
-    /// Those emit nothing and are reported as gaps.
+    /// Eject opens files (S03 §5 "Click the eject button: open file(s)",
+    /// id 40029, which RFC 0005 maps to `OpenMedia { kind: Files, play: true }`);
+    /// its Shift+click (open directory) needs modifier-aware pointer input,
+    /// which this machine does not receive, and stays a gap. The four window
+    /// buttons act per S03 §5 (main menu / minimize / windowshade / close):
+    /// the shade button's effect is measured (S05 §1.3), close quits because
+    /// this is the main window (RFC 0005 O3). The clutter-bar O and V pop menus
+    /// whose contents are unmeasured (S04 §9) and emit nothing.
     fn release_command(&mut self, widget: Widget) -> Option<Command> {
         match widget {
             Widget::Previous => Some(Command::Prev),
@@ -431,6 +435,13 @@ impl MainWindow {
             Widget::Pause => Some(Command::TogglePause),
             Widget::Stop => Some(Command::Stop),
             Widget::Next => Some(Command::Next),
+            Widget::Eject => Some(Command::OpenMedia {
+                kind: OpenMediaKind::Files,
+                play: true,
+            }),
+            Widget::WindowMinimize => Some(Command::Minimize),
+            Widget::WindowShade => Some(Command::ToggleWindowShade(WindowId::Main)),
+            Widget::WindowClose => Some(Command::Quit),
             Widget::Shuffle => Some(Command::ToggleShuffle),
             Widget::Repeat => Some(Command::ToggleRepeat),
             Widget::EqToggle => Some(Command::ToggleWindow(WindowId::Equalizer)),
@@ -793,7 +804,7 @@ mod tests {
     #[test]
     fn every_interactive_widget_emits_its_command() {
         // A long enough duration so the position slider can seek.
-        let cases: [(Widget, &[Command]); 12] = [
+        let cases: [(Widget, &[Command]); 15] = [
             (Widget::Previous, &[Command::Prev]),
             (Widget::Play, &[Command::Play]),
             (Widget::Pause, &[Command::TogglePause]),
@@ -811,7 +822,22 @@ mod tests {
             ),
             (Widget::ClutterA, &[Command::ToggleAlwaysOnTop]),
             (Widget::ClutterD, &[Command::ToggleDoubleSize]),
-            (Widget::Eject, &[]),
+            // S03 §5: eject opens file(s) (id 40029, RFC 0005).
+            (
+                Widget::Eject,
+                &[Command::OpenMedia {
+                    kind: OpenMediaKind::Files,
+                    play: true,
+                }],
+            ),
+            // S03 §5 window buttons; shade measured in S05 §1.3, close of
+            // the main window quits (RFC 0005 O3).
+            (Widget::WindowMinimize, &[Command::Minimize]),
+            (
+                Widget::WindowShade,
+                &[Command::ToggleWindowShade(WindowId::Main)],
+            ),
+            (Widget::WindowClose, &[Command::Quit]),
         ];
         for (widget, expected) in cases {
             let mut machine = MainWindow::new();
@@ -825,9 +851,6 @@ mod tests {
     #[test]
     fn widgets_without_a_core_command_emit_nothing() {
         for widget in [
-            Widget::WindowMinimize,
-            Widget::WindowShade,
-            Widget::WindowClose,
             Widget::TitleBar,
             Widget::TimeDisplay,
             Widget::ClutterO,
