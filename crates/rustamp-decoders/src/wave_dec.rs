@@ -724,6 +724,25 @@ mod tests {
         wav_with(2, RATE, FORMAT_PCM, 16, data)
     }
 
+    /// Overwrites the declared size of the `data` chunk, so a test can claim a
+    /// length the file does not really hold.
+    ///
+    /// The chunk id is located instead of using `bytes.len() - 8`: that offset
+    /// is the size field only when the payload happens to be exactly four bytes
+    /// long, and a stereo fixture overwrote its own audio instead (the duration
+    /// then stayed known, because the size field still said 8). The walk starts
+    /// after the 12-byte RIFF header, where the first chunk id is.
+    fn patch_data_size(bytes: &mut [u8], size: u32) {
+        // The first `data` id after the header is the real one: the payload
+        // follows it, so a look-alike sequence inside a sample cannot win.
+        let at = bytes[12..]
+            .windows(4)
+            .position(|window| window == b"data")
+            .map(|offset| offset + 12)
+            .expect("the fixture has a data chunk");
+        bytes[at + 4..at + 8].copy_from_slice(&size.to_le_bytes());
+    }
+
     /// A 16-bit mono PCM file whose samples are `samples`.
     fn pcm16_mono(samples: &[i16]) -> Vec<u8> {
         let mut data = Vec::new();
@@ -906,8 +925,7 @@ mod tests {
     fn a_data_size_past_the_end_of_the_source_is_clamped() {
         // The header claims 4 GiB of samples; only two frames are present.
         let mut bytes = pcm16_mono(&[16_384, -16_384]);
-        let data_size_at = bytes.len() - 8; // "data" + size, then the payload
-        bytes[data_size_at..data_size_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        patch_data_size(&mut bytes, u32::MAX);
         let mut d = open_bytes(bytes).expect("open");
         assert_eq!(d.duration(), Some(d.spec().duration_of(2)));
         assert_eq!(read_all(&mut d), vec![0.5, -0.5]);
@@ -916,8 +934,7 @@ mod tests {
     #[test]
     fn a_declared_data_size_larger_than_the_file_ends_early() {
         let mut bytes = pcm16_mono(&[16_384, -16_384]);
-        let data_size_at = bytes.len() - 8;
-        bytes[data_size_at..data_size_at + 4].copy_from_slice(&1000u32.to_le_bytes());
+        patch_data_size(&mut bytes, 1000);
         let mut d = open_bytes(bytes).expect("open");
         // The source length clamps the claim, so even the duration is honest.
         assert_eq!(d.duration(), Some(d.spec().duration_of(2)));
@@ -961,13 +978,15 @@ mod tests {
         }
 
         let mut bytes = pcm16(&[16_384, -16_384, 0, 0]);
-        let data_size_at = bytes.len() - 8;
-        bytes[data_size_at..data_size_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        patch_data_size(&mut bytes, u32::MAX);
         let source = MediaSource::Reader {
             reader: Box::new(NoEndSeek(Cursor::new(bytes))),
             extension: None,
         };
         let mut d = WaveDecoder::open(source).expect("open");
+        // The marker patched above is what makes the length unknown: without it
+        // the declared size would give a duration. The eight data bytes are two
+        // stereo frames (16-bit, two channels), so four samples.
         assert_eq!(d.duration(), None, "the length is genuinely unknown");
         assert_eq!(read_all(&mut d), vec![0.5, -0.5, 0.0, 0.0]);
     }

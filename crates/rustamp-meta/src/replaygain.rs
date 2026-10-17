@@ -117,6 +117,21 @@ pub(crate) const EXTRA_ITEM_KEYS: &[(&str, ItemKey)] = &[
     (R128_ALBUM_GAIN_KEY, ItemKey::R128AlbumGain),
 ];
 
+/// Sort key that puts carried names in [`REPLAYGAIN_KEYS`] order.
+///
+/// [`TrackMetadata::extra`](rustamp_core::meta::TrackMetadata::extra) is a
+/// `BTreeMap`, so iterating it yields names in *alphabetical* order, which puts
+/// `R128_ALBUM_GAIN` before `R128_TRACK_GAIN`. The reports promise the fixed
+/// key order instead, so both lists are sorted through this before they leave
+/// the crate. Unknown names (there should be none from
+/// [`ReplayGainTags::apply_to_metadata`]) sort last.
+fn key_rank(name: &str) -> usize {
+    REPLAYGAIN_KEYS
+        .iter()
+        .position(|key| key.eq_ignore_ascii_case(name))
+        .unwrap_or(REPLAYGAIN_KEYS.len())
+}
+
 /// Looks up the [`ItemKey`] for a carried extra name, case-insensitively.
 /// Returns `None` for anything else (including [`REFERENCE_LOUDNESS_KEY`]).
 pub(crate) fn item_key_for_extra(name: &str) -> Option<ItemKey> {
@@ -424,8 +439,11 @@ pub fn replaygain_supported_for_tag_type(tag_type: TagType) -> bool {
 pub struct ReplayGainWriteReport {
     /// Requested keys that were written, in [`REPLAYGAIN_KEYS`] order.
     pub written: Vec<String>,
-    /// Requested keys the target tag format has no field for. Nothing was
-    /// dropped silently: these names are the report.
+    /// Requested keys the target tag format has no field for, in
+    /// [`REPLAYGAIN_KEYS`] order — the same order as
+    /// [`written`](Self::written), so the two lists describe one request
+    /// rather than two map iterations. Nothing was dropped silently: these
+    /// names are the report.
     pub skipped_unsupported: Vec<String>,
 }
 
@@ -456,9 +474,13 @@ pub fn write_replaygain(
 ) -> Result<ReplayGainWriteReport> {
     let mut metadata = TrackMetadata::default();
     tags.apply_to_metadata(&mut metadata);
-    let requested: Vec<String> = metadata.extra.keys().cloned().collect();
+    // `extra` iterates alphabetically; both reports promise the fixed
+    // `REPLAYGAIN_KEYS` order, so sort here instead of leaking the map order.
+    let mut requested: Vec<String> = metadata.extra.keys().cloned().collect();
+    requested.sort_by_key(|key| key_rank(key));
     let report = write_tags_report(path, &metadata)?;
-    let skipped_unsupported = report.unwritten_extra.clone();
+    let mut skipped_unsupported = report.unwritten_extra.clone();
+    skipped_unsupported.sort_by_key(|key| key_rank(key));
     let written = requested
         .into_iter()
         .filter(|key| !skipped_unsupported.iter().any(|s| s == key))
