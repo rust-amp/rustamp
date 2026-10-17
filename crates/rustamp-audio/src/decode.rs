@@ -23,9 +23,10 @@
 //!   audio, and are dropped. At the end of a track, before a format change
 //!   and after a decoder error, `latency` frames of silence are pushed through
 //!   the chain so that the audio it still holds comes out. The contract resets
-//!   stages at every track change, so this happens at every seam; with the
-//!   default chain (equalizer, limiter disabled) the latency is 0 and nothing
-//!   is trimmed or pushed.
+//!   stages at every track change, so this happens at every seam. The
+//!   default chain (equalizer, limiter enabled) has the limiter's look-ahead
+//!   as its latency; with the limiter disabled it is 0 and nothing is trimmed
+//!   or pushed.
 //! * **The format converter** (the resampler's look-ahead). When the next
 //!   track has the same format, the converter is **not** flushed or reset at
 //!   the seam: the two tracks are resampled as one stream
@@ -155,6 +156,14 @@ pub(crate) enum DecodeOut {
         /// Whether the decoder supports seeking.
         seekable: bool,
     },
+    /// The ring held a previous run's audio and the consumer has dropped it;
+    /// the run's first frame is about to be written (see `crate::ring`).
+    StartDrained {
+        /// Ring epoch the drain belongs to.
+        epoch: u64,
+        /// Absolute timeline position of the run's first frame.
+        timeline_pos: u64,
+    },
     /// A seek has been applied and the ring drained.
     Seeked {
         /// Echo of the engine's sequence number.
@@ -227,6 +236,14 @@ impl std::fmt::Debug for DecodeOut {
                 .field("timeline_start", timeline_start)
                 .field("seekable", seekable)
                 .finish(),
+            DecodeOut::StartDrained {
+                epoch,
+                timeline_pos,
+            } => f
+                .debug_struct("StartDrained")
+                .field("epoch", epoch)
+                .field("timeline_pos", timeline_pos)
+                .finish(),
             DecodeOut::Seeked {
                 seq,
                 epoch,
@@ -278,6 +295,10 @@ pub(crate) struct Config {
     /// started (RFC 0005 O8); later toggles arrive as
     /// [`DecodeMsg::SetStopAfterCurrent`].
     pub stop_after_current: bool,
+    /// Ring epoch the engine bumped at the start of the run because the ring
+    /// still held a previous run's audio. The first write waits for its
+    /// drain and the engine's clock re-base (see `crate::ring`).
+    pub start_epoch: Option<u64>,
 }
 
 /// Start the decode thread. Returns its handle and the vis consumer.
@@ -292,6 +313,7 @@ pub(crate) fn spawn(
 ) -> (JoinHandle<()>, Consumer<VisFrame>) {
     let (vis, vis_rx) = VisTap::new(cfg.vis_capacity);
     let stop_after_current = cfg.stop_after_current;
+    let start_epoch = cfg.start_epoch;
     let mut worker = Worker {
         cfg,
         ring,
@@ -313,7 +335,8 @@ pub(crate) fn spawn(
         stop_after_current,
         pending_seek: None,
         pending_skip: None,
-        drain_epoch: None,
+        drain_epoch: start_epoch,
+        report_start: start_epoch.is_some(),
     };
     let handle = std::thread::Builder::new()
         .name("rustamp-decode".into())
@@ -389,9 +412,13 @@ struct Worker {
     stop_after_current: bool,
     pending_seek: Option<(Duration, u64, u32)>,
     pending_skip: Option<Outcome>,
-    /// Ring epoch the consumer still has to drain before post-seek frames may
-    /// be written.
+    /// Ring epoch the consumer still has to drain before post-seek (or, at
+    /// the start of a run, any) frames may be written.
     drain_epoch: Option<u64>,
+    /// The pending drain is the run's start drain: once it is done, report
+    /// [`DecodeOut::StartDrained`] and wait for the engine's re-base. A seek
+    /// before the first write takes this over with its own report.
+    report_start: bool,
 }
 
 impl Worker {
@@ -785,6 +812,10 @@ impl Worker {
                 // aligns `consumed` with the post-seek `written`.
                 let epoch = self.cfg.sync.begin_seek(self.timeline);
                 self.drain_epoch = Some(epoch);
+                // This drain also covers a pending start drain (the consumer
+                // acks the newest epoch), and `Seeked` re-bases the clock, so
+                // the start report is not needed any more.
+                self.report_start = false;
                 if self.await_drain() {
                     return;
                 }
@@ -820,6 +851,10 @@ impl Worker {
     /// be dropped by it, and a dropped frame that `written` already counts
     /// would leave `consumed` behind for good (A6 finding 2, second variant).
     /// The first callback after the resume drains and the decoder carries on.
+    ///
+    /// For the start drain of a run (`report_start`), the run's start position
+    /// is reported once the drain is done and the engine's re-base awaited, in
+    /// the same order as steps 2 and 3 of a seek (see [`crate::ring`]).
     fn await_drain(&mut self) -> bool {
         let Some(epoch) = self.drain_epoch else {
             return false;
@@ -827,6 +862,15 @@ impl Worker {
         loop {
             if self.cfg.sync.drained(epoch) {
                 self.drain_epoch = None;
+                if std::mem::take(&mut self.report_start) {
+                    let _ = self.tx.send(DecodeOut::StartDrained {
+                        epoch,
+                        timeline_pos: self.timeline,
+                    });
+                    if self.cfg.sync.is_active() {
+                        let _ = self.cfg.sync.wait_for_engine(epoch);
+                    }
+                }
                 return false;
             }
             if self.check_control() && (self.quitting || self.stopped) {

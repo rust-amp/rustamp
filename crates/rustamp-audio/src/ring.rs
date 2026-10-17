@@ -37,6 +37,26 @@
 //! by it, and a frame dropped that way would also be missing from `consumed`.
 //! The engine-ack wait of step 3 is skipped while the output is not running.
 //!
+//! # Start of a run (A8)
+//!
+//! `Engine::stop` leaves whatever the stopped run had buffered in the ring:
+//! only the consumer can drop it, and the device is paused. The next run uses
+//! the same handshake as a seek, with the engine starting it:
+//!
+//! 1. `Engine::start_run` resets `written` and `consumed` to 0 (the device is
+//!    paused and the old decode thread joined, so nothing else writes them)
+//!    and, when the ring still holds frames, bumps the epoch and hands it to
+//!    the new decode thread.
+//! 2. The decode thread waits for that drain before its first write, then
+//!    reports the run's start position; the engine re-bases its clock there.
+//!    The drain callback is silent, and the device clock counts it; without
+//!    the re-base the new run's position would run ahead of its audio by that
+//!    callback.
+//! 3. Only after the engine's ack does the first frame of the new run enter
+//!    the ring, so the drain cannot drop it.
+//!
+//! A run that starts with an empty ring skips all of this.
+//!
 //! # End-of-stream detection (F2 fix)
 //!
 //! The engine must finish a run only when the ring is truly empty — every frame
@@ -121,8 +141,9 @@ impl GainState {
 /// State shared by the decode thread, the render callback and the engine.
 #[derive(Debug, Default)]
 pub struct RingSync {
-    /// Incremented by the decode thread when the ring content is invalidated
-    /// (seek).
+    /// Incremented when the ring content is invalidated: by the decode thread
+    /// on a seek, by the engine at the start of a run that finds the ring
+    /// non-empty.
     epoch: AtomicU64,
     /// Epoch the render callback has finished draining.
     drain_ack: AtomicU64,
@@ -238,6 +259,11 @@ impl RingSync {
     /// Decode side: whether the consumer has drained `epoch`.
     pub fn drained(&self, epoch: u64) -> bool {
         self.drain_ack.load(Ordering::Acquire) >= epoch
+    }
+
+    /// Whether the newest epoch has not been drained by the consumer yet.
+    pub fn is_drain_pending(&self) -> bool {
+        !self.drained(self.epoch())
     }
 
     /// Decode side: wait until the engine has re-based its clock.

@@ -66,16 +66,27 @@
 //! closest to the output to catch any overs before the format converter and
 //! the ring buffer.
 //!
-//! The limiter defaults to **disabled**, operating as a bit-exact bypass so
-//! that an untouched player remains bit-transparent. Enabling it is a product
-//! decision (the reference player's behaviour with overs is unmeasured). Its
+//! The limiter defaults to **enabled** (owner decision, 2026-10-17). That is
+//! an own product choice, not 2.95 behaviour: what the reference player does
+//! with overs is unmeasured. Disabled, it is a bit-exact bypass. Its
 //! look-ahead ([`rustamp_dsp::LOOKAHEAD_SECONDS`], 5 ms) is reported through
 //! `DspStage::latency_frames` and handled by the decode thread the way the
 //! converter's is: the stage's start-up frames are dropped and its tail is
 //! pushed out at the end of every track, so no frame is lost, no silence
 //! enters a gapless seam and the position stays exact (see [`crate::decode`]).
+//! The look-ahead therefore costs no timeline offset and no tail; it delays
+//! only the decode thread's output by 5 ms of decoding, which the ring hides.
 //! What remains is that the limiter is reset at every track change (the
 //! `DspStage` contract), so its look-ahead never sees across a seam.
+//!
+//! # Restarting with a non-empty ring (A8)
+//!
+//! A stopped run leaves its buffered audio in the ring. When a run starts with
+//! the ring non-empty, the engine invalidates it (an epoch bump), the decode
+//! thread waits for the render callback to drop it before its first write, and
+//! the engine re-bases the clock at that drain, so no frame of the old run is
+//! played and the drain's silent callback does not count as played time of the
+//! new run. See [`crate::ring`] for the ordering.
 //!
 //! The limiter's ceiling holds at its own output only. The resampler after it
 //! (when the device rate differs from the track's) can rebuild inter-sample
@@ -154,6 +165,16 @@ struct PendingSeek {
     seq: u32,
 }
 
+/// A run that started with a previous run's audio still in the ring, waiting
+/// for the drain and the clock re-base (see [`crate::ring`]).
+#[derive(Debug, Clone, Copy)]
+struct StartDrain {
+    /// Epoch bumped by `start_run`.
+    epoch: u64,
+    /// Device frames the ring held when the run started.
+    stale_frames: u64,
+}
+
 /// The audio engine. One instance per player.
 pub struct Engine {
     cfg: EngineConfig,
@@ -201,6 +222,7 @@ pub struct Engine {
     end_of_stream: Option<u64>,
     seekable: bool,
     pending_seek: Option<PendingSeek>,
+    start_drain: Option<StartDrain>,
     seek_seq: u32,
     start_at: Option<(u64, u32)>,
     last_position_event: Option<Instant>,
@@ -271,6 +293,7 @@ impl Engine {
             end_of_stream: None,
             seekable: false,
             pending_seek: None,
+            start_drain: None,
             seek_seq: 0,
             start_at: None,
             last_position_event: None,
@@ -395,9 +418,45 @@ impl Engine {
     /// render callback. During an underrun the device clock may run ahead of
     /// `written`, but this value correctly stays at whatever is still in the
     /// ring — it never saturates a real backlog to zero.
+    ///
+    /// Audio of a previous run counts too (A8): while stopped, this is what
+    /// the ring physically holds, and after a start it stays at that amount
+    /// until the render callback has dropped it. Nothing of the new run can be
+    /// in the ring before that drain (the decode thread waits for it).
     pub fn buffered_frames(&self) -> u64 {
+        if let Some(start) = self.start_drain
+            && !self.sync.drained(start.epoch)
+        {
+            return start.stale_frames;
+        }
+        if self.transport == TransportState::Stopped
+            && let Some(producer) = self.producer.as_ref()
+        {
+            return self.ring_occupancy(producer);
+        }
         let (written, consumed) = self.sync.counters();
         written.saturating_sub(consumed)
+    }
+
+    /// Whether a ring drain (of a seek, or of a run's start) has not been
+    /// acknowledged by the render callback yet.
+    pub fn is_drain_pending(&self) -> bool {
+        self.sync.is_drain_pending()
+    }
+
+    /// Whether the current run started with a previous run's audio in the
+    /// ring and has not finished its start yet: the drain or the clock re-base
+    /// after it is still outstanding. The new run's position is exact only
+    /// once this is `false`.
+    pub fn is_start_pending(&self) -> bool {
+        self.start_drain.is_some()
+    }
+
+    /// Device frames the ring holds, seen from its write end.
+    fn ring_occupancy(&self, producer: &Producer<f32>) -> u64 {
+        let channels = usize::from(self.device.channels.max(1));
+        let unread = producer.buffer().capacity() - producer.slots();
+        (unread / channels) as u64
     }
 
     /// The raw ring counters `(written, consumed)` in device frames, loaded
@@ -471,19 +530,19 @@ impl Engine {
 
     /// Whether the look-ahead brickwall limiter is enabled.
     ///
-    /// The limiter defaults to disabled, so an untouched player is bit-transparent.
-    /// Enabling it is a product decision (the reference player's behaviour with
-    /// overs is unmeasured) and costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`]).
-    /// Because [`PlayerState`] has no field for the limiter (and changing the
-    /// wire contract requires an RFC), the control remains engine-side.
+    /// The limiter defaults to enabled (owner decision, 2026-10-17; an own
+    /// choice, since the reference player's behaviour with overs is
+    /// unmeasured). Its look-ahead ([`rustamp_dsp::LOOKAHEAD_SECONDS`]) does not
+    /// shift the timeline (see the module docs). Disabled, it is a bit-exact
+    /// bypass. Because [`PlayerState`] has no field for the limiter (and
+    /// changing the wire contract requires an RFC), the control remains
+    /// engine-side.
     pub fn limiter_enabled(&self) -> bool {
         self.limiter_control.enabled()
     }
 
-    /// Enable or disable the look-ahead brickwall limiter.
+    /// Enable or disable the look-ahead brickwall limiter (enabled by default).
     ///
-    /// Enabling it is a product decision (the reference player's behaviour with
-    /// overs is unmeasured) and costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`]).
     /// Takes effect at the stage's next track start or seek (prepare/reset).
     pub fn set_limiter_enabled(&mut self, enabled: bool) {
         self.limiter_control.set_enabled(enabled);
@@ -630,8 +689,12 @@ impl Engine {
         self.timeline_origin = 0;
         self.track_start = 0;
         self.pending_seek = None;
+        self.start_drain = None;
         self.start_at = None;
         self.end_of_stream = None;
+        // The run's counters end here. What it left in the ring stays there
+        // (only the consumer can drop it) and is reported by
+        // `buffered_frames()` until the next run drains it.
         self.sync.set_written(0);
         self.sync.set_consumed(0);
         self.bus
@@ -857,8 +920,25 @@ impl Engine {
                 if self.pending_seek.map(|p| p.seq) == Some(seq) {
                     self.pending_seek = None;
                 }
+                // An initial seek's drain also drops a previous run's audio,
+                // and this re-base replaces the start's.
+                self.start_drain = None;
                 // Re-base the audio clock exactly at the drain: every frame the
                 // device plays from now on belongs to the new position.
+                self.clock_origin = self.output.played_frames();
+                self.timeline_origin = timeline_pos;
+                self.sync.ack_engine(epoch);
+                self.publish_position(true);
+            }
+            DecodeOut::StartDrained {
+                epoch,
+                timeline_pos,
+            } => {
+                // The previous run's audio is gone and the decode thread has
+                // not written yet: everything the device played since the
+                // start (the drain's silent callback included) was no audio
+                // of this run, so the clock starts here.
+                self.start_drain = None;
                 self.clock_origin = self.output.played_frames();
                 self.timeline_origin = timeline_pos;
                 self.sync.ack_engine(epoch);
@@ -905,6 +985,7 @@ impl Engine {
         // played during underruns, so we must NOT freeze at timeline_frames().
         let frozen_end = self.end_of_stream;
         self.end_of_stream = None;
+        self.start_drain = None;
         self.sync.set_active(false);
         let _ = self.output.pause();
         self.join_decode();
@@ -966,6 +1047,27 @@ impl Engine {
         // consumed <= written holds for the new run. The render callback will
         // update it as it reads from the ring.
         self.sync.set_consumed(0);
+        // A8: what a stopped run left in the ring must not reach the device.
+        // Bump the epoch after the counter resets, so the drain aligns
+        // `consumed` with this run's `written` (0); the decode thread waits for
+        // the drain and the re-base before its first write. A seek of the
+        // previous run that was never drained needs the same, or its drain
+        // would drop this run's first frames.
+        let stale_frames = self
+            .producer
+            .as_ref()
+            .map_or(0, |producer| self.ring_occupancy(producer));
+        let start_epoch = if stale_frames > 0 || self.sync.is_drain_pending() {
+            let epoch = self.sync.request_epoch();
+            self.start_drain = Some(StartDrain {
+                epoch,
+                stale_frames,
+            });
+            Some(epoch)
+        } else {
+            self.start_drain = None;
+            None
+        };
         let ring = self
             .producer
             .take()
@@ -981,6 +1083,7 @@ impl Engine {
             vis_enabled: self.cfg.vis_enabled,
             vis_capacity: self.cfg.vis_capacity,
             stop_after_current: self.stop_after_current,
+            start_epoch,
         };
         // The equalizer runs first, on the decoded PCM (see the module docs).
         // A fresh stage per run starts from clean filter history; the shared

@@ -440,6 +440,31 @@ impl Harness {
         }
     }
 
+    /// Drive the start of a run that found a previous run's audio in the ring
+    /// until it is complete: the render callback has dropped that audio and
+    /// the engine has re-based its clock, so the decode thread is free to
+    /// write the run's first frame. A no-op when nothing is pending.
+    ///
+    /// The drain happens in the render callback, so this has to pump. Every
+    /// pump happens before the re-base (the condition is checked right after
+    /// each poll), and until the re-base the decode thread writes nothing, so
+    /// the pumped frames are silence that the re-base leaves out of the
+    /// position.
+    pub fn settle_drain(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.engine.poll().expect("poll");
+            if !self.engine.is_drain_pending() && !self.engine.is_start_pending() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.clock.pump(64);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Wait (without pumping) until at least `frames` are buffered and return
     /// the position at that moment. Every rendered frame from that position on
     /// is real audio, so a caller can compare it against the source.

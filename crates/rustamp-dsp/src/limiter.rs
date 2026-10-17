@@ -6,9 +6,11 @@
 //! can push samples past full scale and that what the reference player does
 //! with such overs is unmeasured; the device path would otherwise clip them
 //! hard. This stage is an **own-choice addition** that offers a clean
-//! alternative to that hard clip. It is **disabled by default** and then a
-//! bit-exact bypass, so the default pipeline stays inert until a caller opts
-//! in. None of its behaviour may be cited as 2.95 behaviour.
+//! alternative to that hard clip. It is **enabled by default** (owner decision,
+//! 2026-10-17); what the reference player does with overs is unmeasured, so
+//! enabling by default is our own choice and it costs latency (the 5 ms
+//! look-ahead). When disabled, it is a bit-exact bypass. None of its behaviour
+//! may be cited as 2.95 behaviour.
 //!
 //! # Why not a crate
 //!
@@ -112,9 +114,16 @@ const SNAP: f64 = 1e-9;
 
 /// The limiter's on/off switch, shared between the engine (writer) and the
 /// stage on the decode thread (reader). Lock-free.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LimiterControl {
     enabled: AtomicBool,
+}
+
+impl Default for LimiterControl {
+    /// A control block in the default state (enabled; owner decision, 2026-10-17).
+    fn default() -> Self {
+        LimiterControl::new(true)
+    }
 }
 
 impl LimiterControl {
@@ -181,7 +190,7 @@ impl Default for Limiter {
 }
 
 impl Limiter {
-    /// A stage with its own control block, disabled.
+    /// A stage with its own control block, enabled by default (owner decision, 2026-10-17).
     pub fn new() -> Self {
         Limiter::with_control(Arc::new(LimiterControl::default()))
     }
@@ -450,13 +459,15 @@ mod tests {
     }
 
     #[test]
-    fn the_default_stage_is_disabled() {
+    fn the_default_stage_is_enabled() {
         let mut limiter = Limiter::new();
         limiter.prepare(AudioSpec::new(FS, 2)).unwrap();
+        assert_eq!(limiter.latency_frames(), LA as u32);
+        assert!(limiter.control().enabled());
         let input: Vec<f32> = noise(1024 * 2, 2).iter().map(|s| s * 8.0).collect();
         let mut out = input.clone();
         limiter.process(&mut out);
-        assert_eq!(bits(&out), bits(&input));
+        assert!(out.iter().all(|s| s.abs() <= limiter.ceiling()));
     }
 
     #[test]
