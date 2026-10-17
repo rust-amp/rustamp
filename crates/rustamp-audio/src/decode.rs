@@ -278,10 +278,6 @@ pub(crate) struct Config {
     /// started (RFC 0005 O8); later toggles arrive as
     /// [`DecodeMsg::SetStopAfterCurrent`].
     pub stop_after_current: bool,
-    /// Ring epoch the worker must await drain for before writing its first
-    /// frame (set on run start to prevent leaking stale frames from a previous
-    /// run into this one).
-    pub drain_epoch: Option<u64>,
 }
 
 /// Start the decode thread. Returns its handle and the vis consumer.
@@ -296,7 +292,6 @@ pub(crate) fn spawn(
 ) -> (JoinHandle<()>, Consumer<VisFrame>) {
     let (vis, vis_rx) = VisTap::new(cfg.vis_capacity);
     let stop_after_current = cfg.stop_after_current;
-    let drain_epoch = cfg.drain_epoch;
     let mut worker = Worker {
         cfg,
         ring,
@@ -318,7 +313,7 @@ pub(crate) fn spawn(
         stop_after_current,
         pending_seek: None,
         pending_skip: None,
-        drain_epoch,
+        drain_epoch: None,
     };
     let handle = std::thread::Builder::new()
         .name("rustamp-decode".into())

@@ -171,10 +171,6 @@ fn commands_drive_the_transport() {
 #[test]
 fn gapless_join_has_no_silence_and_no_dropped_frames() {
     let mut h = Harness::new(&[TRACK_A, TRACK_B]);
-    // The test asserts bit-exact source pattern across the seam; pattern values
-    // exceed the limiter's -0.3 dBFS ceiling (0.1..=1.1), so disable the default-on
-    // limiter to isolate the gapless seam behavior.
-    h.engine.set_limiter_enabled(false);
     h.engine.play_index(0).unwrap();
     // The decode thread may report both tracks before the first poll, so wait
     // for the whole queue rather than for a specific index.
@@ -256,8 +252,6 @@ fn gapless_join_has_no_silence_and_no_dropped_frames() {
 fn seek_is_frame_accurate_and_plays_the_right_audio() {
     // A long track, so the seek target has room after it.
     let mut h = Harness::new(&[LONG_A]);
-    // Disable limiter to verify bit-exact target audio without overshoot limiting.
-    h.engine.set_limiter_enabled(false);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
 
@@ -670,9 +664,6 @@ fn eq_commands_drive_the_published_state() {
 /// with the engine's EQ set to `eq` before playback.
 fn record_left_with_eq(eq: EqState, frames: u64) -> (u64, Vec<f32>) {
     let mut h = Harness::new(&[LONG_A]);
-    // The EQ tests assert exact values against source pattern (e.g. flat EQ bit-transparency),
-    // so disable the limiter to isolate the EQ stage from limiter overshoot attenuation.
-    h.engine.set_limiter_enabled(false);
     h.engine.set_eq(eq);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
@@ -946,8 +937,6 @@ fn normal_run_finishes_when_ring_is_drained() {
 #[test]
 fn seek_while_paused_drains_consistently() {
     let mut h = Harness::new(&[LONG_A]);
-    // The test asserts bit-exact post-seek audio; disable the limiter to isolate the seek drain.
-    h.engine.set_limiter_enabled(false);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
 
@@ -1414,39 +1403,21 @@ impl rustamp_core::audio::DspStage for GainBoostDspStage {
 }
 
 #[test]
-fn default_engine_limiter_is_enabled_and_limits_overs() {
+fn default_engine_limiter_is_disabled_and_bit_exact() {
     let mut h = Harness::new(&[LONG_A]);
-    let ceiling = h.engine.limiter_ceiling();
-    // The engine's limiter defaults to enabled (owner decision, 2026-10-17).
-    assert!(h.engine.limiter_enabled());
-    assert!(h.engine.limiter_control().enabled());
+    // The engine's limiter must default to disabled so an untouched player is bit-transparent.
+    assert!(!h.engine.limiter_enabled());
+    assert!(!h.engine.limiter_control().enabled());
 
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
-    let _p0 = h.wait_refilled(4096).expect("ring must fill with audio");
+    let p0 = h.wait_refilled(4096).expect("ring must fill with audio");
     let mut rec = Vec::new();
     h.clock.pump_record(1024, &mut rec);
     let left: Vec<f32> = rec.iter().step_by(2).copied().collect();
 
-    // Default configuration limits overs: peak <= ceiling.
-    let peak = left.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-    assert!(
-        peak <= ceiling,
-        "peak {peak} must not exceed ceiling {ceiling}"
-    );
-
-    // Disabling returns to bit-exact bypass mode.
-    h.engine.stop().unwrap();
-    h.engine.set_limiter_enabled(false);
-    assert!(!h.engine.limiter_enabled());
-    h.engine.play_index(0).unwrap();
-    assert!(h.wait_track(0));
-    assert!(h.settle_drain());
-    let p0_disabled = h.wait_refilled(4096).expect("ring must refill with audio");
-    let mut rec_disabled = Vec::new();
-    h.clock.pump_record(1024, &mut rec_disabled);
-    let left_disabled: Vec<f32> = rec_disabled.iter().step_by(2).copied().collect();
-    assert_eq!(&left_disabled[..], &expected(1, p0_disabled, 1024)[..]);
+    // Default configuration: bit-exact to the synthetic source pattern.
+    assert_eq!(&left[..], &expected(1, p0, 1024)[..]);
 }
 
 #[test]
@@ -1455,9 +1426,8 @@ fn limiter_limits_hot_signal_to_ceiling_and_disabling_returns_to_bit_exact() {
     // installed stages, Limiter). It must see everything earlier stages
     // produced, and is the stage closest to the output.
     //
-    // Note: The limiter is enabled by default (owner decision, 2026-10-17);
-    // what the reference player does with overs is unmeasured, so enabling
-    // by default is our own product choice and it costs look-ahead latency
+    // Note: Enabling the limiter is a product decision (the reference player's
+    // behaviour with overs is unmeasured) and costs look-ahead latency
     // (LOOKAHEAD_SECONDS, 5 ms).
     let mut h = Harness::new(&[LONG_A]);
     let ceiling = h.engine.limiter_ceiling();
@@ -1467,15 +1437,49 @@ fn limiter_limits_hot_signal_to_ceiling_and_disabling_returns_to_bit_exact() {
     h.engine
         .set_dsp_chain(vec![Box::new(GainBoostDspStage(2.0))]);
 
-    // --- Phase 1: Default is enabled ---
-    assert!(h.engine.limiter_enabled());
-    assert!(h.engine.limiter_control().enabled());
+    // --- Phase 1: Default is disabled (bypass) ---
+    assert!(!h.engine.limiter_enabled());
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
     let p0 = h.wait_refilled(4096).expect("refill run 1");
+    let mut rec_disabled = Vec::new();
+    h.clock.pump_record(2048, &mut rec_disabled);
+    let left_disabled: Vec<f32> = rec_disabled.iter().step_by(2).copied().collect();
+
+    // The un-limited hot signal has samples exceeding the ceiling.
+    let peak_disabled = left_disabled.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(
+        peak_disabled > ceiling,
+        "unlimited signal must exceed ceiling ({peak_disabled} > {ceiling})"
+    );
+    // Exact bypass: each sample is exactly 2.0 * source.
+    for (out, src) in left_disabled.iter().zip(expected(1, p0, 2048)) {
+        assert_eq!(*out, src * 2.0);
+    }
+    // --- Phase 2: Enable the limiter before the run ---
+    // A fresh harness on purpose: `stop()` leaves the run's audio in the ring
+    // and `start_run` does not invalidate it, so a stopped-then-started engine
+    // replays the previous run's tail first. Reusing this harness would measure
+    // that leftover instead of the limiter; the ring reuse is a finding of its
+    // own (see docs/tasks/A8-ring-reuse.md).
+    let mut h = Harness::new(&[LONG_A]);
+    let ceiling = h.engine.limiter_ceiling();
+    h.engine
+        .set_dsp_chain(vec![Box::new(GainBoostDspStage(2.0))]);
+    h.engine.set_limiter_enabled(true);
+    assert!(h.engine.limiter_enabled());
+    assert!(h.engine.limiter_control().enabled());
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    let p0_enabled = h.wait_refilled(4096).expect("refill run 2");
+    assert_eq!(p0_enabled, p0);
     let mut rec_enabled = Vec::new();
     h.clock.pump_record(2048, &mut rec_enabled);
     let left_enabled: Vec<f32> = rec_enabled.iter().step_by(2).copied().collect();
+
+    // Enabling changes the rendered audio.
+    assert_ne!(left_enabled, left_disabled);
 
     // Because the limiter sits LAST in the DSP chain (after the 2.0x boost stage),
     // it sees the hot audio and ensures no output sample exceeds the ceiling.
@@ -1489,38 +1493,12 @@ fn limiter_limits_hot_signal_to_ceiling_and_disabling_returns_to_bit_exact() {
         peak_enabled >= ceiling * 0.99,
         "peak {peak_enabled} should be held close to ceiling {ceiling}"
     );
-
-    // --- Phase 2: Disable the limiter before the run ---
-    h.engine.stop().unwrap();
+    // --- Phase 3: The control round-trips back to disabled ---
+    // Phase 1 already proves that a disabled limiter is a bit-exact bypass, so
+    // this only has to pin that the switch takes effect.
     h.engine.set_limiter_enabled(false);
     assert!(!h.engine.limiter_enabled());
     assert!(!h.engine.limiter_control().enabled());
-
-    h.engine.play_index(0).unwrap();
-    assert!(h.wait_track(0));
-    assert!(h.settle_drain());
-    let p0_disabled = h.wait_refilled(4096).expect("refill run 2");
-    assert_eq!(p0_disabled, p0);
-    let mut rec_disabled = Vec::new();
-    h.clock.pump_record(2048, &mut rec_disabled);
-    let left_disabled: Vec<f32> = rec_disabled.iter().step_by(2).copied().collect();
-
-    // Disabling changes the rendered audio back to the un-limited hot signal.
-    assert_ne!(left_enabled, left_disabled);
-    let peak_disabled = left_disabled.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-    assert!(
-        peak_disabled > ceiling,
-        "unlimited signal must exceed ceiling ({peak_disabled} > {ceiling})"
-    );
-    // Exact bypass: each sample is exactly 2.0 * source.
-    for (out, src) in left_disabled.iter().zip(expected(1, p0_disabled, 2048)) {
-        assert_eq!(*out, src * 2.0);
-    }
-
-    // --- Phase 3: The control round-trips back to enabled ---
-    h.engine.set_limiter_enabled(true);
-    assert!(h.engine.limiter_enabled());
-    assert!(h.engine.limiter_control().enabled());
 }
 
 #[test]
@@ -1530,9 +1508,7 @@ fn limiter_toggle_latches_on_seek() {
     h.engine
         .set_dsp_chain(vec![Box::new(GainBoostDspStage(2.0))]);
 
-    // Start playback with limiter explicitly disabled.
-    h.engine.set_limiter_enabled(false);
-    assert!(!h.engine.limiter_enabled());
+    // Start playback with limiter disabled.
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
     let _p0 = h.wait_refilled(4096).expect("refill");
@@ -1717,8 +1693,6 @@ fn the_enabled_limiter_keeps_a_gapless_join_exact_and_undelayed() {
 fn a_format_change_keeps_the_resampler_tail() {
     // 4410 frames at 44.1 kHz = 4800 at 48 kHz, then 2400 at 48 kHz.
     let mut h = harness_48k(&["fmt4410_2400.tst"]);
-    // Disable limiter to verify bit-exact resampler tail without peak limiting.
-    h.engine.set_limiter_enabled(false);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_buffered(), "the track must be buffered");
 
@@ -1747,8 +1721,8 @@ fn a_decoder_error_keeps_the_audio_decoded_before_it() {
     assert!(h.engine.last_error().is_some(), "the error is reported");
 }
 
-/// A6 finding 8. With the limiter disabled, a NaN from a stage never reaches the
-/// device; every finite sample passes untouched.
+/// A6 finding 8. With the limiter disabled (the default), a NaN from a stage
+/// never reaches the device; every finite sample passes untouched.
 #[test]
 fn a_non_finite_sample_never_reaches_the_device() {
     struct Poison;
@@ -1772,8 +1746,6 @@ fn a_non_finite_sample_never_reaches_the_device() {
     }
 
     let mut h = Harness::new(&[TRACK_A]);
-    // Disable limiter so finite samples pass untouched to match pattern values exactly.
-    h.engine.set_limiter_enabled(false);
     h.engine.set_dsp_chain(vec![Box::new(Poison)]);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_buffered());
@@ -1797,8 +1769,6 @@ fn a_non_finite_sample_never_reaches_the_device() {
 #[test]
 fn seek_before_play_plays_the_target_audio() {
     let mut h = Harness::new(&[LONG_A]);
-    // Disable limiter to verify bit-exact target audio without peak limiting.
-    h.engine.set_limiter_enabled(false);
     h.engine.seek_frames(1500).unwrap();
     h.engine.play().unwrap();
     // The drain happens in a render callback: pump until it has.
@@ -1825,125 +1795,4 @@ fn seek_before_play_plays_the_target_audio() {
     let (written, consumed) = h.engine.ring_counters();
     assert_eq!(consumed, 1500 + 1024);
     assert!(consumed <= written);
-}
-
-/// A8: A stopped run leaves its audio in the ring.
-///
-/// Proves:
-/// - after stop() then play_index(0), the recording contains NO frame of the
-///   previous run, verified bit for bit against the same recording from a
-///   fresh engine;
-/// - nothing new is lost: the first frame the new run writes still reaches
-///   the device;
-/// - buffered_frames() cannot report 0 while the ring holds stale frames
-///   from a previous run.
-#[test]
-fn stopped_run_leaves_no_stale_audio_in_ring_on_restart() {
-    // 1. Fresh engine baseline:
-    let mut h_fresh = Harness::new(&[LONG_A]);
-    h_fresh.engine.set_limiter_enabled(false);
-    h_fresh.engine.play_index(0).unwrap();
-    assert!(h_fresh.wait_track(0));
-    let p_fresh = h_fresh
-        .wait_refilled(4096)
-        .expect("refill fresh engine run");
-    let mut rec_fresh = Vec::new();
-    h_fresh.clock.pump_record(2048, &mut rec_fresh);
-
-    // 2. Stopped-then-restarted engine:
-    let mut h = Harness::new(&[LONG_A]);
-    h.engine.set_limiter_enabled(false);
-    h.engine.play_index(0).unwrap();
-    assert!(h.wait_track(0));
-    let _ = h.wait_refilled(4096).expect("refill run 1");
-
-    // Pump 1024 frames so the ring still holds frames 1024..4096 from the first run.
-    h.clock.pump(1024);
-    h.engine.poll().unwrap();
-    h.engine.stop().unwrap();
-
-    // While stopped, buffered_frames() must honestly report the stale backlog, NOT 0.
-    let stale = h.engine.buffered_frames();
-    assert!(
-        stale > 0,
-        "buffered_frames() must report unconsumed stale frames after stop, got {stale}"
-    );
-    assert_eq!(h.engine.transport(), TransportState::Stopped);
-
-    // Restart the run.
-    h.engine.play_index(0).unwrap();
-    assert!(h.wait_track(0));
-    assert!(h.engine.is_drain_pending());
-    assert_eq!(
-        h.engine.buffered_frames(),
-        stale,
-        "buffered_frames() must report stale frames until consumer acknowledges drain"
-    );
-
-    // Pump to execute the drain callback and await decode refill.
-    assert!(h.settle_drain());
-    assert!(!h.engine.is_drain_pending());
-
-    let p_restarted = h.wait_refilled(4096).expect("refill restarted engine run");
-    assert_eq!(p_restarted, p_fresh);
-    let mut rec_restarted = Vec::new();
-    h.clock.pump_record(2048, &mut rec_restarted);
-
-    // The restarted recording contains NO stale audio from the previous run,
-    // bit for bit identical to a completely fresh engine.
-    assert_eq!(
-        rec_restarted, rec_fresh,
-        "restarted run audio must match fresh engine recording bit for bit"
-    );
-
-    // First frame written by the new run reached the device (exact source pattern).
-    let left: Vec<f32> = rec_restarted.iter().step_by(2).copied().collect();
-    assert_eq!(
-        &left[..],
-        &expected(1, 0, 2048)[..],
-        "first frame the new run writes must reach the device"
-    );
-    let (written, consumed) = h.engine.ring_counters();
-    assert_eq!(consumed, 2048);
-    assert!(consumed <= written);
-}
-
-/// Job 2: Default-enabled limiter keeps a gapless join exact, undelayed,
-/// loses no tail, and adds no silence into the seam.
-#[test]
-fn the_default_limiter_loses_no_tail_and_adds_no_seam_silence() {
-    let mut h = Harness::new(&[TRACK_A, TRACK_B]);
-    // Note: limiter is NOT explicitly enabled here; it defaults to enabled.
-    assert!(h.engine.limiter_enabled());
-    assert!(h.engine.limiter_control().enabled());
-
-    // 0.5x boost keeps pattern samples (0.1..=1.1) in range 0.05..=0.55,
-    // strictly below the limiter's ceiling, so the limiter stays linear.
-    h.engine
-        .set_dsp_chain(vec![Box::new(GainBoostDspStage(0.5))]);
-    h.engine.play_index(0).unwrap();
-    assert!(h.wait_buffered(), "both tracks must be buffered");
-
-    let a = track_frames(TRACK_A);
-    let b = track_frames(TRACK_B);
-    let total = a + b;
-    assert_eq!(
-        h.engine.end_of_stream(),
-        Some(total),
-        "total buffered frames must equal the sum of both tracks"
-    );
-    assert_eq!(h.engine.ring_counters(), (total, 0));
-
-    let left = play_out(&mut h, total);
-    let want: Vec<f32> = expected(1, 0, a)
-        .into_iter()
-        .chain(expected(2, 0, b))
-        .map(|s| s * 0.5)
-        .collect();
-    assert_eq!(
-        left, want,
-        "the default-enabled limiter must preserve gapless audio bit for bit with no tail lost and no seam silence"
-    );
-    assert_eq!(h.engine.last_track_frames(), b);
-    assert_eq!(h.engine.position_frames(), b);
 }

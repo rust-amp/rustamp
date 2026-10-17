@@ -240,12 +240,6 @@ impl RingSync {
         self.drain_ack.load(Ordering::Acquire) >= epoch
     }
 
-    /// Whether a drain requested by [`RingSync::request_epoch`] or
-    /// [`RingSync::begin_seek`] has not yet been acknowledged by the consumer.
-    pub fn is_drain_pending(&self) -> bool {
-        self.drain_ack.load(Ordering::Acquire) < self.epoch.load(Ordering::Acquire)
-    }
-
     /// Decode side: wait until the engine has re-based its clock.
     pub fn wait_for_engine(&self, epoch: u64) -> bool {
         wait_for(&self.engine_ack, epoch)

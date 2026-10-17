@@ -440,24 +440,6 @@ impl Harness {
         }
     }
 
-    /// Drive the pipeline until a pending ring drain has completed: the consumer
-    /// has drained the ring, acknowledged the drain epoch, and the decode thread
-    /// is free to produce new audio.
-    ///
-    /// The drain happens in the render callback, so this has to pump.
-    pub fn settle_drain(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while self.engine.is_drain_pending() {
-            if Instant::now() >= deadline {
-                return false;
-            }
-            self.engine.poll().expect("poll");
-            self.clock.pump(64);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        true
-    }
-
     /// Wait (without pumping) until at least `frames` are buffered and return
     /// the position at that moment. Every rendered frame from that position on
     /// is real audio, so a caller can compare it against the source.
