@@ -1,5 +1,18 @@
 # M10: Media-host PCM transfer
 
+> **Orchestrator note (2026-10-17, after the VM runs).**
+> 1. The first VM run after this merge failed one test,
+>    `format_change_drains_old_pcm_before_new_channel_count`, with
+>    `unexpected error: media host wait timed out` at a **five second** bound. The
+>    next run passed it unchanged, so it is **flaky**, not a deadlock: the resident
+>    fixture starves under load and the read's fixed timeout expires. A flaky test
+>    in the suite is a defect of its own — it should wait on a condition rather than
+>    on a wall-clock bound (or use a bound so generous that only a real stall reaches
+>    it, with the message saying which). Until then, one red run of that test is not
+>    evidence of a broken transfer.
+> 2. The golden suite could not run in the guest at all until the runner learned to
+>    stage `tests/golden` (`e9eda30`). Unrelated to this card, found by the same run.
+
 ## Boundary and scope
 
 Write only `crates/rustamp-mediahost/**`, `crates/rustamp-dechost/**`,
