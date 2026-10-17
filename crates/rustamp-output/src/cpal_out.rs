@@ -102,6 +102,13 @@ impl CpalOutput {
     pub fn has_failed(&self) -> bool {
         self.shared.failed.load(Ordering::Acquire)
     }
+
+    /// The latched fatal stream error, if the device or stream encountered a fatal failure.
+    ///
+    /// Delegates to the [`OutputDevice::stream_error`] trait method.
+    pub fn stream_error(&self) -> Option<Error> {
+        <Self as OutputDevice>::stream_error(self)
+    }
 }
 
 /// The device's advertised name, or an empty string when the backend does not
@@ -379,6 +386,17 @@ impl OutputDevice for CpalOutput {
         self.shared.played.load(Ordering::Acquire)
     }
 
+    fn stream_error(&self) -> Option<Error> {
+        if self.shared.failed.load(Ordering::Acquire) {
+            Some(Error::Output(format!(
+                "{}: audio stream encountered a fatal error or disconnected",
+                self.device_name
+            )))
+        } else {
+            None
+        }
+    }
+
     fn close(&mut self) -> Result<()> {
         self.stream = None;
         self.device = None;
@@ -457,5 +475,19 @@ mod tests {
             Err(Error::InvalidArgument(_))
         ));
         assert!(!out.has_failed());
+        assert!(out.stream_error().is_none());
+    }
+
+    #[test]
+    fn cpal_stream_error_reflects_error_callback() {
+        let out = CpalOutput::new();
+        assert!(OutputDevice::stream_error(&out).is_none());
+        assert!(!out.has_failed());
+        out.shared.failed.store(true, Ordering::Release);
+        assert!(out.has_failed());
+        let err = OutputDevice::stream_error(&out).expect("stream error");
+        let msg = err.to_string();
+        assert!(msg.contains("cpal"), "{msg}");
+        assert!(msg.contains("fatal error or disconnected"), "{msg}");
     }
 }

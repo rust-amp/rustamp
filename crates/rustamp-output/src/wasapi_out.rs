@@ -24,14 +24,13 @@
 //! Failure handling: a failed `open` names the endpoint that was tried and
 //! lists the render endpoints that exist — it never falls back to another
 //! device. An endpoint that disappears or is invalidated **mid-run** is latched
-//! as a fatal render-thread error ([`WasapiOutput::stream_error`], reported by
+//! as a fatal render-thread error ([`OutputDevice::stream_error`], reported by
 //! `close`) instead of being spun on silently. A format change is the same
 //! event: `AUTOCONVERTPCM` fixes the client's format for its lifetime, so when
 //! the endpoint renegotiates its mix format (a device change), Windows
 //! invalidates the client and its calls start failing — that surfaces as the
-//! same latched loss, and a recovery needs a new `open` (the engine's
-//! `OutputDevice` contract has no mid-run error hook yet, so turning the latch
-//! into an `Event::Error` needs an RFC — engine work, not device work).
+//! same latched loss, and a recovery needs a new `open` (RFC 0012 exposes this
+//! to the engine via [`OutputDevice::stream_error`]).
 //!
 //! [`WasapiOutput::with_device_name`] selects one render endpoint by name, like
 //! [`crate::CpalOutput::with_device_name`]; an absent or ambiguous name fails
@@ -317,11 +316,9 @@ impl WasapiOutput {
     /// The latched fatal render-thread error, if the stream died (the endpoint
     /// was removed or invalidated, a write failed, ...).
     ///
-    /// `close` reports the same error; this lets a caller notice device loss
-    /// before it closes. The `OutputDevice` contract has no mid-run error hook,
-    /// so the engine cannot act on it yet.
-    pub fn stream_error(&self) -> Option<&'static str> {
-        error_text(self.shared.error.load(Ordering::Acquire))
+    /// Delegates to the [`OutputDevice::stream_error`] trait method.
+    pub fn stream_error(&self) -> Option<Error> {
+        <Self as OutputDevice>::stream_error(self)
     }
 }
 
@@ -421,6 +418,11 @@ impl OutputDevice for WasapiOutput {
 
     fn played_frames(&self) -> u64 {
         self.shared.played.load(Ordering::Acquire)
+    }
+
+    fn stream_error(&self) -> Option<Error> {
+        let code = self.shared.error.load(Ordering::Acquire);
+        error_text(code).map(|msg| Error::Output(format!("{}: {msg}", self.device_name)))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -829,5 +831,21 @@ mod tests {
         ));
         assert_eq!(out.played_frames(), 0);
         assert!(out.stream_error().is_none());
+    }
+
+    #[test]
+    fn wasapi_stream_error_reflects_failure_streak() {
+        let out = WasapiOutput::new();
+        assert!(OutputDevice::stream_error(&out).is_none());
+        let mut streak = FailureStreak::new(MAX_CONSECUTIVE_FAILURES);
+        for _ in 0..MAX_CONSECUTIVE_FAILURES - 1 {
+            assert!(!streak.tick());
+        }
+        assert!(streak.tick());
+        fail(&out.shared, ERR_GONE);
+        let err = OutputDevice::stream_error(&out).expect("latched error");
+        let msg = err.to_string();
+        assert!(msg.contains("wasapi"), "{msg}");
+        assert!(msg.contains("device"), "{msg}");
     }
 }

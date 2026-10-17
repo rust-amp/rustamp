@@ -652,6 +652,10 @@ impl Engine {
         match self.transport {
             TransportState::Playing => Ok(()),
             TransportState::Paused => {
+                if let Some(err) = self.output.stream_error() {
+                    self.handle_output_error(err);
+                    return Ok(());
+                }
                 self.send(DecodeMsg::Resume);
                 self.output.resume()?;
                 self.sync.set_active(true);
@@ -858,6 +862,12 @@ impl Engine {
     /// Process everything the decode thread reported and publish the resulting
     /// events. Call this regularly (the CLI example does it every few ms).
     pub fn poll(&mut self) -> Result<()> {
+        if self.transport == TransportState::Playing
+            && let Some(err) = self.output.stream_error()
+        {
+            self.handle_output_error(err);
+            return Ok(());
+        }
         if let Some(rx) = self.from_decode.take() {
             loop {
                 match rx.try_recv() {
@@ -1027,11 +1037,54 @@ impl Engine {
         }
     }
 
+    /// Tear down playback after a fatal mid-run output device failure (RFC 0012).
+    ///
+    /// Stops decoding immediately, pauses and flushes the device, transitions
+    /// transport to [`TransportState::Stopped`], freezes the timeline position,
+    /// and publishes [`Event::StateChanged`], [`Event::PositionChanged`] and
+    /// [`Event::Error`].
+    fn handle_output_error(&mut self, err: Error) {
+        self.send(DecodeMsg::Stop);
+        self.sync.set_active(false);
+        let _ = self.output.pause();
+        let _ = self.output.flush();
+        self.join_decode();
+        self.transport = TransportState::Stopped;
+        self.timeline_origin = self.timeline_frames();
+        self.clock_origin = self.output.played_frames();
+        self.pending_seek = None;
+        self.start_drain = None;
+        self.end_of_stream = None;
+        self.sync.set_written(0);
+        self.sync.set_consumed(0);
+        let info = ErrorInfo {
+            kind: ErrorKind::Output,
+            message: err.to_string(),
+        };
+        self.error = Some(info.clone());
+        self.bus
+            .publish(Event::StateChanged(TransportState::Stopped));
+        self.bus.publish(Event::PositionChanged {
+            position_ms: self.position_ms(),
+            duration_ms: self.duration_ms,
+        });
+        self.bus.publish(Event::Error(info));
+    }
+
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
 
     fn start_run(&mut self) -> Result<()> {
+        if let Some(err) = self.output.stream_error() {
+            let info = ErrorInfo {
+                kind: ErrorKind::Output,
+                message: err.to_string(),
+            };
+            self.error = Some(info.clone());
+            self.bus.publish(Event::Error(info));
+            return Err(err);
+        }
         let index = self.current.unwrap_or(0);
         if index as usize >= self.queue.len() {
             return Err(Error::NotFound(format!("queue index {index}")));

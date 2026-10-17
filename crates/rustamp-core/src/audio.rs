@@ -363,6 +363,21 @@ pub trait OutputDevice: Send {
         Err(Error::Unsupported("device volume"))
     }
 
+    /// Check if a fatal mid-stream error occurred on the output device.
+    ///
+    /// Real backends latch stream failures (e.g. endpoint removal, hardware
+    /// format revocation, buffer write streak exhaustion) asynchronously from
+    /// their audio/render callbacks.
+    ///
+    /// This method is called from the control/engine thread (e.g. in
+    /// `Engine::poll`). It must be non-blocking and lock-free.
+    ///
+    /// Returns `None` if the device is healthy or stopped, or `Some(err)`
+    /// describing the fatal failure that terminated output.
+    fn stream_error(&self) -> Option<Error> {
+        None
+    }
+
     /// Stop and release the device.
     fn close(&mut self) -> Result<()>;
 }
@@ -444,5 +459,46 @@ mod tests {
     fn skipped_packets_defaults_to_zero() {
         // RFC 0002, C1: a decoder that cannot tell reports no damage.
         assert_eq!(Minimal.skipped_packets(), 0);
+    }
+
+    /// Minimal output used to check the provided trait methods.
+    struct MinimalOutput;
+
+    impl OutputDevice for MinimalOutput {
+        fn name(&self) -> &str {
+            "minimal"
+        }
+        fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
+            Ok(OutputFormat {
+                spec,
+                buffer_frames: 1024,
+            })
+        }
+        fn start(&mut self, _render: RenderFn) -> Result<()> {
+            Ok(())
+        }
+        fn pause(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn latency(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn played_frames(&self) -> u64 {
+            0
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_error_defaults_to_none() {
+        assert!(MinimalOutput.stream_error().is_none());
     }
 }
