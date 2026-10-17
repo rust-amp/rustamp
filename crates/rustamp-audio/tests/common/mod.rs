@@ -101,6 +101,167 @@ impl Decoder for PatternDecoder {
     }
 }
 
+/// Frequency of the [`tone`] tracks: an even number of hertz, so the tone has
+/// a crest at every multiple of 0.5 s.
+pub const TONE_HZ: f64 = 1_000.0;
+
+/// Amplitude of the [`tone`] tracks.
+pub const TONE_AMPLITUDE: f64 = 0.5;
+
+/// The sample of the continuous test tone at global frame `frame` of a
+/// 44.1 kHz stream. A track `tone<start>_<frames>.tst` plays frames
+/// `start..start + frames`, so `tone0_22050` followed by `tone22050_22050` is
+/// one unbroken tone whose seam (0.5 s) sits on a crest, where cutting the
+/// resampler's filter off would hurt most.
+pub fn tone(frame: u64) -> f32 {
+    let t = frame as f64 / f64::from(SPEC.sample_rate);
+    (TONE_AMPLITUDE * (2.0 * std::f64::consts::PI * TONE_HZ * t).cos()) as f32
+}
+
+/// The format a `fmt<n>_<m>.tst` track switches to after `n` frames.
+pub const CHANGED_SPEC: AudioSpec = AudioSpec::new(48_000, 2);
+
+/// One stretch of a [`ScriptDecoder`]: a format, a length and the sample at
+/// each frame.
+struct Segment {
+    spec: AudioSpec,
+    frames: u64,
+    value: Box<dyn Fn(u64) -> f32 + Send>,
+}
+
+/// A decoder that plays segments back to back, reports
+/// [`rustamp_core::error::Error::FormatChanged`] between two of them and can
+/// end with a decode error instead of a clean end.
+struct ScriptDecoder {
+    segments: Vec<Segment>,
+    current: usize,
+    pos: u64,
+    fail_at_end: bool,
+}
+
+impl Decoder for ScriptDecoder {
+    fn spec(&self) -> AudioSpec {
+        self.segments[self.current].spec
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        let seg = &self.segments[self.current];
+        if self.pos == seg.frames {
+            if self.current + 1 < self.segments.len() {
+                let from = seg.spec;
+                self.current += 1;
+                self.pos = 0;
+                return Err(rustamp_core::error::Error::FormatChanged {
+                    from,
+                    to: self.segments[self.current].spec,
+                });
+            }
+            if self.fail_at_end {
+                self.fail_at_end = false;
+                return Err(rustamp_core::error::Error::Decode("scripted".into()));
+            }
+            return Ok(0);
+        }
+        let ch = usize::from(seg.spec.channels);
+        let n = (out.len() / ch).min((seg.frames - self.pos) as usize);
+        for i in 0..n {
+            let v = (seg.value)(self.pos + i as u64);
+            out[i * ch..(i + 1) * ch].fill(v);
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn seek(&mut self, to: Duration) -> Result<Duration> {
+        let spec = self.spec();
+        let frames = (to.as_secs_f64() * f64::from(spec.sample_rate)).round() as u64;
+        self.pos = frames.min(self.segments[self.current].frames);
+        Ok(spec.duration_of(self.pos))
+    }
+
+    fn duration(&self) -> Option<Duration> {
+        Some(
+            self.segments
+                .iter()
+                .map(|s| s.spec.duration_of(s.frames))
+                .sum(),
+        )
+    }
+
+    fn stream_info(&self) -> StreamInfo {
+        let spec = self.spec();
+        StreamInfo {
+            bitrate_kbps: None,
+            sample_rate_hz: spec.sample_rate,
+            channels: spec.channels,
+        }
+    }
+
+    fn skipped_packets(&self) -> u64 {
+        0
+    }
+}
+
+/// The two numbers of a `<prefix><a>_<b>` stem.
+fn stem_numbers(name: &str, prefix: &str) -> Option<(u64, u64)> {
+    let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let stem = stem.strip_suffix(".tst").unwrap_or(stem);
+    let (a, b) = stem.strip_prefix(prefix)?.split_once('_')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// The scripted decoders: `tone<start>_<frames>` (a stretch of [`tone`]),
+/// `fmt<n>_<m>` (`n` frames of track 1's pattern at [`SPEC`], a format change
+/// to [`CHANGED_SPEC`], then `m` frames of track 2's pattern) and
+/// `err<n>_<seed>` (`n` frames of [`tone`], then a decode error).
+fn scripted(name: &str) -> Option<ScriptDecoder> {
+    let script = |segments, fail_at_end| ScriptDecoder {
+        segments,
+        current: 0,
+        pos: 0,
+        fail_at_end,
+    };
+    if let Some((start, frames)) = stem_numbers(name, "tone") {
+        let value = Box::new(move |f| tone(start + f));
+        return Some(script(
+            vec![Segment {
+                spec: SPEC,
+                frames,
+                value,
+            }],
+            false,
+        ));
+    }
+    if let Some((n, m)) = stem_numbers(name, "fmt") {
+        return Some(script(
+            vec![
+                Segment {
+                    spec: SPEC,
+                    frames: n,
+                    value: Box::new(|f| pattern(1, f)),
+                },
+                Segment {
+                    spec: CHANGED_SPEC,
+                    frames: m,
+                    value: Box::new(|f| pattern(2, f)),
+                },
+            ],
+            false,
+        ));
+    }
+    if let Some((n, _)) = stem_numbers(name, "err") {
+        return Some(script(
+            vec![Segment {
+                spec: SPEC,
+                frames: n,
+                value: Box::new(tone),
+            }],
+            true,
+        ));
+    }
+    None
+}
+
 /// Factory for `*.tst` paths.
 pub struct TestFactory;
 
@@ -134,6 +295,9 @@ impl DecoderFactory for TestFactory {
             MediaSource::Url(u) => u.clone(),
             MediaSource::Reader { extension, .. } => extension.clone().unwrap_or_default(),
         };
+        if let Some(decoder) = scripted(&name) {
+            return Ok(Box::new(decoder));
+        }
         Ok(Box::new(PatternDecoder {
             spec: SPEC,
             seed: track_seed(&name),

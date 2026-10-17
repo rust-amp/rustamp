@@ -10,6 +10,33 @@
 //! continuous. Nothing is dropped and no silence is inserted. The one exception
 //! is the "stop after current track" mode (RFC 0005 O8): when it is armed the
 //! run ends at the end of the current track instead of opening the next entry.
+//!
+//! # Latency at the seams
+//!
+//! Two parts of the path hold audio back, and both are accounted for so that
+//! every decoded frame reaches the ring exactly once, at the timeline position
+//! its track implies:
+//!
+//! * **The DSP chain** (the limiter's look-ahead, or any stage that reports
+//!   [`DspStage::latency_frames`]). After every `prepare` or `reset` the
+//!   first `latency` frames the chain emits are the stages' initial state, not
+//!   audio, and are dropped. At the end of a track, before a format change
+//!   and after a decoder error, `latency` frames of silence are pushed through
+//!   the chain so that the audio it still holds comes out. The contract resets
+//!   stages at every track change, so this happens at every seam; with the
+//!   default chain (equalizer, limiter disabled) the latency is 0 and nothing
+//!   is trimmed or pushed.
+//! * **The format converter** (the resampler's look-ahead). When the next
+//!   track has the same format, the converter is **not** flushed or reset at
+//!   the seam: the two tracks are resampled as one stream
+//!   ([`FormatConverter::continues`]). It is flushed at the end of the run, at
+//!   a seam between two formats, before a mid-stream format change and before
+//!   a run ends on an error. A track's `timeline_start` is where its first
+//!   frame lands on the output timeline, which with a continued resampler is
+//!   ahead of what has been written when the track opens.
+//!
+//! A non-finite sample (NaN, infinity) leaving the DSP chain is replaced by
+//! silence before it reaches the vis tap, the converter or the ring.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -278,6 +305,8 @@ pub(crate) fn spawn(
         src: AudioSpec::new(44100, 2),
         timeline: 0,
         track_start: 0,
+        stream_base: 0,
+        dsp_trim: 0,
         paused: false,
         quitting: false,
         stopped: false,
@@ -346,6 +375,12 @@ struct Worker {
     timeline: u64,
     /// Timeline position where the current track started.
     track_start: u64,
+    /// Timeline position of the converter's last reset: the converter's
+    /// [`FormatConverter::stream_frames`] count from here.
+    stream_base: u64,
+    /// Frames the DSP chain still emits from its initial state after the last
+    /// `prepare`/`reset`; they are dropped (see the module docs).
+    dsp_trim: usize,
     paused: bool,
     quitting: bool,
     stopped: bool,
@@ -363,11 +398,15 @@ impl Worker {
     fn run(&mut self, start_index: u32, start_at: Option<(u64, u32)>) {
         let mut index = start_index;
         let mut start_at = start_at;
+        // The previous track ran to its end and the converter still holds its
+        // tail: a next track in the same format continues that stream.
+        let mut carry = false;
         loop {
             if self.quitting || self.stopped {
                 break;
             }
             let Some(source) = self.cfg.queue.get(index as usize).cloned() else {
+                self.flush_converter();
                 let _ = self.tx.send(DecodeOut::EndOfStream {
                     timeline_end: self.timeline,
                 });
@@ -376,21 +415,29 @@ impl Worker {
             let mut decoder = match self.cfg.registry.open(source.media_source()) {
                 Ok(d) => d,
                 Err(e) => {
+                    self.flush_converter();
                     self.report_error(&e);
                     break;
                 }
             };
-            self.prepare_track(index, decoder.as_ref());
+            let continues = carry && self.conv.continues(decoder.spec(), self.cfg.device);
+            if carry && !continues {
+                // A seam between two formats: the first stream ends here.
+                self.flush_converter();
+            }
+            self.prepare_track(index, decoder.as_ref(), continues);
             if let Some((frames, seq)) = start_at.take() {
                 let to = self.frames_to_duration(frames);
                 self.apply_seek(&mut decoder, to, frames, seq);
             }
             let outcome = self.track_loop(&mut decoder);
+            carry = outcome == Outcome::Ended;
             if outcome == Outcome::Ended && self.stop_after_current {
                 // "Stop after current track" (RFC 0005 O8): the run ends here
                 // instead of opening the next entry. Reporting the end of the
                 // stream is what lets the engine stop the transport and park the
                 // device, exactly as it does at the end of the queue.
+                self.flush_converter();
                 let _ = self.tx.send(DecodeOut::EndOfStream {
                     timeline_end: self.timeline,
                 });
@@ -427,13 +474,19 @@ impl Worker {
     }
 
     /// Configure the DSP chain, the converter and the tap for a new track.
-    fn prepare_track(&mut self, index: u32, decoder: &dyn Decoder) {
+    /// With `continues`, the converter keeps running from the previous track
+    /// (a same-format gapless seam, see the module docs).
+    fn prepare_track(&mut self, index: u32, decoder: &dyn Decoder, continues: bool) {
         let src = decoder.spec();
         self.src = src;
         for stage in &mut self.dsp {
             let _ = stage.prepare(src);
         }
-        self.conv.prepare(src, self.cfg.device);
+        self.dsp_trim = self.dsp_latency();
+        if !continues {
+            self.conv.prepare(src, self.cfg.device);
+            self.stream_base = self.timeline;
+        }
         self.vis.set_enabled(self.cfg.vis_enabled);
         self.vis.prepare(src);
         self.in_buf = vec![0.0; src.samples_for(READ_FRAMES)];
@@ -445,7 +498,10 @@ impl Worker {
             .max_out_frames(READ_FRAMES)
             .max(self.conv.max_out_frames(2 * self.conv.latency_frames()));
         self.out_buf = vec![0.0; self.cfg.device.samples_for(out_frames)];
-        self.track_start = self.timeline;
+        // Where this track's first frame lands: with a continued converter the
+        // previous track's tail is still inside it, so this is ahead of
+        // `timeline`.
+        self.track_start = self.stream_pos();
         let duration_frames = decoder
             .duration()
             .map(|d| (d.as_secs_f64() * f64::from(self.cfg.device.sample_rate)).round() as u64);
@@ -456,9 +512,23 @@ impl Worker {
             duration_ms: decoder.duration().map(|d| d.as_millis() as u64),
             metadata: Box::new(decoder.metadata()),
             stream: Box::new(decoder.stream_info()),
-            timeline_start: self.timeline,
+            timeline_start: self.track_start,
             seekable: decoder.is_seekable(),
         });
+    }
+
+    /// Frames the DSP chain holds back, at the current track's rate.
+    fn dsp_latency(&self) -> usize {
+        self.dsp
+            .iter()
+            .map(|stage| stage.latency_frames() as usize)
+            .sum()
+    }
+
+    /// Timeline position the next input frame maps to, whether or not its
+    /// output has left the converter yet.
+    fn stream_pos(&self) -> u64 {
+        self.stream_base + self.conv.stream_frames()
     }
 
     fn track_loop(&mut self, decoder: &mut Box<dyn Decoder>) -> Outcome {
@@ -472,8 +542,13 @@ impl Worker {
             if self.check_control() {
                 return self.pending_skip.take().unwrap_or(Outcome::Stop);
             }
+            // A skip that arrived while a seek drain was pending.
+            if let Some(skip) = self.pending_skip.take() {
+                return skip;
+            }
             if let Some((to, frames, seq)) = self.pending_seek.take() {
                 self.apply_seek(decoder, to, frames, seq);
+                continue;
             }
             if self.paused {
                 std::thread::sleep(IDLE_SLEEP);
@@ -484,72 +559,117 @@ impl Worker {
             let read = decoder.read(&mut self.in_buf[..want]);
             let frames = match read {
                 Ok(0) => {
-                    // The decoder is exhausted: emit the tail the resampler is
-                    // still holding, so a resampled track has the length its
-                    // duration implies (the equal-rate path emits nothing).
-                    self.flush_tail();
+                    // The decoder is exhausted: emit what the DSP chain still
+                    // holds. The converter's tail stays in it; the run loop
+                    // either continues it with the next track or flushes it.
+                    if !self.flush_dsp() {
+                        return self.abandoned();
+                    }
                     let _ = self.tx.send(DecodeOut::TrackEnded {
-                        frames: self.timeline.saturating_sub(self.track_start),
+                        frames: self.stream_pos().saturating_sub(self.track_start),
                         skipped: decoder.skipped_packets(),
                     });
                     return Outcome::Ended;
                 }
                 Ok(n) => n,
                 Err(Error::FormatChanged { from, to }) => {
-                    self.on_format_changed(decoder.as_ref(), from, to);
+                    if !self.on_format_changed(decoder.as_ref(), from, to) {
+                        return self.abandoned();
+                    }
                     continue;
                 }
                 Err(e) => {
                     self.report_error(&e);
+                    // Keep the audio decoded before the error: the DSP
+                    // chain's part now, the converter's in the run loop.
+                    if !self.flush_dsp() {
+                        return self.abandoned();
+                    }
                     return Outcome::Ended;
                 }
             };
-            let samples = frames * src_ch;
-            for stage in &mut self.dsp {
-                stage.process(&mut self.in_buf[..samples]);
-            }
-            self.vis.push(&self.in_buf[..samples]);
-            let out_frames = self
-                .conv
-                .convert(&self.in_buf[..samples], &mut self.out_buf);
-            let out_samples = self.cfg.device.samples_for(out_frames);
-            let written = self.write_all(out_samples);
-            self.timeline += written as u64;
-            self.cfg.sync.set_written(self.timeline);
-            if written < out_frames {
-                return self.pending_skip.take().unwrap_or(Outcome::Stop);
+            if !self.emit(frames) {
+                return self.abandoned();
             }
         }
     }
 
-    /// Emit the tail the resampler is still holding into the ring and advance
-    /// the timeline. Nothing to do when the rates are equal (the converter
-    /// holds nothing back then).
-    fn flush_tail(&mut self) {
-        if self.conv.latency_frames() == 0 {
-            return;
+    /// The outcome when a write was cut short: a pending skip, else a stop.
+    fn abandoned(&mut self) -> Outcome {
+        if self.quitting {
+            return Outcome::Quit;
         }
+        self.pending_skip.take().unwrap_or(Outcome::Stop)
+    }
+
+    /// Run the first `frames` frames of `in_buf` through the DSP chain, drop
+    /// the chain's start-up frames, and convert and write the rest. `false`
+    /// when the write was cut short and the track must be abandoned.
+    fn emit(&mut self, frames: usize) -> bool {
+        let src_ch = usize::from(self.src.channels);
+        let samples = frames * src_ch;
+        for stage in &mut self.dsp {
+            stage.process(&mut self.in_buf[..samples]);
+        }
+        let skip = self.dsp_trim.min(frames);
+        self.dsp_trim -= skip;
+        if skip == frames {
+            return true;
+        }
+        let block = &mut self.in_buf[skip * src_ch..samples];
+        // Without the limiter nothing else stops a NaN or an infinity from a
+        // decoder or a stage; on the resampled path one would also spread
+        // over a whole FFT block. Finite samples are left untouched.
+        for sample in block.iter_mut() {
+            if !sample.is_finite() {
+                *sample = 0.0;
+            }
+        }
+        self.vis.push(block);
+        let out_frames = self.conv.convert(block, &mut self.out_buf);
+        let written = self.write_all(self.cfg.device.samples_for(out_frames));
+        written == out_frames
+    }
+
+    /// Push `latency` frames of silence through the DSP chain so that the
+    /// audio it holds back comes out (see the module docs). `false` when the
+    /// write was cut short.
+    fn flush_dsp(&mut self) -> bool {
+        let src_ch = usize::from(self.src.channels);
+        let mut left = self.dsp_latency();
+        while left > 0 {
+            let n = left.min(READ_FRAMES);
+            self.in_buf[..n * src_ch].fill(0.0);
+            if !self.emit(n) {
+                return false;
+            }
+            left -= n;
+        }
+        true
+    }
+
+    /// End the converter's stream: emit the tail the resampler is still
+    /// holding into the ring and start the next stream at the current
+    /// timeline position. Emits nothing when the rates are equal (the
+    /// converter holds nothing back then).
+    fn flush_converter(&mut self) {
         let out_frames = self.conv.flush(&mut self.out_buf);
-        if out_frames == 0 {
-            return;
+        if out_frames > 0 {
+            self.write_all(self.cfg.device.samples_for(out_frames));
         }
-        let out_samples = self.cfg.device.samples_for(out_frames);
-        let written = self.write_all(out_samples);
-        self.timeline += written as u64;
-        self.cfg.sync.set_written(self.timeline);
+        self.stream_base = self.timeline;
     }
 
-    /// Write up to `samples` device-format samples into the ring, waiting for
-    /// space and servicing control messages. Returns the number of **frames**
-    /// written (always frame-aligned); fewer than requested when the track must
-    /// be abandoned.
+    /// Write up to `samples` device-format samples from `out_buf` into the
+    /// ring, waiting for space and servicing control messages, and advance the
+    /// timeline. Returns the number of **frames** written (always
+    /// frame-aligned); fewer than requested when the track must be abandoned.
     fn write_all(&mut self, samples: usize) -> usize {
         let channels = usize::from(self.cfg.device.channels.max(1));
         let mut written = 0;
         // A pending drain must complete before the first post-seek frame is
         // written, or the consumer would drop it.
-        self.await_drain();
-        if self.quitting || self.stopped {
+        if self.await_drain() || self.pending_skip.is_some() {
             return 0;
         }
         while written < samples {
@@ -579,6 +699,11 @@ impl Worker {
                         first.copy_from_slice(&self.out_buf[written..written + a]);
                         second.copy_from_slice(&self.out_buf[written + a..written + n]);
                     }
+                    // Publish before committing: the render callback must
+                    // never read a frame that `written` does not count yet,
+                    // or `consumed` would run ahead of it (see `crate::ring`).
+                    self.timeline += (n / channels) as u64;
+                    self.cfg.sync.set_written(self.timeline);
                     chunk.commit_all();
                     written += n;
                 }
@@ -649,16 +774,18 @@ impl Worker {
                 for stage in &mut self.dsp {
                     stage.reset();
                 }
+                self.dsp_trim = self.dsp_latency();
                 self.conv.reset();
                 self.vis.reset();
-                let epoch = self.cfg.sync.request_epoch();
-                self.drain_epoch = Some(epoch);
                 let frames =
                     (reached.as_secs_f64() * f64::from(self.cfg.device.sample_rate)).round() as u64;
                 self.timeline = self.track_start + frames;
-                self.cfg.sync.set_written(self.timeline);
-                self.await_drain();
-                if self.quitting || self.stopped {
+                self.stream_base = self.timeline;
+                // `written` first, the epoch second (A6 finding 2): the drain
+                // aligns `consumed` with the post-seek `written`.
+                let epoch = self.cfg.sync.begin_seek(self.timeline);
+                self.drain_epoch = Some(epoch);
+                if self.await_drain() {
                     return;
                 }
                 let _ = self.tx.send(DecodeOut::Seeked {
@@ -683,39 +810,50 @@ impl Worker {
         }
     }
 
-    /// Wait until the render side has dropped the pre-seek frames.
+    /// Wait until the render side has dropped the pre-seek frames. Returns
+    /// `true` when the run is stopping or quitting instead.
     ///
     /// Control messages are serviced while waiting, so `Stop`, `Quit` and
-    /// `Pause` always work. While the output is paused there is no consumer to
-    /// drain, so the wait is skipped and the drain stays pending: it happens on
-    /// the first callback after the resume (the first block of new audio is then
-    /// dropped, which is the documented price of seeking while paused).
-    fn await_drain(&mut self) {
+    /// `Pause` always work. A skip is remembered in `pending_skip` and acted on
+    /// once the drain is done. The wait does **not** end while the output is
+    /// paused or not yet started: every frame written before the drain would
+    /// be dropped by it, and a dropped frame that `written` already counts
+    /// would leave `consumed` behind for good (A6 finding 2, second variant).
+    /// The first callback after the resume drains and the decoder carries on.
+    fn await_drain(&mut self) -> bool {
         let Some(epoch) = self.drain_epoch else {
-            return;
+            return false;
         };
         loop {
             if self.cfg.sync.drained(epoch) {
                 self.drain_epoch = None;
-                return;
+                return false;
             }
-            if !self.cfg.sync.is_active() {
-                return;
-            }
-            if self.check_control() {
+            if self.check_control() && (self.quitting || self.stopped) {
                 self.drain_epoch = None;
-                return;
+                return true;
             }
             std::thread::sleep(IDLE_SLEEP);
         }
     }
 
-    fn on_format_changed(&mut self, decoder: &dyn Decoder, from: AudioSpec, to: AudioSpec) {
+    /// Switch to a new decoder format mid-stream. What the old format still
+    /// holds (the DSP chain's delay, then the converter's tail) is emitted
+    /// first. `false` when that write was cut short.
+    fn on_format_changed(&mut self, decoder: &dyn Decoder, from: AudioSpec, to: AudioSpec) -> bool {
+        if !self.flush_dsp() {
+            return false;
+        }
+        self.flush_converter();
+        if self.quitting || self.stopped || self.pending_skip.is_some() {
+            return false;
+        }
         self.src = to;
         self.conv.prepare(to, self.cfg.device);
         for stage in &mut self.dsp {
             let _ = stage.prepare(to);
         }
+        self.dsp_trim = self.dsp_latency();
         self.vis.prepare(to);
         self.in_buf = vec![0.0; to.samples_for(READ_FRAMES)];
         // Same sizing as `prepare_track`: room for the resampler's tail too.
@@ -729,6 +867,7 @@ impl Worker {
             to,
             stream: Box::new(decoder.stream_info()),
         });
+        true
     }
 
     fn frames_to_duration(&self, frames: u64) -> Duration {

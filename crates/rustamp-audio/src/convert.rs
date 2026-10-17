@@ -29,8 +29,9 @@
 //! * **Engine: rubato's synchronous FFT resampler** ([`Fft`]) with its default
 //!   preset — a `BlackmanHarris2` (squared Blackman-Harris) windowed-sinc
 //!   anti-aliasing filter, applied by FFT overlap-add, with FFT blocks of
-//!   roughly [`CHUNK_FRAMES`] input frames (rounded up by rubato to a whole
-//!   multiple of the reduced ratio, 294 frames for 44.1 kHz -> 48 kHz). The
+//!   roughly [`CHUNK_FRAMES`] input frames (rounded up to an even number of
+//!   minimum blocks of the reduced ratio, 294 frames for 44.1 kHz -> 48 kHz,
+//!   640 for 32 kHz -> 44.1 kHz; see `fft_chunk_hint` for why even). The
 //!   device rate and the track rate are both fixed for the life of a run, so
 //!   a synchronous resampler fits; rubato documents it as both its fastest and
 //!   its highest-quality option for a fixed ratio. The squared window's
@@ -53,12 +54,26 @@
 //!   exactly that many frames after every [`FormatConverter::prepare`] and
 //!   [`FormatConverter::reset`], so output frame `k` lines up with input time
 //!   `k * src_rate / dst_rate` and the timeline maths downstream stays exact:
-//!   the converter introduces **no group delay** into the stream. What remains
-//!   is look-ahead: the last [`FormatConverter::latency_frames`] input frames
-//!   of a stream have not produced their output yet; [`FormatConverter::flush`]
-//!   emits them at the end of a stream.
-//! * **Fixed-size chunks.** The resampler is driven with chunks of exactly
-//!   [`CHUNK_FRAMES`] input frames collected in an internal FIFO, so the
+//!   the converter introduces **no group delay** into the stream. For the FFT
+//!   engine the trimmed delay is the filter's delay exactly, because both FFT
+//!   sizes are kept even (`fft_chunk_hint`). The sinc fallback reports its
+//!   delay truncated to whole frames, so its output can lead by less than one
+//!   frame; that is inaudible and not corrected. What remains is look-ahead:
+//!   the last [`FormatConverter::latency_frames`] input frames of a stream
+//!   have not produced their output yet; [`FormatConverter::flush`] emits
+//!   them at the end of a stream.
+//! * **Gapless joins.** A track that follows another in the same format does
+//!   not get a fresh resampler: the decode thread neither flushes nor resets
+//!   the converter at that seam ([`FormatConverter::continues`]), so the two
+//!   tracks are resampled as one stream and the seam is exactly as smooth as
+//!   the joined signal. Flushing and re-priming instead would cut track A's
+//!   filter ringing off at the seam and fade track B in from silence, which
+//!   is a dip to about half the level at the seam. A seam between two formats
+//!   still flushes the first and primes the second: two rates cannot share a
+//!   resampler.
+//! * **Fixed-size chunks.** The resampler is driven with chunks of a fixed
+//!   number of input frames ([`CHUNK_FRAMES`] for most pairs, see
+//!   `fft_chunk_hint`) collected in an internal FIFO, so the
 //!   sequence of resampler calls — and hence every output sample — is the same
 //!   however the caller splits the input into blocks. The phase is carried by
 //!   rubato's own state across those calls, so no frame is dropped or repeated
@@ -111,11 +126,13 @@ impl Engine {
     /// lowest terms.
     fn new(rate_in: u32, rate_out: u32, up: u64, down: u64, channels: usize) -> Option<Engine> {
         if up.max(down) <= MAX_FFT_UNIT
-            && let Ok(fft) = Fft::<f32>::new(
+            && let Ok(fft) = Fft::<f32>::new_custom(
                 rate_in as usize,
                 rate_out as usize,
-                CHUNK_FRAMES,
+                fft_chunk_hint(down),
+                1,
                 channels,
+                WindowFunction::BlackmanHarris2,
                 FixedSync::Input,
             )
         {
@@ -217,6 +234,26 @@ impl fmt::Debug for FormatConverter {
     }
 }
 
+/// The chunk size to ask the FFT engine for, with one FFT sub-chunk.
+///
+/// rubato makes the FFT block `ceil(chunk / down)` minimum blocks long, that
+/// is `blocks * down` input and `blocks * up` output frames, and delays the
+/// output by `fft_size_out / 2` frames around a filter centred at
+/// `floor(fft_size_in / 2)` input frames. Both halves are whole and agree
+/// only when both sizes are even. `up` and `down` are coprime, so at least
+/// one of them is odd, and that takes an even block count. [`CHUNK_FRAMES`]
+/// already gives one for most pairs (44.1 -> 48 kHz: two blocks of 147); for
+/// the others (32 -> 44.1 kHz: one block of 320) the block count is rounded
+/// up to the next even number, which doubles that pair's FFT block and delay.
+fn fft_chunk_hint(down: u64) -> usize {
+    let blocks = (CHUNK_FRAMES as u64).div_ceil(down.max(1));
+    if blocks.is_multiple_of(2) {
+        CHUNK_FRAMES
+    } else {
+        ((blocks + 1) * down) as usize
+    }
+}
+
 fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         (a, b) = (b, a % b);
@@ -297,6 +334,28 @@ impl FormatConverter {
         (self.src, self.dst)
     }
 
+    /// Whether `prepare(src, dst)` would configure exactly the conversion in
+    /// use. Then a new track can continue the running stream (a gapless join)
+    /// instead of flushing it and starting a fresh one; see the module docs.
+    pub fn continues(&self, src: AudioSpec, dst: AudioSpec) -> bool {
+        let src = AudioSpec::new(src.sample_rate.max(1), src.channels.max(1));
+        let dst = AudioSpec::new(dst.sample_rate.max(1), dst.channels.max(1));
+        src == self.src && dst == self.dst
+    }
+
+    /// Output frames the input since the last reset maps to:
+    /// `ceil(input_frames * dst_rate / src_rate)`, or the input frame count
+    /// for equal rates. This is where the next input frame lands on the
+    /// output timeline, counted from the last reset, whether or not its
+    /// output has left the converter yet; [`Self::flush`] stops exactly here.
+    pub fn stream_frames(&self) -> u64 {
+        if self.same_rate {
+            self.in_total
+        } else {
+            self.expected_total()
+        }
+    }
+
     /// Upper bound of output frames for `in_frames` input frames.
     ///
     /// This is the one place that predicts the output length. A call appends
@@ -366,6 +425,7 @@ impl FormatConverter {
             let out_capacity = out.len() / out_ch;
             let n = in_frames.min(out_capacity);
             remix(&input[..n * in_ch], &mut out[..n * out_ch], in_ch, out_ch);
+            self.in_total += n as u64;
             return n;
         }
         if self.engine.is_none() {
@@ -736,16 +796,106 @@ mod tests {
 
     #[test]
     fn output_is_time_aligned_with_the_exact_length() {
-        // 44.1 -> 48 kHz is 147:160, not an integer ratio.
-        let out = resample(44_100, 48_000, &sine(1_000.0, 0.5, 44_100), 1024);
-        assert_eq!(out.len(), 48_000);
-        let (_, phase) = fit(settled(&out, 48_000), 12_000, 1_000.0, 48_000);
-        let quarter_frame = 2.0 * PI * 1_000.0 / 48_000.0 / 4.0;
-        assert!(phase.abs() < quarter_frame, "phase {phase}");
+        // 44.1 -> 48 kHz is 147:160, not an integer ratio. 32 <-> 44.1 kHz
+        // (320:441) has a minimum block above CHUNK_FRAMES; with one block
+        // the FFT sizes were odd and the output lagged by half a frame
+        // (32 -> 44.1) or led by 0.36 frame (44.1 -> 32), which this bound
+        // rejects (A6 finding 6).
+        for (src, dst) in [(44_100, 48_000), (32_000, 44_100), (44_100, 32_000)] {
+            let out = resample(src, dst, &sine(1_000.0, 0.5, src), 1024);
+            assert_eq!(out.len(), dst as usize);
+            let offset = dst as usize / 4;
+            let (_, phase) = fit(settled(&out, dst), offset, 1_000.0, dst);
+            let quarter_frame = 2.0 * PI * 1_000.0 / f64::from(dst) / 4.0;
+            // A fifth of a frame: the trim is exact, so only the fit's own
+            // noise remains, and the old errors (0.36 and 0.5) are rejected.
+            assert!(
+                phase.abs() < quarter_frame * 0.8,
+                "{src}->{dst}: phase {phase}"
+            );
+        }
 
         // Lengths that do not divide evenly round up: 1001 * 160 / 147.
         let short = resample(44_100, 48_000, &ramp(1_001), 1024);
         assert_eq!(short.len(), (1_001_usize * 160).div_ceil(147));
+    }
+
+    #[test]
+    fn fft_blocks_are_even_on_both_sides() {
+        for (src, dst) in [
+            (44_100, 48_000),
+            (48_000, 44_100),
+            (32_000, 44_100),
+            (44_100, 32_000),
+            (8_000, 11_025),
+            (22_050, 48_000),
+            (4_000, 8_000),
+            (8_000, 4_000),
+        ] {
+            let c = FormatConverter::new(AudioSpec::new(src, 1), AudioSpec::new(dst, 1));
+            let Some(Engine::Fft(fft)) = c.engine.as_ref() else {
+                panic!("{src}->{dst}: expected the FFT engine");
+            };
+            let (fin, fout) = (fft.fft_size_in(), fft.fft_size_out());
+            assert!(fin % 2 == 0 && fout % 2 == 0, "{src}->{dst}: {fin}/{fout}");
+            // The trimmed delay is then exactly the filter's centre.
+            assert_eq!(c.delay * fin, (fin / 2) * fout, "{src}->{dst}");
+        }
+    }
+
+    /// A6 finding 1 at converter level. Two halves of one DC signal,
+    /// converted as one continued stream, are the joined signal converted at
+    /// once, sample for sample. The control half shows what the measurement
+    /// catches: flushing after the first half and starting the second from a
+    /// reset converter loses the filter ringing each half owes the other
+    /// across the seam.
+    ///
+    /// The size of that error is estimated, not measured: the last frame of
+    /// the first half lands 0.08 input frames after its last sample, where
+    /// the truncated step response is about 6 % low (0.47 instead of 0.5),
+    /// and the first frame of the second half about 2.5 % low. The review
+    /// estimated a dip to half the level; at the sample instants of this rate
+    /// pair the band-limited step is still near full level, so the error is
+    /// smaller. The control only asserts that it is far above the
+    /// resampler's own error (5e-3 against 1e-4).
+    #[test]
+    fn a_continued_stream_has_no_seam() {
+        let half = vec![0.5_f32; 4_410];
+        let joined = resample(44_100, 48_000, &[half.clone(), half.clone()].concat(), 1024);
+        assert_eq!(joined.len(), 9_600);
+
+        let spec_in = AudioSpec::new(44_100, 1);
+        let spec_out = AudioSpec::new(48_000, 1);
+        let mut c = FormatConverter::new(spec_in, spec_out);
+        let mut buf = vec![0.0; c.max_out_frames(4_410)];
+        let mut continued = Vec::new();
+        let n = c.convert(&half, &mut buf);
+        continued.extend_from_slice(&buf[..n]);
+        assert!(c.continues(spec_in, spec_out));
+        assert_eq!(c.stream_frames(), 4_800, "the seam's place on the output");
+        let n = c.convert(&half, &mut buf);
+        continued.extend_from_slice(&buf[..n]);
+        let mut tail = vec![0.0; c.max_out_frames(2 * c.latency_frames())];
+        let n = c.flush(&mut tail);
+        continued.extend_from_slice(&tail[..n]);
+        assert_eq!(bits(&continued), bits(&joined));
+        // Away from the stream's own edges the level is the DC level.
+        assert!(
+            joined[1_000..8_600].iter().all(|v| (v - 0.5).abs() < 1e-4),
+            "no dip at the seam"
+        );
+
+        // Control: flush and restart at the seam.
+        let a = resample(44_100, 48_000, &half, 1024);
+        let b = resample(44_100, 48_000, &half, 1024);
+        assert_eq!(a.len() + b.len(), joined.len());
+        let restarted = [a, b].concat();
+        let worst = restarted[4_600..5_000]
+            .iter()
+            .zip(&joined[4_600..5_000])
+            .map(|(r, j)| (r - j).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst > 5e-3, "a restarted seam deviates: {worst}");
     }
 
     #[test]

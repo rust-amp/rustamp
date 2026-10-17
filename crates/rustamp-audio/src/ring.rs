@@ -17,9 +17,11 @@
 //! consumer can drop it. Three atomics sequence the switch (all in
 //! [`RingSync`]):
 //!
-//! 1. The decode thread bumps [`RingSync::request_epoch`] *after* it has sought
-//!    the decoder. The next render callback sees the new epoch, discards the
-//!    whole ring and stores [`RingSync::drain_ack`].
+//! 1. The decode thread calls [`RingSync::begin_seek`] *after* it has sought
+//!    the decoder. That publishes the post-seek `written` position first and
+//!    bumps the epoch second, so a render callback that sees the new epoch
+//!    also sees the new `written`. The next render callback discards the whole
+//!    ring, aligns `consumed` to that `written` and stores the drain ack.
 //! 2. The decode thread waits for that ack (servicing control messages while it
 //!    waits) and only then reports the new timeline position to the engine,
 //!    which re-bases its audio clock (`clock_origin`) so that the position
@@ -29,11 +31,11 @@
 //!    is ever dropped by the drain of step 1.
 //!
 //! The drain happens in the render callback and therefore also works when the
-//! stream is paused and only resumes later. When the output is not running the
-//! decode thread skips the waits (nothing would consume the ring anyway) and
-//! the consumer drains on the first callback after the resume; that can drop
-//! the first block of new audio, which is the documented price of seeking while
-//! paused.
+//! stream is paused and only resumes later. While the output is not running,
+//! the decode thread keeps waiting for the drain (servicing control messages)
+//! instead of writing ahead: a frame written before the drain would be dropped
+//! by it, and a frame dropped that way would also be missing from `consumed`.
+//! The engine-ack wait of step 3 is skipped while the output is not running.
 //!
 //! # End-of-stream detection (F2 fix)
 //!
@@ -54,6 +56,22 @@
 //! On a seek-drain the counter is reset to `written` so that pre-seek frames
 //! are treated as consumed and the invariant `consumed <= written` holds for
 //! the new epoch.
+//!
+//! # Ordering of the two counters
+//!
+//! * The decode thread publishes `written` **before** it commits the frames to
+//!   the ring, so the render callback can never have read a frame that
+//!   `written` does not count yet.
+//! * The render callback stores `consumed` with `Release` after it has read
+//!   the frames, and readers load it with `Acquire` **before** they load
+//!   `written` ([`RingSync::counters`]). A reader therefore never observes
+//!   `consumed > written` outside a seek.
+//! * Inside a seek, between [`RingSync::begin_seek`] and the drain, a
+//!   backward seek can show `consumed > written` for one callback: a callback
+//!   of the old epoch may still count pre-seek frames. The drain closes that
+//!   window by setting `consumed = written`. The engine's finish condition
+//!   cannot fire inside it, because `end_of_stream` is only known once the
+//!   decode thread has written everything and stopped seeking.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, AtomicU64, Ordering};
@@ -116,9 +134,9 @@ pub struct RingSync {
     /// up to. The engine uses it to report how much audio is buffered.
     written: AtomicU64,
     /// Absolute timeline position (device frames) that the render callback has
-    /// actually read out of the ring. Updated with `Relaxed` ordering on the
-    /// audio thread — no allocation, no lock, no logging. Silence frames
-    /// written during underruns are **not** counted here.
+    /// actually read out of the ring. Stored with `Release` on the audio
+    /// thread — no allocation, no lock, no logging. Silence frames written
+    /// during underruns are **not** counted here.
     ///
     /// Invariant (per epoch): `consumed <= written`.
     ///
@@ -145,12 +163,12 @@ impl RingSync {
     }
 
     /// Store the running total of device frames actually read from the ring.
-    /// Called from the render callback (Relaxed, no allocation, lock or log)
-    /// and reset to 0 by the engine on start_run and stop.
+    /// Called from the render callback (no allocation, lock or log) and reset
+    /// to 0 by the engine on start_run and stop.
     pub fn set_consumed(&self, frames: u64) {
-        // Relaxed is sufficient: the render callback is the sole writer during
-        // playback; start_run and stop reset it when the stream is not running.
-        self.consumed.store(frames, Ordering::Relaxed);
+        // Release: a reader that sees this value also sees the `written` the
+        // frames were published under (see the module docs).
+        self.consumed.store(frames, Ordering::Release);
     }
 
     /// Device frames the render callback has actually read from the ring (not
@@ -158,12 +176,35 @@ impl RingSync {
     /// thread; the value may be stale by one callback when read off the audio
     /// thread.
     pub fn consumed(&self) -> u64 {
-        self.consumed.load(Ordering::Relaxed)
+        self.consumed.load(Ordering::Acquire)
+    }
+
+    /// `(written, consumed)`, loaded in the order that keeps them consistent:
+    /// `consumed` first, then `written`. Outside a seek the result always has
+    /// `consumed <= written` (see the module docs).
+    pub fn counters(&self) -> (u64, u64) {
+        let consumed = self.consumed();
+        let written = self.written();
+        (written, consumed)
     }
 
     /// Ask the consumer to discard the ring; returns the new epoch.
+    ///
+    /// The drain aligns `consumed` with whatever `written` holds when the
+    /// render callback sees the epoch, so a seek must publish its new
+    /// `written` first; [`RingSync::begin_seek`] does both in that order.
     pub fn request_epoch(&self) -> u64 {
         self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Decode side: start a seek whose first post-seek frame sits at timeline
+    /// position `base`. Publishes `written = base` and only then bumps the
+    /// epoch, so the render callback that drains the ring for the new epoch
+    /// aligns `consumed` with `base`, not with the pre-seek `written`. Returns
+    /// the new epoch.
+    pub fn begin_seek(&self, base: u64) -> u64 {
+        self.set_written(base);
+        self.request_epoch()
     }
 
     /// Epoch the consumer is currently serving.
@@ -295,7 +336,7 @@ pub fn make_render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtrb::RingBuffer;
+    use rtrb::{Producer, RingBuffer};
 
     fn render_into(
         render: &mut RenderFn,
@@ -386,36 +427,99 @@ mod tests {
         );
     }
 
-    /// After an epoch drain, consumed is reset to written so the invariant holds.
-    #[test]
-    fn consumed_resets_to_written_after_epoch_drain() {
-        let (mut producer, consumer) = RingBuffer::<f32>::new(32);
+    /// Ring with `written` frames published and pushed, of which `played` have
+    /// been rendered.
+    fn primed(written: u64, played: usize) -> (Producer<f32>, RenderFn, Arc<RingSync>) {
+        let (mut producer, consumer) = RingBuffer::<f32>::new(64);
         let sync = Arc::new(RingSync::new());
         let gain = Arc::new(GainState::new(255, 0));
-        let mut render = make_render(consumer, Arc::clone(&sync), Arc::clone(&gain), 1);
-
-        // Simulate: decode thread wrote 10 frames.
-        sync.set_written(10);
-        for i in 0..10 {
-            producer.push(i as f32).unwrap();
+        let mut render = make_render(consumer, Arc::clone(&sync), gain, 1);
+        sync.set_written(written);
+        for i in 0..written {
+            producer.push(i as f32 + 1.0).unwrap();
         }
-        // Consume 6 of them.
-        render_into(&mut render, 6, 1, &mut Vec::new());
-        assert_eq!(sync.consumed(), 6);
+        render_into(&mut render, played, 1, &mut Vec::new());
+        (producer, render, sync)
+    }
 
-        // Now a seek happens: decode thread bumps epoch and updates written.
-        sync.set_written(10); // still 10 before the seek position is published
-        let epoch = sync.request_epoch();
-        // The next render callback drains the remaining 4 frames.
-        render_into(&mut render, 4, 1, &mut Vec::new());
-        assert!(sync.drained(epoch));
-        // consumed must now equal written (10), not 6+4=10 by coincidence but
-        // because it was explicitly reset to written (which is 10 here anyway).
-        assert_eq!(
-            sync.consumed(),
-            sync.written(),
-            "consumed must equal written after epoch drain"
-        );
+    /// After an epoch drain, `consumed` is the post-seek `written`, not the
+    /// frames read plus the frames dropped. With 10 written, 6 read and 4
+    /// dropped, an implementation that adds the dropped frames ends at 10;
+    /// the seek base is 3 (backward) and 5000 (forward), so only an
+    /// alignment to `written` passes.
+    #[test]
+    fn consumed_resets_to_written_after_epoch_drain() {
+        for base in [3_u64, 5_000] {
+            let (mut producer, mut render, sync) = primed(10, 6);
+            assert_eq!(sync.consumed(), 6);
+
+            let epoch = sync.begin_seek(base);
+            render_into(&mut render, 4, 1, &mut Vec::new());
+            assert!(sync.drained(epoch));
+            assert_eq!(sync.counters(), (base, base), "base {base}");
+
+            // Post-seek frames are counted from the base, and the run's
+            // finish condition (`consumed >= written`) holds exactly when the
+            // last of them has been read.
+            for i in 0..5 {
+                producer.push(100.0 + i as f32).unwrap();
+            }
+            sync.set_written(base + 5);
+            render_into(&mut render, 2, 1, &mut Vec::new());
+            assert_eq!(sync.counters(), (base + 5, base + 2));
+            let out = render_into(&mut render, 3, 1, &mut Vec::new());
+            assert_eq!(out, vec![102.0, 103.0, 104.0], "only post-seek frames");
+            assert_eq!(sync.counters(), (base + 5, base + 5));
+        }
+    }
+
+    /// The A6 interleaving (finding 2): a render callback lands between the
+    /// two stores of a seek. With the old order (epoch first, `written`
+    /// second) the drain aligned `consumed` to the **pre-seek** `written`;
+    /// `begin_seek` stores `written` first, so a callback that lands between
+    /// the two stores still serves the old epoch, and the drain that follows
+    /// aligns to the new `written`.
+    #[test]
+    fn a_callback_between_the_seek_stores_cannot_misalign_consumed() {
+        for base in [3_u64, 1_000] {
+            let (mut producer, mut render, sync) = primed(10, 6);
+            // The first store of `begin_seek`.
+            sync.set_written(base);
+            // A callback in between: it still serves the old epoch and reads
+            // two stale frames.
+            render_into(&mut render, 2, 1, &mut Vec::new());
+            // The second store, then the drain.
+            let epoch = sync.request_epoch();
+            render_into(&mut render, 2, 1, &mut Vec::new());
+            assert!(sync.drained(epoch));
+            assert_eq!(
+                sync.counters(),
+                (base, base),
+                "base {base}: the drain aligns to the post-seek written"
+            );
+            // Backward (3): the run would otherwise finish with audio still in
+            // the ring. Forward (1000): it would otherwise never finish.
+            for i in 0..5 {
+                producer.push(i as f32).unwrap();
+            }
+            sync.set_written(base + 5);
+            let (written, consumed) = sync.counters();
+            assert_eq!(written - consumed, 5, "the backlog is the real backlog");
+            render_into(&mut render, 5, 1, &mut Vec::new());
+            let (written, consumed) = sync.counters();
+            assert_eq!(consumed, written, "the run can finish, and only now");
+        }
+    }
+
+    /// `begin_seek` publishes `written` before the epoch: an observer that
+    /// sees the new epoch also sees the new `written`.
+    #[test]
+    fn begin_seek_publishes_written_before_the_epoch() {
+        let sync = RingSync::new();
+        sync.set_written(10);
+        let epoch = sync.begin_seek(4);
+        assert_eq!(sync.epoch(), epoch);
+        assert_eq!(sync.written(), 4);
     }
 
     /// After a run ends and engine resets written and consumed to 0, the next

@@ -68,8 +68,19 @@
 //!
 //! The limiter defaults to **disabled**, operating as a bit-exact bypass so
 //! that an untouched player remains bit-transparent. Enabling it is a product
-//! decision (the reference player's behaviour with overs is unmeasured) and
-//! costs look-ahead latency ([`rustamp_dsp::LOOKAHEAD_SECONDS`], 5 ms).
+//! decision (the reference player's behaviour with overs is unmeasured). Its
+//! look-ahead ([`rustamp_dsp::LOOKAHEAD_SECONDS`], 5 ms) is reported through
+//! `DspStage::latency_frames` and handled by the decode thread the way the
+//! converter's is: the stage's start-up frames are dropped and its tail is
+//! pushed out at the end of every track, so no frame is lost, no silence
+//! enters a gapless seam and the position stays exact (see [`crate::decode`]).
+//! What remains is that the limiter is reset at every track change (the
+//! `DspStage` contract), so its look-ahead never sees across a seam.
+//!
+//! The limiter's ceiling holds at its own output only. The resampler after it
+//! (when the device rate differs from the track's) can rebuild inter-sample
+//! peaks above the ceiling, and above full scale (A6 finding 3, not fixed
+//! here).
 //! Because [`PlayerState`] has no field for the limiter (and changing the wire
 //! contract requires an RFC), the control remains engine-side via
 //! [`Engine::limiter_enabled`], [`Engine::set_limiter_enabled`], and
@@ -385,7 +396,16 @@ impl Engine {
     /// `written`, but this value correctly stays at whatever is still in the
     /// ring — it never saturates a real backlog to zero.
     pub fn buffered_frames(&self) -> u64 {
-        self.sync.written().saturating_sub(self.sync.consumed())
+        let (written, consumed) = self.sync.counters();
+        written.saturating_sub(consumed)
+    }
+
+    /// The raw ring counters `(written, consumed)` in device frames, loaded
+    /// consistently (see [`RingSync::counters`]). [`Engine::buffered_frames`]
+    /// is their saturating difference, which hides `consumed > written`; this
+    /// accessor lets a diagnostic or a test see such a misalignment.
+    pub fn ring_counters(&self) -> (u64, u64) {
+        self.sync.counters()
     }
 
     /// Absolute timeline position the decode thread reported as the end of the
@@ -790,8 +810,7 @@ impl Engine {
         // real audio frame leaves the ring, not merely until the device clock
         // passes the nominal end time.
         if let Some(end) = self.end_of_stream {
-            let written = self.sync.written();
-            let consumed = self.sync.consumed();
+            let (written, consumed) = self.sync.counters();
             if written >= end && consumed >= written && self.transport == TransportState::Playing {
                 self.finish_run();
             }

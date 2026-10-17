@@ -8,7 +8,9 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Harness, SPEC, expected, pattern, track_frames};
+use common::{Harness, SPEC, TONE_AMPLITUDE, TONE_HZ, expected, pattern, track_frames};
+use rustamp_audio::EngineConfig;
+use rustamp_core::audio::AudioSpec;
 use rustamp_core::bus::command_channel;
 use rustamp_core::command::Command;
 use rustamp_core::event::Event;
@@ -962,26 +964,33 @@ fn seek_while_paused_drains_consistently() {
         h.engine.position_frames()
     );
 
-    // After the seek drains, buffered_frames() must not report a stale pre-seek
-    // backlog. It may be non-zero (post-seek frames already written) but must
-    // not exceed what the decode thread has since written.
-    h.engine.poll().unwrap();
-    // end_of_stream is None while the run is live; check written via
-    // buffered_frames() being sane.
-    let written = h.engine.end_of_stream().unwrap_or(0);
-    let _ = written; // used only to document intent
-
-    // The key invariant: buffered_frames() == written - consumed.
-    // After a seek-drain the render callback aligns consumed to written,
-    // so buffered_frames() reflects only post-seek frames.
-    // We can't easily measure the exact value headlessly, but we can assert
-    // it is not wildly large (no stale pre-seek backlog leaking through).
-    let track_len = track_frames(LONG_A);
+    // The raw counters, not the saturating `buffered_frames()` (A6 test
+    // audit): the drain aligned `consumed` with the seek base, so it is at
+    // least 1000, and it never runs ahead of `written`.
+    let (written, consumed) = h.engine.ring_counters();
+    assert!(consumed >= 1000, "consumed {consumed} behind the seek base");
     assert!(
-        h.engine.buffered_frames() <= track_len,
-        "buffered_frames must not exceed the total track length after a seek; got {}",
-        h.engine.buffered_frames()
+        consumed <= written,
+        "consumed {consumed} > written {written}"
     );
+
+    // And the audio that follows is the source at the position: no post-seek
+    // block was written before the drain and dropped by it.
+    let p0 = h
+        .wait_refilled(4096)
+        .expect("the ring must refill after the seek");
+    assert_eq!(p0, 1000, "nothing was played between the drain and here");
+    let mut rec = Vec::new();
+    h.clock.pump_record(1024, &mut rec);
+    let left: Vec<f32> = rec.iter().step_by(2).copied().collect();
+    assert_eq!(&left[..], &expected(1, p0, 1024)[..]);
+    let (written, consumed) = h.engine.ring_counters();
+    assert_eq!(
+        consumed,
+        1000 + 1024,
+        "every played frame came from the ring"
+    );
+    assert!(consumed <= written);
     assert_eq!(
         h.engine.transport(),
         TransportState::Playing,
@@ -1316,15 +1325,23 @@ fn f2_invariants_hold_across_underruns_and_seeks() {
     );
 
     // 2. Severe underrun: pump more frames than were buffered.
-    // Device plays silence; consumed must only advance by what was actually read.
-    h.clock.pump(initial_buffered + 4000);
+    // Device plays silence; consumed must only advance by what was actually
+    // read. The raw counters are checked, because `buffered_frames()`
+    // saturates and would read 0 for `consumed > written` too (A6 test audit).
+    let (_, consumed_before) = h.engine.ring_counters();
+    let pumped = initial_buffered + 4000;
+    h.clock.pump(pumped);
     h.engine.poll().unwrap();
-    // Invariant: buffered_frames() must not underflow.
-    assert_eq!(
-        h.engine.buffered_frames(),
-        0,
-        "ring should be drained to 0 during underrun, not underflow"
+    let (written, consumed) = h.engine.ring_counters();
+    assert!(
+        consumed <= written,
+        "consumed {consumed} ran ahead of written {written}"
     );
+    assert!(
+        consumed - consumed_before <= pumped,
+        "consumed counts more frames than the device pulled"
+    );
+    assert_eq!(h.engine.buffered_frames(), written - consumed);
     assert_eq!(
         h.engine.transport(),
         TransportState::Playing,
@@ -1335,13 +1352,20 @@ fn f2_invariants_hold_across_underruns_and_seeks() {
     h.engine.seek_frames(5000).unwrap();
     assert!(h.settle_seek(5000), "seek must settle on frame 5000");
 
-    // 4. Seek drain alignment: post-seek frames are written.
+    // 4. Seek drain alignment: `consumed` was set to the seek base (5000),
+    // not left at the pre-seek `written` (A6 finding 2: a backward seek would
+    // leave it above `written`, a forward one below the base).
     h.engine.poll().unwrap();
-    let post_seek_buffered = h.engine.buffered_frames();
-    // Post-seek backlog must be honest and not wildly exceed ring capacity.
+    let (written, consumed) = h.engine.ring_counters();
+    assert!(consumed >= 5000, "consumed {consumed} behind the seek base");
     assert!(
-        post_seek_buffered <= 16384,
-        "buffered frames must be bounded by ring capacity: {post_seek_buffered}"
+        consumed <= written,
+        "consumed {consumed} > written {written} after the seek"
+    );
+    assert!(
+        written - consumed <= 16384,
+        "the backlog is bounded by the ring: {}",
+        written - consumed
     );
 
     // 5. Clean stop: resets backlog to 0.
@@ -1508,4 +1532,267 @@ fn limiter_toggle_latches_on_seek() {
         "limiter must be active after seek: peak {peak_after} <= {ceiling}"
     );
     assert_eq!(p_after, 5000);
+}
+
+// ---------------------------------------------------------------------------
+// A7: resampled seams, DSP latency, format changes and errors
+// ---------------------------------------------------------------------------
+
+/// A device that grants 48 kHz while every synthetic track is 44.1 kHz: the
+/// most common Windows shared-mode setup, and the one that resamples.
+const DEVICE_48K: AudioSpec = AudioSpec::new(48_000, 2);
+
+/// An engine on a 48 kHz device with a ring large enough to hold a whole
+/// short queue, so a test can buffer everything before it plays.
+fn harness_48k(names: &[&str]) -> Harness {
+    Harness::with_config(
+        names,
+        EngineConfig {
+            spec: DEVICE_48K,
+            ring_frames: 1 << 17,
+            ..EngineConfig::default()
+        },
+    )
+}
+
+/// Play `total` buffered frames, return the left channel, and let the run
+/// finish.
+fn play_out(h: &mut Harness, total: u64) -> Vec<f32> {
+    let mut rec = Vec::new();
+    assert_eq!(h.clock.pump_record(total, &mut rec), total);
+    assert!(
+        h.wait_idle(
+            |e| e.transport() == TransportState::Stopped,
+            Duration::from_secs(2)
+        ),
+        "the run must finish once the ring is empty"
+    );
+    rec.iter().step_by(2).copied().collect()
+}
+
+/// A6 finding 1. Two 44.1 kHz tracks that together are one unbroken 1 kHz
+/// tone, on a 48 kHz device, with the seam on a crest of the tone.
+///
+/// What it proves: across a same-format gapless seam the engine's output is
+/// the tone, resampled, within 5e-3 (about -40 dB of the tone) at every frame
+/// away from the stream's own start and end; the sample step stays within 2 %
+/// of the tone's own largest step; the level (RMS per period) is continuous
+/// within 1 %; the seam lands exactly at 0.5 s and the queue has exactly the
+/// length its duration implies. The flush-and-restart seam this replaces
+/// misses the joined signal by about 0.03 next to the seam (estimated, see
+/// `convert::a_continued_stream_has_no_seam`), six times the tolerance.
+///
+/// What it cannot prove: that a seam is inaudible on real material, that a
+/// seam between two **different** formats is smooth (it is not: two rates
+/// cannot share a resampler, so that seam is still flushed and restarted), or
+/// anything about a real device. The tolerance covers the converter's
+/// passband error (±0.05 dB is 3e-3 at this level); the true error is
+/// expected to be far smaller, but it was not measured on this host.
+#[test]
+fn a_resampled_gapless_seam_is_continuous() {
+    let mut h = harness_48k(&["tone0_22050.tst", "tone22050_22050.tst"]);
+    assert_eq!(h.engine.device_spec(), DEVICE_48K);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered(), "both tracks must be buffered");
+
+    // 2 x 22050 frames at 44.1 kHz are exactly 2 x 24000 at 48 kHz.
+    let seam = 24_000_u64;
+    let total = 2 * seam;
+    assert_eq!(h.engine.end_of_stream(), Some(total));
+    assert_eq!(h.engine.ring_counters(), (total, 0));
+    assert_eq!(h.engine.current_index(), Some(1));
+
+    let left = play_out(&mut h, total);
+    assert_eq!(left.len() as u64, total);
+    // Track 2 starts exactly at the seam, and both tracks have their length.
+    assert_eq!(h.engine.position_frames(), total - seam);
+    assert_eq!(h.engine.last_track_frames(), seam);
+
+    let rate = f64::from(DEVICE_48K.sample_rate);
+    let ideal =
+        |k: usize| TONE_AMPLITUDE * (2.0 * std::f64::consts::PI * TONE_HZ * k as f64 / rate).cos();
+    // The stream's own edges (a tone switched on and off from silence) ring;
+    // 10 ms is well past the filter's half length (about 3 ms).
+    let edge = 480;
+    let body = edge..total as usize - edge;
+
+    let (worst_at, worst) = body
+        .clone()
+        .map(|k| (k, (f64::from(left[k]) - ideal(k)).abs()))
+        .fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+    assert!(
+        worst < 5e-3,
+        "the output leaves the resampled tone by {worst} at frame {worst_at} (seam at {seam})"
+    );
+
+    let tone_step = 2.0 * TONE_AMPLITUDE * (std::f64::consts::PI * TONE_HZ / rate).sin();
+    let max_step = body
+        .clone()
+        .skip(1)
+        .map(|k| (f64::from(left[k]) - f64::from(left[k - 1])).abs())
+        .fold(0.0, f64::max);
+    assert!(
+        max_step < tone_step * 1.02,
+        "step {max_step} > {tone_step} (the tone's own largest step)"
+    );
+
+    // Level across the seam: the RMS of every whole period around it.
+    let period = (rate / TONE_HZ) as usize;
+    let target = TONE_AMPLITUDE / 2.0_f64.sqrt();
+    let seam = seam as usize;
+    for start in (seam - 10 * period..seam + 10 * period).step_by(period / 4) {
+        let rms = (left[start..start + period]
+            .iter()
+            .map(|v| f64::from(*v).powi(2))
+            .sum::<f64>()
+            / period as f64)
+            .sqrt();
+        assert!(
+            (rms / target - 1.0).abs() < 0.01,
+            "level {rms} at frame {start} (seam at {seam}, expected {target})"
+        );
+    }
+}
+
+/// A6 finding 4. With the limiter enabled and a signal it does not have to
+/// touch, a gapless queue comes out bit for bit: no look-ahead silence at the
+/// start or in the seam, no frame lost at the seam or at the end, and the
+/// position is not shifted by the look-ahead.
+#[test]
+fn the_enabled_limiter_keeps_a_gapless_join_exact_and_undelayed() {
+    let mut h = Harness::new(&[TRACK_A, TRACK_B]);
+    // 0.5x keeps the pattern (0.1..=1.1) at 0.05..=0.55, below the ceiling,
+    // and the product is exact.
+    h.engine
+        .set_dsp_chain(vec![Box::new(GainBoostDspStage(0.5))]);
+    h.engine.set_limiter_enabled(true);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered(), "both tracks must be buffered");
+
+    let a = track_frames(TRACK_A);
+    let b = track_frames(TRACK_B);
+    let total = a + b;
+    assert_eq!(h.engine.end_of_stream(), Some(total));
+    assert_eq!(h.engine.ring_counters(), (total, 0));
+
+    let left = play_out(&mut h, total);
+    let want: Vec<f32> = expected(1, 0, a)
+        .into_iter()
+        .chain(expected(2, 0, b))
+        .map(|s| s * 0.5)
+        .collect();
+    assert_eq!(left, want, "the delayed limiter output, re-aligned");
+    assert_eq!(h.engine.last_track_frames(), b);
+    assert_eq!(h.engine.position_frames(), b);
+}
+
+/// A6 finding 5. A mid-stream format change from 44.1 kHz (resampled) to
+/// 48 kHz (copied) keeps the resampler's tail: the first part has its full
+/// resampled length, and the second part follows it bit for bit.
+#[test]
+fn a_format_change_keeps_the_resampler_tail() {
+    // 4410 frames at 44.1 kHz = 4800 at 48 kHz, then 2400 at 48 kHz.
+    let mut h = harness_48k(&["fmt4410_2400.tst"]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered(), "the track must be buffered");
+
+    let first = 4_800_u64;
+    let second = 2_400_u64;
+    let total = first + second;
+    assert_eq!(
+        h.engine.end_of_stream(),
+        Some(total),
+        "the tail before the change was dropped"
+    );
+    assert_eq!(h.engine.source_spec(), Some(common::CHANGED_SPEC));
+    let left = play_out(&mut h, total);
+    assert_eq!(&left[first as usize..], &expected(2, 0, second)[..]);
+    assert_eq!(h.engine.last_track_frames(), total);
+}
+
+/// A6 finding 7. A decoder error ends the track but keeps what was decoded
+/// before it, including the part the resampler was still holding.
+#[test]
+fn a_decoder_error_keeps_the_audio_decoded_before_it() {
+    let mut h = harness_48k(&["err4410_0.tst"]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered(), "the run must reach its end");
+    assert_eq!(h.engine.end_of_stream(), Some(4_800));
+    assert!(h.engine.last_error().is_some(), "the error is reported");
+}
+
+/// A6 finding 8. With the limiter disabled (the default), a NaN from a stage
+/// never reaches the device; every finite sample passes untouched.
+#[test]
+fn a_non_finite_sample_never_reaches_the_device() {
+    struct Poison;
+    impl rustamp_core::audio::DspStage for Poison {
+        fn name(&self) -> &str {
+            "poison"
+        }
+        fn prepare(&mut self, _: AudioSpec) -> rustamp_core::error::Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, buf: &mut [f32]) {
+            for (i, s) in buf.iter_mut().enumerate() {
+                match i % 300 {
+                    0 => *s = f32::NAN,
+                    101 => *s = f32::INFINITY,
+                    _ => {}
+                }
+            }
+        }
+        fn reset(&mut self) {}
+    }
+
+    let mut h = Harness::new(&[TRACK_A]);
+    h.engine.set_dsp_chain(vec![Box::new(Poison)]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered());
+    let total = track_frames(TRACK_A);
+    let mut rec = Vec::new();
+    h.clock.pump_record(total, &mut rec);
+    assert!(rec.iter().all(|s| s.is_finite()), "a non-finite sample");
+    let silenced = rec.iter().filter(|s| **s == 0.0).count();
+    assert!(silenced > 0, "the poisoned samples are silenced");
+    for (frame, pair) in rec.as_chunks::<2>().0.iter().enumerate() {
+        let want = pattern(1, frame as u64);
+        for s in pair {
+            assert!(*s == 0.0 || *s == want, "frame {frame}: {s} != {want}");
+        }
+    }
+}
+
+/// A6 finding 2, second variant. A seek requested before the output runs
+/// (the initial seek of a run) is not written ahead of the drain, so the
+/// audio after it is the source at the target and the counters line up.
+#[test]
+fn seek_before_play_plays_the_target_audio() {
+    let mut h = Harness::new(&[LONG_A]);
+    h.engine.seek_frames(1500).unwrap();
+    h.engine.play().unwrap();
+    // The drain happens in a render callback: pump until it has.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.engine.ring_counters().1 < 1500 {
+        assert!(Instant::now() < deadline, "the drain never happened");
+        h.engine.poll().unwrap();
+        h.clock.pump(64);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        h.engine.ring_counters().1,
+        1500,
+        "consumed is the seek base"
+    );
+    let p0 = h
+        .wait_refilled(4096)
+        .expect("the ring must fill after the seek");
+    assert_eq!(p0, 1500);
+    let mut rec = Vec::new();
+    h.clock.pump_record(1024, &mut rec);
+    let left: Vec<f32> = rec.iter().step_by(2).copied().collect();
+    assert_eq!(&left[..], &expected(1, 1500, 1024)[..]);
+    let (written, consumed) = h.engine.ring_counters();
+    assert_eq!(consumed, 1500 + 1024);
+    assert!(consumed <= written);
 }
