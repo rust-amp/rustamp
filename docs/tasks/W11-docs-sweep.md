@@ -88,11 +88,13 @@ from the tree, or were not owned by this pass.
 
 - **G3 mechanism and the ~7.8 ms figure** — `docs/tasks/G3-wake-timeout.md:82-89` (the "kernel timer
   interrupt fires at the next tick boundary (~7–8 ms later)" explanation) and `:80` (the one place
-  the number appears). W10 F7 / G3-4 / G3-5 say the mechanism is self-inconsistent and the figure
-  has no artefact in the tree. **Unverified in-tree:** this describes a VM measurement; the number
-  and the mechanism cannot be settled from code or from any committed log. Correcting it would
-  mean asserting a different mechanism I cannot verify, so the text stands and the doubt is
-  recorded here.
+  the number appears). W10 F7 / G3-4 / G3-5 said the mechanism was self-inconsistent and the figure
+  had no artefact in the tree. **Settled in task card G5 (`0f12340`)**: `G3-wake-timeout.md` was rewritten
+  to withdraw the self-inconsistent tick explanation, mark the ~7.8 ms figure as an unevidenced single
+  observation without in-tree run log or capture, extract and deterministically test `timeout_ms`
+  (`crates/rustamp-ipc/src/shm/wake.rs:145,507`), document honest bounds in test doc comments
+  (`crates/rustamp-ipc/src/shm/ring.rs:1837,1858,1892`), and commit a reproducible host probe
+  (`crates/rustamp-ipc/examples/wake_timeout_probe.rs`).
 - **P4 §4 framing** — `docs/tasks/P4-dll-loader.md:70-88` ("What the VM Run Must Show"). W10 F8
   says §4 reads as a safety barrier while the loader is an ABI loader, not a sandbox. This is a
   framing/security-posture judgment about a lane card, not a stale-by-the-batch sentence with a

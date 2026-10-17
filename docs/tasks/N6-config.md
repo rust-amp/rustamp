@@ -33,7 +33,7 @@ and ensure malformed config files fail loudly with clear diagnostics.
      - `ui.skin` (skin path loaded if present; updated on skin change; persisted on clean exit).
      - `ui.double_size` (applied to main and EQ windows at startup; persisted on clean exit).
      - `ui.always_on_top` (applied to window level; persisted on clean exit).
-     - `ui.easy_move` (persisted on clean exit and read for the menu check; **not** honoured in drag handling — the W10 review corrected this claim, finding F5: there is no `drag_window()` call site, only the menu check at `crates/rustamp-app/src/app.rs:520-521` / `crates/rustamp-app/src/menu.rs:68` and the toggle at `app.rs:1272`; it is still written to the config at `crates/rustamp-app/src/config.rs:287-288`).
+     - `ui.easy_move` (persisted on clean exit and read for the menu check; historically not honoured in drag handling per W10 finding F5, but **wired in task N8 (`24b33e4`)**: `App::easy_drag_main` at `crates/rustamp-app/src/app.rs:558-560`, `Windowed::try_easy_drag` at `crates/rustamp-app/src/window.rs:1283-1293` and pointer handling at `1460-1468`, pinned by `easy_move_decides_which_presses_drag_the_window`).
      - `ui.windows` (screen positions, visibility, and windowshade for Main, Equalizer, Playlist applied at startup and captured on clean exit).
      - `eq.state` (applied to audio engine and equalizer window at startup; updated on EQ changes; persisted on clean exit).
   3. Non-honoured settings:

@@ -73,9 +73,9 @@ not a feature list, so the positive claims below rest on the cards cited):
   (`docs/tasks/J4-skin-fallbacks.md`; `docs/tasks/W11-docs-sweep.md:C1-C9`).
 - **Configuration**: a real file, honoured-only content, loud abort on malformed
   input, saved on clean exit (`docs/tasks/N6-config.md` via
-  `docs/tasks/BETA-readiness-2.md:§1` BETA-12 row — N6 predates the build; the
-  known `easy_move` residue persists: claimed honoured at `config.rs:141`, read
-  only for the menu check, no drag path reads it).
+  `docs/tasks/BETA-readiness-2.md:§1` BETA-12 row — N6 predates the build; in the
+  bytes `easy_move` had no drag path, but in the tree it is now wired by N8
+  (`24b33e4`) at `app.rs:558-560` and `window.rs:1283-1293,1460-1468`).
 - **Open-file path**: the Eject key releases an open-media dialog that stages a
   typed, dropped or Backspace-corrected path and confirms with Enter
   (`docs/tasks/BETA-readiness-2.md:§1` BETA-03 row, tree at `fc3c8c7`; the dialog
@@ -139,6 +139,21 @@ still open and no user action can cross it today.
   block drag / `Alt+Up`/`Down`, delete/crop with the frozen core-`Playlist` rule
   for the current entry; pure functions plus the command-seam spec the window
   lane must call (`docs/tasks/S06i4-playlist-interactions.md:§1-3`).
+- **Load-playlist Enter (N7 `9e8c5d0`, verified N8 `24b33e4`).** Enter confirms through
+  `confirm_load_playlist` (`crates/rustamp-app/src/dialogs.rs:188-191,224-239`),
+  loads via `App::load_playlist_file` (`app.rs:1431-1491`, queue replaced, track 0
+  played, report recorded, skips noted), and closes the dialog; empty confirm keeps
+  the dialog open (`app.rs:2974`).
+- **Easy-move window dragging (N8, `24b33e4`).** Main-window background press drags the
+  window via `Windowed::try_easy_drag` (`crates/rustamp-app/src/window.rs:1283-1293,1460-1468`)
+  and `App::easy_drag_main` (`crates/rustamp-app/src/app.rs:558-560`); controls keep
+  their presses untouched. Pinned by `easy_move_decides_which_presses_drag_the_window`.
+- **Shipped host residents (X2, `3213cdb`).** `xtask/src/package.rs:32-38` now
+  packages `rustamp-dechost-symphonia.exe` and `rustamp-dsphost-stages.exe` beside
+  the player and 32-bit plugin host.
+- **Production plugin approval store (P7, `e8134cf`).** Verified-hash allowlist
+  implemented in `crates/rustamp-plughost/src/approval.rs` and enforced by
+  `loader.rs:676-678` before loading.
 
 **Only modelled (a seam is still open — no user action crosses it):**
 
@@ -148,16 +163,9 @@ still open and no user action can cross it today.
   `TrayIcon::attach` is never called — six chords registered, zero delivered, no
   icon (`docs/tasks/BETA-readiness-2.md:§2f`; `docs/tasks/F3-tray-hotkeys.md:163-182`
   lists the `window.rs` follow-up as the explicit remaining seam).
-- **Load-playlist Enter.** The dialog takes a typed/staged/dropped path and
-  consumes Enter into nothing (`crates/rustamp-app/src/dialogs.rs:29-53,124-141`;
-  `docs/tasks/BETA-readiness-2.md:§1` BETA-09 row).
-- **Residents not shipped.** `xtask/src/package.rs` at HEAD contains no
-  dechost/dsphost/resident packaging (verified by grep: no match); M12/M13/M15
-  each record packaging as later work with loud missing-helper degradation
-  (`M12:§5`, `M13:§5`, `M15:§5`). A beta user cannot reach the resident code.
-- **Classic plugin path.** No production approval store, no user-facing
-  select/configure wiring re-verified, no sandbox claim
-  (`P5-dll-preflight.md:88-112`; `docs/tasks/BETA-readiness-2.md:§4`).
+- **Classic plugin user wiring.** While the approval store exists (`approval.rs`),
+  user-facing plugin selection and configuration UI wiring is not present, and no
+  sandbox claim is made (`P5-dll-preflight.md:88-112`; `docs/tasks/BETA-readiness-2.md:§4`).
 - **Visualiser, shuffle/repeat, EQ presets, prefs/plugin pages, menu
   submenus + Exit, Clutter O/V.** Unchanged skeletons/placebos
   (`docs/tasks/BETA-readiness-2.md:§1` BETA-06/08/10 rows): spectrum is still
@@ -167,14 +175,11 @@ still open and no user action can cross it today.
 ## 4. What is honestly NOT in the beta (either bytes or tree)
 
 The tray icon and delivered hotkeys without their two `window.rs` seams (§3);
-a working Enter on the load-playlist dialog (§3); the visualiser (contracted
-zero, S08 unmeasured); shuffle and repeat as playback (§1 BETA-08 row — flags
-published, engine ignores); any ReplayGain settings surface (engine setters
-only, config key warned-unapplied); the two residents in any shippable or
-registered form (unpackaged, opt-in, default engine unchanged); the classic
-plugin path (loader without an approval store or user wiring); menu submenus,
-Exit-as-quit, Clutter O/V, EQ presets, prefs/plugin selection. The
-`artifact_imports_verified: false` manifest field and the missing clean-machine
+the visualiser (contracted zero, S08 unmeasured); shuffle and repeat as playback
+(§1 BETA-08 row — flags published, engine ignores); any ReplayGain settings surface
+(engine setters only, config key warned-unapplied); user-facing plugin selection/config
+UI wiring; menu submenus, Exit-as-quit, Clutter O/V, EQ presets, prefs/plugin pages.
+The `artifact_imports_verified: false` manifest field and the missing clean-machine
 launch also still hold (`docs/tasks/BETA-readiness-2.md:§4`).
 
 ## 5. Executed proof vs compile-only (as of HEAD `be08b17`)
@@ -242,9 +247,10 @@ shipped default has been the Rust theme since J2 (`docs/tasks/W11-docs-sweep.md:
   artefact bytes — the artefact was not rebuilt and was not diffed file-by-file
   here. §2 flags the weakest claim; the rest should be read as "in the product
   line", not "in these bytes", until someone checks them against `f1b87b8`.
-- Whether the `~7.8 ms` G3 figure, F11 double-print, or plugin user-facing
-  wiring hold (`docs/tasks/BETA-readiness-2.md:§5` — repeated here, not
-  re-investigated).
+- Whether plugin user-facing wiring holds (`docs/tasks/BETA-readiness-2.md:§5`).
+  (Note: the `~7.8 ms` G3 figure was marked by G5 as an unevidenced single observation
+  with its tick mechanism withdrawn in `docs/tasks/G3-wake-timeout.md:90-118`, and
+  F11's double-print was confirmed from code at `lib.rs:87` and `main.rs:93`).
 - Actual pixels of the Rust-theme default (no golden namespace),
   clean-machine launch/reputation prompts, device-loss timing, sound quality —
   all need the VM or hardware (`docs/tasks/BETA-readiness-2.md:§5`).

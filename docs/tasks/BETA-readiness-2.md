@@ -36,24 +36,24 @@ never been run anywhere**.
 | BETA-06 | Hit-testable but dead primary controls | **MOSTLY FIXED, residue named** | Fixed: Eject, Minimize, Shade, Close all release commands (`behaviour.rs:438-444`); ClutterA/D/I act (`behaviour.rs:449-457`); window-menu opens the popup (`behaviour.rs:461`). Still dead: **Clutter O/V emit nothing** (`behaviour.rs:429-430` documents it); **menu submenu parents open nothing** (`menu.rs:47-50,107-129`, `SubmenuDeferred` by design); **Exit closes only the popup, never the player** (`menu.rs:242-251`, asserted by test). |
 | BETA-07 | Playlist visibility/check marks don't control its OS window | **FIXED (by the N5 lane, confirmed by reading)** | `sync_playlist_window` creates/drops the OS window to follow `App::playlist_open` (`window.rs:1089-1101`); PL button, menu row, skinned and OS close all flip the one flag (`window.rs:1091-1092,1187-1191`). The follow-up W10 review of the playlist lane confirms BETA-07 needed no change. Not re-verified: the *initial* `playlist_open` default value. |
 | BETA-08 | Shuffle/Repeat lights advertise unimplemented playback | **STILL OPEN, unchanged** | Flags still app-owned only: toggle/publish (`app.rs:1255-1268`, `publish_modes`), engine still ignores them — decode advance is a plain index step to `EndOfStream` (`decode.rs:450-481`, no shuffle/repeat arm; no `SetShuffle` handling in `engine.rs:554-605` region per first review, structure unchanged). Still blocked on S15. Do not ship as working controls. |
-| BETA-09 | Playlist-file loading is a dead end | **HALF-FIXED, changed shape** | UI half landed (`35cefe1`): the Load Playlist dialog takes a typed, staged or dropped path and formats the skip report (`playlist_window.rs:443-479` tests; `dialogs.rs:239` field). **But `Enter` on the Load Playlist dialog is still consumed and does nothing** (`dialogs.rs:130-133`, "RFC 0010 leaves its confirmation open"), and no `read_playlist` call site exists in the app (`playlist_window.rs` grep: only the dialog-open assertion at `:437`). Library report APIs exist (E3); no wired reader. A user can name a playlist file and nothing happens. |
+| BETA-09 | Playlist-file loading is a dead end | **LARGELY FIXED** | Wired in N7 (`9e8c5d0`) and verified in N8 (`24b33e4`): `Enter` on the Load Playlist dialog confirms through `confirm_load_playlist` (`dialogs.rs:188-191,224-239`), loads via `App::load_playlist_file` (`app.rs:1431-1491`, queue replaced, track 0 played, report recorded, skips noted) and closes the dialog; empty confirm keeps dialog open (`app.rs:2974`). Residual: VM/user execution proof pending. |
 | BETA-10 | Vis/plugin/prefs are skeletons | **STILL OPEN, narrowed** | Vis: spectrum still hard-zero, pinned by test (`vistap.rs:13,173` — "S08 owns this"); renderer draws no live visualiser. Plugin: the **loader is real** now (P5, §2) with VM-only acceptance, but user-facing plugin selection/config wiring was **not re-verified** in this review (no claim made either way). Prefs: still name-only pages (`rustamp-prefs`, dialog draws selected name); EQ presets popup exists, does nothing. All must stay excluded/disabled, not sold as features. |
 | BETA-11 | Platform integration is DPI-only stub | **NARROWED, not closed** | Done: single instance + CLI forwarding (`408132f`; `main.rs:68-77,99-143`), tray **model** (7 entries → Commands, `tray.rs`), hotkey **model + registry + session** (defaults `Ctrl+Alt`, `hotkeys.rs`; session started `main.rs:73`). **Both `window.rs` follow-up seams are still open:** no `take_pending_hotkeys` drain exists anywhere in the app crate, and no `TrayIcon::attach` call exists in `window.rs` — hotkeys register globally but can never deliver a command; the tray icon never appears. Media keys/SMTC/taskbar/file-assoc/external-control window: still absent. |
-| BETA-12 | Config read-only; settings not consumed/saved | **FIXED** | `save()` exists (`config.rs:346-356`), runs on clean exit (`window.rs:238-243`); malformed input aborts loudly (`config.rs:214`, `lib.rs:87`); unhonoured keys warned + omitted (`config.rs:114-186,254-341`); W10 F1 self-corruption fixed through serde (`c32cf7b`; regression test with `WindowId::Gen(3)` at `config.rs:443-539`). **Known residue (W10 F5, persists):** `easy_move` is listed honoured (`config.rs:141`) and persisted (`config.rs:287-288`) but **no drag path reads it** — `window.rs` has no `drag_window`; `Moved` arms only record positions; `easy_move` is read only for the menu check (`app.rs:520-521`, `menu.rs:68`). Same softer pattern for `eq.state.auto` (carried, no auto-preset behaviour — S07-open). |
+| BETA-12 | Config read-only; settings not consumed/saved | **FIXED** | `save()` exists (`config.rs:346-356`), runs on clean exit (`window.rs:238-243`); malformed input aborts loudly (`config.rs:214`, `lib.rs:87`); unhonoured keys warned + omitted (`config.rs:114-186,254-341`); W10 F1 self-corruption fixed through serde (`c32cf7b`; regression test with `WindowId::Gen(3)` at `config.rs:443-539`) and closed as a class in N9 (`99b2cb3`). **Residue:** W10 F5 (`easy_move`) was wired in N8 (`24b33e4`: `app.rs:558-560`, `window.rs:1283-1293,1460-1468`). Residual softer pattern for `eq.state.auto` (carried, no auto-preset behaviour — S07-open). |
 
 ### W10-batch-review reconciliation (39 claims, 10 false — which are still open in code)
 
-- **F1 Gen-window self-corruption — CLOSED** (`c32cf7b`; writer uses the serde form the loader accepts; round-trip test pins `Gen(3)` at `config.rs:452-539`).
-- **F2 loader TOCTOU — CLOSED by P5** (snapshot design: `loader.rs:9-12,369-435`; source path never reaches `LoadLibraryExW`; `approved_image` allowlist at `loader.rs:386-390`; `ImageChanged`/`NotApproved` refusals with tests at `loader.rs:709-759`). Residuals per the card itself: no production approval store; approved bytes still execute `DllMain` (trust decision, documented `loader.rs:33`).
+- **F1 Gen-window self-corruption — CLOSED** (`c32cf7b`; writer uses the serde form the loader accepts; round-trip test pins `Gen(3)` at `config.rs:452-539`; closed as class in N9 `99b2cb3`).
+- **F2 loader TOCTOU — CLOSED by P5 & P7** (snapshot design: `loader.rs:9-12,369-435`; source path never reaches `LoadLibraryExW`; `approved_image` allowlist at `loader.rs:386-390`; `ImageChanged`/`NotApproved` refusals with tests at `loader.rs:709-759`; production approval store added in P7 `e8134cf` at `approval.rs`). Residual: approved bytes still execute `DllMain` (trust decision, documented `loader.rs:33`).
 - **F3 cpal flush gap — CLOSED honestly by A13**: cpal `flush` now refuses (`cpal_out.rs:381-382`, documented) instead of false `Ok`; every required flush goes through `Engine::flush_output` with fail-closed restart barrier (`docs/tasks/A13-flush-contract.md:37-56`). The old universal no-replay claim is superseded, not repeated.
 - **F4 flush-on-failed-seek — CLOSED by A13** (`Worker::apply_seek` sends `Seeked` only on decoder success; refusal sends internal `SeekFailed`, no state reset — `A13:86-106`).
-- **F5 `easy_move` advertised-but-unhonoured — STILL OPEN** (see BETA-12 row).
+- **F5 `easy_move` advertised-but-unhonoured — CLOSED by N8 (`24b33e4`)**: wired via `App::easy_drag_main` (`app.rs:558-560`), `Windowed::try_easy_drag` (`window.rs:1283-1293,1460-1468`), and pinned by `easy_move_decides_which_presses_drag_the_window`.
 - **F6 lookalike dimension test loss — CLOSED by J4** (`tests/lookalike.rs` rewritten for `BuiltinLookalikeSkin` + routing guard `builtin_default_skin_is_still_the_rust_theme`).
-- **F7 G3 wake measurement overclaim — STILL OPEN as a prose problem**: the `>= 1 ms` bound stands; the `~7.8 ms` figure has no in-tree artefact (`G3-wake-timeout.md:80` only). M17 replaced wall-clock waits with conditions where it mattered, but the card's mechanistic claim is unrepaired.
-- **F8 hostile-DLL-reaches-DllMain — CLOSED as a scope correction**: preflight moved before mapping (`pe_preflight.rs`, `loader.rs:405-471` flow), structural refusals precede `LoadLibraryExW`; post-mapping version/getter checks are honestly labelled post-execution ABI refusals (`P5:80-86`). Not-a-sandbox remains stated.
+- **F7 G3 wake measurement overclaim — CLOSED by G5 (`0f12340`)**: `G3-wake-timeout.md` was rewritten to narrow the claim to what the measurement supports and withdraw the tick-explanation mechanism (`G3-wake-timeout.md:90-118`). Deterministic `timeout_ms` contract test extracted and pinned (`wake.rs:145,507`); honest test bounds documented (`ring.rs:1837,1858,1892`); reproducible host probe committed (`examples/wake_timeout_probe.rs`); ~7.8 ms figure explicitly marked as an unevidenced single observation without in-tree capture.
+- **F8 hostile-DLL-reaches-DllMain — CLOSED as a scope correction**: preflight moved before mapping (`pe_preflight.rs`, `loader.rs:405-471` flow), structural refusals precede `LoadLibraryExW`; post-mapping version/getter checks are honestly labelled post-execution ABI refusals (`P5:80-86`). Approval store added in P7 (`e8134cf`). Not-a-sandbox remains stated.
 - **F9 cursor fallback gap — CLOSED by J4** (`resolve_cursor_fallbacks`, `skin.rs:468`; 13 absent-on-both-sides names stay `None` by rule; 4 new tests).
-- **F10 stale docs — 2 of 3 CLOSED by J4** (generator README rewritten; lookalike test retargeted). **Third bullet persists:** `app/src/skin.rs:6` still describes the built-in default as the look-alike skin.
-- **F11 double-printed malformed-config error — NOT RE-VERIFIED, likely persists:** both print sites still exist (`app/src/lib.rs:87` prints, then `main.rs:93` prints the returned `Err`). Needs a 5-minute check, not a claim.
+- **F10 stale docs — 2 of 3 CLOSED by J4 / W11** (generator README rewritten; lookalike test retargeted). **Third bullet persists:** `app/src/skin.rs:6` still describes the built-in default as the look-alike skin.
+- **F11 double-printed malformed-config error — VERIFIED PERSISTS**: both print sites exist and fire (`app/src/lib.rs:87` prints, then `main.rs:93` prints the returned `Err`). Verified by reading.
 - **F12 buffered-flush test pins the call, not the consequence — MOOT/UNCHANGED:** the test still asserts the call; A13 added the consequence-pinning doubles (`flush_contract.rs`, unexecuted — §2).
 
 ---
@@ -93,9 +93,9 @@ no VM-suite record since the merge names them passing — the suite counts in
 HANDOFF stop before this merge. Additionally still missing by the card's own
 list: two-process real-binary runs (bit-identity vs in-process, mid-stream
 kill, missing-helper degradation), engine-side **DSP/stage adapter**
-(nothing — M14 F1 hole flows through), latency compensation, and `xtask`
-packaging of the helpers. Status: **strong evidence on paper, zero execution
-evidence.**
+(added in M19 `resident.rs` via `HostDspChain`, `3213cdb` packages both helpers),
+latency compensation, and `xtask` packaging of the helpers. Status: **strong
+evidence on paper, zero execution evidence.**
 
 ### 2c. The loader (P5, `8a91563`) — what it proves and what it does not
 
@@ -106,10 +106,10 @@ source refusals have headless tests; the VM-only `in_openmpt` acceptance now
 checks the mapped bytes equal the snapshot and the path differs. **Proven by
 reading; executed nowhere** (compile-only lane; VM acceptance pending,
 including the new headless mapping test's i686 build). What it is not: a
-sandbox, a malware detector, an approval store (the project still needs one),
-or protection against same-principal injection / kernel / namespace attacks —
-all stated in the card. Production rule stays: nothing executes without an
-independently approved `approved_image`.
+sandbox, a malware detector, an approval store (implemented in P7 `e8134cf` at
+`crates/rustamp-plughost/src/approval.rs`), or protection against same-principal
+injection / kernel / namespace attacks — all stated in the card. Production
+rule stays: nothing executes without an independently approved `approved_image`.
 
 ### 2d. The flush contract (A13, `e2a8f3b` + `b40ef8d`)
 
@@ -165,10 +165,10 @@ the On/`use_eq` link itself stays unmeasured.
 
 `lookalike` namespace committed (`tests/golden/lookalike/*.png`,
 `ui/tests/golden_lookalike.rs`); `classic-base` cases skip without
-`RUSTAMP_TESTSKINS`. **The actual shipped default — the Rust theme — has no
-golden namespace:** `ui/tests/` contains only `golden_lookalike.rs`, and the
-second-set lane (`LANE-QUEUE.md:20`) was still queued at handoff. First-run
-pixels of the default skin are therefore unpinned.
+`RUSTAMP_TESTSKINS`. **The actual shipped default — the Rust theme — now has its
+golden namespace:** `ui/tests/golden_rust_theme.rs` was committed in `93a16f9`
+and blessed in `9600c95` (Wave 54). First-run pixels of the default skin are now
+pinned.
 
 ### 2j. Visualiser
 
@@ -201,10 +201,9 @@ designed nowhere and run nowhere.
    `TrayIcon` once the main `HWND` exists — or stop starting `HotkeySession`
    (`main.rs:73`). Shipping global chords that can never fire is a live
    side-effect with no function.
-3. **Make Load-Playlist Enter do something or disable it.** The dialog accepts
-   a path and consumes Enter into nothing (`dialogs.rs:130-133`). Wire the E3
-   report APIs into a real load-with-skip-report, or close the dialog path
-   until then — same placebo class as BETA-08.
+3. **Load-Playlist Enter.** (Wired in N7 `9e8c5d0` and verified in N8 `24b33e4`:
+   confirms via `confirm_load_playlist` at `dialogs.rs:188-191,224-239`, loads via
+   `load_playlist_file` at `app.rs:1431-1491`; requires VM execution proof).
 4. **Execute the unexecuted suites in the VM.** `resident.rs` (M15),
    `flush_contract.rs` + cpal refusal (A13), `dsp_control.rs`/M17 transfer
    updates, P5 headless mapping (i686) + `in_openmpt` acceptance, plus the
@@ -213,9 +212,9 @@ designed nowhere and run nowhere.
 5. **Stop advertising what does not work.** Shuffle/Repeat (BETA-08),
    Clutter O/V, menu submenus + Exit, EQ presets, vis/prefs pages, plugin
    selection: hide, disable, or label as unmeasured. Fold in the small
-   honesties: `easy_move` (omit or honour — `config.rs:141` claims it),
-   the stale `app/src/skin.rs:6` line, and the probable F11 double print
-   (`lib.rs:87` + `main.rs:93`).
+   honesties: `easy_move` is wired (N8 `24b33e4`), while the stale
+   `app/src/skin.rs:6` line and F11 double print (`lib.rs:87` + `main.rs:93`)
+   persist.
 
 ---
 
@@ -224,7 +223,7 @@ designed nowhere and run nowhere.
 - A package whose runtime contract is unproven on a clean machine
   (`artifact_imports_verified:false`; no packaged run — §2k).
 - Global hotkeys that register but cannot deliver (§2f).
-- A Load-Playlist dialog that takes a path and does nothing (§1 BETA-09).
+- A Load-Playlist dialog that takes a path and does nothing (wired in N7/N8, VM proof pending — §1 BETA-09).
 - Placebo controls presented as working: Shuffle/Repeat, O/V menus, menu
   Exit/submenus, EQ presets, vis/plugin/prefs selection (§1 BETA-06/08/10).
 - Any reintroduction of: phantom Playing over silence (keep
@@ -235,7 +234,8 @@ designed nowhere and run nowhere.
 - Unapproved-DLL execution anywhere in a user path (no auto-approval; P5
   trust rule).
 - Claims of VM/hardware proof that never ran (packaged launch, resident
-  two-process runs, device-loss timing, the G3 `~7.8 ms` figure as fact).
+  two-process runs, device-loss timing, the G3 `~7.8 ms` figure as fact — G5 has
+  now marked the G3 figure unevidenced).
 - Truncated files presented as verified integrity: keep M17's honest
   short-EOS contract + its documented limit.
 
