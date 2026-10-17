@@ -1,5 +1,24 @@
 # A4: Ring Drain & Honest Backlog (Finding F2 Fix)
 
+> **Orchestrator note (2026-10-17, after verification).** The fix is merged
+> (`4c699e4`) and the suite is green. One test the lane added was removed here:
+> `underrun_does_not_finish_run_early` pumped 3500 device frames at a
+> 3000-frame track and then asserted that real audio was still in the ring. That
+> is wrong — the render callback drains whatever the ring holds on every
+> callback, so after 3500 pumped frames the whole track had been consumed and
+> `buffered_frames() == 0` was **correct**, not a hidden backlog. The case it
+> wanted to pin (a decode thread slower than the device, so the device clock
+> passes the end of stream while frames are still queued) cannot be built
+> deterministically in the null harness, because nothing there makes the decode
+> thread slow. What pins the hole instead: the ring-level unit tests
+> (`consumed_counts_ring_frames_not_silence`,
+> `consumed_resets_to_written_after_epoch_drain`, `consumed_resets_for_second_run`),
+> the engine tests `normal_run_finishes_when_ring_is_drained`,
+> `seek_while_paused_drains_consistently` and
+> `second_run_resets_consumed_and_drains_correctly`, and the real-device
+> VM-only tests (`--ignored:loopback`, `--ignored:real_playback`), which are the
+> only ones where a real device can genuinely underrun.
+
 ## 1. The Hole (Finding F2)
 
 In the audio engine lifecycle, the output backend's render callback advances the device clock (`played_frames`) by the total requested callback buffer length, even for frames filled with silence during an underrun (e.g., when the decode thread is stalled, pre-empted or slow).
