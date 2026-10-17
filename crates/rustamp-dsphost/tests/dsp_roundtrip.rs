@@ -480,12 +480,12 @@ fn abrupt_player_loss_stops_the_host_without_hanging() {
     }
     let mut producer = offer.producer;
     producer
-        .write_from_blocking(&sweep(0), Some(Duration::from_secs(5)))
+        .write_from_blocking(&sweep(0), Some(STALL_WAIT))
         .unwrap();
     let mut one = [0.0; 2];
     back_input
         .consumer
-        .read_into_blocking(&mut one, Some(Duration::from_secs(5)))
+        .read_into_blocking(&mut one, Some(STALL_WAIT))
         .unwrap();
     // Vanish: drop the transport without Shutdown, then the rings.
     drop(player);
@@ -515,10 +515,14 @@ fn abrupt_host_loss_is_loud_and_never_eos() {
                 Message::Hello { .. } => {}
                 Message::Ping(token) => transport.send(&Message::Pong(token)).unwrap(),
                 Message::DspConfigure { spec, .. } => {
+                    // Buffer the back-ring offer: the production order is
+                    // in-ring Ready first, then the back-ring offer (see
+                    // `serve_dsp` and `DspSession::handshake`). Sending the
+                    // back offer here would put it ahead of the in-ring
+                    // Ready and fail the handshake.
                     let offer = NamedPcmRings
                         .create_directed(spec, 1, RingDirection::HostToMain)
                         .unwrap();
-                    transport.send(&offer.message).unwrap();
                     back = Some(offer);
                 }
                 Message::RingOffer { generation, .. } => {
@@ -528,12 +532,15 @@ fn abrupt_host_loss_is_loud_and_never_eos() {
                             generation,
                         })
                         .unwrap();
+                    // In-ring is live: now offer the back-ring.
+                    let offer = back.as_ref().expect("back-ring before configure");
+                    transport.send(&offer.message).unwrap();
                 }
                 Message::RingReady { .. } => {
                     let mut offer = back.take().unwrap();
                     offer
                         .producer
-                        .write_from_blocking(&[0.5, -0.5], Some(Duration::from_secs(5)))
+                        .write_from_blocking(&[0.5, -0.5], Some(STALL_WAIT))
                         .unwrap();
                     transport
                         .send(&Message::DspReady { latency_frames: 0 })
