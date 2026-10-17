@@ -949,11 +949,21 @@ mod tests {
         assert_eq!(bits(&out[LA..]), bits(&quiet[..quiet.len() - LA]));
 
         let mut limiter = stage(true, 1);
-        let hot = vec![3.0_f32; 8 * LA];
+        let frames = FS as usize;
+        let hot = vec![3.0_f32; frames];
         let mut out = hot.clone();
         limiter.process(&mut out);
         assert!(out[..LA].iter().all(|s| *s == 0.0));
-        let settled = &out[4 * LA..];
+        // Under the true-peak criterion, the 0-to-3.0 DC start transient
+        // exhibits Gibbs-like overshoot through the windowed-sinc reconstruction
+        // filter (to ≈ 3.368, +12 %), driving gain down to ≈ 0.287. Once the
+        // step edge clears the detector history, the DC-normalized kernel
+        // reproduces DC at unity (gain target ceiling / 3.0 ≈ 0.322) and the
+        // envelope releases toward it with the 50 ms time constant
+        // (`RELEASE_SECONDS = 0.050`, or 2400 frames at 48 kHz). In the second
+        // half (500 ms = 10 release time constants), the start transient has
+        // fully settled and output DC sits at the ceiling.
+        let settled = &out[frames / 2..];
         let peak = settled.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         assert!(peak <= ceiling, "overshoot: {peak} > {ceiling}");
         assert!(
