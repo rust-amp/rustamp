@@ -32,6 +32,7 @@
 pub mod bmp;
 pub mod error;
 pub mod ini;
+pub mod lookalike;
 pub mod pledit;
 pub mod raster;
 pub mod region;

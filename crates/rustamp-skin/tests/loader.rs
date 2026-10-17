@@ -5,7 +5,7 @@ mod support;
 
 use rustamp_gfx::Image;
 use rustamp_skin::{
-    BuiltinDefaultSkin, MemorySource, PlaylistStyle, Sheet, Skin, Substitute, webamp,
+    BuiltinDefaultSkin, MemorySource, PlaylistStyle, Sheet, Skin, SkinFallback, Substitute, webamp,
 };
 use support::*;
 
@@ -141,7 +141,12 @@ fn archive_path_escapes_are_not_readable() {
 
     let skin = Skin::load(&zip).unwrap();
     // Both escaping entries are ignored, so the default skin fills in.
+    let default_main = BuiltinDefaultSkin.sheet_image(Sheet::Main).unwrap();
     assert_eq!(
+        skin.sheet(Sheet::Main).unwrap().pixel(0, 0),
+        default_main.pixel(0, 0)
+    );
+    assert_ne!(
         skin.sheet(Sheet::Main).unwrap().pixel(0, 0),
         Some(rustamp_skin::PLACEHOLDER_RGBA)
     );
@@ -207,7 +212,9 @@ fn missing_main_sheet_uses_default_skin() {
     let main = skin
         .sheet(Sheet::Main)
         .expect("default skin must supply main.bmp");
-    assert_eq!(main.pixel(0, 0), Some(rustamp_skin::PLACEHOLDER_RGBA));
+    let default_main = BuiltinDefaultSkin.sheet_image(Sheet::Main).unwrap();
+    assert_eq!(main.pixel(0, 0), default_main.pixel(0, 0));
+    assert_ne!(main.pixel(0, 0), Some(rustamp_skin::PLACEHOLDER_RGBA));
     assert!(skin.has_main_window_sprites());
     assert!(
         skin.substitutions()
@@ -329,7 +336,12 @@ fn corrupt_inputs_never_panic() {
     let path = dir.path().join("corrupt_entries.wsz");
     std::fs::write(&path, zip_bytes(&entries)).unwrap();
     let skin = Skin::load(&path).expect("a corrupt entry must fall back, not fail");
+    let default_main = BuiltinDefaultSkin.sheet_image(Sheet::Main).unwrap();
     assert_eq!(
+        skin.sheet(Sheet::Main).unwrap().pixel(0, 0),
+        default_main.pixel(0, 0)
+    );
+    assert_ne!(
         skin.sheet(Sheet::Main).unwrap().pixel(0, 0),
         Some(rustamp_skin::PLACEHOLDER_RGBA)
     );

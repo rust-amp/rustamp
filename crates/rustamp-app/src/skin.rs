@@ -3,9 +3,8 @@
 //!
 //! The app resolves the skin in this order: `--skin <path>`, then the config's
 //! `ui.skin`, then the built-in default skin. The built-in skin is the
-//! repo-owned look-alike placeholder (`rustamp_skin::BuiltinDefaultSkin`, the
-//! `lookalike` namespace of the golden tests); the real look-alike art is the
-//! art lane's job (HANDOFF §6, lane J), so the placeholder is what ships today.
+//! repo-owned look-alike default skin (`rustamp_skin::BuiltinDefaultSkin`,
+//! task card J1).
 //!
 //! A path that cannot be loaded is **not** fatal: the app falls back to the
 //! built-in skin and carries the reason as a warning, so a bad `--skin` never

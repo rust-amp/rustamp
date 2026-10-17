@@ -73,11 +73,11 @@ impl fmt::Display for Substitution {
     }
 }
 
-/// The colour of the generated placeholder art in [`BuiltinDefaultSkin`].
+/// The legacy colour of the placeholder art.
 ///
-/// It is deliberately obvious so that a missing sheet is never mistaken for
-/// real artwork. The real look-alike default skin ships with its own crate.
-pub const PLACEHOLDER_RGBA: [u8; 4] = [0xFF, 0x00, 0xFF, 0xFF]; // provisional: placeholder art, pending the look-alike skin
+/// Preserved as a constant for backwards compatibility; the built-in default
+/// skin now ships newly-drawn lookalike art for all sheets.
+pub const PLACEHOLDER_RGBA: [u8; 4] = [0xFF, 0x00, 0xFF, 0xFF];
 
 /// A source of fallback sprite sheets, used when a skin is missing a file.
 pub trait SkinFallback {
@@ -86,21 +86,24 @@ pub trait SkinFallback {
     fn sheet_image(&self, sheet: Sheet) -> Option<RasterImage>;
 }
 
-/// The built-in stand-in skin.
+/// The built-in default skin.
 ///
-/// This is **not** the shipped default skin (that is the look-alike skin from
-/// the art lane); it generates flat placeholder rectangles at the sizes implied
-/// by the sprite table so the loader always has something to hand the UI.
+/// Supplies newly-drawn clean-room lookalike skin sheets for all classic
+/// sheets, used when running with the default skin or falling back on missing
+/// files.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BuiltinDefaultSkin;
 
 impl SkinFallback for BuiltinDefaultSkin {
     fn sheet_image(&self, sheet: Sheet) -> Option<RasterImage> {
+        if let Some(image) = crate::lookalike::sheet_image(sheet) {
+            return Some(image);
+        }
         let (width, height) = webamp::sheet_extent(sheet);
         if width == 0 || height == 0 {
             return None;
         }
-        Some(RasterImage::filled(width, height, PLACEHOLDER_RGBA))
+        Some(RasterImage::filled(width, height, [0x28, 0x2A, 0x30, 0xFF]))
     }
 }
 
