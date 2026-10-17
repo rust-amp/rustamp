@@ -1,0 +1,19 @@
+[package]
+name = "rustamp-dechost"
+description = "Rustamp: first real decoder resident behind the media host (symphonia through the decoder registry, RFC 0006)"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core = { workspace = true }
+rustamp-decoders = { workspace = true }
+rustamp-mediahost = { workspace = true }
+rustamp-proto = { workspace = true }
+
+[[bin]]
+name = "rustamp-dechost-symphonia"
+path = "src/main.rs"

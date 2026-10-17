@@ -1688,6 +1688,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustamp-dechost"
+version = "0.0.1"
+dependencies = [
+ "rustamp-core",
+ "rustamp-decoders",
+ "rustamp-mediahost",
+ "rustamp-proto",
+]
+
+[[package]]
 name = "rustamp-decoders"
 version = "0.0.1"
 dependencies = [
