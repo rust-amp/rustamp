@@ -41,9 +41,9 @@ use rustamp_core::error::Result;
 use rustamp_core::playlist::EntryId;
 use rustamp_gfx::Image;
 use rustamp_ui::{
-    DockedStack, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog, PlaylistTitleButton,
-    hit_test_button, hit_test_list_row, hit_test_scroll, hit_test_title_bar, in_list_area,
-    render_playlist_window,
+    DockedStack, Key, Modifiers, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog,
+    PlaylistTitleButton, ShortcutOutcome, hit_test_button, hit_test_list_row, hit_test_scroll,
+    hit_test_title_bar, in_list_area, render_playlist_window,
 };
 
 use crate::app::App;
@@ -141,6 +141,40 @@ impl App {
             return Ok(commands);
         }
         Ok(Vec::new())
+    }
+
+    /// A key press while the playlist editor is focused (S03 §2).
+    ///
+    /// The playlist table is consulted first for the three keys it binds to
+    /// playlist actions with a menu-confirmed command: Delete (`1034`, remove
+    /// the selected items, S06 §5), Ctrl+A (`40205`, select all) and Ctrl+I
+    /// (`40171`, invert the selection). Every other key takes the shared
+    /// shortcut path ([`App::key_down`]): S03 leaves how the tables combine
+    /// provisional, and its arrow, Home, End and page rows are provisional
+    /// with no measured effect, so they are not claimed here.
+    pub fn playlist_key_down(
+        &mut self,
+        key: Key,
+        modifiers: Modifiers,
+    ) -> Result<Option<ShortcutOutcome>> {
+        self.sync_playlist_entries();
+        let command = if key == Key::Delete && modifiers == Modifiers::NONE {
+            self.playlist.press_rem()
+        } else if key == Key::Letter(b'A') && modifiers == Modifiers::CTRL {
+            Some(self.playlist.select_all())
+        } else if key == Key::Letter(b'I') && modifiers == Modifiers::CTRL {
+            Some(self.playlist.invert_selection())
+        } else {
+            return self.key_down(key, modifiers);
+        };
+        match command {
+            Some(command) => {
+                self.submit(command.clone())?;
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            // S06 §5.3: Delete with nothing selected changes nothing.
+            None => Ok(Some(ShortcutOutcome::Handled)),
+        }
     }
 
     /// Renders one frame of the playlist window.
@@ -382,8 +416,6 @@ mod tests {
         // The full playlist path: ADD opens the files face, a staged pick
         // confirms through `AddItems`, the dialog closes and the model grows.
         // `play: false` rides through untouched (RFC 0005 O5 stays open).
-        use rustamp_ui::Key;
-
         let mut app = test_app();
         add_entries(&mut app, 3);
         app.playlist_mouse_down(24, 92).expect("ADD applies");
@@ -502,6 +534,71 @@ mod tests {
                 .any(|pixel| pixel[3] != 0),
             "the frame is empty"
         );
+    }
+
+    #[test]
+    fn delete_removes_the_selected_entry_in_the_playlist_window() {
+        // S03 §2: Delete (`1034`, menu) removes the selected items (S06 §5).
+        let mut app = test_app();
+        add_entries(&mut app, 6);
+        app.playlist_mouse_down(60, 28).expect("stage a selection");
+        let outcome = app
+            .playlist_key_down(Key::Delete, Modifiers::NONE)
+            .expect("Delete applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::Remove(vec![
+                EntryId(0)
+            ])]))
+        );
+        assert_eq!(app.playlist().len(), 5);
+        assert_eq!(app.engine().queue().len(), 5);
+        assert_eq!(app.entry_ids.len(), 5);
+    }
+
+    #[test]
+    fn delete_without_a_selection_is_handled_and_changes_nothing() {
+        // S06 §5.3: nothing staged, nothing removed.
+        let mut app = test_app();
+        add_entries(&mut app, 3);
+        let outcome = app
+            .playlist_key_down(Key::Delete, Modifiers::NONE)
+            .expect("Delete applies");
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert_eq!(app.playlist().len(), 3);
+    }
+
+    #[test]
+    fn ctrl_a_selects_all_and_ctrl_i_inverts_in_the_playlist_window() {
+        // S03 §2: Ctrl+A (`40205`) and Ctrl+I (`40171`), both menu-confirmed.
+        let mut app = test_app();
+        add_entries(&mut app, 4);
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'A'), Modifiers::CTRL)
+            .expect("Ctrl+A applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::Select(
+                SelectOp::All
+            )]))
+        );
+        assert_eq!(app.playlist().selected_ids().len(), 4);
+        app.playlist_key_down(Key::Letter(b'I'), Modifiers::CTRL)
+            .expect("Ctrl+I applies");
+        assert!(app.playlist().selected_ids().is_empty());
+    }
+
+    #[test]
+    fn other_playlist_keys_take_the_shared_path_and_leave_the_list_alone() {
+        // S03 §2: Up is a provisional playlist row with no measured effect, so
+        // it reaches the shared shortcut path and does not move the selection.
+        let mut app = test_app();
+        add_entries(&mut app, 6);
+        app.playlist_mouse_down(60, 28).expect("stage a selection");
+        app.playlist_key_down(Key::Up, Modifiers::NONE)
+            .expect("Up applies");
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+        assert_eq!(app.playlist().len(), 6);
     }
 
     /// Opening the playlist window needs an OS window, so this never runs in

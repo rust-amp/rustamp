@@ -301,6 +301,22 @@ impl PlaylistWindow {
         Command::Select(SelectOp::Set(visible))
     }
 
+    /// Ctrl+A selects every entry in the list (S03 §2, `40205` "Select all",
+    /// menu-confirmed). The spec states the binding, not a measured effect, so
+    /// this selects the whole list rather than the visible page that SEL
+    /// selects (S06 §2).
+    pub fn select_all(&mut self) -> Command {
+        self.apply_select(&SelectOp::All);
+        Command::Select(SelectOp::All)
+    }
+
+    /// Ctrl+I inverts the selection (S03 §2, `40171` "Invert selection",
+    /// menu-confirmed; effect not measured).
+    pub fn invert_selection(&mut self) -> Command {
+        self.apply_select(&SelectOp::Invert);
+        Command::Select(SelectOp::Invert)
+    }
+
     /// REM removes the selected entries (S06 §5, settled on both the real and
     /// the posted path: 3475 px, same bounds (12,23)-(254,93)).
     ///
@@ -342,7 +358,7 @@ impl PlaylistWindow {
     /// settled as a pixel symmetry: 1501 px each way, returning on the
     /// reverse arrow). Clamped at both ends of the list.
     pub fn scroll_page(&mut self, direction: ScrollDirection) {
-        let max_first = self.entries.len().saturating_sub(1);
+        let max_first = self.max_first_visible();
         match direction {
             ScrollDirection::Up => {
                 self.first_visible = self.first_visible.saturating_sub(PAGE_STEP_ROWS);
@@ -355,11 +371,21 @@ impl PlaylistWindow {
 
     /// Scrolls so `index` is the first visible entry, clamped into the list.
     pub fn scroll_to(&mut self, index: usize) {
-        self.first_visible = index.min(self.entries.len().saturating_sub(1));
+        self.first_visible = index.min(self.max_first_visible());
+    }
+
+    /// The largest scroll offset: the bottom page shows the last
+    /// [`VISIBLE_ROWS`] entries. S01 §4.2 measured the bottom view of the
+    /// 60-entry list as rows 57-60 with the handle at its lowest point, so
+    /// the offset range is `len - 4`, the same range
+    /// [`scroll_handle_y`](crate::scroll_handle_y) assumes. A list that fits
+    /// one page has offset 0.
+    pub fn max_first_visible(&self) -> usize {
+        self.entries.len().saturating_sub(VISIBLE_ROWS)
     }
 
     fn clamp_scroll(&mut self) {
-        self.first_visible = self.first_visible.min(self.entries.len().saturating_sub(1));
+        self.first_visible = self.first_visible.min(self.max_first_visible());
     }
 }
 
@@ -434,10 +460,12 @@ mod tests {
         assert_eq!(command, Some(Command::Remove(vec![EntryId(56)])));
         assert_eq!(window.len(), 59);
         assert!(window.selected_ids().is_empty());
-        // The list renumbers: rows 57-60 become the entries at 56-58 (S06 §5.4).
+        // The list renumbers (S06 §5.4). The bottom page of 59 entries starts
+        // at offset 55, so the view shows entries 55 and 57-59.
+        assert_eq!(window.first_visible(), 55);
         assert_eq!(
             window.visible_ids(),
-            vec![EntryId(57), EntryId(58), EntryId(59)]
+            vec![EntryId(55), EntryId(57), EntryId(58), EntryId(59)]
         );
     }
 
@@ -498,14 +526,73 @@ mod tests {
 
     #[test]
     fn scrolling_clamps_at_both_ends() {
+        // The bottom page is the last four entries (S01 §4.2: rows 57-60 of
+        // the 60-entry list), so the offset stops at len - 4, never one row.
         let mut window = window_with(6);
         window.scroll_page(ScrollDirection::Up);
         assert_eq!(window.first_visible(), 0);
         for _ in 0..10 {
             window.scroll_page(ScrollDirection::Down);
         }
-        assert_eq!(window.first_visible(), 5);
-        assert_eq!(window.visible_ids(), vec![EntryId(5)]);
+        assert_eq!(window.first_visible(), 2);
+        assert_eq!(
+            window.visible_ids(),
+            vec![EntryId(2), EntryId(3), EntryId(4), EntryId(5)]
+        );
+    }
+
+    #[test]
+    fn a_list_that_fits_one_page_never_scrolls() {
+        let mut window = window_with(3);
+        window.scroll_page(ScrollDirection::Down);
+        assert_eq!(window.first_visible(), 0);
+        assert_eq!(window.visible_ids().len(), 3);
+    }
+
+    #[test]
+    fn the_scroll_range_follows_adds_removals_and_a_clear() {
+        // S06 §3 scope: the view stays inside the list when entries change.
+        let mut window = window_with(60);
+        window.scroll_to(56);
+        // Shrinking to 58 entries pulls the bottom page up to offset 54.
+        window.set_entries(ids(58));
+        assert_eq!(window.first_visible(), 54);
+        assert_eq!(window.visible_ids().len(), VISIBLE_ROWS);
+        // Growing again does not move the view by itself.
+        window.set_entries(ids(60));
+        assert_eq!(window.first_visible(), 54);
+        // A clear resets the view to the top.
+        window.set_entries(Vec::new());
+        assert_eq!(window.first_visible(), 0);
+        assert!(window.visible_ids().is_empty());
+    }
+
+    #[test]
+    fn the_bottom_page_matches_the_handle_at_its_lowest_point() {
+        // S01 §4.2: handle y = 60 at the bottom of a 60-entry list (rows 57-60).
+        let mut window = window_with(60);
+        for _ in 0..30 {
+            window.scroll_page(ScrollDirection::Down);
+        }
+        assert_eq!(window.first_visible(), 56);
+        assert_eq!(
+            crate::playlist_window::scroll_handle_y(window.first_visible(), window.len()),
+            60
+        );
+    }
+
+    #[test]
+    fn ctrl_a_selects_every_entry_and_ctrl_i_inverts_the_selection() {
+        // S03 §2: Ctrl+A (`40205`) and Ctrl+I (`40171`) are menu-confirmed rows.
+        let mut window = window_with(6);
+        assert_eq!(window.select_all(), Command::Select(SelectOp::All));
+        assert_eq!(window.selected_ids(), ids(6));
+        window.apply_select(&SelectOp::Set(vec![EntryId(1), EntryId(3)]));
+        assert_eq!(window.invert_selection(), Command::Select(SelectOp::Invert));
+        assert_eq!(
+            window.selected_ids(),
+            vec![EntryId(0), EntryId(2), EntryId(4), EntryId(5)]
+        );
     }
 
     #[test]
@@ -590,7 +677,8 @@ mod tests {
         );
         assert_eq!(window.selected_ids(), vec![EntryId(56)]);
         assert_eq!(window.len(), 57);
-        assert_eq!(window.first_visible(), 56);
+        // The bottom page of 57 entries starts at offset 53.
+        assert_eq!(window.first_visible(), 53);
     }
 
     #[test]

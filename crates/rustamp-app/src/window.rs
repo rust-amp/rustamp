@@ -507,6 +507,39 @@ impl Windowed {
         self.request_redraw();
     }
 
+    /// A key press while the playlist window is focused (S03 §2: the playlist
+    /// table is checked before the global one). `App::playlist_key_down` owns
+    /// the table's own keys (Delete, Ctrl+A, Ctrl+I) and falls through to the
+    /// shared path for everything else, so nothing regresses.
+    fn playlist_key_event(&mut self, event: &KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let Some(key) = map_key(event) else {
+            return;
+        };
+        let modifiers = map_modifiers(self.modifiers);
+        match self.app.playlist_key_down(key, modifiers) {
+            Ok(Some(ShortcutOutcome::Commands(commands))) => {
+                println!("rustamp: playlist shortcut {key:?} -> {commands:?}");
+            }
+            Ok(Some(ShortcutOutcome::Handled)) => {
+                println!("rustamp: playlist shortcut {key:?} handled locally");
+            }
+            Ok(Some(ShortcutOutcome::Unhandled(action))) => {
+                println!(
+                    "rustamp: playlist shortcut {key:?} -> {action:?} (command id {}, no Command yet)",
+                    action.command_id()
+                );
+            }
+            Ok(None) => return,
+            Err(error) => eprintln!("rustamp: playlist shortcut dispatch failed: {error}"),
+        }
+        self.sync_window_state();
+        self.request_redraw();
+        self.request_playlist_redraw();
+    }
+
     /// A key press while the equalizer window is focused (S03 §3 via S07 §1).
     fn eq_key_event(&mut self, event: &KeyEvent) {
         if event.state != ElementState::Pressed {
@@ -1066,7 +1099,7 @@ impl Windowed {
                 // main focus flag (see `App::render_playlist`).
                 self.request_playlist_redraw();
             }
-            WindowEvent::KeyboardInput { event, .. } => self.key_event(&event),
+            WindowEvent::KeyboardInput { event, .. } => self.playlist_key_event(&event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 // No double-size scale: the playlist ignores it (S05 §2.1).
