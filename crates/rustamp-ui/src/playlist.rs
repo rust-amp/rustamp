@@ -18,7 +18,6 @@ use std::collections::BTreeSet;
 use rustamp_core::command::{Command, OpenMediaKind, SelectOp};
 use rustamp_core::playlist::EntryId;
 
-use crate::playlist_window::{LIST_TOP, ROW_PITCH, in_list_area};
 use crate::shortcuts::{Key, Modifiers};
 
 /// How many list rows are visible at once (S06 §3).
@@ -277,15 +276,15 @@ impl PlaylistWindow {
         self.entries = entries;
         let live: BTreeSet<EntryId> = self.entries.iter().copied().collect();
         self.selected.retain(|id| live.contains(id));
-        if let Some(anchor) = self.shift_anchor {
-            if !live.contains(&anchor) {
-                self.shift_anchor = None;
-            }
+        if let Some(anchor) = self.shift_anchor
+            && !live.contains(&anchor)
+        {
+            self.shift_anchor = None;
         }
-        if let Some(cur) = self.current {
-            if !live.contains(&cur) {
-                self.current = None;
-            }
+        if let Some(cur) = self.current
+            && !live.contains(&cur)
+        {
+            self.current = None;
         }
         self.clamp_scroll();
     }
