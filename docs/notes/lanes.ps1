@@ -33,8 +33,19 @@ Write-Host ''
 
 $rows = @()
 foreach ($dir in Get-ChildItem -Path $Worktrees -Directory | Sort-Object Name) {
+    # Not every directory under the worktree root is still a worktree: one was
+    # left behind without a repository. Report it as such instead of failing.
+    if (-not (Test-Path (Join-Path $dir.FullName '.git'))) {
+        $rows += [pscustomobject]@{ Lane = $dir.Name; Changed = 'n/a'; Base = '(not a worktree)' }
+        continue
+    }
+    # Native commands write to stderr for ordinary conditions, and the script's
+    # Stop preference would turn that into a fatal error.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
     $changed = @(git -C $dir.FullName status --short 2>$null)
     $head = (git -C $dir.FullName log --oneline -1 2>$null)
+    $ErrorActionPreference = $previous
     $rows += [pscustomobject]@{
         Lane    = $dir.Name
         Changed = $changed.Count

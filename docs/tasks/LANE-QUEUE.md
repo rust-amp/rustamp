@@ -85,8 +85,10 @@ whenever a lane reports or an agy job is found finished:
 2. **Refill its slot immediately** from `docs/tasks/LANE-QUEUE.md` and
    `docs/tasks/HARD-TASKS.md` - before starting anything else.
 3. **Targets:** two Muse lanes (the owner's floor until 2026-10-18 midday), at
-   least one free-tier lane, one Codex lane while its quota lasts, and agy filled
-   to its cap of four. Nine lanes is a healthy wave.
+   least one free-tier lane, **one Claude lane through the Claude provider while
+   its quota lasts, and it takes the rather difficult work - never agy's Claude
+   bucket**, one Codex lane while its quota lasts, and agy filled to its cap of
+   four. Ten lanes is a healthy wave.
 4. **Match the source to the work:** ordering, threads, clocks, buffers, second
    processes, numeric subtlety and anything whose proof needs the VM go to Codex;
    well-specified, local, checkable-by-reading work goes to a free-tier lane;
