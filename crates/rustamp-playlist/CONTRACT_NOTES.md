@@ -161,6 +161,8 @@ why, pinned in `tests/audit.rs`:
 
 Not settled by any spec (S06 is silent on playlist files; S14 is missing), so
 nothing was invented: raw-vs-formatted title, artist/album storage, how a
-caller learns that N entries were skipped (the readers return only survivors),
-whether a marker-less text file named `.pls` should be an error (today it is
-read as a bare M3U list, tested), B4S.
+caller learns that N entries were skipped (settled by task card E3: `PlaylistReport`
+and `SkippedEntry` provide surviving entries and detailed skip reasons, while
+`read_playlist` retains its legacy `Vec<LoadedEntry>` signature for full workspace
+compatibility), whether a marker-less text file named `.pls` should be an error
+(today it is read as a bare M3U list, tested), B4S.

@@ -40,21 +40,32 @@ use std::path::Path;
 
 use rustamp_core::playlist::MediaLocation;
 
-use crate::entry::{LoadedEntry, normalize_title};
+use crate::entry::{LoadedEntry, PlaylistReport, SkippedEntry, normalize_title};
 use crate::location::{Base, path_to_file_url};
 use crate::time::parse_ms;
 use crate::xml::{Event, Reader, attr, local_name, unescape};
 
 /// Reads XSPF bytes.
 pub fn read(bytes: &[u8], base: &Path) -> Vec<LoadedEntry> {
-    read_text(&crate::cp1252::decode_text(bytes), base)
+    read_report(bytes, base).into_entries()
+}
+
+/// Reads XSPF bytes, returning surviving entries and any skipped entries.
+pub fn read_report(bytes: &[u8], base: &Path) -> PlaylistReport {
+    read_text_report(&crate::cp1252::decode_text(bytes), base)
 }
 
 /// Reads already-decoded XSPF text.
 pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
+    read_text_report(text, base).into_entries()
+}
+
+/// Reads already-decoded XSPF text, returning surviving entries and any skipped entries.
+pub fn read_text_report(text: &str, base: &Path) -> PlaylistReport {
     let playlist_base = Base::dir(base);
     let mut effective_base = playlist_base;
     let mut entries = Vec::new();
+    let mut skips = Vec::new();
     let mut track: Option<Track> = None;
     let mut track_base: Option<String> = None;
     let mut capture: Option<Field> = None;
@@ -92,7 +103,7 @@ pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
                             Some(spec) => effective_base.resolve_spec(spec),
                             None => effective_base.clone(),
                         };
-                        push_track(&mut entries, finished, &base);
+                        push_track(&mut entries, &mut skips, finished, &base);
                     }
                     track_base = None;
                 } else if let Some(field) = capture
@@ -120,9 +131,9 @@ pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
             Some(spec) => effective_base.resolve_spec(spec),
             None => effective_base.clone(),
         };
-        push_track(&mut entries, unfinished, &base);
+        push_track(&mut entries, &mut skips, unfinished, &base);
     }
-    entries
+    PlaylistReport::new(entries, skips)
 }
 
 /// Checks that `text` is a complete XSPF document: a `<playlist>` root whose
@@ -176,9 +187,30 @@ pub fn validate(text: &str) -> std::result::Result<(), String> {
 }
 
 /// Turns a finished track into an entry. A track without a usable location is
-/// dropped.
-fn push_track(entries: &mut Vec<LoadedEntry>, track: Track, base: &Base) {
-    let Some(location) = track.location.as_deref().and_then(|raw| base.resolve(raw)) else {
+/// dropped and recorded as a skipped entry.
+fn push_track(
+    entries: &mut Vec<LoadedEntry>,
+    skips: &mut Vec<SkippedEntry>,
+    track: Track,
+    base: &Base,
+) {
+    let Some(raw_location) = track.location.as_deref() else {
+        let desc = match track.title.as_deref().and_then(normalize_title) {
+            Some(t) => format!("track missing <location> element: {t}"),
+            None => "track missing <location> element".to_string(),
+        };
+        skips.push(SkippedEntry::new(desc));
+        return;
+    };
+    let Some(location) = base.resolve(raw_location) else {
+        let title_info = track
+            .title
+            .as_deref()
+            .and_then(normalize_title)
+            .map(|t| format!(" ({t})"))
+            .unwrap_or_default();
+        let desc = format!("unresolvable track location: `{raw_location}`{title_info}");
+        skips.push(SkippedEntry::new(desc));
         return;
     };
     entries.push(LoadedEntry {

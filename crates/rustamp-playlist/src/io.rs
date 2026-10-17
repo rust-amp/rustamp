@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::entry::LoadedEntry;
+use crate::entry::{LoadedEntry, PlaylistReport};
 use crate::error::{PlaylistError, Result};
 use crate::format::{PlaylistFormat, detect, looks_like_text, sniff, starts_like_xml};
 
@@ -18,27 +18,34 @@ const B4S_UNSUPPORTED: &str = "B4S is not implemented: it is a Winamp-specific X
 
 /// Reads a playlist, detecting the format from the content.
 ///
-/// `base` is the directory relative locations resolve against — in practice
-/// the parent directory of the playlist file. The process working directory is
-/// never consulted.
-///
-/// Because there is no file name, `.m3u` and `.m3u8` cannot be told apart
-/// here; both decode UTF-8 first and fall back to Windows-1252, which only
-/// differs for a `.m3u8` that contains invalid UTF-8. Use
-/// [`read_playlist_path`] when the file name is known.
+/// Returns only surviving valid entries; skipped entries are silently dropped.
+/// Use [`read_playlist_report`] to receive both surviving entries and a list of
+/// skipped entries with reasons.
 pub fn read_playlist(bytes: &[u8], base: &Path) -> Result<Vec<LoadedEntry>> {
-    read_playlist_with_hint(bytes, base, None)
+    read_playlist_report(bytes, base).map(PlaylistReport::into_entries)
+}
+
+/// Reads a playlist, detecting the format from the content, and returns both
+/// surviving entries and a list of skipped entries with reasons.
+pub fn read_playlist_report(bytes: &[u8], base: &Path) -> Result<PlaylistReport> {
+    read_playlist_report_with_hint(bytes, base, None)
 }
 
 /// Like [`read_playlist`], with a file path used as a format hint.
-///
-/// `base` stays the resolution directory; only `path_hint`'s extension is
-/// consulted.
 pub fn read_playlist_with_hint(
     bytes: &[u8],
     base: &Path,
     path_hint: Option<&Path>,
 ) -> Result<Vec<LoadedEntry>> {
+    read_playlist_report_with_hint(bytes, base, path_hint).map(PlaylistReport::into_entries)
+}
+
+/// Like [`read_playlist_report`], with a file path used as a format hint.
+pub fn read_playlist_report_with_hint(
+    bytes: &[u8],
+    base: &Path,
+    path_hint: Option<&Path>,
+) -> Result<PlaylistReport> {
     let format = detect(bytes, path_hint).ok_or_else(|| {
         let extension = path_hint
             .and_then(Path::extension)
@@ -50,58 +57,63 @@ pub fn read_playlist_with_hint(
              a playlist format"
         ))
     })?;
-    read_playlist_as(format, bytes, base)
+    read_playlist_report_as(format, bytes, base)
 }
 
 /// Reads a playlist from `path`'s bytes: the format hint comes from `path` and
 /// relative locations resolve against `path`'s directory.
 pub fn read_playlist_path(bytes: &[u8], path: &Path) -> Result<Vec<LoadedEntry>> {
+    read_playlist_report_path(bytes, path).map(PlaylistReport::into_entries)
+}
+
+/// Reads a playlist from `path`'s bytes, returning both surviving entries and
+/// any skipped entries with reasons.
+pub fn read_playlist_report_path(bytes: &[u8], path: &Path) -> Result<PlaylistReport> {
     let base = path.parent().unwrap_or_else(|| Path::new(""));
-    read_playlist_with_hint(bytes, base, Some(path))
+    read_playlist_report_with_hint(bytes, base, Some(path))
 }
 
 /// Reads a playlist file from disk.
 pub fn load_playlist_file(path: &Path) -> Result<Vec<LoadedEntry>> {
+    load_playlist_file_report(path).map(PlaylistReport::into_entries)
+}
+
+/// Reads a playlist file from disk, returning surviving entries and skipped entries.
+pub fn load_playlist_file_report(path: &Path) -> Result<PlaylistReport> {
     let bytes = std::fs::read(path)?;
-    read_playlist_path(&bytes, path)
+    read_playlist_report_path(&bytes, path)
 }
 
 /// Reads a playlist with an explicit format, skipping detection.
-///
-/// Skipping detection does not mean believing the caller blindly: the bytes
-/// must be consistent with `format` or the call fails with
-/// [`PlaylistError::UnsupportedFormat`]:
-///
-/// * non-empty M3U/M3U8/PLS input must be text and must not open an XML
-///   document (binary and UTF-16 data would otherwise become junk entries);
-/// * a content marker for a *different* format (see [`sniff`]) is a mismatch;
-///   M3U and M3U8 are interchangeable;
-/// * XSPF must be a complete document ([`crate::xspf::validate`]): a truncated
-///   or malformed file is an error here, although [`crate::xspf::read`] on its
-///   own would return the tracks it saw.
-///
-/// What stays lenient on purpose: a single bad *entry* inside a well-formed
-/// file (empty `FileN=`, a track without `<location>`, a dangling `#EXTINF`)
-/// is skipped, and the entry's other fields are never an error.
 pub fn read_playlist_as(
     format: PlaylistFormat,
     bytes: &[u8],
     base: &Path,
 ) -> Result<Vec<LoadedEntry>> {
+    read_playlist_report_as(format, bytes, base).map(PlaylistReport::into_entries)
+}
+
+/// Reads a playlist with an explicit format, skipping detection, and returns
+/// surviving entries plus any skipped entries with reasons.
+pub fn read_playlist_report_as(
+    format: PlaylistFormat,
+    bytes: &[u8],
+    base: &Path,
+) -> Result<PlaylistReport> {
     if format == PlaylistFormat::B4s {
         return Err(PlaylistError::UnsupportedFormat(B4S_UNSUPPORTED.to_owned()));
     }
     check_claim(format, bytes)?;
     match format {
-        PlaylistFormat::M3u => Ok(crate::m3u::read(bytes, base)),
-        PlaylistFormat::M3u8 => Ok(crate::m3u::read_utf8(bytes, base)),
-        PlaylistFormat::Pls => Ok(crate::pls::read(bytes, base)),
+        PlaylistFormat::M3u => Ok(crate::m3u::read_report(bytes, base)),
+        PlaylistFormat::M3u8 => Ok(crate::m3u::read_utf8_report(bytes, base)),
+        PlaylistFormat::Pls => Ok(crate::pls::read_report(bytes, base)),
         PlaylistFormat::Xspf => {
             let text = crate::cp1252::decode_text(bytes);
             crate::xspf::validate(&text).map_err(|why| {
                 PlaylistError::UnsupportedFormat(format!("not a complete XSPF document: {why}"))
             })?;
-            Ok(crate::xspf::read_text(&text, base))
+            Ok(crate::xspf::read_text_report(&text, base))
         }
         PlaylistFormat::B4s => unreachable!("B4S returned above"),
     }

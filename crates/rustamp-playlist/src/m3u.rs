@@ -30,25 +30,41 @@
 
 use std::path::Path;
 
-use crate::entry::{LoadedEntry, normalize_title};
+use crate::entry::{LoadedEntry, PlaylistReport, SkippedEntry, normalize_title};
 use crate::location::Base;
 use crate::time::{format_seconds, parse_leading_seconds_ms};
 
 /// Reads M3U text, decoding UTF-8 first and falling back to Windows-1252.
 pub fn read(bytes: &[u8], base: &Path) -> Vec<LoadedEntry> {
-    read_text(&crate::cp1252::decode_text(bytes), base)
+    read_report(bytes, base).into_entries()
+}
+
+/// Reads M3U text, returning surviving entries and any skipped entries.
+pub fn read_report(bytes: &[u8], base: &Path) -> PlaylistReport {
+    read_text_report(&crate::cp1252::decode_text(bytes), base)
 }
 
 /// Reads M3U8 text, which is UTF-8 by definition.
 pub fn read_utf8(bytes: &[u8], base: &Path) -> Vec<LoadedEntry> {
-    read_text(&crate::cp1252::decode_utf8_lossy(bytes), base)
+    read_utf8_report(bytes, base).into_entries()
+}
+
+/// Reads M3U8 text, returning surviving entries and any skipped entries.
+pub fn read_utf8_report(bytes: &[u8], base: &Path) -> PlaylistReport {
+    read_text_report(&crate::cp1252::decode_utf8_lossy(bytes), base)
 }
 
 /// Reads already-decoded M3U text.
 pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
+    read_text_report(text, base).into_entries()
+}
+
+/// Reads already-decoded M3U text, returning surviving entries and any skipped entries.
+pub fn read_text_report(text: &str, base: &Path) -> PlaylistReport {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let base = Base::dir(base);
     let mut entries = Vec::new();
+    let mut skips = Vec::new();
     let mut pending_title: Option<String> = None;
     let mut pending_duration: Option<u64> = None;
 
@@ -59,6 +75,13 @@ pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
         }
         if let Some(rest) = line.strip_prefix('#') {
             if let Some(tail) = strip_keyword(rest, "EXTINF") {
+                if pending_title.is_some() || pending_duration.is_some() {
+                    let desc = match pending_title.take() {
+                        Some(t) => format!("dangling #EXTINF without a location line: {t}"),
+                        None => "dangling #EXTINF without a location line".to_string(),
+                    };
+                    skips.push(SkippedEntry::new(desc));
+                }
                 let args = tail.strip_prefix(':').unwrap_or(tail);
                 let (length, title) = match args.split_once(',') {
                     Some((length, title)) => (length, Some(title)),
@@ -81,11 +104,24 @@ pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
                 title: pending_title.take(),
                 duration_ms: pending_duration.take(),
             });
+        } else {
+            let desc = match pending_title.take() {
+                Some(t) => format!("unresolvable location `{line}` ({t})"),
+                None => format!("unresolvable location `{line}`"),
+            };
+            skips.push(SkippedEntry::new(desc));
         }
         pending_title = None;
         pending_duration = None;
     }
-    entries
+    if pending_title.is_some() || pending_duration.is_some() {
+        let desc = match pending_title.take() {
+            Some(t) => format!("dangling #EXTINF without a location line: {t}"),
+            None => "dangling #EXTINF without a location line".to_string(),
+        };
+        skips.push(SkippedEntry::new(desc));
+    }
+    PlaylistReport::new(entries, skips)
 }
 
 /// Writes M3U. Line endings are CRLF and the encoding is UTF-8, matching what

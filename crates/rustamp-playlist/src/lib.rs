@@ -42,8 +42,10 @@
 //!
 //! * A bad **entry** inside a well-formed file is skipped according to the
 //!   rules in each format module (empty `FileN=`, a track without
-//!   `<location>`, a dangling `#EXTINF`). This is silent: the entry points
-//!   return only the surviving entries, with no count of skipped ones.
+//!   `<location>`, a dangling `#EXTINF`). The legacy [`read_playlist`] returns
+//!   only the surviving entries; [`read_playlist_report`] (and
+//!   [`load_playlist_file_report`]) returns a [`PlaylistReport`] providing both
+//!   the surviving entries and a list of [`SkippedEntry`] items with reasons.
 //! * A bad **file** is an error from every entry point in [`io`]: unknown or
 //!   binary/UTF-16 content, XML with another root, an unknown extension
 //!   without a content marker, a file whose content contradicts the format it
@@ -71,12 +73,16 @@ pub mod time;
 pub mod xml;
 pub mod xspf;
 
-pub use entry::{LoadedEntry, append_loaded, insert_loaded, loaded_entries, normalize_title};
+pub use entry::{
+    LoadedEntry, PlaylistReport, SkippedEntry, append_loaded, insert_loaded, loaded_entries,
+    normalize_title,
+};
 pub use error::{PlaylistError, Result};
 pub use format::{PlaylistFormat, detect, looks_like_text, sniff};
 pub use io::{
-    load_playlist_file, read_playlist, read_playlist_as, read_playlist_path,
-    read_playlist_with_hint, write_playlist,
+    load_playlist_file, load_playlist_file_report, read_playlist, read_playlist_as,
+    read_playlist_path, read_playlist_report, read_playlist_report_as, read_playlist_report_path,
+    read_playlist_report_with_hint, read_playlist_with_hint, write_playlist,
 };
 pub use location::{Base, resolve_location};
 pub use order::{randomize, randomize_with, shuffle, shuffled_ids};

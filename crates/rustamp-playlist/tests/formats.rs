@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use rustamp_core::playlist::{MediaLocation, Playlist};
 use rustamp_playlist::{
-    LoadedEntry, PlaylistError, PlaylistFormat, append_loaded, load_playlist_file, read_playlist,
-    read_playlist_as, read_playlist_path, write_playlist,
+    LoadedEntry, PlaylistError, PlaylistFormat, append_loaded, load_playlist_file,
+    load_playlist_file_report, read_playlist, read_playlist_as, read_playlist_path,
+    read_playlist_report_as, read_playlist_report_path, write_playlist,
 };
 
 /// A uniquely named directory under the system temp directory, removed on drop.
@@ -477,4 +478,107 @@ fn large_pls_and_xspf_stay_linear() {
         xspf_time < Duration::from_secs(5),
         "XSPF took {xspf_time:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// reporting skipped entries with reasons (task card E3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_format_reports_exactly_one_skip_for_one_bad_and_one_good_entry() {
+    // 1. M3U: 1 valid entry and 1 dangling #EXTINF
+    let m3u_mixed = b"#EXTM3U\r\n#EXTINF:10,Good Track\r\ngood.mp3\r\n#EXTINF:5,Bad Track\r\n";
+    let m3u_clean = b"#EXTM3U\r\n#EXTINF:10,Good Track\r\ngood.mp3\r\n";
+
+    let rep = read_playlist_report_as(PlaylistFormat::M3u, m3u_mixed, &base()).unwrap();
+    assert_eq!(rep.len(), 1, "m3u mixed survivors");
+    assert_eq!(rep.skip_count(), 1, "m3u mixed skip count");
+    assert!(!rep.is_clean());
+    assert!(!rep.skips[0].reason().is_empty(), "m3u skip reason");
+    assert!(rep.skips[0].reason().contains("dangling #EXTINF"));
+    assert_eq!(rep[0].title.as_deref(), Some("Good Track"));
+
+    let clean_rep = read_playlist_report_as(PlaylistFormat::M3u, m3u_clean, &base()).unwrap();
+    assert_eq!(clean_rep.len(), 1);
+    assert_eq!(clean_rep.skip_count(), 0);
+    assert!(clean_rep.is_clean());
+
+    // 2. M3U8: same behavior
+    let m3u8_mixed = b"#EXTM3U\r\n#EXTINF:10,Good Track\r\ngood.mp3\r\n#EXTINF:5,Bad Track\r\n";
+    let m3u8_clean = b"#EXTM3U\r\n#EXTINF:10,Good Track\r\ngood.mp3\r\n";
+
+    let rep = read_playlist_report_as(PlaylistFormat::M3u8, m3u8_mixed, &base()).unwrap();
+    assert_eq!(rep.len(), 1, "m3u8 mixed survivors");
+    assert_eq!(rep.skip_count(), 1, "m3u8 mixed skip count");
+    assert!(!rep.is_clean());
+    assert!(!rep.skips[0].reason().is_empty());
+    assert!(rep.skips[0].reason().contains("dangling #EXTINF"));
+
+    let clean_rep = read_playlist_report_as(PlaylistFormat::M3u8, m3u8_clean, &base()).unwrap();
+    assert_eq!(clean_rep.len(), 1);
+    assert_eq!(clean_rep.skip_count(), 0);
+    assert!(clean_rep.is_clean());
+
+    // 3. PLS: 1 valid File1 entry, 1 empty File2 entry
+    let pls_mixed = b"[playlist]\r\nFile1=good.mp3\r\nTitle1=Good Track\r\nFile2=\r\nTitle2=Bad Track\r\nNumberOfEntries=2\r\nVersion=2\r\n";
+    let pls_clean =
+        b"[playlist]\r\nFile1=good.mp3\r\nTitle1=Good Track\r\nNumberOfEntries=1\r\nVersion=2\r\n";
+
+    let rep = read_playlist_report_as(PlaylistFormat::Pls, pls_mixed, &base()).unwrap();
+    assert_eq!(rep.len(), 1, "pls mixed survivors");
+    assert_eq!(rep.skip_count(), 1, "pls mixed skip count");
+    assert!(!rep.is_clean());
+    assert!(!rep.skips[0].reason().is_empty(), "pls skip reason");
+    assert!(rep.skips[0].reason().contains("File2"));
+    assert_eq!(rep[0].title.as_deref(), Some("Good Track"));
+
+    let clean_rep = read_playlist_report_as(PlaylistFormat::Pls, pls_clean, &base()).unwrap();
+    assert_eq!(clean_rep.len(), 1);
+    assert_eq!(clean_rep.skip_count(), 0);
+    assert!(clean_rep.is_clean());
+
+    // 4. XSPF: 1 valid track, 1 track missing <location>
+    let xspf_mixed = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\
+  <trackList>\
+    <track><location>good.mp3</location><title>Good Track</title></track>\
+    <track><title>Bad Track</title></track>\
+  </trackList>\
+</playlist>";
+    let xspf_clean = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\
+  <trackList>\
+    <track><location>good.mp3</location><title>Good Track</title></track>\
+  </trackList>\
+</playlist>";
+
+    let rep = read_playlist_report_as(PlaylistFormat::Xspf, xspf_mixed, &base()).unwrap();
+    assert_eq!(rep.len(), 1, "xspf mixed survivors");
+    assert_eq!(rep.skip_count(), 1, "xspf mixed skip count");
+    assert!(!rep.is_clean());
+    assert!(!rep.skips[0].reason().is_empty(), "xspf skip reason");
+    assert!(rep.skips[0].reason().contains("<location>"));
+    assert_eq!(rep[0].title.as_deref(), Some("Good Track"));
+
+    let clean_rep = read_playlist_report_as(PlaylistFormat::Xspf, xspf_clean, &base()).unwrap();
+    assert_eq!(clean_rep.len(), 1);
+    assert_eq!(clean_rep.skip_count(), 0);
+    assert!(clean_rep.is_clean());
+}
+
+#[test]
+fn file_based_report_reading_works() {
+    let dir = TempDir::new("report-test");
+    let list_path = dir.path().join("test.pls");
+    let content = b"[playlist]\r\nFile1=good.mp3\r\nTitle1=Good Track\r\nFile2=\r\nNumberOfEntries=2\r\nVersion=2\r\n";
+    std::fs::write(&list_path, content).expect("write file");
+
+    let report = load_playlist_file_report(&list_path).expect("load report");
+    assert_eq!(report.len(), 1);
+    assert_eq!(report.skip_count(), 1);
+    assert!(report.skips[0].reason().contains("File2"));
+
+    let rep_bytes = read_playlist_report_path(content, &list_path).expect("read report path");
+    assert_eq!(rep_bytes.len(), 1);
+    assert_eq!(rep_bytes.skip_count(), 1);
 }

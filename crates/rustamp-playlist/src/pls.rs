@@ -33,26 +33,37 @@
 //!   with a quote character impossible to represent. `File1=""` is a file
 //!   whose name is two quote characters.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::entry::{LoadedEntry, normalize_title};
+use crate::entry::{LoadedEntry, PlaylistReport, SkippedEntry, normalize_title};
 use crate::location::Base;
 use crate::time::{format_seconds, parse_seconds_ms};
 
 /// Reads PLS text.
 pub fn read(bytes: &[u8], base: &Path) -> Vec<LoadedEntry> {
-    read_text(&crate::cp1252::decode_text(bytes), base)
+    read_report(bytes, base).into_entries()
+}
+
+/// Reads PLS text, returning surviving entries and any skipped entries.
+pub fn read_report(bytes: &[u8], base: &Path) -> PlaylistReport {
+    read_text_report(&crate::cp1252::decode_text(bytes), base)
 }
 
 /// Reads already-decoded PLS text.
 pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
+    read_text_report(text, base).into_entries()
+}
+
+/// Reads already-decoded PLS text, returning surviving entries and any skipped entries.
+pub fn read_text_report(text: &str, base: &Path) -> PlaylistReport {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let base = Base::dir(base);
     let mut section: Option<String> = None;
     let mut files: BTreeMap<u32, String> = BTreeMap::new();
     let mut titles: BTreeMap<u32, String> = BTreeMap::new();
     let mut lengths: BTreeMap<u32, String> = BTreeMap::new();
+    let mut empty_files: BTreeSet<u32> = BTreeSet::new();
 
     for line in text.split(['\r', '\n']) {
         let line = line.trim();
@@ -88,23 +99,65 @@ pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
         // a previously seen `File1`.
         if value.is_empty() {
             map.remove(&index);
+            if name == "file" {
+                empty_files.insert(index);
+            }
         } else {
+            if name == "file" {
+                empty_files.remove(&index);
+            }
             map.insert(index, value);
         }
     }
 
     let mut entries = Vec::with_capacity(files.len());
-    for (index, file) in &files {
-        let Some(location) = base.resolve(file) else {
-            continue;
-        };
-        entries.push(LoadedEntry {
-            location,
-            title: titles.get(index).and_then(|t| normalize_title(t)),
-            duration_ms: lengths.get(index).and_then(|l| parse_seconds_ms(l)),
-        });
+    let mut skips = Vec::new();
+
+    let mut all_indices: BTreeSet<u32> = BTreeSet::new();
+    all_indices.extend(files.keys());
+    all_indices.extend(&empty_files);
+    all_indices.extend(titles.keys());
+    all_indices.extend(lengths.keys());
+
+    for index in all_indices {
+        if let Some(file) = files.get(&index) {
+            if let Some(location) = base.resolve(file) {
+                entries.push(LoadedEntry {
+                    location,
+                    title: titles.get(&index).and_then(|t| normalize_title(t)),
+                    duration_ms: lengths.get(&index).and_then(|l| parse_seconds_ms(l)),
+                });
+            } else {
+                let title_info = titles
+                    .get(&index)
+                    .and_then(|t| normalize_title(t))
+                    .map(|t| format!(" ({t})"))
+                    .unwrap_or_default();
+                skips.push(SkippedEntry::new(format!(
+                    "unresolvable location for File{index}: `{file}`{title_info}"
+                )));
+            }
+        } else if empty_files.contains(&index) {
+            let title_info = titles
+                .get(&index)
+                .and_then(|t| normalize_title(t))
+                .map(|t| format!(": {t}"))
+                .unwrap_or_default();
+            skips.push(SkippedEntry::new(format!(
+                "empty File{index} key{title_info}"
+            )));
+        } else {
+            let title_info = titles
+                .get(&index)
+                .and_then(|t| normalize_title(t))
+                .map(|t| format!(": {t}"))
+                .unwrap_or_default();
+            skips.push(SkippedEntry::new(format!(
+                "Title/Length key without matching File{index}{title_info}"
+            )));
+        }
     }
-    entries
+    PlaylistReport::new(entries, skips)
 }
 
 /// Writes PLS with CRLF line endings, UTF-8, 1-based indices and an accurate

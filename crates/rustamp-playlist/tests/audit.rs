@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use rustamp_core::playlist::MediaLocation;
 use rustamp_playlist::{
     LoadedEntry, PlaylistError, PlaylistFormat, read_playlist, read_playlist_as,
-    read_playlist_path, write_playlist, xspf,
+    read_playlist_path, read_playlist_report, write_playlist, xspf,
 };
 
 fn base() -> PathBuf {
@@ -267,6 +267,37 @@ fn bad_entries_in_a_good_file_are_skipped_and_the_rest_survive() {
     let xspf_doc = b"<playlist><trackList><track><title>t</title></track>\
                      <track><location>a.mp3</location></track></trackList></playlist>";
     assert_eq!(read_playlist(xspf_doc, &base()).unwrap().len(), 1);
+}
+
+#[test]
+fn bad_entries_are_reported_with_reasons_in_playlist_report() {
+    // A dangling #EXTINF with no location after it.
+    let m3u = read_playlist_report(b"#EXTM3U\r\n#EXTINF:5,Orphan\r\n", &base()).unwrap();
+    assert!(m3u.is_empty());
+    assert_eq!(m3u.skip_count(), 1);
+    assert!(m3u.skips[0].reason().contains("dangling #EXTINF"));
+    assert!(m3u.skips[0].reason().contains("Orphan"));
+
+    // FileN with an empty value, TitleN without FileN.
+    let pls = read_playlist_report(
+        b"[playlist]\r\nFile1=\r\nTitle1=x\r\nTitle2=y\r\nFile3=c.mp3\r\n",
+        &base(),
+    )
+    .unwrap();
+    assert_eq!(pls.len(), 1);
+    assert_eq!(pls[0].title, None);
+    assert_eq!(pls.skip_count(), 2);
+    assert!(pls.skips[0].reason().contains("empty File1"));
+    assert!(pls.skips[1].reason().contains("File2"));
+
+    // A track without <location> in a complete document.
+    let xspf_doc = b"<playlist><trackList><track><title>t</title></track>\
+                     <track><location>a.mp3</location></track></trackList></playlist>";
+    let xspf = read_playlist_report(xspf_doc, &base()).unwrap();
+    assert_eq!(xspf.len(), 1);
+    assert_eq!(xspf.skip_count(), 1);
+    assert!(xspf.skips[0].reason().contains("<location>"));
+    assert!(xspf.skips[0].reason().contains("t"));
 }
 
 // ---------------------------------------------------------------------------

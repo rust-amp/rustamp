@@ -56,6 +56,92 @@ impl LoadedEntry {
     }
 }
 
+/// An entry inside a playlist file that was skipped because it was incomplete,
+/// malformed, or unresolvable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedEntry {
+    /// The reason why this entry was skipped.
+    pub reason: String,
+}
+
+impl SkippedEntry {
+    /// Creates a new skipped entry with a reason.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// The human-readable reason why the entry was skipped.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for SkippedEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+/// The outcome of reading a playlist: the surviving valid entries plus any
+/// skipped entries that were dropped during parsing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlaylistReport {
+    /// Successfully parsed and resolved entries.
+    pub entries: Vec<LoadedEntry>,
+    /// Entries that were skipped, along with the reason for each skip.
+    pub skips: Vec<SkippedEntry>,
+}
+
+impl PlaylistReport {
+    /// Creates a new report with entries and skips.
+    pub fn new(entries: Vec<LoadedEntry>, skips: Vec<SkippedEntry>) -> Self {
+        Self { entries, skips }
+    }
+
+    /// Returns `true` if no entries were skipped.
+    pub fn is_clean(&self) -> bool {
+        self.skips.is_empty()
+    }
+
+    /// The number of skipped entries.
+    pub fn skip_count(&self) -> usize {
+        self.skips.len()
+    }
+
+    /// Consumes the report and returns the surviving entries.
+    pub fn into_entries(self) -> Vec<LoadedEntry> {
+        self.entries
+    }
+}
+
+impl std::ops::Deref for PlaylistReport {
+    type Target = [LoadedEntry];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl IntoIterator for PlaylistReport {
+    type Item = LoadedEntry;
+    type IntoIter = std::vec::IntoIter<LoadedEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a PlaylistReport {
+    type Item = &'a LoadedEntry;
+    type IntoIter = std::slice::Iter<'a, LoadedEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
 /// Trims a title and maps the empty result to `None`.
 ///
 /// Every reader uses this, and the writers trim too, so an empty title never
