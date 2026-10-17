@@ -43,8 +43,10 @@ Conventions:
 * One case per state worth pinning, named for it: `main_window_playing` (a
   title, a time, a bitrate and a lit stereo label), `main_window_double_size`
   (the same default state at the settled 550 x 232), a non-flat
-  `equalizer_window_*` and a `playlist_window_selection`. A renderer change
-  then names the state it broke.
+  `equalizer_window_*`, a `playlist_window_selection` (bottom page with a
+  selected row), a `playlist_window_mid_page` (scrolled view with the handle
+  between the settled points) and a `dialog_load_playlist` (the typed-path
+  face). A renderer change then names the state it broke.
 * PNG, 8-bit RGBA, comparison is exact (tolerance 0).
 
 ### Equalizer renderer cases (`lookalike`)
@@ -73,6 +75,15 @@ also checks the flat ramp samples, full horizontal strip and sheet track
 offsets; it reuses the existing flat PNG rather than adding a duplicate.
 Only the two existing EQ images above are intentionally re-blessed; existing
 main-window and playlist images must stay byte-identical.
+
+### Playlist and dialog cases (`lookalike`)
+
+| Name | Dimensions | Coverage |
+|---|---|---|
+| `playlist_window` | 275 x 116 | Empty default playlist frame |
+| `playlist_window_selection` | 275 x 116 | Bottom page (rows 57–60) with row 58 selected; handle at y = 60 |
+| `playlist_window_mid_page` | 275 x 116 | Offset 28 of 60 (handle at the settled y = 40) with row 30 selected via `move_selection_down`; pins the own-choice linear handle interpolation and the S03 §2 provisional Down path |
+| `dialog_load_playlist` | 300 x 100 | Load-playlist dialog with a typed path; the face the BETA-09 UI half types into |
 
 ## Workflow
 

@@ -31,9 +31,9 @@ use rustamp_skin::{BuiltinDefaultSkin, MemorySource, Skin};
 use rustamp_testkit::{SKIN_LOOKALIKE, Snapshot, assert_golden};
 use rustamp_ui::equalizer::{EqSlider, EqWidget};
 use rustamp_ui::{
-    EqualizerLayout, EqualizerState, MainWindowLayout, MainWindowState, MonoStereo, PlaylistWindow,
-    TransportState, eq_frame_size, frame_size, render_equalizer_window, render_main_window,
-    render_playlist_window,
+    DialogKind, EqualizerLayout, EqualizerState, MainWindowLayout, MainWindowState, MonoStereo,
+    PlaylistWindow, TransportState, eq_frame_size, frame_size, render_dialog,
+    render_equalizer_window, render_main_window, render_playlist_window,
 };
 
 /// The built-in skin, loaded the way the app loads it: an empty source with the
@@ -341,4 +341,47 @@ fn golden_lookalike_playlist_window_selection() {
         SKIN_LOOKALIKE,
         &shot.render_image(),
     );
+}
+
+/// The playlist mid-list: the view scrolled to offset 28 of 60, so the
+/// handle sits at its settled middle point (S01 §4.2: y = 40), with one row
+/// selected through the page-key path (`move_selection_down`).
+///
+/// This pins the own-choice linear handle interpolation between the settled
+/// points and the S03 §2 provisional Down behaviour on the same frame.
+#[test]
+fn golden_lookalike_playlist_window_mid_page() {
+    let skin = builtin_skin();
+    let mut window = PlaylistWindow::new();
+    window.set_entries((0..60u64).map(EntryId).collect());
+    window.scroll_to(28);
+    window.apply_select(&SelectOp::Set(vec![EntryId(28)]));
+    // One Down step through the new key path: entry 29, view unchanged.
+    window.move_selection_down();
+    let labels = vec![
+        "29. Rustamp - the look-alike default skin".to_string(),
+        "30. A second entry, so the rows are visible".to_string(),
+        "31. 3:42".to_string(),
+        "32. The fourth row on this page".to_string(),
+    ];
+    let shot = Shot(|| render_playlist_window(&skin, &window, &labels, true));
+    assert_golden(
+        "playlist_window_mid_page",
+        SKIN_LOOKALIKE,
+        &shot.render_image(),
+    );
+}
+
+/// The load-playlist dialog with a typed path: the face the BETA-09 UI half
+/// types into (`DialogManager::type_text` on `LoadPlaylist`).
+///
+/// The body lines mirror what the app assembles for this dialog (the prompt
+/// plus the field); the dialog frame itself is the renderer's own choice
+/// (S04 open), pinned here at its 300 x 100 client size.
+#[test]
+fn golden_lookalike_dialog_load_playlist() {
+    let skin = builtin_skin();
+    let body = ["Playlist file:", r"C:\Music\mix.m3u"];
+    let shot = Shot(|| render_dialog(DialogKind::LoadPlaylist, &skin, &body));
+    assert_golden("dialog_load_playlist", SKIN_LOOKALIKE, &shot.render_image());
 }

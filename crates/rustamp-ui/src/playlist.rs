@@ -18,6 +18,8 @@ use std::collections::BTreeSet;
 use rustamp_core::command::{Command, OpenMediaKind, SelectOp};
 use rustamp_core::playlist::EntryId;
 
+use crate::shortcuts::{Key, Modifiers};
+
 /// How many list rows are visible at once (S06 §3).
 ///
 /// The 1501/1501 px arrow symmetry is settled; the "four rows" count itself is
@@ -112,6 +114,55 @@ pub enum ScrollDirection {
     Down,
 }
 
+/// A playlist-editor key action (S03 §2, playlist editor table).
+///
+/// Only the rows this window implements: the four provisional move/scroll
+/// rows, the two provisional jump rows and the menu-confirmed Enter row.
+/// Delete, Ctrl+A and Ctrl+I keep their existing app path
+/// (`App::playlist_key_down`) and are not part of this mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlaylistKeyAction {
+    /// Up: move the selection up (`40289`, provisional).
+    MoveSelectionUp,
+    /// Down: move the selection down (`40290`, provisional).
+    MoveSelectionDown,
+    /// Home: jump to the first entry (`40264`, provisional).
+    JumpToFirst,
+    /// End: jump to the last entry (`40265`, provisional).
+    JumpToLast,
+    /// PageUp: scroll up one page (`40256`, provisional).
+    PageUp,
+    /// PageDown: scroll down one page (`40257`, provisional).
+    PageDown,
+    /// Enter: play the selected item(s) (`40184`, menu-confirmed).
+    PlaySelected,
+}
+
+/// Maps a key press to the playlist editor's key action, if any.
+///
+/// Covers the S03 §2 rows listed on [`PlaylistKeyAction`]: plain Up, Down,
+/// Home, End, PageUp, PageDown and Enter, each with no modifiers. Every other
+/// key — including Delete, Ctrl+A and Ctrl+I, which keep their existing app
+/// path, and the Alt/Ctrl/Shift playlist rows with no model support (crop,
+/// move-entry, clear, sort, reverse, randomise) — returns `None` and stays on
+/// the shared shortcut path. The provisional rows are implemented as own
+/// choices on the model (`move_selection_up`, `scroll_page`, ...); see each
+/// method for what was chosen.
+pub fn playlist_key_action(key: Key, modifiers: Modifiers) -> Option<PlaylistKeyAction> {
+    if modifiers != Modifiers::NONE {
+        return None;
+    }
+    match key {
+        Key::Up => Some(PlaylistKeyAction::MoveSelectionUp),
+        Key::Down => Some(PlaylistKeyAction::MoveSelectionDown),
+        Key::Home => Some(PlaylistKeyAction::JumpToFirst),
+        Key::End => Some(PlaylistKeyAction::JumpToLast),
+        Key::PageUp => Some(PlaylistKeyAction::PageUp),
+        Key::PageDown => Some(PlaylistKeyAction::PageDown),
+        Key::Enter => Some(PlaylistKeyAction::PlaySelected),
+        _ => None,
+    }
+}
 /// A dialog the playlist window asks the app to open (S06 §4).
 ///
 /// The spec settles existence and titles (from window metadata) and fixes no
@@ -318,6 +369,109 @@ impl PlaylistWindow {
     /// produces the command, because inverting twice is the identity.
     pub fn invert_selection(&mut self) -> Command {
         Command::Select(SelectOp::Invert)
+    }
+
+    /// Moves the selection one entry up (S03 §2, `40289` "Move the selection
+    /// up", **provisional** with no measured effect).
+    ///
+    /// Own choice, stated plainly: the model keeps a selection set, not a
+    /// cursor, so this collapses to a single selection one entry above the
+    /// current first-selected entry (the playlist-order anchor). With no
+    /// selection it selects the last visible row. The view follows so the new
+    /// selection stays visible. A no-op on an empty list.
+    pub fn move_selection_up(&mut self) {
+        let Some(index) = self.selection_anchor_index(false) else {
+            return;
+        };
+        let index = index.saturating_sub(1);
+        self.select_single_and_reveal(index);
+    }
+
+    /// Moves the selection one entry down (S03 §2, `40290` "Move the selection
+    /// down", **provisional** with no measured effect).
+    ///
+    /// Own choice, stated plainly: mirrors [`Self::move_selection_up`]; with
+    /// no selection it selects the first visible row.
+    pub fn move_selection_down(&mut self) {
+        let Some(index) = self.selection_anchor_index(true) else {
+            return;
+        };
+        let index = (index + 1).min(self.entries.len().saturating_sub(1));
+        self.select_single_and_reveal(index);
+    }
+
+    /// Jumps to the first entry (S03 §2, `40264` "Jump to the first entry",
+    /// **provisional** with no measured effect).
+    ///
+    /// Own choice: selects the first entry alone and scrolls to the top.
+    /// A no-op on an empty list.
+    pub fn jump_to_first(&mut self) {
+        if !self.entries.is_empty() {
+            self.select_single_and_reveal(0);
+        }
+    }
+
+    /// Jumps to the last entry (S03 §2, `40265` "Jump to the last entry",
+    /// **provisional** with no measured effect).
+    ///
+    /// Own choice: selects the last entry alone and scrolls so it is visible.
+    /// A no-op on an empty list.
+    pub fn jump_to_last(&mut self) {
+        if let Some(last) = self.entries.len().checked_sub(1) {
+            self.select_single_and_reveal(last);
+        }
+    }
+
+    /// Plays the selected entry (S03 §2, `40184` "Play the selected item(s)",
+    /// menu-confirmed; the effect is not measured).
+    ///
+    /// Own choice, stated plainly: the spec does not say which entry plays
+    /// when several are selected, so this plays the first selected entry in
+    /// playlist order and selects it alone. `None` when nothing is selected.
+    pub fn play_selected(&mut self) -> Option<Command> {
+        let id = self.selected_ids().into_iter().next()?;
+        self.selected.clear();
+        self.selected.insert(id);
+        Some(Command::PlayEntry(id))
+    }
+
+    /// The anchor for [`Self::move_selection_up`] and
+    /// [`Self::move_selection_down`]: the index of the first selected entry
+    /// in playlist order, or — with no selection — the first visible row
+    /// (`down == true`) or the last visible row (`down == false`).
+    fn selection_anchor_index(&self, down: bool) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        if let Some(id) = self.selected_ids().into_iter().next()
+            && let Some(index) = self.entries.iter().position(|entry| *entry == id)
+        {
+            return Some(index);
+        }
+        let visible = self.visible_ids();
+        if visible.is_empty() {
+            return None;
+        }
+        let id = if down {
+            visible[0]
+        } else {
+            visible[visible.len() - 1]
+        };
+        self.entries.iter().position(|entry| *entry == id)
+    }
+
+    /// Selects `entries[index]` alone and scrolls so it is visible.
+    fn select_single_and_reveal(&mut self, index: usize) {
+        let Some(id) = self.entries.get(index).copied() else {
+            return;
+        };
+        self.selected.clear();
+        self.selected.insert(id);
+        if index < self.first_visible {
+            self.scroll_to(index);
+        } else if index >= self.first_visible + VISIBLE_ROWS {
+            self.scroll_to(index + 1 - VISIBLE_ROWS);
+        }
     }
 
     /// REM removes the selected entries (S06 §5, settled on both the real and
@@ -742,5 +896,112 @@ mod tests {
     fn opening_either_dialog_needs_an_os_window() {
         assert_eq!(PlaylistDialog::AddFiles.title(), ADD_DIALOG_TITLE);
         assert_eq!(PlaylistDialog::LoadPlaylist.title(), LOAD_DIALOG_TITLE);
+    }
+
+    #[test]
+    fn up_and_down_move_the_selection_and_reveal_it() {
+        // S03 §2 Up (`40289`) / Down (`40290`): provisional rows, implemented
+        // as own choices (single selection, view follows).
+        let mut window = window_with(60);
+        window.scroll_to(56);
+        window.apply_select(&SelectOp::Set(vec![EntryId(57)]));
+        window.move_selection_up();
+        assert_eq!(window.selected_ids(), vec![EntryId(56)]);
+        assert_eq!(window.first_visible(), 56);
+        // At the top of the view moving up scrolls the view along.
+        window.move_selection_up();
+        assert_eq!(window.selected_ids(), vec![EntryId(55)]);
+        assert_eq!(window.first_visible(), 55);
+        window.move_selection_down();
+        assert_eq!(window.selected_ids(), vec![EntryId(56)]);
+        assert_eq!(window.first_visible(), 55);
+        // Clamped at the ends of the list.
+        let mut window = window_with(3);
+        window.apply_select(&SelectOp::Set(vec![EntryId(0)]));
+        window.move_selection_up();
+        assert_eq!(window.selected_ids(), vec![EntryId(0)]);
+        window.apply_select(&SelectOp::Set(vec![EntryId(2)]));
+        window.move_selection_down();
+        assert_eq!(window.selected_ids(), vec![EntryId(2)]);
+        // An empty list stays empty.
+        let mut window = PlaylistWindow::new();
+        window.move_selection_up();
+        window.move_selection_down();
+        assert!(window.selected_ids().is_empty());
+    }
+
+    #[test]
+    fn home_and_end_jump_to_the_ends_of_the_list() {
+        // S03 §2 Home (`40264`) / End (`40265`): provisional rows, implemented
+        // as own choices (single selection, view follows).
+        let mut window = window_with(60);
+        window.scroll_to(56);
+        window.jump_to_first();
+        assert_eq!(window.selected_ids(), vec![EntryId(0)]);
+        assert_eq!(window.first_visible(), 0);
+        window.jump_to_last();
+        assert_eq!(window.selected_ids(), vec![EntryId(59)]);
+        assert_eq!(window.first_visible(), 56);
+        let mut window = PlaylistWindow::new();
+        window.jump_to_first();
+        window.jump_to_last();
+        assert!(window.selected_ids().is_empty());
+    }
+
+    #[test]
+    fn enter_plays_the_first_selected_entry() {
+        // S03 §2 Enter (`40184`) is menu-confirmed; which entry plays with
+        // several selected is not specified, so the first selected in
+        // playlist order plays (own choice).
+        let mut window = window_with(6);
+        assert_eq!(window.play_selected(), None);
+        window.apply_select(&SelectOp::Set(vec![EntryId(3), EntryId(1)]));
+        assert_eq!(window.play_selected(), Some(Command::PlayEntry(EntryId(1))));
+        assert_eq!(window.selected_ids(), vec![EntryId(1)]);
+    }
+
+    #[test]
+    fn the_playlist_key_map_covers_the_provisional_rows_and_enter() {
+        use crate::shortcuts::{Key, Modifiers};
+
+        // The implemented S03 §2 rows, each with no modifiers.
+        assert_eq!(
+            playlist_key_action(Key::Up, Modifiers::NONE),
+            Some(PlaylistKeyAction::MoveSelectionUp)
+        );
+        assert_eq!(
+            playlist_key_action(Key::Down, Modifiers::NONE),
+            Some(PlaylistKeyAction::MoveSelectionDown)
+        );
+        assert_eq!(
+            playlist_key_action(Key::Home, Modifiers::NONE),
+            Some(PlaylistKeyAction::JumpToFirst)
+        );
+        assert_eq!(
+            playlist_key_action(Key::End, Modifiers::NONE),
+            Some(PlaylistKeyAction::JumpToLast)
+        );
+        assert_eq!(
+            playlist_key_action(Key::PageUp, Modifiers::NONE),
+            Some(PlaylistKeyAction::PageUp)
+        );
+        assert_eq!(
+            playlist_key_action(Key::PageDown, Modifiers::NONE),
+            Some(PlaylistKeyAction::PageDown)
+        );
+        assert_eq!(
+            playlist_key_action(Key::Enter, Modifiers::NONE),
+            Some(PlaylistKeyAction::PlaySelected)
+        );
+        // Modifiers take the shared path; the existing Delete/Ctrl+A/Ctrl+I
+        // app path is untouched by this map.
+        assert_eq!(playlist_key_action(Key::Up, Modifiers::CTRL), None);
+        assert_eq!(playlist_key_action(Key::Enter, Modifiers::CTRL), None);
+        assert_eq!(
+            playlist_key_action(Key::Letter(b'A'), Modifiers::CTRL),
+            None
+        );
+        assert_eq!(playlist_key_action(Key::Delete, Modifiers::NONE), None);
+        assert_eq!(playlist_key_action(Key::Left, Modifiers::NONE), None);
     }
 }
