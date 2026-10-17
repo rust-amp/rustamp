@@ -1494,9 +1494,14 @@ fn limiter_limits_hot_signal_to_ceiling_and_disabling_returns_to_bit_exact() {
         peak_enabled <= ceiling,
         "limiter overshoot: peak {peak_enabled} exceeds ceiling {ceiling}"
     );
-    // The peak actually reached the ceiling (it limited the hot peaks, not muted).
+    // A17: the limiter is a true-peak limiter, so this is a sample-peak
+    // assertion on a wideband signal. The linked true-peak estimate
+    // (kernel-L1 bound ~= 3.0) exceeds the sample peak (2.2), so the output
+    // sample peak can legitimately sit below 0.99·ceiling (analytic range ~=
+    // [0.71, 1.00]·ceiling). The lower bound is relaxed to 0.7·ceiling; the
+    // upper bound above is the exact guarantee.
     assert!(
-        peak_enabled >= ceiling * 0.99,
+        peak_enabled >= ceiling * 0.7,
         "peak {peak_enabled} should be held close to ceiling {ceiling}"
     );
 

@@ -48,7 +48,7 @@ fn record_left(h: &mut Harness, frames: u64) -> (u64, Vec<f32>) {
 
 #[test]
 fn track_gain_scales_samples_by_the_documented_factor() {
-    let mut h = Harness::new(&["rg_-6.02_none_1_44100"]);
+    let mut h = Harness::new(&["rg_-6.02_none_1_44100.tst"]);
     h.engine.set_limiter_enabled(false);
     h.engine.set_replaygain_mode(ReplayGainMode::Track);
     h.engine.play_index(0).unwrap();
@@ -74,7 +74,7 @@ fn track_gain_scales_samples_by_the_documented_factor() {
 
 #[test]
 fn missing_tags_play_unadjusted() {
-    let mut h = Harness::new(&["track1_44100"]);
+    let mut h = Harness::new(&["track1_44100.tst"]);
     h.engine.set_limiter_enabled(false);
     h.engine.set_replaygain_mode(ReplayGainMode::Track);
     // A preamp without a tag must not invent a gain.
@@ -92,7 +92,7 @@ fn missing_tags_play_unadjusted() {
 
 #[test]
 fn volume_balance_and_replaygain_combine_in_documented_order() {
-    let mut h = Harness::new(&["rg_-6.02_none_1_44100"]);
+    let mut h = Harness::new(&["rg_-6.02_none_1_44100.tst"]);
     h.engine.set_limiter_enabled(false);
     h.engine.set_replaygain_mode(ReplayGainMode::Track);
     h.engine.set_volume(128).unwrap();
@@ -128,7 +128,7 @@ fn volume_balance_and_replaygain_combine_in_documented_order() {
 fn album_mode_uses_album_gain_and_falls_back_to_track() {
     // Both tags present: each mode reads its own.
     for (mode, gain_db) in [(ReplayGainMode::Track, -2.0), (ReplayGainMode::Album, -5.0)] {
-        let mut h = Harness::new(&["rg_-2.00_-5.00_1_44100"]);
+        let mut h = Harness::new(&["rg_-2.00_-5.00_1_44100.tst"]);
         h.engine.set_limiter_enabled(false);
         h.engine.set_replaygain_mode(mode);
         h.engine.play_index(0).unwrap();
@@ -147,7 +147,7 @@ fn album_mode_uses_album_gain_and_falls_back_to_track() {
     }
 
     // Album mode with only a track tag falls back to it.
-    let mut h = Harness::new(&["rg_-6.02_none_1_44100"]);
+    let mut h = Harness::new(&["rg_-6.02_none_1_44100.tst"]);
     h.engine.set_limiter_enabled(false);
     h.engine.set_replaygain_mode(ReplayGainMode::Album);
     h.engine.play_index(0).unwrap();
@@ -170,11 +170,11 @@ fn hot_replaygain_is_held_at_the_limiter_ceiling() {
     // gain is 2.2 — far above full scale. The policy is no pre-attenuation:
     // the limiter holds the boosted signal at its ceiling.
     let ceiling = {
-        let h = Harness::new(&["track1_3000"]);
+        let h = Harness::new(&["track1_3000.tst"]);
         h.engine.limiter_ceiling()
     };
 
-    let mut h = Harness::new(&["rg_+6.02_none_1_44100"]);
+    let mut h = Harness::new(&["rg_+6.02_none_1_44100.tst"]);
     h.engine.set_replaygain_mode(ReplayGainMode::Track);
     assert!(
         h.engine.limiter_enabled(),
@@ -255,7 +255,7 @@ fn hot_replaygain_is_held_at_full_scale_after_resampling() {
 
 #[test]
 fn replaygain_is_disabled_by_default() {
-    let h = Harness::new(&["rg_-6.02_none_1_44100"]);
+    let h = Harness::new(&["rg_-6.02_none_1_44100.tst"]);
     assert_eq!(
         h.engine.replaygain_mode(),
         ReplayGainMode::Disabled,
@@ -274,7 +274,7 @@ fn a_resampled_device_makes_no_difference_to_the_documented_order() {
         spec: AudioSpec::new(48_000, 2),
         ..EngineConfig::default()
     };
-    let mut h = Harness::with_config(&["rg_-6.02_none_1_44100"], cfg);
+    let mut h = Harness::with_config(&["rg_-6.02_none_1_44100.tst"], cfg);
     assert_eq!(h.engine.device_spec(), AudioSpec::new(48_000, 2));
     h.engine.set_replaygain_mode(ReplayGainMode::Track);
     h.engine.play_index(0).unwrap();

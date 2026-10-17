@@ -397,7 +397,11 @@ fn resident_track_plays_bit_exact_to_sticky_eos() {
     assert!(h.wait_track(0), "the resident track must open");
     // The handshake replays the fake resident's format and length.
     assert_eq!(h.engine.source_spec(), Some(common::SPEC));
-    assert_eq!(h.engine.duration_frames(), Some(3000));
+    // Wire truth (M15): the resident reports whole milliseconds, so a
+    // 3000-frame track at 44.1 kHz is 3000*1000/44100 = 68 ms on the wire
+    // and 0.068*44100 = 2998.8 -> 2999 device frames back. The content is
+    // still 3000 frames; only the duration quantizes.
+    assert_eq!(h.engine.duration_frames(), Some(2999));
     assert!(h.wait_buffered(), "the resident track must buffer");
 
     let mut rec = Vec::new();
@@ -429,7 +433,10 @@ fn seek_in_resident_track_plays_the_target() {
     let mut h = Harness::new(&["track7_44100.rtst"]);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
-    let target = 20_000u64;
+    // Wire truth (M15): seeks quantize to whole milliseconds, so the target
+    // must be ms-exact for a bit-exact assertion. 450 ms * 44.1 = 19845
+    // frames round-trips exactly; 20000 does not.
+    let target = 19_845u64;
     h.engine.seek_frames(target).unwrap();
     assert!(h.settle_seek(target), "seek did not land on {target}");
 
@@ -559,8 +566,11 @@ fn resident_commands_reach_the_engine_unchanged() {
     assert_eq!(h.engine.transport(), TransportState::Paused);
     h.engine.apply(&Command::Play).unwrap();
     assert_eq!(h.engine.transport(), TransportState::Playing);
-    h.engine.seek_frames(1000).unwrap();
-    assert!(h.settle_seek(1000));
+    // Wire truth (M15): seeks quantize to whole milliseconds, so the smoke
+    // target must be ms-exact. 20 ms * 44.1 = 882 frames round-trips exactly;
+    // 1000 does not.
+    h.engine.seek_frames(882).unwrap();
+    assert!(h.settle_seek(882));
     let _ = h.drain_events();
     assert_eq!(
         h.engine.state().current_index,
