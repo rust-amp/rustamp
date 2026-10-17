@@ -432,12 +432,14 @@ impl Worker {
         self.vis.set_enabled(self.cfg.vis_enabled);
         self.vis.prepare(src);
         self.in_buf = vec![0.0; src.samples_for(READ_FRAMES)];
-        self.out_buf = vec![
-            0.0;
-            self.cfg
-                .device
-                .samples_for(self.conv.max_out_frames(READ_FRAMES))
-        ];
+        // The resampler holds a tail back that is emitted at the end of the
+        // track, and that tail needs more room than one read block, so the
+        // buffer covers both uses.
+        let out_frames = self
+            .conv
+            .max_out_frames(READ_FRAMES)
+            .max(self.conv.max_out_frames(2 * self.conv.latency_frames()));
+        self.out_buf = vec![0.0; self.cfg.device.samples_for(out_frames)];
         self.track_start = self.timeline;
         let duration_frames = decoder
             .duration()
@@ -477,6 +479,10 @@ impl Worker {
             let read = decoder.read(&mut self.in_buf[..want]);
             let frames = match read {
                 Ok(0) => {
+                    // The decoder is exhausted: emit the tail the resampler is
+                    // still holding, so a resampled track has the length its
+                    // duration implies (the equal-rate path emits nothing).
+                    self.flush_tail();
                     let _ = self.tx.send(DecodeOut::TrackEnded {
                         frames: self.timeline.saturating_sub(self.track_start),
                         skipped: decoder.skipped_packets(),
@@ -509,6 +515,23 @@ impl Worker {
                 return self.pending_skip.take().unwrap_or(Outcome::Stop);
             }
         }
+    }
+
+    /// Emit the tail the resampler is still holding into the ring and advance
+    /// the timeline. Nothing to do when the rates are equal (the converter
+    /// holds nothing back then).
+    fn flush_tail(&mut self) {
+        if self.conv.latency_frames() == 0 {
+            return;
+        }
+        let out_frames = self.conv.flush(&mut self.out_buf);
+        if out_frames == 0 {
+            return;
+        }
+        let out_samples = self.cfg.device.samples_for(out_frames);
+        let written = self.write_all(out_samples);
+        self.timeline += written as u64;
+        self.cfg.sync.set_written(self.timeline);
     }
 
     /// Write up to `samples` device-format samples into the ring, waiting for
@@ -690,12 +713,12 @@ impl Worker {
         }
         self.vis.prepare(to);
         self.in_buf = vec![0.0; to.samples_for(READ_FRAMES)];
-        self.out_buf = vec![
-            0.0;
-            self.cfg
-                .device
-                .samples_for(self.conv.max_out_frames(READ_FRAMES))
-        ];
+        // Same sizing as `prepare_track`: room for the resampler's tail too.
+        let out_frames = self
+            .conv
+            .max_out_frames(READ_FRAMES)
+            .max(self.conv.max_out_frames(2 * self.conv.latency_frames()));
+        self.out_buf = vec![0.0; self.cfg.device.samples_for(out_frames)];
         let _ = self.tx.send(DecodeOut::FormatChanged {
             from,
             to,
