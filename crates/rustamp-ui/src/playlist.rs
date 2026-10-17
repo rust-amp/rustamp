@@ -587,11 +587,17 @@ mod tests {
     #[test]
     fn ctrl_a_selects_every_entry_and_ctrl_i_inverts_the_selection() {
         // S03 §2: Ctrl+A (`40205`) and Ctrl+I (`40171`) are menu-confirmed rows.
+        // The window only *produces* the command; the app applies it (see
+        // `App::apply_app`), so the test applies it the same way - and that is
+        // what keeps Invert from being applied twice.
         let mut window = window_with(6);
         assert_eq!(window.select_all(), Command::Select(SelectOp::All));
+        window.apply_select(&SelectOp::All);
         assert_eq!(window.selected_ids(), ids(6));
+
         window.apply_select(&SelectOp::Set(vec![EntryId(1), EntryId(3)]));
         assert_eq!(window.invert_selection(), Command::Select(SelectOp::Invert));
+        window.apply_select(&SelectOp::Invert);
         assert_eq!(
             window.selected_ids(),
             vec![EntryId(0), EntryId(2), EntryId(4), EntryId(5)]
