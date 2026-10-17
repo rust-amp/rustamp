@@ -266,6 +266,11 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
         "balance".into(),
         toml::Value::Integer(i64::from(config.audio.balance)),
     );
+    // Note on deliberately unpersisted fields:
+    // audio.output, audio.device, audio.buffer_ms, audio.fadeout_ms,
+    // audio.gapless, and audio.replaygain are deliberately not persisted
+    // because the audio engine does not support runtime configuration of them yet.
+    // Serializing them would falsely advertise supported functionality (task card N6).
     root.insert("audio".into(), toml::Value::Table(audio));
 
     let mut ui = toml::Table::new();
@@ -287,62 +292,42 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
         "easy_move".into(),
         toml::Value::Boolean(config.ui.easy_move),
     );
+    // Note on deliberately unpersisted field:
+    // ui.snap_distance is deliberately not persisted because window snapping
+    // distance is fixed in the docking logic and not configurable (task card N6).
 
     if !config.ui.windows.is_empty() {
         let mut windows_array = Vec::new();
         for w in &config.ui.windows {
-            let mut win_table = toml::Table::new();
-            // The id must be written exactly the way the loader reads it back.
-            // `WindowId` is a wire type, so its serde form is what
-            // `toml::from_str` into the config expects; hand-rolling it as a
-            // string only worked for the unit variants. A generic window came
-            // out as `Gen(3)`, which the loader refuses, so a clean exit wrote
-            // a file the player itself could not read on the next launch
-            // (W10 finding F1).
-            let id_value = toml::Value::try_from(w.id)
-                .unwrap_or_else(|_| toml::Value::String("Main".to_string()));
-            win_table.insert("id".into(), id_value);
-            win_table.insert("x".into(), toml::Value::Integer(i64::from(w.x)));
-            win_table.insert("y".into(), toml::Value::Integer(i64::from(w.y)));
-            win_table.insert("visible".into(), toml::Value::Boolean(w.visible));
-            win_table.insert("shaded".into(), toml::Value::Boolean(w.shaded));
-            // Sizes round-trip like the id (W10 finding F1 applied to the
-            // size fields): the loader reads them through serde, so a file
-            // that drops them cannot load back what was saved. `None` stays
-            // omitted, so the standard windows write exactly what they did.
-            if let Some(width) = w.width {
-                win_table.insert("width".into(), toml::Value::Integer(i64::from(width)));
-            }
-            if let Some(height) = w.height {
-                win_table.insert("height".into(), toml::Value::Integer(i64::from(height)));
-            }
-            windows_array.push(toml::Value::Table(win_table));
+            // Serialize WindowLayout via serde directly. Hand-rolling child table fields
+            // caused W10 finding F1 (malformed WindowId::Gen format) and N8 test failure
+            // (omitted width and height). Delegating to serde guarantees all WindowLayout
+            // fields serialize in the exact format the serde loader expects.
+            let win_value = toml::Value::try_from(w.clone()).map_err(|e| ConfigError::Write {
+                path: PathBuf::from("<serialize>"),
+                error: e.to_string(),
+            })?;
+            windows_array.push(win_value);
         }
         ui.insert("windows".into(), toml::Value::Array(windows_array));
     }
     root.insert("ui".into(), toml::Value::Table(ui));
 
     let mut eq = toml::Table::new();
-    let mut eq_state = toml::Table::new();
-    eq_state.insert(
-        "enabled".into(),
-        toml::Value::Boolean(config.eq.state.enabled),
-    );
-    eq_state.insert("auto".into(), toml::Value::Boolean(config.eq.state.auto));
-    eq_state.insert(
-        "preamp".into(),
-        toml::Value::Float(f64::from(config.eq.state.preamp)),
-    );
-    let bands: Vec<toml::Value> = config
-        .eq
-        .state
-        .bands
-        .iter()
-        .map(|b| toml::Value::Float(f64::from(*b)))
-        .collect();
-    eq_state.insert("bands".into(), toml::Value::Array(bands));
-    eq.insert("state".into(), toml::Value::Table(eq_state));
+    // Serialize EqState via serde directly. Hand-rolling eq_state fields risks
+    // field omission and drift. Delegating to serde ensures all bands, preamp,
+    // enabled, and auto flags serialize in the format the serde loader expects.
+    let eq_state = toml::Value::try_from(config.eq.state).map_err(|e| ConfigError::Write {
+        path: PathBuf::from("<serialize>"),
+        error: e.to_string(),
+    })?;
+    eq.insert("state".into(), eq_state);
     root.insert("eq".into(), toml::Value::Table(eq));
+
+    // Note on deliberately unpersisted sections:
+    // playlist (shuffle, repeat, manual_advance, last_playlist) and plugins
+    // (plugin_dir, vis_plugin, vis_preset, disabled) are deliberately not persisted
+    // because none of their features are honoured by the player yet (task card N6).
 
     toml::to_string_pretty(&toml::Value::Table(root)).map_err(|e| ConfigError::Write {
         path: PathBuf::from("<serialize>"),
@@ -520,11 +505,38 @@ mod tests {
                 y: 312,
                 visible: false,
                 shaded: false,
-                width: None,
-                height: None,
+                width: Some(275),
+                height: Some(116),
+            },
+            WindowLayout {
+                id: WindowId::Vis,
+                x: 400,
+                y: 80,
+                visible: true,
+                shaded: false,
+                width: Some(275),
+                height: Some(200),
+            },
+            WindowLayout {
+                id: WindowId::Gen(42),
+                x: 400,
+                y: 290,
+                visible: true,
+                shaded: false,
+                width: Some(300),
+                height: Some(250),
+            },
+            WindowLayout {
+                id: WindowId::Video,
+                x: 700,
+                y: 80,
+                visible: false,
+                shaded: false,
+                width: Some(352),
+                height: Some(240),
             },
         ];
-        config.eq.state.enabled = true;
+        config.eq.state.enabled = false;
         config.eq.state.auto = true;
         config.eq.state.preamp = 4.5;
         config.eq.state.bands = [1.0, 2.0, 3.0, 4.0, 5.0, -1.0, -2.0, -3.0, -4.0, -5.0];
@@ -547,6 +559,64 @@ mod tests {
         assert!(!loaded.config.ui.easy_move);
         assert_eq!(loaded.config.ui.windows, config.ui.windows);
         assert_eq!(loaded.config.eq.state, config.eq.state);
+        // Assert the full configuration equals the written one.
+        assert_eq!(
+            loaded.config, config,
+            "entire loaded configuration must equal written configuration"
+        );
+    }
+
+    #[test]
+    fn unpersisted_fields_deliberately_fall_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unpersisted.toml");
+
+        let mut config = Config::default();
+        config.audio.volume = 180;
+        // Set deliberately unpersisted fields to non-default values:
+        config.audio.output = "cpal".into();
+        config.audio.device = Some("TestDevice".into());
+        config.audio.buffer_ms = 450;
+        config.audio.fadeout_ms = 1200;
+        config.audio.gapless = false;
+        config.audio.replaygain = rustamp_core::config::ReplayGainMode::Album;
+        config.ui.snap_distance = 30;
+        config.playlist.shuffle = true;
+        config.playlist.repeat = true;
+        config.playlist.manual_advance = true;
+        config.playlist.last_playlist = Some(PathBuf::from("test.m3u"));
+        config.plugins.plugin_dir = Some(PathBuf::from("plugins"));
+        config.plugins.vis_plugin = Some("vis.dll".into());
+        config.plugins.vis_preset = Some("preset".into());
+        config.plugins.disabled = vec!["bad.dll".into()];
+
+        save(&config, &path).expect("save succeeds");
+
+        let loaded = load(Some(&path)).expect("load succeeds");
+        // Persisted fields survive:
+        assert_eq!(loaded.config.audio.volume, 180);
+        // Unpersisted fields cleanly revert to their documented defaults:
+        assert_eq!(loaded.config.audio.output, Config::default().audio.output);
+        assert_eq!(loaded.config.audio.device, Config::default().audio.device);
+        assert_eq!(
+            loaded.config.audio.buffer_ms,
+            Config::default().audio.buffer_ms
+        );
+        assert_eq!(
+            loaded.config.audio.fadeout_ms,
+            Config::default().audio.fadeout_ms
+        );
+        assert_eq!(loaded.config.audio.gapless, Config::default().audio.gapless);
+        assert_eq!(
+            loaded.config.audio.replaygain,
+            Config::default().audio.replaygain
+        );
+        assert_eq!(
+            loaded.config.ui.snap_distance,
+            Config::default().ui.snap_distance
+        );
+        assert_eq!(loaded.config.playlist, Config::default().playlist);
+        assert_eq!(loaded.config.plugins, Config::default().plugins);
     }
 
     #[test]

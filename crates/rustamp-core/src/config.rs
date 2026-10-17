@@ -205,33 +205,106 @@ mod tests {
 
     #[test]
     fn toml_roundtrip() {
-        let mut c = Config::default();
-        c.audio.volume = 77;
-        c.audio.device = Some("Speakers".into());
-        c.ui.skin = Some(PathBuf::from("skins/base.wsz"));
-        c.eq.state.bands[3] = 4.5;
-        c.eq.state.enabled = true;
-        c.ui.windows = vec![
-            WindowLayout {
-                id: WindowId::Main,
-                x: 10,
-                y: -4,
-                visible: true,
-                shaded: false,
-                width: None,
-                height: None,
+        // Sets EVERY field of EVERY configuration type to a non-default value
+        // and asserts that the loaded configuration equals the written one.
+        // Exhaustive struct literals ensure at compile time that no field can
+        // ever be added to any config struct without being tested here.
+        let c = Config {
+            version: 42,
+            audio: AudioConfig {
+                output: "cpal".into(),
+                device: Some("Speakers".into()),
+                buffer_ms: 350,
+                fadeout_ms: 800,
+                gapless: false,
+                replaygain: ReplayGainMode::Track,
+                volume: 77,
+                balance: -35,
             },
-            WindowLayout {
-                id: WindowId::Gen(3),
-                x: 0,
-                y: 0,
-                visible: false,
-                shaded: true,
-                width: Some(275),
-                height: Some(232),
+            ui: UiConfig {
+                skin: Some(PathBuf::from("skins/base.wsz")),
+                double_size: true,
+                always_on_top: true,
+                easy_move: false,
+                snap_distance: 25,
+                windows: vec![
+                    WindowLayout {
+                        id: WindowId::Main,
+                        x: 10,
+                        y: -4,
+                        visible: true,
+                        shaded: false,
+                        width: None,
+                        height: None,
+                    },
+                    WindowLayout {
+                        id: WindowId::Equalizer,
+                        x: 10,
+                        y: 112,
+                        visible: true,
+                        shaded: true,
+                        width: None,
+                        height: None,
+                    },
+                    WindowLayout {
+                        id: WindowId::Playlist,
+                        x: 10,
+                        y: 228,
+                        visible: false,
+                        shaded: false,
+                        width: Some(275),
+                        height: Some(116),
+                    },
+                    WindowLayout {
+                        id: WindowId::Vis,
+                        x: 285,
+                        y: -4,
+                        visible: true,
+                        shaded: false,
+                        width: Some(275),
+                        height: Some(200),
+                    },
+                    WindowLayout {
+                        id: WindowId::Gen(3),
+                        x: 0,
+                        y: 0,
+                        visible: false,
+                        shaded: true,
+                        width: Some(275),
+                        height: Some(232),
+                    },
+                    WindowLayout {
+                        id: WindowId::Video,
+                        x: 560,
+                        y: -4,
+                        visible: false,
+                        shaded: false,
+                        width: Some(352),
+                        height: Some(240),
+                    },
+                ],
             },
-        ];
-        c.plugins.disabled = vec!["vis_x.dll".into()];
+            eq: EqConfig {
+                state: EqState {
+                    bands: [1.0, 2.0, 3.0, 4.5, 5.0, -1.0, -2.0, -3.0, -4.0, -5.0],
+                    preamp: 3.5,
+                    enabled: false,
+                    auto: true,
+                },
+            },
+            playlist: PlaylistConfig {
+                shuffle: true,
+                repeat: true,
+                manual_advance: true,
+                last_playlist: Some(PathBuf::from("playlists/favs.m3u")),
+            },
+            plugins: PluginsConfig {
+                plugin_dir: Some(PathBuf::from("custom/plugins")),
+                vis_plugin: Some("vis_milk2.dll".into()),
+                vis_preset: Some("preset_1.milk".into()),
+                disabled: vec!["vis_x.dll".into(), "bad_dsp.dll".into()],
+            },
+        };
         let s = toml::to_string(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(c, back);

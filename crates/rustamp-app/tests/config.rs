@@ -67,11 +67,38 @@ fn config_round_trip_honours_all_supported_fields() {
             y: 307,
             visible: false,
             shaded: false,
-            width: None,
-            height: None,
+            width: Some(275),
+            height: Some(116),
+        },
+        WindowLayout {
+            id: WindowId::Vis,
+            x: 330,
+            y: 75,
+            visible: true,
+            shaded: false,
+            width: Some(275),
+            height: Some(200),
+        },
+        WindowLayout {
+            id: WindowId::Gen(42),
+            x: 330,
+            y: 285,
+            visible: true,
+            shaded: false,
+            width: Some(300),
+            height: Some(250),
+        },
+        WindowLayout {
+            id: WindowId::Video,
+            x: 610,
+            y: 75,
+            visible: false,
+            shaded: false,
+            width: Some(352),
+            height: Some(240),
         },
     ];
-    config.eq.state.enabled = true;
+    config.eq.state.enabled = false;
     config.eq.state.auto = true;
     config.eq.state.preamp = 5.0;
     config.eq.state.bands = [1.5, 2.5, 3.5, 4.5, 5.5, -1.5, -2.5, -3.5, -4.5, -5.5];
@@ -98,6 +125,10 @@ fn config_round_trip_honours_all_supported_fields() {
     assert!(!loaded.config.ui.easy_move);
     assert_eq!(loaded.config.ui.windows, config.ui.windows);
     assert_eq!(loaded.config.eq.state, config.eq.state);
+    assert_eq!(
+        loaded.config, config,
+        "entire loaded configuration must equal written configuration"
+    );
 }
 
 #[test]
