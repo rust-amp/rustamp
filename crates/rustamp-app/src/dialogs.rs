@@ -24,10 +24,11 @@
 //! * Jump to time: the prompt plus the typed input. Jump to file opens the
 //!   same box shape; confirming it to a playlist index needs the playlist
 //!   and stays open (only the time box confirms, to [`Command::Seek`]).
-//! * Load playlist: the spec'd title plus an empty file field. There is no
-//!   file picker yet and confirmation is deliberately unmapped: RFC 0010
-//!   leaves replace-versus-append (and the file filter) open, so `Enter`
-//!   does nothing and the dialog stays open.
+//! * Load playlist: the spec'd title plus an entry field (or staged pick) for
+//!   the playlist file. `Enter` confirms and loads the chosen playlist file
+//!   through [`App::load_playlist_file`], enqueuing its surviving tracks in
+//!   order, beginning playback, and surfacing any skipped entries. With
+//!   nothing chosen `Enter` stays consumed and the dialog stays open.
 //! * Open media: a kind-specific face — the prompt plus the entry field for
 //!   the files and directory faces, the staged-pick summary when picks were
 //!   staged, or the typed URL for the location face, then a one-line hint.
@@ -58,7 +59,9 @@ use std::path::PathBuf;
 use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
 use rustamp_gfx::Image;
 use rustamp_prefs::page_name;
-use rustamp_ui::{DialogKind, Key, SkinEntry, dialog_for_command, render_dialog, skin_entries};
+use rustamp_ui::{
+    DialogKind, Key, MAX_MEDIA_LEN, SkinEntry, dialog_for_command, render_dialog, skin_entries,
+};
 
 use crate::app::App;
 
@@ -69,9 +72,19 @@ impl App {
     ///
     /// Returns the opened dialog, or `None` when the command opens no
     /// implemented dialog (the caller keeps its existing note path then).
+    /// Opens the dialog `command` asks for, when it asks for one the app now
+    /// implements (About, file info, either jump box, load playlist, the
+    /// three open-media faces, skin browser, preferences).
+    ///
+    /// Returns the opened dialog, or `None` when the command opens no
+    /// implemented dialog (the caller keeps its existing note path then).
     pub fn open_dialog_for(&mut self, command: &Command) -> Option<DialogKind> {
         let dialog = dialog_for_command(command)?;
         self.dialogs.open(dialog);
+        if dialog == DialogKind::LoadPlaylist {
+            self.playlist_dialog_path = None;
+            self.playlist_dialog_text.clear();
+        }
         // The browser moves its selection with the arrow keys, and without the
         // row count a held Down would overrun the end and a following Up would
         // appear dead. Tell the manager how many rows it is looking at.
@@ -109,12 +122,18 @@ impl App {
 
     /// Closes `dialog` when it is open.
     pub fn close_dialog(&mut self, dialog: DialogKind) {
+        if dialog == DialogKind::LoadPlaylist {
+            self.playlist_dialog_path = None;
+            self.playlist_dialog_text.clear();
+        }
         self.dialogs.close(dialog);
     }
 
     /// Closes whatever dialog is open, if any. Returns whether one was open.
     pub fn close_open_dialog(&mut self) -> bool {
         let open = self.dialogs.open_kind().is_some();
+        self.playlist_dialog_path = None;
+        self.playlist_dialog_text.clear();
         self.dialogs.close_any();
         open
     }
@@ -122,24 +141,55 @@ impl App {
     /// A key press while a dialog is focused.
     ///
     /// `Enter` confirms the jump-to-time box (submitting the resulting
-    /// [`Command::Seek`]), the skin browser's selected skin, or the
+    /// [`Command::Seek`]), the skin browser's selected skin, the
+    /// load-playlist dialog (loading the file and closing the dialog), or the
     /// open-media dialog (submitting the resulting [`Command::AddItems`] and
     /// closing it; with nothing to confirm the dialog stays open);
     /// `Escape` closes the open dialog; digits type into the jump box (and
-    /// letters/digits/spaces into the open-media field) and
-    /// arrows move the skin selection. `Enter` on the load-playlist dialog is
-    /// consumed and does nothing (RFC 0010 leaves its confirmation open), as
-    /// it is on the preferences frame (whose contents are unmeasured, S04
-    /// open, so there is nothing to confirm).
+    /// letters/digits/spaces into the open-media and load-playlist fields) and
+    /// arrows move the skin selection.
     /// Returns `true` when the key was consumed.
     pub fn dialog_key(&mut self, key: Key) -> bool {
+        let is_load_playlist = self.dialog_is_open(DialogKind::LoadPlaylist);
+        if is_load_playlist {
+            match key {
+                Key::Backspace => {
+                    self.playlist_dialog_text.pop();
+                    return true;
+                }
+                Key::Digit(digit) | Key::Numpad(digit) => {
+                    let ch = (b'0' + (digit % 10)) as char;
+                    if self.playlist_dialog_text.chars().count() < MAX_MEDIA_LEN {
+                        self.playlist_dialog_text.push(ch);
+                    }
+                    return true;
+                }
+                Key::Letter(letter) => {
+                    if self.playlist_dialog_text.chars().count() < MAX_MEDIA_LEN {
+                        self.playlist_dialog_text.push(letter as char);
+                    }
+                    return true;
+                }
+                Key::Space => {
+                    if self.playlist_dialog_text.chars().count() < MAX_MEDIA_LEN {
+                        self.playlist_dialog_text.push(' ');
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         let consumed = self.dialogs.key(key);
         if !consumed {
             return false;
         }
         match key {
             Key::Enter => {
-                if let Some(seek) = self.dialogs.confirm_jump_time() {
+                if is_load_playlist {
+                    if self.confirm_load_playlist() {
+                        self.dialogs.close_any();
+                    }
+                } else if let Some(seek) = self.dialogs.confirm_jump_time() {
                     // A failed submit still consumed the key: the dialog stays
                     // open so the user can retry. On success, close the dialog so
                     // it does not linger or double-apply.
@@ -157,9 +207,34 @@ impl App {
                     }
                 }
             }
-            Key::Escape => self.dialogs.close_any(),
+            Key::Escape => {
+                self.playlist_dialog_path = None;
+                self.playlist_dialog_text.clear();
+                self.dialogs.close_any();
+            }
             _ => {}
         }
+        true
+    }
+
+    /// Confirms the load-playlist dialog: loads the chosen playlist file
+    /// through [`App::load_playlist_file`]. Returns whether a path was chosen
+    /// and confirmed (the dialog closes on confirm); with nothing chosen the
+    /// dialog stays open so the user can retry.
+    pub(crate) fn confirm_load_playlist(&mut self) -> bool {
+        let path = if let Some(p) = self.playlist_dialog_path.take() {
+            p
+        } else {
+            let trimmed = self.playlist_dialog_text.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            PathBuf::from(trimmed)
+        };
+        let _ = self.load_playlist_file(&path, true);
+        self.playlist_dialog_text.clear();
+        self.playlist_dialog_path = None;
+        self.dialogs.close_any();
         true
     }
 
@@ -167,7 +242,7 @@ impl App {
     /// text of a key press there instead of the key, see
     /// [`App::dialog_text`]).
     pub fn dialog_accepts_text(&self) -> bool {
-        self.dialogs.accepts_text()
+        self.dialogs.accepts_text() || self.dialog_is_open(DialogKind::LoadPlaylist)
     }
 
     /// Text the OS produced for a key press while a dialog is focused
@@ -176,31 +251,69 @@ impl App {
     /// [`rustamp_ui::DialogManager::type_text`]). Returns whether anything
     /// was typed; control characters are left to [`App::dialog_key`].
     pub fn dialog_text(&mut self, text: &str) -> bool {
+        if self.dialog_is_open(DialogKind::LoadPlaylist) {
+            let mut typed = false;
+            for ch in text.chars().filter(|ch| !ch.is_control()) {
+                if self.playlist_dialog_text.chars().count() < MAX_MEDIA_LEN {
+                    self.playlist_dialog_text.push(ch);
+                    typed = true;
+                }
+            }
+            return typed;
+        }
         self.dialogs.type_text(text)
     }
 
     /// A file dropped from the shell onto the dialog window: the open-media
-    /// file faces stage it as a pick (`Enter` still confirms). Returns
-    /// whether the open dialog took it.
+    /// and load-playlist dialogs stage it as a pick (`Enter` still confirms).
+    /// Returns whether the open dialog took it.
     pub fn dialog_drop_file(&mut self, path: PathBuf) -> bool {
+        if self.dialog_is_open(DialogKind::LoadPlaylist) {
+            self.playlist_dialog_path = Some(path);
+            return true;
+        }
         self.dialogs.drop_media_path(path)
     }
 
-    /// The open-media dialog's entry field text.
+    /// The open-media or load-playlist dialog's entry field text.
     pub fn media_text(&self) -> &str {
+        if self.dialog_is_open(DialogKind::LoadPlaylist) {
+            return &self.playlist_dialog_text;
+        }
         self.dialogs.media_text()
     }
 
-    /// Replaces the open-media dialog's entry field (a full path or URL; see
-    /// [`rustamp_ui::DialogManager::set_media_text`](rustamp_ui::DialogManager::set_media_text)).
+    /// Replaces the open-media or load-playlist dialog's entry field (a full path or URL).
     pub fn set_media_text(&mut self, text: &str) {
+        if self.dialog_is_open(DialogKind::LoadPlaylist) {
+            self.playlist_dialog_text = text.to_string();
+            return;
+        }
         self.dialogs.set_media_text(text);
     }
 
-    /// Stages the open-media dialog's picks (the stand-in for the OS picker's
-    /// result; see [`rustamp_ui::DialogManager::stage_media_paths`](rustamp_ui::DialogManager::stage_media_paths)).
+    /// Stages the open-media or load-playlist dialog's picks.
     pub fn stage_media_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.dialog_is_open(DialogKind::LoadPlaylist) {
+            self.playlist_dialog_path = paths.into_iter().next();
+            return;
+        }
         self.dialogs.stage_media_paths(paths);
+    }
+
+    /// Stages a playlist file pick for the load-playlist dialog.
+    pub fn stage_playlist_path(&mut self, path: PathBuf) {
+        self.playlist_dialog_path = Some(path);
+    }
+
+    /// Sets the text in the load-playlist dialog's entry field.
+    pub fn set_playlist_text(&mut self, text: &str) {
+        self.playlist_dialog_text = text.to_string();
+    }
+
+    /// The text in the load-playlist dialog's entry field.
+    pub fn playlist_text(&self) -> &str {
+        &self.playlist_dialog_text
     }
 
     /// The jump box's current input text.
@@ -233,10 +346,8 @@ impl App {
                 "Playlist number:".to_string(),
                 self.dialogs.jump_text().to_string(),
             ],
-            // No file picker yet and no confirmation mapping (RFC 0010
-            // leaves the semantics open): the prompt plus an empty field,
-            // the same box shape as the jump dialogs.
-            DialogKind::LoadPlaylist => vec!["Playlist file:".to_string(), String::new()],
+            // Prompt plus the staged pick or typed field, then the one-line hint.
+            DialogKind::LoadPlaylist => self.load_playlist_lines(),
             // Kind-specific faces with plain own-choice prompts (the
             // reference's layout and wording are unmeasured, S04 open): the
             // files/directory faces show the staged picks when the OS
@@ -300,6 +411,23 @@ impl App {
                 ]
             }
         }
+    }
+
+    /// The load-playlist dialog's body lines: the prompt plus the staged pick
+    /// or typed field, then the one-line hint.
+    pub(crate) fn load_playlist_lines(&self) -> Vec<String> {
+        let field = if let Some(path) = &self.playlist_dialog_path {
+            field_tail(&path.display().to_string())
+        } else if self.playlist_dialog_text.is_empty() {
+            String::new()
+        } else {
+            field_tail(&self.playlist_dialog_text)
+        };
+        vec![
+            "Playlist file:".to_string(),
+            field,
+            OPEN_PLAYLIST_HINT.to_string(),
+        ]
     }
 
     /// The skin browser's rows from live app state (see
@@ -378,6 +506,10 @@ impl App {
 /// (the reference dialog is an OS picker whose labels are unmeasured, S04
 /// open); paste is not offered because there is no clipboard binding.
 pub(crate) const OPEN_MEDIA_HINT: &str = "Type a path or drop files, Enter adds.";
+
+/// The load-playlist dialog's last line: how to reach a file. Own wording
+/// (the reference dialog is an OS picker whose labels are unmeasured, S04 open).
+pub(crate) const OPEN_PLAYLIST_HINT: &str = "Type a path or drop a file, Enter loads.";
 
 /// How many characters of a field fit on one dialog line: the open-media
 /// client width less both text pads, in `text.bmp` cells (5 px).
