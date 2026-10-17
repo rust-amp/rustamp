@@ -207,8 +207,10 @@ pub use rustamp_meta::replaygain::parse_gain_db;
 pub fn select_gain_db(extra: &BTreeMap<String, String>, mode: ReplayGainMode) -> Option<f32> {
     // Delegate to the metadata crate's reader, so the key spellings and the
     // gain-string parsing live in one place.
-    let mut metadata = rustamp_core::meta::TrackMetadata::default();
-    metadata.extra = extra.clone();
+    let metadata = rustamp_core::meta::TrackMetadata {
+        extra: extra.clone(),
+        ..Default::default()
+    };
     let tags = rustamp_meta::replaygain::ReplayGainTags::from_metadata(&metadata);
     let track = tags.track_gain_db;
     let album = tags.album_gain_db;
