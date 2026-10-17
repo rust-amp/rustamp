@@ -18,22 +18,6 @@ tree). The license is the one each crate declares in its published
 GPL-3.0-or-later. None of them is in the dependency closure of a permissive
 Rustamp crate: they enter through `rustamp-audio`, which is GPL-3.0-or-later.
 
-| Crate | Version | License | Used in | Purpose |
-|---|---|---|---|---|
-| [`rubato`](https://github.com/HEnquist/rubato) | 5.0.1 | MIT OR Apache-2.0 | `rustamp-audio` (`src/convert.rs`) | Band-limited sample-rate conversion (synchronous FFT resampler, asynchronous sinc fallback). crates.io's license field is empty and GitHub reports NOASSERTION, but the crate's `Cargo.toml` declares `MIT OR Apache-2.0` and the package ships `LICENSE-MIT` and `LICENSE-APACHE`. |
-| `audioadapter` | 5.0.0 | MIT OR Apache-2.0 | via `rubato` | Buffer-layout traits for rubato's input and output. |
-| `audioadapter-buffers` | 5.2.0 | MIT OR Apache-2.0 | via `rubato` (used through rubato's re-export) | The `InterleavedSlice` views the converter hands to rubato. |
-| `audioadapter-sample` | 5.2.0 | MIT OR Apache-2.0 | via `rubato` | Sample-format conversions for the adapters. |
-| `audio-codec-algorithms` | 0.8.1 | 0BSD OR Apache-2.0 | via `audioadapter-sample` | Sample-format helpers. |
-| `realfft` | 3.5.0 | MIT | via `rubato` | Real-to-complex FFT for the FFT resampler. |
-| `rustfft` | 6.4.1 | MIT OR Apache-2.0 | via `realfft` | FFT implementation. |
-| `num-complex` | 0.4.6 | MIT OR Apache-2.0 | via `rubato`, `rustfft` | Complex numbers. |
-| `primal-check` | 0.3.4 | MIT OR Apache-2.0 | via `rustfft` | Primality test for FFT planning. |
-| `strength_reduce` | 0.2.4 | MIT OR Apache-2.0 | via `rustfft` | Fast integer division for FFT planning. |
-| `transpose` | 0.2.3 | MIT OR Apache-2.0 | via `rustfft` | Matrix transposition for FFT planning. |
-| `visibility` | 0.1.1 | Zlib OR MIT OR Apache-2.0 | via `rubato` (proc macro, build time only) | Visibility attribute macro. |
-| `windowfunctions` | 0.1.1 | MIT | via `rubato` | Window functions for the anti-aliasing filters. |
-
 Projects we expect to draw from: DeaDBeeF (zlib / GPL / LGPL), webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib), libopenmpt (BSD-3-Clause).
 
 Not bundled: the original Winamp base skin. It is distributed separately as an optional download, and it is used in tests.
@@ -98,6 +82,7 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `windows` | Windows API bindings | ipc, platform, plughost, xtask (Windows only) |
 | `rtrb` | Lock-free audio ring | audio |
 | `cpal` | Cross-platform audio output; loopback capture | output; app (dev) |
+| `rubato` | Band-limited sample-rate conversion (FFT engine; sinc fallback) | audio |
 | `wasapi` | Windows audio output | output |
 | `zip` | Skin archive reading | skin |
 | `lofty` | Audio tags and metadata | meta |
@@ -144,6 +129,10 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `as-raw-xcb-connection` | `1.0.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `atomic-polyfill` | `1.0.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `atomic-waker` | `1.1.2` | `Apache-2.0 OR MIT` | `crates.io` |
+| `audio-codec-algorithms` | `0.8.1` | `0BSD OR Apache-2.0` | `crates.io` |
+| `audioadapter` | `5.0.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `audioadapter-buffers` | `5.2.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `audioadapter-sample` | `5.2.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `autocfg` | `1.5.1` | `Apache-2.0 OR MIT` | `crates.io` |
 | `bitflags` | `1.3.2` | `MIT/Apache-2.0` | `crates.io` |
 | `bitflags` | `2.13.2` | `MIT OR Apache-2.0` | `crates.io` |
@@ -240,6 +229,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `ndk-context` | `0.1.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `ndk-sys` | `0.6.0+11769913` | `MIT OR Apache-2.0` | `crates.io` |
 | `nix` | `0.31.3` | `MIT` | `crates.io` |
+| `num-complex` | `0.4.6` | `MIT OR Apache-2.0` | `crates.io` |
 | `num-derive` | `0.4.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `num-integer` | `0.1.47` | `MIT OR Apache-2.0` | `crates.io` |
 | `num-traits` | `0.2.19` | `MIT OR Apache-2.0` | `crates.io` |
@@ -286,6 +276,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `png` | `0.18.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `polling` | `3.11.0` | `Apache-2.0 OR MIT` | `crates.io` |
 | `postcard` | `1.1.3` | `MIT OR Apache-2.0` | `crates.io` |
+| `primal-check` | `0.3.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `proc-macro-crate` | `3.5.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `proc-macro2` | `1.0.107` | `MIT OR Apache-2.0` | `crates.io` |
 | `quick-xml` | `0.41.0` | `MIT` | `crates.io` |
@@ -293,11 +284,14 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `r-efi` | `5.3.0` | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | `crates.io` |
 | `r-efi` | `6.0.0` | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | `crates.io` |
 | `raw-window-handle` | `0.6.2` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
+| `realfft` | `3.5.0` | `MIT` | `crates.io` |
 | `redox_syscall` | `0.4.1` | `MIT` | `crates.io` |
 | `redox_syscall` | `0.5.18` | `MIT` | `crates.io` |
 | `redox_syscall` | `0.9.4` | `MIT` | `crates.io` |
 | `rtrb` | `0.4.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `rubato` | `5.0.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `rustc_version` | `0.4.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `rustfft` | `6.4.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `rustix` | `0.38.44` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `rustix` | `1.1.5` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `rustversion` | `1.0.23` | `MIT OR Apache-2.0` | `crates.io` |
@@ -321,6 +315,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `softbuffer` | `0.4.8` | `MIT OR Apache-2.0` | `crates.io` |
 | `spin` | `0.9.9` | `MIT` | `crates.io` |
 | `stable_deref_trait` | `1.2.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `strength_reduce` | `0.2.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `strict-num` | `0.1.1` | `MIT` | `crates.io` |
 | `symphonia` | `0.5.5` | `MPL-2.0` | `crates.io` |
 | `symphonia-bundle-flac` | `0.5.5` | `MPL-2.0` | `crates.io` |
@@ -357,11 +352,13 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `toml_writer` | `1.1.3+spec-1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `tracing` | `0.1.44` | `MIT` | `crates.io` |
 | `tracing-core` | `0.1.36` | `MIT` | `crates.io` |
+| `transpose` | `0.2.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `ttf-parser` | `0.25.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `typed-path` | `0.12.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `unicode-ident` | `1.0.27` | `(MIT OR Apache-2.0) AND Unicode-3.0` | `crates.io` |
 | `unicode-segmentation` | `1.13.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `version_check` | `0.9.5` | `MIT/Apache-2.0` | `crates.io` |
+| `visibility` | `0.1.1` | `Zlib OR MIT OR Apache-2.0` | `crates.io` |
 | `walkdir` | `2.5.0` | `Unlicense/MIT` | `crates.io` |
 | `wasapi` | `0.26.0` | `MIT` | `crates.io` |
 | `wasip2` | `1.0.4+wasi-0.2.12` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
@@ -382,6 +379,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `web-sys` | `0.3.106` | `MIT OR Apache-2.0` | `crates.io` |
 | `web-time` | `1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `winapi-util` | `0.1.11` | `Unlicense OR MIT` | `crates.io` |
+| `windowfunctions` | `0.1.1` | `MIT` | `crates.io` |
 | `windows` | `0.62.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `windows-collections` | `0.3.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `windows-core` | `0.62.2` | `MIT OR Apache-2.0` | `crates.io` |
