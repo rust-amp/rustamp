@@ -60,6 +60,22 @@
 //!   recomputed every [`SUB_BLOCK`] frames and the preamp factor is
 //!   interpolated per frame inside each sub-block.
 //!
+//! # Signal hygiene (own choice)
+//!
+//! * **NaN and infinities become silence at the stage input.** A non-finite
+//!   sample would otherwise lodge in the biquad history (`z1`/`z2` stay NaN
+//!   once NaN enters, because every comparison against NaN is false) and
+//!   poison every later frame. The decode thread already replaces non-finite
+//!   samples before the chain; this is defense in depth for any other caller.
+//! * **Subnormals pass through.** They are finite, so they cannot poison the
+//!   history; subnormal *history* is flushed to zero instead
+//!   ([`Biquad::flush_tiny`], −4000 dBFS threshold). The resampled path
+//!   flushes subnormal outputs in the converter, where the bit-exact
+//!   equal-rate promise does not apply.
+//! * **DC passes.** Every peaking section is unity at DC by construction, so a
+//!   constant is returned unchanged except for the preamp factor (pinned by
+//!   `dc_passes_at_unity_through_boosted_bands`).
+//!
 //! # Threading
 //!
 //! The stage lives on the decode thread; the engine owns an [`EqControl`]
@@ -74,6 +90,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use rustamp_core::audio::{AudioSpec, DspStage};
 use rustamp_core::error::Result;
 use rustamp_core::state::{EQ_BANDS, EqState};
+
+use crate::sanitize_sample;
 
 /// Band centre frequencies in Hz. **Own choice**: the base skin's printed band
 /// labels (S01), not measured filter centres.
@@ -445,7 +463,10 @@ impl DspStage for Equalizer {
             self.sub_pos = (self.sub_pos + 1) % SUB_BLOCK;
             let mix = self.mix;
             for (sample, history) in frame.iter_mut().zip(self.history.iter_mut()) {
-                let dry = *sample;
+                // Hostile input becomes silence here; subnormals and DC pass
+                // through (see the module docs). Full bypass above stays
+                // bit-exact because it returns before reaching this line.
+                let dry = sanitize_sample(*sample);
                 // Preamp first, then the bands in ascending order.
                 let mut y = f64::from(dry) * preamp;
                 for ((section, coefs), active) in history
@@ -754,5 +775,120 @@ mod tests {
         bands[4] = 40.0;
         let measured = gain_db(&enabled(bands, f32::INFINITY), BAND_CENTERS_HZ[4]);
         assert!((measured - 12.0).abs() < 0.05, "measured {measured}");
+    }
+
+    /// Every band hits its own centre gain at both anchors, not just band 4:
+    /// the peaking section has exactly the requested gain at its centre by
+    /// construction. Tolerance matches `s09_anchors_...` (±0.05 dB).
+    #[test]
+    fn all_bands_hit_their_centre_gain_at_both_anchors() {
+        for band in 0..EQ_BANDS {
+            for db in [12.0_f32, -12.0] {
+                let mut bands = [0.0; EQ_BANDS];
+                bands[band] = db;
+                let measured = gain_db(&enabled(bands, 0.0), BAND_CENTERS_HZ[band]);
+                assert!(
+                    (measured - f64::from(db)).abs() < 0.05,
+                    "band {band} at {db} dB: measured {measured:.3} dB"
+                );
+            }
+        }
+    }
+
+    /// The intermediate law is linear in dB (own choice): ±6 dB land halfway
+    /// between the anchors, at the centre and through the preamp.
+    #[test]
+    fn intermediate_gains_are_linear_in_db() {
+        let mut bands = [0.0; EQ_BANDS];
+        bands[4] = 6.0;
+        let measured = gain_db(&enabled(bands, 0.0), BAND_CENTERS_HZ[4]);
+        assert!((measured - 6.0).abs() < 0.05, "measured {measured}");
+
+        // Preamp at +6 dB: the exact linear factor, bit for bit.
+        let input = noise(1024);
+        let mut out = input.clone();
+        stage(&enabled([0.0; EQ_BANDS], 6.0), 1).process(&mut out);
+        let factor = 10.0_f64.powf(6.0 / 20.0);
+        for (x, y) in input.iter().zip(out.iter()) {
+            let expected = (f64::from(*x) * factor) as f32;
+            assert_eq!(y.to_bits(), expected.to_bits());
+        }
+    }
+
+    /// DC is unity through the bands: a constant returns unchanged (times the
+    /// exact preamp factor), even with every band at full boost. Peaking
+    /// sections are unity at DC by construction; the last half second is
+    /// measured so the step transient has settled.
+    #[test]
+    fn dc_passes_at_unity_through_boosted_bands() {
+        let dc = vec![0.5_f32; FS as usize];
+        for preamp in [0.0_f32, 12.0, -12.0] {
+            let mut out = dc.clone();
+            stage(&enabled([12.0; EQ_BANDS], preamp), 1).process(&mut out);
+            let factor = 10.0_f64.powf(f64::from(preamp) / 20.0) as f32;
+            let half = FS as usize / 2;
+            for (i, y) in out[half..].iter().enumerate() {
+                let want = 0.5 * factor;
+                assert!(
+                    (y - want).abs() <= 1e-5 * want.abs().max(1e-6),
+                    "preamp {preamp} dB, frame {}: {y} != {want}",
+                    half + i
+                );
+            }
+        }
+    }
+
+    /// A hostile block (NaN, ±infinity) comes out as silence, stays finite,
+    /// and leaves no poison behind: the next block matches a stage that saw
+    /// zeros instead, bit for bit (the sanitizer maps non-finite to exactly
+    /// `0.0` before the filters).
+    #[test]
+    fn non_finite_input_becomes_silence_without_poisoning_history() {
+        let state = enabled(
+            [12.0, -12.0, 6.0, -6.0, 3.0, -3.0, 9.0, -9.0, 12.0, 0.0],
+            6.0,
+        );
+        let mut hostile = noise(2048);
+        hostile[0] = f32::NAN;
+        hostile[500] = f32::INFINITY;
+        hostile[1000] = f32::NEG_INFINITY;
+        hostile[1500] = f32::NAN;
+
+        let mut used = stage(&state, 1);
+        let mut out = hostile.clone();
+        used.process(&mut out);
+        assert!(
+            out.iter().all(|s| s.is_finite()),
+            "nothing non-finite leaves"
+        );
+
+        // What follows the poison must equal what follows zeros.
+        let probe = sine(440.0, 0.25, 2048);
+        let mut a = probe.clone();
+        used.process(&mut a);
+        let mut fresh = stage(&state, 1);
+        let mut zeros = vec![0.0; 2048];
+        fresh.process(&mut zeros);
+        let mut b = probe.clone();
+        fresh.process(&mut b);
+        assert_eq!(
+            bits(&a),
+            bits(&b),
+            "history after poison == history after zeros"
+        );
+    }
+
+    /// Subnormal signal values pass through the processing path unchanged:
+    /// they are finite and cannot poison the history. (The resampled path
+    /// flushes them in the converter; full bypass never touches the buffer.)
+    #[test]
+    fn subnormal_signal_passes_through_unchanged() {
+        let input: Vec<f32> = noise(2048).iter().map(|s| s * 1e-40).collect();
+        assert!(input.iter().all(|s| s.is_subnormal() || *s == 0.0));
+        let mut out = input.clone();
+        // An enabled, flat stage: the processing loop runs (no early bypass)
+        // but no band and no preamp touches the samples.
+        stage(&enabled([0.0; EQ_BANDS], 0.0), 1).process(&mut out);
+        assert_eq!(bits(&out), bits(&input), "subnormals pass through");
     }
 }

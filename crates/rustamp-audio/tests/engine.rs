@@ -1801,6 +1801,51 @@ fn a_non_finite_sample_never_reaches_the_device() {
     }
 }
 
+// A14. With the default chain (limiter enabled) on a resampling device, a
+// hot signal stays within 0 dBFS end to end, at the exact length the duration
+// implies. The 4x boost runs before the limiter (the engine order is EQ ->
+// installed stages -> limiter), so the limiter brings the 2.0 sine down to
+// its ceiling and the resampler reconstructs it; the converter's final
+// ceiling is the bound asserted here.
+//
+// What it cannot prove: that the safety net engaged (a resampled sine never
+// exceeds its own amplitude, so nothing here reaches 1.0), or anything about
+// a real device. Engagement is pinned at converter and chain level.
+#[test]
+fn a_hot_resampled_run_with_the_limiter_holds_0dbfs() {
+    let mut h = harness_48k(&["tone0_22050.tst", "tone22050_22050.tst"]);
+    h.engine
+        .set_dsp_chain(vec![Box::new(GainBoostDspStage(4.0))]);
+    assert!(h.engine.limiter_enabled(), "the default chain limits");
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered(), "both tracks must be buffered");
+    let total = 48_000_u64;
+    assert_eq!(h.engine.end_of_stream(), Some(total));
+    let left = play_out(&mut h, total);
+    let peak = left.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(peak <= 1.0, "above 0 dBFS after resampling: {peak}");
+}
+
+// A14. The guarantee does not depend on the limiter switch: with the limiter
+// off, the same hot signal still never exceeds 0 dBFS, and the safety net
+// demonstrably engages (crest samples sit at exactly ±1.0).
+#[test]
+fn a_hot_resampled_run_without_the_limiter_holds_0dbfs() {
+    let mut h = harness_48k(&["tone0_22050.tst", "tone22050_22050.tst"]);
+    h.engine
+        .set_dsp_chain(vec![Box::new(GainBoostDspStage(4.0))]);
+    h.engine.set_limiter_enabled(false);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_buffered(), "both tracks must be buffered");
+    let total = 48_000_u64;
+    assert_eq!(h.engine.end_of_stream(), Some(total));
+    let left = play_out(&mut h, total);
+    let peak = left.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(peak <= 1.0, "above 0 dBFS with the limiter off: {peak}");
+    let clamped = left.iter().filter(|s| s.abs() == 1.0).count();
+    assert!(clamped > 0, "the safety net never engaged");
+}
+
 /// A6 finding 2, second variant. A seek requested before the output runs
 /// (the initial seek of a run) is not written ahead of the drain, so the
 /// audio after it is the source at the target and the counters line up.

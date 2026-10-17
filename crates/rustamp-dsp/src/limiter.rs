@@ -61,9 +61,12 @@
 //! # Own-choice parameters
 //!
 //! * [`CEILING_DB`] `= -0.3 dBFS`: a sample-peak ceiling just under full scale.
-//!   The limiter sees samples, not the reconstructed waveform; the margin
-//!   leaves a little room for inter-sample peaks and for the small overshoot
-//!   of the band-limited resampler that runs after the DSP chain.
+//!   The limiter sees samples, not the reconstructed waveform; it cannot by
+//!   itself bound what the band-limited resampler after it rebuilds between
+//!   samples (A6 finding 3). The [`FormatConverter`] in `rustamp-audio`
+//!   enforces the final `±1.0` (0 dBFS) ceiling on the resampled path, so the
+//!   ring never holds a sample above full scale; this −0.3 dB margin keeps
+//!   ordinary program material out of that safety net.
 //! * [`LOOKAHEAD_SECONDS`] `= 5 ms`: long enough that the attack ramp spans
 //!   about one period of 200 Hz, so a transient is turned down over a few
 //!   milliseconds instead of being clipped; short enough to keep the added
@@ -76,10 +79,13 @@
 //!
 //! The intended position is the **last** stage of the decode thread's DSP
 //! chain: after the equalizer and any other stage, before the format
-//! converter. After it come only the resampler and the volume/balance gains,
-//! which never raise the level above unity. Inserting it is the engine's
-//! decision (and an owner decision, since it changes the sound once enabled);
-//! this module only provides the stage.
+//! converter. After it come the resampler and the volume/balance gains. The
+//! volume/balance gains never raise the level above unity (attenuation only,
+//! see `rustamp-audio`'s gain module); the resampler **can** rebuild
+//! inter-sample peaks above this stage's ceiling, which is why the converter
+//! holds a final `±1.0` ceiling on the resampled path. Inserting it is the
+//! engine's decision (and an owner decision, since it changes the sound once
+//! enabled); this module only provides the stage.
 //!
 //! # Switching
 //!
@@ -102,6 +108,13 @@ use rustamp_core::error::Result;
 
 /// The output ceiling in dBFS (own choice: -0.3 dBFS, a sample-peak ceiling).
 pub const CEILING_DB: f64 = -0.3;
+
+/// The linear ceiling: no output sample of an active limiter exceeds it.
+/// Kept as a function (not a const) because `powf` is not const-evaluable;
+/// the value is `10^(-0.3/20) ≈ 0.96605`.
+pub fn ceiling_linear() -> f32 {
+    10.0_f64.powf(CEILING_DB / 20.0) as f32
+}
 
 /// Look-ahead, and therefore attack time, in seconds (own choice: 5 ms).
 pub const LOOKAHEAD_SECONDS: f64 = 0.005;
@@ -201,7 +214,7 @@ impl Limiter {
         Limiter {
             control,
             active,
-            ceiling: 10.0_f64.powf(CEILING_DB / 20.0) as f32,
+            ceiling: ceiling_linear(),
             channels: 0,
             lookahead: 1,
             window: 2,
@@ -582,6 +595,11 @@ mod tests {
                 .all(|s| s.is_finite() && s.abs() <= limiter.ceiling())
         );
         assert_eq!(out[1000 + LA * 2], 0.0);
+        // No poison stays behind: a clean block afterwards is finite too.
+        let mut clean = noise(4096 * 2, 16);
+        limiter.process(&mut clean);
+        assert!(clean.iter().all(|s| s.is_finite()));
+        assert!(clean.iter().all(|s| s.abs() <= limiter.ceiling()));
     }
 
     #[test]
@@ -615,5 +633,48 @@ mod tests {
         let mut out = input.clone();
         limiter.process(&mut out);
         assert!(out.iter().all(|s| s.abs() <= limiter.ceiling()));
+    }
+
+    /// DC below the ceiling is delayed bit-exact; DC above it is held at the
+    /// ceiling. The first `lookahead` frames are the zero priming of the
+    /// delay line.
+    #[test]
+    fn dc_is_delayed_exact_and_hot_dc_is_held() {
+        let mut limiter = stage(true, 1);
+        let ceiling = limiter.ceiling();
+        assert!((ceiling - ceiling_linear()).abs() < 1e-9);
+
+        let quiet = vec![0.5_f32; 4 * LA];
+        let mut out = quiet.clone();
+        limiter.process(&mut out);
+        assert!(out[..LA].iter().all(|s| *s == 0.0));
+        assert_eq!(bits(&out[LA..]), bits(&quiet[..quiet.len() - LA]));
+
+        let mut limiter = stage(true, 1);
+        let hot = vec![3.0_f32; 8 * LA];
+        let mut out = hot.clone();
+        limiter.process(&mut out);
+        assert!(out[..LA].iter().all(|s| *s == 0.0));
+        let settled = &out[4 * LA..];
+        let peak = settled.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(peak <= ceiling, "overshoot: {peak} > {ceiling}");
+        assert!(
+            peak >= ceiling * 0.999,
+            "settled {peak}, expected the ceiling {ceiling}"
+        );
+    }
+
+    /// Subnormal signal values pass through an active limiter unchanged
+    /// (delayed): they are finite, so no gain is asked and the exact `1.0`
+    /// fast path keeps them bit for bit.
+    #[test]
+    fn subnormal_signal_passes_through_unchanged() {
+        let mut limiter = stage(true, 1);
+        let input: Vec<f32> = noise(4096, 17).iter().map(|s| s * 1e-40).collect();
+        assert!(input.iter().all(|s| s.is_subnormal() || *s == 0.0));
+        let mut out = input.clone();
+        limiter.process(&mut out);
+        assert!(out[..LA].iter().all(|s| *s == 0.0));
+        assert_eq!(bits(&out[LA..]), bits(&input[..input.len() - LA]));
     }
 }

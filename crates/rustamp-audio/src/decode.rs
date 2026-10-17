@@ -37,7 +37,10 @@
 //!   ahead of what has been written when the track opens.
 //!
 //! A non-finite sample (NaN, infinity) leaving the DSP chain is replaced by
-//! silence before it reaches the vis tap, the converter or the ring.
+//! silence before it reaches the vis tap, the converter or the ring. On the
+//! resampled path the converter additionally holds a final `±1.0` (0 dBFS)
+//! ceiling (see [`FormatConverter`]), so the ring never holds a sample above
+//! full scale however the equalizer and the limiter are set.
 
 use std::path::PathBuf;
 use std::sync::Arc;
