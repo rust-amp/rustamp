@@ -61,9 +61,29 @@ client size, or the player died waiting), `resident-handshake` (no live
 bundled-host child in ~10 s), `capture` (tool exit / no PNG / bad
 signature), `silent-path` (no silent marker on stdout), `stop` (Kill did
 not take), `session` (landed in session 0 / no desktop), plus the outer
-refusals (no interactive session, no done sentinel, session mismatch).
+refusals (no interactive session, no done sentinel, proof with no session
+field, session mismatch).
 A lingering host child after the kill is recorded (`hostReaped: false`) but
 warns rather than fails.
+
+## What the first real runs found (why the runner exists)
+
+Three defects in three runs, each found by running, not by reading: (1) the
+`package` audit refused an incomplete build (a missing load-bearing binary —
+the check working as designed, no script change); (2) the guest script called
+`Invoke-CimMethod -GetOwner`, a parameter that does not exist — fixed to
+`-MethodName GetOwner`; (3) the outer session check refused with `ran in
+session , ...`: failure proofs carried no `session` field, so any inner step
+failure surfaced as an empty session and masked the real cause. Fixed by
+stamping the seen session into every failure proof (inner `Finish-Failure`
+and the `catch` leg) and refusing a session-less proof with its own
+diagnostic that names the failed step. The interactive mechanism itself is
+unchanged and is the GUI-session lane's shape, not a parallel one: discover
+the explorer-owned session (fallback: the Active `query session` console
+row), register a one-shot Scheduled Task as that user with `LogonType
+Interactive` / `RunLevel Limited` (console desktop, no UAC question),
+`Start-ScheduledTask` now, wait on the `done.json` sentinel with a bound,
+unregister, then refuse session 0 / a mismatch loudly.
 
 ## What it still does not prove
 

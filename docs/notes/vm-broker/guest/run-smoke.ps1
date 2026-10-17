@@ -140,10 +140,18 @@ $log = New-Object System.Collections.Generic.List[string]
 function Say($label, $value) { $log.Add(("{0,-22} {1}" -f $label, $value)) }
 
 function Finish-Failure([string]$step, [string]$detail) {
+    # Every failure proof carries the seen session: without it the outer
+    # session check formats an empty value (`ran in session , ...`) and masks
+    # the real step failure. Looked up dynamically so this works no matter
+    # which step calls it.
+    $sess = $null
+    try { $sess = (Get-Process -Id $PID -ErrorAction Stop).SessionId } catch { $sess = $null }
     Say ("STEP FAILED: " + $step) $detail
+    Say 'inner session at failure' $sess
     $log | Set-Content -Path $Transcript -Encoding UTF8
     [pscustomobject]@{
         ok      = $false
+        session = $sess
         failed  = $step
         detail  = $detail
     } | ConvertTo-Json -Depth 6 | Set-Content -Path $ProofPath -Encoding UTF8
@@ -366,9 +374,12 @@ public class SmokeWin {
     @{ ok = $true; failed = 0 } | ConvertTo-Json | Set-Content -Path $DonePath -Encoding UTF8
     exit 0
 } catch {
+    $sess = $null
+    try { $sess = (Get-Process -Id $PID -ErrorAction Stop).SessionId } catch { $sess = $null }
     $log | Set-Content -Path $Transcript -Encoding UTF8
     [pscustomobject]@{
         ok      = $false
+        session = $sess
         failed  = 'inner-exception'
         detail  = $_.Exception.Message
     } | ConvertTo-Json -Depth 6 | Set-Content -Path $ProofPath -Encoding UTF8
@@ -414,6 +425,10 @@ if (-not (Test-Path $ProofPath)) { throw 'STEP guest FAILED: the smoke task fini
 $proof = Get-Content -Path $ProofPath -Raw | ConvertFrom-Json
 
 # --- 6. trust checks: session 0 must fail loudly ---------------------------------
+# A proof with no session field is a diagnostic failure of its own (it used to
+# format as `ran in session , ...`, masking the real step failure): refuse and
+# name the failed step instead of reporting an empty session.
+if ($null -eq $proof.session -or [string]::IsNullOrWhiteSpace([string]$proof.session)) { throw ("STEP guest FAILED: the smoke task produced a proof with no session field (step '{0}': {1}); the session cannot be proven and the run is refused" -f $proof.failed, $proof.detail) }
 if ($proof.session -eq 0) { throw 'STEP guest FAILED: the smoke task ran in session 0, which has no desktop; this run proves nothing and is reported as failed' }
 if ($proof.session -ne $interactiveSession) {
     throw ("STEP guest FAILED: the smoke task ran in session {0}, not the interactive session {1}; refusing" -f $proof.session, $interactiveSession)
