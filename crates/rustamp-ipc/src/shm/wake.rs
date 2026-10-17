@@ -139,8 +139,18 @@ mod backend {
         let ms: u32 = match timeout {
             None => INFINITE,
             Some(d) => {
-                let ms = u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
-                if ms == 0 { 1 } else { ms }
+                let base_ms = u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
+                let has_fraction = d.subsec_nanos() % 1_000_000 != 0;
+                let rounded = if has_fraction {
+                    base_ms.saturating_add(1)
+                } else {
+                    base_ms
+                };
+                if rounded == 0 && d > Duration::ZERO {
+                    1
+                } else {
+                    rounded
+                }
             }
         };
         // SAFETY: `handle` is a valid event handle owned by this `RingWake`.

@@ -1821,13 +1821,14 @@ mod tests {
     /// A timed-out wait returns `TimedOut` / `Ok(0)`, not `Err` or a hang
     /// (RFC 0007 §6.4, acceptance criterion 5).
     ///
-    /// The lower bound on the elapsed time is deliberately absent: it would
-    /// assert how long the kernel event actually blocked, which depends on the
-    /// OS timer and on the event's initial state, and it is not what the
-    /// criterion asks for. What it asks for is that a timeout *returns* - `Ok(0)`
-    /// rather than an error or a hang - and that it does not take absurdly long.
-    /// A wait that returned `TimedOut` early would be a defect of its own and
-    /// needs its own test; it is recorded in `docs/tasks/G2-ipc-blocking.md`.
+    /// The lower bound asserts that the wait actually blocked (elapsed >= 1 ms)
+    /// rather than returning immediately. On Windows with standard timer
+    /// resolution (~15.625 ms), a 10 ms wait evaluates against the kernel timer
+    /// tick and may expire in ~7–8 ms if invoked midway through a tick interval
+    /// (per Microsoft documentation for Win32 wait functions). An assertion of
+    /// `>= 8 ms` failed in the VM due to this tick quantization, not an IPC
+    /// defect. Detailed multi-duration tolerance is measured in
+    /// `blocking_timeout_accuracy_across_durations`.
     #[test]
     fn blocking_timeout_returns_timed_out() {
         let (_producer, mut consumer) = pcm_ring_with_wake(8, 2);
@@ -1836,6 +1837,10 @@ mod tests {
         let result = consumer.read_into_blocking(&mut out, Some(Duration::from_millis(10)));
         let elapsed = start.elapsed();
         assert_eq!(result.unwrap(), 0, "timeout should return Ok(0)");
+        assert!(
+            elapsed >= Duration::from_millis(1),
+            "should block for at least 1ms, took {elapsed:?}"
+        );
         assert!(
             elapsed < Duration::from_millis(200),
             "should not take too long, took {elapsed:?}"
@@ -1846,8 +1851,70 @@ mod tests {
     #[test]
     fn wait_readable_returns_timeout() {
         let (_producer, consumer) = pcm_ring_with_wake(8, 2);
+        let start = std::time::Instant::now();
         let result = consumer.wait_readable(Some(Duration::from_millis(10)));
+        let elapsed = start.elapsed();
         assert_eq!(result.unwrap(), WaitOutcome::TimedOut);
+        assert!(
+            elapsed >= Duration::from_millis(1),
+            "should block for at least 1ms, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "should not take too long, took {elapsed:?}"
+        );
+    }
+
+    /// Measure blocking wait timeout across several durations and multiple runs.
+    /// Fails if any wait returns materially early (task G3 / RFC 0007 §6.4).
+    #[test]
+    fn blocking_timeout_accuracy_across_durations() {
+        const RUNS: usize = 5;
+        let durations = [
+            Duration::from_millis(10),
+            Duration::from_millis(30),
+            Duration::from_millis(60),
+        ];
+
+        let (_producer, mut consumer) = pcm_ring_with_wake(8, 2);
+        let mut out = [0.0f32; 8];
+
+        for &requested in &durations {
+            for run in 0..RUNS {
+                let start = std::time::Instant::now();
+                let result = consumer.read_into_blocking(&mut out, Some(requested));
+                let elapsed = start.elapsed();
+
+                assert_eq!(
+                    result.unwrap(),
+                    0,
+                    "expected Ok(0) on timeout for {requested:?}, run {run}"
+                );
+
+                // Lower bound tolerance:
+                // Standard Windows kernel timer resolution is ~15.625ms (64 Hz).
+                // A timeout can expire up to one tick early if started midway through
+                // a timer interval (as documented by Microsoft for Win32 wait functions).
+                // For sub-tick intervals (<= 16ms), the wait can return on the next tick
+                // (e.g. 5-8ms), but must never return immediately (>= 1ms).
+                // For intervals > 16ms, the wait must not return before (requested - 16ms).
+                let min_expected = requested
+                    .saturating_sub(Duration::from_millis(16))
+                    .max(Duration::from_millis(1));
+
+                assert!(
+                    elapsed >= min_expected,
+                    "wait returned materially early for {requested:?} on run {run}: elapsed {elapsed:?} < min {min_expected:?}"
+                );
+
+                // Upper bound: bounded so the test cannot hang or stall.
+                // Generous tolerance (requested + 500ms) to tolerate loaded VM scheduling jitter.
+                assert!(
+                    elapsed < requested + Duration::from_millis(500),
+                    "wait took too long for {requested:?} on run {run}: elapsed {elapsed:?}"
+                );
+            }
+        }
     }
 
     /// A signal that races with the timeout is not lost: the next wait returns
