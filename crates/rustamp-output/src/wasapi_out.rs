@@ -21,8 +21,21 @@
 //!   "frames rendered" clock), which is what the engine's position model
 //!   expects. It is never reset by `flush`, as RFC 0001 requires.
 //!
-//! Known limitation (M1): device removal and default-device changes are not
-//! handled; the render thread exits and `close` reports the failure.
+//! Failure handling: a failed `open` names the endpoint that was tried and
+//! lists the render endpoints that exist — it never falls back to another
+//! device. An endpoint that disappears or is invalidated **mid-run** is latched
+//! as a fatal render-thread error ([`WasapiOutput::stream_error`], reported by
+//! `close`) instead of being spun on silently. A format change is the same
+//! event: `AUTOCONVERTPCM` fixes the client's format for its lifetime, so when
+//! the endpoint renegotiates its mix format (a device change), Windows
+//! invalidates the client and its calls start failing — that surfaces as the
+//! same latched loss, and a recovery needs a new `open` (the engine's
+//! `OutputDevice` contract has no mid-run error hook yet, so turning the latch
+//! into an `Event::Error` needs an RFC — engine work, not device work).
+//!
+//! [`WasapiOutput::with_device_name`] selects one render endpoint by name, like
+//! [`crate::CpalOutput::with_device_name`]; an absent or ambiguous name fails
+//! `open`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -33,7 +46,7 @@ use std::time::Duration;
 use rustamp_core::audio::{AudioSpec, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::error::{Error, Result};
 use wasapi::{
-    AudioClient, DeviceEnumerator, Direction, Handle, SampleType, ShareMode, StreamMode,
+    AudioClient, Device, DeviceEnumerator, Direction, Handle, SampleType, ShareMode, StreamMode,
     WaveFormat, initialize_mta,
 };
 
@@ -58,6 +71,14 @@ const ERR_COM: u8 = 1;
 const ERR_OPEN: u8 = 2;
 const ERR_CLIENT: u8 = 3;
 const ERR_WRITE: u8 = 4;
+/// The endpoint disappeared or stopped accepting work while the stream ran.
+const ERR_GONE: u8 = 5;
+
+/// Consecutive failures of a device call on the render thread that are
+/// tolerated before the stream is declared dead. A transient hiccup must not
+/// kill playback, but a device that is gone must not be polled forever without
+/// anyone learning of it.
+const MAX_CONSECUTIVE_FAILURES: u32 = 64;
 
 fn error_text(code: u8) -> Option<&'static str> {
     match code {
@@ -65,7 +86,136 @@ fn error_text(code: u8) -> Option<&'static str> {
         ERR_OPEN => Some("the endpoint could not be opened"),
         ERR_CLIENT => Some("IAudioRenderClient is not available"),
         ERR_WRITE => Some("writing to the device failed"),
+        ERR_GONE => Some("the device disappeared or stopped responding"),
         _ => None,
+    }
+}
+
+/// Counts consecutive failures of one device call. The first `tick` at or past
+/// `limit` reports the streak as latched; the render thread quits then, so the
+/// latched case is seen exactly once.
+struct FailureStreak {
+    limit: u32,
+    count: u32,
+}
+
+impl FailureStreak {
+    const fn new(limit: u32) -> Self {
+        FailureStreak { limit, count: 0 }
+    }
+
+    /// Record a failure; `true` once the streak has reached its limit.
+    fn tick(&mut self) -> bool {
+        self.count += 1;
+        self.count >= self.limit
+    }
+
+    /// Record a success.
+    fn reset(&mut self) {
+        self.count = 0;
+    }
+}
+
+/// Latch a fatal error and ask the render loop to stop.
+fn fail(shared: &Shared, code: u8) {
+    shared.error.store(code, Ordering::Release);
+    shared.quit.store(true, Ordering::Release);
+}
+
+/// A failed endpoint open: the error code for `close`, the endpoint name (best
+/// effort) and the message for the caller.
+struct OpenError {
+    code: u8,
+    device_name: String,
+    message: String,
+}
+
+/// Message for a failed endpoint open: it names what was tried and lists the
+/// render endpoints that do exist, so the caller can pick another one.
+fn open_failure_message(target: &str, cause: &str, alternatives: &[String]) -> String {
+    if alternatives.is_empty() {
+        format!("opening {target} failed: {cause}; no render endpoint is available")
+    } else {
+        format!(
+            "opening {target} failed: {cause}; available render endpoints: {}",
+            alternatives.join(" | ")
+        )
+    }
+}
+
+/// Friendly names of the render endpoints currently present (best effort; a
+/// failing enumeration yields an empty list, never an error).
+fn render_endpoint_names(enumerator: &DeviceEnumerator) -> Vec<String> {
+    let Ok(collection) = enumerator.get_device_collection(&Direction::Render) else {
+        return Vec::new();
+    };
+    let Ok(count) = collection.get_nbr_devices() else {
+        return Vec::new();
+    };
+    (0..count)
+        .filter_map(|index| collection.get_device_at_index(index).ok())
+        .filter_map(|device| device.get_friendlyname().ok())
+        .collect()
+}
+
+/// An [`OpenError`] for a failure on an endpoint that is already known by name.
+fn named_open_error(enumerator: &DeviceEnumerator, code: u8, name: &str, cause: &str) -> OpenError {
+    OpenError {
+        code,
+        device_name: name.to_owned(),
+        message: open_failure_message(
+            &format!("\"{name}\""),
+            cause,
+            &render_endpoint_names(enumerator),
+        ),
+    }
+}
+
+/// The one render endpoint whose friendly name contains `wanted`
+/// (case-insensitive), mirroring [`crate::CpalOutput::with_device_name`]. An
+/// absent or ambiguous name fails and lists what exists.
+fn find_render_endpoint(
+    enumerator: &DeviceEnumerator,
+    wanted: &str,
+) -> std::result::Result<(Device, String), OpenError> {
+    let target = format!("the render endpoint named like \"{wanted}\"");
+    let collection = enumerator
+        .get_device_collection(&Direction::Render)
+        .map_err(|e| OpenError {
+            code: ERR_OPEN,
+            device_name: wanted.to_owned(),
+            message: open_failure_message(&target, &e.to_string(), &[]),
+        })?;
+    let count = collection.get_nbr_devices().unwrap_or(0);
+    let needle = wanted.to_lowercase();
+    let mut matches = Vec::new();
+    let mut names = Vec::new();
+    for index in 0..count {
+        let Ok(device) = collection.get_device_at_index(index) else {
+            continue;
+        };
+        let name = device
+            .get_friendlyname()
+            .unwrap_or_else(|_| format!("endpoint {index}"));
+        if name.to_lowercase().contains(&needle) {
+            matches.push((device, name.clone()));
+        }
+        names.push(name);
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        n => {
+            let cause = if n == 0 {
+                "no render endpoint matches".to_owned()
+            } else {
+                format!("{n} render endpoints match")
+            };
+            Err(OpenError {
+                code: ERR_OPEN,
+                device_name: wanted.to_owned(),
+                message: open_failure_message(&target, &cause, &names),
+            })
+        }
     }
 }
 
@@ -109,6 +259,10 @@ pub struct WasapiOutput {
     spec: Option<AudioSpec>,
     buffer_frames: u32,
     device_name: String,
+    /// Endpoint to open instead of the default one (`with_device_name`).
+    wanted: Option<String>,
+    /// Whether `start` has handed a render callback to the render thread.
+    started: bool,
     shared: Arc<Shared>,
     tx: Option<Sender<Cmd>>,
     handle: Option<JoinHandle<()>>,
@@ -127,10 +281,25 @@ impl WasapiOutput {
             spec: None,
             buffer_frames: 0,
             device_name: "wasapi".into(),
+            wanted: None,
+            started: false,
             shared: Arc::new(Shared::new()),
             tx: None,
             handle: None,
         }
+    }
+
+    /// Not opened yet; [`OutputDevice::open`] opens the one render endpoint
+    /// whose friendly name contains `name` (case-insensitive) instead of the
+    /// system default, like [`crate::CpalOutput::with_device_name`].
+    ///
+    /// `open` fails, naming the endpoint and listing the render endpoints that
+    /// exist, when none or more than one matches. It never falls back to the
+    /// default endpoint.
+    pub fn with_device_name(name: impl Into<String>) -> Self {
+        let mut this = Self::new();
+        this.wanted = Some(name.into());
+        this
     }
 
     /// Open the default render endpoint in shared mode.
@@ -144,6 +313,16 @@ impl WasapiOutput {
     pub fn device_name(&self) -> &str {
         &self.device_name
     }
+
+    /// The latched fatal render-thread error, if the stream died (the endpoint
+    /// was removed or invalidated, a write failed, ...).
+    ///
+    /// `close` reports the same error; this lets a caller notice device loss
+    /// before it closes. The `OutputDevice` contract has no mid-run error hook,
+    /// so the engine cannot act on it yet.
+    pub fn stream_error(&self) -> Option<&'static str> {
+        error_text(self.shared.error.load(Ordering::Acquire))
+    }
 }
 
 impl OutputDevice for WasapiOutput {
@@ -153,7 +332,10 @@ impl OutputDevice for WasapiOutput {
 
     fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
         if spec.sample_rate == 0 {
-            return Err(Error::InvalidArgument("sample rate 0".into()));
+            return Err(Error::InvalidArgument("wasapi: sample rate 0".into()));
+        }
+        if spec.channels == 0 {
+            return Err(Error::InvalidArgument("wasapi: channel count 0".into()));
         }
         if self.handle.is_some() {
             return Err(Error::Output("wasapi: already open".into()));
@@ -171,9 +353,10 @@ impl OutputDevice for WasapiOutput {
             spec.sample_rate,
             spec.channels.clamp(1, MAX_CHANNELS as u16),
         );
+        let wanted = self.wanted.clone();
         let handle = std::thread::Builder::new()
             .name("rustamp-wasapi".into())
-            .spawn(move || render_thread(shared, want, rx, ready_tx))
+            .spawn(move || render_thread(shared, want, wanted, rx, ready_tx))
             .map_err(|e| Error::Output(format!("wasapi: render thread: {e}")))?;
         let opened = ready_rx
             .recv()
@@ -195,12 +378,19 @@ impl OutputDevice for WasapiOutput {
     }
 
     fn start(&mut self, render: RenderFn) -> Result<()> {
+        if self.started {
+            // The render thread has already left its command loop; a second
+            // `Start` would be queued and silently ignored, so refuse it.
+            return Err(Error::Output("wasapi: already started".into()));
+        }
         let tx = self
             .tx
             .as_ref()
             .ok_or_else(|| Error::Output("wasapi: not open".into()))?;
         tx.send(Cmd::Start(render))
-            .map_err(|_| Error::Output("wasapi: render thread is gone".into()))
+            .map_err(|_| Error::Output("wasapi: render thread is gone".into()))?;
+        self.started = true;
+        Ok(())
     }
 
     fn pause(&mut self) -> Result<()> {
@@ -242,8 +432,12 @@ impl OutputDevice for WasapiOutput {
             let _ = handle.join();
         }
         self.spec = None;
+        self.started = false;
         match error_text(self.shared.error.load(Ordering::Acquire)) {
-            Some(e) => Err(Error::Output(format!("wasapi: render thread: {e}"))),
+            Some(e) => Err(Error::Output(format!(
+                "wasapi: \"{}\": render thread: {e}",
+                self.device_name
+            ))),
             None => Ok(()),
         }
     }
@@ -264,20 +458,43 @@ struct Endpoint {
     buffer_frames: u32,
 }
 
-fn open_endpoint(want: AudioSpec) -> std::result::Result<(Endpoint, String), (u8, String)> {
-    initialize_mta()
-        .ok()
-        .map_err(|e| (ERR_COM, format!("COM init failed: {e}")))?;
-    let enumerator = DeviceEnumerator::new().map_err(|e| (ERR_OPEN, e.to_string()))?;
-    let device = enumerator
-        .get_default_device(&Direction::Render)
-        .map_err(|e| (ERR_OPEN, e.to_string()))?;
-    let name = device
-        .get_friendlyname()
-        .unwrap_or_else(|_| "default endpoint".into());
+fn open_endpoint(
+    want: AudioSpec,
+    wanted: Option<&str>,
+) -> std::result::Result<(Endpoint, String), OpenError> {
+    initialize_mta().ok().map_err(|e| OpenError {
+        code: ERR_COM,
+        device_name: "the default render endpoint".into(),
+        message: format!("COM could not be initialised: {e}"),
+    })?;
+    let enumerator = DeviceEnumerator::new().map_err(|e| OpenError {
+        code: ERR_OPEN,
+        device_name: "the default render endpoint".into(),
+        message: format!("the device enumerator could not be created: {e}"),
+    })?;
+    let (device, name) = match wanted {
+        Some(wanted) => find_render_endpoint(&enumerator, wanted)?,
+        None => {
+            let device = enumerator
+                .get_default_device(&Direction::Render)
+                .map_err(|e| OpenError {
+                    code: ERR_OPEN,
+                    device_name: "the default render endpoint".into(),
+                    message: open_failure_message(
+                        "the default render endpoint",
+                        &e.to_string(),
+                        &render_endpoint_names(&enumerator),
+                    ),
+                })?;
+            let name = device
+                .get_friendlyname()
+                .unwrap_or_else(|_| "default render endpoint".into());
+            (device, name)
+        }
+    };
     let mut client = device
         .get_iaudioclient()
-        .map_err(|e| (ERR_OPEN, e.to_string()))?;
+        .map_err(|e| named_open_error(&enumerator, ERR_OPEN, &name, &e.to_string()))?;
     let format = WaveFormat::new(
         32,
         32,
@@ -292,16 +509,16 @@ fn open_endpoint(want: AudioSpec) -> std::result::Result<(Endpoint, String), (u8
     };
     client
         .initialize_client(&format, &Direction::Render, &mode)
-        .map_err(|e| (ERR_OPEN, e.to_string()))?;
+        .map_err(|e| named_open_error(&enumerator, ERR_OPEN, &name, &e.to_string()))?;
     let event = client
         .set_get_eventhandle()
-        .map_err(|e| (ERR_OPEN, e.to_string()))?;
+        .map_err(|e| named_open_error(&enumerator, ERR_OPEN, &name, &e.to_string()))?;
     let render_client = client
         .get_audiorenderclient()
-        .map_err(|e| (ERR_CLIENT, e.to_string()))?;
+        .map_err(|e| named_open_error(&enumerator, ERR_CLIENT, &name, &e.to_string()))?;
     let buffer_frames = client
         .get_buffer_size()
-        .map_err(|e| (ERR_OPEN, e.to_string()))?;
+        .map_err(|e| named_open_error(&enumerator, ERR_OPEN, &name, &e.to_string()))?;
     Ok((
         Endpoint {
             client,
@@ -315,8 +532,14 @@ fn open_endpoint(want: AudioSpec) -> std::result::Result<(Endpoint, String), (u8
 }
 
 /// The audio thread: negotiate the endpoint, then render until `quit`.
-fn render_thread(shared: Arc<Shared>, want: AudioSpec, rx: Receiver<Cmd>, ready: Sender<Opened>) {
-    match open_endpoint(want) {
+fn render_thread(
+    shared: Arc<Shared>,
+    want: AudioSpec,
+    wanted: Option<String>,
+    rx: Receiver<Cmd>,
+    ready: Sender<Opened>,
+) {
+    match open_endpoint(want, wanted.as_deref()) {
         Ok((endpoint, name)) => {
             let format = OutputFormat {
                 spec: endpoint.spec,
@@ -333,11 +556,11 @@ fn render_thread(shared: Arc<Shared>, want: AudioSpec, rx: Receiver<Cmd>, ready:
             }
             render_loop(shared, endpoint, rx);
         }
-        Err((code, message)) => {
-            shared.error.store(code, Ordering::Release);
+        Err(e) => {
+            shared.error.store(e.code, Ordering::Release);
             let _ = ready.send(Opened {
-                device_name: "wasapi".into(),
-                outcome: Err(message),
+                device_name: e.device_name,
+                outcome: Err(e.message),
             });
         }
     }
@@ -367,6 +590,7 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
     let channels = usize::from(spec.channels);
     let mut samples: Vec<f32> = vec![0.0; buffer_frames as usize * channels];
     let mut bytes: Vec<u8> = vec![0u8; samples.len() * 4];
+    let mut failures = FailureStreak::new(MAX_CONSECUTIVE_FAILURES);
 
     // The event only fires once the stream runs, so start it before waiting and
     // fill the first buffer, as the Core Audio documentation asks.
@@ -379,6 +603,7 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
             &mut samples,
             &mut bytes,
             &shared,
+            &mut failures,
             buffer_frames,
             channels,
         );
@@ -393,15 +618,40 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
             continue;
         }
         if !streaming {
-            if client.start_stream().is_err() {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
+            match client.start_stream() {
+                Ok(()) => {
+                    failures.reset();
+                    streaming = true;
+                }
+                Err(_) => {
+                    // A device that is gone fails here forever; after a bounded
+                    // number of tries the stream is declared dead instead of
+                    // spinning in silence.
+                    if failures.tick() {
+                        fail(&shared, ERR_GONE);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
             }
-            streaming = true;
         }
         match event.wait_for_event(EVENT_TIMEOUT_MS) {
             Ok(()) => {}
-            Err(_) => continue,
+            Err(_) => {
+                // No buffer arrived within the timeout: the stream is either
+                // quiet or the endpoint is gone. Probing the client tells the
+                // two apart; a failing probe is the loss signal.
+                if client.get_available_space_in_frames().is_err() {
+                    if failures.tick() {
+                        fail(&shared, ERR_GONE);
+                        return;
+                    }
+                } else {
+                    failures.reset();
+                }
+                continue;
+            }
         }
         if shared.quit.load(Ordering::Acquire) {
             break;
@@ -417,6 +667,7 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
             &mut samples,
             &mut bytes,
             &shared,
+            &mut failures,
             buffer_frames,
             channels,
         );
@@ -435,12 +686,23 @@ fn write_available(
     samples: &mut [f32],
     bytes: &mut [u8],
     shared: &Shared,
+    failures: &mut FailureStreak,
     buffer_frames: u32,
     channels: usize,
 ) {
     let available = match client.get_available_space_in_frames() {
-        Ok(n) => n.min(buffer_frames) as usize,
-        Err(_) => return,
+        Ok(n) => {
+            failures.reset();
+            n.min(buffer_frames) as usize
+        }
+        Err(_) => {
+            // A client whose buffer space cannot be read is invalidated; a
+            // single failure can be transient, a persistent one is device loss.
+            if failures.tick() {
+                fail(shared, ERR_GONE);
+            }
+            return;
+        }
     };
     if available == 0 {
         return;
@@ -459,8 +721,7 @@ fn write_available(
         .write_to_device(available, &bytes[..n * 4], None)
         .is_err()
     {
-        shared.error.store(ERR_WRITE, Ordering::Release);
-        shared.quit.store(true, Ordering::Release);
+        fail(shared, ERR_WRITE);
         return;
     }
     shared.played.fetch_add(available as u64, Ordering::AcqRel);
@@ -491,4 +752,66 @@ pub fn is_shared_mode_available() -> bool {
         .initialize_client(&format, &Direction::Render, &mode)
         .is_ok()
         && client.get_sharemode() == Some(ShareMode::Shared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests exercise only pure helpers: they open no device and start no
+    // audio, so they are safe on any machine.
+
+    #[test]
+    fn an_open_failure_names_the_endpoint_and_lists_the_alternatives() {
+        let alternatives = vec!["Speakers (Realtek)".to_owned(), "Headphones".to_owned()];
+        let message =
+            open_failure_message("\"CABLE Input\"", "the endpoint is in use", &alternatives);
+        assert!(message.contains("CABLE Input"), "{message}");
+        assert!(message.contains("in use"), "{message}");
+        assert!(message.contains("Realtek"), "{message}");
+        assert!(message.contains("Headphones"), "{message}");
+    }
+
+    #[test]
+    fn an_open_failure_without_alternatives_says_so() {
+        let message = open_failure_message("the default render endpoint", "denied", &[]);
+        assert!(message.contains("default render endpoint"), "{message}");
+        assert!(message.contains("no render endpoint"), "{message}");
+    }
+
+    #[test]
+    fn device_loss_has_its_own_message() {
+        let gone = error_text(ERR_GONE).expect("ERR_GONE has text");
+        assert!(gone.contains("device"), "{gone}");
+        assert_ne!(error_text(ERR_GONE), error_text(ERR_WRITE));
+        // Every code `close` can report has a message.
+        for code in [ERR_NONE, ERR_COM, ERR_OPEN, ERR_CLIENT, ERR_WRITE, ERR_GONE] {
+            assert_eq!(error_text(code).is_some(), code != ERR_NONE);
+        }
+    }
+
+    #[test]
+    fn a_failure_streak_latches_only_at_the_limit() {
+        let mut streak = FailureStreak::new(3);
+        assert!(!streak.tick());
+        assert!(!streak.tick());
+        assert!(streak.tick(), "the limit is reached");
+        streak.reset();
+        assert!(!streak.tick(), "a success clears the streak");
+    }
+
+    #[test]
+    fn open_rejects_an_impossible_format_before_touching_a_device() {
+        let mut out = WasapiOutput::new();
+        assert!(matches!(
+            out.open(AudioSpec::new(0, 2)),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            out.open(AudioSpec::new(44100, 0)),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(out.played_frames(), 0);
+        assert!(out.stream_error().is_none());
+    }
 }

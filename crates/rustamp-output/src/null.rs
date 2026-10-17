@@ -16,6 +16,33 @@
 //! here: `pump` is the audio thread of this *test* device and the lock is
 //! uncontended in practice. A real backend never takes a lock on the audio
 //! path; [`crate::WasapiOutput`] and [`crate::CpalOutput`] do not.
+//!
+//! ## What the null device models (and what it does not)
+//!
+//! [`NullClock::pump`] drives the engine's [`RenderFn`] the way a real
+//! backend's callback does, so a test that passes here proves those properties
+//! of the real path:
+//!
+//! * **Whole frames, whole buffer.** Every call fills exactly the buffer the
+//!   device asked for (`chunk_frames * channels` samples), never a partial
+//!   frame. The engine's render callback fills the whole slice and writes
+//!   silence for what its ring cannot supply — the same contract
+//!   [`crate::WasapiOutput`] and [`crate::CpalOutput`] hold it to, so
+//!   silence-on-underrun is the *engine's* duty on every backend.
+//! * **Callback size.** `chunk_frames` is the callback size and is reported as
+//!   [`OutputFormat::buffer_frames`], like WASAPI's granted device buffer.
+//!   `pump(n)` pulls at most one chunk per callback, so the last callback of a
+//!   `pump(n)` is smaller when `n` is not a multiple of the chunk; that models
+//!   a real device's first (padding) buffer rather than its steady state.
+//! * **Frame accounting.** `played_frames()` advances *after* the render
+//!   callback returns, exactly like WASAPI (after `write_to_device` succeeds)
+//!   and cpal (after the callback returns): the clock never counts a buffer the
+//!   callback has not produced yet.
+//!
+//! What it does **not** model: a real device can hand a smaller chunk than its
+//! buffer in the steady state (cpal leaves the size to the host), the device
+//! clock drifts against the wall clock, and a real endpoint can disappear or
+//! reject a write; none of that is reproducible here by design.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,6 +59,10 @@ struct Inner {
     render: Option<RenderFn>,
     scratch: Vec<f32>,
     spec: Option<AudioSpec>,
+    /// Frames pulled per callback. It is resized together with `scratch` under
+    /// this mutex, so a pump can never slice a buffer smaller than the chunk it
+    /// asked for (a `u64` outside the lock raced the resize).
+    chunk_frames: u64,
 }
 
 struct Shared {
@@ -39,7 +70,6 @@ struct Shared {
     played: AtomicU64,
     paused: AtomicBool,
     running: AtomicBool,
-    chunk_frames: AtomicU64,
 }
 
 /// The [`OutputDevice`] half of a null output. Pass it to the engine.
@@ -62,11 +92,11 @@ impl NullOutput {
                 render: None,
                 scratch: Vec::new(),
                 spec: None,
+                chunk_frames: DEFAULT_CHUNK_FRAMES,
             }),
             played: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             running: AtomicBool::new(false),
-            chunk_frames: AtomicU64::new(DEFAULT_CHUNK_FRAMES),
         });
         (
             NullOutput {
@@ -83,21 +113,37 @@ impl OutputDevice for NullOutput {
     }
 
     fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
-        let chunk = self.shared.chunk_frames.load(Ordering::Relaxed).max(1);
+        if spec.sample_rate == 0 {
+            return Err(Error::InvalidArgument(
+                "null: sample rate 0 is not a format a device can grant".into(),
+            ));
+        }
+        if spec.channels == 0 {
+            return Err(Error::InvalidArgument(
+                "null: channel count 0 is not a format a device can grant".into(),
+            ));
+        }
         let mut inner = self
             .shared
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.spec.is_some() {
+            return Err(Error::Output("null: already open; close it first".into()));
+        }
+        let chunk = inner.chunk_frames.max(1);
         inner.spec = Some(spec);
         inner.scratch = vec![0.0; spec.samples_for(chunk as usize)];
         inner.render = None;
+        // RFC 0001: `played_frames` counts the frames consumed "since start";
+        // both real backends re-base it in `open`, so the null device does too.
+        self.shared.played.store(0, Ordering::Release);
         self.shared.paused.store(false, Ordering::Release);
         self.shared.running.store(false, Ordering::Release);
         drop(inner);
         Ok(OutputFormat {
             spec,
-            buffer_frames: chunk as u32,
+            buffer_frames: chunk.min(u64::from(u32::MAX)) as u32,
         })
     }
 
@@ -109,6 +155,9 @@ impl OutputDevice for NullOutput {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if inner.spec.is_none() {
             return Err(Error::Output("null output is not open".into()));
+        }
+        if self.shared.running.load(Ordering::Acquire) {
+            return Err(Error::Output("null: already started".into()));
         }
         inner.render = Some(render);
         drop(inner);
@@ -141,12 +190,7 @@ impl OutputDevice for NullOutput {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match inner.spec {
-            Some(spec) if spec.sample_rate > 0 => spec.duration_of(
-                self.shared
-                    .chunk_frames
-                    .load(Ordering::Relaxed)
-                    .min(u64::from(u32::MAX)),
-            ),
+            Some(spec) if spec.sample_rate > 0 => spec.duration_of(inner.chunk_frames.max(1)),
             _ => Duration::ZERO,
         }
     }
@@ -204,8 +248,10 @@ impl NullClock {
     /// the callback scratch buffer, so call it outside a real-time window.
     pub fn set_chunk_frames(&self, frames: u64) {
         let frames = frames.max(1);
-        self.shared.chunk_frames.store(frames, Ordering::Relaxed);
+        // Size and chunk live under the same mutex: a concurrent `pump` either
+        // sees the old chunk with the old scratch buffer or the new pair.
         let mut inner = self.lock();
+        inner.chunk_frames = frames;
         if let Some(spec) = inner.spec {
             inner.scratch = vec![0.0; spec.samples_for(frames as usize)];
         }
@@ -238,11 +284,11 @@ impl NullClock {
         {
             return 0;
         }
-        let chunk = self.shared.chunk_frames.load(Ordering::Relaxed).max(1);
         let mut inner = self.lock();
         let Some(spec) = inner.spec else {
             return 0;
         };
+        let chunk = inner.chunk_frames.max(1);
         let mut left = frames;
         let mut done = 0u64;
         while left > 0 {
@@ -254,11 +300,12 @@ impl NullClock {
             let Some(render) = render.as_mut() else {
                 break;
             };
-            // The clock advances before the callback: `played_frames` then
-            // counts the frames the device handed to the callback, which is
-            // what a real backend reports as well.
-            self.shared.played.fetch_add(n, Ordering::AcqRel);
             render(&mut scratch[..samples]);
+            // The clock advances after the callback returns, matching both real
+            // backends (WASAPI counts after `write_to_device` succeeds, cpal
+            // after the callback returns): `played_frames` never counts a
+            // buffer the callback has not produced yet.
+            self.shared.played.fetch_add(n, Ordering::AcqRel);
             if let Some(out) = out.as_deref_mut() {
                 out.extend_from_slice(&scratch[..samples]);
             }
@@ -326,5 +373,111 @@ mod tests {
         let mut rec = Vec::new();
         clock.pump_record(4, &mut rec);
         assert_eq!(rec, vec![0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn open_rejects_a_format_no_device_can_grant() {
+        let (mut out, _clock) = output_and_clock();
+        for spec in [AudioSpec::new(0, 2), AudioSpec::new(44100, 0)] {
+            let err = out.open(spec).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "{spec:?} must be rejected, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reopening_resets_the_played_clock_like_a_real_device() {
+        let (mut out, clock) = output_and_clock();
+        let spec = AudioSpec::new(8000, 1);
+        out.open(spec).unwrap();
+        out.start(Box::new(|buf: &mut [f32]| buf.fill(0.0)))
+            .unwrap();
+        assert_eq!(clock.pump(100), 100);
+        assert_eq!(clock.frames(), 100);
+        out.close().unwrap();
+        out.open(spec).unwrap();
+        // RFC 0001: `played_frames` counts frames since `start`; both real
+        // backends re-base it in `open`, so the null device must too.
+        assert_eq!(clock.frames(), 0);
+    }
+
+    #[test]
+    fn a_second_open_or_start_is_refused() {
+        let (mut out, _clock) = output_and_clock();
+        let spec = AudioSpec::new(8000, 1);
+        out.open(spec).unwrap();
+        assert!(out.open(spec).is_err(), "second open");
+        out.start(Box::new(|buf: &mut [f32]| buf.fill(0.0)))
+            .unwrap();
+        assert!(
+            out.start(Box::new(|buf: &mut [f32]| buf.fill(0.0)))
+                .is_err()
+        );
+        out.close().unwrap();
+        assert!(
+            out.start(Box::new(|buf: &mut [f32]| buf.fill(0.0)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_clock_advances_after_the_callback_returns() {
+        let (mut out, clock) = output_and_clock();
+        let spec = AudioSpec::new(8000, 1);
+        out.open(spec).unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&observed);
+        let reader = clock.clone();
+        out.start(Box::new(move |buf: &mut [f32]| {
+            seen.lock().unwrap().push(reader.frames());
+            buf.fill(0.0);
+        }))
+        .unwrap();
+        assert_eq!(
+            clock.pump(2 * DEFAULT_CHUNK_FRAMES),
+            2 * DEFAULT_CHUNK_FRAMES
+        );
+        // WASAPI counts a buffer only after `write_to_device` succeeds and cpal
+        // after the callback returns, so a callback must never observe its own
+        // buffer in the clock.
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![0, DEFAULT_CHUNK_FRAMES],
+            "each callback sees only the frames of the callbacks before it"
+        );
+    }
+
+    #[test]
+    fn the_chunk_size_is_the_reported_buffer_and_bounds_a_callback() {
+        let (mut out, clock) = output_and_clock();
+        let spec = AudioSpec::new(8000, 2);
+        let format = out.open(spec).unwrap();
+        assert_eq!(format.buffer_frames, DEFAULT_CHUNK_FRAMES as u32);
+        clock.set_chunk_frames(4);
+        assert_eq!(out.latency(), spec.duration_of(4));
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&calls);
+        out.start(Box::new(move |buf: &mut [f32]| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(buf.len() % 2, 0, "whole frames only");
+            buf.fill(0.0);
+        }))
+        .unwrap();
+        let mut rec = Vec::new();
+        assert_eq!(clock.pump_record(10, &mut rec), 10);
+        assert_eq!(rec.len(), 10 * 2);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "4 + 4 + the 2-frame tail, one chunk per callback"
+        );
+    }
+
+    #[test]
+    fn latency_is_zero_before_open() {
+        let (out, _clock) = output_and_clock();
+        assert_eq!(out.latency(), Duration::ZERO);
     }
 }
