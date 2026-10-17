@@ -45,6 +45,15 @@ if ($filter -like '--ignored*') {
 }
 
 $results = @()
+
+# Timeout per binary: the suite's slowest honest binary runs in couple of minutes.
+# 300 seconds (5 min) gives generous margin; a binary that outlives it is hung, not slow.
+# A hang is a finding about the code under test, not about the runner.
+$TestTimeoutSeconds = 300
+# Print a progress line before each binary so a reader of the log knows exactly
+# which one was running when it stopped.
+Write-Host ("running: {0}" -f $name)
+
 # Real test media: the host runner stages read-only copies at C:\rustamp\testmedia
 # when the owner's archive copy exists on the host. Point the documented
 # RUSTAMP_TESTDATA variable at it so media-dependent tests opt in; without it
@@ -60,8 +69,34 @@ foreach ($exe in $exes) {
     if ($filter -and $name -notlike "*$filter*") { continue }
     if (-not (Test-Path $exe)) { $results += [pscustomobject]@{ exe = $name; exit = -1; summary = 'MISSING BINARY'; failed = @() }; continue }
 
-    $raw = & $exe @extra 2>&1 | Out-String
-    $exit = $LASTEXITCODE
+    # Run with per-binary timeout; if the binary outlives the timeout it is hung, not slow.
+    $job = Start-Job -ScriptBlock { & $exe @extra 2>&1 }
+    $null = $job | Wait-Job -Timeout $TestTimeoutSeconds
+    if ($job.State -eq 'Completed') {
+        $raw = $job | Receive-Job
+        $exit = $LASTEXITCODE
+    } else {
+        # Hung - kill it, record it, carry on
+        Stop-Job -Id $job.Id -Force
+        # Capture whatever output the binary produced before hanging;
+        # these last lines are evidence of where it hung.
+        $captured = @()
+        try { $captured = $job | Receive-Job -ErrorAction Stop } catch { }
+        $raw = $captured
+        $exit = -1
+        $summary = 'HUNG after timeout'
+        # Include the captured output lines as diagnostic so they appear in the report
+        $diag = if ($captured.Count -gt 0) { $captured } else { @("no output captured - binary hung immediately") }
+        $results += [pscustomobject]@{
+            exe        = $name
+            exit       = $exit
+            summary    = $summary
+            failed     = @()
+            diagnostic = $diag
+            hung       = $true
+        }
+        continue
+    }
     $lines = $raw -split "`r?`n"
     $summary = ($lines | Where-Object { $_ -match '^test result:' } | Select-Object -Last 1)
     $failedNames = @($lines | Where-Object { $_ -match '^test .* FAILED$' } | ForEach-Object { $_.Trim() })
@@ -94,6 +129,7 @@ foreach ($exe in $exes) {
         summary    = $summary
         failed     = $failedNames
         diagnostic = $diagnostic
+        hung       = $false
     }
 }
 

@@ -180,9 +180,17 @@ $result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $Filter -Timeou
 Write-Host ''
 Write-Host ("guest {0} as {1}; subst resolved: {2}; ran {3}, failed {4}" -f $result.host, $result.user, $result.subst, $result.ran, $result.failed)
 $result.results | ForEach-Object {
-    $status = if ($_.exit -eq 0) { 'ok  ' } else { 'FAIL' }
-    Write-Host ("  [{0}] {1,-46} {2}" -f $status, $_.exe, $_.summary)
-    foreach ($f in $_.failed) { Write-Host ("         $f") }
-    foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
+    # A hung binary must be impossible to mistake for a pass or for a missing binary.
+    if ($_.hung) {
+        $status = '[HNG]'
+        Write-Host ("  [{0}] {1,-46} {2}" -f $status, $_.exe, $_.summary)
+        Write-Host ("         HUNG after timeout of $($_.exit) seconds - binary was killed, last output captured")
+        foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
+    } else {
+        $status = if ($_.exit -eq 0) { 'ok  ' } else { 'FAIL' }
+        Write-Host ("  [{0}] {1,-46} {2}" -f $status, $_.exe, $_.summary)
+        foreach ($f in $_.failed) { Write-Host ("         $f") }
+        foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
+    }
 }
 if ($result.failed -ne 0) { exit 1 }
