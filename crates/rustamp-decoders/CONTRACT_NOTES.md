@@ -50,12 +50,14 @@ correct behaviour:
    container is broken" apart from "no reader at all" needs a third error kind.
 3. **A container we can read but whose codec we cannot** is folded into the same
    `UnsupportedFormat` (nothing was opened, so it is the closest honest kind).
-4. **The registry guesses on a tie.** `DecoderRegistry::probe` picks the highest
-   confidence and breaks a tie by registration order; it never refuses when two
-   factories claim the same file. With one factory (`default_registry`) this is
-   unreachable, but adding an FFI decoder with overlapping extensions makes it
-   live. Refusing (or requiring the caller to resolve) needs a core RFC; the
-   crate's tests pin today's behaviour.
+4. **The registry resolves ties by registration order (RFC 0013).**
+   `DecoderRegistry::probe` picks the highest confidence and breaks a tie
+   deterministically by registration order (earlier registrations win); it does
+   not refuse when two factories claim the same media with identical score.
+   Content signatures strictly beat extension hints (`Confidence::CONTENT`
+   outranks `Confidence::EXTENSION`), and unclaimed inputs are refused with
+   `Error::UnsupportedFormat`. The multi-factory selection guarantees are
+   proposed in RFC 0013 and pinned by integration tests in `tests/robustness.rs`.
 5. **Zero channels.** The conversion path and `read` use `channels.max(1)`, so a
    hostile buffer cannot reach `chunks_exact(0)`; a stream that really carries no
    audio is reported as `Error::Decode("stream contains no audio")`.

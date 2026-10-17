@@ -241,7 +241,9 @@ impl DecoderRegistry {
         Self::default()
     }
 
-    /// Register a factory. On equal confidence, earlier registrations win.
+    /// Register a factory.
+    ///
+    /// On equal confidence, earlier registrations win (RFC 0013).
     pub fn register(&mut self, factory: Arc<dyn DecoderFactory>) {
         self.factories.push(factory);
     }
@@ -264,6 +266,13 @@ impl DecoderRegistry {
     }
 
     /// Best factory for `hint`, with its confidence, if any scores above zero.
+    ///
+    /// Guarantees (RFC 0013):
+    /// 1. Content decides: a factory matching content signature (`Confidence::CONTENT`)
+    ///    strictly outranks any factory matching only extension (`Confidence::EXTENSION`),
+    ///    regardless of registration order.
+    /// 2. Deterministic tie-break: on equal confidence, earlier registrations win.
+    /// 3. Clear refusal: returns `None` if no factory scores above `Confidence::NONE`.
     pub fn probe(&self, hint: &ProbeHint<'_>) -> Option<(Arc<dyn DecoderFactory>, Confidence)> {
         let mut best: Option<(Arc<dyn DecoderFactory>, Confidence)> = None;
         for f in &self.factories {
@@ -276,6 +285,12 @@ impl DecoderRegistry {
     }
 
     /// Sniff `source`, pick the best factory and open a decoder.
+    ///
+    /// Guarantees (RFC 0013):
+    /// 1. Sniffs [`Self::SNIFF_BYTES`] from `source` to construct a [`ProbeHint`].
+    /// 2. Selects the winning factory via [`Self::probe`].
+    /// 3. Returns `Err(Error::UnsupportedFormat)` if no factory claims the source.
+    /// 4. Dispatches directly to the winner's `open()` without backtracking.
     pub fn open(&self, mut source: MediaSource) -> Result<Box<dyn Decoder>> {
         let ext = source.extension();
         let header = source.sniff(Self::SNIFF_BYTES)?;

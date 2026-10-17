@@ -467,6 +467,39 @@ impl DecoderFactory for ClaimingFactory {
     }
 }
 
+/// A fake factory that claims specific extensions at a designated confidence
+/// without inspecting content (RFC 0013 test helper).
+struct ExtensionClaimingFactory {
+    name: &'static str,
+    extensions: &'static [&'static str],
+    confidence: Confidence,
+}
+
+impl DecoderFactory for ExtensionClaimingFactory {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn extensions(&self) -> &[&str] {
+        self.extensions
+    }
+    fn probe(&self, hint: &ProbeHint<'_>) -> Confidence {
+        match hint.extension {
+            Some(ext) if self.extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) => {
+                self.confidence
+            }
+            _ => Confidence::NONE,
+        }
+    }
+    fn open(&self, _source: MediaSource) -> Result<Box<dyn Decoder>> {
+        // Returns a distinct short mock decoder (10 frames) to verify that real
+        // decoders (which produce thousands of frames) are what actually decode.
+        Ok(Box::new(MockDecoder::silence(
+            AudioSpec::new(44_100, 2),
+            10,
+        )))
+    }
+}
+
 #[test]
 fn a_tie_between_two_claimants_is_broken_by_registration_order_not_refused() {
     let hint = ProbeHint {
@@ -482,10 +515,8 @@ fn a_tie_between_two_claimants_is_broken_by_registration_order_not_refused() {
         name: "second",
         confidence: Confidence::CONTENT,
     }));
-    // Two claimants at equal confidence: `DecoderRegistry::probe` silently picks
-    // the earlier registration instead of refusing to guess. That is core
-    // behaviour, pinned here because it is the one place a wrong decoder can be
-    // picked; changing it needs an RFC (see the B2 report).
+    // Two claimants at equal confidence: `DecoderRegistry::probe` deterministically
+    // selects the earlier registration without refusing (RFC 0013 Guarantee 2).
     let (factory, confidence) = reg.probe(&hint).expect("both claimants answered");
     assert_eq!(factory.name(), "first");
     assert_eq!(confidence, Confidence::CONTENT);
@@ -509,6 +540,228 @@ fn a_tie_between_two_claimants_is_broken_by_registration_order_not_refused() {
         confidence: Confidence::CONTENT,
     }));
     assert_eq!(strong.probe(&hint).expect("a claim").0.name(), "high");
+}
+
+#[test]
+fn content_beats_extension_even_when_extension_factory_registered_first() {
+    // Register an extension-only claimant FIRST: claims "flac" and "mp3" at EXTENSION (40).
+    let mut reg = DecoderRegistry::new();
+    reg.register(Arc::new(ExtensionClaimingFactory {
+        name: "fake_extension_claimant",
+        extensions: &["flac", "mp3"],
+        confidence: Confidence::EXTENSION,
+    }));
+    // Register Symphonia SECOND: verifies content signatures at CONTENT (90).
+    reg.register(Arc::new(SymphoniaDecoderFactory::new()));
+
+    // Case 1: Real FLAC fixture wearing its honest extension ".flac".
+    // Even though the fake factory was registered first, Symphonia's CONTENT score (90)
+    // strictly defeats EXTENSION score (40) per RFC 0013 Guarantee 1.
+    let flac_bytes = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let hint_honest = ProbeHint {
+        extension: Some("flac"),
+        header: &flac_bytes[..64],
+    };
+    let (winner, conf) = reg
+        .probe(&hint_honest)
+        .expect("a factory must claim the flac");
+    assert_eq!(winner.name(), "symphonia");
+    assert_eq!(conf, Confidence::CONTENT);
+
+    let mut decoder = reg
+        .open(reader_source(flac_bytes.clone(), Some("flac")))
+        .expect("open must succeed with content winner");
+    let (frames, outcome) = drain_bounded(decoder.as_mut());
+    assert!(matches!(outcome, Drained::End));
+    assert_eq!(
+        frames, FIXTURE_FRAMES,
+        "must decode the real fixture to the end (not the 10 mock frames)"
+    );
+
+    // Case 2: Real FLAC fixture wearing a lying extension ".mp3".
+    // The fake factory claims "mp3" via extension, but Symphonia inspects the header,
+    // recognizes the FLAC magic bytes ("fLaC"), and scores Confidence::CONTENT.
+    let hint_lying = ProbeHint {
+        extension: Some("mp3"),
+        header: &flac_bytes[..64],
+    };
+    let (winner_lying, conf_lying) = reg.probe(&hint_lying).expect("probe lying flac");
+    assert_eq!(winner_lying.name(), "symphonia");
+    assert_eq!(conf_lying, Confidence::CONTENT);
+
+    let mut decoder_lying = reg
+        .open(reader_source(flac_bytes.clone(), Some("mp3")))
+        .expect("open lying flac");
+    let (frames_lying, outcome_lying) = drain_bounded(decoder_lying.as_mut());
+    assert!(matches!(outcome_lying, Drained::End));
+    assert_eq!(frames_lying, FIXTURE_FRAMES);
+
+    // Case 3: Registration order reversed (Symphonia first, fake second).
+    // Symphonia must still win with CONTENT confidence.
+    let mut reg_rev = DecoderRegistry::new();
+    reg_rev.register(Arc::new(SymphoniaDecoderFactory::new()));
+    reg_rev.register(Arc::new(ExtensionClaimingFactory {
+        name: "fake_extension_claimant",
+        extensions: &["flac", "mp3"],
+        confidence: Confidence::EXTENSION,
+    }));
+    let (winner_rev, conf_rev) = reg_rev.probe(&hint_lying).expect("probe reverse");
+    assert_eq!(winner_rev.name(), "symphonia");
+    assert_eq!(conf_rev, Confidence::CONTENT);
+}
+
+#[test]
+fn tie_break_is_deterministic_by_registration_order_for_both_content_and_extension() {
+    let hint = ProbeHint {
+        extension: Some("test"),
+        header: b"mock_header_bytes",
+    };
+
+    // --- Part A: Tie at Confidence::CONTENT (90 vs 90) ---
+    // Order A -> B: A must win.
+    let mut reg_ab_content = DecoderRegistry::new();
+    reg_ab_content.register(Arc::new(ClaimingFactory {
+        name: "content_factory_a",
+        confidence: Confidence::CONTENT,
+    }));
+    reg_ab_content.register(Arc::new(ClaimingFactory {
+        name: "content_factory_b",
+        confidence: Confidence::CONTENT,
+    }));
+    let (winner_ab_c, conf_ab_c) = reg_ab_content.probe(&hint).expect("probe");
+    assert_eq!(winner_ab_c.name(), "content_factory_a");
+    assert_eq!(conf_ab_c, Confidence::CONTENT);
+    let dec_ab_c = reg_ab_content.open(reader_source(b"test".to_vec(), Some("test")));
+    assert!(dec_ab_c.is_ok(), "content tie must open without refusal");
+
+    // Order B -> A: B must win.
+    let mut reg_ba_content = DecoderRegistry::new();
+    reg_ba_content.register(Arc::new(ClaimingFactory {
+        name: "content_factory_b",
+        confidence: Confidence::CONTENT,
+    }));
+    reg_ba_content.register(Arc::new(ClaimingFactory {
+        name: "content_factory_a",
+        confidence: Confidence::CONTENT,
+    }));
+    let (winner_ba_c, conf_ba_c) = reg_ba_content.probe(&hint).expect("probe");
+    assert_eq!(winner_ba_c.name(), "content_factory_b");
+    assert_eq!(conf_ba_c, Confidence::CONTENT);
+    let dec_ba_c = reg_ba_content.open(reader_source(b"test".to_vec(), Some("test")));
+    assert!(dec_ba_c.is_ok(), "content tie must open without refusal");
+
+    // --- Part B: Tie at Confidence::EXTENSION (40 vs 40) ---
+    // Order A -> B: A must win.
+    let mut reg_ab_ext = DecoderRegistry::new();
+    reg_ab_ext.register(Arc::new(ClaimingFactory {
+        name: "ext_factory_a",
+        confidence: Confidence::EXTENSION,
+    }));
+    reg_ab_ext.register(Arc::new(ClaimingFactory {
+        name: "ext_factory_b",
+        confidence: Confidence::EXTENSION,
+    }));
+    let (winner_ab_e, conf_ab_e) = reg_ab_ext.probe(&hint).expect("probe");
+    assert_eq!(winner_ab_e.name(), "ext_factory_a");
+    assert_eq!(conf_ab_e, Confidence::EXTENSION);
+    let dec_ab_e = reg_ab_ext.open(reader_source(b"test".to_vec(), Some("test")));
+    assert!(dec_ab_e.is_ok(), "extension tie must open without refusal");
+
+    // Order B -> A: B must win.
+    let mut reg_ba_ext = DecoderRegistry::new();
+    reg_ba_ext.register(Arc::new(ClaimingFactory {
+        name: "ext_factory_b",
+        confidence: Confidence::EXTENSION,
+    }));
+    reg_ba_ext.register(Arc::new(ClaimingFactory {
+        name: "ext_factory_a",
+        confidence: Confidence::EXTENSION,
+    }));
+    let (winner_ba_e, conf_ba_e) = reg_ba_ext.probe(&hint).expect("probe");
+    assert_eq!(winner_ba_e.name(), "ext_factory_b");
+    assert_eq!(conf_ba_e, Confidence::EXTENSION);
+    let dec_ba_e = reg_ba_ext.open(reader_source(b"test".to_vec(), Some("test")));
+    assert!(dec_ba_e.is_ok(), "extension tie must open without refusal");
+}
+
+#[test]
+fn nothing_claims_is_refused_with_clear_unsupported_format_error() {
+    let mut reg = DecoderRegistry::new();
+    // Register factory that only claims "known_ext"
+    reg.register(Arc::new(ExtensionClaimingFactory {
+        name: "known_only",
+        extensions: &["known_ext"],
+        confidence: Confidence::EXTENSION,
+    }));
+
+    // Subcase 1: Unknown extension provided -> refused naming the extension
+    let hint_unknown = ProbeHint {
+        extension: Some("unsupported_xyz"),
+        header: &pattern_bytes(64),
+    };
+    assert!(reg.probe(&hint_unknown).is_none());
+    let err_unknown = reg
+        .open(reader_source(pattern_bytes(64), Some("unsupported_xyz")))
+        .err()
+        .expect("must refuse unclaimed media");
+    match err_unknown {
+        Error::UnsupportedFormat(ext) => assert_eq!(ext, "unsupported_xyz"),
+        other => panic!("expected Error::UnsupportedFormat, got {other:?}"),
+    }
+
+    // Subcase 2: No extension (None) and no content signature -> refused with "unknown"
+    let hint_none = ProbeHint {
+        extension: None,
+        header: &pattern_bytes(64),
+    };
+    assert!(reg.probe(&hint_none).is_none());
+    let err_none = reg
+        .open(reader_source(pattern_bytes(64), None))
+        .err()
+        .expect("must refuse media without extension or signature");
+    match err_none {
+        Error::UnsupportedFormat(ext) => assert_eq!(ext, "unknown"),
+        other => panic!("expected Error::UnsupportedFormat(\"unknown\"), got {other:?}"),
+    }
+}
+
+#[test]
+fn real_symphonia_path_opens_every_repo_fixture_with_competing_extension_factory() {
+    // Registry with a competing fake factory registered FIRST for every common extension.
+    let mut reg = DecoderRegistry::new();
+    reg.register(Arc::new(ExtensionClaimingFactory {
+        name: "competing_stub_factory",
+        extensions: &["flac", "mp3", "ogg", "m4a", "aac", "alac", "wav"],
+        confidence: Confidence::EXTENSION,
+    }));
+    // Symphonia registered SECOND: must win on content for all fixtures.
+    reg.register(Arc::new(SymphoniaDecoderFactory::new()));
+
+    let fixtures = [
+        "sine.flac",
+        "sine.mp3",
+        "sine.ogg",
+        "sine_aac.m4a",
+        "sine_alac.m4a",
+    ];
+
+    for fixture_name in fixtures {
+        let path = fixture(fixture_name);
+        let mut decoder = reg
+            .open(MediaSource::Path(path.clone()))
+            .unwrap_or_else(|e| panic!("failed to open fixture {fixture_name}: {e:?}"));
+
+        let (frames, outcome) = drain_bounded(decoder.as_mut());
+        assert!(
+            matches!(outcome, Drained::End),
+            "fixture {fixture_name} must reach Drained::End"
+        );
+        // Ensure that the real Symphonia decoder was chosen, not the 10-frame mock decoder:
+        assert!(
+            frames >= 1000,
+            "fixture {fixture_name} decoded only {frames} frames; expected full fixture"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

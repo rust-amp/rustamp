@@ -22,7 +22,7 @@ pub use symphonia_dec::{SymphoniaDecoder, SymphoniaDecoderFactory};
 /// Registry with every decoder this crate provides, in priority order.
 ///
 /// Register future FFI decoders here; on equal probe confidence the earlier
-/// registration wins.
+/// registration wins (RFC 0013).
 pub fn default_registry() -> DecoderRegistry {
     let mut reg = DecoderRegistry::new();
     reg.register(Arc::new(SymphoniaDecoderFactory::new()));
