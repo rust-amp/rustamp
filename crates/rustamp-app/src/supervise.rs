@@ -170,14 +170,52 @@ pub fn plugin_host_candidates() -> Vec<PathBuf> {
     out
 }
 
+/// Machine type constant for i386 / 32-bit x86 in PE COFF header (IMAGE_FILE_MACHINE_I386).
+pub const IMAGE_FILE_MACHINE_I386: u16 = 0x014c;
+
+/// Validate that a seekable byte stream is a valid 32-bit (i686) PE image (Finding 11).
+pub fn is_i686_reader<R: std::io::Read + std::io::Seek>(mut reader: R) -> bool {
+    use std::io::SeekFrom;
+    let mut dos = [0u8; 64];
+    if reader.read_exact(&mut dos).is_err() {
+        return false;
+    }
+    if dos[0] != b'M' || dos[1] != b'Z' {
+        return false;
+    }
+    let pe_offset = u32::from_le_bytes([dos[0x3C], dos[0x3D], dos[0x3E], dos[0x3F]]);
+    if reader.seek(SeekFrom::Start(pe_offset as u64)).is_err() {
+        return false;
+    }
+    let mut pe_sig_and_header = [0u8; 6];
+    if reader.read_exact(&mut pe_sig_and_header).is_err() {
+        return false;
+    }
+    if &pe_sig_and_header[0..4] != b"PE\0\0" {
+        return false;
+    }
+    let machine = u16::from_le_bytes([pe_sig_and_header[4], pe_sig_and_header[5]]);
+    machine == IMAGE_FILE_MACHINE_I386
+}
+
+/// Validate that a binary file exists and is a valid 32-bit (i686) PE executable (Finding 11).
+pub fn is_i686_executable(path: &std::path::Path) -> bool {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    is_i686_reader(file)
+}
+
 /// First existing candidate from [`plugin_host_candidates`], if any.
 ///
-/// `None` means "no host binary is resolvable at runtime": the supervisor
+/// Enforces i686 architecture: an x64 binary with the same name is rejected (Finding 11).
+/// `None` means "no compatible host binary is resolvable at runtime": the supervisor
 /// stays detached (see the module docs for what would fix that).
 pub fn find_plugin_host() -> Option<PathBuf> {
     plugin_host_candidates()
         .into_iter()
-        .find(|path| path.is_file())
+        .find(|path| path.is_file() && is_i686_executable(path))
 }
 
 /// Makes `command` incapable of raising a window.
@@ -258,8 +296,11 @@ impl Drop for ChildHost {
 /// the host. Even spawning the thread cannot fail the supervisor: if it
 /// cannot be spawned the handover is already disconnected, which reads as a
 /// dead host.
+/// How many inbound frames the reader thread queues for the app thread (Finding 9).
+const HOST_RECV_QUEUE: usize = 16;
+
 fn spawn_host_reader(transport: impl Transport + 'static) -> mpsc::Receiver<Message> {
-    let (events, handover) = mpsc::channel();
+    let (events, handover) = mpsc::sync_channel(HOST_RECV_QUEUE);
     let _ = std::thread::Builder::new()
         .name("rustamp-host-reader".to_owned())
         .spawn(move || {
@@ -400,6 +441,15 @@ impl HostBackend for ProcessBackend {
                  rustamp.exe and no dev-tree build; the host stays detached",
             )
         })?;
+        if !is_i686_executable(&exe) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "rustamp-plughost32 binary at {} is not an i686 (32-bit) executable",
+                    exe.display()
+                ),
+            ));
+        }
         let mut command = Command::new(&exe);
         command
             .stdin(Stdio::piped())
@@ -428,6 +478,29 @@ impl HostBackend for ProcessBackend {
     }
 }
 
+/// State of the supervisor (Finding 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorState {
+    /// Actively supervising, auto-spawns on startup and after cooldown when detached.
+    Running,
+    /// Deliberately stopped via [`Supervisor::stop`]. Will NOT restart until [`Supervisor::resume`] is called.
+    Stopped,
+    /// Persistent failure state: consecutive spawn or handshake failures exceeded the policy limit.
+    PersistentFailure,
+}
+
+/// Default maximum consecutive spawn or handshake failures before entering [`SupervisorState::PersistentFailure`].
+pub const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Default timeout for waiting for the child's startup [`Message::Hello`].
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct PendingHost<L, P> {
+    transport: L,
+    process: P,
+    deadline: Instant,
+}
+
 /// Spawns and supervises one plugin host for one [`HostStateLink`].
 ///
 /// Drive it from the app thread (e.g. [`App::pump`](crate::app::App::pump)):
@@ -438,9 +511,14 @@ impl HostBackend for ProcessBackend {
 pub struct Supervisor<B: HostBackend = ProcessBackend> {
     backend: B,
     process: Option<B::Process>,
+    pending: Option<PendingHost<B::Link, B::Process>>,
+    state: SupervisorState,
     last_attempt: Option<Instant>,
     cooldown: Duration,
+    handshake_timeout: Duration,
     spawn_attempts: u64,
+    consecutive_failures: u32,
+    max_consecutive_failures: u32,
 }
 
 impl<B: HostBackend> Supervisor<B> {
@@ -450,9 +528,14 @@ impl<B: HostBackend> Supervisor<B> {
         Supervisor {
             backend,
             process: None,
+            pending: None,
+            state: SupervisorState::Running,
             last_attempt: None,
             cooldown: DEFAULT_RESTART_COOLDOWN,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             spawn_attempts: 0,
+            consecutive_failures: 0,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
         }
     }
 
@@ -462,9 +545,35 @@ impl<B: HostBackend> Supervisor<B> {
         Supervisor {
             backend,
             process: None,
+            pending: None,
+            state: SupervisorState::Running,
             last_attempt: None,
             cooldown,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             spawn_attempts: 0,
+            consecutive_failures: 0,
+            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+        }
+    }
+
+    /// Explicit failure policy and handshake configuration.
+    pub fn with_failure_policy(
+        backend: B,
+        cooldown: Duration,
+        handshake_timeout: Duration,
+        max_consecutive_failures: u32,
+    ) -> Self {
+        Supervisor {
+            backend,
+            process: None,
+            pending: None,
+            state: SupervisorState::Running,
+            last_attempt: None,
+            cooldown,
+            handshake_timeout,
+            spawn_attempts: 0,
+            consecutive_failures: 0,
+            max_consecutive_failures,
         }
     }
 
@@ -473,53 +582,182 @@ impl<B: HostBackend> Supervisor<B> {
         self.spawn_attempts
     }
 
+    /// The current state of the supervisor (Finding 12).
+    pub fn state(&self) -> SupervisorState {
+        self.state
+    }
+
+    /// Whether the supervisor is deliberately stopped (Finding 12).
+    pub fn is_stopped(&self) -> bool {
+        self.state == SupervisorState::Stopped
+    }
+
+    /// Whether the supervisor has halted due to persistent failures (Finding 12).
+    pub fn is_failed(&self) -> bool {
+        self.state == SupervisorState::PersistentFailure
+    }
+
+    /// How many consecutive failures have occurred.
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Reset any stopped or failed state and permit supervising/restarting again (Finding 12).
+    pub fn resume(&mut self) {
+        self.state = SupervisorState::Running;
+        self.consecutive_failures = 0;
+        self.pending = None;
+    }
+
     /// Whether a live managed child exists right now (non-blocking).
     pub fn is_live(&mut self) -> bool {
         self.process.as_mut().is_some_and(|p| p.is_running())
     }
 
+    fn record_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= self.max_consecutive_failures {
+            self.state = SupervisorState::PersistentFailure;
+        }
+    }
+
     /// One non-blocking supervision step: reap a dead child, replace a
-    /// desynced one, and (re-)attach a fresh transport when due.
+    /// desynced one, enforce the startup Hello barrier (Finding 8), and
+    /// (re-)attach a fresh transport when due.
     ///
     /// Never blocks, never panics, never propagates an error: a host that
     /// cannot be started leaves the link detached and the player unaffected.
     pub fn supervise(&mut self, link: &mut HostStateLink) {
+        // Finding 12: stopped state sticks, and persistent failures halt attempts.
+        if self.state == SupervisorState::Stopped
+            || self.state == SupervisorState::PersistentFailure
+        {
+            return;
+        }
+
         let live = self.process.as_mut().is_some_and(|p| p.is_running());
         if live && link.is_attached() {
             return; // healthy and connected: nothing to do
         }
-        // Either no child, a dead one, or a desynced one (a live child with a
-        // detached link: a failed send detached the link, or the link was
-        // detached by hand). `None` reaps it — dropping a stale child kills it
-        // without waiting — and the spawn below starts fresh rather than
-        // reusing half state.
-        self.process = None;
+
+        // Child process was attached but has now exited: reap and record failure.
+        if link.is_attached() {
+            self.process = None;
+            link.detach();
+            self.record_failure();
+            return;
+        }
+
+        // Child process was running but link was detached externally: desync.
+        if self.process.is_some() {
+            self.process = None;
+            self.record_failure();
+            return;
+        }
+
+        // Handshake barrier (Finding 8): if we have a spawned child waiting for greeting.
+        if let Some(mut pending) = self.pending.take() {
+            if !pending.process.is_running() {
+                self.record_failure();
+                return;
+            }
+            if Instant::now() >= pending.deadline {
+                self.record_failure();
+                return;
+            }
+            match pending.transport.try_recv() {
+                Ok(Some(Message::Hello {
+                    protocol_version, ..
+                })) => {
+                    if protocol_version == rustamp_ipc::PROTOCOL_VERSION {
+                        // Compatible Hello arrived! Barrier passed, attach and mark connected.
+                        self.consecutive_failures = 0;
+                        link.attach(pending.transport);
+                        self.process = Some(pending.process);
+                        return;
+                    } else {
+                        // Incompatible protocol version: reject and reap.
+                        self.record_failure();
+                        return;
+                    }
+                }
+                Ok(Some(_)) => {
+                    // Protocol violation: received message before startup Hello.
+                    self.record_failure();
+                    return;
+                }
+                Ok(None) => {
+                    // Still waiting for Hello: keep link detached until greeting arrives.
+                    self.pending = Some(pending);
+                    return;
+                }
+                Err(_) => {
+                    self.record_failure();
+                    return;
+                }
+            }
+        }
+
+        // Cooling down: stay detached rather than spin on spawns.
         if self
             .last_attempt
             .is_some_and(|at| at.elapsed() < self.cooldown)
         {
-            return; // cooling down: stay detached rather than spin on spawns
+            return;
         }
+
         self.last_attempt = Some(Instant::now());
         self.spawn_attempts += 1;
         match self.backend.spawn() {
-            Ok((transport, process)) => {
-                // Attaching forgets the last sent snapshot, so the host starts
-                // from the real state rather than a stale one.
-                link.attach(transport);
-                self.process = Some(process);
+            Ok((mut transport, mut process)) => {
+                if !process.is_running() {
+                    self.record_failure();
+                    return;
+                }
+                // Check if Hello is already buffered on the transport (e.g. in-memory tests or fast child):
+                match transport.try_recv() {
+                    Ok(Some(Message::Hello {
+                        protocol_version, ..
+                    })) => {
+                        if protocol_version == rustamp_ipc::PROTOCOL_VERSION {
+                            self.consecutive_failures = 0;
+                            link.attach(transport);
+                            self.process = Some(process);
+                        } else {
+                            self.record_failure();
+                        }
+                    }
+                    Ok(Some(_)) => {
+                        self.record_failure();
+                    }
+                    Ok(None) => {
+                        // Await greeting within handshake deadline. Link remains detached until Hello arrives!
+                        let deadline = Instant::now() + self.handshake_timeout;
+                        self.pending = Some(PendingHost {
+                            transport,
+                            process,
+                            deadline,
+                        });
+                    }
+                    Err(_) => {
+                        self.record_failure();
+                    }
+                }
             }
             Err(_) => {
-                // Missing or unstartable host: stay detached. The player runs
-                // identically without a host.
+                self.record_failure();
             }
         }
     }
 
-    /// The deliberate off-switch: kill the managed child (best-effort,
-    /// without waiting) and detach the link without sending anything.
+    /// The deliberate off-switch (Finding 12): kill the managed child (best-effort,
+    /// without waiting) and detach the link without sending anything. Sets the
+    /// supervisor into [`SupervisorState::Stopped`] so subsequent `supervise` calls
+    /// will NOT restart it until [`Supervisor::resume`] is called.
     pub fn stop(&mut self, link: &mut HostStateLink) {
+        self.state = SupervisorState::Stopped;
         self.process = None;
+        self.pending = None;
         link.detach();
     }
 }
@@ -560,6 +798,8 @@ mod tests {
         /// Liveness flags of the spawned processes: the test flips these to
         /// simulate host death.
         flags: Vec<Rc<Cell<bool>>>,
+        /// Whether spawn should automatically send `Message::hello()`.
+        auto_hello: bool,
     }
 
     struct FakeProcess {
@@ -579,7 +819,10 @@ mod tests {
         fn spawn(&mut self) -> io::Result<(MemoryTransport, FakeProcess)> {
             match self.script.pop_front() {
                 Some(Ok(alive)) => {
-                    let (app_end, peer) = MemoryTransport::pair();
+                    let (app_end, mut peer) = MemoryTransport::pair();
+                    if alive && self.auto_hello {
+                        let _ = peer.send(&Message::hello());
+                    }
                     self.peers.push(peer);
                     let alive = Rc::new(Cell::new(alive));
                     self.flags.push(Rc::clone(&alive));
@@ -599,6 +842,7 @@ mod tests {
             script: VecDeque::from([Ok(first)]),
             peers: Vec::new(),
             flags: Vec::new(),
+            auto_hello: true,
         }
     }
     fn supervised(first: bool) -> (Supervisor<FakeBackend>, HostStateLink) {
@@ -657,6 +901,7 @@ mod tests {
                 script: VecDeque::from([Err(io::Error::new(io::ErrorKind::NotFound, "no binary"))]),
                 peers: Vec::new(),
                 flags: Vec::new(),
+                auto_hello: true,
             },
             Duration::from_secs(3600),
         );
@@ -694,6 +939,154 @@ mod tests {
             link.publish(&PlayerState::default()),
             crate::host::PublishOutcome::Detached
         );
+    }
+
+    #[test]
+    fn stop_sticks_and_subsequent_supervise_does_not_restart_until_resumed() {
+        let (mut supervisor, mut link) = supervised(true);
+        supervisor.supervise(&mut link);
+        assert!(supervisor.is_live());
+        assert!(link.is_attached());
+
+        supervisor.stop(&mut link);
+        assert!(!link.is_attached());
+        assert!(!supervisor.is_live());
+        assert!(supervisor.is_stopped());
+
+        // Subsequent supervise calls do NOT restart while stopped (Finding 12)
+        supervisor.backend.script.push_back(Ok(true));
+        supervisor.supervise(&mut link);
+        assert!(!link.is_attached());
+        assert!(!supervisor.is_live());
+        assert_eq!(supervisor.spawn_attempts(), 1);
+
+        // Resume re-enables supervision
+        supervisor.resume();
+        assert_eq!(supervisor.state(), SupervisorState::Running);
+        supervisor.supervise(&mut link);
+        assert!(link.is_attached());
+        assert!(supervisor.is_live());
+        assert_eq!(supervisor.spawn_attempts(), 2);
+    }
+
+    #[test]
+    fn persistent_failure_halts_retries_after_max_failures() {
+        let mut supervisor = Supervisor::with_cooldown(
+            FakeBackend {
+                script: VecDeque::from([
+                    Err(io::Error::new(io::ErrorKind::NotFound, "err1")),
+                    Err(io::Error::new(io::ErrorKind::NotFound, "err2")),
+                    Err(io::Error::new(io::ErrorKind::NotFound, "err3")),
+                    Err(io::Error::new(io::ErrorKind::NotFound, "err4")),
+                ]),
+                peers: Vec::new(),
+                flags: Vec::new(),
+                auto_hello: true,
+            },
+            Duration::ZERO,
+        );
+        let mut link = HostStateLink::detached();
+        // Failure 1
+        supervisor.supervise(&mut link);
+        assert_eq!(supervisor.consecutive_failures(), 1);
+        assert_eq!(supervisor.state(), SupervisorState::Running);
+
+        // Failure 2
+        supervisor.supervise(&mut link);
+        assert_eq!(supervisor.consecutive_failures(), 2);
+        assert_eq!(supervisor.state(), SupervisorState::Running);
+
+        // Failure 3: trips DEFAULT_MAX_CONSECUTIVE_FAILURES (3) -> PersistentFailure (Finding 12)
+        supervisor.supervise(&mut link);
+        assert_eq!(supervisor.consecutive_failures(), 3);
+        assert!(supervisor.is_failed());
+
+        // Subsequent supervise calls do NOT spawn
+        supervisor.supervise(&mut link);
+        assert_eq!(supervisor.spawn_attempts(), 3);
+        assert!(supervisor.is_failed());
+
+        // Resume clears failure count and restores Running state
+        supervisor.resume();
+        assert_eq!(supervisor.state(), SupervisorState::Running);
+        assert_eq!(supervisor.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn hello_barrier_prevents_attach_until_compatible_greeting() {
+        let mut backend = backend(true);
+        backend.auto_hello = false;
+        let mut supervisor = Supervisor::with_cooldown(backend, Duration::ZERO);
+        let mut link = HostStateLink::detached();
+
+        // 1. First supervise spawns child, but greeting is not sent yet (Finding 8)
+        supervisor.supervise(&mut link);
+        assert_eq!(supervisor.spawn_attempts(), 1);
+        assert!(!link.is_attached(), "must not attach before Hello arrives");
+        assert_eq!(
+            link.publish(&PlayerState::default()),
+            crate::host::PublishOutcome::Detached
+        );
+
+        // 2. Child writes compatible Hello.
+        let peer = &mut supervisor.backend.peers[0];
+        peer.send(&Message::hello()).expect("send greeting");
+
+        // 3. Next supervise pump processes Hello, passes the barrier and attaches.
+        supervisor.supervise(&mut link);
+        assert!(link.is_attached(), "must attach after compatible Hello");
+        assert_eq!(
+            link.publish(&PlayerState::default()),
+            crate::host::PublishOutcome::Sent
+        );
+    }
+
+    #[test]
+    fn hello_barrier_rejects_incompatible_protocol_version() {
+        let mut backend = backend(true);
+        backend.auto_hello = false;
+        let mut supervisor = Supervisor::with_cooldown(backend, Duration::ZERO);
+        let mut link = HostStateLink::detached();
+
+        supervisor.supervise(&mut link);
+        assert!(!link.is_attached());
+
+        // Child writes greeting with incompatible protocol version (Finding 8).
+        let peer = &mut supervisor.backend.peers[0];
+        peer.send(&Message::Hello {
+            protocol_version: rustamp_ipc::PROTOCOL_VERSION + 1,
+            pid: 4321,
+        })
+        .expect("send incompatible greeting");
+
+        supervisor.supervise(&mut link);
+        assert!(!link.is_attached(), "incompatible Hello must be rejected");
+        assert_eq!(supervisor.consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn pe_architecture_validation_accepts_i686_and_rejects_other() {
+        // Construct valid PE header for i386 (machine 0x014c) (Finding 11)
+        let mut buf = vec![0u8; 128];
+        buf[0] = b'M';
+        buf[1] = b'Z';
+        buf[0x3C] = 0x40; // PE offset at 64
+        buf[0x40..0x44].copy_from_slice(b"PE\0\0");
+        buf[0x44..0x46].copy_from_slice(&0x014cu16.to_le_bytes()); // IMAGE_FILE_MACHINE_I386
+        assert!(is_i686_reader(std::io::Cursor::new(&buf)));
+
+        // Change machine type to x86_64 (IMAGE_FILE_MACHINE_AMD64 = 0x8664)
+        buf[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+        assert!(!is_i686_reader(std::io::Cursor::new(&buf)));
+
+        // Invalid PE signature
+        buf[0x40..0x44].copy_from_slice(b"NE\0\0");
+        assert!(!is_i686_reader(std::io::Cursor::new(&buf)));
+
+        // Non-MZ
+        buf[0] = b'E';
+        buf[1] = b'L';
+        assert!(!is_i686_reader(std::io::Cursor::new(&buf)));
     }
 
     /// A writer-side transport whose `send` parks until released: stands in
@@ -865,6 +1258,7 @@ mod tests {
     #[test]
     #[ignore = "spawns a real process; VM-only, never part of the default suite"]
     fn spawns_the_real_host_without_a_window() {
+        crate::window::require_test_vm();
         let Some(exe) = find_plugin_host() else {
             eprintln!(
                 "SKIP: no rustamp-plughost32 binary resolvable (see \
@@ -875,7 +1269,13 @@ mod tests {
         };
         let mut supervisor = Supervisor::with_path(exe);
         let mut link = HostStateLink::detached();
-        supervisor.supervise(&mut link);
+        let start = std::time::Instant::now();
+        while !link.is_attached() && start.elapsed() < std::time::Duration::from_secs(5) {
+            supervisor.supervise(&mut link);
+            if !link.is_attached() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         assert!(link.is_attached(), "the real spawn must attach a transport");
         supervisor.stop(&mut link);
         assert!(!link.is_attached());

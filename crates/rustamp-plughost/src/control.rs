@@ -97,23 +97,48 @@ pub fn send_hello(transport: &mut dyn Transport) -> ControlStep {
     }
 }
 
-/// Route one inbound message.
+/// Inbound events from the control channel routed to the UI loop.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlInbound {
+    /// Player state snapshot update.
+    State(PlayerState),
+    /// A ping from the parent with its token. The UI thread answers with Pong
+    /// when it pumps messages, so a hung UI will not answer and trip the supervisor's timeout.
+    Ping(u64),
+}
+
+/// Route one inbound message to an event sink.
 ///
-/// * `PlayerStateUpdate` is forwarded to `on_state` as an owned value; the
-///   caller (the UI thread) applies it to the surface through the state
-///   bridge, so this function never touches a window or a surface and stays
-///   testable without either.
-/// * `Ping` is answered with `Pong` carrying the same token; `Hello` is
-///   answered with our own `Hello` (the peer's version is its business to
-///   check — rejecting a mismatch is the app's decision, reported as a
-///   finding in the module docs, not taken here).
+/// * `PlayerStateUpdate` is forwarded as `ControlInbound::State`.
+/// * `Ping` is forwarded as `ControlInbound::Ping` to the UI thread (so Pong is
+///   driven by UI responsiveness rather than answering from the reader thread).
+/// * `Hello` validates protocol compatibility. If incompatible, triggers shutdown.
+/// * `Shutdown` triggers shutdown.
+/// * Other variants are ignored.
+pub fn handle_message_inbound(
+    message: Message,
+    on_event: &mut dyn FnMut(ControlInbound),
+) -> ControlStep {
+    match message {
+        Message::PlayerStateUpdate(state) => {
+            on_event(ControlInbound::State(*state));
+            ControlStep::Continue
+        }
+        Message::Ping(token) => {
+            on_event(ControlInbound::Ping(token));
+            ControlStep::Continue
+        }
+        Message::Hello { .. } => ControlStep::Continue,
+        Message::Shutdown => ControlStep::Shutdown,
+        _ => ControlStep::Continue,
+    }
+}
+
+/// Route one inbound message (answers Ping directly on transport).
+///
+/// * `PlayerStateUpdate` is forwarded to `on_state` as an owned value.
+/// * `Ping` is answered with `Pong` carrying the same token.
 /// * `Shutdown` returns [`ControlStep::Shutdown`].
-/// * Anything else is ignored (see the module docs): [`ControlStep::Continue`]
-///   with no send and no callback.
-///
-/// A reply that cannot be written means the app end is gone, so the step is
-/// [`ControlStep::Shutdown`] rather than a silent drop: the host must exit,
-/// not linger as an orphan.
 pub fn handle_message(
     message: Message,
     transport: &mut dyn Transport,
@@ -128,15 +153,33 @@ pub fn handle_message(
             Ok(()) => ControlStep::Continue,
             Err(_) => ControlStep::Shutdown,
         },
-        // The host announces itself once at startup: `run_reader` sends the
-        // greeting before it reads anything. An incoming `Hello` is the peer's
-        // announcement, and answering it with a second greeting would make two
-        // peers greet each other forever, so this arm does not reply. Version
-        // rejection belongs to the engine side (RFC 0006 section 8), which
-        // already knows our version from the startup greeting.
         Message::Hello { .. } => ControlStep::Continue,
         Message::Shutdown => ControlStep::Shutdown,
         _ => ControlStep::Continue,
+    }
+}
+
+/// Read until shutdown, close, or error (see [`ControlExit`]), routing events to `on_event`.
+///
+/// Sends the [`send_hello`] handshake first.
+pub fn run_reader_events(
+    transport: &mut dyn Transport,
+    on_event: &mut dyn FnMut(ControlInbound),
+) -> ControlExit {
+    use rustamp_ipc::IpcError;
+    if send_hello(transport) == ControlStep::Shutdown {
+        return ControlExit::ChannelClosed;
+    }
+    loop {
+        match transport.recv() {
+            Ok(message) => {
+                if handle_message_inbound(message, on_event) == ControlStep::Shutdown {
+                    return ControlExit::ShutdownRequested;
+                }
+            }
+            Err(IpcError::Closed) => return ControlExit::ChannelClosed,
+            Err(_) => return ControlExit::ChannelError,
+        }
     }
 }
 
@@ -340,6 +383,32 @@ mod tests {
             ControlStep::Shutdown
         );
         assert_eq!(states, 0);
+    }
+
+    #[test]
+    fn run_reader_events_forwards_pings_and_states_without_auto_answering_pong() {
+        let (mut app_end, mut host_end) = MemoryTransport::pair();
+        app_end.send(&Message::Ping(42)).unwrap();
+        let state = playing_state();
+        app_end
+            .send(&Message::PlayerStateUpdate(Box::new(state.clone())))
+            .unwrap();
+        app_end.send(&Message::Shutdown).unwrap();
+
+        let mut events = Vec::new();
+        let exit = run_reader_events(&mut host_end, &mut |ev| events.push(ev));
+        assert_eq!(exit, ControlExit::ShutdownRequested);
+
+        // Ping(42) and State were forwarded to the event sink:
+        assert_eq!(
+            events,
+            vec![ControlInbound::Ping(42), ControlInbound::State(state)]
+        );
+
+        // The reader only sent the startup Hello — it did NOT send Pong(42).
+        // Pong must be driven by the UI loop so a hung UI will not answer.
+        assert!(matches!(app_end.recv().unwrap(), Message::Hello { .. }));
+        assert!(app_end.try_recv().unwrap().is_none());
     }
 
     /// Really creates the host window. **VM-only and `#[ignore]`d:** it owns a

@@ -47,18 +47,20 @@
 #![windows_subsystem = "windows"]
 
 #[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
 use std::io;
 #[cfg(windows)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 #[cfg(windows)]
 use std::sync::{Arc, mpsc};
 #[cfg(windows)]
 use std::time::Duration;
 
 #[cfg(windows)]
-use rustamp_ipc::StreamTransport;
+use rustamp_ipc::{Message, StreamTransport, Transport};
 #[cfg(windows)]
-use rustamp_plughost::control::{self, ControlExit};
+use rustamp_plughost::control::{self, ControlExit, ControlInbound};
 #[cfg(windows)]
 use rustamp_plughost::message_loop;
 #[cfg(windows)]
@@ -71,6 +73,46 @@ use rustamp_proto::state::PlayerState;
 /// long, large enough to stay out of a busy spin.
 #[cfg(windows)]
 const UI_POLL: Duration = Duration::from_millis(1);
+
+/// Maximum inbound messages processed per pump quantum (work budget).
+#[cfg(windows)]
+const PUMP_WORK_BUDGET: usize = 16;
+
+/// Bounded queue capacities for inbound and outbound channels.
+#[cfg(windows)]
+const INBOUND_QUEUE_BOUND: usize = 16;
+#[cfg(windows)]
+const OUTBOX_QUEUE_BOUND: usize = 16;
+
+#[cfg(windows)]
+const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThread() -> *mut c_void;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn DuplicateHandle(
+        source_process: *mut c_void,
+        source_handle: *mut c_void,
+        target_process: *mut c_void,
+        target_handle: *mut *mut c_void,
+        desired_access: u32,
+        inherit_handle: i32,
+        options: u32,
+    ) -> i32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+    fn CancelSynchronousIo(thread: *mut c_void) -> i32;
+}
+
+/// Why the UI loop exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiLoopExit {
+    /// The reader thread finished (shutdown requested, closed, or error).
+    ReaderDone,
+    /// `WM_QUIT` was received by the message loop.
+    WmQuit,
+}
 
 fn main() {
     std::process::exit(run());
@@ -100,62 +142,170 @@ fn run_windows() -> i32 {
         }
     };
 
-    // The app's end of this pipe pair is the `StreamTransport` the supervisor
-    // builds over the child's stdout/stdin: we read what it writes (stdin)
-    // and write where it reads (stdout). The transport moves to the reader
-    // thread; see `control::run_reader` for why reads stay off the UI thread.
-    let mut transport = StreamTransport::new(io::stdin(), io::stdout());
-    let (state_tx, state_rx) = mpsc::channel::<PlayerState>();
+    // Finding 9: Inbound and outbound channels are bounded.
+    let (inbound_tx, inbound_rx) = mpsc::sync_channel::<ControlInbound>(INBOUND_QUEUE_BOUND);
+    let (outbox_tx, outbox_rx) = mpsc::sync_channel::<Message>(OUTBOX_QUEUE_BOUND);
+
+    // Dedicated writer thread for stdout. Pong is only queued when the UI
+    // loop actually pumps messages (Finding 6), so a hung UI will not answer pings.
+    let _writer = std::thread::Builder::new()
+        .name("rustamp-host-writer".to_string())
+        .spawn(move || {
+            let mut writer = StreamTransport::new(io::empty(), io::stdout());
+            for msg in outbox_rx {
+                if writer.send(&msg).is_err() {
+                    break;
+                }
+            }
+        });
+
+    // Send the startup Hello over the writer channel.
+    let _ = outbox_tx.send(Message::hello());
+
     let reader_done = Arc::new(AtomicBool::new(false));
     let reader_flag = Arc::clone(&reader_done);
+    let reader_thread_handle = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+    let reader_handle_clone = Arc::clone(&reader_thread_handle);
+    let host_hwnd = window.hwnd_raw();
+
+    // Reader thread: reads stdin, forwards events to UI thread via bounded channel.
     let reader = std::thread::spawn(move || {
-        let exit = control::run_reader(&mut transport, &mut |state| {
-            let _ = state_tx.send(state);
+        // Record duplicated thread handle so the UI thread can unblock I/O on WM_QUIT (Finding 7).
+        let mut dup_raw = std::ptr::null_mut();
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentThread(),
+                GetCurrentProcess(),
+                &mut dup_raw,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok != 0 {
+            reader_handle_clone.store(dup_raw, Ordering::SeqCst);
+        }
+
+        let mut transport = StreamTransport::new(io::stdin(), io::sink());
+        let exit = control::run_reader_events(&mut transport, &mut |event| {
+            let _ = inbound_tx.send(event);
         });
+
         reader_flag.store(true, Ordering::SeqCst);
+
+        // Finding 6: Parent-death termination independent of the UI.
+        // If the parent closed the pipe (or asked for shutdown), post WM_QUIT
+        // so a responsive UI loop exits cleanly. Additionally start a timer:
+        // if the UI thread is hung in a plugin DLL, terminate unconditionally
+        // rather than lingering as an orphaned process.
+        if host_hwnd != 0 {
+            unsafe {
+                let hwnd = windows::Win32::Foundation::HWND(host_hwnd as _);
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(hwnd),
+                    windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+                    windows::Win32::Foundation::WPARAM(0),
+                    windows::Win32::Foundation::LPARAM(0),
+                );
+            }
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::process::exit(match exit {
+                ControlExit::ChannelError => 1,
+                _ => 0,
+            });
+        });
+
         exit
     });
 
-    run_ui_loop(&window, state_rx, &reader_done);
+    let exit_reason = run_ui_loop(&window, inbound_rx, &outbox_tx, &reader_done);
 
-    // The UI loop only leaves after the reader set the flag (nothing else
-    // destroys the window), so the reader has returned and joining cannot
-    // block: a blocked stdin read dies with the process, never with a join.
-    match reader.join() {
-        Ok(ControlExit::ChannelError) => 1,
-        Ok(_) => 0,
-        Err(_) => 1,
+    // Finding 7: WM_QUIT can strand join on a blocked stdin reader.
+    // Exit reasons are distinguished, and I/O is unblocked before joining.
+    match exit_reason {
+        UiLoopExit::ReaderDone => match reader.join() {
+            Ok(ControlExit::ChannelError) => 1,
+            Ok(_) => 0,
+            Err(_) => 1,
+        },
+        UiLoopExit::WmQuit => {
+            // Unblock I/O on the reader thread before joining.
+            let raw_h = reader_thread_handle.load(Ordering::SeqCst);
+            if !raw_h.is_null() {
+                unsafe {
+                    let _ = CancelSynchronousIo(raw_h);
+                    let _ = CloseHandle(raw_h);
+                }
+            }
+            let _ = reader.join();
+            0
+        }
     }
 }
 
-/// Drain queued player snapshots into the surface and pump window messages
-/// until the reader thread reports done (or `WM_QUIT` arrives).
-///
-/// Snapshots apply in arrival order; the last one wins. A final drain after
-/// the loop applies anything that arrived with the shutdown itself.
+/// Drain queued player snapshots and pings through the state bridge, pumping
+/// window messages with a per-pump work budget and coalescing snapshots (Finding 9).
 #[cfg(windows)]
 fn run_ui_loop(
     window: &HostWindow,
-    state_rx: mpsc::Receiver<PlayerState>,
+    inbound_rx: mpsc::Receiver<ControlInbound>,
+    outbox_tx: &mpsc::SyncSender<Message>,
     reader_done: &AtomicBool,
-) {
+) -> UiLoopExit {
+    let exit_reason;
+
     loop {
-        for state in state_rx.try_iter() {
+        // Finding 9: Work budget per pump and coalesced snapshots.
+        let mut budget = PUMP_WORK_BUDGET;
+        let mut latest_state: Option<PlayerState> = None;
+        while budget > 0 {
+            match inbound_rx.try_recv() {
+                Ok(ControlInbound::State(state)) => {
+                    latest_state = Some(state);
+                    budget -= 1;
+                }
+                Ok(ControlInbound::Ping(token)) => {
+                    // Finding 6: Pong is generated here when UI pumps, confirming UI liveness.
+                    let _ = outbox_tx.try_send(Message::Pong(token));
+                    budget -= 1;
+                }
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // Apply only the latest state from the drained quantum (coalesced).
+        if let Some(state) = latest_state {
             window
                 .apply_player_state(&state)
                 .expect("UI state updates do not reenter surface access");
         }
+
         if reader_done.load(Ordering::SeqCst) {
+            exit_reason = UiLoopExit::ReaderDone;
             break;
         }
         if !message_loop::pump_once(window) {
+            exit_reason = UiLoopExit::WmQuit;
             break;
         }
         std::thread::sleep(UI_POLL);
     }
-    for state in state_rx.try_iter() {
+
+    // Final drain: coalesce any remaining snapshots that arrived with shutdown.
+    let mut latest_state: Option<PlayerState> = None;
+    for event in inbound_rx.try_iter() {
+        if let ControlInbound::State(state) = event {
+            latest_state = Some(state);
+        }
+    }
+    if let Some(state) = latest_state {
         window
             .apply_player_state(&state)
             .expect("UI state updates do not reenter surface access");
     }
+
+    exit_reason
 }
