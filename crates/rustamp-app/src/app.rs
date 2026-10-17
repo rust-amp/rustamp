@@ -1880,17 +1880,26 @@ mod tests {
             rustamp_core::state::eq_classic_from_db(eng.preamp) as u8
         );
 
-        // 4. UI-driven preamp change (click on preamp track).
+        // 4. UI-driven preamp change (click on the preamp track, away from the
+        //    thumb). The thumb now sits wherever the synchronised value put it,
+        //    and a press *inside* the thumb starts a drag and emits nothing, so
+        //    the press must land outside it.
         let preamp_x = rustamp_ui::EqualizerLayout::slider_x(rustamp_ui::EqSlider::Preamp);
-        let cmds = app.eq_mouse_down(preamp_x + 5, 80).unwrap();
-        assert_eq!(cmds.len(), 1);
+        let before = app.eq_state().preamp;
+        let cmds = app.eq_mouse_down(preamp_x + 5, 45).unwrap();
+        assert_eq!(cmds.len(), 1, "a press outside the thumb commits");
+        assert_ne!(
+            app.eq_state().preamp,
+            before,
+            "the press must move the thumb, not land on it"
+        );
         let eng = app.engine().eq();
         let win = app.eq_state();
         assert_eq!(
             win.preamp,
             rustamp_core::state::eq_classic_from_db(eng.preamp) as u8
         );
-        let _ = app.eq_mouse_up(preamp_x + 5, 80).unwrap();
+        let _ = app.eq_mouse_up(preamp_x + 5, 45).unwrap();
     }
 
     #[test]
