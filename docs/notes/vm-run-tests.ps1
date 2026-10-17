@@ -115,6 +115,15 @@ foreach ($rootFile in 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') {
     $p = Join-Path $RepoRoot $rootFile
     if (Test-Path $p) { Copy-Item $p (Join-Path $Stage $rootFile) -Force }
 }
+# And the committed golden images: the lookalike cases compare against
+# `tests/golden/lookalike/*.png` at the workspace root, so without this every
+# golden test fails in the guest with "golden missing".
+$golden = Join-Path $RepoRoot 'tests\golden'
+if (Test-Path $golden) {
+    $goldenDest = Join-Path $Stage 'tests\golden'
+    New-Item -ItemType Directory -Force -Path (Split-Path $goldenDest) | Out-Null
+    Copy-Item $golden $goldenDest -Recurse -Force
+}
 Write-Host ("    staged {0} MB" -f [math]::Round(((Get-ChildItem $Stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1))
 
 # --- 3. optional reset, then start (the broker ejects the DVD) --------------
