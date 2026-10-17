@@ -46,6 +46,18 @@
 //! `state.stop_after_current` has no surface field and no measured id reads
 //! it, so it is ignored here.
 //!
+//! # Mutating IPCs and Setter overwrites (Finding 3)
+//!
+//! When a plugin calls a setter (volume 122, pan 123, EQ write 128, shuffle 252,
+//! repeat 253) or mutating IPCs (startplay 102, restart 135), the host changes
+//! only its local surface in memory. Because `rustamp-ipc` currently provides no
+//! reverse command channel from `plughost` to `rustamp-app` (S10 §2, §11, RFC 0005
+//! O13), these mutations are never forwarded to the engine. Consequently, the
+//! next inbound [`Message::PlayerStateUpdate`] snapshot unconditionally overwrites
+//! `surface.volume`, `surface.pan`, `surface.shuffle`, `surface.repeat` and
+//! `surface.eq_*`. Closing this gap requires an RFC defining the reverse command
+//! channel across `rustamp-ipc`.
+//!
 //! # State the protocol does not carry (finding, not a gap in the mapping)
 //!
 //! No existing protocol message carries these, so this module invents no
@@ -57,9 +69,11 @@
 //!   `PlayerState` or any other `Message` variant carries it.
 //! * Runtime handles (`surface.{eq,playlist,minibrowser,video,main}_hwnd`,
 //!   `surface.menu_handle`, ids 260/281): host-local values owned by the host
-//!   window itself (`src/host_window.rs` publishes `main_hwnd` at creation);
-//!   they must never cross from the app.
-//! * Internet availability (`surface.inet_available`, id 242): no protocol field.
+//!   window itself (`src/host_window.rs` publishes `main_hwnd` at creation;
+//!   other handles default to 0 pending an M3 architecture decision on handle
+//!   ownership per S10 §13.8). They must never cross from the app.
+//! * Internet availability (`surface.inet_available`, id 242): no protocol field;
+//!   provisional and networking-dependent (S10 §3 row 242, §13.7).
 //! * EQ slot selector (`surface.eq_selected`, the 127-selects/128-writes
 //!   latch): local to one plugin's 127/128 interaction, not player state.
 //! * Seek result (id 106) and video-playing state (id 501): `PlayerState` has
@@ -289,5 +303,42 @@ mod tests {
         assert!(!surface.visible_eq);
         assert!(!surface.inet_available);
         assert!(surface.eq_selected.is_none());
+    }
+
+    #[test]
+    fn snapshot_overwrites_local_setter_mutations_pending_reverse_channel() {
+        let mut surface = IpcSurface::new();
+
+        // 1. Plugin mutates volume, pan, shuffle, repeat, and EQ locally.
+        surface.volume = 200;
+        surface.pan = -50;
+        surface.shuffle = true;
+        surface.repeat = true;
+        surface.eq_bands[0] = 10;
+
+        assert_eq!(surface.answer(122, -666).raw(), 200);
+        assert_eq!(surface.answer(123, -666).raw(), (-50i32) as u32);
+        assert_eq!(surface.answer(250, 0).raw(), 1);
+        assert_eq!(surface.answer(251, 0).raw(), 1);
+        assert_eq!(surface.answer(127, 0).raw(), 10);
+
+        // 2. Incoming PlayerStateUpdate from engine arrives with engine state.
+        let state = PlayerState {
+            volume: 75,
+            balance: 10,
+            shuffle: false,
+            repeat: false,
+            ..PlayerState::default()
+        };
+        apply_player_state(&mut surface, &state);
+
+        // 3. Local mutations are overwritten by the engine snapshot because
+        // plughost does not have a reverse command channel to update the engine.
+        assert_eq!(surface.volume, 75);
+        assert_eq!(surface.pan, 10);
+        assert!(!surface.shuffle);
+        assert!(!surface.repeat);
+        // Default eq flat is 31 (0.0 dB).
+        assert_eq!(surface.eq_bands[0], 31);
     }
 }

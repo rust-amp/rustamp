@@ -151,7 +151,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: true,
         evidence_run: "B3",
         evidence_step: "play_action",
-        note: "Effect measured (+359 px); reply unread because the step posted.",
+        note: "Effect measured (+359 px); reply unread because step posted. Host reports CommandEffect without triggering engine playback (missing reverse channel, S10 2, 11).",
     },
     IpcRow {
         id: 104,
@@ -223,7 +223,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: true,
         evidence_run: "R2/R3",
         evidence_step: "s10_122_volume_query",
-        note: "Query -666 -> 0; read-backs 64, 0, 255. Volume is unsigned 0..=255 (S10 3.9f).",
+        note: "Query -666 -> 0; read-backs 64, 0, 255. Volume is unsigned 0..=255 (S10 3.9f). Sent setter return value unmeasured (S10 0.2 E4, 13.11).",
     },
     IpcRow {
         id: 123,
@@ -235,7 +235,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: true,
         evidence_run: "R2/R3",
         evidence_step: "s10_123_pan_query",
-        note: "Query -666 -> 0; setting 255 reads back -1 (0xFFFFFFFF). Pan is signed (S10 3.9f).",
+        note: "Query -666 -> 0; setting 255 reads back -1 (0xFFFFFFFF). Pan is signed (S10 3.9f). Sent setter return value unmeasured (S10 0.2 E4, 13.11).",
     },
     IpcRow {
         id: 124,
@@ -271,7 +271,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: true,
         evidence_run: "R2/R3",
         evidence_step: "s10_126_info_mode0",
-        note: "Modes 0/1/2 all 0 while stopped.",
+        note: "Modes 0/1/2 all 0 while stopped. Playing sample rate unit (raw Hz vs kHz) unmeasured (S10 13.2).",
     },
     IpcRow {
         id: 127,
@@ -307,7 +307,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: false,
         evidence_run: "B3",
         evidence_step: "restart_action",
-        note: "Capture failed while the process restarted (exit 3).",
+        note: "Capture failed while the process restarted (exit 3). Host process does not restart player (missing protocol channel, S10 2, 11).",
     },
     IpcRow {
         id: 242,
@@ -319,7 +319,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: true,
         evidence_run: "R2/R3",
         evidence_step: "s10_242_inetavailable",
-        note: "Sandbox-networking-dependent; not a fixture property.",
+        note: "Provisional: sandbox-networking-dependent; not a fixture property (S10 3, 13.7).",
     },
     IpcRow {
         id: 250,
@@ -355,7 +355,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: true,
         evidence_run: "R2/R3",
         evidence_step: "s10_setshuffle_1",
-        note: "Posted; effect observed via 250.",
+        note: "Posted; effect observed via 250. -666 query and sent setter return are unmeasured (S10 3, 6).",
     },
     IpcRow {
         id: 253,
@@ -367,7 +367,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: true,
         evidence_run: "R2/R3",
         evidence_step: "s10_setrepeat_1",
-        note: "Posted; effect observed via 251.",
+        note: "Posted; effect observed via 251. -666 query and sent setter return are unmeasured (S10 3, 6).",
     },
     IpcRow {
         id: 260,
@@ -379,7 +379,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: true,
         evidence_run: "R2/R3",
         evidence_step: "s10_260_getwnd_eq",
-        note: "Real distinct per-boot handles (EQ 66262, PE 66264, video 66266, MB 66268/66270).",
+        note: "Real distinct per-boot handles (EQ 66262, PE 66264, video 66266, MB 66268/66270). Host returns 0 pending M3 handle ownership decision (S10 13.8).",
     },
     IpcRow {
         id: 261,
@@ -403,7 +403,7 @@ pub const IPC_TABLE: &[IpcRow] = &[
         stateful: true,
         evidence_run: "R2/R3",
         evidence_step: "s10_281_get_hmenu",
-        note: "Non-null menu handle per boot (262789, 328057).",
+        note: "Non-null menu handle per boot (262789, 328057). Host returns 0 pending M3 menu ownership decision (S10 13.8).",
     },
     IpcRow {
         id: 400,
@@ -747,6 +747,10 @@ impl IpcSurface {
     pub fn answer(&mut self, id: u32, wparam: i64) -> IpcAnswer {
         match id {
             0 => IpcAnswer::Value(WINAMP_VERSION_295),
+            // Mutating IPCs (102 IPC_STARTPLAY, 135 IPC_RESTARTWINAMP) and playlist actions (101, 121).
+            // Finding 3: The host returns CommandEffect { id } (raw() == 1), but causes no effect
+            // in the player engine and no restart of the process because no reverse command channel
+            // is ratified across rustamp-ipc (S10 §2, §11, RFC 0005 O13).
             101 | 121 | 102 | 135 => IpcAnswer::CommandEffect { id },
             104 => IpcAnswer::Value(self.is_playing),
             105 => {
@@ -779,7 +783,11 @@ impl IpcSurface {
                     IpcAnswer::Value(self.volume as u32)
                 } else {
                     let v = wparam.clamp(0, 255) as u8;
+                    // Finding 3: Mutates local surface only; overwritten by next PlayerStateUpdate snapshot.
                     self.volume = v;
+                    // Finding 4: S10 §0.2 E4 and §13.11 note that setter steps were posted, so
+                    // what a sent setter returns was never measured. Returning the new value is an
+                    // unmeasured fallback convention ([IDX] states "old or new value").
                     IpcAnswer::Value(v as u32)
                 }
             }
@@ -789,7 +797,10 @@ impl IpcSurface {
                 } else {
                     let b = (wparam as u32) & 0xff;
                     let signed = if b >= 128 { b as i32 - 256 } else { b as i32 };
+                    // Finding 3: Mutates local surface only; overwritten by next PlayerStateUpdate snapshot.
                     self.pan = signed;
+                    // Finding 4: Sent setter return value is unmeasured (S10 §0.2 E4, §13.11).
+                    // Returning signed pan is an unmeasured fallback convention.
                     IpcAnswer::Value(signed as u32)
                 }
             }
@@ -801,6 +812,8 @@ impl IpcSurface {
                     IpcAnswer::Value(0)
                 } else {
                     match mode {
+                        // Finding 4: S10 §13.2 leaves stream info while playing open;
+                        // whether mode 0 returns raw Hz (self.sample_rate) or kHz is unmeasured.
                         0 => IpcAnswer::Value(self.sample_rate),
                         1 => IpcAnswer::Value(self.bitrate),
                         2 => IpcAnswer::Value(self.channels),
@@ -831,27 +844,39 @@ impl IpcSurface {
                     Some(12) => self.eq_autoload = value != 0,
                     _ => {}
                 }
+                // Finding 3: Local surface is mutated, but not forwarded to engine;
+                // next PlayerStateUpdate snapshot will overwrite these values.
                 IpcAnswer::CommandEffect { id }
             }
             250 => IpcAnswer::Value(u32::from(self.shuffle)),
             251 => IpcAnswer::Value(u32::from(self.repeat)),
             252 => {
+                // Finding 4: -666 is measured only for 122/123. S10 defines dedicated getter 250;
+                // -666 query handling on 252 is an unmeasured speculative convenience.
                 if wparam == -666 {
                     IpcAnswer::Value(u32::from(self.shuffle))
                 } else {
+                    // Finding 3: Mutates local surface only; overwritten by next engine snapshot.
                     self.shuffle = wparam != 0;
+                    // Finding 4: Sent return value is unmeasured (step was posted in S10).
                     IpcAnswer::Value(u32::from(self.shuffle))
                 }
             }
             253 => {
+                // Finding 4: -666 is measured only for 122/123. S10 defines dedicated getter 251;
+                // -666 query handling on 253 is an unmeasured speculative convenience.
                 if wparam == -666 {
                     IpcAnswer::Value(u32::from(self.repeat))
                 } else {
+                    // Finding 3: Mutates local surface only; overwritten by next engine snapshot.
                     self.repeat = wparam != 0;
+                    // Finding 4: Sent return value is unmeasured (step was posted in S10).
                     IpcAnswer::Value(u32::from(self.repeat))
                 }
             }
             260 => {
+                // Finding 5: S10 row 260 measured distinct nonzero handles. These default to 0
+                // on a fresh surface pending an M3 architecture decision on handle ownership (S10 §13.8).
                 let handle = match wparam {
                     0 => self.eq_hwnd,
                     1 => self.playlist_hwnd,
@@ -871,10 +896,14 @@ impl IpcSurface {
                 };
                 IpcAnswer::Value(u32::from(v))
             }
-            281 => IpcAnswer::RuntimeHandle {
-                id,
-                handle: self.menu_handle,
-            },
+            281 => {
+                // Finding 5: S10 row 281 measured a nonzero menu handle. Defaults to 0
+                // pending M3 architecture decision on menu ownership (S10 §13.8).
+                IpcAnswer::RuntimeHandle {
+                    id,
+                    handle: self.menu_handle,
+                }
+            }
             400 => IpcAnswer::Value(0),
             501 => {
                 if self.is_playing == 0 {
@@ -894,6 +923,8 @@ impl IpcSurface {
             3015 => IpcAnswer::Value(1),
             3025 => IpcAnswer::Value(1),
             65536 => IpcAnswer::Value(1),
+            // Finding 4: S10 row 242 explicitly states: "provisional — sandbox-networking-dependent;
+            // not a fixture property, do not export it as one (§13.7)". Defaulting to true (1) is provisional.
             242 => IpcAnswer::Value(u32::from(self.inet_available)),
             _ => {
                 // Known measured ids that intentionally carry no runtime value.
@@ -1071,5 +1102,98 @@ mod tests {
             let row = lookup_table(id).unwrap();
             assert!(row.stateful, "id {id} must be stateful");
         }
+    }
+
+    #[test]
+    fn finding_3_mutating_ipcs_return_command_effect_without_engine_channel() {
+        let mut s = IpcSurface::new();
+        // 102 (IPC_STARTPLAY) and 135 (IPC_RESTARTWINAMP) return CommandEffect
+        // with raw() == 1. In our architecture, no reverse IPC command channel
+        // from plughost to rustamp.exe exists yet (S10 §2, §11, RFC 0005 O13).
+        let ans_102 = s.answer(102, 0);
+        assert_eq!(ans_102, IpcAnswer::CommandEffect { id: 102 });
+        assert_eq!(ans_102.raw(), UNKNOWN_REPLY);
+
+        let ans_135 = s.answer(135, 0);
+        assert_eq!(ans_135, IpcAnswer::CommandEffect { id: 135 });
+        assert_eq!(ans_135.raw(), UNKNOWN_REPLY);
+
+        // Surface state remains stopped (0) because 102 has no engine link here.
+        assert_eq!(s.is_playing, 0);
+    }
+
+    #[test]
+    fn finding_4_sent_volume_and_pan_fallback_returns_new_value() {
+        let mut s = IpcSurface::new();
+        // S10 §0.2 E4 and §13.11 note that setter steps were posted, so what a
+        // sent setter returns was never measured. The host currently returns the
+        // new value as an unmeasured fallback convention.
+        assert_eq!(s.answer(122, 100), IpcAnswer::Value(100));
+        assert_eq!(s.volume, 100);
+        assert_eq!(s.answer(122, -666), IpcAnswer::Value(100));
+
+        assert_eq!(s.answer(123, 40), IpcAnswer::Value(40));
+        assert_eq!(s.pan, 40);
+        assert_eq!(s.answer(123, -666), IpcAnswer::Value(40));
+    }
+
+    #[test]
+    fn finding_4_shuffle_and_repeat_unmeasured_minus_666_fallback() {
+        let mut s = IpcSurface::new();
+        // S10 rows 250/251 are the dedicated getters. -666 was measured only for
+        // 122/123. The -666 query branch on 252/253 is unmeasured, and sent 252/253
+        // return value is unmeasured (step posted in S10).
+        assert_eq!(s.answer(252, -666), IpcAnswer::Value(0));
+        assert_eq!(s.answer(253, -666), IpcAnswer::Value(0));
+
+        // Setting non-zero updates local state.
+        assert_eq!(s.answer(252, 1), IpcAnswer::Value(1));
+        assert!(s.shuffle);
+        assert_eq!(s.answer(252, -666), IpcAnswer::Value(1));
+
+        assert_eq!(s.answer(253, 1), IpcAnswer::Value(1));
+        assert!(s.repeat);
+        assert_eq!(s.answer(253, -666), IpcAnswer::Value(1));
+    }
+
+    #[test]
+    fn finding_4_stream_info_playing_sample_rate_fallback() {
+        let mut s = IpcSurface::new();
+        s.is_playing = 1;
+        s.sample_rate = 44_100;
+        s.bitrate = 192;
+        s.channels = 2;
+
+        // Mode 0 returning raw Hz (44100) vs kHz (44) while playing is unmeasured
+        // in S10 (§13.2). Pinned here as the host's current fallback.
+        assert_eq!(s.answer(126, 0), IpcAnswer::Value(44_100));
+        assert_eq!(s.answer(126, 1), IpcAnswer::Value(192));
+        assert_eq!(s.answer(126, 2), IpcAnswer::Value(2));
+    }
+
+    #[test]
+    fn finding_4_inet_available_provisional_reply() {
+        let mut s = IpcSurface::new();
+        // S10 §3 row 242 and §13.7: provisional, sandbox-networking-dependent.
+        // It must not be treated as an immutable fixture invariant.
+        assert_eq!(s.answer(242, 0), IpcAnswer::Value(1));
+        s.inet_available = false;
+        assert_eq!(s.answer(242, 0), IpcAnswer::Value(0));
+    }
+
+    #[test]
+    fn finding_5_window_and_menu_handles_default_to_zero_pending_m3_decision() {
+        let mut s = IpcSurface::new();
+        // S10 rows 260 and 281 measured distinct nonzero handles in 2.95.
+        // In our out-of-process 32-bit host, handles default to 0 pending an M3
+        // architectural decision on handle ownership (S10 §13.8).
+        for selector in 0..=3 {
+            let ans = s.answer(260, selector);
+            assert_eq!(ans, IpcAnswer::RuntimeHandle { id: 260, handle: 0 });
+            assert_eq!(ans.raw(), 0);
+        }
+        let ans_menu = s.answer(281, 0);
+        assert_eq!(ans_menu, IpcAnswer::RuntimeHandle { id: 281, handle: 0 });
+        assert_eq!(ans_menu.raw(), 0);
     }
 }

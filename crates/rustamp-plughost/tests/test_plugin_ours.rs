@@ -41,6 +41,7 @@ fn our_test_plugin_exercises_the_surface_end_to_end() {
     );
 
     // 3. Volume read / write pair (unsigned 0..=255 convention, S10 3.9f).
+    // Note: Sent setter return value is an unmeasured fallback convention (S10 §0.2 E4, §13.11).
     assert_eq!(
         rustamp_plughost::HostWindow::dispatch_ipc(&mut surface, 64, IPC_SETVOLUME),
         64
@@ -60,6 +61,7 @@ fn our_test_plugin_exercises_the_surface_end_to_end() {
     // 5. Handle selector: IPC_GETWND's selector 0 is the **equalizer** window,
     //    not the main one — that is the mapping the S10 steps measured
     //    (`s10_260_getwnd_eq/pe/mb/video`), and the surface follows it.
+    //    (Handles default to 0 on a fresh surface pending M3 architecture decision, S10 §13.8).
     surface.eq_hwnd = host_hwnd;
     assert_eq!(
         rustamp_plughost::HostWindow::dispatch_ipc(&mut surface, 0, IPC_GETWND),
