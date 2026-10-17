@@ -147,6 +147,21 @@ if (Test-Path $mediaDir) {
     Write-Host '    no real test media on the host; media-dependent tests will skip'
 }
 
+# Real test skins, the same contract as the media above: a directory of `.wsz`
+# files and/or skin folders staged read-only, exposed to the guest as
+# RUSTAMP_TESTSKINS. Tests that need a real classic skin opt in and skip when it
+# is absent, so a checkout without it still passes.
+$skinsDir = 'D:\code\rustamp-testskins'
+if (Test-Path $skinsDir) {
+    Step 'copying test skins into the guest (read-only copies)'
+    $skinsStage = Join-Path (Split-Path $Stage) 'testskins'
+    if (Test-Path $skinsStage) { Remove-Item -Recurse -Force $skinsStage }
+    Copy-Item $skinsDir $skinsStage -Recurse -Force
+    & $broker -Op copyin -Source $skinsStage -Dest 'C:\rustamp\testskins' -TimeoutSeconds 600 | Out-Null
+} else {
+    Write-Host '    no test skins on the host; skin-dependent tests will skip'
+}
+
 Step 'running the tests in the guest'
 # A single positional argument: `-ArgumentList` with an array binds only the
 # first element to the script's parameter, which silently dropped the filter.
