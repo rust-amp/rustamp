@@ -9,6 +9,31 @@ kept in place (see [CLEANROOM.md](CLEANROOM.md)).
 |---|---|---|---|---|
 | webamp classic-skin tables | [captbaritone/webamp](https://github.com/captbaritone/webamp), commit `79117c66d79fdac690fc732a0ce8df543ccd97a0` | MIT | `crates/rustamp-skin/src/webamp.rs` | The sprite rectangles (`packages/webamp/js/skinSprites.ts`), the `text.bmp` glyph grid, the cursor name list, the default analyser colours and the default playlist colours (`packages/webamp/js/baseSkin.json`, `constants.ts`), rewritten in Rust. The MIT notice is at the top of the module. Every ported value carries a `// provisional: webamp, pending S01/S17` marker. |
 
+## Rust crate dependencies
+
+Crates linked as ordinary Cargo dependencies (no code is copied into the
+tree). The license is the one each crate declares in its published
+`Cargo.toml`, read from the local cargo registry and cross-checked with
+`cargo tree --format "{p} {l}"`; every one is permissive and compatible with
+GPL-3.0-or-later. None of them is in the dependency closure of a permissive
+Rustamp crate: they enter through `rustamp-audio`, which is GPL-3.0-or-later.
+
+| Crate | Version | License | Used in | Purpose |
+|---|---|---|---|---|
+| [`rubato`](https://github.com/HEnquist/rubato) | 5.0.1 | MIT OR Apache-2.0 | `rustamp-audio` (`src/convert.rs`) | Band-limited sample-rate conversion (synchronous FFT resampler, asynchronous sinc fallback). crates.io's license field is empty and GitHub reports NOASSERTION, but the crate's `Cargo.toml` declares `MIT OR Apache-2.0` and the package ships `LICENSE-MIT` and `LICENSE-APACHE`. |
+| `audioadapter` | 5.0.0 | MIT OR Apache-2.0 | via `rubato` | Buffer-layout traits for rubato's input and output. |
+| `audioadapter-buffers` | 5.2.0 | MIT OR Apache-2.0 | via `rubato` (used through rubato's re-export) | The `InterleavedSlice` views the converter hands to rubato. |
+| `audioadapter-sample` | 5.2.0 | MIT OR Apache-2.0 | via `rubato` | Sample-format conversions for the adapters. |
+| `audio-codec-algorithms` | 0.8.1 | 0BSD OR Apache-2.0 | via `audioadapter-sample` | Sample-format helpers. |
+| `realfft` | 3.5.0 | MIT | via `rubato` | Real-to-complex FFT for the FFT resampler. |
+| `rustfft` | 6.4.1 | MIT OR Apache-2.0 | via `realfft` | FFT implementation. |
+| `num-complex` | 0.4.6 | MIT OR Apache-2.0 | via `rubato`, `rustfft` | Complex numbers. |
+| `primal-check` | 0.3.4 | MIT OR Apache-2.0 | via `rustfft` | Primality test for FFT planning. |
+| `strength_reduce` | 0.2.4 | MIT OR Apache-2.0 | via `rustfft` | Fast integer division for FFT planning. |
+| `transpose` | 0.2.3 | MIT OR Apache-2.0 | via `rustfft` | Matrix transposition for FFT planning. |
+| `visibility` | 0.1.1 | Zlib OR MIT OR Apache-2.0 | via `rubato` (proc macro, build time only) | Visibility attribute macro. |
+| `windowfunctions` | 0.1.1 | MIT | via `rubato` | Window functions for the anti-aliasing filters. |
+
 Projects we expect to draw from: DeaDBeeF (zlib / GPL / LGPL), webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib), libopenmpt (BSD-3-Clause).
 
 Not bundled: the original Winamp base skin. It is distributed separately as an optional download, and it is used in tests.

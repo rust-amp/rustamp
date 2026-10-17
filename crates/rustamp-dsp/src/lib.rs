@@ -11,5 +11,7 @@
 #![warn(missing_docs)]
 
 pub mod eq;
+pub mod limiter;
 
 pub use eq::{BAND_CENTERS_HZ, BAND_Q, EqControl, Equalizer};
+pub use limiter::{Limiter, LimiterControl};

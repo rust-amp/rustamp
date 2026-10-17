@@ -72,3 +72,4 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 lofty = "0.25"
 winit = "0.30"
 softbuffer = "0.4"
+rubato = "5"
