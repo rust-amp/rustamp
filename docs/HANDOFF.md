@@ -1,5 +1,7 @@
 # Handoff: Rustamp project takeover
 
+> **Live session handover (2026-10-17, late):** see [HANDOFF-SESSION.md](HANDOFF-SESSION.md) - what is merged, what is running (with the job ids), the exact next steps, and the rules this session learned the hard way.
+
 Status as of **2026-10-15**, after the second session (OpenCode orchestrator): lanes A (audio engine), C (skin/gfx), D (main window and its behaviour), E (playlist I/O), G (shared-memory rings) and L (licensing split) are integrated on `main`; S01, S02, S03 and S17 are audited. This document is everything a new agent needs to continue the work. Read it completely before you do anything.
 
 ---
