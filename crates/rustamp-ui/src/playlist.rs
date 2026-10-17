@@ -305,15 +305,18 @@ impl PlaylistWindow {
     /// menu-confirmed). The spec states the binding, not a measured effect, so
     /// this selects the whole list rather than the visible page that SEL
     /// selects (S06 §2).
+    ///
+    /// It only *produces* the command: the app applies `Command::Select` to
+    /// this model, so applying it here as well would apply it twice — which is
+    /// harmless for `All` but not for [`Self::invert_selection`].
     pub fn select_all(&mut self) -> Command {
-        self.apply_select(&SelectOp::All);
         Command::Select(SelectOp::All)
     }
 
     /// Ctrl+I inverts the selection (S03 §2, `40171` "Invert selection",
-    /// menu-confirmed; effect not measured).
+    /// menu-confirmed; effect not measured). Like [`Self::select_all`] it only
+    /// produces the command, because inverting twice is the identity.
     pub fn invert_selection(&mut self) -> Command {
-        self.apply_select(&SelectOp::Invert);
         Command::Select(SelectOp::Invert)
     }
 
