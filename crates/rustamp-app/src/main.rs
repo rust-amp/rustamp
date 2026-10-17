@@ -23,12 +23,22 @@
 //! life; a second launch forwards its command line to the running player and
 //! exits without opening a second window. `--null` is the headless test mode
 //! and never claims the lock, so a test can run beside a normal player.
+//!
+//! # Global hotkeys (task card F3)
+//!
+//! The first (windowed) instance also starts the global-hotkey session
+//! ([`rustamp_platform::HotkeySession`]), which registers the default
+//! `Ctrl+Alt` chords on its own thread for the whole run. A refused chord is a
+//! stderr warning, never a startup failure. `--null` starts no session.
+//! Fired actions queue in the platform crate; the `window.rs` follow-up drains
+//! them through the normal command path (see the F3 card).
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 
 use rustamp_app::cli::{self, OutputChoice, USAGE};
+use rustamp_platform::HotkeySession;
 use rustamp_platform::single_instance::{self, Claim, ForwardRequest, HandOff};
 
 fn main() -> ExitCode {
@@ -46,23 +56,37 @@ fn main() -> ExitCode {
     }
 
     // `--null` is the headless test mode: it never participates in the
-    // single-instance protocol (no window, no config-derived instance). Every
-    // other output mode is a real player and takes the lock.
+    // single-instance protocol (no window, no config-derived instance) and
+    // registers no hotkeys. Every other output mode is a real player and
+    // takes the lock.
     if args.output == OutputChoice::Null {
-        return run_player(args, None);
+        return run_player(args, None, None);
     }
 
     // The key follows the resolved config path, so two normal launches share
     // one instance while tests with their own `RUSTAMP_CONFIG` never collide.
     let key = single_instance::instance_key(rustamp_app::config::default_path().as_deref());
     match single_instance::claim(&key) {
-        Claim::First(instance) => run_player(args, Some(instance)),
+        Claim::First(instance) => {
+            // The session thread registers the default global hotkeys for the
+            // whole run; a taken chord is a warning, never a startup failure.
+            let session = HotkeySession::start();
+            for warning in session.warnings() {
+                eprintln!("rustamp: {warning}");
+            }
+            run_player(args, Some(instance), Some(session))
+        }
         Claim::AlreadyRunning => forward(&key, &args),
     }
 }
 
-/// Runs the player, keeping `instance` (when present) alive for the whole run.
-fn run_player(args: cli::Args, _instance: Option<single_instance::Instance>) -> ExitCode {
+/// Runs the player, keeping `instance` (when present) and the hotkey `session`
+/// alive for the whole run.
+fn run_player(
+    args: cli::Args,
+    _instance: Option<single_instance::Instance>,
+    _hotkeys: Option<HotkeySession>,
+) -> ExitCode {
     match rustamp_app::run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
