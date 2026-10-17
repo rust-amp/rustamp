@@ -12,11 +12,13 @@
 //! in separately licensed resident crates, never in this framework.
 //!
 //! [`decoder`] implements the lossless decoder conversation and resident boundary;
+//! [`dsp`] implements the lossless two-ring DSP conversation the same way;
 //! [`control`] supervises the control stream independently of blocking PCM I/O.
-//! Neither API belongs on an audio render callback. The DSP host remains a stub.
+//! Neither API belongs on an audio render callback.
 
 pub mod control;
 pub mod decoder;
+pub mod dsp;
 pub mod pcm;
 
 use rustamp_ipc::Message;

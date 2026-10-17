@@ -24,6 +24,7 @@ members = [
     "crates/rustamp-testkit",
     "crates/rustamp-mediahost",
     "crates/rustamp-dechost",
+    "crates/rustamp-dsphost",
     "xtask",
 ]
 

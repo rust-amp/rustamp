@@ -1716,6 +1716,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustamp-dsphost"
+version = "0.0.1"
+dependencies = [
+ "rustamp-core",
+ "rustamp-ipc",
+ "rustamp-mediahost",
+ "rustamp-proto",
+]
+
+[[package]]
 name = "rustamp-gfx"
 version = "0.0.1"
 dependencies = [
