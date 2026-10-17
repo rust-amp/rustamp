@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::entry::LoadedEntry;
 use crate::error::{PlaylistError, Result};
-use crate::format::{PlaylistFormat, detect};
+use crate::format::{PlaylistFormat, detect, looks_like_text, sniff, starts_like_xml};
 
 /// Message used for the formats this crate recognizes but does not implement.
 const B4S_UNSUPPORTED: &str = "B4S is not implemented: it is a Winamp-specific XML dialect \
@@ -40,9 +40,15 @@ pub fn read_playlist_with_hint(
     path_hint: Option<&Path>,
 ) -> Result<Vec<LoadedEntry>> {
     let format = detect(bytes, path_hint).ok_or_else(|| {
-        PlaylistError::UnsupportedFormat(
-            "unrecognized playlist content: no M3U, PLS or XSPF marker and not text".to_owned(),
-        )
+        let extension = path_hint
+            .and_then(Path::extension)
+            .map(|e| format!(" (extension `.{}`)", e.to_string_lossy()))
+            .unwrap_or_default();
+        PlaylistError::UnsupportedFormat(format!(
+            "unrecognized playlist content{extension}: no M3U, PLS or XSPF marker, and the data \
+             is binary, UTF-16, XML with another root, or text behind an extension that is not \
+             a playlist format"
+        ))
     })?;
     read_playlist_as(format, bytes, base)
 }
@@ -61,31 +67,118 @@ pub fn load_playlist_file(path: &Path) -> Result<Vec<LoadedEntry>> {
 }
 
 /// Reads a playlist with an explicit format, skipping detection.
+///
+/// Skipping detection does not mean believing the caller blindly: the bytes
+/// must be consistent with `format` or the call fails with
+/// [`PlaylistError::UnsupportedFormat`]:
+///
+/// * non-empty M3U/M3U8/PLS input must be text and must not open an XML
+///   document (binary and UTF-16 data would otherwise become junk entries);
+/// * a content marker for a *different* format (see [`sniff`]) is a mismatch;
+///   M3U and M3U8 are interchangeable;
+/// * XSPF must be a complete document ([`crate::xspf::validate`]): a truncated
+///   or malformed file is an error here, although [`crate::xspf::read`] on its
+///   own would return the tracks it saw.
+///
+/// What stays lenient on purpose: a single bad *entry* inside a well-formed
+/// file (empty `FileN=`, a track without `<location>`, a dangling `#EXTINF`)
+/// is skipped, and the entry's other fields are never an error.
 pub fn read_playlist_as(
     format: PlaylistFormat,
     bytes: &[u8],
     base: &Path,
 ) -> Result<Vec<LoadedEntry>> {
+    if format == PlaylistFormat::B4s {
+        return Err(PlaylistError::UnsupportedFormat(B4S_UNSUPPORTED.to_owned()));
+    }
+    check_claim(format, bytes)?;
     match format {
         PlaylistFormat::M3u => Ok(crate::m3u::read(bytes, base)),
         PlaylistFormat::M3u8 => Ok(crate::m3u::read_utf8(bytes, base)),
         PlaylistFormat::Pls => Ok(crate::pls::read(bytes, base)),
-        PlaylistFormat::Xspf => Ok(crate::xspf::read(bytes, base)),
-        PlaylistFormat::B4s => Err(PlaylistError::UnsupportedFormat(B4S_UNSUPPORTED.to_owned())),
+        PlaylistFormat::Xspf => {
+            let text = crate::cp1252::decode_text(bytes);
+            crate::xspf::validate(&text).map_err(|why| {
+                PlaylistError::UnsupportedFormat(format!("not a complete XSPF document: {why}"))
+            })?;
+            Ok(crate::xspf::read_text(&text, base))
+        }
+        PlaylistFormat::B4s => unreachable!("B4S returned above"),
     }
+}
+
+/// Fails when `bytes` visibly are not `format`.
+fn check_claim(format: PlaylistFormat, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let is_xml = format == PlaylistFormat::Xspf;
+    if !is_xml && (!looks_like_text(bytes) || starts_like_xml(bytes)) {
+        return Err(PlaylistError::UnsupportedFormat(format!(
+            "the data is not {format} text (binary, UTF-16 or XML)"
+        )));
+    }
+    if let Some(found) = sniff(bytes) {
+        let m3u_family = |f| matches!(f, PlaylistFormat::M3u | PlaylistFormat::M3u8);
+        let same = found == format || (m3u_family(found) && m3u_family(format));
+        if !same {
+            return Err(PlaylistError::UnsupportedFormat(format!(
+                "the content is {found}, not {format}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Writes entries in `format` and returns the file bytes.
 ///
 /// M3U/M3U8 and PLS use CRLF line endings, XSPF uses LF; everything is UTF-8.
 /// B4S is recognized but not implemented and returns an error.
+///
+/// An entry the format cannot store without changing it is a
+/// [`PlaylistError::InvalidEntry`] rather than a silently altered file: an
+/// empty location, a location with leading or trailing whitespace (readers
+/// trim), a location with a line break in M3U/M3U8/PLS, or an M3U/M3U8
+/// location starting with `#` (it would read back as a comment). A *title*
+/// with a line break is not an error: M3U/PLS write it with the break replaced
+/// by a space, and every reader trims titles, so titles with leading or
+/// trailing whitespace come back trimmed (documented loss, tested).
 pub fn write_playlist(format: PlaylistFormat, entries: &[LoadedEntry]) -> Result<Vec<u8>> {
+    if format != PlaylistFormat::B4s {
+        check_writable(format, entries)?;
+    }
     match format {
         PlaylistFormat::M3u | PlaylistFormat::M3u8 => Ok(crate::m3u::write(entries)),
         PlaylistFormat::Pls => Ok(crate::pls::write(entries)),
         PlaylistFormat::Xspf => Ok(crate::xspf::write(entries)),
         PlaylistFormat::B4s => Err(PlaylistError::UnsupportedFormat(B4S_UNSUPPORTED.to_owned())),
     }
+}
+
+/// Rejects entries that `format` would store in a changed form.
+fn check_writable(format: PlaylistFormat, entries: &[LoadedEntry]) -> Result<()> {
+    let line_based = format != PlaylistFormat::Xspf;
+    let m3u_family = matches!(format, PlaylistFormat::M3u | PlaylistFormat::M3u8);
+    for (index, entry) in entries.iter().enumerate() {
+        let text = entry.location.to_display_string();
+        let problem = if text.trim().is_empty() {
+            Some("the location is empty")
+        } else if text.trim() != text {
+            Some("the location has leading or trailing whitespace")
+        } else if line_based && text.contains(['\r', '\n']) {
+            Some("the location contains a line break")
+        } else if m3u_family && text.starts_with('#') {
+            Some("the location starts with `#` and would read back as a comment")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(PlaylistError::InvalidEntry(format!(
+                "entry {index} cannot be written as {format}: {problem}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

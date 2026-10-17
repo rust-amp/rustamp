@@ -8,10 +8,15 @@ use lofty::probe::Probe;
 use lofty::tag::items::Timestamp;
 use lofty::tag::{Accessor, ItemKey, Tag};
 
-use rustamp_core::error::Result;
+use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 
 use crate::read::map_lofty;
+
+/// The largest year a tag can hold: the readers only accept a four-digit year
+/// (`read::parse_year`), so anything larger could not be read back, and
+/// `lofty`'s timestamp year is a `u16`, which would silently wrap.
+const MAX_YEAR: u32 = 9999;
 
 /// Writes `metadata` into the tags of `path`.
 ///
@@ -31,8 +36,26 @@ use crate::read::map_lofty;
 /// * [`Error::UnsupportedFormat`] if the file is not a media file whose tags
 ///   [`lofty`] understands.
 /// * [`Error::Other`] if the tag format cannot hold the requested fields.
+/// * [`Error::InvalidArgument`] if `year` is above 9999 (before anything is
+///   opened; the old behaviour was to wrap it into a `u16`).
+///
+/// Known silent losses, kept as documented degradation (see
+/// `CONTRACT_NOTES.md` §Audit): an `extra` key the target tag format has no
+/// field for is skipped without a report. Which keys map is decided by
+/// `lofty`'s per-format key table and was not enumerated by this audit; the
+/// existing round-trip test shows `REPLAYGAIN_TRACK_GAIN` is lost in MP4, and
+/// the `DISCTOTAL` that [`read_tags`](crate::read_tags) puts in `extra` is
+/// likewise only written where `lofty` has a matching key.
 pub fn write_tags(path: impl AsRef<Path>, metadata: &TrackMetadata) -> Result<()> {
     let path = path.as_ref();
+    // Checked before the file is opened, so a refused call touches nothing.
+    if let Some(year) = metadata.year
+        && year > MAX_YEAR
+    {
+        return Err(Error::InvalidArgument(format!(
+            "year {year} cannot be written: tags store a four-digit year (at most {MAX_YEAR})"
+        )));
+    }
     let mut file = Probe::open(path)
         .map_err(map_lofty)?
         .guess_file_type()?

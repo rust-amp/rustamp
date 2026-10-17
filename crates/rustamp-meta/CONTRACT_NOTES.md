@@ -91,3 +91,20 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   missing fields, and whether the format string is per-entry or global. The
   raw inputs it needs (title, artist, album, album artist, track/disc
   numbers, year, genre, comment, extra) are all available from this crate.
+
+## Audit (card E2)
+
+- `write_tags` refuses `year > 9999` with `InvalidArgument` before opening the
+  file; before, `year as u16` wrapped (70000 -> 4464) and was written.
+- Still silent, by documented design: `extra` keys the target format has no
+  field for (best-effort write, e.g. ReplayGain in MP4, tested); `DISCTOTAL`
+  has no field in `TrackMetadata`, so it travels in `extra` and is written only
+  where lofty has a matching key (not enumerated); clearing a field is not
+  possible; a date or number that does not parse (`"01.01.2001"`, `"3/x"`)
+  becomes `None`; `ParsingMode::BestAttempt` drops a malformed tag item rather
+  than failing the file; a file with a media extension but unparseable body
+  may read as empty metadata (`non_media_files_error_or_stay_default` accepts
+  both outcomes). Making those errors needs a decision on strict parsing
+  (`ParsingMode::Strict`) and a "report skipped items" API; no spec asks for it.
+- Round trip losses: see the `write_read_roundtrip_on_each_family` comment
+  (MP4 lacks a plain-text ReplayGain key); total/track strings are numbers only.

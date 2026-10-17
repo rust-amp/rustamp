@@ -1,6 +1,6 @@
 [package]
 name = "rustamp-meta"
-description = "Rustamp: Tag reading (ID3v1/v2 and others) and Winamp 2 title formatting (spec S14), producing TrackMetadata."
+description = "Rustamp: Tag reading and writing (ID3v1/v2 and others) producing TrackMetadata. Title formatting (spec S14) is not implemented."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

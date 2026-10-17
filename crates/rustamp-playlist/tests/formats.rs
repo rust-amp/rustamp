@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use rustamp_core::playlist::{MediaLocation, Playlist};
 use rustamp_playlist::{
-    LoadedEntry, PlaylistFormat, append_loaded, load_playlist_file, read_playlist,
+    LoadedEntry, PlaylistError, PlaylistFormat, append_loaded, load_playlist_file, read_playlist,
     read_playlist_as, read_playlist_path, write_playlist,
 };
 
@@ -355,20 +355,26 @@ fn malformed_input_never_panics() {
     ];
 
     for (name, bytes) in cases {
-        // Explicit formats: the readers must be total.
+        // Explicit formats: the readers must be total (never panic). An
+        // explicit format that the bytes visibly contradict is an
+        // `UnsupportedFormat` error; no other error is possible.
         for format in [
             PlaylistFormat::M3u,
             PlaylistFormat::M3u8,
             PlaylistFormat::Pls,
             PlaylistFormat::Xspf,
         ] {
-            let entries = read_playlist_as(format, bytes, &base())
-                .unwrap_or_else(|e| panic!("{name} failed for {format}: {e}"));
-            // Touch every field so nothing is optimized away.
-            for entry in &entries {
-                let _ = entry.location.to_display_string();
-                let _ = entry.title.as_deref();
-                let _ = entry.duration_ms;
+            match read_playlist_as(format, bytes, &base()) {
+                Ok(entries) => {
+                    // Touch every field so nothing is optimized away.
+                    for entry in &entries {
+                        let _ = entry.location.to_display_string();
+                        let _ = entry.title.as_deref();
+                        let _ = entry.duration_ms;
+                    }
+                }
+                Err(PlaylistError::UnsupportedFormat(_)) => {}
+                Err(other) => panic!("{name} failed for {format}: {other}"),
             }
         }
         // Detection may reject, but must not panic and must not invent entries

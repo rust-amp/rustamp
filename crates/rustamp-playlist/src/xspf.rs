@@ -32,7 +32,9 @@
 //!   UTF-8 first with Windows-1252 as the fallback.
 //! * Malformed XML yields whatever was parsed before the error; it never
 //!   fails and never panics. A document cut off in the middle of a `<track>`
-//!   still yields that track.
+//!   still yields that track. That leniency belongs to [`read`]/[`read_text`];
+//!   [`crate::io::read_playlist_as`] (and so every top-level entry point)
+//!   runs [`validate`] first and rejects such a document.
 
 use std::path::Path;
 
@@ -121,6 +123,56 @@ pub fn read_text(text: &str, base: &Path) -> Vec<LoadedEntry> {
         push_track(&mut entries, unfinished, &base);
     }
     entries
+}
+
+/// Checks that `text` is a complete XSPF document: a `<playlist>` root whose
+/// elements are all closed in order.
+///
+/// [`read_text`] itself stays lenient and yields whatever was parsed before a
+/// defect; callers that must not accept a damaged file (see
+/// [`crate::io::read_playlist_as`]) call this first. The error says what is
+/// wrong. Names are compared by local part, case-insensitively, as in the
+/// reader. This is a structural check only; it does not validate the XSPF
+/// schema.
+pub fn validate(text: &str) -> std::result::Result<(), String> {
+    let mut stack: Vec<String> = Vec::new();
+    let mut root_seen = false;
+    let mut reader = Reader::new(text);
+    while let Some(event) = reader.next_event() {
+        match event {
+            Event::Start { name, .. } => {
+                let local = local_name(name).to_ascii_lowercase();
+                if stack.is_empty() {
+                    if root_seen {
+                        return Err("more than one root element".to_owned());
+                    }
+                    if local != "playlist" {
+                        return Err(format!("root element is <{name}>, not <playlist>"));
+                    }
+                    root_seen = true;
+                }
+                stack.push(local);
+            }
+            Event::End { name } => {
+                let local = local_name(name).to_ascii_lowercase();
+                match stack.pop() {
+                    Some(open) if open == local => {}
+                    Some(open) => {
+                        return Err(format!("</{name}> closes <{open}>"));
+                    }
+                    None => return Err(format!("</{name}> without an open element")),
+                }
+            }
+            Event::Text(_) => {}
+        }
+    }
+    if !root_seen {
+        return Err("no <playlist> root element".to_owned());
+    }
+    if let Some(open) = stack.last() {
+        return Err(format!("document ends inside <{open}> (truncated)"));
+    }
+    Ok(())
 }
 
 /// Turns a finished track into an entry. A track without a usable location is

@@ -38,10 +38,20 @@
 //!
 //! ## Robustness contract
 //!
-//! The readers never panic and never reject a file: malformed input is skipped
-//! according to documented rules, and every format module lists those rules in
-//! its own docs. Only [`read_playlist`] can fail, and only when the bytes are
-//! not recognizable as a playlist at all.
+//! The readers never panic. Two levels, on purpose:
+//!
+//! * A bad **entry** inside a well-formed file is skipped according to the
+//!   rules in each format module (empty `FileN=`, a track without
+//!   `<location>`, a dangling `#EXTINF`). This is silent: the entry points
+//!   return only the surviving entries, with no count of skipped ones.
+//! * A bad **file** is an error from every entry point in [`io`]: unknown or
+//!   binary/UTF-16 content, XML with another root, an unknown extension
+//!   without a content marker, a file whose content contradicts the format it
+//!   is read as, a truncated XSPF document, and B4S.
+//!
+//! Writers fail with [`PlaylistError::InvalidEntry`] instead of storing an
+//! entry in a changed form. See `CONTRACT_NOTES.md` §4 for what a round trip
+//! loses.
 //!
 //! The crate is `#![forbid(unsafe_code)]`.
 

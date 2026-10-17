@@ -131,7 +131,9 @@ These are documented in each module and are candidates for a spec to override:
 
 | Area | Rule |
 |---|---|
-| detection | content marker > `.m3u`/`.m3u8` extension > text (not XML) as M3U > the extension's format > rejected |
+| detection | content marker > empty input takes the extension's format > binary/UTF-16, XML with an unknown root, text behind an unknown or XML (`.xspf`/`.b4s`) extension: **rejected** > `.m3u8` > other text as M3U (card E2 tightened this; before, any `.m3u` was trusted and `.xspf` HTML parsed to an empty list) |
+| explicit format | `read_playlist_as` rejects bytes that contradict the format (other marker, binary/UTF-16/XML for the line formats, truncated or rootless XSPF) |
+| writer input | an empty or whitespace-padded location, a line break in an M3U/PLS location, or a leading `#` in an M3U location is `InvalidEntry`; it used to be rewritten silently |
 | encoding | UTF-8 first (BOM stripped), Windows-1252 fallback for `.m3u`; `.m3u8` uses UTF-8 with replacement characters; UTF-16 is not decoded |
 | M3U | most recent `#EXTINF` wins; leading number of the length; negative/unparseable length = unknown; empty title = `None`; `#` line = comment; `#EXTALBUM`/`#EXTART` recognized and dropped |
 | PLS | keys before the first section and inside `[playlist]`; ascending index order; last occurrence wins (an empty value removes the key); `NumberOfEntries`/`Version` ignored; values verbatim |
@@ -139,3 +141,26 @@ These are documented in each module and are candidates for a spec to override:
 | writing | CRLF for M3U/PLS, LF for XSPF, always UTF-8; unknown duration is `#EXTINF:-1`; a duration with a sub-second part is written with three decimals so that write → read is exact |
 | paths | relative entries join the playlist directory; `/` and `\` are both separators; a drive prefix is never joined; `file:` → `File`, any other scheme → `Url` untouched; empty location = skipped |
 | randomize | one Fisher-Yates permutation from a seeded xorshift64\* generator, applied through `apply_order`; ids, selection and current entry unchanged |
+
+## 4. Round-trip honesty (card E2)
+
+`write_playlist` then `read_playlist_path` is exact for locations (absolute
+files, URLs), non-empty trimmed titles and durations (whole milliseconds), in
+all four formats (`tests/formats.rs`, `tests/property.rs`). What is lost, and
+why, pinned in `tests/audit.rs`:
+
+| Field | Loss | Reason |
+|---|---|---|
+| title with leading/trailing whitespace | comes back trimmed | every reader trims (`normalize_title`) |
+| `Some("")` title | comes back `None` | same |
+| title with CR/LF | M3U/M3U8/PLS: line break becomes a space; XSPF exact | one entry per line in those formats |
+| artist, album | never stored | `LoadedEntry` has no field (2.3); `#EXTART`, `#EXTALBUM`, XSPF `creator`/`album` are parsed away. Needs a core RFC together with the S14 decision (is `title` raw or formatted; is `Artist - Title` split) |
+| relative `File` location | written as-is, resolves against the reader's base | `LoadedEntry::location` is documented as resolved; callers must resolve before writing |
+| XSPF `<title>` of the list, `<meta>`, `<extension>`, per-track `<image>`/`<info>` | dropped | no field |
+| PLS/M3U unknown keys and comments | dropped | no field |
+
+Not settled by any spec (S06 is silent on playlist files; S14 is missing), so
+nothing was invented: raw-vs-formatted title, artist/album storage, how a
+caller learns that N entries were skipped (the readers return only survivors),
+whether a marker-less text file named `.pls` should be an error (today it is
+read as a bare M3U list, tested), B4S.

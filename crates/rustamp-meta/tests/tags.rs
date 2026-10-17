@@ -616,3 +616,52 @@ fn tag_reads_are_fast() {
         "tag reads took {elapsed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Audit (task card E2): refusals are loud
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unrepresentable_year_is_refused_before_the_file_is_touched() {
+    let dir = TempDir::new().unwrap();
+    let path = copy_fixture(&dir, "sine.flac");
+    let before = std::fs::read(&path).unwrap();
+
+    let too_big = TrackMetadata {
+        title: Some("Should Not Be Written".into()),
+        year: Some(70_000),
+        ..TrackMetadata::default()
+    };
+    let error = write_tags(&path, &too_big).unwrap_err();
+    assert!(
+        matches!(error, rustamp_core::Error::InvalidArgument(_)),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file was modified");
+
+    // The largest four-digit year still goes through and reads back.
+    let largest = TrackMetadata {
+        year: Some(9999),
+        ..TrackMetadata::default()
+    };
+    write_tags(&path, &largest).unwrap();
+    assert_eq!(read_tags(&path).unwrap().year, Some(9999));
+}
+
+#[test]
+fn missing_paths_are_errors_for_every_entry_point() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing.mp3");
+    assert!(read_tags(&missing).is_err());
+    assert!(read_artwork(&missing).is_err());
+    assert!(write_tags(&missing, &full_metadata()).is_err());
+    assert!(!missing.exists(), "a failed write must not create the file");
+}
+
+#[test]
+fn a_file_that_is_not_media_is_never_written_to() {
+    let dir = TempDir::new().unwrap();
+    let notes = write_file(&dir, "notes.txt", b"hello, this is not audio");
+    assert!(write_tags(&notes, &full_metadata()).is_err());
+    assert_eq!(std::fs::read(&notes).unwrap(), b"hello, this is not audio");
+}

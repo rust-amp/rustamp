@@ -10,8 +10,9 @@
 //!    encodings (`.m3u` vs `.m3u8`).
 //! 3. Text that does not start an XML document is treated as M3U, so M3U
 //!    content in a file named `.pls` still parses.
-//! 4. Anything else falls back to the extension's format, or is rejected when
-//!    there is no extension hint either.
+//! 4. Anything else is **rejected**: binary or UTF-16 data, XML with an unknown
+//!    root, marker-less text behind an unknown or XML extension. Only empty
+//!    input falls back to the extension's format.
 //!
 //! See [`detect`] for the exact order.
 
@@ -149,12 +150,20 @@ pub fn sniff(bytes: &[u8]) -> Option<PlaylistFormat> {
 ///
 /// 1. a **content marker** (see [`sniff`]) wins, even over a contradicting
 ///    extension; `#EXTM3U` is refined to M3U8 by a `.m3u8` extension,
-/// 2. a `.m3u`/`.m3u8` extension,
-/// 3. text that does not start an XML document is treated as M3U (the
-///    universal fallback for a bare list of paths, e.g. M3U content in a file
-///    named `.pls`),
-/// 4. otherwise the extension's format (so an empty `.xspf` still selects
-///    XSPF), or `None` when there is no hint either.
+/// 2. empty input: the extension's format (so an empty `.xspf` still selects
+///    XSPF), or `None` without a hint,
+/// 3. input that is not text (a NUL byte, many control characters — this
+///    includes UTF-16, which is not decoded) is **rejected** (`None`), whatever
+///    the extension says,
+/// 4. input that starts an XML document but has no known root (`<html>`, a
+///    truncated `<?xml …?>`) is **rejected**,
+/// 5. a path with an extension that is **not** a playlist extension (`.mp3`,
+///    `.txt`, …) and no content marker is **rejected**; a path without any
+///    extension, or no path at all, is not,
+/// 6. remaining marker-less text: an XML format hint (`.xspf`, `.b4s`) is
+///    **rejected** because XML cannot be a bare list; `.m3u8` selects M3U8;
+///    everything else is treated as M3U (the universal fallback for a bare
+///    list of paths, e.g. M3U content in a file named `.pls`).
 pub fn detect(bytes: &[u8], path_hint: Option<&Path>) -> Option<PlaylistFormat> {
     let hint = path_hint.and_then(PlaylistFormat::from_path);
     if let Some(format) = sniff(bytes) {
@@ -163,24 +172,30 @@ pub fn detect(bytes: &[u8], path_hint: Option<&Path>) -> Option<PlaylistFormat> 
             _ => format,
         });
     }
-    if matches!(hint, Some(PlaylistFormat::M3u) | Some(PlaylistFormat::M3u8)) {
+    if bytes.is_empty() {
         return hint;
     }
-    if looks_like_m3u(bytes) {
-        return Some(PlaylistFormat::M3u);
+    if !looks_like_text(bytes) || starts_like_xml(bytes) {
+        return None;
     }
-    hint
+    let unknown_extension =
+        hint.is_none() && path_hint.is_some_and(|path| path.extension().is_some());
+    if unknown_extension {
+        return None;
+    }
+    match hint {
+        Some(PlaylistFormat::Xspf) | Some(PlaylistFormat::B4s) => None,
+        Some(PlaylistFormat::M3u8) => Some(PlaylistFormat::M3u8),
+        _ => Some(PlaylistFormat::M3u),
+    }
 }
 
-/// Whether the bytes look like a bare list of paths (M3U without any marker).
-fn looks_like_m3u(bytes: &[u8]) -> bool {
-    if !looks_like_text(bytes) {
-        return false;
-    }
+/// Whether the text (after BOM and whitespace) opens an XML construct.
+pub(crate) fn starts_like_xml(bytes: &[u8]) -> bool {
     let head = &bytes[..bytes.len().min(SNIFF_LIMIT)];
     let text = crate::cp1252::decode_text(head);
-    let trimmed = text.trim_start_matches(['\u{FEFF}', ' ', '\t', '\r', '\n']);
-    !trimmed.starts_with('<')
+    text.trim_start_matches(['\u{FEFF}', ' ', '\t', '\r', '\n'])
+        .starts_with('<')
 }
 
 /// Whether the first few KiB look like text rather than binary.
