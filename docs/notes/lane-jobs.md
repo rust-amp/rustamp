@@ -15,7 +15,10 @@ slots looked busy.
 | job id | lane | started | task |
 |---|---|---|---|
 | `1792274442307450400-329938ab501dad8db908a2b4` | `wave67-ui-red` | 2026-10-18 00:00 | the UI crate's two red tests |
-| `1792274442307450400-329938ab501dad8db908a2b4` | `wave67-ui-red` | 2026-10-18 00:00 | the UI crate two red tests (0 changes after 20 min: watch it) |
+| `1792275787154594800-4e2e53ae41539d26bcfe1730` | `wave68-audio-red2` | 2026-10-18 00:25 | the audio crate 7 red tests (the suite named them) |
+| `1792275787147659100-59848974900be88757e24681` | `wave68-dsp-red2` | 2026-10-18 00:25 | the DSP crate 4 red tests (true-peak premises) |
+| `1792276842015675500-f5eadeb8ec02fee9c8cc2907` | `wave68-resident-red` | 2026-10-18 00:40 | dsp_roundtrip 2 + real_decode 1 |
+| `1792276842015134300-3b37bdc891c092a2a2a0b729` | `wave68-app-platform` | 2026-10-18 00:40 | app 2 + platform 1 (machine-dependent?) |
 | `1792275634915581300-a67b54f150d0c18d3e9cd062` | `wave67-wave-review` | 2026-10-18 00:20 | adversarial review of tonight's wave (W14) |
 
 Running elsewhere (they notify, no ids needed here): `wave65-wake-honest` on
@@ -37,6 +40,8 @@ Mistral (the wake-timeout claim).
 | `wave66-ignored-staging` | staging for the ignored tests (X4, `2ebaaf0`) |
 | `wave67-config-class` | the configuration writer drift as a class (N9, `99b2cb3`) |
 | `wave65-wake-honest` | the wake-timeout claim made honest by measurement (G5, `0f12340`) |
+| `wave67-ui-red` | the UI crate's two reds (J5, `6e22b56`) |
+| `wave67-wave-review` | the adversarial review of tonight's wave (W14, `84366d5`) |
 
 ## Failed, relaunched elsewhere
 
@@ -66,3 +71,10 @@ once and their worktrees were never created - the same mistake the file already
 warned about, made again. The heartbeat found it inside twenty minutes, which is
 the whole point of it. Both were relaunched with the worktrees in place. **Create
 the worktree first, then launch.**
+## r38 (2026-10-18 00:30) - the first run with no hang
+
+`ran 79, failed 9, hung 0`. The deadlock rebuild holds: `dsp_roundtrip` runs
+(7 passed, 2 failed) instead of blocking the VM, and the runner reports every
+binary. The two Rust-theme goldens were blessed and committed (`9600c95`), which
+closed the two golden failures. What is left, in jobs: audio 7, dsp 4,
+dsp_roundtrip 2 + real_decode 1, app 2 + platform 1, and the UI two (merged).
