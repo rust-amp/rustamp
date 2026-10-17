@@ -640,18 +640,23 @@ impl<B: HostBackend> Supervisor<B> {
             return; // healthy and connected: nothing to do
         }
 
-        // Child process was attached but has now exited: reap and record failure.
+        // A dead child, or a desynced one (a live child whose link was detached:
+        // a failed send detached it, or it was detached by hand), is reaped here
+        // and counted as a failure. The spawn path below then decides in the
+        // *same* pump whether a replacement is due, so a host that dies is
+        // replaced on one supervision step rather than on the next one.
         if link.is_attached() {
             self.process = None;
             link.detach();
             self.record_failure();
-            return;
-        }
-
-        // Child process was running but link was detached externally: desync.
-        if self.process.is_some() {
+        } else if self.process.is_some() {
             self.process = None;
             self.record_failure();
+        }
+
+        // The reap above may have tripped the failure policy: stop rather than
+        // spawn into a state that is meant to hold.
+        if self.state == SupervisorState::PersistentFailure {
             return;
         }
 
