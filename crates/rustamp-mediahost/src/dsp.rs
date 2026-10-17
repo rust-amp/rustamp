@@ -25,6 +25,10 @@ use crate::pcm::{ClosePair, PcmOffer, PcmRings, validate_spec};
 use crate::{MediaHostError, Result};
 
 const CONTROL_WAIT: Duration = Duration::from_secs(5);
+// The ring API has no non-closing control interrupt. Slice worker waits so
+// resets are serviced even with no PCM/space; expiry is only a control check,
+// never EOS, failure or permission to drop a frame. Not a scheduling deadline.
+const CONTROL_POLL: Duration = Duration::from_millis(20);
 const BLOCK_FRAMES: usize = 1024;
 /// Host back-ring capacity in frames. `DspConfigure` carries no capacity hint
 /// (RFC 0006 §6), so this is an own choice: room for a few blocks while the
@@ -115,12 +119,21 @@ fn command(message: Message) -> Result<Option<Transition>> {
 }
 
 fn wait_command(peer: &ControlPeer) -> Result<Message> {
-    loop {
-        match peer.recv(CONTROL_WAIT) {
-            Err(MediaHostError::TimedOut) => continue, // healthy idle peer
-            result => return result,
+    peer.recv_blocking()
+}
+
+fn poll_commands(peer: &ControlPeer, chain: &mut dyn ResidentChain) -> Result<Option<Transition>> {
+    while let Some(message) = peer.try_recv()? {
+        match message {
+            Message::DspReset => chain.reset(),
+            message => {
+                if let Some(transition) = command(message)? {
+                    return Ok(Some(transition));
+                }
+            }
         }
     }
+    Ok(None)
 }
 
 fn refuse(peer: &ControlPeer, offer: &Message, error: &MediaHostError) {
@@ -160,20 +173,13 @@ fn pump<R: MappedRegion>(
     let channels = usize::from(spec.channels);
     let mut block = vec![0.0; BLOCK_FRAMES * channels];
     loop {
-        if let Some(message) = peer.try_recv()? {
-            match message {
-                Message::DspReset => chain.reset(),
-                message => {
-                    if let Some(transition) = command(message)? {
-                        return Ok(transition.into_pump());
-                    }
-                }
-            }
+        if let Some(transition) = poll_commands(peer, chain)? {
+            return Ok(transition.into_pump());
         }
-        // Infinite, lossless wait. The independent control monitor owns a
-        // close-only view of both rings and wakes this worker on death,
-        // shutdown or reconfigure.
-        let frames = match input.read_into_blocking(&mut block, None) {
+        // Lossless wait with nonterminal control checks, including idle reset.
+        // Death/shutdown/reconfigure still close and signal both rings.
+        let frames = match input.read_into_blocking(&mut block, Some(CONTROL_POLL)) {
+            Ok(0) => continue,
             Ok(frames) => frames,
             Err(RingError::Closed) => {
                 peer.check()?;
@@ -181,20 +187,21 @@ fn pump<R: MappedRegion>(
             }
             Err(error) => return Err(error.into()),
         };
+        // A reset may have arrived during the read. Apply it before this first
+        // new block touches state, not after processing it with stale history.
+        if let Some(transition) = poll_commands(peer, chain)? {
+            return Ok(transition.into_pump());
+        }
         chain.process(&mut block[..frames * channels]);
         let mut offset = 0;
         while offset < frames {
-            if let Some(message) = peer.try_recv()? {
-                match message {
-                    Message::DspReset => chain.reset(),
-                    message => {
-                        if let Some(transition) = command(message)? {
-                            return Ok(transition.into_pump());
-                        }
-                    }
-                }
+            if let Some(transition) = poll_commands(peer, chain)? {
+                return Ok(transition.into_pump());
             }
-            match output.write_from_blocking(&block[offset * channels..frames * channels], None) {
+            match output.write_from_blocking(
+                &block[offset * channels..frames * channels],
+                Some(CONTROL_POLL),
+            ) {
                 Ok(written) => offset += written,
                 Err(RingError::Closed) => {
                     peer.check()?;
@@ -356,16 +363,22 @@ fn serve_inner<F: PcmRings>(
                 // sticky EOS, then wait for Shutdown or a fresh configure.
                 back.0.close();
                 input.0.close();
-                match command(wait_command(peer)?)? {
-                    Some(Transition::Reconfigure { spec: next, stages }) => {
-                        chain = open_chain(resident, next, &stages)?;
-                        spec = next;
+                loop {
+                    match wait_command(peer)? {
+                        Message::DspReset => chain.reset(),
+                        message => match command(message)? {
+                            Some(Transition::Reconfigure { spec: next, stages }) => {
+                                chain = open_chain(resident, next, &stages)?;
+                                spec = next;
+                                break;
+                            }
+                            Some(Transition::Stop) => {
+                                peer.flush(CONTROL_WAIT)?;
+                                return Ok(());
+                            }
+                            None => {}
+                        },
                     }
-                    Some(Transition::Stop) => {
-                        peer.flush(CONTROL_WAIT)?;
-                        return Ok(());
-                    }
-                    None => {}
                 }
             }
         }
@@ -539,7 +552,10 @@ impl<F: PcmRings> DspSession<F> {
         Ok(())
     }
 
-    /// Clear stage state without touching the rings (seek / track change).
+    /// Queue a stage-state reset without touching rings, including while idle.
+    /// The worker services resets between processing blocks and while waiting
+    /// for PCM/space. This is not an acknowledgement or an ordering fence for
+    /// writes on the independent PCM channel; queued PCM is not discarded.
     pub fn reset(&mut self) -> Result<()> {
         self.peer.check()?;
         self.peer.send(Message::DspReset)

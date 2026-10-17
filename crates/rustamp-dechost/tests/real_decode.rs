@@ -324,7 +324,7 @@ fn garbage_and_empty_files_are_clean_errors_never_eos() {
 }
 
 #[test]
-fn truncated_file_ends_without_hanging() {
+fn truncated_wav_preserves_backend_short_eos_not_an_integrity_guarantee() {
     let full: Vec<[f32; 2]> = (0..4000)
         .map(|i| {
             let t = i as f32 / 8000.0;
@@ -334,35 +334,34 @@ fn truncated_file_ends_without_hanging() {
     let mut bytes = wav_bytes(8000, 1, &full);
     bytes.truncate(bytes.len() / 2);
     let path = temp_file("truncated.wav", &bytes);
+    // Reference is the same in-process registry decoder, not Winamp. Its
+    // UnexpectedEof -> EOS conversion loses the distinction before the adapter.
+    // Pin that exact terminal here; do not accept an arbitrary error instead.
+    let expected = direct_decode(&path);
+    assert!(!expected.is_empty() && expected.len() < full.len());
 
     let (mut session, done) = start(file_location(&path), 7);
-    let mut frames_total = 0usize;
+    let mut received = Vec::new();
     let mut buf = [0.0f32; 128];
-    let terminal = loop {
-        match session.read(&mut buf, None) {
-            Ok(0) => break "eos",
-            Ok(frames) => frames_total += frames,
-            Err(error) => {
-                break {
-                    assert!(
-                        matches!(error, MediaHostError::OperationFailed(_)),
-                        "truncated input must end loudly, got {error}"
-                    );
-                    "error"
-                };
-            }
+    loop {
+        match session.read(&mut buf, None).expect("backend short EOS") {
+            0 => break,
+            frames => received.extend_from_slice(&buf[..frames]),
         }
-    };
-    assert!(
-        frames_total < 4000,
-        "a file cut in half cannot decode whole, terminal={terminal}"
+    }
+    assert_eq!(
+        received
+            .iter()
+            .map(|sample| sample.to_bits())
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|sample| sample.to_bits())
+            .collect::<Vec<_>>()
     );
-    drop(session);
-    // Either terminal is acceptable (short EOS or a loud decode error); the
-    // requirement is that the host ends instead of hanging or spinning.
-    let _ = done
-        .recv_timeout(JOIN_WAIT)
-        .expect("host must end after a truncated stream instead of spinning");
+    assert_eq!(session.read(&mut buf, None).unwrap(), 0);
+    assert_eq!(session.frames_dropped(), 0);
+    finish_ok(session, done);
     let _ = std::fs::remove_file(&path);
 }
 

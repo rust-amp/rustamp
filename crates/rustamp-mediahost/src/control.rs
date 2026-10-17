@@ -286,6 +286,17 @@ impl ControlPeer {
         })
     }
 
+    /// Wait for a command or terminal failure, without a caller deadline.
+    /// Monitor exit disconnects the queue, so liveness failures still wake it.
+    pub fn recv_blocking(&self) -> Result<Message> {
+        self.check()?;
+        self.incoming.recv().map_err(|_| {
+            self.check()
+                .err()
+                .unwrap_or_else(|| MediaHostError::Disconnected("control monitor stopped".into()))
+        })
+    }
+
     /// Inspect commands between decoder blocks; does not sleep.
     pub fn try_recv(&self) -> Result<Option<Message>> {
         self.check()?;

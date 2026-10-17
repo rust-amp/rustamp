@@ -37,10 +37,7 @@ fn named_pcm_two_process_transfer_and_seek() {
     let mut frame = 29;
     let mut out = [0.0; 22];
     loop {
-        let count = child
-            .session()
-            .read(&mut out, Some(Duration::from_secs(5)))
-            .unwrap();
+        let count = child.session().read(&mut out, None).unwrap();
         if count == 0 {
             break;
         }

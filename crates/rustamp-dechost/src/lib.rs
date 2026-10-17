@@ -17,6 +17,13 @@
 //!
 //! Headless: stdio control plus shared-memory PCM only. No window, no audio
 //! output, no downloads.
+//!
+//! EOS means the backend has no more decodable frames, not verified file
+//! integrity. The current core decoder folds container `UnexpectedEof` into
+//! EOS, including truncated WAV data. This adapter cannot recover that lost
+//! distinction: it preserves EOS and forwards actual backend errors loudly.
+//! Durations may be estimates; comparing them to decoded frames is not a
+//! format-independent truncation check.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -157,6 +164,18 @@ impl ResidentDecoder for RegistryDecoder {
 mod tests {
     use super::*;
     use rustamp_core::audio::AudioSpec;
+
+    #[test]
+    fn url_locations_are_refused_without_opening_a_decoder() {
+        let result = RegistryResident.open(MediaLocationWire::Url(
+            "https://example.invalid/audio.mp3".into(),
+        ));
+        assert!(matches!(
+            result,
+            Err(MediaHostError::OperationFailed(message))
+                if message == "URL decoding is not supported yet (M4): https://example.invalid/audio.mp3"
+        ));
+    }
 
     #[test]
     fn spec_wire_accepts_stereo() {

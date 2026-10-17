@@ -16,7 +16,6 @@ const SPEC: PcmSpecWire = PcmSpecWire {
     sample_rate_hz: 44_100,
     channels: 2,
 };
-const WAIT: Duration = Duration::from_secs(5);
 
 fn fixture() -> PathBuf {
     PathBuf::from(
@@ -53,7 +52,7 @@ fn named_dsp_two_process_gain_round_trip_then_sticky_eos() {
     let mut received = Vec::new();
     let mut out = [0.0; 22];
     loop {
-        let frames = child.session().read(&mut out, Some(WAIT)).unwrap();
+        let frames = child.session().read(&mut out, None).unwrap();
         if frames == 0 {
             break;
         }
@@ -66,7 +65,7 @@ fn named_dsp_two_process_gain_round_trip_then_sticky_eos() {
         assert_eq!(*sample, sign * frame as f32 / 4.0);
     }
     assert_eq!(child.session().frames_dropped(), 0);
-    assert_eq!(child.session().read(&mut out, Some(WAIT)).unwrap(), 0);
+    assert_eq!(child.session().read(&mut out, None).unwrap(), 0);
 }
 
 #[test]
