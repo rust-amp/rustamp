@@ -43,6 +43,7 @@ pub const fn sheet_bytes(sheet: Sheet) -> Option<&'static [u8]> {
         Sheet::EqMain => Some(EQMAIN_BMP),
         Sheet::EqEx => Some(EQ_EX_BMP),
         Sheet::Gen => Some(GEN_BMP),
+        _ => None,
     }
 }
 
@@ -64,4 +65,32 @@ pub fn sheet_image(sheet: Sheet) -> Option<RasterImage> {
             None
         }
     }
+}
+
+/// Builds a [`crate::source::MemorySource`] holding the look-alike skin sheets.
+pub fn source() -> crate::source::MemorySource {
+    let mut source = crate::source::MemorySource::new("built-in lookalike skin");
+    for &sheet in &[
+        Sheet::Main,
+        Sheet::Titlebar,
+        Sheet::Cbuttons,
+        Sheet::Shufrep,
+        Sheet::Posbar,
+        Sheet::Volume,
+        Sheet::Balance,
+        Sheet::Monoster,
+        Sheet::Playpaus,
+        Sheet::Numbers,
+        Sheet::NumsEx,
+        Sheet::Text,
+        Sheet::Pledit,
+        Sheet::EqMain,
+        Sheet::EqEx,
+        Sheet::Gen,
+    ] {
+        if let Some(bytes) = sheet_bytes(sheet) {
+            source.add(sheet.file_name(), bytes.to_vec());
+        }
+    }
+    source
 }

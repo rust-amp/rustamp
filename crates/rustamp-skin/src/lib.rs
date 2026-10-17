@@ -36,6 +36,7 @@ pub mod lookalike;
 pub mod pledit;
 pub mod raster;
 pub mod region;
+pub mod rust_theme;
 pub mod skin;
 pub mod source;
 pub mod viscolor;
@@ -46,8 +47,8 @@ pub use pledit::PlaylistStyle;
 pub use raster::RasterImage;
 pub use region::{Polygon, Region};
 pub use skin::{
-    BuiltinDefaultSkin, CursorFile, CursorKind, PLACEHOLDER_RGBA, Skin, SkinFallback, Substitute,
-    Substitution,
+    BuiltinDefaultSkin, BuiltinLookalikeSkin, CursorFile, CursorKind, PLACEHOLDER_RGBA, Skin,
+    SkinFallback, Substitute, Substitution,
 };
 pub use source::{ArchiveSource, FolderSource, MemorySource, SkinFile, SkinSource};
 pub use webamp::{Sheet, SpriteDef};

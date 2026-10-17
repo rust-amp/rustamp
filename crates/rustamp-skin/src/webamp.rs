@@ -106,6 +106,12 @@ pub enum Sheet {
     Volume,
     /// `gen.bmp`
     Gen,
+    /// `genex.bmp`
+    GenEx,
+    /// `mb.bmp`
+    Mb,
+    /// `video.bmp`
+    Video,
 }
 
 impl Sheet {
@@ -127,6 +133,9 @@ impl Sheet {
         Sheet::EqMain,
         Sheet::EqEx,
         Sheet::Gen,
+        Sheet::GenEx,
+        Sheet::Mb,
+        Sheet::Video,
     ];
 
     /// The file name this sheet is read from.
@@ -148,6 +157,9 @@ impl Sheet {
             Sheet::Titlebar => "titlebar.bmp",
             Sheet::Volume => "volume.bmp",
             Sheet::Gen => "gen.bmp",
+            Sheet::GenEx => "genex.bmp",
+            Sheet::Mb => "mb.bmp",
+            Sheet::Video => "video.bmp",
         }
     }
 
@@ -171,6 +183,9 @@ impl Sheet {
             Sheet::Titlebar => "titlebar",
             Sheet::Volume => "volume",
             Sheet::Gen => "gen",
+            Sheet::GenEx => "genex",
+            Sheet::Mb => "mb",
+            Sheet::Video => "video",
         }
     }
 
@@ -590,6 +605,16 @@ pub fn sprites_in_sheet(sheet: Sheet) -> impl Iterator<Item = &'static SpriteDef
 /// `text.bmp` has no sprite rectangles (its glyphs live in [`TEXT_GLYPHS`]);
 /// its extent is derived from the glyph grid instead.
 pub fn sheet_extent(sheet: Sheet) -> (u32, u32) {
+    match sheet {
+        Sheet::Balance => return (68, 433),
+        Sheet::Monoster => return (58, 24),
+        Sheet::EqEx => return (275, 82),
+        Sheet::Gen => return (194, 109),
+        Sheet::GenEx => return (130, 75),
+        Sheet::Mb => return (234, 119),
+        Sheet::Video => return (234, 119),
+        _ => {}
+    }
     if sheet == Sheet::Text {
         let mut columns = 0;
         let mut rows = 0;

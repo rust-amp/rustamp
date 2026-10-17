@@ -88,13 +88,48 @@ pub trait SkinFallback {
 
 /// The built-in default skin.
 ///
-/// Supplies newly-drawn clean-room lookalike skin sheets for all classic
+/// Supplies newly-drawn clean-room Rust-themed skin sheets for all classic
 /// sheets, used when running with the default skin or falling back on missing
 /// files.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BuiltinDefaultSkin;
 
+impl BuiltinDefaultSkin {
+    /// Creates an in-memory [`crate::source::MemorySource`] containing all 32+1
+    /// files of the complete Rust-themed skin.
+    pub fn source() -> crate::source::MemorySource {
+        crate::rust_theme::source()
+    }
+}
+
 impl SkinFallback for BuiltinDefaultSkin {
+    fn sheet_image(&self, sheet: Sheet) -> Option<RasterImage> {
+        if let Some(image) = crate::rust_theme::sheet_image(sheet) {
+            return Some(image);
+        }
+        let (width, height) = webamp::sheet_extent(sheet);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        Some(RasterImage::filled(width, height, [0x17, 0x18, 0x1C, 0xFF]))
+    }
+}
+
+/// The classic lookalike fallback skin (task card J1).
+///
+/// Supplies classic lookalike dark-metallic sheets when explicitly selected.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BuiltinLookalikeSkin;
+
+impl BuiltinLookalikeSkin {
+    /// Creates an in-memory [`crate::source::MemorySource`] containing the
+    /// available sheets of the classic lookalike skin.
+    pub fn source() -> crate::source::MemorySource {
+        crate::lookalike::source()
+    }
+}
+
+impl SkinFallback for BuiltinLookalikeSkin {
     fn sheet_image(&self, sheet: Sheet) -> Option<RasterImage> {
         if let Some(image) = crate::lookalike::sheet_image(sheet) {
             return Some(image);

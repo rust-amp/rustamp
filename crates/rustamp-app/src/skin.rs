@@ -12,13 +12,15 @@
 
 use std::path::{Path, PathBuf};
 
-use rustamp_skin::{BuiltinDefaultSkin, MemorySource, Skin};
+use rustamp_skin::{BuiltinDefaultSkin, BuiltinLookalikeSkin, Skin};
 
 /// Which skin to load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkinChoice {
-    /// The repo's built-in default (look-alike) skin.
+    /// The repo's built-in default (Rust-themed) skin.
     Builtin,
+    /// The classic look-alike skin.
+    Lookalike,
     /// A folder, `.wsz` or `.zip`.
     Path(PathBuf),
 }
@@ -27,9 +29,19 @@ pub enum SkinChoice {
 /// built-in default.
 pub fn choose(cli: Option<&Path>, config: Option<&Path>) -> SkinChoice {
     match (cli, config) {
-        (Some(path), _) => SkinChoice::Path(path.to_owned()),
-        (None, Some(path)) => SkinChoice::Path(path.to_owned()),
+        (Some(path), _) => resolve_choice(path),
+        (None, Some(path)) => resolve_choice(path),
         (None, None) => SkinChoice::Builtin,
+    }
+}
+
+fn resolve_choice(path: &Path) -> SkinChoice {
+    if let Some(s) = path.to_str()
+        && (s.eq_ignore_ascii_case("lookalike") || s.eq_ignore_ascii_case("builtin:lookalike"))
+    {
+        SkinChoice::Lookalike
+    } else {
+        SkinChoice::Path(path.to_owned())
     }
 }
 
@@ -70,12 +82,12 @@ impl LoadedSkin {
     }
 }
 
-/// Loads the built-in default (look-alike) skin.
+/// Loads the built-in default (Rust-themed) skin.
 ///
-/// The source is in memory and the fallback generates every sheet, so this
-/// cannot fail; a failure here would be a bug in `rustamp-skin`.
+/// Pre-populates all 32 classic entries plus `nums_ex.bmp` from the embedded
+/// Rust theme.
 pub fn builtin() -> LoadedSkin {
-    let mut source = MemorySource::new("built-in default skin");
+    let mut source = BuiltinDefaultSkin::source();
     let skin = Skin::from_source(&mut source, &BuiltinDefaultSkin)
         .expect("the built-in default skin always loads");
     LoadedSkin {
@@ -87,10 +99,25 @@ pub fn builtin() -> LoadedSkin {
     }
 }
 
+/// Loads the classic look-alike skin.
+pub fn lookalike() -> LoadedSkin {
+    let mut source = BuiltinLookalikeSkin::source();
+    let skin = Skin::from_source(&mut source, &BuiltinLookalikeSkin)
+        .expect("the lookalike skin always loads");
+    LoadedSkin {
+        skin,
+        description: "built-in lookalike skin".to_string(),
+        path: None,
+        fell_back: false,
+        warning: None,
+    }
+}
+
 /// Loads the chosen skin, falling back to the built-in default on any error.
 pub fn load(choice: &SkinChoice) -> LoadedSkin {
     match choice {
         SkinChoice::Builtin => builtin(),
+        SkinChoice::Lookalike => lookalike(),
         SkinChoice::Path(path) => match Skin::load(path) {
             Ok(skin) => LoadedSkin {
                 skin,
@@ -172,5 +199,15 @@ mod tests {
             "{}",
             loaded.description()
         );
+    }
+
+    #[test]
+    fn selecting_lookalike_routes_to_lookalike_skin() {
+        let choice = choose(Some(Path::new("lookalike")), None);
+        assert_eq!(choice, SkinChoice::Lookalike);
+        let loaded = load(&choice);
+        assert!(!loaded.fell_back());
+        assert_eq!(loaded.description(), "built-in lookalike skin");
+        assert!(loaded.skin().has_main_window_sprites());
     }
 }

@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Procedural generator for the Rustamp lookalike default skin.
+Procedural generator for the Rustamp Rust-themed built-in skin and lookalike fallback.
 
 Clean-room design:
-- Draws classic dark metallic player chrome, buttons, displays, sliders, and fonts from scratch.
+- Draws complete dark metallic chassis, buttons, displays, sliders, and fonts from scratch.
 - Purely procedural: no external images, fonts, or assets.
-- Produces all 16 BMP sheets expected by the Rustamp skin loader at exact spec dimensions.
+- Produces all 32 classic skin entries (18 BMPs, 11 CURs, 3 TXTs) plus nums_ex.bmp at pixel-exact spec dimensions.
+- Adheres strictly to specs/S01-window-geometry.md and specs/S17-skin-loading-quirks.md.
 """
 
 import os
 import struct
 import math
 
-# Output directory for generated sheets
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "lookalike")
+# Output directory for the Rust-themed default skin assets
+RUST_THEME_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "rust-theme")
+LOOKALIKE_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "lookalike")
 
 def create_bmp_24(width, height, get_pixel):
     """
@@ -58,8 +60,39 @@ def create_bmp_24(width, height, get_pixel):
 
     return header + bytes(data)
 
+def create_cur_32(width, height, hotspot_x, hotspot_y, get_rgba):
+    """
+    Creates a valid Windows .cur file (32-bit RGBA DIB + 1-bit AND mask).
+    get_rgba(x, y) returns (r, g, b, a) where 0 <= x < width, 0 <= y < height, top-down.
+    """
+    and_mask_row_bytes = (width + 31) // 32 * 4
+    and_mask_size = and_mask_row_bytes * height
+    xor_size = width * height * 4
+    dib_size = 40 + xor_size + and_mask_size
+
+    header = struct.pack('<HHH', 0, 2, 1) # 2 = CURSOR
+    dir_entry = struct.pack('<BBBBHHII', width, height, 0, 0, hotspot_x, hotspot_y, dib_size, 22)
+    info_header = struct.pack('<IiiHHIIiiII', 40, width, height * 2, 1, 32, 0, xor_size, 0, 0, 0, 0)
+
+    xor_data = bytearray(xor_size)
+    and_mask = bytearray(and_mask_size)
+
+    xor_idx = 0
+    for y in reversed(range(height)):
+        and_row = 0
+        for x in range(width):
+            r, g, b, a = get_rgba(x, y)
+            xor_data[xor_idx:xor_idx+4] = bytes([b & 0xFF, g & 0xFF, r & 0xFF, a & 0xFF])
+            xor_idx += 4
+            if a == 0:
+                and_row |= (1 << (31 - x))
+        and_idx = (height - 1 - y) * and_mask_row_bytes
+        struct.pack_into('>I', and_mask, and_idx, and_row)
+
+    return header + dir_entry + info_header + bytes(xor_data) + bytes(and_mask)
+
 class Canvas:
-    def __init__(self, width, height, bg_color=(36, 38, 44)):
+    def __init__(self, width, height, bg_color=(23, 24, 28)):
         self.width = width
         self.height = height
         self.pixels = [[bg_color for _ in range(width)] for _ in range(height)]
@@ -91,23 +124,23 @@ class Canvas:
         self.vline(x, y, h, color)
         self.vline(x + w - 1, y, h, color)
 
-    def bevel_raised(self, x, y, w, h, light=(90, 95, 105), shadow=(18, 20, 24)):
+    def bevel_raised(self, x, y, w, h, light=(62, 66, 73), shadow=(13, 14, 16)):
         self.hline(x, y, w, light)
         self.vline(x, y, h, light)
         self.hline(x, y + h - 1, w, shadow)
         self.vline(x + w - 1, y, h, shadow)
 
-    def bevel_sunken(self, x, y, w, h, shadow=(18, 20, 24), light=(75, 80, 90)):
+    def bevel_sunken(self, x, y, w, h, shadow=(10, 11, 13), light=(50, 54, 60)):
         self.hline(x, y, w, shadow)
         self.vline(x, y, h, shadow)
         self.hline(x, y + h - 1, w, light)
         self.vline(x + w - 1, y, h, light)
 
-    def texture_metal(self, x, y, w, h, base_color=(38, 40, 46)):
+    def texture_metal(self, x, y, w, h, base_color=(23, 24, 28)):
         for cy in range(y, y + h):
             if cy < 0 or cy >= self.height:
                 continue
-            delta = (cy % 2) * 4 - 2
+            delta = (cy % 2) * 3 - 1
             r = max(0, min(255, base_color[0] + delta))
             g = max(0, min(255, base_color[1] + delta))
             b = max(0, min(255, base_color[2] + delta))
@@ -115,15 +148,27 @@ class Canvas:
                 if 0 <= cx < self.width:
                     self.pixels[cy][cx] = (r, g, b)
 
+    def draw_gear(self, cx, cy, r_outer, r_inner, r_hole, teeth=8, color=(140, 59, 24), hole_color=(11, 12, 14)):
+        """Draws a procedurally calculated gear / cog silhouette."""
+        for dy in range(-r_outer, r_outer + 1):
+            for dx in range(-r_outer, r_outer + 1):
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist > r_outer:
+                    continue
+                if dist < r_hole:
+                    self.set(cx + dx, cy + dy, hole_color)
+                    continue
+                angle = math.atan2(dy, dx) % (2 * math.pi)
+                tooth_angle = (2 * math.pi) / teeth
+                phase = (angle % tooth_angle) / tooth_angle
+                if dist <= r_inner or phase < 0.5:
+                    self.set(cx + dx, cy + dy, color)
+
     def to_bmp(self):
         return create_bmp_24(self.width, self.height, lambda x, y: self.pixels[y][x])
 
 
 # 5x6 bitmap font definition for text.bmp
-# 31 columns x 3 rows:
-# Row 0: a..z, ", @, unused, unused, space
-# Row 1: 0..9, …, ., :, (, ), -, ', !, _, +, \, /, [, ], ^, &, %, ,, =, $, #
-# Row 2: Å, Ö, Ä, ?, *
 FONT_5X6 = {
     'a': ["01110", "10001", "11111", "10001", "10001", "00000"],
     'b': ["11110", "10001", "11110", "10001", "11110", "00000"],
@@ -194,7 +239,7 @@ FONT_5X6 = {
     '*': ["10101", "01110", "11111", "01110", "10101", "00000"],
 }
 
-def draw_text_glyph(canvas, char, x, y, fg=(0, 255, 60), bg=(0, 0, 0)):
+def draw_text_glyph(canvas, char, x, y, fg=(240, 242, 245), bg=(0, 0, 0)):
     grid = FONT_5X6.get(char.lower())
     if not grid:
         grid = FONT_5X6.get('?')
@@ -203,21 +248,13 @@ def draw_text_glyph(canvas, char, x, y, fg=(0, 255, 60), bg=(0, 0, 0)):
         for cx in range(5):
             canvas.set(x + cx, y + cy, fg if line[cx] == '1' else bg)
 
-def draw_string(canvas, text, x, y, fg=(0, 255, 60), bg=(0, 0, 0)):
+def draw_string(canvas, text, x, y, fg=(240, 242, 245), bg=(0, 0, 0)):
     cur_x = x
     for ch in text:
         draw_text_glyph(canvas, ch, cur_x, y, fg, bg)
         cur_x += 5
 
 # 7-Segment digit patterns for 9x13 cells
-# Segments:
-#   aaa
-#  f   b
-#  f   b
-#   ggg
-#  e   c
-#  e   c
-#   ddd
 SEGMENTS_7 = {
     '0': {'a', 'b', 'c', 'd', 'e', 'f'},
     '1': {'b', 'c'},
@@ -232,11 +269,10 @@ SEGMENTS_7 = {
     ' ': set(),
 }
 
-def draw_7segment_cell(canvas, char, x, y, lit_color=(0, 255, 60), dim_color=(12, 35, 18), bg_color=(5, 8, 8)):
+def draw_7segment_cell(canvas, char, x, y, lit_color=(255, 122, 41), dim_color=(48, 22, 13), bg_color=(11, 12, 14)):
     canvas.fill_rect(x, y, 9, 13, bg_color)
     segs = SEGMENTS_7.get(char, set())
-    
-    # Segment positions (9x13)
+
     def seg_a():
         col = lit_color if 'a' in segs else dim_color
         canvas.hline(x + 2, y + 1, 5, col)
@@ -258,7 +294,7 @@ def draw_7segment_cell(canvas, char, x, y, lit_color=(0, 255, 60), dim_color=(12
     def seg_g():
         col = lit_color if 'g' in segs else dim_color
         canvas.hline(x + 2, y + 6, 5, col)
-        
+
     seg_a()
     seg_b()
     seg_c()
@@ -268,74 +304,72 @@ def draw_7segment_cell(canvas, char, x, y, lit_color=(0, 255, 60), dim_color=(12
     seg_g()
 
 
-# --- Individual Sheet Generators ---
+# --- Rust Theme BMP Generators ---
 
-def generate_main():
-    """Generates main.bmp (275 x 116)."""
-    c = Canvas(275, 116)
-    # Dark metallic chassis
-    c.texture_metal(0, 0, 275, 116, base_color=(40, 42, 48))
-    c.bevel_raised(0, 0, 275, 116, light=(85, 90, 100), shadow=(15, 16, 20))
+def generate_rust_main():
+    """Generates main.bmp (275 x 116). S01 §5, line 680."""
+    c = Canvas(275, 116, bg_color=(23, 24, 28))
+    c.texture_metal(0, 0, 275, 116, base_color=(23, 24, 28))
+    c.bevel_raised(0, 0, 275, 116, light=(62, 66, 73), shadow=(13, 14, 16))
 
-    # Main display cutout: (10, 22) to (264, 68)
-    c.fill_rect(10, 22, 255, 46, (8, 10, 12))
-    c.bevel_sunken(10, 22, 255, 46, shadow=(14, 16, 18), light=(70, 75, 85))
+    # Main display cutout: (10, 22) to (264, 68) -> 255 x 46
+    c.fill_rect(10, 22, 255, 46, (11, 12, 14))
+    c.bevel_sunken(10, 22, 255, 46, shadow=(8, 9, 10), light=(45, 48, 55))
 
-    # Static colon in display for time between 60+9=69 and 78
-    c.fill_rect(73, 29, 2, 2, (0, 255, 60))
-    c.fill_rect(73, 35, 2, 2, (0, 255, 60))
+    # Time display colon dots in Rust orange at (73, 29) and (73, 35)
+    c.fill_rect(73, 29, 2, 2, (255, 107, 43))
+    c.fill_rect(73, 35, 2, 2, (255, 107, 43))
 
-    # Static label indicators in display:
-    # kbps label at window (130, 43), kHz label at (175, 43)
-    draw_string(c, "kbps", 130, 43, fg=(45, 90, 55), bg=(8, 10, 12))
-    draw_string(c, "khz", 175, 43, fg=(45, 90, 55), bg=(8, 10, 12))
+    # Display indicator labels: "kbps" and "khz" in warm subtle rust
+    draw_string(c, "kbps", 130, 43, fg=(110, 50, 28), bg=(11, 12, 14))
+    draw_string(c, "khz", 175, 43, fg=(110, 50, 28), bg=(11, 12, 14))
 
     # Position bar groove at (16, 72, 248, 10)
-    c.fill_rect(16, 72, 248, 10, (14, 15, 18))
-    c.bevel_sunken(16, 72, 248, 10, shadow=(8, 8, 10), light=(65, 70, 80))
+    c.fill_rect(16, 72, 248, 10, (14, 15, 17))
+    c.bevel_sunken(16, 72, 248, 10, shadow=(8, 8, 9), light=(45, 48, 55))
 
     # Volume slider groove at (107, 57, 68, 14)
-    c.fill_rect(107, 57, 68, 14, (12, 14, 16))
-    c.bevel_sunken(107, 57, 68, 14, shadow=(8, 8, 10), light=(65, 70, 80))
+    c.fill_rect(107, 57, 68, 14, (14, 15, 17))
+    c.bevel_sunken(107, 57, 68, 14, shadow=(8, 8, 9), light=(45, 48, 55))
 
     # Balance slider groove at (177, 57, 38, 14)
-    c.fill_rect(177, 57, 38, 14, (12, 14, 16))
-    c.bevel_sunken(177, 57, 38, 14, shadow=(8, 8, 10), light=(65, 70, 80))
+    c.fill_rect(177, 57, 38, 14, (14, 15, 17))
+    c.bevel_sunken(177, 57, 38, 14, shadow=(8, 8, 9), light=(45, 48, 55))
 
-    # Transport button wells at (16, 88) to (136, 106)
-    c.bevel_sunken(15, 87, 143, 20, shadow=(15, 16, 20), light=(70, 75, 85))
+    # Transport button well at (15, 87, 143, 20)
+    c.bevel_sunken(15, 87, 143, 20, shadow=(12, 13, 15), light=(50, 54, 60))
 
     return c.to_bmp()
 
-def generate_titlebar():
-    """Generates titlebar.bmp (350 x 87)."""
-    c = Canvas(350, 87, bg_color=(20, 22, 26))
+def generate_rust_titlebar():
+    """Generates titlebar.bmp (344 x 87). S01 §5, line 681; fixture exact."""
+    c = Canvas(344, 87, bg_color=(20, 21, 24))
 
     # 1. Focused titlebar at (27, 0, 275, 14)
+    # Deep burnished rust to dark graphite gradient
     for x in range(27, 302):
         t = (x - 27) / 275.0
-        # Deep sapphire metallic blue gradient
-        r = int(20 + 15 * (1.0 - t))
-        g = int(35 + 20 * (1.0 - t))
-        b = int(90 + 40 * (1.0 - t))
+        r = int(66 * (1.0 - t * 0.7))
+        g = int(26 * (1.0 - t * 0.5))
+        b = int(14 * (1.0 - t * 0.3))
         for y in range(0, 14):
-            line_hl = 15 if (y == 1 or y == 12) else (0 if y != 6 else -10)
+            line_hl = 12 if (y == 1 or y == 12) else 0
             c.set(x, y, (min(255, r + line_hl), min(255, g + line_hl), min(255, b + line_hl)))
-    c.bevel_raised(27, 0, 275, 14, light=(100, 120, 190), shadow=(10, 15, 40))
-    # Title text "RUSTAMP"
-    draw_string(c, "rustamp", 80, 4, fg=(220, 235, 255), bg=(25, 45, 110))
+    c.bevel_raised(27, 0, 275, 14, light=(140, 60, 25), shadow=(18, 10, 8))
+    # Title lettering "RUSTAMP"
+    draw_string(c, "rustamp", 80, 4, fg=(255, 200, 160), bg=(45, 20, 12))
 
     # 2. Unfocused titlebar at (27, 15, 275, 14)
     for x in range(27, 302):
         t = (x - 27) / 275.0
-        r = int(45 - 12 * t)
-        g = int(48 - 12 * t)
-        b = int(55 - 14 * t)
+        r = int(36 - 8 * t)
+        g = int(38 - 8 * t)
+        b = int(42 - 8 * t)
         for y in range(15, 29):
-            line_hl = 10 if (y == 16 or y == 27) else 0
+            line_hl = 8 if (y == 16 or y == 27) else 0
             c.set(x, y, (r + line_hl, g + line_hl, b + line_hl))
-    c.bevel_raised(27, 15, 275, 14, light=(80, 85, 95), shadow=(18, 20, 24))
-    draw_string(c, "rustamp", 80, 19, fg=(150, 155, 165), bg=(42, 45, 52))
+    c.bevel_raised(27, 15, 275, 14, light=(55, 58, 65), shadow=(12, 13, 15))
+    draw_string(c, "rustamp", 80, 19, fg=(120, 125, 135), bg=(32, 34, 38))
 
     # 3. Shade titlebars (focused at (27, 29, 275, 14), unfocused at (27, 42, 275, 14))
     for y in range(14):
@@ -349,90 +383,84 @@ def generate_titlebar():
             c.set(27 + x, 57 + y, c.get(27 + x, y))
             c.set(27 + x, 72 + y, c.get(27 + x, 15 + y))
 
-    # Embedded title bar window buttons in the title bars (close at 27+264=291, etc.)
+    # Window buttons within title bars
     for base_y in [0, 15, 29, 42, 57, 72]:
         # Options button at x=27+3
-        c.fill_rect(27 + 3, base_y + 3, 9, 8, (60, 65, 75))
-        c.bevel_raised(27 + 3, base_y + 3, 9, 8, light=(120, 125, 140), shadow=(15, 18, 22))
-        c.hline(27 + 5, base_y + 5, 5, (200, 210, 225))
-        c.hline(27 + 5, base_y + 7, 5, (200, 210, 225))
-        c.hline(27 + 5, base_y + 9, 5, (200, 210, 225))
+        c.fill_rect(27 + 3, base_y + 3, 9, 8, (45, 48, 55))
+        c.bevel_raised(27 + 3, base_y + 3, 9, 8, light=(80, 85, 95), shadow=(12, 13, 15))
+        c.hline(27 + 5, base_y + 5, 5, (220, 225, 235))
+        c.hline(27 + 5, base_y + 7, 5, (220, 225, 235))
+        c.hline(27 + 5, base_y + 9, 5, (220, 225, 235))
 
         # Minimize at 27+244
-        c.fill_rect(27 + 244, base_y + 3, 9, 8, (60, 65, 75))
-        c.bevel_raised(27 + 244, base_y + 3, 9, 8, light=(120, 125, 140), shadow=(15, 18, 22))
-        c.hline(27 + 246, base_y + 8, 5, (220, 230, 245))
+        c.fill_rect(27 + 244, base_y + 3, 9, 8, (45, 48, 55))
+        c.bevel_raised(27 + 244, base_y + 3, 9, 8, light=(80, 85, 95), shadow=(12, 13, 15))
+        c.hline(27 + 246, base_y + 8, 5, (240, 242, 248))
 
         # Shade at 27+254
-        c.fill_rect(27 + 254, base_y + 3, 9, 8, (60, 65, 75))
-        c.bevel_raised(27 + 254, base_y + 3, 9, 8, light=(120, 125, 140), shadow=(15, 18, 22))
-        c.frame_rect(27 + 256, base_y + 5, 5, 4, (220, 230, 245))
+        c.fill_rect(27 + 254, base_y + 3, 9, 8, (45, 48, 55))
+        c.bevel_raised(27 + 254, base_y + 3, 9, 8, light=(80, 85, 95), shadow=(12, 13, 15))
+        c.frame_rect(27 + 256, base_y + 5, 5, 4, (240, 242, 248))
 
         # Close at 27+264
-        c.fill_rect(27 + 264, base_y + 3, 9, 8, (60, 65, 75))
-        c.bevel_raised(27 + 264, base_y + 3, 9, 8, light=(120, 125, 140), shadow=(15, 18, 22))
-        # Draw X
+        c.fill_rect(27 + 264, base_y + 3, 9, 8, (45, 48, 55))
+        c.bevel_raised(27 + 264, base_y + 3, 9, 8, light=(80, 85, 95), shadow=(12, 13, 15))
         for d in range(5):
-            c.set(27 + 266 + d, base_y + 5 + d, (220, 230, 245))
-            c.set(27 + 270 - d, base_y + 5 + d, (220, 230, 245))
+            c.set(27 + 266 + d, base_y + 5 + d, (255, 107, 43))
+            c.set(27 + 270 - d, base_y + 5 + d, (255, 107, 43))
 
-    # Separate window buttons at (0, 0) .. (26, 36)
+    # Standalone window buttons at (0, 0) .. (26, 36)
     for bx, by, sym in [(0, 0, 'opt'), (9, 0, 'min'), (0, 18, 'shade'), (18, 0, 'close')]:
-        c.fill_rect(bx, by, 9, 9, (60, 65, 75))
-        c.bevel_raised(bx, by, 9, 9, light=(110, 115, 130), shadow=(18, 20, 24))
-        # Depressed at (bx, by + 9) or (bx + 9, by)
+        c.fill_rect(bx, by, 9, 9, (45, 48, 55))
+        c.bevel_raised(bx, by, 9, 9, light=(75, 80, 90), shadow=(12, 13, 15))
         dep_x, dep_y = (bx, by + 9) if by == 0 else (bx + 9, by)
-        c.fill_rect(dep_x, dep_y, 9, 9, (45, 48, 55))
-        c.bevel_sunken(dep_x, dep_y, 9, 9, shadow=(18, 20, 24), light=(90, 95, 105))
+        c.fill_rect(dep_x, dep_y, 9, 9, (32, 34, 40))
+        c.bevel_sunken(dep_x, dep_y, 9, 9, shadow=(10, 11, 13), light=(65, 70, 80))
 
     # Clutter bar background at (304, 0, 8, 43)
-    c.fill_rect(304, 0, 8, 43, (28, 30, 35))
-    c.bevel_sunken(304, 0, 8, 43, shadow=(15, 16, 20), light=(65, 70, 80))
-    c.fill_rect(312, 0, 8, 43, (24, 25, 28)) # Disabled
-    c.bevel_sunken(312, 0, 8, 43, shadow=(12, 14, 16), light=(50, 55, 60))
+    c.fill_rect(304, 0, 8, 43, (20, 21, 25))
+    c.bevel_sunken(304, 0, 8, 43, shadow=(10, 11, 13), light=(45, 48, 55))
+    c.fill_rect(312, 0, 8, 43, (17, 18, 21))
+    c.bevel_sunken(312, 0, 8, 43, shadow=(8, 9, 10), light=(38, 40, 46))
 
-    # Clutter bar lit buttons:
-    # O (308, 47, 4, 6), A (316, 55, 4, 6), I (324, 63, 3, 6), D (332, 71, 4, 6), V (340, 78, 4, 6)
-    lit = (0, 255, 100)
-    # O
-    c.fill_rect(308, 47, 4, 6, (0, 0, 0))
+    # Clutter bar lit buttons (O, A, I, D, V) at (308..340, 47..78) in glowing Rust orange
+    lit = (255, 107, 43)
+    # O (308, 47, 4, 6)
+    c.fill_rect(308, 47, 4, 6, (11, 12, 14))
     c.frame_rect(308, 47, 4, 6, lit)
-    # A
-    c.fill_rect(316, 55, 4, 6, (0, 0, 0))
+    # A (316, 55, 4, 6)
+    c.fill_rect(316, 55, 4, 6, (11, 12, 14))
     c.hline(317, 55, 2, lit)
     c.vline(316, 56, 5, lit)
     c.vline(319, 56, 5, lit)
     c.hline(316, 58, 4, lit)
-    # I
-    c.fill_rect(324, 63, 3, 6, (0, 0, 0))
+    # I (324, 63, 3, 6)
+    c.fill_rect(324, 63, 3, 6, (11, 12, 14))
     c.vline(325, 63, 6, lit)
-    # D
-    c.fill_rect(332, 71, 4, 6, (0, 0, 0))
+    # D (332, 71, 4, 6)
+    c.fill_rect(332, 71, 4, 6, (11, 12, 14))
     c.vline(332, 71, 6, lit)
     c.hline(332, 71, 3, lit)
     c.hline(332, 76, 3, lit)
     c.vline(335, 72, 4, lit)
-    # V
-    c.fill_rect(340, 78, 4, 6, (0, 0, 0))
+    # V (340, 78, 4, 6)
+    c.fill_rect(340, 78, 4, 6, (11, 12, 14))
     c.vline(340, 78, 4, lit)
     c.vline(343, 78, 4, lit)
     c.set(341, 82, lit)
     c.set(342, 82, lit)
 
-    # Shade position thumb pieces at (0, 36)
-    c.fill_rect(0, 36, 17, 7, (18, 20, 24))
-    c.fill_rect(17, 36, 9, 7, (75, 80, 95))
-    c.bevel_raised(17, 36, 9, 7, light=(120, 130, 150), shadow=(25, 28, 35))
+    # Shade position thumb at (0, 36)
+    c.fill_rect(0, 36, 17, 7, (14, 15, 17))
+    c.fill_rect(17, 36, 9, 7, (55, 60, 70))
+    c.bevel_raised(17, 36, 9, 7, light=(90, 100, 115), shadow=(18, 20, 24))
 
     return c.to_bmp()
 
-def generate_cbuttons():
-    """Generates cbuttons.bmp (136 x 36)."""
-    c = Canvas(136, 36, bg_color=(20, 22, 26))
+def generate_rust_cbuttons():
+    """Generates cbuttons.bmp (136 x 36). S01 §5, line 682."""
+    c = Canvas(136, 36, bg_color=(20, 21, 24))
 
-    # 6 transport buttons:
-    # Prev (0,0), Play (23,0), Pause (46,0), Stop (69,0), Next (92,0) -> 22 x 18
-    # Eject (114,0) -> 22 x 16
     buttons = [
         (0, 0, 22, 18, 'prev'),
         (23, 0, 22, 18, 'play'),
@@ -443,95 +471,83 @@ def generate_cbuttons():
     ]
 
     for x, y, w, h, kind in buttons:
-        # 1. Normal state (y=0)
-        c.fill_rect(x, y, w, h, (55, 60, 68))
-        c.bevel_raised(x, y, w, h, light=(95, 100, 115), shadow=(18, 20, 24))
-        # 2. Active / pressed state (y=18, eject at y=16)
+        # Resting state (y=0)
+        c.fill_rect(x, y, w, h, (40, 42, 48))
+        c.bevel_raised(x, y, w, h, light=(75, 80, 90), shadow=(12, 13, 16))
+        # Pressed state (y=18, eject y=16)
         py = 18 if kind != 'eject' else 16
-        c.fill_rect(x, py, w, h, (42, 46, 52))
-        c.bevel_sunken(x, py, w, h, shadow=(15, 16, 20), light=(80, 85, 95))
+        c.fill_rect(x, py, w, h, (28, 30, 35))
+        c.bevel_sunken(x, py, w, h, shadow=(10, 11, 13), light=(60, 65, 75))
 
-        # Icons (normal at cy=y, pressed at cy=py with +1 offset)
         for is_pressed in [False, True]:
             ox = x + (1 if is_pressed else 0)
             oy = (py if is_pressed else y) + (1 if is_pressed else 0)
-            icon_col = (200, 215, 230) if not is_pressed else (160, 175, 190)
+
+            # Play button has signature Rust orange icon; others off-white
+            if kind == 'play':
+                icon_col = (255, 107, 43) if not is_pressed else (210, 70, 20)
+            else:
+                icon_col = (240, 242, 248) if not is_pressed else (170, 175, 185)
 
             if kind == 'prev':
-                # Vertical bar at left, double triangle
                 c.vline(ox + 4, oy + 4, 10, icon_col)
-                # First triangle
                 for row in range(5):
                     c.vline(ox + 9 - row, oy + 4 + row, (5 - row) * 2, icon_col)
-                # Second triangle
                 for row in range(5):
                     c.vline(ox + 15 - row, oy + 4 + row, (5 - row) * 2, icon_col)
             elif kind == 'play':
-                # Right facing triangle
                 for col in range(9):
-                    h_t = max(1, 10 - col)
                     c.vline(ox + 6 + col, oy + 4 + col // 2, 10 - col, icon_col)
             elif kind == 'pause':
-                # Two vertical bars
                 c.fill_rect(ox + 6, oy + 4, 3, 10, icon_col)
                 c.fill_rect(ox + 12, oy + 4, 3, 10, icon_col)
             elif kind == 'stop':
-                # Square
                 c.fill_rect(ox + 6, oy + 4, 10, 10, icon_col)
             elif kind == 'next':
-                # Double triangle right, vertical bar at right
                 for row in range(5):
                     c.vline(ox + 5 + row, oy + 4 + row, (5 - row) * 2, icon_col)
                 for row in range(5):
                     c.vline(ox + 11 + row, oy + 4 + row, (5 - row) * 2, icon_col)
                 c.vline(ox + 16, oy + 4, 10, icon_col)
             elif kind == 'eject':
-                # Triangle up, bar bottom
                 for row in range(5):
                     c.hline(ox + 10 - row, oy + 4 + row, row * 2 + 1, icon_col)
                 c.hline(ox + 6, oy + 11, 10, icon_col)
 
     return c.to_bmp()
 
-def generate_shufrep():
-    """Generates shufrep.bmp (92 x 85)."""
-    c = Canvas(92, 85, bg_color=(20, 22, 26))
+def generate_rust_shufrep():
+    """Generates shufrep.bmp (92 x 85). S01 §5, line 683."""
+    c = Canvas(92, 85, bg_color=(20, 21, 24))
 
-    # Repeat (0, 0, 28, 15) states at y = 0, 15, 30, 45
-    # Shuffle (28, 0, 47, 15) states at y = 0, 15, 30, 45
     for state, sy in enumerate([0, 15, 30, 45]):
-        is_depressed = (state % 2 == 1)
-        is_selected = (state >= 2)
+        is_dep = (state % 2 == 1)
+        is_sel = (state >= 2)
+        bg = (28, 30, 35) if is_dep else (40, 42, 48)
 
-        # Repeat
-        bg = (42, 46, 52) if is_depressed else (55, 60, 68)
+        # Repeat (0, 0, 28, 15)
         c.fill_rect(0, sy, 28, 15, bg)
-        if is_depressed:
-            c.bevel_sunken(0, sy, 28, 15, shadow=(15, 16, 20), light=(80, 85, 95))
+        if is_dep:
+            c.bevel_sunken(0, sy, 28, 15, shadow=(10, 11, 13), light=(60, 65, 75))
         else:
-            c.bevel_raised(0, sy, 28, 15, light=(95, 100, 115), shadow=(18, 20, 24))
+            c.bevel_raised(0, sy, 28, 15, light=(75, 80, 90), shadow=(12, 13, 16))
 
-        # Shuffle
+        # Shuffle (28, 0, 47, 15)
         c.fill_rect(28, sy, 47, 15, bg)
-        if is_depressed:
-            c.bevel_sunken(28, sy, 47, 15, shadow=(15, 16, 20), light=(80, 85, 95))
+        if is_dep:
+            c.bevel_sunken(28, sy, 47, 15, shadow=(10, 11, 13), light=(60, 65, 75))
         else:
-            c.bevel_raised(28, sy, 47, 15, light=(95, 100, 115), shadow=(18, 20, 24))
+            c.bevel_raised(28, sy, 47, 15, light=(75, 80, 90), shadow=(12, 13, 16))
 
-        # Labels / LED indicators
-        led_col = (0, 255, 60) if is_selected else (20, 50, 25)
-        # Repeat LED dot at (3, sy + 6)
+        # Glowing Rust orange LED when selected
+        led_col = (255, 107, 43) if is_sel else (45, 20, 12)
         c.fill_rect(3, sy + 6, 3, 3, led_col)
-        draw_string(c, "rep", 8, sy + 4, fg=(220, 230, 245), bg=bg)
+        draw_string(c, "rep", 8, sy + 4, fg=(240, 242, 248), bg=bg)
 
-        # Shuffle LED dot at (31, sy + 6)
         c.fill_rect(31, sy + 6, 3, 3, led_col)
-        draw_string(c, "shuffle", 36, sy + 4, fg=(220, 230, 245), bg=bg)
+        draw_string(c, "shuffle", 36, sy + 4, fg=(240, 242, 248), bg=bg)
 
-    # EQ button (23 x 12) at:
-    # Normal: (0, 61), Selected: (0, 73), Depressed: (46, 61), Depressed+Selected: (46, 73)
-    # Playlist button (23 x 12) at:
-    # Normal: (23, 61), Selected: (23, 73), Depressed: (69, 61), Depressed+Selected: (69, 73)
+    # EQ and PL buttons
     for bx, by, kind, is_dep, is_sel in [
         (0, 61, 'eq', False, False),
         (0, 73, 'eq', False, True),
@@ -542,497 +558,897 @@ def generate_shufrep():
         (69, 61, 'pl', True, False),
         (69, 73, 'pl', True, True),
     ]:
-        bg = (42, 46, 52) if is_dep else (55, 60, 68)
+        bg = (28, 30, 35) if is_dep else (40, 42, 48)
         c.fill_rect(bx, by, 23, 12, bg)
         if is_dep:
-            c.bevel_sunken(bx, by, 23, 12, shadow=(15, 16, 20), light=(80, 85, 95))
+            c.bevel_sunken(bx, by, 23, 12, shadow=(10, 11, 13), light=(60, 65, 75))
         else:
-            c.bevel_raised(bx, by, 23, 12, light=(95, 100, 115), shadow=(18, 20, 24))
+            c.bevel_raised(bx, by, 23, 12, light=(75, 80, 90), shadow=(12, 13, 16))
 
-        fg = (0, 255, 60) if is_sel else (180, 190, 205)
+        fg = (255, 107, 43) if is_sel else (170, 175, 185)
         text = "eq" if kind == 'eq' else "pl"
         draw_string(c, text, bx + 6, by + 3, fg=fg, bg=bg)
 
     return c.to_bmp()
 
-def generate_posbar():
-    """Generates posbar.bmp (307 x 10)."""
-    c = Canvas(307, 10, bg_color=(15, 16, 20))
+def generate_rust_posbar():
+    """Generates posbar.bmp (307 x 10). S01 §5, line 684."""
+    c = Canvas(307, 10, bg_color=(14, 15, 17))
 
     # Track at (0, 0, 248, 10)
-    c.fill_rect(0, 0, 248, 10, (18, 20, 24))
-    c.bevel_sunken(0, 0, 248, 10, shadow=(8, 10, 12), light=(60, 65, 75))
-    # Groove line
-    c.hline(2, 4, 244, (10, 12, 14))
-    c.hline(2, 5, 244, (35, 38, 45))
+    c.fill_rect(0, 0, 248, 10, (16, 17, 20))
+    c.bevel_sunken(0, 0, 248, 10, shadow=(8, 9, 10), light=(45, 48, 55))
+    c.hline(2, 4, 244, (9, 10, 12))
+    c.hline(2, 5, 244, (28, 30, 35))
 
     # Resting thumb at (246, 0, 29, 10)
-    c.fill_rect(246, 0, 29, 10, (75, 80, 90))
-    c.bevel_raised(246, 0, 29, 10, light=(130, 140, 155), shadow=(25, 28, 35))
-    # Vertical grip lines
+    c.fill_rect(246, 0, 29, 10, (55, 58, 66))
+    c.bevel_raised(246, 0, 29, 10, light=(95, 100, 115), shadow=(18, 20, 24))
+    # Grip lines in glowing Rust orange
     for gx in [254, 258, 262, 266]:
-        c.vline(gx, 2, 6, (120, 130, 145))
-        c.vline(gx + 1, 2, 6, (35, 38, 45))
+        c.vline(gx, 2, 6, (255, 107, 43))
+        c.vline(gx + 1, 2, 6, (28, 30, 35))
 
     # Dragged thumb at (278, 0, 29, 10)
-    c.fill_rect(278, 0, 29, 10, (65, 70, 80))
-    c.bevel_sunken(278, 0, 29, 10, shadow=(20, 22, 28), light=(110, 120, 135))
+    c.fill_rect(278, 0, 29, 10, (45, 48, 56))
+    c.bevel_sunken(278, 0, 29, 10, shadow=(14, 15, 18), light=(80, 85, 95))
     for gx in [286, 290, 294, 298]:
-        c.vline(gx, 2, 6, (40, 42, 50))
-        c.vline(gx + 1, 2, 6, (130, 140, 155))
+        c.vline(gx, 2, 6, (210, 70, 20))
+        c.vline(gx + 1, 2, 6, (95, 100, 115))
 
     return c.to_bmp()
 
-def generate_volume():
-    """Generates volume.bmp (68 x 433). 28 frames of 15 rows each + thumb strip at y=420."""
-    c = Canvas(68, 433, bg_color=(15, 16, 20))
+def generate_rust_volume():
+    """Generates volume.bmp (68 x 433). S01 §5, line 685."""
+    c = Canvas(68, 433, bg_color=(14, 15, 17))
 
-    # 28 frames of volume track (68 x 15)
     for frame in range(28):
         fy = frame * 15
-        c.fill_rect(0, fy, 68, 15, (22, 24, 28))
-        c.bevel_sunken(0, fy, 68, 14, shadow=(10, 12, 14), light=(55, 60, 70))
+        c.fill_rect(0, fy, 68, 15, (18, 19, 22))
+        c.bevel_sunken(0, fy, 68, 14, shadow=(8, 9, 10), light=(45, 48, 55))
 
-        # Wedge bar graph: 28 levels
-        # Active bars up to frame
         num_bars = frame
         for b in range(27):
             bx = 8 + b * 2
-            # Height grows from 2 px on left to 8 px on right
             bh = 2 + int((b / 27.0) * 6)
             by = fy + 10 - bh
             if b <= num_bars:
-                # Color gradient: green (b=0..16) -> yellow (b=17..22) -> red (b=23..27)
-                if b < 17:
-                    col = (0, 240, 50)
-                elif b < 23:
-                    col = (250, 220, 0)
+                # Fire/ember gradient: golden amber -> fiery Rust orange -> searing red
+                if b < 16:
+                    col = (230, 160, 20)
+                elif b < 22:
+                    col = (255, 107, 43)
                 else:
-                    col = (255, 40, 30)
+                    col = (229, 57, 28)
             else:
-                col = (28, 35, 30) # Unlit bar
+                col = (42, 22, 16) # Unlit ember bar
             c.fill_rect(bx, by, 1, bh, col)
 
-    # Thumbs at y = 420 (height 11, width 14):
-    # Selected at (0, 420, 14, 11), Resting at (15, 420, 14, 11)
+    # Thumbs at y=420 (14 x 11): Selected at (0, 420), Resting at (15, 420)
     for tx, is_sel in [(15, False), (0, True)]:
-        bg = (70, 75, 85) if not is_sel else (55, 60, 70)
+        bg = (55, 58, 66) if not is_sel else (42, 45, 52)
         c.fill_rect(tx, 420, 14, 11, bg)
         if is_sel:
-            c.bevel_sunken(tx, 420, 14, 11, shadow=(20, 22, 28), light=(110, 120, 135))
+            c.bevel_sunken(tx, 420, 14, 11, shadow=(14, 15, 18), light=(85, 90, 100))
         else:
-            c.bevel_raised(tx, 420, 14, 11, light=(130, 140, 155), shadow=(25, 28, 35))
-        # Center indicator notch
-        notch_col = (0, 255, 60) if is_sel else (30, 35, 40)
+            c.bevel_raised(tx, 420, 14, 11, light=(95, 100, 115), shadow=(18, 20, 24))
+        notch_col = (255, 107, 43) if is_sel else (25, 28, 32)
         c.vline(tx + 6, 422, 7, notch_col)
-        c.vline(tx + 7, 422, 7, (120, 130, 145))
+        c.vline(tx + 7, 422, 7, (90, 95, 105))
 
     return c.to_bmp()
 
-def generate_balance():
-    """Generates balance.bmp (47 x 433). 28 frames of 15 rows each + thumb strip at y=420."""
-    c = Canvas(47, 433, bg_color=(15, 16, 20))
+def generate_rust_balance():
+    """Generates balance.bmp (68 x 433). S01 §5, line 686; fixture exact."""
+    c = Canvas(68, 433, bg_color=(14, 15, 17))
 
-    # 28 frames of balance track at (9, 0, 38, 420)
     for frame in range(28):
         fy = frame * 15
-        c.fill_rect(9, fy, 38, 14, (22, 24, 28))
-        c.bevel_sunken(9, fy, 38, 14, shadow=(10, 12, 14), light=(55, 60, 70))
-        # Center mark at 9+19 = 28
-        c.vline(28, fy + 2, 10, (45, 50, 60))
+        c.fill_rect(9, fy, 38, 14, (18, 19, 22))
+        c.bevel_sunken(9, fy, 38, 14, shadow=(8, 9, 10), light=(45, 48, 55))
+        c.vline(28, fy + 2, 10, (38, 40, 46))
 
-        # Balance indicator (frame 14 = center)
-        pan_offset = frame - 14 # -14 to +13
+        pan_offset = frame - 14
         bar_x = 28 + int((pan_offset / 14.0) * 14)
-        c.fill_rect(max(11, min(43, bar_x - 1)), fy + 4, 3, 6, (0, 240, 50))
+        c.fill_rect(max(11, min(43, bar_x - 1)), fy + 4, 3, 6, (255, 107, 43))
 
-    # Thumbs at y = 420 (height 11, width 14):
-    # Selected/Active at (0, 420, 14, 11), Resting at (15, 420, 14, 11)
     for tx, is_sel in [(15, False), (0, True)]:
-        bg = (70, 75, 85) if not is_sel else (55, 60, 70)
+        bg = (55, 58, 66) if not is_sel else (42, 45, 52)
         c.fill_rect(tx, 420, 14, 11, bg)
         if is_sel:
-            c.bevel_sunken(tx, 420, 14, 11, shadow=(20, 22, 28), light=(110, 120, 135))
+            c.bevel_sunken(tx, 420, 14, 11, shadow=(14, 15, 18), light=(85, 90, 100))
         else:
-            c.bevel_raised(tx, 420, 14, 11, light=(130, 140, 155), shadow=(25, 28, 35))
-        notch_col = (0, 255, 60) if is_sel else (30, 35, 40)
+            c.bevel_raised(tx, 420, 14, 11, light=(95, 100, 115), shadow=(18, 20, 24))
+        notch_col = (255, 107, 43) if is_sel else (25, 28, 32)
         c.vline(tx + 6, 422, 7, notch_col)
-        c.vline(tx + 7, 422, 7, (120, 130, 145))
+        c.vline(tx + 7, 422, 7, (90, 95, 105))
 
     return c.to_bmp()
 
-def generate_monoster():
-    """Generates monoster.bmp (56 x 24)."""
-    c = Canvas(56, 24, bg_color=(5, 6, 8))
+def generate_rust_monoster():
+    """Generates monoster.bmp (58 x 24). S01 §5, line 687; fixture exact."""
+    c = Canvas(58, 24, bg_color=(11, 12, 14))
 
-    # Stereo:
-    # Selected/Lit at (0, 0, 29, 12)
-    c.fill_rect(0, 0, 29, 12, (5, 6, 8))
-    draw_string(c, "stereo", 0, 3, fg=(0, 255, 60), bg=(5, 6, 8))
-    # Dim at (0, 12, 29, 12)
-    c.fill_rect(0, 12, 29, 12, (5, 6, 8))
-    draw_string(c, "stereo", 0, 15, fg=(20, 50, 25), bg=(5, 6, 8))
+    # Stereo: Lit at (0, 0, 29, 12), Dim at (0, 12, 29, 12)
+    c.fill_rect(0, 0, 29, 12, (11, 12, 14))
+    draw_string(c, "stereo", 0, 3, fg=(255, 107, 43), bg=(11, 12, 14))
+    c.fill_rect(0, 12, 29, 12, (11, 12, 14))
+    draw_string(c, "stereo", 0, 15, fg=(48, 22, 13), bg=(11, 12, 14))
 
-    # Mono:
-    # Selected/Lit at (29, 0, 27, 12)
-    c.fill_rect(29, 0, 27, 12, (5, 6, 8))
-    draw_string(c, "mono", 32, 3, fg=(0, 255, 60), bg=(5, 6, 8))
-    # Dim at (29, 12, 27, 12)
-    c.fill_rect(29, 12, 27, 12, (5, 6, 8))
-    draw_string(c, "mono", 32, 15, fg=(20, 50, 25), bg=(5, 6, 8))
+    # Mono: Lit at (29, 0, 27, 12), Dim at (29, 12, 27, 12)
+    c.fill_rect(29, 0, 27, 12, (11, 12, 14))
+    draw_string(c, "mono", 32, 3, fg=(255, 107, 43), bg=(11, 12, 14))
+    c.fill_rect(29, 12, 27, 12, (11, 12, 14))
+    draw_string(c, "mono", 32, 15, fg=(48, 22, 13), bg=(11, 12, 14))
 
     return c.to_bmp()
 
-def generate_playpaus():
-    """Generates playpaus.bmp (42 x 9)."""
-    c = Canvas(42, 9, bg_color=(5, 6, 8))
+def generate_rust_playpaus():
+    """Generates playpaus.bmp (42 x 9). S01 §5, line 688."""
+    c = Canvas(42, 9, bg_color=(11, 12, 14))
 
-    # Playing indicator (0, 0, 9, 9): green triangle
+    # Playing (0, 0, 9, 9): Glowing Rust orange triangle
     for col in range(6):
-        c.vline(2 + col, 2 + col // 2, 5 - (col // 2) * 2, (0, 255, 60))
+        c.vline(2 + col, 2 + col // 2, 5 - (col // 2) * 2, (255, 107, 43))
 
-    # Paused indicator (9, 0, 9, 9): amber bars
-    c.fill_rect(11, 2, 2, 5, (250, 200, 0))
-    c.fill_rect(15, 2, 2, 5, (250, 200, 0))
+    # Paused (9, 0, 9, 9): Warm amber bars
+    c.fill_rect(11, 2, 2, 5, (255, 179, 71))
+    c.fill_rect(15, 2, 2, 5, (255, 179, 71))
 
-    # Stopped indicator (18, 0, 9, 9): red square
-    c.fill_rect(20, 2, 5, 5, (230, 40, 30))
+    # Stopped (18, 0, 9, 9): Red square
+    c.fill_rect(20, 2, 5, 5, (211, 47, 47))
 
-    # Decoder working indicator at (36, 0, 3, 9): bright cyan/green
-    c.fill_rect(36, 0, 3, 9, (0, 255, 200))
+    # Working indicator at (36, 0, 3, 9): Bright flame highlight
+    c.fill_rect(36, 0, 3, 9, (255, 160, 92))
 
-    # Decoder idle indicator at (39, 0, 3, 9): dark grey
-    c.fill_rect(39, 0, 3, 9, (25, 30, 35))
+    # Idle indicator at (39, 0, 3, 9): Dark graphite
+    c.fill_rect(39, 0, 3, 9, (25, 27, 32))
 
     return c.to_bmp()
 
-def generate_numbers():
-    """Generates numbers.bmp (99 x 13). 11 cells of 9x13."""
-    c = Canvas(99, 13, bg_color=(5, 8, 8))
+def generate_rust_numbers():
+    """Generates numbers.bmp (99 x 13). S01 §5, line 689."""
+    c = Canvas(99, 13, bg_color=(11, 12, 14))
 
     for digit in range(10):
         draw_7segment_cell(c, str(digit), digit * 9, 0)
 
-    # 11th cell is NO_DIGIT (blank) at (90, 0)
     draw_7segment_cell(c, ' ', 90, 0)
-
-    # Minus sign at (20, 6, 5, 1) solid green
-    c.fill_rect(20, 6, 5, 1, (0, 255, 60))
-    # No minus sign at (9, 6, 5, 1) dim
-    c.fill_rect(9, 6, 5, 1, (12, 35, 18))
+    # Minus sign at (20, 6, 5, 1) solid orange
+    c.fill_rect(20, 6, 5, 1, (255, 122, 41))
+    # No-minus placeholder at (9, 6, 5, 1) dim
+    c.fill_rect(9, 6, 5, 1, (48, 22, 13))
 
     return c.to_bmp()
 
-def generate_nums_ex():
-    """Generates nums_ex.bmp (108 x 13). 12 cells of 9x13."""
-    c = Canvas(108, 13, bg_color=(5, 8, 8))
+def generate_rust_nums_ex():
+    """Generates nums_ex.bmp (108 x 13). S01 §2.3."""
+    c = Canvas(108, 13, bg_color=(11, 12, 14))
 
     for digit in range(10):
         draw_7segment_cell(c, str(digit), digit * 9, 0)
 
-    # Cell 10 at (90, 0): NO_MINUS_SIGN_EX (blank)
     draw_7segment_cell(c, ' ', 90, 0)
-
-    # Cell 11 at (99, 0): MINUS_SIGN_EX
     draw_7segment_cell(c, ' ', 99, 0)
-    c.fill_rect(99 + 2, 6, 5, 1, (0, 255, 60))
+    c.fill_rect(99 + 2, 6, 5, 1, (255, 122, 41))
 
     return c.to_bmp()
 
-def generate_text():
-    """Generates text.bmp (155 x 74). 4 copies of 31x3 grid of 5x6 cells."""
+def generate_rust_text():
+    """Generates text.bmp (155 x 74). S01 §5, line 690."""
     c = Canvas(155, 74, bg_color=(0, 0, 0))
 
     row0 = list("abcdefghijklmnopqrstuvwxyz\"@  ")
     row1 = list("0123456789….:()-'!_+\\/[]^&%,=$#")
     row2 = ["Å", "Ö", "Ä", "?", "*"]
 
-    # 4 copies at y = 0, 18, 38, 56
+    # 4 distinct palette stripes for the Rust theme
     color_schemes = [
-        ((0, 255, 60), (0, 0, 0)),        # y = 0: classic green on black
-        ((220, 240, 255), (25, 30, 40)),   # y = 18: white/cyan on dark slate
-        ((0, 255, 60), (0, 0, 0)),        # y = 38: green on black
-        ((240, 240, 240), (0, 0, 0)),      # y = 56: white on black
+        ((240, 242, 245), (0, 0, 0)),       # y = 0: Off-white on black
+        ((255, 122, 41), (20, 21, 24)),     # y = 18: Bright Rust orange on dark charcoal
+        ((255, 179, 102), (0, 0, 0)),      # y = 38: Warm amber on black
+        ((255, 255, 255), (0, 0, 0)),      # y = 56: Pure white on black
     ]
 
-    for copy_idx, (base_y, (fg, bg)) in enumerate(zip([0, 18, 38, 56], color_schemes)):
-        # Row 0
+    for base_y, (fg, bg) in zip([0, 18, 38, 56], color_schemes):
         for col_idx, ch in enumerate(row0):
             if col_idx < 31:
                 draw_text_glyph(c, ch, col_idx * 5, base_y + 0, fg, bg)
-        # Row 1
         for col_idx, ch in enumerate(row1):
             if col_idx < 31:
                 draw_text_glyph(c, ch, col_idx * 5, base_y + 6, fg, bg)
-        # Row 2
         for col_idx, ch in enumerate(row2):
             if col_idx < 31:
                 draw_text_glyph(c, ch, col_idx * 5, base_y + 12, fg, bg)
 
     return c.to_bmp()
 
-def generate_pledit():
-    """Generates pledit.bmp (280 x 186)."""
-    c = Canvas(280, 186, bg_color=(15, 16, 20))
+def generate_rust_pledit():
+    """Generates pledit.bmp (280 x 186). S01 §5, line 691."""
+    c = Canvas(280, 186, bg_color=(14, 15, 17))
 
-    # Title bars (focused at y=0, unfocused at y=21):
-    # Top left corner (0, y, 25, 20)
-    # Title strip (26, y, 100, 20)
-    # Top tile (127, y, 25, 20)
-    # Top right corner (153, y, 25, 20)
     for focused, base_y in [(True, 0), (False, 21)]:
-        bg = (20, 35, 80) if focused else (40, 44, 50)
-        fg = (220, 235, 255) if focused else (150, 155, 165)
-        # Corners & tiles
-        c.fill_rect(0, base_y, 25, 20, bg)
-        c.bevel_raised(0, base_y, 25, 20, light=(90, 110, 180) if focused else (75, 80, 90), shadow=(10, 15, 30))
+        bg = (48, 22, 14) if focused else (32, 34, 38)
+        fg = (255, 200, 160) if focused else (120, 125, 135)
 
-        c.fill_rect(26, base_y, 100, 20, bg)
-        c.bevel_raised(26, base_y, 100, 20, light=(90, 110, 180) if focused else (75, 80, 90), shadow=(10, 15, 30))
+        for bx, bw in [(0, 25), (26, 100), (127, 25), (153, 25)]:
+            c.fill_rect(bx, base_y, bw, 20, bg)
+            c.bevel_raised(bx, base_y, bw, 20, light=(90, 45, 25) if focused else (55, 58, 65), shadow=(15, 10, 8))
+
         draw_string(c, "playlist", 45, base_y + 7, fg=fg, bg=bg)
 
-        c.fill_rect(127, base_y, 25, 20, bg)
-        c.bevel_raised(127, base_y, 25, 20, light=(90, 110, 180) if focused else (75, 80, 90), shadow=(10, 15, 30))
-
-        c.fill_rect(153, base_y, 25, 20, bg)
-        c.bevel_raised(153, base_y, 25, 20, light=(90, 110, 180) if focused else (75, 80, 90), shadow=(10, 15, 30))
-
-    # Side rails:
     # Left rail at (0, 42, 12, 29)
-    c.fill_rect(0, 42, 12, 29, (35, 38, 45))
-    c.bevel_raised(0, 42, 12, 29, light=(80, 85, 95), shadow=(15, 16, 20))
+    c.fill_rect(0, 42, 12, 29, (28, 30, 35))
+    c.bevel_raised(0, 42, 12, 29, light=(55, 58, 65), shadow=(10, 11, 13))
 
     # Right rail / scrollbar track at (31, 42, 20, 29)
-    c.fill_rect(31, 42, 20, 29, (22, 24, 28))
-    c.bevel_sunken(31, 42, 20, 29, shadow=(10, 12, 15), light=(60, 65, 75))
+    c.fill_rect(31, 42, 20, 29, (18, 19, 22))
+    c.bevel_sunken(31, 42, 20, 29, shadow=(8, 9, 10), light=(45, 48, 55))
 
-    # Scroll handle at (52, 53, 8, 18), selected at (61, 53, 8, 18)
-    c.fill_rect(52, 53, 8, 18, (65, 70, 80))
-    c.bevel_raised(52, 53, 8, 18, light=(120, 130, 145), shadow=(25, 28, 35))
-    c.fill_rect(61, 53, 8, 18, (55, 60, 70))
-    c.bevel_sunken(61, 53, 8, 18, shadow=(20, 22, 28), light=(100, 110, 125))
+    # Scroll handle at (52, 53, 8, 18)
+    c.fill_rect(52, 53, 8, 18, (50, 54, 62))
+    c.bevel_raised(52, 53, 8, 18, light=(85, 90, 100), shadow=(18, 20, 24))
+    c.fill_rect(61, 53, 8, 18, (42, 45, 52))
+    c.bevel_sunken(61, 53, 8, 18, shadow=(14, 15, 18), light=(75, 80, 90))
 
     # Scroll arrows at (261, 72, 8, 10)
-    c.fill_rect(261, 72, 8, 10, (55, 60, 68))
-    c.bevel_raised(261, 72, 8, 10, light=(100, 110, 125), shadow=(18, 20, 24))
-    # Up arrow at (264, 73), down arrow at (264, 78)
-    c.set(264, 74, (200, 215, 230))
-    c.hline(263, 75, 3, (200, 215, 230))
-    c.hline(263, 78, 3, (200, 215, 230))
-    c.set(264, 79, (200, 215, 230))
+    c.fill_rect(261, 72, 8, 10, (40, 42, 48))
+    c.bevel_raised(261, 72, 8, 10, light=(75, 80, 90), shadow=(12, 13, 16))
+    c.set(264, 74, (255, 107, 43))
+    c.hline(263, 75, 3, (255, 107, 43))
+    c.hline(263, 78, 3, (255, 107, 43))
+    c.set(264, 79, (255, 107, 43))
 
-    # Bottom bar:
-    # Left block at (0, 72, 125, 38)
-    c.fill_rect(0, 72, 125, 38, (38, 40, 48))
-    c.bevel_raised(0, 72, 125, 38, light=(85, 90, 100), shadow=(15, 16, 20))
-    # Right block at (126, 72, 150, 38)
-    c.fill_rect(126, 72, 150, 38, (38, 40, 48))
-    c.bevel_raised(126, 72, 150, 38, light=(85, 90, 100), shadow=(15, 16, 20))
+    # Bottom bar blocks
+    c.fill_rect(0, 72, 125, 38, (28, 30, 35))
+    c.bevel_raised(0, 72, 125, 38, light=(60, 64, 72), shadow=(12, 13, 15))
+    c.fill_rect(126, 72, 150, 38, (28, 30, 35))
+    c.bevel_raised(126, 72, 150, 38, light=(60, 64, 72), shadow=(12, 13, 15))
 
     # Bottom buttons from sheet y = 86:
-    # ADD (11), REM (43), SEL (72), MISC (101), LIST OPTS (229)
     for bx, label in [(11, "add"), (43, "rem"), (72, "sel"), (101, "misc"), (229, "opts")]:
-        c.fill_rect(bx, 86, 24, 18, (55, 60, 68))
-        c.bevel_raised(bx, 86, 24, 18, light=(95, 100, 115), shadow=(18, 20, 24))
-        draw_string(c, label, bx + 2, 92, fg=(220, 230, 245), bg=(55, 60, 68))
+        c.fill_rect(bx, 86, 24, 18, (40, 42, 48))
+        c.bevel_raised(bx, 86, 24, 18, light=(75, 80, 90), shadow=(12, 13, 16))
+        draw_string(c, label, bx + 2, 92, fg=(240, 242, 248), bg=(40, 42, 48))
 
     # Visualizer background at (205, 0, 75, 38)
-    c.fill_rect(205, 0, 75, 38, (5, 6, 8))
-    c.bevel_sunken(205, 0, 75, 38, shadow=(10, 12, 15), light=(60, 65, 75))
+    c.fill_rect(205, 0, 75, 38, (11, 12, 14))
+    c.bevel_sunken(205, 0, 75, 38, shadow=(8, 9, 10), light=(45, 48, 55))
 
     return c.to_bmp()
 
-def generate_eqmain():
-    """Generates eqmain.bmp (275 x 315)."""
-    c = Canvas(275, 315, bg_color=(20, 22, 26))
+def generate_rust_eqmain():
+    """Generates eqmain.bmp (275 x 315). S01 §5, line 692. Includes Rust gear motif."""
+    c = Canvas(275, 315, bg_color=(20, 21, 24))
 
     # Window background at (0, 0, 275, 116)
-    c.texture_metal(0, 0, 275, 116, base_color=(40, 42, 48))
-    c.bevel_raised(0, 0, 275, 116, light=(85, 90, 100), shadow=(15, 16, 20))
+    c.texture_metal(0, 0, 275, 116, base_color=(23, 24, 28))
+    c.bevel_raised(0, 0, 275, 116, light=(62, 66, 73), shadow=(13, 14, 16))
 
-    # Printed dB labels on main window: +12db at (40, 39), 0db at (44, 68), -12db at (40, 98)
-    draw_string(c, "+12db", 42, 38, fg=(120, 130, 140), bg=(40, 42, 48))
-    draw_string(c, " 0db", 42, 63, fg=(120, 130, 140), bg=(40, 42, 48))
-    draw_string(c, "-12db", 42, 88, fg=(120, 130, 140), bg=(40, 42, 48))
+    draw_string(c, "+12db", 42, 38, fg=(110, 115, 125), bg=(23, 24, 28))
+    draw_string(c, " 0db", 42, 63, fg=(110, 115, 125), bg=(23, 24, 28))
+    draw_string(c, "-12db", 42, 88, fg=(110, 115, 125), bg=(23, 24, 28))
 
-    # Printed frequency band labels
     band_labels = ["60", "170", "310", "600", "1k", "3k", "6k", "12k", "14k", "16k"]
     for i, lbl in enumerate(band_labels):
         bx = 79 + i * 18 - 4
-        draw_string(c, lbl, bx, 102, fg=(110, 120, 135), bg=(40, 42, 48))
+        draw_string(c, lbl, bx, 102, fg=(110, 115, 125), bg=(23, 24, 28))
 
-    # Preamp label at (20, 102)
-    draw_string(c, "pre", 20, 102, fg=(110, 120, 135), bg=(40, 42, 48))
+    draw_string(c, "pre", 20, 102, fg=(110, 115, 125), bg=(23, 24, 28))
 
-    # Slider grooves under preamp (22) and bands (79 + 18k)
     for k in [-1] + list(range(10)):
         gx = 22 if k == -1 else 79 + k * 18
-        c.fill_rect(gx + 4, 38, 3, 55, (12, 14, 16))
-        c.bevel_sunken(gx + 4, 38, 3, 55, shadow=(8, 8, 10), light=(60, 65, 75))
+        c.fill_rect(gx + 4, 38, 3, 55, (12, 13, 15))
+        c.bevel_sunken(gx + 4, 38, 3, 55, shadow=(8, 8, 9), light=(45, 48, 55))
 
-    # Title bars:
-    # Focused at (0, 134, 275, 14)
-    c.fill_rect(0, 134, 275, 14, (20, 35, 80))
-    c.bevel_raised(0, 134, 275, 14, light=(90, 110, 180), shadow=(10, 15, 30))
-    draw_string(c, "equalizer", 80, 138, fg=(220, 235, 255), bg=(20, 35, 80))
+    # Title bars
+    c.fill_rect(0, 134, 275, 14, (48, 22, 14))
+    c.bevel_raised(0, 134, 275, 14, light=(90, 45, 25), shadow=(15, 10, 8))
+    draw_string(c, "equalizer", 80, 138, fg=(255, 200, 160), bg=(48, 22, 14))
 
-    # Unfocused at (0, 149, 275, 14)
-    c.fill_rect(0, 149, 275, 14, (45, 48, 55))
-    c.bevel_raised(0, 149, 275, 14, light=(80, 85, 95), shadow=(18, 20, 24))
-    draw_string(c, "equalizer", 80, 153, fg=(150, 155, 165), bg=(45, 48, 55))
+    c.fill_rect(0, 149, 275, 14, (32, 34, 38))
+    c.bevel_raised(0, 149, 275, 14, light=(55, 58, 65), shadow=(12, 13, 15))
+    draw_string(c, "equalizer", 80, 153, fg=(120, 125, 135), bg=(32, 34, 38))
 
     # Slider track area at (13, 164, 209, 129)
-    c.fill_rect(13, 164, 209, 129, (25, 27, 32))
+    c.fill_rect(13, 164, 209, 129, (18, 19, 22))
 
-    # Slider thumbs:
-    # Resting at (0, 164, 11, 11)
-    c.fill_rect(0, 164, 11, 11, (75, 80, 90))
-    c.bevel_raised(0, 164, 11, 11, light=(130, 140, 155), shadow=(25, 28, 35))
-    c.hline(2, 169, 7, (30, 35, 40))
-    c.hline(2, 170, 7, (120, 130, 145))
+    # Slider thumbs
+    c.fill_rect(0, 164, 11, 11, (55, 58, 66))
+    c.bevel_raised(0, 164, 11, 11, light=(95, 100, 115), shadow=(18, 20, 24))
+    c.hline(2, 169, 7, (25, 28, 32))
+    c.hline(2, 170, 7, (90, 95, 105))
 
-    # Dragged at (0, 176, 11, 11)
-    c.fill_rect(0, 176, 11, 11, (65, 70, 80))
-    c.bevel_sunken(0, 176, 11, 11, shadow=(20, 22, 28), light=(110, 120, 135))
-    c.hline(2, 181, 7, (0, 255, 60))
+    c.fill_rect(0, 176, 11, 11, (42, 45, 52))
+    c.bevel_sunken(0, 176, 11, 11, shadow=(14, 15, 18), light=(85, 90, 100))
+    c.hline(2, 181, 7, (255, 107, 43))
 
-    # On button: (10, 119, 26, 12) normal, (69, 119) engaged, (128, 119) depressed, (187, 119) engaged+depressed
+    # ON, AUTO buttons with Rust orange lit indicators
     for bx, is_eng, is_dep in [(10, False, False), (69, True, False), (128, False, True), (187, True, True)]:
-        bg = (42, 46, 52) if is_dep else (55, 60, 68)
+        bg = (28, 30, 35) if is_dep else (40, 42, 48)
         c.fill_rect(bx, 119, 26, 12, bg)
         if is_dep:
-            c.bevel_sunken(bx, 119, 26, 12, shadow=(15, 16, 20), light=(80, 85, 95))
+            c.bevel_sunken(bx, 119, 26, 12, shadow=(10, 11, 13), light=(60, 65, 75))
         else:
-            c.bevel_raised(bx, 119, 26, 12, light=(95, 100, 115), shadow=(18, 20, 24))
-        # Indicator dot
-        c.fill_rect(bx + 2, 123, 3, 3, (0, 255, 60) if is_eng else (20, 50, 25))
-        draw_string(c, "on", bx + 8, 122, fg=(220, 230, 245), bg=bg)
+            c.bevel_raised(bx, 119, 26, 12, light=(75, 80, 90), shadow=(12, 13, 16))
+        c.fill_rect(bx + 2, 123, 3, 3, (255, 107, 43) if is_eng else (45, 20, 12))
+        draw_string(c, "on", bx + 8, 122, fg=(240, 242, 248), bg=bg)
 
-    # Auto button: (36, 119, 32, 12)
     for bx, is_eng, is_dep in [(36, False, False), (95, True, False), (154, False, True), (213, True, True)]:
-        bg = (42, 46, 52) if is_dep else (55, 60, 68)
+        bg = (28, 30, 35) if is_dep else (40, 42, 48)
         c.fill_rect(bx, 119, 32, 12, bg)
         if is_dep:
-            c.bevel_sunken(bx, 119, 32, 12, shadow=(15, 16, 20), light=(80, 85, 95))
+            c.bevel_sunken(bx, 119, 32, 12, shadow=(10, 11, 13), light=(60, 65, 75))
         else:
-            c.bevel_raised(bx, 119, 32, 12, light=(95, 100, 115), shadow=(18, 20, 24))
-        c.fill_rect(bx + 2, 123, 3, 3, (0, 255, 60) if is_eng else (20, 50, 25))
-        draw_string(c, "auto", bx + 7, 122, fg=(220, 230, 245), bg=bg)
+            c.bevel_raised(bx, 119, 32, 12, light=(75, 80, 90), shadow=(12, 13, 16))
+        c.fill_rect(bx + 2, 123, 3, 3, (255, 107, 43) if is_eng else (45, 20, 12))
+        draw_string(c, "auto", bx + 7, 122, fg=(240, 242, 248), bg=bg)
 
-    # Presets button: (224, 164, 44, 12) normal, (224, 176, 44, 12) selected
     for by, is_sel in [(164, False), (176, True)]:
-        bg = (45, 50, 58) if is_sel else (55, 60, 68)
+        bg = (32, 34, 40) if is_sel else (40, 42, 48)
         c.fill_rect(224, by, 44, 12, bg)
         if is_sel:
-            c.bevel_sunken(224, by, 44, 12, shadow=(15, 16, 20), light=(80, 85, 95))
+            c.bevel_sunken(224, by, 44, 12, shadow=(10, 11, 13), light=(60, 65, 75))
         else:
-            c.bevel_raised(224, by, 44, 12, light=(95, 100, 115), shadow=(18, 20, 24))
-        draw_string(c, "presets", 227, by + 3, fg=(220, 230, 245), bg=bg)
+            c.bevel_raised(224, by, 44, 12, light=(75, 80, 90), shadow=(12, 13, 16))
+        draw_string(c, "presets", 227, by + 3, fg=(240, 242, 248), bg=bg)
 
     # Graph background at (0, 294, 113, 19)
-    c.fill_rect(0, 294, 113, 19, (6, 8, 10))
-    c.bevel_sunken(0, 294, 113, 19, shadow=(4, 5, 6), light=(50, 55, 65))
-    # Horizontal grid line at y=303
-    c.hline(2, 303, 109, (20, 35, 25))
+    c.fill_rect(0, 294, 113, 19, (11, 12, 14))
+    c.bevel_sunken(0, 294, 113, 19, shadow=(6, 7, 8), light=(40, 44, 50))
+    c.hline(2, 303, 109, (28, 20, 16))
 
-    # Graph line color scale at (115, 294, 1, 19): 19 rows from red to green
+    # --- RUST MOTIF: Procedural Gear / Cog silhouette watermark in EQ graph ---
+    c.draw_gear(cx=56, cy=303, r_outer=8, r_inner=5, r_hole=2, teeth=8, color=(140, 59, 24), hole_color=(11, 12, 14))
+
+    # Graph line scale at (115, 294, 1, 19)
     for y in range(19):
         t = y / 18.0
-        # Row 0 = red, row 9 = green/yellow, row 18 = bright green
-        r = int(255 * (1.0 - t))
-        g = int(255 * min(1.0, t * 1.5))
-        b = 30
+        r = int(255 * (1.0 - t * 0.3))
+        g = int(200 * t)
+        b = int(30 * (1.0 - t))
         c.set(115, 294 + y, (r, g, b))
 
-    # Preamp line at (0, 314, 113, 1)
-    c.hline(0, 314, 113, (0, 255, 60))
+    # Preamp line at (0, 314, 113, 1) in Rust orange
+    c.hline(0, 314, 113, (255, 107, 43))
 
     return c.to_bmp()
 
-def generate_eq_ex():
-    """Generates eq_ex.bmp (275 x 56)."""
-    c = Canvas(275, 56, bg_color=(20, 22, 26))
+def generate_rust_eq_ex():
+    """Generates eq_ex.bmp (275 x 82). S01 §5, line 693; fixture exact."""
+    c = Canvas(275, 82, bg_color=(20, 21, 24))
 
-    # Shade backgrounds:
-    # Selected/Focused at (0, 0, 275, 14)
-    c.fill_rect(0, 0, 275, 14, (20, 35, 80))
-    c.bevel_raised(0, 0, 275, 14, light=(90, 110, 180), shadow=(10, 15, 30))
-    draw_string(c, "equalizer", 80, 4, fg=(220, 235, 255), bg=(20, 35, 80))
+    # Shade backgrounds: Focused (0, 0, 275, 14), Unfocused (0, 15, 275, 14)
+    c.fill_rect(0, 0, 275, 14, (48, 22, 14))
+    c.bevel_raised(0, 0, 275, 14, light=(90, 45, 25), shadow=(15, 10, 8))
+    draw_string(c, "equalizer", 80, 4, fg=(255, 200, 160), bg=(48, 22, 14))
 
-    # Normal/Unfocused at (0, 15, 275, 14)
-    c.fill_rect(0, 15, 275, 14, (45, 48, 55))
-    c.bevel_raised(0, 15, 275, 14, light=(80, 85, 95), shadow=(18, 20, 24))
-    draw_string(c, "equalizer", 80, 19, fg=(150, 155, 165), bg=(45, 48, 55))
+    c.fill_rect(0, 15, 275, 14, (32, 34, 38))
+    c.bevel_raised(0, 15, 275, 14, light=(55, 58, 65), shadow=(12, 13, 15))
+    draw_string(c, "equalizer", 80, 19, fg=(120, 125, 135), bg=(32, 34, 38))
 
-    # Mini volume / balance slider thumbs at y = 30
-    c.fill_rect(1, 30, 9, 7, (75, 80, 95))
-    c.fill_rect(11, 30, 9, 7, (75, 80, 95))
+    # Mini volume / balance sliders & buttons
+    c.fill_rect(1, 30, 9, 7, (55, 58, 66))
+    c.fill_rect(11, 30, 9, 7, (55, 58, 66))
 
-    # Buttons at y = 38..56
-    for by in [38, 47]:
-        c.fill_rect(1, by, 9, 9, (55, 60, 68))
-        c.fill_rect(11, by, 9, 9, (55, 60, 68))
+    for by in [38, 47, 56, 65]:
+        c.fill_rect(1, by, 9, 8, (40, 42, 48))
+        c.fill_rect(11, by, 9, 8, (40, 42, 48))
 
     return c.to_bmp()
 
-def generate_gen():
-    """Generates gen.bmp (178 x 86)."""
-    c = Canvas(178, 86, bg_color=(20, 22, 26))
+def generate_rust_gen():
+    """Generates gen.bmp (194 x 109). S01 §5, line 694; fixture exact. Includes gear teeth border motif."""
+    c = Canvas(194, 109, bg_color=(20, 21, 24))
 
     # Top border tiles (selected y=0, normal y=21)
     for base_y, focused in [(0, True), (21, False)]:
-        bg = (20, 35, 80) if focused else (45, 48, 55)
-        # Corners and fills
-        c.fill_rect(0, base_y, 25, 20, bg)
-        c.bevel_raised(0, base_y, 25, 20, light=(90, 110, 180) if focused else (80, 85, 95), shadow=(10, 15, 30))
-        c.fill_rect(26, base_y, 25, 20, bg)
-        c.fill_rect(52, base_y, 25, 20, bg)
-        c.fill_rect(78, base_y, 25, 20, bg)
-        c.fill_rect(104, base_y, 25, 20, bg)
-        c.fill_rect(130, base_y, 25, 20, bg)
+        bg = (48, 22, 14) if focused else (32, 34, 38)
+        gear_col = (110, 48, 22) if focused else (50, 52, 58)
+        # Corners & fill tiles
+        for tx in range(0, 182, 26):
+            c.fill_rect(tx, base_y, 25, 20, bg)
+            c.bevel_raised(tx, base_y, 25, 20, light=(90, 45, 25) if focused else (55, 58, 65), shadow=(15, 10, 8))
+            # Decorative gear tooth pattern along top edge
+            for tooth in range(4):
+                c.fill_rect(tx + 3 + tooth * 5, base_y + 2, 3, 2, gear_col)
 
     # Bottom bar at (0, 42, 125, 14) and (0, 57, 125, 14)
-    c.fill_rect(0, 42, 125, 14, (38, 40, 48))
-    c.bevel_raised(0, 42, 125, 14, light=(85, 90, 100), shadow=(15, 16, 20))
-    c.fill_rect(0, 57, 125, 14, (38, 40, 48))
-    c.bevel_raised(0, 57, 125, 14, light=(85, 90, 100), shadow=(15, 16, 20))
+    c.fill_rect(0, 42, 125, 14, (28, 30, 35))
+    c.bevel_raised(0, 42, 125, 14, light=(60, 64, 72), shadow=(12, 13, 15))
+    c.fill_rect(0, 57, 125, 14, (28, 30, 35))
+    c.bevel_raised(0, 57, 125, 14, light=(60, 64, 72), shadow=(12, 13, 15))
 
     # Middle rails at (127, 42, 11, 29) and (139, 42, 8, 29)
-    c.fill_rect(127, 42, 11, 29, (35, 38, 45))
-    c.fill_rect(139, 42, 8, 29, (22, 24, 28))
+    c.fill_rect(127, 42, 11, 29, (28, 30, 35))
+    c.fill_rect(139, 42, 8, 29, (18, 19, 22))
+
+    return c.to_bmp()
+
+def generate_rust_genex():
+    """Generates genex.bmp (130 x 75). S01 §5, line 695; fixture exact."""
+    c = Canvas(130, 75, bg_color=(20, 21, 24))
+    c.texture_metal(0, 0, 130, 75, base_color=(23, 24, 28))
+    c.bevel_raised(0, 0, 130, 75, light=(62, 66, 73), shadow=(13, 14, 16))
+
+    # Extra generic controls & sliders
+    c.fill_rect(10, 10, 110, 16, (14, 15, 17))
+    c.bevel_sunken(10, 10, 110, 16, shadow=(8, 9, 10), light=(45, 48, 55))
+    c.draw_gear(cx=65, cy=18, r_outer=6, r_inner=4, r_hole=2, teeth=6, color=(140, 59, 24), hole_color=(14, 15, 17))
+
+    # Slider buttons & checkboxes with Rust orange active state
+    c.fill_rect(10, 36, 12, 12, (40, 42, 48))
+    c.bevel_raised(10, 36, 12, 12, light=(75, 80, 90), shadow=(12, 13, 16))
+    c.fill_rect(13, 39, 6, 6, (255, 107, 43))
+
+    c.fill_rect(30, 36, 12, 12, (28, 30, 35))
+    c.bevel_sunken(30, 36, 12, 12, shadow=(10, 11, 13), light=(60, 65, 75))
+
+    return c.to_bmp()
+
+def generate_rust_mb():
+    """Generates mb.bmp (234 x 119). S01 §5, line 696; fixture exact."""
+    c = Canvas(234, 119, bg_color=(20, 21, 24))
+    c.texture_metal(0, 0, 234, 119, base_color=(23, 24, 28))
+    c.bevel_raised(0, 0, 234, 119, light=(62, 66, 73), shadow=(13, 14, 16))
+
+    # Minibrowser titlebar (0, 0, 234, 14)
+    c.fill_rect(0, 0, 234, 14, (48, 22, 14))
+    c.bevel_raised(0, 0, 234, 14, light=(90, 45, 25), shadow=(15, 10, 8))
+    draw_string(c, "browser", 10, 4, fg=(255, 200, 160), bg=(48, 22, 14))
+
+    # Navigation buttons: Back, Forward, Stop, Reload, Home at y=20
+    nav_buttons = [(" < ", 10), (" > ", 35), (" X ", 60), (" R ", 85), (" H ", 110)]
+    for lbl, bx in nav_buttons:
+        c.fill_rect(bx, 20, 22, 14, (40, 42, 48))
+        c.bevel_raised(bx, 20, 22, 14, light=(75, 80, 90), shadow=(12, 13, 16))
+        draw_string(c, lbl.strip(), bx + 7, 24, fg=(255, 107, 43), bg=(40, 42, 48))
+
+    # Address bar frame at (10, 40, 214, 16)
+    c.fill_rect(10, 40, 214, 16, (11, 12, 14))
+    c.bevel_sunken(10, 40, 214, 16, shadow=(8, 9, 10), light=(45, 48, 55))
+    draw_string(c, "http://rustamp", 15, 45, fg=(140, 70, 35), bg=(11, 12, 14))
+
+    # Content window area at (10, 62, 214, 48)
+    c.fill_rect(10, 62, 214, 48, (14, 15, 17))
+    c.bevel_sunken(10, 62, 214, 48, shadow=(8, 9, 10), light=(45, 48, 55))
+    c.draw_gear(cx=117, cy=86, r_outer=10, r_inner=6, r_hole=2, teeth=8, color=(70, 32, 16), hole_color=(14, 15, 17))
+
+    return c.to_bmp()
+
+def generate_rust_video():
+    """Generates video.bmp (234 x 119). S01 §5, line 697; fixture exact."""
+    c = Canvas(234, 119, bg_color=(20, 21, 24))
+    c.texture_metal(0, 0, 234, 119, base_color=(23, 24, 28))
+    c.bevel_raised(0, 0, 234, 119, light=(62, 66, 73), shadow=(13, 14, 16))
+
+    # Video titlebar
+    c.fill_rect(0, 0, 234, 14, (48, 22, 14))
+    c.bevel_raised(0, 0, 234, 14, light=(90, 45, 25), shadow=(15, 10, 8))
+    draw_string(c, "video", 10, 4, fg=(255, 200, 160), bg=(48, 22, 14))
+
+    # Video screen viewport cutout at (10, 20, 214, 68)
+    c.fill_rect(10, 20, 214, 68, (8, 9, 10))
+    c.bevel_sunken(10, 20, 214, 68, shadow=(6, 7, 8), light=(40, 44, 50))
+    # Gear watermark on screen
+    c.draw_gear(cx=117, cy=54, r_outer=14, r_inner=9, r_hole=3, teeth=8, color=(45, 20, 12), hole_color=(8, 9, 10))
+
+    # Video controls at bottom (10, 94, 214, 18)
+    c.fill_rect(10, 94, 214, 18, (28, 30, 35))
+    c.bevel_sunken(10, 94, 214, 18, shadow=(10, 11, 13), light=(50, 54, 60))
+
+    # Play, Pause, Stop, Fullscreen buttons
+    c.fill_rect(14, 96, 18, 14, (40, 42, 48))
+    c.bevel_raised(14, 96, 18, 14, light=(75, 80, 90), shadow=(12, 13, 16))
+    # Play icon in Rust orange
+    for col in range(6):
+        c.vline(19 + col, 99 + col // 2, 7 - col, (255, 107, 43))
+
+    # Fullscreen button at x=200
+    c.fill_rect(200, 96, 20, 14, (40, 42, 48))
+    c.bevel_raised(200, 96, 20, 14, light=(75, 80, 90), shadow=(12, 13, 16))
+    c.frame_rect(204, 100, 12, 6, (255, 107, 43))
 
     return c.to_bmp()
 
 
-SHEET_GENERATORS = {
-    "main.bmp": generate_main,
-    "titlebar.bmp": generate_titlebar,
-    "cbuttons.bmp": generate_cbuttons,
-    "shufrep.bmp": generate_shufrep,
-    "posbar.bmp": generate_posbar,
-    "volume.bmp": generate_volume,
-    "balance.bmp": generate_balance,
-    "monoster.bmp": generate_monoster,
-    "playpaus.bmp": generate_playpaus,
-    "numbers.bmp": generate_numbers,
-    "nums_ex.bmp": generate_nums_ex,
-    "text.bmp": generate_text,
-    "pledit.bmp": generate_pledit,
-    "eqmain.bmp": generate_eqmain,
-    "eq_ex.bmp": generate_eq_ex,
-    "gen.bmp": generate_gen,
+# --- Rust Theme Cursor Canvas & Drawing Helpers ---
+
+class CursorCanvas:
+    def __init__(self, width=32, height=32):
+        self.width = width
+        self.height = height
+        self.pixels = [[(0, 0, 0, 0) for _ in range(width)] for _ in range(height)]
+
+    def set(self, x, y, rgba):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            self.pixels[y][x] = rgba
+
+    def fill_rect(self, x, y, w, h, rgba):
+        for cy in range(max(0, y), min(self.height, y + h)):
+            for cx in range(max(0, x), min(self.width, x + w)):
+                self.pixels[cy][cx] = rgba
+
+    def hline(self, x, y, w, rgba):
+        self.fill_rect(x, y, w, 1, rgba)
+
+    def vline(self, x, y, h, rgba):
+        self.fill_rect(x, y, 1, h, rgba)
+
+    def frame_rect(self, x, y, w, h, rgba):
+        self.hline(x, y, w, rgba)
+        self.hline(x, y + h - 1, w, rgba)
+        self.vline(x, y, h, rgba)
+        self.vline(x + w - 1, y, h, rgba)
+
+    def to_cur(self, hotspot_x, hotspot_y):
+        return create_cur_32(self.width, self.height, hotspot_x, hotspot_y, lambda x, y: self.pixels[y][x])
+
+
+# Standard Rust palette for cursors
+CUR_BLACK = (0, 0, 0, 255)
+CUR_WHITE = (240, 242, 248, 255)
+CUR_ORANGE = (255, 107, 43, 255)
+CUR_ORANGE_DARK = (180, 60, 20, 255)
+
+def draw_arrow_pointer(c, hx=0, hy=0, accent_color=CUR_ORANGE):
+    """Draws a standard pointer arrow with black outline, white body, and Rust accent."""
+    for y in range(16):
+        for x in range(y + 1):
+            c.set(hx + x, hy + y, CUR_WHITE)
+    # Orange spine accent
+    for d in range(2, 12):
+        c.set(hx + 1, hy + d, accent_color)
+    # Outline
+    for y in range(17):
+        c.set(hx, hy + y, CUR_BLACK)
+        c.set(hx + y, hy + y, CUR_BLACK)
+    c.set(hx + 1, hy + 16, CUR_BLACK)
+
+def generate_rust_normal_cur():
+    """Generates normal.cur (32 x 32, hotspot 0, 0)."""
+    c = CursorCanvas()
+    draw_arrow_pointer(c, 0, 0, CUR_ORANGE)
+    return c.to_cur(0, 0)
+
+def generate_rust_pnormal_cur():
+    """Generates pnormal.cur (32 x 32, hotspot 0, 0)."""
+    c = CursorCanvas()
+    draw_arrow_pointer(c, 0, 0, CUR_ORANGE)
+    # Playlist icon accent (mini list lines) at (14, 12)
+    c.fill_rect(13, 11, 8, 8, CUR_BLACK)
+    c.fill_rect(14, 12, 6, 6, (32, 34, 40, 255))
+    c.hline(15, 13, 4, CUR_ORANGE)
+    c.hline(15, 15, 4, CUR_ORANGE)
+    c.hline(15, 17, 3, CUR_ORANGE)
+    return c.to_cur(0, 0)
+
+def generate_rust_close_cur():
+    """Generates close.cur (32 x 32, hotspot 4, 4)."""
+    c = CursorCanvas()
+    # Close 'X' symbol in Rust orange with black border
+    c.fill_rect(0, 0, 9, 9, CUR_BLACK)
+    c.fill_rect(1, 1, 7, 7, (45, 48, 55, 255))
+    for d in range(5):
+        c.set(2 + d, 2 + d, CUR_ORANGE)
+        c.set(6 - d, 2 + d, CUR_ORANGE)
+    return c.to_cur(4, 4)
+
+def generate_rust_titlebar_cur():
+    """Generates titlebar.cur (32 x 32, hotspot 8, 8). 4-way move cursor."""
+    c = CursorCanvas()
+    cx, cy = 8, 8
+    # 4-way arrows
+    for d in range(-6, 7):
+        c.set(cx + d, cy, CUR_WHITE)
+        c.set(cx, cy + d, CUR_WHITE)
+    # Arrow heads in Rust orange
+    c.set(cx, cy - 7, CUR_ORANGE)
+    c.hline(cx - 1, cy - 6, 3, CUR_ORANGE)
+    c.set(cx, cy + 7, CUR_ORANGE)
+    c.hline(cx - 1, cy + 6, 3, CUR_ORANGE)
+    c.set(cx - 7, cy, CUR_ORANGE)
+    c.vline(cx - 6, cy - 1, 3, CUR_ORANGE)
+    c.set(cx + 7, cy, CUR_ORANGE)
+    c.vline(cx + 6, cy - 1, 3, CUR_ORANGE)
+    # Black borders around heads
+    c.set(cx, cy, CUR_ORANGE)
+    return c.to_cur(cx, cy)
+
+def generate_rust_posbar_cur():
+    """Generates posbar.cur (32 x 32, hotspot 8, 8). Horizontal slider cursor."""
+    c = CursorCanvas()
+    cx, cy = 8, 8
+    c.hline(cx - 7, cy, 15, CUR_WHITE)
+    c.vline(cx, cy - 3, 7, CUR_WHITE)
+    # Horizontal arrow heads in Rust orange
+    c.set(cx - 7, cy, CUR_ORANGE)
+    c.vline(cx - 6, cy - 2, 5, CUR_ORANGE)
+    c.vline(cx - 5, cy - 1, 3, CUR_ORANGE)
+    c.set(cx + 7, cy, CUR_ORANGE)
+    c.vline(cx + 6, cy - 2, 5, CUR_ORANGE)
+    c.vline(cx + 5, cy - 1, 3, CUR_ORANGE)
+    return c.to_cur(cx, cy)
+
+def generate_rust_volbal_cur():
+    """Generates volbal.cur (32 x 32, hotspot 8, 8). Horizontal volume/balance cursor."""
+    c = CursorCanvas()
+    cx, cy = 8, 8
+    c.hline(cx - 6, cy, 13, CUR_WHITE)
+    # Volume wedge arc ticks in Rust orange
+    c.vline(cx - 2, cy - 3, 7, CUR_ORANGE)
+    c.vline(cx + 2, cy - 4, 9, CUR_ORANGE)
+    # Left and right arrow tips
+    c.set(cx - 7, cy, CUR_ORANGE)
+    c.set(cx + 7, cy, CUR_ORANGE)
+    return c.to_cur(cx, cy)
+
+def generate_rust_eqslid_cur():
+    """Generates eqslid.cur (32 x 32, hotspot 8, 8). Vertical slider cursor."""
+    c = CursorCanvas()
+    cx, cy = 8, 8
+    c.vline(cx, cy - 7, 15, CUR_WHITE)
+    c.hline(cx - 3, cy, 7, CUR_WHITE)
+    # Vertical arrow heads in Rust orange
+    c.set(cx, cy - 7, CUR_ORANGE)
+    c.hline(cx - 2, cy - 6, 5, CUR_ORANGE)
+    c.hline(cx - 1, cy - 5, 3, CUR_ORANGE)
+    c.set(cx, cy + 7, CUR_ORANGE)
+    c.hline(cx - 2, cy + 6, 5, CUR_ORANGE)
+    c.hline(cx - 1, cy + 5, 3, CUR_ORANGE)
+    return c.to_cur(cx, cy)
+
+def generate_rust_eqtitle_cur():
+    """Generates eqtitle.cur (32 x 32, hotspot 8, 8). Equalizer title drag cursor."""
+    c = CursorCanvas()
+    cx, cy = 8, 8
+    # 4-way move with mini EQ graph
+    c.hline(cx - 6, cy, 13, CUR_WHITE)
+    c.vline(cx, cy - 6, 13, CUR_WHITE)
+    c.set(cx, cy - 7, CUR_ORANGE)
+    c.set(cx, cy + 7, CUR_ORANGE)
+    c.set(cx - 7, cy, CUR_ORANGE)
+    c.set(cx + 7, cy, CUR_ORANGE)
+    # Mini EQ bars in corners
+    c.vline(cx + 4, cy - 4, 3, CUR_ORANGE)
+    c.vline(cx + 6, cy - 5, 4, CUR_ORANGE)
+    return c.to_cur(cx, cy)
+
+def generate_rust_psize_cur():
+    """Generates psize.cur (32 x 32, hotspot 8, 8). Diagonal resize cursor."""
+    c = CursorCanvas()
+    cx, cy = 8, 8
+    # Diagonal line from (-6, -6) to (6, 6)
+    for d in range(-6, 7):
+        c.set(cx + d, cy + d, CUR_WHITE)
+        c.set(cx + d + 1, cy + d, CUR_BLACK)
+    # Arrowheads in Rust orange
+    c.set(cx - 7, cy - 7, CUR_ORANGE)
+    c.set(cx - 6, cy - 7, CUR_ORANGE)
+    c.set(cx - 7, cy - 6, CUR_ORANGE)
+    c.set(cx + 7, cy + 7, CUR_ORANGE)
+    c.set(cx + 6, cy + 7, CUR_ORANGE)
+    c.set(cx + 7, cy + 6, CUR_ORANGE)
+    return c.to_cur(cx, cy)
+
+def generate_rust_ptbar_cur():
+    """Generates ptbar.cur (32 x 32, hotspot 8, 8). Playlist titlebar move cursor."""
+    c = CursorCanvas()
+    cx, cy = 8, 8
+    c.hline(cx - 6, cy, 13, CUR_WHITE)
+    c.vline(cx, cy - 6, 13, CUR_WHITE)
+    c.set(cx, cy - 7, CUR_ORANGE)
+    c.set(cx, cy + 7, CUR_ORANGE)
+    c.set(cx - 7, cy, CUR_ORANGE)
+    c.set(cx + 7, cy, CUR_ORANGE)
+    # Mini playlist lines
+    c.hline(cx + 3, cy - 3, 4, CUR_ORANGE)
+    c.hline(cx + 3, cy - 1, 4, CUR_ORANGE)
+    return c.to_cur(cx, cy)
+
+def generate_rust_pvscroll_cur():
+    """Generates pvscroll.cur (32 x 32, hotspot 8, 8). Vertical scroll cursor."""
+    c = CursorCanvas()
+    cx, cy = 8, 8
+    c.vline(cx, cy - 7, 15, CUR_WHITE)
+    c.set(cx, cy - 7, CUR_ORANGE)
+    c.hline(cx - 2, cy - 6, 5, CUR_ORANGE)
+    c.set(cx, cy + 7, CUR_ORANGE)
+    c.hline(cx - 2, cy + 6, 5, CUR_ORANGE)
+    # Scrollbar thumb box in center
+    c.frame_rect(cx - 3, cy - 2, 7, 5, CUR_WHITE)
+    c.fill_rect(cx - 2, cy - 1, 5, 3, CUR_ORANGE)
+    return c.to_cur(cx, cy)
+
+
+# --- Text File Generators ---
+
+def generate_rust_pledit_txt():
+    """Generates pledit.txt in Rust theme palette."""
+    return (
+        "[Text]\r\n"
+        "Normal=#DF7B38\r\n"
+        "Current=#FFFFFF\r\n"
+        "NormalBG=#141517\r\n"
+        "SelectedBG=#6A2610\r\n"
+        "Font=Arial\r\n"
+    ).encode('utf-8')
+
+def generate_rust_viscolor_txt():
+    """
+    Generates viscolor.txt (24 fire/rust gradient colors).
+    Slot 0: background (obsidian black)
+    Slot 1: grid lines (dark charcoal rust)
+    Slots 2-17: 16-step fire/rust spectrum gradient (white-amber -> rust flame -> deep ember)
+    Slots 18-22: 5 oscilloscope trace colors (bright flame amber -> deep rust)
+    Slot 23: peak-dots (bright blazing flame)
+    """
+    lines = [
+        "12,13,14",     # 0: Analyser background (obsidian black)
+        "38,32,29",     # 1: Grid lines (dark charcoal rust)
+        "255,240,208",  # 2: Top spectrum peak (white-hot amber)
+        "255,210,128",  # 3: Bright flame gold
+        "255,180,64",   # 4: Warm amber
+        "255,145,36",   # 5: Blazing flame
+        "255,117,24",   # 6: Vibrant fire
+        "240,94,22",    # 7: Vivid Rust orange
+        "229,90,28",    # 8: Rust logo orange
+        "217,68,18",    # 9: Warm rust
+        "204,56,16",    # 10: Deep flame
+        "184,44,14",    # 11: Burnished rust
+        "163,34,12",    # 12: Ember orange
+        "142,26,10",    # 13: Dark rust
+        "122,20,8",     # 14: Deep ember
+        "102,16,6",     # 15: Low ember
+        "82,12,4",      # 16: Dim furnace glow
+        "62,8,2",       # 17: Bottom baseline ember
+        "255,179,71",   # 18: Scope 1 (brightest flame amber)
+        "255,140,26",   # 19: Scope 2
+        "230,106,13",   # 20: Scope 3
+        "179,74,0",     # 21: Scope 4
+        "128,48,0",     # 22: Scope 5
+        "255,224,130",  # 23: Peak dots (blazing white-gold)
+    ]
+    return ("\r\n".join(lines) + "\r\n").encode('utf-8')
+
+def generate_rust_region_txt():
+    """Generates region.txt."""
+    return (
+        "[Normal]\r\n"
+        "NumPoints=4\r\n"
+        "PointList=0,0, 275,0, 275,116, 0,116\r\n"
+        "[WindowShade]\r\n"
+        "NumPoints=4\r\n"
+        "PointList=0,0, 275,0, 275,14, 0,14\r\n"
+        "[Equalizer]\r\n"
+        "NumPoints=4\r\n"
+        "PointList=0,0, 275,0, 275,116, 0,116\r\n"
+    ).encode('utf-8')
+
+
+# --- Master Specifications Table ---
+
+RUST_THEME_GENERATORS = {
+    # 18 classic sheets + 1 extended sheet
+    "main.bmp": generate_rust_main,
+    "titlebar.bmp": generate_rust_titlebar,
+    "cbuttons.bmp": generate_rust_cbuttons,
+    "shufrep.bmp": generate_rust_shufrep,
+    "posbar.bmp": generate_rust_posbar,
+    "volume.bmp": generate_rust_volume,
+    "balance.bmp": generate_rust_balance,
+    "monoster.bmp": generate_rust_monoster,
+    "playpaus.bmp": generate_rust_playpaus,
+    "numbers.bmp": generate_rust_numbers,
+    "nums_ex.bmp": generate_rust_nums_ex,
+    "text.bmp": generate_rust_text,
+    "pledit.bmp": generate_rust_pledit,
+    "eqmain.bmp": generate_rust_eqmain,
+    "eq_ex.bmp": generate_rust_eq_ex,
+    "gen.bmp": generate_rust_gen,
+    "genex.bmp": generate_rust_genex,
+    "mb.bmp": generate_rust_mb,
+    "video.bmp": generate_rust_video,
+    # 11 cursors
+    "normal.cur": generate_rust_normal_cur,
+    "pnormal.cur": generate_rust_pnormal_cur,
+    "close.cur": generate_rust_close_cur,
+    "titlebar.cur": generate_rust_titlebar_cur,
+    "posbar.cur": generate_rust_posbar_cur,
+    "volbal.cur": generate_rust_volbal_cur,
+    "eqslid.cur": generate_rust_eqslid_cur,
+    "eqtitle.cur": generate_rust_eqtitle_cur,
+    "psize.cur": generate_rust_psize_cur,
+    "ptbar.cur": generate_rust_ptbar_cur,
+    "pvscroll.cur": generate_rust_pvscroll_cur,
+    # 3 text files
+    "pledit.txt": generate_rust_pledit_txt,
+    "region.txt": generate_rust_region_txt,
+    "viscolor.txt": generate_rust_viscolor_txt,
 }
 
+# Expected pixel-exact dimensions per specs/S01-window-geometry.md and base-2.91.wsz fixture
+EXPECTED_DIMENSIONS = {
+    "main.bmp": (275, 116),
+    "titlebar.bmp": (344, 87),
+    "cbuttons.bmp": (136, 36),
+    "shufrep.bmp": (92, 85),
+    "posbar.bmp": (307, 10),
+    "volume.bmp": (68, 433),
+    "balance.bmp": (68, 433),
+    "monoster.bmp": (58, 24),
+    "playpaus.bmp": (42, 9),
+    "numbers.bmp": (99, 13),
+    "nums_ex.bmp": (108, 13),
+    "text.bmp": (155, 74),
+    "pledit.bmp": (280, 186),
+    "eqmain.bmp": (275, 315),
+    "eq_ex.bmp": (275, 82),
+    "gen.bmp": (194, 109),
+    "genex.bmp": (130, 75),
+    "mb.bmp": (234, 119),
+    "video.bmp": (234, 119),
+    "normal.cur": (32, 32),
+    "pnormal.cur": (32, 32),
+    "close.cur": (32, 32),
+    "titlebar.cur": (32, 32),
+    "posbar.cur": (32, 32),
+    "volbal.cur": (32, 32),
+    "eqslid.cur": (32, 32),
+    "eqtitle.cur": (32, 32),
+    "psize.cur": (32, 32),
+    "ptbar.cur": (32, 32),
+    "pvscroll.cur": (32, 32),
+}
+
+def verify_static_dimensions(output_dir):
+    """Static dimension check: asserts every generated file matches the required spec dimensions."""
+    print("Verifying static dimensions...")
+    for filename, expected_size in EXPECTED_DIMENSIONS.items():
+        file_path = os.path.join(output_dir, filename)
+        assert os.path.exists(file_path), f"Missing generated file: {filename}"
+        with open(file_path, "rb") as f:
+            data = f.read()
+
+        if filename.endswith(".bmp"):
+            assert len(data) >= 26, f"{filename} too small to be BMP"
+            w, h = struct.unpack('<ii', data[18:26])
+            actual = (w, abs(h))
+            assert actual == expected_size, (
+                f"Dimension mismatch in {filename}: expected {expected_size}, got {actual}"
+            )
+        elif filename.endswith(".cur"):
+            assert len(data) >= 22, f"{filename} too small to be CUR"
+            count = struct.unpack('<H', data[4:6])[0]
+            assert count == 1, f"{filename} should contain 1 cursor image, got {count}"
+            w, h = data[6], data[7]
+            w = 256 if w == 0 else w
+            h = 256 if h == 0 else h
+            actual = (w, h)
+            assert actual == expected_size, (
+                f"Dimension mismatch in {filename}: expected {expected_size}, got {actual}"
+            )
+
+    # Verify text files non-empty
+    for txt in ["pledit.txt", "region.txt", "viscolor.txt"]:
+        file_path = os.path.join(output_dir, txt)
+        assert os.path.exists(file_path), f"Missing text file: {txt}"
+        assert os.path.getsize(file_path) > 0, f"Empty text file: {txt}"
+
+    print(f"STATIC CHECK PASSED: All {len(EXPECTED_DIMENSIONS)} sheets and cursors match exact spec dimensions!")
+
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"Generating lookalike skin sheets to {OUTPUT_DIR}...")
-    for filename, gen_fn in SHEET_GENERATORS.items():
-        out_path = os.path.join(OUTPUT_DIR, filename)
-        bmp_data = gen_fn()
+    os.makedirs(RUST_THEME_DIR, exist_ok=True)
+    print(f"Generating complete Rust-themed skin (32 entries + nums_ex.bmp) to {RUST_THEME_DIR}...")
+    for filename, gen_fn in RUST_THEME_GENERATORS.items():
+        out_path = os.path.join(RUST_THEME_DIR, filename)
+        data = gen_fn()
         with open(out_path, "wb") as f:
-            f.write(bmp_data)
-        print(f"  {filename:15} -> {len(bmp_data):6} bytes")
-    print("Done! All 16 skin sheets generated successfully.")
+            f.write(data)
+        print(f"  {filename:16} -> {len(data):6} bytes")
+
+    verify_static_dimensions(RUST_THEME_DIR)
+    print("Done! Rust-themed skin generated and verified successfully.")
 
 if __name__ == "__main__":
     main()
