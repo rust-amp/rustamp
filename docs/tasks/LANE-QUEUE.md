@@ -75,6 +75,32 @@ poll every outstanding agy job, verify and merge what is done, and refill **befo
 starting new work. Six lanes were merged in one batch that way; before that, five
 finished lanes had gone unnoticed for a while.
 
+## Lane keeping (owner rule, 2026-10-17)
+
+**Refill automatically, on every completion.** The owner's instruction: keep free
+and Muse lanes running, and do the refilling by itself. The standing rule, applied
+whenever a lane reports or an agy job is found finished:
+
+1. **Verify, then merge** the finished lane (both trees, fmt/clippy, the suite).
+2. **Refill its slot immediately** from `docs/tasks/LANE-QUEUE.md` and
+   `docs/tasks/HARD-TASKS.md` - before starting anything else.
+3. **Targets:** two Muse lanes (the owner's floor until 2026-10-18 midday), at
+   least one free-tier lane, one Codex lane while its quota lasts, and agy filled
+   to its cap of four. Nine lanes is a healthy wave.
+4. **Match the source to the work:** ordering, threads, clocks, buffers, second
+   processes, numeric subtlety and anything whose proof needs the VM go to Codex;
+   well-specified, local, checkable-by-reading work goes to a free-tier lane;
+   everything in between goes to Muse.
+5. **Check the table, not the story:** `powershell -ExecutionPolicy Bypass -File
+   docs\notes\lanes.ps1` prints every worktree, how many files it has changed and
+   what it is based on, plus the canonical tree's cleanliness. A lane that reports
+   work its worktree does not contain is a dead lane; a lane that writes into the
+   canonical tree is a broken lane - both have happened.
+6. **Worktree first.** Create the worktree before launching the lane; two lanes
+   were launched into paths that did not exist yet.
+7. **Never wait on a source that failed.** Relaunch on another source
+   (`docs/tasks/HARD-TASKS.md` section 1 keeps the failure log).
+
 ## How a lane is started
 
 1. `worktree_create` with a name that says what it is (`waveNN-<topic>`).
