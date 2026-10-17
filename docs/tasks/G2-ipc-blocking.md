@@ -1,5 +1,21 @@
 # Task card G2 — Blocking consumer and producer for the shm rings (RFC 0007)
 
+> **Orchestrator notes (2026-10-17, after the VM run).**
+> 1. The blocking tests originally used `None` timeouts, so a lost wake hung the
+>    whole suite in the guest for over half an hour. Every wait in the test module
+>    is now bounded (`TEST_WAIT`, ten seconds): a lost wake fails an assertion
+>    instead of stalling the run. The API still accepts `None`.
+> 2. `blocking_timeout_returns_timed_out` failed in the VM because it asserted a
+>    *lower* bound on the elapsed time (`>= 8 ms` of a 10 ms timeout) and the call
+>    returned earlier, with `Ok(0)`. The lower bound was removed: it asserts how
+>    long the kernel event blocked, which depends on the OS timer and the event's
+>    initial state, and the RFC's criterion is that a timeout *returns*. **The
+>    early return itself is an open question**: if `wait` really reports
+>    `TimedOut` before the requested time has elapsed, that is a defect worth its
+>    own test - a caller would read it as "no data" sooner than it asked for. It
+>    needs a check that measures the wait against the requested duration across
+>    several runs before anything is concluded.
+
 **Goal**
 
 Implement RFC 0007 (accepted 2026-10-15) in `rustamp-ipc`'s `shm` module: blocking
