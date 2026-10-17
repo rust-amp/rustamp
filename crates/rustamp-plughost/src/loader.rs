@@ -439,6 +439,8 @@ pub enum PluginLoadError {
     },
     /// Host window HWND is zero or invalid.
     MissingHostWindow,
+    /// Candidate plugin or approval store operation failed the approval store gate.
+    ApprovalStore(crate::approval::ApprovalStoreError),
 }
 
 impl fmt::Display for PluginLoadError {
@@ -476,6 +478,7 @@ impl fmt::Display for PluginLoadError {
                 "{kind:?} plugin returned unsupported version {actual:#x} (expected {expected:#x})"
             ),
             Self::MissingHostWindow => f.write_str("host window HWND is zero or not created"),
+            Self::ApprovalStore(e) => write!(f, "plugin approval store refusal: {e}"),
         }
     }
 }
@@ -485,6 +488,7 @@ impl std::error::Error for PluginLoadError {
         match self {
             Self::Io(e) => Some(e),
             Self::Preflight(e) => Some(e),
+            Self::ApprovalStore(e) => Some(e),
             _ => None,
         }
     }
@@ -644,6 +648,46 @@ pub unsafe fn load_plugin(
             return Err(PluginLoadError::NotX86Architecture);
         }
         // SAFETY: caller verified safety invariants for load_plugin.
+        unsafe { load_plugin_x86(image, window) }
+    }
+}
+
+/// Load and initialize a 32-bit Winamp plugin DLL using an explicit approval store.
+///
+/// 1. Reads the candidate plugin DLL via [`PreparedImage::read`].
+///    This canonicalizes the path, verifies PE structure, section bounds, and undecorated export getters.
+/// 2. Verifies the candidate's exact bytes against the [`crate::approval::ApprovalStore`].
+///    Refuses if unapproved, wrong machine, wrong size, or hash mismatch.
+/// 3. Executes the verified-byte snapshot pipeline:
+///    Re-opens the source under `FILE_SHARE_READ`, locks ancestors, copies to a private snapshot,
+///    verifies snapshot bytes, and passes only the private snapshot to `LoadLibraryExW`.
+///
+/// Keeps all existing preflight, snapshot, and anti-TOCTOU guarantees intact.
+///
+/// # Safety
+///
+/// Must be called on the UI thread owning `window`. The caller relies on the approval store's
+/// prior authorization decision for execution of the plugin (including its dependencies).
+pub unsafe fn load_plugin_with_store(
+    path: &Path,
+    store: &crate::approval::ApprovalStore,
+    window: &HostWindow,
+) -> Result<LoadedPlugin, PluginLoadError> {
+    let image = PreparedImage::read(path)?;
+    image.require_store_approval(store)?;
+
+    #[cfg(not(windows))]
+    {
+        let _ = (window, image);
+        Err(PluginLoadError::NotWindowsPlatform)
+    }
+
+    #[cfg(windows)]
+    {
+        if !cfg!(target_arch = "x86") {
+            return Err(PluginLoadError::NotX86Architecture);
+        }
+        // SAFETY: caller verified safety invariants and store approval.
         unsafe { load_plugin_x86(image, window) }
     }
 }
@@ -1396,5 +1440,78 @@ mod tests {
         clear_active_dsp_module(&mut module);
         assert!(active_dsp_module().is_null());
         assert_eq!(unsafe { host_dsp_is_active() }, 0);
+    }
+
+    #[test]
+    fn loader_with_store_approved_image_loads_to_arch_boundary() {
+        use crate::approval::ApprovalStore;
+        let mut store = ApprovalStore::new();
+        let bytes = test_dll(0x014c);
+        let fixture = Fixture::new(&bytes);
+        store.approve_bytes("test_plugin.dll", &bytes).unwrap();
+
+        // SAFETY: fixture is test data, window is dummy.
+        let result = unsafe { load_plugin_with_store(&fixture.0, &store, &HostWindow::dummy()) };
+
+        #[cfg(not(windows))]
+        assert!(matches!(result, Err(PluginLoadError::NotWindowsPlatform)));
+
+        #[cfg(windows)]
+        {
+            if !cfg!(target_arch = "x86") {
+                assert!(matches!(result, Err(PluginLoadError::NotX86Architecture)));
+            }
+        }
+    }
+
+    #[test]
+    fn loader_with_store_changed_image_is_refused_before_loading() {
+        use crate::approval::ApprovalStore;
+        let mut store = ApprovalStore::new();
+        let bytes = test_dll(0x014c);
+        store.approve_bytes("test_plugin.dll", &bytes).unwrap();
+
+        let mut hostile = bytes.clone();
+        hostile[0x300] ^= 0x99;
+        let fixture = Fixture::new(&hostile);
+
+        // SAFETY: candidate must fail before any execution.
+        let result = unsafe { load_plugin_with_store(&fixture.0, &store, &HostWindow::dummy()) };
+        assert!(matches!(result, Err(PluginLoadError::NotApproved)));
+    }
+
+    #[test]
+    fn loader_with_store_malformed_store_refuses_loudly() {
+        use crate::approval::ApprovalStore;
+        let malformed = "version = 999\n";
+        let err = ApprovalStore::parse(malformed).expect_err("unsupported version must fail");
+        assert!(matches!(
+            err,
+            crate::approval::ApprovalStoreError::UnsupportedVersion(999)
+        ));
+
+        let temp_corrupt =
+            std::env::temp_dir().join(format!("rustamp-corrupt-{}.toml", std::process::id()));
+        std::fs::write(&temp_corrupt, b"invalid toml garbage without version").unwrap();
+        let open_err =
+            ApprovalStore::open_or_empty(&temp_corrupt).expect_err("corrupt file must not load");
+        assert!(matches!(
+            open_err,
+            crate::approval::ApprovalStoreError::Malformed(_)
+        ));
+        let _ = std::fs::remove_file(&temp_corrupt);
+    }
+
+    #[test]
+    fn loader_with_empty_store_approves_nothing() {
+        use crate::approval::ApprovalStore;
+        let empty_store = ApprovalStore::new();
+        let bytes = test_dll(0x014c);
+        let fixture = Fixture::new(&bytes);
+
+        // SAFETY: candidate must fail approval before any execution.
+        let result =
+            unsafe { load_plugin_with_store(&fixture.0, &empty_store, &HostWindow::dummy()) };
+        assert!(matches!(result, Err(PluginLoadError::NotApproved)));
     }
 }

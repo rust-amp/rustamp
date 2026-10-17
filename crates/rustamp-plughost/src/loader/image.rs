@@ -28,6 +28,19 @@ impl PreparedImage {
         Ok(())
     }
 
+    pub fn require_store_approval(
+        &self,
+        store: &crate::approval::ApprovalStore,
+    ) -> Result<(), PluginLoadError> {
+        store
+            .check_approval(&self.bytes)
+            .map(|_| ())
+            .map_err(|err| match err {
+                crate::approval::ApprovalStoreError::NotApproved => PluginLoadError::NotApproved,
+                other => PluginLoadError::ApprovalStore(other),
+            })
+    }
+
     #[cfg(windows)]
     pub fn seal(&self) -> Result<SealedImage, PluginLoadError> {
         use std::io::{Read, Write};
