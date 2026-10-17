@@ -34,6 +34,26 @@
 //! the consumer drains on the first callback after the resume; that can drop
 //! the first block of new audio, which is the documented price of seeking while
 //! paused.
+//!
+//! # End-of-stream detection (F2 fix)
+//!
+//! The engine must finish a run only when the ring is truly empty — every frame
+//! the decode thread wrote has been consumed. Using the device clock
+//! (`played_frames`) for this is wrong: the clock advances for silence frames
+//! written during underruns, so it can run ahead of `written` and trigger a
+//! premature finish.
+//!
+//! Instead, the render callback maintains a consumer-side counter
+//! ([`RingSync::consumed`]) that counts only the frames it actually read from
+//! the ring. The engine's finish condition is then:
+//!
+//! ```text
+//! written == end_of_stream && consumed >= written
+//! ```
+//!
+//! On a seek-drain the counter is reset to `written` so that pre-seek frames
+//! are treated as consumed and the invariant `consumed <= written` holds for
+//! the new epoch.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, AtomicU64, Ordering};
@@ -95,6 +115,17 @@ pub struct RingSync {
     /// Absolute timeline position (device frames) the decode thread has written
     /// up to. The engine uses it to report how much audio is buffered.
     written: AtomicU64,
+    /// Absolute timeline position (device frames) that the render callback has
+    /// actually read out of the ring. Updated with `Relaxed` ordering on the
+    /// audio thread — no allocation, no lock, no logging. Silence frames
+    /// written during underruns are **not** counted here.
+    ///
+    /// Invariant (per epoch): `consumed <= written`.
+    ///
+    /// On a seek-drain the render callback resets this to the current value of
+    /// `written` so that pre-seek frames are treated as consumed and the
+    /// invariant holds for the new epoch.
+    consumed: AtomicU64,
 }
 
 impl RingSync {
@@ -111,6 +142,23 @@ impl RingSync {
     /// Absolute timeline position the decode thread has written up to.
     pub fn written(&self) -> u64 {
         self.written.load(Ordering::Acquire)
+    }
+
+    /// Store the running total of device frames actually read from the ring.
+    /// Called from the render callback (Relaxed, no allocation, lock or log)
+    /// and reset to 0 by the engine on start_run and stop.
+    pub fn set_consumed(&self, frames: u64) {
+        // Relaxed is sufficient: the render callback is the sole writer during
+        // playback; start_run and stop reset it when the stream is not running.
+        self.consumed.store(frames, Ordering::Relaxed);
+    }
+
+    /// Device frames the render callback has actually read from the ring (not
+    /// counting silence written during underruns). Safe to read from any
+    /// thread; the value may be stale by one callback when read off the audio
+    /// thread.
+    pub fn consumed(&self) -> u64 {
+        self.consumed.load(Ordering::Relaxed)
     }
 
     /// Ask the consumer to discard the ring; returns the new epoch.
@@ -173,6 +221,12 @@ fn wait_for(cell: &AtomicU64, epoch: u64) -> bool {
 /// The callback pulls from `consumer`, applies volume and balance and writes
 /// silence for whatever the ring could not supply. It allocates nothing, takes
 /// no lock, does no I/O and logs nothing.
+///
+/// After every callback the `consumed` counter in `sync` is updated with the
+/// number of device frames **actually read from the ring**. Silence frames
+/// produced during underruns are not counted. The engine uses this to detect
+/// when everything the decode thread wrote has been played, without relying on
+/// the device clock.
 pub fn make_render(
     mut consumer: Consumer<f32>,
     sync: Arc<RingSync>,
@@ -197,6 +251,11 @@ pub fn make_render(
                 }
             }
             served_epoch = epoch;
+            // Align `consumed` with `written` so that the pre-seek frames are
+            // treated as consumed and the invariant consumed <= written holds
+            // for the new epoch.
+            let written = sync.written();
+            sync.set_consumed(written);
             sync.drain_ack.store(epoch, Ordering::Release);
             out.fill(0.0);
             return;
@@ -223,6 +282,11 @@ pub fn make_render(
             written += n;
         }
         out[written..].fill(0.0);
+        // Count only the frames actually read from the ring. `written` here is
+        // in samples; divide by channels to get frames.
+        let frames_read = (written / usize::from(channels)) as u64;
+        let consumed = sync.consumed().saturating_add(frames_read);
+        sync.set_consumed(consumed);
         let (volume, balance) = gain.get();
         gain::apply(&mut out[..written], channels, volume, balance);
     })
@@ -296,5 +360,95 @@ mod tests {
         let sync = RingSync::new();
         let epoch = sync.request_epoch();
         assert!(!sync.wait_for_drain(epoch), "no consumer, no ack");
+    }
+
+    /// The consumed counter must track only ring frames, not silence frames.
+    #[test]
+    fn consumed_counts_ring_frames_not_silence() {
+        let (mut producer, consumer) = RingBuffer::<f32>::new(32);
+        let sync = Arc::new(RingSync::new());
+        let gain = Arc::new(GainState::new(255, 0));
+        let channels = 2u16;
+        let mut render = make_render(consumer, Arc::clone(&sync), Arc::clone(&gain), channels);
+
+        // Write 4 frames (8 samples for stereo) into the ring.
+        for i in 0..8 {
+            producer.push(i as f32).unwrap();
+        }
+        // Request a callback for 6 frames: 4 from the ring, 2 as silence.
+        render_into(&mut render, 6, channels, &mut Vec::new());
+
+        // consumed must be 4 (the ring frames), not 6 (total callback frames).
+        assert_eq!(
+            sync.consumed(),
+            4,
+            "silence frames must not count toward consumed"
+        );
+    }
+
+    /// After an epoch drain, consumed is reset to written so the invariant holds.
+    #[test]
+    fn consumed_resets_to_written_after_epoch_drain() {
+        let (mut producer, consumer) = RingBuffer::<f32>::new(32);
+        let sync = Arc::new(RingSync::new());
+        let gain = Arc::new(GainState::new(255, 0));
+        let mut render = make_render(consumer, Arc::clone(&sync), Arc::clone(&gain), 1);
+
+        // Simulate: decode thread wrote 10 frames.
+        sync.set_written(10);
+        for i in 0..10 {
+            producer.push(i as f32).unwrap();
+        }
+        // Consume 6 of them.
+        render_into(&mut render, 6, 1, &mut Vec::new());
+        assert_eq!(sync.consumed(), 6);
+
+        // Now a seek happens: decode thread bumps epoch and updates written.
+        sync.set_written(10); // still 10 before the seek position is published
+        let epoch = sync.request_epoch();
+        // The next render callback drains the remaining 4 frames.
+        render_into(&mut render, 4, 1, &mut Vec::new());
+        assert!(sync.drained(epoch));
+        // consumed must now equal written (10), not 6+4=10 by coincidence but
+        // because it was explicitly reset to written (which is 10 here anyway).
+        assert_eq!(
+            sync.consumed(),
+            sync.written(),
+            "consumed must equal written after epoch drain"
+        );
+    }
+
+    /// After a run ends and engine resets written and consumed to 0, the next
+    /// run's reads count from 0.
+    #[test]
+    fn consumed_resets_for_second_run() {
+        let (mut producer, consumer) = RingBuffer::<f32>::new(32);
+        let sync = Arc::new(RingSync::new());
+        let gain = Arc::new(GainState::new(255, 0));
+        let mut render = make_render(consumer, Arc::clone(&sync), Arc::clone(&gain), 1);
+
+        // First run writes and consumes 10 frames.
+        sync.set_written(10);
+        for i in 0..10 {
+            producer.push(i as f32).unwrap();
+        }
+        render_into(&mut render, 10, 1, &mut Vec::new());
+        assert_eq!(sync.consumed(), 10);
+
+        // Run ends; engine resets counters to 0 for a second run.
+        sync.set_written(0);
+        sync.set_consumed(0);
+
+        // Second run writes 5 frames.
+        sync.set_written(5);
+        for i in 0..5 {
+            producer.push(i as f32).unwrap();
+        }
+        render_into(&mut render, 5, 1, &mut Vec::new());
+        assert_eq!(
+            sync.consumed(),
+            5,
+            "consumed must start from 0 for the second run"
+        );
     }
 }

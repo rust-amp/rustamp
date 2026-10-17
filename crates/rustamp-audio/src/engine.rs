@@ -346,12 +346,16 @@ impl Engine {
         self.seekable
     }
 
-    /// Frames the decode thread has produced but the device has not played yet.
+    /// Frames the decode thread has produced but the render callback has not
+    /// yet read from the ring.
     ///
-    /// Zero during a decode stall (for example right after a seek): the engine
-    /// then writes silence, which is a normal underrun.
+    /// This is the true ring backlog: `written - consumed`. It is zero only
+    /// when every frame the decode thread produced has been consumed by the
+    /// render callback. During an underrun the device clock may run ahead of
+    /// `written`, but this value correctly stays at whatever is still in the
+    /// ring — it never saturates a real backlog to zero.
     pub fn buffered_frames(&self) -> u64 {
-        self.sync.written().saturating_sub(self.timeline_frames())
+        self.sync.written().saturating_sub(self.sync.consumed())
     }
 
     /// Absolute timeline position the decode thread reported as the end of the
@@ -545,6 +549,7 @@ impl Engine {
         self.start_at = None;
         self.end_of_stream = None;
         self.sync.set_written(0);
+        self.sync.set_consumed(0);
         self.bus
             .publish(Event::StateChanged(TransportState::Stopped));
         self.bus.publish(Event::PositionChanged {
@@ -713,12 +718,19 @@ impl Engine {
             }
             self.from_decode = Some(rx);
         }
-        // Everything the decode thread wrote has been played: finish the run.
-        if let Some(end) = self.end_of_stream
-            && self.timeline_frames() >= end
-            && self.transport == TransportState::Playing
-        {
-            self.finish_run();
+        // Finish the run only when the ring is truly empty: every frame the
+        // decode thread wrote has been consumed by the render callback. Using
+        // the device clock here is wrong — it advances for silence frames
+        // during underruns, which would trigger a premature finish. Using
+        // `consumed >= written` instead guarantees we wait until the last
+        // real audio frame leaves the ring, not merely until the device clock
+        // passes the nominal end time.
+        if let Some(end) = self.end_of_stream {
+            let written = self.sync.written();
+            let consumed = self.sync.consumed();
+            if written >= end && consumed >= written && self.transport == TransportState::Playing {
+                self.finish_run();
+            }
         }
         self.publish_position(false);
         Ok(())
@@ -804,18 +816,22 @@ impl Engine {
     }
 
     fn finish_run(&mut self) {
+        // Save end_of_stream before clearing it: that is the exact timeline
+        // position of the last frame the decode thread produced. The device
+        // clock (`timeline_frames()`) may be ahead of it when silence was
+        // played during underruns, so we must NOT freeze at timeline_frames().
+        let frozen_end = self.end_of_stream;
         self.end_of_stream = None;
         self.sync.set_active(false);
         let _ = self.output.pause();
         self.join_decode();
         self.transport = TransportState::Stopped;
-        // Keep the timeline at the final position so callers can report how
-        // much played. Freeze it by folding the elapsed device frames into the
-        // origin **before** re-basing the clock: re-basing alone would reset
-        // `timeline_frames()` to the origin (zero for a run without a seek),
-        // which would report a full track as unplayed — `position_frames()`
-        // back at 0 and `buffered_frames()` back at the whole stream.
-        self.timeline_origin = self.timeline_frames();
+        // Freeze the timeline at the content end, not at the device position.
+        // Re-basing the clock alone would reset `timeline_frames()` to the
+        // timeline_origin (zero for a run without a seek), which would report a
+        // full track as unplayed. Using the saved `end_of_stream` value ensures
+        // position_frames() lands exactly at the track boundary.
+        self.timeline_origin = frozen_end.unwrap_or_else(|| self.timeline_frames());
         self.clock_origin = self.output.played_frames();
         // track_start keeps its final value.
         self.bus
@@ -863,6 +879,10 @@ impl Engine {
         self.end_of_stream = None;
         self.pending_seek = None;
         self.sync.set_written(0);
+        // Reset the consumer-side counter alongside written so the invariant
+        // consumed <= written holds for the new run. The render callback will
+        // update it as it reads from the ring.
+        self.sync.set_consumed(0);
         let ring = self
             .producer
             .take()

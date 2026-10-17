@@ -828,8 +828,21 @@ fn timeline_does_not_dip_after_seek_before_play() {
 
 #[test]
 fn finish_run_frozes_at_content_end_not_device_position() {
-    // Finding F2: verify finish_run() freezes timeline at the decode-side
-    // end_of_stream, not at the (possibly larger) device position.
+    // Finding F2 — restated for the ring-drain fix.
+    //
+    // Previously the test just checked `position_frames() <= track_len`.
+    // That weak bound passed even with the old device-clock-based finish
+    // condition once we also fixed `finish_run` to freeze at `end_of_stream`.
+    //
+    // New expectation (stronger): after the run ends,
+    //   position_frames() == track_len      (frozen exactly at content end)
+    //   buffered_frames() == 0              (ring is empty)
+    //   transport         == Stopped
+    //
+    // The test still pumps past the track length to create an underrun
+    // scenario (device plays silence). The run must NOT finish until the
+    // ring is truly drained (consumed >= written), but it must also not
+    // stall forever: wait_until pumps in steps and polls between them.
     let mut h = Harness::new(&[TRACK_A]);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
@@ -839,14 +852,12 @@ fn finish_run_frozes_at_content_end_not_device_position() {
     // Wait for the decode thread to buffer everything.
     assert!(h.wait_buffered(), "track must be buffered");
 
-    // Pump past the track length so the device catches up and plays
-    // silence (underrun). We advance far enough that the device position
-    // exceeds the content length.
+    // Pump past the track length so the device plays silence (underrun).
     let extra = 1024;
     h.clock.pump(track_len + extra);
     h.engine.poll().unwrap();
 
-    // The decode thread should have finished and signaled EndOfStream.
+    // The run must end, but only once the ring is actually drained.
     assert!(
         h.wait_until(
             |e| e.transport() == TransportState::Stopped,
@@ -855,18 +866,242 @@ fn finish_run_frozes_at_content_end_not_device_position() {
         "run must have ended"
     );
 
-    // position_frames() must NOT exceed the track length.
-    assert!(
-        h.engine.position_frames() <= track_len,
-        "position must not exceed track length; got {} (track = {})",
+    // The timeline must be frozen exactly at the content end (end_of_stream),
+    // not at the device position (which ran further with silence).
+    assert_eq!(
+        h.engine.position_frames(),
+        track_len,
+        "position must equal track length after the run; got {} (track = {})",
         h.engine.position_frames(),
         track_len
     );
 
-    // buffered_frames() must be 0 after the run ends.
+    // The ring must be fully drained.
     assert_eq!(
         h.engine.buffered_frames(),
         0,
         "buffered must be 0 after run ends"
     );
+}
+
+/// Underrun scenario: the device clock runs ahead of the decode thread's
+/// writes (underrun). The run must NOT finish early while real audio is still
+/// in the ring, and `buffered_frames()` must reflect the true backlog.
+#[test]
+fn underrun_does_not_finish_run_early() {
+    let mut h = Harness::new(&[TRACK_A]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    let track_len = track_frames(TRACK_A); // 3000 frames
+
+    // Pump immediately before decode has buffered the whole track.
+    // This creates an underrun: the device pulls 2000 frames, but only a small
+    // initial chunk (~1024 frames) is in the ring. The rest is filled with silence.
+    // Device clock advances by 2000 frames, but consumed only counts real audio.
+    h.clock.pump(2000);
+    h.engine.poll().unwrap();
+    assert_eq!(
+        h.engine.transport(),
+        TransportState::Playing,
+        "run must still be playing after first pump"
+    );
+
+    // Wait until decode thread has written the entire track and signaled EndOfStream.
+    assert!(h.wait_buffered(), "track must be fully buffered");
+
+    // Pump another 1500 frames. Total device clock pumped: 2000 + 1500 = 3500 frames.
+    // Notice 3500 > 3000 (track_len)! The device clock has run past end_of_stream.
+    // Under the old bug (device clock >= end_of_stream), this would have finished
+    // the run prematurely and dropped the remaining audio from the ring.
+    h.clock.pump(1500);
+    h.engine.poll().unwrap();
+
+    // Invariant: real audio is still in the ring (at least 476 frames).
+    // The engine must NOT finish early, and buffered_frames() must report
+    // the honest backlog (written - consumed), not saturating to zero.
+    assert!(
+        h.engine.buffered_frames() > 0,
+        "ring must still hold real audio; got {}",
+        h.engine.buffered_frames()
+    );
+    assert_eq!(
+        h.engine.transport(),
+        TransportState::Playing,
+        "run must not finish early while audio remains in the ring"
+    );
+
+    // Pump the remaining audio to completion.
+    assert!(
+        h.wait_until(
+            |e| e.transport() == TransportState::Stopped,
+            track_len + 8192
+        ),
+        "the run must complete naturally once ring is drained"
+    );
+    assert_eq!(
+        h.engine.position_frames(),
+        track_len,
+        "position must equal track_len after completion"
+    );
+    assert_eq!(
+        h.engine.buffered_frames(),
+        0,
+        "ring must be empty after run"
+    );
+}
+
+/// Normal drain: the run finishes exactly when the ring is empty, the position
+/// lands at the end and `buffered_frames()` is zero.
+#[test]
+fn normal_run_finishes_when_ring_is_drained() {
+    let mut h = Harness::new(&[TRACK_A]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    let track_len = track_frames(TRACK_A);
+
+    // Wait until the whole track is in the ring.
+    assert!(h.wait_buffered(), "track must be fully buffered");
+
+    // At this point written == track_len and consumed == 0 (nothing pumped).
+    assert_eq!(
+        h.engine.buffered_frames(),
+        track_len,
+        "whole track must be in the ring before we start pumping"
+    );
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+
+    // Drive the engine to completion with controlled pumping.
+    assert!(
+        h.wait_until(
+            |e| e.transport() == TransportState::Stopped,
+            track_len + 8192
+        ),
+        "run must finish within the track length"
+    );
+
+    // The ring must be empty.
+    assert_eq!(
+        h.engine.buffered_frames(),
+        0,
+        "ring must be empty when the run ends"
+    );
+    // The position must be exactly at the track end.
+    assert_eq!(
+        h.engine.position_frames(),
+        track_len,
+        "position must be at track end when run finishes"
+    );
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+}
+
+/// After a seek while paused, the ring is drained by the handshake and the
+/// `consumed` counter is reset to `written` so `buffered_frames()` stays
+/// consistent (no stale backlog reported).
+#[test]
+fn seek_while_paused_drains_consistently() {
+    let mut h = Harness::new(&[LONG_A]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    // Let the decode thread buffer some frames, then pause.
+    h.clock.pump(512);
+    h.engine.poll().unwrap();
+    h.engine.pause().unwrap();
+    assert_eq!(h.engine.transport(), TransportState::Paused);
+
+    // Wait for some buffering in the paused state.
+    std::thread::sleep(Duration::from_millis(50));
+    h.engine.poll().unwrap();
+
+    // Issue a seek. While paused the drain happens on the first callback after
+    // resume (documented behaviour); the consumed counter will be reset then.
+    h.engine.seek_frames(1000).unwrap();
+
+    // Resume so the drain callback can fire.
+    h.engine.play().unwrap();
+
+    // Settle the seek (pumps until position == 1000).
+    assert!(
+        h.settle_seek(1000),
+        "seek must settle on frame 1000; got {}",
+        h.engine.position_frames()
+    );
+
+    // After the seek drains, buffered_frames() must not report a stale pre-seek
+    // backlog. It may be non-zero (post-seek frames already written) but must
+    // not exceed what the decode thread has since written.
+    h.engine.poll().unwrap();
+    // end_of_stream is None while the run is live; check written via
+    // buffered_frames() being sane.
+    let written = h.engine.end_of_stream().unwrap_or(0);
+    let _ = written; // used only to document intent
+
+    // The key invariant: buffered_frames() == written - consumed.
+    // After a seek-drain the render callback aligns consumed to written,
+    // so buffered_frames() reflects only post-seek frames.
+    // We can't easily measure the exact value headlessly, but we can assert
+    // it is not wildly large (no stale pre-seek backlog leaking through).
+    let track_len = track_frames(LONG_A);
+    assert!(
+        h.engine.buffered_frames() <= track_len,
+        "buffered_frames must not exceed the total track length after a seek; got {}",
+        h.engine.buffered_frames()
+    );
+    assert_eq!(
+        h.engine.transport(),
+        TransportState::Playing,
+        "transport must still be Playing after the seek"
+    );
+}
+
+/// Consecutive runs: after a track finishes and a second run is started with
+/// `play_index()`, the consumed counter must reset to 0 alongside written so
+/// the second run buffers and drains completely without finishing early.
+#[test]
+fn second_run_resets_consumed_and_drains_correctly() {
+    let mut h = Harness::new(&[TRACK_A]);
+    let track_len = track_frames(TRACK_A);
+
+    // First run: play to completion.
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    assert!(h.wait_buffered());
+    assert!(
+        h.wait_until(
+            |e| e.transport() == TransportState::Stopped,
+            track_len + 8192
+        ),
+        "first run must complete"
+    );
+    assert_eq!(h.engine.buffered_frames(), 0);
+    assert_eq!(h.engine.position_frames(), track_len);
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+
+    // Second run: play the same track again.
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0), "track must open for second run");
+    assert!(h.wait_buffered(), "second run must buffer");
+
+    // Before pumping any frames for the second run, buffered_frames() must report
+    // the whole track length (written = track_len, consumed = 0), NOT 0 from stale state!
+    assert_eq!(
+        h.engine.buffered_frames(),
+        track_len,
+        "second run must start with full track buffered"
+    );
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+
+    // Drive second run to completion.
+    assert!(
+        h.wait_until(
+            |e| e.transport() == TransportState::Stopped,
+            track_len + 8192
+        ),
+        "second run must complete naturally"
+    );
+    assert_eq!(h.engine.buffered_frames(), 0);
+    assert_eq!(h.engine.position_frames(), track_len);
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
 }
