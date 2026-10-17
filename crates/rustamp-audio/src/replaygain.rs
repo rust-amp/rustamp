@@ -31,15 +31,14 @@
 //!   multiplier is a per-track decode-side constant, read once per track
 //!   from the decoder's metadata.
 //!
-//! # Reading the tags without a new dependency
+//! # Reading the tags
 //!
-//! The tag keys and their `extra` encoding are defined by `rustamp-meta`
+//! The tag keys and their `extra` encoding are owned by `rustamp-meta`
 //! (`replaygain.rs`: `REPLAYGAIN_TRACK_GAIN` etc., gains as `"+6.02 dB"`,
-//! peaks linear). This crate does not depend on `rustamp-meta`, so the two
-//! key names this module consumes and the gain-string parsing are mirrored
-//! here with identical semantics (same key spelling, same optional `dB`
-//! suffix, same finite-number rule). If the metadata encoding ever changes,
-//! this mirror must change with it; the unit tests pin the parsing.
+//! peaks linear). This crate consumes that crate's constants and
+//! [`rustamp_meta::replaygain::parse_gain_db`] directly, so there is a single
+//! source of truth for the key spellings and the gain-string parsing. If the
+//! metadata encoding ever changes, this module follows it automatically.
 //!
 //! # Policy (own choices, stated plainly)
 //!
@@ -71,14 +70,16 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-/// The `extra` key holding the track gain, e.g. `"-3.50 dB"`.
-///
-/// Mirrors `rustamp_meta::replaygain::TRACK_GAIN_KEY`; see the module docs.
-pub const TRACK_GAIN_KEY: &str = "REPLAYGAIN_TRACK_GAIN";
 /// The `extra` key holding the album gain, e.g. `"-5.10 dB"`.
 ///
-/// Mirrors `rustamp_meta::replaygain::ALBUM_GAIN_KEY`; see the module docs.
-pub const ALBUM_GAIN_KEY: &str = "REPLAYGAIN_ALBUM_GAIN";
+/// Re-exported from `rustamp_meta::replaygain::ALBUM_GAIN_KEY`: there is a
+/// single owner of the key spelling.
+pub use rustamp_meta::replaygain::ALBUM_GAIN_KEY;
+/// The `extra` key holding the track gain, e.g. `"-3.50 dB"`.
+///
+/// Re-exported from `rustamp_meta::replaygain::TRACK_GAIN_KEY`: there is a
+/// single owner of the key spelling.
+pub use rustamp_meta::replaygain::TRACK_GAIN_KEY;
 
 /// Own choice: the estimator in `rustamp-meta` never suggests more than
 /// ±51 dB, and this side never applies more than that either. Real
@@ -192,15 +193,10 @@ impl ReplayGainControl {
 }
 
 /// Parses a gain tag such as `"-3.50 dB"`, `"+6.02dB"` or bare `"6"` into
-/// dB. Mirrors `rustamp_meta::replaygain::parse_gain_db`: the trailing
+/// dB. Re-exported from `rustamp_meta::replaygain::parse_gain_db`: the trailing
 /// `dB` (any ASCII case) is optional, surrounding whitespace is ignored,
 /// and anything that is not a finite number is `None`.
-pub fn parse_gain_db(text: &str) -> Option<f32> {
-    let upper = text.trim().to_ascii_uppercase();
-    let digits = upper.strip_suffix("DB").unwrap_or(&upper);
-    let value: f32 = digits.trim().parse().ok()?;
-    value.is_finite().then_some(value)
-}
+pub use rustamp_meta::replaygain::parse_gain_db;
 
 /// Selects the gain in dB for `mode` from a track's `extra` tags.
 ///
@@ -209,12 +205,13 @@ pub fn parse_gain_db(text: &str) -> Option<f32> {
 /// not parse is not a value, as in `rustamp-meta`). `Disabled` and "no
 /// usable tag" both select nothing.
 pub fn select_gain_db(extra: &BTreeMap<String, String>, mode: ReplayGainMode) -> Option<f32> {
-    let track = extra
-        .get(TRACK_GAIN_KEY)
-        .and_then(|text| parse_gain_db(text));
-    let album = extra
-        .get(ALBUM_GAIN_KEY)
-        .and_then(|text| parse_gain_db(text));
+    // Delegate to the metadata crate's reader, so the key spellings and the
+    // gain-string parsing live in one place.
+    let mut metadata = rustamp_core::meta::TrackMetadata::default();
+    metadata.extra = extra.clone();
+    let tags = rustamp_meta::replaygain::ReplayGainTags::from_metadata(&metadata);
+    let track = tags.track_gain_db;
+    let album = tags.album_gain_db;
     match mode {
         ReplayGainMode::Disabled => None,
         ReplayGainMode::Track => track.or(album),
