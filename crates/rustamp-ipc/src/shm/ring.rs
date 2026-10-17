@@ -1787,7 +1787,9 @@ mod tests {
         let (mut producer, mut consumer) = pcm_ring_with_wake(1, 2);
 
         // Fill the ring (capacity 1).
-        producer.write_from_blocking(&[0.0f32, 0.0], TEST_WAIT).unwrap();
+        producer
+            .write_from_blocking(&[0.0f32, 0.0], TEST_WAIT)
+            .unwrap();
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
