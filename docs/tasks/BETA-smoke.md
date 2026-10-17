@@ -68,7 +68,7 @@ warns rather than fails.
 
 ## What the first real runs found (why the runner exists)
 
-Three defects in three runs, each found by running, not by reading: (1) the
+Four defects in four runs, each found by running, not by reading: (1) the
 `package` audit refused an incomplete build (a missing load-bearing binary —
 the check working as designed, no script change); (2) the guest script called
 `Invoke-CimMethod -GetOwner`, a parameter that does not exist — fixed to
@@ -83,7 +83,13 @@ the explorer-owned session (fallback: the Active `query session` console
 row), register a one-shot Scheduled Task as that user with `LogonType
 Interactive` / `RunLevel Limited` (console desktop, no UAC question),
 `Start-ScheduledTask` now, wait on the `done.json` sentinel with a bound,
-unregister, then refuse session 0 / a mismatch loudly.
+unregister, then refuse session 0 / a mismatch loudly.; (4) the fifth run
+failed on a path policy: the broker refused a copyin with `access to the
+path "rustamp-plughost32.exe" was denied`. The smokerunner handed the broker
+a relative path (or a bare file name), while the broker only accepts
+copyin sources from the staging root it owns. Fixed by staging with an
+explicit absolute path under the staging root, mirroring the working test
+runner.
 
 ## What it still does not prove
 

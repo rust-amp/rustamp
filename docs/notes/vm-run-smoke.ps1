@@ -115,6 +115,8 @@ if (-not (Test-Path $fixtureSrc)) { Fail 'stage' "fixture missing (not committed
 # existing runners' test binaries); the packaged player and host are
 # static-CRT (X1) and need nothing.
 Step 'staging the packaged bytes (verbatim copies, no rebuild)'
+# Mirror the test runner: use an absolute path under the broker's staging root
+# so the broker's copyin rule (StartsWith check) always passes.
 $Stage = Join-Path $StageRoot 'smoke'
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'player')
