@@ -71,7 +71,7 @@ impl fmt::Display for PePreflightError {
                 )
             }
             Self::MissingSupportedExport => f.write_str(
-                "plugin DLL exports neither winampGetInModule2 nor winampGetGeneralPurposePlugin",
+                "plugin DLL exports neither winampGetInModule2, winampDSPGetHeader2 nor winampGetGeneralPurposePlugin",
             ),
         }
     }
@@ -242,6 +242,7 @@ pub fn check_pe_i386_dll(image: &[u8]) -> Result<PluginKind, PePreflightError> {
         }
         let kind = match name {
             b"winampGetInModule2" => Some(PluginKind::Input),
+            b"winampDSPGetHeader2" => Some(PluginKind::Dsp),
             b"winampGetGeneralPurposePlugin" => Some(PluginKind::General),
             _ => None,
         };
@@ -251,7 +252,7 @@ pub fn check_pe_i386_dll(image: &[u8]) -> Result<PluginKind, PePreflightError> {
                 return Err(invalid("forwarded plugin getters are not supported"));
             }
             executable_rva(image, &sections, function)?;
-            // Preserve the existing input-before-general selection policy.
+            // Preserve the existing input-before-general/DSP selection policy.
             if selected != Some(PluginKind::Input) {
                 selected = Some(kind);
             }
@@ -402,6 +403,9 @@ mod tests {
         let name = b"winampGetGeneralPurposePlugin\0";
         image[0x260..0x260 + name.len()].copy_from_slice(name);
         assert_eq!(check_pe_i386_dll(&image), Ok(PluginKind::General));
+        let name = b"winampDSPGetHeader2\0";
+        image[0x260..0x260 + name.len()].copy_from_slice(name);
+        assert_eq!(check_pe_i386_dll(&image), Ok(PluginKind::Dsp));
     }
 
     #[test]
