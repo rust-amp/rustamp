@@ -61,3 +61,13 @@ audit-grade verification. Nothing that a free lane can do just as well.
 - The lane's report is a claim. Verify the artefacts in **both** the worktree
   and the canonical tree, run `fmt`/`clippy`, then the VM suite, then merge.
 - Record which task ran and what it found here (append, do not rewrite).
+
+## Run log
+
+- **2026-10-17 07:57 (first window after the 02:46 reset).** Items 1, 3 and 4
+  were already in flight elsewhere (M3h Group C in `rustamp-plughost`, the
+  lifecycle re-audit in `rustamp-audio`, and the DSP quality task handed to
+  Claude Code), so the window went to a new, collision-free task: **the
+  licensing-readiness audit** (`wave37-license-audit`, `openai/gpt-6.1-sol`
+  high) — exactly the machinery the new "prefer a maintained crate" rule now
+  depends on. Model used: `openai/gpt-6.1-sol#high`.
