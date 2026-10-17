@@ -15,7 +15,8 @@ slots looked busy.
 | job id | lane | started | task |
 |---|---|---|---|
 | `1792274442307450400-329938ab501dad8db908a2b4` | `wave67-ui-red` | 2026-10-18 00:00 | the UI crate's two red tests |
-| `1792274442306928100-9c8a00d833b8690704d227b9` | `wave67-config-class` | 2026-10-18 00:00 | the writer/loader drift as a class (N8 found the second instance) |
+| `1792274442307450400-329938ab501dad8db908a2b4` | `wave67-ui-red` | 2026-10-18 00:00 | the UI crate two red tests (0 changes after 20 min: watch it) |
+| `1792275634915581300-a67b54f150d0c18d3e9cd062` | `wave67-wave-review` | 2026-10-18 00:20 | adversarial review of tonight's wave (W14) |
 
 Running elsewhere (they notify, no ids needed here): `wave65-wake-honest` on
 Mistral (the wake-timeout claim).
@@ -34,6 +35,8 @@ Mistral (the wake-timeout claim).
 | `wave66-dsp-red` | the DSP crate's last red (`9bf50cc`) |
 | `wave66-approval-store` | the loader's approval store (P7, `e8134cf`) |
 | `wave66-ignored-staging` | staging for the ignored tests (X4, `2ebaaf0`) |
+| `wave67-config-class` | the configuration writer drift as a class (N9, `99b2cb3`) |
+| `wave65-wake-honest` | the wake-timeout claim made honest by measurement (G5, `0f12340`) |
 
 ## Failed, relaunched elsewhere
 
