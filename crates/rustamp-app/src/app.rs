@@ -549,6 +549,16 @@ impl App {
         self.easy_move
     }
 
+    /// Whether a left press at main-window-relative `(x, y)` should move the
+    /// window instead of reaching a control: easy-move is on — the core
+    /// contract's "drag windows from anywhere" (`UiConfig::easy_move`) — and
+    /// the press hit no widget, so no control owns it. Sliders, the marquee
+    /// hand-scroll, buttons and held states all hit-test to a widget and keep
+    /// their presses; a background press reaches nothing and drags.
+    pub fn easy_drag_main(&self, x: i32, y: i32) -> bool {
+        self.easy_move && rustamp_ui::hit_test(&self.layout, x, y).is_none()
+    }
+
     /// The path of the current skin, when it came from disk.
     pub fn current_skin(&self) -> Option<&PathBuf> {
         self.current_skin.as_ref()
@@ -2991,6 +3001,35 @@ mod tests {
         assert!(!app.quit(), "closing a dialog must not quit the app");
     }
 
+    #[test]
+    fn easy_move_decides_which_presses_drag_the_window() {
+        // The easy-move contract (W10 finding F5): the setting is honoured by
+        // the main-window drag decision, not only carried. A press no control
+        // owns drags exactly while easy-move is on; a press on a widget
+        // always reaches the control machine.
+        let (mut app, _dir) = app_with_file(None);
+        assert!(app.easy_move(), "the default config has easy-move on");
+
+        // (5, 100) is background: outside every widget rect, so the control
+        // machine ignores the press and the setting decides.
+        assert!(
+            app.mouse_down(5, 100).unwrap().is_empty(),
+            "the background press must own nothing"
+        );
+        assert!(app.easy_drag_main(5, 100));
+
+        // A control keeps its press whatever the setting says.
+        let (x, y) = widget_centre(Widget::Play);
+        assert!(!app.easy_drag_main(x, y));
+
+        // With easy-move off (menu toggle, shortcut Ctrl+E per S03) nothing
+        // drags: the OS chrome stays the only move path.
+        app.submit(Command::ToggleEasyMove).unwrap();
+        assert!(!app.easy_move());
+        assert!(!app.easy_drag_main(5, 100));
+        assert!(!app.easy_drag_main(x, y));
+    }
+
     // ----- Headless tests for GUI-driven playback chains (task card N3) -----
 
     #[test]
@@ -3618,7 +3657,7 @@ mod tests {
         assert!(!report.is_clean());
         assert_eq!(report.entries.len(), 2);
         assert_eq!(report.skip_count(), 1);
-        assert!(report.skips[0].reason().contains("dangling EXTINF"));
+        assert!(report.skips[0].reason().contains("dangling #EXTINF"));
 
         let notes = app.drain_notes();
         assert!(
@@ -3628,7 +3667,9 @@ mod tests {
             "notes: {notes:?}"
         );
         assert!(
-            notes.iter().any(|n| n.contains("skipped: dangling EXTINF")),
+            notes
+                .iter()
+                .any(|n| n.contains("skipped: dangling #EXTINF")),
             "notes: {notes:?}"
         );
     }

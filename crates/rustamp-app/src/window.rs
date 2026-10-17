@@ -1273,6 +1273,24 @@ impl Windowed {
             _ => {}
         }
     }
+
+    /// Starts an OS window drag for a background press when easy-move is on
+    /// ([`App::easy_drag_main`]). Returns whether the press was consumed by
+    /// the drag, so the control path is skipped; a failed drag falls through
+    /// to the controls so the press is never swallowed. Only the VM can prove
+    /// it (no window may open here); the decision itself is headless-tested
+    /// on [`App::easy_drag_main`].
+    fn try_easy_drag(&mut self, x: i32, y: i32) -> Option<()> {
+        if !self.app.easy_drag_main(x, y) {
+            return None;
+        }
+        let window = self.window.as_ref()?;
+        if let Err(error) = window.drag_window() {
+            eprintln!("rustamp: easy-move drag failed: {error}");
+            return None;
+        }
+        Some(())
+    }
 }
 
 impl ApplicationHandler for Windowed {
@@ -1441,7 +1459,12 @@ impl ApplicationHandler for Windowed {
                 let result = match state {
                     ElementState::Pressed => {
                         self.left_down = true;
-                        self.app.mouse_down(x, y)
+                        // Easy-move (W10 finding F5): a press no control owns
+                        // moves the window instead of reaching the machine.
+                        match self.try_easy_drag(x, y) {
+                            Some(()) => Ok(Vec::new()),
+                            None => self.app.mouse_down(x, y),
+                        }
                     }
                     ElementState::Released => {
                         self.left_down = false;

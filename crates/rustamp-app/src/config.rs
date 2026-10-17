@@ -306,6 +306,16 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
             win_table.insert("y".into(), toml::Value::Integer(i64::from(w.y)));
             win_table.insert("visible".into(), toml::Value::Boolean(w.visible));
             win_table.insert("shaded".into(), toml::Value::Boolean(w.shaded));
+            // Sizes round-trip like the id (W10 finding F1 applied to the
+            // size fields): the loader reads them through serde, so a file
+            // that drops them cannot load back what was saved. `None` stays
+            // omitted, so the standard windows write exactly what they did.
+            if let Some(width) = w.width {
+                win_table.insert("width".into(), toml::Value::Integer(i64::from(width)));
+            }
+            if let Some(height) = w.height {
+                win_table.insert("height".into(), toml::Value::Integer(i64::from(height)));
+            }
             windows_array.push(toml::Value::Table(win_table));
         }
         ui.insert("windows".into(), toml::Value::Array(windows_array));
