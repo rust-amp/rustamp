@@ -321,6 +321,38 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## Rustamp 0.1.0 is tagged (2026-10-18 23:55)
+
+The release is complete except for the push, which cannot proceed: **the
+repository has no remote configured** and `main` has no upstream, so `git push`
+fails with "Could not read from remote repository". The tag `0.1.0` exists
+locally on `9cc8402`, a commit whose code is identical to the package commit
+`f38ad02` - the only difference is the release notes, verified with
+`git diff --stat`.
+
+**Everything the checklist could run, passed:**
+
+| Step | Result |
+|---|---|
+| 3 licence audit | clean |
+| 4 suite, interactive | **84 / 0 / 0** |
+| 5 ignored pass, interactive | **82 / 0 / 0** |
+| 5 E real audio endpoint | **2 / 2 pass** - the cable carries the fixture tone |
+| 8, 9, 11 package | built, re-audited, hashed |
+| 10 PE imports | system DLLs only, no CRT payload |
+| 12 packaged smoke | **pass** - window at client 275x116, bundled host child, every file byte-identical afterwards |
+| 13 clean machine | **not performed**, and named as skipped in the notes |
+| 14 signing | skipped by owner decision |
+| 16 release notes | `docs/RELEASE-NOTES-0.1.0.md` |
+| 17 tag | `0.1.0` on `9cc8402` |
+
+The artefact is `v0.1.0-f38ad02.zip`, 12 461 833 bytes, with a SHA-256 file
+beside it, release ID `rustamp-0.1.0+2026-10-18.f38ad02`.
+
+**What the owner still has to provide:** the remote URL and the access method
+that works on this host, or a decision to create the repository. Until then the
+release state is complete and reproducible locally.
+
 ## The audio prerequisite is now a named baseline (2026-10-18 22:45)
 
 The virtual cable is installed in the guest and verified, and it is now captured
