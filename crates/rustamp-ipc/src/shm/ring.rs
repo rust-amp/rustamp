@@ -8,6 +8,26 @@
 //! Raw pointers are used in exactly two ways: dereferencing the header pointer
 //! for whole-atomic accesses, and copying slot bytes. Both are confined to the
 //! private helpers at the top of this module; the public API is safe.
+//!
+//! # The signalling rule (RFC 0007 §6.2, as corrected on 2026-10-18)
+//!
+//! On a wake ring, **every** advance of a counter signals the matching event:
+//! the producer signals `Wake::Data` after each `write_seq` store, the consumer
+//! signals `Wake::Space` after each `read_seq` store, and `close()` signals
+//! both after the `state` store. The only guard is that this side's store
+//! actually happened — a call that accepted or read zero frames changed
+//! nothing and signals nothing.
+//!
+//! RFC 0007 §6.2 used to recommend an edge: signal only when the write started
+//! from an empty ring, or the read from a full one. That refinement is
+//! withdrawn, because each side had to decide its edge from the counter the
+//! *peer* owns, loaded before the operation and never ordered after the peer's
+//! last store to it. A plain interleaving then lets both sides evaluate a stale
+//! edge, neither signals, and both ends sleep on a ring that is neither closed
+//! nor failed — the stall diagnosed in `docs/tasks/W19-twoproc-stall.md` §1 and
+//! fixed here (`docs/tasks/W19-ring-wake-root.md`). The RFC's own escape clause
+//! is this rule: unconditional signalling "costs one extra `SetEvent` per
+//! advance and is always correct".
 
 use core::sync::atomic::Ordering;
 use std::time::Duration;
@@ -413,8 +433,9 @@ impl<R: MappedRegion> RingProducer<R> {
     /// frames were accepted. Never blocks, never allocates, never overwrites
     /// unread data.
     ///
-    /// On a wake ring, signals `Wake::Data` when the write started from empty
-    /// (RFC 0007 §6.2), so a blocked consumer is woken.
+    /// On a wake ring, signals `Wake::Data` after **every** write that advanced
+    /// `write_seq`, so a blocked consumer is woken (RFC 0007 §6.2 as corrected
+    /// on 2026-10-18; see the signalling rule in the module docs).
     pub fn write_from(&mut self, samples: &[f32]) -> Result<usize, RingError> {
         self.require_kind(RingKind::Pcm)?;
         self.require_live()?;
@@ -437,13 +458,15 @@ impl<R: MappedRegion> RingProducer<R> {
         let free = u64::from(self.meta.capacity).saturating_sub(occupancy);
         let accepted = (offered as u64).min(free) as usize;
         let dropped = offered - accepted;
-        // A write that started from empty makes the ring newly readable.
-        let was_empty = occupancy == 0;
 
         if accepted > 0 {
             self.copy_into_slots(write_seq, samples.as_ptr(), accepted);
             self.store_write_seq(write_seq + accepted as u64);
-            if was_empty && let Some(wake) = &self.wake {
+            // Every advance signals (module docs). The withdrawn `was_empty`
+            // edge was read off `read_seq`, which the consumer owns, so it
+            // could be stale and the signal lost. `accepted > 0` survives as
+            // a guard because it is a fact about this side's own store.
+            if let Some(wake) = &self.wake {
                 let _ = wake.signal(Wake::Data);
             }
         }
@@ -459,8 +482,8 @@ impl<R: MappedRegion> RingProducer<R> {
     /// `true` when the slot was accepted, `false` when the ring was full (one
     /// drop is counted). Never blocks and never overwrites unread data.
     ///
-    /// On a wake ring, signals `Wake::Data` when the write started from empty
-    /// (RFC 0007 §6.2).
+    /// On a wake ring, signals `Wake::Data` after every accepted slot
+    /// (RFC 0007 §6.2 as corrected; see the signalling rule in the module docs).
     pub fn write_slot(&mut self, slot: &VisSlot) -> Result<bool, RingError> {
         self.require_kind(RingKind::Vis)?;
         self.require_live()?;
@@ -469,7 +492,6 @@ impl<R: MappedRegion> RingProducer<R> {
         let dropped_seq = self.dropped_seq(Ordering::Relaxed);
         let read_seq = self.read_seq(Ordering::Acquire);
         let occupancy = write_seq.wrapping_sub(read_seq);
-        let was_empty = occupancy == 0;
         if occupancy >= u64::from(self.meta.capacity) {
             self.store_dropped_seq(dropped_seq + 1);
             return Ok(false);
@@ -486,7 +508,9 @@ impl<R: MappedRegion> RingProducer<R> {
             (*target).seq = write_seq.wrapping_add(dropped_seq);
         };
         self.store_write_seq(write_seq + 1);
-        if was_empty && let Some(wake) = &self.wake {
+        // Every advance signals (module docs); the slot was accepted, so this
+        // side did store.
+        if let Some(wake) = &self.wake {
             let _ = wake.signal(Wake::Data);
         }
         Ok(true)
@@ -563,13 +587,12 @@ impl<R: MappedRegion> RingProducer<R> {
             let occupancy = write_seq.wrapping_sub(read_seq);
             let free = u64::from(self.meta.capacity).saturating_sub(occupancy);
             if free > 0 {
+                // `offered > 0` and `free > 0`, so this branch always stores.
                 let accepted = (offered as u64).min(free) as usize;
-                let was_empty = occupancy == 0;
                 self.copy_into_slots(write_seq, samples.as_ptr(), accepted);
                 self.store_write_seq(write_seq + accepted as u64);
-                if was_empty {
-                    let _ = wake.signal(Wake::Data);
-                }
+                // Every advance signals (module docs).
+                let _ = wake.signal(Wake::Data);
                 return Ok(accepted);
             }
             match wake.wait(Wake::Space, timeout)? {
@@ -793,8 +816,9 @@ impl<R: MappedRegion> RingConsumer<R> {
     /// `min(want, available)` whole frames, returns how many were read and never
     /// blocks. `Ok(0)` means "nothing available yet", not an error.
     ///
-    /// On a wake ring, signals `Wake::Space` when the read started from a full
-    /// ring (RFC 0007 §6.2), so a blocked producer is woken.
+    /// On a wake ring, signals `Wake::Space` after **every** read that advanced
+    /// `read_seq`, so a blocked producer is woken (RFC 0007 §6.2 as corrected
+    /// on 2026-10-18; see the signalling rule in the module docs).
     pub fn read_into(&mut self, out: &mut [f32]) -> Result<usize, RingError> {
         self.require_kind(RingKind::Pcm)?;
         let samples_per_frame = (self.meta.frame_size / 4) as usize;
@@ -816,12 +840,14 @@ impl<R: MappedRegion> RingConsumer<R> {
         if count == 0 {
             return Ok(0);
         }
-        // A read from a full ring frees slots for the producer.
-        let was_full = available == u64::from(self.meta.capacity);
 
         self.copy_out_of_slots(read_seq, out.as_mut_ptr(), count);
         self.store_read_seq(read_seq + count as u64);
-        if was_full && let Some(wake) = &self.wake {
+        // Every advance signals (module docs). The withdrawn `was_full` edge
+        // was read off `write_seq`, which the producer owns, so it could be
+        // stale and the signal lost. `count > 0` survives as a guard because
+        // it is a fact about this side's own store.
+        if let Some(wake) = &self.wake {
             let _ = wake.signal(Wake::Space);
         }
         Ok(count)
@@ -834,8 +860,8 @@ impl<R: MappedRegion> RingConsumer<R> {
     /// never delivered as data (RFC 0003 section 7). The slot's `seq` lets the
     /// caller detect frames skipped since the previous read.
     ///
-    /// On a wake ring, signals `Wake::Space` when the read started from a full
-    /// ring (RFC 0007 §6.2).
+    /// On a wake ring, signals `Wake::Space` after every delivered slot
+    /// (RFC 0007 §6.2 as corrected; see the signalling rule in the module docs).
     pub fn read_slot_into(&mut self, out: &mut VisSlot) -> Result<bool, RingError> {
         self.require_kind(RingKind::Vis)?;
 
@@ -845,8 +871,6 @@ impl<R: MappedRegion> RingConsumer<R> {
         if available == 0 {
             return Ok(false);
         }
-        // A read from a full ring frees a slot for the producer.
-        let was_full = available == u64::from(self.meta.capacity);
 
         let slot_index = (read_seq % u64::from(self.meta.capacity)) as usize;
         // SAFETY: the slot area holds `capacity` `VisSlot`s and `slot_index` is
@@ -863,7 +887,9 @@ impl<R: MappedRegion> RingConsumer<R> {
             );
         }
         self.store_read_seq(read_seq + 1);
-        if was_full && let Some(wake) = &self.wake {
+        // Every advance signals (module docs); a slot was delivered, so this
+        // side did store.
+        if let Some(wake) = &self.wake {
             let _ = wake.signal(Wake::Space);
         }
         Ok(true)
@@ -934,13 +960,12 @@ impl<R: MappedRegion> RingConsumer<R> {
             let read_seq = self.read_seq(Ordering::Relaxed);
             let available = write_seq.wrapping_sub(read_seq);
             if available > 0 {
+                // `want > 0` and `available > 0`, so this branch always stores.
                 let count = (want as u64).min(available) as usize;
-                let was_full = available == u64::from(self.meta.capacity);
                 self.copy_out_of_slots(read_seq, out.as_mut_ptr(), count);
                 self.store_read_seq(read_seq + count as u64);
-                if was_full {
-                    let _ = wake.signal(Wake::Space);
-                }
+                // Every advance signals (module docs).
+                let _ = wake.signal(Wake::Space);
                 return Ok(count);
             }
             if self.is_closed() {
@@ -1684,6 +1709,24 @@ mod tests {
         capacity: u32,
         channels: u32,
     ) -> (RingProducer<AnonymousRegion>, RingConsumer<AnonymousRegion>) {
+        let (producer, consumer, _probe) = pcm_ring_with_wake_probe(capacity, channels);
+        (producer, consumer)
+    }
+
+    /// Like [`pcm_ring_with_wake`], plus a third handle on the same two
+    /// latches so a test can observe the signals themselves.
+    ///
+    /// The probe is a peer waiter, not an observer: an auto-reset event
+    /// releases exactly one waiter, so a test that uses the probe must be the
+    /// only thing waiting on that direction.
+    fn pcm_ring_with_wake_probe(
+        capacity: u32,
+        channels: u32,
+    ) -> (
+        RingProducer<AnonymousRegion>,
+        RingConsumer<AnonymousRegion>,
+        RingWake,
+    ) {
         let frame_size = channels * 4;
         let region = region_for(frame_size, capacity);
         let producer =
@@ -1692,9 +1735,23 @@ mod tests {
         let producer = producer.with_wake(wake.clone());
         let consumer = RingConsumer::attach(region, producer.expect())
             .unwrap()
-            .with_wake(wake);
-        (producer, consumer)
+            .with_wake(wake.clone());
+        (producer, consumer, wake)
     }
+
+    /// Consume whatever is already latched on one direction of a wake, so that
+    /// the next wait reports only what was signaled after this call. Bounded
+    /// by the 1 ms floor of RFC 0007 §6.4 and only ever used on a direction
+    /// nothing else waits on.
+    fn drain_latch(wake: &RingWake, which: Wake) {
+        while wake.wait(which, Some(Duration::from_millis(1))).unwrap() == WaitOutcome::Signaled {}
+    }
+
+    /// Bound for a probe wait that must already be satisfied: the signal is a
+    /// `SetEvent` the ring made before returning, so the latch is set before
+    /// the wait starts and a correct ring returns immediately. The bound only
+    /// decides how fast a regression fails.
+    const PROBE_WAIT: Option<Duration> = Some(Duration::from_millis(250));
 
     /// `write_from_blocking` + `read_into_blocking` deliver every frame exactly
     /// once, in order, with zero drops (RFC 0007 acceptance criterion 2).
@@ -2025,6 +2082,21 @@ mod tests {
     /// No lost wakeup at the check/wait boundary: a stress test with one frame
     /// per call and jitter must not deadlock (RFC 0007 §6.1, acceptance
     /// criterion 3).
+    ///
+    /// **The bound is the test.** Both sides treat `Ok(0)` as a failure, not
+    /// as a retry. While the peer thread still has work, a wait here can only
+    /// end in data (or space) or in a skipped signal: the ring cannot be empty
+    /// for the consumer and full for the producer at the same time, and with
+    /// every advance signalling (module docs) a live peer always sets the
+    /// latch the waiter is on. So a `TEST_WAIT` that expires is a lost wake,
+    /// and the message prints the counters that prove it — the condition was
+    /// already met while the waiter slept.
+    ///
+    /// Until 2026-10-18 this test looped on `Ok(0)` on both sides, so the
+    /// defect it is named after (`docs/tasks/W19-twoproc-stall.md` §1) only
+    /// made it ten seconds slower per occurrence and it could not fail at all.
+    /// The race-free half of the same criterion is
+    /// `every_advance_signals_not_only_the_edge`.
     #[test]
     fn blocking_no_lost_wakeup_under_jitter() {
         const CHANNELS: u32 = 2;
@@ -2040,13 +2112,16 @@ mod tests {
                 for index in 0..FRAMES {
                     let v = index as f32;
                     let buf = [v, -v];
-                    loop {
-                        let written = producer.write_from_blocking(&buf, TEST_WAIT).unwrap();
-                        if written > 0 {
-                            break;
-                        }
-                        std::hint::spin_loop();
-                    }
+                    let written = producer.write_from_blocking(&buf, TEST_WAIT).unwrap();
+                    assert_eq!(
+                        written,
+                        1,
+                        "lost `Space` wake at frame {index}: the wait expired with {} of \
+                         {CAPACITY} frames free (written {}, consumed {})",
+                        producer.free_frames(),
+                        producer.frames_written(),
+                        producer.frames_written() - producer.frames_available(),
+                    );
                 }
             });
 
@@ -2057,6 +2132,14 @@ mod tests {
                 let mut last: Option<f32> = None;
                 while received < FRAMES {
                     let read = consumer.read_into_blocking(&mut out, TEST_WAIT).unwrap();
+                    assert!(
+                        read > 0,
+                        "lost `Data` wake after {received} frames: the wait expired with {} \
+                         frames available (published {}, read {})",
+                        consumer.frames_available(),
+                        consumer.frames_published(),
+                        consumer.frames_read(),
+                    );
                     for i in 0..read {
                         let v = out[i * 2];
                         if let Some(prev) = last {
@@ -2074,6 +2157,125 @@ mod tests {
             p.join().unwrap();
             c.join().unwrap();
         });
+    }
+
+    /// Every advance signals, including one that did not start from an empty
+    /// or a full ring (RFC 0007 §6.2 as corrected, acceptance criterion 3).
+    ///
+    /// This is the race-free half of criterion 3: rather than trying to hit
+    /// the interleaving of `docs/tasks/W19-twoproc-stall.md` §1, it asks the
+    /// events directly. `probe` is a third handle on the same two auto-reset
+    /// latches, so the test can drain a latch and then require that the next
+    /// advance set it again. Nothing else waits on either direction here, so a
+    /// drained latch stays drained and no signal can be stolen.
+    ///
+    /// Under the withdrawn edge both asserted signals were simply not sent,
+    /// which is what let a waiter that had already observed its condition
+    /// unmet sleep on a ring that was neither closed nor failed.
+    #[test]
+    fn every_advance_signals_not_only_the_edge() {
+        let (mut producer, mut consumer, probe) = pcm_ring_with_wake_probe(4, 2);
+
+        // `Data`: a write into a ring that is *not* empty must still signal.
+        assert_eq!(producer.write_from(&[1.0f32, -1.0]).unwrap(), 1);
+        drain_latch(&probe, Wake::Data);
+        assert_eq!(producer.frames_available(), 1, "the ring is not empty");
+        assert_eq!(producer.write_from(&[2.0f32, -2.0]).unwrap(), 1);
+        assert_eq!(
+            probe.wait(Wake::Data, PROBE_WAIT).unwrap(),
+            WaitOutcome::Signaled,
+            "a write into a non-empty ring did not signal Data"
+        );
+
+        // `Space`: a read from a ring that is *not* full must still signal.
+        drain_latch(&probe, Wake::Space);
+        let mut out = [0.0f32; 2];
+        assert_eq!(consumer.frames_available(), 2, "2 of 4 frames, not full");
+        assert_eq!(consumer.read_into(&mut out).unwrap(), 1);
+        assert_eq!(out, [1.0, -1.0]);
+        assert_eq!(
+            probe.wait(Wake::Space, PROBE_WAIT).unwrap(),
+            WaitOutcome::Signaled,
+            "a read from a non-full ring did not signal Space"
+        );
+    }
+
+    /// The blocking paths signal on every advance too: `write_from_blocking`
+    /// and `read_into_blocking` carried their own copy of the withdrawn edge
+    /// (RFC 0007 §6.2 as corrected, acceptance criterion 3).
+    ///
+    /// Same probe discipline as `every_advance_signals_not_only_the_edge`:
+    /// neither call below ever waits, because each one finds its condition
+    /// already met.
+    #[test]
+    fn every_blocking_advance_signals_not_only_the_edge() {
+        let (mut producer, mut consumer, probe) = pcm_ring_with_wake_probe(4, 2);
+
+        assert_eq!(
+            producer
+                .write_from_blocking(&[1.0f32, -1.0], TEST_WAIT)
+                .unwrap(),
+            1
+        );
+        drain_latch(&probe, Wake::Data);
+        assert_eq!(producer.frames_available(), 1, "the ring is not empty");
+        assert_eq!(
+            producer
+                .write_from_blocking(&[2.0f32, -2.0], TEST_WAIT)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            probe.wait(Wake::Data, PROBE_WAIT).unwrap(),
+            WaitOutcome::Signaled,
+            "write_from_blocking into a non-empty ring did not signal Data"
+        );
+
+        drain_latch(&probe, Wake::Space);
+        let mut out = [0.0f32; 2];
+        assert_eq!(consumer.frames_available(), 2, "2 of 4 frames, not full");
+        assert_eq!(consumer.read_into_blocking(&mut out, TEST_WAIT).unwrap(), 1);
+        assert_eq!(out, [1.0, -1.0]);
+        assert_eq!(
+            probe.wait(Wake::Space, PROBE_WAIT).unwrap(),
+            WaitOutcome::Signaled,
+            "read_into_blocking from a non-full ring did not signal Space"
+        );
+    }
+
+    /// A vis ring with a wake signals on every advance as well; the vis path
+    /// carried the same two guards (RFC 0007 §6.2 as corrected). Vis rings are
+    /// created without a wake in production (RFC 0007 §9), so this pins the
+    /// rule for the shape, not for a live caller.
+    #[test]
+    fn every_vis_advance_signals_not_only_the_edge() {
+        let region = region_for(VIS_SLOT_SIZE as u32, 4);
+        let producer =
+            RingProducer::create(region.clone(), RingKind::Vis, VIS_SLOT_SIZE as u32, 4).unwrap();
+        let wake = RingWake::create(&ring_name(RingKind::Vis, producer.generation())).unwrap();
+        let mut producer = producer.with_wake(wake.clone());
+        let mut consumer = RingConsumer::attach(region, producer.expect())
+            .unwrap()
+            .with_wake(wake.clone());
+
+        let slot = VisSlot::from_frame(&VisFrame::default());
+        assert!(producer.write_slot(&slot).unwrap());
+        drain_latch(&wake, Wake::Data);
+        assert!(producer.write_slot(&slot).unwrap());
+        assert_eq!(
+            wake.wait(Wake::Data, PROBE_WAIT).unwrap(),
+            WaitOutcome::Signaled,
+            "write_slot into a non-empty ring did not signal Data"
+        );
+
+        drain_latch(&wake, Wake::Space);
+        let mut out = VisSlot::zeroed();
+        assert!(consumer.read_slot_into(&mut out).unwrap());
+        assert_eq!(
+            wake.wait(Wake::Space, PROBE_WAIT).unwrap(),
+            WaitOutcome::Signaled,
+            "read_slot_into from a non-full ring did not signal Space"
+        );
     }
 
     /// Two-thread lossless delivery via blocking calls: every frame arrives

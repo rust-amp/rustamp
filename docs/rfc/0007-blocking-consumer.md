@@ -3,6 +3,22 @@
 Status: **Accepted** on 2026-10-15 by the project owner. Implementation waits
 for the RFC 0006 card (this RFC exists to unblock it).
 
+### Correction (2026-10-18): §6.2's conditional-signal refinement is **withdrawn**
+
+§6.2 used to recommend an edge-triggered refinement — the producer signals
+`Wake::Data` only when its write started from an empty ring, the consumer
+signals `Wake::Space` only when its read started from a full one — and gave a
+short soundness proof for it. **The refinement is unsound and is withdrawn**;
+the rule of record is the unconditional one that §6.1's argument already
+assumes ("that end always signals when it advances that counter"). The proof,
+the counterexample and the reason for withdrawing rather than repairing are in
+§6.2; the acceptance criterion that was supposed to catch this is sharpened in
+§14.3. Nothing on the wire, in the header or in the API changes: this is a
+signalling rule inside `write_from`/`write_slot`/`read_into`/`read_slot_into`
+and their blocking forms. Diagnosed in
+[`docs/tasks/W19-twoproc-stall.md`](../tasks/W19-twoproc-stall.md) §1, fixed in
+[`docs/tasks/W19-ring-wake-root.md`](../tasks/W19-ring-wake-root.md).
+
 ### Owner decisions (2026-10-15)
 
 - **Accepted as proposed.** The five load-bearing open questions are settled with
@@ -304,30 +320,72 @@ end (which is the failure mode of §4.2).
 - **Consumer** → `Wake::Space`, after the `read_seq` `Release` store.
 - **Either end on `close()`** → both events, after the `state` `Release` store.
 
-A safe and cheap refinement (recommended, and the reason the hot path stays
-syscall-free in the common case): signal only when the advance could have made
-the peer's condition true, i.e.
+The rule is **unconditional**: every advance signals. The only guard an
+implementation may apply is that its own store happened — a call that accepted
+or read zero frames changed nothing and signals nothing. That costs one
+`SetEvent` per advance, and §6.1's argument depends on it.
+
+#### The withdrawn refinement (2026-10-18)
+
+This section used to recommend an edge-triggered refinement as "safe and
+cheap", and it is neither. For the record, the withdrawn text proposed to
+signal only when the advance could have made the peer's condition true, i.e.
 
 - the producer signals `Wake::Data` iff the write **started from empty**
   (`write_seq == read_seq` before the write), and
 - the consumer signals `Wake::Space` iff the read **started from full**
-  (`write_seq - read_seq == capacity` before the read).
+  (`write_seq - read_seq == capacity` before the read),
 
-This is sound, and the proof is short: the consumer waits only after observing
-empty, so its observed `read_seq` does not change while it waits; the producer's
-next write reads its *own* `write_seq` and that same `read_seq`, and since a
-write between the consumer's observation and the producer's check would have
-advanced `write_seq` past the value the consumer loaded, the producer's check
-must observe empty too — so it signals. The space direction is symmetric: a
-consumer's read that finds the ring not-full would require `write_seq` to have
-grown past `read_seq + capacity`, which the occupancy invariant forbids. An
-implementation that is unsure may signal unconditionally; it costs one extra
-`SetEvent` per advance and is always correct.
+with this proof: "the consumer waits only after observing empty, so its
+observed `read_seq` does not change while it waits; the producer's next write
+reads its *own* `write_seq` and **that same `read_seq`** […] so the producer's
+check must observe empty too — so it signals."
+
+**"That same `read_seq`" is the step the proof needs and the step it skips.**
+Nothing orders the producer's load of `read_seq` after the consumer's last
+store to it. Each side decides its edge from the counter the *peer* owns, read
+before its own operation; a plain interleaving therefore lets it evaluate a
+pre-drain (or pre-fill) snapshot. Capacity 3, one frame in the ring
+(`write_seq = 10`, `read_seq = 9`), every step one atomic operation:
+
+1. **P** enters `write_from_blocking`, loads `write_seq = 10`, loads
+   `read_seq = 9` → occupancy 1 → "not from empty". P is descheduled before its
+   `write_seq` store.
+2. **C** reads the frame and stores `read_seq = 10`. Its own edge
+   (`available == capacity`) is false, so it sends no `Wake::Space` either.
+3. **C** is asked for more, finds `write_seq = 10`, `read_seq = 10` → empty,
+   not closed → waits on `Wake::Data`.
+4. **P** resumes, stores `write_seq = 12`, and sends **no** signal, because
+   step 1 already decided the ring was not empty.
+
+C sleeps on data the ring holds; P fills the ring, finds no space and sleeps on
+a `Wake::Space` that C — not looking at the ring at all — will never send. The
+ring is neither closed nor failed, so nothing else ends the wait. The
+occupancy invariant the old proof leaned on holds throughout; it simply says
+nothing about *which snapshot* each side used. The auto-reset latch does not
+rescue it either: it buys C exactly one extra re-check at step 3, after which
+the latch is clear and the next wait is unbounded.
+
+**Withdrawn, not corrected.** Correcting the proof would mean changing the
+rule, not the argument: the premise it needs ("the producer's load of
+`read_seq` is ordered after the consumer's last store to it") is false for the
+code the refinement describes, and no rewording makes it true. A *different*
+rule could be made sound — store first, then re-read the peer's counter behind
+a `SeqCst` fence and signal if the peer's condition now holds (the
+store-then-recheck shape), or add a header waiter flag and signal only when it
+is set — but both need a fence or a new header word on the hot path, both are
+easy to get wrong in exactly the way that produced this defect, and neither was
+what §6.2 claimed. Since the cost of being right is a single `SetEvent` per
+advance on a path that already does a shared-memory copy, the unconditional
+rule wins on merit and not merely on safety. Recorded as open item **O15** for
+anyone who later wants the syscall-free path back and is prepared to prove it.
 
 A wake is a **hint**: the waiter re-reads the counters and drains everything
 available (`read_into` already returns `min(want, available)`), so N writes may
 be served by one wake and one wake may serve zero frames if a race resolved
-itself.
+itself. That is what makes the unconditional rule free of risk in the other
+direction — an extra signal costs one wait return and one re-check, never a
+frame (§6.3).
 
 ### 6.3 Spurious wakeups
 
@@ -503,16 +561,21 @@ Semantics of the additions:
 `unsafe` block carries a `// SAFETY:` comment (RFC 0003 §11). `RingWake` needs
 `unsafe impl Send` for the same reason `NamedRegion` does.
 
-Signalling is added at exactly five places, each after the existing `Release`
-store (the publication ordering of RFC 0003 §6 is untouched):
+Signalling is added only where a counter is stored, always after the existing
+`Release` store (the publication ordering of RFC 0003 §6 is untouched):
 
 | Place | After | Signals |
 |---|---|---|
-| `RingProducer::write_from` | `write_seq` `Release` store | `Wake::Data`, if the write started from empty |
-| `RingProducer::write_slot` | `write_seq` `Release` store | `Wake::Data`, if the slot started from empty |
-| `RingConsumer::read_into` | `read_seq` `Release` store | `Wake::Space`, if the read started from full |
-| `RingConsumer::read_slot_into` | `read_seq` `Release` store | `Wake::Space`, if the read started from full |
+| `RingProducer::write_from` | `write_seq` `Release` store | `Wake::Data`, whenever the store happened |
+| `RingProducer::write_slot` | `write_seq` `Release` store | `Wake::Data`, whenever the slot was accepted |
+| `RingConsumer::read_into` | `read_seq` `Release` store | `Wake::Space`, whenever the store happened |
+| `RingConsumer::read_slot_into` | `read_seq` `Release` store | `Wake::Space`, whenever a slot was delivered |
 | `RingProducer::close` / `RingConsumer::close` | `state` `Release` store | both, unconditionally |
+
+(The "if the write started from empty" / "if the read started from full"
+conditions this table carried until 2026-10-18 are the withdrawn refinement of
+§6.2. `write_from_blocking` and `read_into_blocking` carry the same rule at
+their own stores, which makes seven signalling sites rather than five.)
 
 Everything else is untouched: the slot layout, the header layout, the
 `magic`-last initialisation, the wrap-around arithmetic, the overrun/underrun
@@ -601,8 +664,10 @@ Accounting:
   guarantee. All existing `shm` tests (round trip, wrap-around, full-ring drops,
   unpublished vis slot, stale/foreign regions, generation bump, close visibility,
   layout, soak) must stay green unchanged.
-- **Rings with a wake** pay one `SetEvent` per state-advancing call (and only
-  when the advance could have made the peer's condition true, per §6.2). The
+- **Rings with a wake** pay one `SetEvent` per state-advancing call — on
+  *every* advance, per §6.2 as corrected on 2026-10-18; the "only when the
+  advance could have made the peer's condition true" qualifier this bullet
+  carried is the withdrawn refinement. The
   guarantee wording changes for them from "no blocking call on the read or write
   path" to "no allocation, no lock, no **sleeping** call, no logging; one
   `SetEvent` on an advance".
@@ -645,10 +710,21 @@ must keep holding.
    `received == sent`. Cases: the consumer waits before any data exists; the
    producer waits on a full ring; a block larger than the ring (partial writes,
    caller loops).
-3. **No lost wakeup at the check/wait boundary:** a stress test that makes the
-   race between the condition check and the wait as likely as possible (one
-   frame per call, alternating ends, `std::hint::spin_loop`/`yield` jitter) must
-   finish under a watchdog timeout, not hang.
+3. **No lost wakeup at the check/wait boundary** — sharpened on 2026-10-18,
+   because the original wording ("must finish under a watchdog timeout, not
+   hang") was satisfied by a test that could not fail: it looped on `Ok(0)`, so
+   a skipped signal only made it slower. A test for this criterion must
+   **fail**, not merely slow down, when a signal is skipped. Two shapes
+   qualify, and the implementation should have both:
+   - the stress test (one frame per call, alternating ends,
+     `std::hint::spin_loop`/`yield` jitter) with a bound that is an assertion:
+     while the peer still has work, `Ok(0)` from a blocking call means the
+     signal was skipped, so the test fails and prints the counters that prove
+     the condition was already met; and
+   - a deterministic test of the signalling rule itself (§6.2): with a third
+     handle on the same two latches, drain a latch and assert that the next
+     advance — one that starts from a ring that is neither empty nor full —
+     sets it again. This needs no race and covers all six signalling sites.
 4. **`close()` wakes both waiters:** with a consumer blocked in
    `read_into_blocking(out, None)` and a producer blocked in
    `write_from_blocking(&samples, None)` (two rings, or two phases), a `close()`
@@ -694,6 +770,7 @@ must keep holding.
 | O10 | `RingError::NoWakeObject` plus reusing `MappingFailed` (proposed), or a distinct blocking-ring type, or a `WakeFailed { op, code }` variant? |
 | O11 | Non-Windows backing for the wake: a Linux/macOS primitive (futex / `os_sync_wait_on_address`) for the cross-platform milestone. The RFC defines semantics, not the syscall. |
 | O12 | If Q4's late joiner gets its own rule, does it need a "wake is fresh" signal (it currently just blocks for the next frame)? |
+| O15 | Does the hot path ever need to be syscall-free again, and if so by which sound rule? §6.2's edge is withdrawn; the candidates are store-then-recheck behind a `SeqCst` fence, or a header waiter flag (a ring-ABI change, see O1/O4). Only with a proof that names the ordering edge the old one skipped, and a test of the shape §14.3 now requires. Added 2026-10-18. |
 
 ## 16. Provenance
 
