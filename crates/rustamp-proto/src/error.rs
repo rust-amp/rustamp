@@ -22,6 +22,9 @@ pub enum ErrorKind {
     /// The stream changed format mid-stream (RFC 0002, C4). Appended at the end
     /// so existing serialized values keep their index.
     FormatChanged,
+    /// A DSP stage failed mid-run or refused configuration (RFC 0014).
+    /// Appended at the end so existing serialized values keep their index.
+    Dsp,
 }
 
 /// Serializable description of an error, used by `Event::Error`.

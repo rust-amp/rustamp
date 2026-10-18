@@ -56,7 +56,7 @@ fn the_ceiling_comes_from_the_linked_gain_not_from_the_clamp() {
     input.extend(std::iter::repeat_n(0.0, 2 * la * 2));
     let mut out = input.clone();
     for block in out.chunks_mut(2 * 1_000) {
-        limiter.process(block);
+        limiter.process(block).unwrap();
     }
 
     let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));

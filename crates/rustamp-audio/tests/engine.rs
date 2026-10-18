@@ -14,7 +14,7 @@ use rustamp_audio::EngineConfig;
 use rustamp_core::audio::{AudioSpec, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::bus::command_channel;
 use rustamp_core::command::Command;
-use rustamp_core::error::Result;
+use rustamp_core::error::{Error, ErrorKind, Result};
 use rustamp_core::event::Event;
 use rustamp_core::state::{EqState, TransportState};
 
@@ -728,13 +728,14 @@ impl rustamp_core::audio::DspStage for CountingDspStage {
         Ok(())
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> rustamp_core::error::Result<()> {
         // Multiply by 0.5 and count samples processed
         self.processed_samples
             .fetch_add(buf.len(), std::sync::atomic::Ordering::SeqCst);
         for s in buf {
             *s *= 0.5;
         }
+        Ok(())
     }
 
     fn reset(&mut self) {}
@@ -1394,10 +1395,11 @@ impl rustamp_core::audio::DspStage for GainBoostDspStage {
         Ok(())
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> rustamp_core::error::Result<()> {
         for s in buf {
             *s *= self.0;
         }
+        Ok(())
     }
 
     fn reset(&mut self) {}
@@ -1739,6 +1741,103 @@ fn a_decoder_error_keeps_the_audio_decoded_before_it() {
     assert!(h.engine.last_error().is_some(), "the error is reported");
 }
 
+/// RFC 0014 §7.2's stub: a stage that fails loudly with a message after
+/// `fail_after` blocks — the engine-side half of M14 finding F1's smallest
+/// reproduction. It reports a look-ahead so the end-of-track flush also
+/// runs the failing stage (the re-failure path).
+struct FailingDspStage {
+    fail_after: usize,
+    blocks: usize,
+}
+
+impl rustamp_core::audio::DspStage for FailingDspStage {
+    fn name(&self) -> &str {
+        "failing-dsp"
+    }
+
+    fn prepare(&mut self, _: AudioSpec) -> rustamp_core::error::Result<()> {
+        Ok(())
+    }
+
+    fn process(&mut self, buf: &mut [f32]) -> rustamp_core::error::Result<()> {
+        self.blocks += 1;
+        if self.blocks > self.fail_after {
+            return Err(Error::Dsp("clipping detected".into()));
+        }
+        for s in buf {
+            *s *= 0.5;
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {}
+
+    fn latency_frames(&self) -> u32 {
+        64
+    }
+}
+
+/// RFC 0014 acceptance 2: a stage returning `Err(Error::Dsp("…"))` mid-run
+/// ends the track with `Event::Error` carrying `ErrorKind::Dsp` and the
+/// message text, the transport leaves Playing, and no second error is
+/// published when the flush path re-fails — the stage fails on every later
+/// block, and it reports a look-ahead, so the end-of-track flush runs it
+/// again.
+#[test]
+fn a_stage_error_ends_the_track_loudly_and_only_once() {
+    let mut h = Harness::new(&[TRACK_A]);
+    // The limiter stays off so the healthy block's halved samples are not
+    // clamped; only the failure is under test.
+    h.engine.set_limiter_enabled(false);
+    h.engine.set_dsp_chain(vec![Box::new(FailingDspStage {
+        fail_after: 1,
+        blocks: 0,
+    })]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    assert!(
+        h.wait_buffered(),
+        "the run must reach its end (the track ended at the failure)"
+    );
+    let total = track_frames(TRACK_A);
+    let end = h
+        .engine
+        .end_of_stream()
+        .expect("the run must report its end");
+    assert!(
+        end < total,
+        "the track must end at the failure, before its full length ({end} of {total})"
+    );
+    assert!(
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+        "the transport must leave Playing"
+    );
+    let info = h
+        .engine
+        .last_error()
+        .expect("the stage error must be reported");
+    assert_eq!(info.kind, ErrorKind::Dsp, "{info:?}");
+    assert!(info.message.contains("clipping detected"), "{info:?}");
+    let events = h.drain_events();
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event, Event::Error(_)))
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one error event per run (the flush re-failure must not re-report): {events:?}"
+    );
+    let Event::Error(published) = errors[0] else {
+        unreachable!("filtered to Event::Error")
+    };
+    assert_eq!(published.kind, ErrorKind::Dsp, "{published:?}");
+    assert!(
+        published.message.contains("clipping detected"),
+        "{published:?}"
+    );
+}
+
 /// A6 finding 8. With the limiter disabled, a NaN from a stage never reaches the
 /// device; every finite sample passes untouched.
 #[test]
@@ -1751,7 +1850,7 @@ fn a_non_finite_sample_never_reaches_the_device() {
         fn prepare(&mut self, _: AudioSpec) -> rustamp_core::error::Result<()> {
             Ok(())
         }
-        fn process(&mut self, buf: &mut [f32]) {
+        fn process(&mut self, buf: &mut [f32]) -> rustamp_core::error::Result<()> {
             for (i, s) in buf.iter_mut().enumerate() {
                 match i % 300 {
                     0 => *s = f32::NAN,
@@ -1759,6 +1858,11 @@ fn a_non_finite_sample_never_reaches_the_device() {
                     _ => {}
                 }
             }
+            // The stage stays healthy on the contract (RFC 0014 acceptance 4:
+            // a stage emitting NaN *and* returning Ok still hits the
+            // sanitizer) — the failure channel is pinned by
+            // `a_stage_error_ends_the_track_loudly_and_only_once` below.
+            Ok(())
         }
         fn reset(&mut self) {}
     }

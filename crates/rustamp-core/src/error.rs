@@ -27,7 +27,7 @@ pub enum Error {
     /// An output device failed.
     #[error("output error: {0}")]
     Output(String),
-    /// A DSP stage rejected its configuration.
+    /// A DSP stage failed: refused configuration or a mid-run fault (RFC 0014).
     #[error("dsp error: {0}")]
     Dsp(String),
     /// The operation is not supported (e.g. seeking in a live stream).
@@ -67,6 +67,7 @@ impl From<&Error> for ErrorInfo {
             Error::UnsupportedFormat(_) => ErrorKind::UnsupportedFormat,
             Error::Decode(_) => ErrorKind::Decode,
             Error::Output(_) => ErrorKind::Output,
+            Error::Dsp(_) => ErrorKind::Dsp,
             Error::FormatChanged { .. } => ErrorKind::FormatChanged,
             _ => ErrorKind::Other,
         };
@@ -80,6 +81,17 @@ impl From<&Error> for ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsp_faults_keep_their_kind_and_message() {
+        // RFC 0014 §3.2: a mid-run DSP fault classifies as `Dsp` (not the
+        // `Other` fallthrough) and its diagnostic text survives the
+        // conversion into the wire description.
+        let e = Error::Dsp("clipping detected".into());
+        let info = ErrorInfo::from(&e);
+        assert_eq!(info.kind, ErrorKind::Dsp);
+        assert_eq!(info.message, "dsp error: clipping detected");
+    }
 
     #[test]
     fn format_changed_keeps_its_kind_and_specs() {

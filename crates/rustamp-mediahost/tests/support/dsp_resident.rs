@@ -22,7 +22,7 @@ impl ResidentChain for StubChain {
         0
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> Result<()> {
         if self.crash && self.blocks == 0 {
             // Only the VM-only example selects this mode. Deliberately do
             // not close the rings: this models a resident crashing mid-run.
@@ -36,6 +36,7 @@ impl ResidentChain for StubChain {
                 *sample *= *factor;
             }
         }
+        Ok(())
     }
 
     fn reset(&mut self) {}

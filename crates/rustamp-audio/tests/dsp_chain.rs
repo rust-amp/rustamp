@@ -80,13 +80,13 @@ fn through_chain(input: &[f32], eq: &EqState, limiter_on: bool) -> Vec<f32> {
     let mut equalizer = Equalizer::with_control(Arc::new(EqControl::new(eq)));
     equalizer.prepare(AudioSpec::new(SRC, 1)).unwrap();
     let mut out = input.to_vec();
-    equalizer.process(&mut out);
+    equalizer.process(&mut out).unwrap();
 
     let mut limiter = Limiter::with_control(Arc::new(LimiterControl::new(limiter_on)));
     limiter.prepare(AudioSpec::new(SRC, 1)).unwrap();
     // A silent tail lets the look-ahead's worth of frames come out.
     out.extend(std::iter::repeat_n(0.0, 512));
-    limiter.process(&mut out);
+    limiter.process(&mut out).unwrap();
     out
 }
 

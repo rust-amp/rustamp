@@ -73,27 +73,28 @@
 //!
 //! # Mid-run failures
 //!
-//! The core `DspStage::process` contract is infallible (M14 finding F1; RFC
-//! 0014 is still a draft), so a resident that dies or wedges mid-stream cannot
-//! return an error per block. The adapter latches the first failure into a
-//! [`DspFailureWatch`] — pass the engine's
-//! [`Engine::resident_dsp_watch`](crate::engine::Engine::resident_dsp_watch)
-//! when building the chain — and passes audio through bit-exactly from then
-//! on; [`Engine::poll`](crate::engine::Engine::poll) takes the latch and
-//! fails the track: the resident's death fails the track, never the player
-//! (RFC 0006 §8). A refusal at configure is a loud error at
-//! [`DspResidentConfig::open`] (or at `prepare` for a reconfigure), before or
-//! instead of playback; a missing helper binary degrades to "stage
-//! unavailable", never to a silent in-process fallback.
+//! The core `DspStage::process` contract is fallible (RFC 0014, closing M14
+//! finding F1): the adapter returns a resident that dies, wedges or is
+//! refused mid-stream as `Err(Error::Dsp(..))` from `process`, carrying the
+//! failure text. The engine treats it exactly like a decoder error — report
+//! it, flush the chain, end the track loudly (RFC 0006 §8: the resident's
+//! death fails the track, never the player) — so no engine-polled latch is
+//! needed anymore. The first failure sticks on the stage: a failed chain is
+//! poisoned and resuming on it is an error (RFC 0014 §4.3); recovery is an
+//! explicit replacement with a fresh chain. A refusal at configure is a loud
+//! error at [`DspResidentConfig::open`] (or at `prepare` for a reconfigure,
+//! which the decode thread discards — the poisoned stage returns the latched
+//! refusal from its next `process`), before or instead of playback; a missing
+//! helper binary degrades to "stage unavailable", never to a silent
+//! in-process fallback.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rustamp_core::audio::{
     AudioSpec, Confidence, Decoder, DecoderFactory, DspStage, MediaSource, ProbeHint,
 };
-use rustamp_core::error::{Error as CoreError, ErrorInfo, Result as CoreResult};
+use rustamp_core::error::{Error as CoreError, Result as CoreResult};
 use rustamp_core::state::StreamInfo;
 use rustamp_mediahost::decoder::{DecoderSession, file_location};
 use rustamp_mediahost::dsp::DspSession;
@@ -598,47 +599,6 @@ pub const DEFAULT_DSP_RING_FRAMES: u32 = 4096;
 /// The engine's join of the decode thread is bounded by this too.
 pub const DEFAULT_DSP_BLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A latched resident-DSP failure, polled by the engine.
-///
-/// The core [`DspStage::process`] contract is infallible (M14 finding F1;
-/// RFC 0014 is still a draft), so a resident chain that dies or wedges
-/// mid-stream cannot return an error from `process`. The adapter latches the
-/// first failure here and passes audio through bit-exactly from then on;
-/// [`Engine::poll`](crate::engine::Engine::poll) takes it and fails the track
-/// (RFC 0006 §8: the resident's death fails the track, never the player).
-/// The lock is taken on the decode worker and the engine's caller thread
-/// only — never on the render callback.
-#[derive(Debug, Default)]
-pub struct DspFailureWatch {
-    failure: std::sync::Mutex<Option<ErrorInfo>>,
-}
-
-impl DspFailureWatch {
-    /// A fresh, empty watch.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Latch a failure; the first one sticks, later ones are dropped.
-    pub fn latch(&self, info: ErrorInfo) {
-        let mut failure = self
-            .failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if failure.is_none() {
-            *failure = Some(info);
-        }
-    }
-
-    /// Take the latched failure, if any. The engine handles it exactly once.
-    pub fn take(&self) -> Option<ErrorInfo> {
-        self.failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-    }
-}
-
 /// Wire spec for a core spec. The wire carries `u8` channels, so a wider spec
 /// is refused loudly instead of truncated.
 fn wire_spec(spec: AudioSpec) -> CoreResult<PcmSpecWire> {
@@ -734,40 +694,35 @@ fn process_block<F: PcmRings>(
 }
 
 /// Shared control state of a resident DSP chain: the stage list a reconfigure
-/// sends, the ring capacity, the bounded round-trip, the engine-polled
-/// failure watch and the sticky poisoned state.
+/// sends, the ring capacity, the bounded round-trip and the sticky poisoned
+/// state.
 struct ChainControl {
     stages: Vec<DspStageDesc>,
     ring_frames: u32,
     block_timeout: Duration,
-    watch: Arc<DspFailureWatch>,
-    /// The first failure sticks; `Some` means the chain is poisoned and
-    /// bypasses bit-exactly (RFC 0014's terminal rule, held adapter-side
-    /// while the core contract is infallible).
-    poisoned: Option<CoreError>,
+    /// The first failure sticks; `Some` is the sticky first failure's text:
+    /// every later `process` returns it as a `Dsp` error (RFC 0014 §4.3 —
+    /// resuming on a failed chain is an error, recovery is a replacement).
+    /// The decode thread discards a `prepare` error, so a refused reconfigure
+    /// is held here and surfaces from the next `process`. Every latched
+    /// failure is a `Dsp` error, so kind and text survive the round trip.
+    poisoned: Option<String>,
 }
 
 impl ChainControl {
-    fn new(
-        stages: Vec<DspStageDesc>,
-        ring_frames: u32,
-        block_timeout: Duration,
-        watch: Arc<DspFailureWatch>,
-    ) -> Self {
+    fn new(stages: Vec<DspStageDesc>, ring_frames: u32, block_timeout: Duration) -> Self {
         ChainControl {
             stages,
             ring_frames,
             block_timeout,
-            watch,
             poisoned: None,
         }
     }
 
-    /// Latch a failure: the first one sticks and is published to the watch.
-    fn latch(&mut self, error: CoreError) {
+    /// Latch a failure: the first one sticks.
+    fn latch(&mut self, error: &CoreError) {
         if self.poisoned.is_none() {
-            self.watch.latch(ErrorInfo::from(&error));
-            self.poisoned = Some(error);
+            self.poisoned = Some(error.to_string());
         }
     }
 
@@ -804,22 +759,29 @@ impl ChainControl {
             .map_err(|error| dsp_error_to_core(error, "configure"))
         {
             let err_msg = error.to_string();
-            self.latch(error);
+            self.latch(&error);
             return Err(CoreError::Dsp(err_msg));
         }
         Ok(())
     }
 
-    /// `DspStage::process`: one bounded block round-trip. A failure latches
-    /// (the buffer is left untouched from then on: bit-exact bypass) — the
-    /// engine's next poll fails the track.
-    fn process<F: PcmRings>(&mut self, session: &mut DspSession<F>, buf: &mut [f32]) {
-        if self.poisoned.is_some() {
-            return;
+    /// `DspStage::process`: one bounded block round-trip. A failure is
+    /// returned as `Err` (RFC 0014 §3.5) and latched: the chain is poisoned
+    /// and returns the sticky first failure from then on, without touching
+    /// the session or the buffer again.
+    fn process<F: PcmRings>(
+        &mut self,
+        session: &mut DspSession<F>,
+        buf: &mut [f32],
+    ) -> CoreResult<()> {
+        if let Some(message) = &self.poisoned {
+            return Err(CoreError::Dsp(message.clone()));
         }
         if let Err(error) = process_block(session, buf, self.block_timeout) {
-            self.latch(error);
+            self.latch(&error);
+            return Err(error);
         }
+        Ok(())
     }
 
     /// `DspStage::reset` (seek): clear the resident's stage state; the rings
@@ -857,14 +819,15 @@ impl ChainControl {
             .reset()
             .map_err(|error| dsp_error_to_core(error, "reset"))
         {
-            self.latch(error);
+            self.latch(&error);
         }
     }
 
     /// `DspStage::latency_frames`: the resident's `DspReady` report, which the
     /// decode thread sums into its trim/flush compensation exactly like an
-    /// in-process stage's (RFC 0006 §6.2). Zero once poisoned: the bypass is
-    /// undelayed, so trimming would drop real audio.
+    /// in-process stage's (RFC 0006 §6.2). Zero once poisoned: the stage
+    /// never processes again, so no end-of-track flush may push silence
+    /// through a dead chain.
     fn latency<F: PcmRings>(&self, session: &DspSession<F>) -> u32 {
         if self.poisoned.is_some() {
             0
@@ -902,20 +865,17 @@ pub struct HostDspChain<F: PcmRings> {
 
 impl<F: PcmRings> HostDspChain<F> {
     /// Wrap an open session. The session already completed the configure
-    /// handshake; `stages`/`ring_frames` are what a later reconfigure sends,
-    /// `block_timeout` bounds every block round-trip, and `watch` is where a
-    /// mid-run failure latches (the engine's
-    /// [`Engine::resident_dsp_watch`](crate::engine::Engine::resident_dsp_watch)).
+    /// handshake; `stages`/`ring_frames` are what a later reconfigure sends
+    /// and `block_timeout` bounds every block round-trip.
     pub fn new(
         session: DspSession<F>,
         stages: Vec<DspStageDesc>,
         ring_frames: u32,
         block_timeout: Duration,
-        watch: Arc<DspFailureWatch>,
     ) -> Self {
         HostDspChain {
             session,
-            control: ChainControl::new(stages, ring_frames, block_timeout, watch),
+            control: ChainControl::new(stages, ring_frames, block_timeout),
         }
     }
 
@@ -939,7 +899,7 @@ impl<F: PcmRings> DspStage for HostDspChain<F> {
         self.control.prepare(&mut self.session, spec)
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> CoreResult<()> {
         self.control.process(&mut self.session, buf)
     }
 
@@ -978,11 +938,10 @@ impl ProcessDspChain {
         stages: Vec<DspStageDesc>,
         ring_frames: u32,
         block_timeout: Duration,
-        watch: Arc<DspFailureWatch>,
     ) -> Self {
         ProcessDspChain {
             process: std::sync::Mutex::new(process),
-            control: ChainControl::new(stages, ring_frames, block_timeout, watch),
+            control: ChainControl::new(stages, ring_frames, block_timeout),
         }
     }
 
@@ -1025,19 +984,18 @@ impl DspStage for ProcessDspChain {
         control.prepare(process.session(), spec)
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> CoreResult<()> {
         let Self { process, control } = self;
         let Ok(process) = process.get_mut() else {
-            control.latch(CoreError::Dsp("resident DSP session lock poisoned".into()));
-            return;
+            return Err(CoreError::Dsp("resident DSP session lock poisoned".into()));
         };
-        control.process(process.session(), buf);
+        control.process(process.session(), buf)
     }
 
     fn reset(&mut self) {
         let Self { process, control } = self;
         let Ok(process) = process.get_mut() else {
-            control.latch(CoreError::Dsp("resident DSP session lock poisoned".into()));
+            control.latch(&CoreError::Dsp("resident DSP session lock poisoned".into()));
             return;
         };
         control.reset(process.session());
@@ -1103,23 +1061,16 @@ impl DspResidentConfig {
     ///
     /// `spec` is the format the chain opens at — the device spec is the
     /// natural choice; the first `prepare` with a different format
-    /// reconfigures the resident. `watch` is the engine's
-    /// [`Engine::resident_dsp_watch`](crate::engine::Engine::resident_dsp_watch):
-    /// a mid-run resident failure latches there and the engine fails the
-    /// track.
+    /// reconfigures the resident.
     ///
     /// A refusal at configure (unknown stage id, undecodable params) is a
     /// loud `Dsp` error here, before anything is installed; a missing helper
     /// binary degrades to "stage unavailable" (`Unsupported`), per RFC 0006
     /// §8 — never a silent in-process fallback.
-    pub fn open(
-        &self,
-        spec: AudioSpec,
-        watch: Arc<DspFailureWatch>,
-    ) -> CoreResult<Box<dyn DspStage>> {
+    pub fn open(&self, spec: AudioSpec) -> CoreResult<Box<dyn DspStage>> {
         #[cfg(not(windows))]
         {
-            let _ = (spec, watch);
+            let _ = spec;
             return Err(CoreError::Unsupported(
                 "resident DSP requires Windows named PCM mappings",
             ));
@@ -1148,7 +1099,6 @@ impl DspResidentConfig {
                 self.stages.clone(),
                 self.ring_frames,
                 self.block_timeout,
-                watch,
             )))
         }
     }
@@ -1660,10 +1610,8 @@ mod hosted_tests {
 #[cfg(test)]
 mod dsp_tests {
     //! Pure mapping/config tests for the DSP resident adapter: spec
-    //! conversion, loud error mapping, the failure watch and the opt-in
-    //! config. No rings, no session, no process.
-
-    use rustamp_core::error::ErrorKind;
+    //! conversion, loud error mapping and the opt-in config. No rings, no
+    //! session, no process.
 
     use super::*;
 
@@ -1698,23 +1646,6 @@ mod dsp_tests {
     }
 
     #[test]
-    fn dsp_failure_watch_latches_the_first_failure_once() {
-        let watch = DspFailureWatch::new();
-        assert!(watch.take().is_none());
-        watch.latch(ErrorInfo {
-            kind: ErrorKind::Other,
-            message: "first".into(),
-        });
-        watch.latch(ErrorInfo {
-            kind: ErrorKind::Other,
-            message: "second".into(),
-        });
-        let info = watch.take().expect("the first failure must be latched");
-        assert_eq!(info.message, "first");
-        assert!(watch.take().is_none(), "the watch is handled exactly once");
-    }
-
-    #[test]
     fn dsp_config_defaults_and_overrides() {
         let config = DspResidentConfig::new(
             PathBuf::from("helper.exe"),
@@ -1737,11 +1668,10 @@ mod dsp_tests {
     fn dsp_zero_ring_frames_is_rejected_loudly() {
         let config =
             DspResidentConfig::new(PathBuf::from("helper.exe"), Vec::new()).with_ring_frames(0);
-        let watch = Arc::new(DspFailureWatch::new());
         // On non-Windows this is Unsupported (no spawn platform); on Windows
         // it is InvalidArgument before any process exists. Either way no
         // helper is spawned for a zero capacity.
-        match config.open(AudioSpec::new(44_100, 2), watch) {
+        match config.open(AudioSpec::new(44_100, 2)) {
             Err(CoreError::InvalidArgument(_)) => {}
             #[cfg(not(windows))]
             Err(CoreError::Unsupported(_)) => {}
@@ -1784,7 +1714,7 @@ mod dsp_hosted_tests {
         AudioSpec, Confidence, Decoder, DecoderFactory, DecoderRegistry, MediaSource, ProbeHint,
     };
     use rustamp_core::bus::{EventBus, EventReceiver};
-    use rustamp_core::error::{Error as CoreError, Result as CoreResult};
+    use rustamp_core::error::{Error as CoreError, ErrorKind, Result as CoreResult};
     use rustamp_core::event::Event;
     use rustamp_core::meta::TrackMetadata;
     use rustamp_core::state::{StreamInfo, TransportState};
@@ -1809,10 +1739,11 @@ mod dsp_hosted_tests {
     /// bound so generous that only a real stall reaches it. The old 5 s value
     /// was a wall-clock bound a healthy-but-slow VM schedule trips — the
     /// flake class M24 proved in this guest; as the adapter's per-block
-    /// round-trip bound it could also latch a failure mid-start, before the
-    /// engine's poll published the track start (the erasure path of M25 §1.1,
-    /// which then fails `wait_track`). The one deliberate fast bound (the
-    /// wedge test's 20 ms) is passed explicitly, unchanged.
+    /// round-trip bound it could also turn a slow start into a mid-start
+    /// failure error before the engine's poll published the track start (the
+    /// erasure path of M25 §1.1, which then fails `wait_track`). The one
+    /// deliberate fast bound (the wedge test's 20 ms) is passed explicitly,
+    /// unchanged.
     const WAIT: Duration = Duration::from_secs(30);
     /// Liveness policy for the in-process control peers. The framework
     /// default (`Liveness::default()`: 100 ms interval, 5 s timeout) is a
@@ -1912,7 +1843,7 @@ mod dsp_hosted_tests {
             self.latency as u32
         }
 
-        fn process(&mut self, buf: &mut [f32]) {
+        fn process(&mut self, buf: &mut [f32]) -> HostResult<()> {
             self.calls += 1;
             match self.kind {
                 Kind::Gain => {
@@ -1951,6 +1882,7 @@ mod dsp_hosted_tests {
                     }
                 }
             }
+            Ok(())
         }
 
         fn reset(&mut self) {
@@ -1970,10 +1902,11 @@ mod dsp_hosted_tests {
             self.latency
         }
 
-        fn process(&mut self, buf: &mut [f32]) {
+        fn process(&mut self, buf: &mut [f32]) -> HostResult<()> {
             for stage in &mut self.stages {
-                stage.process(buf);
+                stage.process(buf)?;
             }
+            Ok(())
         }
 
         fn reset(&mut self) {
@@ -2200,21 +2133,10 @@ mod dsp_hosted_tests {
         spec: PcmSpecWire,
         ring_frames: u32,
         block_timeout: Duration,
-    ) -> (
-        HostDspChain<NamedPcmRings>,
-        Arc<DspFailureWatch>,
-        HostOutcome,
-    ) {
-        let watch = Arc::new(DspFailureWatch::new());
+    ) -> (HostDspChain<NamedPcmRings>, HostOutcome) {
         let (session, host) = open_session(stages.clone(), spec, ring_frames);
-        let chain = HostDspChain::new(
-            session,
-            stages,
-            ring_frames,
-            block_timeout,
-            Arc::clone(&watch),
-        );
-        (chain, watch, host)
+        let chain = HostDspChain::new(session, stages, ring_frames, block_timeout);
+        (chain, host)
     }
 
     fn reap(host: HostOutcome) {
@@ -2223,14 +2145,14 @@ mod dsp_hosted_tests {
 
     #[test]
     fn dsp_gain_round_trip_is_bit_exact_with_zero_latency() {
-        let (mut chain, _watch, host) = open_chain(vec![gain_desc(2.0)], SPEC_WIRE, 8, WAIT);
+        let (mut chain, host) = open_chain(vec![gain_desc(2.0)], SPEC_WIRE, 8, WAIT);
         assert_eq!(chain.name(), "resident-dsp");
         assert_eq!(chain.latency_frames(), 0);
         let input: Vec<f32> = (0..7)
             .flat_map(|i| [i as f32 / 4.0, -(i as f32 / 4.0)])
             .collect();
         let mut buf = input.clone();
-        chain.process(&mut buf);
+        chain.process(&mut buf).unwrap();
         for (got, want) in buf.iter().zip(input.iter()) {
             assert_eq!(*got, want * 2.0);
         }
@@ -2246,7 +2168,7 @@ mod dsp_hosted_tests {
     #[test]
     fn dsp_delay_chain_round_trip_is_the_delayed_stream_and_reset_clears_it() {
         const LATENCY: u32 = 3;
-        let (mut chain, _watch, host) = open_chain(vec![delay_desc(LATENCY)], SPEC_WIRE, 8, WAIT);
+        let (mut chain, host) = open_chain(vec![delay_desc(LATENCY)], SPEC_WIRE, 8, WAIT);
         assert_eq!(chain.latency_frames(), LATENCY);
 
         // The block comes back delayed by the chain's latency: the first
@@ -2255,7 +2177,7 @@ mod dsp_hosted_tests {
         let mut expected = vec![0.0; LATENCY as usize * 2];
         expected.extend_from_slice(&input[..(10 - LATENCY as usize) * 2]);
         let mut buf = input.clone();
-        chain.process(&mut buf);
+        chain.process(&mut buf).unwrap();
         assert_eq!(buf, expected);
 
         // A reset (seek) clears the chain state — the next cleared block
@@ -2274,7 +2196,7 @@ mod dsp_hosted_tests {
         for _ in 0..RESET_SETTLE_BLOCKS {
             chain.reset();
             buf.copy_from_slice(&input);
-            chain.process(&mut buf);
+            chain.process(&mut buf).unwrap();
             if buf == expected {
                 settled = true;
                 break;
@@ -2290,7 +2212,7 @@ mod dsp_hosted_tests {
 
     #[test]
     fn dsp_prepare_reconfigures_on_a_format_change() {
-        let (mut chain, _watch, host) = open_chain(vec![gain_desc(2.0)], SPEC_WIRE, 8, WAIT);
+        let (mut chain, host) = open_chain(vec![gain_desc(2.0)], SPEC_WIRE, 8, WAIT);
         let generations = chain.session().generations();
         chain.prepare(AudioSpec::new(48_000, 1)).unwrap();
         assert_eq!(
@@ -2306,7 +2228,7 @@ mod dsp_hosted_tests {
             "a reconfigure bumps both generations"
         );
         let mut buf = [0.25f32, -0.5, 0.125];
-        chain.process(&mut buf);
+        chain.process(&mut buf).unwrap();
         assert_eq!(buf, [0.5, -1.0, 0.25]);
         drop(chain);
         reap(host);
@@ -2315,10 +2237,10 @@ mod dsp_hosted_tests {
     #[test]
     fn dsp_prepare_with_the_same_format_clears_state_without_reconfigure() {
         const LATENCY: u32 = 2;
-        let (mut chain, _watch, host) = open_chain(vec![delay_desc(LATENCY)], SPEC_WIRE, 8, WAIT);
+        let (mut chain, host) = open_chain(vec![delay_desc(LATENCY)], SPEC_WIRE, 8, WAIT);
         let input: Vec<f32> = (0..6).flat_map(|i| [i as f32, -(i as f32)]).collect();
         let mut buf = input.clone();
-        chain.process(&mut buf);
+        chain.process(&mut buf).unwrap();
         // The delay line now holds the block's tail: without a reset the next
         // block would start with that tail instead of the initial state.
         let generations = chain.session().generations();
@@ -2339,7 +2261,7 @@ mod dsp_hosted_tests {
         for _ in 0..RESET_SETTLE_BLOCKS {
             chain.prepare(SPEC).unwrap();
             buf.copy_from_slice(&input);
-            chain.process(&mut buf);
+            chain.process(&mut buf).unwrap();
             if buf == expected {
                 settled = true;
                 break;
@@ -2353,29 +2275,40 @@ mod dsp_hosted_tests {
 
     #[test]
     fn dsp_refusal_at_prepare_is_loud_and_poisons_the_chain() {
-        let (mut chain, watch, host) =
-            open_chain(vec![stage("fake:reconfig-refuse")], SPEC_WIRE, 8, WAIT);
+        let (mut chain, host) = open_chain(vec![stage("fake:reconfig-refuse")], SPEC_WIRE, 8, WAIT);
         let error = chain.prepare(AudioSpec::new(48_000, 1)).unwrap_err();
         assert!(matches!(error, CoreError::Dsp(_)), "{error}");
         assert!(
             error.to_string().contains("refuses a reconfigure"),
             "{error}"
         );
-        // The refusal is latched for the engine and the chain bypasses.
-        let info = watch.take().expect("the refusal must latch");
-        assert!(info.message.contains("resident DSP"), "{info:?}");
+        // The refusal is latched: the decode thread discards a `prepare`
+        // error, so the poisoned stage returns the sticky first failure
+        // from its next `process` (RFC 0014 §4.3).
         assert_eq!(
             chain.latency_frames(),
             0,
-            "a poisoned chain is an undelayed bypass"
+            "a poisoned chain reports no latency"
         );
         let input = [0.5f32, -0.25];
         let mut buf = input;
-        chain.process(&mut buf);
-        assert_eq!(buf, input, "a poisoned chain passes audio through");
-        // The sticky error is returned again, without touching the session.
+        let process_error = chain.process(&mut buf).unwrap_err();
+        assert!(
+            matches!(process_error, CoreError::Dsp(_)),
+            "{process_error}"
+        );
+        assert!(
+            process_error.to_string().contains("refuses a reconfigure"),
+            "{process_error}"
+        );
+        assert_eq!(buf, input, "a poisoned chain must not corrupt the block");
+        // The sticky failure is returned again, without touching the session.
         assert!(matches!(
             chain.prepare(SPEC).unwrap_err(),
+            CoreError::Dsp(_)
+        ));
+        assert!(matches!(
+            chain.process(&mut buf).unwrap_err(),
             CoreError::Dsp(_)
         ));
         drop(chain);
@@ -2388,23 +2321,28 @@ mod dsp_hosted_tests {
 
     #[test]
     fn dsp_death_mid_stream_is_loud_and_poisons_the_chain() {
-        let (mut chain, watch, host) = open_chain(vec![stage("fake:die")], SPEC_WIRE, 8, WAIT);
+        let (mut chain, host) = open_chain(vec![stage("fake:die")], SPEC_WIRE, 8, WAIT);
         // Two good blocks (the fake crashes on its third process call).
         let mut buf = [0.5f32, -0.25, 0.125, 0.0625];
-        chain.process(&mut buf);
+        chain.process(&mut buf).unwrap();
         assert_eq!(buf, [1.0, -0.5, 0.25, 0.125]);
         let mut buf = [0.5f32, -0.25, 0.125, 0.0625];
-        chain.process(&mut buf);
+        chain.process(&mut buf).unwrap();
         assert_eq!(buf, [1.0, -0.5, 0.25, 0.125]);
-        // The third block round-trip dies with the host: the adapter latches
-        // a loud failure and leaves the buffer untouched.
+        // The third block round-trip dies with the host: `process` returns a
+        // loud `Dsp` error and leaves the buffer untouched.
         let input = [0.5f32, -0.25, 0.125, 0.0625];
         let mut buf = input;
-        chain.process(&mut buf);
+        let error = chain.process(&mut buf).unwrap_err();
+        assert!(matches!(error, CoreError::Dsp(_)), "{error}");
+        assert!(error.to_string().contains("resident DSP"), "{error}");
         assert_eq!(buf, input, "a dead resident must not corrupt the block");
-        let info = watch.take().expect("the death must latch");
-        assert!(info.message.contains("resident DSP"), "{info:?}");
         assert_eq!(chain.latency_frames(), 0);
+        // The sticky failure is returned again, without touching the session.
+        assert!(matches!(
+            chain.process(&mut buf).unwrap_err(),
+            CoreError::Dsp(_)
+        ));
         // The host thread died with the crash (bounded reap via the channel).
         let outcome = host.recv_timeout(WAIT).expect("host must finish");
         assert!(outcome.is_err(), "the crash panic, got {outcome:?}");
@@ -2413,7 +2351,7 @@ mod dsp_hosted_tests {
 
     #[test]
     fn dsp_wedge_is_a_bounded_wait_and_poisons_the_chain() {
-        let (mut chain, watch, host) = open_chain(
+        let (mut chain, host) = open_chain(
             vec![stage("fake:slow")],
             SPEC_WIRE,
             8,
@@ -2422,16 +2360,21 @@ mod dsp_hosted_tests {
         let input = [0.5f32, -0.25, 0.125, 0.0625];
         let mut buf = input;
         let start = Instant::now();
-        chain.process(&mut buf);
+        let error = chain.process(&mut buf).unwrap_err();
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(1),
             "the block round-trip must be bounded, took {elapsed:?}"
         );
+        assert!(matches!(error, CoreError::Dsp(_)), "{error}");
+        assert!(error.to_string().contains("timed out"), "{error}");
         assert_eq!(buf, input, "a wedged resident must not corrupt the block");
-        let info = watch.take().expect("the wedge must latch");
-        assert!(info.message.contains("timed out"), "{info:?}");
         assert_eq!(chain.latency_frames(), 0);
+        // The sticky failure is returned again, without touching the session.
+        assert!(matches!(
+            chain.process(&mut buf).unwrap_err(),
+            CoreError::Dsp(_)
+        ));
         drop(chain);
         let outcome = host.recv_timeout(WAIT).expect("host must finish");
         assert!(outcome.is_ok(), "{outcome:?}");
@@ -2553,10 +2496,6 @@ mod dsp_hosted_tests {
         clock: NullClock,
         events: EventReceiver,
         host: HostOutcome,
-        /// The engine's failure watch, shared with the installed chain, so a
-        /// test can wait for a resident failure to latch without polling the
-        /// engine (see `wait_latch`).
-        watch: Arc<DspFailureWatch>,
         _dir: tempfile::TempDir,
     }
 
@@ -2587,14 +2526,7 @@ mod dsp_hosted_tests {
             engine.set_limiter_enabled(false);
             let (session, host) =
                 open_session_with(stages.clone(), SPEC_WIRE, DEFAULT_DSP_RING_FRAMES, resident);
-            let watch = engine.resident_dsp_watch();
-            let chain = HostDspChain::new(
-                session,
-                stages,
-                DEFAULT_DSP_RING_FRAMES,
-                block_timeout,
-                Arc::clone(&watch),
-            );
+            let chain = HostDspChain::new(session, stages, DEFAULT_DSP_RING_FRAMES, block_timeout);
             engine.set_dsp_chain(vec![Box::new(chain)]);
             let queue = names
                 .iter()
@@ -2610,7 +2542,6 @@ mod dsp_hosted_tests {
                 clock,
                 events,
                 host,
-                watch,
                 _dir: dir,
             }
         }
@@ -2665,30 +2596,6 @@ mod dsp_hosted_tests {
                 |e| e.current_index() == Some(index) && e.duration_frames().is_some(),
                 WAIT,
             )
-        }
-
-        /// Wait until a resident failure has latched the engine's failure
-        /// watch, without polling the engine, and hand the latch back. The
-        /// next poll then deterministically finds the failure latched with
-        /// the decode thread's queued track start still unprocessed — the
-        /// erasure window of M25 §1.1 — instead of racing the start
-        /// publication. The watch is a latch, so taking and re-latching the
-        /// same info preserves it exactly: the chain is poisoned after its
-        /// first failure (nothing can latch in between) and the engine is
-        /// not polled meanwhile. The 1 ms sleep is the poll cadence the other
-        /// waits use, not an ordering mechanism.
-        fn wait_latch(&self) -> bool {
-            let deadline = Instant::now() + WAIT;
-            loop {
-                if let Some(info) = self.watch.take() {
-                    self.watch.latch(info);
-                    return true;
-                }
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
         }
 
         fn wait_buffered(&mut self) -> bool {
@@ -2829,15 +2736,9 @@ mod dsp_hosted_tests {
     #[test]
     fn engine_fails_the_track_when_the_resident_dies() {
         // The crash is armed, not counted. The old call-count trigger (the
-        // fake panicked on its third block) raced the start publication: the
-        // decode thread queues `TrackStarted` before its first block, and a
-        // crash a few blocks later can latch the DSP failure before the
-        // engine's poll has processed that message — the failure teardown
-        // (`join_decode`) then discards it, `duration_frames()` is never
-        // published, and `wait_track(0)` below could never succeed. Arming
-        // the trigger only after the start is observed makes the crash
-        // deterministically mid-run — a stronger claim, with every assertion
-        // unchanged.
+        // fake panicked on its third block) raced the start publication; the
+        // armed trigger makes the crash deterministically mid-run — a
+        // stronger claim, with every assertion unchanged.
         let die = Arc::new(AtomicBool::new(false));
         let mut h = DspHarness::with_resident(
             &["track7_44100.tst"],
@@ -2848,11 +2749,13 @@ mod dsp_hosted_tests {
         h.engine.play_index(0).unwrap();
         assert!(h.wait_track(0));
         die.store(true, Ordering::Relaxed);
-        // The fake crashes on the next block: the adapter latches, the
-        // engine's poll fails the track (RFC 0006 §8) — never the player.
-        // The wait pumps the clock so the decode thread keeps flowing to the
-        // armed crash: without a consumer the engine ring fills and the
-        // decode thread parks in its write loop before the next block.
+        // The fake crashes on the next block: the adapter returns a loud
+        // `Dsp` error from `process`, the decode thread reports it and ends
+        // the track (RFC 0014 §3.5; RFC 0006 §8: the resident's death fails
+        // the track, never the player). The wait pumps the clock so the
+        // decode thread keeps flowing to the armed crash: without a consumer
+        // the engine ring fills and the decode thread parks in its write
+        // loop before the next block.
         assert!(
             h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
             "the run must stop when the resident dies"
@@ -2871,47 +2774,66 @@ mod dsp_hosted_tests {
             })
             .expect("a resident death must publish an error event");
         assert!(error.message.contains("resident DSP"), "{error:?}");
+        assert_eq!(error.kind, ErrorKind::Dsp, "{error:?}");
         assert!(h.engine.last_error().is_some());
 
-        // The player survives: a new run plays (the poisoned chain bypasses
-        // bit-exactly) and finishes naturally.
+        // Resuming on the failed chain is an error (RFC 0014 §4.3): the
+        // poisoned stage returns its sticky failure from `process`, so the
+        // next run fails loudly the same way instead of playing through.
         h.engine.play_index(0).unwrap();
         assert_eq!(h.engine.transport(), TransportState::Playing);
-        // The wait measures what the run actually needs - the transport
-        // reaching Stopped - with a generous stall escape, not a pump-count
-        // proxy: a pump only advances the run while the ring holds audio, so
-        // counting pumped frames bounds pathology, never progress, and any
-        // underrun (the start drain, a lagging decode thread, the
-        // StartDrained handshake) burns budget without advancing the run. A
-        // healthy run finishes in well under a second of pumping; only a
-        // wedged run reaches the escape, and it fails loudly with the step
-        // named. The claim is unchanged: the run must finish, and the
-        // position must land exactly at 44_100.
         assert!(
             h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
-            "the second run must finish"
+            "the poisoned chain must fail the next run loudly"
+        );
+        let events = h.drain_events();
+        let error_count = events
+            .iter()
+            .filter(|event| matches!(event, Event::Error(_)))
+            .count();
+        assert_eq!(error_count, 1, "one error event per run, got {error_count}");
+        assert!(h.engine.last_error().is_some());
+
+        // Recovery is an explicit replacement (RFC 0014 §4.3): a fresh chain
+        // with fresh rings plays the track to its end, with no error.
+        let (fresh, fresh_host) = open_chain(
+            vec![gain_desc(2.0)],
+            SPEC_WIRE,
+            DEFAULT_DSP_RING_FRAMES,
+            WAIT,
+        );
+        h.engine.set_dsp_chain(vec![Box::new(fresh)]);
+        h.engine.play_index(0).unwrap();
+        assert_eq!(h.engine.transport(), TransportState::Playing);
+        assert!(
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+            "the fresh chain must finish the track"
         );
         assert_eq!(h.engine.position_frames(), 44_100);
+        let events = h.drain_events();
+        assert!(
+            !events.iter().any(|event| matches!(event, Event::Error(_))),
+            "a healthy fresh chain must not publish an error: {events:?}"
+        );
         h.finish();
+        reap(fresh_host);
     }
 
     #[test]
     fn engine_publishes_the_start_when_the_resident_dies_right_after_it() {
         // The wart this pins (M25 §1.1, A25): the decode thread queues
         // `TrackStarted` — which carries the duration — before its first
-        // block, and a resident death on that first block latches the failure
-        // before the engine's poll has processed the queued start. The
-        // failure teardown used to discard the message, so the window showed
-        // the new track's index with the previous track's duration. The
-        // failure contract is unchanged; the start must survive it.
+        // block, and a resident death on that first block used to race the
+        // start publication through the engine's failure teardown, which
+        // discarded the queued message. With RFC 0014 the failure rides the
+        // decode thread's own report queue instead: `TrackStarted` is queued
+        // first, the error second, and the engine processes both in order —
+        // the erasure window is gone, and the start survives the failure.
         //
         // The crash is armed before the second run starts, so the resident
         // dies on the second track's first block — immediately after its
-        // start was queued. `wait_latch` below holds the engine's polls until
-        // the failure has latched, so the first poll deterministically finds
-        // the start unprocessed in the queue: the erasure window, not a
-        // race. The first track is two blocks long, so the fake's third-call
-        // crash cannot fire during the first run.
+        // start was queued. The first track is two blocks long, so the
+        // fake's third-call crash cannot fire during the first run.
         let die = Arc::new(AtomicBool::new(false));
         let mut h = DspHarness::with_resident(
             &["track7_2048.tst", "track2_44100.tst"],
@@ -2941,19 +2863,17 @@ mod dsp_hosted_tests {
         h.engine.play_index(1).unwrap();
         assert_eq!(h.engine.current_index(), Some(1));
         assert!(
-            h.wait_latch(),
-            "the resident's death must latch the failure watch"
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+            "the run must stop when the resident dies on the first block"
         );
-        // One poll handles the failure; the teardown must publish the start
-        // the decode thread already queued.
-        h.engine.poll().unwrap();
+        // The start the decode thread queued before the failure was
+        // published: the window shows the started track's own duration.
         assert_eq!(
             h.engine.duration_frames(),
             Some(44_100),
             "the reported duration must be the started track's, not the previous track's"
         );
         assert_eq!(h.engine.current_index(), Some(1));
-        assert_eq!(h.engine.transport(), TransportState::Stopped);
         assert_eq!(
             h.engine.position_frames(),
             0,
@@ -2990,15 +2910,15 @@ mod dsp_hosted_tests {
             "the track change must carry the started track's duration"
         );
 
-        // The player survives: the next run plays (the poisoned chain
-        // bypasses bit-exactly) and finishes naturally.
+        // The player survives: it accepts the next run, which fails loudly
+        // on the poisoned chain (RFC 0014 §4.3 — recovery is a fresh chain,
+        // pinned in the death test above).
         h.engine.play_index(1).unwrap();
         assert_eq!(h.engine.transport(), TransportState::Playing);
         assert!(
             h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
-            "the next run must finish"
+            "the poisoned chain must fail the next run loudly"
         );
-        assert_eq!(h.engine.position_frames(), 44_100);
         h.finish();
     }
 
@@ -3012,10 +2932,11 @@ mod dsp_hosted_tests {
         h.engine.play_index(0).unwrap();
         assert!(h.wait_track(0));
         // The resident sleeps on its first block; the adapter's bounded wait
-        // (20 ms) latches a timeout and the engine fails the track — the
-        // engine can never hang on a wedged resident.
+        // (20 ms) turns the wedge into a loud `Dsp` error from `process`,
+        // the decode thread reports it and ends the track — the engine can
+        // never hang on a wedged resident.
         assert!(
-            h.wait_idle(|e| e.transport() == TransportState::Stopped, WAIT),
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
             "the run must stop when the resident wedges"
         );
         let events = h.drain_events();
@@ -3027,6 +2948,7 @@ mod dsp_hosted_tests {
             })
             .expect("a wedged resident must publish an error event");
         assert!(error.message.contains("timed out"), "{error:?}");
+        assert_eq!(error.kind, ErrorKind::Dsp, "{error:?}");
         h.finish();
     }
 }

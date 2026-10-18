@@ -245,8 +245,9 @@ impl DspStage for MockDsp {
         self.channels = spec.channels;
         Ok(())
     }
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> Result<()> {
         self.frames_processed += (buf.len() / usize::from(self.channels.max(1))) as u64;
+        Ok(())
     }
     fn reset(&mut self) {
         self.resets += 1;
@@ -321,7 +322,7 @@ mod tests {
 
         let mut buf = vec![0.0; spec.samples_for(512)];
         let n = dec.read(&mut buf).unwrap();
-        dsp.process(&mut buf[..spec.samples_for(n)]);
+        dsp.process(&mut buf[..spec.samples_for(n)]).unwrap();
         assert_eq!(dsp.frames_processed, 512);
     }
 }

@@ -14,6 +14,9 @@
 //! plain factor the chain multiplies every sample by) and `passthrough`
 //! (empty params; bit-exact bypass). Both report zero latency. Unknown ids
 //! and undecodable params are refused with `DspError` before any ring exists.
+//! A stage that fails mid-run (`DspStage::process -> Err`, RFC 0014) fails
+//! the whole chain: the first error is mapped and ends the helper loudly
+//! through the same `DspError` path.
 //!
 //! **License:** GPL-3.0-or-later, no §7 exception (RFC 0006 §8 erratum: a
 //! resident crate carries its resident's license; this one links GPL-only
@@ -64,10 +67,11 @@ impl DspStage for Gain {
         Ok(())
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> CoreResult<()> {
         for sample in buf.iter_mut() {
             *sample *= self.factor;
         }
+        Ok(())
     }
 
     fn reset(&mut self) {}
@@ -92,7 +96,9 @@ impl DspStage for Passthrough {
         Ok(())
     }
 
-    fn process(&mut self, _buf: &mut [f32]) {}
+    fn process(&mut self, _buf: &mut [f32]) -> CoreResult<()> {
+        Ok(())
+    }
 
     fn reset(&mut self) {}
 }
@@ -155,10 +161,13 @@ impl ResidentChain for Chain {
         self.latency
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> Result<()> {
         for stage in &mut self.stages {
-            stage.process(buf);
+            stage
+                .process(buf)
+                .map_err(|error| MediaHostError::OperationFailed(error.to_string()))?;
         }
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -293,7 +302,7 @@ mod tests {
         assert_eq!(chain.latency_frames(), 0);
         let mut chain = chain;
         let mut buf = [0.25, -0.5, 0.75, 1.0];
-        chain.process(&mut buf);
+        chain.process(&mut buf).unwrap();
         assert_eq!(buf, [0.25, -0.5, 0.75, 1.0]);
         chain.reset();
     }
@@ -303,7 +312,7 @@ mod tests {
         let mut chain = StageResident::new().open(SPEC, &[gain_desc(2.0)]).unwrap();
         assert_eq!(chain.latency_frames(), 0);
         let mut buf = [0.25, -0.5, 0.125, 1.0];
-        chain.process(&mut buf);
+        chain.process(&mut buf).unwrap();
         assert_eq!(buf, [0.5, -1.0, 0.25, 2.0]);
     }
 
@@ -323,7 +332,7 @@ mod tests {
             )
             .unwrap();
         let mut buf = [1.0, -1.0];
-        chain.process(&mut buf);
+        chain.process(&mut buf).unwrap();
         assert_eq!(buf, [2.0, -2.0]);
     }
 

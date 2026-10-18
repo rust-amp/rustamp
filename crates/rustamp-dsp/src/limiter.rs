@@ -533,11 +533,11 @@ impl DspStage for Limiter {
         Ok(())
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> Result<()> {
         let channels = self.channels;
         if !self.active || channels == 0 {
             // Exact bypass: the buffer is not touched.
-            return;
+            return Ok(());
         }
         let ceiling = self.ceiling;
         for frame in buf.chunks_exact_mut(channels) {
@@ -589,6 +589,7 @@ impl DspStage for Limiter {
                 self.delay_pos = 0;
             }
         }
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -727,7 +728,7 @@ mod tests {
         let mut i = 0;
         while at < buf.len() {
             let len = (sizes[i % sizes.len()] * channels).min(buf.len() - at);
-            limiter.process(&mut buf[at..at + len]);
+            limiter.process(&mut buf[at..at + len]).unwrap();
             at += len;
             i += 1;
         }
@@ -751,7 +752,7 @@ mod tests {
         assert!(limiter.control().enabled());
         let input: Vec<f32> = noise(1024 * 2, 2).iter().map(|s| s * 8.0).collect();
         let mut out = input.clone();
-        limiter.process(&mut out);
+        limiter.process(&mut out).unwrap();
         assert!(out.iter().all(|s| s.abs() <= limiter.ceiling()));
     }
 
@@ -898,7 +899,7 @@ mod tests {
         input[2001] = f32::INFINITY;
         input[3000] = f32::NEG_INFINITY;
         let mut out = input.clone();
-        limiter.process(&mut out);
+        limiter.process(&mut out).unwrap();
         assert!(
             out.iter()
                 .all(|s| s.is_finite() && s.abs() <= limiter.ceiling())
@@ -906,7 +907,7 @@ mod tests {
         assert_eq!(out[1000 + LA * 2], 0.0);
         // No poison stays behind: a clean block afterwards is finite too.
         let mut clean = noise(4096 * 2, 16);
-        limiter.process(&mut clean);
+        limiter.process(&mut clean).unwrap();
         assert!(clean.iter().all(|s| s.is_finite()));
         assert!(clean.iter().all(|s| s.abs() <= limiter.ceiling()));
     }
@@ -915,15 +916,15 @@ mod tests {
     fn reset_clears_the_history() {
         let mut used = stage(true, 2);
         let mut warm: Vec<f32> = noise(8192 * 2, 7).iter().map(|s| s * 6.0).collect();
-        used.process(&mut warm);
+        used.process(&mut warm).unwrap();
         used.reset();
 
         let mut fresh = stage(true, 2);
         let probe: Vec<f32> = noise(4096 * 2, 8).iter().map(|s| s * 3.0).collect();
         let mut a = probe.clone();
         let mut b = probe;
-        used.process(&mut a);
-        fresh.process(&mut b);
+        used.process(&mut a).unwrap();
+        fresh.process(&mut b).unwrap();
         assert_eq!(bits(&a), bits(&b));
     }
 
@@ -933,14 +934,14 @@ mod tests {
         limiter.control().set_enabled(true);
         let input: Vec<f32> = noise(2048, 9).iter().map(|s| s * 8.0).collect();
         let mut out = input.clone();
-        limiter.process(&mut out);
+        limiter.process(&mut out).unwrap();
         assert_eq!(bits(&out), bits(&input), "still a bypass until reset");
         assert_eq!(limiter.latency_frames(), 0);
 
         limiter.reset();
         assert_eq!(limiter.latency_frames(), LA as u32);
         let mut out = input.clone();
-        limiter.process(&mut out);
+        limiter.process(&mut out).unwrap();
         assert!(out.iter().all(|s| s.abs() <= limiter.ceiling()));
     }
 
@@ -955,7 +956,7 @@ mod tests {
 
         let quiet = vec![0.5_f32; 4 * LA];
         let mut out = quiet.clone();
-        limiter.process(&mut out);
+        limiter.process(&mut out).unwrap();
         assert!(out[..LA].iter().all(|s| *s == 0.0));
         assert_eq!(bits(&out[LA..]), bits(&quiet[..quiet.len() - LA]));
 
@@ -963,7 +964,7 @@ mod tests {
         let frames = FS as usize;
         let hot = vec![3.0_f32; frames];
         let mut out = hot.clone();
-        limiter.process(&mut out);
+        limiter.process(&mut out).unwrap();
         assert!(out[..LA].iter().all(|s| *s == 0.0));
         // Under the true-peak criterion, the 0-to-3.0 DC start transient
         // exhibits Gibbs-like overshoot through the windowed-sinc reconstruction
@@ -992,7 +993,7 @@ mod tests {
         let input: Vec<f32> = noise(4096, 17).iter().map(|s| s * 1e-40).collect();
         assert!(input.iter().all(|s| s.is_subnormal() || *s == 0.0));
         let mut out = input.clone();
-        limiter.process(&mut out);
+        limiter.process(&mut out).unwrap();
         assert!(out[..LA].iter().all(|s| *s == 0.0));
         assert_eq!(bits(&out[LA..]), bits(&input[..input.len() - LA]));
     }
@@ -1222,7 +1223,7 @@ mod tests {
         assert_eq!(limiter.latency_frames(), 5);
         let input: Vec<f32> = noise(4096, 21).iter().map(|s| s * 8.0).collect();
         let mut out = input.clone();
-        limiter.process(&mut out);
+        limiter.process(&mut out).unwrap();
         assert!(out.iter().all(|s| s.abs() <= limiter.ceiling()));
     }
 }

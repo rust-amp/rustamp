@@ -420,7 +420,11 @@ pub trait DspStage: Send {
     fn prepare(&mut self, spec: AudioSpec) -> Result<()>;
 
     /// Process interleaved frames in place. `buf.len()` is a multiple of the prepared channel count.
-    fn process(&mut self, buf: &mut [f32]);
+    ///
+    /// `Err` is terminal for the current run (RFC 0014 §4): the engine ends
+    /// the track loudly and the resident helper exits loudly. The Ok path
+    /// must not allocate; the Err path may, the run ends there.
+    fn process(&mut self, buf: &mut [f32]) -> Result<()>;
 
     /// Clear internal state (filter history); called on seek and track change.
     fn reset(&mut self);

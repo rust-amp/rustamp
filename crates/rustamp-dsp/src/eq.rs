@@ -444,16 +444,16 @@ impl DspStage for Equalizer {
         Ok(())
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> Result<()> {
         self.poll_control();
         let channels = self.channels;
         if channels == 0 {
-            return;
+            return Ok(());
         }
         for frame in buf.chunks_exact_mut(channels) {
             if !self.enabled && self.mix == 0.0 {
                 // Exact bypass: the rest of the buffer is left untouched.
-                return;
+                return Ok(());
             }
             if self.sub_pos == 0 {
                 self.advance_params();
@@ -493,6 +493,7 @@ impl DspStage for Equalizer {
                 self.mix = (self.mix - self.mix_step).max(0.0);
             }
         }
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -563,7 +564,7 @@ mod tests {
     fn gain_db(state: &EqState, freq: f64) -> f64 {
         let input = sine(freq, 0.25, FS as usize);
         let mut out = input.clone();
-        stage(state, 1).process(&mut out);
+        stage(state, 1).process(&mut out).unwrap();
         let half = FS as usize / 2;
         20.0 * (rms(&out[half..]) / rms(&input[half..])).log10()
     }
@@ -582,7 +583,7 @@ mod tests {
         ] {
             let mut eq = stage(&state, 2);
             let mut out = input.clone();
-            eq.process(&mut out);
+            eq.process(&mut out).unwrap();
             assert_eq!(bits(&out), bits(&input), "disabled must be a bypass");
         }
     }
@@ -592,7 +593,7 @@ mod tests {
         let input = noise(4096 * 2);
         let mut eq = stage(&enabled([0.0; EQ_BANDS], 0.0), 2);
         let mut out = input.clone();
-        eq.process(&mut out);
+        eq.process(&mut out).unwrap();
         assert_eq!(bits(&out), bits(&input));
     }
 
@@ -600,17 +601,17 @@ mod tests {
     fn bypass_after_a_fade_out_equals_the_input_exactly() {
         let mut eq = stage(&enabled([12.0; EQ_BANDS], -6.0), 2);
         let mut warm = noise(4096 * 2);
-        eq.process(&mut warm);
+        eq.process(&mut warm).unwrap();
         eq.control().set(&EqState {
             enabled: false,
             ..enabled([12.0; EQ_BANDS], -6.0)
         });
         // Run the fade out (10 ms = 480 frames) to completion.
         let mut fade = noise(2048 * 2);
-        eq.process(&mut fade);
+        eq.process(&mut fade).unwrap();
         let input = noise(4096 * 2);
         let mut out = input.clone();
-        eq.process(&mut out);
+        eq.process(&mut out).unwrap();
         assert_eq!(bits(&out), bits(&input));
     }
 
@@ -623,7 +624,9 @@ mod tests {
             // Preamp at the anchor: an exact linear factor of 10^(dB/20).
             let input = noise(1024);
             let mut out = input.clone();
-            stage(&enabled([0.0; EQ_BANDS], db), 1).process(&mut out);
+            stage(&enabled([0.0; EQ_BANDS], db), 1)
+                .process(&mut out)
+                .unwrap();
             let factor = 10.0_f64.powf(f64::from(db) / 20.0);
             for (x, y) in input.iter().zip(out.iter()) {
                 let expected = (f64::from(*x) * factor) as f32;
@@ -667,7 +670,7 @@ mod tests {
         let mut eq = stage(&enabled(bands, 6.0), 2);
         let left = noise(2048);
         let mut buf: Vec<f32> = left.iter().flat_map(|l| [*l, 0.0]).collect();
-        eq.process(&mut buf);
+        eq.process(&mut buf).unwrap();
         assert!(buf.iter().skip(1).step_by(2).all(|r| *r == 0.0));
         assert!(buf.iter().step_by(2).any(|l| *l != 0.0));
     }
@@ -693,7 +696,7 @@ mod tests {
             if block == 60 {
                 eq.control().set(&state);
             }
-            eq.process(chunk);
+            eq.process(chunk).unwrap();
         }
         let max_step = out
             .windows(2)
@@ -720,7 +723,7 @@ mod tests {
                 bands[0] = 12.0;
                 eq.control().set(&enabled(bands, -12.0));
             }
-            eq.process(chunk);
+            eq.process(chunk).unwrap();
         }
         let max_step = out
             .windows(2)
@@ -739,7 +742,7 @@ mod tests {
 
         let mut used = stage(&state, 2);
         let mut warm = noise(8192 * 2);
-        used.process(&mut warm);
+        used.process(&mut warm).unwrap();
         used.reset();
 
         let mut fresh = stage(&state, 2);
@@ -748,8 +751,8 @@ mod tests {
         impulse[1] = -1.0;
         let mut a = impulse.clone();
         let mut b = impulse;
-        used.process(&mut a);
-        fresh.process(&mut b);
+        used.process(&mut a).unwrap();
+        fresh.process(&mut b).unwrap();
         assert_eq!(bits(&a), bits(&b));
     }
 
@@ -764,7 +767,7 @@ mod tests {
         eq.prepare(AudioSpec::new(22_050, 2)).unwrap();
         let input = noise(4096 * 2);
         let mut out = input.clone();
-        eq.process(&mut out);
+        eq.process(&mut out).unwrap();
         assert_eq!(bits(&out), bits(&input));
         assert!(out.iter().all(|s| s.is_finite()));
     }
@@ -807,7 +810,9 @@ mod tests {
         // Preamp at +6 dB: the exact linear factor, bit for bit.
         let input = noise(1024);
         let mut out = input.clone();
-        stage(&enabled([0.0; EQ_BANDS], 6.0), 1).process(&mut out);
+        stage(&enabled([0.0; EQ_BANDS], 6.0), 1)
+            .process(&mut out)
+            .unwrap();
         let factor = 10.0_f64.powf(6.0 / 20.0);
         for (x, y) in input.iter().zip(out.iter()) {
             let expected = (f64::from(*x) * factor) as f32;
@@ -824,7 +829,9 @@ mod tests {
         let dc = vec![0.5_f32; FS as usize];
         for preamp in [0.0_f32, 12.0, -12.0] {
             let mut out = dc.clone();
-            stage(&enabled([12.0; EQ_BANDS], preamp), 1).process(&mut out);
+            stage(&enabled([12.0; EQ_BANDS], preamp), 1)
+                .process(&mut out)
+                .unwrap();
             let factor = 10.0_f64.powf(f64::from(preamp) / 20.0) as f32;
             let half = FS as usize / 2;
             for (i, y) in out[half..].iter().enumerate() {
@@ -857,7 +864,7 @@ mod tests {
 
         let mut used = stage(&state, 1);
         let mut out = hostile.clone();
-        used.process(&mut out);
+        used.process(&mut out).unwrap();
         assert!(
             out.iter().all(|s| s.is_finite()),
             "nothing non-finite leaves"
@@ -871,15 +878,15 @@ mod tests {
         // signal's filter history and compare against the wrong stage.
         let probe = sine(440.0, 0.25, 2048);
         let mut a = probe.clone();
-        used.process(&mut a);
+        used.process(&mut a).unwrap();
         let mut fresh = stage(&state, 1);
         let mut sanitized: Vec<f32> = hostile
             .iter()
             .map(|s| if s.is_finite() { *s } else { 0.0 })
             .collect();
-        fresh.process(&mut sanitized);
+        fresh.process(&mut sanitized).unwrap();
         let mut b = probe.clone();
-        fresh.process(&mut b);
+        fresh.process(&mut b).unwrap();
         assert_eq!(
             bits(&a),
             bits(&b),
@@ -897,7 +904,9 @@ mod tests {
         let mut out = input.clone();
         // An enabled, flat stage: the processing loop runs (no early bypass)
         // but no band and no preamp touches the samples.
-        stage(&enabled([0.0; EQ_BANDS], 0.0), 1).process(&mut out);
+        stage(&enabled([0.0; EQ_BANDS], 0.0), 1)
+            .process(&mut out)
+            .unwrap();
         assert_eq!(bits(&out), bits(&input), "subnormals pass through");
     }
 }

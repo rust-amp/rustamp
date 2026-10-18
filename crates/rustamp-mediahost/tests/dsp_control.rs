@@ -139,11 +139,12 @@ impl ResidentChain for StatefulChain {
         0
     }
 
-    fn process(&mut self, buf: &mut [f32]) {
+    fn process(&mut self, buf: &mut [f32]) -> Result<()> {
         for sample in buf {
             *sample += self.history;
         }
         self.history = 1.0;
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -453,6 +454,116 @@ fn reset_without_an_acknowledgement_is_a_loud_bounded_timeout() {
         outcome.is_err(),
         "the player hung up on a failed conversation: the host ends loud, never clean, got {outcome:?}"
     );
+}
+
+/// RFC 0014 acceptance 3 (M14 finding F1's smallest reproduction): a chain
+/// that fails after block *n* with a message. Before RFC 0014 no
+/// `ResidentChain` could express this at all; now `process` returns `Err`,
+/// the pump propagates it, `serve_dsp` sends the existing `DspError` message
+/// with the text, and the player side fails loud and sticky.
+///
+/// The chain passes every block through bit-exactly until block
+/// `FAIL_AT_BLOCK + 1`, which fails with "clipping detected".
+const FAIL_AT_BLOCK: usize = 1024;
+
+struct FailingChain {
+    blocks: usize,
+}
+
+impl ResidentChain for FailingChain {
+    fn latency_frames(&self) -> u32 {
+        0
+    }
+
+    fn process(&mut self, _buf: &mut [f32]) -> Result<()> {
+        self.blocks += 1;
+        if self.blocks > FAIL_AT_BLOCK {
+            return Err(MediaHostError::OperationFailed("clipping detected".into()));
+        }
+        // The healthy blocks pass through bit-exactly.
+        Ok(())
+    }
+
+    fn reset(&mut self) {}
+}
+
+struct FailingResident;
+
+impl DspResident for FailingResident {
+    fn open(&self, _spec: PcmSpecWire, _stages: &[DspStageDesc]) -> Result<Box<dyn ResidentChain>> {
+        Ok(Box::new(FailingChain { blocks: 0 }))
+    }
+}
+
+#[test]
+fn midrun_chain_failure_is_a_loud_dsp_error_carrying_the_text() {
+    let (mut session, done) = start(FailingResident);
+    let mut out = [0.0; 2];
+    // Write FAIL_AT_BLOCK + 1 frames one at a time. The in-ring holds a
+    // single frame, so the host reads each frame as its own block: the
+    // first FAIL_AT_BLOCK blocks pass through bit-exactly and pile up
+    // unread in the back-ring, and block FAIL_AT_BLOCK + 1 fails. Keeping
+    // the healthy backlog in flight across the failure is what makes the
+    // terminal read deterministic: the drain-then-close order hands the
+    // healthy frames over first, and by the time the ring is empty the
+    // `DspError` has long landed (the session's drained-close wake race of
+    // M19 §3 would only be reachable by a read blocked on an empty ring
+    // exactly at the failure).
+    for frame in 0..=FAIL_AT_BLOCK {
+        let v = frame as f32 / 8.0;
+        write_pcm(&mut session, &[v, -v], "the frames around the failure");
+    }
+    // The host failed on the last block and exited with an error; its
+    // outcome also proves the DspError was sent and flushed.
+    let outcome = done
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the host must publish its failure instead of hanging");
+    let host_error = outcome.expect_err("a failed chain must end the host with Err");
+    assert!(
+        host_error.to_string().contains("clipping detected"),
+        "the host's error must carry the chain's text: {host_error}"
+    );
+    // Read the healthy backlog back: every frame that comes back is the
+    // bit-exact passthrough, and the stream ends in the loud failure —
+    // never a drained-close `Ok(0)`.
+    let mut drained = 0usize;
+    loop {
+        match session.read(&mut out, Some(STALL_WAIT)) {
+            Ok(0) => panic!("a mid-run chain failure must not turn into EOS"),
+            Ok(frames) => {
+                assert_eq!(frames, 1, "one frame per read");
+                let want = drained as f32 / 8.0;
+                assert_eq!(out, [want, -want], "frame {drained} must be bit-exact");
+                drained += 1;
+            }
+            Err(error) => {
+                assert!(
+                    matches!(error, MediaHostError::Disconnected(_)),
+                    "the failure must be a disconnect, got {error:?}"
+                );
+                let message = error.to_string();
+                assert!(
+                    message.contains("resident DSP failed"),
+                    "the DspError text must reach the player: {message}"
+                );
+                assert!(
+                    message.contains("clipping detected"),
+                    "the chain's diagnostic must survive: {message}"
+                );
+                break;
+            }
+        }
+    }
+    assert!(
+        drained <= FAIL_AT_BLOCK,
+        "the drain cannot exceed the healthy blocks, got {drained}"
+    );
+    // The failure is sticky: a later read fails loud again, never `Ok(0)`.
+    let again = session
+        .read(&mut out, Some(STALL_WAIT))
+        .expect_err("the failure must stick, never EOS");
+    assert!(again.to_string().contains("clipping detected"), "{again}");
+    drop(session);
 }
 
 #[test]

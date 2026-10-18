@@ -45,6 +45,15 @@
 //! resampled path the converter additionally holds a final `±1.0` (0 dBFS)
 //! ceiling (see [`FormatConverter`]), so the ring never holds a sample above
 //! full scale however the equalizer and the limiter are set.
+//!
+//! # DSP stage failures
+//!
+//! `DspStage::process` is fallible (RFC 0014): an `Err` is terminal for the
+//! run. `emit` handles it exactly like a decoder error — report it, push the
+//! chain's held-back audio out, end the track — and the first failure sticks:
+//! one `Event::Error` per run, never a second one when the flush re-fails.
+//! The NaN sanitizer above stays as defense in depth on the Ok path; an `Err`
+//! bypasses sample post-processing entirely.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -362,6 +371,7 @@ pub(crate) fn spawn(
         pending_skip: None,
         drain_epoch: start_epoch,
         report_start: start_epoch.is_some(),
+        stage_failed: false,
     };
     let handle = std::thread::Builder::new()
         .name("rustamp-decode".into())
@@ -403,6 +413,19 @@ enum Outcome {
 pub(crate) fn clamped_index(index: u32, delta: i32, len: usize) -> u32 {
     let last = len.saturating_sub(1) as i64;
     (i64::from(index) + i64::from(delta)).clamp(0, last) as u32
+}
+
+/// What one block run through the DSP chain did.
+enum Emit {
+    /// The block was processed and written (or trimmed); the track continues.
+    Continue,
+    /// The write was cut short; the track must be abandoned.
+    Abandoned,
+    /// A DSP stage failed (RFC 0014 §3.5): the track ends loudly. The first
+    /// failure was reported and the chain flushed in `emit`; a stage that
+    /// keeps failing during that flush ends the track through the same arm
+    /// without a second report.
+    StageFailed,
 }
 
 struct Worker {
@@ -449,6 +472,9 @@ struct Worker {
     /// [`DecodeOut::StartDrained`] and wait for the engine's re-base. A seek
     /// before the first write takes this over with its own report.
     report_start: bool,
+    /// A DSP stage failure was already reported this run (RFC 0014 §4.2,
+    /// first failure sticks): the worker is one run, so the flag is per run.
+    stage_failed: bool,
 }
 
 impl Worker {
@@ -624,8 +650,12 @@ impl Worker {
                     // The decoder is exhausted: emit what the DSP chain still
                     // holds. The converter's tail stays in it; the run loop
                     // either continues it with the next track or flushes it.
-                    if !self.flush_dsp() {
-                        return self.abandoned();
+                    match self.flush_dsp() {
+                        Emit::Continue => {}
+                        Emit::Abandoned => return self.abandoned(),
+                        // A stage failing during the end-of-track flush ends
+                        // the track loudly (RFC 0014 §3.5).
+                        Emit::StageFailed => return Outcome::Ended,
                     }
                     let _ = self.tx.send(DecodeOut::TrackEnded {
                         frames: self.stream_pos().saturating_sub(self.track_start),
@@ -635,8 +665,10 @@ impl Worker {
                 }
                 Ok(n) => n,
                 Err(Error::FormatChanged { from, to }) => {
-                    if !self.on_format_changed(decoder.as_ref(), from, to) {
-                        return self.abandoned();
+                    match self.on_format_changed(decoder.as_ref(), from, to) {
+                        Emit::Continue => {}
+                        Emit::Abandoned => return self.abandoned(),
+                        Emit::StageFailed => return Outcome::Ended,
                     }
                     continue;
                 }
@@ -644,14 +676,20 @@ impl Worker {
                     self.report_error(&e);
                     // Keep the audio decoded before the error: the DSP
                     // chain's part now, the converter's in the run loop.
-                    if !self.flush_dsp() {
-                        return self.abandoned();
+                    match self.flush_dsp() {
+                        Emit::Continue => {}
+                        Emit::Abandoned => return self.abandoned(),
+                        Emit::StageFailed => return Outcome::Ended,
                     }
                     return Outcome::Ended;
                 }
             };
-            if !self.emit(frames) {
-                return self.abandoned();
+            match self.emit(frames) {
+                Emit::Continue => {}
+                Emit::Abandoned => return self.abandoned(),
+                // A stage error ends the track loudly (RFC 0014 §3.5): the
+                // error was reported and the chain flushed in `emit`.
+                Emit::StageFailed => return Outcome::Ended,
             }
         }
     }
@@ -665,9 +703,8 @@ impl Worker {
     }
 
     /// Run the first `frames` frames of `in_buf` through the DSP chain, drop
-    /// the chain's start-up frames, and convert and write the rest. `false`
-    /// when the write was cut short and the track must be abandoned.
-    fn emit(&mut self, frames: usize) -> bool {
+    /// the chain's start-up frames, and convert and write the rest.
+    fn emit(&mut self, frames: usize) -> Emit {
         let src_ch = usize::from(self.src.channels);
         let samples = frames * src_ch;
         // ReplayGain first: a per-track constant scale on the raw decoder
@@ -677,17 +714,34 @@ impl Worker {
         let rg_gain = self.rg_gain;
         crate::replaygain::apply_gain(&mut self.in_buf[..samples], rg_gain);
         for stage in &mut self.dsp {
-            stage.process(&mut self.in_buf[..samples]);
+            if let Err(e) = stage.process(&mut self.in_buf[..samples]) {
+                // RFC 0014 §3.5: a stage error is terminal for the run and is
+                // handled exactly like the decoder-error arm: report it, keep
+                // the audio the chain still holds, end the track. The first
+                // failure sticks (§4.2): a stage that keeps failing during
+                // the latency flush ends the track through this same arm
+                // without a second report.
+                if !self.stage_failed {
+                    self.stage_failed = true;
+                    self.report_error(&e);
+                    if matches!(self.flush_dsp(), Emit::Abandoned) {
+                        return Emit::Abandoned;
+                    }
+                }
+                return Emit::StageFailed;
+            }
         }
         let skip = self.dsp_trim.min(frames);
         self.dsp_trim -= skip;
         if skip == frames {
-            return true;
+            return Emit::Continue;
         }
         let block = &mut self.in_buf[skip * src_ch..samples];
         // Without the limiter nothing else stops a NaN or an infinity from a
         // decoder or a stage; on the resampled path one would also spread
-        // over a whole FFT block. Finite samples are left untouched.
+        // over a whole FFT block. Finite samples are left untouched. This is
+        // defense in depth on the Ok path only (RFC 0014 §4.5): an `Err`
+        // bypasses sample post-processing entirely.
         for sample in block.iter_mut() {
             if !sample.is_finite() {
                 *sample = 0.0;
@@ -696,24 +750,27 @@ impl Worker {
         self.vis.push(block);
         let out_frames = self.conv.convert(block, &mut self.out_buf);
         let written = self.write_all(self.cfg.device.samples_for(out_frames));
-        written == out_frames
+        if written == out_frames {
+            Emit::Continue
+        } else {
+            Emit::Abandoned
+        }
     }
 
     /// Push `latency` frames of silence through the DSP chain so that the
-    /// audio it holds back comes out (see the module docs). `false` when the
-    /// write was cut short.
-    fn flush_dsp(&mut self) -> bool {
+    /// audio it holds back comes out (see the module docs).
+    fn flush_dsp(&mut self) -> Emit {
         let src_ch = usize::from(self.src.channels);
         let mut left = self.dsp_latency();
         while left > 0 {
             let n = left.min(READ_FRAMES);
             self.in_buf[..n * src_ch].fill(0.0);
-            if !self.emit(n) {
-                return false;
+            match self.emit(n) {
+                Emit::Continue => left -= n,
+                other => return other,
             }
-            left -= n;
         }
-        true
+        Emit::Continue
     }
 
     /// End the converter's stream: emit the tail the resampler is still
@@ -921,14 +978,15 @@ impl Worker {
 
     /// Switch to a new decoder format mid-stream. What the old format still
     /// holds (the DSP chain's delay, then the converter's tail) is emitted
-    /// first. `false` when that write was cut short.
-    fn on_format_changed(&mut self, decoder: &dyn Decoder, from: AudioSpec, to: AudioSpec) -> bool {
-        if !self.flush_dsp() {
-            return false;
+    /// first.
+    fn on_format_changed(&mut self, decoder: &dyn Decoder, from: AudioSpec, to: AudioSpec) -> Emit {
+        match self.flush_dsp() {
+            Emit::Continue => {}
+            other => return other,
         }
         self.flush_converter();
         if self.quitting || self.stopped || self.pending_skip.is_some() {
-            return false;
+            return Emit::Abandoned;
         }
         self.src = to;
         self.conv.prepare(to, self.cfg.device);
@@ -949,7 +1007,7 @@ impl Worker {
             to,
             stream: Box::new(decoder.stream_info()),
         });
-        true
+        Emit::Continue
     }
 
     fn frames_to_duration(&self, frames: u64) -> Duration {

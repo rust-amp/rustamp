@@ -160,7 +160,6 @@ use rustamp_dsp::{EqControl, Equalizer, Limiter, LimiterControl};
 
 use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, clamped_index, spawn};
 use crate::replaygain::{ReplayGainControl, ReplayGainMode};
-use crate::resident::DspFailureWatch;
 use crate::ring::{GainState, RingSync, make_render};
 
 /// Engine configuration.
@@ -227,10 +226,6 @@ pub struct Engine {
     started: bool,
     vis_rx: Option<Consumer<VisFrame>>,
     dsp: Vec<Box<dyn DspStage>>,
-    /// Failure watch of a resident-backed DSP stage (opt-in; see
-    /// [`Engine::resident_dsp_watch`]). Polled in [`Engine::poll`]; a latched
-    /// failure fails the track.
-    dsp_watch: Arc<DspFailureWatch>,
     /// Equalizer state as published in [`PlayerState::eq`].
     eq: EqState,
     /// Where [`Engine::eq`] reaches the running [`Equalizer`] stage.
@@ -318,7 +313,6 @@ impl Engine {
             started: false,
             vis_rx: None,
             dsp: Vec::new(),
-            dsp_watch: Arc::new(DspFailureWatch::new()),
             eq: EqState::default(),
             eq_control: Arc::new(EqControl::default()),
             limiter_control: Arc::new(LimiterControl::default()),
@@ -358,26 +352,17 @@ impl Engine {
     /// Install the DSP chain. Stages run on the decode thread; they are
     /// prepared for every track and on a mid-stream format change.
     ///
+    /// `DspStage::process` is fallible (RFC 0014): an `Err` from a stage ends
+    /// the track loudly — the decode thread reports it, flushes the chain and
+    /// ends the track, and the engine publishes the error (the first failure
+    /// per run sticks).
+    ///
     /// To run the chain in a resident process (opt-in, RFC 0006 §6), build a
     /// stage with [`resident::DspResidentConfig::open`] (or wrap a session in
-    /// [`resident::HostDspChain::new`]) using this engine's
-    /// [`Engine::resident_dsp_watch`] and install it here. The default chain
+    /// [`resident::HostDspChain::new`]) and install it here. The default chain
     /// is empty and never spawns a process.
     pub fn set_dsp_chain(&mut self, dsp: Vec<Box<dyn DspStage>>) {
         self.dsp = dsp;
-    }
-
-    /// The failure watch a resident-backed DSP stage latches into.
-    ///
-    /// Pass this to [`resident::DspResidentConfig::open`] (or
-    /// [`resident::HostDspChain::new`]) and install the returned stage with
-    /// [`Engine::set_dsp_chain`]. The core `DspStage::process` contract is
-    /// infallible (M14 finding F1), so a resident that dies or wedges
-    /// mid-stream latches its first failure here and passes audio through
-    /// bit-exactly; [`Engine::poll`] takes the latch and fails the track —
-    /// the resident's death fails the track, never the player (RFC 0006 §8).
-    pub fn resident_dsp_watch(&self) -> Arc<DspFailureWatch> {
-        Arc::clone(&self.dsp_watch)
     }
 
     /// Replace the play queue. Entries must be re-openable (paths or URLs).
@@ -986,12 +971,6 @@ impl Engine {
     /// Process everything the decode thread reported and publish the resulting
     /// events. Call this regularly (the CLI example does it every few ms).
     pub fn poll(&mut self) -> Result<()> {
-        // A resident-backed DSP stage latched a failure: fail the track
-        // (RFC 0006 §8), never the player.
-        if let Some(info) = self.dsp_watch.take() {
-            self.handle_dsp_failure(info);
-            return Ok(());
-        }
         if self.transport == TransportState::Playing
             && let Some(err) = self.output.stream_error()
         {
@@ -1281,56 +1260,6 @@ impl Engine {
         self.bus.publish(Event::Error(info));
     }
 
-    /// Tear down the run after a resident-backed DSP stage latched a failure
-    /// (RFC 0006 §8: the resident's death fails the track, never the player).
-    ///
-    /// The stage has bypassed bit-exactly since the failure, so the audio
-    /// decoded up to it stays valid; the run stops, the remaining buffered
-    /// audio is dropped and the error is published — the same teardown as a
-    /// fatal output failure, except the output itself stays usable. The
-    /// decode thread is never blocked longer than the stage's bounded block
-    /// round-trip, so the join cannot hang.
-    ///
-    /// A track start the decode thread already reported is published before
-    /// the freeze (M25 §1.1, A25): the join below holds the queued
-    /// `TrackStarted` instead of discarding it, and delivering it here keeps
-    /// the window on the track that actually started — its duration, not the
-    /// previous track's.
-    fn handle_dsp_failure(&mut self, info: ErrorInfo) {
-        let frozen_timeline = self.timeline_frames();
-        self.send(DecodeMsg::Stop);
-        self.sync.set_active(false);
-        let _ = self.output.pause();
-        let _ = self.flush_output();
-        // Deliver the held start before the freeze and the error
-        // publication. The `TrackStarted` arm touches no timeline origin and
-        // no output, so the freeze stays exact, the error is still published
-        // once, and the sticky output-flush failure cannot be armed. Every
-        // other queued report stays discarded — it describes the run being
-        // torn down (a `Seeked` would re-enter the output flush, an `Error`
-        // would publish twice, a `Stopped` would clear the control channel
-        // the `Stop` above still has to reach).
-        if let Some(start) = self.join_decode() {
-            let _ = self.on_decode_out(start);
-        }
-        self.transport = TransportState::Stopped;
-        self.timeline_origin = frozen_timeline;
-        self.clock_origin = self.output.played_frames();
-        self.pending_seek = None;
-        self.start_drain = None;
-        self.end_of_stream = None;
-        self.sync.set_written(0);
-        self.sync.set_consumed(0);
-        self.error = Some(info.clone());
-        self.bus.publish(Event::Error(info));
-        self.bus
-            .publish(Event::StateChanged(TransportState::Stopped));
-        self.bus.publish(Event::PositionChanged {
-            position_ms: self.position_ms(),
-            duration_ms: self.duration_ms,
-        });
-    }
-
     fn start_run(&mut self) -> Result<()> {
         if let Some(message) = &self.flush_failure {
             return Err(Error::Output(message.clone()));
@@ -1453,9 +1382,11 @@ impl Engine {
 
     /// Join the decode thread and take the ring producer and DSP chain back.
     /// Returns a track start the decode thread queued but the engine never
-    /// processed, held instead of discarded (M25 §1.1, A25, M30): the
-    /// failure teardowns (`handle_dsp_failure` and `handle_output_error`)
-    /// deliver it, so a start that already happened survives the failure.
+    /// processed, held instead of discarded (M25 §1.1, A25, M30): the output
+    /// failure teardown (`handle_output_error`) delivers it, so a start that
+    /// already happened survives the failure. A DSP-stage failure needs no
+    /// delivery — RFC 0014 queues `TrackStarted` ahead of the error on the
+    /// decode thread's own report queue, so the start is published first.
     /// Every other caller discards it — the run it belongs to is over, and the
     /// next run publishes its own start.
     fn join_decode(&mut self) -> Option<DecodeOut> {

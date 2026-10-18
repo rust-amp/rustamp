@@ -45,7 +45,8 @@ pub trait ResidentChain: Send {
     /// Total chain latency in frames at the prepared rate.
     fn latency_frames(&self) -> u32;
     /// Process interleaved frames in place; the frame count never changes.
-    fn process(&mut self, buf: &mut [f32]);
+    /// `Err` ends the helper loudly via the existing `DspError` path (RFC 0014).
+    fn process(&mut self, buf: &mut [f32]) -> Result<()>;
     /// Clear internal state (filter history, look-ahead); rings untouched.
     fn reset(&mut self);
 }
@@ -213,7 +214,7 @@ fn pump<R: MappedRegion>(
         if let Some(transition) = poll_commands(peer, chain)? {
             return Ok(transition.into_pump());
         }
-        chain.process(&mut block[..frames * channels]);
+        chain.process(&mut block[..frames * channels])?;
         let mut offset = 0;
         while offset < frames {
             if let Some(transition) = poll_commands(peer, chain)? {
