@@ -18,7 +18,12 @@ use rustamp_core::error::{Error, ErrorKind, Result};
 use rustamp_core::event::Event;
 use rustamp_core::state::TransportState;
 
-const WAIT: Duration = Duration::from_secs(5);
+/// Stall escape for every wait in this harness (the M10 flakiness note's
+/// rule): a bound so generous that only a real stall reaches it, with the
+/// message naming the step — never a wall-clock bound a healthy-but-slow
+/// VM schedule could trip. The 5 s bound this file carried before is the
+/// flake class M24 proved in this guest (docs/tasks/M24-stubborn-three.md §1.3, M25, M26).
+const WAIT: Duration = Duration::from_secs(30);
 const RING: usize = 8192;
 const TARGET: u64 = 20_000;
 

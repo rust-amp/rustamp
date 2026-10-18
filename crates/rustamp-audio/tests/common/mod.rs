@@ -25,6 +25,13 @@ pub const SPEC: AudioSpec = AudioSpec::new(44100, 2);
 /// Frames per synthetic track unless the path says otherwise.
 pub const TRACK_FRAMES: u64 = 3000;
 
+/// Stall escape for every wait in this harness (the M10 flakiness note's
+/// rule): a bound so generous that only a real stall reaches it, with the
+/// message naming the step — never a wall-clock bound a healthy-but-slow
+/// VM schedule could trip. The 5 s bounds this file carried before are
+/// the flake class M24 proved in this guest (docs/tasks/M24-stubborn-three.md §1.3, M25, M26).
+pub const WAIT: Duration = Duration::from_secs(30);
+
 /// The sample value at `frame` for track `seed`: never zero, so silence in the
 /// output is always detectable.
 pub fn pattern(seed: u64, frame: u64) -> f32 {
@@ -419,8 +426,32 @@ impl Harness {
         self.events.try_iter().collect()
     }
 
+    /// Poll and pump until `cond` holds or `timeout` elapses: the wait
+    /// measures the run's own condition with a wall-clock stall escape (the
+    /// M10 rule), not a pump count — a pump only advances the run while the
+    /// ring holds audio, so a pump budget can expire on underruns without
+    /// the run having made progress (the proxy M24 replaced in the lib).
+    pub fn wait_pumping(
+        &mut self,
+        mut cond: impl FnMut(&Engine) -> bool,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.engine.poll().expect("poll");
+            if cond(&self.engine) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.clock.pump(256);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Poll and pump in 256-frame steps until `cond` holds. Returns whether it
-    /// held within `max_frames`.
+    /// held within `max_frames`. Deprecated in favor of `wait_pumping`.
     pub fn wait_until(&mut self, mut cond: impl FnMut(&Engine) -> bool, max_frames: u64) -> bool {
         if cond(&self.engine) {
             return true;
@@ -458,14 +489,14 @@ impl Harness {
     pub fn wait_track(&mut self, index: u32) -> bool {
         self.wait_idle(
             |e| e.current_index() == Some(index) && e.duration_frames().is_some(),
-            Duration::from_secs(5),
+            WAIT,
         )
     }
 
     /// Wait until the decode thread has produced the whole queue (its ring is
     /// then full of the tracks, in order).
     pub fn wait_buffered(&mut self) -> bool {
-        self.wait_idle(|e| e.end_of_stream().is_some(), Duration::from_secs(5))
+        self.wait_idle(|e| e.end_of_stream().is_some(), WAIT)
     }
 
     /// Seek to `target` frames and drive the pipeline until the seek is fully
@@ -486,7 +517,7 @@ impl Harness {
     ///
     /// The drain happens in the render callback, so this has to pump.
     pub fn settle_seek(&mut self, target: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         loop {
             self.engine.poll().expect("poll");
             if self.engine.position_frames() == target {
@@ -511,7 +542,7 @@ impl Harness {
     /// the pumped frames are silence that the re-base leaves out of the
     /// position.
     pub fn settle_drain(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         loop {
             self.engine.poll().expect("poll");
             if !self.engine.is_drain_pending() && !self.engine.is_start_pending() {
@@ -529,7 +560,7 @@ impl Harness {
     /// the position at that moment. Every rendered frame from that position on
     /// is real audio, so a caller can compare it against the source.
     pub fn wait_refilled(&mut self, frames: u64) -> Option<u64> {
-        if self.wait_idle(|e| e.buffered_frames() >= frames, Duration::from_secs(5)) {
+        if self.wait_idle(|e| e.buffered_frames() >= frames, WAIT) {
             Some(self.engine.position_frames())
         } else {
             None

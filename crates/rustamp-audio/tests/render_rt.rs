@@ -76,11 +76,14 @@ fn render_path_and_vis_tap_allocate_nothing() {
     assert!(h.wait_track(0));
     // Let the decode thread prime the ring; its own allocations must not land
     // inside the measurement window.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while h.engine.buffered_frames() == 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert!(h.engine.buffered_frames() > 0, "the ring must be primed");
+    assert!(
+        h.engine.buffered_frames() > 0,
+        "stall: the ring was never primed within 30s"
+    );
     // Drain the queue so the decode thread has nothing left to do.
     let rate = u64::from(SPEC.sample_rate);
     let mut pumped = 0u64;

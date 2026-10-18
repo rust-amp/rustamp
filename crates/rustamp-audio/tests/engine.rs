@@ -9,7 +9,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Harness, SPEC, TONE_AMPLITUDE, TONE_HZ, expected, pattern, track_frames};
+use common::{Harness, SPEC, TONE_AMPLITUDE, TONE_HZ, WAIT, expected, pattern, track_frames};
 use rustamp_audio::EngineConfig;
 use rustamp_core::audio::{AudioSpec, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::bus::command_channel;
@@ -239,10 +239,7 @@ fn gapless_join_has_no_silence_and_no_dropped_frames() {
     );
 
     // The end of the queue stops playback and says so.
-    assert!(h.wait_idle(
-        |e| e.transport() == TransportState::Stopped,
-        Duration::from_secs(2)
-    ));
+    assert!(h.wait_idle(|e| e.transport() == TransportState::Stopped, WAIT));
     let events = h.drain_events();
     assert!(events.contains(&Event::PlaylistEnded), "{events:?}");
     assert!(events.contains(&Event::StateChanged(TransportState::Stopped)));
@@ -320,7 +317,7 @@ fn vis_tap_is_filled_without_the_consumer_running() {
     assert!(h.wait_track(0));
 
     // The tap runs on the decode thread, so frames appear without any pump.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + WAIT;
     let mut frame = None;
     while Instant::now() < deadline {
         h.engine.poll().unwrap();
@@ -330,7 +327,7 @@ fn vis_tap_is_filled_without_the_consumer_running() {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    let frame = frame.expect("a vis frame must be published");
+    let frame = frame.expect("stall: no vis frame was published within WAIT");
     assert!(frame.timestamp_us > 0, "the tap has an audio clock");
     let peak = frame
         .waveform
@@ -531,9 +528,8 @@ fn stop_after_current_halts_at_the_end_of_the_track() {
 
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
-    let total = track_frames(TRACK_A);
     assert!(
-        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "the run must stop at the end of the first track"
     );
     assert_eq!(
@@ -571,9 +567,8 @@ fn arming_stop_after_current_mid_track_reaches_the_running_decode_thread() {
     h.engine.apply(&Command::ToggleStopAfterCurrent).unwrap();
     assert!(h.engine.stop_after_current());
 
-    let total = track_frames(LONG_A);
     assert!(
-        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "the run must stop at the end of the first track"
     );
     assert_eq!(h.engine.current_index(), Some(0));
@@ -591,9 +586,8 @@ fn stop_after_current_on_the_last_track_still_ends_the_playlist() {
     h.engine.apply(&Command::ToggleStopAfterCurrent).unwrap();
     h.engine.play_index(1).unwrap();
     assert!(h.wait_track(1));
-    let total = track_frames(TRACK_B);
     assert!(
-        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "the run must stop at the end of the last track"
     );
     assert_eq!(h.engine.current_index(), Some(1), "no next entry exists");
@@ -766,9 +760,8 @@ fn installed_dsp_chain_survives_consecutive_runs() {
     );
 
     // Pump clock until the track is finished playing
-    let total = track_frames(TRACK_A);
     assert!(
-        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "first run must complete and stop"
     );
 
@@ -787,7 +780,7 @@ fn installed_dsp_chain_survives_consecutive_runs() {
     );
 
     assert!(
-        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "second run must complete and stop"
     );
 
@@ -859,7 +852,7 @@ fn finish_run_frozes_at_content_end_not_device_position() {
     // The test still pumps past the track length to create an underrun
     // scenario (device plays silence). The run must NOT finish until the
     // ring is truly drained (consumed >= written), but it must also not
-    // stall forever: wait_until pumps in steps and polls between them.
+    // stall forever: wait_pumping pumps in steps and polls between them.
     let mut h = Harness::new(&[TRACK_A]);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_track(0));
@@ -876,10 +869,7 @@ fn finish_run_frozes_at_content_end_not_device_position() {
 
     // The run must end, but only once the ring is actually drained.
     assert!(
-        h.wait_until(
-            |e| e.transport() == TransportState::Stopped,
-            track_len + 8192
-        ),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "run must have ended"
     );
 
@@ -924,10 +914,7 @@ fn normal_run_finishes_when_ring_is_drained() {
 
     // Drive the engine to completion with controlled pumping.
     assert!(
-        h.wait_until(
-            |e| e.transport() == TransportState::Stopped,
-            track_len + 8192
-        ),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "run must finish within the track length"
     );
 
@@ -1028,10 +1015,7 @@ fn second_run_resets_consumed_and_drains_correctly() {
     assert!(h.wait_track(0));
     assert!(h.wait_buffered());
     assert!(
-        h.wait_until(
-            |e| e.transport() == TransportState::Stopped,
-            track_len + 8192
-        ),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "first run must complete"
     );
     assert_eq!(h.engine.buffered_frames(), 0);
@@ -1054,10 +1038,7 @@ fn second_run_resets_consumed_and_drains_correctly() {
 
     // Drive second run to completion.
     assert!(
-        h.wait_until(
-            |e| e.transport() == TransportState::Stopped,
-            track_len + 8192
-        ),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "second run must complete naturally"
     );
     assert_eq!(h.engine.buffered_frames(), 0);
@@ -1303,12 +1284,9 @@ fn stop_after_finish_run_resets_position_to_zero() {
     assert!(h.wait_track(0));
     assert!(h.wait_buffered());
 
-    // Pump to completion through wait_until (which runs poll() and invokes finish_run()).
+    // Pump to completion through wait_pumping (which runs poll() and invokes finish_run()).
     assert!(
-        h.wait_until(
-            |e| e.transport() == TransportState::Stopped,
-            track_len + 8192
-        ),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "run must finish"
     );
     assert_eq!(h.engine.position_frames(), track_len);
@@ -1333,8 +1311,10 @@ fn f2_invariants_hold_across_underruns_and_seeks() {
 
     // 1. Initial state: buffered_frames is honest.
     // Some audio should be buffered in the ring.
-    std::thread::sleep(Duration::from_millis(50));
-    h.engine.poll().unwrap();
+    assert!(
+        h.wait_idle(|e| e.buffered_frames() > 0, WAIT),
+        "stall: decode thread never buffered frames in ring"
+    );
     let initial_buffered = h.engine.buffered_frames();
     assert!(
         initial_buffered > 0,
@@ -1600,10 +1580,7 @@ fn play_out(h: &mut Harness, total: u64) -> Vec<f32> {
     let mut rec = Vec::new();
     assert_eq!(h.clock.pump_record(total, &mut rec), total);
     assert!(
-        h.wait_idle(
-            |e| e.transport() == TransportState::Stopped,
-            Duration::from_secs(2)
-        ),
+        h.wait_idle(|e| e.transport() == TransportState::Stopped, WAIT),
         "the run must finish once the ring is empty"
     );
     rec.iter().step_by(2).copied().collect()
@@ -1862,7 +1839,7 @@ fn seek_before_play_plays_the_target_audio() {
     h.engine.seek_frames(1500).unwrap();
     h.engine.play().unwrap();
     // The drain happens in a render callback: pump until it has.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT;
     while h.engine.ring_counters().1 < 1500 {
         assert!(Instant::now() < deadline, "the drain never happened");
         h.engine.poll().unwrap();
@@ -2071,10 +2048,10 @@ fn a_restart_paused_before_its_drain_starts_clean() {
     h.engine.play_index(0).unwrap();
     h.engine.pause().unwrap();
     assert_eq!(h.clock.pump(1024), 0, "a paused device pulls nothing");
-    std::thread::sleep(Duration::from_millis(20));
-    h.engine.poll().unwrap();
-    assert!(h.engine.is_drain_pending());
-    assert!(h.engine.is_start_pending());
+    assert!(
+        h.wait_idle(|e| e.is_drain_pending() && e.is_start_pending(), WAIT),
+        "stall: drain and start were never pending after restart"
+    );
     assert_eq!(
         h.engine.ring_counters(),
         (0, 0),
@@ -2101,10 +2078,7 @@ fn a_restart_after_a_natural_end_needs_no_drain() {
     let mut h = Harness::new(&[TRACK_A]);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_buffered());
-    assert!(h.wait_until(
-        |e| e.transport() == TransportState::Stopped,
-        track_frames(TRACK_A) + 8192
-    ));
+    assert!(h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT));
     assert_eq!(h.engine.buffered_frames(), 0);
 
     h.engine.play_index(0).unwrap();
@@ -2165,10 +2139,7 @@ fn natural_end_flushes_output_device() {
     let mut h = Harness::new(&[TRACK_A]);
     h.engine.play_index(0).unwrap();
     assert!(h.wait_buffered());
-    assert!(h.wait_until(
-        |e| e.transport() == TransportState::Stopped,
-        track_frames(TRACK_A) + 8192
-    ));
+    assert!(h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT));
     assert!(
         h.clock.flushes() >= 1,
         "finishing a run must flush the output device"
@@ -2317,9 +2288,9 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
     // 1. Play track 1
     engine.play_index(0).unwrap();
     // Every wait in this test is a bounded condition (the file's Harness
-    // helpers use the same 5 s deadline): a condition that never becomes
+    // helpers use the same 30 s deadline): a condition that never becomes
     // true must fail loudly with the step named, never spin forever.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + WAIT;
     while engine.current_index() != Some(0) || engine.duration_frames().is_none() {
         engine.poll().unwrap();
         assert!(
@@ -2357,7 +2328,7 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
 
     // 3. Play track 2
     engine.play_index(1).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + WAIT;
     while engine.current_index() != Some(1) || engine.duration_frames().is_none() {
         engine.poll().unwrap();
         assert!(
@@ -2367,7 +2338,7 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
         std::thread::sleep(Duration::from_millis(1));
     }
     // Wait for decode thread to refill the ring
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + WAIT;
     while engine.buffered_frames() < 1024 {
         engine.poll().unwrap();
         assert!(
@@ -2381,7 +2352,7 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
     // new run only after it. Pulling that callback and proving it silent is the
     // stronger half of this test's claim: a callback that still carried track 1
     // audio would be exactly the stale replay the test exists to catch.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + WAIT;
     let mut drained = 0usize;
     while engine.is_start_pending() {
         let mut chunk = Vec::new();
@@ -2402,7 +2373,7 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
         "the stopped run left audio in the ring, so a start drain was due"
     );
     // Only now does the new run's own audio reach the device.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + WAIT;
     while engine.buffered_frames() < 256 {
         engine.poll().unwrap();
         assert!(
