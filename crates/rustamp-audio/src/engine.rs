@@ -970,10 +970,8 @@ impl Engine {
     }
 
     /// Stop, reset the position, drop the device buffer and leave the device
-    /// open but paused. If flush fails with a genuine output error, closes the
-    /// output, reports the error and requires a fresh engine before playback
-    /// can start again. An unsupported flush (e.g. cpal) is treated as a
-    /// capability gap and leaves the device open.
+    /// open but paused. If flush is refused/fails, closes the output, reports
+    /// the error and requires a fresh engine before playback can start again.
     pub fn stop(&mut self) -> Result<()> {
         self.send(DecodeMsg::Stop);
         self.sync.set_active(false);
@@ -1497,44 +1495,32 @@ impl Engine {
     // Internals
     // -----------------------------------------------------------------------
 
-    /// Flush the output device buffer if supported.
-    ///
-    /// Never mistake a ring drain for an endpoint reset.
-    /// An unsupported flush (e.g. cpal) is a capability gap, not a device
-    /// failure: the stream remains open and usable, and playback continues.
-    /// A genuine output failure must stay loud, close the output, and latch a
-    /// restart barrier.
+    /// Never mistake a ring drain or an unsupported flush for an endpoint
+    /// reset. Closing is fail-closed, not a claim to retract hardware audio.
     fn flush_output(&mut self) -> Result<()> {
         if let Some(message) = &self.flush_failure {
             return Err(Error::Output(message.clone()));
         }
-        match self.output.flush() {
-            Ok(()) => Ok(()),
-            Err(Error::Unsupported(_)) => {
-                // Capability gap: the backend cannot drop its hardware endpoint
-                // backlog, but the stream is healthy. Proceed without endpoint flush.
-                Ok(())
+        if let Err(err) = self.output.flush() {
+            let frozen_timeline = self.timeline_frames();
+            self.sync.set_active(false);
+            let _ = self.output.pause();
+            let closed = self.output.close();
+            // close is not required to retain the device clock. Preserve the
+            // timeline across it even on an implementation that resets it.
+            self.timeline_origin = frozen_timeline;
+            self.clock_origin = self.output.played_frames();
+            let mut message = format!(
+                "{}: output flush failed: {err}; output closed; recreate the engine/output before playback",
+                self.output.name()
+            );
+            if let Err(close_err) = closed {
+                message.push_str(&format!("; closing output also failed: {close_err}"));
             }
-            Err(err) => {
-                let frozen_timeline = self.timeline_frames();
-                self.sync.set_active(false);
-                let _ = self.output.pause();
-                let closed = self.output.close();
-                // close is not required to retain the device clock. Preserve the
-                // timeline across it even on an implementation that resets it.
-                self.timeline_origin = frozen_timeline;
-                self.clock_origin = self.output.played_frames();
-                let mut message = format!(
-                    "{}: output flush failed: {err}; output closed; recreate the engine/output before playback",
-                    self.output.name()
-                );
-                if let Err(close_err) = closed {
-                    message.push_str(&format!("; closing output also failed: {close_err}"));
-                }
-                self.flush_failure = Some(message.clone());
-                Err(Error::Output(message))
-            }
+            self.flush_failure = Some(message.clone());
+            return Err(Error::Output(message));
         }
+        Ok(())
     }
 
     fn report_output_error(&mut self, err: &Error) {

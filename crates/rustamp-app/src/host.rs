@@ -342,6 +342,16 @@ impl HostStateLink {
         self.greeting
     }
 
+    /// Record the host greeting obtained during handshake supervision.
+    pub(crate) fn record_greeting(&mut self, protocol_version: u32, pid: u32) {
+        if self.greeting.is_none() {
+            self.greeting = Some(HostGreeting {
+                protocol_version,
+                pid,
+            });
+        }
+    }
+
     /// Whether the recorded greeting speaks a foreign protocol version.
     /// [`poll_at`](HostStateLink::poll_at) detaches on this with
     /// [`PollOutcome::VersionMismatch`] (see finding F2 in the module docs);

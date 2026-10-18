@@ -672,12 +672,14 @@ impl<B: HostBackend> Supervisor<B> {
             }
             match pending.transport.try_recv() {
                 Ok(Some(Message::Hello {
-                    protocol_version, ..
+                    protocol_version,
+                    pid,
                 })) => {
                     if protocol_version == rustamp_ipc::PROTOCOL_VERSION {
                         // Compatible Hello arrived! Barrier passed, attach and mark connected.
                         self.consecutive_failures = 0;
                         link.attach(pending.transport);
+                        link.record_greeting(protocol_version, pid);
                         self.process = Some(pending.process);
                         return;
                     } else {
@@ -722,11 +724,13 @@ impl<B: HostBackend> Supervisor<B> {
                 // Check if Hello is already buffered on the transport (e.g. in-memory tests or fast child):
                 match transport.try_recv() {
                     Ok(Some(Message::Hello {
-                        protocol_version, ..
+                        protocol_version,
+                        pid,
                     })) => {
                         if protocol_version == rustamp_ipc::PROTOCOL_VERSION {
                             self.consecutive_failures = 0;
                             link.attach(transport);
+                            link.record_greeting(protocol_version, pid);
                             self.process = Some(process);
                         } else {
                             self.record_failure();
@@ -1040,6 +1044,10 @@ mod tests {
         // 3. Next supervise pump processes Hello, passes the barrier and attaches.
         supervisor.supervise(&mut link);
         assert!(link.is_attached(), "must attach after compatible Hello");
+        assert!(
+            link.greeting().is_some(),
+            "must record greeting upon passing Hello barrier"
+        );
         assert_eq!(
             link.publish(&PlayerState::default()),
             crate::host::PublishOutcome::Sent
