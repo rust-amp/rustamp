@@ -14,7 +14,15 @@ slots looked busy.
 
 | job id | lane | started | task |
 |---|---|---|---|
-| (Mistral, subagent - notifies) | `wave73-resident-audio3` | 2026-10-18 03:20 | the three stubborn reds: two resident waits a widening did not fix, plus a regression in real_decode |
+| `9f38e282` / `89c6d365` | Paseo-Antigravity `paseo-wave-review`, `paseo-release-checklist` | 2026-10-18 11:20 | wave review (`W16`) and the executed release checklist - **both merged** (`f634b51`, `35faaf5`) |
+| (Claude, subagent - notifies) | `wave90-xtask` | 2026-10-18 11:45 | W16-F08 (full MPL/Apache texts in the notices), W16-F09 (stale placebo sentence in the generated README), checklist step 10 (an offline PE import inspector so `artifact_imports_verified` can become true) |
+| `paseo-wave90-audio` | Paseo-Antigravity | 2026-10-18 11:45 | W16-F02 (the orphaned `PlaybackOrder`), W16-F04 (`Prev` at a cycle start), W16-F07 (non-finite PCM sanitised before the tap) |
+| `paseo-wave90-vis` | Paseo-Antigravity | 2026-10-18 11:45 | W16-F06 (the spectrum mode never checks freshness, so a stop does not clear the screen; the test dodges it by switching mode) |
+
+**Google now starts through Paseo, not the agy bridge** (owner rule, 2026-10-18).
+Paseo agents are watchable (`ls`, `logs`, `attach`, `permit`) and their worktrees
+live under `C:\Users\micro\.paseo\worktrees\3ikyavhh\`. `agy` stays paused as
+described below. Codex and Muse stay on OpenCode subagents, which do notify.
 
 **agy is paused** since 2026-10-18 02:00: four jobs in a row failed with their
 worktrees in place and with quota available, so the channel stopped carrying and
@@ -38,6 +46,12 @@ only when a slot would otherwise sit empty.
 | `wave65-wake-honest` | the wake-timeout claim made honest by measurement (G5, `0f12340`) |
 | `wave67-ui-red` | the UI crate's two reds (J5, `6e22b56`) |
 | `wave67-wave-review` | the adversarial review of tonight's wave (W14, `84366d5`) |
+| `paseo-tray-findings` | the four small tray findings the verification left behind (`bc828a7`) |
+| `paseo-wmapp` | answered, not merged: winit 0.30.13 uses no `WM_APP` messages, so `WM_APP + 1` is collision-free - no change needed |
+| `wave89-merge-reds` | the mediahost helper now skips liveness frames; the xtask layout test can no longer be flipped red by a file lock (`c6a0765`) |
+| `wave89-shuffle-reds` | **the engine now owns the shuffle plan** (the worker built a second, divergent one), the stopped navigation, and three waits that did not wait (`6a606ef`) |
+| `paseo-wave-review` | the adversarial wave review, W16 (`f634b51`) |
+| `paseo-release-checklist` | the eighteen release steps classified and the host-side ones executed with exit codes (`35faaf5`) |
 
 ## Failed, relaunched elsewhere
 
@@ -87,3 +101,18 @@ jobs: audio 2, dsp 1, app 2 + platform 1, UI 2.
 Capture the tool's exit code into a variable **immediately** and gate on that
 variable - never on `$LASTEXITCODE` after another pipeline step has run, because
 that is how a red clippy was read as green and merged.
+
+## r49 (2026-10-18 11:10) - the first run on the upgraded VM
+
+`ran 82, failed 4, hung 0`, on 8 vCPU. **Every old red is gone**: the gapless
+seam, the audio resident, `dsp_roundtrip`, `real_decode`, the UI and the app no
+longer appear. The four failing binaries were all from the newest merges, and
+their five tests are named in the cards: the two S15 shuffle tests, the gapless
+stop test, the mediahost decoder-open helper and the xtask layout check. Two
+lanes took them (`c6a0765`, `6a606ef`), and the review independently confirmed
+the same engine/worker divergence the shuffle lane had found.
+
+## r50 (2026-10-18 11:35) - the confirmation run
+
+Started against `6a606ef` with all five fixes merged. Read `[FAIL]` / `[HNG]`
+before drawing any conclusion from it.
