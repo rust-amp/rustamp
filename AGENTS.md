@@ -9,6 +9,13 @@ Read these first, in this order:
 
 ## Short rules
 
+- **Tests always run in the interactive session** (owner rule, 2026-10-18).
+  The guest's session 0 has no desktop, so anything that opens a window, a
+  dialog, a menu or a plugin host fails there for the wrong reason. Run the
+  suite through the interactive-session path, not the plain session-0 one, and
+  never report a session-0 window failure as a product defect without re-running
+  it in the interactive session first.
+
 - **File search: use `es.exe`, always** (`C:\Program Files\Everything 1.5a\es.exe`),
   never a recursive directory walk. `es.exe <pattern>` prints full paths;
   `es.exe -r <regex>` for a pattern. The owner's standing instruction

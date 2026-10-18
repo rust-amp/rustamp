@@ -321,6 +321,29 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## Owner rule: tests run in the interactive session (2026-10-18 17:20)
+
+The guest's session 0 has no desktop. Everything that opens a window, a dialog,
+a menu or a plugin host therefore fails there for a reason that has nothing to
+do with the product: the four winit binaries, the host-window end-to-end test,
+and the 32-bit DLL acceptance test that proves host interaction.
+
+**From now on the suite runs through the interactive-session path.** The
+practical consequence for reading a result: a window-shaped failure seen in
+session 0 is **not** a product defect until it has been re-run in the interactive
+session. Two of the four reds in the `--ignored` pass were predicted for exactly
+this reason, and the other two are being decided the same way.
+
+Two related things learned while doing it:
+
+- A stray `rustamp-plughost32.exe` left alive by a previous run **locks its own
+  file**, so the next staging fails with access denied on that path before a
+  single test runs. The failure is loud and names the file, which is the right
+  behaviour, but a restart of the guest clears it and should be part of the
+  routine before a run that stages over a previous one.
+- The GUI-session path stages far more (436 MB against 84 MB), so it is the
+  slower of the two and should not be used for runs that cannot need a desktop.
+
 ## The virtual cable, and a real defect it exposed (2026-10-18 16:45)
 
 The guest now has exactly one VB-Audio Virtual Cable: the first install left two
