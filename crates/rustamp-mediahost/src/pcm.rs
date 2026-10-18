@@ -24,12 +24,13 @@ use crate::{MediaHostError, Result};
 /// counters already say the condition is met. Slicing the wait restores the
 /// contract — a skipped signal then costs one slice, not the whole bound.
 ///
-/// The signal can in fact be skipped. `rustamp-ipc` takes RFC 0007 §6.2's
-/// edge-triggered refinement (the producer signals `Data` only when its write
-/// started from empty, the consumer signals `Space` only when its read
-/// started from full), and each side decides that from a counter the peer
-/// owns, which it may read before the peer's last store. The exact
-/// interleaving is in `docs/tasks/W19-twoproc-stall.md`.
+/// The ring now signals after **every** counter advance. RFC 0007 §6.2's
+/// edge-triggered refinement was withdrawn, not repaired; see
+/// `docs/tasks/W19-ring-wake-root.md`. Slicing remains a defensive fallback
+/// for a missing/mispaired wake (injected by `tests/deaf_wake.rs`), not a
+/// prerequisite for progress with the current, correctly paired ring. A
+/// crashed peer's Drop does not signal or close: the independent control
+/// monitor must detect that failure and close its supervised ring view.
 ///
 /// 20 ms is the DSP worker's existing `CONTROL_POLL`, which already bounds
 /// both of its ring waits for the same kind of reason: invisible next to

@@ -2,9 +2,14 @@
 //!
 //! Out-of-process decoder and DSP host binaries (RFC 0006).
 //!
-//! This crate provides two binaries:
-//! - `rustamp-dechost`: hosts a single decoder process
-//! - `rustamp-dsphost`: hosts a DSP chain process
+//! This crate provides two intentionally unavailable framework binaries:
+//! - `rustamp-dechost`: refuses opens because no decoder resident is linked
+//! - `rustamp-dsphost`: refuses configuration because no DSP resident is linked
+//!
+//! The real residents ship separately as `rustamp-dechost-symphonia` and
+//! `rustamp-dsphost-stages`. Keeping them separate is the RFC 0006 §8 license
+//! boundary, not an unfinished PCM transfer. The legacy [`DecoderHost`] and
+//! [`DspHost`] single-message stubs below are not used by either serving loop.
 //!
 //! Both are 64-bit only (their residents are native 64-bit libraries).
 //!

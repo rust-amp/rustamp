@@ -348,6 +348,91 @@ fn bounded_read_timeout_is_not_eos_and_retry_delivers_pcm() {
     finish(session, done);
 }
 
+/// Changes telemetry only on a read that produces no PCM. The normal fixture
+/// changes it on every successful first block, which cannot catch lost final
+/// packet/format telemetry.
+struct BoundaryStatsResident;
+
+struct BoundaryStatsDecoder {
+    inner: Box<dyn ResidentDecoder>,
+    boundaries: u64,
+}
+
+impl DecoderResident for BoundaryStatsResident {
+    fn open(&self, location: MediaLocationWire) -> Result<Box<dyn ResidentDecoder>> {
+        Ok(Box::new(BoundaryStatsDecoder {
+            inner: resident::StubResident.open(location)?,
+            boundaries: 0,
+        }))
+    }
+}
+
+impl ResidentDecoder for BoundaryStatsDecoder {
+    fn info(&self) -> DecoderInfo {
+        self.inner.info()
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        let result = self.inner.read(out);
+        if matches!(result, Ok(0) | Err(MediaHostError::FormatChanged)) {
+            self.boundaries += 1;
+        }
+        result
+    }
+
+    fn seek(&mut self, to_ms: u64) -> Result<u64> {
+        self.inner.seek(to_ms)
+    }
+
+    fn stats(&self) -> (u64, Option<u32>) {
+        (self.boundaries, (self.boundaries > 0).then_some(64))
+    }
+}
+
+#[test]
+fn final_packet_statistics_arrive_before_eos_without_another_pcm_block() {
+    let (mut session, done, _) = start_resident("fixture:plain", 3, BoundaryStatsResident);
+    let mut out = [0.0; 22];
+    let mut received = 0;
+    loop {
+        let frames = read_pcm(&mut session, &mut out, "the final statistics drain").unwrap();
+        if frames == 0 {
+            break;
+        }
+        received += frames;
+    }
+    assert_eq!(received, resident::TOTAL, "statistics must not drop PCM");
+    assert_eq!(
+        session.stats(),
+        (1, Some(64)),
+        "final read telemetry was lost"
+    );
+    finish(session, done);
+}
+
+#[test]
+fn format_boundary_statistics_arrive_before_format_changed_is_returned() {
+    let (mut session, done, _) = start_resident("fixture:format", 3, BoundaryStatsResident);
+    let mut out = [0.0; 22];
+    let mut received = 0;
+    loop {
+        match read_pcm(&mut session, &mut out, "the format statistics drain") {
+            Ok(0) => panic!("EOS must not hide the format transition"),
+            Ok(frames) => received += frames,
+            Err(MediaHostError::FormatChanged) => break,
+            Err(error) => panic!("unexpected error: {error}"),
+        }
+    }
+    assert_eq!(received, resident::CHANGE);
+    assert_eq!(session.info().spec.channels, 1);
+    assert_eq!(
+        session.stats(),
+        (1, Some(64)),
+        "format read telemetry was lost"
+    );
+    finish(session, done);
+}
+
 #[test]
 fn decoder_error_is_loud_and_never_eos() {
     let (mut session, done, _) = start("fixture:fail", 3);

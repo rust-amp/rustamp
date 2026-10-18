@@ -602,3 +602,66 @@ fn bounded_dsp_read_timeout_is_not_eos_and_retry_delivers_pcm() {
     );
     finish(session, done);
 }
+
+#[test]
+fn back_ring_close_before_input_finished_is_sticky_failure_not_eos() {
+    let ((ar, aw), (br, bw)) = streams::streams();
+    let player = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, false).unwrap();
+    let (closed, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        assert!(matches!(
+            host.recv(STALL_WAIT).unwrap(),
+            Message::DspConfigure { .. }
+        ));
+        let offer = host.recv(STALL_WAIT).unwrap();
+        let input = NamedPcmRings
+            .open_directed(&offer, SPEC, RingDirection::MainToHost)
+            .unwrap();
+        host.send(Message::RingReady {
+            kind: RingKind::Pcm,
+            generation: input.consumer.generation(),
+        })
+        .unwrap();
+        let mut back = NamedPcmRings.create(SPEC, 1).unwrap();
+        let back_generation = back.producer.generation();
+        host.send(back.message).unwrap();
+        assert!(matches!(
+            host.recv(STALL_WAIT).unwrap(),
+            Message::RingReady { generation, kind: RingKind::Pcm }
+                if generation == back_generation
+        ));
+        host.send(Message::DspReady { latency_frames: 0 }).unwrap();
+        back.producer.close();
+        closed.send(()).unwrap();
+        // Keep the control channel healthy; EOF, DspError and a missing Pong
+        // must not accidentally satisfy the failure assertion below.
+        held.recv_timeout(STALL_WAIT)
+            .expect("stall: the test never released the healthy control peer");
+        drop(host);
+        done.send(()).unwrap();
+    });
+    let mut session = DspSession::open(player, NamedPcmRings, SPEC, &[], 1).unwrap();
+    observed
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the scripted host never closed the back-ring");
+    let error = session.read(&mut [0.0; 2], Some(STALL_WAIT)).unwrap_err();
+    assert!(matches!(error, MediaHostError::Disconnected(_)), "{error}");
+    assert!(
+        error.to_string().contains("before input finished"),
+        "{error}"
+    );
+    let again = session.write(&[0.25, -0.5]).unwrap_err();
+    assert!(matches!(again, MediaHostError::Disconnected(_)), "{again}");
+    assert!(
+        again.to_string().contains("before input finished"),
+        "{again}"
+    );
+    release.send(()).unwrap();
+    drop(session);
+    result
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the scripted host did not finish");
+}

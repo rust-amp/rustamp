@@ -605,10 +605,15 @@ impl<F: PcmRings> DspSession<F> {
                 Ok(frames)
             }
             Err(RingError::Closed) => {
-                // Drained close: a healthy control channel means the host
-                // published everything and closed gracefully (sticky EOS); a
-                // failed one means the host died (loud, never EOS).
+                // The host cannot finish normally before we finish writes.
+                // Ring close can beat DspError on the independent control
+                // stream, so a currently healthy monitor alone is not proof
+                // of EOS (RFC 0006 §6/§8).
                 self.peer.check()?;
+                if !self.input_closed {
+                    self.peer.fail("DSP back-ring closed before input finished");
+                    self.peer.check()?;
+                }
                 self.eos = true;
                 Ok(0)
             }

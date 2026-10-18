@@ -107,7 +107,18 @@ fn pump<R: MappedRegion>(
         if let Some(message) = peer.try_recv()? {
             return command(message);
         }
-        let frames = match decoder.read(&mut block) {
+        let read = decoder.read(&mut block);
+        // A final corrupt packet can update telemetry without producing PCM.
+        // Publish those changes before EOS/format markers as well as blocks.
+        let stats = decoder.stats();
+        if stats != *last_stats {
+            peer.send(Message::DecoderStats {
+                skipped_packets: stats.0,
+                bitrate_kbps: stats.1,
+            })?;
+            *last_stats = stats;
+        }
+        let frames = match read {
             Ok(0) => return Ok(Transition::Eos),
             Ok(frames) if frames <= BLOCK_FRAMES => frames,
             Ok(_) => {
@@ -122,14 +133,6 @@ fn pump<R: MappedRegion>(
             return Err(MediaHostError::OperationFailed(
                 "resident changed format without FormatChanged".into(),
             ));
-        }
-        let stats = decoder.stats();
-        if stats != *last_stats {
-            peer.send(Message::DecoderStats {
-                skipped_packets: stats.0,
-                bitrate_kbps: stats.1,
-            })?;
-            *last_stats = stats;
         }
         let mut offset = 0;
         while offset < frames {
