@@ -22,7 +22,10 @@ slots looked busy.
 `tests/golden/rust-theme/vis_stopped_tail.png`) were rendered under the old
 decaying stop and must be re-blessed **in the VM** before the golden test can be
 green again. Expect them red in the next suite run, and do not read that as a
-regression.
+regression. The mechanism: `cargo xtask golden --bless` is not a renderer, it
+runs the `golden_*` test functions, so it is `cargo test` and belongs in the
+guest. Bless them there, copy the two PNGs back through the broker, and commit
+them.
 
 **Google now starts through Paseo, not the agy bridge** (owner rule, 2026-10-18).
 Paseo agents are watchable (`ls`, `logs`, `attach`, `permit`) and their worktrees
