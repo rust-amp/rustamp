@@ -321,6 +321,21 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The audio prerequisite is now a named baseline (2026-10-18 22:45)
+
+The virtual cable is installed in the guest and verified, and it is now captured
+as **`base-provisioned-cable`**, a child of `base-provisioned`. The owner's
+baseline is untouched: the broker refuses to overwrite an existing checkpoint
+("checkpoint 'base-provisioned' already exists"), which is a good rule and one
+that saved a fallback here. So a reset run with the audio prerequisite is
+`vm-run-tests.ps1 -Reset -Baseline base-provisioned-cable`, and the release plan
+now names it.
+
+This closes a trap the orchestrator had set for itself: every earlier reset
+restored a baseline taken before the cable existed, so each reset silently
+removed the very device the audio tests need, and the tests then reported the
+cable as missing rather than as failing.
+
 ## The packaged player starts, and the licence audit is current (2026-10-18 22:30)
 
 Steps 3 and 8 to 12 of the release checklist, on the host and in the guest.
