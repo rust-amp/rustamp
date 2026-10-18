@@ -222,6 +222,10 @@ if (Test-Path $skinsDir) {
 # Real test plugins: staged read-only copies of the owner's testplugins directory
 # (D:\code\rustamp-testplugins) into C:\rustamp\testplugins in the guest so
 # DLL acceptance tests find the approved in_openmpt.dll plugin.
+# $pluginsStaged records the host-side staging outcome so the report (step 5
+# and the ignored summary in step 6) can say plainly whether the Group D
+# fixture was staged; a missing fixture must never look like a pass.
+$pluginsStaged = $false
 $pluginsDir = 'D:\code\rustamp-testplugins'
 if (Test-Path $pluginsDir) {
     Step 'copying test plugins into the guest (read-only copies)'
@@ -229,6 +233,7 @@ if (Test-Path $pluginsDir) {
     if (Test-Path $pluginsStage) { Remove-Item -Recurse -Force $pluginsStage }
     Copy-Item $pluginsDir $pluginsStage -Recurse -Force
     & $broker -Op copyin -Source $pluginsStage -Dest 'C:\rustamp\testplugins' -TimeoutSeconds 600 | Out-Null
+    $pluginsStaged = $true
 } else {
     Write-Host '    no test plugins on the host; plugin-dependent tests will skip/refuse'
 }
@@ -258,6 +263,22 @@ if ($null -eq $result.results) { throw "STEP guest FAILED: the guest result obje
 $hungCount = @($result.results | Where-Object { $_.hung }).Count
 Write-Host ''
 Write-Host ("guest {0} as {1}; subst resolved: {2}; ran {3}, failed {4}, hung {5}" -f $result.host, $result.user, $result.subst, $result.ran, $result.failed, $hungCount)
+# Plugin fixture status: the Group D loader tests prove nothing without the
+# staged in_openmpt.dll, so the report names the staging outcome on every run,
+# whatever the filter. Host-side staging throws on copy failure, so
+# $pluginsStaged is ground truth for the host half; the guest half is confirmed
+# when the guest script reports RUSTAMP_TESTPLUGINS back (older guest scripts
+# predate that field and report nothing).
+$guestPlugins = $result.testplugins
+if ($pluginsStaged) {
+    if ($guestPlugins) {
+        Write-Host ("plugin fixture: staged (host D:\code\rustamp-testplugins copied; guest reports RUSTAMP_TESTPLUGINS={0})" -f $guestPlugins)
+    } else {
+        Write-Host 'plugin fixture: staged on the host, but the guest reported no RUSTAMP_TESTPLUGINS value; Group D tests cannot prove anything in this run'
+    }
+} else {
+    Write-Host 'plugin fixture: NOT STAGED (no D:\code\rustamp-testplugins on the host, so RUSTAMP_TESTPLUGINS is unset); Group D tests refuse loudly and prove nothing in this run'
+}
 $result.results | ForEach-Object {
     # A hung binary must be impossible to mistake for a pass or for a missing binary.
     if ($_.hung) {
@@ -316,6 +337,7 @@ if ($Filter -like '--ignored*') {
 
     $ranCount = 0
     $blockedCount = 0
+    $missingFixtureCount = 0
     foreach ($item in $inventory) {
         $searchName = if ($item.Search) { $item.Search } else { $item.Name }
         $passed = $false
@@ -335,11 +357,17 @@ if ($Filter -like '--ignored*') {
         } elseif ($item.Blocker) {
             $blockedCount++
             Write-Host ("  [BLOCKED] {0,-27} {1} ({2})" -f $item.Group, $item.Name, $item.Blocker)
+        } elseif ($item.Group -like 'Group D*' -and -not $pluginsStaged) {
+            # The host never staged D:\code\rustamp-testplugins, so RUSTAMP_TESTPLUGINS
+            # is unset and these tests can only refuse loudly, never pass. Name that
+            # plainly: a missing fixture must not read as a pass or a quiet skip.
+            $missingFixtureCount++
+            Write-Host ("  [MISSING FIXTURE] {0,-21} {1} (no D:\code\rustamp-testplugins on the host; RUSTAMP_TESTPLUGINS unset)" -f $item.Group, $item.Name)
         } else {
             Write-Host ("  [NOT RUN] {0,-27} {1}" -f $item.Group, $item.Name)
         }
     }
-    Write-Host ("`nIgnored tests: {0} ran, {1} blocked pending host/VM decisions, {2} total in inventory" -f $ranCount, $blockedCount, $inventory.Count)
+    Write-Host ("`nIgnored tests: {0} ran, {1} blocked pending host/VM decisions, {2} missing plugin fixture, {3} total in inventory" -f $ranCount, $blockedCount, $missingFixtureCount, $inventory.Count)
 }
 
 # A stall must never be reported as a green run: the hung count is a second,

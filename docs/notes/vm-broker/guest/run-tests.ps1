@@ -360,6 +360,10 @@ foreach ($exe in $exes) {
     user      = $env:USERNAME
     repo      = $repo
     subst     = (Test-Path 'D:\code\Rustamp')
+    # Reports whether the plugin fixture was staged: set only when
+    # C:\rustamp\testplugins exists (see above), so $null here means the Group D
+    # loader tests ran without RUSTAMP_TESTPLUGINS and can only refuse loudly.
+    testplugins = $env:RUSTAMP_TESTPLUGINS
     ran       = $results.Count
     failed    = @($results | Where-Object { $_.exit -ne 0 }).Count
     results   = $results
