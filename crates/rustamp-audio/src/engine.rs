@@ -277,7 +277,6 @@ pub struct Engine {
     repeat: bool,
     shuffle_seed: u64,
     shuffle_plan: Vec<usize>,
-    shuffle_pos: usize,
 }
 
 impl Engine {
@@ -355,7 +354,6 @@ impl Engine {
             repeat: false,
             shuffle_seed: 0x9E37_79B9_7F4A_7C15,
             shuffle_plan: Vec::new(),
-            shuffle_pos: 0,
         })
     }
 
@@ -578,7 +576,17 @@ impl Engine {
             if self.shuffle && !self.queue.is_empty() {
                 self.replan_shuffle_engine(self.current.map(|i| i as usize));
             }
-            self.send(DecodeMsg::SetShuffle(self.shuffle));
+            // The engine owns the plan (S15): hand it to the decode thread
+            // so live traversal follows the published permutation.
+            let plan = if self.shuffle {
+                self.shuffle_plan.clone()
+            } else {
+                Vec::new()
+            };
+            self.send(DecodeMsg::SetShuffle {
+                on: self.shuffle,
+                plan,
+            });
             self.bus.publish(Event::ModesChanged {
                 shuffle: self.shuffle,
                 repeat: self.repeat,
@@ -620,24 +628,34 @@ impl Engine {
         &self.shuffle_plan
     }
 
-    fn replan_shuffle_engine(&mut self, current: Option<usize>) {
-        let len = self.queue.len();
-        if len == 0 {
-            self.shuffle_plan.clear();
-            self.shuffle_pos = 0;
-            return;
-        }
+    /// Advance the engine's shuffle PRNG one step and return its raw value
+    /// (a xorshift64* step over the golden-ratio constant; S15 §1.2's own
+    /// choice of algorithm).
+    fn rng_step(&mut self) -> u64 {
         let mut seed = self.shuffle_seed;
         if seed == 0 {
             seed = 0x9E37_79B9_7F4A_7C15;
         }
-        let plan = if let Some(curr) = current {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        self.shuffle_seed = seed;
+        seed.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Re-plan the shuffle permutation. With `current`, the plan is anchored
+    /// at that track (S15 §4.1: the playing track becomes the first entry);
+    /// without one it is a full permutation of the queue (S15 §1.1).
+    fn replan_shuffle_engine(&mut self, current: Option<usize>) {
+        let len = self.queue.len();
+        if len == 0 {
+            self.shuffle_plan.clear();
+            return;
+        }
+        let plan = if let Some(curr) = current.filter(|&c| c < len) {
             let mut remaining: Vec<usize> = (0..len).filter(|&i| i != curr).collect();
             for i in (1..remaining.len()).rev() {
-                seed ^= seed >> 12;
-                seed ^= seed << 25;
-                seed ^= seed >> 27;
-                let j = (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) % (i as u64 + 1)) as usize;
+                let j = (self.rng_step() % (i as u64 + 1)) as usize;
                 remaining.swap(i, j);
             }
             let mut p = Vec::with_capacity(len);
@@ -647,17 +665,63 @@ impl Engine {
         } else {
             let mut p: Vec<usize> = (0..len).collect();
             for i in (1..p.len()).rev() {
-                seed ^= seed >> 12;
-                seed ^= seed << 25;
-                seed ^= seed >> 27;
-                let j = (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) % (i as u64 + 1)) as usize;
+                let j = (self.rng_step() % (i as u64 + 1)) as usize;
                 p.swap(i, j);
             }
             p
         };
-        self.shuffle_seed = seed;
         self.shuffle_plan = plan;
-        self.shuffle_pos = 0;
+    }
+
+    /// Generate the next shuffle cycle at a repeat boundary (S15 §2.1): a
+    /// full permutation whose first entry is not the track the exhausted
+    /// cycle ended on, so no track plays twice in a row across the boundary.
+    fn replan_shuffle_new_cycle_engine(&mut self, last_track: Option<usize>) {
+        let len = self.queue.len();
+        if len == 0 {
+            self.shuffle_plan.clear();
+            return;
+        }
+        let mut p: Vec<usize> = (0..len).collect();
+        for i in (1..p.len()).rev() {
+            let j = (self.rng_step() % (i as u64 + 1)) as usize;
+            p.swap(i, j);
+        }
+        if len > 1 && Some(p[0]) == last_track {
+            let swap_idx = 1 + (self.rng_step() % (len as u64 - 1)) as usize;
+            p.swap(0, swap_idx);
+        }
+        self.shuffle_plan = p;
+    }
+
+    /// Make the shuffle plan coherent with the queue and the current track
+    /// (S15): re-plan only when the plan cannot be the one being traversed.
+    fn ensure_shuffle_plan(&mut self) {
+        if !self.shuffle || self.queue.is_empty() {
+            return;
+        }
+        let usable = self.shuffle_plan.len() == self.queue.len()
+            && self
+                .current
+                .map(|c| self.shuffle_plan.contains(&(c as usize)))
+                .unwrap_or(true);
+        if !usable {
+            self.replan_shuffle_engine(self.current.map(|i| i as usize));
+        }
+    }
+
+    /// Position of the current track in the active shuffle plan (S15). The
+    /// plan is the single source of truth and the position is derived from
+    /// the current track, so it can never go stale while a run advances it.
+    fn shuffle_pos_of_current(&self) -> usize {
+        match self.current {
+            Some(c) => self
+                .shuffle_plan
+                .iter()
+                .position(|&t| t as u32 == c)
+                .unwrap_or(0),
+            None => 0,
+        }
     }
 
     /// Current equalizer state.
@@ -959,20 +1023,23 @@ impl Engine {
                     None
                 }
             } else {
-                if self.shuffle_plan.is_empty() || self.shuffle_plan.len() != self.queue.len() {
-                    self.replan_shuffle_engine(self.current.map(|i| i as usize));
-                }
+                self.ensure_shuffle_plan();
                 if self.current.is_none() {
                     Some(self.shuffle_plan[0] as u32)
-                } else if self.shuffle_pos + 1 < self.shuffle_plan.len() {
-                    self.shuffle_pos += 1;
-                    Some(self.shuffle_plan[self.shuffle_pos] as u32)
-                } else if self.repeat {
-                    let last = self.shuffle_plan.last().copied();
-                    self.replan_shuffle_engine(last);
-                    Some(self.shuffle_plan[0] as u32)
                 } else {
-                    None
+                    let pos = self.shuffle_pos_of_current();
+                    if pos + 1 < self.shuffle_plan.len() {
+                        Some(self.shuffle_plan[pos + 1] as u32)
+                    } else if self.repeat {
+                        // A new cycle starts at its first entry, which is
+                        // not the track the exhausted cycle ended on
+                        // (S15 §2.1).
+                        let last = self.current.map(|c| c as usize);
+                        self.replan_shuffle_new_cycle_engine(last);
+                        Some(self.shuffle_plan[0] as u32)
+                    } else {
+                        None
+                    }
                 }
             };
             if let Some(target) = next {
@@ -997,15 +1064,14 @@ impl Engine {
                     _ => Some(0),
                 }
             } else {
-                if self.shuffle_plan.is_empty() {
-                    self.replan_shuffle_engine(self.current.map(|i| i as usize));
-                }
-                if self.shuffle_pos > 0 && self.shuffle_pos < self.shuffle_plan.len() {
-                    self.shuffle_pos -= 1;
-                    Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                self.ensure_shuffle_plan();
+                // Walk back along the plan (S15 §3.2): the entry before the
+                // current one is the track played immediately before it.
+                let pos = self.shuffle_pos_of_current();
+                if pos > 0 {
+                    Some(self.shuffle_plan[pos - 1] as u32)
                 } else if self.repeat && self.queue.len() > 1 {
-                    self.shuffle_pos = self.shuffle_plan.len() - 1;
-                    Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                    Some(self.shuffle_plan[self.shuffle_plan.len() - 1] as u32)
                 } else {
                     self.current.or(Some(0))
                 }
@@ -1037,19 +1103,15 @@ impl Engine {
                     self.current = Some(clamped_index(curr, delta, self.queue.len()));
                 }
             } else {
-                if self.shuffle_plan.is_empty() || self.shuffle_plan.len() != self.queue.len() {
-                    self.replan_shuffle_engine(Some(curr as usize));
-                }
+                self.ensure_shuffle_plan();
                 let plen = self.shuffle_plan.len() as i32;
-                if self.repeat {
-                    let rem = (self.shuffle_pos as i32 + delta).rem_euclid(plen);
-                    self.shuffle_pos = rem as usize;
-                    self.current = Some(self.shuffle_plan[self.shuffle_pos] as u32);
+                let pos = self.shuffle_pos_of_current() as i32;
+                let target = if self.repeat {
+                    (pos + delta).rem_euclid(plen)
                 } else {
-                    let target = (self.shuffle_pos as i32 + delta).clamp(0, plen - 1) as usize;
-                    self.shuffle_pos = target;
-                    self.current = Some(self.shuffle_plan[self.shuffle_pos] as u32);
-                }
+                    (pos + delta).clamp(0, plen - 1)
+                } as usize;
+                self.current = Some(self.shuffle_plan[target] as u32);
             }
             return Ok(());
         }
@@ -1293,6 +1355,15 @@ impl Engine {
             DecodeOut::EndOfStream { timeline_end } => {
                 self.end_of_stream = Some(timeline_end);
             }
+            DecodeOut::ShufflePlanned { plan } => {
+                // The worker reports only plans it generated itself (a cycle
+                // boundary, or a fallback when the engine handed none);
+                // adopt it so `shuffle_plan()` stays the plan being
+                // traversed (S15).
+                if plan.len() == self.queue.len() {
+                    self.shuffle_plan = plan;
+                }
+            }
             DecodeOut::Error { kind, message } => {
                 let info = ErrorInfo { kind, message };
                 self.error = Some(info.clone());
@@ -1459,11 +1530,21 @@ impl Engine {
             self.bus.publish(Event::Error(info));
             return Err(err);
         }
-        let index = self.current.unwrap_or(0);
+        let _ = self.join_decode();
+        // S15: the engine owns the shuffle plan; make it coherent with the
+        // queue and the current track before the run starts.
+        self.ensure_shuffle_plan();
+        // With shuffle on and no track selected, playback starts at the
+        // first entry of the permutation (S15 §1.1: the permutation is
+        // generated when playback starts with shuffle on).
+        let index = if self.shuffle && self.current.is_none() && !self.shuffle_plan.is_empty() {
+            self.shuffle_plan[0] as u32
+        } else {
+            self.current.unwrap_or(0)
+        };
         if index as usize >= self.queue.len() {
             return Err(Error::NotFound(format!("queue index {index}")));
         }
-        let _ = self.join_decode();
         self.current = Some(index);
         let start_at = self.start_at.take();
         self.clock_origin = self.output.played_frames();
@@ -1522,6 +1603,7 @@ impl Engine {
             shuffle: self.shuffle,
             repeat: self.repeat,
             shuffle_seed: Some(self.shuffle_seed),
+            shuffle_plan: self.shuffle_plan.clone(),
         };
         self.shuffle_seed = self.shuffle_seed.wrapping_add(1);
         // The equalizer runs first, on the decoded PCM (see the module docs).
@@ -1602,6 +1684,12 @@ impl Engine {
                     }
                     start @ DecodeOut::TrackStarted { .. } => {
                         held_start = Some(start);
+                    }
+                    // A plan the worker generated itself is the plan it ended
+                    // on: adopt it so the engine's published plan stays
+                    // coherent for stopped navigation and the next run (S15).
+                    DecodeOut::ShufflePlanned { plan } if plan.len() == self.queue.len() => {
+                        self.shuffle_plan = plan;
                     }
                     _ => {}
                 }
@@ -1901,22 +1989,57 @@ mod tests {
 
     #[test]
     fn stop_does_not_advance_to_prefetched_next_track_during_gapless() {
-        let wait = Duration::from_secs(5);
-        let mut h = TestHarness::new(&["track1_2048.tst", "track2_44100.tst"]);
+        // The stall escape follows the M10/M24 rule: generous enough that
+        // only a real stall reaches it (the 5 s bounds this module carried
+        // before are the flake class M24 proved in the test guest, and the
+        // M29 liveness sweep never reached this private test module).
+        let wait = Duration::from_secs(30);
+        // Track 0 is longer than the ring (16384 frames), so the decode
+        // thread blocks mid-track while the device has played only part of
+        // it. That is the window in which track 0's start is published and
+        // track 1's start is still queued (see the single poll below).
+        let track0: u64 = 44_100;
+        let mut h = TestHarness::new(&["track1_44100.tst", "track2_44100.tst"]);
 
         h.engine.play_index(0).unwrap();
-        assert!(
-            h.wait_pumping(|e| e.duration_frames() == Some(2048), wait),
-            "track 0 must start"
-        );
 
-        // Wait until track 0 has been decoded and the decode thread pre-fetches track 1
-        // (written frames exceeding track 0's 2048 frames).
-        let prefetched = {
+        // Wait (without polling) until the decode thread writes: its first
+        // write comes after prepare_track queued TrackStarted for track 0,
+        // and the ring still holds the rest of track 0, so the worker cannot
+        // have opened track 1 yet.
+        let track0_started = {
             let deadline = std::time::Instant::now() + wait;
             loop {
                 let (written, _) = h.engine.sync.counters();
-                if written > 2048 {
+                if written > 0 {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        assert!(track0_started, "the decode thread must write track 0");
+
+        // Publish track 0's start with one poll. This poll cannot consume
+        // track 1's start: the worker is still mid-track-0 (the ring blocks
+        // it long before track 0's 44100 frames are written), so TrackStarted
+        // for track 1 is not queued yet.
+        h.engine.poll().unwrap();
+        assert_eq!(h.engine.duration_frames(), Some(track0));
+        assert_eq!(h.engine.current_index(), Some(0));
+
+        // Pump until the decode thread has finished track 0 and prefetched
+        // into track 1 (written frames exceeding track 0's length): the
+        // worker has then queued TrackStarted for track 1. No polling here —
+        // the queued start must stay queued for the stop below.
+        let prefetched = {
+            let deadline = std::time::Instant::now() + wait;
+            loop {
+                h.clock.pump(256);
+                let (written, _) = h.engine.sync.counters();
+                if written > track0 {
                     break true;
                 }
                 if std::time::Instant::now() >= deadline {
@@ -1927,8 +2050,10 @@ mod tests {
         };
         assert!(prefetched, "decode thread should prefetch into track 1");
 
-        // The user stops playback while device has only partially played track 0.
-        assert!(h.clock.frames() < 2048);
+        // The user stops playback while the device has only partially played
+        // track 0 (the ring still holds the rest of it).
+        assert!(h.clock.frames() < track0);
+
         h.engine.stop().unwrap();
 
         assert_eq!(h.engine.transport(), TransportState::Stopped);

@@ -11,7 +11,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Harness, track_frames};
+use common::{Harness, WAIT, track_frames};
 use rustamp_core::event::Event;
 use rustamp_core::state::TransportState;
 
@@ -249,9 +249,18 @@ fn toggle_shuffle_and_repeat_mid_run() {
         "ModesChanged event must be emitted on shuffle toggle"
     );
 
-    // Next must pick one of the remaining unplayed tracks [1, 2, 3]
+    // Next must pick one of the remaining unplayed tracks [1, 2, 3]. The
+    // skip is asynchronous (the worker abandons track 0 and opens the next
+    // one before its start is published), so wait for the engine to land on
+    // the new track instead of reading the index right after the command.
     h.engine.next_track().unwrap();
-    h.engine.poll().unwrap();
+    assert!(
+        h.wait_pumping(
+            |e| matches!(e.current_index(), Some(i) if (1..=3).contains(&i)),
+            WAIT
+        ),
+        "mid-run shuffle toggle must advance to an unplayed track"
+    );
     let next_idx = h.engine.current_index().expect("current track index");
     assert!(
         [1, 2, 3].contains(&next_idx),

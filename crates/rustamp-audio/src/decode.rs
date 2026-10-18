@@ -150,8 +150,14 @@ pub(crate) enum DecodeMsg {
     /// Arm/disarm "stop after current track" (RFC 0005 O8): when armed, the run
     /// ends at the end of the current track instead of advancing.
     SetStopAfterCurrent(bool),
-    /// Set shuffle mode enabled/disabled (spec S15).
-    SetShuffle(bool),
+    /// Set shuffle mode enabled/disabled, carrying the engine's active
+    /// shuffle plan so live traversal follows it (spec S15).
+    SetShuffle {
+        /// Whether shuffle is on.
+        on: bool,
+        /// The engine's active plan when turning on; empty when turning off.
+        plan: Vec<usize>,
+    },
     /// Set repeat mode enabled/disabled (spec S15).
     SetRepeat(bool),
 }
@@ -222,6 +228,13 @@ pub(crate) enum DecodeOut {
     EndOfStream {
         /// Absolute timeline position after the last written frame.
         timeline_end: u64,
+    },
+    /// The worker (re)planned the shuffle permutation on its own — a cycle
+    /// boundary, or a fallback when the engine handed no usable plan. The
+    /// engine adopts it so its published plan stays the traversed one (S15).
+    ShufflePlanned {
+        /// The new active plan.
+        plan: Vec<usize>,
     },
     /// A decoder or output error.
     Error {
@@ -303,6 +316,10 @@ impl std::fmt::Debug for DecodeOut {
                 .debug_struct("EndOfStream")
                 .field("timeline_end", timeline_end)
                 .finish(),
+            DecodeOut::ShufflePlanned { plan } => f
+                .debug_struct("ShufflePlanned")
+                .field("plan", plan)
+                .finish(),
             DecodeOut::Error { kind, message } => f
                 .debug_struct("Error")
                 .field("kind", kind)
@@ -342,11 +359,15 @@ pub(crate) struct Config {
     pub repeat: bool,
     /// Seed for the shuffle PRNG (spec S15).
     pub shuffle_seed: Option<u64>,
+    /// The engine's active shuffle plan (spec S15). The engine owns the
+    /// plan; the worker traverses it, so live playback follows the
+    /// permutation the engine publishes through `Engine::shuffle_plan`.
+    pub shuffle_plan: Vec<usize>,
 }
 
 /// Start the decode thread. Returns its handle and the vis consumer.
 pub(crate) fn spawn(
-    cfg: Config,
+    mut cfg: Config,
     dsp: Vec<Box<dyn DspStage>>,
     ring: Producer<f32>,
     start_index: u32,
@@ -360,6 +381,7 @@ pub(crate) fn spawn(
     let shuffle = cfg.shuffle;
     let repeat = cfg.repeat;
     let rng_state = cfg.shuffle_seed.unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let shuffle_plan = std::mem::take(&mut cfg.shuffle_plan);
     let mut worker = Worker {
         cfg,
         ring,
@@ -382,7 +404,7 @@ pub(crate) fn spawn(
         stop_after_current,
         shuffle,
         repeat,
-        shuffle_plan: Vec::new(),
+        shuffle_plan,
         shuffle_pos: 0,
         rng_state,
         current_index: start_index,
@@ -508,7 +530,22 @@ impl Worker {
         let mut start_at = start_at;
         self.current_index = index;
         if self.shuffle && !self.cfg.queue.is_empty() {
-            self.init_shuffle_plan(start_index as usize);
+            if self.shuffle_plan.len() != self.cfg.queue.len()
+                || !self.shuffle_plan.contains(&(start_index as usize))
+            {
+                // The engine handed no usable plan: plan one anchored at the
+                // track this run starts at (S15 §4.1) and report it, so the
+                // engine's published plan matches the traversal.
+                self.init_shuffle_plan(start_index as usize);
+            } else {
+                // Traverse the engine's plan (the engine owns it — S15);
+                // the position is where this run's first track sits in it.
+                self.shuffle_pos = self
+                    .shuffle_plan
+                    .iter()
+                    .position(|&t| t == start_index as usize)
+                    .unwrap_or(0);
+            }
         }
         // The previous track ran to its end and the converter still holds its
         // tail: a next track in the same format continues that stream.
@@ -701,6 +738,11 @@ impl Worker {
         plan.extend(remaining);
         self.shuffle_plan = plan;
         self.shuffle_pos = 0;
+        // The engine owns the published plan; report one this worker had to
+        // generate itself so the engine adopts it (S15).
+        let _ = self.tx.send(DecodeOut::ShufflePlanned {
+            plan: self.shuffle_plan.clone(),
+        });
     }
 
     fn replan_shuffle_new_cycle(&mut self, last_track: Option<usize>) {
@@ -716,10 +758,11 @@ impl Worker {
         }
         self.shuffle_plan = plan;
         self.shuffle_pos = 0;
-    }
-
-    fn replan_shuffle_mid_run(&mut self, current: usize) {
-        self.init_shuffle_plan(current);
+        // Report the new cycle: the engine adopts it so its published plan
+        // stays the one being traversed (S15).
+        let _ = self.tx.send(DecodeOut::ShufflePlanned {
+            plan: self.shuffle_plan.clone(),
+        });
     }
 
     /// Hand the ring's write end back (used when the thread exits).
@@ -1051,11 +1094,26 @@ impl Worker {
                     return true;
                 }
                 Ok(DecodeMsg::SetStopAfterCurrent(armed)) => self.stop_after_current = armed,
-                Ok(DecodeMsg::SetShuffle(on)) => {
+                Ok(DecodeMsg::SetShuffle { on, plan }) => {
                     if self.shuffle != on {
                         self.shuffle = on;
                         if on && !self.cfg.queue.is_empty() {
-                            self.replan_shuffle_mid_run(self.current_index as usize);
+                            if plan.len() == self.cfg.queue.len() {
+                                // The engine owns the plan (S15): adopt the
+                                // one it published, anchored at the track
+                                // that is playing.
+                                self.shuffle_plan = plan;
+                                self.shuffle_pos = self
+                                    .shuffle_plan
+                                    .iter()
+                                    .position(|&t| t == self.current_index as usize)
+                                    .unwrap_or(0);
+                            } else {
+                                // No usable plan from the engine: plan on our
+                                // own and report it; the engine adopts it on
+                                // its next poll.
+                                self.init_shuffle_plan(self.current_index as usize);
+                            }
                         }
                     }
                 }
