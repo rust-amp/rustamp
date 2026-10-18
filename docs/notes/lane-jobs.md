@@ -16,6 +16,9 @@ slots looked busy.
 |---|---|---|---|
 | `9f38e282` / `89c6d365` | Paseo-Antigravity `paseo-wave-review`, `paseo-release-checklist` | 2026-10-18 11:20 | wave review (`W16`) and the executed release checklist - **both merged** (`f634b51`, `35faaf5`) |
 | `paseo-wave90-audio` | Paseo-Antigravity | 2026-10-18 11:45 | W16-F02 (the orphaned `PlaybackOrder`), W16-F04 (`Prev` at a cycle start), W16-F07 (non-finite PCM sanitised before the tap) |
+| `paseo-wave91-prev` | Paseo-Antigravity | 2026-10-18 12:40 | the one new code red r51 named: `shuffle_repeat_prev_across_cycle_boundary`, the F04 fix's own test |
+| `wave91-focus` | Claude subagent | 2026-10-18 12:40 | land the window focus model rescued from `wave26-windows`: `FocusNextWindow` (Ctrl+Tab) is `not implemented yet` in the tree, and `ShowMainWindow` only sets a flag |
+| `wave91-bless` | Claude subagent | 2026-10-18 12:45 | a `--bless` path through the broker, so the two `vis_stopped_tail` goldens can be re-blessed in the guest and copied back |
 
 **Outstanding after the merges:** the two stopped-tail goldens
 (`tests/golden/lookalike/vis_stopped_tail.png` and
@@ -188,7 +191,46 @@ follows: a lane that runs commands must `Set-Location` into its worktree first,
 and the orchestrator must check `git status --short` in the canonical tree
 before every merge - which is how this one was caught.
 
+## r51 (2026-10-18 12:21) - the run on a quiet host, and the load question settled
+
+`ran 82, failed 3, hung 0`, with **no lane building** while it ran. The two
+binaries that stalled at the thirty second bound in r50, `dsp_roundtrip` and
+`real_decode`, are **green here**, in the same commit's code. That settles it:
+the stall class was the host load three lanes put on the guest, not a property
+of the code or of the guest alone. The rule stands - the suite owns the host.
+
+The three reds, and only these:
+
+- `golden_lookalike_visualization` and `golden_rust_theme_visualization`:
+  **expected**. Both fail on `lookalike/vis_stopped_tail` and
+  `rust-theme/vis_stopped_tail` ("39 of 31900 px differ"), which is exactly the
+  re-bless the visualiser lane predicted. Not a regression.
+- `shuffle_repeat_prev_across_cycle_boundary` (`shuffle_repeat.rs:370`,
+  `left: 2, right: 0`): **a real red**, and it is the F04 fix's own new test
+  failing against the fix. In a lane.
+
+## The `wave26-windows` rescue (2026-10-18 12:45)
+
+Cleaning up 181 accumulated lane worktrees freed 47 GB, and one of the two that
+could not be removed turned out to hold **real work that never landed**:
+
+- `FocusNextWindow` (Ctrl+Tab, command id 40063) is `not implemented yet` in
+  `crates/rustamp-app/src/app.rs` today.
+- `ShowMainWindow` (Alt+W, id 40258) only sets `main_visible`, so it never
+  restores or focuses the OS window.
+- The rescued patch supplies both: a focus cycle over the docked stack, a
+  pending focus request and a pending restore request, 226 added lines plus a
+  new `focus.rs`, with the original author's honest note that the order is an
+  own choice and what a run would have to do to measure the reference's.
+
+The owner's decision was to land it, so `wave91-focus` owns it. The other
+worktree, `wave32-s07-audit`, held a duplicate of
+`docs/tasks/S07R1-eq-audit.md`, which the tree already has, and was removed.
+Both files are preserved under
+`C:\Users\micro\AppData\Local\Temp\opencode\worktree-rescue\`.
+
 ## Two runner defects the targeted re-run exposed (2026-10-18 12:00)
+
 
 The targeted re-run of `dsp_roundtrip` and `real_decode` (`-Filter ... -SkipBuild`)
 did not measure what it was meant to measure, and it failed in two ways worth
