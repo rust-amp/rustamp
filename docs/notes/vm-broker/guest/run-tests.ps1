@@ -34,13 +34,13 @@ $exes = @(Get-ChildItem -Path $deps -Filter '*.exe' | Sort-Object Name | Select-
 if (-not $exes) { throw "no test binaries in $deps" }
 
 $filter = $Filter
-$extra = @()
+$extra = @('--test-threads=1')
 # An `--ignored` prefix asks the binaries to run their ignored tests as well.
 # Those are exactly the tests that open a window or spawn a process: they are
 # ignored by default because the host must stay windowless, and they may only
 # run here, in the guest. `--ignored:name` also filters by binary name.
 if ($filter -like '--ignored*') {
-    $extra = @('--ignored')
+    $extra = @('--ignored', '--test-threads=1')
     $filter = ($filter -replace '^--ignored:?', '')
 }
 
