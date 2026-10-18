@@ -321,6 +321,29 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The packaged player starts, and the licence audit is current (2026-10-18 22:30)
+
+Steps 3 and 8 to 12 of the release checklist, on the host and in the guest.
+
+- **Licence audit: green.** All permissive workspace roots, all features, both
+  Windows targets, and the notices are current; the metadata-only regression pass
+  reports 57 checks. This was re-run because vendoring projectM changed the
+  inventory, and it is green with the notices as the lane left them.
+- **Package: built and re-verified.** The package builds from `d7ddf05` with the
+  player, its two residents, the i686 host and the plugin host bundled into both,
+  and `--check` re-verifies the layout, the manifests, the notices, the import
+  tables and the archive.
+- **The packaged smoke passes, for the first time.** The packaged player started
+  in the guest session as a real window at client 275x116, the runner checks the
+  bundled host child, the silent-path marker is present, and **9 files were
+  verified byte-identical** after the run. This is the first time the packaged
+  bytes - rather than a source build - have been proven to start.
+- **Step 13, the clean-machine run, cannot be performed**: the machine has two
+  checkpoints, `base-provisioned` and `wave5-eq-playback-green`, and neither is a
+  clean operating system. The checklist allows a step to be listed as skipped in
+  the release notes, and this one must be, because the claim that it "starts on a
+  clean machine" is exactly the claim it would test.
+
 ## The VM block: both green, and the cable reveals the next real defect (2026-10-18 22:00)
 
 **The suite and the ignored pass are both fully green in the interactive session,
