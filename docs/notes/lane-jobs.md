@@ -321,6 +321,47 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The owner ran the packaged bytes, and found what the suite could not (2026-10-19)
+
+**The release blocker first.** The owner could not start the packaged player at
+all: it printed that it had opened the real output device and then panicked,
+because winit could not initialise OLE on a thread whose apartment had already
+been set to multithreaded - by our own backend probe, which enumerates and opens
+the audio device on the main thread before the window exists. No automated check
+could see it: the guest window tests run in a different order against different
+devices, and the packaged smoke runs with the null audio path, so **nothing ever
+opened a real audio device before opening a window**. It took the owner running
+the packaged bytes on a machine with a sound card.
+
+**Then seven more, all of the same kind.** The owner looked at the real windows
+and reported: a native title bar on every window; the taskbar showing each window
+separately; the VU meter animating only while focused; drag and drop into the
+playlist not working; the add button opening its own path-entry window instead of
+the standard file dialog; an ugly selected-row highlight; and the menu appearing
+as a decorated window with unreadable text. All are fixed except the highlight's
+skin value, which is done too (`85e8a6b`), and the app-side wiring of the current
+title (`8f7776e`).
+
+**The lesson is a gap, not a bug.** Every one of those is **appearance**, and the
+suite measures **geometry** - client sizes, positions, visibility. A window can be
+exactly the right size and still be wrong to look at, and a menu can open at the
+measured client size with text nobody can read. That is why the release plan needs
+a **visual check by the owner**, and why a further automated test is not the
+answer: a test that measures geometry and claims appearance is worse than none.
+
+**Two things the fixes found on their own.** The frame removal deleted a
+documented approximation: the outer size now equals the client size, so stacking
+the equaliser under the main window lines up on client edges instead of
+overshooting by a caption height. And the menu was never meant to be drawn from
+the skin at all - the specification had already pinned its window class to the one
+Windows uses for menus, and the code carried that class as a constant while a
+comment admitted winit cannot set a window class, so it was an ordinary top-level
+window painted with a fixed-cell glyph sheet, unreadable at any scale.
+
+**Open:** four golden images must be re-blessed in the guest after a human looks
+at them (the orchestrator's job, and the VM has to run for it); and the tag has to
+be re-made and pushed, which still needs a remote from the owner.
+
 ## The orchestrator merged a lane that had died mid-work, and reverted it (2026-10-19 00:40)
 
 **A mistake, recorded because it is the exact class this project has already paid
