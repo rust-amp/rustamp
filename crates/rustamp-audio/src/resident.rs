@@ -776,6 +776,8 @@ impl ChainControl {
     /// every track start, and the `DspStage` contract clears stage state at a
     /// track change (the engine's own stages leave `prepare` with fresh
     /// state), so a same-format prepare resets the resident's chain too.
+    /// That reset rides the asynchronous `DspReset`; see `reset` below for
+    /// the seam race it carries until the mediahost fence lands (A26).
     fn prepare<F: PcmRings>(
         &mut self,
         session: &mut DspSession<F>,
@@ -824,14 +826,29 @@ impl ChainControl {
     /// are untouched, and the decode thread drops the chain's start-up frames
     /// (`dsp_trim`) right after, so the seek stays exact.
     ///
-    /// No wall-clock wait here by design: the resident applies `DspReset`
-    /// asynchronously — the session documents it as neither an acknowledgement
-    /// nor an ordering fence for PCM already queued — so no finite sleep is
-    /// derived from the contract and any fixed duration only narrows the race
-    /// instead of closing it. The decode protocol is robust to the race by
-    /// construction (a stale prefix lands inside the trimmed latency window);
-    /// a true delivery fence needs a session-level acknowledgement owned by
-    /// `rustamp-mediahost`, named as follow-up in `docs/tasks/A22-audio-rest.md`.
+    /// The reset is asynchronous and unfenced: the session documents the send
+    /// as neither an acknowledgement nor an ordering fence for PCM already
+    /// queued, and the control path crosses three more threads (writer,
+    /// reader, monitor) than the PCM path, so the resident can apply
+    /// `DspReset` at any of its control polls — including after the first
+    /// block of the new track was already processed. The trim does not cover
+    /// that landing: it drops only the first `latency` frames of the new
+    /// track, and a reset landing later clears a chain that then holds the
+    /// new track's real frames — a hold-back stage loses them and emits
+    /// `latency` frames of silence in their place, outside the trim window.
+    /// That is injected silence, not a stale prefix, and it is exactly what
+    /// fails the engine seam test
+    /// (`engine_gapless_seam_through_the_resident_chain_is_exact`, A26). The
+    /// seek path survives the race only because its drain delays the first
+    /// post-seek block long enough for the control path to land; the gapless
+    /// seam has no such slack. No wall-clock wait is added here: a fixed
+    /// duration only narrows the race instead of closing it. The fix is a
+    /// session-level acknowledgement on the `DspReset` path — a true delivery
+    /// fence — owned by `rustamp-mediahost` (`DspSession::reset` at
+    /// `crates/rustamp-mediahost/src/dsp.rs:577-580`, the pump's reset sites
+    /// at `dsp.rs:128` and `dsp.rs:368`, the wire variant at
+    /// `crates/rustamp-ipc/src/message.rs:240`), handed over with the exact
+    /// sites and design in `docs/tasks/A26-gapless-real.md`.
     fn reset<F: PcmRings>(&mut self, session: &mut DspSession<F>) {
         if self.poisoned.is_some() {
             return;
