@@ -1348,14 +1348,21 @@ impl Windowed {
         }
     }
 
-    /// The three tray seams, drained once per frame on the UI thread. The
-    /// shell-restart re-add runs first, so a just-restored icon is live before
-    /// this frame's clicks are considered.
+    /// The three tray seams, drained once per frame on the UI thread.
+    ///
+    /// The order is:
+    /// 1. Shell-restart re-add: a just-restored icon is live before this
+    ///    frame's clicks are considered.
+    /// 2. Left click: primary direct action (window toggle) is drained before
+    ///    the menu. If both a left and right click land in the same 16 ms frame,
+    ///    the direct toggle is processed first rather than getting trapped
+    ///    behind the modal popup loop.
+    /// 3. Context menu: opens the modal Win32 popup.
     #[cfg(windows)]
     fn drain_tray(&mut self) {
         self.readd_tray_after_shell_restart();
-        self.drain_tray_menu();
         self.drain_tray_left_click();
+        self.drain_tray_menu();
     }
 
     /// F5 follow-up, gap 2: Explorer restarted and dropped every icon. The
@@ -1363,8 +1370,8 @@ impl Windowed {
     /// `NIM_ADD` path `attach` uses. The subclass survived, so it is not
     /// reinstalled, and a refusal degrades to a warning — no retry loop.
     #[cfg(windows)]
-    fn readd_tray_after_shell_restart(&self) {
-        let Some(tray) = &self.tray else {
+    fn readd_tray_after_shell_restart(&mut self) {
+        let Some(tray) = &mut self.tray else {
             return;
         };
         if !tray.take_shell_restart() {

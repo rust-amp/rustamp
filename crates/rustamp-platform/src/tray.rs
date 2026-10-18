@@ -639,8 +639,22 @@ mod imp {
         /// reinstalled. The previous icon went away with the previous
         /// taskbar, so this creates no second icon. A refusal is reported and
         /// not retried.
-        pub fn readd(&self) -> Result<(), TrayError> {
-            add_icon(self.owner, self.icon.handle)
+        ///
+        /// On success, `added` is set to `true`. On failure, `added` is set to
+        /// `false` so `Drop` does not attempt to remove an icon that was never
+        /// restored. Even if `NIM_DELETE` were sent for an absent icon, Win32
+        /// `Shell_NotifyIconW` safely returns `FALSE` without side effects.
+        pub fn readd(&mut self) -> Result<(), TrayError> {
+            match add_icon(self.owner, self.icon.handle) {
+                Ok(()) => {
+                    self.added = true;
+                    Ok(())
+                }
+                Err(error) => {
+                    self.added = false;
+                    Err(error)
+                }
+            }
         }
 
         /// Shows the native popup from the supplied model data and returns its
@@ -725,8 +739,9 @@ mod imp {
                 };
                 // SAFETY: same invariant as `attach`; the owner window still
                 // exists because the guard never outlives it. A refused
-                // delete is not reported: there is nothing left to clean
-                // through.
+                // delete (or deleting an icon absent after a failed re-add)
+                // is harmless: `Shell_NotifyIconW` returns FALSE without side
+                // effects, and no further cleanup is needed.
                 let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
                 self.added = false;
             }

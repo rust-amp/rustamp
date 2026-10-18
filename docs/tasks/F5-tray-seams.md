@@ -1,7 +1,8 @@
 # Task card F5 — Apply the F3 tray and hotkey seams
 
-Date: 2026-10-18. Status: implemented and compile-checked; test execution and
-interactive-desktop acceptance are pending with the orchestrator.
+Date: 2026-10-18. Status: implemented, compile-checked and unit-tested (247
+passed, 0 failed, 11 ignored); interactive-desktop acceptance is pending with
+the orchestrator.
 
 > **See "Follow-up F5a — Close the three tray-icon gaps" at the end of this
 > card.** A verification pass confirmed both seams below and found three gaps:
@@ -239,8 +240,9 @@ silently lost the icon for the rest of the run.
   player keeps running, exactly like the existing attach failures.
 - `Windowed::drain_tray` (`window.rs:1355`) is the one pump entry point
   (`window.rs:1639`, in `about_to_wait` where `drain_tray_menu` used to be
-  called). It re-adds first, then drains the menu, then the left click, so a
-  just-restored icon is live before this frame's clicks are considered.
+  called). It re-adds first, then drains the left click, then the menu, so a
+  just-restored icon is live before this frame's clicks are considered and the
+  primary action (window toggle) is drained before the modal popup loop.
 
 ## Gap 3 — the icon is the product's, not the stock glyph
 
@@ -421,3 +423,48 @@ pin OS behaviour. In the VM, with `--no-audio`:
    stock-icon fallback path leaves nothing behind.
 6. Re-run F5's own checklist items 1-5 above; this follow-up does not replace
    them.
+7. **Left click during active popup (dismissal vs. toggle).** Click the tray
+   icon while the popup menu is open: observe whether Windows consumes the click
+   on menu dismissal or delivers it to the subclass (causing a window toggle
+   one frame later). Headless tests verify queue isolation and dispatch order;
+   whether dismissal via tray click swallows the click or toggles the window
+   depends on real Windows shell mouse capture behavior and user intent.
+
+---
+
+# Follow-up F5b — Close the four verification findings (commit 8f946a9)
+
+Date: 2026-10-18. Status: four findings closed; clean-room and offline constraints preserved.
+
+A verification pass of commit 8f946a9 identified four findings, resolved as follows:
+
+1. **Honest order in `drain_tray` (`crates/rustamp-app/src/window.rs`):**
+   The order is `readd_tray_after_shell_restart()`, `drain_tray_left_click()`, then
+   `drain_tray_menu()`. Left click is the primary user interaction (direct window
+   toggle). If both a left and right click arrive in the same 16 ms frame, the
+   direct toggle is dispatched immediately before entering `show_menu`'s modal
+   Win32 loop, rather than getting trapped behind the modal popup and firing
+   unexpectedly after the user closes or dismisses the menu.
+2. **Status line in card header (`docs/tasks/F5-tray-seams.md`):**
+   Corrected to record that unit test execution was performed and passed (247
+   passed, 0 failed, 11 ignored); only interactive-desktop VM acceptance remains
+   pending with the orchestrator.
+3. **`readd()` failure handling and `added` flag (`crates/rustamp-platform/src/tray.rs`):**
+   `TrayIcon::readd(&mut self)` now sets `self.added = false` on failure (and `true`
+   on success), preventing `Drop` from issuing `NIM_DELETE` for an icon that is not
+   present in Explorer. In addition, the code and comments in `readd` and `Drop`
+   document that even if `NIM_DELETE` were sent for an absent icon, Win32
+   `Shell_NotifyIconW` safely returns `FALSE` without side effects.
+4. **Queued left click during active popup and the headless boundary:**
+   - *What can be decided headless:* Separate queue coalescing (`LEFT_CLICKS` vs
+     `MENU_REQUESTS`), pure mapping to `TRAY_LEFT_CLICK` (`ToggleMainWindow`),
+     drain order (`drain_tray_left_click` before `drain_tray_menu`), and that
+     queued clicks route to the App command channel.
+   - *What cannot be decided headless:* When a popup is open and the user clicks
+     the tray icon to dismiss it, whether the Windows shell swallows the click or
+     delivers `WM_LBUTTONUP` to the tray subclass depends on Win32 modal mouse
+     capture. Furthermore, whether a user clicking the tray icon during an open
+     popup intended solely to dismiss the menu or also to toggle the window cannot
+     be inferred without interactive-desktop VM evaluation. Item 7 of the VM
+     checklist records this requirement.
+
