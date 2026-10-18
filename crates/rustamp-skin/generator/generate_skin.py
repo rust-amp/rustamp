@@ -1270,7 +1270,7 @@ def generate_rust_pledit_txt():
         "Normal=#DF7B38\r\n"
         "Current=#FFFFFF\r\n"
         "NormalBG=#141517\r\n"
-        "SelectedBG=#6A2610\r\n"
+        "SelectedBG=#0000C6\r\n"
         "Font=Arial\r\n"
     ).encode('utf-8')
 

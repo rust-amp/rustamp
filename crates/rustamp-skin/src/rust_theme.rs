@@ -170,3 +170,17 @@ pub fn builtin_skin() -> crate::error::Result<crate::skin::Skin> {
     let mut s = source();
     crate::skin::Skin::from_source(&mut s, &crate::skin::BuiltinDefaultSkin)
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shipped_playlist_palette_matches_the_w24_replacement() {
+        let skin = super::builtin_skin().expect("the shipped default loads");
+        let style = skin.pledit();
+        assert_eq!(style.normal, [0xDF, 0x7B, 0x38]);
+        assert_eq!(style.current, [0xFF; 3]);
+        assert_eq!(style.normal_bg, [0x14, 0x15, 0x17]);
+        assert_eq!(style.selected_bg, [0x00, 0x00, 0xC6]);
+        assert_eq!(style.font.as_deref(), Some("Arial"));
+    }
+}

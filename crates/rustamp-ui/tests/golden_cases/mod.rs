@@ -297,6 +297,9 @@ pub fn case_playlist_window_selection(skin: &Skin, namespace: &str) {
     // The second visible row (entry 57), through the model's public selection
     // API; `draw_rows` maps selected ids back to the visible row band.
     window.apply_select(&SelectOp::Set(vec![EntryId(57)]));
+    // Current is deliberately not selected: white ink on NormalBG, while
+    // entry 57 keeps Normal ink on SelectedBG (S17 §5).
+    window.set_current(Some(EntryId(56)));
     let labels = vec![
         "57. Rustamp - the look-alike default skin".to_string(),
         "58. A second entry, so the rows are visible".to_string(),
@@ -320,6 +323,8 @@ pub fn case_playlist_window_mid_page(skin: &Skin, namespace: &str) {
     window.apply_select(&SelectOp::Set(vec![EntryId(28)]));
     // One Down step through the new key path: entry 29, view unchanged.
     window.move_selection_down();
+    // Current and selected coincide here: Current ink must not erase the band.
+    window.set_current(Some(EntryId(29)));
     let labels = vec![
         "29. Rustamp - the look-alike default skin".to_string(),
         "30. A second entry, so the rows are visible".to_string(),

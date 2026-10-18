@@ -2,5 +2,5 @@
 Normal=#DF7B38
 Current=#FFFFFF
 NormalBG=#141517
-SelectedBG=#6A2610
+SelectedBG=#0000C6
 Font=Arial

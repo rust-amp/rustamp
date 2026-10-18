@@ -21,7 +21,7 @@
 //!   pitch"). The band below the fourth row is list background (own reading).
 //! * Selection fill: the `SelectedBG` colour from `pledit.txt` over the list
 //!   area (S01 §4, verified by diff); entry text in the `Normal` colour
-//!   (`#00FF00` in the base skin).
+//!   (`#00FF00` in the base skin), or `Current` for the current playback entry.
 //! * Scrollbar handle `PLEDIT.BMP` (52,53,7,17) at (260,y) with y = 20 at the
 //!   scroll top, 40 in the middle and 60 at the bottom (S01 §4.2, round 2,
 //!   verified); the arrow pair `PLEDIT.BMP` (261,72,8,10) fixed at (260,78)
@@ -511,14 +511,33 @@ fn draw_bottom_bar(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin) {
 ///
 /// S01 §4 settles that 2.95 draws the list with a real font (identity open),
 /// so this stand-in cannot match it; see the module docs. The helper mirrors
-/// `render::text_font` (same glyph map, opaque blits).
+/// `render::text_font`'s glyph map, but not its opaque cell backgrounds.
+/// The space cell's top-left pixel is the background key (own-choice mask
+/// extraction, not a measured font rule). Only glyph ink survives, so it can
+/// be tinted without painting a sheet-coloured box over `SelectedBG`.
 fn text_font(skin: &Skin) -> Option<BitmapFont> {
     let raster = skin.sheet(Sheet::Text)?;
     let image =
         Image::from_rgba(raster.width(), raster.height(), raster.as_rgba().to_vec()).ok()?;
+    playlist_font_mask(image)
+}
+
+fn playlist_font_mask(mut image: Image) -> Option<BitmapFont> {
     let mut glyphs = GlyphMap::new(webamp::TEXT_CELL.0, webamp::TEXT_CELL.1);
     for (ch, col, row) in webamp::TEXT_GLYPHS {
         glyphs.insert(*ch, *col, *row);
+    }
+    let (col, row) = glyphs.cell(' ')?;
+    let background = image.pixel(
+        (col * webamp::TEXT_CELL.0) as i32,
+        (row * webamp::TEXT_CELL.1) as i32,
+    )?;
+    for pixel in image.as_rgba_mut().as_chunks_mut::<4>().0 {
+        if pixel[..3] == background[..3] {
+            *pixel = [0; 4];
+        } else {
+            pixel[..3].fill(255);
+        }
     }
     Some(BitmapFont::new(image, glyphs, None, 0))
 }
@@ -531,12 +550,9 @@ fn text_font(skin: &Skin) -> Option<BitmapFont> {
 /// band is one row of the settled list area ([`row_rect`], S06 §2: x 12-254,
 /// 13 px pitch), so it cannot reach the side rails or the scrollbar.
 ///
-/// What the skin also provides and this renderer does **not** use yet:
-/// `Normal` and `Current` (the row text colours, white for the playing
-/// entry). The labels are stamped from the `text.bmp` bitmap font in whatever
-/// colour that sheet bakes in, because `rustamp_gfx::BitmapFont` has no tint
-/// and the golden images pin the current output. That is recorded as a
-/// finding in `docs/tasks/W24-native-frame-and-eq.md`, not changed here.
+/// `Normal` and `Current` tint the glyph ink independently of selection;
+/// `Current` applies only to the app-supplied current entry, not the clicked
+/// or selected one (S17 §5). The bitmap shapes remain a stand-in for `Font`.
 fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &[String]) {
     let style = skin.pledit();
     let selected = [
@@ -564,6 +580,16 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
             // spill past the row or into the scrollbar.
             let mut scratch = Image::new(rect.width, rect.height);
             font.render_text(&mut scratch, 0, 0, text);
+            let colour = if window.current() == Some(*id) {
+                style.current
+            } else {
+                style.normal
+            };
+            for pixel in scratch.as_rgba_mut().as_chunks_mut::<4>().0 {
+                if pixel[3] != 0 {
+                    pixel[..3].copy_from_slice(&colour);
+                }
+            }
             canvas.blit_alpha(&scratch, scratch.bounds(), rect.x, rect.y);
         }
     }
@@ -590,6 +616,97 @@ fn draw_scrollbar(canvas: &mut Image, pledit: Option<&Image>, window: &PlaylistW
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_mask_removes_nonblack_background_and_preserves_ink_alpha() {
+        let background = [0x51, 0x62, 0x73, 255];
+        let mut sheet = Image::filled(155, 18, background);
+        // Black ink must not be mistaken for background; transparent ink
+        // must not become visible merely because its RGB differs from the key.
+        sheet.set_pixel(0, 0, [0, 0, 0, 255]);
+        sheet.set_pixel(1, 0, [0, 0, 0, 128]);
+        sheet.set_pixel(2, 0, [9, 8, 7, 0]);
+        let font = playlist_font_mask(sheet).expect("the space cell exists");
+        let mut scratch = Image::new(10, 6);
+        font.render_text(&mut scratch, 0, 0, "a ");
+        assert_eq!(scratch.pixel(0, 0), Some([255; 4]));
+        assert_eq!(scratch.pixel(1, 0), Some([255, 255, 255, 128]));
+        assert_eq!(scratch.pixel(2, 0).unwrap()[3], 0);
+        assert_eq!(scratch.pixel(3, 0), Some([0; 4]));
+        assert_eq!(scratch.pixel(5, 0), Some([0; 4]), "space is transparent");
+    }
+
+    #[test]
+    fn row_ink_uses_normal_and_current_without_erasing_either_background() {
+        use rustamp_core::{command::SelectOp, playlist::EntryId};
+        use rustamp_skin::{BuiltinDefaultSkin, BuiltinLookalikeSkin};
+
+        for mut source in [BuiltinDefaultSkin::source(), BuiltinLookalikeSkin::source()] {
+            // All four keys differ from both embedded palettes and from one
+            // another, so baked-in or hardcoded colours cannot pass.
+            source.add(
+                "pledit.txt",
+                b"[Text]\nNormal=#13579B\nCurrent=#ECA864\nNormalBG=#192A3B\nSelectedBG=#4C5D6E\n"
+                    .to_vec(),
+            );
+            let skin = Skin::from_source(&mut source, &BuiltinDefaultSkin).unwrap();
+            let mut window = PlaylistWindow::new();
+            window.set_entries((0..8).map(EntryId).collect());
+            window.scroll_to(4);
+            // Long enough to exercise clipping at the list's right edge.
+            let labels = vec!["a a ".repeat(30); VISIBLE_ROWS];
+            for current in [Some(EntryId(5)), Some(EntryId(6)), None] {
+                window.set_current(current);
+                for selected in [EntryId(5), EntryId(6)] {
+                    window.apply_select(&SelectOp::Set(vec![selected]));
+                    let empty = render_playlist_window(&skin, &window, &[], true);
+                    let frame = render_playlist_window(&skin, &window, &labels, true);
+                    for (i, id) in window.visible_ids().into_iter().enumerate() {
+                        let row = row_rect(i).unwrap();
+                        let style = skin.pledit();
+                        let bg = if id == selected {
+                            style.selected_bg
+                        } else {
+                            style.normal_bg
+                        };
+                        let ink = if Some(id) == current {
+                            style.current
+                        } else {
+                            style.normal
+                        };
+                        let bg = [bg[0], bg[1], bg[2], 255];
+                        let ink = [ink[0], ink[1], ink[2], 255];
+                        let mut ink_count = 0;
+                        for y in row.y..row.bottom() {
+                            for x in row.x..row.right() {
+                                let pixel = frame.pixel(x, y).unwrap();
+                                assert!(pixel == bg || pixel == ink, "row {i}: {pixel:?}");
+                                ink_count += usize::from(pixel == ink);
+                            }
+                        }
+                        assert!(ink_count > 0, "a nonempty label must have visible ink");
+                        assert_eq!(
+                            frame.pixel(row.x + 5, row.y),
+                            Some(bg),
+                            "space keeps the band"
+                        );
+                        assert_eq!(frame.pixel(row.x, row.bottom() - 1), Some(bg));
+                    }
+                    for y in 0..frame.height() as i32 {
+                        for x in 0..frame.width() as i32 {
+                            if !in_list_area(x, y) {
+                                assert_eq!(
+                                    frame.pixel(x, y),
+                                    empty.pixel(x, y),
+                                    "clipping at {x},{y}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// The selected row's colour is the skin's, not ours.
     ///
@@ -623,7 +740,7 @@ mod tests {
 
         let mut window = PlaylistWindow::default();
         window.set_entries(vec![EntryId(1), EntryId(2)]);
-        window.select_all();
+        window.apply_select(&rustamp_core::command::SelectOp::All);
         let labels = vec![String::new(), String::new()];
         let frame = render_playlist_window(&skin, &window, &labels, true);
 

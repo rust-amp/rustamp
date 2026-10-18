@@ -301,6 +301,19 @@ impl PlaylistWindow {
         self.entries.is_empty()
     }
 
+    /// The current playback entry, independently of the selection and viewport.
+    pub fn current(&self) -> Option<EntryId> {
+        self.current
+    }
+
+    /// Syncs the current playback entry from the app without selecting or scrolling.
+    ///
+    /// Unknown ids clear the marker. Like [`Self::set_entries`], this only
+    /// mirrors app-owned state; it never predicts playback from a click.
+    pub fn set_current(&mut self, current: Option<EntryId>) {
+        self.current = current.filter(|id| self.entries.contains(id));
+    }
+
     /// Index of the first visible entry (the scroll offset).
     pub fn first_visible(&self) -> usize {
         self.first_visible
@@ -600,6 +613,36 @@ mod tests {
         let mut window = PlaylistWindow::new();
         window.set_entries(ids(n));
         window
+    }
+
+    #[test]
+    fn current_entry_is_app_owned_and_independent_of_selection_and_scroll() {
+        let mut window = window_with(8);
+        window.apply_select(&SelectOp::Set(vec![EntryId(5)]));
+        window.scroll_to(4);
+        window.set_current(Some(EntryId(1)));
+        assert_eq!(window.current(), Some(EntryId(1)));
+        assert_eq!(window.selected_ids(), vec![EntryId(5)]);
+        assert_eq!(window.first_visible(), 4);
+        window.double_click_row(2);
+        assert_eq!(
+            window.current(),
+            Some(EntryId(1)),
+            "a click is not playback"
+        );
+        window.set_entries(ids(8));
+        assert_eq!(window.current(), Some(EntryId(1)), "survives a sync");
+        window.set_entries(vec![EntryId(5)]);
+        assert_eq!(
+            window.current(),
+            None,
+            "removed entries cannot stay current"
+        );
+        window.set_current(Some(EntryId(99)));
+        assert_eq!(window.current(), None, "unknown ids cannot become current");
+        window.set_current(Some(EntryId(5)));
+        window.set_current(None);
+        assert_eq!(window.current(), None, "the app can clear the marker");
     }
 
     #[test]

@@ -217,7 +217,7 @@ a folder pick is a different native dialog (`IFileOpenDialog` with
 
 ---
 
-## 6. The selected playlist row's colour — diagnosed, change is outside this lane
+## 6. The selected playlist row's colour — diagnosis and wave123 follow-up
 
 **What the skin provides, and what the code does with it.** `pledit.txt`
 provides `SelectedBG`, and the renderer already uses exactly that:
@@ -234,13 +234,14 @@ Normal=#DF7B38      <- orange row text
 SelectedBG=#6A2610  <- dark brown selection band
 ```
 
-That is the brown-and-orange bar in the screenshot. It is the skin's own
-choice, faithfully rendered.
+That was the brown-and-orange bar in the screenshot. The brown fill came
+directly from the skin. The text path was separate: it stamped whatever
+foreground and opaque background the `text.bmp` glyph cells baked in, rather
+than using `Normal` or `Current` (see the second finding below).
 
-**`crates/rustamp-skin` is outside this lane's owned paths, so nothing was
-changed there.** The exact change, if the owner wants a different selection
-colour, is in that one file — for example the classic reading S06 §101
-records, a blue band:
+**The original wave122 lane did not own `crates/rustamp-skin`, so it made no
+skin change.** Its exact proposed replacement, now applied by the follow-up
+lane to the shipped asset and its generator, is:
 
 ```
 [Text]
@@ -251,20 +252,32 @@ SelectedBG=#0000C6
 Font=Arial
 ```
 
-(S06 §101 reads the reference highlight as (0,0,198) = `#0000C6`, as
+(S06 §2, line 101 reads the reference highlight as (0,0,198) = `#0000C6`, as
 corroboration only. The webamp-derived default the parser falls back to is
-`#0000FF`.) Changing it will move the playlist golden images in
-`crates/rustamp-ui/tests/golden_cases`, which also need regenerating — that is
-a second reason it does not belong in a lane that cannot run the suite.
+`#0000FF`; S17 §5 also records the base skin's `SelectedBG=#0000C6`.) No
+parser fallback or other skin palette was changed. `Normal` stays Rust orange,
+`Current` stays white and `NormalBG` stays charcoal, exactly as above.
 
-**Second finding, same file, not changed.** `draw_rows` honours `NormalBG`
-and `SelectedBG` but **not** `Normal` and `Current`: the row labels are
-stamped from the `text.bmp` glyph sheet in whatever colour that sheet bakes
-in, because `rustamp_gfx::BitmapFont` has no tint (`rustamp-gfx` is also
-outside this lane) and the golden images pin the current output. So the
-playing entry does not turn white, and a skin that sets `Normal` sees it
-ignored. The fix needs either a tint parameter on `BitmapFont` or a recolour
-pass in `rustamp-ui`, plus regenerated goldens.
+**Second finding, verified and fixed in wave123's UI-owned paths.**
+`draw_rows` honoured `NormalBG` and `SelectedBG` but dropped `Normal` and
+`Current`. It now extracts a glyph mask, recolours the ink to `Normal` or
+`Current`, and alpha-composites it over the existing row background. The
+background key is sampled from the space cell's top-left pixel; that mask
+extraction is an **own-choice bitmap stand-in**, not a measured reference
+font rule. Alpha is preserved. Spaces and gaps do not stamp a black (or
+sheet-coloured) box over the selection. Text still clips to the same row;
+the highlight stays x 12..254 exclusive, 13 px tall, clear of rails/scrollbar.
+
+`PlaylistWindow::current` / `set_current` expose the previously dormant marker.
+The app supplies a stable entry id; selecting or double-clicking an entry
+does not predict playback. `Current` is independent of selection and scroll;
+unknown ids are rejected and removing the entry through `set_entries` clears
+the marker. No shared core contract or `rustamp-gfx` change was needed.
+
+**Still deliberately not implemented:** `Font=Arial` is parsed but the rows
+retain the documented `text.bmp` stand-in. This fixes colour handling, not
+reference-font fidelity; arbitrary decorative/multicolour glyph sheets may
+need a different mask policy or, ultimately, the real font path.
 
 **Check added.**
 `the_selected_row_is_filled_with_the_skins_own_selectedbg` builds a skin whose
@@ -272,6 +285,88 @@ pass in `rustamp-ui`, plus regenerated goldens.
 colour inside the band and *not* outside it. It fails if anyone hardcodes a
 highlight, and it fails if the band spills onto the side rails or the
 scrollbar.
+
+**Wave123 checks added (compiled by clippy, NOT executed here).**
+
+* The shipped default's five palette/font values match the exact replacement.
+* A synthetic mask with a non-black background keeps black ink and fractional
+  alpha, drops the cell background, and does not reveal transparent pixels.
+* Both embedded skins are rendered with four distinct custom colours, current
+  entries selected/unselected/absent, and a scrolled viewport. Every row pixel
+  must be its own ink or background; labels must contain ink, spaces preserve
+  the band, and long text changes no pixel outside the list area.
+* Current-entry state remains independent of selection/scroll, survives a live
+  sync and clears for missing/unknown ids or an explicit `None`.
+* The pre-existing SelectedBG test called `select_all()` but never applied
+  its returned command, so it selected nothing. It now explicitly applies
+  `SelectOp::All`; every existing pixel assertion is retained, not weakened.
+
+### Required app integration — outside wave123's paths, NOT changed
+
+The dormant `current` field had **no producer at all**. Consequently the new
+renderer can honour `Current` when supplied, but the live player will keep
+using `Normal` for all entries until the orchestrator wires this seam.
+
+Exact change in `crates/rustamp-app/src/playlist_window.rs`, at the beginning
+of `App::render_playlist`, before reading `visible_ids()`:
+
+```rust
+let index = self.engine().current_index();
+let current = self.entry_id_for(index);
+self.playlist.set_current(current);
+```
+
+This reuses the existing engine-index-to-stable-id mapping, refreshes on every
+paint (including next/previous and natural advancement), and uses no click or
+selection inference. Add an app-level regression that changes the engine's
+current index while keeping selection fixed, renders, and verifies that the
+`Current` colour follows that id (including an offscreen id and `None`).
+Do not claim the live current-entry colour fixed before this integration.
+
+### Golden handover — review in the guest before blessing
+
+No PNG was regenerated, blessed, deleted, or loosened. Four existing images
+are expected to differ and require the orchestrator's visual review and
+re-blessing **in the interactive VM session**, never on the host:
+
+| Image under `tests/golden/` | What a human should see |
+|---|---|
+| `rust-theme/playlist_window_selection.png` | Bottom page, row labelled 57 current/unselected: white on charcoal; row labelled 58 selected/non-current: Rust-orange ink on a continuous `#0000C6` blue band; other rows orange on charcoal. |
+| `rust-theme/playlist_window_mid_page.png` | Middle page, row labelled 30 current AND selected: white ink on the same blue band; remaining rows orange on charcoal. |
+| `lookalike/playlist_window_selection.png` | Same current/selection separation; white current entry, green normal entries, the look-alike's own blue `SelectedBG`. |
+| `lookalike/playlist_window_mid_page.png` | White current ink on the look-alike's selected band; green normal rows. |
+
+Both shared golden cases now explicitly supply the current id, covering both
+combinations. Ink gaps and spaces must preserve the row background, with no
+black glyph-cell boxes; rails, scrollbar, title and bottom bar must not change.
+`playlist_window.png` in both namespaces remains unchanged: its model has no
+entries, so its supplied labels never render. Main/EQ/dialog/visualization
+goldens are outside this render path and must not be re-blessed for this fix.
+No `classic-base` image may be committed; run that external skin's coverage
+when available and report any actual differences rather than fabricating it.
+
+### Wave123 validation and boundaries
+
+Worktree: `C:\Users\micro\.local\share\opencode\worktree\26de0e\wave123-highlight`.
+Only `rustamp-skin`, `rustamp-ui` and this card are edited. No dependencies,
+downloads, git writes, reference binaries, VM/broker calls or tests were run.
+Sources: S01, S06 §2, S17 §5 and the repo's own renderer/skin assets; no dirty
+room, Winamp source, SDK headers or disassembly was read. Test execution,
+reviewing/re-blessing the four PNGs, app integration, and the owner's real
+window acceptance remain with the orchestrator/owner. Host compilation is
+not test or visual-acceptance evidence.
+
+Wave123 gates (offline, target and compiler temporary files inside this
+worktree; each exit code captured immediately after its command):
+
+| Gate | Exit |
+|---|---|
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 |
+| `cargo build --workspace` | 0 |
+
+`git -C D:\code\Rustamp status --short` returned no entries (exit 0), with
+optional git locks disabled. No file in the canonical checkout was edited.
 
 ---
 
@@ -368,7 +463,7 @@ accelerators the OS draws.
 
 ---
 
-## Changes needed outside this lane's owned paths (not made)
+## Changes outside the original wave122 lane's owned paths
 
 1. **`docs/notes/vm-run-tests.ps1`** (lines ~525 and ~528) lists the two
    removed VM-only menu probes in its expected-test table:
@@ -377,11 +472,12 @@ accelerators the OS draws.
    longer exist. **Exact change:** delete those two `[pscustomobject]` rows
    from the `Group A (VM GUI)` list. Leaving them makes the runner look for
    tests that are gone.
-2. **`crates/rustamp-skin/assets/rust-theme/pledit.txt`** — the selection
-   colour the owner called ugly. Exact replacement content in §6 above.
-3. **`crates/rustamp-gfx`** (`BitmapFont`) — a text colour/tint, so the
-   playlist rows can honour `pledit.txt`'s `Normal` and `Current` (§6,
-   second finding). Needs regenerated playlist goldens.
+2. **Resolved by wave123:** `crates/rustamp-skin/assets/rust-theme/pledit.txt`
+   and its generator now use the exact replacement in §6.
+3. **Resolved without a `rustamp-gfx` edit:** wave123's UI-local glyph mask
+   and tint honour `Normal` and `Current`. The app must still supply the
+   current id; the exact three-line integration and four pending goldens are
+   documented in §6. These app/golden changes were NOT made by wave123.
 4. Documentation that still describes the retired menu window:
    `docs/tasks/N12-window-ansi.md:87`, `docs/tasks/X5-smoke-window.md:38,48`
    (both mention the `Rustamp Menu` window title),
