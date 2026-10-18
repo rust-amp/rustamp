@@ -321,6 +321,28 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The virtual cable, and a real defect it exposed (2026-10-18 16:45)
+
+The guest now has exactly one VB-Audio Virtual Cable: the first install left two
+device nodes, `fix-vbcable-once.ps1` removed both and installed one, and after a
+stop/start cycle the guest reports exactly one `CABLE Output` and one
+`Lautsprecher (VB-Audio Virtual Cable)`, both OK, driver `oem3.inf` version
+1.0.3.5 signed by Vincent Burel. The install uses the INF route on purpose: the
+vendor setup opens a GUI and waits for clicks that never come in session 0.
+
+The two audio tests then ran against a real endpoint for the first time:
+
+- **`real_playback`: PASS** - the player opens the virtual cable and writes to it.
+- **`loopback`: FAIL**, and it is a **product defect**, not an environment one:
+  `output flush failed: unsupported operation: cpal endpoint-buffer flush; close
+  and recreate the output stream instead; output closed`. The tone is never
+  played, because the player treats an unsupported buffer flush as fatal, closes
+  the output and kills playback. On any device whose backend lacks that flush the
+  player cannot play at all. The error message itself names the remedy.
+
+A lane owns it. This is exactly the class of defect the notes predicted only a
+real device could find.
+
 ## The ring root fix (2026-10-18 16:05)
 
 `c96935a`. All **six** edge guards in `crates/rustamp-ipc/src/shm/ring.rs` are
