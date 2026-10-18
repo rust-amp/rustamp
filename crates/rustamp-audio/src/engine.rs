@@ -1203,13 +1203,26 @@ impl Engine {
     /// transport to [`TransportState::Stopped`], freezes the timeline position,
     /// and publishes [`Event::StateChanged`], [`Event::PositionChanged`] and
     /// [`Event::Error`].
+    ///
+    /// A track start the decode thread already reported is published before
+    /// the freeze (M25 §1.1, A25, M30): the join below holds the queued
+    /// `TrackStarted` instead of discarding it, and delivering it here keeps
+    /// the window on the track that actually started — its duration, not the
+    /// previous track's.
     fn handle_output_error(&mut self, err: Error) {
         let frozen_timeline = self.timeline_frames();
         self.send(DecodeMsg::Stop);
         self.sync.set_active(false);
         let _ = self.output.pause();
         let _ = self.flush_output();
-        let _ = self.join_decode();
+        // Deliver the held start before the freeze and the error
+        // publication. The `TrackStarted` arm touches no timeline origin and
+        // no output, so the freeze stays exact, the error is still published
+        // once, and the sticky output-flush failure cannot be armed (M25 §1.1,
+        // A25, M30).
+        if let Some(start) = self.join_decode() {
+            let _ = self.on_decode_out(start);
+        }
         self.transport = TransportState::Stopped;
         self.timeline_origin = frozen_timeline;
         self.clock_origin = self.output.played_frames();
@@ -1440,10 +1453,11 @@ impl Engine {
 
     /// Join the decode thread and take the ring producer and DSP chain back.
     /// Returns a track start the decode thread queued but the engine never
-    /// processed, held instead of discarded (M25 §1.1, A25): the
-    /// resident-failure teardown delivers it, so a start that already
-    /// happened survives the failure. Every other caller discards it — the
-    /// run it belongs to is over, and the next run publishes its own start.
+    /// processed, held instead of discarded (M25 §1.1, A25, M30): the
+    /// failure teardowns (`handle_dsp_failure` and `handle_output_error`)
+    /// deliver it, so a start that already happened survives the failure.
+    /// Every other caller discards it — the run it belongs to is over, and the
+    /// next run publishes its own start.
     fn join_decode(&mut self) -> Option<DecodeOut> {
         // A thread waiting for a ring drain must not block the join; nothing is
         // consuming the ring at this point anyway.
@@ -1509,5 +1523,305 @@ impl Drop for Engine {
         self.send(DecodeMsg::Quit);
         let _ = self.join_decode();
         let _ = self.output.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustamp_core::audio::{
+        AudioSpec, Confidence, Decoder, DecoderFactory, DecoderRegistry, MediaSource, ProbeHint,
+    };
+    use rustamp_core::bus::EventBus;
+    use rustamp_core::error::{ErrorKind, Result as CoreResult};
+    use rustamp_core::event::Event;
+    use rustamp_output::{NullClock, NullOutput};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    const SPEC: AudioSpec = AudioSpec::new(44100, 2);
+
+    struct PatternDecoder {
+        total: u64,
+        pos: u64,
+    }
+
+    impl Decoder for PatternDecoder {
+        fn spec(&self) -> AudioSpec {
+            SPEC
+        }
+
+        fn read(&mut self, out: &mut [f32]) -> CoreResult<usize> {
+            let ch = usize::from(SPEC.channels);
+            let want = out.len() / ch;
+            let n = want.min(self.total.saturating_sub(self.pos) as usize);
+            out[..n * ch].fill(0.1);
+            self.pos += n as u64;
+            Ok(n)
+        }
+
+        fn seek(&mut self, to: Duration) -> CoreResult<Duration> {
+            let frames = (to.as_secs_f64() * f64::from(SPEC.sample_rate)).round() as u64;
+            self.pos = frames.min(self.total);
+            Ok(SPEC.duration_of(self.pos))
+        }
+
+        fn duration(&self) -> Option<Duration> {
+            Some(SPEC.duration_of(self.total))
+        }
+    }
+
+    struct PatternFactory;
+
+    impl DecoderFactory for PatternFactory {
+        fn name(&self) -> &str {
+            "pattern"
+        }
+
+        fn extensions(&self) -> &[&str] {
+            &["tst"]
+        }
+
+        fn probe(&self, hint: &ProbeHint<'_>) -> Confidence {
+            if hint.extension == Some("tst") {
+                Confidence::CONTENT
+            } else {
+                Confidence::NONE
+            }
+        }
+
+        fn open(&self, source: MediaSource) -> CoreResult<Box<dyn Decoder>> {
+            let name = match &source {
+                MediaSource::Path(p) => p.display().to_string(),
+                MediaSource::Url(u) => u.clone(),
+                MediaSource::Reader { .. } => {
+                    return Err(rustamp_core::error::Error::Unsupported(
+                        "fake decoder takes paths only",
+                    ));
+                }
+            };
+            let stem = name.rsplit(['/', '\\']).next().unwrap_or(name.as_str());
+            let stem = stem.strip_suffix(".tst").unwrap_or(stem);
+            let frames = stem
+                .strip_prefix("track")
+                .and_then(|rest| rest.split_once('_'))
+                .map(|(_, f)| f.parse().unwrap_or(3000))
+                .unwrap_or(3000);
+            Ok(Box::new(PatternDecoder {
+                total: frames,
+                pos: 0,
+            }))
+        }
+    }
+
+    struct TestHarness {
+        engine: Engine,
+        clock: NullClock,
+        events: rustamp_core::bus::EventReceiver,
+        _dir: tempfile::TempDir,
+    }
+
+    impl TestHarness {
+        fn new(names: &[&str]) -> Self {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (output, clock) = NullOutput::pair();
+            let bus = EventBus::new();
+            let events = bus.subscribe();
+            let mut registry = DecoderRegistry::new();
+            registry.register(Arc::new(PatternFactory));
+            let mut engine = Engine::new(registry, Box::new(output), bus, EngineConfig::default())
+                .expect("engine construction");
+            engine.set_limiter_enabled(false);
+            let queue = names
+                .iter()
+                .map(|name| {
+                    let path = dir.path().join(name);
+                    std::fs::write(&path, b"").expect("placeholder track");
+                    TrackSource::path(path)
+                })
+                .collect();
+            engine.set_queue(queue);
+            TestHarness {
+                engine,
+                clock,
+                events,
+                _dir: dir,
+            }
+        }
+
+        fn drain_events(&mut self) -> Vec<Event> {
+            self.events.try_iter().collect()
+        }
+
+        fn wait_pumping(
+            &mut self,
+            mut cond: impl FnMut(&Engine) -> bool,
+            timeout: Duration,
+        ) -> bool {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                self.engine.poll().expect("poll");
+                if cond(&self.engine) {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                self.clock.pump(256);
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn engine_publishes_the_start_when_output_fails_right_after_it() {
+        let wait = Duration::from_secs(5);
+        let mut h = TestHarness::new(&["track7_2048.tst", "track2_44100.tst"]);
+
+        // A first run publishes the first track's duration and ends before
+        // the second track opens ("stop after current"): the stale duration
+        // the erasure would leave behind is exactly this one.
+        h.engine.toggle_stop_after_current().unwrap();
+        h.engine.play_index(0).unwrap();
+        assert!(
+            h.wait_pumping(|e| e.duration_frames().is_some(), wait),
+            "the first track must start"
+        );
+        assert_eq!(h.engine.duration_frames(), Some(2048));
+        assert!(
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, wait),
+            "the first run must finish after its track"
+        );
+        assert_eq!(
+            h.engine.duration_frames(),
+            Some(2048),
+            "the second track must not have started"
+        );
+
+        // The second track starts.
+        h.engine.play_index(1).unwrap();
+        assert_eq!(h.engine.current_index(), Some(1));
+
+        // Wait until the decode thread has queued TrackStarted for track 1.
+        // Once the decode thread begins writing into the ring, prepare_track
+        // has definitely sent TrackStarted into the from_decode channel.
+        let start_queued = {
+            let deadline = std::time::Instant::now() + wait;
+            loop {
+                let (written, _) = h.engine.sync.counters();
+                if written > 0 {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        assert!(start_queued, "the decode thread must begin writing track 1");
+
+        // The output device now fails mid-run before Engine::poll processes the queue.
+        h.clock.fail();
+
+        // One poll handles the failure: poll checks stream_error before
+        // from_decode. The failure teardown must deliver the held start.
+        h.engine.poll().unwrap();
+
+        assert_eq!(
+            h.engine.duration_frames(),
+            Some(44_100),
+            "the reported duration must be the started track's, not the previous track's"
+        );
+        assert_eq!(h.engine.current_index(), Some(1));
+        assert_eq!(h.engine.transport(), TransportState::Stopped);
+        assert_eq!(
+            h.engine.position_frames(),
+            0,
+            "the timeline must freeze at the failure (nothing was pumped on track 1)"
+        );
+
+        let events = h.drain_events();
+        let error_count = events
+            .iter()
+            .filter(|event| matches!(event, Event::Error(_)))
+            .count();
+        assert_eq!(error_count, 1, "the error must be published once");
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Error(info) => Some(info),
+                _ => None,
+            })
+            .expect("an output failure must publish an error event");
+        assert_eq!(error.kind, ErrorKind::Output);
+        assert!(
+            error.message.contains("simulated device failure"),
+            "{error:?}"
+        );
+        assert!(h.engine.last_error().is_some());
+
+        // The window shows the started track: its own duration, on the
+        // track-change event too.
+        let started = events.iter().find_map(|event| match event {
+            Event::TrackChanged {
+                index: Some(1),
+                duration_ms,
+                ..
+            } => Some(*duration_ms),
+            _ => None,
+        });
+        assert_eq!(
+            started,
+            Some(Some(1000)),
+            "the track change must carry the started track's duration"
+        );
+    }
+
+    #[test]
+    fn stop_does_not_advance_to_prefetched_next_track_during_gapless() {
+        let wait = Duration::from_secs(5);
+        let mut h = TestHarness::new(&["track1_2048.tst", "track2_44100.tst"]);
+
+        h.engine.play_index(0).unwrap();
+        assert!(
+            h.wait_pumping(|e| e.duration_frames() == Some(2048), wait),
+            "track 0 must start"
+        );
+
+        // Wait until track 0 has been decoded and the decode thread pre-fetches track 1
+        // (written frames exceeding track 0's 2048 frames).
+        let prefetched = {
+            let deadline = std::time::Instant::now() + wait;
+            loop {
+                let (written, _) = h.engine.sync.counters();
+                if written > 2048 {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        assert!(prefetched, "decode thread should prefetch into track 1");
+
+        // The user stops playback while device has only partially played track 0.
+        assert!(h.clock.frames() < 2048);
+        h.engine.stop().unwrap();
+
+        assert_eq!(h.engine.transport(), TransportState::Stopped);
+        // Current index must stay at track 0 (the track that was playing), not jump to track 1!
+        assert_eq!(h.engine.current_index(), Some(0));
+
+        let events = h.drain_events();
+        // Event::TrackChanged must NOT have been emitted for track 1.
+        let track1_changed = events
+            .iter()
+            .any(|e| matches!(e, Event::TrackChanged { index: Some(1), .. }));
+        assert!(
+            !track1_changed,
+            "stop must not publish TrackChanged for prefetched track 1"
+        );
     }
 }

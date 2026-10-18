@@ -313,9 +313,6 @@ impl<F: PcmRings> DecoderSession<F> {
                     metadata,
                 }
             }
-            Message::DecoderError { message } => {
-                return Err(MediaHostError::OperationFailed(message));
-            }
             message => {
                 return Err(MediaHostError::InvalidMessage(format!(
                     "expected DecoderOpened: {message:?}"
@@ -393,10 +390,6 @@ impl<F: PcmRings> DecoderSession<F> {
                 skipped_packets,
                 bitrate_kbps,
             } => self.stats = (skipped_packets, bitrate_kbps),
-            Message::DecoderError { message } => {
-                self.peer.fail(&message);
-                return Err(MediaHostError::OperationFailed(message));
-            }
             message => {
                 if self.pending.len() >= 8 {
                     self.peer.fail("too many pending decoder transitions");
@@ -467,8 +460,7 @@ impl<F: PcmRings> DecoderSession<F> {
                     let message = self.next(deadline)?;
                     if let Some(spec) = self.pending_format {
                         match message {
-                            message @ (Message::DecoderStats { .. }
-                            | Message::DecoderError { .. }) => {
+                            message @ Message::DecoderStats { .. } => {
                                 self.remember(message)?;
                                 continue;
                             }
@@ -487,9 +479,7 @@ impl<F: PcmRings> DecoderSession<F> {
                             validate_spec(spec)?;
                             self.pending_format = Some(spec);
                         }
-                        message @ (Message::DecoderStats { .. } | Message::DecoderError { .. }) => {
-                            self.remember(message)?
-                        }
+                        message @ Message::DecoderStats { .. } => self.remember(message)?,
                         message => {
                             return Err(MediaHostError::InvalidMessage(format!(
                                 "unexpected closed-ring response: {message:?}"
@@ -547,9 +537,7 @@ impl<F: PcmRings> DecoderSession<F> {
                     return Ok(reached_ms);
                 }
                 Message::DecoderEos => {}
-                message @ (Message::DecoderStats { .. } | Message::DecoderError { .. }) => {
-                    self.remember(message)?
-                }
+                message @ Message::DecoderStats { .. } => self.remember(message)?,
                 message => {
                     return Err(MediaHostError::InvalidMessage(format!(
                         "unexpected seek response: {message:?}"
@@ -664,5 +652,147 @@ impl Drop for DecoderProcess {
         self.session.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::Liveness;
+    use rustamp_ipc::Transport;
+    use std::io::{Cursor, Read, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct ByteReader {
+        rx: mpsc::Receiver<Vec<u8>>,
+        bytes: Cursor<Vec<u8>>,
+    }
+    struct ByteWriter(mpsc::Sender<Vec<u8>>);
+
+    impl Read for ByteReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            loop {
+                let count = self.bytes.read(out)?;
+                if count > 0 {
+                    return Ok(count);
+                }
+                match self.rx.recv() {
+                    Ok(bytes) => self.bytes = Cursor::new(bytes),
+                    Err(_) => return Ok(0),
+                }
+            }
+        }
+    }
+
+    impl Write for ByteWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .send(bytes.to_vec())
+                .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pipe() -> (ByteReader, ByteWriter) {
+        let (tx, rx) = mpsc::channel();
+        (
+            ByteReader {
+                rx,
+                bytes: Cursor::new(Vec::new()),
+            },
+            ByteWriter(tx),
+        )
+    }
+
+    #[test]
+    fn decoder_error_fails_control_peer_sticky_as_disconnected() {
+        let (client_r, server_w) = pipe();
+        let (server_r, client_w) = pipe();
+        let liveness = Liveness {
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_millis(500),
+        };
+        let client_peer = ControlPeer::start(client_r, client_w, liveness, false).unwrap();
+        let mut server_transport = rustamp_ipc::StreamTransport::new(server_r, server_w);
+
+        // Server receives client's initial Hello.
+        let msg = server_transport.recv().unwrap();
+        assert!(matches!(msg, Message::Hello { .. }));
+
+        // Server responds with Hello.
+        server_transport.send(&Message::hello()).unwrap();
+
+        // Server sends a terminal DecoderError.
+        server_transport
+            .send(&Message::DecoderError {
+                message: "refused corrupt stream".into(),
+            })
+            .unwrap();
+
+        // The client peer's monitor intercepts DecoderError, calls fail(), and breaks.
+        // It never places DecoderError in incoming_tx; instead peer.recv returns Disconnected.
+        let err = client_peer.recv(Duration::from_millis(500)).unwrap_err();
+        match err {
+            MediaHostError::Disconnected(msg) => {
+                assert!(
+                    msg.contains("resident decoder failed: refused corrupt stream"),
+                    "unexpected disconnect reason: {msg}"
+                );
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+
+        // Subsequent check() also sticky-fails with Disconnected.
+        assert!(client_peer.check().is_err());
+    }
+
+    #[test]
+    fn decoder_session_open_fails_sticky_as_disconnected_when_server_reports_decoder_error() {
+        let (client_r, server_w) = pipe();
+        let (server_r, client_w) = pipe();
+        let liveness = Liveness {
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_millis(500),
+        };
+        let client_peer = ControlPeer::start(client_r, client_w, liveness, false).unwrap();
+        let mut server_transport = rustamp_ipc::StreamTransport::new(server_r, server_w);
+
+        let msg = server_transport.recv().unwrap();
+        assert!(matches!(msg, Message::Hello { .. }));
+        server_transport.send(&Message::hello()).unwrap();
+
+        let server_handle = std::thread::spawn(move || {
+            let open_msg = server_transport.recv().unwrap();
+            assert!(matches!(open_msg, Message::DecoderOpen { .. }));
+            server_transport
+                .send(&Message::DecoderError {
+                    message: "refused corrupt stream".into(),
+                })
+                .unwrap();
+            let _ = server_transport.recv();
+        });
+
+        let rings = crate::pcm::NamedPcmRings;
+        let location = MediaLocationWire::File("bad.bin".into());
+        let res = DecoderSession::open(client_peer, rings, location, 1024);
+        let err = res.err().expect("open must fail");
+        match err {
+            MediaHostError::Disconnected(msg) => {
+                assert!(
+                    msg.contains("resident decoder failed: refused corrupt stream"),
+                    "unexpected disconnect reason: {msg}"
+                );
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        let _ = server_handle.join();
     }
 }
