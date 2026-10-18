@@ -81,6 +81,10 @@ pub struct AppOptions {
 pub struct App {
     engine: Engine,
     ui: MainWindow,
+    /// Drop the next tap batch across a seek/track/stream boundary: frames have
+    /// no generation or source-rate tag. This is conservative, not a proof of
+    /// audible-time or post-seek correspondence (S08 remains open).
+    vis_discontinuity: bool,
     layout: MainWindowLayout,
     /// The equalizer's headless behaviour (S07; the engine stage is M2 future
     /// work, so this is the UI's own prediction state).
@@ -242,6 +246,7 @@ impl App {
         let mut app = App {
             engine,
             ui: MainWindow::from_state(initial),
+            vis_discontinuity: false,
             layout: MainWindowLayout::CLASSIC,
             eq: EqualizerWindow::new(),
             eq_layout: EqualizerLayout::CLASSIC,
@@ -678,8 +683,8 @@ impl App {
         self.pump()
     }
 
-    /// The single pump step: drain commands, poll the engine, drain events and
-    /// refresh the UI's time-dependent parts.
+    /// The single pump step: drain commands, poll the engine, drain events,
+    /// forward the newest actual tap snapshot and refresh the UI.
     pub fn pump(&mut self) -> Result<()> {
         let mut commands = Vec::new();
         while let Some(command) = self.command_rx.try_recv()? {
@@ -696,7 +701,9 @@ impl App {
             self.handle_event(event);
         }
 
-        self.ui.refresh(self.now_ms());
+        let now_ms = self.now_ms();
+        self.pump_visualization(now_ms);
+        self.ui.refresh(now_ms);
         // Supervise the plugin host before mirroring state to it (see
         // `crate::supervise`): non-blocking by contract, so a missing or dead
         // host only costs a cooldown-gated spawn attempt and the mirror below
@@ -712,6 +719,30 @@ impl App {
         Ok(())
     }
 
+    /// UI-thread only: drain once, analyse at most one snapshot. Missing input
+    /// is not silence; refresh still ages the existing deterministic envelopes.
+    /// Source/device rates may differ: the tap is before device conversion, so
+    /// use the decoder's exact rate, never the device rate or rounded UI kHz.
+    fn pump_visualization(&mut self, now_ms: u64) {
+        let frame = self.engine.take_vis_frame();
+        if std::mem::take(&mut self.vis_discontinuity) {
+            // A batch straddling a known boundary is ambiguous. Even a valid
+            // new frame in this batch is sacrificed; no replacement is made.
+            return;
+        }
+        if let Some(frame) = frame {
+            let source_rate_hz = self.engine.source_spec().map_or(0, |s| s.sample_rate);
+            if let Err(error) = self.ui.push_vis_frame(&frame, source_rate_hz, now_ms) {
+                self.note(error.to_string());
+            }
+        }
+    }
+
+    fn invalidate_visualization(&mut self) {
+        self.vis_discontinuity = true;
+        self.ui.reset_visualization();
+    }
+
     /// Applies one external command (see [`App::submit`]).
     pub fn apply(&mut self, command: &Command) {
         self.apply_from(command, false);
@@ -721,6 +752,11 @@ impl App {
     /// to the UI machine unless the UI produced it (the UI machine already
     /// applied its own S02 prediction for its own commands).
     fn apply_from(&mut self, command: &Command, from_ui: bool) {
+        if matches!(command, Command::Seek { .. } | Command::SeekRelative { .. }) {
+            // Includes external/plugin commands as well as the UI's predicted
+            // seek. No public seek-completion/generation tag exists on frames.
+            self.invalidate_visualization();
+        }
         // The engine ignores everything it does not own, so a single forward is
         // enough; a command it cannot apply (Play on an empty queue) becomes an
         // error event instead of taking the app down.
@@ -744,6 +780,12 @@ impl App {
     /// Applies a core [`Event`]: the app's own bookkeeping first, then the UI
     /// machine (the authoritative state).
     pub fn handle_event(&mut self, event: &Event) {
+        if matches!(
+            event,
+            Event::TrackChanged { .. } | Event::StreamInfoChanged(_)
+        ) {
+            self.invalidate_visualization();
+        }
         match event {
             Event::Quit => self.quit = true,
             Event::SkinChanged(path) => self.current_skin = path.clone(),
@@ -1626,6 +1668,10 @@ impl App {
         self.sync_playlist_entries();
     }
 }
+
+#[cfg(test)]
+#[path = "visualization_tests.rs"]
+mod visualization_tests;
 
 #[cfg(test)]
 mod tests {
