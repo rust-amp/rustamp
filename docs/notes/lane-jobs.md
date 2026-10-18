@@ -212,7 +212,43 @@ The three reds, and only these:
   `left: 2, right: 0`): **a real red**, and it is the F04 fix's own new test
   failing against the fix. In a lane.
 
+## The intermittent two-process stall (2026-10-18 13:00) - open, and it needs a number
+
+`dsp_roundtrip::reset_keeps_rings_and_continues` and
+`real_decode::end_of_stream_comes_only_after_the_ring_is_drained` are
+**two-process** tests: the test spawns the resident, and the resident delivers
+PCM over a ring. Both stall intermittently with "the resident stopped delivering
+without a close or an error" at the **30 s** escape, and both finish in a
+fraction of a second when they do run.
+
+The record so far, all on the same code path:
+
+| run | dsp_roundtrip | real_decode |
+|---|---|---|
+| r49 | green | green |
+| r50 | **stall** | **stall** |
+| r51 (quiet host) | green | green |
+| r53 (quiet host, no lane built) | **stall** | green |
+| isolated, one binary, quiet host | **stall** | not yet run |
+
+Two things are now settled and one is not:
+
+- **Not the shipped code.** `rustamp-dechost` and `rustamp-dsphost` depend on
+  `rustamp-core`, `rustamp-decoders`/`rustamp-ipc`, `rustamp-mediahost` and
+  `rustamp-proto`; none of the recent changes touched any of those.
+- **Not simply host build load.** It stalled in r53 with no lane building, and
+  again in an isolated single-binary run.
+- **Open: how often.** A suite that is green four times in five is not the same
+  claim as a suite that is green, and the release may not blur the two. Five
+  consecutive isolated runs are being measured to get a rate.
+
+`-SkipBuild` is **unusable for this**: it reuses a staging a previous run left
+incomplete, which fails either immediately or - worse - reaches the guest with
+no matching binary. The `ran 0` gate catches the second case, and the first
+fails loudly, but neither is a measurement. Filtered runs stage fresh.
+
 ## The `wave26-windows` rescue (2026-10-18 12:45)
+
 
 Cleaning up 181 accumulated lane worktrees freed 47 GB, and one of the two that
 could not be removed turned out to hold **real work that never landed**:
