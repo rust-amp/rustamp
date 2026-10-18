@@ -354,3 +354,48 @@ fn single_entry_queue_all_modes() {
         assert_eq!(h.engine.current_index(), Some(0));
     }
 }
+
+#[test]
+fn shuffle_repeat_prev_across_cycle_boundary() {
+    let mut h = Harness::new(&[SHORT_A, SHORT_B, SHORT_C]);
+    h.engine.set_shuffle(true).unwrap();
+    h.engine.set_repeat(true).unwrap();
+
+    // Start playback on first track of cycle 1
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    let plan1 = h.engine.shuffle_plan().to_vec();
+    assert_eq!(plan1.len(), 3);
+    assert_eq!(plan1[0], 0);
+
+    // Advance through the remaining tracks of cycle 1: pos 1, then pos 2
+    h.engine.next_track().unwrap();
+    assert!(h.wait_pumping(|e| e.current_index() == Some(plan1[1] as u32), WAIT));
+
+    h.engine.next_track().unwrap();
+    assert!(h.wait_pumping(|e| e.current_index() == Some(plan1[2] as u32), WAIT));
+
+    // Next track wraps across the cycle boundary to cycle 2 track 0
+    h.engine.next_track().unwrap();
+    assert!(h.wait_pumping(
+        |e| {
+            let plan2 = e.shuffle_plan();
+            plan2.len() == 3 && e.current_index() == Some(plan2[0] as u32)
+        },
+        WAIT
+    ));
+
+    let plan2 = h.engine.shuffle_plan().to_vec();
+    assert_eq!(h.engine.current_index(), Some(plan2[0] as u32));
+
+    // Now call prev_track() while at track 0 of cycle 2:
+    // S15 §3.2 requires jumping to the last track of cycle 1 (plan1[2])!
+    h.engine.prev_track().unwrap();
+    assert!(h.wait_pumping(|e| e.current_index() == Some(plan1[2] as u32), WAIT));
+    assert_eq!(
+        h.engine.shuffle_plan(),
+        &plan1[..],
+        "shuffle plan must be restored to cycle 1"
+    );
+}

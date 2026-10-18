@@ -157,6 +157,8 @@ pub(crate) enum DecodeMsg {
         on: bool,
         /// The engine's active plan when turning on; empty when turning off.
         plan: Vec<usize>,
+        /// The engine's previous cycle plan when turning on; None when turning off.
+        prev_plan: Option<Vec<usize>>,
     },
     /// Set repeat mode enabled/disabled (spec S15).
     SetRepeat(bool),
@@ -235,6 +237,8 @@ pub(crate) enum DecodeOut {
     ShufflePlanned {
         /// The new active plan.
         plan: Vec<usize>,
+        /// The previous cycle's plan, if any.
+        prev_plan: Option<Vec<usize>>,
     },
     /// A decoder or output error.
     Error {
@@ -316,9 +320,10 @@ impl std::fmt::Debug for DecodeOut {
                 .debug_struct("EndOfStream")
                 .field("timeline_end", timeline_end)
                 .finish(),
-            DecodeOut::ShufflePlanned { plan } => f
+            DecodeOut::ShufflePlanned { plan, prev_plan } => f
                 .debug_struct("ShufflePlanned")
-                .field("plan", plan)
+                .field("len", &plan.len())
+                .field("has_prev", &prev_plan.is_some())
                 .finish(),
             DecodeOut::Error { kind, message } => f
                 .debug_struct("Error")
@@ -363,6 +368,8 @@ pub(crate) struct Config {
     /// plan; the worker traverses it, so live playback follows the
     /// permutation the engine publishes through `Engine::shuffle_plan`.
     pub shuffle_plan: Vec<usize>,
+    /// The previous cycle's shuffle plan, if any (spec S15 §3.2).
+    pub prev_shuffle_plan: Option<Vec<usize>>,
 }
 
 /// Start the decode thread. Returns its handle and the vis consumer.
@@ -382,6 +389,7 @@ pub(crate) fn spawn(
     let repeat = cfg.repeat;
     let rng_state = cfg.shuffle_seed.unwrap_or(0x9E37_79B9_7F4A_7C15);
     let shuffle_plan = std::mem::take(&mut cfg.shuffle_plan);
+    let prev_shuffle_plan = cfg.prev_shuffle_plan.take();
     let mut worker = Worker {
         cfg,
         ring,
@@ -406,6 +414,7 @@ pub(crate) fn spawn(
         repeat,
         shuffle_plan,
         shuffle_pos: 0,
+        prev_shuffle_plan,
         rng_state,
         current_index: start_index,
         pending_seek: None,
@@ -508,6 +517,7 @@ struct Worker {
     repeat: bool,
     shuffle_plan: Vec<usize>,
     shuffle_pos: usize,
+    prev_shuffle_plan: Option<Vec<usize>>,
     rng_state: u64,
     current_index: u32,
     pending_seek: Option<(Duration, u64, u32)>,
@@ -638,8 +648,18 @@ impl Worker {
                             self.shuffle_pos -= 1;
                             Some(self.shuffle_plan[self.shuffle_pos] as u32)
                         } else if self.repeat && self.cfg.queue.len() > 1 {
-                            self.shuffle_pos = self.shuffle_plan.len() - 1;
-                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                            if let Some(prev) = self.prev_shuffle_plan.take() {
+                                self.shuffle_plan = prev;
+                                self.shuffle_pos = self.shuffle_plan.len() - 1;
+                                let _ = self.tx.send(DecodeOut::ShufflePlanned {
+                                    plan: self.shuffle_plan.clone(),
+                                    prev_plan: None,
+                                });
+                                Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                            } else {
+                                self.shuffle_pos = self.shuffle_plan.len() - 1;
+                                Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                            }
                         } else {
                             Some(self.shuffle_plan[0] as u32)
                         }
@@ -738,10 +758,12 @@ impl Worker {
         plan.extend(remaining);
         self.shuffle_plan = plan;
         self.shuffle_pos = 0;
+        self.prev_shuffle_plan = None;
         // The engine owns the published plan; report one this worker had to
         // generate itself so the engine adopts it (S15).
         let _ = self.tx.send(DecodeOut::ShufflePlanned {
             plan: self.shuffle_plan.clone(),
+            prev_plan: None,
         });
     }
 
@@ -756,12 +778,13 @@ impl Worker {
             let swap_idx = 1 + self.rng_below(len - 1);
             plan.swap(0, swap_idx);
         }
-        self.shuffle_plan = plan;
+        self.prev_shuffle_plan = Some(std::mem::replace(&mut self.shuffle_plan, plan));
         self.shuffle_pos = 0;
         // Report the new cycle: the engine adopts it so its published plan
         // stays the one being traversed (S15).
         let _ = self.tx.send(DecodeOut::ShufflePlanned {
             plan: self.shuffle_plan.clone(),
+            prev_plan: self.prev_shuffle_plan.clone(),
         });
     }
 
@@ -1094,7 +1117,11 @@ impl Worker {
                     return true;
                 }
                 Ok(DecodeMsg::SetStopAfterCurrent(armed)) => self.stop_after_current = armed,
-                Ok(DecodeMsg::SetShuffle { on, plan }) => {
+                Ok(DecodeMsg::SetShuffle {
+                    on,
+                    plan,
+                    prev_plan,
+                }) => {
                     if self.shuffle != on {
                         self.shuffle = on;
                         if on && !self.cfg.queue.is_empty() {
@@ -1103,6 +1130,7 @@ impl Worker {
                                 // one it published, anchored at the track
                                 // that is playing.
                                 self.shuffle_plan = plan;
+                                self.prev_shuffle_plan = prev_plan;
                                 self.shuffle_pos = self
                                     .shuffle_plan
                                     .iter()
@@ -1114,6 +1142,10 @@ impl Worker {
                                 // its next poll.
                                 self.init_shuffle_plan(self.current_index as usize);
                             }
+                        } else {
+                            self.shuffle_plan.clear();
+                            self.prev_shuffle_plan = None;
+                            self.shuffle_pos = 0;
                         }
                     }
                 }

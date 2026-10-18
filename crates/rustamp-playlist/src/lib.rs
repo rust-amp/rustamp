@@ -35,8 +35,9 @@
 //!
 //! ## Deliberately out of scope
 //!
-//! * **Shuffle as a mode** (spec S15): [`PlaybackOrder`] manages traversal
-//!   order, repeat boundaries and shuffle permutations.
+//! * **Shuffle as a mode** (spec S15): Traversal order and playback state
+//!   are managed by the audio engine (`rustamp-audio`); this crate provides
+//!   one-shot reordering helpers ([`randomize`], [`shuffle`]).
 //! * **Title formatting** `%1`–`%7` (spec S14): titles are taken from the file
 //!   verbatim.
 //! * **The playlist editor window** (spec S06): the [`interact`] selection,
@@ -100,5 +101,5 @@ pub use io::{
     read_playlist_report_with_hint, read_playlist_with_hint, write_playlist,
 };
 pub use location::{Base, resolve_location};
-pub use order::{PlaybackOrder, randomize, randomize_with, shuffle, shuffled_ids};
+pub use order::{randomize, randomize_with, shuffle, shuffled_ids};
 pub use rng::Rng;

@@ -277,6 +277,7 @@ pub struct Engine {
     repeat: bool,
     shuffle_seed: u64,
     shuffle_plan: Vec<usize>,
+    prev_shuffle_plan: Option<Vec<usize>>,
 }
 
 impl Engine {
@@ -354,6 +355,7 @@ impl Engine {
             repeat: false,
             shuffle_seed: 0x9E37_79B9_7F4A_7C15,
             shuffle_plan: Vec::new(),
+            prev_shuffle_plan: None,
         })
     }
 
@@ -376,6 +378,7 @@ impl Engine {
     /// Replace the play queue. Entries must be re-openable (paths or URLs).
     pub fn set_queue(&mut self, queue: Vec<TrackSource>) {
         self.queue = queue;
+        self.prev_shuffle_plan = None;
         if self.shuffle {
             self.replan_shuffle_engine(self.current.map(|i| i as usize));
         }
@@ -575,17 +578,20 @@ impl Engine {
             self.shuffle = shuffle;
             if self.shuffle && !self.queue.is_empty() {
                 self.replan_shuffle_engine(self.current.map(|i| i as usize));
+            } else {
+                self.prev_shuffle_plan = None;
             }
             // The engine owns the plan (S15): hand it to the decode thread
             // so live traversal follows the published permutation.
-            let plan = if self.shuffle {
-                self.shuffle_plan.clone()
+            let (plan, prev_plan) = if self.shuffle {
+                (self.shuffle_plan.clone(), self.prev_shuffle_plan.clone())
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
             self.send(DecodeMsg::SetShuffle {
                 on: self.shuffle,
                 plan,
+                prev_plan,
             });
             self.bus.publish(Event::ModesChanged {
                 shuffle: self.shuffle,
@@ -671,6 +677,7 @@ impl Engine {
             p
         };
         self.shuffle_plan = plan;
+        self.prev_shuffle_plan = None;
     }
 
     /// Generate the next shuffle cycle at a repeat boundary (S15 §2.1): a
@@ -680,6 +687,7 @@ impl Engine {
         let len = self.queue.len();
         if len == 0 {
             self.shuffle_plan.clear();
+            self.prev_shuffle_plan = None;
             return;
         }
         let mut p: Vec<usize> = (0..len).collect();
@@ -691,7 +699,7 @@ impl Engine {
             let swap_idx = 1 + (self.rng_step() % (len as u64 - 1)) as usize;
             p.swap(0, swap_idx);
         }
-        self.shuffle_plan = p;
+        self.prev_shuffle_plan = Some(std::mem::replace(&mut self.shuffle_plan, p));
     }
 
     /// Make the shuffle plan coherent with the queue and the current track
@@ -1071,7 +1079,13 @@ impl Engine {
                 if pos > 0 {
                     Some(self.shuffle_plan[pos - 1] as u32)
                 } else if self.repeat && self.queue.len() > 1 {
-                    Some(self.shuffle_plan[self.shuffle_plan.len() - 1] as u32)
+                    if let Some(prev) = self.prev_shuffle_plan.take() {
+                        self.shuffle_plan = prev;
+                        let last_idx = self.shuffle_plan.len() - 1;
+                        Some(self.shuffle_plan[last_idx] as u32)
+                    } else {
+                        Some(self.shuffle_plan[self.shuffle_plan.len() - 1] as u32)
+                    }
                 } else {
                     self.current.or(Some(0))
                 }
@@ -1355,13 +1369,14 @@ impl Engine {
             DecodeOut::EndOfStream { timeline_end } => {
                 self.end_of_stream = Some(timeline_end);
             }
-            DecodeOut::ShufflePlanned { plan } => {
+            DecodeOut::ShufflePlanned { plan, prev_plan } => {
                 // The worker reports only plans it generated itself (a cycle
                 // boundary, or a fallback when the engine handed none);
                 // adopt it so `shuffle_plan()` stays the plan being
                 // traversed (S15).
                 if plan.len() == self.queue.len() {
                     self.shuffle_plan = plan;
+                    self.prev_shuffle_plan = prev_plan;
                 }
             }
             DecodeOut::Error { kind, message } => {
@@ -1604,6 +1619,7 @@ impl Engine {
             repeat: self.repeat,
             shuffle_seed: Some(self.shuffle_seed),
             shuffle_plan: self.shuffle_plan.clone(),
+            prev_shuffle_plan: self.prev_shuffle_plan.clone(),
         };
         self.shuffle_seed = self.shuffle_seed.wrapping_add(1);
         // The equalizer runs first, on the decoded PCM (see the module docs).
@@ -1688,8 +1704,11 @@ impl Engine {
                     // A plan the worker generated itself is the plan it ended
                     // on: adopt it so the engine's published plan stays
                     // coherent for stopped navigation and the next run (S15).
-                    DecodeOut::ShufflePlanned { plan } if plan.len() == self.queue.len() => {
+                    DecodeOut::ShufflePlanned { plan, prev_plan }
+                        if plan.len() == self.queue.len() =>
+                    {
                         self.shuffle_plan = plan;
+                        self.prev_shuffle_plan = prev_plan;
                     }
                     _ => {}
                 }
