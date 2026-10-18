@@ -450,6 +450,14 @@ impl App {
     /// Recreates the engine and output if the previous output closed due to
     /// a terminal flush refusal or failure, fulfilling the caller's duty
     /// under the audio contract.
+    ///
+    /// This is the caller's half of the output recovery split, and the whole of
+    /// it. A fatal mid-run *stream* error is explicitly not handled here: RFC
+    /// 0012 §4.3 item 8 gives that case to `Engine::play()`, which closes and
+    /// reopens the device object the engine already owns and keeps the position
+    /// it froze until an explicit retry. Stream-error teardown never arms
+    /// [`Engine::is_flush_failed`]. An actual flush refusal (including a later
+    /// stop/seek) still takes precedence. See `docs/tasks/W23-rfc0012-gaps.md` §4.
     pub fn ensure_engine_ready(&mut self) -> Result<()> {
         if self.engine.is_flush_failed() {
             self.note(
@@ -4290,5 +4298,80 @@ mod tests {
         assert!(!app.engine().is_flush_failed());
         assert_eq!(app.engine().transport(), TransportState::Stopped);
         assert!(app.engine().last_error().is_none());
+    }
+
+    /// The division of labour the RFC left open (W23 gap 3), end to end.
+    ///
+    /// A fatal mid-run stream error is recovered by the engine reopening the
+    /// device it already owns. The application must not step in with
+    /// `recreate_engine()`, because its fresh engine starts at position zero
+    /// and would destroy the frozen position of RFC 0012 §4.3 item 4.
+    ///
+    /// The discriminator is the lifecycle counter of the output object the app
+    /// held before the failure: a caller-side recreation builds a *new*
+    /// `NullOutput::pair()`, whose `opens()` reads 1 after `Engine::new`, while
+    /// the engine's own reopen takes the old object's `opens()` to 2.
+    #[test]
+    fn a_stream_error_is_recovered_by_the_engine_not_by_app_recreation() {
+        let (mut app, dir) = app_with_file(None);
+        let track = track(&dir, "track1_44100.tst");
+        app.engine_mut().set_queue(vec![TrackSource::path(track)]);
+
+        app.submit(Command::Play).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while app.engine().buffered_frames() < 256 {
+            app.pump().unwrap();
+            assert!(std::time::Instant::now() < deadline, "audio never buffered");
+            std::thread::yield_now();
+        }
+        app.advance_null_clock(256);
+        app.pump().unwrap();
+        assert!(app.engine().position_frames() > 0);
+        let clock = app.clock.clone().expect("the null output has a clock");
+        assert_eq!(clock.opens(), 1);
+
+        clock.fail();
+        app.pump().unwrap();
+
+        assert_eq!(app.engine().transport(), TransportState::Stopped);
+        assert!(app.engine().is_stream_lost(), "the engine armed its reopen");
+        assert!(
+            !app.engine().is_flush_failed(),
+            "nothing asked the caller to recreate anything"
+        );
+        assert!(
+            clock.is_failed(),
+            "the app still holds the very output that failed"
+        );
+        assert_eq!(
+            app.clock.as_ref().unwrap().opens(),
+            1,
+            "the app did not recreate the engine or the output"
+        );
+        let frozen_ms = app.engine().position_ms();
+        assert!(
+            frozen_ms > 0,
+            "the frozen position survived: {frozen_ms} ms"
+        );
+        for _ in 0..3 {
+            app.ensure_engine_ready().unwrap();
+            app.pump().unwrap();
+            assert_eq!(app.engine().position_ms(), frozen_ms);
+            assert!(
+                app.last_error().is_some(),
+                "the device failure stays visible"
+            );
+        }
+
+        // Play again: the engine reopens its own device.
+        app.submit(Command::Play).unwrap();
+        assert_eq!(
+            app.clock.as_ref().unwrap().opens(),
+            2,
+            "the same output object was reopened, not replaced"
+        );
+        assert!(!app.engine().is_stream_lost());
+        assert!(!clock.is_failed(), "the reopen cleared the device latch");
+        assert_eq!(app.engine().transport(), TransportState::Playing);
     }
 }

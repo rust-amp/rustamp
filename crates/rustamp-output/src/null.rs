@@ -72,6 +72,14 @@ struct Shared {
     running: AtomicBool,
     flushes: AtomicU64,
     failed: AtomicBool,
+    /// Successful `open`/`close`/`start` calls since the pair was created.
+    ///
+    /// Unlike `flushes`, these are *not* reset by `open`: they count the
+    /// device's whole lifecycle history, which is what a test needs to prove
+    /// that a second lifecycle really happened (RFC 0012 §4.3 item 8).
+    opens: AtomicU64,
+    closes: AtomicU64,
+    starts: AtomicU64,
 }
 
 /// The [`OutputDevice`] half of a null output. Pass it to the engine.
@@ -101,6 +109,9 @@ impl NullOutput {
             running: AtomicBool::new(false),
             flushes: AtomicU64::new(0),
             failed: AtomicBool::new(false),
+            opens: AtomicU64::new(0),
+            closes: AtomicU64::new(0),
+            starts: AtomicU64::new(0),
         });
         (
             NullOutput {
@@ -146,6 +157,7 @@ impl OutputDevice for NullOutput {
         self.shared.running.store(false, Ordering::Release);
         self.shared.flushes.store(0, Ordering::Release);
         self.shared.failed.store(false, Ordering::Release);
+        self.shared.opens.fetch_add(1, Ordering::AcqRel);
         drop(inner);
         Ok(OutputFormat {
             spec,
@@ -169,6 +181,7 @@ impl OutputDevice for NullOutput {
         drop(inner);
         self.shared.paused.store(false, Ordering::Release);
         self.shared.running.store(true, Ordering::Release);
+        self.shared.starts.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -226,6 +239,7 @@ impl OutputDevice for NullOutput {
         drop(inner);
         self.shared.running.store(false, Ordering::Release);
         self.shared.paused.store(false, Ordering::Release);
+        self.shared.closes.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -262,6 +276,23 @@ impl NullClock {
     /// Total number of times [`OutputDevice::flush`] was called on the output device.
     pub fn flushes(&self) -> u64 {
         self.shared.flushes.load(Ordering::Acquire)
+    }
+
+    /// Successful [`OutputDevice::open`] calls since the pair was created.
+    /// Not reset by `open` itself, so a second lifecycle is observable.
+    pub fn opens(&self) -> u64 {
+        self.shared.opens.load(Ordering::Acquire)
+    }
+
+    /// [`OutputDevice::close`] calls since the pair was created.
+    pub fn closes(&self) -> u64 {
+        self.shared.closes.load(Ordering::Acquire)
+    }
+
+    /// Successful [`OutputDevice::start`] calls since the pair was created.
+    /// A second start proves a second render callback was installed.
+    pub fn starts(&self) -> u64 {
+        self.shared.starts.load(Ordering::Acquire)
     }
 
     /// Simulate a fatal hardware/stream failure mid-run.
@@ -542,5 +573,42 @@ mod tests {
         out.open(spec).unwrap();
         assert!(out.stream_error().is_none());
         assert!(!clock.is_failed());
+    }
+
+    /// The lifecycle counters a reopen test reads must survive the reopen they
+    /// are counting: `open` resets `flushes`, and must not reset these.
+    #[test]
+    fn lifecycle_counters_count_every_open_close_and_start() {
+        let (mut out, clock) = NullOutput::pair();
+        assert_eq!((clock.opens(), clock.closes(), clock.starts()), (0, 0, 0));
+
+        let spec = AudioSpec::new(44_100, 2);
+        out.open(spec).unwrap();
+        assert_eq!((clock.opens(), clock.closes(), clock.starts()), (1, 0, 0));
+        // A refused second open is not a lifecycle.
+        assert!(out.open(spec).is_err());
+        assert_eq!(clock.opens(), 1);
+
+        out.start(Box::new(|buf: &mut [f32]| buf.fill(0.25)))
+            .unwrap();
+        assert_eq!((clock.opens(), clock.closes(), clock.starts()), (1, 0, 1));
+        // A refused second start is not a lifecycle either.
+        assert!(out.start(Box::new(|_: &mut [f32]| {})).is_err());
+        assert_eq!(clock.starts(), 1);
+        out.flush().unwrap();
+        assert_eq!(clock.flushes(), 1);
+
+        out.close().unwrap();
+        assert_eq!((clock.opens(), clock.closes(), clock.starts()), (1, 1, 1));
+
+        out.open(spec).unwrap();
+        out.start(Box::new(|buf: &mut [f32]| buf.fill(0.5)))
+            .unwrap();
+        assert_eq!(
+            (clock.opens(), clock.closes(), clock.starts()),
+            (2, 1, 2),
+            "the second lifecycle is observable; open resets only `flushes`"
+        );
+        assert_eq!(clock.flushes(), 0, "open re-bases the flush counter");
     }
 }

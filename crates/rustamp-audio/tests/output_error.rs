@@ -8,10 +8,12 @@
 //! - A healthy device is unaffected
 //! - Position freezes at the point of failure
 //! - Resume while paused detects device loss and stops cleanly
+//! - An explicit Play after a failed run reopens the output (RFC 0012 §4.3
+//!   item 8) and really carries audio again
 
 mod common;
 
-use common::Harness;
+use common::{Harness, WAIT};
 use rustamp_core::error::ErrorKind;
 use rustamp_core::event::Event;
 use rustamp_core::state::TransportState;
@@ -218,5 +220,95 @@ fn device_failure_before_play_errors_immediately() {
             .iter()
             .any(|e| matches!(e, Event::Error(info) if info.kind == ErrorKind::Output)),
         "Error(Output) expected: {events:?}"
+    );
+}
+
+/// RFC 0012 §4.3 item 8: the run that a fatal device failure ended is not the
+/// end of the player. The next explicit Play gives the device a fresh
+/// `close`/`open`/`start` lifecycle and audio flows again.
+///
+/// This pins the whole promise, not just the latch: the lifecycle counters show
+/// a second `open` and a second `start` on the *same* device object, and the
+/// recorded callback output shows real samples rather than the silence a ring
+/// or callback that was not rebuilt would produce.
+#[test]
+fn explicit_play_after_a_failed_run_reopens_the_output_and_plays_again() {
+    let mut h = Harness::new(&[LONG_TRACK]);
+    h.engine.play().expect("playback start");
+    assert!(h.wait_track(0), "track opens");
+    assert!(
+        h.wait_pumping(|e| e.position_frames() > 0, WAIT),
+        "the first run must play before it can fail"
+    );
+    assert_eq!(
+        (h.clock.opens(), h.clock.closes(), h.clock.starts()),
+        (1, 0, 1),
+        "one lifecycle so far: the open in Engine::new and the start of this run"
+    );
+    let flushes_before = h.clock.flushes();
+
+    h.clock.fail();
+    h.engine.poll().expect("poll after failure");
+
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+    assert!(
+        h.engine.is_stream_lost(),
+        "the fresh open RFC 0012 promises must be armed"
+    );
+    // The teardown of a dead device must not flush it: a backend that refuses
+    // the flush would otherwise arm the terminal caller-side latch and hand
+    // this failure to application-side recreation, which starts from zero.
+    assert_eq!(
+        h.clock.flushes(),
+        flushes_before,
+        "a dead device is not flushed"
+    );
+    assert!(
+        !h.engine.is_flush_failed(),
+        "a stream error is not a flush refusal"
+    );
+    assert_eq!(
+        (h.clock.opens(), h.clock.closes(), h.clock.starts()),
+        (1, 0, 1),
+        "RFC 0012 §4.3 pauses the device, it does not close or reopen it yet"
+    );
+    let frozen_ms = h.engine.position_ms();
+    assert!(frozen_ms > 0, "the frozen position is real: {frozen_ms} ms");
+    let _ = h.drain_events();
+
+    // The explicit Play of RFC 0012 §4.3 item 8.
+    h.engine
+        .play()
+        .expect("an explicit Play after a failed run reopens the output");
+
+    assert_eq!(
+        (h.clock.opens(), h.clock.closes(), h.clock.starts()),
+        (2, 1, 2),
+        "the same device object was closed, reopened and started again"
+    );
+    assert!(!h.engine.is_stream_lost(), "the reopen cleared the latch");
+    assert!(!h.engine.is_flush_failed());
+    assert!(!h.clock.is_failed(), "a successful open clears the latch");
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+
+    // The reopened run is a real run: the new decode thread writes into the
+    // new ring, and the rebuilt render callback reads it back out.
+    assert!(
+        h.wait_idle(|e| e.buffered_frames() >= 512, WAIT),
+        "the reopened run must buffer audio"
+    );
+    let mut heard = Vec::new();
+    assert_eq!(
+        h.clock.pump_record(512, &mut heard),
+        512,
+        "the reopened device pumps again"
+    );
+    assert!(
+        heard.iter().any(|sample| *sample != 0.0),
+        "the rebuilt ring and callback carry real audio, not silence"
+    );
+    assert!(
+        h.engine.position_frames() > 0,
+        "the reopened run advances its own timeline from zero"
     );
 }

@@ -273,11 +273,40 @@ pub struct Engine {
     /// engine/output lifecycle may start again; stream_error alone is not a
     /// barrier, since close may clear a backend's failure latch.
     flush_failure: Option<String>,
+    /// A fatal mid-run stream error ended the run (RFC 0012 §4.3). The device
+    /// object itself is still owned here, so the next explicit start gives it a
+    /// fresh `close`/`open`/`start` lifecycle (RFC 0012 §4.3 item 8) instead of
+    /// refusing forever. This is the engine's own half of the recovery split;
+    /// `flush_failure` is the caller's half (see [`Engine::is_flush_failed`]).
+    stream_lost: bool,
     shuffle: bool,
     repeat: bool,
     shuffle_seed: u64,
     shuffle_plan: Vec<usize>,
     prev_shuffle_plan: Option<Vec<usize>>,
+}
+
+/// Ring capacity in samples for `cfg` on a device that granted `device`.
+///
+/// Shared by [`Engine::new`] and the RFC 0012 reopen, so a device that grants a
+/// different channel count on its second open still gets a correctly sized ring.
+fn ring_samples_for(cfg: &EngineConfig, device: AudioSpec) -> usize {
+    cfg.ring_frames
+        .max(256)
+        .saturating_mul(usize::from(device.channels.max(1)))
+}
+
+/// Why playback is being torn down by [`Engine::handle_output_error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFailure {
+    /// The device latched a fatal mid-run stream error (RFC 0012): this output
+    /// is dead and gets a fresh `open()` on the next explicit start, so its
+    /// endpoint buffer is not worth flushing now.
+    StreamLost,
+    /// Something else on the output path failed while the device itself is
+    /// still alive — a refused flush on a stopped seek, a decode report that
+    /// could not be applied. The flush contract applies unchanged here.
+    OnLiveDevice,
 }
 
 impl Engine {
@@ -291,11 +320,7 @@ impl Engine {
     ) -> Result<Engine> {
         let format: OutputFormat = output.open(cfg.spec)?;
         let device = format.spec;
-        let ring_samples = cfg
-            .ring_frames
-            .max(256)
-            .saturating_mul(usize::from(device.channels.max(1)));
-        let (producer, consumer) = RingBuffer::<f32>::new(ring_samples);
+        let (producer, consumer) = RingBuffer::<f32>::new(ring_samples_for(&cfg, device));
         let sync = Arc::new(RingSync::new());
         let initial_volume = cfg.volume;
         let initial_balance = cfg.balance;
@@ -351,6 +376,7 @@ impl Engine {
             last_track_frames: 0,
             error: None,
             flush_failure: None,
+            stream_lost: false,
             shuffle: false,
             repeat: false,
             shuffle_seed: 0x9E37_79B9_7F4A_7C15,
@@ -436,8 +462,27 @@ impl Engine {
 
     /// Whether the output was closed after a terminal flush refusal or failure,
     /// requiring the caller to recreate the engine and output before playing again.
+    ///
+    /// This is the caller's half of the output recovery split. The engine's own
+    /// half - a fatal mid-run stream error, which the engine recovers from by
+    /// reopening the device it already holds - is [`Engine::is_stream_lost`].
+    /// Stream-error teardown does not flush, so it cannot arm this latch.
+    /// A later explicit stop/seek still obeys the strict flush contract.
     pub fn is_flush_failed(&self) -> bool {
         self.flush_failure.is_some()
+    }
+
+    /// Whether a fatal mid-run stream error ended the run and the output is
+    /// waiting for the fresh `open()` that RFC 0012 §4.3 item 8 promises on the
+    /// next explicit start.
+    ///
+    /// Unlike [`Engine::is_flush_failed`] this is **not** terminal and needs no
+    /// caller-side recreation: the engine still owns the device object, so
+    /// `play()`/`play_index()` close and reopen it. A reopen that fails leaves
+    /// this set and reports an [`Error::Output`] naming the device, so the next
+    /// explicit start tries again.
+    pub fn is_stream_lost(&self) -> bool {
+        self.stream_lost
     }
 
     /// Packets the decoder skipped in the track that ended last (RFC 0002, C1).
@@ -951,7 +996,7 @@ impl Engine {
             TransportState::Playing => Ok(()),
             TransportState::Paused => {
                 if let Some(err) = self.output.stream_error() {
-                    self.handle_output_error(err);
+                    self.handle_output_error(err, OutputFailure::StreamLost);
                     return Ok(());
                 }
                 self.send(DecodeMsg::Resume);
@@ -1186,7 +1231,10 @@ impl Engine {
                 // A decoder can already have exited while its buffered run is
                 // paused. A refused flush must stop that case too, not leave a
                 // Paused engine able to resume a now-closed stream.
-                self.handle_output_error(Error::Output(err.to_string()));
+                self.handle_output_error(
+                    Error::Output(err.to_string()),
+                    OutputFailure::OnLiveDevice,
+                );
                 return Err(err);
             }
             // Not running: remember the target and apply it when playback
@@ -1250,7 +1298,7 @@ impl Engine {
         if self.transport == TransportState::Playing
             && let Some(err) = self.output.stream_error()
         {
-            self.handle_output_error(err);
+            self.handle_output_error(err, OutputFailure::StreamLost);
             return Ok(());
         }
         if let Some(rx) = self.from_decode.take() {
@@ -1272,7 +1320,7 @@ impl Engine {
                 // Restore the receiver before teardown so join_decode recovers
                 // Returned and does not leave queued seek reports to rebase a
                 // stopped run on the next poll.
-                self.handle_output_error(err);
+                self.handle_output_error(err, OutputFailure::OnLiveDevice);
                 return Ok(());
             }
         }
@@ -1471,7 +1519,7 @@ impl Engine {
 
     /// Tear down playback after a fatal mid-run output device failure (RFC 0012).
     ///
-    /// Stops decoding immediately, pauses and flushes the device, transitions
+    /// Stops decoding immediately, pauses the device, transitions
     /// transport to [`TransportState::Stopped`], freezes the timeline position,
     /// and publishes [`Event::StateChanged`], [`Event::PositionChanged`] and
     /// [`Event::Error`].
@@ -1481,12 +1529,23 @@ impl Engine {
     /// `TrackStarted` instead of discarding it, and delivering it here keeps
     /// the window on the track that actually started — its duration, not the
     /// previous track's.
-    fn handle_output_error(&mut self, err: Error) {
+    ///
+    /// `cause` decides what happens to the output. [`OutputFailure::StreamLost`]
+    /// arms the RFC 0012 §4.3 item 8 reopen and omits flushing, as §4.3
+    /// specifies. Otherwise an unnecessary flush refusal would trigger caller
+    /// recreation and lose the frozen position. [`OutputFailure::OnLiveDevice`]
+    /// still flushes; a refusal remains terminal, exactly as before.
+    fn handle_output_error(&mut self, err: Error, cause: OutputFailure) {
         let frozen_timeline = self.timeline_frames();
+        if cause == OutputFailure::StreamLost {
+            self.stream_lost = true;
+        }
         self.send(DecodeMsg::Stop);
         self.sync.set_active(false);
         let _ = self.output.pause();
-        let _ = self.flush_output();
+        if cause == OutputFailure::OnLiveDevice {
+            let _ = self.flush_output();
+        }
         // Deliver the held start before the freeze and the error
         // publication. The `TrackStarted` arm touches no timeline origin and
         // no output, so the freeze stays exact, the error is still published
@@ -1544,6 +1603,61 @@ impl Engine {
         Ok(())
     }
 
+    /// Give the output the fresh lifecycle RFC 0012 §4.3 item 8 promises after a
+    /// fatal mid-run stream error: `close()`, `open()`, and a rebuilt ring and
+    /// render callback for the following `start()`.
+    ///
+    /// The engine can do this without a device factory because it still owns
+    /// the very same [`OutputDevice`] object — that is what separates this from
+    /// a terminal flush refusal, where the output has to be rebuilt from a
+    /// device descriptor the engine does not have and the caller does
+    /// (`crates/rustamp-core/src/audio.rs` `OutputDevice::flush`, W22).
+    ///
+    /// `close()` destroys the render callback the dead stream owned and takes
+    /// the ring's consumer half with it, so both halves are made anew here.
+    /// Both real backends release their stream before returning the old latched
+    /// error from `close()`. Attempt `open()` even then; its result decides
+    /// whether a new lifecycle exists. Keep the retry armed until `start()`
+    /// succeeds, since cpal creates its actual stream there.
+    ///
+    /// A device that grants a different format on the second open is adopted:
+    /// `self.device` becomes the granted spec, the ring is sized for it, and
+    /// the next run's decode thread converts to it like any other run. Rescale
+    /// frame-based state so a failed start retains the frozen time and an
+    /// explicit stopped seek keeps its target under the new sample rate.
+    fn reopen_output(&mut self) -> Result<()> {
+        let frozen_timeline = self.timeline_frames();
+        let _ = self.output.close();
+        self.started = false;
+        let opened = self.output.open(self.cfg.spec);
+        // Even a failed open can reset the backend's clock (WASAPI does).
+        // Preserve the snapshot until a new run actually starts.
+        self.timeline_origin = frozen_timeline;
+        self.clock_origin = self.output.played_frames();
+        let format = opened?;
+        let old_rate = u64::from(self.device.sample_rate);
+        let new_rate = u64::from(format.spec.sample_rate);
+        let rescale = |frames: u64| frames.saturating_mul(new_rate) / old_rate;
+        self.timeline_origin = rescale(self.timeline_origin);
+        self.track_start = rescale(self.track_start);
+        self.duration_frames = self.duration_frames.map(rescale);
+        self.start_at = self.start_at.map(|(frames, seq)| (rescale(frames), seq));
+        self.device = format.spec;
+        let (producer, consumer) = RingBuffer::<f32>::new(ring_samples_for(&self.cfg, self.device));
+        // A fresh handshake state alongside the fresh ring: the dead run's
+        // epoch and counters describe a ring that no longer exists.
+        self.sync = Arc::new(RingSync::new());
+        self.render = Some(make_render(
+            consumer,
+            Arc::clone(&self.sync),
+            Arc::clone(&self.gain),
+            self.device.channels,
+        ));
+        self.producer = Some(producer);
+        self.start_drain = None;
+        Ok(())
+    }
+
     fn report_output_error(&mut self, err: &Error) {
         let info = ErrorInfo {
             kind: ErrorKind::Output,
@@ -1557,6 +1671,23 @@ impl Engine {
         if let Some(message) = &self.flush_failure {
             return Err(Error::Output(message.clone()));
         }
+        let _ = self.join_decode();
+        if self.stream_lost {
+            // RFC 0012 §4.3 item 8: an explicit start after a fatal mid-run
+            // stream error opens the device again rather than refusing
+            // forever. A successful `open()` clears the backend's failure
+            // latch in every backend we have, so the health check below reads
+            // the *new* lifecycle; a failing one keeps the retry armed and
+            // reports an error naming the device, which is exactly what the
+            // RFC promises Play to return while the device is still missing.
+            // The pre-start check itself stays (RFC §8 Q3): it still rejects a
+            // device that was already broken before any run existed, which no
+            // teardown ever armed a reopen for.
+            if let Err(err) = self.reopen_output() {
+                self.report_output_error(&err);
+                return Err(err);
+            }
+        }
         if let Some(err) = self.output.stream_error() {
             let info = ErrorInfo {
                 kind: ErrorKind::Output,
@@ -1566,9 +1697,11 @@ impl Engine {
             self.bus.publish(Event::Error(info));
             return Err(err);
         }
-        let _ = self.join_decode();
         // S15: the engine owns the shuffle plan; make it coherent with the
         // queue and the current track before the run starts.
+        let retry_snapshot =
+            self.stream_lost
+                .then_some((self.timeline_origin, self.track_start, self.start_at));
         self.ensure_shuffle_plan();
         // With shuffle on and no track selected, playback starts at the
         // first entry of the permutation (S15 §1.1: the permutation is
@@ -1670,12 +1803,31 @@ impl Engine {
                 .render
                 .take()
                 .ok_or_else(|| Error::Output("render callback missing".into()))?;
-            self.output.start(render)?;
+            if let Err(err) = self.output.start(render) {
+                if let Some((timeline, track_start, start_at)) = retry_snapshot {
+                    self.send(DecodeMsg::Stop);
+                    self.sync.set_active(false);
+                    let _ = self.output.pause();
+                    let _ = self.join_decode();
+                    self.timeline_origin = timeline;
+                    self.track_start = track_start;
+                    self.start_at = start_at;
+                    self.clock_origin = self.output.played_frames();
+                    self.pending_seek = None;
+                    self.start_drain = None;
+                    self.report_output_error(&err);
+                }
+                return Err(err);
+            }
             self.started = true;
         } else {
             self.output.resume()?;
         }
         self.sync.set_active(true);
+        if self.stream_lost {
+            self.stream_lost = false;
+            self.error = None;
+        }
         self.transport = TransportState::Playing;
         self.publish_state();
         Ok(())
