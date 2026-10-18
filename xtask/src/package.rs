@@ -30,7 +30,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{cargo, no_window_command, run_status};
+use crate::{cargo, no_window_command, pe_imports, run_status};
 
 const PLAYER_CRATE: &str = "rustamp-app";
 const PLAYER_BIN: &str = "rustamp";
@@ -57,7 +57,16 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
 // to silently negate the runtime policy. Explicit --target keeps these flags
 // off host-side proc macros/build scripts.
 const PACKAGE_RUSTFLAGS: &str = "-C\x1ftarget-feature=+crt-static";
-const RUNTIME_MANIFEST: &str = r#"{"crt":"msvc","crt_linkage":"static","rustflags":["-C","target-feature=+crt-static"],"vc_redist_required":false,"bundled_runtime_dlls":[],"system_dlls_required":true,"artifact_imports_verified":false}"#;
+
+/// The `runtime` object of every manifest. `artifact_imports_verified` is true
+/// only when the PE import tables of every shipped executable were parsed and
+/// named nothing but Windows system DLLs (see `pe_imports`).
+fn runtime_manifest(meta: &ReleaseMetadata) -> String {
+    format!(
+        r#"{{"crt":"msvc","crt_linkage":"static","rustflags":["-C","target-feature=+crt-static"],"vc_redist_required":false,"bundled_runtime_dlls":[],"system_dlls_required":true,"artifact_imports_verified":{}}}"#,
+        meta.imports_verified
+    )
+}
 
 // GPL closure check for the host runs against this crate list. Kept in sync
 // with `.github/scripts/check-permissive-licenses.sh`.
@@ -74,6 +83,8 @@ pub struct ReleaseMetadata {
     pub protocol_version: u32,
     pub config_version: u32,
     pub schema_version: u32,
+    /// Set once the PE import inspection passed for every shipped executable.
+    pub imports_verified: bool,
 }
 
 impl ReleaseMetadata {
@@ -99,6 +110,7 @@ impl ReleaseMetadata {
             protocol_version: PROTOCOL_VERSION,
             config_version: CONFIG_VERSION,
             schema_version: MANIFEST_SCHEMA_VERSION,
+            imports_verified: false,
         }
     }
 
@@ -113,6 +125,7 @@ impl ReleaseMetadata {
             protocol_version: PROTOCOL_VERSION,
             config_version: CONFIG_VERSION,
             schema_version: MANIFEST_SCHEMA_VERSION,
+            imports_verified: false,
         }
     }
 }
@@ -200,7 +213,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let build_host = !parsed.player_only;
 
     // Discover release metadata from the workspace root and git.
-    let meta = ReleaseMetadata::discover(&root, build_player, build_host);
+    let mut meta = ReleaseMetadata::discover(&root, build_player, build_host);
 
     let out_dir = parsed
         .out
@@ -252,7 +265,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         println!(
             "  output: generated README.md, QUICKSTART.md, THIRD_PARTY.md, and manifests (schema 3)"
         );
-        println!("  not proven: DLL imports or first launch on a clean OS");
+        println!(
+            "  imports: every shipped EXE is parsed offline and must import only Windows system \
+             DLLs (a real packaging run, or --check on an existing layout); a dry run inspects nothing"
+        );
+        println!("  not proven: first launch on a clean OS");
         if !parsed.host_only {
             println!(
                 "  player ships residents: {} and {} beside {}",
@@ -287,15 +304,28 @@ pub fn run(args: &[String]) -> Result<(), String> {
             );
         }
         if parsed.check && out_dir.exists() {
-            audit_version_consistency(&out_dir, &meta)?;
+            // Inspect first: a layout whose binaries fail the import check must
+            // not be audited as if it were verified.
+            inspect_imports(&staged_binaries(
+                &out_dir,
+                !parsed.host_only,
+                !parsed.player_only,
+            ))?;
+            let verified = ReleaseMetadata {
+                imports_verified: true,
+                ..meta.clone()
+            };
+            audit_version_consistency(&out_dir, &verified)?;
             audit_package_layout(
                 &out_dir,
                 if parsed.release { "release" } else { "debug" },
                 !parsed.host_only,
                 !parsed.player_only,
-                &meta,
+                &verified,
             )?;
-            println!("  existing layout: OK (files/manifests/notices only; no binary executed)");
+            println!(
+                "  existing layout: OK (files/manifests/notices and PE import tables; no binary executed)"
+            );
             if zip_path.is_file() {
                 audit_zip_archive(&zip_path, &meta)?;
                 println!("  existing zip archive: OK (format and checksum match)");
@@ -355,6 +385,24 @@ pub fn run(args: &[String]) -> Result<(), String> {
     } else {
         None
     };
+
+    // Offline PE import inspection of the built binaries, before anything is
+    // staged: a non-system import (MSVCP140.dll, VCRUNTIME140.dll, ...) or an
+    // unreadable binary stops the run. Only a pass lets the manifests say
+    // `artifact_imports_verified: true`.
+    let mut built: Vec<(PathBuf, u16)> = Vec::new();
+    for (src, machine) in [
+        (&player_src, pe_imports::MACHINE_X64),
+        (&dechost_src, pe_imports::MACHINE_X64),
+        (&dsphost_src, pe_imports::MACHINE_X64),
+        (&host_src, pe_imports::MACHINE_X86),
+    ] {
+        if let Some(path) = src {
+            built.push((path.clone(), machine));
+        }
+    }
+    inspect_imports(&built)?;
+    meta.imports_verified = true;
 
     let mut manifest_items: Vec<String> = Vec::new();
 
@@ -478,6 +526,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         &out_dir.join("THIRD_PARTY.md"),
     )?;
 
+    // The staged copies are what ships: inspect them too, not only the build outputs.
+    inspect_imports(&staged_binaries(&out_dir, build_player, build_host))?;
     audit_package_layout(&out_dir, profile, build_player, build_host, &meta)?;
 
     println!(
@@ -807,6 +857,7 @@ fn build_top_manifest(
     bundled_host: bool,
     meta: &ReleaseMetadata,
 ) -> String {
+    let runtime = runtime_manifest(meta);
     let mut lines: Vec<String> = Vec::new();
     lines.push("{".to_string());
     lines.push(format!("  \"schema_version\": {},", meta.schema_version));
@@ -827,7 +878,7 @@ fn build_top_manifest(
     lines.push("  \"readme\": \"README.md\",".to_string());
     lines.push("  \"quickstart\": \"QUICKSTART.md\",".to_string());
     lines.push("  \"third_party_notices\": \"THIRD_PARTY.md\",".to_string());
-    lines.push(format!("  \"runtime\": {RUNTIME_MANIFEST},"));
+    lines.push(format!("  \"runtime\": {runtime},"));
     if player {
         lines.push("  \"player\": {".to_string());
         lines.push("    \"package_dir\": \"player\",".to_string());
@@ -850,7 +901,7 @@ fn build_top_manifest(
         }
         lines.push(format!("    \"crate\": \"{PLAYER_CRATE}\","));
         lines.push(format!("    \"target\": \"{PLAYER_TARGET}\","));
-        lines.push(format!("    \"runtime\": {RUNTIME_MANIFEST},"));
+        lines.push(format!("    \"runtime\": {runtime},"));
         lines.push(format!(
             "    \"decoder_host\": \"player/{}\",",
             binary_name(DECHOST_BIN)
@@ -859,16 +910,16 @@ fn build_top_manifest(
         lines.push(format!(
             "    \"decoder_host_target\": \"{DECHOST_TARGET}\","
         ));
-        lines.push(format!("    \"decoder_host_runtime\": {RUNTIME_MANIFEST},"));
+        lines.push(format!("    \"decoder_host_runtime\": {runtime},"));
         lines.push(format!(
             "    \"dsp_host\": \"player/{}\",",
             binary_name(DSPHOST_BIN)
         ));
         lines.push(format!("    \"dsp_host_crate\": \"{DSPHOST_CRATE}\","));
         lines.push(format!("    \"dsp_host_target\": \"{DSPHOST_TARGET}\","));
-        lines.push(format!("    \"dsp_host_runtime\": {RUNTIME_MANIFEST},"));
+        lines.push(format!("    \"dsp_host_runtime\": {runtime},"));
         if bundled_host {
-            lines.push(format!("    \"bundled_host_runtime\": {RUNTIME_MANIFEST},"));
+            lines.push(format!("    \"bundled_host_runtime\": {runtime},"));
             lines.push("    \"bundled_host_requires_wow64_on_x64\": true,".to_string());
         }
         lines.push("    \"license\": \"GPL-3.0-or-later\", ".to_string());
@@ -888,7 +939,7 @@ fn build_top_manifest(
         ));
         lines.push(format!("    \"crate\": \"{HOST_CRATE}\","));
         lines.push(format!("    \"target\": \"{HOST_TARGET}\","));
-        lines.push(format!("    \"runtime\": {RUNTIME_MANIFEST},"));
+        lines.push(format!("    \"runtime\": {runtime},"));
         lines.push("    \"requires_wow64_on_x64\": true,".to_string());
         lines.push("    \"license\": \"MIT OR Apache-2.0\", ".to_string());
         lines.push(
@@ -907,12 +958,13 @@ fn build_top_manifest(
 }
 
 fn serde_manifest_player(profile: &str, bundled_host: bool, meta: &ReleaseMetadata) -> String {
+    let runtime = runtime_manifest(meta);
     let bundled_line = if bundled_host {
         format!(
             "\n  \"bundled_host\": \"{bin}\",\n  \
              \"host_resolution\": \"RFC 0006 §8: beside rustamp.exe \
              (the first supervise.rs candidate)\",\n  \
-             \"bundled_host_runtime\": {RUNTIME_MANIFEST},\n  \
+             \"bundled_host_runtime\": {runtime},\n  \
              \"bundled_host_requires_wow64_on_x64\": true,",
             bin = binary_name(HOST_BIN),
         )
@@ -933,14 +985,14 @@ fn serde_manifest_player(profile: &str, bundled_host: bool, meta: &ReleaseMetada
          \"decoder_host\": \"{dechost_bin}\",\n  \
          \"decoder_host_crate\": \"{dechost_crate}\",\n  \
          \"decoder_host_target\": \"{dechost_target}\",\n  \
-         \"decoder_host_runtime\": {RUNTIME_MANIFEST},\n  \
+         \"decoder_host_runtime\": {runtime},\n  \
          \"dsp_host\": \"{dsphost_bin}\",\n  \
          \"dsp_host_crate\": \"{dsphost_crate}\",\n  \
          \"dsp_host_target\": \"{dsphost_target}\",\n  \
-         \"dsp_host_runtime\": {RUNTIME_MANIFEST},\n  \
+         \"dsp_host_runtime\": {runtime},\n  \
          \"crate\": \"{crate_}\",\n  \
          \"target\": \"{target}\",\n  \"license\": \"GPL-3.0-or-later\",\n  \
-         \"runtime\": {RUNTIME_MANIFEST},\n  \"quickstart\": \"QUICKSTART.md\",\n  \
+         \"runtime\": {runtime},\n  \"quickstart\": \"QUICKSTART.md\",\n  \
          \"third_party_notices\": \"THIRD_PARTY.md\",\n  \
          \"license_files\": [\"LICENSE\", \"PLUGIN-EXCEPTION.md\", \"THIRD_PARTY.md\"],\n  \
          \"gpl\": true\n}}\n",
@@ -966,6 +1018,7 @@ fn serde_manifest_player(profile: &str, bundled_host: bool, meta: &ReleaseMetada
 }
 
 fn serde_manifest_host(profile: &str, meta: &ReleaseMetadata) -> String {
+    let runtime = runtime_manifest(meta);
     format!(
         "{{\n  \"package\": \"rustamp-plughost\",\n  \
          \"schema_version\": {schema_version},\n  \
@@ -977,7 +1030,7 @@ fn serde_manifest_host(profile: &str, meta: &ReleaseMetadata) -> String {
          \"profile\": \"{profile}\",\n  \
          \"binary\": \"{bin}\",\n  \"crate\": \"{crate_}\",\n  \
          \"target\": \"{target}\",\n  \"license\": \"MIT OR Apache-2.0\",\n  \
-         \"runtime\": {RUNTIME_MANIFEST},\n  \"requires_wow64_on_x64\": true,\n  \
+         \"runtime\": {runtime},\n  \"requires_wow64_on_x64\": true,\n  \
          \"third_party_notices\": \"THIRD_PARTY.md\",\n  \
          \"license_files\": [\"LICENSE-MIT\", \"LICENSE-APACHE\", \"THIRD_PARTY.md\"],\n  \
          \"contains_gpl_binary\": false,\n  \
@@ -1003,9 +1056,14 @@ fn quickstart(profile: &str, player: bool, bundled_host: bool, meta: &ReleaseMet
              Use the full player package for listening to music.\n\n\
              Runtime policy: static MSVC CRT; no VC++ redistributable or runtime DLLs\n\
              are shipped or required by this policy. Windows system DLLs and WOW64\n\
-             on x64 Windows are still required. DLL imports and clean-OS launch\n\
-             must be verified by the release process. See host/manifest.json.\n",
-            meta.release_id
+             on x64 Windows are still required. {} See host/manifest.json.\n",
+            meta.release_id,
+            if meta.imports_verified {
+                "The import table was inspected at packaging time (system DLLs only);\n\
+                 launch on a clean OS has not been certified."
+            } else {
+                "DLL imports and clean-OS launch must be verified by the release process."
+            }
         );
     }
     let mut text = format!(
@@ -1013,8 +1071,7 @@ fn quickstart(profile: &str, player: bool, bundled_host: bool, meta: &ReleaseMet
 
 Use Windows 10/11 x64 (WOW64 is needed for the 32-bit helper). Package policy:
 packaged EXEs use the static MSVC CRT, so no VC++ redistributable installation or
-app-local CRT DLLs are needed. Windows system DLLs are still required. Final DLL
-imports and launch on a truly clean OS still need release validation.
+app-local CRT DLLs are needed. Windows system DLLs are still required. {imports}
 
 Portable distribution: unzip the archive to any directory. No installer,
 no registry keys, and no system services are used. To uninstall, delete the folder.
@@ -1051,7 +1108,12 @@ rustamp-dsphost-stages.exe) are internal background processes, not user entry po
 This folder is a portable release (not an installer or a signed release).
 No automatic updates: download updates manually from GitHub releases.
 "#,
-        release_id = meta.release_id
+        release_id = meta.release_id,
+        imports = if meta.imports_verified {
+            "The import tables of every EXE were inspected at packaging\ntime and name only Windows system DLLs; launch on a truly clean OS is not certified."
+        } else {
+            "Final DLL\nimports and launch on a truly clean OS still need release validation."
+        },
     );
     if !bundled_host {
         text.push_str(
@@ -1131,12 +1193,14 @@ Get-FileHash -Path .\{release_id}.zip -Algorithm SHA256
 - Single-instance command-line forwarding via Windows named pipes.
 - Configuration loaded from and saved to `%APPDATA%\Rustamp\rustamp.toml` on clean exit.
 - Supervised background helpers (32-bit plugin host, decoder resident, DSP resident).
+- Shuffle and repeat toggles drive the playback engine; the engine owns the shuffle plan.
+- Built-in visualizer (spectrum analyzer and oscilloscope) is fed from the audio the player is playing.
 
 ### Unproven / Not Implemented:
-- **Clean Machine Proof:** `artifact_imports_verified: false` remains; launch on a truly clean OS without developer runtimes has not been certified.
+- **Clean Machine Proof:** {clean_machine}
 - **Physical Audio Hardware:** Tested in VM environments; physical device-loss timing, diverse sound card compatibility, and hardware latency remain uncertified.
-- **Winamp Plugins:** The 32-bit helper and verified-byte approval store exist, but user-facing UI wiring is not yet implemented. The helper is not a sandbox.
-- **Visualizer & Placebos:** Spectrum analyzer is contracted to zero. Shuffle and repeat UI toggles are not yet connected to the playback engine.
+- **Winamp Plugins:** The 32-bit helper and verified-byte approval store exist, but user-facing UI wiring is not yet implemented. The helper is not a sandbox. Winamp visualization plugins are not hosted.
+- **Visualizer Fidelity:** The built-in visualizer's response (scaling, decay, refresh cadence) is not matched against the reference player.
 
 ## 5. Licensing & Third-Party Notices
 
@@ -1153,8 +1217,29 @@ Rustamp is clean-room software:
         protocol_version = meta.protocol_version,
         config_version = meta.config_version,
         profile = profile,
+        clean_machine = if meta.imports_verified {
+            "`artifact_imports_verified: true`: the import tables of every shipped EXE were parsed offline at packaging time and name only Windows system DLLs (no MSVCP140.dll, VCRUNTIME140.dll or other runtime). This is a static check; launch on a truly clean OS has not been certified."
+        } else {
+            "`artifact_imports_verified: false`: the import tables were not inspected for this package; launch on a truly clean OS without developer runtimes has not been certified."
+        },
     );
     let _ = (player, host);
+    s
+}
+
+/// Full Mozilla Public License 2.0 text (MPL-2.0 §3.2 / §3.1 require it to
+/// accompany Symphonia in binary form). Verbatim copy of the SPDX license text,
+/// stored in `xtask/licenses/MPL-2.0.txt`.
+const MPL_2_0_TEXT: &str = include_str!("../licenses/MPL-2.0.txt");
+
+/// Full Apache License 2.0 text, taken from the repository's own `LICENSE-APACHE`.
+const APACHE_2_0_TEXT: &str = include_str!("../../LICENSE-APACHE");
+
+fn ensure_trailing_newline(text: &str) -> String {
+    let mut s = text.to_string();
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
     s
 }
 
@@ -1224,8 +1309,12 @@ fn player_third_party_notices(root: &Path, meta: &ReleaseMetadata) -> Result<Str
          Copyright (c) 2019-2022 The Symphonia Developers.\n\n\
          In accordance with Section 3.2 of the Mozilla Public License v2.0, the Source Code Form\n\
          of Symphonia is available at https://github.com/pdeljanov/Symphonia and via crates.io.\n\
-         The terms of the Mozilla Public License, v. 2.0 apply to Symphonia:\n\n\
-         https://www.mozilla.org/en-US/MPL/2.0/\n\n\
+         The terms of the Mozilla Public License, v. 2.0 apply to Symphonia. The full\n\
+         license text follows (Mozilla Public License Version 2.0, also available at\n\
+         https://www.mozilla.org/en-US/MPL/2.0/):\n\n\
+         ```text\n\
+         {mpl}\
+         ```\n\n\
          ---\n\n\
          ## 5. Permissive Open Source License Texts\n\n\
          ### The MIT License\n\n\
@@ -1244,16 +1333,10 @@ fn player_third_party_notices(root: &Path, meta: &ReleaseMetadata) -> Result<Str
          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n\
          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n\
          SOFTWARE.\n\n\
-         ### Apache License, Version 2.0\n\n\
-         Licensed under the Apache License, Version 2.0 (the \"License\");\n\
-         you may not use this file except in compliance with the License.\n\
-         You may obtain a copy of the License at:\n\n\
-         http://www.apache.org/licenses/LICENSE-2.0\n\n\
-         Unless required by applicable law or agreed to in writing, software\n\
-         distributed under the License is distributed on an \"AS IS\" BASIS,\n\
-         WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n\
-         See the License for the specific language governing permissions and\n\
-         limitations under the License.\n\n\
+         ### Apache License, Version 2.0 (full text)\n\n\
+         ```text\n\
+         {apache}\
+         ```\n\n\
          ### The 2-Clause BSD License\n\n\
          Redistribution and use in source and binary forms, with or without\n\
          modification, are permitted provided that the following conditions are met:\n\n\
@@ -1314,6 +1397,8 @@ fn player_third_party_notices(root: &Path, meta: &ReleaseMetadata) -> Result<Str
         commit = meta.commit,
         version = meta.product_version,
         inventory = inventory,
+        mpl = ensure_trailing_newline(&MPL_2_0_TEXT.replace("\r\n", "\n")),
+        apache = ensure_trailing_newline(&APACHE_2_0_TEXT.replace("\r\n", "\n")),
     ));
     Ok(out)
 }
@@ -1424,6 +1509,61 @@ fn extract_cargo_inventory(root: &Path) -> Result<String, String> {
     Ok("<!-- BEGIN CARGO LICENSE INVENTORY -->\n(inventory metadata)\n<!-- END CARGO LICENSE INVENTORY -->".to_string())
 }
 
+/// The executables a staged layout ships, with the machine type each must have.
+fn staged_binaries(out: &Path, player: bool, host: bool) -> Vec<(PathBuf, u16)> {
+    let mut files = Vec::new();
+    if player {
+        let dir = out.join("player");
+        files.push((dir.join(binary_name(PLAYER_BIN)), pe_imports::MACHINE_X64));
+        files.push((dir.join(binary_name(DECHOST_BIN)), pe_imports::MACHINE_X64));
+        files.push((dir.join(binary_name(DSPHOST_BIN)), pe_imports::MACHINE_X64));
+        if host {
+            files.push((dir.join(binary_name(HOST_BIN)), pe_imports::MACHINE_X86));
+        }
+    }
+    if host {
+        files.push((
+            out.join("host").join(binary_name(HOST_BIN)),
+            pe_imports::MACHINE_X86,
+        ));
+    }
+    files
+}
+
+/// Parse the import tables of every file and require Windows system DLLs only.
+///
+/// Reports every file before failing, so one run shows the whole picture. An
+/// empty list, an unreadable file, a non-PE file or a wrong machine type is an
+/// error, never a pass. No binary is executed.
+fn inspect_imports(files: &[(PathBuf, u16)]) -> Result<(), String> {
+    if files.is_empty() {
+        return Err("PE import inspection has no binary to inspect; refusing".to_string());
+    }
+    let mut failures = Vec::new();
+    for (path, machine) in files {
+        match pe_imports::verify_file(path, Some(*machine), None) {
+            Ok(imports) => println!(
+                "xtask package: imports OK   {}",
+                pe_imports::summary(path, &imports)
+            ),
+            Err(e) => {
+                eprintln!("xtask package: imports FAIL {e}");
+                failures.push(e);
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "PE import inspection failed for {} of {} binaries: {}",
+            failures.len(),
+            files.len(),
+            failures.join("; ")
+        ))
+    }
+}
+
 /// Read-only headless guard, run even without artifacts by `package --check`.
 /// It checks the actual command factory and generated policy, not PE imports.
 fn check_runtime_contract(root: &Path) -> Result<(), String> {
@@ -1473,6 +1613,21 @@ fn check_runtime_contract(root: &Path) -> Result<(), String> {
             if !manifest.contains(required) {
                 return Err(format!("runtime manifest contract missing {required}"));
             }
+        }
+    }
+    let verified_meta = ReleaseMetadata {
+        imports_verified: true,
+        ..dummy_meta.clone()
+    };
+    for manifest in [
+        serde_manifest_player("release", true, &verified_meta),
+        serde_manifest_host("release", &verified_meta),
+        build_top_manifest("release", true, true, true, &verified_meta),
+    ] {
+        if !manifest.contains("\"artifact_imports_verified\":true")
+            || manifest.contains("\"artifact_imports_verified\":false")
+        {
+            return Err("runtime manifest contract: verified imports not recorded".to_string());
         }
     }
     let guide = quickstart("release", true, true, &dummy_meta);
@@ -2526,6 +2681,40 @@ mod tests {
         assert!(notices.contains("Webamp Classic Skin Tables (MIT)"));
         assert!(notices.contains("Symphonia Audio Decoders and Demuxers (MPL-2.0)"));
         assert!(notices.contains("BEGIN CARGO LICENSE INVENTORY"));
+    }
+
+    #[test]
+    fn player_third_party_carries_the_full_mpl_and_apache_texts() {
+        let root = rustamp_testkit::workspace_root();
+        let meta = ReleaseMetadata::for_testing();
+        let notices = player_third_party_notices(&root, &meta).expect("player notices");
+        // MPL-2.0: first line, a middle clause, the last exhibit.
+        assert!(notices.contains("Mozilla Public License Version 2.0\n=========="));
+        assert!(notices.contains("3.2. Distribution of Executable Form"));
+        assert!(notices.contains("Exhibit B - \"Incompatible With Secondary Licenses\" Notice"));
+        // Apache-2.0: the terms and conditions, not only the source header.
+        assert!(notices.contains("TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION"));
+        assert!(notices.contains("4. Redistribution."));
+        assert!(notices.contains("END OF TERMS AND CONDITIONS"));
+        // The host notices must stay free of the MPL text.
+        let host = host_third_party_notices(&root, &meta).expect("host notices");
+        assert!(!host.contains("Mozilla Public License Version 2.0"));
+    }
+
+    #[test]
+    fn readme_no_longer_calls_shuffle_repeat_or_the_visualizer_placebos() {
+        let meta = ReleaseMetadata::for_testing();
+        let text = readme("release", true, true, &meta);
+        assert!(!text.contains("contracted to zero"));
+        assert!(!text.contains("not yet connected to the playback engine"));
+        assert!(text.contains("`artifact_imports_verified: false`"));
+        let verified = ReleaseMetadata {
+            imports_verified: true,
+            ..meta
+        };
+        assert!(
+            readme("release", true, true, &verified).contains("`artifact_imports_verified: true`")
+        );
     }
 
     #[test]

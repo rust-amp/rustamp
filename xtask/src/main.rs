@@ -9,9 +9,12 @@
 //! * `plughost [--release]` - build the 32-bit plugin host.
 //! * `package [options]` - package the player (x86_64) and the plugin host
 //!   (i686) as separate artefacts, bundling the host beside the player.
+//! * `pe-imports [--allow a.dll,b.dll] [--machine x64|x86] <file>...` - parse
+//!   PE import tables offline and fail on any non-system DLL.
 
 mod capture;
 mod package;
+mod pe_imports;
 mod ring_cross;
 mod wake_cross;
 
@@ -29,7 +32,8 @@ commands:
   ring-cross                         cross-bitness shared-memory ring check (Windows only)
   wake-cross                         cross-bitness blocking wake check (RFC 0007, Windows only)
   plughost [--release]               build rustamp-plughost for i686-pc-windows-msvc
-  package [options]                  package player (x86_64) and plugin host (i686) separately";
+  package [options]                  package player (x86_64) and plugin host (i686) separately
+  pe-imports [options] <file>...     offline PE import check: only Windows system DLLs allowed";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -43,6 +47,7 @@ fn main() -> ExitCode {
         Some("wake-cross") => wake_cross::run(&rest),
         Some("plughost") => plughost(&rest),
         Some("package") => package::run(&rest),
+        Some("pe-imports") => pe_imports::run(&rest),
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
