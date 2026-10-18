@@ -321,6 +321,22 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## A lane died of a provider outage, and the VM block owns the host (2026-10-18 21:40)
+
+The BETA-07 lane on the free provider failed with "Service temporarily
+unavailable" - an outage on that source, not a fault in the lane, and the same
+class as the two Claude lanes that hit a session limit earlier today. It is
+recorded rather than quietly restarted because the rule that produced this whole
+wave is that a lane which writes nothing and says nothing is not a lane, and the
+only reason this one is known to have died is that it reported.
+
+**It is deliberately not relaunched yet.** The owner asked for the virtual-machine
+block to run, and that block owns the host: a lane starting now would begin
+compiling while the suite is measuring, and a slowed suite produces false stalls
+that would then have to be read as product defects. So the slot stays empty until
+the block is done, and BETA-07 goes back on a different source then - never
+waiting, but also never disturbing a measurement that the release depends on.
+
 ## The release wave: six lanes merged, and the host work is proven (2026-10-18 21:20)
 
 Merged since the owner released everything: `e585505` (the command-line half of
