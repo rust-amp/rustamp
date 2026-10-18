@@ -33,7 +33,10 @@
 #      the supervisor spawned it and it survived startup far enough to serve
 #      the framed stdio control channel (startup `Hello`, per-`Ping` `Pong`);
 #   4. the existing capture tool (`cargo xtask capture`, staged alongside,
-#      NOT rebuilt here) screenshots a `Rustamp*` window to PNG;
+#      NOT rebuilt here) screenshots a `Rustamp*` window to PNG; its stderr
+#      `note:` lines (several windows match, PrintWindow fallback) are
+#      captured into the logs and are never fatal - see the 5.1 trap note
+#      at the capture step below;
 #   5. the player's own stdout names the silent path
 #      (`output null (windowed; silent, no audio device)`), not a real device.
 #
@@ -359,10 +362,28 @@ public class SmokeWin {
     if ($null -eq $hostPid) { Finish-Failure 'resident-handshake' 'no live rustamp-plughost32.exe child of the player appeared within ~10 s; the bundled host is not supervising' }
 
     # --- capture through the existing capture tool ----------------------------
+    # Windows PowerShell 5.1 trap (the one-shot task runs powershell.exe, i.e.
+    # 5.1): with $ErrorActionPreference = 'Stop', a native command's stderr
+    # redirected by 2>&1 is wrapped in ErrorRecords, and the preference turns
+    # them into a TERMINATING error. The capture tool prints `note:` lines to
+    # stderr and still exits 0 - "N windows matched; using the first" when
+    # several visible windows match --title (the main window `Rustamp` AND the
+    # playlist window `Rustamp Playlist` both contain "Rustamp"; the playlist
+    # is open by default, app.rs `playlist_open ... unwrap_or(true)`), and the
+    # PrintWindow-fallback note - so a successful capture would kill this
+    # payload at the invocation, losing the tool's output and exit code with
+    # it. Relax the preference around each call and restore it right after;
+    # the exit code is read as usual and the notes stay in the logs.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     $listRaw = & $ToolExe capture --list 2>&1 | Out-String
+    $ErrorActionPreference = $prevEap
     $listRaw | Set-Content -Path (Join-Path $OutDir 'window-list.log') -Encoding UTF8
     Say 'capture --list exit' $LASTEXITCODE
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     $capRaw = & $ToolExe capture --title Rustamp --out $PngPath 2>&1 | Out-String
+    $ErrorActionPreference = $prevEap
     $capRaw | Set-Content -Path (Join-Path $OutDir 'capture.log') -Encoding UTF8
     $capExit = $LASTEXITCODE
     Say 'capture exit' $capExit
@@ -438,12 +459,30 @@ public class SmokeWin {
 } catch {
     $sess = $null
     try { $sess = (Get-Process -Id $PID -ErrorAction Stop).SessionId } catch { $sess = $null }
+    # Name the throw site, not just the message: an uncaught statement error
+    # otherwise surfaces as `inner-exception` with no step, line or category,
+    # and the next diagnosis has to guess where the payload died (the
+    # 2026-10-18 capture failure spent a whole VM run on exactly that).
+    $at = 'unknown'
+    if ($null -ne $_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber -gt 0) {
+        $src = [string]$_.InvocationInfo.ScriptName
+        if ([string]::IsNullOrWhiteSpace($src)) { $src = 'inner.ps1' }
+        $at = '{0}:{1}' -f $src, $_.InvocationInfo.ScriptLineNumber
+    }
+    Say 'inner exception at' $at
+    Say 'inner exception type' $_.Exception.GetType().FullName
+    Say 'inner exception category' ([string]$_.CategoryInfo.Category)
+    Say 'inner exception id' ([string]$_.FullyQualifiedErrorId)
+    Say 'inner exception message' $_.Exception.Message
     $log | Set-Content -Path $Transcript -Encoding UTF8
     [pscustomobject]@{
-        ok      = $false
-        session = $sess
-        failed  = 'inner-exception'
-        detail  = $_.Exception.Message
+        ok       = $false
+        session  = $sess
+        failed   = 'inner-exception'
+        detail   = $_.Exception.Message
+        at       = $at
+        category = ([string]$_.CategoryInfo.Category)
+        errorId  = ([string]$_.FullyQualifiedErrorId)
     } | ConvertTo-Json -Depth 6 | Set-Content -Path $ProofPath -Encoding UTF8
     @{ ok = $false; failed = 'inner-exception' } | ConvertTo-Json | Set-Content -Path $DonePath -Encoding UTF8
     exit 3
@@ -495,7 +534,11 @@ if ($proof.session -eq 0) { throw 'STEP guest FAILED: the smoke task ran in sess
 if ($proof.session -ne $interactiveSession) {
     throw ("STEP guest FAILED: the smoke task ran in session {0}, not the interactive session {1}; refusing" -f $proof.session, $interactiveSession)
 }
-if (-not $proof.ok) { throw ("STEP guest FAILED: step '{0}' failed in the guest ({1}); transcript and logs are under C:\rustamp\out\smoke\ (copy out with the broker copyout op)" -f $proof.failed, $proof.detail) }
+# The failure proof stamps the throw site (`at`, X7); name it here too, so
+# an inner exception says where it died without a copy-out first.
+$guestAt = ''
+if ($proof.at) { $guestAt = ' at {0}' -f $proof.at }
+if (-not $proof.ok) { throw ("STEP guest FAILED: step '{0}' failed in the guest{2} ({1}); transcript and logs are under C:\rustamp\out\smoke\ (copy out with the broker copyout op)" -f $proof.failed, $proof.detail, $guestAt) }
 
 # The outer half's own trail joins the transcript (session discovery is the
 # number-one historical failure point, and it happens before the inner

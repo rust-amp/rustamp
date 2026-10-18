@@ -49,8 +49,8 @@ only with `-Reset` (otherwise plain start, like the existing runners).
 | `package` audit | `player\rustamp.exe`, `player\rustamp-plughost32.exe`, `host\rustamp-plughost32.exe` exist and are non-empty; SHA-256 recorded. The bundled copy beside the player is the first `supervise.rs` candidate (RFC 0006 §8). Missing/empty binaries fail here, before any VM work. |
 | `build-tool` | Only `cargo build -p xtask` (the existing, reviewed window-capture tool) is compiled. The player and host are **never rebuilt**: they are staged byte-for-byte, so the proof is of the shipped bytes, not a fresh build. |
 | `stage` | Verbatim package copies + capture tool (+ host CRT DLLs beside the tool only — the packaged binaries are static-CRT per X1) + the repo's committed `sine.flac` fixture (known-good media, so a decode failure names the package, not BETA-04-style bad input). |
-| `guest` (`run-smoke.ps1`) | In the interactive session (explorer-owned, never session 0): the player starts with `--no-audio <fixture>` and stays up; the main window (documented rule `Rustamp`, or `Rustamp - <error>` while an error is showing per `crates/rustamp-app/src/app.rs:350-362`, owned by the player pid, visible) appears within 60 s at client **275×116** (S01 rest size, pinned on the packaged build) — a timeout now dumps every owned top-level window it saw (title, class, rect, visibility); a live `rustamp-plughost32.exe` child of the player exists (the supervisor resolves the bundled copy first and spawns eagerly, and the host sends its startup `Hello` / per-`Ping` `Pong` only while its UI pump runs — so a live child proves the pair reached handshake service); `xtask capture` screenshots a `Rustamp*` window; the player prints `output null (windowed; silent, no audio device)` (silent path, not a real device); the player is killed and its exit recorded. |
-| `verify` (host) | Session is non-zero; proof facts complete; window size re-asserted; PNG exists, is ≥512 bytes and carries the PNG signature; every file recomputed against the guest `hashes.json` (the `vm-run-capture.ps1` §7 integrity leg); `--list` log, stdout/stderr logs and transcript land in `staging\out\smoke\` for the eye. |
+| `guest` (`run-smoke.ps1`) | In the interactive session (explorer-owned, never session 0): the player starts with `--no-audio <fixture>` and stays up; the main window (documented rule `Rustamp`, or `Rustamp - <error>` while an error is showing per `crates/rustamp-app/src/app.rs:350-362`, owned by the player pid, visible) appears within 60 s at client **275×116** (S01 rest size, pinned on the packaged build) — a timeout now dumps every owned top-level window it saw (title, class, rect, visibility); a live `rustamp-plughost32.exe` child of the player exists (the supervisor resolves the bundled copy first and spawns eagerly, and the host sends its startup `Hello` / per-`Ping` `Pong` only while its UI pump runs — so a live child proves the pair reached handshake service); `xtask capture` screenshots a `Rustamp*` window (its stderr `note:` lines - several windows match, PrintWindow fallback - are captured into the logs and are never fatal); the player prints `output null (windowed; silent, no audio device)` (silent path, not a real device); the player is killed and its exit recorded. |
+| `verify` (host) | Session is non-zero; proof facts complete; window size re-asserted; PNG exists, is ≥512 bytes and carries the PNG signature; every file recomputed against the guest `hashes.json` (the `vm-run-capture.ps1` §7 integrity leg); `--list` log, capture log, stdout/stderr logs and transcript land in `staging\out\smoke\` for the eye. |
 
 ## How it fails (every case exits non-zero, naming the step)
 
@@ -69,17 +69,22 @@ names a missing runtime), `window` (no main window in 60 s under the
 documented rule — the failure names every visible owned top-level window
 seen, or says none was enumerated — or wrong client size, or the player
 died waiting), `resident-handshake` (no live
-bundled-host child in ~10 s), `capture` (tool exit / no PNG / bad
-signature), `silent-path` (no silent marker on stdout), `stop` (Kill did
+bundled-host child in ~10 s), `capture` (tool exit — named with the tool's
+own stderr, which is captured into `capture.log` and is not itself a
+failure / no PNG / bad signature), `silent-path` (no silent marker on
+stdout), `stop` (Kill did
 not take), `session` (landed in session 0 / no desktop), plus the outer
 refusals (no interactive session, no done sentinel, proof with no session
-field, session mismatch).
+field, session mismatch). An uncaught statement error inside the payload
+is reported as `inner-exception` and now names its throw site (`at`, the
+exception type, category and error id are stamped into the proof and the
+transcript).
 A lingering host child after the kill is recorded (`hostReaped: false`) but
 warns rather than fails.
 
 ## What the first real runs found (why the runner exists)
 
-Six defects in seven runs, each found by running, not by reading: (1) the
+Seven defects in eight runs, each found by running, not by reading: (1) the
 `package` audit refused an incomplete build (a missing load-bearing binary —
 the check working as designed, no script change); (2) the guest script called
 `Invoke-CimMethod -GetOwner`, a parameter that does not exist — fixed to
@@ -136,6 +141,28 @@ copy-in failure now reports the path-policy refusal and the in-guest case
 apart, naming the real cause and the remedy (a fresh guest: `-Reset`). The
 deeper fix — the guest payload's failure paths exiting without killing the
 player — belongs to the guest script, which this lane does not touch.
+(7) The eighth run passed every check up to and including `capture --list`
+(exit 0) — session 1, virtual screen, player alive, main window `Rustamp`
+at client 275x116, live bundled-host child — and then died with
+`step 'inner-exception' failed in the guest` before the capture step could
+record anything. The cause was the capture invocation itself
+(`run-smoke.ps1:365` before the fix): the one-shot task runs
+`powershell.exe`, i.e. Windows PowerShell 5.1, where a native command's
+stderr redirected by `2>&1` is wrapped in ErrorRecords and
+`$ErrorActionPreference = 'Stop'` turns them into a terminating error — and
+the capture tool prints `note: 2 windows matched; using the first
+(hwnd=0x...)` to stderr because `--title Rustamp` is a substring match that
+both the main window (`Rustamp`) and the default-open playlist window
+(`Rustamp Playlist`; `app.rs:237` `playlist_open ... unwrap_or(true)`)
+satisfy, while the tool still exits 0. The tool succeeded; the wrapper
+killed the run, and the step lost the tool's merged output and exit code
+with it (the transcript ended at `capture --list exit 0`; `capture.log` was
+never written, so the note text survived only inside the exception
+message). Fixed in the guest script (card `docs/tasks/X7-smoke-capture.md`):
+the preference is relaxed around both tool invocations and restored right
+after, and the payload's catch leg now stamps the throw site (`at`, plus
+exception type, category and error id) into the proof and the transcript,
+which the outer half names in its failure message.
 
 ## What it still does not prove
 
@@ -145,8 +172,11 @@ a long run (the player lives ~half a minute, then is killed — no clean-exit
 claim), pipe-byte handshake content (liveness is proven, the framed bytes
 are the supervisor's private channel), pixel-exact art (the PNG will show
 the BETA-02 magenta placeholder), decode beyond the one committed fixture,
-or which `Rustamp*` window the PNG shows when main and playlist both match
-(the proof records the selected hwnd/title/size and the full `--list`).
+or which `Rustamp*` window the PNG shows: the main window and the
+default-open playlist window (`Rustamp Playlist`) both match
+`--title Rustamp`, and the tool captures the first match in `EnumWindows`
+order (the proof records the selected hwnd/title/size, the tool's `note:`
+line and the full `--list`, so the choice is visible, not asserted).
 
 ## Verification and boundary receipt
 
