@@ -746,8 +746,21 @@ fn write_available(
 }
 
 /// Whether a shared-mode render client can be initialised in this process.
-/// Used by the CLI example to fall back to the null output on machines without
-/// an audio endpoint (for example CI).
+/// Used by [`crate::default_output`] to choose the backend, and by the CLI
+/// example to fall back to the null output on machines without an audio
+/// endpoint (for example CI).
+///
+/// # Never call this on a thread that will own a window
+///
+/// This probe initialises COM **on the calling thread, in the multi-threaded
+/// apartment**, and it does so *before* it looks for an endpoint — so it
+/// consumes the thread's apartment even when it answers `false`. A thread in
+/// the MTA can never enter a single-threaded apartment afterwards:
+/// `OleInitialize` returns `RPC_E_CHANGED_MODE`, and `winit` panics on that
+/// when it creates a window with drag-and-drop support. Callers that may be on
+/// a UI thread go through [`crate::default_output`], which runs this probe on a
+/// thread of its own; the real endpoint is opened by [`render_thread`], which
+/// likewise initialises COM only for itself.
 pub fn is_shared_mode_available() -> bool {
     if initialize_mta().ok().is_err() {
         return false;

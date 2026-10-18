@@ -23,6 +23,17 @@
 //! unusable, `open` fails loudly and the caller decides, for example by falling
 //! back to [`NullOutput`] explicitly. `out_disk` (the `out_disk` equivalent of
 //! the original player) is an M2 item.
+//!
+//! # Windows: COM stays off the caller's thread
+//!
+//! Every COM initialisation this crate performs happens on a thread this crate
+//! owns: [`WasapiOutput`] creates and uses its endpoint interfaces only on its
+//! render thread, and the shared-mode probe behind [`default_output`] runs on a
+//! short-lived thread of its own. The caller's apartment is therefore never
+//! consumed, which is what lets the player build its device on the same thread
+//! that afterwards creates the window — a thread in the multi-threaded
+//! apartment can no longer enter a single-threaded one, and `winit`'s
+//! `OleInitialize` (drag and drop) would panic with `RPC_E_CHANGED_MODE`.
 
 #![warn(missing_docs)]
 
@@ -54,12 +65,88 @@ use rustamp_core::audio::OutputDevice;
 /// lists the alternatives. This function itself never opens a stream and never
 /// returns an error; the caller can fall back to [`NullOutput`] explicitly (the
 /// `--null` mode does).
+///
+/// # COM apartment (Windows)
+///
+/// This function **leaves the caller's COM apartment untouched**, so it is safe
+/// to call it from the thread that later owns the GUI. The Windows probe needs
+/// COM in the multi-threaded apartment ([`is_shared_mode_available`] calls
+/// `CoInitializeEx(COINIT_MULTITHREADED)` on *its* thread), and an MTA thread
+/// can never become a single-threaded apartment afterwards: `OleInitialize`
+/// then fails with `RPC_E_CHANGED_MODE`, which is what `winit` calls when it
+/// creates a window with drag-and-drop support. The probe therefore runs on a
+/// short-lived thread of its own (see [`probe_shared_mode_off_thread`]), and
+/// [`WasapiOutput`] keeps every COM object on its own render thread. Keep it
+/// that way: a caller that does the probe inline on the main thread cannot
+/// open a window any more.
 pub fn default_output() -> Box<dyn OutputDevice> {
     #[cfg(windows)]
     {
-        if is_shared_mode_available() {
+        if probe_shared_mode_off_thread() {
             return Box::new(WasapiOutput::new());
         }
     }
     Box::new(CpalOutput::new())
+}
+
+/// [`is_shared_mode_available`] on a short-lived thread of its own.
+///
+/// The probe initialises COM as multi-threaded on the thread that runs it, and
+/// that is irreversible for the lifetime of the thread. Running it on a
+/// dedicated thread keeps the apartment of the caller — in the player, the
+/// thread that goes on to create the window — free, while the answer is
+/// exactly the one the inline probe gave: the same process, the same endpoint,
+/// the same client parameters.
+///
+/// The thread is joined, so the backend choice is still made before
+/// [`default_output`] returns and nothing is left running behind the caller's
+/// back. It exits without `CoUninitialize` (as the inline probe did on the
+/// caller's thread); Windows releases the apartment state of a terminated
+/// thread, and the per-process MTA that [`WasapiOutput`] needs is entered by
+/// its own render thread. A thread that cannot be spawned or that panics is
+/// reported as "not available", which selects the [`CpalOutput`] fallback —
+/// the same answer a failing probe gives.
+#[cfg(windows)]
+fn probe_shared_mode_off_thread() -> bool {
+    std::thread::Builder::new()
+        .name("rustamp-wasapi-probe".into())
+        .spawn(is_shared_mode_available)
+        .ok()
+        .and_then(|probe| probe.join().ok())
+        .unwrap_or(false)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// The regression guard for the OLE apartment defect: choosing the backend
+    /// must not consume the caller's apartment.
+    ///
+    /// `winit` creates its window with drag-and-drop support (the player uses
+    /// `WindowEvent::DroppedFile`), so it calls `OleInitialize` on the thread
+    /// that runs the event loop — which fails with `RPC_E_CHANGED_MODE`, and
+    /// panics, once that thread is in the multi-threaded apartment. The player
+    /// builds its output device on exactly that thread, before the window
+    /// exists, so entering an STA afterwards is the property that has to hold.
+    ///
+    /// This needs **no audio endpoint**: the probe initialises COM before it
+    /// looks for a device, so the test fails on a machine without one too —
+    /// which is what makes it the guard the device-bound tests could not be.
+    #[test]
+    fn default_output_leaves_the_calling_thread_free_for_an_sta() {
+        let device = default_output();
+        drop(device);
+        let entered = wasapi::initialize_sta();
+        if entered.is_ok() {
+            // Balance our own initialisation; the thread is left as found.
+            wasapi::deinitialize();
+        }
+        assert!(
+            entered.is_ok(),
+            "default_output() left this thread in the multi-threaded apartment \
+             (CoInitializeEx(COINIT_APARTMENTTHREADED) returned {entered:?}); a window \
+             created on it would panic in OleInitialize with RPC_E_CHANGED_MODE"
+        );
+    }
 }

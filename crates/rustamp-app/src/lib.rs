@@ -117,6 +117,11 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         file: args.file.clone(),
         seconds: args.seconds,
     };
+    // The device is built here, on the thread that calls `window::run` below.
+    // On Windows that order is only safe because `rustamp-output` keeps every
+    // COM initialisation on its own threads: `winit` needs this thread free to
+    // enter a single-threaded apartment when it creates the window. See
+    // `app::create_output`.
     let mut app = App::new(options)?;
     app.set_config_path(config_path);
     for warning in &loaded.warnings {

@@ -184,6 +184,15 @@ pub(crate) fn is_playlist_file(path: &Path) -> bool {
 }
 
 /// Creates the output device and optional null clock for the given choice.
+///
+/// This runs on the thread that afterwards creates the window (see
+/// [`crate::run`]), so on Windows nothing here may initialise COM on *this*
+/// thread: `winit` calls `OleInitialize` for drag and drop when it creates the
+/// window and panics with `RPC_E_CHANGED_MODE` if the thread is already in the
+/// multi-threaded apartment. `rustamp_output::default_output` guarantees that
+/// (backend probe and WASAPI endpoint both live on their own threads); see its
+/// "COM apartment" section before putting any device work in front of the
+/// window.
 fn create_output(choice: OutputChoice) -> (Box<dyn OutputDevice>, Option<NullClock>) {
     match choice {
         OutputChoice::Null | OutputChoice::NoAudio => {
