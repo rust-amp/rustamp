@@ -59,9 +59,7 @@ use std::path::PathBuf;
 use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
 use rustamp_gfx::Image;
 use rustamp_prefs::page_name;
-use rustamp_ui::{
-    DialogKind, Key, MAX_MEDIA_LEN, SkinEntry, dialog_for_command, render_dialog, skin_entries,
-};
+use rustamp_ui::{DialogKind, Key, SkinEntry, dialog_for_command, render_dialog, skin_entries};
 
 use crate::app::App;
 
@@ -72,19 +70,9 @@ impl App {
     ///
     /// Returns the opened dialog, or `None` when the command opens no
     /// implemented dialog (the caller keeps its existing note path then).
-    /// Opens the dialog `command` asks for, when it asks for one the app now
-    /// implements (About, file info, either jump box, load playlist, the
-    /// three open-media faces, skin browser, preferences).
-    ///
-    /// Returns the opened dialog, or `None` when the command opens no
-    /// implemented dialog (the caller keeps its existing note path then).
     pub fn open_dialog_for(&mut self, command: &Command) -> Option<DialogKind> {
         let dialog = dialog_for_command(command)?;
         self.dialogs.open(dialog);
-        if dialog == DialogKind::LoadPlaylist {
-            self.playlist_dialog_path = None;
-            self.playlist_dialog_text.clear();
-        }
         // The browser moves its selection with the arrow keys, and without the
         // row count a held Down would overrun the end and a following Up would
         // appear dead. Tell the manager how many rows it is looking at.
@@ -122,18 +110,12 @@ impl App {
 
     /// Closes `dialog` when it is open.
     pub fn close_dialog(&mut self, dialog: DialogKind) {
-        if dialog == DialogKind::LoadPlaylist {
-            self.playlist_dialog_path = None;
-            self.playlist_dialog_text.clear();
-        }
         self.dialogs.close(dialog);
     }
 
     /// Closes whatever dialog is open, if any. Returns whether one was open.
     pub fn close_open_dialog(&mut self) -> bool {
         let open = self.dialogs.open_kind().is_some();
-        self.playlist_dialog_path = None;
-        self.playlist_dialog_text.clear();
         self.dialogs.close_any();
         open
     }
@@ -153,28 +135,16 @@ impl App {
         let is_load_playlist = self.dialog_is_open(DialogKind::LoadPlaylist);
         if is_load_playlist {
             match key {
-                Key::Backspace => {
-                    self.playlist_dialog_text.pop();
-                    return true;
-                }
                 Key::Digit(digit) | Key::Numpad(digit) => {
                     let ch = (b'0' + (digit % 10)) as char;
-                    if self.playlist_dialog_text.chars().count() < MAX_MEDIA_LEN {
-                        self.playlist_dialog_text.push(ch);
-                    }
-                    return true;
+                    return self.dialogs.type_text(&ch.to_string());
                 }
                 Key::Letter(letter) => {
-                    if self.playlist_dialog_text.chars().count() < MAX_MEDIA_LEN {
-                        self.playlist_dialog_text.push(letter as char);
-                    }
-                    return true;
+                    let ch = letter as char;
+                    return self.dialogs.type_text(&ch.to_string());
                 }
                 Key::Space => {
-                    if self.playlist_dialog_text.chars().count() < MAX_MEDIA_LEN {
-                        self.playlist_dialog_text.push(' ');
-                    }
-                    return true;
+                    return self.dialogs.type_text(" ");
                 }
                 _ => {}
             }
@@ -208,8 +178,6 @@ impl App {
                 }
             }
             Key::Escape => {
-                self.playlist_dialog_path = None;
-                self.playlist_dialog_text.clear();
                 self.dialogs.close_any();
             }
             _ => {}
@@ -222,18 +190,10 @@ impl App {
     /// and confirmed (the dialog closes on confirm); with nothing chosen the
     /// dialog stays open so the user can retry.
     pub(crate) fn confirm_load_playlist(&mut self) -> bool {
-        let path = if let Some(p) = self.playlist_dialog_path.take() {
-            p
-        } else {
-            let trimmed = self.playlist_dialog_text.trim();
-            if trimmed.is_empty() {
-                return false;
-            }
-            PathBuf::from(trimmed)
+        let Some(path) = self.dialogs.confirm_load_playlist_path() else {
+            return false;
         };
         let _ = self.load_playlist_file(&path, true);
-        self.playlist_dialog_text.clear();
-        self.playlist_dialog_path = None;
         self.dialogs.close_any();
         true
     }
@@ -242,7 +202,7 @@ impl App {
     /// text of a key press there instead of the key, see
     /// [`App::dialog_text`]).
     pub fn dialog_accepts_text(&self) -> bool {
-        self.dialogs.accepts_text() || self.dialog_is_open(DialogKind::LoadPlaylist)
+        self.dialogs.accepts_text()
     }
 
     /// Text the OS produced for a key press while a dialog is focused
@@ -251,16 +211,6 @@ impl App {
     /// [`rustamp_ui::DialogManager::type_text`]). Returns whether anything
     /// was typed; control characters are left to [`App::dialog_key`].
     pub fn dialog_text(&mut self, text: &str) -> bool {
-        if self.dialog_is_open(DialogKind::LoadPlaylist) {
-            let mut typed = false;
-            for ch in text.chars().filter(|ch| !ch.is_control()) {
-                if self.playlist_dialog_text.chars().count() < MAX_MEDIA_LEN {
-                    self.playlist_dialog_text.push(ch);
-                    typed = true;
-                }
-            }
-            return typed;
-        }
         self.dialogs.type_text(text)
     }
 
@@ -269,16 +219,16 @@ impl App {
     /// Returns whether the open dialog took it.
     pub fn dialog_drop_file(&mut self, path: PathBuf) -> bool {
         if self.dialog_is_open(DialogKind::LoadPlaylist) {
-            self.playlist_dialog_path = Some(path);
-            return true;
+            self.dialogs.drop_playlist_path(path)
+        } else {
+            self.dialogs.drop_media_path(path)
         }
-        self.dialogs.drop_media_path(path)
     }
 
     /// The open-media or load-playlist dialog's entry field text.
     pub fn media_text(&self) -> &str {
         if self.dialog_is_open(DialogKind::LoadPlaylist) {
-            return &self.playlist_dialog_text;
+            return self.dialogs.playlist_text();
         }
         self.dialogs.media_text()
     }
@@ -286,7 +236,7 @@ impl App {
     /// Replaces the open-media or load-playlist dialog's entry field (a full path or URL).
     pub fn set_media_text(&mut self, text: &str) {
         if self.dialog_is_open(DialogKind::LoadPlaylist) {
-            self.playlist_dialog_text = text.to_string();
+            self.dialogs.set_playlist_text(text);
             return;
         }
         self.dialogs.set_media_text(text);
@@ -295,7 +245,9 @@ impl App {
     /// Stages the open-media or load-playlist dialog's picks.
     pub fn stage_media_paths(&mut self, paths: Vec<PathBuf>) {
         if self.dialog_is_open(DialogKind::LoadPlaylist) {
-            self.playlist_dialog_path = paths.into_iter().next();
+            if let Some(first) = paths.into_iter().next() {
+                self.dialogs.stage_playlist_path(first);
+            }
             return;
         }
         self.dialogs.stage_media_paths(paths);
@@ -303,17 +255,17 @@ impl App {
 
     /// Stages a playlist file pick for the load-playlist dialog.
     pub fn stage_playlist_path(&mut self, path: PathBuf) {
-        self.playlist_dialog_path = Some(path);
+        self.dialogs.stage_playlist_path(path);
     }
 
     /// Sets the text in the load-playlist dialog's entry field.
     pub fn set_playlist_text(&mut self, text: &str) {
-        self.playlist_dialog_text = text.to_string();
+        self.dialogs.set_playlist_text(text);
     }
 
     /// The text in the load-playlist dialog's entry field.
     pub fn playlist_text(&self) -> &str {
-        &self.playlist_dialog_text
+        self.dialogs.playlist_text()
     }
 
     /// The jump box's current input text.
@@ -416,12 +368,12 @@ impl App {
     /// The load-playlist dialog's body lines: the prompt plus the staged pick
     /// or typed field, then the one-line hint.
     pub(crate) fn load_playlist_lines(&self) -> Vec<String> {
-        let field = if let Some(path) = &self.playlist_dialog_path {
+        let field = if let Some(path) = self.dialogs.staged_playlist_path() {
             field_tail(&path.display().to_string())
-        } else if self.playlist_dialog_text.is_empty() {
+        } else if self.dialogs.playlist_text().is_empty() {
             String::new()
         } else {
-            field_tail(&self.playlist_dialog_text)
+            field_tail(self.dialogs.playlist_text())
         };
         vec![
             "Playlist file:".to_string(),

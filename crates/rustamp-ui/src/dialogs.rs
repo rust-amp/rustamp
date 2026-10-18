@@ -824,20 +824,6 @@ impl DialogManager {
             false
         }
     }
-
-    /// Confirms the load-playlist dialog: always `None`.
-    ///
-    /// RFC 0010 leaves replace-versus-append (and the file filter) open, and
-    /// no spec fixes the dialog beyond its title, so there is deliberately no
-    /// confirmation *command* yet — confirming must not silently decide
-    /// append semantics by emitting `AddItems`. The path itself is confirmed
-    /// separately ([`confirm_load_playlist_path`](Self::confirm_load_playlist_path)):
-    /// the app reads the file, enqueues the surviving entries and reports the
-    /// skips (see [`playlist_load_summary_lines`]). `Enter` stays consumed
-    /// (see [`key`](Self::key)) and the dialog stays open.
-    pub fn confirm_load_playlist(&self) -> Option<Command> {
-        None
-    }
 }
 
 /// The note lines the app surfaces after reading a playlist file.
@@ -1176,16 +1162,15 @@ mod tests {
     }
 
     #[test]
-    fn confirming_the_load_playlist_dialog_decides_nothing() {
-        // RFC 0010 leaves replace-versus-append open, so confirmation must
-        // not emit a command (in particular not `AddItems`, which would
-        // assert append semantics the spec does not contain).
+    fn confirming_the_load_playlist_dialog_yields_no_path_without_input() {
+        // RFC 0010: load playlist confirmation produces a path (not a core command).
+        // Without an input or staged path, confirming yields None.
         let mut manager = DialogManager::new();
-        assert_eq!(manager.confirm_load_playlist(), None);
+        assert_eq!(manager.confirm_load_playlist_path(), None);
         manager.open(DialogKind::LoadPlaylist);
-        assert_eq!(manager.confirm_load_playlist(), None);
+        assert_eq!(manager.confirm_load_playlist_path(), None);
         manager.open(DialogKind::Jump(JumpTarget::Time));
-        assert_eq!(manager.confirm_load_playlist(), None);
+        assert_eq!(manager.confirm_load_playlist_path(), None);
     }
 
     #[test]
@@ -1591,8 +1576,6 @@ mod tests {
         );
         // Control characters never land in the field.
         assert!(!manager.type_text("\r"));
-        // No confirmation command: RFC 0010 leaves append-versus-replace open.
-        assert_eq!(manager.confirm_load_playlist(), None);
         // Opening another dialog clears the field and the pick.
         manager.open(DialogKind::About);
         manager.open(DialogKind::LoadPlaylist);

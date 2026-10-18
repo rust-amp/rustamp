@@ -134,8 +134,6 @@ pub struct App {
     /// skin browser, preferences); owned here, rendered by `dialogs.rs`,
     /// hosted by `window.rs`.
     pub(crate) dialogs: DialogManager,
-    pub(crate) playlist_dialog_text: String,
-    pub(crate) playlist_dialog_path: Option<PathBuf>,
     pub(crate) last_playlist_report: Option<rustamp_playlist::PlaylistReport>,
     /// Whether the main-menu popup is open (owned here, rendered by
     /// `menu.rs`, hosted by `window.rs`; S04).
@@ -273,8 +271,6 @@ impl App {
             next_entry_id: 0,
             playlist: PlaylistWindow::new(),
             dialogs: DialogManager::new(),
-            playlist_dialog_text: String::new(),
-            playlist_dialog_path: None,
             last_playlist_report: None,
             main_menu_open: false,
             notes: Vec::new(),
@@ -3765,5 +3761,49 @@ mod tests {
         // Key letters/digits
         assert!(app.dialog_key(Key::Letter(b'u')));
         assert_eq!(app.playlist_text(), "my_list.m3u");
+    }
+
+    #[test]
+    fn about_dialog_body_reflects_workspace_version() {
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenAbout).unwrap();
+        assert!(app.dialog_is_open(DialogKind::About));
+
+        let body = app.open_dialog_lines().expect("about dialog open");
+        assert_eq!(
+            body[0],
+            format!("{} 0.1.0-beta.1", rustamp_ui::PROGRAM_NAME),
+            "about dialog first line must show the workspace version"
+        );
+    }
+
+    #[test]
+    fn load_playlist_uses_dialog_manager_contract() {
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenPlaylist).unwrap();
+        assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
+
+        // Direct staging routes to DialogManager
+        app.stage_playlist_path(PathBuf::from("staged.m3u"));
+        assert_eq!(
+            app.dialogs.confirm_load_playlist_path(),
+            Some(PathBuf::from("staged.m3u"))
+        );
+
+        // Dropping a file routes to DialogManager
+        assert!(app.dialog_drop_file(PathBuf::from("dropped.pls")));
+        assert_eq!(
+            app.dialogs.confirm_load_playlist_path(),
+            Some(PathBuf::from("dropped.pls"))
+        );
+
+        // Closing resets DialogManager state
+        app.close_dialog(DialogKind::LoadPlaylist);
+        assert_eq!(app.dialogs.confirm_load_playlist_path(), None);
+        assert!(app.playlist_text().is_empty());
     }
 }

@@ -1,5 +1,7 @@
 # RFC 0010: a core command for the playlist window's Load Playlist dialog
 
+Status: **Accepted** (2026-10-18).
+
 ## Goal
 
 The playlist window's **LIST OPTS** button opens a dialog the measurement
