@@ -65,6 +65,15 @@ if (Test-Path 'C:\rustamp\testskins') { $env:RUSTAMP_TESTSKINS = 'C:\rustamp\tes
 # exist on the host. Point RUSTAMP_TESTPLUGINS at it so DLL acceptance tests find
 # the approved in_openmpt.dll plugin.
 if (Test-Path 'C:\rustamp\testplugins') { $env:RUSTAMP_TESTPLUGINS = 'C:\rustamp\testplugins' }
+# The classic DSP fixture (P8) rides in the same copy at dsp\dsp_optilab_core.dll.
+# Point RUSTAMP_TESTPLUGIN_DSP at the file itself when it is there, and hash it so
+# the host can confirm the guest holds exactly the pinned bytes (reported below).
+$dspPluginPath = 'C:\rustamp\testplugins\dsp\dsp_optilab_core.dll'
+$dspPluginHash = $null
+if (Test-Path $dspPluginPath) {
+    $env:RUSTAMP_TESTPLUGIN_DSP = $dspPluginPath
+    $dspPluginHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dspPluginPath).Hash
+}
 
 # Mediahost resident fixture examples: set RUSTAMP_DECODER_FIXTURE and
 # RUSTAMP_DSP_FIXTURE when staged, enabling the two-process pcm_process and
@@ -364,6 +373,9 @@ foreach ($exe in $exes) {
     # C:\rustamp\testplugins exists (see above), so $null here means the Group D
     # loader tests ran without RUSTAMP_TESTPLUGINS and can only refuse loudly.
     testplugins = $env:RUSTAMP_TESTPLUGINS
+    # Same idea for the DSP fixture: $null means it was not found in the guest.
+    testplugindsp = $env:RUSTAMP_TESTPLUGIN_DSP
+    testplugindspsha256 = $dspPluginHash
     ran       = $results.Count
     failed    = @($results | Where-Object { $_.exit -ne 0 }).Count
     results   = $results

@@ -227,6 +227,18 @@ if (Test-Path $skinsDir) {
 # fixture was staged; a missing fixture must never look like a pass.
 $pluginsStaged = $false
 $pluginsDir = 'D:\code\rustamp-testplugins'
+# The classic DSP fixture (P8) travels inside the same wholesale copy, at
+# dsp\dsp_optilab_core.dll. $dspHostState is what the host knows before the
+# guest speaks: 'absent' (no file), 'wrong-hash' (a file that is not the pinned
+# fixture - never staged as the approved one) or 'present'.
+$dspFixtureName = 'dsp_optilab_core.dll'
+$dspFixtureSha256 = '78A140C9114B60B361DC7E9A0203DD6D6F23D567E1F309396CD78BAEA7797874'
+$dspHostFile = Join-Path $pluginsDir "dsp\$dspFixtureName"
+$dspHostState = 'absent'
+if (Test-Path $dspHostFile) {
+    $dspHostHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dspHostFile).Hash
+    $dspHostState = if ($dspHostHash -eq $dspFixtureSha256) { 'present' } else { 'wrong-hash' }
+}
 if (Test-Path $pluginsDir) {
     Step 'copying test plugins into the guest (read-only copies)'
     $pluginsStage = Join-Path (Split-Path $Stage) 'testplugins'
@@ -279,6 +291,26 @@ if ($pluginsStaged) {
 } else {
     Write-Host 'plugin fixture: NOT STAGED (no D:\code\rustamp-testplugins on the host, so RUSTAMP_TESTPLUGINS is unset); Group D tests refuse loudly and prove nothing in this run'
 }
+# DSP fixture status (P8), named on every run for the same reason: a missing or
+# wrong DSP DLL must never read as a pass. The guest reports the path of the
+# file it found and that file's SHA-256 (guest ground truth, after the copy).
+$dspStaged = $false
+$guestDspPath = $result.testplugindsp
+$guestDspHash = $result.testplugindspsha256
+if ($dspHostState -eq 'absent') {
+    Write-Host ('dsp plugin fixture: NOT STAGED (no dsp\{0} under D:\code\rustamp-testplugins, so RUSTAMP_TESTPLUGIN_DSP is unset); the DSP acceptance test refuses loudly and proves nothing in this run' -f $dspFixtureName)
+} elseif ($dspHostState -eq 'wrong-hash') {
+    Write-Host ('dsp plugin fixture: WRONG FILE on the host (SHA-256 is not {0}); the DSP acceptance test refuses and proves nothing in this run' -f $dspFixtureSha256)
+} elseif (-not $pluginsStaged) {
+    Write-Host 'dsp plugin fixture: NOT STAGED (host staging did not run); the DSP acceptance test proves nothing in this run'
+} elseif (-not $guestDspPath) {
+    Write-Host 'dsp plugin fixture: staged on the host, but the guest reported no RUSTAMP_TESTPLUGIN_DSP value; the DSP acceptance test cannot prove anything in this run'
+} elseif ($guestDspHash -ne $dspFixtureSha256) {
+    Write-Host ('dsp plugin fixture: guest copy has SHA-256 {0}, not the pinned {1}; the DSP acceptance test proves nothing in this run' -f $guestDspHash, $dspFixtureSha256)
+} else {
+    $dspStaged = $true
+    Write-Host ('dsp plugin fixture: staged and verified (guest RUSTAMP_TESTPLUGIN_DSP={0}, SHA-256 {1})' -f $guestDspPath, $guestDspHash)
+}
 $result.results | ForEach-Object {
     # A hung binary must be impossible to mistake for a pass or for a missing binary.
     if ($_.hung) {
@@ -329,6 +361,7 @@ if ($Filter -like '--ignored*') {
         # Group D — VM i686 plugin test + real approved DLL (2 tests)
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'loads_real_32bit_in_openmpt_dll_and_proves_host_interaction' },
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'approved_real_dll_maps_headlessly_from_verified_snapshot' },
+        [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'real_dsp_plugin_loads_initializes_and_changes_audio_through_the_bridge'; Fixture = 'dsp' },
 
         # Group E — Real audio endpoint (2 tests - left out pending decision)
         [pscustomobject]@{ Group = 'Group E (Real Audio Endpoint)'; Name = 'the_real_device_plays_a_reference_file_to_its_end'; Blocker = 'Real audio endpoint decision (WASAPI default device)' },
@@ -357,6 +390,11 @@ if ($Filter -like '--ignored*') {
         } elseif ($item.Blocker) {
             $blockedCount++
             Write-Host ("  [BLOCKED] {0,-27} {1} ({2})" -f $item.Group, $item.Name, $item.Blocker)
+        } elseif ($item.Fixture -eq 'dsp' -and -not $dspStaged) {
+            # The DSP fixture is missing, wrong or unconfirmed by the guest (see the
+            # dsp plugin fixture line above): the test can only refuse, never pass.
+            $missingFixtureCount++
+            Write-Host ("  [MISSING FIXTURE] {0,-21} {1} (dsp plugin fixture not staged and verified; RUSTAMP_TESTPLUGIN_DSP)" -f $item.Group, $item.Name)
         } elseif ($item.Group -like 'Group D*' -and -not $pluginsStaged) {
             # The host never staged D:\code\rustamp-testplugins, so RUSTAMP_TESTPLUGINS
             # is unset and these tests can only refuse loudly, never pass. Name that

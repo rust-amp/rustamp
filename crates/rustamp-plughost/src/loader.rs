@@ -594,6 +594,96 @@ impl LoadedPlugin {
         }
         self.initialized = false;
     }
+
+    /// Host-visible state of a loaded DSP module, read from the plugin's own
+    /// module struct. `None` for any other plugin kind (and off Windows).
+    ///
+    /// The struct lives in plugin static data, so this stays readable after
+    /// [`quit`](Self::quit) (the mapping is retained); `host_active` then reads
+    /// false because `quit` clears the active slot.
+    pub fn dsp_info(&self) -> Option<DspModuleInfo> {
+        match self.inner {
+            #[cfg(windows)]
+            LoadedPluginInner::Dsp { module } if !module.is_null() => {
+                // SAFETY: the module pointer was verified non-null at load time and
+                // points into plugin static data of the retained mapping.
+                let m = unsafe { *module };
+                Some(DspModuleInfo {
+                    has_config: m.config.is_some(),
+                    has_init: m.init.is_some(),
+                    has_process: m.process.is_some(),
+                    has_quit: m.quit.is_some(),
+                    parent_window: m.parent_window as usize,
+                    dll_instance: m.dll_instance as usize,
+                    // SAFETY: argument-free host callback reading the atomic slot.
+                    host_active: unsafe { host_dsp_is_active() } != 0
+                        && active_dsp_module() == module,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Run interleaved 16-bit PCM through the host's `dsp_process` callback, the
+    /// path a real input plugin's decode loop takes (S09 §3.1 offset 0x88).
+    ///
+    /// `pcm` holds `frames * channels` samples; it is grown to twice that for the
+    /// plugin (S09 §3.5 line 207), processed in place and then truncated to the
+    /// validated output frame count, which is returned. `None` when this is not
+    /// an initialized DSP plugin, `channels` is not positive or `pcm` is not a
+    /// whole number of frames. A crashing or wedged plugin takes this thread
+    /// down with it (no isolation, P6 §4).
+    pub fn dsp_process_i16(
+        &self,
+        pcm: &mut Vec<i16>,
+        channels: usize,
+        sample_rate: u32,
+    ) -> Option<usize> {
+        if !self.initialized || channels == 0 || !pcm.len().is_multiple_of(channels) {
+            return None;
+        }
+        match self.inner {
+            #[cfg(windows)]
+            LoadedPluginInner::Dsp { .. } => {
+                let frames = pcm.len() / channels;
+                pcm.resize(pcm.len() * 2, 0);
+                // SAFETY: the buffer holds twice `frames * channels` samples and the
+                // callback runs the active module synchronously on this thread.
+                let out = unsafe {
+                    host_dsp_process(
+                        pcm.as_mut_ptr() as *mut core::ffi::c_void,
+                        frames as core::ffi::c_int,
+                        16,
+                        channels as core::ffi::c_int,
+                        sample_rate as core::ffi::c_int,
+                    )
+                };
+                let out = usize::try_from(out).unwrap_or(frames);
+                pcm.truncate(out * channels);
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Host-visible state of a loaded DSP module (see [`LoadedPlugin::dsp_info`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DspModuleInfo {
+    /// The plugin supplied a `config` callback (never invoked by the host here).
+    pub has_config: bool,
+    /// The plugin supplied an `init` callback.
+    pub has_init: bool,
+    /// The plugin supplied a `process` callback.
+    pub has_process: bool,
+    /// The plugin supplied a `quit` callback.
+    pub has_quit: bool,
+    /// `parent_window` as filled by the host before `init`.
+    pub parent_window: usize,
+    /// `dll_instance` as filled by the host before `init`.
+    pub dll_instance: usize,
+    /// The host's `dsp_is_active` answers nonzero for exactly this module.
+    pub host_active: bool,
 }
 
 impl Drop for LoadedPlugin {

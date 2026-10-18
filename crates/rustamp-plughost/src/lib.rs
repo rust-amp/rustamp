@@ -26,6 +26,8 @@ pub use commands::{
 };
 pub use host_window::*;
 pub use ipc::*;
-pub use loader::{LoadedPlugin, PluginLoadError, load_plugin, load_plugin_with_store};
+pub use loader::{
+    DspModuleInfo, LoadedPlugin, PluginLoadError, load_plugin, load_plugin_with_store,
+};
 pub use message_loop::*;
 pub use rustamp_plugin_abi::common;
