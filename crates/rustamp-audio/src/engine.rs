@@ -284,6 +284,7 @@ pub struct Engine {
     shuffle_seed: u64,
     shuffle_plan: Vec<usize>,
     prev_shuffle_plan: Option<Vec<usize>>,
+    track_starts: Vec<(u32, u64)>,
 }
 
 /// Ring capacity in samples for `cfg` on a device that granted `device`.
@@ -382,6 +383,7 @@ impl Engine {
             shuffle_seed: 0x9E37_79B9_7F4A_7C15,
             shuffle_plan: Vec::new(),
             prev_shuffle_plan: None,
+            track_starts: Vec::new(),
         })
     }
 
@@ -618,6 +620,21 @@ impl Engine {
         }
     }
 
+    /// Index of the track currently being heard from the output device, or
+    /// `self.current` if not playing.
+    pub fn audible_index(&self) -> Option<u32> {
+        if self.transport == TransportState::Stopped {
+            return self.current;
+        }
+        let pos = self.sync.consumed();
+        for &(idx, start) in self.track_starts.iter().rev() {
+            if pos >= start {
+                return Some(idx);
+            }
+        }
+        self.current
+    }
+
     /// Whether shuffle mode is enabled (spec S15).
     pub fn shuffle(&self) -> bool {
         self.shuffle
@@ -633,7 +650,8 @@ impl Engine {
         if self.shuffle != shuffle {
             self.shuffle = shuffle;
             if self.shuffle && !self.queue.is_empty() {
-                self.replan_shuffle_engine(self.current.map(|i| i as usize));
+                let current = self.audible_index().or(self.current).map(|i| i as usize);
+                self.replan_shuffle_engine(current);
             } else {
                 self.prev_shuffle_plan = None;
             }
@@ -666,6 +684,9 @@ impl Engine {
     pub fn set_repeat(&mut self, repeat: bool) -> Result<()> {
         if self.repeat != repeat {
             self.repeat = repeat;
+            if repeat {
+                self.end_of_stream = None;
+            }
             self.send(DecodeMsg::SetRepeat(self.repeat));
             self.bus.publish(Event::ModesChanged {
                 shuffle: self.shuffle,
@@ -1042,6 +1063,7 @@ impl Engine {
         self.start_drain = None;
         self.start_at = None;
         self.end_of_stream = None;
+        self.track_starts.clear();
         // The run's counters end here. What it left in the ring stays there
         // (only the consumer can drop it) and is reported by
         // `buffered_frames()` until the next run drains it.
@@ -1328,12 +1350,12 @@ impl Engine {
         // decode thread wrote has been consumed by the render callback. Using
         // the device clock here is wrong — it advances for silence frames
         // during underruns, which would trigger a premature finish. Using
-        // `consumed >= written` instead guarantees we wait until the last
-        // real audio frame leaves the ring, not merely until the device clock
+        // `consumed >= end` instead guarantees we wait until the last
+        // real audio frame of the run leaves the ring, not merely until the device clock
         // passes the nominal end time.
         if let Some(end) = self.end_of_stream {
             let (written, consumed) = self.sync.counters();
-            if written >= end && consumed >= written && self.transport == TransportState::Playing {
+            if written >= end && consumed >= end && self.transport == TransportState::Playing {
                 self.finish_run();
             }
         }
@@ -1353,6 +1375,7 @@ impl Engine {
                 timeline_start,
                 seekable,
             } => {
+                self.track_starts.push((index, timeline_start));
                 self.current = Some(index);
                 self.src_spec = Some(src);
                 self.duration_frames = duration_frames;
@@ -1438,6 +1461,9 @@ impl Engine {
             DecodeOut::EndOfStream { timeline_end } => {
                 self.end_of_stream = Some(timeline_end);
             }
+            DecodeOut::EndOfStreamRevoked => {
+                self.end_of_stream = None;
+            }
             DecodeOut::ShufflePlanned { plan, prev_plan } => {
                 // The worker reports only plans it generated itself (a cycle
                 // boundary, or a fallback when the engine handed none);
@@ -1472,6 +1498,7 @@ impl Engine {
         let frozen_end = self.end_of_stream;
         self.end_of_stream = None;
         self.start_drain = None;
+        self.track_starts.clear();
         self.sync.set_active(false);
         let _ = self.output.pause();
         let flushed = self.flush_output();
@@ -1725,6 +1752,8 @@ impl Engine {
         self.timeline_origin = start_at.as_ref().map(|(frames, _)| *frames).unwrap_or(0);
         self.track_start = 0;
         self.end_of_stream = None;
+        self.track_starts.clear();
+        self.track_starts.push((index, 0));
         self.pending_seek = start_at.map(|(_, seq)| PendingSeek { seq });
         self.sync.set_written(0);
         // Reset the consumer-side counter alongside written so the invariant
@@ -1854,6 +1883,7 @@ impl Engine {
         // A thread waiting for a ring drain must not block the join; nothing is
         // consuming the ring at this point anyway.
         self.sync.set_active(false);
+        self.to_decode = None;
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }

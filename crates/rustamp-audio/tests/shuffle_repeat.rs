@@ -401,3 +401,140 @@ fn shuffle_repeat_prev_across_cycle_boundary() {
         "shuffle plan must be restored to cycle 1"
     );
 }
+
+#[test]
+fn regression_late_repeat_enablement_at_queue_end() {
+    let mut h = Harness::new(&[SHORT_A, SHORT_B]);
+    h.engine.set_shuffle(false).unwrap();
+    h.engine.set_repeat(false).unwrap();
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    // Wait until both tracks have buffered into the ring and EOS was published
+    assert!(h.wait_buffered());
+    assert!(h.engine.end_of_stream().is_some());
+
+    let total = track_frames(SHORT_A) + track_frames(SHORT_B);
+    assert_eq!(h.engine.buffered_frames(), total);
+
+    // Audio is still unconsumed in the ring (buffered_frames == total).
+    // Now toggle repeat ON: this MUST revoke EOS and keep the run alive.
+    h.engine.set_repeat(true).unwrap();
+    assert!(h.engine.repeat());
+    assert!(h.engine.end_of_stream().is_none());
+
+    // Pump through the remaining frames of the first cycle
+    h.clock.pump(total);
+    h.engine.poll().unwrap();
+
+    // The defect would have terminated the worker, so the engine would have
+    // stopped playback once the buffer drained.
+    // With the fix, repeat is honoured: transport stays Playing and loops.
+    assert_eq!(
+        h.engine.transport(),
+        TransportState::Playing,
+        "Transport must remain Playing after buffer drain when repeat was re-enabled"
+    );
+
+    // Pump into cycle 2: track 0 must play again
+    assert!(h.wait_pumping(
+        |e| e.transport() == TransportState::Playing && e.current_index() == Some(0),
+        WAIT
+    ));
+}
+
+#[test]
+fn regression_late_repeat_disablement_near_cycle_boundary() {
+    let mut h = Harness::new(&[SHORT_A, SHORT_B]);
+    h.engine.set_shuffle(false).unwrap();
+    h.engine.set_repeat(true).unwrap();
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    // Under repeat, decoder decodes track A, track B, and starts prebuffering Cycle 2 track A.
+    // Pump only track A so track B is currently playing/audible.
+    let len_a = track_frames(SHORT_A);
+    let len_b = track_frames(SHORT_B);
+
+    h.clock.pump(len_a);
+    h.engine.poll().unwrap();
+    assert_eq!(h.engine.audible_index(), Some(1));
+
+    // Now turn repeat OFF while track B of Cycle 1 is still audible
+    h.engine.set_repeat(false).unwrap();
+    assert!(!h.engine.repeat());
+
+    // Pump the rest of Cycle 1 (track B)
+    h.clock.pump(len_b);
+
+    // Playback must stop cleanly at the end of Cycle 1 (S15 §4.3)
+    assert!(h.wait_idle(|e| e.transport() == TransportState::Stopped, WAIT));
+    let events = h.drain_events();
+    assert!(
+        events.contains(&Event::PlaylistEnded),
+        "Turning repeat off before cycle end must stop playback with PlaylistEnded: {events:?}"
+    );
+}
+
+#[test]
+fn regression_shuffle_mid_run_replan_anchoring_to_audible_track() {
+    let mut h = Harness::new(&[SHORT_A, SHORT_B, SHORT_C]);
+    h.engine.set_shuffle(false).unwrap();
+    h.engine.set_repeat(false).unwrap();
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    // Wait until queue is fully pre-buffered (decoder has read past track 0 and 1, reached track 2)
+    assert!(h.wait_buffered());
+
+    // Device has consumed 0 frames, so Track 0 is currently audible
+    assert_eq!(h.engine.audible_index(), Some(0));
+
+    // Enable shuffle mid-run: S15 §4.1 mandates that track K (the audible track 0)
+    // is set as the first entry (pos 0) in the active shuffle plan.
+    h.engine.set_shuffle(true).unwrap();
+    let plan = h.engine.shuffle_plan();
+    assert_eq!(plan.len(), 3);
+    assert_eq!(
+        plan[0], 0,
+        "Shuffle replan must anchor to audible track 0, not decoder prefetched track"
+    );
+}
+
+#[test]
+fn regression_single_track_repeat_toggle_during_drain() {
+    let mut h = Harness::new(&[SHORT_A]);
+    h.engine.set_shuffle(false).unwrap();
+    h.engine.set_repeat(false).unwrap();
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    // Wait until track 0 is fully decoded into the ring
+    assert!(h.wait_buffered());
+    let len = track_frames(SHORT_A);
+    assert_eq!(h.engine.buffered_frames(), len);
+
+    // Toggle repeat ON before ring drains
+    h.engine.set_repeat(true).unwrap();
+    assert!(h.engine.repeat());
+    assert!(h.engine.end_of_stream().is_none());
+
+    // Pump past the end of the first iteration
+    h.clock.pump(len);
+    h.engine.poll().unwrap();
+
+    // Transport must not stop; it must continue playing track 0
+    assert_eq!(
+        h.engine.transport(),
+        TransportState::Playing,
+        "Single-track queue must loop when repeat is turned on during drain"
+    );
+    assert!(h.wait_pumping(
+        |e| e.transport() == TransportState::Playing && e.current_index() == Some(0),
+        WAIT
+    ));
+}

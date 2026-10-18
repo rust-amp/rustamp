@@ -231,6 +231,8 @@ pub(crate) enum DecodeOut {
         /// Absolute timeline position after the last written frame.
         timeline_end: u64,
     },
+    /// A previously reported EndOfStream is revoked (e.g. repeat toggled on).
+    EndOfStreamRevoked,
     /// The worker (re)planned the shuffle permutation on its own — a cycle
     /// boundary, or a fallback when the engine handed no usable plan. The
     /// engine adopts it so its published plan stays the traversed one (S15).
@@ -320,6 +322,7 @@ impl std::fmt::Debug for DecodeOut {
                 .debug_struct("EndOfStream")
                 .field("timeline_end", timeline_end)
                 .finish(),
+            DecodeOut::EndOfStreamRevoked => write!(f, "EndOfStreamRevoked"),
             DecodeOut::ShufflePlanned { plan, prev_plan } => f
                 .debug_struct("ShufflePlanned")
                 .field("len", &plan.len())
@@ -422,6 +425,7 @@ pub(crate) fn spawn(
         drain_epoch: start_epoch,
         report_start: start_epoch.is_some(),
         stage_failed: false,
+        cycle_boundary: None,
     };
     let handle = std::thread::Builder::new()
         .name("rustamp-decode".into())
@@ -532,6 +536,9 @@ struct Worker {
     /// A DSP stage failure was already reported this run (RFC 0014 §4.2,
     /// first failure sticks): the worker is one run, so the flag is per run.
     stage_failed: bool,
+    /// Timeline position of a repeat cycle loop seam, if a new cycle was
+    /// prebuffered while repeat was ON.
+    cycle_boundary: Option<u64>,
 }
 
 impl Worker {
@@ -611,6 +618,7 @@ impl Worker {
                         if (next as usize) < self.cfg.queue.len() {
                             Some(next)
                         } else if self.repeat && !self.cfg.queue.is_empty() {
+                            self.cycle_boundary = Some(self.timeline);
                             Some(0)
                         } else {
                             None
@@ -623,6 +631,7 @@ impl Worker {
                             self.shuffle_pos += 1;
                             Some(self.shuffle_plan[self.shuffle_pos] as u32)
                         } else if self.repeat && !self.cfg.queue.is_empty() {
+                            self.cycle_boundary = Some(self.timeline);
                             let last = self.shuffle_plan.last().copied();
                             self.replan_shuffle_new_cycle(last);
                             Some(self.shuffle_plan[0] as u32)
@@ -698,14 +707,25 @@ impl Worker {
                 Outcome::Stop | Outcome::Quit => None,
             };
 
-            let Some(next_idx) = next_target else {
-                if matches!(outcome, Outcome::Ended | Outcome::SkipNext) {
-                    self.flush_converter();
-                    let _ = self.tx.send(DecodeOut::EndOfStream {
-                        timeline_end: self.timeline,
-                    });
+            let next_idx = match next_target {
+                Some(idx) => idx,
+                None => {
+                    if matches!(outcome, Outcome::Ended | Outcome::SkipNext) {
+                        self.flush_converter();
+                        let _ = self.tx.send(DecodeOut::EndOfStream {
+                            timeline_end: self.timeline,
+                        });
+                        match self.wait_at_eos() {
+                            Some(idx) => {
+                                carry = false;
+                                idx
+                            }
+                            None => break,
+                        }
+                    } else {
+                        break;
+                    }
                 }
-                break;
             };
             index = next_idx;
         }
@@ -877,6 +897,12 @@ impl Worker {
             }
             if self.stopped {
                 return Outcome::Stop;
+            }
+            if let Some(boundary) = self.cycle_boundary {
+                let (_written, consumed) = self.cfg.sync.counters();
+                if consumed >= boundary {
+                    self.cycle_boundary = None;
+                }
             }
             if self.check_control() {
                 return self.pending_skip.take().unwrap_or(Outcome::Stop);
@@ -1151,6 +1177,18 @@ impl Worker {
                 }
                 Ok(DecodeMsg::SetRepeat(on)) => {
                     self.repeat = on;
+                    if !on && let Some(boundary) = self.cycle_boundary {
+                        let (_written, consumed) = self.cfg.sync.counters();
+                        if consumed < boundary {
+                            self.cycle_boundary = None;
+                            self.flush_converter();
+                            let _ = self.tx.send(DecodeOut::EndOfStream {
+                                timeline_end: boundary,
+                            });
+                            self.pending_skip = Some(Outcome::Stop);
+                            return true;
+                        }
+                    }
                 }
                 Ok(DecodeMsg::Seek {
                     to,
@@ -1161,6 +1199,140 @@ impl Worker {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.quitting = true;
                     return true;
+                }
+            }
+        }
+    }
+
+    /// Wait at end-of-stream until repeat is enabled, navigation is requested,
+    /// or playback is stopped/terminated.
+    fn wait_at_eos(&mut self) -> Option<u32> {
+        loop {
+            if self.quitting || self.stopped {
+                return None;
+            }
+            match self.rx.recv() {
+                Ok(DecodeMsg::Quit) => {
+                    self.quitting = true;
+                    return None;
+                }
+                Ok(DecodeMsg::Stop) => {
+                    self.stopped = true;
+                    return None;
+                }
+                Ok(DecodeMsg::Pause) => {
+                    self.paused = true;
+                }
+                Ok(DecodeMsg::Resume) => {
+                    self.paused = false;
+                }
+                Ok(DecodeMsg::SetRepeat(on)) => {
+                    self.repeat = on;
+                    if on && !self.cfg.queue.is_empty() {
+                        let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
+                        if !self.shuffle {
+                            self.cycle_boundary = Some(self.timeline);
+                            return Some(0);
+                        } else {
+                            if self.shuffle_plan.is_empty() {
+                                self.init_shuffle_plan(0);
+                            }
+                            let last = self.shuffle_plan.last().copied();
+                            self.replan_shuffle_new_cycle(last);
+                            self.cycle_boundary = Some(self.timeline);
+                            return Some(self.shuffle_plan[0] as u32);
+                        }
+                    }
+                }
+                Ok(DecodeMsg::SetShuffle {
+                    on,
+                    plan,
+                    prev_plan,
+                }) => {
+                    if self.shuffle != on {
+                        self.shuffle = on;
+                        if on && !self.cfg.queue.is_empty() {
+                            if plan.len() == self.cfg.queue.len() {
+                                self.shuffle_plan = plan;
+                                self.prev_shuffle_plan = prev_plan;
+                                self.shuffle_pos = 0;
+                            } else {
+                                self.init_shuffle_plan(0);
+                            }
+                        } else {
+                            self.shuffle_plan.clear();
+                            self.prev_shuffle_plan = None;
+                            self.shuffle_pos = 0;
+                        }
+                    }
+                }
+                Ok(DecodeMsg::Next) => {
+                    if self.repeat && !self.cfg.queue.is_empty() {
+                        let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
+                        if !self.shuffle {
+                            self.cycle_boundary = Some(self.timeline);
+                            return Some(0);
+                        } else {
+                            let last = self.shuffle_plan.last().copied();
+                            self.replan_shuffle_new_cycle(last);
+                            self.cycle_boundary = Some(self.timeline);
+                            return Some(self.shuffle_plan[0] as u32);
+                        }
+                    }
+                }
+                Ok(DecodeMsg::Prev) => {
+                    if !self.cfg.queue.is_empty() {
+                        let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
+                        if !self.shuffle {
+                            if self.repeat {
+                                return Some((self.cfg.queue.len() - 1) as u32);
+                            } else {
+                                return Some(0);
+                            }
+                        } else {
+                            if self.shuffle_plan.is_empty() {
+                                self.init_shuffle_plan(0);
+                            }
+                            if self.repeat
+                                && self.cfg.queue.len() > 1
+                                && let Some(prev) = self.prev_shuffle_plan.take()
+                            {
+                                self.shuffle_plan = prev;
+                                self.shuffle_pos = self.shuffle_plan.len() - 1;
+                                let _ = self.tx.send(DecodeOut::ShufflePlanned {
+                                    plan: self.shuffle_plan.clone(),
+                                    prev_plan: None,
+                                });
+                                return Some(self.shuffle_plan[self.shuffle_pos] as u32);
+                            }
+                            return Some(self.shuffle_plan[0] as u32);
+                        }
+                    }
+                }
+                Ok(DecodeMsg::SkipBy(delta)) => {
+                    if delta != 0 && !self.cfg.queue.is_empty() && self.repeat {
+                        let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
+                        if !self.shuffle {
+                            let qlen = self.cfg.queue.len() as i32;
+                            let rem = delta.rem_euclid(qlen);
+                            return Some(rem as u32);
+                        } else {
+                            if self.shuffle_plan.is_empty() {
+                                self.init_shuffle_plan(0);
+                            }
+                            let plen = self.shuffle_plan.len() as i32;
+                            let rem = delta.rem_euclid(plen) as usize;
+                            self.shuffle_pos = rem;
+                            return Some(self.shuffle_plan[self.shuffle_pos] as u32);
+                        }
+                    }
+                }
+                Ok(DecodeMsg::SetStopAfterCurrent(armed)) => {
+                    self.stop_after_current = armed;
+                }
+                Ok(DecodeMsg::Seek { .. }) => {}
+                Err(_) => {
+                    return None;
                 }
             }
         }
