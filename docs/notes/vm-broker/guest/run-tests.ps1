@@ -35,6 +35,17 @@ if (-not $exes) { throw "no test binaries in $deps" }
 
 $filter = $Filter
 $extra = @('--test-threads=1')
+# A `--bless` prefix asks the golden tests to rewrite their reference images
+# instead of comparing against them: rustamp-testkit's assert_golden reads
+# RUSTAMP_BLESS and writes when it is exactly `1`. Like `--ignored`, the token is
+# stripped from the binary-name filter, so `--bless:golden` blesses and runs only
+# the golden binaries. Without the token nothing here changes.
+$bless = $false
+if ($filter -like '--bless*') {
+    $bless = $true
+    $filter = ($filter -replace '^--bless:?', '')
+    $env:RUSTAMP_BLESS = '1'
+}
 # An `--ignored` prefix asks the binaries to run their ignored tests as well.
 # Those are exactly the tests that open a window or spawn a process: they are
 # ignored by default because the host must stay windowless, and they may only
@@ -361,6 +372,24 @@ foreach ($exe in $exes) {
         diagnostic     = $diagnostic
         hung           = $false
         timeoutSeconds = $TestTimeoutSeconds
+    }
+}
+
+# Only with --bless: stage the two re-blessed images under C:\rustamp\out\bless,
+# the one tree the broker's copyout op may read. Keeping the skin sub-folder means
+# the two files with the same name cannot overwrite each other. Files that were
+# not written are simply absent; the host checks for them.
+if ($bless) {
+    $blessOut = 'C:\rustamp\out\bless'
+    if (Test-Path $blessOut) { Remove-Item -Recurse -Force $blessOut }
+    New-Item -ItemType Directory -Force -Path $blessOut | Out-Null
+    foreach ($skin in 'lookalike', 'rust-theme') {
+        $src = Join-Path $repo "tests\golden\$skin\vis_stopped_tail.png"
+        if (Test-Path $src) {
+            $dstDir = Join-Path $blessOut $skin
+            New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+            Copy-Item -LiteralPath $src -Destination $dstDir -Force
+        }
     }
 }
 

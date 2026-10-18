@@ -22,7 +22,9 @@ param(
     [string]$Baseline = 'base-provisioned',
     [string]$RepoRoot = 'D:\code\Rustamp',
     [string]$Stage = 'D:\code\rustamp-vm\staging\code\Rustamp',
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Where the re-blessed golden images land on the host (only with --bless).
+    [string]$BlessOut = 'D:\code\rustamp-vm\staging\out\bless-golden'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -331,6 +333,28 @@ $result.results | ForEach-Object {
     }
 }
 
+# --- 5b. bless: bring the re-blessed golden images back (only with --bless) ---
+# The guest staged them under C:\rustamp\out\bless (see run-tests.ps1). copyout
+# nests the source folder inside the destination, so the files land at
+# $BlessOut\bless\<skin>\vis_stopped_tail.png. Not run without the token: the
+# default path is unchanged.
+$blessMissing = 0
+if ($Filter -like '--bless*') {
+    Step "copying the re-blessed golden images back to $BlessOut"
+    if (Test-Path $BlessOut) { Remove-Item -Recurse -Force $BlessOut }
+    $null = New-Item -ItemType Directory -Force -Path $BlessOut
+    & $broker -Op copyout -Source 'C:\rustamp\out\bless' -Dest $BlessOut -TimeoutSeconds 600 | Out-Null
+    foreach ($skin in 'lookalike', 'rust-theme') {
+        $p = Join-Path $BlessOut "bless\$skin\vis_stopped_tail.png"
+        if (Test-Path $p) {
+            Write-Host ("blessed: {0}  SHA-256 {1}" -f $p, (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash)
+        } else {
+            $blessMissing++
+            Write-Host ("  BLESS MISSING: {0} did not come back (the guest did not write it)" -f $p)
+        }
+    }
+}
+
 # --- 6. ignored tests summary (W12 inventory) -------------------------------
 if ($Filter -like '--ignored*') {
     Write-Host ''
@@ -410,7 +434,7 @@ if ($Filter -like '--ignored*') {
 
 # A stall must never be reported as a green run: the hung count is a second,
 # independent gate on the exit code, so a counting drift cannot hide a hang.
-if ($result.failed -ne 0 -or $hungCount -ne 0) { exit 1 }
+if ($result.failed -ne 0 -or $hungCount -ne 0 -or $blessMissing -ne 0) { exit 1 }
 
 # A run that executed no binary at all proves nothing, so it must never exit
 # zero. Without this gate a filter that matches nothing - or a staging that lost
