@@ -321,6 +321,32 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The flush defect and the three interactive reds (2026-10-18 18:40)
+
+Both merged (`88d17c0`), both with green gates.
+
+**The flush defect is more than a test problem.** The chain: end of stream,
+`finish_run`, `flush_output`, and `CpalOutput::flush` returning `Unsupported`
+because the backend cannot flush an endpoint buffer. Under the A13 policy
+`flush_output` treated **every** error, including that one, as fatal: it paused
+the output, closed the device and latched a failure. And `stop()` and
+`seek_frames()` call `flush_output` too, so **any stop or seek on such an
+endpoint destroyed the output for good**. The sibling playback test passed only
+because it never looked at the engine's last error. That is a product defect, not
+a strict test, and it is why the cable test mattered.
+
+**All three interactive reds were test bugs**, each decided on its own evidence
+and none written off as session 0: the about-dialog test held the version string
+hardcoded where the dialog builds it from the crate version, so it now asserts
+the same way and cannot go stale again; and the two plugin-host tests asserted
+things the headless or older path could not provide. No claim was weakened and no
+sleep was introduced.
+
+**One gap named rather than left:** the reset restores a baseline taken before
+the virtual cable was installed, so a reset run has no cable afterwards and the
+audio group cannot run in the same pass. The clean fix is to put the cable into
+the baseline with the broker's checkpoint operation, so every future run has it.
+
 ## The interactive run: 8 GUI tests freed, and three reds named (2026-10-18 18:10)
 
 The owner rule earned itself in its first use. With a desktop:
