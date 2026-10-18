@@ -321,6 +321,38 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The VM block: both green, and the cable reveals the next real defect (2026-10-18 22:00)
+
+**The suite and the ignored pass are both fully green in the interactive session,
+for the first time.**
+
+- Suite, interactive, with a reset: **ran 84, failed 0, hung 0**, exit 0.
+- Ignored pass, interactive: **ran 82, failed 0, hung 0**, exit 0 - 18 ran, 2
+  blocked, 0 missing fixtures, 20 in the inventory. The two blocked ones are
+  exactly the two real-audio-endpoint tests, which need the cable.
+- The 84 rather than 83 is the new command-line test a lane pinned today.
+
+**The cable went into the guest and the audio path moved forward twice over.**
+
+- `real_playback` **passes**: the real device plays a reference file to its end.
+- `loopback` **still fails, but later and for a different reason**, and the
+  difference is the evidence that two real defects were fixed: the old message
+  was "output flush failed, unsupported operation, cpal endpoint-buffer flush"
+  and it is **gone**, so the engine no longer treats a flush the backend cannot
+  do as fatal and the application now recreates the engine and the output after
+  such a refusal. The device is found and the capture stream opens. What fails
+  now is the **capture**: "the capture stream on CABLE Output failed: A buffer
+  underrun or overrun occurred", at `loopback.rs:596`.
+
+That is a new, real finding and it is with a lane. The test must keep measuring
+the tone; a policy that tolerates a stream error must not become a policy that
+accepts silence.
+
+**A note on the trap I set myself:** `-Reset` restores a baseline taken before
+the cable was installed, so every reset run has no cable. The audio tests were
+therefore run without a reset, and putting the cable into the baseline is the
+clean fix.
+
 ## A lane died of a provider outage, and the VM block owns the host (2026-10-18 21:40)
 
 The BETA-07 lane on the free provider failed with "Service temporarily
