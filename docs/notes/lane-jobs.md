@@ -321,6 +321,39 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The release wave: six lanes merged, and the host work is proven (2026-10-18 21:20)
+
+Merged since the owner released everything: `e585505` (the command-line half of
+playlist loading, pinned, after proving the readiness line was stale),
+`f6856ce` (shuffle and repeat are applied, refuting the readiness line, with the
+one remaining lie named), `964d2d1` (the wake proved across the process boundary
+on the ring that actually ships), `f52eb4b` (the device-error hook is largely
+already implemented, with the three gaps named), `9b7ef7c` (the plugin DLL
+acceptance taken forward, after writing down what was already done), `427c3de`
+(projectM vendored with recorded provenance and the wrapper written against it).
+
+**The two most valuable findings of the wave were refutations.** The wake harness
+that already existed proves the wake across an edge in every one of its five
+phases, and that is forced by how a consumer and a producer block - so it cannot
+reach the failure class that caused the thirty-second stall and would have kept
+passing while the product stalled. And three separate readiness lines turned out
+to describe behaviour that had been fixed hours or days after the snapshot they
+were written from, which is why every lane in this wave was told to verify its
+gap before fixing it.
+
+**projectM is in the tree, and the clean-room question was checked before it
+went in.** The vendored release contains no Winamp material at all - no front
+end, no SDK header, nothing whose name mentions it - and the library is loaded
+dynamically rather than linked, so the permissive crate stays permissive, the
+library stays a separate component with its own terms, and the relinking the
+licence requires is possible. The provenance records the release and asset
+identifiers, the size and the digest, and says plainly that the digest agreement
+checks the bytes against the release metadata while no detached signature was
+verified and nothing was built or run. The exact narrow packaging patch is in the
+card, because the packaging tool was held by another lane.
+
+**The release licence audit must be re-run**: this changes its inventory.
+
 ## The owner released everything, and the three open questions are closed (2026-10-18 20:45)
 
 "Alles freigegeben." Recorded here because an approval that is not written down
