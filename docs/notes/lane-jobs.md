@@ -321,6 +321,29 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The owner released everything, and the three open questions are closed (2026-10-18 20:45)
+
+"Alles freigegeben." Recorded here because an approval that is not written down
+is the thing that produced today's two wrong queue entries:
+
+- **RFC 0012, the device-error hook: accepted.** The RFC's status line now reads
+  Accepted rather than Proposed, and the contract change may be implemented. It
+  had been listed in the queue as approved while its own text said Proposed; the
+  approval is now real and dated instead of inferred.
+- **P3, the plugin DLL acceptance: approved.** Its card's "not permission to run
+  anything" line was correct when written and is now superseded by the owner.
+- **projectM: implementation and bundling approved**, including the five
+  decisions the review lane left open - the front end and build architecture, the
+  package layout, the native dependencies and assets, the route by which the
+  library source is delivered, and the authorisation to implement. The plan the
+  review wrote stands: the library belongs in the player package under its own
+  plugin directory, never in the permissive host package or its closure, with a
+  visualisation wrapper written here because upstream has not maintained its
+  Winamp front end since 2012, and with the licence notices, the third-party
+  inventory and the full LGPL text added.
+
+The release tag `0.1.0` was already released earlier today and stands.
+
 ## The packaging path is proven end to end on the host (2026-10-18 20:25)
 
 A dry run from `6922e0a` into a clearly named practice directory, so that it could

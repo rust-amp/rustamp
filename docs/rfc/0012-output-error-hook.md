@@ -1,6 +1,6 @@
 # RFC 0012: Output Device Mid-Run Error Hook
 
-Status: **Proposed**
+Status: **Accepted** (owner approval, 2026-10-18; Proposed until then)
 Owner: Lane I (contracts / architecture) & Lane H (output robustness).
 Depends on: RFC 0001 (core contracts), RFC 0002 (audio contracts), RFC 0004 (licensing and permissive wire crates).
 

@@ -25,20 +25,17 @@ model class it wants.
 ## Released by the owner (2026-10-17) — ready to start
 
 - **RFC 0012, the device-error hook** (`docs/tasks/H4-output-error-rfc.md`,
-  `docs/rfc/0012-output-error-hook.md`) - **do not start: it is not approved.**
-  This line said the contract change was approved; the RFC says `Status:
-  Proposed`, the H4 card says "design only - no implementation or behavior
-  change", and the section below correctly says it waits for the owner's
-  acceptance. The other section is right and this one was wrong. The audio crate
-  is free now, but that is not the blocker: the owner's acceptance is. Treat it
-  as a question for the owner.
-- **The plugin DLL acceptance** (`docs/tasks/P3-dll-acceptance.md`) - **do not
-  start: the card contradicts this line.** It appears here and again under
-  "Needs a decision first", and the card itself is explicit that it "is not
-  permission to run anything". Since then the loader was built and Group D runs
-  against `in_openmpt` in the VM, so the execution this line describes has
-  effectively happened; what remains is the owner's call on the card's own open
-  points. Treat this entry as a question for the owner, not a task.
+  `docs/rfc/0012-output-error-hook.md`) - **accepted by the owner, 2026-10-18.**
+  The RFC's status line now reads Accepted; the contract change is released and
+  may be implemented. Owns `rustamp-core`, `rustamp-output` and the engine's poll
+  step in `rustamp-audio`, so it waits only for the audio crate to be free. Read
+  the RFC for what it settles - do not implement more than it accepts.
+- **The plugin DLL acceptance** (`docs/tasks/P3-dll-acceptance.md`) - **approved
+  by the owner, 2026-10-18.** The card's own "not permission to run anything"
+  line was true when it was written and is now superseded: the owner has released
+  the acceptance work. Owns `rustamp-plughost`, `rustamp-plugin-abi` and the
+  VM-only acceptance path. The loader and the Group D tests already exist, so read
+  the card for what is still open rather than rebuilding them.
 - **The S08 measurement runs** (`docs/tasks/S08-vis.md`). The probe and the
   three jobs are designed; the orchestrator runs them in the VM and the lane
   fills the spec from the artefacts.
