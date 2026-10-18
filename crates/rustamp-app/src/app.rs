@@ -121,6 +121,15 @@ pub struct App {
     /// the main window, so an unavailable tray can never strand the player.
     main_visible: bool,
     minimize_requested: bool,
+    /// Which player window holds keyboard focus: the headless model of the OS
+    /// activation (see [`crate::focus`]); the presenter applies it.
+    focused_window: WindowId,
+    /// Pending "focus this OS window" for the presenter.
+    focus_request: Option<WindowId>,
+    /// Pending "un-minimize the main OS window" for the presenter: the half
+    /// of `ShowMainWindow` that `main_visible` alone cannot express, since a
+    /// minimized window is still visible.
+    restore_request: bool,
     playlist_ended: bool,
     /// Stable ids the app assigns to the engine's queue entries.
     ///
@@ -271,6 +280,9 @@ impl App {
             quit: false,
             main_visible: true,
             minimize_requested: false,
+            focused_window: WindowId::Main,
+            focus_request: None,
+            restore_request: false,
             playlist_ended: false,
             entry_ids: Vec::new(),
             next_entry_id: 0,
@@ -591,6 +603,36 @@ impl App {
         std::mem::take(&mut self.minimize_requested)
     }
 
+    /// Whether `window` exists and can take focus right now.
+    ///
+    /// The main window counts while it is shown ([`App::main_visible`]); the
+    /// equalizer and the playlist editor count while their open flags say so.
+    /// A closed or hidden window cannot take focus, and windows the app does
+    /// not have (`Vis`, `Gen`, `Video`) report closed.
+    pub fn window_open(&self, window: WindowId) -> bool {
+        match window {
+            WindowId::Main => self.main_visible,
+            WindowId::Equalizer => self.eq_open(),
+            WindowId::Playlist => self.playlist_open(),
+            WindowId::Vis | WindowId::Gen(_) | WindowId::Video => false,
+        }
+    }
+
+    /// Which player window holds keyboard focus (see [`crate::focus`]).
+    pub fn focused_window(&self) -> WindowId {
+        self.focused_window
+    }
+
+    /// Takes the pending "focus this OS window" request, if any.
+    pub fn take_focus_request(&mut self) -> Option<WindowId> {
+        self.focus_request.take()
+    }
+
+    /// Takes the pending "un-minimize the main OS window" request, if any.
+    pub fn take_restore_request(&mut self) -> bool {
+        std::mem::take(&mut self.restore_request)
+    }
+
     /// Drains the accumulated notes (unimplemented commands, fallbacks).
     pub fn drain_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
@@ -774,6 +816,46 @@ impl App {
         // `eq_frame_size`; shading the main never resizes it, S05 §3.2).
         if matches!(command, Command::ToggleDoubleSize) {
             self.eq.set_double_size(self.ui.state().double_size);
+        }
+        // A toggle may have closed the focused window underneath the focus.
+        self.maintain_focus();
+    }
+
+    /// Moves focus to the next open player window (`FocusNextWindow`, S03 id
+    /// 40063) in [`crate::focus::FOCUS_ORDER`], skipping closed windows. Sizes
+    /// are untouched: focusing never resizes.
+    fn focus_next_window(&mut self) {
+        let next = crate::focus::next_focus(self.focused_window, |window| self.window_open(window));
+        // With the main window hidden and nothing else open the cycle has no
+        // window to give the focus to; a hidden window cannot take it.
+        if self.window_open(next) {
+            self.focused_window = next;
+            self.focus_request = Some(next);
+        }
+    }
+
+    /// Shows the main window (`ShowMainWindow`, S03 id 40258): show,
+    /// un-minimize, raise and focus it. One-way by contract: unlike
+    /// `ToggleWindow(Main)` it never hides. A minimize that has not reached
+    /// the OS yet is dropped, since there is nothing to restore from then.
+    fn show_main_window(&mut self) {
+        self.main_visible = true;
+        self.minimize_requested = false;
+        self.restore_request = true;
+        self.focused_window = WindowId::Main;
+        self.focus_request = Some(WindowId::Main);
+    }
+
+    /// Repairs the focus after a window closed: a focused window that is no
+    /// longer open falls back to the main window, with a request so the
+    /// presenter follows. A hidden main window is not repaired (it is the
+    /// fallback, and a hidden window cannot take focus).
+    fn maintain_focus(&mut self) {
+        if self.focused_window != WindowId::Main && !self.window_open(self.focused_window) {
+            self.focused_window = WindowId::Main;
+            if self.main_visible {
+                self.focus_request = Some(WindowId::Main);
+            }
         }
     }
 
@@ -1355,7 +1437,15 @@ impl App {
             }
             C::ToggleAlwaysOnTop => self.always_on_top = !self.always_on_top,
             C::ToggleEasyMove => self.easy_move = !self.easy_move,
-            C::Minimize => self.minimize_requested = true,
+            C::Minimize => {
+                // The later of Minimize and ShowMainWindow wins: a restore
+                // that has not reached the OS yet is dropped.
+                self.minimize_requested = true;
+                self.restore_request = false;
+                if self.focus_request == Some(WindowId::Main) {
+                    self.focus_request = None;
+                }
+            }
             // Closing the focused window quits when that window is the main one
             // (RFC 0005 owner decision O3); it is the only window today.
             // An open dialog closes first instead of quitting the player.
@@ -1370,7 +1460,7 @@ impl App {
                 // presenter reads the new size from `frame_size`.
             }
             C::ToggleWindow(WindowId::Main) => self.main_visible = !self.main_visible,
-            C::ShowMainWindow => self.main_visible = true,
+            C::ShowMainWindow => self.show_main_window(),
             C::ToggleWindow(WindowId::Equalizer) => {
                 self.note(
                     "Equalizer window toggled (the render state drives the OS window); \
@@ -1436,9 +1526,7 @@ impl App {
             // The main-menu popup (S04): the app owns the open state, the
             // presenter hosts the OS window for it.
             C::OpenMainMenu => self.open_main_menu(),
-            C::FocusNextWindow => {
-                self.note(format!("{command:?} is not implemented yet"));
-            }
+            C::FocusNextWindow => self.focus_next_window(),
             C::ConfigureVisPlugin | C::ToggleVisPlugin => {
                 self.note(format!("{command:?} needs the plugin host (M3)"));
             }
@@ -2516,6 +2604,164 @@ mod tests {
         let notes = app.drain_notes();
         assert!(notes.iter().any(|n| n.contains("Equalizer")), "{notes:?}");
         assert!(!app.quit(), "toggling the EQ window must not quit the app");
+    }
+
+    // ----- window focus (`FocusNextWindow`, `ShowMainWindow`) -----
+
+    /// Opens or closes the equalizer and the playlist editor to the wanted
+    /// state (the playlist starts open, the equalizer closed), then clears the
+    /// requests and notes the toggles left behind.
+    fn set_open(app: &mut App, eq: bool, playlist: bool) {
+        if app.eq_open() != eq {
+            app.submit(Command::ToggleWindow(WindowId::Equalizer))
+                .unwrap();
+        }
+        if app.playlist_open() != playlist {
+            app.submit(Command::ToggleWindow(WindowId::Playlist))
+                .unwrap();
+        }
+        app.take_focus_request();
+        app.drain_notes();
+    }
+
+    /// Submits `FocusNextWindow` and returns the window the model now focuses,
+    /// asserting that the pending request names the same window.
+    fn focus_next(app: &mut App) -> WindowId {
+        app.submit(Command::FocusNextWindow).unwrap();
+        let focused = app.focused_window();
+        assert_eq!(app.take_focus_request(), Some(focused));
+        focused
+    }
+
+    #[test]
+    fn focus_next_window_visits_the_open_windows_in_the_stated_order_and_wraps() {
+        // The order is an own choice (see `focus.rs`), not a measurement.
+        let (mut app, _dir) = app_with_file(None);
+        set_open(&mut app, true, true);
+        assert_eq!(app.focused_window(), WindowId::Main);
+        let visited: Vec<_> = (0..6).map(|_| focus_next(&mut app)).collect();
+        assert_eq!(
+            visited,
+            [
+                WindowId::Equalizer,
+                WindowId::Playlist,
+                WindowId::Main,
+                WindowId::Equalizer,
+                WindowId::Playlist,
+                WindowId::Main,
+            ]
+        );
+        assert!(app.drain_notes().is_empty(), "the command is implemented");
+    }
+
+    #[test]
+    fn focus_next_window_skips_a_closed_window() {
+        let (mut app, _dir) = app_with_file(None);
+        set_open(&mut app, false, true);
+        assert_eq!(focus_next(&mut app), WindowId::Playlist);
+        assert_eq!(focus_next(&mut app), WindowId::Main);
+        set_open(&mut app, true, false);
+        assert_eq!(focus_next(&mut app), WindowId::Equalizer);
+        assert_eq!(focus_next(&mut app), WindowId::Main);
+        // Only the main window left: the focus stays on it.
+        set_open(&mut app, false, false);
+        assert_eq!(focus_next(&mut app), WindowId::Main);
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn focus_requests_are_consumed_once() {
+        let (mut app, _dir) = app_with_file(None);
+        set_open(&mut app, true, true);
+        app.submit(Command::FocusNextWindow).unwrap();
+        assert_eq!(app.take_focus_request(), Some(WindowId::Equalizer));
+        assert_eq!(app.take_focus_request(), None, "taken, not repeated");
+        // The model keeps the focus after the request is gone.
+        assert_eq!(app.focused_window(), WindowId::Equalizer);
+        // An unrelated command neither re-raises the request nor moves focus.
+        app.submit(Command::ToggleShuffle).unwrap();
+        assert_eq!(app.take_focus_request(), None);
+        assert_eq!(app.focused_window(), WindowId::Equalizer);
+    }
+
+    #[test]
+    fn closing_the_focused_window_falls_back_to_main() {
+        let (mut app, _dir) = app_with_file(None);
+        set_open(&mut app, true, true);
+        assert_eq!(focus_next(&mut app), WindowId::Equalizer);
+        app.submit(Command::ToggleWindow(WindowId::Equalizer))
+            .unwrap();
+        assert_eq!(app.focused_window(), WindowId::Main);
+        assert_eq!(app.take_focus_request(), Some(WindowId::Main));
+        // Closing a window that does not hold the focus asks for nothing.
+        app.submit(Command::ToggleWindow(WindowId::Playlist))
+            .unwrap();
+        assert_eq!(app.focused_window(), WindowId::Main);
+        assert_eq!(app.take_focus_request(), None);
+    }
+
+    #[test]
+    fn a_hidden_main_window_is_not_focusable() {
+        let (mut app, _dir) = app_with_file(None);
+        set_open(&mut app, false, false);
+        app.submit(Command::ToggleWindow(WindowId::Main)).unwrap();
+        assert!(!app.window_open(WindowId::Main));
+        app.submit(Command::FocusNextWindow).unwrap();
+        assert_eq!(app.take_focus_request(), None, "nothing can take focus");
+        // Unlike the toggle, the explicit show brings it back.
+        app.submit(Command::ShowMainWindow).unwrap();
+        assert!(app.window_open(WindowId::Main));
+        assert_eq!(app.take_focus_request(), Some(WindowId::Main));
+    }
+
+    #[test]
+    fn show_main_window_shows_restores_and_focuses_once() {
+        let (mut app, _dir) = app_with_file(None);
+        set_open(&mut app, true, true);
+        focus_next(&mut app);
+        app.submit(Command::ToggleWindow(WindowId::Main)).unwrap();
+        assert!(!app.main_visible());
+
+        app.submit(Command::ShowMainWindow).unwrap();
+        assert!(app.main_visible());
+        assert_eq!(app.focused_window(), WindowId::Main);
+        assert_eq!(app.take_focus_request(), Some(WindowId::Main));
+        assert!(app.take_restore_request());
+        assert!(!app.take_restore_request(), "taken, not repeated");
+        // One-way: a second show keeps the window shown.
+        app.submit(Command::ShowMainWindow).unwrap();
+        assert!(app.main_visible());
+        assert!(app.drain_notes().is_empty(), "the command is implemented");
+    }
+
+    #[test]
+    fn the_later_of_minimize_and_show_main_window_wins() {
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::Minimize).unwrap();
+        app.submit(Command::ShowMainWindow).unwrap();
+        assert!(!app.take_minimize_request(), "the show beat the minimize");
+        assert!(app.take_restore_request());
+
+        app.take_focus_request();
+        app.submit(Command::ShowMainWindow).unwrap();
+        app.submit(Command::Minimize).unwrap();
+        assert!(app.take_minimize_request(), "the minimize beat the show");
+        assert!(!app.take_restore_request());
+        assert_eq!(app.take_focus_request(), None, "no focus into a minimize");
+    }
+
+    #[test]
+    fn focus_commands_keep_the_main_window_geometry() {
+        // Focusing never resizes: a shaded, double-sized window keeps its size.
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::ToggleWindowShade(WindowId::Main))
+            .unwrap();
+        app.submit(Command::ToggleDoubleSize).unwrap();
+        let (main_size, eq_size) = (app.frame_size(), app.eq_frame_size());
+        app.submit(Command::FocusNextWindow).unwrap();
+        app.submit(Command::ShowMainWindow).unwrap();
+        assert_eq!(app.frame_size(), main_size);
+        assert_eq!(app.eq_frame_size(), eq_size);
     }
 
     // ----- the simple modal dialogs (About, file info, jump-to) -----

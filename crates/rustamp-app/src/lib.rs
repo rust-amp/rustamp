@@ -16,6 +16,9 @@
 //! * [`dialogs`] - the simple modal dialogs (About, file info, jump-to) on
 //!   top of [`rustamp_ui::DialogManager`]: opening, closing, jump input and
 //!   the body lines. Headless; the OS window lives in [`window`].
+//! * [`focus`] — the window-focus order for `FocusNextWindow` (own choice over
+//!   [`rustamp_core::state::WindowId`], not a measurement). Pure; the model
+//!   lives in [`app::App`], the OS half in [`window`].
 //! * [`host`] — the app side of the player-state bridge to `rustamp-plughost32`:
 //!   assembling [`rustamp_core::state::PlayerState`] snapshots and publishing
 //!   them as [`rustamp_ipc::Message::PlayerStateUpdate`] over the existing
@@ -50,6 +53,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod dialogs;
+pub mod focus;
 pub mod host;
 pub mod menu;
 pub mod playlist_window;

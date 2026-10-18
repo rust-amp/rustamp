@@ -393,6 +393,30 @@ impl Windowed {
         }
     }
 
+    /// Applies the window-management requests (`ShowMainWindow`, S03 id
+    /// 40258; `FocusNextWindow`, S03 id 40063): un-minimize first, then move
+    /// keyboard focus. Both requests are taken every call, so none outlives
+    /// the frame it was made in. A focus request naming a window with no OS
+    /// window (a closed equalizer, a windowless id) is dropped: a closed
+    /// window cannot take focus, and the headless model already skipped it.
+    /// Focusing never resizes, so shade and double-size geometry is untouched.
+    fn apply_focus_requests(&mut self) {
+        let restore = self.app.take_restore_request();
+        let target = self.app.take_focus_request();
+        if restore && let Some(window) = &self.window {
+            window.set_minimized(false);
+        }
+        let window = match target {
+            Some(CoreWindowId::Main) => self.window.as_ref(),
+            Some(CoreWindowId::Equalizer) => self.eq_window.as_ref(),
+            Some(CoreWindowId::Playlist) => self.playlist_window.as_ref(),
+            _ => None,
+        };
+        if let Some(window) = window {
+            window.focus_window();
+        }
+    }
+
     /// Creates, resizes or closes the equalizer's OS window so it matches
     /// `eq_open` and [`App::eq_frame_size`].
     ///
@@ -1680,6 +1704,9 @@ impl ApplicationHandler for Windowed {
         self.sync_playlist_window(event_loop);
         self.sync_playlist_position();
         self.request_playlist_redraw();
+        // After every window has been synced, so a focus request for a window
+        // that opened this frame finds its OS window.
+        self.apply_focus_requests();
         // An error the user must see goes to the native title (BETA-04).
         self.sync_title();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
@@ -1990,6 +2017,23 @@ mod tests {
             presenter.app.main_visible(),
             "a right-click transport pick must not toggle the window"
         );
+        assert!(presenter.window.is_none(), "the test must stay headless");
+    }
+
+    /// The presenter half that is decidable without a desktop: it takes both
+    /// requests every call, whether or not an OS window exists to receive
+    /// them, so nothing stays queued for a later frame.
+    #[test]
+    fn the_presenter_consumes_focus_and_restore_requests_without_leaking_them() {
+        let mut presenter = desktop_test_presenter(false);
+        presenter.app.submit(Command::FocusNextWindow).unwrap();
+        presenter.app.submit(Command::ShowMainWindow).unwrap();
+        presenter.apply_focus_requests();
+        assert_eq!(presenter.app.take_focus_request(), None);
+        assert!(!presenter.app.take_restore_request());
+        // A second call with nothing pending is a no-op.
+        presenter.apply_focus_requests();
+        assert_eq!(presenter.app.take_focus_request(), None);
         assert!(presenter.window.is_none(), "the test must stay headless");
     }
 
