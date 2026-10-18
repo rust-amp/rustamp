@@ -1540,8 +1540,12 @@ mod hosted_tests {
             Err(error) => panic!("refusal must be OperationFailed, got {error}"),
             Ok(_) => panic!("refusal must be loud, never a session"),
         }
+        // The host's terminal sequence is one send plus the framework's
+        // bounded flush (5 s CONTROL_WAIT) and return; the test's bound must
+        // cover a full flush plus loaded-VM scheduling headroom. The claim
+        // is unchanged: the host must end with an error instead of stalling.
         result
-            .recv_timeout(WAIT * 2)
+            .recv_timeout(WAIT * 3)
             .expect("host must end after a refused open instead of stalling")
             .expect_err("a refused open must end the host with an error");
     }
@@ -2617,7 +2621,15 @@ mod dsp_hosted_tests {
         assert!(!left.contains(&0.0), "the seam must not contain silence");
 
         assert!(
-            h.wait_until(|e| e.transport() == TransportState::Stopped, 6000 + 8192),
+            h.wait_until(
+                |e| e.transport() == TransportState::Stopped,
+                // Consumption bound in 256-frame pump steps: the joint 6000
+                // frames plus one full engine ring of overlap slack for the
+                // drain/ack handshake and loaded-VM pump skew. The exact
+                // assertions below do the real work; this only bounds
+                // pathology.
+                6000 + 16_384
+            ),
             "the run must finish"
         );
         assert_eq!(h.engine.position_frames(), 3000);
@@ -2690,7 +2702,15 @@ mod dsp_hosted_tests {
         assert!(
             h.wait_until(
                 |e| e.transport() == TransportState::Stopped,
-                44_100 + 16_384
+                // Worst-case consumption in 256-frame pump steps: a full
+                // engine ring of stale audio plus the full second track, plus
+                // drain-handshake/re-base slack. The stale term is structural,
+                // not a guess: after the latch the decode thread keeps
+                // bypass-writing until Stop lands, and it outruns the 1 ms
+                // polling test thread, so the ring can be full (16_384)
+                // when the second run starts. The claim is unchanged: the
+                // run must finish, exactly at 44_100.
+                44_100 + 16_384 + 8_192
             ),
             "the second run must finish"
         );
