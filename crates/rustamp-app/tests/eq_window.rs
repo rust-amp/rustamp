@@ -11,8 +11,10 @@
 //! ```
 //!
 //! It opens the equalizer window at its docked size and position (S07 + S05
-//! §3.1: 275 x 116 at (26,145)), reads back the client size and the outer
-//! position, and exits. It creates no softbuffer surface and plays nothing;
+//! §3.1: 275 x 116 at (26,145)), reads back the client size, the outer
+//! position and the outer size, and exits. The outer size is the frame check:
+//! it equals the client size only when the window carries no native caption
+//! (wave122), which is the one half of that defect a desktop can observe. It creates no softbuffer surface and plays nothing;
 //! painting is covered by the headless render tests.
 //!
 //! The loop is built off the main thread on purpose: tests run on harness
@@ -22,7 +24,7 @@
 use std::sync::{Arc, Mutex};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::PhysicalPosition;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
@@ -51,6 +53,7 @@ fn the_equalizer_window_opens_at_its_docked_size_and_position() {
     struct Probe {
         seen: Arc<Mutex<Option<(u32, u32)>>>,
         seen_pos: Arc<Mutex<Option<(i32, i32)>>>,
+        seen_outer: Arc<Mutex<Option<(u32, u32)>>>,
     }
 
     impl ApplicationHandler for Probe {
@@ -58,19 +61,25 @@ fn the_equalizer_window_opens_at_its_docked_size_and_position() {
             let (w, h) =
                 rustamp_ui::docking::window_size(rustamp_ui::WindowKind::Equalizer, false, false);
             let at = rustamp_ui::DEFAULT_EQUALIZER_POSITION;
+            // The product's own shell, so this probe sees the frame the
+            // player ships with: borderless, because the title bar is part
+            // of the skin.
             let window: Window = event_loop
                 .create_window(
-                    Window::default_attributes()
-                        .with_title("Rustamp Equalizer (ignored probe)")
-                        .with_inner_size(PhysicalSize::new(w, h))
-                        .with_position(PhysicalPosition::new(at.x, at.y))
-                        .with_resizable(false),
+                    rustamp_ui::skinned_window_attributes(
+                        "Rustamp Equalizer (ignored probe)",
+                        (w, h),
+                        rustamp_ui::shell::TaskbarRole::Secondary,
+                    )
+                    .with_position(PhysicalPosition::new(at.x, at.y)),
                 )
                 .expect("create the equalizer window");
             let size = window.inner_size();
             *self.seen.lock().unwrap() = Some((size.width, size.height));
             let pos = window.outer_position().expect("read the window position");
             *self.seen_pos.lock().unwrap() = Some((pos.x, pos.y));
+            let outer = window.outer_size();
+            *self.seen_outer.lock().unwrap() = Some((outer.width, outer.height));
             event_loop.exit();
         }
 
@@ -85,9 +94,11 @@ fn the_equalizer_window_opens_at_its_docked_size_and_position() {
 
     let seen = Arc::new(Mutex::new(None));
     let seen_pos = Arc::new(Mutex::new(None));
+    let seen_outer = Arc::new(Mutex::new(None));
     let mut probe = Probe {
         seen: Arc::clone(&seen),
         seen_pos: Arc::clone(&seen_pos),
+        seen_outer: Arc::clone(&seen_outer),
     };
     // Off the main thread on purpose: this test runs on a harness worker
     // thread, so `EventLoop::new()` would panic. The product keeps the
@@ -99,5 +110,14 @@ fn the_equalizer_window_opens_at_its_docked_size_and_position() {
         *seen_pos.lock().unwrap(),
         Some((26, 145)),
         "the equalizer must open at its S05 §3.1 docked position"
+    );
+    // The frame check that needs a desktop: a window with a native caption
+    // is taller and wider on the outside than its client area. Borderless
+    // means the two are the same, which is also what makes the docked
+    // neighbour stack client edges gap-free (S05 §3.3).
+    assert_eq!(
+        *seen_outer.lock().unwrap(),
+        Some((275, 116)),
+        "the equalizer window must have no native frame: outer size == client size"
     );
 }

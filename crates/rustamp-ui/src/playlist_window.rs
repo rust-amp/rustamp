@@ -523,6 +523,20 @@ fn text_font(skin: &Skin) -> Option<BitmapFont> {
     Some(BitmapFont::new(image, glyphs, None, 0))
 }
 
+/// Paints the visible rows: the selection band first, then the labels.
+///
+/// The selected row's colour is the **skin's** `SelectedBG` from
+/// `pledit.txt` ([`rustamp_skin::PlaylistStyle::selected_bg`]), never a
+/// colour of ours - the skin decides what a selected row looks like. The
+/// band is one row of the settled list area ([`row_rect`], S06 §2: x 12-254,
+/// 13 px pitch), so it cannot reach the side rails or the scrollbar.
+///
+/// What the skin also provides and this renderer does **not** use yet:
+/// `Normal` and `Current` (the row text colours, white for the playing
+/// entry). The labels are stamped from the `text.bmp` bitmap font in whatever
+/// colour that sheet bakes in, because `rustamp_gfx::BitmapFont` has no tint
+/// and the golden images pin the current output. That is recorded as a
+/// finding in `docs/tasks/W24-native-frame-and-eq.md`, not changed here.
 fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &[String]) {
     let style = skin.pledit();
     let selected = [
@@ -576,6 +590,64 @@ fn draw_scrollbar(canvas: &mut Image, pledit: Option<&Image>, window: &PlaylistW
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The selected row's colour is the skin's, not ours.
+    ///
+    /// The owner's screenshot showed a brown-and-orange selection band that
+    /// fights the skin. This is the check that says where that colour comes
+    /// from: a skin whose `pledit.txt` names a selection colour must get
+    /// exactly that colour, in exactly the settled list band. It fails if
+    /// anyone hardcodes a highlight here, and it fails if the band spills
+    /// outside the list area.
+    ///
+    /// The band is the only thing a headless check can state. Whether the
+    /// *bundled* skin's own `SelectedBG` is pleasant is a choice in that
+    /// skin's `pledit.txt` (`crates/rustamp-skin/assets/rust-theme`), not in
+    /// this renderer - see the card.
+    #[test]
+    fn the_selected_row_is_filled_with_the_skins_own_selectedbg() {
+        use rustamp_core::playlist::EntryId;
+        use rustamp_skin::{BuiltinDefaultSkin, Skin};
+
+        // A skin that differs from every default, so a hardcoded colour
+        // cannot pass by accident.
+        let wanted = [0x12u8, 0x34, 0x56];
+        let mut source = rustamp_skin::rust_theme::source();
+        source.add(
+            "pledit.txt",
+            b"[Text]\nNormal=#00FF00\nCurrent=#FFFFFF\nNormalBG=#000000\nSelectedBG=#123456\n"
+                .to_vec(),
+        );
+        let skin = Skin::from_source(&mut source, &BuiltinDefaultSkin).expect("the skin loads");
+        assert_eq!(skin.pledit().selected_bg, wanted, "the skin was read");
+
+        let mut window = PlaylistWindow::default();
+        window.set_entries(vec![EntryId(1), EntryId(2)]);
+        window.select_all();
+        let labels = vec![String::new(), String::new()];
+        let frame = render_playlist_window(&skin, &window, &labels, true);
+
+        let row = row_rect(0).expect("the first visible row");
+        let pixel = |x: i32, y: i32| {
+            let index = ((y as u32 * frame.width() + x as u32) * 4) as usize;
+            let rgba = &frame.as_rgba()[index..index + 3];
+            [rgba[0], rgba[1], rgba[2]]
+        };
+        // Inside the band: the skin's colour, at both ends of the row.
+        assert_eq!(pixel(row.x, row.y), wanted);
+        assert_eq!(pixel(LIST_RIGHT - 1, row.y + ROW_PITCH - 1), wanted);
+        // Outside it: the side rails are the skin's art, never the fill.
+        assert_ne!(
+            pixel(LIST_LEFT - 1, row.y),
+            wanted,
+            "the band must stop at the list area (S06 section 2: x 12-254)"
+        );
+        assert_ne!(
+            pixel(LIST_RIGHT, row.y),
+            wanted,
+            "the band must not reach the scrollbar"
+        );
+    }
 
     #[test]
     fn client_size_is_275x116_at_rest() {

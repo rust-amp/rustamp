@@ -261,10 +261,13 @@ impl ApplicationHandler for MainWindowPresenter {
             return;
         }
         let (width, height) = frame_size(self.window.state());
-        let attributes = Window::default_attributes()
-            .with_title("Rustamp - main window (D2)")
-            .with_inner_size(PhysicalSize::new(width, height))
-            .with_resizable(false);
+        // The shared shell, so the example window is borderless like the
+        // player's: the title bar is part of the skin (`crate::shell`).
+        let attributes = crate::shell::skinned_window_attributes(
+            "Rustamp - main window (D2)",
+            (width, height),
+            crate::shell::TaskbarRole::Application,
+        );
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {

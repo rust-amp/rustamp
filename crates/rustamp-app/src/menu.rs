@@ -5,11 +5,15 @@
 //! the renderer and the pure popup geometry (placement anchor, hit-testing);
 //! this module is the app side: it owns the popup's open state, builds the
 //! [`MenuFlags`] from live app state, resolves check marks, and activates
-//! menu leaves through the same key-dispatch the shortcuts use. The OS window
-//! itself is created by the presenter (`window.rs`): it opens at the measured
-//! client size (323 x 569, S04 §§1,8), renders [`render_menu`](App::render_menu),
-//! and routes presses and keys back into [`App::menu_click`] /
-//! [`App::close_main_menu`].
+//! menu leaves through the same key-dispatch the shortcuts use.
+//!
+//! **The live popup is the operating system's own menu** (wave122). The
+//! presenter asks for [`App::native_main_menu`], shows it with
+//! `TrackPopupMenu`, and routes the chosen entry back through
+//! [`App::activate_menu_choice`]. The self-drawn 323 x 569 surface
+//! ([`render_menu`](App::render_menu)) and the click hit-testing
+//! ([`App::menu_click`]) are the retired path: they keep their S04 receipts
+//! and their tests, and nothing in the player uses them.
 
 use rustamp_core::command::Command;
 use rustamp_core::error::Result;
@@ -94,8 +98,49 @@ impl App {
         self.main_menu_open
     }
 
-    /// Renders one frame of the main-menu popup at the measured client size
-    /// (323 x 569, S04 §§1,8) with live check marks.
+    /// The main menu as a native popup tree, with live check marks.
+    ///
+    /// This is the **live** menu (wave122): the operating system draws it, so
+    /// the separators, the submenu arrows, the right-aligned accelerators and
+    /// the tick marks are the system menu's own, and the text is in the
+    /// system font. The rows and their order are the S04 §2 model
+    /// unchanged; the check marks resolve against live state exactly as
+    /// before ([`App::menu_flags`]).
+    ///
+    /// The presenter shows it and routes the chosen id back through
+    /// [`App::activate_menu_choice`].
+    pub fn native_main_menu(&self) -> rustamp_ui::menu::NativeMainMenu {
+        rustamp_ui::menu::native_main_menu(self.state(), &self.menu_flags())
+    }
+
+    /// Runs what one chosen native-menu entry means.
+    ///
+    /// A leaf goes through the existing activation path
+    /// ([`App::activate_menu_item`]) - the same dispatch the matching key
+    /// press runs - and a measured row with no command keeps its draw-only
+    /// treatment (S04 §9 covers no click-through for the title row,
+    /// `Library`, `Minibrowser` and `Exit`), so nothing is invented for it.
+    ///
+    /// The popup itself is already closed by the time this runs: the system
+    /// menu returns only once the user has chosen or dismissed.
+    pub fn activate_menu_choice(
+        &mut self,
+        choice: rustamp_ui::menu::MenuChoice,
+    ) -> Result<Option<MenuOutcome>> {
+        match choice {
+            rustamp_ui::menu::MenuChoice::Action { label, action } => {
+                self.activate_menu_item(label, action).map(Some)
+            }
+            rustamp_ui::menu::MenuChoice::NoAction { .. } => Ok(None),
+        }
+    }
+
+    /// Renders one frame of the **retired** self-drawn popup at the measured
+    /// client size (323 x 569, S04 §§1,8) with live check marks.
+    ///
+    /// Nothing in the player paints this any more: the live menu is the
+    /// system popup ([`App::native_main_menu`]). It is kept for the S04
+    /// geometry receipts and the golden tests that pin them.
     pub fn render_menu(&self) -> Image {
         rustamp_ui::menu::render_main_menu(self.skin.skin(), self.state(), &self.menu_flags())
     }

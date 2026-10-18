@@ -1,6 +1,23 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! The main-menu popup: a table-driven model, check-state mapping and renderer.
 //!
+//! **The live popup is the operating system's own menu** (wave122):
+//! [`native_main_menu`] turns the table below into a
+//! [`rustamp_platform::PopupRow`] tree and `rustamp-app` shows it with
+//! `TrackPopupMenu`. That is the faithful answer - S04 §1 settles the
+//! reference popup's window class as `#32768`, which is the class Windows
+//! uses for menus - and it is what makes the menu a frameless popup in the
+//! system font, with the separators, submenu arrows, right-aligned
+//! accelerators and tick marks the OS draws itself.
+//!
+//! [`render_main_window`](crate::render::render_main_window)'s sibling
+//! [`render_main_menu`] below is the **retired** self-drawn popup: a 323 x 569
+//! surface in the `text.bmp` bitmap font. It is kept for its S04 geometry
+//! receipts and its golden tests, and nothing in the player paints it any
+//! more. It is where the unreadable text came from: the glyph sheet is a
+//! small fixed-cell font and the measured rows are 35 px tall, so no scale of
+//! it reads like a menu.
+//!
 //! The popup is the `#32768` window the menu button (and `Alt+F`, S03 §1 id
 //! 40043) opens. Its client size (**323 x 569**) and the check-mark cell
 //! (**x = 16-29**) are **settled** measurements from spec **S04** (audited
@@ -58,6 +75,7 @@
 use std::ops::Range;
 
 use rustamp_gfx::{BitmapFont, GlyphMap, Image, Rect};
+use rustamp_platform::PopupRow;
 use rustamp_skin::{Sheet, Skin, webamp};
 
 use crate::shortcuts::ShortcutAction;
@@ -728,6 +746,144 @@ pub fn top_level(id: MainMenuId) -> Option<&'static MainMenuItem> {
         MenuRow::Item(item) if item.id == id => Some(item),
         _ => None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The native popup menu
+// ---------------------------------------------------------------------------
+
+/// What one chosen menu entry does.
+///
+/// The native popup reports an id; this is what that id meant. Submenu
+/// parents are **not** choices - the OS opens their submenu - so they never
+/// appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuChoice {
+    /// A leaf with a dispatchable action: runs the same key dispatch the
+    /// matching shortcut runs (see [`crate::shortcuts`]).
+    Action {
+        /// The row's label, for the note an undispatchable action records.
+        label: &'static str,
+        /// The action to dispatch.
+        action: ShortcutAction,
+    },
+    /// A measured row with no dispatch behind it (the title row, `Library`,
+    /// `Minibrowser`, `Exit`): choosing it closes the menu and does nothing,
+    /// because S04 §9 covers no click-through for them.
+    NoAction {
+        /// The row's label.
+        label: &'static str,
+    },
+}
+
+impl MenuChoice {
+    /// The row's label, whichever kind it is.
+    pub fn label(self) -> &'static str {
+        match self {
+            MenuChoice::Action { label, .. } | MenuChoice::NoAction { label } => label,
+        }
+    }
+}
+
+/// The main menu as a native popup, with live check marks.
+///
+/// `rows` is the tree [`rustamp_platform::show_popup_menu`] draws: the OS
+/// supplies the menu's appearance - the system font, the separator lines, the
+/// submenu arrows, the right-aligned accelerator column and the tick marks -
+/// because the reference's popups are system menus (S04 §1 settles their
+/// window class as `#32768`). `choices` is the lookup for what came back:
+/// an entry's id is its **1-based index** into it
+/// ([`NativeMainMenu::choice_for_id`]).
+///
+/// What this carries from the model, unchanged: the S04 §2 row order and the
+/// four separator positions, the six submenu parents (S04 §3.2), the six
+/// `Alt+*` accelerators and the `View file info` key (S04 §3.3, §3.4), and
+/// the three checkable window rows resolved against live state (S04 §3.1,
+/// [`check_state`]). What it drops is only our own drawing: the face colour,
+/// the hand-drawn arrows and ticks and the bitmap font, none of which a
+/// system menu needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeMainMenu {
+    /// The row tree, in display order.
+    pub rows: Vec<PopupRow>,
+    /// What each id means; an id is the 1-based index into this.
+    pub choices: Vec<MenuChoice>,
+}
+
+impl NativeMainMenu {
+    /// What the chosen `id` means, or `None` for an id that is not ours
+    /// (`0` is "dismissed").
+    pub fn choice_for_id(&self, id: u32) -> Option<MenuChoice> {
+        let index = usize::try_from(id).ok()?.checked_sub(1)?;
+        self.choices.get(index).copied()
+    }
+}
+
+/// Builds the main menu as a native popup tree for the current state.
+///
+/// Submenu entries are leaves (submenus nest no further - no evidence for
+/// it), and their contents stay the provisional S03-backed grouping the model
+/// already carries (S04 §9 never opened one). They are now reachable: the
+/// self-drawn popup could only note that a submenu was deferred, because it
+/// had no way to draw one.
+pub fn native_main_menu(state: &MainWindowState, flags: &MenuFlags) -> NativeMainMenu {
+    let mut rows = Vec::with_capacity(MAIN_MENU_ROWS);
+    let mut choices = Vec::new();
+    for row in MAIN_MENU.iter() {
+        let item = match row {
+            MenuRow::Separator => {
+                rows.push(PopupRow::Separator);
+                continue;
+            }
+            MenuRow::Item(item) => item,
+        };
+        match item.action {
+            MenuAction::Submenu(id) => {
+                let mut entries = Vec::new();
+                for entry in submenu_entries(id) {
+                    choices.push(MenuChoice::Action {
+                        label: entry.label,
+                        action: entry.action,
+                    });
+                    entries.push(PopupRow::Entry {
+                        id: choices.len() as u32,
+                        label: entry.label.to_string(),
+                        accelerator: entry.shortcut.map(str::to_string),
+                        checked: check_state(entry.check, state, flags),
+                        enabled: true,
+                    });
+                }
+                rows.push(PopupRow::Submenu {
+                    label: item.label.to_string(),
+                    rows: entries,
+                });
+            }
+            MenuAction::Shortcut(action) => {
+                choices.push(MenuChoice::Action {
+                    label: item.label,
+                    action,
+                });
+                rows.push(PopupRow::Entry {
+                    id: choices.len() as u32,
+                    label: item.label.to_string(),
+                    accelerator: item.shortcut.map(str::to_string),
+                    checked: check_state(item.check, state, flags),
+                    enabled: true,
+                });
+            }
+            MenuAction::NoAction => {
+                choices.push(MenuChoice::NoAction { label: item.label });
+                rows.push(PopupRow::Entry {
+                    id: choices.len() as u32,
+                    label: item.label.to_string(),
+                    accelerator: item.shortcut.map(str::to_string),
+                    checked: check_state(item.check, state, flags),
+                    enabled: true,
+                });
+            }
+        }
+    }
+    NativeMainMenu { rows, choices }
 }
 
 // ---------------------------------------------------------------------------

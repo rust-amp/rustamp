@@ -2,18 +2,20 @@
 //! The main-menu popup wiring, end to end but **headless** (task card wave21b).
 //!
 //! GUI must never run on the host, so every test here drives [`App`] with the
-//! null output and opens **no window** — except
-//! [`the_main_menu_popup_opens_at_the_measured_client_size`], which is
-//! `#[ignore]`d **and** refuses unless it can prove it runs inside the
-//! headless test VM, exactly like `tests/eq_window.rs`. There is
-//! deliberately **no** override. Run it only inside the headless test VM:
-//!
-//! ```text
-//! cargo test -p rustamp-app --test main_menu -- --ignored
-//! ```
+//! null output and opens **no window**. That is now the whole file: the menu
+//! is the operating system's own popup (wave122), so there is no window of
+//! ours left to measure, and the probe that used to check this popup's
+//! 323 x 569 client size is gone with it. That probe is also the lesson: it
+//! measured a size and passed while the popup carried a standard window
+//! caption and drew unreadable text.
 //!
 //! What the headless tests pin:
 //!
+//! * the popup the player shows is a **native menu tree**, with the S04 §2
+//!   row order, the four separators, the six submenu parents (which the OS
+//!   draws an arrow for), the measured accelerators in their own column and
+//!   the three checkable window rows following live state - and every id it
+//!   can report maps back to exactly one action;
 //! * the time toggle is wired to the existing UI-local flip (RFC 0005 §9):
 //!   activating it flips the flag and the elapsed/remaining check pair
 //!   (S04 §4.1) moves with it — those rows live in the Options popup, not on
@@ -141,87 +143,195 @@ fn an_action_without_a_command_notes_the_item_by_name() {
     );
 }
 
-// The shared test-VM gate lives in `rustamp_app::window::require_test_vm`:
-// this file keeps no copy of it. There is deliberately **no** override:
-// the test below opens the menu popup, and an ignored test that can do that
-// on the host is a loaded gun.
+// ---------------------------------------------------------------------------
+// The native popup (wave122)
+// ---------------------------------------------------------------------------
 
-/// Opens the real main-menu popup and checks its client size and position.
+/// The frame-and-font defect, pinned at the decision: the menu the player
+/// shows is a native menu tree, not a window of ours.
 ///
-/// The size is the settled S04 measurement (323 x 569, S04 §1/§8); the
-/// position is probe-only (the popup anchor is unmeasured, so the test asks
-/// for (50,50) and checks the window opened there). It creates no
-/// softbuffer surface and paints nothing; painting is covered by the headless
-/// render tests.
+/// Everything the reference screenshot shows has to be in the tree, because
+/// the OS draws it from there: separator rows between the groups, a submenu
+/// row for every parent (the OS draws the arrow), an accelerator carried
+/// separately from the label (the OS right-aligns it) and a tick flag on the
+/// toggles. The system font and the frameless popup shape come with the menu
+/// and need no data at all.
 ///
-/// The loop is built off the main thread on purpose: tests run on harness
-/// worker threads, so `EventLoop::new()` would panic. See
-/// [`rustamp_app::window::build_event_loop`].
+/// What this cannot check: that the OS then draws it legibly. That needs a
+/// desktop, so only the owner's machine can confirm it - but the unreadable
+/// bitmap font is gone by construction, because no font of ours is used.
 #[test]
-#[ignore = "VM-only: opens the main-menu popup; run inside the headless test VM"]
-fn the_main_menu_popup_opens_at_the_measured_client_size() {
-    use std::sync::{Arc, Mutex};
+fn the_main_menu_is_a_native_menu_tree_with_the_measured_shape() {
+    use rustamp_platform::PopupRow;
+    use rustamp_ui::menu::{MAIN_MENU_ROWS, MAIN_MENU_SEPARATORS, MAIN_MENU_SUBMENUS};
 
-    use winit::application::ApplicationHandler;
-    use winit::dpi::{PhysicalPosition, PhysicalSize};
-    use winit::event::WindowEvent;
-    use winit::event_loop::ActiveEventLoop;
-    use winit::window::{Window, WindowId};
+    let app = headless_app();
+    let menu = app.native_main_menu();
 
-    // The gate, before any window exists.
-    rustamp_app::window::require_test_vm();
-
-    let (width, height) = rustamp_ui::menu::MAIN_MENU_CLIENT_SIZE;
-    assert_eq!((width, height), (323, 569));
-
-    struct Probe {
-        seen: Arc<Mutex<Option<(u32, u32)>>>,
-        seen_pos: Arc<Mutex<Option<(i32, i32)>>>,
-    }
-
-    impl ApplicationHandler for Probe {
-        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-            let (w, h) = rustamp_ui::menu::MAIN_MENU_CLIENT_SIZE;
-            let window: Window = event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("Rustamp Main Menu (ignored probe)")
-                        .with_inner_size(PhysicalSize::new(w, h))
-                        .with_position(PhysicalPosition::new(50, 50))
-                        .with_resizable(false),
-                )
-                .expect("create the main-menu popup");
-            let size = window.inner_size();
-            *self.seen.lock().unwrap() = Some((size.width, size.height));
-            let pos = window.outer_position().expect("read the popup position");
-            *self.seen_pos.lock().unwrap() = Some((pos.x, pos.y));
-            event_loop.exit();
-        }
-
-        fn window_event(
-            &mut self,
-            _event_loop: &ActiveEventLoop,
-            _id: WindowId,
-            _event: WindowEvent,
-        ) {
-        }
-    }
-
-    let seen = Arc::new(Mutex::new(None));
-    let seen_pos = Arc::new(Mutex::new(None));
-    let mut probe = Probe {
-        seen: Arc::clone(&seen),
-        seen_pos: Arc::clone(&seen_pos),
-    };
-    // Off the main thread on purpose: this test runs on a harness worker
-    // thread, so `EventLoop::new()` would panic. The product keeps the
-    // default; see `rustamp_app::window::build_event_loop`.
-    let event_loop = rustamp_app::window::build_event_loop(true).expect("create the event loop");
-    event_loop.run_app(&mut probe).expect("run the event loop");
-    assert_eq!(*seen.lock().unwrap(), Some((323, 569)));
     assert_eq!(
-        *seen_pos.lock().unwrap(),
-        Some((50, 50)),
-        "the popup must open where it was asked to (probe-only anchor)"
+        menu.rows.len(),
+        MAIN_MENU_ROWS,
+        "every S04 §2 row reaches the popup"
     );
+    let separators = menu
+        .rows
+        .iter()
+        .filter(|row| matches!(row, PopupRow::Separator))
+        .count();
+    assert_eq!(
+        separators, MAIN_MENU_SEPARATORS,
+        "the four separator rules are separator rows, not drawn lines"
+    );
+    let submenus = menu
+        .rows
+        .iter()
+        .filter(|row| matches!(row, PopupRow::Submenu { .. }))
+        .count();
+    assert_eq!(
+        submenus, MAIN_MENU_SUBMENUS,
+        "the six arrow rows are real submenus, so the OS draws the arrow and opens them"
+    );
+    // Every submenu has entries: the self-drawn popup could only note that a
+    // submenu was deferred, because it had no way to draw one.
+    for row in &menu.rows {
+        if let PopupRow::Submenu { label, rows } = row {
+            assert!(!rows.is_empty(), "{label} opens nothing");
+        }
+    }
+
+    // The accelerators S04 §3.3/§3.4 measured are carried as accelerators,
+    // separately from the label, which is what gets them right-aligned.
+    let accelerators: Vec<(&str, &str)> = menu
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            PopupRow::Entry {
+                label,
+                accelerator: Some(accelerator),
+                ..
+            } => Some((label.as_str(), accelerator.as_str())),
+            _ => None,
+        })
+        .collect();
+    for (label, accelerator) in [
+        ("View file info", "Alt+3"),
+        ("Main Window", "Alt+W"),
+        ("Playlist Editor", "Alt+E"),
+        ("Equalizer", "Alt+G"),
+        ("Library", "Alt+L"),
+        ("Minibrowser", "Alt+T"),
+        ("Video", "Alt+V"),
+    ] {
+        assert!(
+            accelerators.contains(&(label, accelerator)),
+            "{label} must carry {accelerator}: {accelerators:?}"
+        );
+    }
+    assert!(
+        menu.rows.iter().all(|row| match row {
+            PopupRow::Entry { label, .. } => !label.contains('\t'),
+            _ => true,
+        }),
+        "the label must not carry the accelerator itself"
+    );
+}
+
+/// The tick marks are the OS's, and they follow live state.
+#[test]
+fn the_native_menus_tick_marks_follow_the_open_windows() {
+    use rustamp_platform::PopupRow;
+
+    let checked = |menu: &rustamp_ui::menu::NativeMainMenu, wanted: &str| {
+        menu.rows.iter().any(|row| match row {
+            PopupRow::Entry { label, checked, .. } => label == wanted && *checked,
+            _ => false,
+        })
+    };
+
+    let mut app = headless_app();
+    let equalizer = top_level(MainMenuId::Equalizer).unwrap();
+    assert!(
+        !checked(&app.native_main_menu(), equalizer.label),
+        "the equalizer starts closed, so its row carries no tick"
+    );
+    app.activate_menu_item(equalizer.label, ShortcutAction::ToggleEqualizer)
+        .expect("activation submits");
+    assert!(
+        checked(&app.native_main_menu(), equalizer.label),
+        "opening the equalizer ticks its row"
+    );
+}
+
+/// The ids the OS reports map back to exactly one action each, and nothing
+/// else maps at all. A menu that mis-maps one id runs the wrong action, which
+/// is the one way this path can be silently wrong.
+#[test]
+fn every_id_the_native_menu_can_report_maps_back_to_one_action() {
+    use rustamp_platform::PopupRow;
+    use rustamp_ui::menu::MenuChoice;
+
+    let app = headless_app();
+    let menu = app.native_main_menu();
+
+    fn ids(rows: &[PopupRow], into: &mut Vec<(u32, String)>) {
+        for row in rows {
+            match row {
+                PopupRow::Entry { id, label, .. } => into.push((*id, label.clone())),
+                PopupRow::Submenu { rows, .. } => ids(rows, into),
+                PopupRow::Separator => {}
+            }
+        }
+    }
+    let mut reported = Vec::new();
+    ids(&menu.rows, &mut reported);
+    assert_eq!(
+        reported.len(),
+        menu.choices.len(),
+        "one choice per selectable entry"
+    );
+    for (id, label) in &reported {
+        assert_ne!(*id, 0, "{label}: zero is reserved for a dismissed menu");
+        let choice = menu
+            .choice_for_id(*id)
+            .unwrap_or_else(|| panic!("{label}: id {id} maps to nothing"));
+        assert_eq!(
+            choice.label(),
+            label.as_str(),
+            "id {id} maps to the wrong row"
+        );
+    }
+    // Out-of-range ids are not choices.
+    assert_eq!(menu.choice_for_id(0), None);
+    assert_eq!(menu.choice_for_id(menu.choices.len() as u32 + 1), None);
+
+    // A row S04 §2 measures but S03 gives no command keeps its draw-only
+    // treatment: choosing it closes the menu and runs nothing.
+    let exit = menu
+        .choices
+        .iter()
+        .find(|choice| choice.label() == "Exit")
+        .copied()
+        .expect("Exit is a measured row");
+    assert!(matches!(exit, MenuChoice::NoAction { .. }));
+    let mut app = headless_app();
+    assert_eq!(app.activate_menu_choice(exit).expect("no dispatch"), None);
+    assert!(!app.quit(), "choosing Exit must not quit: S04 §9 is silent");
+    assert!(app.drain_notes().is_empty());
+}
+
+/// A chosen leaf runs the same dispatch the matching key press runs - the
+/// native path reuses the existing activation, it does not add a second one.
+#[test]
+fn a_chosen_native_leaf_runs_the_existing_key_dispatch() {
+    use rustamp_ui::menu::MenuChoice;
+
+    let mut app = headless_app();
+    let outcome = app
+        .activate_menu_choice(MenuChoice::Action {
+            label: "View file info",
+            action: ShortcutAction::ViewFileInfo,
+        })
+        .expect("activation submits");
+    assert!(matches!(outcome, Some(MenuOutcome::Commands(_))));
+    assert!(app.dialog_is_open(rustamp_ui::DialogKind::FileInfo));
 }

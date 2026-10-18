@@ -37,6 +37,8 @@
 //! The stack positions in the plain double-size state are open (S05 §2.2); the
 //! same bottom-edge rule is applied there.
 
+use std::path::PathBuf;
+
 use rustamp_core::command::Command;
 use rustamp_core::error::Result;
 use rustamp_core::playlist::EntryId;
@@ -256,6 +258,39 @@ impl App {
         }
     }
 
+    /// Adds media dropped from the shell onto the playlist editor.
+    ///
+    /// The same append the ADD button performs: the paths become
+    /// [`MediaLocation::File`](rustamp_core::playlist::MediaLocation) items
+    /// through the shared [`rustamp_ui::media_items_for_paths`] and are
+    /// submitted as one [`Command::AddItems`] with `play: false` (RFC 0005
+    /// O5 leaves the playlist add's `play` unmeasured, and the ADD path
+    /// already chose `false`), so a drop and a pick cannot drift apart.
+    ///
+    /// `winit` delivers one `DroppedFile` event per file, so a multi-file
+    /// drop arrives as several calls and the entries keep the shell's order.
+    /// Dropping is additive: it never replaces the queue, and an empty list
+    /// submits nothing.
+    ///
+    /// A dropped playlist file (`.m3u`, `.pls`, `.xspf`) is added as an
+    /// ordinary entry here, not loaded: the reference's drop-a-playlist
+    /// behaviour is unmeasured (S06 leaves it open) and the load path is the
+    /// LIST OPTS dialog.
+    pub fn drop_on_playlist(&mut self, paths: &[PathBuf]) -> Result<Vec<Command>> {
+        let items = rustamp_ui::media_items_for_paths(paths);
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let command = Command::AddItems {
+            items,
+            at: None,
+            play: false,
+        };
+        self.submit(command.clone())?;
+        self.sync_playlist_entries();
+        Ok(vec![command])
+    }
+
     /// One title-bar button press (S01 §4 rects, provisional).
     ///
     /// Close hides the playlist editor: it is a toggle window, and closing a
@@ -294,8 +329,6 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use rustamp_core::command::{Command, OpenMediaKind, SelectOp};
     use rustamp_core::config::Config;
     use rustamp_core::playlist::{EntryId, MediaLocation};
@@ -329,6 +362,64 @@ mod tests {
             play: false,
         })
         .expect("AddItems applies");
+    }
+
+    /// The drag-and-drop defect: dropping files on the playlist window did
+    /// nothing, because only the dialog window had a drop handler.
+    ///
+    /// The model half is checked here: a drop appends the files, in order,
+    /// without replacing what is there, and an empty drop changes nothing.
+    /// That the OS delivers the drop to the playlist window needs a desktop
+    /// and a shell drag, so only the owner's machine can confirm it.
+    #[test]
+    fn dropping_files_on_the_playlist_appends_them_in_order() {
+        let mut app = test_app();
+        add_entries(&mut app, 1);
+        app.sync_playlist_entries();
+        let before = app.playlist().len();
+        let dropped = [
+            PathBuf::from("C:/Music/first.mp3"),
+            PathBuf::from("C:/Music/second.mp3"),
+        ];
+        let commands = app.drop_on_playlist(&dropped).expect("the drop applies");
+        assert_eq!(
+            commands.len(),
+            1,
+            "one AddItems for the batch: {commands:?}"
+        );
+        assert!(matches!(
+            commands[0],
+            Command::AddItems {
+                play: false,
+                at: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            app.playlist().len(),
+            before + 2,
+            "a drop appends and never replaces"
+        );
+        let queue = app.engine().queue();
+        assert!(
+            queue
+                .get(queue.len() - 2)
+                .expect("the first dropped entry")
+                .display()
+                .contains("first"),
+            "the shell's order is kept"
+        );
+        assert!(
+            queue
+                .last()
+                .expect("the second dropped entry")
+                .display()
+                .contains("second")
+        );
+        // Nothing dropped changes nothing.
+        let unchanged = app.playlist().len();
+        assert!(app.drop_on_playlist(&[]).expect("an empty drop").is_empty());
+        assert_eq!(app.playlist().len(), unchanged);
     }
 
     #[test]

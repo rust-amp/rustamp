@@ -29,6 +29,9 @@
 //! * [`playlist::PlaylistWindow`] is the headless playlist-editor behaviour of
 //!   spec **S06**: list selection, page scrolling, REM removal and the
 //!   bottom-bar dialog requests (titles only, no dialog internals).
+//! * [`shell::skinned_window_attributes`] is the single place that decides
+//!   what an OS window looks like outside its client area: every window of
+//!   this player is borderless, because its title bar is part of the skin.
 //! * [`presenter::MainWindowPresenter`] is the thin `winit`/`softbuffer`
 //!   window used by the `main_window` example; it owns the clock.
 //!
@@ -51,6 +54,7 @@ pub mod playlist;
 pub mod playlist_window;
 pub mod presenter;
 pub mod render;
+pub mod shell;
 pub mod shortcuts;
 pub mod state;
 pub mod visualization;
@@ -91,9 +95,10 @@ pub use layout::{
 pub use menu::{
     CHECK_CELL_X, MAIN_MENU, MAIN_MENU_CLASS, MAIN_MENU_CLIENT_SIZE, MAIN_MENU_ITEM_HEIGHT_PX,
     MAIN_MENU_ROWS, MAIN_MENU_SEPARATOR_HEIGHT_PX, MAIN_MENU_SEPARATORS, MAIN_MENU_SUBMENUS,
-    MENU_BUTTON_POINT, MainMenuId, MainMenuItem, MenuAction, MenuCheck, MenuFlags, MenuRow,
-    SubmenuId, SubmenuItem, check_state, menu_item_at, menu_popup_origin, render_main_menu,
-    render_submenu, row_at_y, row_bands, submenu_client_size, submenu_entries, top_level,
+    MENU_BUTTON_POINT, MainMenuId, MainMenuItem, MenuAction, MenuCheck, MenuChoice, MenuFlags,
+    MenuRow, NativeMainMenu, SubmenuId, SubmenuItem, check_state, menu_item_at, menu_popup_origin,
+    native_main_menu, render_main_menu, render_submenu, row_at_y, row_bands, submenu_client_size,
+    submenu_entries, top_level,
 };
 pub use playlist::{
     ADD_DIALOG_TITLE, BUTTON_BAND_BOTTOM, BUTTON_BAND_TOP, LIST_SELECT_POINT, LOAD_DIALOG_TITLE,
@@ -112,6 +117,10 @@ pub use playlist_window::{
 };
 pub use presenter::{MainWindowPresenter, PresenterError, map_key, map_key_code, map_modifiers};
 pub use render::{frame_size, render_main_window};
+pub use shell::{
+    SKINNED_DECORATIONS, SKINNED_RESIZABLE, TaskbarRole, attributes_client_size,
+    skinned_window_attributes,
+};
 pub use shortcuts::{
     Binding, GLOBAL_TABLE, Key, MAIN_TABLE, Modifiers, ShortcutAction, ShortcutOutcome,
     ShortcutWindow, TEN_TRACK_STEP, VOLUME_STEP, lookup,
