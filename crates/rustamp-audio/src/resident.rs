@@ -2536,6 +2536,10 @@ mod dsp_hosted_tests {
         clock: NullClock,
         events: EventReceiver,
         host: HostOutcome,
+        /// The engine's failure watch, shared with the installed chain, so a
+        /// test can wait for a resident failure to latch without polling the
+        /// engine (see `wait_latch`).
+        watch: Arc<DspFailureWatch>,
         _dir: tempfile::TempDir,
     }
 
@@ -2566,12 +2570,13 @@ mod dsp_hosted_tests {
             engine.set_limiter_enabled(false);
             let (session, host) =
                 open_session_with(stages.clone(), SPEC_WIRE, DEFAULT_DSP_RING_FRAMES, resident);
+            let watch = engine.resident_dsp_watch();
             let chain = HostDspChain::new(
                 session,
                 stages,
                 DEFAULT_DSP_RING_FRAMES,
                 block_timeout,
-                engine.resident_dsp_watch(),
+                Arc::clone(&watch),
             );
             engine.set_dsp_chain(vec![Box::new(chain)]);
             let queue = names
@@ -2588,6 +2593,7 @@ mod dsp_hosted_tests {
                 clock,
                 events,
                 host,
+                watch,
                 _dir: dir,
             }
         }
@@ -2642,6 +2648,30 @@ mod dsp_hosted_tests {
                 |e| e.current_index() == Some(index) && e.duration_frames().is_some(),
                 WAIT,
             )
+        }
+
+        /// Wait until a resident failure has latched the engine's failure
+        /// watch, without polling the engine, and hand the latch back. The
+        /// next poll then deterministically finds the failure latched with
+        /// the decode thread's queued track start still unprocessed — the
+        /// erasure window of M25 §1.1 — instead of racing the start
+        /// publication. The watch is a latch, so taking and re-latching the
+        /// same info preserves it exactly: the chain is poisoned after its
+        /// first failure (nothing can latch in between) and the engine is
+        /// not polled meanwhile. The 1 ms sleep is the poll cadence the other
+        /// waits use, not an ordering mechanism.
+        fn wait_latch(&self) -> bool {
+            let deadline = Instant::now() + WAIT;
+            loop {
+                if let Some(info) = self.watch.take() {
+                    self.watch.latch(info);
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
         }
 
         fn wait_buffered(&mut self) -> bool {
@@ -2843,6 +2873,113 @@ mod dsp_hosted_tests {
         assert!(
             h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
             "the second run must finish"
+        );
+        assert_eq!(h.engine.position_frames(), 44_100);
+        h.finish();
+    }
+
+    #[test]
+    fn engine_publishes_the_start_when_the_resident_dies_right_after_it() {
+        // The wart this pins (M25 §1.1, A25): the decode thread queues
+        // `TrackStarted` — which carries the duration — before its first
+        // block, and a resident death on that first block latches the failure
+        // before the engine's poll has processed the queued start. The
+        // failure teardown used to discard the message, so the window showed
+        // the new track's index with the previous track's duration. The
+        // failure contract is unchanged; the start must survive it.
+        //
+        // The crash is armed before the second run starts, so the resident
+        // dies on the second track's first block — immediately after its
+        // start was queued. `wait_latch` below holds the engine's polls until
+        // the failure has latched, so the first poll deterministically finds
+        // the start unprocessed in the queue: the erasure window, not a
+        // race. The first track is two blocks long, so the fake's third-call
+        // crash cannot fire during the first run.
+        let die = Arc::new(AtomicBool::new(false));
+        let mut h = DspHarness::with_resident(
+            &["track7_2048.tst", "track2_44100.tst"],
+            vec![stage("fake:die")],
+            WAIT,
+            FakeDspResident::armed(Arc::clone(&die)),
+        );
+        // A first run publishes the first track's duration and ends before
+        // the second track opens ("stop after current"): the stale duration
+        // the erasure would leave behind is exactly this one.
+        h.engine.toggle_stop_after_current().unwrap();
+        h.engine.play_index(0).unwrap();
+        assert!(h.wait_track(0), "the first track must start");
+        assert_eq!(h.engine.duration_frames(), Some(2048));
+        assert!(
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+            "the first run must finish after its track"
+        );
+        assert_eq!(
+            h.engine.duration_frames(),
+            Some(2048),
+            "the second track must not have started"
+        );
+
+        // The second track starts; the resident dies on its first block.
+        die.store(true, Ordering::Relaxed);
+        h.engine.play_index(1).unwrap();
+        assert_eq!(h.engine.current_index(), Some(1));
+        assert!(
+            h.wait_latch(),
+            "the resident's death must latch the failure watch"
+        );
+        // One poll handles the failure; the teardown must publish the start
+        // the decode thread already queued.
+        h.engine.poll().unwrap();
+        assert_eq!(
+            h.engine.duration_frames(),
+            Some(44_100),
+            "the reported duration must be the started track's, not the previous track's"
+        );
+        assert_eq!(h.engine.current_index(), Some(1));
+        assert_eq!(h.engine.transport(), TransportState::Stopped);
+        assert_eq!(
+            h.engine.position_frames(),
+            0,
+            "the timeline must freeze at the failure (nothing was pumped)"
+        );
+        let events = h.drain_events();
+        let error_count = events
+            .iter()
+            .filter(|event| matches!(event, Event::Error(_)))
+            .count();
+        assert_eq!(error_count, 1, "the error must be published once");
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Error(info) => Some(info),
+                _ => None,
+            })
+            .expect("a resident death must publish an error event");
+        assert!(error.message.contains("resident DSP"), "{error:?}");
+        assert!(h.engine.last_error().is_some());
+        // The window shows the started track: its own duration, on the
+        // track-change event too.
+        let started = events.iter().find_map(|event| match event {
+            Event::TrackChanged {
+                index: Some(1),
+                duration_ms,
+                ..
+            } => Some(*duration_ms),
+            _ => None,
+        });
+        assert_eq!(
+            started,
+            Some(Some(1000)),
+            "the track change must carry the started track's duration"
+        );
+
+        // The player survives: the next run plays (the poisoned chain
+        // bypasses bit-exactly) and finishes naturally.
+        h.engine.play_index(1).unwrap();
+        assert_eq!(h.engine.transport(), TransportState::Playing);
+        assert!(
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+            "the next run must finish"
         );
         assert_eq!(h.engine.position_frames(), 44_100);
         h.finish();

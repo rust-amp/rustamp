@@ -804,7 +804,7 @@ impl Engine {
         self.sync.set_active(false);
         let _ = self.output.pause();
         let flushed = self.flush_output();
-        self.join_decode();
+        let _ = self.join_decode();
         self.transport = TransportState::Stopped;
         self.clock_origin = self.output.played_frames();
         self.timeline_origin = 0;
@@ -1162,7 +1162,7 @@ impl Engine {
         self.sync.set_active(false);
         let _ = self.output.pause();
         let flushed = self.flush_output();
-        self.join_decode();
+        let _ = self.join_decode();
         self.transport = TransportState::Stopped;
         // Freeze the timeline at the content end, not at the device position.
         // Re-basing the clock alone would reset `timeline_frames()` to the
@@ -1209,7 +1209,7 @@ impl Engine {
         self.sync.set_active(false);
         let _ = self.output.pause();
         let _ = self.flush_output();
-        self.join_decode();
+        let _ = self.join_decode();
         self.transport = TransportState::Stopped;
         self.timeline_origin = frozen_timeline;
         self.clock_origin = self.output.played_frames();
@@ -1277,13 +1277,29 @@ impl Engine {
     /// fatal output failure, except the output itself stays usable. The
     /// decode thread is never blocked longer than the stage's bounded block
     /// round-trip, so the join cannot hang.
+    ///
+    /// A track start the decode thread already reported is published before
+    /// the freeze (M25 §1.1, A25): the join below holds the queued
+    /// `TrackStarted` instead of discarding it, and delivering it here keeps
+    /// the window on the track that actually started — its duration, not the
+    /// previous track's.
     fn handle_dsp_failure(&mut self, info: ErrorInfo) {
         let frozen_timeline = self.timeline_frames();
         self.send(DecodeMsg::Stop);
         self.sync.set_active(false);
         let _ = self.output.pause();
         let _ = self.flush_output();
-        self.join_decode();
+        // Deliver the held start before the freeze and the error
+        // publication. The `TrackStarted` arm touches no timeline origin and
+        // no output, so the freeze stays exact, the error is still published
+        // once, and the sticky output-flush failure cannot be armed. Every
+        // other queued report stays discarded — it describes the run being
+        // torn down (a `Seeked` would re-enter the output flush, an `Error`
+        // would publish twice, a `Stopped` would clear the control channel
+        // the `Stop` above still has to reach).
+        if let Some(start) = self.join_decode() {
+            let _ = self.on_decode_out(start);
+        }
         self.transport = TransportState::Stopped;
         self.timeline_origin = frozen_timeline;
         self.clock_origin = self.output.played_frames();
@@ -1319,7 +1335,7 @@ impl Engine {
         if index as usize >= self.queue.len() {
             return Err(Error::NotFound(format!("queue index {index}")));
         }
-        self.join_decode();
+        let _ = self.join_decode();
         self.current = Some(index);
         let start_at = self.start_at.take();
         self.clock_origin = self.output.played_frames();
@@ -1423,7 +1439,12 @@ impl Engine {
     }
 
     /// Join the decode thread and take the ring producer and DSP chain back.
-    fn join_decode(&mut self) {
+    /// Returns a track start the decode thread queued but the engine never
+    /// processed, held instead of discarded (M25 §1.1, A25): the
+    /// resident-failure teardown delivers it, so a start that already
+    /// happened survives the failure. Every other caller discards it — the
+    /// run it belongs to is over, and the next run publishes its own start.
+    fn join_decode(&mut self) -> Option<DecodeOut> {
         // A thread waiting for a ring drain must not block the join; nothing is
         // consuming the ring at this point anyway.
         self.sync.set_active(false);
@@ -1434,15 +1455,25 @@ impl Engine {
         // was not handled in `poll`, recover both the ring producer and the
         // installed DSP chain here. On shutdown (`Drop`), this ensures that
         // stages are cleanly retrieved and dropped in order with the engine.
+        // A queued `TrackStarted` is held for the caller: the last one wins,
+        // naming the track the decode thread had open when the run ended.
+        let mut held_start = None;
         if let Some(rx) = self.from_decode.take() {
             while let Ok(out) = rx.try_recv() {
-                if let DecodeOut::Returned { producer, dsp } = out {
-                    self.producer = Some(producer);
-                    self.dsp = dsp;
+                match out {
+                    DecodeOut::Returned { producer, dsp } => {
+                        self.producer = Some(producer);
+                        self.dsp = dsp;
+                    }
+                    start @ DecodeOut::TrackStarted { .. } => {
+                        held_start = Some(start);
+                    }
+                    _ => {}
                 }
             }
         }
         self.to_decode = None;
+        held_start
     }
 
     fn publish_state(&self) {
@@ -1476,7 +1507,7 @@ fn clamp_gain(gain_db: f32) -> Option<f32> {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.send(DecodeMsg::Quit);
-        self.join_decode();
+        let _ = self.join_decode();
         let _ = self.output.close();
     }
 }
