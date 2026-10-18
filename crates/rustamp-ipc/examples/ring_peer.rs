@@ -39,6 +39,31 @@
 //! section 8), and the ring API has no way to discover a header blindly.
 //!
 //! The whole path uses the safe ring API: this file contains no `unsafe`.
+//!
+//! # The wake modes
+//!
+//! `wake-produce` / `wake-consume` are the two halves of
+//! `cargo xtask wake-cross`: a PCM **wake ring** (RFC 0007) driven by one-line
+//! commands on stdin, each answered by one line on stdout, so the runner - not
+//! a sleep - orders the two processes. Both halves also keep a *probe*: a
+//! second [`RingWake`] handle on the same two kernel events, obtained by
+//! cloning the one they hand to the ring. It lets a peer assert the signalling
+//! rule of RFC 0007 §6.2 directly:
+//!
+//! * `DRAIN_LATCH data|space` -> `LATCH_DRAINED <dir> taken=<n>`: poll the
+//!   latch until it is clear.
+//! * `EXPECT_LATCH data|space` -> `LATCH_SET <dir>`, or a `FAIL` line and a
+//!   non-zero exit when the latch is clear.
+//! * `EXPECT_NO_LATCH data|space` -> `LATCH_CLEAR <dir>`, the negative control:
+//!   it fails when the latch *is* set. Run right after a drain, it shows that
+//!   the `EXPECT_LATCH` that follows is a real discrimination and not a
+//!   constant.
+//! * `REPORT` -> `STATE ...`, the counters, so a claim about the ring's
+//!   occupancy is evidence rather than an assumption.
+//!
+//! Draining and expecting never wait ([`RingWake::take_signal`] polls), and
+//! the probe is only ever used in phases where nothing is blocked, so it
+//! cannot steal a real waiter's signal.
 
 use std::process::ExitCode;
 
@@ -62,7 +87,7 @@ mod imp {
 
     use rustamp_ipc::shm::{
         NamedRegion, RING_DATA_OFFSET, RingConsumer, RingError, RingExpect, RingKind, RingProducer,
-        RingWake, VIS_SLOT_SIZE, VisSlot,
+        RingWake, VIS_SLOT_SIZE, VisSlot, WaitOutcome, Wake,
     };
     use rustamp_proto::vis::{VIS_CHANNELS, VIS_SAMPLES};
 
@@ -72,6 +97,26 @@ mod imp {
     const OPEN_RETRY: Duration = Duration::from_millis(2);
     /// How long either side waits for the peer before it gives up.
     const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// The bounded wait a side uses to **prove it is blocked** before it tells
+    /// the runner so.
+    ///
+    /// It is a wait on the mechanism under test whose `TimedOut` outcome is an
+    /// assertion, not a `thread::sleep`: a blocking call that returns `Ok(0)`
+    /// here entered the kernel wait, found the ring empty (or full) and the
+    /// latch clear, and came back untouched. That is the fact the runner used
+    /// to buy with a 25 ms sleep after the announcement, which proved nothing.
+    /// It cannot produce a false failure either: nothing is signalling during
+    /// it, and a stale latch only costs one further pass of the check-then-wait
+    /// loop.
+    const ANNOUNCE_WAIT: Duration = Duration::from_millis(50);
+
+    /// How long a side that has announced itself blocked waits to be woken.
+    ///
+    /// Deliberately shorter than the runner's own per-step timeout, so the peer
+    /// that can name the failure and print the counters is the one that
+    /// reports it.
+    const BLOCK_WAIT: Duration = Duration::from_secs(5);
 
     /// Deterministic, position-dependent value, exactly representable as `f32`.
     ///
@@ -532,6 +577,64 @@ mod imp {
         }
     }
 
+    /// Report a failed expectation and fail the peer.
+    ///
+    /// The `FAIL` line goes on stdout because the runner treats such a line as
+    /// an immediate failure of the step it is waiting for, so the diagnostic it
+    /// prints is this exact sentence. The `Err` then exits the peer non-zero,
+    /// so a runner that is no longer watching still sees the failure.
+    fn fail<T>(message: String) -> Result<T, String> {
+        print_line(&format!("FAIL {message}"))?;
+        Err(message)
+    }
+
+    /// Parse `data` / `space` into a wake direction.
+    fn wake_direction(value: Option<&str>) -> Result<Wake, String> {
+        match value {
+            Some("data") => Ok(Wake::Data),
+            Some("space") => Ok(Wake::Space),
+            Some(other) => Err(format!("unknown wake direction `{other}`")),
+            None => Err("this command needs `data` or `space`".to_string()),
+        }
+    }
+
+    /// The direction's name, for a report line.
+    fn direction_name(which: Wake) -> &'static str {
+        match which {
+            Wake::Data => "data",
+            Wake::Space => "space",
+        }
+    }
+
+    /// Consume whatever is already latched on one direction of the probe, so
+    /// that the next [`RingWake::take_signal`] reports only what was signalled
+    /// after this call.
+    ///
+    /// Nothing waits: `take_signal` polls. The probe is a third handle on the
+    /// ring's two events and is only used in phases where neither side is
+    /// blocked, so a drained latch stays drained and no signal is stolen from a
+    /// real waiter.
+    fn drain_latch(probe: &RingWake, which: Wake) -> Result<u32, String> {
+        /// An auto-reset event holds at most one signal, so the loop below runs
+        /// at most twice. The bound only stops a broken backend from spinning.
+        const MAX_TAKES: u32 = 64;
+        let mut taken = 0u32;
+        while probe
+            .take_signal(which)
+            .map_err(|e| format!("take_signal({}) failed: {e}", direction_name(which)))?
+            == WaitOutcome::Signaled
+        {
+            taken += 1;
+            if taken >= MAX_TAKES {
+                return Err(format!(
+                    "the {} latch was still signalled after {MAX_TAKES} takes",
+                    direction_name(which)
+                ));
+            }
+        }
+        Ok(taken)
+    }
+
     fn wake_produce(args: Args) -> Result<(), String> {
         let name = require(args.name, "--name")?;
         let capacity = require(args.capacity, "--capacity")?;
@@ -544,6 +647,11 @@ mod imp {
             .map_err(|e| format!("could not create the ring: {e}"))?;
         let wake = RingWake::create(&name)
             .map_err(|e| format!("could not create wake for `{name}`: {e}"))?;
+        // A second handle on the same two kernel events, kept out of the ring:
+        // the probe of the mid-advance phases.
+        // `create_and_clone_share_the_same_latches` in `shm::wake` pins that a
+        // clone is the same object.
+        let probe = wake.clone();
         let mut producer = producer.with_wake(wake);
 
         print_line(&format!(
@@ -621,16 +729,44 @@ mod imp {
                         }
                         current_index += free as u64;
                     }
-                    print_line("WRITER_BLOCKING")?;
                     let mut extra_block = Vec::with_capacity(extra * channels);
                     for i in 0..extra as u64 {
                         for c in 0..channels {
                             extra_block.push(pcm_sample(current_index + i, c));
                         }
                     }
+                    // Prove the writer really is blocked before announcing it:
+                    // a bounded `write_from_blocking` on a full ring that
+                    // returns `Ok(0)` waited on `Wake::Space` and wrote
+                    // nothing. The runner used to buy this with a sleep after
+                    // the announcement; this is the fact itself.
+                    let probe_written = producer
+                        .write_from_blocking(&extra_block, Some(ANNOUNCE_WAIT))
+                        .map_err(|e| format!("write_from_blocking probe failed: {e}"))?;
+                    if probe_written != 0 {
+                        return fail(format!(
+                            "FILL_AND_BLOCK: the ring was not full, {probe_written} \
+                             frames were accepted before the writer could block (free={})",
+                            producer.free_frames()
+                        ));
+                    }
+                    print_line("WRITER_BLOCKING")?;
                     let written = producer
-                        .write_from_blocking(&extra_block, Some(PEER_TIMEOUT))
+                        .write_from_blocking(&extra_block, Some(BLOCK_WAIT))
                         .map_err(|e| format!("write_from_blocking extra failed: {e}"))?;
+                    if written == 0 {
+                        // `Ok(0)` means the wait expired with the ring still
+                        // full. While the peer still has frames to drain that
+                        // is a skipped `Wake::Space` signal, not a slow
+                        // machine, so it is a failure and not a retry.
+                        return fail(format!(
+                            "FILL_AND_BLOCK: no Wake::Space within {BLOCK_WAIT:?}; the \
+                             ring reports free={} written={} dropped={}",
+                            producer.free_frames(),
+                            producer.frames_written(),
+                            producer.frames_dropped()
+                        ));
+                    }
                     if written != extra {
                         return Err(format!("extra accepted {written} of {extra}"));
                     }
@@ -664,6 +800,90 @@ mod imp {
                     }
                     print_line(&format!("BULK_WROTE {total}"))?;
                 }
+                "WRITE_NB" => {
+                    // The non-blocking write site (`write_from`), which
+                    // carried its own copy of the withdrawn edge.
+                    let n: usize = parts
+                        .next()
+                        .ok_or("WRITE_NB needs a count")?
+                        .parse()
+                        .map_err(|e| format!("invalid count: {e}"))?;
+                    let mut block = Vec::with_capacity(n * channels);
+                    for i in 0..n as u64 {
+                        for c in 0..channels {
+                            block.push(pcm_sample(current_index + i, c));
+                        }
+                    }
+                    let written = producer
+                        .write_from(&block)
+                        .map_err(|e| format!("write_from failed: {e}"))?;
+                    if written != n {
+                        return fail(format!(
+                            "WRITE_NB: write_from accepted {written} of {n} (free={})",
+                            producer.free_frames()
+                        ));
+                    }
+                    current_index += n as u64;
+                    print_line(&format!("WROTE_NB {n}"))?;
+                }
+                "DRAIN_LATCH" => {
+                    let which = wake_direction(parts.next())?;
+                    let taken = drain_latch(&probe, which)?;
+                    print_line(&format!(
+                        "LATCH_DRAINED {} taken={taken}",
+                        direction_name(which)
+                    ))?;
+                }
+                "EXPECT_LATCH" => {
+                    let which = wake_direction(parts.next())?;
+                    let outcome = probe
+                        .take_signal(which)
+                        .map_err(|e| format!("take_signal failed: {e}"))?;
+                    if outcome != WaitOutcome::Signaled {
+                        return fail(format!(
+                            "the peer advanced its counter without signalling \
+                             Wake::{which:?}; this side reports available={} free={} \
+                             capacity={} written={} - the advance was neither from empty \
+                             nor to full, which is exactly the case the withdrawn edge of \
+                             RFC 0007 6.2 skipped",
+                            producer.frames_available(),
+                            producer.free_frames(),
+                            producer.capacity(),
+                            producer.frames_written()
+                        ));
+                    }
+                    print_line(&format!("LATCH_SET {}", direction_name(which)))?;
+                }
+                "EXPECT_NO_LATCH" => {
+                    // The negative control. Run directly after a drain, it
+                    // proves two things the positive assertion needs: the
+                    // drain really left the latch clear, and this probe can
+                    // report a missing signal at all - so a `LATCH_SET` later
+                    // in the phase discriminates, which a check that cannot
+                    // fail would not.
+                    let which = wake_direction(parts.next())?;
+                    let outcome = probe
+                        .take_signal(which)
+                        .map_err(|e| format!("take_signal failed: {e}"))?;
+                    if outcome != WaitOutcome::TimedOut {
+                        return fail(format!(
+                            "the {} latch was still set after the drain, so the next \
+                             EXPECT_LATCH would prove nothing",
+                            direction_name(which)
+                        ));
+                    }
+                    print_line(&format!("LATCH_CLEAR {}", direction_name(which)))?;
+                }
+                "REPORT" => {
+                    print_line(&format!(
+                        "STATE available={} free={} capacity={} written={} dropped={}",
+                        producer.frames_available(),
+                        producer.free_frames(),
+                        producer.capacity(),
+                        producer.frames_written(),
+                        producer.frames_dropped()
+                    ))?;
+                }
                 "CLOSE" => {
                     producer.close();
                     print_line("CLOSED")?;
@@ -687,6 +907,11 @@ mod imp {
 
         let consumer = open_with_retry(&name, size, expect)?;
         let wake = open_wake_with_retry(&name)?;
+        // A second handle on the same two kernel events, kept out of the ring:
+        // the probe of the mid-advance phases. It is a clone of the handle this
+        // process *opened* by name, so a `Wake::Data` it reports was set by the
+        // peer process, across the bitness boundary.
+        let probe = wake.clone();
         let mut consumer = consumer.with_wake(wake);
 
         print_line("CONSUMER_READY")?;
@@ -753,19 +978,44 @@ mod imp {
                         .ok_or("READ_BLOCK needs a count")?
                         .parse()
                         .map_err(|e| format!("invalid count: {e}"))?;
-                    print_line("READER_BLOCKING")?;
                     let mut buf = vec![0.0f32; n * channels];
+                    // Prove the reader really is blocked before announcing it:
+                    // a bounded `read_into_blocking` that returns `Ok(0)`
+                    // entered the kernel wait on an empty ring with a clear
+                    // latch and came back untouched. The runner used to buy
+                    // this with a sleep after the announcement, which proved
+                    // nothing about where the reader was.
+                    let probe_read = consumer
+                        .read_into_blocking(&mut buf, Some(ANNOUNCE_WAIT))
+                        .map_err(|e| format!("read_into_blocking probe failed: {e}"))?;
+                    if probe_read != 0 {
+                        return fail(format!(
+                            "READ_BLOCK: the ring was not empty, {probe_read} frames \
+                             arrived before the reader could block (available={})",
+                            consumer.frames_available()
+                        ));
+                    }
+                    print_line("READER_BLOCKING")?;
                     let mut read_total = 0usize;
                     while read_total < n {
                         let read = consumer
-                            .read_into_blocking(
-                                &mut buf[read_total * channels..],
-                                Some(PEER_TIMEOUT),
-                            )
+                            .read_into_blocking(&mut buf[read_total * channels..], Some(BLOCK_WAIT))
                             .map_err(|e| format!("read_into_blocking failed: {e}"))?;
                         if read == 0 {
-                            return Err(format!(
-                                "read_into_blocking timed out after reading {read_total} of {n}"
+                            // `Ok(0)` means the wait expired with the ring
+                            // still empty. While the peer still has frames to
+                            // write that is a skipped `Wake::Data` signal, not
+                            // a slow machine, so it is a failure and not a
+                            // retry (the W19 lesson: a bound that only makes a
+                            // test slower is not a bound).
+                            return fail(format!(
+                                "READ_BLOCK: no Wake::Data within {BLOCK_WAIT:?} after \
+                                 {read_total} of {n} frames; the ring reports \
+                                 available={} published={} read={} dropped={}",
+                                consumer.frames_available(),
+                                consumer.frames_published(),
+                                consumer.frames_read(),
+                                consumer.frames_dropped()
                             ));
                         }
                         for i in 0..read {
@@ -823,14 +1073,35 @@ mod imp {
                     print_line(&format!("DRAINED {n}"))?;
                 }
                 "WAIT_CLOSE" => {
-                    print_line("WAITING_CLOSE")?;
                     let mut buf = vec![0.0f32; channels];
-                    match consumer.read_into_blocking(&mut buf, Some(PEER_TIMEOUT)) {
+                    // Same discipline as READ_BLOCK: the announcement is only
+                    // made after a bounded wait proved the ring is empty and
+                    // still live, so what follows is a blocked waiter being
+                    // released by the peer's `close()`, not a reader that
+                    // happened to find the state flag already set.
+                    let probe_read = consumer
+                        .read_into_blocking(&mut buf, Some(ANNOUNCE_WAIT))
+                        .map_err(|e| format!("read_into_blocking probe failed: {e}"))?;
+                    if probe_read != 0 {
+                        return fail(format!(
+                            "WAIT_CLOSE: the ring was not empty, {probe_read} frames \
+                             were still pending (available={})",
+                            consumer.frames_available()
+                        ));
+                    }
+                    print_line("WAITING_CLOSE")?;
+                    match consumer.read_into_blocking(&mut buf, Some(BLOCK_WAIT)) {
                         Err(RingError::Closed) => {
                             print_line("CLOSED_OK")?;
                         }
                         Ok(0) => {
-                            return Err("expected Err(Closed), got timed out Ok(0)".to_string());
+                            return fail(format!(
+                                "WAIT_CLOSE: no wake within {BLOCK_WAIT:?}; close() must \
+                                 signal both events after the state store (RFC 0007 \
+                                 6.5). The ring reports closed={} available={}",
+                                consumer.is_closed(),
+                                consumer.frames_available()
+                            ));
                         }
                         Ok(frames) => {
                             return Err(format!(
@@ -876,6 +1147,92 @@ mod imp {
                     }
                     current_index += total as u64;
                     print_line(&format!("BULK_READ_OK {total}"))?;
+                }
+                "READ_NB" => {
+                    // The non-blocking read site (`read_into`), which carried
+                    // its own copy of the withdrawn edge.
+                    let n: usize = parts
+                        .next()
+                        .ok_or("READ_NB needs a count")?
+                        .parse()
+                        .map_err(|e| format!("invalid count: {e}"))?;
+                    let mut buf = vec![0.0f32; n * channels];
+                    let read = consumer
+                        .read_into(&mut buf)
+                        .map_err(|e| format!("read_into failed: {e}"))?;
+                    if read != n {
+                        return fail(format!(
+                            "READ_NB: read_into delivered {read} of {n} (available={})",
+                            consumer.frames_available()
+                        ));
+                    }
+                    for i in 0..read {
+                        let index = current_index + i as u64;
+                        for c in 0..channels {
+                            let got = buf[i * channels + c];
+                            let want = pcm_sample(index, c);
+                            if got != want {
+                                return Err(format!(
+                                    "PCM frame {index} channel {c}: expected {want}, got {got}"
+                                ));
+                            }
+                        }
+                    }
+                    current_index += n as u64;
+                    print_line(&format!("READ_NB_OK {n}"))?;
+                }
+                "DRAIN_LATCH" => {
+                    let which = wake_direction(parts.next())?;
+                    let taken = drain_latch(&probe, which)?;
+                    print_line(&format!(
+                        "LATCH_DRAINED {} taken={taken}",
+                        direction_name(which)
+                    ))?;
+                }
+                "EXPECT_LATCH" => {
+                    let which = wake_direction(parts.next())?;
+                    let outcome = probe
+                        .take_signal(which)
+                        .map_err(|e| format!("take_signal failed: {e}"))?;
+                    if outcome != WaitOutcome::Signaled {
+                        return fail(format!(
+                            "the peer advanced its counter without signalling \
+                             Wake::{which:?}; this side reports available={} capacity={} \
+                             published={} read={} - the advance was neither from empty \
+                             nor to full, which is exactly the case the withdrawn edge of \
+                             RFC 0007 6.2 skipped",
+                            consumer.frames_available(),
+                            consumer.capacity(),
+                            consumer.frames_published(),
+                            consumer.frames_read()
+                        ));
+                    }
+                    print_line(&format!("LATCH_SET {}", direction_name(which)))?;
+                }
+                "EXPECT_NO_LATCH" => {
+                    // The negative control; see the `wake-produce` arm.
+                    let which = wake_direction(parts.next())?;
+                    let outcome = probe
+                        .take_signal(which)
+                        .map_err(|e| format!("take_signal failed: {e}"))?;
+                    if outcome != WaitOutcome::TimedOut {
+                        return fail(format!(
+                            "the {} latch was still set after the drain, so the next \
+                             EXPECT_LATCH would prove nothing",
+                            direction_name(which)
+                        ));
+                    }
+                    print_line(&format!("LATCH_CLEAR {}", direction_name(which)))?;
+                }
+                "REPORT" => {
+                    print_line(&format!(
+                        "STATE available={} capacity={} published={} read={} dropped={}",
+                        consumer.frames_available(),
+                        consumer.capacity(),
+                        consumer.frames_published(),
+                        consumer.frames_read(),
+                        consumer.frames_dropped()
+                    ))?;
                 }
                 "QUIT" => {
                     break;

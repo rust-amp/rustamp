@@ -26,10 +26,11 @@
 //!
 //! [`RingWake::wait`] (used by [`RingProducer::wait_writable`] and
 //! [`RingConsumer::wait_readable`] and the blocking read/write calls) is the
-//! only thing that may call `WaitForSingleObject`. Signaling (`SetEvent`) is a
-//! syscall, not a sleep, and is called from the existing `write_from` /
-//! `write_slot` / `read_into` / `read_slot_into` / `close` paths. See RFC 0007
-//! §6.7.
+//! only thing that may **block** in `WaitForSingleObject`. Signaling
+//! (`SetEvent`) is a syscall, not a sleep, and is called from the existing
+//! `write_from` / `write_slot` / `read_into` / `read_slot_into` / `close`
+//! paths. [`RingWake::take_signal`] passes a zero timeout, so it polls the
+//! latch and returns without ever being descheduled. See RFC 0007 §6.7.
 //!
 //! [`RingProducer::wait_writable`]: super::ring::RingProducer::wait_writable
 //! [`RingConsumer::wait_readable`]: super::ring::RingConsumer::wait_readable
@@ -420,6 +421,29 @@ impl RingWake {
             None => Err(RingError::NoWakeObject),
         }
     }
+
+    /// Take one direction's pending signal, if there is one, without waiting.
+    ///
+    /// This is a **poll** of the latch, not a wait: it is
+    /// `WaitForSingleObject` with the zero millisecond argument that
+    /// `timeout_ms` already derives from `Duration::ZERO` (RFC 0007 §6.4), so
+    /// it never sleeps and the sleeping rule of RFC 0007 §6.7 is untouched -
+    /// the four blocking ring methods stay the only calls that can block.
+    ///
+    /// `Signaled` means a signal was pending and this call consumed it (the
+    /// events are auto-reset); `TimedOut` means none was pending. As with
+    /// every other use of the wake, the outcome says nothing about the ring's
+    /// contents - only the counters do (RFC 0007 §6.3).
+    ///
+    /// It exists so that a third handle on a ring's two latches can assert the
+    /// signalling rule of RFC 0007 §6.2 directly, which is the deterministic
+    /// half of acceptance criterion 3. The unit tests in `shm::ring` do that
+    /// with the crate-private [`RingWake::wait`]; a cross-process peer is a
+    /// separate crate and needs this. See
+    /// `docs/tasks/W22-wake-cross-process.md`.
+    pub fn take_signal(&self, which: Wake) -> Result<WaitOutcome, RingError> {
+        self.wait(which, Some(Duration::ZERO))
+    }
 }
 
 impl Drop for RingWake {
@@ -495,6 +519,46 @@ mod tests {
         );
         peer.close();
         peer.close(); // idempotent
+    }
+
+    /// `take_signal` polls a latch without waiting, and consumes the signal
+    /// it reports: the events are auto-reset, so one `signal` is one
+    /// `Signaled`. It is the primitive the cross-process mid-advance proof of
+    /// `docs/tasks/W22-wake-cross-process.md` is built on.
+    #[test]
+    fn take_signal_reports_and_consumes_one_pending_signal() {
+        let wake = RingWake::create("rustamp-test-wake-take").unwrap();
+        let probe = wake.clone();
+
+        // Nothing has been signalled yet.
+        assert_eq!(
+            probe.take_signal(Wake::Data).unwrap(),
+            WaitOutcome::TimedOut
+        );
+
+        wake.signal(Wake::Data).unwrap();
+        assert_eq!(
+            probe.take_signal(Wake::Data).unwrap(),
+            WaitOutcome::Signaled,
+            "a pending signal must be reported"
+        );
+        assert_eq!(
+            probe.take_signal(Wake::Data).unwrap(),
+            WaitOutcome::TimedOut,
+            "the auto-reset latch must be clear after it was taken"
+        );
+
+        // The two directions are separate objects: taking one leaves the
+        // other alone.
+        wake.signal(Wake::Space).unwrap();
+        assert_eq!(
+            probe.take_signal(Wake::Data).unwrap(),
+            WaitOutcome::TimedOut
+        );
+        assert_eq!(
+            probe.take_signal(Wake::Space).unwrap(),
+            WaitOutcome::Signaled
+        );
     }
 
     /// The mechanism's own timing contract is exact and deterministic
