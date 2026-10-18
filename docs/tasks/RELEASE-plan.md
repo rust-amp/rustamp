@@ -68,12 +68,13 @@ repeated VM work.
 
 | | |
 |---|---|
-| Missing | The central unproven claim: the shipped EXEs import only system DLLs and start on a Windows with no developer tooling. `artifact_imports_verified: false` is written into every manifest (`package.rs:45`); no PE import inspection exists; the static CRT is a build *policy* checked on the command line (`check_runtime_contract`, `package.rs:785-841`), not on the bytes. First launch on a clean OS, WOW64, reputation prompts and the audio device are listed "not proven" (`X1-package-runtime.md:106-112`). |
-| Cost | M. Offline PE import inspection is S; a *clean* guest checkpoint (no Rust, no VC++ redistributable, no dev tools) and a smoke job against it is M; an audio-endpoint run is hardware-dependent (L). |
-| Depends on | G0 first (a green smoke on the existing guest), then a guest checkpoint that provably lacks the VC++ runtime. The current `base-provisioned` baseline is the test-host baseline (`vm-run-smoke.ps1:40`); whether it is "clean" in the release sense has **not** been established in anything read here and must be checked before the word is used. |
-| This host | Offline: dump imports of the three binaries and compare to a system-DLL allowlist (a new read-only xtask check is the natural place; flip `artifact_imports_verified` only from that check, never by hand). Hash and compare. Run the existing smoke runner. Never open a window on the host (AGENTS/CONTRIBUTING GUI rule; `package.rs:778`). |
-| Owner | Builds/approves the clean checkpoint; decides whether a second OS image (Windows 10 vs 11, no WOW64 case) is required; runs anything needing real audio hardware. |
-| May claim without it | "Built with the static MSVC CRT per the build command" — and only that. **Never** "runs on a clean machine". |
+| Status | **Partially Implemented (Host PE Import Inspection Complete in `ff644db`; Clean VM Run Pending)**. `xtask/src/pe_imports.rs` parses PE import and delay-load directories for all packaged executables, enforcing a strict system-DLL allowlist and rejecting dynamic C runtime DLLs. Manifests now set `artifact_imports_verified: true`. The remaining unproven half: actual launch on a pristine clean machine without developer runtimes (Step 13). |
+| Missing | Launch proof on a clean Windows machine with no developer tooling. While offline static PE import inspection confirms only allowlisted system DLLs are imported and dynamic CRTs are absent, actual execution on a pristine OS checkpoint (Step 13) has not yet been performed. First launch on a clean OS, WOW64 compatibility, reputation prompts, and physical audio hardware remain unproven. |
+| Cost | M (clean guest checkpoint and smoke job against it). Offline PE inspection is Done (S). |
+| Depends on | G0 first (green smoke on existing guest), then guest checkpoint that provably lacks VC++ runtime. |
+| This host | Offline PE inspection implemented in `xtask/src/pe_imports.rs` and executed by `cargo xtask pe-imports` / `cargo xtask package`. Static check only; never open a window on host. |
+| Owner | Builds/approves clean checkpoint; runs Step 13 clean smoke; runs anything needing real audio hardware. |
+| May claim without it | "Statically verified to import only Windows system DLLs (excluding dynamic CRT DLLs); manifest sets `artifact_imports_verified: true`." **Never** "proven to run on a clean machine". |
 
 ### G4. Installer (Resolved by Owner Decision: Portable ZIP on GitHub — card `docs/tasks/X10-release-zip.md`)
 
@@ -223,8 +224,8 @@ owner's broker-mediated guest (`docs/notes/vm-run-tests.ps1:6-10`). Each step sa
 | 6 | CI-equivalent | host/CI | the three `ci.yml` jobs (`licenses`, `windows`) | Same gates on the project's CI | CI runs `cargo test --workspace` on a hosted runner, which this project's own rules forbid on the dev host; treat CI as additional, not a substitute for step 4 |
 | 7 | Version consistency | host | `cargo xtask package --check` (after G2: also checks version/commit/folder agreement) | GPL-free host closure, static-CRT command contract on all four binaries, QUICKSTART switches (`package.rs:785-841`) | Anything about the bytes — it builds nothing |
 | 8 | Build the package | host | `cargo xtask package --release --out <empty new dir>` | The four binaries built from the pinned flags into a layout that passes the exact-allowlist audit; refuses a non-empty `--out` (`package.rs:143-145,293`) | That they run |
-| 9 | Re-audit the produced folder | host | `cargo xtask package --check --out <that dir>` | Layout, manifests and QUICKSTART are exactly what the generator produces; no stale CRT DLLs or wrong-side licence files (`package.rs:128-136`) | Imports, launch (the manifest still says `artifact_imports_verified:false`) |
-| 10 | Import inspection | host (after G3 tooling) | offline PE import dump of all four EXEs vs a system-DLL allowlist | Only system DLLs are imported — **the first evidence the static CRT worked in the bytes** | Runtime behaviour |
+| 9 | Re-audit the produced folder | host | `cargo xtask package --check --out <that dir>` | Layout, manifests and QUICKSTART are exactly what the generator produces; no stale CRT DLLs or wrong-side licence files (`package.rs:128-136`) | Launch proof (the manifest sets `artifact_imports_verified: true` after step 10) |
+| 10 | Import inspection | host | `cargo xtask pe-imports` / integrated in `cargo xtask package` (`xtask/src/pe_imports.rs`) | Statically verifies all binaries import only system DLLs from allowlist and no CRT DLLs; sets `artifact_imports_verified: true` | Runtime launch behaviour / dynamic runtime loading (Step 13 still needed) |
 | 11 | Hash manifest, unsigned | host | SHA-256 of every file in the folder, written beside it (the smoke runner already hashes the player, bundled host and standalone host, `vm-run-smoke.ps1:78-80`) | Later steps and downloaders can detect any change | Authenticity — a hash beside the files proves nothing against a tamperer who also replaces the hash |
 | 12 | Packaged smoke | VM | `powershell -File docs\notes\vm-run-smoke.ps1` (takes the newest folder under `D:\code\rustamp-beta`, or `-PackageDir`) | Staged bytes equal the hashes; the player launched with `--no-audio` opens the `Rustamp` window at client 275×116; a live `rustamp-plughost32.exe` child answered the handshake; silent marker present; killed; every file re-hashed identical (`BETA-smoke.md:45-68`, summarised at `BETA-what-is-in-it.md:221-230`) | A real audio endpoint, a real plugin DLL, a clean exit, a clean machine (§5) |
 | 13 | Clean-machine run | VM (clean checkpoint, after G3) | the same smoke against the clean checkpoint | Starts with no developer runtime present — if and only if the checkpoint is shown clean | Other OS builds; reputation prompts on a signed binary |
@@ -254,7 +255,7 @@ evidence exists, and the notes must say they are unproven in the meantime.
 
 | Claim | Why it is unproven | What would change that |
 |---|---|---|
-| "Starts on a clean machine" / "no installation needed on any Windows" | `artifact_imports_verified:false` in every manifest (`package.rs:45`); no clean-OS run; no packaged window ever proven open (`BETA-readiness-2.md:180-189`; `X1-package-runtime.md:106-112`) | Steps 10 and 13, with the checkpoint shown clean |
+| "Starts on a clean machine" / "no installation needed on any Windows" | Offline PE import check statically verifies system DLL imports (`artifact_imports_verified: true`), but bare clean-OS execution without developer runtimes has not been executed; no packaged window ever proven open (`BETA-readiness-2.md:180-189`; `X1-package-runtime.md:106-112`) | Step 13, with the checkpoint shown clean |
 | "Plays audio" / "works with your sound card" / "sounds right" | The smoke runner uses `--no-audio`/null output only; sound quality, device-loss timing and a real endpoint need hardware (`BETA-what-is-in-it.md:233-236`; `BETA-readiness-2.md:256-258`). The one production WASAPI test is `real_playback` (VM, Group E1) and a VM endpoint is not hardware | A recorded run on named hardware with the device, driver and result written down |
 | "Runs your Winamp plugins" / "plugin compatible" | The smoke run proves a control channel to the host process, not a DLL (`BETA-what-is-in-it.md:234-235`). The loader is real but its acceptance tests (Group D, `in_openmpt`) are VM-only and the P5 suites were compile-only (`BETA-readiness-2.md:100-112`); user-facing plugin selection/config wiring is not present (`BETA-what-is-in-it.md:166-168`); the loader is "not a sandbox" (P5 card, as quoted at `BETA-readiness-2.md:109-112`); approved bytes still run `DllMain` (`BETA-readiness-2.md:47-48`) | Group D results per plugin, and UI wiring |
 | Any performance statement ("low CPU", "fast start", "real-time safe", "low latency", "gapless" as measured) | No performance measurement is recorded; the G3 `~7.8 ms` wake figure was withdrawn as an unevidenced single observation (`BETA-readiness-2.md:52,237-238`); the DSP/resident latency compensation is compile-only; S08 visualiser cost is unmeasured (`BETA-readiness-2.md:173-178`) | A measured, reproducible benchmark with hardware and method recorded |
@@ -262,7 +263,7 @@ evidence exists, and the notes must say they are unproven in the meantime.
 | "Signed", "verified publisher", "safe" | No signing exists (G5) | G5 done and verified |
 | "Installs", "uninstalls", "file associations", "auto-updates" | None exists (G4, G6; `X1-package-runtime.md:113-114`) | G4/G6 done |
 | "Licence-compliant" / "cleared" | The audit is metadata-only (`CONTRIBUTING.md:77-83`); X1 leaves notices, source offer and CRT terms to a release-owner review (`X1-package-runtime.md:115-120`) | G1 review signed off by the owner |
-| Features whose controls are placebos: shuffle/repeat as playback, visualiser, EQ presets, prefs/plugin pages, menu submenus/Exit-as-quit, Clutter O/V, tray icon, global hotkeys, ReplayGain settings (`BETA-readiness-2.md:221-233`; `BETA-what-is-in-it.md:158-183`) | Skeletons or model-only; hide or label them | Their own proofs |
+| Features whose controls are placebos: Clutter O/V, menu submenus / Exit-as-quit, EQ presets, prefs/plugin pages, ReplayGain settings UI (`BETA-readiness-2.md:221-233`; `BETA-what-is-in-it.md:158-183`) | Skeletons or model-only; hide or label them. (Note: shuffle/repeat, visualiser, tray icon, global hotkeys, and window focus navigation are now implemented and functional in the tree; note that visualiser response curves are internal design choices, not measured against Winamp, and window focus order is an own choice rather than a measurement) | Their own proofs |
 | "All tests pass" | No green full run at HEAD is on record; compile-only suites are the majority of newer work (`BETA-what-is-in-it.md:200-212`). Quoted counts are per-commit snapshots | Step 4 at the release commit, quoted with the commit |
 | Anything about the *tree* said of the *bytes* | The artefact is frozen at its build commit; the tree has moved on (`BETA-what-is-in-it.md:7-13`) | State the commit the claim is about; use the §3 identity |
 
@@ -281,8 +282,10 @@ and at which commit; state what was skipped.
    - Built-in pure-Rust APPNOTE.TXT ZIP packager and SHA-256 checksum generator producing `<release_id>.zip` and `.sha256`.
    - Release notes template and honest G5/G6 disclosures created.
    - Verification checks pass (`cargo xtask package --check`).
-2. **R3 (xtask, host-only):** offline PE import check for the four EXEs; sole writer
-   of `artifact_imports_verified`.
+2. **R3 (xtask, host-only — Completed in `ff644db`, card `docs/tasks/W17-xtask-findings.md`):**
+   - Offline PE import check implemented in `xtask/src/pe_imports.rs`.
+   - Checks import and delay-load tables of all packaged binaries against Windows system DLL allowlist; rejects dynamic CRT DLLs.
+   - Sets `artifact_imports_verified: true` in package manifests when verified.
 3. **R4 (VM, owner-triggered):** G0 smoke on a fresh build; then the clean-checkpoint
    run.
 

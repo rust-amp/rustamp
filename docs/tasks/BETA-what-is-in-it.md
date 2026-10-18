@@ -1,30 +1,38 @@
 # BETA — what is in the packaged beta (artefact vs tree)
 
-**Date:** 2026-10-17. **Scope:** docs-only inventory of the packaged beta as it
-stands. No `.rs` file, test, runner script, `docs/HANDOFF.md` or review card
-was edited; nothing was executed.
+**Date:** 2026-10-18. **Scope:** docs-only inventory of the packaged beta as it
+stands, reconciled at HEAD (`1912b98`). No `.rs` file, test, runner script,
+`docs/HANDOFF.md` or review card was edited; nothing was executed.
 
 **The one distinction this card keeps:** the artefact bytes are frozen at the
 build source commit, while the tree has moved on. The package in
 `D:\code\rustamp-beta\2026-10-17` was built from `main` at `f1b87b8`
-(`docs/tasks/BETA-build.md:3-4`); `git log f1b87b8..HEAD` counts **72 commits**
-since, none of which rebuilt the artefact. So below, **"in the bytes"** means
-`f1b87b8` plus the packaging commit `e00d922`, and **"in the tree"** means HEAD
-(`be08b17`). Anything in §3 is newer than the bytes a user downloads.
+(`docs/tasks/BETA-build.md:3-4`); the tree has moved forward substantially
+since, incorporating major functionality (visualiser, shuffle/repeat, tray/hotkeys,
+focus commands, PE import inspection, full licence texts, schema 3 packaging).
+So below, **"in the bytes"** means `f1b87b8` plus the packaging commit `e00d922`,
+and **"in the tree"** means HEAD (`1912b98`). Anything in §3 is newer than the
+bytes a user downloads.
 
 ## 1. What the package contains, and how it starts
 
-Contents (unchanged since the build; `docs/tasks/BETA-build.md:10-20`):
+Contents (in the tree package definition, `xtask/src/package.rs` via X2, X10, ff644db):
 
 | Path | What |
 |---|---|
 | `player/rustamp.exe` | the player, x86_64, release, static CRT |
-| `player/rustamp-plughost32.exe` | bundled copy of the 32-bit host beside the player (RFC 0006 §8 first `supervise.rs` candidate) |
+| `player/rustamp-dechost-symphonia.exe` | symphonia decoder resident helper, x86_64, release, static CRT |
+| `player/rustamp-dsphost-stages.exe` | gain/passthrough DSP resident helper, x86_64, release, static CRT |
+| `player/rustamp-plughost32.exe` | bundled copy of the 32-bit host beside the player (RFC 0006 §8) |
 | `player/LICENSE`, `player/PLUGIN-EXCEPTION.md` | the GPL set |
+| `player/THIRD_PARTY.md` | GPL-3.0 §6 source offer, static CRT terms, Webamp notice, full MPL-2.0 and Apache-2.0 texts, 302-crate inventory |
+| `player/QUICKSTART.md` | user quickstart guide |
 | `host/rustamp-plughost32.exe` | the host on its own, i686, permissive licences only, no GPL binary |
 | `host/LICENSE-MIT`, `host/LICENSE-APACHE` | the permissive set |
-| `manifest.json`, `player/manifest.json`, `host/manifest.json` | what went where, under which licence, schema version 2, `artifact_imports_verified: false` |
-| `README.md` | what works, what does not, how to run it |
+| `host/THIRD_PARTY.md` | strictly permissive terms, static CRT terms, MIT/Apache texts, 35-package closure |
+| `manifest.json`, `player/manifest.json`, `host/manifest.json` | layout, licences, schema version 3, version/commit stamped, `artifact_imports_verified: true` (post-pe-imports) |
+| `README.md`, `QUICKSTART.md`, `THIRD_PARTY.md` | top-level documentation, quickstart, and root license inventory |
+| `<release_id>.zip`, `<release_id>.zip.sha256` | deterministic portable ZIP archive and SHA-256 checksum file |
 
 Runtime shape (`docs/tasks/X1-package-runtime.md:13-50`): both binaries select
 the MSVC C runtime statically (`-C target-feature=+crt-static` in the package
@@ -154,33 +162,61 @@ still open and no user action can cross it today.
 - **Production plugin approval store (P7, `e8134cf`).** Verified-hash allowlist
   implemented in `crates/rustamp-plughost/src/approval.rs` and enforced by
   `loader.rs:676-678` before loading.
+- **Built-in Visualiser (feea30a, f7b09ea, W17-vis-clear).** Implemented and wired to
+  the running player in the interface pump after engine polling and before refresh,
+  ingesting decoder source samples. When playback stops (`TransportState::Stopped`),
+  both oscilloscope and spectrum modes reset immediately to static baseline (zeroing
+  bars, peaks, targets, centering scope, setting `VisInput::Missing`), with no decaying
+  spectrum tail retained. Golden updates/re-blessing (`vis_stopped_tail.png`) and
+  live VM desktop execution proof pending. Ballistics and response curves are an
+  internal design choice rather than a measurement matched to Winamp; Winamp
+  visualisation plugins are not hosted.
+- **Shuffle & Repeat, engine-owned (ade10e6, 6a606ef, 702719c).** Traversal order is
+  owned by the audio engine, which generates the single shuffle permutation and
+  coordinates the plan with the decode worker across thread boundaries; cycle replanning
+  honours anti-repeat rules; `Prev` on the first track restores the previous cycle plan;
+  orphaned duplicate state machine in the playlist crate deleted in favor of engine authority.
+- **Tray + global hotkeys (F3, d2c8e5d, 8f946a9, bc828a7).** Both `window.rs` seams are
+  closed. Hotkeys are drained in the window pump through standard command mappings;
+  tray icon attaches to the shell, responds to left-click, double-click, and native
+  context menu, and re-registers on `TaskbarCreated` after Explorer restarts; missing
+  icon degrades gracefully to a warning.
+- **Window focus commands (b17aa81, 1912b98, W18-window-focus).** `Ctrl+Tab`
+  (`FocusNextWindow`) cycles across open docked windows, skipping closed ones; `Alt+W`
+  (`ShowMainWindow`) shows, un-minimizes, and focuses the main window (including
+  un-hiding after tray minimize). Pure order model `[Main, Equalizer, Playlist]`.
+  Honest note: the focus order is an own choice rather than a reference measurement.
+- **Offline PE import inspection (ff644db, W17-xtask-findings).** `xtask/src/pe_imports.rs`
+  parses import and delay-load directories, refusing any non-allowlisted module or dynamic
+  CRT DLL. Checked on packaging; sets `artifact_imports_verified: true` in manifests.
+  Offline static check; proves nothing about clean machine execution.
+- **Full licence texts in notices (ff644db, W17-xtask-findings).** Player notices
+  (`player/THIRD_PARTY.md`) embed full text of MPL-2.0 (373 lines, SPDX canonical) and
+  Apache-2.0.
 
 **Only modelled (a seam is still open — no user action crosses it):**
 
-- **Tray + global hotkeys (F3, `4682139`).** Model, registry, session thread and
-  `main.rs` start-up wiring exist (`crates/rustamp-app/src/main.rs:41,73`), but
-  nothing drains `take_pending_hotkeys()` (no call site in the app crate) and
-  `TrayIcon::attach` is never called — six chords registered, zero delivered, no
-  icon (`docs/tasks/BETA-readiness-2.md:§2f`; `docs/tasks/F3-tray-hotkeys.md:163-182`
-  lists the `window.rs` follow-up as the explicit remaining seam).
 - **Classic plugin user wiring.** While the approval store exists (`approval.rs`),
   user-facing plugin selection and configuration UI wiring is not present, and no
   sandbox claim is made (`P5-dll-preflight.md:88-112`; `docs/tasks/BETA-readiness-2.md:§4`).
-- **Visualiser, shuffle/repeat, EQ presets, prefs/plugin pages, menu
-  submenus + Exit, Clutter O/V.** Unchanged skeletons/placebos
-  (`docs/tasks/BETA-readiness-2.md:§1` BETA-06/08/10 rows): spectrum is still
-  hard-zero by contract test, the engine still ignores the shuffle/repeat flags,
-  Exit still closes only the popup.
+- **Skeletons and placebos:** EQ presets popup (exists, does nothing); preferences
+  pages (`rustamp-prefs`, draws selected name only); window menu submenus (deferred);
+  window menu Exit (closes only popup, asserted by test); Clutter O/V buttons (emit
+  no command).
+- **ReplayGain UI surface:** Engine setters exist, config key warned-and-unapplied.
 
 ## 4. What is honestly NOT in the beta (either bytes or tree)
 
-The tray icon and delivered hotkeys without their two `window.rs` seams (§3);
-the visualiser (contracted zero, S08 unmeasured); shuffle and repeat as playback
-(§1 BETA-08 row — flags published, engine ignores); any ReplayGain settings surface
-(engine setters only, config key warned-unapplied); user-facing plugin selection/config
-UI wiring; menu submenus, Exit-as-quit, Clutter O/V, EQ presets, prefs/plugin pages.
-The `artifact_imports_verified: false` manifest field and the missing clean-machine
-launch also still hold (`docs/tasks/BETA-readiness-2.md:§4`).
+Clean-machine execution proof (static PE imports are verified to reference only
+Windows system DLLs, allowing `artifact_imports_verified: true`, but first launch
+on a pristine machine without developer runtimes has not been executed); physical
+audio hardware verification (device-loss recovery, hardware latency, and driver
+compatibility require physical hardware); running real Winamp plugins in the shipped
+player, or any UI wiring for plugin configuration; visualiser fidelity matched
+to a reference Winamp implementation (ballistics and response curves are internal
+design choices), and Winamp visualization plugins are not hosted; placebo controls
+(Clutter O/V, menu submenus, menu Exit-as-quit, EQ presets, prefs/plugin pages);
+ReplayGain settings UI surface.
 
 ## 5. Executed proof vs compile-only (as of HEAD `be08b17`)
 

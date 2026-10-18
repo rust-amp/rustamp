@@ -93,17 +93,23 @@ User configuration is saved to `%APPDATA%\Rustamp\rustamp.toml` on clean exit; y
 ### Proven & Functional in This Release:
 - **Audio Playback:** Local playback of MP3, FLAC, and WAV/RIFF audio streams via Symphonia decoders.
 - **Transport Controls:** Play, pause, stop, frame-accurate seeking, and gapless track advance.
+- **Built-in Visualiser:** Implemented and wired to the playing audio stream (oscilloscope and 19-band spectrum analyzer). Clears the screen immediately the moment playback stops, in every mode.
+- **Shuffle & Repeat:** Implemented and driven by the audio engine, which owns the traversal permutation and cycle replanning (including previous-cycle restoration on Prev).
 - **Equalizer & DSP:** 10-band Equalizer and preamp in the DSP chain (flat/unity by default).
+- **System Tray & Global Hotkeys:** Complete and operational. Global hotkey chords register and drain into the command queue; the tray icon attaches to the shell, responds to left-click, double-click, and context menu, and recovers upon Explorer restarts (`TaskbarCreated`).
+- **Window Focus Commands:** Keyboard focus navigation is functional: `Ctrl+Tab` (`FocusNextWindow`) cycles across open docked windows, and `Alt+W` (`ShowMainWindow`) shows, un-minimizes, and focuses the main window (including recovery after tray hide). Note: the focus cycle (`[Main, Equalizer, Playlist]`) is an own design choice rather than a reference measurement.
 - **Skins & Themes:** Built-in default drawn Rust theme skin, selectable lookalike theme (`--skin lookalike`), and external classic skin archives (.wsz, .zip, and uncompressed skin directories).
 - **Single Instance:** Second-instance command-line argument forwarding via Windows named pipes (`\\.\pipe\rustamp-app-cli`).
 - **Configuration:** Persistent settings saved to `%APPDATA%\Rustamp\rustamp.toml` upon clean exit.
 - **Process Supervision:** Supervised background helper processes (`rustamp-dechost-symphonia.exe`, `rustamp-dsphost-stages.exe`, and bundled `rustamp-plughost32.exe`).
+- **Portable Release Package & PE Import Audit:** Shipped as a standalone portable archive with complete licence inventory and full text for required licences. Executables are statically verified to import only Windows system DLLs (excluding dynamic CRT DLLs), allowing `artifact_imports_verified: true` in the manifest.
 
 ### Unproven / Not Supported / Placebos:
-- **Clean Machine Proof:** `artifact_imports_verified: false` remains set in manifests; launch on a bare Windows system without developer tools has not yet been audited against a system-DLL allowlist.
+- **Clean Machine Proof:** Although offline static PE import inspection verifies that executables import only Windows system DLLs (`artifact_imports_verified: true`), actual execution on a bare clean Windows installation without developer runtimes has not yet been executed in a clean VM checkpoint.
 - **Physical Audio Hardware:** Validated in hypervisor virtual machines with null/software sinks; physical sound card latency, hardware device-loss recovery, and diverse driver compatibility are not certified.
-- **Winamp Plugins:** The 32-bit helper process (`rustamp-plughost32.exe`) and byte-level approval store exist, but user-facing UI configuration is not yet implemented. The helper process is out-of-process isolation, not a security sandbox.
-- **Visualizer & Placebo Controls:** The main window spectrum analyzer is contracted to zero. The Shuffle and Repeat UI buttons are toggles but not yet connected to playlist order or playback loops.
+- **Winamp Plugins:** The 32-bit helper process (`rustamp-plughost32.exe`) and byte-level approval store exist, but user-facing UI configuration is not yet implemented. Real Winamp plugins are not proven running in the shipped player. The helper process provides out-of-process isolation, not a security sandbox.
+- **Visualizer Fidelity & Vis Plugins:** The built-in visualizer's response curves and ballistics are internal design choices, not measured against or matched to a reference Winamp implementation. External Winamp visualization plugins are not hosted.
+- **Placebo & Skeleton Controls:** Clutter bar O/V buttons emit no commands; menu submenus are deferred skeletons; the window menu Exit item closes only the popup rather than exiting the application; EQ presets popup and preferences pages remain skeletons.
 
 ---
 
@@ -116,7 +122,8 @@ Rustamp is built under strict clean-room and open-source compliance standards:
 - **Source Code Offer (GPL-3.0 §6):** Complete corresponding source code for the player and all bundled components is available at:
   - Repository: https://github.com/rustamp/rustamp
   - Release Tag: https://github.com/rustamp/rustamp/releases/tag/v{product_version}
-- **Symphonia (MPL-2.0):** Audio demuxers and decoders are licensed under Mozilla Public License 2.0. Source code is accessible at https://github.com/pdeljanov/Symphonia.
+- **Symphonia (MPL-2.0):** Audio demuxers and decoders are licensed under Mozilla Public License 2.0. The full 373-line text of MPL-2.0 is embedded in `player/THIRD_PARTY.md`. Source code is accessible at https://github.com/pdeljanov/Symphonia.
+- **Apache-2.0:** Shipped dependencies licensed under Apache-2.0 carry the complete license text embedded in `player/THIRD_PARTY.md` (and beside the host in `host/LICENSE-APACHE`).
 - **Webamp Classic Skin Tables:** Classic skin layout and palette tables are derived from Webamp under the MIT License (Jordan Eldredge).
 - **Microsoft C Runtime (MSVC CRT):** Statically linked under the Microsoft Visual Studio Software License Terms (REDIST.TXT).
-- **Complete Inventory:** Complete license texts and an inventory of all 302 crate dependencies are provided in `THIRD_PARTY.md` and `player/THIRD_PARTY.md`.
+- **Complete Inventory:** Complete license texts and an inventory of all 302 crate dependencies are provided in `THIRD_PARTY.md`, `player/THIRD_PARTY.md`, and `host/THIRD_PARTY.md`.

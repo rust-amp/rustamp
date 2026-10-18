@@ -11,16 +11,17 @@ executed here (task constraint); `git log`/`grep`/reads only.
 ## Decision
 
 **Still not ready for an ordinary first-user beta — but the failure set is
-narrower and different.** Of the twelve first-review findings, **seven are
-fixed or substantially fixed** (01, 02, 03, 04, 05, 12, and most of 06),
-**two changed shape** (07 fixed-by-another-lane, 09 half-fixed), and **three
-are still open in essentially original form** (08 shuffle/repeat, 10
-vis/plugin/prefs skeletons, 11 platform beyond instance+tray-model+hotkey-model).
-The new ground since the first review is real but largely **compile-only**:
-the two residents, the engine-side adapter, the loader, the flush contract and
-the mediahost concurrency fixes all landed with tests that were **written but
-explicitly not executed** (lane constraint), and **the packaged beta has still
-never been run anywhere**.
+narrower and different.** Of the twelve first-review findings, **eight are
+fixed or substantially fixed** (01, 02, 03, 04, 05, 08, 12, and most of 06),
+**three changed shape or were largely closed** (07, 09, 11), and **one
+remains open in original form** (10 vis/plugin/prefs skeletons, where vis is
+now wired and clears on stop, while vis reference matching, plugin user UI wiring,
+and prefs pages remain open).
+The new ground since the first review is real: the two residents, the engine-side
+adapter, the loader, the flush contract, tray and hotkeys, engine-owned shuffle
+and repeat, the built-in visualiser, window focus commands, and offline PE import
+inspection all landed. While static host gates pass and tests are written, **the
+packaged beta has still never been run anywhere in a full user session**.
 
 ---
 
@@ -28,17 +29,17 @@ never been run anywhere**.
 
 | # | First-review claim | Status today | Evidence |
 |---|---|---|---|
-| BETA-01 | No self-contained runtime policy; cold-machine `0xC0000135` risk; mixed-bitness CRT collision | **FIXED** | `xtask/src/package.rs:36` pins `+crt-static` for both binaries; `RUNTIME_MANIFEST` (`package.rs:37`) declares static linkage, no redist/DLLs; `check_runtime_contract` enforces the factory command (`package.rs:697-735`); `package --check` audits existing layouts and rejects stale CRT DLLs (`package.rs:878-942`); QUICKSTART + runtime policy staged (`package.rs:186,235,641-672`). Residual: `artifact_imports_verified:false` in the manifest — PE imports still unverified, and no clean-machine run exists (see §4). |
+| BETA-01 | No self-contained runtime policy; cold-machine `0xC0000135` risk; mixed-bitness CRT collision | **FIXED** | `xtask/src/package.rs:36` pins `+crt-static` for both binaries; `RUNTIME_MANIFEST` (`package.rs:37`) declares static linkage, no redist/DLLs; `check_runtime_contract` enforces the factory command (`package.rs:697-735`); `package --check` audits existing layouts and rejects stale CRT DLLs (`package.rs:878-942`); QUICKSTART + runtime policy staged (`package.rs:186,235,641-672`). `xtask/src/pe_imports.rs` (ff644db) inspects PE import and delay-load tables against system-DLL allowlist, setting `artifact_imports_verified: true`. Residual: cold-machine run on a bare OS without dev runtimes remains unexecuted (see §4). |
 | BETA-02 | First-run/default/fallback skin is flat magenta, font included | **FIXED, changed shape** | Built-in default is now the drawn Rust theme: `crates/rustamp-app/src/skin.rs:88-91` loads `BuiltinDefaultSkin` (Rust theme); J2 proved 19/19 sheets at exact sizes and 33/33 files (`docs/tasks/W10-batch-review.md` J2-1/2/7). No `PLACEHOLDER_RGBA` path is reachable for the built-ins (W10 J2-4 HOLDS). **Shape change:** the default is no longer the look-alike; `BuiltinLookalikeSkin` + the `lookalike` skin path stay reachable (W10 J2-5 HOLDS). Stale-doc residue: `crates/rustamp-app/src/skin.rs:6` still calls it the "look-alike default skin" (W10 F10 third bullet, unfixed — J4 owned only the skin crate). |
 | BETA-03 | No ordinary GUI route from empty queue to a media file | **LARGELY FIXED** | Eject releases `OpenMedia{Files, play:true}` (`crates/rustamp-ui/src/behaviour.rs:438-441`); the dialog types full paths incl. `:`, `\`, `.` via OS text (`crates/rustamp-app/src/dialogs.rs:173-178`); Backspace deletes; Explorer drop stages a pick; Enter confirms and closes (`dialogs.rs:151-158`). Still open: no native OS picker, no paste path, Shift+click open-directory gap (`behaviour.rs:423-426` names it), directory-confirm adds one file, URLs refused by the decoder. |
 | BETA-04 | Missing/unsupported media → phantom Playing; errors vanish at GUI boundary | **FIXED at app layer** | `surface_error` (`crates/rustamp-app/src/app.rs:1201-1233`): notes the failure, titles it with the entry name (`window_title`), stops a running transport unless EOS already reported, and re-syncs the UI transport so an optimistic Playing light goes out. `Event::Error` is drained (`app.rs:715`) instead of ignored; headless run breaks on `last_error` instead of hanging (`app.rs:1101-1104`) and returns it (`app.rs:1117-1119`). Residual: no new VM/user run proves the silence is gone; engine-worker open-failure loudness was not re-traced here beyond the existing `engine.rs:1023` error publish. |
 | BETA-05 | Device failure unrecoverable/unreportable; H4 design-only | **SUBSTANTIALLY FIXED, reshaped** | RFC 0012 implemented (`e3f73be`): `OutputDevice::stream_error` (`crates/rustamp-core/src/audio.rs:388-399`, default `None`), WASAPI failure-streak latch (`wasapi_out.rs:423-425,837-846`), cpal error-callback latch (`cpal_out.rs:400-402,493-499`), `Engine::poll` checks it every pump (`engine.rs:891-897`) into `handle_output_error` (`engine.rs:1103`). A flush refusal now fail-closes (A13, §2). Residual: no real-hardware loss run; recovery means a **new** Engine/output lifecycle (no auto-rebuild) — honest but austere. |
 | BETA-06 | Hit-testable but dead primary controls | **MOSTLY FIXED, residue named** | Fixed: Eject, Minimize, Shade, Close all release commands (`behaviour.rs:438-444`); ClutterA/D/I act (`behaviour.rs:449-457`); window-menu opens the popup (`behaviour.rs:461`). Still dead: **Clutter O/V emit nothing** (`behaviour.rs:429-430` documents it); **menu submenu parents open nothing** (`menu.rs:47-50,107-129`, `SubmenuDeferred` by design); **Exit closes only the popup, never the player** (`menu.rs:242-251`, asserted by test). |
 | BETA-07 | Playlist visibility/check marks don't control its OS window | **FIXED (by the N5 lane, confirmed by reading)** | `sync_playlist_window` creates/drops the OS window to follow `App::playlist_open` (`window.rs:1089-1101`); PL button, menu row, skinned and OS close all flip the one flag (`window.rs:1091-1092,1187-1191`). The follow-up W10 review of the playlist lane confirms BETA-07 needed no change. Not re-verified: the *initial* `playlist_open` default value. |
-| BETA-08 | Shuffle/Repeat lights advertise unimplemented playback | **STILL OPEN, unchanged** | Flags still app-owned only: toggle/publish (`app.rs:1255-1268`, `publish_modes`), engine still ignores them — decode advance is a plain index step to `EndOfStream` (`decode.rs:450-481`, no shuffle/repeat arm; no `SetShuffle` handling in `engine.rs:554-605` region per first review, structure unchanged). Still blocked on S15. Do not ship as working controls. |
+| BETA-08 | Shuffle/Repeat lights advertise unimplemented playback | **FIXED** | Implemented and driven by the audio engine (`ade10e6`, `6a606ef`, `702719c`). The audio engine generates and owns the shuffle permutation and coordinates the plan with the decode worker; anti-repeat cycle boundary rule enforced; `Prev` on first track restores previous cycle plan; orphaned duplicate state machine in playlist crate deleted in favor of engine authority. |
 | BETA-09 | Playlist-file loading is a dead end | **LARGELY FIXED** | Wired in N7 (`9e8c5d0`) and verified in N8 (`24b33e4`): `Enter` on the Load Playlist dialog confirms through `confirm_load_playlist` (`dialogs.rs:188-191,224-239`), loads via `App::load_playlist_file` (`app.rs:1431-1491`, queue replaced, track 0 played, report recorded, skips noted) and closes the dialog; empty confirm keeps dialog open (`app.rs:2974`). Residual: VM/user execution proof pending. |
-| BETA-10 | Vis/plugin/prefs are skeletons | **STILL OPEN, narrowed** | Vis: spectrum still hard-zero, pinned by test (`vistap.rs:13,173` — "S08 owns this"); renderer draws no live visualiser. Plugin: the **loader is real** now (P5, §2) with VM-only acceptance, but user-facing plugin selection/config wiring was **not re-verified** in this review (no claim made either way). Prefs: still name-only pages (`rustamp-prefs`, dialog draws selected name); EQ presets popup exists, does nothing. All must stay excluded/disabled, not sold as features. |
-| BETA-11 | Platform integration is DPI-only stub | **NARROWED, not closed** | Done: single instance + CLI forwarding (`408132f`; `main.rs:68-77,99-143`), tray **model** (7 entries → Commands, `tray.rs`), hotkey **model + registry + session** (defaults `Ctrl+Alt`, `hotkeys.rs`; session started `main.rs:73`). **Both `window.rs` follow-up seams are still open:** no `take_pending_hotkeys` drain exists anywhere in the app crate, and no `TrayIcon::attach` call exists in `window.rs` — hotkeys register globally but can never deliver a command; the tray icon never appears. Media keys/SMTC/taskbar/file-assoc/external-control window: still absent. |
+| BETA-10 | Vis/plugin/prefs are skeletons | **PARTIALLY FIXED, reshaped** | Vis: built-in visualiser is implemented and wired to playing audio (`feea30a`), clearing screen immediately on stop in all modes (`f7b09ea`, `W17-vis-clear`). Unproven: reference response curves (own design choice) and vis plugins. Plugin: loader is real (P5) with approval store (P7); user-facing plugin selection/config UI wiring remains open. Prefs: still name-only pages (`rustamp-prefs`, dialog draws selected name); EQ presets popup exists, does nothing. |
+| BETA-11 | Platform integration is DPI-only stub | **LARGELY FIXED, residue named** | Single instance + CLI forwarding complete (`408132f`); tray icon attached, responds to left/double-click and context menu, recovers on `TaskbarCreated` (`d2c8e5d`, `8f946a9`, `bc828a7`); hotkey queue drained into app command queue (`window.rs`); window focus navigation implemented (`FocusNextWindow` / `ShowMainWindow`, `b17aa81`, `1912b98`, `W18-window-focus`) with pure order model `[Main, Equalizer, Playlist]`. Honest note: focus order is an own choice rather than a measurement. Media keys / SMTC / taskbar / file-assoc / external-control window still absent. |
 | BETA-12 | Config read-only; settings not consumed/saved | **FIXED** | `save()` exists (`config.rs:346-356`), runs on clean exit (`window.rs:238-243`); malformed input aborts loudly (`config.rs:214`, `lib.rs:87`); unhonoured keys warned + omitted (`config.rs:114-186,254-341`); W10 F1 self-corruption fixed through serde (`c32cf7b`; regression test with `WindowId::Gen(3)` at `config.rs:443-539`) and closed as a class in N9 (`99b2cb3`). **Residue:** W10 F5 (`easy_move`) was wired in N8 (`24b33e4`: `app.rs:558-560`, `window.rs:1283-1293,1460-1468`). Residual softer pattern for `eq.state.auto` (carried, no auto-preset behaviour — S07-open). |
 
 ### W10-batch-review reconciliation (39 claims, 10 false — which are still open in code)
@@ -135,15 +136,16 @@ the latter visibly stale at `app/src/skin.rs:6`).
 
 ### 2f. Tray and hotkeys (F3, `4682139`)
 
-Model + registry + session are in (`platform/src/tray.rs` 315 lines,
-`hotkeys.rs` 792 lines; headless mapping/bookkeeping tests written,
-unexecuted). **The two `window.rs` seams are open:** hotkey firings queue
-process-globally but nothing drains them (`take_pending_hotkeys` appears
-nowhere in the app crate — only the F2 `take_pending` drain at
-`window.rs:1487`), and `TrayIcon::attach` is never called. Net user effect
-today: **six global chords registered, zero delivered; no tray icon.**
-Either wire the ~8 follow-up lines in `window.rs` (VM checklist in the card)
-or do not start the session.
+### 2f. Tray and hotkeys (F3, closed in `d2c8e5d`, `8f946a9`, `bc828a7`)
+
+The two `window.rs` seams are now **CLOSED**:
+- Hotkey firings are drained in the `window.rs` event pump via `take_pending_hotkeys()`
+  and dispatched directly to `app.submit(command)`.
+- `TrayIcon` attaches to the main `HWND`, handles right-click context menu, left-click
+  and double-click window restore/minimize toggling, and re-registers the tray icon
+  upon receiving the shell `TaskbarCreated` message (Explorer restarts). Missing icon
+  gracefully degrades to a warning.
+Global hotkeys and tray icon are fully operational in code.
 
 ### 2g. Configuration
 
@@ -170,12 +172,19 @@ golden namespace:** `ui/tests/golden_rust_theme.rs` was committed in `93a16f9`
 and blessed in `9600c95` (Wave 54). First-run pixels of the default skin are now
 pinned.
 
-### 2j. Visualiser
+### 2j. Visualiser (feea30a, f7b09ea, W17-vis-clear)
 
-Still unmeasured and still a skeleton: waveform tap raw, spectrum zero by
-contract-test (`vistap.rs:173`); S08 probe + three jobs designed, runs are the
-orchestrator's and have no recorded result; S08 spec unwritten. Nothing to
-beta-test here beyond confirming it stays off/latent.
+The built-in visualiser is no longer contracted to zero:
+- `feea30a` wired the visualizer state machine into the interface pump, ingesting
+  raw decoder source samples and advancing spectrum and oscilloscope state without
+  allocations.
+- `f7b09ea` (`W17-vis-clear`) corrected the stopped state: the moment playback stops
+  (`TransportState::Stopped`), the visualiser resets immediately to static baseline
+  in every mode (`Spectrum`, `Scope`, `ScopeDots`), zeroing bars, peaks, targets,
+  and centering the scope, leaving no decaying tail.
+- **Honest boundaries:** Frequency response curves, FFT binning, and decay ballistics
+  are internal design choices, not measured against a reference Winamp implementation.
+  External Winamp visualization plugins are not hosted.
 
 ### 2k. The packaged beta that has never been run
 
@@ -188,6 +197,29 @@ records a packaged run (`git log --grep` finds only the record itself). The
 needed VM job (stage packaged folder → launch → prove window → exit) is
 designed nowhere and run nowhere.
 
+### 2l. Window focus navigation (`b17aa81`, `1912b98`, `W18-window-focus`)
+
+Focus commands are implemented and operational:
+- `Ctrl+Tab` (`FocusNextWindow`) cycles across open docked windows, skipping closed ones.
+- `Alt+W` (`ShowMainWindow`) restores minimized windows, unhides windows hidden by
+  tray minimize, and requests focus for the main window.
+- The focus cycle `[Main, Equalizer, Playlist]` is implemented with a pure order
+  model. **Honest note:** the focus sequence is an intentional internal design
+  choice rather than an empirical measurement of Winamp 2.95.
+
+### 2m. Offline PE import inspection (`ff644db`, `W17-xtask-findings`)
+
+`xtask/src/pe_imports.rs` parses PE import and delay-load directories against a
+strict Windows system DLL allowlist. It confirms zero dynamic C runtime DLLs
+(`msvcp*.dll`, `vcruntime*.dll`, `ucrtbase.dll`), allowing `artifact_imports_verified: true`
+to be honestly stamped into release manifests. Static inspection only; says
+nothing about clean-machine execution.
+
+### 2n. Full licence texts in notices (`ff644db`, `W17-xtask-findings`)
+
+Canonical full texts of MPL-2.0 (373 lines, SPDX canonical) and Apache-2.0 are
+embedded in `player/THIRD_PARTY.md` as required by the licenses.
+
 ---
 
 ## 3. The five things to fix first (beta order)
@@ -196,11 +228,9 @@ designed nowhere and run nowhere.
    has never executed: launch, prove the window, exit cleanly, note
    reputation/smart-screen behaviour. Every other item below is theory until
    the thing a user downloads has opened once. (BETA-build.md:41-44.)
-2. **Close or remove the F3 seams.** Drain `take_pending_hotkeys()` into
-   `submit` next to the F2 drain (`window.rs:1487` neighbourhood) and attach
-   `TrayIcon` once the main `HWND` exists — or stop starting `HotkeySession`
-   (`main.rs:73`). Shipping global chords that can never fire is a live
-   side-effect with no function.
+2. **Close or remove the F3 seams.** **CLOSED** in `d2c8e5d`, `8f946a9`, `bc828a7`:
+   `take_pending_hotkeys()` is drained in `window.rs` into `app.submit()`, and
+   `TrayIcon::attach` is called when HWND is created, with `TaskbarCreated` recovery.
 3. **Load-Playlist Enter.** (Wired in N7 `9e8c5d0` and verified in N8 `24b33e4`:
    confirms via `confirm_load_playlist` at `dialogs.rs:188-191,224-239`, loads via
    `load_playlist_file` at `app.rs:1431-1491`; requires VM execution proof).
@@ -209,23 +239,24 @@ designed nowhere and run nowhere.
    updates, P5 headless mapping (i686) + `in_openmpt` acceptance, plus the
    windowed four. The beta's load-bearing new semantics (fail-closed flush
    barrier, resident bit-identity, snapshot mapping) are compile-only today.
-5. **Stop advertising what does not work.** Shuffle/Repeat (BETA-08),
-   Clutter O/V, menu submenus + Exit, EQ presets, vis/prefs pages, plugin
-   selection: hide, disable, or label as unmeasured. Fold in the small
-   honesties: `easy_move` is wired (N8 `24b33e4`), while the stale
-   `app/src/skin.rs:6` line and F11 double print (`lib.rs:87` + `main.rs:93`)
-   persist.
+5. **Stop advertising what does not work.** Shuffle/Repeat (BETA-08) and Visualiser
+   (BETA-10) are now functional code paths. Hide, disable, or label remaining
+   placebos: Clutter O/V, menu submenus + Exit, EQ presets, prefs pages, plugin
+   UI selection. Fold in the small honesties: `easy_move` is wired (N8 `24b33e4`),
+   while the stale `app/src/skin.rs:6` line and F11 double print (`lib.rs:87` +
+   `main.rs:93`) persist.
 
 ---
 
 ## 4. What a beta must not ship with
 
 - A package whose runtime contract is unproven on a clean machine
-  (`artifact_imports_verified:false`; no packaged run — §2k).
-- Global hotkeys that register but cannot deliver (§2f).
+  (PE imports are now verified with `artifact_imports_verified: true`, but
+  first launch on a bare clean OS without developer runtimes remains unexecuted).
+- Global hotkeys that register but cannot deliver (now delivered; closed in §2f).
 - A Load-Playlist dialog that takes a path and does nothing (wired in N7/N8, VM proof pending — §1 BETA-09).
-- Placebo controls presented as working: Shuffle/Repeat, O/V menus, menu
-  Exit/submenus, EQ presets, vis/plugin/prefs selection (§1 BETA-06/08/10).
+- Placebo controls presented as working: Clutter O/V, menu Exit/submenus, EQ presets,
+  prefs/plugin UI selection (§1 BETA-06/10; Shuffle/Repeat and Visualiser are now functional).
 - Any reintroduction of: phantom Playing over silence (keep
   `app.rs:1201-1233` + VM proof), cpal flush claimed as success (keep
   `cpal_out.rs:381-382` refusal + restart barrier), config self-corruption
@@ -243,8 +274,9 @@ designed nowhere and run nowhere.
 
 ## 5. What this review could not determine
 
-- Whether the shipped EXEs import only system DLLs, launch on a truly clean
-  OS, or trigger reputation prompts (no artefact inspection or run here).
+- Whether the shipped EXEs launch on a truly clean OS or trigger reputation
+  prompts (PE imports are now statically audited via `xtask pe-imports` against
+  system-DLL allowlists, but bare clean-machine run has not been executed in the VM).
 - Whether `resident.rs`, `flush_contract.rs`, M17's new tests, P5's loader
   tests, or the tray/hotkey headless tests pass — none executed anywhere
   per their cards, and no post-merge VM record names them.
