@@ -321,9 +321,33 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The ring root fix (2026-10-18 16:05)
+
+`c96935a`. All **six** edge guards in `crates/rustamp-ipc/src/shm/ring.rs` are
+gone - the diagnosis listed four PCM sites, but the two visualiser sites carried
+the same unsound edge. Every advance now signals; the only surviving guards are
+facts about **this** side (a wake-less ring does not look at an event, and a call
+that moved no frame signals nothing), which is exactly what made the old ones
+unsound. Cost: one extra signal per advance on a wake ring.
+
+**RFC 0007 section 6.2 is withdrawn, not corrected** - the proof's load-bearing
+premise is false, and correcting it would have left the unsound rule standing as
+the recommendation while the code did something else. The withdrawn text stays
+in the document verbatim and dated, with the counterexample, and the two sound
+alternatives are recorded as open item O15. Nothing on the wire, in the header
+or in the API moves.
+
+The acceptance test that "could not fail" now fails on a zero read, and three
+deterministic tests pin the rule through the plain, blocking and visualiser
+paths by taking a third handle on the ring latches and requiring a signal on an
+advance that does not cross the empty or full boundary. All six of those
+assertions fail under the old code.
+
+One small follow-up is named and not done: `crates/rustamp-mediahost/src/pcm.rs`
+lines 26-31 still describe the edge as live code. It needs one sentence, not a
+behaviour change, and the slice it justifies is still justified without it.
+
 ## The `wave26-windows` rescue (2026-10-18 12:45)
-
-
 Cleaning up 181 accumulated lane worktrees freed 47 GB, and one of the two that
 could not be removed turned out to hold **real work that never landed**:
 
