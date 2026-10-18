@@ -635,6 +635,40 @@ impl Engine {
         self.current
     }
 
+    /// If repeat was disabled mid-run while a cycle was playing, determine the
+    /// timeline end of the currently audible cycle if subsequent cycles were
+    /// already prebuffered into `track_starts` (spec S15 §4.3).
+    fn current_cycle_end(&self, pos: u64) -> Option<u64> {
+        let n = self.queue.len();
+        if n == 0 {
+            return None;
+        }
+        let curr_idx = self
+            .track_starts
+            .iter()
+            .rposition(|&(_, start)| pos >= start)?;
+        if !self.shuffle {
+            let last_track_index = (n - 1) as u32;
+            let final_entry_idx = self.track_starts[curr_idx..]
+                .iter()
+                .position(|&(idx, _)| idx == last_track_index)
+                .map(|offset| curr_idx + offset)?;
+            if final_entry_idx + 1 < self.track_starts.len() {
+                Some(self.track_starts[final_entry_idx + 1].1)
+            } else {
+                None
+            }
+        } else {
+            let cycle = curr_idx / n;
+            let final_entry_idx = cycle * n + (n - 1);
+            if final_entry_idx + 1 < self.track_starts.len() {
+                Some(self.track_starts[final_entry_idx + 1].1)
+            } else {
+                None
+            }
+        }
+    }
+
     /// Whether shuffle mode is enabled (spec S15).
     pub fn shuffle(&self) -> bool {
         self.shuffle
@@ -686,6 +720,11 @@ impl Engine {
             self.repeat = repeat;
             if repeat {
                 self.end_of_stream = None;
+            } else if self.transport == TransportState::Playing {
+                let pos = self.sync.consumed();
+                if let Some(cycle_end) = self.current_cycle_end(pos) {
+                    self.end_of_stream = Some(cycle_end);
+                }
             }
             self.send(DecodeMsg::SetRepeat(self.repeat));
             self.bus.publish(Event::ModesChanged {
@@ -1353,6 +1392,13 @@ impl Engine {
         // `consumed >= end` instead guarantees we wait until the last
         // real audio frame of the run leaves the ring, not merely until the device clock
         // passes the nominal end time.
+        if !self.repeat && self.transport == TransportState::Playing && self.end_of_stream.is_none()
+        {
+            let pos = self.sync.consumed();
+            if let Some(cycle_end) = self.current_cycle_end(pos) {
+                self.end_of_stream = Some(cycle_end);
+            }
+        }
         if let Some(end) = self.end_of_stream {
             let (written, consumed) = self.sync.counters();
             if written >= end && consumed >= end && self.transport == TransportState::Playing {
@@ -1459,7 +1505,10 @@ impl Engine {
                 self.bus.publish(Event::StreamInfoChanged(self.stream));
             }
             DecodeOut::EndOfStream { timeline_end } => {
-                self.end_of_stream = Some(timeline_end);
+                self.end_of_stream = Some(match self.end_of_stream {
+                    Some(existing) => existing.min(timeline_end),
+                    None => timeline_end,
+                });
             }
             DecodeOut::EndOfStreamRevoked => {
                 self.end_of_stream = None;
@@ -1498,6 +1547,14 @@ impl Engine {
         let frozen_end = self.end_of_stream;
         self.end_of_stream = None;
         self.start_drain = None;
+        if let Some(end) = frozen_end {
+            for &(idx, start) in self.track_starts.iter().rev() {
+                if end > start || (end == start && start == 0) {
+                    self.current = Some(idx);
+                    break;
+                }
+            }
+        }
         self.track_starts.clear();
         self.sync.set_active(false);
         let _ = self.output.pause();

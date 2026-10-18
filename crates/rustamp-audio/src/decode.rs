@@ -425,7 +425,7 @@ pub(crate) fn spawn(
         drain_epoch: start_epoch,
         report_start: start_epoch.is_some(),
         stage_failed: false,
-        cycle_boundary: None,
+        cycle_boundaries: Vec::new(),
     };
     let handle = std::thread::Builder::new()
         .name("rustamp-decode".into())
@@ -536,9 +536,9 @@ struct Worker {
     /// A DSP stage failure was already reported this run (RFC 0014 §4.2,
     /// first failure sticks): the worker is one run, so the flag is per run.
     stage_failed: bool,
-    /// Timeline position of a repeat cycle loop seam, if a new cycle was
+    /// Timeline positions of repeat cycle loop seams for cycles that have been
     /// prebuffered while repeat was ON.
-    cycle_boundary: Option<u64>,
+    cycle_boundaries: Vec<u64>,
 }
 
 impl Worker {
@@ -618,7 +618,7 @@ impl Worker {
                         if (next as usize) < self.cfg.queue.len() {
                             Some(next)
                         } else if self.repeat && !self.cfg.queue.is_empty() {
-                            self.cycle_boundary = Some(self.timeline);
+                            self.cycle_boundaries.push(self.timeline);
                             Some(0)
                         } else {
                             None
@@ -631,7 +631,7 @@ impl Worker {
                             self.shuffle_pos += 1;
                             Some(self.shuffle_plan[self.shuffle_pos] as u32)
                         } else if self.repeat && !self.cfg.queue.is_empty() {
-                            self.cycle_boundary = Some(self.timeline);
+                            self.cycle_boundaries.push(self.timeline);
                             let last = self.shuffle_plan.last().copied();
                             self.replan_shuffle_new_cycle(last);
                             Some(self.shuffle_plan[0] as u32)
@@ -898,12 +898,9 @@ impl Worker {
             if self.stopped {
                 return Outcome::Stop;
             }
-            if let Some(boundary) = self.cycle_boundary {
-                let (_written, consumed) = self.cfg.sync.counters();
-                if consumed >= boundary {
-                    self.cycle_boundary = None;
-                }
-            }
+            let (_written, consumed) = self.cfg.sync.counters();
+            self.cycle_boundaries
+                .retain(|&boundary| consumed < boundary);
             if self.check_control() {
                 return self.pending_skip.take().unwrap_or(Outcome::Stop);
             }
@@ -1177,10 +1174,12 @@ impl Worker {
                 }
                 Ok(DecodeMsg::SetRepeat(on)) => {
                     self.repeat = on;
-                    if !on && let Some(boundary) = self.cycle_boundary {
+                    if !on {
                         let (_written, consumed) = self.cfg.sync.counters();
-                        if consumed < boundary {
-                            self.cycle_boundary = None;
+                        if let Some(&boundary) =
+                            self.cycle_boundaries.iter().find(|&&b| consumed < b)
+                        {
+                            self.cycle_boundaries.clear();
                             self.flush_converter();
                             let _ = self.tx.send(DecodeOut::EndOfStream {
                                 timeline_end: boundary,
@@ -1231,7 +1230,7 @@ impl Worker {
                     if on && !self.cfg.queue.is_empty() {
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
                         if !self.shuffle {
-                            self.cycle_boundary = Some(self.timeline);
+                            self.cycle_boundaries.push(self.timeline);
                             return Some(0);
                         } else {
                             if self.shuffle_plan.is_empty() {
@@ -1239,7 +1238,7 @@ impl Worker {
                             }
                             let last = self.shuffle_plan.last().copied();
                             self.replan_shuffle_new_cycle(last);
-                            self.cycle_boundary = Some(self.timeline);
+                            self.cycle_boundaries.push(self.timeline);
                             return Some(self.shuffle_plan[0] as u32);
                         }
                     }
@@ -1270,12 +1269,12 @@ impl Worker {
                     if self.repeat && !self.cfg.queue.is_empty() {
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
                         if !self.shuffle {
-                            self.cycle_boundary = Some(self.timeline);
+                            self.cycle_boundaries.push(self.timeline);
                             return Some(0);
                         } else {
                             let last = self.shuffle_plan.last().copied();
                             self.replan_shuffle_new_cycle(last);
-                            self.cycle_boundary = Some(self.timeline);
+                            self.cycle_boundaries.push(self.timeline);
                             return Some(self.shuffle_plan[0] as u32);
                         }
                     }
