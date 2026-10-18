@@ -36,6 +36,6 @@ pub use single_instance::{
     Claim, ForwardRequest, HandOff, Instance, LockState, StartupAction, claim, forward,
     instance_key, startup_action, take_pending,
 };
-pub use tray::{TRAY_CALLBACK_MESSAGE, TRAY_MENU, TRAY_TOOLTIP, TrayMenuEntry};
+pub use tray::{TRAY_CALLBACK_MESSAGE, TRAY_LEFT_CLICK, TRAY_MENU, TRAY_TOOLTIP, TrayMenuEntry};
 #[cfg(windows)]
 pub use tray::{TrayError, TrayIcon};

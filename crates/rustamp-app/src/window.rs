@@ -1348,6 +1348,49 @@ impl Windowed {
         }
     }
 
+    /// The three tray seams, drained once per frame on the UI thread. The
+    /// shell-restart re-add runs first, so a just-restored icon is live before
+    /// this frame's clicks are considered.
+    #[cfg(windows)]
+    fn drain_tray(&mut self) {
+        self.readd_tray_after_shell_restart();
+        self.drain_tray_menu();
+        self.drain_tray_left_click();
+    }
+
+    /// F5 follow-up, gap 2: Explorer restarted and dropped every icon. The
+    /// callback queued the `TaskbarCreated` broadcast; re-add through the same
+    /// `NIM_ADD` path `attach` uses. The subclass survived, so it is not
+    /// reinstalled, and a refusal degrades to a warning — no retry loop.
+    #[cfg(windows)]
+    fn readd_tray_after_shell_restart(&self) {
+        let Some(tray) = &self.tray else {
+            return;
+        };
+        if !tray.take_shell_restart() {
+            return;
+        }
+        if let Err(error) = tray.readd() {
+            eprintln!("rustamp: tray icon lost after a shell restart: {error}");
+        }
+    }
+
+    /// F5 follow-up, gap 1: a **left** click activates the window instead of
+    /// doing nothing. It routes through the existing model entry
+    /// [`rustamp_platform::TRAY_LEFT_CLICK`] and the same
+    /// `submit_platform_commands` path a menu pick uses, so the tray still
+    /// invents no command and no popup is opened here.
+    #[cfg(windows)]
+    fn drain_tray_left_click(&mut self) {
+        let Some(tray) = &self.tray else {
+            return;
+        };
+        if !tray.take_left_click() {
+            return;
+        }
+        self.submit_platform_commands(rustamp_platform::TRAY_LEFT_CLICK.commands());
+    }
+
     /// The native callback only queues. Open the popup here, outside winit's
     /// window procedure, then route the selected model entry through submit.
     #[cfg(windows)]
@@ -1593,7 +1636,7 @@ impl ApplicationHandler for Windowed {
         // in queue order, before the usual pump/state synchronisation below.
         self.submit_hotkeys(take_pending_hotkeys());
         #[cfg(windows)]
-        self.drain_tray_menu();
+        self.drain_tray();
         // A `--no-audio` run has no device pulling on its own thread, so the
         // virtual clock is driven here, once per frame, exactly as
         // `run_headless` drives it headless. With a real device this is a
@@ -1913,6 +1956,34 @@ mod tests {
             "Exit must reach the app, not just close a popup"
         );
         assert!(presenter.window.is_none());
+    }
+
+    /// F5 follow-up, gap 1: the left click reaches show/hide through the real
+    /// App command channel, both ways, and stays distinct from a right click.
+    #[test]
+    fn a_tray_left_click_toggles_the_main_window_through_the_command_path() {
+        let mut presenter = desktop_test_presenter(false);
+        assert!(presenter.app.main_visible(), "visibility starts true");
+        presenter.submit_platform_commands(rustamp_platform::TRAY_LEFT_CLICK.commands());
+        assert!(!presenter.app.main_visible(), "a left click hides it");
+        presenter.submit_platform_commands(rustamp_platform::TRAY_LEFT_CLICK.commands());
+        assert!(presenter.app.main_visible(), "and shows it again");
+        // Same model entry as the menu's show/hide row, so the two agree.
+        presenter.submit_platform_commands(TrayMenuEntry::ToggleMainWindow.commands());
+        assert!(!presenter.app.main_visible());
+        presenter.submit_platform_commands(rustamp_platform::TRAY_LEFT_CLICK.commands());
+        assert!(presenter.app.main_visible());
+        // A left click is not a right click: it never quits and never moves
+        // the transport, whatever the popup rows would have done.
+        assert!(!presenter.app.quit());
+        assert_eq!(presenter.app.engine().transport(), TransportState::Stopped);
+        // And a right-click pick that is *not* show/hide leaves visibility be.
+        presenter.submit_platform_commands(TrayMenuEntry::Stop.commands());
+        assert!(
+            presenter.app.main_visible(),
+            "a right-click transport pick must not toggle the window"
+        );
+        assert!(presenter.window.is_none(), "the test must stay headless");
     }
 
     #[test]
