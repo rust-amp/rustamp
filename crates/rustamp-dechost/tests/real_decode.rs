@@ -347,13 +347,26 @@ fn garbage_and_empty_files_are_clean_errors_never_eos() {
             let _ = done.send(outcome);
         });
         let outcome = DecoderSession::open(client, NamedPcmRings, file_location(&path), 3);
+        // The honest contract is a loud refusal that carries the resident's
+        // reason — never an accepted session, never EOS. The error variant is
+        // deliberately not pinned: the framework's control monitor consumes
+        // the resident's terminal DecoderError and fails the peer sticky
+        // (rustamp-mediahost/src/control.rs), so the player sees
+        // Disconnected("resident decoder failed: operation failed: ..."),
+        // and the OperationFailed arm in DecoderSession::open is unreachable
+        // (the monitor never forwards DecoderError to the session). The
+        // framework's own resident-failure test pins the reason, not the
+        // variant; this one does the same and keeps the reason.
         let described = match &outcome {
             Ok(_) => "Ok(session): the undecodable file was accepted".to_string(),
             Err(error) => format!("Err({error:?})"),
         };
+        let Err(error) = outcome else {
+            panic!("{name}: undecodable input must be a loud error, never EOS (got {described})");
+        };
         assert!(
-            matches!(outcome, Err(MediaHostError::OperationFailed(_))),
-            "{name}: undecodable input must be a loud error, never EOS (got {described})"
+            error.to_string().contains("operation failed"),
+            "{name}: the loud error must carry the resident's refusal reason (got {described})"
         );
         result
             .recv_timeout(JOIN_WAIT)

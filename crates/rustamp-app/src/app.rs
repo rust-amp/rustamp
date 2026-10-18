@@ -3598,11 +3598,17 @@ mod tests {
         assert_eq!(app.engine().queue()[0], TrackSource::path(t1));
         assert_eq!(app.engine().queue()[1], TrackSource::path(t2));
 
-        // First entry starts playback
+        // First entry starts playback. The engine starts the run synchronously
+        // (`play_index` sets the transport before the dialog key returns), but
+        // the UI machine learns Playing only when the app pumps the
+        // StateChanged event off the bus, so the wait must cover the UI state
+        // it asserts: a wait on the engine alone is already satisfied before
+        // the first pump and would assert an event nobody has delivered yet.
         assert!(pump_until(
             &mut app,
             |app| app.engine().transport() == TransportState::Playing
-                && app.engine().current_index() == Some(0),
+                && app.engine().current_index() == Some(0)
+                && app.state().transport == TransportState::Playing,
             2000
         ));
         assert_eq!(app.state().transport, TransportState::Playing);
