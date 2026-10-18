@@ -838,10 +838,11 @@ mod tests {
         }
     }
 
-    /// A hostile block (NaN, ±infinity) comes out as silence, stays finite,
-    /// and leaves no poison behind: the next block matches a stage that saw
-    /// zeros instead, bit for bit (the sanitizer maps non-finite to exactly
-    /// `0.0` before the filters).
+    /// A hostile block (non-finite samples mixed into signal) becomes silence
+    /// at the stage input, stays finite on the way out, and leaves no poison
+    /// behind: the next block matches, bit for bit, a stage that saw the same
+    /// block with the non-finite samples as zeros (the sanitizer maps
+    /// non-finite to exactly `0.0` before the filters).
     #[test]
     fn non_finite_input_becomes_silence_without_poisoning_history() {
         let state = enabled(
@@ -862,19 +863,27 @@ mod tests {
             "nothing non-finite leaves"
         );
 
-        // What follows the poison must equal what follows zeros.
+        // What follows the poison must equal what follows the same block with
+        // the non-finite samples as zeros: the sanitizer maps them to exactly
+        // 0.0 before the filters, so the poison leaves no trace beyond a zero
+        // sample. The surrounding signal is not part of the claim, so the
+        // baseline keeps it — an all-zero baseline would also drop the
+        // signal's filter history and compare against the wrong stage.
         let probe = sine(440.0, 0.25, 2048);
         let mut a = probe.clone();
         used.process(&mut a);
         let mut fresh = stage(&state, 1);
-        let mut zeros = vec![0.0; 2048];
-        fresh.process(&mut zeros);
+        let mut sanitized: Vec<f32> = hostile
+            .iter()
+            .map(|s| if s.is_finite() { *s } else { 0.0 })
+            .collect();
+        fresh.process(&mut sanitized);
         let mut b = probe.clone();
         fresh.process(&mut b);
         assert_eq!(
             bits(&a),
             bits(&b),
-            "history after poison == history after zeros"
+            "history after poison == history after the sanitized block"
         );
     }
 
