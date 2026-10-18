@@ -215,8 +215,13 @@ fn fixture() -> PathBuf {
 ///
 /// In a virtual machine (Hyper-V headless guest), the default 10 ms WASAPI
 /// endpoint buffer leaves no cushion against scheduler jitter or preemption.
-/// Requesting 100 ms gives WASAPI a sufficiently deep capture ring buffer.
-const CAPTURE_BUFFER: Duration = Duration::from_millis(100);
+/// A 100 ms buffer proved still too tight: under heavy test-suite load, VM
+/// preemption spikes exceeding 100 ms triggered a capture ring overrun (xrun)
+/// that dropped a packet at frame 68355, breaking the continuous tone into
+/// 23- and 4-window fragments. Requesting 500 ms gives WASAPI 50 device
+/// periods of capture headroom, absorbing virtualization scheduling jitter
+/// without dropping frames or breaking the contiguous tone.
+const CAPTURE_BUFFER: Duration = Duration::from_millis(500);
 
 /// Bounded tolerance for transient buffer underruns/overruns (xruns) on the
 /// virtual cable under VM load.
