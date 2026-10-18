@@ -854,12 +854,13 @@ impl Windowed {
 
     /// A key press while the dialog window is focused.
     ///
-    /// The dialog consumes `Enter` (confirm the jump box, the skin
-    /// browser or the open-media dialog; a no-op on the load-playlist and preferences dialogs, whose
-    /// confirmation is open per RFC 0010 and whose contents are unmeasured), `Escape` (close),
-    /// `Backspace`, typed text (the open-media field and the jump box, see
-    /// [`App::dialog_text`]) and the arrows of the skin browser; the window
-    /// closes itself when the app reports no open dialog afterwards.
+    /// The dialog consumes `Enter` (confirm the jump box, the skin browser,
+    /// the open-media dialog, or the load-playlist dialog, which loads the
+    /// chosen playlist file; the preferences dialog is a no-op, its contents
+    /// unmeasured), `Escape` (close), `Backspace`, typed text (the open-media
+    /// and load-playlist fields and the jump box, see [`App::dialog_text`])
+    /// and the arrows of the skin browser; the window closes itself when the
+    /// app reports no open dialog afterwards.
     fn dialog_key_event(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
         if event.state != ElementState::Pressed {
             return;

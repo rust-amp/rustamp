@@ -2399,8 +2399,9 @@ mod tests {
     #[test]
     fn open_playlist_is_an_app_owned_command_that_opens_its_dialog() {
         // RFC 0010: LIST OPTS opens the `Load Playlist` dialog (S06 §4). The
-        // spec fixes the title only, so the app opens the real window and
-        // implements no dialog behaviour beyond it — in particular no note.
+        // spec fixes the title only; this command opens the real window and
+        // records no note of its own — the dialog's load behaviour is pinned
+        // by the load-playlist tests below.
         let (mut app, _dir) = app_with_file(None);
         assert!(crate::routing::app_owns(&Command::OpenPlaylist));
         app.submit(Command::OpenPlaylist).unwrap();
@@ -3376,8 +3377,10 @@ mod tests {
 
     #[test]
     fn the_load_playlist_dialog_keeps_its_confirmation_open() {
-        // RFC 0010: no confirmation semantics. Enter is consumed and changes
-        // nothing; Escape closes; the focused-window close does too.
+        // An empty confirm keeps the dialog open (there is no path to load);
+        // a confirmed one loads the file and closes the dialog (see the
+        // load-playlist tests below). Escape closes; the focused-window
+        // close does too.
         use rustamp_ui::{DialogKind, Key};
 
         let (mut app, _dir) = app_with_file(None);
@@ -4059,6 +4062,62 @@ mod tests {
         assert_eq!(report.skip_count(), 1);
         assert!(report.skips[0].reason().contains("dangling #EXTINF"));
 
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("loaded 2 tracks, skipped 1 malformed entries")),
+            "notes: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("skipped: dangling #EXTINF")),
+            "notes: {notes:?}"
+        );
+    }
+
+    /// The other half of readiness finding BETA-09 (review revision
+    /// `f9012dc`): a playlist named as the CLI `<file>` must load as a *list*
+    /// through the reporting reader, not queue as one media file. The dialog
+    /// half is pinned above; this pins the CLI half, which no test covered.
+    #[test]
+    fn playlist_file_given_on_the_command_line_loads_as_a_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let t1 = track(&dir, "track1.tst");
+        let t2 = track(&dir, "track2.tst");
+
+        // A dangling EXTINF before the first entry: the reader drops it and
+        // keeps the reason, so an app that called the legacy `read_playlist` /
+        // `load_playlist_file` (which discard it through `into_entries`) could
+        // not satisfy the skip assertions below.
+        let m3u_path = dir.path().join("cli.m3u");
+        std::fs::write(
+            &m3u_path,
+            b"#EXTM3U\r\n#EXTINF:60,Dangling Track\r\n#EXTINF:120,Track One\r\ntrack1.tst\r\n#EXTINF:180,Track Two\r\ntrack2.tst\r\n",
+        )
+        .unwrap();
+
+        // The playlist path *is* the CLI `<file>` argument.
+        let (mut app, _d) = app_with_file(Some(m3u_path.clone()));
+
+        // It loaded as a list of its surviving entries, in file order...
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.engine().queue()[0], TrackSource::path(t1));
+        assert_eq!(app.engine().queue()[1], TrackSource::path(t2));
+        // ...and the playlist itself is not in the queue as a media path.
+        assert!(!app.engine().queue().contains(&TrackSource::path(m3u_path)));
+
+        // The kept reasons reached the app: the report is recorded and not
+        // silent, and no error was fabricated.
+        let report = app.last_playlist_report().expect("report recorded");
+        assert!(!report.is_clean());
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.skip_count(), 1);
+        assert!(report.skips[0].reason().contains("dangling #EXTINF"));
+        assert_eq!(app.last_error(), None);
+
+        // The drop is surfaced as a note (stderr in windowed runs).
         let notes = app.drain_notes();
         assert!(
             notes
