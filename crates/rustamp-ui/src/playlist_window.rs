@@ -209,15 +209,22 @@ pub const SCROLL_SPLIT_Y: i32 = 83;
 /// Handle y for a scroll offset of `first_visible` in a list of `len`.
 ///
 /// The three S01 §4.2 points (20 top, 40 middle, 60 bottom) are pinned; the
-/// linear interpolation between them is an own choice. A list that fits the
-/// four-row page shows the handle at the top.
+/// linear interpolation between them is an own choice, rounded to the
+/// nearest row so that it is the exact inverse of
+/// [`scroll_offset_for_handle_y`] on the pixel grid (a dragged handle
+/// renders under the cursor). A list that fits the four-row page shows the
+/// handle at the top.
 pub fn scroll_handle_y(first_visible: usize, len: usize) -> i32 {
     if len <= VISIBLE_ROWS {
         return SCROLL_TOP_Y;
     }
     let max_first = len.saturating_sub(VISIBLE_ROWS);
     let clamped = first_visible.min(max_first);
-    SCROLL_TOP_Y + (SCROLL_TRAVEL_PX as usize * clamped / max_first.max(1)) as i32
+    // Round to the nearest row, the same way the inverse rounds; the
+    // settled points are exact multiples of the row count, so they are
+    // unchanged by the rounding.
+    let rows = max_first.max(1);
+    SCROLL_TOP_Y + ((SCROLL_TRAVEL_PX as usize * clamped + rows / 2) / rows) as i32
 }
 
 /// Which scroll direction (if any) a click at `(x, y)` requests.
@@ -258,7 +265,12 @@ pub fn scroll_handle_rect(first_visible: usize, len: usize) -> Rect {
 /// fixes the pixel-to-row mapping. This is the linear inverse of
 /// [`scroll_handle_y`] (which is itself an own-choice interpolation between
 /// the three settled S01 §4.2 points), clamped to the track ends and rounded
-/// to the nearest row, so every offset round-trips exactly.
+/// to the nearest row, so the two mappings are exact inverses on the pixel
+/// grid: every handle position maps to an offset and back to the same
+/// position. An exact round trip in the other direction — every offset
+/// through its position and back — is impossible, because the 57 offsets of
+/// a 60-entry list share 41 integer pixel rows; offsets that share a row
+/// land within one row of themselves.
 pub fn scroll_offset_for_handle_y(y: i32, len: usize) -> usize {
     let max_first = len.saturating_sub(VISIBLE_ROWS);
     if max_first == 0 {
@@ -670,13 +682,23 @@ mod tests {
     }
 
     #[test]
-    fn handle_drag_mapping_round_trips_every_offset() {
+    fn handle_drag_mapping_round_trips_every_position() {
         // S06 §3 settles only that a dragged handle "moves the view"; the
         // linear pixel-to-row mapping is an own choice, pinned here by the
-        // round-trip: every offset maps to a handle y and back to itself.
+        // round-trip in the drag direction: every handle position maps to a
+        // scroll offset and back to the same position, so a dragged handle
+        // renders under the cursor. The reverse — every offset through its
+        // position and back — cannot be exact, because the 57 offsets of a
+        // 60-entry list share 41 integer pixel rows; those offsets land
+        // within one row of themselves, pinned below.
+        for y in SCROLL_TOP_Y..=SCROLL_TOP_Y + SCROLL_TRAVEL_PX {
+            let offset = scroll_offset_for_handle_y(y, 60);
+            assert_eq!(scroll_handle_y(offset, 60), y, "y {y}");
+        }
+        // Offsets that share a pixel row land within one row of themselves.
         for offset in 0..=56usize {
-            let y = scroll_handle_y(offset, 60);
-            assert_eq!(scroll_offset_for_handle_y(y, 60), offset, "offset {offset}");
+            let back = scroll_offset_for_handle_y(scroll_handle_y(offset, 60), 60);
+            assert!(back.abs_diff(offset) <= 1, "offset {offset}");
         }
         // Ends and clamps.
         assert_eq!(scroll_offset_for_handle_y(20, 60), 0);

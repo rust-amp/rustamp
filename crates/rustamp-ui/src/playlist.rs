@@ -151,8 +151,10 @@ pub enum PlaylistKeyAction {
 /// Home, End, PageUp, PageDown and Enter with no modifiers; `Alt+Up` and
 /// `Alt+Down` for moving the selected block; and `Ctrl+Delete` for cropping to
 /// the selection. Plain `Delete`, `Ctrl+A` and `Ctrl+I` return `None` here to
-/// preserve the existing app-side shortcut routing (`App::playlist_key_down`),
-/// while their actions can be dispatched directly via [`PlaylistWindow::handle_key_action`].
+/// preserve the existing app-side shortcut routing (`App::playlist_key_down`).
+/// Nothing dispatches these actions yet — the app does not consult this map —
+/// so applying them (and the plain `Delete` row) is app-side follow-up work;
+/// the map only names the actions.
 pub fn playlist_key_action(key: Key, modifiers: Modifiers) -> Option<PlaylistKeyAction> {
     match modifiers {
         Modifiers::NONE => match key {

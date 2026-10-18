@@ -1627,7 +1627,10 @@ mod tests {
         assert!(!manager.key(Key::Digit(1)));
         assert!(!manager.key(Key::Space));
         assert!(manager.key(Key::Backspace));
-        assert_eq!(manager.playlist_text(), "  mix.m3");
+        // Backspace removes exactly one character — here one of the two
+        // trailing spaces the field was set with (they pin the trim on
+        // confirm above), so the other trailing space remains.
+        assert_eq!(manager.playlist_text(), "  mix.m3u ");
     }
 
     #[test]
