@@ -321,6 +321,34 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The orchestrator merged a lane that had died mid-work, and reverted it (2026-10-19 00:40)
+
+**A mistake, recorded because it is the exact class this project has already paid
+for once.**
+
+`wave119-beta07` died on a provider quota after writing a card and a **half
+finished** test file. I read the card, believed its claim that the gates passed,
+and merged - but I had written the merge script without the guard that branches on
+the gate exit codes, so the merge went through while `fmt` was **1** and `clippy`
+was **101**, with real compile errors: an unresolved import of `MenuOutcome`, a
+call to `AppOptions::headless` that does not exist, and `MainWindowLayout::default`
+that does not exist either. The lane had died **mid-edit**, so its file was never
+compilable and its card's claim about the gates described an earlier state.
+
+Reverted with `git reset --hard 086a339` (nothing was pushed and there is no
+remote, so this is clean). The tree compiles again, `fmt` and `clippy` are both 0,
+the half-written test and its card are gone, and the tag `0.1.0` is untouched.
+
+**Two lessons, and the second one is the expensive one:**
+
+1. **A lane that died mid-work is not a lane.** Its card may describe a state its
+   files never reached. The work must be finished by a fresh lane, not merged on
+   the strength of a claim written before the work was done.
+2. **The gate check must branch on the exit code, not print it.** I printed the
+   codes and then merged anyway, which is the same failure the notes already warn
+   about from an earlier wave: a red clippy was merged once before. Printing an
+   exit code is not a gate; the gate is the branch that refuses to continue.
+
 ## Rustamp 0.1.0 is tagged (2026-10-18 23:55)
 
 The release is complete except for the push, which cannot proceed: **the
