@@ -17,7 +17,6 @@ model class it wants.
 | 2 | **BETA-09** — loading a playlist file is a dead end; the skip diagnostics exist only at the library API | `rustamp-app` | `docs/tasks/BETA-readiness.md`, `docs/tasks/E3-playlist-skips.md` | fast |
 | 3 | **BETA-08** — the shuffle and repeat lights advertise behaviour that is not applied (S15) | `rustamp-audio`, `rustamp-playlist` | `docs/tasks/BETA-readiness.md`, `specs/S15-shuffle-repeat.md` if it exists | balanced |
 | 4 | **The wake, cross-process** — prove the RFC 0007 wake across the 32/64-bit boundary, the way `ring-cross` does | `rustamp-ipc`, `xtask` | `docs/tasks/G2-ipc-blocking.md`, `docs/rfc/0007-blocking-consumer.md` | balanced |
-| 5 | **Golden cases, second set** — double-size main window, the EQ with a raised band, a playing main window with a time and a title | `rustamp-ui` tests | `tests/golden/README.md` | fast |
 | 6 | **The EQ presets** — the popup exists and does nothing; find what a spec settles and implement only that | `rustamp-ui`, `rustamp-app` | `specs/S07-eq-dsp.md` §4.2 | balanced |
 | 7 | **`rustamp-mediahost`, the PCM transfer** — RFC 0006's remainder: the ring wake and real decoders behind the stubs | `rustamp-mediahost` | `docs/rfc/0006-out-of-process-hosting.md` | deep |
 | 8 | **ReplayGain** — the M2 item, with the scanner | `rustamp-audio`, `rustamp-meta` | `docs/PLAN.md` M2 | deep |
@@ -30,10 +29,13 @@ model class it wants.
   engine must learn about a device failure. Owns `rustamp-core`,
   `rustamp-output` and the engine's poll step in `rustamp-audio` — so it waits
   for the audio crate to be free (the flush lane holds it right now).
-- **The plugin DLL acceptance** (`docs/tasks/P3-dll-acceptance.md`). Approved:
-  build the loader and run it against a **freely licensed** plugin (in_openmpt
-  is in the reference installation) **in the VM only**. Owns
-  `rustamp-plughost`, `rustamp-plugin-abi` and a VM-only test.
+- **The plugin DLL acceptance** (`docs/tasks/P3-dll-acceptance.md`) - **do not
+  start: the card contradicts this line.** It appears here and again under
+  "Needs a decision first", and the card itself is explicit that it "is not
+  permission to run anything". Since then the loader was built and Group D runs
+  against `in_openmpt` in the VM, so the execution this line describes has
+  effectively happened; what remains is the owner's call on the card's own open
+  points. Treat this entry as a question for the owner, not a task.
 - **The S08 measurement runs** (`docs/tasks/S08-vis.md`). The probe and the
   three jobs are designed; the orchestrator runs them in the VM and the lane
   fills the spec from the artefacts.

@@ -321,6 +321,43 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The queue had a stale line, and a lane proved it instead of building a duplicate (2026-10-18 20:05)
+
+Two lanes finished and both are merged (`aa107aa` mediahost, `586a780` the golden
+card).
+
+**The golden lane found no work to do, and that was the right answer.** The ready
+queue asked for a second set of golden cases - a double-size main window, the
+equaliser with a raised band, and a playing main window with a time and a title -
+and all three already exist in both committed skin namespaces, with images
+tracked in `main`. The line was stale: written before the work landed and never
+removed. The proof is ancestry rather than assertion, the commit that introduced
+the line being an ancestor of the commit that landed the work and not the other
+way round, and the double-size images were checked offline as well - every
+two-by-two block matching the single-size pixel over more than 120 000 samples
+with no deviation. Adding a duplicate would have forced a blessing of a state
+that was already pinned, which is a fabricated expectation rather than a test.
+The line is struck from the queue. The one genuinely unpinned neighbour, a
+double-size **playing** window, is named in the card with an honest note that its
+added value is small because another case already doubles a playing state.
+
+**The mediahost lane took the honest remainder of RFC 0006** and said so rather
+than declaring the RFC done. Reading it against the code showed most of what the
+RFC asks for already real; what was actually wrong was that decoder statistics
+could be lost when a stream ended or changed format, and that a DSP return ring
+closed early was reported as an ordinary end of stream instead of a persistent
+error - a caller could have believed a truncated stream was complete. Both are
+fixed, each with a regression test that fails if the fix is removed, and the
+stale comment that explained the ring wake as edge-triggered is corrected. What
+is still open is written down, including that a finished write side needs an
+unambiguous positive completion signal, because a closed ring alone cannot
+distinguish success from failure.
+
+**And a queue contradiction is corrected rather than left to trap a lane:** P3,
+the plugin DLL acceptance, is listed both as released by the owner and as needing
+a decision, while its own card says plainly that it is not permission to run
+anything. The entry now says what it is - a question for the owner.
+
 ## Two earlier verdicts overturned, and the consequence named (2026-10-18 19:20)
 
 `f8d3e87`, gates green. Two reds survived the previous round, and chasing them
