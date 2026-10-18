@@ -9,7 +9,7 @@ use rustamp_core::audio::{AudioSpec, Confidence, Decoder, DecoderFactory, MediaS
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::StreamInfo;
 use rustamp_core::vis::{VIS_SAMPLES, VisFrame};
-use rustamp_ui::visualization::{SPECTRUM_BANDS, VisInput, VisMode, VisState};
+use rustamp_ui::visualization::{SPECTRUM_BANDS, VisError, VisInput, VisMode, VisState};
 
 struct Signal {
     rate: u32,
@@ -294,4 +294,29 @@ fn absent_tap_frames_keep_exact_freshness_hold_fall_and_refresh_partition() {
     app.ui.refresh(1300);
     assert_eq!(app.state().visualization.bars, [0; SPECTRUM_BANDS]);
     assert_eq!(app.state().visualization.peaks, [0; SPECTRUM_BANDS]);
+}
+
+#[test]
+fn a_non_finite_frame_is_only_reported_and_playback_keeps_running() {
+    // The live decoder sanitises non-finite samples before the tap (RFC 0014
+    // §4.5), so this arm is unreachable end to end: it is pinned here by direct
+    // injection. The point is that the report never halts playback and never
+    // becomes a fake accepted frame.
+    let (mut app, _dir) = fixture();
+    app.ui
+        .handle_event(&Event::StateChanged(TransportState::Playing), 0);
+    let mut waveform = [[0.0f32; VIS_SAMPLES]; 2];
+    waveform[0][3] = f32::NAN;
+    let bad = VisFrame {
+        timestamp_us: 1,
+        waveform,
+        ..VisFrame::default()
+    };
+    assert_eq!(
+        app.ui.push_vis_frame(&bad, 32_000, 0),
+        Err(VisError::NonFinitePcm)
+    );
+    assert_eq!(app.state().transport, TransportState::Playing);
+    assert_eq!(app.state().visualization.input, VisInput::Missing);
+    assert_eq!(app.state().visualization.source_timestamp_us, None);
 }

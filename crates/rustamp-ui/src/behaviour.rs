@@ -177,6 +177,12 @@ impl MainWindow {
     /// The app must drain `Engine::take_vis_frame()` in its pump, after transport
     /// and stream events. This UI-only method does not depend on the engine.
     /// Decode-ahead selection/latency and all reference S08 laws remain open.
+    ///
+    /// A returned [`VisError`] is an analysis report, never a playback error:
+    /// [`VisError::NonFinitePcm`] is an offline validation invariant that the
+    /// live path cannot reach (RFC 0014 §4.5 sanitises the samples first), so a
+    /// caller only notes it and keeps playing. It must not stop, pause or reset
+    /// the transport.
     pub fn push_vis_frame(
         &mut self,
         frame: &VisFrame,

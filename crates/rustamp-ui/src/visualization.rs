@@ -16,6 +16,10 @@
 //! selection metadata. Its timestamp is retained, not treated as a wall clock.
 //! Decode-ahead/audio-to-pixel synchronisation remains open. A missing or stale
 //! frame is not silence: the scope disappears and the existing bars/peaks decay.
+//! A frame carrying a non-finite sample is rejected as an *invalid frame*, never
+//! as a playback error: [`VisError::NonFinitePcm`] is an offline validation
+//! invariant that the live path cannot reach (RFC 0014 §4.5) and must not halt
+//! playback.
 
 use rustamp_core::vis::{VIS_SAMPLES, VisFrame};
 use rustamp_gfx::{Image, Rect};
@@ -129,12 +133,31 @@ pub struct VisAnalysis {
 }
 
 /// A frame cannot be analysed honestly with these inputs.
+///
+/// These are **analysis** errors, not playback errors: reporting one never
+/// changes transport, playback or engine state and never substitutes samples.
+/// The live caller `MainWindow::push_vis_frame` only notes them through the
+/// app's bounded diagnostic route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum VisError {
     /// The source sample rate is not supplied. Never assume 44.1 kHz.
     #[error("visualisation needs the source sample rate")]
     MissingSampleRate,
-    /// Reject the entire bad frame instead of inventing replacement samples.
+    /// An **offline validation invariant**, not a live-pipeline error.
+    ///
+    /// An isolated test harness, a synthetic unit test or a custom offline
+    /// analysis rejects a whole frame that carries a non-finite sample instead
+    /// of inventing replacement samples.
+    ///
+    /// On the live path this arm cannot fire: `rustamp-audio` replaces every
+    /// non-finite sample a stage produces with `0.0` before the frame reaches
+    /// the visualiser tap (RFC 0014 §4.5, defence in depth), and a stage that
+    /// detects its own non-finite output must return `Err` on the decode path
+    /// instead of relying on this check.
+    ///
+    /// It is therefore never a pipeline-halting audio error. An offline
+    /// analysis reports the frame as invalid and continues; playback state is
+    /// not touched.
     #[error("visualisation frame contains non-finite PCM")]
     NonFinitePcm,
 }
@@ -148,6 +171,10 @@ pub fn bin_frequency_hz(bin: usize, sample_rate_hz: u32) -> Result<f64, VisError
 }
 
 /// Analyse exactly the samples in a tap frame; leave `frame.spectrum` untouched.
+///
+/// A pure function over the frame and the rate: it is the offline analysis
+/// entry point as well as the live one, so a non-finite or rate-less frame is
+/// reported through [`VisError`] without touching playback or display state.
 ///
 /// Periodic Hann coherent-gain normalisation makes an integer-bin full-scale
 /// sine 1.0. Nyquist uses the undoubled real coefficient. DC removal happens
@@ -293,8 +320,11 @@ impl Visualizer {
 
     /// Accept one actual frame, with an unrounded source rate. Paused/stopped
     /// input is discarded, not queued for resume. Invalid input returns an error;
-    /// it never becomes a fake silence frame. Call regularly with the newest
-    /// frame the engine offers; arrival time is an own-choice display clock.
+    /// it never becomes a fake silence frame. A rejected frame is reported only
+    /// ([`VisError::NonFinitePcm`] is an offline validation invariant) and never
+    /// halts playback or clears the last accepted display state. Call regularly
+    /// with the newest frame the engine offers; arrival time is an own-choice
+    /// display clock.
     pub fn push(
         &mut self,
         frame: &VisFrame,
@@ -531,6 +561,33 @@ mod tests {
             frame.waveform[1][100] = bad;
             assert_eq!(analyze(&frame, 44100), Err(VisError::NonFinitePcm));
         }
+    }
+
+    #[test]
+    fn non_finite_pcm_is_an_offline_invariant_and_never_halts_playback() {
+        // The zero-sanitizer in `rustamp-audio` keeps this arm off the live path
+        // (RFC 0014 §4.5), so it is an offline validation invariant: it reports
+        // an invalid frame and touches nothing else. There is no playback state
+        // in this module to halt, and the last accepted display state survives.
+        let mut vis = Visualizer::default();
+        vis.set_mode(VisMode::Scope);
+        vis.push(&tone(16, 1.0), 44100, 0, TransportState::Playing)
+            .unwrap();
+        let accepted = vis.state().clone();
+        let mut bad = tone(16, 1.0);
+        bad.waveform[0][7] = f32::NAN;
+        // Same instant, so no elapsed display time confuses the comparison.
+        assert_eq!(
+            vis.push(&bad, 44100, 0, TransportState::Playing),
+            Err(VisError::NonFinitePcm)
+        );
+        assert_eq!(vis.state(), &accepted);
+        // A rejected frame does not wedge the analyser: the next finite frame is
+        // still accepted and the selected mode is unchanged.
+        vis.push(&tone(16, 0.25), 44100, 200, TransportState::Playing)
+            .unwrap();
+        assert_eq!(vis.state().input, VisInput::Fresh);
+        assert_eq!(vis.state().mode, VisMode::Scope);
     }
 
     #[test]

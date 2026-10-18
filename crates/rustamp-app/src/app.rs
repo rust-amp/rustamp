@@ -765,6 +765,10 @@ impl App {
     /// is not silence; refresh still ages the existing deterministic envelopes.
     /// Source/device rates may differ: the tap is before device conversion, so
     /// use the decoder's exact rate, never the device rate or rounded UI kHz.
+    ///
+    /// An analysis error is only noted, never fatal: `VisError::NonFinitePcm`
+    /// is an offline validation invariant that the live path cannot reach
+    /// (RFC 0014 §4.5), and noting a rejected frame must not halt playback.
     fn pump_visualization(&mut self, now_ms: u64) {
         let frame = self.engine.take_vis_frame();
         if std::mem::take(&mut self.vis_discontinuity) {
