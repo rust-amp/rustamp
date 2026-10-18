@@ -66,6 +66,8 @@ only when a slot would otherwise sit empty.
 | `paseo-wave90-vis` | the visualiser clears the moment playback stops, in every mode, and the test no longer dodges the claim (`f7b09ea`) - **two stopped-tail goldens must be re-blessed in the VM** |
 | `wave90-xtask` (Claude) | the full MPL-2.0 and Apache-2.0 texts shipped in the notices, the false placebo sentence in the generated README corrected, and a hand-written PE import inspector that refuses rather than passes (`ff644db`) - **closes release step 10** |
 | `paseo-wave90-audio` | deleted the orphaned `PlaybackOrder` with the layering evidence, restored the previous cycle plan on `Prev`, and kept the NaN sanitizer because RFC 0014 mandates it (`702719c`) |
+| `wave91-bless` (Claude) | a `--bless` path through the broker: the guest learns the token beside `--ignored`, the host gains a bless-output step and a gate on missing images (`2b54468`) |
+| `wave91-focus` (Claude) | **landed the rescued focus model**: `FocusNextWindow` cycles the open windows and `ShowMainWindow` now restores and focuses, hand-rebased with a Minimize/Show ordering fix and the S03 correction (`b17aa81`) |
 
 ### Where the W16 review stands
 
