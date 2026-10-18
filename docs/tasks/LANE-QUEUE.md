@@ -25,10 +25,13 @@ model class it wants.
 ## Released by the owner (2026-10-17) — ready to start
 
 - **RFC 0012, the device-error hook** (`docs/tasks/H4-output-error-rfc.md`,
-  `docs/rfc/0012-output-error-hook.md`). The contract change is approved: the
-  engine must learn about a device failure. Owns `rustamp-core`,
-  `rustamp-output` and the engine's poll step in `rustamp-audio` — so it waits
-  for the audio crate to be free (the flush lane holds it right now).
+  `docs/rfc/0012-output-error-hook.md`) - **do not start: it is not approved.**
+  This line said the contract change was approved; the RFC says `Status:
+  Proposed`, the H4 card says "design only - no implementation or behavior
+  change", and the section below correctly says it waits for the owner's
+  acceptance. The other section is right and this one was wrong. The audio crate
+  is free now, but that is not the blocker: the owner's acceptance is. Treat it
+  as a question for the owner.
 - **The plugin DLL acceptance** (`docs/tasks/P3-dll-acceptance.md`) - **do not
   start: the card contradicts this line.** It appears here and again under
   "Needs a decision first", and the card itself is explicit that it "is not
