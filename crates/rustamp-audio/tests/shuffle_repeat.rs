@@ -454,10 +454,11 @@ fn regression_late_repeat_disablement_near_cycle_boundary() {
     assert!(h.wait_track(0));
 
     // Under repeat, decoder decodes track A, track B, and starts prebuffering Cycle 2 track A.
-    // Pump only track A so track B is currently playing/audible.
     let len_a = track_frames(SHORT_A);
     let len_b = track_frames(SHORT_B);
+    assert!(h.wait_idle(|e| e.buffered_frames() > len_a + len_b, WAIT));
 
+    // Pump only track A so track B is currently playing/audible.
     h.clock.pump(len_a);
     h.engine.poll().unwrap();
     assert_eq!(h.engine.audible_index(), Some(1));
