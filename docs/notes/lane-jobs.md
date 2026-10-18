@@ -294,6 +294,33 @@ with every run's wall time and `resetBetweenRuns: false` stated honestly, and a
 non-zero exit despite eight green repetitions, so one failure cannot hide in a
 majority.
 
+## r54 (2026-10-18 15:40) - the suite is green, with nothing left red
+
+```
+ran 83, failed 0, hung 0        exit=0
+```
+
+**The first fully green suite.** Eighty-three binaries, no failure, no hang, and
+the new `deaf_wake` regression test passes (2 passed, 0.82 s), which is the
+deterministic pin for the stall fix: it removes the wake signal entirely and
+still demands bit-exact delivery from the header counters alone.
+
+What is green now, and what each one cost:
+
+| green | closed by |
+|---|---|
+| both golden binaries | re-blessed in the guest and promoted (`9467e47`) |
+| `shuffle_repeat` | the corrected cycle test (`7841807`) |
+| `dsp_roundtrip`, `real_decode` | the sliced PCM waits (`b67a5bc`) |
+| `deaf_wake` | new, and it cannot pass by luck |
+| the focus model, the visualiser clear, the licence texts, the import check | `b17aa81`, `f7b09ea`, `ff644db` |
+
+## r53 (2026-10-18 13:35) - one red, and it was the stall
+
+`ran 82, failed 1, hung 0`: the goldens were green and `shuffle_repeat` was
+green, and the single red was `dsp_roundtrip` at the thirty second escape. That
+run is what the rate measurement and the diagnosis grew out of.
+
 ## The `wave26-windows` rescue (2026-10-18 12:45)
 
 
