@@ -26,13 +26,17 @@ use rustamp_ipc::shm::{
 use rustamp_proto::host::{DspStageDesc, PcmSpecWire};
 
 use crate::control::{ControlPeer, RingAbort};
-use crate::pcm::{ClosePair, PcmOffer, PcmRings, validate_spec};
+use crate::pcm::{
+    ClosePair, PcmOffer, PcmRings, RingCounters, read_frames, validate_spec, write_frames,
+};
 use crate::{MediaHostError, Result};
 
 const CONTROL_WAIT: Duration = Duration::from_secs(5);
 // The ring API has no non-closing control interrupt. Slice worker waits so
 // resets are serviced even with no PCM/space; expiry is only a control check,
 // never EOS, failure or permission to drop a frame. Not a scheduling deadline.
+// It is also what keeps a skipped wake signal off this side's liveness, the
+// same job `crate::pcm::RING_POLL` does for the player side (same 20 ms).
 const CONTROL_POLL: Duration = Duration::from_millis(20);
 const BLOCK_FRAMES: usize = 1024;
 /// Host back-ring capacity in frames. `DspConfigure` carries no capacity hint
@@ -486,6 +490,32 @@ impl<F: PcmRings> DspSession<F> {
         self.from_host.frames_dropped()
     }
 
+    /// Back-ring counters right now, for stall diagnostics (see
+    /// [`RingCounters::available`]): a [`DspSession::read`] that returned
+    /// [`MediaHostError::TimedOut`] while `available` is nonzero waited on
+    /// processed frames the ring already held, which is a skipped wake and
+    /// not a slow host.
+    pub fn back_ring_counters(&self) -> RingCounters {
+        RingCounters {
+            published: self.from_host.frames_published(),
+            read: self.from_host.frames_read(),
+            closed: self.from_host.is_closed(),
+        }
+    }
+
+    /// In-ring counters right now, the mirror of [`DspSession::back_ring_counters`]
+    /// for the write direction: a [`DspSession::write_timeout`] that returned
+    /// [`MediaHostError::TimedOut`] while `available` is **below** the ring
+    /// capacity waited for space the ring already had.
+    pub fn in_ring_counters(&self) -> RingCounters {
+        let published = self.to_host.frames_written();
+        RingCounters {
+            published,
+            read: published.saturating_sub(self.to_host.frames_available()),
+            closed: self.to_host.is_closed(),
+        }
+    }
+
     /// Push whole frames toward the host. Infinite lossless wait; a closed
     /// ring with a healthy control channel is a loud disconnect, never data
     /// loss. Misaligned or empty buffers are caller errors. The bounded form
@@ -527,9 +557,10 @@ impl<F: PcmRings> DspSession<F> {
                     "unexpected DSP message while writing: {message:?}"
                 )));
             }
-            match self.to_host.write_from_blocking(
+            match write_frames(
+                &mut self.to_host,
                 &buf[offset * channels..frames * channels],
-                remaining(deadline)?,
+                deadline,
             ) {
                 Ok(0) => return Err(MediaHostError::TimedOut),
                 Ok(written) => offset += written,
@@ -567,7 +598,7 @@ impl<F: PcmRings> DspSession<F> {
             )));
         }
         let deadline = timeout.map(|duration| Instant::now() + duration);
-        match self.from_host.read_into_blocking(out, remaining(deadline)?) {
+        match read_frames(&mut self.from_host, out, deadline) {
             Ok(0) => Err(MediaHostError::TimedOut),
             Ok(frames) => {
                 self.peer.check()?;
@@ -782,16 +813,6 @@ fn attach_back<F: PcmRings>(
             Err(error)
         }
     }
-}
-
-fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>> {
-    deadline
-        .map(|deadline| {
-            deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(MediaHostError::TimedOut)
-        })
-        .transpose()
 }
 
 /// Owned child plus worker session. Drop always kills and reaps the helper.

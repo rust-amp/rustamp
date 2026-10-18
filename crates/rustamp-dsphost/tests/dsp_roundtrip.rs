@@ -18,6 +18,15 @@
 //! message on expiry names the stall. `DspSession::open` and `reconfigure`
 //! inherit the framework's 5 s `CONTROL_WAIT` for a single handshake
 //! exchange.
+//!
+//! What the escape used to hide (docs/tasks/W19-twoproc-stall.md): the
+//! framework spent the whole 30 s inside **one** wait on the back-ring's
+//! wake event, so a signal the ring skipped cost the entire bound instead of
+//! being noticed at the next look at the counters. `reset_keeps_rings_and_continues`
+//! is the most exposed test in this file, and that is the stall it hit. The
+//! framework now slices every PCM wait (`rustamp-mediahost`'s
+//! `pcm::RING_POLL`), and both escapes below print the ring counters so a
+//! future red says which of the two causes it was.
 
 #![cfg(windows)]
 
@@ -164,10 +173,18 @@ fn start(
 /// producer-side half of the deadlock this file once carried.
 fn write_pcm(session: &mut DspSession<NamedPcmRings>, buf: &[f32], step: &str) {
     match session.write_timeout(buf, Some(STALL_WAIT)) {
-        Err(MediaHostError::TimedOut) => panic!(
-            "stall: {step} could not write within {STALL_WAIT:?} \
-             (the resident stopped draining the in-ring without a close or an error)"
-        ),
+        Err(MediaHostError::TimedOut) => {
+            let ring = session.in_ring_counters();
+            panic!(
+                "stall: {step} could not write within {STALL_WAIT:?} \
+                 (the resident stopped draining the in-ring without a close or an error); \
+                 in-ring at the escape: published {}, read {}, available {}, closed {}",
+                ring.published,
+                ring.read,
+                ring.available(),
+                ring.closed
+            )
+        }
         other => other.unwrap(),
     }
 }
@@ -175,12 +192,26 @@ fn write_pcm(session: &mut DspSession<NamedPcmRings>, buf: &[f32], step: &str) {
 /// Read PCM with a stall escape (see the file docs): a healthy host delivers
 /// within milliseconds, so a timeout means it stopped answering without
 /// data, a close or an error — a stall that fails loudly, never a pass.
+///
+/// The escape reports the back-ring counters, because red on its own cannot
+/// tell the two causes apart (docs/tasks/W19-twoproc-stall.md): a nonzero
+/// `available` means the processed frames were already published and this
+/// wait slept on them (a skipped wake), a zero one means the host published
+/// nothing for thirty seconds (a wedged or starved host).
 fn read_pcm(session: &mut DspSession<NamedPcmRings>, out: &mut [f32], step: &str) -> usize {
     match session.read(out, Some(STALL_WAIT)) {
-        Err(MediaHostError::TimedOut) => panic!(
-            "stall: {step} received no PCM within {STALL_WAIT:?} \
-             (the resident stopped delivering without a close or an error)"
-        ),
+        Err(MediaHostError::TimedOut) => {
+            let ring = session.back_ring_counters();
+            panic!(
+                "stall: {step} received no PCM within {STALL_WAIT:?} \
+                 (the resident stopped delivering without a close or an error); \
+                 back-ring at the escape: published {}, read {}, available {}, closed {}",
+                ring.published,
+                ring.read,
+                ring.available(),
+                ring.closed
+            )
+        }
         other => other.unwrap(),
     }
 }
@@ -239,10 +270,18 @@ fn round_trip(session: &mut DspSession<NamedPcmRings>, from: usize, to: usize) -
 /// Sticky-EOS read with the same stall escape (see the file docs).
 fn read_sticky(session: &mut DspSession<NamedPcmRings>, out: &mut [f32], step: &str) -> usize {
     match session.read(out, Some(STALL_WAIT)) {
-        Err(MediaHostError::TimedOut) => panic!(
-            "stall: {step} received no drained close within {STALL_WAIT:?} \
-             (the resident stopped answering without closing the ring)"
-        ),
+        Err(MediaHostError::TimedOut) => {
+            let ring = session.back_ring_counters();
+            panic!(
+                "stall: {step} received no drained close within {STALL_WAIT:?} \
+                 (the resident stopped answering without closing the ring); \
+                 back-ring at the escape: published {}, read {}, available {}, closed {}",
+                ring.published,
+                ring.read,
+                ring.available(),
+                ring.closed
+            )
+        }
         other => other.unwrap(),
     }
 }

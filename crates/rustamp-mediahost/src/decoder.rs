@@ -15,7 +15,7 @@ use rustamp_proto::host::{MediaLocationWire, PcmSpecWire};
 use rustamp_proto::meta::TrackMetadata;
 
 use crate::control::ControlPeer;
-use crate::pcm::{PcmRings, validate_spec};
+use crate::pcm::{PcmRings, RingCounters, read_frames, validate_spec, write_frames};
 use crate::{MediaHostError, Result};
 
 const CONTROL_WAIT: Duration = Duration::from_secs(5);
@@ -136,9 +136,13 @@ fn pump<R: MappedRegion>(
             if let Some(message) = peer.try_recv()? {
                 return command(message);
             }
-            // Infinite, lossless wait. The independent control monitor owns a
-            // close-only view and wakes this worker on death/seek/shutdown.
-            match ring.write_from_blocking(&block[offset * channels..frames * channels], None) {
+            // Infinite, lossless wait, sliced into `RING_POLL` steps so that
+            // space the player has already freed is picked up from the
+            // counters even if the `Space` signal was skipped (see
+            // `crate::pcm::RING_POLL`). The independent control monitor owns
+            // a close-only view and wakes this worker on
+            // death/seek/shutdown.
+            match write_frames(ring, &block[offset * channels..frames * channels], None) {
                 Ok(written) => offset += written,
                 Err(RingError::Closed) => {
                     peer.check()?;
@@ -384,6 +388,19 @@ impl<F: PcmRings> DecoderSession<F> {
         self.input.frames_dropped()
     }
 
+    /// PCM ring counters right now, for stall diagnostics (see
+    /// [`RingCounters::available`]): a read that returned
+    /// [`MediaHostError::TimedOut`] while `available` is nonzero waited on
+    /// data the ring already held, which is a skipped wake and not a slow
+    /// resident.
+    pub fn ring_counters(&self) -> RingCounters {
+        RingCounters {
+            published: self.input.frames_published(),
+            read: self.input.frames_read(),
+            closed: self.input.is_closed(),
+        }
+    }
+
     fn remember(&mut self, message: Message) -> Result<()> {
         match message {
             Message::DecoderStats {
@@ -448,7 +465,7 @@ impl<F: PcmRings> DecoderSession<F> {
         while let Some(message) = self.peer.try_recv()? {
             self.remember(message)?;
         }
-        match self.input.read_into_blocking(out, remaining(deadline)?) {
+        match read_frames(&mut self.input, out, deadline) {
             Ok(0) => Err(MediaHostError::TimedOut),
             Ok(frames) => {
                 self.peer.check()?;

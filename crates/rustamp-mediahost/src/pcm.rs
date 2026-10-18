@@ -1,11 +1,118 @@
 //! PCM ring allocation/opening, separate from residents and control messages.
+//!
+//! Every PCM wait in this crate goes through [`read_frames`]/[`write_frames`],
+//! which slice the wait so that delivery depends on the ring counters alone
+//! and never on a wake signal arriving (see [`RING_POLL`]).
+
+use std::time::{Duration, Instant};
 
 use rustamp_ipc::Message;
-use rustamp_ipc::shm::{MappedRegion, RingConsumer, RingDirection, RingProducer};
+use rustamp_ipc::shm::{MappedRegion, RingConsumer, RingDirection, RingError, RingProducer};
 use rustamp_proto::host::PcmSpecWire;
 
 use crate::control::RingAbort;
 use crate::{MediaHostError, Result};
+
+/// Longest single wait on one ring wake event.
+///
+/// RFC 0007 §6.1 and §6.3 make the ring counters the source of truth and the
+/// wake event only a hint: "a lost, duplicated or spurious signal can never
+/// turn into a wrong frame", because the waiter re-derives its condition from
+/// the counters after every wake. A waiter that spends its whole deadline in
+/// one `WaitForSingleObject` turns that hint into a liveness dependency: if
+/// the signal is skipped, the wait runs to the caller's bound even though the
+/// counters already say the condition is met. Slicing the wait restores the
+/// contract — a skipped signal then costs one slice, not the whole bound.
+///
+/// The signal can in fact be skipped. `rustamp-ipc` takes RFC 0007 §6.2's
+/// edge-triggered refinement (the producer signals `Data` only when its write
+/// started from empty, the consumer signals `Space` only when its read
+/// started from full), and each side decides that from a counter the peer
+/// owns, which it may read before the peer's last store. The exact
+/// interleaving is in `docs/tasks/W19-twoproc-stall.md`.
+///
+/// 20 ms is the DSP worker's existing `CONTROL_POLL`, which already bounds
+/// both of its ring waits for the same kind of reason: invisible next to
+/// every caller bound on this path (5 s in the engine adapter, 30 s in the
+/// suites) and 50 event waits per second for a ring that is idle anyway.
+pub(crate) const RING_POLL: Duration = Duration::from_millis(20);
+
+/// Ring counters at one instant. Diagnostics only — the three values are
+/// read one after the other, so a live peer may advance between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingCounters {
+    /// Frames the producer has published.
+    pub published: u64,
+    /// Frames the consumer has taken.
+    pub read: u64,
+    /// Whether either end has closed the ring.
+    pub closed: bool,
+}
+
+impl RingCounters {
+    /// Frames published and not yet taken.
+    ///
+    /// This is the value that tells a lost wake from a starved schedule: a
+    /// read that timed out while this is nonzero waited on data the ring
+    /// already held.
+    pub fn available(&self) -> u64 {
+        self.published.wrapping_sub(self.read)
+    }
+}
+
+/// The next slice to wait, or `None` once the caller's deadline has passed.
+fn next_slice(deadline: Option<Instant>) -> Option<Duration> {
+    match deadline {
+        None => Some(RING_POLL),
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            (!left.is_zero()).then(|| left.min(RING_POLL))
+        }
+    }
+}
+
+/// Read whole frames, with the wait sliced to [`RING_POLL`] (see there).
+///
+/// `deadline` keeps the meanings [`RingConsumer::read_into_blocking`] gives a
+/// timeout, so no caller contract changes: `None` waits until data, a closed
+/// ring or a failure; `Some` returns `Ok(0)` once it has passed. A slice that
+/// expires is not an outcome — it only sends the loop back to the counters.
+pub(crate) fn read_frames<R: MappedRegion>(
+    consumer: &mut RingConsumer<R>,
+    out: &mut [f32],
+    deadline: Option<Instant>,
+) -> std::result::Result<usize, RingError> {
+    loop {
+        let Some(slice) = next_slice(deadline) else {
+            return Ok(0);
+        };
+        match consumer.read_into_blocking(out, Some(slice))? {
+            0 => {}
+            frames => return Ok(frames),
+        }
+    }
+}
+
+/// Write whole frames, with the wait sliced to [`RING_POLL`] (see there).
+///
+/// Same deadline meanings as [`read_frames`]. `Ok(0)` means the deadline
+/// passed with the ring still full; the blocking write never drops, so no
+/// frame is lost by a slice or by the timeout.
+pub(crate) fn write_frames<R: MappedRegion>(
+    producer: &mut RingProducer<R>,
+    samples: &[f32],
+    deadline: Option<Instant>,
+) -> std::result::Result<usize, RingError> {
+    loop {
+        let Some(slice) = next_slice(deadline) else {
+            return Ok(0);
+        };
+        match producer.write_from_blocking(samples, Some(slice))? {
+            0 => {}
+            written => return Ok(written),
+        }
+    }
+}
 
 /// A newly allocated host-to-player ring. No PCM may flow until RingReady.
 pub struct PcmOffer<R: MappedRegion> {

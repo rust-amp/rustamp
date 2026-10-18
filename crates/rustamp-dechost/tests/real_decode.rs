@@ -11,6 +11,17 @@
 //! generous bound (`JOIN_WAIT`), which a healthy host reaches in milliseconds;
 //! the message on expiry names the stall. `DecoderSession::open` and `seek`
 //! inherit the framework's 5 s `CONTROL_WAIT` for a single handshake exchange.
+//!
+//! What the escape used to hide (docs/tasks/W19-twoproc-stall.md): the
+//! framework spent the whole 30 s inside **one** wait on the ring's wake
+//! event, so a signal the ring skipped cost the entire bound instead of being
+//! noticed at the next look at the counters.
+//! `end_of_stream_comes_only_after_the_ring_is_drained` is the most exposed
+//! test in this file — three-frame ring, 32-frame reads, so the most
+//! handoffs — and that is the stall it hit. The framework now slices every
+//! PCM wait (`rustamp-mediahost`'s `pcm::RING_POLL`), and the escape below
+//! prints the ring counters so a future red says which of the two causes it
+//! was.
 
 #![cfg(windows)]
 
@@ -146,16 +157,30 @@ fn finish_ok(session: DecoderSession<NamedPcmRings>, done: mpsc::Receiver<Result
 /// Read PCM with a stall escape (see the file docs): a healthy resident
 /// delivers within milliseconds, so a timeout means it stopped answering
 /// without EOS or an error — a stall that fails loudly, never a pass.
+///
+/// The escape reports the ring counters, because red on its own cannot tell
+/// the two causes apart (docs/tasks/W19-twoproc-stall.md): a nonzero
+/// `available` means the frames were already published and this wait slept
+/// on them (a skipped wake), a zero one means the resident published nothing
+/// for thirty seconds (a wedged or starved host).
 fn read_pcm(
     session: &mut DecoderSession<NamedPcmRings>,
     buf: &mut [f32],
     step: &str,
 ) -> Result<usize> {
     match session.read(buf, Some(STALL_WAIT)) {
-        Err(MediaHostError::TimedOut) => panic!(
-            "stall: {step} received no PCM within {STALL_WAIT:?} \
-             (the resident stopped delivering without EOS or an error)"
-        ),
+        Err(MediaHostError::TimedOut) => {
+            let ring = session.ring_counters();
+            panic!(
+                "stall: {step} received no PCM within {STALL_WAIT:?} \
+                 (the resident stopped delivering without EOS or an error); \
+                 ring at the escape: published {}, read {}, available {}, closed {}",
+                ring.published,
+                ring.read,
+                ring.available(),
+                ring.closed
+            )
+        }
         other => other,
     }
 }
