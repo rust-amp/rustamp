@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 
 use rustamp_core::command::Command;
 use rustamp_core::state::WindowId as CoreWindowId;
-use rustamp_platform::{init_dpi_awareness, single_instance};
+use rustamp_platform::{HotkeyAction, init_dpi_awareness, single_instance, take_pending_hotkeys};
 use rustamp_ui::{
     DEFAULT_MAIN_POSITION, DialogKind, Key, Modifiers, PLAYLIST_WINDOW_SIZE, ShortcutOutcome,
     docking::DockedStack,
@@ -246,6 +246,10 @@ pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {
 
 struct Windowed {
     app: App,
+    /// Declared before the window/surfaces so its Drop removes the icon and
+    /// callback while the owning HWND is still alive (F3/F5).
+    #[cfg(windows)]
+    tray: Option<rustamp_platform::TrayIcon>,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     main_id: Option<WindowId>,
@@ -293,6 +297,8 @@ struct Windowed {
     applied_eq_client: Option<(u32, u32)>,
     /// The always-on-top level last applied to the OS window.
     applied_on_top: bool,
+    /// Runtime show/hide state last applied to the main OS window.
+    applied_main_visible: bool,
     /// The main window title last applied ([`App::window_title`]).
     applied_title: Option<String>,
     /// The docked stack model (S05 §3.3, §4.2, §5): shade/double-size flags
@@ -309,6 +315,8 @@ impl Windowed {
         let applied_on_top = app.always_on_top();
         Self {
             app,
+            #[cfg(windows)]
+            tray: None,
             window: None,
             surface: None,
             main_id: None,
@@ -335,6 +343,7 @@ impl Windowed {
             applied_client: None,
             applied_eq_client: None,
             applied_on_top,
+            applied_main_visible: true,
             applied_title: None,
             stack: DockedStack::default_launch(),
             last_main_outer: None,
@@ -362,6 +371,14 @@ impl Windowed {
             self.stack.set_main_double_size(double_size);
         }
         if let Some(window) = &self.window {
+            if self.app.main_visible() != self.applied_main_visible {
+                self.applied_main_visible = self.app.main_visible();
+                window.set_visible(self.applied_main_visible);
+                if self.applied_main_visible {
+                    window.set_minimized(false);
+                    window.focus_window();
+                }
+            }
             if self.app.always_on_top() != self.applied_on_top {
                 self.applied_on_top = self.app.always_on_top();
                 window.set_window_level(if self.applied_on_top {
@@ -1291,6 +1308,62 @@ impl Windowed {
         }
         Some(())
     }
+
+    /// F3's pending actions enter the same external command channel as a
+    /// plugin or forwarded command, never the already-applied UI path.
+    fn submit_hotkeys(&mut self, actions: impl IntoIterator<Item = HotkeyAction>) {
+        for action in actions {
+            self.submit_platform_commands(action.commands());
+        }
+    }
+
+    fn submit_platform_commands(&mut self, commands: impl IntoIterator<Item = Command>) {
+        for command in commands {
+            if let Err(error) = self.app.submit(command) {
+                eprintln!("rustamp: desktop command failed: {error}");
+            }
+        }
+    }
+
+    /// F3 attach seam: called once after the main window and surface exist.
+    /// Failure leaves the window running, with no icon and no callback.
+    #[cfg(windows)]
+    fn attach_tray(&mut self) {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Some(window) = &self.window else {
+            return;
+        };
+        match window.window_handle() {
+            Ok(handle) => match handle.as_raw() {
+                RawWindowHandle::Win32(handle) => {
+                    match rustamp_platform::TrayIcon::attach(handle.hwnd.get()) {
+                        Ok(tray) => self.tray = Some(tray),
+                        Err(error) => eprintln!("rustamp: tray icon unavailable: {error}"),
+                    }
+                }
+                _ => eprintln!("rustamp: tray icon unavailable: expected a Win32 window handle"),
+            },
+            Err(error) => eprintln!("rustamp: tray icon unavailable: {error}"),
+        }
+    }
+
+    /// The native callback only queues. Open the popup here, outside winit's
+    /// window procedure, then route the selected model entry through submit.
+    #[cfg(windows)]
+    fn drain_tray_menu(&mut self) {
+        let Some(tray) = &self.tray else {
+            return;
+        };
+        if !tray.take_menu_request() {
+            return;
+        }
+        match tray.show_menu(rustamp_platform::TRAY_MENU) {
+            Ok(Some(entry)) => self.submit_platform_commands(entry.commands()),
+            Ok(None) => {} // Cancellation is not a failure or a command.
+            Err(error) => eprintln!("rustamp: tray menu unavailable: {error}"),
+        }
+    }
 }
 
 impl ApplicationHandler for Windowed {
@@ -1345,6 +1418,8 @@ impl ApplicationHandler for Windowed {
         if let Some(window) = &self.window {
             self.main_id = Some(window.id());
         }
+        #[cfg(windows)]
+        self.attach_tray();
         self.sync_window_state();
         self.sync_eq_window(event_loop);
         self.request_redraw();
@@ -1514,6 +1589,11 @@ impl ApplicationHandler for Windowed {
                 }
             }
         }
+        // F3 seam, next to F2: every queued firing is submitted exactly once,
+        // in queue order, before the usual pump/state synchronisation below.
+        self.submit_hotkeys(take_pending_hotkeys());
+        #[cfg(windows)]
+        self.drain_tray_menu();
         // A `--no-audio` run has no device pulling on its own thread, so the
         // virtual clock is driven here, once per frame, exactly as
         // `run_headless` drives it headless. With a real device this is a
@@ -1553,6 +1633,14 @@ impl ApplicationHandler for Windowed {
         // An error the user must see goes to the native title (BETA-04).
         self.sync_title();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Remove the icon/callback before winit tears down the owning HWND.
+        #[cfg(windows)]
+        {
+            self.tray = None;
+        }
     }
 }
 
@@ -1729,6 +1817,113 @@ fn map_key(event: &KeyEvent) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::AppOptions;
+    use crate::cli::OutputChoice;
+    use rustamp_core::config::Config;
+    use rustamp_core::playlist::MediaLocation;
+    use rustamp_core::state::TransportState;
+    use rustamp_platform::TrayMenuEntry;
+
+    /// No event loop, window, hotkey registration, host process or audio device.
+    fn desktop_test_presenter(with_tracks: bool) -> Windowed {
+        let mut app = App::new(AppOptions {
+            config: Config::default(),
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            file: None,
+            seconds: None,
+        })
+        .unwrap();
+        if with_tracks {
+            let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../rustamp-decoders/tests/fixtures/sine.flac");
+            assert!(fixture.exists(), "missing fixture {}", fixture.display());
+            app.submit(Command::AddItems {
+                items: vec![
+                    MediaLocation::File(fixture.clone()),
+                    MediaLocation::File(fixture),
+                ],
+                at: None,
+                play: false,
+            })
+            .unwrap();
+        }
+        Windowed::new(app)
+    }
+
+    fn wait_for_index(presenter: &mut Windowed, index: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while presenter.app.engine().current_index() != Some(index) {
+            presenter.app.pump().unwrap();
+            assert!(Instant::now() < deadline, "track {index} was not selected");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn the_hotkey_drain_consumer_routes_in_order_through_the_real_app_channel() {
+        let mut presenter = desktop_test_presenter(true);
+        // Order matters: pause after play must leave the transport Paused.
+        presenter.submit_hotkeys([HotkeyAction::Play, HotkeyAction::PauseUnpause]);
+        assert_eq!(presenter.app.engine().transport(), TransportState::Paused);
+        wait_for_index(&mut presenter, 0);
+        presenter.submit_hotkeys([HotkeyAction::PauseUnpause]);
+        assert_eq!(presenter.app.engine().transport(), TransportState::Playing);
+        presenter.submit_hotkeys([HotkeyAction::NextTrack]);
+        wait_for_index(&mut presenter, 1);
+        presenter.submit_hotkeys([HotkeyAction::PreviousTrack]);
+        wait_for_index(&mut presenter, 0);
+        presenter.submit_hotkeys([HotkeyAction::Stop, HotkeyAction::ToggleMainWindow]);
+        assert_eq!(presenter.app.engine().transport(), TransportState::Stopped);
+        assert!(
+            !presenter.app.main_visible(),
+            "one toggle must hide, not toggle twice"
+        );
+        presenter.submit_hotkeys([]);
+        assert!(
+            !presenter.app.main_visible(),
+            "an empty drain must do nothing"
+        );
+        assert!(presenter.window.is_none(), "the test must stay headless");
+    }
+
+    #[test]
+    fn tray_picks_share_the_command_path_for_visibility_transport_and_quit() {
+        let mut presenter = desktop_test_presenter(true);
+        for (entry, expected) in [
+            (TrayMenuEntry::Play, TransportState::Playing),
+            (TrayMenuEntry::PauseUnpause, TransportState::Paused),
+            (TrayMenuEntry::PauseUnpause, TransportState::Playing),
+            (TrayMenuEntry::Stop, TransportState::Stopped),
+        ] {
+            presenter.submit_platform_commands(entry.commands());
+            assert_eq!(presenter.app.engine().transport(), expected);
+        }
+        presenter.submit_platform_commands(TrayMenuEntry::ToggleMainWindow.commands());
+        assert!(!presenter.app.main_visible());
+        presenter.app.submit(Command::ShowMainWindow).unwrap();
+        assert!(
+            presenter.app.main_visible(),
+            "the normal show command can recover it"
+        );
+        presenter.submit_platform_commands(TrayMenuEntry::ExitPlayer.commands());
+        assert!(
+            presenter.app.quit(),
+            "Exit must reach the app, not just close a popup"
+        );
+        assert!(presenter.window.is_none());
+    }
+
+    #[test]
+    fn a_refused_play_on_an_empty_queue_does_not_drop_the_next_desktop_action() {
+        let mut presenter = desktop_test_presenter(false);
+        presenter.submit_hotkeys([HotkeyAction::Play, HotkeyAction::ToggleMainWindow]);
+        assert_eq!(presenter.app.engine().transport(), TransportState::Stopped);
+        assert!(!presenter.app.main_visible());
+        presenter.submit_hotkeys([HotkeyAction::ToggleMainWindow]);
+        assert!(presenter.app.main_visible());
+    }
 
     #[test]
     fn physical_codes_map_to_headless_keys() {

@@ -30,8 +30,8 @@
 //! ([`rustamp_platform::HotkeySession`]), which registers the default
 //! `Ctrl+Alt` chords on its own thread for the whole run. A refused chord is a
 //! stderr warning, never a startup failure. `--null` starts no session.
-//! Fired actions queue in the platform crate; the `window.rs` follow-up drains
-//! them through the normal command path (see the F3 card).
+//! Fired actions queue in the platform crate; `Windowed::about_to_wait` drains
+//! them through the normal command path (see the F3/F5 cards).
 
 #![forbid(unsafe_code)]
 

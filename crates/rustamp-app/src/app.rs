@@ -113,6 +113,9 @@ pub struct App {
     pub(crate) focused: bool,
     current_skin: Option<PathBuf>,
     quit: bool,
+    /// Runtime tray/hotkey visibility; start visible even if a previous run hid
+    /// the main window, so an unavailable tray can never strand the player.
+    main_visible: bool,
     minimize_requested: bool,
     playlist_ended: bool,
     /// Stable ids the app assigns to the engine's queue entries.
@@ -263,6 +266,7 @@ impl App {
             focused: true,
             current_skin: None,
             quit: false,
+            main_visible: true,
             minimize_requested: false,
             playlist_ended: false,
             entry_ids: Vec::new(),
@@ -530,6 +534,11 @@ impl App {
     /// Whether the app should exit.
     pub fn quit(&self) -> bool {
         self.quit
+    }
+
+    /// Whether the presenter should show the main window (F3/F5 show/hide).
+    pub fn main_visible(&self) -> bool {
+        self.main_visible
     }
 
     /// Whether the app uses the null output (`--null` headless or `--no-audio`
@@ -1322,6 +1331,8 @@ impl App {
                 // The UI machine has already applied its S02 prediction; the
                 // presenter reads the new size from `frame_size`.
             }
+            C::ToggleWindow(WindowId::Main) => self.main_visible = !self.main_visible,
+            C::ShowMainWindow => self.main_visible = true,
             C::ToggleWindow(WindowId::Equalizer) => {
                 self.note(
                     "Equalizer window toggled (the render state drives the OS window); \
@@ -1387,7 +1398,7 @@ impl App {
             // The main-menu popup (S04): the app owns the open state, the
             // presenter hosts the OS window for it.
             C::OpenMainMenu => self.open_main_menu(),
-            C::FocusNextWindow | C::ShowMainWindow => {
+            C::FocusNextWindow => {
                 self.note(format!("{command:?} is not implemented yet"));
             }
             C::ConfigureVisPlugin | C::ToggleVisPlugin => {
