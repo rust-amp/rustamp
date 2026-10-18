@@ -144,6 +144,25 @@ Two hypotheses, both settled:
 start lanes that build, and do not build, while a suite run is in flight. A
 targeted re-run of those two binaries on a quiet host decides it.
 
+## Stray file in the canonical tree (2026-10-18 11:49)
+
+An empty `package.rs`, zero bytes, appeared in the **canonical tree root**
+`D:\code\Rustamp` at 11:49:25 - inside the window in which the xtask lane
+started. It was quarantined to
+`C:\Users\micro\AppData\Local\Temp\opencode\stray-package.rs` rather than
+deleted, so the evidence survives while the tree stays clean, and the lane's own
+worktree is untouched and correct (`xtask/src/package.rs`, a new
+`xtask/licenses/MPL-2.0.txt`, a new `xtask/src/pe_imports.rs`).
+
+It is the boundary-violation class the notes already warn about, and the likely
+mechanism is worth naming: **an OpenCode subagent inherits the session working
+directory**, so a shell redirect or a bare file creation inside a lane whose
+prompt says "write only in your worktree" can still land in `D:\code\Rustamp`.
+The lane's edits are unaffected because they used absolute paths. The rule that
+follows: a lane that runs commands must `Set-Location` into its worktree first,
+and the orchestrator must check `git status --short` in the canonical tree
+before every merge - which is how this one was caught.
+
 ## Two runner defects the targeted re-run exposed (2026-10-18 12:00)
 
 The targeted re-run of `dsp_roundtrip` and `real_decode` (`-Filter ... -SkipBuild`)
