@@ -81,6 +81,7 @@ struct Endpoint {
     resumes: u64,
     closes: u64,
     refuse_flush: bool,
+    fail_flush: bool,
 }
 
 struct BufferedOutput(Arc<Mutex<Endpoint>>);
@@ -118,8 +119,12 @@ impl OutputDevice for BufferedOutput {
     fn flush(&mut self) -> Result<()> {
         let mut ep = self.0.lock().unwrap();
         ep.flushes += 1;
+        if ep.fail_flush {
+            // A genuine output failure must stay loud.
+            return Err(Error::Output("scripted endpoint flush failure".into()));
+        }
         if ep.refuse_flush {
-            // Like cpal: report refusal and leave the endpoint untouched.
+            // Like cpal: report refusal/capability-gap and leave the endpoint untouched.
             return Err(Error::Unsupported("scripted endpoint flush"));
         }
         ep.pending.clear();
@@ -150,6 +155,10 @@ struct Harness {
 
 impl Harness {
     fn new(refuse_seek: bool, refuse_flush: bool, short: bool) -> Self {
+        Self::with_flags(refuse_seek, refuse_flush, false, short)
+    }
+
+    fn with_flags(refuse_seek: bool, refuse_flush: bool, fail_flush: bool, short: bool) -> Self {
         let ep = Arc::new(Mutex::new(Endpoint {
             render: None,
             pending: VecDeque::new(),
@@ -160,6 +169,7 @@ impl Harness {
             resumes: 0,
             closes: 0,
             refuse_flush,
+            fail_flush,
         }));
         let bus = EventBus::new();
         let events = bus.subscribe();
@@ -366,8 +376,8 @@ fn pause_resume_retains_audio_and_stop_start_still_discards_the_previous_run() {
 }
 
 #[test]
-fn a_refused_flush_on_seek_closes_output_and_blocks_all_restart_paths() {
-    let mut h = Harness::new(false, true, false);
+fn a_failed_flush_on_seek_closes_output_and_blocks_all_restart_paths() {
+    let mut h = Harness::with_flags(false, false, true, false);
     h.prime();
     h.engine.seek_frames(TARGET).unwrap();
     h.drive_to_seek_result();
@@ -378,7 +388,7 @@ fn a_refused_flush_on_seek_closes_output_and_blocks_all_restart_paths() {
     assert_eq!(
         h.ep.lock().unwrap().flushes,
         1,
-        "teardown must not retry a refused flush"
+        "teardown must not retry a failed flush"
     );
     assert_eq!(h.ep.lock().unwrap().closes, 1);
     assert!(h.ep.lock().unwrap().render.is_none());
@@ -410,8 +420,8 @@ fn a_refused_flush_on_seek_closes_output_and_blocks_all_restart_paths() {
 }
 
 #[test]
-fn stop_and_stopped_seek_report_a_refused_flush_instead_of_silent_success() {
-    let mut h = Harness::new(false, true, false);
+fn stop_and_stopped_seek_report_a_failed_flush_instead_of_silent_success() {
+    let mut h = Harness::with_flags(false, false, true, false);
     h.prime();
     assert!(h.engine.stop().is_err());
     assert_eq!(h.engine.transport(), TransportState::Stopped);
@@ -419,7 +429,7 @@ fn stop_and_stopped_seek_report_a_refused_flush_instead_of_silent_success() {
     assert_eq!(h.ep.lock().unwrap().closes, 1);
     assert!(h.engine.play().is_err());
 
-    let mut h = Harness::new(false, true, false);
+    let mut h = Harness::with_flags(false, false, true, false);
     assert!(h.engine.seek_frames(500).is_err());
     assert_eq!(h.engine.last_error().unwrap().kind, ErrorKind::Output);
     assert!(h.engine.play().is_err());
@@ -427,8 +437,8 @@ fn stop_and_stopped_seek_report_a_refused_flush_instead_of_silent_success() {
 }
 
 #[test]
-fn natural_end_keeps_its_position_and_reports_a_refused_flush() {
-    let mut h = Harness::new(false, true, true);
+fn natural_end_keeps_its_position_and_reports_a_failed_flush() {
+    let mut h = Harness::with_flags(false, false, true, true);
     h.engine.play_index(1).unwrap();
     h.wait(|h| h.engine.end_of_stream().is_some());
     h.stage(3000);
@@ -439,6 +449,101 @@ fn natural_end_keeps_its_position_and_reports_a_refused_flush() {
     assert_eq!(h.ep.lock().unwrap().closes, 1);
     assert_eq!(h.engine.last_error().unwrap().kind, ErrorKind::Output);
     assert!(h.engine.play().is_err());
+}
+
+#[test]
+fn an_unsupported_flush_on_seek_continues_playback_without_error_or_close() {
+    let mut h = Harness::new(false, true, false);
+    h.prime();
+    assert_eq!(h.ep.lock().unwrap().pending[0], expected(1, 0, 1)[0]);
+    h.engine.seek_frames(TARGET).unwrap();
+    h.drive_to_seek_result();
+    if h.engine.is_drain_pending() {
+        h.stage(64); // Drain callback; no post-seek content is writable yet.
+    }
+    h.wait(|h| h.ep.lock().unwrap().flushes == 1);
+    assert_eq!(
+        h.ep.lock().unwrap().closes,
+        0,
+        "unsupported flush must not close output"
+    );
+    assert_eq!(
+        h.engine.transport(),
+        TransportState::Playing,
+        "transport remains Playing"
+    );
+    assert!(
+        h.engine.last_error().is_none(),
+        "unsupported flush is a capability gap, not an error"
+    );
+    assert_eq!(h.engine.position_frames(), TARGET);
+    h.wait(|h| h.engine.buffered_frames() >= 256);
+    h.stage(256);
+    assert_eq!(
+        h.hear(),
+        expected(1, TARGET, 256),
+        "post-seek audio continues playing"
+    );
+}
+
+#[test]
+fn stop_and_stopped_seek_succeed_on_unsupported_flush() {
+    let mut h = Harness::new(false, true, false);
+    h.prime();
+    assert!(
+        h.engine.stop().is_ok(),
+        "stop must succeed even if endpoint flush is unsupported"
+    );
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+    assert_eq!(h.engine.position_frames(), 0);
+    assert_eq!(
+        h.ep.lock().unwrap().closes,
+        0,
+        "stop must not close output on unsupported flush"
+    );
+    assert!(h.engine.last_error().is_none());
+    assert!(
+        h.engine.play().is_ok(),
+        "playback must be restartable after stop on unsupported flush"
+    );
+
+    let mut h2 = Harness::new(false, true, false);
+    assert!(
+        h2.engine.seek_frames(500).is_ok(),
+        "stopped seek must succeed on unsupported flush"
+    );
+    assert!(h2.engine.last_error().is_none());
+    assert_eq!(h2.ep.lock().unwrap().closes, 0);
+    assert_eq!(h2.engine.position_frames(), 500);
+    assert!(
+        h2.engine.play().is_ok(),
+        "playback starts after stopped seek on unsupported flush"
+    );
+}
+
+#[test]
+fn natural_end_on_unsupported_flush_finishes_cleanly_without_error() {
+    let mut h = Harness::new(false, true, true);
+    h.engine.play_index(1).unwrap();
+    h.wait(|h| h.engine.end_of_stream().is_some());
+    h.stage(3000);
+    assert_eq!(h.hear(), expected(2, 0, 3000));
+    h.engine.poll().unwrap();
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+    assert_eq!(h.engine.position_frames(), 3000);
+    assert_eq!(
+        h.ep.lock().unwrap().closes,
+        0,
+        "natural end must not close output on unsupported flush"
+    );
+    assert!(
+        h.engine.last_error().is_none(),
+        "natural end on unsupported flush must not report an error"
+    );
+    assert!(
+        h.engine.play_index(0).is_ok(),
+        "subsequent playback must succeed without recreating engine"
+    );
 }
 
 #[test]
