@@ -321,6 +321,32 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The interactive run: 8 GUI tests freed, and three reds named (2026-10-18 18:10)
+
+The owner rule earned itself in its first use. With a desktop:
+
+- **All eight Group A GUI tests pass** - the window, the menu popup, the
+  equaliser window, the playlist window, the dialogs and the two tests that only
+  this lane can evidence. In session 0 they were red or not run.
+- **Group C, the four resident fixtures: all pass.**
+- **Two ignored tests fail in the interactive session too**, so they are **not**
+  the session-0 artefact the others turned out to be, and the readiness audit had
+  not listed them as expected-red either: the 32-bit DLL acceptance test that
+  proves host interaction (`dll_acceptance.rs:175`) and the host-window
+  end-to-end test (`plughost_e2e.rs:237`). Had the rule not been set, "session 0"
+  would have been accepted for both and two real findings would have gone
+  unnamed.
+- **A third red appeared only in the interactive suite run**:
+  `about_dialog_body_reflects_workspace_version` (`app.rs:4071`) asserts the
+  about dialog says `RUSTAMP 0.1.0-beta.1` while it now says `RUSTAMP 0.1.0`.
+  That is the version change colliding with a hardcoded string, and it is the
+  orchestrator's own doing: the version lane was told not to touch `crates/**`.
+  The honest fix is to assert against the crate version so it cannot go stale
+  again.
+
+All three are with a lane. A full guest log is kept at
+`C:\Users\micro\AppData\Local\Temp\opencode\vm-three-reds-full.log`.
+
 ## Phase 1 in the interactive session: 4 of 4 green (2026-10-18 17:40)
 
 ```
