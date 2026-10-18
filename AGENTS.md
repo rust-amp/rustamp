@@ -16,6 +16,11 @@ Read these first, in this order:
   never report a session-0 window failure as a product defect without re-running
   it in the interactive session first.
 
+- **No new Claude tasks** (owner rule, 2026-10-19). Do not start any further lane
+  on Claude. Existing Claude lanes may finish; nothing new goes there. With
+  Google's quota also exhausted until 2026-10-24, the remaining sources are
+  **OpenAI** and the **free** models.
+
 - **File search: use `es.exe`, always** (`C:\Program Files\Everything 1.5a\es.exe`),
   never a recursive directory walk. `es.exe <pattern>` prints full paths;
   `es.exe -r <regex>` for a pattern. The owner's standing instruction
