@@ -19,8 +19,10 @@
 //!    playback device must be the cable, not the default device.
 //! 3. The capture stream starts first and records a silent **pre-roll**
 //!    before playback starts (see "Synchronization").
-//! 4. The engine plays the fixture to its end (`Playing` → `Stopped`, no
-//!    error, ring drained), and the capture keeps recording a tail after it.
+//! 4. The engine plays the fixture to its end (`Playing` → `Stopped`, ring
+//!    drained), and the capture keeps recording a tail after it. The cpal
+//!    endpoint-buffer flush must report its documented terminal refusal;
+//!    the caller recreates the engine/output only after capture has stopped.
 //! 5. The recording is analysed in 50 ms windows (see "Metric"): the pre-roll
 //!    holds no tone; after the play mark the tone appears within a latency
 //!    bound, lasts as long as the fixture without a dropout, does not last
@@ -111,7 +113,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rustamp_audio::{Engine, EngineConfig, TrackSource};
 use rustamp_core::bus::EventBus;
-use rustamp_core::error::ErrorKind;
+use rustamp_core::error::{Error, ErrorInfo, ErrorKind};
 use rustamp_core::state::TransportState;
 use rustamp_output::CpalOutput;
 
@@ -613,25 +615,30 @@ fn the_cable_carries_the_fixture_tone() {
     // and COM contention on the virtual cable while capture is in flight.
     drop(stream);
 
-    // On a backend that cannot flush portably (the cpal cable endpoint),
-    // the post-playback flush was refused with Error::Unsupported.
-    // The engine treats that refusal as terminal for the current output:
-    // it stops the run and closes the output.
-    if let Some(error) = engine.last_error() {
-        assert_eq!(
-            error.kind,
-            ErrorKind::Output,
-            "the decode failed: {:?}",
-            engine.last_error()
-        );
-        assert!(
-            error.message.contains("output flush failed"),
-            "unexpected error on engine: {:?}",
-            engine.last_error()
-        );
-    }
+    // This test deliberately uses CpalOutput, whose flush always refuses.
+    // Require that exact refusal, not an absent error, a different unsupported
+    // operation, a decoder/stream failure, or a failure to close the output.
+    let expected_flush_message = format!(
+        "{name}: output flush failed: unsupported operation: cpal endpoint-buffer flush; \
+         close and recreate the output stream instead; output closed; \
+         recreate the engine/output before playback"
+    );
+    let expected_flush_error = ErrorInfo {
+        kind: ErrorKind::Output,
+        message: format!("output error: {expected_flush_message}"),
+    };
+    assert_eq!(
+        engine.last_error(),
+        Some(&expected_flush_error),
+        "natural completion must report precisely the cpal flush refusal"
+    );
+    assert!(
+        engine.is_flush_failed(),
+        "a refused flush must latch the closed output's terminal failure"
+    );
+    assert_eq!(engine.transport(), TransportState::Stopped);
 
-    // The audio contract (crates/rustamp-core/src/audio.rs:370-380) requires
+    // The audio contract (OutputDevice::flush in rustamp-core/src/audio.rs) requires
     // the caller (the application or test) to recreate the engine and output
     // before playback can resume. Exercise that documented path honestly:
     let output = Box::new(CpalOutput::with_device_name(CABLE_MATCH));
@@ -652,6 +659,16 @@ fn the_cable_carries_the_fixture_tone() {
         "the freshly recreated engine has an error: {:?}",
         recreated_engine.last_error()
     );
+    assert!(
+        !recreated_engine.is_flush_failed(),
+        "caller recreation must provide a fresh output without the terminal latch"
+    );
+    assert!(
+        is_cable_device(recreated_engine.output_name()),
+        "caller recreation opened {:?}, not the cable",
+        recreated_engine.output_name()
+    );
+    assert_eq!(recreated_engine.transport(), TransportState::Stopped);
 
     // Verify capture health: fatal stream errors fail the test, and xruns
     // are bounded by MAX_TOLERATED_XRUNS.
@@ -760,6 +777,20 @@ fn the_cable_carries_the_fixture_tone() {
         }
     }
 
-    engine.stop().expect("stopping the engine after the run");
+    // The old engine is still terminal even after caller-side recreation.
+    // Stop must return the same refusal, not silently succeed or replace it
+    // with an unrelated error. No further playback uses this closed output.
+    let error = engine
+        .stop()
+        .expect_err("stopping the old engine must retain its terminal flush refusal");
+    match error {
+        Error::Output(message) => assert_eq!(
+            message, expected_flush_message,
+            "stop must return the latched cpal flush refusal unchanged"
+        ),
+        other => panic!("stop returned {other:?}, not the documented output flush refusal"),
+    }
+    assert!(engine.is_flush_failed(), "stop must not clear the refusal");
+    assert_eq!(engine.last_error(), Some(&expected_flush_error));
     assert_eq!(engine.transport(), TransportState::Stopped);
 }
