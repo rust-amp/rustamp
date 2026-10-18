@@ -4070,7 +4070,7 @@ mod tests {
         let body = app.open_dialog_lines().expect("about dialog open");
         assert_eq!(
             body[0],
-            format!("{} 0.1.0-beta.1", rustamp_ui::PROGRAM_NAME),
+            format!("{} {}", rustamp_ui::PROGRAM_NAME, env!("CARGO_PKG_VERSION")),
             "about dialog first line must show the workspace version"
         );
     }

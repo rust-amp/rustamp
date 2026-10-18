@@ -208,6 +208,8 @@ fn probe(hwnd: *mut c_void) -> Option<String> {
 #[test]
 #[ignore = "spawns the real host and queries its window; VM-only, never part of the default suite"]
 fn app_published_state_reaches_the_host_window() {
+    rustamp_app::window::require_test_vm();
+
     // 1. Resolve exactly the way production does: packaged layout first, the
     // dev-tree heuristic after (see `rustamp-app/src/supervise.rs`). A plain
     // `cargo test --workspace` build stages no i686 host, so this may resolve
@@ -231,9 +233,17 @@ fn app_published_state_reaches_the_host_window() {
     // 2. Spawn the way the supervisor does and attach the link. `supervise`
     // (not a hand-rolled `Command`) is the point: the spawn flags
     // (`CREATE_NO_WINDOW`, piped stdio) are the production ones.
+    // Under Finding 8, `supervise` holds the spawned host in `pending`
+    // until `Message::Hello` arrives. Pump until attached or timeout.
     let mut supervisor = Supervisor::with_path(exe.clone());
     let mut link = HostStateLink::detached();
-    supervisor.supervise(&mut link);
+    let attach_deadline = Instant::now() + Duration::from_secs(5);
+    while !link.is_attached() && Instant::now() < attach_deadline {
+        supervisor.supervise(&mut link);
+        if !link.is_attached() {
+            std::thread::yield_now();
+        }
+    }
     assert!(
         link.is_attached(),
         "the real spawn must attach a transport for {}",

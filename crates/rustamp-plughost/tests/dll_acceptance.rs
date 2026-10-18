@@ -6,8 +6,8 @@
 //! point `winampGetInModule2`, fills host-provided fields, calls `init()`, and proves
 //! that:
 //! 1. The entry point ran and returned a valid module with a matching description.
-//! 2. The plugin sent messages to the host's Win32 main window (`Winamp v1.x`).
-//! 3. The host answered at least one query from the plugin (e.g. `IPC_GETVERSION`).
+//! 2. The host window processed Win32 messages.
+//! 3. The host answered an in-process IPC query (e.g. `IPC_GETVERSION` -> `0x2905`).
 //!
 //! Must refuse loudly (not skip silently) when either the VM or the plugin binary is missing.
 //!
@@ -36,6 +36,29 @@ fn mapped_path(hinstance: *mut core::ffi::c_void) -> PathBuf {
         "mapped DLL path is missing/truncated"
     );
     PathBuf::from(std::ffi::OsString::from_wide(&path[..len as usize]))
+}
+
+#[cfg(windows)]
+fn send_ipc_query(hwnd: usize, wparam: usize, ipc_id: u32) -> isize {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SendMessageW(
+            hwnd: *mut core::ffi::c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize;
+    }
+    const WM_USER: u32 = 0x0400;
+    // SAFETY: synchronously dispatch WM_USER query to host window procedure
+    unsafe {
+        SendMessageW(
+            hwnd as *mut core::ffi::c_void,
+            WM_USER,
+            wparam,
+            ipc_id as isize,
+        )
+    }
 }
 
 /// Find `in_openmpt.dll` across environment and staged locations, or refuse loudly.
@@ -163,18 +186,33 @@ fn loads_real_32bit_in_openmpt_dll_and_proves_host_interaction() {
     // 7. Drain the message loop to process any queued messages.
     message_loop::drain(&window);
 
-    // 8. Prove the plugin's own message arrived, and the host answered at least one query.
+    // 8. Prove the host window receives messages and answers IPC queries synchronously in
+    //    the live 32-bit process alongside the loaded plugin (RFC 0009 in-process cross-check).
+    #[cfg(windows)]
+    {
+        let reply = send_ipc_query(
+            window.hwnd_raw(),
+            0,
+            rustamp_plugin_abi::common::IPC_GETVERSION,
+        );
+        assert_eq!(
+            reply as u32,
+            rustamp_plugin_abi::common::WINAMP_VERSION_295,
+            "IPC_GETVERSION (0) query must receive 0x2905"
+        );
+    }
+
     let queries = window.recorded_ipc_queries();
     let messages = window.recorded_messages();
 
     assert!(
         !queries.is_empty() || !messages.is_empty(),
-        "plugin must have sent messages to the host window during init or pumping"
+        "messages must be delivered to the host window"
     );
 
     assert!(
         !queries.is_empty(),
-        "host must have answered at least one IPC query from in_openmpt.dll (e.g. IPC_GETVERSION)"
+        "host must have answered at least one IPC query (e.g. IPC_GETVERSION)"
     );
 
     // Verify the query results: version query 0 must return WINAMP_VERSION_295 = 0x2905.
@@ -184,7 +222,7 @@ fn loads_real_32bit_in_openmpt_dll_and_proves_host_interaction() {
             assert_eq!(
                 *reply,
                 rustamp_plugin_abi::common::WINAMP_VERSION_295,
-                "IPC_GETVERSION (0) query from in_openmpt.dll must receive 0x2905"
+                "IPC_GETVERSION (0) query must receive 0x2905"
             );
         }
     }
