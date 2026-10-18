@@ -361,13 +361,12 @@ fn shuffle_repeat_prev_across_cycle_boundary() {
     h.engine.set_shuffle(true).unwrap();
     h.engine.set_repeat(true).unwrap();
 
-    // Start playback on first track of cycle 1
-    h.engine.play_index(0).unwrap();
-    assert!(h.wait_track(0));
-
     let plan1 = h.engine.shuffle_plan().to_vec();
     assert_eq!(plan1.len(), 3);
-    assert_eq!(plan1[0], 0);
+
+    // Start playback on first track of cycle 1 (S15 §1.1)
+    h.engine.play().unwrap();
+    assert!(h.wait_track(plan1[0] as u32));
 
     // Advance through the remaining tracks of cycle 1: pos 1, then pos 2
     h.engine.next_track().unwrap();
@@ -392,7 +391,10 @@ fn shuffle_repeat_prev_across_cycle_boundary() {
     // Now call prev_track() while at track 0 of cycle 2:
     // S15 §3.2 requires jumping to the last track of cycle 1 (plan1[2])!
     h.engine.prev_track().unwrap();
-    assert!(h.wait_pumping(|e| e.current_index() == Some(plan1[2] as u32), WAIT));
+    assert!(h.wait_pumping(
+        |e| e.current_index() == Some(plan1[2] as u32) && e.shuffle_plan() == &plan1[..],
+        WAIT
+    ));
     assert_eq!(
         h.engine.shuffle_plan(),
         &plan1[..],
