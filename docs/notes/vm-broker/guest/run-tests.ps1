@@ -56,6 +56,7 @@ if ($filter -like '--ignored*') {
 }
 
 $results = @()
+$executedCount = 0
 
 # Timeout per binary: the suite's slowest honest binary runs in couple of minutes.
 # 300 seconds (5 min) gives generous margin; a binary that outlives it is hung, not slow.
@@ -300,6 +301,7 @@ foreach ($exe in $exes) {
         }
         continue
     }
+    $executedCount++
 
     # stdout first, then stderr. The two are separate pipes now, so their lines
     # cannot be interleaved the way the old `2>&1` merge appeared to; every match
@@ -371,6 +373,9 @@ foreach ($exe in $exes) {
         failed         = $failedNames
         diagnostic     = $diagnostic
         hung           = $false
+        # The test's own 30 s escape is a stall too, not the runner's 300 s
+        # timeout. Inspect all output, not the bounded diagnostic excerpt.
+        stalled        = [bool](@($lines | Where-Object { $_ -match 'the resident stopped delivering' }).Count)
         timeoutSeconds = $TestTimeoutSeconds
     }
 }
@@ -405,7 +410,8 @@ if ($bless) {
     # Same idea for the DSP fixture: $null means it was not found in the guest.
     testplugindsp = $env:RUSTAMP_TESTPLUGIN_DSP
     testplugindspsha256 = $dspPluginHash
-    ran       = $results.Count
+    # LEFT OUT / MISSING / DID NOT START rows are not executed binaries.
+    ran       = $executedCount
     failed    = @($results | Where-Object { $_.exit -ne 0 }).Count
     results   = $results
 }

@@ -2,6 +2,9 @@
 #
 #   powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-tests.ps1 -Filter rustamp_app
 #   powershell ... -Reset            # restore base-provisioned first
+#   powershell ... -Filter dsp_roundtrip -Repeat 20 -RepeatSummaryPath rate.json
+# Repeats build/stage/copy once, then run sequentially in the same guest. -Reset
+# restores once, not between repetitions. Wall times cover each guest request.
 #
 # The division of labour is deliberate and security-relevant:
 #   * HERE (unelevated): compile and stage. Compiling runs build scripts from
@@ -23,6 +26,8 @@ param(
     [string]$RepoRoot = 'D:\code\Rustamp',
     [string]$Stage = 'D:\code\rustamp-vm\staging\code\Rustamp',
     [switch]$SkipBuild,
+    [ValidateRange(1, 2147483647)] [int]$Repeat = 1,
+    [string]$RepeatSummaryPath = '',
     # Where the re-blessed golden images land on the host (only with --bless).
     [string]$BlessOut = 'D:\code\rustamp-vm\staging\out\bless-golden'
 )
@@ -31,6 +36,65 @@ $ErrorActionPreference = 'Stop'
 $broker = Join-Path $PSScriptRoot 'vm-broker\invoke-broker.ps1'
 
 function Step($t) { Write-Host "--- $t" }
+
+$RepoRoot = [IO.Path]::GetFullPath($RepoRoot).TrimEnd('\')
+$Stage = [IO.Path]::GetFullPath($Stage).TrimEnd('\')
+$receiptPath = Join-Path $Stage 'stage-receipt.json'
+
+# A receipt is written LAST, only after a successful full build and staging.
+# Hashes prove completeness, not just a plausible count. Old stages without a
+# receipt cannot prove anything and are deliberately refused (never rebuilt).
+function Get-Inventory($Files, [string]$Root) {
+    foreach ($file in @($Files | Sort-Object FullName -Unique)) {
+        [pscustomobject]@{
+            path = $file.FullName.Substring($Root.Length + 1)
+            hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        }
+    }
+}
+
+function Get-WorkspaceStageInventory {
+    # Include source/build inputs as well as current artifacts: a changed test
+    # target or new crate must invalidate the old Cargo artifact selection.
+    $files = @()
+    foreach ($dir in 'crates', 'xtask', '.cargo', 'tests\golden') {
+        $p = Join-Path $RepoRoot $dir
+        if (Test-Path -LiteralPath $p) { $files += @(Get-ChildItem -LiteralPath $p -Recurse -File -Force) }
+    }
+    foreach ($name in 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'rust-toolchain') {
+        $p = Join-Path $RepoRoot $name
+        if (Test-Path -LiteralPath $p) { $files += Get-Item -LiteralPath $p }
+    }
+    foreach ($dir in 'target\debug', 'target\debug\deps', 'target\debug\examples', 'target\i686-pc-windows-msvc\debug', 'target\i686-pc-windows-msvc\debug\deps') {
+        $p = Join-Path $RepoRoot $dir
+        if (Test-Path -LiteralPath $p) {
+            $files += @(Get-ChildItem -LiteralPath $p -File | Where-Object { $_.Extension -in '.exe', '.dll' })
+        }
+    }
+    Get-Inventory $files $RepoRoot
+    foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
+        $p = Join-Path $env:SystemRoot "System32\$crt"
+        if (Test-Path -LiteralPath $p) {
+            [pscustomobject]@{ path = "System32\$crt"; hash = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash }
+        }
+    }
+}
+
+function Assert-Inventory($Expected, $Actual, [string]$Label) {
+    $known = @{}
+    foreach ($entry in $Actual) { $known[$entry.path] = $entry.hash }
+    $problems = @()
+    foreach ($entry in $Expected) {
+        if (-not $known.ContainsKey($entry.path)) { $problems += "missing $Label file: $($entry.path)" }
+        elseif ($known[$entry.path] -ne $entry.hash) { $problems += "changed $Label file: $($entry.path)" }
+        $known.Remove($entry.path)
+    }
+    foreach ($name in $known.Keys) { $problems += "unexpected $Label file: $name" }
+    if ($problems) {
+        throw ("-SkipBuild refused: staging is incomplete or no longer matches the current workspace.`n    " +
+            ($problems -join "`n    ") + "`nRun once without -SkipBuild to create a complete staging; no build or guest operation was attempted.")
+    }
+}
 
 # --- 1. compile on the host (builds, does not run) ---------------------------
 if (-not $SkipBuild) {
@@ -68,12 +132,25 @@ if (-not $SkipBuild) {
     if ($fixtureBuildExit -ne 0) { throw "cargo build examples decoder_fixture / dsp_fixture failed with exit $fixtureBuildExit" }
 } else {
     Step 'skipping the build (-SkipBuild); the previously staged binaries are reused'
-    $stagedDeps = Join-Path $Stage 'target\debug\deps'
-    if (-not (Test-Path $stagedDeps)) { throw "nothing staged at $stagedDeps" }
-    $testExes = @(Get-ChildItem -Path $stagedDeps -Filter '*.exe' | Select-Object -ExpandProperty FullName)
+    if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+        throw "-SkipBuild refused: missing $receiptPath; this staging has no completion receipt, so its completeness cannot be proved. Run once without -SkipBuild; no automatic rebuild or guest operation was attempted."
+    }
+    try { $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json } catch {
+        throw "-SkipBuild refused: unreadable completion receipt $receiptPath; staging completeness cannot be proved. Run once without -SkipBuild."
+    }
+    if ($receipt.version -ne 1 -or $receipt.repo -ne $RepoRoot -or -not $receipt.files -or -not $receipt.inputs -or -not $receipt.testExes -or -not $receipt.i686TestExes) {
+        throw "-SkipBuild refused: invalid completion receipt $receiptPath for workspace $RepoRoot; staging completeness cannot be proved. Run once without -SkipBuild."
+    }
+    $stagedFiles = @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force | Where-Object { $_.FullName -ne $receiptPath })
+    Assert-Inventory $receipt.files @(Get-Inventory $stagedFiles $Stage) 'staged'
+    Assert-Inventory $receipt.inputs @(Get-WorkspaceStageInventory) 'workspace/runtime input'
+    $testExes = @($receipt.testExes)
+    $i686TestExes = @($receipt.i686TestExes)
+    Write-Host ("    verified {0} staged files against the complete receipt and current workspace/runtime inputs" -f $receipt.files.Count)
 }
 
 # --- 2. stage ----------------------------------------------------------------
+if (-not $SkipBuild) {
 Step "staging into $Stage"
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'target\debug\deps')
@@ -110,10 +187,12 @@ $ErrorActionPreference = 'Continue'
 $prevRustflags = $env:RUSTFLAGS
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 & cargo build -p rustamp-plughost --target i686-pc-windows-msvc 2>$null | Out-Null
+$plughostBuildExit = $LASTEXITCODE
 $plughostTestJson = & cargo test -p rustamp-plughost --all-targets --all-features --no-run --target i686-pc-windows-msvc --message-format=json 2>$null
 $plughostTestExit = $LASTEXITCODE
 if ($null -eq $prevRustflags) { Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue } else { $env:RUSTFLAGS = $prevRustflags }
 $ErrorActionPreference = $prevPref
+if ($plughostBuildExit -ne 0) { throw "cargo build -p rustamp-plughost --target i686-pc-windows-msvc failed with exit $plughostBuildExit" }
 if ($plughostTestExit -ne 0) { throw "cargo test -p rustamp-plughost --no-run --target i686-pc-windows-msvc failed with exit $plughostTestExit" }
 
 $hostExe = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\rustamp-plughost32.exe'
@@ -175,6 +254,29 @@ if (Test-Path $golden) {
     Copy-Item $golden $goldenDest -Recurse -Force
 }
 Write-Host ("    staged {0} MB" -f [math]::Round(((Get-ChildItem $Stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1))
+$stagedFiles = @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force)
+[pscustomobject]@{
+    version = 1
+    repo = $RepoRoot
+    testExes = @($testExes)
+    i686TestExes = @($i686TestExes)
+    files = @(Get-Inventory $stagedFiles $Stage)
+    inputs = @(Get-WorkspaceStageInventory)
+} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
+}
+
+# Mirror the guest's binary-name filter and helper exclusions without launching
+# any binary on the host. Keep the guest's ran=0 gate too: this is only preflight.
+$binaryFilter = $Filter
+if ($binaryFilter -like '--bless*') { $binaryFilter = $binaryFilter -replace '^--bless:?', '' }
+if ($binaryFilter -like '--ignored*') { $binaryFilter = $binaryFilter -replace '^--ignored:?', '' }
+$selected = @(Get-ChildItem -LiteralPath (Join-Path $Stage 'target\debug\deps') -Filter '*.exe' -File | Where-Object {
+    $_.Name -notin 'rustamp-plughost32.exe', 'rustamp.exe' -and (-not $binaryFilter -or $_.Name -like "*$binaryFilter*")
+})
+if ($selected.Count -eq 0) {
+    throw ("host preflight FAILED: filter '{0}' matches no staged test binary ({1} test artifacts); no guest operation was attempted." -f $Filter, ($testExes.Count + $i686TestExes.Count))
+}
+Write-Host ("    host selection: {0} test binaries (filter: '{1}')" -f $selected.Count, $Filter)
 
 # --- 3. optional reset, then start (the broker ejects the DVD) --------------
 if ($Reset) {
@@ -252,6 +354,7 @@ if (Test-Path $pluginsDir) {
     Write-Host '    no test plugins on the host; plugin-dependent tests will skip/refuse'
 }
 
+function Invoke-GuestTestRun {
 Step 'running the tests in the guest'
 # The guest bounds each binary at 300 s (`$TestTimeoutSeconds` in
 # docs\notes\vm-broker\guest\run-tests.ps1) and is meant to keep going after a
@@ -267,7 +370,10 @@ $guestTimeoutSeconds = 60 + (($PerBinaryTimeoutSeconds + 60) * [math]::Max($allB
 Write-Host ("    per-binary timeout {0} s; broker bound {1} s for {2} binaries" -f $PerBinaryTimeoutSeconds, $guestTimeoutSeconds, $allBinariesCount)
 # A single positional argument: `-ArgumentList` with an array binds only the
 # first element to the script's parameter, which silently dropped the filter.
-$result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $Filter -TimeoutSeconds $guestTimeoutSeconds
+$guestClock = [Diagnostics.Stopwatch]::StartNew()
+try {
+    $result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $Filter -TimeoutSeconds $guestTimeoutSeconds
+} finally { $guestClock.Stop() }
 # A guest run that produced no object produced no report at all: say which step
 # lost it instead of printing empty columns below.
 if (-not $result) { throw "STEP guest FAILED: the broker returned no result object for run-tests.ps1 (see D:\code\rustamp-vm\broker\broker.log)" }
@@ -275,6 +381,9 @@ if ($null -eq $result.results) { throw "STEP guest FAILED: the guest result obje
 
 # --- 5. results --------------------------------------------------------------
 $hungCount = @($result.results | Where-Object { $_.hung }).Count
+# Count repetitions with either the runner timeout or the resident's own escape
+# as stalled. These remain failures, not a separate route around the exit gate.
+$stallCount = @($result.results | Where-Object { $_.hung -or $_.stalled }).Count
 Write-Host ''
 Write-Host ("guest {0} as {1}; subst resolved: {2}; ran {3}, failed {4}, hung {5}" -f $result.host, $result.user, $result.subst, $result.ran, $result.failed, $hungCount)
 # Plugin fixture status: the Group D loader tests prove nothing without the
@@ -434,12 +543,81 @@ if ($Filter -like '--ignored*') {
 
 # A stall must never be reported as a green run: the hung count is a second,
 # independent gate on the exit code, so a counting drift cannot hide a hang.
-if ($result.failed -ne 0 -or $hungCount -ne 0 -or $blessMissing -ne 0) { exit 1 }
+$runFailed = ($result.failed -ne 0 -or $hungCount -ne 0 -or $blessMissing -ne 0 -or $stallCount -ne 0)
 
 # A run that executed no binary at all proves nothing, so it must never exit
 # zero. Without this gate a filter that matches nothing - or a staging that lost
 # the binaries - prints "ran 0, failed 0, hung 0" and reads exactly like a pass.
-if ($result.ran -eq 0) {
+if ($null -eq $result.ran -or $result.ran -eq 0) {
     Write-Host ("  FAILED: the guest executed no test binary at all, so this run proves nothing (filter: '{0}'; {1} binaries were staged)." -f $Filter, $allBinariesCount)
-    exit 1
+    $runFailed = $true
 }
+return [pscustomobject]@{
+    passed = -not $runFailed
+    stalled = ($stallCount -ne 0)
+    wallSeconds = $guestClock.Elapsed.TotalSeconds
+    ran = $result.ran
+    failedBinaries = $result.failed
+    hungBinaries = $hungCount
+    stalledBinaries = $stallCount
+    error = $null
+}
+}
+
+$showRepeatSummary = $PSBoundParameters.ContainsKey('Repeat') -or $RepeatSummaryPath
+$runs = @()
+for ($iteration = 1; $iteration -le $Repeat; $iteration++) {
+    if ($showRepeatSummary) { Step ("repetition {0}/{1}" -f $iteration, $Repeat) }
+    $attemptClock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $run = Invoke-GuestTestRun
+    } catch {
+        if (-not $showRepeatSummary) { throw }
+        # After an infrastructure failure the guest may still be running. Do
+        # NOT send another request: record the incomplete measurement and stop.
+        $run = [pscustomobject]@{
+            passed = $false
+            stalled = $false
+            wallSeconds = $attemptClock.Elapsed.TotalSeconds
+            ran = $null
+            failedBinaries = $null
+            hungBinaries = $null
+            stalledBinaries = $null
+            error = $_.Exception.Message
+        }
+    } finally { $attemptClock.Stop() }
+    $run | Add-Member -NotePropertyName iteration -NotePropertyValue $iteration
+    $runs += $run
+    if ($run.error) { break }
+}
+
+$passedRuns = @($runs | Where-Object { $_.passed }).Count
+$failedRuns = @($runs | Where-Object { -not $_.passed }).Count
+$stalledRuns = @($runs | Where-Object { $_.stalled }).Count
+$notAttempted = $Repeat - $runs.Count
+if ($showRepeatSummary) {
+    Write-Host ''
+    Step 'repeat summary (stall count is a subset of failures; no reset between repetitions)'
+    foreach ($run in $runs) {
+        $status = if ($run.passed) { 'PASS' } elseif ($run.stalled) { 'STALL' } else { 'FAIL' }
+        Write-Host ("  run {0}/{1}: {2}; wall {3:F3} s; ran {4}; failed binaries {5}; hung {6}" -f $run.iteration, $Repeat, $status, $run.wallSeconds, $run.ran, $run.failedBinaries, $run.hungBinaries)
+        if ($run.error) { Write-Host ("    infrastructure failure: {0}" -f $run.error) }
+    }
+    $rateLine = "RATE filter='{0}': {1}/{2} passed ({3:F1}%); {4}/{2} failed; {5}/{2} stalled; requested {6}, not attempted {7}" -f $Filter, $passedRuns, $runs.Count, (100.0 * $passedRuns / $runs.Count), $failedRuns, $stalledRuns, $Repeat, $notAttempted
+    Write-Host $rateLine
+    if ($RepeatSummaryPath) {
+        [pscustomobject]@{
+            filter = $Filter
+            requested = $Repeat
+            attempted = $runs.Count
+            passed = $passedRuns
+            failed = $failedRuns
+            stalled = $stalledRuns
+            notAttempted = $notAttempted
+            resetBetweenRuns = $false
+            rate = $rateLine
+            runs = @($runs)
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $RepeatSummaryPath -Encoding UTF8
+    }
+}
+if ($failedRuns -ne 0 -or $notAttempted -ne 0) { exit 1 }
