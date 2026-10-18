@@ -149,12 +149,30 @@ Step 'copying the staged package tree into the guest'
 & $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\smoke' -TimeoutSeconds 1800 | Out-Null
 
 Step 'running the packaged player smoke in the guest interactive session'
-$result = & $broker -Op guest -Script 'run-smoke.ps1' -TimeoutSeconds $GuestTimeoutSeconds
-if (-not $result) { Fail 'guest' 'the broker returned no result object for run-smoke.ps1 (see broker.log)' }
+$OutDir = Join-Path $StageRoot 'out\smoke'
+try {
+    $result = & $broker -Op guest -Script 'run-smoke.ps1' -TimeoutSeconds $GuestTimeoutSeconds
+    if (-not $result) { Fail 'guest' 'the broker returned no result object for run-smoke.ps1 (see broker.log)' }
+} catch {
+    # Failure path still copies the guest's own transcript out, so the next
+    # diagnosis does not need a manual copyout: the inner payload writes
+    # `guest-transcript.txt` (window dump included) before it fails, and the
+    # outer half appends session discovery to it. Best-effort: a copyout
+    # failure must not mask the original guest error.
+    $guestErr = $_.Exception.Message
+    try {
+        if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
+        $null = New-Item -ItemType Directory -Force -Path $OutDir
+        & $broker -Op copyout -Source 'C:\rustamp\out\smoke' -Dest $OutDir -TimeoutSeconds 600 | Out-Null
+        Write-Host ("    guest outputs (incl. guest-transcript.txt) copied to {0} despite the failure" -f $OutDir)
+    } catch {
+        Write-Host ("    WARNING: failure-path copyout also failed: {0}" -f $_.Exception.Message)
+    }
+    throw "STEP guest FAILED: $guestErr"
+}
 
 # --- 6. copy the proof and outputs back; verify -------------------------------
 Step 'copying the smoke proof and captures back to the host'
-$OutDir = Join-Path $StageRoot 'out\smoke'
 if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 $null = New-Item -ItemType Directory -Force -Path $OutDir
 & $broker -Op copyout -Source 'C:\rustamp\out\smoke' -Dest $OutDir -TimeoutSeconds 600 | Out-Null

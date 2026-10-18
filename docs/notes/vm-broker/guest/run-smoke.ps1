@@ -23,8 +23,11 @@
 #   1. the packaged `player\rustamp.exe` starts with `--no-audio` (the silent
 #      windowed mode: a real window, the null output, no audio device needed)
 #      and stays up;
-#   2. its main window (exact title `Rustamp`, owned by the player pid,
-#      visible) appears within a bounded wait, at the S01 rest client size;
+#   2. its main window (documented rule `Rustamp`, or `Rustamp - <error>`
+#      while an error is showing per `crates/rustamp-app/src/app.rs:350-362`,
+#      owned by the player pid, visible) appears within a bounded wait, at
+#      the S01 rest client size; on failure the step dumps every owned
+#      top-level window it saw (title, class, rect, visibility);
 #   3. the bundled `rustamp-plughost32.exe` (staged beside the player, RFC 0006
 #      section 8 packaged layout) appears as a live child of the player, i.e.
 #      the supervisor spawned it and it survived startup far enough to serve
@@ -193,6 +196,7 @@ public class SmokeWin {
     public delegate bool CB(IntPtr h, IntPtr p);
     [DllImport("user32.dll")] public static extern bool EnumWindows(CB cb, IntPtr p);
     [DllImport("user32.dll")] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
@@ -205,6 +209,17 @@ public class SmokeWin {
     public static string WindowRect(IntPtr h) {
         RECT r; if (!GetWindowRect(h, out r)) return "";
         return "(" + r.left + "," + r.top + ")-(" + r.right + "," + r.bottom + ")";
+    }
+    public static string ClassName(IntPtr h) {
+        StringBuilder s = new StringBuilder(256);
+        int n = GetClassNameW(h, s, s.Capacity);
+        if (n <= 0) return "";
+        return s.ToString();
+    }
+    public static string Title(IntPtr h) {
+        StringBuilder s = new StringBuilder(512);
+        GetWindowTextW(h, s, s.Capacity);
+        return s.ToString();
     }
 }
 "@
@@ -234,12 +249,17 @@ public class SmokeWin {
     }
     Say 'player alive after 2 s' 'yes'
 
-    # --- bounded wait for the exact main window (mirrors the headless test) --
-    # Exact title `Rustamp`, owned by the player pid, visible. The playlist
-    # window (`Rustamp Playlist`) must NOT satisfy this wait: proving the
-    # main window opened is the point. 60 s budget, 100 ms poll.
+    # --- bounded wait for the main window (mirrors the headless test) ------
+    # Documented title rule (`crates/rustamp-app/src/app.rs:350-362`,
+    # applied in `crates/rustamp-app/src/window.rs:704-713`): `Rustamp`,
+    # or `Rustamp - <error>` while an error is showing. The wait accepts
+    # exactly that rule — never a bare substring — so an error title still
+    # passes the wait (the client-size check below still applies) while the
+    # playlist window (`Rustamp Playlist`) still does NOT satisfy it.
+    # 60 s budget, 100 ms poll.
     $deadline = (Get-Date).AddSeconds(60)
     $mainHwnd = [Int64]0
+    $mainTitle = $null
     $mainClient = $null
     $mainRect = $null
     while ((Get-Date) -lt $deadline) {
@@ -248,10 +268,8 @@ public class SmokeWin {
         }
         $found = New-Object System.Collections.ArrayList
         [void][SmokeWin]::EnumWindows({ param($h, $p)
-            $sb = New-Object Text.StringBuilder 256
-            [void][SmokeWin]::GetWindowTextW($h, $sb, 256)
-            $t = $sb.ToString()
-            if ($t -ne 'Rustamp') { return $true }
+            $t = [SmokeWin]::Title($h)
+            if (-not ($t -eq 'Rustamp' -or $t.StartsWith('Rustamp - '))) { return $true }
             $childPid = 0; [void][SmokeWin]::GetWindowThreadProcessId($h, [ref]$childPid)
             if ($childPid -ne $player.Id) { return $true }
             if (-not [SmokeWin]::IsWindowVisible($h)) { return $true }
@@ -260,7 +278,9 @@ public class SmokeWin {
         }, [IntPtr]::Zero)
         if ($found.Count -ge 1) {
             $mainHwnd = [Int64]$found[0]
+            $mainTitle = [SmokeWin]::Title([IntPtr]$mainHwnd)
             Say 'main window matches' $found.Count
+            Say 'main window title' $mainTitle
             $mainClient = [SmokeWin]::ClientSize([IntPtr]$mainHwnd)
             $mainRect = [SmokeWin]::WindowRect([IntPtr]$mainHwnd)
             Say 'main window hwnd' ("0x{0:X}" -f $mainHwnd)
@@ -270,7 +290,49 @@ public class SmokeWin {
         }
         Start-Sleep -Milliseconds 100
     }
-    if ($mainHwnd -eq 0) { Finish-Failure 'window' 'no visible main window (exact title `Rustamp`, owned by the player) appeared within 60 s' }
+    if ($mainHwnd -eq 0) {
+        # Report what was actually seen: every top-level window owned by the
+        # player or its live children (title, class, rect, visibility). A
+        # check that only names the title it wanted costs a whole VM run;
+        # this dump is the diagnosis the next run would otherwise need.
+        $childPids = @(Get-CimInstance Win32_Process -Filter ("ParentProcessId = " + $player.Id) -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty ProcessId)
+        if ($null -eq $childPids) { $childPids = @() }
+        $ownedSet = @($player.Id) + @($childPids)
+        $seen = New-Object System.Collections.ArrayList
+        [void][SmokeWin]::EnumWindows({ param($h, $p)
+            $wpid = 0; [void][SmokeWin]::GetWindowThreadProcessId($h, [ref]$wpid)
+            if ($ownedSet -notcontains $wpid) { return $true }
+            [void]$seen.Add([pscustomobject]@{
+                Hwnd    = ("0x{0:X}" -f [Int64]$h)
+                Pid     = $wpid
+                Title   = [SmokeWin]::Title($h)
+                Class   = [SmokeWin]::ClassName($h)
+                Visible = [bool][SmokeWin]::IsWindowVisible($h)
+                Client  = [SmokeWin]::ClientSize($h)
+                Rect    = [SmokeWin]::WindowRect($h)
+            })
+            return $true
+        }, [IntPtr]::Zero)
+        $visCount = @($seen | Where-Object { $_.Visible }).Count
+        Say 'owned top-level windows' ("{0} total, {1} visible (player pid {2}; child pids: {3})" -f $seen.Count, $visCount, $player.Id, (($childPids -join ',') ))
+        if ($seen.Count -eq 0) {
+            Say 'owned windows' ("no top-level window owned by player pid {0} or its children was enumerated at all" -f $player.Id)
+        } else {
+            $n = 0
+            foreach ($w in $seen) {
+                if ($n -ge 20) { Say 'owned windows' ("... and {0} more (capped at 20)" -f ($seen.Count - 20)); break }
+                Say 'owned window' ("hwnd={0} pid={1} visible={2} class=`"{3}` title=`"{4}`" client={5} rect={6}" -f $w.Hwnd, $w.Pid, $w.Visible, $w.Class, $w.Title, $w.Client, $w.Rect)
+                $n++
+            }
+        }
+        $detailTitles = @($seen | Where-Object { $_.Visible } | ForEach-Object { "pid={0} title=`"{1}`" class=`"{2}`"" -f $_.Pid, $_.Title, $_.Class })
+        if ($detailTitles.Count -eq 0) {
+            Finish-Failure 'window' ("no visible main window (documented rule: `Rustamp` or `Rustamp - <error>`, owned by the player) appeared within 60 s; no visible top-level window owned by player pid {0} or its children was enumerated ({1} owned total)" -f $player.Id, $seen.Count)
+        } else {
+            Finish-Failure 'window' ("no visible main window (documented rule: `Rustamp` or `Rustamp - <error>`, owned by the player) appeared within 60 s; visible owned windows were: " + ($detailTitles -join '; '))
+        }
+    }
 
     # The S01 rest client size, pinned on the packaged build too.
     if ($mainClient -ne '275x116') { Finish-Failure 'window' ("the main window client is {0}, want 275x116 (S01 rest size)" -f $mainClient) }
@@ -350,7 +412,7 @@ public class SmokeWin {
         playerPid     = $player.Id
         upSeconds     = $upSeconds
         windowHwnd    = ("0x{0:X}" -f $mainHwnd)
-        windowTitle   = 'Rustamp'
+        windowTitle   = $mainTitle
         windowClient  = $mainClient
         windowRect    = $mainRect
         hostChildPid  = $hostPid

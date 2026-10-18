@@ -49,15 +49,17 @@ only with `-Reset` (otherwise plain start, like the existing runners).
 | `package` audit | `player\rustamp.exe`, `player\rustamp-plughost32.exe`, `host\rustamp-plughost32.exe` exist and are non-empty; SHA-256 recorded. The bundled copy beside the player is the first `supervise.rs` candidate (RFC 0006 §8). Missing/empty binaries fail here, before any VM work. |
 | `build-tool` | Only `cargo build -p xtask` (the existing, reviewed window-capture tool) is compiled. The player and host are **never rebuilt**: they are staged byte-for-byte, so the proof is of the shipped bytes, not a fresh build. |
 | `stage` | Verbatim package copies + capture tool (+ host CRT DLLs beside the tool only — the packaged binaries are static-CRT per X1) + the repo's committed `sine.flac` fixture (known-good media, so a decode failure names the package, not BETA-04-style bad input). |
-| `guest` (`run-smoke.ps1`) | In the interactive session (explorer-owned, never session 0): the player starts with `--no-audio <fixture>` and stays up; the exact `Rustamp` main window (player pid, visible) appears within 60 s at client **275×116** (S01 rest size, pinned on the packaged build); a live `rustamp-plughost32.exe` child of the player exists (the supervisor resolves the bundled copy first and spawns eagerly, and the host sends its startup `Hello` / per-`Ping` `Pong` only while its UI pump runs — so a live child proves the pair reached handshake service); `xtask capture` screenshots a `Rustamp*` window; the player prints `output null (windowed; silent, no audio device)` (silent path, not a real device); the player is killed and its exit recorded. |
+| `guest` (`run-smoke.ps1`) | In the interactive session (explorer-owned, never session 0): the player starts with `--no-audio <fixture>` and stays up; the main window (documented rule `Rustamp`, or `Rustamp - <error>` while an error is showing per `crates/rustamp-app/src/app.rs:350-362`, owned by the player pid, visible) appears within 60 s at client **275×116** (S01 rest size, pinned on the packaged build) — a timeout now dumps every owned top-level window it saw (title, class, rect, visibility); a live `rustamp-plughost32.exe` child of the player exists (the supervisor resolves the bundled copy first and spawns eagerly, and the host sends its startup `Hello` / per-`Ping` `Pong` only while its UI pump runs — so a live child proves the pair reached handshake service); `xtask capture` screenshots a `Rustamp*` window; the player prints `output null (windowed; silent, no audio device)` (silent path, not a real device); the player is killed and its exit recorded. |
 | `verify` (host) | Session is non-zero; proof facts complete; window size re-asserted; PNG exists, is ≥512 bytes and carries the PNG signature; every file recomputed against the guest `hashes.json` (the `vm-run-capture.ps1` §7 integrity leg); `--list` log, stdout/stderr logs and transcript land in `staging\out\smoke\` for the eye. |
 
 ## How it fails (every case exits non-zero, naming the step)
 
 `STEP package / build-tool / stage / guest / verify FAILED: <detail>`.
 Named guest sub-steps: `start` (immediate exit, with code — 0xC0000135
-names a missing runtime), `window` (no exact main window in 60 s, or wrong
-client size, or the player died waiting), `resident-handshake` (no live
+names a missing runtime), `window` (no main window in 60 s under the
+documented rule — the failure names every visible owned top-level window
+seen, or says none was enumerated — or wrong client size, or the player
+died waiting), `resident-handshake` (no live
 bundled-host child in ~10 s), `capture` (tool exit / no PNG / bad
 signature), `silent-path` (no silent marker on stdout), `stop` (Kill did
 not take), `session` (landed in session 0 / no desktop), plus the outer
@@ -89,7 +91,15 @@ path "rustamp-plughost32.exe" was denied`. The smokerunner handed the broker
 a relative path (or a bare file name), while the broker only accepts
 copyin sources from the staging root it owns. Fixed by staging with an
 explicit absolute path under the staging root, mirroring the working test
-runner.
+runner. (5) The sixth run reached the interactive session (session 1,
+pinned virtual display) with the player alive after 2 s, then failed the
+window step with a message that named only the wanted title — it could not
+say whether a player window existed under a different title or no window
+existed at all. Fixed without weakening the check (card
+`docs/tasks/X5-smoke-window.md`): the wait now accepts exactly the
+documented title rule, and a timeout dumps every owned top-level window it
+saw; the host runner best-effort-copies the guest outputs back even when
+the guest step throws.
 
 ## What it still does not prove
 
