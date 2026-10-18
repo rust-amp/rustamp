@@ -50,7 +50,7 @@ only with `-Reset` (otherwise plain start, like the existing runners).
 | `build-tool` | Only `cargo build -p xtask` (the existing, reviewed window-capture tool) is compiled. The player and host are **never rebuilt**: they are staged byte-for-byte, so the proof is of the shipped bytes, not a fresh build. |
 | `stage` | Verbatim package copies + capture tool (+ host CRT DLLs beside the tool only — the packaged binaries are static-CRT per X1) + the repo's committed `sine.flac` fixture (known-good media, so a decode failure names the package, not BETA-04-style bad input). |
 | `guest` (`run-smoke.ps1`) | In the interactive session (explorer-owned, never session 0): the player starts with `--no-audio <fixture>` and stays up; the main window (documented rule `Rustamp`, or `Rustamp - <error>` while an error is showing per `crates/rustamp-app/src/app.rs:350-362`, owned by the player pid, visible) appears within 60 s at client **275×116** (S01 rest size, pinned on the packaged build) — a timeout now dumps every owned top-level window it saw (title, class, rect, visibility); a live `rustamp-plughost32.exe` child of the player exists (the supervisor resolves the bundled copy first and spawns eagerly, and the host sends its startup `Hello` / per-`Ping` `Pong` only while its UI pump runs — so a live child proves the pair reached handshake service); `xtask capture` screenshots a `Rustamp*` window (its stderr `note:` lines - several windows match, PrintWindow fallback - are captured into the logs and are never fatal); the player prints `output null (windowed; silent, no audio device)` (silent path, not a real device); the player is killed and its exit recorded. |
-| `verify` (host) | Session is non-zero; proof facts complete; window size re-asserted; PNG exists, is ≥512 bytes and carries the PNG signature; every file recomputed against the guest `hashes.json` (the `vm-run-capture.ps1` §7 integrity leg); `--list` log, capture log, stdout/stderr logs and transcript land in `staging\out\smoke\` for the eye. |
+| `verify` (host) | Session is non-zero; proof facts complete; window size re-asserted; PNG exists, is ≥512 bytes and carries the PNG signature; every file recomputed against the guest `hashes.json` (the `vm-run-capture.ps1` §7 integrity leg) — the guest writes that manifest once, after `guest-transcript.txt` is complete, so the completed transcript is byte-verified too, and a manifest that does not cover it is refused (X9); `--list` log, capture log, stdout/stderr logs and transcript land in `staging\out\smoke\` for the eye. |
 
 ## How it fails (every case exits non-zero, naming the step)
 
@@ -84,7 +84,7 @@ warns rather than fails.
 
 ## What the first real runs found (why the runner exists)
 
-Seven defects in eight runs, each found by running, not by reading: (1) the
+Eight defects in nine runs, each found by running, not by reading: (1) the
 `package` audit refused an incomplete build (a missing load-bearing binary —
 the check working as designed, no script change); (2) the guest script called
 `Invoke-CimMethod -GetOwner`, a parameter that does not exist — fixed to
@@ -162,7 +162,24 @@ message). Fixed in the guest script (card `docs/tasks/X7-smoke-capture.md`):
 the preference is relaxed around both tool invocations and restored right
 after, and the payload's catch leg now stamps the throw site (`at`, plus
 exception type, category and error id) into the proof and the transcript,
-which the outer half names in its failure message.
+which the outer half names in its failure message. (8) The ninth run
+passed every guest check — session 1, main window `Rustamp` at client
+275x116, live bundled-host child, capture with its PNG gates, the silent
+marker, the stop with its exit recorded — and then failed the host's
+final hash leg on the proof's own transcript: `STEP verify FAILED: hash
+mismatch on 'guest-transcript.txt': guest <hash> host <hash>`. The
+mismatch was structural, not corruption: the inner payload wrote the
+transcript and then hashed it into `hashes.json` (`run-smoke.ps1:449-456`
+before this lane), but the outer half appends its session-discovery trail
+to the same transcript afterwards (`:546-550`), so the manifest always
+described a shorter file than the one copied back — the check could never
+pass on any successful run, while every other manifest entry (proof,
+PNG, logs) verified, which is exactly what the run showed. Fixed in the
+guest script (card `docs/tasks/X9-smoke-hash.md`): the manifest is now
+written once, by the outer half, after the transcript is complete, so
+the completed transcript — stop record and exit code included — is
+itself byte-verified, and the host refuses a manifest that does not
+cover `guest-transcript.txt`.
 
 ## What it still does not prove
 

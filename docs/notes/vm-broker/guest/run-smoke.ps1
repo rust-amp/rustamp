@@ -44,6 +44,12 @@
 # broker `copyout` op (source under `C:\rustamp\out`, as that op requires).
 # The host runner (`docs/notes/vm-run-smoke.ps1`) re-verifies every file,
 # including a SHA-256 recompute against the guest-written `hashes.json`.
+# That manifest is written ONCE, by the OUTER half below, AFTER
+# `guest-transcript.txt` is complete: the transcript is a live log this
+# script keeps appending to (the outer half adds its session-discovery
+# trail after the payload exits), so a manifest written by the payload
+# would hash a file that is still about to change - the ninth run's
+# structural `hash mismatch on 'guest-transcript.txt'` (X9).
 #
 # Result contract (runbook section 7): this script emits EXACTLY ONE object
 # (the proof, at the end) and nothing else on the output stream. Progress
@@ -423,7 +429,13 @@ public class SmokeWin {
     $hostReaped = ($lingering.Count -eq 0)
     Say 'host reaped with player' $hostReaped
 
-    # --- proof, manifest, sentinel --------------------------------------------
+    # --- proof, transcript, sentinel --------------------------------------------
+    # NO manifest here. The transcript is a live log: the OUTER half appends
+    # its session-discovery trail to it after this payload exits (see the
+    # manifest step in the outer half below). A manifest written here would
+    # hash a transcript that is still about to change, and the host's
+    # byte-identical leg could then never pass - the ninth run's structural
+    # `hash mismatch on 'guest-transcript.txt'` (docs/tasks/X9-smoke-hash.md).
     $proof = [pscustomobject]@{
         ok            = $true
         session       = $me
@@ -447,13 +459,6 @@ public class SmokeWin {
     }
     $proof | ConvertTo-Json -Depth 6 | Set-Content -Path $ProofPath -Encoding UTF8
     $log | Set-Content -Path $Transcript -Encoding UTF8
-    $hashes = [ordered]@{}
-    foreach ($f in Get-ChildItem -Path $OutDir -File -Recurse | Sort-Object FullName) {
-        $rel = $f.FullName.Substring($OutDir.Length + 1)
-        if ($rel -ieq 'hashes.json') { continue }
-        $hashes[$rel] = (Get-FileHash -Path $f.FullName -Algorithm SHA256).Hash
-    }
-    $hashes | ConvertTo-Json | Set-Content -Path (Join-Path $OutDir 'hashes.json') -Encoding UTF8
     @{ ok = $true; failed = 0 } | ConvertTo-Json | Set-Content -Path $DonePath -Encoding UTF8
     exit 0
 } catch {
@@ -548,6 +553,24 @@ if (Test-Path $guestTranscript) {
     '' | Add-Content -Path $guestTranscript -Encoding UTF8
     $transcript | Add-Content -Path $guestTranscript -Encoding UTF8
 }
+
+# --- hash manifest: written ONCE, after the transcript is complete ----------
+# This is the last write to the output tree, so every file it covers is
+# final when it is hashed: the completed transcript (the payload's stop
+# record and exit code plus this half's session-discovery trail), the
+# proof, the PNG and its logs, the payload itself, and the done sentinel.
+# It covers every file under the output directory except itself; the host
+# recomputes every entry (vm-run-smoke.ps1, 'verifying hashes'). It is
+# written here, not by the payload, because the payload exits before this
+# half's append: a payload-written manifest hashed a transcript that was
+# still about to change, which is why the hash leg could never pass (X9).
+$hashes = [ordered]@{}
+foreach ($f in Get-ChildItem -Path $OutDir -File -Recurse | Sort-Object FullName) {
+    $rel = $f.FullName.Substring($OutDir.Length + 1)
+    if ($rel -ieq 'hashes.json') { continue }
+    $hashes[$rel] = (Get-FileHash -Path $f.FullName -Algorithm SHA256).Hash
+}
+$hashes | ConvertTo-Json | Set-Content -Path (Join-Path $OutDir 'hashes.json') -Encoding UTF8
 
 # Single-object result contract: this object is the ONLY stdout of this
 # script (progress above lives in $transcript, which the host prints from

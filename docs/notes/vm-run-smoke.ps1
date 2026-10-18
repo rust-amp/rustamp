@@ -214,9 +214,13 @@ try {
 } catch {
     # Failure path still copies the guest's own transcript out, so the next
     # diagnosis does not need a manual copyout: the inner payload writes
-    # `guest-transcript.txt` (window dump included) before it fails, and the
-    # outer half appends session discovery to it. Best-effort: a copyout
-    # failure must not mask the original guest error.
+    # `guest-transcript.txt` (window dump included) before it fails. On a
+    # failed run that transcript is the payload's only: the outer half
+    # appends its session-discovery trail and writes `hashes.json` only on
+    # a successful run (in run-smoke.ps1 both sit after the failure
+    # throws), so a failed run brings the transcript back without a
+    # manifest and the hash leg below never runs for it. Best-effort: a
+    # copyout failure must not mask the original guest error.
     $guestErr = $_.Exception.Message
     try {
         if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
@@ -261,11 +265,21 @@ if (-not ($sig[0] -eq 0x89 -and $sig[1] -eq 0x50 -and $sig[2] -eq 0x4E -and $sig
 }
 
 # Byte-identity: recompute every hash, compare against the guest manifest
-# (same integrity leg as vm-run-capture.ps1 section 7).
+# (same integrity leg as vm-run-capture.ps1 section 7). The guest writes
+# that manifest once, after guest-transcript.txt is complete
+# (run-smoke.ps1, outer half), so every entry - the completed transcript
+# included - is verifiable byte-for-byte (X9).
 Step 'verifying hashes (byte-identical or refused)'
 $manifestPath = Join-Path $OutDir 'hashes.json'
 if (-not (Test-Path $manifestPath)) { Fail 'verify' 'no hashes.json came back: the guest run did not finish its manifest step; nothing is promoted' }
 $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+# The transcript is the proof's primary evidence (window dump, stop record,
+# exit code), so it must be IN the byte-identical set: a manifest that
+# does not cover it means the guest script regressed to hashing a live
+# log - refuse instead of verifying a subset (X9).
+if ($null -eq $manifest.PSObject.Properties['guest-transcript.txt']) {
+    Fail 'verify' "the manifest does not cover 'guest-transcript.txt': the guest writes hashes.json after the transcript is complete, so an uncovered transcript is a guest-script regression, not a smaller proof"
+}
 $checked = 0
 foreach ($entry in $manifest.PSObject.Properties) {
     $p = Join-Path $OutDir $entry.Name
