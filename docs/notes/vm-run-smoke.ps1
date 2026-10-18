@@ -115,9 +115,13 @@ if (-not (Test-Path $fixtureSrc)) { Fail 'stage' "fixture missing (not committed
 # existing runners' test binaries); the packaged player and host are
 # static-CRT (X1) and need nothing.
 Step 'staging the packaged bytes (verbatim copies, no rebuild)'
-# Mirror the test runner: use an absolute path under the broker's staging root
-# so the broker's copyin rule (StartsWith check) always passes.
+# Mirror the test runner: the staged tree lives under the broker's staging
+# root, and the copy-in hands the broker that ABSOLUTE path. It is resolved
+# here (GetFullPath), so even a relative -StageRoot argument cannot produce a
+# relative copy-in source; the broker's rule itself is verified again, on the
+# host, right before the copy-in call (section 5).
 $Stage = Join-Path $StageRoot 'smoke'
+$Stage = [System.IO.Path]::GetFullPath($Stage)
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'player')
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'tools')
@@ -145,11 +149,65 @@ if ($Reset) {
 }
 
 # --- 5. copy in and run the smoke in the interactive session ------------------
+# The broker's copyin rule (docs\notes\vm-broker\vm-broker.ps1, 'copyin' op):
+# the source must resolve under the staging root it owns
+# (D:\code\rustamp-vm\staging) and the destination under the guest root
+# (C:\rustamp). Both are checked HERE, on the host, so a path mistake fails
+# this runner under its own step name instead of inside the broker. The staged
+# tree is handed over as one absolute path under that root - the same shape as
+# the test runner's copyin (its $Stage is an absolute path under the same
+# root).
+$copyinSource = [System.IO.Path]::GetFullPath($Stage)
+$copyinDest = 'C:\rustamp\smoke'
+$stageRootFull = [System.IO.Path]::GetFullPath($StageRoot)
+$guestRootFull = [System.IO.Path]::GetFullPath('C:\rustamp')
+if (-not $copyinSource.StartsWith($stageRootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Fail 'copyin' "the staged tree '$copyinSource' is not under the broker's staging root '$stageRootFull' (its copyin accepts sources from that root only)"
+}
+if (-not $copyinDest.StartsWith($guestRootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Fail 'copyin' "the copy-in destination '$copyinDest' is not under the guest root '$guestRootFull' (its copyin accepts destinations from that root only)"
+}
 Step 'copying the staged package tree into the guest'
-& $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\smoke' -TimeoutSeconds 1800 | Out-Null
+try {
+    & $broker -Op copyin -Source $copyinSource -Dest $copyinDest -TimeoutSeconds 1800 | Out-Null
+} catch {
+    $brokerErr = $_.Exception.Message
+    if ($brokerErr -match 'copyin (source|destination) must live under') {
+        # The broker's own path-policy refusal: it names the root and the
+        # offending path, so the runner's path expressions are the thing to
+        # fix - report it as such.
+        Fail 'copyin' "the broker refused a copy-in path (its rule, docs\notes\vm-broker\vm-broker.ps1 'copyin'): $brokerErr"
+    }
+    # The broker's path rule passed, so the failure is on the broker's side
+    # of the call. The known case (broker.log 2026-10-17 20:38 and 2026-10-18
+    # 08:03) is an access-denied naming a staged file: the guest could not
+    # delete/overwrite it because a process there still holds it open. After
+    # a smoke run whose guest payload failed before its kill step, the player
+    # lives on to its --seconds backstop and its bundled host child can
+    # outlive it (the recorded hostReaped: false finding), so
+    # C:\rustamp\smoke\player\rustamp-plughost32.exe stays locked and the next
+    # copy-in cannot replace it. Remedy: a fresh guest - re-run with -Reset
+    # (restores the baseline checkpoint) or stop+start the guest. broker.log's
+    # 'op=copyin args=' line records the source the broker actually received,
+    # so the next diagnosis can settle this runner's -Source in one look
+    # instead of guessing at it.
+    Fail 'copyin' ("the broker's copy-in failed with this runner's source '$copyinSource' and destination '$copyinDest', both of which passed the broker's path rule: $brokerErr`n" +
+        "    If this is an access-denied naming a staged file (the known case), the guest still holds that file open - a leftover rustamp.exe / rustamp-plughost32.exe process from a previous smoke run (the guest payload's failure paths exit without killing the player, and the host child can outlive it). Remedy: re-run with -Reset for a fresh guest (restores the '$Baseline' checkpoint), or stop+start the guest.")
+}
 
 Step 'running the packaged player smoke in the guest interactive session'
+# The results directory is the copy-out destination, so the broker's copyout
+# rule applies to it: it must resolve under the host results root
+# (D:\code\rustamp-vm\staging\out). Resolved and verified here, once, so both
+# copy-out calls below (the failure path and the success path) use the same
+# absolute path.
 $OutDir = Join-Path $StageRoot 'out\smoke'
+$OutDir = [System.IO.Path]::GetFullPath($OutDir)
+$stageOutRoot = Join-Path $StageRoot 'out'
+$stageOutFull = [System.IO.Path]::GetFullPath($stageOutRoot)
+if (-not $OutDir.StartsWith($stageOutFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Fail 'copyout' "the copy-out destination '$OutDir' is not under the broker's results root '$stageOutFull' (its copyout accepts destinations from that root only)"
+}
 try {
     $result = & $broker -Op guest -Script 'run-smoke.ps1' -TimeoutSeconds $GuestTimeoutSeconds
     if (-not $result) { Fail 'guest' 'the broker returned no result object for run-smoke.ps1 (see broker.log)' }

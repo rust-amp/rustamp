@@ -54,7 +54,16 @@ only with `-Reset` (otherwise plain start, like the existing runners).
 
 ## How it fails (every case exits non-zero, naming the step)
 
-`STEP package / build-tool / stage / guest / verify FAILED: <detail>`.
+`STEP package / build-tool / stage / copyin / copyout / guest / verify
+FAILED: <detail>`.
+
+The copy-in fails two distinguishable ways: the broker's path-policy refusal
+(its own `copyin ... must live under ...` message — this runner's path
+expression is wrong) or an in-guest failure (a RemoteException after the
+paths were accepted — the known case is an access-denied naming a staged
+file, i.e. the guest still holds that file open, a leftover process from a
+previous run; remedy: a fresh guest via `-Reset`). See
+`docs/tasks/X6-smoke-copyin.md`.
 Named guest sub-steps: `start` (immediate exit, with code — 0xC0000135
 names a missing runtime), `window` (no main window in 60 s under the
 documented rule — the failure names every visible owned top-level window
@@ -70,7 +79,7 @@ warns rather than fails.
 
 ## What the first real runs found (why the runner exists)
 
-Four defects in four runs, each found by running, not by reading: (1) the
+Six defects in seven runs, each found by running, not by reading: (1) the
 `package` audit refused an incomplete build (a missing load-bearing binary —
 the check working as designed, no script change); (2) the guest script called
 `Invoke-CimMethod -GetOwner`, a parameter that does not exist — fixed to
@@ -86,12 +95,24 @@ row), register a one-shot Scheduled Task as that user with `LogonType
 Interactive` / `RunLevel Limited` (console desktop, no UAC question),
 `Start-ScheduledTask` now, wait on the `done.json` sentinel with a bound,
 unregister, then refuse session 0 / a mismatch loudly.; (4) the fifth run
-failed on a path policy: the broker refused a copyin with `access to the
-path "rustamp-plughost32.exe" was denied`. The smokerunner handed the broker
-a relative path (or a bare file name), while the broker only accepts
-copyin sources from the staging root it owns. Fixed by staging with an
-explicit absolute path under the staging root, mirroring the working test
-runner. (5) The sixth run reached the interactive session (session 1,
+failed at the copy-in with `access to the path "rustamp-plughost32.exe" was
+denied` — and the first diagnosis of it was wrong. That refusal was not the
+broker's path policy (the policy refusal is the broker's own `copyin source
+must live under ...` message, and it did not fire): broker.log's
+`op=copyin args=` line records the source the broker actually received,
+`D:\code\rustamp-vm\staging\smoke` — absolute, under the staging root the
+broker owns. The error was raised INSIDE the guest (a RemoteException): the
+broker's copy-in clears `C:\rustamp\smoke` and copies the staged tree in,
+and it could not delete/overwrite
+`C:\rustamp\smoke\player\rustamp-plughost32.exe` because a process in the
+guest still held it open — the previous run's player (its payload failed
+before the kill step and `Finish-Failure` exits without killing it, so it
+lived on to its `--seconds 120` backstop) and/or its bundled host child,
+which can outlive the player (the recorded `hostReaped: false` finding).
+The "fix" that landed for it (commit 6873089) changed no path — only a
+comment; the `$Stage` line predates it — and the error came back unchanged
+on the next run, which is what disproved the staging-root diagnosis. (5) The
+sixth run reached the interactive session (session 1,
 pinned virtual display) with the player alive after 2 s, then failed the
 window step with a message that named only the wanted title — it could not
 say whether a player window existed under a different title or no window
@@ -99,7 +120,22 @@ existed at all. Fixed without weakening the check (card
 `docs/tasks/X5-smoke-window.md`): the wait now accepts exactly the
 documented title rule, and a timeout dumps every owned top-level window it
 saw; the host runner best-effort-copies the guest outputs back even when
-the guest step throws.
+the guest step throws. (6) The seventh run failed at the same copy-in with
+the same in-guest access-denied on `rustamp-plughost32.exe`, again with the
+absolute staging path in broker.log's args line, ~20 minutes after the
+sixth run's player had started. The repetition — after the same copy-in had
+already succeeded three times from clean-guest states (10-17 20:33 and
+20:34, 10-18 07:41; ~3-4 s each, against ~1 s for both failures, which is
+the broker's first in-guest file operation) — pinned the cause to the
+guest's state, not to the runner's paths: a leftover host child holds the
+staged binary open and the broker's copy-in cannot replace it. Fixed in the
+runner (card `docs/tasks/X6-smoke-copyin.md`): the copy-in source is
+resolved to an absolute path and verified under the staging root before the
+call, the copy-out destination is verified under the results root, and a
+copy-in failure now reports the path-policy refusal and the in-guest case
+apart, naming the real cause and the remedy (a fresh guest: `-Reset`). The
+deeper fix — the guest payload's failure paths exiting without killing the
+player — belongs to the guest script, which this lane does not touch.
 
 ## What it still does not prove
 
