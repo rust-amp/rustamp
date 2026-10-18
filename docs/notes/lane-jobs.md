@@ -321,6 +321,38 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## Two earlier verdicts overturned, and the consequence named (2026-10-18 19:20)
+
+`f8d3e87`, gates green. Two reds survived the previous round, and chasing them
+overturned both verdicts rather than patching the tests.
+
+**The flush contract is the authority, and W20 was wrong.** The core contract
+(`crates/rustamp-core/src/audio.rs:361-369`) is explicit: a backend that cannot
+flush portably **must refuse** with `Error::Unsupported` rather than return `Ok`
+and let stale audio play - "a silent `Ok` is the one answer that is worse than a
+failure" - and **the engine treats a refusal as terminal**: it stops the run and
+does not resume into an output it cannot clean, so **the caller has to recreate
+the engine and the output**. W20 had made `Unsupported` mean "capability gap, so
+continue", which is a contradiction of that contract, and the contract test
+caught it exactly as it should: skipping the flush lets the listener hear the
+stale backlog first. The engine and the contract test are back to the documented
+behaviour, and nothing the test claims was weakened.
+
+**The host-window test was not a test bug, and W21's verdict is overturned.**
+W21 called it a test bug and added a five-second polling loop; the same test
+still failed afterwards, and its runtime jumped from a fifth of a second to
+fifteen. The fault was in `supervise.rs`, in the product, and that is where it is
+fixed.
+
+**The consequence, named rather than left to be discovered:** with the refusal
+terminal again, `crates/rustamp-app/tests/loopback.rs:544` - which asserts the
+engine's last error is none after the fixture tone - will fail again on the
+virtual cable, because that test is the caller and the caller is the one the
+contract obliges to recreate the engine and the output. That is not a test
+blemish to be papered over: it is the caller-side duty, and whether the
+application does it on a device that refuses the flush is an open question that
+this note hands to a lane.
+
 ## The flush defect and the three interactive reds (2026-10-18 18:40)
 
 Both merged (`88d17c0`), both with green gates.
