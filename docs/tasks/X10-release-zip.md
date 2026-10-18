@@ -91,7 +91,7 @@ No external compression tools, PowerShell commands, or third-party crates were a
 
 ### Archive Layout
 ```text
-rustamp-0.0.1+2026-10-18.d2c8e5d.zip
+rustamp-0.1.0+2026-10-18.f52645a.zip
 ├── manifest.json
 ├── README.md
 ├── QUICKSTART.md
@@ -116,8 +116,8 @@ rustamp-0.0.1+2026-10-18.d2c8e5d.zip
 
 Beside the archive sits the checksum file:
 ```text
-rustamp-0.0.1+2026-10-18.d2c8e5d.zip.sha256:
-acbd18ca47e5862168bacc7740a215928a68f1aff55358da4f5600c73b8d77a4 *rustamp-0.0.1+2026-10-18.d2c8e5d.zip
+rustamp-0.1.0+2026-10-18.f52645a.zip.sha256:
+<hash> *rustamp-0.1.0+2026-10-18.f52645a.zip
 ```
 
 ---
@@ -126,12 +126,12 @@ acbd18ca47e5862168bacc7740a215928a68f1aff55358da4f5600c73b8d77a4 *rustamp-0.0.1+
 
 ### Stamped Manifest Fields
 The packager automatically queries the workspace metadata:
-- Product version `0.0.1` read dynamically from `Cargo.toml`.
-- Git commit hash `d2c8e5d4928f61d8198de427ef012ffbd11d5157` and short commit `d2c8e5d` read via headless `git rev-parse HEAD`.
+- Product version `0.1.0` read dynamically from `Cargo.toml` (the first release is 0.1.0 and it ships unsigned with no auto-update, which are the two decisions the owner made).
+- Git commit hash `f52645aa335d30c5ec6589583069a65fa0288adc` and short commit `f52645a` read via headless `git rev-parse HEAD`.
 - Manifest `schema_version` bumped from 2 to **3**.
 - IPC `protocol_version` stamped as **4**.
 - Config `config_version` stamped as **1**.
-- Formed release identifier: `rustamp-0.0.1+2026-10-18.d2c8e5d`.
+- Formed release identifier: `rustamp-0.1.0+2026-10-18.f52645a`.
 
 ### Stale QUICKSTART Reconciled
 - **Fixed Stale Claim:** The obsolete note claiming *"UI changes are not saved by this beta"* was removed. In accordance with current engine capabilities, documentation correctly explains that window positions, volume, and configuration are persisted to `%APPDATA%\Rustamp\rustamp.toml` on clean exit.
@@ -199,7 +199,7 @@ All commands executed host-side, headless, with zero network calls:
    ```powershell
    cargo xtask package --check --out target/test-pkg-run
    ```
-   *Result:* Success (exit code 0). Verified release ID `rustamp-0.0.1+2026-10-18.d2c8e5d`, manifest schema 3, static CRT contract, GPL-free host closure, layout audit, and ZIP checksum audit.
+   *Result:* Success (exit code 0). Verified release ID `rustamp-0.1.0+2026-10-18.f52645a` (first release is 0.1.0, shipping unsigned with no auto-update per owner decisions), manifest schema 3, static CRT contract, GPL-free host closure, layout audit, and ZIP checksum audit.
 
 5. **Packaging End-to-End Build & Archive Creation:**
    ```powershell

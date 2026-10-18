@@ -157,12 +157,14 @@ rules (no tests run by a lane, no window on the host, VM only through the broker
 
 1. **One product version, SemVer, from `[workspace.package].version`.** It is
    already the single source (every crate inherits it) and already shown to the
-   user. Pre-1.0 the project stays on `0.MINOR.PATCH`, with the 0.x convention that a
+   user. The owner decided that the first release is `0.1.0` (not a beta) and
+   that it ships unsigned with no auto-update, which are the two decisions the owner made.
+   Pre-1.0 the project stays on `0.MINOR.PATCH`, with the 0.x convention that a
    MINOR bump may break anything and PATCH is fixes only. Release candidates and
-   betas carry a pre-release suffix: `0.1.0-beta.1`, `0.1.0-beta.2`, … A `1.0.0`
+   betas carry a pre-release suffix (`0.2.0-beta.1`, …). A `1.0.0`
    is **not** promised by this rule; it requires G1, G3, G4, G5 all closed.
 2. **An artefact is identified by `<version>+<yyyy-mm-dd>.<short-commit>`**, and
-   its folder is named the same (`rustamp-0.1.0-beta.1+2026-10-18.abc1234`). This
+   its folder is named the same (`rustamp-0.1.0+2026-10-18.f52645a`). This
    keeps the dated folder the project already uses, adds the version it lacked, and
    adds the commit it lacked — so "72 commits stale" becomes a printed fact in the
    manifest rather than something a card has to reconstruct. SemVer build metadata
@@ -267,9 +269,10 @@ evidence exists, and the notes must say they are unproven in the meantime.
 | "All tests pass" | No green full run at HEAD is on record; compile-only suites are the majority of newer work (`BETA-what-is-in-it.md:200-212`). Quoted counts are per-commit snapshots | Step 4 at the release commit, quoted with the commit |
 | Anything about the *tree* said of the *bytes* | The artefact is frozen at its build commit; the tree has moved on (`BETA-what-is-in-it.md:7-13`) | State the commit the claim is about; use the §3 identity |
 
-Standing wording for any release page, until the table above changes: **"Beta.
-Unsigned. Portable folder, not an installer. Not verified on a clean machine, a
-real audio device, a real Winamp plugin, or for performance."** State what passed
+Standing wording for any release page, until the table above changes: **"Version 0.1.0.
+Unsigned. Portable folder, not an installer. No auto-update. Not verified on a clean machine, a
+real audio device, a real Winamp plugin, or for performance."** (The first release is 0.1.0
+and ships unsigned with no auto-update, which are the two decisions the owner made.) State what passed
 and at which commit; state what was skipped.
 
 ---

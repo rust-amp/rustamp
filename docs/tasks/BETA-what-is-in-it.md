@@ -1,7 +1,9 @@
 # BETA — what is in the packaged beta (artefact vs tree)
 
-**Date:** 2026-10-18. **Scope:** docs-only inventory of the packaged beta as it
-stands, reconciled at HEAD (`1912b98`). No `.rs` file, test, runner script,
+**Date:** 2026-10-18. **Scope:** docs-only inventory of the packaged release as it
+stands, reconciled at HEAD (`1912b98`). Note on release status: the first release
+is 0.1.0 (no longer a beta) and it ships unsigned with no auto-update, which are the two
+decisions the owner made. No `.rs` file, test, runner script,
 `docs/HANDOFF.md` or review card was edited; nothing was executed.
 
 **The one distinction this card keeps:** the artefact bytes are frozen at the

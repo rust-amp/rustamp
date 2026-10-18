@@ -10,6 +10,8 @@ executed here (task constraint); `git log`/`grep`/reads only.
 
 ## Decision
 
+**Owner Release Decision:** The owner decided that the first release is 0.1.0 (no longer a beta) and that it ships unsigned with no auto-update, which are the two decisions the owner made.
+
 **Still not ready for an ordinary first-user beta — but the failure set is
 narrower and different.** Of the twelve first-review findings, **eight are
 fixed or substantially fixed** (01, 02, 03, 04, 05, 08, 12, and most of 06),

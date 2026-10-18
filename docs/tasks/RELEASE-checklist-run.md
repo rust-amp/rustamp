@@ -3,9 +3,10 @@
 **Date:** 2026-10-18  
 **Worktree:** `C:\Users\micro\.paseo\worktrees\3ikyavhh\paseo-release-checklist`  
 **Git Commit:** `c6a0765bc4e245cd4489de2c1db16f0d4bbd6093` (`c6a0765`)  
-**Product Version:** `0.1.0-beta.1` (from [Cargo.toml](file:///C:/Users/micro/.paseo/worktrees/3ikyavhh/paseo-release-checklist/Cargo.toml#L32))  
-**Release Identifier:** `rustamp-0.1.0-beta.1+2026-10-18.c6a0765`  
+**Product Version:** `0.1.0` (from [Cargo.toml](file:///C:/Users/micro/.paseo/worktrees/3ikyavhh/paseo-release-checklist/Cargo.toml#L32))  
+**Release Identifier:** `rustamp-0.1.0+2026-10-18.c6a0765`  
 **Manifest Schema:** Version 3 | **IPC Protocol:** Version 4 | **Config Schema:** Version 1  
+**Owner Decision:** The first release is 0.1.0 and it ships unsigned with no auto-update, which are the two decisions the owner made.  
 **Reference Documents:** [RELEASE-plan.md](file:///C:/Users/micro/.paseo/worktrees/3ikyavhh/paseo-release-checklist/docs/tasks/RELEASE-plan.md), [X10-release-zip.md](file:///C:/Users/micro/.paseo/worktrees/3ikyavhh/paseo-release-checklist/docs/tasks/X10-release-zip.md)
 
 ---
@@ -173,12 +174,12 @@ Every step from Section 4 of [RELEASE-plan.md](file:///C:/Users/micro/.paseo/wor
   ```text
   xtask package: dry run (no files written)
     workspace root: C:\Users\micro\.paseo\worktrees\3ikyavhh\paseo-release-checklist
-    release ID:     rustamp-0.1.0-beta.1+2026-10-18.c6a0765
-    product version:0.1.0-beta.1
+    release ID:     rustamp-0.1.0+2026-10-18.c6a0765
+    product version:0.1.0
     commit:         c6a0765bc4e245cd4489de2c1db16f0d4bbd6093 (c6a0765)
-    output dir:     C:\Users\micro\.paseo\worktrees\3ikyavhh\paseo-release-checklist\target\package\rustamp-0.1.0-beta.1+2026-10-18.c6a0765
-    portable zip:   C:\Users\micro\.paseo\worktrees\3ikyavhh\paseo-release-checklist\target\package\rustamp-0.1.0-beta.1+2026-10-18.c6a0765.zip
-    checksum file:  C:\Users\micro\.paseo\worktrees\3ikyavhh\paseo-release-checklist\target\package\rustamp-0.1.0-beta.1+2026-10-18.c6a0765.zip.sha256
+    output dir:     C:\Users\micro\.paseo\worktrees\3ikyavhh\paseo-release-checklist\target\package\rustamp-0.1.0+2026-10-18.c6a0765
+    portable zip:   C:\Users\micro\.paseo\worktrees\3ikyavhh\paseo-release-checklist\target\package\rustamp-0.1.0+2026-10-18.c6a0765.zip
+    checksum file:  C:\Users\micro\.paseo\worktrees\3ikyavhh\paseo-release-checklist\target\package\rustamp-0.1.0+2026-10-18.c6a0765.zip.sha256
     scope: player + host
     player target:  x86_64-pc-windows-msvc (rustamp-app)
     decoder host:   x86_64-pc-windows-msvc (rustamp-dechost)
@@ -193,7 +194,7 @@ Every step from Section 4 of [RELEASE-plan.md](file:///C:/Users/micro/.paseo/wor
     player bundles host: yes (rustamp-plughost32.exe beside rustamp.exe: RFC 0006 §8, the first `supervise.rs` candidate)
     host-only artefact: unchanged (rustamp-plughost32.exe + LICENSE-MIT/APACHE/THIRD_PARTY.md, GPL-free proof as before)
   ```
-- **What a pass proves:** Manifest schema 3 stamping consistency, product version (`0.1.0-beta.1`), commit tracking (`c6a0765`), GPL-free host closure, and compile-time static MSVC CRT flags (`-C target-feature=+crt-static`).
+- **What a pass proves:** Manifest schema 3 stamping consistency, product version (`0.1.0`), commit tracking (`c6a0765`), GPL-free host closure, and compile-time static MSVC CRT flags (`-C target-feature=+crt-static`).
 - **What it does NOT prove:** Anything about compiled binaries or runtime behavior (builds nothing).
 
 ---
@@ -204,10 +205,10 @@ Every step from Section 4 of [RELEASE-plan.md](file:///C:/Users/micro/.paseo/wor
 - **Exit Code:** `0`
 - **Output:**
   ```text
-  Compiling rustamp-app v0.1.0-beta.1 (x86_64-pc-windows-msvc) [release]
-  Compiling rustamp-dechost v0.1.0-beta.1 (x86_64-pc-windows-msvc) [release]
-  Compiling rustamp-dsphost v0.1.0-beta.1 (x86_64-pc-windows-msvc) [release]
-  Compiling rustamp-plughost v0.1.0-beta.1 (i686-pc-windows-msvc) [release]
+  Compiling rustamp-app v0.1.0 (x86_64-pc-windows-msvc) [release]
+  Compiling rustamp-dechost v0.1.0 (x86_64-pc-windows-msvc) [release]
+  Compiling rustamp-dsphost v0.1.0 (x86_64-pc-windows-msvc) [release]
+  Compiling rustamp-plughost v0.1.0 (i686-pc-windows-msvc) [release]
   xtask package: player -> target/dist-test\player
   xtask package: player includes residents: rustamp-dechost-symphonia.exe and rustamp-dsphost-stages.exe beside rustamp.exe
   xtask package: player bundles rustamp-plughost32.exe beside rustamp.exe (RFC 0006 §8)
@@ -231,7 +232,7 @@ Every step from Section 4 of [RELEASE-plan.md](file:///C:/Users/micro/.paseo/wor
   ```text
   xtask package: dry run (no files written)
     workspace root: C:\Users\micro\.paseo\worktrees\3ikyavhh\paseo-release-checklist
-    release ID:     rustamp-0.1.0-beta.1+2026-10-18.c6a0765
+    release ID:     rustamp-0.1.0+2026-10-18.c6a0765
     output dir:     target/dist-test
     portable zip:   target\dist-test.zip
     checksum file:  target\dist-test.zip.sha256
@@ -334,7 +335,7 @@ Every step from Section 4 of [RELEASE-plan.md](file:///C:/Users/micro/.paseo/wor
 - **Execution Status:** **EXECUTED**
 - **Reference:** [RELEASE-notes-template.md](file:///C:/Users/micro/.paseo/worktrees/3ikyavhh/paseo-release-checklist/docs/tasks/RELEASE-notes-template.md)
 - **Exit Code:** `0`
-- **Output:** Stamped with version `0.1.0-beta.1`, commit `c6a0765`, protocol 4, config 1, and honest disclosures of G5 (unsigned) and G6 (no auto-updates).
+- **Output:** Stamped with version `0.1.0`, commit `c6a0765`, protocol 4, config 1, and honest disclosures of G5 (unsigned) and G6 (no auto-updates). The first release is 0.1.0 and ships unsigned with no auto-update, which are the two decisions the owner made.
 - **What a pass proves:** Release documentation honestly distinguishes what is in the shipped bytes vs tree, detailing manual upgrade instructions and unproven boundaries.
 - **What it does NOT prove:** Anything beyond documentation accuracy.
 
@@ -342,7 +343,7 @@ Every step from Section 4 of [RELEASE-plan.md](file:///C:/Users/micro/.paseo/wor
 
 ### Step 17 — Git release tag
 - **Classification:** Needs the owner.
-- **Intended Command:** `git tag -a v0.1.0-beta.1 -m "Release v0.1.0-beta.1"`
+- **Intended Command:** `git tag -a v0.1.0 -m "Release v0.1.0"`
 - **Execution Status:** **NOT RUN (BLOCKED)**
 - **What blocks it:** Creating git tags or commits was explicitly forbidden for this run ("make no commit"); git tagging is the sole prerogative of the project owner upon full checklist sign-off.
 - **Who must do it:** The project owner.

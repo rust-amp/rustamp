@@ -6,7 +6,7 @@
 
 Two owner decisions are closed in this lane:
 1. **RFC 0010 is Accepted**: The Load Playlist dialog command and contract are formally settled. The core command `Command::OpenPlaylist` triggers opening the dialog; dialog confirmation carries a file path (`Option<PathBuf>`) rather than an engine mutation command; the app loads the playlist with replace semantics and surfaces skip reports.
-2. **First Release Version Number**: Following `docs/tasks/RELEASE-plan.md` §3 (the accepted versioning rule), the product receives its first SemVer number: `0.1.0-beta.1`.
+2. **First Release Version Number**: Following `docs/tasks/RELEASE-plan.md` §3 (the accepted versioning rule), the product was initially given `0.1.0-beta.1`. The owner subsequently decided that the first release is `0.1.0` (not a beta) and that it ships unsigned with no auto-update, which are the two decisions the owner made (formalized in `docs/tasks/W20-version-010.md`).
 
 ## 2. Changes Implemented
 
