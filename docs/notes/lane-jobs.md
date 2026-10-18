@@ -247,6 +247,22 @@ incomplete, which fails either immediately or - worse - reaches the guest with
 no matching binary. The `ran 0` gate catches the second case, and the first
 fails loudly, but neither is a measurement. Filtered runs stage fresh.
 
+## Measured: 5 of 5 green in isolation (2026-10-18 14:45)
+
+Five consecutive isolated runs of `dsp_roundtrip` on a quiet host, full staging,
+`-Reset` each time: **5 passed, 0 stalled**, every guest run finishing in
+0.26-0.29 s. The fifth took 190 s of wall time instead of the usual 135-138 s,
+which means **lanes were building while it ran** - and the guest test still
+passed in 0.27 s. So host load slows the run without killing the delivery.
+
+That weakens the load explanation and leaves a sharper question, which is now
+with the Claude diagnosis lane: the stall has appeared **only inside suite
+runs** (two of four) and once immediately after a broken `-SkipBuild` staging,
+and never in five isolated runs. In a suite run eighty-two binaries execute one
+after another, so the candidate is a **resident or thread left behind by a
+previous binary** competing with the two-process test, which would explain why
+it happens in the suite and not alone.
+
 ## The `wave26-windows` rescue (2026-10-18 12:45)
 
 
