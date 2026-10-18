@@ -1264,6 +1264,13 @@ mod hosted_tests {
     const TOTAL: usize = 2048;
     const CHANGE_AT: usize = 512;
     const WAIT: Duration = Duration::from_secs(5);
+    /// Liveness policy for the in-process control peers — the same
+    /// wall-clock trip wire the `dsp_hosted_tests` module documents (the
+    /// framework's 5 s default flakes under this VM's load; see M24).
+    const LIVENESS: Liveness = Liveness {
+        interval: Duration::from_millis(100),
+        timeout: Duration::from_secs(30),
+    };
 
     struct FakeResident;
 
@@ -1416,8 +1423,8 @@ mod hosted_tests {
         seek_timeout: Duration,
     ) -> (HostDecoder<NamedPcmRings>, mpsc::Receiver<HostResult<()>>) {
         let ((ar, aw), (br, bw)) = streams();
-        let client = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-        let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+        let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+        let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
         let (done, result) = mpsc::channel();
         thread::spawn(move || {
             let outcome = serve_decoder(&host, &NamedPcmRings, &FakeResident);
@@ -1520,8 +1527,8 @@ mod hosted_tests {
     #[test]
     fn refusal_is_loud_and_never_eos() {
         let ((ar, aw), (br, bw)) = streams();
-        let client = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-        let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+        let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+        let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
         let (done, result) = mpsc::channel();
         thread::spawn(move || {
             let outcome = serve_decoder(&host, &NamedPcmRings, &FakeResident);
@@ -1744,7 +1751,7 @@ mod dsp_hosted_tests {
 
     use std::collections::VecDeque;
     use std::io::{Cursor, Read, Write};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::Instant;
@@ -1775,6 +1782,18 @@ mod dsp_hosted_tests {
         channels: 2,
     };
     const WAIT: Duration = Duration::from_secs(5);
+    /// Liveness policy for the in-process control peers. The framework
+    /// default (`Liveness::default()`: 100 ms interval, 5 s timeout) is a
+    /// wall-clock bound a healthy-but-slow VM schedule can trip — the flake
+    /// class M24 fixed in rustamp-dechost's `real_decode` suite. A dead
+    /// resident never answers a Ping and is caught by the control EOF
+    /// regardless, and a wedged resident by the adapter's own bounded block
+    /// round-trip, so no test here depends on a fast liveness expiry; only
+    /// the trip wire moves, from 5 s to six times the harness wait.
+    const LIVENESS: Liveness = Liveness {
+        interval: Duration::from_millis(100),
+        timeout: Duration::from_secs(30),
+    };
 
     /// Probe bound for the asynchronous `DspReset`: how many host-serviced
     /// blocks a cleared-state probe may take to observe the reset. A progress
@@ -1824,6 +1843,14 @@ mod dsp_hosted_tests {
         channels: usize,
         pending: VecDeque<f32>,
         calls: usize,
+        /// Armed crash trigger for `Kind::Die`: the chain panics on the next
+        /// block once set. The engine-level death test arms it after the
+        /// track start is published, so the crash is deterministically
+        /// mid-run instead of racing the start publication (a call-count
+        /// crash can latch the DSP failure before the engine's poll has
+        /// processed the decode thread's already-queued `TrackStarted`, and
+        /// the failure teardown discards that message).
+        die: Option<Arc<AtomicBool>>,
     }
 
     impl FakeChain {
@@ -1837,7 +1864,14 @@ mod dsp_hosted_tests {
                 channels,
                 pending,
                 calls: 0,
+                die: None,
             }
+        }
+
+        /// Arm the crash trigger of a `Kind::Die` chain.
+        fn armed_to_die(mut self, die: Arc<AtomicBool>) -> Self {
+            self.die = Some(die);
+            self
         }
     }
 
@@ -1872,7 +1906,12 @@ mod dsp_hosted_tests {
                     }
                 }
                 Kind::Die => {
-                    if self.calls == 3 {
+                    if self.calls == 3
+                        || self
+                            .die
+                            .as_ref()
+                            .is_some_and(|armed| armed.load(Ordering::Relaxed))
+                    {
                         panic!("fake resident crash");
                     }
                     for sample in buf.iter_mut() {
@@ -1917,12 +1956,24 @@ mod dsp_hosted_tests {
     /// crash, a configure refusal, a reconfigure refusal).
     struct FakeDspResident {
         opens: AtomicUsize,
+        /// Crash trigger handed to every `fake:die` chain this resident
+        /// builds; `None` keeps the call-count crash (third block).
+        die: Option<Arc<AtomicBool>>,
     }
 
     impl FakeDspResident {
         fn new() -> Self {
             FakeDspResident {
                 opens: AtomicUsize::new(0),
+                die: None,
+            }
+        }
+
+        /// A resident whose `fake:die` chains crash once `die` is set.
+        fn armed(die: Arc<AtomicBool>) -> Self {
+            FakeDspResident {
+                opens: AtomicUsize::new(0),
+                die: Some(die),
             }
         }
     }
@@ -1981,7 +2032,11 @@ mod dsp_hosted_tests {
                         FakeChain::new(Kind::Delay, 1.0, frames as usize, channels)
                     }
                     "fake:slow" => FakeChain::new(Kind::Slow, 2.0, 0, channels),
-                    "fake:die" => FakeChain::new(Kind::Die, 2.0, 0, channels),
+                    "fake:die" => match &self.die {
+                        Some(die) => FakeChain::new(Kind::Die, 2.0, 0, channels)
+                            .armed_to_die(Arc::clone(die)),
+                        None => FakeChain::new(Kind::Die, 2.0, 0, channels),
+                    },
                     "fake:refuse" => {
                         return Err(MediaHostError::OperationFailed(
                             "fake resident refuses this chain".into(),
@@ -2082,12 +2137,23 @@ mod dsp_hosted_tests {
         spec: PcmSpecWire,
         ring_frames: u32,
     ) -> (DspSession<NamedPcmRings>, HostOutcome) {
+        open_session_with(stages, spec, ring_frames, FakeDspResident::new())
+    }
+
+    /// The same in-process session with a chosen fake resident — the
+    /// engine-level death test passes an armed one so its crash trigger is
+    /// under the test's control (see `FakeChain::die`).
+    fn open_session_with(
+        stages: Vec<DspStageDesc>,
+        spec: PcmSpecWire,
+        ring_frames: u32,
+        resident: FakeDspResident,
+    ) -> (DspSession<NamedPcmRings>, HostOutcome) {
         let ((ar, aw), (br, bw)) = streams();
-        let client = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-        let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+        let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+        let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
         let (done, result) = mpsc::channel();
         thread::spawn(move || {
-            let resident = FakeDspResident::new();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 serve_dsp(&host, &NamedPcmRings, &resident)
             }));
@@ -2460,6 +2526,18 @@ mod dsp_hosted_tests {
 
     impl DspHarness {
         fn new(names: &[&str], stages: Vec<DspStageDesc>, block_timeout: Duration) -> DspHarness {
+            Self::with_resident(names, stages, block_timeout, FakeDspResident::new())
+        }
+
+        /// A harness whose in-process fake resident is the given one — the
+        /// engine-level death test passes an armed one so the resident's
+        /// crash is triggered by the test, not by a call count.
+        fn with_resident(
+            names: &[&str],
+            stages: Vec<DspStageDesc>,
+            block_timeout: Duration,
+            resident: FakeDspResident,
+        ) -> DspHarness {
             let dir = tempfile::tempdir().expect("temp dir");
             let (output, clock) = NullOutput::pair();
             let bus = EventBus::new();
@@ -2471,7 +2549,8 @@ mod dsp_hosted_tests {
             // Bit-exact comparisons: the default-on limiter would clamp the
             // synthetic pattern's overs.
             engine.set_limiter_enabled(false);
-            let (session, host) = open_session(stages.clone(), SPEC_WIRE, DEFAULT_DSP_RING_FRAMES);
+            let (session, host) =
+                open_session_with(stages.clone(), SPEC_WIRE, DEFAULT_DSP_RING_FRAMES, resident);
             let chain = HostDspChain::new(
                 session,
                 stages,
@@ -2711,13 +2790,33 @@ mod dsp_hosted_tests {
 
     #[test]
     fn engine_fails_the_track_when_the_resident_dies() {
-        let mut h = DspHarness::new(&["track7_44100.tst"], vec![stage("fake:die")], WAIT);
+        // The crash is armed, not counted. The old call-count trigger (the
+        // fake panicked on its third block) raced the start publication: the
+        // decode thread queues `TrackStarted` before its first block, and a
+        // crash a few blocks later can latch the DSP failure before the
+        // engine's poll has processed that message — the failure teardown
+        // (`join_decode`) then discards it, `duration_frames()` is never
+        // published, and `wait_track(0)` below could never succeed. Arming
+        // the trigger only after the start is observed makes the crash
+        // deterministically mid-run — a stronger claim, with every assertion
+        // unchanged.
+        let die = Arc::new(AtomicBool::new(false));
+        let mut h = DspHarness::with_resident(
+            &["track7_44100.tst"],
+            vec![stage("fake:die")],
+            WAIT,
+            FakeDspResident::armed(Arc::clone(&die)),
+        );
         h.engine.play_index(0).unwrap();
         assert!(h.wait_track(0));
-        // The fake crashes on its third block: the adapter latches, the
+        die.store(true, Ordering::Relaxed);
+        // The fake crashes on the next block: the adapter latches, the
         // engine's poll fails the track (RFC 0006 §8) — never the player.
+        // The wait pumps the clock so the decode thread keeps flowing to the
+        // armed crash: without a consumer the engine ring fills and the
+        // decode thread parks in its write loop before the next block.
         assert!(
-            h.wait_idle(|e| e.transport() == TransportState::Stopped, WAIT),
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
             "the run must stop when the resident dies"
         );
         let position = h.engine.position_frames();

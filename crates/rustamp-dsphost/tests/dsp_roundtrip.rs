@@ -40,6 +40,18 @@ const JOIN_WAIT: Duration = Duration::from_secs(30);
 /// enough that only a real stall reaches it, and a timeout is a loud
 /// failure that names the step, never a pass.
 const STALL_WAIT: Duration = Duration::from_secs(30);
+/// Liveness policy for the test's control peers. The framework default
+/// (`Liveness::default()`: 100 ms interval, 5 s timeout) is a wall-clock
+/// bound a healthy-but-slow VM schedule can trip — the flake class M24
+/// proved in this VM and fixed in rustamp-dechost's `real_decode` suite
+/// (M24 §1.3), which also named this file's suites as still carrying it.
+/// A dead resident never answers a Ping and is caught by the control EOF
+/// regardless, and every PCM wait keeps its `STALL_WAIT` bound, so no test
+/// here depends on a fast liveness expiry; only the trip wire moves.
+const LIVENESS: Liveness = Liveness {
+    interval: Duration::from_millis(100),
+    timeout: STALL_WAIT,
+};
 const SPEC: PcmSpecWire = PcmSpecWire {
     sample_rate_hz: 44_100,
     channels: 2,
@@ -135,8 +147,8 @@ fn start(
     capacity: u32,
 ) -> (DspSession<NamedPcmRings>, mpsc::Receiver<Result<()>>) {
     let ((ar, aw), (br, bw)) = streams();
-    let client = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-    let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
     let (done, result) = mpsc::channel();
     thread::spawn(move || {
         let outcome = serve_dsp(&host, &NamedPcmRings, &StageResident);
@@ -291,8 +303,8 @@ fn gain_chain_changes_audio_measurably() {
 #[test]
 fn unknown_stage_is_a_loud_error_before_any_ring() {
     let ((ar, aw), (br, bw)) = streams();
-    let client = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-    let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
     let (done, result) = mpsc::channel();
     thread::spawn(move || {
         let outcome = serve_dsp(&host, &NamedPcmRings, &StageResident);
@@ -323,8 +335,8 @@ fn unknown_stage_is_a_loud_error_before_any_ring() {
 #[test]
 fn gain_with_bad_params_is_refused() {
     let ((ar, aw), (br, bw)) = streams();
-    let client = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-    let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
     let (done, result) = mpsc::channel();
     thread::spawn(move || {
         let outcome = serve_dsp(&host, &NamedPcmRings, &StageResident);
@@ -434,7 +446,7 @@ fn abrupt_player_loss_stops_the_host_without_hanging() {
         .unwrap();
     let in_generation = offer.producer.generation();
     player.send(&offer.message).unwrap();
-    let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
     let (done, result) = mpsc::channel();
     thread::spawn(move || {
         let outcome = serve_dsp(&host, &NamedPcmRings, &StageResident);
@@ -503,7 +515,7 @@ fn abrupt_player_loss_stops_the_host_without_hanging() {
 #[test]
 fn abrupt_host_loss_is_loud_and_never_eos() {
     let ((ar, aw), (br, bw)) = streams();
-    let peer = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
+    let peer = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
     let (die, death) = mpsc::channel();
     thread::spawn(move || {
         // Deliberately no ControlPeer or close guard at the fake host end.
