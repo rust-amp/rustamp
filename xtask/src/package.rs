@@ -2279,7 +2279,13 @@ mod tests {
             // Missing THIRD_PARTY.md fails
             fs::remove_file(out.join("THIRD_PARTY.md")).unwrap();
             assert!(audit_package_layout(&out, "release", player, host, &meta).is_err());
-            copy_file(&root.join("THIRD_PARTY.md"), &out.join("THIRD_PARTY.md")).unwrap();
+            // Same guarded restore as the fixture setup above: the audit only
+            // compares against the repository file when it exists.
+            if root.join("THIRD_PARTY.md").is_file() {
+                copy_file(&root.join("THIRD_PARTY.md"), &out.join("THIRD_PARTY.md")).unwrap();
+            } else {
+                fs::write(out.join("THIRD_PARTY.md"), b"third party notices").unwrap();
+            }
 
             let dir = out.join(if player { "player" } else { "host" });
             for stale in ["vcruntime140.dll", "unexpected.exe", "LICENSE-GPL"] {
@@ -2294,7 +2300,10 @@ mod tests {
             fs::write(dir.join("manifest.json"), b"dynamic CRT").unwrap();
             assert!(audit_package_layout(&out, "release", player, host, &meta).is_err());
         }
-        fs::remove_dir_all(base).unwrap();
+        // Best-effort cleanup after every claim above has passed or failed on
+        // its own merits: a locked temp file on Windows must not flip a green
+        // test red, and unique temp names make leftovers harmless.
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

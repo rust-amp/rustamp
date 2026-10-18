@@ -770,8 +770,20 @@ mod tests {
         server_transport.send(&Message::hello()).unwrap();
 
         let server_handle = std::thread::spawn(move || {
-            let open_msg = server_transport.recv().unwrap();
-            assert!(matches!(open_msg, Message::DecoderOpen { .. }));
+            // The client's liveness monitor answers the handshake with an
+            // immediate Ping that races the session's DecoderOpen; both orders
+            // are legitimate wire traffic (production residents answer Pong
+            // through their own monitor and never surface either frame). Skip
+            // the liveness chatter and pin the open itself; anything else is
+            // still a loud failure so a genuinely wrong first message cannot
+            // slip through.
+            loop {
+                match server_transport.recv().unwrap() {
+                    Message::DecoderOpen { .. } => break,
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    other => panic!("expected DecoderOpen, got {other:?}"),
+                }
+            }
             server_transport
                 .send(&Message::DecoderError {
                     message: "refused corrupt stream".into(),
