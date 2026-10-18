@@ -98,6 +98,9 @@ pub struct App {
     commands: CommandSender,
     command_rx: CommandReceiver,
 
+    output_choice: OutputChoice,
+    registry: DecoderRegistry,
+
     /// The virtual clock, when the null output is in use (`--null` headless or
     /// `--no-audio` windowed).
     clock: Option<NullClock>,
@@ -180,6 +183,17 @@ pub(crate) fn is_playlist_file(path: &Path) -> bool {
         .any(|fmt| fmt.extension().eq_ignore_ascii_case(ext))
 }
 
+/// Creates the output device and optional null clock for the given choice.
+fn create_output(choice: OutputChoice) -> (Box<dyn OutputDevice>, Option<NullClock>) {
+    match choice {
+        OutputChoice::Null | OutputChoice::NoAudio => {
+            let (output, clock) = NullOutput::pair();
+            (Box::new(output), Some(clock))
+        }
+        OutputChoice::Default => (default_output(), None),
+    }
+}
+
 impl App {
     /// Builds the player with the default decoder registry.
     pub fn new(options: AppOptions) -> Result<App> {
@@ -192,20 +206,14 @@ impl App {
         let events = bus.subscribe();
         let (commands, command_rx) = command_channel();
 
-        let (output, clock): (Box<dyn OutputDevice>, Option<NullClock>) = match options.output {
-            OutputChoice::Null | OutputChoice::NoAudio => {
-                let (output, clock) = NullOutput::pair();
-                (Box::new(output), Some(clock))
-            }
-            OutputChoice::Default => (default_output(), None),
-        };
+        let (output, clock) = create_output(options.output);
 
         let cfg = EngineConfig {
             volume: options.volume,
             balance: options.config.audio.balance,
             ..EngineConfig::default()
         };
-        let mut engine = Engine::new(registry, output, bus.clone(), cfg)?;
+        let mut engine = Engine::new(registry.clone(), output, bus.clone(), cfg)?;
         // `Engine::new` initialises its gain from the config but reports
         // `volume: 255, balance: 0` in `PlayerState` (an engine-side
         // inconsistency; see the findings). Re-assert the configured values so
@@ -266,6 +274,8 @@ impl App {
             events,
             commands,
             command_rx,
+            output_choice: options.output,
+            registry,
             clock,
             started: Instant::now(),
             seconds: options.seconds,
@@ -386,6 +396,68 @@ impl App {
     /// The audio engine.
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The audio engine, mutably (tests and embedding).
+    pub fn engine_mut(&mut self) -> &mut Engine {
+        &mut self.engine
+    }
+
+    /// Recreates the audio output device and engine as required by the audio
+    /// contract (crates/rustamp-core/src/audio.rs:370-380) when a backend
+    /// refuses flush (`Error::Unsupported`) or closes the output.
+    /// Preserves the queue, current track index, volume, balance, equalizer
+    /// settings, replaygain, limiter, shuffle, and repeat modes.
+    pub fn recreate_engine(&mut self) -> Result<()> {
+        let (output, clock) = create_output(self.output_choice);
+        let queue = self.engine.queue().to_vec();
+        let current_index = self.engine.current_index();
+        let volume = self.engine.volume();
+        let balance = self.engine.balance();
+        let eq = self.engine.eq();
+        let limiter = self.engine.limiter_enabled();
+        let replaygain_mode = self.engine.replaygain_mode();
+        let replaygain_preamp_db = self.engine.replaygain_preamp_db();
+        let stop_after_current = self.engine.stop_after_current();
+        let shuffle = self.engine.shuffle();
+        let repeat = self.engine.repeat();
+
+        let cfg = EngineConfig {
+            volume,
+            balance,
+            ..EngineConfig::default()
+        };
+        let mut new_engine = Engine::new(self.registry.clone(), output, self.bus.clone(), cfg)?;
+        new_engine.set_volume(volume)?;
+        new_engine.set_balance(balance)?;
+        new_engine.set_eq(eq);
+        new_engine.set_queue(queue);
+        new_engine.set_current_index(current_index);
+        new_engine.set_limiter_enabled(limiter);
+        new_engine.set_replaygain_mode(replaygain_mode);
+        new_engine.set_replaygain_preamp_db(replaygain_preamp_db);
+        let _ = new_engine.set_shuffle(shuffle);
+        let _ = new_engine.set_repeat(repeat);
+        if stop_after_current {
+            let _ = new_engine.toggle_stop_after_current();
+        }
+
+        self.engine = new_engine;
+        self.clock = clock;
+        Ok(())
+    }
+
+    /// Recreates the engine and output if the previous output closed due to
+    /// a terminal flush refusal or failure, fulfilling the caller's duty
+    /// under the audio contract.
+    pub fn ensure_engine_ready(&mut self) -> Result<()> {
+        if self.engine.is_flush_failed() {
+            self.note(
+                "recreating audio engine and output after terminal flush refusal".to_string(),
+            );
+            self.recreate_engine()?;
+        }
+        Ok(())
     }
 
     /// The loaded configuration.
@@ -802,6 +874,9 @@ impl App {
             // Includes external/plugin commands as well as the UI's predicted
             // seek. No public seek-completion/generation tag exists on frames.
             self.invalidate_visualization();
+        }
+        if self.engine.is_flush_failed() {
+            let _ = self.ensure_engine_ready();
         }
         // The engine ignores everything it does not own, so a single forward is
         // enough; a command it cannot apply (Play on an empty queue) becomes an
@@ -1374,6 +1449,7 @@ impl App {
             self.note(format!("notice: {}", info.message));
             return;
         }
+        let is_flush_refusal = self.engine.is_flush_failed();
         let entry = self
             .engine
             .current_index()
@@ -1391,7 +1467,21 @@ impl App {
             _ => info.message.clone(),
         };
         self.note(format!("error: {message}"));
-        self.last_error = Some(message);
+        if is_flush_refusal {
+            self.note(
+                "recreating audio engine and output after terminal flush refusal".to_string(),
+            );
+            if let Err(error) = self.recreate_engine() {
+                let recreation_err = format!("error: recreating engine failed: {error}");
+                self.note(recreation_err.clone());
+                self.last_error = Some(recreation_err);
+            } else {
+                // The engine and output have been cleanly recreated as obliged by the audio contract.
+                self.last_error = None;
+            }
+        } else {
+            self.last_error = Some(message);
+        }
         if self.engine.transport() != TransportState::Stopped
             && self.engine.end_of_stream().is_none()
             && let Err(error) = self.engine.stop()
@@ -1630,11 +1720,11 @@ impl App {
         self.engine.set_queue(queue);
         self.sync_entry_ids();
 
-        if play
-            && !report.entries.is_empty()
-            && let Err(error) = self.engine.play_index(0)
-        {
-            self.publish_error(&error);
+        if play && !report.entries.is_empty() {
+            let _ = self.ensure_engine_ready();
+            if let Err(error) = self.engine.play_index(0) {
+                self.publish_error(&error);
+            }
         }
 
         self.last_playlist_report = Some(report.clone());
@@ -1702,16 +1792,17 @@ impl App {
                 "AddItems: insert position {at} is not supported yet; the entries were appended"
             ));
         }
-        if play
-            && !items.is_empty()
-            && let Err(error) = self.engine.play_index(first_new)
-        {
-            self.publish_error(&error);
+        if play && !items.is_empty() {
+            let _ = self.ensure_engine_ready();
+            if let Err(error) = self.engine.play_index(first_new) {
+                self.publish_error(&error);
+            }
         }
     }
 
     fn play_entry(&mut self, id: EntryId) {
         if let Some(index) = self.entry_ids.iter().position(|entry| *entry == id) {
+            let _ = self.ensure_engine_ready();
             if let Err(error) = self.engine.play_index(index as u32) {
                 self.publish_error(&error);
             }
@@ -4101,5 +4192,44 @@ mod tests {
         app.close_dialog(DialogKind::LoadPlaylist);
         assert_eq!(app.dialogs.confirm_load_playlist_path(), None);
         assert!(app.playlist_text().is_empty());
+    }
+
+    #[test]
+    fn recreate_engine_preserves_playback_state_and_cleans_flush_failure() {
+        let (mut app, dir) = app_with_file(None);
+        let t1 = track(&dir, "track1.tst");
+        let t2 = track(&dir, "track2.tst");
+
+        app.submit(Command::SetVolume(180)).unwrap();
+        app.submit(Command::SetBalance(42)).unwrap();
+        app.submit(Command::SetEqEnabled(true)).unwrap();
+        app.submit(Command::SetPreamp(3.0)).unwrap();
+        app.submit(Command::ToggleShuffle).unwrap();
+        app.submit(Command::ToggleRepeat).unwrap();
+
+        let queue = vec![TrackSource::path(t1.clone()), TrackSource::path(t2.clone())];
+        app.engine_mut().set_queue(queue);
+        app.engine_mut().set_current_index(Some(1));
+
+        assert_eq!(app.engine().volume(), 180);
+        assert_eq!(app.engine().balance(), 42);
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.engine().current_index(), Some(1));
+        assert!(app.engine().shuffle());
+        assert!(app.engine().repeat());
+        assert!(!app.engine().is_flush_failed());
+
+        // Recreate the engine and output
+        app.recreate_engine().expect("recreation succeeds");
+
+        assert_eq!(app.engine().volume(), 180);
+        assert_eq!(app.engine().balance(), 42);
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.engine().current_index(), Some(1));
+        assert!(app.engine().shuffle());
+        assert!(app.engine().repeat());
+        assert!(!app.engine().is_flush_failed());
+        assert_eq!(app.engine().transport(), TransportState::Stopped);
+        assert!(app.engine().last_error().is_none());
     }
 }

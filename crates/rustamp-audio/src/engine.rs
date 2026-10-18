@@ -394,6 +394,11 @@ impl Engine {
         self.current
     }
 
+    /// Set the current queue index without starting playback.
+    pub fn set_current_index(&mut self, index: Option<u32>) {
+        self.current = index.filter(|&i| (i as usize) < self.queue.len());
+    }
+
     /// Transport state.
     pub fn transport(&self) -> TransportState {
         self.transport
@@ -427,6 +432,12 @@ impl Engine {
     /// Last decoder or output error, if any.
     pub fn last_error(&self) -> Option<&ErrorInfo> {
         self.error.as_ref()
+    }
+
+    /// Whether the output was closed after a terminal flush refusal or failure,
+    /// requiring the caller to recreate the engine and output before playing again.
+    pub fn is_flush_failed(&self) -> bool {
+        self.flush_failure.is_some()
     }
 
     /// Packets the decoder skipped in the track that ended last (RFC 0002, C1).
@@ -1195,6 +1206,16 @@ impl Engine {
             seq,
         });
         Ok(())
+    }
+
+    /// Master volume (`0..=255`).
+    pub fn volume(&self) -> u8 {
+        self.volume
+    }
+
+    /// Pan balance (`-127..=127`).
+    pub fn balance(&self) -> i8 {
+        self.balance
     }
 
     /// Set the volume (`0..=255`).

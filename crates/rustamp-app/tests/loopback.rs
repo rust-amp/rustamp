@@ -111,6 +111,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rustamp_audio::{Engine, EngineConfig, TrackSource};
 use rustamp_core::bus::EventBus;
+use rustamp_core::error::ErrorKind;
 use rustamp_core::state::TransportState;
 use rustamp_output::CpalOutput;
 
@@ -540,16 +541,51 @@ fn the_cable_carries_the_fixture_tone() {
         std::thread::sleep(PUMP_INTERVAL);
     }
     engine.poll().expect("draining the final events");
-    assert!(
-        engine.last_error().is_none(),
-        "the decode failed: {:?}",
-        engine.last_error()
-    );
     assert!(engine.played_frames() > 0, "\"{name}\" consumed no frames");
     assert_eq!(
         engine.buffered_frames(),
         0,
         "the ring still holds frames: they were decoded but never rendered"
+    );
+
+    // On a backend that cannot flush portably (the cpal cable endpoint),
+    // the post-playback flush was refused with Error::Unsupported.
+    // The engine treats that refusal as terminal for the current output:
+    // it stops the run and closes the output.
+    if let Some(error) = engine.last_error() {
+        assert_eq!(
+            error.kind,
+            ErrorKind::Output,
+            "the decode failed: {:?}",
+            engine.last_error()
+        );
+        assert!(
+            error.message.contains("output flush failed"),
+            "unexpected error on engine: {:?}",
+            engine.last_error()
+        );
+    }
+
+    // The audio contract (crates/rustamp-core/src/audio.rs:370-380) requires
+    // the caller (the application or test) to recreate the engine and output
+    // before playback can resume. Exercise that documented path honestly:
+    let output = Box::new(CpalOutput::with_device_name(CABLE_MATCH));
+    let mut engine = match Engine::new(
+        rustamp_decoders::default_registry(),
+        output,
+        EventBus::new(),
+        EngineConfig::default(),
+    ) {
+        Ok(engine) => engine,
+        Err(error) => panic!(
+            "MISSING CABLE: the playback endpoint \"{PLAYBACK_DEVICE}\" could not be reopened \
+             ({error})"
+        ),
+    };
+    assert!(
+        engine.last_error().is_none(),
+        "the freshly recreated engine has an error: {:?}",
+        engine.last_error()
     );
 
     // Tail: the tone's end crosses the render and capture latency.
