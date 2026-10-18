@@ -1,0 +1,20 @@
+{
+  "component": "libprojectM",
+  "version": "4.1.8",
+  "license": "LGPL-2.1-or-later",
+  "acquired_utc": "2026-10-18T13:42:52.6947245Z",
+  "provenance": "Official projectM-visualizer/projectm GitHub release asset, uploaded by kblaschke; not GitHub auto-generated tag tarball",
+  "release_url": "https://github.com/projectM-visualizer/projectm/releases/tag/v4.1.8",
+  "metadata_url": "https://api.github.com/repos/projectM-visualizer/projectm/releases/tags/v4.1.8",
+  "release_id": 404509882,
+  "release_published_utc": "2026-10-06T09:01:03Z",
+  "asset_id": 615012180,
+  "url": "https://github.com/projectM-visualizer/projectm/releases/download/v4.1.8/libprojectM-4.1.8.tar.gz",
+  "size_bytes": 1309526,
+  "sha256": "f72135e8b8e5fd807f908537255b41ac7ba4830309265e830cb756535487239e",
+  "upstream_digest": "sha256:f72135e8b8e5fd807f908537255b41ac7ba4830309265e830cb756535487239e",
+  "upstream_match": true,
+  "analysis_card_match": true,
+  "archive": "C:\\Users\\micro\\AppData\\Local\\Temp\\opencode\\wave98-projectm-4.1.8-staging\\libprojectM-4.1.8.tar.gz",
+  "limitations": "Digest agreement verifies bytes against GitHub release metadata; no independent detached signature verified. No build, install or execution."
+}

@@ -8,5 +8,10 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 rustamp-core.workspace = true
+rustamp-plugin-abi.workspace = true
+

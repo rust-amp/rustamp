@@ -8,6 +8,7 @@ kept in place (see [CLEANROOM.md](CLEANROOM.md)).
 | Component | Source | License | Used in | Notes |
 |---|---|---|---|---|
 | webamp classic-skin tables | [captbaritone/webamp](https://github.com/captbaritone/webamp), commit `79117c66d79fdac690fc732a0ce8df543ccd97a0` | MIT | `crates/rustamp-skin/src/webamp.rs` | The sprite rectangles (`packages/webamp/js/skinSprites.ts`), the `text.bmp` glyph grid, the cursor name list, the default analyser colours and the default playlist colours (`packages/webamp/js/baseSkin.json`, `constants.ts`), rewritten in Rust. The MIT notice is at the top of the module. Every ported value carries a `// provisional: webamp, pending S01/S17` marker. |
+| libprojectM 4.1.8 | [projectM-visualizer/projectm](https://github.com/projectM-visualizer/projectm/releases/tag/v4.1.8), release `v4.1.8` (`libprojectM-4.1.8.tar.gz`, SHA-256 `f72135e8b8e5fd807f908537255b41ac7ba4830309265e830cb756535487239e`, 1,309,526 bytes) | LGPL-2.1-or-later (see [LICENSE-LGPL-2.1](LICENSE-LGPL-2.1)), with vendored subcomponents under MIT: `hlslparser` (MIT), `projectm-eval` (MIT), `glm` (Happy Bunny / MIT), `SOIL2` (Public Domain / MIT) | `third_party/projectm`, wrapped by `crates/rustamp-vis` (`vis_projectm.dll`), deployed to `player/Plugins/projectM/` (player package only; never enters permissive `host/` package or its dependency closure) | Maintained C++ library for MilkDrop preset visualization. Wrapped via original clean-room classic `vis_` FFI wrapper in `rustamp-vis`. Fulfills LGPL-2.1 Section 6 duties: dynamic linking with replaceable shared library (`projectM-4.dll`), source offer covering all Section 6 materials, and relink capability. |
 
 ## Rust crate dependencies
 
@@ -18,7 +19,8 @@ tree). The license is the one each crate declares in its published
 GPL-3.0-or-later. None of them is in the dependency closure of a permissive
 Rustamp crate: they enter through `rustamp-audio`, which is GPL-3.0-or-later.
 
-Projects we expect to draw from: DeaDBeeF (zlib / GPL / LGPL), webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib), libopenmpt (BSD-3-Clause).
+Projects we expect to draw from: DeaDBeeF (zlib / GPL / LGPL), webamp (MIT), butterchurn (MIT; port source for rustamp-milkdrop), WDL/EEL2 (zlib), libopenmpt (BSD-3-Clause), projectM 4.1.8 (LGPL-2.1-or-later; selected native library bundled player-only with classic wrapper in rustamp-vis).
+
 
 Not bundled: the original Winamp base skin. It is distributed separately as an optional download, and it is used in tests.
 
@@ -62,6 +64,30 @@ inventory below includes their serialization, error and Windows dependencies.
 Their license
 texts are the canonical MIT and Apache-2.0 texts, copied unmodified from a crate
 in the local cargo registry.
+
+## Native bundled components and LGPL-2.1 Section 6 compliance
+
+### libprojectM 4.1.8
+
+- **Component**: `libprojectM` 4.1.8
+- **Upstream source**: [projectM-visualizer/projectm](https://github.com/projectM-visualizer/projectm), release `v4.1.8`
+- **Release archive**: `libprojectM-4.1.8.tar.gz` (1,309,526 bytes, SHA-256 `f72135e8b8e5fd807f908537255b41ac7ba4830309265e830cb756535487239e`)
+- **Vendored location**: `third_party/projectm/` (with `PROVENANCE.json`)
+- **License**: LGPL-2.1-or-later. Full license text is available at [LICENSE-LGPL-2.1](LICENSE-LGPL-2.1) in the repository root.
+- **Copyright holders**: Copyright (C) 2003-2023 projectM Team (Carmelo Piccione, Peter Sperl, Mischa Spiegelmock, Kyle Davis, and contributors).
+- **Subcomponents (vendored)**:
+  - `vendor/hlslparser`: MIT, Copyright (c) 2013-2023 Unknown Worlds Entertainment, Inc.
+  - `vendor/projectm-eval`: MIT, Copyright (c) 2023 The projectM Team.
+  - `vendor/glm`: MIT / Happy Bunny, Copyright (c) 2005-2023 G-Truc Creation.
+  - `vendor/SOIL2`: Public Domain / MIT, Copyright (c) 2007-2023 Spartan Code Studios.
+- **Packaging layout and host isolation**:
+  - Bundled exclusively in the player distribution under `player/Plugins/projectM/` (`vis_projectm.dll`, `projectM-4.dll`, `LICENSE-LGPL-2.1`).
+  - **Strict host isolation**: projectM and its LGPL license NEVER enter `host/`, `host/THIRD_PARTY.md`, or the permissive plugin-host dependency closure.
+- **LGPL-2.1 Section 6 duties (relink capability and source offer)**:
+  - **Section 6(b) Dynamic linking and relinking**: `vis_projectm.dll` dynamically links against `projectM-4.dll`. Users are entitled and able to replace `projectM-4.dll` with an interface-compatible custom or newer build without modifying or recompiling the host player or wrapper.
+  - **Section 6(d) / Section 6(c) Source offer**: Rustamp provides a complete, machine-readable copy of the corresponding source code for `libprojectM 4.1.8` at release SHA-256 `f72135e8b8e5fd807f908537255b41ac7ba4830309265e830cb756535487239e`, including all build scripts, CMake configurations, and the clean-room wrapper source in `crates/rustamp-vis`.
+  - **Reverse engineering & debugging**: Modification and reverse engineering of the library for debugging such modifications are explicitly permitted under the terms of LGPL-2.1.
+
 
 ## Cargo dependencies: purposes and consumers
 

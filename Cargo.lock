@@ -1878,6 +1878,7 @@ name = "rustamp-vis"
 version = "0.1.0"
 dependencies = [
  "rustamp-core",
+ "rustamp-plugin-abi",
 ]
 
 [[package]]
