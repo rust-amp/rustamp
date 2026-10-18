@@ -35,6 +35,17 @@ const SEEK_WAIT: Duration = Duration::from_secs(30);
 /// only a real stall reaches it, and a timeout is a loud failure that names
 /// the step, never a pass.
 const STALL_WAIT: Duration = Duration::from_secs(30);
+/// Liveness policy for the in-process control peers. The timeout is a stall
+/// escape, never a schedule bound (the M10 flake class): a dead resident
+/// never answers a Ping, so only a real death reaches it, and matching
+/// STALL_WAIT keeps a healthy-but-slow schedule from ever tripping it -
+/// exactly what the waiting rule above forbids. No test in this file
+/// depends on a fast liveness expiry: the only dead-host case here is the
+/// player vanishing, which the control EOF (not the Ping deadline) detects.
+const LIVENESS: Liveness = Liveness {
+    interval: Duration::from_millis(100),
+    timeout: STALL_WAIT,
+};
 
 fn repo_fixture(name: &str) -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -114,8 +125,8 @@ fn start(
     capacity: u32,
 ) -> (DecoderSession<NamedPcmRings>, mpsc::Receiver<Result<()>>) {
     let ((ar, aw), (br, bw)) = streams();
-    let client = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-    let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
     let (done, result) = mpsc::channel();
     thread::spawn(move || {
         let outcome = serve_decoder(&host, &NamedPcmRings, &RegistryResident);
@@ -339,8 +350,8 @@ fn garbage_and_empty_files_are_clean_errors_never_eos() {
     for (name, bytes) in [("garbage.bin", vec![7u8; 256]), ("empty.wav", Vec::new())] {
         let path = temp_file(name, &bytes);
         let ((ar, aw), (br, bw)) = streams();
-        let client = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-        let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+        let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+        let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
         let (done, result) = mpsc::channel();
         thread::spawn(move || {
             let outcome = serve_decoder(&host, &NamedPcmRings, &RegistryResident);

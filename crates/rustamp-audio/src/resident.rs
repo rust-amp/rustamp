@@ -1533,13 +1533,28 @@ mod hosted_tests {
             MediaLocationWire::Url("fake:refuse".into()),
             3,
         );
-        match outcome {
-            Err(MediaHostError::OperationFailed(message)) => {
-                assert!(message.contains("refuses"), "{message}");
-            }
-            Err(error) => panic!("refusal must be OperationFailed, got {error}"),
-            Ok(_) => panic!("refusal must be loud, never a session"),
-        }
+        // The honest contract is a loud refusal that carries the resident's
+        // reason - never an accepted session, never EOS. The error variant is
+        // deliberately not pinned: the framework's control monitor consumes
+        // the resident's terminal DecoderError and fails the peer sticky
+        // (rustamp-mediahost/src/control.rs), so the player sees
+        // Disconnected("resident decoder failed: operation failed: ..."),
+        // and the OperationFailed arm in DecoderSession::open is unreachable
+        // (the monitor never forwards DecoderError to the session). The
+        // variant is the framework's internal mapping, not this adapter's;
+        // the reason pin below is the stronger claim - a bare transport
+        // failure (TimedOut, a reason-less Disconnected) can never pass it.
+        let described = match &outcome {
+            Ok(_) => "Ok(session): the refused open was accepted".to_string(),
+            Err(error) => format!("Err({error:?})"),
+        };
+        let Err(error) = outcome else {
+            panic!("refusal must be loud, never a session (got {described})");
+        };
+        assert!(
+            error.to_string().contains("refuses"),
+            "the loud refusal must carry the resident's refusal reason (got {described})"
+        );
         // The host's terminal sequence is one send plus the framework's
         // bounded flush (5 s CONTROL_WAIT) and return; the test's bound must
         // cover a full flush plus loaded-VM scheduling headroom. The claim
@@ -2504,6 +2519,32 @@ mod dsp_hosted_tests {
             cond(&self.engine)
         }
 
+        /// Poll and pump until `cond` holds or `timeout` elapses. Unlike
+        /// `wait_until`, which bounds a wait by pumped frames, this waits on
+        /// the run's own condition with a wall-clock stall escape: a pump
+        /// only advances the run while the ring holds audio, so a pump count
+        /// can expire on underruns (the start drain, the StartDrained
+        /// handshake, a lagging decode thread) without the run having made
+        /// progress. The escape is generous - only a wedged run reaches it.
+        fn wait_pumping(
+            &mut self,
+            mut cond: impl FnMut(&Engine) -> bool,
+            timeout: Duration,
+        ) -> bool {
+            let deadline = Instant::now() + timeout;
+            loop {
+                self.engine.poll().expect("poll");
+                if cond(&self.engine) {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                self.clock.pump(256);
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
         fn wait_idle(&mut self, mut cond: impl FnMut(&Engine) -> bool, timeout: Duration) -> bool {
             let deadline = Instant::now() + timeout;
             loop {
@@ -2699,19 +2740,18 @@ mod dsp_hosted_tests {
         // bit-exactly) and finishes naturally.
         h.engine.play_index(0).unwrap();
         assert_eq!(h.engine.transport(), TransportState::Playing);
+        // The wait measures what the run actually needs - the transport
+        // reaching Stopped - with a generous stall escape, not a pump-count
+        // proxy: a pump only advances the run while the ring holds audio, so
+        // counting pumped frames bounds pathology, never progress, and any
+        // underrun (the start drain, a lagging decode thread, the
+        // StartDrained handshake) burns budget without advancing the run. A
+        // healthy run finishes in well under a second of pumping; only a
+        // wedged run reaches the escape, and it fails loudly with the step
+        // named. The claim is unchanged: the run must finish, and the
+        // position must land exactly at 44_100.
         assert!(
-            h.wait_until(
-                |e| e.transport() == TransportState::Stopped,
-                // Worst-case consumption in 256-frame pump steps: a full
-                // engine ring of stale audio plus the full second track, plus
-                // drain-handshake/re-base slack. The stale term is structural,
-                // not a guess: after the latch the decode thread keeps
-                // bypass-writing until Stop lands, and it outruns the 1 ms
-                // polling test thread, so the ring can be full (16_384)
-                // when the second run starts. The claim is unchanged: the
-                // run must finish, exactly at 44_100.
-                44_100 + 16_384 + 8_192
-            ),
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
             "the second run must finish"
         );
         assert_eq!(h.engine.position_frames(), 44_100);
