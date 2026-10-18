@@ -823,6 +823,15 @@ impl ChainControl {
     /// `DspStage::reset` (seek): clear the resident's stage state; the rings
     /// are untouched, and the decode thread drops the chain's start-up frames
     /// (`dsp_trim`) right after, so the seek stays exact.
+    ///
+    /// No wall-clock wait here by design: the resident applies `DspReset`
+    /// asynchronously — the session documents it as neither an acknowledgement
+    /// nor an ordering fence for PCM already queued — so no finite sleep is
+    /// derived from the contract and any fixed duration only narrows the race
+    /// instead of closing it. The decode protocol is robust to the race by
+    /// construction (a stale prefix lands inside the trimmed latency window);
+    /// a true delivery fence needs a session-level acknowledgement owned by
+    /// `rustamp-mediahost`, named as follow-up in `docs/tasks/A22-audio-rest.md`.
     fn reset<F: PcmRings>(&mut self, session: &mut DspSession<F>) {
         if self.poisoned.is_some() {
             return;
@@ -832,11 +841,6 @@ impl ChainControl {
             .map_err(|error| dsp_error_to_core(error, "reset"))
         {
             self.latch(error);
-        } else {
-            // Give the resident worker's control thread hops and poll slice
-            // (CONTROL_POLL = 20 ms) time to deliver and service DspReset before
-            // the next PCM block is written to the ring.
-            std::thread::sleep(Duration::from_millis(30));
         }
     }
 
@@ -1753,6 +1757,15 @@ mod dsp_hosted_tests {
     };
     const WAIT: Duration = Duration::from_secs(5);
 
+    /// Probe bound for the asynchronous `DspReset`: how many host-serviced
+    /// blocks a cleared-state probe may take to observe the reset. A progress
+    /// bound, not a time bound — iterations advance only on completed block
+    /// round-trips (each bounded by the block timeout and loud on expiry), so
+    /// load cannot expire it early the way a wall-clock sleep expires. Attempt
+    /// one is the common case; the rest covers consecutive control-plane
+    /// scheduling blackouts. Only the VM can prove the bound always suffices.
+    const RESET_SETTLE_BLOCKS: usize = 16;
+
     fn gain_desc(factor: f32) -> DspStageDesc {
         DspStageDesc {
             id: "gain".into(),
@@ -2128,13 +2141,29 @@ mod dsp_hosted_tests {
         chain.process(&mut buf);
         assert_eq!(buf, expected);
 
-        // A reset (seek) clears the chain state — the next block starts from
-        // the initial state again — and never touches the rings.
+        // A reset (seek) clears the chain state — the next cleared block
+        // starts from the initial state again — and never touches the rings.
         let generations = chain.session().generations();
         chain.reset();
         assert_eq!(chain.session().generations(), generations);
+        // The resident applies `DspReset` asynchronously (no ordering fence),
+        // so the cleared state is eventual: re-send the reset and re-probe
+        // until the cleared output appears, bounded in host-serviced blocks
+        // (progress, never wall-clock). Stale output carries the previous
+        // block's nonzero tail, so this cannot false-pass; a reset that never
+        // lands fails the final assertion.
         let mut buf = input.clone();
-        chain.process(&mut buf);
+        let mut settled = false;
+        for _ in 0..RESET_SETTLE_BLOCKS {
+            chain.reset();
+            buf.copy_from_slice(&input);
+            chain.process(&mut buf);
+            if buf == expected {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "reset must clear the resident's state");
         assert_eq!(buf, expected);
 
         drop(chain);
@@ -2184,8 +2213,22 @@ mod dsp_hosted_tests {
         );
         let mut expected = vec![0.0; LATENCY as usize * 2];
         expected.extend_from_slice(&input[..(6 - LATENCY as usize) * 2]);
+        // Same eventual-consistency note as the delay round-trip above: the
+        // same-format prepare clears through the asynchronous reset, so
+        // re-prepare and re-probe until the cleared output appears, bounded
+        // in host-serviced blocks. The tail is nonzero, so no false pass.
         let mut buf = input.clone();
-        chain.process(&mut buf);
+        let mut settled = false;
+        for _ in 0..RESET_SETTLE_BLOCKS {
+            chain.prepare(SPEC).unwrap();
+            buf.copy_from_slice(&input);
+            chain.process(&mut buf);
+            if buf == expected {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "prepare must clear the resident's state");
         assert_eq!(buf, expected, "prepare must clear the resident's state");
         drop(chain);
         reap(host);
