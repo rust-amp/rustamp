@@ -141,3 +141,27 @@ lane only, 5 are asserted in prose alone. Ready work, in the order it rates them
 **VM-only, and therefore not a lane's work:** both two-process spawn-and-kill
 tests, real resident runs, the engine-side adapters, latency compensation, and
 any contention behaviour.
+
+## Google lanes go through Paseo (owner rule, 2026-10-18)
+
+Antigravity lanes are started with `paseo run --provider antigravity` (modes
+Default, Auto Edit, YOLO) instead of the agy bridge in OpenCode, because Paseo
+can be watched: `paseo ls` lists the agents, `paseo logs <id>` shows the
+timeline, `paseo attach <id>` follows a live run, and `paseo permit` answers a
+permission request. The agy bridge does none of that and, worse, reports nothing
+when a job finishes - which is how four finished lanes once sat unnoticed for
+three and a half hours.
+
+What Paseo can and cannot drive, as its own provider list reports it:
+
+| provider | status | use |
+|---|---|---|
+| antigravity | available | the Google lanes, from now on |
+| claude | available | Claude lanes (a comparison with the OpenCode route is in flight) |
+| opencode | available | possible, unused so far |
+| pi | available | a further source |
+| codex | **unavailable** | Codex stays on the OpenCode subagent route |
+| muse | **unavailable** | Muse stays on the OpenCode subagent route |
+
+Jobs already running through the agy bridge are left to finish rather than
+duplicated; every new Google task starts through Paseo.
