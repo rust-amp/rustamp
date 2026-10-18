@@ -273,6 +273,11 @@ pub struct Engine {
     /// engine/output lifecycle may start again; stream_error alone is not a
     /// barrier, since close may clear a backend's failure latch.
     flush_failure: Option<String>,
+    shuffle: bool,
+    repeat: bool,
+    shuffle_seed: u64,
+    shuffle_plan: Vec<usize>,
+    shuffle_pos: usize,
 }
 
 impl Engine {
@@ -346,6 +351,11 @@ impl Engine {
             last_track_frames: 0,
             error: None,
             flush_failure: None,
+            shuffle: false,
+            repeat: false,
+            shuffle_seed: 0x9E37_79B9_7F4A_7C15,
+            shuffle_plan: Vec::new(),
+            shuffle_pos: 0,
         })
     }
 
@@ -368,6 +378,9 @@ impl Engine {
     /// Replace the play queue. Entries must be re-openable (paths or URLs).
     pub fn set_queue(&mut self, queue: Vec<TrackSource>) {
         self.queue = queue;
+        if self.shuffle {
+            self.replan_shuffle_engine(self.current.map(|i| i as usize));
+        }
     }
 
     /// The current queue.
@@ -537,8 +550,8 @@ impl Engine {
             duration_ms: self.duration_ms,
             volume: self.volume,
             balance: self.balance,
-            shuffle: false,
-            repeat: false,
+            shuffle: self.shuffle,
+            repeat: self.repeat,
             current_index: self.current,
             current_id: None,
             playlist_len: self.queue.len() as u32,
@@ -546,6 +559,105 @@ impl Engine {
             eq: self.eq,
             stop_after_current: self.stop_after_current,
         }
+    }
+
+    /// Whether shuffle mode is enabled (spec S15).
+    pub fn shuffle(&self) -> bool {
+        self.shuffle
+    }
+
+    /// Whether repeat mode is enabled (spec S15).
+    pub fn repeat(&self) -> bool {
+        self.repeat
+    }
+
+    /// Set shuffle mode enabled or disabled (spec S15).
+    pub fn set_shuffle(&mut self, shuffle: bool) -> Result<()> {
+        if self.shuffle != shuffle {
+            self.shuffle = shuffle;
+            if self.shuffle && !self.queue.is_empty() {
+                self.replan_shuffle_engine(self.current.map(|i| i as usize));
+            }
+            self.send(DecodeMsg::SetShuffle(self.shuffle));
+            self.bus.publish(Event::ModesChanged {
+                shuffle: self.shuffle,
+                repeat: self.repeat,
+            });
+        }
+        Ok(())
+    }
+
+    /// Toggle shuffle mode (spec S15).
+    pub fn toggle_shuffle(&mut self) -> Result<()> {
+        self.set_shuffle(!self.shuffle)
+    }
+
+    /// Set repeat mode enabled or disabled (spec S15).
+    pub fn set_repeat(&mut self, repeat: bool) -> Result<()> {
+        if self.repeat != repeat {
+            self.repeat = repeat;
+            self.send(DecodeMsg::SetRepeat(self.repeat));
+            self.bus.publish(Event::ModesChanged {
+                shuffle: self.shuffle,
+                repeat: self.repeat,
+            });
+        }
+        Ok(())
+    }
+
+    /// Toggle repeat mode (spec S15).
+    pub fn toggle_repeat(&mut self) -> Result<()> {
+        self.set_repeat(!self.repeat)
+    }
+
+    /// Set the PRNG seed for shuffle permutations (spec S15; for tests).
+    pub fn set_shuffle_seed(&mut self, seed: u64) {
+        self.shuffle_seed = seed;
+    }
+
+    /// Active shuffle permutation plan.
+    pub fn shuffle_plan(&self) -> &[usize] {
+        &self.shuffle_plan
+    }
+
+    fn replan_shuffle_engine(&mut self, current: Option<usize>) {
+        let len = self.queue.len();
+        if len == 0 {
+            self.shuffle_plan.clear();
+            self.shuffle_pos = 0;
+            return;
+        }
+        let mut seed = self.shuffle_seed;
+        if seed == 0 {
+            seed = 0x9E37_79B9_7F4A_7C15;
+        }
+        let plan = if let Some(curr) = current {
+            let mut remaining: Vec<usize> = (0..len).filter(|&i| i != curr).collect();
+            for i in (1..remaining.len()).rev() {
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                let j = (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) % (i as u64 + 1)) as usize;
+                remaining.swap(i, j);
+            }
+            let mut p = Vec::with_capacity(len);
+            p.push(curr);
+            p.extend(remaining);
+            p
+        } else {
+            let mut p: Vec<usize> = (0..len).collect();
+            for i in (1..p.len()).rev() {
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                let j = (seed.wrapping_mul(0x2545_F491_4F6C_DD1D) % (i as u64 + 1)) as usize;
+                p.swap(i, j);
+            }
+            p
+        };
+        self.shuffle_seed = seed;
+        self.shuffle_plan = plan;
+        self.shuffle_pos = 0;
     }
 
     /// Current equalizer state.
@@ -706,6 +818,10 @@ impl Engine {
             Command::SkipBy { delta } => self.skip_by(*delta),
             Command::PlayLast => self.play_last(),
             Command::ToggleStopAfterCurrent => self.toggle_stop_after_current(),
+            Command::ToggleShuffle => self.toggle_shuffle(),
+            Command::ToggleRepeat => self.toggle_repeat(),
+            Command::SetShuffle(on) => self.set_shuffle(*on),
+            Command::SetRepeat(on) => self.set_repeat(*on),
             Command::SetBand { band, gain_db } => self.set_eq_band(*band, *gain_db),
             Command::SetPreamp(gain_db) => {
                 self.set_eq(EqState {
@@ -827,51 +943,114 @@ impl Engine {
         self.start_run()
     }
 
-    /// Skip to the next queue entry. At the end of the queue playback stops.
+    /// Skip to the next queue entry. Under S15 modes, respects shuffle and repeat.
     pub fn next_track(&mut self) -> Result<()> {
         if self.transport == TransportState::Stopped || self.to_decode.is_none() {
-            let next = self.current.map(|i| i + 1).unwrap_or(0);
-            if next as usize >= self.queue.len() {
+            if self.queue.is_empty() {
                 return Ok(());
             }
-            return self.play_index(next);
+            let next = if !self.shuffle {
+                let n = self.current.map(|i| i + 1).unwrap_or(0);
+                if (n as usize) < self.queue.len() {
+                    Some(n)
+                } else if self.repeat {
+                    Some(0)
+                } else {
+                    None
+                }
+            } else {
+                if self.shuffle_plan.is_empty() || self.shuffle_plan.len() != self.queue.len() {
+                    self.replan_shuffle_engine(self.current.map(|i| i as usize));
+                }
+                if self.current.is_none() {
+                    Some(self.shuffle_plan[0] as u32)
+                } else if self.shuffle_pos + 1 < self.shuffle_plan.len() {
+                    self.shuffle_pos += 1;
+                    Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                } else if self.repeat {
+                    let last = self.shuffle_plan.last().copied();
+                    self.replan_shuffle_engine(last);
+                    Some(self.shuffle_plan[0] as u32)
+                } else {
+                    None
+                }
+            };
+            if let Some(target) = next {
+                return self.play_index(target);
+            }
+            return Ok(());
         }
         self.send(DecodeMsg::Next);
         Ok(())
     }
 
-    /// Go back to the previous queue entry.
+    /// Go back to the previous queue entry. Under S15 modes, respects shuffle and repeat.
     pub fn prev_track(&mut self) -> Result<()> {
         if self.transport == TransportState::Stopped || self.to_decode.is_none() {
-            let prev = self.current.map(|i| i.saturating_sub(1)).unwrap_or(0);
-            return self.play_index(prev);
+            if self.queue.is_empty() {
+                return Ok(());
+            }
+            let prev = if !self.shuffle {
+                match self.current {
+                    Some(0) if self.repeat => Some((self.queue.len() - 1) as u32),
+                    Some(i) if i > 0 => Some(i - 1),
+                    _ => Some(0),
+                }
+            } else {
+                if self.shuffle_plan.is_empty() {
+                    self.replan_shuffle_engine(self.current.map(|i| i as usize));
+                }
+                if self.shuffle_pos > 0 && self.shuffle_pos < self.shuffle_plan.len() {
+                    self.shuffle_pos -= 1;
+                    Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                } else if self.repeat && self.queue.len() > 1 {
+                    self.shuffle_pos = self.shuffle_plan.len() - 1;
+                    Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                } else {
+                    self.current.or(Some(0))
+                }
+            };
+            if let Some(target) = prev {
+                return self.play_index(target);
+            }
+            return Ok(());
         }
         self.send(DecodeMsg::Prev);
         Ok(())
     }
 
     /// Move the current entry by `delta` positions in the order
-    /// [`Engine::next_track`]/[`Engine::prev_track`] follow, clamped to the
-    /// queue (RFC 0005 `Command::SkipBy`, ids 40195 / 40197).
-    ///
-    /// `delta = 0` and an empty queue are no-ops. S02 §1: changing the entry
-    /// while stopped does **not** start playback, so the stopped case only moves
-    /// the current index — unlike [`Engine::next_track`], which starts a run
-    /// there. The moved index is observable through
-    /// [`PlayerState::current_index`]; no event is published, because the entry
-    /// is not opened (there is no metadata to report). Play order (shuffle) vs
-    /// playlist order is open (RFC 0005 O9 / S15); this follows the queue order,
-    /// like `Next`/`Prev`.
+    /// [`Engine::next_track`]/[`Engine::prev_track`] follow, clamped or wrapped
+    /// according to the repeat mode (RFC 0005 `Command::SkipBy`, ids 40195 / 40197).
     pub fn skip_by(&mut self, delta: i32) -> Result<()> {
         if delta == 0 || self.queue.is_empty() {
             return Ok(());
         }
         if self.transport == TransportState::Stopped || self.to_decode.is_none() {
-            self.current = Some(clamped_index(
-                self.current.unwrap_or(0),
-                delta,
-                self.queue.len(),
-            ));
+            let curr = self.current.unwrap_or(0);
+            if !self.shuffle {
+                let qlen = self.queue.len() as i32;
+                if self.repeat {
+                    let rem = (curr as i32 + delta).rem_euclid(qlen);
+                    self.current = Some(rem as u32);
+                } else {
+                    self.current = Some(clamped_index(curr, delta, self.queue.len()));
+                }
+            } else {
+                if self.shuffle_plan.is_empty() || self.shuffle_plan.len() != self.queue.len() {
+                    self.replan_shuffle_engine(Some(curr as usize));
+                }
+                let plen = self.shuffle_plan.len() as i32;
+                if self.repeat {
+                    let rem = (self.shuffle_pos as i32 + delta).rem_euclid(plen);
+                    self.shuffle_pos = rem as usize;
+                    self.current = Some(self.shuffle_plan[self.shuffle_pos] as u32);
+                } else {
+                    let target = (self.shuffle_pos as i32 + delta).clamp(0, plen - 1) as usize;
+                    self.shuffle_pos = target;
+                    self.current = Some(self.shuffle_plan[self.shuffle_pos] as u32);
+                }
+            }
             return Ok(());
         }
         self.send(DecodeMsg::SkipBy(delta));
@@ -1164,10 +1343,17 @@ impl Engine {
         // the mode on the last track still ends the playlist. The RFC leaves
         // the exact interaction open (it rides on S02 open question 5); this
         // is the implemented reading.
-        let queue_exhausted = self
-            .current
-            .map(|index| index as usize + 1 >= self.queue.len())
-            .unwrap_or(true);
+        let queue_exhausted = !self.repeat
+            && self
+                .current
+                .map(|index| {
+                    if self.stop_after_current {
+                        index as usize + 1 >= self.queue.len()
+                    } else {
+                        true
+                    }
+                })
+                .unwrap_or(true);
         if queue_exhausted {
             self.bus.publish(Event::PlaylistEnded);
         }
@@ -1333,7 +1519,11 @@ impl Engine {
             stop_after_current: self.stop_after_current,
             replay_gain: Arc::clone(&self.replaygain_control),
             start_epoch,
+            shuffle: self.shuffle,
+            repeat: self.repeat,
+            shuffle_seed: Some(self.shuffle_seed),
         };
+        self.shuffle_seed = self.shuffle_seed.wrapping_add(1);
         // The equalizer runs first, on the decoded PCM (see the module docs).
         // A fresh stage per run starts from clean filter history; the shared
         // control carries the settings across runs.

@@ -150,6 +150,10 @@ pub(crate) enum DecodeMsg {
     /// Arm/disarm "stop after current track" (RFC 0005 O8): when armed, the run
     /// ends at the end of the current track instead of advancing.
     SetStopAfterCurrent(bool),
+    /// Set shuffle mode enabled/disabled (spec S15).
+    SetShuffle(bool),
+    /// Set repeat mode enabled/disabled (spec S15).
+    SetRepeat(bool),
 }
 
 /// Reports, decode thread -> engine.
@@ -332,6 +336,12 @@ pub(crate) struct Config {
     /// still held a previous run's audio. The first write waits for its
     /// drain and the engine's clock re-base (see `crate::ring`).
     pub start_epoch: Option<u64>,
+    /// Whether shuffle mode is active when the run starts (spec S15).
+    pub shuffle: bool,
+    /// Whether repeat mode is active when the run starts (spec S15).
+    pub repeat: bool,
+    /// Seed for the shuffle PRNG (spec S15).
+    pub shuffle_seed: Option<u64>,
 }
 
 /// Start the decode thread. Returns its handle and the vis consumer.
@@ -347,6 +357,9 @@ pub(crate) fn spawn(
     let (vis, vis_rx) = VisTap::new(cfg.vis_capacity);
     let stop_after_current = cfg.stop_after_current;
     let start_epoch = cfg.start_epoch;
+    let shuffle = cfg.shuffle;
+    let repeat = cfg.repeat;
+    let rng_state = cfg.shuffle_seed.unwrap_or(0x9E37_79B9_7F4A_7C15);
     let mut worker = Worker {
         cfg,
         ring,
@@ -367,6 +380,12 @@ pub(crate) fn spawn(
         stopped: false,
         rg_gain: 1.0,
         stop_after_current,
+        shuffle,
+        repeat,
+        shuffle_plan: Vec::new(),
+        shuffle_pos: 0,
+        rng_state,
+        current_index: start_index,
         pending_seek: None,
         pending_skip: None,
         drain_epoch: start_epoch,
@@ -463,6 +482,12 @@ struct Worker {
     /// "Stop after current track" is armed (RFC 0005 O8): the run ends at the
     /// end of the current track instead of advancing.
     stop_after_current: bool,
+    shuffle: bool,
+    repeat: bool,
+    shuffle_plan: Vec<usize>,
+    shuffle_pos: usize,
+    rng_state: u64,
+    current_index: u32,
     pending_seek: Option<(Duration, u64, u32)>,
     pending_skip: Option<Outcome>,
     /// Ring epoch the consumer still has to drain before post-seek (or, at
@@ -481,6 +506,10 @@ impl Worker {
     fn run(&mut self, start_index: u32, start_at: Option<(u64, u32)>) {
         let mut index = start_index;
         let mut start_at = start_at;
+        self.current_index = index;
+        if self.shuffle && !self.cfg.queue.is_empty() {
+            self.init_shuffle_plan(start_index as usize);
+        }
         // The previous track ran to its end and the converter still holds its
         // tail: a next track in the same format continues that stream.
         let mut carry = false;
@@ -488,6 +517,7 @@ impl Worker {
             if self.quitting || self.stopped {
                 break;
             }
+            self.current_index = index;
             let Some(source) = self.cfg.queue.get(index as usize).cloned() else {
                 self.flush_converter();
                 let _ = self.tx.send(DecodeOut::EndOfStream {
@@ -526,15 +556,170 @@ impl Worker {
                 });
                 break;
             }
-            match outcome {
-                Outcome::Ended | Outcome::SkipNext => index = index.saturating_add(1),
-                Outcome::SkipPrev => index = index.saturating_sub(1),
-                Outcome::SkipBy(delta) => {
-                    index = clamped_index(index, delta, self.cfg.queue.len());
+
+            let next_target = match outcome {
+                Outcome::Ended | Outcome::SkipNext => {
+                    if !self.shuffle {
+                        let next = index.saturating_add(1);
+                        if (next as usize) < self.cfg.queue.len() {
+                            Some(next)
+                        } else if self.repeat && !self.cfg.queue.is_empty() {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    } else {
+                        if self.shuffle_plan.is_empty() {
+                            self.init_shuffle_plan(index as usize);
+                        }
+                        if self.shuffle_pos + 1 < self.shuffle_plan.len() {
+                            self.shuffle_pos += 1;
+                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                        } else if self.repeat && !self.cfg.queue.is_empty() {
+                            let last = self.shuffle_plan.last().copied();
+                            self.replan_shuffle_new_cycle(last);
+                            Some(self.shuffle_plan[0] as u32)
+                        } else {
+                            None
+                        }
+                    }
                 }
-                Outcome::Stop | Outcome::Quit => break,
+                Outcome::SkipPrev => {
+                    if !self.shuffle {
+                        if index > 0 {
+                            Some(index - 1)
+                        } else if self.repeat && !self.cfg.queue.is_empty() {
+                            Some((self.cfg.queue.len() - 1) as u32)
+                        } else {
+                            Some(0)
+                        }
+                    } else {
+                        if self.shuffle_plan.is_empty() {
+                            self.init_shuffle_plan(index as usize);
+                        }
+                        if self.shuffle_pos > 0 {
+                            self.shuffle_pos -= 1;
+                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                        } else if self.repeat && self.cfg.queue.len() > 1 {
+                            self.shuffle_pos = self.shuffle_plan.len() - 1;
+                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                        } else {
+                            Some(self.shuffle_plan[0] as u32)
+                        }
+                    }
+                }
+                Outcome::SkipBy(delta) => {
+                    if delta == 0 || self.cfg.queue.is_empty() {
+                        Some(index)
+                    } else if !self.shuffle {
+                        let qlen = self.cfg.queue.len() as i32;
+                        if self.repeat {
+                            let curr = index as i32;
+                            let rem = (curr + delta).rem_euclid(qlen);
+                            Some(rem as u32)
+                        } else {
+                            Some(clamped_index(index, delta, self.cfg.queue.len()))
+                        }
+                    } else {
+                        if self.shuffle_plan.is_empty() {
+                            self.init_shuffle_plan(index as usize);
+                        }
+                        let plen = self.shuffle_plan.len() as i32;
+                        if self.repeat {
+                            let curr = self.shuffle_pos as i32;
+                            let rem = (curr + delta).rem_euclid(plen);
+                            self.shuffle_pos = rem as usize;
+                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                        } else {
+                            let curr = self.shuffle_pos as i32;
+                            let target = (curr + delta).clamp(0, plen - 1) as usize;
+                            self.shuffle_pos = target;
+                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
+                        }
+                    }
+                }
+                Outcome::Stop | Outcome::Quit => None,
+            };
+
+            let Some(next_idx) = next_target else {
+                if matches!(outcome, Outcome::Ended | Outcome::SkipNext) {
+                    self.flush_converter();
+                    let _ = self.tx.send(DecodeOut::EndOfStream {
+                        timeline_end: self.timeline,
+                    });
+                }
+                break;
+            };
+            index = next_idx;
+        }
+    }
+
+    fn rng_next(&mut self) -> u64 {
+        let mut x = self.rng_state;
+        if x == 0 {
+            x = 0x9E37_79B9_7F4A_7C15;
+        }
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn rng_below(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            return 0;
+        }
+        let n = upper as u64;
+        let limit = u64::MAX / n * n;
+        loop {
+            let value = self.rng_next();
+            if value < limit {
+                return (value % n) as usize;
             }
         }
+    }
+
+    fn shuffle_slice(&mut self, items: &mut [usize]) {
+        for i in (1..items.len()).rev() {
+            let j = self.rng_below(i + 1);
+            items.swap(i, j);
+        }
+    }
+
+    fn init_shuffle_plan(&mut self, start_index: usize) {
+        let len = self.cfg.queue.len();
+        if len == 0 {
+            self.shuffle_plan.clear();
+            self.shuffle_pos = 0;
+            return;
+        }
+        let mut remaining: Vec<usize> = (0..len).filter(|&i| i != start_index).collect();
+        self.shuffle_slice(&mut remaining);
+        let mut plan = Vec::with_capacity(len);
+        plan.push(start_index);
+        plan.extend(remaining);
+        self.shuffle_plan = plan;
+        self.shuffle_pos = 0;
+    }
+
+    fn replan_shuffle_new_cycle(&mut self, last_track: Option<usize>) {
+        let len = self.cfg.queue.len();
+        if len == 0 {
+            return;
+        }
+        let mut plan: Vec<usize> = (0..len).collect();
+        self.shuffle_slice(&mut plan);
+        if len > 1 && last_track.is_some() && Some(plan[0]) == last_track {
+            let swap_idx = 1 + self.rng_below(len - 1);
+            plan.swap(0, swap_idx);
+        }
+        self.shuffle_plan = plan;
+        self.shuffle_pos = 0;
+    }
+
+    fn replan_shuffle_mid_run(&mut self, current: usize) {
+        self.init_shuffle_plan(current);
     }
 
     /// Hand the ring's write end back (used when the thread exits).
@@ -866,6 +1051,17 @@ impl Worker {
                     return true;
                 }
                 Ok(DecodeMsg::SetStopAfterCurrent(armed)) => self.stop_after_current = armed,
+                Ok(DecodeMsg::SetShuffle(on)) => {
+                    if self.shuffle != on {
+                        self.shuffle = on;
+                        if on && !self.cfg.queue.is_empty() {
+                            self.replan_shuffle_mid_run(self.current_index as usize);
+                        }
+                    }
+                }
+                Ok(DecodeMsg::SetRepeat(on)) => {
+                    self.repeat = on;
+                }
                 Ok(DecodeMsg::Seek {
                     to,
                     track_frames,
