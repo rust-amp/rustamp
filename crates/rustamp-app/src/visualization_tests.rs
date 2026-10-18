@@ -199,24 +199,27 @@ fn pause_freezes_the_display_discards_input_and_resume_accepts_new_pcm() {
 
 #[test]
 fn stopping_playing_or_paused_cannot_retain_scope_or_stale_bars() {
-    for pause_first in [false, true] {
-        let (mut app, _dir) = playing();
-        app.ui.set_vis_mode(VisMode::Scope);
-        if pause_first {
-            app.submit(Command::Pause).unwrap();
+    for mode in [VisMode::Spectrum, VisMode::Scope] {
+        for pause_first in [false, true] {
+            let (mut app, _dir) = playing();
+            app.ui.set_vis_mode(mode);
+            if pause_first {
+                app.submit(Command::Pause).unwrap();
+            }
+            app.submit(Command::Stop).unwrap();
+            assert_eq!(app.state().transport, TransportState::Stopped);
+            assert_eq!(app.state().visualization.input, VisInput::Missing);
+            assert_eq!(app.state().visualization.source_timestamp_us, None);
+            assert_eq!(app.state().visualization.bars, [0; SPECTRUM_BANDS]);
+            assert_eq!(app.state().visualization.peaks, [0; SPECTRUM_BANDS]);
+            assert_static_pixels(&mut app);
+            let later = app.now_ms() + 2000;
+            app.pump_visualization(later);
+            app.ui.refresh(later);
+            assert_eq!(app.state().visualization.bars, [0; SPECTRUM_BANDS]);
+            assert_eq!(app.state().visualization.peaks, [0; SPECTRUM_BANDS]);
+            assert_static_pixels(&mut app);
         }
-        app.submit(Command::Stop).unwrap();
-        assert_eq!(app.state().transport, TransportState::Stopped);
-        assert_eq!(app.state().visualization.input, VisInput::Missing);
-        assert_eq!(app.state().visualization.source_timestamp_us, None);
-        assert_static_pixels(&mut app); // No fake zero scope line after stop.
-        let later = app.now_ms() + 2000;
-        app.pump_visualization(later);
-        app.ui.refresh(later);
-        assert_eq!(app.state().visualization.bars, [0; SPECTRUM_BANDS]);
-        assert_eq!(app.state().visualization.peaks, [0; SPECTRUM_BANDS]);
-        app.ui.set_vis_mode(VisMode::Spectrum);
-        assert_static_pixels(&mut app);
     }
 }
 

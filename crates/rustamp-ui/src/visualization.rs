@@ -238,8 +238,9 @@ impl Visualizer {
     }
 
     /// Advance using milliseconds supplied by the presenter. Pause freezes all
-    /// envelopes and freshness; stop clears the scope/target, then bars and peaks
-    /// fall normally. Backwards clocks cannot advance time (all own choices).
+    /// envelopes and freshness; stop clears the screen immediately in all modes
+    /// (decay is applied only while playback continues). Backwards clocks cannot
+    /// advance time.
     pub fn advance(&mut self, now_ms: u64, transport: TransportState) {
         let elapsed = self.last_ms.map_or(0, |last| now_ms.saturating_sub(last));
         self.last_ms = Some(self.last_ms.unwrap_or(now_ms).max(now_ms));
@@ -252,9 +253,12 @@ impl Visualizer {
             return;
         }
         if transport == TransportState::Stopped {
-            self.last_input = None;
-            self.targets.fill(0);
-            self.state.source_timestamp_us = None;
+            let mode = self.state.mode;
+            *self = Self::default();
+            self.state.mode = mode;
+            self.last_ms = Some(now_ms);
+            self.last_transport = TransportState::Stopped;
+            return;
         }
         let expires = self.last_input.map(|t| t.saturating_add(FRAME_FRESH_MS));
         // Split at expiry so one large advance equals many small advances.
@@ -584,26 +588,31 @@ mod tests {
 
     #[test]
     fn stop_and_reset_do_not_replay_scope_or_retain_old_rate_envelopes() {
-        let mut vis = Visualizer::default();
-        vis.set_mode(VisMode::Scope);
-        vis.push(&tone(16, 1.0), 44100, 0, TransportState::Playing)
-            .unwrap();
-        vis.advance(0, TransportState::Stopped);
-        assert_eq!(vis.state.input, VisInput::Missing);
-        vis.advance(2000, TransportState::Stopped);
-        assert_eq!(vis.state.bars, [0; SPECTRUM_BANDS]);
-        vis.push(&tone(16, 1.0), 44100, 2000, TransportState::Paused)
-            .unwrap();
-        assert_eq!(vis.state.input, VisInput::Missing);
-        vis.reset();
-        assert_eq!(vis.state.mode, VisMode::Scope);
-        assert_eq!(vis.state.source_timestamp_us, None);
-        vis.push(&tone(16, 1.0), 44100, 2000, TransportState::Playing)
-            .unwrap();
-        vis.push(&VisFrame::default(), 48000, 2000, TransportState::Playing)
-            .unwrap();
-        assert_eq!(vis.state.bars, [0; SPECTRUM_BANDS]);
-        assert_eq!(vis.state.peaks, [0; SPECTRUM_BANDS]);
+        for mode in [VisMode::Spectrum, VisMode::Scope] {
+            let mut vis = Visualizer::default();
+            vis.set_mode(mode);
+            vis.push(&tone(16, 1.0), 44100, 0, TransportState::Playing)
+                .unwrap();
+            vis.advance(0, TransportState::Stopped);
+            assert_eq!(vis.state.input, VisInput::Missing);
+            assert_eq!(vis.state.bars, [0; SPECTRUM_BANDS]);
+            assert_eq!(vis.state.peaks, [0; SPECTRUM_BANDS]);
+            vis.advance(2000, TransportState::Stopped);
+            assert_eq!(vis.state.bars, [0; SPECTRUM_BANDS]);
+            assert_eq!(vis.state.peaks, [0; SPECTRUM_BANDS]);
+            vis.push(&tone(16, 1.0), 44100, 2000, TransportState::Paused)
+                .unwrap();
+            assert_eq!(vis.state.input, VisInput::Missing);
+            vis.reset();
+            assert_eq!(vis.state.mode, mode);
+            assert_eq!(vis.state.source_timestamp_us, None);
+            vis.push(&tone(16, 1.0), 44100, 2000, TransportState::Playing)
+                .unwrap();
+            vis.push(&VisFrame::default(), 48000, 2000, TransportState::Playing)
+                .unwrap();
+            assert_eq!(vis.state.bars, [0; SPECTRUM_BANDS]);
+            assert_eq!(vis.state.peaks, [0; SPECTRUM_BANDS]);
+        }
     }
 
     #[test]
