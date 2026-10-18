@@ -263,6 +263,37 @@ after another, so the candidate is a **resident or thread left behind by a
 previous binary** competing with the two-process test, which would explain why
 it happens in the suite and not alone.
 
+## Measured rate: 8 of 10 warm, 5 of 5 fresh (2026-10-18 15:10)
+
+The runner now has `-Repeat`, and its first real use measured the stall instead
+of describing it. Ten warm repetitions of `dsp_roundtrip` in one guest, no reset
+between them:
+
+```
+RATE filter='dsp_roundtrip': 8/10 passed (80,0%); 2/10 failed; 2/10 stalled
+stalls at repetitions 2 and 9 - not adjacent
+passing runs 3.0 s, stalling runs 33.1 s
+```
+
+Combined with the five fresh-guest runs (each with its own `-Reset`, all green),
+that is **13 of 15 runs green, about one stall in seven**, with no cargo process
+running during the measured run.
+
+**A correction to the first reading.** The stall appeared at repetitions 2 and 9,
+and repetition 3 ran clean immediately after the stall at 2, so this is **not**
+persistent leftover state from a previous run - the first conclusion was too
+strong and is withdrawn here. What survives is the plain fact: an intermittent
+race in the two-process resident delivery, roughly one run in seven, at the
+thirty second escape, with no close and no error, and the same test completing
+in a quarter of a second whenever it does run. It is not the shipped code (the
+dependency graph) and not host build load (no builds ran). The mechanism is with
+the Claude diagnosis lane.
+
+The `-Repeat` feature paid for itself in one run: a quotable rate, a JSON record
+with every run's wall time and `resetBetweenRuns: false` stated honestly, and a
+non-zero exit despite eight green repetitions, so one failure cannot hide in a
+majority.
+
 ## The `wave26-windows` rescue (2026-10-18 12:45)
 
 
