@@ -1263,7 +1263,12 @@ mod hosted_tests {
 
     const TOTAL: usize = 2048;
     const CHANGE_AT: usize = 512;
-    const WAIT: Duration = Duration::from_secs(5);
+    /// Stall escape for every wait this module waits on (the M10 rule): a
+    /// bound so generous that only a real stall reaches it. The old 5 s value
+    /// was a wall-clock bound a healthy-but-slow VM schedule trips — the
+    /// flake class M24 proved in this guest. The one deliberate fast bound
+    /// (the wedged-resident probe below) passes its own 20 ms, unchanged.
+    const WAIT: Duration = Duration::from_secs(30);
     /// Liveness policy for the in-process control peers — the same
     /// wall-clock trip wire the `dsp_hosted_tests` module documents (the
     /// framework's 5 s default flakes under this VM's load; see M24).
@@ -1604,7 +1609,9 @@ mod hosted_tests {
             matches!(decoder.read(&mut out), Err(CoreError::Decode(_))),
             "a wedged resident must fail loudly after the bound"
         );
-        assert!(start.elapsed() < WAIT);
+        // Kept at the original 5 s (not the widened WAIT): the 20 ms read
+        // bound is the claim; this only proves the bound fired, not a hang.
+        assert!(start.elapsed() < Duration::from_secs(5));
         // fake:slow sleeps for 150 ms; allow it to finish and deliver before retry.
         thread::sleep(Duration::from_millis(150));
         assert_eq!(
@@ -1781,7 +1788,15 @@ mod dsp_hosted_tests {
         sample_rate_hz: 44_100,
         channels: 2,
     };
-    const WAIT: Duration = Duration::from_secs(5);
+    /// Stall escape for every wait this module waits on (the M10 rule): a
+    /// bound so generous that only a real stall reaches it. The old 5 s value
+    /// was a wall-clock bound a healthy-but-slow VM schedule trips — the
+    /// flake class M24 proved in this guest; as the adapter's per-block
+    /// round-trip bound it could also latch a failure mid-start, before the
+    /// engine's poll published the track start (the erasure path of M25 §1.1,
+    /// which then fails `wait_track`). The one deliberate fast bound (the
+    /// wedge test's 20 ms) is passed explicitly, unchanged.
+    const WAIT: Duration = Duration::from_secs(30);
     /// Liveness policy for the in-process control peers. The framework
     /// default (`Liveness::default()`: 100 ms interval, 5 s timeout) is a
     /// wall-clock bound a healthy-but-slow VM schedule can trip — the flake
@@ -1789,10 +1804,10 @@ mod dsp_hosted_tests {
     /// resident never answers a Ping and is caught by the control EOF
     /// regardless, and a wedged resident by the adapter's own bounded block
     /// round-trip, so no test here depends on a fast liveness expiry; only
-    /// the trip wire moves, from 5 s to six times the harness wait.
+    /// the trip wire moves, from 5 s to the stall escape.
     const LIVENESS: Liveness = Liveness {
         interval: Duration::from_millis(100),
-        timeout: Duration::from_secs(30),
+        timeout: WAIT,
     };
 
     /// Probe bound for the asynchronous `DspReset`: how many host-serviced
@@ -2581,30 +2596,14 @@ mod dsp_hosted_tests {
             self.events.try_iter().collect()
         }
 
-        fn wait_until(&mut self, mut cond: impl FnMut(&Engine) -> bool, max_frames: u64) -> bool {
-            if cond(&self.engine) {
-                return true;
-            }
-            let mut pumped = 0;
-            while pumped < max_frames {
-                self.engine.poll().expect("poll");
-                if cond(&self.engine) {
-                    return true;
-                }
-                self.clock.pump(256);
-                pumped += 256;
-                thread::sleep(Duration::from_millis(1));
-            }
-            cond(&self.engine)
-        }
-
-        /// Poll and pump until `cond` holds or `timeout` elapses. Unlike
-        /// `wait_until`, which bounds a wait by pumped frames, this waits on
-        /// the run's own condition with a wall-clock stall escape: a pump
-        /// only advances the run while the ring holds audio, so a pump count
-        /// can expire on underruns (the start drain, the StartDrained
-        /// handshake, a lagging decode thread) without the run having made
-        /// progress. The escape is generous - only a wedged run reaches it.
+        /// Poll and pump until `cond` holds or `timeout` elapses. The wait
+        /// measures the run's own condition with a wall-clock stall escape:
+        /// a pump only advances the run while the ring holds audio, so a
+        /// pump-count budget can expire on underruns (the start drain, the
+        /// StartDrained handshake, a lagging decode thread) without the run
+        /// having made progress — which is why this harness waits on the
+        /// condition, not on a count (the proxy M24 replaced). The escape is
+        /// generous - only a wedged run reaches it.
         fn wait_pumping(
             &mut self,
             mut cond: impl FnMut(&Engine) -> bool,
@@ -2701,7 +2700,7 @@ mod dsp_hosted_tests {
         assert_eq!(&left[..], &expected(7, 0, 3000)[..]);
 
         assert!(
-            h.wait_until(|e| e.transport() == TransportState::Stopped, 3000 + 8192),
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
             "the run must finish"
         );
         assert_eq!(h.engine.position_frames(), 3000);
@@ -2741,15 +2740,7 @@ mod dsp_hosted_tests {
         assert!(!left.contains(&0.0), "the seam must not contain silence");
 
         assert!(
-            h.wait_until(
-                |e| e.transport() == TransportState::Stopped,
-                // Consumption bound in 256-frame pump steps: the joint 6000
-                // frames plus one full engine ring of overlap slack for the
-                // drain/ack handshake and loaded-VM pump skew. The exact
-                // assertions below do the real work; this only bounds
-                // pathology.
-                6000 + 16_384
-            ),
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
             "the run must finish"
         );
         assert_eq!(h.engine.position_frames(), 3000);

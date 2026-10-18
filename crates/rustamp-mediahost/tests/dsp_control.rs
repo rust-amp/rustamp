@@ -33,13 +33,23 @@ const SPEC: PcmSpecWire = PcmSpecWire {
 /// docs): generous enough that only a real stall reaches it, and a timeout is
 /// a loud failure that names the step, never a pass.
 const STALL_WAIT: Duration = Duration::from_secs(30);
+/// Liveness policy for the in-process control peers. The framework default
+/// (`Liveness::default()`: 100 ms interval, 5 s timeout) is a wall-clock
+/// bound a healthy-but-slow VM schedule can trip — the flake class M24
+/// proved in this guest and fixed in the dechost/audio/dsphost suites
+/// (M24 §1.3, M25). A dead resident never answers a Ping and is caught by
+/// the control EOF regardless, so only the trip wire moves.
+const LIVENESS: Liveness = Liveness {
+    interval: Duration::from_millis(100),
+    timeout: STALL_WAIT,
+};
 
 fn start(
     resident: impl DspResident + Send + 'static,
 ) -> (DspSession<NamedPcmRings>, mpsc::Receiver<Result<()>>) {
     let ((ar, aw), (br, bw)) = streams::streams();
-    let player = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-    let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+    let player = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
     let (done, result) = mpsc::channel();
     thread::spawn(move || {
         let _ = done.send(serve_dsp(&host, &NamedPcmRings, &resident));

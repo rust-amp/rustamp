@@ -28,6 +28,16 @@ const SPEC: PcmSpecWire = PcmSpecWire {
 /// milliseconds, so a timeout means the helper stopped answering without a
 /// terminal signal — a stall that fails loudly, never a pass.
 const STALL_WAIT: Duration = Duration::from_secs(30);
+/// Liveness policy for the test's own control peer. The framework default
+/// (`Liveness::default()`: 100 ms interval, 5 s timeout) is a wall-clock
+/// bound a healthy-but-slow VM schedule can trip — the flake class M24
+/// proved in this guest (M24 §1.3, M25). A dead helper never answers a
+/// Ping and is caught by the control EOF regardless, so only the trip wire
+/// moves.
+const LIVENESS: Liveness = Liveness {
+    interval: Duration::from_millis(100),
+    timeout: STALL_WAIT,
+};
 
 fn fixture() -> PathBuf {
     PathBuf::from(
@@ -68,8 +78,7 @@ fn read_pcm(session: &mut DspSession<NamedPcmRings>, out: &mut [f32], step: &str
 #[test]
 #[ignore = "two processes; Hyper-V VM only; requires RUSTAMP_DSP_FIXTURE"]
 fn named_dsp_two_process_gain_round_trip_then_sticky_eos() {
-    let mut child =
-        DspProcess::spawn(&fixture(), SPEC, vec![gain(2.0)], 3, Liveness::default()).unwrap();
+    let mut child = DspProcess::spawn(&fixture(), SPEC, vec![gain(2.0)], 3, LIVENESS).unwrap();
     assert_ne!(child.pid(), std::process::id());
     assert_eq!(child.session().latency_frames(), 0);
     let total = 4099;
@@ -128,7 +137,7 @@ fn host_exits_mid_stream_and_infinite_read_survives() {
                 params: Vec::new(),
             }],
             3,
-            Liveness::default(),
+            LIVENESS,
         )
         .unwrap();
         write_pcm(

@@ -16,6 +16,16 @@ use rustamp_proto::host::MediaLocationWire;
 /// milliseconds, so a timeout means the helper stopped answering without a
 /// terminal signal — a stall that fails loudly, never a pass.
 const STALL_WAIT: Duration = Duration::from_secs(30);
+/// Liveness policy for the test's own control peer. The framework default
+/// (`Liveness::default()`: 100 ms interval, 5 s timeout) is a wall-clock
+/// bound a healthy-but-slow VM schedule can trip — the flake class M24
+/// proved in this guest (M24 §1.3, M25). A dead helper never answers a
+/// Ping and is caught by the control EOF regardless, so only the trip wire
+/// moves.
+const LIVENESS: Liveness = Liveness {
+    interval: Duration::from_millis(100),
+    timeout: STALL_WAIT,
+};
 
 fn fixture() -> PathBuf {
     PathBuf::from(
@@ -31,14 +41,11 @@ fn named_pcm_two_process_transfer_and_seek() {
         &fixture(),
         MediaLocationWire::Url("fixture:plain".into()),
         3,
-        Liveness::default(),
+        LIVENESS,
     )
     .unwrap();
     assert_ne!(child.pid(), std::process::id());
-    assert_eq!(
-        child.session().seek(29, Duration::from_secs(5)).unwrap(),
-        29
-    );
+    assert_eq!(child.session().seek(29, STALL_WAIT).unwrap(), 29);
     let mut frame = 29;
     let mut out = [0.0; 22];
     loop {
@@ -73,7 +80,7 @@ fn host_exits_mid_stream_and_infinite_read_survives() {
             &executable,
             MediaLocationWire::Url("fixture:exit".into()),
             3,
-            Liveness::default(),
+            LIVENESS,
         )
         .unwrap();
         let mut received = 0;

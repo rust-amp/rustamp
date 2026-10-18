@@ -37,7 +37,22 @@ mod common;
 
 use common::{expected, pattern};
 
-const WAIT: Duration = Duration::from_secs(5);
+/// Stall escape for every wait in this harness and for the resident
+/// decoder's read/seek timeout (the M10 flakiness note's rule): a bound so
+/// generous that only a real stall reaches it, with the message naming the
+/// step — never a wall-clock bound a healthy-but-slow VM schedule could
+/// trip. The 5 s bounds this file carried before are the flake class M24
+/// proved in this guest (docs/tasks/M24-stubborn-three.md §1.3, M25).
+const WAIT: Duration = Duration::from_secs(30);
+/// Liveness policy for the in-process control peers. The framework default
+/// (`Liveness::default()`: 100 ms interval, 5 s timeout) is the same
+/// wall-clock trip wire, still present here after M24/M25 fixed the lib and
+/// the dechost/dsphost suites: a dead resident never answers a Ping and is
+/// caught by the control EOF regardless, so only the trip wire moves.
+const LIVENESS: Liveness = Liveness {
+    interval: Duration::from_millis(100),
+    timeout: WAIT,
+};
 
 /// Fake resident serving the same synthetic pattern the in-process
 /// `TestFactory` serves, so resident and in-process tracks are comparable.
@@ -194,7 +209,7 @@ impl DecoderFactory for FakeResidentFactory {
                 bytes: Cursor::new(Vec::new()),
             },
             ByteWriter(a_tx),
-            Liveness::default(),
+            LIVENESS,
             false,
         )
         .map_err(|e| CoreError::Decode(e.to_string()))?;
@@ -204,7 +219,7 @@ impl DecoderFactory for FakeResidentFactory {
                 bytes: Cursor::new(Vec::new()),
             },
             ByteWriter(b_tx),
-            Liveness::default(),
+            LIVENESS,
             true,
         )
         .map_err(|e| CoreError::Decode(e.to_string()))?;
@@ -326,25 +341,28 @@ impl Harness {
         self.events.try_iter().collect()
     }
 
-    fn wait_until(&mut self, mut cond: impl FnMut(&Engine) -> bool, max_frames: u64) -> bool {
-        if cond(&self.engine) {
-            return true;
-        }
-        let mut pumped = 0;
-        while pumped < max_frames {
+    /// Poll and pump until `cond` holds or `timeout` elapses: the wait
+    /// measures the run's own condition with a wall-clock stall escape (the
+    /// M10 rule), not a pump count — a pump only advances the run while the
+    /// ring holds audio, so a pump budget can expire on underruns without
+    /// the run having made progress (the proxy M24 replaced in the lib).
+    fn wait_pumping(&mut self, mut cond: impl FnMut(&Engine) -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
             self.engine.poll().expect("poll");
             if cond(&self.engine) {
                 return true;
             }
+            if Instant::now() >= deadline {
+                return false;
+            }
             self.clock.pump(256);
-            pumped += 256;
             thread::sleep(Duration::from_millis(1));
         }
-        cond(&self.engine)
     }
 
     fn wait_track(&mut self, index: u32) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         loop {
             self.engine.poll().expect("poll");
             if self.engine.current_index() == Some(index) && self.engine.duration_frames().is_some()
@@ -359,7 +377,7 @@ impl Harness {
     }
 
     fn wait_buffered(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         loop {
             self.engine.poll().expect("poll");
             if self.engine.end_of_stream().is_some() {
@@ -373,7 +391,7 @@ impl Harness {
     }
 
     fn settle_seek(&mut self, target: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         loop {
             self.engine.poll().expect("poll");
             if self.engine.position_frames() == target {
@@ -419,7 +437,7 @@ fn resident_track_plays_bit_exact_to_sticky_eos() {
     // Sticky end of stream: the run finishes only once the ring is drained,
     // and the timeline freezes exactly at the content end.
     assert!(
-        h.wait_until(|e| e.transport() == TransportState::Stopped, 3000 + 8192),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "the run must finish"
     );
     // With duration quantized to 2999 frames (M15), position_frames() clamps to duration.
@@ -443,7 +461,7 @@ fn seek_in_resident_track_plays_the_target() {
 
     // Wait for fresh post-seek audio without pumping silence in between, then
     // compare against the pattern at the settled position.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT;
     let p0 = loop {
         h.engine.poll().unwrap();
         if h.engine.buffered_frames() >= 4096 {
@@ -494,7 +512,7 @@ fn resident_to_inprocess_source_change_is_gapless() {
     assert_eq!(left[3000], pattern(2, 0));
 
     assert!(
-        h.wait_until(|e| e.transport() == TransportState::Stopped, total + 8192),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "the mixed run must finish"
     );
     assert_eq!(h.engine.position_frames(), 3000);
@@ -533,7 +551,7 @@ fn seek_past_the_end_clamps_through_the_wire() {
     // quantizes the round trip, so the resident lands within one millisecond
     // (~44 frames at 44.1 kHz) of it — coarse tolerance, by wire design.
     h.engine.seek_frames(1_000_000).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT;
     loop {
         h.engine.poll().unwrap();
         let pos = h.engine.position_frames();
@@ -550,7 +568,7 @@ fn seek_past_the_end_clamps_through_the_wire() {
     // The clamped seek terminates: pumping the rest finishes the run with an
     // empty ring, exactly like an in-process seek past the end.
     assert!(
-        h.wait_until(|e| e.transport() == TransportState::Stopped, 8192),
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "the clamped run must finish"
     );
     assert_eq!(h.engine.buffered_frames(), 0);

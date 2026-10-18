@@ -23,12 +23,21 @@ use rustamp_mediahost::pcm::{CloseRing, PcmInput, PcmOffer, PcmRings};
 use rustamp_mediahost::{MediaHostError, Result};
 use rustamp_proto::host::{MediaLocationWire, PcmSpecWire};
 
-const WAIT: Duration = Duration::from_secs(5);
 /// Stall bound for every wait that waits on the host worker: the M10
 /// flakiness note's sanctioned form — a bound so generous that only a real
 /// stall reaches it, with the message saying which. A timeout is always a
 /// loud failure that names the step, never a pass.
 const STALL_WAIT: Duration = Duration::from_secs(30);
+/// Liveness policy for the in-process control peers. The framework default
+/// (`Liveness::default()`: 100 ms interval, 5 s timeout) is a wall-clock
+/// bound a healthy-but-slow VM schedule can trip — the flake class M24
+/// proved in this guest and fixed in the dechost/audio/dsphost suites
+/// (M24 §1.3, M25). A dead resident never answers a Ping and is caught by
+/// the control EOF regardless, so only the trip wire moves.
+const LIVENESS: Liveness = Liveness {
+    interval: Duration::from_millis(100),
+    timeout: STALL_WAIT,
+};
 
 struct ByteReader {
     rx: mpsc::Receiver<Vec<u8>>,
@@ -166,8 +175,8 @@ fn start_resident(
     TestRings,
 ) {
     let ((ar, aw), (br, bw)) = streams();
-    let client = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
-    let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
     let rings = TestRings::default();
     let host_rings = rings.clone();
     let (done, result) = mpsc::channel();
@@ -305,7 +314,7 @@ fn format_change_drains_old_pcm_before_new_channel_count() {
 #[test]
 fn seek_interrupts_full_ring_and_discards_prefetch() {
     let (mut session, done, rings) = start("fixture:plain", 1);
-    assert_eq!(session.seek(29, WAIT).unwrap(), 29);
+    assert_eq!(session.seek(29, STALL_WAIT).unwrap(), 29);
     let mut out = [0.0; 2];
     assert_eq!(
         read_pcm(&mut session, &mut out, "the post-seek read").unwrap(),
@@ -367,7 +376,7 @@ fn decoder_error_is_loud_and_never_eos() {
 #[test]
 fn abrupt_player_loss_wakes_a_full_ring_decoder_writer() {
     let ((ar, aw), (br, bw)) = streams();
-    let host = ControlPeer::start(br, bw, Liveness::default(), true).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
     let rings = TestRings::default();
     let host_rings = rings.clone();
     let (done, result) = mpsc::channel();
@@ -421,7 +430,7 @@ fn abrupt_player_loss_wakes_a_full_ring_decoder_writer() {
 #[test]
 fn abrupt_control_loss_wakes_infinite_pcm_wait_without_eos() {
     let ((ar, aw), (br, bw)) = streams();
-    let peer = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
+    let peer = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
     let rings = TestRings::default();
     let host_rings = rings.clone();
     let (die, death) = mpsc::channel();
@@ -481,7 +490,7 @@ fn abrupt_control_loss_wakes_infinite_pcm_wait_without_eos() {
         let _ = done.send(session.read(&mut out, None));
     });
     let outcome = result
-        .recv_timeout(WAIT)
+        .recv_timeout(STALL_WAIT)
         .expect("control EOF must wake an infinite PCM wait");
     assert!(matches!(outcome, Err(MediaHostError::Disconnected(_))));
 }
@@ -509,11 +518,14 @@ fn missing_pong_is_bounded_even_with_an_open_control_stream() {
     let mut unresponsive = StreamTransport::new(br, bw);
     unresponsive.send(&Message::hello()).unwrap();
     let start = Instant::now();
-    let outcome = peer.recv(WAIT);
+    let outcome = peer.recv(STALL_WAIT);
     assert!(matches!(outcome, Err(MediaHostError::Disconnected(_))));
-    assert!(start.elapsed() < WAIT);
+    // Kept at the original 5 s (not the widened stall escape): the 200 ms
+    // policy above is the claim; this only proves the liveness fired, it
+    // did not hang.
+    assert!(start.elapsed() < Duration::from_secs(5));
     assert!(matches!(
-        waiter.recv_timeout(WAIT).unwrap(),
+        waiter.recv_timeout(STALL_WAIT).unwrap(),
         Err(rustamp_ipc::shm::RingError::Closed)
     ));
     assert!(
@@ -527,7 +539,7 @@ fn missing_pong_is_bounded_even_with_an_open_control_stream() {
 #[test]
 fn old_hello_is_rejected_before_decoder_open() {
     let ((ar, aw), (br, bw)) = streams();
-    let peer = ControlPeer::start(ar, aw, Liveness::default(), false).unwrap();
+    let peer = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
     let mut old = StreamTransport::new(br, bw);
     old.send(&Message::Hello {
         protocol_version: 2,
@@ -535,7 +547,7 @@ fn old_hello_is_rejected_before_decoder_open() {
     })
     .unwrap();
     assert!(matches!(
-        peer.recv(WAIT),
+        peer.recv(STALL_WAIT),
         Err(MediaHostError::Disconnected(_))
     ));
 }
