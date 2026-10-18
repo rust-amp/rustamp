@@ -24,6 +24,8 @@
 //! * [`render::render_main_window`] paints one RGBA frame through
 //!   [`rustamp_gfx`], falling back per spec **S17** when a skin lacks a sheet.
 //! * [`widget::hit_test`] maps a window-relative point to a [`widget::Widget`].
+//! * [`visualization`] implements Rustamp's own analyser/scope and envelopes,
+//!   consuming actual waveform snapshots. S08 reference behaviour remains open.
 //! * [`playlist::PlaylistWindow`] is the headless playlist-editor behaviour of
 //!   spec **S06**: list selection, page scrolling, REM removal and the
 //!   bottom-bar dialog requests (titles only, no dialog internals).
@@ -51,6 +53,7 @@ pub mod presenter;
 pub mod render;
 pub mod shortcuts;
 pub mod state;
+pub mod visualization;
 pub mod widget;
 
 pub use behaviour::{

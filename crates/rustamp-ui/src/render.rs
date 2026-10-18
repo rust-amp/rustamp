@@ -195,6 +195,13 @@ fn render_1x(state: &MainWindowState, skin: &Skin, layout: &MainWindowLayout) ->
     draw_text_field(&mut canvas, &sheets, layout.kbps, state.kbps);
     draw_text_field(&mut canvas, &sheets, layout.khz, state.khz);
 
+    crate::visualization::draw_visualization(
+        &mut canvas,
+        layout.visualization,
+        &state.visualization,
+        skin.viscolors(),
+    );
+
     canvas
 }
 

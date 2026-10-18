@@ -109,6 +109,10 @@ pub struct MainWindowLayout {
     pub play_indicator: Rect,
     /// The decoder-active/idle indicator at (24,28), 3 x 9 (S01 §2.1, verified).
     pub decoder_indicator: Rect,
+    /// Own-choice spectrum/scope area below the time display: (24,43,76,16).
+    /// S01 only anchors the indicator, not the analyser extent. Reference grade
+    /// **open**, S08 measurement Q8; this must not be called S01-measured.
+    pub visualization: Rect,
     /// The stereo indicator (S01 §2.1, verified).
     pub stereo: Rect,
     /// The mono indicator (S01 §2.1, verified).
@@ -168,6 +172,7 @@ impl MainWindowLayout {
         time_display: Rect::new(36, 26, 60, 13),
         play_indicator: Rect::new(26, 28, 9, 9),
         decoder_indicator: Rect::new(24, 28, 3, 9),
+        visualization: Rect::new(24, 43, 76, 16),
         stereo: Rect::new(239, 41, 29, 12),
         mono: Rect::new(212, 41, 27, 12),
         marquee: Rect::new(111, 27, 154, 6),

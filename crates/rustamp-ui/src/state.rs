@@ -123,6 +123,9 @@ pub struct MainWindowState {
     pub volume: u8,
     /// Balance, `0..=100` (50 is centred).
     pub balance: u8,
+    /// Rustamp's own deterministic analyser/scope drawing state. Every S08
+    /// reference question remains open; see [`crate::visualization`].
+    pub visualization: crate::visualization::VisState,
 }
 
 impl Default for MainWindowState {
@@ -155,6 +158,7 @@ impl Default for MainWindowState {
             position: 0,
             volume: 50,
             balance: 50,
+            visualization: crate::visualization::VisState::default(),
         }
     }
 }

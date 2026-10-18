@@ -4,10 +4,12 @@
 #![allow(dead_code)] // Shared across two test binaries (lookalike and rust-theme), each using their own skin loader and namespace.
 
 use rustamp_core::command::SelectOp;
+use rustamp_core::event::Event;
 use rustamp_core::playlist::EntryId;
 use rustamp_skin::{BuiltinDefaultSkin, BuiltinLookalikeSkin, Skin};
 use rustamp_testkit::{Snapshot, assert_golden};
 use rustamp_ui::equalizer::{EqSlider, EqWidget};
+use rustamp_ui::visualization::{VisInput, VisMode};
 use rustamp_ui::{
     DialogKind, EqualizerLayout, EqualizerState, MainWindowLayout, MainWindowState, MonoStereo,
     PlaylistWindow, TransportState, eq_frame_size, frame_size, render_dialog,
@@ -338,6 +340,93 @@ pub fn case_dialog_load_playlist(skin: &Skin, namespace: &str) {
     let body = ["Playlist file:", r"C:\Music\mix.m3u"];
     let shot = Shot(|| render_dialog(DialogKind::LoadPlaylist, skin, &body));
     assert_golden("dialog_load_playlist", namespace, &shot.render_image());
+}
+
+/// Own-choice S08 regression states, generated from our deterministic PCM rather
+/// than hard-coded bar heights. No reference measurement or capture is implied.
+pub fn case_visualization(skin: &Skin, namespace: &str) {
+    use rustamp_core::vis::{VIS_SAMPLES, VisFrame};
+    use rustamp_ui::MainWindow;
+
+    let frame = VisFrame {
+        timestamp_us: 13061,
+        waveform: std::array::from_fn(|ch| {
+            let (bin, amplitude) = if ch == 0 { (8.0, 0.5) } else { (128.0, 0.25) };
+            std::array::from_fn(|n| {
+                (std::f64::consts::TAU * bin * n as f64 / VIS_SAMPLES as f64).sin() as f32
+                    * amplitude
+            })
+        }),
+        ..VisFrame::default()
+    };
+    let mut window = MainWindow::new();
+    window.handle_event(&Event::StateChanged(TransportState::Playing), 0);
+    window.push_vis_frame(&frame, 44100, 0).unwrap();
+    let spectrum = window.state().clone();
+    assert!(spectrum.visualization.bars.iter().any(|&h| h > 0));
+    let mut states = vec![("vis_spectrum", spectrum.clone())];
+
+    window.refresh(425);
+    let decay = window.state().clone();
+    assert_eq!(decay.visualization.input, VisInput::Stale);
+    assert_ne!(decay.visualization.bars, spectrum.visualization.bars);
+    assert_ne!(decay.visualization.peaks, spectrum.visualization.peaks);
+    states.push(("vis_spectrum_decay", decay));
+
+    window.push_vis_frame(&frame, 44100, 500).unwrap();
+    window.handle_event(&Event::StateChanged(TransportState::Paused), 500);
+    let frozen = window.state().visualization.clone();
+    window.refresh(1000);
+    assert_eq!(window.state().visualization, frozen);
+    states.push(("vis_spectrum_paused", window.state().clone()));
+
+    window.handle_event(&Event::StateChanged(TransportState::Playing), 1000);
+    let scope = VisFrame {
+        waveform: [std::array::from_fn(|n| {
+            // A low-frequency square exposes the connected stroke vs dots.
+            if n % 144 < 72 { 0.8 } else { -0.8 }
+        }); 2],
+        ..VisFrame::default()
+    };
+    window.push_vis_frame(&scope, 44100, 1000).unwrap();
+    window.set_vis_mode(VisMode::Scope);
+    states.push(("vis_scope", window.state().clone()));
+    window.set_vis_mode(VisMode::ScopeDots);
+    states.push(("vis_scope_dots", window.state().clone()));
+
+    window.set_vis_mode(VisMode::Scope);
+    window
+        .push_vis_frame(&VisFrame::default(), 44100, 1000)
+        .unwrap();
+    states.push(("vis_scope_silence", window.state().clone()));
+    window.reset_visualization();
+    assert_eq!(window.state().visualization.input, VisInput::Missing);
+    states.push(("vis_scope_missing", window.state().clone()));
+
+    window.set_vis_mode(VisMode::Off);
+    states.push(("vis_off", window.state().clone()));
+
+    window.set_vis_mode(VisMode::Spectrum);
+    window.push_vis_frame(&frame, 44100, 1000).unwrap();
+    window.handle_event(&Event::StateChanged(TransportState::Stopped), 1000);
+    window.refresh(1425);
+    states.push(("vis_stopped_tail", window.state().clone()));
+
+    let mut doubled = spectrum;
+    doubled.double_size = true;
+    states.push(("vis_spectrum_double_size", doubled));
+    for (name, state) in states {
+        let image = render_main_window(&state, skin, &MainWindowLayout::CLASSIC);
+        if state.double_size {
+            let mut single = state.clone();
+            single.double_size = false;
+            assert_eq!(
+                image,
+                render_main_window(&single, skin, &MainWindowLayout::CLASSIC).scaled(2)
+            );
+        }
+        assert_golden(name, namespace, &Shot(|| image.clone()).render_image());
+    }
 }
 
 macro_rules! register_golden_tests {

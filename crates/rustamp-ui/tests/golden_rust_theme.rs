@@ -19,6 +19,14 @@
 
 mod golden_cases;
 
+#[test]
+fn golden_rust_theme_visualization() {
+    golden_cases::case_visualization(
+        &golden_cases::rust_theme_skin(),
+        golden_cases::SKIN_RUST_THEME,
+    );
+}
+
 use golden_cases::{SKIN_RUST_THEME, register_golden_tests, rust_theme_skin};
 
 register_golden_tests!(

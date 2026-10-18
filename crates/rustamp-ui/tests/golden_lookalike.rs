@@ -21,6 +21,11 @@ mod golden_cases;
 
 use golden_cases::{SKIN_LOOKALIKE, lookalike_skin, register_golden_tests};
 
+#[test]
+fn golden_lookalike_visualization() {
+    golden_cases::case_visualization(&lookalike_skin(), SKIN_LOOKALIKE);
+}
+
 register_golden_tests!(
     lookalike_skin,
     SKIN_LOOKALIKE,

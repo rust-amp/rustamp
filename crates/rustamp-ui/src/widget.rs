@@ -65,6 +65,8 @@ pub enum Widget {
     TimeDisplay,
     /// The track-title marquee.
     Marquee,
+    /// Rustamp's UI-local analyser/scope mode cycle (S08 Q9 open, own choice).
+    Visualization,
     /// The mono indicator.
     Mono,
     /// The stereo indicator.
@@ -102,6 +104,7 @@ impl Widget {
         Widget::BalanceSlider,
         Widget::TimeDisplay,
         Widget::Marquee,
+        Widget::Visualization,
         Widget::Mono,
         Widget::Stereo,
     ];
@@ -145,6 +148,7 @@ impl Widget {
             Widget::BalanceSlider => layout.balance_track,
             Widget::TimeDisplay => layout.time_display,
             Widget::Marquee => layout.marquee,
+            Widget::Visualization => layout.visualization,
             Widget::Mono => layout.mono,
             Widget::Stereo => layout.stereo,
         }

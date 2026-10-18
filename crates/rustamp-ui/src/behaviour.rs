@@ -13,6 +13,8 @@
 //! (the display-title format, the hint's time/percentage format, the slider
 //! click mapping, the marquee drag ratio and the window-button window positions)
 //! are marked **provisional** in the code.
+//! The built-in analyser is separately Rustamp's **own choice**, with reference
+//! grade **open**, in [`crate::visualization`]; it is not an S02 measurement.
 
 use rustamp_core::command::{Command, OpenMediaKind};
 use rustamp_core::event::Event;
@@ -21,7 +23,9 @@ use rustamp_core::state::{StreamInfo, TransportState, WindowId};
 
 use crate::layout::{BALANCE_THUMB_SIZE, MainWindowLayout, VOLUME_THUMB_SIZE};
 use crate::state::{MainWindowState, MonoStereo};
+use crate::visualization::{VisError, VisMode, Visualizer};
 use crate::widget::{Widget, hit_test};
+use rustamp_core::vis::VisFrame;
 
 /// The program name the marquee shows when nothing is loaded.
 ///
@@ -101,6 +105,7 @@ pub struct MainWindow {
     scroll_base_ms: u64,
     manual_offset: i32,
     blink_base_ms: Option<u64>,
+    visualization: Visualizer,
 }
 
 impl Default for MainWindow {
@@ -141,8 +146,12 @@ impl MainWindow {
             scroll_base_ms: 0,
             manual_offset: 0,
             blink_base_ms: None,
+            visualization: Visualizer::default(),
         };
         machine.always_on_top = machine.state.clutter_a;
+        machine
+            .visualization
+            .set_mode(machine.state.visualization.mode);
         machine.refresh(0);
         machine
     }
@@ -160,6 +169,37 @@ impl MainWindow {
     /// Sets whether the window is focused (drives the title-bar focus variant).
     pub fn set_focused(&mut self, focused: bool) {
         self.state.title_bar_focused = focused;
+    }
+
+    /// Feed the newest **actual** engine tap frame and its unrounded source
+    /// sample rate. No PCM is invented when the caller has no frame/rate.
+    ///
+    /// The app must drain `Engine::take_vis_frame()` in its pump, after transport
+    /// and stream events. This UI-only method does not depend on the engine.
+    /// Decode-ahead selection/latency and all reference S08 laws remain open.
+    pub fn push_vis_frame(
+        &mut self,
+        frame: &VisFrame,
+        sample_rate_hz: u32,
+        now_ms: u64,
+    ) -> Result<(), VisError> {
+        let result = self
+            .visualization
+            .push(frame, sample_rate_hz, now_ms, self.state.transport);
+        self.state.visualization = self.visualization.state().clone();
+        result
+    }
+
+    /// UI-local mode selection; no plugin mode or persistence is implied.
+    pub fn set_vis_mode(&mut self, mode: VisMode) {
+        self.visualization.set_mode(mode);
+        self.state.visualization = self.visualization.state().clone();
+    }
+
+    /// Discard analyser history after an externally initiated seek/discontinuity.
+    pub fn reset_visualization(&mut self) {
+        self.visualization.reset();
+        self.state.visualization = self.visualization.state().clone();
     }
 
     /// Whether the marquee autoscrolls (S02 §3).
@@ -225,6 +265,8 @@ impl MainWindow {
         self.update_time(now_ms);
         self.update_marquee(now_ms);
         self.update_held();
+        self.visualization.advance(now_ms, self.state.transport);
+        self.state.visualization = self.visualization.state().clone();
     }
 
     /// Applies a core [`Event`] (the authoritative source of player state).
@@ -237,6 +279,7 @@ impl MainWindow {
                 metadata,
                 duration_ms,
             } => {
+                self.reset_visualization();
                 self.duration_ms = *duration_ms;
                 self.position_ms = 0;
                 self.track_title = if id.is_some() {
@@ -389,11 +432,13 @@ impl MainWindow {
         }
         match command {
             Command::Seek { to_ms } => {
+                self.reset_visualization();
                 if self.state.transport != TransportState::Stopped {
                     self.position_ms = clamp_position(*to_ms, self.duration_ms);
                 }
             }
             Command::SeekRelative { delta_ms } => {
+                self.reset_visualization();
                 if self.state.transport != TransportState::Stopped {
                     let target = (self.position_ms as i64 + delta_ms).max(0) as u64;
                     self.position_ms = clamp_position(target, self.duration_ms);
@@ -464,6 +509,11 @@ impl MainWindow {
                 // There is no core command or persisted field for it, so it is
                 // UI-local (reported gap).
                 self.state.time_remaining = !self.state.time_remaining;
+                None
+            }
+            Widget::Visualization => {
+                // Own choice only: Q9's switching gesture/styles are unmeasured.
+                self.set_vis_mode(self.state.visualization.mode.next());
                 None
             }
             _ => None,

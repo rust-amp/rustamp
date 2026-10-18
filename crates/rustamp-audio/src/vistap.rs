@@ -15,6 +15,15 @@
 //!   unverified derivation into the engine. See the report for the spec
 //!   request.
 //!
+//! Rustamp's UI may derive its own display from these actual waveform samples;
+//! that is not S08's unmeasured plugin conversion. `VisFrame` carries no sample
+//! rate or seek generation: the caller must supply the engine's source format,
+//! never infer a rate from rounded kHz or the output device. Publication happens
+//! once at the end of a sufficiently large decode block (not at an exact
+//! 576-frame hop). Decode can run ahead of audible output; the timestamp below
+//! is not proof of audio-to-pixel synchronisation. Dropped/absent frames are not
+//! digital silence. The built-in renderer must not fabricate missing samples.
+//!
 //! [`VisTap::push`] allocates nothing, so the tap can run inside the decode
 //! loop without touching the allocator.
 
