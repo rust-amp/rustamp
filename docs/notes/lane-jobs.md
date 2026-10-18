@@ -14,11 +14,12 @@ slots looked busy.
 
 | job id | lane | started | task |
 |---|---|---|---|
-| `1792280424170544900-195524e8efc13fd8e4997a16` | `wave71-audio-rest` | 2026-10-18 01:40 | the audio crate's last two reds |
-| `1792280424172655100-54ea78b49bba824117e6ec29` | `wave71-dsp-rest` | 2026-10-18 01:40 | the DSP crate's last red |
+| (Mistral, subagent - notifies) | `wave73-resident-audio3` | 2026-10-18 03:20 | the three stubborn reds: two resident waits a widening did not fix, plus a regression in real_decode |
 
-Running elsewhere (they notify, no ids needed here): `wave70-app-platform2`
-(Muse, app 2 + platform 1) and `wave70-ui-red2` (Mistral, the UI two).
+**agy is paused** since 2026-10-18 02:00: four jobs in a row failed with their
+worktrees in place and with quota available, so the channel stopped carrying and
+the work moved to Muse and Mistral. Start an agy job again only as a probe, and
+only when a slot would otherwise sit empty.
 ## Done, merged
 
 | lane | outcome |
