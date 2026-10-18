@@ -53,19 +53,33 @@
 //! RFC already documents, so the app side can start listening without any host
 //! change.
 //!
+//! # Load requests
+//!
+//! [`Message::LoadPlugin`] is routed to the UI thread as
+//! [`ControlInbound::Load`] (P3 §5.3). It is **not** acted on here: mapping a
+//! DLL calls the plugin's `init` and must happen on the thread that owns the
+//! host window (S09 §3.5, §7.2), which the reader thread is not. The UI thread
+//! answers it through [`crate::registry::PluginRegistry`] with the
+//! `PluginLoaded`/`PluginError` variants the protocol already has, so no wire
+//! format changes. [`handle_message`], the reader-thread variant that owns the
+//! transport and has no window, therefore still ignores it.
+//!
 //! # Messages this module deliberately ignores
 //!
 //! Any other variant returns [`ControlStep::Continue`] and touches neither the
 //! surface nor the channel: `WinampIpc` has no reply variant in the protocol,
 //! so answering one over the channel would invent protocol; classic plugins
-//! keep querying the host window in-process instead. `LoadPlugin`,
-//! `CommandToHost`, the ring offers and the RFC 0006 decoder/DSP messages
-//! (including the RFC 0015 `DspResetAck` reply, which only a DSP session's
-//! player side expects) belong to other hosts or to future cards; acting on
-//! them here would be guessing. See [`crate::state_bridge`] for the same
+//! keep querying the host window in-process instead. `CommandToHost`, the ring
+//! offers and the RFC 0006 decoder/DSP messages (including the RFC 0015
+//! `DspResetAck` reply, which only a DSP session's player side expects) belong
+//! to other hosts or to future cards; acting on them here would be guessing.
+//! There is also no message for "configure plugin N" or "quit plugin N": a
+//! Configure request from the app (P3 §4 step 9) needs an RFC and the contract
+//! lane, and none is invented here. See [`crate::state_bridge`] for the same
 //! honesty on the surface.
 
 use rustamp_ipc::{Message, Transport};
+use rustamp_plugin_abi::PluginKind;
 use rustamp_proto::state::PlayerState;
 
 /// What one handled message decided.
@@ -107,6 +121,15 @@ pub enum ControlInbound {
     /// A ping from the parent with its token. The UI thread answers with Pong
     /// when it pumps messages, so a hung UI will not answer and trip the supervisor's timeout.
     Ping(u64),
+    /// The parent asked for a plugin DLL to be loaded. Carried to the UI thread
+    /// because that is where a plugin's `init` has to run (S09 §3.5, §7.2); the
+    /// UI thread answers with `PluginLoaded` or `PluginError`.
+    Load {
+        /// Host-visible path of the DLL, exactly as the app sent it.
+        path: String,
+        /// The kind the app expects; a mismatch is refused before any mapping.
+        kind: PluginKind,
+    },
 }
 
 /// Route one inbound message to an event sink.
@@ -114,6 +137,8 @@ pub enum ControlInbound {
 /// * `PlayerStateUpdate` is forwarded as `ControlInbound::State`.
 /// * `Ping` is forwarded as `ControlInbound::Ping` to the UI thread (so Pong is
 ///   driven by UI responsiveness rather than answering from the reader thread).
+/// * `LoadPlugin` is forwarded as `ControlInbound::Load`, for the same reason:
+///   only the UI thread may call into a plugin.
 /// * `Hello` validates protocol compatibility. If incompatible, triggers shutdown.
 /// * `Shutdown` triggers shutdown.
 /// * Other variants are ignored.
@@ -128,6 +153,10 @@ pub fn handle_message_inbound(
         }
         Message::Ping(token) => {
             on_event(ControlInbound::Ping(token));
+            ControlStep::Continue
+        }
+        Message::LoadPlugin { path, kind } => {
+            on_event(ControlInbound::Load { path, kind });
             ControlStep::Continue
         }
         Message::Hello { .. } => ControlStep::Continue,
@@ -312,6 +341,45 @@ mod tests {
         );
         // Unknown ids still fall through to the S10 convention of 1.
         assert_eq!(surface.answer(0xDEAD_BEEF, 0), IpcAnswer::Unknown(1));
+    }
+
+    #[test]
+    fn a_load_request_is_routed_to_the_ui_thread_and_answered_nowhere_else() {
+        let (mut app_end, mut host_end) = MemoryTransport::pair();
+        let request = Message::LoadPlugin {
+            path: r"C:\plugins\gen_example.dll".to_string(),
+            kind: rustamp_plugin_abi::PluginKind::General,
+        };
+        app_end.send(&request).unwrap();
+        app_end.send(&Message::Shutdown).unwrap();
+
+        let mut events = Vec::new();
+        assert_eq!(
+            run_reader_events(&mut host_end, &mut |ev| events.push(ev)),
+            ControlExit::ShutdownRequested
+        );
+        assert_eq!(
+            events,
+            vec![ControlInbound::Load {
+                path: r"C:\plugins\gen_example.dll".to_string(),
+                kind: rustamp_plugin_abi::PluginKind::General,
+            }],
+            "a load request must reach the thread that owns the window"
+        );
+        // Only the startup Hello went out: the reader thread, which has no
+        // window, answers a load request neither with PluginLoaded nor with
+        // PluginError. That reply is the UI thread's (see run_ui_loop).
+        assert!(matches!(app_end.recv().unwrap(), Message::Hello { .. }));
+        assert!(app_end.try_recv().unwrap().is_none());
+
+        // The transport-owning variant still does not act on it at all.
+        let mut states = 0;
+        assert_eq!(
+            handle_message(request, &mut host_end, &mut |_| states += 1),
+            ControlStep::Continue
+        );
+        assert_eq!(states, 0);
+        assert!(app_end.try_recv().unwrap().is_none());
     }
 
     #[test]

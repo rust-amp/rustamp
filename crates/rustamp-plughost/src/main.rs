@@ -1,15 +1,24 @@
 //! # rustamp-plughost32
 //!
-//! The helper intended to load classic Winamp plugin DLLs in an i686 build.
-//! Currently it serves a window and talks to `rustamp.exe` over `rustamp-ipc`;
-//! no DLL loader or export invocation exists, and `LoadPlugin` is ignored.
-//! Surface tests do not prove DLL loading. The separate VM-only acceptance
-//! design is `docs/tasks/P3-dll-acceptance.md` (blocked; do not execute).
+//! The helper that loads classic Winamp plugin DLLs in an i686 build. It
+//! serves a window, talks to `rustamp.exe` over `rustamp-ipc`, and answers a
+//! `LoadPlugin` request on its UI thread through
+//! [`rustamp_plughost::registry::PluginRegistry`]. Surface tests do not prove
+//! DLL loading; the VM-only acceptance path is `docs/tasks/P3-dll-acceptance.md`
+//! and `docs/tasks/W23-p3-acceptance.md`.
 //!
 //! The process owns exactly one window — the hidden fake `Winamp v1.x` main
 //! window that plugins query — and answers the app over the framed stdio
 //! control channel the app connects (RFC 0006 §8; spawned with piped stdio by
 //! `rustamp-app/src/supervise.rs`).
+//!
+//! # Which plugins may execute here
+//!
+//! Only bytes the operator's approval store approves, named with
+//! `--approvals <path>`. With no such argument the store is empty and **no**
+//! plugin loads; a store that exists but cannot be read refuses every load and
+//! says why, rather than degrading into an empty allowlist. Nothing is ever
+//! approved because its path, name or architecture looks right.
 //!
 //! # Main flow
 //!
@@ -23,8 +32,9 @@
 //!    thread over an `mpsc` channel, and returns on `Shutdown`, on a closed
 //!    pipe, or on a channel error.
 //! 3. The UI thread runs [`run_ui_loop`]: drain every queued snapshot through
-//!    the state bridge, pump one window message without blocking, sleep one
-//!    millisecond. It stops when the reader is done (or on `WM_QUIT`).
+//!    the state bridge, handle a queued load request against the approval
+//!    store, pump one window message without blocking, sleep one millisecond.
+//!    It stops when the reader is done (or on `WM_QUIT`).
 //! 4. The process exits: `0` on `Shutdown` or a closed channel, `1` when the
 //!    window cannot be created or the channel errored.
 //!
@@ -66,6 +76,8 @@ use rustamp_ipc::{Message, StreamTransport, Transport};
 use rustamp_plughost::control::{self, ControlExit, ControlInbound};
 #[cfg(windows)]
 use rustamp_plughost::message_loop;
+#[cfg(windows)]
+use rustamp_plughost::registry::PluginRegistry;
 #[cfg(windows)]
 use rustamp_plughost::{HostWindow, IpcSurface};
 #[cfg(windows)]
@@ -133,6 +145,26 @@ fn run() -> i32 {
     }
 }
 
+/// Path of the approval store, from `--approvals <path>` or `--approvals=<path>`.
+///
+/// `None` means the operator named none, which approves nothing. The argument
+/// names *where the operator's decision is recorded*; it is not itself an
+/// approval, and no environment variable can stand in for it.
+#[cfg(windows)]
+fn approval_store_path() -> Option<std::path::PathBuf> {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        let text = arg.to_string_lossy();
+        if let Some(rest) = text.strip_prefix("--approvals=") {
+            return Some(std::path::PathBuf::from(rest));
+        }
+        if text == "--approvals" {
+            return args.next().map(std::path::PathBuf::from);
+        }
+    }
+    None
+}
+
 /// Create the host window, serve the control channel, run until shutdown.
 #[cfg(windows)]
 fn run_windows() -> i32 {
@@ -144,6 +176,18 @@ fn run_windows() -> i32 {
             return 1;
         }
     };
+
+    // Declared after the window on purpose: the registry quits its plugins
+    // when it drops, and that must happen while the window they were handed
+    // still exists (S09 §7.2; the window outlives every plugin).
+    let store_path = approval_store_path();
+    let mut registry = PluginRegistry::from_store_path(store_path.as_deref());
+    match registry.approved_count() {
+        Some(count) => eprintln!("rustamp-plughost32: {count} approved plugin(s)"),
+        None => eprintln!(
+            "rustamp-plughost32: the approval store could not be read; every load will be refused"
+        ),
+    }
 
     // Finding 9: Inbound and outbound channels are bounded.
     let (inbound_tx, inbound_rx) = mpsc::sync_channel::<ControlInbound>(INBOUND_QUEUE_BOUND);
@@ -224,7 +268,11 @@ fn run_windows() -> i32 {
         exit
     });
 
-    let exit_reason = run_ui_loop(&window, inbound_rx, &outbox_tx, &reader_done);
+    let exit_reason = run_ui_loop(&window, &mut registry, inbound_rx, &outbox_tx, &reader_done);
+
+    // Quit the plugins while the window is still alive and on this thread.
+    // Reverse load order; the DLLs stay mapped (S09 §1 line 46).
+    registry.quit_all();
 
     // Finding 7: WM_QUIT can strand join on a blocked stdin reader.
     // Exit reasons are distinguished, and I/O is unblocked before joining.
@@ -249,11 +297,18 @@ fn run_windows() -> i32 {
     }
 }
 
-/// Drain queued player snapshots and pings through the state bridge, pumping
-/// window messages with a per-pump work budget and coalescing snapshots (Finding 9).
+/// Drain queued player snapshots, pings and load requests, pumping window
+/// messages with a per-pump work budget and coalescing snapshots (Finding 9).
+///
+/// A load request is the one event that can take arbitrarily long: it runs the
+/// plugin's `DllMain` and `init` on this thread (S09 §3.5, §7.2), and there is
+/// no isolation. That is why it is answered here rather than on the reader
+/// thread, and why the reply goes out through `outbox_tx` instead of a print:
+/// stdout is the frame stream.
 #[cfg(windows)]
 fn run_ui_loop(
     window: &HostWindow,
+    registry: &mut PluginRegistry,
     inbound_rx: mpsc::Receiver<ControlInbound>,
     outbox_tx: &mpsc::SyncSender<Message>,
     reader_done: &AtomicBool,
@@ -273,6 +328,14 @@ fn run_ui_loop(
                 Ok(ControlInbound::Ping(token)) => {
                     // Finding 6: Pong is generated here when UI pumps, confirming UI liveness.
                     let _ = outbox_tx.try_send(Message::Pong(token));
+                    budget -= 1;
+                }
+                Ok(ControlInbound::Load { path, kind }) => {
+                    // SAFETY: this is the UI thread owning `window`, and the
+                    // approval store is the operator's decision about which
+                    // code may execute in this process.
+                    let reply = unsafe { registry.handle_load_request(&path, kind, window) };
+                    let _ = outbox_tx.try_send(reply);
                     budget -= 1;
                 }
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
@@ -298,6 +361,9 @@ fn run_ui_loop(
     }
 
     // Final drain: coalesce any remaining snapshots that arrived with shutdown.
+    // A load request that arrived with the shutdown is deliberately dropped
+    // unanswered: the process is on its way out, and mapping a DLL now would
+    // run plugin code the host is about to stop pumping messages for.
     let mut latest_state: Option<PlayerState> = None;
     for event in inbound_rx.try_iter() {
         if let ControlInbound::State(state) = event {

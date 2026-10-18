@@ -4,8 +4,12 @@
 //! (`rustamp-plughost32`) is the host process itself; this crate library exists
 //! so the table-driven IPC answering surface can be unit tested and so other
 //! permissive crates can call it without depending on the binary target.
-//! No DLL-loading path exists yet. Headless surface tests are not DLL
-//! acceptance; `pe_preflight` only inspects bytes and executes no image.
+//!
+//! `loader` maps approved 32-bit plugin DLLs and calls their real entry points;
+//! `registry` is the control-channel routing around it. Neither the headless
+//! surface tests nor `pe_preflight` (which only inspects bytes and executes no
+//! image) are DLL acceptance: that is the VM-only Group D path, see
+//! `docs/tasks/P3-dll-acceptance.md` and `docs/tasks/W23-p3-acceptance.md`.
 //!
 //! Licensed `MIT OR Apache-2.0` (RFC 0004).
 
@@ -17,6 +21,7 @@ pub mod ipc;
 pub mod loader;
 pub mod message_loop;
 pub mod pe_preflight;
+pub mod registry;
 pub mod state_bridge;
 
 pub use approval::{ApprovalEntry, ApprovalStore, ApprovalStoreError};
@@ -27,7 +32,9 @@ pub use commands::{
 pub use host_window::*;
 pub use ipc::*;
 pub use loader::{
-    DspModuleInfo, LoadedPlugin, PluginLoadError, load_plugin, load_plugin_with_store,
+    DspModuleInfo, GeneralModuleInfo, LoadedPlugin, PluginConfigError, PluginLoadError,
+    load_plugin, load_plugin_with_store,
 };
 pub use message_loop::*;
+pub use registry::{PluginRegistry, RegistryConfigError, accept_loaded_kind};
 pub use rustamp_plugin_abi::common;

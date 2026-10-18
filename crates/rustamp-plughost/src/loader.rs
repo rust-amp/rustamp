@@ -30,6 +30,13 @@
 //! 9. **Unload policy**: at shutdown, calls `quit()` on loaded plugins in reverse
 //!    order (S09 §3.5 line 166, §7.2 line 380); input and general DLLs are NOT freed
 //!    at shutdown because plugins may have subclassed windows (S09 §1 line 46).
+//!    Reverse order across several plugins is [`crate::registry::PluginRegistry`]'s
+//!    job; a single [`LoadedPlugin`] only quits itself.
+//! 10. **Configuration**: [`LoadedPlugin::config`] calls a general plugin's
+//!     `config()` on the UI thread (S09 §7.1 offset 0x0C). Callback slots are
+//!     reported through [`LoadedPlugin::general_info`] / [`LoadedPlugin::dsp_info`]
+//!     and never enforced by this loader: S09 §7 requires no general plugin to
+//!     provide one, and a null slot is refused, never transmuted.
 //!
 //! Structural preflight is NOT a malware detector or approval gate. A valid
 //! trusted DLL and its dependencies can run TLS/DllMain during LoadLibraryExW,
@@ -45,14 +52,15 @@ use crate::pe_preflight::PePreflightError;
 use rustamp_plugin_abi::PluginKind;
 #[cfg(any(windows, test))]
 use rustamp_plugin_abi::common::DSP_VERSION;
+#[cfg(any(windows, test))]
+use rustamp_plugin_abi::common::{GEN_VERSION, read_c_string_lossy};
 #[cfg(windows)]
 use rustamp_plugin_abi::common::{
-    GEN_VERSION, IN_VERSION, IN_VERSION_FLAG_INIT_STATUS, IN_VERSION_FLAG_WIDE_FILENAMES,
-    read_c_string_lossy,
+    IN_VERSION, IN_VERSION_FLAG_INIT_STATUS, IN_VERSION_FLAG_WIDE_FILENAMES,
 };
 #[cfg(any(windows, test))]
 use rustamp_plugin_abi::dsp::{DspHeader, DspModule};
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use rustamp_plugin_abi::general::GeneralPlugin;
 #[cfg(windows)]
 use rustamp_plugin_abi::input::InModule;
@@ -400,6 +408,83 @@ unsafe fn init_dsp_module(
 }
 
 // ---------------------------------------------------------------------------
+// General-purpose plugin initialization (S09 §7)
+// ---------------------------------------------------------------------------
+
+/// What actually happened while a general-purpose module was initialized.
+///
+/// `init_result` is the raw `int` the plugin returned, recorded and **not**
+/// interpreted: the role of a non-zero return in 2.95 is S09 U-8 and stays
+/// open (P3 §5.4). `init_called` is false when the plugin supplied no `init`
+/// slot, so a skipped call is never reported as a successful initialization.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct GeneralInit {
+    module: *mut GeneralPlugin,
+    init_called: bool,
+    init_result: core::ffi::c_int,
+}
+
+/// Validate and initialize a general-purpose plugin module (S09 §7.1, §7.2).
+///
+/// Mirrors [`init_dsp_module`]: the version is checked, the two host-filled
+/// members are written, and `init` is called — in that order, all on the
+/// caller's thread, which must be the UI thread owning the host window
+/// (S09 §7.2 line 377).
+///
+/// Callback **slots are reported, never enforced**: S09 §7 does not require a
+/// general plugin to create a window, subclass, or provide `config`, so no
+/// universal rule is invented here (P3 §3). Requiring the slots is the
+/// acceptance runner's job, through [`LoadedPlugin::general_info`], before it
+/// calls the matching callback. A null slot is never transmuted or called.
+///
+/// # Safety
+///
+/// `module` must be null or point at a live `winampGeneralPurposePlugin` in
+/// the mapped plugin's static storage (S09 §0). `host_hwnd` must be the real
+/// main-window handle and `hinstance` the plugin's own module handle. The
+/// plugin's `init` runs here on the caller's thread.
+#[cfg(any(windows, test))]
+unsafe fn init_general_module(
+    module: *mut GeneralPlugin,
+    host_hwnd: usize,
+    hinstance: *mut core::ffi::c_void,
+) -> Result<GeneralInit, PluginLoadError> {
+    if module.is_null() {
+        return Err(PluginLoadError::NullModule);
+    }
+    // SAFETY: caller guarantees a live module for these reads.
+    let version = unsafe { (*module).version };
+    // S09 §7.1 line 367: 0x10 in 2.95; 0x11 is 5.x-only. Checked before any
+    // host field is written and before `init` can run.
+    if version != GEN_VERSION {
+        return Err(PluginLoadError::UnsupportedVersion {
+            kind: PluginKind::General,
+            actual: version,
+            expected: GEN_VERSION,
+        });
+    }
+    // S09 §7.1 lines 372–373: the host fills these two before init().
+    // SAFETY: live module in plugin static data.
+    unsafe {
+        (*module).parent_window = host_hwnd as *mut core::ffi::c_void;
+        (*module).dll_instance = hinstance;
+    }
+    let mut init_called = false;
+    let mut init_result = 0;
+    // SAFETY: cdecl, no arguments (S09 §7.1 offset 0x08), non-null slot.
+    if let Some(init) = unsafe { (*module).init } {
+        init_called = true;
+        init_result = unsafe { init() };
+    }
+    Ok(GeneralInit {
+        module,
+        init_called,
+        init_result,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Error and Result Types
 // ---------------------------------------------------------------------------
 
@@ -498,14 +583,53 @@ impl std::error::Error for PluginLoadError {
 // LoadedPlugin
 // ---------------------------------------------------------------------------
 
+/// Why a plugin's configuration callback was not invoked.
+///
+/// Opening a configuration dialog is a UI action, so a refusal here is always
+/// returned to the caller rather than guessed at: nothing is ever called
+/// through a null slot (S09 §0, P3 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginConfigError {
+    /// The plugin supplied no `config` callback. S09 §7 does not require one,
+    /// so this is a fact about this plugin, not a verdict on its validity.
+    MissingCallback,
+    /// `quit` already ran (or `init` never did): the plugin is not live.
+    NotInitialized,
+    /// This kind's configuration is not routed through the host here. A DSP
+    /// module's `config` opens a dialog and stays deliberately uninvoked
+    /// (see `tests/dsp_acceptance.rs`); input and output are their own cards.
+    WrongKind(PluginKind),
+}
+
+impl fmt::Display for PluginConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingCallback => {
+                f.write_str("plugin supplied no config callback; nothing was called")
+            }
+            Self::NotInitialized => f.write_str("plugin is not initialized; config was not called"),
+            Self::WrongKind(kind) => write!(
+                f,
+                "config is not routed for a {kind:?} plugin; nothing was called"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PluginConfigError {}
+
 #[derive(Debug)]
 enum LoadedPluginInner {
     #[cfg(windows)]
     Input { module: *mut InModule },
     #[cfg(windows)]
     Dsp { module: *mut DspModule },
-    #[cfg(windows)]
-    General { module: *mut GeneralPlugin },
+    #[cfg(any(windows, test))]
+    General {
+        module: *mut GeneralPlugin,
+        init_called: bool,
+        init_result: core::ffi::c_int,
+    },
     #[allow(dead_code)]
     Unsupported,
 }
@@ -580,8 +704,8 @@ impl LoadedPlugin {
                     clear_active_dsp_module(module);
                 }
             }
-            #[cfg(windows)]
-            LoadedPluginInner::General { module } => {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::General { module, .. } => {
                 if !module.is_null() {
                     // SAFETY: module pointer was verified non-null at load time.
                     if let Some(quit_fn) = unsafe { (*module).quit } {
@@ -593,6 +717,77 @@ impl LoadedPlugin {
             LoadedPluginInner::Unsupported => {}
         }
         self.initialized = false;
+    }
+
+    /// Host-visible state of a loaded general-purpose module, read back out of
+    /// the plugin's own module struct. `None` for any other plugin kind.
+    ///
+    /// This is what an acceptance runner checks **before** it calls anything
+    /// (P3 §4 step 4, §3): the `init`/`config`/`quit` slots as the plugin
+    /// supplied them, the two members the host filled before `init`, and
+    /// whether `init` actually ran and what it returned. A missing slot is a
+    /// fixture/precondition fact reported here, not a refusal invented in the
+    /// loader. The struct lives in plugin static data, so this stays readable
+    /// after [`quit`](Self::quit) (the mapping is retained, S09 §1 line 46).
+    pub fn general_info(&self) -> Option<GeneralModuleInfo> {
+        match self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::General {
+                module,
+                init_called,
+                init_result,
+            } if !module.is_null() => {
+                // SAFETY: the module pointer was verified non-null at load time
+                // and points into plugin static data of the retained mapping.
+                let m = unsafe { *module };
+                Some(GeneralModuleInfo {
+                    has_init: m.init.is_some(),
+                    has_config: m.config.is_some(),
+                    has_quit: m.quit.is_some(),
+                    parent_window: m.parent_window as usize,
+                    dll_instance: m.dll_instance as usize,
+                    init_called,
+                    init_result,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Open a general-purpose plugin's configuration dialog: call its `config`
+    /// callback with no arguments (S09 §7.1 offset 0x0C, §7.2 "config on the UI
+    /// thread"; P3 §4 step 9).
+    ///
+    /// Must be called on the UI thread that owns the host window, which is the
+    /// parent the plugin was handed before `init`. The call is synchronous: a
+    /// modal dialog returns only when the plugin closes it, so the caller must
+    /// expect this to block and must keep pumping afterwards (see
+    /// [`crate::message_loop::pump_bounded`]). A null slot, a plugin that is
+    /// not live, and any other kind are all refused without calling anything;
+    /// S09 U-15 (the modal/parent context of a general Config in 2.95) stays
+    /// open, so no parent or modality is forced here beyond the handed parent.
+    pub fn config(&self) -> Result<(), PluginConfigError> {
+        match self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::General { module, .. } => {
+                if !self.initialized {
+                    return Err(PluginConfigError::NotInitialized);
+                }
+                if module.is_null() {
+                    return Err(PluginConfigError::MissingCallback);
+                }
+                // SAFETY: live module in the retained mapping's static data.
+                let config_slot = unsafe { (*module).config };
+                let Some(config_fn) = config_slot else {
+                    return Err(PluginConfigError::MissingCallback);
+                };
+                // SAFETY: cdecl, no arguments (S09 §7.1 offset 0x0C), non-null
+                // slot, on the UI thread owning the parent window.
+                unsafe { config_fn() };
+                Ok(())
+            }
+            _ => Err(PluginConfigError::WrongKind(self.kind)),
+        }
     }
 
     /// Host-visible state of a loaded DSP module, read from the plugin's own
@@ -665,6 +860,46 @@ impl LoadedPlugin {
             _ => None,
         }
     }
+
+    /// Wrap an already-initialized synthetic general module as a loaded plugin,
+    /// for host-side tests of the general lifecycle (`config`, `quit` order).
+    ///
+    /// No DLL is mapped and no export is resolved, so a test built on this
+    /// proves host logic only — never DLL acceptance (P3 §7 false passes).
+    #[cfg(test)]
+    pub(crate) fn general_for_test(
+        name: &str,
+        module: *mut GeneralPlugin,
+        init_called: bool,
+        init_result: core::ffi::c_int,
+    ) -> Self {
+        Self {
+            path: PathBuf::from(name),
+            kind: PluginKind::General,
+            hinstance: core::ptr::null_mut(),
+            description: name.to_string(),
+            inner: LoadedPluginInner::General {
+                module,
+                init_called,
+                init_result,
+            },
+            initialized: true,
+        }
+    }
+
+    /// A loaded plugin of a kind this host has no bridge for, for tests that
+    /// check what the kind-specific entry points refuse.
+    #[cfg(test)]
+    pub(crate) fn unsupported_for_test(kind: PluginKind) -> Self {
+        Self {
+            path: PathBuf::from("unsupported"),
+            kind,
+            hinstance: core::ptr::null_mut(),
+            description: String::new(),
+            inner: LoadedPluginInner::Unsupported,
+            initialized: true,
+        }
+    }
 }
 
 /// Host-visible state of a loaded DSP module (see [`LoadedPlugin::dsp_info`]).
@@ -684,6 +919,27 @@ pub struct DspModuleInfo {
     pub dll_instance: usize,
     /// The host's `dsp_is_active` answers nonzero for exactly this module.
     pub host_active: bool,
+}
+
+/// Host-visible state of a loaded general-purpose module
+/// (see [`LoadedPlugin::general_info`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneralModuleInfo {
+    /// The plugin supplied an `init` callback (S09 §7.1 offset 0x08).
+    pub has_init: bool,
+    /// The plugin supplied a `config` callback (S09 §7.1 offset 0x0C). S09 §7
+    /// does not require one; our acceptance fixture is required to have one.
+    pub has_config: bool,
+    /// The plugin supplied a `quit` callback (S09 §7.1 offset 0x10).
+    pub has_quit: bool,
+    /// `parent_window` as filled by the host before `init`.
+    pub parent_window: usize,
+    /// `dll_instance` as filled by the host before `init`.
+    pub dll_instance: usize,
+    /// `init` was actually called. False means the slot was null and skipped.
+    pub init_called: bool,
+    /// The raw value `init` returned, recorded and not interpreted (S09 U-8).
+    pub init_result: core::ffi::c_int,
 }
 
 impl Drop for LoadedPlugin {
@@ -1004,40 +1260,30 @@ unsafe fn load_general_module(
     type GenGetModuleFn = unsafe extern "C" fn() -> *mut GeneralPlugin;
     let get_module: GenGetModuleFn = unsafe { core::mem::transmute(proc_ptr) };
     let module_ptr = unsafe { get_module() };
-    if module_ptr.is_null() {
-        return Err(PluginLoadError::NullModule);
-    }
 
-    // S09 §7.1 line 367: 0x10 in 2.95.
-    let version = unsafe { (*module_ptr).version };
-    if version != GEN_VERSION {
-        return Err(PluginLoadError::UnsupportedVersion {
-            kind: PluginKind::General,
-            actual: version,
-            expected: GEN_VERSION,
-        });
-    }
+    // The description is read before init() so a plugin that rewrites its own
+    // pointer during init cannot change what the host reported it as.
+    let description = if module_ptr.is_null() {
+        String::new()
+    } else {
+        // SAFETY: non-null module in the mapped image's static data; a null
+        // description pointer reads as empty and is not dereferenced (S09 §3).
+        unsafe { read_c_string_lossy((*module_ptr).description) }
+    };
 
-    let description = unsafe { read_c_string_lossy((*module_ptr).description) };
-
-    // S09 §7.1 lines 372–373: host fills parent_window and dll_instance before init().
-    unsafe {
-        (*module_ptr).parent_window = host_hwnd as *mut core::ffi::c_void;
-        (*module_ptr).dll_instance = hinstance;
-    }
-
-    // Call init() (S09 §7.1 offset 0x08, §7.2 line 377).
-    if let Some(init_fn) = unsafe { (*module_ptr).init } {
-        let _ = unsafe { init_fn() };
-        // S09 U-8: role of non-zero return value in 2.95 is unverified.
-    }
+    // SAFETY: getter result from the approved mapped image; UI thread.
+    let init = unsafe { init_general_module(module_ptr, host_hwnd, hinstance) }?;
 
     Ok(LoadedPlugin {
         path,
         kind: PluginKind::General,
         hinstance,
         description,
-        inner: LoadedPluginInner::General { module: module_ptr },
+        inner: LoadedPluginInner::General {
+            module: init.module,
+            init_called: init.init_called,
+            init_result: init.init_result,
+        },
         initialized: true,
     })
 }
@@ -1046,6 +1292,7 @@ unsafe fn load_general_module(
 mod tests {
     use super::*;
     use crate::pe_preflight::test_dll;
+    use rustamp_plugin_abi::common::GEN_VERSION_WIDE_DESC;
 
     struct Fixture(PathBuf);
 
@@ -1603,5 +1850,278 @@ mod tests {
         let result =
             unsafe { load_plugin_with_store(&fixture.0, &empty_store, &HostWindow::dummy()) };
         assert!(matches!(result, Err(PluginLoadError::NotApproved)));
+    }
+
+    // -----------------------------------------------------------------------
+    // General-purpose plugin lifecycle (S09 §7, P3 §4 steps 4, 5, 9, 10)
+    //
+    // Synthetic in-process modules, as the DSP tests above use. These prove
+    // the host's own order of operations and refusals; they map no DLL and
+    // resolve no export, so they are NOT DLL acceptance (P3 §7).
+    // -----------------------------------------------------------------------
+
+    thread_local! {
+        /// What the synthetic general callbacks recorded, in call order.
+        static GEN_LOG: std::cell::RefCell<Vec<String>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        /// The module `gen_init_reading_fields` reads its host fields from.
+        static GEN_MODULE: Cell<*mut GeneralPlugin> = const { Cell::new(core::ptr::null_mut()) };
+    }
+
+    fn gen_note(entry: impl Into<String>) {
+        GEN_LOG.with(|log| log.borrow_mut().push(entry.into()));
+    }
+
+    fn gen_log() -> Vec<String> {
+        GEN_LOG.with(|log| log.borrow().clone())
+    }
+
+    fn gen_log_clear() {
+        GEN_LOG.with(|log| log.borrow_mut().clear());
+        GEN_MODULE.with(|slot| slot.set(core::ptr::null_mut()));
+    }
+
+    /// Reads the two members the host must have filled *before* `init` runs,
+    /// so a pass pins the ordering and not just the final field values.
+    unsafe extern "C" fn gen_init_reading_fields() -> core::ffi::c_int {
+        let module = GEN_MODULE.with(|slot| slot.get());
+        if module.is_null() {
+            gen_note("init with no module");
+            return -1;
+        }
+        // SAFETY: the test owns the module and keeps it alive across the call.
+        let (parent, instance) = unsafe { ((*module).parent_window, (*module).dll_instance) };
+        gen_note(format!(
+            "init parent={:#x} instance={:#x}",
+            parent as usize, instance as usize
+        ));
+        0
+    }
+
+    unsafe extern "C" fn gen_init_refusing() -> core::ffi::c_int {
+        gen_note("init");
+        7
+    }
+
+    unsafe extern "C" fn gen_config() {
+        gen_note("config");
+    }
+
+    unsafe extern "C" fn gen_quit() {
+        gen_note("quit");
+    }
+
+    fn gen_module(
+        init: Option<unsafe extern "C" fn() -> core::ffi::c_int>,
+        config: Option<unsafe extern "C" fn()>,
+        quit: Option<unsafe extern "C" fn()>,
+    ) -> GeneralPlugin {
+        GeneralPlugin {
+            version: GEN_VERSION,
+            description: c"synthetic general".as_ptr(),
+            init,
+            config,
+            quit,
+            ..GeneralPlugin::default()
+        }
+    }
+
+    #[test]
+    fn general_version_refusal_precedes_any_callback() {
+        gen_log_clear();
+        let mut module = gen_module(
+            Some(gen_init_reading_fields),
+            Some(gen_config),
+            Some(gen_quit),
+        );
+        // 0x11 is 5.x-only (S09 §7.1); 2.95 expects 0x10 exactly.
+        module.version = GEN_VERSION_WIDE_DESC;
+        GEN_MODULE.with(|slot| slot.set(&mut module));
+        // SAFETY: live stack module; no DLL is involved.
+        let err = unsafe {
+            init_general_module(&mut module, 0x1234, 0x5678_usize as *mut core::ffi::c_void)
+        }
+        .expect_err("version 0x11 must be refused");
+        assert!(
+            matches!(
+                err,
+                PluginLoadError::UnsupportedVersion {
+                    kind: PluginKind::General,
+                    actual: 0x11,
+                    expected: 0x10,
+                }
+            ),
+            "unexpected refusal: {err}"
+        );
+        assert!(
+            gen_log().is_empty(),
+            "no plugin callback may run before the version check, but ran {:?}",
+            gen_log()
+        );
+        // Nothing of the host was published into a module it refused.
+        assert!(module.parent_window.is_null());
+        assert!(module.dll_instance.is_null());
+    }
+
+    #[test]
+    fn general_host_fields_are_visible_to_init_and_recorded() {
+        gen_log_clear();
+        let mut module = gen_module(
+            Some(gen_init_reading_fields),
+            Some(gen_config),
+            Some(gen_quit),
+        );
+        GEN_MODULE.with(|slot| slot.set(&mut module));
+        // SAFETY: live stack module; no DLL is involved.
+        let init = unsafe {
+            init_general_module(&mut module, 0xBEEF, 0xCAFE_usize as *mut core::ffi::c_void)
+        }
+        .expect("a 0x10 module with every slot must initialize");
+        assert!(init.init_called);
+        assert_eq!(init.init_result, 0);
+        // The ordering: init saw both host members already filled.
+        assert_eq!(gen_log(), vec!["init parent=0xbeef instance=0xcafe"]);
+
+        let plugin = LoadedPlugin::general_for_test(
+            "gen_synthetic",
+            &mut module,
+            init.init_called,
+            init.init_result,
+        );
+        assert_eq!(
+            plugin.general_info().expect("general plugins report info"),
+            GeneralModuleInfo {
+                has_init: true,
+                has_config: true,
+                has_quit: true,
+                parent_window: 0xBEEF,
+                dll_instance: 0xCAFE,
+                init_called: true,
+                init_result: 0,
+            }
+        );
+        // A general plugin is not a DSP one and says so.
+        assert_eq!(plugin.dsp_info(), None);
+    }
+
+    #[test]
+    fn general_null_module_and_null_init_are_reported_not_called() {
+        gen_log_clear();
+        // SAFETY: a null module is exactly the input under test.
+        let err = unsafe {
+            init_general_module(
+                core::ptr::null_mut(),
+                0x1,
+                0x2_usize as *mut core::ffi::c_void,
+            )
+        }
+        .expect_err("a null module must be refused");
+        assert!(matches!(err, PluginLoadError::NullModule), "{err}");
+
+        let mut bare = gen_module(None, None, None);
+        // SAFETY: live stack module with every plugin slot null.
+        let init =
+            unsafe { init_general_module(&mut bare, 0x11, 0x22_usize as *mut core::ffi::c_void) }
+                .expect("S09 §7 does not require any slot, so this still loads");
+        assert!(!init.init_called, "a null init must not be reported as run");
+        assert_eq!(init.init_result, 0);
+        assert!(gen_log().is_empty());
+
+        let plugin = LoadedPlugin::general_for_test(
+            "gen_bare",
+            &mut bare,
+            init.init_called,
+            init.init_result,
+        );
+        assert_eq!(
+            plugin.general_info().unwrap(),
+            GeneralModuleInfo {
+                has_init: false,
+                has_config: false,
+                has_quit: false,
+                parent_window: 0x11,
+                dll_instance: 0x22,
+                init_called: false,
+                init_result: 0,
+            },
+            "the absent slots are what an acceptance runner refuses on"
+        );
+    }
+
+    #[test]
+    fn general_init_refusal_is_recorded_and_not_turned_into_a_verdict() {
+        gen_log_clear();
+        let mut module = gen_module(Some(gen_init_refusing), Some(gen_config), Some(gen_quit));
+        // SAFETY: live stack module; no DLL is involved.
+        let init =
+            unsafe { init_general_module(&mut module, 0x30, 0x40_usize as *mut core::ffi::c_void) }
+                .expect("S09 U-8 is open: a non-zero general init is recorded, not a refusal");
+        assert!(init.init_called);
+        assert_eq!(init.init_result, 7, "the plugin's own value must survive");
+        assert_eq!(gen_log(), vec!["init"]);
+    }
+
+    #[test]
+    fn general_config_runs_once_and_a_null_slot_is_refused() {
+        gen_log_clear();
+        let mut module = gen_module(None, Some(gen_config), Some(gen_quit));
+        let plugin = LoadedPlugin::general_for_test("gen_cfg", &mut module, false, 0);
+        assert_eq!(plugin.config(), Ok(()));
+        assert_eq!(gen_log(), vec!["config"], "config must run exactly once");
+
+        gen_log_clear();
+        let mut without = gen_module(None, None, Some(gen_quit));
+        let silent = LoadedPlugin::general_for_test("gen_nocfg", &mut without, false, 0);
+        assert_eq!(silent.config(), Err(PluginConfigError::MissingCallback));
+        assert!(
+            gen_log().is_empty(),
+            "a null config slot must never be called"
+        );
+    }
+
+    #[test]
+    fn general_config_after_quit_and_on_other_kinds_is_refused() {
+        gen_log_clear();
+        let mut module = gen_module(None, Some(gen_config), Some(gen_quit));
+        let mut plugin = LoadedPlugin::general_for_test("gen_cfg", &mut module, false, 0);
+        plugin.quit();
+        assert_eq!(plugin.config(), Err(PluginConfigError::NotInitialized));
+        assert_eq!(gen_log(), vec!["quit"], "only quit may have run");
+
+        // Any other kind is refused without a call: a DSP `config` opens a
+        // dialog and stays deliberately uninvoked here.
+        for kind in [
+            PluginKind::Input,
+            PluginKind::Dsp,
+            PluginKind::Visualization,
+        ] {
+            let other = LoadedPlugin::unsupported_for_test(kind);
+            assert_eq!(other.config(), Err(PluginConfigError::WrongKind(kind)));
+            assert_eq!(other.general_info(), None);
+        }
+    }
+
+    #[test]
+    fn general_quit_runs_once_and_is_idempotent() {
+        gen_log_clear();
+        let mut module = gen_module(
+            Some(gen_init_reading_fields),
+            Some(gen_config),
+            Some(gen_quit),
+        );
+        let mut plugin = LoadedPlugin::general_for_test("gen_quit", &mut module, true, 0);
+        assert!(plugin.is_initialized());
+        plugin.quit();
+        assert!(!plugin.is_initialized());
+        plugin.quit();
+        drop(plugin); // Drop quits too; it must not call the plugin again.
+        assert_eq!(
+            gen_log(),
+            vec!["quit"],
+            "quit must reach the plugin exactly once"
+        );
+        // The module struct stays readable after quit (the mapping is retained).
+        assert_eq!(module.version, GEN_VERSION);
     }
 }
