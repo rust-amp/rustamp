@@ -1420,7 +1420,7 @@ impl App {
     }
 
     /// The stable id of queue entry `index`.
-    fn entry_id_for(&mut self, index: Option<u32>) -> Option<EntryId> {
+    pub(crate) fn entry_id_for(&mut self, index: Option<u32>) -> Option<EntryId> {
         let index = index? as usize;
         if index >= self.engine.queue().len() {
             return None;
@@ -1734,6 +1734,9 @@ impl App {
             })
             .collect();
 
+        // A replacement must not lend the old track's index (or an in-flight
+        // TrackStarted) to an unrelated entry in the new queue.
+        self.clear_entries();
         self.engine.set_queue(queue);
         self.sync_entry_ids();
 
@@ -1856,6 +1859,12 @@ impl App {
         }
         self.entry_ids = new_ids;
         self.engine.set_queue(new_queue);
+        // Keep a surviving current entry by identity, not by its former row.
+        // Removing it clears Current even when another entry takes that index.
+        let current = playing_id
+            .and_then(|id| self.entry_ids.iter().position(|entry| *entry == id))
+            .map(|index| index as u32);
+        self.engine.set_current_index(current);
         self.sync_playlist_entries();
     }
 
@@ -1865,6 +1874,7 @@ impl App {
         }
         self.entry_ids.clear();
         self.engine.set_queue(Vec::new());
+        self.engine.set_current_index(None);
         self.sync_playlist_entries();
     }
 }

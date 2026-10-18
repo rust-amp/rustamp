@@ -301,7 +301,7 @@ scrollbar.
   its returned command, so it selected nothing. It now explicitly applies
   `SelectOp::All`; every existing pixel assertion is retained, not weakened.
 
-### Required app integration — outside wave123's paths, NOT changed
+### Required app integration — outside wave123's paths, completed by wave124
 
 The dormant `current` field had **no producer at all**. Consequently the new
 renderer can honour `Current` when supplied, but the live player will keep
@@ -322,6 +322,68 @@ selection inference. Add an app-level regression that changes the engine's
 current index while keeping selection fixed, renders, and verifies that the
 `Current` colour follows that id (including an offscreen id and `None`).
 Do not claim the live current-entry colour fixed before this integration.
+
+### Wave124 app integration and stale-entry guard
+
+`App::render_playlist` now applies the exact three-line call above before
+reading `visible_ids()`. The engine owns the current index: explicit playback
+and navigation change it, and `Engine::on_decode_out(TrackStarted)` changes it
+on decoded/natural advancement. Reading it on every paint covers all those
+paths, without trusting selection or a delayed UI metadata event.
+
+**Terminology:** this seam feeds the current **entry id**, not a title string.
+`Current` is a `pledit.txt` ink colour. Row labels already come afresh from each
+queue source's `display()` in `App::playlist_label`; no cached decoded title
+is copied between entries. A populated playlist with no current index gets
+`None` and normal ink throughout. Missing metadata does not suppress the
+source label. An empty label emits no ink (the existing UI contract); it does
+not reuse the previous frame's label. The UI rejects unknown ids, and the app
+mapping also rejects out-of-range indices.
+
+**Necessary extensions to the card:** `entry_id_for` was private to the app
+module, so the suggested call from the sibling playlist module did not
+compile (E0624). Its visibility is now `pub(crate)`, not a public crate API.
+The three-line call alone would also expose
+stale *valid* indices because `Engine::set_queue` does not reset them. The
+app's `remove_entries` now remaps a surviving current entry by stable id, or
+clears the index if that entry was removed. `clear_entries` clears the index,
+so adding new entries later cannot revive it. `load_playlist_file` uses that
+clear path before replacing the queue, stopping an old run and discarding its
+pending decode reports through the existing engine stop path, assigning fresh
+ids and leaving no current entry unless playback is requested. Ordinary Stop
+still keeps the engine's current entry; this is not a playing-only marker.
+No core or engine contract was changed.
+
+Four new headless app regressions pin actual rendered row ink and background:
+selection stays fixed while current moves on/off the visible page or becomes
+`None`; a populated pre-play list has no current row; an empty source label
+does not retain old ink; removal before/current, clear-and-add and replacing
+a playlist without playback cannot lend Current to another entry. They use
+the existing built-in skin and pixel assertions, not golden files. They are
+compiled by clippy but **not executed by this lane**. The orchestrator must
+run them in its interactive-session VM suite. A desktop is still required to
+confirm that the live presented window follows playback and looks correct;
+the four pending golden reviews below remain entirely with the orchestrator.
+
+Worktree: `C:\Users\micro\.local\share\opencode\worktree\26de0e\wave124-title`.
+Owned edits: `crates/rustamp-app/src/app.rs`,
+`crates/rustamp-app/src/playlist_window.rs` and this card only. Sources: this
+card, S06 §2, S17 §5 and the repository's app/UI/engine code. No dirty-room
+material, Winamp source, SDK headers or disassembly was read. No dependencies,
+downloads, reference runs, VM/broker calls, test execution, golden changes or
+git writes were made. Host compile gates are not runtime or visual acceptance.
+
+Wave124 final gates (offline; target and compiler temporary files confined to
+this worktree; each exit captured immediately into its own variable):
+
+| Gate | Exit |
+|---|---|
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 0 |
+| `cargo build --workspace` | 0 |
+
+`git -C D:\code\Rustamp status --short` returned no entries (exit 0), with
+optional locks disabled. No canonical checkout file was edited.
 
 ### Golden handover — review in the guest before blessing
 
@@ -475,9 +537,9 @@ accelerators the OS draws.
 2. **Resolved by wave123:** `crates/rustamp-skin/assets/rust-theme/pledit.txt`
    and its generator now use the exact replacement in §6.
 3. **Resolved without a `rustamp-gfx` edit:** wave123's UI-local glyph mask
-   and tint honour `Normal` and `Current`. The app must still supply the
-   current id; the exact three-line integration and four pending goldens are
-   documented in §6. These app/golden changes were NOT made by wave123.
+    and tint honour `Normal` and `Current`. Wave124 now supplies the current id
+    from the app with stale-index guards; see §6. The four pending goldens still
+    need the orchestrator's guest review. Neither change was made by wave123.
 4. Documentation that still describes the retired menu window:
    `docs/tasks/N12-window-ansi.md:87`, `docs/tasks/X5-smoke-window.md:38,48`
    (both mention the `Rustamp Menu` window title),

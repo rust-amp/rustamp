@@ -182,6 +182,11 @@ impl App {
 
     /// Renders one frame of the playlist window.
     pub fn render_playlist(&mut self) -> Image {
+        // Playback, not selection, owns Current (S17 section 5). Read the
+        // engine on every paint, including natural advancement and no track.
+        let index = self.engine().current_index();
+        let current = self.entry_id_for(index);
+        self.playlist.set_current(current);
         let ids = self.playlist.visible_ids();
         let labels: Vec<String> = ids.iter().map(|id| self.playlist_label(*id)).collect();
         let focused = self.focused_for_playlist();
@@ -362,6 +367,127 @@ mod tests {
             play: false,
         })
         .expect("AddItems applies");
+    }
+
+    /// Check actual row ink through the app's production render path, without
+    /// golden files or a desktop. None must overwrite any previous marker.
+    fn assert_current_frame(app: &mut App, current: Option<EntryId>) {
+        let frame = app.render_playlist();
+        assert_eq!(app.playlist().current(), current);
+        let style = app.skin.skin().pledit();
+        assert_ne!(style.normal, style.current);
+        let selected = app.playlist().selected_ids();
+        for (row, id) in app.playlist().visible_ids().iter().enumerate() {
+            let rect = rustamp_ui::playlist_window::row_rect(row).unwrap();
+            let ink = if current == Some(*id) {
+                style.current
+            } else {
+                style.normal
+            };
+            let bg = if selected.contains(id) {
+                style.selected_bg
+            } else {
+                style.normal_bg
+            };
+            let ink = [ink[0], ink[1], ink[2], 255];
+            let bg = [bg[0], bg[1], bg[2], 255];
+            let mut ink_count = 0;
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right() {
+                    let pixel = frame.pixel(x, y).unwrap();
+                    assert!(pixel == ink || pixel == bg, "row {row}: {pixel:?}");
+                    ink_count += usize::from(pixel == ink);
+                }
+            }
+            assert!(ink_count > 0, "the queue label must render in row {row}");
+        }
+    }
+
+    #[test]
+    fn current_row_ink_follows_the_engine_without_selecting_or_scrolling() {
+        let mut app = test_app();
+        assert_current_frame(&mut app, None);
+        add_entries(&mut app, 8);
+        app.submit(Command::Select(SelectOp::Set(vec![EntryId(0)])))
+            .unwrap();
+        // A populated, selected playlist is not evidence of playback. There
+        // is no decoded metadata; labels still come from each queue source.
+        assert_eq!(app.engine().current_index(), None);
+        assert_current_frame(&mut app, None);
+        for index in [Some(1), Some(0), Some(5), None] {
+            app.engine_mut().set_current_index(index);
+            assert_current_frame(&mut app, index.map(|i| EntryId(u64::from(i))));
+            assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+            assert_eq!(app.playlist().first_visible(), 0);
+        }
+        app.playlist.scroll_to(4);
+        for index in [Some(5), Some(1), None, Some(99)] {
+            app.engine_mut().set_current_index(index);
+            let current = index.filter(|i| *i < 8).map(|i| EntryId(u64::from(i)));
+            assert_current_frame(&mut app, current);
+            assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+            assert_eq!(app.playlist().first_visible(), 4);
+        }
+    }
+
+    #[test]
+    fn an_empty_queue_label_does_not_reuse_the_previous_title() {
+        let mut app = test_app();
+        add_entries(&mut app, 1);
+        app.engine_mut().set_current_index(Some(0));
+        assert_current_frame(&mut app, Some(EntryId(0)));
+        // No playback or metadata: directly exercise the existing empty-label
+        // renderer contract after a frame that had visible title ink.
+        app.engine_mut()
+            .set_queue(vec![rustamp_audio::TrackSource::Url(String::new())]);
+        let frame = app.render_playlist();
+        assert_eq!(app.playlist().current(), Some(EntryId(0)));
+        let rect = rustamp_ui::playlist_window::row_rect(0).unwrap();
+        let bg = app.skin.skin().pledit().normal_bg;
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                assert_eq!(frame.pixel(x, y), Some([bg[0], bg[1], bg[2], 255]));
+            }
+        }
+    }
+
+    #[test]
+    fn queue_edits_never_lend_a_stale_current_index_to_another_entry() {
+        let mut app = test_app();
+        add_entries(&mut app, 4);
+        app.engine_mut().set_current_index(Some(2));
+        assert_current_frame(&mut app, Some(EntryId(2)));
+        // Removing an earlier row moves the index, not the current identity.
+        app.submit(Command::Remove(vec![EntryId(0)])).unwrap();
+        assert_eq!(app.engine().current_index(), Some(1));
+        assert_current_frame(&mut app, Some(EntryId(2)));
+        // Entry 3 now takes index 1 but must not inherit Current.
+        app.submit(Command::Remove(vec![EntryId(2)])).unwrap();
+        assert_eq!(app.engine().current_index(), None);
+        assert_current_frame(&mut app, None);
+        app.engine_mut().set_current_index(Some(0));
+        assert_current_frame(&mut app, Some(EntryId(1)));
+        app.submit(Command::Clear).unwrap();
+        assert_current_frame(&mut app, None);
+        add_entries(&mut app, 2);
+        assert_eq!(app.engine().current_index(), None);
+        assert_current_frame(&mut app, None);
+    }
+
+    #[test]
+    fn replacing_the_playlist_without_playing_clears_current_and_old_ids() {
+        let mut app = test_app();
+        add_entries(&mut app, 2);
+        app.engine_mut().set_current_index(Some(1));
+        assert_current_frame(&mut app, Some(EntryId(1)));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replacement.m3u");
+        std::fs::write(&path, "#EXTM3U\nreplacement0.mp3\nreplacement1.mp3\n").unwrap();
+        app.load_playlist_file(&path, false).unwrap();
+        assert_eq!(app.engine().current_index(), None);
+        assert_eq!(app.playlist().len(), 2);
+        assert_eq!(app.playlist().visible_ids(), vec![EntryId(2), EntryId(3)]);
+        assert_current_frame(&mut app, None);
     }
 
     /// The drag-and-drop defect: dropping files on the playlist window did
