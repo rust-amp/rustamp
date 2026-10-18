@@ -321,6 +321,30 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## The packaging path is proven end to end on the host (2026-10-18 20:25)
+
+A dry run from `6922e0a` into a clearly named practice directory, so that it could
+not be mistaken for the release artefact:
+
+- **`cargo xtask package --release --out ...` exited 0.** The player is x86_64
+  with its two residents bundled beside it, the host is i686, the plugin host is
+  bundled into both, the manifests are schema 3, and a zip with a checksum beside
+  it was written. The release ID is `rustamp-0.1.0+2026-10-18.6922e0a` with
+  product version `0.1.0`, so step 7's version consistency holds.
+- **`cargo xtask package --check --out ...` exited 0**: layout, manifests, notices,
+  the PE import tables of all five executables and the zip format and checksum all
+  verified, with no binary executed.
+- **Every shipped executable imports only Windows system DLLs** - no CRT DLL, no
+  VC redist payload - and the host closure is GPL-free, which is the check that
+  matters most for a release.
+- What is **not** proven is the first launch on a clean OS, which is step 13, and
+  that is exactly the gap the readiness audit named.
+
+**A documentation defect found by doing it:** the release plan gives step 10 as
+`cargo xtask pe-imports` with no arguments, and the tool refuses an empty file
+list, so the documented command fails. The real packaged check is the integrated
+one in `package --check`. The plan is corrected.
+
 ## The queue had a stale line, and a lane proved it instead of building a duplicate (2026-10-18 20:05)
 
 Two lanes finished and both are merged (`aa107aa` mediahost, `586a780` the golden
