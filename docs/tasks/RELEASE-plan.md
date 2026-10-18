@@ -40,27 +40,29 @@ repeated VM work.
 | Owner | Starts the VM job (VM access is the owner's broker; `docs/notes/vm-run-tests.ps1:6-10` splits unelevated compile/stage from the elevated VM step). |
 | May claim without it | Nothing about running. "A folder that the layout audit accepts" is the ceiling. |
 
-### G1. Licence inventory that must ship (do this first of the real items — it is the cheapest and the only one that is a legal blocker)
+### G1. Licence inventory that must ship (Implemented in X10 — card `docs/tasks/X10-release-zip.md`)
 
 | | |
 |---|---|
-| Missing | The package ships exactly the GPL set beside the player (`LICENSE`, `PLUGIN-EXCEPTION.md`) and the permissive set beside the host (`LICENSE-MIT`, `LICENSE-APACHE`) — nothing else. `audit_package_layout` **rejects any extra file** (`package.rs:860-894,907-955`), so `THIRD_PARTY.md` cannot be added without changing the audit. No dependency licence texts or copyright notices travel with the binaries, no webamp MIT notice (`THIRD_PARTY.md:10`), no source-offer/source-delivery text for the GPL player, no statement on the static Microsoft CRT's redistribution terms. X1 lists all four as "still need an external release-owner review/bundle" (`X1-package-runtime.md:115-120`); CONTRIBUTING says the automatic check "is not legal clearance" (`CONTRIBUTING.md:77-83`). |
-| Cost | M. Generating and shipping texts is S (a `THIRD_PARTY`/notices file in each side of the layout, plus the matching allowlist and audit edit in `package.rs` and its tests). The *review* is the real cost and is not an engineering task. |
-| Depends on | The licence auditor (`.github/scripts/license-audit.py`, `check-permissive-licenses.sh`) and `Cargo.lock`; a cold checkout needs an authorised `cargo fetch --locked` (`CONTRIBUTING.md:69-72`). A per-side split: the host folder must stay GPL-free, so its notices must list only host-closure crates. |
-| This host | Run the audit, regenerate the inventory (`python .github/scripts/license-audit.py --inventory`), diff it against the marked block of `THIRD_PARTY.md`; write the bundling change; extend the layout audit and its tests; ship `NOTICES` files in both sides. Check that every dependency licence *text* (not just the SPDX identifier) is present — the auditor is metadata-only. |
-| Owner | The legal call: GPL-3.0-or-later player + PLUGIN-EXCEPTION wording, the source-offer form (written offer vs. hosting source beside the download), whether the static CRT and any Windows-SDK-derived import libraries impose notice terms, and sign-off that the exception is compatible with every GPL-side dependency (`CONTRIBUTING.md:77-83` names that explicitly as unchecked). |
-| May claim without it | "Declared licences of the dependency graph pass an automated allowlist check." Not: "licence-compliant", "cleared", or "legally reviewed". |
+| Status | **Implemented in X10.** The packaging tool (`xtask/src/package.rs`) now generates and audits the complete license inventory and required notices. The layout audit expects rather than refuses `THIRD_PARTY.md` across top-level, player, and host directories. |
+| Missing | Previously missing texts and notices. Now shipped: `player/THIRD_PARTY.md` ships the GPL-3.0 §6 written source offer (repo and release tag links), static MSVC CRT redistribution terms, Webamp MIT skin-table attribution, Symphonia MPL-2.0 notice & full 374-line license text, canonical permissive licenses, and full `Cargo.lock` inventory (302 crates). `host/THIRD_PARTY.md` ships strictly permissive terms, static CRT terms, canonical MIT/Apache texts, and the 35-package host normal closure inventory. Audited by `audit_host_dir` for zero copyleft/MPL contamination. |
+| Cost | Done (S–M). |
+| Depends on | `Cargo.lock`, `THIRD_PARTY.md`, `xtask/src/package.rs`. |
+| This host | Packaging and layout audit implemented and validated by `cargo xtask package --check`. |
+| Owner | Legal sign-off remains external, but all mechanical obligations and texts are now packaged and shipped. |
+| May claim | "Ships complete third-party license notices, dependency inventories, static CRT terms, and GPL-3 §6 written source offer." |
 
-### G2. Version numbering and release notes
+### G2. Version numbering and release notes (Implemented in X10 — card `docs/tasks/X10-release-zip.md`)
 
 | | |
 |---|---|
-| Missing | No version policy is written down. The workspace sits at `0.0.1` (`Cargo.toml:32`), never bumped; the package manifest records **no product version and no commit** (`package.rs:563-660`; fields: schema_version, generated_by, profile, runtime, per-package blocks); the beta is identified only by a dated folder name and a card (`BETA-build.md:3-4`). No `CHANGELOG`; the repository root has none (listed at read time: README, LICENSE*, PLUGIN-EXCEPTION, THIRD_PARTY, CLEANROOM, CONTRIBUTING, AGENTS). The QUICKSTART is stale against the tree (it says "UI changes are not saved by this beta" at `package.rs:766`, while config now saves on clean exit — `BETA-readiness-2.md:42`), so release notes must be written from the tree at the release commit, not copied. |
-| Cost | S for the rule + manifest fields + a notes template; M for writing honest notes each release. |
-| Depends on | §3 (the rule). A manifest schema change is a `package.rs` edit and bumps the manifest `schema_version` (currently 2). |
-| This host | Everything: write the rule, add `product_version`, `commit`, `protocol_version`, `config_version` to the manifest, generate notes from `git log` plus the proof state. |
-| Owner | Choosing the first number and the naming (§3 is a proposal, not a decision). |
-| May claim without it | Nothing is lost by *not* claiming; but a package without a version cannot be reported against, so no bug report can honestly name what it ran. |
+| Status | **Implemented in X10.** Version policy §3 implemented in `xtask/src/package.rs` with manifest schema bumped to version 3. Release notes template created in `docs/tasks/RELEASE-notes-template.md`. |
+| Missing | Previously unstamped. Now stamped: `product_version` dynamically read from `Cargo.toml` (`0.0.1`), `commit` and `commit_short` read from headless git, `release_id` formatted as `rustamp-<version>+<date>.<short_commit>`, IPC `protocol_version: 4`, and `config_version: 1`. Stale QUICKSTART note removed and replaced with accurate description of `%APPDATA%\Rustamp\rustamp.toml` persistence on clean exit. `package --check` verifies folder name, manifest, and `Cargo.toml` consistency. |
+| Cost | Done (S). |
+| Depends on | `Cargo.toml`, git metadata, `xtask/src/package.rs`. |
+| This host | Implemented and verified via `cargo xtask package --check`. |
+| Owner | Decides when to bump product version in `Cargo.toml`. |
+| May claim | "Manifests and archives carry stamped product version, git commit, protocol version, and config version." |
 
 ### G3. Clean-machine launch proof
 
@@ -73,46 +75,52 @@ repeated VM work.
 | Owner | Builds/approves the clean checkpoint; decides whether a second OS image (Windows 10 vs 11, no WOW64 case) is required; runs anything needing real audio hardware. |
 | May claim without it | "Built with the static MSVC CRT per the build command" — and only that. **Never** "runs on a clean machine". |
 
-### G4. Installer
+### G4. Installer (Resolved by Owner Decision: Portable ZIP on GitHub — card `docs/tasks/X10-release-zip.md`)
 
 | | |
 |---|---|
-| Missing | Everything. The product is a folder of EXEs launched from PowerShell (`package.rs:739-743`). No install location, shortcuts, uninstaller, per-user vs per-machine decision, file associations (X1 says none are implemented), or install-time WOW64 check. |
-| Cost | L (toolchain + decisions + a VM install/uninstall/upgrade matrix). |
-| Depends on | G1 (the installer must carry the notices), G2 (version stamping), G3 (nothing to install until the bytes are proven), and the choice of toolchain. No installer toolchain is present in the repo; **no choice has been made** and none is recommended here as settled. Candidate classes: a plain signed ZIP (no installer at all — the honest minimum), MSIX, MSI (WiX), or an NSIS/Inno-style setup. Each is a download, so each needs the owner's consent (`AGENTS.md` short rules). |
-| This host | Design the install layout and write the uninstall contract; model it in `xtask` as a layout audit like the existing one; draft the VM job (install → launch → uninstall → verify nothing left). Cannot build or run an installer without the toolchain. |
-| Owner | Picks the format; approves any download; decides per-user vs per-machine; decides whether file associations are in scope (they open the "unfinished" file path — `BETA-readiness-2.md:33`). |
-| May claim without it | "Portable folder, unzip and run from PowerShell." That is what the QUICKSTART already says. Do not call it "installed". |
+| Status | **Resolved by Owner Decision:** Portable ZIP published on GitHub. No installer, no registry, no service. Implemented in X10. |
+| Missing | Previously missing archive creation. Now implemented in `xtask/src/package.rs`: pure-Rust APPNOTE.TXT ZIP packager producing `<release_id>.zip` with stored method (deterministic), forward-slash paths, UTF-8 flag, fixed DOS timestamps, and accompanying `<release_id>.zip.sha256` checksum file generated via pure-Rust SHA-256 and CRC-32 engines. Top-level `README.md` and `QUICKSTART.md` provide extraction and usage instructions. |
+| Cost | Done (S–M). Zero external dependencies added. |
+| Depends on | `xtask/src/package.rs`. |
+| This host | Built and verified natively by `cargo xtask package`. |
+| Owner | Decided portable ZIP archive on GitHub; no MSI/Inno/MSIX installer toolchain needed. |
+| May claim | "Portable ZIP archive, extract and run. No installer, no registry keys, no services." |
 
-### G5. Code signing
-
-| | |
-|---|---|
-| Missing | No certificate, no signing step, no timestamp, no verification command. Unsigned binaries trigger SmartScreen/reputation prompts; none has been observed because nothing has run on a clean guest (`BETA-readiness-2.md:246-247`). |
-| Cost | L and recurring: a code-signing certificate (annual, with an identity/organisation validation; EV vs OV is a reputation question), a key-custody decision (modern CA rules push to hardware tokens or a cloud signing service — check the issuer's current terms, not assumed here), and a signing workflow. |
-| Depends on | G4 (what is being signed: the EXEs, the installer, or both) and the final bytes (signing changes the hash, so every hash manifest must be taken **after** signing, and the unsigned hashes are build-only evidence). |
-| This host | Write the signing and verification procedure (`signtool`-class sign + timestamp + verify, as a documented step) and a verify-only check that fails a release candidate whose binaries are unsigned. Cannot sign. |
-| Owner | Everything that is a secret or a purchase: the certificate, the key or token, the account, the timestamp-server choice, and who may sign. The key must never be in the repo, a lane, or a VM image. |
-| May claim without it | "Unsigned. Windows may warn." State this on the download page and in the notes. Never imply publisher identity. |
-
-### G6. Update path
+### G5. Code signing (Resolved by Owner Decision: Unsigned Binaries — card `docs/tasks/X10-release-zip.md`)
 
 | | |
 |---|---|
-| Missing | There is no updater, no release feed, no version check. The packager refuses a non-empty `--out` and never overwrites (`package.rs:843-856`) — deliberately; an in-place upgrade would need a policy for user config (`%APPDATA%\Rustamp\rustamp.toml`, `package.rs:765`) that this repo has only partly defined (`CONFIG_VERSION = 1`, `crates/rustamp-core/src/config.rs:15`; an unknown `version` is exercised at `config.rs:213`, the migration behaviour was not read here). |
-| Cost | S for the honest manual path; L for an in-app updater (network code, a signing-key trust root, rollback — a security-sensitive feature that should not be built before signing exists). |
-| Depends on | G2 (versions to compare), G5 (an updater without signature verification is a remote-code-execution path), G4 (replace-in-place needs an install location). |
-| This host | Define the manual path: each release is a new folder named by §3; config is never touched by the package; a release note says how to move. Verify with a headless check that a config written by version N loads under N+1 (config round-trip tests already exist for `Gen(n)`, `BETA-readiness-2.md:42`). |
-| Owner | Whether an in-app updater is wanted at all; hosting of the feed; the signing root of trust. |
-| May claim without it | "No automatic updates. Download the new folder." Do not mention "update available" anywhere until a feed exists. |
+| Status | **Resolved by Owner Decision:** Binaries remain unsigned. No Authenticode certificate. Stated honestly in release notes and documentation. |
+| Missing | Commercial code-signing certificate is not purchased. Releases state honestly that binaries are unsigned, explaining Windows Defender SmartScreen ("Windows protected your PC") behavior, providing click-through instructions ("More info" -> "Run anyway"), and offering `.sha256` checksum files so users can verify archive integrity independently. |
+| Cost | Done (documentation and verification checksums in place). |
+| Depends on | Release notes disclosures. |
+| This host | Disclosures documented in `RELEASE-notes-template.md`, `README.md`, and `X10-release-zip.md`. Checksums generated automatically beside archive. |
+| Owner | Decided to ship unsigned releases. |
+| May claim | "Unsigned binaries. Windows SmartScreen may warn; manual bypass instructions and SHA-256 integrity verification provided." Never claim publisher identity or verified security. |
+
+### G6. Update path (Resolved by Owner Decision: No Automatic Updates — card `docs/tasks/X10-release-zip.md`)
+
+| | |
+|---|---|
+| Status | **Resolved by Owner Decision:** No automatic updates. No background service, no telemetry. Stated honestly in release notes. |
+| Missing | Automatic updater is deliberately excluded. The release notes and documentation state that Rustamp has no update daemon or phone-home mechanism. The manual upgrade process is documented: users download newer release ZIPs and extract them; configuration in `%APPDATA%\Rustamp\rustamp.toml` is preserved across manual upgrades. |
+| Cost | Done (documented manual path). |
+| Depends on | Release notes disclosures. |
+| This host | Disclosures documented in `RELEASE-notes-template.md`, `README.md`, and `X10-release-zip.md`. |
+| Owner | Decided no automatic updater. |
+| May claim | "No automatic updates. Upgrades are manual by downloading new release archives. User settings in %APPDATA% are preserved." |
 
 ### Order and critical path
 
-`G0 → G1 → G2 → G3 → (owner decision on format) G4 → G5 → G6`. G1 and G2 can run
-in parallel with G0 because they only need the tree. The honest first release
-(call it a *portable beta*) needs **G0–G3 only**, with G4–G6 stated as absent.
-A release that wants to be called anything stronger than "beta" needs G4–G5 as
-well, and anything promising updates needs G6, which needs G5.
+`G0 → G1 → G2 → G3 → G4 (portable ZIP) → G5 (unsigned) → G6 (manual)`.
+Under the owner's release decision:
+- **G1 (Licence inventory):** Complete (X10).
+- **G2 (Version stamping & notes template):** Complete (X10).
+- **G4 (Portable ZIP & checksum):** Complete (X10).
+- **G5 (Unsigned disclosures):** Complete (X10).
+- **G6 (Manual updates disclosure):** Complete (X10).
+- **G0 & G3:** Remain the only operational verification items requiring VM execution and clean-machine checkpoint inspection.
 
 ---
 
@@ -265,24 +273,18 @@ and at which commit; state what was skipped.
 
 ---
 
-## 6. Suggested lane breakdown (for the orchestrator; not started)
+## 6. Suggested lane breakdown (for the orchestrator)
 
-1. **R1 (docs/xtask, host-only):** manifest gains `product_version`, `commit`,
-   `protocol_version`, `config_version`, bumps manifest `schema_version`;
-   `package --check` verifies agreement. Owned: `xtask/src/package.rs` + its tests
-   (no execution by the lane; the VM runs them).
-2. **R2 (docs/xtask, host-only):** ship per-side notices (GPL side: player, residents
-   and the third-party notices; host side: host closure only); extend the exact
-   layout allowlist and the wrong-side tests.
-3. **R3 (xtask, host-only):** offline PE import check for the four EXEs; sole writer
+1. **R1 & R2 & R5 (Portable ZIP Release & Inventory — Completed in X10, card `docs/tasks/X10-release-zip.md`):**
+   - Manifest schema bumped to 3, gains stamped `product_version`, `commit`, `commit_short`, `release_id`, `protocol_version`, `config_version`.
+   - Layout audit extended to expect `THIRD_PARTY.md` across root, player, and host.
+   - Built-in pure-Rust APPNOTE.TXT ZIP packager and SHA-256 checksum generator producing `<release_id>.zip` and `.sha256`.
+   - Release notes template and honest G5/G6 disclosures created.
+   - Verification checks pass (`cargo xtask package --check`).
+2. **R3 (xtask, host-only):** offline PE import check for the four EXEs; sole writer
    of `artifact_imports_verified`.
-4. **R4 (VM, owner-triggered):** G0 smoke on a fresh build; then the clean-checkpoint
+3. **R4 (VM, owner-triggered):** G0 smoke on a fresh build; then the clean-checkpoint
    run.
-5. **R5 (owner decisions):** format (G4), certificate (G5), legal review (G1),
-   first version number (G2).
-
-R1–R3 touch the same file as the packaging code and must be sequenced, not run in
-parallel.
 
 ---
 
