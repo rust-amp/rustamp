@@ -411,3 +411,11 @@ if ($Filter -like '--ignored*') {
 # A stall must never be reported as a green run: the hung count is a second,
 # independent gate on the exit code, so a counting drift cannot hide a hang.
 if ($result.failed -ne 0 -or $hungCount -ne 0) { exit 1 }
+
+# A run that executed no binary at all proves nothing, so it must never exit
+# zero. Without this gate a filter that matches nothing - or a staging that lost
+# the binaries - prints "ran 0, failed 0, hung 0" and reads exactly like a pass.
+if ($result.ran -eq 0) {
+    Write-Host ("  FAILED: the guest executed no test binary at all, so this run proves nothing (filter: '{0}'; {1} binaries were staged)." -f $Filter, $allBinariesCount)
+    exit 1
+}

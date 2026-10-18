@@ -116,3 +116,48 @@ the same engine/worker divergence the shuffle lane had found.
 
 Started against `6a606ef` with all five fixes merged. Read `[FAIL]` / `[HNG]`
 before drawing any conclusion from it.
+
+**Result:** `ran 82, failed 2, hung 0`. The four r49 reds are closed, and the
+two remaining are **not** code defects. `dsp_roundtrip`
+(`reset_keeps_rings_and_continues`, `dsp_roundtrip.rs:180`) and `real_decode`
+(`end_of_stream_comes_only_after_the_ring_is_drained`, `real_decode.rs:155`)
+both hit the **30 s stall escape** with "the resident stopped delivering" -
+while the very same binaries ran in **0.26 s** and **0.85 s** in r49.
+
+Two hypotheses, both settled:
+
+- **A regression from the five fixes is refuted by the dependency graph.**
+  `rustamp-dechost` and `rustamp-dsphost` depend on `rustamp-core`,
+  `rustamp-decoders`/`rustamp-ipc`, `rustamp-mediahost` and `rustamp-proto` -
+  **not on `rustamp-audio`**, which is the only crate `6a606ef` touched, and the
+  `decoder.rs` change in `c6a0765` is a test helper. A logic defect also fails
+  fast; it does not hang for exactly the stall bound.
+- **The cause is host load.** r50 ran while three lanes were doing
+  `cargo clippy --workspace --all-targets --all-features` and
+  `cargo build --workspace` on the same machine as the 8-vCPU guest. A binary
+  that normally finishes in a quarter of a second took thirty. The 30 s class is
+  therefore **load-induced**, not a property of the guest alone: the upgrade
+  reduced it, but the orchestrator can recreate it by building while the suite
+  runs.
+
+**Rule for every suite run from now on:** the VM suite owns the host. Do not
+start lanes that build, and do not build, while a suite run is in flight. A
+targeted re-run of those two binaries on a quiet host decides it.
+
+## Two runner defects the targeted re-run exposed (2026-10-18 12:00)
+
+The targeted re-run of `dsp_roundtrip` and `real_decode` (`-Filter ... -SkipBuild`)
+did not measure what it was meant to measure, and it failed in two ways worth
+keeping:
+
+- **`-SkipBuild` reuses a stale, partial staging.** The first run died in
+  `Copy-Item` on `target\debug\deps\audit-*.exe`, a file the staged tree still
+  listed but no longer had. It failed loudly (exit 1), which is correct, but the
+  lesson is that `-SkipBuild` is only safe against a staging a full run produced
+  in one piece. A filtered run should stage fresh.
+- **A run that executes nothing reported a pass.** The second run printed
+  `ran 0, failed 0, hung 0` and exited **0**, because the exit gate only looked
+  at `failed` and `hung`. A filter that matches nothing - or a staging that lost
+  the binaries - therefore read exactly like a green run. This is the dangerous
+  one: it can turn "I proved nothing" into "it passed". The runner now fails
+  loudly when `ran` is zero, naming the filter and how many binaries were staged.
