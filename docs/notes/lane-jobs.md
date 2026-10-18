@@ -62,6 +62,21 @@ only when a slot would otherwise sit empty.
 | `paseo-release-checklist` | the eighteen release steps classified and the host-side ones executed with exit codes (`35faaf5`) |
 | `paseo-wave90-vis` | the visualiser clears the moment playback stops, in every mode, and the test no longer dodges the claim (`f7b09ea`) - **two stopped-tail goldens must be re-blessed in the VM** |
 | `wave90-xtask` (Claude) | the full MPL-2.0 and Apache-2.0 texts shipped in the notices, the false placebo sentence in the generated README corrected, and a hand-written PE import inspector that refuses rather than passes (`ff644db`) - **closes release step 10** |
+| `paseo-wave90-audio` | deleted the orphaned `PlaybackOrder` with the layering evidence, restored the previous cycle plan on `Prev`, and kept the NaN sanitizer because RFC 0014 mandates it (`702719c`) |
+
+### Where the W16 review stands
+
+| Finding | Outcome |
+|---|---|
+| W16-F01 engine/worker shuffle divergence | **closed by `6a606ef`**, independently confirmed by the review and re-audited by the audio lane |
+| W16-F02 orphaned `PlaybackOrder` | **closed** (`702719c`) - deleted, with the layering argument recorded |
+| W16-F03 shuffle state at the queue end | **closed by `6a606ef`**, re-audited |
+| W16-F04 `Prev` at a cycle start | **closed** (`702719c`) |
+| W16-F05 mid-run toggle handover | **closed by `6a606ef`**, re-audited |
+| W16-F06 spectrum ghost after stop | **closed** (`f7b09ea`) - two goldens still need re-blessing in the VM |
+| W16-F07 non-finite PCM sanitised before the tap | **refuted, not fixed**: RFC 0014 section 4.5 mandates the sanitizer and a pinned test asserts it, so the decoder is right. What remains is one **contract amendment in `rustamp-ui`**, written out in `docs/tasks/W17-audio-findings.md` section 3: `VisError::NonFinitePcm` is an offline validation invariant, not a live pipeline error, and must not halt playback. Small, and still open. |
+| W16-F08 licence texts | **closed** (`ff644db`) |
+| W16-F09 stale placebo README | **closed** (`ff644db`) |
 
 ## Failed, relaunched elsewhere
 
