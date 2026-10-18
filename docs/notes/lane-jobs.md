@@ -15,9 +15,14 @@ slots looked busy.
 | job id | lane | started | task |
 |---|---|---|---|
 | `9f38e282` / `89c6d365` | Paseo-Antigravity `paseo-wave-review`, `paseo-release-checklist` | 2026-10-18 11:20 | wave review (`W16`) and the executed release checklist - **both merged** (`f634b51`, `35faaf5`) |
-| (Claude, subagent - notifies) | `wave90-xtask` | 2026-10-18 11:45 | W16-F08 (full MPL/Apache texts in the notices), W16-F09 (stale placebo sentence in the generated README), checklist step 10 (an offline PE import inspector so `artifact_imports_verified` can become true) |
 | `paseo-wave90-audio` | Paseo-Antigravity | 2026-10-18 11:45 | W16-F02 (the orphaned `PlaybackOrder`), W16-F04 (`Prev` at a cycle start), W16-F07 (non-finite PCM sanitised before the tap) |
-| `paseo-wave90-vis` | Paseo-Antigravity | 2026-10-18 11:45 | W16-F06 (the spectrum mode never checks freshness, so a stop does not clear the screen; the test dodges it by switching mode) |
+
+**Outstanding after the merges:** the two stopped-tail goldens
+(`tests/golden/lookalike/vis_stopped_tail.png` and
+`tests/golden/rust-theme/vis_stopped_tail.png`) were rendered under the old
+decaying stop and must be re-blessed **in the VM** before the golden test can be
+green again. Expect them red in the next suite run, and do not read that as a
+regression.
 
 **Google now starts through Paseo, not the agy bridge** (owner rule, 2026-10-18).
 Paseo agents are watchable (`ls`, `logs`, `attach`, `permit`) and their worktrees
@@ -52,6 +57,8 @@ only when a slot would otherwise sit empty.
 | `wave89-shuffle-reds` | **the engine now owns the shuffle plan** (the worker built a second, divergent one), the stopped navigation, and three waits that did not wait (`6a606ef`) |
 | `paseo-wave-review` | the adversarial wave review, W16 (`f634b51`) |
 | `paseo-release-checklist` | the eighteen release steps classified and the host-side ones executed with exit codes (`35faaf5`) |
+| `paseo-wave90-vis` | the visualiser clears the moment playback stops, in every mode, and the test no longer dodges the claim (`f7b09ea`) - **two stopped-tail goldens must be re-blessed in the VM** |
+| `wave90-xtask` (Claude) | the full MPL-2.0 and Apache-2.0 texts shipped in the notices, the false placebo sentence in the generated README corrected, and a hand-written PE import inspector that refuses rather than passes (`ff644db`) - **closes release step 10** |
 
 ## Failed, relaunched elsewhere
 
