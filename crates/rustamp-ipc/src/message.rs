@@ -26,7 +26,13 @@ use crate::shm::{RingDirection, RingExpect, RingKind, RingRefuseReason};
 ///   the RFC 0007 wake events (`rustamp-ipc`-local, no `Message` change).
 ///   RFC 0005 shipped v2 first; RFC 0006/0007 therefore take v3 to avoid
 ///   breaking existing v2 peers that would mis-decode the new variants.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// * `4`: adds [`Message::DspResetAck`], the acknowledgement that turns
+///   `DspReset` into an ordering fence (RFC 0015). Postcard encodes an enum
+///   by declaration index, so a v3 peer would mis-decode the new variant —
+///   and `DspError`, whose index moves from 26 to 27 — for the same reason
+///   the 0 → 1 and 2 → 3 bumps exist: the mismatch becomes a clean `Hello`
+///   rejection instead of a decode error.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Wire form of [`VisFrame`] (flat vectors, `channel-major`: all samples of
 /// channel 0, then channel 1). Each vector has `VIS_CHANNELS * VIS_SAMPLES` values.
@@ -238,6 +244,10 @@ pub enum Message {
     },
     /// M: clear stage state; rings untouched.
     DspReset,
+    /// H: answer to `DspReset` — the chain state is cleared (RFC 0015).
+    /// This is the delivery fence: `DspSession::reset` returns only after
+    /// the acknowledgement arrives.
+    DspResetAck,
     /// Either: configure failed, a stage died, or the chain broke.
     DspError {
         /// Error description.

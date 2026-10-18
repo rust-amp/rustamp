@@ -155,6 +155,11 @@ impl MediaHost for DspHost {
             Message::DspReset => Err(MediaHostError::NotImplemented(
                 "DspReset not implemented in stub".into(),
             )),
+            // A reply, not a command: the stub never sends DspResetAck, so
+            // receiving one is a protocol violation (RFC 0015).
+            Message::DspResetAck => Err(MediaHostError::InvalidMessage(
+                "DspResetAck is a host-to-player reply; the DSP host does not handle it".into(),
+            )),
             Message::Shutdown => Ok(None),
             _ => Err(MediaHostError::InvalidMessage(format!(
                 "DspHost does not handle {:?}",

@@ -4,8 +4,15 @@
 //! wedged or dead host reaches the bound, and reaching it fails loudly with
 //! the step named — never a pass. Writes go through `write_pcm`
 //! (`write_timeout` with the same bound), so the producer side is closed
-//! too. Only the explicit timeout test requests a short PCM deadline; no
-//! wall-clock assertion decides whether work completed.
+//! too. Only the explicit timeout tests request a short deadline (the PCM
+//! read timeout, and the framework's `CONTROL_WAIT` reset-acknowledgement
+//! bound); no wall-clock assertion decides whether work completed.
+//!
+//! The reset fence (RFC 0015): `DspSession::reset` waits for the host's
+//! `DspResetAck`, so a reset that returns has landed. The fence tests assert
+//! exactly that — the chain's own report is already observable when `reset`
+//! returns, and the wait is still blocked while the host's callback is held
+//! — plus the bounded, loud timeout when no acknowledgement ever comes.
 
 #![cfg(windows)]
 
@@ -14,13 +21,16 @@ mod resident;
 #[path = "support/streams.rs"]
 mod streams;
 
+use std::io::{Read, Write};
 use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use rustamp_ipc::shm::{RingDirection, RingKind};
+use rustamp_ipc::{Message, StreamTransport, Transport};
 use rustamp_mediahost::control::{ControlPeer, Liveness};
 use rustamp_mediahost::dsp::{DspResident, DspSession, ResidentChain, serve_dsp};
-use rustamp_mediahost::pcm::NamedPcmRings;
+use rustamp_mediahost::pcm::{NamedPcmRings, PcmRings};
 use rustamp_mediahost::{MediaHostError, Result};
 use rustamp_proto::host::{DspStageDesc, PcmSpecWire};
 
@@ -89,6 +99,18 @@ fn write_pcm(session: &mut DspSession<NamedPcmRings>, buf: &[f32], step: &str) {
     }
 }
 
+/// Read one `DspResetAck` from a raw player transport, answering liveness
+/// pings on the way; anything else is a protocol violation.
+fn recv_ack<R: Read + Send, W: Write + Send>(player: &mut StreamTransport<R, W>) {
+    loop {
+        match player.recv().unwrap() {
+            Message::Ping(token) => player.send(&Message::Pong(token)).unwrap(),
+            Message::DspResetAck => return,
+            message => panic!("expected DspResetAck, got {message:?}"),
+        }
+    }
+}
+
 struct StatefulResident {
     resets: mpsc::Sender<u32>,
     release_first: Mutex<Option<mpsc::Receiver<()>>>,
@@ -137,6 +159,49 @@ impl ResidentChain for StatefulChain {
 }
 
 #[test]
+fn reset_returns_only_after_the_host_applied_it() {
+    let (resets, observed) = mpsc::channel();
+    let (mut session, done) = start(StatefulResident {
+        resets,
+        release_first: Mutex::new(None),
+    });
+    // No PCM, no hold: the fenced wait returns once the chain state is
+    // cleared — the chain's own report is already there when it does,
+    // with no re-send and no further wait.
+    session.reset().unwrap();
+    assert_eq!(
+        observed.try_recv(),
+        Ok(1),
+        "the fence: the reset must be applied when reset returns"
+    );
+    let generations = session.generations();
+    session.reset().unwrap();
+    assert_eq!(
+        observed.try_recv(),
+        Ok(2),
+        "the fence: the reset must be applied when reset returns"
+    );
+    assert_eq!(
+        session.generations(),
+        generations,
+        "the fence never touches the rings"
+    );
+    // The acknowledgement is consumed by the wait: the stream is undisturbed.
+    let mut out = [0.0; 2];
+    write_pcm(
+        &mut session,
+        &[0.25, -0.25],
+        "the block after the fenced resets",
+    );
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the block after the fenced resets").unwrap(),
+        1
+    );
+    assert_eq!(out, [0.25, -0.25]);
+    finish(session, done);
+}
+
+#[test]
 fn idle_reset_lands_without_pcm_and_clears_history_before_the_next_block() {
     let (resets, observed) = mpsc::channel();
     let (release, held) = mpsc::channel();
@@ -145,22 +210,36 @@ fn idle_reset_lands_without_pcm_and_clears_history_before_the_next_block() {
         release_first: Mutex::new(Some(held)),
     });
     let generations = session.generations();
-    session.reset().unwrap();
+
+    // The first reset is serviced with no PCM at all: the pump polls commands
+    // between its bounded read slices. Its callback is held, so the fenced
+    // wait blocks — a reset is not acknowledged before it is applied.
+    let handle = thread::spawn(move || {
+        session.reset().unwrap();
+        session
+    });
     assert_eq!(
         observed
             .recv_timeout(STALL_WAIT)
-            .expect("stall: the host did not service the first reset instead of hanging"),
+            .expect("stall: the host did not enter the first reset instead of hanging"),
         1
     );
-    // A second reset is queued while the first callback is held. The old
-    // one-command-then-infinite-read loop could never service it without PCM.
-    session.reset().unwrap();
+    assert!(
+        !handle.is_finished(),
+        "the fence: reset must not return while the host's callback is held"
+    );
     release.send(()).unwrap();
+    let mut session = handle
+        .join()
+        .expect("the fenced wait must return once the host applies the reset");
+
+    // The second reset is serviced in order; when it returns, the chain has
+    // already applied it — the count is there with no further wait.
+    session.reset().unwrap();
     assert_eq!(
-        observed
-            .recv_timeout(STALL_WAIT)
-            .expect("stall: the host did not service the second reset instead of hanging"),
-        2
+        observed.try_recv(),
+        Ok(2),
+        "the fence: the reset must be applied when reset returns"
     );
     assert_eq!(session.generations(), generations);
 
@@ -175,12 +254,13 @@ fn idle_reset_lands_without_pcm_and_clears_history_before_the_next_block() {
         1
     );
     assert_eq!(out, [0.25, -0.25]);
+
+    // A mid-stream reset clears the history the running chain accumulated.
     session.reset().unwrap();
     assert_eq!(
-        observed
-            .recv_timeout(STALL_WAIT)
-            .expect("stall: the host did not service the mid-stream reset instead of hanging"),
-        3
+        observed.try_recv(),
+        Ok(3),
+        "the fence: the mid-stream reset must be applied when reset returns"
     );
     write_pcm(
         &mut session,
@@ -207,13 +287,12 @@ fn idle_reset_lands_without_pcm_and_clears_history_before_the_next_block() {
         read_pcm(&mut session, &mut out, "the drained EOS read").unwrap(),
         0
     );
+    // The post-EOS idle loop answers the fence too.
     session.reset().unwrap();
     assert_eq!(
-        observed
-            .recv_timeout(STALL_WAIT)
-            .expect("stall: the host did not service the post-EOS reset instead of hanging"),
-        4,
-        "reset also lands after drained EOS"
+        observed.try_recv(),
+        Ok(4),
+        "the fence: reset also lands after drained EOS"
     );
     assert_eq!(session.generations(), generations);
     assert_eq!(
@@ -221,6 +300,159 @@ fn idle_reset_lands_without_pcm_and_clears_history_before_the_next_block() {
         0
     );
     finish(session, done);
+}
+
+/// The host-side half of the fence: a player may queue several resets
+/// behind a callback that is still running; the pump drains them in order
+/// and answers each with exactly one `DspResetAck` (RFC 0015). Driven over
+/// a raw transport because the session's fenced wait serializes resets by
+/// design — a burst exists only below the session.
+#[test]
+fn queued_resets_are_each_acknowledged_in_order_while_the_host_is_busy() {
+    let (resets, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let resident = StatefulResident {
+        resets,
+        release_first: Mutex::new(Some(held)),
+    };
+    let ((ar, aw), (br, bw)) = streams::streams();
+    let mut player = StreamTransport::new(ar, aw);
+    player.send(&Message::hello()).unwrap();
+    player
+        .send(&Message::DspConfigure {
+            spec: SPEC,
+            stages: Vec::new(),
+        })
+        .unwrap();
+    let offer = NamedPcmRings
+        .create_directed(SPEC, 1, RingDirection::MainToHost)
+        .unwrap();
+    let in_generation = offer.producer.generation();
+    player.send(&offer.message).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(serve_dsp(&host, &NamedPcmRings, &resident));
+    });
+    // The host's ControlPeer queues its own Hello first; consume it (and
+    // answer pings) before the handshake replies, exactly like the raw
+    // decoder mirrors in the pcm_transfer suite.
+    let mut saw_in_ready = false;
+    let back = loop {
+        match player.recv().unwrap() {
+            Message::Hello { .. } => {}
+            Message::Ping(token) => player.send(&Message::Pong(token)).unwrap(),
+            Message::RingReady {
+                kind: RingKind::Pcm,
+                generation,
+            } => {
+                assert_eq!(generation, in_generation, "in-ring ready generation");
+                saw_in_ready = true;
+            }
+            offer @ Message::RingOffer { .. } => {
+                assert!(saw_in_ready, "back-ring offer before the in-ring was ready");
+                break offer;
+            }
+            message => panic!("unexpected handshake message: {message:?}"),
+        }
+    };
+    let back_input = NamedPcmRings
+        .open_directed(&back, SPEC, RingDirection::HostToMain)
+        .unwrap();
+    player
+        .send(&Message::RingReady {
+            kind: RingKind::Pcm,
+            generation: back_input.consumer.generation(),
+        })
+        .unwrap();
+    loop {
+        match player.recv().unwrap() {
+            Message::Ping(token) => player.send(&Message::Pong(token)).unwrap(),
+            Message::DspReady { .. } => break,
+            message => panic!("unexpected post-handshake message: {message:?}"),
+        }
+    }
+
+    // The first reset's callback is held; a second reset queued behind it
+    // must still be serviced, in order, each with exactly one ack.
+    player.send(&Message::DspReset).unwrap();
+    assert_eq!(
+        observed
+            .recv_timeout(STALL_WAIT)
+            .expect("stall: the host did not enter the first reset instead of hanging"),
+        1
+    );
+    player.send(&Message::DspReset).unwrap();
+    release.send(()).unwrap();
+    recv_ack(&mut player);
+    recv_ack(&mut player);
+    assert_eq!(
+        observed
+            .recv_timeout(STALL_WAIT)
+            .expect("stall: the host did not service the queued reset instead of hanging"),
+        2
+    );
+
+    player.send(&Message::Shutdown).unwrap();
+    drop(back_input);
+    drop(offer.producer);
+    drop(player);
+    result
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the host must publish its shutdown outcome instead of hanging")
+        .unwrap();
+}
+
+#[test]
+fn reset_without_an_acknowledgement_is_a_loud_bounded_timeout() {
+    // A resident whose reset never returns: the pump is held inside the
+    // callback, so no DspResetAck can come. The session's bounded wait must
+    // fail loudly (TimedOut) — never a silent pass — and the failure must be
+    // sticky: a late acknowledgement can never surface as an "unexpected
+    // message" on a later write or read.
+    let (resets, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let (mut session, done) = start(StatefulResident {
+        resets,
+        release_first: Mutex::new(Some(held)),
+    });
+    assert!(
+        matches!(session.reset(), Err(MediaHostError::TimedOut)),
+        "a missing acknowledgement is a loud TimedOut, never a silent pass"
+    );
+    // The host did receive and enter the reset — the wait failed because
+    // the acknowledgement never came, not because the message was lost.
+    assert_eq!(
+        observed.try_recv(),
+        Ok(1),
+        "the host must have entered the reset whose acknowledgement never came"
+    );
+    // The failure is sticky and names the fence: later calls fail with the
+    // disconnect, never a race against the late acknowledgement.
+    let error = session.write(&[0.0, 0.0]).unwrap_err();
+    assert!(
+        matches!(error, MediaHostError::Disconnected(_)),
+        "a timed-out reset fails the conversation sticky, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("reset acknowledgement"),
+        "the sticky failure must name the reset acknowledgement, got {error}"
+    );
+    assert!(matches!(
+        session.read(&mut [0.0, 0.0], Some(STALL_WAIT)),
+        Err(MediaHostError::Disconnected(_))
+    ));
+    // Release the wedged callback: the host then sends the late ack into the
+    // failed conversation and ends loud on the player's hang-up.
+    release.send(()).unwrap();
+    drop(session);
+    let outcome = done
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the host must publish its outcome instead of hanging");
+    assert!(
+        outcome.is_err(),
+        "the player hung up on a failed conversation: the host ends loud, never clean, got {outcome:?}"
+    );
 }
 
 #[test]

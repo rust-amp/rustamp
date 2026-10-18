@@ -60,8 +60,10 @@
 //! so answering one over the channel would invent protocol; classic plugins
 //! keep querying the host window in-process instead. `LoadPlugin`,
 //! `CommandToHost`, the ring offers and the RFC 0006 decoder/DSP messages
-//! belong to other hosts or to future cards; acting on them here would be
-//! guessing. See [`crate::state_bridge`] for the same honesty on the surface.
+//! (including the RFC 0015 `DspResetAck` reply, which only a DSP session's
+//! player side expects) belong to other hosts or to future cards; acting on
+//! them here would be guessing. See [`crate::state_bridge`] for the same
+//! honesty on the surface.
 
 use rustamp_ipc::{Message, Transport};
 use rustamp_proto::state::PlayerState;
@@ -323,6 +325,9 @@ mod tests {
                 lparam: 0,
             },
             Message::DspReset,
+            // The RFC 0015 acknowledgement is a host-to-player reply a plugin
+            // host never expects; like DspReset it is ignored and sends nothing.
+            Message::DspResetAck,
         ] {
             let mut states = 0;
             assert_eq!(

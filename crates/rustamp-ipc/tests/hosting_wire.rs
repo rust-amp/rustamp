@@ -1,6 +1,7 @@
 //! The RFC 0006 wire proof: the new hosting [`Message`] variants encode and
 //! decode correctly, and their variant indices are appended after the RFC 0005
-//! block (which ended at `CommandToHost`, index 14).
+//! block (which ended at `CommandToHost`, index 14). RFC 0015's `DspResetAck`
+//! rides in the same DSP block, beside `DspReset`.
 //!
 //! `postcard` encodes an enum by its **declaration index** and a struct
 //! positionally, so "appended" is a byte-level claim.
@@ -18,16 +19,17 @@ fn decode(bytes: &[u8]) -> Message {
 }
 
 /// The pre-0006 protocol had 15 variants (0..=14), with `CommandToHost` at index 14.
-/// RFC 0006 appends 13 new variants (indices 15..=27).
-const RFC_0006_VARIANT_COUNT: usize = 12;
+/// The hosting block is RFC 0006's 12 variants (indices 15..=26) plus RFC
+/// 0015's `DspResetAck` (index 26), which pushed `DspError` to 27.
+const HOSTING_VARIANT_COUNT: usize = 13;
 
 #[test]
-fn protocol_version_is_three() {
-    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 3);
+fn protocol_version_is_four() {
+    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 4);
     assert_eq!(
         rustamp_ipc::Message::hello(),
         rustamp_ipc::Message::Hello {
-            protocol_version: 3,
+            protocol_version: 4,
             pid: std::process::id(),
         }
     );
@@ -227,18 +229,27 @@ fn dsp_reset_roundtrip() {
 }
 
 #[test]
+fn dsp_reset_ack_roundtrip() {
+    let msg = Message::DspResetAck;
+    let bytes = encode(&msg);
+    // Variant index 26 = 0x1a (unit variant; RFC 0015)
+    assert_eq!(bytes, [0x1a]);
+    assert_eq!(decode(&bytes), msg);
+}
+
+#[test]
 fn dsp_error_roundtrip() {
     let msg = Message::DspError {
         message: "stage 'eq' not found".into(),
     };
     let bytes = encode(&msg);
-    // Variant index 26 = 0x1a
-    assert_eq!(bytes[0], 0x1a);
+    // Variant index 27 = 0x1b (moved by RFC 0015's DspResetAck at 0x1a)
+    assert_eq!(bytes[0], 0x1b);
     assert_eq!(decode(&bytes), msg);
 }
 
 #[test]
-fn all_rfc_0006_variants_roundtrip() {
+fn all_hosting_variants_roundtrip() {
     let messages = [
         Message::DecoderOpen {
             location: MediaLocationWire::File("test.mp3".into()),
@@ -287,19 +298,20 @@ fn all_rfc_0006_variants_roundtrip() {
             latency_frames: 512,
         },
         Message::DspReset,
+        Message::DspResetAck,
         Message::DspError {
             message: "dsp error".into(),
         },
     ];
 
     // The array lists `DecoderOpen` twice on purpose (a file location and a URL),
-    // so it has one more entry than there are RFC 0006 variants. What matters is
+    // so it has one more entry than there are hosting variants. What matters is
     // that it covers every one of them.
     let distinct: std::collections::BTreeSet<u8> = messages.iter().map(|m| encode(m)[0]).collect();
     assert_eq!(
         distinct.len(),
-        RFC_0006_VARIANT_COUNT,
-        "every RFC 0006 variant must appear in this round-trip list"
+        HOSTING_VARIANT_COUNT,
+        "every hosting variant (RFC 0006 plus RFC 0015's ack) must appear in this round-trip list"
     );
 
     for msg in messages {
@@ -310,9 +322,11 @@ fn all_rfc_0006_variants_roundtrip() {
 }
 
 #[test]
-fn rfc_0006_variant_indices_are_sequential_after_rfc_0005() {
-    // The first RFC 0006 variant (DecoderOpen) should be at index 15 (0x0f)
-    // because RFC 0005 ended with CommandToHost at index 14 (0x0e).
+fn hosting_variant_indices_are_sequential_after_rfc_0005() {
+    // The first hosting variant (DecoderOpen) should be at index 15 (0x0f)
+    // because RFC 0005 ended with CommandToHost at index 14 (0x0e). The
+    // block is RFC 0006's variants plus RFC 0015's DspResetAck beside
+    // DspReset, so DspError is the last one at index 27 (0x1b).
     let indices: Vec<u8> = [
         Message::DecoderOpen {
             location: MediaLocationWire::File("x".into()),
@@ -352,6 +366,7 @@ fn rfc_0006_variant_indices_are_sequential_after_rfc_0005() {
         },
         Message::DspReady { latency_frames: 0 },
         Message::DspReset,
+        Message::DspResetAck,
         Message::DspError {
             message: "x".into(),
         },
@@ -360,22 +375,23 @@ fn rfc_0006_variant_indices_are_sequential_after_rfc_0005() {
     .map(|msg| encode(msg)[0])
     .collect();
 
-    // Should be 0x0f through 0x1a (15 through 26)
-    let expected: Vec<u8> = (15..=26).collect();
+    // Should be 0x0f through 0x1b (15 through 27)
+    let expected: Vec<u8> = (15..=27).collect();
     assert_eq!(
         indices, expected,
-        "RFC 0006 variants must be appended sequentially"
+        "hosting variants must be appended sequentially"
     );
 }
 
 #[test]
 fn total_message_variant_count() {
     // Pre-0006: 15 variants (0..14)
-    // RFC 0006: 12 variants (15..26) - eight decoder, four DSP
-    // Total: 27 variants (0..26)
+    // Hosting block: 13 variants (15..27) - RFC 0006's twelve plus RFC
+    // 0015's DspResetAck beside DspReset, which moved DspError to 27
+    // Total: 28 variants (0..27)
     let all_indices: std::collections::BTreeSet<u8> = [
         Message::Hello {
-            protocol_version: 3,
+            protocol_version: 4,
             pid: 0,
         },
         Message::Ping(0),
@@ -464,6 +480,7 @@ fn total_message_variant_count() {
         },
         Message::DspReady { latency_frames: 0 },
         Message::DspReset,
+        Message::DspResetAck,
         Message::DspError {
             message: "x".into(),
         },
@@ -472,7 +489,7 @@ fn total_message_variant_count() {
     .map(|msg| encode(msg)[0])
     .collect();
 
-    assert_eq!(all_indices.len(), 27, "exactly 27 variants (0..26)");
+    assert_eq!(all_indices.len(), 28, "exactly 28 variants (0..27)");
     assert_eq!(all_indices.iter().next(), Some(&0x00));
-    assert_eq!(all_indices.iter().next_back(), Some(&0x1a));
+    assert_eq!(all_indices.iter().next_back(), Some(&0x1b));
 }

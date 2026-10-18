@@ -11,6 +11,11 @@
 //! read and closes the back-ring, and the player exposes `Ok(0)` only after
 //! that closed back-ring is drained, then sticks there. A dead host is never
 //! silent EOS: the supervisor fails sticky and every wait turns loud.
+//!
+//! `DspReset` is fenced (RFC 0015): the host answers `DspResetAck` once the
+//! chain state is cleared — at every poll site, including idle after a
+//! drained EOS — and `DspSession::reset` waits for that acknowledgement, so
+//! a reset that returns is a reset that landed.
 
 use std::time::{Duration, Instant};
 
@@ -105,6 +110,8 @@ impl Transition {
 
 /// A reconfigure or shutdown command; `DspReset` is a no-op here (it clears
 /// stage state but never touches rings, so there is nothing to transition).
+/// The acknowledgement is not sent here: `poll_commands` and the post-EOS
+/// idle loop send it after applying the reset (RFC 0015).
 fn command(message: Message) -> Result<Option<Transition>> {
     match message {
         Message::DspConfigure { spec, stages } => {
@@ -112,6 +119,12 @@ fn command(message: Message) -> Result<Option<Transition>> {
         }
         Message::Shutdown => Ok(Some(Transition::Stop)),
         Message::DspReset => Ok(None),
+        // A reply, not a command: a DSP host never receives its own
+        // acknowledgement (RFC 0015). Classified explicitly so a confused
+        // peer fails with the direction rule, not a generic catch-all.
+        Message::DspResetAck => Err(MediaHostError::InvalidMessage(
+            "DspResetAck is a host-to-player reply; the DSP host does not handle it".into(),
+        )),
         message => Err(MediaHostError::InvalidMessage(format!(
             "unexpected DSP command: {message:?}"
         ))),
@@ -125,7 +138,15 @@ fn wait_command(peer: &ControlPeer) -> Result<Message> {
 fn poll_commands(peer: &ControlPeer, chain: &mut dyn ResidentChain) -> Result<Option<Transition>> {
     while let Some(message) = peer.try_recv()? {
         match message {
-            Message::DspReset => chain.reset(),
+            // The acknowledgement is the delivery fence (RFC 0015): it is
+            // sent only after the reset is applied, so the session's `reset`
+            // returns only once the chain state is cleared. One ack per
+            // reset, at every poll site (top of loop, before a block is
+            // processed, during write-back).
+            Message::DspReset => {
+                chain.reset();
+                peer.send(Message::DspResetAck)?;
+            }
             message => {
                 if let Some(transition) = command(message)? {
                     return Ok(Some(transition));
@@ -365,7 +386,13 @@ fn serve_inner<F: PcmRings>(
                 input.0.close();
                 loop {
                     match wait_command(peer)? {
-                        Message::DspReset => chain.reset(),
+                        // Same fence as the pump (RFC 0015): the idle loop
+                        // also answers a reset with DspResetAck, after
+                        // applying it.
+                        Message::DspReset => {
+                            chain.reset();
+                            peer.send(Message::DspResetAck)?;
+                        }
                         message => match command(message)? {
                             Some(Transition::Reconfigure { spec: next, stages }) => {
                                 chain = open_chain(resident, next, &stages)?;
@@ -570,13 +597,41 @@ impl<F: PcmRings> DspSession<F> {
         Ok(())
     }
 
-    /// Queue a stage-state reset without touching rings, including while idle.
-    /// The worker services resets between processing blocks and while waiting
-    /// for PCM/space. This is not an acknowledgement or an ordering fence for
-    /// writes on the independent PCM channel; queued PCM is not discarded.
+    /// Clear the stage state and wait for the host's acknowledgement: the
+    /// delivery fence for the PCM channel (RFC 0015). The worker services
+    /// `DspReset` between processing blocks and while waiting for PCM/space —
+    /// including while idle and after a drained EOS — and answers
+    /// `DspResetAck` once the chain state is cleared; the rings are
+    /// untouched, so queued PCM is never discarded. `reset` returns only
+    /// after that acknowledgement: a returned reset is a landed reset, and
+    /// no block written afterwards can be processed with pre-reset state.
+    ///
+    /// The wait is bounded (`CONTROL_WAIT`, the handshake bound). If the
+    /// acknowledgement never comes, this fails loudly — `TimedOut`, never a
+    /// silent pass — and fails the conversation sticky: the chain's state is
+    /// then unknown (the reset may still land late), so every later call on
+    /// the session returns `Disconnected` naming the reset acknowledgement,
+    /// and a late `DspResetAck` can never be mistaken for an unexpected
+    /// message on a write or read.
     pub fn reset(&mut self) -> Result<()> {
         self.peer.check()?;
-        self.peer.send(Message::DspReset)
+        self.peer.send(Message::DspReset)?;
+        match self.peer.recv(CONTROL_WAIT) {
+            Ok(Message::DspResetAck) => Ok(()),
+            Ok(message) => {
+                let error = MediaHostError::InvalidMessage(format!(
+                    "expected DspResetAck while waiting for the reset fence: {message:?}"
+                ));
+                self.peer.fail(&error.to_string());
+                Err(error)
+            }
+            Err(error @ MediaHostError::TimedOut) => {
+                self.peer
+                    .fail("DSP reset acknowledgement did not arrive in time");
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Replace the chain: close both rings, run a fresh two-ring handshake,
