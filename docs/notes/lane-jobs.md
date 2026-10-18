@@ -321,6 +321,32 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## Phase 1 in the interactive session: 4 of 4 green (2026-10-18 17:40)
+
+```
+gui session 1 as rustamp on DESKTOP-UL3J9H6; screen {X=0,Y=0,Width=1824,Height=768}
+ran 4, failed 0
+  the_equalizer_window_opens_at_its_docked_size_and_position    ok  0.05s
+  the_main_menu_popup_opens_at_the_measured_client_size         ok  0.07s
+  the_playlist_window_opens_docked_below_the_main_window        ok  4.68s
+  the_windowed_player_opens_a_window_inside_the_test_vm         ok  3.02s
+```
+
+**The two predicted winit reds are decided: session-0 artefacts, not defects.**
+`headless` and `playlist_window` pass with a desktop, so the rule the owner set is
+what decided it, and the two tests that only this lane can evidence are now
+green.
+
+Still undecided, and named rather than assumed: the other two reds of the
+`--ignored` pass, the host-window end-to-end test and the 32-bit DLL acceptance
+test, were not among these four. The new default path decides them the same way
+- green there means a session-0 artefact, red there means a real finding.
+
+One environment note from this run: the previous attempt died before any test
+because a stray `rustamp-plughost32.exe` held its own file and the staging was
+refused with access denied on that path. A guest restart cleared it, and the
+staging then succeeded.
+
 ## Owner rule: tests run in the interactive session (2026-10-18 17:20)
 
 The guest's session 0 has no desktop. Everything that opens a window, a dialog,
