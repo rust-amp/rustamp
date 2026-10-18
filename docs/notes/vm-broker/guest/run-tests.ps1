@@ -1,8 +1,9 @@
 # Run the Rustamp test binaries INSIDE the guest.  Allow-listed guest script.
 #
-# Called by the broker (`-Op guest -Script run-tests.ps1`). It expects the host
-# to have compiled and staged the tree (see docs\notes\vm-run-tests.ps1) at
-# C:\rustamp\code\Rustamp.
+# Shared payload for run-gui-session.ps1 (the default interactive path).
+# Direct broker execution in session 0 is refused except for the deliberately
+# named --desktop-free-residents:pcm_process / :dsp_process selections (W21).
+# It expects the host to have compiled and staged C:\rustamp\code\Rustamp.
 #
 # The trick that makes "compile on the host, run in the guest" work without
 # touching a single test: the tests locate the repository, the fixtures and the
@@ -10,12 +11,20 @@
 # D:\code\Rustamp\...). `subst D: C:\rustamp` makes exactly those paths resolve
 # inside the guest, so the same binaries run unchanged.
 #
-# Nothing graphical is involved: the test binaries are console programs, and
-# this runs in a PowerShell Direct session (no desktop).
+# A console test binary can still open a window or spawn a GUI helper. Running
+# the suite in session 0 is therefore NOT safe evidence (owner, 2026-10-18).
 
 param([string]$Filter = '')
 
 $ErrorActionPreference = 'Continue'
+$session = (Get-Process -Id $PID -ErrorAction Stop).SessionId
+$desktopFree = $Filter -cmatch '^--desktop-free-residents:(pcm_process|dsp_process)$'
+if ($desktopFree) {
+    $Filter = '--ignored:' + $Matches[1]
+} elseif ($session -eq 0 -or $Filter -like '--desktop-free*') {
+    throw 'session-0 suite refused: use run-gui-session.ps1; only --desktop-free-residents:pcm_process or :dsp_process is allowed without a desktop'
+}
+$logDir = if (-not $desktopFree) { 'C:\rustamp\out\gui-session' } else { $null }
 
 # 1. make the baked host paths resolve
 if (-not (Test-Path 'D:\code\Rustamp')) {
@@ -230,6 +239,7 @@ function Invoke-TestBinary {
 foreach ($exe in $exes) {
     $name = Split-Path $exe -Leaf
     if ($filter -and $name -notlike "*$filter*") { continue }
+    if ($desktopFree -and $name -notmatch ('^' + [regex]::Escape($filter) + '-[0-9a-f]+\.exe$')) { continue }
 
     # Skip non-test helper binaries staged beside test binaries for candidate lookup
     if ($name -eq 'rustamp-plughost32.exe' -or $name -eq 'rustamp.exe') { continue }
@@ -287,6 +297,9 @@ foreach ($exe in $exes) {
     }
 
     $run = Invoke-TestBinary -Exe $exe -ArgList $extra -TimeoutSeconds $TestTimeoutSeconds
+    if ($logDir) {
+        @($run.stdout, $run.stderr) | Set-Content -LiteralPath (Join-Path $logDir ($name + '.log')) -Encoding UTF8 -ErrorAction Stop
+    }
 
     if (-not $run.started) {
         $results += [pscustomobject]@{
@@ -365,9 +378,14 @@ foreach ($exe in $exes) {
     # Runner-level findings (a kill that did not land, an unreadable exit code)
     # belong with the binary's own output: they explain the verdict above them.
     if ($run.notes) { $diagnostic = @($diagnostic + @($run.notes)) }
+    # Starting a program without a test summary, or losing its output, cannot
+    # certify a pass even when its process exit code happens to be zero.
+    $effectiveExit = $run.exit
+    if (-not $summary -or $run.notes) { $effectiveExit = -1 }
+    if (-not $summary) { $diagnostic += 'no test result summary was produced; the process exit alone cannot certify a pass' }
     $results += [pscustomobject]@{
         exe            = $name
-        exit           = $run.exit
+        exit           = $effectiveExit
         summary        = $summary
         passed         = $passedNames
         failed         = $failedNames
@@ -401,6 +419,7 @@ if ($bless) {
 [pscustomobject]@{
     host      = $env:COMPUTERNAME
     user      = $env:USERNAME
+    session   = $session
     repo      = $repo
     subst     = (Test-Path 'D:\code\Rustamp')
     # Reports whether the plugin fixture was staged: set only when
@@ -412,6 +431,7 @@ if ($bless) {
     testplugindspsha256 = $dspPluginHash
     # LEFT OUT / MISSING / DID NOT START rows are not executed binaries.
     ran       = $executedCount
+    testsRun  = (@($results | ForEach-Object { $_.passed }).Count + @($results | ForEach-Object { $_.failed }).Count)
     failed    = @($results | Where-Object { $_.exit -ne 0 }).Count
     results   = $results
 }

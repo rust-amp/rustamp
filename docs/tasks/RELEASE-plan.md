@@ -215,14 +215,25 @@ unelevated developer host, which never opens a window or runs tests; "VM" = the
 owner's broker-mediated guest (`docs/notes/vm-run-tests.ps1:6-10`). Each step says
 **what a pass proves** — and, in the same line, what it does not.
 
+**Owner rule (2026-10-18): tests use the guest's interactive session by
+default.** Session 0 has no desktop; failures opening a window, dialog, menu or
+plugin host there are not product evidence. `vm-run-tests.ps1` now dispatches
+the entire selected suite through the interactive task, not the former
+four-window subset. Before guest staging it kills and awaits stray staged
+`rustamp-plughost32.exe` processes (one broker round trip, no reboot); cleanup
+or copy failures still stop the run. See [W21](W21-interactive-default.md) for
+the deliberately narrow desktop-free resident-fixture exception, proof/log
+paths and the static-only validation receipt. W19's old two-runner split and
+session-0 failures (G1/G2) are historical, not the release procedure.
+
 | # | Step | Where | Command | A pass proves | It does not prove |
 |---|---|---|---|---|---|
 | 0 | Clean tree, known commit | host | `git status --short` empty; record `git rev-parse HEAD` | The artefact can be tied to one commit | Anything about behaviour |
 | 1 | Format | host | `cargo fmt --all -- --check` | Formatting only | — |
 | 2 | Lints | host | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Compiles all targets warning-free (`AGENTS.md` required gate) | That any test passes — the lane rule is that a lane never runs tests, so many suites are compile-only until step 4 |
 | 3 | Licence audit | host | `bash .github/scripts/check-permissive-licenses.sh` (or `python .github/scripts/license-audit.py`) and `python .github/scripts/check-license-audit.py`; then `python .github/scripts/license-audit.py --inventory` and diff against `THIRD_PARTY.md` | Declared licences of the five permissive crates' closures are on the allowlist and the inventory is current (`ci.yml:39-44`) | Legal clearance, licence texts, build/dev edges, native libraries, copied code (`CONTRIBUTING.md:77-83`) |
-| 4 | Full suite | VM | `powershell -NoProfile -ExecutionPolicy Bypass -File docs\notes\vm-run-tests.ps1 -Reset` | Every test binary ran; the runner names `[FAIL]` and `[HNG]` binaries (5-minute bound, `HANDOFF-SESSION.md:14-15`). **Release gate: zero FAIL and zero HNG at the release commit** | The last recorded full run (r36) had 11 failures and 2 hangs; no green run at HEAD is on record (`BETA-what-is-in-it.md:209-212`). Any older green count is a snapshot, not today's |
-| 5 | Ignored pass | VM | `... vm-run-tests.ps1 -Filter --ignored` (the runner prints the W12 inventory summary for `--ignored*` filters, `vm-run-tests.ps1:303-307`); the window group via `vm-run-gui-session.ps1` | The 19 ignored tests: beta-required are Groups A (8 window), B (3 real-process), D (2 real-DLL), and E1 `real_playback` (`W12-ignored-inventory.md:147-200`) | See §5: Group D is the only real-plugin evidence; Group E1 is the only production WASAPI path; an inventory line is not a pass — read each test's result |
+| 4 | Full suite | VM interactive session (default) | `powershell -NoProfile -ExecutionPolicy Bypass -File docs\notes\vm-run-tests.ps1 -Reset` | Every selected test binary ran on the desktop; session proof and per-binary logs come back under `D:\code\rustamp-vm\staging\out\gui-session\gui-session`. The existing 300 s binary bound, build/staging receipts, failure/hang/stall/empty-run and repeat gates remain. **Release gate: zero FAIL, HNG or stall, and nonzero executed binaries and test cases, at the release commit** | Ignored tests (step 5); runtime validation of the W21 runner changes is still pending. Older green counts are per-commit snapshots, not today's result |
+| 5 | Ignored pass | VM interactive session (default) | `... vm-run-tests.ps1 -Filter '--ignored'`; then separate `... vm-run-tests.ps1 -Reset -Filter '--ignored:real_playback'` and `... vm-run-tests.ps1 -Reset -Filter '--ignored:loopback'` (W19 audio prerequisites must be in the baseline) | The 20-entry W12/W19 inventory: A (8, including all five actual winit tests), B (3), C (4), D (3, including DSP), E (2). No separate GUI command is required; the general pass still explicitly leaves E out and the two filtered/reset commands cover it | See §5: an inventory line, missing fixture, LEFT OUT or NOT RUN is not a pass — read every required test's own result; virtual audio endpoints are not hardware or audio-quality proof |
 | 6 | CI-equivalent | host/CI | the three `ci.yml` jobs (`licenses`, `windows`) | Same gates on the project's CI | CI runs `cargo test --workspace` on a hosted runner, which this project's own rules forbid on the dev host; treat CI as additional, not a substitute for step 4 |
 | 7 | Version consistency | host | `cargo xtask package --check` (after G2: also checks version/commit/folder agreement) | GPL-free host closure, static-CRT command contract on all four binaries, QUICKSTART switches (`package.rs:785-841`) | Anything about the bytes — it builds nothing |
 | 8 | Build the package | host | `cargo xtask package --release --out <empty new dir>` | The four binaries built from the pinned flags into a layout that passes the exact-allowlist audit; refuses a non-empty `--out` (`package.rs:143-145,293`) | That they run |

@@ -1,8 +1,17 @@
-# Compile and stage on the host (unelevated), run the tests in the guest.
+# Compile and stage on the host (unelevated), run the suite in the guest's
+# INTERACTIVE session by default (owner rule, 2026-10-18). Session 0 has no
+# desktop: window, dialog, menu and plugin-host failures there are not product
+# evidence. The same path handles normal, --ignored and --bless runs.
 #
+#   powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-tests.ps1 -Reset
 #   powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-tests.ps1 -Filter rustamp_app
 #   powershell ... -Reset            # restore base-provisioned first
 #   powershell ... -Filter dsp_roundtrip -Repeat 20 -RepeatSummaryPath rate.json
+#   powershell ... -DesktopFreeResidentFixtures -Filter '--ignored:pcm_process'
+# The last form deliberately runs ONLY the desktop-free resident fixture tests
+# (pcm_process or dsp_process); it is not a general session-0 escape hatch.
+# Before guest copyin, stray staged plugin hosts are killed and awaited, not
+# hidden by a copy retry. This adds one broker round trip, not a guest reboot.
 # Repeats build/stage/copy once, then run sequentially in the same guest. -Reset
 # restores once, not between repetitions. Wall times cover each guest request.
 #
@@ -26,6 +35,8 @@ param(
     [string]$RepoRoot = 'D:\code\Rustamp',
     [string]$Stage = 'D:\code\rustamp-vm\staging\code\Rustamp',
     [switch]$SkipBuild,
+    [switch]$DesktopFreeResidentFixtures,
+    [string]$SessionOut = 'D:\code\rustamp-vm\staging\out\gui-session',
     [ValidateRange(1, 2147483647)] [int]$Repeat = 1,
     [string]$RepeatSummaryPath = '',
     # Where the re-blessed golden images land on the host (only with --bless).
@@ -34,6 +45,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $broker = Join-Path $PSScriptRoot 'vm-broker\invoke-broker.ps1'
+$runnerSource = Join-Path $PSScriptRoot 'vm-broker\guest\run-tests.ps1'
+if ($DesktopFreeResidentFixtures -and $Filter -cnotin '--ignored:pcm_process', '--ignored:dsp_process') {
+    throw '-DesktopFreeResidentFixtures requires exactly -Filter --ignored:pcm_process or --ignored:dsp_process; no other session-0 selection is allowed.'
+}
 
 function Step($t) { Write-Host "--- $t" }
 
@@ -72,6 +87,7 @@ function Get-WorkspaceStageInventory {
         }
     }
     Get-Inventory $files $RepoRoot
+    [pscustomobject]@{ path = 'vm-test-runner\run-tests.ps1'; hash = (Get-FileHash -LiteralPath $runnerSource -Algorithm SHA256).Hash }
     foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
         $p = Join-Path $env:SystemRoot "System32\$crt"
         if (Test-Path -LiteralPath $p) {
@@ -138,7 +154,7 @@ if (-not $SkipBuild) {
     try { $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json } catch {
         throw "-SkipBuild refused: unreadable completion receipt $receiptPath; staging completeness cannot be proved. Run once without -SkipBuild."
     }
-    if ($receipt.version -ne 1 -or $receipt.repo -ne $RepoRoot -or -not $receipt.files -or -not $receipt.inputs -or -not $receipt.testExes -or -not $receipt.i686TestExes) {
+    if ($receipt.version -ne 2 -or $receipt.repo -ne $RepoRoot -or -not $receipt.files -or -not $receipt.inputs -or -not $receipt.testExes -or -not $receipt.i686TestExes) {
         throw "-SkipBuild refused: invalid completion receipt $receiptPath for workspace $RepoRoot; staging completeness cannot be proved. Run once without -SkipBuild."
     }
     $stagedFiles = @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force | Where-Object { $_.FullName -ne $receiptPath })
@@ -254,9 +270,14 @@ if (Test-Path $golden) {
     Copy-Item $golden $goldenDest -Recurse -Force
 }
 Write-Host ("    staged {0} MB" -f [math]::Round(((Get-ChildItem $Stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1))
+# The scheduled task reuses this exact runner, including its timeouts, fixture
+# environment and result schema; never maintain a second, smaller suite here.
+$runnerStage = Join-Path $Stage 'vm-test-runner'
+$null = New-Item -ItemType Directory -Force -Path $runnerStage
+Copy-Item -LiteralPath $runnerSource -Destination (Join-Path $runnerStage 'run-tests.ps1') -Force
 $stagedFiles = @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force)
 [pscustomobject]@{
-    version = 1
+    version = 2
     repo = $RepoRoot
     testExes = @($testExes)
     i686TestExes = @($i686TestExes)
@@ -288,6 +309,12 @@ if ($Reset) {
 }
 
 # --- 4. copy in and run ------------------------------------------------------
+Step 'clearing stray staged plugin hosts in the guest before copyin'
+$cleanupClock = [Diagnostics.Stopwatch]::StartNew()
+try {
+    & $broker -Op guest -Script 'prepare-test-staging.ps1' -TimeoutSeconds 120 | Out-Null
+} finally { $cleanupClock.Stop() }
+Write-Host ("    pre-staging cleanup: {0:F3} s (no reboot)" -f $cleanupClock.Elapsed.TotalSeconds)
 Step 'copying the staged tree into the guest'
 & $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\code\Rustamp' -TimeoutSeconds 1800 | Out-Null
 
@@ -355,7 +382,8 @@ if (Test-Path $pluginsDir) {
 }
 
 function Invoke-GuestTestRun {
-Step 'running the tests in the guest'
+if ($DesktopFreeResidentFixtures) { Step 'running ONLY desktop-free resident fixtures in guest session 0' }
+else { Step 'running the suite in the guest INTERACTIVE session' }
 # The guest bounds each binary at 300 s (`$TestTimeoutSeconds` in
 # docs\notes\vm-broker\guest\run-tests.ps1) and is meant to keep going after a
 # hung one. This bound has to cover every binary in that worst case, or a run
@@ -366,18 +394,41 @@ Step 'running the tests in the guest'
 # by hand and named here.
 $PerBinaryTimeoutSeconds = 300
 $allBinariesCount = $testExes.Count + $i686TestExes.Count
-$guestTimeoutSeconds = 60 + (($PerBinaryTimeoutSeconds + 60) * [math]::Max($allBinariesCount, 1))
+$guestTimeoutSeconds = 180 + (($PerBinaryTimeoutSeconds + 60) * [math]::Max($allBinariesCount, 1))
 Write-Host ("    per-binary timeout {0} s; broker bound {1} s for {2} binaries" -f $PerBinaryTimeoutSeconds, $guestTimeoutSeconds, $allBinariesCount)
 # A single positional argument: `-ArgumentList` with an array binds only the
 # first element to the script's parameter, which silently dropped the filter.
 $guestClock = [Diagnostics.Stopwatch]::StartNew()
+$guestScript = 'run-gui-session.ps1'
+$guestFilter = $Filter
+if ($DesktopFreeResidentFixtures) {
+    $guestScript = 'run-tests.ps1'
+    $guestFilter = '--desktop-free-residents:' + ($Filter -replace '^--ignored:', '')
+}
 try {
-    $result = & $broker -Op guest -Script 'run-tests.ps1' -GuestArgs $Filter -TimeoutSeconds $guestTimeoutSeconds
+    $result = & $broker -Op guest -Script $guestScript -GuestArgs $guestFilter -TimeoutSeconds $guestTimeoutSeconds
 } finally { $guestClock.Stop() }
 # A guest run that produced no object produced no report at all: say which step
 # lost it instead of printing empty columns below.
-if (-not $result) { throw "STEP guest FAILED: the broker returned no result object for run-tests.ps1 (see D:\code\rustamp-vm\broker\broker.log)" }
+if (-not $result) { throw "STEP guest FAILED: the broker returned no result object for $guestScript (see D:\code\rustamp-vm\broker\broker.log)" }
 if ($null -eq $result.results) { throw "STEP guest FAILED: the guest result object carries no results (see D:\code\rustamp-vm\broker\broker.log)" }
+if (-not $DesktopFreeResidentFixtures) {
+    if ($null -eq $result.session -or $result.session -le 0 -or -not $result.marker -or -not $result.screen) {
+        throw 'STEP guest FAILED: no usable interactive-session proof; this run proves nothing.'
+    }
+    Step 'copying the session proof and per-binary logs back'
+    if (Test-Path $SessionOut) { Remove-Item -Recurse -Force $SessionOut }
+    $null = New-Item -ItemType Directory -Force -Path $SessionOut
+    & $broker -Op copyout -Source 'C:\rustamp\out\gui-session' -Dest $SessionOut -TimeoutSeconds 600 | Out-Null
+    # copyout nests the source directory inside the destination.
+    $proofPath = Join-Path $SessionOut 'gui-session\session-proof.json'
+    if (-not (Test-Path -LiteralPath $proofPath)) { throw 'no session-proof.json came back; nothing is promoted' }
+    $proof = Get-Content -LiteralPath $proofPath -Raw | ConvertFrom-Json
+    if ($proof.runId -ne $result.runId -or $proof.session -ne $result.session -or $proof.ran -ne $result.ran -or $proof.failed -ne $result.failed) {
+        throw 'copied session proof does not match this guest run; nothing is promoted'
+    }
+    Write-Host ("    session {0}; screen {1}; proof and logs: {2}" -f $result.session, $result.screen, (Split-Path $proofPath))
+}
 
 # --- 5. results --------------------------------------------------------------
 $hungCount = @($result.results | Where-Object { $_.hung }).Count
@@ -552,6 +603,10 @@ if ($null -eq $result.ran -or $result.ran -eq 0) {
     Write-Host ("  FAILED: the guest executed no test binary at all, so this run proves nothing (filter: '{0}'; {1} binaries were staged)." -f $Filter, $allBinariesCount)
     $runFailed = $true
 }
+if ($null -eq $result.testsRun -or $result.testsRun -eq 0) {
+    Write-Host '  FAILED: no executed test case was reported; starting binaries that run zero tests proves nothing.'
+    $runFailed = $true
+}
 return [pscustomobject]@{
     passed = -not $runFailed
     stalled = ($stallCount -ne 0)
@@ -621,3 +676,4 @@ if ($showRepeatSummary) {
     }
 }
 if ($failedRuns -ne 0 -or $notAttempted -ne 0) { exit 1 }
+exit 0

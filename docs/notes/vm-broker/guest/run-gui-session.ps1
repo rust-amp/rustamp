@@ -1,254 +1,151 @@
-# Run the ignored winit window tests INSIDE the guest's interactive session.
-#
-# Allow-listed guest script. Called by the broker exactly like run-tests.ps1:
+# Allow-listed guest launcher for the FULL suite in the INTERACTIVE session
+# (owner rule, 2026-10-18), not a separate four-test implementation. The fixed
+# staged run-tests.ps1 payload owns fixtures, per-binary 300 s timeouts and
+# results. The broker stays in session 0 and never compiles or runs GUI tests.
 #
 #   broker -Op guest -Script run-gui-session.ps1 -GuestArgs <filter>
 #
-# Why this script exists: the broker's PowerShell Direct sessions land in
-# session 0 as the S4U user, which has no desktop. The plugin host's plain
-# Win32 window and the end-to-end test pass there, but every winit window test
-# panics inside winit without a desktop. The guest is provisioned to hold an
-# auto-logon interactive session (see docs\notes\vm-provision-test-host.ps1 §1,
-# which must have written Winlogon's DefaultPassword for that to be true), so this
-# script registers a one-shot Scheduled Task that runs as the interactive user
-# with LogonType Interactive - i.e. in that session, on its desktop - and waits
-# for it. The task-registration shape follows the precedent of
-# docs\notes\vm-broker\register-broker-task.ps1 (action + principal + trigger),
-# moved inside the guest and pointed at the console session instead of S4U.
-#
-# Division of labour (unchanged): the host compiled and staged unelevated, the
-# broker only touches the VM, this script only runs what is staged. The
-# executed payload is a fixed local path written by THIS allow-listed script,
-# never an argument from the broker, so the allow-list model holds: the only
-# broker-controlled input is the optional test-name filter.
-#
-# Trust: the run reports its session id, user, computer and the window client
-# sizes/positions the tests assert. A run that lands in session 0 FAILS LOUDLY
-# (three layers: the Interactive principal cannot start without the logon, the
-# inner script refuses session 0 before any binary runs, the outer wrapper
-# refuses a proof file showing session 0) instead of reporting a pass.
-#
-# Results land in C:\rustamp\out\gui-session\ and come back via the existing
-# broker `copyout` op (source under C:\rustamp\out, as that op requires).
+# Normal/--ignored/--bless filters have exactly the suite runner's meaning.
+# No desktop-free fallback: no session, no screen, no completion, no proof or
+# no executed tests means a loud failure. Proof + per-binary logs are written
+# under C:\rustamp\out\gui-session for the existing copyout operation.
 
 param([string]$Filter = '')
 
 $ErrorActionPreference = 'Stop'
-
+if ($Filter -like '--desktop-free*') { throw 'desktop-free selections must use the explicit desktop-free runner path' }
 $TaskName = 'RustampGuiSession'
-$WorkDir  = 'C:\rustamp\out\gui-session'
+$WorkDir = 'C:\rustamp\out\gui-session'
 $InnerPath = Join-Path $WorkDir 'inner.ps1'
-$DonePath  = Join-Path $WorkDir 'done.json'
+$DonePath = Join-Path $WorkDir 'done.json'
 $ProofPath = Join-Path $WorkDir 'session-proof.json'
+$RunnerPath = 'C:\rustamp\code\Rustamp\vm-test-runner\run-tests.ps1'
+if (-not (Test-Path -LiteralPath $RunnerPath)) { throw "missing shared runner $RunnerPath; stage with vm-run-tests.ps1 (no old staging fallback)" }
 
-function Session-Of([int]$ProcessId) {
-    (Get-Process -Id $ProcessId -ErrorAction Stop).SessionId
-}
-
-# --- 0. record where THIS script landed (must be session 0; informational) ----
-$launcherSession = Session-Of $PID
-Write-Output ("launcher session {0} as {1} on {2}" -f $launcherSession, $env:USERNAME, $env:COMPUTERNAME)
-
-# --- 1. make the baked host paths resolve (same trick as run-tests.ps1) -------
-if (-not (Test-Path 'D:\code\Rustamp')) {
-    subst D: C:\rustamp
-}
-$repo = 'D:\code\Rustamp'
-if (-not (Test-Path $repo)) { throw "the repository is not staged at $repo" }
-$deps = Join-Path $repo 'target\debug\deps'
-if (-not (Test-Path $deps)) { throw "no staged binaries at $deps" }
-
-# --- 2. find the interactive session and its user ------------------------------
-# Primary signal: explorer.exe owns the console desktop; its session is the
-# interactive one and its owner is the auto-logon user. Fallback: `query
-# session` looking for the Active console row. No hardcoded user name: the
-# provision script sets auto-logon to whoever provisioned, and either signal
-# follows it.
+# Explorer's owner is the provisioned auto-logon user. An unattached console
+# need not be labelled Active; the inner payload also proves a usable screen.
 $interactiveSession = $null
 $interactiveUser = $null
 $interactiveDomain = $null
-$explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+$explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue |
+    Where-Object { $_.SessionId -gt 0 } | Select-Object -First 1
 if ($explorer) {
     $interactiveSession = $explorer.SessionId
-    $owner = (Get-CimInstance Win32_Process -Filter ("ProcessId = " + $explorer.Id) | Invoke-CimMethod -MethodName GetOwner)
+    $owner = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $explorer.Id) | Invoke-CimMethod -MethodName GetOwner
     $interactiveUser = $owner.User
     $interactiveDomain = $owner.Domain
-    Write-Output ("interactive session {0} via explorer (user {1}\{2})" -f $interactiveSession, $interactiveDomain, $interactiveUser)
 } else {
-    Write-Output 'no explorer process; falling back to `query session`'
     foreach ($line in (query session 2>$null)) {
-        # Active console row looks like: ">console  rustamp  1  Active"
         if ($line -match '^\s*>?\s*console\s+(\S+)\s+(\d+)\s+Active') {
             $interactiveUser = $Matches[1]
             $interactiveSession = [int]$Matches[2]
             $interactiveDomain = $env:COMPUTERNAME
-            Write-Output ("interactive session {0} via query session (user {1})" -f $interactiveSession, $interactiveUser)
             break
         }
     }
 }
-if ($null -eq $interactiveSession) { throw 'no interactive session found: explorer is not running and `query session` shows no Active console; the window tests have no desktop to run on' }
-if ($interactiveSession -eq 0) { throw 'the "interactive" session resolved to session 0, which has no desktop; refusing instead of reporting a pass' }
-if ([string]::IsNullOrWhiteSpace($interactiveUser)) { throw 'interactive session found but its user could not be resolved; refusing' }
-
-# --- 3. write the inner payload (fixed local path, filter baked in) ------------
-# The four ignored winit window tests and nothing else. Each runs in its own
-# staged binary with `--ignored <exact name>` so a binary-name filter cannot
-# accidentally widen the set. The spawn-based cases (playlist_window, headless)
-# resolve rustamp.exe through the compile-time path, which works because of the
-# subst above - same as the existing guest runs.
-$windowCases = @(
-    @{ stem = 'eq_window';       test = 'the_equalizer_window_opens_at_its_docked_size_and_position' },
-    @{ stem = 'main_menu';       test = 'the_main_menu_popup_opens_at_the_measured_client_size' },
-    @{ stem = 'playlist_window'; test = 'the_playlist_window_opens_docked_below_the_main_window' },
-    @{ stem = 'headless';        test = 'the_windowed_player_opens_a_window_inside_the_test_vm' }
-)
-if (-not [string]::IsNullOrWhiteSpace($Filter)) {
-    $want = $Filter.Trim()
-    $windowCases = @($windowCases | Where-Object { $_.stem -like "*$want*" -or $_.test -like "*$want*" })
-    if (-not $windowCases) { throw "filter '$Filter' matches none of the four window tests" }
+if ($null -eq $interactiveSession -or $interactiveSession -le 0 -or [string]::IsNullOrWhiteSpace($interactiveUser)) {
+    throw 'no interactive desktop user found; refusing to run the suite in session 0'
 }
-$caseJson = ($windowCases | ConvertTo-Json -Compress)
 
+# Cover the same worst case as the host bound (300 s + kill/drain margin per
+# binary), with another 120 s reserved by the host for task launch/return.
+# Keep these constants in step with vm-run-tests.ps1 and run-tests.ps1.
+$binaries = @(Get-ChildItem -LiteralPath 'C:\rustamp\code\Rustamp\target\debug\deps' -Filter '*.exe' -File |
+    Where-Object { $_.Name -notin 'rustamp-plughost32.exe', 'rustamp.exe' })
+$taskTimeoutSeconds = 60 + (360 * [math]::Max($binaries.Count, 1))
+# Do not erase an older live task's evidence or silently start concurrent runs.
+$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existing -and $existing.State -in 'Running', 'Queued') { throw 'a previous interactive suite task is still running/queued; refusing to overlap it' }
+if ($existing) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
 if (Test-Path $WorkDir) { Remove-Item -Recurse -Force $WorkDir }
 $null = New-Item -ItemType Directory -Force -Path $WorkDir
-
-# The filter travels baked into the file (single-quoted here-string: nothing
-# expands at write time). The inner script re-asserts the session because the
-# only thing that proves the desktop is the process that actually runs there.
+$runId = [guid]::NewGuid().ToString('N')
+# Encode data, never interpolate a filter into executable PowerShell syntax.
+$filter64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Filter))
 $inner = @'
-$ErrorActionPreference = 'Continue'
-$WorkDir   = 'C:\rustamp\out\gui-session'
+$ErrorActionPreference = 'Stop'
+$WorkDir = 'C:\rustamp\out\gui-session'
+$DonePath = Join-Path $WorkDir 'done.json'
 $ProofPath = Join-Path $WorkDir 'session-proof.json'
-$DonePath  = Join-Path $WorkDir 'done.json'
-
-# Fail loudly in session 0: no desktop there, and a pass from there would be a lie.
-$me = (Get-Process -Id $PID).SessionId
-if ($me -eq 0) {
-    $msg = 'refusing: the GUI task landed in session 0, which has no desktop; a window test cannot pass here'
-    Write-Output $msg
-    @{ ok = $false; error = $msg } | ConvertTo-Json | Set-Content -Path $DonePath -Encoding UTF8
+try {
+    $me = (Get-Process -Id $PID).SessionId
+    if ($me -le 0) { throw 'interactive suite task landed in session 0, which has no desktop; refusing' }
+    Add-Type -AssemblyName System.Windows.Forms
+    $screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    if ($screen.Width -le 0 -or $screen.Height -le 0) { throw 'no usable desktop: the virtual screen is empty' }
+    $marker = Test-Path 'C:\rustamp\code\Rustamp'
+    if (-not $marker) { throw 'the staged repository marker is missing' }
+    $filter = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__FILTER64__'))
+    $result = & 'C:\rustamp\code\Rustamp\vm-test-runner\run-tests.ps1' -Filter $filter
+    if (-not $result -or $null -eq $result.results -or $null -eq $result.failed) { throw 'the shared suite payload returned no complete report' }
+    $result | Add-Member -NotePropertyName runId -NotePropertyValue '__RUNID__'
+    $result | Add-Member -NotePropertyName screen -NotePropertyValue $screen.ToString()
+    $result | Add-Member -NotePropertyName marker -NotePropertyValue $marker
+    $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ProofPath -Encoding UTF8
+    $ok = ($result.failed -eq 0 -and $result.ran -gt 0 -and $result.testsRun -gt 0 -and
+        @($result.results | Where-Object { $_.hung -or $_.stalled }).Count -eq 0)
+    @{ ok = $ok; runId = '__RUNID__' } | ConvertTo-Json | Set-Content -LiteralPath $DonePath -Encoding UTF8
+    if (-not $ok) { exit 1 }
+} catch {
+    @{ ok = $false; runId = '__RUNID__'; error = $_.Exception.Message } |
+        ConvertTo-Json | Set-Content -LiteralPath $DonePath -Encoding UTF8
     exit 3
 }
-
-if (-not (Test-Path 'D:\code\Rustamp')) { subst D: C:\rustamp }
-$deps = 'D:\code\Rustamp\target\debug\deps'
-
-Add-Type -AssemblyName System.Windows.Forms
-$screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
-if ($screen.Width -le 0 -or $screen.Height -le 0) {
-    $msg = 'refusing: no usable desktop in this session (virtual screen is empty)'
-    Write-Output $msg
-    @{ ok = $false; error = $msg } | ConvertTo-Json | Set-Content -Path $DonePath -Encoding UTF8
-    exit 3
-}
-
-$cases = '__CASES__' | ConvertFrom-Json
-$results = @()
-foreach ($c in $cases) {
-    # Several crates can produce a binary with the same stem (both `rustamp-app`
-    # and `rustamp-ui` ship a `playlist_window` test binary, for example), and
-    # only one of them contains the ignored test. Pick the binary whose `--list`
-    # output names it, so a stem collision cannot silently run zero tests and
-    # still report a pass.
-    $candidates = @(Get-ChildItem -Path $deps -Filter ($c.stem + '-*.exe') -ErrorAction SilentlyContinue |
-        Sort-Object Name)
-    $exe = $null
-    foreach ($cand in $candidates) {
-        $listed = @(& $cand.FullName --list 2>&1 | ForEach-Object { $_.ToString().Trim() })
-        if ($listed | Where-Object { $_ -like ($c.test + ':*') }) {
-            $exe = $cand.FullName
-            break
-        }
-    }
-    if (-not $exe) {
-        $results += [pscustomobject]@{ stem = $c.stem; test = $c.test; exit = -1; summary = 'MISSING BINARY'; log = $null }
-        continue
-    }
-    # One log per case so the host can read exactly what the test said,
-    # including the client size/position lines the tests assert.
-    $logPath = Join-Path $WorkDir ($c.stem + '.log')
-    $raw = & $exe --ignored $c.test --exact 2>&1 | Out-String
-    $exit = $LASTEXITCODE
-    $raw | Set-Content -Path $logPath -Encoding UTF8
-    $lines = $raw -split "`r?`n"
-    $summary = ($lines | Where-Object { $_ -match '^test result:' } | Select-Object -Last 1)
-    $results += [pscustomobject]@{ stem = $c.stem; test = $c.test; exit = $exit; summary = $summary; log = (Split-Path $logPath -Leaf) }
-}
-
-[pscustomobject]@{
-    session  = $me
-    user     = $env:USERNAME
-    computer = $env:COMPUTERNAME
-    marker   = (Test-Path 'C:\rustamp\code\Rustamp')
-    screen   = $screen.ToString()
-    ran      = $results.Count
-    failed   = @($results | Where-Object { $_.exit -ne 0 }).Count
-    results  = $results
-} | ConvertTo-Json -Depth 6 | Set-Content -Path $ProofPath -Encoding UTF8
-
-$proof = Get-Content -Path $ProofPath -Raw | ConvertFrom-Json
-@{ ok = ($proof.failed -eq 0); failed = $proof.failed } | ConvertTo-Json | Set-Content -Path $DonePath -Encoding UTF8
-exit $proof.failed
 '@
-$inner = $inner.Replace('__CASES__', $caseJson)
-$inner | Set-Content -Path $InnerPath -Encoding UTF8
+$inner = $inner.Replace('__FILTER64__', $filter64).Replace('__RUNID__', $runId)
+$inner | Set-Content -LiteralPath $InnerPath -Encoding UTF8
 
-# --- 4. register the one-shot task in the interactive session -------------------
-# Precedent: register-broker-task.ps1 (action + principal + trigger). Differences
-# are the point: LogonType Interactive (this user, when logged on: the console
-# desktop) instead of S4U (session 0), Limited instead of Highest (the tests
-# need no elevation; an elevated interactive task would add a UAC question the
-# run cannot answer), and a one-shot trigger (this run only, then unregistered).
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+# Demand-start only: a trigger one minute in the future could re-run a short
+# suite while its proof is being copied. Limited + Interactive, never S4U.
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $InnerPath)
 $principal = New-ScheduledTaskPrincipal -UserId ("{0}\{1}" -f $interactiveDomain, $interactiveUser) `
     -LogonType Interactive -RunLevel Limited
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
-Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal `
-    -Trigger $trigger -Force | Out-Null
-Write-Output ("registered '{0}' as {1}\{2} (Interactive, session {3}, one-shot)" -f $TaskName, $interactiveDomain, $interactiveUser, $interactiveSession)
-
-# --- 5. run it now and wait for the sentinel ------------------------------------
-Start-ScheduledTask -TaskName $TaskName
-$deadline = (Get-Date).AddMinutes(20)
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds $taskTimeoutSeconds)
+Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
 $done = $null
-while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Seconds 5
-    if (Test-Path $DonePath) {
-        try { $done = Get-Content -Path $DonePath -Raw | ConvertFrom-Json } catch { continue }
-        break
+try {
+    Start-ScheduledTask -TaskName $TaskName
+    $launchDeadline = (Get-Date).AddSeconds(60)
+    $deadline = (Get-Date).AddSeconds($taskTimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+        if (Test-Path -LiteralPath $DonePath) {
+            try { $candidate = Get-Content -LiteralPath $DonePath -Raw | ConvertFrom-Json } catch { $candidate = $null }
+            if ($candidate -and $candidate.runId -eq $runId) { $done = $candidate; break }
+        }
+        $state = (Get-ScheduledTask -TaskName $TaskName).State
+        if ($state -eq 'Disabled' -or ((Get-Date) -ge $launchDeadline -and $state -notin 'Running', 'Queued')) {
+            $lastResult = (Get-ScheduledTaskInfo -TaskName $TaskName).LastTaskResult
+            throw "interactive task is $state with no done sentinel (task result $lastResult); launch/runner failed, not green"
+        }
     }
-    $state = (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State
-    if ($state -eq 'Disabled') { break }
+} finally {
+    # Bound the task itself as well as each child. Never leave a timed-out task
+    # running after unregistering its definition and call that a completed run.
+    $task = Get-ScheduledTask -TaskName $TaskName
+    if ($task.State -in 'Running', 'Queued') {
+        Stop-ScheduledTask -TaskName $TaskName
+        $stopDeadline = (Get-Date).AddSeconds(10)
+        do {
+            Start-Sleep -Milliseconds 200
+            $task = Get-ScheduledTask -TaskName $TaskName
+        } while ($task.State -in 'Running', 'Queued' -and (Get-Date) -lt $stopDeadline)
+        if ($task.State -in 'Running', 'Queued') { throw 'interactive task did not stop within 10 s; its definition is retained; do not stage another run' }
+    }
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-if (-not $done) { throw 'the GUI task produced no done sentinel within 20 minutes; its logs (if any) are under C:\rustamp\out\gui-session\' }
-if (-not (Test-Path $ProofPath)) { throw 'the GUI task finished without a session proof; refusing instead of reporting a pass' }
-$proof = Get-Content -Path $ProofPath -Raw | ConvertFrom-Json
-
-# --- 6. trust checks: session 0 must fail loudly ---------------------------------
-# The tests' own require_test_vm gate already refused off-VM; this is the
-# session half: prove the desktop session, then report the window facts.
-if ($proof.session -eq 0) { throw 'the GUI task ran in session 0, which has no desktop; this run proves nothing and is reported as failed' }
-if ($proof.session -ne $interactiveSession) {
-    throw ("the GUI task ran in session {0}, not the interactive session {1}; refusing" -f $proof.session, $interactiveSession)
+if (-not $done) { throw "the interactive task produced no done sentinel within $taskTimeoutSeconds s; the run is incomplete, not green" }
+if ($done.error) { throw ("interactive suite failed: " + $done.error) }
+if (-not (Test-Path -LiteralPath $ProofPath)) { throw 'interactive task finished without a session proof; refusing' }
+$proof = Get-Content -LiteralPath $ProofPath -Raw | ConvertFrom-Json
+if ($proof.runId -ne $runId -or $proof.session -ne $interactiveSession -or $proof.session -le 0 -or -not $proof.marker -or -not $proof.screen) {
+    throw 'interactive session proof does not match this run/user session/staged tree; refusing'
 }
-Write-Output ("gui session {0} as {1} on {2}; screen {3}; ran {4}, failed {5}" -f `
-    $proof.session, $proof.user, $proof.computer, $proof.screen, $proof.ran, $proof.failed)
-foreach ($r in $proof.results) {
-    $status = if ($r.exit -eq 0) { 'ok  ' } else { 'FAIL' }
-    Write-Output ("  [{0}] {1,-16} {2} ({3})" -f $status, $r.stem, $r.summary, $r.test)
+if ($null -eq $proof.ran -or $proof.ran -le 0 -or $null -eq $proof.testsRun -or $proof.testsRun -le 0) {
+    Write-Host 'FAILED: the interactive task executed no test binary/case; this run proves nothing'
 }
-if ($proof.failed -ne 0) { throw ("{0} window test(s) failed; logs are under C:\rustamp\out\gui-session\ (copy out with the broker copyout op)" -f $proof.failed) }
-
-[pscustomobject]@{
-    host      = $proof.computer
-    user      = $proof.user
-    session   = $proof.session
-    screen    = $proof.screen
-    ran       = $proof.ran
-    failed    = $proof.failed
-    results   = $proof.results
-}
+# Return failures too, in the original suite schema. The host prints every
+# diagnostic and applies its failure/hang/stall/empty/bless/repeat exit gates.
+$proof
