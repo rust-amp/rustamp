@@ -246,6 +246,12 @@ fn the_gui_rail_refuses_to_open_a_window() {
 /// kills the player. The final assertion pins `output null`: the run must
 /// have taken the silent path, never a real device.
 ///
+/// The window's **title and class must round-trip in full** (task card
+/// N12): both are read back through the wide API into a wide buffer and
+/// compared exactly, so a wide/ANSI mismatch at the Win32 boundary — on
+/// the player's writing side or the reader's side — fails here instead of
+/// surfacing as a one-character title or class.
+///
 /// The spawned child builds its loop on its own main thread, so it needs no
 /// opt-in: the off-main-thread mode
 /// ([`rustamp_app::window::build_event_loop`]) is only for the in-process
@@ -299,6 +305,25 @@ fn the_windowed_player_opens_a_window_inside_the_test_vm() {
     #[cfg(windows)]
     {
         let main = child_windows::find_window(pid, "Rustamp", Duration::from_secs(10));
+        // The title and the class round-trip in full (task card N12).
+        // `find_window` already matched the exact multi-character title; the
+        // explicit read-backs below pin the title and add the class, which
+        // no test read before. winit 0.30 registers the user-window class
+        // as `Window Class` (Cargo.lock pins winit 0.30.13); a
+        // one-character title or class is the wide/ANSI-mismatch
+        // signature, not a real window property.
+        assert_eq!(
+            child_windows::window_title(main),
+            "Rustamp",
+            "the main window title must round-trip in full"
+        );
+        assert_eq!(
+            child_windows::window_class(main),
+            "Window Class",
+            "the main window class must round-trip in full: winit 0.30's \
+             registered class; a one-character class is the wide/ANSI-mismatch \
+             signature (task card N12)"
+        );
         assert_eq!(
             child_windows::client_size(main),
             (275, 116),

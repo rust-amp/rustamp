@@ -3,9 +3,16 @@
 //!
 //! Shared by `headless.rs` (main window) and `playlist_window.rs` (main plus
 //! playlist editor): find a spawned child's top-level windows by process id
-//! and title, then read back their client size and outer origin. The
-//! `user32` surface is declared by hand, mirroring `plughost_e2e.rs`, so
-//! this adds no dependency — and the assertions themselves open no window.
+//! and title, then read back their title, class, client size and outer
+//! origin. The `user32` surface is declared by hand, mirroring
+//! `plughost_e2e.rs`, so this adds no dependency — and the assertions
+//! themselves open no window.
+//!
+//! Every read here pairs the wide API with a wide buffer (`GetWindowTextW`
+//! / `GetClassNameW` into a `u16` array): the A/W-correct pattern of task
+//! card N12. A reader that mixes variants (a wide API handed an ANSI
+//! buffer) truncates every string to its first character and can never
+//! match the exact multi-character titles `find_window` waits for.
 //!
 //! Windows-only: the headless test VM is Windows. Including tests declare
 //! this module behind `#[cfg(windows)]` and skip the geometry half
@@ -32,6 +39,7 @@ unsafe extern "system" {
     ) -> i32;
     fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
     fn GetWindowTextW(hwnd: *mut c_void, text: *mut u16, max: i32) -> i32;
+    fn GetClassNameW(hwnd: *mut c_void, text: *mut u16, max: i32) -> i32;
     fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
     fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
     fn IsWindowVisible(hwnd: *mut c_void) -> i32;
@@ -57,11 +65,28 @@ fn top_level_windows() -> Vec<*mut c_void> {
     out
 }
 
-fn window_title(hwnd: *mut c_void) -> String {
+/// The window's title, read with the wide API into a wide buffer
+/// (`GetWindowTextW` + a `u16` array): the A/W-correct pattern of task card
+/// N12. `find_window` matches this exactly, so a reader that truncates to
+/// one character can never pass unnoticed.
+pub fn window_title(hwnd: *mut c_void) -> String {
     let mut buffer = [0u16; 256];
     // SAFETY: `buffer` is a valid 256-wide out-buffer. Only windows owned by
     // the spawned child are read, and those answer promptly.
     let len = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    String::from_utf16_lossy(&buffer[..len.max(0) as usize])
+}
+
+/// The window's class name, read with the wide API into a wide buffer
+/// (`GetClassNameW` + a `u16` array): the same A/W-correct pattern as
+/// [`window_title`] (task card N12). A one-character result is the
+/// signature of a wide/ANSI mismatch at the Win32 boundary, never of a
+/// one-character class.
+pub fn window_class(hwnd: *mut c_void) -> String {
+    let mut buffer = [0u16; 256];
+    // SAFETY: `buffer` is a valid 256-wide out-buffer. Only windows owned by
+    // the spawned child are read, and those answer promptly.
+    let len = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
     String::from_utf16_lossy(&buffer[..len.max(0) as usize])
 }
 

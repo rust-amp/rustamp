@@ -50,7 +50,10 @@ fn fixture() -> std::path::PathBuf {
 /// the playlist client is 275 x 116 (S06 scope, S01 §1), and the playlist
 /// outer origin sits exactly one docked step below the main outer origin —
 /// the S05 §3.1/§4.2 neighbour relation, independent of where the OS placed
-/// the main window (the product sets no absolute main position).
+/// the main window (the product sets no absolute main position). The
+/// windows' **titles and class must also round-trip in full** (task card
+/// N12): a one-character title or class is the wide/ANSI-mismatch
+/// signature, not a real window property.
 #[test]
 #[ignore = "VM-only: opens the GUI windows; run inside the headless test VM"]
 fn the_playlist_window_opens_docked_below_the_main_window() {
@@ -111,6 +114,35 @@ fn the_playlist_window_opens_docked_below_the_main_window() {
     {
         let main = child_windows::find_window(pid, "Rustamp", Duration::from_secs(10));
         let playlist = child_windows::find_window(pid, "Rustamp Playlist", Duration::from_secs(10));
+        // The titles and the class round-trip in full (task card N12): both
+        // windows are winit windows and carry winit 0.30's registered class
+        // `Window Class` (Cargo.lock pins winit 0.30.13). `find_window`
+        // already matched the exact multi-character titles; the explicit
+        // read-backs pin them and add the class.
+        assert_eq!(
+            child_windows::window_title(main),
+            "Rustamp",
+            "the main window title must round-trip in full"
+        );
+        assert_eq!(
+            child_windows::window_title(playlist),
+            "Rustamp Playlist",
+            "the playlist window title must round-trip in full"
+        );
+        assert_eq!(
+            child_windows::window_class(main),
+            "Window Class",
+            "the main window class must round-trip in full (winit 0.30's \
+             registered class; a one-character class is the wide/ANSI-mismatch \
+             signature, task card N12)"
+        );
+        assert_eq!(
+            child_windows::window_class(playlist),
+            "Window Class",
+            "the playlist window class must round-trip in full (winit 0.30's \
+             registered class; a one-character class is the wide/ANSI-mismatch \
+             signature, task card N12)"
+        );
         assert_eq!(
             child_windows::client_size(main),
             (275, 116),
