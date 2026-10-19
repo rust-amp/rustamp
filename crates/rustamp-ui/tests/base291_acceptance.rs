@@ -4,7 +4,7 @@
 use rustamp_core::{command::SelectOp, playlist::EntryId};
 use rustamp_gfx::{Image, Rect};
 use rustamp_skin::{
-    ArchiveSource, BuiltinDefaultSkin, Sheet, Skin, SkinSource, Substitute, webamp,
+    ArchiveSource, BuiltinDefaultSkin, CursorSlot, Sheet, Skin, SkinSource, Substitute, webamp,
 };
 use rustamp_ui::*;
 
@@ -118,10 +118,8 @@ fn base291_archive_native_sheets_metadata_and_tables() {
         "volbal", "pnormal",
     ] {
         let file = source.read_any(name, &["cur"]).unwrap();
-        assert_eq!(
-            skin.cursor(&format!("{name}.cur")).unwrap().bytes,
-            file.bytes
-        );
+        let slot = CursorSlot::from_file_name(&format!("{name}.cur")).unwrap();
+        assert_eq!(skin.cursor_slot(slot).unwrap().bytes, file.bytes);
     }
     for def in webamp::SPRITES.iter().filter(|d| d.sheet != Sheet::NumsEx) {
         let (image, resolved) = skin.sprite_image(def.name).unwrap();

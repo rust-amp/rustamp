@@ -5,8 +5,8 @@ mod support;
 
 use rustamp_gfx::Image;
 use rustamp_skin::{
-    BuiltinDefaultSkin, CursorKind, MemorySource, PlaylistStyle, Sheet, Skin, SkinFallback,
-    Substitute, webamp,
+    BuiltinDefaultSkin, CursorKind, CursorSlot, MemorySource, PlaylistStyle, Sheet, Skin,
+    SkinFallback, Substitute, webamp,
 };
 use support::*;
 
@@ -534,7 +534,7 @@ fn missing_cursors_fall_back_to_the_builtin_skin() {
     // The synthetic skin ships no cursors; the built-in default ships 11.
     assert_eq!(skin.cursors().len(), 11);
     let close = skin
-        .cursor("close.cur")
+        .cursor_slot(CursorSlot::Close)
         .expect("close.cur must come from the fallback");
     assert_eq!(close.kind, CursorKind::Cur);
     assert_eq!(
@@ -560,7 +560,7 @@ fn cursor_missing_from_both_skin_and_fallback_stays_absent() {
 
     // 13 of the 24 loader-requested names are absent from the built-in skin.
     assert!(rustamp_skin::rust_theme::cursor_bytes("eqclose.cur").is_none());
-    assert!(skin.cursor("eqclose.cur").is_none());
+    assert!(skin.cursor_slot(CursorSlot::EqClose).is_none());
     assert!(
         !skin
             .substitutions()
@@ -581,7 +581,7 @@ fn shipped_cursor_is_never_shadowed_by_the_fallback() {
     let skin = Skin::load(dir.path()).unwrap();
 
     let close = skin
-        .cursor("close.cur")
+        .cursor_slot(CursorSlot::Close)
         .expect("the shipped close.cur must be kept");
     assert_eq!(close.bytes, b"shipped-close-cursor");
     assert!(
@@ -605,7 +605,11 @@ fn ani_variant_carries_the_cur_slot() {
 
     // 10 fallback cursors plus the shipped .ani one; no posbar.cur fallback.
     assert_eq!(skin.cursors().len(), 11);
-    assert!(skin.cursor("posbar.cur").is_none());
+    let posbar = skin
+        .cursor_slot(CursorSlot::PosBar)
+        .expect("the shipped posbar.ani must fill the posbar slot");
+    assert_eq!(posbar.bytes, b"RIFF-shipped-ani");
+    assert_eq!(posbar.kind, CursorKind::Ani);
     assert!(
         !skin
             .substitutions()

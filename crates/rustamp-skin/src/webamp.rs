@@ -512,37 +512,6 @@ pub static TEXT_GLYPHS: &[(char, u32, u32)] = &[
     ('<', 22, 1), ('>', 23, 1), ('{', 22, 1), ('}', 23, 1), // webamp aliases, not in S01
 ];
 
-/// The cursor files a skin may ship, ported from webamp's `CURSORS` list.
-///
-/// S17 §8 lists a smaller verified set and leaves the region mapping open, so
-/// this list stays provisional and is unchanged by the S01 reconciliation.
-pub static CURSOR_NAMES: &[&str] = &[
-    "close.cur",    // provisional: webamp; S17 §8 lists a subset
-    "eqclose.cur",  // provisional: webamp; S17 §8 lists a subset
-    "eqnormal.cur", // provisional: webamp; S17 §8 lists a subset
-    "eqslid.cur",   // provisional: webamp; S17 §8 lists a subset
-    "eqtitle.cur",  // provisional: webamp; S17 §8 lists a subset
-    "mainmenu.cur", // provisional: webamp; S17 §8 lists a subset
-    "mmenu.cur",    // provisional: webamp; S17 §8 lists a subset
-    "min.cur",      // provisional: webamp; S17 §8 lists a subset
-    "normal.cur",   // provisional: webamp; S17 §8 lists a subset
-    "pclose.cur",   // provisional: webamp; S17 §8 lists a subset
-    "pnormal.cur",  // provisional: webamp; S17 §8 lists a subset
-    "posbar.cur",   // provisional: webamp; S17 §8 lists a subset
-    "psize.cur",    // provisional: webamp; S17 §8 lists a subset
-    "ptbar.cur",    // provisional: webamp; S17 §8 lists a subset
-    "pvscroll.cur", // provisional: webamp; S17 §8 lists a subset
-    "pwinbut.cur",  // provisional: webamp; S17 §8 lists a subset
-    "pwsnorm.cur",  // provisional: webamp; S17 §8 lists a subset
-    "pwssize.cur",  // provisional: webamp; S17 §8 lists a subset
-    "songname.cur", // provisional: webamp; S17 §8 lists a subset
-    "titlebar.cur", // provisional: webamp; S17 §8 lists a subset
-    "volbal.cur",   // provisional: webamp; S17 §8 lists a subset
-    "winbut.cur",   // provisional: webamp; S17 §8 lists a subset
-    "wsnormal.cur", // provisional: webamp; S17 §8 lists a subset
-    "wsposbar.cur", // provisional: webamp; S17 §8 lists a subset
-];
-
 /// The 24 default analyser colours.
 ///
 /// S17 §6 lists the base skin's `viscolor.txt`: 24 entries, slot 0 the
@@ -682,22 +651,6 @@ mod tests {
         assert!(sprite("MINUS_SIGN_EX").is_some());
         assert_eq!(sheet_extent(Sheet::Numbers), (99, 13));
         assert_eq!(sheet_extent(Sheet::NumsEx), (108, 13));
-    }
-
-    /// S17 §8: the base skin ships these eleven cursors; the loader must ask
-    /// for every one of them.
-    #[test]
-    fn the_base_skin_cursor_set_is_covered() {
-        for name in [
-            "normal", "close", "eqslid", "eqtitle", "posbar", "psize", "ptbar", "pvscroll",
-            "titlebar", "volbal", "pnormal",
-        ] {
-            let wanted = format!("{name}.cur");
-            assert!(
-                CURSOR_NAMES.iter().any(|c| c.eq_ignore_ascii_case(&wanted)),
-                "the loader never asks for {wanted}"
-            );
-        }
     }
 
     /// S01 §2.4: the transport buttons are 22 px wide at a 23 px pitch.

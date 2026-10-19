@@ -14,7 +14,7 @@ use std::io::Read;
 
 use rustamp_skin::rust_theme;
 use rustamp_skin::webamp::{self, Sheet};
-use rustamp_skin::{CursorKind, PlaylistStyle, Region};
+use rustamp_skin::{CursorKind, CursorSlot, PlaylistStyle, Region};
 
 /// Exact spec dimensions per `specs/S01-window-geometry.md` §5 (lines 680–697).
 const SPEC_SHEET_SIZES: &[(Sheet, u32, u32, &str)] = &[
@@ -83,8 +83,10 @@ fn rust_theme_loads_all_32_entries_without_substitutions() {
         "Rust theme must ship all 11 cursors"
     );
     for (name, _, _) in CURSOR_NAMES_11 {
+        let slot =
+            CursorSlot::from_file_name(name).unwrap_or_else(|| panic!("{name} is no cursor slot"));
         let cur = skin
-            .cursor(name)
+            .cursor_slot(slot)
             .unwrap_or_else(|| panic!("missing cursor {name}"));
         assert_eq!(cur.kind, CursorKind::Cur);
         assert!(!cur.bytes.is_empty());
