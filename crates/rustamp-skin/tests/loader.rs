@@ -402,7 +402,10 @@ fn text_files_are_parsed_when_present() {
     assert_eq!(pledit.current, [0x44, 0x55, 0x66]);
     assert_eq!(pledit.normal_bg, [0x77, 0x88, 0x99]);
     assert_eq!(pledit.selected_bg, [0xAA, 0xBB, 0xCC]);
-    assert_eq!(pledit.font.as_deref(), Some("Comic Sans MS"));
+    assert_eq!(
+        pledit.font.as_ref().map(|font| font.family.as_str()),
+        Some("Comic Sans MS")
+    );
 
     assert_eq!(skin.viscolors()[0], [10, 20, 30]);
     assert_eq!(skin.viscolors()[1], [40, 50, 60]);
@@ -414,6 +417,27 @@ fn text_files_are_parsed_when_present() {
         vec![(0, 0), (275, 0), (275, 116), (0, 116)]
     );
     assert_eq!(skin.region().window_shade().len(), 1);
+}
+
+/// The `Font=` line carries the family, the size and the style flags: S17 §5
+/// settles the family, the rest is the classic `Font=Name,size` form.
+#[test]
+fn the_font_line_carries_the_size_and_the_style_flags() {
+    let mut entries = synthetic_entries();
+    entries.retain(|(name, _)| !name.eq_ignore_ascii_case("pledit.txt"));
+    entries.push((
+        "pledit.txt".to_string(),
+        b"[Text]\nFont=Comic Sans MS,11,bold\n".to_vec(),
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    write_folder(dir.path(), &entries);
+
+    let skin = Skin::load(dir.path()).unwrap();
+    let font = skin.pledit().font.as_ref().expect("the font line");
+    assert_eq!(font.family, "Comic Sans MS");
+    assert_eq!(font.size, Some(11));
+    assert!(font.bold);
+    assert!(!font.italic);
 }
 
 #[test]

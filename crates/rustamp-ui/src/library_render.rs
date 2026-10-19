@@ -222,6 +222,17 @@ pub const LIBRARY_SEARCH_PLACEHOLDER: &str = "Search the library";
 /// host without this font still draws a readable list.
 pub const LIBRARY_FONT_FAMILY: &str = "Segoe UI";
 
+/// The system font the library draws its text with.
+///
+/// The library window is not skinned, so it uses the same size the playlist
+/// rows use and no style flags.
+const LIBRARY_FONT: crate::playlist_font::SystemFont<'static> = crate::playlist_font::SystemFont {
+    family: LIBRARY_FONT_FAMILY,
+    size: crate::playlist_font::DEFAULT_SIZE,
+    bold: false,
+    italic: false,
+};
+
 // ---------------------------------------------------------------------------
 // The geometry
 // ---------------------------------------------------------------------------
@@ -600,7 +611,7 @@ fn draw_search(frame: &mut Image, view: &LibraryView, chrome: &LibraryChrome, fo
 /// text that is longer than the field is clipped, and its caret stands at
 /// the field's right edge.
 fn draw_caret(frame: &mut Image, text: &str, field: Rect, band: Rect) {
-    let width = crate::playlist_font::text_width(LIBRARY_FONT_FAMILY, text).unwrap_or(0);
+    let width = crate::playlist_font::text_width(LIBRARY_FONT, text).unwrap_or(0);
     let caret_x = field
         .x
         .saturating_add(width as i32)
@@ -668,7 +679,7 @@ fn draw_text(frame: &mut Image, text: &str, band: Rect, colour: [u8; 3]) {
         return;
     }
     let Some(scratch) =
-        crate::playlist_font::render(LIBRARY_FONT_FAMILY, text, band.width, band.height, colour)
+        crate::playlist_font::render(LIBRARY_FONT, text, band.width, band.height, colour)
     else {
         return;
     };

@@ -37,9 +37,10 @@
 //! Deliberate simplifications (the spec leaves these open, so they are kept
 //! simple and named):
 //!
-//! * Entry text uses the installed family from `pledit.txt` (S17 §5). Our
-//!   rasterization size/hinting are not a claim of GDI-exact reference pixels.
-//!   If no system font is available, the bitmap font is an explicit fallback.
+//! * Entry text uses the installed family from `pledit.txt` (S17 §5), at the
+//!   size and with the style the same line asks for. Our rasterization
+//!   size/hinting are not a claim of GDI-exact reference pixels. If no system
+//!   font is available, the bitmap font is an explicit fallback.
 //! * The up/down split of the arrow pair (at y = 83) is an own choice; only
 //!   the two click points are settled.
 //! * The handle-y interpolation between the three settled points is an own
@@ -601,7 +602,8 @@ fn playlist_font_mask(mut image: Image) -> Option<BitmapFont> {
 ///
 /// `Normal` and `Current` tint the glyph ink independently of selection;
 /// `Current` applies only to the app-supplied current entry, not the clicked
-/// or selected one (S17 §5).
+/// or selected one (S17 §5). The **font** is the skin's too: the `Font=`
+/// line of `pledit.txt` names the family, the size and the style (S17 §5).
 fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &[String]) {
     let style = skin.pledit();
     let selected = [
@@ -611,6 +613,7 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
         255,
     ];
     let font = text_font(skin);
+    let request = crate::playlist_font::SystemFont::from_playlist_font(style.font.as_ref());
     let visible = window.visible_ids();
     let selected_ids = window.selected_ids();
     for (i, id) in visible.iter().enumerate().take(VISIBLE_ROWS) {
@@ -629,13 +632,9 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
         } else {
             style.normal
         };
-        if let Some(scratch) = crate::playlist_font::render(
-            style.font.as_deref().unwrap_or("Arial"),
-            text,
-            rect.width,
-            rect.height,
-            colour,
-        ) {
+        if let Some(scratch) =
+            crate::playlist_font::render(request, text, rect.width, rect.height, colour)
+        {
             canvas.blit_alpha(&scratch, scratch.bounds(), rect.x, rect.y);
         } else if let Some(font) = font.as_ref() {
             // Scratch-clipped like the main-window marquee, so text cannot
