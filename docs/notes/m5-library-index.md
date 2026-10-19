@@ -41,6 +41,8 @@ same second.
   `NotFound` when the path is not a root), `Library::roots() -> Vec<Root>`
 - `Library::query(&Query) -> TrackPage { rows, total }`, `Library::count()`,
   `Library::get(id)`
+- `Library::write_tags(id, &TrackMetadata) -> Result<TrackRow>` (writes the
+  tags into the real file and refreshes the row from it, see below)
 - `TrackRow { id, path, metadata: TrackMetadata, mtime_ns, size }`
 - `Root { id, path, added_at }`
 - `Query { path_prefix, artist, album, title, genre, text, sort, descending,
@@ -92,7 +94,41 @@ of the roots table, so a path can be scanned without being registered.
 A re-scan of an unchanged tree reports zero `added`/`updated`/`removed`, zero
 `skipped`, and returns identical row ids.
 
-## Tests (24, all headless on temp directories)
+## Tag writing (wave169)
+
+`Library::write_tags(id, &TrackMetadata) -> Result<TrackRow>` edits the tags of
+an indexed track. The values go into the **real file** through
+`rustamp_meta::write_tags`, which replaces the file atomically (the file is
+either the old one or the new one). A field that is `None` is left as the file
+has it (the `rustamp-meta` contract), so one field can be edited without the
+others being lost.
+
+The row is then rebuilt from the file: the tags are **read back** after the
+write, and it is those values that land in the index - never the values the
+caller passed in. A format that stores a value differently, or cannot store it
+at all, therefore shows up in the index as the file really is; the index can
+never claim a value the file does not carry. The row id does not change (the
+row is updated in place), and the stored `mtime_ns`/`size` are refreshed from
+the written file, so the next scan sees no change and does not read the file
+a second time. The refreshed row is returned.
+
+Error cases:
+
+- `NotFound` if no row has the id, and `NotFound` if the file the row points
+  at is gone - a file that vanished between the scan and the write is
+  reported, never written into the row silently.
+- The error of the write itself: an unreadable file, a format whose tags
+  cannot be written (`UnsupportedFormat`), a year a tag cannot hold
+  (`InvalidArgument`).
+- The error of reading the tags back, if the written file cannot be read any
+  more.
+
+A failed write leaves the row exactly as it was, and the file untouched (the
+write is atomic). A write that succeeded but could not be read back leaves the
+row as it was, too: the row is then stale and the next scan repairs it,
+because the file's stat no longer matches the stored one.
+
+## Tests (32, all headless on temp directories)
 
 Scan/query (14, wave145): `scan_indexes_and_queries`, `rescan_is_idempotent`,
 `update_on_change`, `removed_files_dropped`, `query_by_album`,
@@ -116,6 +152,17 @@ straight in the index, because a WAV tag cannot carry `duration_ms`),
 `pagination_reports_the_unpaged_total` (boundaries: first/next/last page, past
 the end, `None` limit, `limit 0`, filter-scoped total).
 
+Tag writing (8, wave169): `writing_tags_updates_the_row_without_a_rescan`
+(the row follows the write, the id survives, the file carries the new value
+and the next scan finds no change), `the_row_follows_the_file_and_not_the_caller`
+(a value the format cannot store never reaches the row),
+`a_partial_write_keeps_the_tags_the_caller_did_not_set`,
+`a_failed_write_leaves_the_row_unchanged` (a year a tag cannot hold),
+`a_write_to_a_file_that_is_no_media_leaves_the_row_unchanged`,
+`a_vanished_file_is_reported_and_leaves_the_row_alone`,
+`writing_to_an_unknown_track_is_an_error`,
+`a_write_keeps_the_extra_tags_of_the_file`.
+
 Fixtures are 44-byte WAV headers written with `rustamp_meta::write_tags`, so no
 audio is decoded and no window is opened.
 
@@ -126,8 +173,10 @@ audio is decoded and no window is opened.
   can loop over `roots()` calling `scan_root(id)` per root.
 - Display columns: title, artist, album, track, duration, genre, path; the
   index has no column for artwork or for the file name.
-- Tag editing: `rustamp_meta::write_tags`, then re-scan the file (or update
-  the row directly) — no write API in this crate yet.
+- Tag editing is available now: `Library::write_tags(id, &metadata)` writes
+  the file and returns the refreshed row. A caller that needs to know which
+  `extra` entries the target format refused uses
+  `rustamp_meta::write_tags_report` directly.
 - Artwork via `rustamp_meta::read_artwork`; not stored in the index.
 - A per-root last-scan timestamp (the `roots` table has only `added_at`) and
   scan progress.
@@ -145,6 +194,8 @@ audio is decoded and no window is opened.
   full-text index; there is no ranking and no cross-column matching.
 - Sorting by duration is mostly a stable order over `NULL`s today, because
   `rustamp-meta` does not read audio properties.
+- A tag write cannot ask for a field to be removed: `write_tags` reads a
+  `None` as "leave the value the file has".
 
 ## Dependency added
 
