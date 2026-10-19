@@ -258,7 +258,7 @@ fn replaygain_is_disabled_by_default() {
     let h = Harness::new(&["rg_-6.02_none_1_44100.tst"]);
     assert_eq!(
         h.engine.replaygain_mode(),
-        ReplayGainMode::Disabled,
+        ReplayGainMode::Off,
         "loudness never changes until the user asks"
     );
     assert_eq!(h.engine.replaygain_preamp_db(), 0.0);

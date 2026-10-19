@@ -159,7 +159,7 @@ use rustamp_core::vis::VisFrame;
 use rustamp_dsp::{EqControl, Equalizer, Limiter, LimiterControl};
 
 use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, clamped_index, spawn};
-use crate::replaygain::{ReplayGainControl, ReplayGainMode};
+use crate::replaygain::{IntoReplayGainValue, ReplayGainControl, ReplayGainMode};
 use crate::ring::{GainState, RingSync, make_render};
 
 /// Engine configuration.
@@ -925,7 +925,7 @@ impl Engine {
     }
 
     /// Select which ReplayGain value normalizes a track
-    /// ([`ReplayGainMode::Disabled`], [`ReplayGainMode::Track`] or
+    /// ([`ReplayGainMode::Off`], [`ReplayGainMode::Track`] or
     /// [`ReplayGainMode::Album`]).
     ///
     /// Takes effect from the next track (or seek): the decode thread
@@ -948,6 +948,33 @@ impl Engine {
     /// previous value). Takes effect from the next track (or seek).
     pub fn set_replaygain_preamp_db(&mut self, preamp_db: f32) {
         self.replaygain_control.set_preamp_db(preamp_db);
+    }
+
+    /// Set the ReplayGain mode and the current track's gain/peak values.
+    ///
+    /// The app calls this when a track starts, passing the values read from
+    /// the track's metadata (see `rustamp-meta::replaygain::ReplayGainTags`).
+    /// `None` (or a non-finite number) means the tag is absent.
+    pub fn set_replaygain<TG, TP, AG, AP>(
+        &mut self,
+        mode: ReplayGainMode,
+        track_gain_db: TG,
+        track_peak: TP,
+        album_gain_db: AG,
+        album_peak: AP,
+    ) where
+        TG: IntoReplayGainValue,
+        TP: IntoReplayGainValue,
+        AG: IntoReplayGainValue,
+        AP: IntoReplayGainValue,
+    {
+        self.replaygain_control.set_mode(mode);
+        self.replaygain_control.set_track_values(
+            track_gain_db.into_value(),
+            track_peak.into_value(),
+            album_gain_db.into_value(),
+            album_peak.into_value(),
+        );
     }
 
     /// The ReplayGain control block, shared with the decode thread.
