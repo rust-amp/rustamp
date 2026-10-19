@@ -7,7 +7,9 @@
 use std::time::{Duration, Instant};
 
 use rustamp_ipc::Message;
-use rustamp_ipc::shm::{MappedRegion, RingConsumer, RingDirection, RingError, RingProducer};
+use rustamp_ipc::shm::{
+    MappedRegion, RingConsumer, RingDirection, RingError, RingKind, RingProducer,
+};
 use rustamp_proto::host::PcmSpecWire;
 
 use crate::control::RingAbort;
@@ -135,12 +137,22 @@ pub struct PcmInput<R: MappedRegion> {
 
 /// Mapping policy. The real implementation is [`NamedPcmRings`] on Windows;
 /// tests substitute shared anonymous regions, not a second transfer algorithm.
+///
+/// Every implementation must apply the direction rule of [`check_offer`]: a
+/// ring is offered in one direction only, and an opener refuses an offer
+/// whose direction is not the one it expects, before any mapping opens.
 pub trait PcmRings: Send + 'static {
     /// Mapping backing each endpoint.
     type Region: MappedRegion + 'static;
     /// Allocate a fresh ring and its wake before announcing it.
+    ///
+    /// The decoder path: the ring runs host -> main, so the offer announces
+    /// [`RingDirection::HostToMain`].
     fn create(&self, spec: PcmSpecWire, capacity: u32) -> Result<PcmOffer<Self::Region>>;
     /// Validate/open the ring and wake before returning RingReady.
+    ///
+    /// The decoder path: an offer in another direction is refused
+    /// ([`check_offer`]).
     fn open(&self, offer: &Message, spec: PcmSpecWire) -> Result<PcmInput<Self::Region>>;
 
     /// Direction-aware allocation. The default covers the decoder path
@@ -163,6 +175,9 @@ pub trait PcmRings: Send + 'static {
 
     /// Direction-aware open. The default covers the decoder path through
     /// [`PcmRings::open`]; see [`PcmRings::create_directed`].
+    ///
+    /// An offer whose direction is not `direction` is refused
+    /// ([`check_offer`]).
     fn open_directed(
         &self,
         offer: &Message,
@@ -184,6 +199,34 @@ pub fn validate_spec(spec: PcmSpecWire) -> Result<()> {
     if spec.channels == 0 || spec.sample_rate_hz == 0 {
         return Err(MediaHostError::InvalidMessage(
             "zero PCM channels/sample rate".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an offer that is not a PCM ring in the expected direction.
+///
+/// The direction tells an opener which end it is (RFC 0003 §9): the decoder's
+/// PCM ring runs host -> main (`HostToMain`), the DSP in-ring main -> host
+/// (`MainToHost`). An opener that expects one direction refuses an offer for
+/// the other one **before** it opens a mapping, so a ring offered backwards
+/// never carries data.
+///
+/// This is the single copy of that rule: production ([`NamedPcmRings`]) and
+/// the in-process test doubles call it, so a test double cannot drift from
+/// the rule production enforces.
+pub fn check_offer(offer: &Message, expected: RingDirection) -> Result<()> {
+    let Message::RingOffer {
+        kind, direction, ..
+    } = offer
+    else {
+        return Err(MediaHostError::InvalidMessage(
+            "expected PCM RingOffer".into(),
+        ));
+    };
+    if *kind != RingKind::Pcm || *direction != expected {
+        return Err(MediaHostError::InvalidMessage(
+            "wrong ring kind/direction".into(),
         ));
     }
     Ok(())
@@ -254,7 +297,7 @@ impl NamedPcmRings {
         direction: RingDirection,
     ) -> Result<PcmOffer<rustamp_ipc::shm::NamedRegion>> {
         use rustamp_ipc::shm::{
-            MAX_RING_BYTES, NamedRegion, RING_DATA_OFFSET, RingKind, RingWake, ring_name,
+            MAX_RING_BYTES, NamedRegion, RING_DATA_OFFSET, RingWake, ring_name,
         };
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -306,28 +349,26 @@ impl NamedPcmRings {
         expected: RingDirection,
     ) -> Result<PcmInput<rustamp_ipc::shm::NamedRegion>> {
         use rustamp_ipc::shm::{
-            MAX_RING_BYTES, NamedRegion, RING_DATA_OFFSET, RingError, RingKind, RingWake,
+            MAX_RING_BYTES, NamedRegion, RING_DATA_OFFSET, RingError, RingWake,
         };
         validate_spec(spec)?;
+        // The kind and the direction are checked before any mapping opens, so
+        // a ring offered backwards never carries data.
+        check_offer(offer, expected)?;
         let Message::RingOffer {
             name,
-            kind,
             frame_size,
             capacity,
             size,
             generation,
-            direction,
+            ..
         } = offer
         else {
+            // `check_offer` already refused every other message.
             return Err(MediaHostError::InvalidMessage(
                 "expected PCM RingOffer".into(),
             ));
         };
-        if *kind != RingKind::Pcm || *direction != expected {
-            return Err(MediaHostError::InvalidMessage(
-                "wrong ring kind/direction".into(),
-            ));
-        }
         if *frame_size != spec.frame_size() {
             return Err(RingError::FrameSizeMismatch {
                 expected: spec.frame_size(),
@@ -353,5 +394,73 @@ impl NamedPcmRings {
             consumer,
             abort: Box::new(CloseRing(abort)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A PCM ring offer in `direction`.
+    fn pcm_offer(direction: RingDirection) -> Message {
+        Message::RingOffer {
+            name: "mediahost-direction-rule".into(),
+            kind: RingKind::Pcm,
+            frame_size: 8,
+            capacity: 1,
+            size: 64,
+            generation: 1,
+            direction,
+        }
+    }
+
+    #[test]
+    fn an_offer_in_the_expected_direction_is_accepted() {
+        assert!(
+            check_offer(
+                &pcm_offer(RingDirection::HostToMain),
+                RingDirection::HostToMain
+            )
+            .is_ok()
+        );
+        assert!(
+            check_offer(
+                &pcm_offer(RingDirection::MainToHost),
+                RingDirection::MainToHost
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_offer_in_the_other_direction_is_refused() {
+        for (offered, expected) in [
+            (RingDirection::MainToHost, RingDirection::HostToMain),
+            (RingDirection::HostToMain, RingDirection::MainToHost),
+        ] {
+            assert!(
+                matches!(
+                    check_offer(&pcm_offer(offered), expected),
+                    Err(MediaHostError::InvalidMessage(_))
+                ),
+                "a ring offered {offered:?} must not open as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_that_is_no_pcm_ring_offer_is_refused() {
+        assert!(matches!(
+            check_offer(&Message::hello(), RingDirection::HostToMain),
+            Err(MediaHostError::InvalidMessage(_))
+        ));
+        let mut vis = pcm_offer(RingDirection::HostToMain);
+        if let Message::RingOffer { kind, .. } = &mut vis {
+            *kind = RingKind::Vis;
+        }
+        assert!(matches!(
+            check_offer(&vis, RingDirection::HostToMain),
+            Err(MediaHostError::InvalidMessage(_))
+        ));
     }
 }
