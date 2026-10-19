@@ -17,6 +17,12 @@
 //! as a playback error: [`VisError::NonFinitePcm`] is an offline validation
 //! invariant that the live path cannot reach (RFC 0014 §4.5) and must not halt
 //! playback.
+//!
+//! The colours are the skin's own: the renderer reads the 24 slots of the
+//! loaded skin's `viscolor.txt` (S17 §6, see [`slots`]) and invents no colour
+//! of its own. A skin without a `viscolor.txt` falls back to the built-in
+//! default list (`rustamp_skin::webamp::DEFAULT_VISCOLORS`), so the palette
+//! always comes from the skin that is loaded.
 
 use rustamp_core::vis::VisFrame;
 use rustamp_gfx::{Image, Rect};
@@ -29,6 +35,28 @@ use crate::state::TransportState;
 
 const BAR_PITCH: i32 = 4;
 const BAR_WIDTH: u32 = 3;
+
+/// The `viscolor.txt` slot numbers and what they mean (S17 §6).
+///
+/// S17 §6 lists the slots of a skin's `viscolor.txt` and the meaning of each
+/// one. The renderer draws with these slots and with no other colour, so the
+/// map below is the whole contract between a skin and the analyser.
+pub mod slots {
+    /// The analyser background: the whole analyser area.
+    pub const BACKGROUND: usize = 0;
+    /// The grid dots, drawn on every second pixel.
+    pub const GRID: usize = 1;
+    /// The first spectrum-gradient slot: the **top** row of a bar.
+    pub const SPECTRUM_TOP: usize = 2;
+    /// The last spectrum-gradient slot: the **bottom** row of a bar.
+    pub const SPECTRUM_BOTTOM: usize = 17;
+    /// The first oscilloscope slot: the brightest of the five.
+    pub const OSCILLOSCOPE_FIRST: usize = 18;
+    /// The last oscilloscope slot: the dimmest of the five.
+    pub const OSCILLOSCOPE_LAST: usize = 22;
+    /// The peak marker that rides above a falling bar.
+    pub const PEAK: usize = 23;
+}
 
 /// UI render choices and switching order, all **own choices** (Q9 open).
 /// Both scope styles use the shared [`ClassicMode::Oscilloscope`].
@@ -262,10 +290,48 @@ fn scope_row(sample: f32) -> u8 {
     ((1.0 - f64::from(sample).clamp(-1.0, 1.0)) * f64::from(SPECTRUM_ROWS - 1) * 0.5).round() as u8
 }
 
-/// Paint only within `area`. Slot use/orientation/grid/strokes are own choices
-/// (Q2/Q4/Q8/Q9 open), not promoted from S17's provisional slot descriptions.
-/// Slot 0 background; slot 1 dots at even x/y; slots 2..17 bottom->top ramp;
-/// slot 23 peaks; slot 18 scope. No colour constants bypass the skin palette.
+/// The slot of the spectrum gradient row `row`, counted from the bar's bottom.
+///
+/// S17 §6: slots 2..17 are the 16-colour gradient, **slot 2 at the top of the
+/// bar and slot 17 at the bottom**. The base skin's own file names slot 2 "top
+/// of spec", and our Rust theme names slot 2 "top spectrum peak" and slot 17
+/// "bottom baseline ember", so the ramp runs from the top row down.
+fn spectrum_slot(row: u8) -> usize {
+    slots::SPECTRUM_BOTTOM - usize::from(row)
+}
+
+/// The slot of the oscilloscope row `row`.
+///
+/// S17 §6: slots 18..22 are the five oscilloscope colours, slot 18 the
+/// brightest and the later ones progressively dimmer. Which sample wears which
+/// colour is not determined by the spec, so it stays an own choice: the trace
+/// steps one slot away from the centre line per row, and the outermost rows
+/// share the dimmest colour. The quiet trace therefore keeps the skin's
+/// brightest oscilloscope colour.
+fn oscilloscope_slot(row: u8) -> usize {
+    let row = i32::from(row);
+    // The centre line lies between the two middle rows.
+    let low = i32::from((SPECTRUM_ROWS - 1) / 2);
+    let high = i32::from(SPECTRUM_ROWS / 2);
+    let distance = (row - low).abs().min((row - high).abs()) as usize;
+    let steps = slots::OSCILLOSCOPE_LAST - slots::OSCILLOSCOPE_FIRST;
+    slots::OSCILLOSCOPE_FIRST + distance.min(steps)
+}
+
+/// Paint only within `area`. Every colour comes from the skin's palette
+/// (`viscolor.txt`, S17 §6), so a skin change repaints the analyser in the new
+/// colours without any other wiring.
+///
+/// | Slot | Drawn as |
+/// |---|---|
+/// | 0 | the analyser background |
+/// | 1 | the grid dots, on every second pixel |
+/// | 2..17 | the bar rows, slot 2 at the top of a bar and slot 17 at the bottom |
+/// | 18..22 | the oscilloscope trace, one step per row away from the centre line |
+/// | 23 | the peak marker above a falling bar |
+///
+/// The grid pitch, the stroke styles and the row the oscilloscope colour
+/// steps from are own choices (Q2/Q4/Q9 open).
 pub fn draw_visualization(
     canvas: &mut Image,
     area: Rect,
@@ -277,11 +343,15 @@ pub fn draw_visualization(
         [r, g, b, 255]
     };
     // Fixed-size scratch makes even a changed layout safe: clip, never spill.
-    let mut image = Image::filled(SCOPE_COLUMNS as u32, u32::from(SPECTRUM_ROWS), color(0));
+    let mut image = Image::filled(
+        SCOPE_COLUMNS as u32,
+        u32::from(SPECTRUM_ROWS),
+        color(slots::BACKGROUND),
+    );
     if state.mode != VisMode::Off {
         for y in (0..i32::from(SPECTRUM_ROWS)).step_by(2) {
             for x in (0..SCOPE_COLUMNS as i32).step_by(2) {
-                image.set_pixel(x, y, color(1));
+                image.set_pixel(x, y, color(slots::GRID));
             }
         }
     }
@@ -292,14 +362,14 @@ pub fn draw_visualization(
                 for row in 0..state.bars[band].min(SPECTRUM_ROWS) {
                     image.fill_rect(
                         Rect::new(x, i32::from(SPECTRUM_ROWS - 1 - row), BAR_WIDTH, 1),
-                        color(2 + usize::from(row)),
+                        color(spectrum_slot(row)),
                     );
                 }
                 let peak = state.peaks[band].min(SPECTRUM_ROWS);
                 if peak > 0 {
                     image.fill_rect(
                         Rect::new(x, i32::from(SPECTRUM_ROWS - peak), BAR_WIDTH, 1),
-                        color(23),
+                        color(slots::PEAK),
                     );
                 }
             }
@@ -310,17 +380,13 @@ pub fn draw_visualization(
                 if state.mode == VisMode::Scope && x > 0 {
                     let previous = state.scope[x - 1].min(SPECTRUM_ROWS - 1);
                     // A one-column vertical bridge connects adjacent samples.
-                    image.fill_rect(
-                        Rect::new(
-                            x as i32,
-                            i32::from(row.min(previous)),
-                            1,
-                            u32::from(row.abs_diff(previous)) + 1,
-                        ),
-                        color(18),
-                    );
+                    // Every row of the bridge wears the colour of its row, so
+                    // the trace keeps the skin's brightness ramp.
+                    for y in row.min(previous)..=row.max(previous) {
+                        image.set_pixel(x as i32, i32::from(y), color(oscilloscope_slot(y)));
+                    }
                 } else {
-                    image.set_pixel(x as i32, i32::from(row), color(18));
+                    image.set_pixel(x as i32, i32::from(row), color(oscilloscope_slot(row)));
                 }
             }
         }
@@ -482,13 +548,13 @@ mod tests {
         state.peaks[0] = 16;
         state.bars[18] = 1;
         draw_visualization(&mut image, area, &state, &palette);
-        assert_eq!(image.pixel(3, 4), Some([23, 0, 0, 255]));
-        assert_eq!(image.pixel(5, 5), Some([16, 0, 0, 255]));
-        assert_eq!(image.pixel(3, 19), Some([2, 0, 0, 255]));
+        assert_eq!(image.pixel(3, 4), Some([23, 0, 0, 255]), "peak marker");
+        assert_eq!(image.pixel(5, 5), Some([3, 0, 0, 255]), "bar row 14");
+        assert_eq!(image.pixel(3, 19), Some([17, 0, 0, 255]), "bar row 0");
         assert_eq!(image.pixel(6, 19), Some([0, 0, 0, 255]), "one-column gap");
         assert_eq!(
             image.pixel(75, 19),
-            Some([2, 0, 0, 255]),
+            Some([17, 0, 0, 255]),
             "last bar starts at 72"
         );
         for y in 0..30 {
@@ -506,6 +572,54 @@ mod tests {
         assert_eq!(image.pixel(99, 29), Some(sentinel));
     }
 
+    /// S17 §6: slots 2..17 are the spectrum gradient, slot 2 at the **top** of
+    /// a bar and slot 17 at the bottom.
+    #[test]
+    fn the_spectrum_gradient_runs_from_slot_2_at_the_top_to_slot_17_at_the_bottom() {
+        let palette = std::array::from_fn(|slot| [slot as u8, 0, 0]);
+        let area = Rect::new(0, 0, 76, 16);
+        let mut image = Image::new(76, 16);
+        let mut state = VisState::default();
+        state.bars[0] = 16;
+        draw_visualization(&mut image, area, &state, &palette);
+        for row in 0..SPECTRUM_ROWS {
+            let y = i32::from(SPECTRUM_ROWS - 1 - row);
+            assert_eq!(
+                image.pixel(0, y),
+                Some([slots::SPECTRUM_BOTTOM as u8 - row, 0, 0, 255]),
+                "row {row} of the bar"
+            );
+        }
+    }
+
+    /// S17 §6: slots 18..22 are the five oscilloscope colours, slot 18 the
+    /// brightest. The trace steps one slot per row away from the centre line.
+    #[test]
+    fn the_oscilloscope_wears_the_five_brightness_slots() {
+        let palette = std::array::from_fn(|slot| [slot as u8, 0, 0]);
+        let area = Rect::new(0, 0, 76, 16);
+        let mut image = Image::new(76, 16);
+        let mut state = VisState {
+            mode: VisMode::ScopeDots,
+            input: VisInput::Fresh,
+            ..VisState::default()
+        };
+        // One sample per row, from the top row to the bottom row.
+        for (column, row) in state.scope.iter_mut().enumerate().take(16) {
+            *row = column as u8;
+        }
+        draw_visualization(&mut image, area, &state, &palette);
+        for (column, row) in state.scope.iter().enumerate().take(16) {
+            let distance = (*row as i32 - 7).abs().min((*row as i32 - 8).abs());
+            let expected = slots::OSCILLOSCOPE_FIRST as u8 + distance.min(4) as u8;
+            assert_eq!(
+                image.pixel(column as i32, i32::from(*row)),
+                Some([expected, 0, 0, 255]),
+                "row {row}"
+            );
+        }
+    }
+
     #[test]
     fn missing_scope_draws_no_fake_line_and_styles_have_different_strokes() {
         let palette = std::array::from_fn(|slot| [slot as u8, 0, 0]);
@@ -517,12 +631,10 @@ mod tests {
         };
         draw_visualization(&mut image, area, &state, &palette);
         assert!(
-            !image
-                .as_rgba()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .any(|p| p[0] == 18)
+            !image.as_rgba().as_chunks::<4>().0.iter().any(|p| {
+                (slots::OSCILLOSCOPE_FIRST as u8..=slots::OSCILLOSCOPE_LAST as u8).contains(&p[0])
+            }),
+            "no oscilloscope colour without fresh input"
         );
         state.input = VisInput::Fresh;
         state.scope[0] = 0;
@@ -532,7 +644,7 @@ mod tests {
         state.mode = VisMode::ScopeDots;
         draw_visualization(&mut image, area, &state, &palette);
         assert_eq!(image.pixel(1, 7), Some([0, 0, 0, 255]));
-        assert_eq!(image.pixel(1, 15), Some([18, 0, 0, 255]));
+        assert_eq!(image.pixel(1, 15), Some([22, 0, 0, 255]));
         state.mode = VisMode::Off;
         draw_visualization(&mut image, area, &state, &palette);
         assert!(
