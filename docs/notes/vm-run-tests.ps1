@@ -125,6 +125,15 @@ $genFixtureStaged = $false
 $outFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\out_rustamp_fixture.dll'
 $outFixtureStaged = $false
 
+# The visualization and DSP fixtures (crates/rustamp-plughost/examples/
+# vis_rustamp_fixture.rs and dsp_rustamp_fixture.rs) are the same kind of
+# artifact for the `vis_` and `dsp_` plugin kinds: own clean-room cdylibs,
+# built for i686 by the same test build, loaded through the OS loader.
+$visFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\vis_rustamp_fixture.dll'
+$visFixtureStaged = $false
+$dspFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\dsp_rustamp_fixture.dll'
+$dspFixtureStaged = $false
+
 # --- 1. compile on the host (builds, does not run) ---------------------------
 if (-not $SkipBuild) {
     Step 'compiling on the host (cargo test --no-run; nothing is executed)'
@@ -277,6 +286,24 @@ if (Test-Path $outFixtureDll) {
     Write-Host '    staged the i686 output plugin fixture beside the binaries'
 } else {
     Write-Host '    WARNING: no i686 output plugin fixture was built; its acceptance test will report it blocked'
+}
+
+# The visualization and DSP plugin fixtures travel with the test binaries too.
+if (Test-Path $visFixtureDll) {
+    Copy-Item $visFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
+    Copy-Item $visFixtureDll $i686TargetDeps -Force
+    $visFixtureStaged = $true
+    Write-Host '    staged the i686 visualization plugin fixture beside the binaries'
+} else {
+    Write-Host '    WARNING: no i686 visualization plugin fixture was built; its acceptance test will report it blocked'
+}
+if (Test-Path $dspFixtureDll) {
+    Copy-Item $dspFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
+    Copy-Item $dspFixtureDll $i686TargetDeps -Force
+    $dspFixtureStaged = $true
+    Write-Host '    staged the i686 DSP plugin fixture beside the binaries'
+} else {
+    Write-Host '    WARNING: no i686 DSP plugin fixture was built; its acceptance test will report it blocked'
 }
 
 foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
