@@ -332,6 +332,8 @@ pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {
             "rustamp: DPI awareness unavailable ({error}); the client area may be virtualized"
         );
     }
+    let mut app = app;
+    apply_first_start_scale(&mut app);
     let mut presenter = Windowed::new(app);
     // The product owns the main thread, so the default mode: exactly
     // `EventLoop::new()`. The off-main-thread opt-in (`true`) exists only
@@ -345,6 +347,38 @@ pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     run_res.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// The effective DPI from which the player starts at double size.
+///
+/// 144 is 150 %: below it the 275x116 classic window is still a sensible size,
+/// from there on it is too small to read.
+const HIGH_DPI: u32 = 144;
+
+/// Whether a start with no saved configuration should begin at double size:
+/// only on the first start (nothing saved yet) and only on a high-DPI primary
+/// display. Once the config file exists the saved `ui.double_size` (and the
+/// preferences) decide, so the user's choice is never overridden.
+fn first_start_double_size(config_exists: bool, primary_dpi: Option<u32>) -> bool {
+    !config_exists && primary_dpi.is_some_and(|dpi| dpi >= HIGH_DPI)
+}
+
+/// Applies [`first_start_double_size`] to `app`. Runs after DPI awareness is
+/// set, so the monitor DPI is the real one and not the virtualized 96.
+fn apply_first_start_scale(app: &mut App) {
+    let Some(path) = app.config_path() else {
+        return;
+    };
+    let exists = path.exists();
+    let dpi = rustamp_platform::DisplaySnapshot::capture()
+        .ok()
+        .and_then(|snapshot| snapshot.primary().map(|monitor| monitor.dpi));
+    if first_start_double_size(exists, dpi)
+        && !app.state().double_size
+        && let Err(error) = app.submit(Command::ToggleDoubleSize)
+    {
+        eprintln!("rustamp: could not start at double size: {error}");
+    }
 }
 
 struct Windowed {
@@ -2039,6 +2073,19 @@ mod tests {
     use rustamp_core::playlist::MediaLocation;
     use rustamp_core::state::TransportState;
     use rustamp_platform::TrayMenuEntry;
+
+    #[test]
+    fn double_size_is_a_first_start_default_on_high_dpi_only() {
+        // First start on a 150 % / 200 % display: double size.
+        assert!(first_start_double_size(false, Some(144)));
+        assert!(first_start_double_size(false, Some(192)));
+        // A 100 % / 125 % display, or an unknown one, keeps the classic size.
+        assert!(!first_start_double_size(false, Some(96)));
+        assert!(!first_start_double_size(false, Some(120)));
+        assert!(!first_start_double_size(false, None));
+        // Once a config exists the saved choice rules, whatever the DPI.
+        assert!(!first_start_double_size(true, Some(192)));
+    }
 
     /// No event loop, window, hotkey registration, host process or audio device.
     fn desktop_test_presenter(with_tracks: bool) -> Windowed {
