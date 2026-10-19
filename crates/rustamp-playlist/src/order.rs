@@ -127,6 +127,16 @@ impl PlaybackOrder {
     }
 
     /// Explicitly set the current index (e.g. user selected track).
+    ///
+    /// In shuffle mode the active permutation is kept and the cursor moves
+    /// into it: the traversal continues behind the selected track, and the
+    /// entries before it in the permutation are deferred to the next cycle.
+    /// The permutation itself is only rebuilt by [`set_shuffle`](Self::set_shuffle),
+    /// [`set_len`](Self::set_len) and [`invalidate`](Self::invalidate).
+    ///
+    /// The engine's decode thread relies on that: it re-aligns its own
+    /// place in a permutation the engine re-planned (S15 §4.1) without
+    /// disturbing it.
     pub fn set_current_index(&mut self, index: Option<usize>) {
         if let Some(idx) = index {
             if idx < self.len {
