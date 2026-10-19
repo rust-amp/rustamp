@@ -25,9 +25,10 @@
 //!
 //! `set_volume` and `set_pan` are the two callbacks the host itself may
 //! call: S09 §3.5 step 2 has it apply the player's levels to the output
-//! before `play` (the hand-over, see `src/handoff.rs`). The fixture keeps the
-//! two values without tracing them, so the acceptance test's "no playback
-//! call" assertion stays about the playback path.
+//! before `play` (the hand-over, see `src/handoff.rs`). They are recorded
+//! too, so the hand-over's host half is visible in the output plug-in's own
+//! trace; the acceptance test asserts that they are absent as well, because
+//! no hand-over happens there.
 //!
 //! # What this is not
 //!
@@ -74,7 +75,7 @@ const HOST_WINDOW_CLASS: &str = "Winamp v1.x";
 /// it before it calls `init` (S09 §0, §4.1).
 static mut MODULE: OutModule = OutModule {
     version: OUT_VERSION,
-    description: c"Rustamp out fixture".as_ptr(),
+    description: FIXTURE_DESCRIPTION.as_ptr().cast::<c_char>(),
     id: FIXTURE_MODULE_ID,
     main_window: core::ptr::null_mut(),
     dll_instance: core::ptr::null_mut(),
@@ -195,7 +196,7 @@ unsafe extern "C" fn fixture_open(
 /// `close` (S09 §4.1 offset 0x28): close the device. Driven by the input
 /// plugin, never by the host.
 unsafe extern "C" fn fixture_close() {
-    trace("close");
+    trace(EVENT_CLOSE);
 }
 
 /// `write` (S09 §4.1 offset 0x2C): take at most 8192 bytes, never block.
@@ -216,13 +217,20 @@ unsafe extern "C" fn fixture_write(_data: *mut c_char, len: c_int) -> c_int {
 }
 
 /// `can_write` (S09 §4.1 offset 0x30): how many bytes fit right now.
+///
+/// Driven by the input plugin, never by the host (S09 §4.2 step 3).
 unsafe extern "C" fn fixture_can_write() -> c_int {
+    trace(&format!("{EVENT_CAN_WRITE}{FIXTURE_BUFFER_BYTES}"));
     FIXTURE_BUFFER_BYTES
 }
 
 /// `is_playing` (S09 §4.1 offset 0x34): nonzero while audio is still audible.
+///
+/// Driven by the input plugin, never by the host (S09 §4.2 step 3).
 unsafe extern "C" fn fixture_is_playing() -> c_int {
-    i32::from(WRITTEN_MS.load(Ordering::SeqCst) > PLAYED_MS.load(Ordering::SeqCst))
+    let playing = i32::from(WRITTEN_MS.load(Ordering::SeqCst) > PLAYED_MS.load(Ordering::SeqCst));
+    trace(&format!("{EVENT_IS_PLAYING}{playing}"));
+    playing
 }
 
 /// `pause` (S09 §4.1 offset 0x38): 1 pauses, 0 resumes; returns the previous
@@ -233,12 +241,20 @@ unsafe extern "C" fn fixture_pause(state: c_int) -> c_int {
 }
 
 /// `set_volume` (S09 §4.1 offset 0x3C): 0..255.
+///
+/// The host calls this one itself, as part of the hand-over before `play`
+/// (S09 §3.5 step 2).
 unsafe extern "C" fn fixture_set_volume(volume: c_int) {
+    trace(&format!("{EVENT_SET_VOLUME}{volume}"));
     VOLUME.store(volume.clamp(0, 255) as u32, Ordering::SeqCst);
 }
 
 /// `set_pan` (S09 §4.1 offset 0x40): -128..128.
+///
+/// The host calls this one itself, as part of the hand-over before `play`
+/// (S09 §3.5 step 2).
 unsafe extern "C" fn fixture_set_pan(pan: c_int) {
+    trace(&format!("{EVENT_SET_PAN}{pan}"));
     PAN.store(pan.clamp(-128, 128), Ordering::SeqCst);
 }
 

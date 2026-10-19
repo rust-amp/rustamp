@@ -156,6 +156,12 @@ fn occurrences(trace: &str, needle: &str) -> usize {
     trace.lines().filter(|line| *line == needle).count()
 }
 
+/// The text of a NUL-terminated description constant of the shared protocol.
+fn description_text(raw: &[u8]) -> String {
+    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
 #[test]
 #[ignore = "VM-only: maps a real 32-bit output plugin DLL into the host; run in test VM"]
 fn a_real_output_plugin_is_loaded_gets_its_host_fields_and_quits_cleanly() {
@@ -209,9 +215,10 @@ fn a_real_output_plugin_is_loaded_gets_its_host_fields_and_quits_cleanly() {
         PluginKind::Output,
         "winampGetOutModule must select the output kind (S09 §2)"
     );
-    assert!(
-        !loaded.description().is_empty(),
-        "the plugin's own description must be readable"
+    assert_eq!(
+        loaded.description(),
+        description_text(FIXTURE_DESCRIPTION),
+        "the plugin's own description must be readable from plugin memory"
     );
     println!(
         "PLUGIN_LOADED kind={:?} name={:?}",
@@ -260,9 +267,25 @@ fn a_real_output_plugin_is_loaded_gets_its_host_fields_and_quits_cleanly() {
         trace.contains(&parent_class_line(true)),
         "the parent window's class must be Winamp v1.x (S09 §1):\n{trace}"
     );
-    for forbidden in [EVENT_OPEN, EVENT_WRITE, EVENT_CONFIG, EVENT_ABOUT] {
+    // The host drives no playback callback of its own: `open`, `can_write`,
+    // `write`, `is_playing` and `close` belong to the *input* plugin's decode
+    // thread (S09 §4.2 step 3), and `set_volume`/`set_pan` to the hand-over
+    // (S09 §3.5 step 2), which needs a selected output — there is none here.
+    // The check is per line, not per substring: "can_write" contains "write",
+    // so a substring test would confuse the two calls.
+    for forbidden in [
+        EVENT_OPEN,
+        EVENT_CAN_WRITE,
+        EVENT_WRITE,
+        EVENT_IS_PLAYING,
+        EVENT_CLOSE,
+        EVENT_SET_VOLUME,
+        EVENT_SET_PAN,
+        EVENT_CONFIG,
+        EVENT_ABOUT,
+    ] {
         assert!(
-            !trace.contains(forbidden),
+            !trace.lines().any(|line| line.starts_with(forbidden)),
             "the host must not call '{forbidden}' before a configuration request:\n{trace}"
         );
     }

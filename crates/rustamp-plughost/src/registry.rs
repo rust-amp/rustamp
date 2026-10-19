@@ -440,6 +440,34 @@ impl PluginRegistry {
             .general_info()
     }
 
+    /// What the plugin with this id reports about itself, if it is an input
+    /// plugin ([`LoadedPlugin::input_info`]).
+    ///
+    /// The report is read back out of the plugin's own module struct, so it
+    /// shows the members the host filled — including `out_module`, which the
+    /// hand-over writes before `play` (S09 §3.1 offset 0x94, §3.5 step 2).
+    #[cfg(any(windows, test))]
+    pub fn input_info(&self, plugin_id: u32) -> Option<crate::input::InModuleInfo> {
+        self.loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)?
+            .plugin
+            .input_info()
+    }
+
+    /// What the plugin with this id reports about itself, if it is an output
+    /// plugin ([`LoadedPlugin::output_info`]).
+    ///
+    /// The report is read back out of the plugin's own module struct, so it
+    /// shows the members the host filled (S09 §4.1).
+    pub fn output_info(&self, plugin_id: u32) -> Option<crate::loader::OutModuleInfo> {
+        self.loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)?
+            .plugin
+            .output_info()
+    }
+
     /// Quit every loaded plugin in **reverse** load order (S09 §3.5 line 166,
     /// §7.2 line 380) and return the ids in the order they were quit.
     ///

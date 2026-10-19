@@ -132,6 +132,14 @@ $outFixtureStaged = $false
 $inFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\in_rustamp_fixture.dll'
 $inFixtureStaged = $false
 
+# The hand-over input plugin fixture (crates/rustamp-plughost/examples/
+# in_handoff_rustamp_fixture.rs) is the same kind of artifact for the input ->
+# output hand-over (S09 §3.5 step 2, §3.7): our own clean-room cdylib with
+# flag bit 0 set, built for i686 by the same test build. It drives the output
+# plugin the host hands it and opens no window and no audio device itself.
+$inHandoffFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\in_handoff_rustamp_fixture.dll'
+$inHandoffFixtureStaged = $false
+
 # The visualization and DSP fixtures (crates/rustamp-plughost/examples/
 # vis_rustamp_fixture.rs and dsp_rustamp_fixture.rs) are the same kind of
 # artifact for the `vis_` and `dsp_` plugin kinds: own clean-room cdylibs,
@@ -216,6 +224,7 @@ if (-not $SkipBuild) {
     $genFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\gen_rustamp_fixture.dll')
     $outFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\out_rustamp_fixture.dll')
     $inFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\in_rustamp_fixture.dll')
+    $inHandoffFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\in_handoff_rustamp_fixture.dll')
     $crashFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\crash_rustamp_fixture.dll')
     Write-Host ("    verified {0} staged files against the complete receipt and current workspace/runtime inputs" -f $receipt.files.Count)
 }
@@ -336,6 +345,18 @@ if (Test-Path $inFixtureDll) {
     Write-Host '    staged the i686 input plugin fixture beside the binaries'
 } else {
     Write-Host '    WARNING: no i686 input plugin fixture was built; its acceptance test will report it blocked'
+}
+
+# The hand-over input plugin fixture travels with the test binaries too: the
+# hand-over acceptance maps it and the output fixture side by side, one in
+# each process.
+if (Test-Path $inHandoffFixtureDll) {
+    Copy-Item $inHandoffFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
+    Copy-Item $inHandoffFixtureDll $i686TargetDeps -Force
+    $inHandoffFixtureStaged = $true
+    Write-Host '    staged the i686 hand-over input plugin fixture beside the binaries'
+} else {
+    Write-Host '    WARNING: no i686 hand-over input plugin fixture was built; its acceptance test will report it blocked'
 }
 
 # The visualization and DSP plugin fixtures travel with the test binaries too.
@@ -624,6 +645,15 @@ if ($inFixtureStaged) {
 } else {
     Write-Host 'in plugin fixture: NOT STAGED (the i686 build produced no input fixture); its acceptance test refuses loudly and proves nothing in this run'
 }
+# Hand-over input plugin fixture status (S09 §3.5 step 2, §3.7): the same
+# kind of own cdylib, for the input -> output hand-over. It needs no
+# third-party DLL either.
+if ($inHandoffFixtureStaged) {
+    $inHandoffFixturePath = if (Test-Path $inHandoffFixtureDll) { $inHandoffFixtureDll } else { Join-Path $Stage 'target\debug\deps\in_handoff_rustamp_fixture.dll' }
+    Write-Host ('handoff in plugin fixture: staged (our own i686 cdylib, SHA-256 {0})' -f (Get-FileHash -LiteralPath $inHandoffFixturePath -Algorithm SHA256).Hash)
+} else {
+    Write-Host 'handoff in plugin fixture: NOT STAGED (the i686 build produced no hand-over input fixture); its acceptance test refuses loudly and proves nothing in this run'
+}
 # Crashing plugin fixture status (PLAN M3, crash isolation): the same kind of
 # own cdylib, built by the i686 test build and copied into the stage with the
 # test binaries. It faults on purpose, so it only ever runs in the guest.
@@ -713,6 +743,7 @@ if ($Filter -like '--ignored*') {
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'a_real_general_purpose_plugin_is_loaded_answers_from_its_own_code_and_quits_cleanly'; Fixture = 'gen' },
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'the_real_host_process_loads_a_general_purpose_dll_and_quits_it_cleanly'; Fixture = 'gen' },
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'a_real_input_plugin_is_loaded_filled_plays_and_quits_cleanly'; Fixture = 'in' },
+        [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'a_real_input_plugin_hands_its_audio_to_the_selected_output_plugin'; Fixture = 'handoff-in' },
 
         # Group E — Real audio endpoint (2 tests - left out pending decision)
         [pscustomobject]@{ Group = 'Group E (Real Audio Endpoint)'; Name = 'the_real_device_plays_a_reference_file_to_its_end'; Blocker = 'Real audio endpoint decision (WASAPI default device)' },
@@ -756,6 +787,11 @@ if ($Filter -like '--ignored*') {
             # test can only refuse, never pass.
             $missingFixtureCount++
             Write-Host ("  [MISSING FIXTURE] {0,-21} {1} (the i686 input plugin fixture was not staged)" -f $item.Group, $item.Name)
+        } elseif ($item.Fixture -eq 'handoff-in' -and -not $inHandoffFixtureStaged) {
+            # Our own hand-over input fixture was not built for i686, so its
+            # acceptance test can only refuse, never pass.
+            $missingFixtureCount++
+            Write-Host ("  [MISSING FIXTURE] {0,-21} {1} (the i686 hand-over input plugin fixture was not staged)" -f $item.Group, $item.Name)
         } elseif ($item.Group -like 'Group D*' -and -not $pluginsStaged) {
             # The host never staged D:\code\rustamp-testplugins, so RUSTAMP_TESTPLUGINS
             # is unset and these tests can only refuse loudly, never pass. Name that
