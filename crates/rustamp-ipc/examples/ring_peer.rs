@@ -261,6 +261,70 @@ mod imp {
         out.flush().map_err(|e| format!("stdout: {e}"))
     }
 
+    /// The wall clock in microseconds since the epoch.
+    ///
+    /// The wall clock is the only clock the two processes share, so it is
+    /// what the runner compares the producer's publish against the
+    /// consumer's release with.
+    fn now_us() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0)
+    }
+
+    /// The CPU time this thread has burned, in microseconds.
+    ///
+    /// Windows accounts a thread's user and kernel time in 100 ns units, on
+    /// the system timer tick, so the number only means something over a
+    /// window of a few ticks. A thread that is blocked in the kernel wait
+    /// does not accrue CPU time - it is not running - so this stays near zero
+    /// for a wait and grows with the wall clock for a spin. That difference
+    /// is what proves the RFC 0007 consumer waits instead of polling.
+    fn thread_cpu_micros() -> u64 {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: all four out-parameters are live locals, and
+        // `GetCurrentThread` returns the pseudo-handle of the calling thread,
+        // which is always valid for `GetThreadTimes`.
+        unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        }
+        .expect("GetThreadTimes on the current thread");
+        let micros = |ft: FILETIME| -> u64 {
+            ((u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)) / 10
+        };
+        micros(kernel) + micros(user)
+    }
+
+    /// Parse an optional millisecond delay from a command's arguments.
+    ///
+    /// The delay exists for one reason: to make the *other* side's blocked
+    /// window wide enough for the operating system to account thread time at
+    /// all. It orders nothing - the blocked side has already proved that it
+    /// blocks - and it is never used to make a signal land in a particular
+    /// place.
+    fn optional_delay_ms(parts: &mut std::str::SplitWhitespace<'_>) -> Result<Option<u64>, String> {
+        match parts.next() {
+            None => Ok(None),
+            Some(value) => value
+                .parse()
+                .map(Some)
+                .map_err(|e| format!("invalid delay in ms: {e}")),
+        }
+    }
+
     fn produce(args: Args) -> Result<(), String> {
         let name = require(args.name, "--name")?;
         let kind = require(args.kind, "--kind")?;
@@ -692,20 +756,28 @@ mod imp {
                         .ok_or("WRITE needs a count")?
                         .parse()
                         .map_err(|e| format!("invalid count: {e}"))?;
+                    // The optional delay widens the consumer's blocked window,
+                    // so the thread-time accounting can tell a sleeping
+                    // consumer from a spinning one. It orders nothing.
+                    if let Some(delay) = optional_delay_ms(&mut parts)? {
+                        std::thread::sleep(Duration::from_millis(delay));
+                    }
                     let mut block = Vec::with_capacity(n * channels);
                     for i in 0..n as u64 {
                         for c in 0..channels {
                             block.push(pcm_sample(current_index + i, c));
                         }
                     }
+                    let started = now_us();
                     let written = producer
                         .write_from_blocking(&block, Some(PEER_TIMEOUT))
                         .map_err(|e| format!("write_from_blocking failed: {e}"))?;
+                    let done = now_us();
                     if written != n {
                         return Err(format!("write_from_blocking accepted {written} of {n}"));
                     }
                     current_index += n as u64;
-                    print_line(&format!("WROTE {n}"))?;
+                    print_line(&format!("WROTE {n} started_us={started} done_us={done}"))?;
                 }
                 "FILL_AND_BLOCK" => {
                     let extra: usize = parts
@@ -740,6 +812,8 @@ mod imp {
                     // returns `Ok(0)` waited on `Wake::Space` and wrote
                     // nothing. The runner used to buy this with a sleep after
                     // the announcement; this is the fact itself.
+                    let cpu_before = thread_cpu_micros();
+                    let wall_started = Instant::now();
                     let probe_written = producer
                         .write_from_blocking(&extra_block, Some(ANNOUNCE_WAIT))
                         .map_err(|e| format!("write_from_blocking probe failed: {e}"))?;
@@ -754,6 +828,9 @@ mod imp {
                     let written = producer
                         .write_from_blocking(&extra_block, Some(BLOCK_WAIT))
                         .map_err(|e| format!("write_from_blocking extra failed: {e}"))?;
+                    let released = now_us();
+                    let wall = wall_started.elapsed();
+                    let cpu = thread_cpu_micros().saturating_sub(cpu_before);
                     if written == 0 {
                         // `Ok(0)` means the wait expired with the ring still
                         // full. While the peer still has frames to drain that
@@ -771,7 +848,10 @@ mod imp {
                         return Err(format!("extra accepted {written} of {extra}"));
                     }
                     current_index += extra as u64;
-                    print_line(&format!("WRITER_WOKEN {extra}"))?;
+                    print_line(&format!(
+                        "WRITER_WOKEN {extra} at_us={released} cpu_us={cpu} wall_us={}",
+                        wall.as_micros()
+                    ))?;
                 }
                 "BULK_WRITE" => {
                     let total: usize = parts
@@ -985,6 +1065,8 @@ mod imp {
                     // latch and came back untouched. The runner used to buy
                     // this with a sleep after the announcement, which proved
                     // nothing about where the reader was.
+                    let cpu_before = thread_cpu_micros();
+                    let wall_started = Instant::now();
                     let probe_read = consumer
                         .read_into_blocking(&mut buf, Some(ANNOUNCE_WAIT))
                         .map_err(|e| format!("read_into_blocking probe failed: {e}"))?;
@@ -1033,7 +1115,13 @@ mod imp {
                         read_total += read;
                     }
                     current_index += n as u64;
-                    print_line(&format!("READER_WOKEN {n}"))?;
+                    let released = now_us();
+                    let wall = wall_started.elapsed();
+                    let cpu = thread_cpu_micros().saturating_sub(cpu_before);
+                    print_line(&format!(
+                        "READER_WOKEN {n} at_us={released} cpu_us={cpu} wall_us={}",
+                        wall.as_micros()
+                    ))?;
                 }
                 "DRAIN" => {
                     let n: usize = parts
@@ -1041,7 +1129,15 @@ mod imp {
                         .ok_or("DRAIN needs a count")?
                         .parse()
                         .map_err(|e| format!("invalid count: {e}"))?;
+                    // The optional delay widens the producer's blocked
+                    // window, so the thread-time accounting can tell a
+                    // sleeping producer from a spinning one. It orders
+                    // nothing.
+                    if let Some(delay) = optional_delay_ms(&mut parts)? {
+                        std::thread::sleep(Duration::from_millis(delay));
+                    }
                     let mut buf = vec![0.0f32; n * channels];
+                    let started = now_us();
                     let mut read_total = 0usize;
                     while read_total < n {
                         let read = consumer
@@ -1070,7 +1166,8 @@ mod imp {
                         read_total += read;
                     }
                     current_index += n as u64;
-                    print_line(&format!("DRAINED {n}"))?;
+                    let done = now_us();
+                    print_line(&format!("DRAINED {n} started_us={started} done_us={done}"))?;
                 }
                 "WAIT_CLOSE" => {
                     let mut buf = vec![0.0f32; channels];

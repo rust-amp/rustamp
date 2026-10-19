@@ -8,10 +8,15 @@
 //!    honouring the requested duration within OS timer resolution bounds.
 //! 2. **Blocked reader woken by writer**: reader blocks in `WaitForSingleObject`
 //!    on `Wake::Data`; writer writes samples and signals `Wake::Data`; reader is
-//!    woken across the process boundary and verifies the samples.
+//!    woken across the process boundary and verifies the samples. The phase
+//!    also measures the two claims RFC 0007 makes about that wait: the **wake
+//!    latency is bounded** (the two peers stamp the wall clock, the only clock
+//!    they share) and the reader **slept instead of polling** (its thread
+//!    burned no CPU while it waited).
 //! 3. **Blocked writer woken by reader**: writer fills the ring and blocks in
 //!    `WaitForSingleObject` on `Wake::Space`; reader drains frames and signals
-//!    `Wake::Space`; writer is woken and finishes publishing.
+//!    `Wake::Space`; writer is woken and finishes publishing. The same two
+//!    measurements are taken for the other end of the mechanism.
 //! 4. **Bulk lossless delivery**: multi-frame transfer using `write_from_blocking`
 //!    and `read_into_blocking` with zero drops and mathematical sample verification.
 //! 5. **Mid-advance signalling, non-blocking sites**: the signalling rule of
@@ -23,6 +28,22 @@
 //!    copy of the withdrawn edge.
 //! 7. **Shutdown wake**: reader blocks on empty ring; peer calls `close()`; reader
 //!    is woken immediately and returns `Err(RingError::Closed)`.
+//!
+//! # How the "it slept" measurement works
+//!
+//! Windows accounts a thread's user and kernel time on the system timer tick,
+//! and a thread that is blocked in the kernel wait does not accrue any: it is
+//! not running. The reader therefore reports how much CPU its thread burned
+//! across the blocked window, and the runner requires that number to be a
+//! fraction of the wall clock. A reader that polled instead of waiting would
+//! burn the whole window, three orders of magnitude more, and the phase
+//! would fail.
+//!
+//! The window has to be wide enough for the accounting to mean anything, so
+//! the peer that publishes (or drains) waits `PEER_DELAY_MS` first. That
+//! delay orders nothing: the blocked side has already proved that it blocks
+//! (its announcement follows a bounded wait that returned `Ok(0)`), and the
+//! signal follows the command, not the delay.
 //!
 //! # Why phases 5 and 6 exist
 //!
@@ -74,6 +95,29 @@ const RUNS: [(&str, &str); 2] = [(X86, X64), (X64, X86)];
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The upper bound for the wake latency: from the producer's publish to the
+/// consumer's release.
+///
+/// Generous enough for a loaded machine, tight enough that a wake which only
+/// arrives when the wait expires cannot pass.
+const LATENCY_BOUND: Duration = Duration::from_secs(2);
+
+/// The CPU time a blocked side may burn, in microseconds.
+///
+/// A wait in the kernel costs next to nothing; a poll costs the whole wall
+/// clock. The bound sits between the two by three orders of magnitude.
+const CPU_BOUND_MICROS: u64 = 50_000;
+
+/// How long the peer waits before it publishes, so that the blocked side's
+/// window is wide enough for the operating system to account thread time.
+///
+/// The delay orders nothing: the blocked side has already proved that it
+/// blocks, and the signal follows the command, not the delay. It exists
+/// because Windows accounts thread time on the system timer tick, and a
+/// window of a few milliseconds could not tell a sleeping thread from a
+/// spinning one.
+const PEER_DELAY_MS: u64 = 300;
 
 /// Capacity of the wake ring every direction runs on, and the frame size.
 ///
@@ -282,17 +326,49 @@ fn run_direction(
         // needs no sleep for it.
         wait_for_line(&consumer_out, "READER_BLOCKING", STEP_TIMEOUT)
             .map_err(|e| format!("STEP reader-wake FAILED (reader did not block): {e}"))?;
-        writeln!(producer_in, "WRITE 16").map_err(|e| format!("stdin: {e}"))?;
+        // The producer publishes after a delay, so the reader's blocked window
+        // is wide enough for the thread-time accounting to mean anything.
+        writeln!(producer_in, "WRITE 16 {PEER_DELAY_MS}").map_err(|e| format!("stdin: {e}"))?;
         producer_in.flush().map_err(|e| format!("flush: {e}"))?;
-        wait_for_line(&producer_out, "WROTE 16", STEP_TIMEOUT)
+        let wrote = wait_for_line(&producer_out, "WROTE 16", STEP_TIMEOUT)
             .map_err(|e| format!("STEP reader-wake FAILED (producer write failed): {e}"))?;
-        wait_for_line(&consumer_out, "READER_WOKEN 16", STEP_TIMEOUT).map_err(|e| {
+        let woken = wait_for_line(&consumer_out, "READER_WOKEN 16", STEP_TIMEOUT).map_err(|e| {
             format!("STEP reader-wake FAILED (reader was not woken or data mismatch): {e}")
         })?;
+        // The wake latency, measured across the process boundary: the two
+        // peers stamp the wall clock, which is the only clock they share.
+        let published_us = field(&wrote, "done_us")?;
+        let released_us = field(&woken, "at_us")?;
+        let latency_us = released_us.saturating_sub(published_us);
+        if latency_us > LATENCY_BOUND.as_micros() as u64 {
+            return Err(format!(
+                "STEP reader-wake FAILED: the reader was released {latency_us} us after the \
+                 writer published, which is beyond the {LATENCY_BOUND:?} bound"
+            ));
+        }
+        // The reader slept instead of polling: it burned no CPU while it
+        // waited (RFC 0007 section 1 and 4.3).
+        let cpu_us = field(&woken, "cpu_us")?;
+        let wall_us = field(&woken, "wall_us")?;
+        if cpu_us.saturating_mul(4) >= wall_us {
+            return Err(format!(
+                "STEP reader-wake FAILED: the blocked reader burned {cpu_us} us of CPU over \
+                 {wall_us} us of wall clock: it polled instead of sleeping"
+            ));
+        }
+        if cpu_us > CPU_BOUND_MICROS {
+            return Err(format!(
+                "STEP reader-wake FAILED: the blocked reader burned {cpu_us} us of CPU; a \
+                 wait in the kernel costs next to nothing"
+            ));
+        }
         rows.push(Row {
             direction: direction.to_owned(),
             phase: "reader-wake".to_owned(),
-            result: "OK (reader woken by writer, 16 frames verified)".to_owned(),
+            result: format!(
+                "OK (reader woken by writer, 16 frames verified, {latency_us} us of latency, \
+                 {cpu_us} us of CPU over {wall_us} us)"
+            ),
         });
 
         // Phase 3: Blocked writer woken by reader (Space wake)
@@ -303,20 +379,51 @@ fn run_direction(
         wait_for_line(&producer_out, "WRITER_BLOCKING", STEP_TIMEOUT).map_err(|e| {
             format!("STEP writer-wake FAILED (producer did not block on full ring): {e}")
         })?;
-        writeln!(consumer_in, "DRAIN 16").map_err(|e| format!("stdin: {e}"))?;
+        // The reader drains after a delay, so the writer's blocked window is
+        // wide enough for the thread-time accounting to mean anything.
+        writeln!(consumer_in, "DRAIN 16 {PEER_DELAY_MS}").map_err(|e| format!("stdin: {e}"))?;
         consumer_in.flush().map_err(|e| format!("flush: {e}"))?;
-        wait_for_line(&consumer_out, "DRAINED 16", STEP_TIMEOUT)
+        let drained = wait_for_line(&consumer_out, "DRAINED 16", STEP_TIMEOUT)
             .map_err(|e| format!("STEP writer-wake FAILED (consumer failed to drain): {e}"))?;
-        wait_for_line(&producer_out, "WRITER_WOKEN 8", STEP_TIMEOUT)
+        let writer_woken = wait_for_line(&producer_out, "WRITER_WOKEN 8", STEP_TIMEOUT)
             .map_err(|e| format!("STEP writer-wake FAILED (writer was not woken on space): {e}"))?;
         writeln!(consumer_in, "DRAIN 8").map_err(|e| format!("stdin: {e}"))?;
         consumer_in.flush().map_err(|e| format!("flush: {e}"))?;
         wait_for_line(&consumer_out, "DRAINED 8", STEP_TIMEOUT)
             .map_err(|e| format!("STEP writer-wake FAILED (consumer failed to drain tail): {e}"))?;
+        // The wake latency and the sleeping of the blocked writer, measured
+        // across the process boundary. The consumer's `done_us` is the moment
+        // its read returned, which is after the `Wake::Space` signal.
+        let drained_us = field(&drained, "done_us")?;
+        let released_us = field(&writer_woken, "at_us")?;
+        let latency_us = released_us.saturating_sub(drained_us);
+        if latency_us > LATENCY_BOUND.as_micros() as u64 {
+            return Err(format!(
+                "STEP writer-wake FAILED: the writer was released {latency_us} us after the \
+                 reader drained, which is beyond the {LATENCY_BOUND:?} bound"
+            ));
+        }
+        let cpu_us = field(&writer_woken, "cpu_us")?;
+        let wall_us = field(&writer_woken, "wall_us")?;
+        if cpu_us.saturating_mul(4) >= wall_us {
+            return Err(format!(
+                "STEP writer-wake FAILED: the blocked writer burned {cpu_us} us of CPU over \
+                 {wall_us} us of wall clock: it polled instead of sleeping"
+            ));
+        }
+        if cpu_us > CPU_BOUND_MICROS {
+            return Err(format!(
+                "STEP writer-wake FAILED: the blocked writer burned {cpu_us} us of CPU; a \
+                 wait in the kernel costs next to nothing"
+            ));
+        }
         rows.push(Row {
             direction: direction.to_owned(),
             phase: "writer-wake".to_owned(),
-            result: "OK (writer woken by reader, space wake verified)".to_owned(),
+            result: format!(
+                "OK (writer woken by reader, space wake verified, {latency_us} us of latency, \
+                 {cpu_us} us of CPU over {wall_us} us)"
+            ),
         });
 
         // Phase 4: Bulk lossless transfer
