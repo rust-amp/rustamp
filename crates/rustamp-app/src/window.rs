@@ -1612,9 +1612,8 @@ impl Windowed {
     /// Events for the playlist editor window, in playlist-window coordinates.
     ///
     /// Files dropped from the shell are added ([`App::drop_on_playlist`]).
-    /// Input routes to [`App::playlist_mouse_down`] /
-    /// [`App::playlist_mouse_up`]; keyboard shortcuts stay global (the same
-    /// key-event path as the main window — S06 leaves playlist keys open).
+    /// Pointer input routes to the headless row-drag model; leave and focus
+    /// loss cancel it. Playlist keys use the playlist-specific shortcut path.
     /// Closing the playlist hides it ([`App::close_playlist_window`], the
     /// same toggle as its skinned Close and the PL button) and never quits
     /// the player; the PL button brings it back.
@@ -1651,9 +1650,13 @@ impl Windowed {
                 self.request_playlist_redraw();
             }
             WindowEvent::DroppedFile(path) => self.drop_file(path),
-            WindowEvent::Focused(_) => {
+            WindowEvent::Focused(focused) => {
                 // Per-window activation is open, so the playlist shares the
                 // main focus flag (see `App::render_playlist`).
+                if !focused {
+                    self.app.playlist_mouse_leave();
+                    self.last_playlist_click = None;
+                }
                 self.request_playlist_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => self.playlist_key_event(&event),
@@ -1661,6 +1664,17 @@ impl Windowed {
             WindowEvent::CursorMoved { position, .. } => {
                 // No double-size scale: the playlist ignores it (S05 §2.1).
                 self.playlist_cursor = (position.x as i32, position.y as i32);
+                self.app
+                    .playlist_mouse_move(self.playlist_cursor.0, self.playlist_cursor.1);
+                if self.app.playlist().drag_insertion().is_some() {
+                    self.last_playlist_click = None;
+                }
+                self.request_playlist_redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.app.playlist_mouse_leave();
+                self.last_playlist_click = None;
+                self.request_playlist_redraw();
             }
             WindowEvent::MouseInput {
                 state,
@@ -1677,8 +1691,7 @@ impl Windowed {
                     self.last_playlist_click = None;
                     return;
                 }
-                // Drags are open (S06 Q6: reorder vs selection block), so only
-                // the press/release pair is routed; moves are not forwarded.
+                // Row dragging is an own choice while S06 §8 Q6 stays open.
                 let result = match state {
                     ElementState::Pressed => {
                         let now = Instant::now();
