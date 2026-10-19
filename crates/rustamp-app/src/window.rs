@@ -1174,7 +1174,13 @@ impl Windowed {
         #[cfg(windows)]
         {
             let owner = self.raw_main_window();
-            match rustamp_platform::save_playlist_file(owner, "Save Playlist", "playlist.m3u") {
+            let default_name = format!(
+                "playlist.{}",
+                self.app
+                    .loaded_playlist_format()
+                    .unwrap_or(rustamp_playlist::PlaylistFormat::M3u)
+            );
+            match rustamp_platform::save_playlist_file(owner, "Save Playlist", &default_name) {
                 Ok(Some(path)) => {
                     let command = Command::SavePlaylist(path.clone());
                     if let Err(error) = self.app.submit(command) {
