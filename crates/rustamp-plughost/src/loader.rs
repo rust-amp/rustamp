@@ -49,6 +49,14 @@
 //!     path of its own. The `id` member is left untouched: the 5.x host
 //!     replaces it with the DLL file name (5.x-only), and whether 2.95 does is
 //!     open (S09 U-4).
+//! 12. **Visualization plugins**: the host resolves `winampVisGetHeader`,
+//!     validates the header and enumerates the library's modules (S09 §5.1,
+//!     §5.3 step 2). A module is chosen and started later — the user picks
+//!     one — so the host fills `parent_window`, `dll_instance`, `sample_rate`
+//!     and `channels` into the chosen module and calls its `init` there
+//!     (S09 §5.2, §5.3 step 2). The frame loop lives in [`crate::vis`]; the
+//!     data that would fill the module's arrays comes from the audio path
+//!     and does not exist yet.
 //!
 //! Structural preflight is NOT a malware detector or approval gate. A valid
 //! trusted DLL and its dependencies can run TLS/DllMain during LoadLibraryExW,
@@ -81,7 +89,11 @@ use rustamp_plugin_abi::input::InModule;
 #[cfg(any(windows, test))]
 use rustamp_plugin_abi::output::OutModule;
 #[cfg(any(windows, test))]
+use rustamp_plugin_abi::vis::{VisHeader, VisModule};
+#[cfg(any(windows, test))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::vis::{VisError, VisLibraryInfo, VisModuleEntry, VisRunInfo};
 
 mod image;
 use image::PreparedImage;
@@ -157,18 +169,13 @@ unsafe extern "C" fn host_vis_feed_pcm(
 
 #[cfg(windows)]
 /// Host callback: `vis_get_mode(spectrum_rows, waveform_rows)` (S09 §3.1 offset 0x78 line 108).
-/// Returns 0 when no visualization is running; zeroes row counts.
+/// Answers for the running visualization: nonzero while one runs, and the row
+/// counts it asked for. With none running both counts are zero.
 unsafe extern "C" fn host_vis_get_mode(
     spectrum_rows: *mut core::ffi::c_int,
     waveform_rows: *mut core::ffi::c_int,
 ) -> core::ffi::c_int {
-    if !spectrum_rows.is_null() {
-        unsafe { *spectrum_rows = 0 };
-    }
-    if !waveform_rows.is_null() {
-        unsafe { *waveform_rows = 0 };
-    }
-    0
+    crate::vis::vis_get_mode(spectrum_rows, waveform_rows)
 }
 
 #[cfg(windows)]
@@ -182,10 +189,13 @@ unsafe extern "C" fn host_vis_feed_frame(
 
 #[cfg(windows)]
 /// Host callback: `vis_set_format(sample_rate, channels)` (S09 §3.1 offset 0x80 line 110).
+/// Copies the announced stream format into the running visualization module
+/// (S09 §3.8).
 unsafe extern "C" fn host_vis_set_format(
-    _sample_rate: core::ffi::c_int,
-    _channels: core::ffi::c_int,
+    sample_rate: core::ffi::c_int,
+    channels: core::ffi::c_int,
 ) {
+    crate::vis::vis_set_format(sample_rate, channels);
 }
 
 #[cfg(windows)]
@@ -727,6 +737,18 @@ enum LoadedPluginInner {
         module: *mut OutModule,
         init_called: bool,
     },
+    /// A visualization library: its header, the modules it hands out and the
+    /// module that is running, if any (S09 §5.1, §5.3).
+    #[cfg(any(windows, test))]
+    Vis {
+        header: *mut VisHeader,
+        modules: Vec<VisModuleEntry>,
+        /// The module whose `init` ran and that is still the running
+        /// visualization.
+        active: Option<*mut VisModule>,
+        init_called: bool,
+        init_result: core::ffi::c_int,
+    },
     #[allow(dead_code)]
     Unsupported,
 }
@@ -740,6 +762,10 @@ pub struct LoadedPlugin {
     path: PathBuf,
     kind: PluginKind,
     hinstance: *mut core::ffi::c_void,
+    /// The host's main window, handed to the plugin (S09 §1 "Parent window").
+    /// A visualization module is filled when the user starts it, so the host
+    /// keeps the handle (S09 §5.2, §5.3 step 2).
+    host_hwnd: usize,
     description: String,
     inner: LoadedPluginInner,
     initialized: bool,
@@ -767,8 +793,19 @@ impl LoadedPlugin {
     }
 
     /// Whether `init()` was successfully called on this plugin.
+    ///
+    /// For a visualization plugin this means that one of its modules is
+    /// running: the module is chosen and initialized when the user starts the
+    /// visualization, not when the DLL is loaded (S09 §5.3 step 2).
     pub fn is_initialized(&self) -> bool {
-        self.initialized
+        match self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Vis { active, .. } => match active {
+                Some(module) => crate::vis::active_vis_module() == module,
+                None => false,
+            },
+            _ => self.initialized,
+        }
     }
 
     /// Call `quit()` on the plugin if initialized (S09 §3.5 line 166, §7.2 line 380).
@@ -818,6 +855,24 @@ impl LoadedPlugin {
                     if let Some(quit_fn) = unsafe { (*module).quit } {
                         // SAFETY: quit() takes no arguments in OutModule (S09 §4.1 offset 0x20).
                         unsafe { quit_fn() };
+                    }
+                }
+            }
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Vis { active, .. } => {
+                if let Some(module) = active {
+                    // Only the module that still owns the running slot is quit
+                    // here. A module another visualization replaced was
+                    // already quit when the new one started (S09 §5.3 step 1
+                    // and step 5), and it must not be quit twice.
+                    if crate::vis::active_vis_module() == module {
+                        // SAFETY: module pointer was verified non-null when the
+                        // module list was read.
+                        if let Some(quit_fn) = unsafe { (*module).quit } {
+                            // SAFETY: quit(module) per S09 §5.2 offset 0x930.
+                            unsafe { quit_fn(module) };
+                        }
+                        crate::vis::clear_active_vis_module(module);
                     }
                 }
             }
@@ -954,6 +1009,146 @@ impl LoadedPlugin {
         }
     }
 
+    /// The library-level state of a loaded visualization plugin: the header
+    /// version, the library's own name and the list of modules it hands out
+    /// (S09 §5.1). `None` for any other plugin kind.
+    ///
+    /// The module list is what the host shows in the visualization list; the
+    /// user picks one of its indices, and
+    /// [`vis_start`](Self::vis_start) starts it.
+    pub fn vis_info(&self) -> Option<VisLibraryInfo> {
+        match &self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Vis {
+                header, modules, ..
+            } => {
+                // SAFETY: the header lives in the retained mapping's static
+                // data, which outlives the plugin (S09 §1 line 46).
+                let (version, description) = unsafe {
+                    (
+                        (**header).version,
+                        read_c_string_lossy((**header).description),
+                    )
+                };
+                Some(VisLibraryInfo {
+                    version,
+                    description,
+                    modules: modules.iter().map(|entry| entry.info.clone()).collect(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Host-visible state of the running visualization module, read from the
+    /// plugin's own module struct. `None` when no module of this plugin is
+    /// running (nothing started yet, `quit` already ran, or another
+    /// visualization took over).
+    pub fn vis_run_info(&self) -> Option<VisRunInfo> {
+        match &self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Vis {
+                modules,
+                active,
+                init_called,
+                init_result,
+                ..
+            } => {
+                let module = (*active)?;
+                if crate::vis::active_vis_module() != module {
+                    return None;
+                }
+                let index = modules
+                    .iter()
+                    .find(|entry| entry.module == module)
+                    .map(|entry| entry.info.index)
+                    .unwrap_or(-1);
+                // SAFETY: the module pointer was verified non-null when the
+                // module list was read and points into the retained mapping's
+                // static data.
+                let m = unsafe { *module };
+                Some(VisRunInfo {
+                    index,
+                    parent_window: m.parent_window as usize,
+                    dll_instance: m.dll_instance as usize,
+                    sample_rate: m.sample_rate,
+                    channels: m.channels,
+                    latency_ms: m.latency_ms,
+                    delay_ms: m.delay_ms,
+                    init_called: *init_called,
+                    init_result: *init_result,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Start one of the library's modules (S09 §5.3 step 2).
+    ///
+    /// The host fills the parent window, the plugin's own module handle, the
+    /// sample rate and the channel count into the chosen module and then calls
+    /// its `init`. A nonzero return aborts the start (S09 §5.2), and the
+    /// module is then not running. A visualization that is already running is
+    /// stopped first, because only one visualization is active at a time
+    /// (S09 §5.3 step 1).
+    pub fn vis_start(&mut self, index: i32) -> Result<(), VisError> {
+        let (module, host_hwnd, hinstance) = match &self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Vis { modules, .. } => {
+                let Some(entry) = modules.iter().find(|entry| entry.info.index == index) else {
+                    return Err(VisError::UnknownModule(index));
+                };
+                (entry.module, self.host_hwnd, self.hinstance)
+            }
+            _ => return Err(VisError::WrongKind(self.kind)),
+        };
+        // S09 §5.3 step 1: a running visualization is stopped before another
+        // one starts.
+        crate::vis::stop_active_vis_module();
+        // SAFETY: the module lives in the mapped plugin's static data, which
+        // the retained mapping keeps alive; `init` runs on this thread, which
+        // owns the host window.
+        let init = unsafe { crate::vis::init_vis_module(module, host_hwnd, hinstance) }?;
+        if let LoadedPluginInner::Vis {
+            active,
+            init_called,
+            init_result,
+            ..
+        } = &mut self.inner
+        {
+            *active = Some(init.module);
+            *init_called = init.init_called;
+            *init_result = init.init_result;
+        }
+        self.initialized = true;
+        crate::vis::set_active_vis_module(init.module);
+        Ok(())
+    }
+
+    /// Draw one frame of the running visualization (S09 §5.3 step 4b).
+    ///
+    /// The plugin's own return value is reported: 0 continues the
+    /// visualization, a nonzero value ends it and the host then calls `quit`
+    /// (S09 §5.2, offset 0x92C). With no module running — nothing started
+    /// yet, or another visualization took over — nothing is called.
+    pub fn vis_render(&self) -> Result<i32, VisError> {
+        let module = match self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Vis { active, .. } => match active {
+                Some(module) => module,
+                None => return Err(VisError::NotRunning),
+            },
+            _ => return Err(VisError::WrongKind(self.kind)),
+        };
+        if crate::vis::active_vis_module() != module {
+            // Another visualization is running; this one is not.
+            return Err(VisError::NotRunning);
+        }
+        // SAFETY: the module lives in the mapped plugin's static data, which
+        // the retained mapping keeps alive.
+        unsafe { crate::vis::render_vis_frame(module) }
+    }
+
     /// Run interleaved 16-bit PCM through the host's `dsp_process` callback, the
     /// path a real input plugin's decode loop takes (S09 §3.1 offset 0x88).
     ///
@@ -1012,6 +1207,7 @@ impl LoadedPlugin {
             path: PathBuf::from(name),
             kind: PluginKind::General,
             hinstance: core::ptr::null_mut(),
+            host_hwnd: 0,
             description: name.to_string(),
             inner: LoadedPluginInner::General {
                 module,
@@ -1033,12 +1229,43 @@ impl LoadedPlugin {
             path: PathBuf::from(name),
             kind: PluginKind::Output,
             hinstance: core::ptr::null_mut(),
+            host_hwnd: 0,
             description: name.to_string(),
             inner: LoadedPluginInner::Output {
                 module,
                 init_called,
             },
             initialized: true,
+        }
+    }
+
+    /// Wrap a synthetic visualization library as a loaded plugin, for
+    /// host-side tests of the visualization lifecycle (module list, `init`,
+    /// `render`, `quit`).
+    ///
+    /// No DLL is mapped and no export is resolved, so a test built on this
+    /// proves host logic only — never DLL acceptance (P3 §7 false passes).
+    #[cfg(test)]
+    pub(crate) fn vis_for_test(
+        name: &str,
+        header: *mut VisHeader,
+        modules: Vec<VisModuleEntry>,
+        host_hwnd: usize,
+    ) -> Self {
+        Self {
+            path: PathBuf::from(name),
+            kind: PluginKind::Visualization,
+            hinstance: core::ptr::null_mut(),
+            host_hwnd,
+            description: name.to_string(),
+            inner: LoadedPluginInner::Vis {
+                header,
+                modules,
+                active: None,
+                init_called: false,
+                init_result: 0,
+            },
+            initialized: false,
         }
     }
 
@@ -1050,6 +1277,7 @@ impl LoadedPlugin {
             path: PathBuf::from("unsupported"),
             kind,
             hinstance: core::ptr::null_mut(),
+            host_hwnd: 0,
             description: String::new(),
             inner: LoadedPluginInner::Unsupported,
             initialized: true,
@@ -1288,7 +1516,10 @@ unsafe fn load_plugin_x86(
             rustamp_plugin_abi::common::EXPORT_OUT_GET_MODULE,
             "winampGetOutModule",
         ),
-        _ => unreachable!("preflight selects input/dsp/general/output only"),
+        PluginKind::Visualization => (
+            rustamp_plugin_abi::common::EXPORT_VIS_GET_HEADER,
+            "winampVisGetHeader",
+        ),
     };
     // SAFETY: mapped module handle, static NUL-terminated export name.
     let export = unsafe { GetProcAddress(hinstance, name.as_ptr()) };
@@ -1308,7 +1539,10 @@ unsafe fn load_plugin_x86(
         PluginKind::Output => unsafe {
             load_output_module(image.path, hinstance, export, host_hwnd)
         },
-        _ => unreachable!("preflight selects input/dsp/general/output only"),
+        // SAFETY: approved mapped getter and UI-thread HWND, per caller contract.
+        PluginKind::Visualization => unsafe {
+            load_vis_module(image.path, hinstance, export, host_hwnd)
+        },
     }
 }
 
@@ -1405,6 +1639,7 @@ unsafe fn load_input_module(
         path,
         kind: PluginKind::Input,
         hinstance,
+        host_hwnd,
         description,
         inner: LoadedPluginInner::Input { module: module_ptr },
         initialized: true,
@@ -1432,6 +1667,7 @@ unsafe fn load_dsp_module(
         path,
         kind: PluginKind::Dsp,
         hinstance,
+        host_hwnd,
         description,
         inner: LoadedPluginInner::Dsp { module: module_ptr },
         initialized: true,
@@ -1467,6 +1703,7 @@ unsafe fn load_general_module(
         path,
         kind: PluginKind::General,
         hinstance,
+        host_hwnd,
         description,
         inner: LoadedPluginInner::General {
             module: init.module,
@@ -1505,12 +1742,54 @@ unsafe fn load_output_module(
         path,
         kind: PluginKind::Output,
         hinstance,
+        host_hwnd,
         description,
         inner: LoadedPluginInner::Output {
             module: init.module,
             init_called: init.init_called,
         },
         initialized: true,
+    })
+}
+
+#[cfg(windows)]
+unsafe fn load_vis_module(
+    path: PathBuf,
+    hinstance: *mut core::ffi::c_void,
+    proc_ptr: *mut core::ffi::c_void,
+    host_hwnd: usize,
+) -> Result<LoadedPlugin, PluginLoadError> {
+    // S09 §1 line 38, §2 line 58: cdecl getter returning the static
+    // visualization header. In 2.x it takes no arguments; a 5.x main-window
+    // argument would be a harmless extra under cdecl, so calling with none is
+    // correct either way (U-9).
+    type VisGetHeaderFn = unsafe extern "C" fn() -> *mut VisHeader;
+    let get_header: VisGetHeaderFn = unsafe { core::mem::transmute(proc_ptr) };
+    let header_ptr = unsafe { get_header() };
+    // SAFETY: the header lives in the mapped plugin's static data; the
+    // plugin's `get_module` runs here on the UI thread (S09 §5.3 step 2).
+    let modules = unsafe { crate::vis::list_vis_modules(header_ptr)? };
+    // The description is read before any module runs, so a plugin that
+    // rewrites its own pointer later cannot change what the host reported.
+    // SAFETY: `list_vis_modules` refused a null header, so it is live here.
+    let description = unsafe { read_c_string_lossy((*header_ptr).description) };
+
+    // No module is initialized yet: the user picks one, and the host starts
+    // it then (S09 §5.3 step 1 and step 2).
+    Ok(LoadedPlugin {
+        path,
+        kind: PluginKind::Visualization,
+        hinstance,
+        host_hwnd,
+        description,
+        inner: LoadedPluginInner::Vis {
+            header: header_ptr,
+            modules,
+            active: None,
+            init_called: false,
+            init_result: 0,
+        },
+        initialized: false,
     })
 }
 

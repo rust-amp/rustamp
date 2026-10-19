@@ -13,6 +13,12 @@ pub const VIS_ROW_LEN: usize = 576;
 /// Maximum number of spectrum or waveform rows a visualization can request
 /// (S09 section 5.2).
 pub const VIS_MAX_ROWS: usize = 2;
+/// Stream sample rate in Hz the host writes into a visualization module before
+/// any `vis_set_format` arrives (S09 section 5.2, offset 0x00C).
+pub const VIS_DEFAULT_SAMPLE_RATE: i32 = 44_100;
+/// Channel count the host writes into a visualization module before any
+/// `vis_set_format` arrives (S09 section 5.2, offset 0x010).
+pub const VIS_DEFAULT_CHANNELS: i32 = 2;
 
 /// Version of an input module in 2.95 (`version` member, S09 section 3.2).
 pub const IN_VERSION: i32 = 0x100;

@@ -19,6 +19,8 @@ Nothing here was resolved from memory or outside S09.
 12. **No padding** is asserted by S09 and relied upon; the layout asserts check it on x86 only.
 13. **Optional extended-info exports**: only names are provided, no signatures (U-13).
 14. **Vis `config` call order**: S09 5.3 item 7 is UNV; `parent_window` validity before `config` is assumed documented-but-unverified.
+15. **Vis module list length**: S09 5.1 says the host asks for `get_module(0)`, `get_module(1)`, ... until the answer is null; it does not bound the list. A host needs an own bound so that a plugin which never answers null cannot hang it; the bound is host policy, not an ABI fact. The crate models the list only through the `get_module` callback, so nothing here depends on a number.
+16. **Vis discovery**: U-5 (a `vis_` file-name prefix filter, or any DLL probed for the export) is still open. S09 2 records for 2.95 that *any* DLL in the Plugins folder may be probed for `winampVisGetHeader` and that no prefix filter string is present, so a host that recognizes a visualization by its export alone matches what S09 states; the `vis_` prefix stays a convention.
 
 ## S09 open items depended on
 
