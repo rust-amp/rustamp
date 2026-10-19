@@ -10,3 +10,8 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+rustamp-meta.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
