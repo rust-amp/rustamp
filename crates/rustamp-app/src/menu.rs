@@ -43,8 +43,8 @@ pub enum MenuOutcome {
 pub enum MenuClickOutcome {
     /// A leaf row was chosen and the popup closed: `Some` carries the
     /// activation outcome for a `Shortcut` leaf (through
-    /// [`App::activate_menu_item`); `None` for a `NoAction` row (the title
-    /// row, `Library`, `Minibrowser`, `Exit`), which keeps its draw-only
+    /// [`App::activate_menu_item`), or the quit for `Exit`; `None` for a
+    /// `NoAction` row (the title row, `Library`, `Minibrowser`), which keeps its draw-only
     /// treatment — S04 §9 explicitly does not cover click-through, so no
     /// behaviour is invented for these rows.
     Activated(Option<MenuOutcome>),
@@ -119,7 +119,8 @@ impl App {
     /// ([`App::activate_menu_item`]) - the same dispatch the matching key
     /// press runs - and a measured row with no command keeps its draw-only
     /// treatment (S04 §9 covers no click-through for the title row,
-    /// `Library`, `Minibrowser` and `Exit`), so nothing is invented for it.
+    /// `Library` and `Minibrowser`), so nothing is invented for it. `Exit`
+    /// submits `Command::Quit`.
     ///
     /// The popup itself is already closed by the time this runs: the system
     /// menu returns only once the user has chosen or dismissed.
@@ -131,6 +132,7 @@ impl App {
             rustamp_ui::menu::MenuChoice::Action { label, action } => {
                 self.activate_menu_item(label, action).map(Some)
             }
+            rustamp_ui::menu::MenuChoice::Exit => self.quit_from_menu().map(Some),
             rustamp_ui::menu::MenuChoice::NoAction { .. } => Ok(None),
         }
     }
@@ -161,6 +163,11 @@ impl App {
                 self.close_main_menu();
                 Ok(MenuClickOutcome::Activated(Some(outcome)))
             }
+            MenuAction::Exit => {
+                let outcome = self.quit_from_menu()?;
+                self.close_main_menu();
+                Ok(MenuClickOutcome::Activated(Some(outcome)))
+            }
             MenuAction::NoAction => {
                 self.close_main_menu();
                 Ok(MenuClickOutcome::Activated(None))
@@ -174,6 +181,14 @@ impl App {
                 Ok(MenuClickOutcome::SubmenuDeferred(id))
             }
         }
+    }
+
+    /// The `Exit` row: submits `Command::Quit`, the same command the
+    /// tray's Exit entry sends, so the app shuts down through its usual path.
+    fn quit_from_menu(&mut self) -> Result<MenuOutcome> {
+        let commands = vec![Command::Quit];
+        self.forward(&commands)?;
+        Ok(MenuOutcome::Commands(commands))
     }
 
     /// Activates one menu leaf: runs the shortcut dispatch for `action` and
@@ -283,17 +298,32 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_no_action_row_closes_without_dispatching() {
-        // `Exit` has no S03 row (S04 §2) and keeps its draw-only treatment:
-        // the popup closes, nothing is submitted, no note is recorded.
+    fn clicking_exit_quits_the_player() {
         let mut app = test_app();
         app.open_main_menu();
         let (x, y) = row_middle(MainMenuId::Exit);
         let outcome = app.menu_click(x, y).unwrap();
+        assert_eq!(
+            outcome,
+            MenuClickOutcome::Activated(Some(MenuOutcome::Commands(vec![Command::Quit])))
+        );
+        assert!(!app.main_menu_is_open());
+        assert!(app.drain_notes().is_empty());
+        assert!(app.quit(), "Exit must quit the player");
+    }
+
+    #[test]
+    fn clicking_a_no_action_row_closes_without_dispatching() {
+        // `Library` has no S03 row (S04 §2): the popup closes, nothing is
+        // submitted, no note is recorded.
+        let mut app = test_app();
+        app.open_main_menu();
+        let (x, y) = row_middle(MainMenuId::Library);
+        let outcome = app.menu_click(x, y).unwrap();
         assert_eq!(outcome, MenuClickOutcome::Activated(None));
         assert!(!app.main_menu_is_open());
         assert!(app.drain_notes().is_empty());
-        assert!(!app.quit(), "closing the popup must not quit the player");
+        assert!(!app.quit());
     }
 
     #[test]

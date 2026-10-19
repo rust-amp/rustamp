@@ -53,6 +53,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod dialogs;
+pub mod eq_presets;
 pub mod focus;
 pub mod host;
 pub mod menu;

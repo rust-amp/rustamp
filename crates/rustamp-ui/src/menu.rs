@@ -205,11 +205,14 @@ pub enum MenuAction {
     Shortcut(ShortcutAction),
     /// A parent: opens the submenu.
     Submenu(SubmenuId),
-    /// A measured row with no dispatch behind it in this tree: the title row,
-    /// `Library` and `Exit` have no S03 command (S04 §2 notes `Exit` has no
-    /// S03 row), and `Minibrowser`'s action is deferred with no bridge yet
-    /// (RFC 0005 §11). S04 §9 explicitly does not cover click-through, so no
-    /// behaviour is invented: the row draws its label and never dispatches.
+    /// `Exit`: quits the player (`Command::Quit`). S04 §2 notes `Exit` has no
+    /// S03 row, so it has no shortcut; the app submits the quit command itself.
+    Exit,
+    /// A measured row with no dispatch behind it in this tree: the title row
+    /// and `Library` have no S03 command, and `Minibrowser`'s action is
+    /// deferred with no bridge yet (RFC 0005 §11). S04 §9 explicitly does not
+    /// cover click-through, so no behaviour is invented: the row draws its
+    /// label and never dispatches.
     NoAction,
 }
 
@@ -439,13 +442,13 @@ pub const MAIN_MENU: [MenuRow; MAIN_MENU_ROWS] = [
     }),
     // S04 §2 separator at y=528.
     MenuRow::Separator,
-    // S04 §2 row 15: `Exit` (no S03 row, so no dispatch — S04 §9).
+    // S04 §2 row 15: `Exit` (no S03 row; it quits the player).
     MenuRow::Item(MainMenuItem {
         id: MainMenuId::Exit,
         label: "Exit",
         shortcut: None,
         check: MenuCheck::None,
-        action: MenuAction::NoAction,
+        action: MenuAction::Exit,
     }),
 ];
 
@@ -767,8 +770,10 @@ pub enum MenuChoice {
         /// The action to dispatch.
         action: ShortcutAction,
     },
+    /// `Exit`: quits the player.
+    Exit,
     /// A measured row with no dispatch behind it (the title row, `Library`,
-    /// `Minibrowser`, `Exit`): choosing it closes the menu and does nothing,
+    /// `Minibrowser`): choosing it closes the menu and does nothing,
     /// because S04 §9 covers no click-through for them.
     NoAction {
         /// The row's label.
@@ -781,6 +786,7 @@ impl MenuChoice {
     pub fn label(self) -> &'static str {
         match self {
             MenuChoice::Action { label, .. } | MenuChoice::NoAction { label } => label,
+            MenuChoice::Exit => "Exit",
         }
     }
 }
@@ -871,8 +877,12 @@ pub fn native_main_menu(state: &MainWindowState, flags: &MenuFlags) -> NativeMai
                     enabled: true,
                 });
             }
-            MenuAction::NoAction => {
-                choices.push(MenuChoice::NoAction { label: item.label });
+            MenuAction::Exit | MenuAction::NoAction => {
+                choices.push(if item.action == MenuAction::Exit {
+                    MenuChoice::Exit
+                } else {
+                    MenuChoice::NoAction { label: item.label }
+                });
                 rows.push(PopupRow::Entry {
                     id: choices.len() as u32,
                     label: item.label.to_string(),
@@ -1311,9 +1321,10 @@ mod tests {
                 MenuAction::Shortcut(action) => leaves.push((item.label, action)),
                 MenuAction::Submenu(_) => {}
                 MenuAction::NoAction => undrawn += 1,
+                MenuAction::Exit => {}
             }
         }
-        assert_eq!(undrawn, 4);
+        assert_eq!(undrawn, 3);
         for entry in [
             &PLAYBACK_ENTRIES[..],
             &PLAY_ENTRIES[..],

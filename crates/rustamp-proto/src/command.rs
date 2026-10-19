@@ -272,4 +272,9 @@ pub enum Command {
     /// fixes the dialog's title only, so replace-vs-append and every other
     /// confirmation semantic stays open.
     OpenPlaylist,
+    /// Open the Options popup (clutter-bar letter O, S02 §2, S04 §4). RFC 0016.
+    OpenOptionsMenu,
+    /// Open the visualization menu (clutter-bar letter V, S02 §2, S04 §5).
+    /// RFC 0016.
+    OpenVisualizationMenu,
 }

@@ -304,18 +304,20 @@ fn every_id_the_native_menu_can_report_maps_back_to_one_action() {
     assert_eq!(menu.choice_for_id(0), None);
     assert_eq!(menu.choice_for_id(menu.choices.len() as u32 + 1), None);
 
-    // A row S04 §2 measures but S03 gives no command keeps its draw-only
-    // treatment: choosing it closes the menu and runs nothing.
+    // `Exit` quits the player.
     let exit = menu
         .choices
         .iter()
         .find(|choice| choice.label() == "Exit")
         .copied()
         .expect("Exit is a measured row");
-    assert!(matches!(exit, MenuChoice::NoAction { .. }));
+    assert!(matches!(exit, MenuChoice::Exit));
     let mut app = headless_app();
-    assert_eq!(app.activate_menu_choice(exit).expect("no dispatch"), None);
-    assert!(!app.quit(), "choosing Exit must not quit: S04 §9 is silent");
+    assert_eq!(
+        app.activate_menu_choice(exit).expect("quit dispatches"),
+        Some(MenuOutcome::Commands(vec![Command::Quit]))
+    );
+    assert!(app.quit(), "choosing Exit must quit the player");
     assert!(app.drain_notes().is_empty());
 }
 

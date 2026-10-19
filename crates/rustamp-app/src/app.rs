@@ -758,11 +758,41 @@ impl App {
     /// Returns the entries the real popup must carry.
     pub fn request_eq_presets_menu(&mut self, request: EqMenuRequest) -> &'static [&'static str] {
         let entries = request.entries();
+        let names: Vec<&str> = crate::eq_presets::presets()
+            .iter()
+            .map(|p| p.name)
+            .collect();
         self.note(format!(
-            "open presets popup {request:?} ({}): the menu is not implemented yet",
-            entries.join("/")
+            "open presets popup {request:?} ({}): the menu window is not implemented yet; \
+             Load offers {}",
+            entries.join("/"),
+            names.join(", ")
         ));
         entries
+    }
+
+    /// Applies the built-in equalizer preset `name` (ignoring case).
+    ///
+    /// Sets all ten bands through ordinary `SetBand` commands and leaves the
+    /// preamp and the on/auto flags alone. The engine's resulting gains are
+    /// what the configuration saves, so the choice persists (see
+    /// [`crate::eq_presets`]). Returns `false` when no such preset exists.
+    pub fn apply_eq_preset(&mut self, name: &str) -> Result<bool> {
+        let Some(preset) = crate::eq_presets::find_preset(name) else {
+            return Ok(false);
+        };
+        for (band, &gain_db) in preset.bands.iter().enumerate() {
+            self.submit(Command::SetBand {
+                band: band as u8,
+                gain_db,
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// The built-in preset the current band gains correspond to, if any.
+    pub fn current_eq_preset(&self) -> Option<&'static str> {
+        crate::eq_presets::preset_name_for(&self.engine.eq())
     }
 
     /// Asks the app to exit (the window's close button).
@@ -2697,6 +2727,19 @@ mod tests {
             app.request_eq_presets_menu(rustamp_ui::EqMenuRequest::Presets),
             &["Load", "Save", "Delete"]
         );
+    }
+
+    #[test]
+    fn applying_a_preset_sets_the_bands_and_is_recognised_again() {
+        let (mut app, _dir) = app_with_file(None);
+        assert!(!app.apply_eq_preset("No Such Preset").unwrap());
+        assert!(app.apply_eq_preset("rock").unwrap());
+        let rock = crate::eq_presets::find_preset("Rock").unwrap();
+        assert_eq!(app.engine.eq().bands, rock.bands);
+        assert_eq!(app.current_eq_preset(), Some("Rock"));
+        // The window's sliders follow the engine.
+        assert!(app.apply_eq_preset("Flat").unwrap());
+        assert_eq!(app.current_eq_preset(), Some("Flat"));
     }
 
     #[test]

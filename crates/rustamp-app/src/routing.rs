@@ -87,7 +87,9 @@ pub fn app_owns(command: &Command) -> bool {
         | C::OpenMainMenu
         | C::ConfigureVisPlugin
         | C::ToggleVisPlugin
-        | C::OpenPlaylist => true,
+        | C::OpenPlaylist
+        | C::OpenOptionsMenu
+        | C::OpenVisualizationMenu => true,
     }
 }
 
@@ -158,6 +160,8 @@ mod tests {
             Command::ShowMainWindow,
             Command::CloseFocusedWindow,
             Command::OpenMainMenu,
+            Command::OpenOptionsMenu,
+            Command::OpenVisualizationMenu,
             Command::ToggleVisPlugin,
         ] {
             assert!(app_owns(&command), "{command:?} belongs to the app");

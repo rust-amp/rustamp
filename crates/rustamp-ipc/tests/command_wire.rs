@@ -299,6 +299,18 @@ fn the_last_five_new_variants_and_the_video_window() {
 }
 
 #[test]
+fn the_clutter_menu_commands_are_appended_after_open_playlist() {
+    // RFC 0016: `OpenPlaylist` is index 56 (0x38); the two clutter-bar menu
+    // commands follow it, so no earlier byte string moves.
+    assert_eq!(encode(&Command::OpenPlaylist), [0x38]);
+    assert_eq!(encode(&Command::OpenOptionsMenu), [0x39]);
+    assert_eq!(encode(&Command::OpenVisualizationMenu), [0x3a]);
+    for command in [Command::OpenOptionsMenu, Command::OpenVisualizationMenu] {
+        assert_eq!(decode(&encode(&command)), command);
+    }
+}
+
+#[test]
 fn every_new_variant_round_trips() {
     let commands = [
         Command::SkipBy { delta: -3 },
