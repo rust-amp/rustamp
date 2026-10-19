@@ -72,7 +72,7 @@ impl fmt::Display for PePreflightError {
             }
             Self::MissingSupportedExport => f.write_str(
                 "plugin DLL exports neither winampGetInModule2, winampDSPGetHeader2, \
-                 winampGetGeneralPurposePlugin nor winampGetOutModule",
+                 winampGetGeneralPurposePlugin, winampVisGetHeader nor winampGetOutModule",
             ),
         }
     }
@@ -267,12 +267,15 @@ pub fn check_pe_i386_dll(image: &[u8]) -> Result<PluginKind, PePreflightError> {
 /// the order only has to be stable and documented. Input keeps the precedence
 /// it always had, the output getter comes last — an `out_` DLL is never
 /// mistaken for another kind — and the relative order of the kinds that were
-/// already supported is unchanged. The visualization getter is not scanned
-/// here; the visualization plugin kind has its own card.
-const SUPPORTED_GETTERS: [(&[u8], PluginKind); 4] = [
+/// already supported is unchanged. The visualization getter sits between the
+/// general and the output getter: like the output getter it is recognized by
+/// its export alone, because 2.95 probes any DLL for it and no `vis_` file
+/// name prefix is part of the contract (S09 §2, U-5).
+const SUPPORTED_GETTERS: [(&[u8], PluginKind); 5] = [
     (b"winampGetInModule2", PluginKind::Input),
     (b"winampDSPGetHeader2", PluginKind::Dsp),
     (b"winampGetGeneralPurposePlugin", PluginKind::General),
+    (b"winampVisGetHeader", PluginKind::Visualization),
     (b"winampGetOutModule", PluginKind::Output),
 ];
 
@@ -445,6 +448,18 @@ mod tests {
     }
 
     #[test]
+    fn recognises_a_visualization_plugin_by_its_export() {
+        let mut image = test_dll(0x014c);
+        let name = b"winampVisGetHeader\0";
+        image[0x260..0x260 + name.len()].copy_from_slice(name);
+        assert_eq!(
+            check_pe_i386_dll(&image),
+            Ok(PluginKind::Visualization),
+            "the visualization getter must select the visualization kind (S09 §2)"
+        );
+    }
+
+    #[test]
     fn the_getter_table_matches_the_abi_exports() {
         for (name, kind) in SUPPORTED_GETTERS {
             assert_eq!(
@@ -459,10 +474,13 @@ mod tests {
             Some((0, PluginKind::Input))
         );
         assert_eq!(
-            supported_getter(b"winampGetOutModule"),
-            Some((3, PluginKind::Output))
+            supported_getter(b"winampVisGetHeader"),
+            Some((3, PluginKind::Visualization))
         );
-        assert_eq!(supported_getter(b"winampVisGetHeader"), None);
+        assert_eq!(
+            supported_getter(b"winampGetOutModule"),
+            Some((4, PluginKind::Output))
+        );
         assert_eq!(supported_getter(b"something_else"), None);
     }
 
