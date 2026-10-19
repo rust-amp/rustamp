@@ -1130,6 +1130,45 @@ mod tests {
         (producer, consumer)
     }
 
+    /// The CPU time the calling thread has burned, in microseconds.
+    ///
+    /// Windows accounts a thread's user and kernel time in 100 ns units, on the
+    /// system timer tick, so the number only means something over a window of
+    /// a few ticks. That is why the tests below block for hundreds of
+    /// milliseconds: a shorter window could not tell a sleeping thread from a
+    /// spinning one.
+    ///
+    /// A thread that is blocked in the kernel wait does not accrue CPU time -
+    /// it is not running - so the number stays near zero for a wait and grows
+    /// with the wall clock for a spin.
+    #[cfg(windows)]
+    fn thread_cpu_micros() -> u64 {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: all four out-parameters are live locals, and
+        // `GetCurrentThread` returns the pseudo-handle of the calling thread,
+        // which is always valid for `GetThreadTimes`.
+        unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        }
+        .expect("GetThreadTimes on the current thread");
+        let micros = |ft: FILETIME| -> u64 {
+            ((u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)) / 10
+        };
+        micros(kernel) + micros(user)
+    }
+
     #[test]
     fn pcm_round_trip_is_byte_exact_across_two_wraps() {
         // Capacity 7 is deliberately not a power of two.
@@ -2340,5 +2379,219 @@ mod tests {
         assert_eq!(written, TOTAL);
         assert_eq!(dropped, 0);
         assert_eq!(received, TOTAL);
+    }
+
+    /// A blocked consumer sleeps in the kernel; it does not spin (RFC 0007
+    /// §1 and §4.3: the consumer waits for data instead of polling for it).
+    ///
+    /// This is the RFC's core claim, measured rather than argued: the thread
+    /// that waits burns no CPU while it waits. A polling consumer would burn
+    /// the whole wall clock, so the two cases are an order of magnitude apart
+    /// and the bound below separates them.
+    ///
+    /// The window is 300 ms on purpose: Windows accounts thread time on the
+    /// system timer tick, so a shorter window could not tell the two apart.
+    #[cfg(windows)]
+    #[test]
+    fn a_blocking_read_sleeps_instead_of_spinning() {
+        const WINDOW: Duration = Duration::from_millis(300);
+
+        let (_producer, consumer) = pcm_ring_with_wake(8, 2);
+
+        let (read, cpu_micros, wall) = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                let mut consumer = consumer;
+                let mut out = [0.0f32; 8];
+                let cpu_before = thread_cpu_micros();
+                let started = Instant::now();
+                // The ring is empty and nothing signals it, so this call can
+                // only end in the timeout.
+                let read = consumer.read_into_blocking(&mut out, Some(WINDOW)).unwrap();
+                let wall = started.elapsed();
+                let cpu_after = thread_cpu_micros();
+                (read, cpu_after.saturating_sub(cpu_before), wall)
+            });
+            worker.join().unwrap()
+        });
+
+        assert_eq!(read, 0, "the empty ring must time out, not deliver");
+        assert!(
+            wall >= WINDOW,
+            "the wait returned after {wall:?}, before the requested {WINDOW:?}"
+        );
+        println!(
+            "blocked read: {wall:?} of wall clock, {cpu_micros} us of CPU ({:.3} % of a core)",
+            100.0 * cpu_micros as f64 / wall.as_micros() as f64
+        );
+        assert!(
+            cpu_micros * 4 < wall.as_micros() as u64,
+            "the blocked thread burned {cpu_micros} us of CPU over {wall:?} of wall clock: \
+             it polled instead of sleeping"
+        );
+        assert!(
+            cpu_micros < 50_000,
+            "the blocked thread burned {cpu_micros} us of CPU; a wait in the kernel costs \
+             next to nothing"
+        );
+    }
+
+    /// The same claim for the other end of the ring: a producer that waits for
+    /// space sleeps in the kernel instead of spinning on the free counter
+    /// (RFC 0007 §1, §4.3).
+    #[cfg(windows)]
+    #[test]
+    fn a_blocking_write_sleeps_instead_of_spinning() {
+        const WINDOW: Duration = Duration::from_millis(300);
+
+        let (mut producer, _consumer) = pcm_ring_with_wake(1, 2);
+        // Fill the ring, so the producer has to wait for space.
+        producer.write_from(&[1.0f32, -1.0]).unwrap();
+        assert_eq!(producer.free_frames(), 0);
+
+        let (written, cpu_micros, wall) = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                let mut producer = producer;
+                let cpu_before = thread_cpu_micros();
+                let started = Instant::now();
+                let written = producer
+                    .write_from_blocking(&[2.0f32, -2.0], Some(WINDOW))
+                    .unwrap();
+                let wall = started.elapsed();
+                let cpu_after = thread_cpu_micros();
+                (written, cpu_after.saturating_sub(cpu_before), wall)
+            });
+            worker.join().unwrap()
+        });
+
+        assert_eq!(written, 0, "the full ring must time out, not accept frames");
+        assert!(
+            wall >= WINDOW,
+            "the wait returned after {wall:?}, before the requested {WINDOW:?}"
+        );
+        println!(
+            "blocked write: {wall:?} of wall clock, {cpu_micros} us of CPU ({:.3} % of a core)",
+            100.0 * cpu_micros as f64 / wall.as_micros() as f64
+        );
+        assert!(
+            cpu_micros * 4 < wall.as_micros() as u64,
+            "the blocked thread burned {cpu_micros} us of CPU over {wall:?} of wall clock: \
+             it polled instead of sleeping"
+        );
+        assert!(
+            cpu_micros < 50_000,
+            "the blocked thread burned {cpu_micros} us of CPU; a wait in the kernel costs \
+             next to nothing"
+        );
+    }
+
+    /// The state machine of a wait: a condition that is already met returns at
+    /// once, and a ring that is closed or stale is reported instead of waited
+    /// on (RFC 0007 §6.1, §5.3 and §6.5).
+    #[test]
+    fn the_wait_state_machine_reports_the_state_instead_of_waiting() {
+        let (mut producer, consumer) = pcm_ring_with_wake(4, 2);
+
+        // Data is already there: the wait must not block. `Signaled` is only
+        // returned when the counter check found the condition met, so the
+        // outcome itself is the evidence; the elapsed bound is a smoke floor.
+        producer.write_from(&[1.0f32, -1.0]).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            consumer
+                .wait_readable(Some(Duration::from_secs(5)))
+                .unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a satisfied wait must return at once, took {:?}",
+            started.elapsed()
+        );
+
+        // Space is free: the same on the producer side.
+        let started = Instant::now();
+        assert_eq!(
+            producer
+                .wait_writable(Some(Duration::from_secs(5)))
+                .unwrap(),
+            WaitOutcome::Signaled
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a satisfied wait must return at once, took {:?}",
+            started.elapsed()
+        );
+
+        // A closed ring is reported, not waited on.
+        producer.close();
+        assert!(matches!(
+            consumer.wait_readable(TEST_WAIT),
+            Err(RingError::Closed)
+        ));
+        assert!(matches!(
+            producer.wait_writable(TEST_WAIT),
+            Err(RingError::Closed)
+        ));
+    }
+
+    /// A blocking call on a ring whose generation moved on reports `Stale`
+    /// instead of waiting on a ring that is not its own (RFC 0007 §5.3,
+    /// acceptance criterion 6).
+    #[test]
+    fn the_blocking_path_rejects_a_stale_generation() {
+        let region = region_for(8, 8);
+        let producer = RingProducer::create(region.clone(), RingKind::Pcm, 8, 8).unwrap();
+        let wake = RingWake::create(&ring_name(RingKind::Pcm, producer.generation())).unwrap();
+        let expect = producer.expect();
+        let mut consumer = RingConsumer::attach(region.clone(), expect)
+            .unwrap()
+            .with_wake(wake);
+
+        // The creator re-creates the ring under the same mapping: the
+        // generation moves on and the old consumer is stale.
+        let _second = RingProducer::create(region, RingKind::Pcm, 8, 8).unwrap();
+
+        let mut out = [0.0f32; 8];
+        assert!(
+            matches!(
+                consumer.read_into_blocking(&mut out, TEST_WAIT),
+                Err(RingError::Stale { .. })
+            ),
+            "a blocking read on a stale ring must report Stale"
+        );
+        assert!(
+            matches!(
+                consumer.wait_readable(TEST_WAIT),
+                Err(RingError::Stale { .. })
+            ),
+            "a wait on a stale ring must report Stale"
+        );
+    }
+
+    /// A blocked write that runs out of time writes nothing and drops nothing
+    /// (RFC 0007 §6.4 and §7: `Ok(0)` means the ring stayed full).
+    #[test]
+    fn a_blocking_write_times_out_on_a_full_ring_without_dropping() {
+        let (mut producer, _consumer) = pcm_ring_with_wake(1, 2);
+        producer.write_from(&[1.0f32, -1.0]).unwrap();
+        assert_eq!(producer.free_frames(), 0, "the ring is full");
+
+        let started = Instant::now();
+        let written = producer
+            .write_from_blocking(&[2.0f32, -2.0], Some(Duration::from_millis(50)))
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(written, 0, "a timed-out write accepts nothing");
+        assert_eq!(producer.frames_dropped(), 0, "a blocking write never drops");
+        assert_eq!(producer.frames_written(), 1, "the ring is unchanged");
+        assert!(
+            elapsed >= Duration::from_millis(1),
+            "the wait returned at once after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the wait took too long: {elapsed:?}"
+        );
     }
 }
