@@ -44,6 +44,19 @@
 //! perceptual estimator can use it without changing call sites. The same
 //! holds for `channels`, which today only shapes (and validates) the input.
 //!
+//! ## Album values
+//!
+//! [`album_gain_db`], [`album_gain_from_histograms`] and
+//! [`album_gain_from_blocks`] compute the album-level gain of a set of
+//! tracks: the negative of the 95th percentile of the pooled per-block
+//! loudness values of the album, clamped to ±51 dB — the track rule applied
+//! to the album as a whole. [`album_peak`] is the largest track peak of the
+//! album.
+//!
+//! Which tracks belong to one album is a separate question: the grouping
+//! and the mapping from a track to its album values live in the
+//! [`album`](crate::album) module.
+//!
 //! ## Format support (honest answers)
 //!
 //! The four classic keys round-trip on every primary tag type `lofty`
@@ -62,6 +75,8 @@
 //! Applying the gain to audio — the volume stage that reads these tags —
 //! belongs to another lane (`rustamp-audio`) and is explicitly not done here.
 //! See `docs/tasks/E4-replaygain.md` for what that side still has to do.
+
+use std::borrow::Borrow;
 
 use lofty::file::FileType;
 use lofty::tag::{ItemKey, TagType};
@@ -295,6 +310,25 @@ pub const REFERENCE_RMS: f64 = core::f64::consts::FRAC_1_SQRT_2;
 /// usefully encode.
 pub const MAX_GAIN_DB: f32 = 51.0;
 
+/// Width of one loudness histogram bin, in dB.
+const HISTOGRAM_BIN_WIDTH_DB: f32 = 0.01;
+
+/// The lowest loudness a histogram bin covers, in dB.
+///
+/// A block below it lands in the lowest bin: the histogram measures from
+/// here up and cannot resolve anything below its floor.
+const HISTOGRAM_MIN_DB: f32 = -100.0;
+
+/// The highest loudness a histogram bin covers, in dB.
+const HISTOGRAM_MAX_DB: f32 = 20.0;
+
+/// The loudness at or below which a block counts as silence, in dB.
+///
+/// An album whose blocks all sit here measures as silent and gets the
+/// neutral 0.0 dB gain instead of the saturated +51 dB a silent album
+/// would otherwise ask for.
+const SILENCE_FLOOR_DB: f32 = -99.0;
+
 /// A histogram of per-block loudness values, used to combine tracks into an
 /// album-level ReplayGain measurement.
 #[derive(Debug, Clone, PartialEq)]
@@ -482,21 +516,7 @@ pub fn analyze_replaygain(
     };
 
     // Histogram (0.01 dB bins from -100 to +20 dB).
-    let bin_width = 0.01f32;
-    let min_db = -100.0f32;
-    let bins_count = ((20.0 - (-100.0)) / bin_width as f64).round() as usize + 1;
-    let mut counts = vec![0u32; bins_count];
-    for &l in &block_loudness {
-        let idx = ((l - min_db) / bin_width).round();
-        let idx = idx.clamp(0.0, (bins_count - 1) as f32) as usize;
-        counts[idx] += 1;
-    }
-    let histogram = ReplayGainHistogram {
-        bin_width_db: bin_width,
-        min_db,
-        counts: counts.clone(),
-        bins: counts,
-    };
+    let histogram = histogram_of_blocks(&block_loudness);
 
     Ok(ReplayGainAnalysis {
         track_gain_db,
@@ -508,36 +528,150 @@ pub fn analyze_replaygain(
     })
 }
 
-/// Computes an album-level gain in dB from a collection of per-track analyses.
-pub fn album_gain_db(analyses: &[ReplayGainAnalysis]) -> f32 {
-    let mut all: Vec<f32> = Vec::new();
-    for a in analyses {
-        all.extend_from_slice(&a.block_loudness_db);
+/// The number of bins a loudness histogram holds.
+fn histogram_bin_count() -> usize {
+    ((HISTOGRAM_MAX_DB - HISTOGRAM_MIN_DB) as f64 / HISTOGRAM_BIN_WIDTH_DB as f64).round() as usize
+        + 1
+}
+
+/// The loudness histogram of a list of per-block loudness values.
+///
+/// The bins are the ones [`analyze_replaygain`] uses: 0.01 dB wide from
+/// -100 dB to +20 dB. A value outside that range lands in the closest
+/// bin, so the histogram never loses a block.
+fn histogram_of_blocks(blocks: &[f32]) -> ReplayGainHistogram {
+    let bin_count = histogram_bin_count();
+    let mut counts = vec![0u32; bin_count];
+    for &loudness in blocks {
+        let index = ((loudness - HISTOGRAM_MIN_DB) / HISTOGRAM_BIN_WIDTH_DB).round();
+        let index = index.clamp(0.0, (bin_count - 1) as f32) as usize;
+        counts[index] += 1;
     }
-    album_gain_from_blocks(&all)
+    ReplayGainHistogram {
+        bin_width_db: HISTOGRAM_BIN_WIDTH_DB,
+        min_db: HISTOGRAM_MIN_DB,
+        counts: counts.clone(),
+        bins: counts,
+    }
+}
+
+/// Computes an album-level gain in dB from a collection of per-track analyses.
+///
+/// The analyses may be given by value or by reference. The album gain is
+/// the negative of the 95th percentile of the pooled per-block loudness
+/// values of all tracks, clamped to ±51 dB — the same rule the track gain
+/// uses, applied to the album as a whole. An album whose blocks all sit
+/// at or below -99 dB is silent and measures as the neutral 0.0 dB.
+///
+/// See [`album_gain_from_histograms`] for the rule and
+/// [`crate::album`] for the grouping of tracks into albums.
+pub fn album_gain_db(analyses: &[impl Borrow<ReplayGainAnalysis>]) -> f32 {
+    let histograms: Vec<&ReplayGainHistogram> = analyses
+        .iter()
+        .map(|analysis| &analysis.borrow().histogram)
+        .collect();
+    album_gain_from_histograms(&histograms)
+}
+
+/// Computes an album-level gain in dB from the loudness histograms of the
+/// album's tracks.
+///
+/// The histograms are pooled bin by bin and the album gain is the negative
+/// of the 95th percentile of the pooled per-block loudness values,
+/// clamped to ±51 dB. The percentile is resolved on the histogram's
+/// 0.01 dB grid, so it can differ from the exact percentile of the same
+/// blocks by at most 0.005 dB.
+///
+/// An album whose blocks all sit at or below -99 dB is silent and
+/// measures as the neutral 0.0 dB — a silent album must not ask for the
+/// saturated +51 dB a loud one would.
+pub fn album_gain_from_histograms(histograms: &[&ReplayGainHistogram]) -> f32 {
+    match pooled_percentile_db(histograms) {
+        Some(loudness) => {
+            (-(loudness as f64)).clamp(f64::from(-MAX_GAIN_DB), f64::from(MAX_GAIN_DB)) as f32
+        }
+        None => 0.0,
+    }
 }
 
 /// Computes an album-level gain in dB from a flat list of per-block loudness
 /// values (in dB, relative to `REFERENCE_RMS`).
+///
+/// The list is the blocks of all tracks of the album, pooled. The result is
+/// the same as [`album_gain_from_histograms`] for the same blocks: the
+/// percentile is resolved on the histogram's 0.01 dB grid, so it can differ
+/// from the exact percentile by at most 0.005 dB.
 pub fn album_gain_from_blocks(blocks: &[f32]) -> f32 {
-    if blocks.is_empty() {
-        return 0.0;
+    let histogram = histogram_of_blocks(blocks);
+    album_gain_from_histograms(&[&histogram])
+}
+
+/// The 95th percentile of the pooled histograms, in dB.
+///
+/// The histograms are pooled bin by bin; a bin's value is its left edge.
+/// `None` when there is no block at all, or when every block sits at or
+/// below the silence floor (-99 dB) — a silent album.
+fn pooled_percentile_db(histograms: &[&ReplayGainHistogram]) -> Option<f32> {
+    let first = histograms.first()?;
+    let width = first.bin_width_db;
+    let min_db = first.min_db;
+    if width <= 0.0 || !width.is_finite() || !min_db.is_finite() {
+        return None;
     }
-    let mut sorted: Vec<f32> = blocks.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-    let n = sorted.len();
-    let idx = ((n as f64 - 1.0) * 0.95).round().clamp(0.0, (n - 1) as f64) as usize;
-    let loudness = sorted[idx] as f64;
-    if blocks.iter().all(|&x| x <= -99.0) {
-        0.0
-    } else {
-        (-loudness).clamp(f64::from(-MAX_GAIN_DB), f64::from(MAX_GAIN_DB)) as f32
+    let bin_count = first.counts.len();
+    if bin_count == 0 {
+        return None;
     }
+
+    // Pool onto the first histogram's grid, by value: a bin of another
+    // histogram lands in the bin that holds its loudness.
+    let mut pooled = vec![0u64; bin_count];
+    for histogram in histograms {
+        for (index, &count) in histogram.counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let value = histogram.min_db + index as f32 * histogram.bin_width_db;
+            let target = ((value - min_db) / width).round();
+            let target = target.clamp(0.0, (bin_count - 1) as f32) as usize;
+            pooled[target] += u64::from(count);
+        }
+    }
+
+    let total: u64 = pooled.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    // Silence: no block above the floor. A single loud block among silent
+    // ones is not silence, even when the percentile lands in the silence.
+    let loud_blocks: u64 = pooled
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| min_db + *index as f32 * width > SILENCE_FLOOR_DB)
+        .map(|(_, &count)| count)
+        .sum();
+    if loud_blocks == 0 {
+        return None;
+    }
+
+    // The same rank the track gain uses: the 95th percentile of the blocks.
+    let rank = (((total - 1) as f64) * 0.95).round() as u64;
+    let mut cumulative = 0u64;
+    for (index, &count) in pooled.iter().enumerate() {
+        cumulative += count;
+        if cumulative > rank {
+            return Some(min_db + index as f32 * width);
+        }
+    }
+    None
 }
 
 /// Album peak: the largest track peak.
-pub fn album_peak(analyses: &[ReplayGainAnalysis]) -> f32 {
-    analyses.iter().map(|a| a.track_peak).fold(0.0f32, f32::max)
+pub fn album_peak(analyses: &[impl Borrow<ReplayGainAnalysis>]) -> f32 {
+    analyses
+        .iter()
+        .map(|analysis| analysis.borrow().track_peak)
+        .fold(0.0f32, f32::max)
 }
 
 /// Whether files with extension `ext` (no leading dot, any case) keep the
@@ -769,6 +903,62 @@ mod tests {
         let mut inf = vec![0.5f32; 100];
         inf[50] = f32::INFINITY;
         assert!(analyze_replaygain(&inf, 1, SAMPLE_RATE).is_err());
+    }
+
+    #[test]
+    fn the_album_gain_pools_the_blocks_of_every_track() {
+        let loud =
+            analyze_replaygain(&sine(0.5, 440.0, SAMPLE_RATE as usize), 1, SAMPLE_RATE).unwrap();
+        let quiet =
+            analyze_replaygain(&sine(0.1, 440.0, SAMPLE_RATE as usize), 1, SAMPLE_RATE).unwrap();
+        // Both tracks contribute the same number of blocks, so the pooled
+        // 95th percentile is the loud track's loudness.
+        let album = album_gain_db(&[&loud, &quiet]);
+        assert!(
+            (album - loud.track_gain_db).abs() <= 0.01,
+            "album gain = {album}, loud track = {}",
+            loud.track_gain_db
+        );
+        // The quiet track asks for much more gain than the album does.
+        assert!(album < quiet.track_gain_db);
+    }
+
+    #[test]
+    fn a_one_track_album_reproduces_the_track_gain() {
+        let analysis =
+            analyze_replaygain(&sine(0.5, 440.0, SAMPLE_RATE as usize), 1, SAMPLE_RATE).unwrap();
+        let album = album_gain_db(&[&analysis]);
+        // The percentile is resolved on the histogram's 0.01 dB grid, so the
+        // album gain can differ from the track gain by one bin.
+        assert!(
+            (album - analysis.track_gain_db).abs() <= 0.01,
+            "album gain = {album}, track gain = {}",
+            analysis.track_gain_db
+        );
+        // The block path and the histogram path are the same rule.
+        assert_eq!(album, album_gain_from_blocks(&analysis.block_loudness_db));
+    }
+
+    #[test]
+    fn a_silent_album_is_neutral() {
+        let silence =
+            analyze_replaygain(&vec![0.0f32; SAMPLE_RATE as usize], 1, SAMPLE_RATE).unwrap();
+        assert_eq!(album_gain_db(&[&silence]), 0.0);
+        assert_eq!(album_gain_from_blocks(&silence.block_loudness_db), 0.0);
+        let empty: [&ReplayGainAnalysis; 0] = [];
+        assert_eq!(album_gain_db(&empty), 0.0);
+        assert_eq!(album_gain_from_blocks(&[]), 0.0);
+    }
+
+    #[test]
+    fn the_album_peak_is_the_largest_track_peak() {
+        let quiet =
+            analyze_replaygain(&sine(0.5, 440.0, SAMPLE_RATE as usize), 1, SAMPLE_RATE).unwrap();
+        let hot =
+            analyze_replaygain(&sine(0.9, 440.0, SAMPLE_RATE as usize), 1, SAMPLE_RATE).unwrap();
+        assert_eq!(album_peak(&[&quiet, &hot]), hot.track_peak);
+        let empty: [&ReplayGainAnalysis; 0] = [];
+        assert_eq!(album_peak(&empty), 0.0);
     }
 
     #[test]
