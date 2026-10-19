@@ -14,6 +14,9 @@
 //! * [`skin`] — skin selection with a clear fallback to the repo's built-in
 //!   default (Rust-themed) skin.
 //! * [`routing`] — which layer owns a [`rustamp_core::command::Command`].
+//! * [`region`] — the skin's window shape: the `region.txt` section a
+//!   window uses and the rectangles its mask becomes. Pure; the operating
+//!   system's window region lives in [`rustamp_platform::window_region`].
 //! * [`app`] - [`app::App`]: engine + headless UI machine + command/event
 //!   routing. Fully headless and unit-tested.
 //! * [`eq_autoload`] — the equalizer's automatic per-track preset selection
@@ -75,6 +78,7 @@ pub mod host;
 pub mod menu;
 mod output;
 pub mod playlist_window;
+pub mod region;
 pub mod routing;
 pub mod skin;
 pub mod supervise;

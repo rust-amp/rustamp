@@ -91,7 +91,8 @@ test that accidentally loses `--null` fails loudly rather than starting a GUI.
 
 The tests that open windows are `#[ignore]`d and VM-only
 (`tests/headless.rs`, `tests/playlist_window.rs`, `tests/eq_window.rs`,
-`tests/main_menu.rs`, and the menu unit test in `src/window.rs`):
+`tests/main_menu.rs`, `tests/window_region.rs`, and the menu unit test in
+`src/window.rs`):
 
 ```text
 cargo test -p rustamp-app -- --ignored
@@ -211,6 +212,46 @@ pwsh -File docs/notes/vm-run-tests.ps1 -Filter '--ignored:docking_presenter'
 ```
 
 Never run the ignored test on the host; `require_test_vm()` refuses it there.
+
+## The skin's window shape (`region.txt`)
+
+A skin's `region.txt` describes the **visible** area of a window (S17 §7):
+everything outside the polygons is transparent. `rustamp-skin` turns those
+polygons into a per-pixel mask (`rustamp_skin::Region::mask`); the app turns
+the mask into rectangles and hands them to the operating system, which clips
+the window to them (`SetWindowRgn`).
+
+| Window | Section of `region.txt` |
+|---|---|
+| main window | `[Normal]`, `[WindowShade]` while it is shaded |
+| equalizer | `[Equalizer]` |
+| playlist editor | none: it keeps its rectangle (own choice) |
+
+The rules the app follows (`src/region.rs`):
+
+* **No mask, no shape.** A skin without a `region.txt` — or with a section
+  that has no polygon, which is the base skin's case (S17 §7) — leaves the
+  window a plain rectangle.
+* **A mask that covers no pixel is not a shape.** The window stays a
+  rectangle; an empty region would make the window invisible.
+* **The shape is scaled with the skin.** The polygons are drawn in the skin's
+  own pixels, so the mask is built for the layout size and scaled to the
+  window's physical pixels, exactly like the skin's bitmaps in the
+  double-size mode.
+
+The shape is applied again whenever one of its inputs changes: the window is
+resized (which the shade and the double-size mode both do), another skin is
+loaded, or the window is shown again.
+
+The FFI lives in `rustamp-platform` (`window_region`), because the app crate
+is `deny(unsafe_code)`. The handle belongs to the **system** after a
+successful `SetWindowRgn` — the app must not delete it then; a call that
+fails leaves the handle with the caller, which deletes it.
+
+The rectangles and the section choice are covered headless, in
+`src/region.rs`. The operating system's window region itself is covered by
+the ignored `tests/window_region.rs`, which cuts a real window to a skin's
+shape, reads the shape back and clears it again: **VM-only**.
 
 ## The playlist editor's windowshade
 
