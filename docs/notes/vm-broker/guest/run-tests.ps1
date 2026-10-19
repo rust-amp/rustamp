@@ -111,6 +111,67 @@ if (-not (Test-Path $dspFixture)) {
 }
 if (Test-Path $dspFixture) { $env:RUSTAMP_DSP_FIXTURE = $dspFixture }
 
+function Assert-RequiredFixture([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Get-Item -LiteralPath $Path -ErrorAction Stop).Length -eq 0) {
+        throw "required staged fixture missing or empty: $Path; refusing before any test binary runs"
+    }
+}
+
+function Test-SelectedIgnoredBinary([string]$Pattern) {
+    return ($extra -contains '--ignored' -and @($exes | Where-Object {
+        $name = Split-Path $_ -Leaf
+        $name -like $Pattern -and (-not $filter -or $name -like "*$filter*")
+    }).Count -gt 0)
+}
+
+if ($extra -notcontains '--ignored' -and @($exes | Where-Object {
+    (Split-Path $_ -Leaf) -like 'base291_acceptance-*' -and (-not $filter -or (Split-Path $_ -Leaf) -like "*$filter*")
+}).Count -gt 0) {
+    $base291Skin = 'C:\rustamp\testskins\base-2.91.wsz'
+    Assert-RequiredFixture $base291Skin
+    $env:RUSTAMP_BASE291_SKIN = $base291Skin
+}
+
+# Detect incomplete copyin before the suite can degenerate into fixture refusals.
+# The two DSP fixtures deliberately share an old environment name; the DLL is
+# selected per binary below, never substituted for the resident executable.
+if ($extra -contains '--ignored' -and -not $desktopFree) {
+    foreach ($fixtureName in 'gen_rustamp_fixture', 'out_rustamp_fixture', 'in_rustamp_fixture',
+        'in_handoff_rustamp_fixture', 'vis_rustamp_fixture', 'dsp_rustamp_fixture', 'crash_rustamp_fixture') {
+        Assert-RequiredFixture (Join-Path $deps "$fixtureName.dll")
+    }
+    Assert-RequiredFixture (Join-Path $deps 'rustamp-plughost32.exe')
+    if ((Test-SelectedIgnoredBinary 'dll_acceptance-*') -or
+        (Test-SelectedIgnoredBinary 'control_load_acceptance-*') -or
+        (Test-SelectedIgnoredBinary 'rustamp_plughost-*')) {
+        $openmpt = @('C:\rustamp\testplugins\in_openmpt.dll', 'C:\rustamp\testplugins\libopenmpt\Winamp\in_openmpt.dll') |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+        if (-not $openmpt) { throw 'required staged in_openmpt.dll missing; refusing before any test binary runs' }
+        Assert-RequiredFixture $openmpt
+    }
+    if (Test-SelectedIgnoredBinary 'dsp_acceptance-*') {
+        Assert-RequiredFixture $dspPluginPath
+        if ($dspPluginHash -ne '78A140C9114B60B361DC7E9A0203DD6D6F23D567E1F309396CD78BAEA7797874') {
+            throw 'required staged approved DSP fixture has the wrong SHA-256; refusing before any test binary runs'
+        }
+    }
+}
+
+Remove-Item Env:\RUSTAMP_BASE291_VM_CAPTURES -ErrorAction SilentlyContinue
+if (Test-SelectedIgnoredBinary 'base291_acceptance-*') {
+    $captureRoot = 'C:\rustamp\base291-captures'
+    Assert-RequiredFixture (Join-Path $captureRoot 'session-proof.json')
+    foreach ($case in 'main-active', 'main-inactive', 'main-shade', 'main-double',
+        'eq-active', 'eq-inactive', 'eq-shade', 'eq-double',
+        'playlist-active', 'playlist-inactive', 'playlist-shade') {
+        foreach ($kind in 'presented', 'reference') {
+            Assert-RequiredFixture (Join-Path $captureRoot "$case.$kind.png")
+        }
+    }
+    $env:RUSTAMP_BASE291_VM_CAPTURES = $captureRoot
+    Write-Host "base291 captures: $captureRoot (11 real pairs and capture-session proof present)"
+}
+
 # --- launch one test binary, bounded, and bring its output back as text -------
 #
 # Two rules this helper follows, both written down because the first version of
@@ -160,6 +221,11 @@ function Invoke-TestBinary {
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    if ((Split-Path $Exe -Leaf) -like 'dsp_fixture_acceptance-*') {
+        $pluginDsp = Join-Path $deps 'dsp_rustamp_fixture.dll'
+        Assert-RequiredFixture $pluginDsp
+        $psi.EnvironmentVariables['RUSTAMP_DSP_FIXTURE'] = $pluginDsp
+    }
     # The child inherits this process's environment - RUSTAMP_TESTDATA and
     # RUSTAMP_TESTSKINS, set just above - and the subst'd D:, because it is an
     # ordinary child of this session: nothing is re-established in a new
@@ -435,6 +501,7 @@ if ($bless) {
     # Same idea for the DSP fixture: $null means it was not found in the guest.
     testplugindsp = $env:RUSTAMP_TESTPLUGIN_DSP
     testplugindspsha256 = $dspPluginHash
+    base291captures = $env:RUSTAMP_BASE291_VM_CAPTURES
     # LEFT OUT / MISSING / DID NOT START rows are not executed binaries.
     ran       = $executedCount
     testsRun  = (@($results | ForEach-Object { $_.passed }).Count + @($results | ForEach-Object { $_.failed }).Count)

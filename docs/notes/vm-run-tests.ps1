@@ -40,7 +40,9 @@ param(
     [ValidateRange(1, 2147483647)] [int]$Repeat = 1,
     [string]$RepeatSummaryPath = '',
     # Where the re-blessed golden images land on the host (only with --bless).
-    [string]$BlessOut = 'D:\code\rustamp-vm\staging\out\bless-golden'
+    [string]$BlessOut = 'D:\code\rustamp-vm\staging\out\bless-golden',
+    # Real, approved capture pairs; never synthesized by the test runner.
+    [string]$Base291Captures = 'D:\code\rustamp-testcaptures\base291'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,8 +54,61 @@ if ($DesktopFreeResidentFixtures -and $Filter -cnotin '--ignored:pcm_process', '
 
 function Step($t) { Write-Host "--- $t" }
 
+function Assert-RequiredFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Get-Item -LiteralPath $Path).Length -eq 0) {
+        throw "required fixture missing or empty: $Path; no guest test run is allowed with incomplete fixtures"
+    }
+}
+
+function Copy-RequiredFile([string]$Source, [string]$Destination) {
+    Assert-RequiredFile $Source
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+    $copied = Join-Path $Destination (Split-Path $Source -Leaf)
+    Assert-RequiredFile $copied
+    if ((Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $copied -Algorithm SHA256).Hash) {
+        throw "required fixture staging hash mismatch: $Source -> $copied"
+    }
+}
+
+function Assert-I686Pe([string]$Path) {
+    Assert-RequiredFile $Path
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "not a PE fixture: $Path" }
+    $offset = [BitConverter]::ToInt32($bytes, 0x3c)
+    if ($offset -lt 0 -or $offset -gt $bytes.Length - 6 -or
+        [BitConverter]::ToUInt32($bytes, $offset) -ne 0x4550 -or
+        [BitConverter]::ToUInt16($bytes, $offset + 4) -ne 0x14c) {
+        throw "required plugin host/fixture is not i686 PE: $Path"
+    }
+}
+
+function Assert-Base291Captures([string]$Root) {
+    Assert-RequiredFile (Join-Path $Root 'session-proof.json')
+    foreach ($case in 'main-active', 'main-inactive', 'main-shade', 'main-double',
+        'eq-active', 'eq-inactive', 'eq-shade', 'eq-double',
+        'playlist-active', 'playlist-inactive', 'playlist-shade') {
+        foreach ($kind in 'presented', 'reference') {
+            Assert-RequiredFile (Join-Path $Root "$case.$kind.png")
+        }
+    }
+}
+
+function Assert-SeparateFixturePaths([string]$Source, [string]$Destination) {
+    $sourceRoot = [IO.Path]::GetFullPath($Source).TrimEnd('\') + '\'
+    $destinationRoot = [IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
+    if ($sourceRoot.StartsWith($destinationRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        $destinationRoot.StartsWith($sourceRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "capture source and staging paths must not overlap: $Source / $Destination"
+    }
+}
+
 $RepoRoot = [IO.Path]::GetFullPath($RepoRoot).TrimEnd('\')
 $Stage = [IO.Path]::GetFullPath($Stage).TrimEnd('\')
+$Base291Captures = [IO.Path]::GetFullPath($Base291Captures).TrimEnd('\')
+$captureStage = Join-Path (Split-Path $Stage) 'base291-captures'
+# Check before the main stage can be removed too: inputs are read-only.
+Assert-SeparateFixturePaths $Base291Captures $Stage
+Assert-SeparateFixturePaths $Base291Captures $captureStage
 $receiptPath = Join-Path $Stage 'stage-receipt.json'
 
 # A receipt is written LAST, only after a successful full build and staging.
@@ -87,6 +142,7 @@ function Get-WorkspaceStageInventory {
         }
     }
     Get-Inventory $files $RepoRoot
+    [pscustomobject]@{ path = 'vm-test-runner\vm-run-tests.ps1'; hash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash }
     [pscustomobject]@{ path = 'vm-test-runner\run-tests.ps1'; hash = (Get-FileHash -LiteralPath $runnerSource -Algorithm SHA256).Hash }
     foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
         $p = Join-Path $env:SystemRoot "System32\$crt"
@@ -114,20 +170,20 @@ function Assert-Inventory($Expected, $Actual, [string]$Label) {
 
 # The general-purpose plugin fixture of the P3 DLL acceptance is a cdylib
 # (crates/rustamp-plughost/examples/gen_rustamp_fixture.rs) built for i686 by
-# the test build below. The acceptance test loads it through the OS loader,
+# an explicit example build below. The acceptance test loads it through the OS loader,
 # so it has to travel with the test binaries; it is never linked into them.
 $genFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\gen_rustamp_fixture.dll'
 $genFixtureStaged = $false
 
 # The output plugin fixture (crates/rustamp-plughost/examples/out_rustamp_fixture.rs)
 # is the same kind of artifact for the `out_` plugin kind: our own clean-room
-# cdylib, built for i686 by the same test build, loaded through the OS loader.
+# cdylib, built for i686 by the same example build, loaded through the OS loader.
 $outFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\out_rustamp_fixture.dll'
 $outFixtureStaged = $false
 
 # The input plugin fixture (crates/rustamp-plughost/examples/in_rustamp_fixture.rs)
 # is the same kind of artifact for the `in_` plugin kind: our own clean-room
-# cdylib, built for i686 by the same test build, loaded through the OS loader.
+# cdylib, built for i686 by the same example build, loaded through the OS loader.
 # It opens no window and no audio device.
 $inFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\in_rustamp_fixture.dll'
 $inFixtureStaged = $false
@@ -135,7 +191,7 @@ $inFixtureStaged = $false
 # The hand-over input plugin fixture (crates/rustamp-plughost/examples/
 # in_handoff_rustamp_fixture.rs) is the same kind of artifact for the input ->
 # output hand-over (S09 §3.5 step 2, §3.7): our own clean-room cdylib with
-# flag bit 0 set, built for i686 by the same test build. It drives the output
+# flag bit 0 set, built for i686 by the same example build. It drives the output
 # plugin the host hands it and opens no window and no audio device itself.
 $inHandoffFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\in_handoff_rustamp_fixture.dll'
 $inHandoffFixtureStaged = $false
@@ -143,7 +199,7 @@ $inHandoffFixtureStaged = $false
 # The visualization and DSP fixtures (crates/rustamp-plughost/examples/
 # vis_rustamp_fixture.rs and dsp_rustamp_fixture.rs) are the same kind of
 # artifact for the `vis_` and `dsp_` plugin kinds: own clean-room cdylibs,
-# built for i686 by the same test build, loaded through the OS loader.
+# built for i686 by the same example build, loaded through the OS loader.
 $visFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\vis_rustamp_fixture.dll'
 $visFixtureStaged = $false
 $dspFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\dsp_rustamp_fixture.dll'
@@ -152,10 +208,12 @@ $dspFixtureStaged = $false
 # The crashing plugin fixture (crates/rustamp-plughost/examples/
 # crash_rustamp_fixture.rs) is the same kind of artifact for the crash
 # isolation acceptance (PLAN M3): our own clean-room cdylib, built for i686 by
-# the same test build, loaded through the OS loader. It faults on purpose, so
+# the same example build, loaded through the OS loader. It faults on purpose, so
 # it must only ever run inside the guest.
 $crashFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\crash_rustamp_fixture.dll'
 $crashFixtureStaged = $false
+$pluginFixtureNames = @('gen_rustamp_fixture', 'out_rustamp_fixture', 'in_rustamp_fixture',
+    'in_handoff_rustamp_fixture', 'vis_rustamp_fixture', 'dsp_rustamp_fixture', 'crash_rustamp_fixture')
 
 # --- 1. compile on the host (builds, does not run) ---------------------------
 if (-not $SkipBuild) {
@@ -211,7 +269,7 @@ if (-not $SkipBuild) {
     try { $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json } catch {
         throw "-SkipBuild refused: unreadable completion receipt $receiptPath; staging completeness cannot be proved. Run once without -SkipBuild."
     }
-    if ($receipt.version -ne 2 -or $receipt.repo -ne $RepoRoot -or -not $receipt.files -or -not $receipt.inputs -or -not $receipt.testExes -or -not $receipt.i686TestExes) {
+    if ($receipt.version -ne 3 -or $receipt.repo -ne $RepoRoot -or -not $receipt.files -or -not $receipt.inputs -or -not $receipt.testExes -or -not $receipt.i686TestExes) {
         throw "-SkipBuild refused: invalid completion receipt $receiptPath for workspace $RepoRoot; staging completeness cannot be proved. Run once without -SkipBuild."
     }
     $stagedFiles = @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force | Where-Object { $_.FullName -ne $receiptPath })
@@ -225,6 +283,8 @@ if (-not $SkipBuild) {
     $outFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\out_rustamp_fixture.dll')
     $inFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\in_rustamp_fixture.dll')
     $inHandoffFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\in_handoff_rustamp_fixture.dll')
+    $visFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\vis_rustamp_fixture.dll')
+    $dspFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\dsp_rustamp_fixture.dll')
     $crashFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\crash_rustamp_fixture.dll')
     Write-Host ("    verified {0} staged files against the complete receipt and current workspace/runtime inputs" -f $receipt.files.Count)
 }
@@ -245,27 +305,18 @@ if (Test-Path (Join-Path $debugDir 'rustamp.exe')) { Copy-Item (Join-Path $debug
 # Stage mediahost resident fixture examples (decoder_fixture, dsp_fixture)
 $decoderFixtureExe = Join-Path $debugDir 'examples\decoder_fixture.exe'
 $dspFixtureExe = Join-Path $debugDir 'examples\dsp_fixture.exe'
-if (Test-Path $decoderFixtureExe) {
-    Copy-Item $decoderFixtureExe (Join-Path $Stage 'target\debug\examples') -Force
-    Copy-Item $decoderFixtureExe (Join-Path $Stage 'target\debug') -Force
-    Write-Host '    staged decoder_fixture example'
-}
-if (Test-Path $dspFixtureExe) {
-    Copy-Item $dspFixtureExe (Join-Path $Stage 'target\debug\examples') -Force
-    Copy-Item $dspFixtureExe (Join-Path $Stage 'target\debug') -Force
-    Write-Host '    staged dsp_fixture example'
+foreach ($fixture in $decoderFixtureExe, $dspFixtureExe) {
+    Copy-RequiredFile $fixture (Join-Path $Stage 'target\debug\examples')
+    Copy-RequiredFile $fixture (Join-Path $Stage 'target\debug')
+    Write-Host ('    staged resident fixture {0}' -f (Split-Path $fixture -Leaf))
 }
 
 # The real decoder resident (RFC 0006 §5). The engine adapter's two-process
 # tests spawn it and look for it next to the test binaries, so it has to sit
 # in target\debug beside them.
 $dechostExe = Join-Path $debugDir 'rustamp-dechost-symphonia.exe'
-if (Test-Path $dechostExe) {
-    Copy-Item $dechostExe (Join-Path $Stage 'target\debug') -Force
-    Write-Host '    staged the real decoder resident'
-} else {
-    Write-Host '    WARNING: no real decoder resident was built; the two-process engine test reports itself skipped'
-}
+Copy-RequiredFile $dechostExe (Join-Path $Stage 'target\debug')
+Write-Host '    staged the real decoder resident'
 
 # The plugin host is built for i686 — the app is 64-bit and the host 32-bit by
 # design (RFC 0006 §8) — so a plain workspace test build produces none and the
@@ -276,27 +327,36 @@ Step 'building the i686 plugin host and plughost test binaries'
 $prevPref = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 $prevRustflags = $env:RUSTFLAGS
-$env:RUSTFLAGS = '-C target-feature=+crt-static'
-& cargo build -p rustamp-plughost --target i686-pc-windows-msvc 2>$null | Out-Null
-$plughostBuildExit = $LASTEXITCODE
-$plughostTestJson = & cargo test -p rustamp-plughost --all-targets --all-features --no-run --target i686-pc-windows-msvc --message-format=json 2>$null
-$plughostTestExit = $LASTEXITCODE
-if ($null -eq $prevRustflags) { Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue } else { $env:RUSTFLAGS = $prevRustflags }
-$ErrorActionPreference = $prevPref
-if ($plughostBuildExit -ne 0) { throw "cargo build -p rustamp-plughost --target i686-pc-windows-msvc failed with exit $plughostBuildExit" }
+try {
+    $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    & cargo build --offline -p rustamp-plughost --target i686-pc-windows-msvc 2>$null | Out-Null
+    $plughostBuildExit = $LASTEXITCODE
+    if ($plughostBuildExit -ne 0) { throw "i686 plugin host build failed with exit $plughostBuildExit" }
+    # `cargo test --all-targets --no-run` does not promise loadable cdylibs.
+    # Build the exact examples that the refusing acceptance tests name.
+    foreach ($fixtureName in $pluginFixtureNames) {
+        Step "building required i686 cdylib $fixtureName"
+        & cargo build --offline -p rustamp-plughost --example $fixtureName --target i686-pc-windows-msvc 2>$null | Out-Null
+        $pluginFixtureBuildExit = $LASTEXITCODE
+        if ($pluginFixtureBuildExit -ne 0) { throw "i686 fixture $fixtureName build failed with exit $pluginFixtureBuildExit" }
+        Assert-I686Pe (Join-Path $RepoRoot "target\i686-pc-windows-msvc\debug\examples\$fixtureName.dll")
+    }
+    $plughostTestJson = & cargo test --offline -p rustamp-plughost --all-targets --all-features --no-run --target i686-pc-windows-msvc --message-format=json 2>$null
+    $plughostTestExit = $LASTEXITCODE
+} finally {
+    if ($null -eq $prevRustflags) { Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue } else { $env:RUSTFLAGS = $prevRustflags }
+    $ErrorActionPreference = $prevPref
+}
 if ($plughostTestExit -ne 0) { throw "cargo test -p rustamp-plughost --no-run --target i686-pc-windows-msvc failed with exit $plughostTestExit" }
 
 $hostExe = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\rustamp-plughost32.exe'
-if (Test-Path $hostExe) {
-    Copy-Item $hostExe (Join-Path $Stage 'target\debug\deps') -Force
-    Copy-Item $hostExe (Join-Path $Stage 'target\debug') -Force
-    $i686TargetDebug = Join-Path $Stage 'target\i686-pc-windows-msvc\debug'
-    $null = New-Item -ItemType Directory -Force -Path $i686TargetDebug
-    Copy-Item $hostExe $i686TargetDebug -Force
-    Write-Host '    staged the i686 plugin host beside the binaries'
-} else {
-    Write-Host '    WARNING: no i686 plugin host was built; the end-to-end test will report it blocked'
-}
+Assert-I686Pe $hostExe
+Copy-RequiredFile $hostExe (Join-Path $Stage 'target\debug\deps')
+Copy-RequiredFile $hostExe (Join-Path $Stage 'target\debug')
+$i686TargetDebug = Join-Path $Stage 'target\i686-pc-windows-msvc\debug'
+$null = New-Item -ItemType Directory -Force -Path $i686TargetDebug
+Copy-RequiredFile $hostExe $i686TargetDebug
+Write-Host '    staged the i686 plugin host beside the binaries'
 
 $i686TestExes = @()
 foreach ($line in $plughostTestJson) {
@@ -307,6 +367,7 @@ foreach ($line in $plughostTestJson) {
     }
 }
 $i686TargetDeps = Join-Path $Stage 'target\i686-pc-windows-msvc\debug\deps'
+if ($i686TestExes.Count -eq 0) { throw 'no i686 plughost test binaries were produced; refusing incomplete staging' }
 $null = New-Item -ItemType Directory -Force -Path $i686TargetDeps
 foreach ($exe in $i686TestExes) {
     Copy-Item $exe (Join-Path $Stage 'target\debug\deps') -Force
@@ -316,77 +377,16 @@ if ($i686TestExes.Count -gt 0) {
     Write-Host ("    staged {0} i686 plughost test binaries beside the binaries" -f $i686TestExes.Count)
 }
 
-# The general-purpose plugin fixture travels with the test binaries: the
-# acceptance test loads it through the OS loader, never linked into them.
-if (Test-Path $genFixtureDll) {
-    Copy-Item $genFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
-    Copy-Item $genFixtureDll $i686TargetDeps -Force
-    $genFixtureStaged = $true
-    Write-Host '    staged the i686 general-purpose plugin fixture beside the binaries'
-} else {
-    Write-Host '    WARNING: no i686 general-purpose plugin fixture was built; its acceptance test will report it blocked'
+# Follow the existing beside-the-binaries layout used by every fixture finder.
+# Never certify a receipt after a missing, wrong-architecture or failed copy.
+foreach ($fixtureName in $pluginFixtureNames) {
+    $fixtureDll = Join-Path $RepoRoot "target\i686-pc-windows-msvc\debug\examples\$fixtureName.dll"
+    Assert-I686Pe $fixtureDll
+    Copy-RequiredFile $fixtureDll (Join-Path $Stage 'target\debug\deps')
+    Copy-RequiredFile $fixtureDll $i686TargetDeps
+    Write-Host "    staged required i686 $fixtureName.dll beside both sets of binaries"
 }
-
-# The output plugin fixture travels with the test binaries for the same reason.
-if (Test-Path $outFixtureDll) {
-    Copy-Item $outFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
-    Copy-Item $outFixtureDll $i686TargetDeps -Force
-    $outFixtureStaged = $true
-    Write-Host '    staged the i686 output plugin fixture beside the binaries'
-} else {
-    Write-Host '    WARNING: no i686 output plugin fixture was built; its acceptance test will report it blocked'
-}
-
-# The input plugin fixture travels with the test binaries for the same reason.
-if (Test-Path $inFixtureDll) {
-    Copy-Item $inFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
-    Copy-Item $inFixtureDll $i686TargetDeps -Force
-    $inFixtureStaged = $true
-    Write-Host '    staged the i686 input plugin fixture beside the binaries'
-} else {
-    Write-Host '    WARNING: no i686 input plugin fixture was built; its acceptance test will report it blocked'
-}
-
-# The hand-over input plugin fixture travels with the test binaries too: the
-# hand-over acceptance maps it and the output fixture side by side, one in
-# each process.
-if (Test-Path $inHandoffFixtureDll) {
-    Copy-Item $inHandoffFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
-    Copy-Item $inHandoffFixtureDll $i686TargetDeps -Force
-    $inHandoffFixtureStaged = $true
-    Write-Host '    staged the i686 hand-over input plugin fixture beside the binaries'
-} else {
-    Write-Host '    WARNING: no i686 hand-over input plugin fixture was built; its acceptance test will report it blocked'
-}
-
-# The visualization and DSP plugin fixtures travel with the test binaries too.
-if (Test-Path $visFixtureDll) {
-    Copy-Item $visFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
-    Copy-Item $visFixtureDll $i686TargetDeps -Force
-    $visFixtureStaged = $true
-    Write-Host '    staged the i686 visualization plugin fixture beside the binaries'
-} else {
-    Write-Host '    WARNING: no i686 visualization plugin fixture was built; its acceptance test will report it blocked'
-}
-if (Test-Path $dspFixtureDll) {
-    Copy-Item $dspFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
-    Copy-Item $dspFixtureDll $i686TargetDeps -Force
-    $dspFixtureStaged = $true
-    Write-Host '    staged the i686 DSP plugin fixture beside the binaries'
-} else {
-    Write-Host '    WARNING: no i686 DSP plugin fixture was built; its acceptance test will report it blocked'
-}
-
-# The crashing plugin fixture travels with the test binaries too: the crash
-# isolation acceptance loads it through the OS loader and lets it fault.
-if (Test-Path $crashFixtureDll) {
-    Copy-Item $crashFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
-    Copy-Item $crashFixtureDll $i686TargetDeps -Force
-    $crashFixtureStaged = $true
-    Write-Host '    staged the i686 crashing plugin fixture beside the binaries'
-} else {
-    Write-Host '    WARNING: no i686 crashing plugin fixture was built; its acceptance test will report it blocked'
-}
+$genFixtureStaged = $outFixtureStaged = $inFixtureStaged = $inHandoffFixtureStaged = $visFixtureStaged = $dspFixtureStaged = $crashFixtureStaged = $true
 
 foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
     $p = Join-Path $env:SystemRoot "System32\$crt"
@@ -424,7 +424,7 @@ $null = New-Item -ItemType Directory -Force -Path $runnerStage
 Copy-Item -LiteralPath $runnerSource -Destination (Join-Path $runnerStage 'run-tests.ps1') -Force
 $stagedFiles = @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force)
 [pscustomobject]@{
-    version = 2
+    version = 3
     repo = $RepoRoot
     testExes = @($testExes)
     i686TestExes = @($i686TestExes)
@@ -446,6 +446,54 @@ if ($selected.Count -eq 0) {
 }
 Write-Host ("    host selection: {0} test binaries (filter: '{1}')" -f $selected.Count, $Filter)
 
+# Validate required artifacts even with -SkipBuild. A receipt records bytes,
+# but must not allow an older incomplete fixture contract to be reused.
+foreach ($fixtureName in $pluginFixtureNames) {
+    foreach ($dir in 'target\debug\deps', 'target\i686-pc-windows-msvc\debug\deps') {
+        Assert-I686Pe (Join-Path $Stage "$dir\$fixtureName.dll")
+    }
+}
+Assert-I686Pe (Join-Path $Stage 'target\debug\deps\rustamp-plughost32.exe')
+
+function Test-SelectedIgnoredBinary([string]$Pattern) {
+    return ($Filter -like '--ignored*' -and @($selected | Where-Object { $_.Name -like $Pattern }).Count -gt 0)
+}
+
+# External fixtures use the existing wholesale staging + broker copyin below.
+# Fail BEFORE any guest operation when a selected ignored binary needs one.
+$pluginsDir = 'D:\code\rustamp-testplugins'
+$skinsDir = 'D:\code\rustamp-testskins'
+if ($Filter -notlike '--ignored*' -and @($selected | Where-Object { $_.Name -like 'base291_acceptance-*' }).Count -gt 0) {
+    Assert-RequiredFile (Join-Path $skinsDir 'base-2.91.wsz')
+}
+$dspFixtureName = 'dsp_optilab_core.dll'
+$dspFixtureSha256 = '78A140C9114B60B361DC7E9A0203DD6D6F23D567E1F309396CD78BAEA7797874'
+if ((Test-SelectedIgnoredBinary 'dll_acceptance-*') -or
+    (Test-SelectedIgnoredBinary 'control_load_acceptance-*') -or
+    (Test-SelectedIgnoredBinary 'rustamp_plughost-*')) {
+    $openmpt = @(Join-Path $pluginsDir 'in_openmpt.dll'; Join-Path $pluginsDir 'libopenmpt\Winamp\in_openmpt.dll') |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $openmpt) { throw "required approved in_openmpt.dll missing under $pluginsDir; no guest operation was attempted" }
+    Assert-I686Pe $openmpt
+}
+if (Test-SelectedIgnoredBinary 'dsp_acceptance-*') {
+    $requiredDsp = Join-Path $pluginsDir "dsp\$dspFixtureName"
+    Assert-I686Pe $requiredDsp
+    if ((Get-FileHash -LiteralPath $requiredDsp -Algorithm SHA256).Hash -ne $dspFixtureSha256) {
+        throw "required approved DSP fixture has the wrong SHA-256: $requiredDsp; no guest operation was attempted"
+    }
+}
+$captureRequired = Test-SelectedIgnoredBinary 'base291_acceptance-*'
+if ($captureRequired) {
+    Assert-Base291Captures $Base291Captures
+    Step 'staging the real base291 VM capture pairs (read-only copies)'
+    if (Test-Path -LiteralPath $captureStage) { Remove-Item -LiteralPath $captureStage -Recurse -Force }
+    Copy-Item -LiteralPath $Base291Captures -Destination $captureStage -Recurse -Force -ErrorAction Stop
+    Assert-Base291Captures $captureStage
+    Assert-Inventory @(Get-Inventory @(Get-ChildItem -LiteralPath $Base291Captures -Recurse -File) $Base291Captures) `
+        @(Get-Inventory @(Get-ChildItem -LiteralPath $captureStage -Recurse -File) $captureStage) 'capture'
+}
+
 # --- 3. optional reset, then start (the broker ejects the DVD) --------------
 if ($Reset) {
     Step "restoring $Baseline"
@@ -464,6 +512,10 @@ try {
 Write-Host ("    pre-staging cleanup: {0:F3} s (no reboot)" -f $cleanupClock.Elapsed.TotalSeconds)
 Step 'copying the staged tree into the guest'
 & $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\code\Rustamp' -TimeoutSeconds 1800 | Out-Null
+if ($captureRequired) {
+    Step 'copying approved base291 VM captures into the guest'
+    & $broker -Op copyin -Source $captureStage -Dest 'C:\rustamp\base291-captures' -TimeoutSeconds 600 | Out-Null
+}
 
 # Real test media (copied once from the owner's archive, never modified there):
 # if the directory exists on the host it is staged as-is, so tests that opt in
@@ -486,7 +538,6 @@ if (Test-Path $mediaDir) {
 # files and/or skin folders staged read-only, exposed to the guest as
 # RUSTAMP_TESTSKINS. Tests that need a real classic skin opt in and skip when it
 # is absent, so a checkout without it still passes.
-$skinsDir = 'D:\code\rustamp-testskins'
 if (Test-Path $skinsDir) {
     Step 'copying test skins into the guest (read-only copies)'
     $skinsStage = Join-Path (Split-Path $Stage) 'testskins'
@@ -504,13 +555,10 @@ if (Test-Path $skinsDir) {
 # and the ignored summary in step 6) can say plainly whether the Group D
 # fixture was staged; a missing fixture must never look like a pass.
 $pluginsStaged = $false
-$pluginsDir = 'D:\code\rustamp-testplugins'
 # The classic DSP fixture (P8) travels inside the same wholesale copy, at
 # dsp\dsp_optilab_core.dll. $dspHostState is what the host knows before the
 # guest speaks: 'absent' (no file), 'wrong-hash' (a file that is not the pinned
 # fixture - never staged as the approved one) or 'present'.
-$dspFixtureName = 'dsp_optilab_core.dll'
-$dspFixtureSha256 = '78A140C9114B60B361DC7E9A0203DD6D6F23D567E1F309396CD78BAEA7797874'
 $dspHostFile = Join-Path $pluginsDir "dsp\$dspFixtureName"
 $dspHostState = 'absent'
 if (Test-Path $dspHostFile) {
@@ -559,6 +607,12 @@ try {
 # lost it instead of printing empty columns below.
 if (-not $result) { throw "STEP guest FAILED: the broker returned no result object for $guestScript (see D:\code\rustamp-vm\broker\broker.log)" }
 if ($null -eq $result.results) { throw "STEP guest FAILED: the guest result object carries no results (see D:\code\rustamp-vm\broker\broker.log)" }
+if ($captureRequired) {
+    if ($result.base291captures -ne 'C:\rustamp\base291-captures') {
+        throw 'STEP guest FAILED: required base291 capture environment was not confirmed by the guest'
+    }
+    Write-Host ('base291 captures: staged and guest-confirmed (RUSTAMP_BASE291_VM_CAPTURES={0}; 11 real pairs plus capture-session proof)' -f $result.base291captures)
+}
 if (-not $DesktopFreeResidentFixtures) {
     if ($null -eq $result.session -or $result.session -le 0 -or -not $result.marker -or -not $result.screen) {
         throw 'STEP guest FAILED: no usable interactive-session proof; this run proves nothing.'
@@ -621,7 +675,7 @@ if ($dspHostState -eq 'absent') {
     Write-Host ('dsp plugin fixture: staged and verified (guest RUSTAMP_TESTPLUGIN_DSP={0}, SHA-256 {1})' -f $guestDspPath, $guestDspHash)
 }
 # General-purpose plugin fixture status (P3): our own clean-room cdylib, built
-# by the i686 test build and copied into the stage with the test binaries. It
+# by the explicit i686 example build and copied beside the test binaries. It
 # needs no third-party DLL, so it is staged whenever the build produced it.
 if ($genFixtureStaged) {
     $genFixturePath = if (Test-Path $genFixtureDll) { $genFixtureDll } else { Join-Path $Stage 'target\debug\deps\gen_rustamp_fixture.dll' }
@@ -655,7 +709,7 @@ if ($inHandoffFixtureStaged) {
     Write-Host 'handoff in plugin fixture: NOT STAGED (the i686 build produced no hand-over input fixture); its acceptance test refuses loudly and proves nothing in this run'
 }
 # Crashing plugin fixture status (PLAN M3, crash isolation): the same kind of
-# own cdylib, built by the i686 test build and copied into the stage with the
+# own cdylib, built by the explicit i686 example build and copied with the
 # test binaries. It faults on purpose, so it only ever runs in the guest.
 if ($crashFixtureStaged) {
     $crashFixturePath = if (Test-Path $crashFixtureDll) { $crashFixtureDll } else { Join-Path $Stage 'target\debug\deps\crash_rustamp_fixture.dll' }
