@@ -57,6 +57,22 @@ pub enum ReplayGainMode {
     Album,
 }
 
+/// Output mode of the audio device.
+///
+/// The WASAPI backend runs either in **shared** mode (the endpoint mixes the
+/// player's stream with the other clients of the device) or in **exclusive**
+/// mode (the endpoint belongs to the player alone). The backend's own type is
+/// `rustamp_output::WasapiMode`; the player maps between the two, because the
+/// configuration crate may not depend on the output crate. RFC 0019.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OutputMode {
+    /// Shared mode: the endpoint mixes the player's stream with other clients.
+    #[default]
+    Shared,
+    /// Exclusive mode: the endpoint belongs to the player alone.
+    Exclusive,
+}
+
 /// Audio settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -65,6 +81,8 @@ pub struct AudioConfig {
     pub output: String,
     /// Device identifier within the backend; `None` = system default.
     pub device: Option<String>,
+    /// Output mode of the device (shared or exclusive).
+    pub output_mode: OutputMode,
     /// Output buffer length in ms.
     pub buffer_ms: u32,
     /// Fade-out duration for `StopWithFadeout`, in ms.
@@ -84,6 +102,7 @@ impl Default for AudioConfig {
         AudioConfig {
             output: "auto".into(),
             device: None,
+            output_mode: OutputMode::Shared,
             buffer_ms: 200,
             fadeout_ms: 500,
             gapless: true,
@@ -214,6 +233,7 @@ mod tests {
             audio: AudioConfig {
                 output: "cpal".into(),
                 device: Some("Speakers".into()),
+                output_mode: OutputMode::Exclusive,
                 buffer_ms: 350,
                 fadeout_ms: 800,
                 gapless: false,
@@ -316,5 +336,22 @@ mod tests {
         assert_eq!(c.audio.volume, 5);
         assert_eq!(c.audio.buffer_ms, AudioConfig::default().buffer_ms);
         assert_eq!(c.version, CONFIG_VERSION);
+    }
+
+    #[test]
+    fn the_output_mode_defaults_to_shared_and_survives_a_file() {
+        // An older file without the key keeps the default: the field is
+        // additive and `AudioConfig` is `#[serde(default)]`.
+        let c: Config = toml::from_str("[audio]\nvolume = 5\n").unwrap();
+        assert_eq!(c.audio.output_mode, OutputMode::Shared);
+
+        // Every mode survives a write/read cycle.
+        for mode in [OutputMode::Shared, OutputMode::Exclusive] {
+            let mut config = Config::default();
+            config.audio.output_mode = mode;
+            let text = toml::to_string(&config).unwrap();
+            let back: Config = toml::from_str(&text).unwrap();
+            assert_eq!(back.audio.output_mode, mode);
+        }
     }
 }

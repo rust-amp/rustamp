@@ -121,6 +121,7 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
             let reason = match key.as_str() {
                 "output" => Some("only the default audio backend is supported"),
                 "device" => Some("audio device selection is not supported yet"),
+                "output_mode" => Some("the output mode is not applied yet"),
                 "buffer_ms" => Some("output buffer length is fixed"),
                 "fadeout_ms" => Some("fadeout duration is not supported yet"),
                 "gapless" => Some("gapless mode is not configurable"),
