@@ -23,6 +23,11 @@
 //!   scanned_at    INTEGER    -- unix seconds of last scan
 //! )
 //! track_extra(track_id, key, value)  -- the TrackMetadata::extra map
+//! roots(
+//!   id            INTEGER PRIMARY KEY AUTOINCREMENT,
+//!   path          TEXT NOT NULL UNIQUE,              -- root path as added
+//!   added_at      INTEGER NOT NULL                   -- unix seconds
+//! )
 //! ```
 //!
 //! The stable row id is the SQLite `rowid` (`id`); it survives re-scans
@@ -32,6 +37,41 @@
 //! differently spelled path is a different row. Non-UTF-8 paths are stored
 //! through a lossy conversion and cannot be distinguished from their
 //! replacement-character form.
+//!
+//! ## Roots
+//!
+//! [`Library::add_root`], [`Library::remove_root`] and [`Library::roots`]
+//! manage the list of indexed directories. A root is stored as the path string
+//! it was added with (no canonicalisation, no drive-letter folding), so
+//! callers should use one spelling per directory; adding the same spelling
+//! twice is a no-op that returns the existing row. [`Library::scan_root`]
+//! scans one root by its id, and [`Library::scan`] keeps working on an
+//! arbitrary path, so a scan does not have to be registered first.
+//! [`Library::remove_root`] forgets the root and deletes every indexed track
+//! under it; the rest of the library is untouched.
+//!
+//! ## Query
+//!
+//! [`Library::query`] takes a [`Query`]: the optional filters (`path_prefix`,
+//! `artist`, `album`, `title`, `genre`, `text`) are combined with AND, then the
+//! matches are sorted, paged and counted. It returns a [`TrackPage`] whose
+//! `total` is the number of matches *before* `limit`/`offset` is applied, so a
+//! UI can size a scrollbar without issuing a second query.
+//!
+//! `text` is the free-text search: one string matched as a literal
+//! case-insensitive substring of `title`, `artist` or `album` (`LIKE` with
+//! `ESCAPE`), so `%`, `_` and `\` are searched literally. Both the columns and
+//! the search term are case folded with Rust's Unicode lower-casing (a
+//! registered `rustamp_lower` SQL function) rather than SQLite's ASCII-only
+//! `NOCASE`, so `Ärzte` matches `ärzte` and `ÄRZTE`. Whitespace-only text means
+//! "no text filter".
+//!
+//! Sorting picks [`SortKey`] `Id`, `Title`, `Artist`, `Album` or `Duration`
+//! and can be reversed with `descending`; text columns sort case-insensitively
+//! with the same Unicode folding, `NULL` values sort last in both directions,
+//! and ties are always broken by ascending row id. That total order is what
+//! makes `limit`/`offset` paging stable across queries. `limit: Some(0)`
+//! returns no rows but still reports the full `total`.
 //!
 //! ## Scan rule
 //!
@@ -72,7 +112,16 @@
 //!   preserves both size and modification time (to the filesystem's
 //!   timestamp granularity) is not noticed until something else changes.
 //! * Tag reading does not decode audio, so `duration_ms` and `bitrate_kbps`
-//!   are only filled when tags themselves carry them.
+//!   are only filled when tags themselves carry them. Sorting by duration is
+//!   therefore mostly a stable order over `NULL`s today.
+//! * Roots may nest: removing an outer root also drops the tracks of an inner
+//!   root, while the inner root stays listed.
+//! * `text` matches substrings of the three columns only; it is a `LIKE` scan,
+//!   not a tokenised full-text index, and cannot match across columns
+//!   (`title + artist` as one haystack) or by word prefix ranking.
+//! * `scan_root`/`scan` do not record scan progress or a per-root last-scan
+//!   time; the caller drives scanning (for example from a background thread)
+//!   and gets the [`ScanReport`] back.
 
 #![forbid(unsafe_code)]
 
@@ -81,6 +130,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
@@ -89,6 +139,11 @@ use rustamp_core::meta::TrackMetadata;
 /// [`read_raw`] expects.
 const TRACK_COLUMNS: &str = "id, path, title, artist, album, album_artist, year, genre, \
      comment, track_no, track_total, disc_no, duration_ms, bitrate_kbps, mtime_ns, size";
+
+/// SQL function that lower-cases a value with Rust's Unicode rules, so the
+/// crate is case-insensitive beyond SQLite's ASCII-only `NOCASE`. Registered on
+/// every connection in [`configure`].
+const LOWER_FN: &str = "rustamp_lower";
 
 /// The stored `(mtime_ns, size)` pair used for change detection.
 type StoredStat = (Option<i64>, Option<i64>);
@@ -108,12 +163,14 @@ pub struct TrackRow {
     pub size: Option<i64>,
 }
 
-/// Filter for [`Library::query`]. All fields are optional and combined with
-/// AND. `None` means "no constraint".
+/// Filter, sort and window for [`Library::query`]. The filter fields are
+/// combined with AND; `None` means "no constraint".
 ///
 /// Text filters are exact, case-sensitive matches. `path_prefix` is a literal
 /// byte prefix, not a directory boundary: a prefix of `C:\music` also matches
-/// `C:\music2`.
+/// `C:\music2`. The remaining fields shape the result (see the module docs):
+/// [`Query::text`] searches, [`Query::sort`] and [`Query::descending`] order,
+/// [`Query::limit`] and [`Query::offset`] page.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Query {
     /// Only rows whose path starts with this prefix.
@@ -126,6 +183,54 @@ pub struct Query {
     pub title: Option<String>,
     /// Exact genre match.
     pub genre: Option<String>,
+    /// Free-text search: a literal, case-insensitive substring of `title`,
+    /// `artist` or `album`. `%`, `_` and `\` are literal, not wildcards.
+    /// Whitespace-only text is ignored.
+    pub text: Option<String>,
+    /// Sort column. Ties are broken by ascending row id.
+    pub sort: SortKey,
+    /// Reverse the sort column's order. `NULL` values still sort last.
+    pub descending: bool,
+    /// Maximum number of rows to return; `None` returns every match.
+    pub limit: Option<u32>,
+    /// Number of matches to skip before the first returned row.
+    pub offset: u32,
+}
+
+/// Sort column for [`Query::sort`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    /// Insertion order (the stable row id). The default.
+    #[default]
+    Id,
+    /// Track title, case-insensitively.
+    Title,
+    /// Track artist, case-insensitively.
+    Artist,
+    /// Album title, case-insensitively.
+    Album,
+    /// Track duration in milliseconds, shortest first.
+    Duration,
+}
+
+/// One page of [`Library::query`] results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackPage {
+    /// The requested window of matches, in sort order.
+    pub rows: Vec<TrackRow>,
+    /// Number of matches for the filter, ignoring `limit` and `offset`.
+    pub total: usize,
+}
+
+/// A registered library root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Root {
+    /// Stable root id.
+    pub id: i64,
+    /// Root path as it was added.
+    pub path: PathBuf,
+    /// Unix seconds when the root was added.
+    pub added_at: i64,
 }
 
 /// Summary returned by [`Library::scan`].
@@ -152,14 +257,17 @@ impl Library {
     /// Open (or create) a library database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path.as_ref()).map_err(map_sqlite)?;
-        let mut lib = Self { conn };
-        lib.migrate()?;
-        Ok(lib)
+        Self::from_connection(conn)
     }
 
     /// Open an in-memory library (useful for tests).
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(map_sqlite)?;
+        Self::from_connection(conn)
+    }
+
+    fn from_connection(conn: Connection) -> Result<Self> {
+        configure(&conn)?;
         let mut lib = Self { conn };
         lib.migrate()?;
         Ok(lib)
@@ -194,6 +302,11 @@ impl Library {
                     key      TEXT NOT NULL,
                     value    TEXT NOT NULL,
                     PRIMARY KEY (track_id, key)
+                );
+                CREATE TABLE IF NOT EXISTS roots (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path     TEXT NOT NULL UNIQUE,
+                    added_at INTEGER NOT NULL
                 );",
             )
             .map_err(map_sqlite)?;
@@ -277,45 +390,59 @@ impl Library {
         Ok(report)
     }
 
-    /// Query rows by filter, ordered by row id.
-    pub fn query(&self, filter: &Query) -> Result<Vec<TrackRow>> {
-        let mut sql = format!("SELECT {TRACK_COLUMNS} FROM tracks WHERE 1=1");
-        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(prefix) = &filter.path_prefix {
-            sql.push_str(" AND path LIKE ? ESCAPE '\\'");
-            binds.push(Box::new(like_prefix(&prefix.to_string_lossy())));
+    /// Scan the root registered under `root_id`. See [`Library::scan`].
+    ///
+    /// Returns [`Error::NotFound`] when no root has that id, and when the
+    /// registered directory no longer exists.
+    pub fn scan_root(&mut self, root_id: i64) -> Result<ScanReport> {
+        let root = self
+            .root_by_id(root_id)?
+            .ok_or_else(|| Error::NotFound(format!("root {root_id}")))?;
+        self.scan(&root.path)
+    }
+
+    /// Query rows by filter, sorted and paged. See the module docs for the
+    /// search, sort and paging rules.
+    pub fn query(&self, filter: &Query) -> Result<TrackPage> {
+        let (where_sql, binds) = filter_sql(filter);
+        let total: i64 = self
+            .conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM tracks{where_sql}"),
+                rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
+
+        let mut sql = format!(
+            "SELECT {TRACK_COLUMNS} FROM tracks{where_sql} ORDER BY {}",
+            order_sql(filter)
+        );
+        let limit = filter.limit.map(i64::from).unwrap_or(-1);
+        let offset = i64::from(filter.offset);
+        let mut bounds: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        if filter.limit.is_some() {
+            sql.push_str(" LIMIT ? OFFSET ?");
+            bounds.push(&limit);
+            bounds.push(&offset);
+        } else if filter.offset > 0 {
+            sql.push_str(" LIMIT -1 OFFSET ?");
+            bounds.push(&offset);
         }
-        if let Some(v) = &filter.artist {
-            sql.push_str(" AND artist = ?");
-            binds.push(Box::new(v.clone()));
-        }
-        if let Some(v) = &filter.album {
-            sql.push_str(" AND album = ?");
-            binds.push(Box::new(v.clone()));
-        }
-        if let Some(v) = &filter.title {
-            sql.push_str(" AND title = ?");
-            binds.push(Box::new(v.clone()));
-        }
-        if let Some(v) = &filter.genre {
-            sql.push_str(" AND genre = ?");
-            binds.push(Box::new(v.clone()));
-        }
-        sql.push_str(" ORDER BY id");
 
         let mut stmt = self.conn.prepare(&sql).map_err(map_sqlite)?;
         let rows = stmt
-            .query_map(
-                rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
-                read_raw,
-            )
+            .query_map(rusqlite::params_from_iter(bounds), read_raw)
             .map_err(map_sqlite)?;
 
         let mut result = Vec::new();
         for row in rows {
             result.push(row.map_err(map_sqlite)?.into_track(&self.conn)?);
         }
-        Ok(result)
+        Ok(TrackPage {
+            rows: result,
+            total: total as usize,
+        })
     }
 
     /// Total number of indexed tracks.
@@ -341,10 +468,97 @@ impl Library {
         }
     }
 
+    // ---- roots ----
+
+    /// Add `path` as a library root and return it.
+    ///
+    /// Idempotent: a path that is already a root is returned unchanged. The
+    /// path is stored exactly as given (no canonicalisation) and does not have
+    /// to exist yet, so a library can list an offline drive; scanning it while
+    /// it is missing reports [`Error::NotFound`].
+    pub fn add_root(&mut self, path: &Path) -> Result<Root> {
+        let path_str = path.to_string_lossy().to_string();
+        if let Some(existing) = self.root_by_path(&path_str)? {
+            return Ok(existing);
+        }
+        let added_at = now_unix();
+        self.conn
+            .execute(
+                "INSERT INTO roots (path, added_at) VALUES (?1, ?2)",
+                params![path_str, added_at],
+            )
+            .map_err(map_sqlite)?;
+        Ok(Root {
+            id: self.conn.last_insert_rowid(),
+            path: path.to_path_buf(),
+            added_at,
+        })
+    }
+
+    /// Forget the root `path` and delete every indexed track under it.
+    ///
+    /// Returns the number of deleted tracks, which may be zero for a root that
+    /// was never scanned. Tracks under other roots are untouched. Returns
+    /// [`Error::NotFound`] when `path` is not a registered root.
+    pub fn remove_root(&mut self, path: &Path) -> Result<usize> {
+        let path_str = path.to_string_lossy().to_string();
+        if self.root_by_path(&path_str)?.is_none() {
+            return Err(Error::NotFound(path.display().to_string()));
+        }
+        let stored = self.rows_under(path)?;
+        let tx = self.conn.transaction().map_err(map_sqlite)?;
+        for track_path in stored.keys() {
+            delete_path(&tx, track_path)?;
+        }
+        tx.execute("DELETE FROM roots WHERE path = ?1", params![path_str])
+            .map_err(map_sqlite)?;
+        tx.commit().map_err(map_sqlite)?;
+        Ok(stored.len())
+    }
+
+    /// The registered roots, oldest first.
+    pub fn roots(&self) -> Result<Vec<Root>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path, added_at FROM roots ORDER BY id")
+            .map_err(map_sqlite)?;
+        let rows = stmt.query_map([], read_root).map_err(map_sqlite)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(map_sqlite)?);
+        }
+        Ok(result)
+    }
+
+    /// Look up a root by its stored path string.
+    fn root_by_path(&self, path: &str) -> Result<Option<Root>> {
+        self.conn
+            .query_row(
+                "SELECT id, path, added_at FROM roots WHERE path = ?1",
+                params![path],
+                read_root,
+            )
+            .optional()
+            .map_err(map_sqlite)
+    }
+
+    /// Look up a root by id.
+    fn root_by_id(&self, id: i64) -> Result<Option<Root>> {
+        self.conn
+            .query_row(
+                "SELECT id, path, added_at FROM roots WHERE id = ?1",
+                params![id],
+                read_root,
+            )
+            .optional()
+            .map_err(map_sqlite)
+    }
+
     // ---- internals ----
 
     /// All stored paths under `root`, with the stat fields used for change
-    /// detection.
+    /// detection. This is also the row set [`Library::remove_root`] deletes,
+    /// so both operations agree on what "under this root" means.
     fn rows_under(&self, root: &Path) -> Result<HashMap<PathBuf, StoredStat>> {
         let pattern = like_prefix(&root.to_string_lossy());
         let mut stmt = self
@@ -375,7 +589,93 @@ impl Library {
     }
 }
 
-/// Insert or update the row for `path` and replace its extra map.
+/// Configure a fresh connection: foreign keys on, so deleting a track also
+/// drops its `track_extra` rows, plus the Unicode lower-casing SQL function.
+fn configure(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(map_sqlite)?;
+    conn.create_scalar_function(
+        LOWER_FN,
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let value: Option<String> = ctx.get(0)?;
+            Ok(value.map(|v| v.to_lowercase()))
+        },
+    )
+    .map_err(map_sqlite)?;
+    Ok(())
+}
+
+/// The `WHERE` clause for `filter` and its bound values, in bind order.
+fn filter_sql(filter: &Query) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut sql = String::from(" WHERE 1=1");
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(prefix) = &filter.path_prefix {
+        sql.push_str(" AND path LIKE ? ESCAPE '\\'");
+        binds.push(Box::new(like_prefix(&prefix.to_string_lossy())));
+    }
+    if let Some(v) = &filter.artist {
+        sql.push_str(" AND artist = ?");
+        binds.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.album {
+        sql.push_str(" AND album = ?");
+        binds.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.title {
+        sql.push_str(" AND title = ?");
+        binds.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.genre {
+        sql.push_str(" AND genre = ?");
+        binds.push(Box::new(v.clone()));
+    }
+    if let Some(text) = &filter.text {
+        let term = text.trim();
+        if !term.is_empty() {
+            let pattern = like_contains(term);
+            sql.push_str(&format!(
+                " AND ({LOWER_FN}(title) LIKE {LOWER_FN}(?) ESCAPE '\\' \
+                 OR {LOWER_FN}(artist) LIKE {LOWER_FN}(?) ESCAPE '\\' \
+                 OR {LOWER_FN}(album) LIKE {LOWER_FN}(?) ESCAPE '\\')"
+            ));
+            for _ in 0..3 {
+                binds.push(Box::new(pattern.clone()));
+            }
+        }
+    }
+    (sql, binds)
+}
+
+/// The `ORDER BY` clause for `filter`: the requested column, then the row id as
+/// a tie-break, so paging is stable. `NULL` values sort last in both
+/// directions.
+fn order_sql(filter: &Query) -> String {
+    let dir = if filter.descending { "DESC" } else { "ASC" };
+    match filter.sort {
+        SortKey::Id => format!("id {dir}"),
+        SortKey::Title => text_order("title", dir),
+        SortKey::Artist => text_order("artist", dir),
+        SortKey::Album => text_order("album", dir),
+        SortKey::Duration => format!("(duration_ms IS NULL), duration_ms {dir}, id ASC"),
+    }
+}
+
+/// Order by a text column, case-folded with [`LOWER_FN`].
+fn text_order(column: &str, dir: &str) -> String {
+    format!("({column} IS NULL), {LOWER_FN}({column}) {dir}, id ASC")
+}
+
+/// Read one `roots` row.
+fn read_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<Root> {
+    Ok(Root {
+        id: row.get(0)?,
+        path: PathBuf::from(row.get::<_, String>(1)?),
+        added_at: row.get(2)?,
+    })
+}
+
 fn upsert_row(
     conn: &Connection,
     path: &Path,
@@ -594,14 +894,25 @@ fn walk_dir(root: &Path, out: &mut Vec<PathBuf>, complete: &mut bool) {
 /// Escape `%`, `_` and `\` in `prefix` and append the `%` that makes the
 /// pattern a prefix match for `LIKE ... ESCAPE '\'`.
 fn like_prefix(prefix: &str) -> String {
-    let mut escaped = String::with_capacity(prefix.len() + 1);
-    for ch in prefix.chars() {
+    let mut escaped = escape_like(prefix);
+    escaped.push('%');
+    escaped
+}
+
+/// `%escaped%`: a literal substring match for `LIKE ... ESCAPE '\'`.
+fn like_contains(text: &str) -> String {
+    format!("%{}%", escape_like(text))
+}
+
+/// Escape the `LIKE` metacharacters in `text`, keeping it literal.
+fn escape_like(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
         if matches!(ch, '%' | '_' | '\\') {
             escaped.push('\\');
         }
         escaped.push(ch);
     }
-    escaped.push('%');
     escaped
 }
 
@@ -665,9 +976,28 @@ mod tests {
     }
 
     fn only_row(lib: &Library) -> TrackRow {
-        let mut rows = lib.query(&Query::default()).unwrap();
+        let mut rows = lib.query(&Query::default()).unwrap().rows;
         assert_eq!(rows.len(), 1);
         rows.remove(0)
+    }
+
+    /// Rows for `filter` with the default sort and no paging.
+    fn matches(lib: &Library, filter: &Query) -> Vec<TrackRow> {
+        let page = lib.query(filter).unwrap();
+        assert_eq!(
+            page.total,
+            page.rows.len(),
+            "unpaged query: total is the row count"
+        );
+        page.rows
+    }
+
+    /// Titles of `filter`'s rows, `None` where a title is absent.
+    fn titles(lib: &Library, filter: &Query) -> Vec<Option<String>> {
+        matches(lib, filter)
+            .into_iter()
+            .map(|row| row.metadata.title)
+            .collect()
     }
 
     #[test]
@@ -690,22 +1020,24 @@ mod tests {
         assert_eq!(lib.count().unwrap(), 2);
 
         // Query by artist.
-        let rows = lib
-            .query(&Query {
+        let rows = matches(
+            &lib,
+            &Query {
                 artist: Some("Artist X".to_owned()),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].metadata.title.as_deref(), Some("Song A"));
 
         // Query by path prefix.
-        let rows = lib
-            .query(&Query {
+        let rows = matches(
+            &lib,
+            &Query {
                 path_prefix: Some(root.to_path_buf()),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        );
         assert_eq!(rows.len(), 2);
     }
 
@@ -787,12 +1119,13 @@ mod tests {
 
         let mut lib = Library::in_memory().unwrap();
         lib.scan(root).unwrap();
-        let rows = lib
-            .query(&Query {
+        let rows = matches(
+            &lib,
+            &Query {
                 album: Some("Album Z".to_owned()),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        );
         assert_eq!(rows.len(), 1);
     }
 
@@ -813,24 +1146,26 @@ mod tests {
         let mut lib = Library::in_memory().unwrap();
         lib.scan(root).unwrap();
 
-        let rows = lib
-            .query(&Query {
+        let rows = matches(
+            &lib,
+            &Query {
                 artist: Some("X".to_owned()),
                 album: Some("Album 1".to_owned()),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].metadata.title.as_deref(), Some("One"));
 
         // A filter that matches nothing yields no rows.
-        let rows = lib
-            .query(&Query {
+        let rows = matches(
+            &lib,
+            &Query {
                 artist: Some("X".to_owned()),
                 genre: Some("Jazz".to_owned()),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        );
         assert!(rows.is_empty());
     }
 
@@ -967,12 +1302,13 @@ mod tests {
         let rep = lib.scan(&root_b).unwrap();
         assert_eq!(rep.removed, 1);
         assert_eq!(lib.count().unwrap(), 1);
-        let rows = lib
-            .query(&Query {
+        let rows = matches(
+            &lib,
+            &Query {
                 path_prefix: Some(root_a.clone()),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].metadata.title.as_deref(), Some("A"));
     }
@@ -992,12 +1328,13 @@ mod tests {
         // Idempotent: a broken escape would see a changed pattern and re-add.
         assert_eq!(lib.scan(&root).unwrap().updated, 0);
 
-        let rows = lib
-            .query(&Query {
+        let rows = matches(
+            &lib,
+            &Query {
                 path_prefix: Some(root.clone()),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        );
         assert_eq!(rows.len(), 1);
 
         fs::remove_file(&a).unwrap();
@@ -1012,5 +1349,406 @@ mod tests {
         let mut lib = Library::in_memory().unwrap();
         assert!(matches!(lib.scan(&missing), Err(Error::NotFound(_))));
         assert_eq!(lib.count().unwrap(), 0);
+    }
+
+    /// Index one WAV per `(file name, title, artist, album)` entry. The
+    /// `TempDir` is returned so the caller keeps the files alive.
+    fn library_with(entries: &[(&str, &str, &str, &str)]) -> (TempDir, Library) {
+        let dir = TempDir::new().unwrap();
+        for (name, title, artist, album) in entries {
+            let path = dir.path().join(name);
+            make_wav(&path);
+            write_tags(&path, title, artist, album);
+        }
+        let mut lib = Library::in_memory().unwrap();
+        lib.scan(dir.path()).unwrap();
+        (dir, lib)
+    }
+
+    #[test]
+    fn roots_are_added_listed_and_idempotent() {
+        let mut lib = Library::in_memory().unwrap();
+        assert!(lib.roots().unwrap().is_empty());
+
+        let first = lib.add_root(Path::new("C:/music")).unwrap();
+        let second = lib.add_root(Path::new("D:/more")).unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.path, PathBuf::from("C:/music"));
+
+        // Adding the same spelling again returns the existing row.
+        let again = lib.add_root(Path::new("C:/music")).unwrap();
+        assert_eq!(again, first);
+
+        let roots = lib.roots().unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], first);
+        assert_eq!(roots[1], second);
+    }
+
+    #[test]
+    fn scan_root_scans_the_registered_directory() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_tags(&a, "A", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        let rep = lib.scan_root(entry.id).unwrap();
+        assert_eq!(rep.added, 1);
+        assert_eq!(lib.count().unwrap(), 1);
+
+        // An unknown root id is an error, not an empty report.
+        assert!(matches!(
+            lib.scan_root(entry.id + 1),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn removing_a_root_drops_its_tracks_and_extras() {
+        let dir = TempDir::new().unwrap();
+        let root_a = dir.path().join("a");
+        let root_b = dir.path().join("b");
+        fs::create_dir(&root_a).unwrap();
+        fs::create_dir(&root_b).unwrap();
+        for (root, title) in [(&root_a, "A"), (&root_b, "B")] {
+            let path = root.join("track.wav");
+            make_wav(&path);
+            let mut md = TrackMetadata {
+                title: Some(title.to_owned()),
+                ..Default::default()
+            };
+            // A key the WAV writer round-trips (see `extras_round_trip`).
+            md.extra
+                .insert("REPLAYGAIN_TRACK_GAIN".to_owned(), "1.50 dB".to_owned());
+            rustamp_meta::write_tags(&path, &md).unwrap();
+        }
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry_a = lib.add_root(&root_a).unwrap();
+        let entry_b = lib.add_root(&root_b).unwrap();
+        lib.scan_root(entry_a.id).unwrap();
+        lib.scan_root(entry_b.id).unwrap();
+        assert_eq!(lib.count().unwrap(), 2);
+        assert_eq!(extra_rows(&lib), 2);
+
+        assert_eq!(lib.remove_root(&root_a).unwrap(), 1, "one track dropped");
+        assert_eq!(lib.roots().unwrap(), vec![entry_b.clone()]);
+        assert_eq!(lib.count().unwrap(), 1);
+        let rows = matches(&lib, &Query::default());
+        assert_eq!(rows[0].metadata.title.as_deref(), Some("B"));
+        assert_eq!(extra_rows(&lib), 1, "the extra rows cascade with the track");
+
+        // A root that is listed and scanned drops its track as well.
+        assert_eq!(lib.remove_root(&root_b).unwrap(), 1);
+        assert_eq!(extra_rows(&lib), 0);
+        assert!(lib.roots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_listed_but_unscanned_root_drops_nothing() {
+        let mut lib = Library::in_memory().unwrap();
+        lib.add_root(Path::new("C:/empty")).unwrap();
+        assert_eq!(lib.remove_root(Path::new("C:/empty")).unwrap(), 0);
+        assert!(lib.roots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_an_unlisted_root_is_an_error() {
+        let mut lib = Library::in_memory().unwrap();
+        assert!(matches!(
+            lib.remove_root(Path::new("C:/never-added")),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// Number of `track_extra` rows, to check the delete cascade.
+    fn extra_rows(lib: &Library) -> i64 {
+        lib.conn
+            .query_row("SELECT COUNT(*) FROM track_extra", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn freetext_searches_title_artist_and_album_case_insensitively() {
+        let (_dir, lib) = library_with(&[
+            ("a.wav", "Sonne", "Rammstein", "Mutter"),
+            ("b.wav", "Mein Herz Brennt", "Rammstein", "Mutter"),
+            ("c.wav", "Wunder", "Ärzte", "Jazz ist anders"),
+            ("d.wav", "Jazz Club", "Someone", "Other"),
+        ]);
+
+        // Title, lowercase query against a capitalised title.
+        assert_eq!(
+            titles(&lib, &text_query("sonne")),
+            vec![Some("Sonne".to_owned())]
+        );
+        // Artist, twice.
+        assert_eq!(titles(&lib, &text_query("ramm")).len(), 2, "both Rammstein");
+        // Album.
+        assert_eq!(titles(&lib, &text_query("mutter")).len(), 2);
+        // A term in either of two columns.
+        assert_eq!(titles(&lib, &text_query("jazz")).len(), 2);
+        // Unicode case folding: `Ärzte` matches `ärzte` and `ÄRZTE`.
+        assert_eq!(
+            titles(&lib, &text_query("ärzte")),
+            vec![Some("Wunder".to_owned())]
+        );
+        assert_eq!(titles(&lib, &text_query("ÄRZTE")).len(), 1);
+        // Whitespace-only text is no filter at all.
+        assert_eq!(titles(&lib, &text_query("   ")).len(), 4);
+        // No match: empty rows and a zero total.
+        let page = lib.query(&text_query("nothing here")).unwrap();
+        assert!(page.rows.is_empty());
+        assert_eq!(page.total, 0);
+
+        // Free text and a field filter combine with AND.
+        let filter = Query {
+            artist: Some("Rammstein".to_owned()),
+            ..text_query("mutter")
+        };
+        assert_eq!(titles(&lib, &filter).len(), 2);
+        let filter = Query {
+            artist: Some("Someone".to_owned()),
+            ..text_query("mutter")
+        };
+        assert!(titles(&lib, &filter).is_empty());
+    }
+
+    #[test]
+    fn freetext_treats_like_wildcards_literally() {
+        let (_dir, lib) = library_with(&[
+            ("a.wav", "100% Hits", "X", "Al"),
+            ("b.wav", "100 Hits", "X", "Al"),
+            ("c.wav", "a_b", "Y", "Al"),
+            ("d.wav", "axb", "Y", "Al"),
+        ]);
+
+        assert_eq!(
+            titles(&lib, &text_query("100%")),
+            vec![Some("100% Hits".to_owned())]
+        );
+        assert_eq!(
+            titles(&lib, &text_query("a_b")),
+            vec![Some("a_b".to_owned())]
+        );
+        // A lone `%` searches for a literal `%` instead of matching anything.
+        assert_eq!(
+            titles(&lib, &text_query("%")),
+            vec![Some("100% Hits".to_owned())]
+        );
+    }
+
+    #[test]
+    fn sort_orders_by_column_case_insensitively_with_nulls_last() {
+        let (dir, lib) = library_with(&[
+            ("a.wav", "banana", "zoe", "Zebra"),
+            ("b.wav", "Apple", "Ada", "apple"),
+            ("c.wav", "cherry", "mike", "Mango"),
+        ]);
+
+        let by_title = Query {
+            sort: SortKey::Title,
+            ..Default::default()
+        };
+        assert_eq!(
+            titles(&lib, &by_title),
+            vec![
+                Some("Apple".to_owned()),
+                Some("banana".to_owned()),
+                Some("cherry".to_owned())
+            ]
+        );
+
+        let artists = |query: &Query| -> Vec<Option<String>> {
+            matches(&lib, query)
+                .into_iter()
+                .map(|row| row.metadata.artist)
+                .collect()
+        };
+        let by_artist = Query {
+            sort: SortKey::Artist,
+            ..Default::default()
+        };
+        assert_eq!(
+            artists(&by_artist),
+            vec![
+                Some("Ada".to_owned()),
+                Some("mike".to_owned()),
+                Some("zoe".to_owned())
+            ]
+        );
+
+        let albums = |query: &Query| -> Vec<Option<String>> {
+            matches(&lib, query)
+                .into_iter()
+                .map(|row| row.metadata.album)
+                .collect()
+        };
+        let by_album = Query {
+            sort: SortKey::Album,
+            ..Default::default()
+        };
+        assert_eq!(
+            albums(&by_album),
+            vec![
+                Some("apple".to_owned()),
+                Some("Mango".to_owned()),
+                Some("Zebra".to_owned())
+            ]
+        );
+
+        // Durations come out of tags, so set them directly: `a` has none, `b`
+        // is the shortest. `NULL` sorts last even though it is the first row
+        // by insert order.
+        set_duration(&lib, &dir.path().join("b.wav"), 1000);
+        set_duration(&lib, &dir.path().join("c.wav"), 5000);
+        let by_duration = Query {
+            sort: SortKey::Duration,
+            ..Default::default()
+        };
+        let ids: Vec<i64> = matches(&lib, &by_duration)
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let full = matches(&lib, &by_title);
+        let id_of = |title: &str| -> i64 {
+            full.iter()
+                .find(|row| row.metadata.title.as_deref() == Some(title))
+                .unwrap()
+                .id
+        };
+        assert_eq!(ids, vec![id_of("Apple"), id_of("cherry"), id_of("banana")]);
+
+        // Descending reverses the durations but keeps the `NULL` last.
+        let by_duration_desc = Query {
+            descending: true,
+            ..by_duration.clone()
+        };
+        let ids: Vec<i64> = matches(&lib, &by_duration_desc)
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec![id_of("cherry"), id_of("Apple"), id_of("banana")]);
+    }
+
+    #[test]
+    fn sort_descending_reverses_order_with_stable_ties() {
+        let (_dir, lib) = library_with(&[
+            ("a.wav", "one", "X", "Al"),
+            ("b.wav", "two", "X", "Al"),
+            ("c.wav", "three", "Y", "Al"),
+        ]);
+
+        // Insert order, for the row ids.
+        let ascending = matches(&lib, &Query::default());
+        assert_eq!(ascending.len(), 3);
+        let (id_a, id_b, id_c) = (ascending[0].id, ascending[1].id, ascending[2].id);
+        assert_eq!(ascending[0].metadata.title.as_deref(), Some("one"));
+
+        let by_artist_desc = Query {
+            sort: SortKey::Artist,
+            descending: true,
+            ..Default::default()
+        };
+        let ids: Vec<i64> = matches(&lib, &by_artist_desc)
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![id_c, id_a, id_b],
+            "Y first, X ties by ascending id"
+        );
+
+        let by_title_desc = Query {
+            sort: SortKey::Title,
+            descending: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            titles(&lib, &by_title_desc),
+            vec![
+                Some("two".to_owned()),
+                Some("three".to_owned()),
+                Some("one".to_owned())
+            ],
+            "descending undoes the ascending title order"
+        );
+    }
+
+    #[test]
+    fn pagination_reports_the_unpaged_total() {
+        let (_dir, lib) = library_with(&[
+            ("a.wav", "T1", "X", "Al"),
+            ("b.wav", "T2", "X", "Al"),
+            ("c.wav", "T3", "X", "Al"),
+            ("d.wav", "T4", "X", "Al"),
+            ("e.wav", "T5", "X", "Al"),
+        ]);
+        let sorted = |limit: Option<u32>, offset: u32| -> Query {
+            Query {
+                sort: SortKey::Title,
+                limit,
+                offset,
+                ..Default::default()
+            }
+        };
+
+        for (limit, offset, expected) in [
+            (Some(2), 0, vec!["T1", "T2"]),
+            (Some(2), 2, vec!["T3", "T4"]),
+            (Some(2), 4, vec!["T5"]),
+            (Some(2), 5, vec![]),
+            (None, 3, vec!["T4", "T5"]),
+            (None, 5, vec![]),
+            (Some(0), 0, vec![]),
+            (Some(10), 0, vec!["T1", "T2", "T3", "T4", "T5"]),
+        ] {
+            let page = lib.query(&sorted(limit, offset)).unwrap();
+            assert_eq!(
+                page.rows
+                    .iter()
+                    .map(|row| row.metadata.title.clone().unwrap())
+                    .collect::<Vec<_>>(),
+                expected,
+                "limit {limit:?} offset {offset}"
+            );
+            assert_eq!(page.total, 5, "limit {limit:?} offset {offset}");
+        }
+
+        // The total follows the filter, not the window.
+        let filter = Query {
+            text: Some("T3".to_owned()),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let page = lib.query(&filter).unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.total, 1);
+    }
+
+    /// A [`Query`] with only the free-text term set.
+    fn text_query(text: &str) -> Query {
+        Query {
+            text: Some(text.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// `TrackMetadata` cannot carry `duration_ms` into a WAV, so set it
+    /// straight in the index for the duration sort test.
+    fn set_duration(lib: &Library, path: &Path, duration_ms: i64) {
+        let changed = lib
+            .conn
+            .execute(
+                "UPDATE tracks SET duration_ms = ?1 WHERE path = ?2",
+                rusqlite::params![duration_ms, path.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
     }
 }
