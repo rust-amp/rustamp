@@ -129,6 +129,25 @@
 //! `try_recv` (see [`crate::supervise`]). Either way reading and pinging stay
 //! on the app thread or the reader thread: never on the audio path.
 //!
+//! # Commands to the host (RFC 0005 §5.4)
+//!
+//! The control channel carries both directions. The state direction is the
+//! [`Message::PlayerStateUpdate`] postcard above; the command direction is
+//! [`Message::CommandToHost`], which asks the host to do something only it
+//! can do. The one command the app sends that way today is
+//! [`Command::ConfigureVisPlugin`]: the visualization plug-in runs inside
+//! `rustamp-plughost32.exe`, and only the host's UI thread may call into a
+//! plug-in (S09 §3.5), so the app asks the host to open the plug-in's
+//! configuration dialog instead of opening it itself. The request travels
+//! over the **same** channel as the snapshots — no new transport, no new
+//! message, no protocol change.
+//!
+//! Like publishing, sending a command never blocks the player: with no
+//! transport attached nothing goes out ([`CommandOutcome::Detached`]), and a
+//! failed send detaches the link and reports [`CommandOutcome::HostGone`].
+//! The app turns the outcome into a note, so a request is never dropped
+//! silently.
+//!
 //! # Findings (decisions the specs and RFCs do not make)
 //!
 //! * **F2 — a foreign greeting is rejected (decided).**
@@ -158,6 +177,7 @@
 
 use std::time::{Duration, Instant};
 
+use rustamp_core::command::Command;
 use rustamp_core::state::PlayerState;
 use rustamp_ipc::{IpcError, Message, PROTOCOL_VERSION, Transport};
 
@@ -253,6 +273,22 @@ pub enum PublishOutcome {
     /// The send failed (stalled or dead host). The link detached itself, so
     /// the next attempt reports [`PublishOutcome::Detached`]; the player was
     /// not blocked and saw no error.
+    HostGone,
+}
+
+/// What one [`HostStateLink::send_command`] attempt did.
+///
+/// Like [`PublishOutcome`], none of these is an error the player must
+/// handle: the app reports the outcome to the user instead of failing, so a
+/// request is never dropped silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// The command went out on the transport.
+    Sent,
+    /// No transport is attached; nothing went out and nothing was touched.
+    Detached,
+    /// The send failed (stalled or dead host). The link detached itself, so
+    /// the next attempt reports [`CommandOutcome::Detached`].
     HostGone,
 }
 
@@ -525,6 +561,36 @@ impl HostStateLink {
                 self.transport = None;
                 self.last_sent = None;
                 PublishOutcome::HostGone
+            }
+        }
+    }
+
+    /// Send one command to the host (RFC 0005 §5.4, the player -> host
+    /// direction).
+    ///
+    /// The visualization plug-in runs in the host process, and only the
+    /// host's UI thread may call into a plug-in (S09 §3.5), so the app asks
+    /// the host to open the plug-in's configuration dialog instead of opening
+    /// it itself: [`Message::CommandToHost`] carries the request over the
+    /// same control channel as the state snapshots.
+    ///
+    /// Never blocks the player: with no host attached nothing goes out
+    /// ([`CommandOutcome::Detached`]), and a failed send detaches the link
+    /// and reports [`CommandOutcome::HostGone`] instead of propagating an
+    /// error. The caller turns the outcome into a note, so a request is
+    /// never dropped silently.
+    pub fn send_command(&mut self, command: Command) -> CommandOutcome {
+        if self.transport.is_none() {
+            return CommandOutcome::Detached;
+        }
+        match self.send(&Message::CommandToHost(command)) {
+            Ok(()) => CommandOutcome::Sent,
+            Err(_) => {
+                // Same rule as a failed publish: the channel cannot be
+                // trusted any more, so the link detaches and the supervisor
+                // replaces the host.
+                self.detach();
+                CommandOutcome::HostGone
             }
         }
     }
@@ -916,5 +982,57 @@ mod tests {
         assert_eq!(link.poll_at(Instant::now()), PollOutcome::HostGone);
         assert!(!link.is_attached());
         assert_eq!(link.poll_at(Instant::now()), PollOutcome::Detached);
+    }
+
+    #[test]
+    fn a_command_reaches_the_host_over_the_same_channel() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+
+        assert_eq!(
+            link.send_command(Command::ConfigureVisPlugin),
+            CommandOutcome::Sent
+        );
+        // The peer decodes the real codec bytes into the same message.
+        assert_eq!(
+            host_end.recv().expect("one framed message"),
+            Message::CommandToHost(Command::ConfigureVisPlugin)
+        );
+        // Nothing else went out: one request, one frame.
+        assert!(host_end.try_recv().expect("codec reads").is_none());
+    }
+
+    #[test]
+    fn a_detached_link_refuses_the_command_instead_of_dropping_it() {
+        let mut link = HostStateLink::detached();
+        assert_eq!(
+            link.send_command(Command::ConfigureVisPlugin),
+            CommandOutcome::Detached
+        );
+        assert!(!link.is_attached());
+    }
+
+    #[test]
+    fn a_dead_host_detaches_on_a_failed_command() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, host_end) = MemoryTransport::pair();
+        drop(host_end);
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        // The failed send is absorbed: the link detaches and says so.
+        assert_eq!(
+            link.send_command(Command::ConfigureVisPlugin),
+            CommandOutcome::HostGone
+        );
+        assert!(!link.is_attached());
+        // From here on it is the ordinary no-host path.
+        assert_eq!(
+            link.send_command(Command::ConfigureVisPlugin),
+            CommandOutcome::Detached
+        );
     }
 }
