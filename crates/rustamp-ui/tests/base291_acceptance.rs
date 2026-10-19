@@ -966,7 +966,7 @@ fn base291_vm_presented_pixels_match_reference_captures() {
 
 #[test]
 fn base291_slider_frames_blank_readouts_and_visualization_palette() {
-    use rustamp_ui::visualization::{VisInput, VisMode, VisState};
+    use rustamp_ui::visualization::{VisInput, VisMode, VisState, slots};
     let skin = skin();
     let layout = MainWindowLayout::CLASSIC;
     for (value, volume_frame, balance_frame) in [(0, 0, 27), (50, 13, 0), (100, 27, 27)] {
@@ -1032,17 +1032,23 @@ fn base291_slider_frames_blank_readouts_and_visualization_palette() {
         let area = layout.visualization;
         match mode {
             VisMode::Spectrum => {
+                // S17 §6: slot 2 at the top of a bar, slot 17 at the bottom.
                 for row in 0..16 {
                     assert_eq!(
                         frame.pixel(area.x, area.y + 15 - row),
-                        Some(rgba(2 + row as usize))
+                        Some(rgba(slots::SPECTRUM_BOTTOM - row as usize))
                     );
                 }
             }
             VisMode::Scope | VisMode::ScopeDots => {
-                assert_eq!(frame.pixel(area.x, area.y + 8), Some(rgba(18)))
+                // The scope sits on the centre line, which wears the
+                // brightest of the five oscilloscope colours.
+                assert_eq!(
+                    frame.pixel(area.x, area.y + 8),
+                    Some(rgba(slots::OSCILLOSCOPE_FIRST))
+                )
             }
-            VisMode::Off => assert_eq!(frame.pixel(area.x, area.y), Some(rgba(0))),
+            VisMode::Off => assert_eq!(frame.pixel(area.x, area.y), Some(rgba(slots::BACKGROUND))),
         }
     }
 }
