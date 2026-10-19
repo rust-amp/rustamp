@@ -22,6 +22,14 @@ Read these first, in this order:
   2026-10-19): a merged lane leaves no worktree behind, so the tree list stays a
   picture of what is actually running.
 
+- **A lane must leave the workspace compiling** (owner rule, 2026-10-19).
+  If a lane changes a shared type — adds a field, a variant, a trait method —
+  it must update **every consumer** in the same change, or the lane is not done.
+  A lane that reports "this breaks `main` because another crate must change" and
+  stops has not finished; the orchestrator grants it the minimal extra scope to
+  make the workspace build. The done criterion is `cargo clippy --workspace` and
+  `cargo test --workspace` green, not the lane's own crate.
+
 - **Garbage output → restart the task on a stronger model** (owner rule, 2026-10-19).
   When a lane reports success but the diff is speculative — invented APIs, alias
   functions/types that all do the same thing, dead code nothing calls — the work
