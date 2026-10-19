@@ -69,6 +69,21 @@ after every merge), not by trusting the lane's report.
 | `wave186` | artwork covers borrowed into the library renderer |
 | `wave187` | `frame_size` error parity in the single offer check, mutation-proven |
 | `wave188` | `viscolor.txt` slot mapping per S17: the gradient orientation was inverted, all five scope slots now used |
+| `wave189` | `in_` plugin host driver (play/pause/unpause/stop, clock) + acceptance fixture |
+| `wave190` | a truncated stream is a loud decode failure, not EOS (RIFF/WAVE oracle; limits named for the rest) |
+| `wave191` | the app sends `ConfigureVisPlugin` over the control channel; a missing host is reported |
+| `wave192` | input→output handoff: `out_module` + volume/pan before `play`, `0x402` end-of-track |
+| `wave193` | RFC 0020 draft: a generic "configure plugin N" wire message (not accepted) |
+| `wave194` | EQ windowshade: shade-aware input (the unshaded layout used to answer), toggle, persistence |
+| `wave195` | real `in_`/`out_` handoff acceptance fixture: the trace proves both sides |
+| `wave196` | kill-the-host acceptance: whole frames then a sticky loud error, never a torn frame or silent EOS |
+| `wave197` | title-bar double-click toggles windowshade on all three windows |
+| `wave198` | `vis_` render loop: zeroed rows without a frame, module-paced, start/stop ordering |
+| `wave199` | album ReplayGain grouping over pooled histograms |
+| `wave202` | registry start/stop/step for the vis loop; `PluginRegistry` proven not `Send` |
+
+In flight at the time of writing: `wave200` (DSP-path kill test), `wave201`
+(S03 §2 playlist shortcut table), `wave203` (sidecar cover art).
 
 ## Rules added to `AGENTS.md` during the session
 
