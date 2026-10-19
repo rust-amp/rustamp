@@ -27,7 +27,9 @@
 //!   fails the same way.
 //! * The stream's error callback latches a failure flag; `close` reports it
 //!   naming the device and [`CpalOutput::has_failed`] exposes it earlier. The
-//!   engine observes the same flag through [`OutputDevice::stream_error`].
+//!   engine observes the same flag through [`OutputDevice::stream_error`],
+//!   which reports the recovery the latched fault allows (see
+//!   [`crate::recovery`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -36,6 +38,8 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rustamp_core::audio::{AudioSpec, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::error::{Error, Result};
+
+use crate::recovery::{self, DeviceFault, OutputSelection};
 
 /// Callback size assumed for the reported latency when the backend does not
 /// tell us (cpal exposes no buffer size).
@@ -112,6 +116,19 @@ impl CpalOutput {
     /// Delegates to the [`OutputDevice::stream_error`] trait method.
     pub fn stream_error(&self) -> Option<Error> {
         <Self as OutputDevice>::stream_error(self)
+    }
+
+    /// How the stream was selected: the system default device, or the device
+    /// the caller named.
+    ///
+    /// The selection decides where a recovery can land, so it is part of the
+    /// decision the latched fault is reported with
+    /// ([`crate::recovery::decide`]).
+    fn selection(&self) -> OutputSelection {
+        match self.wanted {
+            Some(_) => OutputSelection::Pinned,
+            None => OutputSelection::Default,
+        }
     }
 }
 
@@ -399,9 +416,20 @@ impl OutputDevice for CpalOutput {
 
     fn stream_error(&self) -> Option<Error> {
         if self.shared.failed.load(Ordering::Acquire) {
-            Some(Error::Output(format!(
-                "{}: audio stream encountered a fatal error or disconnected",
-                self.device_name
+            // cpal reports the failure of the *stream*, not of a device call,
+            // and the error callback carries no error code, so the fault is the
+            // generic one: the device is gone or stopped answering. RFC 0012
+            // Q4 decides that every error of the callback is fatal for now;
+            // telling a device loss from a severe underrun needs the error
+            // code that cpal does not hand out.
+            //
+            // The recovery is the same either way: the next explicit start
+            // reopens the stream, and a stream that follows the system default
+            // reopens on the device that is the default now.
+            Some(Error::Output(recovery::message(
+                DeviceFault::Lost,
+                self.selection(),
+                &self.device_name,
             )))
         } else {
             None
@@ -499,7 +527,24 @@ mod tests {
         let err = OutputDevice::stream_error(&out).expect("stream error");
         let msg = err.to_string();
         assert!(msg.contains("cpal"), "{msg}");
-        assert!(msg.contains("fatal error or disconnected"), "{msg}");
+        assert!(msg.contains("disappeared or stopped responding"), "{msg}");
+        assert!(
+            msg.contains("press Play to continue on the current default device"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_cpal_device_cannot_continue_on_the_default() {
+        let out = CpalOutput::with_device_name("CABLE Output");
+        out.shared.failed.store(true, Ordering::Release);
+        let err = OutputDevice::stream_error(&out).expect("stream error");
+        let msg = err.to_string();
+        assert!(msg.contains("choose another device"), "{msg}");
+        assert!(
+            !msg.contains("current default device"),
+            "a pinned device never continues on the default: {msg}"
+        );
     }
 
     #[test]
