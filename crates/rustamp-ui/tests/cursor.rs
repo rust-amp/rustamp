@@ -80,12 +80,21 @@ fn the_equalizer_mapping_follows_the_hit_test() {
     ];
     for (x, y, slot) in cases {
         assert_eq!(
-            equalizer_cursor(eq_hit_test(&layout, x, y)),
+            equalizer_cursor(eq_hit_test(&layout, x, y, false)),
             slot,
             "at ({x},{y})"
         );
     }
     assert_eq!(equalizer_cursor(None), CursorSlot::EqNormal);
+    // The shaded equalizer is its title band alone (S05 §1.2).
+    assert_eq!(
+        equalizer_cursor(eq_hit_test(&layout, 100, 5, true)),
+        CursorSlot::EqTitle
+    );
+    assert_eq!(
+        equalizer_cursor(eq_hit_test(&layout, 79, 60, true)),
+        CursorSlot::EqNormal
+    );
 }
 
 /// The playlist window: the title band, its two buttons, the scrollbar and

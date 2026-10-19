@@ -142,23 +142,32 @@ mod tests {
         let layout = EqualizerLayout::CLASSIC;
         // A band slider (x = 79 + 18k) and the title bar.
         assert_eq!(
-            equalizer_cursor(eq_hit_test(&layout, 79, 60)),
+            equalizer_cursor(eq_hit_test(&layout, 79, 60, false)),
             CursorSlot::EqSlid
         );
         assert_eq!(
-            equalizer_cursor(eq_hit_test(&layout, 22, 60)),
+            equalizer_cursor(eq_hit_test(&layout, 22, 60, false)),
             CursorSlot::EqSlid
         );
         assert_eq!(
-            equalizer_cursor(eq_hit_test(&layout, 100, 5)),
+            equalizer_cursor(eq_hit_test(&layout, 100, 5, false)),
             CursorSlot::EqTitle
         );
         // The On button is plain background.
         assert_eq!(
-            equalizer_cursor(eq_hit_test(&layout, 20, 24)),
+            equalizer_cursor(eq_hit_test(&layout, 20, 24, false)),
             CursorSlot::EqNormal
         );
         assert_eq!(equalizer_cursor(None), CursorSlot::EqNormal);
+        // The shaded equalizer is the title band alone (S05 §1.2).
+        assert_eq!(
+            equalizer_cursor(eq_hit_test(&layout, 100, 5, true)),
+            CursorSlot::EqTitle
+        );
+        assert_eq!(
+            equalizer_cursor(eq_hit_test(&layout, 79, 60, true)),
+            CursorSlot::EqNormal
+        );
     }
 
     #[test]

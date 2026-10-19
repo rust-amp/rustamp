@@ -42,6 +42,16 @@
 //! The track atlas (13,164,209,129) is **not** blitted as a whole (S01 refutes
 //! that). Shade drawing remains provisional (S01 §3,
 //! S05 §1.5). See `docs/tasks/S07r-eq-renderer.md` for settling measurements.
+//!
+//! # The windowshade form
+//!
+//! S05 §1.2: the shade is a single 14-px title-bar row and no body rows are
+//! drawn, so the shaded frame is that band alone — 275 x 14, or 550 x 28 when
+//! the double-size flag is set (the scaled shade, an own choice for the
+//! equalizer, S05 §2.3). Its pixels come from `eq_ex.bmp` (S01 §3, provisional:
+//! row 0 focused, row 15 unfocused). S07 has no shade wording, so nothing in
+//! the audited specs shows sliders in this form and none are drawn; the body
+//! controls are not part of the frame.
 
 use rustamp_gfx::{Image, Rect};
 use rustamp_skin::{Sheet, Skin};
@@ -51,13 +61,13 @@ use crate::equalizer::{
     EqSlider, EqWidget, EqualizerLayout, EqualizerState, FLAT_VALUE, MAX_VALUE, THUMB_BOTTOM_Y,
     THUMB_SIZE, THUMB_TOP_Y,
 };
+use crate::layout::SHADE_HEIGHT;
 
 /// The frame size an equalizer state renders to, including double-size.
 ///
 /// Delegates to [`docking::window_size`] (single source of truth, S05 §2.1).
-/// The equalizer's shade drawing is open (S05 §1.5); the shaded size is
-/// whatever the current docking geometry says (275 x 14, per S01 §1) and is
-/// deliberately not re-derived here.
+/// The shaded size is the 14-px band of S01 §1 (275 x 14; open in S05 §1.5,
+/// which never shaded the equalizer).
 pub fn eq_frame_size(state: &EqualizerState) -> (u32, u32) {
     window_size(WindowKind::Equalizer, state.windowshade, state.double_size)
 }
@@ -257,18 +267,21 @@ fn render_1x(state: &EqualizerState, skin: &Skin, layout: &EqualizerLayout) -> I
     let sheets = EqSheets::load(skin);
 
     if state.windowshade {
-        // S05 §1.5: the equalizer's shade drawing is open. The size is the
-        // existing docking geometry; the pixels stay the shade sheet's title
-        // band (S01 §3 provisional) with the title bar as fallback.
-        let mut canvas = Image::filled(layout.background.width, 14, [0, 0, 0, 255]);
+        // S05 §1.2: the shade is a single 14-px title-bar row; no body rows
+        // are drawn. S01 §3 (provisional): the band comes from `eq_ex.bmp`,
+        // row 0 focused and row 15 unfocused.
+        let mut canvas = Image::filled(layout.background.width, SHADE_HEIGHT, [0, 0, 0, 255]);
         if let Some(image) = sheets.eq_ex.as_ref() {
             let y = if state.focused { 0 } else { 15 };
-            canvas.blit_rect(image, Rect::new(0, y, 275, 14), 0, 0);
+            canvas.blit_rect(image, Rect::new(0, y, 275, SHADE_HEIGHT), 0, 0);
         } else {
+            // A skin without the shade sheet keeps a title strip instead of a
+            // blank window (S17: the loader substitutes the built-in default;
+            // this is the last resort for a skin that has no sheet at all).
             blit_eqmain(
                 &mut canvas,
                 &sheets,
-                Rect::new(0, if state.focused { 134 } else { 149 }, 275, 14),
+                Rect::new(0, if state.focused { 134 } else { 149 }, 275, SHADE_HEIGHT),
                 0,
                 0,
             );
