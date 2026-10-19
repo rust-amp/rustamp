@@ -21,7 +21,7 @@ use rustamp_core::audio::{
 };
 use rustamp_core::bus::{EventBus, EventReceiver};
 use rustamp_core::command::Command;
-use rustamp_core::error::{Error as CoreError, Result as CoreResult};
+use rustamp_core::error::{Error as CoreError, ErrorKind, Result as CoreResult};
 use rustamp_core::event::Event;
 use rustamp_core::state::TransportState;
 use rustamp_mediahost::control::{ControlPeer, Liveness};
@@ -57,24 +57,42 @@ const LIVENESS: Liveness = Liveness {
 /// Fake resident serving the same synthetic pattern the in-process
 /// `TestFactory` serves, so resident and in-process tracks are comparable.
 /// The file stem `track<seed>_<frames>.rtst` sets the content; the stem
-/// `refuse` fails the open loudly.
+/// `die<seed>_<frames>.rtst` serves the same content and then fails loudly,
+/// the way a resident that dies mid-track does; any other stem is refused.
 struct PatternResident;
 
 struct PatternDecoder {
     seed: u64,
     total: u64,
     pos: u64,
+    /// The resident fails loudly once its frames are spent.
+    dies: bool,
 }
 
-fn parse_stem(name: &str) -> Option<(u64, u64)> {
+/// What the fake resident serves for one file stem.
+#[derive(Clone, Copy)]
+enum Script {
+    /// The pattern for that many frames.
+    Pattern { seed: u64, frames: u64 },
+    /// The pattern for that many frames, then a loud failure.
+    Die { seed: u64, frames: u64 },
+}
+
+fn parse_stem(name: &str) -> Option<Script> {
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = stem.strip_suffix(".rtst").unwrap_or(stem);
-    if stem == "refuse" {
-        return None;
-    }
-    let head = stem.strip_prefix("track")?;
+    let (dies, head) = match stem.strip_prefix("track") {
+        Some(head) => (false, head),
+        None => (true, stem.strip_prefix("die")?),
+    };
     let (seed, frames) = head.split_once('_')?;
-    Some((seed.parse().ok()?, frames.parse().ok()?))
+    let seed: u64 = seed.parse().ok()?;
+    let frames: u64 = frames.parse().ok()?;
+    Some(if dies {
+        Script::Die { seed, frames }
+    } else {
+        Script::Pattern { seed, frames }
+    })
 }
 
 impl DecoderResident for PatternResident {
@@ -85,10 +103,17 @@ impl DecoderResident for PatternResident {
             ));
         };
         match parse_stem(&name) {
-            Some((seed, total)) => Ok(Box::new(PatternDecoder {
+            Some(Script::Pattern { seed, frames }) => Ok(Box::new(PatternDecoder {
                 seed,
-                total,
+                total: frames,
                 pos: 0,
+                dies: false,
+            })),
+            Some(Script::Die { seed, frames }) => Ok(Box::new(PatternDecoder {
+                seed,
+                total: frames,
+                pos: 0,
+                dies: true,
             })),
             None => Err(MediaHostError::OperationFailed(
                 "fake resident refuses this file".into(),
@@ -112,6 +137,14 @@ impl ResidentDecoder for PatternDecoder {
 
     fn read(&mut self, out: &mut [f32]) -> HostResult<usize> {
         let channels = 2usize;
+        if self.dies && self.pos >= self.total {
+            // The resident dies mid-track: the host turns this into a
+            // `DecoderError`, and the engine must surface it like a local
+            // decode error (RFC 0006 §5.7).
+            return Err(MediaHostError::OperationFailed(
+                "the fake resident died mid-track".into(),
+            ));
+        }
         let n = (out.len() / channels).min((self.total - self.pos) as usize);
         for i in 0..n {
             let v = pattern(self.seed, self.pos + i as u64);
@@ -233,7 +266,10 @@ impl DecoderFactory for FakeResidentFactory {
         // Reap the host thread when the decoder drops: without this the test
         // process would leak one thread per opened track.
         let decoder = ReapedDecoder {
-            inner: Some(HostDecoder::new(session, WAIT, WAIT)),
+            inner: Some(
+                HostDecoder::new(session, WAIT, WAIT)
+                    .expect("the handshake the session validated is adoptable"),
+            ),
             done: Some(result),
         };
         Ok(Box::new(decoder))
@@ -540,6 +576,46 @@ fn resident_refusal_is_a_loud_open_error() {
         Err(error) => panic!("refusal must be Decode, got {error}"),
         Ok(_) => panic!("refusal must be loud, never a decoder"),
     }
+}
+
+#[test]
+fn a_resident_that_dies_mid_track_fails_the_track_loudly() {
+    // RFC 0006 §5.7: the host reports the failure and the engine surfaces it
+    // as an event exactly like a local decode error — never as the end of the
+    // track, never as silence, and never as a hang.
+    let mut h = Harness::new(&["die7_3000.rtst"]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0), "the resident track must open");
+
+    // The failure arrives as an error event.
+    let deadline = Instant::now() + WAIT;
+    let error = loop {
+        h.engine.poll().unwrap();
+        let error = h.drain_events().into_iter().find_map(|event| match event {
+            Event::Error(info) => Some(info),
+            _ => None,
+        });
+        if let Some(info) = error {
+            break info;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the resident's death must be reported"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(error.kind, ErrorKind::Decode, "{}", error.message);
+    assert!(
+        error.message.contains("resident"),
+        "the report must name the resident: {}",
+        error.message
+    );
+
+    // And the track ends: the run does not hang and the transport parks.
+    assert!(
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+        "the failed track must end the run"
+    );
 }
 
 #[test]

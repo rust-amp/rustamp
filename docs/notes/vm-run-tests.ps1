@@ -176,6 +176,18 @@ if (-not $SkipBuild) {
     $fixtureBuildExit = $LASTEXITCODE
     $ErrorActionPreference = $prevPref
     if ($fixtureBuildExit -ne 0) { throw "cargo build examples decoder_fixture / dsp_fixture failed with exit $fixtureBuildExit" }
+
+    Step 'building the real decoder resident (rustamp-dechost-symphonia)'
+    # The engine adapter's two-process tests (crates/rustamp-audio/tests/
+    # resident_process.rs) spawn the real resident. It is a workspace binary,
+    # so it is built explicitly here: the test build only produces its test
+    # harness, not the plain executable the test spawns.
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & cargo build --offline -p rustamp-dechost --bin rustamp-dechost-symphonia 2>$null | Out-Null
+    $dechostBuildExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevPref
+    if ($dechostBuildExit -ne 0) { throw "cargo build -p rustamp-dechost failed with exit $dechostBuildExit" }
 } else {
     Step 'skipping the build (-SkipBuild); the previously staged binaries are reused'
     if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
@@ -225,6 +237,17 @@ if (Test-Path $dspFixtureExe) {
     Copy-Item $dspFixtureExe (Join-Path $Stage 'target\debug\examples') -Force
     Copy-Item $dspFixtureExe (Join-Path $Stage 'target\debug') -Force
     Write-Host '    staged dsp_fixture example'
+}
+
+# The real decoder resident (RFC 0006 §5). The engine adapter's two-process
+# tests spawn it and look for it next to the test binaries, so it has to sit
+# in target\debug beside them.
+$dechostExe = Join-Path $debugDir 'rustamp-dechost-symphonia.exe'
+if (Test-Path $dechostExe) {
+    Copy-Item $dechostExe (Join-Path $Stage 'target\debug') -Force
+    Write-Host '    staged the real decoder resident'
+} else {
+    Write-Host '    WARNING: no real decoder resident was built; the two-process engine test reports itself skipped'
 }
 
 # The plugin host is built for i686 — the app is 64-bit and the host 32-bit by
