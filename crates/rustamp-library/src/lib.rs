@@ -3,9 +3,10 @@
 //!
 //! Media Library (M5): a persistent, SQLite-backed index of audio tracks.
 //!
-//! This crate owns the storage and scan/query layer only. It does not touch
-//! the player, the UI or the playlist model. A future UI lane builds on top
-//! of [`Library`] by calling [`Library::scan`] and [`Library::query`].
+//! This crate owns the storage, the scan/query layer and the tag writing
+//! only. It does not touch the player, the UI or the playlist model. A
+//! future UI lane builds on top of [`Library`] by calling [`Library::scan`],
+//! [`Library::query`] and [`Library::write_tags`].
 //!
 //! ## Schema
 //!
@@ -106,6 +107,30 @@
 //! that does not exist is an error ([`Error::NotFound`]) rather than an empty
 //! report.
 //!
+//! ## Tag writing
+//!
+//! [`Library::write_tags`] edits the tags of an indexed track. The values
+//! are written into the **real file** with [`rustamp_meta::write_tags`],
+//! which replaces the file atomically: after the call the file is either the
+//! old one or the new one, never a half-written mixture. A field that is
+//! `None` is left as the file has it (the `rustamp-meta` contract), so one
+//! field can be edited without the others being lost.
+//!
+//! The row is then rebuilt from the file: the tags are **read back** after
+//! the write and it is *those* values that land in the index, never the
+//! values the caller passed in. A format that stores a value differently, or
+//! cannot store it at all, therefore shows up in the index as the file
+//! really is - the index can never claim a value the file does not carry.
+//!
+//! The row id does not change (the row is updated in place), and the stored
+//! `mtime_ns`/`size` are refreshed from the written file, so the next scan
+//! sees no change and does not read the file a second time.
+//!
+//! A failed write leaves the row exactly as it was. A file that vanished
+//! between the scan and the write is an error ([`Error::NotFound`]) and not
+//! a silent row update: the index must not describe a file that is not
+//! there any more.
+//!
 //! ## Known limits
 //!
 //! * Change detection uses the file's stat, not its contents. A rewrite that
@@ -122,6 +147,9 @@
 //! * `scan_root`/`scan` do not record scan progress or a per-root last-scan
 //!   time; the caller drives scanning (for example from a background thread)
 //!   and gets the [`ScanReport`] back.
+//! * A tag write cannot ask for a field to be removed: `write_tags` reads a
+//!   `None` as "leave the value the file has" (the `rustamp-meta`
+//!   contract).
 
 #![forbid(unsafe_code)]
 
@@ -466,6 +494,81 @@ impl Library {
             None => Ok(None),
             Some(raw) => Ok(Some(raw.into_track(&self.conn)?)),
         }
+    }
+
+    // ---- tag writing ----
+
+    /// Write `metadata` into the tags of the indexed track `id` and refresh
+    /// the row from the file.
+    ///
+    /// The values are written into the **real file** with
+    /// [`rustamp_meta::write_tags`], which replaces it atomically: after the
+    /// call the file is either the old one or the new one, never a
+    /// half-written mixture. A field that is `None` in `metadata` is left as
+    /// the file has it (the `rustamp-meta` contract), so one field can be
+    /// edited without losing the others.
+    ///
+    /// The row is then rebuilt from the file: the tags are **read back**
+    /// after the write, and it is *those* values that land in the index,
+    /// never the values the caller passed in. A format that stores a value
+    /// differently, or cannot store it at all, therefore shows up in the
+    /// index as the file really is - the index can never claim a value the
+    /// file does not carry.
+    ///
+    /// The row id does not change (the row is updated in place), and the
+    /// stored `mtime_ns`/`size` are refreshed from the written file, so the
+    /// next scan sees no change and does not read the file a second time.
+    /// The refreshed row is returned, so a caller can show it without
+    /// querying again.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::NotFound`] if no row has the id `id`, or if the file the
+    ///   row points at is gone. A file that vanished between the scan and
+    ///   the write is reported, never written into the row silently.
+    /// * The error of the write itself: an unreadable file, a format whose
+    ///   tags cannot be written, a year a tag cannot hold.
+    /// * The error of reading the tags back, if the written file cannot be
+    ///   read any more.
+    ///
+    /// A failed write leaves the row exactly as it was. A write that
+    /// succeeded but could not be read back leaves the row as it was, too:
+    /// the row is then stale, and the next scan repairs it, because the
+    /// file's stat no longer matches the stored one.
+    pub fn write_tags(&mut self, id: i64, metadata: &TrackMetadata) -> Result<TrackRow> {
+        let row = self
+            .get(id)?
+            .ok_or_else(|| Error::NotFound(format!("track {id}")))?;
+        let path = row.path;
+
+        // The file must still be there. A write into a file that vanished
+        // would fail halfway, and a row that describes a file which is not
+        // there any more must not be updated.
+        if fs::metadata(&path).is_err() {
+            return Err(Error::NotFound(path.display().to_string()));
+        }
+
+        rustamp_meta::write_tags(&path, metadata)?;
+
+        // What the file says now, not what the caller asked for.
+        let tags = rustamp_meta::read_tags(&path)?;
+
+        // The write replaced the file, so the stat is taken again: the row
+        // must carry the size and the mtime of the new file, or the next
+        // scan would see a change and read the file a second time. A stat
+        // that fails leaves both unknown, which the next scan repairs.
+        let stat = fs::metadata(&path).ok();
+        let mtime_ns = stat.as_ref().and_then(mtime_of);
+        let size = stat.map(|stat| stat.len() as i64);
+
+        let tx = self.conn.transaction().map_err(map_sqlite)?;
+        // The row is updated by its path, so the id it had before the write
+        // is the id it has now.
+        let row_id = upsert_row(&tx, &path, &tags, mtime_ns, size)?;
+        tx.commit().map_err(map_sqlite)?;
+
+        self.get(row_id)?
+            .ok_or_else(|| Error::NotFound(format!("track {row_id}")))
     }
 
     // ---- roots ----
@@ -963,7 +1066,9 @@ mod tests {
         f.write_all(&buf).unwrap();
     }
 
-    fn write_tags(path: &Path, title: &str, artist: &str, album: &str) {
+    /// Writes a title/artist/album fixture into `path`. Named apart from
+    /// [`Library::write_tags`] so the two are not confused in a test.
+    fn write_fixture_tags(path: &Path, title: &str, artist: &str, album: &str) {
         let md = TrackMetadata {
             title: Some(title.to_owned()),
             artist: Some(artist.to_owned()),
@@ -1008,8 +1113,8 @@ mod tests {
         let b = root.join("b.wav");
         make_wav(&a);
         make_wav(&b);
-        write_tags(&a, "Song A", "Artist X", "Album 1");
-        write_tags(&b, "Song B", "Artist Y", "Album 2");
+        write_fixture_tags(&a, "Song A", "Artist X", "Album 1");
+        write_fixture_tags(&b, "Song B", "Artist Y", "Album 2");
 
         let mut lib = Library::in_memory().unwrap();
         let rep = lib.scan(root).unwrap();
@@ -1047,7 +1152,7 @@ mod tests {
         let root = dir.path();
         let a = root.join("a.wav");
         make_wav(&a);
-        write_tags(&a, "Song A", "Artist X", "Album 1");
+        write_fixture_tags(&a, "Song A", "Artist X", "Album 1");
 
         let mut lib = Library::in_memory().unwrap();
         lib.scan(root).unwrap();
@@ -1070,14 +1175,14 @@ mod tests {
         let root = dir.path();
         let a = root.join("a.wav");
         make_wav(&a);
-        write_tags(&a, "Song A", "Artist X", "Album 1");
+        write_fixture_tags(&a, "Song A", "Artist X", "Album 1");
 
         let mut lib = Library::in_memory().unwrap();
         lib.scan(root).unwrap();
         let id_before = only_row(&lib).id;
 
         // Rewrite the tags. No sleep: change detection uses nanoseconds.
-        write_tags(&a, "Song A2", "Artist X", "Album 1");
+        write_fixture_tags(&a, "Song A2", "Artist X", "Album 1");
         let rep = lib.scan(root).unwrap();
         assert_eq!(rep.updated, 1);
         assert_eq!(rep.added, 0);
@@ -1096,8 +1201,8 @@ mod tests {
         let b = root.join("b.wav");
         make_wav(&a);
         make_wav(&b);
-        write_tags(&a, "A", "X", "Al");
-        write_tags(&b, "B", "Y", "Al2");
+        write_fixture_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&b, "B", "Y", "Al2");
 
         let mut lib = Library::in_memory().unwrap();
         lib.scan(root).unwrap();
@@ -1115,7 +1220,7 @@ mod tests {
         let root = dir.path();
         let a = root.join("a.wav");
         make_wav(&a);
-        write_tags(&a, "A", "X", "Album Z");
+        write_fixture_tags(&a, "A", "X", "Album Z");
 
         let mut lib = Library::in_memory().unwrap();
         lib.scan(root).unwrap();
@@ -1140,7 +1245,7 @@ mod tests {
         ] {
             let path = root.join(name);
             make_wav(&path);
-            write_tags(&path, title, artist, album);
+            write_fixture_tags(&path, title, artist, album);
         }
 
         let mut lib = Library::in_memory().unwrap();
@@ -1204,7 +1309,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let a = root.join("a.wav");
         make_wav(&a);
-        write_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&a, "A", "X", "Al");
 
         {
             let mut lib = Library::open(&db).unwrap();
@@ -1222,7 +1327,7 @@ mod tests {
         let root = dir.path();
         let a = root.join("a.wav");
         make_wav(&a);
-        write_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&a, "A", "X", "Al");
 
         let mut lib = Library::in_memory().unwrap();
         lib.scan(root).unwrap();
@@ -1240,7 +1345,7 @@ mod tests {
         let root = dir.path();
         let a = root.join("a.wav");
         make_wav(&a);
-        write_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&a, "A", "X", "Al");
         fs::write(root.join("cover.jpg"), b"not an image").unwrap();
         fs::write(root.join("notes.txt"), b"liner notes").unwrap();
         fs::write(root.join("list.m3u"), b"a.wav").unwrap();
@@ -1260,7 +1365,7 @@ mod tests {
         let root = dir.path();
         let a = root.join("a.wav");
         make_wav(&a);
-        write_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&a, "A", "X", "Al");
 
         let mut lib = Library::in_memory().unwrap();
         lib.scan(root).unwrap();
@@ -1290,8 +1395,8 @@ mod tests {
         let b = root_b.join("b.wav");
         make_wav(&a);
         make_wav(&b);
-        write_tags(&a, "A", "X", "Al");
-        write_tags(&b, "B", "Y", "Al2");
+        write_fixture_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&b, "B", "Y", "Al2");
 
         let mut lib = Library::in_memory().unwrap();
         lib.scan(&root_a).unwrap();
@@ -1321,7 +1426,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let a = root.join("a.wav");
         make_wav(&a);
-        write_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&a, "A", "X", "Al");
 
         let mut lib = Library::in_memory().unwrap();
         assert_eq!(lib.scan(&root).unwrap().added, 1);
@@ -1358,7 +1463,7 @@ mod tests {
         for (name, title, artist, album) in entries {
             let path = dir.path().join(name);
             make_wav(&path);
-            write_tags(&path, title, artist, album);
+            write_fixture_tags(&path, title, artist, album);
         }
         let mut lib = Library::in_memory().unwrap();
         lib.scan(dir.path()).unwrap();
@@ -1392,7 +1497,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let a = root.join("a.wav");
         make_wav(&a);
-        write_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&a, "A", "X", "Al");
 
         let mut lib = Library::in_memory().unwrap();
         let entry = lib.add_root(&root).unwrap();
@@ -1750,5 +1855,181 @@ mod tests {
             )
             .unwrap();
         assert_eq!(changed, 1);
+    }
+
+    // ---- tag writing ----
+
+    /// A library with one indexed WAV file, and the row it holds.
+    fn library_with_one_track() -> (TempDir, Library, PathBuf, TrackRow) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.wav");
+        make_wav(&path);
+        write_fixture_tags(&path, "Song A", "Artist X", "Album 1");
+        let mut lib = Library::in_memory().unwrap();
+        lib.scan(dir.path()).unwrap();
+        let row = only_row(&lib);
+        (dir, lib, path, row)
+    }
+
+    #[test]
+    fn writing_tags_updates_the_row_without_a_rescan() {
+        let (_dir, mut lib, path, before) = library_with_one_track();
+
+        let mut edited = before.metadata.clone();
+        edited.title = Some("Song A2".to_owned());
+        let after = lib.write_tags(before.id, &edited).unwrap();
+
+        // The row carries the new value, and the id is the one it had.
+        assert_eq!(after.id, before.id, "stable id preserved");
+        assert_eq!(after.metadata.title.as_deref(), Some("Song A2"));
+        assert_eq!(after.metadata.artist.as_deref(), Some("Artist X"));
+
+        // The stored row carries it too, not just the returned one.
+        let stored = lib.get(before.id).unwrap().unwrap();
+        assert_eq!(stored.metadata.title.as_deref(), Some("Song A2"));
+
+        // The file really was written: it is the file that says so.
+        let on_disk = rustamp_meta::read_tags(&path).unwrap();
+        assert_eq!(on_disk.title.as_deref(), Some("Song A2"));
+        assert_eq!(after.metadata, on_disk, "the row is what the file says");
+
+        // The stat was refreshed with the write, so the next scan finds no
+        // change and does not read the file a second time.
+        let report = lib.scan(path.parent().unwrap()).unwrap();
+        assert_eq!(report.added, 0);
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(only_row(&lib).metadata.title.as_deref(), Some("Song A2"));
+    }
+
+    #[test]
+    fn the_row_follows_the_file_and_not_the_caller() {
+        let (_dir, mut lib, path, before) = library_with_one_track();
+
+        let mut edited = before.metadata.clone();
+        edited.title = Some("Song A2".to_owned());
+        // A field no tag container carries: the writer drops it and the
+        // reader never reports it.
+        edited.duration_ms = Some(1234);
+        let after = lib.write_tags(before.id, &edited).unwrap();
+
+        assert_eq!(after.metadata.title.as_deref(), Some("Song A2"));
+        assert_eq!(
+            after.metadata.duration_ms, None,
+            "the file carries no duration, so the row must not claim one"
+        );
+        assert_eq!(after.metadata, rustamp_meta::read_tags(&path).unwrap());
+    }
+
+    #[test]
+    fn a_partial_write_keeps_the_tags_the_caller_did_not_set() {
+        let (_dir, mut lib, _path, before) = library_with_one_track();
+
+        // Only the title is set: the writer leaves the other tags as the
+        // file has them, and the read-back shows exactly that.
+        let edited = TrackMetadata {
+            title: Some("Song A2".to_owned()),
+            ..Default::default()
+        };
+        let after = lib.write_tags(before.id, &edited).unwrap();
+
+        assert_eq!(after.metadata.title.as_deref(), Some("Song A2"));
+        assert_eq!(after.metadata.artist.as_deref(), Some("Artist X"));
+        assert_eq!(after.metadata.album.as_deref(), Some("Album 1"));
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_row_unchanged() {
+        let (_dir, mut lib, path, before) = library_with_one_track();
+
+        // A year no tag can hold: the write is refused before the file is
+        // opened, so neither the file nor the row changes.
+        let mut edited = before.metadata.clone();
+        edited.title = Some("Song A2".to_owned());
+        edited.year = Some(70_000);
+        let error = lib.write_tags(before.id, &edited).unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+
+        let after = only_row(&lib);
+        assert_eq!(after, before, "the row is untouched");
+        let on_disk = rustamp_meta::read_tags(&path).unwrap();
+        assert_eq!(on_disk.title.as_deref(), Some("Song A"));
+    }
+
+    #[test]
+    fn a_write_to_a_file_that_is_no_media_leaves_the_row_unchanged() {
+        let (_dir, mut lib, path, before) = library_with_one_track();
+
+        // The file is broken behind the library's back: the write fails on
+        // the file, and the row keeps the values it had.
+        fs::write(&path, b"this is not a media file at all").unwrap();
+        let mut edited = before.metadata.clone();
+        edited.title = Some("Song A2".to_owned());
+        let error = lib.write_tags(before.id, &edited).unwrap_err();
+        assert!(matches!(error, Error::UnsupportedFormat(_)), "{error:?}");
+
+        let after = only_row(&lib);
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.metadata.title.as_deref(), Some("Song A"));
+    }
+
+    #[test]
+    fn a_vanished_file_is_reported_and_leaves_the_row_alone() {
+        let (_dir, mut lib, path, before) = library_with_one_track();
+
+        // The file is gone between the scan and the write.
+        fs::remove_file(&path).unwrap();
+
+        let mut edited = before.metadata.clone();
+        edited.title = Some("Song A2".to_owned());
+        let error = lib.write_tags(before.id, &edited).unwrap_err();
+        assert!(matches!(error, Error::NotFound(_)), "{error:?}");
+
+        // The row is not updated with values no file has.
+        let after = only_row(&lib);
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.metadata.title.as_deref(), Some("Song A"));
+    }
+
+    #[test]
+    fn writing_to_an_unknown_track_is_an_error() {
+        let mut lib = Library::in_memory().unwrap();
+        let error = lib.write_tags(42, &TrackMetadata::default()).unwrap_err();
+        assert!(matches!(error, Error::NotFound(_)), "{error:?}");
+        assert_eq!(lib.count().unwrap(), 0, "no row was created");
+    }
+
+    #[test]
+    fn a_write_keeps_the_extra_tags_of_the_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.wav");
+        make_wav(&path);
+        let mut md = TrackMetadata {
+            title: Some("Song A".to_owned()),
+            ..Default::default()
+        };
+        md.extra
+            .insert("REPLAYGAIN_TRACK_GAIN".to_owned(), "1.50 dB".to_owned());
+        rustamp_meta::write_tags(&path, &md).unwrap();
+
+        let mut lib = Library::in_memory().unwrap();
+        lib.scan(dir.path()).unwrap();
+        let before = only_row(&lib);
+
+        let mut edited = before.metadata.clone();
+        edited.title = Some("Song A2".to_owned());
+        let after = lib.write_tags(before.id, &edited).unwrap();
+
+        assert_eq!(after.metadata.title.as_deref(), Some("Song A2"));
+        assert_eq!(
+            after
+                .metadata
+                .extra
+                .get("REPLAYGAIN_TRACK_GAIN")
+                .map(String::as_str),
+            Some("1.50 dB"),
+            "the extra tag survived the write"
+        );
     }
 }
