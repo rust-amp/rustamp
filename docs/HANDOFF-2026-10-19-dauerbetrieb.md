@@ -80,10 +80,18 @@ after every merge), not by trusting the lane's report.
 | `wave197` | title-bar double-click toggles windowshade on all three windows |
 | `wave198` | `vis_` render loop: zeroed rows without a frame, module-paced, start/stop ordering |
 | `wave199` | album ReplayGain grouping over pooled histograms |
+| `wave200` | DSP-path kill tests: round trip, sticky error, write-direction wake |
+| `wave201` | S03 §2 playlist shortcut table as data (83 bound, 5 explicitly unimplemented) |
 | `wave202` | registry start/stop/step for the vis loop; `PluginRegistry` proven not `Send` |
+| `wave203` | sidecar cover art fallback with stat-based invalidation |
+| `wave204` | DSP write means *delivered*: a delivery fence closes the silent-frame gap |
+| `wave206` | property tests for the S15 order model (no model bug found) |
+| `wave207` | the app reads `PluginLoaded`/`PluginError` into a host-scoped inventory |
 
-In flight at the time of writing: `wave200` (DSP-path kill test), `wave201`
-(S03 §2 playlist shortcut table), `wave203` (sidecar cover art).
+In flight at the time of writing: `wave205` (real BS.1770 R128 loudness — the
+first attempt derived it from ReplayGain and was sent back for the 3–6 dB stereo
+error), `wave208` (order-model follow-ups: doc lie, unbounded history, `skip_by`
+hardening), `wave209` (the app asks the host to load a plugin).
 
 ## Rules added to `AGENTS.md` during the session
 
