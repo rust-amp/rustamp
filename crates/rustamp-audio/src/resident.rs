@@ -40,6 +40,25 @@
 //! the decode thread. Prefetch defaults to [`DEFAULT_PREFETCH_FRAMES`] frames
 //! of ring capacity hint.
 //!
+//! # Supervision (RFC 0006 §8)
+//!
+//! The supervision policy belongs to the engine, not to the contract: the
+//! engine spawns the helper, runs the `Hello`/`Ping` liveness on the control
+//! channel and kills and reaps it on close. [`ResidentConfig::liveness`] is
+//! that policy, and [`DEFAULT_RESIDENT_LIVENESS`] is its default — a stall
+//! escape rather than the framework's 5 s wall-clock trip wire, because a
+//! *dead* helper is caught by the control EOF at once and only a *wedged* one
+//! waits for the `Pong` deadline, which the per-`read` bound already covers
+//! much earlier.
+//!
+//! # Where the two-process path is proven
+//!
+//! The tests in this module drive the adapter over an in-process control pair.
+//! The real thing — a helper in its own process, the real named ring, the
+//! real control channel — is proven by `tests/resident_process.rs`, which is
+//! `#[ignore]`d because it spawns a process and therefore runs only in the
+//! Hyper-V test VM.
+//!
 //! # The DSP resident (RFC 0006 §6)
 //!
 //! The same seam one level down: [`HostDspChain`] presents a media-host
@@ -96,6 +115,7 @@ use rustamp_core::audio::{
 };
 use rustamp_core::error::{Error as CoreError, Result as CoreResult};
 use rustamp_core::state::StreamInfo;
+use rustamp_mediahost::control::Liveness;
 use rustamp_mediahost::decoder::{DecoderSession, file_location};
 use rustamp_mediahost::dsp::DspSession;
 use rustamp_mediahost::pcm::PcmRings;
@@ -120,6 +140,31 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Own choice, same rationale as [`DEFAULT_READ_TIMEOUT`].
 pub const DEFAULT_SEEK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Liveness policy the engine uses for a resident helper.
+///
+/// Own choice, and RFC 0006 §8 puts the supervision policy on the engine
+/// side: "the engine spawns the helper, runs `Hello`/`Ping` liveness on the
+/// control channel, and kills and reaps it on close".
+///
+/// The framework's `Liveness::default()` treats a missed `Pong` as death
+/// after 5 s. That is a wall-clock trip wire, and this repository's own test
+/// guest proved that class: a healthy-but-slow schedule crosses it and the
+/// track dies for a reason that never happened (docs/tasks/M24 §1.3). The two
+/// failure modes are not equally urgent:
+///
+/// * A **dead** helper is caught at once by the control EOF — the peer sees
+///   the closed stream, not a missing `Pong`.
+/// * A **wedged** helper (alive, but not answering) is the only case this
+///   deadline covers, and the engine's per-`read` bound
+///   ([`DEFAULT_READ_TIMEOUT`]) already fails that track much earlier.
+///
+/// So the default here is a stall escape rather than a schedule bound, and
+/// [`ResidentConfig::with_liveness`] lets a caller tighten it.
+pub const DEFAULT_RESIDENT_LIVENESS: Liveness = Liveness {
+    interval: Duration::from_millis(100),
+    timeout: Duration::from_secs(30),
+};
 
 /// File extensions the resident factory claims, mirroring what the symphonia
 /// resident behind the helper serves today (MP3/FLAC/Vorbis/WAV/AIFF/CAF/
@@ -148,6 +193,9 @@ pub struct ResidentConfig {
     pub read_timeout: Duration,
     /// Bound for one seek handshake.
     pub seek_timeout: Duration,
+    /// `Hello`/`Ping` liveness the engine supervises the helper with
+    /// (RFC 0006 §8). See [`DEFAULT_RESIDENT_LIVENESS`].
+    pub liveness: Liveness,
 }
 
 impl ResidentConfig {
@@ -158,6 +206,7 @@ impl ResidentConfig {
             prefetch_frames: DEFAULT_PREFETCH_FRAMES,
             read_timeout: DEFAULT_READ_TIMEOUT,
             seek_timeout: DEFAULT_SEEK_TIMEOUT,
+            liveness: DEFAULT_RESIDENT_LIVENESS,
         }
     }
 
@@ -174,15 +223,48 @@ impl ResidentConfig {
         self.seek_timeout = seek_timeout;
         self
     }
+
+    /// Override the `Hello`/`Ping` liveness the engine supervises the helper
+    /// with. The default is [`DEFAULT_RESIDENT_LIVENESS`].
+    pub fn with_liveness(mut self, liveness: Liveness) -> Self {
+        self.liveness = liveness;
+        self
+    }
 }
 
-/// Core [`AudioSpec`] for a wire [`PcmSpecWire`].
+/// The wire location for one engine source, or a loud refusal.
 ///
-/// Infallible: the wire holds `u8` channels and a `u32` rate, both of which
-/// fit the core spec. A zero rate or zero channels never reaches here — the
-/// session validates the handshake before the adapter is built.
-fn audio_spec_from_wire(spec: PcmSpecWire) -> AudioSpec {
-    AudioSpec::new(spec.sample_rate_hz, u16::from(spec.channels))
+/// RFC 0006 §5.1: the host opens the paths and URLs it can reach itself.
+/// A `MediaSource::Reader` cannot cross the process boundary, and a
+/// non-UTF-8 local path cannot be encoded on the wire yet (HANDOFF-3), so
+/// both are refused loudly instead of being mangled or silently decoded
+/// in-process.
+fn host_location(source: &MediaSource) -> CoreResult<MediaLocationWire> {
+    match source {
+        MediaSource::Path(path) => {
+            file_location(path).map_err(|error| CoreError::Decode(error.to_string()))
+        }
+        MediaSource::Url(url) => Ok(MediaLocationWire::Url(url.clone())),
+        MediaSource::Reader { .. } => Err(CoreError::Unsupported(
+            "reader sources stay in-process; the resident only opens paths and URLs",
+        )),
+    }
+}
+
+/// The engine format for one wire format, or a loud refusal.
+///
+/// The negotiation is one-sided (RFC 0006 §5.2): the host owns the format —
+/// it answers `DecoderOpened` with a wire spec — and the engine adopts it.
+/// A format the wire cannot carry (no channels, no sample rate) is refused
+/// here instead of becoming an `AudioSpec` with a zero rate that would
+/// divide by zero in the clock.
+fn negotiated_spec(spec: PcmSpecWire) -> CoreResult<AudioSpec> {
+    rustamp_mediahost::pcm::validate_spec(spec)
+        .map_err(|error| CoreError::Decode(format!("resident handshake: {error}")))?;
+    Ok(AudioSpec::new(
+        spec.sample_rate_hz,
+        u16::from(spec.channels),
+    ))
 }
 
 /// Saturating [`Duration`] to whole wire milliseconds.
@@ -243,7 +325,7 @@ fn convert_read<F: PcmRings>(
     match session.read(out, Some(read_timeout)) {
         Ok(frames) => Ok(frames),
         Err(MediaHostError::FormatChanged) => {
-            let to = audio_spec_from_wire(session.info().spec);
+            let to = negotiated_spec(session.info().spec)?;
             let from = *spec;
             *spec = to;
             Err(CoreError::FormatChanged { from, to })
@@ -265,7 +347,7 @@ fn convert_seek<F: PcmRings>(
 ) -> CoreResult<Duration> {
     match session.seek(ms_from_duration(to), seek_timeout) {
         Ok(reached_ms) => {
-            *spec = audio_spec_from_wire(session.info().spec);
+            *spec = negotiated_spec(session.info().spec)?;
             Ok(Duration::from_millis(reached_ms))
         }
         Err(error) => Err(host_error_to_core(error, "seek")),
@@ -299,15 +381,21 @@ pub struct HostDecoder<F: PcmRings> {
 
 impl<F: PcmRings> HostDecoder<F> {
     /// Wrap an open session. The session already completed the format
-    /// handshake, so the spec is taken from it.
-    pub fn new(session: DecoderSession<F>, read_timeout: Duration, seek_timeout: Duration) -> Self {
-        let spec = audio_spec_from_wire(session.info().spec);
-        HostDecoder {
+    /// handshake, so the spec is taken from it. A handshake the engine cannot
+    /// adopt (no channels, no sample rate) is refused loudly instead of
+    /// becoming a decoder with a broken clock.
+    pub fn new(
+        session: DecoderSession<F>,
+        read_timeout: Duration,
+        seek_timeout: Duration,
+    ) -> CoreResult<Self> {
+        let spec = negotiated_spec(session.info().spec)?;
+        Ok(HostDecoder {
             session,
             read_timeout,
             seek_timeout,
             spec,
-        }
+        })
     }
 
     /// The wrapped session (for diagnostics and tests).
@@ -378,21 +466,22 @@ pub struct ProcessDecoder {
 
 #[cfg(windows)]
 impl ProcessDecoder {
-    /// Wrap a spawned helper. Reads the handshake spec from its session.
+    /// Wrap a spawned helper. Reads the handshake spec from its session; a
+    /// format the engine cannot adopt is refused loudly.
     pub fn new(
         mut process: rustamp_mediahost::decoder::DecoderProcess,
         read_timeout: Duration,
         seek_timeout: Duration,
-    ) -> Self {
-        let spec = audio_spec_from_wire(process.session().info().spec);
+    ) -> CoreResult<Self> {
+        let spec = negotiated_spec(process.session().info().spec)?;
         let pid = process.pid();
-        ProcessDecoder {
+        Ok(ProcessDecoder {
             process: std::sync::Mutex::new(process),
             read_timeout,
             seek_timeout,
             spec,
             pid,
-        }
+        })
     }
 
     /// Lock the session. The decode worker is the only accessor, so this never
@@ -524,16 +613,18 @@ impl DecoderFactory for ResidentFactory {
     }
 
     fn open(&self, source: MediaSource) -> CoreResult<Box<dyn Decoder>> {
+        // The request mapping does not depend on the platform: what cannot
+        // cross the boundary is refused before anything is spawned.
+        let location = host_location(&source)?;
         #[cfg(not(windows))]
         {
-            let _ = source;
+            let _ = location;
             return Err(CoreError::Unsupported(
                 "resident decoding requires Windows named PCM mappings",
             ));
         }
         #[cfg(windows)]
         {
-            use rustamp_mediahost::control::Liveness;
             use rustamp_mediahost::decoder::DecoderProcess;
 
             if self.config.prefetch_frames == 0 {
@@ -541,22 +632,11 @@ impl DecoderFactory for ResidentFactory {
                     "resident prefetch_frames must be above zero".into(),
                 ));
             }
-            let location = match source {
-                MediaSource::Path(path) => {
-                    file_location(&path).map_err(|error| CoreError::Decode(error.to_string()))?
-                }
-                MediaSource::Url(url) => MediaLocationWire::Url(url),
-                MediaSource::Reader { .. } => {
-                    return Err(CoreError::Unsupported(
-                        "reader sources stay in-process; the resident only opens paths and URLs",
-                    ));
-                }
-            };
             let process = DecoderProcess::spawn(
                 &self.config.helper,
                 location,
                 self.config.prefetch_frames,
-                Liveness::default(),
+                self.config.liveness,
             )
             .map_err(|error| match &error {
                 MediaHostError::OperationFailed(message)
@@ -573,7 +653,7 @@ impl DecoderFactory for ResidentFactory {
                 process,
                 self.config.read_timeout,
                 self.config.seek_timeout,
-            )))
+            )?))
         }
     }
 }
@@ -1077,7 +1157,6 @@ impl DspResidentConfig {
         }
         #[cfg(windows)]
         {
-            use rustamp_mediahost::control::Liveness;
             use rustamp_mediahost::dsp::DspProcess;
 
             if self.ring_frames == 0 {
@@ -1114,7 +1193,71 @@ mod tests {
             sample_rate_hz: 44_100,
             channels: 2,
         };
-        assert_eq!(audio_spec_from_wire(wire), AudioSpec::new(44_100, 2));
+        assert_eq!(negotiated_spec(wire).unwrap(), AudioSpec::new(44_100, 2));
+    }
+
+    #[test]
+    fn a_format_the_wire_cannot_carry_is_refused_loudly() {
+        // The negotiation is one-sided: the host owns the format. A format
+        // with no channels or no sample rate must not become an `AudioSpec`
+        // with a zero rate (the clock would divide by it).
+        for wire in [
+            PcmSpecWire {
+                sample_rate_hz: 44_100,
+                channels: 0,
+            },
+            PcmSpecWire {
+                sample_rate_hz: 0,
+                channels: 2,
+            },
+        ] {
+            let error = negotiated_spec(wire).expect_err("a broken format must be refused");
+            assert!(
+                matches!(&error, CoreError::Decode(message) if message.contains("handshake")),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_request_mapping_crosses_the_boundary_only_for_paths_and_urls() {
+        // RFC 0006 §5.1: the host opens what it can reach itself.
+        let path = MediaSource::Path(PathBuf::from("C:/Music/track.mp3"));
+        assert_eq!(
+            host_location(&path).unwrap(),
+            MediaLocationWire::File("C:/Music/track.mp3".into())
+        );
+        let url = MediaSource::Url("https://example.invalid/stream.mp3".into());
+        assert_eq!(
+            host_location(&url).unwrap(),
+            MediaLocationWire::Url("https://example.invalid/stream.mp3".into())
+        );
+        let reader = MediaSource::Reader {
+            reader: Box::new(std::io::Cursor::new(vec![0u8; 8])),
+            extension: Some("mp3".into()),
+        };
+        assert!(
+            matches!(host_location(&reader), Err(CoreError::Unsupported(_))),
+            "a reader cannot cross the process boundary"
+        );
+    }
+
+    #[test]
+    fn the_liveness_policy_is_the_engine_s_own() {
+        // RFC 0006 §8 puts the supervision policy on the engine side, and the
+        // default must be a stall escape rather than the framework's 5 s
+        // wall-clock trip wire (the flake class M24 proved in this guest).
+        assert_eq!(
+            ResidentConfig::new(PathBuf::from("helper.exe")).liveness,
+            DEFAULT_RESIDENT_LIVENESS
+        );
+        assert!(DEFAULT_RESIDENT_LIVENESS.timeout > Duration::from_secs(5));
+        let tightened = Liveness {
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_secs(2),
+        };
+        let config = ResidentConfig::new(PathBuf::from("helper.exe")).with_liveness(tightened);
+        assert_eq!(config.liveness, tightened);
     }
 
     #[test]
@@ -1410,7 +1553,8 @@ mod hosted_tests {
         )
         .unwrap();
         (
-            HostDecoder::new(session, read_timeout, seek_timeout),
+            HostDecoder::new(session, read_timeout, seek_timeout)
+                .expect("the handshake the session validated is adoptable"),
             result,
         )
     }

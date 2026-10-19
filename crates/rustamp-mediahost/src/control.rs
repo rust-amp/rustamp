@@ -21,7 +21,10 @@ pub trait RingAbort: Send {
 }
 
 /// Control timing policy. PCM waits themselves may remain infinite.
-#[derive(Clone, Copy)]
+///
+/// `Debug` because the engine carries the policy in its own configuration
+/// (RFC 0006 §8 puts the supervision policy on the engine side).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Liveness {
     /// Interval between probes (and monitor shutdown checks).
     pub interval: Duration,
