@@ -369,6 +369,9 @@ impl Skin {
     }
 
     /// The window regions from `region.txt`.
+    ///
+    /// The polygons are the windows' shapes; `Region::mask` turns them into
+    /// the per-pixel coverage of a window of a given size.
     pub fn region(&self) -> &Region {
         &self.region
     }
