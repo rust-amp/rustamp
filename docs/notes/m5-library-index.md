@@ -180,6 +180,35 @@ write is atomic). A write that succeeded but could not be read back leaves the
 row as it was, too: the row is then stale and the next scan repairs it,
 because the file's stat no longer matches the stored one.
 
+## Sidecar cover art (wave203)
+
+`ArtworkCache::get(path)` answers with the **embedded** front cover of the
+track. A track whose file carries no picture falls back to a **sidecar**
+image in the same directory.
+
+- The names that are looked for, in the order they are tried:
+  `cover.jpg`, `cover.png`, `folder.jpg`, `folder.png`, `front.jpg`,
+  `album.jpg` (the public constant `SIDECAR_NAMES`). The first name that
+  is a regular file wins; a file that wins but cannot be decoded is "no
+  cover", the next name is not tried.
+- Only the directory of the track is searched: a cover that sits further up
+  the tree is not found.
+- The precedence is **embedded first, sidecar second**. An embedded cover
+  wins over every sidecar, so the presence of a sidecar changes nothing.
+- The invalidation rule: an answer stays valid while the track keeps its
+  `(mtime_ns, size)` and, unless the answer is the embedded cover, while
+  the sidecar keeps its `(mtime_ns, size)`. A changed `cover.jpg`
+  invalidates the cached cover, and a `cover.jpg` that appears next to a
+  track that had none invalidates the cached "no cover".
+- The sidecar goes through the same decoder as the embedded picture: the
+  format is guessed from the picture itself, it is scaled down to
+  `THUMBNAIL_MAX_EDGE`, and the `MAX_DECODE_BYTES` limit applies.
+- A sidecar that cannot be read or decoded is "no cover" and not an error:
+  a broken `cover.jpg` must not break the row it belongs to.
+
+The "no cover" answer is cached like every other answer, so a directory
+with neither an embedded picture nor a sidecar is read once.
+
 ## Tests (38, all headless on temp directories)
 
 Scan/query (14, wave145): `scan_indexes_and_queries`, `rescan_is_idempotent`,
@@ -246,7 +275,9 @@ audio is decoded and no window is opened.
   the file and returns the refreshed row. A caller that needs to know which
   `extra` entries the target format refused uses
   `rustamp_meta::write_tags_report` directly.
-- Artwork via `rustamp_meta::read_artwork`; not stored in the index.
+- Artwork via `ArtworkCache::get(path)`: the embedded front cover of the
+  track, or the sidecar image next to it (`cover.jpg` and friends); the
+  picture is decoded on the fly and never stored in the index.
 - A per-root last-scan timestamp (the `roots` table has only `added_at`).
 - CD playback/ripping (M5 optional) is out of scope here.
 

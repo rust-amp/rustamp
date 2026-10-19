@@ -170,12 +170,29 @@
 //! library view can draw the album art without reading and decoding the
 //! track file on every frame.
 //!
+//! **Where the cover comes from**: the **embedded** front cover of the
+//! track wins - it belongs to the file and travels with it. A track whose
+//! file carries no picture falls back to the **sidecar** image in the same
+//! directory: the `cover.jpg` of the album folder, for example. The names
+//! that are looked for, and the order they are tried in, are
+//! [`SIDECAR_NAMES`]; the first name that is a regular file wins. The
+//! sidecar is looked for in the directory of the track only, never above
+//! it.
+//!
 //! **The key** is the path of the track. Every entry carries the
 //! `(mtime_ns, size)` pair its cover was decoded from: a lookup stats the
 //! file, and the same pair is a hit while a different pair is a miss that
 //! replaces the entry. That is the same pair the index uses to notice a
 //! changed file, so a rewritten track loses its cover exactly when the
 //! index notices the rewrite.
+//!
+//! **The sidecar key**: an answer that does not come from the embedded
+//! cover also carries the `(mtime_ns, size)` pair of the sidecar it was
+//! built from. A changed `cover.jpg` therefore invalidates the cached
+//! cover, and a `cover.jpg` that appears next to a track that had none
+//! invalidates the cached "no cover". The pair of the sidecar is only
+//! looked at when the answer can depend on it: an embedded cover wins
+//! over every sidecar, so its presence changes nothing.
 //!
 //! **The bound** is an LRU with two limits: at most
 //! [`DEFAULT_MAX_ENTRIES`] answers and at most [`DEFAULT_MAX_BYTES`] of
@@ -192,11 +209,15 @@
 //! [`THUMBNAIL_MAX_EDGE`] on its longest edge is scaled down into that
 //! size, with the aspect ratio kept. A picture that needs more than
 //! [`MAX_DECODE_BYTES`] to decode is not decoded and counts as "no cover".
+//! A sidecar image goes through the same decoder and obeys the same
+//! thumbnail and size rules.
 //!
 //! A file without a cover is answered with "no cover", and that answer is
 //! cached: a track without album art is not read again. A file that cannot
 //! be read at all is an error, and nothing is cached - a failure that may
-//! be transient must not be remembered as "no cover".
+//! be transient must not be remembered as "no cover". A sidecar that
+//! cannot be read or decoded is "no cover" as well: a broken `cover.jpg`
+//! must not break the row it belongs to.
 //!
 //! ## Known limits
 //!
@@ -222,9 +243,10 @@
 //!   contract).
 //! * The artwork cache notices a changed file through its stat, like the
 //!   index does: a rewrite that keeps both the size and the modification
-//!   time keeps the old cover.
-//! * The artwork cache holds embedded pictures only. A cover image that
-//!   sits next to the track (`cover.jpg`, `folder.jpg`) is not looked for.
+//!   time keeps the old cover. The same holds for a sidecar image.
+//! * The sidecar fallback looks in the directory of the track only, and
+//!   only for the names of [`SIDECAR_NAMES`]. A cover that sits further up
+//!   the tree is not found.
 
 #![forbid(unsafe_code)]
 
@@ -244,7 +266,7 @@ mod artwork;
 
 pub use artwork::{
     ArtworkCache, ArtworkCacheStats, CoverImage, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
-    MAX_DECODE_BYTES, THUMBNAIL_MAX_EDGE,
+    MAX_DECODE_BYTES, SIDECAR_NAMES, THUMBNAIL_MAX_EDGE,
 };
 
 /// The column list shared by every row-returning statement, in the order
