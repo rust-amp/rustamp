@@ -1,11 +1,12 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! Headless integration of the UI-local analyser. Run only in the test VM.
+//! Headless integration of the shared analyser. Run only in the test VM.
 
 use rustamp_core::command::Command;
 use rustamp_core::event::Event;
 use rustamp_core::vis::{VIS_SAMPLES, VisFrame};
 use rustamp_ui::visualization::{VisError, VisInput, VisMode};
 use rustamp_ui::{MainWindow, MainWindowLayout, TransportState, Widget, hit_test};
+use rustamp_vis::analyser::{Analyser, ClassicMode, SPECTRUM_ROWS};
 
 fn frame() -> VisFrame {
     VisFrame {
@@ -88,4 +89,61 @@ fn own_choice_mode_cycle_requires_release_in_the_area_and_emits_no_command() {
     window.mouse_down(area.x, area.y, 0);
     window.mouse_up(274, 115, 0);
     assert_eq!(window.state().visualization.mode, VisMode::Spectrum);
+}
+
+#[test]
+fn main_window_uses_the_shared_trigger_and_dots_only_change_the_stroke() {
+    let mut window = MainWindow::new();
+    window.handle_event(&Event::StateChanged(TransportState::Playing), 0);
+    window.set_vis_mode(VisMode::Scope);
+    let mut shared = Analyser::default();
+    shared.set_mode(ClassicMode::Oscilloscope);
+    let mut reference = None;
+    let mut raw_reference = None;
+    for index in 0..6 {
+        let frame = VisFrame {
+            // A sliding, exactly periodic waveform: the previous untriggered
+            // scope moved with this window, whereas the shared trigger locks it.
+            waveform: [std::array::from_fn(|n| if (n + index * 5) % 36 < 18 { 0.8 } else { -0.8 });
+                2],
+            ..VisFrame::default()
+        };
+        let now = index as u64 * 20;
+        shared.push(&frame, 44100, now).unwrap();
+        window.push_vis_frame(&frame, 44100, now).unwrap();
+        let rows = shared.scope().map(|sample| {
+            ((1.0 - f64::from(sample).clamp(-1.0, 1.0)) * f64::from(SPECTRUM_ROWS - 1) * 0.5)
+                .round() as u8
+        });
+        assert!(shared.trigger().is_some());
+        assert_eq!(window.state().visualization.scope, rows);
+        if let Some(reference) = reference {
+            assert_eq!(rows, reference, "triggered UI pixels must not slide");
+            assert_ne!(frame.waveform[0], raw_reference.unwrap());
+        } else {
+            reference = Some(rows);
+            raw_reference = Some(frame.waveform[0]);
+        }
+        window.set_vis_mode(VisMode::ScopeDots);
+        assert_eq!(window.state().visualization.scope, rows);
+        assert_eq!(window.state().visualization.input, VisInput::Fresh);
+        window.set_vis_mode(VisMode::Scope);
+    }
+}
+
+#[test]
+fn main_window_spectrum_tracks_shared_heights_and_envelopes() {
+    let mut window = MainWindow::new();
+    window.handle_event(&Event::StateChanged(TransportState::Playing), 0);
+    let mut shared = Analyser::default();
+    for (now, input) in [(0, frame()), (400, VisFrame::default()), (800, frame())] {
+        shared.push(&input, 44100, now).unwrap();
+        window.push_vis_frame(&input, 44100, now).unwrap();
+        for time in [now, now + 100, now + 125, now + 300] {
+            shared.advance(time);
+            window.refresh(time);
+            assert_eq!(window.state().visualization.bars, shared.bars());
+            assert_eq!(window.state().visualization.peaks, shared.peaks());
+        }
+    }
 }

@@ -393,8 +393,8 @@ pub fn case_visualization(skin: &Skin, namespace: &str) {
         }); 2],
         ..VisFrame::default()
     };
-    window.push_vis_frame(&scope, 44100, 1000).unwrap();
     window.set_vis_mode(VisMode::Scope);
+    window.push_vis_frame(&scope, 44100, 1000).unwrap();
     states.push(("vis_scope", window.state().clone()));
     window.set_vis_mode(VisMode::ScopeDots);
     states.push(("vis_scope_dots", window.state().clone()));

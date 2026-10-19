@@ -34,10 +34,9 @@
 //!
 //! ## Relationship to the main window's analyser
 //!
-//! The main window currently carries its own copy of this arithmetic in
-//! `rustamp-ui`. This module is the single place where the classic modes
-//! live; moving the window over to it is a separate change that also owns
-//! the window's drawing, so it is not part of this module.
+//! The main window uses this analyser through `rustamp-ui`, which supplies
+//! the transport-aware clock and draws the returned rows and trace using
+//! the skin palette. Dot versus line strokes remain a renderer choice.
 
 use std::fmt;
 
@@ -368,7 +367,7 @@ pub fn scope_trace(window: &[f32], trigger: usize) -> [f32; SCOPE_COLUMNS] {
 /// The analyser keeps no clock of its own. Every entry point takes the
 /// current time in milliseconds, so the same input always produces the same
 /// output.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Analyser {
     mode: ClassicMode,
     tuning: Tuning,
@@ -482,12 +481,16 @@ impl Analyser {
         for band in 0..SPECTRUM_BANDS {
             // While the input is fresh the bar rests on the last analysed
             // value; once it is gone the bar falls freely.
-            let bar = decay_rows(
-                self.bars[band],
-                fresh_ms,
-                self.tuning.bar_fall_rows_per_second,
-            )
-            .max(self.floors[band]);
+            let bar = if fresh_ms > 0 {
+                decay_rows(
+                    self.bars[band],
+                    fresh_ms,
+                    self.tuning.bar_fall_rows_per_second,
+                )
+                .max(self.floors[band])
+            } else {
+                self.bars[band]
+            };
             self.bars[band] = decay_rows(bar, stale_ms, self.tuning.bar_fall_rows_per_second);
             // The peak marker rests for its hold and only then falls.
             let hold_ms = self.peak_hold_until_ms[band]
@@ -671,6 +674,60 @@ mod tests {
     }
 
     #[test]
+    fn silence_and_dc_have_no_spectrum_and_plugin_spectrum_is_ignored() {
+        for dc in [0.0, -0.5, 1.0] {
+            let frame = VisFrame {
+                waveform: [[dc; VIS_SAMPLES]; 2],
+                ..VisFrame::default()
+            };
+            assert_eq!(
+                analyse(&frame, 44100).unwrap().magnitudes,
+                [0.0; SPECTRUM_BANDS]
+            );
+            assert_eq!(scope_signal(&frame), [0.0; VIS_SAMPLES]);
+        }
+        let mut frame = sine(0, 36, 0.5);
+        let expected = analyse(&frame, 44100).unwrap();
+        frame.spectrum = [[f32::NAN; VIS_SAMPLES]; 2];
+        assert_eq!(analyse(&frame, 44100).unwrap(), expected);
+    }
+
+    #[test]
+    fn independent_channels_do_not_cancel_and_two_tones_survive() {
+        let mono = sine(0, 36, 0.5);
+        let expected = analyse(&mono, 44100).unwrap().magnitudes;
+        let mut frame = mono.clone();
+        frame.waveform[1].fill(0.0);
+        assert_eq!(analyse(&frame, 44100).unwrap().magnitudes, expected);
+        frame.waveform.swap(0, 1);
+        assert_eq!(analyse(&frame, 44100).unwrap().magnitudes, expected);
+        frame = mono;
+        frame.waveform[1]
+            .iter_mut()
+            .for_each(|sample| *sample = -*sample);
+        assert_eq!(analyse(&frame, 44100).unwrap().magnitudes, expected);
+        assert_eq!(scope_signal(&frame), [0.0; VIS_SAMPLES]);
+        frame.waveform[1] = sine(0, 4, 0.25).waveform[0];
+        let two = analyse(&frame, 44100).unwrap();
+        assert!((two.magnitudes[band_of(16)] - 0.5).abs() < 0.00001);
+        assert!((two.magnitudes[band_of(144)] - 0.25).abs() < 0.00001);
+    }
+
+    #[test]
+    fn bands_cover_the_half_spectrum_once_and_nyquist_is_not_doubled() {
+        let bins: Vec<_> = BAND_EDGES
+            .windows(2)
+            .flat_map(|pair| pair[0]..pair[1])
+            .collect();
+        assert_eq!(bins, (1..=288).collect::<Vec<_>>());
+        let frame = VisFrame {
+            waveform: [std::array::from_fn(|n| if n % 2 == 0 { 0.5 } else { -0.5 }); 2],
+            ..VisFrame::default()
+        };
+        assert!((analyse(&frame, 48000).unwrap().magnitudes[band_of(288)] - 0.5).abs() < 0.00001);
+    }
+
+    #[test]
     fn the_height_law_is_the_own_d_b_scale() {
         assert_eq!(magnitude_rows(1.0), SPECTRUM_ROWS);
         assert_eq!(magnitude_rows(0.5), 14);
@@ -722,6 +779,23 @@ mod tests {
         slow.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
         slow.advance(350);
         assert_eq!(slow.bars()[band], 15, "4 rows/s over 250 ms");
+    }
+
+    #[test]
+    fn stale_floors_do_not_raise_the_bars_again_on_later_refreshes() {
+        let mut once = Analyser::default();
+        once.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
+        let mut many = once.clone();
+        once.advance(425);
+        for time in [25, 80, 100, 101, 180, 299, 300, 425] {
+            many.advance(time);
+        }
+        assert_eq!(once.bars(), many.bars());
+        assert_eq!(once.peaks(), many.peaks());
+        many.advance(2000);
+        many.advance(2001);
+        assert_eq!(many.bars(), [0; SPECTRUM_BANDS]);
+        assert_eq!(many.peaks(), [0; SPECTRUM_BANDS]);
     }
 
     #[test]
