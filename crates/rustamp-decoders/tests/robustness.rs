@@ -385,6 +385,183 @@ fn a_complete_file_ends_with_an_end_of_stream() {
 }
 
 // ---------------------------------------------------------------------------
+// MPEG audio: the Xing/Info header as a truncation oracle
+// ---------------------------------------------------------------------------
+
+/// The position of the Xing/Info tag in the MPEG fixture.
+///
+/// The first MPEG frame follows the ID3v2 tag and carries the tag behind its
+/// side information.
+fn xing_tag(bytes: &[u8]) -> usize {
+    let mut found = None;
+    for (i, window) in bytes.windows(4).enumerate() {
+        if window == b"Xing" || window == b"Info" {
+            assert!(found.is_none(), "the fixture carries more than one tag");
+            found = Some(i);
+        }
+    }
+    found.expect("the fixture carries a Xing/Info tag")
+}
+
+/// A cut MPEG file is a loud decode failure when its Xing/Info header says
+/// what the file should hold.
+///
+/// The header states the number of MPEG frames and the number of bytes the
+/// audio occupies. A file that ends before both are there was cut, and
+/// saying so is the whole point: a half-downloaded track must not play short
+/// as if it were complete.
+#[test]
+fn a_truncated_mp3_with_a_xing_header_is_a_loud_failure() {
+    let full = std::fs::read(fixture("sine.mp3")).expect("fixture");
+    // Cut in the middle of the audio data.
+    let cut = full[..full.len() * 3 / 5].to_vec();
+    assert!(cut.len() < full.len());
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("mp3")))
+        .expect("a truncated mp3 still opens");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        frames < FIXTURE_FRAMES,
+        "a truncated file must not yield the claimed {FIXTURE_FRAMES} frames: {frames}"
+    );
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => {
+            assert!(
+                message.contains("truncated"),
+                "the failure must name the truncation: {message}"
+            );
+            assert!(
+                message.contains(&format!("of the {FIXTURE_FRAMES} frames")),
+                "the failure must name the count the header declares: {message}"
+            );
+        }
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// The same rule for a file on disk: the header is read from the file, not
+/// from a stream.
+#[test]
+fn a_truncated_mp3_file_with_a_xing_header_is_a_loud_failure() {
+    let full = std::fs::read(fixture("sine.mp3")).expect("fixture");
+    let cut = full[..full.len() * 3 / 5].to_vec();
+    let file = tempfile::NamedTempFile::new().expect("temp file");
+    std::fs::write(file.path(), &cut).expect("write");
+    let mut d = SymphoniaDecoder::open(MediaSource::Path(file.path().to_path_buf()))
+        .expect("a truncated mp3 still opens");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(frames < FIXTURE_FRAMES, "only {frames} frames");
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => assert!(
+            message.contains("truncated"),
+            "the failure must name the truncation: {message}"
+        ),
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// The same file, intact: it holds everything its header declares, so it ends
+/// with a plain end of stream and the declared number of frames.
+#[test]
+fn an_intact_mp3_with_a_xing_header_ends_with_the_declared_count() {
+    let full = std::fs::read(fixture("sine.mp3")).expect("fixture");
+    let mut d = SymphoniaDecoder::open(reader_source(full, Some("mp3"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(matches!(outcome, Drained::End), "{outcome:?}");
+    assert_eq!(
+        frames, FIXTURE_FRAMES,
+        "the file holds every frame its header declares"
+    );
+}
+
+/// The limit of the rule, named so it is not mistaken for a fix.
+///
+/// Without a Xing/Info header there is no oracle: a reader can only estimate
+/// the frame count from the bitrate, and an estimate is not evidence of a cut
+/// file. A truncated MPEG file without the header therefore still ends with
+/// an end of stream, exactly as before.
+#[test]
+fn a_truncated_mp3_without_a_xing_header_still_ends_cleanly() {
+    let mut full = std::fs::read(fixture("sine.mp3")).expect("fixture");
+    // Take the tag out of the first frame: the file states nothing about
+    // what it holds any more, so the reader falls back to its estimate.
+    let tag = xing_tag(&full);
+    full[tag..tag + 4].copy_from_slice(b"XXXX");
+    let cut = full[..full.len() * 3 / 5].to_vec();
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("mp3"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "without a header there is no oracle: {outcome:?}"
+    );
+    assert!(
+        frames < FIXTURE_FRAMES,
+        "the file is cut, but nothing states what it should hold: {frames}"
+    );
+}
+
+/// A header that lies is not a cut file.
+///
+/// The frame count in the tag is larger than the file could ever hold, but
+/// the file holds every byte the tag declares: the header is wrong, the file
+/// is not cut. The byte count is what tells the two apart, so this file ends
+/// cleanly - calling it truncated would be crying wolf.
+#[test]
+fn a_xing_header_that_lies_about_the_frame_count_is_not_a_truncation() {
+    let mut full = std::fs::read(fixture("sine.mp3")).expect("fixture");
+    let tag = xing_tag(&full);
+    // The frame count follows the tag id and its flags.
+    full[tag + 8..tag + 12].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut d = SymphoniaDecoder::open(reader_source(full, Some("mp3"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "a wrong header is not a cut file: {outcome:?}"
+    );
+    assert!(
+        frames >= FIXTURE_FRAMES,
+        "the file holds all of its frames: {frames}"
+    );
+}
+
+/// The other side of the same coin: damage is not a cut file.
+///
+/// The header is intact and states the whole file, but the damage in the
+/// middle costs frames - not bytes. A damaged MPEG file therefore still
+/// ends cleanly, as it always did.
+#[test]
+fn a_damaged_mp3_with_a_xing_header_is_not_called_truncated() {
+    let mut bytes = std::fs::read(fixture("sine.mp3")).expect("fixture");
+    let len = bytes.len();
+    for b in &mut bytes[len / 2..len / 2 + 300] {
+        *b ^= 0xA5;
+    }
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("mp3"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "a damaged file is not a cut file: {outcome:?}"
+    );
+    assert!(frames > FIXTURE_FRAMES / 2, "only {frames} frames");
+}
+
+/// A seek must not turn a complete file into a truncated one.
+///
+/// After a seek the stream is read from the target, so the frames still to
+/// come are counted from there and the declared count is what is left of it.
+#[test]
+fn a_seek_in_an_intact_mp3_does_not_turn_it_into_a_truncation() {
+    let full = std::fs::read(fixture("sine.mp3")).expect("fixture");
+    let mut d = SymphoniaDecoder::open(reader_source(full, Some("mp3"))).expect("open");
+    d.seek(Duration::from_millis(500)).expect("seek");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "a seek is not a cut file: {outcome:?}"
+    );
+    assert!(frames > 0, "the rest of the file is still there");
+}
+
+// ---------------------------------------------------------------------------
 // Headers that lie about their format
 // ---------------------------------------------------------------------------
 

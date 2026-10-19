@@ -18,7 +18,8 @@
 //!   before that count is reached, the file was cut and `read` reports
 //!   [`Error::Decode`]. A file that holds everything its container declares
 //!   ends with `Ok(0)` as before. The rule is limited to the containers that
-//!   state their payload exactly (RIFF/WAVE); see [`states_frame_count`].
+//!   state their payload exactly (RIFF/WAVE, and MPEG audio with a
+//!   Xing/Info header); see [`declared_payload`].
 //! * Corrupt packets are skipped; see [`SymphoniaDecoder::skipped_packets`].
 //! * Hostile input (truncated, empty, lying headers, noise) is rejected with a
 //!   defined error or degraded to a defined end of stream; the loop in
@@ -36,7 +37,7 @@ use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::StreamInfo;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, CodecParameters, DecoderOptions};
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
@@ -228,19 +229,134 @@ pub(crate) fn frames_at(rate: u64, at: Duration) -> u64 {
     secs.saturating_add(frac)
 }
 
-/// Whether the container states the number of frames it holds.
+/// The beginning of a file, as the header parse needs it.
+struct HeaderProbe {
+    /// The length of the ID3v2 tag at the start of the file (0 when there is
+    /// none).
+    id3v2: usize,
+    /// The bytes behind that tag.
+    window: Vec<u8>,
+}
+
+/// The byte claim of a container: how many bytes the payload occupies and how
+/// many the file holds.
+#[derive(Debug, Clone, Copy)]
+struct ByteClaim {
+    /// The number of bytes the container declares.
+    declared: u64,
+    /// The number of bytes the file actually holds.
+    available: u64,
+}
+
+/// The payload a container declares.
 ///
-/// The declared frame count is the oracle for a truncated file only where the
+/// The declared frame count is the oracle for a cut file only where the
 /// container *states* it exactly. A RIFF/WAVE `data` chunk states the number
 /// of samples it holds, and raw PCM has no unit that can be lost: a damaged
-/// file changes the samples, not the frame count. Every other container this
-/// crate reads either estimates the count (MPEG audio without a Xing/LAME
-/// header), counts it differently from what it delivers (the AIFF reader
-/// includes the `SSND` header in its frame count) or can lose frames to
-/// damage without losing any (FLAC, MP4), so their count is no evidence of a
-/// cut file.
-fn states_frame_count(header: &[u8]) -> bool {
-    crate::wave_dec::is_riff_wave(header)
+/// file changes the samples, not the frame count, so a shortfall of frames is
+/// a cut file.
+///
+/// MPEG audio is different: a damaged MPEG frame is resynchronised by the
+/// reader, so a damaged file delivers fewer frames than it declares too. The
+/// Xing/Info tag states the byte count as well, and that is what tells the
+/// two apart - a cut file is short of bytes, a damaged file is short of
+/// frames only.
+///
+/// Every other container this crate reads either estimates the count (MPEG
+/// audio without a Xing/Info tag, MP4), counts it differently from what it
+/// delivers (the AIFF reader includes the `SSND` header in its frame count)
+/// or can lose frames to damage without losing any (FLAC), so their count is
+/// no evidence of a cut file.
+#[derive(Debug, Clone, Copy)]
+struct Declared {
+    /// The number of frames the container declares the file holds.
+    frames: u64,
+    /// The byte claim, when the container makes one.
+    ///
+    /// `None` when the container states no byte count: then a shortfall of
+    /// frames is a cut file on its own.
+    bytes: Option<ByteClaim>,
+}
+
+/// The payload the container declares, if it states one exactly.
+///
+/// `header` is the beginning of the file, `params` the codec parameters the
+/// container reader reported and `byte_len` the length of the file.
+fn declared_payload(
+    header: &HeaderProbe,
+    params: &CodecParameters,
+    byte_len: Option<u64>,
+) -> Option<Declared> {
+    if crate::wave_dec::is_riff_wave(&header.window) {
+        // The `data` chunk states the number of samples it holds. Damaged
+        // samples are still samples, so a shortfall of frames can only mean
+        // that the file was cut.
+        return params.n_frames.map(|frames| Declared {
+            frames,
+            bytes: None,
+        });
+    }
+    // MPEG audio: the Xing/Info tag states the frame count and the byte count
+    // of the audio data.
+    let xing = crate::mpeg_header::parse(header.id3v2, &header.window)?;
+    let trim = u64::from(params.delay.unwrap_or(0)) + u64::from(params.padding.unwrap_or(0));
+    let frames = u64::from(xing.frames)
+        .saturating_mul(xing.samples_per_frame)
+        .saturating_sub(trim);
+    // The container reader states the same number when it read the same tag.
+    // If it does not, it fell back to its own estimate - and an estimate is
+    // not evidence of a cut file.
+    if params.n_frames != Some(frames) {
+        return None;
+    }
+    let byte_len = byte_len?;
+    Some(Declared {
+        frames,
+        bytes: Some(ByteClaim {
+            declared: u64::from(xing.bytes),
+            available: byte_len.saturating_sub(xing.start),
+        }),
+    })
+}
+
+/// How many bytes of the file the header parse reads.
+///
+/// The Xing/Info tag sits behind the side information of the first MPEG
+/// frame: the frame header, the side information and the tag itself.
+const HEADER_WINDOW: usize = 512;
+
+/// Reads the bytes behind an ID3v2 tag, with the length of that tag.
+///
+/// The tag is skipped, not read: it can be large (cover art) and the header
+/// parse only needs the bytes behind it. The reader is left where it was
+/// found.
+fn header_probe(reader: &mut dyn ReadSeek) -> HeaderProbe {
+    let mut head = [0u8; 10];
+    if reader.read_exact(&mut head).is_err() {
+        return HeaderProbe {
+            id3v2: 0,
+            window: Vec::new(),
+        };
+    }
+    let id3v2 = crate::mpeg_header::id3v2_len(&head);
+    if reader.seek(SeekFrom::Start(id3v2 as u64)).is_err() {
+        return HeaderProbe {
+            id3v2,
+            window: Vec::new(),
+        };
+    }
+    let mut window = vec![0u8; HEADER_WINDOW];
+    let mut filled = 0;
+    while filled < window.len() {
+        match reader.read(&mut window[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    window.truncate(filled);
+    HeaderProbe { id3v2, window }
 }
 
 /// Queues a detected mid-stream format change.
@@ -286,11 +402,11 @@ pub struct SymphoniaDecoder {
     pending_format_change: Option<AudioSpec>,
     /// Frames handed out since the last seek.
     delivered: u64,
-    /// The frame count the container states, when it states an exact one.
+    /// The payload the container states, when it states an exact one.
     ///
     /// `None` means "no oracle": either the container does not state a count
-    /// or it states an estimate (see [`states_frame_count`]).
-    declared_frames: Option<u64>,
+    /// or it states an estimate (see [`declared_payload`]).
+    declared: Option<Declared>,
     /// A truncation found at the end of the stream.
     ///
     /// Reported by the next `read` that writes no frames, so the frames that
@@ -305,31 +421,36 @@ pub struct SymphoniaDecoder {
 
 impl SymphoniaDecoder {
     /// Open a decoder for `source` (`Path` or `Reader`).
-    pub fn open(mut source: MediaSource) -> Result<Self> {
+    pub fn open(source: MediaSource) -> Result<Self> {
         let ext = source.extension();
-        // The container's own signature, read before the source is handed to
-        // symphonia: it decides whether the frame count the container states
-        // is an oracle for a cut file (see [`states_frame_count`]).
-        let header = source.sniff(12).unwrap_or_default();
-        let (mss, byte_len) = match source {
+        // The container's own header, read before the source is handed to
+        // symphonia: it decides whether the payload the file declares is an
+        // oracle for a cut file (see [`declared_payload`]).
+        let (mss, byte_len, header) = match source {
             MediaSource::Url(_) => {
                 return Err(Error::Unsupported(
                     "URL sources are not supported yet; network streaming comes in M4",
                 ));
             }
             MediaSource::Path(p) => {
-                let f = File::open(&p)?;
+                let mut f = File::open(&p)?;
                 let len = f.metadata().ok().map(|m| m.len());
+                let header = header_probe(&mut f);
+                // The file is the source: it starts at the beginning.
+                f.seek(SeekFrom::Start(0))?;
                 let mss = MediaSourceStream::new(Box::new(f), MediaSourceStreamOptions::default());
-                (mss, len)
+                (mss, len, header)
             }
             MediaSource::Reader { mut reader, .. } => {
                 let len = reader.seek(SeekFrom::End(0)).ok();
                 reader.seek(SeekFrom::Start(0))?;
+                let header = header_probe(&mut *reader);
+                // The reader is the source: it starts at the beginning.
+                reader.seek(SeekFrom::Start(0))?;
                 let src = ReaderSource { inner: reader, len };
                 let mss =
                     MediaSourceStream::new(Box::new(src), MediaSourceStreamOptions::default());
-                (mss, len)
+                (mss, len, header)
             }
         };
 
@@ -389,7 +510,7 @@ impl SymphoniaDecoder {
             seek_target: None,
             pending_format_change: None,
             delivered: 0,
-            declared_frames: params.n_frames.filter(|_| states_frame_count(&header)),
+            declared: declared_payload(&header, &params, byte_len),
             truncation: None,
             skipped: 0,
             consecutive_errors: 0,
@@ -522,23 +643,37 @@ impl SymphoniaDecoder {
         }
     }
 
-    /// Records that the stream ended before the container's declared frame
-    /// count was reached: the file was cut, not finished.
+    /// Records that the stream ended before the container's declared payload
+    /// was delivered: the file was cut, not finished.
     ///
     /// Only a container that states an exact frame count can say this (see
-    /// [`states_frame_count`]); without that oracle the end of the stream
-    /// stays an end of stream.
+    /// [`declared_payload`]); without that oracle the end of the stream stays
+    /// an end of stream.
     fn note_truncation(&mut self) {
-        let Some(declared) = self.declared_frames else {
+        let Some(declared) = &self.declared else {
             return;
         };
-        if self.delivered >= declared {
+        if self.delivered >= declared.frames {
             return;
         }
-        self.truncation = Some(format!(
-            "truncated stream: the file ends after {} of the {} frames its container declares",
-            self.delivered, declared
-        ));
+        // The frames are short. That is a cut file only when the bytes are
+        // missing as well: a damaged file delivers fewer frames than it
+        // declares too, but it holds all of its bytes.
+        if let Some(bytes) = &declared.bytes
+            && bytes.available >= bytes.declared
+        {
+            return;
+        }
+        self.truncation = Some(match &declared.bytes {
+            Some(bytes) => format!(
+                "truncated stream: the file ends after {} of the {} frames its Xing/Info header declares and holds {} of the {} bytes it declares",
+                self.delivered, declared.frames, bytes.available, bytes.declared
+            ),
+            None => format!(
+                "truncated stream: the file ends after {} of the {} frames its container declares",
+                self.delivered, declared.frames
+            ),
+        });
     }
 
     fn note_skip(&mut self) -> Result<()> {
@@ -662,9 +797,9 @@ impl Decoder for SymphoniaDecoder {
         // truncated one.
         self.delivered = 0;
         self.truncation = None;
-        if let Some(declared) = self.declared_frames {
+        if let Some(declared) = &mut self.declared {
             let target = seeked.required_ts.saturating_add(pre);
-            self.declared_frames = Some(declared.saturating_sub(target));
+            declared.frames = declared.frames.saturating_sub(target);
         }
         Ok(self.spec.duration_of(target_frames))
     }
@@ -885,21 +1020,94 @@ mod tests {
     // B2: hostile input, error classification and format changes
     // -----------------------------------------------------------------------
 
-    /// The frame count is an oracle for a cut file only where the container
-    /// states it exactly: a RIFF/WAVE `data` chunk does, the others do not.
+    /// The declared payload is the oracle for a cut file only where the
+    /// container states it exactly: a RIFF/WAVE `data` chunk does, the other
+    /// containers do not.
     #[test]
-    fn only_containers_that_state_the_frame_count_are_checked() {
+    fn only_containers_that_state_their_payload_are_checked() {
         let mut wave = b"RIFF".to_vec();
         wave.extend_from_slice(&0u32.to_le_bytes());
         wave.extend_from_slice(b"WAVEfmt ");
-        assert!(states_frame_count(&wave));
-        assert!(!states_frame_count(b"fLaC\0\0\0\0\0\0\0\0"));
-        assert!(!states_frame_count(b"ID3\0\0\0\0\0\0\0\0\0"));
+        let mut params = CodecParameters::new();
+        params.with_n_frames(8000);
+        let declared = declared_payload(
+            &HeaderProbe {
+                id3v2: 0,
+                window: wave.clone(),
+            },
+            &params,
+            Some(4096),
+        )
+        .expect("a wav states its payload");
+        assert_eq!(declared.frames, 8000);
+        assert!(
+            declared.bytes.is_none(),
+            "a wav states no byte count: a damaged sample is still a sample"
+        );
+
         // A RIFF container that is not WAVE is not a WAV file.
         let mut avi = b"RIFF".to_vec();
         avi.extend_from_slice(&0u32.to_le_bytes());
         avi.extend_from_slice(b"AVI LIST");
-        assert!(!states_frame_count(&avi));
+        assert!(
+            declared_payload(
+                &HeaderProbe {
+                    id3v2: 0,
+                    window: avi,
+                },
+                &params,
+                Some(4096)
+            )
+            .is_none()
+        );
+
+        // A FLAC file states its frame count, but a damaged FLAC frame is
+        // resynchronised by the reader, so its count is no evidence of a cut
+        // file.
+        assert!(
+            declared_payload(
+                &HeaderProbe {
+                    id3v2: 0,
+                    window: b"fLaC\0\0\0\0\0\0\0\0".to_vec(),
+                },
+                &params,
+                Some(4096)
+            )
+            .is_none()
+        );
+    }
+
+    /// An MPEG file with a Xing/Info tag states its frame count *and* its byte
+    /// count: that is the oracle for a cut MPEG file.
+    #[test]
+    fn an_mpeg_file_with_a_xing_header_states_its_payload() {
+        // A MPEG 1 layer III stereo frame with a Xing tag behind its side
+        // information: 59 frames of 1152 samples in 12_537 bytes.
+        let mut window = vec![0xFF, 0xFB, 0x90, 0x00];
+        window.extend_from_slice(&[0u8; 32]);
+        window.extend_from_slice(b"Xing");
+        window.extend_from_slice(&0x03u32.to_be_bytes());
+        window.extend_from_slice(&59u32.to_be_bytes());
+        window.extend_from_slice(&12_537u32.to_be_bytes());
+        let header = HeaderProbe { id3v2: 0, window };
+
+        let mut params = CodecParameters::new();
+        params.with_n_frames(59 * 1152 - 1105 - 713);
+        // The LAME extension of the tag states the encoder delay and padding.
+        params.with_delay(1105);
+        params.with_padding(713);
+        let declared = declared_payload(&header, &params, Some(12_537))
+            .expect("the tag states the payload of the file");
+        assert_eq!(declared.frames, 59 * 1152 - 1105 - 713);
+        let bytes = declared.bytes.expect("the tag states the byte count too");
+        assert_eq!(bytes.declared, 12_537);
+        assert_eq!(bytes.available, 12_537);
+
+        // A reader that fell back to its own estimate states another number.
+        // An estimate is not evidence of a cut file.
+        let mut estimated = CodecParameters::new();
+        estimated.with_n_frames(69_120);
+        assert!(declared_payload(&header, &estimated, Some(12_537)).is_none());
     }
 
     /// A decoded-buffer stand-in with `frames` frames and `channels` channels,
