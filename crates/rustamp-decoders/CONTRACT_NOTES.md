@@ -12,14 +12,35 @@ Behaviour the core contract leaves open, and what the decoders do.
   cannot be continued, so the stream ends (`read` returns `Ok(0)`) as C3.4
   requires.
 - **Truncation.** A file that was cut short is a decode failure, not an end of
-  stream. The oracle is the frame count the container states: when the stream
-  ends before that count was delivered, `read` fails with
+  stream. The oracle is the payload the container states: when the stream
+  ends before that payload was delivered, `read` fails with
   `Error::Decode("truncated stream: ...")` in a call that writes no frames, so
   the frames the file does hold are still delivered. A file that holds
   everything its container declares ends with `Ok(0)` as before. The check
-  applies to the containers that state their payload exactly - RIFF/WAVE, whose
-  `data` chunk states the number of samples - and to no other (see the named
-  limits below).
+  applies to the containers that state their payload exactly:
+  - **RIFF/WAVE**: the `data` chunk states the number of samples it holds.
+    A damaged sample is still a sample, so a shortfall of frames can only
+    mean that the file was cut.
+  - **MPEG audio with a Xing/Info header**: the tag states the number of MPEG
+    frames *and* the number of bytes the audio occupies (see below). Both
+    are needed: a damaged MPEG frame is resynchronised by the reader, so a
+    damaged file delivers fewer frames than it declares as well - but it holds
+    all of its bytes. A file that is short of frames *and* of bytes was cut; a
+    file that is short of frames only is damaged and keeps playing.
+- **The MPEG audio header** (`mpeg_header.rs`). An MPEG audio file may carry a
+  **Xing** (variable bitrate) or **Info** (constant bitrate) tag in its first
+  frame, behind the side information. The tag states the number of MPEG frames
+  (the frame that carries the tag is not counted: it holds the tag, not
+  audio) and the number of bytes the audio occupies. Both are read from the
+  file itself, and the frame count is turned into a sample count the way the
+  container reader does it: frames times the samples per frame, less the
+  encoder delay and padding of the LAME extension. The reader's own count has
+  to agree with that: a reader that fell back to its bitrate estimate states
+  another number, and an estimate is not evidence of a cut file - then there is
+  no oracle and the file ends as it always did.
+  The byte count is not an exact length (some encoders count the tag frame
+  with the audio, some do not), so it is only used as evidence that bytes are
+  missing: a file that holds fewer bytes than the tag declares was cut.
 - **Seek.** `SeekMode::Accurate` plus a 4096-frame pre-roll that is decoded and
   discarded, because MP3/Vorbis/AAC need previous blocks for exact output.
   Returns the requested position clamped to the duration (it is sample exact).
@@ -43,8 +64,11 @@ Behaviour the core contract leaves open, and what the decoders do.
   `Unsupported` to `Error::Decode` while keeping the message, because a
   container that was accepted is ours, damaged — not foreign.
 - **Bitrate** is the file average (file size / duration), not instantaneous.
-- **Duration** is `None` when the container gives no frame count (e.g. MP3
-  without a Xing/Info header, or any source whose length cannot be read).
+- **Duration** is `None` when the container gives no frame count (any source
+  whose length cannot be read). Where the container only *estimates* the count
+  (an MP3 without a Xing/Info header, an estimate from the bitrate), the
+  estimate is used for the duration: good enough for a display, and no
+  evidence at all that the file was cut.
 
 ## Wave decoder (`wave_dec.rs`)
 
@@ -90,17 +114,19 @@ Distinctions the decoders still cannot make, named so they are not mistaken for
 correct behaviour:
 
 1. **A truncated stream is no longer indistinguishable from a clean end** (both
-   decoders). The decoders compare the frames they delivered with the frame
-   count the container states and report a shortfall as `Error::Decode`, so a
-   cut file fails loudly instead of playing short. The remaining limit is
-   where no such oracle exists: the count is only evidence of a cut file when
-   the container states it exactly (a RIFF/WAVE `data` chunk does). The MPEG
-   audio reader only estimates its frame count when the file carries no
-   Xing/LAME header, the AIFF reader counts the `SSND` header into its frame
-   count, and the FLAC and MP4 readers resynchronise damaged frames without
-   counting them - so a truncated file of those kinds still ends with an end of
-   stream. The wave decoder has no such limit: it parses the `data` chunk
-   itself and compares the declared length with the bytes that are there.
+   decoders). The decoders compare the frames they delivered with the payload
+   the container states and report a shortfall as `Error::Decode`, so a cut
+   file fails loudly instead of playing short. The remaining limit is where no
+   such oracle exists: the count is only evidence of a cut file when the
+   container states it exactly. RIFF/WAVE does (its `data` chunk states the
+   number of samples), and so does MPEG audio whose file carries a Xing/Info
+   header - there the byte count of the header tells a cut file from a
+   damaged one. The MPEG audio reader only estimates its frame count when the
+   file carries no such header, the AIFF reader counts the `SSND` header into
+   its frame count, and the FLAC and MP4 readers resynchronise damaged frames
+   without counting them - so a truncated file of those kinds still ends with
+   an end of stream. The wave decoder has no such limit: it parses the `data`
+   chunk itself and compares the declared length with the bytes that are there.
 2. **A damaged file whose *content signature* matches is reported as
    `UnsupportedFormat`** (symphonia). The signature tells the factory to hand the
    file to symphonia; when the probe then rejects the body, nothing is open yet,
@@ -130,6 +156,15 @@ correct behaviour:
    stream that really carries no audio is reported as
    `Error::Decode("stream contains no audio")`. The wave decoder refuses a
    `fmt ` chunk with zero channels at open time instead.
+6. **A cut MPEG file is only a loud failure when its header states both
+   counts** (symphonia). A Xing/Info tag that states the frame count but not
+   the byte count is no oracle: a damaged MPEG file delivers fewer frames
+   than it declares too, and without the byte count the two cannot be told
+   apart. The same holds when the reader and this crate do not read the same
+   header (a first frame with a CRC, for example): the reader's estimate is
+   not evidence, so such a file ends as it always did. A header that lies
+   about the frame count while the file holds every byte it declares is not
+   a cut file either - it ends cleanly, like the damaged file it resembles.
 
 ## Proposals
 
