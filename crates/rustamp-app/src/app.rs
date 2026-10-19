@@ -54,7 +54,9 @@ use rustamp_ui::{
 };
 
 use crate::cli::OutputChoice;
-use crate::host::{HostStateLink, PollOutcome, PublishOutcome, player_state_message};
+use crate::host::{
+    CommandOutcome, HostStateLink, PollOutcome, PublishOutcome, player_state_message,
+};
 use crate::output::create_output;
 use crate::routing;
 use crate::skin::{LoadedSkin, SkinChoice, load as load_skin};
@@ -1404,6 +1406,37 @@ impl App {
         self.host.poll()
     }
 
+    /// Ask the plugin host to open the visualization plug-in's configuration
+    /// dialog (RFC 0005 §5.4, the player -> host direction).
+    ///
+    /// The plug-in runs in `rustamp-plughost32.exe` and only the host's UI
+    /// thread may call into a plug-in (S09 §3.5), so the app sends
+    /// [`Message::CommandToHost(Command::ConfigureVisPlugin`)] over the
+    /// existing control channel instead of opening the dialog itself (see
+    /// [`crate::host`]).
+    ///
+    /// The request is never dropped silently: a missing or dead host is
+    /// reported to the user as a note, the same way an unimplemented command
+    /// is.
+    fn request_vis_plugin_configuration(&mut self) {
+        match self.host.send_command(Command::ConfigureVisPlugin) {
+            CommandOutcome::Sent => self.note(
+                "the visualization plug-in's configuration was requested from the plugin host"
+                    .to_string(),
+            ),
+            CommandOutcome::Detached => self.note(
+                "no plugin host is attached: the visualization plug-in's configuration \
+                 was not opened"
+                    .to_string(),
+            ),
+            CommandOutcome::HostGone => self.note(
+                "the plugin host is gone: the visualization plug-in's configuration \
+                 was not opened"
+                    .to_string(),
+            ),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // UI input (the window forwards OS input here)
     // -----------------------------------------------------------------------
@@ -1935,8 +1968,17 @@ impl App {
             }
             // RFC 0018: Alt+Delete removes the entries whose file is gone.
             C::RemoveDeadFiles => self.remove_dead_files(),
-            C::ConfigureVisPlugin | C::ToggleVisPlugin => {
-                self.note(format!("{command:?} needs the plugin host (M3)"));
+            // RFC 0005 §5.4: the visualization plug-in lives in the plugin
+            // host, so the request travels to the host (see `crate::host`).
+            C::ConfigureVisPlugin => self.request_vis_plugin_configuration(),
+            C::ToggleVisPlugin => {
+                // The host has no start/stop path yet: only the configure
+                // request is routed (RFC 0005 §5.4 defers the rest to M3).
+                self.note(
+                    "ToggleVisPlugin is not implemented by the plugin host yet \
+                     (only the configure request is routed)"
+                        .to_string(),
+                );
             }
             // The remaining variants are the engine's (see `routing::app_owns`).
             _ => {}
@@ -3240,6 +3282,65 @@ mod tests {
         assert!(!app.host_attached());
         app.stop_host();
         assert!(!app.host_attached());
+    }
+
+    #[test]
+    fn the_configure_vis_action_asks_the_plugin_host_over_the_control_channel() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+
+        // Alt+K is the measured shortcut for "Configure plug-in..." (40221).
+        let outcome = app.key_down(Key::Letter(b'K'), Modifiers::ALT).unwrap();
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::ConfigureVisPlugin]))
+        );
+
+        // Exactly one request crossed the channel. The pump's own frames
+        // (the greeting, the state snapshot) are not requests.
+        let mut requests = 0;
+        while let Ok(Some(message)) = host_end.try_recv() {
+            if message == Message::CommandToHost(Command::ConfigureVisPlugin) {
+                requests += 1;
+            }
+        }
+        assert_eq!(requests, 1, "exactly one configure request went out");
+    }
+
+    #[test]
+    fn without_a_plugin_host_the_configure_request_is_reported_not_dropped() {
+        let (mut app, _dir) = app_with_file(None);
+        assert!(!app.host_attached());
+
+        app.apply(&Command::ConfigureVisPlugin);
+
+        // The request could not go anywhere, and the user is told so.
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("no plugin host is attached")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn the_toggle_vis_action_still_reports_that_the_host_cannot_do_it_yet() {
+        let (mut app, _dir) = app_with_file(None);
+
+        app.apply(&Command::ToggleVisPlugin);
+
+        // The host has no start/stop path: the request is not sent anywhere.
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("not implemented by the plugin host")),
+            "{notes:?}"
+        );
     }
 
     // ----- the equalizer window (S07; headless, no window opened) -----
