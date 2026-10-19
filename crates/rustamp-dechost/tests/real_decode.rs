@@ -32,7 +32,9 @@
 //! is nothing missing). A container whose reader scans the whole file before
 //! it plays anything (MP4) refuses a cut file when it is opened instead:
 //! that terminal is a refusal with the same diagnostic, and it is pinned
-//! separately.
+//! separately. A file that cannot be decoded at all (a FLAC file without a
+//! `STREAMINFO` block, which states no audio parameters) is refused the same
+//! way, and the refusal names what is missing.
 
 #![cfg(windows)]
 
@@ -592,6 +594,63 @@ fn a_truncated_mp4_is_refused_at_the_open_and_never_ends_the_stream() {
     };
     assert!(
         error.to_string().contains("truncated"),
+        "the refusal must carry the resident's reason: {error}"
+    );
+    result
+        .recv_timeout(JOIN_WAIT)
+        .expect("host must end after a failed open instead of stalling")
+        .expect_err("a failed open must end the host with an error");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A FLAC file without a `STREAMINFO` block is refused at the open, and the
+/// refusal names the missing block.
+///
+/// The `STREAMINFO` block of the metadata chain is the one that states the
+/// audio parameters. A file without it has nothing to decode: the reader
+/// cannot recognise a frame without them and runs into the end of the file,
+/// which it reports as an end of stream - for a file that is not at its end.
+/// The decoder names the missing block instead, and that name is what the
+/// player sees: a loud refusal, never an end of stream.
+#[test]
+fn a_flac_without_a_stream_info_block_is_refused_at_the_open_and_never_ends_the_stream() {
+    let bytes = std::fs::read(repo_fixture("sine.flac")).expect("fixture");
+    // The type byte of the first metadata block: the `STREAMINFO` block
+    // becomes a block of a type the reader does not know, so the file states
+    // no audio parameters. The rest of the file is untouched.
+    let mut without = bytes.clone();
+    without[4] = 126;
+    let path = temp_file("no-stream-info.flac", &without);
+
+    // The in-process reference: the file is refused when it is opened, and
+    // the refusal names the missing block.
+    let error = rustamp_decoders::default_registry()
+        .open(MediaSource::Path(path.clone()))
+        .err()
+        .expect("a FLAC file without a STREAMINFO block must not open");
+    assert!(
+        error.to_string().contains("STREAMINFO"),
+        "the refusal must name the missing block: {error}"
+    );
+
+    // The hosted path: the session never opens, so the player sees a loud
+    // refusal and never an end of stream.
+    let ((ar, aw), (br, bw)) = streams();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        let outcome = serve_decoder(&host, &NamedPcmRings, &RegistryResident);
+        let _ = done.send(outcome);
+    });
+    let outcome = DecoderSession::open(client, NamedPcmRings, file_location(&path), 3);
+    let Err(error) = outcome else {
+        panic!(
+            "a FLAC file without a STREAMINFO block must be a loud refusal, never an accepted session"
+        );
+    };
+    assert!(
+        error.to_string().contains("STREAMINFO"),
         "the refusal must carry the resident's reason: {error}"
     );
     result

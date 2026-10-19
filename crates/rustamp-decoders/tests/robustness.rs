@@ -350,6 +350,12 @@ fn a_truncated_wav_is_a_loud_failure_and_not_an_end_of_stream() {
 /// frame is resynchronised by the container reader, so a corrupt file
 /// delivers fewer frames than it declares too. A frame count cannot tell the
 /// two apart, so a truncated FLAC is not called truncated.
+///
+/// The *metadata* of a FLAC file is a different matter: the chain of
+/// metadata blocks states the length of every block, so a file that ends
+/// inside the chain is named as a cut (see
+/// `a_flac_with_a_cut_metadata_chain_is_named_as_a_truncation`). What has no
+/// oracle is the audio behind the chain.
 #[test]
 fn a_truncated_flac_is_not_mistaken_for_a_cut_file() {
     let full = std::fs::read(fixture("sine.flac")).expect("fixture");
@@ -596,16 +602,16 @@ fn a_flac_whose_stream_info_lies_about_the_sample_count_is_not_a_cut_file() {
     assert_eq!(frames, FIXTURE_FRAMES, "the file holds all of its frames");
 }
 
-/// A FLAC file without a `STREAMINFO` block cannot be decoded.
+/// A FLAC file without a `STREAMINFO` block is refused by name.
 ///
 /// The block is the one that states the audio parameters, so a file without
 /// it has nothing to decode: the reader cannot recognise a frame without them
-/// and runs into the end of the file. The file is refused with a defined
-/// error - never a panic, never a hang.
+/// and runs into the end of the file. The reader's bare "end of stream" named
+/// the wrong problem for a file that is not at its end, so the decoder names
+/// the missing block instead.
 ///
-/// What the refusal *says* is the container reader's business: it reports the
-/// end of the stream, which for a file that is not at its end is a poor
-/// diagnosis. The refusal itself is the documented behaviour.
+/// The refusal itself is the documented behaviour: a defined error, never a
+/// panic, never a hang.
 #[test]
 fn a_flac_without_a_stream_info_block_is_refused() {
     let mut bytes = std::fs::read(fixture("sine.flac")).expect("fixture");
@@ -615,6 +621,99 @@ fn a_flac_without_a_stream_info_block_is_refused() {
         .err()
         .expect("a FLAC file without a STREAMINFO block cannot be decoded");
     assert_defined_open_failure(&err, "a FLAC file without a STREAMINFO block");
+    assert!(
+        matches!(&err, Error::Decode(message) if message.contains("the FLAC file has no STREAMINFO block")),
+        "the refusal must name the missing block: {err:?}"
+    );
+}
+
+/// A FLAC file whose metadata chain was cut is named as a truncation.
+///
+/// The chain of metadata blocks states the length of every block, so a file
+/// that ends inside one was cut: it is not at its end, and an end of stream
+/// would be a lie. The decoder names the cut instead of letting the reader's
+/// bare "end of stream" stand.
+#[test]
+fn a_flac_with_a_cut_metadata_chain_is_named_as_a_truncation() {
+    let full = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let (_, at, len) = flac_metadata(&full)[0];
+    // Cut inside the payload of the first metadata block: its header claims
+    // `len` bytes, the file holds half of them.
+    let cut = full[..at + len / 2].to_vec();
+    let err = SymphoniaDecoder::open(reader_source(cut, Some("flac")))
+        .err()
+        .expect("a FLAC file with a cut metadata chain cannot be decoded");
+    match err {
+        Error::Decode(message) => {
+            assert!(
+                message.contains("truncated"),
+                "the failure must name the truncation: {message}"
+            );
+            assert!(
+                message.contains("metadata blocks"),
+                "the failure must name the metadata chain: {message}"
+            );
+            assert!(
+                message.contains(&format!("claims {len} bytes")),
+                "the failure must name the claim of the cut block: {message}"
+            );
+        }
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// A FLAC file that ends between two metadata blocks was cut as well.
+///
+/// The chain says there is another block and there is none: the file is not
+/// at its end, and the reader's end of stream would be a lie.
+#[test]
+fn a_flac_that_ends_between_two_metadata_blocks_is_named_as_a_truncation() {
+    let full = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let (_, at, len) = flac_metadata(&full)[0];
+    // The first block ends here; the header of the next one is gone.
+    let cut = full[..at + len].to_vec();
+    let err = SymphoniaDecoder::open(reader_source(cut, Some("flac")))
+        .err()
+        .expect("a FLAC file with a cut metadata chain cannot be decoded");
+    match err {
+        Error::Decode(message) => {
+            assert!(
+                message.contains("truncated"),
+                "the failure must name the truncation: {message}"
+            );
+            assert!(
+                message.contains(&format!("no block header at offset {}", at + len)),
+                "the failure must name the missing block header: {message}"
+            );
+        }
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// The probe of another format is left alone.
+///
+/// A file that is not a FLAC file has no metadata chain, so the FLAC probe
+/// has nothing to say about it: its own container names the problem.
+#[test]
+fn a_file_that_is_not_a_flac_is_not_named_as_one() {
+    let full = std::fs::read(fixture("sine.mp3")).expect("fixture");
+    let cut = full[..full.len() * 3 / 5].to_vec();
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("mp3")))
+        .expect("a truncated mp3 still opens");
+    let (_, outcome) = drain_bounded(&mut d);
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => {
+            assert!(
+                message.contains("truncated"),
+                "the failure must name the truncation: {message}"
+            );
+            assert!(
+                !message.contains("FLAC"),
+                "the FLAC probe must not touch another format: {message}"
+            );
+        }
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
 }
 
 /// A metadata block the reader does not know is skipped.

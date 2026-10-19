@@ -43,7 +43,29 @@ Behaviour the core contract leaves open, and what the decoders do.
   by the reader (its CRC-16 does not match) while the reader resynchronises at
   the next frame. A corrupt file is therefore short of samples exactly like a
   cut one, and it holds all of its bytes - the shortfall proves nothing. A
-  truncated FLAC file still ends with an end of stream.
+  truncated FLAC file still ends with an end of stream. The *metadata* of a
+  FLAC file is a different matter - see below.
+- **The FLAC metadata** (`flac_header.rs`). A FLAC file is the `fLaC` marker,
+  a chain of metadata blocks and then the audio frames. Every block starts
+  with a header of four bytes: one type byte (bit 7 marks the last block of
+  the chain, bits 0 to 6 are the type) and a 24 bit big endian length of the
+  payload. The chain is read from the file itself, because a block can be
+  larger than any header window, and it says two things:
+  - The chain holds the **`STREAMINFO` block** (type 0), the one that states
+    the audio parameters. A file without it has nothing to decode: the reader
+    cannot recognise a frame without the parameters and runs into the end of
+    the file, which it reports as an end of stream - for a file that is not
+    at its end. The decoder refuses such a file when it is opened and names
+    the missing block: `Error::Decode("the FLAC file has no STREAMINFO
+    block")`.
+  - The chain states the **length of every block**, so a file that ends
+    inside one was cut. That is a truncation and not an end of stream, and
+    the decoder names it when the file is opened:
+    `Error::Decode("truncated stream: the FLAC file ends inside its metadata
+    blocks (...)")`. The message states where the cut is and what the cut
+    block claims.
+  What the chain does **not** state is the length of the audio, so the audio
+  behind it keeps the honest end of stream (see the named collapse below).
 - **The MPEG audio header** (`mpeg_header.rs`). An MPEG audio file may carry a
   **Xing** (variable bitrate) or **Info** (constant bitrate) tag in its first
   frame, behind the side information. The tag states the number of MPEG frames
@@ -277,6 +299,10 @@ correct behaviour:
    close to its own size), so it fires for some cuts and not for others, and
    a loud failure on such a threshold would be an unstable promise. It is
    therefore not implemented, and the honest end of stream stays.
+   The limit covers the **audio** only. The metadata chain in front of it
+   states the length of every block, so a file that ends inside the chain is
+   named as a cut when it is opened, and a file without a `STREAMINFO` block
+   is named as undecodable.
 9. **An MP4 file is only a loud failure when its own boxes agree** (symphonia).
    MP4/M4A states its payload exactly, so it has an oracle - but the oracle
    needs the boxes to agree with each other and with the reader:
