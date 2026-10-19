@@ -125,6 +125,13 @@ $genFixtureStaged = $false
 $outFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\out_rustamp_fixture.dll'
 $outFixtureStaged = $false
 
+# The input plugin fixture (crates/rustamp-plughost/examples/in_rustamp_fixture.rs)
+# is the same kind of artifact for the `in_` plugin kind: our own clean-room
+# cdylib, built for i686 by the same test build, loaded through the OS loader.
+# It opens no window and no audio device.
+$inFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\in_rustamp_fixture.dll'
+$inFixtureStaged = $false
+
 # The visualization and DSP fixtures (crates/rustamp-plughost/examples/
 # vis_rustamp_fixture.rs and dsp_rustamp_fixture.rs) are the same kind of
 # artifact for the `vis_` and `dsp_` plugin kinds: own clean-room cdylibs,
@@ -208,6 +215,7 @@ if (-not $SkipBuild) {
     # the staged tree is the ground truth here.
     $genFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\gen_rustamp_fixture.dll')
     $outFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\out_rustamp_fixture.dll')
+    $inFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\in_rustamp_fixture.dll')
     $crashFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\crash_rustamp_fixture.dll')
     Write-Host ("    verified {0} staged files against the complete receipt and current workspace/runtime inputs" -f $receipt.files.Count)
 }
@@ -318,6 +326,16 @@ if (Test-Path $outFixtureDll) {
     Write-Host '    staged the i686 output plugin fixture beside the binaries'
 } else {
     Write-Host '    WARNING: no i686 output plugin fixture was built; its acceptance test will report it blocked'
+}
+
+# The input plugin fixture travels with the test binaries for the same reason.
+if (Test-Path $inFixtureDll) {
+    Copy-Item $inFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
+    Copy-Item $inFixtureDll $i686TargetDeps -Force
+    $inFixtureStaged = $true
+    Write-Host '    staged the i686 input plugin fixture beside the binaries'
+} else {
+    Write-Host '    WARNING: no i686 input plugin fixture was built; its acceptance test will report it blocked'
 }
 
 # The visualization and DSP plugin fixtures travel with the test binaries too.
@@ -598,6 +616,14 @@ if ($outFixtureStaged) {
 } else {
     Write-Host 'out plugin fixture: NOT STAGED (the i686 build produced no output fixture); its acceptance test refuses loudly and proves nothing in this run'
 }
+# Input plugin fixture status (P3): the same kind of own cdylib, for the
+# `in_` plugin kind. It needs no third-party DLL either.
+if ($inFixtureStaged) {
+    $inFixturePath = if (Test-Path $inFixtureDll) { $inFixtureDll } else { Join-Path $Stage 'target\debug\deps\in_rustamp_fixture.dll' }
+    Write-Host ('in plugin fixture: staged (our own i686 cdylib, SHA-256 {0})' -f (Get-FileHash -LiteralPath $inFixturePath -Algorithm SHA256).Hash)
+} else {
+    Write-Host 'in plugin fixture: NOT STAGED (the i686 build produced no input fixture); its acceptance test refuses loudly and proves nothing in this run'
+}
 # Crashing plugin fixture status (PLAN M3, crash isolation): the same kind of
 # own cdylib, built by the i686 test build and copied into the stage with the
 # test binaries. It faults on purpose, so it only ever runs in the guest.
@@ -686,6 +712,7 @@ if ($Filter -like '--ignored*') {
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'real_dsp_plugin_loads_initializes_and_changes_audio_through_the_bridge'; Fixture = 'dsp' },
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'a_real_general_purpose_plugin_is_loaded_answers_from_its_own_code_and_quits_cleanly'; Fixture = 'gen' },
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'the_real_host_process_loads_a_general_purpose_dll_and_quits_it_cleanly'; Fixture = 'gen' },
+        [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'a_real_input_plugin_is_loaded_filled_plays_and_quits_cleanly'; Fixture = 'in' },
 
         # Group E — Real audio endpoint (2 tests - left out pending decision)
         [pscustomobject]@{ Group = 'Group E (Real Audio Endpoint)'; Name = 'the_real_device_plays_a_reference_file_to_its_end'; Blocker = 'Real audio endpoint decision (WASAPI default device)' },
@@ -724,6 +751,11 @@ if ($Filter -like '--ignored*') {
             # acceptance test can only refuse, never pass.
             $missingFixtureCount++
             Write-Host ("  [MISSING FIXTURE] {0,-21} {1} (the i686 general-purpose plugin fixture was not staged)" -f $item.Group, $item.Name)
+        } elseif ($item.Fixture -eq 'in' -and -not $inFixtureStaged) {
+            # Our own input fixture was not built for i686, so its acceptance
+            # test can only refuse, never pass.
+            $missingFixtureCount++
+            Write-Host ("  [MISSING FIXTURE] {0,-21} {1} (the i686 input plugin fixture was not staged)" -f $item.Group, $item.Name)
         } elseif ($item.Group -like 'Group D*' -and -not $pluginsStaged) {
             # The host never staged D:\code\rustamp-testplugins, so RUSTAMP_TESTPLUGINS
             # is unset and these tests can only refuse loudly, never pass. Name that

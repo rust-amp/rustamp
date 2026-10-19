@@ -14,6 +14,14 @@ rust-version.workspace = true
 name = "rustamp-plughost32"
 path = "src/main.rs"
 
+# The clean-room input ("in_") plugin fixture, for the same reason: a
+# separate cdylib artifact that the acceptance test maps through the OS
+# loader, never linked into the host or into a test binary. It opens no
+# window and no audio device.
+[[example]]
+name = "in_rustamp_fixture"
+crate-type = ["cdylib"]
+
 # The clean-room general-purpose ("gen_") plugin fixture for the P3 DLL
 # acceptance (docs/tasks/P3-dll-acceptance.md §2). It is a separate cdylib
 # artifact that the acceptance test loads through the OS loader; it is never

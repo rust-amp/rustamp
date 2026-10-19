@@ -47,7 +47,19 @@
 //!     plugin that is not live is refused: S09 requires no plugin to provide
 //!     a `config` callback, so its absence is a fact about that plugin and
 //!     never a verdict on its validity.
-//! 11. **Output plugins**: the host fills `main_window` and `dll_instance` in
+//! 11. **Input plugins**: the host fills `main_window`, `dll_instance` and the
+//!     host callbacks (the analyzer, visualization and DSP groups and
+//!     `set_info`) before `init`, and clears `set_info` first and fills it
+//!     again after `init` returned (S09 §3.5 lines 153–156). `out_module`
+//!     stays empty: no output plugin is selected, and the selection is the
+//!     `config_outname` setting, which is S12's business (S09 §3.1 offset
+//!     0x94). The host then drives the plugin's playback — `play`, `pause`,
+//!     `unpause`, `stop` — and reads its own state answers (`is_paused`,
+//!     `get_length`, `get_position`); see [`crate::input`]. The host has no
+//!     audio path into a classic input plugin: the plugin's decode thread,
+//!     the output plugin it drives and the analyzer data are not here yet
+//!     (S09 §3.6, §3.7).
+//! 12. **Output plugins**: the host fills `main_window` and `dll_instance` in
 //!     the `Out_Module` and calls `init` (S09 §4.1 lines 233–237, §4.2 line 252).
 //!     The host calls **no other** output callback: `open`, `write`,
 //!     `can_write`, `is_playing`, `pause`, `set_volume`, `set_pan`, `flush`
@@ -56,7 +68,7 @@
 //!     path of its own. The `id` member is left untouched: the 5.x host
 //!     replaces it with the DLL file name (5.x-only), and whether 2.95 does is
 //!     open (S09 U-4).
-//! 12. **Visualization plugins**: the host resolves `winampVisGetHeader`,
+//! 13. **Visualization plugins**: the host resolves `winampVisGetHeader`,
 //!     validates the header and enumerates the library's modules (S09 §5.1,
 //!     §5.3 step 2). A module is chosen and started later — the user picks
 //!     one — so the host fills `parent_window`, `dll_instance`, `sample_rate`
@@ -64,7 +76,7 @@
 //!     (S09 §5.2, §5.3 step 2). The frame loop lives in [`crate::vis`]; the
 //!     data that would fill the module's arrays comes from the audio path
 //!     and does not exist yet.
-//! 13. **DSP plugins**: the host resolves `winampDSPGetHeader2`, validates the
+//! 14. **DSP plugins**: the host resolves `winampDSPGetHeader2`, validates the
 //!     header and enumerates the library's modules (S09 §6.1, §6.3 step 1).
 //!     The selected module — the index the stored `config_dspplugin_num`
 //!     names, the first module while no selection is persisted — gets the
@@ -109,6 +121,8 @@ use rustamp_plugin_abi::vis::{VisHeader, VisModule};
 #[cfg(any(windows, test))]
 use crate::dsp::DspModuleEntry;
 use crate::dsp::{DspError, DspLibraryInfo, DspRunInfo};
+#[cfg(windows)]
+use crate::input::{InModuleInfo, InputError};
 use crate::vis::{VisError, VisLibraryInfo, VisModuleEntry, VisRunInfo};
 
 mod image;
@@ -554,7 +568,12 @@ impl std::error::Error for PluginConfigError {}
 #[derive(Debug)]
 enum LoadedPluginInner {
     #[cfg(windows)]
-    Input { module: *mut InModule },
+    Input {
+        module: *mut InModule,
+        /// `init` was actually called. False means the slot was null and
+        /// skipped (S09 §3.1 offset 0x24).
+        init_called: bool,
+    },
     /// A DSP library: its header, the modules it hands out and the module
     /// that is active, if any (S09 §6.1, §6.3).
     #[cfg(any(windows, test))]
@@ -670,7 +689,7 @@ impl LoadedPlugin {
         let _scope = plugin_call_scope(&self.identity, "quit");
         match self.inner {
             #[cfg(windows)]
-            LoadedPluginInner::Input { module } => {
+            LoadedPluginInner::Input { module, .. } => {
                 if !module.is_null() {
                     // SAFETY: module pointer was verified non-null at load time.
                     if let Some(quit_fn) = unsafe { (*module).quit } {
@@ -807,7 +826,7 @@ impl LoadedPlugin {
         match self.inner {
             // S09 §3.1 offset 0x1C: `config(parent window handle)`.
             #[cfg(windows)]
-            LoadedPluginInner::Input { module } => {
+            LoadedPluginInner::Input { module, .. } => {
                 if !self.initialized {
                     return Err(PluginConfigError::NotInitialized);
                 }
@@ -1013,6 +1032,146 @@ impl LoadedPlugin {
             }
             _ => None,
         }
+    }
+
+    /// Host-visible state of a loaded input module, read out of the plugin's
+    /// own module struct. `None` for any other plugin kind.
+    ///
+    /// The struct lives in plugin static data, so this stays readable after
+    /// [`quit`](Self::quit) (the mapping is retained, S09 §1 line 46).
+    #[cfg(windows)]
+    pub fn input_info(&self) -> Option<InModuleInfo> {
+        match self.inner {
+            LoadedPluginInner::Input {
+                module,
+                init_called,
+            } if !module.is_null() => Some(crate::input::module_info(module, init_called)),
+            _ => None,
+        }
+    }
+
+    /// The plugin's own module pointer, when this is an input plugin.
+    #[cfg(windows)]
+    fn input_module(&self) -> Result<*mut InModule, InputError> {
+        match self.inner {
+            LoadedPluginInner::Input { module, .. } if !module.is_null() => Ok(module),
+            LoadedPluginInner::Input { .. } => Err(InputError::NullModule),
+            _ => Err(InputError::WrongKind(self.kind())),
+        }
+    }
+
+    /// Start playback of `path` through the input plugin (S09 §3.5 step 3).
+    ///
+    /// The host hands the plugin the path as an ANSI string and reports the
+    /// plugin's own answer: 0 is success, -1 is "file not found" and any
+    /// other nonzero is another error that stops the playlist advance
+    /// (S09 §3.1 offset 0x38). A plugin that supplied no `play` slot is
+    /// refused, never called through a null slot (S09 §0).
+    ///
+    /// The host has no audio path into a classic input plugin yet: the
+    /// plugin's own decode thread, the output plugin it drives and the
+    /// analyzer data are not here (S09 §3.6, §3.7). What this call does is
+    /// start the plugin's playback and give the acceptance path a lifecycle
+    /// to pin.
+    #[cfg(windows)]
+    pub fn input_play(&self, path: &Path) -> Result<(), InputError> {
+        if !self.initialized {
+            return Err(InputError::NotInitialized);
+        }
+        let module = self.input_module()?;
+        // `play` is plugin code like every other call: a fault in it must
+        // name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "play");
+        crate::input::call_play(module, path)
+    }
+
+    /// Pause the input plugin's playback (S09 §3.1 offset 0x3C).
+    #[cfg(windows)]
+    pub fn input_pause(&self) -> Result<(), InputError> {
+        if !self.initialized {
+            return Err(InputError::NotInitialized);
+        }
+        let module = self.input_module()?;
+        // `pause` is plugin code like every other call: a fault in it must
+        // name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "pause");
+        crate::input::call_pause(module)
+    }
+
+    /// Resume the input plugin's playback (S09 §3.1 offset 0x40).
+    #[cfg(windows)]
+    pub fn input_unpause(&self) -> Result<(), InputError> {
+        if !self.initialized {
+            return Err(InputError::NotInitialized);
+        }
+        let module = self.input_module()?;
+        // `unpause` is plugin code like every other call: a fault in it must
+        // name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "unpause");
+        crate::input::call_unpause(module)
+    }
+
+    /// Stop the input plugin's playback and let it unload the stream
+    /// (S09 §3.5 step 6, S09 §3.1 offset 0x48).
+    #[cfg(windows)]
+    pub fn input_stop(&self) -> Result<(), InputError> {
+        if !self.initialized {
+            return Err(InputError::NotInitialized);
+        }
+        let module = self.input_module()?;
+        // `stop` is plugin code like every other call: a fault in it must
+        // name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "stop");
+        crate::input::call_stop(module)
+    }
+
+    /// Ask the input plugin whether it is paused (S09 §3.1 offset 0x44).
+    ///
+    /// The answer is the plugin's own, never one the host invented.
+    #[cfg(windows)]
+    pub fn input_is_paused(&self) -> Result<bool, InputError> {
+        if !self.initialized {
+            return Err(InputError::NotInitialized);
+        }
+        let module = self.input_module()?;
+        // `is_paused` is plugin code like every other call: a fault in it
+        // must name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "is_paused");
+        crate::input::call_is_paused(module)
+    }
+
+    /// Ask the input plugin for the track length in milliseconds
+    /// (S09 §3.1 offset 0x4C).
+    ///
+    /// The answer is the plugin's own, never one the host invented.
+    #[cfg(windows)]
+    pub fn input_length_ms(&self) -> Result<i32, InputError> {
+        if !self.initialized {
+            return Err(InputError::NotInitialized);
+        }
+        let module = self.input_module()?;
+        // `get_length` is plugin code like every other call: a fault in it
+        // must name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "get_length");
+        crate::input::call_get_length(module)
+    }
+
+    /// Ask the input plugin for the playback position in milliseconds
+    /// (S09 §3.1 offset 0x50).
+    ///
+    /// The answer is the plugin's own, never one the host invented. S09
+    /// §3.6 lets the analyzer and visualization threads ask for it, so the
+    /// call has to be safe from any thread the host owns.
+    #[cfg(windows)]
+    pub fn input_position_ms(&self) -> Result<i32, InputError> {
+        if !self.initialized {
+            return Err(InputError::NotInitialized);
+        }
+        let module = self.input_module()?;
+        // `get_position` is plugin code like every other call: a fault in it
+        // must name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "get_position");
+        crate::input::call_get_position(module)
     }
 
     /// The library-level state of a loaded visualization plugin: the header
@@ -1343,7 +1502,10 @@ impl LoadedPlugin {
             hinstance: core::ptr::null_mut(),
             host_hwnd,
             description: name.to_string(),
-            inner: LoadedPluginInner::Input { module },
+            inner: LoadedPluginInner::Input {
+                module,
+                init_called: true,
+            },
             initialized: true,
         }
     }
@@ -1748,7 +1910,9 @@ unsafe fn load_input_module(
     }
 
     // Call init() (S09 §3.1 offset 0x24, §3.5 line 156).
+    let mut init_called = false;
     if let Some(init_fn) = unsafe { (*module_ptr).init } {
+        init_called = true;
         let _scope = plugin_call_scope(&identity, "init");
         unsafe { init_fn() };
     }
@@ -1763,7 +1927,10 @@ unsafe fn load_input_module(
         hinstance,
         host_hwnd,
         description,
-        inner: LoadedPluginInner::Input { module: module_ptr },
+        inner: LoadedPluginInner::Input {
+            module: module_ptr,
+            init_called,
+        },
         initialized: true,
     })
 }

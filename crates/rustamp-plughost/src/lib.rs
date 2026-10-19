@@ -6,7 +6,10 @@
 //! permissive crates can call it without depending on the binary target.
 //!
 //! `loader` maps approved 32-bit plugin DLLs and calls their real entry points;
-//! `registry` is the control-channel routing around it. `vis` is the
+//! `registry` is the control-channel routing around it. `input` is the input
+//! (`in_`) bridge: the host members of a classic input module, the
+//! `init`/`play`/`pause`/`stop`/`quit` lifecycle and the state answers the
+//! plugin itself gives. `vis` is the
 //! visualization (`vis_`) bridge: the module list of a library, the
 //! `init`/`render`/`quit` lifecycle of one of its modules and the host
 //! callbacks the running visualization answers. `dsp` is the DSP (`dsp_`)
@@ -25,6 +28,8 @@ pub mod control;
 pub mod dsp;
 pub mod fault;
 pub mod host_window;
+#[cfg(windows)]
+pub mod input;
 pub mod ipc;
 pub mod loader;
 pub mod message_loop;
@@ -44,6 +49,8 @@ pub use dsp::{DspError, DspLibraryInfo, DspModuleInfo, DspRunInfo};
 pub use fault::{FaultGuard, install_fault_guard};
 pub use fault::{PLUGIN_FAULT_EXIT_CODE, PluginIdentity, plugin_call_scope};
 pub use host_window::*;
+#[cfg(windows)]
+pub use input::{InModuleInfo, InputError};
 pub use ipc::*;
 pub use loader::{
     GeneralModuleInfo, LoadedPlugin, OutModuleInfo, PluginConfigError, PluginLoadError,
