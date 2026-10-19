@@ -85,13 +85,21 @@ after every merge), not by trusting the lane's report.
 | `wave202` | registry start/stop/step for the vis loop; `PluginRegistry` proven not `Send` |
 | `wave203` | sidecar cover art fallback with stat-based invalidation |
 | `wave204` | DSP write means *delivered*: a delivery fence closes the silent-frame gap |
+| `wave205` | real BS.1770-4 integrated loudness for the R128 tags (first attempt sent back: 3–6 dB stereo error) |
 | `wave206` | property tests for the S15 order model (no model bug found) |
 | `wave207` | the app reads `PluginLoaded`/`PluginError` into a host-scoped inventory |
+| `wave208` | order follow-ups: the re-anchor doc lie, unused `history` removed, `skip_by` clamped |
+| `wave209` | enabling a plugin asks the host to load it; the host is spawned with its approval store |
+| `wave210` | MP3 Xing/Info header as the truncation oracle (frames **and** bytes must be short) |
+| `wave211` | pure device selection from the config, one matching rule for resolver and backends |
+| `wave212` | enabled plugins load when a host attaches, once per host generation |
+| `wave213` | runtime playlist font size (`Ctrl+Num+/-`), row pitch follows the font |
+| `wave214` | exact AIFF truncation oracle (`SSND` header correction + two-condition rule) |
 
-In flight at the time of writing: `wave205` (real BS.1770 R128 loudness — the
-first attempt derived it from ReplayGain and was sent back for the 3–6 dB stereo
-error), `wave208` (order-model follow-ups: doc lie, unbounded history, `skip_by`
-hardening), `wave209` (the app asks the host to load a plugin).
+In flight at the time of writing: `wave215` (wire the device selection into
+`create_output`), `wave216` (FLAC truncation oracle, or the precise no-oracle
+finding), `wave217` (ReplayGain filters designed at the source rate instead of
+linear resampling).
 
 ## Rules added to `AGENTS.md` during the session
 
