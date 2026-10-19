@@ -95,11 +95,19 @@ after every merge), not by trusting the lane's report.
 | `wave212` | enabled plugins load when a host attaches, once per host generation |
 | `wave213` | runtime playlist font size (`Ctrl+Num+/-`), row pitch follows the font |
 | `wave214` | exact AIFF truncation oracle (`SSND` header correction + two-condition rule) |
+| `wave215` | the app honours `audio.device`, pins the named output, serialises it honestly |
+| `wave216` | FLAC has no exact truncation oracle — proven with measurements, limit pinned |
+| `wave217` | the ReplayGain filter is designed at the source rate (44.1 kHz was up to 4.6 dB off at 20 kHz) |
+| `wave218` | "Generate HTML playlist" (40292) with escaping and a native save dialog |
+| `wave220` | the library removes rows whose files are gone, keeps unreadable ones and reports them |
 
-In flight at the time of writing: `wave215` (wire the device selection into
-`create_output`), `wave216` (FLAC truncation oracle, or the precise no-oracle
-finding), `wave217` (ReplayGain filters designed at the source rate instead of
-linear resampling).
+Also this session: the post-merge check was a **false green** because it ran
+`cargo check --workspace` without `--all-targets`; three test call sites were
+broken for a whole wave. The rule in `AGENTS.md` now demands
+`--all-targets --all-features`.
+
+In flight at the time of writing: `wave219` (MP4 truncation oracle, or the
+proven limit), `wave221` ("Read extended info on selection", 40293).
 
 ## Rules added to `AGENTS.md` during the session
 
