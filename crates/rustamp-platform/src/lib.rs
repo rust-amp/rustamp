@@ -18,6 +18,8 @@
 //! [`file_dialog`]; the operating system's own popup menu lives in
 //! [`popup_menu`].
 //! A skin's cursor files become operating-system cursors in [`cursor`].
+//! A skin's window region becomes the operating system's window region in
+//! [`window_region`].
 
 pub mod cursor;
 pub mod displays;
@@ -28,6 +30,7 @@ pub mod popup_menu;
 pub mod prefs_dialog;
 pub mod single_instance;
 pub mod tray;
+pub mod window_region;
 
 pub use cursor::{
     CursorError, CursorFormat, OsCursor, cursor_payload, pointer_window, restore_cursor,
@@ -62,3 +65,4 @@ pub use single_instance::{
 pub use tray::{TRAY_CALLBACK_MESSAGE, TRAY_LEFT_CLICK, TRAY_MENU, TRAY_TOOLTIP, TrayMenuEntry};
 #[cfg(windows)]
 pub use tray::{TrayError, TrayIcon};
+pub use window_region::{RegionRect, apply_window_region, window_region_contains};

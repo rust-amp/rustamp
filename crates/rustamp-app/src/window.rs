@@ -474,6 +474,11 @@ struct Windowed {
     /// The cache belongs to one skin load: it is emptied when the app
     /// loads another skin, so no cursor handle outlives its skin.
     cursors: SkinCursors,
+    /// The skin load the windows' shapes were built for.
+    ///
+    /// A shape belongs to one skin: another skin's `region.txt` means
+    /// another shape, so the shapes are built again when the skin changes.
+    applied_region_skin: Option<u64>,
     last_playlist_click: Option<(Instant, (i32, i32))>,
     modifiers: ModifiersState,
     /// The client size last requested, so repeat requests are skipped.
@@ -527,6 +532,7 @@ impl Windowed {
             eq_left_down: false,
             playlist_cursor: (0, 0),
             cursors,
+            applied_region_skin: None,
             last_playlist_click: None,
             modifiers: ModifiersState::empty(),
             applied_client: None,
@@ -601,6 +607,7 @@ impl Windowed {
             self.stack.set_playlist_shaded(self.app.playlist_shaded());
         }
         self.apply_docking_positions();
+        let mut shown = false;
         if let Some(window) = &self.window {
             if self.app.main_visible() != self.applied_main_visible {
                 self.applied_main_visible = self.app.main_visible();
@@ -608,6 +615,7 @@ impl Windowed {
                 if self.applied_main_visible {
                     window.set_minimized(false);
                     window.focus_window();
+                    shown = true;
                 }
             }
             if self.app.always_on_top() != self.applied_on_top {
@@ -621,6 +629,64 @@ impl Windowed {
             if self.app.take_minimize_request() {
                 window.set_minimized(true);
             }
+        }
+        if shown {
+            // The window is shown again: its shape belongs to the skin and
+            // to the size the window has now.
+            self.apply_main_region();
+        }
+    }
+
+    /// Applies the skin's window shape to the player's windows.
+    ///
+    /// A shape belongs to one skin, one window size and one window state, so
+    /// it is built again whenever one of them changes: the window is resized
+    /// (which the shade and the double-size mode both do), another skin is
+    /// loaded, or the window is shown again.
+    fn sync_window_regions(&mut self) {
+        self.applied_region_skin = Some(self.app.skin_generation());
+        self.apply_main_region();
+        self.apply_eq_region();
+    }
+
+    /// Cuts the main window to the shape the skin's region asks for.
+    ///
+    /// A skin without a `region.txt` (the base skin's case, S17 §7) leaves
+    /// the window a plain rectangle: the region is cleared, not replaced by
+    /// an empty one — an empty region would make the window invisible.
+    fn apply_main_region(&mut self) {
+        let raw = self.raw_main_window();
+        if raw == 0 {
+            return;
+        }
+        let state = self.app.state();
+        let rects = crate::region::main_rects(
+            self.app.skin.skin().region(),
+            state.windowshade,
+            state.double_size,
+        );
+        if !rustamp_platform::window_region::apply_window_region(raw, &rects) {
+            eprintln!("rustamp: the main window's shape could not be applied");
+        }
+    }
+
+    /// Cuts the equalizer window to the shape the skin's region asks for.
+    ///
+    /// The equalizer has a section of its own (S17 §7); a skin without one
+    /// leaves the window a plain rectangle.
+    fn apply_eq_region(&mut self) {
+        let raw = self.raw_eq_window();
+        if raw == 0 {
+            return;
+        }
+        let state = self.app.eq_state();
+        let rects = crate::region::equalizer_rects(
+            self.app.skin.skin().region(),
+            state.windowshade,
+            state.double_size,
+        );
+        if !rustamp_platform::window_region::apply_window_region(raw, &rects) {
+            eprintln!("rustamp: the equalizer window's shape could not be applied");
         }
     }
 
@@ -706,6 +772,9 @@ impl Windowed {
             self.eq_window = Some(window);
             self.eq_surface = Some(surface);
             self.applied_eq_client = Some((width, height));
+            // The new window starts as a plain rectangle; the skin's shape
+            // is cut out of it right away.
+            self.apply_eq_region();
         }
         let desired = self.app.eq_frame_size();
         if self.applied_eq_client != Some(desired)
@@ -2216,6 +2285,9 @@ impl ApplicationHandler for Windowed {
             }
         }
         self.sync_window_state();
+        // The skin's shape is cut out of the main window; the equalizer
+        // gets its own shape when it is created below.
+        self.sync_window_regions();
         self.sync_eq_window(event_loop);
         self.request_redraw();
         self.request_redraw_eq();
@@ -2265,6 +2337,9 @@ impl ApplicationHandler for Windowed {
                 // (S05 §3.3, §5): the equalizer tracks the new bottom edge,
                 // and so does the playlist.
                 self.sync_window_state();
+                // The shape belongs to one size: a resized window is cut to
+                // the skin's shape again.
+                self.apply_main_region();
                 self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged {
@@ -2425,6 +2500,11 @@ impl ApplicationHandler for Windowed {
         // A skin loaded in this tick replaces the cursors: the cache of the
         // old skin is emptied, so no cursor handle outlives its skin.
         self.cursors.sync(self.app.skin_generation());
+        // The same skin brings another `region.txt`: the windows' shapes
+        // follow it.
+        if self.applied_region_skin != Some(self.app.skin_generation()) {
+            self.sync_window_regions();
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
     }
 
@@ -2466,6 +2546,9 @@ impl Windowed {
                     self.applied_eq_client = None;
                     self.sync_eq_window(event_loop);
                 }
+                // The shape belongs to one size: a resized window is cut
+                // to the skin's shape again.
+                self.apply_eq_region();
                 self.request_redraw_eq();
             }
             WindowEvent::ScaleFactorChanged {
