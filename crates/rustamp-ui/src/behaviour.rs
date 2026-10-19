@@ -477,8 +477,9 @@ impl MainWindow {
     /// which this machine does not receive, and stays a gap. The four window
     /// buttons act per S03 §5 (main menu / minimize / windowshade / close):
     /// the shade button's effect is measured (S05 §1.3), close quits because
-    /// this is the main window (RFC 0005 O3). The clutter-bar O and V pop menus
-    /// whose contents are unmeasured (S04 §9) and emit nothing.
+    /// this is the main window (RFC 0005 O3). The clutter-bar O and V emit
+    /// `OpenOptionsMenu` / `OpenVisualizationMenu` (RFC 0016, S02 §2); the
+    /// app does not render those popups yet.
     fn release_command(&mut self, widget: Widget) -> Option<Command> {
         match widget {
             Widget::Previous => Some(Command::Prev),
@@ -499,6 +500,8 @@ impl MainWindow {
             Widget::PlaylistToggle => Some(Command::ToggleWindow(WindowId::Playlist)),
             Widget::ClutterA => Some(Command::ToggleAlwaysOnTop),
             Widget::ClutterD => Some(Command::ToggleDoubleSize),
+            Widget::ClutterO => Some(Command::OpenOptionsMenu),
+            Widget::ClutterV => Some(Command::OpenVisualizationMenu),
             Widget::ClutterI => {
                 if self.track_title.is_some() {
                     Some(Command::OpenFileInfo)
@@ -909,9 +912,7 @@ mod tests {
         for widget in [
             Widget::TitleBar,
             Widget::TimeDisplay,
-            Widget::ClutterO,
             Widget::ClutterI,
-            Widget::ClutterV,
             Widget::Marquee,
             Widget::Mono,
             Widget::Stereo,
@@ -919,6 +920,31 @@ mod tests {
             let mut machine = MainWindow::new();
             playing(&mut machine, 0);
             assert_eq!(click(&mut machine, widget, 0), [], "{widget:?}");
+        }
+    }
+
+    #[test]
+    fn clutter_o_and_v_open_their_popups_on_release_inside() {
+        // S02 §2: O opens the Options popup, V the visualization menu
+        // (RFC 0016).
+        for (widget, expected) in [
+            (Widget::ClutterO, Command::OpenOptionsMenu),
+            (Widget::ClutterV, Command::OpenVisualizationMenu),
+        ] {
+            let mut machine = MainWindow::new();
+            playing(&mut machine, 0);
+            assert_eq!(click(&mut machine, widget, 0), [expected], "{widget:?}");
+        }
+    }
+
+    #[test]
+    fn clutter_o_and_v_emit_nothing_when_released_outside() {
+        for widget in [Widget::ClutterO, Widget::ClutterV] {
+            let mut machine = MainWindow::new();
+            let (x, y) = centre(widget);
+            machine.mouse_down(x, y, 0);
+            assert_eq!(machine.mouse_up(200, 100, 0), [], "{widget:?}");
+            assert!(!machine.state().clutter_o && !machine.state().clutter_v);
         }
     }
 
@@ -1010,13 +1036,13 @@ mod tests {
 
     #[test]
     fn the_five_clutterbar_actions_do_their_thing() {
-        // O: momentary, no command.
+        // O: momentary, opens the Options popup (RFC 0016).
         let mut machine = MainWindow::new();
         let (x, y) = centre(Widget::ClutterO);
         machine.mouse_down(x, y, 0);
         assert!(machine.state().clutter_o);
         assert_eq!(machine.hint().as_deref(), Some("OPTIONS MENU"));
-        assert_eq!(machine.mouse_up(x, y, 0), []);
+        assert_eq!(machine.mouse_up(x, y, 0), [Command::OpenOptionsMenu]);
         assert!(!machine.state().clutter_o);
 
         // A: latched always-on-top.
@@ -1052,13 +1078,13 @@ mod tests {
         assert!(machine.state().double_size);
         assert!(machine.state().clutter_d);
 
-        // V: momentary visualization menu.
+        // V: momentary, opens the visualization menu (RFC 0016).
         let mut machine = MainWindow::new();
         let (x, y) = centre(Widget::ClutterV);
         machine.mouse_down(x, y, 0);
         assert!(machine.state().clutter_v);
         assert_eq!(machine.hint().as_deref(), Some("VISUALIZATION MENU"));
-        assert_eq!(machine.mouse_up(x, y, 0), []);
+        assert_eq!(machine.mouse_up(x, y, 0), [Command::OpenVisualizationMenu]);
         assert!(!machine.state().clutter_v);
     }
 

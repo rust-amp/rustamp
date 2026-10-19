@@ -934,6 +934,52 @@ impl Windowed {
         eprintln!("rustamp: a native popup menu is only implemented on Windows");
     }
 
+    /// Shows a pending clutterbar popup (Options or visualization menu,
+    /// RFC 0016) as the system's own menu, like [`Windowed::drain_main_menu`].
+    ///
+    /// Anchored at the letter's click point (S04 §1); the screen position is
+    /// unmeasured, so that is our choice.
+    fn drain_clutter_menu(&mut self) {
+        let Some(kind) = self.app.take_clutter_menu() else {
+            return;
+        };
+        #[cfg(windows)]
+        {
+            let owner = self.raw_main_window();
+            let main_outer = self
+                .window
+                .as_ref()
+                .and_then(|window| window.outer_position().ok())
+                .map(|position| (position.x, position.y))
+                .unwrap_or((DEFAULT_MAIN_POSITION.x, DEFAULT_MAIN_POSITION.y));
+            let point = match kind {
+                crate::menu::ClutterMenu::Options => rustamp_ui::menu::CLUTTER_O_POINT,
+                crate::menu::ClutterMenu::Visualization => rustamp_ui::menu::CLUTTER_V_POINT,
+            };
+            let menu = self.app.native_clutter_menu(kind);
+            match rustamp_platform::show_popup_menu(
+                owner,
+                &menu.rows,
+                rustamp_ui::menu::clutter_popup_origin(main_outer, point),
+            ) {
+                Ok(None) => {}
+                Ok(Some(id)) => match menu.choice_for_id(id) {
+                    Some(choice) => {
+                        if let Err(error) = self.app.activate_menu_choice(choice) {
+                            eprintln!("rustamp: menu item failed: {error}");
+                        }
+                    }
+                    None => eprintln!("rustamp: the menu reported an unknown id {id}"),
+                },
+                Err(error) => eprintln!("rustamp: no {kind:?} menu: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = kind;
+            eprintln!("rustamp: a native popup menu is only implemented on Windows");
+        }
+    }
     /// Shows a pending standard file-open dialog and adds what was chosen.
     ///
     /// The ADD button and the open-media actions ask for files. They used to
@@ -1875,6 +1921,7 @@ impl ApplicationHandler for Windowed {
         // Outside every window procedure, like the tray popup: both of
         // these run their own modal message loop.
         self.drain_main_menu();
+        self.drain_clutter_menu();
         self.drain_media_pick();
         self.drain_prefs();
         // After every window has been synced, so a focus request for a window

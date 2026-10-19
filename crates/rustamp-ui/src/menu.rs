@@ -779,6 +779,11 @@ pub enum MenuChoice {
         /// The row's label.
         label: &'static str,
     },
+    /// The Options popup's Time elapsed / Time remaining rows: sets the
+    /// reading (`true` = remaining) instead of toggling it, so choosing the
+    /// row that is already on keeps it on (S04 §4.2: the check moves between
+    /// the two rows, it never clears).
+    SetTimeRemaining(bool),
 }
 
 impl MenuChoice {
@@ -787,6 +792,8 @@ impl MenuChoice {
         match self {
             MenuChoice::Action { label, .. } | MenuChoice::NoAction { label } => label,
             MenuChoice::Exit => "Exit",
+            MenuChoice::SetTimeRemaining(false) => "Time elapsed",
+            MenuChoice::SetTimeRemaining(true) => "Time remaining",
         }
     }
 }
@@ -896,6 +903,182 @@ pub fn native_main_menu(state: &MainWindowState, flags: &MenuFlags) -> NativeMai
     NativeMainMenu { rows, choices }
 }
 
+// ---------------------------------------------------------------------------
+// Clutter-bar popups (RFC 0016)
+// ---------------------------------------------------------------------------
+
+/// The client point whose click opens the Options popup: clutterbar letter O
+/// (S04 §1 row 2, posted left click at client (14,25)).
+pub const CLUTTER_O_POINT: (i32, i32) = (14, 25);
+
+/// The client point whose click opens the visualization menu: clutterbar
+/// letter V (S04 §1 row 4, posted left click at client (14,56)).
+pub const CLUTTER_V_POINT: (i32, i32) = (14, 56);
+
+/// Where a clutterbar popup opens, given the main window's outer (screen)
+/// origin and the letter's click point.
+///
+/// Own choice, stated plainly: S04 settles the click points, the class and
+/// the sizes, but popup screen placement is unmeasured (S04 §9), so the
+/// popup's top-left anchors at the letter it came from, as
+/// [`menu_popup_origin`] does for the main menu.
+pub fn clutter_popup_origin(main_outer: (i32, i32), point: (i32, i32)) -> (i32, i32) {
+    (main_outer.0 + point.0, main_outer.1 + point.1)
+}
+
+/// Appends one leaf entry and its choice, with the 1-based id convention of
+/// [`NativeMainMenu`].
+fn push_leaf(
+    rows: &mut Vec<PopupRow>,
+    choices: &mut Vec<MenuChoice>,
+    choice: MenuChoice,
+    accelerator: Option<&str>,
+    checked: bool,
+) {
+    choices.push(choice);
+    rows.push(PopupRow::Entry {
+        id: choices.len() as u32,
+        label: choice.label().to_string(),
+        accelerator: accelerator.map(str::to_string),
+        checked,
+        enabled: true,
+    });
+}
+
+fn action_choice(label: &'static str, action: ShortcutAction) -> MenuChoice {
+    MenuChoice::Action { label, action }
+}
+
+/// The Options popup (clutterbar letter O) as a native popup tree.
+///
+/// Rows, separators and hints are S04 §4.1: `Preferences...`, the `Skins`
+/// submenu, a separator, the `Time elapsed` / `Time remaining` pair, a
+/// separator, `Always On Top`, `Double Size`, `EasyMove`, a separator,
+/// `Repeat`, `Shuffle`. The tick moves between the time rows with the live
+/// reading (S04 §4.2). The capture shows Repeat and Shuffle unchecked; they
+/// are ticked from live state here, which agrees in that state. The `R` / `S`
+/// hints are provisional (S04 §4.3). The `Skins` entries reuse the main
+/// menu's provisional grouping (S04 §9).
+pub fn native_options_menu(state: &MainWindowState, flags: &MenuFlags) -> NativeMainMenu {
+    let mut rows = Vec::new();
+    let mut choices = Vec::new();
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("Preferences...", ShortcutAction::Preferences),
+        Some("Ctrl+P"),
+        false,
+    );
+    let mut entries = Vec::new();
+    for entry in submenu_entries(SubmenuId::Skins) {
+        choices.push(action_choice(entry.label, entry.action));
+        entries.push(PopupRow::Entry {
+            id: choices.len() as u32,
+            label: entry.label.to_string(),
+            accelerator: entry.shortcut.map(str::to_string),
+            checked: false,
+            enabled: true,
+        });
+    }
+    rows.push(PopupRow::Submenu {
+        label: "Skins".to_string(),
+        rows: entries,
+    });
+    rows.push(PopupRow::Separator);
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        MenuChoice::SetTimeRemaining(false),
+        Some("(Ctrl+T toggles)"),
+        !state.time_remaining,
+    );
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        MenuChoice::SetTimeRemaining(true),
+        Some("(Ctrl+T toggles)"),
+        state.time_remaining,
+    );
+    rows.push(PopupRow::Separator);
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("Always On Top", ShortcutAction::ToggleAlwaysOnTop),
+        Some("Ctrl+A"),
+        flags.always_on_top,
+    );
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("Double Size", ShortcutAction::ToggleDoubleSize),
+        Some("Ctrl+D"),
+        state.double_size,
+    );
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("EasyMove", ShortcutAction::ToggleEasyMove),
+        Some("Ctrl+E"),
+        flags.easy_move,
+    );
+    rows.push(PopupRow::Separator);
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("Repeat", ShortcutAction::ToggleRepeat),
+        Some("R"),
+        state.repeat,
+    );
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("Shuffle", ShortcutAction::ToggleShuffle),
+        Some("S"),
+        state.shuffle,
+    );
+    NativeMainMenu { rows, choices }
+}
+
+/// The visualization menu (clutterbar letter V) as a native popup tree.
+///
+/// S04 §5: four rows, a separator after the first, no checks, no submenus.
+/// Row 1 has no text hint (the icon pixels at its right are unidentified).
+/// Whether a plug-in list follows `Select plug-in...` is open (S04 §5), so
+/// none is appended.
+pub fn native_visualization_menu() -> NativeMainMenu {
+    let mut rows = Vec::new();
+    let mut choices = Vec::new();
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("Visualization options...", ShortcutAction::VisOptions),
+        None,
+        false,
+    );
+    rows.push(PopupRow::Separator);
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("Start/Stop plug-in", ShortcutAction::ToggleVisPlugin),
+        Some("Ctrl+Shift+K"),
+        false,
+    );
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("Configure plug-in...", ShortcutAction::ConfigureVisPlugin),
+        Some("Alt+K"),
+        false,
+    );
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        action_choice("Select plug-in...", ShortcutAction::SelectVisPlugin),
+        Some("Ctrl+K"),
+        false,
+    );
+    NativeMainMenu { rows, choices }
+}
 // ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
@@ -1540,5 +1723,140 @@ mod tests {
         assert_eq!(menu_item_at(323, 10), None);
         assert_eq!(menu_item_at(10, 569), None);
         assert_eq!(menu_item_at(500, 500), None);
+    }
+}
+
+#[cfg(test)]
+mod clutter_popup_tests {
+    use super::*;
+
+    fn labels(rows: &[PopupRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                PopupRow::Separator => "-".to_string(),
+                PopupRow::Entry { label, .. } | PopupRow::Submenu { label, .. } => label.clone(),
+            })
+            .collect()
+    }
+
+    fn checked(rows: &[PopupRow], wanted: &str) -> bool {
+        rows.iter().any(
+            |row| matches!(row, PopupRow::Entry { label, checked: true, .. } if label == wanted),
+        )
+    }
+
+    #[test]
+    fn clutter_points_and_origin_follow_s04() {
+        assert_eq!(CLUTTER_O_POINT, (14, 25));
+        assert_eq!(CLUTTER_V_POINT, (14, 56));
+        assert_eq!(
+            clutter_popup_origin((100, 200), CLUTTER_V_POINT),
+            (114, 256)
+        );
+    }
+
+    #[test]
+    fn options_popup_rows_and_separators_match_s04_4_1() {
+        let menu = native_options_menu(&MainWindowState::default(), &MenuFlags::default());
+        assert_eq!(
+            labels(&menu.rows),
+            [
+                "Preferences...",
+                "Skins",
+                "-",
+                "Time elapsed",
+                "Time remaining",
+                "-",
+                "Always On Top",
+                "Double Size",
+                "EasyMove",
+                "-",
+                "Repeat",
+                "Shuffle",
+            ]
+        );
+    }
+
+    #[test]
+    fn options_popup_tick_moves_with_the_time_reading() {
+        let flags = MenuFlags::default();
+        let mut state = MainWindowState::default();
+        let menu = native_options_menu(&state, &flags);
+        assert!(checked(&menu.rows, "Time elapsed"));
+        assert!(!checked(&menu.rows, "Time remaining"));
+        state.time_remaining = true;
+        let menu = native_options_menu(&state, &flags);
+        assert!(!checked(&menu.rows, "Time elapsed"));
+        assert!(checked(&menu.rows, "Time remaining"));
+    }
+
+    #[test]
+    fn options_popup_checks_resolve_from_live_state() {
+        let flags = MenuFlags {
+            always_on_top: true,
+            easy_move: true,
+            ..MenuFlags::default()
+        };
+        let state = MainWindowState {
+            double_size: true,
+            repeat: true,
+            ..MainWindowState::default()
+        };
+        let menu = native_options_menu(&state, &flags);
+        for on in ["Always On Top", "Double Size", "EasyMove", "Repeat"] {
+            assert!(checked(&menu.rows, on), "{on}");
+        }
+        assert!(!checked(&menu.rows, "Shuffle"));
+        assert!(!checked(&menu.rows, "Preferences..."));
+    }
+
+    #[test]
+    fn options_popup_time_rows_set_the_reading() {
+        let menu = native_options_menu(&MainWindowState::default(), &MenuFlags::default());
+        assert_eq!(menu.choice_for_id(0), None);
+        let ids: Vec<_> = menu
+            .choices
+            .iter()
+            .filter(|choice| matches!(choice, MenuChoice::SetTimeRemaining(_)))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                &MenuChoice::SetTimeRemaining(false),
+                &MenuChoice::SetTimeRemaining(true)
+            ]
+        );
+    }
+
+    #[test]
+    fn visualization_menu_has_four_rows_and_one_separator() {
+        let menu = native_visualization_menu();
+        assert_eq!(
+            labels(&menu.rows),
+            [
+                "Visualization options...",
+                "-",
+                "Start/Stop plug-in",
+                "Configure plug-in...",
+                "Select plug-in...",
+            ]
+        );
+        assert_eq!(menu.choices.len(), 4);
+        let accelerators: Vec<_> = menu
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                PopupRow::Entry { accelerator, .. } => Some(accelerator.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            accelerators,
+            [None, Some("Ctrl+Shift+K"), Some("Alt+K"), Some("Ctrl+K")]
+        );
+        assert!(menu.rows.iter().all(|row| !matches!(
+            row,
+            PopupRow::Submenu { .. } | PopupRow::Entry { checked: true, .. }
+        )));
     }
 }
