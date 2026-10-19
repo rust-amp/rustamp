@@ -1751,6 +1751,7 @@ dependencies = [
  "rustamp-mediahost",
  "rustamp-meta",
  "rustamp-output",
+ "rustamp-playlist",
  "rustamp-proto",
  "tempfile",
 ]

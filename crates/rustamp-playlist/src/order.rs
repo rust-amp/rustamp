@@ -201,6 +201,15 @@ impl PlaybackOrder {
         }
     }
 
+    /// Re-seed the permutation generator.
+    ///
+    /// The next permutation is drawn from the new seed. The active plan is
+    /// left alone: it is the permutation the traversal follows, and a
+    /// re-seed must not move the play cursor.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.rng = Rng::new(seed);
+    }
+
     /// Set shuffle mode enabled/disabled (S15 §4).
     pub fn set_shuffle(&mut self, shuffle: bool) {
         if self.shuffle == shuffle {

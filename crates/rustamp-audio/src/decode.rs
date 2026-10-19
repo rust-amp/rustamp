@@ -58,6 +58,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -67,6 +68,7 @@ use rustamp_core::error::{Error, ErrorKind};
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::StreamInfo;
 use rustamp_core::vis::VisFrame;
+use rustamp_playlist::PlaybackOrder;
 
 use crate::convert::FormatConverter;
 use crate::replaygain::ReplayGainControl;
@@ -150,18 +152,19 @@ pub(crate) enum DecodeMsg {
     /// Arm/disarm "stop after current track" (RFC 0005 O8): when armed, the run
     /// ends at the end of the current track instead of advancing.
     SetStopAfterCurrent(bool),
-    /// Set shuffle mode enabled/disabled, carrying the engine's active
-    /// shuffle plan so live traversal follows it (spec S15).
-    SetShuffle {
+    /// The engine changed the playback modes (spec S15).
+    ///
+    /// The engine writes the modes into the shared model at once, so the
+    /// published state is the current one. The message carries them as well,
+    /// because the control channel is first-in, first-out: the modes a
+    /// navigation command was issued under are the ones this thread saw
+    /// before it, and the thread remembers them (see `Worker::in_issued_mode`).
+    ModesChanged {
         /// Whether shuffle is on.
-        on: bool,
-        /// The engine's active plan when turning on; empty when turning off.
-        plan: Vec<usize>,
-        /// The engine's previous cycle plan when turning on; None when turning off.
-        prev_plan: Option<Vec<usize>>,
+        shuffle: bool,
+        /// Whether repeat is on.
+        repeat: bool,
     },
-    /// Set repeat mode enabled/disabled (spec S15).
-    SetRepeat(bool),
 }
 
 /// Reports, decode thread -> engine.
@@ -233,15 +236,6 @@ pub(crate) enum DecodeOut {
     },
     /// A previously reported EndOfStream is revoked (e.g. repeat toggled on).
     EndOfStreamRevoked,
-    /// The worker (re)planned the shuffle permutation on its own — a cycle
-    /// boundary, or a fallback when the engine handed no usable plan. The
-    /// engine adopts it so its published plan stays the traversed one (S15).
-    ShufflePlanned {
-        /// The new active plan.
-        plan: Vec<usize>,
-        /// The previous cycle's plan, if any.
-        prev_plan: Option<Vec<usize>>,
-    },
     /// A decoder or output error.
     Error {
         /// Classification.
@@ -323,11 +317,6 @@ impl std::fmt::Debug for DecodeOut {
                 .field("timeline_end", timeline_end)
                 .finish(),
             DecodeOut::EndOfStreamRevoked => write!(f, "EndOfStreamRevoked"),
-            DecodeOut::ShufflePlanned { plan, prev_plan } => f
-                .debug_struct("ShufflePlanned")
-                .field("len", &plan.len())
-                .field("has_prev", &prev_plan.is_some())
-                .finish(),
             DecodeOut::Error { kind, message } => f
                 .debug_struct("Error")
                 .field("kind", kind)
@@ -361,23 +350,15 @@ pub(crate) struct Config {
     /// still held a previous run's audio. The first write waits for its
     /// drain and the engine's clock re-base (see `crate::ring`).
     pub start_epoch: Option<u64>,
-    /// Whether shuffle mode is active when the run starts (spec S15).
-    pub shuffle: bool,
-    /// Whether repeat mode is active when the run starts (spec S15).
-    pub repeat: bool,
-    /// Seed for the shuffle PRNG (spec S15).
-    pub shuffle_seed: Option<u64>,
-    /// The engine's active shuffle plan (spec S15). The engine owns the
-    /// plan; the worker traverses it, so live playback follows the
-    /// permutation the engine publishes through `Engine::shuffle_plan`.
-    pub shuffle_plan: Vec<usize>,
-    /// The previous cycle's shuffle plan, if any (spec S15 §3.2).
-    pub prev_shuffle_plan: Option<Vec<usize>>,
+    /// The shared playback order (spec S15): the permutation, the repeat
+    /// boundaries and the traversal history. The engine owns the model and
+    /// the worker follows it, so both traverse the same order.
+    pub order: Arc<Mutex<PlaybackOrder>>,
 }
 
 /// Start the decode thread. Returns its handle and the vis consumer.
 pub(crate) fn spawn(
-    mut cfg: Config,
+    cfg: Config,
     dsp: Vec<Box<dyn DspStage>>,
     ring: Producer<f32>,
     start_index: u32,
@@ -388,11 +369,6 @@ pub(crate) fn spawn(
     let (vis, vis_rx) = VisTap::new(cfg.vis_capacity);
     let stop_after_current = cfg.stop_after_current;
     let start_epoch = cfg.start_epoch;
-    let shuffle = cfg.shuffle;
-    let repeat = cfg.repeat;
-    let rng_state = cfg.shuffle_seed.unwrap_or(0x9E37_79B9_7F4A_7C15);
-    let shuffle_plan = std::mem::take(&mut cfg.shuffle_plan);
-    let prev_shuffle_plan = cfg.prev_shuffle_plan.take();
     let mut worker = Worker {
         cfg,
         ring,
@@ -413,20 +389,22 @@ pub(crate) fn spawn(
         stopped: false,
         rg_gain: 1.0,
         stop_after_current,
-        shuffle,
-        repeat,
-        shuffle_plan,
-        shuffle_pos: 0,
-        prev_shuffle_plan,
-        rng_state,
+        shuffle: false,
+        repeat: false,
         current_index: start_index,
         pending_seek: None,
         pending_skip: None,
         drain_epoch: start_epoch,
         report_start: start_epoch.is_some(),
         stage_failed: false,
-        cycle_boundaries: Vec::new(),
     };
+    // The modes live in the shared model; the worker remembers them only to
+    // notice a change.
+    let (shuffle, repeat) = {
+        let order = worker.order();
+        (order.shuffle(), order.repeat())
+    };
+    worker.sync_modes(shuffle, repeat);
     let handle = std::thread::Builder::new()
         .name("rustamp-decode".into())
         .spawn(move || {
@@ -458,15 +436,6 @@ enum Outcome {
     Stop,
     /// The engine is shutting down.
     Quit,
-}
-
-/// The queue index `delta` entries away from `index`, clamped to `0..len`.
-///
-/// `len` is never zero here: the run loop has already returned when the queue is
-/// empty.
-pub(crate) fn clamped_index(index: u32, delta: i32, len: usize) -> u32 {
-    let last = len.saturating_sub(1) as i64;
-    (i64::from(index) + i64::from(delta)).clamp(0, last) as u32
 }
 
 /// What one block run through the DSP chain did.
@@ -517,12 +486,11 @@ struct Worker {
     /// "Stop after current track" is armed (RFC 0005 O8): the run ends at the
     /// end of the current track instead of advancing.
     stop_after_current: bool,
+    /// The shuffle mode as the worker last saw it. The model is the truth;
+    /// this is what a change is noticed against.
     shuffle: bool,
+    /// The repeat mode as the worker last saw it (see `shuffle`).
     repeat: bool,
-    shuffle_plan: Vec<usize>,
-    shuffle_pos: usize,
-    prev_shuffle_plan: Option<Vec<usize>>,
-    rng_state: u64,
     current_index: u32,
     pending_seek: Option<(Duration, u64, u32)>,
     pending_skip: Option<Outcome>,
@@ -536,9 +504,6 @@ struct Worker {
     /// A DSP stage failure was already reported this run (RFC 0014 §4.2,
     /// first failure sticks): the worker is one run, so the flag is per run.
     stage_failed: bool,
-    /// Timeline positions of repeat cycle loop seams for cycles that have been
-    /// prebuffered while repeat was ON.
-    cycle_boundaries: Vec<u64>,
 }
 
 impl Worker {
@@ -546,24 +511,6 @@ impl Worker {
         let mut index = start_index;
         let mut start_at = start_at;
         self.current_index = index;
-        if self.shuffle && !self.cfg.queue.is_empty() {
-            if self.shuffle_plan.len() != self.cfg.queue.len()
-                || !self.shuffle_plan.contains(&(start_index as usize))
-            {
-                // The engine handed no usable plan: plan one anchored at the
-                // track this run starts at (S15 §4.1) and report it, so the
-                // engine's published plan matches the traversal.
-                self.init_shuffle_plan(start_index as usize);
-            } else {
-                // Traverse the engine's plan (the engine owns it — S15);
-                // the position is where this run's first track sits in it.
-                self.shuffle_pos = self
-                    .shuffle_plan
-                    .iter()
-                    .position(|&t| t == start_index as usize)
-                    .unwrap_or(0);
-            }
-        }
         // The previous track ran to its end and the converter still holds its
         // tail: a next track in the same format continues that stream.
         let mut carry = false;
@@ -611,99 +558,14 @@ impl Worker {
                 break;
             }
 
+            // The traversal order (spec S15) decides what comes next: the
+            // permutation, the repeat boundary and the history live in the
+            // model the engine shares with this thread.
             let next_target = match outcome {
-                Outcome::Ended | Outcome::SkipNext => {
-                    if !self.shuffle {
-                        let next = index.saturating_add(1);
-                        if (next as usize) < self.cfg.queue.len() {
-                            Some(next)
-                        } else if self.repeat && !self.cfg.queue.is_empty() {
-                            self.cycle_boundaries.push(self.timeline);
-                            Some(0)
-                        } else {
-                            None
-                        }
-                    } else {
-                        if self.shuffle_plan.is_empty() {
-                            self.init_shuffle_plan(index as usize);
-                        }
-                        if self.shuffle_pos + 1 < self.shuffle_plan.len() {
-                            self.shuffle_pos += 1;
-                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
-                        } else if self.repeat && !self.cfg.queue.is_empty() {
-                            self.cycle_boundaries.push(self.timeline);
-                            let last = self.shuffle_plan.last().copied();
-                            self.replan_shuffle_new_cycle(last);
-                            Some(self.shuffle_plan[0] as u32)
-                        } else {
-                            None
-                        }
-                    }
-                }
-                Outcome::SkipPrev => {
-                    if !self.shuffle {
-                        if index > 0 {
-                            Some(index - 1)
-                        } else if self.repeat && !self.cfg.queue.is_empty() {
-                            Some((self.cfg.queue.len() - 1) as u32)
-                        } else {
-                            Some(0)
-                        }
-                    } else {
-                        if self.shuffle_plan.is_empty() {
-                            self.init_shuffle_plan(index as usize);
-                        }
-                        if self.shuffle_pos > 0 {
-                            self.shuffle_pos -= 1;
-                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
-                        } else if self.repeat && self.cfg.queue.len() > 1 {
-                            if let Some(prev) = self.prev_shuffle_plan.take() {
-                                self.shuffle_plan = prev;
-                                self.shuffle_pos = self.shuffle_plan.len() - 1;
-                                let _ = self.tx.send(DecodeOut::ShufflePlanned {
-                                    plan: self.shuffle_plan.clone(),
-                                    prev_plan: None,
-                                });
-                                Some(self.shuffle_plan[self.shuffle_pos] as u32)
-                            } else {
-                                self.shuffle_pos = self.shuffle_plan.len() - 1;
-                                Some(self.shuffle_plan[self.shuffle_pos] as u32)
-                            }
-                        } else {
-                            Some(self.shuffle_plan[0] as u32)
-                        }
-                    }
-                }
-                Outcome::SkipBy(delta) => {
-                    if delta == 0 || self.cfg.queue.is_empty() {
-                        Some(index)
-                    } else if !self.shuffle {
-                        let qlen = self.cfg.queue.len() as i32;
-                        if self.repeat {
-                            let curr = index as i32;
-                            let rem = (curr + delta).rem_euclid(qlen);
-                            Some(rem as u32)
-                        } else {
-                            Some(clamped_index(index, delta, self.cfg.queue.len()))
-                        }
-                    } else {
-                        if self.shuffle_plan.is_empty() {
-                            self.init_shuffle_plan(index as usize);
-                        }
-                        let plen = self.shuffle_plan.len() as i32;
-                        if self.repeat {
-                            let curr = self.shuffle_pos as i32;
-                            let rem = (curr + delta).rem_euclid(plen);
-                            self.shuffle_pos = rem as usize;
-                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
-                        } else {
-                            let curr = self.shuffle_pos as i32;
-                            let target = (curr + delta).clamp(0, plen - 1) as usize;
-                            self.shuffle_pos = target;
-                            Some(self.shuffle_plan[self.shuffle_pos] as u32)
-                        }
-                    }
-                }
+                Outcome::Ended => self.advance_in_order(),
+                Outcome::SkipNext => self.next_in_order(),
+                Outcome::SkipPrev => self.prev_in_order(),
+                Outcome::SkipBy(delta) => self.skip_in_order(delta),
                 Outcome::Stop | Outcome::Quit => None,
             };
 
@@ -731,81 +593,78 @@ impl Worker {
         }
     }
 
-    fn rng_next(&mut self) -> u64 {
-        let mut x = self.rng_state;
-        if x == 0 {
-            x = 0x9E37_79B9_7F4A_7C15;
-        }
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.rng_state = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    /// The shared playback order (spec S15).
+    fn order(&self) -> MutexGuard<'_, PlaybackOrder> {
+        self.cfg
+            .order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn rng_below(&mut self, upper: usize) -> usize {
-        if upper <= 1 {
-            return 0;
-        }
-        let n = upper as u64;
-        let limit = u64::MAX / n * n;
-        loop {
-            let value = self.rng_next();
-            if value < limit {
-                return (value % n) as usize;
-            }
-        }
+    /// The next track in the active playback order, for the *automatic*
+    /// advance at a track end (S15 §3.1).
+    ///
+    /// It takes the mode as it is now: a mode change takes effect at the
+    /// next queue boundary check (S15 §4.3).
+    fn advance_in_order(&mut self) -> Option<u32> {
+        self.order().next_index().map(|index| index as u32)
     }
 
-    fn shuffle_slice(&mut self, items: &mut [usize]) {
-        for i in (1..items.len()).rev() {
-            let j = self.rng_below(i + 1);
-            items.swap(i, j);
-        }
+    /// The next track in the active playback order, for a manual `Next`
+    /// (S15 §3.1).
+    fn next_in_order(&mut self) -> Option<u32> {
+        self.in_issued_mode(|order| order.next_index().map(|index| index as u32))
     }
 
-    fn init_shuffle_plan(&mut self, start_index: usize) {
-        let len = self.cfg.queue.len();
-        if len == 0 {
-            self.shuffle_plan.clear();
-            self.shuffle_pos = 0;
-            return;
-        }
-        let mut remaining: Vec<usize> = (0..len).filter(|&i| i != start_index).collect();
-        self.shuffle_slice(&mut remaining);
-        let mut plan = Vec::with_capacity(len);
-        plan.push(start_index);
-        plan.extend(remaining);
-        self.shuffle_plan = plan;
-        self.shuffle_pos = 0;
-        self.prev_shuffle_plan = None;
-        // The engine owns the published plan; report one this worker had to
-        // generate itself so the engine adopts it (S15).
-        let _ = self.tx.send(DecodeOut::ShufflePlanned {
-            plan: self.shuffle_plan.clone(),
-            prev_plan: None,
-        });
+    /// The previous track in the active playback order (S15 §3.2): in shuffle
+    /// mode the track that was played immediately before the current one.
+    fn prev_in_order(&mut self) -> Option<u32> {
+        self.in_issued_mode(|order| order.prev_index().map(|index| index as u32))
     }
 
-    fn replan_shuffle_new_cycle(&mut self, last_track: Option<usize>) {
-        let len = self.cfg.queue.len();
-        if len == 0 {
-            return;
-        }
-        let mut plan: Vec<usize> = (0..len).collect();
-        self.shuffle_slice(&mut plan);
-        if len > 1 && last_track.is_some() && Some(plan[0]) == last_track {
-            let swap_idx = 1 + self.rng_below(len - 1);
-            plan.swap(0, swap_idx);
-        }
-        self.prev_shuffle_plan = Some(std::mem::replace(&mut self.shuffle_plan, plan));
-        self.shuffle_pos = 0;
-        // Report the new cycle: the engine adopts it so its published plan
-        // stays the one being traversed (S15).
-        let _ = self.tx.send(DecodeOut::ShufflePlanned {
-            plan: self.shuffle_plan.clone(),
-            prev_plan: self.prev_shuffle_plan.clone(),
-        });
+    /// The track `delta` entries away in the active playback order
+    /// (S15 §3.3).
+    fn skip_in_order(&mut self, delta: i32) -> Option<u32> {
+        self.in_issued_mode(|order| order.skip_by(delta).map(|index| index as u32))
+    }
+
+    /// Evaluate a navigation command with the repeat mode it was issued
+    /// under.
+    ///
+    /// The engine applies a mode change to the model at once, so that the
+    /// published plan is the one the traversal follows. A navigation command
+    /// that was queued before that change must not be wrapped by it, so the
+    /// repeat mode of the command is the one this thread last saw in the
+    /// command stream. The model keeps the published mode afterwards.
+    fn in_issued_mode<T>(&mut self, navigate: impl FnOnce(&mut PlaybackOrder) -> T) -> T {
+        let mut order = self.order();
+        let published = order.repeat();
+        order.set_repeat(self.repeat);
+        let result = navigate(&mut order);
+        order.set_repeat(published);
+        result
+    }
+
+    /// Take over the modes the engine published, and report what changed.
+    ///
+    /// The modes live in the model; this thread remembers the ones it last
+    /// saw in the command stream, so that a change can be noticed and a
+    /// navigation command can be evaluated with the mode it was issued
+    /// under.
+    fn sync_modes(&mut self, shuffle: bool, repeat: bool) -> (bool, bool) {
+        let changed = (shuffle != self.shuffle, repeat != self.repeat);
+        self.shuffle = shuffle;
+        self.repeat = repeat;
+        changed
+    }
+
+    /// Keep the worker's own place in the permutation after the engine
+    /// re-planned it around the track that is playing (S15 §4.1): the track
+    /// this thread is decoding stays where it is in the new plan, so it is
+    /// not abandoned half-way.
+    fn realign_order(&mut self) {
+        let mut order = self.order();
+        order.set_current_index(Some(self.current_index as usize));
     }
 
     /// Hand the ring's write end back (used when the thread exits).
@@ -905,9 +764,6 @@ impl Worker {
             if self.stopped {
                 return Outcome::Stop;
             }
-            let (_written, consumed) = self.cfg.sync.counters();
-            self.cycle_boundaries
-                .retain(|&boundary| consumed < boundary);
             if self.check_control() {
                 return self.pending_skip.take().unwrap_or(Outcome::Stop);
             }
@@ -1147,53 +1003,13 @@ impl Worker {
                     return true;
                 }
                 Ok(DecodeMsg::SetStopAfterCurrent(armed)) => self.stop_after_current = armed,
-                Ok(DecodeMsg::SetShuffle {
-                    on,
-                    plan,
-                    prev_plan,
-                }) => {
-                    if self.shuffle != on {
-                        self.shuffle = on;
-                        if on && !self.cfg.queue.is_empty() {
-                            if plan.len() == self.cfg.queue.len() {
-                                // The engine owns the plan (S15): adopt the
-                                // one it published, anchored at the track
-                                // that is playing.
-                                self.shuffle_plan = plan;
-                                self.prev_shuffle_plan = prev_plan;
-                                self.shuffle_pos = self
-                                    .shuffle_plan
-                                    .iter()
-                                    .position(|&t| t == self.current_index as usize)
-                                    .unwrap_or(0);
-                            } else {
-                                // No usable plan from the engine: plan on our
-                                // own and report it; the engine adopts it on
-                                // its next poll.
-                                self.init_shuffle_plan(self.current_index as usize);
-                            }
-                        } else {
-                            self.shuffle_plan.clear();
-                            self.prev_shuffle_plan = None;
-                            self.shuffle_pos = 0;
-                        }
-                    }
-                }
-                Ok(DecodeMsg::SetRepeat(on)) => {
-                    self.repeat = on;
-                    if !on {
-                        let (_written, consumed) = self.cfg.sync.counters();
-                        if let Some(&boundary) =
-                            self.cycle_boundaries.iter().find(|&&b| consumed < b)
-                        {
-                            self.cycle_boundaries.clear();
-                            self.flush_converter();
-                            let _ = self.tx.send(DecodeOut::EndOfStream {
-                                timeline_end: boundary,
-                            });
-                            self.pending_skip = Some(Outcome::Stop);
-                            return true;
-                        }
+                Ok(DecodeMsg::ModesChanged { shuffle, repeat }) => {
+                    let (shuffle_changed, _) = self.sync_modes(shuffle, repeat);
+                    if shuffle_changed && shuffle {
+                        // The engine re-planned the permutation around the
+                        // track that is playing (S15 §4.1); this thread keeps
+                        // its own place in it.
+                        self.realign_order();
                     }
                 }
                 Ok(DecodeMsg::Seek {
@@ -1232,104 +1048,42 @@ impl Worker {
                 Ok(DecodeMsg::Resume) => {
                     self.paused = false;
                 }
-                Ok(DecodeMsg::SetRepeat(on)) => {
-                    self.repeat = on;
-                    if on && !self.cfg.queue.is_empty() {
+                Ok(DecodeMsg::ModesChanged { shuffle, repeat }) => {
+                    // The shuffle change needs no action here: the engine
+                    // re-planned the permutation around the track that is
+                    // playing (S15 §4.1) and this thread keeps the place it
+                    // had in it.
+                    let (_, repeat_changed) = self.sync_modes(shuffle, repeat);
+                    if repeat_changed && repeat && !self.cfg.queue.is_empty() {
+                        // Repeat was turned on at the end of the queue: the
+                        // traversal continues with the next cycle (S15 §2).
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
-                        if !self.shuffle {
-                            self.cycle_boundaries.push(self.timeline);
-                            return Some(0);
-                        } else {
-                            if self.shuffle_plan.is_empty() {
-                                self.init_shuffle_plan(0);
-                            }
-                            let last = self.shuffle_plan.last().copied();
-                            self.replan_shuffle_new_cycle(last);
-                            self.cycle_boundaries.push(self.timeline);
-                            return Some(self.shuffle_plan[0] as u32);
-                        }
-                    }
-                }
-                Ok(DecodeMsg::SetShuffle {
-                    on,
-                    plan,
-                    prev_plan,
-                }) => {
-                    if self.shuffle != on {
-                        self.shuffle = on;
-                        if on && !self.cfg.queue.is_empty() {
-                            if plan.len() == self.cfg.queue.len() {
-                                self.shuffle_plan = plan;
-                                self.prev_shuffle_plan = prev_plan;
-                                self.shuffle_pos = 0;
-                            } else {
-                                self.init_shuffle_plan(0);
-                            }
-                        } else {
-                            self.shuffle_plan.clear();
-                            self.prev_shuffle_plan = None;
-                            self.shuffle_pos = 0;
+                        if let Some(next) = self.advance_in_order() {
+                            return Some(next);
                         }
                     }
                 }
                 Ok(DecodeMsg::Next) => {
                     if self.repeat && !self.cfg.queue.is_empty() {
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
-                        if !self.shuffle {
-                            self.cycle_boundaries.push(self.timeline);
-                            return Some(0);
-                        } else {
-                            let last = self.shuffle_plan.last().copied();
-                            self.replan_shuffle_new_cycle(last);
-                            self.cycle_boundaries.push(self.timeline);
-                            return Some(self.shuffle_plan[0] as u32);
+                        if let Some(next) = self.next_in_order() {
+                            return Some(next);
                         }
                     }
                 }
                 Ok(DecodeMsg::Prev) => {
                     if !self.cfg.queue.is_empty() {
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
-                        if !self.shuffle {
-                            if self.repeat {
-                                return Some((self.cfg.queue.len() - 1) as u32);
-                            } else {
-                                return Some(0);
-                            }
-                        } else {
-                            if self.shuffle_plan.is_empty() {
-                                self.init_shuffle_plan(0);
-                            }
-                            if self.repeat
-                                && self.cfg.queue.len() > 1
-                                && let Some(prev) = self.prev_shuffle_plan.take()
-                            {
-                                self.shuffle_plan = prev;
-                                self.shuffle_pos = self.shuffle_plan.len() - 1;
-                                let _ = self.tx.send(DecodeOut::ShufflePlanned {
-                                    plan: self.shuffle_plan.clone(),
-                                    prev_plan: None,
-                                });
-                                return Some(self.shuffle_plan[self.shuffle_pos] as u32);
-                            }
-                            return Some(self.shuffle_plan[0] as u32);
+                        if let Some(prev) = self.prev_in_order() {
+                            return Some(prev);
                         }
                     }
                 }
                 Ok(DecodeMsg::SkipBy(delta)) => {
                     if delta != 0 && !self.cfg.queue.is_empty() && self.repeat {
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
-                        if !self.shuffle {
-                            let qlen = self.cfg.queue.len() as i32;
-                            let rem = delta.rem_euclid(qlen);
-                            return Some(rem as u32);
-                        } else {
-                            if self.shuffle_plan.is_empty() {
-                                self.init_shuffle_plan(0);
-                            }
-                            let plen = self.shuffle_plan.len() as i32;
-                            let rem = delta.rem_euclid(plen) as usize;
-                            self.shuffle_pos = rem;
-                            return Some(self.shuffle_plan[self.shuffle_pos] as u32);
+                        if let Some(target) = self.skip_in_order(delta) {
+                            return Some(target);
                         }
                     }
                 }

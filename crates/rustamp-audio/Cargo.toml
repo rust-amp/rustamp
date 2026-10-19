@@ -13,6 +13,7 @@ rustamp-core.workspace = true
 rustamp-dsp.workspace = true
 rustamp-mediahost.workspace = true
 rustamp-meta.workspace = true
+rustamp-playlist.workspace = true
 rustamp-proto.workspace = true
 rtrb.workspace = true
 rubato.workspace = true
