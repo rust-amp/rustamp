@@ -561,22 +561,36 @@ fn abrupt_host_loss_is_loud_and_never_eos() {
         let mut transport = StreamTransport::new(br, bw);
         transport.send(&Message::hello()).unwrap();
         let mut back = None;
+        let mut spec = None;
+        let mut input = None;
         loop {
             match transport.recv().unwrap() {
                 Message::Hello { .. } => {}
                 Message::Ping(token) => transport.send(&Message::Pong(token)).unwrap(),
-                Message::DspConfigure { spec, .. } => {
+                Message::DspConfigure {
+                    spec: configured, ..
+                } => {
+                    spec = Some(configured);
                     // Buffer the back-ring offer: the production order is
                     // in-ring Ready first, then the back-ring offer (see
                     // `serve_dsp` and `DspSession::handshake`). Sending the
                     // back offer here would put it ahead of the in-ring
                     // Ready and fail the handshake.
                     let offer = NamedPcmRings
-                        .create_directed(spec, 1, RingDirection::HostToMain)
+                        .create_directed(configured, 1, RingDirection::HostToMain)
                         .unwrap();
                     back = Some(offer);
                 }
-                Message::RingOffer { generation, .. } => {
+                offer @ Message::RingOffer { generation, .. } => {
+                    // Open the in-ring, like a real host: the player's frame
+                    // is delivered when the host takes it, so a host that
+                    // never takes would strand it.
+                    let spec = spec.expect("the configure must come before the ring offer");
+                    input = Some(
+                        NamedPcmRings
+                            .open_directed(&offer, spec, RingDirection::MainToHost)
+                            .unwrap(),
+                    );
                     transport
                         .send(&Message::RingReady {
                             kind: rustamp_ipc::shm::RingKind::Pcm,
@@ -595,6 +609,15 @@ fn abrupt_host_loss_is_loud_and_never_eos() {
                         .unwrap();
                     transport
                         .send(&Message::DspReady { latency_frames: 0 })
+                        .unwrap();
+                    // Take the frame the player writes, like a real host:
+                    // block n out is block n back (RFC 0006 §6).
+                    let mut frame = [0.0f32; 2];
+                    input
+                        .as_mut()
+                        .expect("the in-ring is live")
+                        .consumer
+                        .read_into_blocking(&mut frame, Some(STALL_WAIT))
                         .unwrap();
                     death.recv_timeout(Duration::from_secs(30)).unwrap();
                     // RingProducer::Drop does NOT close the ring.

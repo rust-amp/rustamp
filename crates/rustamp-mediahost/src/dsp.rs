@@ -23,6 +23,16 @@
 //! chain state is cleared — at every poll site, including idle after a
 //! drained EOS — and `DspSession::reset` waits for that acknowledgement, so
 //! a reset that returns is a reset that landed.
+//!
+//! The **write** is fenced the same way (RFC 0006 §6): a write returns only
+//! after the host has *taken* the frames from the in-ring, so `Ok(())` is a
+//! delivery fact and not a queueing fact. A ring that still has room would
+//! otherwise accept frames nobody will ever process — between the helper's
+//! death and the observation of the control EOF, and for as long as a helper
+//! stops draining — and the write would report success for a frame that is
+//! lost. The frame counters are the evidence here, exactly as they are the
+//! end-of-transfer evidence; the control channel is what turns the wait loud
+//! when the helper is gone.
 
 use std::time::{Duration, Instant};
 
@@ -34,7 +44,8 @@ use rustamp_proto::host::{DspStageDesc, PcmSpecWire};
 
 use crate::control::{ControlPeer, RingAbort};
 use crate::pcm::{
-    ClosePair, PcmOffer, PcmRings, RingCounters, read_frames, validate_spec, write_frames,
+    ClosePair, PcmOffer, PcmRings, RING_POLL, RingCounters, read_frames, validate_spec,
+    write_frames,
 };
 use crate::{MediaHostError, Result};
 
@@ -534,6 +545,13 @@ impl<F: PcmRings> DspSession<F> {
     /// ring with a healthy control channel is a loud disconnect, never data
     /// loss. Misaligned or empty buffers are caller errors. The bounded form
     /// of the same write is [`DspSession::write_timeout`].
+    ///
+    /// The write is a **delivery fact**, not a queueing fact: it returns only
+    /// after the host has taken the frames from the in-ring (the frame
+    /// counters are the DSP path's evidence, RFC 0006 §6). A write that
+    /// returns `Ok(())` has therefore not dropped a frame into a ring nobody
+    /// reads: the chain has it, and a helper that dies before taking it
+    /// turns the wait loud instead of reporting success.
     pub fn write(&mut self, buf: &[f32]) -> Result<()> {
         self.write_timeout(buf, None)
     }
@@ -541,14 +559,19 @@ impl<F: PcmRings> DspSession<F> {
     /// Push whole frames toward the host, bounded by `timeout` for the whole
     /// call (not per chunk). `None` waits indefinitely, exactly like
     /// [`DspSession::write`]. `Some` returns [`MediaHostError::TimedOut`] when
-    /// the resident has not made room in time: a stall that fails loudly,
-    /// never false EOS and never a silent short write — `Ok(())` means the
-    /// whole buffer was accepted, and the return type carries no accepted
-    /// count, so a caller must treat the stream as stalled rather than
-    /// continue writing. Frames the ring accepted before the timeout stay
-    /// delivered; the timeout itself drops nothing. The engine-side resident
-    /// adapter uses this so a wedged resident fails the track instead of
-    /// hanging the decode thread.
+    /// the resident has neither made room in time nor taken the frames: a
+    /// stall that fails loudly, never false EOS and never a silent short
+    /// write — `Ok(())` means the host has the whole buffer, and the return
+    /// type carries no accepted count, so a caller must treat the stream as
+    /// stalled rather than continue writing. Frames the ring accepted before
+    /// the timeout stay delivered; the timeout itself drops nothing. The
+    /// engine-side resident adapter uses this so a wedged resident fails the
+    /// track instead of hanging the decode thread.
+    ///
+    /// The bound covers the delivery as well as the space: the call returns
+    /// only after the host has taken the frames (see [`DspSession::write`]),
+    /// so a helper that stops draining the in-ring fails the write instead
+    /// of accepting frames nobody will process.
     pub fn write_timeout(&mut self, buf: &[f32], timeout: Option<Duration>) -> Result<()> {
         self.peer.check()?;
         if self.input_closed {
@@ -590,7 +613,92 @@ impl<F: PcmRings> DspSession<F> {
                 }
             }
         }
+        // The delivery fence: the host must have taken the frames this call
+        // published. Without it a write would report success for a frame
+        // that nobody will ever process — the ring still has room while the
+        // helper is gone or has stopped draining (the write gap).
+        self.await_delivery(deadline)?;
         Ok(())
+    }
+
+    /// Wait until the host has taken the frames the last write published.
+    ///
+    /// The wait ends in one of three ways, and only the first is a success:
+    /// the host took the frames (the delivery the write promised), the
+    /// control channel failed (the helper is gone: the frames are lost and
+    /// the write fails loudly, naming the death), or the caller's deadline
+    /// passed (a stall: the write fails loudly, never a silent success).
+    fn await_delivery(&mut self, deadline: Option<Instant>) -> Result<()> {
+        // The target: the host reads the in-ring in order, so it has taken
+        // this write's frames exactly when its read count reached the
+        // producer's write count. The count is the evidence (RFC 0006 §6).
+        let target = self.to_host.frames_written();
+        loop {
+            if self.taken_frames() >= target {
+                return Ok(());
+            }
+            // The control channel's terminal state: a dead helper turns the
+            // wait loud instead of leaving the frames in the ring.
+            self.peer.check()?;
+            if self.to_host.is_closed() {
+                // The supervisor closed the ring, so the helper is gone.
+                self.peer.check()?;
+                return Err(MediaHostError::Disconnected(
+                    "DSP host closed its input ring".into(),
+                ));
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(MediaHostError::TimedOut);
+            }
+            // Wait for the host's progress. Two events carry it, and both
+            // are only hints (RFC 0007 §6.1): the host's read frees space in
+            // the in-ring (the space event) and its processed output arrives
+            // on the back-ring (the data event). The counters above stay
+            // the evidence.
+            if self.to_host.free_frames() == 0 {
+                // The in-ring is full: the host's read signals the space
+                // event, so the wait wakes exactly on the take.
+                match self.to_host.wait_writable(Some(RING_POLL)) {
+                    Ok(_) => {}
+                    Err(RingError::Closed) => {
+                        self.peer.check()?;
+                        return Err(MediaHostError::Disconnected(
+                            "DSP host closed its input ring".into(),
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else if self.from_host.frames_available() == 0 {
+                // The back-ring is empty: the host's publish signals the
+                // data event.
+                match self.from_host.wait_readable(Some(RING_POLL)) {
+                    Ok(_) => {}
+                    Err(RingError::Closed) => {
+                        self.peer.check()?;
+                        return Err(MediaHostError::Disconnected(
+                            "DSP host closed its back-ring".into(),
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                // Both events are set, so neither wait would block: the
+                // counters are polled instead, and the poll slice keeps a
+                // helper that never takes the frame from burning a core.
+                std::thread::sleep(RING_POLL);
+            }
+        }
+    }
+
+    /// Frames the host has taken from the in-ring.
+    ///
+    /// The producer's own count minus the frames still in the ring: the
+    /// difference is what the consumer read (RFC 0007 §6.1: the counters are
+    /// the evidence, a wake signal is only a hint).
+    fn taken_frames(&self) -> u64 {
+        self.to_host
+            .frames_written()
+            .saturating_sub(self.to_host.frames_available())
     }
 
     /// Pull processed frames. `None` waits until data, a drained close, or a
