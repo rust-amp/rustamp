@@ -3110,6 +3110,112 @@ mod tests {
     }
 
     #[test]
+    fn jump_to_file_lists_the_matches_and_counts_them() {
+        use rustamp_core::command::JumpTarget;
+        let (mut app, dir) = app_with_file(None);
+        app.engine.set_queue(vec![
+            TrackSource::path(track(&dir, "alpha.mp3")),
+            TrackSource::path(track(&dir, "beta.mp3")),
+            TrackSource::path(track(&dir, "Gamma Beta.mp3")),
+        ]);
+        app.sync_entry_ids();
+        app.submit(Command::OpenJump {
+            target: JumpTarget::File,
+        })
+        .unwrap();
+
+        // The search field, one row per match and the count line. The first
+        // match is the selected one, so it carries the marker.
+        let lines = app.open_dialog_lines().unwrap();
+        assert_eq!(lines.first().map(String::as_str), Some("Search: "));
+        assert_eq!(lines.len(), 1 + 3 + 1, "{lines:?}");
+        assert!(lines[1].starts_with("> 1. "), "{lines:?}");
+        assert!(lines[1].ends_with("alpha.mp3"), "{lines:?}");
+        assert!(lines[2].starts_with("  2. "), "{lines:?}");
+        assert!(lines[2].ends_with("beta.mp3"), "{lines:?}");
+        assert!(lines[3].starts_with("  3. "), "{lines:?}");
+        assert!(lines[3].ends_with("Gamma Beta.mp3"), "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("3 of 3 entries"));
+
+        // A search narrows the list and the count.
+        assert!(app.dialog_text("BETA"));
+        let lines = app.open_dialog_lines().unwrap();
+        assert_eq!(lines.first().map(String::as_str), Some("Search: BETA"));
+        assert!(lines[1].starts_with("> 2. "), "{lines:?}");
+        assert!(lines[1].ends_with("beta.mp3"), "{lines:?}");
+        assert!(lines[2].starts_with("  3. "), "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("2 of 3 entries"));
+    }
+
+    #[test]
+    fn jump_to_file_keeps_the_selection_in_view_and_starts_over_next_time() {
+        use rustamp_core::command::JumpTarget;
+        let (mut app, dir) = app_with_file(None);
+        let queue: Vec<_> = (0..15)
+            .map(|index| TrackSource::path(track(&dir, &format!("track{index:02}.mp3"))))
+            .collect();
+        app.engine.set_queue(queue);
+        app.sync_entry_ids();
+        app.submit(Command::OpenJump {
+            target: JumpTarget::File,
+        })
+        .unwrap();
+
+        // The window shows ten rows, the selected one marked.
+        let lines = app.open_dialog_lines().unwrap();
+        assert_eq!(lines.len(), 1 + rustamp_ui::JUMP_FILE_ROWS + 1, "{lines:?}");
+        assert!(lines[1].starts_with("> 1. "), "{lines:?}");
+
+        // Moving down past the window scrolls it: the selected row stays
+        // visible and stays the marked one.
+        for _ in 0..12 {
+            assert!(app.dialog_key(Key::Down));
+        }
+        let lines = app.open_dialog_lines().unwrap();
+        let marked: Vec<&String> = lines.iter().filter(|line| line.starts_with("> ")).collect();
+        assert_eq!(marked.len(), 1, "{lines:?}");
+        assert!(marked[0].starts_with("> 13. "), "{lines:?}");
+
+        // Closing and opening the box again starts over: no search text and
+        // the first row selected.
+        assert!(app.dialog_key(Key::Escape));
+        app.submit(Command::OpenJump {
+            target: JumpTarget::File,
+        })
+        .unwrap();
+        assert_eq!(app.jump_text(), "");
+        let lines = app.open_dialog_lines().unwrap();
+        assert!(lines[1].starts_with("> 1. "), "{lines:?}");
+    }
+
+    #[test]
+    fn the_jump_to_file_shortcuts_open_the_box() {
+        use rustamp_core::command::JumpTarget;
+        let (mut app, _dir) = app_with_file(None);
+        let jump = rustamp_ui::DialogKind::Jump(JumpTarget::File);
+
+        // S03 §1/§2: `J` and `Num.` both carry the command id 40194, which
+        // opens the jump-to-file box.
+        for key in [Key::Letter(b'J'), Key::NumDecimal] {
+            assert!(app.dialog_open_kind().is_none());
+            let outcome = app.key_down(key, Modifiers::NONE).unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    Some(rustamp_ui::ShortcutOutcome::Commands(ref commands))
+                        if commands == &vec![Command::OpenJump { target: JumpTarget::File }]
+                ),
+                "{key:?} -> {outcome:?}"
+            );
+            assert!(app.dialog_is_open(jump), "{key:?}");
+
+            // Escape closes it again, so the next key starts from scratch.
+            assert!(app.dialog_key(Key::Escape));
+            assert!(app.dialog_open_kind().is_none());
+        }
+    }
+
+    #[test]
     fn double_size_reaches_the_equalizer_window() {
         // S05 §2.1: the flag resizes the equalizer to 550 x 232.
         let (mut app, _dir) = app_with_file(None);

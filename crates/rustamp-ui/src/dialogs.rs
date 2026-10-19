@@ -27,6 +27,14 @@
 //!   [`parse_jump_time_ms`]). Digits arrive as [`Key`]s; the colon has no
 //!   [`Key`], so it arrives as typed text through
 //!   [`DialogManager::type_text`].
+//! * The jump-to-file box (S03 id 40194) is a **search box over the
+//!   playlist**, not a second time box: it takes any text, lists the entries
+//!   whose display text contains it (ignoring case), and moves a selection
+//!   with `Up`/`Down` (see [`DialogManager::jump_index`] and
+//!   [`DialogManager::set_jump_rows`]). The app confirms the selection to
+//!   `Command::PlayEntry`. The reference's list layout, sorting, wording and
+//!   result count are unmeasured, so the row shape, the result window and
+//!   the count line are own choices.
 //! * The load-playlist dialog takes the playlist file the same way the
 //!   open-media faces take theirs: typing the full path (any printable
 //!   character through [`DialogManager::type_text`]; `Backspace` deletes),
@@ -479,10 +487,16 @@ impl DialogManager {
     /// Tells the manager how many results the jump-to-file box has now, so
     /// the selection stays inside them. The app calls it after every change
     /// of the search text.
+    ///
+    /// An empty result list puts the selection back on the first row: there
+    /// is no row to point at, and a stale index would select an unrelated
+    /// entry as soon as the next search matches again.
     pub fn set_jump_rows(&mut self, rows: usize) {
         self.jump_rows = rows;
         if rows > 0 {
             self.jump_index = self.jump_index.min(rows - 1);
+        } else {
+            self.jump_index = 0;
         }
     }
 
