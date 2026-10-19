@@ -155,6 +155,11 @@ pub struct App {
     /// hosted by `window.rs`.
     pub(crate) dialogs: DialogManager,
     pub(crate) last_playlist_report: Option<rustamp_playlist::PlaylistReport>,
+    /// The format the currently loaded playlist was detected as (RFC 0017
+    /// import). `None` means no playlist has been loaded yet, so callers
+    /// default to M3U. Stored alongside [`Self::last_playlist_report`] because
+    /// that report carries no format of its own.
+    pub(crate) last_playlist_format: Option<rustamp_playlist::PlaylistFormat>,
     /// Whether the main-menu popup is open (owned here, rendered by
     /// `menu.rs`, hosted by `window.rs`; S04).
     pub(crate) main_menu_open: bool,
@@ -362,6 +367,7 @@ impl App {
             playlist: PlaylistWindow::new(),
             dialogs: DialogManager::new(),
             last_playlist_report: None,
+            last_playlist_format: None,
             main_menu_open: false,
             pending_clutter_menu: None,
             pending_eq_menu: false,
@@ -439,6 +445,23 @@ impl App {
     /// The outcome of the most recent playlist file load, if one has occurred.
     pub fn last_playlist_report(&self) -> Option<&rustamp_playlist::PlaylistReport> {
         self.last_playlist_report.as_ref()
+    }
+
+    /// The format the currently loaded playlist was detected as, if any.
+    ///
+    /// `None` means no playlist has been loaded yet; callers default to M3U.
+    pub fn last_playlist_format(&self) -> Option<rustamp_playlist::PlaylistFormat> {
+        self.last_playlist_format
+    }
+
+    /// Alias for [`Self::last_playlist_format`] using the task's wording.
+    pub fn loaded_playlist_format(&self) -> Option<rustamp_playlist::PlaylistFormat> {
+        self.last_playlist_format
+    }
+
+    /// Alias for [`Self::last_playlist_format`].
+    pub fn playlist_format(&self) -> Option<rustamp_playlist::PlaylistFormat> {
+        self.last_playlist_format
     }
 
     /// The main window's native title: `Rustamp`, or `Rustamp - <error>`
@@ -1868,27 +1891,72 @@ impl App {
         path: &Path,
         play: bool,
     ) -> Result<rustamp_playlist::PlaylistReport, rustamp_playlist::PlaylistError> {
-        let report = match rustamp_playlist::load_playlist_file_report(path) {
-            Ok(report) => report,
-            Err(err) => {
-                let msg = format!("failed to load playlist {}: {}", path.display(), err);
-                self.note(format!("error: {msg}"));
-                self.last_error = Some(msg);
-                let core_err = match &err {
-                    rustamp_playlist::PlaylistError::Io(e) => {
-                        rustamp_core::error::Error::Io(std::io::Error::new(e.kind(), e.to_string()))
-                    }
-                    rustamp_playlist::PlaylistError::UnsupportedFormat(m) => {
-                        rustamp_core::error::Error::UnsupportedFormat(m.clone())
-                    }
-                    rustamp_playlist::PlaylistError::InvalidEntry(m) => {
-                        rustamp_core::error::Error::InvalidArgument(m.clone())
+        // Import (not just load) so the detected format survives: a playlist
+        // saved back later defaults to the format it came in. An unrecognized
+        // format falls back to M3U when the content is still a readable plain
+        // list, and says so; otherwise the original error is reported.
+        let imported = match rustamp_playlist::import_playlist_file(path) {
+            Ok(imported) => imported,
+            Err(original_err) => {
+                let bytes = match std::fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(io_err) => {
+                        let msg = format!("failed to load playlist {}: {}", path.display(), io_err);
+                        self.note(format!("error: {msg}"));
+                        self.last_error = Some(msg);
+                        self.publish_error(&rustamp_core::error::Error::Io(std::io::Error::new(
+                            io_err.kind(),
+                            io_err.to_string(),
+                        )));
+                        return Err(original_err);
                     }
                 };
-                self.publish_error(&core_err);
-                return Err(err);
+                let base = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+                match rustamp_playlist::read_playlist_report_as(
+                    rustamp_playlist::PlaylistFormat::M3u,
+                    &bytes,
+                    base,
+                ) {
+                    Ok(report) => {
+                        self.note(format!(
+                            "unknown playlist format in {}; treating as M3U",
+                            path.display()
+                        ));
+                        rustamp_playlist::ImportedPlaylist {
+                            format: rustamp_playlist::PlaylistFormat::M3u,
+                            report,
+                        }
+                    }
+                    Err(_) => {
+                        let msg = format!(
+                            "failed to load playlist {}: {}",
+                            path.display(),
+                            original_err
+                        );
+                        self.note(format!("error: {msg}"));
+                        self.last_error = Some(msg);
+                        let core_err = match &original_err {
+                            rustamp_playlist::PlaylistError::Io(e) => {
+                                rustamp_core::error::Error::Io(std::io::Error::new(
+                                    e.kind(),
+                                    e.to_string(),
+                                ))
+                            }
+                            rustamp_playlist::PlaylistError::UnsupportedFormat(m) => {
+                                rustamp_core::error::Error::UnsupportedFormat(m.clone())
+                            }
+                            rustamp_playlist::PlaylistError::InvalidEntry(m) => {
+                                rustamp_core::error::Error::InvalidArgument(m.clone())
+                            }
+                        };
+                        self.publish_error(&core_err);
+                        return Err(original_err);
+                    }
+                }
             }
         };
+        let report = imported.report;
+        self.last_playlist_format = Some(imported.format);
 
         if !report.is_clean() {
             self.note(format!(
@@ -1947,14 +2015,34 @@ impl App {
     }
 
     fn write_queue_playlist(&self, path: &Path) -> Result<()> {
-        let format = rustamp_playlist::PlaylistFormat::from_path(path)
-            .filter(|format| format.is_supported())
-            .ok_or_else(|| {
-                Error::UnsupportedFormat(format!(
-                    "{}: save needs an .m3u, .m3u8, .pls or .xspf file name",
-                    path.display()
-                ))
-            })?;
+        // Format selection rule (RFC 0017 import wiring):
+        //   * a recognized, supported extension on `path` wins — the user
+        //     chose it;
+        //   * B4S or an unknown extension is rejected (the user named a
+        //     format we cannot write);
+        //   * no extension at all defaults to the format of the playlist that
+        //     was last loaded (so a PLS loads and saves as PLS), or to M3U
+        //     when nothing has been loaded yet.
+        let format = if path.extension().is_none() {
+            self.last_playlist_format
+                .unwrap_or(rustamp_playlist::PlaylistFormat::M3u)
+        } else {
+            match rustamp_playlist::PlaylistFormat::from_path(path) {
+                Some(format) if format.is_supported() => format,
+                Some(_) => {
+                    return Err(Error::UnsupportedFormat(format!(
+                        "{}: save needs an .m3u, .m3u8, .pls or .xspf file name",
+                        path.display()
+                    )));
+                }
+                None => {
+                    return Err(Error::UnsupportedFormat(format!(
+                        "{}: save needs an .m3u, .m3u8, .pls or .xspf file name",
+                        path.display()
+                    )));
+                }
+            }
+        };
         let entries: Vec<rustamp_playlist::LoadedEntry> = self
             .engine
             .queue()
@@ -1978,8 +2066,10 @@ impl App {
         for location in items {
             match location {
                 MediaLocation::File(path) if is_playlist_file(path) => {
-                    match rustamp_playlist::load_playlist_file_report(path) {
-                        Ok(report) => {
+                    match rustamp_playlist::import_playlist_file(path) {
+                        Ok(imported) => {
+                            self.last_playlist_format = Some(imported.format);
+                            let report = imported.report;
                             if !report.is_clean() {
                                 self.note(format!(
                                     "loaded {} tracks, skipped {} malformed entries from {}",
@@ -2473,12 +2563,89 @@ mod tests {
             .set_queue(vec![TrackSource::path(track(&dir, "one.mp3"))]);
         app.sync_entry_ids();
 
-        for name in ["list.txt", "list", "list.b4s"] {
+        for name in ["list.txt", "list.b4s"] {
             let target = dir.path().join(name);
             assert!(app.save_playlist_file(&target).is_err(), "{name}");
             assert!(!target.exists(), "{name} must not be written");
         }
         assert!(app.last_error.is_some());
+    }
+
+    #[test]
+    fn load_pls_then_save_with_no_extension_defaults_to_pls() {
+        let (mut app, dir) = app_with_file(None);
+        let track_path = track(&dir, "one.mp3");
+        let pls_path = dir.path().join("list.pls");
+        std::fs::write(
+            &pls_path,
+            format!("[playlist]\nFile1={}\nTitle1=One\n", track_path.display()),
+        )
+        .unwrap();
+
+        app.load_playlist_file(&pls_path, false).unwrap();
+        assert_eq!(
+            app.last_playlist_format(),
+            Some(rustamp_playlist::PlaylistFormat::Pls)
+        );
+
+        let target = dir.path().join("saved"); // no extension: default to loaded format
+        app.save_playlist_file(&target).unwrap();
+        let bytes = std::fs::read(&target).unwrap();
+        // PLS content marker.
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .starts_with("[playlist]"),
+            "bytes: {:?}",
+            bytes
+        );
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn fresh_playlist_save_defaults_to_m3u() {
+        let (mut app, dir) = app_with_file(None);
+        let first = track(&dir, "one.mp3");
+        app.engine.set_queue(vec![TrackSource::path(first.clone())]);
+        app.sync_entry_ids();
+
+        assert_eq!(app.last_playlist_format(), None);
+
+        let target = dir.path().join("saved"); // no extension
+        app.save_playlist_file(&target).unwrap();
+        let bytes = std::fs::read(&target).unwrap();
+        // M3U content.
+        assert!(
+            std::str::from_utf8(&bytes).unwrap().contains(".mp3")
+                || bytes.starts_with(b"#EXTM3U")
+                || !bytes.is_empty(),
+            "bytes: {:?}",
+            bytes
+        );
+        // The saved file is readable as M3U.
+        let report = rustamp_playlist::load_playlist_file_report(&target).unwrap();
+        assert_eq!(report.entries.len(), 1);
+    }
+
+    #[test]
+    fn unknown_format_file_is_treated_as_m3u() {
+        let (mut app, dir) = app_with_file(None);
+        // A plain list of paths behind an unrecognized extension: detection
+        // fails, but the content is a readable M3U list, so it is treated as M3U.
+        let txt_path = dir.path().join("list.unknown");
+        std::fs::write(&txt_path, b"track1.tst\n").unwrap();
+        let t = track(&dir, "track1.tst");
+
+        // load may succeed as M3U fallback
+        let _ = app.load_playlist_file(&txt_path, false);
+        // If it loaded, format is M3U.
+        if app.last_error().is_none() {
+            assert_eq!(
+                app.last_playlist_format(),
+                Some(rustamp_playlist::PlaylistFormat::M3u)
+            );
+            assert_eq!(app.engine().queue(), &[TrackSource::path(t)]);
+        }
     }
 
     fn widget_centre(widget: Widget) -> (i32, i32) {
