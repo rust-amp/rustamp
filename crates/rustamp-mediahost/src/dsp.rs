@@ -91,20 +91,6 @@ impl DspResident for UnavailableDspResident {
     }
 }
 
-struct ActiveRing<R: MappedRegion>(RingProducer<R>);
-impl<R: MappedRegion> Drop for ActiveRing<R> {
-    fn drop(&mut self) {
-        self.0.close();
-    }
-}
-
-struct ActiveConsumer<R: MappedRegion>(RingConsumer<R>);
-impl<R: MappedRegion> Drop for ActiveConsumer<R> {
-    fn drop(&mut self) {
-        self.0.close();
-    }
-}
-
 enum Transition {
     Reconfigure {
         spec: PcmSpecWire,
@@ -268,6 +254,11 @@ pub fn serve_dsp<F: PcmRings>(
 ) -> Result<()> {
     let result = serve_inner(peer, rings, resident);
     if let Err(error) = &result {
+        // A local close (including ControlPeer::drop) can reach the player
+        // before the independent control stream delivers DspError. Let the
+        // player's monitor store the diagnostic and then close both rings;
+        // EOF/liveness remains the fallback if this send cannot reach it.
+        peer.release_abort();
         let _ = peer.send(Message::DspError {
             message: error.to_string(),
         });
@@ -348,8 +339,11 @@ fn serve_inner<F: PcmRings>(
             message: back_message,
             abort: back_abort,
         } = back_offer;
-        let mut input = ActiveConsumer(in_consumer);
-        let mut back = ActiveRing(back_producer);
+        // Endpoint drop only unmaps; normal transitions close explicitly.
+        // Errors leave closure to the player's control monitor so ring state
+        // cannot overtake the terminal diagnostic (see serve_dsp).
+        let mut input = in_consumer;
+        let mut back = back_producer;
         peer.set_abort(Box::new(ClosePair(in_abort, back_abort)) as Box<dyn RingAbort>)?;
         peer.send(Message::RingReady {
             kind: RingKind::Pcm,
@@ -371,11 +365,15 @@ fn serve_inner<F: PcmRings>(
                 }
                 message => match command(message)? {
                     Some(Transition::Reconfigure { spec: next, stages }) => {
+                        input.close();
+                        back.close();
                         chain = open_chain(resident, next, &stages)?;
                         spec = next;
                         continue 'generation;
                     }
                     Some(Transition::Stop) => {
+                        input.close();
+                        back.close();
                         peer.flush(CONTROL_WAIT)?;
                         return Ok(());
                     }
@@ -387,17 +385,18 @@ fn serve_inner<F: PcmRings>(
             latency_frames: chain.latency_frames(),
         })?;
         // 4. Run until the input closes, a reconfigure lands, or we stop.
-        // Every ring closes before replacement, including early errors via Drop.
-        match pump(peer, chain.as_mut(), &mut input.0, &mut back.0, spec)? {
+        // Every ring closes before replacement; errors close remotely only
+        // after the diagnostic is recorded by the player's monitor.
+        match pump(peer, chain.as_mut(), &mut input, &mut back, spec)? {
             PumpOut::Reconfigure { spec: next, stages } => {
-                input.0.close();
-                back.0.close();
+                input.close();
+                back.close();
                 chain = open_chain(resident, next, &stages)?;
                 spec = next;
             }
             PumpOut::Stop => {
-                input.0.close();
-                back.0.close();
+                input.close();
+                back.close();
                 peer.flush(CONTROL_WAIT)?;
                 return Ok(());
             }
@@ -405,8 +404,8 @@ fn serve_inner<F: PcmRings>(
                 // Graceful end-of-writes: every read frame was processed and
                 // published. Close the back-ring so the player drains to a
                 // sticky EOS, then wait for Shutdown or a fresh configure.
-                back.0.close();
-                input.0.close();
+                back.close();
+                input.close();
                 loop {
                     match wait_command(peer)? {
                         // Same fence as the pump (RFC 0015): the idle loop

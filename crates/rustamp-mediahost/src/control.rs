@@ -242,6 +242,14 @@ impl ControlPeer {
         Ok(())
     }
 
+    /// Relinquish local ring closure before sending a terminal DSP diagnostic.
+    /// The remote monitor stores that diagnostic before closing its own abort
+    /// handles. Local teardown must not race that store via shared ring state;
+    /// if publication fails, remote EOF/liveness still closes the rings.
+    pub(crate) fn release_abort(&self) {
+        self.state.lock().unwrap().abort = None;
+    }
+
     /// Check the sticky failure reason; a dead host is never ordinary EOS.
     pub fn check(&self) -> Result<()> {
         match &self.state.lock().unwrap().failure {

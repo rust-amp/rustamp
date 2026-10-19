@@ -49,7 +49,7 @@ mod resident;
 #[path = "support/streams.rs"]
 mod streams;
 
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -501,6 +501,8 @@ const FAIL_AT_BLOCK: usize = 1024;
 
 struct FailingChain {
     blocks: usize,
+    fail_after: usize,
+    release_failure: mpsc::Receiver<()>,
 }
 
 impl ResidentChain for FailingChain {
@@ -510,7 +512,10 @@ impl ResidentChain for FailingChain {
 
     fn process(&mut self, _buf: &mut [f32]) -> Result<()> {
         self.blocks += 1;
-        if self.blocks > FAIL_AT_BLOCK {
+        if self.blocks > self.fail_after {
+            self.release_failure
+                .recv_timeout(STALL_WAIT)
+                .expect("stall: the test never released the chain failure");
             return Err(MediaHostError::OperationFailed("clipping detected".into()));
         }
         // The healthy blocks pass through bit-exactly.
@@ -520,32 +525,43 @@ impl ResidentChain for FailingChain {
     fn reset(&mut self) {}
 }
 
-struct FailingResident;
+struct FailingResident {
+    fail_after: usize,
+    release_failure: Mutex<Option<mpsc::Receiver<()>>>,
+}
 
 impl DspResident for FailingResident {
     fn open(&self, _spec: PcmSpecWire, _stages: &[DspStageDesc]) -> Result<Box<dyn ResidentChain>> {
-        Ok(Box::new(FailingChain { blocks: 0 }))
+        Ok(Box::new(FailingChain {
+            blocks: 0,
+            fail_after: self.fail_after,
+            release_failure: self.release_failure.lock().unwrap().take().unwrap(),
+        }))
     }
 }
 
 #[test]
 fn midrun_chain_failure_is_a_loud_dsp_error_carrying_the_text() {
-    let (mut session, done) = start(FailingResident);
+    let (release, held) = mpsc::channel();
+    let (mut session, done) = start(FailingResident {
+        fail_after: FAIL_AT_BLOCK,
+        release_failure: Mutex::new(Some(held)),
+    });
     let mut out = [0.0; 2];
     // Write FAIL_AT_BLOCK + 1 frames one at a time. The in-ring holds a
     // single frame, so the host reads each frame as its own block: the
     // first FAIL_AT_BLOCK blocks pass through bit-exactly and pile up
     // unread in the back-ring, and block FAIL_AT_BLOCK + 1 fails. Keeping
     // the healthy backlog in flight across the failure is what makes the
-    // terminal read deterministic: the drain-then-close order hands the
-    // healthy frames over first, and by the time the ring is empty the
-    // `DspError` has long landed (the session's drained-close wake race of
-    // M19 §3 would only be reachable by a read blocked on an empty ring
-    // exactly at the failure).
+    // terminal read exercise the failure with a healthy backlog. Hold the
+    // failing callback until its write returns: delivery only means the
+    // host took the frame, not that processing succeeded. Without this
+    // precondition the final write may legitimately observe the failure.
     for frame in 0..=FAIL_AT_BLOCK {
         let v = frame as f32 / 8.0;
         write_pcm(&mut session, &[v, -v], "the frames around the failure");
     }
+    release.send(()).unwrap();
     // The host failed on the last block and exited with an error; its
     // outcome also proves the DspError was sent and flushed.
     let outcome = done
@@ -597,6 +613,98 @@ fn midrun_chain_failure_is_a_loud_dsp_error_carrying_the_text() {
         .expect_err("the failure must stick, never EOS");
     assert!(again.to_string().contains("clipping detected"), "{again}");
     drop(session);
+}
+
+/// Hold exactly the terminal control message before the player's monitor can
+/// see it. Framing is decoded and re-encoded, so no partial-read assumption or
+/// scheduler delay determines where the gate lands.
+struct HeldDiagnosticReader {
+    inner: streams::ByteReader,
+    pending: Cursor<Vec<u8>>,
+    seen: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl Read for HeldDiagnosticReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.pending.position() == self.pending.get_ref().len() as u64 {
+            let message =
+                rustamp_ipc::read_frame(&mut self.inner).map_err(std::io::Error::other)?;
+            if matches!(message, Message::DspError { .. }) {
+                self.seen.send(()).unwrap();
+                self.release
+                    .recv_timeout(STALL_WAIT)
+                    .expect("stall: the test never released the terminal diagnostic");
+            }
+            let mut bytes = Vec::new();
+            rustamp_ipc::write_frame(&mut bytes, &message).map_err(std::io::Error::other)?;
+            self.pending = Cursor::new(bytes);
+        }
+        self.pending.read(out)
+    }
+}
+
+#[test]
+fn chain_failure_reaches_the_monitor_before_ring_close_even_after_host_teardown() {
+    let ((ar, aw), (br, bw)) = streams::streams();
+    let (seen, diagnostic) = mpsc::channel();
+    let (release_diagnostic, held_diagnostic) = mpsc::channel();
+    let player = ControlPeer::start(
+        HeldDiagnosticReader {
+            inner: ar,
+            pending: Cursor::new(Vec::new()),
+            seen,
+            release: held_diagnostic,
+        },
+        aw,
+        LIVENESS,
+        false,
+    )
+    .unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
+    let (release_failure, held_failure) = mpsc::channel();
+    let resident = FailingResident {
+        fail_after: 0,
+        release_failure: Mutex::new(Some(held_failure)),
+    };
+    let (done, outcome) = mpsc::channel();
+    thread::spawn(move || {
+        let result = serve_dsp(&host, &NamedPcmRings, &resident);
+        drop(host);
+        done.send(result).unwrap();
+    });
+    let mut session = DspSession::open(player, NamedPcmRings, SPEC, &[], 1).unwrap();
+    write_pcm(&mut session, &[0.25, -0.5], "the frame before failure");
+    release_failure.send(()).unwrap();
+    diagnostic
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the host never sent its terminal diagnostic");
+    let error = outcome
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the host never finished its teardown")
+        .expect_err("the failed chain must end the host with an error");
+    assert!(error.to_string().contains("clipping detected"), "{error}");
+    // The host is gone, but the diagnostic is still in transit. Only the
+    // player's monitor may close these rings after storing that diagnostic.
+    assert!(
+        !session.in_ring_counters().closed,
+        "input closed before DspError"
+    );
+    assert!(
+        !session.back_ring_counters().closed,
+        "back-ring closed before DspError"
+    );
+    release_diagnostic.send(()).unwrap();
+    let error = read_pcm(&mut session, &mut [0.0; 2], "the terminal diagnostic")
+        .expect_err("a chain failure must never become EOS");
+    assert!(matches!(error, MediaHostError::Disconnected(_)), "{error}");
+    assert!(error.to_string().contains("resident DSP failed"), "{error}");
+    assert!(error.to_string().contains("clipping detected"), "{error}");
+    let again = session.write(&[0.0; 2]).unwrap_err();
+    assert_eq!(again.to_string(), error.to_string(), "failure must stick");
 }
 
 #[test]
