@@ -41,7 +41,7 @@ use std::path::PathBuf;
 
 use rustamp_core::command::Command;
 use rustamp_core::error::Result;
-use rustamp_core::playlist::EntryId;
+use rustamp_core::playlist::{EntryId, SortKey};
 use rustamp_core::state::WindowId;
 use rustamp_gfx::Image;
 use rustamp_ui::{
@@ -148,13 +148,24 @@ impl App {
 
     /// A key press while the playlist editor is focused (S03 §2).
     ///
-    /// The playlist table is consulted first for the three keys it binds to
-    /// playlist actions with a menu-confirmed command: Delete (`1034`, remove
-    /// the selected items, S06 §5), Ctrl+A (`40205`, select all) and Ctrl+I
-    /// (`40171`, invert the selection). Every other key takes the shared
-    /// shortcut path ([`App::key_down`]): S03 leaves how the tables combine
-    /// provisional, and its arrow, Home, End and page rows are provisional
-    /// with no measured effect, so they are not claimed here.
+    /// The playlist table is consulted first, in this order:
+    ///
+    /// * Delete (`1034`, remove the selected items, S06 §5);
+    /// * Ctrl+S (`40204`, save the playlist: the app records the request and
+    ///   the presenter opens the native save dialog);
+    /// * the rows [`rustamp_ui::playlist::playlist_key_action`] names — the
+    ///   selection moves, jumps and paging (provisional), Enter (`40184`, play
+    ///   the selection), `Ctrl+Delete` (`1035`, crop to the selection), the
+    ///   four menu-confirmed reorder rows (`Ctrl+Shift+1/2/3` sort by title,
+    ///   file name and path and file name, `40209`-`40211`; `Ctrl+Shift+R`
+    ///   randomizes the list, `40212`) and the provisional `Alt+Up`/`Alt+Down`
+    ///   block moves, which are noted as unimplemented;
+    /// * Ctrl+A (`40205`, select all) and Ctrl+I (`40171`, invert the
+    ///   selection).
+    ///
+    /// Every other key takes the shared shortcut path ([`App::key_down`]): S03
+    /// leaves how the two tables combine provisional, so a key the playlist
+    /// table does not bind keeps whatever global binding it has.
     pub fn playlist_key_down(
         &mut self,
         key: Key,
@@ -244,6 +255,26 @@ impl App {
                     let command = Command::Remove(ids_to_remove);
                     self.submit(command.clone())?;
                     self.sync_playlist_entries();
+                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
+                }
+                // The four reorder rows of S03 §2, menu-confirmed: the app
+                // sorts or randomizes its entry-id table and the model
+                // re-syncs (`App::sort_entries` / `App::randomize_entries`).
+                PlaylistKeyAction::SortByTitle
+                | PlaylistKeyAction::SortByFileName
+                | PlaylistKeyAction::SortByPathAndFileName => {
+                    let key = match action {
+                        PlaylistKeyAction::SortByTitle => SortKey::Title,
+                        PlaylistKeyAction::SortByFileName => SortKey::FileName,
+                        _ => SortKey::PathAndFileName,
+                    };
+                    let command = Command::Sort(key);
+                    self.submit(command.clone())?;
+                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
+                }
+                PlaylistKeyAction::Randomize => {
+                    let command = Command::Randomize;
+                    self.submit(command.clone())?;
                     return Ok(Some(ShortcutOutcome::Commands(vec![command])));
                 }
                 // Block move actions (provisional, not implemented yet)
@@ -967,6 +998,79 @@ mod tests {
             .expect("Up applies");
         assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
         assert_eq!(app.playlist().len(), 6);
+    }
+
+    #[test]
+    fn ctrl_shift_chords_sort_and_randomize_the_playlist() {
+        // S03 §2: `40209`-`40212` — Ctrl+Shift+1/2/3 sort by title, file name
+        // and path and file name, Ctrl+Shift+R randomizes the list; all four
+        // are menu-confirmed commands.
+        let mut app = test_app();
+        let items = vec![
+            MediaLocation::File(PathBuf::from("zulu.mp3")),
+            MediaLocation::File(PathBuf::from("alpha.mp3")),
+            MediaLocation::File(PathBuf::from("mike.mp3")),
+        ];
+        app.submit(Command::AddItems {
+            items,
+            at: None,
+            play: false,
+        })
+        .expect("AddItems applies");
+        let chord = Modifiers::CTRL | Modifiers::SHIFT;
+
+        let outcome = app
+            .playlist_key_down(Key::Digit(2), chord)
+            .expect("Ctrl+Shift+2 applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::Sort(
+                SortKey::FileName
+            )]))
+        );
+        // alpha(1), mike(2), zulu(0): model and id table move together.
+        assert_eq!(
+            app.playlist().visible_ids(),
+            vec![EntryId(1), EntryId(2), EntryId(0)]
+        );
+
+        // Without a loaded report every title falls back to the file name, so
+        // Ctrl+Shift+1 keeps that order; Ctrl+Shift+3 sorts the same names.
+        for (digit, key) in [
+            (Key::Digit(1), SortKey::Title),
+            (Key::Digit(3), SortKey::PathAndFileName),
+        ] {
+            let outcome = app
+                .playlist_key_down(digit, chord)
+                .expect("the chord applies");
+            assert_eq!(
+                outcome,
+                Some(ShortcutOutcome::Commands(vec![Command::Sort(key)]))
+            );
+        }
+        assert_eq!(
+            app.playlist().visible_ids(),
+            vec![EntryId(1), EntryId(2), EntryId(0)]
+        );
+
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'R'), chord)
+            .expect("Ctrl+Shift+R applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::Randomize]))
+        );
+        // The entries survive the shuffle; only their rows move.
+        let mut ids = app.playlist().visible_ids();
+        ids.sort_by_key(|id| id.0);
+        assert_eq!(ids, vec![EntryId(0), EntryId(1), EntryId(2)]);
+
+        // A Ctrl+Shift chord the table does not bind keeps the shared path.
+        assert_eq!(
+            app.playlist_key_down(Key::Digit(4), chord)
+                .expect("an unbound key"),
+            None
+        );
     }
 
     /// Opening the playlist window needs an OS window, so this never runs in
