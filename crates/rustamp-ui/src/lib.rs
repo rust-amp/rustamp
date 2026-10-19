@@ -33,6 +33,14 @@
 //! * [`playlist::PlaylistWindow`] is the headless playlist-editor behaviour of
 //!   spec **S06**: list selection, page scrolling, REM removal and the
 //!   bottom-bar dialog requests (titles only, no dialog internals).
+//! * [`library::LibraryView`] is the headless media-library view model: the
+//!   loaded page of rows, the search text, the sort key and direction, the
+//!   selected row and the scroll offset. It never touches SQLite - the app
+//!   runs the query and hands the rows back.
+//! * [`library_layout::LibraryLayout`] is the renderer-facing layout of the
+//!   library window: the columns, their widths in text cells and the row
+//!   lines as text. The library window is a modern (unskinned) window, so no
+//!   skin is involved.
 //! * [`shell::skinned_window_attributes`] is the single place that decides
 //!   what an OS window looks like outside its client area: every window of
 //!   this player is borderless, because its title bar is part of the skin.
@@ -54,6 +62,8 @@ pub mod equalizer;
 pub use docking as geometry;
 pub use docking as windows;
 pub mod layout;
+pub mod library;
+pub mod library_layout;
 pub mod menu;
 pub mod playlist;
 mod playlist_font;
@@ -99,6 +109,11 @@ pub use equalizer::{
 };
 pub use layout::{
     DOUBLE_HEIGHT, DOUBLE_WIDTH, MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH,
+};
+pub use library::{LibraryColumn, LibraryRequest, LibraryRow, LibrarySort, LibraryView};
+pub use library_layout::{
+    LIBRARY_COLUMN_GAP, LIBRARY_COLUMN_TITLES, LIBRARY_COLUMN_WIDTHS, LIBRARY_COLUMNS,
+    LIBRARY_MIN_TITLE_WIDTH, LibraryLayout, format_duration,
 };
 pub use menu::{
     CHECK_CELL_X, CLUTTER_O_POINT, CLUTTER_V_POINT, MAIN_MENU, MAIN_MENU_CLASS,
