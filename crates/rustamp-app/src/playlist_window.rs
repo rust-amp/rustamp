@@ -43,15 +43,16 @@
 
 use std::path::PathBuf;
 
-use rustamp_core::command::Command;
+use rustamp_core::command::{Command, OpenMediaKind};
 use rustamp_core::error::Result;
 use rustamp_core::playlist::{EntryId, SortKey};
 use rustamp_core::state::WindowId;
 use rustamp_gfx::Image;
 use rustamp_ui::{
     DockedStack, Key, Modifiers, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog,
-    PlaylistTitleButton, ShortcutOutcome, WindowKind, hit_test_button, hit_test_list_row,
-    hit_test_scroll, hit_test_title_bar, in_list_area, render_playlist_window, window_size,
+    PlaylistKeyAction, PlaylistTitleButton, ShortcutOutcome, WindowKind, hit_test_button,
+    hit_test_list_row, hit_test_scroll, hit_test_title_bar, in_list_area, render_playlist_window,
+    window_size,
 };
 
 use crate::app::App;
@@ -220,30 +221,33 @@ impl App {
     ///
     /// The playlist table is consulted first, in this order:
     ///
-    /// * Delete (`1034`, remove the selected items, S06 §5);
-    /// * Ctrl+S (`40204`, save the playlist: the app records the request and
-    ///   the presenter opens the native save dialog);
-    /// * the rows [`rustamp_ui::playlist::playlist_key_action`] names — the
-    ///   selection moves, jumps and paging (provisional), Enter (`40184`, play
-    ///   the selection), `Ctrl+Delete` (`1035`, crop to the selection), the
-    ///   four menu-confirmed reorder rows (`Ctrl+Shift+1/2/3` sort by title,
-    ///   file name and path and file name, `40209`-`40211`; `Ctrl+Shift+R`
-    ///   randomizes the list, `40212`), the two whole-list removal presets
-    ///   (`Alt+Delete` "Remove all dead files", `40222`; `Ctrl+Shift+Delete`
-    ///   or `Ctrl+N` "Clear the playlist", `40214`) and the provisional
-    ///   `Alt+Up`/`Alt+Down` block moves, which are noted as unimplemented;
-    /// * Ctrl+A (`40205`, select all) and Ctrl+I (`40171`, invert the
-    ///   selection).
+    /// * the rows [`rustamp_ui::playlist::PLAYLIST_TABLE`] names — every row
+    ///   of S03 §2 this build can act on, from the selection moves and jumps
+    ///   (provisional) over Enter (`40184`, play the selection), `Delete`
+    ///   (`1034`) and `Ctrl+Delete` (`1035`, crop), the four `Ctrl+Shift`
+    ///   reorder rows, the two whole-list removal presets (`Alt+Delete`
+    ///   "Remove all dead files", `40222`; `Ctrl+Shift+Delete` or `Ctrl+N`
+    ///   "Clear the playlist", `40214`), the add rows (`L`, `Ctrl+L`,
+    ///   `Shift+L`, `Insert`, `Ctrl+Insert`, `Shift+Insert`, `Num0`,
+    ///   `Ctrl+Num0` — `1032`, `1036`, `1039`), the list rows (`Ctrl+A`
+    ///   "Select all", `40205`; `Ctrl+I` "Invert selection", `40171`;
+    ///   `Ctrl+S` "Save playlist", `40204`; `Ctrl+O` "Open playlist",
+    ///   `40202`; `Ctrl+R` "Reverse the list", `40213`) and the shared rows
+    ///   of S03 §1/§4;
+    /// * the S03 §2 rows this build cannot act on yet
+    ///   ([`rustamp_ui::playlist::UNIMPLEMENTED_PLAYLIST_ROWS`]): they are
+    ///   bound to their command id, but no command implements them, so the
+    ///   app records a note and does nothing;
+    /// * every other key takes the shared shortcut path ([`App::key_down`]).
     ///
-    /// Every other key takes the shared shortcut path ([`App::key_down`]): S03
-    /// leaves how the two tables combine provisional, so a key the playlist
-    /// table does not bind keeps whatever global binding it has.
+    /// S03 leaves how the tables combine provisional, so a key the playlist
+    /// table does not bind keeps whatever binding the shared path has.
     pub fn playlist_key_down(
         &mut self,
         key: Key,
         modifiers: Modifiers,
     ) -> Result<Option<ShortcutOutcome>> {
-        use rustamp_ui::playlist::{PlaylistKeyAction, playlist_key_action};
+        use rustamp_ui::playlist::{playlist_key_action, unimplemented_playlist_row};
 
         self.sync_playlist_entries();
 
@@ -254,156 +258,251 @@ impl App {
         // held row gesture. Like the drag itself this is an own-choice rule.
         self.playlist.cancel_drag();
 
-        // Handle Delete first (plain Delete returns None from playlist_key_action)
-        if key == Key::Delete && modifiers == Modifiers::NONE {
-            match self.playlist.press_rem() {
-                Some(command) => {
-                    self.submit(command.clone())?;
-                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
-                }
-                // S06 §5.3: Delete with nothing selected changes nothing
-                None => return Ok(Some(ShortcutOutcome::Handled)),
-            }
+        // The playlist table (S03 §2) comes before the shared path: it is the
+        // editor's own table and shadows the main and global rows where the
+        // two disagree.
+        if let Some(action) = playlist_key_action(key, modifiers) {
+            return self.dispatch_playlist_action(action);
         }
 
-        // Handle Ctrl+S (Save Playlist, command ID 40204, S03 §2)
-        // Signal to presenter to open native save-dialog
-        if key == Key::Letter(b'S') && modifiers == Modifiers::CTRL {
-            self.request_save_playlist = true;
+        // A row S03 §2 binds but this build has no command for: note it and
+        // do nothing, so the shared path cannot run a different action for
+        // the same chord.
+        if let Some(row) = unimplemented_playlist_row(key, modifiers) {
+            self.note(format!(
+                "playlist shortcut {:?} (command id {}) has no command yet",
+                row.key, row.command_id
+            ));
             return Ok(Some(ShortcutOutcome::Handled));
         }
 
-        // Check for playlist-specific key actions (S03 §2)
-        if let Some(action) = playlist_key_action(key, modifiers) {
-            match action {
-                // Navigation actions (provisional, no measured effect)
-                PlaylistKeyAction::MoveSelectionUp => {
-                    self.playlist.move_selection_up();
-                    return Ok(Some(ShortcutOutcome::Handled));
-                }
-                PlaylistKeyAction::MoveSelectionDown => {
-                    self.playlist.move_selection_down();
-                    return Ok(Some(ShortcutOutcome::Handled));
-                }
-                PlaylistKeyAction::JumpToFirst => {
-                    self.playlist.jump_to_first();
-                    return Ok(Some(ShortcutOutcome::Handled));
-                }
-                PlaylistKeyAction::JumpToLast => {
-                    self.playlist.jump_to_last();
-                    return Ok(Some(ShortcutOutcome::Handled));
-                }
-                PlaylistKeyAction::PageUp => {
-                    self.playlist
-                        .scroll_page(rustamp_ui::playlist::ScrollDirection::Up);
-                    return Ok(Some(ShortcutOutcome::Handled));
-                }
-                PlaylistKeyAction::PageDown => {
-                    self.playlist
-                        .scroll_page(rustamp_ui::playlist::ScrollDirection::Down);
-                    return Ok(Some(ShortcutOutcome::Handled));
-                }
-                // Play selected entry (menu-confirmed)
-                PlaylistKeyAction::PlaySelected => match self.playlist.play_selected() {
-                    Some(command) => {
-                        self.submit(command.clone())?;
-                        return Ok(Some(ShortcutOutcome::Commands(vec![command])));
-                    }
-                    None => return Ok(Some(ShortcutOutcome::Handled)),
-                },
-                // Crop to selected entries (menu-confirmed, Ctrl+Delete)
-                PlaylistKeyAction::Crop => {
-                    let selected = self.playlist.selected_ids();
-                    if selected.is_empty() {
-                        return Ok(Some(ShortcutOutcome::Handled));
-                    }
-                    // Remove all entries that are NOT selected (invert the removal)
-                    let selected_set: std::collections::BTreeSet<_> =
-                        selected.iter().copied().collect();
-                    let ids_to_remove: Vec<EntryId> = self
-                        .entry_ids
-                        .iter()
-                        .copied()
-                        .filter(|id| !selected_set.contains(id))
-                        .collect();
+        // Everything else takes the shared shortcut path.
+        self.key_down(key, modifiers)
+    }
 
-                    if ids_to_remove.is_empty() {
-                        return Ok(Some(ShortcutOutcome::Handled));
-                    }
-
-                    let command = Command::Remove(ids_to_remove);
-                    self.submit(command.clone())?;
-                    self.sync_playlist_entries();
-                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
-                }
-                // Remove all dead files (menu-confirmed, Alt+Delete, 40222).
-                // The app resolves which entries are dead, so the command
-                // carries no payload (RFC 0018).
-                PlaylistKeyAction::RemoveDead => {
-                    let command = Command::RemoveDeadFiles;
-                    self.submit(command.clone())?;
-                    self.sync_playlist_entries();
-                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
-                }
-                // Clear the playlist (menu-confirmed, Ctrl+Shift+Delete and
-                // Ctrl+N, both id 40214, S03 §2).
-                PlaylistKeyAction::ClearPlaylist => {
-                    let command = Command::Clear;
-                    self.submit(command.clone())?;
-                    self.sync_playlist_entries();
-                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
-                }
-                // The four reorder rows of S03 §2, menu-confirmed: the app
-                // sorts or randomizes its entry-id table and the model
-                // re-syncs (`App::sort_entries` / `App::randomize_entries`).
-                PlaylistKeyAction::SortByTitle
-                | PlaylistKeyAction::SortByFileName
-                | PlaylistKeyAction::SortByPathAndFileName => {
-                    let key = match action {
-                        PlaylistKeyAction::SortByTitle => SortKey::Title,
-                        PlaylistKeyAction::SortByFileName => SortKey::FileName,
-                        _ => SortKey::PathAndFileName,
-                    };
-                    let command = Command::Sort(key);
-                    self.submit(command.clone())?;
-                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
-                }
-                PlaylistKeyAction::Randomize => {
-                    let command = Command::Randomize;
-                    self.submit(command.clone())?;
-                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
-                }
-                // Block move actions (provisional, not implemented yet)
-                PlaylistKeyAction::MoveBlockUp | PlaylistKeyAction::MoveBlockDown => {
-                    self.note(format!(
-                        "playlist key action {action:?} is not implemented yet (provisional, no Command)"
-                    ));
-                    return Ok(Some(ShortcutOutcome::Handled));
-                }
-                // Delete already handled above
-                PlaylistKeyAction::Delete => {
-                    unreachable!("Delete is handled before playlist_key_action")
-                }
+    /// Runs one S03 §2 action.
+    ///
+    /// The shared rows (S03 §1/§4) go through the main window's machine, so
+    /// the prediction and the command set are the same wherever the key was
+    /// pressed ([`App::dispatch_shared_shortcut`]).
+    fn dispatch_playlist_action(
+        &mut self,
+        action: PlaylistKeyAction,
+    ) -> Result<Option<ShortcutOutcome>> {
+        match action {
+            // ----- the shared S03 rows (S03 §1/§4) -----
+            PlaylistKeyAction::Shared(shortcut) => {
+                let outcome = self.dispatch_shared_shortcut(shortcut)?;
+                Ok(Some(outcome))
             }
-        }
+            // ----- navigation (provisional, no measured effect) -----
+            PlaylistKeyAction::MoveSelectionUp => {
+                self.playlist.move_selection_up();
+                Ok(Some(ShortcutOutcome::Handled))
+            }
+            PlaylistKeyAction::MoveSelectionDown => {
+                self.playlist.move_selection_down();
+                Ok(Some(ShortcutOutcome::Handled))
+            }
+            PlaylistKeyAction::JumpToFirst => {
+                self.playlist.jump_to_first();
+                Ok(Some(ShortcutOutcome::Handled))
+            }
+            PlaylistKeyAction::JumpToLast => {
+                self.playlist.jump_to_last();
+                Ok(Some(ShortcutOutcome::Handled))
+            }
+            PlaylistKeyAction::PageUp => {
+                self.playlist
+                    .scroll_page(rustamp_ui::playlist::ScrollDirection::Up);
+                Ok(Some(ShortcutOutcome::Handled))
+            }
+            PlaylistKeyAction::PageDown => {
+                self.playlist
+                    .scroll_page(rustamp_ui::playlist::ScrollDirection::Down);
+                Ok(Some(ShortcutOutcome::Handled))
+            }
+            // ----- the block moves (provisional, no measured effect) -----
+            PlaylistKeyAction::MoveBlockUp => self.playlist_block_move(true),
+            PlaylistKeyAction::MoveBlockDown => self.playlist_block_move(false),
+            // ----- play the selection (menu-confirmed) -----
+            PlaylistKeyAction::PlaySelected => match self.playlist.play_selected() {
+                Some(command) => {
+                    self.submit(command.clone())?;
+                    Ok(Some(ShortcutOutcome::Commands(vec![command])))
+                }
+                None => Ok(Some(ShortcutOutcome::Handled)),
+            },
+            // ----- remove, crop, clear (menu-confirmed) -----
+            PlaylistKeyAction::Delete => match self.playlist.press_rem() {
+                Some(command) => {
+                    self.submit(command.clone())?;
+                    Ok(Some(ShortcutOutcome::Commands(vec![command])))
+                }
+                // S06 §5.3: Delete with nothing selected changes nothing.
+                None => Ok(Some(ShortcutOutcome::Handled)),
+            },
+            PlaylistKeyAction::Crop => {
+                let selected = self.playlist.selected_ids();
+                if selected.is_empty() {
+                    return Ok(Some(ShortcutOutcome::Handled));
+                }
+                // Remove all entries that are NOT selected (invert the removal)
+                let selected_set: std::collections::BTreeSet<_> =
+                    selected.iter().copied().collect();
+                let ids_to_remove: Vec<EntryId> = self
+                    .entry_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !selected_set.contains(id))
+                    .collect();
 
-        // Legacy shortcuts still handled directly (Ctrl+A, Ctrl+I)
-        let command = if key == Key::Letter(b'A') && modifiers == Modifiers::CTRL {
-            Some(self.playlist.select_all())
-        } else if key == Key::Letter(b'I') && modifiers == Modifiers::CTRL {
-            Some(self.playlist.invert_selection())
-        } else {
-            // Fall through to global shortcuts
-            return self.key_down(key, modifiers);
-        };
+                if ids_to_remove.is_empty() {
+                    return Ok(Some(ShortcutOutcome::Handled));
+                }
 
-        match command {
-            Some(command) => {
+                let command = Command::Remove(ids_to_remove);
+                self.submit(command.clone())?;
+                self.sync_playlist_entries();
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            // Remove all dead files (menu-confirmed, Alt+Delete, 40222).
+            // The app resolves which entries are dead, so the command
+            // carries no payload (RFC 0018).
+            PlaylistKeyAction::RemoveDead => {
+                let command = Command::RemoveDeadFiles;
+                self.submit(command.clone())?;
+                self.sync_playlist_entries();
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            // Clear the playlist (menu-confirmed, Ctrl+Shift+Delete and
+            // Ctrl+N, both id 40214, S03 §2).
+            PlaylistKeyAction::ClearPlaylist => {
+                let command = Command::Clear;
+                self.submit(command.clone())?;
+                self.sync_playlist_entries();
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            // ----- the reorder rows (menu-confirmed) -----
+            // The app sorts or randomizes its entry-id table and the model
+            // re-syncs (`App::sort_entries` / `App::randomize_entries`).
+            PlaylistKeyAction::SortByTitle
+            | PlaylistKeyAction::SortByFileName
+            | PlaylistKeyAction::SortByPathAndFileName => {
+                let key = match action {
+                    PlaylistKeyAction::SortByTitle => SortKey::Title,
+                    PlaylistKeyAction::SortByFileName => SortKey::FileName,
+                    _ => SortKey::PathAndFileName,
+                };
+                let command = Command::Sort(key);
                 self.submit(command.clone())?;
                 Ok(Some(ShortcutOutcome::Commands(vec![command])))
             }
-            None => Ok(Some(ShortcutOutcome::Handled)),
+            PlaylistKeyAction::Randomize => {
+                let command = Command::Randomize;
+                self.submit(command.clone())?;
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            PlaylistKeyAction::Reverse => {
+                let command = Command::Reverse;
+                self.submit(command.clone())?;
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            // ----- the selection rows (menu-confirmed) -----
+            PlaylistKeyAction::SelectAll => {
+                let command = self.playlist.select_all();
+                self.submit(command.clone())?;
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            PlaylistKeyAction::InvertSelection => {
+                let command = self.playlist.invert_selection();
+                self.submit(command.clone())?;
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            // ----- the add rows (menu-confirmed) -----
+            // The three add commands are the playlist's own (`1032`, `1036`,
+            // `1039`), so they open the app's media dialog with the
+            // matching face. Their `play` flag is unmeasured (RFC 0005 O5),
+            // so it takes the ADD button's `false`.
+            PlaylistKeyAction::AddFiles => self.open_media(OpenMediaKind::Files),
+            PlaylistKeyAction::AddLocation => self.open_media(OpenMediaKind::Location),
+            PlaylistKeyAction::AddDirectory => self.open_media(OpenMediaKind::Directory),
+            // ----- the remaining menu-confirmed rows -----
+            PlaylistKeyAction::OpenPlaylist => {
+                let command = Command::OpenPlaylist;
+                self.submit(command.clone())?;
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            PlaylistKeyAction::SavePlaylist => {
+                // The presenter opens the native save dialog and sends
+                // `Command::SavePlaylist` with the chosen path.
+                self.request_save_playlist = true;
+                Ok(Some(ShortcutOutcome::Handled))
+            }
+            PlaylistKeyAction::FileInfo => {
+                // S03 §6 Q6 leaves open whether the playlist's "File info"
+                // (`40208`) and the main window's "View file info" (`40188`)
+                // are the same dialog; the app has one file-info box, so the
+                // playlist's row opens it.
+                let command = Command::OpenFileInfo;
+                self.submit(command.clone())?;
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            PlaylistKeyAction::BookmarkSelection => {
+                // S03 §2's row bookmarks the *selected* item(s); the app's
+                // bookmark command bookmarks the current track and the
+                // bookmark store does not exist yet (RFC 0005 O12), so the
+                // row is routed to it.
+                let command = Command::AddBookmark;
+                self.submit(command.clone())?;
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
+            // ----- the provisional close row -----
+            PlaylistKeyAction::CloseEditor => {
+                let commands = self.close_playlist_window()?;
+                if commands.is_empty() {
+                    Ok(Some(ShortcutOutcome::Handled))
+                } else {
+                    Ok(Some(ShortcutOutcome::Commands(commands)))
+                }
+            }
+            // ----- the editor's own windowshade -----
+            PlaylistKeyAction::ToggleEditorShade => {
+                let command = Command::ToggleWindowShade(WindowId::Playlist);
+                self.submit(command.clone())?;
+                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+            }
         }
+    }
+
+    /// Moves the selected block one row up or down (S03 §2 `40215`/`40216`).
+    ///
+    /// The model owns the selection and the order, so it computes the target
+    /// and emits the ordinary [`Command::MoveEntries`]; the app applies it
+    /// and the model re-syncs. Nothing selected, or a block that already
+    /// starts or ends the list, changes nothing.
+    fn playlist_block_move(&mut self, up: bool) -> Result<Option<ShortcutOutcome>> {
+        let command = if up {
+            self.playlist.move_block_up()
+        } else {
+            self.playlist.move_block_down()
+        };
+        let Some(command) = command else {
+            return Ok(Some(ShortcutOutcome::Handled));
+        };
+        self.submit(command.clone())?;
+        self.sync_playlist_entries();
+        Ok(Some(ShortcutOutcome::Commands(vec![command])))
+    }
+
+    /// Opens the app's media dialog for the playlist's add rows.
+    ///
+    /// `play` is `false`: the add commands' `play` flag is unmeasured
+    /// (RFC 0005 O5) and the ADD button takes `false` as well.
+    fn open_media(&mut self, kind: OpenMediaKind) -> Result<Option<ShortcutOutcome>> {
+        let command = Command::OpenMedia { kind, play: false };
+        self.submit(command.clone())?;
+        Ok(Some(ShortcutOutcome::Commands(vec![command])))
     }
 
     /// Renders one frame of the playlist window.
@@ -1387,9 +1486,261 @@ mod tests {
             )]))
         );
         assert_eq!(app.playlist().selected_ids().len(), 4);
+        // The playlist's own Ctrl+A shadows the main and global table's
+        // `40019` "Toggle always on top".
+        assert!(!app.always_on_top());
         app.playlist_key_down(Key::Letter(b'I'), Modifiers::CTRL)
             .expect("Ctrl+I applies");
         assert!(app.playlist().selected_ids().is_empty());
+    }
+
+    #[test]
+    fn the_add_shortcuts_open_the_matching_media_face() {
+        // S03 §2: the playlist editor's own add commands — `1032` "Add
+        // file(s)", `1036` "Add directory" and `1039` "Add location".
+        let mut app = test_app();
+        for (key, modifiers, kind) in [
+            (Key::Letter(b'L'), Modifiers::NONE, OpenMediaKind::Files),
+            (Key::Letter(b'L'), Modifiers::CTRL, OpenMediaKind::Location),
+            (
+                Key::Letter(b'L'),
+                Modifiers::SHIFT,
+                OpenMediaKind::Directory,
+            ),
+            (Key::Insert, Modifiers::NONE, OpenMediaKind::Directory),
+            (Key::Insert, Modifiers::CTRL, OpenMediaKind::Files),
+            (Key::Insert, Modifiers::SHIFT, OpenMediaKind::Location),
+            (Key::Numpad(0), Modifiers::NONE, OpenMediaKind::Files),
+            (Key::Numpad(0), Modifiers::CTRL, OpenMediaKind::Location),
+        ] {
+            let outcome = app
+                .playlist_key_down(key, modifiers)
+                .unwrap_or_else(|error| panic!("{key:?} {modifiers:?}: {error}"));
+            assert_eq!(
+                outcome,
+                Some(ShortcutOutcome::Commands(vec![Command::OpenMedia {
+                    kind,
+                    play: false
+                }])),
+                "{key:?} {modifiers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_playlist_and_ctrl_r_reverses_the_list() {
+        // S03 §2: Ctrl+O is `40202` "Open playlist", Ctrl+R is `40213`
+        // "Reverse the list".
+        let mut app = test_app();
+        let items = vec![
+            MediaLocation::File(PathBuf::from("a.mp3")),
+            MediaLocation::File(PathBuf::from("b.mp3")),
+            MediaLocation::File(PathBuf::from("c.mp3")),
+        ];
+        app.submit(Command::AddItems {
+            items,
+            at: None,
+            play: false,
+        })
+        .expect("AddItems applies");
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'O'), Modifiers::CTRL)
+            .expect("Ctrl+O applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::OpenPlaylist]))
+        );
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::LoadPlaylist));
+
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'R'), Modifiers::CTRL)
+            .expect("Ctrl+R applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::Reverse]))
+        );
+        assert_eq!(
+            app.entry_ids,
+            vec![EntryId(2), EntryId(1), EntryId(0)],
+            "the rows turn around, the entries survive"
+        );
+        assert_eq!(
+            app.playlist().visible_ids(),
+            vec![EntryId(2), EntryId(1), EntryId(0)]
+        );
+    }
+
+    #[test]
+    fn alt_3_opens_the_file_info_and_alt_i_bookmarks_the_selection() {
+        // S03 §2: Alt+3 is `40208` "File info", Alt+I is `40319`
+        // "Bookmark the selected item(s)".
+        let mut app = test_app();
+        let outcome = app
+            .playlist_key_down(Key::Digit(3), Modifiers::ALT)
+            .expect("Alt+3 applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::OpenFileInfo]))
+        );
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::FileInfo));
+
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'I'), Modifiers::ALT)
+            .expect("Alt+I applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::AddBookmark]))
+        );
+    }
+
+    #[test]
+    fn ctrl_f4_closes_the_playlist_editor() {
+        // S03 §2: Ctrl+F4 is `40224` "Close the playlist editor".
+        let mut app = test_app();
+        assert!(app.playlist_open(), "the editor starts open");
+        let outcome = app
+            .playlist_key_down(Key::F(4), Modifiers::CTRL)
+            .expect("Ctrl+F4 applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::ToggleWindow(
+                WindowId::Playlist
+            )]))
+        );
+        assert!(!app.playlist_open());
+    }
+
+    #[test]
+    fn ctrl_w_toggles_the_editors_windowshade() {
+        // S03 §2: Ctrl+W is `40064` "Toggle windowshade". The editor's shade
+        // is its own (S01 §1), so the row toggles the editor and not the main
+        // window.
+        let mut app = test_app();
+        assert!(!app.playlist_shaded());
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'W'), Modifiers::CTRL)
+            .expect("Ctrl+W applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::ToggleWindowShade(
+                WindowId::Playlist
+            )]))
+        );
+        assert!(app.playlist_shaded());
+        assert!(!app.state().windowshade, "the main window keeps its shade");
+    }
+
+    #[test]
+    fn ctrl_s_asks_the_presenter_for_the_save_dialog() {
+        // S03 §2: Ctrl+S is `40204` "Save playlist"; the presenter opens the
+        // native save dialog and sends the chosen path.
+        let mut app = test_app();
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'S'), Modifiers::CTRL)
+            .expect("Ctrl+S applies");
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert!(app.request_save_playlist);
+    }
+
+    #[test]
+    fn the_shared_rows_reach_the_shared_path() {
+        // S03 §2 shares most of its rows with S03 §1/§4; they run against the
+        // same machine, so the command is the one the main window sends.
+        let mut app = test_app();
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'B'), Modifiers::NONE)
+            .expect("B applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::Next]))
+        );
+
+        let outcome = app
+            .playlist_key_down(Key::F(1), Modifiers::NONE)
+            .expect("F1 applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::OpenAbout]))
+        );
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::About));
+
+        // Ctrl+Tab moves the focus to the next player window (the row is
+        // provisional in S03 §2, the command exists).
+        let outcome = app
+            .playlist_key_down(Key::Tab, Modifiers::CTRL)
+            .expect("Ctrl+Tab applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::FocusNextWindow]))
+        );
+
+        // Ctrl+T toggles the elapsed/remaining time of the main window.
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'T'), Modifiers::CTRL)
+            .expect("Ctrl+T applies");
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert!(app.state().time_remaining);
+    }
+
+    #[test]
+    fn alt_up_and_alt_down_move_the_selected_block() {
+        // S03 §2: Alt+Up is `40215` and Alt+Down is `40216` "Move the
+        // selected entry up/down" (provisional).
+        let mut app = test_app();
+        add_entries(&mut app, 4);
+        app.submit(Command::Select(SelectOp::Set(vec![EntryId(1), EntryId(2)])))
+            .expect("Select applies");
+        let outcome = app
+            .playlist_key_down(Key::Up, Modifiers::ALT)
+            .expect("Alt+Up applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::MoveEntries {
+                ids: vec![EntryId(1), EntryId(2)],
+                to: 0,
+            }]))
+        );
+        assert_eq!(
+            app.entry_ids,
+            vec![EntryId(1), EntryId(2), EntryId(0), EntryId(3)]
+        );
+
+        let outcome = app
+            .playlist_key_down(Key::Down, Modifiers::ALT)
+            .expect("Alt+Down applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::MoveEntries {
+                ids: vec![EntryId(1), EntryId(2)],
+                to: 1,
+            }]))
+        );
+        assert_eq!(
+            app.entry_ids,
+            vec![EntryId(0), EntryId(1), EntryId(2), EntryId(3)]
+        );
+        // The selection follows the rows it moved.
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(1), EntryId(2)]);
+    }
+
+    #[test]
+    fn the_rows_without_a_command_do_nothing_and_are_noted() {
+        // S03 §2's `40255` "Edit the playlist entry" has no command yet, so
+        // the row is listed as unimplemented: it must not fall through to the
+        // main table's `40186` "Toggle easy move".
+        let mut app = test_app();
+        let easy_move = app.easy_move();
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'E'), Modifiers::CTRL)
+            .expect("Ctrl+E applies");
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert_eq!(
+            app.easy_move(),
+            easy_move,
+            "the main table's Ctrl+E must not run"
+        );
+        let notes = app.drain_notes();
+        assert!(notes.iter().any(|note| note.contains("40255")), "{notes:?}");
     }
 
     #[test]

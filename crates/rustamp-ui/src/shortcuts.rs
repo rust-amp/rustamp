@@ -165,8 +165,11 @@ impl std::ops::BitOr for Modifiers {
 
 /// Which window's table applies (S03 §1-§3).
 ///
-/// Only the main window's table is filled; the playlist editor (S03 §2) and
-/// the equalizer (S03 §3) do not exist yet.
+/// Only the main window's table lives here. The playlist editor's table
+/// (S03 §2) is [`crate::playlist::PLAYLIST_TABLE`] — it names its own
+/// actions and reuses the shared ones through
+/// [`crate::playlist::PlaylistKeyAction::Shared`] — and the equalizer
+/// (S03 §3) has no table yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ShortcutWindow {
