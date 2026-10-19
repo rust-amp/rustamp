@@ -296,6 +296,10 @@ impl App {
             .windows
             .iter()
             .find(|w| w.id == WindowId::Playlist);
+        // The editor's windowshade is saved with the other windows (S01 §1),
+        // so a saved editor comes back shaded. Read it before the config
+        // moves into the app.
+        let pl_shaded = pl_layout.is_some_and(|layout| layout.shaded);
 
         // Seed the UI machine from the config, window layouts, and the engine's initial state.
         let initial = MainWindowState {
@@ -376,6 +380,10 @@ impl App {
         // A path skin remembers where it came from, so `RefreshSkin` can re-read it.
         app.current_skin = app.skin.path().map(PathBuf::from);
         app.eq.set_double_size(app.ui.state().double_size);
+        // The playlist editor's windowshade is saved with the other windows
+        // (S01 §1: the shade band is 14 px tall), so a saved editor comes
+        // back shaded.
+        app.playlist.windowshade = pl_shaded;
         app.sync_eq_from_engine();
         // The engine's snapshot is the authoritative starting state.
         app.sync_entry_ids();
@@ -638,13 +646,14 @@ impl App {
         }
         if let Some(pl) = windows.iter_mut().find(|w| w.id == WindowId::Playlist) {
             pl.visible = self.playlist_open();
+            pl.shaded = self.playlist.windowshade;
         } else {
             windows.push(WindowLayout {
                 id: WindowId::Playlist,
                 x: 26,
                 y: rustamp_ui::DEFAULT_PLAYLIST_POSITION.y,
                 visible: self.playlist_open(),
-                shaded: false,
+                shaded: self.playlist.windowshade,
                 width: None,
                 height: None,
             });
@@ -1795,6 +1804,12 @@ impl App {
             C::ToggleDoubleSize | C::ToggleWindowShade(WindowId::Main) => {
                 // The UI machine has already applied its S02 prediction; the
                 // presenter reads the new size from `frame_size`.
+            }
+            C::ToggleWindowShade(WindowId::Playlist) => {
+                // The playlist editor owns its shade state (S01 §1: the shade
+                // band is 14 px tall); the presenter reads the new size from
+                // `playlist_frame_size` and re-flows the docked stack.
+                self.playlist.windowshade = !self.playlist.windowshade;
             }
             C::ToggleWindow(WindowId::Main) => self.main_visible = !self.main_visible,
             C::ShowMainWindow => self.show_main_window(),
