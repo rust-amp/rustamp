@@ -51,6 +51,7 @@ pub use docking as windows;
 pub mod layout;
 pub mod menu;
 pub mod playlist;
+mod playlist_font;
 pub mod playlist_window;
 pub mod presenter;
 pub mod render;

@@ -628,6 +628,7 @@ impl MainWindow {
     fn update_held(&mut self) {
         self.state.pressed = self.held.and_then(Widget::transport_button);
         self.state.pressed_window_button = self.held.and_then(Widget::window_button);
+        self.state.pressed_widget = self.held;
         self.state.position_thumb_pressed = self.held == Some(Widget::PositionSlider);
         // Momentary letters light while held; the latched A/D letters stay lit
         // while their option is on (S02 §2).

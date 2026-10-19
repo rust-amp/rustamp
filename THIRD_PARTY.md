@@ -114,6 +114,8 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `lofty` | Audio tags and metadata | meta |
 | `winit` | Window/event-loop integration | app, ui |
 | `softbuffer` | CPU-rendered window presentation | app, ui |
+| `fontdb` | Headless discovery of the installed family requested by `pledit.txt` (`fs` feature only, no mmap/fontconfig) | ui |
+| `ab_glyph` | Safe CPU rasterization of playlist system-font glyphs | ui |
 | `embed-manifest` | Build-time: embeds the Windows application manifest (Common Controls 6 for the native preferences dialog) | app (build script) |
 | `symphonia` | Audio decoding/demuxing | decoders; MPL-2.0, not permissive |
 | `hound` | WAV test fixtures | decoders (dev) |
@@ -125,7 +127,7 @@ is not in this lockfile and is deliberately not recorded as already used.
 
 ## Complete Cargo.lock license inventory
 
-Snapshot: 2026-10-17, **289 external package versions**, all from crates.io.
+Snapshot: 2026-10-19, **306 external package versions**, all from crates.io.
 `Cargo.lock` records names/versions/sources/checksums, **not licenses**; licenses
 below are the exact cached package-manifest declarations returned by
 `cargo metadata --offline --locked --all-features --format-version 1`.
@@ -214,6 +216,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `fdeflate` | `0.3.7` | `MIT OR Apache-2.0` | `crates.io` |
 | `find-msvc-tools` | `0.1.14` | `MIT OR Apache-2.0` | `crates.io` |
 | `flate2` | `1.1.10` | `MIT OR Apache-2.0` | `crates.io` |
+| `fontdb` | `0.24.0` | `MIT` | `crates.io` |
 | `foreign-types` | `0.5.0` | `MIT/Apache-2.0` | `crates.io` |
 | `foreign-types-macros` | `0.2.4` | `MIT/Apache-2.0` | `crates.io` |
 | `foreign-types-shared` | `0.3.1` | `MIT/Apache-2.0` | `crates.io` |
@@ -337,6 +340,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `simd_cesu8` | `1.2.0` | `Apache-2.0 OR MIT` | `crates.io` |
 | `simdutf8` | `0.1.5` | `MIT OR Apache-2.0` | `crates.io` |
 | `slab` | `0.4.12` | `MIT` | `crates.io` |
+| `slotmap` | `1.1.1` | `Zlib` | `crates.io` |
 | `smallvec` | `1.16.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `smithay-client-toolkit` | `0.19.2` | `MIT` | `crates.io` |
 | `smol_str` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
@@ -371,6 +375,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `tiny-skia` | `0.11.4` | `BSD-3-Clause` | `crates.io` |
 | `tiny-skia-path` | `0.11.4` | `BSD-3-Clause` | `crates.io` |
 | `tiny-xlib` | `0.2.5` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
+| `tinyvec` | `1.13.3` | `Zlib OR Apache-2.0 OR MIT` | `crates.io` |
 | `tokio` | `1.53.3` | `MIT` | `crates.io` |
 | `toml` | `0.9.12+spec-1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `toml_datetime` | `0.7.5+spec-1.1.0` | `MIT OR Apache-2.0` | `crates.io` |

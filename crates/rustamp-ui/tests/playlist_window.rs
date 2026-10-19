@@ -174,9 +174,19 @@ fn title_band_buttons_and_bottom_bar_come_from_their_sprites() {
     // The right corner is 25 px wide, so it starts at 275 - 25 = 250 (S01 §4.1
     // puts it at 250,0); 260 is the scroll handle's x, not the corner's.
     assert_eq!(rgb(&frame, 250, 5), RCORNER);
-    // Close/shade cells (S01 §4, provisional).
-    assert_eq!(rgb(&frame, 264, 3), CLOSEC);
-    assert_eq!(rgb(&frame, 254, 3), SHADEC);
+    // Resting buttons are part of the title body; selected cells overlay only
+    // while held, rather than making every frame look pressed.
+    assert_eq!(rgb(&frame, 264, 3), RCORNER);
+    assert_eq!(rgb(&frame, 254, 3), RCORNER);
+    for (button, x, colour) in [
+        (rustamp_ui::PlaylistTitleButton::Close, 264, CLOSEC),
+        (rustamp_ui::PlaylistTitleButton::Shade, 254, SHADEC),
+    ] {
+        let mut window = PlaylistWindow::new();
+        window.pressed_title_button = Some(button);
+        let held = render_playlist_window(&skin, &window, &[], true);
+        assert_eq!(rgb(&held, x, 3), colour);
+    }
     // Bottom bar blocks (S01 §4) and the five button faces (S01 §4.1).
     assert_eq!(rgb(&frame, 5, 100), BB_LEFT);
     assert_eq!(rgb(&frame, 200, 100), BB_RIGHT);

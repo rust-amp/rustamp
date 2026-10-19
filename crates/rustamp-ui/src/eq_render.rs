@@ -15,10 +15,8 @@
 //! * On/Auto buttons (S07 §3.1/§3.2): normal, engaged, held and held-engaged
 //!   sheet rects at the measured held footprints (On (14,18,25,12), Auto
 //!   held (39,18,33,12)); engagement adds only the 6 px indicator cell.
-//! * Presets button (S07 §4.1): normal at (217,18,44,12). Whether a distinct
-//!   *sheet* rect backs the held sprite is not separable from captures, so no
-//!   held sheet rect is invented: the held state renders the normal sprite and
-//!   the 528 px held difference is reported, not drawn.
+//! * Presets button (S01 §3, held-states run): normal (224,164,44,12),
+//!   held (224,176,44,12), drawn at (217,18).
 //! * Graph background (S01 §3, round 2): (0,294,113,19) at (86,17).
 //! * Slider thumbs (S01 §3.1): resting (0,164,11,11), dragged (0,176,11,11),
 //!   at the mapped thumb-y.
@@ -42,7 +40,7 @@
 //!   Preamp shares the band ramp and fills update during drags (own choices).
 //!
 //! The track atlas (13,164,209,129) is **not** blitted as a whole (S01 refutes
-//! that). Presets held-sheet identity and shade drawing remain open (S07 §4.1,
+//! that). Shade drawing remains provisional (S01 §3,
 //! S05 §1.5). See `docs/tasks/S07r-eq-renderer.md` for settling measurements.
 
 use rustamp_gfx::{Image, Rect};
@@ -102,11 +100,8 @@ impl EqSheets {
 /// Blits an explicit `eqmain.bmp` region at `(dx, dy)`, skipping it when the
 /// sheet is missing.
 ///
-/// The regions are the S07 §3.1 sheet rects, spelled out instead of going
-/// through the skin's named sprites: the skin table still carries the pre-S07
-/// widths (On 26 px instead of the measured 25, Auto held at x = 154/213
-/// instead of 153/212 at 33 px wide), which is reported as a finding
-/// (rustamp-skin is not this lane's path). The 1 px column this drops is the
+/// The regions are the S07 §3.1 / S01 §3 sheet rects. The 1 px column omitted
+/// from the older 26-pixel On rect is the
 /// separator before the Auto body, which S01 §3 says is not drawn at the On
 /// button's window position.
 fn blit_eqmain(canvas: &mut Image, sheets: &EqSheets, src: Rect, dx: i32, dy: i32) {
@@ -338,12 +333,20 @@ fn render_1x(state: &EqualizerState, skin: &Skin, layout: &EqualizerLayout) -> I
         layout.auto.y,
     );
 
-    // Presets (S07 §4.1): no held sheet rect is invented, so the normal
-    // sprite draws in every state.
+    // S01 §3 (held-states run): the 44x12 held sprite comes from row176.
     blit_eqmain(
         &mut canvas,
         &sheets,
-        Rect::new(224, 164, 44, 12),
+        Rect::new(
+            224,
+            if state.held == Some(EqWidget::Presets) {
+                176
+            } else {
+                164
+            },
+            44,
+            12,
+        ),
         layout.presets.x,
         layout.presets.y,
     );

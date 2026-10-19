@@ -293,6 +293,11 @@ pub fn range_ids(entries: &[EntryId], anchor: usize, target: usize) -> Vec<Entry
 /// slice is [`VISIBLE_ROWS`] entries starting at the scroll offset.
 #[derive(Debug, Clone, Default)]
 pub struct PlaylistWindow {
+    /// Render the skin's 275x14 playlist windowshade band (S01 §1/§4).
+    pub windowshade: bool,
+    /// Held title button, overlaid from pledit.bmp; bottom buttons have no
+    /// pressed sprite (S01 §4.1).
+    pub pressed_title_button: Option<crate::playlist_window::PlaylistTitleButton>,
     entries: Vec<EntryId>,
     first_visible: usize,
     selected: BTreeSet<EntryId>,

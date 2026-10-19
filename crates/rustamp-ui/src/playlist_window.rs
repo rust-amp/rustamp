@@ -37,12 +37,9 @@
 //! Deliberate simplifications (the spec leaves these open, so they are kept
 //! simple and named):
 //!
-//! * The tiled title band clips whole 25 px tiles at the band edges instead of
-//!   the measured partial anchor pieces (S01 §4.1); the pixels differ where a
-//!   partial piece would start.
-//! * Entry text is drawn with the `text.bmp` bitmap font as a stand-in. S01 §4
-//!   settles that 2.95 uses a real font here, whose identity is open, so no
-//!   stand-in can match it; the colour follows `pledit.txt`.
+//! * Entry text uses the installed family from `pledit.txt` (S17 §5). Our
+//!   rasterization size/hinting are not a claim of GDI-exact reference pixels.
+//!   If no system font is available, the bitmap font is an explicit fallback.
 //! * The up/down split of the arrow pair (at y = 83) is an own choice; only
 //!   the two click points are settled.
 //! * The handle-y interpolation between the three settled points is an own
@@ -370,6 +367,24 @@ pub fn render_playlist_window(
     labels: &[String],
     focused: bool,
 ) -> Image {
+    if window.windowshade {
+        let mut canvas = Image::filled(275, 14, [0, 0, 0, 255]);
+        let pledit = load_sheet(skin, Sheet::Pledit);
+        // S01 §4 provisional webamp shade rectangles. Playlist ignores 2x.
+        let y = if focused { 42 } else { 57 };
+        for x in (0..225).step_by(25) {
+            blit_region(&mut canvas, pledit.as_ref(), Rect::new(72, y, 25, 14), x, 0);
+        }
+        blit_region(
+            &mut canvas,
+            pledit.as_ref(),
+            Rect::new(99, y, 50, 14),
+            225,
+            0,
+        );
+        draw_title_buttons(&mut canvas, pledit.as_ref(), skin, window);
+        return canvas;
+    }
     let (width, height) = PLAYLIST_WINDOW_SIZE;
     let style = skin.pledit();
     let mut canvas = Image::filled(
@@ -388,7 +403,30 @@ pub fn render_playlist_window(
     draw_bottom_bar(&mut canvas, pledit.as_ref(), skin);
     draw_rows(&mut canvas, skin, window, labels);
     draw_scrollbar(&mut canvas, pledit.as_ref(), window);
+    draw_title_buttons(&mut canvas, pledit.as_ref(), skin, window);
     canvas
+}
+
+fn draw_title_buttons(
+    canvas: &mut Image,
+    pledit: Option<&Image>,
+    skin: &Skin,
+    window: &PlaylistWindow,
+) {
+    if let Some(button) = window.pressed_title_button {
+        let (name, rect) = match button {
+            PlaylistTitleButton::Close => ("PLAYLIST_CLOSE_SELECTED", CLOSE_BUTTON_RECT),
+            PlaylistTitleButton::Shade => (
+                if window.windowshade {
+                    "PLAYLIST_EXPAND_SELECTED"
+                } else {
+                    "PLAYLIST_COLLAPSE_SELECTED"
+                },
+                SHADE_BUTTON_RECT,
+            ),
+        };
+        blit_sprite(canvas, pledit, skin, name, rect.x, rect.y);
+    }
 }
 
 fn load_sheet(skin: &Skin, sheet: Sheet) -> Option<Image> {
@@ -446,25 +484,33 @@ fn draw_title_bar(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin, focus
         )
     };
     blit_sprite(canvas, pledit, skin, corner, 0, 0);
-    // Tiled bands at 25 px pitch, clipped at the band edges (whole tiles; the
-    // measured partial anchor pieces of S01 §4.1 are an owned simplification).
-    // The tiles go down first so the strip and the corners cover the overflow.
-    let mut dx = TITLE_TILE_WIDTH as i32;
-    while dx < TITLE_STRIP_X {
-        blit_sprite(canvas, pledit, skin, tile, dx, 0);
-        dx += TITLE_TILE_WIDTH as i32;
-    }
-    let mut dx = TITLE_STRIP_X + TITLE_STRIP_WIDTH as i32;
-    while dx < 250 {
-        blit_sprite(canvas, pledit, skin, tile, dx, 0);
-        dx += TITLE_TILE_WIDTH as i32;
+    // S01 §4.1: fresh partial tiles at each band's left edge, then full
+    // tiles anchored to the fixed piece on its right (not to the window).
+    if let Some(def) = skin.sprite(tile) {
+        for (left, right) in [(25, TITLE_STRIP_X), (187, 250)] {
+            let partial = (right - left) % TITLE_TILE_WIDTH as i32;
+            let mut dx = left;
+            while dx < right {
+                let width = if dx == left && partial != 0 {
+                    partial
+                } else {
+                    TITLE_TILE_WIDTH as i32
+                };
+                blit_region(
+                    canvas,
+                    pledit,
+                    Rect::new(def.x as i32, def.y as i32, width as u32, 20),
+                    dx,
+                    0,
+                );
+                dx += width;
+            }
+        }
     }
     blit_sprite(canvas, pledit, skin, strip, TITLE_STRIP_X, 0);
     blit_sprite(canvas, pledit, skin, right, 250, 0);
-    // Close/shade from the raw sheet rects (S01 §4, provisional); the webamp
-    // table only names the pressed cells, so no sprite name is used.
-    blit_region(canvas, pledit, Rect::new(52, 42, 9, 9), 264, 3);
-    blit_region(canvas, pledit, Rect::new(62, 42, 9, 9), 254, 3);
+    // Resting window buttons are already in the title body; only a held
+    // button overlays the separate selected cell (see draw_title_buttons).
 }
 
 fn draw_side_rails(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin) {
@@ -533,10 +579,12 @@ fn playlist_font_mask(mut image: Image) -> Option<BitmapFont> {
         (row * webamp::TEXT_CELL.1) as i32,
     )?;
     for pixel in image.as_rgba_mut().as_chunks_mut::<4>().0 {
-        if pixel[..3] == background[..3] {
+        if pixel[..3] == background[..3] || pixel[3] < 128 {
             *pixel = [0; 4];
         } else {
-            pixel[..3].fill(255);
+            // The bitmap fallback obeys the same 1-bit contract as the system
+            // font: fractional source alpha must not create off-palette ink.
+            *pixel = [255; 4];
         }
     }
     Some(BitmapFont::new(image, glyphs, None, 0))
@@ -552,7 +600,7 @@ fn playlist_font_mask(mut image: Image) -> Option<BitmapFont> {
 ///
 /// `Normal` and `Current` tint the glyph ink independently of selection;
 /// `Current` applies only to the app-supplied current entry, not the clicked
-/// or selected one (S17 §5). The bitmap shapes remain a stand-in for `Font`.
+/// or selected one (S17 §5).
 fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &[String]) {
     let style = skin.pledit();
     let selected = [
@@ -575,7 +623,20 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
         if text.is_empty() {
             continue;
         }
-        if let Some(font) = font.as_ref() {
+        let colour = if window.current() == Some(*id) {
+            style.current
+        } else {
+            style.normal
+        };
+        if let Some(scratch) = crate::playlist_font::render(
+            style.font.as_deref().unwrap_or("Arial"),
+            text,
+            rect.width,
+            rect.height,
+            colour,
+        ) {
+            canvas.blit_alpha(&scratch, scratch.bounds(), rect.x, rect.y);
+        } else if let Some(font) = font.as_ref() {
             // Scratch-clipped like the main-window marquee, so text cannot
             // spill past the row or into the scrollbar.
             let mut scratch = Image::new(rect.width, rect.height);
@@ -618,7 +679,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn playlist_mask_removes_nonblack_background_and_preserves_ink_alpha() {
+    fn playlist_mask_removes_nonblack_background_and_quantizes_ink_alpha() {
         let background = [0x51, 0x62, 0x73, 255];
         let mut sheet = Image::filled(155, 18, background);
         // Black ink must not be mistaken for background; transparent ink
@@ -626,11 +687,12 @@ mod tests {
         sheet.set_pixel(0, 0, [0, 0, 0, 255]);
         sheet.set_pixel(1, 0, [0, 0, 0, 128]);
         sheet.set_pixel(2, 0, [9, 8, 7, 0]);
+        sheet.set_pixel(3, 0, [9, 8, 7, 127]);
         let font = playlist_font_mask(sheet).expect("the space cell exists");
         let mut scratch = Image::new(10, 6);
         font.render_text(&mut scratch, 0, 0, "a ");
         assert_eq!(scratch.pixel(0, 0), Some([255; 4]));
-        assert_eq!(scratch.pixel(1, 0), Some([255, 255, 255, 128]));
+        assert_eq!(scratch.pixel(1, 0), Some([255; 4]));
         assert_eq!(scratch.pixel(2, 0).unwrap()[3], 0);
         assert_eq!(scratch.pixel(3, 0), Some([0; 4]));
         assert_eq!(scratch.pixel(5, 0), Some([0; 4]), "space is transparent");
@@ -677,20 +739,17 @@ mod tests {
                         let bg = [bg[0], bg[1], bg[2], 255];
                         let ink = [ink[0], ink[1], ink[2], 255];
                         let mut ink_count = 0;
+                        let mut background_count = 0;
                         for y in row.y..row.bottom() {
                             for x in row.x..row.right() {
                                 let pixel = frame.pixel(x, y).unwrap();
                                 assert!(pixel == bg || pixel == ink, "row {i}: {pixel:?}");
                                 ink_count += usize::from(pixel == ink);
+                                background_count += usize::from(pixel == bg);
                             }
                         }
                         assert!(ink_count > 0, "a nonempty label must have visible ink");
-                        assert_eq!(
-                            frame.pixel(row.x + 5, row.y),
-                            Some(bg),
-                            "space keeps the band"
-                        );
-                        assert_eq!(frame.pixel(row.x, row.bottom() - 1), Some(bg));
+                        assert!(background_count > 0, "glyphs must not erase the band");
                     }
                     for y in 0..frame.height() as i32 {
                         for x in 0..frame.width() as i32 {
