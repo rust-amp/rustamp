@@ -41,7 +41,7 @@ use rustamp_mediahost::decoder::{
     DecoderInfo, DecoderResident, DecoderSession, ResidentDecoder, serve_decoder,
 };
 use rustamp_mediahost::dsp::{DspSession, serve_dsp};
-use rustamp_mediahost::pcm::{CloseRing, PcmInput, PcmOffer, PcmRings};
+use rustamp_mediahost::pcm::{CloseRing, PcmInput, PcmOffer, PcmRings, check_offer};
 use rustamp_mediahost::{MediaHostError, Result};
 use rustamp_proto::host::{DspStageDesc, MediaLocationWire, PcmSpecWire};
 
@@ -131,19 +131,19 @@ impl DeafRings {
         spec: PcmSpecWire,
         expected: RingDirection,
     ) -> Result<PcmInput<AnonymousRegion>> {
+        // The same rule production enforces: an offer in another direction is
+        // refused before any mapping opens.
+        check_offer(offer, expected)?;
         let Message::RingOffer {
-            name,
-            frame_size,
-            direction,
-            ..
+            name, frame_size, ..
         } = offer
         else {
+            // `check_offer` already refused every other message.
             return Err(MediaHostError::InvalidMessage(
                 "expected PCM RingOffer".into(),
             ));
         };
         assert_eq!(*frame_size, spec.frame_size());
-        assert_eq!(*direction, expected, "ring direction");
         let region = self.0.lock().unwrap()[name].clone();
         let expect = offer.ring_expect().unwrap();
         let consumer = RingConsumer::attach(region.clone(), expect)?

@@ -19,7 +19,7 @@ use rustamp_mediahost::control::{ControlPeer, Liveness};
 use rustamp_mediahost::decoder::{
     DecoderInfo, DecoderResident, DecoderSession, ResidentDecoder, serve_decoder,
 };
-use rustamp_mediahost::pcm::{CloseRing, PcmInput, PcmOffer, PcmRings};
+use rustamp_mediahost::pcm::{CloseRing, PcmInput, PcmOffer, PcmRings, check_offer};
 use rustamp_mediahost::{MediaHostError, Result};
 use rustamp_proto::host::{MediaLocationWire, PcmSpecWire};
 
@@ -99,10 +99,13 @@ fn streams() -> ((ByteReader, ByteWriter), (ByteReader, ByteWriter)) {
 #[derive(Clone, Default)]
 struct TestRings(Arc<Mutex<HashMap<String, AnonymousRegion>>>);
 
-impl PcmRings for TestRings {
-    type Region = AnonymousRegion;
-
-    fn create(&self, spec: PcmSpecWire, capacity: u32) -> Result<PcmOffer<Self::Region>> {
+impl TestRings {
+    fn create_impl(
+        &self,
+        spec: PcmSpecWire,
+        capacity: u32,
+        direction: RingDirection,
+    ) -> Result<PcmOffer<AnonymousRegion>> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let size = RING_DATA_OFFSET + spec.frame_size() as usize * capacity as usize;
@@ -125,7 +128,7 @@ impl PcmRings for TestRings {
             capacity,
             size: size as u64,
             generation: producer.generation(),
-            direction: RingDirection::HostToMain,
+            direction,
         };
         Ok(PcmOffer {
             producer,
@@ -134,12 +137,24 @@ impl PcmRings for TestRings {
         })
     }
 
-    fn open(&self, offer: &Message, spec: PcmSpecWire) -> Result<PcmInput<Self::Region>> {
+    fn open_impl(
+        &self,
+        offer: &Message,
+        spec: PcmSpecWire,
+        expected: RingDirection,
+    ) -> Result<PcmInput<AnonymousRegion>> {
+        // The same rule production enforces (`NamedPcmRings::open_impl`): an
+        // offer in another direction is refused before any mapping opens, so
+        // this double cannot run a configuration the host could never create.
+        check_offer(offer, expected)?;
         let Message::RingOffer {
             name, frame_size, ..
         } = offer
         else {
-            panic!("expected offer")
+            // `check_offer` already refused every other message.
+            return Err(MediaHostError::InvalidMessage(
+                "expected PCM RingOffer".into(),
+            ));
         };
         assert_eq!(*frame_size, spec.frame_size());
         let region = self.0.lock().unwrap()[name].clone();
@@ -152,6 +167,87 @@ impl PcmRings for TestRings {
             abort: Box::new(CloseRing(abort)),
         })
     }
+}
+
+impl PcmRings for TestRings {
+    type Region = AnonymousRegion;
+
+    fn create(&self, spec: PcmSpecWire, capacity: u32) -> Result<PcmOffer<Self::Region>> {
+        self.create_impl(spec, capacity, RingDirection::HostToMain)
+    }
+
+    fn open(&self, offer: &Message, spec: PcmSpecWire) -> Result<PcmInput<Self::Region>> {
+        self.open_impl(offer, spec, RingDirection::HostToMain)
+    }
+
+    fn create_directed(
+        &self,
+        spec: PcmSpecWire,
+        capacity: u32,
+        direction: RingDirection,
+    ) -> Result<PcmOffer<Self::Region>> {
+        self.create_impl(spec, capacity, direction)
+    }
+
+    fn open_directed(
+        &self,
+        offer: &Message,
+        spec: PcmSpecWire,
+        direction: RingDirection,
+    ) -> Result<PcmInput<Self::Region>> {
+        self.open_impl(offer, spec, direction)
+    }
+}
+
+/// The in-process double must enforce the direction rule production
+/// enforces: an opener refuses an offer whose direction is not the one it
+/// expects, before any mapping opens.
+///
+/// Before the rule was shared, this double opened a `MainToHost` ring on the
+/// decoder path happily, so a test could pass with a configuration the host
+/// could never create (M14 finding F4).
+#[test]
+fn test_rings_refuse_the_direction_production_refuses() {
+    let rings = TestRings::default();
+    let spec = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 2,
+    };
+
+    // The decoder path runs host -> main: the accepted direction builds and
+    // opens.
+    let offer = rings.create(spec, 1).unwrap();
+    let Message::RingOffer { direction, .. } = &offer.message else {
+        panic!("expected a ring offer");
+    };
+    assert_eq!(*direction, RingDirection::HostToMain);
+    assert!(rings.open(&offer.message, spec).is_ok());
+
+    // The refused direction: a main -> host ring on the decoder path. This is
+    // the configuration production refuses with `InvalidMessage`.
+    let backwards = rings
+        .create_directed(spec, 1, RingDirection::MainToHost)
+        .unwrap();
+    let Message::RingOffer { direction, .. } = &backwards.message else {
+        panic!("expected a ring offer");
+    };
+    assert_eq!(*direction, RingDirection::MainToHost);
+    assert!(matches!(
+        rings.open(&backwards.message, spec),
+        Err(MediaHostError::InvalidMessage(_))
+    ));
+
+    // The same ring opens when its direction is the expected one, and the
+    // host -> main ring does not open as a main -> host ring either.
+    assert!(
+        rings
+            .open_directed(&backwards.message, spec, RingDirection::MainToHost)
+            .is_ok()
+    );
+    assert!(matches!(
+        rings.open_directed(&offer.message, spec, RingDirection::MainToHost),
+        Err(MediaHostError::InvalidMessage(_))
+    ));
 }
 
 fn start(
