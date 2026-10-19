@@ -51,6 +51,28 @@
 //! The movement keys always move the selection, whether the search field has
 //! the focus or not: the field holds one line of text, and the list is what
 //! the window is for.
+//!
+//! # The covers
+//!
+//! The list has a cover column: it shows the album art of the row. The art
+//! comes from the **artwork cache** ([`ArtworkCache`]), which the app owns
+//! and which lives as long as the library window does.
+//!
+//! Every frame asks the cache for the cover of every visible row and lends
+//! the answers to the renderer as **borrowed views** ([`CoverRef`]): the
+//! renderer reads the thumbnail's own bytes, so nothing is copied per frame.
+//!
+//! A track without a cover is drawn without one, and a cover that cannot be
+//! read is drawn as no cover as well: the failure is reported once, and the
+//! frame goes on.
+//!
+//! The cache notices a changed file by the file's `(mtime, size)`, so a
+//! rescan that changed a track invalidates its cover on its own. The app
+//! invalidates nothing.
+//!
+//! The cover of a row is read and decoded the first time the row is drawn,
+//! and the frame that draws it waits for it. The frames after that are
+//! served from the cache.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -61,14 +83,21 @@ use rustamp_core::error::{Error, Result};
 use rustamp_core::playlist::MediaLocation;
 use rustamp_core::state::WindowId;
 use rustamp_gfx::{Image, Rect};
-use rustamp_library::{Cancel, Library, Query, Root, ScanPhase, ScanProgress, SortKey, TrackRow};
-use rustamp_ui::library_render::{LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT};
+use rustamp_library::{
+    ArtworkCache, Cancel, CoverImage, Library, Query, Root, ScanPhase, ScanProgress, SortKey,
+    TrackRow,
+};
+use rustamp_ui::library_render::{CoverRef, LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT};
 use rustamp_ui::{
     Key, LibraryChrome, LibraryColumn, LibraryLayout, LibraryRequest, LibraryRow, LibrarySort,
     LibraryView, Modifiers, scroll_for_click,
 };
 
 use crate::app::App;
+
+#[cfg(test)]
+#[path = "library_window_tests.rs"]
+mod library_window_tests;
 
 /// The number of the media library's window, in the `Gen` range of
 /// [`WindowId`].
@@ -147,6 +176,20 @@ pub struct LibraryWindow {
     /// it answers while a scan holds the index: a scan does not change the
     /// roots, so the list is still the truth.
     roots: Vec<PathBuf>,
+    /// The decoded covers of the rows the window shows.
+    ///
+    /// The cache is the app's: it is asked once per frame and it keeps the
+    /// answers, so a cover is read from the file only once. It notices a
+    /// changed file by the file's stat, so a rescan that changed a track
+    /// invalidates its cover without any work here.
+    artwork: ArtworkCache,
+    /// The cover failure of the last frame, if there was one.
+    cover_failure: Option<String>,
+    /// The cover failure the app was told about already.
+    ///
+    /// The failure repeats with every frame while it lasts, so it is
+    /// reported once.
+    noted_cover_failure: Option<String>,
 }
 
 impl Default for LibraryWindow {
@@ -161,6 +204,9 @@ impl Default for LibraryWindow {
             folder_request: false,
             error: None,
             roots: Vec::new(),
+            artwork: ArtworkCache::new(),
+            cover_failure: None,
+            noted_cover_failure: None,
         };
         window.update_viewport();
         window
@@ -335,21 +381,36 @@ impl LibraryWindow {
     }
 
     /// Paints the window: the page, the chrome and the status line.
-    pub fn render(&self) -> Image {
+    pub fn render(&mut self) -> Image {
         let mut frame = Image::new(self.size.0, self.size.1);
-        // Cover art is not wired into the app yet: the renderer takes a
-        // borrowed RGBA view per visible row, and the artwork cache that
-        // produces them is a follow-up lane. An empty slice draws the rows
-        // without covers, which is the documented "no cover" state.
+        // The covers of the visible rows: the cache's answers, lent to the
+        // renderer as borrowed views. The answers are kept in `owns`, which
+        // outlives the call, so the pixels are read where they already lie.
+        let mut owns: Vec<Option<Arc<CoverImage>>> = Vec::new();
+        let (covers, failure) = covers_of(&self.artwork, self.view.visible_rows(), &mut owns);
+        self.cover_failure = failure;
         rustamp_ui::render_library_window(
             &mut frame,
             &self.view,
             &self.layout(),
             self.viewport(),
             self.search_focused,
-            &[],
+            &covers,
         );
         frame
+    }
+
+    /// The cover failure of the last frame, if it is a new one.
+    ///
+    /// The failure repeats with every frame while it lasts, so the app is
+    /// told about it once: a note per frame would drown the presenter's
+    /// list.
+    pub fn take_cover_failure(&mut self) -> Option<String> {
+        if self.cover_failure == self.noted_cover_failure {
+            return None;
+        }
+        self.noted_cover_failure = self.cover_failure.clone();
+        self.cover_failure.take()
     }
 
     /// A left-button press at the client coordinates `(x, y)`.
@@ -737,6 +798,50 @@ fn root_paths(roots: Vec<Root>) -> Vec<PathBuf> {
     roots.into_iter().map(|root| root.path).collect()
 }
 
+/// The covers of the rows, as borrowed views of the cache's answers.
+///
+/// The answers are kept in `owns`, which has to outlive the returned
+/// views: the renderer borrows the pixels, and the cache owns them.
+/// Nothing is copied - a view points at the thumbnail's own bytes.
+///
+/// A row without a cover has no view, and neither has a row whose cover
+/// could not be read: the failure is returned next to the views, and the
+/// frame is drawn without that cover.
+fn covers_of<'a>(
+    cache: &ArtworkCache,
+    rows: &[LibraryRow],
+    owns: &'a mut Vec<Option<Arc<CoverImage>>>,
+) -> (Vec<Option<CoverRef<'a>>>, Option<String>) {
+    owns.clear();
+    let mut failure = None;
+    for row in rows {
+        match cache.get(&row.path) {
+            Ok(cover) => owns.push(cover),
+            Err(error) => {
+                owns.push(None);
+                if failure.is_none() {
+                    failure = Some(format!(
+                        "the cover of {} could not be read: {error}",
+                        row.path.display()
+                    ));
+                }
+            }
+        }
+    }
+    let owns: &'a Vec<Option<Arc<CoverImage>>> = &*owns;
+    let covers = owns
+        .iter()
+        .map(|answer| {
+            answer.as_ref().map(|cover| CoverRef {
+                width: cover.width,
+                height: cover.height,
+                pixels: &cover.pixels,
+            })
+        })
+        .collect();
+    (covers, failure)
+}
+
 /// The index query the view's request asks for.
 ///
 /// The view owns the search term, the sort column and the window of rows;
@@ -810,8 +915,15 @@ impl App {
     }
 
     /// Renders one frame of the library window.
-    pub fn render_library(&self) -> Image {
-        self.library_window.render()
+    ///
+    /// A cover that could not be read is noted once: the frame itself is
+    /// drawn without that cover, so a broken file never breaks the list.
+    pub fn render_library(&mut self) -> Image {
+        let image = self.library_window.render();
+        if let Some(failure) = self.library_window.take_cover_failure() {
+            self.note(format!("Library: {failure}"));
+        }
+        image
     }
 
     /// A left-button press in the library window, in client coordinates.
