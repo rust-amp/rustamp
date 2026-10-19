@@ -80,6 +80,29 @@
 //! host-side method that would serve it is
 //! [`crate::registry::PluginRegistry::configure_plugin`].
 //!
+//! # Start/stop requests
+//!
+//! The registry can start and stop a visualization
+//! ([`crate::registry::PluginRegistry::start_vis`],
+//! [`crate::registry::PluginRegistry::stop_vis`]), but **no request on the
+//! wire reaches that path yet**.
+//!
+//! The only vis request the protocol carries besides the Configure one is
+//! [`Command::ToggleVisPlugin`], and it is a **unit variant**: it names
+//! neither the plug-in nor the module, so it cannot say *what* to start. The
+//! host would have to guess which of the loaded visualization plug-ins and
+//! which of their modules the player means, and a guess that starts the wrong
+//! plug-in is worse than no answer at all. A request that carries the plug-in
+//! id and the module index needs a new `Command` variant with a payload — a
+//! wire change, which needs an RFC (RFC 0020) — and none is invented here.
+//! `ToggleVisPlugin` therefore still falls into the catch-all arm, like every
+//! other command the host cannot act on.
+//!
+//! The player could not send such a request even if the wire carried it: the
+//! app never reads the host's answers, so it does not know the plug-in id the
+//! host assigned (RFC 0020 §2, §3.5). Both halves of the gap are outside this
+//! crate.
+//!
 //! # Messages this module deliberately ignores
 //!
 //! Any other variant returns [`ControlStep::Continue`] and touches neither the
@@ -87,7 +110,9 @@
 //! so answering one over the channel would invent protocol; classic plugins
 //! keep querying the host window in-process instead. `CommandToHost` carries
 //! the player's own commands, and only the Configure request above is one the
-//! host can act on; the ring offers and the RFC 0006 decoder/DSP messages
+//! host can act on; the start/stop request of the section above is one it
+//! cannot, because the wire does not say what to start. The ring offers and
+//! the RFC 0006 decoder/DSP messages
 //! (including the RFC 0015 `DspResetAck` reply, which only a DSP session's
 //! player side expects) belong to other hosts or to future cards; acting on
 //! them here would be guessing. There is also no message for "quit plugin N":

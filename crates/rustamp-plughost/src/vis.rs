@@ -265,7 +265,20 @@ impl VisLoop {
     /// refusing `init` aborts the start, and nothing runs (S09 section 5.2,
     /// offset 0x928).
     pub fn start(&mut self, plugin: &mut LoadedPlugin, index: i32) -> Result<(), VisError> {
-        plugin.vis_start(index)?;
+        if let Err(error) = plugin.vis_start(index) {
+            // A refusing `init` aborts the start (S09 section 5.2), and the
+            // module that ran before was already quit (S09 section 5.3 step 1):
+            // nothing runs any more, so the loop must not claim to run. An
+            // unknown module index changes nothing — the module that runs
+            // keeps running, so the loop keeps running it.
+            if matches!(error, VisError::InitFailed(_)) {
+                self.running = false;
+                self.ended = false;
+                self.final_frame = false;
+                self.next_frame_ms = None;
+            }
+            return Err(error);
+        }
         // The module's own cadence (S09 section 5.2, offsets 0x014 and 0x018).
         // A negative delay is nonsense: the host waits no time at all then.
         self.delay_ms = plugin
@@ -1663,6 +1676,59 @@ mod tests {
         // A second stop must not reach the plugin again.
         vis.stop(&mut plugin);
         assert_eq!(vis_log().len(), 2);
+    }
+
+    #[test]
+    fn a_refusing_start_leaves_the_loop_not_running() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+        assert!(vis.is_running());
+
+        // The second module's `init` refuses. The module that ran before was
+        // already quit (S09 §5.3 step 1), so nothing runs any more and the
+        // loop must not claim to run.
+        let mut refusing = test_module(c"refusing");
+        refusing.init = Some(test_init_refusing);
+        let mut other = test_plugin(&mut refusing);
+        assert_eq!(vis.start(&mut other, 0), Err(VisError::InitFailed(1)));
+        assert!(
+            !vis.is_running(),
+            "a refused start must leave no visualization running"
+        );
+        assert_eq!(
+            vis.step(&other, 0, None).expect("no frame may be drawn"),
+            VisStep::Idle
+        );
+    }
+
+    #[test]
+    fn an_unknown_module_index_keeps_the_running_visualization() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+
+        // The library has no such module: nothing was changed, so the module
+        // that runs keeps running.
+        assert_eq!(
+            vis.start(&mut plugin, 7),
+            Err(VisError::UnknownModule(7)),
+            "an unknown module index must be refused"
+        );
+        assert!(vis.is_running());
+        assert_eq!(
+            vis_log(),
+            vec!["init parent=0x99 instance=0x0 rate=44100 channels=2"],
+            "only the init of the successful start ran"
+        );
     }
 
     #[test]
