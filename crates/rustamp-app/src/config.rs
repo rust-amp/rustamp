@@ -7,9 +7,9 @@
 //! equalizer state, and window placements).
 //!
 //! For settings that cannot be honoured yet (e.g. output backend/device selection,
-//! audio buffer lengths, ReplayGain, shuffle/repeat playback modes,
-//! and plugins), the configuration loader reports clear warnings rather than
-//! silently ignoring them.
+//! audio buffer lengths, shuffle/repeat playback modes, and plugins), the
+//! configuration loader reports clear warnings rather than silently ignoring them.
+//! ReplayGain is now honoured (audio.replaygain).
 //!
 //! On clean exit, the app writes an honest configuration to `%RUSTAMP_CONFIG%`
 //! (when set) or `%APPDATA%\Rustamp\rustamp.toml`. The serialized configuration
@@ -124,7 +124,7 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
                 "buffer_ms" => Some("output buffer length is fixed"),
                 "fadeout_ms" => Some("fadeout duration is not supported yet"),
                 "gapless" => Some("gapless mode is not configurable"),
-                "replaygain" => Some("ReplayGain is not supported yet"),
+                "replaygain" => None,
                 "volume" | "balance" => None,
                 _ => Some("unrecognized audio setting"),
             };
@@ -266,11 +266,22 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
         "balance".into(),
         toml::Value::Integer(i64::from(config.audio.balance)),
     );
+    audio.insert(
+        "replaygain".into(),
+        toml::Value::String(
+            match config.audio.replaygain {
+                rustamp_core::config::ReplayGainMode::Off => "Off",
+                rustamp_core::config::ReplayGainMode::Track => "Track",
+                rustamp_core::config::ReplayGainMode::Album => "Album",
+            }
+            .to_owned(),
+        ),
+    );
     // Note on deliberately unpersisted fields:
-    // audio.output, audio.device, audio.buffer_ms, audio.fadeout_ms,
-    // audio.gapless, and audio.replaygain are deliberately not persisted
-    // because the audio engine does not support runtime configuration of them yet.
-    // Serializing them would falsely advertise supported functionality (task card N6).
+    // audio.output, audio.device, audio.buffer_ms, audio.fadeout_ms and
+    // audio.gapless are deliberately not persisted because the audio engine
+    // does not support runtime configuration of them yet. audio.replaygain is
+    // persisted: it is honoured by the engine (task card E4/A15 wiring).
     root.insert("audio".into(), toml::Value::Table(audio));
 
     let mut ui = toml::Table::new();
@@ -356,6 +367,7 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
     // playlist (shuffle, repeat, manual_advance, last_playlist) and the
     // plugins' vis_plugin / vis_preset are deliberately not persisted because
     // none of those features are honoured by the player yet (task card N6).
+    // audio.replaygain is persisted (see above).
 
     toml::to_string_pretty(&toml::Value::Table(root)).map_err(|e| ConfigError::Write {
         path: PathBuf::from("<serialize>"),
@@ -607,7 +619,6 @@ mod tests {
         config.audio.buffer_ms = 450;
         config.audio.fadeout_ms = 1200;
         config.audio.gapless = false;
-        config.audio.replaygain = rustamp_core::config::ReplayGainMode::Album;
         config.ui.snap_distance = 30;
         config.playlist.shuffle = true;
         config.playlist.repeat = true;
@@ -618,11 +629,18 @@ mod tests {
         config.plugins.vis_preset = Some("preset".into());
         config.plugins.disabled = vec!["bad.dll".into()];
 
+        // replaygain is now persisted, so set it non-default and expect it back.
+        config.audio.replaygain = rustamp_core::config::ReplayGainMode::Album;
+
         save(&config, &path).expect("save succeeds");
 
         let loaded = load(Some(&path)).expect("load succeeds");
         // Persisted fields survive:
         assert_eq!(loaded.config.audio.volume, 180);
+        assert_eq!(
+            loaded.config.audio.replaygain,
+            rustamp_core::config::ReplayGainMode::Album
+        );
         // Unpersisted fields cleanly revert to their documented defaults:
         assert_eq!(loaded.config.audio.output, Config::default().audio.output);
         assert_eq!(loaded.config.audio.device, Config::default().audio.device);
@@ -635,10 +653,6 @@ mod tests {
             Config::default().audio.fadeout_ms
         );
         assert_eq!(loaded.config.audio.gapless, Config::default().audio.gapless);
-        assert_eq!(
-            loaded.config.audio.replaygain,
-            Config::default().audio.replaygain
-        );
         assert_eq!(loaded.config.ui.snap_distance, 30);
         assert_eq!(loaded.config.playlist, Config::default().playlist);
         // The plug-in pages' two settings survive; the vis ones do not.
@@ -666,7 +680,6 @@ mod tests {
 
         // The serialized text must NOT contain any unhonoured field names.
         let ignored_keywords = [
-            "replaygain",
             "buffer_ms",
             "fadeout_ms",
             "gapless",
@@ -700,13 +713,10 @@ shuffle = true
 
         let loaded = load(Some(&path)).expect("load succeeds");
         assert_eq!(loaded.config.audio.volume, 180);
-        assert!(
-            loaded
-                .warnings
-                .iter()
-                .any(|w| w.contains("audio.replaygain") && w.contains("not applied")),
-            "expected warning for audio.replaygain in {:?}",
-            loaded.warnings
+        // replaygain is now honoured, so it no longer warns.
+        assert_eq!(
+            loaded.config.audio.replaygain,
+            rustamp_core::config::ReplayGainMode::Track
         );
         assert!(
             loaded

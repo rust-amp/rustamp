@@ -45,6 +45,7 @@ use rustamp_core::playlist::{EntryId, MediaLocation, SortKey};
 use rustamp_core::state::{PlayerState, TransportState, WindowId};
 use rustamp_gfx::Image;
 use rustamp_ipc::{Message, Transport};
+use rustamp_meta::replaygain::ReplayGainTags;
 use rustamp_output::{NullClock, NullOutput, default_output};
 use rustamp_ui::{
     DialogManager, EqMenuRequest, EqualizerLayout, EqualizerWindow, Key, MainWindow,
@@ -228,6 +229,28 @@ fn create_output(choice: OutputChoice) -> (Box<dyn OutputDevice>, Option<NullClo
     }
 }
 
+/// Maps the persisted configuration mode to the audio engine's mode.
+fn replaygain_mode_to_audio(
+    mode: rustamp_core::config::ReplayGainMode,
+) -> rustamp_audio::ReplayGainMode {
+    match mode {
+        rustamp_core::config::ReplayGainMode::Off => rustamp_audio::ReplayGainMode::Off,
+        rustamp_core::config::ReplayGainMode::Track => rustamp_audio::ReplayGainMode::Track,
+        rustamp_core::config::ReplayGainMode::Album => rustamp_audio::ReplayGainMode::Album,
+    }
+}
+
+/// Maps the audio engine's mode back to the persisted configuration mode.
+fn replaygain_mode_from_audio(
+    mode: rustamp_audio::ReplayGainMode,
+) -> rustamp_core::config::ReplayGainMode {
+    match mode {
+        rustamp_audio::ReplayGainMode::Off => rustamp_core::config::ReplayGainMode::Off,
+        rustamp_audio::ReplayGainMode::Track => rustamp_core::config::ReplayGainMode::Track,
+        rustamp_audio::ReplayGainMode::Album => rustamp_core::config::ReplayGainMode::Album,
+    }
+}
+
 impl App {
     /// Builds the player with the default decoder registry.
     pub fn new(options: AppOptions) -> Result<App> {
@@ -255,6 +278,7 @@ impl App {
         engine.set_volume(options.volume)?;
         engine.set_balance(options.config.audio.balance)?;
         engine.set_eq(options.config.eq.state);
+        engine.set_replaygain_mode(replaygain_mode_to_audio(options.config.audio.replaygain));
         if let Some(file) = &options.file
             && !is_playlist_file(file)
         {
@@ -579,6 +603,7 @@ impl App {
             audio: AudioConfig {
                 volume,
                 balance,
+                replaygain: replaygain_mode_from_audio(self.engine.replaygain_mode()),
                 ..self.config.audio.clone()
             },
             ui: UiConfig {
@@ -1078,6 +1103,24 @@ impl App {
     /// Applies a core [`Event`]: the app's own bookkeeping first, then the UI
     /// machine (the authoritative state).
     pub fn handle_event(&mut self, event: &Event) {
+        // A track that actually opened: read its ReplayGain tags and drive the
+        // engine's ReplayGain stage from them. Absent tags leave the control's
+        // values unset, so the mode stays harmless (unity).
+        if let Event::TrackChanged {
+            metadata: Some(metadata),
+            ..
+        } = event
+        {
+            let tags = ReplayGainTags::from_metadata(metadata);
+            let mode = self.engine.replaygain_mode();
+            self.engine.set_replaygain(
+                mode,
+                tags.track_gain_db,
+                tags.track_peak,
+                tags.album_gain_db,
+                tags.album_peak,
+            );
+        }
         if matches!(
             event,
             Event::TrackChanged { .. } | Event::StreamInfoChanged(_)

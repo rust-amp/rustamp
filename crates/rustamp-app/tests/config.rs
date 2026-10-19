@@ -155,7 +155,6 @@ fn an_ignored_field_is_not_advertised() {
     let serialized = serialize_honest(&config).expect("serialize honest config");
 
     let ignored_names = [
-        "replaygain",
         "buffer_ms",
         "fadeout_ms",
         "gapless",
@@ -201,12 +200,7 @@ repeat = true
 ";
     let val: toml::Value = toml::from_str(toml_input).unwrap();
     let warnings = ignored_fields_in_toml(&val);
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("audio.replaygain") && w.contains("not applied")),
-        "audio.replaygain warning missing: {warnings:?}"
-    );
+    // replaygain is now honoured: no warning.
     assert!(
         warnings
             .iter()
