@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use rustamp_core::meta::TrackMetadata;
 use rustamp_meta::{
-    ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, Artwork, R128_ALBUM_GAIN_KEY, R128_TRACK_GAIN_KEY,
-    REFERENCE_LOUDNESS_KEY, ReplayGainTags, read_artwork, read_tags, scan_paths,
+    ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, Artwork, PictureKind, R128_ALBUM_GAIN_KEY, R128_TRACK_GAIN_KEY,
+    REFERENCE_LOUDNESS_KEY, ReplayGainTags, read_artwork, read_artworks, read_tags, scan_paths,
     supported_extensions, supports_extension, write_replaygain, write_tags, write_tags_report,
 };
 use tempfile::TempDir;
@@ -549,6 +549,52 @@ const PNG_LIKE: &[u8] = &[
     0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01,
 ];
 
+/// The front cover a test file carries.
+fn front_cover() -> Artwork {
+    Artwork {
+        kind: PictureKind::FrontCover,
+        mime_type: Some("image/png".into()),
+        description: Some("front cover".into()),
+        data: PNG_LIKE.to_vec(),
+    }
+}
+
+/// The picture a test file carries, in `lofty`'s own model.
+///
+/// The tag layer of this crate cannot write pictures — `TrackMetadata` has no
+/// field for them — so the test writes them with `lofty` itself.
+fn picture() -> lofty::picture::Picture {
+    use lofty::picture::{MimeType, Picture, PictureType};
+
+    Picture::unchecked(PNG_LIKE.to_vec())
+        .mime_type(MimeType::Png)
+        .pic_type(PictureType::CoverFront)
+        .description("front cover")
+        .build()
+}
+
+/// Writes `picture` into the primary tag of the file at `path`.
+fn write_picture(
+    path: &std::path::Path,
+    tag_type: lofty::tag::TagType,
+    picture: lofty::picture::Picture,
+) {
+    use lofty::config::WriteOptions;
+    use lofty::tag::{Tag, TagExt};
+    use std::io::Seek;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open file");
+    let mut tag = Tag::new(tag_type);
+    tag.push_picture(picture);
+    file.rewind().expect("rewind");
+    tag.save_to(&mut file, WriteOptions::default())
+        .expect("write picture");
+}
+
 #[test]
 fn artwork_is_exposed_with_unchanged_bytes() {
     let dir = TempDir::new().unwrap();
@@ -563,21 +609,152 @@ fn artwork_is_exposed_with_unchanged_bytes() {
         Some("Art Title")
     );
 
-    let artwork = read_artwork(&path).unwrap();
-    assert_eq!(
-        artwork,
-        vec![Artwork {
-            kind: 3,
-            mime_type: Some("image/png".into()),
-            description: Some("front cover".into()),
-            data: PNG_LIKE.to_vec(),
-        }]
-    );
+    assert_eq!(read_artwork(&path).unwrap(), Some(front_cover()));
+    assert_eq!(read_artworks(&path).unwrap(), vec![front_cover()]);
 }
 
 #[test]
-fn files_without_artwork_yield_an_empty_list() {
-    assert!(read_artwork(fixture("sine.flac")).unwrap().is_empty());
+fn files_without_artwork_have_no_cover() {
+    assert!(read_artwork(fixture("sine.flac")).unwrap().is_none());
+    assert!(read_artworks(fixture("sine.flac")).unwrap().is_empty());
+}
+
+#[test]
+fn the_front_cover_is_read_from_every_container() {
+    let dir = TempDir::new().unwrap();
+
+    // ID3v2 `APIC` (MP3, AAC, WAV, AIFF).
+    let mp3 = write_file(
+        &dir,
+        "art.mp3",
+        &id3v2_tag(&[id3v2_apic_frame("image/png", 3, "front cover", PNG_LIKE)]),
+    );
+    assert_eq!(read_artwork(&mp3).unwrap(), Some(front_cover()));
+
+    // The FLAC `PICTURE` block.
+    let flac = write_file(
+        &dir,
+        "art.flac",
+        &synthetic_flac_with_picture(
+            &[("TITLE", "Art Title")],
+            Some((3, "image/png", "front cover", PNG_LIKE)),
+        ),
+    );
+    assert_eq!(read_artwork(&flac).unwrap(), Some(front_cover()));
+
+    // The Vorbis `METADATA_BLOCK_PICTURE`.
+    let ogg = copy_fixture(&dir, "sine.ogg");
+    write_picture(&ogg, lofty::tag::TagType::VorbisComments, picture());
+    assert_eq!(read_artwork(&ogg).unwrap(), Some(front_cover()));
+
+    // The MP4 `covr` atom.
+    let m4a = copy_fixture(&dir, "sine_aac.m4a");
+    write_picture(&m4a, lofty::tag::TagType::Mp4Ilst, picture());
+    let cover = read_artwork(&m4a).unwrap().expect("the mp4 cover");
+    assert_eq!(cover.kind, PictureKind::FrontCover);
+    assert_eq!(cover.mime_type.as_deref(), Some("image/png"));
+    assert_eq!(cover.description, None, "the covr atom has no description");
+    assert_eq!(cover.data, PNG_LIKE);
+}
+
+#[test]
+fn a_picture_without_a_role_is_the_cover() {
+    // A tagger that does not know the picture types stores the type 0.
+    let dir = TempDir::new().unwrap();
+    let path = write_file(
+        &dir,
+        "art.flac",
+        &synthetic_flac_with_picture(&[], Some((0, "image/png", "cover", PNG_LIKE))),
+    );
+
+    let cover = read_artwork(&path).unwrap().expect("the cover");
+    assert_eq!(cover.kind, PictureKind::Other);
+    assert_eq!(cover.mime_type.as_deref(), Some("image/png"));
+    assert_eq!(cover.data, PNG_LIKE);
+}
+
+#[test]
+fn a_real_front_cover_wins_over_an_untyped_picture() {
+    let dir = TempDir::new().unwrap();
+    let mut flac = b"fLaC".to_vec();
+    flac.extend_from_slice(&flac_block(0, false, &flac_streaminfo()));
+    flac.extend_from_slice(&flac_block(
+        4,
+        false,
+        &flac_vorbis_comments(&[("TITLE", "Art")]),
+    ));
+    flac.extend_from_slice(&flac_block(
+        6,
+        false,
+        &flac_picture_block(0, "image/png", "cover", PNG_LIKE),
+    ));
+    flac.extend_from_slice(&flac_block(
+        6,
+        false,
+        &flac_picture_block(3, "image/png", "front cover", PNG_LIKE),
+    ));
+    flac.extend_from_slice(&flac_block(1, true, &[]));
+    flac.extend_from_slice(&[0u8; 64]);
+    let path = write_file(&dir, "two.flac", &flac);
+
+    let cover = read_artwork(&path).unwrap().expect("the cover");
+    assert_eq!(cover.kind, PictureKind::FrontCover);
+    assert_eq!(cover.description.as_deref(), Some("front cover"));
+
+    let pictures = read_artworks(&path).unwrap();
+    assert_eq!(pictures.len(), 2, "{pictures:?}");
+}
+
+#[test]
+fn a_back_cover_is_not_the_front_cover() {
+    let dir = TempDir::new().unwrap();
+    let path = write_file(
+        &dir,
+        "back.flac",
+        &synthetic_flac_with_picture(&[], Some((4, "image/png", "back", PNG_LIKE))),
+    );
+
+    assert!(read_artwork(&path).unwrap().is_none());
+
+    let pictures = read_artworks(&path).unwrap();
+    assert_eq!(pictures.len(), 1, "{pictures:?}");
+    assert_eq!(pictures[0].kind, PictureKind::BackCover);
+    assert_eq!(pictures[0].data, PNG_LIKE);
+}
+
+#[test]
+fn a_corrupt_picture_is_an_error_and_never_a_panic() {
+    let dir = TempDir::new().unwrap();
+
+    // A FLAC picture block that is too short to hold a picture.
+    let mut flac = b"fLaC".to_vec();
+    flac.extend_from_slice(&flac_block(0, false, &flac_streaminfo()));
+    flac.extend_from_slice(&flac_block(
+        4,
+        false,
+        &flac_vorbis_comments(&[("TITLE", "Art")]),
+    ));
+    flac.extend_from_slice(&flac_block(6, false, &[0, 0, 0, 3]));
+    flac.extend_from_slice(&flac_block(1, true, &[]));
+    flac.extend_from_slice(&[0u8; 64]);
+    let flac = write_file(&dir, "broken.flac", &flac);
+    assert!(
+        read_artwork(&flac).is_err(),
+        "the broken picture is an error"
+    );
+    assert!(read_artworks(&flac).is_err());
+
+    // An `APIC` frame that ends before its picture type.
+    let mp3 = write_file(
+        &dir,
+        "broken.mp3",
+        &id3v2_tag(&[id3v2_frame(b"APIC", &[0x00])]),
+    );
+    assert!(
+        read_artwork(&mp3).is_err(),
+        "the broken picture is an error"
+    );
+    assert!(read_artworks(&mp3).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,12 +1368,12 @@ fn the_cover_art_of_a_flac_file_survives_a_write() {
         ),
     );
 
-    let before = read_artwork(&path).unwrap();
+    let before = read_artworks(&path).unwrap();
     assert_eq!(before.len(), 1, "{before:?}");
 
     write_tags(&path, &full_metadata()).unwrap();
 
-    assert_eq!(read_artwork(&path).unwrap(), before);
+    assert_eq!(read_artworks(&path).unwrap(), before);
     assert_eq!(
         read_tags(&path).unwrap().title.as_deref(),
         Some("Round Trip Title")

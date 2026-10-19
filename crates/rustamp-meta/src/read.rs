@@ -6,15 +6,16 @@
 
 use std::path::{Path, PathBuf};
 
-use lofty::config::ParseOptions;
-use lofty::file::{TaggedFile, TaggedFileExt};
+use lofty::config::{ParseOptions, ParsingMode};
+use lofty::file::{FileType, TaggedFile, TaggedFileExt};
+use lofty::picture::Picture;
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, Tag, TagType};
 
 use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 
-use crate::artwork::Artwork;
+use crate::artwork::{Artwork, PictureKind};
 
 /// Tag types in descending precedence when a file carries more than one tag.
 ///
@@ -91,21 +92,59 @@ const EXTRA_ITEMS: &[(ItemKey, &str)] = &[
 /// * [`Error::UnsupportedFormat`] if the file is not a media file whose tags
 ///   [`lofty`] understands.
 pub fn read_tags(path: impl AsRef<Path>) -> Result<TrackMetadata> {
-    let file = load(path.as_ref(), false)?;
+    let file = load(path.as_ref(), tag_options())?;
     Ok(metadata_from(&file))
 }
 
-/// Reads the embedded pictures of `path`.
+/// Reads the front cover of `path`.
 ///
-/// The picture bytes are returned verbatim; see [`Artwork`]. Pictures from
-/// every tag are returned in the same precedence order as [`read_tags`].
+/// The cover is the embedded picture a library view shows: the first picture
+/// of the file's primary tag that claims to be the front cover
+/// ([`PictureKind::FrontCover`]). A picture that names no role at all
+/// ([`PictureKind::Other`]) is the cover only when no picture claims the
+/// role — that is what a tagger writes when it does not know the picture
+/// types. A file whose pictures all name another role (a back cover, the
+/// media label) has no front cover, and the answer is `None`.
+///
+/// The picture bytes are returned verbatim; see [`Artwork`]. Nothing is
+/// decoded, resized or validated: the caller hands the bytes and the MIME
+/// type to an image decoder.
+///
+/// **Embedded pictures only.** A cover image that sits next to the file
+/// (`cover.jpg`, `folder.jpg`) is *not* looked for; this function never
+/// touches the network and never reads a file other than `path` itself.
 ///
 /// # Errors
 ///
-/// See [`read_tags`].
-pub fn read_artwork(path: impl AsRef<Path>) -> Result<Vec<Artwork>> {
-    let file = load(path.as_ref(), true)?;
-    Ok(artwork_from(&file))
+/// * [`Error::Io`] if the file cannot be opened or read.
+/// * [`Error::UnsupportedFormat`] if the file is not a media file whose tags
+///   [`lofty`] understands.
+/// * [`Error::Other`] if the tag container cannot be parsed. Unlike
+///   [`read_tags`], the artwork reader parses strictly, so a corrupt picture
+///   is reported instead of being silently dropped. The price is that a
+///   file whose tag is malformed in another way is an error here as well,
+///   even when [`read_tags`] still reads its text fields.
+pub fn read_artwork(path: impl AsRef<Path>) -> Result<Option<Artwork>> {
+    let file = load(path.as_ref(), artwork_options())?;
+    Ok(front_cover(&file))
+}
+
+/// Reads every embedded picture of `path`.
+///
+/// The pictures are returned in the same precedence order as [`read_tags`]:
+/// the primary tag first, then the other tags of the file. The bytes are
+/// returned verbatim; see [`Artwork`].
+///
+/// This is the form to use when a caller wants more than the album art — the
+/// back cover or the media label, for example. A library view that shows the
+/// album art wants [`read_artwork`].
+///
+/// # Errors
+///
+/// See [`read_artwork`].
+pub fn read_artworks(path: impl AsRef<Path>) -> Result<Vec<Artwork>> {
+    let file = load(path.as_ref(), artwork_options())?;
+    Ok(artworks(&file))
 }
 
 /// Reads the tags of many paths, returning one result per path.
@@ -130,17 +169,36 @@ where
 }
 
 /// Opens `path`, guesses its format and parses its tags.
-fn load(path: &Path, read_cover_art: bool) -> Result<TaggedFile> {
-    let options = ParseOptions::new()
-        .read_properties(false)
-        .read_cover_art(read_cover_art);
-
+fn load(path: &Path, options: ParseOptions) -> Result<TaggedFile> {
     Probe::open(path)
         .map_err(map_lofty)?
         .guess_file_type()?
         .options(options)
         .read()
         .map_err(map_lofty)
+}
+
+/// The parse options of the tag reader.
+///
+/// No audio properties (the decoder fills those) and no pictures (the tag
+/// reader is about the text fields). Malformed tag bytes are tolerated:
+/// a broken frame is dropped, the rest of the file still reads.
+fn tag_options() -> ParseOptions {
+    ParseOptions::new()
+        .read_properties(false)
+        .read_cover_art(false)
+}
+
+/// The parse options of the artwork reader.
+///
+/// The pictures are read, the audio properties are not. The parsing is
+/// strict: a picture that cannot be parsed is an error, not a picture that
+/// is silently dropped — a cover art that is half there is worse than none.
+fn artwork_options() -> ParseOptions {
+    ParseOptions::new()
+        .read_properties(false)
+        .read_cover_art(true)
+        .parsing_mode(ParsingMode::Strict)
 }
 
 /// Maps a `lofty` error onto the shared [`Error`] type.
@@ -242,20 +300,67 @@ fn metadata_from(file: &TaggedFile) -> TrackMetadata {
     metadata
 }
 
+/// The pictures of `file`, in tag precedence order.
+///
+/// The pictures are borrowed, so a caller that wants one of them does not
+/// pay for the bytes of the others.
+fn pictures(file: &TaggedFile) -> impl Iterator<Item = &Picture> {
+    ordered_tags(file)
+        .into_iter()
+        .flat_map(|tag| tag.pictures().iter())
+}
+
 /// Collects the pictures of every tag, highest precedence first.
-fn artwork_from(file: &TaggedFile) -> Vec<Artwork> {
-    let mut pictures = Vec::new();
-    for tag in ordered_tags(file) {
-        for picture in tag.pictures() {
-            pictures.push(Artwork {
-                kind: picture.pic_type().as_u8(),
-                mime_type: picture.mime_type().map(|mime| mime.as_str().to_owned()),
-                description: picture.description().map(str::to_owned),
-                data: picture.data().to_vec(),
-            });
+fn artworks(file: &TaggedFile) -> Vec<Artwork> {
+    let file_type = file.file_type();
+    pictures(file)
+        .map(|picture| artwork(picture, picture_kind(picture, file_type)))
+        .collect()
+}
+
+/// The artwork value of `picture`.
+fn artwork(picture: &Picture, kind: PictureKind) -> Artwork {
+    Artwork {
+        kind,
+        mime_type: picture.mime_type().map(|mime| mime.as_str().to_owned()),
+        description: picture.description().map(str::to_owned),
+        data: picture.data().to_vec(),
+    }
+}
+
+/// The front cover of `file`.
+///
+/// The first picture that claims to be the front cover wins. A picture that
+/// names no role ([`PictureKind::Other`]) is the cover only when no picture
+/// claims the role: it is what a tagger writes when it does not know the
+/// picture types, but a real front cover is always the better answer.
+fn front_cover(file: &TaggedFile) -> Option<Artwork> {
+    let file_type = file.file_type();
+    let mut without_a_role = None;
+    for picture in pictures(file) {
+        let kind = picture_kind(picture, file_type);
+        if kind.is_front_cover() {
+            return Some(artwork(picture, kind));
+        }
+        if kind == PictureKind::Other && without_a_role.is_none() {
+            without_a_role = Some(artwork(picture, kind));
         }
     }
-    pictures
+    without_a_role
+}
+
+/// The role of `picture`.
+///
+/// MP4 has no picture type: the `covr` atom holds the album art, and
+/// `lofty` reports every MP4 picture as [`PictureKind::Other`]. It is
+/// reported as the front cover here, because that is what the atom means.
+fn picture_kind(picture: &Picture, file_type: FileType) -> PictureKind {
+    let kind = PictureKind::from_u8(picture.pic_type().as_u8());
+    if file_type == FileType::Mp4 && kind == PictureKind::Other {
+        PictureKind::FrontCover
+    } else {
+        kind
+    }
 }
 
 /// The first non-empty, trimmed string for `key`, in tag precedence order.
