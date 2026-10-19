@@ -28,7 +28,7 @@
 //! [`NullOutput`](rustamp_output::NullOutput); the windowed presenter in
 //! [`crate::window`] only adds the `winit`/`softbuffer` shell around it.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -104,8 +104,30 @@ pub struct App {
     pub(crate) skin: LoadedSkin,
     config: Config,
     /// The plug-in folder as the preferences pages last scanned it
-    /// ([`App::rescan_plugins`]); empty until the dialog first opens.
+    /// ([`App::rescan_plugins`]); empty until the folder was read.
     plugin_scan: rustamp_prefs::PluginScan,
+    /// Whether the plug-in folder was read for this session.
+    ///
+    /// The startup load needs the list before it can ask the host for the
+    /// plug-ins the user has switched on (see
+    /// [`App::load_enabled_plugins`]), so it reads the folder once — the
+    /// scan reads bytes and never loads anything. The preferences pages
+    /// refresh the scan on their own ([`App::rescan_plugins`]).
+    plugin_scanned: bool,
+    /// The host generation the plug-in state below belongs to.
+    ///
+    /// A new host has loaded nothing, so the state starts over with it
+    /// (see [`App::sync_plugin_host_state`]).
+    plugin_host_generation: u64,
+    /// The plug-in files the host was asked to load in that generation.
+    ///
+    /// The host loads one plug-in per request and the protocol has no unload
+    /// request, so a file is asked for once per host (see
+    /// [`App::request_plugin_load`]).
+    plugin_requests: HashSet<String>,
+    /// Whether the plug-ins the user has switched on were already asked for
+    /// in that generation (see [`App::load_enabled_plugins_for_new_host`]).
+    plugin_startup_loaded: bool,
 
     bus: EventBus,
     events: EventReceiver,
@@ -345,6 +367,10 @@ impl App {
             skin: options.skin,
             config: options.config,
             plugin_scan: rustamp_prefs::PluginScan::default(),
+            plugin_scanned: false,
+            plugin_host_generation: 0,
+            plugin_requests: HashSet::new(),
+            plugin_startup_loaded: false,
             config_path: None,
             bus,
             events,
@@ -746,6 +772,7 @@ impl App {
     /// bytes only; nothing is loaded or executed.
     pub fn rescan_plugins(&mut self) {
         self.plugin_scan = rustamp_prefs::scan(&self.plugin_dir(), &self.plugin_approvals_path());
+        self.plugin_scanned = true;
     }
 
     /// The last plug-in scan.
@@ -1094,10 +1121,17 @@ impl App {
                 self.note(report);
             }
         }
+        // A new host has loaded nothing: the per-host plug-in state starts
+        // over with it (see `App::sync_plugin_host_state`).
+        self.sync_plugin_host_state();
         // Mirror the player state to the plugin host (see `crate::host`):
         // best-effort by contract, so the outcome is ignored — a detached or
         // dead host neither fails nor blocks the pump.
         let _ = self.poll_host();
+        // Ask the host for the plug-ins the user has switched on, once per
+        // host: the request needs the channel, so it waits for the attach
+        // the supervisor made above (see `App::load_enabled_plugins`).
+        self.load_enabled_plugins_for_new_host();
         let _ = self.publish_host_state();
         Ok(())
     }
@@ -1433,6 +1467,9 @@ impl App {
         // is the only place the user learns about it.
         let failures = self.host.take_plugin_failures();
         for failure in failures {
+            // The host refused this file, so it is not loaded: a later
+            // request for it may try again.
+            self.plugin_requests.remove(&failure.path);
             self.note(format!(
                 "the plugin host could not load {}: {}",
                 failure.path, failure.message
@@ -1485,21 +1522,130 @@ impl App {
     /// The request is never dropped silently: a missing or dead host is
     /// reported to the user as a note, the same way an unimplemented command
     /// is.
+    ///
+    /// # One request per file, per host
+    ///
+    /// The host loads one plug-in per request and the protocol has no unload
+    /// request, so a second request for the same file would map it a second
+    /// time. The app therefore asks for a file once per host: the files it
+    /// asked for are remembered until the host refuses one (then it may be
+    /// asked for again) or a new host arrives (then the new host has loaded
+    /// nothing and is asked for everything again).
     pub fn request_plugin_load(&mut self, path: &Path, kind: PluginKind) {
+        let asked = path.to_string_lossy().into_owned();
+        if !self.plugin_requests.insert(asked.clone()) {
+            // The host was asked for this file already: asking again would
+            // load it twice, and the protocol cannot unload it.
+            self.note(format!(
+                "the plugin host was already asked to load {}: a plug-in is not loaded twice",
+                path.display()
+            ));
+            return;
+        }
         match self.host.load_plugin(path, kind) {
             CommandOutcome::Sent => self.note(format!(
                 "the plugin host was asked to load {}",
                 path.display()
             )),
-            CommandOutcome::Detached => self.note(format!(
-                "no plugin host is attached: {} was not loaded",
-                path.display()
-            )),
-            CommandOutcome::HostGone => self.note(format!(
-                "the plugin host is gone: {} was not loaded",
-                path.display()
-            )),
+            CommandOutcome::Detached => {
+                // Nothing was asked, so the file may be asked for later.
+                self.plugin_requests.remove(&asked);
+                self.note(format!(
+                    "no plugin host is attached: {} was not loaded",
+                    path.display()
+                ));
+            }
+            CommandOutcome::HostGone => {
+                self.plugin_requests.remove(&asked);
+                self.note(format!(
+                    "the plugin host is gone: {} was not loaded",
+                    path.display()
+                ));
+            }
         }
+    }
+
+    /// The plug-ins the user has switched on, in the scan's order.
+    ///
+    /// "Switched on" means what the plug-in pages show as "on": the
+    /// approval store approved the exact image **and** the file is not on
+    /// the disabled list ([`rustamp_prefs::PluginEntry::is_enabled`]). A
+    /// plug-in that is not approved is off whatever the list says, and the
+    /// host would refuse it anyway.
+    ///
+    /// The order is the scan's order, and the scan sorts the entries by file
+    /// name (case-insensitively), so the requests go out in a stable order.
+    fn enabled_plugins(&self) -> Vec<(PathBuf, PluginKind)> {
+        self.plugin_scan
+            .entries
+            .iter()
+            .filter(|entry| entry.is_enabled(&self.config.plugins))
+            .map(|entry| (entry.path.clone(), entry.kind))
+            .collect()
+    }
+
+    /// Asks the plugin host to load every plug-in the user has switched on.
+    ///
+    /// This is the startup load: a classic plug-in runs inside
+    /// `rustamp-plughost32.exe`, so the player can only get one by asking
+    /// the host over the control channel (see [`crate::host`]).
+    ///
+    /// * **The order** is the scan's order (see [`enabled_plugins`]).
+    /// * **A plug-in that is off is not asked for.** The scan decides, and it
+    ///   reads the approval store: a missing or broken store approves
+    ///   nothing, so nothing is loaded.
+    /// * **A failed load is a note, never an error.** A plug-in the host
+    ///   refuses is reported by the host's own answer (see
+    ///   [`poll_host`](App::poll_host)); a missing or dead host is reported
+    ///   here (see [`request_plugin_load`](App::request_plugin_load)). The
+    ///   player starts either way.
+    fn load_enabled_plugins(&mut self) {
+        if !self.plugin_scanned {
+            // The list is read once per session: the scan reads the folder
+            // and the approval store as bytes and loads nothing.
+            self.rescan_plugins();
+        }
+        for (path, kind) in self.enabled_plugins() {
+            self.request_plugin_load(&path, kind);
+        }
+    }
+
+    /// Asks the host for the plug-ins the user has switched on, once per
+    /// host.
+    ///
+    /// The request needs the channel, so the load waits for a host to be
+    /// attached: the supervisor spawns the host and attaches the transport
+    /// (see [`crate::supervise`]), and the load runs on the next pump step.
+    /// A host that never arrives loads nothing — there is no channel to ask
+    /// over — and the plug-in pages say so when the user switches a plug-in
+    /// on without a host (see [`request_plugin_load`](App::request_plugin_load)).
+    ///
+    /// Once per host, not once per pump: a host is asked for each plug-in
+    /// exactly once (see [`request_plugin_load`](App::request_plugin_load)).
+    /// A **new** host is asked again, because a fresh host process has
+    /// loaded nothing (RFC 0020 Q6).
+    fn load_enabled_plugins_for_new_host(&mut self) {
+        if self.plugin_startup_loaded || !self.host.is_attached() {
+            return;
+        }
+        self.plugin_startup_loaded = true;
+        self.load_enabled_plugins();
+    }
+
+    /// Forgets the per-host plug-in state when a new host is attached.
+    ///
+    /// The plug-in ids and the loaded set belong to one host process
+    /// (RFC 0020 Q6): a new host has loaded nothing, so the app forgets
+    /// what it asked the old one for and asks the new one for everything
+    /// again.
+    fn sync_plugin_host_state(&mut self) {
+        let generation = self.host.generation();
+        if generation == self.plugin_host_generation {
+            return;
+        }
+        self.plugin_host_generation = generation;
+        self.plugin_requests.clear();
+        self.plugin_startup_loaded = false;
     }
 
     // -----------------------------------------------------------------------
@@ -3607,18 +3753,80 @@ mod tests {
 
     /// A scan with one approved plug-in, as the plug-in pages would list it.
     fn scan_with_one_plugin(app: &mut App) {
+        scan_with_plugins(
+            app,
+            vec![approved_entry("gen_one.dll", PluginKind::General)],
+        );
+    }
+
+    /// One approved plug-in, as the scan would list it.
+    fn approved_entry(file: &str, kind: PluginKind) -> rustamp_prefs::PluginEntry {
+        rustamp_prefs::PluginEntry {
+            file: file.to_string(),
+            path: PathBuf::from("C:\\plugins").join(file),
+            kind,
+            size: 4096,
+            status: rustamp_prefs::PluginStatus::Approved,
+        }
+    }
+
+    /// A scan with the given plug-ins, as the plug-in pages would list them.
+    ///
+    /// The scan counts as taken, so the startup load reads this list instead
+    /// of reading the real folder.
+    fn scan_with_plugins(app: &mut App, entries: Vec<rustamp_prefs::PluginEntry>) {
         app.plugin_scan = rustamp_prefs::PluginScan {
             dir: PathBuf::from("C:\\plugins"),
-            entries: vec![rustamp_prefs::PluginEntry {
-                file: "gen_one.dll".to_string(),
-                path: PathBuf::from("C:\\plugins\\gen_one.dll"),
-                kind: PluginKind::General,
-                size: 4096,
-                status: rustamp_prefs::PluginStatus::Approved,
-            }],
+            entries,
             dir_problem: None,
             store_problem: None,
         };
+        app.plugin_scanned = true;
+    }
+
+    /// A synthetic i686 plug-in image: a PE32 DLL that exports `export`.
+    ///
+    /// The image is never mapped and never executed: the scan reads it as
+    /// bytes and the passive preflight reads its headers.
+    fn fake_plugin(export: &[u8], tweak: u8) -> Vec<u8> {
+        let mut bytes = vec![0; 0x600];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        for (offset, value) in [
+            (0x84, 0x014c_u16), // machine: i386
+            (0x86, 1),          // one section
+            (0x94, 224),        // size of the optional header
+            (0x96, 0x2102),     // characteristics
+            (0x98, 0x10b),      // optional header: PE32
+        ] {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        for (offset, value) in [
+            (0xa8, 0x1100_u32), // entry point
+            (0xd0, 0x2000),     // image base
+            (0xd4, 0x200),
+            (0xf4, 16),     // section alignment
+            (0xf8, 0x1000), // file alignment
+            (0xfc, 0x100),
+            (0x180, 0x400), // the export directory
+            (0x184, 0x1000),
+            (0x188, 0x400),
+            (0x18c, 0x200),
+            (0x19c, 0x6000_0020),
+            (0x214, 1),
+            (0x218, 1),
+            (0x21c, 0x1040),
+            (0x220, 0x1044),
+            (0x224, 0x1048),
+            (0x240, 0x1100),
+            (0x244, 0x1060),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[0x260..0x260 + export.len()].copy_from_slice(export);
+        bytes[0x300] = tweak;
+        bytes
     }
 
     /// The load requests the host received, in order.
@@ -3734,6 +3942,242 @@ mod tests {
         assert_eq!(plugins[0].plugin_id, 1);
         assert_eq!(plugins[0].name, "Rustamp Fixture");
         assert_eq!(plugins[0].kind, PluginKind::General);
+    }
+
+    // ----- the startup load (the enabled plug-ins, once per host) -----
+
+    #[test]
+    fn two_enabled_plugins_are_asked_for_in_order_after_the_host_attaches() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        scan_with_plugins(
+            &mut app,
+            vec![
+                approved_entry("gen_one.dll", PluginKind::General),
+                approved_entry("in_two.dll", PluginKind::Input),
+            ],
+        );
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+
+        app.pump().unwrap();
+
+        // Two requests, in the scan's order, each naming the file the scan
+        // listed and the kind that file declares. The pump's own frames (the
+        // greeting, the state snapshot) are not requests.
+        assert_eq!(
+            load_requests(&mut host_end),
+            vec![
+                ("C:\\plugins\\gen_one.dll".to_string(), PluginKind::General),
+                ("C:\\plugins\\in_two.dll".to_string(), PluginKind::Input),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plugin_that_is_switched_off_is_not_asked_for_at_startup() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        scan_with_plugins(
+            &mut app,
+            vec![
+                approved_entry("gen_one.dll", PluginKind::General),
+                approved_entry("in_two.dll", PluginKind::Input),
+            ],
+        );
+        // The user switched the second one off: it stays off.
+        app.config.plugins.disabled = vec!["in_two.dll".to_string()];
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+
+        app.pump().unwrap();
+
+        assert_eq!(
+            load_requests(&mut host_end),
+            vec![("C:\\plugins\\gen_one.dll".to_string(), PluginKind::General)]
+        );
+    }
+
+    #[test]
+    fn a_plugin_that_is_not_approved_is_not_asked_for_at_startup() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        let mut entry = approved_entry("gen_one.dll", PluginKind::General);
+        entry.status = rustamp_prefs::PluginStatus::NotApproved;
+        scan_with_plugins(&mut app, vec![entry]);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+
+        app.pump().unwrap();
+
+        // The approval store did not approve the image, so the host would
+        // refuse it: the app does not ask.
+        assert!(load_requests(&mut host_end).is_empty());
+    }
+
+    #[test]
+    fn a_detached_host_produces_notes_instead_of_load_requests() {
+        let (mut app, _dir) = app_with_file(None);
+        scan_with_plugins(
+            &mut app,
+            vec![approved_entry("gen_one.dll", PluginKind::General)],
+        );
+        assert!(!app.host_attached());
+
+        app.load_enabled_plugins();
+
+        // The request could not go anywhere, and the user is told so.
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("no plugin host is attached")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_host_is_asked_for_a_plugin_only_once() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        scan_with_plugins(
+            &mut app,
+            vec![approved_entry("gen_one.dll", PluginKind::General)],
+        );
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+
+        app.pump().unwrap();
+        assert_eq!(load_requests(&mut host_end).len(), 1);
+
+        // Further pumps do not ask again: the host has the plug-in, and the
+        // protocol cannot unload it.
+        app.pump().unwrap();
+        app.pump().unwrap();
+        assert!(load_requests(&mut host_end).is_empty());
+    }
+
+    #[test]
+    fn a_new_host_is_asked_again_because_it_has_loaded_nothing() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        scan_with_plugins(
+            &mut app,
+            vec![approved_entry("gen_one.dll", PluginKind::General)],
+        );
+
+        let (first_end, mut first_host) = MemoryTransport::pair();
+        app.attach_host(first_end);
+        app.pump().unwrap();
+        assert_eq!(load_requests(&mut first_host).len(), 1);
+
+        // The host is replaced. The inventory cannot tell the new peer what
+        // the old one had loaded (the answer carries no path), so the app
+        // asks again: a fresh host process has loaded nothing.
+        let (second_end, mut second_host) = MemoryTransport::pair();
+        app.attach_host(second_end);
+        app.pump().unwrap();
+
+        // The old channel is silent, the new one gets the request.
+        assert!(load_requests(&mut first_host).is_empty());
+        assert_eq!(load_requests(&mut second_host).len(), 1);
+    }
+
+    #[test]
+    fn a_refused_plugin_is_reported_and_may_be_asked_for_again() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        scan_with_plugins(
+            &mut app,
+            vec![approved_entry("gen_one.dll", PluginKind::General)],
+        );
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+        app.pump().unwrap();
+        assert_eq!(load_requests(&mut host_end).len(), 1);
+
+        // The host refuses the plug-in.
+        host_end
+            .send(&Message::PluginError {
+                path: "C:\\plugins\\gen_one.dll".to_string(),
+                message: "not a PE image".to_string(),
+            })
+            .unwrap();
+        app.pump().unwrap();
+
+        // The refusal is the user's news, and it does not stop the player.
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("could not load") && note.contains("gen_one.dll")),
+            "{notes:?}"
+        );
+
+        // The file is not loaded, so asking for it again is allowed.
+        app.request_plugin_load(Path::new("C:\\plugins\\gen_one.dll"), PluginKind::General);
+        assert_eq!(load_requests(&mut host_end).len(), 1);
+    }
+
+    #[test]
+    fn the_startup_load_reads_the_folder_and_the_approval_store() {
+        use rustamp_ipc::MemoryTransport;
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = fake_plugin(b"winampGetGeneralPurposePlugin\0", 1);
+        std::fs::write(dir.path().join("gen_one.dll"), &image).unwrap();
+
+        let (mut app, _config) = app_with_file(None);
+        app.config.plugins.plugin_dir = Some(dir.path().to_path_buf());
+        // The approval store lives beside the configuration file.
+        app.set_config_path(Some(dir.path().join("rustamp.toml")));
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+        app.pump().unwrap();
+
+        // No store approved the image, so the host is never asked for it: a
+        // missing store is an empty allowlist, not a silent "yes".
+        assert!(load_requests(&mut host_end).is_empty());
+    }
+
+    #[test]
+    fn an_approved_plugin_in_the_folder_is_asked_for_at_startup() {
+        use rustamp_ipc::MemoryTransport;
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = fake_plugin(b"winampGetGeneralPurposePlugin\0", 1);
+        std::fs::write(dir.path().join("gen_one.dll"), &image).unwrap();
+        let mut store = rustamp_plughost::ApprovalStore::new();
+        store.approve_bytes("gen_one.dll", &image).unwrap();
+        store
+            .save_to_file(&dir.path().join(rustamp_prefs::APPROVALS_FILE))
+            .unwrap();
+
+        let (mut app, _config) = app_with_file(None);
+        app.config.plugins.plugin_dir = Some(dir.path().to_path_buf());
+        app.set_config_path(Some(dir.path().join("rustamp.toml")));
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+        app.pump().unwrap();
+
+        assert_eq!(
+            load_requests(&mut host_end),
+            vec![(
+                dir.path()
+                    .join("gen_one.dll")
+                    .to_string_lossy()
+                    .into_owned(),
+                PluginKind::General
+            )]
+        );
     }
 
     // ----- the equalizer window (S07; headless, no window opened) -----
