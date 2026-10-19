@@ -143,6 +143,44 @@ the whole tree. Only the files the player's decoders claim are added; a
 playlist file inside the directory is not imported (loading a playlist is the
 LIST OPTS path). See `src/directory.rs` for the rules and their tests.
 
+## The equalizer's automatic per-track presets (AUTO)
+
+The equalizer window's AUTO button (`A`, command 40245) switches the engine's
+`autoload_eq` flag — the saved-state key S07 §12 item 13 settles — and while
+that flag is set, the app picks a preset for every track that starts. The
+rules live in `eq-autoload.toml`, beside the configuration file and next to
+the user's `presets.eqf` library; the file is written by hand and read once at
+start-up.
+
+```toml
+# The preset for a track that matches no rule. Without it, such a track keeps
+# the curve it has.
+default = "Flat"
+
+# The rules, in the order they are tried. The first match decides.
+[[rule]]
+tag = "genre"          # genre, artist or album
+value = "Rock"
+preset = "Rock"
+
+[[rule]]
+tag = "artist"
+value = "Miles Davis"
+preset = "Jazz"
+```
+
+`preset` names a built-in preset or one of the user's saved presets. A value
+matches ASCII-case-insensitively, with surrounding space ignored.
+
+**What the specification settles and what is Rustamp's own choice.** S07 §12
+item 13 settles the flag behind the AUTO button and nothing else: the
+specification names the flag, not the behaviour behind it. The trigger (the
+track start), the key (genre, artist or album), the order (the file's), the
+fallback (the file's `default`, otherwise the current curve) and the
+precedence (the auto-load runs at the track start only, so a manual change
+during the track is never overwritten; the next track start decides again) are
+Rustamp's design. See `src/eq_autoload.rs`.
+
 ## Classic-window docking
 
 `window.rs` applies `rustamp_ui::docking::DockedStack` positions to the main,
