@@ -6,9 +6,11 @@
 //!
 //! * [`NullOutput`] — deterministic virtual device for tests and `--null`
 //!   playback. The caller drives its clock with [`NullClock::pump`].
-//! * [`WasapiOutput`] — Windows shared-mode WASAPI (`windows` only), event
-//!   driven, with automatic format conversion so the endpoint grants the
-//!   requested format.
+//! * [`WasapiOutput`] — Windows WASAPI (`windows` only), event driven, in
+//!   shared mode (with automatic format conversion so the endpoint grants
+//!   the requested format) or in exclusive mode (the device is driven
+//!   directly, in its own format). The mode is chosen by the caller on the
+//!   device: [`WasapiMode::Shared`] is the default.
 //! * [`CpalOutput`] — the cross-platform fallback behind the same trait.
 //!
 //! All three fill the whole buffer, write silence on underrun and do not
@@ -56,6 +58,9 @@
 mod null;
 
 #[cfg(windows)]
+mod wasapi_exclusive;
+
+#[cfg(windows)]
 mod wasapi_out;
 
 mod cpal_out;
@@ -64,7 +69,7 @@ pub use cpal_out::CpalOutput;
 pub use null::{DEFAULT_CHUNK_FRAMES, NullClock, NullOutput};
 
 #[cfg(windows)]
-pub use wasapi_out::{WasapiOutput, is_shared_mode_available};
+pub use wasapi_out::{WasapiMode, WasapiOutput, is_shared_mode_available};
 
 use rustamp_core::audio::OutputDevice;
 
