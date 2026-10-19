@@ -438,14 +438,19 @@ fn regression_late_repeat_enablement_at_queue_end() {
     h.engine.set_repeat(false).unwrap();
 
     h.engine.play_index(0).unwrap();
-    assert!(h.wait_track(0));
-
-    // Wait until both tracks have buffered into the ring and EOS was published
-    assert!(h.wait_buffered());
-    assert!(h.engine.end_of_stream().is_some());
 
     let total = track_frames(SHORT_A) + track_frames(SHORT_B);
-    assert_eq!(h.engine.buffered_frames(), total);
+    // A fast worker can prefetch both tracks before the first poll, so the
+    // decoder's current_index may already be 1: wait_track(0) can miss it.
+    // This regression needs EOS with the entire first cycle still unconsumed,
+    // not the next cycle's audio (repeat is still off). Never pump this wait.
+    assert!(h.wait_idle(
+        |e| e.buffered_frames() == total && e.end_of_stream() == Some(total),
+        WAIT
+    ));
+    assert_eq!(h.engine.ring_counters(), (total, 0));
+    assert_eq!(h.engine.current_index(), Some(1));
+    assert_eq!(h.engine.audible_index(), Some(0));
 
     // Audio is still unconsumed in the ring (buffered_frames == total).
     // Now toggle repeat ON: this MUST revoke EOS and keep the run alive.
@@ -515,10 +520,17 @@ fn regression_shuffle_mid_run_replan_anchoring_to_audible_track() {
     h.engine.set_repeat(false).unwrap();
 
     h.engine.play_index(0).unwrap();
-    assert!(h.wait_track(0));
 
-    // Wait until queue is fully pre-buffered (decoder has read past track 0 and 1, reached track 2)
-    assert!(h.wait_buffered());
+    let total = track_frames(SHORT_A) + track_frames(SHORT_B) + track_frames(SHORT_C);
+    // Do not wait for the transient decoder index 0: a fast worker may have
+    // already prefetched track 2 before the first poll. The discriminator is
+    // decoder index 2 versus audible index 0, with all audio still in the ring.
+    // Unlike late repeat enablement, this replan does not require EOS.
+    assert!(h.wait_idle(
+        |e| e.buffered_frames() == total && e.current_index() == Some(2),
+        WAIT
+    ));
+    assert_eq!(h.engine.ring_counters(), (total, 0));
 
     // Device has consumed 0 frames, so Track 0 is currently audible
     assert_eq!(h.engine.audible_index(), Some(0));
