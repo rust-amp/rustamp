@@ -12,6 +12,13 @@
 //! Every rule cites its S06 section. Pixel counts below are the whole-window
 //! differing-pixel counts from the sandbox runs, quoted so a reviewer can
 //! match the rule to the evidence; they are not recomputed here.
+//!
+//! Dragging is an own choice: S06 §8 Q6 explicitly leaves reorder versus
+//! selection-block semantics unresolved. A selected row drags the selection in
+//! playlist order; an unselected row selects itself. Four pixels of motion
+//! activate a drag. Row halves choose before/after, blank list space chooses
+//! after the visible rows. Escape, leaving the list, or an order change cancels.
+//! Playback and selection stay attached to entry ids; no auto-scroll is implied.
 
 use std::collections::BTreeSet;
 
@@ -43,6 +50,16 @@ pub const BUTTON_BAND_BOTTOM: i32 = 110;
 /// The list click that selects the first visible row (S06 §2, settled: a
 /// single posted click at (60,28) changes 2918 px, bbox (12,23)-(254,93)).
 pub const LIST_SELECT_POINT: (i32, i32) = (60, 28);
+
+// Own-choice drag slop in playlist client pixels (S06 §8 Q6 is open).
+const DRAG_THRESHOLD: u32 = 4;
+
+#[derive(Debug, Clone)]
+struct PlaylistDrag {
+    press: (i32, i32),
+    ids: Vec<EntryId>,
+    insertion: Option<usize>,
+}
 
 /// The five bottom-bar buttons (S06 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -303,6 +320,7 @@ pub struct PlaylistWindow {
     selected: BTreeSet<EntryId>,
     shift_anchor: Option<EntryId>,
     current: Option<EntryId>,
+    drag: Option<PlaylistDrag>,
 }
 
 impl PlaylistWindow {
@@ -316,6 +334,9 @@ impl PlaylistWindow {
     /// Entries that no longer exist drop out of the selection; the scroll
     /// offset is clamped so the visible slice stays inside the list.
     pub fn set_entries(&mut self, entries: Vec<EntryId>) {
+        if self.entries != entries {
+            self.cancel_drag();
+        }
         self.entries = entries;
         let live: BTreeSet<EntryId> = self.entries.iter().copied().collect();
         self.selected.retain(|id| live.contains(id));
@@ -379,16 +400,92 @@ impl PlaylistWindow {
             .collect()
     }
 
-    /// A single click on the list selects the first visible row (S06 §2,
-    /// settled: 2918 px, bbox (12,23)-(254,93), reproduced three times).
-    ///
-    /// Row order is unchanged (S06 §2, visual reading); on an empty list this
-    /// is a no-op.
-    pub fn click_list_first_visible(&mut self) -> Option<Command> {
-        let first = self.visible_ids().into_iter().next()?;
-        self.selected.clear();
-        self.selected.insert(first);
-        Some(Command::Select(SelectOp::Set(vec![first])))
+    /// Presses a row and arms a drag, preserving an existing multi-selection
+    /// when the pressed row belongs to it. Returns a selection command only
+    /// when pressing an unselected row. Own choice, not settled by S06 §8 Q6.
+    pub fn mouse_down(&mut self, x: i32, y: i32) -> Option<Command> {
+        self.cancel_drag();
+        if self.windowshade {
+            return None;
+        }
+        let row = crate::playlist_window::hit_test_list_row(x, y)?;
+        let id = *self.entries.get(self.first_visible + row)?;
+        let command = if self.selected.contains(&id) {
+            None
+        } else {
+            self.selected.clear();
+            self.selected.insert(id);
+            self.shift_anchor = Some(id);
+            Some(Command::Select(SelectOp::Set(vec![id])))
+        };
+        self.drag = Some(PlaylistDrag {
+            press: (x, y),
+            ids: self.selected_ids(),
+            insertion: None,
+        });
+        command
+    }
+
+    /// Updates an armed drag. Four pixels of motion on either axis activate
+    /// it; leaving the list cancels instead of clamping or auto-scrolling.
+    /// Upper/lower row halves mean insert-before/after (own choices, Q6).
+    pub fn mouse_move(&mut self, x: i32, y: i32) {
+        use crate::playlist_window::{LIST_TOP, ROW_PITCH, in_list_area};
+
+        let Some(drag) = self.drag.as_mut() else {
+            return;
+        };
+        if self.windowshade || !in_list_area(x, y) {
+            self.cancel_drag();
+            return;
+        }
+        if drag.insertion.is_none()
+            && x.abs_diff(drag.press.0).max(y.abs_diff(drag.press.1)) < DRAG_THRESHOLD
+        {
+            return;
+        }
+        let relative = y - LIST_TOP;
+        let row = relative / ROW_PITCH;
+        let after = relative % ROW_PITCH >= (ROW_PITCH + 1) / 2;
+        let gap = (row as usize + usize::from(after)).min(VISIBLE_ROWS);
+        drag.insertion = Some((self.first_visible + gap).min(self.entries.len()));
+    }
+
+    /// Releases a drag as the existing `MoveEntries` command. Its target is
+    /// measured *after* removing the moved ids. A click or unchanged order
+    /// emits nothing. The app alone applies the move; this model never predicts
+    /// a new playing row or changes the order before the command is accepted.
+    pub fn mouse_up(&mut self, x: i32, y: i32) -> Option<Command> {
+        self.mouse_move(x, y);
+        let drag = self.drag.take()?;
+        let gap = drag.insertion?;
+        let moved: BTreeSet<_> = drag.ids.iter().copied().collect();
+        let positions: Vec<_> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| moved.contains(id).then_some(index))
+            .collect();
+        let to = gap - positions.iter().filter(|&&index| index < gap).count();
+        if positions.iter().copied().eq(to..to + positions.len()) {
+            return None;
+        }
+        Some(Command::MoveEntries {
+            ids: drag.ids,
+            to: u32::try_from(to).ok()?,
+        })
+    }
+
+    /// The active insertion gap in playlist coordinates, before removing the
+    /// dragged rows. `None` until the threshold is crossed or after cancellation.
+    pub fn drag_insertion(&self) -> Option<usize> {
+        self.drag.as_ref().and_then(|drag| drag.insertion)
+    }
+
+    /// Cancels a pending/active drag without moving entries or clearing selection.
+    /// Returns whether a gesture was cancelled (including a press below slop).
+    pub fn cancel_drag(&mut self) -> bool {
+        self.drag.take().is_some()
     }
 
     /// A double-click on visible row `row` plays that entry (S03 §5, S06 §8 Q5).
@@ -436,6 +533,12 @@ impl PlaylistWindow {
                 }
                 self.selected = inverted;
             }
+        }
+        if self.drag.as_ref().is_some_and(|drag| {
+            drag.ids.len() != self.selected.len()
+                || drag.ids.iter().any(|id| !self.selected.contains(id))
+        }) {
+            self.cancel_drag();
         }
     }
 
@@ -657,6 +760,147 @@ mod tests {
     }
 
     #[test]
+    fn row_drag_crosses_slop_then_chooses_row_halves() {
+        let mut window = window_with(4);
+        assert_eq!(
+            window.mouse_down(60, 28),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(0)])))
+        );
+        window.mouse_move(63, 28);
+        assert_eq!(window.drag_insertion(), None);
+        window.mouse_move(64, 28);
+        assert_eq!(window.drag_insertion(), Some(0));
+        window.mouse_move(60, 55); // Upper half of row 2.
+        assert_eq!(window.drag_insertion(), Some(2));
+        window.mouse_move(60, 56); // Lower half of row 2.
+        assert_eq!(window.drag_insertion(), Some(3));
+        assert_eq!(
+            window.mouse_up(60, 56),
+            Some(Command::MoveEntries {
+                ids: vec![EntryId(0)],
+                to: 2,
+            })
+        );
+        assert_eq!(window.drag_insertion(), None);
+        assert_eq!(window.visible_ids(), ids(4), "the app owns order");
+    }
+
+    #[test]
+    fn dragging_a_selected_row_keeps_all_selected_ids_in_playlist_order() {
+        let mut window = window_with(8);
+        let selection = vec![EntryId(1), EntryId(6)];
+        window.apply_select(&SelectOp::Set(vec![EntryId(6), EntryId(1)]));
+        window.set_current(Some(EntryId(6)));
+        assert_eq!(window.mouse_down(60, 42), None);
+        window.set_entries(ids(8)); // A same-order app sync must not cancel.
+        window.mouse_move(60, 23);
+        assert_eq!(
+            window.mouse_up(60, 23),
+            Some(Command::MoveEntries {
+                ids: selection.clone(),
+                to: 0,
+            })
+        );
+        window.set_entries(vec![
+            EntryId(1),
+            EntryId(6),
+            EntryId(0),
+            EntryId(2),
+            EntryId(3),
+            EntryId(4),
+            EntryId(5),
+            EntryId(7),
+        ]);
+        assert_eq!(
+            window.visible_ids(),
+            vec![EntryId(1), EntryId(6), EntryId(0), EntryId(2)]
+        );
+        assert_eq!(window.selected_ids(), selection);
+        assert_eq!(window.current(), Some(EntryId(6)));
+    }
+
+    #[test]
+    fn row_drag_uses_scrolled_gaps_and_blank_space_after_the_last_entry() {
+        let mut window = window_with(8);
+        window.scroll_to(4);
+        window.mouse_down(60, 28);
+        window.mouse_move(60, 74);
+        assert_eq!(window.drag_insertion(), Some(8));
+        assert_eq!(
+            window.mouse_up(60, 74),
+            Some(Command::MoveEntries {
+                ids: vec![EntryId(4)],
+                to: 7,
+            })
+        );
+
+        let mut window = window_with(2);
+        assert_eq!(
+            window.mouse_down(60, 70),
+            None,
+            "blank space cannot start a drag"
+        );
+        window.mouse_down(60, 28);
+        window.mouse_move(60, 85);
+        assert_eq!(window.drag_insertion(), Some(2));
+        assert_eq!(
+            window.mouse_up(60, 85),
+            Some(Command::MoveEntries {
+                ids: vec![EntryId(0)],
+                to: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn clicks_and_drops_around_an_unchanged_block_emit_no_move() {
+        let mut window = window_with(4);
+        window.mouse_down(60, 28);
+        assert_eq!(window.mouse_up(63, 28), None);
+        for y in [36, 48, 49, 61] {
+            window.apply_select(&SelectOp::Set(vec![EntryId(1), EntryId(2)]));
+            window.mouse_down(60, 42);
+            window.mouse_move(64, y);
+            assert!(window.drag_insertion().is_some());
+            assert_eq!(window.mouse_up(64, y), None, "y={y}");
+            assert_eq!(window.visible_ids(), ids(4));
+        }
+    }
+
+    #[test]
+    fn cancelling_leaving_or_changing_entries_prevents_a_later_drop() {
+        let mut window = window_with(4);
+        for leave in [
+            None,
+            Some((11, 50)),
+            Some((254, 50)),
+            Some((60, 22)),
+            Some((60, 93)),
+        ] {
+            window.mouse_down(60, 28);
+            window.mouse_move(60, 74);
+            assert_eq!(window.drag_insertion(), Some(4));
+            if let Some((x, y)) = leave {
+                window.mouse_move(x, y);
+            } else {
+                assert!(window.cancel_drag());
+            }
+            assert_eq!(window.drag_insertion(), None);
+            assert_eq!(window.mouse_up(60, 74), None);
+            assert_eq!(window.visible_ids(), ids(4));
+            assert_eq!(window.selected_ids(), vec![EntryId(0)]);
+        }
+        window.mouse_down(60, 28);
+        window.mouse_move(60, 74);
+        window.set_entries(vec![EntryId(1), EntryId(0), EntryId(2), EntryId(3)]);
+        assert_eq!(window.mouse_up(60, 74), None, "concurrent reorder cancels");
+        window.mouse_down(60, 28);
+        window.mouse_move(60, 74);
+        window.apply_select(&SelectOp::All);
+        assert_eq!(window.mouse_up(60, 74), None, "changed selection cancels");
+    }
+
+    #[test]
     fn current_entry_is_app_owned_and_independent_of_selection_and_scroll() {
         let mut window = window_with(8);
         window.apply_select(&SelectOp::Set(vec![EntryId(5)]));
@@ -691,7 +935,7 @@ mod tests {
         // S06 §2: single posted click at (60,28) selects the first visible row.
         let mut window = window_with(60);
         window.scroll_to(56);
-        let command = window.click_list_first_visible();
+        let command = window.mouse_down(LIST_SELECT_POINT.0, LIST_SELECT_POINT.1);
         assert_eq!(
             command,
             Some(Command::Select(SelectOp::Set(vec![EntryId(56)])))
@@ -708,7 +952,10 @@ mod tests {
     #[test]
     fn clicking_an_empty_list_selects_nothing() {
         let mut window = PlaylistWindow::new();
-        assert_eq!(window.click_list_first_visible(), None);
+        assert_eq!(
+            window.mouse_down(LIST_SELECT_POINT.0, LIST_SELECT_POINT.1),
+            None
+        );
         assert!(window.selected_ids().is_empty());
     }
 
@@ -738,7 +985,7 @@ mod tests {
         // S06 §5: REM removes the selected entry with no menu choice required.
         let mut window = window_with(60);
         window.scroll_to(56);
-        window.click_list_first_visible();
+        window.mouse_down(LIST_SELECT_POINT.0, LIST_SELECT_POINT.1);
         let command = window.press_rem();
         assert_eq!(command, Some(Command::Remove(vec![EntryId(56)])));
         assert_eq!(window.len(), 59);

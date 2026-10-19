@@ -1798,10 +1798,9 @@ impl App {
             C::Select(op) => self.playlist.apply_select(op),
             C::Sort(key) => self.sort_entries(*key),
             C::Randomize => self.randomize_entries(),
-            C::MoveEntries { .. } | C::Reverse => {
-                self.note(
-                    "playlist move and reverse are not wired to the app yet (S14/S15)".to_string(),
-                );
+            C::MoveEntries { ids, to } => self.move_entries(ids, *to as usize),
+            C::Reverse => {
+                self.note("playlist reverse is not wired to the app yet (S14/S15)".to_string());
             }
             C::OpenAbout
             | C::OpenFileInfo
@@ -2325,6 +2324,21 @@ impl App {
         let mut order: Vec<usize> = (0..self.entry_ids.len()).collect();
         rustamp_playlist::shuffle(&mut order, &mut rng);
         self.reorder_entries(order);
+    }
+
+    /// Applies the existing block-move contract: ids keep playlist-relative
+    /// order, unknown/duplicate ids are ignored, and `to` is clamped in the
+    /// remaining list. Like sorting, playback and selection follow identity.
+    fn move_entries(&mut self, ids: &[EntryId], to: usize) {
+        let moved: std::collections::BTreeSet<_> = ids.iter().copied().collect();
+        let (block, mut rest): (Vec<_>, Vec<_>) =
+            (0..self.entry_ids.len()).partition(|&row| moved.contains(&self.entry_ids[row]));
+        let to = to.min(rest.len());
+        rest.splice(to..to, block);
+        if rest.iter().copied().eq(0..self.entry_ids.len()) {
+            return;
+        }
+        self.reorder_entries(rest);
     }
 
     /// Reorders the id table and the engine queue to `order`, a permutation of
@@ -4868,6 +4882,73 @@ mod tests {
         assert_eq!(app.engine().current_index(), Some(2));
         assert_eq!(app.entry_id_for(Some(2)), Some(EntryId(0)));
         assert_eq!(app.playlist().selected_ids(), vec![EntryId(1)]);
+    }
+
+    #[test]
+    fn dragging_the_playing_entry_moves_its_row_without_restarting_playback() {
+        use rustamp_core::command::SelectOp;
+
+        let (mut app, dir) = app_with_file(None);
+        let items = (0..4)
+            .map(|i| MediaLocation::File(track(&dir, &format!("drag{i}.tst"))))
+            .collect();
+        app.submit(Command::AddItems {
+            items,
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        app.submit(Command::PlayEntry(EntryId(1))).unwrap();
+        // This is a fresh run, so there is no stale ring to drain. Fill it
+        // before driving the virtual device: pumping 1024 frames per 1 ms
+        // while waiting can consume all four one-second tracks before the
+        // decoder ever builds the required backlog, or advance to another
+        // track before the drag starts. The clock stays frozen until ready.
+        assert!(pump_until(
+            &mut app,
+            |app| app.engine().buffered_frames() > 4096 && app.engine().source_spec().is_some(),
+            2000
+        ));
+        app.advance_null_clock(1024);
+        app.pump().unwrap();
+        assert_eq!(
+            app.engine().current_index(),
+            Some(1),
+            "the dragged entry must already be playing"
+        );
+        app.submit(Command::Select(SelectOp::Set(vec![EntryId(1)])))
+            .unwrap();
+        let position = app.engine().position_ms();
+        assert!(
+            position > 0,
+            "prove a running track, not just a Play command"
+        );
+        app.playlist_mouse_down(60, 42).unwrap();
+        app.playlist_mouse_move(60, 74);
+        assert_eq!(
+            app.playlist_mouse_up(60, 74).unwrap(),
+            vec![Command::MoveEntries {
+                ids: vec![EntryId(1)],
+                to: 3,
+            }]
+        );
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+        assert_eq!(app.engine().position_ms(), position);
+        app.pump().unwrap();
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+        assert_eq!(app.engine().position_ms(), position);
+        assert_eq!(app.engine().current_index(), Some(3));
+        assert_eq!(
+            app.entry_ids,
+            vec![EntryId(0), EntryId(2), EntryId(3), EntryId(1)]
+        );
+        assert_eq!(
+            app.engine().queue()[3].display(),
+            dir.path().join("drag1.tst").display().to_string()
+        );
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(1)]);
+        app.render_playlist();
+        assert_eq!(app.playlist().current(), Some(EntryId(1)));
     }
 
     #[test]

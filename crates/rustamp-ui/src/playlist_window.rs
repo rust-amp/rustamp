@@ -44,8 +44,9 @@
 //!   the two click points are settled.
 //! * The handle-y interpolation between the three settled points is an own
 //!   linear choice.
-//! * MISC popup contents, sort/randomise, double-click, drag, keyboard and
-//!   message exposure stay open (S06 §8) and are not rendered or wired here.
+//! * The drag insertion line is an own-choice one-pixel rule in the skin's
+//!   `Normal` colour. S06 §8 Q6 establishes neither its shape nor its colour.
+//! * MISC popup contents and message exposure stay open (S06 §8).
 
 use rustamp_gfx::{BitmapFont, GlyphMap, Image, Rect};
 use rustamp_skin::{Sheet, Skin, webamp};
@@ -162,9 +163,8 @@ pub fn in_list_area(x: i32, y: i32) -> bool {
 /// Which visible row (if any) a click at `(x, y)` lands on.
 ///
 /// Rows are the 13 px bands from [`row_rect`]; the band below the fourth row
-/// is background and hits nothing. Callers that implement the S06 §2 click
-/// map any hit to the model's first-visible-row selection (a single click
-/// selects the first visible row, whatever row was clicked).
+/// is background and hits nothing. S06 §2 settles the first-row click only;
+/// selecting the actual row elsewhere is an own choice.
 pub fn hit_test_list_row(x: i32, y: i32) -> Option<usize> {
     if !(LIST_LEFT..LIST_RIGHT).contains(&x) || y < LIST_TOP {
         return None;
@@ -402,6 +402,7 @@ pub fn render_playlist_window(
     draw_side_rails(&mut canvas, pledit.as_ref(), skin);
     draw_bottom_bar(&mut canvas, pledit.as_ref(), skin);
     draw_rows(&mut canvas, skin, window, labels);
+    draw_drag_insertion(&mut canvas, skin, window);
     draw_scrollbar(&mut canvas, pledit.as_ref(), window);
     draw_title_buttons(&mut canvas, pledit.as_ref(), skin, window);
     canvas
@@ -674,9 +675,69 @@ fn draw_scrollbar(canvas: &mut Image, pledit: Option<&Image>, window: &PlaylistW
     );
 }
 
+fn draw_drag_insertion(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow) {
+    let Some(gap) = window.drag_insertion() else {
+        return;
+    };
+    let Some(row) = gap.checked_sub(window.first_visible()) else {
+        return;
+    };
+    if row > VISIBLE_ROWS {
+        return;
+    }
+    // Own-choice geometry, not reference pixels: integer, opaque, skin-coloured
+    // and clipped to the list. No extra asset or antialiased overlay is used.
+    let y = (LIST_TOP + row as i32 * ROW_PITCH).min(LIST_BOTTOM - 1);
+    let colour = skin.pledit().normal;
+    canvas.fill_rect(
+        Rect::new(LIST_LEFT, y, (LIST_RIGHT - LIST_LEFT) as u32, 1),
+        [colour[0], colour[1], colour[2], 255],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drag_indicator_is_one_opaque_skin_coloured_line_and_disappears_on_cancel() {
+        use rustamp_core::playlist::EntryId;
+        use rustamp_skin::{BuiltinDefaultSkin, BuiltinLookalikeSkin};
+
+        for mut source in [BuiltinDefaultSkin::source(), BuiltinLookalikeSkin::source()] {
+            source.add(
+                "pledit.txt",
+                b"[Text]\nNormal=#13579B\nNormalBG=#192A3B\nSelectedBG=#4C5D6E\n".to_vec(),
+            );
+            let skin = Skin::from_source(&mut source, &BuiltinDefaultSkin).unwrap();
+            let mut window = PlaylistWindow::new();
+            window.set_entries((0..4).map(EntryId).collect());
+            window.mouse_down(60, 28);
+            let before = render_playlist_window(&skin, &window, &[], true);
+            for (pointer_y, line_y) in [
+                (23, LIST_TOP),
+                (50, LIST_TOP + 2 * ROW_PITCH),
+                (85, LIST_TOP + 4 * ROW_PITCH),
+            ] {
+                window.mouse_move(64, pointer_y);
+                let frame = render_playlist_window(&skin, &window, &[], true);
+                for y in 0..frame.height() as i32 {
+                    for x in 0..frame.width() as i32 {
+                        if y == line_y && (LIST_LEFT..LIST_RIGHT).contains(&x) {
+                            assert_eq!(frame.pixel(x, y), Some([0x13, 0x57, 0x9b, 255]));
+                        } else {
+                            assert_eq!(frame.pixel(x, y), before.pixel(x, y), "{x},{y}");
+                        }
+                    }
+                }
+            }
+            window.cancel_drag();
+            assert_eq!(
+                render_playlist_window(&skin, &window, &[], true).as_rgba(),
+                before.as_rgba()
+            );
+        }
+    }
 
     #[test]
     fn playlist_mask_removes_nonblack_background_and_quantizes_ink_alpha() {

@@ -212,7 +212,7 @@ fn selection_highlight_covers_the_selected_row_band() {
     // S06 §2 + S01 §4: the selected row's background is `SelectedBG`.
     let skin = synthetic_playlist_skin();
     let mut window = window_with(6);
-    window.click_list_first_visible();
+    window.mouse_down(60, 28);
     let labels = vec!["a".to_string(); 4];
     let frame = render_playlist_window(&skin, &window, &labels, true);
     // Row 0 (y 23-36) selected; x = 200 is past the one-glyph label.

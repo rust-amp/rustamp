@@ -11,8 +11,9 @@
 //! Wiring (no behaviour is reimplemented; every gesture below delegates to the
 //! model and forwards the command it produces):
 //!
-//! * list click → [`PlaylistWindow::click_list_first_visible`] (S06 §2: a
-//!   single click selects the first visible row);
+//! * list press/move/release → [`PlaylistWindow::mouse_down`],
+//!   [`PlaylistWindow::mouse_move`], [`PlaylistWindow::mouse_up`]. S06 §2
+//!   settles the first-row click; drag rules are own choices (S06 §8 Q6);
 //! * SEL → [`PlaylistWindow::press_sel`] (S06 §2: selects all visible rows),
 //!   REM → [`PlaylistWindow::press_rem`] (S06 §5: removes the selection,
 //!   no-op unstaged), ADD → [`PlaylistWindow::press_add`], LIST OPTS →
@@ -92,17 +93,15 @@ impl App {
 
     /// A left-button press at playlist-window-relative `(x, y)`.
     ///
-    /// Actions fire on the press (the posted-click equivalent of the S06
-    /// runs); [`App::playlist_mouse_up`] is the no-op release.
+    /// Buttons fire on press; rows arm a headless drag (S06 §8 Q6 is open).
     pub fn playlist_mouse_down(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
         self.sync_playlist_entries();
+        self.playlist.cancel_drag();
         if let Some(button) = hit_test_button(x, y) {
             return self.playlist_press(button);
         }
-        // S06 §2: a single click selects the first visible row, whatever row
-        // was hit, so any point in the band maps to the same model call.
         if in_list_area(x, y) {
-            return match self.playlist.click_list_first_visible() {
+            return match self.playlist.mouse_down(x, y) {
                 Some(command) => {
                     let commands = vec![command.clone()];
                     self.submit(command)?;
@@ -123,10 +122,25 @@ impl App {
 
     /// A left-button release at playlist-window-relative `(x, y)`.
     ///
-    /// Always empty: playlist actions fire on the press (see
-    /// [`App::playlist_mouse_down`]).
-    pub fn playlist_mouse_up(&mut self, _x: i32, _y: i32) -> Result<Vec<Command>> {
+    /// A completed drag uses `MoveEntries`, sharing the sort/reorder application
+    /// path. Plain releases and cancelled/unchanged drags emit nothing.
+    pub fn playlist_mouse_up(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+        self.sync_playlist_entries();
+        if let Some(command) = self.playlist.mouse_up(x, y) {
+            self.submit(command.clone())?;
+            return Ok(vec![command]);
+        }
         Ok(Vec::new())
+    }
+
+    /// Feeds a playlist-relative pointer position to the headless drag model.
+    pub fn playlist_mouse_move(&mut self, x: i32, y: i32) {
+        self.playlist.mouse_move(x, y);
+    }
+
+    /// Cancels a row drag on pointer leave or focus loss, without moving rows.
+    pub fn playlist_mouse_leave(&mut self) {
+        self.playlist.cancel_drag();
     }
 
     /// A double-click at playlist-window-relative `(x, y)` (S03 §5, S06 §8 Q5).
@@ -135,6 +149,7 @@ impl App {
     /// entry ([`Command::PlayEntry`]).
     pub fn playlist_double_click(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
         self.sync_playlist_entries();
+        self.playlist.cancel_drag();
         if in_list_area(x, y)
             && let Some(row) = hit_test_list_row(x, y)
             && let Some(command) = self.playlist.double_click_row(row)
@@ -176,6 +191,13 @@ impl App {
         use rustamp_ui::playlist::{PlaylistKeyAction, playlist_key_action};
 
         self.sync_playlist_entries();
+
+        if key == Key::Escape && self.playlist.cancel_drag() {
+            return Ok(Some(ShortcutOutcome::Handled));
+        }
+        // A keyboard action must not change selection/viewport underneath a
+        // held row gesture. Like the drag itself this is an own-choice rule.
+        self.playlist.cancel_drag();
 
         // Handle Delete first (plain Delete returns None from playlist_key_action)
         if key == Key::Delete && modifiers == Modifiers::NONE {
@@ -472,6 +494,7 @@ impl App {
     /// Hides the playlist editor when it is open (its title-bar Close and its
     /// OS close box). Returns the command it sent, if any.
     pub fn close_playlist_window(&mut self) -> Result<Vec<Command>> {
+        self.playlist.cancel_drag();
         if !self.playlist_open() {
             return Ok(Vec::new());
         }
@@ -516,6 +539,129 @@ mod tests {
             play: false,
         })
         .expect("AddItems applies");
+    }
+
+    #[test]
+    fn dragging_rows_reorders_queue_and_ids_at_both_ends_and_row_halves() {
+        for (count, press_y, drop_y, expected) in [
+            (4, 42, 74, vec![0, 2, 3, 1]), // One row to the bottom.
+            (4, 68, 23, vec![3, 0, 1, 2]), // Last row to the top.
+            (3, 28, 85, vec![1, 2, 0]),    // Blank space after a short list.
+            (4, 28, 50, vec![1, 0, 2, 3]), // Before row 2.
+            (4, 28, 60, vec![1, 2, 0, 3]), // After row 2.
+        ] {
+            let mut app = test_app();
+            add_entries(&mut app, count);
+            app.playlist_mouse_down(60, press_y).unwrap();
+            app.playlist_mouse_move(60, drop_y);
+            let commands = app.playlist_mouse_up(60, drop_y).unwrap();
+            assert!(matches!(commands.as_slice(), [Command::MoveEntries { .. }]));
+            assert_eq!(
+                app.entry_ids,
+                expected.iter().copied().map(EntryId).collect::<Vec<_>>()
+            );
+            let expected_labels: Vec<_> =
+                expected.iter().map(|id| format!("track{id}.mp3")).collect();
+            let labels: Vec<_> = app
+                .engine()
+                .queue()
+                .iter()
+                .map(|source| source.display())
+                .collect();
+            assert_eq!(labels, expected_labels, "queue and ids must move together");
+            assert_eq!(app.playlist().visible_ids(), app.entry_ids);
+            assert!(app.drain_notes().is_empty());
+        }
+    }
+
+    #[test]
+    fn dragging_a_multi_selection_preserves_order_selection_and_current_identity() {
+        let mut app = test_app();
+        add_entries(&mut app, 4);
+        app.engine_mut().set_current_index(Some(2));
+        app.submit(Command::Select(SelectOp::Set(vec![EntryId(2), EntryId(0)])))
+            .unwrap();
+        assert!(app.playlist_mouse_down(60, 54).unwrap().is_empty());
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(0), EntryId(2)]);
+        app.playlist_mouse_move(60, 74);
+        assert_eq!(
+            app.playlist_mouse_up(60, 74).unwrap(),
+            vec![Command::MoveEntries {
+                ids: vec![EntryId(0), EntryId(2)],
+                to: 2,
+            }]
+        );
+        assert_eq!(
+            app.entry_ids,
+            vec![EntryId(1), EntryId(3), EntryId(0), EntryId(2)]
+        );
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(0), EntryId(2)]);
+        assert_eq!(app.engine().current_index(), Some(3));
+        assert_current_frame(&mut app, Some(EntryId(2)));
+    }
+
+    #[test]
+    fn same_position_click_escape_and_leave_never_reorder() {
+        let mut app = test_app();
+        add_entries(&mut app, 4);
+        app.submit(Command::Select(SelectOp::Set(vec![EntryId(1), EntryId(2)])))
+            .unwrap();
+        let original_queue: Vec<_> = app
+            .engine()
+            .queue()
+            .iter()
+            .map(|source| source.display())
+            .collect();
+        for cancellation in 0..4 {
+            app.playlist_mouse_down(60, 42).unwrap();
+            let drop_y = if cancellation < 2 { 42 } else { 74 };
+            if cancellation > 0 {
+                app.playlist_mouse_move(64, drop_y);
+            }
+            match cancellation {
+                2 => assert_eq!(
+                    app.playlist_key_down(Key::Escape, Modifiers::NONE).unwrap(),
+                    Some(ShortcutOutcome::Handled)
+                ),
+                3 => app.playlist_mouse_leave(),
+                _ => {}
+            }
+            assert!(app.playlist_mouse_up(60, drop_y).unwrap().is_empty());
+            assert_eq!(
+                app.entry_ids,
+                vec![EntryId(0), EntryId(1), EntryId(2), EntryId(3)]
+            );
+            assert_eq!(app.playlist().selected_ids(), vec![EntryId(1), EntryId(2)]);
+            assert_eq!(app.playlist().drag_insertion(), None);
+            assert_eq!(
+                app.engine()
+                    .queue()
+                    .iter()
+                    .map(|source| source.display())
+                    .collect::<Vec<_>>(),
+                original_queue
+            );
+        }
+    }
+
+    #[test]
+    fn move_command_ignores_unknown_and_duplicate_ids_and_clamps_target() {
+        let mut app = test_app();
+        add_entries(&mut app, 4);
+        app.submit(Command::MoveEntries {
+            ids: vec![EntryId(2), EntryId(99), EntryId(0), EntryId(2)],
+            to: u32::MAX,
+        })
+        .unwrap();
+        assert_eq!(
+            app.entry_ids,
+            vec![EntryId(1), EntryId(3), EntryId(0), EntryId(2)]
+        );
+        for ids in [vec![], vec![EntryId(99)]] {
+            let before = app.entry_ids.clone();
+            app.submit(Command::MoveEntries { ids, to: 0 }).unwrap();
+            assert_eq!(app.entry_ids, before);
+        }
     }
 
     /// Check actual row ink through the app's production render path, without
