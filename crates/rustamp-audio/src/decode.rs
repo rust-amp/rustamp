@@ -837,7 +837,14 @@ impl Worker {
         // and the converter ceiling below see the normalized signal, so a hot
         // correction is limited and clamped like any other hot signal.
         let metadata = decoder.metadata();
-        self.rg_gain = self.cfg.replay_gain.effective_gain(&metadata.extra);
+        let tags = rustamp_meta::replaygain::ReplayGainTags::from_metadata(&metadata);
+        self.cfg.replay_gain.set_track_values(
+            tags.track_gain_db,
+            tags.track_peak,
+            tags.album_gain_db,
+            tags.album_peak,
+        );
+        self.rg_gain = self.cfg.replay_gain.effective_gain_current();
         for stage in &mut self.dsp {
             let _ = stage.prepare(src);
         }

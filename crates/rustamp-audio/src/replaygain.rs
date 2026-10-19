@@ -44,7 +44,7 @@
 //!
 //! * **Track vs. album:** [`ReplayGainMode`]. `Track` uses the track gain and
 //!   falls back to the album gain when the track has none; `Album` is the
-//!   mirror. `Disabled` (the default) ignores every tag. The choice is a user
+//!   mirror. `Off` (the default) ignores every tag. The choice is a user
 //!   setting because a player normalizes either per song or per album, never
 //!   both at once; the setting has to live somewhere the UI can reach, which
 //!   is engine-side here (see [`crate::engine`]).
@@ -75,11 +75,17 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 /// Re-exported from `rustamp_meta::replaygain::ALBUM_GAIN_KEY`: there is a
 /// single owner of the key spelling.
 pub use rustamp_meta::replaygain::ALBUM_GAIN_KEY;
+/// The `extra` key holding the album peak, linear.
+pub use rustamp_meta::replaygain::ALBUM_PEAK_KEY;
+/// Re-exported from `rustamp-meta`: the parsed ReplayGain tags.
+pub use rustamp_meta::replaygain::ReplayGainTags;
 /// The `extra` key holding the track gain, e.g. `"-3.50 dB"`.
 ///
 /// Re-exported from `rustamp_meta::replaygain::TRACK_GAIN_KEY`: there is a
 /// single owner of the key spelling.
 pub use rustamp_meta::replaygain::TRACK_GAIN_KEY;
+/// The `extra` key holding the track peak, linear.
+pub use rustamp_meta::replaygain::TRACK_PEAK_KEY;
 
 /// Own choice: the estimator in `rustamp-meta` never suggests more than
 /// ±51 dB, and this side never applies more than that either. Real
@@ -97,13 +103,13 @@ pub const MAX_PREAMP_DB: f32 = 24.0;
 ///
 /// Own choice of shape: exactly one source at a time, with a silent fallback
 /// to the other when the preferred one is missing, and a default of
-/// [`ReplayGainMode::Disabled`] so the player never changes loudness until
+/// [`ReplayGainMode::Off`] so the player never changes loudness until
 /// the user asks it to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReplayGainMode {
     /// Ignore every ReplayGain tag; play unadjusted.
     #[default]
-    Disabled,
+    Off,
     /// Normalize per track; fall back to the album gain when the track has none.
     Track,
     /// Normalize per album; fall back to the track gain when the album has none.
@@ -114,7 +120,7 @@ impl ReplayGainMode {
     /// The discriminant stored in [`ReplayGainControl`].
     fn discriminant(self) -> u8 {
         match self {
-            ReplayGainMode::Disabled => 0,
+            ReplayGainMode::Off => 0,
             ReplayGainMode::Track => 1,
             ReplayGainMode::Album => 2,
         }
@@ -126,7 +132,7 @@ impl ReplayGainMode {
         match value {
             1 => ReplayGainMode::Track,
             2 => ReplayGainMode::Album,
-            _ => ReplayGainMode::Disabled,
+            _ => ReplayGainMode::Off,
         }
     }
 }
@@ -137,23 +143,123 @@ impl ReplayGainMode {
 /// Takes effect per track: the decode thread snapshots the control when it
 /// opens a track, so a change mid-track applies from the next track (or a
 /// seek, which re-opens the pipeline state).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ReplayGainControl {
     mode: AtomicU8,
     /// The preamp in dB, stored as bits so the whole control stays atomic.
     preamp_bits: AtomicU32,
+    /// Track gain in dB, stored as bits; NaN means "no value".
+    track_gain_bits: AtomicU32,
+    /// Track peak, linear; NaN means "no value".
+    track_peak_bits: AtomicU32,
+    /// Album gain in dB; NaN means "no value".
+    album_gain_bits: AtomicU32,
+    /// Album peak, linear; NaN means "no value".
+    album_peak_bits: AtomicU32,
+}
+
+impl Default for ReplayGainControl {
+    fn default() -> Self {
+        ReplayGainControl {
+            mode: AtomicU8::new(ReplayGainMode::Off.discriminant()),
+            preamp_bits: AtomicU32::new(0.0f32.to_bits()),
+            track_gain_bits: AtomicU32::new(f32::NAN.to_bits()),
+            track_peak_bits: AtomicU32::new(f32::NAN.to_bits()),
+            album_gain_bits: AtomicU32::new(f32::NAN.to_bits()),
+            album_peak_bits: AtomicU32::new(f32::NAN.to_bits()),
+        }
+    }
 }
 
 impl ReplayGainControl {
     /// A control block with the given mode and preamp.
     pub fn new(mode: ReplayGainMode, preamp_db: f32) -> Self {
-        let control = ReplayGainControl {
-            mode: AtomicU8::new(mode.discriminant()),
-            preamp_bits: AtomicU32::new(0.0f32.to_bits()),
-        };
+        let control = ReplayGainControl::default();
         control.set_mode(mode);
         control.set_preamp_db(preamp_db);
         control
+    }
+
+    /// Store the current track's ReplayGain values (gains in dB, peaks linear).
+    /// `None` means the tag is absent.
+    pub fn set_track_values(
+        &self,
+        track_gain_db: Option<f32>,
+        track_peak: Option<f32>,
+        album_gain_db: Option<f32>,
+        album_peak: Option<f32>,
+    ) {
+        self.track_gain_bits.store(
+            track_gain_db.unwrap_or(f32::NAN).to_bits(),
+            Ordering::Release,
+        );
+        self.track_peak_bits
+            .store(track_peak.unwrap_or(f32::NAN).to_bits(), Ordering::Release);
+        self.album_gain_bits.store(
+            album_gain_db.unwrap_or(f32::NAN).to_bits(),
+            Ordering::Release,
+        );
+        self.album_peak_bits
+            .store(album_peak.unwrap_or(f32::NAN).to_bits(), Ordering::Release);
+    }
+
+    /// The current track's gain in dB, if present.
+    pub fn track_gain_db(&self) -> Option<f32> {
+        let v = f32::from_bits(self.track_gain_bits.load(Ordering::Acquire));
+        if v.is_nan() { None } else { Some(v) }
+    }
+
+    /// The current track's peak, if present.
+    pub fn track_peak(&self) -> Option<f32> {
+        let v = f32::from_bits(self.track_peak_bits.load(Ordering::Acquire));
+        if v.is_nan() { None } else { Some(v) }
+    }
+
+    /// The current track's album gain in dB, if present.
+    pub fn album_gain_db(&self) -> Option<f32> {
+        let v = f32::from_bits(self.album_gain_bits.load(Ordering::Acquire));
+        if v.is_nan() { None } else { Some(v) }
+    }
+
+    /// The current track's album peak, if present.
+    pub fn album_peak(&self) -> Option<f32> {
+        let v = f32::from_bits(self.album_peak_bits.load(Ordering::Acquire));
+        if v.is_nan() { None } else { Some(v) }
+    }
+
+    /// Set the mode and the current track's gain/peak values.
+    pub fn set_replaygain<TG, TP, AG, AP>(
+        &self,
+        mode: ReplayGainMode,
+        track_gain_db: TG,
+        track_peak: TP,
+        album_gain_db: AG,
+        album_peak: AP,
+    ) where
+        TG: IntoReplayGainValue,
+        TP: IntoReplayGainValue,
+        AG: IntoReplayGainValue,
+        AP: IntoReplayGainValue,
+    {
+        self.set_mode(mode);
+        self.set_track_values(
+            track_gain_db.into_value(),
+            track_peak.into_value(),
+            album_gain_db.into_value(),
+            album_peak.into_value(),
+        );
+    }
+
+    /// The linear multiplier for the current track, using the stored values.
+    pub fn effective_gain_current(&self) -> f32 {
+        effective_gain_values(
+            self.mode(),
+            self.track_gain_db(),
+            self.track_peak(),
+            self.album_gain_db(),
+            self.album_peak(),
+            self.preamp_db(),
+        )
     }
 
     /// The requested mode.
@@ -202,23 +308,71 @@ pub use rustamp_meta::replaygain::parse_gain_db;
 ///
 /// `Track` prefers the track gain and falls back to the album gain;
 /// `Album` is the mirror. Malformed values count as absent (a tag that does
-/// not parse is not a value, as in `rustamp-meta`). `Disabled` and "no
+/// not parse is not a value, as in `rustamp-meta`). `Off` and "no
 /// usable tag" both select nothing.
 pub fn select_gain_db(extra: &BTreeMap<String, String>, mode: ReplayGainMode) -> Option<f32> {
-    // Delegate to the metadata crate's reader, so the key spellings and the
-    // gain-string parsing live in one place.
     let metadata = rustamp_core::meta::TrackMetadata {
         extra: extra.clone(),
         ..Default::default()
     };
     let tags = rustamp_meta::replaygain::ReplayGainTags::from_metadata(&metadata);
-    let track = tags.track_gain_db;
-    let album = tags.album_gain_db;
+    select_gain_db_values(mode, tags.track_gain_db, tags.album_gain_db)
+}
+
+/// Selects the gain in dB for `mode` from raw values.
+pub fn select_gain_db_values(
+    mode: ReplayGainMode,
+    track_gain_db: Option<f32>,
+    album_gain_db: Option<f32>,
+) -> Option<f32> {
     match mode {
-        ReplayGainMode::Disabled => None,
-        ReplayGainMode::Track => track.or(album),
-        ReplayGainMode::Album => album.or(track),
+        ReplayGainMode::Off => None,
+        ReplayGainMode::Track => track_gain_db.or(album_gain_db),
+        ReplayGainMode::Album => album_gain_db.or(track_gain_db),
     }
+}
+
+/// Selects the peak paired with the selected gain for `mode`.
+pub fn select_peak_values(
+    mode: ReplayGainMode,
+    track_gain_db: Option<f32>,
+    track_peak: Option<f32>,
+    album_gain_db: Option<f32>,
+    album_peak: Option<f32>,
+) -> Option<f32> {
+    match mode {
+        ReplayGainMode::Off => None,
+        ReplayGainMode::Track => {
+            if track_gain_db.is_some() {
+                track_peak
+            } else {
+                album_peak
+            }
+        }
+        ReplayGainMode::Album => {
+            if album_gain_db.is_some() {
+                album_peak
+            } else {
+                track_peak
+            }
+        }
+    }
+}
+
+/// Selects the peak paired with the selected gain from a track's `extra` tags.
+pub fn select_peak(extra: &BTreeMap<String, String>, mode: ReplayGainMode) -> Option<f32> {
+    let metadata = rustamp_core::meta::TrackMetadata {
+        extra: extra.clone(),
+        ..Default::default()
+    };
+    let tags = rustamp_meta::replaygain::ReplayGainTags::from_metadata(&metadata);
+    select_peak_values(
+        mode,
+        tags.track_gain_db,
+        tags.track_peak,
+        tags.album_gain_db,
+        tags.album_peak,
+    )
 }
 
 /// Converts a gain in dB to a linear multiplier: `10^(gain/20)`.
@@ -240,20 +394,111 @@ pub fn gain_db_to_linear(gain_db: f32) -> f32 {
 /// A non-finite preamp is treated as `0.0` (it cannot shift a correction).
 /// When no gain is selected — disabled mode, or no usable tag — the result
 /// is `1.0` whatever the preamp says: a missing tag plays unadjusted.
+/// The linear multiplier for a track, using the gain and peak held in its
+/// `extra` tags.
+///
+/// A non-finite preamp is treated as `0.0`. When no gain is selected the
+/// result is `1.0` whatever the preamp says.
+///
+/// **Clip protection:** if the selected gain plus preamp would push a sample
+/// past full scale, the peak tag (when present) scales the result by
+/// `1 / peak` instead, so the correction never clips (classic ReplayGain).
 pub fn effective_gain(
     extra: &BTreeMap<String, String>,
     mode: ReplayGainMode,
     preamp_db: f32,
 ) -> f32 {
-    let Some(selected) = select_gain_db(extra, mode) else {
+    let metadata = rustamp_core::meta::TrackMetadata {
+        extra: extra.clone(),
+        ..Default::default()
+    };
+    let tags = rustamp_meta::replaygain::ReplayGainTags::from_metadata(&metadata);
+    effective_gain_values(
+        mode,
+        tags.track_gain_db,
+        tags.track_peak,
+        tags.album_gain_db,
+        tags.album_peak,
+        preamp_db,
+    )
+}
+
+/// The linear multiplier for a track from raw gain/peak values.
+///
+/// `track_gain_db` / `album_gain_db` are gains in dB; `track_peak` /
+/// `album_peak` are linear peaks. `None` means the value is absent.
+///
+/// Clip protection scales by `1 / peak` when the gain would otherwise push
+/// past full scale and a peak is available.
+pub fn effective_gain_values(
+    mode: ReplayGainMode,
+    track_gain_db: Option<f32>,
+    track_peak: Option<f32>,
+    album_gain_db: Option<f32>,
+    album_peak: Option<f32>,
+    preamp_db: f32,
+) -> f32 {
+    let selected_gain = select_gain_db_values(mode, track_gain_db, album_gain_db);
+    let Some(selected) = selected_gain else {
         return 1.0;
     };
+    let selected_peak =
+        select_peak_values(mode, track_gain_db, track_peak, album_gain_db, album_peak);
     let preamp = if preamp_db.is_finite() {
         preamp_db
     } else {
         0.0
     };
-    gain_db_to_linear(selected + preamp)
+    let mut gain = gain_db_to_linear(selected + preamp);
+    if let Some(peak) = selected_peak
+        && peak > 0.0
+        && peak.is_finite()
+    {
+        let limit = 1.0 / peak;
+        if gain > limit {
+            gain = limit;
+        }
+    }
+    gain
+}
+
+/// A value that can be turned into an optional ReplayGain gain/peak.
+///
+/// Implemented for the common scalar and `Option` forms so callers can pass
+/// either a missing value (`None`) or a number directly.
+pub trait IntoReplayGainValue {
+    /// Convert into an optional value.
+    fn into_value(self) -> Option<f32>;
+}
+
+impl IntoReplayGainValue for Option<f32> {
+    fn into_value(self) -> Option<f32> {
+        self
+    }
+}
+
+impl IntoReplayGainValue for Option<f64> {
+    fn into_value(self) -> Option<f32> {
+        self.map(|v| v as f32)
+    }
+}
+
+impl IntoReplayGainValue for f32 {
+    fn into_value(self) -> Option<f32> {
+        Some(self)
+    }
+}
+
+impl IntoReplayGainValue for f64 {
+    fn into_value(self) -> Option<f32> {
+        Some(self as f32)
+    }
+}
+
+impl IntoReplayGainValue for i32 {
+    fn into_value(self) -> Option<f32> {
+        Some(self as f32)
+    }
 }
 
 /// Applies a ReplayGain multiplier in place to interleaved `f32` samples.
@@ -321,7 +566,7 @@ mod tests {
             "track mode falls back to the album gain"
         );
 
-        assert_eq!(select_gain_db(&both, ReplayGainMode::Disabled), None);
+        assert_eq!(select_gain_db(&both, ReplayGainMode::Off), None);
         assert_eq!(
             select_gain_db(&BTreeMap::new(), ReplayGainMode::Track),
             None
@@ -376,7 +621,7 @@ mod tests {
             effective_gain(&BTreeMap::new(), ReplayGainMode::Track, 6.0),
             1.0
         );
-        assert_eq!(effective_gain(&extra, ReplayGainMode::Disabled, 6.0), 1.0);
+        assert_eq!(effective_gain(&extra, ReplayGainMode::Off, 6.0), 1.0);
         // A non-finite preamp cannot shift a correction.
         assert_eq!(
             effective_gain(&extra, ReplayGainMode::Track, f32::NAN),
@@ -409,7 +654,7 @@ mod tests {
     #[test]
     fn the_control_round_trips_mode_and_preamp() {
         let control = ReplayGainControl::default();
-        assert_eq!(control.mode(), ReplayGainMode::Disabled);
+        assert_eq!(control.mode(), ReplayGainMode::Off);
         assert_eq!(control.preamp_db(), 0.0);
 
         control.set_mode(ReplayGainMode::Album);
