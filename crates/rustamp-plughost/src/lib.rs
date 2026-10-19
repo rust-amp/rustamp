@@ -9,7 +9,9 @@
 //! `registry` is the control-channel routing around it. `input` is the input
 //! (`in_`) bridge: the host members of a classic input module, the
 //! `init`/`play`/`pause`/`stop`/`quit` lifecycle and the state answers the
-//! plugin itself gives. `vis` is the
+//! plugin itself gives. `handoff` is the input → output hand-over: the host
+//! writes the selected output plugin into the input module before `play`, and
+//! it records the end-of-track notification an input plugin posts. `vis` is the
 //! visualization (`vis_`) bridge: the module list of a library, the
 //! `init`/`render`/`quit` lifecycle of one of its modules and the host
 //! callbacks the running visualization answers. `dsp` is the DSP (`dsp_`)
@@ -27,8 +29,9 @@ mod commands;
 pub mod control;
 pub mod dsp;
 pub mod fault;
+pub mod handoff;
 pub mod host_window;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub mod input;
 pub mod ipc;
 pub mod loader;
@@ -48,8 +51,9 @@ pub use dsp::{DspError, DspLibraryInfo, DspModuleInfo, DspRunInfo};
 #[cfg(windows)]
 pub use fault::{FaultGuard, install_fault_guard};
 pub use fault::{PLUGIN_FAULT_EXIT_CODE, PluginIdentity, plugin_call_scope};
+pub use handoff::{END_OF_TRACK_MESSAGE, HandoffError, is_end_of_track_message, take_end_of_track};
 pub use host_window::*;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub use input::{InModuleInfo, InputError};
 pub use ipc::*;
 pub use loader::{

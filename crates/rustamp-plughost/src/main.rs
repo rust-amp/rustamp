@@ -379,6 +379,17 @@ fn run_ui_loop(
             exit_reason = UiLoopExit::WmQuit;
             break;
         }
+        // S09 §3.6: an input plug-in's decode thread posts the end-of-track
+        // notification `0x402` to the host window, and the host reports it to
+        // its caller. The player owns the playlist, so the host advances
+        // nothing itself; the report goes to stderr, which the supervisor
+        // inherits, because stdout is the frame stream.
+        let ended = rustamp_plughost::handoff::take_end_of_track();
+        if ended > 0 {
+            eprintln!(
+                "rustamp-plughost32: the input plug-in reported {ended} end-of-track notification(s)"
+            );
+        }
         std::thread::sleep(UI_POLL);
     }
 

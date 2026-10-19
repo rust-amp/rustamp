@@ -17,11 +17,17 @@
 //! * `quit` records that the host tore the plugin down (S09 §4.2 step 4).
 //!
 //! The playback callbacks (`open`, `close`, `write`, `can_write`,
-//! `is_playing`, `pause`, `set_volume`, `set_pan`, `flush` and the two time
-//! queries) are implemented and record every call, but the **host never calls
-//! them**: S09 §4.2 step 3 drives the output from the *input* plugin's decode
-//! thread. The acceptance test asserts that their trace lines are absent, so
-//! a host that drove the output itself would fail the test.
+//! `is_playing`, `pause`, `flush` and the two time queries) are implemented
+//! and record every call, but the **host never calls them**: S09 §4.2 step 3
+//! drives the output from the *input* plugin's decode thread. The acceptance
+//! test asserts that their trace lines are absent, so a host that drove the
+//! output itself would fail the test.
+//!
+//! `set_volume` and `set_pan` are the two callbacks the host itself may
+//! call: S09 §3.5 step 2 has it apply the player's levels to the output
+//! before `play` (the hand-over, see `src/handoff.rs`). The fixture keeps the
+//! two values without tracing them, so the acceptance test's "no playback
+//! call" assertion stays about the playback path.
 //!
 //! # What this is not
 //!

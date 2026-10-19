@@ -50,24 +50,25 @@
 //! 11. **Input plugins**: the host fills `main_window`, `dll_instance` and the
 //!     host callbacks (the analyzer, visualization and DSP groups and
 //!     `set_info`) before `init`, and clears `set_info` first and fills it
-//!     again after `init` returned (S09 §3.5 lines 153–156). `out_module`
-//!     stays empty: no output plugin is selected, and the selection is the
-//!     `config_outname` setting, which is S12's business (S09 §3.1 offset
-//!     0x94). The host then drives the plugin's playback — `play`, `pause`,
-//!     `unpause`, `stop` — and reads its own state answers (`is_paused`,
-//!     `get_length`, `get_position`); see [`crate::input`]. The host has no
-//!     audio path into a classic input plugin: the plugin's decode thread,
-//!     the output plugin it drives and the analyzer data are not here yet
-//!     (S09 §3.6, §3.7).
+//!     again after `init` returned (S09 §3.5 lines 153–156). The host then
+//!     drives the plugin's playback — `play`, `pause`, `unpause`, `stop` — and
+//!     reads its own state answers (`is_paused`, `get_length`, `get_position`);
+//!     see [`crate::input`]. `out_module` is filled by the **hand-over**
+//!     before `play` (S09 §3.5 step 2, §3.7), not by the loader: the
+//!     selection is the `config_outname` setting, which is S12's business, and
+//!     the hand-over lives in [`crate::handoff`]. The host still drives no
+//!     audio itself: the plugin's decode thread, the analyzer data and the
+//!     visualization data are not here (S09 §3.6, §3.7).
 //! 12. **Output plugins**: the host fills `main_window` and `dll_instance` in
 //!     the `Out_Module` and calls `init` (S09 §4.1 lines 233–237, §4.2 line 252).
-//!     The host calls **no other** output callback: `open`, `write`,
-//!     `can_write`, `is_playing`, `pause`, `set_volume`, `set_pan`, `flush`
-//!     and the two time queries are driven by the **input** plugin from its
-//!     decode thread (S09 §4.2 step 3, §3.7), and the host has no playback
-//!     path of its own. The `id` member is left untouched: the 5.x host
-//!     replaces it with the DLL file name (5.x-only), and whether 2.95 does is
-//!     open (S09 U-4).
+//!     The host drives **no** playback callback of its own: `open`, `write`,
+//!     `can_write`, `is_playing`, `pause`, `flush` and the two time queries
+//!     are driven by the **input** plugin from its decode thread
+//!     (S09 §4.2 step 3, §3.7). The one exception is the hand-over: the host
+//!     applies the current volume and pan to the output before `play`
+//!     (S09 §3.5 step 2, §3.7). The `id` member is left untouched: the 5.x
+//!     host replaces it with the DLL file name (5.x-only), and whether 2.95
+//!     does is open (S09 U-4).
 //! 13. **Visualization plugins**: the host resolves `winampVisGetHeader`,
 //!     validates the header and enumerates the library's modules (S09 §5.1,
 //!     §5.3 step 2). A module is chosen and started later — the user picks
@@ -111,7 +112,7 @@ use rustamp_plugin_abi::common::{
 use rustamp_plugin_abi::dsp::{DspHeader, DspModule};
 #[cfg(any(windows, test))]
 use rustamp_plugin_abi::general::GeneralPlugin;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use rustamp_plugin_abi::input::InModule;
 #[cfg(any(windows, test))]
 use rustamp_plugin_abi::output::OutModule;
@@ -121,7 +122,7 @@ use rustamp_plugin_abi::vis::{VisHeader, VisModule};
 #[cfg(any(windows, test))]
 use crate::dsp::DspModuleEntry;
 use crate::dsp::{DspError, DspLibraryInfo, DspRunInfo};
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use crate::input::{InModuleInfo, InputError};
 use crate::vis::{VisError, VisLibraryInfo, VisModuleEntry, VisRunInfo};
 
@@ -567,7 +568,7 @@ impl std::error::Error for PluginConfigError {}
 
 #[derive(Debug)]
 enum LoadedPluginInner {
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     Input {
         module: *mut InModule,
         /// `init` was actually called. False means the slot was null and
@@ -688,7 +689,7 @@ impl LoadedPlugin {
         // name this plugin.
         let _scope = plugin_call_scope(&self.identity, "quit");
         match self.inner {
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             LoadedPluginInner::Input { module, .. } => {
                 if !module.is_null() {
                     // SAFETY: module pointer was verified non-null at load time.
@@ -825,7 +826,7 @@ impl LoadedPlugin {
         let _scope = plugin_call_scope(&self.identity, "config");
         match self.inner {
             // S09 §3.1 offset 0x1C: `config(parent window handle)`.
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             LoadedPluginInner::Input { module, .. } => {
                 if !self.initialized {
                     return Err(PluginConfigError::NotInitialized);
@@ -1039,7 +1040,7 @@ impl LoadedPlugin {
     ///
     /// The struct lives in plugin static data, so this stays readable after
     /// [`quit`](Self::quit) (the mapping is retained, S09 §1 line 46).
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub fn input_info(&self) -> Option<InModuleInfo> {
         match self.inner {
             LoadedPluginInner::Input {
@@ -1051,12 +1052,38 @@ impl LoadedPlugin {
     }
 
     /// The plugin's own module pointer, when this is an input plugin.
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     fn input_module(&self) -> Result<*mut InModule, InputError> {
         match self.inner {
             LoadedPluginInner::Input { module, .. } if !module.is_null() => Ok(module),
             LoadedPluginInner::Input { .. } => Err(InputError::NullModule),
             _ => Err(InputError::WrongKind(self.kind())),
+        }
+    }
+
+    /// The plugin's own `In_Module` pointer, when this is an input plugin.
+    ///
+    /// The pointer aims at the plugin's static data and stays valid as long
+    /// as the DLL is mapped (S09 §0). The host writes the selected output
+    /// plugin into that module before `play` (S09 §3.5 step 2, §3.7).
+    #[cfg(any(windows, test))]
+    pub(crate) fn input_module_ptr(&self) -> Option<*mut InModule> {
+        match self.inner {
+            LoadedPluginInner::Input { module, .. } if !module.is_null() => Some(module),
+            _ => None,
+        }
+    }
+
+    /// The plugin's own `Out_Module` pointer, when this is an output plugin.
+    ///
+    /// The pointer aims at the plugin's static data and stays valid as long
+    /// as the DLL is mapped (S09 §0). It is what the host hands to an input
+    /// plugin (S09 §3.5 step 2, §3.7).
+    #[cfg(any(windows, test))]
+    pub(crate) fn output_module_ptr(&self) -> Option<*mut OutModule> {
+        match self.inner {
+            LoadedPluginInner::Output { module, .. } if !module.is_null() => Some(module),
+            _ => None,
         }
     }
 
@@ -1068,12 +1095,12 @@ impl LoadedPlugin {
     /// (S09 §3.1 offset 0x38). A plugin that supplied no `play` slot is
     /// refused, never called through a null slot (S09 §0).
     ///
-    /// The host has no audio path into a classic input plugin yet: the
-    /// plugin's own decode thread, the output plugin it drives and the
-    /// analyzer data are not here (S09 §3.6, §3.7). What this call does is
-    /// start the plugin's playback and give the acceptance path a lifecycle
-    /// to pin.
-    #[cfg(windows)]
+    /// The host drives no audio itself: the plugin's own decode thread, the
+    /// analyzer data and the visualization data are not here (S09 §3.6,
+    /// §3.7). The output plugin the plugin will drive is handed over before
+    /// this call, by [`crate::registry::PluginRegistry::play_input`]
+    /// (S09 §3.5 step 2, §3.7).
+    #[cfg(any(windows, test))]
     pub fn input_play(&self, path: &Path) -> Result<(), InputError> {
         if !self.initialized {
             return Err(InputError::NotInitialized);
@@ -1086,7 +1113,7 @@ impl LoadedPlugin {
     }
 
     /// Pause the input plugin's playback (S09 §3.1 offset 0x3C).
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub fn input_pause(&self) -> Result<(), InputError> {
         if !self.initialized {
             return Err(InputError::NotInitialized);
@@ -1099,7 +1126,7 @@ impl LoadedPlugin {
     }
 
     /// Resume the input plugin's playback (S09 §3.1 offset 0x40).
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub fn input_unpause(&self) -> Result<(), InputError> {
         if !self.initialized {
             return Err(InputError::NotInitialized);
@@ -1113,7 +1140,7 @@ impl LoadedPlugin {
 
     /// Stop the input plugin's playback and let it unload the stream
     /// (S09 §3.5 step 6, S09 §3.1 offset 0x48).
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub fn input_stop(&self) -> Result<(), InputError> {
         if !self.initialized {
             return Err(InputError::NotInitialized);
@@ -1128,7 +1155,7 @@ impl LoadedPlugin {
     /// Ask the input plugin whether it is paused (S09 §3.1 offset 0x44).
     ///
     /// The answer is the plugin's own, never one the host invented.
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub fn input_is_paused(&self) -> Result<bool, InputError> {
         if !self.initialized {
             return Err(InputError::NotInitialized);
@@ -1144,7 +1171,7 @@ impl LoadedPlugin {
     /// (S09 §3.1 offset 0x4C).
     ///
     /// The answer is the plugin's own, never one the host invented.
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub fn input_length_ms(&self) -> Result<i32, InputError> {
         if !self.initialized {
             return Err(InputError::NotInitialized);
@@ -1162,7 +1189,7 @@ impl LoadedPlugin {
     /// The answer is the plugin's own, never one the host invented. S09
     /// §3.6 lets the analyzer and visualization threads ask for it, so the
     /// call has to be safe from any thread the host owns.
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub fn input_position_ms(&self) -> Result<i32, InputError> {
         if !self.initialized {
             return Err(InputError::NotInitialized);
@@ -1495,7 +1522,6 @@ impl LoadedPlugin {
     /// No DLL is mapped and no export is resolved, so a test built on this
     /// proves host logic only — never DLL acceptance (P3 §7 false passes).
     #[cfg(test)]
-    #[cfg(windows)]
     pub(crate) fn input_for_test(name: &str, module: *mut InModule, host_hwnd: usize) -> Self {
         Self {
             identity: PluginIdentity::new(Path::new(name), PluginKind::Input),

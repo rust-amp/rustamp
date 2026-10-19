@@ -473,6 +473,11 @@ unsafe fn handle_window_message(
         }
         // SAFETY: forward original arguments without a surface borrow.
         msg => {
+            // S09 §3.6: an input plugin's decode thread posts the end-of-track
+            // notification `0x402` to the main window with both parameters
+            // zero. It is not an IPC query: the host records it and reports it
+            // to its caller.
+            crate::handoff::on_window_message(msg);
             let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WindowState;
             if let Some(state) = unsafe { state_ptr.as_ref() } {
                 let _ = state
