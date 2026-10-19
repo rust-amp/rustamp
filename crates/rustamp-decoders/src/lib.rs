@@ -23,6 +23,7 @@ use rustamp_core::audio::DecoderRegistry;
 pub mod symphonia_dec;
 pub mod wave_dec;
 
+mod aiff_header;
 mod mpeg_header;
 
 pub use symphonia_dec::{SymphoniaDecoder, SymphoniaDecoderFactory};

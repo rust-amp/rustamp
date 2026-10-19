@@ -562,6 +562,170 @@ fn a_seek_in_an_intact_mp3_does_not_turn_it_into_a_truncation() {
 }
 
 // ---------------------------------------------------------------------------
+// AIFF: the COMM and SSND chunks as a truncation oracle
+// ---------------------------------------------------------------------------
+
+/// The 80-bit IEEE 754 extended float an AIFF file stores a sample rate in.
+///
+/// The value is `2^(exponent - 16383) * mantissa / 2^63`, with the
+/// mantissa's integer bit set.
+fn extended_rate(rate: u32) -> [u8; 10] {
+    let rate = rate.max(1);
+    let exponent = 16383 + 31 - rate.leading_zeros();
+    let mantissa = u64::from(rate) << (63 - (31 - rate.leading_zeros()));
+    let mut out = [0u8; 10];
+    out[..2].copy_from_slice(&(exponent as u16).to_be_bytes());
+    out[2..].copy_from_slice(&mantissa.to_be_bytes());
+    out
+}
+
+/// A minimal AIFF file: `FORM`/`AIFF` with a `COMM` chunk and an `SSND`
+/// chunk that holds `frames` frames of 16 bit mono audio.
+///
+/// The `COMM` chunk states the number of sample frames, the `SSND` chunk the
+/// number of bytes of sound data: the two numbers the truncation oracle
+/// compares the file against.
+fn aiff_bytes(frames: u32) -> Vec<u8> {
+    let block_align = 2u32; // 16 bit mono
+    let data_len = u64::from(frames) * u64::from(block_align);
+    // The `SSND` chunk holds its own eight byte header next to the sound
+    // data.
+    let ssnd_len = 8 + data_len;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FORM");
+    out.extend_from_slice(&((4 + 26 + 8 + ssnd_len) as u32).to_be_bytes());
+    out.extend_from_slice(b"AIFF");
+    out.extend_from_slice(b"COMM");
+    out.extend_from_slice(&18u32.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // channels
+    out.extend_from_slice(&frames.to_be_bytes()); // sample frames
+    out.extend_from_slice(&16u16.to_be_bytes()); // bits per sample
+    out.extend_from_slice(&extended_rate(RATE));
+    out.extend_from_slice(b"SSND");
+    out.extend_from_slice(&(ssnd_len as u32).to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // offset
+    out.extend_from_slice(&0u32.to_be_bytes()); // block size
+    out.extend(std::iter::repeat_n(0u8, data_len as usize));
+    out
+}
+
+/// A cut AIFF file is a loud decode failure.
+///
+/// The `COMM` chunk states the number of sample frames and the `SSND` chunk
+/// the number of bytes of sound data. A file that is short of frames *and* of
+/// bytes was cut, and saying so is the whole point: a half-downloaded track
+/// must not play short as if it were complete.
+#[test]
+fn a_truncated_aiff_is_a_loud_failure_and_not_an_end_of_stream() {
+    let full = aiff_bytes(1000);
+    // Cut inside the sound data, in the middle of a frame.
+    let cut = full[..full.len() - 3].to_vec();
+    assert!(cut.len() < full.len());
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("aiff")))
+        .expect("a truncated aiff still opens");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        frames < 1000,
+        "a truncated file must not yield the claimed 1000 frames: {frames}"
+    );
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => {
+            assert!(
+                message.contains("truncated"),
+                "the failure must name the truncation: {message}"
+            );
+            assert!(
+                message.contains("of the 1000 frames"),
+                "the failure must name the count the file declares: {message}"
+            );
+        }
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// The same file, intact: it holds everything its chunks declare, so it ends
+/// with a plain end of stream and exactly the declared number of frames.
+///
+/// The count is the one the `COMM` chunk states, not the one the reader
+/// reports: the reader counts the eight bytes of the `SSND` header as audio
+/// and would say 1004 frames for 1000 frames of sound data.
+#[test]
+fn an_intact_aiff_ends_with_the_declared_count() {
+    let full = aiff_bytes(1000);
+    let mut d = SymphoniaDecoder::open(reader_source(full, Some("aiff"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(matches!(outcome, Drained::End), "{outcome:?}");
+    assert_eq!(
+        frames, 1000,
+        "the file holds every frame its COMM chunk declares"
+    );
+}
+
+/// Damage is not a cut file.
+///
+/// The samples in the middle of the file are damaged, but the file holds
+/// every byte its `SSND` chunk declares: the header and the file agree, so
+/// the file keeps playing and ends cleanly.
+#[test]
+fn a_damaged_aiff_that_holds_all_its_bytes_is_not_called_truncated() {
+    let mut bytes = aiff_bytes(1000);
+    let len = bytes.len();
+    for b in &mut bytes[len / 2..len / 2 + 300] {
+        *b ^= 0xA5;
+    }
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("aiff"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "a damaged file is not a cut file: {outcome:?}"
+    );
+    assert_eq!(frames, 1000, "damage costs samples, not frames");
+}
+
+/// A header that lies is not a cut file.
+///
+/// The `COMM` chunk claims far more frames than the file holds, but the file
+/// holds every byte its `SSND` chunk declares: the header is wrong, the file
+/// is not cut. The byte count is what tells the two apart, so this file ends
+/// cleanly - calling it truncated would be crying wolf.
+#[test]
+fn an_aiff_header_that_lies_about_the_frame_count_is_not_a_truncation() {
+    let mut bytes = aiff_bytes(1000);
+    // The sample frame count of the `COMM` chunk: the chunk header is 8
+    // bytes behind the `FORM` header, the channels take two more.
+    let at = 12 + 8 + 2;
+    bytes[at..at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("aiff"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "a wrong header is not a cut file: {outcome:?}"
+    );
+    assert_eq!(frames, 1000, "the file holds all of its frames");
+}
+
+/// A file on disk behaves like a stream: the header is read from the file,
+/// not from a stream.
+#[test]
+fn a_truncated_aiff_file_on_disk_is_a_loud_failure() {
+    let full = aiff_bytes(1000);
+    let cut = full[..full.len() - 3].to_vec();
+    let file = tempfile::NamedTempFile::new().expect("temp file");
+    std::fs::write(file.path(), &cut).expect("write");
+    let mut d = SymphoniaDecoder::open(MediaSource::Path(file.path().to_path_buf()))
+        .expect("a truncated aiff still opens");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(frames < 1000, "only {frames} frames");
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => assert!(
+            message.contains("truncated"),
+            "the failure must name the truncation: {message}"
+        ),
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Headers that lie about their format
 // ---------------------------------------------------------------------------
 
