@@ -145,9 +145,18 @@ impl PresenterWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DialogRoute {
     /// The standard Windows file-open dialog, with multiple selection
-    /// allowed; `play` is the requesting command's flag, carried through to
-    /// the [`Command::AddItems`] the choice produces.
-    NativeFilePicker { play: bool },
+    /// allowed.
+    ///
+    /// The requesting command's `play` flag is not part of the route: it
+    /// rides along in the [`DialogKind`] the request came in as, and
+    /// reaches the [`Command::AddItems`] the choice produces.
+    NativeFilePicker,
+    /// The shell's folder dialog: the **directory** face of the open-media
+    /// dialog (S03 id 40187).
+    ///
+    /// A folder is not a file, so the file-open dialog cannot ask for one;
+    /// the shell has its own dialog for it.
+    NativeDirectoryPicker,
     /// The preferences dialog: a real Windows dialog (tree of pages, group
     /// boxes, check boxes) opened on `page`.
     NativePreferences { page: PrefsPage },
@@ -158,22 +167,45 @@ enum DialogRoute {
 impl DialogRoute {
     /// Which route `kind` takes.
     ///
-    /// Only the **files** face of the open-media dialog is native: Windows
-    /// has a file-open dialog for exactly that, and asking the user to type a
-    /// path into a window of ours instead is the defect. A directory pick and
-    /// a location/URL entry are not file-open dialogs, and everything else
+    /// The **files** and the **directory** faces of the open-media dialog
+    /// are native: Windows has a file-open dialog for exactly the first,
+    /// and the shell's folder dialog for exactly the second. Asking the
+    /// user to type a path into a window of ours instead is the defect.
+    /// A location/URL entry is not a file-open dialog, and everything else
     /// (About, file info, jump, the skin browser, load playlist)
     /// is the player's own face with no OS equivalent.
     fn for_dialog(kind: DialogKind) -> Self {
         match kind {
             DialogKind::OpenMedia {
                 kind: OpenMediaKind::Files,
-                play,
-            } => DialogRoute::NativeFilePicker { play },
+                ..
+            } => DialogRoute::NativeFilePicker,
+            DialogKind::OpenMedia {
+                kind: OpenMediaKind::Directory,
+                ..
+            } => DialogRoute::NativeDirectoryPicker,
             DialogKind::Preferences(page) => DialogRoute::NativePreferences { page },
             _ => DialogRoute::OwnWindow,
         }
     }
+}
+
+/// The answer of a native media dialog.
+///
+/// The two native faces answer differently - the file dialog answers with a
+/// list, the folder dialog with one path - so the answers are kept apart
+/// here, and the *meaning* of each answer (cancelled, chosen, failed) is
+/// the same for both.
+#[derive(Debug)]
+enum MediaPick {
+    /// The files the user chose. An empty list is a cancelled dialog.
+    Files(Vec<PathBuf>),
+    /// The directory the user chose. `None` is a cancelled dialog.
+    Directory(Option<PathBuf>),
+    /// The file dialog failed.
+    FileFailed(rustamp_platform::FileDialogError),
+    /// The folder dialog failed.
+    DirectoryFailed(rustamp_platform::FileDialogError),
 }
 
 /// The repaint/pump interval (~60 fps).
@@ -413,14 +445,17 @@ struct Windowed {
     dialog_id: Option<WindowId>,
     /// Which dialog the OS window above shows (`None` while it is closed).
     dialog_kind: Option<DialogKind>,
-    /// A standard file-open dialog waiting to be shown, with the `play` flag
-    /// of the request that asked for it.
+    /// A native media dialog (the file-open dialog or the shell's folder
+    /// dialog) waiting to be shown.
+    ///
+    /// The request is a [`DialogKind`], so it carries the face (files or
+    /// directory) and the requesting command's `play` flag with it.
     ///
     /// The native dialog is modal and runs its own message loop, so it must
     /// not be opened from inside a window procedure - the same rule the tray
     /// popup follows. The request is recorded here and drained once per tick
     /// in [`Windowed::drain_media_pick`].
-    pending_media_pick: Option<(DialogKind, bool)>,
+    pending_media_pick: Option<DialogKind>,
     /// The preferences page the app asked for, opened from the tick for the
     /// same reason as the file pick (never from inside a window procedure).
     pending_prefs: Option<PrefsPage>,
@@ -1148,16 +1183,18 @@ impl Windowed {
         eprintln!("rustamp: a native popup menu is only implemented on Windows");
     }
 
-    /// Shows a pending standard file-open dialog and adds what was chosen.
+    /// Shows a pending native media dialog and adds what was chosen.
     ///
-    /// The ADD button and the open-media actions ask for files. They used to
+    /// The ADD button and the open-media actions ask for media. They used to
     /// open a window of ours that wanted a typed path or a drop onto it;
     /// Windows has a file-open dialog for exactly this, with multiple
-    /// selection, so the player uses it
-    /// ([`rustamp_platform::pick_media_files`]).
+    /// selection, and the shell has a folder dialog for the directory face,
+    /// so the player uses them
+    /// ([`rustamp_platform::pick_media_files`],
+    /// [`rustamp_platform::pick_directory`]).
     ///
     /// Where the seam sits, and why here: the headless half keeps its model -
-    /// a command still *requests* a file choice, which is what the app's
+    /// a command still *requests* a media choice, which is what the app's
     /// tests pin - and the presenter decides how the OS asks. The dialog is
     /// modal and runs its own message loop, so it is opened from the tick,
     /// never from a window procedure (the rule the tray popup follows).
@@ -1168,38 +1205,126 @@ impl Windowed {
     /// `play` flag untouched, so `Play file` still starts and the playlist's
     /// ADD still only appends. A cancelled dialog adds nothing.
     ///
-    /// The other two faces keep their own windows: a directory pick and a
-    /// location/URL entry are not file-open dialogs (the directory picker
-    /// would be a different native dialog, which no spec covers yet).
+    /// A chosen **directory** contributes the media files of the tree below
+    /// it (see [`crate::directory`]); the chosen directory itself is not an
+    /// entry, and the scan runs in this tick. The location face keeps its
+    /// own window: a URL is typed, not picked.
     fn drain_media_pick(&mut self) {
-        let Some((kind, play)) = self.pending_media_pick.take() else {
+        let Some(dialog) = self.pending_media_pick.take() else {
             return;
         };
-        #[cfg(windows)]
-        {
-            let owner = self.raw_main_window();
-            match rustamp_platform::pick_media_files(owner, kind.title(), true) {
-                Ok(paths) if paths.is_empty() => {} // Cancelled: nothing to add.
-                Ok(paths) => {
-                    let items = rustamp_ui::media_items_for_paths(&paths);
-                    let command = Command::AddItems {
-                        items,
-                        at: None,
-                        play,
-                    };
-                    if let Err(error) = self.app.submit(command) {
-                        eprintln!("rustamp: the chosen files could not be added: {error}");
+        let DialogKind::OpenMedia { kind, play } = dialog else {
+            return;
+        };
+        let answer = match kind {
+            OpenMediaKind::Files => match self.platform_media_files(dialog.title()) {
+                Ok(paths) => MediaPick::Files(paths),
+                Err(error) => MediaPick::FileFailed(error),
+            },
+            OpenMediaKind::Directory => match self.platform_media_directory(dialog.title()) {
+                Ok(directory) => MediaPick::Directory(directory),
+                Err(error) => MediaPick::DirectoryFailed(error),
+            },
+            // The location face is a typed URL, not a native dialog.
+            OpenMediaKind::Location => return,
+        };
+        self.apply_media_pick(answer, play);
+    }
+
+    /// The files the user chose in the standard file-open dialog.
+    ///
+    /// An empty selection is a cancelled dialog, which is not an error.
+    #[cfg(windows)]
+    fn platform_media_files(
+        &self,
+        title: &str,
+    ) -> Result<Vec<PathBuf>, rustamp_platform::FileDialogError> {
+        rustamp_platform::pick_media_files(self.raw_main_window(), title, true)
+    }
+
+    /// No native file dialog on this platform yet (milestone M6).
+    #[cfg(not(windows))]
+    fn platform_media_files(
+        &self,
+        _title: &str,
+    ) -> Result<Vec<PathBuf>, rustamp_platform::FileDialogError> {
+        Err(rustamp_platform::FileDialogError::Unsupported)
+    }
+
+    /// The directory the user chose in the shell's folder dialog.
+    ///
+    /// `None` is a cancelled dialog, which is not an error.
+    #[cfg(windows)]
+    fn platform_media_directory(
+        &self,
+        title: &str,
+    ) -> Result<Option<PathBuf>, rustamp_platform::FileDialogError> {
+        rustamp_platform::pick_directory(self.raw_main_window(), title)
+    }
+
+    /// No native folder dialog on this platform yet (milestone M6).
+    #[cfg(not(windows))]
+    fn platform_media_directory(
+        &self,
+        _title: &str,
+    ) -> Result<Option<PathBuf>, rustamp_platform::FileDialogError> {
+        Err(rustamp_platform::FileDialogError::Unsupported)
+    }
+
+    /// Adds what a native media pick means to the playlist.
+    ///
+    /// * **Files**: the chosen files are appended. An empty selection is a
+    ///   cancelled dialog and adds nothing.
+    /// * **Directory**: the media files the chosen directory holds are
+    ///   appended. `None` is a cancelled dialog and adds nothing.
+    /// * **Failed**: the dialog failed; nothing is added and the failure is
+    ///   reported.
+    ///
+    /// The `play` flag is the requesting command's, carried through
+    /// untouched: the main window's open actions start the first added
+    /// entry, the playlist's ADD only appends.
+    fn apply_media_pick(&mut self, answer: MediaPick, play: bool) {
+        match answer {
+            MediaPick::Files(paths) => self.add_media_paths(paths, play),
+            MediaPick::Directory(Some(directory)) => {
+                let extensions = self.app.decodable_extensions();
+                match crate::directory::media_files(&directory, &extensions) {
+                    Ok(paths) if paths.is_empty() => {
+                        // Nothing to add: say so, so a folder without media
+                        // does not look like a button that does nothing.
+                        self.app.note(format!(
+                            "the chosen directory holds no media file: {}",
+                            directory.display()
+                        ));
                     }
-                    self.app.sync_playlist_entries();
+                    Ok(paths) => self.add_media_paths(paths, play),
+                    Err(error) => {
+                        eprintln!("rustamp: the chosen directory could not be read: {error}")
+                    }
                 }
-                Err(error) => eprintln!("rustamp: no file dialog: {error}"),
+            }
+            // Cancelled: the playlist stays as it is.
+            MediaPick::Directory(None) => {}
+            MediaPick::FileFailed(error) => eprintln!("rustamp: no file dialog: {error}"),
+            MediaPick::DirectoryFailed(error) => {
+                eprintln!("rustamp: no directory dialog: {error}")
             }
         }
-        #[cfg(not(windows))]
-        {
-            let _ = (kind, play);
-            eprintln!("rustamp: a native file dialog is only implemented on Windows");
+    }
+
+    /// Appends the chosen media files to the playlist.
+    ///
+    /// An empty list is a cancelled dialog: nothing is added, and the
+    /// playlist model is left alone.
+    fn add_media_paths(&mut self, paths: Vec<PathBuf>, play: bool) {
+        if paths.is_empty() {
+            return;
         }
+        let command = crate::directory::add_command(&paths, play);
+        if let Err(error) = self.app.submit(command) {
+            eprintln!("rustamp: the chosen files could not be added: {error}");
+        }
+        self.app.sync_playlist_entries();
     }
 
     /// Shows the native save-playlist dialog when Ctrl+S was pressed.
@@ -1346,6 +1471,33 @@ impl Windowed {
     fn is_eq_window(&self, id: WindowId) -> bool {
         self.eq_id == Some(id)
     }
+    /// Hands the app's open dialog to the OS, when the OS has a dialog for
+    /// it.
+    ///
+    /// A native dialog is not a window of ours: the request is recorded and
+    /// drained from the tick (see [`Windowed::drain_media_pick`]), because
+    /// this runs from window procedures too, and a modal dialog must not be
+    /// opened from inside one.
+    ///
+    /// The app's own dialog is closed, so the two never answer at once.
+    /// Returns whether the dialog was taken over; a dialog of ours
+    /// ([`DialogRoute::OwnWindow`]) stays with the app.
+    fn route_open_dialog(&mut self, kind: DialogKind) -> bool {
+        match DialogRoute::for_dialog(kind) {
+            DialogRoute::NativeFilePicker | DialogRoute::NativeDirectoryPicker => {
+                self.app.close_dialog(kind);
+                self.pending_media_pick = Some(kind);
+                true
+            }
+            DialogRoute::NativePreferences { page } => {
+                self.app.close_dialog(kind);
+                self.pending_prefs = Some(page);
+                true
+            }
+            DialogRoute::OwnWindow => false,
+        }
+    }
+
     /// Creates or closes the dialog OS window so it matches the app's open
     /// dialog ([`App::dialog_open_kind`]).
     ///
@@ -1367,17 +1519,7 @@ impl Windowed {
         let Some(kind) = open else {
             return;
         };
-        // A native dialog is not a window of ours: see
-        // [`Windowed::drain_media_pick`]. The request is only recorded here,
-        // because this runs from window procedures too.
-        if let DialogRoute::NativeFilePicker { play } = DialogRoute::for_dialog(kind) {
-            self.app.close_dialog(kind);
-            self.pending_media_pick = Some((kind, play));
-            return;
-        }
-        if let DialogRoute::NativePreferences { page } = DialogRoute::for_dialog(kind) {
-            self.app.close_dialog(kind);
-            self.pending_prefs = Some(page);
+        if self.route_open_dialog(kind) {
             return;
         }
         let (width, height) = kind.client_size();
@@ -2761,29 +2903,36 @@ mod tests {
     /// typed path or a drop onto it, instead of the standard Windows
     /// file-open dialog.
     ///
-    /// The routing decision is checked here: the files face is native and
-    /// carries the requesting command's `play` flag, and no other dialog
-    /// changed. Multiple selection and the decoding of what the user picked
-    /// are checked in `rustamp-platform` (`file_dialog::parse_selection`).
-    /// That the OS then shows the dialog needs a desktop, so only the owner's
-    /// machine can confirm it.
+    /// The routing decision is checked here: the files face is the file-open
+    /// dialog and the directory face is the shell's folder dialog - a folder
+    /// is not a file, so the file-open dialog cannot ask for one. The
+    /// requesting command's `play` flag rides along in the dialog kind, not
+    /// in the route. Multiple selection and the decoding of what the user
+    /// picked are checked in `rustamp-platform`
+    /// (`file_dialog::parse_selection`, `file_dialog::directory_result`).
+    /// That the OS then shows the dialog needs a desktop, so only the
+    /// owner's machine can confirm it.
     #[test]
-    fn only_the_files_face_of_open_media_is_the_native_file_dialog() {
+    fn the_files_and_the_directory_face_of_open_media_are_native() {
         for play in [true, false] {
             assert_eq!(
                 DialogRoute::for_dialog(DialogKind::OpenMedia {
                     kind: OpenMediaKind::Files,
                     play,
                 }),
-                DialogRoute::NativeFilePicker { play },
-                "the files face is the standard file-open dialog, with the play flag kept"
+                DialogRoute::NativeFilePicker,
+                "the files face is the standard file-open dialog"
+            );
+            assert_eq!(
+                DialogRoute::for_dialog(DialogKind::OpenMedia {
+                    kind: OpenMediaKind::Directory,
+                    play,
+                }),
+                DialogRoute::NativeDirectoryPicker,
+                "the directory face is the shell's folder dialog"
             );
         }
         for kind in [
-            DialogKind::OpenMedia {
-                kind: OpenMediaKind::Directory,
-                play: true,
-            },
             DialogKind::OpenMedia {
                 kind: OpenMediaKind::Location,
                 play: true,
@@ -2812,22 +2961,134 @@ mod tests {
     /// a drained request is gone - a modal dialog opened twice, or opened
     /// from inside a window procedure, is how this path breaks.
     #[test]
-    fn a_pending_file_dialog_is_drained_exactly_once() {
+    fn a_pending_media_dialog_is_drained_exactly_once() {
+        for kind in [OpenMediaKind::Files, OpenMediaKind::Directory] {
+            let mut presenter = desktop_test_presenter(false);
+            presenter.pending_media_pick = Some(DialogKind::OpenMedia { kind, play: false });
+            // No main window, so there is no owner handle and the platform call
+            // refuses before any dialog exists; the request is still consumed.
+            presenter.drain_media_pick();
+            assert!(presenter.pending_media_pick.is_none());
+            presenter.drain_media_pick();
+            assert!(presenter.pending_media_pick.is_none());
+            assert!(presenter.window.is_none(), "the test must stay headless");
+        }
+    }
+
+    /// The app's own dialog gives way to the native one.
+    ///
+    /// The app stays headless: it only *requests* a media choice, and the
+    /// presenter decides how the OS asks. The request is recorded and
+    /// drained from the tick, because a modal dialog must not be opened from
+    /// inside a window procedure.
+    #[test]
+    fn the_directory_face_is_taken_over_by_the_native_folder_dialog() {
+        let dialog = DialogKind::OpenMedia {
+            kind: OpenMediaKind::Directory,
+            play: true,
+        };
         let mut presenter = desktop_test_presenter(false);
-        presenter.pending_media_pick = Some((
-            DialogKind::OpenMedia {
-                kind: OpenMediaKind::Files,
-                play: false,
-            },
-            false,
-        ));
-        // No main window, so there is no owner handle and the platform call
-        // refuses before any dialog exists; the request is still consumed.
-        presenter.drain_media_pick();
-        assert!(presenter.pending_media_pick.is_none());
-        presenter.drain_media_pick();
-        assert!(presenter.pending_media_pick.is_none());
-        assert!(presenter.window.is_none(), "the test must stay headless");
+        presenter
+            .app
+            .submit(Command::OpenMedia {
+                kind: OpenMediaKind::Directory,
+                play: true,
+            })
+            .unwrap();
+        assert!(
+            presenter.app.dialog_is_open(dialog),
+            "the app requests the choice"
+        );
+        assert!(presenter.route_open_dialog(dialog));
+        assert!(
+            !presenter.app.dialog_is_open(dialog),
+            "the app's own dialog gives way to the native one"
+        );
+        assert_eq!(
+            presenter.pending_media_pick,
+            Some(dialog),
+            "the request waits for the tick"
+        );
+    }
+
+    /// A chosen directory contributes the media files it holds.
+    ///
+    /// The chosen directory itself is not an entry: the pick brings in the
+    /// media below it (the depth is Rustamp's own choice, see
+    /// [`crate::directory`]). The files that are not media are left out.
+    #[test]
+    fn a_chosen_directory_adds_its_media_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mp3"), b"").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        std::fs::create_dir_all(dir.path().join("album")).unwrap();
+        std::fs::write(dir.path().join("album/b.flac"), b"").unwrap();
+
+        let mut presenter = desktop_test_presenter(false);
+        presenter.apply_media_pick(MediaPick::Directory(Some(dir.path().to_path_buf())), false);
+        assert_eq!(
+            presenter.app.playlist().len(),
+            2,
+            "the two media files of the tree are added, the text file is not"
+        );
+    }
+
+    /// A cancelled dialog adds nothing.
+    #[test]
+    fn a_cancelled_media_pick_adds_nothing() {
+        let mut presenter = desktop_test_presenter(false);
+        presenter.apply_media_pick(MediaPick::Directory(None), true);
+        presenter.apply_media_pick(MediaPick::Files(Vec::new()), true);
+        assert_eq!(presenter.app.playlist().len(), 0);
+    }
+
+    /// A folder without a media file says so instead of doing nothing.
+    #[test]
+    fn a_directory_without_media_files_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        let mut presenter = desktop_test_presenter(false);
+        presenter.apply_media_pick(MediaPick::Directory(Some(dir.path().to_path_buf())), false);
+        assert_eq!(presenter.app.playlist().len(), 0);
+        let notes = presenter.app.drain_notes();
+        assert_eq!(
+            notes.len(),
+            1,
+            "the player says that nothing was added: {notes:?}"
+        );
+        assert!(notes[0].contains("no media file"), "{notes:?}");
+    }
+
+    /// A failed dialog adds nothing.
+    #[test]
+    fn a_failed_media_pick_adds_nothing() {
+        let mut presenter = desktop_test_presenter(false);
+        presenter.apply_media_pick(
+            MediaPick::DirectoryFailed(rustamp_platform::FileDialogError::NullOwner),
+            true,
+        );
+        presenter.apply_media_pick(
+            MediaPick::FileFailed(rustamp_platform::FileDialogError::NullOwner),
+            true,
+        );
+        assert_eq!(presenter.app.playlist().len(), 0);
+    }
+
+    /// The chosen files are **appended** to the playlist, not replacing it.
+    ///
+    /// The `play` flag of the request is pinned by the command itself (see
+    /// [`crate::directory::add_command`]); here the playlist is the
+    /// observable.
+    #[test]
+    fn the_chosen_files_are_appended_to_the_playlist() {
+        let mut presenter = desktop_test_presenter(true);
+        let before = presenter.app.playlist().len();
+        presenter.add_media_paths(vec![PathBuf::from("C:/music/a.mp3")], false);
+        assert_eq!(
+            presenter.app.playlist().len(),
+            before + 1,
+            "the chosen file is appended to the entries that are already there"
+        );
     }
 
     /// The animation defect: the main window's visualization (the "VU meter")

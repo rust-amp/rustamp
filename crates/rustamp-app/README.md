@@ -117,6 +117,32 @@ tests run on harness worker threads; the product keeps the default.
 which drops the commands the UI machine emits and cannot route anything to the
 engine. See the module docs in `src/window.rs`.
 
+## The open-media dialogs
+
+The app's dialog model is headless: a command *requests* a media choice, and
+the presenter decides how the OS asks for it. Two of the three faces of
+`Command::OpenMedia` are native Windows dialogs, and both are opened **from
+the tick** (`window::drain_media_pick`), never from a window procedure: they
+are modal and run their own message loop.
+
+| Face | Command id | Dialog |
+|---|---|---|
+| Open file(s) | 40029 (playlist: 1032) | the standard file-open dialog (`rustamp_platform::pick_media_files`) |
+| Open directory | 40187 (playlist: 1036) | the shell's folder dialog (`rustamp_platform::pick_directory`) |
+| Open location | 40185 (playlist: 1039) | a window of ours: a URL is typed, not picked |
+
+A cancelled dialog adds nothing. The chosen files are appended to the playlist
+with the requesting command's `play` flag untouched, so the main window's open
+actions start the first added entry and the playlist's ADD only appends.
+
+**A chosen directory contributes the media files of the tree below it.** That
+depth is a Rustamp choice: S03 names the action and its shortcut, S04 covers
+the menus that carry it, and S06 covers the playlist editor's ADD and LIST OPTS
+dialogs — none of them says whether a directory contributes its own files or
+the whole tree. Only the files the player's decoders claim are added; a
+playlist file inside the directory is not imported (loading a playlist is the
+LIST OPTS path). See `src/directory.rs` for the rules and their tests.
+
 ## Classic-window docking
 
 `window.rs` applies `rustamp_ui::docking::DockedStack` positions to the main,

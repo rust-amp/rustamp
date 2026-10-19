@@ -480,6 +480,16 @@ impl App {
         &mut self.engine
     }
 
+    /// The file extensions this player's decoders claim.
+    ///
+    /// The directory face of the open-media dialog uses this to tell media
+    /// files from the other files in a folder (see [`crate::directory`]).
+    /// The list comes from the registry the app was built with, so an
+    /// embedding that registers its own decoder gets its own extensions.
+    pub fn decodable_extensions(&self) -> Vec<String> {
+        self.registry.extensions()
+    }
+
     /// Recreates the audio output device and engine as required by the audio
     /// contract (crates/rustamp-core/src/audio.rs:370-380) when a backend
     /// refuses flush (`Error::Unsupported`) or closes the output.

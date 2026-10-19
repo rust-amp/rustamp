@@ -16,6 +16,9 @@
 //! * [`dialogs`] - the simple modal dialogs (About, file info, jump-to) on
 //!   top of [`rustamp_ui::DialogManager`]: opening, closing, jump input and
 //!   the body lines. Headless; the OS window lives in [`window`].
+//! * [`directory`] - what a chosen directory contributes to the playlist:
+//!   the media files of the tree below it, and the command that appends
+//!   them. Pure; the folder dialog itself lives in [`window`].
 //! * [`focus`] — the window-focus order for `FocusNextWindow` (own choice over
 //!   [`rustamp_core::state::WindowId`], not a measurement). Pure; the model
 //!   lives in [`app::App`], the OS half in [`window`].
@@ -55,6 +58,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod dialogs;
+pub mod directory;
 pub mod eq_presets;
 #[cfg(any(windows, test))]
 mod external_control;
