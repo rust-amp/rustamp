@@ -61,6 +61,7 @@ mod external_control;
 pub mod focus;
 pub mod host;
 pub mod menu;
+mod output;
 pub mod playlist_window;
 pub mod routing;
 pub mod skin;
@@ -122,7 +123,7 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     // On Windows that order is only safe because `rustamp-output` keeps every
     // COM initialisation on its own threads: `winit` needs this thread free to
     // enter a single-threaded apartment when it creates the window. See
-    // `app::create_output`.
+    // `output::create_output`.
     let mut app = App::new(options)?;
     app.set_config_path(config_path);
     for warning in &loaded.warnings {

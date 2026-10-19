@@ -26,6 +26,30 @@ no file exits immediately.
 
 ## Windowed mode — headless test VM only
 
+### Audio output mode
+
+`audio.output_mode = "Shared"` (default) retains the automatic WASAPI/cpal
+selection. `"Exclusive"` requests WASAPI exclusive access on Windows. A refusal
+retries shared mode on the same endpoint; its actual `downgrade_reason()` is
+reported through the app's notes (printed as `rustamp: ...` by the presenter).
+If WASAPI cannot open either mode, cpal is tried with an explicit fallback note;
+if that also fails, startup returns both errors. Outside Windows, exclusive is
+unsupported: the app uses the normal cpal output and reports that limitation.
+`--null` and `--no-audio` always override the mode without touching hardware.
+
+The Preferences choice is saved immediately and applies at the next startup
+or engine recreation, not to a currently open stream. The saved value is the
+request, so a temporary device refusal never erases an exclusive preference.
+Open diagnostics are also retained for later device reopens.
+
+Selection/serialization tests are headless. The real app selection probe is
+`output::tests::the_app_exclusive_path_opens_a_real_endpoint_or_reports_its_downgrade`:
+it is ignored by default and **VM-only**, just like `rustamp-output`'s
+`wasapi_exclusive` integration test. Neither is evidence of a real exclusive
+open until explicitly run against the VM's endpoint.
+
+### Running the windowed player
+
 ```text
 cargo run -p rustamp-app -- <file>
 ```

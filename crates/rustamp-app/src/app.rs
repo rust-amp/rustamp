@@ -25,15 +25,15 @@
 //! knows both sides.
 //!
 //! Everything in this module is headless and unit-tested with a
-//! [`NullOutput`]; the windowed presenter in [`crate::window`] only adds the
-//! `winit`/`softbuffer` shell around it.
+//! [`NullOutput`](rustamp_output::NullOutput); the windowed presenter in
+//! [`crate::window`] only adds the `winit`/`softbuffer` shell around it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rustamp_audio::{Engine, EngineConfig, TrackSource};
-use rustamp_core::audio::{DecoderRegistry, OutputDevice};
+use rustamp_core::audio::DecoderRegistry;
 use rustamp_core::bus::{CommandReceiver, CommandSender, EventBus, EventReceiver, command_channel};
 use rustamp_core::command::Command;
 use rustamp_core::config::{
@@ -46,7 +46,7 @@ use rustamp_core::state::{PlayerState, TransportState, WindowId};
 use rustamp_gfx::Image;
 use rustamp_ipc::{Message, Transport};
 use rustamp_meta::replaygain::ReplayGainTags;
-use rustamp_output::{NullClock, NullOutput, default_output};
+use rustamp_output::NullClock;
 use rustamp_ui::{
     DialogManager, EqMenuRequest, EqualizerLayout, EqualizerWindow, Key, MainWindow,
     MainWindowLayout, MainWindowState, Modifiers, PlaylistDialog, PlaylistWindow, ShortcutOutcome,
@@ -55,6 +55,7 @@ use rustamp_ui::{
 
 use crate::cli::OutputChoice;
 use crate::host::{HostStateLink, PollOutcome, PublishOutcome, player_state_message};
+use crate::output::create_output;
 use crate::routing;
 use crate::skin::{LoadedSkin, SkinChoice, load as load_skin};
 use crate::supervise::Supervisor;
@@ -103,6 +104,8 @@ pub struct App {
     command_rx: CommandReceiver,
 
     output_choice: OutputChoice,
+    /// Control-thread output-open diagnostics, including later engine reopens.
+    output_notes: std::sync::mpsc::Receiver<String>,
     registry: DecoderRegistry,
 
     /// The virtual clock, when the null output is in use (`--null` headless or
@@ -214,26 +217,6 @@ fn source_is_dead(source: &TrackSource) -> bool {
     }
 }
 
-/// Creates the output device and optional null clock for the given choice.
-///
-/// This runs on the thread that afterwards creates the window (see
-/// [`crate::run`]), so on Windows nothing here may initialise COM on *this*
-/// thread: `winit` calls `OleInitialize` for drag and drop when it creates the
-/// window and panics with `RPC_E_CHANGED_MODE` if the thread is already in the
-/// multi-threaded apartment. `rustamp_output::default_output` guarantees that
-/// (backend probe and WASAPI endpoint both live on their own threads); see its
-/// "COM apartment" section before putting any device work in front of the
-/// window.
-fn create_output(choice: OutputChoice) -> (Box<dyn OutputDevice>, Option<NullClock>) {
-    match choice {
-        OutputChoice::Null | OutputChoice::NoAudio => {
-            let (output, clock) = NullOutput::pair();
-            (Box::new(output), Some(clock))
-        }
-        OutputChoice::Default => (default_output(), None),
-    }
-}
-
 /// Maps the persisted configuration mode to the audio engine's mode.
 fn replaygain_mode_to_audio(
     mode: rustamp_core::config::ReplayGainMode,
@@ -268,14 +251,14 @@ impl App {
         let events = bus.subscribe();
         let (commands, command_rx) = command_channel();
 
-        let (output, clock) = create_output(options.output);
+        let output = create_output(options.output, options.config.audio.output_mode);
 
         let cfg = EngineConfig {
             volume: options.volume,
             balance: options.config.audio.balance,
             ..EngineConfig::default()
         };
-        let mut engine = Engine::new(registry.clone(), output, bus.clone(), cfg)?;
+        let mut engine = Engine::new(registry.clone(), output.device, bus.clone(), cfg)?;
         // `Engine::new` initialises its gain from the config but reports
         // `volume: 255, balance: 0` in `PlayerState` (an engine-side
         // inconsistency; see the findings). Re-assert the configured values so
@@ -343,8 +326,9 @@ impl App {
             commands,
             command_rx,
             output_choice: options.output,
+            output_notes: output.notes,
             registry,
-            clock,
+            clock: output.clock,
             started: Instant::now(),
             seconds: options.seconds,
             last_null_tick: Instant::now(),
@@ -499,7 +483,7 @@ impl App {
     /// Preserves the queue, current track index, volume, balance, equalizer
     /// settings, replaygain, limiter, shuffle, and repeat modes.
     pub fn recreate_engine(&mut self) -> Result<()> {
-        let (output, clock) = create_output(self.output_choice);
+        let output = create_output(self.output_choice, self.config.audio.output_mode);
         let queue = self.engine.queue().to_vec();
         let current_index = self.engine.current_index();
         let volume = self.engine.volume();
@@ -517,7 +501,8 @@ impl App {
             balance,
             ..EngineConfig::default()
         };
-        let mut new_engine = Engine::new(self.registry.clone(), output, self.bus.clone(), cfg)?;
+        let mut new_engine =
+            Engine::new(self.registry.clone(), output.device, self.bus.clone(), cfg)?;
         new_engine.set_volume(volume)?;
         new_engine.set_balance(balance)?;
         new_engine.set_eq(eq);
@@ -533,7 +518,10 @@ impl App {
         }
 
         self.engine = new_engine;
-        self.clock = clock;
+        // Do not lose a pending diagnostic from the previous device.
+        self.collect_output_notes();
+        self.output_notes = output.notes;
+        self.clock = output.clock;
         Ok(())
     }
 
@@ -577,12 +565,11 @@ impl App {
             .set_replaygain_mode(replaygain_mode_to_audio(mode));
     }
 
-    /// Remembers the output mode of the device.
+    /// Remembers the requested output mode for the next device creation.
     ///
     /// The device is opened when the player starts, so the mode applies from
-    /// the next start on. It is not written to the configuration file yet: the
-    /// player does not apply it yet, and the file must not advertise a setting
-    /// the player ignores.
+    /// the next start (or engine recreation) on, not to a running stream.
+    /// A downgrade never overwrites the saved request.
     pub fn set_output_mode(&mut self, mode: rustamp_core::config::OutputMode) {
         self.config.audio.output_mode = mode;
     }
@@ -896,7 +883,14 @@ impl App {
 
     /// Drains the accumulated notes (unimplemented commands, fallbacks).
     pub fn drain_notes(&mut self) -> Vec<String> {
+        self.collect_output_notes();
         std::mem::take(&mut self.notes)
+    }
+
+    fn collect_output_notes(&mut self) {
+        // Unlike repetitive unimplemented-command notes, output downgrades
+        // must not be discarded when the ordinary note budget is exhausted.
+        self.notes.extend(self.output_notes.try_iter());
     }
 
     /// Asks the app to open one of the playlist window's dialogs (S06 §4).
@@ -2560,6 +2554,27 @@ mod tests {
             seconds: None,
         };
         (App::with_registry(options, registry()).unwrap(), dir)
+    }
+
+    #[test]
+    fn output_open_notes_reach_the_presenter_without_erasing_the_saved_request() {
+        let (mut app, _dir) = app_with_file(None);
+        app.set_output_mode(rustamp_core::config::OutputMode::Exclusive);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.output_notes = rx;
+        // Exercise diagnostic transport only, not a simulated exclusive open.
+        let diagnostic =
+            "Exclusive audio output was refused; using WASAPI shared mode: endpoint busy";
+        tx.send(diagnostic.to_owned()).unwrap();
+        for _ in 0..MAX_NOTES {
+            app.note("ordinary note".into());
+        }
+        app.recreate_engine().unwrap();
+        assert!(app.drain_notes().iter().any(|note| note == diagnostic));
+        assert_eq!(
+            app.current_config().audio.output_mode,
+            rustamp_core::config::OutputMode::Exclusive
+        );
     }
 
     #[test]
