@@ -107,6 +107,39 @@
 //! that does not exist is an error ([`Error::NotFound`]) rather than an empty
 //! report.
 //!
+//! ## Removing dead entries
+//!
+//! [`Library::remove_missing`] drops the rows whose file is gone, without a
+//! full rescan: it walks the **rows** the index holds under the registered
+//! roots and asks the file system about each path. It is the library's
+//! counterpart of the playlist's "remove dead files".
+//!
+//! The **check** is one stat per row, and it has three answers:
+//!
+//! * the path exists -> the row stays;
+//! * the path does not exist -> the row is dropped;
+//! * the path cannot be checked (a permission error, a path the system
+//!   refuses to name) -> the row **stays** and is reported.
+//!
+//! The third answer is the point of the operation. A row that cannot be
+//! checked is not a row that is known to be dead: an unreadable directory
+//! says nothing about the files below it, so dropping its rows would throw
+//! away index data over a permission that may be gone tomorrow.
+//!
+//! The **scope** is the registered roots: `remove_missing(None)` walks every
+//! registered root, `remove_missing(Some(&[id]))` only the roots with those
+//! ids. The rows of the roots that were not selected are never touched, and
+//! a row that lies outside every registered root is never touched either.
+//!
+//! The **report** ([`RemoveReport`]) says how many rows were checked, how
+//! many were removed, and which rows were kept because their file could not
+//! be checked.
+//!
+//! The deletion is one transaction, and the `track_extra` rows of a removed
+//! track go with it: the foreign key cascades. The artwork cache is not
+//! touched - it is keyed by path and checks the file's stat on every lookup,
+//! so the cover of a removed track is gone the next time it is asked for.
+//!
 //! ## Scan progress and cancellation
 //!
 //! [`Library::scan_with_progress`] is the scan for a background thread: it
@@ -247,11 +280,17 @@
 //! * The sidecar fallback looks in the directory of the track only, and
 //!   only for the names of [`SIDECAR_NAMES`]. A cover that sits further up
 //!   the tree is not found.
+//! * `remove_missing` cannot tell a deleted file from a file on a share
+//!   that is not reachable: both answer "not found". The rows of a root on
+//!   an offline drive are therefore dropped.
+//! * `remove_missing` only reaches the rows under a registered root. A row
+//!   that a scan of an unregistered path left behind is never cleaned up.
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -385,6 +424,23 @@ pub struct ScanReport {
     /// A cancelled scan reports the state it committed, so `added`,
     /// `updated` and `removed` are the changes the index really holds.
     pub cancelled: bool,
+}
+
+/// Summary returned by [`Library::remove_missing`].
+///
+/// The report says what the operation did to the index: how many rows it
+/// looked at, how many it dropped, and which rows it kept because their file
+/// could not be checked.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RemoveReport {
+    /// Rows whose file was looked for on disk.
+    pub checked: usize,
+    /// Rows whose file is gone and were dropped from the index.
+    pub removed: usize,
+    /// Rows whose file could not be checked; they were kept.
+    ///
+    /// The paths are sorted, so the list is the same for the same index.
+    pub kept_unreadable: Vec<PathBuf>,
 }
 
 /// How many considered files a scan commits in one transaction.
@@ -891,6 +947,95 @@ impl Library {
             )
             .optional()
             .map_err(map_sqlite)
+    }
+
+    // ---- removing dead entries ----
+
+    /// Drop the rows whose file is gone, under the selected roots.
+    ///
+    /// This is the library's "remove dead entries": it walks the **rows** the
+    /// index holds under the registered roots and asks the file system about
+    /// each path, so it does not need a full rescan. See the module docs for
+    /// the rule.
+    ///
+    /// `roots` selects the roots the operation works on: `None` means every
+    /// registered root, a list of root ids means those roots only (the ids
+    /// come from [`Library::roots`]). A root id that is not registered is an
+    /// error ([`Error::NotFound`]), and nothing is removed in that case.
+    ///
+    /// The rows of the roots that were not selected are never touched.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when a given root id is not registered, and the
+    /// error of the database when the deletion cannot be written.
+    pub fn remove_missing(&mut self, roots: Option<&[i64]>) -> Result<RemoveReport> {
+        let selected = self.selected_roots(roots)?;
+
+        // The rows under the selected roots. A row under two roots (nested
+        // roots) is looked at once.
+        let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
+        for root in &selected {
+            for (path, _) in self.rows_under(&root.path)? {
+                candidates.insert(path);
+            }
+        }
+
+        let mut gone: Vec<PathBuf> = Vec::new();
+        let mut kept_unreadable: Vec<PathBuf> = Vec::new();
+        for path in &candidates {
+            match fs::metadata(path) {
+                // The file is there: the row stays.
+                Ok(_) => {}
+                // The file is gone: the row is dropped.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    gone.push(path.clone());
+                }
+                // The file could not be checked: the row stays, and the
+                // caller learns which rows these are.
+                Err(_) => kept_unreadable.push(path.clone()),
+            }
+        }
+
+        let removed = self.delete_paths(&gone)?;
+        Ok(RemoveReport {
+            checked: candidates.len(),
+            removed,
+            kept_unreadable,
+        })
+    }
+
+    /// The roots an operation works on: the given ids, or every registered
+    /// root when no ids are given.
+    fn selected_roots(&self, roots: Option<&[i64]>) -> Result<Vec<Root>> {
+        let Some(ids) = roots else {
+            return self.roots();
+        };
+        let mut selected = Vec::with_capacity(ids.len());
+        for id in ids {
+            let root = self
+                .root_by_id(*id)?
+                .ok_or_else(|| Error::NotFound(format!("root {id}")))?;
+            selected.push(root);
+        }
+        Ok(selected)
+    }
+
+    /// Delete the rows with the given paths, in one transaction.
+    ///
+    /// The paths are unique in the index, so every path is exactly one row.
+    /// The `track_extra` rows of a deleted track go with it: the foreign key
+    /// cascades.
+    fn delete_paths(&mut self, paths: &[PathBuf]) -> Result<usize> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction().map_err(map_sqlite)?;
+        for path in paths {
+            delete_path(&tx, path)?;
+        }
+        tx.commit().map_err(map_sqlite)?;
+        Ok(paths.len())
     }
 
     // ---- internals ----
@@ -2742,5 +2887,226 @@ mod tests {
         assert_eq!(report.scanned, 0);
         assert_eq!(report.added, 0);
         assert_eq!(lib.count().unwrap(), 0);
+    }
+
+    // ---- removing dead entries ----
+
+    #[test]
+    fn remove_missing_drops_the_row_whose_file_is_gone() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        let b = root.join("b.wav");
+        make_wav(&a);
+        make_wav(&b);
+        write_fixture_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&b, "B", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        lib.scan_root(entry.id).unwrap();
+        assert_eq!(lib.count().unwrap(), 2);
+
+        fs::remove_file(&b).unwrap();
+        let report = lib.remove_missing(None).unwrap();
+        assert_eq!(report.checked, 2, "both rows were looked at");
+        assert_eq!(report.removed, 1);
+        assert!(report.kept_unreadable.is_empty());
+
+        // The row of the file that is still there stays.
+        let rows = matches(&lib, &Query::default());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, a);
+        assert_eq!(rows[0].metadata.title.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn remove_missing_keeps_the_rows_whose_file_is_there() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_fixture_tags(&a, "A", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        lib.scan_root(entry.id).unwrap();
+
+        let report = lib.remove_missing(None).unwrap();
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.removed, 0);
+        assert!(report.kept_unreadable.is_empty());
+        assert_eq!(lib.count().unwrap(), 1);
+        assert_eq!(only_row(&lib).metadata.title.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn remove_missing_leaves_the_other_roots_alone() {
+        let dir = TempDir::new().unwrap();
+        let root_a = dir.path().join("a");
+        let root_b = dir.path().join("b");
+        fs::create_dir(&root_a).unwrap();
+        fs::create_dir(&root_b).unwrap();
+        let a = root_a.join("a.wav");
+        let b = root_b.join("b.wav");
+        make_wav(&a);
+        make_wav(&b);
+        write_fixture_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&b, "B", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry_a = lib.add_root(&root_a).unwrap();
+        let entry_b = lib.add_root(&root_b).unwrap();
+        lib.scan_root(entry_a.id).unwrap();
+        lib.scan_root(entry_b.id).unwrap();
+        assert_eq!(lib.count().unwrap(), 2);
+
+        // Only the chosen root is walked: the row of the other root is not
+        // even looked at.
+        fs::remove_file(&a).unwrap();
+        let report = lib.remove_missing(Some(&[entry_a.id])).unwrap();
+        assert_eq!(report.checked, 1, "only the rows of the chosen root");
+        assert_eq!(report.removed, 1);
+        assert_eq!(lib.count().unwrap(), 1);
+        assert_eq!(only_row(&lib).path, b);
+
+        // Without a choice every root is walked.
+        fs::remove_file(&b).unwrap();
+        let report = lib.remove_missing(None).unwrap();
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.removed, 1);
+        assert_eq!(lib.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_missing_keeps_a_row_whose_path_cannot_be_checked() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_fixture_tags(&a, "A", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        lib.scan_root(entry.id).unwrap();
+
+        // A row whose path the system refuses to name: the check fails with
+        // something else than "not found", so the row must not be dropped.
+        let odd = root.join("odd\u{0}name.wav");
+        lib.conn
+            .execute(
+                "INSERT INTO tracks (path, title) VALUES (?1, ?2)",
+                rusqlite::params![odd.to_string_lossy().to_string(), "Odd"],
+            )
+            .unwrap();
+
+        let report = lib.remove_missing(None).unwrap();
+        assert_eq!(report.checked, 2);
+        assert_eq!(
+            report.removed, 0,
+            "a row that cannot be checked is not dead"
+        );
+        assert_eq!(report.kept_unreadable, vec![odd.clone()]);
+        assert_eq!(
+            lib.count().unwrap(),
+            2,
+            "the row that cannot be checked stays"
+        );
+    }
+
+    #[test]
+    fn remove_missing_drops_the_extras_with_the_track() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        let mut md = TrackMetadata {
+            title: Some("A".to_owned()),
+            ..Default::default()
+        };
+        // A key the WAV writer round-trips (see `extras_round_trip`).
+        md.extra
+            .insert("REPLAYGAIN_TRACK_GAIN".to_owned(), "1.50 dB".to_owned());
+        rustamp_meta::write_tags(&a, &md).unwrap();
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        lib.scan_root(entry.id).unwrap();
+        assert_eq!(lib.count().unwrap(), 1);
+        assert_eq!(extra_rows(&lib), 1);
+
+        fs::remove_file(&a).unwrap();
+        let report = lib.remove_missing(None).unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(lib.count().unwrap(), 0);
+        assert_eq!(extra_rows(&lib), 0, "the extra rows cascade with the track");
+    }
+
+    #[test]
+    fn remove_missing_with_an_unknown_root_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_fixture_tags(&a, "A", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        lib.scan_root(entry.id).unwrap();
+
+        let error = lib.remove_missing(Some(&[entry.id + 1])).unwrap_err();
+        assert!(matches!(error, Error::NotFound(_)), "{error:?}");
+        assert_eq!(lib.count().unwrap(), 1, "nothing was removed");
+    }
+
+    #[test]
+    fn remove_missing_on_an_empty_library_does_nothing() {
+        let mut lib = Library::in_memory().unwrap();
+        let report = lib.remove_missing(None).unwrap();
+        assert_eq!(report, RemoveReport::default());
+        assert_eq!(lib.count().unwrap(), 0);
+    }
+
+    /// A PNG of one colour, as a sidecar cover.
+    fn png_cover() -> Vec<u8> {
+        let picture = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(picture)
+            .write_to(&mut io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("encode the picture");
+        out
+    }
+
+    #[test]
+    fn remove_missing_does_not_touch_the_artwork_cache() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_fixture_tags(&a, "A", "X", "Al");
+        // A sidecar cover next to the track: the cache answers from it.
+        fs::write(root.join("cover.png"), png_cover()).unwrap();
+
+        let cache = ArtworkCache::new();
+        assert!(
+            cache.get(&a).unwrap().is_some(),
+            "the sidecar cover is cached"
+        );
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        lib.scan_root(entry.id).unwrap();
+        fs::remove_file(&a).unwrap();
+        let report = lib.remove_missing(None).unwrap();
+        assert_eq!(report.removed, 1);
+
+        // The cache belongs to the caller: the operation did not touch it.
+        assert_eq!(cache.entry_count(), 1);
     }
 }
