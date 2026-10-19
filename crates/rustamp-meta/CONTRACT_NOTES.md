@@ -57,6 +57,33 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   entries are written best-effort (only keys that map to the target format).
   Clearing a field is not supported yet; a tag editor (S06 era) will need an
   explicit "remove" form.
+- **Writing is atomic.** The new file is built next to the original (same
+  directory, so the rename stays on one volume) and renamed over it. A
+  failed or interrupted write therefore leaves the original byte for byte
+  as it was; there is no half-written media file. The replacement keeps the
+  permissions of the original. A symlinked file is written *through*: the
+  link stays a link and the file it points at is replaced.
+- **Only the primary tag is written.** A file may carry more than one tag
+  (an MP3 with ID3v2 and ID3v1). The write replaces the format's primary
+  tag and leaves the other tags byte for byte as they were; the old code
+  rewrote all of them.
+- **Unknown frames and keys.** "Unknown" means the tag format allows it but
+  this crate has no field for it: a `TXXX` frame with a private
+  description, a FLAC `CUSTOM_KEY`, a freeform MP4 atom. ID3v2 and MP4 keep
+  them — `lofty` holds them next to the generic tag, and the write path
+  turns its `preserve_format_specific_items` option on so that they do not
+  depend on the global state. The Vorbis family keeps them because the
+  *concrete* tag is written, not the generic one (the generic model cannot
+  represent a key it does not know, so a write used to drop every
+  `CUSTOM_KEY` of a FLAC file). APEv2 has no such place in `lofty`'s generic
+  model: its unknown items are dropped. The cover art of a FLAC file lives
+  in its own metadata block and is kept as well.
+- **What a write replaces.** The tag container is rewritten, nothing else:
+  the audio frames are copied byte for byte (the Ogg writer is the
+  exception — it rewrites the page headers, so the sequence numbers and
+  their checksums change, but the audio packets do not). An ID3v2 tag is
+  written as ID3v2.4 with 1 KiB of padding, whatever the file held before.
+  A FLAC file without a padding block gets one.
 
 ## Requests
 
@@ -108,6 +135,39 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   both outcomes). Making those errors needs a decision on strict parsing
   (`ParsingMode::Strict`) and a "report skipped items" API; no spec asks for it.
 - Round trip losses: total/track strings are numbers only.
+
+## Audit (tag writing)
+
+- **The write is atomic.** The new file is built next to the original and
+  renamed over it (`src/atomic.rs`). Before, `lofty` wrote into the file in
+  place: a write that failed half-way left a damaged media file. A
+  read-only file cannot be written (Windows refuses to replace it), and the
+  original stays as it was.
+- **Only the primary tag is written.** Before, every tag of the file was
+  rewritten, so an ID3v1 tag next to an ID3v2 tag was rewritten as well.
+  Now the second tag stays byte for byte as it was.
+- **The Vorbis family keeps its unknown keys.** Before, the write went
+  through `lofty`'s generic tag model, which drops every key it does not
+  know: a FLAC file's own `CUSTOM_KEY` was lost on every write. The
+  concrete Vorbis comments are written now, so the key survives.
+- **The FLAC cover art survives.** The concrete comments alone would have
+  dropped it — a FLAC file keeps its pictures in their own metadata block —
+  so the whole FLAC file is written, comments and picture blocks.
+- **The ID3v2 unknown frames survive.** They were already kept (the
+  generic model holds them in a companion tag), but only while `lofty`'s
+  global `preserve_format_specific_items` option is on. The write path
+  turns it on for the calling thread, so the behaviour does not depend on
+  what the rest of the process did to the global options. The option is
+  thread-local and `rustamp-meta` is the only crate in the workspace that
+  uses `lofty`.
+- **Still lost, by documented design:** the unknown items of an APEv2 tag
+  (`lofty`'s generic model has no place for them), and the ID3v2 tag of a
+  FLAC file (the format does not allow it; the copy in the file is left
+  alone).
+- **Not supported yet:** clearing a field (a tag editor needs an explicit
+  "remove" form), and writing a tag into a file that has none of the
+  format's primary tag type but has a secondary one (an MP3 with only an
+  ID3v1 tag gets an ID3v2 tag, the ID3v1 tag stays).
 
 ## Audit (card E4 — ReplayGain)
 

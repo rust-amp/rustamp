@@ -104,7 +104,7 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `crossbeam-channel` | Cross-thread channels | core, ipc |
 | `toml` | Config serialization and I/O | app; core (dev) |
 | `png` | Golden-image I/O | testkit |
-| `tempfile` | Temporary test files/directories | app, audio, decoders, meta, skin, testkit (dev) |
+| `tempfile` | Temporary files: the temporary file of the atomic tag write, and the test files of the crates below | meta; app, audio, decoders, skin, testkit (dev) |
 | `windows` | Windows API bindings | ipc, platform, plughost, xtask (Windows only) |
 | `rtrb` | Lock-free audio ring | audio |
 | `cpal` | Cross-platform audio output; loopback capture | output; app (dev) |
