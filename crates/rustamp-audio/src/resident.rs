@@ -51,6 +51,44 @@
 //! waits for the `Pong` deadline, which the per-`read` bound already covers
 //! much earlier.
 //!
+//! # Restart policy (RFC 0006 §8)
+//!
+//! RFC 0006 §8 puts the restart policy on the engine side: "Restart policy
+//! (retry once, then fail the track) is engine policy, not contract." The
+//! engine's policy is [`RestartingDecoder`]: a resident that fails mid-track
+//! is **restarted once** — a fresh helper is spawned, the same source is
+//! reopened and the track continues at the last position the engine had taken
+//! from it. A second failure ends the track loudly with the existing
+//! `Decode` error; the player is never the thing that fails.
+//!
+//! Three points are the engine's own, and the RFC does not decide them:
+//!
+//! * **Where the track resumes.** The RFC says "retry once" but not where.
+//!   The narrow reading is a retry of the *helper*, not of the track: the
+//!   track continues at the last known position, so no audio is replayed and
+//!   none is skipped. That position is the number of frames the engine took
+//!   from the resident, and the wire quantizes it to whole milliseconds (the
+//!   same tolerance as any seek).
+//! * **What counts as a failure worth a retry.** The RFC names the death
+//!   signals ("a missed `Pong` or an unexpected close"), but the framework
+//!   reports a dead helper, a wedged helper and a helper that reported a
+//!   decode failure through one and the same channel, so the engine cannot
+//!   tell them apart without a change to the media-host contract. The policy
+//!   therefore retries *any* mid-track failure of the resident once — which
+//!   is exactly "try once more, then drop the track".
+//! * **What is lost.** Nothing that was audible: the frames the dead helper
+//!   had produced but not yet delivered are re-produced by the restarted
+//!   helper, because the resume position is the last position the *engine*
+//!   had taken. The only imprecision is the millisecond the wire quantizes
+//!   the resume to (the same tolerance as any seek). A resident that cannot
+//!   seek is therefore never restarted after it delivered audio — a restart
+//!   would replay the track from its start.
+//!
+//! The policy covers a failure *while the track plays*. A failure during a
+//! seek is the engine's seek path (it reports the failed seek and keeps
+//! playing); the next read then triggers the restart, which resumes at the
+//! position before the seek.
+//!
 //! # Where the two-process path is proven
 //!
 //! The tests in this module drive the adapter over an in-process control pair.
@@ -166,6 +204,14 @@ pub const DEFAULT_RESIDENT_LIVENESS: Liveness = Liveness {
     timeout: Duration::from_secs(30),
 };
 
+/// How many times a failed resident may be restarted within one track.
+///
+/// RFC 0006 §8: "Restart policy (retry once, then fail the track) is engine
+/// policy, not contract." The RFC's own value is one; the engine keeps it as
+/// a policy in [`ResidentConfig`] so a caller can tighten it (zero switches
+/// the restart off) without touching the contract.
+pub const DEFAULT_RESIDENT_RESTARTS: u32 = 1;
+
 /// File extensions the resident factory claims, mirroring what the symphonia
 /// resident behind the helper serves today (MP3/FLAC/Vorbis/WAV/AIFF/CAF/
 /// AAC/ALAC/MKA).
@@ -196,6 +242,9 @@ pub struct ResidentConfig {
     /// `Hello`/`Ping` liveness the engine supervises the helper with
     /// (RFC 0006 §8). See [`DEFAULT_RESIDENT_LIVENESS`].
     pub liveness: Liveness,
+    /// Restarts a failed resident may spend in one track (RFC 0006 §8). See
+    /// [`DEFAULT_RESIDENT_RESTARTS`].
+    pub restarts: u32,
 }
 
 impl ResidentConfig {
@@ -207,6 +256,7 @@ impl ResidentConfig {
             read_timeout: DEFAULT_READ_TIMEOUT,
             seek_timeout: DEFAULT_SEEK_TIMEOUT,
             liveness: DEFAULT_RESIDENT_LIVENESS,
+            restarts: DEFAULT_RESIDENT_RESTARTS,
         }
     }
 
@@ -228,6 +278,14 @@ impl ResidentConfig {
     /// with. The default is [`DEFAULT_RESIDENT_LIVENESS`].
     pub fn with_liveness(mut self, liveness: Liveness) -> Self {
         self.liveness = liveness;
+        self
+    }
+
+    /// Override the restart budget of one track (RFC 0006 §8). The default
+    /// is [`DEFAULT_RESIDENT_RESTARTS`]; zero switches the restart off, so a
+    /// failed resident ends the track at once.
+    pub fn with_restarts(mut self, restarts: u32) -> Self {
+        self.restarts = restarts;
         self
     }
 }
@@ -568,6 +626,226 @@ impl Decoder for ProcessDecoder {
     }
 }
 
+/// Reopens a resident for the same source after a failure.
+///
+/// RFC 0006 §8 puts the restart policy on the engine side, and the engine
+/// spawns the helper: the adapter knows *that* a helper has to come back,
+/// but not *how* one is spawned. This is that seam. The production
+/// implementation spawns a fresh helper process; the tests open a fresh
+/// in-process session.
+pub trait ResidentReopen: Send {
+    /// Open a fresh decoder for the same source, at its start.
+    ///
+    /// The caller seeks it to the position the track had reached; a failure
+    /// here ends the track.
+    fn reopen(&mut self) -> CoreResult<Box<dyn Decoder>>;
+}
+
+/// A resident decoder that restarts its helper once per track
+/// (RFC 0006 §8).
+///
+/// The engine's restart policy: "retry once, then fail the track". A
+/// resident that fails mid-track is replaced by a fresh one — the helper is
+/// spawned again, the same source is reopened and the track continues at the
+/// last position the engine had taken from it. A second failure ends the
+/// track loudly; the player never fails with it.
+///
+/// The wrapper is deliberately thin: every other call goes to the decoder in
+/// use, so the engine keeps driving a single [`Decoder`] and there is no
+/// second decode path (RFC 0006 §10.4).
+pub struct RestartingDecoder {
+    decoder: Box<dyn Decoder>,
+    reopen: Box<dyn ResidentReopen>,
+    /// Frames the engine took from the resident since the last seek: the
+    /// position a restarted helper has to resume at.
+    position_frames: u64,
+    /// Damage the previous helpers reported. The counter is cumulative over
+    /// the track (RFC 0002 C1), so a restart adds to it instead of resetting
+    /// it.
+    skipped_base: u64,
+    /// Restarts this track has spent.
+    restarts: u32,
+    /// Restarts this track may spend.
+    budget: u32,
+}
+
+impl RestartingDecoder {
+    /// Wrap `decoder`; `reopen` brings the helper back and `restarts` is the
+    /// number of restarts one track may spend.
+    pub fn new(decoder: Box<dyn Decoder>, reopen: Box<dyn ResidentReopen>, restarts: u32) -> Self {
+        RestartingDecoder {
+            decoder,
+            reopen,
+            position_frames: 0,
+            skipped_base: 0,
+            restarts: 0,
+            budget: restarts,
+        }
+    }
+
+    /// The frames a duration names in a spec.
+    fn frames_at(spec: AudioSpec, at: Duration) -> u64 {
+        (at.as_secs_f64() * f64::from(spec.sample_rate.max(1))).round() as u64
+    }
+
+    /// Whether a failure may still be retried.
+    ///
+    /// The budget is per track, so the retry never loops. A resident that
+    /// cannot seek is not restarted after it delivered audio: the fresh
+    /// helper would replay the track from its start.
+    fn can_restart(&self) -> bool {
+        self.restarts < self.budget && (self.position_frames == 0 || self.decoder.is_seekable())
+    }
+
+    /// Restart the helper and reopen the same source at the last known
+    /// position.
+    ///
+    /// The failure that triggered the restart is part of the message, so the
+    /// report names both the cause and the restart.
+    fn restart(&mut self, cause: &CoreError) -> CoreResult<()> {
+        self.restarts += 1;
+        let spec = self.decoder.spec();
+        let mut fresh = self
+            .reopen
+            .reopen()
+            .map_err(|error| restart_failure(cause, &error))?;
+        if fresh.spec() != spec {
+            // The engine adopted the old format when it opened the track; a
+            // reopened helper that reports another one would be decoded with
+            // the wrong converter, so the track ends instead.
+            return Err(CoreError::Decode(
+                "resident restart: the reopened helper reports another format".into(),
+            ));
+        }
+        if self.position_frames > 0 {
+            let target = Duration::from_millis(resume_ms(spec, self.position_frames));
+            let reached = fresh
+                .seek(target)
+                .map_err(|error| restart_failure(cause, &error))?;
+            // The wire quantizes the resume to whole milliseconds, so the
+            // reached position is the truth from here on.
+            self.position_frames = Self::frames_at(spec, reached);
+        }
+        self.skipped_base += self.decoder.skipped_packets();
+        self.decoder = fresh;
+        Ok(())
+    }
+}
+
+impl Decoder for RestartingDecoder {
+    fn spec(&self) -> AudioSpec {
+        self.decoder.spec()
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> CoreResult<usize> {
+        match self.decoder.read(out) {
+            Ok(frames) => {
+                self.position_frames += frames as u64;
+                Ok(frames)
+            }
+            // A format change is a transition, not a failure: the resident is
+            // alive and the engine adopts the new format (RFC 0002 C3).
+            Err(error @ CoreError::FormatChanged { .. }) => Err(error),
+            Err(error) => {
+                if !self.can_restart() {
+                    return Err(error);
+                }
+                self.restart(&error)?;
+                match self.decoder.read(out) {
+                    Ok(frames) => {
+                        self.position_frames += frames as u64;
+                        Ok(frames)
+                    }
+                    // The second failure ends the track: the budget is spent
+                    // and the retry never loops.
+                    Err(second) => Err(CoreError::Decode(format!(
+                        "resident restart did not save the track: {}",
+                        error_text(&second)
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn seek(&mut self, to: Duration) -> CoreResult<Duration> {
+        let reached = self.decoder.seek(to)?;
+        self.position_frames = Self::frames_at(self.decoder.spec(), reached);
+        Ok(reached)
+    }
+
+    fn duration(&self) -> Option<Duration> {
+        self.decoder.duration()
+    }
+
+    fn metadata(&self) -> rustamp_core::meta::TrackMetadata {
+        self.decoder.metadata()
+    }
+
+    fn stream_info(&self) -> StreamInfo {
+        self.decoder.stream_info()
+    }
+
+    fn is_seekable(&self) -> bool {
+        self.decoder.is_seekable()
+    }
+
+    fn skipped_packets(&self) -> u64 {
+        self.skipped_base + self.decoder.skipped_packets()
+    }
+}
+
+/// The wire position of a frame count, rounded to the nearest millisecond.
+///
+/// The wire speaks whole milliseconds, so a resume lands within half a
+/// millisecond of the position the engine had reached — the same tolerance as
+/// any seek.
+fn resume_ms(spec: AudioSpec, frames: u64) -> u64 {
+    let rate = u64::from(spec.sample_rate.max(1));
+    (frames * 1000 + rate / 2) / rate
+}
+
+/// The message of a core error, without the `decode error: ` prefix.
+fn error_text(error: &CoreError) -> String {
+    match error {
+        CoreError::Decode(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+/// A failed restart as a loud decode error: the track ends, the player does
+/// not (RFC 0006 §8).
+fn restart_failure(cause: &CoreError, error: &CoreError) -> CoreError {
+    CoreError::Decode(format!(
+        "resident restart failed after {}: {}",
+        error_text(cause),
+        error_text(error)
+    ))
+}
+
+/// Reopens a decoder resident in a fresh helper process (RFC 0006 §8).
+#[cfg(windows)]
+struct ProcessReopen {
+    config: ResidentConfig,
+    location: MediaLocationWire,
+}
+
+#[cfg(windows)]
+impl ResidentReopen for ProcessReopen {
+    fn reopen(&mut self) -> CoreResult<Box<dyn Decoder>> {
+        use rustamp_mediahost::decoder::DecoderProcess;
+
+        let process = DecoderProcess::spawn(
+            &self.config.helper,
+            self.location.clone(),
+            self.config.prefetch_frames,
+            self.config.liveness,
+        )
+        .map_err(|error| CoreError::Decode(format!("resident restart: {error}")))?;
+        let decoder =
+            ProcessDecoder::new(process, self.config.read_timeout, self.config.seek_timeout)?;
+        Ok(Box::new(decoder))
+    }
+}
+
 /// Opt-in [`DecoderFactory`] that opens every track through the helper.
 ///
 /// Registering this factory is what selects the resident: a registry without
@@ -634,7 +912,7 @@ impl DecoderFactory for ResidentFactory {
             }
             let process = DecoderProcess::spawn(
                 &self.config.helper,
-                location,
+                location.clone(),
                 self.config.prefetch_frames,
                 self.config.liveness,
             )
@@ -649,11 +927,19 @@ impl DecoderFactory for ResidentFactory {
                 }
                 other => CoreError::Decode(other.to_string()),
             })?;
-            Ok(Box::new(ProcessDecoder::new(
-                process,
-                self.config.read_timeout,
-                self.config.seek_timeout,
-            )?))
+            let decoder =
+                ProcessDecoder::new(process, self.config.read_timeout, self.config.seek_timeout)?;
+            // The restart policy (RFC 0006 §8): a helper that fails mid-track
+            // comes back once, and the track continues where it stopped.
+            let reopen = ProcessReopen {
+                config: self.config.clone(),
+                location,
+            };
+            Ok(Box::new(RestartingDecoder::new(
+                Box::new(decoder),
+                Box::new(reopen),
+                self.config.restarts,
+            )))
         }
     }
 }
@@ -1346,6 +1632,294 @@ mod tests {
             Err(error) => panic!("zero prefetch must not open, got {error}"),
             Ok(_) => panic!("zero prefetch must not open"),
         }
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    //! The restart policy (RFC 0006 §8) on its own: a scripted decoder and a
+    //! scripted reopener, no media host, no process, no ring. The engine level
+    //! proof — a real resident that dies mid-track — is in `tests/resident.rs`.
+
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    const SPEC: AudioSpec = AudioSpec::new(1000, 1);
+
+    /// What the scripted residents did.
+    #[derive(Default)]
+    struct Log {
+        /// How many residents were opened.
+        opens: usize,
+        /// The positions the residents were seeked to, in order.
+        seeks: Vec<Duration>,
+    }
+
+    /// What a scripted resident does.
+    #[derive(Clone, Copy)]
+    enum Script {
+        /// Serves `frames` frames and then fails.
+        Die(u64),
+        /// Serves `frames` frames and then fails, and cannot be seeked: a
+        /// restart would replay the track from its start.
+        DieUnseekable(u64),
+        /// Changes the format once and then serves.
+        Format,
+        /// Serves forever.
+        Live,
+    }
+
+    /// A decoder that follows a [`Script`].
+    struct Scripted {
+        log: Arc<Mutex<Log>>,
+        script: Script,
+        /// Frames served so far.
+        served: u64,
+        changed: bool,
+    }
+
+    impl Scripted {
+        fn new(log: Arc<Mutex<Log>>, script: Script) -> Self {
+            log.lock().expect("the log is not poisoned").opens += 1;
+            Scripted {
+                log,
+                script,
+                served: 0,
+                changed: false,
+            }
+        }
+    }
+
+    impl Decoder for Scripted {
+        fn spec(&self) -> AudioSpec {
+            if self.changed {
+                AudioSpec::new(2000, 1)
+            } else {
+                SPEC
+            }
+        }
+
+        fn read(&mut self, out: &mut [f32]) -> CoreResult<usize> {
+            match self.script {
+                Script::Format if !self.changed => {
+                    self.changed = true;
+                    return Err(CoreError::FormatChanged {
+                        from: SPEC,
+                        to: AudioSpec::new(2000, 1),
+                    });
+                }
+                Script::Die(until) | Script::DieUnseekable(until) if self.served >= until => {
+                    return Err(CoreError::Decode("the scripted resident died".into()));
+                }
+                _ => {}
+            }
+            let left = match self.script {
+                Script::Die(until) | Script::DieUnseekable(until) => {
+                    (until - self.served).min(out.len() as u64) as usize
+                }
+                _ => out.len(),
+            };
+            for sample in out[..left].iter_mut() {
+                *sample = self.served as f32;
+                self.served += 1;
+            }
+            Ok(left)
+        }
+
+        fn seek(&mut self, to: Duration) -> CoreResult<Duration> {
+            self.log
+                .lock()
+                .expect("the log is not poisoned")
+                .seeks
+                .push(to);
+            self.served = RestartingDecoder::frames_at(SPEC, to);
+            Ok(to)
+        }
+
+        fn duration(&self) -> Option<Duration> {
+            Some(SPEC.duration_of(self.served))
+        }
+
+        fn is_seekable(&self) -> bool {
+            !matches!(self.script, Script::DieUnseekable(_))
+        }
+    }
+
+    /// A reopener that hands out scripted residents.
+    struct Reopen {
+        log: Arc<Mutex<Log>>,
+        script: Script,
+    }
+
+    impl ResidentReopen for Reopen {
+        fn reopen(&mut self) -> CoreResult<Box<dyn Decoder>> {
+            Ok(Box::new(Scripted::new(self.log.clone(), self.script)))
+        }
+    }
+
+    /// A decoder that fails at `until`, wrapped in the restart policy.
+    fn scripted(
+        log: &Arc<Mutex<Log>>,
+        first: Script,
+        again: Script,
+        restarts: u32,
+    ) -> RestartingDecoder {
+        RestartingDecoder::new(
+            Box::new(Scripted::new(log.clone(), first)),
+            Box::new(Reopen {
+                log: log.clone(),
+                script: again,
+            }),
+            restarts,
+        )
+    }
+
+    #[test]
+    fn a_failed_resident_is_restarted_once_at_the_last_known_position() {
+        // RFC 0006 §8: "retry once, then fail the track". The retry resumes
+        // at the last position the engine had taken from the resident.
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut decoder = scripted(&log, Script::Die(100), Script::Live, 1);
+        let mut buf = [0.0f32; 10];
+        for _ in 0..10 {
+            assert_eq!(decoder.read(&mut buf).expect("the resident serves"), 10);
+        }
+        // The next read hits the failure: the helper comes back and the track
+        // continues where it stopped.
+        assert_eq!(
+            decoder
+                .read(&mut buf)
+                .expect("the restarted resident serves"),
+            10
+        );
+        let log = log.lock().expect("the log is not poisoned");
+        assert_eq!(log.opens, 2, "the helper must come back exactly once");
+        assert_eq!(
+            log.seeks,
+            vec![Duration::from_millis(100)],
+            "the retry must resume at the last known position"
+        );
+    }
+
+    #[test]
+    fn a_second_failure_fails_the_track_and_the_retry_never_loops() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut decoder = scripted(&log, Script::Die(100), Script::Die(0), 1);
+        let mut buf = [0.0f32; 10];
+        for _ in 0..10 {
+            decoder.read(&mut buf).expect("the resident serves");
+        }
+        // The retry fails as well: the track ends loudly, and the policy does
+        // not spend a second restart.
+        let error = decoder
+            .read(&mut buf)
+            .expect_err("the second failure must end the track");
+        assert!(
+            matches!(&error, CoreError::Decode(message) if message.contains("resident restart")),
+            "{error}"
+        );
+        let log = log.lock().expect("the log is not poisoned");
+        assert_eq!(log.opens, 2, "the retry must not loop");
+    }
+
+    #[test]
+    fn a_healthy_resident_is_never_restarted() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut decoder = scripted(&log, Script::Live, Script::Live, 1);
+        let mut buf = [0.0f32; 10];
+        for _ in 0..5 {
+            assert_eq!(decoder.read(&mut buf).expect("the resident serves"), 10);
+        }
+        let log = log.lock().expect("the log is not poisoned");
+        assert_eq!(log.opens, 1, "a healthy resident is never replaced");
+        assert!(log.seeks.is_empty(), "a healthy resident is never seeked");
+    }
+
+    #[test]
+    fn a_resident_that_cannot_seek_is_not_restarted_after_it_delivered_audio() {
+        // A restart would replay the track from its start, so the track ends
+        // instead: the policy never trades a repetition for a gap.
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut decoder = scripted(&log, Script::DieUnseekable(100), Script::Live, 1);
+        let mut buf = [0.0f32; 10];
+        for _ in 0..10 {
+            decoder.read(&mut buf).expect("the resident serves");
+        }
+        let error = decoder
+            .read(&mut buf)
+            .expect_err("a failed resident must fail the track");
+        assert!(
+            matches!(&error, CoreError::Decode(message) if message.contains("died")),
+            "{error}"
+        );
+        let log = log.lock().expect("the log is not poisoned");
+        assert_eq!(log.opens, 1, "an unseekable resident is never restarted");
+    }
+
+    #[test]
+    fn a_failure_before_the_first_frame_restarts_without_a_seek() {
+        // Nothing was played yet, so there is no position to resume at.
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut decoder = scripted(&log, Script::Die(0), Script::Live, 1);
+        let mut buf = [0.0f32; 10];
+        assert_eq!(
+            decoder
+                .read(&mut buf)
+                .expect("the restarted resident serves"),
+            10
+        );
+        let log = log.lock().expect("the log is not poisoned");
+        assert_eq!(log.opens, 2);
+        assert!(log.seeks.is_empty(), "there is no position to resume at");
+    }
+
+    #[test]
+    fn a_format_change_is_a_transition_and_never_restarts() {
+        // RFC 0002 C3: the engine adopts the new format and reads on.
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut decoder = scripted(&log, Script::Format, Script::Live, 1);
+        let mut buf = [0.0f32; 10];
+        let error = decoder
+            .read(&mut buf)
+            .expect_err("the format change is reported to the engine");
+        assert!(
+            matches!(&error, CoreError::FormatChanged { .. }),
+            "{error:?}"
+        );
+        let log = log.lock().expect("the log is not poisoned");
+        assert_eq!(log.opens, 1, "a format change never restarts the helper");
+    }
+
+    #[test]
+    fn a_restart_budget_of_zero_switches_the_restart_off() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut decoder = scripted(&log, Script::Die(100), Script::Live, 0);
+        let mut buf = [0.0f32; 10];
+        for _ in 0..10 {
+            decoder.read(&mut buf).expect("the resident serves");
+        }
+        let error = decoder
+            .read(&mut buf)
+            .expect_err("without a budget the failure ends the track");
+        assert!(
+            matches!(&error, CoreError::Decode(message) if message.contains("died")),
+            "{error}"
+        );
+        let log = log.lock().expect("the log is not poisoned");
+        assert_eq!(log.opens, 1, "a budget of zero never restarts");
+    }
+
+    #[test]
+    fn the_restart_budget_is_the_engine_s_own() {
+        // RFC 0006 §8: the restart policy is engine policy, not contract.
+        assert_eq!(DEFAULT_RESIDENT_RESTARTS, 1);
+        assert_eq!(
+            ResidentConfig::new(PathBuf::from("helper.exe")).restarts,
+            DEFAULT_RESIDENT_RESTARTS
+        );
+        let config = ResidentConfig::new(PathBuf::from("helper.exe")).with_restarts(0);
+        assert_eq!(config.restarts, 0);
     }
 }
 

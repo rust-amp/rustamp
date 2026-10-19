@@ -298,6 +298,12 @@ fn a_helper_that_dies_mid_stream_is_a_loud_decode_error() {
                 matches!(&error, CoreError::Decode(message) if !message.is_empty()),
                 "the death must surface as a loud decode error, got {error:?}"
             );
+            // RFC 0006 §8: the engine restarts the helper once before it gives
+            // up on the track, and the second death is what ends it.
+            assert!(
+                error.to_string().contains("resident restart"),
+                "the track must have been restarted once, got {error}"
+            );
         }
         Err(error) => {
             // The helper died before its first block could be read (a heavily
@@ -306,6 +312,10 @@ fn a_helper_that_dies_mid_stream_is_a_loud_decode_error() {
             assert!(
                 matches!(&error, CoreError::Decode(message) if !message.is_empty()),
                 "the death must surface as a loud decode error, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains("resident restart"),
+                "the track must have been restarted once, got {error}"
             );
         }
     }
