@@ -384,14 +384,14 @@ pub static SPRITES: &[SpriteDef] = &[
     def("EQ_CLOSE_BUTTON", Sheet::EqMain, 0, 116, 9, 9), // provisional: webamp; not in S01
     def("EQ_CLOSE_BUTTON_ACTIVE", Sheet::EqMain, 0, 125, 9, 9), // provisional: webamp; not in S01
     def("EQ_MAXIMIZE_BUTTON_ACTIVE_FALLBACK", Sheet::EqMain, 254, 152, 9, 9), // provisional: webamp; not in S01
-    def("EQ_ON_BUTTON", Sheet::EqMain, 10, 119, 26, 12), // S01 §3 verified
-    def("EQ_ON_BUTTON_DEPRESSED", Sheet::EqMain, 128, 119, 26, 12), // provisional: webamp; not in S01
-    def("EQ_ON_BUTTON_SELECTED", Sheet::EqMain, 69, 119, 26, 12), // S01 §3 provisional (engaged)
-    def("EQ_ON_BUTTON_SELECTED_DEPRESSED", Sheet::EqMain, 187, 119, 26, 12), // provisional: webamp; not in S01
+    def("EQ_ON_BUTTON", Sheet::EqMain, 10, 119, 25, 12), // S01 §3 round 2
+    def("EQ_ON_BUTTON_DEPRESSED", Sheet::EqMain, 128, 119, 25, 12), // S01 §3 held-states run
+    def("EQ_ON_BUTTON_SELECTED", Sheet::EqMain, 69, 119, 25, 12), // S01 §3 round 2
+    def("EQ_ON_BUTTON_SELECTED_DEPRESSED", Sheet::EqMain, 187, 119, 25, 12), // S01 §3 held-states run
     def("EQ_AUTO_BUTTON", Sheet::EqMain, 36, 119, 32, 12), // S01 §3 verified
-    def("EQ_AUTO_BUTTON_DEPRESSED", Sheet::EqMain, 154, 119, 32, 12), // provisional: webamp; not in S01
+    def("EQ_AUTO_BUTTON_DEPRESSED", Sheet::EqMain, 153, 119, 33, 12), // S01 §3 held-states run
     def("EQ_AUTO_BUTTON_SELECTED", Sheet::EqMain, 95, 119, 32, 12), // S01 §3 provisional (engaged)
-    def("EQ_AUTO_BUTTON_SELECTED_DEPRESSED", Sheet::EqMain, 213, 119, 32, 12), // provisional: webamp; not in S01
+    def("EQ_AUTO_BUTTON_SELECTED_DEPRESSED", Sheet::EqMain, 212, 119, 33, 12), // S01 §3 held-states run
     def("EQ_GRAPH_BACKGROUND", Sheet::EqMain, 0, 294, 113, 19), // S01 §3 provisional (composite with the drawn curve)
     def("EQ_GRAPH_LINE_COLORS", Sheet::EqMain, 115, 294, 1, 19), // provisional: webamp; not in S01
     def("EQ_PRESETS_BUTTON", Sheet::EqMain, 224, 164, 44, 12), // S01 §3 verified

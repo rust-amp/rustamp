@@ -73,6 +73,8 @@ pub struct MainWindowState {
     pub pressed: Option<TransportButton>,
     /// The window button currently held down, if any (S02 §7).
     pub pressed_window_button: Option<WindowButton>,
+    /// Held slider or toggle, selecting its skin's depressed sprite.
+    pub pressed_widget: Option<crate::widget::Widget>,
     /// Whether the position-bar thumb is held and drawn pressed (S02 §7).
     pub position_thumb_pressed: bool,
     /// Whether the window is focused (picks the focused title bar).
@@ -134,6 +136,7 @@ impl Default for MainWindowState {
             transport: TransportState::Stopped,
             pressed: None,
             pressed_window_button: None,
+            pressed_widget: None,
             position_thumb_pressed: false,
             title_bar_focused: true,
             windowshade: false,

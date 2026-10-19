@@ -18,6 +18,7 @@ use rustamp_skin::{Sheet, Skin, webamp};
 use crate::docking::{WindowKind, window_size};
 use crate::layout::{MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH};
 use crate::state::{MainWindowState, MonoStereo, TransportButton, TransportState, WindowButton};
+use crate::widget::Widget;
 
 /// The digit sprite names for `numbers.bmp`, indexed by digit value.
 const DIGIT_NAMES: [&str; 10] = [
@@ -245,6 +246,19 @@ fn draw_shade(
         layout.shade_position.x + offset as i32,
         layout.shade_position.y,
     );
+    if state.pressed_window_button == Some(WindowButton::Shade) {
+        let rect = layout.window_button(WindowButton::Shade);
+        blit_named(
+            canvas,
+            sheets,
+            skin,
+            "MAIN_SHADE_BUTTON_SELECTED_DEPRESSED",
+            rect.x,
+            rect.y,
+        );
+    } else {
+        draw_window_buttons(canvas, sheets, skin, layout, state);
+    }
 }
 
 fn draw_clutter_bar(
@@ -373,10 +387,11 @@ fn draw_toggles(
     layout: &MainWindowLayout,
     state: &MainWindowState,
 ) {
-    let shuffle = if state.shuffle {
-        "MAIN_SHUFFLE_BUTTON_SELECTED"
-    } else {
-        "MAIN_SHUFFLE_BUTTON"
+    let shuffle = match (state.shuffle, state.pressed_widget == Some(Widget::Shuffle)) {
+        (false, false) => "MAIN_SHUFFLE_BUTTON",
+        (false, true) => "MAIN_SHUFFLE_BUTTON_DEPRESSED",
+        (true, false) => "MAIN_SHUFFLE_BUTTON_SELECTED",
+        (true, true) => "MAIN_SHUFFLE_BUTTON_SELECTED_DEPRESSED",
     };
     blit_named(
         canvas,
@@ -386,10 +401,11 @@ fn draw_toggles(
         layout.shuffle.x,
         layout.shuffle.y,
     );
-    let repeat = if state.repeat {
-        "MAIN_REPEAT_BUTTON_SELECTED"
-    } else {
-        "MAIN_REPEAT_BUTTON"
+    let repeat = match (state.repeat, state.pressed_widget == Some(Widget::Repeat)) {
+        (false, false) => "MAIN_REPEAT_BUTTON",
+        (false, true) => "MAIN_REPEAT_BUTTON_DEPRESSED",
+        (true, false) => "MAIN_REPEAT_BUTTON_SELECTED",
+        (true, true) => "MAIN_REPEAT_BUTTON_SELECTED_DEPRESSED",
     };
     blit_named(
         canvas,
@@ -399,10 +415,14 @@ fn draw_toggles(
         layout.repeat.x,
         layout.repeat.y,
     );
-    let eq = if state.eq_open {
-        "MAIN_EQ_BUTTON_SELECTED"
-    } else {
-        "MAIN_EQ_BUTTON"
+    let eq = match (
+        state.eq_open,
+        state.pressed_widget == Some(Widget::EqToggle),
+    ) {
+        (false, false) => "MAIN_EQ_BUTTON",
+        (false, true) => "MAIN_EQ_BUTTON_DEPRESSED",
+        (true, false) => "MAIN_EQ_BUTTON_SELECTED",
+        (true, true) => "MAIN_EQ_BUTTON_DEPRESSED_SELECTED",
     };
     blit_named(
         canvas,
@@ -412,10 +432,14 @@ fn draw_toggles(
         layout.eq_toggle.x,
         layout.eq_toggle.y,
     );
-    let playlist = if state.playlist_open {
-        "MAIN_PLAYLIST_BUTTON_SELECTED"
-    } else {
-        "MAIN_PLAYLIST_BUTTON"
+    let playlist = match (
+        state.playlist_open,
+        state.pressed_widget == Some(Widget::PlaylistToggle),
+    ) {
+        (false, false) => "MAIN_PLAYLIST_BUTTON",
+        (false, true) => "MAIN_PLAYLIST_BUTTON_DEPRESSED",
+        (true, false) => "MAIN_PLAYLIST_BUTTON_SELECTED",
+        (true, true) => "MAIN_PLAYLIST_BUTTON_DEPRESSED_SELECTED",
     };
     blit_named(
         canvas,
@@ -494,7 +518,12 @@ fn draw_volume(
         layout.volume_track.y,
     );
     let thumb = layout.volume_thumb_at(state.volume);
-    blit_named(canvas, sheets, skin, "MAIN_VOLUME_THUMB", thumb.x, thumb.y);
+    let name = if state.pressed_widget == Some(Widget::VolumeSlider) {
+        "MAIN_VOLUME_THUMB_SELECTED"
+    } else {
+        "MAIN_VOLUME_THUMB"
+    };
+    blit_named(canvas, sheets, skin, name, thumb.x, thumb.y);
 }
 
 fn draw_balance(
@@ -510,7 +539,7 @@ fn draw_balance(
         sheets,
         Sheet::Balance,
         Rect::new(
-            0,
+            9,
             (frame * 15) as i32,
             layout.balance_track.width,
             layout.balance_track.height,
@@ -519,20 +548,12 @@ fn draw_balance(
         layout.balance_track.y,
     );
     let thumb = layout.balance_thumb_at(state.balance);
-    blit_named(canvas, sheets, skin, "MAIN_BALANCE_THUMB", thumb.x, thumb.y);
-}
-
-/// True when the skin ships `nums_ex.bmp` itself.
-///
-/// The loader records a substitution when `nums_ex.bmp` was absent and filled
-/// from `numbers.bmp` (S17 §3), so the absence of that record means the skin
-/// provided the variant.
-fn uses_nums_ex(skin: &Skin) -> bool {
-    skin.sheet(Sheet::NumsEx).is_some()
-        && !skin
-            .substitutions()
-            .iter()
-            .any(|s| s.requested.eq_ignore_ascii_case("nums_ex.bmp"))
+    let name = if state.pressed_widget == Some(Widget::BalanceSlider) {
+        "MAIN_BALANCE_THUMB_ACTIVE"
+    } else {
+        "MAIN_BALANCE_THUMB"
+    };
+    blit_named(canvas, sheets, skin, name, thumb.x, thumb.y);
 }
 
 fn draw_time(
@@ -546,7 +567,9 @@ fn draw_time(
     if !state.time_visible {
         return;
     }
-    let nums_ex = uses_nums_ex(skin);
+    // The loader distinguishes shipped digit art from per-file fallback.
+    // Sheets are independent: a fallback NumsEx must not shadow real Numbers.
+    let nums_ex = skin.time_digit_sheet() == Sheet::NumsEx;
     let names = if nums_ex { DIGIT_NAMES_EX } else { DIGIT_NAMES };
     let blank = if nums_ex {
         "NO_MINUS_SIGN_EX"
@@ -590,14 +613,6 @@ fn draw_indicators(
         TransportState::Paused => "MAIN_PAUSED_INDICATOR",
         TransportState::Stopped => "MAIN_STOPPED_INDICATOR",
     };
-    blit_named(
-        canvas,
-        sheets,
-        skin,
-        transport,
-        layout.play_indicator.x,
-        layout.play_indicator.y,
-    );
     let decoder = if state.decoder_active() {
         "MAIN_WORKING_INDICATOR"
     } else {
@@ -610,6 +625,17 @@ fn draw_indicators(
         decoder,
         layout.decoder_indicator.x,
         layout.decoder_indicator.y,
+    );
+    // S01's decoder and transport footprints share x26. The complete 9x9
+    // transport cell must win that column (S02 §1), not be overwritten by
+    // the decoder strip's rightmost pixel.
+    blit_named(
+        canvas,
+        sheets,
+        skin,
+        transport,
+        layout.play_indicator.x,
+        layout.play_indicator.y,
     );
     // S02 §6: the lit label follows the channel mode, but stopped (or nothing
     // loaded) dims both labels.
