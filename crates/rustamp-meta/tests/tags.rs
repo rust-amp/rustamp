@@ -126,6 +126,169 @@ fn id3v2_text_frame(id: &[u8; 4], text: &str) -> Vec<u8> {
     id3v2_frame(id, &data)
 }
 
+/// A `TXXX` frame: a user text frame, identified by its description.
+fn id3v2_txxx_frame(description: &str, text: &str) -> Vec<u8> {
+    let mut data = vec![0x00]; // ISO-8859-1
+    data.extend_from_slice(description.as_bytes());
+    data.push(0x00);
+    data.extend_from_slice(text.as_bytes());
+    id3v2_frame(b"TXXX", &data)
+}
+
+/// The size of the ID3v2 tag at the front of `bytes`, header included.
+fn id3v2_tag_size(bytes: &[u8]) -> usize {
+    assert_eq!(&bytes[..3], b"ID3");
+    // The size in the header is synchsafe: seven bits per byte.
+    let size = (usize::from(bytes[6] & 0x7F) << 21)
+        | (usize::from(bytes[7] & 0x7F) << 14)
+        | (usize::from(bytes[8] & 0x7F) << 7)
+        | usize::from(bytes[9] & 0x7F);
+    10 + size
+}
+
+/// The audio frames of the MP3 fixture: everything behind its ID3v2 tag.
+fn mp3_audio() -> Vec<u8> {
+    let bytes = std::fs::read(fixture("sine.mp3")).expect("read fixture");
+    bytes[id3v2_tag_size(&bytes)..].to_vec()
+}
+
+/// A FLAC metadata block: a type byte, a 24-bit size and the content.
+fn flac_block(ty: u8, last: bool, content: &[u8]) -> Vec<u8> {
+    let mut block = Vec::new();
+    block.push(if last { ty | 0x80 } else { ty });
+    let size = (content.len() as u32).to_be_bytes();
+    block.extend_from_slice(&size[1..]);
+    block.extend_from_slice(content);
+    block
+}
+
+/// The `STREAMINFO` block every FLAC file must start with.
+fn flac_streaminfo() -> Vec<u8> {
+    let mut info = Vec::new();
+    info.extend_from_slice(&4096u16.to_be_bytes()); // minimum block size
+    info.extend_from_slice(&4096u16.to_be_bytes()); // maximum block size
+    info.extend_from_slice(&[0, 0, 0]); // minimum frame size
+    info.extend_from_slice(&[0, 0, 0]); // maximum frame size
+    // 20 bits sample rate, 3 bits channels - 1, 5 bits bits per sample - 1,
+    // 36 bits total samples.
+    let packed = (44_100u64 << 44) | (1 << 41) | (15 << 36) | 44_100;
+    info.extend_from_slice(&packed.to_be_bytes());
+    info.extend_from_slice(&[0u8; 16]); // MD5 of the unencoded audio
+    info
+}
+
+/// The content of a `VORBIS_COMMENT` block.
+fn flac_vorbis_comments(comments: &[(&str, &str)]) -> Vec<u8> {
+    let mut content = Vec::new();
+    content.extend_from_slice(&0u32.to_le_bytes()); // vendor length
+    content.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for (key, value) in comments {
+        let comment = format!("{key}={value}");
+        content.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        content.extend_from_slice(comment.as_bytes());
+    }
+    content
+}
+
+/// A small FLAC file with the given Vorbis comments.
+///
+/// The audio frames are a stand-in: the tag layer never decodes them, but
+/// the file has to look like a FLAC file to the reader and the writer.
+fn synthetic_flac(comments: &[(&str, &str)]) -> Vec<u8> {
+    synthetic_flac_with_picture(comments, None)
+}
+
+/// A small FLAC file with the given Vorbis comments and picture block.
+fn synthetic_flac_with_picture(
+    comments: &[(&str, &str)],
+    picture: Option<(u32, &str, &str, &[u8])>,
+) -> Vec<u8> {
+    let mut file = b"fLaC".to_vec();
+    file.extend_from_slice(&flac_block(0, false, &flac_streaminfo()));
+    file.extend_from_slice(&flac_block(4, false, &flac_vorbis_comments(comments)));
+    if let Some((kind, mime, description, data)) = picture {
+        let block = flac_picture_block(kind, mime, description, data);
+        file.extend_from_slice(&flac_block(6, false, &block));
+    }
+    file.extend_from_slice(&flac_block(1, true, &[])); // the padding block
+    file.extend_from_slice(&[0u8; 64]); // the audio frames
+    file
+}
+
+/// The content of a FLAC picture block.
+fn flac_picture_block(kind: u32, mime: &str, description: &str, data: &[u8]) -> Vec<u8> {
+    let mut block = Vec::new();
+    block.extend_from_slice(&kind.to_be_bytes());
+    block.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+    block.extend_from_slice(mime.as_bytes());
+    block.extend_from_slice(&(description.len() as u32).to_be_bytes());
+    block.extend_from_slice(description.as_bytes());
+    block.extend_from_slice(&0u32.to_be_bytes()); // width
+    block.extend_from_slice(&0u32.to_be_bytes()); // height
+    block.extend_from_slice(&0u32.to_be_bytes()); // colour depth
+    block.extend_from_slice(&0u32.to_be_bytes()); // number of colours
+    block.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    block.extend_from_slice(data);
+    block
+}
+
+/// A symbolic link to `target`, if the system allows one.
+fn symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+}
+
+/// The offset where the audio frames of a FLAC file start.
+fn flac_audio_start(bytes: &[u8]) -> usize {
+    assert_eq!(&bytes[..4], b"fLaC");
+    let mut offset = 4;
+    loop {
+        let header = bytes[offset];
+        let size = u32::from_be_bytes([0, bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+            as usize;
+        offset += 4 + size;
+        if header & 0x80 != 0 {
+            return offset;
+        }
+    }
+}
+
+/// The Vorbis comments of a FLAC file, read with `lofty`'s concrete API.
+fn flac_comments(path: &std::path::Path) -> lofty::ogg::tag::VorbisComments {
+    use lofty::config::ParseOptions;
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+
+    let mut file = std::fs::File::open(path).expect("open flac");
+    FlacFile::read_from(&mut file, ParseOptions::new().read_properties(false))
+        .expect("read flac")
+        .vorbis_comments()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The duration of a media file, in milliseconds.
+fn duration_ms(path: &std::path::Path) -> u128 {
+    use lofty::config::ParseOptions;
+    use lofty::file::AudioFile;
+    use lofty::probe::Probe;
+
+    let file = Probe::open(path)
+        .expect("probe")
+        .guess_file_type()
+        .expect("guess")
+        .options(ParseOptions::new().read_properties(true))
+        .read()
+        .expect("read");
+    file.properties().duration().as_millis()
+}
+
 fn id3v2_apic_frame(mime: &str, kind: u8, description: &str, picture: &[u8]) -> Vec<u8> {
     let mut data = vec![0x00]; // ISO-8859-1
     data.extend_from_slice(mime.as_bytes());
@@ -848,5 +1011,303 @@ fn album_keys_and_full_metadata_share_one_roundtrip() {
     assert_eq!(
         got.extra.get(ALBUM_PEAK_KEY).map(String::as_str),
         Some("0.999000")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Writing: the audio, the unknown frames, the atomicity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_write_leaves_the_audio_bytes_untouched() {
+    let dir = TempDir::new().unwrap();
+
+    // MP3: the ID3v2 tag sits in front of the audio frames, so everything
+    // behind it must be bit-identical after the write.
+    let path = copy_fixture(&dir, "sine.mp3");
+    let before = std::fs::read(&path).unwrap();
+    write_tags(&path, &full_metadata()).unwrap();
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        &before[id3v2_tag_size(&before)..],
+        &after[id3v2_tag_size(&after)..],
+        "the MP3 audio frames changed"
+    );
+
+    // FLAC: the metadata blocks sit in front of the audio frames.
+    let path = copy_fixture(&dir, "sine.flac");
+    let before = std::fs::read(&path).unwrap();
+    write_tags(&path, &full_metadata()).unwrap();
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(
+        &before[flac_audio_start(&before)..],
+        &after[flac_audio_start(&after)..],
+        "the FLAC audio frames changed"
+    );
+}
+
+#[test]
+fn a_write_keeps_the_length_of_the_audio() {
+    // The Ogg writer rewrites the page headers (the sequence numbers and
+    // their checksums), so the audio cannot be compared byte for byte there.
+    // Its length may not change, though: the stream is still the same.
+    let dir = TempDir::new().unwrap();
+    for name in ["sine.mp3", "sine.flac", "sine.ogg"] {
+        let path = copy_fixture(&dir, name);
+        let before = duration_ms(&path);
+        write_tags(&path, &full_metadata()).unwrap();
+        assert_eq!(before, duration_ms(&path), "{name}: the audio got shorter");
+    }
+}
+
+#[test]
+fn unknown_id3v2_frames_survive_a_write() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("unknown.mp3");
+
+    // The fixture's audio with a tag that holds a text frame and a user text
+    // frame this crate has no field for.
+    let mut bytes = id3v2_tag(&[
+        id3v2_text_frame(b"TIT2", "Original Title"),
+        id3v2_text_frame(b"TZZZ", "Unknown Frame"),
+        id3v2_txxx_frame("CUSTOM_TXXX", "Custom Value"),
+    ]);
+    bytes.extend_from_slice(&mp3_audio());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let metadata = TrackMetadata {
+        title: Some("New Title".into()),
+        ..TrackMetadata::default()
+    };
+    write_tags(&path, &metadata).unwrap();
+
+    let after = std::fs::read(&path).unwrap();
+    assert!(
+        after
+            .windows(b"Unknown Frame".len())
+            .any(|w| w == b"Unknown Frame"),
+        "the unknown text frame was dropped"
+    );
+    assert!(
+        after
+            .windows(b"Custom Value".len())
+            .any(|w| w == b"Custom Value"),
+        "the unknown user text frame was dropped"
+    );
+    assert_eq!(
+        read_tags(&path).unwrap().title.as_deref(),
+        Some("New Title")
+    );
+}
+
+#[test]
+fn unknown_vorbis_keys_survive_a_write() {
+    let dir = TempDir::new().unwrap();
+    let path = write_file(
+        &dir,
+        "custom.flac",
+        &synthetic_flac(&[("TITLE", "Original Title"), ("CUSTOM_KEY", "Custom Value")]),
+    );
+
+    let metadata = TrackMetadata {
+        title: Some("New Title".into()),
+        ..TrackMetadata::default()
+    };
+    write_tags(&path, &metadata).unwrap();
+
+    let comments = flac_comments(&path);
+    assert_eq!(comments.get("CUSTOM_KEY"), Some("Custom Value"));
+    assert_eq!(comments.get("TITLE"), Some("New Title"));
+    assert_eq!(
+        read_tags(&path).unwrap().title.as_deref(),
+        Some("New Title")
+    );
+}
+
+#[test]
+fn unknown_mp4_atoms_survive_a_write() {
+    let dir = TempDir::new().unwrap();
+    let path = copy_fixture(&dir, "sine_aac.m4a");
+
+    // A freeform atom that this crate has no field for.
+    {
+        use lofty::config::{ParseOptions, WriteOptions};
+        use lofty::file::AudioFile;
+        use lofty::mp4::{Atom, AtomData, AtomIdent, Mp4File};
+        use lofty::prelude::TagExt;
+        use std::io::Seek;
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mp4 =
+            Mp4File::read_from(&mut file, ParseOptions::new().read_properties(false)).unwrap();
+        let mut ilst = mp4.ilst().cloned().unwrap_or_default();
+        ilst.insert(Atom::new(
+            AtomIdent::Freeform {
+                mean: "com.apple.iTunes".into(),
+                name: "CUSTOMKEY".into(),
+            },
+            AtomData::UTF8("Custom Value".into()),
+        ));
+        file.rewind().unwrap();
+        ilst.save_to(&mut file, WriteOptions::default()).unwrap();
+    }
+
+    let before = std::fs::read(&path).unwrap();
+    assert!(
+        before
+            .windows(b"CUSTOMKEY".len())
+            .any(|w| w == b"CUSTOMKEY"),
+        "the atom was not written"
+    );
+
+    write_tags(&path, &full_metadata()).unwrap();
+
+    let after = std::fs::read(&path).unwrap();
+    assert!(
+        after.windows(b"CUSTOMKEY".len()).any(|w| w == b"CUSTOMKEY"),
+        "the unknown atom was dropped"
+    );
+    assert_eq!(
+        read_tags(&path).unwrap().title.as_deref(),
+        Some("Round Trip Title")
+    );
+}
+
+#[test]
+fn the_cover_art_of_a_flac_file_survives_a_write() {
+    // The cover art of a FLAC file lives in its own metadata block, next to
+    // the comment block.
+    let dir = TempDir::new().unwrap();
+    let path = write_file(
+        &dir,
+        "art.flac",
+        &synthetic_flac_with_picture(
+            &[("TITLE", "Original Title")],
+            Some((3, "image/png", "front cover", PNG_LIKE)),
+        ),
+    );
+
+    let before = read_artwork(&path).unwrap();
+    assert_eq!(before.len(), 1, "{before:?}");
+
+    write_tags(&path, &full_metadata()).unwrap();
+
+    assert_eq!(read_artwork(&path).unwrap(), before);
+    assert_eq!(
+        read_tags(&path).unwrap().title.as_deref(),
+        Some("Round Trip Title")
+    );
+}
+
+#[test]
+fn a_symlinked_file_is_written_through() {
+    let dir = TempDir::new().unwrap();
+    let target = copy_fixture(&dir, "sine.flac");
+    let link = dir.path().join("link.flac");
+    if let Err(error) = symlink(&target, &link) {
+        // Windows only allows symbolic links with the right privilege.
+        println!("skipping the symlink test: {error}");
+        return;
+    }
+
+    write_tags(&link, &full_metadata()).unwrap();
+
+    // The link is still a link ...
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link was replaced by a file"
+    );
+    // ... and the file it points at carries the new title.
+    assert_eq!(
+        read_tags(&target).unwrap().title.as_deref(),
+        Some("Round Trip Title")
+    );
+}
+
+#[test]
+fn the_second_tag_of_a_file_is_left_alone() {
+    // An MP3 with an ID3v1 tag next to its ID3v2 tag: only the primary tag
+    // is written, the other one stays byte for byte as it was.
+    let dir = TempDir::new().unwrap();
+    let path = copy_fixture(&dir, "sine.mp3");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&id3v1(
+        "V1 Title",
+        "V1 Artist",
+        "V1 Album",
+        "1999",
+        "V1 Comment",
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+
+    let before = std::fs::read(&path).unwrap();
+    let id3v1_before = &before[before.len() - 128..];
+    write_tags(&path, &full_metadata()).unwrap();
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(&after[after.len() - 128..], id3v1_before);
+}
+
+#[test]
+fn a_write_leaves_no_temporary_file_behind() {
+    let dir = TempDir::new().unwrap();
+    let path = copy_fixture(&dir, "sine.flac");
+    write_tags(&path, &full_metadata()).unwrap();
+
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+}
+
+#[test]
+fn a_write_that_cannot_happen_leaves_the_file_alone() {
+    // The new file is built next to the original and renamed over it, so a
+    // write that cannot happen never touches the original.
+    let dir = TempDir::new().unwrap();
+    let path = copy_fixture(&dir, "sine.flac");
+    let before = std::fs::read(&path).unwrap();
+
+    // Windows refuses to replace a read-only file, Unix refuses to create a
+    // file in a read-only directory.
+    #[cfg(windows)]
+    let original = {
+        let original = std::fs::metadata(&path).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&path, read_only).unwrap();
+        original
+    };
+    #[cfg(unix)]
+    let original = {
+        use std::os::unix::fs::PermissionsExt;
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), read_only).unwrap();
+        original
+    };
+
+    let error = write_tags(&path, &full_metadata());
+
+    // Put the file (or the directory) back so that the temporary directory
+    // can be cleaned up.
+    #[cfg(windows)]
+    std::fs::set_permissions(&path, original).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(dir.path(), original).unwrap();
+
+    assert!(error.is_err(), "the write should have failed");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the file was modified"
     );
 }

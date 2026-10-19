@@ -11,6 +11,6 @@ rust-version.workspace = true
 [dependencies]
 rustamp-core.workspace = true
 lofty.workspace = true
-
-[dev-dependencies]
+# The atomic tag write: the new file is built next to the original and
+# renamed over it.
 tempfile.workspace = true

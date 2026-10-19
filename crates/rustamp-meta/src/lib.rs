@@ -12,7 +12,9 @@
 //! * [`scan_paths`] reads many files at once, returning one [`Result`] per
 //!   path so a single unreadable file never aborts a folder scan.
 //! * [`write_tags`] writes the common fields back, preserving whatever the
-//!   caller does not set.
+//!   caller does not set. The write is atomic: the new file is built next
+//!   to the original and renamed over it, and the audio frames are copied
+//!   byte for byte.
 //! * [`write_tags_report`] is the honest form of [`write_tags`]: it names
 //!   every `extra` entry the target format could not store.
 //! * The [`replaygain`] module holds the ReplayGain keys, the
@@ -26,6 +28,11 @@
 //! (ID3v1/v2, Vorbis comments, MP4/ILST, APE, RIFF INFO, AIFF text) but never
 //! runs an audio codec. When several tags are present they are merged with a
 //! fixed precedence (see [`read_tags`]).
+//!
+//! Writing goes through the same crate: the tag container is rewritten, the
+//! audio is never decoded, and the file is replaced atomically. Which tag
+//! format is written, and which unknown frames or keys survive, is
+//! documented in the `write` module.
 //!
 //! ## Out of scope
 //!
@@ -52,6 +59,7 @@
 #![forbid(unsafe_code)]
 
 mod artwork;
+mod atomic;
 mod read;
 pub mod replaygain;
 mod write;
