@@ -399,7 +399,7 @@ fn enter_without_a_selection_plays_nothing() {
 #[test]
 fn the_window_renders_a_frame_of_its_client_size() {
     let dir = TempDir::new().expect("temp dir");
-    let app = library_app(&dir);
+    let mut app = library_app(&dir);
     let image = app.render_library();
     assert_eq!((image.width(), image.height()), LIBRARY_CLIENT_SIZE);
 }
