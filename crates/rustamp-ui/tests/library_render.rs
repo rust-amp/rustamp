@@ -163,7 +163,7 @@ fn the_viewport_is_split_into_the_header_the_rows_and_the_status_line() {
     let layout = LibraryLayout::default();
     let viewport = Rect::new(0, 0, 700, 100);
     let mut frame = Image::filled(700, 100, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, false);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
 
     // The header holds the column titles, and only the panel background and
     // the titles' own colour.
@@ -224,7 +224,7 @@ fn the_selected_row_is_highlighted_and_the_others_are_not() {
     let layout = LibraryLayout::default();
     let viewport = Rect::new(0, 0, 700, 100);
     let mut frame = Image::filled(700, 100, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, false);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
 
     let selected = row_band(viewport, 1);
     assert!(
@@ -259,7 +259,7 @@ fn the_columns_line_up_with_the_header() {
     let layout = LibraryLayout::default();
     let viewport = Rect::new(0, 0, 700, 100);
     let mut frame = Image::filled(700, 100, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, false);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
 
     let upto = layout.column_x(LibraryColumn::Duration) * LIBRARY_CELL_WIDTH;
     let header = ink_profile(
@@ -301,7 +301,7 @@ fn a_row_that_does_not_fit_the_viewport_is_not_drawn() {
     // separator, two rows and the status line.
     let short = Rect::new(0, 0, 700, LIBRARY_LINE_HEIGHT * 5 + 1);
     let mut frame = Image::filled(700, short.height, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, short, false);
+    render_library_window(&mut frame, &view, &layout, short, false, &[]);
     assert!(
         count(&frame, row_band(short, 0), LIBRARY_ROW_TEXT) > 0,
         "the first row is drawn"
@@ -325,7 +325,7 @@ fn a_row_that_does_not_fit_the_viewport_is_not_drawn() {
     // it out for good.
     let tall = Rect::new(0, 0, 700, LIBRARY_LINE_HEIGHT * 8 + 1);
     let mut frame = Image::filled(700, tall.height, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, tall, false);
+    render_library_window(&mut frame, &view, &layout, tall, false, &[]);
     assert!(
         count(&frame, row_band(tall, 2), LIBRARY_ROW_TEXT) > 0,
         "the third row is drawn when the viewport has room for it"
@@ -338,7 +338,7 @@ fn nothing_is_drawn_outside_the_viewport() {
     let layout = LibraryLayout::default();
     let viewport = Rect::new(10, 20, 200, 60);
     let mut frame = Image::filled(400, 200, [7, 11, 13, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, false);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
 
     for y in 0..200 {
         for x in 0..400 {
@@ -367,7 +367,7 @@ fn the_status_line_starts_at_the_left_edge_of_the_viewport() {
     let layout = LibraryLayout::default();
     let viewport = Rect::new(0, 0, 400, 100);
     let mut frame = Image::filled(400, 100, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, false);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
 
     let status = status_band(viewport);
     let first = first_ink_x(&frame, status, LIBRARY_STATUS_TEXT).expect("the status line is drawn");
@@ -394,7 +394,7 @@ fn a_viewport_that_is_too_short_shows_the_header_and_nothing_else() {
     let layout = LibraryLayout::default();
     let viewport = Rect::new(0, 0, 700, 10);
     let mut frame = Image::filled(700, 10, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, false);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
 
     assert!(
         count(&frame, Rect::new(0, 0, 700, 10), LIBRARY_HEADER_TEXT) > 0,

@@ -112,7 +112,7 @@ fn the_search_field_shows_the_text_the_hint_and_the_caret() {
 
     // An empty field shows the hint and no text.
     let mut frame = Image::filled(700, 100, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, false);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
     assert!(
         count(&frame, field, LIBRARY_SEARCH_HINT) > 0,
         "the hint is drawn while the field is empty"
@@ -131,7 +131,7 @@ fn the_search_field_shows_the_text_the_hint_and_the_caret() {
     // A field with text shows the text and no hint.
     view.set_search("hello");
     let mut frame = Image::filled(700, 100, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, false);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
     assert!(
         count(&frame, field, LIBRARY_SEARCH_TEXT) > 0,
         "the text as typed is drawn"
@@ -152,7 +152,7 @@ fn the_caret_stands_behind_the_text_of_the_focused_field() {
     let chrome = LibraryChrome::new(&view, viewport);
 
     let mut frame = Image::filled(700, 100, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, true);
+    render_library_window(&mut frame, &view, &layout, viewport, true, &[]);
     let field = chrome.search;
     let last_text = last_ink_x(&frame, field, LIBRARY_SEARCH_TEXT).expect("the text is drawn");
     let caret = first_ink_x(&frame, field, LIBRARY_SEARCH_CARET).expect("the caret is drawn");
@@ -179,7 +179,7 @@ fn the_caret_of_an_empty_field_stands_at_its_left_edge() {
     let chrome = LibraryChrome::new(&view, viewport);
 
     let mut frame = Image::filled(700, 100, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, true);
+    render_library_window(&mut frame, &view, &layout, viewport, true, &[]);
     let caret = first_ink_x(&frame, chrome.search, LIBRARY_SEARCH_CARET)
         .expect("the caret is drawn while the field is focused");
     assert_eq!(
@@ -327,7 +327,7 @@ fn the_scrollbar_is_a_column_beside_the_rows() {
     let viewport = Rect::new(0, 0, 700, 200);
     let chrome = LibraryChrome::new(&view, viewport);
     let mut frame = Image::filled(700, 200, [0, 0, 0, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, false);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
 
     assert_eq!(
         chrome.rows.right(),
@@ -351,7 +351,7 @@ fn the_chrome_paints_nothing_outside_the_viewport() {
     let layout = LibraryLayout::default();
     let viewport = Rect::new(10, 20, 300, 200);
     let mut frame = Image::filled(400, 300, [7, 11, 13, 255]);
-    render_library_window(&mut frame, &view, &layout, viewport, true);
+    render_library_window(&mut frame, &view, &layout, viewport, true, &[]);
 
     for y in 0..300 {
         for x in 0..400 {
