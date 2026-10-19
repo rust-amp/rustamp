@@ -16,8 +16,12 @@
 //! with [`WindowId`]'s derived `Ord`; that order is still not what is used,
 //! because there `Video` sorts after `Gen(u32)` only since `postcard` encodes
 //! the enum by declaration index (see its docs), a wire-layout accident rather
-//! than a focus order. `Vis`, `Gen` and `Video` are windows the app does not
-//! have, so they are not in the cycle; giving them a position is open.
+//! than a focus order. The **media library** is a `Gen` window (see
+//! [`crate::library_window`]) and takes the last place in the cycle: it is
+//! not part of the docked stack, so it follows the three windows that are.
+//! That is an own choice like the rest of the order. `Vis` and `Video` are
+//! windows the app does not have, so they are not in the cycle; giving them
+//! a position is open.
 //!
 //! What would measure the reference's order: post `WM_COMMAND` 40063 to each
 //! of the three windows in turn (as the S03 audit posts other ids) and read
@@ -34,8 +38,14 @@ use rustamp_core::state::WindowId;
 
 /// The windows `FocusNextWindow` cycles through, in cycle order.
 ///
-/// Own choice (see the module docs): the S05 docked stack top-to-bottom.
-pub const FOCUS_ORDER: [WindowId; 3] = [WindowId::Main, WindowId::Equalizer, WindowId::Playlist];
+/// Own choice (see the module docs): the S05 docked stack top-to-bottom,
+/// with the media library last.
+pub const FOCUS_ORDER: [WindowId; 4] = [
+    WindowId::Main,
+    WindowId::Equalizer,
+    WindowId::Playlist,
+    crate::library_window::LIBRARY_WINDOW_ID,
+];
 
 /// The next window after `current` among the open ones, wrapping around.
 ///
@@ -76,12 +86,35 @@ mod tests {
         // Own choice, not a measurement (see the module docs).
         assert_eq!(
             FOCUS_ORDER,
-            [WindowId::Main, WindowId::Equalizer, WindowId::Playlist]
+            [
+                WindowId::Main,
+                WindowId::Equalizer,
+                WindowId::Playlist,
+                crate::library_window::LIBRARY_WINDOW_ID,
+            ]
         );
         let all = open(true, true, true);
         assert_eq!(next_focus(WindowId::Main, &all), WindowId::Equalizer);
         assert_eq!(next_focus(WindowId::Equalizer, &all), WindowId::Playlist);
         assert_eq!(next_focus(WindowId::Playlist, &all), WindowId::Main);
+    }
+
+    /// The media library is the last window of the cycle: it is not part of
+    /// the docked stack, so it follows the three windows that are.
+    #[test]
+    fn the_media_library_is_the_last_window_of_the_cycle() {
+        let library = crate::library_window::LIBRARY_WINDOW_ID;
+        let all = |window: WindowId| window != WindowId::Vis;
+        assert_eq!(
+            next_focus(WindowId::Playlist, all),
+            library,
+            "the playlist hands the focus to the media library"
+        );
+        assert_eq!(
+            next_focus(library, all),
+            WindowId::Main,
+            "the cycle wraps around after the media library"
+        );
     }
 
     #[test]

@@ -53,9 +53,11 @@ pub enum MenuClickOutcome {
     /// A leaf row was chosen and the popup closed: `Some` carries the
     /// activation outcome for a `Shortcut` leaf (through
     /// [`App::activate_menu_item`), or the quit for `Exit`; `None` for a
-    /// `NoAction` row (the title row, `Library`, `Minibrowser`), which keeps its draw-only
+    /// `NoAction` row (the title row, `Minibrowser`), which keeps its draw-only
     /// treatment — S04 §9 explicitly does not cover click-through, so no
-    /// behaviour is invented for these rows.
+    /// behaviour is invented for these rows. The `Library` row is the
+    /// exception: it opens the media library (own choice, see
+    /// [`App::activate_menu_choice`]).
     Activated(Option<MenuOutcome>),
     /// A submenu parent was clicked: nothing opens (S04 §9 — submenu
     /// contents were never measured), so the popup stays open and a note
@@ -149,8 +151,9 @@ impl App {
     /// A leaf goes through the existing activation path
     /// ([`App::activate_menu_item`]) - the same dispatch the matching key
     /// press runs - and a measured row with no command keeps its draw-only
-    /// treatment (S04 §9 covers no click-through for the title row,
-    /// `Library` and `Minibrowser`), so nothing is invented for it. `Exit`
+    /// treatment (S04 §9 covers no click-through for the title row and
+    /// `Minibrowser`), so nothing is invented for it. The `Library` row is
+    /// the one exception: it opens the media library (see below). `Exit`
     /// submits `Command::Quit`.
     ///
     /// The popup itself is already closed by the time this runs: the system
@@ -164,6 +167,15 @@ impl App {
                 self.activate_menu_item(label, action).map(Some)
             }
             rustamp_ui::menu::MenuChoice::Exit => self.quit_from_menu().map(Some),
+            rustamp_ui::menu::MenuChoice::NoAction { label: "Library" } => {
+                // The media library. **Own choice:** S04 §9 does not cover
+                // the click-through of this row, and S03 records no command
+                // for it, so the row opens the library window with the
+                // window's own command id (see `crate::library_window`).
+                let command = Command::ToggleWindow(crate::library_window::LIBRARY_WINDOW_ID);
+                self.submit(command.clone())?;
+                Ok(Some(MenuOutcome::Commands(vec![command])))
+            }
             rustamp_ui::menu::MenuChoice::NoAction { .. } => Ok(None),
             rustamp_ui::menu::MenuChoice::UnavailableCommand { label, command_id } => {
                 self.note(format!(
@@ -216,6 +228,11 @@ impl App {
             }
             MenuAction::NoAction => {
                 self.close_main_menu();
+                if item.id == rustamp_ui::menu::MainMenuId::Library {
+                    return Ok(MenuClickOutcome::Activated(self.activate_menu_choice(
+                        rustamp_ui::menu::MenuChoice::NoAction { label: "Library" },
+                    )?));
+                }
                 Ok(MenuClickOutcome::Activated(None))
             }
             MenuAction::Submenu(id) => {
@@ -378,12 +395,32 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_no_action_row_closes_without_dispatching() {
-        // `Library` has no S03 row (S04 §2): the popup closes, nothing is
-        // submitted, no note is recorded.
+    fn clicking_the_library_row_opens_the_media_library() {
+        // The `Library` row has no S03 command (S04 §2), so the click opens
+        // the media library with the window's own command id (own choice).
         let mut app = test_app();
         app.open_main_menu();
         let (x, y) = row_middle(MainMenuId::Library);
+        let outcome = app.menu_click(x, y).unwrap();
+        assert_eq!(
+            outcome,
+            MenuClickOutcome::Activated(Some(MenuOutcome::Commands(vec![Command::ToggleWindow(
+                crate::library_window::LIBRARY_WINDOW_ID
+            )])))
+        );
+        assert!(!app.main_menu_is_open());
+        assert!(app.library_open());
+        assert!(app.drain_notes().is_empty());
+        assert!(!app.quit());
+    }
+
+    #[test]
+    fn clicking_the_title_row_closes_without_dispatching() {
+        // The title row is a measured row with no command (S04 §9): the
+        // popup closes, nothing is submitted, no note is recorded.
+        let mut app = test_app();
+        app.open_main_menu();
+        let (x, y) = row_middle(MainMenuId::Title);
         let outcome = app.menu_click(x, y).unwrap();
         assert_eq!(outcome, MenuClickOutcome::Activated(None));
         assert!(!app.main_menu_is_open());
