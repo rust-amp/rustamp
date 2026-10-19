@@ -1032,6 +1032,401 @@ fn a_truncated_aiff_file_on_disk_is_a_loud_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// MP4/M4A: the media data box and the sample tables as a truncation oracle
+// ---------------------------------------------------------------------------
+
+/// A box of an ISO base media file: its type and its payload.
+fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// A box that starts with a version and flags.
+fn mp4_full_box(kind: &[u8; 4], flags: u32, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(0u8);
+    body.extend_from_slice(&flags.to_be_bytes()[1..]);
+    body.extend_from_slice(payload);
+    mp4_box(kind, &body)
+}
+
+/// A minimal MP4 file with uncompressed 16 bit stereo PCM in a media data
+/// box.
+///
+/// The movie box comes first, so the file is the "fast start" layout: the
+/// sample table is at the front and the media data behind it. The sample
+/// tables state one sample per audio frame, so the media header states the
+/// number of frames the file holds.
+fn mp4_pcm_bytes(frames: u32, rate: u32) -> Vec<u8> {
+    let movie_timescale = 1000u32;
+    let movie_duration = frames * movie_timescale / rate;
+
+    // The movie header.
+    let mut mvhd = Vec::new();
+    mvhd.extend_from_slice(&0u32.to_be_bytes()); // creation time
+    mvhd.extend_from_slice(&0u32.to_be_bytes()); // modification time
+    mvhd.extend_from_slice(&movie_timescale.to_be_bytes());
+    mvhd.extend_from_slice(&movie_duration.to_be_bytes());
+    mvhd.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // preferred rate
+    mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // preferred volume
+    mvhd.extend_from_slice(&[0u8; 2]); // reserved
+    mvhd.extend_from_slice(&[0u8; 8]); // reserved
+    mvhd.extend_from_slice(&[0u8; 36]); // transformation matrix
+    mvhd.extend_from_slice(&[0u8; 24]); // predefined
+    mvhd.extend_from_slice(&2u32.to_be_bytes()); // next track id
+    let mvhd = mp4_full_box(b"mvhd", 0, &mvhd);
+
+    // The track header.
+    let mut tkhd = Vec::new();
+    tkhd.extend_from_slice(&0u32.to_be_bytes()); // creation time
+    tkhd.extend_from_slice(&0u32.to_be_bytes()); // modification time
+    tkhd.extend_from_slice(&1u32.to_be_bytes()); // track id
+    tkhd.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    tkhd.extend_from_slice(&movie_duration.to_be_bytes());
+    tkhd.extend_from_slice(&[0u8; 8]); // reserved
+    tkhd.extend_from_slice(&0u16.to_be_bytes()); // layer
+    tkhd.extend_from_slice(&0u16.to_be_bytes()); // alternate group
+    tkhd.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
+    tkhd.extend_from_slice(&[0u8; 2]); // reserved
+    tkhd.extend_from_slice(&[0u8; 36]); // transformation matrix
+    tkhd.extend_from_slice(&0u32.to_be_bytes()); // width
+    tkhd.extend_from_slice(&0u32.to_be_bytes()); // height
+    let tkhd = mp4_full_box(b"tkhd", 3, &tkhd);
+
+    // The media header: the timescale is the sample rate, so the duration is
+    // the number of audio frames.
+    let mut mdhd = Vec::new();
+    mdhd.extend_from_slice(&0u32.to_be_bytes()); // creation time
+    mdhd.extend_from_slice(&0u32.to_be_bytes()); // modification time
+    mdhd.extend_from_slice(&rate.to_be_bytes()); // timescale
+    mdhd.extend_from_slice(&frames.to_be_bytes()); // duration
+    mdhd.extend_from_slice(&0x55C4u16.to_be_bytes()); // language
+    mdhd.extend_from_slice(&0u16.to_be_bytes()); // quality
+    let mdhd = mp4_full_box(b"mdhd", 0, &mdhd);
+
+    // The handler reference: the track holds sound.
+    let mut hdlr = Vec::new();
+    hdlr.extend_from_slice(&0u32.to_be_bytes()); // predefined
+    hdlr.extend_from_slice(b"soun");
+    hdlr.extend_from_slice(&[0u8; 12]); // reserved
+    hdlr.extend_from_slice(b"\0"); // name
+    let hdlr = mp4_full_box(b"hdlr", 0, &hdlr);
+
+    // The sound media header.
+    let smhd = mp4_full_box(b"smhd", 0, &[0u8; 4]);
+
+    // The data information: the samples are in the file itself.
+    let url = mp4_full_box(b"url ", 1, &[]);
+    let mut dref = Vec::new();
+    dref.extend_from_slice(&1u32.to_be_bytes());
+    dref.extend_from_slice(&url);
+    let dinf = mp4_box(b"dinf", &mp4_full_box(b"dref", 0, &dref));
+
+    // The sample description: a `sowt` entry, 16 bit little endian PCM.
+    let mut sowt = Vec::new();
+    sowt.extend_from_slice(&[0u8; 6]); // reserved
+    sowt.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+    sowt.extend_from_slice(&0u16.to_be_bytes()); // version
+    sowt.extend_from_slice(&0u16.to_be_bytes()); // revision
+    sowt.extend_from_slice(&0u32.to_be_bytes()); // vendor
+    sowt.extend_from_slice(&2u16.to_be_bytes()); // channels
+    sowt.extend_from_slice(&16u16.to_be_bytes()); // sample size
+    sowt.extend_from_slice(&0u16.to_be_bytes()); // compression id
+    sowt.extend_from_slice(&0u16.to_be_bytes()); // packet size
+    sowt.extend_from_slice(&(rate << 16).to_be_bytes()); // sample rate (16.16)
+    let mut stsd = Vec::new();
+    stsd.extend_from_slice(&1u32.to_be_bytes()); // entry count
+    stsd.extend_from_slice(&mp4_box(b"sowt", &sowt));
+    let stsd = mp4_full_box(b"stsd", 0, &stsd);
+
+    // The time to sample table: one sample per frame.
+    let mut stts = Vec::new();
+    stts.extend_from_slice(&1u32.to_be_bytes()); // entry count
+    stts.extend_from_slice(&frames.to_be_bytes()); // sample count
+    stts.extend_from_slice(&1u32.to_be_bytes()); // sample delta
+    let stts = mp4_full_box(b"stts", 0, &stts);
+
+    // The sample to chunk table: all samples in one chunk.
+    let mut stsc = Vec::new();
+    stsc.extend_from_slice(&1u32.to_be_bytes()); // entry count
+    stsc.extend_from_slice(&1u32.to_be_bytes()); // first chunk
+    stsc.extend_from_slice(&frames.to_be_bytes()); // samples per chunk
+    stsc.extend_from_slice(&1u32.to_be_bytes()); // sample description index
+    let stsc = mp4_full_box(b"stsc", 0, &stsc);
+
+    // The sample size table: every sample is one stereo frame.
+    let mut stsz = Vec::new();
+    stsz.extend_from_slice(&4u32.to_be_bytes()); // sample size
+    stsz.extend_from_slice(&frames.to_be_bytes()); // sample count
+    let stsz = mp4_full_box(b"stsz", 0, &stsz);
+
+    // The chunk offset table: the offset is patched once the file is laid out.
+    let mut stco = Vec::new();
+    stco.extend_from_slice(&1u32.to_be_bytes()); // entry count
+    stco.extend_from_slice(&0u32.to_be_bytes()); // chunk offset
+    let stco = mp4_full_box(b"stco", 0, &stco);
+
+    let stbl = mp4_box(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+    let minf = mp4_box(b"minf", &[smhd, dinf, stbl].concat());
+    let mdia = mp4_box(b"mdia", &[mdhd, hdlr, minf].concat());
+    let trak = mp4_box(b"trak", &[tkhd, mdia].concat());
+    let moov = mp4_box(b"moov", &[mvhd, trak].concat());
+
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(b"M4A ");
+    ftyp.extend_from_slice(&0x200u32.to_be_bytes()); // minor version
+    ftyp.extend_from_slice(b"M4A ");
+    ftyp.extend_from_slice(b"isom");
+    let ftyp = mp4_box(b"ftyp", &ftyp);
+
+    // The media data: one stereo frame per sample.
+    let mut mdat = Vec::new();
+    for i in 0..frames {
+        let v = (i as i16).to_le_bytes();
+        mdat.extend_from_slice(&v);
+        mdat.extend_from_slice(&v);
+    }
+    let mdat = mp4_box(b"mdat", &mdat);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&moov);
+    let mdat_at = file.len();
+    file.extend_from_slice(&mdat);
+    // The first sample starts behind the header of the media data box.
+    let offset = (mdat_at + 8) as u32;
+    let at = mp4_offset_box(&file, b"stco");
+    file[at..at + 4].copy_from_slice(&offset.to_be_bytes());
+    file
+}
+
+/// The offset of the first payload byte of the first box of the given type.
+fn mp4_offset_box(bytes: &[u8], kind: &[u8; 4]) -> usize {
+    let at = bytes
+        .windows(4)
+        .position(|w| w == kind)
+        .unwrap_or_else(|| panic!("the {kind:?} box"));
+    // The box header is eight bytes, the version and flags four: the payload
+    // starts behind them.
+    at + 8 + 4
+}
+
+/// A cut MP4 file is a loud failure, not a short play.
+///
+/// The media data box states how many bytes of media data the file holds. A
+/// file that is shorter than that was cut, and the container reader - which
+/// scans the whole file before it plays anything - refuses such a file. The
+/// decoder names the cut instead of letting the bare "end of stream" of the
+/// reader stand.
+#[test]
+fn a_truncated_mp4_is_a_loud_failure() {
+    let full = mp4_pcm_bytes(1000, RATE);
+    // Cut inside the media data, in the middle of a frame.
+    let cut = full[..full.len() - 1000].to_vec();
+    assert!(cut.len() < full.len());
+    let err = SymphoniaDecoder::open(reader_source(cut, Some("m4a")))
+        .err()
+        .expect("a truncated mp4 must not open");
+    match err {
+        Error::Decode(message) => assert!(
+            message.contains("truncated"),
+            "the failure must name the truncation: {message}"
+        ),
+        other => panic!("a cut file must fail loudly: {other:?}"),
+    }
+}
+
+/// The same file on disk: the header is read from the file, not from a
+/// stream.
+#[test]
+fn a_truncated_mp4_file_on_disk_is_a_loud_failure() {
+    let full = mp4_pcm_bytes(1000, RATE);
+    let cut = full[..full.len() - 1000].to_vec();
+    let file = tempfile::NamedTempFile::new().expect("temp file");
+    std::fs::write(file.path(), &cut).expect("write");
+    let err = SymphoniaDecoder::open(MediaSource::Path(file.path().to_path_buf()))
+        .err()
+        .expect("a truncated mp4 must not open");
+    assert!(
+        matches!(&err, Error::Decode(message) if message.contains("truncated")),
+        "{err:?}"
+    );
+}
+
+/// The same file, intact: it holds everything its boxes declare, so it ends
+/// with a plain end of stream and the number of frames the media header
+/// states.
+#[test]
+fn an_intact_mp4_ends_with_the_declared_count() {
+    let full = mp4_pcm_bytes(1000, RATE);
+    let mut d = SymphoniaDecoder::open(reader_source(full, Some("m4a"))).expect("open");
+    assert_eq!(
+        d.duration().map(|d| d.as_millis()),
+        Some(22),
+        "the media header states the duration"
+    );
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(matches!(outcome, Drained::End), "{outcome:?}");
+    assert_eq!(
+        frames, 1000,
+        "the file holds every frame its media header declares"
+    );
+}
+
+/// Damage is not a cut file.
+///
+/// The samples in the middle of the file are damaged, but the file holds
+/// every byte its media data box declares: the boxes and the file agree, so
+/// the file keeps playing and ends cleanly.
+#[test]
+fn a_damaged_mp4_that_holds_all_its_bytes_is_not_called_truncated() {
+    let mut bytes = std::fs::read(fixture("sine_alac.m4a")).expect("fixture");
+    let len = bytes.len();
+    for b in &mut bytes[len / 2..len / 2 + 300] {
+        *b ^= 0xA5;
+    }
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("m4a"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "a damaged file is not a cut file: {outcome:?}"
+    );
+    assert!(
+        frames < FIXTURE_FRAMES,
+        "the damaged frame is lost: {frames} of the {FIXTURE_FRAMES} frames"
+    );
+}
+
+/// A cut MP4 file with the movie box behind the media data.
+///
+/// The file is the other way round: the media data comes first and the movie
+/// box behind it. A cut file then has no movie box at all - but the media
+/// data box still states the bytes that are missing, so the cut is named all
+/// the same.
+#[test]
+fn a_truncated_mp4_with_the_movie_box_at_the_end_is_a_loud_failure() {
+    let bytes = std::fs::read(fixture("sine_alac.m4a")).expect("fixture");
+    // Cut the file inside the media data: the movie box is behind it and is
+    // gone with it.
+    let cut = bytes[..bytes.len() / 2].to_vec();
+    assert!(
+        !cut.windows(4).any(|w| w == b"moov"),
+        "the cut file has no movie box left"
+    );
+    let err = SymphoniaDecoder::open(reader_source(cut, Some("m4a")))
+        .err()
+        .expect("a truncated mp4 must not open");
+    assert!(
+        matches!(&err, Error::Decode(message) if message.contains("truncated")),
+        "{err:?}"
+    );
+}
+
+/// A file whose sample table points beyond the end of the file.
+///
+/// The media data box is intact, so the file opens - but the samples it
+/// names are not there. The stream ends before the media header's count is
+/// reached, and the file is shorter than the sample table says: it was cut.
+#[test]
+fn an_mp4_whose_sample_table_points_beyond_the_file_is_a_loud_failure() {
+    let mut bytes = mp4_pcm_bytes(1000, RATE);
+    // The chunk offset table: move the first chunk behind the end of the
+    // file.
+    let at = mp4_offset_box(&bytes, b"stco");
+    let offset = u32::from_be_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+    bytes[at..at + 4].copy_from_slice(&(offset + 100_000).to_be_bytes());
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("m4a"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert_eq!(frames, 0, "the file holds no sample that is there");
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => assert!(
+            message.contains("truncated"),
+            "the failure must name the truncation: {message}"
+        ),
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// A file without the sample tables states nothing about its payload.
+///
+/// The sample size box is what states the number of samples and their sizes;
+/// without it the container reader refuses the file. The refusal is a
+/// defined error - never a panic, never a hang - and the decoder adds no
+/// claim of its own to it.
+#[test]
+fn an_mp4_without_the_sample_size_box_is_refused() {
+    let mut bytes = std::fs::read(fixture("sine_alac.m4a")).expect("fixture");
+    let at = bytes
+        .windows(4)
+        .position(|w| w == b"stsz")
+        .expect("the sample size box");
+    bytes[at..at + 4].copy_from_slice(b"stzX");
+    let err = SymphoniaDecoder::open(reader_source(bytes, Some("m4a")))
+        .err()
+        .expect("a file without the sample tables cannot be decoded");
+    assert_defined_open_failure(&err, "an mp4 without the sample size box");
+}
+
+/// A file without the chunk offsets states nothing about where its samples
+/// are.
+#[test]
+fn an_mp4_without_the_chunk_offsets_is_refused() {
+    let mut bytes = std::fs::read(fixture("sine_alac.m4a")).expect("fixture");
+    let at = bytes
+        .windows(4)
+        .position(|w| w == b"stco")
+        .expect("the chunk offset box");
+    bytes[at..at + 4].copy_from_slice(b"stcX");
+    let err = SymphoniaDecoder::open(reader_source(bytes, Some("m4a")))
+        .err()
+        .expect("a file without the chunk offsets cannot be decoded");
+    assert_defined_open_failure(&err, "an mp4 without the chunk offsets");
+}
+
+/// The repository fixtures: an intact MP4 file ends with the number of
+/// frames its media header states, and a cut one fails loudly.
+#[test]
+fn the_mp4_fixtures_are_read_to_their_end_and_a_cut_one_is_named() {
+    for (name, frames) in [("sine_alac.m4a", 66_150u64), ("sine_aac.m4a", 67_584)] {
+        let bytes = std::fs::read(fixture(name)).expect("fixture");
+        let mut d = SymphoniaDecoder::open(reader_source(bytes.clone(), Some("m4a")))
+            .expect("a complete fixture opens");
+        let (got, outcome) = drain_bounded(&mut d);
+        assert!(matches!(outcome, Drained::End), "{name}: {outcome:?}");
+        assert_eq!(got, frames, "{name}: the whole file was decoded");
+
+        let cut = bytes[..bytes.len() / 2].to_vec();
+        let err = SymphoniaDecoder::open(reader_source(cut, Some("m4a")))
+            .err()
+            .expect("a truncated fixture must not open");
+        assert!(
+            matches!(&err, Error::Decode(message) if message.contains("truncated")),
+            "{name}: {err:?}"
+        );
+    }
+}
+
+/// A seek must not turn a complete file into a truncated one.
+///
+/// After a seek the stream is read from the target, so the frames still to
+/// come are counted from there and the declared count is what is left of it.
+#[test]
+fn a_seek_in_an_intact_mp4_does_not_turn_it_into_a_truncation() {
+    let bytes = std::fs::read(fixture("sine_alac.m4a")).expect("fixture");
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("m4a"))).expect("open");
+    d.seek(Duration::from_millis(500)).expect("seek");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "a seek is not a cut file: {outcome:?}"
+    );
+    assert!(frames > 0, "the rest of the file is still there");
+}
+
+// ---------------------------------------------------------------------------
 // Headers that lie about their format
 // ---------------------------------------------------------------------------
 

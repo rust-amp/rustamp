@@ -32,6 +32,11 @@ Behaviour the core contract leaves open, and what the decoders do.
     two conditions as for MPEG audio: a file that is short of frames *and* of
     bytes was cut, a file that is short of frames only (a last frame the
     chunk size cut in half) keeps playing.
+  - **MP4/M4A**: the media data box states the number of bytes of media data
+    the file holds, and the media header together with the sample tables state
+    the number of frames and the bytes of the audio itself (see below). The
+    claim of the media data box is the one that survives the loss of the movie
+    box, so it is the one that names a cut file.
   FLAC is not on that list, and the reason is worth naming: its `STREAMINFO`
   block states the number of samples exactly, but the format has no field for
   the number of bytes the audio occupies, and a damaged FLAC frame is dropped
@@ -70,6 +75,36 @@ Behaviour the core contract leaves open, and what the decoders do.
   its sound data holds.
   The **duration** still comes from the reader's count, so it is up to
   `8 / block_align` frames too long (0.09 ms for 16 bit mono at 44.1 kHz).
+- **The MP4 header** (`mp4_header.rs`). An MP4 file states its payload in its
+  boxes, and it states it in two places:
+  - The **media data box** (`mdat`) states how many bytes of media data the
+    file holds. A file that is shorter than that was cut. This claim is the
+    one that survives the loss of the movie box, so it is the one that names
+    a cut file: a file whose movie box sits behind the media data (the layout
+    ffmpeg writes) has no movie box left once it is cut, but the media data
+    box is still there with its claim.
+  - The **media header** (`mdhd`) states the duration of a track in units of
+    the media timescale, and the **sample tables** (`stsz`, `stsc`, `stco` /
+    `co64`) state where the samples of the track are and how many bytes they
+    occupy. Together they are the frame count and the byte count of the
+    end-of-stream rule, the same two conditions as for MPEG audio and AIFF.
+  Two things have to line up for the end-of-stream rule to apply. The
+  duration is a number of *frames* only when the media timescale is the sample
+  rate; otherwise it is a number of timescale units, which is not what the
+  reader delivers. And the reader's own count has to be the one the media
+  header states, otherwise the two counts are about different tracks - a file
+  with two sound tracks that state the same number of frames is therefore no
+  oracle at all.
+  The **where** the truncation is reported is different from the other
+  containers as well: the MP4 container reader scans the whole file before it
+  plays anything, so a cut MP4 file is refused when it is *opened*, not at
+  the end of the stream. The decoder names the cut
+  (`Error::Decode("truncated stream: the file holds N of the M bytes its
+  media data box declares")`) instead of letting the bare "end of stream" of
+  the reader stand. A file whose boxes are all there but whose sample table
+  points behind the end of the file is the case the end-of-stream rule
+  catches: it opens, and the stream ends before the media header's count is
+  reached.
 - **Seek.** `SeekMode::Accurate` plus a 4096-frame pre-roll that is decoded and
   discarded, because MP3/Vorbis/AAC need previous blocks for exact output.
   Returns the requested position clamped to the duration (it is sample exact).
@@ -156,12 +191,17 @@ correct behaviour:
    eight bytes of the `SSND` header as audio, so its own count is corrected
    before the comparison - see above).
    The MPEG audio reader only estimates its frame count when the file carries
-   no such header, and the FLAC and MP4 readers resynchronise damaged frames
-   without counting them - so a truncated file of those kinds still ends with
-   an end of stream. An AIFF file whose length is unknown (a reader that
+   no such header, and the FLAC reader resynchronises damaged frames without
+   counting them - so a truncated FLAC file still ends with an end of stream.
+   An AIFF file whose length is unknown (a reader that
    cannot report its end) has no byte count and therefore no oracle either.
    The wave decoder has no such limit: it parses the `data`
    chunk itself and compares the declared length with the bytes that are there.
+   MP4/M4A states its payload exactly as well - its media data box states the
+   bytes of the file, its media header and sample tables state the frames and
+   the bytes of the audio - but its container reader scans the whole file
+   before it plays anything, so the cut is named when the file is *opened*
+   rather than at the end of the stream (see above).
    The FLAC case is item 8 below: it is the one where the container states the
    sample count exactly and still cannot say whether the file was cut.
 2. **A damaged file whose *content signature* matches is reported as
@@ -237,6 +277,28 @@ correct behaviour:
    close to its own size), so it fires for some cuts and not for others, and
    a loud failure on such a threshold would be an unstable promise. It is
    therefore not implemented, and the honest end of stream stays.
+9. **An MP4 file is only a loud failure when its own boxes agree** (symphonia).
+   MP4/M4A states its payload exactly, so it has an oracle - but the oracle
+   needs the boxes to agree with each other and with the reader:
+   - The **media data box** names the cut when the file is shorter than the
+     box claims. That claim survives the loss of the movie box, so it is the
+     one that names a cut file in either layout.
+   - The **end-of-stream rule** (the media header's frame count and the
+     sample tables' byte count) needs the media timescale to be the sample
+     rate (otherwise the duration is a number of timescale units and not a
+     number of frames) and the reader's own count to be the one the media
+     header states (otherwise the two counts are about different tracks). A
+     file with two sound tracks that state the same number of frames, a
+     fragmented file without a movie box, and a file whose length is unknown
+     are therefore no oracle: they end as they always did.
+   - A file that holds every byte its media data box declares is not a cut
+     file, even when its media header claims more frames than the file
+     delivers: a damaged AAC or ALAC frame is dropped by the reader, so a
+     corrupt-but-complete file is short of frames exactly like a cut one
+     (measured on the repository fixtures: 62054 of 66150 frames for the
+     damaged ALAC file, 64512 of 67584 for the damaged AAC file) while it
+     holds all of its bytes. It ends cleanly, like the damaged file it
+     resembles.
 
 ## Proposals
 

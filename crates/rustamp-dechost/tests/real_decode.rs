@@ -29,7 +29,10 @@
 //! fails with a diagnostic that names the truncation, an intact file ends
 //! with an end of stream and the frame count its container declares, and a
 //! stream that holds no frames at all ends with an end of stream too (there
-//! is nothing missing).
+//! is nothing missing). A container whose reader scans the whole file before
+//! it plays anything (MP4) refuses a cut file when it is opened instead:
+//! that terminal is a refusal with the same diagnostic, and it is pinned
+//! separately.
 
 #![cfg(windows)]
 
@@ -543,6 +546,58 @@ fn an_intact_file_ends_with_a_clean_end_of_stream() {
     );
     assert_eq!(session.frames_dropped(), 0);
     finish_ok(session, done);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A truncated MP4 file is refused when it is opened, and the refusal names
+/// the truncation.
+///
+/// The MP4 container reader scans the whole file before it plays anything, so
+/// a cut MP4 file never reaches the transfer: it is refused at the open.
+/// The terminal shape is therefore the one of an unreadable file, not the one
+/// of a failed transfer - and the reason that reaches the player names the
+/// cut, so a half-downloaded track is not mistaken for a finished one.
+#[test]
+fn a_truncated_mp4_is_refused_at_the_open_and_never_ends_the_stream() {
+    let bytes = std::fs::read(repo_fixture("sine_alac.m4a")).expect("fixture");
+    // Cut the file inside the media data: the movie box is behind it and is
+    // gone with it.
+    let cut = bytes[..bytes.len() / 2].to_vec();
+    let path = temp_file("truncated.m4a", &cut);
+
+    // The in-process reference: the file is refused when it is opened, and
+    // the refusal names the cut.
+    let error = rustamp_decoders::default_registry()
+        .open(MediaSource::Path(path.clone()))
+        .err()
+        .expect("a truncated mp4 must not open");
+    assert!(
+        error.to_string().contains("truncated"),
+        "the refusal must name the truncation: {error}"
+    );
+
+    // The hosted path: the session never opens, so the player sees a loud
+    // refusal and never an end of stream.
+    let ((ar, aw), (br, bw)) = streams();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        let outcome = serve_decoder(&host, &NamedPcmRings, &RegistryResident);
+        let _ = done.send(outcome);
+    });
+    let outcome = DecoderSession::open(client, NamedPcmRings, file_location(&path), 3);
+    let Err(error) = outcome else {
+        panic!("a truncated mp4 must be a loud refusal, never an accepted session");
+    };
+    assert!(
+        error.to_string().contains("truncated"),
+        "the refusal must carry the resident's reason: {error}"
+    );
+    result
+        .recv_timeout(JOIN_WAIT)
+        .expect("host must end after a failed open instead of stalling")
+        .expect_err("a failed open must end the host with an error");
     let _ = std::fs::remove_file(&path);
 }
 

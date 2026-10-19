@@ -18,8 +18,13 @@
 //!   before that count is reached, the file was cut and `read` reports
 //!   [`Error::Decode`]. A file that holds everything its container declares
 //!   ends with `Ok(0)` as before. The rule is limited to the containers that
-//!   state their payload exactly (RIFF/WAVE, AIFF, and MPEG audio with a
+//!   state their payload exactly (RIFF/WAVE, AIFF, MPEG audio with a
 //!   Xing/Info header); see [`declared_payload`].
+//! * **MP4/M4A states its payload exactly too**, but its container reader
+//!   scans the whole file before it plays anything: a cut MP4 file is refused
+//!   when it is opened, not at the end of the stream. The decoder names the
+//!   cut instead of letting the bare "end of stream" of the reader stand (see
+//!   [`mp4_truncation`]).
 //! * **FLAC has no such oracle** (a named limit, see `CONTRACT_NOTES.md`):
 //!   its `STREAMINFO` block states the number of samples exactly, but the
 //!   format states no byte count anywhere, and a damaged FLAC frame is
@@ -247,6 +252,12 @@ struct HeaderProbe {
     /// chunks state the payload, and they are not always inside the header
     /// window.
     aiff: Option<crate::aiff_header::AiffHeader>,
+    /// What an MP4 file states about its payload, when the file is an MP4
+    /// file.
+    ///
+    /// The movie box can be at the end of the file and larger than the header
+    /// window, so the boxes are read from the file itself.
+    mp4: Option<crate::mp4_header::Mp4Header>,
 }
 
 /// The byte claim of a container: how many bytes the payload occupies and how
@@ -279,9 +290,15 @@ struct ByteClaim {
 /// frame count is not the count of the file (see `aiff_header`); the count
 /// the file states is the one to compare with.
 ///
+/// MP4 states both counts as well: the media header states the duration of
+/// the track in units of the media timescale, and the sample tables state
+/// where the samples of the track are and how many bytes they occupy. The
+/// duration is a frame count only when the media timescale is the sample
+/// rate, and the reader's own count has to be the one the media header
+/// states - otherwise the two counts are about different tracks.
+///
 /// Every other container this crate reads either estimates the count (MPEG
-/// Every other container this crate reads either estimates the count (MPEG
-/// audio without a Xing/Info tag, MP4), counts it differently from what it
+/// audio without a Xing/Info tag), counts it differently from what it
 /// delivers (the AIFF reader includes the `SSND` header in its frame count)
 /// or can lose frames to damage without losing any (FLAC), so their count is
 /// no evidence of a cut file.
@@ -349,6 +366,37 @@ fn declared_payload(
             source: "its COMM chunk",
         });
     }
+    // MP4/M4A: the media header states the number of frames and the sample
+    // tables state where the samples are and how many bytes they occupy.
+    if let Some(mp4) = &header.mp4 {
+        // The reader's own count has to be the one the media header states:
+        // otherwise the two counts are about different tracks.
+        let n_frames = params.n_frames?;
+        let mut matching = mp4.tracks().iter().filter(|t| t.frames() == n_frames);
+        let track = matching.next()?;
+        if matching.next().is_some() {
+            // Two sound tracks state the same number of frames: which one the
+            // reader picked cannot be told apart.
+            return None;
+        }
+        // The duration is a number of frames only when the media timescale is
+        // the sample rate. Otherwise it is a number of timescale units, and
+        // that is not what the reader delivers.
+        if track.timescale() != params.sample_rate? {
+            return None;
+        }
+        // The byte count is what tells a cut file from a damaged one, so a
+        // file whose length is unknown has no oracle.
+        let byte_len = byte_len?;
+        return Some(Declared {
+            frames: track.frames(),
+            bytes: Some(ByteClaim {
+                declared: track.data_bytes(),
+                available: byte_len.saturating_sub(track.data_start()),
+            }),
+            source: "its media header",
+        });
+    }
     // MPEG audio: the Xing/Info tag states the frame count and the byte count
     // of the audio data.
     let xing = crate::mpeg_header::parse(header.id3v2, &header.window)?;
@@ -394,6 +442,7 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
             id3v2: 0,
             window: Vec::new(),
             aiff: None,
+            mp4: None,
         };
     }
     let id3v2 = crate::mpeg_header::id3v2_len(&head);
@@ -402,6 +451,7 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
             id3v2,
             window: Vec::new(),
             aiff: None,
+            mp4: None,
         };
     }
     let mut window = vec![0u8; HEADER_WINDOW];
@@ -419,11 +469,39 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
     // are read from the file itself: the chunks before the sound data can be
     // larger than the header window.
     let aiff = crate::aiff_header::parse(reader, len);
+    // An MP4 file states its payload in its media data box and in its sample
+    // tables. They are read from the file itself: the movie box can be at
+    // the end of the file and larger than the header window.
+    let mp4 = if crate::mp4_header::looks_like_mp4(&window) {
+        crate::mp4_header::parse(reader, len)
+    } else {
+        None
+    };
     HeaderProbe {
         id3v2,
         window,
         aiff,
+        mp4,
     }
+}
+
+/// The message for a file that ends before the media data box says it does.
+///
+/// The media data box of an MP4 file states how many bytes of media data the
+/// file holds. A file that is shorter than that was cut. The container reader
+/// scans the whole file before it plays anything, so it refuses such a file
+/// with a bare "end of stream" - naming the cut is the point of the oracle.
+fn mp4_truncation(header: &HeaderProbe, byte_len: Option<u64>) -> Option<String> {
+    let (start, end) = header.mp4.as_ref()?.media_data()?;
+    let byte_len = byte_len?;
+    if byte_len >= end {
+        return None;
+    }
+    Some(format!(
+        "truncated stream: the file holds {} of the {} bytes its media data box declares",
+        byte_len.saturating_sub(start),
+        end - start
+    ))
 }
 
 /// Queues a detected mid-stream format change.
@@ -527,6 +605,14 @@ impl SymphoniaDecoder {
         // is certain.
         if byte_len == Some(0) {
             return Err(Error::Decode("empty source: 0 bytes to decode".into()));
+        }
+
+        // A file that ends before the media data box of an MP4 file says it
+        // does was cut. The container reader scans the whole file before it
+        // plays anything, so it refuses such a file with a bare "end of
+        // stream" - naming the cut is the point of the oracle.
+        if let Some(message) = mp4_truncation(&header, byte_len) {
+            return Err(Error::Decode(message));
         }
 
         let mut hint = Hint::new();
@@ -1102,6 +1188,7 @@ mod tests {
                 id3v2: 0,
                 window: wave.clone(),
                 aiff: None,
+                mp4: None,
             },
             &params,
             Some(4096),
@@ -1123,6 +1210,7 @@ mod tests {
                     id3v2: 0,
                     window: avi,
                     aiff: None,
+                    mp4: None,
                 },
                 &params,
                 Some(4096)
@@ -1139,6 +1227,7 @@ mod tests {
                     id3v2: 0,
                     window: b"fLaC\0\0\0\0\0\0\0\0".to_vec(),
                     aiff: None,
+                    mp4: None,
                 },
                 &params,
                 Some(4096)
@@ -1163,6 +1252,7 @@ mod tests {
             id3v2: 0,
             window,
             aiff: None,
+            mp4: None,
         };
 
         let mut params = CodecParameters::new();
