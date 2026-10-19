@@ -168,6 +168,12 @@ fn approval_store_path() -> Option<std::path::PathBuf> {
 /// Create the host window, serve the control channel, run until shutdown.
 #[cfg(windows)]
 fn run_windows() -> i32 {
+    // The fault filter goes up before anything else can run plugin code: from
+    // now on an unhandled exception (a plugin that dereferences a null
+    // pointer, say) is reported on stderr and ends the host with the exit
+    // code the supervisor recognises (`rustamp_plughost::fault`).
+    let _fault_guard = rustamp_plughost::fault::install_fault_guard();
+
     let surface = IpcSurface::new();
     let window = match HostWindow::create(surface) {
         Ok(window) => window,

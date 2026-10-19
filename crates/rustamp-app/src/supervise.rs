@@ -48,6 +48,13 @@
 //!   replaced the same way rather than half-reused. Spawn attempts are
 //!   cooldown-gated so a host that dies on start cannot turn into a spawn
 //!   loop. [`Supervisor::stop`] is the deliberate off-switch.
+//! * **A dead host is reported, not swallowed.** The child's exit code says
+//!   how it died, and the crash policy
+//!   ([`rustamp_plughost::restart`]) says what happens next: a fresh host
+//!   after a growing delay, or — after too many crashes in a row — no fresh
+//!   host at all. The report comes back out of
+//!   [`supervise`](Supervisor::supervise) so the app can show it to the user
+//!   (PLAN M3: "Crash isolation: restart the host on plugin crash").
 //!
 //! # Binary-path finding
 //!
@@ -86,9 +93,15 @@
 //!   live-but-not-reading host fills the queue and detaches within the
 //!   liveness timeout instead of stalling a write (finding F3 in
 //!   [`crate::host`]).
-//! * **F3 — restart policy.** A dead host is retried forever, gated only by
-//!   the cooldown. Give-up/backoff policy is undecided by the RFCs and is
-//!   reported, not chosen.
+//! * **F3 — restart policy (decided, documented in the host's crate).** The
+//!   RFCs leave the give-up and backoff policy open, so it is chosen here and
+//!   written down in one place: [`rustamp_plughost::restart`] owns the
+//!   host-death contract (the exit codes the host uses and the decision the
+//!   supervisor takes), and this module applies it. A dead host is replaced
+//!   after the cooldown, each further consecutive crash doubles the delay,
+//!   and after three crashes in a row the host is left down with a loud
+//!   report. A host that ran for longer than a minute is not part of a crash
+//!   loop, so its death starts the count again.
 
 use std::io;
 use std::path::PathBuf;
@@ -97,6 +110,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use rustamp_ipc::{IpcError, Message, StreamTransport, Transport};
+use rustamp_plughost::restart::{
+    CrashLedger, DEFAULT_CRASH_WINDOW, DEFAULT_MAX_CONSECUTIVE_CRASHES, DEFAULT_MAX_RESTART_DELAY,
+    HostExit, RestartDecision, RestartPolicy, classify_exit,
+};
 
 use crate::host::HostStateLink;
 
@@ -247,6 +264,13 @@ pub trait HostProcess {
     /// Non-blocking: `true` while the host is still running. Must never block
     /// and never panic; an indeterminate state counts as dead.
     fn is_running(&mut self) -> bool;
+
+    /// The host's exit code, once it has ended; `None` while it runs.
+    ///
+    /// The supervisor reads it to tell a crash from an ordinary exit (see
+    /// `rustamp_plughost::restart`), so it must never block and must never
+    /// panic.
+    fn exit_code(&mut self) -> Option<i32>;
 }
 
 /// How a [`Supervisor`] starts hosts: one method, so the production spawn
@@ -275,6 +299,16 @@ impl HostProcess for ChildHost {
         // `try_wait` never blocks; anything but "still running" (exited, or an
         // error that should not happen) counts as dead rather than panicking.
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn exit_code(&mut self) -> Option<i32> {
+        // `try_wait` never blocks and keeps the status once the child ended,
+        // so asking again after the child died is free and still correct.
+        self.child
+            .try_wait()
+            .ok()
+            .flatten()
+            .and_then(|status| status.code())
     }
 }
 
@@ -485,7 +519,8 @@ pub enum SupervisorState {
     Running,
     /// Deliberately stopped via [`Supervisor::stop`]. Will NOT restart until [`Supervisor::resume`] is called.
     Stopped,
-    /// Persistent failure state: consecutive spawn or handshake failures exceeded the policy limit.
+    /// Persistent failure state: consecutive spawn or handshake failures exceeded the policy limit,
+    /// or the crash policy gave up after too many crashes in a row.
     PersistentFailure,
 }
 
@@ -494,6 +529,22 @@ pub const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// Default timeout for waiting for the child's startup [`Message::Hello`].
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The restart policy for a host that died.
+///
+/// The policy lives in the host's own crate (`rustamp_plughost::restart`),
+/// because it is the contract between the two processes: the host says how it
+/// died through its exit code, and this policy says what the supervisor does
+/// about it. The cooldown is the policy's base delay: it is already "the
+/// minimum time between two spawn attempts".
+fn restart_policy(cooldown: Duration) -> RestartPolicy {
+    RestartPolicy::new(
+        DEFAULT_MAX_CONSECUTIVE_CRASHES,
+        cooldown,
+        DEFAULT_MAX_RESTART_DELAY,
+        DEFAULT_CRASH_WINDOW,
+    )
+}
 
 struct PendingHost<L, P> {
     transport: L,
@@ -519,28 +570,30 @@ pub struct Supervisor<B: HostBackend = ProcessBackend> {
     spawn_attempts: u64,
     consecutive_failures: u32,
     max_consecutive_failures: u32,
+    /// What to do when the host died (see `rustamp_plughost::restart`).
+    policy: RestartPolicy,
+    /// The crashes that happened in a row, so the retries stay bounded.
+    crashes: CrashLedger,
+    /// When the running host was attached, so a death can be told from a
+    /// crash loop.
+    started_at: Option<Instant>,
+    /// The earliest time the next spawn may happen (the crash policy's delay).
+    next_spawn_at: Option<Instant>,
 }
 
 impl<B: HostBackend> Supervisor<B> {
     /// A supervisor that has started nothing yet (the link stays detached
     /// until the first [`supervise`](Supervisor::supervise)).
     pub fn new(backend: B) -> Self {
-        Supervisor {
-            backend,
-            process: None,
-            pending: None,
-            state: SupervisorState::Running,
-            last_attempt: None,
-            cooldown: DEFAULT_RESTART_COOLDOWN,
-            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
-            spawn_attempts: 0,
-            consecutive_failures: 0,
-            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
-        }
+        Supervisor::with_cooldown(backend, DEFAULT_RESTART_COOLDOWN)
     }
 
     /// Like [`new`](Supervisor::new) with an explicit restart cooldown
     /// (tests use [`Duration::ZERO`] to skip waiting).
+    ///
+    /// The cooldown is also the base delay of the crash policy: the first
+    /// restart after a crash waits one cooldown, and each further consecutive
+    /// crash doubles it.
     pub fn with_cooldown(backend: B, cooldown: Duration) -> Self {
         Supervisor {
             backend,
@@ -553,6 +606,10 @@ impl<B: HostBackend> Supervisor<B> {
             spawn_attempts: 0,
             consecutive_failures: 0,
             max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            policy: restart_policy(cooldown),
+            crashes: CrashLedger::new(),
+            started_at: None,
+            next_spawn_at: None,
         }
     }
 
@@ -574,6 +631,10 @@ impl<B: HostBackend> Supervisor<B> {
             spawn_attempts: 0,
             consecutive_failures: 0,
             max_consecutive_failures,
+            policy: restart_policy(cooldown),
+            crashes: CrashLedger::new(),
+            started_at: None,
+            next_spawn_at: None,
         }
     }
 
@@ -603,10 +664,16 @@ impl<B: HostBackend> Supervisor<B> {
     }
 
     /// Reset any stopped or failed state and permit supervising/restarting again (Finding 12).
+    ///
+    /// The crash history goes with it: a deliberate resume is a fresh start,
+    /// not a continuation of the crash loop.
     pub fn resume(&mut self) {
         self.state = SupervisorState::Running;
         self.consecutive_failures = 0;
         self.pending = None;
+        self.crashes.reset();
+        self.started_at = None;
+        self.next_spawn_at = None;
     }
 
     /// Whether a live managed child exists right now (non-blocking).
@@ -621,23 +688,51 @@ impl<B: HostBackend> Supervisor<B> {
         }
     }
 
+    /// What to do after the host died.
+    ///
+    /// The host's exit code says how it died, the policy says what happens
+    /// next, and the report says it out loud. The player is never affected:
+    /// the host is a separate process, so a dead host costs the plugins, not
+    /// the playback.
+    fn on_host_death(&mut self, exit: HostExit) -> Option<String> {
+        let lived = self.started_at.map(|at| at.elapsed()).unwrap_or_default();
+        let crashes = self.crashes.record(exit, lived, self.policy.crash_window);
+        match self.policy.decide(exit, crashes) {
+            RestartDecision::Restart { after, report } => {
+                // The next spawn waits for the policy's delay: the cooldown
+                // for the first crash, twice that for the next one.
+                self.next_spawn_at = Some(Instant::now() + after);
+                Some(report)
+            }
+            RestartDecision::GiveUp { report } => {
+                // The retries are bounded: the host stays down until the
+                // supervisor is resumed deliberately.
+                self.state = SupervisorState::PersistentFailure;
+                Some(report)
+            }
+        }
+    }
+
     /// One non-blocking supervision step: reap a dead child, replace a
     /// desynced one, enforce the startup Hello barrier (Finding 8), and
     /// (re-)attach a fresh transport when due.
     ///
     /// Never blocks, never panics, never propagates an error: a host that
     /// cannot be started leaves the link detached and the player unaffected.
-    pub fn supervise(&mut self, link: &mut HostStateLink) {
+    ///
+    /// Returns the report about a host that died, if one died: the caller
+    /// shows it to the user (the app notes it, the presenter prints it).
+    pub fn supervise(&mut self, link: &mut HostStateLink) -> Option<String> {
         // Finding 12: stopped state sticks, and persistent failures halt attempts.
         if self.state == SupervisorState::Stopped
             || self.state == SupervisorState::PersistentFailure
         {
-            return;
+            return None;
         }
 
         let live = self.process.as_mut().is_some_and(|p| p.is_running());
         if live && link.is_attached() {
-            return; // healthy and connected: nothing to do
+            return None; // healthy and connected: nothing to do
         }
 
         // A dead child, or a desynced one (a live child whose link was detached:
@@ -645,6 +740,17 @@ impl<B: HostBackend> Supervisor<B> {
         // and counted as a failure. The spawn path below then decides in the
         // *same* pump whether a replacement is due, so a host that dies is
         // replaced on one supervision step rather than on the next one.
+        let mut report = None;
+        if !live && self.process.is_some() {
+            // The host is gone. Its exit code says how it died, and the crash
+            // policy says what happens next: a fresh host after a growing
+            // delay, or the end of the retries.
+            let exit_code = self
+                .process
+                .as_mut()
+                .and_then(|process| process.exit_code());
+            report = self.on_host_death(classify_exit(exit_code));
+        }
         if link.is_attached() {
             self.process = None;
             link.detach();
@@ -657,18 +763,18 @@ impl<B: HostBackend> Supervisor<B> {
         // The reap above may have tripped the failure policy: stop rather than
         // spawn into a state that is meant to hold.
         if self.state == SupervisorState::PersistentFailure {
-            return;
+            return report;
         }
 
         // Handshake barrier (Finding 8): if we have a spawned child waiting for greeting.
         if let Some(mut pending) = self.pending.take() {
             if !pending.process.is_running() {
                 self.record_failure();
-                return;
+                return report;
             }
             if Instant::now() >= pending.deadline {
                 self.record_failure();
-                return;
+                return report;
             }
             match pending.transport.try_recv() {
                 Ok(Some(Message::Hello {
@@ -681,36 +787,42 @@ impl<B: HostBackend> Supervisor<B> {
                         link.attach(pending.transport);
                         link.record_greeting(protocol_version, pid);
                         self.process = Some(pending.process);
-                        return;
+                        self.started_at = Some(Instant::now());
+                        return report;
                     } else {
                         // Incompatible protocol version: reject and reap.
                         self.record_failure();
-                        return;
+                        return report;
                     }
                 }
                 Ok(Some(_)) => {
                     // Protocol violation: received message before startup Hello.
                     self.record_failure();
-                    return;
+                    return report;
                 }
                 Ok(None) => {
                     // Still waiting for Hello: keep link detached until greeting arrives.
                     self.pending = Some(pending);
-                    return;
+                    return report;
                 }
                 Err(_) => {
                     self.record_failure();
-                    return;
+                    return report;
                 }
             }
         }
 
-        // Cooling down: stay detached rather than spin on spawns.
+        // Cooling down: stay detached rather than spin on spawns. The crash
+        // policy's delay is a second floor: a host that died waits for it
+        // even when the cooldown has passed.
         if self
             .last_attempt
             .is_some_and(|at| at.elapsed() < self.cooldown)
         {
-            return;
+            return report;
+        }
+        if self.next_spawn_at.is_some_and(|at| Instant::now() < at) {
+            return report;
         }
 
         self.last_attempt = Some(Instant::now());
@@ -719,7 +831,7 @@ impl<B: HostBackend> Supervisor<B> {
             Ok((mut transport, mut process)) => {
                 if !process.is_running() {
                     self.record_failure();
-                    return;
+                    return report;
                 }
                 // Check if Hello is already buffered on the transport (e.g. in-memory tests or fast child):
                 match transport.try_recv() {
@@ -732,6 +844,7 @@ impl<B: HostBackend> Supervisor<B> {
                             link.attach(transport);
                             link.record_greeting(protocol_version, pid);
                             self.process = Some(process);
+                            self.started_at = Some(Instant::now());
                         } else {
                             self.record_failure();
                         }
@@ -757,6 +870,7 @@ impl<B: HostBackend> Supervisor<B> {
                 self.record_failure();
             }
         }
+        report
     }
 
     /// The deliberate off-switch (Finding 12): kill the managed child (best-effort,
@@ -807,17 +921,29 @@ mod tests {
         /// Liveness flags of the spawned processes: the test flips these to
         /// simulate host death.
         flags: Vec<Rc<Cell<bool>>>,
+        /// The exit code every dead host reports: the test sets it to a
+        /// Windows exception status to simulate a crash.
+        exit_codes: Vec<Rc<Cell<i32>>>,
         /// Whether spawn should automatically send `Message::hello()`.
         auto_hello: bool,
     }
 
     struct FakeProcess {
         alive: Rc<Cell<bool>>,
+        exit_code: Rc<Cell<i32>>,
     }
 
     impl HostProcess for FakeProcess {
         fn is_running(&mut self) -> bool {
             self.alive.get()
+        }
+
+        fn exit_code(&mut self) -> Option<i32> {
+            if self.alive.get() {
+                None
+            } else {
+                Some(self.exit_code.get())
+            }
         }
     }
 
@@ -835,7 +961,9 @@ mod tests {
                     self.peers.push(peer);
                     let alive = Rc::new(Cell::new(alive));
                     self.flags.push(Rc::clone(&alive));
-                    Ok((app_end, FakeProcess { alive }))
+                    let exit_code = Rc::new(Cell::new(0));
+                    self.exit_codes.push(Rc::clone(&exit_code));
+                    Ok((app_end, FakeProcess { alive, exit_code }))
                 }
                 Some(Err(error)) => Err(error),
                 None => Err(io::Error::new(
@@ -851,6 +979,7 @@ mod tests {
             script: VecDeque::from([Ok(first)]),
             peers: Vec::new(),
             flags: Vec::new(),
+            exit_codes: Vec::new(),
             auto_hello: true,
         }
     }
@@ -865,7 +994,7 @@ mod tests {
     fn first_supervise_attaches_and_publishes_over_the_same_channel() {
         let (mut supervisor, mut link) = supervised(true);
         assert!(!link.is_attached());
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(link.is_attached());
         assert!(supervisor.is_live());
         assert_eq!(supervisor.spawn_attempts(), 1);
@@ -882,13 +1011,19 @@ mod tests {
     #[test]
     fn a_dead_host_is_reaped_and_replaced_with_a_fresh_transport() {
         let (mut supervisor, mut link) = supervised(true);
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(link.is_attached());
 
         // The host dies. The next step reaps it and starts a fresh pair.
         supervisor.backend.flags[0].set(false);
         supervisor.backend.script.push_back(Ok(true));
-        supervisor.supervise(&mut link);
+        let report = supervisor
+            .supervise(&mut link)
+            .expect("a dead host is reported");
+        assert!(
+            report.contains("the plugin host exited on its own"),
+            "the report must say what happened: {report}"
+        );
         assert_eq!(supervisor.spawn_attempts(), 2);
         assert!(link.is_attached());
         assert!(supervisor.is_live());
@@ -904,22 +1039,114 @@ mod tests {
     }
 
     #[test]
+    fn a_crashed_host_is_reported_and_replaced() {
+        let (mut supervisor, mut link) = supervised(true);
+        assert!(supervisor.supervise(&mut link).is_none());
+        assert!(link.is_attached());
+
+        // The host dies from a Windows access violation (0xC0000005).
+        supervisor.backend.flags[0].set(false);
+        supervisor.backend.exit_codes[0].set(0xC000_0005u32 as i32);
+        supervisor.backend.script.push_back(Ok(true));
+
+        let report = supervisor
+            .supervise(&mut link)
+            .expect("a crashed host is reported");
+        assert!(
+            report.contains("the plugin host crashed (Windows exception 0xC0000005)"),
+            "the report must name the crash: {report}"
+        );
+        assert!(
+            report.contains("the player keeps playing"),
+            "the report must say the player is unaffected: {report}"
+        );
+        // The player keeps playing and a fresh host takes over.
+        assert_eq!(supervisor.spawn_attempts(), 2);
+        assert!(link.is_attached());
+        assert!(supervisor.is_live());
+    }
+
+    #[test]
+    fn a_plugin_fault_is_reported_as_a_fault() {
+        let (mut supervisor, mut link) = supervised(true);
+        assert!(supervisor.supervise(&mut link).is_none());
+
+        // The host caught the fault itself and ended with its own exit code.
+        supervisor.backend.flags[0].set(false);
+        supervisor.backend.exit_codes[0].set(rustamp_plughost::PLUGIN_FAULT_EXIT_CODE as i32);
+        supervisor.backend.script.push_back(Ok(true));
+
+        let report = supervisor
+            .supervise(&mut link)
+            .expect("a plugin fault is reported");
+        assert!(
+            report.contains("reported a plugin fault"),
+            "the report must name the fault: {report}"
+        );
+        assert!(
+            report.contains("stderr line names the plugin"),
+            "the report must point at the host's own report: {report}"
+        );
+    }
+
+    #[test]
+    fn a_crash_loop_ends_the_retries_with_a_loud_report() {
+        let (mut supervisor, mut link) = supervised(true);
+        assert!(supervisor.supervise(&mut link).is_none());
+
+        for crash in 1..=3 {
+            // The host that is running dies from an access violation.
+            let index = supervisor.backend.flags.len() - 1;
+            supervisor.backend.flags[index].set(false);
+            supervisor.backend.exit_codes[index].set(0xC000_0005u32 as i32);
+            supervisor.backend.script.push_back(Ok(true));
+
+            let report = supervisor
+                .supervise(&mut link)
+                .expect("every crash is reported");
+            if crash < 3 {
+                assert!(
+                    report.contains(&format!("crash {crash} of 3")),
+                    "the report must count the crashes: {report}"
+                );
+            } else {
+                assert!(
+                    report.contains("crashed 3 times in a row"),
+                    "the last report must name the loop: {report}"
+                );
+            }
+        }
+
+        // The retries are bounded: the host stays down until the supervisor is
+        // resumed deliberately.
+        assert!(supervisor.is_failed());
+        let attempts = supervisor.spawn_attempts();
+        assert!(supervisor.supervise(&mut link).is_none());
+        assert_eq!(
+            supervisor.spawn_attempts(),
+            attempts,
+            "a failed supervisor must not start another host"
+        );
+    }
+
+    #[test]
     fn a_failed_spawn_stays_detached_and_the_cooldown_bounds_retries() {
         let mut supervisor = Supervisor::with_cooldown(
             FakeBackend {
                 script: VecDeque::from([Err(io::Error::new(io::ErrorKind::NotFound, "no binary"))]),
                 peers: Vec::new(),
                 flags: Vec::new(),
+                exit_codes: Vec::new(),
                 auto_hello: true,
             },
             Duration::from_secs(3600),
         );
         let mut link = HostStateLink::detached();
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(!link.is_attached());
         assert_eq!(supervisor.spawn_attempts(), 1);
         // Still cooling down: no second attempt, still detached, no panic.
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert_eq!(supervisor.spawn_attempts(), 1);
         assert!(!link.is_attached());
     }
@@ -927,11 +1154,11 @@ mod tests {
     #[test]
     fn a_live_but_detached_child_is_replaced_not_reused() {
         let (mut supervisor, mut link) = supervised(true);
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         supervisor.backend.script.push_back(Ok(true));
         // Desync the pair by hand (what a `HostGone` send does on its own).
         link.detach();
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert_eq!(supervisor.spawn_attempts(), 2);
         assert!(link.is_attached());
     }
@@ -939,7 +1166,7 @@ mod tests {
     #[test]
     fn stop_kills_the_child_and_detaches_without_a_send() {
         let (mut supervisor, mut link) = supervised(true);
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(supervisor.is_live());
         supervisor.stop(&mut link);
         assert!(!link.is_attached());
@@ -953,7 +1180,7 @@ mod tests {
     #[test]
     fn stop_sticks_and_subsequent_supervise_does_not_restart_until_resumed() {
         let (mut supervisor, mut link) = supervised(true);
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(supervisor.is_live());
         assert!(link.is_attached());
 
@@ -964,7 +1191,7 @@ mod tests {
 
         // Subsequent supervise calls do NOT restart while stopped (Finding 12)
         supervisor.backend.script.push_back(Ok(true));
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(!link.is_attached());
         assert!(!supervisor.is_live());
         assert_eq!(supervisor.spawn_attempts(), 1);
@@ -972,7 +1199,7 @@ mod tests {
         // Resume re-enables supervision
         supervisor.resume();
         assert_eq!(supervisor.state(), SupervisorState::Running);
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(link.is_attached());
         assert!(supervisor.is_live());
         assert_eq!(supervisor.spawn_attempts(), 2);
@@ -990,28 +1217,29 @@ mod tests {
                 ]),
                 peers: Vec::new(),
                 flags: Vec::new(),
+                exit_codes: Vec::new(),
                 auto_hello: true,
             },
             Duration::ZERO,
         );
         let mut link = HostStateLink::detached();
         // Failure 1
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert_eq!(supervisor.consecutive_failures(), 1);
         assert_eq!(supervisor.state(), SupervisorState::Running);
 
         // Failure 2
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert_eq!(supervisor.consecutive_failures(), 2);
         assert_eq!(supervisor.state(), SupervisorState::Running);
 
         // Failure 3: trips DEFAULT_MAX_CONSECUTIVE_FAILURES (3) -> PersistentFailure (Finding 12)
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert_eq!(supervisor.consecutive_failures(), 3);
         assert!(supervisor.is_failed());
 
         // Subsequent supervise calls do NOT spawn
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert_eq!(supervisor.spawn_attempts(), 3);
         assert!(supervisor.is_failed());
 
@@ -1029,7 +1257,7 @@ mod tests {
         let mut link = HostStateLink::detached();
 
         // 1. First supervise spawns child, but greeting is not sent yet (Finding 8)
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert_eq!(supervisor.spawn_attempts(), 1);
         assert!(!link.is_attached(), "must not attach before Hello arrives");
         assert_eq!(
@@ -1042,7 +1270,7 @@ mod tests {
         peer.send(&Message::hello()).expect("send greeting");
 
         // 3. Next supervise pump processes Hello, passes the barrier and attaches.
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(link.is_attached(), "must attach after compatible Hello");
         assert!(
             link.greeting().is_some(),
@@ -1061,7 +1289,7 @@ mod tests {
         let mut supervisor = Supervisor::with_cooldown(backend, Duration::ZERO);
         let mut link = HostStateLink::detached();
 
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(!link.is_attached());
 
         // Child writes greeting with incompatible protocol version (Finding 8).
@@ -1072,7 +1300,7 @@ mod tests {
         })
         .expect("send incompatible greeting");
 
-        supervisor.supervise(&mut link);
+        assert!(supervisor.supervise(&mut link).is_none());
         assert!(!link.is_attached(), "incompatible Hello must be rejected");
         assert_eq!(supervisor.consecutive_failures(), 1);
     }
@@ -1284,7 +1512,7 @@ mod tests {
         let mut link = HostStateLink::detached();
         let start = std::time::Instant::now();
         while !link.is_attached() && start.elapsed() < std::time::Duration::from_secs(5) {
-            supervisor.supervise(&mut link);
+            assert!(supervisor.supervise(&mut link).is_none());
             if !link.is_attached() {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }

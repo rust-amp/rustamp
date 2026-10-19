@@ -1053,7 +1053,11 @@ impl App {
         // host only costs a cooldown-gated spawn attempt and the mirror below
         // degrades to detached. Unmanaged by default (no spawns in tests).
         if let Some(supervisor) = self.host_supervisor.as_mut() {
-            supervisor.supervise(&mut self.host);
+            // A host that died is reported to the user: the presenter prints
+            // the notes (see `crate::window`).
+            if let Some(report) = supervisor.supervise(&mut self.host) {
+                self.note(report);
+            }
         }
         // Mirror the player state to the plugin host (see `crate::host`):
         // best-effort by contract, so the outcome is ignored — a detached or

@@ -23,12 +23,14 @@ pub mod approval;
 mod commands;
 pub mod control;
 pub mod dsp;
+pub mod fault;
 pub mod host_window;
 pub mod ipc;
 pub mod loader;
 pub mod message_loop;
 pub mod pe_preflight;
 pub mod registry;
+pub mod restart;
 pub mod state_bridge;
 pub mod vis;
 
@@ -38,6 +40,9 @@ pub use commands::{
     drop_reason,
 };
 pub use dsp::{DspError, DspLibraryInfo, DspModuleInfo, DspRunInfo};
+#[cfg(windows)]
+pub use fault::{FaultGuard, install_fault_guard};
+pub use fault::{PLUGIN_FAULT_EXIT_CODE, PluginIdentity, plugin_call_scope};
 pub use host_window::*;
 pub use ipc::*;
 pub use loader::{
@@ -46,5 +51,6 @@ pub use loader::{
 };
 pub use message_loop::*;
 pub use registry::{PluginRegistry, RegistryConfigError, accept_loaded_kind};
+pub use restart::{CrashLedger, HostExit, RestartDecision, RestartPolicy, classify_exit};
 pub use rustamp_plugin_abi::common;
 pub use vis::{VisError, VisLibraryInfo, VisModuleInfo, VisRunInfo};
