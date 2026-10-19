@@ -4,6 +4,22 @@
 **Date:** 2026-10-19  
 **Current State:** M0 complete, M1 nearly done, BETA-10 done
 
+> **Status update (2026-10-19, continuous run):** the section below is the
+> original gap analysis. Many of its items have since been implemented and are
+> listed in `docs/HANDOFF-2026-10-19-dauerbetrieb.md` (48 merged lanes): native
+> file/directory dialogs, drag-and-drop, save/load playlist with format
+> detection, playlist keyboard + sort + remove-dead + clear + drag-reorder,
+> jump-to-file, docking/snapping, window shaping, skin cursors, `pledit.txt`
+> font, `viscolor.txt` palette, EQ presets/auto-load, ReplayGain (scanner +
+> engine + config), WASAPI exclusive, device-change recovery, fades, all five
+> plugin kinds, plugin crash isolation, external control (WM_WA_IPC), the media
+> library (index, scan, view, renderer, window, covers, tag writes, roots in
+> preferences), and the cross-process wake proof. What still blocks parity is
+> listed under "Open points" in that session log: missing specs (S08, S11–S14,
+> S16, S18–S20), RFC 0020 (dated draft), and the VM verification of everything
+> window-shaped.
+
+
 ---
 
 ## Status Overview
