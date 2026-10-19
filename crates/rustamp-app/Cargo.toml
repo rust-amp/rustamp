@@ -28,6 +28,7 @@ rustamp-milkdrop.workspace = true
 rustamp-ipc.workspace = true
 rustamp-platform.workspace = true
 rustamp-prefs.workspace = true
+rustamp-plugin-abi.workspace = true
 rustamp-library.workspace = true
 # The app owns the OS window and the event loop, so it drives `winit` and
 # `softbuffer` directly (the `rustamp-ui` presenter is a manual example and
@@ -39,6 +40,7 @@ toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rustamp-plughost.workspace = true
 # Capture side of the VM-only loopback test (`tests/loopback.rs`); already a
 # workspace dependency through `rustamp-output`, so nothing new is fetched.
 cpal.workspace = true

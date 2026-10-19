@@ -92,6 +92,9 @@ pub struct App {
     eq_layout: EqualizerLayout,
     pub(crate) skin: LoadedSkin,
     config: Config,
+    /// The plug-in folder as the preferences pages last scanned it
+    /// ([`App::rescan_plugins`]); empty until the dialog first opens.
+    plugin_scan: rustamp_prefs::PluginScan,
 
     bus: EventBus,
     events: EventReceiver,
@@ -280,6 +283,7 @@ impl App {
             eq_layout: EqualizerLayout::CLASSIC,
             skin: options.skin,
             config: options.config,
+            plugin_scan: rustamp_prefs::PluginScan::default(),
             config_path: None,
             bus,
             events,
@@ -561,8 +565,73 @@ impl App {
                 state: self.engine.eq(),
             },
             playlist: PlaylistConfig::default(),
-            plugins: PluginsConfig::default(),
+            plugins: PluginsConfig {
+                // What the plug-in pages edit: the folder and the off-list.
+                // The rest stays unpersisted (see `config::serialize_honest`).
+                plugin_dir: self.config.plugins.plugin_dir.clone(),
+                disabled: self.config.plugins.disabled.clone(),
+                ..PluginsConfig::default()
+            },
         }
+    }
+
+    /// The plug-in settings the preferences pages edit.
+    pub fn plugins_config(&self) -> &PluginsConfig {
+        &self.config.plugins
+    }
+
+    /// The folder the plug-in pages scan: the configured one, else `Plugins`
+    /// beside the executable (the classic layout).
+    pub fn plugin_dir(&self) -> PathBuf {
+        self.config.plugins.plugin_dir.clone().unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("Plugins")))
+                .unwrap_or_else(|| PathBuf::from("Plugins"))
+        })
+    }
+
+    /// Where the approval store lives: beside the configuration file (the
+    /// executable's folder when no configuration path is set).
+    pub fn plugin_approvals_path(&self) -> PathBuf {
+        let beside = self
+            .config_path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            })
+            .unwrap_or_default();
+        beside.join(rustamp_prefs::APPROVALS_FILE)
+    }
+
+    /// Reads the plug-in folder and the approval store again. Reads files as
+    /// bytes only; nothing is loaded or executed.
+    pub fn rescan_plugins(&mut self) {
+        self.plugin_scan = rustamp_prefs::scan(&self.plugin_dir(), &self.plugin_approvals_path());
+    }
+
+    /// The last plug-in scan.
+    pub fn plugin_scan(&self) -> &rustamp_prefs::PluginScan {
+        &self.plugin_scan
+    }
+
+    /// Switches the scanned plug-in `index` on or off. Switching on is refused
+    /// unless the approval store approved the exact image
+    /// ([`rustamp_prefs::set_enabled`]); there is no other way to enable one.
+    pub fn set_plugin_enabled(
+        &mut self,
+        index: usize,
+        on: bool,
+    ) -> Result<(), rustamp_prefs::EnableRefused> {
+        let Some(entry) = self.plugin_scan.entries.get(index) else {
+            return Ok(());
+        };
+        rustamp_prefs::set_enabled(&mut self.config.plugins, entry, on)
     }
 
     /// Saves the current configuration to the configured path, if one is set.

@@ -10,3 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+# Plugin pages: passive PE preflight and the approval store. Neither executes
+# a plugin, so the 64-bit player may use them (only the host maps a DLL).
+rustamp-plughost.workspace = true
+rustamp-plugin-abi.workspace = true

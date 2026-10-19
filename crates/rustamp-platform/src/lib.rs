@@ -42,7 +42,7 @@ pub use popup_menu::{PopupMenuError, PopupRow, item_text, show_popup_menu};
 #[cfg(windows)]
 pub use prefs_dialog::PrefsWindow;
 pub use prefs_dialog::{
-    Bind, PrefsAction, PrefsError, PrefsNode, PrefsSettings, TREE as PREFS_TREE,
+    Bind, PluginRow, PrefsAction, PrefsError, PrefsNode, PrefsSettings, TREE as PREFS_TREE,
 };
 pub use single_instance::{
     Claim, ForwardRequest, HandOff, Instance, LockState, StartupAction, claim, forward,
