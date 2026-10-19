@@ -19,6 +19,8 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    # `CoCreateInstance` and the apartment for the folder dialog (`file_dialog`).
+    "Win32_System_Com",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
@@ -28,6 +30,8 @@ features = [
     # `GetOpenFileNameW` for the standard file-open dialog (`file_dialog`).
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
+    # `IFileOpenDialog` for the modern folder dialog (`file_dialog`); the
+    # tray icon needs the same feature.
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]

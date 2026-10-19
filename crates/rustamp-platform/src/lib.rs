@@ -14,8 +14,9 @@
 //! Single instance and command-line forwarding live in [`single_instance`].
 //! The tray menu model and the Win32 icon attach live in [`tray`]; global
 //! hotkeys live in [`hotkeys`].
-//! The standard file-open dialog lives in [`file_dialog`]; the operating
-//! system's own popup menu lives in [`popup_menu`].
+//! The standard file-open dialog and the directory picker live in
+//! [`file_dialog`]; the operating system's own popup menu lives in
+//! [`popup_menu`].
 
 pub mod displays;
 pub mod dpi;
@@ -32,8 +33,9 @@ pub use displays::{
 };
 pub use dpi::{DpiAwareness, DpiError, WindowChrome, init_dpi_awareness, outer_size_for_client};
 pub use file_dialog::{
-    EQF_FILTERS, FileDialogError, MEDIA_FILTERS, PLAYLIST_SAVE_FILTERS, parse_selection,
-    pick_eqf_file, pick_media_files, save_playlist_file,
+    CANCELLED_HRESULT, DIRECTORY_DIALOG_OPTIONS, EQF_FILTERS, FileDialogError, MEDIA_FILTERS,
+    PLAYLIST_SAVE_FILTERS, directory_dialog_options, directory_result, parse_selection,
+    parse_wide_path, pick_directory, pick_eqf_file, pick_media_files, save_playlist_file,
 };
 pub use hotkeys::{
     DEFAULT_HOTKEYS, HotkeyAction, HotkeyBackend, HotkeyCombo, HotkeyError, HotkeyId,
