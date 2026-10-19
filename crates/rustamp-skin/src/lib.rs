@@ -12,19 +12,23 @@
 //! * the cursors the skin ships ([`CursorFile`]).
 //!
 //! Missing files never fail the whole load: each one falls back per file (see
-//! [`Substitution`]). `nums_ex.bmp` falls back to `numbers.bmp`, a missing
-//! sheet falls back to the default skin, and a missing cursor falls back to
-//! the default skin's own cursor of the same name — or stays absent when the
-//! default skin carries no cursor under that name.
+//! [`Substitution`]). A missing sheet falls back to the default skin, a
+//! missing cursor falls back to the default skin's own cursor of the same name
+//! — or stays absent when the default skin carries no cursor under that name.
+//!
+//! `nums_ex.bmp` and `numbers.bmp` are **not** interchangeable: when a skin
+//! carries `nums_ex.bmp`, the time display uses it instead of
+//! `numbers.bmp` and the digit layout changes with it (S17 §3). The sheet the
+//! time display takes its digits from is [`Skin::time_digit_sheet`].
 //!
 //! ## Sprite tables
 //!
 //! The sprite rectangles and default colours in [`webamp`] were ported from
-//! webamp (MIT) and are now **reconciled with the audited spec S01**
-//! (`specs/S01-window-geometry.md`): every value cites the S01 section that
-//! measured it, and the rows S01 still calls provisional keep a
-//! `// provisional: webamp, pending S01/S17` marker. Fallback behaviour follows
-//! the audited spec S17.
+//! webamp (MIT) and are now **reconciled with the audited specs S01 and S17**
+//! (`specs/S01-window-geometry.md`, `specs/S17-skin-loading-quirks.md`): every
+//! value cites the spec section that measured it, and the rows the specs still
+//! call provisional keep a `// provisional: webamp, pending S01/S17` marker.
+//! Fallback behaviour follows the audited spec S17.
 //!
 //! Codes against the frozen core contract in [`rustamp_core`]; see
 //! `docs/rfc/0001-core-contracts.md`.

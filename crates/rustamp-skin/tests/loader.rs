@@ -163,9 +163,12 @@ fn archive_path_escapes_are_not_readable() {
     );
 }
 
+/// S17 §3: when a skin carries `nums_ex.bmp`, the time display uses it
+/// **instead of** `numbers.bmp` — and the digit layout changes with it, so
+/// the two sheets are never substituted for one another.
 #[test]
-fn nums_ex_falls_back_to_numbers_and_is_reported() {
-    // Skin with numbers.bmp but no nums_ex.bmp.
+fn nums_ex_replaces_numbers_for_the_time_display() {
+    // A skin with numbers.bmp but no nums_ex.bmp: the classic layout wins.
     let mut entries = synthetic_entries();
     entries.retain(|(name, _)| !name.eq_ignore_ascii_case("numbers.bmp"));
     entries.push((
@@ -177,33 +180,89 @@ fn nums_ex_falls_back_to_numbers_and_is_reported() {
     write_folder(dir.path(), &entries);
     let skin = Skin::load(dir.path()).unwrap();
 
-    let nums_ex = skin
-        .sheet(Sheet::NumsEx)
-        .expect("nums_ex should be substituted");
-    assert_eq!(nums_ex.pixel(0, 0), Some([200, 100, 50, 255]));
+    assert_eq!(skin.time_digit_sheet(), Sheet::Numbers);
+    // The skin's own numbers.bmp is the time-display source.
+    assert_eq!(
+        skin.sheet(Sheet::Numbers).unwrap().pixel(0, 0),
+        Some([200, 100, 50, 255])
+    );
+    // The extended sheet must not be the classic one: the two layouts differ
+    // (S17 §3), so the classic image cannot stand in for the extended sheet.
+    let default_nums_ex = BuiltinDefaultSkin.sheet_image(Sheet::NumsEx).unwrap();
+    assert_eq!(
+        skin.sheet(Sheet::NumsEx).unwrap().pixel(0, 0),
+        default_nums_ex.pixel(0, 0)
+    );
     assert!(
-        skin.substitutions().iter().any(|s| {
-            s.requested == "nums_ex.bmp" && s.with == Substitute::Sheet(Sheet::Numbers)
-        }),
-        "expected a nums_ex -> numbers substitution, got {:?}",
+        skin.substitutions()
+            .iter()
+            .any(|s| { s.requested == "nums_ex.bmp" && s.with == Substitute::DefaultSkin }),
+        "expected a default-skin substitution for nums_ex.bmp, got {:?}",
         skin.substitutions()
     );
 
-    // The reverse direction: only nums_ex.bmp present.
+    // The other way round: a skin that carries nums_ex.bmp.
     let mut entries = synthetic_entries();
     entries.retain(|(name, _)| !name.eq_ignore_ascii_case("numbers.bmp"));
     entries.push(("nums_ex.bmp".to_string(), bmp24_solid(108, 13, [7, 7, 7])));
     let dir2 = tempfile::tempdir().unwrap();
     write_folder(dir2.path(), &entries);
     let skin2 = Skin::load(dir2.path()).unwrap();
+
+    assert_eq!(skin2.time_digit_sheet(), Sheet::NumsEx);
+    assert_eq!(
+        skin2.sheet(Sheet::NumsEx).unwrap().pixel(0, 0),
+        Some([7, 7, 7, 255])
+    );
+    // The classic sheet must not be the extended one.
+    let default_numbers = BuiltinDefaultSkin.sheet_image(Sheet::Numbers).unwrap();
     assert_eq!(
         skin2.sheet(Sheet::Numbers).unwrap().pixel(0, 0),
+        default_numbers.pixel(0, 0)
+    );
+    assert!(
+        skin2
+            .substitutions()
+            .iter()
+            .any(|s| { s.requested == "numbers.bmp" && s.with == Substitute::DefaultSkin }),
+        "expected a default-skin substitution for numbers.bmp, got {:?}",
+        skin2.substitutions()
+    );
+}
+
+/// S17 §3: a skin that carries both sheets uses the extended one for the time
+/// display, and neither file is reported as missing.
+#[test]
+fn nums_ex_wins_when_the_skin_carries_both() {
+    let mut entries = synthetic_entries();
+    entries.retain(|(name, _)| !name.eq_ignore_ascii_case("numbers.bmp"));
+    entries.push((
+        "numbers.bmp".to_string(),
+        bmp24_solid(99, 13, [200, 100, 50]),
+    ));
+    entries.push(("nums_ex.bmp".to_string(), bmp24_solid(108, 13, [7, 7, 7])));
+
+    let dir = tempfile::tempdir().unwrap();
+    write_folder(dir.path(), &entries);
+    let skin = Skin::load(dir.path()).unwrap();
+
+    assert_eq!(skin.time_digit_sheet(), Sheet::NumsEx);
+    assert_eq!(
+        skin.sheet(Sheet::Numbers).unwrap().pixel(0, 0),
+        Some([200, 100, 50, 255])
+    );
+    assert_eq!(
+        skin.sheet(Sheet::NumsEx).unwrap().pixel(0, 0),
         Some([7, 7, 7, 255])
     );
     assert!(
-        skin2.substitutions().iter().any(|s| {
-            s.requested == "numbers.bmp" && s.with == Substitute::Sheet(Sheet::NumsEx)
-        })
+        !skin
+            .substitutions()
+            .iter()
+            .any(|s| s.requested.eq_ignore_ascii_case("numbers.bmp")
+                || s.requested.eq_ignore_ascii_case("nums_ex.bmp")),
+        "neither digit sheet is missing, got {:?}",
+        skin.substitutions()
     );
 }
 
@@ -232,6 +291,79 @@ fn missing_main_sheet_uses_default_skin() {
 
     // An unknown sprite name is not invented.
     assert!(skin.sprite("NOT_A_REAL_SPRITE").is_none());
+}
+
+/// S17 §2 leaves the behaviour for a completely invalid skin open. The
+/// loader's choice: a file that is not a ZIP is an error, and a folder without
+/// a single sheet is a skin whose every element comes from the built-in
+/// default.
+#[test]
+fn an_invalid_skin_is_reported_not_panicked() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let broken = dir.path().join("broken.wsz");
+    std::fs::write(&broken, b"not a zip at all").unwrap();
+    assert!(
+        Skin::load(&broken).is_err(),
+        "a file that is not a ZIP is not a skin"
+    );
+
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let skin = Skin::load(&empty).expect("an empty folder loads with every sheet missing");
+    assert!(skin.has_main_window_sprites());
+    assert!(
+        skin.substitutions()
+            .iter()
+            .any(|s| s.requested == "main.bmp" && s.with == Substitute::DefaultSkin),
+        "expected a default-skin substitution, got {:?}",
+        skin.substitutions()
+    );
+}
+
+/// S17 §2: deleting `main.bmp` **and** `titlebar.bmp` from an otherwise
+/// complete skin does not stop the window from rendering, and the fallback is
+/// per element: the missing sheets come from the built-in default skin while
+/// the rest of the skin still comes from the skin itself.
+#[test]
+fn a_missing_main_and_titlebar_fall_back_per_element() {
+    let mut entries = synthetic_entries();
+    entries.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("main.bmp") && !name.eq_ignore_ascii_case("titlebar.bmp")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    write_folder(dir.path(), &entries);
+
+    let skin = Skin::load(dir.path()).unwrap();
+
+    // The two missing elements come from the built-in default skin.
+    for sheet in [Sheet::Main, Sheet::Titlebar] {
+        let default = BuiltinDefaultSkin.sheet_image(sheet).unwrap();
+        assert_eq!(
+            skin.sheet(sheet).unwrap().pixel(0, 0),
+            default.pixel(0, 0),
+            "{sheet:?} must come from the default skin"
+        );
+        assert!(
+            skin.substitutions()
+                .iter()
+                .any(|s| s.requested == sheet.file_name() && s.with == Substitute::DefaultSkin),
+            "expected a default-skin substitution for {sheet:?}, got {:?}",
+            skin.substitutions()
+        );
+    }
+
+    // The clutter bar and the controls still come from the skin itself: the
+    // synthetic skin paints them in a colour the default skin does not use.
+    assert_eq!(
+        skin.sheet(Sheet::Cbuttons).unwrap().pixel(0, 0),
+        Some([4, 5, 6, 255])
+    );
+    assert_eq!(
+        skin.sheet(Sheet::Shufrep).unwrap().pixel(0, 0),
+        Some([7, 8, 9, 255])
+    );
+    assert!(skin.has_main_window_sprites());
 }
 
 #[test]

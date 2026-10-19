@@ -1,10 +1,17 @@
 //! `region.txt` window-region parsing.
 //!
-//! A region file has one section per window state (`Normal`, `WindowShade`, …).
-//! Each section carries `NumPoints` (a comma-separated list of polygon vertex
+//! A region file has one section per window state. S17 §7 names the three
+//! classic sections `[Normal]`, `[WindowShade]` and `[Equalizer]`. Each
+//! section carries `NumPoints` (a comma-separated list of polygon vertex
 //! counts) and `PointList` (the vertices, alternating `x` and `y`, separated by
 //! commas or spaces). The parser builds one polygon per count and drops counts
-//! below three, matching the documented behaviour.
+//! below three.
+//!
+//! S17 §7 leaves the handling of a malformed `NumPoints`/`PointList` (mismatched
+//! counts) open. The parser's own rule: a count below three is dropped, a
+//! polygon with fewer than three points left is dropped, and a polygon whose
+//! point list ends early keeps the points it has. The other polygons of the
+//! section are kept.
 
 use std::collections::HashMap;
 
@@ -54,6 +61,11 @@ impl Region {
     /// The `WindowShade` section.
     pub fn window_shade(&self) -> &[Polygon] {
         self.polygons("windowshade")
+    }
+
+    /// The `Equalizer` section.
+    pub fn equalizer(&self) -> &[Polygon] {
+        self.polygons("equalizer")
     }
 
     /// True when no section produced a usable polygon.
@@ -151,5 +163,45 @@ PointList=0,0,275,0,275,14,0,14\r\n";
     #[test]
     fn empty_text_is_empty() {
         assert!(Region::parse("").is_empty());
+    }
+
+    /// S17 §7: the three classic sections are `[Normal]`, `[WindowShade]` and
+    /// `[Equalizer]`.
+    #[test]
+    fn parses_the_three_classic_sections() {
+        let text = "\
+[Normal]\r\n\
+NumPoints=4\r\n\
+PointList=0, 0, 275, 0, 275, 116, 0, 116\r\n\
+[WindowShade]\r\n\
+NumPoints=4\r\n\
+PointList=0,0,275,0,275,14,0,14\r\n\
+[Equalizer]\r\n\
+NumPoints=4\r\n\
+PointList=0,0,275,0,275,116,0,116\r\n";
+        let region = Region::parse(text);
+        assert_eq!(region.normal().len(), 1);
+        assert_eq!(region.window_shade().len(), 1);
+        assert_eq!(region.equalizer().len(), 1);
+        assert_eq!(
+            region.equalizer()[0],
+            vec![(0, 0), (275, 0), (275, 116), (0, 116)]
+        );
+    }
+
+    /// S17 §7: the base skin's `region.txt` has every polygon commented out,
+    /// so the windows are plain rectangles and there is no masking.
+    #[test]
+    fn a_fully_commented_region_masks_nothing() {
+        let text = "\
+; a comment\r\n\
+;NumPoints=4\r\n\
+;PointList=0, 0, 275, 0, 275, 116, 0, 116\r\n\
+[Normal]\r\n\
+;NumPoints=4\r\n\
+;PointList=0, 0, 275, 0, 275, 116, 0, 116\r\n";
+        let region = Region::parse(text);
+        assert!(region.is_empty());
+        assert!(region.normal().is_empty());
     }
 }

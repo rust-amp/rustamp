@@ -10,6 +10,11 @@
 //! For 32-bit images it uses the stored alpha channel, except when the whole
 //! alpha channel is zero, which classic tools write for "opaque" (a quirk that
 //! spec S17 must confirm).
+//!
+//! The classic sheets carry **no transparency** (S17 §4: 2.95 copies them
+//! opaquely, there is no per-sheet colour key and nothing is masked). A
+//! palette index therefore always yields an opaque pixel, and a pixel a
+//! run-length stream does not cover is opaque black rather than a hole.
 
 /// A decoded BMP.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +296,13 @@ fn decode_rle8(
     let width = header.width as i32;
     let height = header.height as i32;
 
+    // S17 §4: the classic sheets are copied opaquely, there is no per-sheet
+    // transparency colour key and nothing is masked. A pixel the run-length
+    // stream does not cover is therefore opaque black, not a transparent hole.
+    for pixel in out.as_chunks_mut::<4>().0.iter_mut() {
+        pixel.copy_from_slice(&[0, 0, 0, 255]);
+    }
+
     let mut x = 0i32;
     let mut y = if top_down { 0 } else { height - 1 };
     let mut p = 0usize;
@@ -508,8 +520,35 @@ mod tests {
         let decoded = decode(&bmp).unwrap();
         assert_eq!(decoded.rgba[0..4], [0, 255, 0, 255]);
         assert_eq!(decoded.rgba[4..8], [0, 255, 0, 255]);
-        // The remaining pixels stay zero (unset), never panic.
-        assert_eq!(decoded.rgba[8..12], [0, 0, 0, 0]);
+        // The remaining pixels stay opaque black (S17 §4: the classic sheets
+        // carry no transparency), never a transparent hole.
+        assert_eq!(decoded.rgba[8..12], [0, 0, 0, 255]);
+        assert_eq!(decoded.rgba[12..16], [0, 0, 0, 255]);
+    }
+
+    /// S17 §4: a run-length stream that leaves a row out must not punch a
+    /// transparent hole into the sheet. The base skin's `text.bmp` is such a
+    /// file: it encodes 73 of its 74 rows.
+    #[test]
+    fn rle8_leaves_uncovered_pixels_opaque() {
+        let palette = palette_bgra(&[[255, 0, 0], [0, 255, 0]]);
+        let mut bmp = build(8, 2, 2, &[], &palette);
+        bmp[30..34].copy_from_slice(&1u32.to_le_bytes());
+        // One row of two green pixels, then end of bitmap: the second row is
+        // never encoded. The rows of a run-length stream run from the bottom
+        // of the image upwards, so the encoded row is the bottom one.
+        bmp.extend_from_slice(&[2, 1, 0, 1]);
+        let decoded = decode(&bmp).unwrap();
+        assert_eq!(decoded.rgba[8..12], [0, 255, 0, 255]);
+        assert_eq!(decoded.rgba[12..16], [0, 255, 0, 255]);
+        // The row that was never encoded is opaque black.
+        assert_eq!(decoded.rgba[0..4], [0, 0, 0, 255]);
+        assert_eq!(decoded.rgba[4..8], [0, 0, 0, 255]);
+        // No pixel of the sheet is transparent.
+        assert!(
+            decoded.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
+            "a classic sheet must not contain transparent pixels"
+        );
     }
 
     #[test]
