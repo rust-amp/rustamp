@@ -1,0 +1,99 @@
+# Continuous-run session log — 2026-10-19
+
+This session ran the lane cycle continuously: start a lane in its own worktree,
+verify it, merge it, delete the worktree, refill. Every merged lane was verified
+by the orchestrator (`fmt`, `clippy`, the relevant tests, and a workspace check
+after every merge), not by trusting the lane's report.
+
+## Merged (in order)
+
+| Lane | What it delivered |
+|---|---|
+| — (baseline `fff9225`) | phase 1: playlist keyboard, drag-drop, save playlist, menu actions, save-playlist UI |
+| `wave127` | playlist remove-dead-files (40222) + clear (40214), RFC 0018 |
+| `wave129` | jump-to-file row overflow fix, count line, stale selection index, tests |
+| `wave130` | **docking integration** (the `docking.rs` model was unused; now wired, with snapping + persistence). Retried on GPT-6.1-SOL after the first attempt produced alias spam |
+| `wave131` | EQ presets `.eqf` (merged with the baseline) |
+| `wave132` | playlist format detection: the `sniff` window was 4 KiB and mis-detected PLS with a long comment; import API added |
+| `wave133` | ReplayGain 1.0 scanner (`rustamp-meta`) |
+| `wave134` | RFC 0012 device-error contract pinned with tests + VM-only marker |
+| `wave135` | mediahost PCM transfer: truncated transfer is a loud failure, stub facade removed |
+| `wave136` | engine ReplayGain stage with clip protection |
+| `wave138` | S15 shuffle/repeat order model (`rustamp-playlist`) |
+| `wave140` | base-2.91 skin acceptance suite + sprite/font/shade fixes; regression (antialiased playlist rows) caught and fixed |
+| `wave141` | `audio.replaygain` config wired to the engine |
+| `wave142` | WASAPI exclusive mode + shared-mode downgrade report |
+| `wave143` | the app keeps the loaded playlist format and uses it as the save default |
+| `wave144` | classic analyser modes (peak hold, triggered scope) in `rustamp-vis` |
+| `wave145` | SQLite media-library index (scan/query, four defects in the prior attempt fixed) |
+| `wave146` | `out_` plugin support |
+| `wave147` | atomic tag writes; unknown items preserved per format family |
+| `wave148` | the UI uses the shared `rustamp-vis` analyser; duplicate maths deleted |
+| `wave149` | external-control surface (`WM_WA_IPC`/`WM_COMMAND`, `Winamp v1.x`), ID table |
+| `wave150` | Preferences: ReplayGain + output mode, RFC 0019 |
+| `wave151` | playlist drag-to-reorder with insert line and identity-preserving moves |
+| `wave152` | one shared `PlaybackOrder` for the engine and the decode thread (−642 lines of duplicate) |
+| `wave153` | library multi-root, unicode freetext search, sort + pagination |
+| `wave154` | native directory picker (`IFileOpenDialog` + `FOS_PICKFOLDERS`) |
+| `wave155` | embedded artwork reader (APIC/FLAC/Vorbis/covr) |
+| `wave156` | `audio.output_mode` actually applied, with downgrade notes and honest persistence |
+| `wave157` | `vis_` plugin support (MilkDrop/AVS/Geiss class) |
+| `wave158` | "Open directory" end to end (40187, Shift+L/Insert), recursive as an own choice |
+| `wave159` | playlist MISC menu (40292/40293) per S04 §7 |
+| `wave160` | `dsp_` plugin support — all five classic kinds now load |
+| `wave161` | device-invalidation recovery decision + loud report (RFC 0012 fail-to-stop) |
+| `wave162` | EQ auto-load per track (`eq-autoload.toml`), own-choice rules documented |
+| `wave163` | playlist windowshade toggle (was a no-op), reflow + persistence |
+| `wave164` | skin cursor slots + hit-region mapping |
+| `wave165` | plugin fault attribution + bounded crash restart policy |
+| `wave166` | skin cursors applied (`LoadCursorFromFileW`; `CreateIconFromResourceEx` measured to fail on in-memory bytes) |
+| `wave167` | RFC 0007 cross-process wake proof with latency bound and no-busy-spin |
+| `wave168` | media-library view model + column layout |
+| `wave169` | library tag writes update the row from the read-back file |
+| `wave170` | window-region mask builder from `region.txt` |
+| `wave171` | media-library renderer |
+| `wave172` | region mask applied via `SetWindowRgn` |
+| `wave173` | library search field + scrollbar chrome |
+| `wave174` | cancellable library scan with progress events and batch commits |
+| `wave175` | mediahost engine adapter gaps: validated spec, engine-owned liveness, two-process proof |
+| `wave176` | equal-power fade stage; `StopWithFadeout` now really fades |
+| `wave177` | media-library window in the app (modern shell, index, view, input, scan) |
+| `wave178` | bounded artwork cache (decoded thumbnails, `image`, MIT/Apache) |
+| `wave179` | library cover column with a borrowed RGBA view (UI stays free of the library crate) |
+| `wave180` | a ring reset now signals the wake so blocked peers see the new generation (M14) |
+| `wave181` | resident restart policy: retry once, then fail the track (RFC 0006 §8) |
+| `wave182` | Preferences: media-library roots (add/remove, DB as the source of truth) |
+| `wave183` | `pledit.txt` `Font=` honoured (family/size/style), 1-bit invariant kept |
+| `wave184` | test doubles refuse the ring direction production refuses (M14), mutation-proven |
+| `wave185` | plugin config routing for every kind; `ConfigureVisPlugin` finally reaches the host |
+| `wave186` | artwork covers borrowed into the library renderer |
+| `wave187` | `frame_size` error parity in the single offer check, mutation-proven |
+| `wave188` | `viscolor.txt` slot mapping per S17: the gradient orientation was inverted, all five scope slots now used |
+
+## Rules added to `AGENTS.md` during the session
+
+1. **One worktree per subagent, created before it starts**; delete it after the merge.
+2. **Garbage output → restart the task on a stronger model** (alias spam, dead code).
+3. **A lane must leave the workspace compiling** — and the orchestrator runs
+   `cargo check --workspace` after **every** merge.
+4. **Headless tests run on the host**; only window/GUI tests need the VM.
+
+## Open points
+
+- **Specs that do not exist yet (dirty room):** S08 (vis measurement), S11 (embed
+  frames / `gen.bmp`), S12 (`winamp.ini` keys), S13 (drag-drop rules), S14 (title
+  formatting), S16 (more preferences pages), S18 (fades), S19 (streaming), S20
+  (media library).
+- **S04 does not export the playlist menu trees** (File/Sort/List/Selection) — only
+  the MISC menu is settled; no provisional labels were invented.
+- **RFC 0020** is needed for a generic "configure plugin N" wire message
+  (`PROTOCOL_VERSION` 4 → 5); the host-side API is ready (`wave185`).
+- **VM verification** of everything window-shaped is still outstanding: the
+  library window, the folder picker, the prefs pages, window shaping, skin cursors,
+  the plugin acceptance tests, the exclusive output, the device-loss test.
+- **The `resident_to_inprocess_source_change_is_gapless` flake** is pre-existing
+  and load-dependent; it passes in isolation. `--test-threads=1` helps but is not
+  a guarantee under heavy parallel builds.
+- The `SelectedBG` colour question from the base skin (`#0000C6` vs the built-in
+  `#0000FF`) still needs an owner decision: adopting it requires re-blessing two
+  playlist goldens.
