@@ -155,6 +155,12 @@ impl App {
     /// shortcut path ([`App::key_down`]): S03 leaves how the tables combine
     /// provisional, and its arrow, Home, End and page rows are provisional
     /// with no measured effect, so they are not claimed here.
+    ///
+    /// The two removal presets of S03 §2 are dispatched through the map
+    /// ([`playlist_key_action`](rustamp_ui::playlist::playlist_key_action)):
+    /// `Alt+Delete` ("Remove all dead files", `40222`) and `Ctrl+Shift+Delete`
+    /// or `Ctrl+N` ("Clear the playlist", `40214`). Both are menu-confirmed
+    /// rows that need no selection, so they are whole-list operations.
     pub fn playlist_key_down(
         &mut self,
         key: Key,
@@ -242,6 +248,23 @@ impl App {
                     }
 
                     let command = Command::Remove(ids_to_remove);
+                    self.submit(command.clone())?;
+                    self.sync_playlist_entries();
+                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
+                }
+                // Remove all dead files (menu-confirmed, Alt+Delete, 40222).
+                // The app resolves which entries are dead, so the command
+                // carries no payload (RFC 0018).
+                PlaylistKeyAction::RemoveDead => {
+                    let command = Command::RemoveDeadFiles;
+                    self.submit(command.clone())?;
+                    self.sync_playlist_entries();
+                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
+                }
+                // Clear the playlist (menu-confirmed, Ctrl+Shift+Delete and
+                // Ctrl+N, both id 40214, S03 §2).
+                PlaylistKeyAction::ClearPlaylist => {
+                    let command = Command::Clear;
                     self.submit(command.clone())?;
                     self.sync_playlist_entries();
                     return Ok(Some(ShortcutOutcome::Commands(vec![command])));
@@ -934,6 +957,59 @@ mod tests {
             .expect("Delete applies");
         assert_eq!(outcome, Some(ShortcutOutcome::Handled));
         assert_eq!(app.playlist().len(), 3);
+    }
+
+    #[test]
+    fn alt_delete_removes_the_dead_files_and_ctrl_shift_delete_clears() {
+        // S03 §2: Alt+Delete (`40222`) removes all dead files (RFC 0018);
+        // Ctrl+Shift+Delete and Ctrl+N both clear the playlist (`40214`).
+        // The entries point into a temp dir that holds one real file, so the
+        // outcome does not depend on the working directory.
+        let mut app = test_app();
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let alive = dir.path().join("alive.mp3");
+        std::fs::write(&alive, b"").expect("write the fixture");
+        let gone = dir.path().join("gone.mp3");
+        app.submit(Command::AddItems {
+            items: vec![MediaLocation::File(alive), MediaLocation::File(gone)],
+            at: None,
+            play: false,
+        })
+        .expect("AddItems applies");
+        assert_eq!(app.playlist().len(), 2);
+
+        let outcome = app
+            .playlist_key_down(Key::Delete, Modifiers::ALT)
+            .expect("Alt+Delete applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::RemoveDeadFiles]))
+        );
+        assert_eq!(app.playlist().len(), 1);
+        assert_eq!(app.engine().queue().len(), 1);
+
+        // Ctrl+Shift+Delete clears what is left.
+        let outcome = app
+            .playlist_key_down(Key::Delete, Modifiers::CTRL | Modifiers::SHIFT)
+            .expect("Ctrl+Shift+Delete applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::Clear]))
+        );
+        assert!(app.playlist().is_empty());
+
+        // Ctrl+N is the second chord for the same command id.
+        add_entries(&mut app, 2);
+        assert_eq!(app.playlist().len(), 2);
+        let outcome = app
+            .playlist_key_down(Key::Letter(b'N'), Modifiers::CTRL)
+            .expect("Ctrl+N applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::Clear]))
+        );
+        assert!(app.playlist().is_empty());
+        assert!(app.engine().queue().is_empty());
     }
 
     #[test]

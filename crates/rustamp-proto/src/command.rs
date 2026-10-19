@@ -281,4 +281,11 @@ pub enum Command {
     /// extension (`.m3u`, `.m3u8`, `.pls`, `.xspf`); any other extension is
     /// refused. S03 records command id 40204 for it. RFC 0017.
     SavePlaylist(PathBuf),
+    /// Remove every entry whose local file no longer exists on disk ("Remove
+    /// all dead files", Alt+Delete, S03 §2, command id 40222). Network streams
+    /// ([`MediaLocation::Url`](crate::playlist::MediaLocation::Url)) are never
+    /// checked and always survive; the spec fixes the label only, so the
+    /// stream rule is an own choice (RFC 0018). No payload: the app owns the
+    /// player's state and resolves the dead entries itself. RFC 0018.
+    RemoveDeadFiles,
 }

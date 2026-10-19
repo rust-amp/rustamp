@@ -194,6 +194,20 @@ pub(crate) fn is_playlist_file(path: &Path) -> bool {
         .any(|fmt| fmt.extension().eq_ignore_ascii_case(ext))
 }
 
+/// Whether a queue entry is "dead": a local file that no longer exists.
+///
+/// Only [`TrackSource::Path`] is probed. A URL is a network stream, not a file,
+/// so it is never checked and always survives ("Remove all dead files",
+/// S03 §2 command id 40222). S03 settles the label, not the stream rule, so
+/// that rule — and keeping a path that now names an existing directory — is an
+/// own choice (RFC 0018).
+fn source_is_dead(source: &TrackSource) -> bool {
+    match source {
+        TrackSource::Path(path) => !path.exists(),
+        TrackSource::Url(_) => false,
+    }
+}
+
 /// Creates the output device and optional null clock for the given choice.
 ///
 /// This runs on the thread that afterwards creates the window (see
@@ -1750,6 +1764,8 @@ impl App {
             C::SavePlaylist(path) => {
                 let _ = self.save_playlist_file(path);
             }
+            // RFC 0018: Alt+Delete removes the entries whose file is gone.
+            C::RemoveDeadFiles => self.remove_dead_files(),
             C::ConfigureVisPlugin | C::ToggleVisPlugin => {
                 self.note(format!("{command:?} needs the plugin host (M3)"));
             }
@@ -2032,6 +2048,29 @@ impl App {
         self.engine.set_queue(Vec::new());
         self.engine.set_current_index(None);
         self.sync_playlist_entries();
+    }
+
+    /// Removes every entry whose local file no longer exists on disk
+    /// ("Remove all dead files", Alt+Delete, S03 §2 command id 40222,
+    /// RFC 0018).
+    ///
+    /// A playlist with no dead entry changes nothing and records no note — the
+    /// same silence as an unstaged Delete (S06 §5.3). The removal itself is the
+    /// ordinary [`App::remove_entries`] path, so the playing entry, the current
+    /// index and the selection follow the rules every other removal uses.
+    fn remove_dead_files(&mut self) {
+        let dead: Vec<EntryId> = self
+            .entry_ids
+            .iter()
+            .copied()
+            .zip(self.engine.queue())
+            .filter(|(_id, source)| source_is_dead(source))
+            .map(|(id, _source)| id)
+            .collect();
+        if dead.is_empty() {
+            return;
+        }
+        self.remove_entries(&dead);
     }
 }
 
@@ -4224,6 +4263,62 @@ mod tests {
         assert!(app.engine().queue().is_empty());
         assert!(app.playlist().is_empty());
         assert!(app.entry_ids.is_empty());
+    }
+
+    #[test]
+    fn remove_dead_files_drops_only_the_missing_local_files() {
+        // S03 §2 `40222` ("Remove all dead files", RFC 0018): the entry whose
+        // file is gone leaves; the existing file and the stream stay. The
+        // stream is never probed — a URL is not a file (own choice, RFC 0018).
+        let (mut app, dir) = app_with_file(None);
+        let alive = track(&dir, "alive.tst");
+        let gone = dir.path().join("gone.tst");
+        assert!(!gone.exists(), "the fixture must start absent");
+        app.submit(Command::AddItems {
+            items: vec![
+                MediaLocation::File(alive.clone()),
+                MediaLocation::File(gone),
+                MediaLocation::Url("http://example.invalid/stream.mp3".to_string()),
+            ],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        assert_eq!(app.entry_ids.len(), 3);
+
+        app.submit(Command::RemoveDeadFiles).unwrap();
+        // Stable ids, in order: the dead middle entry is gone, nothing renumbers.
+        assert_eq!(app.entry_ids, vec![EntryId(0), EntryId(2)]);
+        assert_eq!(app.engine().queue().len(), 2);
+        assert_eq!(app.playlist().len(), 2);
+        assert_eq!(app.playlist().visible_ids(), vec![EntryId(0), EntryId(2)]);
+
+        // No dead entry left: the command is a silent no-op.
+        app.submit(Command::RemoveDeadFiles).unwrap();
+        assert_eq!(app.entry_ids, vec![EntryId(0), EntryId(2)]);
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn remove_dead_files_stops_the_engine_when_the_playing_entry_is_dead() {
+        // The removal goes through `remove_entries`, so a dead current entry
+        // stops playback and clears Current, exactly like any other removal.
+        let (mut app, dir) = app_with_file(None);
+        let dead = dir.path().join("never-written.tst");
+        app.submit(Command::AddItems {
+            items: vec![MediaLocation::File(dead.clone())],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        // The engine refuses to open a missing file, so stage the current row
+        // the way a previously alive entry would look after the file vanished.
+        app.engine_mut().set_current_index(Some(0));
+        app.submit(Command::RemoveDeadFiles).unwrap();
+        assert!(app.entry_ids.is_empty());
+        assert!(app.engine().queue().is_empty());
+        assert_eq!(app.engine().current_index(), None);
+        assert!(app.playlist().is_empty());
     }
 
     /// Pins the OS window parameters the two new dialogs must carry (titles
