@@ -156,13 +156,18 @@ fn channel_weights(channels: usize) -> Vec<f64> {
 }
 
 /// The number of samples in a BS.1770-4 block (400 ms).
+///
+/// At least one sample: a rate so low that 400 ms is shorter than one
+/// sample must not produce an empty block.
 fn block_size(sample_rate_hz: u32) -> usize {
-    (sample_rate_hz as usize * BLOCK_MS as usize + 500) / 1000
+    ((sample_rate_hz as usize * BLOCK_MS as usize + 500) / 1000).max(1)
 }
 
 /// The number of samples between two BS.1770-4 blocks (100 ms).
+///
+/// At least one sample, so that the blocks always move forward.
 fn block_step(sample_rate_hz: u32) -> usize {
-    (sample_rate_hz as usize * BLOCK_STEP_MS as usize + 500) / 1000
+    ((sample_rate_hz as usize * BLOCK_STEP_MS as usize + 500) / 1000).max(1)
 }
 
 /// The BS.1770-4 blocks of a signal.
@@ -670,6 +675,22 @@ mod tests {
         assert_eq!(channel_weights(4), vec![1.0, 1.0, 1.0, 0.0]);
         assert_eq!(channel_weights(5), vec![1.0, 1.0, 1.0, 1.41, 1.41]);
         assert_eq!(channel_weights(6), vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41]);
+    }
+
+    #[test]
+    fn an_absurd_rate_does_not_hang_the_measurement() {
+        // A rate so low that a block is shorter than one sample: without a
+        // minimum of one sample the blocks would never move forward and the
+        // measurement would fill a vector until it runs out of memory.
+        for rate in [1u32, 2, 3, 4_294_967_295] {
+            let samples = vec![0.5f32; 64];
+            let blocks = LoudnessBlocks::measure(&samples, 1, rate).unwrap();
+            // The measurement returns; whether it finds a block at all
+            // depends on whether the signal is long enough for one.
+            if let Some(loudness) = blocks.integrated_loudness() {
+                assert!(loudness.is_finite(), "{rate} Hz");
+            }
+        }
     }
 
     #[test]
