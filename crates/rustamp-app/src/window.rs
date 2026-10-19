@@ -966,7 +966,12 @@ impl Windowed {
     /// pointer.
     fn apply_eq_cursor(&mut self) {
         let (x, y) = self.eq_cursor;
-        let widget = rustamp_ui::equalizer::hit_test(&rustamp_ui::EqualizerLayout::CLASSIC, x, y);
+        let widget = rustamp_ui::equalizer::hit_test(
+            &rustamp_ui::EqualizerLayout::CLASSIC,
+            x,
+            y,
+            self.app.eq_state().windowshade,
+        );
         let slot = rustamp_ui::equalizer_cursor(widget);
         let raw = self.raw_eq_window();
         self.apply_cursor(slot, raw);
@@ -2878,8 +2883,12 @@ impl Windowed {
             } => {
                 let (x, y) = self.eq_cursor;
                 if state == ElementState::Pressed
-                    && rustamp_ui::equalizer::hit_test(&rustamp_ui::EqualizerLayout::CLASSIC, x, y)
-                        == Some(rustamp_ui::EqWidget::TitleBar)
+                    && rustamp_ui::equalizer::hit_test(
+                        &rustamp_ui::EqualizerLayout::CLASSIC,
+                        x,
+                        y,
+                        self.app.eq_state().windowshade,
+                    ) == Some(rustamp_ui::EqWidget::TitleBar)
                     && let Some(window) = &self.eq_window
                     && window.drag_window().is_ok()
                 {

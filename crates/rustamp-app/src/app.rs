@@ -643,13 +643,14 @@ impl App {
         }
         if let Some(eq) = windows.iter_mut().find(|w| w.id == WindowId::Equalizer) {
             eq.visible = self.eq_open();
+            eq.shaded = self.eq_state().windowshade;
         } else {
             windows.push(WindowLayout {
                 id: WindowId::Equalizer,
                 x: 26,
                 y: rustamp_ui::DEFAULT_EQUALIZER_POSITION.y,
                 visible: self.eq_open(),
-                shaded: false,
+                shaded: self.eq_state().windowshade,
                 width: None,
                 height: None,
             });
@@ -1881,6 +1882,12 @@ impl App {
                 // band is 14 px tall); the presenter reads the new size from
                 // `playlist_frame_size` and re-flows the docked stack.
                 self.playlist.windowshade = !self.playlist.windowshade;
+            }
+            C::ToggleWindowShade(WindowId::Equalizer) => {
+                // The equalizer owns its shade state the same way (S01 §1: the
+                // shade band is 14 px tall); the presenter reads the new size
+                // from `eq_frame_size` and re-flows the docked stack.
+                self.eq.set_windowshade(!self.eq.state().windowshade);
             }
             C::ToggleWindow(WindowId::Main) => self.main_visible = !self.main_visible,
             C::ShowMainWindow => self.show_main_window(),

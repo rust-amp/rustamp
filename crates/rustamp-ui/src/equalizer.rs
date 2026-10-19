@@ -16,6 +16,27 @@
 //! §7.1/§7.2), the graph curve (S07 §7.3/§7.4), the band/preamp step sizes and
 //! the dB mapping (S07 §9, §7.2), the balance right half (S07 §6, §12 O4) and
 //! the equalizer's shade drawing (S05 §1.5).
+//!
+//! # The windowshade form (S01 §1, §3; S05 §1.2, §1.5)
+//!
+//! A shaded equalizer is a **275 x 14 title strip** (S01 §1: the windowshade
+//! height is 14 px for the main window, the equalizer and the playlist
+//! editor). Its band comes from `eq_ex.bmp` (S01 §3: row 0 focused, row 15
+//! unfocused, both provisional), and S05 §1.2 settles for the windowshade in
+//! general that "the shade is a single 14-px title-bar row: no body rows are
+//! drawn".
+//!
+//! The On/Auto/Presets buttons and the eleven sliders belong to the body, so a
+//! shaded equalizer neither draws them nor answers them: [`hit_test`] takes
+//! the shade flag and only the title band answers there.
+//!
+//! **S07 has no shade wording at all**, so nothing in the audited specs shows
+//! sliders in the equalizer's shade form. The webamp cross-check that
+//! `rustamp-skin` carries names mini volume/balance cells in the same
+//! `eq_ex.bmp` (rows 30-36), but no spec settles *where* they sit in the
+//! strip (S05 §1.2 lists the equalizer's shade drawing as open), so they are
+//! not drawn and not hit-tested here. The keyboard path is unchanged: the
+//! window is still the equalizer, so `N`/`A`/`S` still act (S03 §3).
 
 use rustamp_core::command::Command;
 use rustamp_gfx::Rect;
@@ -259,7 +280,8 @@ impl EqSlider {
 /// A hit-testable widget of the equalizer window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EqWidget {
-    /// The title-bar band (the EQ shade/window buttons are unmeasured, S05 §1.5).
+    /// The title-bar band (the EQ window buttons are unmeasured, S05 §1.5).
+    /// In the windowshade form the band is the whole window (S05 §1.2).
     TitleBar,
     /// The On button (S07 §3.2).
     On,
@@ -272,14 +294,23 @@ pub enum EqWidget {
 }
 
 impl EqWidget {
-    /// Every hit-testable widget, in priority order: the buttons first (the
-    /// Auto held rect reaches into the separator column), then the sliders.
+    /// Every hit-testable widget of the **unshaded** window, in priority
+    /// order: the buttons first (the Auto held rect reaches into the
+    /// separator column), then the sliders.
     pub const ALL: &'static [EqWidget] = &[
         EqWidget::On,
         EqWidget::Auto,
         EqWidget::Presets,
         EqWidget::TitleBar,
     ];
+
+    /// Every hit-testable widget of the **windowshade** form.
+    ///
+    /// S05 §1.2: the shade is a single 14-px title-bar row and no body rows
+    /// are drawn. The On/Auto/Presets buttons and the eleven sliders belong
+    /// to the body, so they are not visible in the shade and must not answer
+    /// a click. The band itself answers: it is the window's drag target.
+    pub const SHADE: &'static [EqWidget] = &[EqWidget::TitleBar];
 
     /// The widget's window-relative rectangle.
     pub fn rect(self, layout: &EqualizerLayout) -> Rect {
@@ -302,11 +333,23 @@ fn contains(rect: &Rect, x: i32, y: i32) -> bool {
 
 /// Returns the widget at the window-relative point `(x, y)`, or `None` when
 /// the point is outside every hit-testable region.
-pub fn hit_test(layout: &EqualizerLayout, x: i32, y: i32) -> Option<EqWidget> {
-    for widget in EqWidget::ALL {
+///
+/// `shaded` selects the windowshade form (S05 §1.2): there the window is the
+/// 14-px title strip, so only the band can be hit and the body controls —
+/// which are not drawn — answer nothing.
+pub fn hit_test(layout: &EqualizerLayout, x: i32, y: i32, shaded: bool) -> Option<EqWidget> {
+    let widgets = if shaded {
+        EqWidget::SHADE
+    } else {
+        EqWidget::ALL
+    };
+    for widget in widgets {
         if contains(&widget.rect(layout), x, y) {
             return Some(*widget);
         }
+    }
+    if shaded {
+        return None;
     }
     for slider in EqSlider::ALL_BANDS {
         let widget = EqWidget::Slider(slider);
@@ -343,7 +386,8 @@ pub struct EqualizerState {
     pub thumb_dragged: bool,
     /// Whether the window is focused (picks the focused title bar, S01 §3).
     pub focused: bool,
-    /// Whether the window is drawn in windowshade form (drawing open, S05 §1.5).
+    /// Whether the window is drawn in windowshade form (S01 §1: the shade
+    /// band is 14 px tall; S05 §1.2: a single title-bar row, no body rows).
     pub windowshade: bool,
     /// Whether the frame is drawn at 2x (S05 §2.1: 550 x 232).
     pub double_size: bool,
@@ -478,6 +522,22 @@ impl EqualizerWindow {
         self.state.focused = focused;
     }
 
+    /// Sets the windowshade flag (S01 §1: the shade band is 14 px tall;
+    /// S05 §1.2: the shade is a title strip alone).
+    ///
+    /// The sliders and the On/Auto/Presets buttons belong to the body, which
+    /// the shade does not draw, so a drag cannot survive the switch: the held
+    /// widget and the slider drag are dropped.
+    pub fn set_windowshade(&mut self, shaded: bool) {
+        if self.state.windowshade == shaded {
+            return;
+        }
+        self.state.windowshade = shaded;
+        self.state.held = None;
+        self.state.thumb_dragged = false;
+        self.drag = None;
+    }
+
     /// Synchronizes the equalizer window state with an authoritative [`EqState`].
     ///
     /// Updates band gains, preamp gain, enabled flag and auto flag to match
@@ -496,8 +556,11 @@ impl EqualizerWindow {
 
     /// A press at window-relative `(x, y)`. Buttons arm their held sprite;
     /// sliders commit on the button down (S07 §5/§6 commit rule).
+    ///
+    /// In the windowshade form only the title band answers (S05 §1.2): the
+    /// body controls are not drawn there, so they must not act either.
     pub fn mouse_down(&mut self, x: i32, y: i32) -> Vec<Command> {
-        let widget = hit_test(&self.layout, x, y);
+        let widget = hit_test(&self.layout, x, y, self.state.windowshade);
         self.state.held = widget;
         self.drag = None;
         let mut commands = Vec::new();
@@ -541,7 +604,7 @@ impl EqualizerWindow {
         let mut commands = Vec::new();
         if self.drag.is_none()
             && let Some(held) = self.state.held
-            && hit_test(&self.layout, x, y) == Some(held)
+            && hit_test(&self.layout, x, y, self.state.windowshade) == Some(held)
         {
             match held {
                 EqWidget::On => {
@@ -697,28 +760,58 @@ mod tests {
     #[test]
     fn hit_testing_finds_the_buttons_and_sliders() {
         let l = EqualizerLayout::CLASSIC;
-        assert_eq!(hit_test(&l, 14, 18), Some(EqWidget::On));
-        assert_eq!(hit_test(&l, 38, 29), Some(EqWidget::On));
+        assert_eq!(hit_test(&l, 14, 18, false), Some(EqWidget::On));
+        assert_eq!(hit_test(&l, 38, 29, false), Some(EqWidget::On));
         // The corrected Auto column: x = 39 belongs to Auto, not the gap.
-        assert_eq!(hit_test(&l, 39, 24), Some(EqWidget::Auto));
-        assert_eq!(hit_test(&l, 55, 24), Some(EqWidget::Auto));
-        assert_eq!(hit_test(&l, 217, 18), Some(EqWidget::Presets));
-        assert_eq!(hit_test(&l, 260, 29), Some(EqWidget::Presets));
+        assert_eq!(hit_test(&l, 39, 24, false), Some(EqWidget::Auto));
+        assert_eq!(hit_test(&l, 55, 24, false), Some(EqWidget::Auto));
+        assert_eq!(hit_test(&l, 217, 18, false), Some(EqWidget::Presets));
+        assert_eq!(hit_test(&l, 260, 29, false), Some(EqWidget::Presets));
         assert_eq!(
-            hit_test(&l, 22, 63),
+            hit_test(&l, 22, 63, false),
             Some(EqWidget::Slider(EqSlider::Preamp))
         );
         assert_eq!(
-            hit_test(&l, 79, 63),
+            hit_test(&l, 79, 63, false),
             Some(EqWidget::Slider(EqSlider::Band(0)))
         );
         assert_eq!(
-            hit_test(&l, 241, 63),
+            hit_test(&l, 241, 63, false),
             Some(EqWidget::Slider(EqSlider::Band(9)))
         );
-        assert_eq!(hit_test(&l, 137, 7), Some(EqWidget::TitleBar));
-        assert_eq!(hit_test(&l, 274, 115), None);
-        assert_eq!(hit_test(&l, -1, 0), None);
+        assert_eq!(hit_test(&l, 137, 7, false), Some(EqWidget::TitleBar));
+        assert_eq!(hit_test(&l, 274, 115, false), None);
+        assert_eq!(hit_test(&l, -1, 0, false), None);
+    }
+
+    /// S05 §1.2: the shade is a single 14-px title-bar row. Only the band
+    /// answers there; the body controls are not drawn, so they must not.
+    #[test]
+    fn the_shaded_equalizer_answers_only_its_title_band() {
+        let l = EqualizerLayout::CLASSIC;
+        // The band is the whole shaded window.
+        assert_eq!(hit_test(&l, 0, 0, true), Some(EqWidget::TitleBar));
+        assert_eq!(hit_test(&l, 137, 7, true), Some(EqWidget::TitleBar));
+        assert_eq!(hit_test(&l, 274, 13, true), Some(EqWidget::TitleBar));
+        // The On/Auto/Presets buttons and every slider are body controls.
+        assert_eq!(hit_test(&l, 20, 24, true), None);
+        assert_eq!(hit_test(&l, 55, 24, true), None);
+        assert_eq!(hit_test(&l, 239, 24, true), None);
+        for slider in EqSlider::ALL_BANDS {
+            let rect = EqualizerLayout::slider_hit(slider);
+            assert_eq!(
+                hit_test(&l, rect.x, rect.y, true),
+                None,
+                "{slider:?} must not answer in the shade"
+            );
+            assert_eq!(
+                hit_test(&l, rect.x, rect.y, false),
+                Some(EqWidget::Slider(slider)),
+                "{slider:?} must answer in the unshaded window"
+            );
+        }
+        // Below the strip nothing hits, in either form.
+        assert_eq!(hit_test(&l, 0, 14, true), None);
     }
 
     #[test]
@@ -882,5 +975,87 @@ mod tests {
         // Preserves UI-only flags:
         assert!(!window.state().focused);
         assert!(window.state().double_size);
+    }
+
+    /// S05 §1.2: the shade is a title strip, so the body controls are not
+    /// drawn there and must not answer a click.
+    #[test]
+    fn the_shaded_equalizer_answers_neither_the_buttons_nor_the_sliders() {
+        let mut window = EqualizerWindow::new();
+        window.set_windowshade(true);
+        assert!(window.state().windowshade);
+
+        // The On button (14,18,25,12).
+        assert!(window.mouse_down(20, 24).is_empty());
+        assert_eq!(window.state().held, None);
+        assert!(window.mouse_up(20, 24).is_empty());
+        assert!(window.state().enabled, "the On button must not toggle");
+
+        // The Auto button (40,18,32,12).
+        assert!(window.mouse_down(55, 24).is_empty());
+        assert!(window.mouse_up(55, 24).is_empty());
+        assert!(!window.state().auto, "the Auto button must not toggle");
+
+        // The Presets button (217,18,44,12).
+        assert!(window.mouse_down(239, 24).is_empty());
+        assert!(window.mouse_up(239, 24).is_empty());
+        assert_eq!(window.take_menu_request(), None);
+
+        // The preamp and a band: a press commits nothing and starts no drag.
+        let preamp = window.state().preamp;
+        assert!(window.mouse_down(22, 95).is_empty());
+        assert_eq!(window.state().preamp, preamp);
+        assert_eq!(window.state().held, None);
+        assert!(window.mouse_move(22, 40).is_empty());
+        assert_eq!(window.state().preamp, preamp);
+        assert!(window.mouse_up(22, 40).is_empty());
+        assert_eq!(window.state().preamp, preamp);
+
+        let band = window.state().bands[0];
+        assert!(window.mouse_down(79, 95).is_empty());
+        assert_eq!(window.state().bands[0], band);
+        assert!(window.mouse_up(79, 95).is_empty());
+        assert_eq!(window.state().bands[0], band);
+    }
+
+    /// The unshaded path is untouched: the same clicks still act.
+    #[test]
+    fn the_unshaded_equalizer_still_answers_the_body_controls() {
+        let mut window = EqualizerWindow::new();
+        assert!(!window.state().windowshade);
+
+        assert!(window.mouse_down(20, 24).is_empty());
+        assert_eq!(window.state().held, Some(EqWidget::On));
+        assert_eq!(window.mouse_up(20, 24), vec![Command::SetEqEnabled(false)]);
+
+        assert!(window.mouse_down(239, 24).is_empty());
+        assert!(window.mouse_up(239, 24).is_empty());
+        assert_eq!(window.take_menu_request(), Some(EqMenuRequest::Presets));
+
+        let commands = window.mouse_down(22, 95);
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], Command::SetPreamp(_)));
+        assert!(window.state().preamp > FLAT_VALUE);
+    }
+
+    /// Shading drops a running slider drag: the sliders are gone with the
+    /// body (S05 §1.2).
+    #[test]
+    fn shading_cancels_a_running_slider_drag() {
+        let mut window = EqualizerWindow::new();
+        assert!(window.mouse_down(22, 65).is_empty());
+        assert_eq!(
+            window.state().held,
+            Some(EqWidget::Slider(EqSlider::Preamp))
+        );
+
+        window.set_windowshade(true);
+
+        assert_eq!(window.state().held, None);
+        assert!(!window.state().thumb_dragged);
+        let preamp = window.state().preamp;
+        // The drag does not continue behind the shade.
+        assert!(window.mouse_move(22, 40).is_empty());
+        assert_eq!(window.state().preamp, preamp);
     }
 }

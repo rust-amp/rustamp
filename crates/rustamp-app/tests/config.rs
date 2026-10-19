@@ -417,6 +417,48 @@ fn the_playlist_editors_windowshade_round_trips_through_the_config() {
     assert_eq!(restarted.playlist_frame_size(), (275, 14));
 }
 
+/// The equalizer's windowshade is saved with the other windows (S01 §1: the
+/// shade band is 14 px tall), so a shaded equalizer comes back shaded - and
+/// the live state is written back out.
+#[test]
+fn the_equalizers_windowshade_round_trips_through_the_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("eq-shade.toml");
+
+    let mut app = test_app_with_config(Config::default(), Some(path.clone()));
+    assert!(
+        !app.eq_state().windowshade,
+        "a fresh equalizer is not shaded"
+    );
+    assert_eq!(app.eq_frame_size(), (275, 116));
+
+    // The windowshade command collapses the equalizer ...
+    app.submit(Command::ToggleWindowShade(WindowId::Equalizer))
+        .unwrap();
+    assert!(app.eq_state().windowshade);
+    assert_eq!(app.eq_frame_size(), (275, 14));
+
+    // ... and the state survives the save.
+    app.save_config().expect("save config");
+    let loaded = load(Some(&path)).expect("load config");
+    let equalizer = loaded
+        .config
+        .ui
+        .windows
+        .iter()
+        .find(|w| w.id == WindowId::Equalizer)
+        .expect("the equalizer's layout is saved");
+    assert!(equalizer.shaded, "the shaded equalizer is saved shaded");
+
+    // A new player built from that file comes up shaded.
+    let restarted = test_app_with_config(loaded.config, None);
+    assert!(
+        restarted.eq_state().windowshade,
+        "a saved shaded equalizer comes back shaded"
+    );
+    assert_eq!(restarted.eq_frame_size(), (275, 14));
+}
+
 #[test]
 fn preferences_dialog_open_page_declares_settings_not_applied() {
     let config = Config::default();
