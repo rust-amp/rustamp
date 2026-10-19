@@ -462,11 +462,11 @@ impl App {
                     return;
                 }
                 // The device is opened when the player starts, so the mode is
-                // remembered now and applied from the next start on. It is not
-                // written to the configuration file yet: the player does not
-                // apply it (`config::serialize_honest` writes honoured fields
-                // only).
+                // saved now and applied at the next start/device creation.
                 self.set_output_mode(mode);
+                if let Err(error) = self.save_config() {
+                    self.note(format!("preferences: {error}"));
+                }
             }
             PrefsAction::LoadSkin(row) => {
                 let Some(entry) = self.browser_entries().into_iter().nth(row) else {

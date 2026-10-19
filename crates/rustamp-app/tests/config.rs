@@ -170,7 +170,10 @@ fn an_ignored_field_is_not_advertised() {
 
     for name in ignored_names {
         assert!(
-            !serialized.contains(name),
+            // Match keys, not substrings: supported `output_mode` is not `output`.
+            !serialized
+                .lines()
+                .any(|line| line.starts_with(&format!("{name} ="))),
             "serialized honest config advertises ignored setting '{name}':\n{serialized}"
         );
     }
@@ -217,6 +220,27 @@ repeat = true
             .any(|w| w.contains("playlist.shuffle") && w.contains("not applied")),
         "playlist.shuffle warning missing: {warnings:?}"
     );
+}
+
+#[test]
+fn both_output_modes_are_honestly_serialized_without_ignored_field_warnings() {
+    use rustamp_core::config::OutputMode;
+
+    for mode in [OutputMode::Shared, OutputMode::Exclusive] {
+        let mut config = Config::default();
+        config.audio.output_mode = mode;
+        let serialized = serialize_honest(&config).expect("serialize");
+        let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
+        assert!(value["audio"].get("output_mode").is_some());
+        assert!(ignored_fields_in_toml(&value).is_empty());
+        assert_eq!(
+            rustamp_app::config::parse(&serialized)
+                .unwrap()
+                .audio
+                .output_mode,
+            mode
+        );
+    }
 }
 
 #[test]

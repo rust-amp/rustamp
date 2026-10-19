@@ -121,12 +121,11 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
             let reason = match key.as_str() {
                 "output" => Some("only the default audio backend is supported"),
                 "device" => Some("audio device selection is not supported yet"),
-                "output_mode" => Some("the output mode is not applied yet"),
                 "buffer_ms" => Some("output buffer length is fixed"),
                 "fadeout_ms" => Some("fadeout duration is not supported yet"),
                 "gapless" => Some("gapless mode is not configurable"),
                 "replaygain" => None,
-                "volume" | "balance" => None,
+                "volume" | "balance" | "output_mode" => None,
                 _ => Some("unrecognized audio setting"),
             };
             if let Some(r) = reason {
@@ -248,7 +247,7 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
 /// Serializes a [`Config`] to TOML, including **only** fields that the player actually honours.
 ///
 /// Unhonoured / unapplied fields (such as `audio.output`, `audio.device`, `audio.buffer_ms`,
-/// `audio.fadeout_ms`, `audio.gapless`, `audio.replaygain`, `playlist.shuffle`,
+/// `audio.fadeout_ms`, `audio.gapless`, `playlist.shuffle`,
 /// `playlist.repeat`, `playlist.manual_advance`, `playlist.last_playlist`, and `plugins.*`) are
 /// omitted so the config file does not advertise unsupported features or mislead users.
 pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
@@ -266,6 +265,16 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
     audio.insert(
         "balance".into(),
         toml::Value::Integer(i64::from(config.audio.balance)),
+    );
+    // Persist the request, not a device-specific downgrade. Like the native
+    // preferences label says, a change takes effect at the next startup
+    // (also used when the app recreates the engine and device).
+    audio.insert(
+        "output_mode".into(),
+        toml::Value::try_from(config.audio.output_mode).map_err(|e| ConfigError::Write {
+            path: PathBuf::from("<serialize>"),
+            error: e.to_string(),
+        })?,
     );
     audio.insert(
         "replaygain".into(),

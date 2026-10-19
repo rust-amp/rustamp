@@ -124,9 +124,8 @@ fn the_replaygain_mode_follows_the_dialog_and_survives_a_restart() {
 }
 
 #[test]
-fn the_output_mode_follows_the_dialog_but_is_not_persisted_yet() {
-    // The device is opened when the player starts and the mode is not applied
-    // yet, so the saved file must not advertise it (config N6's honesty rule).
+fn the_output_mode_follows_the_dialog_and_survives_a_restart() {
+    // Null output makes this a persistence test, not a real exclusive open.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("output_mode.toml");
 
@@ -136,15 +135,20 @@ fn the_output_mode_follows_the_dialog_but_is_not_persisted_yet() {
         rustamp_core::config::OutputMode::Shared
     );
 
-    app.apply_prefs_action(PrefsAction::SetOutputMode(
+    for mode in [
         rustamp_core::config::OutputMode::Exclusive,
-    ));
-    assert_eq!(
-        app.prefs_settings().output_mode,
-        rustamp_core::config::OutputMode::Exclusive
-    );
-
-    app.save_config().expect("save");
-    let text = std::fs::read_to_string(&path).unwrap();
-    assert!(!text.contains("output_mode"), "{text}");
+        rustamp_core::config::OutputMode::Shared,
+    ] {
+        app.apply_prefs_action(PrefsAction::SetOutputMode(mode));
+        assert_eq!(app.prefs_settings().output_mode, mode);
+        // Applying the dialog action saves immediately, like other settings.
+        let loaded = load(Some(&path)).expect("load");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.config.audio.output_mode, mode);
+        assert_eq!(
+            app_with(loaded.config, None).prefs_settings().output_mode,
+            mode
+        );
+        assert_eq!(app.engine().output_name(), "null", "no live device switch");
+    }
 }
