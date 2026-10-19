@@ -25,10 +25,26 @@
 //! lists `PluginLoaded` among the false passes for *those* claims; here it is
 //! the claim under test and nothing more.
 //!
+//! The second test in this file adds the **general-purpose** kind at the
+//! process level: the production host maps our own clean-room `gen_`
+//! fixture, resolves `winampGetGeneralPurposePlugin`, runs its `init` — which
+//! subclasses the host's window and creates a window of its own — and quits
+//! it on shutdown. The evidence is the plugin's own trace file, written from
+//! inside the host process and named after the pid the `Hello` frame reports.
+//! The in-process half of that milestone (the plugin's own IPC queries, its
+//! configuration window and the subclass restore) is
+//! `tests/gen_acceptance.rs`.
+//!
 //! Must refuse loudly (not skip silently) when the VM, the host binary or the
 //! plugin binary is missing.
 //!
 //! Licensed `MIT OR Apache-2.0` (RFC 0004).
+
+#[path = "common/gen_fixture.rs"]
+pub mod gen_fixture;
+
+#[path = "common/gen_protocol.rs"]
+pub mod gen_protocol;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -348,5 +364,157 @@ fn the_real_host_process_loads_an_approved_dll_through_the_control_channel() {
         status.code(),
         Some(0),
         "the host must exit 0 after Shutdown, got {status:?}"
+    );
+}
+
+/// The plugin's own trace file, once it holds `marker`.
+///
+/// The file is written from **inside** the plugin, in the host process, and
+/// named after that process id — so it is evidence the host's own plugin ran,
+/// not something the runner could have written.
+fn wait_for_trace(pid: u32, marker: &str) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "{}{pid}.{}",
+        gen_protocol::TRACE_FILE_PREFIX,
+        gen_protocol::TRACE_FILE_EXTENSION
+    ));
+    let deadline = std::time::Instant::now() + REPLY_DEADLINE;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && text.contains(marker)
+        {
+            return text;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "the plugin wrote no trace containing '{marker}' at {} within {REPLY_DEADLINE:?}",
+                path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The production host process must load a real 32-bit **general-purpose**
+/// plugin DLL and quit it cleanly.
+///
+/// This is the process-level half of P3 §2 ("the production i686 host"): the
+/// host maps the DLL, resolves `winampGetGeneralPurposePlugin`, fills the
+/// host-owned members, calls `init` — which subclasses the host's window and
+/// creates a window of its own — and quits the plugin on shutdown, restoring
+/// the host's original window procedure.
+///
+/// The plugin's own trace file proves that all of that happened **inside the
+/// host process**: it is written by the plugin and named after the host's
+/// pid, which the `Hello` frame reports.
+#[test]
+#[ignore = "VM-only: spawns the real i686 host process and loads a real 32-bit general-purpose DLL; run in test VM"]
+fn the_real_host_process_loads_a_general_purpose_dll_and_quits_it_cleanly() {
+    require_test_vm();
+    if !cfg!(target_arch = "x86") {
+        panic!(
+            "REFUSING LOUDLY: the host must be i686 to map a 32-bit plugin DLL; \
+             this test binary is not x86, so the child it spawns is not either"
+        );
+    }
+
+    let exe = find_host_exe();
+    let fixture = gen_fixture::find_fixture_dll();
+    let approved = std::fs::read(&fixture).expect("the staged fixture must be readable");
+    println!(
+        "FIXTURE {} size={} sha256={}",
+        fixture.display(),
+        approved.len(),
+        Sha256::digest_hex(&approved)
+    );
+    println!("HOST {}", exe.display());
+
+    // The operator's allowlist: exactly these bytes, nothing else.
+    let scratch = Scratch::new();
+    let approvals = scratch.join("plugins-approved.toml");
+    let mut store = ApprovalStore::new();
+    store
+        .approve_bytes(gen_fixture::FIXTURE_FILE_NAME, &approved)
+        .expect("the fixture must pass passive preflight as a general plugin");
+    store
+        .save_to_file(&approvals)
+        .expect("the approval store must be writable");
+
+    let mut host = Host::spawn(&exe, &approvals);
+
+    // The handshake, and the host's real pid.
+    let pid = match host.expect_reply("Hello") {
+        Message::Hello {
+            protocol_version,
+            pid,
+        } => {
+            assert_eq!(
+                protocol_version, PROTOCOL_VERSION,
+                "the host greeted with an incompatible protocol version"
+            );
+            assert_ne!(pid, 0, "the host must report its real pid");
+            println!("HOST_PID {pid}");
+            pid
+        }
+        other => panic!("the host's first frame must be Hello, got {other:?}"),
+    };
+
+    // The load under test: a real general-purpose plugin in the production host.
+    let reply = host.load(&fixture, PluginKind::General, "PluginLoaded");
+    match &reply {
+        Message::PluginLoaded {
+            plugin_id,
+            name,
+            kind,
+        } => {
+            assert_eq!(*kind, PluginKind::General);
+            assert_eq!(*plugin_id, 1, "the first successful load is id 1");
+            assert!(
+                !name.is_empty(),
+                "the name must come from the plugin's own description"
+            );
+            println!("PLUGIN_LOADED id={plugin_id} kind={kind:?} name={name:?}");
+        }
+        Message::PluginError { message, .. } => panic!(
+            "the approved fixture must load in the real i686 host, but it was refused: {message}"
+        ),
+        other => panic!("expected PluginLoaded, got {other:?}"),
+    }
+
+    // The plugin's own trace: it ran inside the host process, subclassed the
+    // host's window and created a window of its own.
+    let trace = wait_for_trace(pid, "window created");
+    println!("PLUGIN_TRACE\n{trace}");
+    assert!(
+        trace.contains("init parent="),
+        "the plugin's init must have run inside the host process:\n{trace}"
+    );
+    assert!(
+        trace.contains("subclass installed"),
+        "the plugin must have subclassed the host's window:\n{trace}"
+    );
+    assert!(
+        trace.contains("parent class ok=1"),
+        "the plugin must have seen the host's Winamp v1.x window:\n{trace}"
+    );
+
+    // Shutdown: the host quits the plugin and exits 0.
+    host.send(&Message::Shutdown);
+    let status = host
+        .child
+        .wait()
+        .expect("waiting for the host process must succeed");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the host must exit 0 after Shutdown, got {status:?}"
+    );
+
+    // The plugin's quit ran in the host process too: the host's original
+    // window procedure is back and the plugin's window is gone.
+    let trace = wait_for_trace(pid, "quit subclass_restored=true");
+    assert!(
+        trace.contains("window_destroyed=true"),
+        "the plugin must have destroyed its own window:\n{trace}"
     );
 }

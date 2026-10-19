@@ -14,6 +14,15 @@ rust-version.workspace = true
 name = "rustamp-plughost32"
 path = "src/main.rs"
 
+# The clean-room general-purpose ("gen_") plugin fixture for the P3 DLL
+# acceptance (docs/tasks/P3-dll-acceptance.md §2). It is a separate cdylib
+# artifact that the acceptance test loads through the OS loader; it is never
+# linked into the host or into the test binary, so it cannot be mistaken for
+# a mocked or statically linked plugin.
+[[example]]
+name = "gen_rustamp_fixture"
+crate-type = ["cdylib"]
+
 [dependencies]
 rustamp-ipc.workspace = true
 rustamp-plugin-abi.workspace = true

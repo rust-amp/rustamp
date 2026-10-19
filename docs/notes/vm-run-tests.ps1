@@ -80,7 +80,7 @@ function Get-WorkspaceStageInventory {
         $p = Join-Path $RepoRoot $name
         if (Test-Path -LiteralPath $p) { $files += Get-Item -LiteralPath $p }
     }
-    foreach ($dir in 'target\debug', 'target\debug\deps', 'target\debug\examples', 'target\i686-pc-windows-msvc\debug', 'target\i686-pc-windows-msvc\debug\deps') {
+    foreach ($dir in 'target\debug', 'target\debug\deps', 'target\debug\examples', 'target\i686-pc-windows-msvc\debug', 'target\i686-pc-windows-msvc\debug\deps', 'target\i686-pc-windows-msvc\debug\examples') {
         $p = Join-Path $RepoRoot $dir
         if (Test-Path -LiteralPath $p) {
             $files += @(Get-ChildItem -LiteralPath $p -File | Where-Object { $_.Extension -in '.exe', '.dll' })
@@ -111,6 +111,13 @@ function Assert-Inventory($Expected, $Actual, [string]$Label) {
             ($problems -join "`n    ") + "`nRun once without -SkipBuild to create a complete staging; no build or guest operation was attempted.")
     }
 }
+
+# The general-purpose plugin fixture of the P3 DLL acceptance is a cdylib
+# (crates/rustamp-plughost/examples/gen_rustamp_fixture.rs) built for i686 by
+# the test build below. The acceptance test loads it through the OS loader,
+# so it has to travel with the test binaries; it is never linked into them.
+$genFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\gen_rustamp_fixture.dll'
+$genFixtureStaged = $false
 
 # --- 1. compile on the host (builds, does not run) ---------------------------
 if (-not $SkipBuild) {
@@ -162,6 +169,9 @@ if (-not $SkipBuild) {
     Assert-Inventory $receipt.inputs @(Get-WorkspaceStageInventory) 'workspace/runtime input'
     $testExes = @($receipt.testExes)
     $i686TestExes = @($receipt.i686TestExes)
+    # The staging receipt covers the fixture file itself, so its presence in
+    # the staged tree is the ground truth here.
+    $genFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\gen_rustamp_fixture.dll')
     Write-Host ("    verified {0} staged files against the complete receipt and current workspace/runtime inputs" -f $receipt.files.Count)
 }
 
@@ -239,6 +249,17 @@ foreach ($exe in $i686TestExes) {
 }
 if ($i686TestExes.Count -gt 0) {
     Write-Host ("    staged {0} i686 plughost test binaries beside the binaries" -f $i686TestExes.Count)
+}
+
+# The general-purpose plugin fixture travels with the test binaries: the
+# acceptance test loads it through the OS loader, never linked into them.
+if (Test-Path $genFixtureDll) {
+    Copy-Item $genFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
+    Copy-Item $genFixtureDll $i686TargetDeps -Force
+    $genFixtureStaged = $true
+    Write-Host '    staged the i686 general-purpose plugin fixture beside the binaries'
+} else {
+    Write-Host '    WARNING: no i686 general-purpose plugin fixture was built; its acceptance test will report it blocked'
 }
 
 foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
@@ -473,6 +494,15 @@ if ($dspHostState -eq 'absent') {
     $dspStaged = $true
     Write-Host ('dsp plugin fixture: staged and verified (guest RUSTAMP_TESTPLUGIN_DSP={0}, SHA-256 {1})' -f $guestDspPath, $guestDspHash)
 }
+# General-purpose plugin fixture status (P3): our own clean-room cdylib, built
+# by the i686 test build and copied into the stage with the test binaries. It
+# needs no third-party DLL, so it is staged whenever the build produced it.
+if ($genFixtureStaged) {
+    $genFixturePath = if (Test-Path $genFixtureDll) { $genFixtureDll } else { Join-Path $Stage 'target\debug\deps\gen_rustamp_fixture.dll' }
+    Write-Host ('gen plugin fixture: staged (our own i686 cdylib, SHA-256 {0})' -f (Get-FileHash -LiteralPath $genFixturePath -Algorithm SHA256).Hash)
+} else {
+    Write-Host 'gen plugin fixture: NOT STAGED (the i686 build produced no general-purpose fixture); its acceptance test refuses loudly and proves nothing in this run'
+}
 $result.results | ForEach-Object {
     # A hung binary must be impossible to mistake for a pass or for a missing binary.
     if ($_.hung) {
@@ -550,6 +580,8 @@ if ($Filter -like '--ignored*') {
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'loads_real_32bit_in_openmpt_dll_and_proves_host_interaction' },
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'approved_real_dll_maps_headlessly_from_verified_snapshot' },
         [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'real_dsp_plugin_loads_initializes_and_changes_audio_through_the_bridge'; Fixture = 'dsp' },
+        [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'a_real_general_purpose_plugin_is_loaded_answers_from_its_own_code_and_quits_cleanly'; Fixture = 'gen' },
+        [pscustomobject]@{ Group = 'Group D (i686 DLL Acceptance)'; Name = 'the_real_host_process_loads_a_general_purpose_dll_and_quits_it_cleanly'; Fixture = 'gen' },
 
         # Group E — Real audio endpoint (2 tests - left out pending decision)
         [pscustomobject]@{ Group = 'Group E (Real Audio Endpoint)'; Name = 'the_real_device_plays_a_reference_file_to_its_end'; Blocker = 'Real audio endpoint decision (WASAPI default device)' },
@@ -583,6 +615,11 @@ if ($Filter -like '--ignored*') {
             # dsp plugin fixture line above): the test can only refuse, never pass.
             $missingFixtureCount++
             Write-Host ("  [MISSING FIXTURE] {0,-21} {1} (dsp plugin fixture not staged and verified; RUSTAMP_TESTPLUGIN_DSP)" -f $item.Group, $item.Name)
+        } elseif ($item.Fixture -eq 'gen' -and -not $genFixtureStaged) {
+            # Our own general-purpose fixture was not built for i686, so its
+            # acceptance test can only refuse, never pass.
+            $missingFixtureCount++
+            Write-Host ("  [MISSING FIXTURE] {0,-21} {1} (the i686 general-purpose plugin fixture was not staged)" -f $item.Group, $item.Name)
         } elseif ($item.Group -like 'Group D*' -and -not $pluginsStaged) {
             # The host never staged D:\code\rustamp-testplugins, so RUSTAMP_TESTPLUGINS
             # is unset and these tests can only refuse loudly, never pass. Name that
