@@ -60,15 +60,29 @@
 //!   unmeasured (S04 open), so there are no controls to draw, type into or
 //!   confirm. `Enter` stays consumed and keeps the dialog open; `Escape` (or
 //!   the window's close button) closes it.
+//! * Extended info (S03 §2 `40293` "Read extended info on selection"): the
+//!   tags of the selected playlist entries. The app reads them when the
+//!   action runs (the tags are read once, not per frame) and the box shows
+//!   the snapshot: the count of the selection, the entry the tags belong to
+//!   (the first selected one, in playlist order) and its tag fields — or the
+//!   reason it has none: a stream has no local file, the file could not be
+//!   read, or it carries no tags. S03 §2 gives the id and the chord only, so
+//!   the content is an own choice (see
+//!   [`rustamp_ui::dialogs::ExtendedInfo`]).
 
 use std::path::PathBuf;
 
+use rustamp_audio::TrackSource;
 use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
+use rustamp_core::meta::TrackMetadata;
 use rustamp_gfx::Image;
 use rustamp_platform::{Bind, PluginRow, PrefsAction, PrefsNode, PrefsSettings};
 use rustamp_plugin_abi::PluginKind;
 use rustamp_prefs::page_name;
-use rustamp_ui::{DialogKind, Key, SkinEntry, dialog_for_command, render_dialog, skin_entries};
+use rustamp_ui::{
+    DialogKind, ExtendedInfo, Key, SkinEntry, dialog_for_command, extended_info_lines,
+    render_dialog, skin_entries,
+};
 
 use crate::app::App;
 
@@ -557,6 +571,7 @@ impl App {
                 "GPL-3.0-or-later.".to_string(),
             ],
             DialogKind::FileInfo => self.file_info_lines(),
+            DialogKind::ExtendedInfo => self.extended_info_lines(),
             DialogKind::Jump(JumpTarget::Time) => vec![
                 "Seconds or m:ss:".to_string(),
                 self.dialogs.jump_text().to_string(),
@@ -715,6 +730,131 @@ impl App {
             None => format!("{} ms", state.position_ms),
         };
         vec![track, stream, position]
+    }
+
+    /// Reads the extended info of the selected entries and opens the box
+    /// (S03 §2 `40293` "Read extended info on selection").
+    ///
+    /// The content is an **own choice** (S03 §2 gives the id and the chord
+    /// only); the rules are:
+    ///
+    /// * the selection is the playlist editor's own (S06), in playlist
+    ///   order;
+    /// * the box names how many entries are selected;
+    /// * the tags shown are those of the **first** selected entry — a
+    ///   multi-selection is summarised, not read entry by entry, so the
+    ///   action stays one file read;
+    /// * a URL entry has no local file and therefore no tags: the box says
+    ///   so;
+    /// * a file that cannot be read is reported the same way — the box
+    ///   names the error, and nothing panics.
+    ///
+    /// With nothing selected the action notes that and opens no box.
+    pub(crate) fn show_extended_info(&mut self) {
+        let sources = self.selected_sources();
+        let Some(first) = sources.first().cloned() else {
+            self.note("extended info: nothing is selected".to_string());
+            return;
+        };
+        self.extended_info = Some(extended_info_for(sources.len(), &first));
+        self.dialogs.open(DialogKind::ExtendedInfo);
+    }
+
+    /// The queue sources of the selected entries, in playlist order.
+    ///
+    /// The selection is the editor's own (S06): its ids, mapped onto the
+    /// engine's queue through the app's id table. An id that is no longer in
+    /// the queue is skipped, so a stale selection cannot name a wrong entry.
+    fn selected_sources(&self) -> Vec<TrackSource> {
+        let mut sources = Vec::new();
+        for id in self.playlist.selected_ids() {
+            let Some(index) = self.entry_ids.iter().position(|entry| *entry == id) else {
+                continue;
+            };
+            if let Some(source) = self.engine().queue().get(index) {
+                sources.push(source.clone());
+            }
+        }
+        sources
+    }
+
+    /// The extended-info box's body lines: the snapshot the action took.
+    ///
+    /// An empty snapshot (the box was opened without a reading) says so
+    /// instead of showing nothing.
+    pub(crate) fn extended_info_lines(&self) -> Vec<String> {
+        match &self.extended_info {
+            Some(info) => extended_info_lines(info),
+            None => vec!["no extended info was read".to_string()],
+        }
+    }
+}
+
+/// The extended info of `source`: its tags, or the reason it has none.
+///
+/// Pure function so the app and its tests share it.
+fn extended_info_for(selected: usize, source: &TrackSource) -> ExtendedInfo {
+    let mut info = ExtendedInfo {
+        selected,
+        subject: source.display(),
+        ..ExtendedInfo::default()
+    };
+    match source {
+        TrackSource::Url(_) => {
+            info.message = Some("a stream has no local file to read tags from".to_string());
+        }
+        TrackSource::Path(path) => match rustamp_meta::read_tags(path) {
+            Ok(metadata) => {
+                info.fields = metadata_fields(&metadata);
+                if info.fields.is_empty() {
+                    info.message = Some("the file has no tags".to_string());
+                }
+            }
+            Err(error) => {
+                info.message = Some(format!("the file could not be read: {error}"));
+            }
+        },
+    }
+    info
+}
+
+/// The tag fields of `metadata`, in a fixed order.
+///
+/// Own choice: the fields a tagger writes most often, in the order the
+/// file-info box names them. A field the file does not carry is left out.
+/// The duration is not among them — `rustamp-meta` reads tag containers
+/// only and never scans the audio, so the duration stays unknown here (the
+/// decoder fills it during playback).
+fn metadata_fields(metadata: &TrackMetadata) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = Vec::new();
+    push_field(&mut fields, "Title", metadata.title.clone());
+    push_field(&mut fields, "Artist", metadata.artist.clone());
+    push_field(&mut fields, "Album", metadata.album.clone());
+    push_field(&mut fields, "Album artist", metadata.album_artist.clone());
+    push_field(
+        &mut fields,
+        "Year",
+        metadata.year.map(|year| year.to_string()),
+    );
+    push_field(&mut fields, "Genre", metadata.genre.clone());
+    if let Some(track) = metadata.track_no {
+        let value = match metadata.track_total {
+            Some(total) => format!("{track}/{total}"),
+            None => track.to_string(),
+        };
+        fields.push(("Track".to_string(), value));
+    }
+    if let Some(disc) = metadata.disc_no {
+        fields.push(("Disc".to_string(), disc.to_string()));
+    }
+    push_field(&mut fields, "Comment", metadata.comment.clone());
+    fields
+}
+
+/// Adds a field to `fields`, unless the file does not carry it.
+fn push_field(fields: &mut Vec<(String, String)>, name: &str, value: Option<String>) {
+    if let Some(value) = value {
+        fields.push((name.to_string(), value));
     }
 }
 

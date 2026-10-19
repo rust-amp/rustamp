@@ -492,6 +492,15 @@ impl App {
                 self.request_html_playlist = true;
                 Ok(Some(ShortcutOutcome::Handled))
             }
+            // ----- the extended info of the selection (S03 §2 `40293`) -----
+            // The tags of the selected entries are read and shown in the
+            // extended-info box. No core command opens that box (reading a
+            // file's tags is not a player action, RFC 0005 §9), so the app
+            // opens it itself; the action is handled either way.
+            PlaylistKeyAction::ReadExtendedInfo => {
+                self.show_extended_info();
+                Ok(Some(ShortcutOutcome::Handled))
+            }
             // ----- the provisional close row -----
             PlaylistKeyAction::CloseEditor => {
                 let commands = self.close_playlist_window()?;
@@ -1384,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn every_misc_id_uses_existing_menu_dispatch_and_only_reports_the_gap() {
+    fn every_misc_id_uses_existing_menu_dispatch() {
         let mut app = test_app();
         add_entries(&mut app, 3);
         let menu = rustamp_ui::menu::native_playlist_misc_menu();
@@ -1403,21 +1412,26 @@ mod tests {
         assert_eq!(app.playlist().visible_ids(), entries);
         assert_eq!(app.playlist().selected_ids(), selection);
 
-        // "Read extended info on selection" has no command yet.
-        let (id, label) = (40293, "Read extended info on selection");
+        // "Read extended info on selection" is the editor's `Ctrl+Alt+E` row:
+        // the same command id, so the menu reads the tags of the selection
+        // like the key does.
+        let first = app.entry_ids[0];
+        app.submit(Command::Select(SelectOp::Set(vec![first])))
+            .unwrap();
         assert_eq!(
-            app.activate_menu_choice(menu.choice_for_id(id).unwrap())
+            app.activate_menu_choice(menu.choice_for_id(40293).unwrap())
                 .unwrap(),
-            Some(crate::menu::MenuOutcome::Noted)
+            None
         );
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::ExtendedInfo));
         let notes = app.drain_notes();
-        assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains(label), "{notes:?}");
-        assert!(notes[0].contains(&id.to_string()), "{notes:?}");
-        assert!(notes[0].contains("not implemented"), "{notes:?}");
+        assert!(
+            notes.iter().all(|note| !note.contains("not implemented")),
+            "{notes:?}"
+        );
         assert_eq!(app.engine().queue().len(), 3);
         assert_eq!(app.playlist().visible_ids(), entries);
-        assert_eq!(app.playlist().selected_ids(), selection);
+        assert_eq!(app.playlist().selected_ids(), vec![first]);
     }
 
     #[test]
@@ -1951,6 +1965,147 @@ mod tests {
         );
         let notes = app.drain_notes();
         assert!(notes.iter().any(|note| note.contains("40255")), "{notes:?}");
+    }
+
+    /// A copy of the tagged MP3 fixture, in a temporary directory.
+    ///
+    /// The fixture lives in the decoders' test data (`sine.mp3`); it is
+    /// copied, never written to.
+    fn tagged_mp3(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rustamp-decoders/tests/fixtures/sine.mp3");
+        let path = dir.path().join(name);
+        std::fs::copy(&fixture, &path).expect("copy the tagged fixture");
+        path
+    }
+
+    /// Adds one entry to the queue and returns its id.
+    fn add_entry(app: &mut App, location: MediaLocation) -> EntryId {
+        app.submit(Command::AddItems {
+            items: vec![location],
+            at: None,
+            play: false,
+        })
+        .expect("AddItems applies");
+        *app.entry_ids.last().expect("the entry has an id")
+    }
+
+    /// Presses the playlist's `Ctrl+Alt+E` row (S03 §2 `40293`).
+    fn read_extended_info(app: &mut App) -> Option<ShortcutOutcome> {
+        app.playlist_key_down(Key::Letter(b'E'), Modifiers::CTRL | Modifiers::ALT)
+            .expect("Ctrl+Alt+E applies")
+    }
+
+    #[test]
+    fn the_extended_info_row_shows_the_tags_of_the_selected_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        let id = add_entry(&mut app, MediaLocation::File(path.clone()));
+        app.submit(Command::Select(SelectOp::Set(vec![id])))
+            .unwrap();
+
+        let outcome = read_extended_info(&mut app);
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::ExtendedInfo));
+        let lines = app.open_dialog_lines().expect("the box has lines");
+        let text = lines.join("\n");
+        assert!(text.contains("1 entry selected"), "{text}");
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(text.contains("Title: Sine Title"), "{text}");
+        assert!(text.contains("Artist: Test Artist"), "{text}");
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn the_extended_info_row_summarises_a_multi_selection() {
+        // Own choice: a multi-selection is summarised — the box names how
+        // many entries are selected and shows the tags of the **first** one.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let first = tagged_mp3(&dir, "first.mp3");
+        let second = tagged_mp3(&dir, "second.mp3");
+        let mut app = test_app();
+        let a = add_entry(&mut app, MediaLocation::File(first.clone()));
+        let b = add_entry(&mut app, MediaLocation::File(second.clone()));
+        app.submit(Command::Select(SelectOp::Set(vec![a, b])))
+            .unwrap();
+
+        read_extended_info(&mut app);
+        let lines = app.open_dialog_lines().expect("the box has lines");
+        assert!(lines[0].contains("2 entries selected"), "{lines:?}");
+        assert!(lines[0].contains("showing the first"), "{lines:?}");
+        assert!(lines[1].contains(&first.display().to_string()), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line == "Title: Sine Title"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_extended_info_row_reports_a_missing_file_and_a_stream() {
+        // A file that cannot be read and a stream are reported, not a panic.
+        let mut app = test_app();
+        let missing = add_entry(&mut app, MediaLocation::File(PathBuf::from("gone.mp3")));
+        let stream = add_entry(
+            &mut app,
+            MediaLocation::Url("http://example.com/stream".to_string()),
+        );
+
+        // The missing file: the box names the error.
+        app.submit(Command::Select(SelectOp::Set(vec![missing])))
+            .unwrap();
+        read_extended_info(&mut app);
+        let text = app
+            .open_dialog_lines()
+            .expect("the box has lines")
+            .join("\n");
+        assert!(text.contains("could not be read"), "{text}");
+        assert!(text.contains("gone.mp3"), "{text}");
+
+        // The stream: it has no local file, so it has no tags.
+        app.submit(Command::Select(SelectOp::Set(vec![stream])))
+            .unwrap();
+        read_extended_info(&mut app);
+        let text = app
+            .open_dialog_lines()
+            .expect("the box has lines")
+            .join("\n");
+        assert!(text.contains("a stream has no local file"), "{text}");
+        assert!(text.contains("http://example.com/stream"), "{text}");
+    }
+
+    #[test]
+    fn the_extended_info_row_with_nothing_selected_says_so_and_opens_nothing() {
+        let mut app = test_app();
+        add_entries(&mut app, 2);
+        let outcome = read_extended_info(&mut app);
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert!(!app.dialog_is_open(rustamp_ui::DialogKind::ExtendedInfo));
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("nothing is selected")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn the_extended_info_row_is_not_unimplemented_any_more() {
+        // The row is bound now: the app neither notes a gap nor lets the
+        // chord fall through to another table.
+        let mut app = test_app();
+        add_entries(&mut app, 1);
+        read_extended_info(&mut app);
+        let notes = app.drain_notes();
+        assert!(
+            !notes.iter().any(|note| note.contains("no command yet")),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("40293")),
+            "{notes:?}"
+        );
     }
 
     #[test]

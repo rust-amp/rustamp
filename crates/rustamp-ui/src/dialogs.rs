@@ -75,6 +75,14 @@
 //!   controls and layout are unmeasured (S04 open), so it shows the requested
 //!   page's name and nothing else. The page list, names and default live in
 //!   `rustamp-prefs`; only the two measured pages exist.
+//! * The extended-info box (S03 §2 `40293` "Read extended info on
+//!   selection") shows the **tags** of the selected playlist entries: the
+//!   count of the selection, the entry the tags belong to (the first
+//!   selected one) and its tag fields — or the reason it has none (a stream
+//!   has no local file, the file could not be read, it carries no tags).
+//!   It is **not** the file-info box, which shows the current track as the
+//!   engine sees it. S03 §2 gives the id and the chord only, so the content
+//!   is an own choice (see [`ExtendedInfo`]).
 //! * Rendering uses the `text.bmp` bitmap font as a stand-in (the same choice
 //!   as the playlist rows; the reference's real dialog font is unknown).
 
@@ -94,6 +102,18 @@ pub enum DialogKind {
     About,
     /// The file-info box for the current track (S03 "View file info", id 40188).
     FileInfo,
+    /// The extended-info box for the playlist selection (S03 §2 "Read extended
+    /// info on selection", id 40293).
+    ///
+    /// **Not** the file-info box: that one shows the *current track* as the
+    /// engine sees it (bitrate, sample rate, channels), while this one shows
+    /// the *tags* of the selected playlist entries. The two answer different
+    /// questions, so they are two dialogs.
+    ///
+    /// No core command opens it (reading a file's tags is not a player
+    /// action, RFC 0005 §9), so the app opens it itself; the content is
+    /// [`ExtendedInfo`].
+    ExtendedInfo,
     /// A jump box (S03 "Jump to file/time", ids 40194/40193).
     Jump(JumpTarget),
     /// The load-playlist dialog (S06 §4 LIST OPTS, RFC 0010
@@ -131,6 +151,9 @@ impl DialogKind {
         match self {
             DialogKind::About => "About Rustamp",
             DialogKind::FileInfo => "File info",
+            // Own choice: S03 §2 gives the row's id and chord, not a title,
+            // and no spec fixes dialog titles (S04 open).
+            DialogKind::ExtendedInfo => "Extended info",
             DialogKind::Jump(JumpTarget::File) => "Jump to file",
             DialogKind::Jump(JumpTarget::Time) => "Jump to time",
             DialogKind::LoadPlaylist => crate::playlist::LOAD_DIALOG_TITLE,
@@ -163,6 +186,7 @@ impl DialogKind {
         match self {
             DialogKind::About => ABOUT_CLIENT_SIZE,
             DialogKind::FileInfo => FILE_INFO_CLIENT_SIZE,
+            DialogKind::ExtendedInfo => EXTENDED_INFO_CLIENT_SIZE,
             DialogKind::Jump(JumpTarget::Time) => JUMP_CLIENT_SIZE,
             DialogKind::Jump(JumpTarget::File) => JUMP_FILE_CLIENT_SIZE,
             DialogKind::LoadPlaylist => LOAD_PLAYLIST_CLIENT_SIZE,
@@ -177,6 +201,9 @@ impl DialogKind {
 pub const ABOUT_CLIENT_SIZE: (u32, u32) = (260, 110);
 /// Client size of the file-info box. Own choice (see the module docs).
 pub const FILE_INFO_CLIENT_SIZE: (u32, u32) = (300, 140);
+/// Client size of the extended-info box: a count line, the entry the tags
+/// belong to and the tag fields. Own choice (see the module docs).
+pub const EXTENDED_INFO_CLIENT_SIZE: (u32, u32) = (320, 190);
 /// Client size of the jump-to-time box. Own choice (see the module docs).
 pub const JUMP_CLIENT_SIZE: (u32, u32) = (220, 90);
 /// Client size of the jump-to-file box: a search field plus
@@ -232,17 +259,24 @@ pub fn dialog_for_command(command: &Command) -> Option<DialogKind> {
 
 /// The [`Command`] that opens `dialog` (the inverse of
 /// [`dialog_for_command`], for tests).
-pub fn opening_command(dialog: DialogKind) -> Command {
+///
+/// `None` for a dialog no command opens: the extended-info box is opened
+/// by the playlist's `Ctrl+Alt+E` action (S03 §2 `40293`), because reading
+/// a file's tags is not a player action and needs no core command
+/// (RFC 0005 §9).
+pub fn opening_command(dialog: DialogKind) -> Option<Command> {
     match dialog {
-        DialogKind::About => Command::OpenAbout,
-        DialogKind::FileInfo => Command::OpenFileInfo,
-        DialogKind::Jump(target) => Command::OpenJump { target },
-        DialogKind::LoadPlaylist => Command::OpenPlaylist,
-        DialogKind::OpenMedia { kind, play } => Command::OpenMedia { kind, play },
-        DialogKind::SkinBrowser => Command::OpenSkinBrowser,
+        DialogKind::About => Some(Command::OpenAbout),
+        DialogKind::FileInfo => Some(Command::OpenFileInfo),
+        DialogKind::Jump(target) => Some(Command::OpenJump { target }),
+        DialogKind::LoadPlaylist => Some(Command::OpenPlaylist),
+        DialogKind::OpenMedia { kind, play } => Some(Command::OpenMedia { kind, play }),
+        DialogKind::SkinBrowser => Some(Command::OpenSkinBrowser),
         // The page-carrying command round-trips; a bare `OpenPrefs` (which
         // opens the default page) has no exact inverse and maps back here.
-        DialogKind::Preferences(page) => Command::OpenPrefsPage(page),
+        DialogKind::Preferences(page) => Some(Command::OpenPrefsPage(page)),
+        // No command opens the extended-info box; the app opens it itself.
+        DialogKind::ExtendedInfo => None,
     }
 }
 
@@ -910,6 +944,71 @@ impl DialogManager {
     }
 }
 
+/// The content of the extended-info box (S03 §2 `40293`).
+///
+/// A **snapshot**: the app fills it when the action runs and the box shows
+/// it. The app owns the reading of the tags (`rustamp-meta` lives there);
+/// this type only carries what was read, so the box stays headless.
+///
+/// S03 §2 gives the command id and the chord only, so the content is an
+/// **own choice**. The rules it follows:
+///
+/// * `selected` is how many entries are selected;
+/// * `subject` is the entry the fields belong to — the **first** selected
+///   one, in playlist order. A multi-selection is summarised, not read
+///   entry by entry, so the action stays one file read;
+/// * `fields` are the tag fields of `subject`, as `(name, value)` pairs in
+///   the order the app read them;
+/// * `message` says why there are no fields: a stream has no local file,
+///   the file could not be read, or it carries no tags.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtendedInfo {
+    /// How many entries are selected.
+    pub selected: usize,
+    /// The entry the fields belong to: the first selected one, in playlist
+    /// order. Its path or URL.
+    pub subject: String,
+    /// The tag fields of [`Self::subject`], as `(name, value)` pairs.
+    pub fields: Vec<(String, String)>,
+    /// Why there are no fields (a stream, an unreadable file, a file without
+    /// tags). `None` with empty `fields` means "no tags".
+    pub message: Option<String>,
+}
+
+/// The extended-info box's body lines.
+///
+/// The rule (own choice, see [`ExtendedInfo`]): the first line names how
+/// many entries are selected, the second names the entry the tags belong
+/// to, and the rest are the tag fields — or the message that says why there
+/// are none. A multi-selection says that it shows the first entry, so the
+/// summary is not read as the tags of all of them.
+pub fn extended_info_lines(info: &ExtendedInfo) -> Vec<String> {
+    let mut lines = Vec::new();
+    if info.selected == 1 {
+        lines.push("1 entry selected".to_string());
+    } else {
+        lines.push(format!(
+            "{} entries selected (showing the first)",
+            info.selected
+        ));
+    }
+    lines.push(info.subject.clone());
+    if !info.fields.is_empty() {
+        lines.extend(
+            info.fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}")),
+        );
+    } else {
+        lines.push(
+            info.message
+                .clone()
+                .unwrap_or_else(|| "the file has no tags".to_string()),
+        );
+    }
+    lines
+}
+
 /// The note lines the app surfaces after reading a playlist file.
 ///
 /// `loaded` is the number of surviving entries, `skips` the per-entry skip
@@ -1011,9 +1110,22 @@ mod tests {
             DialogKind::Preferences(PrefsPage::VisPlugin),
             DialogKind::Preferences(PrefsPage::VisOptions),
         ] {
-            let command = opening_command(dialog);
+            let command = opening_command(dialog).expect("the dialog has a command");
             assert_eq!(dialog_for_command(&command), Some(dialog), "{command:?}");
         }
+    }
+
+    #[test]
+    fn the_extended_info_box_has_no_command_and_no_entry_in_the_command_map() {
+        // The playlist's `Ctrl+Alt+E` action opens it (S03 §2 `40293`):
+        // reading a file's tags is not a player action, so no core command
+        // exists (RFC 0005 §9) and the app opens the box itself.
+        assert_eq!(opening_command(DialogKind::ExtendedInfo), None);
+        assert_eq!(
+            dialog_for_command(&Command::OpenFileInfo),
+            Some(DialogKind::FileInfo),
+            "the file-info box is a different box"
+        );
     }
 
     #[test]
@@ -1075,9 +1187,14 @@ mod tests {
             DialogKind::Preferences(PrefsPage::VisPlugin).client_size(),
             PREFS_CLIENT_SIZE
         );
+        assert_eq!(
+            DialogKind::ExtendedInfo.client_size(),
+            EXTENDED_INFO_CLIENT_SIZE
+        );
         for size in [
             ABOUT_CLIENT_SIZE,
             FILE_INFO_CLIENT_SIZE,
+            EXTENDED_INFO_CLIENT_SIZE,
             JUMP_CLIENT_SIZE,
             LOAD_PLAYLIST_CLIENT_SIZE,
             OPEN_MEDIA_CLIENT_SIZE,
@@ -1095,6 +1212,67 @@ mod tests {
         assert_eq!(
             DialogKind::Preferences(PrefsPage::VisPlugin).title(),
             "Preferences"
+        );
+    }
+
+    #[test]
+    fn the_extended_info_box_names_the_selection_and_the_fields() {
+        // Own choice (S03 §2 gives the id and the chord only): the count
+        // first, then the entry the fields belong to, then the fields.
+        let info = ExtendedInfo {
+            selected: 1,
+            subject: r"C:\Music\song.mp3".to_string(),
+            fields: vec![
+                ("Title".to_string(), "A Song".to_string()),
+                ("Artist".to_string(), "An Artist".to_string()),
+            ],
+            message: None,
+        };
+        assert_eq!(
+            extended_info_lines(&info),
+            vec![
+                "1 entry selected",
+                r"C:\Music\song.mp3",
+                "Title: A Song",
+                "Artist: An Artist",
+            ]
+        );
+
+        // A multi-selection says that it shows the first entry.
+        let many = ExtendedInfo {
+            selected: 3,
+            ..info.clone()
+        };
+        let lines = extended_info_lines(&many);
+        assert_eq!(lines[0], "3 entries selected (showing the first)");
+        assert_eq!(lines[1], r"C:\Music\song.mp3");
+
+        // Without fields the message says why there are none.
+        let empty = ExtendedInfo {
+            selected: 1,
+            subject: "http://example.com/stream".to_string(),
+            fields: Vec::new(),
+            message: Some("a stream has no local file to read tags from".to_string()),
+        };
+        assert_eq!(
+            extended_info_lines(&empty),
+            vec![
+                "1 entry selected",
+                "http://example.com/stream",
+                "a stream has no local file to read tags from",
+            ]
+        );
+
+        // A snapshot without a message says the plain thing.
+        let untagged = ExtendedInfo {
+            selected: 1,
+            subject: r"C:\Music\plain.mp3".to_string(),
+            fields: Vec::new(),
+            message: None,
+        };
+        assert_eq!(
+            extended_info_lines(&untagged).last().map(String::as_str),
+            Some("the file has no tags")
         );
     }
 
