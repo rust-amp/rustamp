@@ -10,11 +10,13 @@
 
 use std::io::{Cursor, Read, Write};
 use std::sync::mpsc;
-use std::sync::{Arc, atomic};
+use std::sync::{Arc, Mutex, atomic};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustamp_audio::resident::HostDecoder;
+use rustamp_audio::resident::{
+    DEFAULT_RESIDENT_RESTARTS, HostDecoder, ResidentReopen, RestartingDecoder,
+};
 use rustamp_audio::{Engine, EngineConfig, TrackSource};
 use rustamp_core::audio::{
     AudioSpec, Confidence, Decoder, DecoderFactory, DecoderRegistry, MediaSource, ProbeHint,
@@ -54,14 +56,45 @@ const LIVENESS: Liveness = Liveness {
     timeout: WAIT,
 };
 
+/// The PCM ring capacity of a fake resident's session, in frames.
+///
+/// Small on purpose: the engine's read takes what the ring holds, so the
+/// window between the position the engine reached and the position the dead
+/// helper had reached stays small enough to bound in the restart assertion.
+const RING_FRAMES: u32 = 64;
+
+/// The frames the fake resident serves before it dies: 100 ms at 44.1 kHz, so
+/// the millisecond wire lands on the death point exactly.
+const DEATH_FRAMES: u64 = 4410;
+
 /// Fake resident serving the same synthetic pattern the in-process
 /// `TestFactory` serves, so resident and in-process tracks are comparable.
 /// The file stem `track<seed>_<frames>.rtst` sets the content; the stem
 /// `die<seed>_<frames>.rtst` serves the same content and then fails loudly,
 /// the way a resident that dies mid-track does; any other stem is refused.
-struct PatternResident;
+struct PatternResident {
+    /// What every resident of this harness did, for the restart assertions.
+    log: Arc<Mutex<ResidentLog>>,
+}
+
+/// What the fake residents did: one entry per opened decoder.
+#[derive(Default)]
+struct ResidentLog {
+    opens: Vec<ResidentOpen>,
+}
+
+/// One opened decoder: the file it serves and the seeks it received.
+struct ResidentOpen {
+    /// The file the resident was asked to serve.
+    name: String,
+    /// The seek targets the resident received, in milliseconds.
+    seeks: Vec<u64>,
+}
 
 struct PatternDecoder {
+    log: Arc<Mutex<ResidentLog>>,
+    /// The entry of [`ResidentLog::opens`] this decoder belongs to.
+    index: usize,
     seed: u64,
     total: u64,
     pos: u64,
@@ -102,23 +135,29 @@ impl DecoderResident for PatternResident {
                 "fake resident takes names as URLs".into(),
             ));
         };
-        match parse_stem(&name) {
-            Some(Script::Pattern { seed, frames }) => Ok(Box::new(PatternDecoder {
-                seed,
-                total: frames,
-                pos: 0,
-                dies: false,
-            })),
-            Some(Script::Die { seed, frames }) => Ok(Box::new(PatternDecoder {
-                seed,
-                total: frames,
-                pos: 0,
-                dies: true,
-            })),
-            None => Err(MediaHostError::OperationFailed(
-                "fake resident refuses this file".into(),
-            )),
-        }
+        let script = parse_stem(&name).ok_or_else(|| {
+            MediaHostError::OperationFailed("fake resident refuses this file".into())
+        })?;
+        let (seed, frames, dies) = match script {
+            Script::Pattern { seed, frames } => (seed, frames, false),
+            Script::Die { seed, frames } => (seed, frames, true),
+        };
+        let index = {
+            let mut log = self.log.lock().expect("the log is not poisoned");
+            log.opens.push(ResidentOpen {
+                name: name.clone(),
+                seeks: Vec::new(),
+            });
+            log.opens.len() - 1
+        };
+        Ok(Box::new(PatternDecoder {
+            log: self.log.clone(),
+            index,
+            seed,
+            total: frames,
+            pos: 0,
+            dies,
+        }))
     }
 }
 
@@ -158,6 +197,9 @@ impl ResidentDecoder for PatternDecoder {
     fn seek(&mut self, to_ms: u64) -> HostResult<u64> {
         let frames = to_ms * u64::from(common::SPEC.sample_rate) / 1000;
         self.pos = frames.min(self.total);
+        self.log.lock().expect("the log is not poisoned").opens[self.index]
+            .seeks
+            .push(to_ms);
         Ok(self.pos * 1000 / u64::from(common::SPEC.sample_rate))
     }
 
@@ -207,7 +249,73 @@ impl Write for ByteWriter {
 /// Factory under test: opens `*.rtst` through a fake resident without
 /// spawning a process. The only test-only seam; production uses
 /// [`rustamp_audio::resident::ResidentFactory`] with a real helper binary.
-struct FakeResidentFactory;
+struct FakeResidentFactory {
+    /// What every resident of this harness did, for the restart assertions.
+    log: Arc<Mutex<ResidentLog>>,
+}
+
+/// Open one fake resident session: a control pair, a host thread serving the
+/// fake resident and the engine's adapter in front of it. No helper binary
+/// is spawned.
+fn spawn_fake_resident(name: &str, log: Arc<Mutex<ResidentLog>>) -> CoreResult<Box<dyn Decoder>> {
+    let (a_tx, b_rx) = mpsc::channel();
+    let (b_tx, a_rx) = mpsc::channel();
+    let client = ControlPeer::start(
+        ByteReader {
+            rx: a_rx,
+            bytes: Cursor::new(Vec::new()),
+        },
+        ByteWriter(a_tx),
+        LIVENESS,
+        false,
+    )
+    .map_err(|e| CoreError::Decode(e.to_string()))?;
+    let host = ControlPeer::start(
+        ByteReader {
+            rx: b_rx,
+            bytes: Cursor::new(Vec::new()),
+        },
+        ByteWriter(b_tx),
+        LIVENESS,
+        true,
+    )
+    .map_err(|e| CoreError::Decode(e.to_string()))?;
+    let (done, result) = mpsc::channel();
+    let resident = PatternResident { log };
+    thread::spawn(move || {
+        let outcome = serve_decoder(&host, &NamedPcmRings, &resident);
+        let _ = done.send(outcome);
+    });
+    let session = DecoderSession::open(
+        client,
+        NamedPcmRings,
+        MediaLocationWire::Url(name.to_string()),
+        RING_FRAMES,
+    )
+    .map_err(|e| CoreError::Decode(e.to_string()))?;
+    // Reap the host thread when the decoder drops: without this the test
+    // process would leak one thread per opened track.
+    Ok(Box::new(ReapedDecoder {
+        inner: Some(
+            HostDecoder::new(session, WAIT, WAIT)
+                .expect("the handshake the session validated is adoptable"),
+        ),
+        done: Some(result),
+    }))
+}
+
+/// Reopens a fake resident for the same source: the restart policy's seam
+/// (RFC 0006 §8) in this harness. A fresh host thread serves the same file.
+struct FakeReopen {
+    name: String,
+    log: Arc<Mutex<ResidentLog>>,
+}
+
+impl ResidentReopen for FakeReopen {
+    fn reopen(&mut self) -> CoreResult<Box<dyn Decoder>> {
+        spawn_fake_resident(&self.name, self.log.clone())
+    }
+}
 
 impl DecoderFactory for FakeResidentFactory {
     fn name(&self) -> &str {
@@ -234,45 +342,18 @@ impl DecoderFactory for FakeResidentFactory {
                 return Err(CoreError::Unsupported("fake resident takes paths only"));
             }
         };
-        let (a_tx, b_rx) = mpsc::channel();
-        let (b_tx, a_rx) = mpsc::channel();
-        let client = ControlPeer::start(
-            ByteReader {
-                rx: a_rx,
-                bytes: Cursor::new(Vec::new()),
-            },
-            ByteWriter(a_tx),
-            LIVENESS,
-            false,
-        )
-        .map_err(|e| CoreError::Decode(e.to_string()))?;
-        let host = ControlPeer::start(
-            ByteReader {
-                rx: b_rx,
-                bytes: Cursor::new(Vec::new()),
-            },
-            ByteWriter(b_tx),
-            LIVENESS,
-            true,
-        )
-        .map_err(|e| CoreError::Decode(e.to_string()))?;
-        let (done, result) = mpsc::channel();
-        thread::spawn(move || {
-            let outcome = serve_decoder(&host, &NamedPcmRings, &PatternResident);
-            let _ = done.send(outcome);
-        });
-        let session = DecoderSession::open(client, NamedPcmRings, MediaLocationWire::Url(name), 64)
-            .map_err(|e| CoreError::Decode(e.to_string()))?;
-        // Reap the host thread when the decoder drops: without this the test
-        // process would leak one thread per opened track.
-        let decoder = ReapedDecoder {
-            inner: Some(
-                HostDecoder::new(session, WAIT, WAIT)
-                    .expect("the handshake the session validated is adoptable"),
-            ),
-            done: Some(result),
+        let decoder = spawn_fake_resident(&name, self.log.clone())?;
+        // The restart policy (RFC 0006 §8): a resident that fails mid-track
+        // is reopened once, at the position the engine had reached.
+        let reopen = FakeReopen {
+            name,
+            log: self.log.clone(),
         };
-        Ok(Box::new(decoder))
+        Ok(Box::new(RestartingDecoder::new(
+            decoder,
+            Box::new(reopen),
+            DEFAULT_RESIDENT_RESTARTS,
+        )))
     }
 }
 
@@ -333,6 +414,8 @@ struct Harness {
     engine: Engine,
     clock: NullClock,
     events: EventReceiver,
+    /// What the fake residents did, for the restart assertions.
+    log: Arc<Mutex<ResidentLog>>,
     _dir: tempfile::TempDir,
 }
 
@@ -350,7 +433,8 @@ impl Harness {
         let events = bus.subscribe();
         let mut registry = DecoderRegistry::new();
         registry.register(common::TestFactory::arc());
-        registry.register(Arc::new(FakeResidentFactory));
+        let log = Arc::new(Mutex::new(ResidentLog::default()));
+        registry.register(Arc::new(FakeResidentFactory { log: log.clone() }));
         // Bit-exact comparisons: the default-on limiter would clamp the
         // synthetic pattern's overs.
         let mut engine = Engine::new(registry, Box::new(output), bus, EngineConfig::default())
@@ -369,6 +453,7 @@ impl Harness {
             engine,
             clock,
             events,
+            log,
             _dir: dir,
         }
     }
@@ -561,7 +646,9 @@ fn resident_to_inprocess_source_change_is_gapless() {
 fn resident_refusal_is_a_loud_open_error() {
     // No engine run: the factory must fail the open loudly without spawning
     // anything, exactly like an undecodable file in-process.
-    let factory = FakeResidentFactory;
+    let factory = FakeResidentFactory {
+        log: Arc::new(Mutex::new(ResidentLog::default())),
+    };
     let outcome = factory.open(MediaSource::Path(
         format!(
             "track-refuse-{}.rtst",
@@ -615,6 +702,123 @@ fn a_resident_that_dies_mid_track_fails_the_track_loudly() {
     assert!(
         h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
         "the failed track must end the run"
+    );
+}
+
+#[test]
+fn a_resident_that_dies_mid_track_is_restarted_once_and_then_fails_the_track() {
+    // RFC 0006 §8: the engine restarts a dead helper once and reopens the
+    // same source; a second failure ends the track loudly, and the player
+    // keeps running.
+    let mut h = Harness::new(&["die7_4410.rtst", "track2_3000.rtst"]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0), "the resident track must open");
+
+    // The failure arrives as an error event.
+    let deadline = Instant::now() + WAIT;
+    let error = loop {
+        h.engine.poll().unwrap();
+        let error = h.drain_events().into_iter().find_map(|event| match event {
+            Event::Error(info) => Some(info),
+            _ => None,
+        });
+        if let Some(info) = error {
+            break info;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the resident's death must be reported"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(error.kind, ErrorKind::Decode, "{}", error.message);
+    assert!(
+        error.message.contains("resident"),
+        "the report must name the resident: {}",
+        error.message
+    );
+
+    // The helper came back exactly once and the retry resumed at the last
+    // position the engine had reached. The engine had taken everything the
+    // dead helper published except the audio still in flight (the ring's
+    // prefetch window), so the resume is at most that window behind the
+    // death point.
+    {
+        let log = h.log.lock().expect("the log is not poisoned");
+        let dying: Vec<&ResidentOpen> = log
+            .opens
+            .iter()
+            .filter(|open| open.name.contains("die7_4410"))
+            .collect();
+        assert_eq!(
+            dying.len(),
+            2,
+            "the helper must be restarted exactly once, got {} opens",
+            dying.len()
+        );
+        assert_eq!(
+            dying[1].seeks.len(),
+            1,
+            "the retry must resume at the last known position"
+        );
+        let resume_ms = dying[1].seeks[0];
+        let lowest = (DEATH_FRAMES - 2 * u64::from(RING_FRAMES)) * 1000 / 44_100;
+        let highest = DEATH_FRAMES * 1000 / 44_100;
+        assert!(
+            (lowest..=highest).contains(&resume_ms),
+            "the retry must resume at the last known position, got {resume_ms} ms"
+        );
+    }
+
+    // The player keeps running: the next track plays and the run ends
+    // normally. A dead helper fails the track, never the player.
+    assert!(
+        h.wait_pumping(|e| e.current_index() == Some(1), WAIT),
+        "the player must carry on with the next track"
+    );
+    assert!(
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+        "the run must finish"
+    );
+    let events = h.drain_events();
+    assert!(events.contains(&Event::PlaylistEnded), "{events:?}");
+}
+
+#[test]
+fn a_healthy_resident_track_is_never_restarted() {
+    // The restart policy must not touch a track that plays: one resident, no
+    // seek, the same bit-exact audio as before.
+    let mut h = Harness::new(&["track7_3000.rtst"]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    assert!(h.wait_buffered(), "the resident track must buffer");
+
+    let mut rec = Vec::new();
+    let mut pumped = 0u64;
+    while pumped < 3000 {
+        let step = 500.min(3000 - pumped);
+        h.clock.pump_record(step, &mut rec);
+        pumped += step;
+        h.engine.poll().unwrap();
+    }
+    let left: Vec<f32> = rec.iter().step_by(2).copied().collect();
+    assert_eq!(left.len(), 3000);
+    assert_eq!(&left[..], &expected(7, 0, 3000)[..]);
+
+    let log = h.log.lock().expect("the log is not poisoned");
+    let healthy: Vec<&ResidentOpen> = log
+        .opens
+        .iter()
+        .filter(|open| open.name.contains("track7_3000"))
+        .collect();
+    assert_eq!(
+        healthy.len(),
+        1,
+        "a healthy track must open its resident exactly once"
+    );
+    assert!(
+        healthy[0].seeks.is_empty(),
+        "a healthy track must not be seeked"
     );
 }
 

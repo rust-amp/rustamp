@@ -64,6 +64,8 @@ pub use engine::{Engine, EngineConfig};
 pub use replaygain::{ReplayGainControl, ReplayGainMode};
 #[cfg(windows)]
 pub use resident::ProcessDecoder;
-pub use resident::{HostDecoder, ResidentConfig, ResidentFactory};
+pub use resident::{
+    HostDecoder, ResidentConfig, ResidentFactory, ResidentReopen, RestartingDecoder,
+};
 pub use ring::{GainState, RingSync};
 pub use vistap::VisTap;
