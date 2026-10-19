@@ -9,6 +9,9 @@
 //! * **Reads** M3U, M3U8, PLS and XSPF from bytes ([`read_playlist`]) or from
 //!   disk ([`load_playlist_file`]), detecting the format from the content and
 //!   from the file name extension ([`PlaylistFormat`]).
+//! * **Imports** a playlist and reports the format it was detected as
+//!   ([`import_playlist_file`], [`import_playlist_path`]), so a caller that
+//!   writes the playlist back can use the format it came in.
 //! * **Writes** M3U/M3U8, PLS and XSPF ([`write_playlist`]) so that
 //!   write → read round-trips order, locations, titles and durations.
 //! * **Resolves** relative entries against the playlist file's directory, not
@@ -96,8 +99,9 @@ pub use interact::{
     remove_selected, select_range, toggle_select_at,
 };
 pub use io::{
-    load_playlist_file, load_playlist_file_report, read_playlist, read_playlist_as,
-    read_playlist_path, read_playlist_report, read_playlist_report_as, read_playlist_report_path,
+    ImportedPlaylist, import_playlist_file, import_playlist_path, load_playlist_file,
+    load_playlist_file_report, read_playlist, read_playlist_as, read_playlist_path,
+    read_playlist_report, read_playlist_report_as, read_playlist_report_path,
     read_playlist_report_with_hint, read_playlist_with_hint, write_playlist,
 };
 pub use location::{Base, resolve_location};
