@@ -119,8 +119,9 @@ pub enum ScrollDirection {
 /// Implements the provisional move/scroll rows, the two provisional jump rows,
 /// the menu-confirmed Enter row, the provisional `Alt+Up`/`Alt+Down` block moves,
 /// the menu-confirmed `Delete` and `Ctrl+Delete` (Crop) rows, and the
-/// menu-confirmed `Alt+Delete` (remove dead files) and `Ctrl+Shift+Delete` /
-/// `Ctrl+N` (clear the playlist) rows.
+/// menu-confirmed `Alt+Delete` (remove dead files), `Ctrl+Shift+Delete` /
+/// `Ctrl+N` (clear the playlist) rows, and the menu-confirmed `Ctrl+Shift`
+/// reorder rows (the three sorts and randomize).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlaylistKeyAction {
     /// Up: move the selection up (`40289`, provisional).
@@ -150,6 +151,15 @@ pub enum PlaylistKeyAction {
     MoveBlockUp,
     /// Alt+Down: move the selected block down (`40216`, provisional).
     MoveBlockDown,
+    /// Ctrl+Shift+1: sort the list by title (`40209`, menu-confirmed).
+    SortByTitle,
+    /// Ctrl+Shift+2: sort the list by file name (`40210`, menu-confirmed).
+    SortByFileName,
+    /// Ctrl+Shift+3: sort the list by path and file name (`40211`,
+    /// menu-confirmed).
+    SortByPathAndFileName,
+    /// Ctrl+Shift+R: randomize the list (`40212`, menu-confirmed).
+    Randomize,
 }
 
 /// Maps a key press to the playlist editor's key action, if any.
@@ -157,17 +167,26 @@ pub enum PlaylistKeyAction {
 /// Covers the S03 §2 rows listed on [`PlaylistKeyAction`]: plain Up, Down,
 /// Home, End, PageUp, PageDown and Enter with no modifiers; `Alt+Up` and
 /// `Alt+Down` for moving the selected block; `Alt+Delete` for removing dead
-/// files; and `Ctrl+Delete` for cropping to the selection. `Ctrl+Shift+Delete`
-/// and `Ctrl+N` both clear the playlist, because S03 §2 binds the one command
-/// id `40214` to both chords. Plain `Delete`, `Ctrl+A` and `Ctrl+I` return
-/// `None` here to preserve the existing app-side shortcut routing
-/// (`App::playlist_key_down`).
+/// files; and `Ctrl+Delete` for cropping to the selection. The `Ctrl+Shift`
+/// rows are tested first because [`Modifiers`] is a bit set that no
+/// single-modifier match can express: `Ctrl+Shift+Delete` and `Ctrl+N` clear
+/// the playlist (S03 §2 binds the one command id `40214` to both chords) and
+/// `Ctrl+Shift+1/2/3` / `Ctrl+Shift+R` are the three sorts and randomize.
+/// Plain `Delete`, `Ctrl+A` and `Ctrl+I` return `None` here to preserve the
+/// existing app-side shortcut routing (`App::playlist_key_down`).
+///
+/// The app consults the map in `App::playlist_key_down`; this function only
+/// names the row, it never runs it.
 pub fn playlist_key_action(key: Key, modifiers: Modifiers) -> Option<PlaylistKeyAction> {
     // Checked before the single-modifier arms: `Modifiers` is a set, so
     // Ctrl+Shift is neither `Modifiers::CTRL` nor `Modifiers::SHIFT`.
     if modifiers == Modifiers::CTRL.union(Modifiers::SHIFT) {
         return match key {
             Key::Delete => Some(PlaylistKeyAction::ClearPlaylist),
+            Key::Digit(1) => Some(PlaylistKeyAction::SortByTitle),
+            Key::Digit(2) => Some(PlaylistKeyAction::SortByFileName),
+            Key::Digit(3) => Some(PlaylistKeyAction::SortByPathAndFileName),
+            Key::Letter(b'R') => Some(PlaylistKeyAction::Randomize),
             _ => None,
         };
     }
@@ -1105,6 +1124,33 @@ mod tests {
         );
         assert_eq!(playlist_key_action(Key::Delete, Modifiers::NONE), None);
         assert_eq!(playlist_key_action(Key::Left, Modifiers::NONE), None);
+
+        // The four reorder rows of S03 §2, menu-confirmed: `Ctrl+Shift+1/2/3`
+        // for the three sorts and `Ctrl+Shift+R` for randomizing.
+        let chord = Modifiers::CTRL.union(Modifiers::SHIFT);
+        assert_eq!(
+            playlist_key_action(Key::Digit(1), chord),
+            Some(PlaylistKeyAction::SortByTitle)
+        );
+        assert_eq!(
+            playlist_key_action(Key::Digit(2), chord),
+            Some(PlaylistKeyAction::SortByFileName)
+        );
+        assert_eq!(
+            playlist_key_action(Key::Digit(3), chord),
+            Some(PlaylistKeyAction::SortByPathAndFileName)
+        );
+        assert_eq!(
+            playlist_key_action(Key::Letter(b'R'), chord),
+            Some(PlaylistKeyAction::Randomize)
+        );
+        // Only the full chord matches: neither modifier alone, nor the chord
+        // on a key the table does not bind.
+        assert_eq!(playlist_key_action(Key::Digit(1), Modifiers::CTRL), None);
+        assert_eq!(playlist_key_action(Key::Digit(1), Modifiers::SHIFT), None);
+        assert_eq!(playlist_key_action(Key::Digit(1), Modifiers::NONE), None);
+        assert_eq!(playlist_key_action(Key::Digit(4), chord), None);
+        assert_eq!(playlist_key_action(Key::Letter(b'A'), chord), None);
     }
 
     #[test]

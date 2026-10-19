@@ -28,7 +28,7 @@
 //! [`NullOutput`]; the windowed presenter in [`crate::window`] only adds the
 //! `winit`/`softbuffer` shell around it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,7 @@ use rustamp_core::config::{
 };
 use rustamp_core::error::{Error, ErrorInfo, ErrorKind, Result};
 use rustamp_core::event::Event;
-use rustamp_core::playlist::{EntryId, MediaLocation};
+use rustamp_core::playlist::{EntryId, MediaLocation, SortKey};
 use rustamp_core::state::{PlayerState, TransportState, WindowId};
 use rustamp_gfx::Image;
 use rustamp_ipc::{Message, Transport};
@@ -1730,9 +1730,11 @@ impl App {
             C::Remove(ids) => self.remove_entries(ids),
             C::Clear => self.clear_entries(),
             C::Select(op) => self.playlist.apply_select(op),
-            C::MoveEntries { .. } | C::Sort(_) | C::Randomize | C::Reverse => {
+            C::Sort(key) => self.sort_entries(*key),
+            C::Randomize => self.randomize_entries(),
+            C::MoveEntries { .. } | C::Reverse => {
                 self.note(
-                    "the playlist reordering is not wired to the app yet (S14/S15)".to_string(),
+                    "playlist move and reverse are not wired to the app yet (S14/S15)".to_string(),
                 );
             }
             C::OpenAbout
@@ -2041,6 +2043,196 @@ impl App {
             .and_then(|id| self.entry_ids.iter().position(|entry| *entry == id))
             .map(|index| index as u32);
         self.engine.set_current_index(current);
+        self.sync_playlist_entries();
+    }
+
+    /// Applies `Command::Sort` to the playlist order (S03 §2 `40209`-`40211`,
+    /// RFC 0005 §5: the app owns the playlist model).
+    ///
+    /// The key texts mirror core
+    /// [`Playlist::sort`](rustamp_core::playlist::Playlist::sort):
+    ///
+    /// * `Title` — the name the last playlist load carried (`#EXTINF`, PLS
+    ///   `TitleN`), matched by location and falling back to the file name, so
+    ///   a queue the load did not name sorts like `FileName`;
+    /// * `FileName` — the final path component;
+    /// * `PathAndFileName` — the full location;
+    /// * `Duration` — the duration the last load carried, unknown first
+    ///   (`None` before `Some`, the core's rule).
+    ///
+    /// Text is compared case-insensitively and every sort is stable, so equal
+    /// keys keep their relative order. Table, queue and model reorder together
+    /// ([`App::reorder_entries`]); nothing else changes — the current entry
+    /// keeps playing and ids keep their selection.
+    fn sort_entries(&mut self, key: SortKey) {
+        if self.entry_ids.len() < 2 {
+            return;
+        }
+        // Titles and durations exist only for what the last playlist load
+        // reported: no entry is probed for tags or properties (S14 title
+        // formatting is open; `rustamp-meta` does not scan properties).
+        let mut order: Vec<usize> = (0..self.entry_ids.len()).collect();
+        match key {
+            SortKey::Duration => {
+                let durations = self.loaded_durations();
+                order.sort_by_cached_key(|&index| {
+                    self.queue_location(index)
+                        .and_then(|location| durations.get(&location).copied())
+                });
+            }
+            SortKey::Title | SortKey::FileName | SortKey::PathAndFileName => {
+                // Only `Title` reads the loaded names; the other two sort on
+                // the location alone.
+                let titles = if key == SortKey::Title {
+                    self.loaded_titles()
+                } else {
+                    HashMap::new()
+                };
+                order.sort_by_cached_key(|&index| self.sort_text(index, key, &titles));
+            }
+        }
+        self.reorder_entries(order);
+    }
+
+    /// The case-insensitive sort text of queue row `index` for one of the
+    /// three text keys; `titles` feeds `Title` only.
+    ///
+    /// A row the queue does not hold sorts as the empty string and leaves with
+    /// the next sync; while the tables mirror each other that cannot happen.
+    fn sort_text(
+        &self,
+        index: usize,
+        key: SortKey,
+        titles: &HashMap<MediaLocation, String>,
+    ) -> String {
+        let Some(location) = self.queue_location(index) else {
+            return String::new();
+        };
+        let text = match key {
+            SortKey::Title => titles
+                .get(&location)
+                .cloned()
+                .unwrap_or_else(|| location.file_name()),
+            SortKey::FileName => location.file_name(),
+            SortKey::PathAndFileName => location.to_display_string(),
+            // `Duration` takes the numeric branch of `Self::sort_entries`.
+            SortKey::Duration => unreachable!("Duration sorts numerically"),
+        };
+        text.to_lowercase()
+    }
+
+    /// The media location of queue row `index`, if the row exists.
+    fn queue_location(&self, index: usize) -> Option<MediaLocation> {
+        Some(match self.engine.queue().get(index)? {
+            TrackSource::Path(path) => MediaLocation::File(path.clone()),
+            TrackSource::Url(url) => MediaLocation::Url(url.clone()),
+        })
+    }
+
+    /// Names the last playlist load carried, by location.
+    fn loaded_titles(&self) -> HashMap<MediaLocation, String> {
+        self.last_playlist_report
+            .as_ref()
+            .map(|report| {
+                report
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .title
+                            .as_ref()
+                            .map(|title| (entry.location.clone(), title.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Durations the last playlist load carried, by location.
+    fn loaded_durations(&self) -> HashMap<MediaLocation, u64> {
+        self.last_playlist_report
+            .as_ref()
+            .map(|report| {
+                report
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .duration_ms
+                            .map(|duration| (entry.location.clone(), duration))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Applies `Command::Randomize` (S03 §2 `40212`, the `MISC -> Randomize
+    /// List` action): one in-place permutation of the order.
+    ///
+    /// S15 §5 maps the action to `rustamp-playlist::order::randomize`, whose
+    /// Fisher-Yates shuffle is [`rustamp_playlist::shuffle`]. The app holds no
+    /// core `Playlist` — its order is the id table plus the engine queue — so
+    /// the permutation is taken over row indices and handed to
+    /// [`App::reorder_entries`]: ids, selection and the current entry survive,
+    /// only the rows move.
+    ///
+    /// The seed is an own choice (S15 Q7.3 leaves the reference's seeding
+    /// open): wall-clock nanoseconds give each press a fresh stream with no
+    /// random-source dependency, and the generator itself is deterministic. A
+    /// clock that does not advance only repeats the previous permutation, which
+    /// is a legal outcome of a shuffle anyway.
+    fn randomize_entries(&mut self) {
+        if self.entry_ids.len() < 2 {
+            return;
+        }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        let mut rng = rustamp_playlist::Rng::new(seed);
+        let mut order: Vec<usize> = (0..self.entry_ids.len()).collect();
+        rustamp_playlist::shuffle(&mut order, &mut rng);
+        self.reorder_entries(order);
+    }
+
+    /// Reorders the id table and the engine queue to `order`, a permutation of
+    /// row indices, and re-syncs the playlist model.
+    ///
+    /// The tables mirror each other (see [`App::sync_entry_ids`]), so they move
+    /// together. Playback is untouched: the current entry is carried by
+    /// identity to its new row, the way [`App::remove_entries`] keeps a
+    /// surviving current entry, so the track plays on and only the indicator
+    /// moves. The model keeps selection by id across the re-sync.
+    ///
+    /// The current index is written before the queue because
+    /// [`Engine::set_queue`] re-plans an active shuffle around the current
+    /// index, which is only meaningful in the new order. An order that is not a
+    /// row permutation of a matching queue is dropped rather than applied: half
+    /// of it would desynchronize the tables.
+    fn reorder_entries(&mut self, order: Vec<usize>) {
+        let len = self.entry_ids.len();
+        if len == 0
+            || order.len() != len
+            || self.engine.queue().len() != len
+            || order.iter().any(|&row| row >= len)
+        {
+            return;
+        }
+        let new_ids: Vec<EntryId> = order.iter().map(|&row| self.entry_ids[row]).collect();
+        let new_queue: Vec<TrackSource> = order
+            .iter()
+            .map(|&row| self.engine.queue()[row].clone())
+            .collect();
+        let current_id = self
+            .engine
+            .current_index()
+            .and_then(|index| self.entry_ids.get(index as usize))
+            .copied();
+        self.entry_ids = new_ids;
+        let current = current_id
+            .and_then(|id| self.entry_ids.iter().position(|entry| *entry == id))
+            .map(|index| index as u32);
+        self.engine.set_current_index(current);
+        self.engine.set_queue(new_queue);
         self.sync_playlist_entries();
     }
 
@@ -4306,6 +4498,198 @@ mod tests {
         assert_eq!(app.entry_ids.len(), 2);
         assert_eq!(app.entry_ids, vec![EntryId(2), EntryId(4)]);
         assert_eq!(app.playlist().visible_ids(), vec![EntryId(2), EntryId(4)]);
+    }
+
+    #[test]
+    fn sort_by_file_name_reorders_the_table_the_queue_and_the_model() {
+        // S03 §2 `40210`: sort by file name, case-insensitively.
+        let (mut app, dir) = app_with_file(None);
+        let zulu = track(&dir, "Zulu.mp3");
+        let alpha = track(&dir, "alpha.mp3");
+        let beta = track(&dir, "Beta.mp3");
+        app.submit(Command::AddItems {
+            items: vec![
+                MediaLocation::File(zulu),
+                MediaLocation::File(alpha),
+                MediaLocation::File(beta),
+            ],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+
+        app.submit(Command::Sort(SortKey::FileName)).unwrap();
+
+        // alpha < Beta < Zulu once case is folded away.
+        assert_eq!(app.entry_ids, vec![EntryId(1), EntryId(2), EntryId(0)]);
+        assert_eq!(app.playlist().visible_ids(), app.entry_ids);
+        let names: Vec<String> = app
+            .engine()
+            .queue()
+            .iter()
+            .map(|track| track.display())
+            .collect();
+        assert!(names[0].ends_with("alpha.mp3"), "{names:?}");
+        assert!(names[1].ends_with("Beta.mp3"), "{names:?}");
+        assert!(names[2].ends_with("Zulu.mp3"), "{names:?}");
+    }
+
+    #[test]
+    fn sort_by_title_uses_the_loaded_titles_and_falls_back_to_the_file_name() {
+        // S03 §2 `40209`: an entry the load did not name keeps the file name as
+        // its key (the core's fallback).
+        let (mut app, dir) = app_with_file(None);
+        let named = track(&dir, "fileA.mp3");
+        let unnamed = track(&dir, "fileB.mp3");
+        app.submit(Command::AddItems {
+            items: vec![
+                MediaLocation::File(named.clone()),
+                MediaLocation::File(unnamed.clone()),
+            ],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        app.last_playlist_report = Some(rustamp_playlist::PlaylistReport::new(
+            vec![
+                rustamp_playlist::LoadedEntry::new(MediaLocation::File(named)).with_title("Zulu"),
+                rustamp_playlist::LoadedEntry::new(MediaLocation::File(unnamed)),
+            ],
+            Vec::new(),
+        ));
+
+        app.submit(Command::Sort(SortKey::Title)).unwrap();
+
+        // "fileb.mp3" < "zulu": the unnamed entry's fallback sorts first.
+        assert_eq!(app.entry_ids, vec![EntryId(1), EntryId(0)]);
+    }
+
+    #[test]
+    fn sort_by_duration_puts_unknown_durations_first() {
+        // `SortKey::Duration`: unknown first (the core's `None`-before-`Some`
+        // rule); the durations come from the last playlist load.
+        let (mut app, dir) = app_with_file(None);
+        let slow = track(&dir, "slow.mp3");
+        let fast = track(&dir, "fast.mp3");
+        let unknown = track(&dir, "unknown.mp3");
+        app.submit(Command::AddItems {
+            items: vec![
+                MediaLocation::File(slow.clone()),
+                MediaLocation::File(fast.clone()),
+                MediaLocation::File(unknown.clone()),
+            ],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        app.last_playlist_report = Some(rustamp_playlist::PlaylistReport::new(
+            vec![
+                rustamp_playlist::LoadedEntry::new(MediaLocation::File(slow))
+                    .with_duration_ms(9_000),
+                rustamp_playlist::LoadedEntry::new(MediaLocation::File(fast))
+                    .with_duration_ms(1_000),
+                rustamp_playlist::LoadedEntry::new(MediaLocation::File(unknown)),
+            ],
+            Vec::new(),
+        ));
+
+        app.submit(Command::Sort(SortKey::Duration)).unwrap();
+
+        // unknown(2), then 1 s (1), then 9 s (0).
+        assert_eq!(app.entry_ids, vec![EntryId(2), EntryId(1), EntryId(0)]);
+    }
+
+    #[test]
+    fn equal_sort_keys_keep_their_relative_order_and_the_path_breaks_the_tie() {
+        // Stable, like the core's rule: equal file names keep insertion order,
+        // and only the full path separates them.
+        let (mut app, dir) = app_with_file(None);
+        let b_dir = dir.path().join("b").join("x.mp3");
+        let a_dir = dir.path().join("a").join("x.mp3");
+        app.submit(Command::AddItems {
+            items: vec![MediaLocation::File(b_dir), MediaLocation::File(a_dir)],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+
+        app.submit(Command::Sort(SortKey::FileName)).unwrap();
+        assert_eq!(
+            app.entry_ids,
+            vec![EntryId(0), EntryId(1)],
+            "a tie is stable"
+        );
+
+        app.submit(Command::Sort(SortKey::PathAndFileName)).unwrap();
+        assert_eq!(
+            app.entry_ids,
+            vec![EntryId(1), EntryId(0)],
+            "the a/ path sorts first"
+        );
+    }
+
+    #[test]
+    fn sorting_keeps_the_current_entry_and_the_selection_by_identity() {
+        use rustamp_core::command::SelectOp;
+
+        let (mut app, dir) = app_with_file(None);
+        let zulu = track(&dir, "zulu.mp3");
+        let alpha = track(&dir, "alpha.mp3");
+        let mike = track(&dir, "mike.mp3");
+        app.submit(Command::AddItems {
+            items: vec![
+                MediaLocation::File(zulu),
+                MediaLocation::File(alpha),
+                MediaLocation::File(mike),
+            ],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        app.engine_mut().set_current_index(Some(0));
+        app.submit(Command::Select(SelectOp::Set(vec![EntryId(1)])))
+            .unwrap();
+
+        app.submit(Command::Sort(SortKey::FileName)).unwrap();
+
+        // alpha(1), mike(2), zulu(0): zulu moved to row 2 and is still current;
+        // the selected alpha is row 0 and still selected.
+        assert_eq!(app.entry_ids, vec![EntryId(1), EntryId(2), EntryId(0)]);
+        assert_eq!(app.engine().current_index(), Some(2));
+        assert_eq!(app.entry_id_for(Some(2)), Some(EntryId(0)));
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(1)]);
+    }
+
+    #[test]
+    fn randomize_permutes_the_order_and_keeps_the_entries() {
+        // S03 §2 `40212` (S15 §5 maps it to the in-place shuffle): the order
+        // changes, the entries do not.
+        let (mut app, dir) = app_with_file(None);
+        let items = (0..32)
+            .map(|i| MediaLocation::File(track(&dir, &format!("r{i:02}.mp3"))))
+            .collect::<Vec<_>>();
+        app.submit(Command::AddItems {
+            items,
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        let before = app.entry_ids.clone();
+
+        app.submit(Command::Randomize).unwrap();
+
+        let after = app.entry_ids.clone();
+        let mut before_sorted = before.clone();
+        before_sorted.sort_by_key(|id| id.0);
+        let mut after_sorted = after.clone();
+        after_sorted.sort_by_key(|id| id.0);
+        assert_eq!(before_sorted, after_sorted, "the same 32 ids");
+        assert_ne!(before, after, "a 32-entry shuffle changes the order");
+        // The model holds every entry and mirrors the new order (only the
+        // visible page is exposed).
+        assert_eq!(app.playlist().len(), after.len());
+        let visible = app.playlist().visible_ids();
+        assert_eq!(visible.as_slice(), &after[..visible.len()]);
     }
 
     #[test]
