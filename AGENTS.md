@@ -29,6 +29,9 @@ Read these first, in this order:
   stops has not finished; the orchestrator grants it the minimal extra scope to
   make the workspace build. The done criterion is `cargo clippy --workspace` and
   `cargo test --workspace` green, not the lane's own crate.
+  **After every merge, the orchestrator runs `cargo check --workspace` itself** —
+  a lane that only ran its own crate's tests can still leave a caller broken, and
+  the breakage then surfaces at the *next* merge, far from its cause.
 
 - **Garbage output → restart the task on a stronger model** (owner rule, 2026-10-19).
   When a lane reports success but the diff is speculative — invented APIs, alias
