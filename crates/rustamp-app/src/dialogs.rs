@@ -380,6 +380,7 @@ impl App {
             skins: entries.into_iter().map(|entry| entry.name).collect(),
             skin_selected,
             plugins: self.plugin_rows(),
+            library_roots: self.library_roots(),
         }
     }
 
@@ -498,6 +499,21 @@ impl App {
                 }
             }
             PrefsAction::RescanPlugins => self.rescan_plugins(),
+            PrefsAction::AddLibraryRoot => {
+                // The dialog does not pick the folder itself: the presenter
+                // asks the user for it, from the tick.
+                self.library_window.request_folder();
+            }
+            PrefsAction::RemoveLibraryRoot(row) => {
+                // The row is a row of the list the dialog shows; a row that
+                // does not exist removes nothing.
+                let Some(path) = self.prefs_settings().library_root(row).map(PathBuf::from) else {
+                    return;
+                };
+                if let Err(error) = self.remove_library_root(&path) {
+                    self.note(format!("preferences: {error}"));
+                }
+            }
         }
     }
 

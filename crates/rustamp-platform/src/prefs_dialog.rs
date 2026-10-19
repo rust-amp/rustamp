@@ -32,6 +32,20 @@
 //!
 //! The reference's preferences pages are unmeasured (S04 is open), so the page
 //! that carries them and the wording of their labels are own choices.
+//!
+//! # The library page
+//!
+//! One page is not the reference's: `Library`. The media library is this
+//! player's own feature, and the folders it indexes are a setting the user
+//! has to be able to change. The page lists the roots
+//! ([`PrefsSettings::library_roots`]) and offers two actions: add a folder
+//! ([`PrefsAction::AddLibraryRoot`]) and remove the selected root
+//! ([`PrefsAction::RemoveLibraryRoot`]).
+//!
+//! The roots are **not** a setting of the configuration file: they live in
+//! the media library's own database, and the player reads them from there.
+//! The dialog only shows them and says what the user did; the player turns
+//! the action into a change of the index.
 
 use rustamp_core::config::{OutputMode, ReplayGainMode};
 
@@ -64,6 +78,12 @@ pub enum PrefsNode {
     GeneralPurpose,
     /// `Skins`.
     Skins,
+    /// `Library`.
+    ///
+    /// **Own choice.** The reference's tree has no such page (S04 is open);
+    /// the media library is this player's own feature, and its roots are a
+    /// setting the user has to be able to change.
+    Library,
     /// `Bookmarks`.
     Bookmarks,
 }
@@ -98,6 +118,7 @@ pub const TREE: &[TreeEntry] = &[
     entry(PrefsNode::DspEffect, "DSP/Effect", 1),
     entry(PrefsNode::GeneralPurpose, "General Purpose", 1),
     entry(PrefsNode::Skins, "Skins", 0),
+    entry(PrefsNode::Library, "Library", 0),
     entry(PrefsNode::Bookmarks, "Bookmarks", 0),
 ];
 
@@ -294,6 +315,22 @@ pub enum Item {
         /// Placement.
         rect: Rect,
     },
+    /// The media library's roots, one row each.
+    LibraryRoots {
+        /// Placement.
+        rect: Rect,
+    },
+    /// Asks for a folder to add to the media library
+    /// ([`PrefsAction::AddLibraryRoot`]).
+    LibraryAdd {
+        /// Placement.
+        rect: Rect,
+    },
+    /// Removes the selected root ([`PrefsAction::RemoveLibraryRoot`]).
+    LibraryRemove {
+        /// Placement.
+        rect: Rect,
+    },
 }
 
 /// Width and height of the page area.
@@ -444,6 +481,25 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
                 rect: rect(10, 20, w - 20, PAGE_SIZE.1 - 30),
             },
         ],
+        PrefsNode::Library => vec![
+            Item::Group {
+                text: "Media library folders",
+                rect: rect(0, 0, w, PAGE_SIZE.1),
+            },
+            Item::Label {
+                text: "The media library indexes the tracks in these folders.",
+                rect: rect(12, 20, w - 24, 36),
+            },
+            Item::LibraryRoots {
+                rect: rect(10, 60, w - 20, 150),
+            },
+            Item::LibraryAdd {
+                rect: rect(10, 218, 120, 26),
+            },
+            Item::LibraryRemove {
+                rect: rect(138, 218, 114, 26),
+            },
+        ],
         PrefsNode::Bookmarks => note_page("Bookmarks", "Bookmarks are not available yet."),
     }
 }
@@ -484,6 +540,12 @@ pub struct PrefsSettings {
     pub skin_selected: Option<usize>,
     /// The rows of every plug-in page's list.
     pub plugins: Vec<PluginRow>,
+    /// The media library's roots, one row each.
+    ///
+    /// The roots are not a setting of the configuration file: they live in
+    /// the media library's own database, and the player reads them from
+    /// there.
+    pub library_roots: Vec<String>,
 }
 
 impl PrefsSettings {
@@ -510,6 +572,14 @@ impl PrefsSettings {
             ComboBind::OutputMode => output_mode_row(self.output_mode),
         }
     }
+
+    /// The media library's root in the row `row` of the library's list.
+    ///
+    /// `None` for a row that does not exist: the row is the one the user
+    /// picked, and a stale one must not remove another root.
+    pub fn library_root(&self, row: usize) -> Option<&str> {
+        self.library_roots.get(row).map(String::as_str)
+    }
 }
 
 /// What the user did in the dialog; the player turns it into a command.
@@ -528,6 +598,15 @@ pub enum PrefsAction {
     TogglePlugin(usize),
     /// The plug-in folder should be read again.
     RescanPlugins,
+    /// A folder should be added to the media library.
+    ///
+    /// The player asks the user for the folder itself; the dialog only says
+    /// that a folder was asked for.
+    AddLibraryRoot,
+    /// The media library's root in this row should be removed.
+    ///
+    /// The row is a row of [`PrefsSettings::library_roots`].
+    RemoveLibraryRoot(usize),
 }
 
 /// Why the dialog could not be opened.
@@ -588,8 +667,13 @@ mod win32 {
     const ID_PLUGINS: u16 = 61;
     const ID_PLUGIN_TOGGLE: u16 = 62;
     const ID_PLUGIN_RESCAN: u16 = 63;
+    const ID_LIBRARY_ROOTS: u16 = 64;
+    const ID_LIBRARY_ADD: u16 = 65;
+    const ID_LIBRARY_REMOVE: u16 = 66;
     /// Scrollable width (unscaled pixels) of a plug-in row.
     const PLUGIN_ROW_EXTENT: i32 = 900;
+    /// Scrollable width (unscaled pixels) of a library root.
+    const ROOT_ROW_EXTENT: i32 = 900;
 
     /// Layout of the frame in unscaled pixels (client area).
     const CLIENT: (i32, i32) = (440, 300);
@@ -635,6 +719,11 @@ mod win32 {
         plugin_list: Option<HWND>,
         plugin_ids: Vec<Option<usize>>,
         plugin_texts: Vec<String>,
+        /// The media library's root list of the current page.
+        library_list: Option<HWND>,
+        /// The row texts the root list shows, so a push that changes
+        /// nothing does not rebuild the list.
+        library_texts: Vec<String>,
         actions: Vec<PrefsAction>,
         /// Tree item handles, indexed like [`TREE`].
         items: Vec<isize>,
@@ -768,6 +857,8 @@ mod win32 {
                     plugin_list: None,
                     plugin_ids: Vec::new(),
                     plugin_texts: Vec::new(),
+                    library_list: None,
+                    library_texts: Vec::new(),
                     actions: Vec::new(),
                     items,
                     quiet: false,
@@ -843,23 +934,29 @@ mod win32 {
 
         /// Pushes the player's current settings into the open controls.
         pub fn set_settings(&self, settings: &PrefsSettings) {
-            let Ok((checks, combos, skin_list, plugin_list, node)) = STATE.with(|state| {
-                let mut guard = state.try_borrow_mut().map_err(|_| ())?;
-                let inner = guard.as_mut().ok_or(())?;
-                inner.settings = settings.clone();
-                Ok::<_, ()>((
-                    inner.checks.clone(),
-                    inner.combos.clone(),
-                    inner.skin_list,
-                    inner.plugin_list,
-                    inner.node,
-                ))
-            }) else {
+            let Ok((checks, combos, skin_list, plugin_list, library_list, node)) =
+                STATE.with(|state| {
+                    let mut guard = state.try_borrow_mut().map_err(|_| ())?;
+                    let inner = guard.as_mut().ok_or(())?;
+                    inner.settings = settings.clone();
+                    Ok::<_, ()>((
+                        inner.checks.clone(),
+                        inner.combos.clone(),
+                        inner.skin_list,
+                        inner.plugin_list,
+                        inner.library_list,
+                        inner.node,
+                    ))
+                })
+            else {
                 return;
             };
             let controls = (checks, skin_list);
             if let Some(list) = plugin_list {
                 refresh_plugin_list(list, node, settings);
+            }
+            if let Some(list) = library_list {
+                refresh_root_list(list, settings);
             }
             for (control, _, bind) in controls.0 {
                 set_check(control, settings.get(bind));
@@ -1067,6 +1164,8 @@ mod win32 {
                         i.plugin_list = None;
                         i.plugin_ids.clear();
                         i.plugin_texts.clear();
+                        i.library_list = None;
+                        i.library_texts.clear();
                         std::mem::take(&mut i.page)
                     })
                 })
@@ -1082,6 +1181,7 @@ mod win32 {
         let mut combos = Vec::new();
         let mut skin_list = None;
         let mut plugin_list = None;
+        let mut library_list = None;
         for (next_id, item) in (FIRST_PAGE_ID..).zip(page_items(node)) {
             match item {
                 Item::Group { text, rect } => {
@@ -1275,6 +1375,69 @@ mod win32 {
                         page.push(c);
                     }
                 }
+                Item::LibraryRoots { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("LISTBOX"),
+                        "",
+                        WS_CHILD.0
+                            | WS_VISIBLE.0
+                            | WS_TABSTOP.0
+                            | WS_VSCROLL.0
+                            | WS_HSCROLL.0
+                            | LBS_NOTIFY,
+                        WS_EX_CLIENTEDGE.0,
+                        shift(rect),
+                        ID_LIBRARY_ROOTS,
+                        dpi,
+                        font,
+                    ) {
+                        // A row is a path, and a path can be longer than the
+                        // list: let the list scroll sideways instead of
+                        // cutting the row off.
+                        // SAFETY: sizing the scroll range of our own list box.
+                        unsafe {
+                            SendMessageW(
+                                c,
+                                LB_SETHORIZONTALEXTENT,
+                                Some(WPARAM(scale(ROOT_ROW_EXTENT, dpi) as usize)),
+                                Some(LPARAM(0)),
+                            );
+                        }
+                        page.push(c);
+                        library_list = Some(c);
+                    }
+                }
+                Item::LibraryAdd { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Add folder...",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_LIBRARY_ADD,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
+                Item::LibraryRemove { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Remove",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_LIBRARY_REMOVE,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
             }
         }
         STATE.with(|state| {
@@ -1286,10 +1449,14 @@ mod win32 {
                 inner.combos = combos;
                 inner.skin_list = skin_list;
                 inner.plugin_list = plugin_list;
+                inner.library_list = library_list;
             }
         });
         if let Some(list) = plugin_list {
             refresh_plugin_list(list, node, settings);
+        }
+        if let Some(list) = library_list {
+            refresh_root_list(list, settings);
         }
     }
 
@@ -1342,6 +1509,51 @@ mod win32 {
         });
     }
 
+    /// Makes the media library's root list show `settings`' roots, keeping the
+    /// selected row. Does nothing when the list already shows exactly them, so
+    /// the per-tick settings push does not flicker the list.
+    fn refresh_root_list(list: HWND, settings: &PrefsSettings) {
+        let texts = settings.library_roots.clone();
+        let unchanged = STATE.with(|state| {
+            state
+                .try_borrow()
+                .ok()
+                .is_some_and(|g| g.as_ref().is_some_and(|i| i.library_texts == texts))
+        });
+        if unchanged {
+            return;
+        }
+        // SAFETY: querying and refilling our own list box.
+        unsafe {
+            let selected = SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
+            SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+            for text in &texts {
+                let wide_text = wide(text);
+                SendMessageW(
+                    list,
+                    LB_ADDSTRING,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(wide_text.as_ptr() as isize)),
+                );
+            }
+            if selected >= 0 && (selected as usize) < texts.len() {
+                SendMessageW(
+                    list,
+                    LB_SETCURSEL,
+                    Some(WPARAM(selected as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+        }
+        STATE.with(|state| {
+            if let Ok(mut guard) = state.try_borrow_mut()
+                && let Some(inner) = guard.as_mut()
+            {
+                inner.library_texts = texts;
+            }
+        });
+    }
+
     /// Records a user action from the window procedure (queue only: no
     /// player state is touched here).
     fn push_action(action: PrefsAction) {
@@ -1373,6 +1585,30 @@ mod win32 {
                 }
                 if id == ID_PLUGIN_RESCAN && code == BN_CLICKED {
                     push_action(PrefsAction::RescanPlugins);
+                    return LRESULT(0);
+                }
+                if id == ID_LIBRARY_ADD && code == BN_CLICKED {
+                    // The dialog does not ask for the folder itself: the
+                    // player does, from the tick.
+                    push_action(PrefsAction::AddLibraryRoot);
+                    return LRESULT(0);
+                }
+                if id == ID_LIBRARY_REMOVE && code == BN_CLICKED {
+                    // The row the user picked; no selection removes nothing.
+                    let picked = STATE.with(|state| {
+                        let guard = state.try_borrow().ok()?;
+                        let inner = guard.as_ref()?;
+                        let list = inner.library_list?;
+                        // SAFETY: querying our own list box.
+                        let row = unsafe {
+                            SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)))
+                        }
+                        .0;
+                        usize::try_from(row).ok()
+                    });
+                    if let Some(row) = picked {
+                        push_action(PrefsAction::RemoveLibraryRoot(row));
+                    }
                     return LRESULT(0);
                 }
                 if id == ID_PLUGIN_TOGGLE && code == BN_CLICKED {
@@ -1538,6 +1774,7 @@ mod tests {
                 "DSP/Effect",
                 "General Purpose",
                 "Skins",
+                "Library",
                 "Bookmarks",
             ]
         );
@@ -1569,7 +1806,10 @@ mod tests {
                     | Item::SkinList { rect }
                     | Item::PluginList { rect }
                     | Item::PluginToggle { rect }
-                    | Item::PluginRescan { rect } => vec![rect],
+                    | Item::PluginRescan { rect }
+                    | Item::LibraryRoots { rect }
+                    | Item::LibraryAdd { rect }
+                    | Item::LibraryRemove { rect } => vec![rect],
                     Item::Combo { label, list, .. } => vec![label, list],
                 };
                 for r in rects {
@@ -1823,5 +2063,71 @@ mod tests {
         assert!(!settings.get(Bind::EasyMove));
         assert!(!settings.get(Bind::DoubleSize));
         assert!(!settings.get(Bind::Shuffle));
+    }
+
+    #[test]
+    fn the_library_page_has_a_root_list_and_the_two_buttons() {
+        let items = page_items(PrefsNode::Library);
+        let count = |f: fn(&Item) -> bool| items.iter().filter(|i| f(i)).count();
+        assert_eq!(count(|i| matches!(i, Item::LibraryRoots { .. })), 1);
+        assert_eq!(count(|i| matches!(i, Item::LibraryAdd { .. })), 1);
+        assert_eq!(count(|i| matches!(i, Item::LibraryRemove { .. })), 1);
+        // The list is above the buttons: the user picks a root and then
+        // removes it.
+        let roots = items
+            .iter()
+            .find_map(|item| match item {
+                Item::LibraryRoots { rect } => Some(*rect),
+                _ => None,
+            })
+            .expect("the root list");
+        let add = items
+            .iter()
+            .find_map(|item| match item {
+                Item::LibraryAdd { rect } => Some(*rect),
+                _ => None,
+            })
+            .expect("the add button");
+        let remove = items
+            .iter()
+            .find_map(|item| match item {
+                Item::LibraryRemove { rect } => Some(*rect),
+                _ => None,
+            })
+            .expect("the remove button");
+        assert!(roots.y + roots.h <= add.y, "the list is above the buttons");
+        assert!(add.y + add.h <= remove.y + remove.h);
+    }
+
+    #[test]
+    fn the_library_page_lists_the_roots_the_player_pushed_in() {
+        let settings = PrefsSettings {
+            library_roots: vec![r"C:\Music".to_string(), r"D:\Tunes".to_string()],
+            ..PrefsSettings::default()
+        };
+        assert_eq!(settings.library_roots, [r"C:\Music", r"D:\Tunes"]);
+    }
+
+    #[test]
+    fn the_library_actions_say_what_the_user_wanted() {
+        let settings = PrefsSettings {
+            library_roots: vec![r"C:\Music".to_string(), r"D:\Tunes".to_string()],
+            ..PrefsSettings::default()
+        };
+        // The row the user picked names the root; a row that does not exist
+        // names nothing.
+        assert_eq!(settings.library_root(0), Some(r"C:\Music"));
+        assert_eq!(settings.library_root(1), Some(r"D:\Tunes"));
+        assert_eq!(settings.library_root(2), None);
+        // The add button asks for a folder; the player picks it.
+        assert_eq!(
+            PrefsAction::AddLibraryRoot,
+            PrefsAction::AddLibraryRoot,
+            "the action carries no row: the folder is not chosen yet"
+        );
+        assert_ne!(
+            PrefsAction::RemoveLibraryRoot(0),
+            PrefsAction::RemoveLibraryRoot(1)
+        );
     }
 }
