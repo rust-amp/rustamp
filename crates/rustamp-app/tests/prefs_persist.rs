@@ -1,0 +1,97 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
+//! Headless tests that what the native preferences dialog changes reaches the
+//! saved configuration and comes back after a restart.
+
+use std::path::PathBuf;
+
+use rustamp_app::app::{App, AppOptions};
+use rustamp_app::cli::OutputChoice;
+use rustamp_app::config::load;
+use rustamp_app::skin::{self, SkinChoice};
+use rustamp_core::config::Config;
+use rustamp_platform::{Bind, PrefsAction};
+
+fn app_with(config: Config, path: Option<PathBuf>) -> App {
+    let volume = config.audio.volume;
+    let options = AppOptions {
+        config,
+        skin: skin::load(&SkinChoice::Builtin),
+        output: OutputChoice::Null,
+        volume,
+        file: None,
+        seconds: Some(1),
+    };
+    let mut app = App::new(options).expect("build headless app");
+    app.set_config_path(path);
+    app
+}
+
+#[test]
+fn window_settings_changed_in_the_dialog_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prefs.toml");
+
+    let mut app = app_with(Config::default(), Some(path.clone()));
+    let before = app.prefs_settings();
+    assert!(!before.always_on_top);
+    assert!(before.easy_move, "easy move is on by default");
+    assert!(!before.double_size);
+
+    app.apply_prefs_action(PrefsAction::Set(Bind::AlwaysOnTop, true));
+    app.apply_prefs_action(PrefsAction::Set(Bind::EasyMove, false));
+    app.apply_prefs_action(PrefsAction::Set(Bind::DoubleSize, true));
+
+    let shown = app.prefs_settings();
+    assert!(shown.always_on_top && !shown.easy_move && shown.double_size);
+
+    app.save_config().expect("save");
+    let loaded = load(Some(&path)).expect("load").config;
+    assert!(loaded.ui.always_on_top);
+    assert!(!loaded.ui.easy_move);
+    assert!(loaded.ui.double_size);
+
+    // A new run built from the saved file shows the same values in the dialog.
+    let restarted = app_with(loaded, None).prefs_settings();
+    assert!(restarted.always_on_top && !restarted.easy_move && restarted.double_size);
+}
+
+#[test]
+fn a_check_box_already_at_its_value_changes_nothing() {
+    let mut app = app_with(Config::default(), None);
+    let before = app.prefs_settings();
+    app.apply_prefs_action(PrefsAction::Set(Bind::AlwaysOnTop, false));
+    app.apply_prefs_action(PrefsAction::Set(Bind::EasyMove, true));
+    assert_eq!(app.prefs_settings(), before);
+}
+
+#[test]
+fn shuffle_and_repeat_follow_the_dialog_but_are_not_persisted() {
+    // They are app-owned flags with no effect on playback yet (config N6), so
+    // the saved file must not advertise them.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("modes.toml");
+
+    let mut app = app_with(Config::default(), Some(path.clone()));
+    app.apply_prefs_action(PrefsAction::Set(Bind::Shuffle, true));
+    app.apply_prefs_action(PrefsAction::Set(Bind::Repeat, true));
+    let shown = app.prefs_settings();
+    assert!(shown.shuffle && shown.repeat);
+
+    app.save_config().expect("save");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("shuffle") && !text.contains("repeat"),
+        "{text}"
+    );
+}
+
+#[test]
+fn choosing_the_built_in_skin_row_keeps_it_selected() {
+    let mut app = app_with(Config::default(), None);
+    let settings = app.prefs_settings();
+    let row = settings
+        .skin_selected
+        .expect("the skin in use appears in the list");
+    app.apply_prefs_action(PrefsAction::LoadSkin(row));
+    assert_eq!(app.prefs_settings().skin_selected, Some(row));
+}
