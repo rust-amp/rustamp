@@ -32,8 +32,8 @@ pub use commands::{
 pub use host_window::*;
 pub use ipc::*;
 pub use loader::{
-    DspModuleInfo, GeneralModuleInfo, LoadedPlugin, PluginConfigError, PluginLoadError,
-    load_plugin, load_plugin_with_store,
+    DspModuleInfo, GeneralModuleInfo, LoadedPlugin, OutModuleInfo, PluginConfigError,
+    PluginLoadError, load_plugin, load_plugin_with_store,
 };
 pub use message_loop::*;
 pub use registry::{PluginRegistry, RegistryConfigError, accept_loaded_kind};

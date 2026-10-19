@@ -71,7 +71,8 @@ impl fmt::Display for PePreflightError {
                 )
             }
             Self::MissingSupportedExport => f.write_str(
-                "plugin DLL exports neither winampGetInModule2, winampDSPGetHeader2 nor winampGetGeneralPurposePlugin",
+                "plugin DLL exports neither winampGetInModule2, winampDSPGetHeader2, \
+                 winampGetGeneralPurposePlugin nor winampGetOutModule",
             ),
         }
     }
@@ -226,7 +227,7 @@ pub fn check_pe_i386_dll(image: &[u8]) -> Result<PluginKind, PePreflightError> {
             .ok_or(invalid("export count overflow"))?,
     )?;
     let mut previous = None;
-    let mut selected = None;
+    let mut selected: Option<(u8, PluginKind)> = None;
     for index in 0..names {
         let name_rva = read_u32(name_table, index * 4)? as usize;
         let name = export_name(image, &sections, name_rva)?;
@@ -240,25 +241,48 @@ pub fn check_pe_i386_dll(image: &[u8]) -> Result<PluginKind, PePreflightError> {
         if ordinal >= functions {
             return Err(invalid("plugin export ordinal is out of bounds"));
         }
-        let kind = match name {
-            b"winampGetInModule2" => Some(PluginKind::Input),
-            b"winampDSPGetHeader2" => Some(PluginKind::Dsp),
-            b"winampGetGeneralPurposePlugin" => Some(PluginKind::General),
-            _ => None,
+        let Some((rank, kind)) = supported_getter(name) else {
+            continue;
         };
-        if let Some(kind) = kind {
-            let function = read_u32(function_table, ordinal * 4)? as usize;
-            if (export..export + export_size).contains(&function) {
-                return Err(invalid("forwarded plugin getters are not supported"));
-            }
-            executable_rva(image, &sections, function)?;
-            // Preserve the existing input-before-general/DSP selection policy.
-            if selected != Some(PluginKind::Input) {
-                selected = Some(kind);
-            }
+        let function = read_u32(function_table, ordinal * 4)? as usize;
+        if (export..export + export_size).contains(&function) {
+            return Err(invalid("forwarded plugin getters are not supported"));
+        }
+        executable_rva(image, &sections, function)?;
+        // The kind that comes first in the table wins. A DLL exporting several
+        // getters is pathological, but the choice has to be stable.
+        if selected.is_none_or(|(current, _)| rank < current) {
+            selected = Some((rank, kind));
         }
     }
-    selected.ok_or(PePreflightError::MissingSupportedExport)
+    selected
+        .map(|(_, kind)| kind)
+        .ok_or(PePreflightError::MissingSupportedExport)
+}
+
+/// The getters the passive preflight recognises, in the order they win when a
+/// DLL exports more than one of them.
+///
+/// Own policy, not S09: a plugin DLL exports exactly one getter (S09 §2), so
+/// the order only has to be stable and documented. Input keeps the precedence
+/// it always had, the output getter comes last — an `out_` DLL is never
+/// mistaken for another kind — and the relative order of the kinds that were
+/// already supported is unchanged. The visualization getter is not scanned
+/// here; the visualization plugin kind has its own card.
+const SUPPORTED_GETTERS: [(&[u8], PluginKind); 4] = [
+    (b"winampGetInModule2", PluginKind::Input),
+    (b"winampDSPGetHeader2", PluginKind::Dsp),
+    (b"winampGetGeneralPurposePlugin", PluginKind::General),
+    (b"winampGetOutModule", PluginKind::Output),
+];
+
+/// The rank and kind of a recognised getter, `None` for any other export.
+fn supported_getter(name: &[u8]) -> Option<(u8, PluginKind)> {
+    SUPPORTED_GETTERS
+        .iter()
+        .enumerate()
+        .find(|(_, (candidate, _))| *candidate == name)
+        .map(|(rank, (_, kind))| (rank as u8, *kind))
 }
 
 struct Section {
@@ -406,6 +430,40 @@ mod tests {
         let name = b"winampDSPGetHeader2\0";
         image[0x260..0x260 + name.len()].copy_from_slice(name);
         assert_eq!(check_pe_i386_dll(&image), Ok(PluginKind::Dsp));
+    }
+
+    #[test]
+    fn recognises_an_output_plugin_by_its_export() {
+        let mut image = test_dll(0x014c);
+        let name = b"winampGetOutModule\0";
+        image[0x260..0x260 + name.len()].copy_from_slice(name);
+        assert_eq!(
+            check_pe_i386_dll(&image),
+            Ok(PluginKind::Output),
+            "the output getter must select the output kind (S09 §2)"
+        );
+    }
+
+    #[test]
+    fn the_getter_table_matches_the_abi_exports() {
+        for (name, kind) in SUPPORTED_GETTERS {
+            assert_eq!(
+                rustamp_plugin_abi::PluginKind::from_export_name(name),
+                Some(kind),
+                "{name:?} must be the export the ABI assigns to {kind:?}"
+            );
+        }
+        // The order is the documented policy: input first, output last.
+        assert_eq!(
+            supported_getter(b"winampGetInModule2"),
+            Some((0, PluginKind::Input))
+        );
+        assert_eq!(
+            supported_getter(b"winampGetOutModule"),
+            Some((3, PluginKind::Output))
+        );
+        assert_eq!(supported_getter(b"winampVisGetHeader"), None);
+        assert_eq!(supported_getter(b"something_else"), None);
     }
 
     #[test]

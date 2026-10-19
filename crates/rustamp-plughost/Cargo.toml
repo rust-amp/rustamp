@@ -23,6 +23,13 @@ path = "src/main.rs"
 name = "gen_rustamp_fixture"
 crate-type = ["cdylib"]
 
+# The clean-room output ("out_") plugin fixture, for the same reason: a
+# separate cdylib artifact that the acceptance test maps through the OS
+# loader, never linked into the host or into the test binary.
+[[example]]
+name = "out_rustamp_fixture"
+crate-type = ["cdylib"]
+
 [dependencies]
 rustamp-ipc.workspace = true
 rustamp-plugin-abi.workspace = true
