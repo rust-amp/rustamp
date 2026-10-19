@@ -18,7 +18,7 @@
 //!   before that count is reached, the file was cut and `read` reports
 //!   [`Error::Decode`]. A file that holds everything its container declares
 //!   ends with `Ok(0)` as before. The rule is limited to the containers that
-//!   state their payload exactly (RIFF/WAVE, and MPEG audio with a
+//!   state their payload exactly (RIFF/WAVE, AIFF, and MPEG audio with a
 //!   Xing/Info header); see [`declared_payload`].
 //! * Corrupt packets are skipped; see [`SymphoniaDecoder::skipped_packets`].
 //! * Hostile input (truncated, empty, lying headers, noise) is rejected with a
@@ -236,6 +236,12 @@ struct HeaderProbe {
     id3v2: usize,
     /// The bytes behind that tag.
     window: Vec<u8>,
+    /// The AIFF header, when the file is an AIFF file.
+    ///
+    /// The AIFF chunks are read from the file itself: the `COMM` and `SSND`
+    /// chunks state the payload, and they are not always inside the header
+    /// window.
+    aiff: Option<crate::aiff_header::AiffHeader>,
 }
 
 /// The byte claim of a container: how many bytes the payload occupies and how
@@ -262,11 +268,15 @@ struct ByteClaim {
 /// two apart - a cut file is short of bytes, a damaged file is short of
 /// frames only.
 ///
+/// AIFF states both counts as well: the `COMM` chunk states the number of
+/// sample frames, the `SSND` chunk the number of bytes of sound data. The
+/// reader counts the eight bytes of the `SSND` header as audio, so its own
+/// frame count is not the count of the file (see `aiff_header`); the count
+/// the file states is the one to compare with.
+///
 /// Every other container this crate reads either estimates the count (MPEG
-/// audio without a Xing/Info tag, MP4), counts it differently from what it
-/// delivers (the AIFF reader includes the `SSND` header in its frame count)
-/// or can lose frames to damage without losing any (FLAC), so their count is
-/// no evidence of a cut file.
+/// audio without a Xing/Info tag, MP4) or can lose frames to damage without
+/// losing any (FLAC), so their count is no evidence of a cut file.
 #[derive(Debug, Clone, Copy)]
 struct Declared {
     /// The number of frames the container declares the file holds.
@@ -276,6 +286,8 @@ struct Declared {
     /// `None` when the container states no byte count: then a shortfall of
     /// frames is a cut file on its own.
     bytes: Option<ByteClaim>,
+    /// What states the frame count, named in the failure message.
+    source: &'static str,
 }
 
 /// The payload the container declares, if it states one exactly.
@@ -294,6 +306,30 @@ fn declared_payload(
         return params.n_frames.map(|frames| Declared {
             frames,
             bytes: None,
+            source: "its container",
+        });
+    }
+    // AIFF: the `COMM` chunk states the number of sample frames and the
+    // `SSND` chunk states the number of bytes of sound data. Both are exact,
+    // so a file that is short of frames *and* of bytes was cut.
+    if let Some(aiff) = &header.aiff {
+        // The reader counts the eight bytes of the `SSND` header as audio, so
+        // its frame count is the one the correction is about. It has to be the
+        // count this parse expects: otherwise the reader read another chunk
+        // and the two counts are about different things.
+        if params.n_frames != Some(aiff.reader_frames()) {
+            return None;
+        }
+        // The byte count is what tells a cut file from a damaged one, so a
+        // file whose length is unknown has no oracle.
+        let byte_len = byte_len?;
+        return Some(Declared {
+            frames: aiff.declared_frames(),
+            bytes: Some(ByteClaim {
+                declared: aiff.sound_bytes(),
+                available: byte_len.saturating_sub(aiff.data_start()),
+            }),
+            source: "its COMM chunk",
         });
     }
     // MPEG audio: the Xing/Info tag states the frame count and the byte count
@@ -316,6 +352,7 @@ fn declared_payload(
             declared: u64::from(xing.bytes),
             available: byte_len.saturating_sub(xing.start),
         }),
+        source: "its Xing/Info header",
     })
 }
 
@@ -330,12 +367,16 @@ const HEADER_WINDOW: usize = 512;
 /// The tag is skipped, not read: it can be large (cover art) and the header
 /// parse only needs the bytes behind it. The reader is left where it was
 /// found.
-fn header_probe(reader: &mut dyn ReadSeek) -> HeaderProbe {
+///
+/// `len` is the length of the file when it is known; it bounds the AIFF chunk
+/// walk.
+fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
     let mut head = [0u8; 10];
     if reader.read_exact(&mut head).is_err() {
         return HeaderProbe {
             id3v2: 0,
             window: Vec::new(),
+            aiff: None,
         };
     }
     let id3v2 = crate::mpeg_header::id3v2_len(&head);
@@ -343,6 +384,7 @@ fn header_probe(reader: &mut dyn ReadSeek) -> HeaderProbe {
         return HeaderProbe {
             id3v2,
             window: Vec::new(),
+            aiff: None,
         };
     }
     let mut window = vec![0u8; HEADER_WINDOW];
@@ -356,7 +398,15 @@ fn header_probe(reader: &mut dyn ReadSeek) -> HeaderProbe {
         }
     }
     window.truncate(filled);
-    HeaderProbe { id3v2, window }
+    // An AIFF file states its payload in its `COMM` and `SSND` chunks. They
+    // are read from the file itself: the chunks before the sound data can be
+    // larger than the header window.
+    let aiff = crate::aiff_header::parse(reader, len);
+    HeaderProbe {
+        id3v2,
+        window,
+        aiff,
+    }
 }
 
 /// Queues a detected mid-stream format change.
@@ -435,7 +485,7 @@ impl SymphoniaDecoder {
             MediaSource::Path(p) => {
                 let mut f = File::open(&p)?;
                 let len = f.metadata().ok().map(|m| m.len());
-                let header = header_probe(&mut f);
+                let header = header_probe(&mut f, len);
                 // The file is the source: it starts at the beginning.
                 f.seek(SeekFrom::Start(0))?;
                 let mss = MediaSourceStream::new(Box::new(f), MediaSourceStreamOptions::default());
@@ -444,7 +494,7 @@ impl SymphoniaDecoder {
             MediaSource::Reader { mut reader, .. } => {
                 let len = reader.seek(SeekFrom::End(0)).ok();
                 reader.seek(SeekFrom::Start(0))?;
-                let header = header_probe(&mut *reader);
+                let header = header_probe(&mut *reader, len);
                 // The reader is the source: it starts at the beginning.
                 reader.seek(SeekFrom::Start(0))?;
                 let src = ReaderSource { inner: reader, len };
@@ -666,12 +716,12 @@ impl SymphoniaDecoder {
         }
         self.truncation = Some(match &declared.bytes {
             Some(bytes) => format!(
-                "truncated stream: the file ends after {} of the {} frames its Xing/Info header declares and holds {} of the {} bytes it declares",
-                self.delivered, declared.frames, bytes.available, bytes.declared
+                "truncated stream: the file ends after {} of the {} frames {} declares and holds {} of the {} bytes it declares",
+                self.delivered, declared.frames, declared.source, bytes.available, bytes.declared
             ),
             None => format!(
-                "truncated stream: the file ends after {} of the {} frames its container declares",
-                self.delivered, declared.frames
+                "truncated stream: the file ends after {} of the {} frames {} declares",
+                self.delivered, declared.frames, declared.source
             ),
         });
     }
@@ -1034,6 +1084,7 @@ mod tests {
             &HeaderProbe {
                 id3v2: 0,
                 window: wave.clone(),
+                aiff: None,
             },
             &params,
             Some(4096),
@@ -1054,6 +1105,7 @@ mod tests {
                 &HeaderProbe {
                     id3v2: 0,
                     window: avi,
+                    aiff: None,
                 },
                 &params,
                 Some(4096)
@@ -1069,6 +1121,7 @@ mod tests {
                 &HeaderProbe {
                     id3v2: 0,
                     window: b"fLaC\0\0\0\0\0\0\0\0".to_vec(),
+                    aiff: None,
                 },
                 &params,
                 Some(4096)
@@ -1089,7 +1142,11 @@ mod tests {
         window.extend_from_slice(&0x03u32.to_be_bytes());
         window.extend_from_slice(&59u32.to_be_bytes());
         window.extend_from_slice(&12_537u32.to_be_bytes());
-        let header = HeaderProbe { id3v2: 0, window };
+        let header = HeaderProbe {
+            id3v2: 0,
+            window,
+            aiff: None,
+        };
 
         let mut params = CodecParameters::new();
         params.with_n_frames(59 * 1152 - 1105 - 713);

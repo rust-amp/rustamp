@@ -27,6 +27,11 @@ Behaviour the core contract leaves open, and what the decoders do.
     damaged file delivers fewer frames than it declares as well - but it holds
     all of its bytes. A file that is short of frames *and* of bytes was cut; a
     file that is short of frames only is damaged and keeps playing.
+  - **AIFF**: the `COMM` chunk states the number of sample frames and the
+    `SSND` chunk the number of bytes of sound data (see below). The same
+    two conditions as for MPEG audio: a file that is short of frames *and* of
+    bytes was cut, a file that is short of frames only (a last frame the
+    chunk size cut in half) keeps playing.
 - **The MPEG audio header** (`mpeg_header.rs`). An MPEG audio file may carry a
   **Xing** (variable bitrate) or **Info** (constant bitrate) tag in its first
   frame, behind the side information. The tag states the number of MPEG frames
@@ -41,6 +46,23 @@ Behaviour the core contract leaves open, and what the decoders do.
   The byte count is not an exact length (some encoders count the tag frame
   with the audio, some do not), so it is only used as evidence that bytes are
   missing: a file that holds fewer bytes than the tag declares was cut.
+- **The AIFF header** (`aiff_header.rs`). An AIFF file states its payload in
+  two chunks: the `COMM` chunk names the number of sample frames, the `SSND`
+  chunk the number of bytes of sound data. The container reader counts the
+  whole `SSND` chunk as audio, so the frame count it reports is the chunk size
+  divided by the block align - up to `8 / block_align` frames more than the
+  file holds (four frames for 16 bit mono, one for 24 bit stereo). That is the
+  correction: the count the file states (`COMM`) is the one to compare with,
+  and the reader's count has to be the one the correction expects - otherwise
+  the reader read another chunk and the two counts are about different things.
+  The byte count is the `SSND` chunk without its own eight byte header (the
+  `offset` and the `blockSize` field), and it is compared with the bytes that
+  are really there. The header is read from the file itself, not from a fixed
+  window: the chunks before the sound data can be larger than any window.
+  A file that states no frame count (`COMM` with 0) falls back to the frames
+  its sound data holds.
+  The **duration** still comes from the reader's count, so it is up to
+  `8 / block_align` frames too long (0.09 ms for 16 bit mono at 44.1 kHz).
 - **Seek.** `SeekMode::Accurate` plus a 4096-frame pre-roll that is decoded and
   discarded, because MP3/Vorbis/AAC need previous blocks for exact output.
   Returns the requested position clamped to the duration (it is sample exact).
@@ -121,11 +143,17 @@ correct behaviour:
    container states it exactly. RIFF/WAVE does (its `data` chunk states the
    number of samples), and so does MPEG audio whose file carries a Xing/Info
    header - there the byte count of the header tells a cut file from a
-   damaged one. The MPEG audio reader only estimates its frame count when the
-   file carries no such header, the AIFF reader counts the `SSND` header into
-   its frame count, and the FLAC and MP4 readers resynchronise damaged frames
+   damaged one. AIFF does as well: its `COMM` chunk states the number of
+   sample frames and its `SSND` chunk the number of bytes of sound data, and
+   the two together tell a cut file from a damaged one (the reader counts the
+   eight bytes of the `SSND` header as audio, so its own count is corrected
+   before the comparison - see above).
+   The MPEG audio reader only estimates its frame count when the file carries
+   no such header, and the FLAC and MP4 readers resynchronise damaged frames
    without counting them - so a truncated file of those kinds still ends with
-   an end of stream. The wave decoder has no such limit: it parses the `data`
+   an end of stream. An AIFF file whose length is unknown (a reader that
+   cannot report its end) has no byte count and therefore no oracle either.
+   The wave decoder has no such limit: it parses the `data`
    chunk itself and compares the declared length with the bytes that are there.
 2. **A damaged file whose *content signature* matches is reported as
    `UnsupportedFormat`** (symphonia). The signature tells the factory to hand the
@@ -165,6 +193,16 @@ correct behaviour:
    not evidence, so such a file ends as it always did. A header that lies
    about the frame count while the file holds every byte it declares is not
    a cut file either - it ends cleanly, like the damaged file it resembles.
+7. **A cut AIFF file is only a loud failure when its two chunks agree with
+   the reader** (symphonia). The `COMM` chunk states the frame count and the
+   `SSND` chunk the byte count; the reader's own count has to be the one the
+   `SSND` chunk implies (its size divided by the block align, the eight bytes
+   of its own header included), otherwise the two counts are about different
+   chunks and there is no oracle. A file that holds every byte its `SSND`
+   chunk declares is not a cut file either, even when its `COMM` chunk claims
+   more frames than the file holds - it ends cleanly, like the damaged file it
+   resembles. A block-aligned file (a non-zero `offset` or `blockSize` in the
+   `SSND` chunk) is one the reader refuses, so it never reaches this rule.
 
 ## Proposals
 
