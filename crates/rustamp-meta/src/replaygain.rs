@@ -16,15 +16,15 @@
 //! The analysis implements the classic ReplayGain 1.0 proposal (David
 //! Robinson, "Replay Gain - a proposed standard", 2001-07-31,
 //! replaygain.org; summarized on the Hydrogenaudio wiki as the "ReplayGain
-//! 1.0 specification"): an equal-loudness filter (the standard Yule shelf
-//! followed by a Butterworth high-pass) is applied to a mono downmix, the
-//! result is split into 50 ms blocks, each block's RMS is converted to dB
-//! relative to [`REFERENCE_RMS`], and the track loudness is the 95th
-//! percentile of those block values. The reference is **89 dB SPL pink
-//! noise**, anchored in the digital domain so that **a full-scale sine wave
-//! (peak 1.0, RMS 1/sqrt(2)) measures 0.00 dB gain**. The peak is the
-//! largest absolute sample value of the *unfiltered* input, linear, exactly
-//! as a `REPLAYGAIN_*_PEAK` tag holds it.
+//! 1.0 specification"): an equal-loudness filter followed by a high-pass
+//! filter is applied to a mono downmix, the result is split into 50 ms
+//! blocks, each block's RMS is converted to dB relative to
+//! [`REFERENCE_RMS`], and the track loudness is the 95th percentile of
+//! those block values. The reference is **89 dB SPL pink noise**, anchored
+//! in the digital domain so that **a full-scale sine wave (peak 1.0, RMS
+//! 1/sqrt(2)) measures 0.00 dB gain**. The peak is the largest absolute
+//! sample value of the *unfiltered* input, linear, exactly as a
+//! `REPLAYGAIN_*_PEAK` tag holds it.
 //!
 //! What this is not:
 //!
@@ -40,10 +40,35 @@
 //!   music. Direction and scale agree on simple signals (see the tests);
 //!   bit equality is not claimed.
 //!
-//! The `sample_rate_hz` argument is accepted and validated but does not
-//! change the number — there are no filters to tune — so that a future
-//! perceptual estimator can use it without changing call sites. The same
-//! holds for `channels`, which today only shapes (and validates) the input.
+//! ## The filter and the sample rate
+//!
+//! The loudness filter is a pair of biquad sections: an equal-loudness
+//! section and a high-pass section. Its reference design is given at
+//! 48 kHz. For every other rate the two sections are *retuned*: they are
+//! taken to the analog domain and realized again for the rate of the
+//! signal, the same way the K-weighting of the R128 measurement is
+//! designed for the rate of the signal (`dsp::retune`). The signal itself
+//! is **not** resampled any more.
+//!
+//! That matters: the old path resampled the signal to 48 kHz with a linear
+//! interpolator, which folds the top octave down and attenuates it. A
+//! 16 kHz tone in a 44.1 kHz file measured 3.5 dB louder than the same
+//! tone in a 48 kHz file. Now the same signal measures the same at every
+//! rate, and the 48 kHz numbers are the ones the reference design gives.
+//!
+//! The ReplayGain 1.0 specification describes its loudness filter as a
+//! tenth-order "yulewalk" filter (an approximation of the equal-loudness
+//! contour) in cascade with a second-order Butterworth high-pass at 150 Hz,
+//! and publishes the coefficients of the two for 44.1 kHz and 48 kHz only.
+//! The pair of sections this crate uses is **not** that filter - it is the
+//! pair this crate has always used, and the numbers it produces are the
+//! ones its tags were written with. `docs/notes/replaygain-filter-rate.md`
+//! tells the whole story: what the specification says, what this crate
+//! does, and what would change if the specification's filter were adopted.
+//!
+//! The `sample_rate_hz` argument therefore *does* change the number: it
+//! decides which filter the signal is measured with. `channels` shapes
+//! (and validates) the input, it does not change the number.
 //!
 //! ## Album values
 //!
@@ -110,7 +135,7 @@ use lofty::tag::{ItemKey, TagType};
 use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 
-use crate::dsp::Biquad;
+use crate::dsp::{Biquad, retune};
 use crate::r128::LoudnessBlocks;
 use crate::write::write_tags_report;
 
@@ -393,20 +418,89 @@ pub struct ReplayGainAnalysis {
     pub loudness_blocks: LoudnessBlocks,
 }
 
+/// The sample rate the ReplayGain filter design is given for.
+const FILTER_REFERENCE_RATE: u32 = 48_000;
+
+/// The equal-loudness section of the reference design, at 48 kHz.
+///
+/// The section is the one this crate has always used; see
+/// `docs/notes/replaygain-filter-rate.md` for what it is and what the
+/// ReplayGain 1.0 specification says about its own filter.
+const REFERENCE_EQUAL_LOUDNESS: ([f64; 3], [f64; 3]) = (
+    [0.995527971309, -1.991055942619, 0.995527971310],
+    [1.0, -1.991119453430, 0.991172964241],
+);
+
+/// The high-pass section of the reference design, at 48 kHz.
+///
+/// The section is stored in its reduced form. Its numerator is
+/// `0.997862928247 * (1 - z^-1)^2` and its denominator is
+/// `(1 - z^-1) * (1 - 0.995789367305 z^-1)`: the two share the factor
+/// `(1 - z^-1)` exactly, so the section is a first-order high-pass. The
+/// uncancelled pair would put a pole exactly on the unit circle (at
+/// `z = 1`), and any rounding in the rate transformation could push that
+/// pole outside it - a filter that grows without bound.
+const REFERENCE_HIGH_PASS: ([f64; 3], [f64; 3]) = (
+    [0.997862928247, -0.997862928247, 0.0],
+    [1.0, -0.995789367305, 0.0],
+);
+
+/// The ReplayGain loudness filter for one sample rate.
+///
+/// The filter is the pair of sections of the reference design, retuned for
+/// the rate of the signal: the sections are taken to the analog domain
+/// and realized again, so that the same filter - the same cutoff
+/// frequencies, the same shape - runs at every rate.
+struct LoudnessFilter {
+    /// The equal-loudness section.
+    equal_loudness: Biquad,
+    /// The high-pass section.
+    high_pass: Biquad,
+}
+
+impl LoudnessFilter {
+    /// The filter for `sample_rate_hz`.
+    fn new(sample_rate_hz: u32) -> Self {
+        let (b, a) = REFERENCE_EQUAL_LOUDNESS;
+        let equal_loudness = retune(b, a, FILTER_REFERENCE_RATE, sample_rate_hz);
+        let (b, a) = REFERENCE_HIGH_PASS;
+        let high_pass = retune(b, a, FILTER_REFERENCE_RATE, sample_rate_hz);
+        Self {
+            equal_loudness: Biquad::new(equal_loudness.0, equal_loudness.1),
+            high_pass: Biquad::new(high_pass.0, high_pass.1),
+        }
+    }
+
+    /// Filters `input`, returning the filtered signal.
+    fn apply(&self, input: &[f64]) -> Vec<f64> {
+        let filtered = self.equal_loudness.apply(input);
+        self.high_pass.apply(&filtered)
+    }
+}
+
+/// The number of samples in a 50 ms block at `sample_rate_hz`.
+///
+/// At least one sample: a rate so low that 50 ms is shorter than one
+/// sample must not produce an empty block.
+fn block_size(sample_rate_hz: u32) -> usize {
+    ((sample_rate_hz as usize * 50 + 500) / 1000).max(1)
+}
+
 /// Estimates the ReplayGain track gain and peak of interleaved PCM samples.
 ///
 /// Implements the classic ReplayGain 1.0 method: an equal-loudness filter
-/// (the standard Yule shelf followed by a Butterworth high-pass) is applied
-/// to a mono downmix, the result is split into 50 ms blocks, each block's
-/// RMS is converted to dB relative to `REFERENCE_RMS`, and the track
-/// loudness is the 95th percentile of those block values. The gain is the
-/// negation of that loudness, clamped to +-MAX_GAIN_DB. The peak is the
-/// largest absolute sample of the *unfiltered* input.
+/// followed by a high-pass filter is applied to a mono downmix, the result
+/// is split into 50 ms blocks, each block's RMS is converted to dB
+/// relative to `REFERENCE_RMS`, and the track loudness is the 95th
+/// percentile of those block values. The gain is the negation of that
+/// loudness, clamped to +-MAX_GAIN_DB. The peak is the largest absolute
+/// sample of the *unfiltered* input.
 ///
 /// * `samples` holds `channels`-interleaved `f32` samples, typically in
 ///   -1.0..=1.0 but any finite values are accepted.
-/// * `sample_rate_hz` drives a linear resample to the 48 kHz the reference
-///   filter coefficients are specified for when it differs.
+/// * `sample_rate_hz` is the rate of the signal. The loudness filter is
+///   designed for it (see the module docs), so the signal is measured as
+///   it is and not resampled.
 ///
 /// The function is pure - no I/O, no globals, no audio hardware.
 ///
@@ -464,35 +558,12 @@ pub fn analyze_replaygain(
         mono.push(acc / channels as f64);
     }
 
-    // Resample to 48 kHz (the rate the reference filter coefficients target)
-    // when necessary.
-    let target_sr = 48_000.0f64;
-    if sample_rate_hz != 48_000 {
-        let ratio = target_sr / sample_rate_hz as f64;
-        let out_len = ((mono.len() as f64) * ratio).round().max(1.0) as usize;
-        let mut out = vec![0.0f64; out_len];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let src_pos = i as f64 / ratio;
-            let i0 = src_pos.floor() as usize;
-            let frac = src_pos - i0 as f64;
-            let s0 = mono.get(i0).copied().unwrap_or(0.0);
-            let s1 = mono.get(i0 + 1).copied().unwrap_or(s0);
-            *slot = s0 + (s1 - s0) * frac;
-        }
-        mono = out;
-    }
+    // The loudness filter, designed for the rate of the signal.
+    let filter = LoudnessFilter::new(sample_rate_hz);
+    let filtered = filter.apply(&mono);
 
-    // Filter coefficients for 48 kHz (ReplayGain 1.0 reference).
-    const YULE_B: [f64; 3] = [0.995527971309, -1.991055942619, 0.995527971310];
-    const YULE_A: [f64; 3] = [1.0, -1.991119453430, 0.991172964241];
-    const BUTT_B: [f64; 3] = [0.997862928247, -1.995725856494, 0.997862928247];
-    const BUTT_A: [f64; 3] = [1.0, -1.995789367305, 0.995789367305];
-
-    let filtered = Biquad::new(YULE_B, YULE_A).apply(&mono);
-    let filtered = Biquad::new(BUTT_B, BUTT_A).apply(&filtered);
-
-    // 50 ms blocks at 48 kHz.
-    let block_size = 2400usize;
+    // 50 ms blocks at the rate of the signal.
+    let block_size = block_size(sample_rate_hz);
     let mut block_loudness: Vec<f32> = Vec::new();
     let mut i = 0usize;
     while i < filtered.len() {
@@ -817,19 +888,195 @@ pub fn write_replaygain(
 mod tests {
     use super::*;
 
+    use crate::dsp::pole_magnitudes;
+
     const SAMPLE_RATE: u32 = 44_100;
 
     /// A sine at `frequency` Hz, `amplitude` peak, exactly `cycles` whole
     /// cycles over the buffer, so the RMS is `amplitude / sqrt(2)` up to
     /// sampling quantization.
     fn sine(amplitude: f32, frequency: f32, frames: usize) -> Vec<f32> {
+        sine_at(amplitude, frequency, frames, SAMPLE_RATE)
+    }
+
+    /// A sine at `frequency` Hz, `amplitude` peak, `frames` long, at
+    /// `sample_rate_hz`.
+    fn sine_at(amplitude: f32, frequency: f32, frames: usize, sample_rate_hz: u32) -> Vec<f32> {
         (0..frames)
             .map(|i| {
                 amplitude
-                    * (2.0 * core::f32::consts::PI * frequency * i as f32 / SAMPLE_RATE as f32)
+                    * (2.0 * core::f32::consts::PI * frequency * i as f32 / sample_rate_hz as f32)
                         .sin()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_48_khz_numbers_are_the_ones_the_reference_design_gives() {
+        // The values the analysis gave before the filters were designed
+        // for the rate of the signal. The linear resampling to 48 kHz is
+        // gone, the numbers stay: at 48 kHz the reference design is the
+        // design.
+        let cases = [
+            (1.0f32, 1000.0f32, -0.002103164f32),
+            (1.0, 440.0, -0.012911906),
+            (1.0, 16_000.0, 0.00056985137),
+            (0.5, 440.0, 6.007688),
+            (1.0, 100.0, 0.113936365),
+        ];
+        for (amplitude, frequency, expected) in cases {
+            let samples = sine_at(amplitude, frequency, 48_000, 48_000);
+            let analysis = analyze_replaygain(&samples, 1, 48_000).unwrap();
+            assert!(
+                (analysis.track_gain_db - expected).abs() < 1e-6,
+                "{frequency} Hz: gain = {} instead of {expected}",
+                analysis.track_gain_db
+            );
+        }
+
+        // The blocks themselves, not only the gain that came out of them.
+        let samples = sine_at(1.0, 1000.0, 48_000, 48_000);
+        let analysis = analyze_replaygain(&samples, 1, 48_000).unwrap();
+        assert_eq!(analysis.block_loudness_db.len(), 20);
+        assert!((analysis.block_loudness_db[0] - -0.0011514138).abs() < 1e-6);
+        assert!((analysis.block_loudness_db[1] - 0.0020970486).abs() < 1e-6);
+        assert!((analysis.block_loudness_db[19] - 0.0021031366).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_same_signal_measures_the_same_at_every_rate() {
+        // The same tone, one second long, at three rates: the measurement
+        // must not depend on the rate the file happens to have. Before the
+        // filters were designed for the rate of the signal, the linear
+        // resampling folded the top octave down: a 16 kHz tone measured
+        // 3.5 dB louder in a 44.1 kHz file than in a 48 kHz one.
+        for frequency in [100.0f32, 440.0, 1000.0, 8000.0, 16000.0] {
+            let gains: Vec<f32> = [44_100u32, 48_000, 96_000]
+                .iter()
+                .map(|&rate| {
+                    let samples = sine_at(1.0, frequency, rate as usize, rate);
+                    analyze_replaygain(&samples, 1, rate).unwrap().track_gain_db
+                })
+                .collect();
+            let lowest = gains.iter().copied().fold(f32::INFINITY, f32::min);
+            let highest = gains.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                highest - lowest < 0.01,
+                "{frequency} Hz: {gains:?} differ by {} dB",
+                highest - lowest
+            );
+        }
+    }
+
+    #[test]
+    fn the_filter_is_stable_at_every_rate() {
+        for rate in [
+            8_000u32, 16_000, 22_050, 44_100, 48_000, 96_000, 192_000, 384_000,
+        ] {
+            // Five seconds of tone: a filter that is not stable grows
+            // without bound and the measurement leaves every scale.
+            let samples = sine_at(1.0, 1000.0, rate as usize * 5, rate);
+            let analysis = analyze_replaygain(&samples, 1, rate).unwrap();
+            assert!(analysis.track_gain_db.is_finite(), "{rate} Hz");
+            assert!(analysis.track_peak.is_finite(), "{rate} Hz");
+            for &block in &analysis.block_loudness_db {
+                assert!(block.is_finite(), "{rate} Hz: a block of {block} dB");
+                assert!(block < 10.0, "{rate} Hz: a block of {block} dB");
+            }
+        }
+    }
+
+    #[test]
+    fn the_designed_filter_has_its_poles_inside_the_unit_circle() {
+        for rate in [
+            4_000u32, 8_000, 22_050, 44_100, 48_000, 96_000, 192_000, 384_000,
+        ] {
+            let filter = LoudnessFilter::new(rate);
+            for section in [filter.equal_loudness, filter.high_pass] {
+                for pole in pole_magnitudes([1.0, section.a1, section.a2]) {
+                    assert!(pole < 1.0, "a pole of {pole} at {rate} Hz");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_absurd_rate_does_not_produce_a_nan() {
+        // A rate so low that a 50 ms block is shorter than one sample, and
+        // a rate so high that the filter's poles are almost on the unit
+        // circle: the measurement stays finite either way.
+        for rate in [1u32, 2, 3, 4_294_967_295] {
+            let samples = sine_at(1.0, 1000.0, 64, rate);
+            let analysis = analyze_replaygain(&samples, 1, rate).unwrap();
+            assert!(analysis.track_gain_db.is_finite(), "{rate} Hz");
+            assert!(
+                analysis
+                    .block_loudness_db
+                    .iter()
+                    .all(|block| block.is_finite()),
+                "{rate} Hz"
+            );
+        }
+    }
+
+    #[test]
+    fn the_blocks_are_fifty_milliseconds_at_every_rate() {
+        for rate in [44_100u32, 48_000, 96_000] {
+            let samples = sine_at(1.0, 1000.0, rate as usize, rate);
+            let analysis = analyze_replaygain(&samples, 1, rate).unwrap();
+            assert_eq!(analysis.block_loudness_db.len(), 20, "{rate} Hz");
+        }
+    }
+
+    #[test]
+    fn the_filter_at_the_reference_rate_is_the_reference_design() {
+        let filter = LoudnessFilter::new(FILTER_REFERENCE_RATE);
+        let (b, a) = REFERENCE_EQUAL_LOUDNESS;
+        assert_eq!(
+            (
+                filter.equal_loudness.b0,
+                filter.equal_loudness.b1,
+                filter.equal_loudness.b2
+            ),
+            (b[0], b[1], b[2])
+        );
+        assert_eq!(
+            (filter.equal_loudness.a1, filter.equal_loudness.a2),
+            (a[1], a[2])
+        );
+        let (b, a) = REFERENCE_HIGH_PASS;
+        assert_eq!(
+            (
+                filter.high_pass.b0,
+                filter.high_pass.b1,
+                filter.high_pass.b2
+            ),
+            (b[0], b[1], b[2])
+        );
+        assert_eq!((filter.high_pass.a1, filter.high_pass.a2), (a[1], a[2]));
+    }
+
+    #[test]
+    fn the_reduced_high_pass_section_filters_like_the_uncancelled_one() {
+        // The reference design's high-pass section before the exact
+        // pole/zero pair at z = 1 was cancelled.
+        let uncancelled = Biquad::new(
+            [0.997862928247, -1.995725856494, 0.997862928247],
+            [1.0, -1.995789367305, 0.995789367305],
+        );
+        let reduced = Biquad::new(
+            [0.997862928247, -0.997862928247, 0.0],
+            [1.0, -0.995789367305, 0.0],
+        );
+        let input: Vec<f64> = (0..48_000)
+            .map(|i| (2.0 * core::f64::consts::PI * 440.0 * i as f64 / 48_000.0).sin())
+            .collect();
+        let a = uncancelled.apply(&input);
+        let b = reduced.apply(&input);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-9, "{x} vs {y}");
+        }
     }
 
     #[test]

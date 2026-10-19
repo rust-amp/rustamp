@@ -76,10 +76,22 @@ full-scale square vs. full-scale sine → same peak, ≈3.01 dB apart; 1e-6 and
 ragged frames, NaN/Inf samples → all refused with `InvalidArgument`.
 
 What it is not: not EBU R128/BS.1770 integrated loudness (no K-weighting, no
-gating, no channel weights — the rate argument is validated but does not
-change the number), not perceptual (no equal-loudness contour), and not a
-substitute for the reference implementations' exact numbers
+gating, no channel weights), not perceptual (no equal-loudness contour), and
+not a substitute for the reference implementations' exact numbers
 (mp3gain/metaflac/foobar2000/loudgain will differ).
+
+The loudness filter is a pair of biquad sections (an equal-loudness and a
+high-pass section) whose reference design is given at 48 kHz. For every
+other rate the sections are **retuned** — taken to the analog domain and
+realized again for the rate of the signal — and the signal is **not**
+resampled any more; the 50 ms blocks are computed from the rate of the
+signal. The 48 kHz numbers are bit-identical to the ones the analysis gave
+before; the numbers at other rates no longer depend on a linear resampling
+that folded the top octave down (a 20 kHz tone in a 44.1 kHz file measured
+4.59 dB louder than the same tone in a 48 kHz file; now the difference is
+0.0002 dB). See `docs/notes/replaygain-filter-rate.md` for the filter
+design, the numbers and what the ReplayGain 1.0 specification itself says
+about its own filter.
 
 Own choices (all documented in code): silence → neutral 0 dB; clamp ±51 dB;
 reference anchor at full-scale sine; R128 `db_to_r128_q8` saturates via `as`;
