@@ -26,6 +26,11 @@ pub const TRACE_FILE_EXTENSION: &str = "log";
 /// evidence that the host did not touch it.
 pub const FIXTURE_MODULE_ID: i32 = 0x0001_0000;
 
+/// The description the fixture publishes (S09 §4.1 offset 0x04).
+///
+/// NUL-terminated, because the ABI member is a pointer to an ANSI string.
+pub const FIXTURE_DESCRIPTION: &[u8] = b"Rustamp out fixture\0";
+
 /// The trace line the fixture writes when `init` runs.
 pub fn init_line(parent: usize, instance: usize, id: i32) -> String {
     format!("init parent={parent:#x} instance={instance:#x} id={id}")
@@ -47,8 +52,38 @@ pub const QUIT_LINE: &str = "quit";
 /// no such line is in the trace.
 pub const EVENT_OPEN: &str = "open ";
 
+/// Trace prefix of the `can_write` callback.
+///
+/// `can_write` belongs to the same decode-thread path as `open` (S09 §4.2
+/// step 3), so the host never calls it either.
+pub const EVENT_CAN_WRITE: &str = "can_write ";
+
 /// Trace prefix of the `write` callback. Never called by the host.
 pub const EVENT_WRITE: &str = "write ";
+
+/// Trace prefix of the `is_playing` callback.
+///
+/// `is_playing` belongs to the same decode-thread path as `open`
+/// (S09 §4.2 step 3), so the host never calls it either.
+pub const EVENT_IS_PLAYING: &str = "is_playing ";
+
+/// Trace prefix of the `close` callback.
+///
+/// `close` belongs to the same decode-thread path as `open` (S09 §4.2
+/// step 3), so the host never calls it either.
+pub const EVENT_CLOSE: &str = "close";
+
+/// Trace prefix of the `set_volume` callback.
+///
+/// The two callbacks the host itself may call are `set_volume` and
+/// `set_pan`: S09 §3.5 step 2 has it apply the player's levels to the
+/// output before `play` (the hand-over, see `src/handoff.rs`). Without a
+/// hand-over the host calls neither, so the acceptance test asserts that no
+/// such line is in the trace.
+pub const EVENT_SET_VOLUME: &str = "set_volume ";
+
+/// Trace prefix of the `set_pan` callback. See [`EVENT_SET_VOLUME`].
+pub const EVENT_SET_PAN: &str = "set_pan ";
 
 /// Trace prefix of the `config` callback.
 ///

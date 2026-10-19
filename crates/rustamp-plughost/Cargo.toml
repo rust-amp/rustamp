@@ -38,6 +38,15 @@ crate-type = ["cdylib"]
 name = "out_rustamp_fixture"
 crate-type = ["cdylib"]
 
+# The clean-room input ("in_") plugin fixture for the **hand-over** (S09
+# §3.5 step 2, §3.7): it sets flag bit 0 and drives the output plug-in the
+# host hands it. A separate cdylib artifact like the others, so the
+# hand-over acceptance maps both plug-ins through the OS loader instead of
+# linking them into a test binary. It opens no window and no audio device.
+[[example]]
+name = "in_handoff_rustamp_fixture"
+crate-type = ["cdylib"]
+
 # The clean-room visualization ("vis_") plugin fixture, for the same reason:
 # a separate cdylib artifact that the acceptance test maps through the OS
 # loader, never linked into the host or into the test binary. It opens no
