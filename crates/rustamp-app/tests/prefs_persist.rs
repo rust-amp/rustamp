@@ -95,3 +95,56 @@ fn choosing_the_built_in_skin_row_keeps_it_selected() {
     app.apply_prefs_action(PrefsAction::LoadSkin(row));
     assert_eq!(app.prefs_settings().skin_selected, Some(row));
 }
+
+#[test]
+fn the_replaygain_mode_follows_the_dialog_and_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replaygain.toml");
+
+    let mut app = app_with(Config::default(), Some(path.clone()));
+    assert_eq!(
+        app.prefs_settings().replaygain,
+        rustamp_core::config::ReplayGainMode::Off
+    );
+
+    app.apply_prefs_action(PrefsAction::SetReplayGain(
+        rustamp_core::config::ReplayGainMode::Album,
+    ));
+    assert_eq!(
+        app.prefs_settings().replaygain,
+        rustamp_core::config::ReplayGainMode::Album
+    );
+
+    app.save_config().expect("save");
+    let loaded = load(Some(&path)).expect("load").config;
+    assert_eq!(
+        loaded.audio.replaygain,
+        rustamp_core::config::ReplayGainMode::Album
+    );
+}
+
+#[test]
+fn the_output_mode_follows_the_dialog_but_is_not_persisted_yet() {
+    // The device is opened when the player starts and the mode is not applied
+    // yet, so the saved file must not advertise it (config N6's honesty rule).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("output_mode.toml");
+
+    let mut app = app_with(Config::default(), Some(path.clone()));
+    assert_eq!(
+        app.prefs_settings().output_mode,
+        rustamp_core::config::OutputMode::Shared
+    );
+
+    app.apply_prefs_action(PrefsAction::SetOutputMode(
+        rustamp_core::config::OutputMode::Exclusive,
+    ));
+    assert_eq!(
+        app.prefs_settings().output_mode,
+        rustamp_core::config::OutputMode::Exclusive
+    );
+
+    app.save_config().expect("save");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("output_mode"), "{text}");
+}

@@ -375,6 +375,8 @@ impl App {
             double_size: self.state().double_size,
             shuffle: self.state().shuffle,
             repeat: self.state().repeat,
+            replaygain: self.replaygain_mode(),
+            output_mode: self.config().audio.output_mode,
             skins: entries.into_iter().map(|entry| entry.name).collect(),
             skin_selected,
             plugins: self.plugin_rows(),
@@ -443,6 +445,28 @@ impl App {
                 if let Err(error) = self.submit(command) {
                     self.note(format!("preferences: {error}"));
                 }
+            }
+            PrefsAction::SetReplayGain(mode) => {
+                if self.replaygain_mode() == mode {
+                    return;
+                }
+                // The engine runs the mode; the saved configuration takes it
+                // from the engine (`App::current_config`).
+                self.set_replaygain_mode(mode);
+                if let Err(error) = self.save_config() {
+                    self.note(format!("preferences: {error}"));
+                }
+            }
+            PrefsAction::SetOutputMode(mode) => {
+                if self.config().audio.output_mode == mode {
+                    return;
+                }
+                // The device is opened when the player starts, so the mode is
+                // remembered now and applied from the next start on. It is not
+                // written to the configuration file yet: the player does not
+                // apply it (`config::serialize_honest` writes honoured fields
+                // only).
+                self.set_output_mode(mode);
             }
             PrefsAction::LoadSkin(row) => {
                 let Some(entry) = self.browser_entries().into_iter().nth(row) else {

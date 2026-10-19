@@ -20,6 +20,20 @@
 //!
 //! A control exists only where the player really has the setting behind it.
 //! Pages without any setting say so in words instead of showing dead controls.
+//!
+//! # The audio settings
+//!
+//! Two settings are not a yes/no but a list of values: the ReplayGain mode
+//! (off, track, album) and the output mode (shared, exclusive). They are
+//! drop-down lists ([`Item::Combo`]) bound to one of the two
+//! ([`ComboBind`]), and the list's order ([`REPLAYGAIN_CHOICES`],
+//! [`OUTPUT_MODE_CHOICES`]) is the single place where the dialog, the
+//! configuration and the player agree on what a row means.
+//!
+//! The reference's preferences pages are unmeasured (S04 is open), so the page
+//! that carries them and the wording of their labels are own choices.
+
+use rustamp_core::config::{OutputMode, ReplayGainMode};
 
 /// One node of the page tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -119,6 +133,107 @@ pub enum Bind {
     Repeat,
 }
 
+/// A setting a drop-down list is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComboBind {
+    /// The ReplayGain mode: off, track or album.
+    ReplayGain,
+    /// The output mode: shared or exclusive.
+    OutputMode,
+}
+
+/// The ReplayGain modes the list shows, in order.
+///
+/// The order is the list's row order, so it is also the order the rows are
+/// numbered by. Every mode of the configuration is in it.
+pub const REPLAYGAIN_CHOICES: [ReplayGainMode; 3] = [
+    ReplayGainMode::Off,
+    ReplayGainMode::Track,
+    ReplayGainMode::Album,
+];
+
+/// The output modes the list shows, in order.
+///
+/// The order is the list's row order, so it is also the order the rows are
+/// numbered by. Every mode of the configuration is in it.
+pub const OUTPUT_MODE_CHOICES: [OutputMode; 2] = [OutputMode::Shared, OutputMode::Exclusive];
+
+/// The text of the list row that shows `mode`.
+pub fn replaygain_label(mode: ReplayGainMode) -> &'static str {
+    match mode {
+        ReplayGainMode::Off => "Off",
+        ReplayGainMode::Track => "Track",
+        ReplayGainMode::Album => "Album",
+    }
+}
+
+/// The text of the list row that shows `mode`.
+pub fn output_mode_label(mode: OutputMode) -> &'static str {
+    match mode {
+        OutputMode::Shared => "Shared",
+        OutputMode::Exclusive => "Exclusive",
+    }
+}
+
+/// The row that shows `mode`.
+///
+/// Every mode is in [`REPLAYGAIN_CHOICES`] (a test pins that), so the fallback
+/// is unreachable and only keeps the function total.
+pub fn replaygain_row(mode: ReplayGainMode) -> usize {
+    REPLAYGAIN_CHOICES
+        .iter()
+        .position(|m| *m == mode)
+        .unwrap_or(0)
+}
+
+/// The mode the row `row` shows, or `None` for a row that does not exist.
+pub fn replaygain_at(row: usize) -> Option<ReplayGainMode> {
+    REPLAYGAIN_CHOICES.get(row).copied()
+}
+
+/// The row that shows `mode`.
+///
+/// Every mode is in [`OUTPUT_MODE_CHOICES`] (a test pins that), so the
+/// fallback is unreachable and only keeps the function total.
+pub fn output_mode_row(mode: OutputMode) -> usize {
+    OUTPUT_MODE_CHOICES
+        .iter()
+        .position(|m| *m == mode)
+        .unwrap_or(0)
+}
+
+/// The mode the row `row` shows, or `None` for a row that does not exist.
+pub fn output_mode_at(row: usize) -> Option<OutputMode> {
+    OUTPUT_MODE_CHOICES.get(row).copied()
+}
+
+impl ComboBind {
+    /// The texts of the rows the list shows, in order.
+    pub fn labels(self) -> Vec<&'static str> {
+        match self {
+            ComboBind::ReplayGain => REPLAYGAIN_CHOICES
+                .iter()
+                .copied()
+                .map(replaygain_label)
+                .collect(),
+            ComboBind::OutputMode => OUTPUT_MODE_CHOICES
+                .iter()
+                .copied()
+                .map(output_mode_label)
+                .collect(),
+        }
+    }
+
+    /// The action the row `row` stands for, or `None` for a row that does not
+    /// exist.
+    pub fn action(self, row: usize) -> Option<PrefsAction> {
+        match self {
+            ComboBind::ReplayGain => replaygain_at(row).map(PrefsAction::SetReplayGain),
+            ComboBind::OutputMode => output_mode_at(row).map(PrefsAction::SetOutputMode),
+        }
+    }
+}
+
 /// One element of a page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
@@ -144,6 +259,20 @@ pub enum Item {
         rect: Rect,
         /// The setting it shows and changes.
         bind: Bind,
+    },
+    /// A drop-down list with a label in front of it.
+    Combo {
+        /// The label's text.
+        text: &'static str,
+        /// Where the label sits.
+        label: Rect,
+        /// Where the list sits. Its height is the height of the **drop-down
+        /// list**, not of the closed box: the closed box is drawn at the
+        /// standard height at the top of the rectangle, so the rectangle must
+        /// not reach over the group box's frame.
+        list: Rect,
+        /// The setting it shows and changes.
+        bind: ComboBind,
     },
     /// The list of loadable skins; choosing a row loads it.
     SkinList {
@@ -217,10 +346,36 @@ const PLUGIN_HINT: &str = "Only approved plug-ins can be switched on. \
 pub fn page_items(node: PrefsNode) -> Vec<Item> {
     let w = PAGE_SIZE.0;
     match node {
-        PrefsNode::Setup => note_page(
-            "Rustamp setup",
-            "Language: English.\nSettings are saved to the player's configuration file when it closes.",
-        ),
+        // The audio settings live on the Setup page: it is the page for the
+        // device, and both settings are about how the player sounds. The
+        // group box is tall enough for the drop-down lists, so that a list
+        // never reaches over the group's frame.
+        PrefsNode::Setup => vec![
+            Item::Group {
+                text: "Audio",
+                rect: rect(0, 0, w, 160),
+            },
+            Item::Combo {
+                text: "ReplayGain:",
+                label: rect(12, 22, 100, 20),
+                list: rect(118, 20, 132, 60),
+                bind: ComboBind::ReplayGain,
+            },
+            Item::Combo {
+                text: "Output mode:",
+                label: rect(12, 100, 100, 20),
+                list: rect(118, 98, 132, 60),
+                bind: ComboBind::OutputMode,
+            },
+            Item::Group {
+                text: "General",
+                rect: rect(0, 168, w, 72),
+            },
+            Item::Label {
+                text: "Language: English.\nSettings are saved to the player's configuration file when it closes.",
+                rect: rect(12, 188, w - 24, 48),
+            },
+        ],
         PrefsNode::FileTypes => note_page(
             "File types",
             "Associating file types with Rustamp is not available yet.",
@@ -319,6 +474,10 @@ pub struct PrefsSettings {
     pub shuffle: bool,
     /// Repeat.
     pub repeat: bool,
+    /// The ReplayGain mode.
+    pub replaygain: ReplayGainMode,
+    /// The output mode.
+    pub output_mode: OutputMode,
     /// The skins that can be loaded, one row each.
     pub skins: Vec<String>,
     /// The row of the skin in use.
@@ -343,6 +502,14 @@ impl PrefsSettings {
             Bind::Repeat => self.repeat,
         }
     }
+
+    /// The row the list of `bind` shows.
+    pub fn combo_row(&self, bind: ComboBind) -> usize {
+        match bind {
+            ComboBind::ReplayGain => replaygain_row(self.replaygain),
+            ComboBind::OutputMode => output_mode_row(self.output_mode),
+        }
+    }
 }
 
 /// What the user did in the dialog; the player turns it into a command.
@@ -350,6 +517,10 @@ impl PrefsSettings {
 pub enum PrefsAction {
     /// A check box was set to this value.
     Set(Bind, bool),
+    /// The ReplayGain mode was set to this value.
+    SetReplayGain(ReplayGainMode),
+    /// The output mode was set to this value.
+    SetOutputMode(OutputMode),
     /// A skin row was chosen.
     LoadSkin(usize),
     /// The toggle button was pressed with this plug-in selected
@@ -393,18 +564,19 @@ mod win32 {
         AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        BM_GETCHECK, BM_SETCHECK, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-        HMENU, IDC_ARROW, IsWindow, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
-        LB_SETHORIZONTALEXTENT, LoadCursorW, NONCLIENTMETRICSW, RegisterClassExW,
-        SPI_GETNONCLIENTMETRICS, SW_SHOW, SendMessageW, SetForegroundWindow, ShowWindow,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WM_NOTIFY, WM_SETFONT, WNDCLASSEXW,
-        WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_HSCROLL, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
-        WS_VSCROLL,
+        BM_GETCHECK, BM_SETCHECK, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE,
+        CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, HMENU, IDC_ARROW, IsWindow,
+        LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETHORIZONTALEXTENT,
+        LoadCursorW, NONCLIENTMETRICSW, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW,
+        SendMessageW, SetForegroundWindow, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+        WM_DESTROY, WM_NOTIFY, WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
+        WS_HSCROLL, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, PWSTR};
 
     use super::{
-        Bind, Item, PrefsAction, PrefsError, PrefsNode, PrefsSettings, Rect, TREE, page_items,
+        Bind, ComboBind, Item, PrefsAction, PrefsError, PrefsNode, PrefsSettings, Rect, TREE,
+        page_items,
     };
 
     const CLASS_NAME: &str = "RustampPreferences";
@@ -438,6 +610,9 @@ mod win32 {
     const LBS_NOTIFY: u32 = 0x1;
     const LBN_SELCHANGE: u32 = 1;
     const BN_CLICKED: u32 = 0;
+    /// Combo box style bit (`CBS_DROPDOWNLIST`): a list the user picks from,
+    /// without an edit field. Kept as a plain number like the styles above.
+    const CBS_DROPDOWNLIST: u32 = 0x3;
 
     /// The dialog's live state. The dialog is a singleton per thread (the UI
     /// thread), so the window procedure and the handle share it here instead
@@ -452,6 +627,8 @@ mod win32 {
         /// Controls of the current page: (window, binding).
         page: Vec<HWND>,
         checks: Vec<(HWND, u16, Bind)>,
+        /// The drop-down lists of the current page: (window, id, binding).
+        combos: Vec<(HWND, u16, ComboBind)>,
         skin_list: Option<HWND>,
         /// The plug-in list of the current page, the player's id behind each
         /// of its rows and the row texts it shows.
@@ -586,6 +763,7 @@ mod win32 {
                     settings: settings.clone(),
                     page: Vec::new(),
                     checks: Vec::new(),
+                    combos: Vec::new(),
                     skin_list: None,
                     plugin_list: None,
                     plugin_ids: Vec::new(),
@@ -665,12 +843,13 @@ mod win32 {
 
         /// Pushes the player's current settings into the open controls.
         pub fn set_settings(&self, settings: &PrefsSettings) {
-            let Ok((checks, skin_list, plugin_list, node)) = STATE.with(|state| {
+            let Ok((checks, combos, skin_list, plugin_list, node)) = STATE.with(|state| {
                 let mut guard = state.try_borrow_mut().map_err(|_| ())?;
                 let inner = guard.as_mut().ok_or(())?;
                 inner.settings = settings.clone();
                 Ok::<_, ()>((
                     inner.checks.clone(),
+                    inner.combos.clone(),
                     inner.skin_list,
                     inner.plugin_list,
                     inner.node,
@@ -684,6 +863,9 @@ mod win32 {
             }
             for (control, _, bind) in controls.0 {
                 set_check(control, settings.get(bind));
+            }
+            for (control, _, bind) in combos {
+                set_combo_row(control, settings.combo_row(bind));
             }
             if let (Some(list), Some(row)) = (controls.1, settings.skin_selected) {
                 // SAFETY: selecting a row of our own list box.
@@ -714,6 +896,20 @@ mod win32 {
                 Some(WPARAM(usize::from(on))),
                 Some(LPARAM(0)),
             );
+        }
+    }
+
+    /// Selects the row of a drop-down list, unless it already shows it (the
+    /// per-tick settings push must not close a list the user has open).
+    fn set_combo_row(control: HWND, row: usize) {
+        // SAFETY: the selection of our own combo box.
+        let current =
+            unsafe { SendMessageW(control, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))) }.0;
+        if current < 0 || current as usize != row {
+            // SAFETY: selecting a row of our own combo box.
+            unsafe {
+                SendMessageW(control, CB_SETCURSEL, Some(WPARAM(row)), Some(LPARAM(0)));
+            }
         }
     }
 
@@ -866,6 +1062,7 @@ mod win32 {
                 .and_then(|mut g| {
                     g.as_mut().map(|i| {
                         i.checks.clear();
+                        i.combos.clear();
                         i.skin_list = None;
                         i.plugin_list = None;
                         i.plugin_ids.clear();
@@ -882,6 +1079,7 @@ mod win32 {
         let shift = |r: Rect| (r.x + PAGE_ORIGIN.0, r.y + PAGE_ORIGIN.1, r.w, r.h);
         let mut page = Vec::new();
         let mut checks = Vec::new();
+        let mut combos = Vec::new();
         let mut skin_list = None;
         let mut plugin_list = None;
         for (next_id, item) in (FIRST_PAGE_ID..).zip(page_items(node)) {
@@ -931,6 +1129,53 @@ mod win32 {
                         set_check(c, settings.get(bind));
                         page.push(c);
                         checks.push((c, next_id, bind));
+                    }
+                }
+                Item::Combo {
+                    text,
+                    label,
+                    list,
+                    bind,
+                } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("STATIC"),
+                        text,
+                        WS_CHILD.0 | WS_VISIBLE.0 | SS_LEFT,
+                        0,
+                        shift(label),
+                        next_id,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("COMBOBOX"),
+                        "",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST,
+                        0,
+                        shift(list),
+                        next_id,
+                        dpi,
+                        font,
+                    ) {
+                        for entry in bind.labels() {
+                            let entry = wide(entry);
+                            // SAFETY: the text outlives the call.
+                            unsafe {
+                                SendMessageW(
+                                    c,
+                                    CB_ADDSTRING,
+                                    Some(WPARAM(0)),
+                                    Some(LPARAM(entry.as_ptr() as isize)),
+                                );
+                            }
+                        }
+                        set_combo_row(c, settings.combo_row(bind));
+                        page.push(c);
+                        combos.push((c, next_id, bind));
                     }
                 }
                 Item::SkinList { rect } => {
@@ -1038,6 +1283,7 @@ mod win32 {
             {
                 inner.page = page;
                 inner.checks = checks;
+                inner.combos = combos;
                 inner.skin_list = skin_list;
                 inner.plugin_list = plugin_list;
             }
@@ -1161,6 +1407,29 @@ mod win32 {
                         push_action(PrefsAction::LoadSkin(row as usize));
                     }
                     return LRESULT(0);
+                }
+                if code == CBN_SELCHANGE {
+                    // A drop-down list of the current page picked another row.
+                    let hit = STATE.with(|state| {
+                        state.try_borrow().ok().and_then(|g| {
+                            g.as_ref().and_then(|i| {
+                                i.combos.iter().find(|(_, cid, _)| *cid == id).copied()
+                            })
+                        })
+                    });
+                    if let Some((control, _, bind)) = hit {
+                        // SAFETY: reading the selection of our own combo box.
+                        let row = unsafe {
+                            SendMessageW(control, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)))
+                        }
+                        .0;
+                        if row >= 0
+                            && let Some(action) = bind.action(row as usize)
+                        {
+                            push_action(action);
+                        }
+                        return LRESULT(0);
+                    }
                 }
                 if code == BN_CLICKED {
                     let hit = STATE.with(|state| {
@@ -1293,18 +1562,21 @@ mod tests {
     fn every_item_fits_inside_the_page_area() {
         for entry in TREE {
             for item in page_items(entry.node) {
-                let r = match item {
+                let rects: Vec<Rect> = match item {
                     Item::Group { rect, .. }
                     | Item::Label { rect, .. }
                     | Item::Check { rect, .. }
                     | Item::SkinList { rect }
                     | Item::PluginList { rect }
                     | Item::PluginToggle { rect }
-                    | Item::PluginRescan { rect } => rect,
+                    | Item::PluginRescan { rect } => vec![rect],
+                    Item::Combo { label, list, .. } => vec![label, list],
                 };
-                assert!(r.x >= 0 && r.y >= 0, "{:?}: {r:?}", entry.node);
-                assert!(r.x + r.w <= PAGE_SIZE.0, "{:?}: {r:?}", entry.node);
-                assert!(r.y + r.h <= PAGE_SIZE.1, "{:?}: {r:?}", entry.node);
+                for r in rects {
+                    assert!(r.x >= 0 && r.y >= 0, "{:?}: {r:?}", entry.node);
+                    assert!(r.x + r.w <= PAGE_SIZE.0, "{:?}: {r:?}", entry.node);
+                    assert!(r.y + r.h <= PAGE_SIZE.1, "{:?}: {r:?}", entry.node);
+                }
             }
         }
     }
@@ -1328,6 +1600,155 @@ mod tests {
             Bind::Repeat,
         ] {
             assert!(seen.contains(&bind), "{bind:?} has no control");
+        }
+    }
+
+    #[test]
+    fn each_list_setting_has_exactly_one_drop_down() {
+        let mut seen: Vec<ComboBind> = Vec::new();
+        for entry in TREE {
+            for item in page_items(entry.node) {
+                if let Item::Combo { bind, .. } = item {
+                    assert!(!seen.contains(&bind), "{bind:?} appears twice");
+                    seen.push(bind);
+                }
+            }
+        }
+        for bind in [ComboBind::ReplayGain, ComboBind::OutputMode] {
+            assert!(seen.contains(&bind), "{bind:?} has no control");
+        }
+    }
+
+    #[test]
+    fn the_setup_page_carries_the_two_audio_settings() {
+        // The reference's page contents are unmeasured (S04 is open), so the
+        // page that carries them is an own choice: Setup is the page for the
+        // device, and it is the one that says what the player does.
+        let items = page_items(PrefsNode::Setup);
+        let combos: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Combo { text, bind, .. } => Some((*text, *bind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            combos,
+            [
+                ("ReplayGain:", ComboBind::ReplayGain),
+                ("Output mode:", ComboBind::OutputMode),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_replaygain_list_shows_every_mode_in_order() {
+        assert_eq!(
+            REPLAYGAIN_CHOICES,
+            [
+                ReplayGainMode::Off,
+                ReplayGainMode::Track,
+                ReplayGainMode::Album
+            ]
+        );
+        assert_eq!(
+            ComboBind::ReplayGain.labels(),
+            vec!["Off", "Track", "Album"]
+        );
+        // Every mode has a row, and the row shows that mode again.
+        for (row, mode) in REPLAYGAIN_CHOICES.iter().copied().enumerate() {
+            assert_eq!(replaygain_row(mode), row, "{mode:?}");
+            assert_eq!(replaygain_at(row), Some(mode), "row {row}");
+        }
+        assert_eq!(replaygain_at(REPLAYGAIN_CHOICES.len()), None);
+    }
+
+    #[test]
+    fn the_output_mode_list_shows_every_mode_in_order() {
+        assert_eq!(
+            OUTPUT_MODE_CHOICES,
+            [OutputMode::Shared, OutputMode::Exclusive]
+        );
+        assert_eq!(ComboBind::OutputMode.labels(), vec!["Shared", "Exclusive"]);
+        for (row, mode) in OUTPUT_MODE_CHOICES.iter().copied().enumerate() {
+            assert_eq!(output_mode_row(mode), row, "{mode:?}");
+            assert_eq!(output_mode_at(row), Some(mode), "row {row}");
+        }
+        assert_eq!(output_mode_at(OUTPUT_MODE_CHOICES.len()), None);
+    }
+
+    #[test]
+    fn a_list_row_stands_for_the_action_that_sets_its_value() {
+        for (row, mode) in REPLAYGAIN_CHOICES.iter().copied().enumerate() {
+            assert_eq!(
+                ComboBind::ReplayGain.action(row),
+                Some(PrefsAction::SetReplayGain(mode))
+            );
+        }
+        for (row, mode) in OUTPUT_MODE_CHOICES.iter().copied().enumerate() {
+            assert_eq!(
+                ComboBind::OutputMode.action(row),
+                Some(PrefsAction::SetOutputMode(mode))
+            );
+        }
+        // A row that does not exist changes nothing.
+        assert_eq!(ComboBind::ReplayGain.action(REPLAYGAIN_CHOICES.len()), None);
+        assert_eq!(
+            ComboBind::OutputMode.action(OUTPUT_MODE_CHOICES.len()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_settings_show_the_row_of_their_value() {
+        let settings = PrefsSettings {
+            replaygain: ReplayGainMode::Album,
+            output_mode: OutputMode::Exclusive,
+            ..PrefsSettings::default()
+        };
+        assert_eq!(settings.combo_row(ComboBind::ReplayGain), 2);
+        assert_eq!(settings.combo_row(ComboBind::OutputMode), 1);
+    }
+
+    #[test]
+    fn the_default_settings_show_the_first_row() {
+        let settings = PrefsSettings::default();
+        assert_eq!(settings.combo_row(ComboBind::ReplayGain), 0);
+        assert_eq!(settings.combo_row(ComboBind::OutputMode), 0);
+        assert_eq!(settings.replaygain, ReplayGainMode::Off);
+        assert_eq!(settings.output_mode, OutputMode::Shared);
+    }
+
+    #[test]
+    fn a_value_survives_the_way_through_the_dialog() {
+        // The whole path of a change: the configuration's value becomes the
+        // list's row, the row becomes the action, and the action carries the
+        // value back to the configuration.
+        for mode in [
+            ReplayGainMode::Off,
+            ReplayGainMode::Track,
+            ReplayGainMode::Album,
+        ] {
+            let settings = PrefsSettings {
+                replaygain: mode,
+                ..PrefsSettings::default()
+            };
+            let row = settings.combo_row(ComboBind::ReplayGain);
+            let action = ComboBind::ReplayGain
+                .action(row)
+                .expect("a row stands for a mode");
+            assert_eq!(action, PrefsAction::SetReplayGain(mode));
+        }
+        for mode in [OutputMode::Shared, OutputMode::Exclusive] {
+            let settings = PrefsSettings {
+                output_mode: mode,
+                ..PrefsSettings::default()
+            };
+            let row = settings.combo_row(ComboBind::OutputMode);
+            let action = ComboBind::OutputMode
+                .action(row)
+                .expect("a row stands for a mode");
+            assert_eq!(action, PrefsAction::SetOutputMode(mode));
         }
     }
 

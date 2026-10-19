@@ -563,6 +563,30 @@ impl App {
         &self.config
     }
 
+    /// The ReplayGain mode the engine currently runs in.
+    ///
+    /// The engine is the live truth: the saved configuration takes the mode
+    /// from it ([`App::current_config`]).
+    pub fn replaygain_mode(&self) -> rustamp_core::config::ReplayGainMode {
+        replaygain_mode_from_audio(self.engine.replaygain_mode())
+    }
+
+    /// Sets the ReplayGain mode of the engine at once.
+    pub fn set_replaygain_mode(&mut self, mode: rustamp_core::config::ReplayGainMode) {
+        self.engine
+            .set_replaygain_mode(replaygain_mode_to_audio(mode));
+    }
+
+    /// Remembers the output mode of the device.
+    ///
+    /// The device is opened when the player starts, so the mode applies from
+    /// the next start on. It is not written to the configuration file yet: the
+    /// player does not apply it yet, and the file must not advertise a setting
+    /// the player ignores.
+    pub fn set_output_mode(&mut self, mode: rustamp_core::config::OutputMode) {
+        self.config.audio.output_mode = mode;
+    }
+
     /// Sets the path where configuration will be persisted on exit.
     pub fn set_config_path(&mut self, path: Option<PathBuf>) {
         self.config_path = path;
