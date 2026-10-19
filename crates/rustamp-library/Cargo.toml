@@ -12,6 +12,9 @@ rust-version.workspace = true
 rustamp-core.workspace = true
 rustamp-meta.workspace = true
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+# The cover decoder: JPEG and PNG, the formats cover art comes in. The
+# default features are off: the other formats are not decoded.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

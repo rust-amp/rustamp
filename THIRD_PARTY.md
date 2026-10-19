@@ -120,6 +120,7 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `symphonia` | Audio decoding/demuxing | decoders; MPL-2.0, not permissive |
 | `hound` | WAV test fixtures | decoders (dev) |
 | `rusqlite` | SQLite-backed media library index | library |
+| `image` | Cover-art decoding for the media library's artwork cache (JPEG and PNG only) | library |
 
 Consumer names omit the `rustamp-` prefix, except `xtask`. Other entries below
 are transitives supporting these dependencies, including non-Windows targets,
@@ -128,7 +129,7 @@ is not in this lockfile and is deliberately not recorded as already used.
 
 ## Complete Cargo.lock license inventory
 
-Snapshot: 2026-10-19, **313 external package versions**, all from crates.io.
+Snapshot: 2026-10-19, **319 external package versions**, all from crates.io.
 `Cargo.lock` records names/versions/sources/checksums, **not licenses**; licenses
 below are the exact cached package-manifest declarations returned by
 `cargo metadata --offline --locked --all-features --format-version 1`.
@@ -172,6 +173,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `bytemuck` | `1.25.2` | `Zlib OR Apache-2.0 OR MIT` | `crates.io` |
 | `bytemuck_derive` | `1.12.1` | `Zlib OR Apache-2.0 OR MIT` | `crates.io` |
 | `byteorder` | `1.5.0` | `Unlicense OR MIT` | `crates.io` |
+| `byteorder-lite` | `0.1.0` | `Unlicense OR MIT` | `crates.io` |
 | `bytes` | `1.12.1` | `MIT` | `crates.io` |
 | `calloop` | `0.13.0` | `MIT` | `crates.io` |
 | `calloop-wayland-source` | `0.3.0` | `MIT` | `crates.io` |
@@ -236,6 +238,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `heapless` | `0.7.17` | `MIT OR Apache-2.0` | `crates.io` |
 | `hermit-abi` | `0.5.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `hound` | `3.5.1` | `Apache-2.0` | `crates.io` |
+| `image` | `0.25.10` | `MIT OR Apache-2.0` | `crates.io` |
 | `indexmap` | `2.14.2` | `Apache-2.0 OR MIT` | `crates.io` |
 | `jni` | `0.22.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `jni-macros` | `0.22.4` | `MIT OR Apache-2.0` | `crates.io` |
@@ -261,6 +264,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `memmap2` | `0.9.11` | `MIT OR Apache-2.0` | `crates.io` |
 | `miniz_oxide` | `0.8.9` | `MIT OR Zlib OR Apache-2.0` | `crates.io` |
 | `miniz_oxide` | `0.9.1` | `MIT OR Zlib OR Apache-2.0` | `crates.io` |
+| `moxcms` | `0.8.1` | `BSD-3-Clause OR Apache-2.0` | `crates.io` |
 | `multiversion_no_op` | `1.0.0` | `Apache-2.0 OR MIT` | `crates.io` |
 | `ndk` | `0.9.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `ndk-context` | `0.1.1` | `MIT OR Apache-2.0` | `crates.io` |
@@ -316,6 +320,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `primal-check` | `0.3.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `proc-macro-crate` | `3.5.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `proc-macro2` | `1.0.107` | `MIT OR Apache-2.0` | `crates.io` |
+| `pxfm` | `0.1.30` | `BSD-3-Clause OR Apache-2.0` | `crates.io` |
 | `quick-xml` | `0.41.0` | `MIT` | `crates.io` |
 | `quote` | `1.0.47` | `MIT OR Apache-2.0` | `crates.io` |
 | `r-efi` | `5.3.0` | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | `crates.io` |
@@ -459,4 +464,6 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `zip` | `9.0.3` | `MIT` | `crates.io` |
 | `zlib-rs` | `0.6.8` | `Zlib` | `crates.io` |
 | `zopfli` | `0.8.4` | `Apache-2.0` | `crates.io` |
+| `zune-core` | `0.5.3` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
+| `zune-jpeg` | `0.5.15` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
 <!-- END CARGO LICENSE INVENTORY -->
