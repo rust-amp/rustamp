@@ -49,8 +49,9 @@ use rustamp_meta::replaygain::ReplayGainTags;
 use rustamp_output::NullClock;
 use rustamp_ui::{
     DialogManager, EqMenuRequest, EqualizerLayout, EqualizerWindow, Key, MainWindow,
-    MainWindowLayout, MainWindowState, Modifiers, PlaylistDialog, PlaylistWindow, ShortcutOutcome,
-    eq_frame_size, frame_size, render_equalizer_window, render_main_window, volume_percent,
+    MainWindowLayout, MainWindowState, Modifiers, PlaylistDialog, PlaylistWindow, ShortcutAction,
+    ShortcutOutcome, ShortcutWindow, eq_frame_size, frame_size, lookup, render_equalizer_window,
+    render_main_window, volume_percent,
 };
 
 use crate::cli::OutputChoice;
@@ -1592,14 +1593,32 @@ impl App {
             self.submit(command.clone())?;
             return Ok(Some(ShortcutOutcome::Commands(vec![command])));
         }
-        let outcome = self.ui.key_down(key, modifiers, self.now_ms());
-        if let Some(ShortcutOutcome::Commands(commands)) = &outcome {
-            let commands = commands.clone();
-            self.forward(&commands)?;
-        } else {
-            // `Handled` (for example the time-display toggle) may still have
-            // changed the render state, so refresh.
+        let Some(action) = lookup(ShortcutWindow::Main, key, modifiers) else {
             self.pump()?;
+            return Ok(None);
+        };
+        Ok(Some(self.dispatch_shared_shortcut(action)?))
+    }
+
+    /// Dispatches one shared shortcut action (S03 §1/§4) and forwards the
+    /// commands it produces.
+    ///
+    /// The playlist editor's table (S03 §2) shares most of its rows with the
+    /// main window's, so the shared rows are dispatched here — against the
+    /// same [`MainWindow`] machine — whichever window the key was pressed in.
+    /// The machine applies its S02 prediction first, then the commands go to
+    /// the engine and the app ([`App::forward`]).
+    pub(crate) fn dispatch_shared_shortcut(
+        &mut self,
+        action: ShortcutAction,
+    ) -> Result<ShortcutOutcome> {
+        let outcome = self.ui.dispatch_shortcut(action, self.now_ms());
+        match &outcome {
+            ShortcutOutcome::Commands(commands) => {
+                let commands = commands.clone();
+                self.forward(&commands)?;
+            }
+            ShortcutOutcome::Handled | ShortcutOutcome::Unhandled(_) => self.pump()?,
         }
         Ok(outcome)
     }
@@ -2025,9 +2044,7 @@ impl App {
             C::Sort(key) => self.sort_entries(*key),
             C::Randomize => self.randomize_entries(),
             C::MoveEntries { ids, to } => self.move_entries(ids, *to as usize),
-            C::Reverse => {
-                self.note("playlist reverse is not wired to the app yet (S14/S15)".to_string());
-            }
+            C::Reverse => self.reverse_entries(),
             C::OpenAbout
             | C::OpenFileInfo
             | C::OpenJump { .. }
@@ -2628,6 +2645,22 @@ impl App {
         self.engine.set_queue(Vec::new());
         self.engine.set_current_index(None);
         self.sync_playlist_entries();
+    }
+
+    /// Applies `Command::Reverse` (S03 §2 `40213`, "Reverse the list").
+    ///
+    /// One permutation of the row indices, handed to
+    /// [`App::reorder_entries`]: ids, selection and the current entry survive,
+    /// only the rows turn around. The list's order after the reversal is the
+    /// plain reverse of the order before it — the spec names the action, not
+    /// the resulting order, so this is the one reading of "reverse the list"
+    /// that needs no further choice.
+    fn reverse_entries(&mut self) {
+        if self.entry_ids.len() < 2 {
+            return;
+        }
+        let order: Vec<usize> = (0..self.entry_ids.len()).rev().collect();
+        self.reorder_entries(order);
     }
 
     /// Removes every entry whose local file no longer exists on disk

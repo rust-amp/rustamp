@@ -148,9 +148,10 @@ pub use menu::{
 };
 pub use playlist::{
     ADD_DIALOG_TITLE, BUTTON_BAND_BOTTOM, BUTTON_BAND_TOP, LIST_SELECT_POINT, LOAD_DIALOG_TITLE,
-    PAGE_STEP_ROWS, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog, PlaylistKeyAction,
-    PlaylistWindow, ScrollDirection, VISIBLE_ROWS, button_hit_range, has_window_menu_button,
-    hit_test_button, playlist_key_action,
+    PAGE_STEP_ROWS, PLAYLIST_TABLE, PLAYLIST_WINDOW_SIZE, PlaylistBinding, PlaylistButton,
+    PlaylistDialog, PlaylistKeyAction, PlaylistWindow, ScrollDirection,
+    UNIMPLEMENTED_PLAYLIST_ROWS, VISIBLE_ROWS, button_hit_range, has_window_menu_button,
+    hit_test_button, playlist_key_action, playlist_key_binding, unimplemented_playlist_row,
 };
 pub use playlist_window::{
     BOTTOM_BAR_RECT, BUTTON_SRC_Y, CLOSE_BUTTON_RECT, LIST_BOTTOM, LIST_LEFT, LIST_OPTS_SRC_X,
