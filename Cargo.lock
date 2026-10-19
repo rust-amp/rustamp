@@ -1660,6 +1660,8 @@ dependencies = [
  "rustamp-output",
  "rustamp-platform",
  "rustamp-playlist",
+ "rustamp-plughost",
+ "rustamp-plugin-abi",
  "rustamp-prefs",
  "rustamp-skin",
  "rustamp-ui",
@@ -1835,6 +1837,8 @@ name = "rustamp-prefs"
 version = "0.1.0"
 dependencies = [
  "rustamp-core",
+ "rustamp-plughost",
+ "rustamp-plugin-abi",
 ]
 
 [[package]]

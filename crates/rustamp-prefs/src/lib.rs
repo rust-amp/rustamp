@@ -35,6 +35,13 @@
 //! Skeleton (milestone M0). Codes against the frozen contracts in
 //! [`rustamp_core`]; see `docs/rfc/0001-core-contracts.md`.
 
+mod plugins;
+
+pub use plugins::{
+    APPROVALS_FILE, EnableRefused, MAX_PLUGIN_BYTES, PluginEntry, PluginScan, PluginStatus,
+    kind_name, scan, set_enabled,
+};
+
 use rustamp_core::command::{Command, PrefsPage};
 
 /// Every page the preferences dialog can show, in stable order.

@@ -150,6 +150,21 @@ pub enum Item {
         /// Placement.
         rect: Rect,
     },
+    /// The plug-ins of the page's kind, one row each ([`PluginRow`]).
+    PluginList {
+        /// Placement.
+        rect: Rect,
+    },
+    /// Switches the selected plug-in row on or off ([`PrefsAction::TogglePlugin`]).
+    PluginToggle {
+        /// Placement.
+        rect: Rect,
+    },
+    /// Reads the plug-in folder again ([`PrefsAction::RescanPlugins`]).
+    PluginRescan {
+        /// Placement.
+        rect: Rect,
+    },
 }
 
 /// Width and height of the page area.
@@ -167,6 +182,36 @@ fn note_page(group: &'static str, text: &'static str) -> Vec<Item> {
         },
     ]
 }
+
+/// The layout every plug-in page shares: the caption, a hint, the list and the
+/// two buttons under it.
+fn plugin_page(caption: &'static str, hint: &'static str) -> Vec<Item> {
+    let w = PAGE_SIZE.0;
+    vec![
+        Item::Group {
+            text: caption,
+            rect: rect(0, 0, w, PAGE_SIZE.1),
+        },
+        Item::Label {
+            text: hint,
+            rect: rect(12, 20, w - 24, 56),
+        },
+        Item::PluginList {
+            rect: rect(10, 80, w - 20, 158),
+        },
+        Item::PluginToggle {
+            rect: rect(10, 246, 150, 26),
+        },
+        Item::PluginRescan {
+            rect: rect(168, 246, w - 178, 26),
+        },
+    ]
+}
+
+/// Hint under every plug-in page's caption. The approval gate and the fact
+/// that nothing is loaded at startup yet are stated, not implied.
+const PLUGIN_HINT: &str = "Only approved plug-ins can be switched on. \
+    Your choice is saved, but the player does not load plug-ins at startup yet.";
 
 /// What `node`'s page contains.
 pub fn page_items(node: PrefsNode) -> Vec<Item> {
@@ -230,23 +275,11 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
         PrefsNode::PlugIns => {
             note_page("Plug-ins", "Choose a plug-in type in the list on the left.")
         }
-        PrefsNode::Input => note_page("Input plug-ins", "Input plug-ins are not configurable yet."),
-        PrefsNode::Output => note_page(
-            "Output plug-ins",
-            "The output device is chosen automatically.",
-        ),
-        PrefsNode::PlugInVisualization => note_page(
-            "Visualization plug-in",
-            "Visualization plug-ins are not configurable yet.",
-        ),
-        PrefsNode::DspEffect => note_page(
-            "DSP/Effect plug-ins",
-            "DSP/effect plug-ins are not configurable yet.",
-        ),
-        PrefsNode::GeneralPurpose => note_page(
-            "General purpose plug-ins",
-            "General purpose plug-ins are not configurable yet.",
-        ),
+        PrefsNode::Input => plugin_page("Input plug-ins", PLUGIN_HINT),
+        PrefsNode::Output => plugin_page("Output plug-ins", PLUGIN_HINT),
+        PrefsNode::PlugInVisualization => plugin_page("Visualization plug-ins", PLUGIN_HINT),
+        PrefsNode::DspEffect => plugin_page("DSP/Effect plug-ins", PLUGIN_HINT),
+        PrefsNode::GeneralPurpose => plugin_page("General purpose plug-ins", PLUGIN_HINT),
         PrefsNode::Skins => vec![
             Item::Group {
                 text: "Select skin",
@@ -258,6 +291,19 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
         ],
         PrefsNode::Bookmarks => note_page("Bookmarks", "Bookmarks are not available yet."),
     }
+}
+
+/// One row of a plug-in page's list, prepared by the player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRow {
+    /// The page whose list shows this row.
+    pub node: PrefsNode,
+    /// The player's id for the plug-in, echoed back in
+    /// [`PrefsAction::TogglePlugin`]. `None` for an information row (such as
+    /// "no plug-ins found"), which the toggle button ignores.
+    pub id: Option<usize>,
+    /// The row text.
+    pub text: String,
 }
 
 /// The settings the dialog shows, pushed in by the player.
@@ -277,9 +323,16 @@ pub struct PrefsSettings {
     pub skins: Vec<String>,
     /// The row of the skin in use.
     pub skin_selected: Option<usize>,
+    /// The rows of every plug-in page's list.
+    pub plugins: Vec<PluginRow>,
 }
 
 impl PrefsSettings {
+    /// The rows `node`'s list shows, in order.
+    pub fn plugin_rows(&self, node: PrefsNode) -> impl Iterator<Item = &PluginRow> {
+        self.plugins.iter().filter(move |row| row.node == node)
+    }
+
     /// The current value of `bind`.
     pub fn get(&self, bind: Bind) -> bool {
         match bind {
@@ -299,6 +352,11 @@ pub enum PrefsAction {
     Set(Bind, bool),
     /// A skin row was chosen.
     LoadSkin(usize),
+    /// The toggle button was pressed with this plug-in selected
+    /// ([`PluginRow::id`]).
+    TogglePlugin(usize),
+    /// The plug-in folder should be read again.
+    RescanPlugins,
 }
 
 /// Why the dialog could not be opened.
@@ -336,11 +394,12 @@ mod win32 {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         BM_GETCHECK, BM_SETCHECK, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-        HMENU, IDC_ARROW, IsWindow, LB_ADDSTRING, LB_GETCURSEL, LB_SETCURSEL, LoadCursorW,
-        NONCLIENTMETRICSW, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW, SendMessageW,
-        SetForegroundWindow, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY,
-        WM_NOTIFY, WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_SYSMENU,
-        WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        HMENU, IDC_ARROW, IsWindow, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
+        LB_SETHORIZONTALEXTENT, LoadCursorW, NONCLIENTMETRICSW, RegisterClassExW,
+        SPI_GETNONCLIENTMETRICS, SW_SHOW, SendMessageW, SetForegroundWindow, ShowWindow,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WM_NOTIFY, WM_SETFONT, WNDCLASSEXW,
+        WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_HSCROLL, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+        WS_VSCROLL,
     };
     use windows::core::{PCWSTR, PWSTR};
 
@@ -354,6 +413,11 @@ mod win32 {
     const FIRST_PAGE_ID: u16 = 100;
     const ID_TREE: u16 = 50;
     const ID_SKINS: u16 = 60;
+    const ID_PLUGINS: u16 = 61;
+    const ID_PLUGIN_TOGGLE: u16 = 62;
+    const ID_PLUGIN_RESCAN: u16 = 63;
+    /// Scrollable width (unscaled pixels) of a plug-in row.
+    const PLUGIN_ROW_EXTENT: i32 = 900;
 
     /// Layout of the frame in unscaled pixels (client area).
     const CLIENT: (i32, i32) = (440, 300);
@@ -389,6 +453,11 @@ mod win32 {
         page: Vec<HWND>,
         checks: Vec<(HWND, u16, Bind)>,
         skin_list: Option<HWND>,
+        /// The plug-in list of the current page, the player's id behind each
+        /// of its rows and the row texts it shows.
+        plugin_list: Option<HWND>,
+        plugin_ids: Vec<Option<usize>>,
+        plugin_texts: Vec<String>,
         actions: Vec<PrefsAction>,
         /// Tree item handles, indexed like [`TREE`].
         items: Vec<isize>,
@@ -518,6 +587,9 @@ mod win32 {
                     page: Vec::new(),
                     checks: Vec::new(),
                     skin_list: None,
+                    plugin_list: None,
+                    plugin_ids: Vec::new(),
+                    plugin_texts: Vec::new(),
                     actions: Vec::new(),
                     items,
                     quiet: false,
@@ -593,14 +665,23 @@ mod win32 {
 
         /// Pushes the player's current settings into the open controls.
         pub fn set_settings(&self, settings: &PrefsSettings) {
-            let Ok(controls) = STATE.with(|state| {
+            let Ok((checks, skin_list, plugin_list, node)) = STATE.with(|state| {
                 let mut guard = state.try_borrow_mut().map_err(|_| ())?;
                 let inner = guard.as_mut().ok_or(())?;
                 inner.settings = settings.clone();
-                Ok::<_, ()>((inner.checks.clone(), inner.skin_list))
+                Ok::<_, ()>((
+                    inner.checks.clone(),
+                    inner.skin_list,
+                    inner.plugin_list,
+                    inner.node,
+                ))
             }) else {
                 return;
             };
+            let controls = (checks, skin_list);
+            if let Some(list) = plugin_list {
+                refresh_plugin_list(list, node, settings);
+            }
             for (control, _, bind) in controls.0 {
                 set_check(control, settings.get(bind));
             }
@@ -786,6 +867,9 @@ mod win32 {
                     g.as_mut().map(|i| {
                         i.checks.clear();
                         i.skin_list = None;
+                        i.plugin_list = None;
+                        i.plugin_ids.clear();
+                        i.plugin_texts.clear();
                         std::mem::take(&mut i.page)
                     })
                 })
@@ -799,6 +883,7 @@ mod win32 {
         let mut page = Vec::new();
         let mut checks = Vec::new();
         let mut skin_list = None;
+        let mut plugin_list = None;
         for (next_id, item) in (FIRST_PAGE_ID..).zip(page_items(node)) {
             match item {
                 Item::Group { text, rect } => {
@@ -882,6 +967,69 @@ mod win32 {
                         skin_list = Some(c);
                     }
                 }
+                Item::PluginList { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("LISTBOX"),
+                        "",
+                        WS_CHILD.0
+                            | WS_VISIBLE.0
+                            | WS_TABSTOP.0
+                            | WS_VSCROLL.0
+                            | WS_HSCROLL.0
+                            | LBS_NOTIFY,
+                        WS_EX_CLIENTEDGE.0,
+                        shift(rect),
+                        ID_PLUGINS,
+                        dpi,
+                        font,
+                    ) {
+                        // Rows carry a file name, the approval verdict and
+                        // possibly a refusal reason: let the list scroll
+                        // sideways instead of cutting them off.
+                        // SAFETY: sizing the scroll range of our own list box.
+                        unsafe {
+                            SendMessageW(
+                                c,
+                                LB_SETHORIZONTALEXTENT,
+                                Some(WPARAM(scale(PLUGIN_ROW_EXTENT, dpi) as usize)),
+                                Some(LPARAM(0)),
+                            );
+                        }
+                        page.push(c);
+                        plugin_list = Some(c);
+                    }
+                }
+                Item::PluginToggle { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Switch on / off",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_PLUGIN_TOGGLE,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
+                Item::PluginRescan { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Rescan",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_PLUGIN_RESCAN,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
             }
         }
         STATE.with(|state| {
@@ -891,6 +1039,59 @@ mod win32 {
                 inner.page = page;
                 inner.checks = checks;
                 inner.skin_list = skin_list;
+                inner.plugin_list = plugin_list;
+            }
+        });
+        if let Some(list) = plugin_list {
+            refresh_plugin_list(list, node, settings);
+        }
+    }
+
+    /// Makes the plug-in list show `settings`' rows for `node`, keeping the
+    /// selected row. Does nothing when the list already shows exactly them, so
+    /// the per-tick settings push does not flicker the list.
+    fn refresh_plugin_list(list: HWND, node: PrefsNode, settings: &PrefsSettings) {
+        let (ids, texts): (Vec<Option<usize>>, Vec<String>) = settings
+            .plugin_rows(node)
+            .map(|row| (row.id, row.text.clone()))
+            .unzip();
+        let unchanged = STATE.with(|state| {
+            state.try_borrow().ok().is_some_and(|g| {
+                g.as_ref()
+                    .is_some_and(|i| i.plugin_ids == ids && i.plugin_texts == texts)
+            })
+        });
+        if unchanged {
+            return;
+        }
+        // SAFETY: querying and refilling our own list box.
+        unsafe {
+            let selected = SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
+            SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+            for text in &texts {
+                let wide_text = wide(text);
+                SendMessageW(
+                    list,
+                    LB_ADDSTRING,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(wide_text.as_ptr() as isize)),
+                );
+            }
+            if selected >= 0 && (selected as usize) < texts.len() {
+                SendMessageW(
+                    list,
+                    LB_SETCURSEL,
+                    Some(WPARAM(selected as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+        }
+        STATE.with(|state| {
+            if let Ok(mut guard) = state.try_borrow_mut()
+                && let Some(inner) = guard.as_mut()
+            {
+                inner.plugin_ids = ids;
+                inner.plugin_texts = texts;
             }
         });
     }
@@ -922,6 +1123,31 @@ mod win32 {
                 if id == ID_CLOSE && code == BN_CLICKED {
                     // SAFETY: closes our own window.
                     let _ = unsafe { DestroyWindow(hwnd) };
+                    return LRESULT(0);
+                }
+                if id == ID_PLUGIN_RESCAN && code == BN_CLICKED {
+                    push_action(PrefsAction::RescanPlugins);
+                    return LRESULT(0);
+                }
+                if id == ID_PLUGIN_TOGGLE && code == BN_CLICKED {
+                    // The id behind the selected row; an information row or no
+                    // selection toggles nothing.
+                    let picked = STATE.with(|state| {
+                        let guard = state.try_borrow().ok()?;
+                        let inner = guard.as_ref()?;
+                        let list = inner.plugin_list?;
+                        // SAFETY: querying our own list box.
+                        let row = unsafe {
+                            SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)))
+                        }
+                        .0;
+                        usize::try_from(row)
+                            .ok()
+                            .and_then(|row| inner.plugin_ids.get(row).copied().flatten())
+                    });
+                    if let Some(plugin) = picked {
+                        push_action(PrefsAction::TogglePlugin(plugin));
+                    }
                     return LRESULT(0);
                 }
                 if id == ID_SKINS && code == LBN_SELCHANGE {
@@ -1071,7 +1297,10 @@ mod tests {
                     Item::Group { rect, .. }
                     | Item::Label { rect, .. }
                     | Item::Check { rect, .. }
-                    | Item::SkinList { rect } => rect,
+                    | Item::SkinList { rect }
+                    | Item::PluginList { rect }
+                    | Item::PluginToggle { rect }
+                    | Item::PluginRescan { rect } => rect,
                 };
                 assert!(r.x >= 0 && r.y >= 0, "{:?}: {r:?}", entry.node);
                 assert!(r.x + r.w <= PAGE_SIZE.0, "{:?}: {r:?}", entry.node);
@@ -1100,6 +1329,65 @@ mod tests {
         ] {
             assert!(seen.contains(&bind), "{bind:?} has no control");
         }
+    }
+
+    #[test]
+    fn every_plugin_page_has_a_list_a_toggle_and_a_rescan_button() {
+        for node in [
+            PrefsNode::Input,
+            PrefsNode::Output,
+            PrefsNode::PlugInVisualization,
+            PrefsNode::DspEffect,
+            PrefsNode::GeneralPurpose,
+        ] {
+            let items = page_items(node);
+            let count = |f: fn(&Item) -> bool| items.iter().filter(|i| f(i)).count();
+            assert_eq!(
+                count(|i| matches!(i, Item::PluginList { .. })),
+                1,
+                "{node:?}"
+            );
+            assert_eq!(
+                count(|i| matches!(i, Item::PluginToggle { .. })),
+                1,
+                "{node:?}"
+            );
+            assert_eq!(
+                count(|i| matches!(i, Item::PluginRescan { .. })),
+                1,
+                "{node:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plugin_hint_states_the_approval_gate_and_that_nothing_loads_yet() {
+        let hint = PLUGIN_HINT;
+        assert!(hint.contains("approved"), "{hint}");
+        assert!(hint.contains("does not load plug-ins"), "{hint}");
+    }
+
+    #[test]
+    fn plugin_rows_are_filtered_by_page_in_order() {
+        let row = |node, id, text: &str| PluginRow {
+            node,
+            id,
+            text: text.to_string(),
+        };
+        let settings = PrefsSettings {
+            plugins: vec![
+                row(PrefsNode::Input, Some(0), "in_a"),
+                row(PrefsNode::GeneralPurpose, Some(1), "gen_a"),
+                row(PrefsNode::Input, None, "note"),
+            ],
+            ..PrefsSettings::default()
+        };
+        let input: Vec<_> = settings
+            .plugin_rows(PrefsNode::Input)
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(input, ["in_a", "note"]);
+        assert_eq!(settings.plugin_rows(PrefsNode::DspEffect).count(), 0);
     }
 
     #[test]

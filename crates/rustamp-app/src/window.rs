@@ -1005,6 +1005,8 @@ impl Windowed {
                         window.raise();
                     }
                     _ => {
+                        // Fresh folder and approval list each time it opens.
+                        self.app.rescan_plugins();
                         let settings = self.app.prefs_settings();
                         match PrefsWindow::open(self.raw_main_window(), node, &settings) {
                             Ok(window) => self.prefs_window = Some(window),

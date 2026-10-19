@@ -169,10 +169,10 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
     if let Some(plugins) = table.get("plugins").and_then(toml::Value::as_table) {
         for key in plugins.keys() {
             let reason = match key.as_str() {
-                "plugin_dir" => Some("plugin directory is not configurable"),
+                // The plug-in pages edit and save these two.
+                "plugin_dir" | "disabled" => None,
                 "vis_plugin" => Some("visualization plugin loading is not supported yet"),
                 "vis_preset" => Some("visualization preset is not supported yet"),
-                "disabled" => Some("disabling plugins via config is not supported yet"),
                 _ => Some("unrecognized plugins setting"),
             };
             if let Some(r) = reason {
@@ -324,10 +324,37 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
     eq.insert("state".into(), eq_state);
     root.insert("eq".into(), toml::Value::Table(eq));
 
+    // The plug-in pages edit the plug-in folder and the off-list, so those two
+    // are persisted (and only when set, to keep a default file small).
+    let mut plugins = toml::Table::new();
+    if let Some(dir) = &config.plugins.plugin_dir {
+        plugins.insert(
+            "plugin_dir".into(),
+            toml::Value::String(dir.to_string_lossy().into_owned()),
+        );
+    }
+    if !config.plugins.disabled.is_empty() {
+        plugins.insert(
+            "disabled".into(),
+            toml::Value::Array(
+                config
+                    .plugins
+                    .disabled
+                    .iter()
+                    .cloned()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !plugins.is_empty() {
+        root.insert("plugins".into(), toml::Value::Table(plugins));
+    }
+
     // Note on deliberately unpersisted sections:
-    // playlist (shuffle, repeat, manual_advance, last_playlist) and plugins
-    // (plugin_dir, vis_plugin, vis_preset, disabled) are deliberately not persisted
-    // because none of their features are honoured by the player yet (task card N6).
+    // playlist (shuffle, repeat, manual_advance, last_playlist) and the
+    // plugins' vis_plugin / vis_preset are deliberately not persisted because
+    // none of those features are honoured by the player yet (task card N6).
 
     toml::to_string_pretty(&toml::Value::Table(root)).map_err(|e| ConfigError::Write {
         path: PathBuf::from("<serialize>"),
@@ -616,7 +643,15 @@ mod tests {
             Config::default().ui.snap_distance
         );
         assert_eq!(loaded.config.playlist, Config::default().playlist);
-        assert_eq!(loaded.config.plugins, Config::default().plugins);
+        // The plug-in pages' two settings survive; the vis ones do not.
+        assert_eq!(
+            loaded.config.plugins.plugin_dir,
+            Some(PathBuf::from("plugins"))
+        );
+        assert_eq!(loaded.config.plugins.disabled, vec!["bad.dll".to_string()]);
+        assert_eq!(loaded.config.plugins.vis_plugin, None);
+        assert_eq!(loaded.config.plugins.vis_preset, None);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
     }
 
     #[test]
@@ -640,10 +675,8 @@ mod tests {
             "snap_distance",
             "manual_advance",
             "last_playlist",
-            "plugin_dir",
             "vis_plugin",
             "vis_preset",
-            "disabled",
             "shuffle",
             "repeat",
         ];

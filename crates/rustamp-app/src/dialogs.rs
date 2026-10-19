@@ -58,7 +58,8 @@ use std::path::PathBuf;
 
 use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
 use rustamp_gfx::Image;
-use rustamp_platform::{Bind, PrefsAction, PrefsNode, PrefsSettings};
+use rustamp_platform::{Bind, PluginRow, PrefsAction, PrefsNode, PrefsSettings};
+use rustamp_plugin_abi::PluginKind;
 use rustamp_prefs::page_name;
 use rustamp_ui::{DialogKind, Key, SkinEntry, dialog_for_command, render_dialog, skin_entries};
 
@@ -289,7 +290,50 @@ impl App {
             repeat: self.state().repeat,
             skins: entries.into_iter().map(|entry| entry.name).collect(),
             skin_selected,
+            plugins: self.plugin_rows(),
         }
+    }
+
+    /// The rows of every plug-in page's list, from the last scan. Each page
+    /// lists its own kind; a page with nothing to list, and any problem with
+    /// the folder or the approval store, gets an information row (`id: None`)
+    /// instead of an empty list that looks like a working one.
+    fn plugin_rows(&self) -> Vec<PluginRow> {
+        let scan = self.plugin_scan();
+        let config = self.plugins_config();
+        let mut rows = Vec::new();
+        for node in PLUGIN_NODES {
+            let info = |text: String| PluginRow {
+                node,
+                id: None,
+                text,
+            };
+            if let Some(problem) = &scan.dir_problem {
+                rows.push(info(format!("Plug-in folder unreadable: {problem}")));
+            }
+            if let Some(problem) = &scan.store_problem {
+                rows.push(info(format!(
+                    "Approval list unusable, nothing is approved: {problem}"
+                )));
+            }
+            let before = rows.len();
+            for (index, entry) in scan.entries.iter().enumerate() {
+                if plugin_node_for(entry.kind) == node {
+                    rows.push(PluginRow {
+                        node,
+                        id: Some(index),
+                        text: entry.row_text(config),
+                    });
+                }
+            }
+            if rows.len() == before {
+                rows.push(info(format!(
+                    "No plug-ins of this type in {}",
+                    scan.dir.display()
+                )));
+            }
+        }
+        rows
     }
 
     /// Applies something the user did in the native preferences dialog, through
@@ -326,6 +370,23 @@ impl App {
                     None => self.load_builtin_skin(),
                 }
             }
+            PrefsAction::TogglePlugin(index) => {
+                let Some(entry) = self.plugin_scan().entries.get(index) else {
+                    return;
+                };
+                let on = !entry.is_enabled(self.plugins_config());
+                match self.set_plugin_enabled(index, on) {
+                    // Saved at once: the player does not load plug-ins yet,
+                    // so the choice must not wait for a clean exit to count.
+                    Ok(()) => {
+                        if let Err(error) = self.save_config() {
+                            self.note(format!("preferences: {error}"));
+                        }
+                    }
+                    Err(refused) => self.note(format!("preferences: {refused}")),
+                }
+            }
+            PrefsAction::RescanPlugins => self.rescan_plugins(),
         }
     }
 
@@ -507,6 +568,26 @@ impl App {
             None => format!("{} ms", state.position_ms),
         };
         vec![track, stream, position]
+    }
+}
+
+/// The five plug-in pages of the native preferences dialog.
+const PLUGIN_NODES: [PrefsNode; 5] = [
+    PrefsNode::Input,
+    PrefsNode::Output,
+    PrefsNode::PlugInVisualization,
+    PrefsNode::DspEffect,
+    PrefsNode::GeneralPurpose,
+];
+
+/// The plug-in page that lists plug-ins of `kind`.
+fn plugin_node_for(kind: PluginKind) -> PrefsNode {
+    match kind {
+        PluginKind::Input => PrefsNode::Input,
+        PluginKind::Output => PrefsNode::Output,
+        PluginKind::Visualization => PrefsNode::PlugInVisualization,
+        PluginKind::Dsp => PrefsNode::DspEffect,
+        PluginKind::General => PrefsNode::GeneralPurpose,
     }
 }
 

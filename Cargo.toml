@@ -52,6 +52,7 @@ rustamp-ui = { path = "crates/rustamp-ui" }
 rustamp-vis = { path = "crates/rustamp-vis" }
 rustamp-milkdrop = { path = "crates/rustamp-milkdrop" }
 rustamp-plugin-abi = { path = "crates/rustamp-plugin-abi" }
+rustamp-plughost = { path = "crates/rustamp-plughost" }
 rustamp-ipc = { path = "crates/rustamp-ipc" }
 rustamp-mediahost = { path = "crates/rustamp-mediahost" }
 rustamp-platform = { path = "crates/rustamp-platform" }

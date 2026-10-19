@@ -166,10 +166,8 @@ fn an_ignored_field_is_not_advertised() {
         "repeat",
         "manual_advance",
         "last_playlist",
-        "plugin_dir",
         "vis_plugin",
         "vis_preset",
-        "disabled",
     ];
 
     for name in ignored_names {
