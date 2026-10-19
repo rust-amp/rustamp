@@ -533,6 +533,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edf234dd1594d6dd434a8fb8cada51ddbbc593e40e4a01556a0b31c62da2775b"
 
 [[package]]
+name = "embed-manifest"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba92c8f4591bf29f89716b45e5f5f56577adbb81426e5620c6e994da7c88bb7a"
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1641,6 +1647,7 @@ name = "rustamp-app"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "embed-manifest",
  "rustamp-audio",
  "rustamp-core",
  "rustamp-decoders",

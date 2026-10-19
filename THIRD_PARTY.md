@@ -114,6 +114,7 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `lofty` | Audio tags and metadata | meta |
 | `winit` | Window/event-loop integration | app, ui |
 | `softbuffer` | CPU-rendered window presentation | app, ui |
+| `embed-manifest` | Build-time: embeds the Windows application manifest (Common Controls 6 for the native preferences dialog) | app (build script) |
 | `symphonia` | Audio decoding/demuxing | decoders; MPL-2.0, not permissive |
 | `hound` | WAV test fixtures | decoders (dev) |
 
@@ -202,6 +203,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `drm-fourcc` | `2.2.0` | `MIT` | `crates.io` |
 | `drm-sys` | `0.8.1` | `MIT` | `crates.io` |
 | `dtor` | `0.8.1` | `Apache-2.0 OR MIT` | `crates.io` |
+| `embed-manifest` | `1.5.1` | `MIT` | `crates.io` |
 | `embedded-io` | `0.4.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `embedded-io` | `0.6.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `encoding_rs` | `0.8.42` | `(Apache-2.0 OR MIT) AND BSD-3-Clause` | `crates.io` |

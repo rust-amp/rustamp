@@ -22,6 +22,7 @@ pub mod dpi;
 pub mod file_dialog;
 pub mod hotkeys;
 pub mod popup_menu;
+pub mod prefs_dialog;
 pub mod single_instance;
 pub mod tray;
 
@@ -38,6 +39,11 @@ pub use hotkeys::{
 #[cfg(windows)]
 pub use hotkeys::{Win32HotkeyBackend, Win32HotkeyError};
 pub use popup_menu::{PopupMenuError, PopupRow, item_text, show_popup_menu};
+#[cfg(windows)]
+pub use prefs_dialog::PrefsWindow;
+pub use prefs_dialog::{
+    Bind, PrefsAction, PrefsError, PrefsNode, PrefsSettings, TREE as PREFS_TREE,
+};
 pub use single_instance::{
     Claim, ForwardRequest, HandOff, Instance, LockState, StartupAction, claim, forward,
     instance_key, startup_action, take_pending,

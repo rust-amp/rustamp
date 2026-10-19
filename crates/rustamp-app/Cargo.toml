@@ -42,3 +42,6 @@ tempfile.workspace = true
 # Capture side of the VM-only loopback test (`tests/loopback.rs`); already a
 # workspace dependency through `rustamp-output`, so nothing new is fetched.
 cpal.workspace = true
+
+[build-dependencies]
+embed-manifest = "1.5.1"

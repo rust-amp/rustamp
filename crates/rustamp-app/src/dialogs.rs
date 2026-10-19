@@ -58,6 +58,7 @@ use std::path::PathBuf;
 
 use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
 use rustamp_gfx::Image;
+use rustamp_platform::{Bind, PrefsAction, PrefsNode, PrefsSettings};
 use rustamp_prefs::page_name;
 use rustamp_ui::{DialogKind, Key, SkinEntry, dialog_for_command, render_dialog, skin_entries};
 
@@ -273,6 +274,61 @@ impl App {
         self.dialogs.jump_text()
     }
 
+    /// The settings the native preferences dialog shows, from live app state.
+    pub fn prefs_settings(&self) -> PrefsSettings {
+        let entries = self.browser_entries();
+        let current = self.current_skin();
+        let skin_selected = entries
+            .iter()
+            .position(|entry| entry.path.as_ref() == current);
+        PrefsSettings {
+            always_on_top: self.always_on_top(),
+            easy_move: self.easy_move(),
+            double_size: self.state().double_size,
+            shuffle: self.state().shuffle,
+            repeat: self.state().repeat,
+            skins: entries.into_iter().map(|entry| entry.name).collect(),
+            skin_selected,
+        }
+    }
+
+    /// Applies something the user did in the native preferences dialog, through
+    /// the same commands the menu and the keys use. A control already at the
+    /// requested value changes nothing.
+    pub fn apply_prefs_action(&mut self, action: PrefsAction) {
+        match action {
+            PrefsAction::Set(bind, on) => {
+                let current = self.prefs_settings().get(bind);
+                if current == on {
+                    return;
+                }
+                let command = match bind {
+                    Bind::AlwaysOnTop => Command::ToggleAlwaysOnTop,
+                    Bind::EasyMove => Command::ToggleEasyMove,
+                    Bind::DoubleSize => Command::ToggleDoubleSize,
+                    Bind::Shuffle => Command::SetShuffle(on),
+                    Bind::Repeat => Command::SetRepeat(on),
+                };
+                if let Err(error) = self.submit(command) {
+                    self.note(format!("preferences: {error}"));
+                }
+            }
+            PrefsAction::LoadSkin(row) => {
+                let Some(entry) = self.browser_entries().into_iter().nth(row) else {
+                    return;
+                };
+                match entry.path {
+                    Some(path) => {
+                        if let Err(error) = self.submit(Command::LoadSkin(path)) {
+                            self.note(format!("preferences: {error}"));
+                        }
+                    }
+                    None => self.load_builtin_skin(),
+                }
+            }
+        }
+    }
+
     /// Renders one frame of `dialog`.
     pub fn render_dialog(&self, dialog: DialogKind) -> Image {
         let body = self.dialog_body(dialog);
@@ -454,6 +510,14 @@ impl App {
     }
 }
 
+/// The page of the native preferences dialog that opens for `page`.
+pub fn prefs_node_for(page: PrefsPage) -> PrefsNode {
+    match page {
+        PrefsPage::VisPlugin => PrefsNode::PlugInVisualization,
+        PrefsPage::VisOptions => PrefsNode::OptionsVisualization,
+    }
+}
+
 /// The open-media file faces' last line: how to reach a file. Own wording
 /// (the reference dialog is an OS picker whose labels are unmeasured, S04
 /// open); paste is not offered because there is no clipboard binding.
@@ -488,6 +552,18 @@ pub use rustamp_ui::DialogManager as Dialogs;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_two_measured_pages_open_their_native_pages() {
+        assert_eq!(
+            prefs_node_for(PrefsPage::VisPlugin),
+            PrefsNode::PlugInVisualization
+        );
+        assert_eq!(
+            prefs_node_for(PrefsPage::VisOptions),
+            PrefsNode::OptionsVisualization
+        );
+    }
 
     #[test]
     fn a_long_path_shows_its_tail() {

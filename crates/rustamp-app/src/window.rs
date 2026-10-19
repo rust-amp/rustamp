@@ -73,7 +73,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustamp_core::command::{Command, OpenMediaKind};
+use rustamp_core::command::{Command, OpenMediaKind, PrefsPage};
 use rustamp_core::state::WindowId as CoreWindowId;
 use rustamp_platform::{HotkeyAction, init_dpi_awareness, single_instance, take_pending_hotkeys};
 use rustamp_ui::shell::TaskbarRole;
@@ -148,6 +148,9 @@ enum DialogRoute {
     /// allowed; `play` is the requesting command's flag, carried through to
     /// the [`Command::AddItems`] the choice produces.
     NativeFilePicker { play: bool },
+    /// The preferences dialog: a real Windows dialog (tree of pages, group
+    /// boxes, check boxes) opened on `page`.
+    NativePreferences { page: PrefsPage },
     /// A window of ours, painted from the dialog model.
     OwnWindow,
 }
@@ -159,7 +162,7 @@ impl DialogRoute {
     /// has a file-open dialog for exactly that, and asking the user to type a
     /// path into a window of ours instead is the defect. A directory pick and
     /// a location/URL entry are not file-open dialogs, and everything else
-    /// (About, file info, jump, preferences, the skin browser, load playlist)
+    /// (About, file info, jump, the skin browser, load playlist)
     /// is the player's own face with no OS equivalent.
     fn for_dialog(kind: DialogKind) -> Self {
         match kind {
@@ -167,6 +170,7 @@ impl DialogRoute {
                 kind: OpenMediaKind::Files,
                 play,
             } => DialogRoute::NativeFilePicker { play },
+            DialogKind::Preferences(page) => DialogRoute::NativePreferences { page },
             _ => DialogRoute::OwnWindow,
         }
     }
@@ -380,6 +384,12 @@ struct Windowed {
     /// popup follows. The request is recorded here and drained once per tick
     /// in [`Windowed::drain_media_pick`].
     pending_media_pick: Option<(DialogKind, bool)>,
+    /// The preferences page the app asked for, opened from the tick for the
+    /// same reason as the file pick (never from inside a window procedure).
+    pending_prefs: Option<PrefsPage>,
+    /// The native preferences dialog while it is open.
+    #[cfg(windows)]
+    prefs_window: Option<rustamp_platform::PrefsWindow>,
     cursor: (i32, i32),
     eq_cursor: (i32, i32),
     left_down: bool,
@@ -426,6 +436,9 @@ impl Windowed {
             dialog_id: None,
             dialog_kind: None,
             pending_media_pick: None,
+            pending_prefs: None,
+            #[cfg(windows)]
+            prefs_window: None,
             cursor: (0, 0),
             eq_cursor: (0, 0),
             left_down: false,
@@ -941,6 +954,51 @@ impl Windowed {
         }
     }
 
+    /// Opens (or raises) the native preferences dialog, then relays what the
+    /// user did in it. The dialog is modeless: it lives on this thread's
+    /// message loop, so the tick only has to feed it the player's settings and
+    /// take its actions back.
+    fn drain_prefs(&mut self) {
+        #[cfg(windows)]
+        {
+            use rustamp_platform::PrefsWindow;
+
+            if let Some(page) = self.pending_prefs.take() {
+                let node = crate::dialogs::prefs_node_for(page);
+                match self.prefs_window {
+                    Some(window) if window.is_open() => {
+                        window.show_page(node);
+                        window.raise();
+                    }
+                    _ => {
+                        let settings = self.app.prefs_settings();
+                        match PrefsWindow::open(self.raw_main_window(), node, &settings) {
+                            Ok(window) => self.prefs_window = Some(window),
+                            Err(error) => eprintln!("rustamp: no preferences dialog: {error}"),
+                        }
+                    }
+                }
+            }
+            let Some(window) = self.prefs_window else {
+                return;
+            };
+            if !window.is_open() {
+                self.prefs_window = None;
+                return;
+            }
+            for action in window.take_actions() {
+                self.app.apply_prefs_action(action);
+            }
+            window.set_settings(&self.app.prefs_settings());
+        }
+        #[cfg(not(windows))]
+        {
+            if self.pending_prefs.take().is_some() {
+                eprintln!("rustamp: a native preferences dialog is only implemented on Windows");
+            }
+        }
+    }
+
     /// The main window's raw OS handle, or `0` when it has none yet.
     ///
     /// The one reader for the places that need the window itself rather than
@@ -1029,6 +1087,11 @@ impl Windowed {
         if let DialogRoute::NativeFilePicker { play } = DialogRoute::for_dialog(kind) {
             self.app.close_dialog(kind);
             self.pending_media_pick = Some((kind, play));
+            return;
+        }
+        if let DialogRoute::NativePreferences { page } = DialogRoute::for_dialog(kind) {
+            self.app.close_dialog(kind);
+            self.pending_prefs = Some(page);
             return;
         }
         let (width, height) = kind.client_size();
@@ -1779,6 +1842,7 @@ impl ApplicationHandler for Windowed {
         // these run their own modal message loop.
         self.drain_main_menu();
         self.drain_media_pick();
+        self.drain_prefs();
         // After every window has been synced, so a focus request for a window
         // that opened this frame finds its OS window.
         self.apply_focus_requests();
@@ -2232,6 +2296,13 @@ mod tests {
                 DialogRoute::for_dialog(kind),
                 DialogRoute::OwnWindow,
                 "{kind:?} has no OS dialog and keeps its own window"
+            );
+        }
+        for page in [PrefsPage::VisPlugin, PrefsPage::VisOptions] {
+            assert_eq!(
+                DialogRoute::for_dialog(DialogKind::Preferences(page)),
+                DialogRoute::NativePreferences { page },
+                "preferences is a real Windows dialog"
             );
         }
     }
