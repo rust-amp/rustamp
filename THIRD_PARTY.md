@@ -98,7 +98,7 @@ replacement for license texts, source-offer obligations or an artifact review.
 
 | Direct dependency | Purpose | Direct workspace consumers (including dev dependencies) |
 |---|---|---|
-| `thiserror` | Error definitions | core, gfx, ipc, mediahost, platform, skin, ui |
+| `thiserror` | Error definitions | core, gfx, ipc, mediahost, output, platform, skin, ui |
 | `serde` | Serializable state and wire types | app, core, ipc, plugin-abi, proto |
 | `postcard` | Wire serialization | ipc; proto (dev) |
 | `crossbeam-channel` | Cross-thread channels | core, ipc |

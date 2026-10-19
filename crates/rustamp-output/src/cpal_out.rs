@@ -21,10 +21,10 @@
 //!   format, which keeps the render callback out of a lock.
 //! * Device: the host's default output device, or — with
 //!   [`CpalOutput::with_device_name`] — the one output device whose name
-//!   contains the given text. A named device that is absent or ambiguous fails
-//!   `open`, naming the wanted device and listing the devices that exist; it
-//!   never falls back to the default device. A default device that is absent
-//!   fails the same way.
+//!   matches the given text (the rule of [`crate::selection::matches`]). A
+//!   named device that is absent or ambiguous fails `open`, naming the wanted
+//!   device and listing the devices that exist; it never falls back to the
+//!   default device. A default device that is absent fails the same way.
 //! * The stream's error callback latches a failure flag; `close` reports it
 //!   naming the device and [`CpalOutput::has_failed`] exposes it earlier. The
 //!   engine observes the same flag through [`OutputDevice::stream_error`],
@@ -88,7 +88,11 @@ impl CpalOutput {
     }
 
     /// Not opened yet; [`OutputDevice::open`] opens the one output device
-    /// whose name contains `name` (case-insensitive), never the default one.
+    /// whose name matches `name`, never the default one.
+    ///
+    /// The match is the rule of [`crate::selection::matches`]: the name is
+    /// trimmed and compared case-insensitively, and the device's name must
+    /// *contain* it ("Speakers" matches "Speakers (Realtek)").
     ///
     /// `open` fails, naming the wanted device and listing the available
     /// ones, when no output device or more than one matches.
@@ -181,18 +185,18 @@ fn no_default_device_message(names: &[String]) -> String {
     }
 }
 
-/// The one output device of `host` whose name contains `wanted`
-/// (case-insensitive).
+/// The one output device of `host` whose name matches `wanted` (the rule of
+/// [`crate::selection::matches`]: trimmed, case-insensitive, contained in the
+/// device's name).
 fn find_output_device(host: &cpal::Host, wanted: &str) -> Result<cpal::Device> {
     let devices = host
         .output_devices()
         .map_err(|e| Error::Output(format!("cpal: listing output devices: {e}")))?;
-    let needle = wanted.to_lowercase();
     let mut names = Vec::new();
     let mut found = Vec::new();
     for device in devices {
         let name = device_name(&device);
-        if name.to_lowercase().contains(&needle) {
+        if crate::selection::matches(wanted, &name) {
             found.push(device);
         }
         names.push(name);

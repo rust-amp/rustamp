@@ -233,7 +233,7 @@ fn open_failure_message(target: &str, cause: &str, alternatives: &[String]) -> S
 
 /// Friendly names of the render endpoints currently present (best effort; a
 /// failing enumeration yields an empty list, never an error).
-fn render_endpoint_names(enumerator: &DeviceEnumerator) -> Vec<String> {
+pub(crate) fn endpoint_names(enumerator: &DeviceEnumerator) -> Vec<String> {
     let Ok(collection) = enumerator.get_device_collection(&Direction::Render) else {
         return Vec::new();
     };
@@ -251,16 +251,13 @@ fn named_open_error(enumerator: &DeviceEnumerator, code: u8, name: &str, cause: 
     OpenError {
         code,
         device_name: name.to_owned(),
-        message: open_failure_message(
-            &format!("\"{name}\""),
-            cause,
-            &render_endpoint_names(enumerator),
-        ),
+        message: open_failure_message(&format!("\"{name}\""), cause, &endpoint_names(enumerator)),
     }
 }
 
-/// The one render endpoint whose friendly name contains `wanted`
-/// (case-insensitive), mirroring [`crate::CpalOutput::with_device_name`]. An
+/// The one render endpoint whose friendly name matches `wanted` (the rule of
+/// [`crate::selection::matches`]: trimmed, case-insensitive, contained in the
+/// friendly name), mirroring [`crate::CpalOutput::with_device_name`]. An
 /// absent or ambiguous name fails and lists what exists.
 fn find_render_endpoint(
     enumerator: &DeviceEnumerator,
@@ -275,7 +272,6 @@ fn find_render_endpoint(
             message: open_failure_message(&target, &e.to_string(), &[]),
         })?;
     let count = collection.get_nbr_devices().unwrap_or(0);
-    let needle = wanted.to_lowercase();
     let mut matches = Vec::new();
     let mut names = Vec::new();
     for index in 0..count {
@@ -285,7 +281,7 @@ fn find_render_endpoint(
         let name = device
             .get_friendlyname()
             .unwrap_or_else(|_| format!("endpoint {index}"));
-        if name.to_lowercase().contains(&needle) {
+        if crate::selection::matches(wanted, &name) {
             matches.push((device, name.clone()));
         }
         names.push(name);
@@ -472,8 +468,12 @@ impl WasapiOutput {
     }
 
     /// Not opened yet; [`OutputDevice::open`] opens the one render endpoint
-    /// whose friendly name contains `name` (case-insensitive) instead of the
-    /// system default, like [`crate::CpalOutput::with_device_name`].
+    /// whose friendly name matches `name` instead of the system default,
+    /// like [`crate::CpalOutput::with_device_name`].
+    ///
+    /// The match is the rule of [`crate::selection::matches`]: the name is
+    /// trimmed and compared case-insensitively, and the endpoint's friendly
+    /// name must *contain* it ("Speakers" matches "Speakers (Realtek)").
     ///
     /// `open` fails, naming the endpoint and listing the render endpoints that
     /// exist, when none or more than one matches. It never falls back to the
@@ -710,7 +710,7 @@ fn open_endpoint(
                     message: open_failure_message(
                         "the default render endpoint",
                         &e.to_string(),
-                        &render_endpoint_names(&enumerator),
+                        &endpoint_names(&enumerator),
                     ),
                 })?;
             let name = device
