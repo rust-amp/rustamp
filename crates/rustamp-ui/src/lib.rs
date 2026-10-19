@@ -42,8 +42,11 @@
 //!   lines as text. The library window is a modern (unskinned) window, so no
 //!   skin is involved.
 //! * [`library_render::render_library_window`] paints the media library's
-//!   content - the column titles, the rows, the selection and the status
-//!   line - into a frame, with the modern window's own palette.
+//!   content - the search field, the column titles, the rows, the
+//!   selection, the scrollbar and the status line - into a frame, with the
+//!   modern window's own palette. [`library_render::LibraryChrome`] is the
+//!   window's geometry: a pure function of the viewport and the view, so
+//!   the app can map a click to the band it belongs to.
 //! * [`shell::skinned_window_attributes`] is the single place that decides
 //!   what an OS window looks like outside its client area: every window of
 //!   this player is borderless, because its title bar is part of the skin.
@@ -120,9 +123,13 @@ pub use library_layout::{
     LIBRARY_MIN_TITLE_WIDTH, LibraryLayout, format_duration,
 };
 pub use library_render::{
-    LIBRARY_CELL_WIDTH, LIBRARY_FONT_FAMILY, LIBRARY_HEADER_TEXT, LIBRARY_LINE_HEIGHT,
-    LIBRARY_PANEL_BACKGROUND, LIBRARY_ROW_TEXT, LIBRARY_SELECTION, LIBRARY_SELECTION_TEXT,
-    LIBRARY_SEPARATOR, LIBRARY_STATUS_TEXT, LIBRARY_WINDOW_BACKGROUND, render_library_window,
+    LIBRARY_CARET_WIDTH, LIBRARY_CELL_WIDTH, LIBRARY_FONT_FAMILY, LIBRARY_HEADER_TEXT,
+    LIBRARY_LINE_HEIGHT, LIBRARY_MIN_THUMB_HEIGHT, LIBRARY_PANEL_BACKGROUND, LIBRARY_ROW_TEXT,
+    LIBRARY_SCROLLBAR_THUMB, LIBRARY_SCROLLBAR_TRACK, LIBRARY_SCROLLBAR_WIDTH,
+    LIBRARY_SEARCH_BACKGROUND, LIBRARY_SEARCH_CARET, LIBRARY_SEARCH_HINT, LIBRARY_SEARCH_PADDING,
+    LIBRARY_SEARCH_PLACEHOLDER, LIBRARY_SEARCH_TEXT, LIBRARY_SELECTION, LIBRARY_SELECTION_TEXT,
+    LIBRARY_SEPARATOR, LIBRARY_STATUS_TEXT, LIBRARY_WINDOW_BACKGROUND, LibraryChrome,
+    render_library_window, scroll_for_click,
 };
 pub use menu::{
     CHECK_CELL_X, CLUTTER_O_POINT, CLUTTER_V_POINT, MAIN_MENU, MAIN_MENU_CLASS,
