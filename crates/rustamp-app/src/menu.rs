@@ -165,6 +165,12 @@ impl App {
             }
             rustamp_ui::menu::MenuChoice::Exit => self.quit_from_menu().map(Some),
             rustamp_ui::menu::MenuChoice::NoAction { .. } => Ok(None),
+            rustamp_ui::menu::MenuChoice::UnavailableCommand { label, command_id } => {
+                self.note(format!(
+                    "menu \"{label}\": command {command_id} is not implemented yet"
+                ));
+                Ok(Some(MenuOutcome::Noted))
+            }
             rustamp_ui::menu::MenuChoice::SetTimeRemaining(remaining) => {
                 // Set, don't toggle: the shortcut is a flip, so only flip when
                 // the reading differs.

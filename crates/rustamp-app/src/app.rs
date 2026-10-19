@@ -170,6 +170,8 @@ pub struct App {
     pub(crate) pending_clutter_menu: Option<crate::menu::ClutterMenu>,
     /// The equalizer's Presets popup is waiting to be shown (S07 §4.2).
     pub(crate) pending_eq_menu: bool,
+    /// The playlist MISC popup awaits the presenter's modal-menu drain.
+    pub(crate) pending_playlist_misc_menu: bool,
     /// A save-playlist request waiting for the presenter (Ctrl+S, S03 §2, command ID 40204).
     pub(crate) request_save_playlist: bool,
     /// The user's saved equalizer presets (`presets.eqf` beside the config).
@@ -355,6 +357,7 @@ impl App {
             main_menu_open: false,
             pending_clutter_menu: None,
             pending_eq_menu: false,
+            pending_playlist_misc_menu: false,
             request_save_playlist: false,
             eq_user_presets: Vec::new(),
             notes: Vec::new(),

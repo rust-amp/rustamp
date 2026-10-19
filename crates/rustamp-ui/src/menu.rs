@@ -71,6 +71,11 @@
 //! menu (S04 §2): [`MenuCheck::TimeElapsed`] / [`MenuCheck::TimeRemaining`]
 //! still resolve from [`MainWindowState::time_remaining`](crate::state::MainWindowState)
 //! for that popup's future use.
+//!
+//! The playlist MISC popup is [`native_playlist_misc_menu`] (S04 §7).
+//! Its two S03 ids have no app commands yet: [`MenuChoice::UnavailableCommand`]
+//! keeps the ids and reports that gap instead of inventing behaviour. Other
+//! playlist popup trees, including right-click, remain open in S04 §9.
 
 use std::ops::Range;
 
@@ -779,6 +784,14 @@ pub enum MenuChoice {
         /// The row's label.
         label: &'static str,
     },
+    /// A spec-backed command id with no app command implementation yet.
+    /// Selection reports the gap; it must not synthesize another command.
+    UnavailableCommand {
+        /// The measured row label.
+        label: &'static str,
+        /// The public command id recorded by S03.
+        command_id: u32,
+    },
     /// The Options popup's Time elapsed / Time remaining rows: sets the
     /// reading (`true` = remaining) instead of toggling it, so choosing the
     /// row that is already on keeps it on (S04 §4.2: the check moves between
@@ -790,7 +803,9 @@ impl MenuChoice {
     /// The row's label, whichever kind it is.
     pub fn label(self) -> &'static str {
         match self {
-            MenuChoice::Action { label, .. } | MenuChoice::NoAction { label } => label,
+            MenuChoice::Action { label, .. }
+            | MenuChoice::NoAction { label }
+            | MenuChoice::UnavailableCommand { label, .. } => label,
             MenuChoice::Exit => "Exit",
             MenuChoice::SetTimeRemaining(false) => "Time elapsed",
             MenuChoice::SetTimeRemaining(true) => "Time remaining",
@@ -805,8 +820,9 @@ impl MenuChoice {
 /// submenu arrows, the right-aligned accelerator column and the tick marks -
 /// because the reference's popups are system menus (S04 §1 settles their
 /// window class as `#32768`). `choices` is the lookup for what came back:
-/// an entry's id is its **1-based index** into it
-/// ([`NativeMainMenu::choice_for_id`]).
+/// leaf choices are stored in depth-first display order and resolved by
+/// [`NativeMainMenu::choice_for_id`]. Main/clutter menus use local 1-based
+/// ids; the playlist MISC popup uses its S03 public command ids.
 ///
 /// What this carries from the model, unchanged: the S04 §2 row order and the
 /// four separator positions, the six submenu parents (S04 §3.2), the six
@@ -819,7 +835,7 @@ impl MenuChoice {
 pub struct NativeMainMenu {
     /// The row tree, in display order.
     pub rows: Vec<PopupRow>,
-    /// What each id means; an id is the 1-based index into this.
+    /// Leaf choices in depth-first display order (separators excluded).
     pub choices: Vec<MenuChoice>,
 }
 
@@ -827,7 +843,30 @@ impl NativeMainMenu {
     /// What the chosen `id` means, or `None` for an id that is not ours
     /// (`0` is "dismissed").
     pub fn choice_for_id(&self, id: u32) -> Option<MenuChoice> {
-        let index = usize::try_from(id).ok()?.checked_sub(1)?;
+        fn leaf_index(rows: &[PopupRow], id: u32, index: &mut usize) -> Option<usize> {
+            for row in rows {
+                match row {
+                    PopupRow::Entry { id: row_id, .. } => {
+                        if *row_id == id {
+                            return Some(*index);
+                        }
+                        *index += 1;
+                    }
+                    PopupRow::Submenu { rows, .. } => {
+                        if let Some(found) = leaf_index(rows, id, index) {
+                            return Some(found);
+                        }
+                    }
+                    PopupRow::Separator => {}
+                }
+            }
+            None
+        }
+        if id == 0 {
+            return None;
+        }
+        let mut index = 0;
+        let index = leaf_index(&self.rows, id, &mut index)?;
         self.choices.get(index).copied()
     }
 }
@@ -1077,6 +1116,37 @@ pub fn native_visualization_menu() -> NativeMainMenu {
         Some("Ctrl+K"),
         false,
     );
+    NativeMainMenu { rows, choices }
+}
+
+/// The playlist MISC popup (S04 §7, corroborated by S06 §4).
+///
+/// These are the only exported playlist popup rows: File, Sort, List,
+/// Selection and right-click trees remain open (S04 §9, S06 §8). In
+/// particular, Sort must not be inserted into MISC: that expectation was
+/// explicitly refuted. Labels, order, separator, hints and the unchecked,
+/// enabled state below match the nothing-loaded capture. Loaded-state
+/// comparisons remain open (S04 §9). S03 §2 supplies the ids.
+/// Neither id has an app command yet, so a choice reports that limitation.
+pub fn native_playlist_misc_menu() -> NativeMainMenu {
+    let mut rows = Vec::new();
+    let mut choices = Vec::new();
+    for (label, command_id, accelerator) in [
+        ("Generate HTML playlist", 40292, "(Ctrl+Alt+G)"),
+        ("Read extended info on selection", 40293, "(Ctrl+Alt+E)"),
+    ] {
+        if !rows.is_empty() {
+            rows.push(PopupRow::Separator);
+        }
+        rows.push(PopupRow::Entry {
+            id: command_id,
+            label: label.to_string(),
+            accelerator: Some(accelerator.to_string()),
+            checked: false,
+            enabled: true,
+        });
+        choices.push(MenuChoice::UnavailableCommand { label, command_id });
+    }
     NativeMainMenu { rows, choices }
 }
 // ---------------------------------------------------------------------------
@@ -1329,6 +1399,51 @@ mod tests {
     use super::*;
     use crate::behaviour::MainWindow;
     use crate::shortcuts::ShortcutOutcome;
+
+    #[test]
+    fn playlist_misc_matches_the_complete_exported_s04_tree() {
+        let menu = native_playlist_misc_menu();
+        assert_eq!(
+            menu.rows,
+            vec![
+                PopupRow::Entry {
+                    id: 40292,
+                    label: "Generate HTML playlist".to_string(),
+                    accelerator: Some("(Ctrl+Alt+G)".to_string()),
+                    checked: false,
+                    enabled: true,
+                },
+                PopupRow::Separator,
+                PopupRow::Entry {
+                    id: 40293,
+                    label: "Read extended info on selection".to_string(),
+                    accelerator: Some("(Ctrl+Alt+E)".to_string()),
+                    checked: false,
+                    enabled: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn every_playlist_misc_id_preserves_its_missing_command_mapping() {
+        let menu = native_playlist_misc_menu();
+        for (id, label) in [
+            (40292, "Generate HTML playlist"),
+            (40293, "Read extended info on selection"),
+        ] {
+            assert_eq!(
+                menu.choice_for_id(id),
+                Some(MenuChoice::UnavailableCommand {
+                    label,
+                    command_id: id,
+                })
+            );
+        }
+        for id in [0, 1, 2, 40291, 40294, u32::MAX] {
+            assert_eq!(menu.choice_for_id(id), None);
+        }
+    }
 
     fn item_rows() -> Vec<MainMenuItem> {
         MAIN_MENU
