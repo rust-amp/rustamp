@@ -9,12 +9,17 @@
 //!   ([`Skin::sprite`], [`Skin::sprite_image`], [`webamp::SPRITES`]);
 //! * `pledit.txt` ([`PlaylistStyle`]), `viscolor.txt`
 //!   ([`Skin::viscolors`]) and `region.txt` ([`Region`]);
-//! * the cursors the skin ships ([`CursorFile`]).
+//! * the cursors the skin ships: the classic cursor **slots**
+//!   ([`CursorSlot`]) and the file bytes behind them
+//!   ([`CursorFile`], [`Skin::cursor_slot`]). The bytes stay untouched —
+//!   this crate never decodes a `.cur` or an `.ani`.
 //!
 //! Missing files never fail the whole load: each one falls back per file (see
 //! [`Substitution`]). A missing sheet falls back to the default skin, a
 //! missing cursor falls back to the default skin's own cursor of the same name
 //! — or stays absent when the default skin carries no cursor under that name.
+//! A slot nobody carries is absent, and the caller falls back to the system
+//! cursor.
 //!
 //! `nums_ex.bmp` and `numbers.bmp` are **not** interchangeable: when a skin
 //! carries `nums_ex.bmp`, the time display uses it instead of
@@ -36,6 +41,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bmp;
+pub mod cursor;
 pub mod error;
 pub mod ini;
 pub mod lookalike;
@@ -48,6 +54,7 @@ pub mod source;
 pub mod viscolor;
 pub mod webamp;
 
+pub use cursor::CursorSlot;
 pub use error::{Result, SkinError};
 pub use pledit::PlaylistStyle;
 pub use raster::RasterImage;

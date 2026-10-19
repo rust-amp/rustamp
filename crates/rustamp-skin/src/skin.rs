@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::bmp;
+use crate::cursor::CursorSlot;
 use crate::error::{Result, SkinError};
 use crate::pledit::PlaylistStyle;
 use crate::raster::RasterImage;
@@ -281,9 +282,8 @@ impl Skin {
         };
 
         let mut cursors = Vec::new();
-        for name in webamp::CURSOR_NAMES {
-            let stem = name.strip_suffix(".cur").unwrap_or(name);
-            if let Some(file) = source.read_any(stem, &["cur", "ani"]) {
+        for slot in CursorSlot::ALL {
+            if let Some(file) = source.read_any(slot.stem(), &["cur", "ani"]) {
                 let kind = if file.bytes.starts_with(b"RIFF") {
                     CursorKind::Ani
                 } else {
@@ -380,11 +380,20 @@ impl Skin {
         &self.cursors
     }
 
-    /// Looks up a cursor by its file name (case-insensitive).
-    pub fn cursor(&self, name: &str) -> Option<&CursorFile> {
+    /// The cursor file the skin carries for `slot`, if any.
+    ///
+    /// The slot is filled by the skin's own file (`<stem>.cur` or
+    /// `<stem>.ani`) or by the fallback's cursor of the same name (see
+    /// [`SkinFallback::cursor`]). A slot nobody carries is **absent**:
+    /// `None` means "this skin has no cursor for that slot", and the caller
+    /// falls back to the system cursor.
+    ///
+    /// The bytes are the file's bytes, untouched — this crate never decodes a
+    /// cursor.
+    pub fn cursor_slot(&self, slot: CursorSlot) -> Option<&CursorFile> {
         self.cursors
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .find(|cursor| CursorSlot::from_file_name(&cursor.name) == Some(slot))
     }
 
     /// Every file that was missing and what replaced it.
@@ -447,21 +456,6 @@ fn resolve_default_fallbacks(
     }
 }
 
-/// The cursor file-name stem, ignoring a `.cur`/`.ani` suffix of either case.
-///
-/// A skin that ships `posbar.ani` carries the `posbar.cur` slot, so the
-/// fallback must never shadow it with a cursor of its own.
-fn cursor_stem(name: &str) -> &str {
-    for suffix in [".cur", ".ani"] {
-        if name.len() >= suffix.len()
-            && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-        {
-            return &name[..name.len() - suffix.len()];
-        }
-    }
-    name
-}
-
 /// Fills any missing cursor from the fallback skin.
 ///
 /// This is the same rule sheets follow ([`resolve_default_fallbacks`]): a
@@ -474,17 +468,16 @@ fn resolve_cursor_fallbacks(
     fallback: &dyn SkinFallback,
     substitutions: &mut Vec<Substitution>,
 ) {
-    for name in webamp::CURSOR_NAMES {
-        let wanted = cursor_stem(name);
+    for slot in CursorSlot::ALL {
         if cursors
             .iter()
-            .any(|c| cursor_stem(&c.name).eq_ignore_ascii_case(wanted))
+            .any(|c| CursorSlot::from_file_name(&c.name) == Some(*slot))
         {
             continue;
         }
-        if let Some(cursor) = fallback.cursor(name) {
+        if let Some(cursor) = fallback.cursor(slot.file_name()) {
             substitutions.push(Substitution {
-                requested: (*name).to_string(),
+                requested: slot.file_name().to_string(),
                 with: Substitute::DefaultSkin,
             });
             cursors.push(cursor);

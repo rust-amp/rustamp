@@ -24,6 +24,10 @@
 //! * [`render::render_main_window`] paints one RGBA frame through
 //!   [`rustamp_gfx`], falling back per spec **S17** when a skin lacks a sheet.
 //! * [`widget::hit_test`] maps a window-relative point to a [`widget::Widget`].
+//! * [`cursor`] maps a hit-test result to the [`rustamp_skin::CursorSlot`] the
+//!   skin is asked for. The mapping is **Rustamp's own choice** (S17 §8
+//!   leaves it open) and is a pure function: it never touches the skin or
+//!   the OS.
 //! * [`visualization`] implements Rustamp's own analyser/scope and envelopes,
 //!   consuming actual waveform snapshots. S08 reference behaviour remains open.
 //! * [`playlist::PlaylistWindow`] is the headless playlist-editor behaviour of
@@ -41,6 +45,7 @@
 #![forbid(unsafe_code)]
 
 pub mod behaviour;
+pub mod cursor;
 pub mod dialogs;
 pub mod docking;
 pub mod eq_render;
@@ -65,6 +70,7 @@ pub use behaviour::{
     MainWindow, PROGRAM_NAME, balance_percent, core_balance, core_volume, transport_transition,
     volume_percent,
 };
+pub use cursor::{equalizer_cursor, main_window_cursor, playlist_cursor_at};
 pub use dialogs::{
     ABOUT_CLIENT_SIZE, DialogKind, DialogManager, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE,
     JUMP_FILE_CLIENT_SIZE, JUMP_FILE_ROWS, LOAD_PLAYLIST_CLIENT_SIZE, MAX_JUMP_FILE_LEN,
