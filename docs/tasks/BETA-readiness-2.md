@@ -242,11 +242,12 @@ embedded in `player/THIRD_PARTY.md` as required by the licenses.
    windowed four. The beta's load-bearing new semantics (fail-closed flush
    barrier, resident bit-identity, snapshot mapping) are compile-only today.
 5. **Stop advertising what does not work.** Shuffle/Repeat (BETA-08) and Visualiser
-   (BETA-10) are now functional code paths. Hide, disable, or label remaining
-   placebos: Clutter O/V, menu submenus + Exit, EQ presets, prefs pages, plugin
-   UI selection. Fold in the small honesties: `easy_move` is wired (N8 `24b33e4`),
-   while the stale `app/src/skin.rs:6` line and F11 double print (`lib.rs:87` +
-   `main.rs:93`) persist.
+   (BETA-10) are now functional code paths. Remaining placebos being implemented:
+   Clutter O/V (in progress), plugin UI selection (in progress). **Fixed:** menu Exit
+   (`63678cd`), menu submenus (already functional via native OS popup), EQ presets
+   (`63678cd` - 9 standard presets), prefs pages (`29757c2` - already wired, tests added).
+   Small honesties: `easy_move` is wired (N8 `24b33e4`), stale `app/src/skin.rs:6` line
+   and F11 double print fixed (`1b4df32`).
 
 ---
 
@@ -257,8 +258,10 @@ embedded in `player/THIRD_PARTY.md` as required by the licenses.
   first launch on a bare clean OS without developer runtimes remains unexecuted).
 - Global hotkeys that register but cannot deliver (now delivered; closed in §2f).
 - A Load-Playlist dialog that takes a path and does nothing (wired in N7/N8, VM proof pending — §1 BETA-09).
-- Placebo controls presented as working: Clutter O/V, menu Exit/submenus, EQ presets,
-  prefs/plugin UI selection (§1 BETA-06/10; Shuffle/Repeat and Visualiser are now functional).
+- Placebo controls presented as working: Clutter O/V and plugin UI selection are being
+  implemented in worktrees (§1 BETA-06/10). **Fixed:** menu Exit (`63678cd`), menu submenus
+  (already functional), EQ presets (`63678cd`), prefs pages (`29757c2`). Shuffle/Repeat
+  and Visualiser are functional.
 - Any reintroduction of: phantom Playing over silence (keep
   `app.rs:1201-1233` + VM proof), cpal flush claimed as success (keep
   `cpal_out.rs:381-382` refusal + restart barrier), config self-corruption
