@@ -118,7 +118,9 @@
 //! * a `Pong` clears the probe it answers (tokens must match; a stale token
 //!   is ignored rather than trusted); a probe unanswered for
 //!   [`PONG_TIMEOUT`] is the RFC's missed-`Pong` failure, and the link
-//!   detaches so the supervisor replaces the host.
+//!   detaches so the supervisor replaces the host;
+//! * what the host says about its plug-ins is recorded (see the next
+//!   section).
 //!
 //! Which thread reads the real pipe depends on the transport, because a
 //! blocking pipe cannot be polled:
@@ -128,6 +130,44 @@
 //! thread owns the read half, handing what it reads back through the same
 //! `try_recv` (see [`crate::supervise`]). Either way reading and pinging stay
 //! on the app thread or the reader thread: never on the audio path.
+//!
+//! # Reading the host's plug-in answers
+//!
+//! The same drain also reads what the host says about its plug-ins. The host
+//! answers a load request with [`Message::PluginLoaded`], which carries the
+//! **host-assigned** handle, the plug-in's display name and its kind (or with
+//! [`Message::PluginError`], which carries the path and the reason). The app
+//! keeps those answers in a [`PluginInventory`] (see
+//! [`crate::plugin_inventory`]) and reads them through
+//! [`plugins`](HostStateLink::plugins), [`plugin`](HostStateLink::plugin) and
+//! [`plugins_of_kind`](HostStateLink::plugins_of_kind).
+//!
+//! Before this, the drain ignored every variant but the handshake, so the
+//! player never learned a plug-in id and could not name a plug-in in a
+//! request (RFC 0020 §3.5). Nothing about the wire changed: the variants
+//! existed, the app simply never looked at them.
+//!
+//! Three rules keep the record honest:
+//!
+//! * **The ids are the host's.** The host hands them out in load order and
+//!   re-uses the numbers after a restart, so an id names a plug-in only for
+//!   the lifetime of the process that issued it (RFC 0020 Q6). The inventory
+//!   is therefore cleared when the link attaches a new peer or detaches from
+//!   the old one.
+//! * **An unknown variant is ignored, not an error.** The drain never
+//!   answers a message it does not know: that would invent protocol.
+//! * **A message that reports nothing the app needs changes nothing.** The
+//!   protocol carries no "a visualization started" message, so the host's
+//!   running-visualization slot has no counterpart on this side; the
+//!   visualization plug-ins in the inventory are the ones that were *loaded*,
+//!   not the one that is *running*.
+//!
+//! One ordering note: the host greets before it can answer anything (the
+//! greeting goes out on its reader thread at startup, the answers come from
+//! its UI thread later), so the supervisor's handshake barrier never sees a
+//! [`Message::PluginLoaded`] first. Were that to change, the barrier would
+//! read it as a protocol violation and replace the host
+//! (see [`crate::supervise`]).
 //!
 //! # Commands to the host (RFC 0005 §5.4)
 //!
@@ -180,6 +220,9 @@ use std::time::{Duration, Instant};
 use rustamp_core::command::Command;
 use rustamp_core::state::PlayerState;
 use rustamp_ipc::{IpcError, Message, PROTOCOL_VERSION, Transport};
+use rustamp_plugin_abi::PluginKind;
+
+use crate::plugin_inventory::{LoadedPlugin, PluginInventory, PluginLoadFailure};
 
 /// Maximum rate of position-only publications (see the module docs).
 ///
@@ -310,6 +353,10 @@ pub struct HostStateLink {
     next_token: u64,
     pending_pong: Option<(u64, Instant)>,
     next_ping_at: Option<Instant>,
+    /// What the host told us about its plug-ins (see
+    /// [`crate::plugin_inventory`]). Belongs to the attached host process
+    /// only: it is cleared whenever the peer changes.
+    inventory: PluginInventory,
 }
 
 impl HostStateLink {
@@ -325,6 +372,7 @@ impl HostStateLink {
             next_token: 1,
             pending_pong: None,
             next_ping_at: None,
+            inventory: PluginInventory::default(),
         }
     }
 
@@ -337,6 +385,10 @@ impl HostStateLink {
     /// [`publish`](HostStateLink::publish) sends unconditionally and the host
     /// starts from the real state rather than from a stale one.
     ///
+    /// Attaching also forgets the plug-in inventory: the ids in it were
+    /// issued by the *previous* host process, and a new host re-uses the
+    /// numbers for different plug-ins (RFC 0020 Q6).
+    ///
     /// The pump calls `send` on this transport, so attach a handover-backed
     /// one ([`MemoryTransport`](rustamp_ipc::MemoryTransport), or the
     /// supervisor's split pipe link): a raw blocking pipe would stall
@@ -345,14 +397,19 @@ impl HostStateLink {
         self.transport = Some(Box::new(transport));
         self.last_sent = None;
         self.reset_liveness();
+        self.inventory.clear();
     }
 
     /// Drop the transport without sending anything. The next
     /// [`publish`](HostStateLink::publish) returns [`PublishOutcome::Detached`].
+    ///
+    /// The plug-in inventory goes with the transport: the ids it holds were
+    /// issued by the host that just went away, so they name nothing now.
     pub fn detach(&mut self) {
         self.transport = None;
         self.last_sent = None;
         self.reset_liveness();
+        self.inventory.clear();
     }
 
     /// Forget the handshake state: a fresh transport means a fresh peer, so
@@ -398,6 +455,35 @@ impl HostStateLink {
             .is_some_and(|greeting| !greeting.is_supported())
     }
 
+    /// The plug-ins the attached host reported as loaded (see
+    /// [`crate::plugin_inventory`]).
+    ///
+    /// Empty while no host is attached: the ids belong to one host process
+    /// and are forgotten when it is replaced (RFC 0020 Q6).
+    pub fn plugins(&self) -> &[LoadedPlugin] {
+        self.inventory.plugins()
+    }
+
+    /// The plug-in the host reported under this id, if any.
+    pub fn plugin(&self, plugin_id: u32) -> Option<&LoadedPlugin> {
+        self.inventory.by_id(plugin_id)
+    }
+
+    /// The plug-ins of one kind the host reported (see
+    /// [`PluginInventory::of_kind`](crate::plugin_inventory::PluginInventory::of_kind)).
+    ///
+    /// "Of this kind" is not "running": the protocol carries no message that
+    /// says which plug-in is running.
+    pub fn plugins_of_kind(&self, kind: PluginKind) -> impl Iterator<Item = &LoadedPlugin> {
+        self.inventory.of_kind(kind)
+    }
+
+    /// The loads the host refused since the last call (see
+    /// [`PluginInventory::take_failures`](crate::plugin_inventory::PluginInventory::take_failures)).
+    pub fn take_plugin_failures(&mut self) -> Vec<PluginLoadFailure> {
+        self.inventory.take_failures()
+    }
+
     /// One non-blocking liveness step: drain what the host wrote, greet and
     /// probe it, and detach on a dead channel or a missed `Pong`.
     ///
@@ -421,9 +507,9 @@ impl HostStateLink {
             return PollOutcome::Detached;
         }
         // Drain everything the host wrote since the last step: the startup
-        // greeting and same-token pongs. Anything else is future traffic
-        // (plugin answers belong to a later card) and is ignored, never
-        // answered — answering an unknown variant would invent protocol.
+        // greeting, same-token pongs and the plug-in answers. Anything else
+        // is traffic this app has no use for and is ignored, never answered —
+        // answering an unknown variant would invent protocol.
         loop {
             let inbound = match self.transport.as_mut() {
                 Some(transport) => transport.try_recv(),
@@ -489,6 +575,9 @@ impl HostStateLink {
     ///   once at startup, and a fresh peer means a fresh transport).
     /// * `Pong` clears the matching outstanding probe; a stale token is
     ///   ignored rather than trusted.
+    /// * `PluginLoaded` records the plug-in in the inventory — the host's
+    ///   answer to a load request, carrying the id a later request needs.
+    /// * `PluginError` records a refused load for the app to report.
     /// * Anything else is ignored (see
     ///   [`poll_at`](HostStateLink::poll_at)).
     fn on_inbound(&mut self, message: Message) {
@@ -512,6 +601,16 @@ impl HostStateLink {
                 self.pending_pong = None;
             }
             Message::Pong(_) => {}
+            Message::PluginLoaded {
+                plugin_id,
+                name,
+                kind,
+            } => {
+                self.inventory.record_loaded(plugin_id, name, kind);
+            }
+            Message::PluginError { path, message } => {
+                self.inventory.record_failure(path, message);
+            }
             _ => {}
         }
     }
@@ -558,8 +657,11 @@ impl HostStateLink {
                 // A stalled or dead host must never block the player and must
                 // never wedge the link on a broken transport: drop it and let
                 // the supervisor (see `crate::supervise`) re-attach a live one.
+                // The plug-in ids die with that host, so the inventory goes
+                // with it.
                 self.transport = None;
                 self.last_sent = None;
+                self.inventory.clear();
                 PublishOutcome::HostGone
             }
         }
@@ -950,7 +1052,8 @@ mod tests {
         let (app_end, mut host_end) = MemoryTransport::pair();
         let mut link = HostStateLink::detached();
         link.attach(app_end);
-        // Traffic a later card owns: plugin answers the app never solicited.
+        // Traffic this app has no use for: a classic IPC query and the
+        // decoder host's end-of-stream.
         host_end
             .send(&Message::WinampIpc {
                 msg_id: 104,
@@ -1034,5 +1137,192 @@ mod tests {
             link.send_command(Command::ConfigureVisPlugin),
             CommandOutcome::Detached
         );
+    }
+
+    // ----- the plug-in inventory (the host's answers, read back) -----
+
+    #[test]
+    fn a_loaded_plugin_lands_in_the_inventory() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 1,
+                name: "MilkDrop 2".to_string(),
+                kind: PluginKind::Visualization,
+            })
+            .unwrap();
+
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Healthy);
+        let plugins = link.plugins();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].plugin_id, 1);
+        assert_eq!(plugins[0].name, "MilkDrop 2");
+        assert_eq!(plugins[0].kind, PluginKind::Visualization);
+        // The id is what a later request needs, so it is findable by it.
+        assert_eq!(link.plugin(1).map(|p| p.name.as_str()), Some("MilkDrop 2"));
+        assert!(link.plugin(2).is_none());
+    }
+
+    #[test]
+    fn a_second_plugin_of_another_kind_is_added() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 1,
+                name: "MilkDrop 2".to_string(),
+                kind: PluginKind::Visualization,
+            })
+            .unwrap();
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 2,
+                name: "Sleeper".to_string(),
+                kind: PluginKind::Dsp,
+            })
+            .unwrap();
+
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Healthy);
+        let plugins = link.plugins();
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[1].plugin_id, 2);
+        assert_eq!(plugins[1].kind, PluginKind::Dsp);
+        // The kind is a query of its own: a vis request must not pick a DSP.
+        let vis: Vec<u32> = link
+            .plugins_of_kind(PluginKind::Visualization)
+            .map(|p| p.plugin_id)
+            .collect();
+        assert_eq!(vis, vec![1]);
+        let dsp: Vec<u32> = link
+            .plugins_of_kind(PluginKind::Dsp)
+            .map(|p| p.plugin_id)
+            .collect();
+        assert_eq!(dsp, vec![2]);
+    }
+
+    #[test]
+    fn an_unknown_message_is_ignored_and_the_inventory_stays() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 1,
+                name: "MilkDrop 2".to_string(),
+                kind: PluginKind::Visualization,
+            })
+            .unwrap();
+        // Traffic the app has no use for: a classic IPC query, a decoder
+        // host's end-of-stream and a ring offer that belongs to another host.
+        host_end
+            .send(&Message::WinampIpc {
+                msg_id: 104,
+                wparam: 0,
+                lparam: 0,
+            })
+            .unwrap();
+        host_end.send(&Message::DecoderEos).unwrap();
+
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Healthy);
+        assert!(link.is_attached());
+        // Only the plug-in answer changed the record; the rest is ignored,
+        // not an error.
+        assert_eq!(link.plugins().len(), 1);
+        assert_eq!(link.plugins()[0].name, "MilkDrop 2");
+        // Nothing was answered either: only our own startup greeting went out.
+        assert!(matches!(host_end.recv().unwrap(), Message::Hello { .. }));
+        assert!(host_end.try_recv().expect("codec reads").is_none());
+    }
+
+    #[test]
+    fn a_detached_link_reports_no_plugins() {
+        let mut link = HostStateLink::detached();
+        // Nothing is reported, and asking is not a panic.
+        assert!(link.plugins().is_empty());
+        assert!(link.plugin(1).is_none());
+        assert!(
+            link.plugins_of_kind(PluginKind::Visualization)
+                .next()
+                .is_none()
+        );
+        assert!(link.take_plugin_failures().is_empty());
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Detached);
+        assert!(link.plugins().is_empty());
+    }
+
+    #[test]
+    fn a_replaced_host_clears_the_inventory() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 1,
+                name: "first".to_string(),
+                kind: PluginKind::General,
+            })
+            .unwrap();
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Healthy);
+        assert_eq!(link.plugins().len(), 1);
+
+        // The host dies: the ids it issued die with it (RFC 0020 Q6).
+        link.detach();
+        assert!(link.plugins().is_empty());
+
+        // A new host starts its numbering at one again, for another plug-in.
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        link.attach(app_end);
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 1,
+                name: "second".to_string(),
+                kind: PluginKind::Dsp,
+            })
+            .unwrap();
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Healthy);
+        let plugins = link.plugins();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "second");
+        assert_eq!(plugins[0].kind, PluginKind::Dsp);
+    }
+
+    #[test]
+    fn a_refused_load_is_recorded_for_the_app() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+
+        host_end
+            .send(&Message::PluginError {
+                path: "C:\\plugins\\bad.dll".to_string(),
+                message: "not a PE image".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(link.poll_at(Instant::now()), PollOutcome::Healthy);
+        let failures = link.take_plugin_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, "C:\\plugins\\bad.dll");
+        assert_eq!(failures[0].message, "not a PE image");
+        // Reported once, not on every poll.
+        assert!(link.take_plugin_failures().is_empty());
+        // A refused load is no plug-in.
+        assert!(link.plugins().is_empty());
     }
 }
