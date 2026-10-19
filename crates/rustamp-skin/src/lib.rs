@@ -8,7 +8,9 @@
 //! * the named sprite rectangles and a lookup that returns the source sheet
 //!   ([`Skin::sprite`], [`Skin::sprite_image`], [`webamp::SPRITES`]);
 //! * `pledit.txt` ([`PlaylistStyle`]), `viscolor.txt`
-//!   ([`Skin::viscolors`]) and `region.txt` ([`Region`]);
+//!   ([`Skin::viscolors`]) and `region.txt` ([`Region`]), including the
+//!   **window-shape mask** ([`RegionMask`]) the region's polygons describe
+//!   for a window of a given size;
 //! * the cursors the skin ships: the classic cursor **slots**
 //!   ([`CursorSlot`]) and the file bytes behind them
 //!   ([`CursorFile`], [`Skin::cursor_slot`]). The bytes stay untouched —
@@ -48,6 +50,7 @@ pub mod lookalike;
 pub mod pledit;
 pub mod raster;
 pub mod region;
+pub mod region_mask;
 pub mod rust_theme;
 pub mod skin;
 pub mod source;
@@ -58,7 +61,8 @@ pub use cursor::CursorSlot;
 pub use error::{Result, SkinError};
 pub use pledit::PlaylistStyle;
 pub use raster::RasterImage;
-pub use region::{Polygon, Region};
+pub use region::{Polygon, Region, RegionSection};
+pub use region_mask::{MaskSpan, RegionMask, build_mask};
 pub use skin::{
     BuiltinDefaultSkin, BuiltinLookalikeSkin, CursorFile, CursorKind, PLACEHOLDER_RGBA, Skin,
     SkinFallback, Substitute, Substitution,

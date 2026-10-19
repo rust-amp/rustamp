@@ -95,3 +95,37 @@ Three decisions are recorded here because they are not measurements:
 `Skin::cursor(name)` (a lookup by file name) is gone: the slot is the one
 way to ask, and it also answers for an `.ani` file, which the name lookup
 could not.
+
+## 6. The window-shape mask
+
+`rustamp_skin::Region::mask(section, width, height)` turns the polygons of a
+`region.txt` section into the **per-pixel coverage** of a window of that size:
+a bitmap with one bit per pixel, plus a run-length view
+(`RegionMask::spans`) for an application that has to hand the shape to the
+system as rectangles. `None` means **no mask** — the section has no polygon,
+so the window keeps its rectangle (S17 §7: the base skin's `region.txt` has
+every polygon commented out).
+
+Three decisions are recorded here because S17 §7 does not settle them:
+
+1. **The fill rule is this crate's own choice: the non-zero winding rule,
+   sampled at the pixel centre.** A pixel is covered when the point
+   `(x + 0.5, y + 0.5)` lies inside the polygon, "inside" meaning that the
+   winding number around the point is not zero. S17 §7 only says that the
+   polygons define the visible area, that the coordinates are the outer pixel
+   corners and that the polygons of a section are additive; it does not say
+   how a self-intersecting polygon is filled. The rule is exact — the
+   rasteriser works in integer arithmetic, every edge crossing being a
+   rational number — so a diagonal edge never misplaces a pixel.
+2. **The polygons of one section are additive** (S17 §7): the mask is the
+   union of their areas, so a polygon wound the other way inside another one
+   does not cut a hole. The mask is therefore not a general polygon boolean
+   operation, only a union.
+3. **A pixel whose centre lies exactly on an edge belongs to the run that
+   starts at that edge**: the covered interval of a scanline is half-open,
+   `[left, right)`. A diagonal edge through pixel corners therefore splits
+   those pixels cleanly instead of covering them twice or not at all.
+
+The mask belongs to one window size: a window that changes its size needs a
+new mask. The application applies the mask to the client area; the crate
+never calls the system itself.

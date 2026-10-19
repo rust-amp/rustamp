@@ -12,13 +12,39 @@
 //! polygon with fewer than three points left is dropped, and a polygon whose
 //! point list ends early keeps the points it has. The other polygons of the
 //! section are kept.
+//!
+//! The polygons are the window's *shape*; [`crate::region_mask`] turns them
+//! into a per-pixel coverage mask for a window of a given size.
 
 use std::collections::HashMap;
 
 use crate::ini::parse_ini;
+use crate::region_mask::{RegionMask, build_mask};
 
 /// A polygon as a list of `(x, y)` vertices.
 pub type Polygon = Vec<(i32, i32)>;
+
+/// The window states a `region.txt` can describe (S17 §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RegionSection {
+    /// `[Normal]` — the windows in their normal state.
+    Normal,
+    /// `[WindowShade]` — the windows in window-shade mode.
+    WindowShade,
+    /// `[Equalizer]` — the equalizer window.
+    Equalizer,
+}
+
+impl RegionSection {
+    /// The section name as it is written in `region.txt`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            RegionSection::Normal => "Normal",
+            RegionSection::WindowShade => "WindowShade",
+            RegionSection::Equalizer => "Equalizer",
+        }
+    }
+}
 
 /// The polygons of a `region.txt`, grouped by section.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -76,6 +102,26 @@ impl Region {
     /// The section names present.
     pub fn section_names(&self) -> impl Iterator<Item = &str> {
         self.sections.keys().map(String::as_str)
+    }
+
+    /// The coverage mask of one section for a window of `width` x `height`.
+    ///
+    /// `None` means **no mask**: the section has no polygon, so the window
+    /// keeps its rectangle. That is the base skin's case — S17 §7 records that
+    /// its `region.txt` has every polygon commented out.
+    ///
+    /// A mask may still cover no pixel at all, for example when every polygon
+    /// of the section lies outside the window; what to do with such a mask is
+    /// the application's decision.
+    ///
+    /// The mask is pure data; the application applies it to the window.
+    /// See [`crate::region_mask`] for the fill rule.
+    pub fn mask(&self, section: RegionSection, width: u32, height: u32) -> Option<RegionMask> {
+        let polygons = self.polygons(section.name());
+        if polygons.is_empty() {
+            return None;
+        }
+        Some(build_mask(polygons, width, height))
     }
 }
 
@@ -203,5 +249,38 @@ PointList=0,0,275,0,275,116,0,116\r\n";
         let region = Region::parse(text);
         assert!(region.is_empty());
         assert!(region.normal().is_empty());
+    }
+
+    /// A section without a polygon means **no mask**: the window keeps its
+    /// rectangle.
+    #[test]
+    fn a_region_without_polygons_has_no_mask() {
+        let region = Region::parse("");
+        assert!(region.mask(RegionSection::Normal, 275, 116).is_none());
+        assert!(region.mask(RegionSection::WindowShade, 275, 14).is_none());
+        assert!(region.mask(RegionSection::Equalizer, 275, 116).is_none());
+    }
+
+    /// Every section gets the mask of its own polygons.
+    #[test]
+    fn every_section_gets_its_own_mask() {
+        let text = "\
+[Normal]\r\n\
+NumPoints=4\r\n\
+PointList=0, 0, 275, 0, 275, 116, 0, 116\r\n\
+[WindowShade]\r\n\
+NumPoints=4\r\n\
+PointList=0, 0, 275, 0, 275, 14, 0, 14\r\n";
+        let region = Region::parse(text);
+        let normal = region
+            .mask(RegionSection::Normal, 275, 116)
+            .expect("normal mask");
+        assert_eq!(normal.covered_pixels(), 275 * 116);
+        let shade = region
+            .mask(RegionSection::WindowShade, 275, 116)
+            .expect("window shade mask");
+        assert_eq!(shade.covered_pixels(), 275 * 14);
+        // The equalizer section is missing: no mask.
+        assert!(region.mask(RegionSection::Equalizer, 275, 116).is_none());
     }
 }
