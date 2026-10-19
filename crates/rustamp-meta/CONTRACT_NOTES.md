@@ -47,9 +47,10 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   loudness variants, ISRC, MusicBrainz IDs, composer, label, ...).
   `DISCTOTAL` is put there too, because there is no `disc_total` field yet.
 - **Pictures.** `TrackMetadata` has no field for cover art, so pictures are
-  returned by `read_artwork` as `Artwork` values (picture type, MIME type,
-  description, raw bytes). The bytes are exposed verbatim; nothing is
-  decoded, resized or validated.
+  returned by `read_artwork` (the front cover) and `read_artworks` (every
+  picture) as `Artwork` values: the role (`PictureKind`), the MIME type, the
+  description and the raw bytes. The bytes are exposed verbatim; nothing is
+  decoded, resized or validated. See "Artwork" below.
 - **Writing.** `write_tags` sets only the fields that are `Some` and leaves
   the rest of the tag untouched, so read → edit → write preserves what the
   caller does not set. A missing primary tag is created. The year is written
@@ -85,6 +86,44 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   written as ID3v2.4 with 1 KiB of padding, whatever the file held before.
   A FLAC file without a padding block gets one.
 
+## Artwork
+
+The artwork reader exists so a library view can show album art. It reads the
+pictures that are *inside* the file and nothing else.
+
+- **API.** `read_artwork(path) -> Result<Option<Artwork>>` returns the front
+  cover, `read_artworks(path) -> Result<Vec<Artwork>>` returns every picture
+  of the file in the tag precedence order (primary tag first). `Artwork`
+  carries the role (`PictureKind`), the MIME type, the description and the
+  raw bytes. The bytes are the stored ones: no decoding, no resizing, no
+  validation — the caller hands them to an image decoder.
+- **Picture kinds.** `PictureKind` mirrors the ID3v2 `APIC` picture types
+  (`0..=20`, anything above is `Undefined(u8)`). MP4 has no picture type: the
+  `covr` atom *is* the album art, so an MP4 picture is reported as
+  `FrontCover`.
+- **The front cover** is the first picture that claims the role
+  (`FrontCover`). A picture that names no role (`Other`, the type `0`) is the
+  cover only when no picture claims the role — that is what a tagger writes
+  when it does not know the picture types. Pictures that name another role (a
+  back cover, the media label) are not the front cover: a file with only
+  those has no front cover and `read_artwork` answers `None`.
+- **Containers covered.** The ID3v2 `APIC` frame (MP3, AAC, WAV, AIFF), the
+  FLAC `PICTURE` block, the Vorbis `METADATA_BLOCK_PICTURE` (Ogg Vorbis,
+  Opus, Speex) and the MP4 `covr` atom. APEv2 cover art is *not* covered:
+  `lofty` keeps it as a binary item, not as a picture.
+- **Embedded only.** No network, no sidecar lookup: a `cover.jpg` next to the
+  file is never read. The reader touches the file it is given and nothing
+  else.
+- **Strict.** The artwork reader parses strictly, the tag reader stays
+  best-effort. A picture that cannot be parsed is an error, not a picture
+  that is silently dropped — a half-there cover is worse than none. The price
+  is that a file whose tag container is malformed in another way is an error
+  here as well, even when `read_tags` still reads its text fields. A file
+  without any picture is `Ok(None)`, never an error.
+- **Not written.** The tag layer cannot write pictures: `TrackMetadata` has no
+  field for them. Writing cover art needs the `rustamp-core` change below
+  (or a separate write API in this crate).
+
 ## Requests
 
 ### `rustamp-core` proposal (needs an RFC before it lands)
@@ -95,11 +134,12 @@ Decisions this crate makes where the frozen contracts leave room, plus the
    remove the workaround. Additive, `#[serde(default)]` already applies.
 2. **Add an artwork field to `TrackMetadata`** (for example
    `artwork: Vec<TrackArtwork>`), or bless a sibling type in `rustamp-meta`
-   as the contract for cover art. Today the playlist/library lane has no
-   agreed way to carry a picture from a tag read to the UI. Keeping raw bytes
-   in `TrackMetadata` would make it heavier to clone on the hot path, so a
-   side-channel type is probably better; that is exactly why this is a
-   proposal and not a change.
+   as the contract for cover art. The sibling type exists now (`Artwork` in
+   `rustamp-meta`, read with `read_artwork`), but the playlist/library lane
+   still has no agreed way to carry a picture from a tag read to the UI.
+   Keeping raw bytes in `TrackMetadata` would make it heavier to clone on
+   the hot path, so a side-channel type is probably better; that is exactly
+   why this is a proposal and not a change.
 3. **Note (no change requested):** `TrackMetadata::duration_ms` /
    `bitrate_kbps` are deliberately left `None` here; the decoder fills them
    from the container. If the library ever wants tag-only durations without
@@ -203,3 +243,28 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   own choice; gain clamps at ±51 dB by own choice; non-finite samples and
   ragged frames are refused loudly. Not EBU R128, not bit-identical to
   mp3gain/metaflac/foobar2000/loudgain.
+
+## Audit (artwork reading)
+
+- **The API changed shape.** `read_artwork` used to answer
+  `Result<Vec<Artwork>>` (every picture). It now answers
+  `Result<Option<Artwork>>` — the front cover, which is what a library view
+  needs — and the old form is `read_artworks`. The picture type is a
+  `PictureKind` instead of a bare `u8`, so a caller can ask
+  `is_front_cover()` instead of comparing numbers. No crate outside this one
+  used the old signature.
+- **Tested, headless, on temp files.** The front cover is read back from all
+  four containers: the ID3v2 `APIC` frame, the FLAC `PICTURE` block, the
+  Vorbis `METADATA_BLOCK_PICTURE` and the MP4 `covr` atom — bytes, MIME type
+  and description survive. A file without a picture answers `None`, not an
+  error; a picture that cannot be parsed is an error, never a panic (a
+  truncated FLAC picture block and a truncated `APIC` frame are both tested).
+  A back cover is not the front cover, and a real front cover wins over an
+  untyped picture.
+- **The test writes the pictures with `lofty`.** The tag layer of this crate
+  cannot write pictures, so the test writes them with `lofty`'s own API
+  (`Tag::push_picture` + `Tag::save_to`) into a copy of a fixture.
+- **Still open:** writing cover art (needs the `rustamp-core` proposal
+  below), a sidecar `cover.jpg` lookup (deliberately out of scope), and
+  decoding the image (the caller's job — the bytes are handed over as they
+  are stored).

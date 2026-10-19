@@ -7,8 +7,10 @@
 //! The crate is deliberately *tags only*:
 //!
 //! * [`read_tags`] reads the tag fields of a file without decoding any audio.
-//! * [`read_artwork`] exposes embedded pictures as raw bytes (no image
-//!   decoding, no resizing).
+//! * [`read_artwork`] reads the embedded front cover of a file as raw bytes
+//!   (no image decoding, no resizing) and [`read_artworks`] reads every
+//!   embedded picture. Only pictures *inside* the file are read: a cover
+//!   image that sits next to the file is not looked for.
 //! * [`scan_paths`] reads many files at once, returning one [`Result`] per
 //!   path so a single unreadable file never aborts a folder scan.
 //! * [`write_tags`] writes the common fields back, preserving whatever the
@@ -33,6 +35,15 @@
 //! audio is never decoded, and the file is replaced atomically. Which tag
 //! format is written, and which unknown frames or keys survive, is
 //! documented in the `write` module.
+//!
+//! ## Artwork
+//!
+//! The embedded pictures of the containers the crate understands are read:
+//! the ID3v2 `APIC` frame (MP3, AAC, WAV, AIFF), the FLAC `PICTURE` block,
+//! the Vorbis `METADATA_BLOCK_PICTURE` (Ogg Vorbis, Opus, Speex) and the MP4
+//! `covr` atom. [`read_artwork`] returns the front cover — the one picture a
+//! library view shows — and [`read_artworks`] returns every picture of the
+//! file. The bytes are the stored ones; this crate never decodes an image.
 //!
 //! ## Out of scope
 //!
@@ -64,8 +75,8 @@ mod read;
 pub mod replaygain;
 mod write;
 
-pub use artwork::Artwork;
-pub use read::{read_artwork, read_tags, scan_paths};
+pub use artwork::{Artwork, PictureKind};
+pub use read::{read_artwork, read_artworks, read_tags, scan_paths};
 pub use replaygain::{
     ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, MAX_GAIN_DB, R128_ALBUM_GAIN_KEY, R128_STEPS_PER_DB,
     R128_TRACK_GAIN_KEY, REFERENCE_LOUDNESS_KEY, REFERENCE_RMS, REPLAYGAIN_KEYS,
