@@ -94,7 +94,7 @@ fn rust_theme_loads_all_32_entries_without_substitutions() {
     assert_eq!(skin.pledit().normal, [0xDF, 0x7B, 0x38]);
     assert_eq!(skin.pledit().current, [0xFF, 0xFF, 0xFF]);
     assert_eq!(skin.pledit().normal_bg, [0x14, 0x15, 0x17]);
-    assert_eq!(skin.pledit().selected_bg, [0x6A, 0x26, 0x10]);
+    assert_eq!(skin.pledit().selected_bg, [0x00, 0x00, 0xC6]);
 
     // Viscolors: 24 colors loaded
     let vis = skin.viscolors();
@@ -184,7 +184,7 @@ fn text_files_parse_results_match_rust_theme() {
     assert_eq!(pledit.normal, [0xDF, 0x7B, 0x38]);
     assert_eq!(pledit.current, [0xFF, 0xFF, 0xFF]);
     assert_eq!(pledit.normal_bg, [0x14, 0x15, 0x17]);
-    assert_eq!(pledit.selected_bg, [0x6A, 0x26, 0x10]);
+    assert_eq!(pledit.selected_bg, [0x00, 0x00, 0xC6]);
     assert_eq!(pledit.font.as_deref(), Some("Arial"));
 
     let vis = rustamp_skin::viscolor::parse_viscolors(rust_theme::viscolor_str());
