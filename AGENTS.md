@@ -18,6 +18,9 @@ Read these first, in this order:
   subagent writes nothing there. Before creating the worktrees, make sure the
   baseline is **committed** — a worktree is cut from a commit, so uncommitted
   work in the canonical tree is invisible to every worktree.
+  **Delete the worktree from disk as soon as its work is merged** (owner rule,
+  2026-10-19): a merged lane leaves no worktree behind, so the tree list stays a
+  picture of what is actually running.
 
 - **Garbage output → restart the task on a stronger model** (owner rule, 2026-10-19).
   When a lane reports success but the diff is speculative — invented APIs, alias
