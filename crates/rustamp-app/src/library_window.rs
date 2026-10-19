@@ -317,12 +317,17 @@ impl LibraryWindow {
     /// Paints the window: the page, the chrome and the status line.
     pub fn render(&self) -> Image {
         let mut frame = Image::new(self.size.0, self.size.1);
+        // Cover art is not wired into the app yet: the renderer takes a
+        // borrowed RGBA view per visible row, and the artwork cache that
+        // produces them is a follow-up lane. An empty slice draws the rows
+        // without covers, which is the documented "no cover" state.
         rustamp_ui::render_library_window(
             &mut frame,
             &self.view,
             &self.layout(),
             self.viewport(),
             self.search_focused,
+            &[],
         );
         frame
     }
