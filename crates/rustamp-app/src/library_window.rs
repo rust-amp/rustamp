@@ -61,7 +61,7 @@ use rustamp_core::error::{Error, Result};
 use rustamp_core::playlist::MediaLocation;
 use rustamp_core::state::WindowId;
 use rustamp_gfx::{Image, Rect};
-use rustamp_library::{Cancel, Library, Query, ScanPhase, ScanProgress, SortKey, TrackRow};
+use rustamp_library::{Cancel, Library, Query, Root, ScanPhase, ScanProgress, SortKey, TrackRow};
 use rustamp_ui::library_render::{LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT};
 use rustamp_ui::{
     Key, LibraryChrome, LibraryColumn, LibraryLayout, LibraryRequest, LibraryRow, LibrarySort,
@@ -141,6 +141,12 @@ pub struct LibraryWindow {
     folder_request: bool,
     /// The last failure the user should see; it is shown in the caption.
     error: Option<String>,
+    /// The registered roots, as the preferences page shows them.
+    ///
+    /// The roots live in the index. This is the list the app read last, and
+    /// it answers while a scan holds the index: a scan does not change the
+    /// roots, so the list is still the truth.
+    roots: Vec<PathBuf>,
 }
 
 impl Default for LibraryWindow {
@@ -154,6 +160,7 @@ impl Default for LibraryWindow {
             open: false,
             folder_request: false,
             error: None,
+            roots: Vec::new(),
         };
         window.update_viewport();
         window
@@ -248,11 +255,24 @@ impl LibraryWindow {
         if self.open {
             return self.close();
         }
-        if self.index.is_none() && self.worker.is_none() {
-            self.index = Some(Self::open_index(database)?);
-        }
+        self.ensure_index(database)?;
         self.open = true;
         self.refresh()
+    }
+
+    /// Opens the index if it is not open yet.
+    ///
+    /// The library window opens the index when it opens; the preferences
+    /// page needs the roots before that, so the app asks for the index here.
+    /// A running scan holds the index: it is not opened a second time, and
+    /// the scan is left alone.
+    pub fn ensure_index(&mut self, database: Option<&Path>) -> Result<()> {
+        if self.index.is_none() && self.worker.is_none() {
+            self.index = Some(Self::open_index(database)?);
+            let roots = self.read_roots(database)?;
+            self.roots = roots;
+        }
+        Ok(())
     }
 
     /// Closes the window (its own close box).
@@ -503,7 +523,88 @@ impl LibraryWindow {
             return Err(Error::NotFound("the library index is not open".into()));
         };
         index.add_root(&path)?;
+        // The new root is in the index now: the list the app keeps says so
+        // before the scan takes the index away.
+        let roots = root_paths(index.roots()?);
+        self.roots = roots;
         self.start_scan(vec![path])
+    }
+
+    /// The registered roots, oldest first.
+    ///
+    /// The index that is open answers. Without one - the library window was
+    /// never opened, or a scan holds the index - the list the app read last
+    /// answers: a scan does not change the roots, so the list is still the
+    /// truth.
+    pub fn roots(&self) -> Result<Vec<PathBuf>> {
+        match self.index.as_ref() {
+            Some(index) => Ok(root_paths(index.roots()?)),
+            None => Ok(self.roots.clone()),
+        }
+    }
+
+    /// Reads the registered roots into the list the app keeps.
+    ///
+    /// The index that is open answers; without one a short connection to
+    /// the same database file answers. A player whose library has no
+    /// database file yet has no roots, and the file is not created just to
+    /// read them.
+    pub fn refresh_roots(&mut self, database: Option<&Path>) -> Result<()> {
+        let roots = self.read_roots(database)?;
+        self.roots = roots;
+        Ok(())
+    }
+
+    /// Forgets the root `path` and the tracks indexed under it.
+    ///
+    /// A running scan is stopped first: a scan of the removed root would
+    /// index its tracks again, and the root would leave tracks behind that
+    /// no later scan removes (only the registered roots are scanned).
+    ///
+    /// The index that is open answers; without one a short connection to
+    /// the same database file answers.
+    pub fn remove_root(&mut self, database: Option<&Path>, path: &Path) -> Result<()> {
+        self.stop_scan();
+        if let Some(index) = self.index.as_mut() {
+            index.remove_root(path)?;
+        } else {
+            let Some(database) = database else {
+                return Err(Error::NotFound(
+                    "the media library has no index to remove a root from".into(),
+                ));
+            };
+            let mut index = Library::open(database)?;
+            index.remove_root(path)?;
+        }
+        self.refresh_roots(database)
+    }
+
+    /// Asks the presenter for a folder to add to the library.
+    ///
+    /// The request is drained from the tick, never from a window procedure:
+    /// the folder dialog runs its own modal message loop.
+    pub fn request_folder(&mut self) {
+        self.folder_request = true;
+    }
+
+    /// The roots of the index, read from the index that is open or from a
+    /// short connection to the database file.
+    fn read_roots(&self, database: Option<&Path>) -> Result<Vec<PathBuf>> {
+        if let Some(index) = self.index.as_ref() {
+            return Ok(root_paths(index.roots()?));
+        }
+        let Some(database) = database else {
+            // Without a database file the roots live in the in-memory index,
+            // which is only there while the library window holds it.
+            return Ok(Vec::new());
+        };
+        if !database.is_file() {
+            // The library was never used: it has no roots, and the database
+            // file is not created just to read them.
+            return Ok(Vec::new());
+        }
+        let index = Library::open(database)?;
+        Ok(root_paths(index.roots()?))
     }
 
     /// Scans the registered roots again.
@@ -511,7 +612,7 @@ impl LibraryWindow {
         let Some(index) = &self.index else {
             return Ok(());
         };
-        let roots: Vec<PathBuf> = index.roots()?.into_iter().map(|root| root.path).collect();
+        let roots = root_paths(index.roots()?);
         self.start_scan(roots)
     }
 
@@ -624,6 +725,11 @@ impl LibraryWindow {
         self.take_back(worker);
         self.refresh()
     }
+}
+
+/// The paths of the registered roots.
+fn root_paths(roots: Vec<Root>) -> Vec<PathBuf> {
+    roots.into_iter().map(|root| root.path).collect()
 }
 
 /// The index query the view's request asks for.
@@ -741,7 +847,48 @@ impl App {
 
     /// Adds a folder to the library and scans it.
     pub fn library_add_folder(&mut self, path: PathBuf) -> Result<()> {
+        // The index is opened here when it is not open yet: the folder can
+        // be added before the library window was ever opened.
+        let database = self.library_database_path();
+        self.library_window.ensure_index(database.as_deref())?;
         self.library_window.scan_folder(path)
+    }
+
+    /// The media library's roots, as the preferences page shows them.
+    ///
+    /// The roots live in the media library's own database, not in the
+    /// configuration file: the page reads them from the index. A database
+    /// that cannot be read leaves the page empty; the failure is reported
+    /// when the roots are read for the page (see
+    /// [`App::refresh_library_roots`]).
+    pub(crate) fn library_roots(&self) -> Vec<String> {
+        match self.library_window.roots() {
+            Ok(roots) => roots
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Reads the media library's roots for the preferences page.
+    ///
+    /// The index answers when it is open; without one a short connection to
+    /// the database file answers. A player whose library was never used has
+    /// no database file, and the file is not created just because the page
+    /// was looked at.
+    pub fn refresh_library_roots(&mut self) -> Result<()> {
+        let database = self.library_database_path();
+        self.library_window.refresh_roots(database.as_deref())
+    }
+
+    /// Forgets the media library's root `path` and the tracks under it.
+    pub(crate) fn remove_library_root(&mut self, path: &Path) -> Result<()> {
+        let database = self.library_database_path();
+        self.library_window.remove_root(database.as_deref(), path)?;
+        // The library window must not show the tracks that are gone now.
+        self.library_window.refresh()?;
+        Ok(())
     }
 
     /// Closes the library window (its own close box).

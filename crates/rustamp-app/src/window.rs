@@ -1589,6 +1589,12 @@ impl Windowed {
                     _ => {
                         // Fresh folder and approval list each time it opens.
                         self.app.rescan_plugins();
+                        // The library page lists the media library's roots:
+                        // they are read from the index when it is open, and
+                        // from the database file when it is not.
+                        if let Err(error) = self.app.refresh_library_roots() {
+                            eprintln!("rustamp: the library roots could not be read: {error}");
+                        }
                         let settings = self.app.prefs_settings();
                         match PrefsWindow::open(self.raw_main_window(), node, &settings) {
                             Ok(window) => self.prefs_window = Some(window),
@@ -1619,7 +1625,8 @@ impl Windowed {
 
     /// Shows the folder dialog the media library asked for.
     ///
-    /// `Ctrl+O` in the library window asks for a folder to index. The
+    /// `Ctrl+O` in the library window asks for a folder to index, and the
+    /// preferences page's `Add folder...` button asks for one too. The
     /// request is drained from the tick, never from a window procedure: the
     /// dialog runs its own modal message loop, exactly like the tray popup.
     /// A cancelled dialog adds nothing; a chosen folder is registered as a
