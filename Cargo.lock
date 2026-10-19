@@ -1905,6 +1905,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "rustamp-core",
+ "thiserror 2.0.21",
  "wasapi",
 ]
 

@@ -18,6 +18,17 @@
 //! device it tried and lists the devices that exist; no backend substitutes a
 //! different device behind the caller's back.
 //!
+//! # Which device to open
+//!
+//! The configuration names the device and the mode, and [`selection`] turns
+//! them into the plan the player opens: [`selection::plan`] is pure (no
+//! device, no enumeration), and [`selection::resolve`] checks the name against
+//! the devices that exist — a name that matches nothing is a typed error, and
+//! the *caller* decides whether to fall back to the default device or to
+//! refuse to play. The matching rule (trimmed, case-insensitive, contained in
+//! the device's friendly name) is the one the backends use to open a named
+//! device, so a name that resolves opens that device.
+//!
 //! `default_output()` picks WASAPI on Windows when a shared-mode client can be
 //! initialised and `cpal` otherwise. That choice is made **before** any open and
 //! is visible to the caller through [`OutputDevice::name`]; the selected backend
@@ -80,6 +91,7 @@
 mod null;
 
 pub mod recovery;
+pub mod selection;
 
 #[cfg(windows)]
 mod wasapi_exclusive;
