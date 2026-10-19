@@ -216,7 +216,7 @@ pub enum MenuAction {
 /// Identity of a top-level row (settled order and labels: S04 §2 rows 1-15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MainMenuId {
-    /// Title row `Nullsoft Winamp...` (S04 §2 row 1; visual reading).
+    /// Title row `Rustamp...` (S04 §2 row 1; visual reading).
     Title,
     /// `Play` submenu (S04 §2 row 2).
     Play,
@@ -316,7 +316,7 @@ pub const MAIN_MENU: [MenuRow; MAIN_MENU_ROWS] = [
     // S04 §2 row 1: title row (visual reading, y≈11-28).
     MenuRow::Item(MainMenuItem {
         id: MainMenuId::Title,
-        label: "Nullsoft Winamp...",
+        label: "Rustamp...",
         shortcut: None,
         check: MenuCheck::None,
         action: MenuAction::NoAction,
@@ -1169,7 +1169,7 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "Nullsoft Winamp...",
+                "Rustamp...",
                 "Play",
                 "View file info",
                 "Bookmarks",

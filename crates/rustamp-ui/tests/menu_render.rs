@@ -129,7 +129,7 @@ fn labels_draw_through_the_skin_font() {
     let skin = synthetic_skin();
     let frame = render_main_menu(&skin, &MainWindowState::default(), &MenuFlags::default());
     let background = face(&skin);
-    // Row 0 (the `Nullsoft Winamp...` title, S04 §2 row 1, band 0..35,
+    // Row 0 (the `Rustamp...` title, S04 §2 row 1, band 0..35,
     // labels at x = 45 per the S04 §3.5 text zone) holds `a` cells.
     let mut glyph_pixels = 0;
     for y in 0..35 {
