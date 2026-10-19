@@ -4,6 +4,16 @@
 no DLL loader, probe DLL or executable acceptance runner implemented. No runtime
 acceptance claimed. This card is not permission to run anything.
 
+> **The status paragraph above predates the loader and the W23 lane.** The
+> loader, the approval store, the registry and the control routing exist
+> (`crates/rustamp-plughost/src/loader.rs`, `approval.rs`, `registry.rs`,
+> `control.rs`), and §9 records the per-item audit of 2026-10-19, including
+> the general-purpose fixture and the two acceptance tests this lane added.
+> The owner released the acceptance work on 2026-10-18
+> (`docs/tasks/LANE-QUEUE.md`, "Released by the owner"); **no runtime
+> acceptance is claimed by this card or by that lane** — the VM run is still
+> the only thing that can produce one.
+
 **Boundary:** write only your own files in
 `C:\Users\micro\.local\share\opencode\worktree\26de0e\wave41-plughost-dll`.
 Write nothing under `D:\code\Rustamp`; do not even read that canonical tree,
@@ -234,3 +244,89 @@ default-target compile checks, not an i686 runtime proof. Seven new test
 functions were compile-checked only. No test ran, plugin loaded, window opened,
 audio played, download performed or commit made. All authored source/card
 changes are in the owned paths above; build outputs remain worktree-local.
+
+## 9. Audit of the card against the code (2026-10-19, wave 137)
+
+The card is older than the code. This section records, per card item, what
+already existed, what this lane implemented, what only the VM can produce and
+what still needs a specification. **No runtime acceptance is claimed here**:
+every new test is `#[ignore]`d and VM-only, and nothing in this lane loaded a
+DLL, opened a window or ran a plugin.
+
+### 9.1 Per item
+
+| Card item | State | Where |
+|---|---|---|
+| §1 label correction (surface test is not a plugin) | done already | `tests/test_plugin_ours.rs`, `src/host_window.rs` |
+| §2 first milestone: load one 32-bit `gen_` probe DLL, exercise real calls and window procedures in both directions, open/close its Config dialog, quit cleanly | **implemented now** (VM-only) | fixture `examples/gen_rustamp_fixture.rs`; in-process `tests/gen_acceptance.rs`; at the process level `tests/control_load_acceptance.rs` |
+| §3 S09 fact ledger | done already (spec) | `specs/S09-plugin-abi.md` |
+| §4 step 0 (gate, staging, hashes) | partly done already: the runner stages binaries and the approval store pins bytes; the run manifest is still the VM owner's | `docs/notes/vm-run-tests.ps1`, `src/approval.rs` |
+| §4 step 1 (spawn through the production supervisor) | done already for the load path | `tests/control_load_acceptance.rs`, `src/registry.rs` |
+| §4 step 2 (own the real `Winamp v1.x` HWND before init) | done already | `src/host_window.rs`; the fixture now checks the class itself (`parent class ok=1`) |
+| §4 step 3 (load, resolve the export, call the getter) | done already (loader) | `src/loader.rs` (`load_plugin`, `load_plugin_with_store`, `map_plugin_image`, `load_general_module`) |
+| §4 step 4 (check version and slots, write host fields) | done already | `src/loader.rs` `init_general_module`; `LoadedPlugin::general_info` |
+| §4 step 5 (`init` on the UI thread) | done already | `src/loader.rs`; the fixture's own trace records it |
+| §4 step 6 (IPC from DLL code through the saved original proc) | **implemented now** (VM-only) | `examples/gen_rustamp_fixture.rs` (`query_parent`, `subclass_proc`), `tests/gen_acceptance.rs` |
+| §4 step 7 (unknown IPC id answers 1) | done already in the surface; **exercised from DLL code now** | `src/ipc.rs` (`UNKNOWN_REPLY`), the fixture's `CMD_IPC_UNKNOWN_REPLY` |
+| §4 step 8 (a fresh challenge to the plugin-owned window) | **implemented now** (VM-only) | private challenge protocol, `tests/common/gen_protocol.rs` |
+| §4 step 9 (Config: owned by the parent, closed by the guest, host keeps pumping) | **implemented now** (VM-only) | the fixture's `fixture_config`; `tests/gen_acceptance.rs` |
+| §4 step 10 (quit: windows gone, subclass restored, no premature `FreeLibrary`) | done already for the ordering; **the restore and the window teardown are exercised now** | `src/registry.rs` `quit_all`, `src/loader.rs` `LoadedPlugin::quit` |
+| §5.1 owner/reference gate | released by the owner (2026-10-18); the reference *installation* is still not needed by this milestone | `docs/tasks/LANE-QUEUE.md` |
+| §5.2 fixture + real loader | loader done already; **the clean-room `gen_` fixture implemented now** | `examples/gen_rustamp_fixture.rs`, `crates/rustamp-plughost/Cargo.toml` |
+| §5.3 control routing | done already (W23); **the general kind at the process level added now** | `src/registry.rs`, `src/control.rs`, `src/main.rs` |
+| §5.4 S09 confirmations (U-7 version range, U-8 `init` result, U-15 Config context) | **needs a spec** — the code records the raw `init` result and does not interpret it | `src/loader.rs` `GeneralModuleInfo::init_result` |
+| §5.5 private test protocol / evidence | **implemented now**: an OS-registered message, a private command set, the fixture's own trace file | `tests/common/gen_protocol.rs`, `examples/gen_rustamp_fixture.rs` |
+| §5.6 the other kinds (vis, output, input, DSP lifecycle) | out of this milestone: the card proves one kind, not five. Vis/output need their own card and their own fixtures | `src/pe_preflight.rs` (input/DSP/general only) |
+| §5.7 reference cross-check against 2.95 | **needs a spec** (dirty room) | S09 U-7, U-8, U-15 |
+| §6 safe scaffolding (passive preflight) | done already | `src/pe_preflight.rs` |
+| §7 the retained run bundle | **partly**: the plugin's own trace file and the test log exist; the retained bundle, the module inventory and the captures are still the VM owner's | `examples/gen_rustamp_fixture.rs` (`trace`) |
+| §8 lane verification | this lane's receipts below | — |
+
+### 9.2 What only the VM can produce
+
+Both new tests are `#[ignore]`d and refuse loudly (never skip) outside the
+test VM, off i686 or without the fixture:
+
+| Test | Proves |
+|---|---|
+| `tests/gen_acceptance.rs` `a_real_general_purpose_plugin_is_loaded_answers_from_its_own_code_and_quits_cleanly` | the whole in-process milestone: load, version, host fields, subclass, plugin-originated IPC (`0x2905`) and unknown-id (`1`), the plugin's own window answering a challenge, the Config window owned by the host's window and closed by the guest, the quit restoring the host's original window procedure, and the plugin's own trace agreeing with the host's trace |
+| `tests/control_load_acceptance.rs` `the_real_host_process_loads_a_general_purpose_dll_and_quits_it_cleanly` | the process-level half: the production `rustamp-plughost32.exe` maps the same DLL, answers `PluginLoaded { kind: General }` and quits the plugin on shutdown, proved by the plugin's own trace file inside the host process |
+
+The runner must build and stage the fixture: `docs/notes/vm-run-tests.ps1`
+now copies `target\i686-pc-windows-msvc\debug\examples\gen_rustamp_fixture.dll`
+next to the test binaries and reports the fixture's state on every run.
+
+### 9.3 What this lane did **not** do, and why
+
+* **No runtime acceptance.** Nothing was loaded, no window was opened, no
+  plugin ran, no test ran in this lane. The `#[ignore]`d tests are the
+  orchestrator's interactive VM run.
+* **No wire-level "configure plugin N".** The protocol has no such message
+  (S10/RFC 0006), so routing a user-equivalent Configure request from the app
+  needs an RFC and the contract lane. `PluginRegistry::config` is ready for it
+  in process.
+* **No app side.** `rustamp-app` still never sends `LoadPlugin` nor reads the
+  host's stdout; that is `rustamp-app`'s path.
+* **No reference cross-check, no 2.95 comparison, no captures.**
+* **The visualization and output kinds** stay untouched, as the card's first
+  milestone is one kind.
+
+### 9.4 Lane receipts (2026-10-19, wave 137)
+
+Compile-only, in this lane's worktree:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | **exit 0** |
+| `cargo clippy -p rustamp-plughost -p rustamp-plugin-abi --all-targets --all-features -- -D warnings` | **exit 0** |
+| `cargo test -p rustamp-plughost -p rustamp-plugin-abi --all-features` | **exit 0** (97 + 6 unit tests pass; the 6 VM-only tests are `#[ignore]`d and did not run) |
+| the same Clippy gate with `--target i686-pc-windows-msvc` | **exit 0** |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **exit 0** |
+| `cargo test --workspace --all-features` | **exit 0** |
+| `git diff --check` | **exit 0** |
+
+The i686 fixture was built and inspected **passively** (`dumpbin /exports`):
+machine `14C`, `DLL`, and the **undecorated** export
+`winampGetGeneralPurposePlugin`; the host's own preflight selects those bytes
+as `PluginKind::General`. No DLL was mapped, no window opened, no test
+executed, no download, no dependency added and nothing committed.
