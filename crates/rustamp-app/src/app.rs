@@ -47,6 +47,7 @@ use rustamp_gfx::Image;
 use rustamp_ipc::{Message, Transport};
 use rustamp_meta::replaygain::ReplayGainTags;
 use rustamp_output::NullClock;
+use rustamp_plugin_abi::PluginKind;
 use rustamp_ui::{
     DialogManager, EqMenuRequest, EqualizerLayout, EqualizerWindow, Key, MainWindow,
     MainWindowLayout, MainWindowState, Modifiers, PlaylistDialog, PlaylistWindow, ShortcutAction,
@@ -1468,6 +1469,36 @@ impl App {
                  was not opened"
                     .to_string(),
             ),
+        }
+    }
+
+    /// Ask the plugin host to load the plug-in at `path` (the player -> host
+    /// direction).
+    ///
+    /// A classic plug-in runs inside `rustamp-plughost32.exe`, so only the
+    /// host can map one: the app names the file and the kind it declares and
+    /// the host loads it — or refuses it, with the reason (see
+    /// [`crate::host`]). The answer arrives on the same channel and is read
+    /// on the next [`pump`](App::pump): a loaded plug-in shows up in
+    /// [`host_plugins`](App::host_plugins), a refused one becomes a note.
+    ///
+    /// The request is never dropped silently: a missing or dead host is
+    /// reported to the user as a note, the same way an unimplemented command
+    /// is.
+    pub fn request_plugin_load(&mut self, path: &Path, kind: PluginKind) {
+        match self.host.load_plugin(path, kind) {
+            CommandOutcome::Sent => self.note(format!(
+                "the plugin host was asked to load {}",
+                path.display()
+            )),
+            CommandOutcome::Detached => self.note(format!(
+                "no plugin host is attached: {} was not loaded",
+                path.display()
+            )),
+            CommandOutcome::HostGone => self.note(format!(
+                "the plugin host is gone: {} was not loaded",
+                path.display()
+            )),
         }
     }
 
@@ -3570,6 +3601,139 @@ mod tests {
         // The note is given once, not on every pump.
         app.pump().unwrap();
         assert!(app.drain_notes().is_empty());
+    }
+
+    // ----- asking the host to load a plug-in -----
+
+    /// A scan with one approved plug-in, as the plug-in pages would list it.
+    fn scan_with_one_plugin(app: &mut App) {
+        app.plugin_scan = rustamp_prefs::PluginScan {
+            dir: PathBuf::from("C:\\plugins"),
+            entries: vec![rustamp_prefs::PluginEntry {
+                file: "gen_one.dll".to_string(),
+                path: PathBuf::from("C:\\plugins\\gen_one.dll"),
+                kind: PluginKind::General,
+                size: 4096,
+                status: rustamp_prefs::PluginStatus::Approved,
+            }],
+            dir_problem: None,
+            store_problem: None,
+        };
+    }
+
+    /// The load requests the host received, in order.
+    fn load_requests(host_end: &mut rustamp_ipc::MemoryTransport) -> Vec<(String, PluginKind)> {
+        let mut requests = Vec::new();
+        while let Ok(Some(message)) = host_end.try_recv() {
+            if let Message::LoadPlugin { path, kind } = message {
+                requests.push((path, kind));
+            }
+        }
+        requests
+    }
+
+    #[test]
+    fn switching_a_plugin_on_asks_the_plugin_host_to_load_it() {
+        use rustamp_ipc::MemoryTransport;
+        use rustamp_platform::PrefsAction;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+        scan_with_one_plugin(&mut app);
+        // The plug-in is switched off, so the page's toggle switches it on.
+        app.config.plugins.disabled = vec!["gen_one.dll".to_string()];
+
+        app.apply_prefs_action(PrefsAction::TogglePlugin(0));
+
+        // Exactly one request crossed the channel, and it names the file the
+        // scan listed and the kind that file declares. The pump's own frames
+        // (the greeting, the state snapshot) are not requests.
+        assert_eq!(
+            load_requests(&mut host_end),
+            vec![("C:\\plugins\\gen_one.dll".to_string(), PluginKind::General)]
+        );
+        // The choice is saved as well: the plug-in stays on after a restart.
+        assert!(app.config.plugins.disabled.is_empty());
+    }
+
+    #[test]
+    fn switching_a_plugin_off_asks_the_host_for_no_load() {
+        use rustamp_ipc::MemoryTransport;
+        use rustamp_platform::PrefsAction;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+        scan_with_one_plugin(&mut app);
+
+        // The plug-in is on (approved and not on the disabled list), so the
+        // page's toggle switches it off.
+        app.apply_prefs_action(PrefsAction::TogglePlugin(0));
+
+        // Nothing was loaded: a plug-in that is switched off is not asked
+        // for.
+        assert!(load_requests(&mut host_end).is_empty());
+        // The protocol has no unload request, so the user is told that the
+        // plug-in stays loaded in the host.
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|note| note.contains("no unload request")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_plugin_host_the_load_request_is_reported_not_dropped() {
+        use rustamp_platform::PrefsAction;
+
+        let (mut app, _dir) = app_with_file(None);
+        assert!(!app.host_attached());
+        scan_with_one_plugin(&mut app);
+        app.config.plugins.disabled = vec!["gen_one.dll".to_string()];
+
+        app.apply_prefs_action(PrefsAction::TogglePlugin(0));
+
+        // The request could not go anywhere, and the user is told so.
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("no plugin host is attached")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn the_plugin_the_host_loaded_lands_in_the_inventory() {
+        use rustamp_ipc::MemoryTransport;
+        use rustamp_platform::PrefsAction;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+        scan_with_one_plugin(&mut app);
+        app.config.plugins.disabled = vec!["gen_one.dll".to_string()];
+
+        app.apply_prefs_action(PrefsAction::TogglePlugin(0));
+
+        // The host answers the load.
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 1,
+                name: "Rustamp Fixture".to_string(),
+                kind: PluginKind::General,
+            })
+            .unwrap();
+
+        // The pump reads the answer, like every other host message.
+        app.pump().unwrap();
+
+        let plugins = app.host_plugins();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].plugin_id, 1);
+        assert_eq!(plugins[0].name, "Rustamp Fixture");
+        assert_eq!(plugins[0].kind, PluginKind::General);
     }
 
     // ----- the equalizer window (S07; headless, no window opened) -----

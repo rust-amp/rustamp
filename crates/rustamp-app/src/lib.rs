@@ -52,8 +52,9 @@
 //!   frame and the resizability put back.
 //! * [`supervise`] — spawn and supervision for `rustamp-plughost32`: finding
 //!   the i686 host binary, starting it with `CREATE_NO_WINDOW` over piped
-//!   stdio, and re-attaching (or restarting) it when it dies — off the audio
-//!   path, degrading to detached.
+//!   stdio (with the operator's approval store, which the host needs before
+//!   it loads anything), and re-attaching (or restarting) it when it dies —
+//!   off the audio path, degrading to detached.
 //! * [`window`] — the `winit`/`softbuffer` shell for the real player.
 //!
 //! [`run`] is the entry point the `rustamp` binary calls.
@@ -163,8 +164,14 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     // Start the plugin host when it is resolvable (see `crate::supervise`):
     // best-effort by contract, so a missing binary only means the player runs
-    // detached — it never fails startup and never opens a window.
-    app.manage_host(crate::supervise::Supervisor::from_search());
+    // detached — it never fails startup and never opens a window. The host
+    // reads the operator's approval decisions from the store beside the
+    // configuration file; without that argument it approves nothing and
+    // refuses every load.
+    let approvals = app.plugin_approvals_path();
+    app.manage_host(crate::supervise::Supervisor::new(
+        crate::supervise::ProcessBackend::from_search().with_approvals(approvals),
+    ));
 
     match args.output {
         // ----- headless test mode: no window -----

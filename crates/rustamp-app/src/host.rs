@@ -182,7 +182,15 @@
 //! over the **same** channel as the snapshots — no new transport, no new
 //! message, no protocol change.
 //!
-//! Like publishing, sending a command never blocks the player: with no
+//! The other request the app sends is not a command but a
+//! [`Message::LoadPlugin`]: the app names a plug-in DLL and the kind it
+//! declares, and the host loads it (or refuses it, with the reason). The
+//! host owns the loader, the approval gate and the plug-in ids, so the
+//! request carries nothing but the path and the kind
+//! ([`HostStateLink::load_plugin`]). The answer comes back on the same
+//! channel and lands in the inventory (see the section above).
+//!
+//! Like publishing, sending a request never blocks the player: with no
 //! transport attached nothing goes out ([`CommandOutcome::Detached`]), and a
 //! failed send detaches the link and reports [`CommandOutcome::HostGone`].
 //! The app turns the outcome into a note, so a request is never dropped
@@ -215,6 +223,7 @@
 //!   non-blocking mode; overlapped I/O would need new dependencies), so the
 //!   handover — not a syscall flag — is the bound.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rustamp_core::command::Command;
@@ -319,14 +328,16 @@ pub enum PublishOutcome {
     HostGone,
 }
 
-/// What one [`HostStateLink::send_command`] attempt did.
+/// What one request to the host did.
 ///
-/// Like [`PublishOutcome`], none of these is an error the player must
-/// handle: the app reports the outcome to the user instead of failing, so a
-/// request is never dropped silently.
+/// A request is either a [`Command`](rustamp_core::command::Command) or a
+/// plug-in load (see [`HostStateLink::load_plugin`]). Like
+/// [`PublishOutcome`], none of these is an error the player must handle: the
+/// app reports the outcome to the user instead of failing, so a request is
+/// never dropped silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandOutcome {
-    /// The command went out on the transport.
+    /// The request went out on the transport.
     Sent,
     /// No transport is attached; nothing went out and nothing was touched.
     Detached,
@@ -691,6 +702,48 @@ impl HostStateLink {
                 // Same rule as a failed publish: the channel cannot be
                 // trusted any more, so the link detaches and the supervisor
                 // replaces the host.
+                self.detach();
+                CommandOutcome::HostGone
+            }
+        }
+    }
+
+    /// Asks the host to load the plug-in at `path` (the protocol's
+    /// [`Message::LoadPlugin`] request).
+    ///
+    /// A classic plug-in runs **inside** `rustamp-plughost32.exe` — only the
+    /// host can map one — so the player asks for it over the control channel
+    /// it already has. The request names the path the host shall read and the
+    /// kind the file declares; the host refuses a request whose kind does not
+    /// match the image (and refuses an image its approval store does not
+    /// approve), and answers either way: with [`Message::PluginLoaded`] (the
+    /// host-assigned id, the plug-in's name and its kind) or with
+    /// [`Message::PluginError`] (the path and the reason). Both answers are
+    /// read by [`poll`](HostStateLink::poll) and land in the inventory.
+    ///
+    /// The path travels as the protocol's text: the app spells it the way the
+    /// file system gave it to it, and the host reads the file itself — it
+    /// never trusts bytes the app saw, and it re-checks the kind against the
+    /// image before it maps anything.
+    ///
+    /// Never blocks the player: with no host attached nothing goes out
+    /// ([`CommandOutcome::Detached`]), and a failed send detaches the link
+    /// and reports [`CommandOutcome::HostGone`]. The caller turns the
+    /// outcome into a note, so a request is never dropped silently.
+    pub fn load_plugin(&mut self, path: &Path, kind: PluginKind) -> CommandOutcome {
+        if self.transport.is_none() {
+            return CommandOutcome::Detached;
+        }
+        let request = Message::LoadPlugin {
+            path: path.to_string_lossy().into_owned(),
+            kind,
+        };
+        match self.send(&request) {
+            Ok(()) => CommandOutcome::Sent,
+            Err(_) => {
+                // Same rule as a failed publish or a failed command: the
+                // channel cannot be trusted any more, so the link detaches and
+                // the supervisor replaces the host.
                 self.detach();
                 CommandOutcome::HostGone
             }
@@ -1140,6 +1193,63 @@ mod tests {
     }
 
     // ----- the plug-in inventory (the host's answers, read back) -----
+
+    #[test]
+    fn a_load_request_reaches_the_host_over_the_same_channel() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+
+        let path = Path::new("C:\\plugins\\gen_one.dll");
+        assert_eq!(
+            link.load_plugin(path, PluginKind::General),
+            CommandOutcome::Sent
+        );
+        // The peer decodes the real codec bytes into the same message: the
+        // path the host shall read and the kind the file declares.
+        assert_eq!(
+            host_end.recv().expect("one framed message"),
+            Message::LoadPlugin {
+                path: "C:\\plugins\\gen_one.dll".to_string(),
+                kind: PluginKind::General,
+            }
+        );
+        // Nothing else went out: one request, one frame.
+        assert!(host_end.try_recv().expect("codec reads").is_none());
+    }
+
+    #[test]
+    fn a_detached_link_refuses_the_load_instead_of_dropping_it() {
+        let mut link = HostStateLink::detached();
+        assert_eq!(
+            link.load_plugin(Path::new("C:\\plugins\\gen_one.dll"), PluginKind::General),
+            CommandOutcome::Detached
+        );
+        assert!(!link.is_attached());
+    }
+
+    #[test]
+    fn a_dead_host_detaches_on_a_failed_load_request() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (app_end, host_end) = MemoryTransport::pair();
+        drop(host_end);
+        let mut link = HostStateLink::detached();
+        link.attach(app_end);
+        // The failed send is absorbed: the link detaches and says so.
+        assert_eq!(
+            link.load_plugin(Path::new("C:\\plugins\\gen_one.dll"), PluginKind::General),
+            CommandOutcome::HostGone
+        );
+        assert!(!link.is_attached());
+        // From here on it is the ordinary no-host path.
+        assert_eq!(
+            link.load_plugin(Path::new("C:\\plugins\\gen_one.dll"), PluginKind::General),
+            CommandOutcome::Detached
+        );
+    }
 
     #[test]
     fn a_loaded_plugin_lands_in_the_inventory() {

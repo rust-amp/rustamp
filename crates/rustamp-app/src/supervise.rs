@@ -55,6 +55,11 @@
 //!   host at all. The report comes back out of
 //!   [`supervise`](Supervisor::supervise) so the app can show it to the user
 //!   (PLAN M3: "Crash isolation: restart the host on plugin crash").
+//! * **The host is told where the operator's approvals live.** The host
+//!   approves nothing without its `--approvals` argument and refuses every
+//!   load it is asked for, so the supervisor names the store the app reads
+//!   too ([`crate::app::App::plugin_approvals_path`]). The argument names
+//!   *where* the decision is recorded; it is not itself an approval.
 //!
 //! # Binary-path finding
 //!
@@ -445,6 +450,12 @@ impl Transport for ProcessLink {
 /// read on the app thread (see the module docs).
 pub struct ProcessBackend {
     exe: Option<PathBuf>,
+    /// The approval store the host reads (`--approvals`).
+    ///
+    /// `None` means the host approves nothing and refuses every load, so a
+    /// player that can load plug-ins names the store the operator filled in
+    /// (see [`crate::app::App::plugin_approvals_path`]).
+    approvals: Option<PathBuf>,
 }
 
 impl ProcessBackend {
@@ -454,12 +465,26 @@ impl ProcessBackend {
     pub fn from_search() -> Self {
         ProcessBackend {
             exe: find_plugin_host(),
+            approvals: None,
         }
     }
 
     /// Pin an explicit binary path (packaging layouts, tests).
     pub fn with_path(path: PathBuf) -> Self {
-        ProcessBackend { exe: Some(path) }
+        ProcessBackend {
+            exe: Some(path),
+            approvals: None,
+        }
+    }
+
+    /// Name the approval store the host reads (its `--approvals` argument).
+    ///
+    /// Without it the host approves nothing, so it refuses every load it is
+    /// asked for — the app's own plug-in pages would then offer plug-ins the
+    /// host can never load.
+    pub fn with_approvals(mut self, path: PathBuf) -> Self {
+        self.approvals = Some(path);
+        self
     }
 }
 
@@ -485,6 +510,12 @@ impl HostBackend for ProcessBackend {
             ));
         }
         let mut command = Command::new(&exe);
+        if let Some(approvals) = &self.approvals {
+            // The host reads the operator's approval decisions from this
+            // store; without the argument it approves nothing and refuses
+            // every load (see `rustamp-plughost`'s `--approvals`).
+            command.arg("--approvals").arg(approvals);
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -487,12 +487,35 @@ impl App {
                     return;
                 };
                 let on = !entry.is_enabled(self.plugins_config());
+                // The request the host gets carries the path and the kind, so
+                // they are read before the scan is borrowed again.
+                let path = entry.path.clone();
+                let kind = entry.kind;
                 match self.set_plugin_enabled(index, on) {
-                    // Saved at once: the player does not load plug-ins yet,
-                    // so the choice must not wait for a clean exit to count.
                     Ok(()) => {
+                        // Saved at once: the choice must not wait for a clean
+                        // exit to count.
                         if let Err(error) = self.save_config() {
                             self.note(format!("preferences: {error}"));
+                        }
+                        if on {
+                            // Switching a plug-in on asks the plugin host to
+                            // load it: the choice has to reach the host, not
+                            // only the configuration file. Only an approved
+                            // plug-in gets this far: the approval gate in
+                            // `set_plugin_enabled` refuses the rest, so the
+                            // host is never asked for an unapproved image.
+                            self.request_plugin_load(&path, kind);
+                        } else {
+                            // The protocol has no unload request, so the
+                            // plug-in stays loaded in the host until the host
+                            // is replaced. Saying so beats a switch that
+                            // looks as if it stopped something.
+                            self.note(format!(
+                                "the plugin host has no unload request: {} stays loaded until \
+                                 the host restarts",
+                                path.display()
+                            ));
                         }
                     }
                     Err(refused) => self.note(format!("preferences: {refused}")),
