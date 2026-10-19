@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use rustamp_ipc::Message;
 use rustamp_ipc::shm::{
-    AnonymousRegion, RING_DATA_OFFSET, RingConsumer, RingDirection, RingKind, RingProducer,
-    RingWake,
+    AnonymousRegion, RING_DATA_OFFSET, RingConsumer, RingDirection, RingError, RingKind,
+    RingProducer, RingWake,
 };
 use rustamp_mediahost::control::{ControlPeer, Liveness};
 use rustamp_mediahost::decoder::{
@@ -131,19 +131,15 @@ impl DeafRings {
         spec: PcmSpecWire,
         expected: RingDirection,
     ) -> Result<PcmInput<AnonymousRegion>> {
-        // The same rule production enforces: an offer in another direction is
-        // refused before any mapping opens.
-        check_offer(offer, expected)?;
-        let Message::RingOffer {
-            name, frame_size, ..
-        } = offer
-        else {
+        // The same rules production enforces: an offer in another direction
+        // or with a foreign frame size is refused before any mapping opens.
+        check_offer(offer, expected, spec)?;
+        let Message::RingOffer { name, .. } = offer else {
             // `check_offer` already refused every other message.
             return Err(MediaHostError::InvalidMessage(
                 "expected PCM RingOffer".into(),
             ));
         };
-        assert_eq!(*frame_size, spec.frame_size());
         let region = self.0.lock().unwrap()[name].clone();
         let expect = offer.ring_expect().unwrap();
         let consumer = RingConsumer::attach(region.clone(), expect)?
@@ -185,6 +181,80 @@ impl PcmRings for DeafRings {
     ) -> Result<PcmInput<Self::Region>> {
         self.open_impl(offer, spec, direction)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The offer rules
+// ---------------------------------------------------------------------------
+
+/// The error of a refused open. [`PcmInput`] is not `Debug`, so a refused
+/// result cannot be unwrapped with `unwrap_err`.
+fn refused<T>(result: Result<T>) -> MediaHostError {
+    match result {
+        Ok(_) => panic!("the open must be refused, not succeed"),
+        Err(error) => error,
+    }
+}
+
+/// The deaf ring double must report a foreign frame size the way production
+/// does: with the typed [`RingError::FrameSizeMismatch`], never with a
+/// panic.
+///
+/// Before the rule was shared, this double asserted the frame size with
+/// `assert_eq!`, so a mismatched offer aborted the test binary instead of
+/// reporting the error production returns.
+#[test]
+fn deaf_rings_refuse_the_frame_size_production_refuses() {
+    let rings = DeafRings::default();
+    // Mono: one channel is a 4-byte frame, the offer carries 8.
+    let mono = PcmSpecWire {
+        sample_rate_hz: SPEC.sample_rate_hz,
+        channels: 1,
+    };
+    let offer = rings.create(SPEC, 1).unwrap();
+
+    // The matching frame size opens.
+    assert!(rings.open(&offer.message, SPEC).is_ok());
+
+    // A spec with a different frame size is refused the way production
+    // refuses it, naming the size it expected and the one it found.
+    let error = refused(rings.open(&offer.message, mono));
+    assert!(
+        matches!(
+            &error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 4,
+                found: 8
+            })
+        ),
+        "a foreign frame size must be reported, not panicked: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "frame size mismatch: expected 4, found 8"
+    );
+
+    // An offer that lies about its frame size is refused with the same
+    // error, naming the spec's size as the expected one.
+    let mut lying = offer.message.clone();
+    if let Message::RingOffer { frame_size, .. } = &mut lying {
+        *frame_size = 16;
+    }
+    let error = refused(rings.open(&lying, SPEC));
+    assert!(
+        matches!(
+            &error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 8,
+                found: 16
+            })
+        ),
+        "a lying offer must be reported, not panicked: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "frame size mismatch: expected 8, found 16"
+    );
 }
 
 // ---------------------------------------------------------------------------
