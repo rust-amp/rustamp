@@ -17,7 +17,9 @@
 //! The standard file-open dialog and the directory picker live in
 //! [`file_dialog`]; the operating system's own popup menu lives in
 //! [`popup_menu`].
+//! A skin's cursor files become operating-system cursors in [`cursor`].
 
+pub mod cursor;
 pub mod displays;
 pub mod dpi;
 pub mod file_dialog;
@@ -27,6 +29,10 @@ pub mod prefs_dialog;
 pub mod single_instance;
 pub mod tray;
 
+pub use cursor::{
+    CursorError, CursorFormat, OsCursor, cursor_payload, pointer_window, restore_cursor,
+    set_window_cursor,
+};
 pub use displays::{
     DisplayChanges, DisplayError, DisplaySnapshot, Monitor, ScreenRect, clamp_saved_position,
     display_changes, dpi_at,

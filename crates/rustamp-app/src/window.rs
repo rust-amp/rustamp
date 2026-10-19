@@ -75,6 +75,7 @@ use std::time::{Duration, Instant};
 use rustamp_core::command::{Command, OpenMediaKind, PrefsPage};
 use rustamp_core::state::WindowId as CoreWindowId;
 use rustamp_platform::{HotkeyAction, init_dpi_awareness, single_instance, take_pending_hotkeys};
+use rustamp_skin::CursorSlot;
 use rustamp_ui::shell::TaskbarRole;
 use rustamp_ui::{
     DEFAULT_MAIN_POSITION, DialogKind, Key, Modifiers, ShortcutOutcome,
@@ -89,6 +90,7 @@ use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
 use crate::app::App;
+use crate::cursor::{CursorAction, SkinCursors, cursor_action};
 
 /// A window this presenter creates.
 ///
@@ -467,6 +469,11 @@ struct Windowed {
     left_down: bool,
     eq_left_down: bool,
     playlist_cursor: (i32, i32),
+    /// The skin's cursors as the operating system knows them, one per slot.
+    ///
+    /// The cache belongs to one skin load: it is emptied when the app
+    /// loads another skin, so no cursor handle outlives its skin.
+    cursors: SkinCursors,
     last_playlist_click: Option<(Instant, (i32, i32))>,
     modifiers: ModifiersState,
     /// The client size last requested, so repeat requests are skipped.
@@ -491,6 +498,7 @@ impl Windowed {
     fn new(app: App) -> Self {
         let applied_on_top = app.always_on_top();
         let stack = Self::restore_stack(&app);
+        let cursors = SkinCursors::new(app.skin_generation());
         Self {
             app,
             #[cfg(windows)]
@@ -518,6 +526,7 @@ impl Windowed {
             left_down: false,
             eq_left_down: false,
             playlist_cursor: (0, 0),
+            cursors,
             last_playlist_click: None,
             modifiers: ModifiersState::empty(),
             applied_client: None,
@@ -829,6 +838,76 @@ impl Windowed {
             1.0
         };
         ((position.x / scale) as i32, (position.y / scale) as i32)
+    }
+
+    /// Shows the skin's cursor for the control under the pointer.
+    ///
+    /// `slot` is the slot the window's region maps to (see
+    /// `rustamp_ui::cursor`) and `raw_window` the window's own handle. A
+    /// slot the skin does not carry leaves the system's cursor in place: no
+    /// `SetCursor` call is made at all.
+    fn apply_cursor(&mut self, slot: CursorSlot, raw_window: isize) {
+        // The cache belongs to one skin load; another skin empties it, so
+        // no cursor of the old skin outlives it.
+        self.cursors.sync(self.app.skin_generation());
+        let file = self.app.skin.skin().cursor_slot(slot);
+        let cursor = self.cursors.get(slot, file);
+        match cursor_action(slot, file, cursor.is_some()) {
+            CursorAction::Show(_) => {
+                if let Some(cursor) = cursor {
+                    rustamp_platform::cursor::set_window_cursor(raw_window, cursor);
+                }
+            }
+            // No cursor for this slot: the system's own cursor stays.
+            CursorAction::KeepSystem => {}
+        }
+    }
+
+    /// Shows the main window's skin cursor for the control under the
+    /// pointer.
+    fn apply_main_cursor(&mut self) {
+        let (x, y) = self.cursor;
+        let widget = rustamp_ui::hit_test(&rustamp_ui::MainWindowLayout::CLASSIC, x, y);
+        let slot = rustamp_ui::main_window_cursor(widget);
+        let raw = self.raw_main_window();
+        self.apply_cursor(slot, raw);
+    }
+
+    /// Shows the equalizer window's skin cursor for the control under the
+    /// pointer.
+    fn apply_eq_cursor(&mut self) {
+        let (x, y) = self.eq_cursor;
+        let widget = rustamp_ui::equalizer::hit_test(&rustamp_ui::EqualizerLayout::CLASSIC, x, y);
+        let slot = rustamp_ui::equalizer_cursor(widget);
+        let raw = self.raw_eq_window();
+        self.apply_cursor(slot, raw);
+    }
+
+    /// Shows the playlist window's skin cursor for the region under the
+    /// pointer.
+    fn apply_playlist_cursor(&mut self) {
+        let (x, y) = self.playlist_cursor;
+        let slot = rustamp_ui::playlist_cursor_at(x, y);
+        let raw = self.raw_playlist_window();
+        self.apply_cursor(slot, raw);
+    }
+
+    /// Gives the pointer back to the operating system.
+    ///
+    /// The pointer keeps the cursor of the window it is over, so the
+    /// system's own cursor is restored only when the pointer is over none
+    /// of the player's windows: clicking the equalizer must not take the
+    /// skin's cursor away from it.
+    fn restore_system_cursor(&mut self) {
+        let ours = [
+            self.raw_main_window(),
+            self.raw_eq_window(),
+            self.raw_playlist_window(),
+        ];
+        if ours.contains(&rustamp_platform::cursor::pointer_window()) {
+            return;
+        }
+        rustamp_platform::cursor::restore_cursor();
     }
 
     fn key_event(&mut self, event: &KeyEvent) {
@@ -1423,17 +1502,18 @@ impl Windowed {
     ///
     /// The one reader for the places that need the window itself rather than
     /// `winit`'s wrapper: the tray icon attach and the native dialogs.
-    #[cfg(windows)]
     fn raw_main_window(&self) -> isize {
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        raw_handle(self.window.as_deref())
+    }
 
-        let Some(window) = &self.window else {
-            return 0;
-        };
-        match window.window_handle().map(|handle| handle.as_raw()) {
-            Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
-            _ => 0,
-        }
+    /// The equalizer window's raw OS handle, or `0` when it has none.
+    fn raw_eq_window(&self) -> isize {
+        raw_handle(self.eq_window.as_deref())
+    }
+
+    /// The playlist window's raw OS handle, or `0` when it has none.
+    fn raw_playlist_window(&self) -> isize {
+        raw_handle(self.playlist_window.as_deref())
     }
 
     /// Paints every open window with this tick's frame.
@@ -1856,6 +1936,9 @@ impl Windowed {
                 // Per-window activation is open, so the playlist shares the
                 // main focus flag (see `App::render_playlist`).
                 if !focused {
+                    // The pointer keeps the cursor it had; give the system
+                    // its own back when the window loses the focus.
+                    self.restore_system_cursor();
                     self.app.playlist_mouse_leave();
                     self.last_playlist_click = None;
                 }
@@ -1866,6 +1949,7 @@ impl Windowed {
             WindowEvent::CursorMoved { position, .. } => {
                 // No double-size scale: the playlist ignores it (S05 §2.1).
                 self.playlist_cursor = (position.x as i32, position.y as i32);
+                self.apply_playlist_cursor();
                 self.app
                     .playlist_mouse_move(self.playlist_cursor.0, self.playlist_cursor.1);
                 if self.app.playlist().drag_insertion().is_some() {
@@ -1874,6 +1958,9 @@ impl Windowed {
                 self.request_playlist_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
+                // The skin's cursor only holds while the pointer is over
+                // this window; the system's own cursor takes over.
+                self.restore_system_cursor();
                 self.app.playlist_mouse_leave();
                 self.last_playlist_click = None;
                 self.request_playlist_redraw();
@@ -2191,12 +2278,18 @@ impl ApplicationHandler for Windowed {
             }
             WindowEvent::Focused(focused) => {
                 self.app.set_focused(focused);
+                if !focused {
+                    // The pointer keeps the cursor it had; give the system
+                    // its own back when the window loses the focus.
+                    self.restore_system_cursor();
+                }
                 self.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => self.key_event(&event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = self.to_layout(position);
+                self.apply_main_cursor();
                 if self.left_down {
                     let (x, y) = self.cursor;
                     if let Err(error) = self.app.mouse_move(x, y) {
@@ -2204,6 +2297,11 @@ impl ApplicationHandler for Windowed {
                     }
                     self.request_redraw();
                 }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // The skin's cursor only holds while the pointer is over
+                // this window; the system's own cursor takes over.
+                self.restore_system_cursor();
             }
             WindowEvent::MouseInput {
                 state,
@@ -2324,6 +2422,9 @@ impl ApplicationHandler for Windowed {
         self.apply_focus_requests();
         // An error the user must see goes to the native title (BETA-04).
         self.sync_title();
+        // A skin loaded in this tick replaces the cursors: the cache of the
+        // old skin is emptied, so no cursor handle outlives its skin.
+        self.cursors.sync(self.app.skin_generation());
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
     }
 
@@ -2379,12 +2480,18 @@ impl Windowed {
             WindowEvent::DroppedFile(path) => self.drop_file(path),
             WindowEvent::Focused(focused) => {
                 self.app.set_eq_focused(focused);
+                if !focused {
+                    // The pointer keeps the cursor it had; give the system
+                    // its own back when the window loses the focus.
+                    self.restore_system_cursor();
+                }
                 self.request_redraw_eq();
             }
             WindowEvent::KeyboardInput { event, .. } => self.eq_key_event(&event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.eq_cursor = self.to_eq_layout(position);
+                self.apply_eq_cursor();
                 if self.eq_left_down {
                     let (x, y) = self.eq_cursor;
                     if let Err(error) = self.app.eq_mouse_move(x, y) {
@@ -2392,6 +2499,11 @@ impl Windowed {
                     }
                     self.request_redraw_eq();
                 }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // The skin's cursor only holds while the pointer is over
+                // this window; the system's own cursor takes over.
+                self.restore_system_cursor();
             }
             WindowEvent::MouseInput {
                 state,
@@ -2435,6 +2547,22 @@ impl Windowed {
 /// Converts `winit` modifier state into the headless [`Modifiers`].
 fn map_modifiers(state: ModifiersState) -> Modifiers {
     Modifiers::new(state.control_key(), state.alt_key(), state.shift_key())
+}
+
+/// The window's raw OS handle, or `0` when it has none.
+///
+/// Only the Win32 handle is of use (the platform's cursor API takes it);
+/// every other platform answers `0`.
+fn raw_handle(window: Option<&Window>) -> isize {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Some(window) = window else {
+        return 0;
+    };
+    match window.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
+        _ => 0,
+    }
 }
 
 /// Maps a physical key code to a [`Key`].
