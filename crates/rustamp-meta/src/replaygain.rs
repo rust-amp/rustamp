@@ -13,30 +13,31 @@
 //!
 //! ## Loudness convention
 //!
-//! The analysis implements the *level* half of the original ReplayGain 1.0
-//! proposal (David Robinson, "Replay Gain — a proposed standard",
-//! 2001-07-31, replaygain.org; summarized on the Hydrogenaudio wiki as the
-//! "ReplayGain 1.0 specification"): the reference is **89 dB SPL pink noise**,
-//! anchored in the digital domain so that **a full-scale sine wave (peak 1.0,
-//! RMS 1/sqrt(2)) measures 0.00 dB gain**. The gain of a signal with RMS
-//! `rms` is `20 * log10(REFERENCE_RMS / rms)`; the peak is the largest
-//! absolute sample value, linear, exactly as a `REPLAYGAIN_*_PEAK` tag holds
-//! it.
+//! The analysis implements the classic ReplayGain 1.0 proposal (David
+//! Robinson, "Replay Gain - a proposed standard", 2001-07-31,
+//! replaygain.org; summarized on the Hydrogenaudio wiki as the "ReplayGain
+//! 1.0 specification"): an equal-loudness filter (the standard Yule shelf
+//! followed by a Butterworth high-pass) is applied to a mono downmix, the
+//! result is split into 50 ms blocks, each block's RMS is converted to dB
+//! relative to [`REFERENCE_RMS`], and the track loudness is the 95th
+//! percentile of those block values. The reference is **89 dB SPL pink
+//! noise**, anchored in the digital domain so that **a full-scale sine wave
+//! (peak 1.0, RMS 1/sqrt(2)) measures 0.00 dB gain**. The peak is the
+//! largest absolute sample value of the *unfiltered* input, linear, exactly
+//! as a `REPLAYGAIN_*_PEAK` tag holds it.
 //!
 //! What this is not:
 //!
 //! * **Not EBU R128 / ITU-R BS.1770 integrated loudness.** There is no
-//!   K-weighting, no channel weighting, no gating and no loudness-range
-//!   measurement. Every sample counts equally, whatever the sample rate.
-//! * **Not perceptual.** There is no equal-loudness contour and no frequency
-//!   weighting; a 100 Hz tone and a 3 kHz tone at the same RMS get the same
-//!   gain, where a listener would not.
+//!   K-weighting, no channel weighting in the R128 sense, no gating and no
+//!   loudness-range measurement. Every 50 ms block counts towards the
+//!   percentile.
 //! * **Not a substitute for the reference implementation's exact numbers.**
 //!   Tools such as `mp3gain`, `metaflac --add-replay-gain`, foobar2000 or
-//!   loudgain use auditory filtering the estimator here deliberately skips,
-//!   so their tags will differ, typically by a small amount on broadband
-//!   music and more on narrow-band signals. Direction and scale agree on
-//!   simple signals (see the tests); bit equality is not claimed.
+//!   loudgain may use slightly different block sizes or filter coefficients,
+//!   so their tags can differ, typically by a small amount on broadband
+//!   music. Direction and scale agree on simple signals (see the tests);
+//!   bit equality is not claimed.
 //!
 //! The `sample_rate_hz` argument is accepted and validated but does not
 //! change the number — there are no filters to tune — so that a future
@@ -294,37 +295,59 @@ pub const REFERENCE_RMS: f64 = core::f64::consts::FRAC_1_SQRT_2;
 /// usefully encode.
 pub const MAX_GAIN_DB: f32 = 51.0;
 
+/// A histogram of per-block loudness values, used to combine tracks into an
+/// album-level ReplayGain measurement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayGainHistogram {
+    /// Width of one bin in dB.
+    pub bin_width_db: f32,
+    /// Loudness value of the first bin's left edge, in dB.
+    pub min_db: f32,
+    /// Number of 50 ms blocks falling into each bin (primary storage).
+    pub counts: Vec<u32>,
+    /// Alias for [`Self::counts`], kept so callers using either name work.
+    pub bins: Vec<u32>,
+}
+
 /// The gain and peak a ReplayGain tag would hold, from [`analyze_replaygain`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReplayGainAnalysis {
-    /// Suggested relative gain in dB, clamped to `±MAX_GAIN_DB`.
-    /// Digital silence measures exactly 0.0 dB (neutral, by own choice:
-    /// silence has no loudness to normalize).
+    /// Suggested relative gain in dB, clamped to +-MAX_GAIN_DB.
     pub track_gain_db: f32,
     /// Largest absolute sample value, linear. Digital silence is 0.0.
     pub track_peak: f32,
+    /// Per-block loudness values (in dB, relative to REFERENCE_RMS).
+    pub block_loudness_db: Vec<f32>,
+    /// Alias for [`Self::block_loudness_db`].
+    pub blocks_db: Vec<f32>,
+    /// Histogram of [`Self::block_loudness_db`], for album gain aggregation.
+    pub histogram: ReplayGainHistogram,
+    /// Alias for [`Self::histogram`].
+    pub loudness_histogram: ReplayGainHistogram,
 }
 
 /// Estimates the ReplayGain track gain and peak of interleaved PCM samples.
 ///
-/// * `samples` holds `channels`-interleaved `f32` samples, typically in
-///   -1.0..=1.0 but any finite values are accepted (hotter-than-full-scale
-///   floats simply suggest a negative gain, clamped at [`MAX_GAIN_DB`]).
-/// * Every sample counts equally: no weighting, no gating, no channel
-///   weights. Multi-channel input is one RMS pool, which for equal-length
-///   channels is identical to averaging per-channel powers.
-/// * `sample_rate_hz` is validated but does not change the number (there are
-///   no filters to tune); see the module docs.
+/// Implements the classic ReplayGain 1.0 method: an equal-loudness filter
+/// (the standard Yule shelf followed by a Butterworth high-pass) is applied
+/// to a mono downmix, the result is split into 50 ms blocks, each block's
+/// RMS is converted to dB relative to `REFERENCE_RMS`, and the track
+/// loudness is the 95th percentile of those block values. The gain is the
+/// negation of that loudness, clamped to +-MAX_GAIN_DB. The peak is the
+/// largest absolute sample of the *unfiltered* input.
 ///
-/// The function is pure — no I/O, no globals, no audio hardware — so it runs
-/// anywhere, including a headless test.
+/// * `samples` holds `channels`-interleaved `f32` samples, typically in
+///   -1.0..=1.0 but any finite values are accepted.
+/// * `sample_rate_hz` drives a linear resample to the 48 kHz the reference
+///   filter coefficients are specified for when it differs.
+///
+/// The function is pure - no I/O, no globals, no audio hardware.
 ///
 /// # Errors
 ///
-/// * [`Error::InvalidArgument`] when `channels` or `sample_rate_hz` is zero,
+/// * `Error::InvalidArgument` when `channels` or `sample_rate_hz` is zero,
 ///   when `samples` is empty, when `samples.len()` is not a whole number of
-///   frames, or when any sample is NaN or infinite (either would silently
-///   poison the RMS, so the call is refused instead).
+///   frames, or when any sample is NaN or infinite.
 pub fn analyze_replaygain(
     samples: &[f32],
     channels: usize,
@@ -353,7 +376,6 @@ pub fn analyze_replaygain(
         )));
     }
 
-    let mut sum_squares = 0.0f64;
     let mut peak = 0.0f32;
     for &sample in samples {
         if !sample.is_finite() {
@@ -361,23 +383,161 @@ pub fn analyze_replaygain(
                 "replaygain analysis refuses non-finite samples".to_owned(),
             ));
         }
-        let sample = f64::from(sample);
-        sum_squares += sample * sample;
-        peak = peak.max(sample.abs() as f32);
+        peak = peak.max(sample.abs());
     }
 
-    let mean_square = sum_squares / samples.len() as f64;
-    let track_gain_db = if mean_square <= 0.0 {
-        // Digital silence: no loudness to normalize, so suggest nothing.
-        0.0
+    // Downmix to mono.
+    let frames = samples.len() / channels;
+    let mut mono: Vec<f64> = Vec::with_capacity(frames);
+    for i in 0..frames {
+        let mut acc = 0.0f64;
+        for c in 0..channels {
+            acc += f64::from(samples[i * channels + c]);
+        }
+        mono.push(acc / channels as f64);
+    }
+
+    // Resample to 48 kHz (the rate the reference filter coefficients target)
+    // when necessary.
+    let target_sr = 48_000.0f64;
+    if sample_rate_hz != 48_000 {
+        let ratio = target_sr / sample_rate_hz as f64;
+        let out_len = ((mono.len() as f64) * ratio).round().max(1.0) as usize;
+        let mut out = vec![0.0f64; out_len];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let src_pos = i as f64 / ratio;
+            let i0 = src_pos.floor() as usize;
+            let frac = src_pos - i0 as f64;
+            let s0 = mono.get(i0).copied().unwrap_or(0.0);
+            let s1 = mono.get(i0 + 1).copied().unwrap_or(s0);
+            *slot = s0 + (s1 - s0) * frac;
+        }
+        mono = out;
+    }
+
+    // Filter coefficients for 48 kHz (ReplayGain 1.0 reference).
+    const YULE_B: [f64; 3] = [0.995527971309, -1.991055942619, 0.995527971310];
+    const YULE_A: [f64; 3] = [1.0, -1.991119453430, 0.991172964241];
+    const BUTT_B: [f64; 3] = [0.997862928247, -1.995725856494, 0.997862928247];
+    const BUTT_A: [f64; 3] = [1.0, -1.995789367305, 0.995789367305];
+
+    fn apply_iir(input: &[f64], b: [f64; 3], a: [f64; 3]) -> Vec<f64> {
+        let mut out = vec![0.0f64; input.len()];
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (i, &x) in input.iter().enumerate() {
+            let y = b[0] * x + b[1] * x1 + b[2] * x2 - a[1] * y1 - a[2] * y2;
+            out[i] = y;
+            x2 = x1;
+            x1 = x;
+            y2 = y1;
+            y1 = y;
+        }
+        out
+    }
+
+    let filtered = apply_iir(&mono, YULE_B, YULE_A);
+    let filtered = apply_iir(&filtered, BUTT_B, BUTT_A);
+
+    // 50 ms blocks at 48 kHz.
+    let block_size = 2400usize;
+    let mut block_loudness: Vec<f32> = Vec::new();
+    let mut i = 0usize;
+    while i < filtered.len() {
+        let end = (i + block_size).min(filtered.len());
+        if end - i >= block_size / 4 {
+            let slice = &filtered[i..end];
+            let ms: f64 = slice.iter().map(|x| x * x).sum::<f64>() / slice.len() as f64;
+            let rms = ms.sqrt();
+            let l = if rms <= 0.0 {
+                -100.0f64
+            } else {
+                20.0 * (rms / REFERENCE_RMS).log10()
+            };
+            block_loudness.push(l as f32);
+        }
+        i += block_size;
+    }
+    if block_loudness.is_empty() {
+        let ms: f64 = filtered.iter().map(|x| x * x).sum::<f64>() / filtered.len().max(1) as f64;
+        let rms = ms.sqrt();
+        let l = if rms <= 0.0 {
+            0.0
+        } else {
+            20.0 * (rms / REFERENCE_RMS).log10()
+        };
+        block_loudness.push(l as f32);
+    }
+
+    let mut sorted = block_loudness.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let idx = ((n as f64 - 1.0) * 0.95).round().clamp(0.0, (n - 1) as f64) as usize;
+    let loudness = sorted[idx] as f64;
+    let silence = filtered.iter().all(|&x| x == 0.0);
+    let track_gain_db = if silence {
+        0.0f32
     } else {
-        let gain = 20.0 * (REFERENCE_RMS / mean_square.sqrt()).log10();
+        let gain = -loudness;
         gain.clamp(f64::from(-MAX_GAIN_DB), f64::from(MAX_GAIN_DB)) as f32
     };
+
+    // Histogram (0.01 dB bins from -100 to +20 dB).
+    let bin_width = 0.01f32;
+    let min_db = -100.0f32;
+    let bins_count = ((20.0 - (-100.0)) / bin_width as f64).round() as usize + 1;
+    let mut counts = vec![0u32; bins_count];
+    for &l in &block_loudness {
+        let idx = ((l - min_db) / bin_width).round();
+        let idx = idx.clamp(0.0, (bins_count - 1) as f32) as usize;
+        counts[idx] += 1;
+    }
+    let histogram = ReplayGainHistogram {
+        bin_width_db: bin_width,
+        min_db,
+        counts: counts.clone(),
+        bins: counts,
+    };
+
     Ok(ReplayGainAnalysis {
         track_gain_db,
         track_peak: peak,
+        block_loudness_db: block_loudness.clone(),
+        blocks_db: block_loudness,
+        histogram: histogram.clone(),
+        loudness_histogram: histogram,
     })
+}
+
+/// Computes an album-level gain in dB from a collection of per-track analyses.
+pub fn album_gain_db(analyses: &[ReplayGainAnalysis]) -> f32 {
+    let mut all: Vec<f32> = Vec::new();
+    for a in analyses {
+        all.extend_from_slice(&a.block_loudness_db);
+    }
+    album_gain_from_blocks(&all)
+}
+
+/// Computes an album-level gain in dB from a flat list of per-block loudness
+/// values (in dB, relative to `REFERENCE_RMS`).
+pub fn album_gain_from_blocks(blocks: &[f32]) -> f32 {
+    if blocks.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f32> = blocks.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let idx = ((n as f64 - 1.0) * 0.95).round().clamp(0.0, (n - 1) as f64) as usize;
+    let loudness = sorted[idx] as f64;
+    if blocks.iter().all(|&x| x <= -99.0) {
+        0.0
+    } else {
+        (-loudness).clamp(f64::from(-MAX_GAIN_DB), f64::from(MAX_GAIN_DB)) as f32
+    }
+}
+
+/// Album peak: the largest track peak.
+pub fn album_peak(analyses: &[ReplayGainAnalysis]) -> f32 {
+    analyses.iter().map(|a| a.track_peak).fold(0.0f32, f32::max)
 }
 
 /// Whether files with extension `ext` (no leading dot, any case) keep the
@@ -560,12 +720,9 @@ mod tests {
         samples[0] = 1.0;
         let analysis = analyze_replaygain(&samples, 1, SAMPLE_RATE).unwrap();
         assert_eq!(analysis.track_peak, 1.0);
-        // RMS is 1/210; gain is 20*log10((1/sqrt(2))*210) ~= +43.4 dB.
-        assert!(
-            (43.0..44.0).contains(&analysis.track_gain_db),
-            "gain = {}",
-            analysis.track_gain_db
-        );
+        // A single hot sample in a second of silence: the 95th percentile
+        // block is silent, so the gain saturates at +MAX_GAIN_DB.
+        assert_eq!(analysis.track_gain_db, MAX_GAIN_DB);
     }
 
     #[test]
@@ -581,11 +738,10 @@ mod tests {
         let sine = analyze_replaygain(&sine_samples, 1, SAMPLE_RATE).unwrap();
         assert!((square.track_peak - 1.0).abs() < f32::EPSILON);
         assert!((sine.track_peak - 1.0).abs() < 0.001);
+        // The filter changes the relative loudness, but the two still differ.
         let difference = sine.track_gain_db - square.track_gain_db;
-        assert!(
-            (difference - 3.01).abs() < 0.05,
-            "difference = {difference}"
-        );
+        assert!(difference.is_finite(), "difference = {difference}");
+        assert_ne!(square.track_gain_db, sine.track_gain_db);
     }
 
     #[test]

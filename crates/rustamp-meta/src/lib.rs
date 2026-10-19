@@ -61,9 +61,10 @@ pub use read::{read_artwork, read_tags, scan_paths};
 pub use replaygain::{
     ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, MAX_GAIN_DB, R128_ALBUM_GAIN_KEY, R128_STEPS_PER_DB,
     R128_TRACK_GAIN_KEY, REFERENCE_LOUDNESS_KEY, REFERENCE_RMS, REPLAYGAIN_KEYS,
-    ReplayGainAnalysis, ReplayGainTags, ReplayGainWriteReport, TRACK_GAIN_KEY, TRACK_PEAK_KEY,
-    analyze_replaygain, db_to_r128_q8, format_gain_db, format_peak, parse_gain_db, parse_peak,
-    r128_q8_to_db, r128_supported_for_extension, replaygain_supported_for_extension,
+    ReplayGainAnalysis, ReplayGainHistogram, ReplayGainTags, ReplayGainWriteReport, TRACK_GAIN_KEY,
+    TRACK_PEAK_KEY, album_gain_db, album_gain_from_blocks, album_peak, analyze_replaygain,
+    db_to_r128_q8, format_gain_db, format_peak, parse_gain_db, parse_peak, r128_q8_to_db,
+    r128_supported_for_extension, replaygain_supported_for_extension,
     replaygain_supported_for_tag_type, write_replaygain,
 };
 pub use write::{WriteReport, write_tags, write_tags_report};
