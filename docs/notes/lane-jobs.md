@@ -321,6 +321,31 @@ What is green now, and what each one cost:
 green, and the single red was `dsp_roundtrip` at the thirty second escape. That
 run is what the rate measurement and the diagnosis grew out of.
 
+## A lane wrote into the canonical tree, and the packages built there are suspect (2026-10-19)
+
+The BETA-10 lane reported honestly that the canonical tree was not clean - nine
+modified files and two untracked ones - and said it had not written there. It was
+wrong about that, and the files name it: `prefs_dialog.rs`, `dialogs.rs`,
+`window.rs`, `menu.rs` and a new `build.rs`, which is preferences-dialog work and
+nothing else's. A subagent inherits the orchestrator's session directory, so an
+edit made with a relative path lands in `D:\code\Rustamp` rather than in the
+worktree, and the lane did not connect the dirty status it saw to itself.
+
+The work is **not lost**: it is parked in `stash@{0}` with a message naming the
+incident, and the canonical tree is clean again. Nothing was discarded.
+
+**What this costs, stated plainly:** the gates and the package builds I ran in the
+canonical tree may have compiled that uncommitted work rather than the merged
+code. I cannot date the stash precisely enough to say which of the packages the
+owner tried were affected, so the honest answer is that the bytes he ran are
+**not guaranteed to be the bytes on `main`**, and every package built before this
+note should be treated as suspect and rebuilt from a verified clean tree.
+
+**The rule this restores, and it is not new:** never build a package or trust a
+gate in a tree whose status you have not just read. A dirty canonical tree is not
+a cosmetic problem - it silently changes what is being measured, which is exactly
+how a stray file was caught once before.
+
 ## The owner ran the packaged bytes, and found what the suite could not (2026-10-19)
 
 **The release blocker first.** The owner could not start the packaged player at
