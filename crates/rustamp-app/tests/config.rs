@@ -103,7 +103,7 @@ fn config_round_trip_honours_all_supported_fields() {
     config.eq.state.preamp = 5.0;
     config.eq.state.bands = [1.5, 2.5, 3.5, 4.5, 5.5, -1.5, -2.5, -3.5, -4.5, -5.5];
 
-    save(&config, &path).expect("save config");
+    save(&config, None, &path).expect("save config");
     assert!(path.exists(), "config file exists on disk");
 
     let loaded = load(Some(&path)).expect("load config");
@@ -152,7 +152,7 @@ fn an_ignored_field_is_not_advertised() {
     config.plugins.vis_preset = Some("preset.milk".to_string());
     config.plugins.disabled = vec!["bad.dll".to_string()];
 
-    let serialized = serialize_honest(&config).expect("serialize honest config");
+    let serialized = serialize_honest(&config, None).expect("serialize honest config");
 
     let ignored_names = [
         "buffer_ms",
@@ -229,7 +229,7 @@ fn both_output_modes_are_honestly_serialized_without_ignored_field_warnings() {
     for mode in [OutputMode::Shared, OutputMode::Exclusive] {
         let mut config = Config::default();
         config.audio.output_mode = mode;
-        let serialized = serialize_honest(&config).expect("serialize");
+        let serialized = serialize_honest(&config, None).expect("serialize");
         let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
         assert!(value["audio"].get("output_mode").is_some());
         assert!(ignored_fields_in_toml(&value).is_empty());

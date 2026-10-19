@@ -128,7 +128,37 @@ pub const LIST_RIGHT: i32 = 254;
 pub const LIST_BOTTOM: i32 = 93;
 
 /// Row pitch in pixels (S01 §4.2: "four rows at 13 px pitch").
+///
+/// This is the pitch of the **default** font size: the pitch follows the
+/// font (see [`row_pitch`]), so a skin that names a size or a user who
+/// changes the size draws taller or shorter rows.
 pub const ROW_PITCH: i32 = 13;
+
+/// The height of the list page in pixels: the settled four rows of 13 px
+/// (S01 §4.2, S06 §3).
+///
+/// The page is the room the rows have; the number of rows in it follows the
+/// row pitch (see [`visible_rows`]).
+pub const LIST_PAGE_HEIGHT: i32 = ROW_PITCH * VISIBLE_ROWS as i32;
+
+/// The row height (the row pitch) for a font size, in pixels.
+///
+/// The row is as tall as the text it carries (own choice): at the default
+/// 13 px font this is the settled 13 px pitch of S01 §4.2.
+pub fn row_pitch(size: u32) -> i32 {
+    i32::try_from(size).unwrap_or(i32::MAX).max(1)
+}
+
+/// How many whole rows fit in the list page at a row pitch.
+///
+/// The page is the settled four rows of 13 px (S01 §4.2, S06 §3). The pitch
+/// follows the font, so the number of rows in the page is **recomputed**: a
+/// bigger font shows fewer rows, a smaller one more. The page never reaches
+/// past the list area (S06 §2), so a row is never clipped.
+pub fn visible_rows(pitch: i32) -> usize {
+    let pitch = pitch.max(1);
+    (LIST_PAGE_HEIGHT / pitch).max(1) as usize
+}
 
 /// The settled list band as a rectangle (S06 §2).
 pub fn list_area() -> Rect {
@@ -142,17 +172,17 @@ pub fn list_area() -> Rect {
 
 /// The rectangle of visible row `row` (0-based).
 ///
-/// Returns `None` past [`VISIBLE_ROWS`]: rows below the fourth band are list
-/// background (own reading; the spec fixes the band and the pitch only).
-pub fn row_rect(row: usize) -> Option<Rect> {
-    if row >= VISIBLE_ROWS {
+/// Returns `None` past the page: the rows below it are list background (own
+/// reading; the spec fixes the band and the pitch only).
+pub fn row_rect(row: usize, pitch: i32) -> Option<Rect> {
+    if row >= visible_rows(pitch) {
         return None;
     }
     Some(Rect::new(
         LIST_LEFT,
-        LIST_TOP + row as i32 * ROW_PITCH,
+        LIST_TOP + row as i32 * pitch,
         (LIST_RIGHT - LIST_LEFT) as u32,
-        ROW_PITCH as u32,
+        pitch.max(1) as u32,
     ))
 }
 
@@ -163,15 +193,20 @@ pub fn in_list_area(x: i32, y: i32) -> bool {
 
 /// Which visible row (if any) a click at `(x, y)` lands on.
 ///
-/// Rows are the 13 px bands from [`row_rect`]; the band below the fourth row
-/// is background and hits nothing. S06 §2 settles the first-row click only;
-/// selecting the actual row elsewhere is an own choice.
-pub fn hit_test_list_row(x: i32, y: i32) -> Option<usize> {
+/// The rows are the bands of `pitch` pixels from [`row_rect`]; the band below
+/// the page is background and hits nothing. S06 §2 settles the first-row
+/// click only; selecting the actual row elsewhere is an own choice.
+pub fn hit_test_list_row(x: i32, y: i32, pitch: i32) -> Option<usize> {
     if !(LIST_LEFT..LIST_RIGHT).contains(&x) || y < LIST_TOP {
         return None;
     }
-    let row = ((y - LIST_TOP) / ROW_PITCH) as usize;
-    if row < VISIBLE_ROWS { Some(row) } else { None }
+    let pitch = pitch.max(1);
+    let row = ((y - LIST_TOP) / pitch) as usize;
+    if row < visible_rows(pitch) {
+        Some(row)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,13 +245,15 @@ pub const SCROLL_SPLIT_Y: i32 = 83;
 /// linear interpolation between them is an own choice, rounded to the
 /// nearest row so that it is the exact inverse of
 /// [`scroll_offset_for_handle_y`] on the pixel grid (a dragged handle
-/// renders under the cursor). A list that fits the four-row page shows the
-/// handle at the top.
-pub fn scroll_handle_y(first_visible: usize, len: usize) -> i32 {
-    if len <= VISIBLE_ROWS {
+/// renders under the cursor). A list that fits the page shows the handle at
+/// the top. The page holds as many rows as the row pitch allows (see
+/// [`visible_rows`]).
+pub fn scroll_handle_y(first_visible: usize, len: usize, pitch: i32) -> i32 {
+    let rows = visible_rows(pitch);
+    if len <= rows {
         return SCROLL_TOP_Y;
     }
-    let max_first = len.saturating_sub(VISIBLE_ROWS);
+    let max_first = len.saturating_sub(rows);
     let clamped = first_visible.min(max_first);
     // Round to the nearest row, the same way the inverse rounds; the
     // settled points are exact multiples of the row count, so they are
@@ -252,8 +289,13 @@ pub const SCROLL_TRACK_RECT: Rect = Rect::new(260, 20, 8, 58);
 
 /// The handle rectangle for a scroll offset of `first_visible` in a list of
 /// `len` (S01 §4.2: `PLEDIT.BMP` (52,53,7,17) drawn at (260,y)).
-pub fn scroll_handle_rect(first_visible: usize, len: usize) -> Rect {
-    Rect::new(SCROLL_HANDLE_X, scroll_handle_y(first_visible, len), 7, 17)
+pub fn scroll_handle_rect(first_visible: usize, len: usize, pitch: i32) -> Rect {
+    Rect::new(
+        SCROLL_HANDLE_X,
+        scroll_handle_y(first_visible, len, pitch),
+        7,
+        17,
+    )
 }
 
 /// The scroll offset for a handle-top position `y` in a list of `len`.
@@ -269,8 +311,8 @@ pub fn scroll_handle_rect(first_visible: usize, len: usize) -> Rect {
 /// through its position and back — is impossible, because the 57 offsets of
 /// a 60-entry list share 41 integer pixel rows; offsets that share a row
 /// land within one row of themselves.
-pub fn scroll_offset_for_handle_y(y: i32, len: usize) -> usize {
-    let max_first = len.saturating_sub(VISIBLE_ROWS);
+pub fn scroll_offset_for_handle_y(y: i32, len: usize, pitch: i32) -> usize {
+    let max_first = len.saturating_sub(visible_rows(pitch));
     if max_first == 0 {
         return 0;
     }
@@ -304,6 +346,7 @@ pub fn hit_test_scrollbar(
     y: i32,
     first_visible: usize,
     len: usize,
+    pitch: i32,
 ) -> Option<ScrollbarHit> {
     if in_rect(x, y, SCROLL_ARROWS_RECT) {
         return None;
@@ -311,7 +354,7 @@ pub fn hit_test_scrollbar(
     if !in_rect(x, y, SCROLL_TRACK_RECT) {
         return None;
     }
-    let handle = scroll_handle_rect(first_visible, len);
+    let handle = scroll_handle_rect(first_visible, len, pitch);
     if in_rect(x, y, handle) {
         Some(ScrollbarHit::Handle)
     } else if y < handle.y {
@@ -598,12 +641,15 @@ fn playlist_font_mask(mut image: Image) -> Option<BitmapFont> {
 /// `pledit.txt` ([`rustamp_skin::PlaylistStyle::selected_bg`]), never a
 /// colour of ours - the skin decides what a selected row looks like. The
 /// band is one row of the settled list area ([`row_rect`], S06 §2: x 12-254,
-/// 13 px pitch), so it cannot reach the side rails or the scrollbar.
+/// the row pitch of the current font), so it cannot reach the side rails or
+/// the scrollbar.
 ///
 /// `Normal` and `Current` tint the glyph ink independently of selection;
 /// `Current` applies only to the app-supplied current entry, not the clicked
 /// or selected one (S17 §5). The **font** is the skin's too: the `Font=`
-/// line of `pledit.txt` names the family, the size and the style (S17 §5).
+/// line of `pledit.txt` names the family and the style (S17 §5), and the
+/// **size** is the one the user can change at runtime (S03 §2 `40335` /
+/// `40336`), so the model owns it.
 fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &[String]) {
     let style = skin.pledit();
     let selected = [
@@ -613,11 +659,13 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
         255,
     ];
     let font = text_font(skin);
-    let request = crate::playlist_font::SystemFont::from_playlist_font(style.font.as_ref());
+    let pitch = window.row_pitch();
+    let request = crate::playlist_font::SystemFont::from_playlist_font(style.font.as_ref())
+        .with_size(window.font_size().size());
     let visible = window.visible_ids();
     let selected_ids = window.selected_ids();
-    for (i, id) in visible.iter().enumerate().take(VISIBLE_ROWS) {
-        let Some(rect) = row_rect(i) else {
+    for (i, id) in visible.iter().enumerate() {
+        let Some(rect) = row_rect(i, pitch) else {
             continue;
         };
         if selected_ids.contains(id) {
@@ -663,7 +711,7 @@ fn draw_scrollbar(canvas: &mut Image, pledit: Option<&Image>, window: &PlaylistW
         pledit,
         SCROLL_HANDLE_SRC,
         SCROLL_HANDLE_X,
-        scroll_handle_y(window.first_visible(), window.len()),
+        scroll_handle_y(window.first_visible(), window.len(), window.row_pitch()),
     );
     blit_region(
         canvas,
@@ -681,12 +729,13 @@ fn draw_drag_insertion(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow)
     let Some(row) = gap.checked_sub(window.first_visible()) else {
         return;
     };
-    if row > VISIBLE_ROWS {
+    let pitch = window.row_pitch();
+    if row > window.visible_rows() {
         return;
     }
     // Own-choice geometry, not reference pixels: integer, opaque, skin-coloured
     // and clipped to the list. No extra asset or antialiased overlay is used.
-    let y = (LIST_TOP + row as i32 * ROW_PITCH).min(LIST_BOTTOM - 1);
+    let y = (LIST_TOP + row as i32 * pitch).min(LIST_BOTTOM - 1);
     let colour = skin.pledit().normal;
     canvas.fill_rect(
         Rect::new(LIST_LEFT, y, (LIST_RIGHT - LIST_LEFT) as u32, 1),
@@ -784,7 +833,7 @@ mod tests {
                     let empty = render_playlist_window(&skin, &window, &[], true);
                     let frame = render_playlist_window(&skin, &window, &labels, true);
                     for (i, id) in window.visible_ids().into_iter().enumerate() {
-                        let row = row_rect(i).unwrap();
+                        let row = row_rect(i, ROW_PITCH).unwrap();
                         let style = skin.pledit();
                         let bg = if id == selected {
                             style.selected_bg
@@ -863,7 +912,7 @@ mod tests {
         let labels = vec![String::new(), String::new()];
         let frame = render_playlist_window(&skin, &window, &labels, true);
 
-        let row = row_rect(0).expect("the first visible row");
+        let row = row_rect(0, ROW_PITCH).expect("the first visible row");
         let pixel = |x: i32, y: i32| {
             let index = ((y as u32 * frame.width() + x as u32) * 4) as usize;
             let rgba = &frame.as_rgba()[index..index + 3];
@@ -883,6 +932,88 @@ mod tests {
             wanted,
             "the band must not reach the scrollbar"
         );
+    }
+
+    /// The classic invariant at every size: a row holds the skin's ink and
+    /// its background, never a blended shade (no antialiasing).
+    #[test]
+    fn the_rows_hold_only_ink_and_background_at_every_font_size() {
+        use rustamp_core::playlist::EntryId;
+        use rustamp_skin::{BuiltinDefaultSkin, BuiltinLookalikeSkin};
+
+        for mut source in [BuiltinDefaultSkin::source(), BuiltinLookalikeSkin::source()] {
+            source.add(
+                "pledit.txt",
+                b"[Text]\nNormal=#13579B\nCurrent=#ECA864\nNormalBG=#192A3B\nSelectedBG=#4C5D6E\n"
+                    .to_vec(),
+            );
+            let skin = Skin::from_source(&mut source, &BuiltinDefaultSkin).unwrap();
+            let mut window = PlaylistWindow::new();
+            window.set_entries((0..8).map(EntryId).collect());
+            let labels = vec!["Mixed Case AV ffi 0123456789".to_string(); 8];
+            for size in [8u32, 10, 13, 16, 20, 26, 32] {
+                window.set_font_size_override(Some(size));
+                let frame = render_playlist_window(&skin, &window, &labels, true);
+                let style = skin.pledit();
+                let ink = [style.normal[0], style.normal[1], style.normal[2], 255];
+                let bg = [
+                    style.normal_bg[0],
+                    style.normal_bg[1],
+                    style.normal_bg[2],
+                    255,
+                ];
+                let pitch = window.row_pitch();
+                for row in 0..window.visible_rows() {
+                    let rect = row_rect(row, pitch).expect("the visible row");
+                    let mut ink_count = 0;
+                    for y in rect.y..rect.bottom() {
+                        for x in rect.x..rect.right() {
+                            let pixel = frame.pixel(x, y).expect("a pixel");
+                            assert!(
+                                pixel == ink || pixel == bg,
+                                "size {size}, row {row}: off-palette pixel {pixel:?}"
+                            );
+                            ink_count += usize::from(pixel == ink);
+                        }
+                    }
+                    assert!(ink_count > 0, "size {size}, row {row}: no ink");
+                }
+            }
+        }
+    }
+
+    /// The runtime size replaces the **size** only: the family and the style
+    /// stay the skin's (S17 §5).
+    #[test]
+    fn the_runtime_size_keeps_the_skins_family_and_style() {
+        use rustamp_core::playlist::EntryId;
+        use rustamp_skin::{BuiltinDefaultSkin, Skin};
+
+        fn skin_with_font(font: &str) -> Skin {
+            let mut source = BuiltinDefaultSkin::source();
+            source.add(
+                "pledit.txt",
+                format!("[Text]\nNormal=#00FF00\nCurrent=#FFFFFF\nNormalBG=#000000\nSelectedBG=#0000C6\nFont={font}\n").into_bytes(),
+            );
+            Skin::from_source(&mut source, &BuiltinDefaultSkin).expect("the skin loads")
+        }
+
+        let mut window = PlaylistWindow::new();
+        window.set_entries(vec![EntryId(1)]);
+        let labels = vec!["Mixed Case AV ffi".to_string()];
+        // The user picks a size; the family and the style stay the skin's.
+        window.set_font_size_override(Some(18));
+        let courier =
+            render_playlist_window(&skin_with_font("Courier New,13"), &window, &labels, true);
+        let arial = render_playlist_window(&skin_with_font("Arial,13"), &window, &labels, true);
+        let bold = render_playlist_window(
+            &skin_with_font("Courier New,13,bold"),
+            &window,
+            &labels,
+            true,
+        );
+        assert_ne!(courier, arial, "the family is still the skin's");
+        assert_ne!(courier, bold, "the style is still the skin's");
     }
 
     #[test]
@@ -906,22 +1037,51 @@ mod tests {
     fn list_rows_follow_the_settled_band_and_pitch() {
         // S06 §2 bbox (12,23)-(254,93); S01 §4.2 13 px pitch, four rows.
         assert_eq!(list_area(), Rect::new(12, 23, 242, 70));
-        assert_eq!(row_rect(0), Some(Rect::new(12, 23, 242, 13)));
-        assert_eq!(row_rect(3), Some(Rect::new(12, 62, 242, 13)));
-        assert_eq!(row_rect(4), None);
+        assert_eq!(row_rect(0, ROW_PITCH), Some(Rect::new(12, 23, 242, 13)));
+        assert_eq!(row_rect(3, ROW_PITCH), Some(Rect::new(12, 62, 242, 13)));
+        assert_eq!(row_rect(4, ROW_PITCH), None);
+    }
+
+    /// The row height follows the font, so the page holds more rows with a
+    /// smaller font and fewer with a bigger one - and never clips a row.
+    #[test]
+    fn the_row_height_follows_the_font_and_the_page_holds_whole_rows() {
+        assert_eq!(row_pitch(13), 13);
+        assert_eq!(row_pitch(8), 8);
+        assert_eq!(row_pitch(32), 32);
+        // The settled page is four rows of 13 px (S01 §4.2).
+        assert_eq!(visible_rows(ROW_PITCH), 4);
+        assert_eq!(LIST_PAGE_HEIGHT, 52);
+        // A smaller font fits more rows, a bigger one fewer.
+        assert_eq!(visible_rows(10), 5);
+        assert_eq!(visible_rows(17), 3);
+        assert_eq!(visible_rows(26), 2);
+        assert_eq!(visible_rows(32), 1);
+        // The rows never leave the list area (S06 §2): the page is 52 px and
+        // the band is 70 px tall.
+        for size in 8..=32 {
+            let pitch = row_pitch(size);
+            let rows = visible_rows(pitch);
+            assert!(rows * pitch as usize <= LIST_PAGE_HEIGHT as usize, "{size}");
+            assert!(
+                LIST_TOP + (rows as i32) * pitch <= LIST_BOTTOM,
+                "the last row must stay inside the list area ({size})"
+            );
+            assert!(row_rect(rows, pitch).is_none(), "{size}");
+        }
     }
 
     #[test]
     fn list_hit_testing_maps_rows_and_background() {
-        assert_eq!(hit_test_list_row(60, 28), Some(0));
-        assert_eq!(hit_test_list_row(12, 23), Some(0));
-        assert_eq!(hit_test_list_row(253, 74), Some(3));
+        assert_eq!(hit_test_list_row(60, 28, ROW_PITCH), Some(0));
+        assert_eq!(hit_test_list_row(12, 23, ROW_PITCH), Some(0));
+        assert_eq!(hit_test_list_row(253, 74, ROW_PITCH), Some(3));
         // Below the fourth row is background (own reading).
-        assert_eq!(hit_test_list_row(60, 75), None);
-        assert_eq!(hit_test_list_row(60, 92), None);
+        assert_eq!(hit_test_list_row(60, 75, ROW_PITCH), None);
+        assert_eq!(hit_test_list_row(60, 92, ROW_PITCH), None);
         // Outside the band horizontally.
-        assert_eq!(hit_test_list_row(11, 28), None);
-        assert_eq!(hit_test_list_row(254, 28), None);
+        assert_eq!(hit_test_list_row(11, 28, ROW_PITCH), None);
+        assert_eq!(hit_test_list_row(254, 28, ROW_PITCH), None);
         assert!(in_list_area(60, 92));
         assert!(!in_list_area(60, 93));
     }
@@ -929,14 +1089,14 @@ mod tests {
     #[test]
     fn scroll_handle_pins_the_three_settled_points() {
         // S01 §4.2: y = 20 top, 40 middle, 60 bottom (60-entry list).
-        assert_eq!(scroll_handle_y(0, 60), 20);
-        assert_eq!(scroll_handle_y(28, 60), 40);
-        assert_eq!(scroll_handle_y(56, 60), 60);
+        assert_eq!(scroll_handle_y(0, 60, ROW_PITCH), 20);
+        assert_eq!(scroll_handle_y(28, 60, ROW_PITCH), 40);
+        assert_eq!(scroll_handle_y(56, 60, ROW_PITCH), 60);
         // A list that fits the page stays at the top.
-        assert_eq!(scroll_handle_y(0, 4), 20);
-        assert_eq!(scroll_handle_y(0, 0), 20);
+        assert_eq!(scroll_handle_y(0, 4, ROW_PITCH), 20);
+        assert_eq!(scroll_handle_y(0, 0, ROW_PITCH), 20);
         // Clamped past the end.
-        assert_eq!(scroll_handle_y(1000, 60), 60);
+        assert_eq!(scroll_handle_y(1000, 60, ROW_PITCH), 60);
     }
 
     #[test]
@@ -984,7 +1144,10 @@ mod tests {
         let visible = model.visible_ids();
         assert_eq!(visible.len(), VISIBLE_ROWS);
         for (row, id) in visible.iter().enumerate() {
-            assert_eq!(hit_test_list_row(60, 23 + row as i32 * 13), Some(row));
+            assert_eq!(
+                hit_test_list_row(60, 23 + row as i32 * ROW_PITCH, ROW_PITCH),
+                Some(row)
+            );
             assert_eq!(*id, EntryId(56 + row as u64));
         }
     }
@@ -1000,48 +1163,52 @@ mod tests {
         // 60-entry list share 41 integer pixel rows; those offsets land
         // within one row of themselves, pinned below.
         for y in SCROLL_TOP_Y..=SCROLL_TOP_Y + SCROLL_TRAVEL_PX {
-            let offset = scroll_offset_for_handle_y(y, 60);
-            assert_eq!(scroll_handle_y(offset, 60), y, "y {y}");
+            let offset = scroll_offset_for_handle_y(y, 60, ROW_PITCH);
+            assert_eq!(scroll_handle_y(offset, 60, ROW_PITCH), y, "y {y}");
         }
         // Offsets that share a pixel row land within one row of themselves.
         for offset in 0..=56usize {
-            let back = scroll_offset_for_handle_y(scroll_handle_y(offset, 60), 60);
+            let back =
+                scroll_offset_for_handle_y(scroll_handle_y(offset, 60, ROW_PITCH), 60, ROW_PITCH);
             assert!(back.abs_diff(offset) <= 1, "offset {offset}");
         }
         // Ends and clamps.
-        assert_eq!(scroll_offset_for_handle_y(20, 60), 0);
-        assert_eq!(scroll_offset_for_handle_y(60, 60), 56);
-        assert_eq!(scroll_offset_for_handle_y(0, 60), 0);
-        assert_eq!(scroll_offset_for_handle_y(100, 60), 56);
+        assert_eq!(scroll_offset_for_handle_y(20, 60, ROW_PITCH), 0);
+        assert_eq!(scroll_offset_for_handle_y(60, 60, ROW_PITCH), 56);
+        assert_eq!(scroll_offset_for_handle_y(0, 60, ROW_PITCH), 0);
+        assert_eq!(scroll_offset_for_handle_y(100, 60, ROW_PITCH), 56);
         // The settled middle point (S01 §4.2: y = 40 for a 60-entry list).
-        assert_eq!(scroll_offset_for_handle_y(40, 60), 28);
+        assert_eq!(scroll_offset_for_handle_y(40, 60, ROW_PITCH), 28);
         // A list that fits one page never moves.
-        assert_eq!(scroll_offset_for_handle_y(60, 3), 0);
+        assert_eq!(scroll_offset_for_handle_y(60, 3, ROW_PITCH), 0);
     }
 
     #[test]
     fn scrollbar_hit_testing_separates_handle_track_and_arrows() {
         // A 60-entry list at the bottom page: handle at y = 60..77.
-        assert_eq!(scroll_handle_rect(56, 60), Rect::new(260, 60, 7, 17));
         assert_eq!(
-            hit_test_scrollbar(263, 65, 56, 60),
+            scroll_handle_rect(56, 60, ROW_PITCH),
+            Rect::new(260, 60, 7, 17)
+        );
+        assert_eq!(
+            hit_test_scrollbar(263, 65, 56, 60, ROW_PITCH),
             Some(ScrollbarHit::Handle)
         );
         // Track above the handle pages up, below it pages down (own choice).
         assert_eq!(
-            hit_test_scrollbar(263, 30, 56, 60),
+            hit_test_scrollbar(263, 30, 56, 60, ROW_PITCH),
             Some(ScrollbarHit::TrackAbove)
         );
         assert_eq!(
-            hit_test_scrollbar(263, 77, 0, 60),
+            hit_test_scrollbar(263, 77, 0, 60, ROW_PITCH),
             Some(ScrollbarHit::TrackBelow)
         );
         // The arrow pair keeps its own path and is not a track hit.
-        assert_eq!(hit_test_scrollbar(263, 81, 56, 60), None);
-        assert_eq!(hit_test_scrollbar(263, 87, 56, 60), None);
+        assert_eq!(hit_test_scrollbar(263, 81, 56, 60, ROW_PITCH), None);
+        assert_eq!(hit_test_scrollbar(263, 87, 56, 60, ROW_PITCH), None);
         // Outside the column nothing hits.
-        assert_eq!(hit_test_scrollbar(259, 30, 56, 60), None);
-        assert_eq!(hit_test_scrollbar(268, 30, 56, 60), None);
-        assert_eq!(hit_test_scrollbar(263, 19, 56, 60), None);
+        assert_eq!(hit_test_scrollbar(259, 30, 56, 60, ROW_PITCH), None);
+        assert_eq!(hit_test_scrollbar(268, 30, 56, 60, ROW_PITCH), None);
+        assert_eq!(hit_test_scrollbar(263, 19, 56, 60, ROW_PITCH), None);
     }
 }

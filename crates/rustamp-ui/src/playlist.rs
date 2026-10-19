@@ -25,18 +25,20 @@ use std::collections::BTreeSet;
 use rustamp_core::command::{Command, OpenMediaKind, SelectOp};
 use rustamp_core::playlist::EntryId;
 
+use crate::playlist_font::PlaylistFontSize;
 use crate::shortcuts::{Key, Modifiers, ShortcutAction};
 
-/// How many list rows are visible at once (S06 §3).
+/// How many list rows the settled page holds (S06 §3).
 ///
 /// The 1501/1501 px arrow symmetry is settled; the "four rows" count itself is
 /// a **visual reading** (OCR of the uncertain skin font), so the constant is
-/// marked accordingly and the page step below is defined in terms of it.
+/// marked accordingly.
+///
+/// The count is the one of the **default** font size: the row height follows
+/// the font, so the page holds more rows with a smaller font and fewer with a
+/// bigger one (see [`crate::playlist_window::visible_rows`]). The page step
+/// is therefore the page's row count, not a constant.
 pub const VISIBLE_ROWS: usize = 4;
-
-/// One scrollbar-arrow step moves the view by one page (S06 §3, settled as a
-/// pixel symmetry: up-arrow 1501 px, down-arrow 1501 px back, same bounds).
-pub const PAGE_STEP_ROWS: usize = VISIBLE_ROWS;
 
 /// The playlist editor's client size (S06 scope; S01 §1, verified).
 pub const PLAYLIST_WINDOW_SIZE: (u32, u32) = (275, 116);
@@ -138,7 +140,9 @@ pub enum ScrollDirection {
 /// the menu-confirmed `Delete` and `Ctrl+Delete` (Crop) rows, and the
 /// menu-confirmed `Alt+Delete` (remove dead files), `Ctrl+Shift+Delete` /
 /// `Ctrl+N` (clear the playlist) rows, and the menu-confirmed `Ctrl+Shift`
-/// reorder rows (the three sorts and randomize).
+/// reorder rows (the three sorts and randomize). The two provisional
+/// font-size rows (`40335` / `40336`) change the rows the editor draws and
+/// nothing else, so they are UI-local (RFC 0005 §9/§11.6).
 ///
 /// The rows S03 §2 shares with the main window (S03 §1) and the global table
 /// (S03 §4) — the transport keys, the window keys and the global rows — are
@@ -214,6 +218,15 @@ pub enum PlaylistKeyAction {
     /// editor's title bar carries its own shade button), so the row toggles
     /// the editor and not the main window.
     ToggleEditorShade,
+    /// Ctrl+Num+: increase the playlist font size (`40335`, provisional).
+    ///
+    /// A view setting of this window: it changes the rows the editor draws
+    /// and nothing else, so it needs no core command (RFC 0005 §9/§11.6).
+    IncreaseFontSize,
+    /// Ctrl+Num-: decrease the playlist font size (`40336`, provisional).
+    ///
+    /// The counterpart of [`Self::IncreaseFontSize`].
+    DecreaseFontSize,
     /// A row whose action is one of the shared S03 actions (S03 §1/§4).
     ///
     /// The shared actions carry their own command id, so a shared row of the
@@ -259,6 +272,8 @@ impl PlaylistKeyAction {
             Self::BookmarkSelection => 40319,
             Self::CloseEditor => 40224,
             Self::ToggleEditorShade => 40064,
+            Self::IncreaseFontSize => 40335,
+            Self::DecreaseFontSize => 40336,
         }
     }
 }
@@ -292,7 +307,7 @@ const fn prow(
 
 /// The playlist editor's shortcut table (S03 §2), in the spec's row order.
 ///
-/// The 83 rows whose command this build can act on. The five remaining rows
+/// The 85 rows whose command this build can act on. The three remaining rows
 /// of S03 §2 have no command yet and are listed in
 /// [`UNIMPLEMENTED_PLAYLIST_ROWS`].
 ///
@@ -547,6 +562,18 @@ pub const PLAYLIST_TABLE: &[PlaylistBinding] = &[
         Modifiers::SHIFT,
         PlaylistKeyAction::Shared(ShortcutAction::StopWithFadeout),
         false,
+    ),
+    prow(
+        Key::NumAdd,
+        Modifiers::CTRL,
+        PlaylistKeyAction::IncreaseFontSize,
+        true,
+    ),
+    prow(
+        Key::NumSubtract,
+        Modifiers::CTRL,
+        PlaylistKeyAction::DecreaseFontSize,
+        true,
     ),
     prow(
         Key::NumDecimal,
@@ -830,9 +857,10 @@ pub struct UnimplementedPlaylistRow {
 ///   reads extended info.
 /// * `Ctrl+Alt+G` — `40292` "Generate HTML playlist": no command writes an
 ///   HTML playlist.
-/// * `Ctrl+Num+` / `Ctrl+Num-` — `40335` / `40336` "Increase/Decrease the
-///   playlist font size": the playlist font comes from the skin's
-///   `pledit.txt` and nothing changes it at runtime.
+///
+/// The two font-size rows (`40335` / `40336`) are **not** in this list: they
+/// are view settings of the editor and act on the playlist machine alone
+/// (RFC 0005 §9/§11.6), so they are rows of [`PLAYLIST_TABLE`].
 pub const UNIMPLEMENTED_PLAYLIST_ROWS: &[UnimplementedPlaylistRow] = &[
     UnimplementedPlaylistRow {
         key: Key::Letter(b'E'),
@@ -851,18 +879,6 @@ pub const UNIMPLEMENTED_PLAYLIST_ROWS: &[UnimplementedPlaylistRow] = &[
         modifiers: Modifiers::CTRL.union(Modifiers::ALT),
         command_id: 40292,
         provisional: false,
-    },
-    UnimplementedPlaylistRow {
-        key: Key::NumAdd,
-        modifiers: Modifiers::CTRL,
-        command_id: 40335,
-        provisional: true,
-    },
-    UnimplementedPlaylistRow {
-        key: Key::NumSubtract,
-        modifiers: Modifiers::CTRL,
-        command_id: 40336,
-        provisional: true,
     },
 ];
 
@@ -982,7 +998,8 @@ pub fn range_ids(entries: &[EntryId], anchor: usize, target: usize) -> Vec<Entry
 ///
 /// The machine tracks entry order as [`EntryId`]s (synced from the app via
 /// [`PlaylistWindow::set_entries`]); selection is a set of ids. The visible
-/// slice is [`VISIBLE_ROWS`] entries starting at the scroll offset.
+/// slice is as many entries as the list page holds at the current font size
+/// ([`PlaylistWindow::visible_rows`]), starting at the scroll offset.
 #[derive(Debug, Clone, Default)]
 pub struct PlaylistWindow {
     /// Render the skin's 275x14 playlist windowshade band (S01 §1/§4).
@@ -990,6 +1007,8 @@ pub struct PlaylistWindow {
     /// Held title button, overlaid from pledit.bmp; bottom buttons have no
     /// pressed sprite (S01 §4.1).
     pub pressed_title_button: Option<crate::playlist_window::PlaylistTitleButton>,
+    /// The runtime font size (S03 §2 `40335` / `40336`).
+    font_size: PlaylistFontSize,
     entries: Vec<EntryId>,
     first_visible: usize,
     selected: BTreeSet<EntryId>,
@@ -1038,6 +1057,55 @@ impl PlaylistWindow {
         self.entries.is_empty()
     }
 
+    /// The runtime font size (S03 §2 `40335` / `40336`).
+    ///
+    /// The size is the skin's (`pledit.txt`) until the user changes it; the
+    /// user's choice replaces the size only, the family and the style stay
+    /// the skin's.
+    pub fn font_size(&self) -> PlaylistFontSize {
+        self.font_size
+    }
+
+    /// The row height in pixels, from the font size.
+    pub fn row_pitch(&self) -> i32 {
+        crate::playlist_window::row_pitch(self.font_size.size())
+    }
+
+    /// How many rows the list page holds at the current font size.
+    pub fn visible_rows(&self) -> usize {
+        crate::playlist_window::visible_rows(self.row_pitch())
+    }
+
+    /// Sets the skin's font size; the playlist uses it until the user
+    /// changes the size.
+    ///
+    /// The app calls this when the skin changes, so the rows follow the
+    /// skin's `Font=` line (S17 §5).
+    pub fn set_skin_font_size(&mut self, size: u32) {
+        self.font_size.set_skin_size(size);
+    }
+
+    /// Restores the user's chosen size, or clears it with `None`.
+    ///
+    /// This is the path a persisted choice comes back through.
+    pub fn set_font_size_override(&mut self, size: Option<u32>) {
+        self.font_size.set_user_size(size);
+    }
+
+    /// One step larger (S03 §2 `40335`, provisional).
+    ///
+    /// Returns whether the size changed; at the largest size it does not.
+    pub fn increase_font_size(&mut self) -> bool {
+        self.font_size.increase()
+    }
+
+    /// One step smaller (S03 §2 `40336`, provisional).
+    ///
+    /// Returns whether the size changed; at the smallest size it does not.
+    pub fn decrease_font_size(&mut self) -> bool {
+        self.font_size.decrease()
+    }
+
     /// The current playback entry, independently of the selection and viewport.
     pub fn current(&self) -> Option<EntryId> {
         self.current
@@ -1056,12 +1124,12 @@ impl PlaylistWindow {
         self.first_visible
     }
 
-    /// The currently visible entries, at most [`VISIBLE_ROWS`] (S06 §3).
+    /// The currently visible entries, at most the page's row count (S06 §3).
     pub fn visible_ids(&self) -> Vec<EntryId> {
         self.entries
             .iter()
             .skip(self.first_visible)
-            .take(VISIBLE_ROWS)
+            .take(self.visible_rows())
             .copied()
             .collect()
     }
@@ -1083,7 +1151,7 @@ impl PlaylistWindow {
         if self.windowshade {
             return None;
         }
-        let row = crate::playlist_window::hit_test_list_row(x, y)?;
+        let row = crate::playlist_window::hit_test_list_row(x, y, self.row_pitch())?;
         let id = *self.entries.get(self.first_visible + row)?;
         let command = if self.selected.contains(&id) {
             None
@@ -1105,8 +1173,12 @@ impl PlaylistWindow {
     /// it; leaving the list cancels instead of clamping or auto-scrolling.
     /// Upper/lower row halves mean insert-before/after (own choices, Q6).
     pub fn mouse_move(&mut self, x: i32, y: i32) {
-        use crate::playlist_window::{LIST_TOP, ROW_PITCH, in_list_area};
+        use crate::playlist_window::{LIST_TOP, in_list_area};
 
+        // The row geometry is read before the drag is borrowed: the pitch
+        // follows the font, so it can change while a drag is armed.
+        let pitch = self.row_pitch();
+        let rows = self.visible_rows();
         let Some(drag) = self.drag.as_mut() else {
             return;
         };
@@ -1120,9 +1192,9 @@ impl PlaylistWindow {
             return;
         }
         let relative = y - LIST_TOP;
-        let row = relative / ROW_PITCH;
-        let after = relative % ROW_PITCH >= (ROW_PITCH + 1) / 2;
-        let gap = (row as usize + usize::from(after)).min(VISIBLE_ROWS);
+        let row = relative / pitch;
+        let after = relative % pitch >= (pitch + 1) / 2;
+        let gap = (row as usize + usize::from(after)).min(rows);
         drag.insertion = Some((self.first_visible + gap).min(self.entries.len()));
     }
 
@@ -1396,8 +1468,8 @@ impl PlaylistWindow {
         self.selected.insert(id);
         if index < self.first_visible {
             self.scroll_to(index);
-        } else if index >= self.first_visible + VISIBLE_ROWS {
-            self.scroll_to(index + 1 - VISIBLE_ROWS);
+        } else if index >= self.first_visible + self.visible_rows() {
+            self.scroll_to(index + 1 - self.visible_rows());
         }
     }
 
@@ -1438,17 +1510,19 @@ impl PlaylistWindow {
         PlaylistDialog::LoadPlaylist
     }
 
-    /// One scrollbar-arrow step scrolls one page of four rows (S06 §3,
-    /// settled as a pixel symmetry: 1501 px each way, returning on the
-    /// reverse arrow). Clamped at both ends of the list.
+    /// One scrollbar-arrow step scrolls one page (S06 §3, settled as a pixel
+    /// symmetry: 1501 px each way, returning on the reverse arrow). The page
+    /// is as many rows as the list shows at the current font size. Clamped at
+    /// both ends of the list.
     pub fn scroll_page(&mut self, direction: ScrollDirection) {
         let max_first = self.max_first_visible();
+        let step = self.visible_rows();
         match direction {
             ScrollDirection::Up => {
-                self.first_visible = self.first_visible.saturating_sub(PAGE_STEP_ROWS);
+                self.first_visible = self.first_visible.saturating_sub(step);
             }
             ScrollDirection::Down => {
-                self.first_visible = (self.first_visible + PAGE_STEP_ROWS).min(max_first);
+                self.first_visible = (self.first_visible + step).min(max_first);
             }
         }
     }
@@ -1458,14 +1532,14 @@ impl PlaylistWindow {
         self.first_visible = index.min(self.max_first_visible());
     }
 
-    /// The largest scroll offset: the bottom page shows the last
-    /// [`VISIBLE_ROWS`] entries. S01 §4.2 measured the bottom view of the
-    /// 60-entry list as rows 57-60 with the handle at its lowest point, so
-    /// the offset range is `len - 4`, the same range
+    /// The largest scroll offset: the bottom page shows the last entries of
+    /// the page. S01 §4.2 measured the bottom view of the 60-entry list as
+    /// rows 57-60 with the handle at its lowest point, so the offset range
+    /// is `len - 4` at the default font size, the same range
     /// [`scroll_handle_y`](crate::scroll_handle_y) assumes. A list that fits
     /// one page has offset 0.
     pub fn max_first_visible(&self) -> usize {
-        self.entries.len().saturating_sub(VISIBLE_ROWS)
+        self.entries.len().saturating_sub(self.visible_rows())
     }
 
     fn clamp_scroll(&mut self) {
@@ -1834,7 +1908,11 @@ mod tests {
         }
         assert_eq!(window.first_visible(), 56);
         assert_eq!(
-            crate::playlist_window::scroll_handle_y(window.first_visible(), window.len()),
+            crate::playlist_window::scroll_handle_y(
+                window.first_visible(),
+                window.len(),
+                window.row_pitch()
+            ),
             60
         );
     }
@@ -2582,32 +2660,40 @@ mod tests {
             .map(|binding| binding.action.command_id())
             .collect();
         // Alt+F, Alt+M, Ctrl+Alt+N, Num2, Num8, Down, Alt+Down, Up, Alt+Up,
-        // Home, End, PgUp, PgDn, F3, Ctrl+F4, F5, Alt+Enter, Ctrl+Tab.
-        assert_eq!(provisional.len(), 18);
+        // Home, End, PgUp, PgDn, F3, Ctrl+F4, F5, Alt+Enter, Ctrl+Tab, and
+        // the two font-size rows.
+        assert_eq!(provisional.len(), 20);
         for id in [
             40043, 40334, 40305, 40059, 40058, 40290, 40216, 40289, 40215, 40264, 40265, 40256,
-            40257, 40318, 40224, 40291, 40337, 40063,
+            40257, 40318, 40224, 40291, 40337, 40063, 40335, 40336,
         ] {
             assert!(provisional.contains(&id), "{id}");
         }
-        // The two font-size rows are provisional too, and unimplemented.
+        // The two font-size rows are bound rows of the table now, and they are
+        // provisional (S03 §2 marks them so).
         for id in [40335, 40336] {
             assert!(
-                UNIMPLEMENTED_PLAYLIST_ROWS
+                PLAYLIST_TABLE
                     .iter()
-                    .any(|row| row.command_id == id && row.provisional),
+                    .any(|binding| binding.action.command_id() == id && binding.provisional),
                 "{id}"
+            );
+            assert!(
+                !UNIMPLEMENTED_PLAYLIST_ROWS
+                    .iter()
+                    .any(|row| row.command_id == id),
+                "{id} must not be listed as unimplemented"
             );
         }
     }
 
     #[test]
-    fn the_unimplemented_rows_are_the_five_s03_rows_without_a_command() {
+    fn the_unimplemented_rows_are_the_three_s03_rows_without_a_command() {
         let rows: Vec<u32> = UNIMPLEMENTED_PLAYLIST_ROWS
             .iter()
             .map(|row| row.command_id)
             .collect();
-        assert_eq!(rows, vec![40255, 40293, 40292, 40335, 40336]);
+        assert_eq!(rows, vec![40255, 40293, 40292]);
         // None of them resolves to an action.
         for row in UNIMPLEMENTED_PLAYLIST_ROWS {
             assert_eq!(
@@ -2617,6 +2703,89 @@ mod tests {
                 row.key
             );
         }
+    }
+
+    /// S03 §2's two font-size rows are bound and act on the playlist machine
+    /// alone: they change the rows the editor draws and nothing else, so
+    /// they need no core command (RFC 0005 §9/§11.6).
+    #[test]
+    fn the_font_size_rows_are_bound_and_walk_the_size_within_its_range() {
+        assert_eq!(
+            playlist_key_action(Key::NumAdd, Modifiers::CTRL),
+            Some(PlaylistKeyAction::IncreaseFontSize)
+        );
+        assert_eq!(
+            playlist_key_action(Key::NumSubtract, Modifiers::CTRL),
+            Some(PlaylistKeyAction::DecreaseFontSize)
+        );
+        assert_eq!(
+            playlist_key_action(Key::NumAdd, Modifiers::NONE),
+            None,
+            "the row needs Ctrl"
+        );
+        assert_eq!(
+            unimplemented_playlist_row(Key::NumAdd, Modifiers::CTRL),
+            None
+        );
+
+        let mut window = window_with(4);
+        assert_eq!(window.font_size().size(), 13, "the default size");
+        assert!(!window.font_size().is_overridden());
+        assert!(window.increase_font_size());
+        assert_eq!(window.font_size().size(), 14);
+        assert!(window.font_size().is_overridden());
+        assert!(window.decrease_font_size());
+        assert_eq!(window.font_size().size(), 13);
+        // The size is clamped at both ends of the range.
+        for _ in 0..1000 {
+            window.increase_font_size();
+        }
+        assert_eq!(
+            window.font_size().size(),
+            crate::playlist_font::MAX_FONT_SIZE
+        );
+        assert!(!window.increase_font_size(), "the largest size is the end");
+        for _ in 0..1000 {
+            window.decrease_font_size();
+        }
+        assert_eq!(
+            window.font_size().size(),
+            crate::playlist_font::MIN_FONT_SIZE
+        );
+        assert!(!window.decrease_font_size(), "the smallest size is the end");
+    }
+
+    /// The row height follows the font, so the page holds more rows with a
+    /// smaller font and fewer with a bigger one - and no row is clipped.
+    #[test]
+    fn the_row_count_follows_the_font_size() {
+        let mut window = window_with(60);
+        assert_eq!(window.row_pitch(), 13);
+        assert_eq!(window.visible_rows(), 4);
+        assert_eq!(window.visible_ids().len(), 4);
+
+        // The skin's size is used until the user changes it.
+        window.set_skin_font_size(10);
+        assert_eq!(window.row_pitch(), 10);
+        assert_eq!(window.visible_rows(), 5);
+        assert_eq!(window.visible_ids().len(), 5);
+
+        // The user's size wins over the skin's from then on.
+        window.increase_font_size();
+        assert_eq!(window.row_pitch(), 11);
+        assert_eq!(window.visible_rows(), 4);
+        window.set_skin_font_size(20);
+        assert_eq!(
+            window.row_pitch(),
+            11,
+            "the user's size wins over the skin's"
+        );
+
+        // A bigger font: fewer rows, and they still fit the page.
+        window.set_font_size_override(Some(26));
+        assert_eq!(window.row_pitch(), 26);
+        assert_eq!(window.visible_rows(), 2);
+        assert_eq!(window.visible_ids().len(), 2);
     }
 
     #[test]

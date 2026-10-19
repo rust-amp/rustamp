@@ -148,19 +148,23 @@ pub use menu::{
 };
 pub use playlist::{
     ADD_DIALOG_TITLE, BUTTON_BAND_BOTTOM, BUTTON_BAND_TOP, LIST_SELECT_POINT, LOAD_DIALOG_TITLE,
-    PAGE_STEP_ROWS, PLAYLIST_TABLE, PLAYLIST_WINDOW_SIZE, PlaylistBinding, PlaylistButton,
-    PlaylistDialog, PlaylistKeyAction, PlaylistWindow, ScrollDirection,
-    UNIMPLEMENTED_PLAYLIST_ROWS, VISIBLE_ROWS, button_hit_range, has_window_menu_button,
-    hit_test_button, playlist_key_action, playlist_key_binding, unimplemented_playlist_row,
+    PLAYLIST_TABLE, PLAYLIST_WINDOW_SIZE, PlaylistBinding, PlaylistButton, PlaylistDialog,
+    PlaylistKeyAction, PlaylistWindow, ScrollDirection, UNIMPLEMENTED_PLAYLIST_ROWS, VISIBLE_ROWS,
+    button_hit_range, has_window_menu_button, hit_test_button, playlist_key_action,
+    playlist_key_binding, unimplemented_playlist_row,
+};
+pub use playlist_font::{
+    FONT_SIZE_STEP, MAX_FONT_SIZE, MIN_FONT_SIZE, PlaylistFontSize, skin_font_size,
 };
 pub use playlist_window::{
     BOTTOM_BAR_RECT, BUTTON_SRC_Y, CLOSE_BUTTON_RECT, LIST_BOTTOM, LIST_LEFT, LIST_OPTS_SRC_X,
-    LIST_RIGHT, LIST_TOP, PlaylistTitleButton, ROW_PITCH, SCROLL_ARROWS_RECT, SCROLL_ARROWS_SRC,
-    SCROLL_HANDLE_SRC, SCROLL_HANDLE_X, SCROLL_SPLIT_Y, SCROLL_TOP_Y, SCROLL_TRACK_RECT,
-    SCROLL_TRAVEL_PX, SHADE_BUTTON_RECT, ScrollbarHit, TITLE_BAR_HEIGHT, TITLE_STRIP_WIDTH,
-    TITLE_STRIP_X, TITLE_TILE_WIDTH, button_rect, hit_test_list_row, hit_test_scroll,
-    hit_test_scrollbar, hit_test_title_bar, in_list_area, list_area, render_playlist_window,
-    row_rect, scroll_handle_rect, scroll_handle_y, scroll_offset_for_handle_y,
+    LIST_PAGE_HEIGHT, LIST_RIGHT, LIST_TOP, PlaylistTitleButton, ROW_PITCH, SCROLL_ARROWS_RECT,
+    SCROLL_ARROWS_SRC, SCROLL_HANDLE_SRC, SCROLL_HANDLE_X, SCROLL_SPLIT_Y, SCROLL_TOP_Y,
+    SCROLL_TRACK_RECT, SCROLL_TRAVEL_PX, SHADE_BUTTON_RECT, ScrollbarHit, TITLE_BAR_HEIGHT,
+    TITLE_STRIP_WIDTH, TITLE_STRIP_X, TITLE_TILE_WIDTH, button_rect, hit_test_list_row,
+    hit_test_scroll, hit_test_scrollbar, hit_test_title_bar, in_list_area, list_area,
+    render_playlist_window, row_pitch, row_rect, scroll_handle_rect, scroll_handle_y,
+    scroll_offset_for_handle_y, visible_rows,
 };
 pub use presenter::{MainWindowPresenter, PresenterError, map_key, map_key_code, map_modifiers};
 pub use render::{frame_size, render_main_window};
