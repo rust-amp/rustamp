@@ -36,11 +36,33 @@
 //! their own atomic latch, and [`NullOutput`] models the failure without any
 //! hardware.
 //!
+//! # Device change and the recovery it allows
+//!
+//! A device that was invalidated — removed, or replaced as the system default
+//! endpoint — is a *device change*. The WASAPI backend tells it apart from the
+//! other failures: Windows reports it as `AUDCLNT_E_DEVICE_INVALIDATED`, and
+//! the client is then invalid for good (it needs a new `open`, it never
+//! recovers on its own). The cpal backend cannot: its error callback carries
+//! no error code, so it reports the generic fault (RFC 0012 Q4).
+//!
+//! What the change allows depends on how the device was chosen, and that is
+//! the whole of [`recovery`]: a stream that follows the system default
+//! continues on the device that is the default *now*, while a stream bound to a
+//! named device can only fail until that device is back. The decision is pure
+//! and is unit tested; the latched error carries it, so the user learns what
+//! the next Play will do instead of reading a flat "the device disappeared".
+//!
+//! The recovery itself is **not** automatic: RFC 0012 §4.3 (and its open
+//! question Q1) decide that a lost device is a fail-to-stop. The run ends, the
+//! error is reported, and the *next explicit start* gives the output a fresh
+//! `close`/`open`/`start` lifecycle — which is where a stream that follows the
+//! default lands on the new default device.
+//!
 //! The **real** failure path — an endpoint that is really removed, a mix format
 //! that is really renegotiated, a write that really fails on a real endpoint —
 //! needs real hardware and is therefore **VM-only**. It is deliberately *not*
-//! faked here: the unit tests cover the latch and the mapping, and nothing
-//! pretends to have lost a device.
+//! faked here: the unit tests cover the latch, the mapping and the decision,
+//! and nothing pretends to have lost a device.
 //!
 //! # Windows: COM stays off the caller's thread
 //!
@@ -56,6 +78,8 @@
 #![warn(missing_docs)]
 
 mod null;
+
+pub mod recovery;
 
 #[cfg(windows)]
 mod wasapi_exclusive;

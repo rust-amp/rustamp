@@ -44,6 +44,16 @@
 //! same latched loss, and a recovery needs a new `open` (RFC 0012 exposes this
 //! to the engine via [`OutputDevice::stream_error`]).
 //!
+//! An invalidated client is told apart from the other failures: Windows reports
+//! it as `AUDCLNT_E_DEVICE_INVALIDATED`, and it is terminal — the client needs
+//! a new `open` and never recovers on its own. The *device* behind it may be
+//! alive (the system default endpoint changed) or gone (it was unplugged), and
+//! that difference decides what the recovery is: a stream that follows the
+//! system default continues on the device that is the default now, while a
+//! stream bound to a named device can only fail until that device is back. The
+//! decision is [`crate::recovery::decide`], and the latched error says which
+//! one it is.
+//!
 //! [`WasapiOutput::with_device_name`] selects one render endpoint by name, like
 //! [`crate::CpalOutput::with_device_name`]; an absent or ambiguous name fails
 //! `open`.
@@ -75,9 +85,10 @@ use rustamp_core::audio::{AudioSpec, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::error::{Error, Result};
 use wasapi::{
     AudioClient, CapabilityProbe, Device, DeviceEnumerator, Direction, Handle, SampleType,
-    ShareMode, StreamMode, WaveFormat, initialize_mta,
+    ShareMode, StreamMode, WasapiError, WaveFormat, initialize_mta,
 };
 
+use crate::recovery::{self, DeviceFault, OutputSelection};
 use crate::wasapi_exclusive::{DeviceFormat, MAX_CHANNELS, SampleLayout};
 
 /// Requested buffer duration in 100 ns units (200 ms). The audio engine may
@@ -99,6 +110,17 @@ const ERR_CLIENT: u8 = 3;
 const ERR_WRITE: u8 = 4;
 /// The endpoint disappeared or stopped accepting work while the stream ran.
 const ERR_GONE: u8 = 5;
+/// The audio client was invalidated while the stream ran: the endpoint was
+/// removed, the system default endpoint changed, or the endpoint renegotiated
+/// its mix format.
+const ERR_INVALIDATED: u8 = 6;
+
+/// `AUDCLNT_E_DEVICE_INVALIDATED` (0x88890004).
+///
+/// Windows invalidates the audio client when the endpoint is removed, when the
+/// system default endpoint changes, and when the endpoint renegotiates its mix
+/// format. The client never recovers on its own: it needs a new `open`.
+const AUDCLNT_E_DEVICE_INVALIDATED: i32 = 0x8889_0004u32 as i32;
 
 /// Consecutive failures of a device call on the render thread that are
 /// tolerated before the stream is declared dead. A transient hiccup must not
@@ -106,14 +128,54 @@ const ERR_GONE: u8 = 5;
 /// anyone learning of it.
 const MAX_CONSECUTIVE_FAILURES: u32 = 64;
 
+/// The fault a Windows error code describes, if it describes one.
+///
+/// Only the invalidation matters for the recovery: it says that the *client*
+/// is invalid, not that the device is broken. The device may well be alive
+/// (only the default endpoint changed) or gone (it was unplugged) — the
+/// recovery decision ([`crate::recovery::decide`]) tells the two apart by the
+/// selection.
+fn fault_of_hresult(code: i32) -> Option<u8> {
+    if code == AUDCLNT_E_DEVICE_INVALIDATED {
+        Some(ERR_INVALIDATED)
+    } else {
+        None
+    }
+}
+
+/// The code a failed device call latches.
+///
+/// An invalidated client is terminal — Windows invalidated it for good — so
+/// it is latched at once and the render thread stops. Every other failure
+/// keeps the caller's own code and the bounded retry streak.
+fn fault_code(err: &WasapiError, fallback: u8) -> u8 {
+    match err {
+        WasapiError::Windows(e) => fault_of_hresult(e.code().0).unwrap_or(fallback),
+        _ => fallback,
+    }
+}
+
+/// The fault a latched error code describes, if it describes a mid-run fault.
+///
+/// The open-phase codes (`ERR_COM`, `ERR_OPEN`, `ERR_CLIENT`) describe a
+/// failed *open*, not a device that died during a run.
+fn fault_of_code(code: u8) -> Option<DeviceFault> {
+    match code {
+        ERR_INVALIDATED => Some(DeviceFault::Invalidated),
+        ERR_GONE => Some(DeviceFault::Lost),
+        ERR_WRITE => Some(DeviceFault::WriteFailed),
+        _ => None,
+    }
+}
+
 fn error_text(code: u8) -> Option<&'static str> {
     match code {
         ERR_COM => Some("COM could not be initialised"),
         ERR_OPEN => Some("the endpoint could not be opened"),
         ERR_CLIENT => Some("IAudioRenderClient is not available"),
-        ERR_WRITE => Some("writing to the device failed"),
-        ERR_GONE => Some("the device disappeared or stopped responding"),
-        _ => None,
+        // The mid-run faults share their wording with the recovery report, so
+        // the two can never drift apart.
+        _ => fault_of_code(code).map(recovery::fault_text),
     }
 }
 
@@ -441,6 +503,19 @@ impl WasapiOutput {
     pub fn stream_error(&self) -> Option<Error> {
         <Self as OutputDevice>::stream_error(self)
     }
+
+    /// How the stream was selected: the system default endpoint, or the device
+    /// the caller named.
+    ///
+    /// The selection decides where a recovery can land, so it is part of the
+    /// decision the latched fault is reported with
+    /// ([`crate::recovery::decide`]).
+    fn selection(&self) -> OutputSelection {
+        match self.wanted {
+            Some(_) => OutputSelection::Pinned,
+            None => OutputSelection::Default,
+        }
+    }
 }
 
 impl OutputDevice for WasapiOutput {
@@ -544,7 +619,15 @@ impl OutputDevice for WasapiOutput {
 
     fn stream_error(&self) -> Option<Error> {
         let code = self.shared.error.load(Ordering::Acquire);
-        error_text(code).map(|msg| Error::Output(format!("{}: {msg}", self.device_name)))
+        let text = error_text(code)?;
+        let message = match fault_of_code(code) {
+            // A device that died during the run: the message says what the
+            // recovery is, so the user knows what the next Play will do.
+            Some(fault) => recovery::message(fault, self.selection(), &self.device_name),
+            // A failed open: the plain reason, named after the device.
+            None => format!("{}: {text}", self.device_name),
+        };
+        Some(Error::Output(message))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1006,7 +1089,14 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
                     failures.reset();
                     streaming = true;
                 }
-                Err(_) => {
+                Err(err) => {
+                    // An invalidated client is terminal: Windows invalidated it
+                    // for good, so the stream needs a new `open` and there is
+                    // nothing to retry.
+                    if fault_code(&err, ERR_GONE) == ERR_INVALIDATED {
+                        fail(&shared, ERR_INVALIDATED);
+                        return;
+                    }
                     // A device that is gone fails here forever; after a bounded
                     // number of tries the stream is declared dead instead of
                     // spinning in silence.
@@ -1041,13 +1131,19 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
                 // No buffer arrived within the timeout: the stream is either
                 // quiet or the endpoint is gone. Probing the client tells the
                 // two apart; a failing probe is the loss signal.
-                if client.get_available_space_in_frames().is_err() {
-                    if failures.tick() {
-                        fail(&shared, ERR_GONE);
-                        return;
+                match client.get_available_space_in_frames() {
+                    Ok(_) => failures.reset(),
+                    Err(err) => {
+                        // An invalidated client is terminal (see above).
+                        if fault_code(&err, ERR_GONE) == ERR_INVALIDATED {
+                            fail(&shared, ERR_INVALIDATED);
+                            return;
+                        }
+                        if failures.tick() {
+                            fail(&shared, ERR_GONE);
+                            return;
+                        }
                     }
-                } else {
-                    failures.reset();
                 }
                 continue;
             }
@@ -1109,7 +1205,14 @@ fn write_available(
             failures.reset();
             n.min(buffer_frames) as usize
         }
-        Err(_) => {
+        Err(err) => {
+            // An invalidated client is terminal: Windows invalidated it for
+            // good, so the stream needs a new `open` and there is nothing to
+            // retry.
+            if fault_code(&err, ERR_GONE) == ERR_INVALIDATED {
+                fail(shared, ERR_INVALIDATED);
+                return;
+            }
             // A client whose buffer space cannot be read is invalidated; a
             // single failure can be transient, a persistent one is device loss.
             if failures.tick() {
@@ -1125,11 +1228,11 @@ fn write_available(
     render(&mut samples[..n]);
     let width = layout.bytes_per_sample();
     crate::wasapi_exclusive::write_samples(&samples[..n], layout, &mut bytes[..n * width]);
-    if render_client
-        .write_to_device(available, &bytes[..n * width], None)
-        .is_err()
-    {
-        fail(shared, ERR_WRITE);
+    if let Err(err) = render_client.write_to_device(available, &bytes[..n * width], None) {
+        // A write that fails because the client was invalidated is the
+        // invalidation, not a write failure: the device may be alive and only
+        // the default endpoint changed.
+        fail(shared, fault_code(&err, ERR_WRITE));
         return;
     }
     shared.played.fetch_add(available as u64, Ordering::AcqRel);
@@ -1206,9 +1309,68 @@ mod tests {
         assert!(gone.contains("device"), "{gone}");
         assert_ne!(error_text(ERR_GONE), error_text(ERR_WRITE));
         // Every code `close` can report has a message.
-        for code in [ERR_NONE, ERR_COM, ERR_OPEN, ERR_CLIENT, ERR_WRITE, ERR_GONE] {
+        for code in [
+            ERR_NONE,
+            ERR_COM,
+            ERR_OPEN,
+            ERR_CLIENT,
+            ERR_WRITE,
+            ERR_GONE,
+            ERR_INVALIDATED,
+        ] {
             assert_eq!(error_text(code).is_some(), code != ERR_NONE);
         }
+    }
+
+    #[test]
+    fn an_invalidated_client_is_its_own_fault() {
+        // Windows invalidates the client when the endpoint is removed, when the
+        // system default endpoint changes, and when the endpoint renegotiates
+        // its mix format. The client never recovers on its own: it needs a new
+        // `open`, so the failure is latched at once instead of being retried.
+        assert_eq!(
+            fault_of_hresult(AUDCLNT_E_DEVICE_INVALIDATED),
+            Some(ERR_INVALIDATED)
+        );
+        // Any other Windows error keeps the caller's own code.
+        assert_eq!(fault_of_hresult(0x8000_0001u32.cast_signed()), None);
+        assert_eq!(
+            fault_of_code(ERR_INVALIDATED),
+            Some(DeviceFault::Invalidated),
+            "the invalidation is the fault the recovery decides on"
+        );
+    }
+
+    #[test]
+    fn the_latched_error_names_the_recovery() {
+        // A stream that follows the system default continues on the device
+        // that is the default now, so the message says so.
+        let out = WasapiOutput::new();
+        fail(&out.shared, ERR_INVALIDATED);
+        let err = OutputDevice::stream_error(&out).expect("latched error");
+        let msg = err.to_string();
+        assert!(msg.contains("invalidated"), "{msg}");
+        assert!(
+            msg.contains("press Play to continue on the current default device"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_device_cannot_continue_on_the_default() {
+        // The user named the device, and the backend never substitutes another
+        // one behind their back: the recovery is the device coming back, or
+        // the user choosing another one.
+        let out = WasapiOutput::with_device_name("CABLE Input");
+        fail(&out.shared, ERR_GONE);
+        let err = OutputDevice::stream_error(&out).expect("latched error");
+        let msg = err.to_string();
+        assert!(msg.contains("disappeared"), "{msg}");
+        assert!(msg.contains("choose another device"), "{msg}");
+        assert!(
+            !msg.contains("current default device"),
+            "a pinned device never continues on the default: {msg}"
+        );
     }
 
     #[test]
