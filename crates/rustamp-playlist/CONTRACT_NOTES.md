@@ -74,8 +74,13 @@ Requested decisions from S06:
   entry" style action) — this crate only keeps the resolved location, title and
   duration.
 * Whether the playlist window needs to know which format a loaded file had
-  (for "Save playlist" defaulting to the same format). This crate exposes
-  `PlaylistFormat` and the caller is expected to remember it.
+  (for "Save playlist" defaulting to the same format). **Answered by the
+  import side:** `import_playlist_file` and `import_playlist_path` return an
+  `ImportedPlaylist` that carries the detected `PlaylistFormat` next to the
+  entries, so the caller no longer has to guess it. The plain readers
+  (`read_playlist*`, `load_playlist_file*`) keep their signature and report
+  the entries only. `rustamp-app` does not use the import side yet; that is
+  the open end.
 
 ## 2. Proposals for `rustamp-core` (need an RFC)
 
@@ -132,6 +137,7 @@ These are documented in each module and are candidates for a spec to override:
 | Area | Rule |
 |---|---|
 | detection | content marker > empty input takes the extension's format > binary/UTF-16, XML with an unknown root, text behind an unknown or XML (`.xspf`/`.b4s`) extension: **rejected** > `.m3u8` > other text as M3U (card E2 tightened this; before, any `.m3u` was trusted and `.xspf` HTML parsed to an empty list) |
+| marker search | the **whole file** is searched for a marker, not only its first kilobyte, so a PLS with a long comment preamble and an XSPF with a long XML comment in front of its root are still recognized; the markers are ASCII and are searched in the raw bytes, so the search does not depend on the encoding |
 | explicit format | `read_playlist_as` rejects bytes that contradict the format (other marker, binary/UTF-16/XML for the line formats, truncated or rootless XSPF) |
 | writer input | an empty or whitespace-padded location, a line break in an M3U/PLS location, or a leading `#` in an M3U location is `InvalidEntry`; it used to be rewritten silently |
 | encoding | UTF-8 first (BOM stripped), Windows-1252 fallback for `.m3u`; `.m3u8` uses UTF-8 with replacement characters; UTF-16 is not decoded |

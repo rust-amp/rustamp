@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use rustamp_core::playlist::{MediaLocation, Playlist};
 use rustamp_playlist::{
-    LoadedEntry, PlaylistError, PlaylistFormat, append_loaded, load_playlist_file,
-    load_playlist_file_report, read_playlist, read_playlist_as, read_playlist_path,
-    read_playlist_report_as, read_playlist_report_path, write_playlist,
+    LoadedEntry, PlaylistError, PlaylistFormat, append_loaded, import_playlist_file,
+    import_playlist_path, load_playlist_file, load_playlist_file_report, read_playlist,
+    read_playlist_as, read_playlist_path, read_playlist_report_as, read_playlist_report_path,
+    write_playlist,
 };
 
 /// A uniquely named directory under the system temp directory, removed on drop.
@@ -581,4 +582,127 @@ fn file_based_report_reading_works() {
     let rep_bytes = read_playlist_report_path(content, &list_path).expect("read report path");
     assert_eq!(rep_bytes.len(), 1);
     assert_eq!(rep_bytes.skip_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// the import side: format detection and import
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_import_reports_the_format_it_detected() {
+    let entries = sample_entries();
+    for format in [
+        PlaylistFormat::M3u,
+        PlaylistFormat::M3u8,
+        PlaylistFormat::Pls,
+        PlaylistFormat::Xspf,
+    ] {
+        let bytes = write_playlist(format, &entries).expect("write");
+        let path = base().join(format!("list.{}", format.extension()));
+        let imported = import_playlist_path(&bytes, &path).expect("import");
+        assert_eq!(
+            imported.format,
+            format,
+            "format of list.{}",
+            format.extension()
+        );
+        assert_eq!(imported.report.entries, entries, "round-trip of {format}");
+        assert!(imported.report.is_clean());
+    }
+}
+
+#[test]
+fn the_content_wins_over_a_wrong_extension() {
+    // A PLS file named `.m3u` is a PLS.
+    let pls = b"[playlist]\r\nFile1=a.mp3\r\n";
+    let imported = import_playlist_path(pls, &base().join("list.m3u")).expect("import");
+    assert_eq!(imported.format, PlaylistFormat::Pls);
+    assert_eq!(imported.report.entries.len(), 1);
+
+    // An XSPF file named `.pls` is an XSPF.
+    let xspf =
+        b"<playlist><trackList><track><location>a.mp3</location></track></trackList></playlist>";
+    let imported = import_playlist_path(xspf, &base().join("list.pls")).expect("import");
+    assert_eq!(imported.format, PlaylistFormat::Xspf);
+    assert_eq!(imported.report.entries.len(), 1);
+
+    // An M3U file named `.xspf` is an M3U, because the content says so.
+    let m3u = b"#EXTM3U\r\na.mp3\r\n";
+    let imported = import_playlist_path(m3u, &base().join("list.xspf")).expect("import");
+    assert_eq!(imported.format, PlaylistFormat::M3u);
+    assert_eq!(imported.report.entries.len(), 1);
+}
+
+#[test]
+fn the_extension_tells_m3u_from_m3u8() {
+    let m3u = b"#EXTM3U\r\na.mp3\r\n";
+    assert_eq!(
+        import_playlist_path(m3u, &base().join("list.m3u"))
+            .expect("import")
+            .format,
+        PlaylistFormat::M3u
+    );
+    assert_eq!(
+        import_playlist_path(m3u, &base().join("list.m3u8"))
+            .expect("import")
+            .format,
+        PlaylistFormat::M3u8
+    );
+}
+
+#[test]
+fn a_broken_file_is_an_error_and_not_an_empty_list() {
+    // Binary data.
+    assert!(matches!(
+        import_playlist_path(&[0x00, 0x01, 0x02, 0xFF], &base().join("list.m3u")),
+        Err(PlaylistError::UnsupportedFormat(_))
+    ));
+    // A truncated XSPF document.
+    assert!(matches!(
+        import_playlist_path(
+            b"<playlist><trackList><track><location>a.mp3",
+            &base().join("list.xspf")
+        ),
+        Err(PlaylistError::UnsupportedFormat(_))
+    ));
+    // A foreign extension and no marker.
+    assert!(matches!(
+        import_playlist_path(b"a.mp3\r\n", &base().join("list.mp3")),
+        Err(PlaylistError::UnsupportedFormat(_))
+    ));
+    // A file that is not there at all.
+    assert!(matches!(
+        import_playlist_file(&base().join("does-not-exist.m3u")),
+        Err(PlaylistError::Io(_))
+    ));
+}
+
+#[test]
+fn importing_a_file_from_disk_reports_the_format() {
+    let dir = TempDir::new("import");
+    let list = dir.path().join("list.m3u8");
+    std::fs::write(&list, "#EXTM3U\r\n#EXTINF:1,Song\r\nsong.mp3\r\n").expect("write file");
+
+    let imported = import_playlist_file(&list).expect("import");
+    assert_eq!(imported.format, PlaylistFormat::M3u8);
+    assert_eq!(imported.report.entries.len(), 1);
+    assert_eq!(imported.report.entries[0].title.as_deref(), Some("Song"));
+    // The location is resolved against the file's own directory.
+    assert_eq!(
+        imported.report.entries[0].location,
+        file(&dir.path().join("song.mp3").to_string_lossy())
+    );
+}
+
+#[test]
+fn an_import_reports_the_entries_it_skipped() {
+    let imported = import_playlist_path(
+        b"#EXTM3U\r\n#EXTINF:1,Good\r\ngood.mp3\r\n#EXTINF:2,Dangling\r\n",
+        &base().join("list.m3u"),
+    )
+    .expect("import");
+    assert_eq!(imported.report.entries.len(), 1);
+    assert_eq!(imported.report.skip_count(), 1);
+    assert!(!imported.report.is_clean());
+    assert!(imported.report.skips[0].reason().contains("dangling"));
 }
