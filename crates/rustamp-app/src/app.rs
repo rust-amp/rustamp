@@ -279,13 +279,17 @@ impl App {
             playlist_open: pl_layout.map(|l| l.visible).unwrap_or(true),
             ..MainWindowState::default()
         };
+        let eq_shaded = eq_layout.is_some_and(|layout| layout.shaded);
 
         let mut app = App {
             engine,
             ui: MainWindow::from_state(initial),
             vis_discontinuity: false,
             layout: MainWindowLayout::CLASSIC,
-            eq: EqualizerWindow::new(),
+            eq: EqualizerWindow::from_state(rustamp_ui::EqualizerState {
+                windowshade: eq_shaded,
+                ..rustamp_ui::EqualizerState::default()
+            }),
             eq_layout: EqualizerLayout::CLASSIC,
             skin: options.skin,
             config: options.config,
@@ -522,7 +526,7 @@ impl App {
             windows.push(WindowLayout {
                 id: WindowId::Main,
                 x: 26,
-                y: 26,
+                y: rustamp_ui::DEFAULT_MAIN_POSITION.y,
                 visible: true,
                 shaded: self.ui.state().windowshade,
                 width: None,
@@ -535,7 +539,7 @@ impl App {
             windows.push(WindowLayout {
                 id: WindowId::Equalizer,
                 x: 26,
-                y: 142,
+                y: rustamp_ui::DEFAULT_EQUALIZER_POSITION.y,
                 visible: self.eq_open(),
                 shaded: false,
                 width: None,
@@ -548,7 +552,7 @@ impl App {
             windows.push(WindowLayout {
                 id: WindowId::Playlist,
                 x: 26,
-                y: 258,
+                y: rustamp_ui::DEFAULT_PLAYLIST_POSITION.y,
                 visible: self.playlist_open(),
                 shaded: false,
                 width: None,

@@ -161,7 +161,6 @@ fn an_ignored_field_is_not_advertised() {
         "gapless",
         "output",
         "device",
-        "snap_distance",
         "shuffle",
         "repeat",
         "manual_advance",
@@ -176,6 +175,13 @@ fn an_ignored_field_is_not_advertised() {
             "serialized honest config advertises ignored setting '{name}':\n{serialized}"
         );
     }
+    assert_eq!(
+        rustamp_app::config::parse(&serialized)
+            .unwrap()
+            .ui
+            .snap_distance,
+        25
+    );
 
     // Conversely, if a user writes unapplied fields into a config file,
     // the loader explicitly identifies them with descriptive warnings.
@@ -208,10 +214,8 @@ repeat = true
         "audio.buffer_ms warning missing: {warnings:?}"
     );
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("ui.snap_distance") && w.contains("not applied")),
-        "ui.snap_distance warning missing: {warnings:?}"
+        warnings.iter().all(|w| !w.contains("ui.snap_distance")),
+        "supported snap distance must not warn: {warnings:?}"
     );
     assert!(
         warnings

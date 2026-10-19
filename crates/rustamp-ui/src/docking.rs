@@ -3,8 +3,8 @@
 //! Everything here is a function of positions and sizes (no window, no clock, no
 //! IO), so it is unit-tested headlessly. The constants and shapes below are taken
 //! only from `specs/S05-docking.md` (§§3, 4 and 5) plus `specs/S01-window-geometry.md`;
-//! anything `S05` leaves open is left open in the code as well (a named
-//! provisional constant or an empty rule set, never a guess).
+//! additional snap/undock policies needed by the presenter are explicitly
+//! documented as Rustamp choices, never as measured reference behaviour.
 //!
 //! # What this module models
 //!
@@ -130,8 +130,100 @@ impl ClassicWindow {
 
     /// The bottom edge (`top + height`).
     pub fn bottom(&self) -> i32 {
-        self.y + self.height as i32
+        self.y.saturating_add(self.height as i32)
     }
+
+    /// Snaps a proposed position to a visible neighbour's outside edges.
+    ///
+    /// Rustamp policy, not a measured S05 rule: all four sides participate,
+    /// the closest candidate wins (target order breaks ties), and a zero
+    /// tolerance disables snapping. Parallel edges must overlap; matching
+    /// corners may align within the same tolerance. The presenter supplies
+    /// only visible targets and `UiConfig::snap_distance`.
+    pub fn snapped_position(
+        &self,
+        position: WindowPosition,
+        targets: &[ClassicWindow],
+        tolerance: u32,
+    ) -> WindowPosition {
+        if tolerance == 0 {
+            return position;
+        }
+        let mut best = position;
+        let mut best_distance = u64::MAX;
+        for target in targets {
+            let align = |value: i32, start: i32, end: i32| {
+                if value == start || value == end {
+                    return value;
+                }
+                let a = snap_edge(value, start, tolerance);
+                let b = snap_edge(value, end, tolerance);
+                if b != value
+                    && (a == value
+                        || (i64::from(a) - i64::from(value)).abs()
+                            > (i64::from(b) - i64::from(value)).abs())
+                {
+                    b
+                } else {
+                    a
+                }
+            };
+            let x = align(
+                position.x,
+                target.x,
+                target
+                    .x
+                    .saturating_add(target.width as i32)
+                    .saturating_sub(self.width as i32),
+            );
+            let y = align(
+                position.y,
+                target.y,
+                target.bottom().saturating_sub(self.height as i32),
+            );
+            for candidate in [
+                WindowPosition::new(x, target.y.saturating_sub(self.height as i32)),
+                WindowPosition::new(x, target.bottom()),
+                WindowPosition::new(target.x.saturating_sub(self.width as i32), y),
+                WindowPosition::new(target.x.saturating_add(target.width as i32), y),
+            ] {
+                let dx = (i64::from(candidate.x) - i64::from(position.x)).unsigned_abs();
+                let dy = (i64::from(candidate.y) - i64::from(position.y)).unsigned_abs();
+                let moved = Self {
+                    x: candidate.x,
+                    y: candidate.y,
+                    ..*self
+                };
+                if dx <= u64::from(tolerance)
+                    && dy <= u64::from(tolerance)
+                    && touches(moved, *target)
+                    && dx + dy < best_distance
+                {
+                    best = candidate;
+                    best_distance = dx + dy;
+                }
+            }
+        }
+        best
+    }
+}
+
+// Exact coincident outside edges with positive overlap form a connection.
+// This is Rustamp's reconstructible docking policy; S05 leaves undocking open.
+fn touches(a: ClassicWindow, b: ClassicWindow) -> bool {
+    let (ax, ay, bx, by) = (
+        i64::from(a.x),
+        i64::from(a.y),
+        i64::from(b.x),
+        i64::from(b.y),
+    );
+    let (ar, ab, br, bb) = (
+        ax + i64::from(a.width),
+        ay + i64::from(a.height),
+        bx + i64::from(b.width),
+        by + i64::from(b.height),
+    );
+    ((ab == by || bb == ay) && ax < br && bx < ar) || ((ar == bx || br == ax) && ay < bb && by < ab)
 }
 
 /// The three classic windows together, as a docked set (S05 §4.3).
@@ -155,39 +247,63 @@ impl DockedStack {
         }
     }
 
-    /// Re-flows the docked neighbours so the equalizer's top follows the main
-    /// window's bottom edge and the playlist's top follows the equalizer's
-    /// bottom edge (S05 §3.3, §5). Horizontal offsets are preserved.
-    pub fn reflow(&mut self) {
-        // Keep the equalizer horizontally aligned with the main when it started
-        // that way; only the vertical edge is forced to track.
-        if self.equalizer.x == self.main.x {
-            self.equalizer.y = self.main.bottom();
+    // Follow existing connections, never create a connection merely because
+    // two detached windows happen to have the same x coordinate. Main is the
+    // anchor; a detached EQ can still carry its playlist on an EQ resize.
+    fn reflow(&mut self, before: Self) {
+        let old = [before.main, before.equalizer, before.playlist];
+        let mut new = [self.main, self.equalizer, self.playlist];
+        let mut visited = [false; 3];
+        for root in 0..3 {
+            if visited[root] {
+                continue;
+            }
+            visited[root] = true;
+            let mut queue = vec![root];
+            while let Some(parent) = queue.pop() {
+                for child in 0..3 {
+                    if visited[child] || !touches(old[parent], old[child]) {
+                        continue;
+                    }
+                    visited[child] = true;
+                    let mut dx = new[parent].x.saturating_sub(old[parent].x);
+                    let mut dy = new[parent].y.saturating_sub(old[parent].y);
+                    if i64::from(old[child].x)
+                        == i64::from(old[parent].x) + i64::from(old[parent].width)
+                    {
+                        dx = dx.saturating_add(new[parent].width as i32 - old[parent].width as i32);
+                    }
+                    if old[child].y == old[parent].bottom() {
+                        dy = dy
+                            .saturating_add(new[parent].height as i32 - old[parent].height as i32);
+                    }
+                    new[child].x = new[child].x.saturating_add(dx);
+                    new[child].y = new[child].y.saturating_add(dy);
+                    queue.push(child);
+                }
+            }
         }
-        if self.playlist.x == self.equalizer.x {
-            self.playlist.y = self.equalizer.bottom();
-        }
+        [self.main, self.equalizer, self.playlist] = new;
     }
 
     /// Moves the whole docked set by the same delta (S05 §4.2, §5): a move of
     /// the main window moves every docked neighbour by the same delta.
     pub fn move_main(&mut self, dx: i32, dy: i32) {
-        self.main.x += dx;
-        self.main.y += dy;
-        self.equalizer.x += dx;
-        self.equalizer.y += dy;
-        self.playlist.x += dx;
-        self.playlist.y += dy;
+        let before = *self;
+        self.main.x = self.main.x.saturating_add(dx);
+        self.main.y = self.main.y.saturating_add(dy);
+        self.reflow(before);
     }
 
     /// Toggles the main window's windowshade and re-flows the stack (S05 §1.1,
     /// §3.3, §5). Neighbours are not resized (S05 §3.2).
     pub fn set_main_shaded(&mut self, shaded: bool) {
+        let before = *self;
         self.main.shaded = shaded;
         let (w, h) = window_size(WindowKind::Main, shaded, self.main.double_size);
         self.main.width = w;
         self.main.height = h;
-        self.reflow();
+        self.reflow(before);
     }
 
     /// Toggles the main window's double-size and re-flows the stack (S05 §2.1,
@@ -196,42 +312,46 @@ impl DockedStack {
     /// (see [`window_size`]; S05 §2.3, run 20261016-091412), and the stored
     /// rectangle always matches [`window_size`].
     pub fn set_main_double_size(&mut self, double_size: bool) {
+        let before = *self;
         self.main.double_size = double_size;
         let (w, h) = window_size(WindowKind::Main, self.main.shaded, double_size);
         self.main.width = w;
         self.main.height = h;
-        self.reflow();
+        self.reflow(before);
     }
 
-    /// Toggles the equalizer's double-size (S05 §2.1). The playlist is not
-    /// affected.
+    /// Toggles the equalizer's double-size (S05 §2.1). A connected playlist
+    /// follows its edge without itself resizing.
     pub fn set_equalizer_double_size(&mut self, double_size: bool) {
+        let before = *self;
         self.equalizer.double_size = double_size;
         // Keep stored geometry consistent with the renderer even when shaded
         // (the EQ shade+2x composition is provisional, S05 §1.5).
         let (w, h) = window_size(WindowKind::Equalizer, self.equalizer.shaded, double_size);
         self.equalizer.width = w;
         self.equalizer.height = h;
-        self.reflow();
+        self.reflow(before);
     }
 
     /// Toggles windowshade for the equalizer. The provisional 14-px shade
     /// (S01 §1, unmeasured in S05 §1.5) scales with the renderer's 2x flag.
     pub fn set_equalizer_shaded(&mut self, shaded: bool) {
+        let before = *self;
         self.equalizer.shaded = shaded;
         let (w, h) = window_size(WindowKind::Equalizer, shaded, self.equalizer.double_size);
         self.equalizer.width = w;
         self.equalizer.height = h;
-        self.reflow();
+        self.reflow(before);
     }
 
     /// Toggles windowshade for the playlist editor.
     pub fn set_playlist_shaded(&mut self, shaded: bool) {
+        let before = *self;
         self.playlist.shaded = shaded;
         let (w, h) = window_size(WindowKind::Playlist, shaded, self.playlist.double_size);
         self.playlist.width = w;
         self.playlist.height = h;
-        self.reflow();
+        self.reflow(before);
     }
 }
 
@@ -389,9 +509,9 @@ pub const SHADE_REFLOW_PX: i32 = (WINDOW_HEIGHT as i32) - (SHADE_HEIGHT as i32);
 /// `S05` leaves the snap rules themselves open (§4.1, §7): whether a window
 /// snaps to screen edges or to other windows, which edges participate, whether a
 /// drag must be in progress, and the tolerance. **None of that is measured**, so
-/// this crate exposes only a single, explicitly provisional tolerance and a
-/// generic edge-snap helper that takes the participating edges and the tolerance
-/// as arguments. Do not treat the constant as a measured Winamp value.
+/// the generic helpers take the tolerance as an argument. The presenter uses
+/// [`ClassicWindow::snapped_position`]'s explicit Rustamp edge policy. Do not
+/// treat that policy or the constant as measured Winamp behaviour.
 ///
 /// The value mirrors the pre-existing `UiConfig::snap_distance` default (10) and
 /// is kept for compatibility; it has **not** been measured against 2.95.
@@ -416,7 +536,7 @@ pub fn snap_within(distance: i32, tolerance: u32) -> bool {
 /// target value; otherwise return the original. The participating edges and the
 /// tolerance are the caller's (S05 §4.1, open).
 pub fn snap_edge(value: i32, target: i32, tolerance: u32) -> i32 {
-    if snap_within(value - target, tolerance) {
+    if (i64::from(value) - i64::from(target)).unsigned_abs() <= u64::from(tolerance) {
         target
     } else {
         value
@@ -479,6 +599,126 @@ pub type Pos = WindowPosition;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_same_x_windows_are_not_carried_or_reflowed() {
+        let mut stack = DockedStack::default_launch();
+        stack.equalizer.y += 50;
+        stack.playlist.y += 50;
+        let detached = (stack.equalizer, stack.playlist);
+        stack.move_main(200, 30);
+        stack.set_main_shaded(true);
+        stack.set_main_double_size(true);
+        assert_eq!((stack.equalizer, stack.playlist), detached);
+        stack.set_equalizer_shaded(true);
+        assert_eq!(stack.playlist.y, detached.1.y - 102);
+    }
+
+    #[test]
+    fn direct_and_transitive_side_connections_follow_main() {
+        let mut stack = DockedStack::default_launch();
+        stack.equalizer.x = stack.main.x + stack.main.width as i32;
+        stack.equalizer.y = stack.main.y + 20;
+        stack.playlist.x = stack.equalizer.x;
+        stack.playlist.y = stack.equalizer.bottom();
+        let before = stack;
+        stack.move_main(-50, 80);
+        assert_eq!(
+            (stack.equalizer.x, stack.equalizer.y),
+            (before.equalizer.x - 50, before.equalizer.y + 80)
+        );
+        assert_eq!(
+            (stack.playlist.x, stack.playlist.y),
+            (before.playlist.x - 50, before.playlist.y + 80)
+        );
+        stack.set_main_double_size(true);
+        assert_eq!(stack.equalizer.x, stack.main.x + 550);
+        assert_eq!(stack.playlist.x, stack.equalizer.x);
+    }
+
+    #[test]
+    fn playlist_can_dock_directly_to_main_without_a_connected_equalizer() {
+        let mut stack = DockedStack::default_launch();
+        stack.equalizer.x = 900;
+        stack.playlist.y = stack.main.bottom();
+        stack.move_main(10, 20);
+        stack.set_main_shaded(true);
+        assert_eq!((stack.playlist.x, stack.playlist.y), (36, 63));
+        assert_eq!((stack.equalizer.x, stack.equalizer.y), (900, 145));
+    }
+
+    #[test]
+    fn snapping_supports_all_sides_and_configurable_inclusive_tolerance() {
+        let main = ClassicWindow::new_main(100, 100);
+        let eq = ClassicWindow::new_equalizer(900, 900);
+        for (proposed, expected) in [
+            ((107, 226), (100, 216)),   // below, inclusive 10 px gap
+            ((94, -23), (100, -16)),    // above
+            ((385, 106), (375, 100)),   // right
+            ((-185, 108), (-175, 100)), // left
+        ] {
+            assert_eq!(
+                eq.snapped_position(WindowPosition::new(proposed.0, proposed.1), &[main], 10),
+                WindowPosition::new(expected.0, expected.1)
+            );
+        }
+        let outside = WindowPosition::new(100, 227);
+        assert_eq!(eq.snapped_position(outside, &[main], 10), outside);
+        assert_eq!(
+            eq.snapped_position(outside, &[main], 11),
+            WindowPosition::new(100, 216)
+        );
+        assert_eq!(eq.snapped_position(outside, &[main], 0), outside);
+        assert_eq!(eq.snapped_position(outside, &[], 20), outside);
+        // Close edge coordinates alone are insufficient without overlap.
+        let far_side = WindowPosition::new(900, 221);
+        assert_eq!(eq.snapped_position(far_side, &[main], 10), far_side);
+    }
+
+    #[test]
+    fn snapped_neighbour_connects_and_a_later_move_detaches_it() {
+        let mut stack = DockedStack::default_launch();
+        let at = stack
+            .equalizer
+            .snapped_position(WindowPosition::new(30, 150), &[stack.main], 10);
+        stack.equalizer.x = at.x;
+        stack.equalizer.y = at.y;
+        stack.move_main(200, 0);
+        assert_eq!(stack.equalizer.x, 226);
+        stack.equalizer.x = 900;
+        let detached = stack.equalizer;
+        stack.move_main(100, 0);
+        assert_eq!(stack.equalizer, detached);
+    }
+
+    #[test]
+    fn snap_distance_calculation_handles_extreme_saved_coordinates() {
+        assert_eq!(snap_edge(i32::MIN, i32::MAX, 10), i32::MIN);
+        assert_eq!(snap_edge(i32::MIN, i32::MAX, u32::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn snapping_keeps_exact_alignment_and_uses_nearest_visible_target() {
+        let mut main = ClassicWindow::new_main(100, 100);
+        main.width = 280;
+        let eq = ClassicWindow::new_equalizer(900, 900);
+        assert_eq!(
+            eq.snapped_position(WindowPosition::new(100, 220), &[main], 10),
+            WindowPosition::new(100, 216)
+        );
+        let mut other = ClassicWindow::new_playlist(100, 102);
+        other.height = 116;
+        assert_eq!(
+            eq.snapped_position(WindowPosition::new(100, 220), &[main, other], 10),
+            WindowPosition::new(100, 218)
+        );
+        // A wider doubled main also offers right-edge alignment.
+        main.width = 550;
+        assert_eq!(
+            eq.snapped_position(WindowPosition::new(380, 220), &[main], 10),
+            WindowPosition::new(375, 216)
+        );
+    }
 
     #[test]
     fn default_stack_matches_s05_3_1() {
