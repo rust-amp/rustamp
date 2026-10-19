@@ -18,12 +18,19 @@
 //! Headless: stdio control plus shared-memory PCM only. No window, no audio
 //! output, no downloads.
 //!
-//! EOS means the backend has no more decodable frames, not verified file
-//! integrity. The current core decoder folds container `UnexpectedEof` into
-//! EOS, including truncated WAV data. This adapter cannot recover that lost
-//! distinction: it preserves EOS and forwards actual backend errors loudly.
-//! Durations may be estimates; comparing them to decoded frames is not a
-//! format-independent truncation check.
+//! EOS means the backend has no more decodable frames **and the file holds
+//! everything its container declares**. A file that was cut short is a decode
+//! failure, not an end of stream: the decoder reports it as
+//! [`Error::Decode`](rustamp_core::error::Error::Decode), this adapter turns
+//! that into a loud [`MediaHostError::OperationFailed`], and the framework
+//! reports it as a terminal `DecoderError` instead of an end of stream. A
+//! half-downloaded track therefore fails loudly instead of playing short.
+//!
+//! The limit of that rule is where the decoder has no oracle: only a
+//! container that states its payload length exactly (RIFF/WAVE) can say that
+//! a file was cut, so a truncated file of another kind still ends with an end
+//! of stream. Durations may be estimates as well; comparing them to decoded
+//! frames is not a format-independent truncation check.
 
 use std::path::PathBuf;
 use std::time::Duration;

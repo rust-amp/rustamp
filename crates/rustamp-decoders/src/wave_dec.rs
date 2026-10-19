@@ -14,6 +14,14 @@
 //! standard KSDATAFORMAT sub-format GUIDs). No Winamp source, SDK header or
 //! disassembly was consulted and nothing was copied.
 //!
+//! # Truncation
+//!
+//! The `data` chunk header states how many bytes of sample data the file
+//! holds. A file that ends before that many bytes were read was **cut**, and
+//! the decoder says so: the frames the file does hold are delivered, and the
+//! next `read` that writes no frames fails with [`Error::Decode`]. A file
+//! that holds everything its header declares ends with `Ok(0)` as usual.
+//!
 //! # Why this factory exists next to symphonia
 //!
 //! [`SymphoniaDecoderFactory`](crate::SymphoniaDecoderFactory) already decodes
@@ -86,7 +94,7 @@ impl WaveDecoderFactory {
 ///
 /// The same 12-byte test symphonia applies, so a real WAV file is a genuine
 /// equal-confidence tie between the two factories (RFC 0013).
-fn is_riff_wave(h: &[u8]) -> bool {
+pub(crate) fn is_riff_wave(h: &[u8]) -> bool {
     h.len() >= 12 && &h[0..4] == b"RIFF" && &h[8..12] == b"WAVE"
 }
 
@@ -185,9 +193,16 @@ struct Fmt {
 struct Data {
     /// Byte offset of the first sample.
     start: u64,
-    /// Bytes of sample data, when known. `None` for a streaming `data` chunk
-    /// (`0xFFFFFFFF`) in a source that cannot report its length: read to EOF.
+    /// Bytes of sample data the source really holds, when known. `None` for
+    /// a streaming `data` chunk (`0xFFFFFFFF`) in a source that cannot report
+    /// its length: read to EOF.
     len: Option<u64>,
+    /// Bytes of sample data the chunk header declares, when it declares a
+    /// length at all.
+    ///
+    /// This is the claim the file has to keep: a source that ends before the
+    /// declared length is a cut file, not a finished stream.
+    declared: Option<u64>,
 }
 
 /// Little-endian `u16` at `at`.
@@ -252,14 +267,29 @@ fn parse(reader: &mut dyn ReadSeek, file_len: Option<u64>) -> Result<(Fmt, Data)
                 ));
             }
             let start = reader.stream_position()?;
+            // The chunk header states how many bytes of sample data the file
+            // holds. That is the claim the file has to keep: a source that
+            // ends before it was cut.
+            let declared = if size == u32::MAX && file_len.is_none() {
+                // The streaming marker of a source that cannot report its
+                // length is not a length at all: read to the end of the
+                // source.
+                None
+            } else {
+                Some(u64::from(size))
+            };
+            // The bytes the source really holds, when that is known: the
+            // duration is computed from them, so it never claims more than
+            // the file has.
             let len = match file_len {
                 Some(total) => Some(u64::from(size).min(total.saturating_sub(start))),
-                // Without a length the declared size is the only bound, except
-                // for the streaming marker, which is not a length at all.
-                None if size == u32::MAX => None,
-                None => Some(u64::from(size)),
+                None => declared,
             };
-            data = Some(Data { start, len });
+            data = Some(Data {
+                start,
+                len,
+                declared,
+            });
             // The sample data is bounded by `size`; anything after it (including
             // the RIFF pad byte of an odd `data` size) is not audio.
             break;
@@ -425,8 +455,8 @@ pub struct WaveDecoder {
     frame_bytes: usize,
     /// Byte offset of the first sample in the source.
     data_start: u64,
-    /// Declared length of the sample data, when known.
-    data_len: Option<u64>,
+    /// Declared length of the sample data, when the chunk states one.
+    data_declared: Option<u64>,
     /// Bytes of the sample data already read from the source.
     data_read: u64,
     /// Frames of sample data in the source, when known.
@@ -435,6 +465,9 @@ pub struct WaveDecoder {
     buf: Vec<u8>,
     buf_len: usize,
     buf_pos: usize,
+    /// A truncation found in the sample data, reported by the next `read`
+    /// that writes no frames.
+    truncation: Option<String>,
     skipped: u64,
     meta: TrackMetadata,
 }
@@ -490,12 +523,13 @@ impl WaveDecoder {
             shift: fmt.shift,
             frame_bytes,
             data_start: data.start,
-            data_len: data.len,
+            data_declared: data.declared,
             data_read: 0,
             total_frames,
             buf: vec![0u8; cap],
             buf_len: 0,
             buf_pos: 0,
+            truncation: None,
             skipped: 0,
             meta,
         };
@@ -511,13 +545,19 @@ impl WaveDecoder {
 
     /// Refills the byte buffer from the source, bounded by the declared `data`
     /// length. Leaves `buf_len == 0` at the end of the sample data.
+    ///
+    /// A source that ends before the declared length was **cut**: the
+    /// truncation is recorded and reported by the next `read` that writes no
+    /// frames, so the frames the file does hold are still delivered.
     fn refill(&mut self) -> Result<()> {
         self.buf_pos = 0;
         self.buf_len = 0;
-        let want = match self.data_len {
-            Some(len) => len
+        let want = match self.data_declared {
+            Some(declared) => declared
                 .saturating_sub(self.data_read)
                 .min(self.buf.len() as u64) as usize,
+            // A source of unknown length is read to its end, and that end is
+            // the end of the stream: there is no claim to keep.
             None => self.buf.len(),
         };
         if want == 0 {
@@ -534,6 +574,16 @@ impl WaveDecoder {
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(Error::Io(e)),
             }
+        }
+        if filled < want
+            && let Some(declared) = self.data_declared
+        {
+            // The source ended inside the payload the header declares.
+            self.truncation = Some(format!(
+                "truncated WAV data: the file ends after {} of the {} declared bytes",
+                self.data_read + filled as u64,
+                declared
+            ));
         }
         self.data_read += filled as u64;
         self.buf_len = filled;
@@ -583,6 +633,13 @@ impl Decoder for WaveDecoder {
             self.buf_pos += n * self.frame_bytes;
             done += n;
         }
+        if done == 0
+            && let Some(message) = &self.truncation
+        {
+            // The file was cut: the frames it holds were delivered, and the
+            // failure comes now, in a call that writes no frames.
+            return Err(Error::Decode(message.clone()));
+        }
         Ok(done)
     }
 
@@ -611,6 +668,9 @@ impl Decoder for WaveDecoder {
         self.buf_pos = 0;
         self.buf_len = 0;
         self.data_read = frames.saturating_mul(self.frame_bytes as u64);
+        // A seek re-opens the stream: what the previous position held about
+        // the file's completeness does not describe the new one.
+        self.truncation = None;
         Ok(self.spec.duration_of(frames))
     }
 
@@ -922,23 +982,49 @@ mod tests {
     }
 
     #[test]
-    fn a_data_size_past_the_end_of_the_source_is_clamped() {
+    fn a_data_size_past_the_end_of_the_source_is_a_truncation() {
         // The header claims 4 GiB of samples; only two frames are present.
         let mut bytes = pcm16_mono(&[16_384, -16_384]);
         patch_data_size(&mut bytes, u32::MAX);
         let mut d = open_bytes(bytes).expect("open");
+        // The duration stays honest about the bytes that are really there...
         assert_eq!(d.duration(), Some(d.spec().duration_of(2)));
-        assert_eq!(read_all(&mut d), vec![0.5, -0.5]);
+        // ...and the claim the file cannot keep is reported, not swallowed.
+        let mut buf = [0.0f32; 2];
+        assert_eq!(d.read(&mut buf).expect("the frames the file holds"), 2);
+        let err = d
+            .read(&mut buf)
+            .expect_err("a file cut below its declared length must fail");
+        assert!(
+            matches!(&err, Error::Decode(m) if m.contains("truncated WAV data")),
+            "{err:?}"
+        );
     }
 
     #[test]
-    fn a_declared_data_size_larger_than_the_file_ends_early() {
+    fn a_declared_data_size_larger_than_the_file_is_a_truncation() {
         let mut bytes = pcm16_mono(&[16_384, -16_384]);
         patch_data_size(&mut bytes, 1000);
         let mut d = open_bytes(bytes).expect("open");
         // The source length clamps the claim, so even the duration is honest.
         assert_eq!(d.duration(), Some(d.spec().duration_of(2)));
-        assert_eq!(read_all(&mut d), vec![0.5, -0.5]);
+        let mut buf = [0.0f32; 2];
+        assert_eq!(d.read(&mut buf).expect("the frames the file holds"), 2);
+        let err = d
+            .read(&mut buf)
+            .expect_err("a file cut below its declared length must fail");
+        assert!(
+            matches!(&err, Error::Decode(m) if m.contains("truncated WAV data")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_complete_file_ends_with_an_end_of_stream() {
+        let mut d = open_bytes(pcm16_mono(&[16_384, -16_384])).expect("open");
+        let mut buf = [0.0f32; 2];
+        assert_eq!(d.read(&mut buf).expect("read"), 2);
+        assert_eq!(d.read(&mut buf).expect("read at the end"), 0);
     }
 
     #[test]

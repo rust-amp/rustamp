@@ -13,6 +13,12 @@
 //!   format.
 //! * A container reset (chained Ogg) cannot be continued, so the stream ends
 //!   (`read` returns `Ok(0)`) as C3.4 requires.
+//! * A **truncated** file is a decode failure, not an end of stream: when the
+//!   container states how many frames the file holds and the stream ends
+//!   before that count is reached, the file was cut and `read` reports
+//!   [`Error::Decode`]. A file that holds everything its container declares
+//!   ends with `Ok(0)` as before. The rule is limited to the containers that
+//!   state their payload exactly (RIFF/WAVE); see [`states_frame_count`].
 //! * Corrupt packets are skipped; see [`SymphoniaDecoder::skipped_packets`].
 //! * Hostile input (truncated, empty, lying headers, noise) is rejected with a
 //!   defined error or degraded to a defined end of stream; the loop in
@@ -222,6 +228,21 @@ pub(crate) fn frames_at(rate: u64, at: Duration) -> u64 {
     secs.saturating_add(frac)
 }
 
+/// Whether the container states the number of frames it holds.
+///
+/// The declared frame count is the oracle for a truncated file only where the
+/// container *states* it exactly. A RIFF/WAVE `data` chunk states the number
+/// of samples it holds, and raw PCM has no unit that can be lost: a damaged
+/// file changes the samples, not the frame count. Every other container this
+/// crate reads either estimates the count (MPEG audio without a Xing/LAME
+/// header), counts it differently from what it delivers (the AIFF reader
+/// includes the `SSND` header in its frame count) or can lose frames to
+/// damage without losing any (FLAC, MP4), so their count is no evidence of a
+/// cut file.
+fn states_frame_count(header: &[u8]) -> bool {
+    crate::wave_dec::is_riff_wave(header)
+}
+
 /// Queues a detected mid-stream format change.
 ///
 /// `spec` is deliberately not switched here: RFC 0002 C3 has `spec()` report the
@@ -263,6 +284,18 @@ pub struct SymphoniaDecoder {
     /// A detected mid-stream format change, reported by the next `read` that
     /// writes no frames (RFC 0002, C3).
     pending_format_change: Option<AudioSpec>,
+    /// Frames handed out since the last seek.
+    delivered: u64,
+    /// The frame count the container states, when it states an exact one.
+    ///
+    /// `None` means "no oracle": either the container does not state a count
+    /// or it states an estimate (see [`states_frame_count`]).
+    declared_frames: Option<u64>,
+    /// A truncation found at the end of the stream.
+    ///
+    /// Reported by the next `read` that writes no frames, so the frames that
+    /// were decoded before the cut are still delivered.
+    truncation: Option<String>,
     skipped: u64,
     consecutive_errors: u32,
     finished: bool,
@@ -272,8 +305,12 @@ pub struct SymphoniaDecoder {
 
 impl SymphoniaDecoder {
     /// Open a decoder for `source` (`Path` or `Reader`).
-    pub fn open(source: MediaSource) -> Result<Self> {
+    pub fn open(mut source: MediaSource) -> Result<Self> {
         let ext = source.extension();
+        // The container's own signature, read before the source is handed to
+        // symphonia: it decides whether the frame count the container states
+        // is an oracle for a cut file (see [`states_frame_count`]).
+        let header = source.sniff(12).unwrap_or_default();
         let (mss, byte_len) = match source {
             MediaSource::Url(_) => {
                 return Err(Error::Unsupported(
@@ -351,6 +388,9 @@ impl SymphoniaDecoder {
             pending_pos: 0,
             seek_target: None,
             pending_format_change: None,
+            delivered: 0,
+            declared_frames: params.n_frames.filter(|_| states_frame_count(&header)),
+            truncation: None,
             skipped: 0,
             consecutive_errors: 0,
             finished: false,
@@ -402,6 +442,7 @@ impl SymphoniaDecoder {
                 Ok(p) => p,
                 Err(SymError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     self.finished = true;
+                    self.note_truncation();
                     return Ok(false);
                 }
                 Err(SymError::ResetRequired) => {
@@ -481,6 +522,25 @@ impl SymphoniaDecoder {
         }
     }
 
+    /// Records that the stream ended before the container's declared frame
+    /// count was reached: the file was cut, not finished.
+    ///
+    /// Only a container that states an exact frame count can say this (see
+    /// [`states_frame_count`]); without that oracle the end of the stream
+    /// stays an end of stream.
+    fn note_truncation(&mut self) {
+        let Some(declared) = self.declared_frames else {
+            return;
+        };
+        if self.delivered >= declared {
+            return;
+        }
+        self.truncation = Some(format!(
+            "truncated stream: the file ends after {} of the {} frames its container declares",
+            self.delivered, declared
+        ));
+    }
+
     fn note_skip(&mut self) -> Result<()> {
         self.skipped += 1;
         self.consecutive_errors += 1;
@@ -529,6 +589,17 @@ impl Decoder for SymphoniaDecoder {
                 .copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
             self.pending_pos += n;
             written += n;
+            // Counted here, not after the loop: the end of the stream is
+            // detected inside the loop, and it has to see the frames this
+            // call already handed out.
+            self.delivered += (n / ch) as u64;
+        }
+        if written == 0
+            && let Some(message) = &self.truncation
+        {
+            // The file was cut: the frames it holds were delivered, and the
+            // failure comes now, in a call that writes no frames.
+            return Err(Error::Decode(message.clone()));
         }
         if written == 0
             && let Some(e) = take_format_change(&mut self.spec, &mut self.pending_format_change)
@@ -584,6 +655,17 @@ impl Decoder for SymphoniaDecoder {
         // stale; the format of the reopened position is what matters.
         self.pending_format_change = None;
         self.seek_target = Some(seeked.required_ts + pre);
+        // After a seek the stream is read from the target, so the frames still
+        // to come are counted from there and the declared count is what is
+        // left of it. A seek that lands before the target only makes the
+        // declared count larger, which cannot turn a complete file into a
+        // truncated one.
+        self.delivered = 0;
+        self.truncation = None;
+        if let Some(declared) = self.declared_frames {
+            let target = seeked.required_ts.saturating_add(pre);
+            self.declared_frames = Some(declared.saturating_sub(target));
+        }
         Ok(self.spec.duration_of(target_frames))
     }
 
@@ -802,6 +884,23 @@ mod tests {
     // -----------------------------------------------------------------------
     // B2: hostile input, error classification and format changes
     // -----------------------------------------------------------------------
+
+    /// The frame count is an oracle for a cut file only where the container
+    /// states it exactly: a RIFF/WAVE `data` chunk does, the others do not.
+    #[test]
+    fn only_containers_that_state_the_frame_count_are_checked() {
+        let mut wave = b"RIFF".to_vec();
+        wave.extend_from_slice(&0u32.to_le_bytes());
+        wave.extend_from_slice(b"WAVEfmt ");
+        assert!(states_frame_count(&wave));
+        assert!(!states_frame_count(b"fLaC\0\0\0\0\0\0\0\0"));
+        assert!(!states_frame_count(b"ID3\0\0\0\0\0\0\0\0\0"));
+        // A RIFF container that is not WAVE is not a WAV file.
+        let mut avi = b"RIFF".to_vec();
+        avi.extend_from_slice(&0u32.to_le_bytes());
+        avi.extend_from_slice(b"AVI LIST");
+        assert!(!states_frame_count(&avi));
+    }
 
     /// A decoded-buffer stand-in with `frames` frames and `channels` channels,
     /// all silence. The first channel is what the `fill_*` helpers below write.

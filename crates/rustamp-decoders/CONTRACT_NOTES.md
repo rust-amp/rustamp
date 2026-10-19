@@ -11,11 +11,22 @@ Behaviour the core contract leaves open, and what the decoders do.
   call on, and the next `read` continues in it. A container reset (chained Ogg)
   cannot be continued, so the stream ends (`read` returns `Ok(0)`) as C3.4
   requires.
+- **Truncation.** A file that was cut short is a decode failure, not an end of
+  stream. The oracle is the frame count the container states: when the stream
+  ends before that count was delivered, `read` fails with
+  `Error::Decode("truncated stream: ...")` in a call that writes no frames, so
+  the frames the file does hold are still delivered. A file that holds
+  everything its container declares ends with `Ok(0)` as before. The check
+  applies to the containers that state their payload exactly - RIFF/WAVE, whose
+  `data` chunk states the number of samples - and to no other (see the named
+  limits below).
 - **Seek.** `SeekMode::Accurate` plus a 4096-frame pre-roll that is decoded and
   discarded, because MP3/Vorbis/AAC need previous blocks for exact output.
   Returns the requested position clamped to the duration (it is sample exact).
   A stream with no known duration has nothing to clamp to, so the target is
   bounded by `MAX_SEEK_FRAMES` (2^53) instead of overflowing the frame count.
+  After a seek the truncation check counts from the new position, so a seek
+  cannot turn a complete file into a truncated one.
 - **Empty input.** A source of zero bytes is rejected before probing with
   `Error::Decode("empty source: 0 bytes to decode")`, not with the probe's "no
   suitable format reader found" (which named the wrong problem).
@@ -55,13 +66,17 @@ the core contract leaves room:
   `bext`, ...) are skipped with the RIFF pad byte that follows an odd size. The
   RIFF size field itself is not trusted - the chunk walk is authoritative - so
   trailing bytes after `data` are ignored rather than an error.
-- **`data` size.** A declared size that reaches past the end of the source is
-  clamped to the bytes that are really there (so even `duration()` stays honest
-  for a truncated file). The streaming marker `0xFFFFFFFF` means "to EOF"; in a
-  source that cannot report its length the duration is then `None`.
+- **`data` size.** The declared size is the claim the file has to keep: a source
+  that ends before the declared length was cut, and the decoder says so - the
+  frames the file does hold are delivered, and the next `read` that writes no
+  frames fails with `Error::Decode("truncated WAV data: ...")`. The duration is
+  still computed from the bytes that are really there, so it never claims more
+  than the file has. The streaming marker `0xFFFFFFFF` means "to EOF" in a
+  source that cannot report its length; there is no claim to keep, so that
+  stream ends cleanly and its duration is `None`.
 - **Truncated tail.** A `data` size that is not a whole number of frames leaves a
   partial frame. It is dropped and counted in `skipped_packets()`; the stream
-  ends cleanly (the same short-EOS shape as the symphonia path).
+  ends cleanly (the file holds everything its header declares).
 - **Seek.** Sample exact: a byte offset from the start of the sample data, no
   pre-roll. The target is clamped to the duration when that is known; half a
   frame of slack makes a target derived from `duration_of(n)` land on frame `n`
@@ -74,13 +89,18 @@ the core contract leaves room:
 Distinctions the decoders still cannot make, named so they are not mistaken for
 correct behaviour:
 
-1. **A truncated stream is indistinguishable from a clean end** (both decoders).
-   By the time the container stops handing out packets the decoder has a clean
-   `Ok(0)`; the caller cannot tell "the file ended" from "the file was cut
-   short". Fixing it would mean inventing a `Truncated` outcome for every
-   container, which the current `Decoder` contract does not carry (RFC 0002 has
-   no such item). The wave decoder does count a half frame as a skipped unit,
-   which is the only trace it can leave.
+1. **A truncated stream is no longer indistinguishable from a clean end** (both
+   decoders). The decoders compare the frames they delivered with the frame
+   count the container states and report a shortfall as `Error::Decode`, so a
+   cut file fails loudly instead of playing short. The remaining limit is
+   where no such oracle exists: the count is only evidence of a cut file when
+   the container states it exactly (a RIFF/WAVE `data` chunk does). The MPEG
+   audio reader only estimates its frame count when the file carries no
+   Xing/LAME header, the AIFF reader counts the `SSND` header into its frame
+   count, and the FLAC and MP4 readers resynchronise damaged frames without
+   counting them - so a truncated file of those kinds still ends with an end of
+   stream. The wave decoder has no such limit: it parses the `data` chunk
+   itself and compares the declared length with the bytes that are there.
 2. **A damaged file whose *content signature* matches is reported as
    `UnsupportedFormat`** (symphonia). The signature tells the factory to hand the
    file to symphonia; when the probe then rejects the body, nothing is open yet,

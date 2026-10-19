@@ -104,6 +104,7 @@ fn sine(i: usize, c: u16) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// How a bounded drain ended.
+#[derive(Debug)]
 enum Drained {
     /// `read` returned `Ok(0)`: a defined end of stream.
     End,
@@ -307,6 +308,80 @@ fn a_truncated_flac_never_reports_more_audio_than_its_bytes_hold() {
         frames.is_none_or(|f| f < FIXTURE_FRAMES),
         "a truncated file must not yield the full {FIXTURE_FRAMES} frames: {frames:?}"
     );
+}
+
+/// A cut file is a loud decode failure, not an end of stream.
+///
+/// The RIFF/WAVE `data` chunk states the number of samples the file holds.
+/// A file that ends before that count was delivered was cut, and saying so is
+/// the whole point: a half-downloaded track must not play short as if it were
+/// complete.
+#[test]
+fn a_truncated_wav_is_a_loud_failure_and_not_an_end_of_stream() {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let full = wav_bytes(spec, 8000, sine);
+    // Cut inside the sample data, in the middle of a frame.
+    let cut = full[..full.len() * 2 / 5].to_vec();
+    assert!(cut.len() < full.len());
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("wav")))
+        .expect("a truncated wav still opens");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        frames < 8000,
+        "a truncated file must not yield the claimed 8000 frames: {frames}"
+    );
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => assert!(
+            message.contains("truncated"),
+            "the failure must name the truncation: {message}"
+        ),
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// The limit of the rule, named so it is not mistaken for a fix.
+///
+/// FLAC states its sample count in the `STREAMINFO` block, but a damaged FLAC
+/// frame is resynchronised by the container reader, so a corrupt file
+/// delivers fewer frames than it declares too. A frame count cannot tell the
+/// two apart, so a truncated FLAC is not called truncated.
+#[test]
+fn a_truncated_flac_is_not_mistaken_for_a_cut_file() {
+    let full = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let cut = full[..full.len() / 3].to_vec();
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("flac")))
+        .expect("a truncated flac still opens");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        frames < FIXTURE_FRAMES,
+        "a truncated file must not yield the full {FIXTURE_FRAMES} frames: {frames}"
+    );
+    if let Drained::Failed(Error::Decode(message)) = &outcome {
+        assert!(
+            !message.contains("truncated"),
+            "a FLAC has no exact oracle, so it must not be called truncated: {message}"
+        );
+    }
+}
+
+/// A file that holds everything its container declares ends with a plain end
+/// of stream, and the frame count is the one the container states.
+#[test]
+fn a_complete_file_ends_with_an_end_of_stream() {
+    for name in ["sine.flac", "sine.mp3", "sine.ogg", "sine_alac.m4a"] {
+        let bytes = std::fs::read(fixture(name)).expect("fixture");
+        let extension = name.rsplit('.').next().map(str::to_owned);
+        let mut d = SymphoniaDecoder::open(reader_source(bytes, extension.as_deref()))
+            .expect("a complete fixture opens");
+        let (frames, outcome) = drain_bounded(&mut d);
+        assert!(matches!(outcome, Drained::End), "{name}: {outcome:?}");
+        assert_eq!(frames, FIXTURE_FRAMES, "{name}: the whole file was decoded");
+    }
 }
 
 // ---------------------------------------------------------------------------

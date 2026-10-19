@@ -22,6 +22,14 @@
 //! PCM wait (`rustamp-mediahost`'s `pcm::RING_POLL`), and the escape below
 //! prints the ring counters so a future red says which of the two causes it
 //! was.
+//!
+//! Terminal classification (docs/tasks/M14-host-framework-review.md, F2): a
+//! stream that was cut short is a **loud failure**, never a clean end of
+//! stream. The tests below pin both terminals separately: a truncated file
+//! fails with a diagnostic that names the truncation, an intact file ends
+//! with an end of stream and the frame count its container declares, and a
+//! stream that holds no frames at all ends with an end of stream too (there
+//! is nothing missing).
 
 #![cfg(windows)]
 
@@ -197,6 +205,28 @@ fn direct_decode(path: &Path) -> Vec<f32> {
         match decoder.read(&mut buf).expect("direct read") {
             0 => return out,
             frames => out.extend_from_slice(&buf[..frames * channels]),
+        }
+    }
+}
+
+/// Decode a file in-process and report how the decode ended.
+///
+/// The end of a stream is one of two things: the file held everything its
+/// container declared and the decode ends with an end of stream, or the file
+/// was cut and the decode fails. The second one is a failure, not a short
+/// end of stream, so the two are kept apart here.
+fn direct_decode_terminal(path: &Path) -> (Vec<f32>, Option<String>) {
+    let mut decoder = rustamp_decoders::default_registry()
+        .open(MediaSource::Path(path.to_path_buf()))
+        .expect("direct open");
+    let channels = usize::from(decoder.spec().channels);
+    let mut out = Vec::new();
+    let mut buf = vec![0.0f32; 2048 * channels];
+    loop {
+        match decoder.read(&mut buf) {
+            Ok(0) => return (out, None),
+            Ok(frames) => out.extend_from_slice(&buf[..frames * channels]),
+            Err(error) => return (out, Some(error.to_string())),
         }
     }
 }
@@ -412,8 +442,25 @@ fn garbage_and_empty_files_are_clean_errors_never_eos() {
     }
 }
 
+/// Read the whole stream and report how it ended.
+///
+/// `None` is a clean end of stream; `Some(message)` is the failure that
+/// ended the transfer. A stall is a panic (see [`read_pcm`]), never a
+/// terminal of its own.
+fn drain_pcm(session: &mut DecoderSession<NamedPcmRings>, step: &str) -> (usize, Option<String>) {
+    let mut buf = [0.0f32; 128];
+    let mut frames = 0usize;
+    loop {
+        match read_pcm(session, &mut buf, step) {
+            Ok(0) => return (frames, None),
+            Ok(n) => frames += n,
+            Err(error) => return (frames, Some(error.to_string())),
+        }
+    }
+}
+
 #[test]
-fn truncated_wav_preserves_backend_short_eos_not_an_integrity_guarantee() {
+fn a_truncated_file_is_a_loud_decode_failure_and_not_an_end_of_stream() {
     let full: Vec<[f32; 2]> = (0..4000)
         .map(|i| {
             let t = i as f32 / 8000.0;
@@ -421,40 +468,112 @@ fn truncated_wav_preserves_backend_short_eos_not_an_integrity_guarantee() {
         })
         .collect();
     let mut bytes = wav_bytes(8000, 1, &full);
-    bytes.truncate(bytes.len() / 2);
+    // Cut the file inside the sample data, in the middle of a frame: the
+    // header still claims 4000 frames, the file holds 2999 of them.
+    bytes.truncate(bytes.len() - 2001);
     let path = temp_file("truncated.wav", &bytes);
-    // Reference is the same in-process registry decoder, not Winamp. Its
-    // UnexpectedEof -> EOS conversion loses the distinction before the adapter.
-    // Pin that exact terminal here; do not accept an arbitrary error instead.
-    let expected = direct_decode(&path);
-    assert!(!expected.is_empty() && expected.len() < full.len());
+
+    // The same decoder in-process: the frames the file holds, then the
+    // failure. A truncated file must not look like a finished one.
+    let (expected, failure) = direct_decode_terminal(&path);
+    let failure = failure.expect("a truncated file must fail, not end the stream");
+    assert!(
+        failure.contains("truncated"),
+        "the failure must name the truncation: {failure}"
+    );
+    assert_eq!(expected.len(), 2999, "the frames the file holds");
 
     let (mut session, done) = start(file_location(&path), 7);
-    let mut received = Vec::new();
-    let mut buf = [0.0f32; 128];
-    loop {
-        match read_pcm(&mut session, &mut buf, "the truncated-file transfer")
-            .expect("backend short EOS")
-        {
-            0 => break,
-            frames => received.extend_from_slice(&buf[..frames]),
-        }
-    }
-    assert_eq!(
-        received
-            .iter()
-            .map(|sample| sample.to_bits())
-            .collect::<Vec<_>>(),
-        expected
-            .iter()
-            .map(|sample| sample.to_bits())
-            .collect::<Vec<_>>()
+    let (frames, failure) = drain_pcm(&mut session, "the truncated-file transfer");
+    let failure =
+        failure.expect("a truncated file must be a loud failure, never a clean end of stream");
+    assert!(
+        failure.contains("truncated"),
+        "the failure must name the truncation: {failure}"
+    );
+    assert!(
+        frames > 0 && frames <= expected.len(),
+        "the frames the file holds are delivered before the failure, and no more: {frames}"
+    );
+    // The host ends with the resident's failure, not with a clean shutdown.
+    let error = done
+        .recv_timeout(JOIN_WAIT)
+        .expect("the host must end after a failed decode instead of stalling")
+        .expect_err("a failed decode must end the host with an error");
+    assert!(
+        error.to_string().contains("truncated"),
+        "the host error must name the truncation: {error}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_intact_file_ends_with_a_clean_end_of_stream() {
+    let full: Vec<[f32; 2]> = (0..4000)
+        .map(|i| {
+            let t = i as f32 / 8000.0;
+            [(t * 440.0).sin() * 0.5, (t * 550.0).sin() * 0.5]
+        })
+        .collect();
+    let bytes = wav_bytes(8000, 1, &full);
+    let path = temp_file("intact.wav", &bytes);
+
+    // The in-process reference: the whole file, then an end of stream.
+    let (expected, failure) = direct_decode_terminal(&path);
+    assert!(
+        failure.is_none(),
+        "a complete file must not fail: {failure:?}"
+    );
+    assert_eq!(expected.len(), 4000, "the whole file is decoded");
+
+    let (mut session, done) = start(file_location(&path), 7);
+    let (frames, failure) = drain_pcm(&mut session, "the intact-file transfer");
+    assert!(
+        failure.is_none(),
+        "a complete file must end with an end of stream, not a failure: {failure:?}"
     );
     assert_eq!(
-        read_pcm(&mut session, &mut buf, "the sticky EOS read").unwrap(),
+        frames,
+        expected.len(),
+        "every frame of the file is delivered"
+    );
+    assert_eq!(
+        read_pcm(&mut session, &mut [0.0f32; 128], "the sticky EOS read").unwrap(),
         0
     );
     assert_eq!(session.frames_dropped(), 0);
+    finish_ok(session, done);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_empty_stream_is_a_clean_zero_length_end_of_stream() {
+    // A complete WAV file whose `data` chunk is empty: nothing to play, but
+    // nothing missing either. That is an end of stream, not a failure.
+    let mut bytes = wav_bytes(8000, 1, &[]);
+    bytes.truncate(36);
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    let path = temp_file("empty-data.wav", &bytes);
+
+    let (expected, failure) = direct_decode_terminal(&path);
+    assert!(
+        failure.is_none(),
+        "an empty stream must not be a failure: {failure:?}"
+    );
+    assert!(expected.is_empty(), "an empty stream decodes to no frames");
+
+    let (mut session, done) = start(file_location(&path), 7);
+    let (frames, failure) = drain_pcm(&mut session, "the empty-stream transfer");
+    assert!(
+        failure.is_none(),
+        "an empty stream must end with an end of stream, not a failure: {failure:?}"
+    );
+    assert_eq!(frames, 0, "an empty stream delivers no frames");
+    assert_eq!(
+        read_pcm(&mut session, &mut [0.0f32; 128], "the sticky EOS read").unwrap(),
+        0
+    );
     finish_ok(session, done);
     let _ = std::fs::remove_file(&path);
 }
