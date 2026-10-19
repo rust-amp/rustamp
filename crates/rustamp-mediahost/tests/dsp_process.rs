@@ -194,6 +194,11 @@ fn host_exits_mid_stream_and_infinite_read_survives() {
 /// therefore look like a complete transfer, so the death has to be seen on
 /// the control channel first - that is what this test pins, and the
 /// decoder path cannot have it: `DecoderEos` is a marker message.
+///
+/// The write direction is pinned too: after the kill a write must fail
+/// loudly. A write that returned `Ok(())` would report a delivered frame
+/// for a transfer that never happened - the in-ring still has room, and
+/// nobody will ever read the frame from it.
 #[test]
 #[ignore = "two processes; Hyper-V VM only; requires RUSTAMP_DSP_FIXTURE"]
 fn killing_the_dsp_helper_mid_stream_is_a_loud_error_and_never_a_torn_frame() {
@@ -274,6 +279,28 @@ fn killing_the_dsp_helper_mid_stream_is_a_loud_error_and_never_a_torn_frame() {
     let MediaHostError::Disconnected(_) = &again else {
         panic!("the failure must stick as the same loud error: {again}");
     };
+
+    // The write direction: the in-ring still has room, but nobody will ever
+    // read the frame from it. The write must not report success for it.
+    let write_error = match child
+        .session()
+        .write_timeout(&frame_pattern::frame_samples(delivered), Some(STALL_WAIT))
+    {
+        Ok(()) => panic!("a killed DSP helper must not accept a frame"),
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: the killed helper was not noticed within {STALL_WAIT:?} \
+             (the write waited for a frame nobody will ever take)"
+        ),
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(_) = &write_error else {
+        panic!("the write must fail with a loud, typed error: {write_error}");
+    };
+    assert!(
+        write_error.to_string().contains("control stream ended"),
+        "the death must be seen on the control channel: {write_error}"
+    );
+
     assert!(
         delivered >= 4,
         "the helper must have streamed before the kill, not died before it"
