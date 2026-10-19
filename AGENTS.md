@@ -43,7 +43,10 @@ Read these first, in this order:
   dialog, a menu or a plugin host fails there for the wrong reason. Run the
   suite through the interactive-session path, not the plain session-0 one, and
   never report a session-0 window failure as a product defect without re-running
-  it in the interactive session first.
+  it in the interactive session first. **This is about window/GUI tests only:**
+  a headless unit test (no window, no device, no spawned process) **runs on the
+  host** and must be run by every lane — "the tests need the VM" is never a
+  reason to skip `cargo test` for headless tests.
 
 - **No new Claude tasks** (owner rule, 2026-10-19). Do not start any further lane
   on Claude. Existing Claude lanes may finish; nothing new goes there. With
