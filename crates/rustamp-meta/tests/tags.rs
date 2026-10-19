@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 use rustamp_core::meta::TrackMetadata;
 use rustamp_meta::{
     ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, Artwork, PictureKind, R128_ALBUM_GAIN_KEY, R128_TRACK_GAIN_KEY,
-    REFERENCE_LOUDNESS_KEY, ReplayGainTags, read_artwork, read_artworks, read_tags, scan_paths,
-    supported_extensions, supports_extension, write_replaygain, write_tags, write_tags_report,
+    REFERENCE_LOUDNESS_KEY, ReplayGainTags, analyze_replaygain, r128_track_gain_q8, read_artwork,
+    read_artworks, read_tags, scan_paths, supported_extensions, supports_extension,
+    write_replaygain, write_tags, write_tags_report,
 };
 use tempfile::TempDir;
 
@@ -333,6 +334,65 @@ fn riff_chunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+/// A chunk of an AIFF file: the same as a RIFF chunk, but big-endian.
+fn aiff_chunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(id);
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        out.push(0);
+    }
+    out
+}
+
+/// A minimal AAC (ADTS) file: a frame header and a little sound data.
+///
+/// The header is the seven bytes of an ADTS frame without CRC: AAC LC,
+/// 44.1 kHz, mono.
+fn aac_file() -> Vec<u8> {
+    const PAYLOAD: usize = 32;
+    let frame_length = 7 + PAYLOAD;
+
+    let header = [
+        0xFFu8,
+        0xF1, // MPEG-4, layer 0, no CRC
+        0x50, // AAC LC, 44.1 kHz, mono
+        0x40, // mono, no copyright, short frame
+        ((frame_length >> 3) & 0xFF) as u8,
+        (((frame_length & 7) << 5) | 0x1F) as u8,
+        0xFC, // the buffer is full, one raw data block
+    ];
+    let mut frame = header.to_vec();
+    frame.extend_from_slice(&[0u8; PAYLOAD]);
+    frame
+}
+
+/// A minimal AIFF file: a `FORM` container with a `COMM` and an `SSND`
+/// chunk.
+fn aiff_file() -> Vec<u8> {
+    let mut comm = Vec::new();
+    comm.extend_from_slice(&1u16.to_be_bytes()); // channels
+    comm.extend_from_slice(&44100u32.to_be_bytes()); // sample frames
+    comm.extend_from_slice(&16u16.to_be_bytes()); // sample size
+    // 44100 Hz as an 80-bit IEEE extended float.
+    comm.extend_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]);
+
+    let mut ssnd = Vec::new();
+    ssnd.extend_from_slice(&0u32.to_be_bytes()); // offset
+    ssnd.extend_from_slice(&0u32.to_be_bytes()); // block size
+    ssnd.extend_from_slice(&[0u8; 64]); // the sound data
+
+    let mut body = b"AIFF".to_vec();
+    body.extend_from_slice(&aiff_chunk(b"COMM", &comm));
+    body.extend_from_slice(&aiff_chunk(b"SSND", &ssnd));
+
+    let mut file = b"FORM".to_vec();
+    file.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    file.extend_from_slice(&body);
+    file
 }
 
 /// A minimal 8-bit mono PCM WAV with a RIFF `LIST INFO` chunk.
@@ -1081,24 +1141,266 @@ fn r128_keys_roundtrip_on_vorbis_and_are_refused_loudly_elsewhere() {
         );
     }
 
-    // ID3v2 and MP4 ilst have no field for R128: the write lands the classic
-    // keys and reports the R128 ones instead of dropping them silently.
-    for name in ["sine.mp3", "sine_aac.m4a"] {
+    // The MP4 ilst has no field for R128: the write lands the classic keys
+    // and reports the R128 ones instead of dropping them silently.
+    let path = copy_fixture(&dir, "sine_aac.m4a");
+    let report = write_replaygain(&path, &full_replaygain()).unwrap();
+    assert!(!report.is_complete());
+    assert_eq!(
+        report.skipped_unsupported,
+        vec![
+            R128_TRACK_GAIN_KEY.to_owned(),
+            R128_ALBUM_GAIN_KEY.to_owned()
+        ]
+    );
+    // The classic keys still landed.
+    let got = ReplayGainTags::from_metadata(&read_tags(&path).unwrap());
+    assert_eq!(got.track_gain_db, Some(-3.5));
+    assert!(got.r128_track_gain_q8.is_none());
+}
+
+#[test]
+fn the_r128_keys_reach_an_id3v2_file_as_txxx_frames() {
+    let dir = TempDir::new().unwrap();
+    let path = copy_fixture(&dir, "sine.mp3");
+
+    let tags = ReplayGainTags {
+        r128_track_gain_q8: Some(-1152),
+        r128_album_gain_q8: Some(-1280),
+        ..ReplayGainTags::default()
+    };
+    let report = write_replaygain(&path, &tags).unwrap();
+    assert!(
+        report.is_complete(),
+        "skipped {:?}",
+        report.skipped_unsupported
+    );
+
+    // The frames are in the file, with the key as their description.
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes
+            .windows(R128_TRACK_GAIN_KEY.len())
+            .any(|w| w == R128_TRACK_GAIN_KEY.as_bytes()),
+        "the R128_TRACK_GAIN frame is not in the file"
+    );
+    assert!(
+        bytes
+            .windows(R128_ALBUM_GAIN_KEY.len())
+            .any(|w| w == R128_ALBUM_GAIN_KEY.as_bytes()),
+        "the R128_ALBUM_GAIN frame is not in the file"
+    );
+
+    // And they are read back.
+    assert_eq!(
+        ReplayGainTags::from_metadata(&read_tags(&path).unwrap()),
+        tags
+    );
+}
+
+#[test]
+fn the_r128_keys_reach_the_id3v2_chunk_of_a_wav_file() {
+    let dir = TempDir::new().unwrap();
+    let path = write_file(
+        &dir,
+        "r128.wav",
+        &wav_with_info("Info Title", "Info Artist"),
+    );
+
+    let tags = ReplayGainTags {
+        r128_track_gain_q8: Some(-1152),
+        r128_album_gain_q8: Some(-1280),
+        ..ReplayGainTags::default()
+    };
+    let report = write_replaygain(&path, &tags).unwrap();
+    assert!(
+        report.is_complete(),
+        "skipped {:?}",
+        report.skipped_unsupported
+    );
+
+    // The RIFF INFO chunk is untouched, and the R128 values are in the
+    // ID3v2 chunk beside it.
+    let got = read_tags(&path).unwrap();
+    assert_eq!(got.title.as_deref(), Some("Info Title"));
+    assert_eq!(got.artist.as_deref(), Some("Info Artist"));
+    assert_eq!(
+        ReplayGainTags::from_metadata(&got).r128_track_gain_q8,
+        Some(-1152)
+    );
+    assert_eq!(
+        ReplayGainTags::from_metadata(&got).r128_album_gain_q8,
+        Some(-1280)
+    );
+}
+
+#[test]
+fn the_r128_keys_reach_the_id3v2_chunk_of_an_aiff_file() {
+    let dir = TempDir::new().unwrap();
+    let path = write_file(&dir, "r128.aiff", &aiff_file());
+
+    let tags = ReplayGainTags {
+        r128_track_gain_q8: Some(-1152),
+        r128_album_gain_q8: Some(-1280),
+        ..ReplayGainTags::default()
+    };
+    let report = write_replaygain(&path, &tags).unwrap();
+    assert!(
+        report.is_complete(),
+        "skipped {:?}",
+        report.skipped_unsupported
+    );
+
+    let got = ReplayGainTags::from_metadata(&read_tags(&path).unwrap());
+    assert_eq!(got.r128_track_gain_q8, Some(-1152));
+    assert_eq!(got.r128_album_gain_q8, Some(-1280));
+}
+
+#[test]
+fn the_r128_keys_reach_the_id3v2_tag_of_an_aac_file() {
+    let dir = TempDir::new().unwrap();
+    let path = write_file(&dir, "r128.aac", &aac_file());
+
+    let tags = ReplayGainTags {
+        r128_track_gain_q8: Some(-1152),
+        r128_album_gain_q8: Some(-1280),
+        ..ReplayGainTags::default()
+    };
+    let report = write_replaygain(&path, &tags).unwrap();
+    assert!(
+        report.is_complete(),
+        "skipped {:?}",
+        report.skipped_unsupported
+    );
+
+    let got = ReplayGainTags::from_metadata(&read_tags(&path).unwrap());
+    assert_eq!(got.r128_track_gain_q8, Some(-1152));
+    assert_eq!(got.r128_album_gain_q8, Some(-1280));
+}
+
+#[test]
+fn writing_the_r128_keys_keeps_the_other_frames() {
+    // The R128 values are written through the concrete ID3v2 tag; the
+    // frames this crate has no field for must survive that.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("unknown.mp3");
+
+    let mut bytes = id3v2_tag(&[
+        id3v2_text_frame(b"TIT2", "Original Title"),
+        id3v2_txxx_frame("CUSTOM_TXXX", "Custom Value"),
+    ]);
+    bytes.extend_from_slice(&mp3_audio());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let tags = ReplayGainTags {
+        r128_track_gain_q8: Some(-1152),
+        r128_album_gain_q8: Some(-1280),
+        ..ReplayGainTags::default()
+    };
+    let report = write_replaygain(&path, &tags).unwrap();
+    assert!(report.is_complete());
+
+    let after = std::fs::read(&path).unwrap();
+    assert!(
+        after
+            .windows("Custom Value".len())
+            .any(|w| w == b"Custom Value"),
+        "the unknown user text frame was dropped"
+    );
+    assert_eq!(
+        read_tags(&path).unwrap().title.as_deref(),
+        Some("Original Title")
+    );
+    assert_eq!(
+        ReplayGainTags::from_metadata(&read_tags(&path).unwrap()).r128_track_gain_q8,
+        Some(-1152)
+    );
+}
+
+#[test]
+fn the_r128_tags_do_not_disturb_the_replaygain_tags() {
+    let dir = TempDir::new().unwrap();
+
+    for name in ["sine.flac", "sine.mp3", "sine.ogg"] {
         let path = copy_fixture(&dir, name);
-        let report = write_replaygain(&path, &full_replaygain()).unwrap();
-        assert!(!report.is_complete(), "{name}");
-        assert_eq!(
-            report.skipped_unsupported,
-            vec![
-                R128_TRACK_GAIN_KEY.to_owned(),
-                R128_ALBUM_GAIN_KEY.to_owned()
-            ],
-            "{name}"
+
+        // The classic tags alone.
+        let classic = ReplayGainTags {
+            track_gain_db: Some(-3.5),
+            track_peak: Some(0.987654),
+            album_gain_db: Some(-5.1),
+            album_peak: Some(0.999),
+            ..ReplayGainTags::default()
+        };
+        write_replaygain(&path, &classic).unwrap();
+
+        // The R128 tags on top of them.
+        let mut both = classic.clone();
+        both.r128_track_gain_q8 = Some(-1152);
+        both.r128_album_gain_q8 = Some(-1280);
+        let report = write_replaygain(&path, &both).unwrap();
+        assert!(
+            report.is_complete(),
+            "{name}: skipped {:?}",
+            report.skipped_unsupported
         );
-        // The classic keys still landed.
+
         let got = ReplayGainTags::from_metadata(&read_tags(&path).unwrap());
         assert_eq!(got.track_gain_db, Some(-3.5), "{name}");
-        assert!(got.r128_track_gain_q8.is_none(), "{name}");
+        assert_eq!(got.track_peak, Some(0.987654), "{name}");
+        assert_eq!(got.album_gain_db, Some(-5.1), "{name}");
+        assert_eq!(got.album_peak, Some(0.999), "{name}");
+        assert_eq!(got.r128_track_gain_q8, both.r128_track_gain_q8, "{name}");
+        assert_eq!(got.r128_album_gain_q8, both.r128_album_gain_q8, "{name}");
+    }
+}
+
+#[test]
+fn the_r128_values_of_a_file_survive_the_round_trip() {
+    // The production: a signal is analyzed, the R128 values are measured
+    // from the analysis, written to a file and read back.
+    let dir = TempDir::new().unwrap();
+
+    // A half-scale sine wave: about 6 dB below full scale.
+    let samples: Vec<f32> = (0..44_100)
+        .map(|i| 0.5 * (2.0 * core::f32::consts::PI * 1000.0 * i as f32 / 44_100.0).sin())
+        .collect();
+    let analysis = analyze_replaygain(&samples, 1, 44_100).unwrap();
+
+    let tags = ReplayGainTags {
+        track_gain_db: Some(analysis.track_gain_db),
+        track_peak: Some(analysis.track_peak),
+        r128_track_gain_q8: Some(r128_track_gain_q8(&analysis.loudness_blocks)),
+        ..ReplayGainTags::default()
+    };
+
+    // A half-scale tone has an RMS of -9 dBFS, and a 1 kHz tone's loudness
+    // is its RMS level, so the track measures about -9 LUFS and needs 14 dB
+    // of attenuation to reach the -23 LUFS target.
+    let gain_db = rustamp_meta::r128_q8_to_db(tags.r128_track_gain_q8.expect("a track gain"));
+    assert!(
+        (gain_db - (-14.0)).abs() < 0.2,
+        "the R128 gain is {gain_db} dB"
+    );
+
+    for name in ["sine.flac", "sine.mp3", "sine.ogg"] {
+        let path = copy_fixture(&dir, name);
+        let report = write_replaygain(&path, &tags).unwrap();
+        assert!(
+            report.is_complete(),
+            "{name}: skipped {:?}",
+            report.skipped_unsupported
+        );
+
+        let got = ReplayGainTags::from_metadata(&read_tags(&path).unwrap());
+        assert_eq!(got.r128_track_gain_q8, tags.r128_track_gain_q8, "{name}");
+        // The ReplayGain tag holds two decimals, so it comes back rounded.
+        let written = got.track_gain_db.expect("the track gain");
+        let measured = tags.track_gain_db.expect("the track gain");
+        assert!(
+            (written - measured).abs() < 0.01,
+            "{name}: {written} dB is not {measured} dB"
+        );
     }
 }
 

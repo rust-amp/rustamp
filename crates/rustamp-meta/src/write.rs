@@ -17,6 +17,16 @@
 //! Which tag a file gets, and which unknown frames or keys survive, is
 //! documented at [`write_tags_report`].
 //!
+//! ## The R128 keys of an ID3v2 tag
+//!
+//! `lofty` 0.25.4 has no `ItemKey` for the `R128_TRACK_GAIN` /
+//! `R128_ALBUM_GAIN` keys in ID3v2, so the generic tag model cannot hold
+//! them. The concrete ID3v2 tag can: a `TXXX` frame is told apart by its
+//! description, and the description of these frames is the key. The writer
+//! therefore adds them to the concrete tag and hands the tag back to the
+//! generic model, which keeps such a frame next to the frames it models
+//! itself. A file without R128 values is written exactly as before.
+//!
 //! ## Symlinks
 //!
 //! A symlinked file is written *through*: the link stays a link and the file
@@ -28,6 +38,7 @@ use std::path::Path;
 use lofty::config::{GlobalOptions, ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, FileType, TaggedFileExt};
 use lofty::flac::FlacFile;
+use lofty::id3::v2::Id3v2Tag;
 use lofty::ogg::tag::VorbisComments;
 use lofty::ogg::{OpusFile, SpeexFile, VorbisFile};
 use lofty::probe::Probe;
@@ -39,7 +50,7 @@ use rustamp_core::meta::TrackMetadata;
 
 use crate::atomic::replace_atomically;
 use crate::read::map_lofty;
-use crate::replaygain::item_key_for_extra;
+use crate::replaygain::{R128_ALBUM_GAIN_KEY, R128_TRACK_GAIN_KEY, item_key_for_extra};
 
 /// The largest year a tag can hold: the readers only accept a four-digit year
 /// (`read::parse_year`), so anything larger could not be read back, and
@@ -56,7 +67,7 @@ const MAX_YEAR: u32 = 9999;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WriteReport {
     /// `extra` keys that were not written because the target tag format has
-    /// no field for them (for example `R128_TRACK_GAIN` on MP3, or
+    /// no field for them (for example `R128_TRACK_GAIN` on an MP4 file, or
     /// `REPLAYGAIN_REFERENCE_LOUDNESS` everywhere — `lofty` 0.25.4 has no
     /// key for it). Everything else in `extra` was written.
     pub unwritten_extra: Vec<String>,
@@ -107,7 +118,9 @@ impl WriteReport {
 /// ReplayGain keys are looked up in a canonical table (see `replaygain`),
 /// not by the format's short key name, so MP4 — whose ilst map only knows
 /// the freeform `----:com.apple.iTunes:replaygain_*` form — round-trips the
-/// four classic keys instead of dropping them.
+/// four classic keys instead of dropping them. The R128 keys are written
+/// as `TXXX` frames in an ID3v2 tag and as plain comments in a Vorbis one;
+/// every other format refuses them, and the refusal is reported.
 ///
 /// # Errors
 ///
@@ -219,7 +232,15 @@ impl Target {
     /// could not store.
     fn apply(&mut self, metadata: &TrackMetadata) -> Vec<String> {
         match self {
-            Self::Generic(tag) => apply_to_tag(tag, metadata),
+            Self::Generic(tag) => {
+                let mut unwritten = apply_to_tag(tag, metadata);
+                // ID3v2 has no `ItemKey` for the R128 keys, but it can carry
+                // them as `TXXX` frames (see `write_id3v2_r128`).
+                if tag.tag_type() == TagType::Id3v2 && write_id3v2_r128(tag, metadata) {
+                    unwritten.retain(|key| !is_r128_key(key));
+                }
+                unwritten
+            }
             Self::Flac(flac) => {
                 if flac.vorbis_comments().is_none() {
                     flac.set_vorbis_comments(VorbisComments::new());
@@ -363,4 +384,46 @@ fn apply_to_vorbis(comments: &mut VorbisComments, metadata: &TrackMetadata) -> V
         comments.insert(key.to_owned(), value.to_owned());
     }
     unwritten
+}
+
+/// Whether `key` names one of the two R128 keys.
+fn is_r128_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case(R128_TRACK_GAIN_KEY) || key.eq_ignore_ascii_case(R128_ALBUM_GAIN_KEY)
+}
+
+/// Writes the R128 values of `metadata` into an ID3v2 tag as `TXXX` frames.
+///
+/// `lofty` 0.25.4 has no `ItemKey` for the R128 keys in ID3v2, so the
+/// generic tag model cannot hold them: a `TXXX` frame is told apart by its
+/// description, and only the descriptions `lofty` knows have an `ItemKey`.
+/// The concrete tag can hold such a frame. The round trip through it is
+/// what puts the frame into the generic tag's companion — the place where
+/// the writer keeps the frames it does not model itself — so the frame
+/// reaches the file next to the mapped items.
+///
+/// Returns `true` when at least one frame was written.
+fn write_id3v2_r128(tag: &mut Tag, metadata: &TrackMetadata) -> bool {
+    let mut frames: Vec<(&str, &str)> = Vec::new();
+    for (key, value) in &metadata.extra {
+        let description = if key.eq_ignore_ascii_case(R128_TRACK_GAIN_KEY) {
+            R128_TRACK_GAIN_KEY
+        } else if key.eq_ignore_ascii_case(R128_ALBUM_GAIN_KEY) {
+            R128_ALBUM_GAIN_KEY
+        } else {
+            continue;
+        };
+        frames.push((description, value.as_str()));
+    }
+    if frames.is_empty() {
+        return false;
+    }
+
+    // The concrete tag is built once, from the tag as it stands, and the
+    // frames are added to it.
+    let mut concrete: Id3v2Tag = tag.clone().into();
+    for (description, value) in frames {
+        concrete.insert_user_text(description.to_owned(), value.to_owned());
+    }
+    *tag = concrete.into();
+    true
 }
