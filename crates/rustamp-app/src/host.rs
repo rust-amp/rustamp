@@ -154,6 +154,11 @@
 //!   the lifetime of the process that issued it (RFC 0020 Q6). The inventory
 //!   is therefore cleared when the link attaches a new peer or detaches from
 //!   the old one.
+//! * **A new peer is a new host.** [`HostStateLink::generation`] counts the
+//!   peers the link was attached to, and it changes exactly when a new peer
+//!   arrives. The app uses it to tell "the same host" from "a fresh host":
+//!   a fresh host has loaded nothing, so the plug-ins the user has switched
+//!   on are asked for again (see [`crate::app::App`]).
 //! * **An unknown variant is ignored, not an error.** The drain never
 //!   answers a message it does not know: that would invent protocol.
 //! * **A message that reports nothing the app needs changes nothing.** The
@@ -189,6 +194,12 @@
 //! request carries nothing but the path and the kind
 //! ([`HostStateLink::load_plugin`]). The answer comes back on the same
 //! channel and lands in the inventory (see the section above).
+//!
+//! The app sends that request for the plug-ins the user has switched on
+//! when a host attaches (see [`crate::app::App`]): a classic plug-in runs
+//! inside the host process, so the player can only get one by asking the
+//! host. The request waits for the channel — a load request without a
+//! channel is reported to the user, never sent into the void.
 //!
 //! Like publishing, sending a request never blocks the player: with no
 //! transport attached nothing goes out ([`CommandOutcome::Detached`]), and a
@@ -368,6 +379,9 @@ pub struct HostStateLink {
     /// [`crate::plugin_inventory`]). Belongs to the attached host process
     /// only: it is cleared whenever the peer changes.
     inventory: PluginInventory,
+    /// How many peers this link was attached to (see
+    /// [`HostStateLink::generation`]).
+    generation: u64,
 }
 
 impl HostStateLink {
@@ -384,6 +398,7 @@ impl HostStateLink {
             pending_pong: None,
             next_ping_at: None,
             inventory: PluginInventory::default(),
+            generation: 0,
         }
     }
 
@@ -398,7 +413,9 @@ impl HostStateLink {
     ///
     /// Attaching also forgets the plug-in inventory: the ids in it were
     /// issued by the *previous* host process, and a new host re-uses the
-    /// numbers for different plug-ins (RFC 0020 Q6).
+    /// numbers for different plug-ins (RFC 0020 Q6). The
+    /// [`generation`](HostStateLink::generation) counts the peers, so the app
+    /// can tell that this is a new host.
     ///
     /// The pump calls `send` on this transport, so attach a handover-backed
     /// one ([`MemoryTransport`](rustamp_ipc::MemoryTransport), or the
@@ -409,6 +426,19 @@ impl HostStateLink {
         self.last_sent = None;
         self.reset_liveness();
         self.inventory.clear();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// How many peers this link was attached to.
+    ///
+    /// The count starts at zero (no peer yet) and changes exactly when a new
+    /// peer is attached (see [`attach`](HostStateLink::attach)). It is the
+    /// app's way to tell "the same host" from "a fresh one": the plug-in
+    /// ids and the loaded set belong to one host process (RFC 0020 Q6), so a
+    /// fresh peer has loaded nothing and the plug-ins the user has switched
+    /// on have to be asked for again.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Drop the transport without sending anything. The next
