@@ -6,8 +6,9 @@
 //! permissive crates can call it without depending on the binary target.
 //!
 //! `loader` maps approved 32-bit plugin DLLs and calls their real entry points;
-//! `registry` is the control-channel routing around it. `input` is the input
-//! (`in_`) bridge: the host members of a classic input module, the
+//! `registry` is the control-channel routing around it and the start/stop path
+//! of the running visualization. `input` is the input (`in_`) bridge: the host
+//! members of a classic input module, the
 //! `init`/`play`/`pause`/`stop`/`quit` lifecycle and the state answers the
 //! plugin itself gives. `handoff` is the input → output hand-over: the host
 //! writes the selected output plugin into the input module before `play`, and
@@ -62,7 +63,9 @@ pub use loader::{
     load_plugin, load_plugin_with_store,
 };
 pub use message_loop::*;
-pub use registry::{PluginRegistry, RegistryConfigError, accept_loaded_kind};
+pub use registry::{
+    PluginRegistry, RegistryConfigError, RegistryVisError, RunningVis, accept_loaded_kind,
+};
 pub use restart::{CrashLedger, HostExit, RestartDecision, RestartPolicy, classify_exit};
 pub use rustamp_plugin_abi::common;
 pub use vis::{
