@@ -527,4 +527,57 @@ mod tests {
     fn stream_error_defaults_to_none() {
         assert!(MinimalOutput.stream_error().is_none());
     }
+
+    /// An output that latched a fatal mid-run failure.
+    struct FailingOutput;
+
+    impl OutputDevice for FailingOutput {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
+            Ok(OutputFormat {
+                spec,
+                buffer_frames: 1024,
+            })
+        }
+        fn start(&mut self, _render: RenderFn) -> Result<()> {
+            Ok(())
+        }
+        fn pause(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn latency(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn played_frames(&self) -> u64 {
+            0
+        }
+        fn stream_error(&self) -> Option<Error> {
+            Some(Error::Output("the device disappeared".into()))
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_latched_failure_is_reachable_through_the_trait_object() {
+        // RFC 0012 §1.2 and §4.1: the engine holds a `Box<dyn OutputDevice>`,
+        // so a latched failure that only lived in an inherent backend method
+        // would be invisible to it. The trait method is the contract, and it
+        // has to work through the trait object the engine really uses.
+        let device: Box<dyn OutputDevice> = Box::new(FailingOutput);
+        let err = device.stream_error().expect("the latched failure");
+        assert!(
+            matches!(err, Error::Output(ref msg) if msg == "the device disappeared"),
+            "{err}"
+        );
+    }
 }

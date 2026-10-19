@@ -24,6 +24,22 @@
 //! back to [`NullOutput`] explicitly. `out_disk` (the `out_disk` equivalent of
 //! the original player) is an M2 item.
 //!
+//! # Mid-run device failures (RFC 0012)
+//!
+//! A device that disappears, loses its format or refuses a write mid-run latches
+//! the failure; the engine learns it through
+//! [`OutputDevice::stream_error`] and ends the run with a reported error. The
+//! latch and its mapping into an [`Error`](rustamp_core::error::Error) are
+//! covered by deterministic unit tests: the real backends are driven through
+//! their own atomic latch, and [`NullOutput`] models the failure without any
+//! hardware.
+//!
+//! The **real** failure path — an endpoint that is really removed, a mix format
+//! that is really renegotiated, a write that really fails on a real endpoint —
+//! needs real hardware and is therefore **VM-only**. It is deliberately *not*
+//! faked here: the unit tests cover the latch and the mapping, and nothing
+//! pretends to have lost a device.
+//!
 //! # Windows: COM stays off the caller's thread
 //!
 //! Every COM initialisation this crate performs happens on a thread this crate
