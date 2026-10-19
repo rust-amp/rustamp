@@ -321,6 +321,16 @@ fn save_playlist_is_appended_after_the_clutter_menus() {
 }
 
 #[test]
+fn remove_dead_files_is_appended_after_save_playlist() {
+    // RFC 0018: `RemoveDeadFiles` is index 60 (0x3c), after `SavePlaylist`
+    // (0x3b), so no earlier byte string moves.
+    let command = Command::RemoveDeadFiles;
+    let bytes = encode(&command);
+    assert_eq!(bytes, [0x3c]);
+    assert_eq!(decode(&bytes), command);
+}
+
+#[test]
 fn every_new_variant_round_trips() {
     let commands = [
         Command::SkipBy { delta: -3 },

@@ -118,7 +118,9 @@ pub enum ScrollDirection {
 ///
 /// Implements the provisional move/scroll rows, the two provisional jump rows,
 /// the menu-confirmed Enter row, the provisional `Alt+Up`/`Alt+Down` block moves,
-/// and the menu-confirmed `Delete` and `Ctrl+Delete` (Crop) rows.
+/// the menu-confirmed `Delete` and `Ctrl+Delete` (Crop) rows, and the
+/// menu-confirmed `Alt+Delete` (remove dead files) and `Ctrl+Shift+Delete` /
+/// `Ctrl+N` (clear the playlist) rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PlaylistKeyAction {
     /// Up: move the selection up (`40289`, provisional).
@@ -139,6 +141,11 @@ pub enum PlaylistKeyAction {
     Delete,
     /// Ctrl+Delete: crop to the selected item(s) (`1035`, menu-confirmed).
     Crop,
+    /// Alt+Delete: remove all dead files (`40222`, menu-confirmed, RFC 0018).
+    RemoveDead,
+    /// Ctrl+Shift+Delete or Ctrl+N: clear the playlist (`40214`,
+    /// menu-confirmed; S03 §2 binds both chords to the one id).
+    ClearPlaylist,
     /// Alt+Up: move the selected block up (`40215`, provisional).
     MoveBlockUp,
     /// Alt+Down: move the selected block down (`40216`, provisional).
@@ -149,13 +156,21 @@ pub enum PlaylistKeyAction {
 ///
 /// Covers the S03 §2 rows listed on [`PlaylistKeyAction`]: plain Up, Down,
 /// Home, End, PageUp, PageDown and Enter with no modifiers; `Alt+Up` and
-/// `Alt+Down` for moving the selected block; and `Ctrl+Delete` for cropping to
-/// the selection. Plain `Delete`, `Ctrl+A` and `Ctrl+I` return `None` here to
-/// preserve the existing app-side shortcut routing (`App::playlist_key_down`).
-/// Nothing dispatches these actions yet — the app does not consult this map —
-/// so applying them (and the plain `Delete` row) is app-side follow-up work;
-/// the map only names the actions.
+/// `Alt+Down` for moving the selected block; `Alt+Delete` for removing dead
+/// files; and `Ctrl+Delete` for cropping to the selection. `Ctrl+Shift+Delete`
+/// and `Ctrl+N` both clear the playlist, because S03 §2 binds the one command
+/// id `40214` to both chords. Plain `Delete`, `Ctrl+A` and `Ctrl+I` return
+/// `None` here to preserve the existing app-side shortcut routing
+/// (`App::playlist_key_down`).
 pub fn playlist_key_action(key: Key, modifiers: Modifiers) -> Option<PlaylistKeyAction> {
+    // Checked before the single-modifier arms: `Modifiers` is a set, so
+    // Ctrl+Shift is neither `Modifiers::CTRL` nor `Modifiers::SHIFT`.
+    if modifiers == Modifiers::CTRL.union(Modifiers::SHIFT) {
+        return match key {
+            Key::Delete => Some(PlaylistKeyAction::ClearPlaylist),
+            _ => None,
+        };
+    }
     match modifiers {
         Modifiers::NONE => match key {
             Key::Up => Some(PlaylistKeyAction::MoveSelectionUp),
@@ -170,10 +185,12 @@ pub fn playlist_key_action(key: Key, modifiers: Modifiers) -> Option<PlaylistKey
         Modifiers::ALT => match key {
             Key::Up => Some(PlaylistKeyAction::MoveBlockUp),
             Key::Down => Some(PlaylistKeyAction::MoveBlockDown),
+            Key::Delete => Some(PlaylistKeyAction::RemoveDead),
             _ => None,
         },
         Modifiers::CTRL => match key {
             Key::Delete => Some(PlaylistKeyAction::Crop),
+            Key::Letter(b'N') => Some(PlaylistKeyAction::ClearPlaylist),
             _ => None,
         },
         _ => None,
@@ -1088,5 +1105,39 @@ mod tests {
         );
         assert_eq!(playlist_key_action(Key::Delete, Modifiers::NONE), None);
         assert_eq!(playlist_key_action(Key::Left, Modifiers::NONE), None);
+    }
+
+    #[test]
+    fn the_playlist_key_map_covers_remove_dead_and_clear() {
+        use crate::shortcuts::{Key, Modifiers};
+
+        // S03 §2: Alt+Delete is `40222` ("Remove all dead files", RFC 0018).
+        assert_eq!(
+            playlist_key_action(Key::Delete, Modifiers::ALT),
+            Some(PlaylistKeyAction::RemoveDead)
+        );
+        // S03 §2 binds the one id `40214` to both Ctrl+Shift+Delete and Ctrl+N.
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        assert_eq!(
+            playlist_key_action(Key::Delete, ctrl_shift),
+            Some(PlaylistKeyAction::ClearPlaylist)
+        );
+        assert_eq!(
+            playlist_key_action(Key::Letter(b'N'), Modifiers::CTRL),
+            Some(PlaylistKeyAction::ClearPlaylist)
+        );
+        // Neighbouring chords stay unmapped.
+        assert_eq!(playlist_key_action(Key::Delete, Modifiers::SHIFT), None);
+        assert_eq!(
+            playlist_key_action(Key::Delete, Modifiers::CTRL | Modifiers::ALT),
+            None
+        );
+        assert_eq!(playlist_key_action(Key::Letter(b'N'), ctrl_shift), None);
+        // Ctrl+Delete keeps cropping; plain Delete stays app-side.
+        assert_eq!(
+            playlist_key_action(Key::Delete, Modifiers::CTRL),
+            Some(PlaylistKeyAction::Crop)
+        );
+        assert_eq!(playlist_key_action(Key::Delete, Modifiers::NONE), None);
     }
 }

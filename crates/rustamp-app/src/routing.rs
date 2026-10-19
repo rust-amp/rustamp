@@ -90,7 +90,8 @@ pub fn app_owns(command: &Command) -> bool {
         | C::OpenPlaylist
         | C::OpenOptionsMenu
         | C::OpenVisualizationMenu
-        | C::SavePlaylist(_) => true,
+        | C::SavePlaylist(_)
+        | C::RemoveDeadFiles => true,
     }
 }
 
@@ -189,6 +190,7 @@ mod tests {
             Command::Sort(SortKey::Title),
             Command::Randomize,
             Command::Reverse,
+            Command::RemoveDeadFiles,
         ] {
             assert!(app_owns(&command), "{command:?} belongs to the app");
         }
