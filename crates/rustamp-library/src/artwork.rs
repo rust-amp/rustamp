@@ -2,9 +2,26 @@
 //! The artwork cache: the decoded cover of a track, kept in memory.
 //!
 //! A library view asks for the cover of a track every frame it draws, and
-//! the cover is embedded in the track file. Answering the question means
-//! reading the file and decoding the picture - far too much work for every
-//! frame. [`ArtworkCache`] does that work once and keeps the result.
+//! the cover is either embedded in the track file or a picture that sits
+//! next to it. Answering the question means reading the file and decoding
+//! the picture - far too much work for every frame. [`ArtworkCache`] does
+//! that work once and keeps the result.
+//!
+//! # Where the cover comes from
+//!
+//! The **embedded** front cover of the track wins: it belongs to the file
+//! and travels with it. A track whose file carries no picture falls back
+//! to the **sidecar** image in the same directory - the `cover.jpg` of the
+//! album folder, for example. The names that are looked for, and the
+//! order they are tried in, are [`SIDECAR_NAMES`].
+//!
+//! # When the answer is stale
+//!
+//! An answer is valid while the track keeps its `(mtime_ns, size)` and,
+//! unless it is the embedded cover, while the sidecar next to the track
+//! keeps its `(mtime_ns, size)`. A rewritten `cover.jpg` therefore
+//! invalidates the cached cover, and a `cover.jpg` that appears next to a
+//! track that had none invalidates the cached "no cover".
 //!
 //! See the crate documentation for the key, the bound and the decode rule.
 
@@ -40,6 +57,26 @@ pub const DEFAULT_MAX_ENTRIES: usize = 256;
 /// bound and holds a cache that is configured with many entries.
 pub const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// The names of the sidecar images, in the order they are tried.
+///
+/// A track whose file carries no picture falls back to a cover image in
+/// the same directory. These are the names that are looked for, and this
+/// is the order they are tried in: the first name that is a regular file
+/// wins, so `cover.jpg` beats `folder.png`. A file that wins but cannot
+/// be decoded is "no cover": the next name is not tried.
+///
+/// The list is fixed, so a caller knows what the cache looks for. It is
+/// deliberately short and covers the names that are in wide use; a name
+/// outside the list is not looked for.
+pub const SIDECAR_NAMES: &[&str] = &[
+    "cover.jpg",
+    "cover.png",
+    "folder.jpg",
+    "folder.png",
+    "front.jpg",
+    "album.jpg",
+];
+
 /// A decoded cover image.
 ///
 /// The pixels are 8-bit non-premultiplied RGBA, row-major, the first row on
@@ -68,9 +105,11 @@ pub struct ArtworkCacheStats {
 ///
 /// The cache is keyed by the path of the track. Every entry carries the
 /// `(mtime_ns, size)` pair its cover was decoded from, so a file that
-/// changed loses its cover. The cache is bounded: it holds at most a
-/// number of entries and at most a number of bytes, and it drops the least
-/// recently used cover when a new one does not fit.
+/// changed loses its cover. A cover that came from a sidecar image also
+/// carries the `(mtime_ns, size)` pair of that image, so a changed
+/// `cover.jpg` loses the cover as well. The cache is bounded: it holds at
+/// most a number of entries and at most a number of bytes, and it drops
+/// the least recently used cover when a new one does not fit.
 ///
 /// The cache can be shared between threads: it holds its entries behind a
 /// mutex and never blocks on anything but itself.
@@ -107,18 +146,23 @@ impl ArtworkCache {
 
     /// The cover of the track at `path`.
     ///
-    /// * `Ok(Some(cover))` - the file has a cover that could be decoded.
-    /// * `Ok(None)` - the file has no cover, or its cover is not an image
-    ///   this cache can show. The answer is cached, so a track without a
-    ///   cover is not read again.
-    /// * `Err(_)` - the file could not be read at all. Nothing is cached:
+    /// The cover is the **embedded** picture of the track; a track whose
+    /// file carries none falls back to the **sidecar** image in the same
+    /// directory (see [`SIDECAR_NAMES`]).
+    ///
+    /// * `Ok(Some(cover))` - the track has a cover that could be decoded.
+    /// * `Ok(None)` - the track has no cover, or none that this cache can
+    ///   show. The answer is cached, so a track without a cover is not
+    ///   read again.
+    /// * `Err(_)` - the track could not be read at all. Nothing is cached:
     ///   a failure that may be transient must not be remembered as "no
     ///   cover".
     ///
     /// A file that cannot be stat'ed and a file whose read failed are such
-    /// errors. A file whose tags cannot be parsed, and a cover that is not
-    /// a decodable image, are properties of the file: they count as "no
-    /// cover" and are cached like any other "no cover".
+    /// errors. A file whose tags cannot be parsed, a cover that is not a
+    /// decodable image and a sidecar that cannot be read or decoded are
+    /// properties of the files: they count as "no cover" and are cached
+    /// like any other "no cover".
     pub fn get(&self, path: &Path) -> Result<Option<Arc<CoverImage>>> {
         let stat = match fs::metadata(path) {
             Ok(meta) => FileStat::of(&meta),
@@ -126,12 +170,15 @@ impl ArtworkCache {
         };
 
         if let Some(known) = self.lookup(path, stat) {
+            self.lock().hits += 1;
             return Ok(known.answer());
         }
 
-        let known = load_cover(path)?;
-        self.store(path, stat, known.clone());
-        Ok(known.answer())
+        self.lock().reads += 1;
+        let loaded = load_cover(path)?;
+        let answer = loaded.known.answer();
+        self.store(path, stat, loaded);
+        Ok(answer)
     }
 
     /// The number of answers the cache holds.
@@ -148,27 +195,51 @@ impl ArtworkCache {
         }
     }
 
-    /// The cached answer for `path`, if the file still has the stat the
-    /// answer was built from.
+    /// The cached answer for `path`, if it is still valid.
+    ///
+    /// The answer is valid while the track keeps its stat and - unless it
+    /// is the embedded cover of the track - while the sidecar next to the
+    /// track keeps its stat.
     fn lookup(&self, path: &Path, stat: FileStat) -> Option<Known> {
-        let mut inner = self.lock();
-        match inner.lookup(path, stat) {
-            Some(known) => {
-                inner.hits += 1;
-                Some(known)
+        let entry = {
+            let inner = self.lock();
+            let entry = inner.entries.get(path)?;
+            if entry.stat != stat {
+                // The track changed: the answer is stale.
+                return None;
             }
-            None => {
-                // The file is not cached (or it changed): it is read.
-                inner.reads += 1;
-                None
+            entry.clone()
+        };
+
+        if !entry.embedded {
+            // The answer depends on the sidecar next to the track: the
+            // file system has to say whether it is still the same file
+            // with the same content.
+            if find_sidecar(path) != entry.sidecar {
+                return None;
             }
         }
+
+        // The entry is taken again: another thread may have replaced it
+        // while the sidecar was looked up.
+        let mut inner = self.lock();
+        let tick = inner.next_tick();
+        let current = inner.entries.get_mut(path)?;
+        if current.stat != entry.stat
+            || current.sidecar != entry.sidecar
+            || current.embedded != entry.embedded
+        {
+            // The entry changed under us: the answer is built again.
+            return None;
+        }
+        current.tick = tick;
+        Some(current.known.clone())
     }
 
     /// Keep the answer for `path`.
-    fn store(&self, path: &Path, stat: FileStat, known: Known) {
+    fn store(&self, path: &Path, stat: FileStat, loaded: Loaded) {
         let mut inner = self.lock();
-        inner.insert(path.to_path_buf(), stat, known);
+        inner.insert(path.to_path_buf(), stat, loaded);
     }
 
     /// The entries of the cache.
@@ -213,13 +284,48 @@ impl Known {
     }
 }
 
-/// One entry of the cache.
-struct Entry {
-    /// The stat the answer was built from.
+/// The sidecar image next to a track.
+///
+/// The path and the stat of the file: the stat is what makes a changed
+/// sidecar invalidate the cached answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sidecar {
+    /// The path of the sidecar file.
+    path: PathBuf,
+    /// The stat the picture was decoded from.
     stat: FileStat,
+}
+
+/// What the file system said about the cover of a track.
+struct Loaded {
     /// The answer.
     known: Known,
-    /// What the entry costs: the pixels plus the path it is filed under.
+    /// The sidecar the answer depends on: the file next to the track, or
+    /// `None` when the directory holds none.
+    ///
+    /// The field is only meaningful when `embedded` is `false`: an
+    /// embedded cover wins over every sidecar, so the sidecar is not even
+    /// looked for.
+    sidecar: Option<Sidecar>,
+    /// Whether the answer is the embedded cover of the track.
+    embedded: bool,
+}
+
+/// One entry of the cache.
+#[derive(Clone)]
+struct Entry {
+    /// The stat of the track the answer was built from.
+    stat: FileStat,
+    /// The sidecar the answer was built from.
+    sidecar: Option<Sidecar>,
+    /// Whether the answer is the embedded cover of the track.
+    ///
+    /// An embedded cover wins over a sidecar image, so the sidecar cannot
+    /// change the answer and does not have to be looked for again.
+    embedded: bool,
+    /// The answer.
+    known: Known,
+    /// What the entry costs: the pixels plus the paths it is filed under.
     bytes: usize,
     /// When the entry was last used; the smallest tick is the entry that is
     /// dropped first.
@@ -268,22 +374,14 @@ struct Inner {
 }
 
 impl Inner {
-    /// The cached answer for `path`, if the file still has `stat`.
-    fn lookup(&mut self, path: &Path, stat: FileStat) -> Option<Known> {
-        let tick = self.next_tick();
-        let entry = self.entries.get_mut(path)?;
-        if entry.stat != stat {
-            // The file changed: the entry is stale and is replaced by the
-            // answer for the new file.
-            return None;
-        }
-        entry.tick = tick;
-        Some(entry.known.clone())
-    }
-
     /// Keep the answer for `path` and make room for it.
-    fn insert(&mut self, path: PathBuf, stat: FileStat, known: Known) {
-        let bytes = known.bytes() + path.as_os_str().len();
+    fn insert(&mut self, path: PathBuf, stat: FileStat, loaded: Loaded) {
+        let bytes = loaded.known.bytes()
+            + path.as_os_str().len()
+            + loaded
+                .sidecar
+                .as_ref()
+                .map_or(0, |sidecar| sidecar.path.as_os_str().len());
         if let Some(old) = self.entries.remove(&path) {
             self.bytes = self.bytes.saturating_sub(old.bytes);
         }
@@ -312,7 +410,9 @@ impl Inner {
             path,
             Entry {
                 stat,
-                known,
+                sidecar: loaded.sidecar,
+                embedded: loaded.embedded,
+                known: loaded.known,
                 bytes,
                 tick,
             },
@@ -334,22 +434,88 @@ impl Inner {
     }
 }
 
-/// Read the cover of `path` and decode it.
-fn load_cover(path: &Path) -> Result<Known> {
+/// Read the cover of the track at `path`.
+///
+/// The embedded front cover of the track wins; a track whose file carries
+/// no picture falls back to the sidecar image in the same directory.
+fn load_cover(path: &Path) -> Result<Loaded> {
     match rustamp_meta::read_artwork(path) {
-        Ok(Some(artwork)) => Ok(match decode_cover(&artwork.data) {
-            Some(image) => Known::Cover(Arc::new(image)),
-            None => Known::NoCover,
-        }),
-        Ok(None) => Ok(Known::NoCover),
-        Err(Error::Io(err)) => Err(Error::Io(err)),
+        Ok(Some(artwork)) => {
+            if let Some(image) = decode_cover(&artwork.data) {
+                // The embedded cover wins over every sidecar, so the
+                // sidecar is not even looked for.
+                return Ok(Loaded {
+                    known: Known::Cover(Arc::new(image)),
+                    sidecar: None,
+                    embedded: true,
+                });
+            }
+            // The embedded picture is not a picture this cache can show:
+            // the sidecar is the fallback.
+        }
+        Ok(None) => {
+            // The track carries no picture: the sidecar is the fallback.
+        }
+        Err(Error::Io(err)) => return Err(Error::Io(err)),
         Err(_other) => {
-            // The file has no cover this cache can show: its tag container
-            // cannot be parsed. That is a property of the file, so the
-            // answer is cached like any other "no cover".
-            Ok(Known::NoCover)
+            // The tag container cannot be parsed: the track has no
+            // embedded cover this cache can show, so the sidecar is the
+            // fallback.
         }
     }
+    Ok(load_sidecar(path))
+}
+
+/// The sidecar cover of the track at `path`.
+///
+/// A sidecar that cannot be read or cannot be decoded is "no cover": it
+/// must not break the row it belongs to. The sidecar itself is part of
+/// the answer, so a sidecar that is fixed later invalidates it.
+fn load_sidecar(path: &Path) -> Loaded {
+    let sidecar = find_sidecar(path);
+    let known = match &sidecar {
+        Some(sidecar) => match read_picture(&sidecar.path) {
+            Some(image) => Known::Cover(Arc::new(image)),
+            None => Known::NoCover,
+        },
+        None => Known::NoCover,
+    };
+    Loaded {
+        known,
+        sidecar,
+        embedded: false,
+    }
+}
+
+/// The sidecar image next to the track at `path`.
+///
+/// The names of [`SIDECAR_NAMES`] are tried in order in the directory of
+/// the track; the first one that is a regular file wins. `None` when the
+/// directory holds no sidecar at all.
+fn find_sidecar(path: &Path) -> Option<Sidecar> {
+    let dir = path.parent()?;
+    for name in SIDECAR_NAMES {
+        let candidate = dir.join(name);
+        let Ok(meta) = fs::metadata(&candidate) else {
+            continue;
+        };
+        if !meta.is_file() {
+            // A directory or a special file under a cover name is not a
+            // cover: the next name is tried.
+            continue;
+        }
+        return Some(Sidecar {
+            path: candidate,
+            stat: FileStat::of(&meta),
+        });
+    }
+    None
+}
+
+/// Read the picture file at `path` and decode it.
+fn read_picture(path: &Path) -> Option<CoverImage> {
+    let bytes = fs::read(path).ok()?;
+    decode_cover(&bytes)
 }
 
 /// Decode the picture bytes into a cover.
@@ -491,7 +657,12 @@ mod tests {
 
     /// Write a file into `dir`.
     fn write(dir: &TempDir, name: &str, bytes: &[u8]) -> PathBuf {
-        let path = dir.path().join(name);
+        write_in(dir.path(), name, bytes)
+    }
+
+    /// Write a file into the directory `dir`.
+    fn write_in(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
         fs::write(&path, bytes).expect("write the file");
         path
     }
@@ -748,5 +919,259 @@ mod tests {
     fn the_cache_can_be_shared_between_threads() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ArtworkCache>();
+    }
+
+    // ---- sidecar cover art ----
+
+    #[test]
+    fn an_embedded_cover_wins_over_a_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let path = write(
+            &dir,
+            "track.mp3",
+            &mp3_with_cover("image/png", &png(2, 2, RED)),
+        );
+        // The sidecar is right next to the track, but the embedded cover
+        // wins.
+        write(&dir, "cover.jpg", &jpeg(8, 8, BLUE));
+        let cache = ArtworkCache::new();
+
+        let cover = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!((cover.width, cover.height), (2, 2), "the embedded cover");
+        assert_eq!(&cover.pixels[..4], &RED);
+    }
+
+    #[test]
+    fn a_sidecar_cover_is_used_when_the_track_has_none() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        write(&dir, "cover.jpg", &jpeg(8, 8, BLUE));
+        let cache = ArtworkCache::new();
+
+        let cover = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!((cover.width, cover.height), (8, 8));
+        // JPEG is lossy, so the colour is only close to the original.
+        assert!(
+            cover.pixels[2] > 200 && cover.pixels[0] < 60,
+            "the blue channel survives: {:?}",
+            &cover.pixels[..4]
+        );
+    }
+
+    #[test]
+    fn a_sidecar_cover_is_scaled_down_like_an_embedded_one() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        write(&dir, "cover.png", &png(200, 100, RED));
+        let cache = ArtworkCache::new();
+
+        let cover = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!(cover.width, THUMBNAIL_MAX_EDGE);
+        assert_eq!(
+            cover.height,
+            THUMBNAIL_MAX_EDGE / 2,
+            "the aspect ratio is kept"
+        );
+    }
+
+    #[test]
+    fn the_sidecar_names_are_the_documented_list() {
+        assert_eq!(
+            SIDECAR_NAMES,
+            &[
+                "cover.jpg",
+                "cover.png",
+                "folder.jpg",
+                "folder.png",
+                "front.jpg",
+                "album.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_first_sidecar_name_wins() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        // Every name of the list is there, each with its own size: the
+        // first name of the list is the one that is used.
+        for (index, name) in SIDECAR_NAMES.iter().enumerate() {
+            write(&dir, name, &png(2 + index as u32, 2, RED));
+        }
+        let cache = ArtworkCache::new();
+
+        let cover = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!(cover.width, 2, "the first name wins: {SIDECAR_NAMES:?}");
+    }
+
+    #[test]
+    fn a_later_sidecar_name_is_used_when_the_earlier_ones_are_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        // Only the last name of the list is there.
+        let last = SIDECAR_NAMES.last().expect("the list is not empty");
+        write(&dir, last, &png(3, 3, RED));
+        let cache = ArtworkCache::new();
+
+        let cover = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!((cover.width, cover.height), (3, 3), "{last} is used");
+    }
+
+    #[test]
+    fn the_sidecar_is_looked_for_next_to_the_track() {
+        let dir = TempDir::new().unwrap();
+        let album = dir.path().join("album");
+        fs::create_dir(&album).unwrap();
+        // The cover sits one directory above the track: it is not the
+        // cover of that track.
+        write(&dir, "cover.jpg", &jpeg(8, 8, BLUE));
+        let path = write_in(&album, "track.mp3", &mp3_without_cover());
+        let cache = ArtworkCache::new();
+
+        assert!(
+            cache.get(&path).unwrap().is_none(),
+            "the cover of the directory above is not used"
+        );
+    }
+
+    #[test]
+    fn a_changed_sidecar_invalidates_the_cached_cover() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        write(&dir, "cover.jpg", &jpeg(8, 8, BLUE));
+        let cache = ArtworkCache::new();
+
+        let first = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!(cache.stats().reads, 1);
+
+        // The sidecar changes: the cached cover is stale.
+        write(&dir, "cover.jpg", &png(4, 4, RED));
+        let second = cache.get(&path).unwrap().expect("the cover");
+
+        assert_eq!(cache.stats().reads, 2, "the changed sidecar is read again");
+        assert_eq!((second.width, second.height), (4, 4));
+        assert_ne!(first.pixels, second.pixels);
+        assert_eq!(cache.entry_count(), 1, "the stale cover is replaced");
+    }
+
+    #[test]
+    fn a_new_modification_time_of_the_sidecar_invalidates_the_cover() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        let sidecar = write(&dir, "cover.png", &png(4, 4, RED));
+        let size = fs::metadata(&sidecar).unwrap().len();
+        let cache = ArtworkCache::new();
+
+        let first = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!(&first.pixels[..4], &RED);
+
+        // The sidecar keeps its size, but its content and its modification
+        // time change.
+        write(&dir, "cover.png", &png(4, 4, BLUE));
+        set_modified(&sidecar, SystemTime::now() + Duration::from_secs(60));
+        assert_eq!(
+            fs::metadata(&sidecar).unwrap().len(),
+            size,
+            "the sidecar keeps its size"
+        );
+
+        let second = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!(cache.stats().reads, 2, "the changed sidecar is read again");
+        assert_eq!(&second.pixels[..4], &BLUE);
+    }
+
+    #[test]
+    fn a_sidecar_that_appears_later_is_picked_up() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        let cache = ArtworkCache::new();
+
+        assert!(cache.get(&path).unwrap().is_none(), "there is no cover yet");
+        assert_eq!(cache.stats().reads, 1);
+
+        // The cover appears next to the track: the cached "no cover" is
+        // stale.
+        write(&dir, "cover.jpg", &jpeg(8, 8, BLUE));
+        let cover = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!((cover.width, cover.height), (8, 8));
+        assert_eq!(cache.stats().reads, 2, "the track is read again");
+    }
+
+    #[test]
+    fn a_removed_sidecar_invalidates_the_cached_cover() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        write(&dir, "cover.jpg", &jpeg(8, 8, BLUE));
+        let cache = ArtworkCache::new();
+
+        assert!(cache.get(&path).unwrap().is_some(), "the cover");
+
+        fs::remove_file(dir.path().join("cover.jpg")).unwrap();
+        assert!(
+            cache.get(&path).unwrap().is_none(),
+            "the cover is gone, so there is none"
+        );
+        assert_eq!(cache.stats().reads, 2, "the track is read again");
+    }
+
+    #[test]
+    fn a_directory_without_a_cover_keeps_answering_no_cover() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        let cache = ArtworkCache::new();
+
+        assert!(cache.get(&path).unwrap().is_none());
+        assert!(cache.get(&path).unwrap().is_none());
+        assert_eq!(cache.stats().reads, 1, "the track is read once");
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.entry_count(), 1, "the missing cover is cached");
+    }
+
+    #[test]
+    fn an_unchanged_sidecar_is_served_from_the_cache() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        write(&dir, "cover.jpg", &jpeg(8, 8, BLUE));
+        let cache = ArtworkCache::new();
+
+        let first = cache.get(&path).unwrap().expect("the cover");
+        let second = cache.get(&path).unwrap().expect("the cover");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the cached cover is the same image"
+        );
+        assert_eq!(cache.stats().reads, 1, "the track is read once");
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    #[test]
+    fn a_corrupt_sidecar_is_treated_as_no_cover() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        write(&dir, "cover.jpg", b"not an image");
+        let cache = ArtworkCache::new();
+
+        // The broken sidecar is not an error: the row keeps working.
+        assert!(cache.get(&path).unwrap().is_none());
+        assert!(cache.get(&path).unwrap().is_none());
+        assert_eq!(cache.entry_count(), 1, "the answer is cached");
+        assert_eq!(cache.stats().reads, 1, "the track is read once");
+    }
+
+    #[test]
+    fn a_fixed_sidecar_is_picked_up() {
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "track.mp3", &mp3_without_cover());
+        write(&dir, "cover.jpg", b"not an image");
+        let cache = ArtworkCache::new();
+
+        assert!(cache.get(&path).unwrap().is_none(), "the sidecar is broken");
+
+        // The sidecar is repaired: the cached "no cover" is stale.
+        write(&dir, "cover.jpg", &png(4, 4, RED));
+        let cover = cache.get(&path).unwrap().expect("the cover");
+        assert_eq!((cover.width, cover.height), (4, 4));
+        assert_eq!(&cover.pixels[..4], &RED);
+        assert_eq!(cache.stats().reads, 2, "the track is read again");
     }
 }
