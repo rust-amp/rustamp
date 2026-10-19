@@ -103,6 +103,42 @@
 //! `rustamp-core` contract); the application layer calls the setters below
 //! directly, as it does for [`Engine::set_limiter_enabled`].
 //!
+//! # The output fade (own design; S18 does not exist)
+//!
+//! The engine owns a lock-free [`FadeControl`] that drives the output fade
+//! stage ([`rustamp_dsp::Fade`]) in the **render callback**, the consumer side
+//! of the ring:
+//!
+//! ```text
+//! decoder -> preamp -> 10 bands -> [installed DspStage]* -> limiter -> vis tap
+//!         -> FormatConverter -> ring -> volume/balance -> fade -> device
+//! ```
+//!
+//! The fade runs there and not in the decode chain because of the ring: the
+//! decode thread writes about 370 ms ahead of the device, so a fade applied
+//! there would be heard only after that backlog had been played at full level.
+//! On the consumer side the ramp covers exactly the frames the device plays,
+//! so its duration is the requested one.
+//!
+//! **Own choices** (the reference player's behaviour is unmeasured; spec S18
+//! does not exist, so nothing here may be cited as 2.95 behaviour):
+//!
+//! * the ramp law is **equal power** (`g = sqrt(from^2 + (to^2 - from^2) * t)`),
+//!   so the perceived loudness falls evenly;
+//! * the duration comes from [`EngineConfig::fade_ms`], whose default is the
+//!   frozen [`AudioConfig::fadeout_ms`](rustamp_core::config::AudioConfig::fadeout_ms)
+//!   default (500 ms);
+//! * **only** [`Command::StopWithFadeout`] fades. A plain [`Command::Stop`]
+//!   and a [`Command::Pause`] stay immediate, so the existing stop semantics
+//!   are untouched;
+//! * a transport that is not playing, or a duration of `0` ms, stops at once:
+//!   there is nothing to fade;
+//! * a [`Command::Play`] during a running fade-out **cancels** it and ramps
+//!   the gain back up, so the fade is not a one-way door.
+//!
+//! The visualization tap sits before the ring, so it shows the un-faded
+//! signal — the same split the volume/balance gain has.
+//!
 //! # Restarting with a non-empty ring (A8)
 //!
 //! A stopped run leaves its buffered audio in the ring. When a run starts with
@@ -182,12 +218,13 @@ use rustamp_core::audio::{
 };
 use rustamp_core::bus::{CommandReceiver, EventBus};
 use rustamp_core::command::Command;
+use rustamp_core::config::AudioConfig;
 use rustamp_core::error::{Error, ErrorInfo, ErrorKind, Result};
 use rustamp_core::event::Event;
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::{EQ_BANDS, EqState, PlayerState, StreamInfo, TransportState};
 use rustamp_core::vis::VisFrame;
-use rustamp_dsp::{EqControl, Equalizer, Limiter, LimiterControl};
+use rustamp_dsp::{EqControl, Equalizer, FadeControl, Limiter, LimiterControl};
 use rustamp_playlist::PlaybackOrder;
 use rustamp_playlist::rng::DEFAULT_SEED;
 
@@ -213,6 +250,14 @@ pub struct EngineConfig {
     pub balance: i8,
     /// Minimum wall-clock distance between two `PositionChanged` events.
     pub position_interval: Duration,
+    /// Duration of the fade-out that [`Command::StopWithFadeout`] runs, in
+    /// milliseconds.
+    ///
+    /// The default is the frozen configuration's own default
+    /// ([`AudioConfig::fadeout_ms`](rustamp_core::config::AudioConfig::fadeout_ms)),
+    /// so the player setting and the engine agree until the application
+    /// passes its configured value in. A duration of `0` stops at once.
+    pub fade_ms: u32,
 }
 
 impl Default for EngineConfig {
@@ -225,6 +270,7 @@ impl Default for EngineConfig {
             volume: 255,
             balance: 0,
             position_interval: Duration::from_millis(200),
+            fade_ms: AudioConfig::default().fadeout_ms,
         }
     }
 }
@@ -266,6 +312,12 @@ pub struct Engine {
     /// Where [`Engine::limiter_enabled`] / [`Engine::set_limiter_enabled`] reaches
     /// the running [`Limiter`] stage.
     limiter_control: Arc<LimiterControl>,
+    /// Where the output fade stage in the render callback takes its requests
+    /// from (see the module docs).
+    fade_control: Arc<FadeControl>,
+    /// A fade-out that has not finished yet: the counter of the request it
+    /// waits for. The transport stops when the ramp is over.
+    pending_fade_stop: Option<u64>,
     /// Where [`Engine::set_replaygain_mode`] / [`Engine::set_replaygain_preamp_db`]
     /// reaches the decode thread. Snapshotted once per track.
     replaygain_control: Arc<ReplayGainControl>,
@@ -361,11 +413,13 @@ impl Engine {
         let initial_volume = cfg.volume;
         let initial_balance = cfg.balance;
         let gain = Arc::new(GainState::new(initial_volume, initial_balance));
+        let fade_control = Arc::new(FadeControl::new());
         let render = make_render(
             consumer,
             Arc::clone(&sync),
             Arc::clone(&gain),
-            device.channels,
+            device,
+            Arc::clone(&fade_control),
         );
         Ok(Engine {
             cfg,
@@ -382,6 +436,8 @@ impl Engine {
             eq: EqState::default(),
             eq_control: Arc::new(EqControl::default()),
             limiter_control: Arc::new(LimiterControl::default()),
+            fade_control,
+            pending_fade_stop: None,
             replaygain_control: Arc::new(ReplayGainControl::default()),
             producer: Some(producer),
             to_decode: None,
@@ -1028,7 +1084,8 @@ impl Engine {
                     self.play()
                 }
             }
-            Command::Stop | Command::StopWithFadeout => self.stop(),
+            Command::Stop => self.stop(),
+            Command::StopWithFadeout => self.stop_with_fadeout(),
             Command::Next => self.next_track(),
             Command::Prev => self.prev_track(),
             Command::Seek { to_ms } => self.seek_ms(*to_ms),
@@ -1092,6 +1149,11 @@ impl Engine {
         if let Some(message) = &self.flush_failure {
             return Err(Error::Output(message.clone()));
         }
+        if self.pending_fade_stop.take().is_some() {
+            // A fade-out is still running: cancel it and ramp the gain back
+            // up instead of stopping. The transport keeps playing.
+            self.fade_control.fade_in(self.cfg.fade_ms);
+        }
         match self.transport {
             TransportState::Playing => Ok(()),
             TransportState::Paused => {
@@ -1129,6 +1191,9 @@ impl Engine {
     /// open but paused. If flush is refused/fails, closes the output, reports
     /// the error and requires a fresh engine before playback can start again.
     pub fn stop(&mut self) -> Result<()> {
+        // A pending fade-out is over: the transport stops now, whatever the
+        // ramp was doing.
+        self.pending_fade_stop = None;
         self.send(DecodeMsg::Stop);
         self.sync.set_active(false);
         let _ = self.output.pause();
@@ -1158,6 +1223,26 @@ impl Engine {
             self.report_output_error(err);
         }
         flushed
+    }
+
+    /// Stop with a fade-out: the output gain ramps to silence over
+    /// [`EngineConfig::fade_ms`] and the transport stops when the ramp is
+    /// over (see the module docs).
+    ///
+    /// A transport that is not playing has nothing to fade, and a duration of
+    /// `0` ms means "no fade", so both stop at once. A plain
+    /// [`Command::Stop`] and a [`Command::Pause`] stay immediate: the fade is
+    /// an own choice for the explicit fade-out command, and the reference
+    /// player's behaviour is unmeasured (spec S18 does not exist).
+    pub fn stop_with_fadeout(&mut self) -> Result<()> {
+        if self.transport != TransportState::Playing || self.cfg.fade_ms == 0 {
+            return self.stop();
+        }
+        self.fade_control.fade_out(self.cfg.fade_ms);
+        // The counter of the request this stop waits for. The stage reports
+        // it back when the ramp is over; `poll` then stops the transport.
+        self.pending_fade_stop = Some(self.fade_control.requested());
+        Ok(())
     }
 
     /// Play the queue entry at `index`.
@@ -1386,6 +1471,16 @@ impl Engine {
                 return Ok(());
             }
         }
+        // A fade-out that has run its course stops the transport. The stage
+        // reports the finished request from the render callback, so the stop
+        // happens exactly when the ramp reached silence.
+        if let Some(request) = self.pending_fade_stop
+            && self.fade_control.is_finished(request)
+        {
+            self.pending_fade_stop = None;
+            // `stop` reports an output failure itself (see `Engine::stop`).
+            let _ = self.stop();
+        }
         // Finish the run only when the ring is truly empty: every frame the
         // decode thread wrote has been consumed by the render callback. Using
         // the device clock here is wrong — it advances for silence frames
@@ -1540,6 +1635,9 @@ impl Engine {
         let frozen_end = self.end_of_stream;
         self.end_of_stream = None;
         self.start_drain = None;
+        // The run ended by itself: a pending fade-out has nothing left to
+        // fade.
+        self.pending_fade_stop = None;
         if let Some(end) = frozen_end {
             for &(idx, start) in self.track_starts.iter().rev() {
                 if end > start || (end == start && start == 0) {
@@ -1635,6 +1733,7 @@ impl Engine {
         self.timeline_origin = frozen_timeline;
         self.clock_origin = self.output.played_frames();
         self.pending_seek = None;
+        self.pending_fade_stop = None;
         self.start_drain = None;
         self.end_of_stream = None;
         self.sync.set_written(0);
@@ -1724,11 +1823,15 @@ impl Engine {
         // A fresh handshake state alongside the fresh ring: the dead run's
         // epoch and counters describe a ring that no longer exists.
         self.sync = Arc::new(RingSync::new());
+        // The new render callback starts with a fresh fade stage, which takes
+        // the newest request over: the reset puts it at unity.
+        self.fade_control.reset();
         self.render = Some(make_render(
             consumer,
             Arc::clone(&self.sync),
             Arc::clone(&self.gain),
-            self.device.channels,
+            self.device,
+            Arc::clone(&self.fade_control),
         ));
         self.producer = Some(producer);
         self.start_drain = None;
@@ -1873,6 +1976,11 @@ impl Engine {
         self.vis_rx = Some(vis_rx);
 
         if !self.started {
+            // A run always starts at unity: a fade-out that latched the gain
+            // at zero must not silence the next track. The reset is a
+            // request, so it takes effect in the render callback that pulls
+            // the run's first frame.
+            self.fade_control.reset();
             let render = self
                 .render
                 .take()
@@ -1895,6 +2003,9 @@ impl Engine {
             }
             self.started = true;
         } else {
+            // The device is already running and only paused: the reset still
+            // has to be requested, so the run's first frame is not attenuated.
+            self.fade_control.reset();
             self.output.resume()?;
         }
         self.sync.set_active(true);

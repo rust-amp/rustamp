@@ -23,7 +23,7 @@
 //!
 //! ```text
 //! decode thread:  Decoder -> Equalizer (S07) -> [DspStage]* -> Limiter -> FormatConverter -> rtrb::Producer
-//! output thread:  rtrb::Consumer -> volume/balance -> OutputDevice
+//! output thread:  rtrb::Consumer -> volume/balance -> output fade -> OutputDevice
 //! caller thread:  Engine (commands, events, audio clock, vis tap)
 //! ```
 //!

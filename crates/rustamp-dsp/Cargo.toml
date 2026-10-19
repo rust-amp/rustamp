@@ -1,6 +1,6 @@
 [package]
 name = "rustamp-dsp"
-description = "Rustamp: Winamp-style 10-band equalizer and preamp (spec S07), resampler and limiter, as DspStage implementations."
+description = "Rustamp: Winamp-style 10-band equalizer and preamp (spec S07), limiter and output fade, as DspStage implementations."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -12,16 +12,20 @@
 //! costs the look-ahead latency. A stage on its own is disabled, so a caller
 //! that builds one directly still gets a bit-exact bypass — except that a
 //! directly built [`Limiter`] defaults to enabled and must be switched off
-//! explicitly. The resampler is **not** here: it
-//! changes the frame count, which a `DspStage` cannot, so it lives in
+//! explicitly. The output fade is [`fade::Fade`], an equal-power gain ramp
+//! that the engine runs in the render callback; spec S18 does not exist, so
+//! its law and its rules are our own choices. The resampler is **not** here:
+//! it changes the frame count, which a `DspStage` cannot, so it lives in
 //! `rustamp-audio`'s converter.
 
 #![warn(missing_docs)]
 
 pub mod eq;
+pub mod fade;
 pub mod limiter;
 
 pub use eq::{BAND_CENTERS_HZ, BAND_Q, EqControl, Equalizer};
+pub use fade::{Fade, FadeControl};
 pub use limiter::{Limiter, LimiterControl};
 
 /// Signal-domain input policy shared by the stages: a non-finite sample can

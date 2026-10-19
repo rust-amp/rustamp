@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! decode thread: decoder -> DSP -> converter -> Producer<f32>
-//! output thread: Consumer<f32> -> gain -> device
+//! output thread: Consumer<f32> -> gain -> fade -> device
 //! ```
 //!
 //! Both ends are wait-free; the producer polls the ring's free space with a
@@ -98,7 +98,8 @@ use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rtrb::Consumer;
-use rustamp_core::audio::RenderFn;
+use rustamp_core::audio::{AudioSpec, DspStage, RenderFn};
+use rustamp_dsp::{Fade, FadeControl};
 
 use crate::gain;
 
@@ -283,11 +284,16 @@ fn wait_for(cell: &AtomicU64, epoch: u64) -> bool {
     true
 }
 
-/// Build the render callback for a device with `channels` channels.
+/// Build the render callback for a device with the given format.
 ///
 /// The callback pulls from `consumer`, applies volume and balance and writes
 /// silence for whatever the ring could not supply. It allocates nothing, takes
 /// no lock, does no I/O and logs nothing.
+///
+/// The output fade ([`Fade`](rustamp_dsp::Fade)) is the last stage before the
+/// device: it attenuates the frames the device is about to play, so its ramp
+/// covers exactly the output and not the ring's backlog. Its requests come
+/// from `fade`, a control block the engine shares with this stage.
 ///
 /// After every callback the `consumed` counter in `sync` is updated with the
 /// number of device frames **actually read from the ring**. Silence frames
@@ -298,9 +304,14 @@ pub fn make_render(
     mut consumer: Consumer<f32>,
     sync: Arc<RingSync>,
     gain: Arc<GainState>,
-    channels: u16,
+    spec: AudioSpec,
+    fade: Arc<FadeControl>,
 ) -> RenderFn {
-    let channels = channels.max(1);
+    let channels = spec.channels.max(1);
+    let mut fade_stage = Fade::with_control(fade);
+    // The fade never fails; a format it cannot be prepared for is a format
+    // the device granted, and the stage clamps what it needs.
+    let _ = fade_stage.prepare(spec);
     let mut served_epoch = sync.epoch();
     Box::new(move |out: &mut [f32]| {
         let epoch = sync.epoch();
@@ -325,6 +336,9 @@ pub fn make_render(
             sync.set_consumed(written);
             sync.drain_ack.store(epoch, Ordering::Release);
             out.fill(0.0);
+            // The fade counts the frames the device plays, the silent ones of
+            // a drain included: its ramp is a ramp over the output.
+            let _ = fade_stage.process(out);
             return;
         }
         let mut written = 0;
@@ -356,6 +370,10 @@ pub fn make_render(
         sync.set_consumed(consumed);
         let (volume, balance) = gain.get();
         gain::apply(&mut out[..written], channels, volume, balance);
+        // The fade covers the whole callback, the silence of an underrun
+        // included: it is a ramp over the output the device plays, so its
+        // duration is the requested one.
+        let _ = fade_stage.process(out);
     })
 }
 
@@ -363,6 +381,16 @@ pub fn make_render(
 mod tests {
     use super::*;
     use rtrb::{Producer, RingBuffer};
+
+    /// A fade control with no request pending: the stage stays at unity.
+    fn fade() -> Arc<FadeControl> {
+        Arc::new(FadeControl::new())
+    }
+
+    /// The format the test callbacks run in.
+    fn spec(channels: u16) -> AudioSpec {
+        AudioSpec::new(44_100, channels)
+    }
 
     fn render_into(
         render: &mut RenderFn,
@@ -381,7 +409,7 @@ mod tests {
         let (mut producer, consumer) = RingBuffer::<f32>::new(16);
         let sync = Arc::new(RingSync::new());
         let gain = Arc::new(GainState::new(255, 0));
-        let mut render = make_render(consumer, Arc::clone(&sync), gain, 2);
+        let mut render = make_render(consumer, Arc::clone(&sync), gain, spec(2), fade());
         for i in 0..6 {
             producer.push(i as f32).unwrap();
         }
@@ -394,7 +422,7 @@ mod tests {
         let (mut producer, consumer) = RingBuffer::<f32>::new(16);
         let sync = Arc::new(RingSync::new());
         let gain = Arc::new(GainState::new(255, 0));
-        let mut render = make_render(consumer, Arc::clone(&sync), gain.clone(), 2);
+        let mut render = make_render(consumer, Arc::clone(&sync), gain.clone(), spec(2), fade());
         for _ in 0..4 {
             producer.push(1.0).unwrap();
         }
@@ -408,7 +436,7 @@ mod tests {
         let (mut producer, consumer) = RingBuffer::<f32>::new(16);
         let sync = Arc::new(RingSync::new());
         let gain = Arc::new(GainState::new(255, 0));
-        let mut render = make_render(consumer, Arc::clone(&sync), gain, 1);
+        let mut render = make_render(consumer, Arc::clone(&sync), gain, spec(1), fade());
         for i in 0..8 {
             producer.push(i as f32).unwrap();
         }
@@ -436,7 +464,13 @@ mod tests {
         let sync = Arc::new(RingSync::new());
         let gain = Arc::new(GainState::new(255, 0));
         let channels = 2u16;
-        let mut render = make_render(consumer, Arc::clone(&sync), Arc::clone(&gain), channels);
+        let mut render = make_render(
+            consumer,
+            Arc::clone(&sync),
+            Arc::clone(&gain),
+            spec(channels),
+            fade(),
+        );
 
         // Write 4 frames (8 samples for stereo) into the ring.
         for i in 0..8 {
@@ -459,7 +493,7 @@ mod tests {
         let (mut producer, consumer) = RingBuffer::<f32>::new(64);
         let sync = Arc::new(RingSync::new());
         let gain = Arc::new(GainState::new(255, 0));
-        let mut render = make_render(consumer, Arc::clone(&sync), gain, 1);
+        let mut render = make_render(consumer, Arc::clone(&sync), gain, spec(1), fade());
         sync.set_written(written);
         for i in 0..written {
             producer.push(i as f32 + 1.0).unwrap();
@@ -555,7 +589,13 @@ mod tests {
         let (mut producer, consumer) = RingBuffer::<f32>::new(32);
         let sync = Arc::new(RingSync::new());
         let gain = Arc::new(GainState::new(255, 0));
-        let mut render = make_render(consumer, Arc::clone(&sync), Arc::clone(&gain), 1);
+        let mut render = make_render(
+            consumer,
+            Arc::clone(&sync),
+            Arc::clone(&gain),
+            spec(1),
+            fade(),
+        );
 
         // First run writes and consumes 10 frames.
         sync.set_written(10);
