@@ -176,6 +176,9 @@ pub struct App {
     pub(crate) request_save_playlist: bool,
     /// The user's saved equalizer presets (`presets.eqf` beside the config).
     pub(crate) eq_user_presets: Vec<crate::eq_presets::UserPreset>,
+    /// The equalizer's automatic per-track preset rules (`eq-autoload.toml`
+    /// beside the config); see [`crate::eq_autoload`].
+    pub(crate) eq_auto_rules: crate::eq_autoload::AutoLoadRules,
     notes: Vec<String>,
     /// The last error the user should see (BETA-04): a failed open/decode or
     /// a rejected command. Shown in the main window's native title bar
@@ -360,6 +363,7 @@ impl App {
             pending_playlist_misc_menu: false,
             request_save_playlist: false,
             eq_user_presets: Vec::new(),
+            eq_auto_rules: crate::eq_autoload::AutoLoadRules::default(),
             notes: Vec::new(),
             last_error: None,
             host: HostStateLink::detached(),
@@ -591,6 +595,7 @@ impl App {
     pub fn set_config_path(&mut self, path: Option<PathBuf>) {
         self.config_path = path;
         self.load_eq_user_presets();
+        self.load_eq_auto_rules();
     }
 
     /// The path where configuration will be persisted, if set.
@@ -1174,6 +1179,10 @@ impl App {
                 tags.album_gain_db,
                 tags.album_peak,
             );
+            // The equalizer's own per-track preset: the AUTO flag is the gate
+            // (S07 §12 item 13) and the lookup runs at the track start only
+            // (see `crate::eq_autoload`).
+            self.auto_load_eq_preset(metadata);
         }
         if matches!(
             event,
@@ -1654,7 +1663,7 @@ impl App {
 
     /// Synchronizes the equalizer window machine's state from the authoritative
     /// engine equalizer state.
-    fn sync_eq_from_engine(&mut self) {
+    pub(crate) fn sync_eq_from_engine(&mut self) {
         let eq = self.engine.eq();
         self.eq.sync_from_eq_state(&eq);
     }

@@ -13,6 +13,9 @@
 //! * [`routing`] — which layer owns a [`rustamp_core::command::Command`].
 //! * [`app`] - [`app::App`]: engine + headless UI machine + command/event
 //!   routing. Fully headless and unit-tested.
+//! * [`eq_autoload`] — the equalizer's automatic per-track preset selection
+//!   (the AUTO button): the rule table, the decision and the track-start
+//!   wiring (S07 §12 item 13).
 //! * [`dialogs`] - the simple modal dialogs (About, file info, jump-to) on
 //!   top of [`rustamp_ui::DialogManager`]: opening, closing, jump input and
 //!   the body lines. Headless; the OS window lives in [`window`].
@@ -59,6 +62,7 @@ pub mod cli;
 pub mod config;
 pub mod dialogs;
 pub mod directory;
+pub mod eq_autoload;
 pub mod eq_presets;
 #[cfg(any(windows, test))]
 mod external_control;

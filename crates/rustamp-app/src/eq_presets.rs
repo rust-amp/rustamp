@@ -89,6 +89,23 @@ pub fn find_preset(name: &str) -> Option<&'static EqPreset> {
         .find(|preset| preset.name.eq_ignore_ascii_case(name))
 }
 
+/// The curve a preset name resolves to: its ten band gains and the preamp it
+/// carries.
+///
+/// A built-in preset carries no preamp of its own, so loading it leaves the
+/// preamp alone; a saved preset carries the preamp it was saved with, so
+/// loading it restores that preamp too. The built-ins are searched first, so
+/// a built-in wins over a saved preset of the same name.
+pub fn named_curve(name: &str, saved: &[UserPreset]) -> Option<([f32; EQ_BANDS], Option<f32>)> {
+    if let Some(preset) = find_preset(name) {
+        return Some((preset.bands, None));
+    }
+    saved
+        .iter()
+        .find(|preset| preset.name.eq_ignore_ascii_case(name))
+        .map(|preset| (preset.bands, Some(preset.preamp)))
+}
+
 /// The name of the preset whose gains match `state`'s bands, if any.
 ///
 /// This is how the selection is persisted: the saved gains identify the preset.

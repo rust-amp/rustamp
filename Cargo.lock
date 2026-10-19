@@ -1732,6 +1732,7 @@ dependencies = [
  "rustamp-skin",
  "rustamp-ui",
  "rustamp-vis",
+ "serde",
  "softbuffer",
  "tempfile",
  "toml",
