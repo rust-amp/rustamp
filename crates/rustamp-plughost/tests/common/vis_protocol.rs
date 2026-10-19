@@ -81,6 +81,13 @@ pub fn quit_line(module: usize) -> String {
 
 /// The trace prefix of the `config` callback.
 ///
-/// The host must not call it: for a visualization it opens a dialog, and this
-/// run must stay headless.
+/// The host routes it to the running module when the player asks for the
+/// visualization plug-in's configuration (S09 §5.2 offset 0x924). This
+/// fixture's `config` opens **no window**: it only writes this trace line,
+/// so the route can be proven headlessly.
 pub const EVENT_CONFIG: &str = "config ";
+
+/// The trace line the fixture writes when a module's `config` runs.
+pub fn config_line(module: usize) -> String {
+    format!("{EVENT_CONFIG}module={module}")
+}

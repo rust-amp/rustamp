@@ -35,11 +35,18 @@
 //!    windows (S09 §1 line 46).
 //!    Reverse order across several plugins is [`crate::registry::PluginRegistry`]'s
 //!    job; a single [`LoadedPlugin`] only quits itself.
-//! 10. **Configuration**: [`LoadedPlugin::config`] calls a general plugin's
-//!     `config()` on the UI thread (S09 §7.1 offset 0x0C). Callback slots are
-//!     reported through [`LoadedPlugin::general_info`] / [`LoadedPlugin::dsp_info`]
-//!     and never enforced by this loader: S09 §7 requires no general plugin to
-//!     provide one, and a null slot is refused, never transmuted.
+//! 10. **Configuration**: [`LoadedPlugin::config`] calls the `config` callback
+//!     of a loaded plugin of **any** kind on the UI thread (S09 §1 "Config /
+//!     About"). Every kind has such a slot, and the host calls it with the
+//!     arguments that kind's slot takes: the input and output kinds take the
+//!     parent window handle (S09 §3.1 offset 0x1C, §4.1 offset 0x14), the
+//!     general kind takes no argument and reads the parent window from its own
+//!     struct (S09 §7.1 offset 0x0C, offset 0x14), and the DSP and
+//!     visualization kinds take their module pointer (S09 §6.2 offset 0x0C,
+//!     §5.2 offset 0x924). A null slot is refused, never transmuted, and a
+//!     plugin that is not live is refused: S09 requires no plugin to provide
+//!     a `config` callback, so its absence is a fact about that plugin and
+//!     never a verdict on its validity.
 //! 11. **Output plugins**: the host fills `main_window` and `dll_instance` in
 //!     the `Out_Module` and calls `init` (S09 §4.1 lines 233–237, §4.2 line 252).
 //!     The host calls **no other** output callback: `open`, `write`,
@@ -511,15 +518,19 @@ impl std::error::Error for PluginLoadError {
 /// through a null slot (S09 §0, P3 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginConfigError {
-    /// The plugin supplied no `config` callback. S09 §7 does not require one,
-    /// so this is a fact about this plugin, not a verdict on its validity.
+    /// The plugin supplied no `config` callback. S09 requires no plugin to
+    /// provide one, so this is a fact about this plugin, not a verdict on its
+    /// validity.
     MissingCallback,
-    /// `quit` already ran (or `init` never did): the plugin is not live.
+    /// The plugin is not live: `quit` already ran, `init` never did, or — for
+    /// the DSP and visualization kinds — its module is not the running one any
+    /// more.
     NotInitialized,
-    /// This kind's configuration is not routed through the host here. A
-    /// general-purpose plugin's `config` (S09 §7.1 offset 0x0C) and a DSP
-    /// module's `config` (S09 §6.2 offset 0x0C) are routed; input, output
-    /// and visualization are their own cards.
+    /// This loaded plugin has no kind bridge in this host, so the host does
+    /// not know which `config` signature to call. Every kind the loader
+    /// produces is bridged; the variant stays so that a plugin of a kind this
+    /// host cannot drive is a reported error and never a call through a
+    /// signature the host would have to guess.
     WrongKind(PluginKind),
 }
 
@@ -765,25 +776,74 @@ impl LoadedPlugin {
     }
 
     /// Open a plugin's configuration dialog: call its `config` callback
-    /// (S09 §1 "Config / About", §7.1 offset 0x0C, §6.2 offset 0x0C).
+    /// (S09 §1 "Config / About").
     ///
-    /// The argument depends on the kind: a general-purpose plugin's `config`
-    /// takes no arguments (S09 §7.1 offset 0x0C), a DSP module's takes the
-    /// module pointer (S09 §6.2 offset 0x0C).
+    /// Every kind has a `config` slot, and the host calls it with the
+    /// arguments that kind's slot takes:
+    ///
+    /// * an **input** or **output** plugin takes the parent window handle
+    ///   (S09 §3.1 offset 0x1C, §4.1 offset 0x14) — the host window the
+    ///   plugin was handed before `init`;
+    /// * a **general** plugin takes no argument and reads the parent window
+    ///   from its own struct (S09 §7.1 offset 0x0C and offset 0x14);
+    /// * a **DSP** or **visualization** plugin takes its module pointer
+    ///   (S09 §6.2 offset 0x0C, §5.2 offset 0x924). Only the module that
+    ///   still owns the one active slot is configured: a module another
+    ///   plugin replaced is not live, and its parent window is not valid.
     ///
     /// Must be called on the UI thread that owns the host window, which is the
     /// parent the plugin was handed before `init`. The call is synchronous: a
     /// modal dialog returns only when the plugin closes it, so the caller must
     /// expect this to block and must keep pumping afterwards (see
     /// [`crate::message_loop::pump_bounded`]). A null slot, a plugin that is
-    /// not live, and any other kind are all refused without calling anything;
-    /// S09 U-15 (the modal/parent context of a general Config in 2.95) stays
-    /// open, so no parent or modality is forced here beyond the handed parent.
+    /// not live, and a plugin this host has no kind bridge for are all refused
+    /// without calling anything; S09 U-15 (the modal/parent context of a
+    /// general Config in 2.95) stays open, so no parent or modality is forced
+    /// here beyond the handed parent.
     pub fn config(&self) -> Result<(), PluginConfigError> {
         // `config` is plugin code like every other call: a fault in it must
         // name this plugin.
         let _scope = plugin_call_scope(&self.identity, "config");
         match self.inner {
+            // S09 §3.1 offset 0x1C: `config(parent window handle)`.
+            #[cfg(windows)]
+            LoadedPluginInner::Input { module } => {
+                if !self.initialized {
+                    return Err(PluginConfigError::NotInitialized);
+                }
+                if module.is_null() {
+                    return Err(PluginConfigError::MissingCallback);
+                }
+                // SAFETY: live module in the retained mapping's static data.
+                let Some(config_fn) = (unsafe { (*module).config }) else {
+                    return Err(PluginConfigError::MissingCallback);
+                };
+                // SAFETY: cdecl, one argument (S09 §3.1 offset 0x1C), non-null
+                // slot, on the UI thread owning the parent window.
+                unsafe { config_fn(self.host_hwnd as *mut core::ffi::c_void) };
+                Ok(())
+            }
+            // S09 §4.1 offset 0x14: `config(parent window handle)`.
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Output { module, .. } => {
+                if !self.initialized {
+                    return Err(PluginConfigError::NotInitialized);
+                }
+                if module.is_null() {
+                    return Err(PluginConfigError::MissingCallback);
+                }
+                // SAFETY: live module in the retained mapping's static data.
+                let Some(config_fn) = (unsafe { (*module).config }) else {
+                    return Err(PluginConfigError::MissingCallback);
+                };
+                // SAFETY: cdecl, one argument (S09 §4.1 offset 0x14), non-null
+                // slot, on the UI thread owning the parent window.
+                unsafe { config_fn(self.host_hwnd as *mut core::ffi::c_void) };
+                Ok(())
+            }
+            // S09 §7.1 offset 0x0C: `config()`, no arguments. The plugin reads
+            // the parent window from its own struct (offset 0x14), which the
+            // host filled before `init`.
             #[cfg(any(windows, test))]
             LoadedPluginInner::General { module, .. } => {
                 if !self.initialized {
@@ -802,6 +862,7 @@ impl LoadedPlugin {
                 unsafe { config_fn() };
                 Ok(())
             }
+            // S09 §6.2 offset 0x0C: `config(module)`.
             #[cfg(any(windows, test))]
             LoadedPluginInner::Dsp { active, .. } => {
                 if !self.initialized {
@@ -821,6 +882,33 @@ impl LoadedPlugin {
                     return Err(PluginConfigError::MissingCallback);
                 };
                 // SAFETY: cdecl, one argument (S09 §6.2 offset 0x0C), non-null
+                // slot, on the UI thread owning the parent window.
+                unsafe { config_fn(module) };
+                Ok(())
+            }
+            // S09 §5.2 offset 0x924: `config(module)`. The module's parent
+            // window is filled when the module starts (S09 §5.3 step 2), so
+            // only the running module is configured (S09 §5.3 step 7).
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Vis { active, .. } => {
+                if !self.initialized {
+                    return Err(PluginConfigError::NotInitialized);
+                }
+                let Some(module) = active else {
+                    return Err(PluginConfigError::NotInitialized);
+                };
+                if module.is_null() || crate::vis::active_vis_module() != module {
+                    // Another visualization is running; this one is not, so its
+                    // module is not live and its dialog must not be opened
+                    // (S09 §5.3 step 1).
+                    return Err(PluginConfigError::NotInitialized);
+                }
+                // SAFETY: live module in the retained mapping's static data.
+                let config_slot = unsafe { (*module).config };
+                let Some(config_fn) = config_slot else {
+                    return Err(PluginConfigError::MissingCallback);
+                };
+                // SAFETY: cdecl, one argument (S09 §5.2 offset 0x924), non-null
                 // slot, on the UI thread owning the parent window.
                 unsafe { config_fn(module) };
                 Ok(())
@@ -1211,21 +1299,51 @@ impl LoadedPlugin {
     }
 
     /// Wrap an already-initialized synthetic output module as a loaded plugin,
-    /// for host-side tests of the output lifecycle (`init`, `quit` order).
+    /// for host-side tests of the output lifecycle (`init`, `config`, `quit`
+    /// order).
+    ///
+    /// `host_hwnd` is the parent window the host handed the plugin; the
+    /// output's `config` receives it as its argument (S09 §4.1 offset 0x14).
     ///
     /// No DLL is mapped and no export is resolved, so a test built on this
     /// proves host logic only — never DLL acceptance (P3 §7 false passes).
     #[cfg(test)]
-    pub(crate) fn output_for_test(name: &str, module: *mut OutModule, init_called: bool) -> Self {
+    pub(crate) fn output_for_test(
+        name: &str,
+        module: *mut OutModule,
+        init_called: bool,
+        host_hwnd: usize,
+    ) -> Self {
         Self {
             identity: PluginIdentity::new(Path::new(name), PluginKind::Output),
             hinstance: core::ptr::null_mut(),
-            host_hwnd: 0,
+            host_hwnd,
             description: name.to_string(),
             inner: LoadedPluginInner::Output {
                 module,
                 init_called,
             },
+            initialized: true,
+        }
+    }
+
+    /// Wrap an already-initialized synthetic input module as a loaded plugin,
+    /// for host-side tests of the input lifecycle (`config`).
+    ///
+    /// `host_hwnd` is the parent window the host handed the plugin; the
+    /// input's `config` receives it as its argument (S09 §3.1 offset 0x1C).
+    ///
+    /// No DLL is mapped and no export is resolved, so a test built on this
+    /// proves host logic only — never DLL acceptance (P3 §7 false passes).
+    #[cfg(test)]
+    #[cfg(windows)]
+    pub(crate) fn input_for_test(name: &str, module: *mut InModule, host_hwnd: usize) -> Self {
+        Self {
+            identity: PluginIdentity::new(Path::new(name), PluginKind::Input),
+            hinstance: core::ptr::null_mut(),
+            host_hwnd,
+            description: name.to_string(),
+            inner: LoadedPluginInner::Input { module },
             initialized: true,
         }
     }
@@ -1287,8 +1405,9 @@ impl LoadedPlugin {
         }
     }
 
-    /// A loaded plugin of a kind this host has no bridge for, for tests that
-    /// check what the kind-specific entry points refuse.
+    /// A loaded plugin the host has no kind bridge for, for tests that check
+    /// what the kind-specific entry points refuse. The loader never produces
+    /// one: every kind it maps is bridged.
     #[cfg(test)]
     pub(crate) fn unsupported_for_test(kind: PluginKind) -> Self {
         Self {
@@ -2362,15 +2481,16 @@ mod tests {
         assert_eq!(plugin.config(), Err(PluginConfigError::NotInitialized));
         assert_eq!(gen_log(), vec!["quit"], "only quit may have run");
 
-        // Any other kind is refused without a call. A DSP plugin has its own
-        // `config` route (S09 §6.2, offset 0x0C) and is covered by the DSP
-        // bridge's own tests; a plugin of that kind that this host has no
-        // bridge for is refused like every other one.
-        for kind in [PluginKind::Input, PluginKind::Visualization] {
-            let other = LoadedPlugin::unsupported_for_test(kind);
-            assert_eq!(other.config(), Err(PluginConfigError::WrongKind(kind)));
-            assert_eq!(other.general_info(), None);
-        }
+        // A plugin the host has no kind bridge for is refused without a call:
+        // the host does not know which `config` signature to use, and it never
+        // guesses one. The loader maps no such plugin; the variant exists so
+        // that such a request is a reported error.
+        let other = LoadedPlugin::unsupported_for_test(PluginKind::General);
+        assert_eq!(
+            other.config(),
+            Err(PluginConfigError::WrongKind(PluginKind::General))
+        );
+        assert_eq!(other.general_info(), None);
     }
 
     #[test]
@@ -2445,6 +2565,12 @@ mod tests {
 
     unsafe extern "C" fn out_quit() {
         out_note("quit");
+    }
+
+    /// The output's `config` receives the parent window the host handed the
+    /// plugin (S09 §4.1 offset 0x14).
+    unsafe extern "C" fn out_config(parent: *mut core::ffi::c_void) {
+        out_note(format!("config parent={:#x}", parent as usize));
     }
 
     /// The plugin's own `open`: the host must never call it (S09 §4.2 step 3
@@ -2527,7 +2653,8 @@ mod tests {
             vec!["init parent=0xbeef instance=0xcafe id=65536"]
         );
 
-        let plugin = LoadedPlugin::output_for_test("out_synthetic", &mut module, init.init_called);
+        let plugin =
+            LoadedPlugin::output_for_test("out_synthetic", &mut module, init.init_called, 0);
         assert_eq!(
             plugin.output_info().expect("output plugins report info"),
             OutModuleInfo {
@@ -2580,7 +2707,7 @@ mod tests {
         assert!(!init.init_called, "a null init must not be reported as run");
         assert!(out_log().is_empty());
 
-        let plugin = LoadedPlugin::output_for_test("out_bare", &mut bare, init.init_called);
+        let plugin = LoadedPlugin::output_for_test("out_bare", &mut bare, init.init_called, 0);
         assert_eq!(
             plugin.output_info().unwrap(),
             OutModuleInfo {
@@ -2599,7 +2726,7 @@ mod tests {
     fn output_quit_runs_once_and_is_idempotent() {
         out_log_clear();
         let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
-        let mut plugin = LoadedPlugin::output_for_test("out_quit", &mut module, true);
+        let mut plugin = LoadedPlugin::output_for_test("out_quit", &mut module, true, 0);
         assert!(plugin.is_initialized());
         plugin.quit();
         assert!(!plugin.is_initialized());
@@ -2615,19 +2742,108 @@ mod tests {
     }
 
     #[test]
-    fn output_config_is_not_routed_by_this_host() {
+    fn output_config_runs_once_with_the_parent_window() {
         out_log_clear();
         let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
-        let plugin = LoadedPlugin::output_for_test("out_config", &mut module, true);
-        // The output's `config` takes the parent window and opens a dialog;
-        // it is another card, so nothing is called here.
+        module.config = Some(out_config);
+        // The host window the plugin was handed is what its `config` gets
+        // (S09 §4.1 offset 0x14).
+        let plugin = LoadedPlugin::output_for_test("out_config", &mut module, true, 0xBEEF);
+        assert_eq!(plugin.config(), Ok(()));
         assert_eq!(
-            plugin.config(),
-            Err(PluginConfigError::WrongKind(PluginKind::Output))
+            out_log(),
+            vec!["config parent=0xbeef"],
+            "the config callback must run exactly once, with the parent window"
         );
+
+        // A module without a `config` slot is refused, never called.
+        out_log_clear();
+        let mut bare = out_module(Some(out_init_reading_fields), Some(out_quit));
+        let plugin = LoadedPlugin::output_for_test("out_bare", &mut bare, true, 0xBEEF);
+        assert_eq!(plugin.config(), Err(PluginConfigError::MissingCallback));
         assert!(
             out_log().is_empty(),
-            "no output callback may run for a refused config"
+            "a null config slot must never be called"
+        );
+
+        // A plugin that was quit is not live and must not be configured.
+        out_log_clear();
+        let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
+        module.config = Some(out_config);
+        let mut plugin = LoadedPlugin::output_for_test("out_quit", &mut module, true, 0xBEEF);
+        plugin.quit();
+        assert_eq!(plugin.config(), Err(PluginConfigError::NotInitialized));
+        assert_eq!(out_log(), vec!["quit"], "only quit may have run");
+    }
+
+    // -----------------------------------------------------------------------
+    // Input plugin configuration (S09 §3.1 offset 0x1C)
+    //
+    // The input kind exists only on Windows (the loader maps 32-bit DLLs
+    // there), so its route is exercised on Windows only. The module is a
+    // synthetic in-process struct: no DLL is mapped and no export is
+    // resolved, so this proves host logic only (P3 §7).
+    // -----------------------------------------------------------------------
+
+    #[cfg(windows)]
+    thread_local! {
+        /// What the synthetic input callbacks recorded, in call order.
+        static IN_LOG: std::cell::RefCell<Vec<String>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    #[cfg(windows)]
+    fn in_log() -> Vec<String> {
+        IN_LOG.with(|log| log.borrow().clone())
+    }
+
+    #[cfg(windows)]
+    fn in_log_clear() {
+        IN_LOG.with(|log| log.borrow_mut().clear());
+    }
+
+    /// The input's `config` receives the parent window the host handed the
+    /// plugin (S09 §3.1 offset 0x1C).
+    #[cfg(windows)]
+    unsafe extern "C" fn in_config(parent: *mut core::ffi::c_void) {
+        IN_LOG.with(|log| {
+            log.borrow_mut()
+                .push(format!("config parent={:#x}", parent as usize))
+        });
+    }
+
+    #[cfg(windows)]
+    fn in_module(config: Option<unsafe extern "C" fn(*mut core::ffi::c_void)>) -> InModule {
+        InModule {
+            version: IN_VERSION,
+            description: c"synthetic input".as_ptr(),
+            config,
+            ..InModule::default()
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_config_runs_once_with_the_parent_window() {
+        in_log_clear();
+        let mut module = in_module(Some(in_config));
+        let plugin = LoadedPlugin::input_for_test("in_config", &mut module, 0xBEEF);
+        assert_eq!(plugin.config(), Ok(()));
+        assert_eq!(
+            in_log(),
+            vec!["config parent=0xbeef"],
+            "the config callback must run exactly once, with the parent window"
+        );
+
+        // A module without a `config` slot is refused, never called.
+        in_log_clear();
+        let mut bare = in_module(None);
+        let plugin = LoadedPlugin::input_for_test("in_bare", &mut bare, 0xBEEF);
+        assert_eq!(plugin.config(), Err(PluginConfigError::MissingCallback));
+        assert!(
+            in_log().is_empty(),
+            "a null config slot must never be called"
         );
     }
 }

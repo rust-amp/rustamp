@@ -52,9 +52,16 @@ pub const EVENT_WRITE: &str = "write ";
 
 /// Trace prefix of the `config` callback.
 ///
-/// The output's `config` takes the parent window and opens a dialog; it is
-/// another card, so the host must not call it here.
+/// The output's `config` takes the parent window and opens a dialog
+/// (S09 §4.1 offset 0x14). The host routes it when the player asks for the
+/// plug-in's configuration; this fixture's `config` opens **no window**: it
+/// only writes this trace line, so the route can be proven headlessly.
 pub const EVENT_CONFIG: &str = "config ";
+
+/// The trace line the fixture writes when `config` runs.
+pub fn config_line(parent: usize) -> String {
+    format!("{EVENT_CONFIG}parent={parent:#x}")
+}
 
 /// Trace prefix of the `about` callback. Never called by the host.
 pub const EVENT_ABOUT: &str = "about ";

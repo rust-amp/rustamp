@@ -468,16 +468,20 @@ pub(crate) fn vis_set_format(sample_rate: c_int, channels: c_int) {
     }
 }
 
+/// Serializes the tests that touch the process-wide running-visualization
+/// slot, exactly as the DSP bridge's slot lock does.
+///
+/// The slot is process-global, so every test that starts, stops or inspects
+/// the running visualization takes this lock — including the ones in other
+/// modules that drive a visualization through [`crate::loader::LoadedPlugin`].
+#[cfg(test)]
+pub(crate) static VIS_SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::loader::{LoadedPlugin, PluginLoadError};
     use std::cell::{Cell, RefCell};
-    use std::sync::Mutex;
-
-    /// Serializes the tests that touch the process-wide running-visualization
-    /// slot, exactly as the DSP bridge's slot lock does.
-    static VIS_SLOT_LOCK: Mutex<()> = Mutex::new(());
 
     thread_local! {
         /// The modules the synthetic getter hands out, in index order.
@@ -593,6 +597,12 @@ mod tests {
     /// `quit` records the teardown.
     unsafe extern "C" fn test_quit(_module: *mut VisModule) {
         vis_note("quit");
+    }
+
+    /// `config` records the call. A visualization config opens a dialog, so
+    /// the host calls it on the UI thread (S09 §5.3 step 7).
+    unsafe extern "C" fn test_config(_module: *mut VisModule) {
+        vis_note("config");
     }
 
     /// A header whose getter hands out `modules`.
@@ -896,6 +906,77 @@ mod tests {
         let before = vis_log().len();
         plugin.quit();
         assert_eq!(vis_log().len(), before);
+    }
+
+    #[test]
+    fn the_config_callback_is_routed_to_the_running_module() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        module.config = Some(test_config);
+        let mut header = test_header(vec![&mut module]);
+        // SAFETY: live stack header and module; no DLL is involved.
+        let modules = unsafe { list_vis_modules(&mut header) }.expect("a valid header must list");
+        let mut plugin = LoadedPlugin::vis_for_test("vis_synthetic", &mut header, modules, 0x99);
+
+        // Nothing runs before the user picks a module, so there is no live
+        // module to configure (S09 §5.3 step 2).
+        assert_eq!(
+            plugin.config(),
+            Err(crate::loader::PluginConfigError::NotInitialized)
+        );
+        assert!(
+            vis_log().is_empty(),
+            "nothing may be called before the start"
+        );
+
+        plugin.vis_start(0).expect("the module must start");
+        assert_eq!(plugin.config(), Ok(()));
+        assert_eq!(
+            vis_log(),
+            vec![
+                "init parent=0x99 instance=0x0 rate=44100 channels=2",
+                "config"
+            ],
+            "the config callback must run exactly once, on the running module"
+        );
+
+        // A module without a `config` slot is refused, never called.
+        vis_log_clear();
+        let mut bare = test_module(c"bare");
+        let mut header = test_header(vec![&mut bare]);
+        // SAFETY: live stack header and module; no DLL is involved.
+        let modules = unsafe { list_vis_modules(&mut header) }.expect("a valid header must list");
+        let mut plugin = LoadedPlugin::vis_for_test("vis_bare", &mut header, modules, 0x99);
+        plugin.vis_start(0).expect("the module must start");
+        assert_eq!(
+            plugin.config(),
+            Err(crate::loader::PluginConfigError::MissingCallback)
+        );
+        assert!(
+            !vis_log().iter().any(|entry| entry == "config"),
+            "a null config slot must never be called"
+        );
+
+        // A module that is not running any more is not live: its dialog must
+        // not be opened (S09 §5.3 step 1).
+        vis_log_clear();
+        let mut ended = test_module(c"ended");
+        ended.config = Some(test_config);
+        let mut header = test_header(vec![&mut ended]);
+        // SAFETY: live stack header and module; no DLL is involved.
+        let modules = unsafe { list_vis_modules(&mut header) }.expect("a valid header must list");
+        let mut plugin = LoadedPlugin::vis_for_test("vis_ended", &mut header, modules, 0x99);
+        plugin.vis_start(0).expect("the module must start");
+        plugin.quit();
+        assert_eq!(
+            plugin.config(),
+            Err(crate::loader::PluginConfigError::NotInitialized)
+        );
+        assert!(
+            !vis_log().iter().any(|entry| entry == "config"),
+            "a quit module must not be configured"
+        );
     }
 
     #[test]

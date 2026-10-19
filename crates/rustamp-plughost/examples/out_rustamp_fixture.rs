@@ -152,10 +152,11 @@ unsafe extern "C" fn fixture_quit() {
 
 /// `config` (S09 §4.1 offset 0x14): opens the plugin's configuration dialog.
 ///
-/// The host does not call it in this milestone (the output's configuration is
-/// its own card), so the trace line below must never appear.
+/// The host routes it with the parent window when the player asks for the
+/// plug-in's configuration; nothing calls it on its own, so the trace line
+/// below appears only after such a request.
 unsafe extern "C" fn fixture_config(parent: *mut c_void) {
-    trace(&format!("{EVENT_CONFIG}parent={:#x}", parent as usize));
+    trace(&config_line(parent as usize));
 }
 
 /// `about` (S09 §4.1 offset 0x18): opens the plugin's about box.

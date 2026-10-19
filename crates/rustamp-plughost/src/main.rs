@@ -33,8 +33,10 @@
 //!    pipe, or on a channel error.
 //! 3. The UI thread runs [`run_ui_loop`]: drain every queued snapshot through
 //!    the state bridge, handle a queued load request against the approval
-//!    store, pump one window message without blocking, sleep one millisecond.
-//!    It stops when the reader is done (or on `WM_QUIT`).
+//!    store, open the visualization plug-in's configuration dialog when the
+//!    player asks for it (RFC 0005 §5.4), pump one window message without
+//!    blocking, sleep one millisecond. It stops when the reader is done (or on
+//!    `WM_QUIT`).
 //! 4. The process exits: `0` on `Shutdown` or a closed channel, `1` when the
 //!    window cannot be created or the channel errored.
 //!
@@ -344,6 +346,20 @@ fn run_ui_loop(
                     let _ = outbox_tx.try_send(reply);
                     budget -= 1;
                 }
+                Ok(ControlInbound::ConfigureVis) => {
+                    // The player's Configure request for the visualization
+                    // plug-in (RFC 0005 §5.4). The plug-in opens the dialog,
+                    // so this runs here, on the thread that owns the window
+                    // the plug-in was handed as its parent. A refusal is
+                    // reported: stdout is the frame stream, so the diagnostic
+                    // goes to stderr (which the supervisor inherits).
+                    if let Err(error) = registry.configure_vis() {
+                        eprintln!(
+                            "rustamp-plughost32: cannot configure the visualization plug-in: {error}"
+                        );
+                    }
+                    budget -= 1;
+                }
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
@@ -367,9 +383,10 @@ fn run_ui_loop(
     }
 
     // Final drain: coalesce any remaining snapshots that arrived with shutdown.
-    // A load request that arrived with the shutdown is deliberately dropped
-    // unanswered: the process is on its way out, and mapping a DLL now would
-    // run plugin code the host is about to stop pumping messages for.
+    // A load or a Configure request that arrived with the shutdown is
+    // deliberately dropped unanswered: the process is on its way out, and
+    // mapping a DLL or opening a plugin's dialog now would run plugin code the
+    // host is about to stop pumping messages for.
     let mut latest_state: Option<PlayerState> = None;
     for event in inbound_rx.try_iter() {
         if let ControlInbound::State(state) = event {

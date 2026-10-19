@@ -10,6 +10,17 @@
 //! answer through the framed channel rather than printing (a stray line on
 //! stdout would corrupt the frame stream — see `src/main.rs`).
 //!
+//! # Configuration
+//!
+//! [`PluginRegistry::configure_plugin`] opens the configuration dialog of a
+//! loaded plug-in on the UI thread, and [`PluginRegistry::configure_vis`] does
+//! the same for the running visualization plug-in — the request the player
+//! sends as `Message::CommandToHost(Command::ConfigureVisPlugin)`
+//! (RFC 0005 §5.4). Every refusal (an unknown id, a kind that does not match
+//! the loaded plug-in, a plug-in with no `config` slot, a plug-in that is not
+//! live) is returned to the caller: nothing is ever called through a null slot
+//! or a signature the host would have to guess (S09 §0, P3 §3).
+//!
 //! # What this module does not decide
 //!
 //! * **Approval.** The registry never approves anything. It holds the
@@ -72,6 +83,18 @@ pub struct PluginRegistry {
 pub enum RegistryConfigError {
     /// No plugin carries this id.
     UnknownPlugin(u32),
+    /// The request named a kind the loaded plugin does not have. The plugin
+    /// was not touched: the host compares the kind the request carries with
+    /// the kind it recorded when the plugin was loaded, the same check the
+    /// load path makes twice.
+    WrongKind {
+        /// The kind the request asked for.
+        expected: PluginKind,
+        /// The kind the loaded plugin actually has.
+        actual: PluginKind,
+    },
+    /// No visualization plug-in is running, so there is none to configure.
+    NoRunningVis,
     /// The plugin refused the call; nothing was invoked.
     Plugin(PluginConfigError),
 }
@@ -80,6 +103,13 @@ impl std::fmt::Display for RegistryConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownPlugin(id) => write!(f, "no plugin with id {id} is loaded"),
+            Self::WrongKind { expected, actual } => write!(
+                f,
+                "the request asked for a {expected:?} plugin, but the loaded one is a {actual:?} plugin"
+            ),
+            Self::NoRunningVis => {
+                f.write_str("no visualization plug-in is running; nothing was configured")
+            }
             Self::Plugin(e) => write!(f, "{e}"),
         }
     }
@@ -236,15 +266,51 @@ impl PluginRegistry {
         reply
     }
 
-    /// Open the configuration dialog of the plugin with this id, on this thread
-    /// (P3 §4 step 9). Synchronous: a modal dialog returns only when the plugin
-    /// closes it.
-    pub fn config(&self, plugin_id: u32) -> Result<(), RegistryConfigError> {
+    /// Open the configuration dialog of the loaded plugin with this id, on this
+    /// thread (P3 §4 step 9). Synchronous: a modal dialog returns only when
+    /// the plugin closes it.
+    ///
+    /// `kind` is the kind the request carries. The host compares it with the
+    /// kind it recorded when the plugin was loaded and refuses a mismatch
+    /// before anything is called: a request that names the wrong kind is a
+    /// reported error, never a call through a signature the host would have
+    /// to guess. The plugin's own `config` slot then runs on the UI thread
+    /// that owns the host window, with the parent window the plugin was
+    /// handed (S09 §3.1 offset 0x1C, §4.1 offset 0x14, §5.2 offset 0x924,
+    /// §6.2 offset 0x0C, §7.1 offset 0x0C).
+    pub fn configure_plugin(
+        &self,
+        plugin_id: u32,
+        kind: PluginKind,
+    ) -> Result<(), RegistryConfigError> {
         let entry = self
             .loaded
             .iter()
             .find(|entry| entry.id == plugin_id)
             .ok_or(RegistryConfigError::UnknownPlugin(plugin_id))?;
+        let actual = entry.plugin.kind();
+        if actual != kind {
+            return Err(RegistryConfigError::WrongKind {
+                expected: kind,
+                actual,
+            });
+        }
+        entry.plugin.config().map_err(RegistryConfigError::Plugin)
+    }
+
+    /// Open the configuration dialog of the running visualization plug-in, on
+    /// this thread.
+    ///
+    /// The player's request names no plug-in: `Command::ConfigureVisPlugin`
+    /// (RFC 0005 §5.4) means "the current vis plug-in", which is the one
+    /// whose module is running. With no visualization running there is none
+    /// to configure, and the request is refused.
+    pub fn configure_vis(&self) -> Result<(), RegistryConfigError> {
+        let entry = self
+            .loaded
+            .iter()
+            .find(|entry| entry.plugin.vis_run_info().is_some())
+            .ok_or(RegistryConfigError::NoRunningVis)?;
         entry.plugin.config().map_err(RegistryConfigError::Plugin)
     }
 
@@ -295,6 +361,7 @@ mod tests {
     use super::*;
     use crate::pe_preflight::test_dll;
     use rustamp_plugin_abi::general::GeneralPlugin;
+    use rustamp_plugin_abi::vis::{VisHeader, VisModule};
 
     struct Fixture(std::path::PathBuf);
 
@@ -372,6 +439,48 @@ mod tests {
             quit,
             ..GeneralPlugin::default()
         }))
+    }
+
+    // ---- a synthetic visualization library, for the vis configure route ----
+
+    thread_local! {
+        /// The module the synthetic vis getter hands out.
+        static VIS_MODULE: std::cell::Cell<*mut VisModule> = const {
+            std::cell::Cell::new(core::ptr::null_mut())
+        };
+    }
+
+    unsafe extern "C" fn vis_get_module(index: core::ffi::c_int) -> *mut VisModule {
+        if index != 0 {
+            return core::ptr::null_mut();
+        }
+        VIS_MODULE.with(|slot| slot.get())
+    }
+
+    unsafe extern "C" fn vis_config(_module: *mut VisModule) {
+        CONFIG_LOG.with(|log| log.borrow_mut().push("vis"));
+    }
+
+    /// A synthetic visualization library with one module that has a `config`
+    /// slot (S09 §5.2 offset 0x924). The module and the header are leaked on
+    /// purpose: the registry holds raw pointers into them, exactly as it does
+    /// into a mapped DLL's static data.
+    fn vis_library() -> (*mut VisHeader, Vec<crate::vis::VisModuleEntry>) {
+        let module: &'static mut VisModule = Box::leak(Box::new(VisModule {
+            description: c"synthetic vis".as_ptr(),
+            config: Some(vis_config),
+            ..VisModule::default()
+        }));
+        VIS_MODULE.with(|slot| slot.set(module as *mut VisModule));
+        let header: &'static mut VisHeader = Box::leak(Box::new(VisHeader {
+            version: rustamp_plugin_abi::common::VIS_VERSION,
+            description: c"synthetic vis library".as_ptr(),
+            get_module: Some(vis_get_module),
+        }));
+        // SAFETY: live leaked header and module; no DLL is involved.
+        let modules = unsafe { crate::vis::list_vis_modules(header) }
+            .expect("a valid header must list its modules");
+        (header as *mut VisHeader, modules)
     }
 
     #[test]
@@ -625,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reaches_exactly_the_named_plugin_and_an_unknown_id_touches_nothing() {
+    fn configure_reaches_exactly_the_named_plugin_and_refuses_an_unknown_id_or_a_wrong_kind() {
         CONFIG_LOG.with(|log| log.borrow_mut().clear());
         let mut registry = PluginRegistry::new(ApprovalStore::new());
         let with_config = registry.insert_for_test(LoadedPlugin::general_for_test(
@@ -641,17 +750,29 @@ mod tests {
             0,
         ));
 
-        assert_eq!(registry.config(with_config), Ok(()));
+        assert_eq!(
+            registry.configure_plugin(with_config, PluginKind::General),
+            Ok(())
+        );
         assert_eq!(CONFIG_LOG.with(|log| log.borrow().clone()), vec!["a"]);
 
         assert_eq!(
-            registry.config(without),
+            registry.configure_plugin(without, PluginKind::General),
             Err(RegistryConfigError::Plugin(
                 PluginConfigError::MissingCallback
             ))
         );
+        // The request named a kind the loaded plugin does not have: nothing
+        // may be called, and the refusal names both kinds.
         assert_eq!(
-            registry.config(9_999),
+            registry.configure_plugin(with_config, PluginKind::Dsp),
+            Err(RegistryConfigError::WrongKind {
+                expected: PluginKind::Dsp,
+                actual: PluginKind::General,
+            })
+        );
+        assert_eq!(
+            registry.configure_plugin(9_999, PluginKind::General),
             Err(RegistryConfigError::UnknownPlugin(9_999))
         );
         assert_eq!(
@@ -666,6 +787,44 @@ mod tests {
             .expect("a general plugin reports its slots");
         assert!(!info.has_config && !info.has_quit);
         assert!(registry.general_info(9_999).is_none());
+    }
+
+    #[test]
+    fn the_vis_configure_request_reaches_the_running_visualization() {
+        // The running-visualization slot is process-global, so this test takes
+        // the same lock the visualization bridge's own tests take.
+        let _guard = crate::vis::VIS_SLOT_LOCK.lock().unwrap();
+        CONFIG_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+
+        // No visualization runs: there is none to configure.
+        assert_eq!(
+            registry.configure_vis(),
+            Err(RegistryConfigError::NoRunningVis)
+        );
+        assert!(CONFIG_LOG.with(|log| log.borrow().is_empty()));
+
+        let (header, modules) = vis_library();
+        let mut plugin = LoadedPlugin::vis_for_test("vis_synthetic", header, modules, 0x99);
+        plugin.vis_start(0).expect("the module must start");
+        let id = registry.insert_for_test(plugin);
+
+        assert_eq!(registry.configure_vis(), Ok(()));
+        assert_eq!(
+            CONFIG_LOG.with(|log| log.borrow().clone()),
+            vec!["vis"],
+            "the config callback must run exactly once"
+        );
+
+        // The id-addressed route reaches the same plugin.
+        assert_eq!(
+            registry.configure_plugin(id, PluginKind::Visualization),
+            Ok(())
+        );
+        assert_eq!(
+            CONFIG_LOG.with(|log| log.borrow().clone()),
+            vec!["vis", "vis"]
+        );
     }
 
     #[test]
