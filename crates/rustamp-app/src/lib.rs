@@ -9,7 +9,7 @@
 //! * [`config`] — config file loading with defaults (RFC 0001 defines the
 //!   types, not the I/O).
 //! * [`skin`] — skin selection with a clear fallback to the repo's built-in
-//!   default (look-alike) skin.
+//!   default (Rust-themed) skin.
 //! * [`routing`] — which layer owns a [`rustamp_core::command::Command`].
 //! * [`app`] - [`app::App`]: engine + headless UI machine + command/event
 //!   routing. Fully headless and unit-tested.
@@ -85,13 +85,9 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // ----- configuration -----
     let config_path = config::default_path();
-    let loaded = match config::load(config_path.as_deref()) {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            eprintln!("rustamp: {error}");
-            return Err(Box::new(error));
-        }
-    };
+    // The error is returned, not printed here: the caller (`main`) prints it
+    // once, so a config failure is not reported twice.
+    let loaded = config::load(config_path.as_deref())?;
     for warning in &loaded.warnings {
         eprintln!("rustamp: {warning}");
     }

@@ -2,9 +2,10 @@
 //! Skin selection and loading (task card N1).
 //!
 //! The app resolves the skin in this order: `--skin <path>`, then the config's
-//! `ui.skin`, then the built-in default skin. The built-in skin is the
-//! repo-owned look-alike default skin (`rustamp_skin::BuiltinDefaultSkin`,
-//! task card J1).
+//! `ui.skin`, then the built-in default skin. The built-in default is the
+//! repo-owned Rust-themed skin (`rustamp_skin::BuiltinDefaultSkin`); the
+//! classic look-alike is a separate choice (`builtin:lookalike`, i.e.
+//! [`rustamp_skin::BuiltinLookalikeSkin`], task card J1).
 //!
 //! A path that cannot be loaded is **not** fatal: the app falls back to the
 //! built-in skin and carries the reason as a warning, so a bad `--skin` never
