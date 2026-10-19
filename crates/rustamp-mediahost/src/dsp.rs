@@ -12,6 +12,13 @@
 //! that closed back-ring is drained, then sticks there. A dead host is never
 //! silent EOS: the supervisor fails sticky and every wait turns loud.
 //!
+//! Without a marker, the **frame counts** are the end-of-transfer evidence
+//! (RFC 0006 §6): the host processes strictly in order, so block *n* out is
+//! block *n* back, and every frame written into the chain has to come back.
+//! A drained back-ring that returned fewer frames than were written is a
+//! truncated transfer, and the session reports it as a loud sticky failure —
+//! never as an end of stream, which would hide the loss (RFC 0006 §4).
+//!
 //! `DspReset` is fenced (RFC 0015): the host answers `DspResetAck` once the
 //! chain state is cleared — at every poll site, including idle after a
 //! drained EOS — and `DspSession::reset` waits for that acknowledgement, so
@@ -495,6 +502,9 @@ impl<F: PcmRings> DspSession<F> {
     /// [`MediaHostError::TimedOut`] while `available` is nonzero waited on
     /// processed frames the ring already held, which is a skipped wake and
     /// not a slow host.
+    ///
+    /// Its `read` is the returned half of the end-of-transfer evidence: the
+    /// frames the host actually handed back (RFC 0006 §6).
     pub fn back_ring_counters(&self) -> RingCounters {
         RingCounters {
             published: self.from_host.frames_published(),
@@ -507,6 +517,10 @@ impl<F: PcmRings> DspSession<F> {
     /// for the write direction: a [`DspSession::write_timeout`] that returned
     /// [`MediaHostError::TimedOut`] while `available` is **below** the ring
     /// capacity waited for space the ring already had.
+    ///
+    /// Its `published` is the written half of the end-of-transfer evidence:
+    /// the frames handed to the chain, which the host has to return
+    /// (RFC 0006 §6).
     pub fn in_ring_counters(&self) -> RingCounters {
         let published = self.to_host.frames_written();
         RingCounters {
@@ -581,7 +595,8 @@ impl<F: PcmRings> DspSession<F> {
 
     /// Pull processed frames. `None` waits until data, a drained close, or a
     /// loud control failure; an explicit timeout returns `TimedOut`, never
-    /// false EOS. EOS requires a drained closed back-ring and then sticks.
+    /// false EOS. EOS requires a drained closed back-ring **and** every frame
+    /// written into the chain returned (RFC 0006 §6), and then sticks.
     pub fn read(&mut self, out: &mut [f32], timeout: Option<Duration>) -> Result<usize> {
         self.peer.check()?;
         if out.is_empty() || !out.len().is_multiple_of(usize::from(self.spec.channels)) {
@@ -614,6 +629,21 @@ impl<F: PcmRings> DspSession<F> {
                     self.peer.fail("DSP back-ring closed before input finished");
                     self.peer.check()?;
                 }
+                // The end-of-transfer evidence (RFC 0006 §6): the host
+                // processes strictly in order, so block n out is block n
+                // back. Every frame written into the chain has to come
+                // back; a drained back-ring that returned fewer frames is a
+                // truncated transfer, and an end of stream would hide the
+                // loss (RFC 0006 §4). The counters are per generation, so a
+                // reconfigure starts the comparison over.
+                let written = self.to_host.frames_written();
+                let returned = self.from_host.frames_read();
+                if returned != written {
+                    self.peer.fail(&format!(
+                        "DSP transfer truncated: {written} frames written, {returned} returned"
+                    ));
+                    self.peer.check()?;
+                }
                 self.eos = true;
                 Ok(0)
             }
@@ -627,6 +657,11 @@ impl<F: PcmRings> DspSession<F> {
     /// Signal end-of-writes after the final block. Reading continues until the
     /// back-ring drains to a sticky EOS; the host stays alive for Shutdown or
     /// a reconfigure.
+    ///
+    /// After this call the transfer is complete only if every frame written
+    /// into the chain comes back (RFC 0006 §6); a back-ring that closes
+    /// earlier is a truncated transfer and fails the session loudly, never an
+    /// end of stream.
     pub fn finish_writes(&mut self) -> Result<()> {
         self.peer.check()?;
         self.to_host.close();

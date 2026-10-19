@@ -13,6 +13,12 @@
 //! exactly that — the chain's own report is already observable when `reset`
 //! returns, and the wait is still blocked while the host's callback is held
 //! — plus the bounded, loud timeout when no acknowledgement ever comes.
+//!
+//! The end-of-transfer evidence (RFC 0006 §4/§6): the DSP path has no
+//! end-of-stream marker, so the frame counts decide whether a closed
+//! back-ring is a finished transfer or a truncated one. The scripted-host
+//! pair at the end of this file drives both sides of that rule with a
+//! healthy control channel, so nothing but the counts can tell them apart.
 
 #![cfg(windows)]
 
@@ -26,7 +32,7 @@ use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use rustamp_ipc::shm::{RingDirection, RingKind};
+use rustamp_ipc::shm::{RingDirection, RingError, RingKind};
 use rustamp_ipc::{Message, StreamTransport, Transport};
 use rustamp_mediahost::control::{ControlPeer, Liveness};
 use rustamp_mediahost::dsp::{DspResident, DspSession, ResidentChain, serve_dsp};
@@ -664,4 +670,187 @@ fn back_ring_close_before_input_finished_is_sticky_failure_not_eos() {
     result
         .recv_timeout(STALL_WAIT)
         .expect("stall: the scripted host did not finish");
+}
+
+/// Frames the scripted host takes from the in-ring before the transfer ends.
+const SCRIPT_FRAMES: usize = 4;
+/// Capacity of the scripted back-ring. It has to hold every frame the host
+/// publishes without a reader, because the player reads only after the
+/// transfer ended.
+const SCRIPT_BACK_RING: u32 = 8;
+
+/// A scripted host that completes the real two-ring handshake, takes
+/// [`SCRIPT_FRAMES`] frames from the in-ring and publishes only the first
+/// `returned` of them to the back-ring, which it then closes.
+///
+/// The control channel stays healthy on purpose: no `DspError`, no EOF and
+/// no missing Pong may accidentally satisfy a failure assertion, so the
+/// **frame counts** are the only evidence the player has for what the host
+/// did with the frames it was given (RFC 0006 §6). Returns the channel that
+/// announces the closed back-ring and the one that releases the host at the
+/// end of the test.
+fn scripted_host(host: ControlPeer, returned: usize) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (closed, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    thread::spawn(move || {
+        // The handshake, in the production order: configure, the player's
+        // in-ring offer, the in-ring Ready, the back-ring offer, the back-ring
+        // Ready, DspReady.
+        assert!(matches!(
+            host.recv(STALL_WAIT).unwrap(),
+            Message::DspConfigure { .. }
+        ));
+        let offer = host.recv(STALL_WAIT).unwrap();
+        let mut input = NamedPcmRings
+            .open_directed(&offer, SPEC, RingDirection::MainToHost)
+            .unwrap();
+        host.send(Message::RingReady {
+            kind: RingKind::Pcm,
+            generation: input.consumer.generation(),
+        })
+        .unwrap();
+        let mut back = NamedPcmRings.create(SPEC, SCRIPT_BACK_RING).unwrap();
+        let back_generation = back.producer.generation();
+        host.send(back.message).unwrap();
+        assert!(matches!(
+            host.recv(STALL_WAIT).unwrap(),
+            Message::RingReady { generation, kind: RingKind::Pcm }
+                if generation == back_generation
+        ));
+        host.send(Message::DspReady { latency_frames: 0 }).unwrap();
+
+        // The transfer: take every frame the player wrote, publish only
+        // `returned` of them.
+        let mut buf = [0.0f32; 2];
+        let mut taken = 0usize;
+        let mut published = 0usize;
+        while taken < SCRIPT_FRAMES {
+            let count = input
+                .consumer
+                .read_into_blocking(&mut buf, Some(STALL_WAIT))
+                .expect("stall: the scripted host never read the player's frames");
+            assert!(count > 0, "stall: the scripted host read no frame");
+            taken += count;
+            if published < returned {
+                back.producer
+                    .write_from_blocking(&buf[..count * 2], Some(STALL_WAIT))
+                    .expect("stall: the scripted host could not publish its frame");
+                published += count;
+            }
+        }
+        // The player closes the in-ring when it finished its writes; the
+        // back-ring closes with the transfer.
+        assert!(matches!(
+            input
+                .consumer
+                .read_into_blocking(&mut buf, Some(STALL_WAIT)),
+            Err(RingError::Closed)
+        ));
+        back.producer.close();
+        closed.send(()).unwrap();
+        held.recv_timeout(STALL_WAIT)
+            .expect("stall: the test never released the scripted host");
+        drop(host);
+    });
+    (observed, release)
+}
+
+/// Write [`SCRIPT_FRAMES`] frames into the chain and end the write side.
+fn write_script_frames(session: &mut DspSession<NamedPcmRings>) {
+    for frame in 0..SCRIPT_FRAMES {
+        let value = frame as f32 / 8.0;
+        write_pcm(
+            session,
+            &[value, -value],
+            "the frames before the transfer ends",
+        );
+    }
+    session.finish_writes().unwrap();
+}
+
+/// Read the drained transfer: the frames that came back, then the terminal
+/// outcome. `None` is the end of the stream, `Some` the failure that ended
+/// it.
+fn drain_transfer(session: &mut DspSession<NamedPcmRings>) -> (usize, Option<MediaHostError>) {
+    let mut out = [0.0f32; 16];
+    let mut received = 0usize;
+    loop {
+        match read_pcm(session, &mut out, "the drained transfer") {
+            Ok(0) => return (received, None),
+            Ok(frames) => received += frames,
+            Err(error) => return (received, Some(error)),
+        }
+    }
+}
+
+/// A host that returns fewer frames than it was given must not look like a
+/// finished transfer: RFC 0006 §6 says block *n* out is block *n* back, and
+/// RFC 0006 §4 forbids a lost frame crossing the boundary unnoticed.
+#[test]
+fn a_truncated_transfer_after_finished_writes_is_a_loud_failure_not_eos() {
+    let ((ar, aw), (br, bw)) = streams::streams();
+    let player = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, false).unwrap();
+    let (observed, release) = scripted_host(host, SCRIPT_FRAMES - 1);
+    let mut session = DspSession::open(player, NamedPcmRings, SPEC, &[], 1).unwrap();
+    write_script_frames(&mut session);
+    observed
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the scripted host never closed the back-ring");
+
+    let (received, failure) = drain_transfer(&mut session);
+    assert_eq!(
+        received,
+        SCRIPT_FRAMES - 1,
+        "the frames the host did return must arrive"
+    );
+    let error = failure.expect("a truncated transfer must not turn into EOS");
+    assert!(matches!(error, MediaHostError::Disconnected(_)), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("truncated"), "{message}");
+    assert!(
+        message.contains(&format!("{SCRIPT_FRAMES} frames written")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("{} returned", SCRIPT_FRAMES - 1)),
+        "{message}"
+    );
+    // The failure is sticky: a later write fails loud too, never an EOS.
+    let again = session.write(&[0.25, -0.5]).unwrap_err();
+    assert!(matches!(again, MediaHostError::Disconnected(_)), "{again}");
+    release.send(()).unwrap();
+    drop(session);
+}
+
+/// The same scripted host that returns every frame it was given: the
+/// transfer is complete, so the drained back-ring is the end of the stream
+/// (RFC 0006 §6).
+#[test]
+fn a_complete_transfer_after_finished_writes_is_the_end_of_stream() {
+    let ((ar, aw), (br, bw)) = streams::streams();
+    let player = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, false).unwrap();
+    let (observed, release) = scripted_host(host, SCRIPT_FRAMES);
+    let mut session = DspSession::open(player, NamedPcmRings, SPEC, &[], 1).unwrap();
+    write_script_frames(&mut session);
+    observed
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the scripted host never closed the back-ring");
+
+    let (received, failure) = drain_transfer(&mut session);
+    assert_eq!(received, SCRIPT_FRAMES, "every frame must come back");
+    assert!(
+        failure.is_none(),
+        "a complete transfer must not fail: {:?}",
+        failure
+    );
+    // The end of the stream sticks.
+    let mut out = [0.0f32; 2];
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the sticky EOS read").unwrap(),
+        0
+    );
+    release.send(()).unwrap();
+    drop(session);
 }
