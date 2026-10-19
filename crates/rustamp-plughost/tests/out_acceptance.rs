@@ -12,10 +12,12 @@
 //!    ran, and the plugin saw the `Winamp v1.x` class (S09 §1, §4.1
 //!    lines 233–237);
 //! 3. the host left the module `id` alone (S09 §4.1 line 231, U-4);
-//! 4. the host called **no** playback callback: `open`, `write`, `config` and
-//!    `about` are driven by the input plugin or belong to another card
+//! 4. the host called **no** playback callback on its own: `open` and `write`
+//!    are driven by the input plugin's decode thread, `about` has no route
 //!    (S09 §4.2 step 3);
-//! 5. `quit` reaches the plugin and the DLL stays mapped (S09 §4.2 step 4,
+//! 5. the player's Configure request reaches the module's `config` exactly
+//!    once, with the parent window (S09 §4.1 offset 0x14);
+//! 6. `quit` reaches the plugin and the DLL stays mapped (S09 §4.2 step 4,
 //!    §1 line 46).
 //!
 //! The plugin's own trace file — written from inside the DLL — is checked for
@@ -149,6 +151,11 @@ fn mapped_path(hinstance: *mut core::ffi::c_void) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written as usize]))
 }
 
+/// How often a line appears in the fixture's trace.
+fn occurrences(trace: &str, needle: &str) -> usize {
+    trace.lines().filter(|line| *line == needle).count()
+}
+
 #[test]
 #[ignore = "VM-only: maps a real 32-bit output plugin DLL into the host; run in test VM"]
 fn a_real_output_plugin_is_loaded_gets_its_host_fields_and_quits_cleanly() {
@@ -256,11 +263,26 @@ fn a_real_output_plugin_is_loaded_gets_its_host_fields_and_quits_cleanly() {
     for forbidden in [EVENT_OPEN, EVENT_WRITE, EVENT_CONFIG, EVENT_ABOUT] {
         assert!(
             !trace.contains(forbidden),
-            "the host must not call '{forbidden}':\n{trace}"
+            "the host must not call '{forbidden}' before a configuration request:\n{trace}"
         );
     }
 
-    // 8. Quit (S09 §4.2 step 4): the plugin is told, the DLL stays mapped.
+    // 8. The player's Configure request reaches the module's `config` with the
+    //    parent window (S09 §4.1 offset 0x14). This fixture's `config` opens
+    //    no window, so the route is proven from the plugin's own trace.
+    loaded
+        .config()
+        .expect("the output module's config must be routed");
+    let trace =
+        std::fs::read_to_string(trace_path()).expect("the fixture must have written its own trace");
+    assert_eq!(
+        occurrences(&trace, &config_line(host_hwnd)),
+        1,
+        "the config callback must reach the plugin exactly once, with the parent \
+         window:\n{trace}"
+    );
+
+    // 9. Quit (S09 §4.2 step 4): the plugin is told, the DLL stays mapped.
     loaded.quit();
     assert!(!loaded.is_initialized());
     let trace =

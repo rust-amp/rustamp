@@ -201,10 +201,11 @@ unsafe extern "C" fn fixture_quit(module: *mut VisModule) {
 /// `config` (S09 §5.2, offset 0x924): opens the plugin's configuration
 /// dialog.
 ///
-/// The host does not call it in this milestone (a dialog would open a
-/// window), so the trace line below must never appear.
+/// The host routes it to the running module when the player asks for the
+/// visualization plug-in's configuration; nothing calls it on its own, so the
+/// trace line below appears only after such a request.
 unsafe extern "C" fn fixture_config(module: *mut VisModule) {
-    trace(&format!("{EVENT_CONFIG}module={}", module_index(module)));
+    trace(&config_line(module_index(module)));
 }
 
 /// The fixture's own trace file.

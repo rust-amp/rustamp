@@ -64,22 +64,40 @@
 //! format changes. [`handle_message`], the reader-thread variant that owns the
 //! transport and has no window, therefore still ignores it.
 //!
+//! # Configure requests
+//!
+//! One Configure request exists on the wire today:
+//! [`Message::CommandToHost`] carrying [`Command::ConfigureVisPlugin`]
+//! (RFC 0005 §5.4). It asks the host to open the running visualization
+//! plug-in's configuration dialog, and it is routed to the UI thread as
+//! [`ControlInbound::ConfigureVis`] — only that thread may call into a
+//! plugin, and the dialog is opened with the parent window the plug-in was
+//! handed.
+//!
+//! The other plug-in kinds have **no** Configure request: naming a plug-in
+//! needs a payload the protocol does not carry, and a new `Command` variant is
+//! a wire change that needs an RFC (P3 §4 step 9). None is invented here; the
+//! host-side method that would serve it is
+//! [`crate::registry::PluginRegistry::configure_plugin`].
+//!
 //! # Messages this module deliberately ignores
 //!
 //! Any other variant returns [`ControlStep::Continue`] and touches neither the
 //! surface nor the channel: `WinampIpc` has no reply variant in the protocol,
 //! so answering one over the channel would invent protocol; classic plugins
-//! keep querying the host window in-process instead. `CommandToHost`, the ring
-//! offers and the RFC 0006 decoder/DSP messages (including the RFC 0015
-//! `DspResetAck` reply, which only a DSP session's player side expects) belong
-//! to other hosts or to future cards; acting on them here would be guessing.
-//! There is also no message for "configure plugin N" or "quit plugin N": a
-//! Configure request from the app (P3 §4 step 9) needs an RFC and the contract
-//! lane, and none is invented here. See [`crate::state_bridge`] for the same
-//! honesty on the surface.
+//! keep querying the host window in-process instead. `CommandToHost` carries
+//! the player's own commands, and only the Configure request above is one the
+//! host can act on; the ring offers and the RFC 0006 decoder/DSP messages
+//! (including the RFC 0015 `DspResetAck` reply, which only a DSP session's
+//! player side expects) belong to other hosts or to future cards; acting on
+//! them here would be guessing. There is also no message for "quit plugin N":
+//! a request for that needs an RFC and the contract lane, and none is
+//! invented here. See [`crate::state_bridge`] for the same honesty on the
+//! surface.
 
 use rustamp_ipc::{Message, Transport};
 use rustamp_plugin_abi::PluginKind;
+use rustamp_proto::command::Command;
 use rustamp_proto::state::PlayerState;
 
 /// What one handled message decided.
@@ -130,6 +148,12 @@ pub enum ControlInbound {
         /// The kind the app expects; a mismatch is refused before any mapping.
         kind: PluginKind,
     },
+    /// The parent asked the host to open the running visualization plug-in's
+    /// configuration dialog (RFC 0005 §5.4:
+    /// [`Command::ConfigureVisPlugin`]). Carried to the UI thread because only
+    /// that thread may call into a plugin, and the dialog is opened with the
+    /// parent window the plug-in was handed.
+    ConfigureVis,
 }
 
 /// Route one inbound message to an event sink.
@@ -139,6 +163,9 @@ pub enum ControlInbound {
 ///   driven by UI responsiveness rather than answering from the reader thread).
 /// * `LoadPlugin` is forwarded as `ControlInbound::Load`, for the same reason:
 ///   only the UI thread may call into a plugin.
+/// * `CommandToHost(Command::ConfigureVisPlugin)` is forwarded as
+///   `ControlInbound::ConfigureVis`, for the same reason: the Configure dialog
+///   is opened by the plugin, on the thread that owns the parent window.
 /// * `Hello` validates protocol compatibility. If incompatible, triggers shutdown.
 /// * `Shutdown` triggers shutdown.
 /// * Other variants are ignored.
@@ -159,6 +186,10 @@ pub fn handle_message_inbound(
             on_event(ControlInbound::Load { path, kind });
             ControlStep::Continue
         }
+        Message::CommandToHost(Command::ConfigureVisPlugin) => {
+            on_event(ControlInbound::ConfigureVis);
+            ControlStep::Continue
+        }
         Message::Hello { .. } => ControlStep::Continue,
         Message::Shutdown => ControlStep::Shutdown,
         _ => ControlStep::Continue,
@@ -170,6 +201,8 @@ pub fn handle_message_inbound(
 /// * `PlayerStateUpdate` is forwarded to `on_state` as an owned value.
 /// * `Ping` is answered with `Pong` carrying the same token.
 /// * `Shutdown` returns [`ControlStep::Shutdown`].
+/// * A load or a Configure request is ignored here: both call into a plugin,
+///   and only the thread that owns the host window may do that.
 pub fn handle_message(
     message: Message,
     transport: &mut dyn Transport,
@@ -246,6 +279,7 @@ mod tests {
     use crate::ipc::{IpcAnswer, IpcSurface};
     use crate::state_bridge::apply_player_state;
     use rustamp_ipc::{MemoryTransport, PROTOCOL_VERSION};
+    use rustamp_proto::command::Command;
     use rustamp_proto::state::{EqState, StreamInfo, TransportState};
 
     fn playing_state() -> PlayerState {
@@ -379,6 +413,37 @@ mod tests {
             ControlStep::Continue
         );
         assert_eq!(states, 0);
+        assert!(app_end.try_recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_configure_request_reaches_the_ui_thread_and_other_host_commands_do_not() {
+        let (mut app_end, mut host_end) = MemoryTransport::pair();
+        // The player's Configure request for the visualization plug-in
+        // (RFC 0005 §5.4). It travels in the message the protocol already has.
+        app_end
+            .send(&Message::CommandToHost(Command::ConfigureVisPlugin))
+            .unwrap();
+        // Another player→host command the host cannot act on: it must not
+        // reach the UI thread as an event.
+        app_end
+            .send(&Message::CommandToHost(Command::ToggleVisPlugin))
+            .unwrap();
+        app_end.send(&Message::Shutdown).unwrap();
+
+        let mut events = Vec::new();
+        assert_eq!(
+            run_reader_events(&mut host_end, &mut |ev| events.push(ev)),
+            ControlExit::ShutdownRequested
+        );
+        assert_eq!(
+            events,
+            vec![ControlInbound::ConfigureVis],
+            "the Configure request must reach the thread that owns the window"
+        );
+        // Only the startup Hello went out: the reader thread has no window and
+        // opens no dialog.
+        assert!(matches!(app_end.recv().unwrap(), Message::Hello { .. }));
         assert!(app_end.try_recv().unwrap().is_none());
     }
 

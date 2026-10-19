@@ -18,10 +18,12 @@
 //! 4. a frame is drawn: the data arrays are zeroed (no frame is available
 //!    yet) and the plugin's `render` is called; the plugin's own return value
 //!    is the host's answer (S09 §5.2, §5.3 step 4b);
-//! 5. only one visualization runs at a time: starting the second module quits
+//! 5. the player's Configure request reaches the **running** module's `config`
+//!    exactly once (S09 §5.2 offset 0x924, §5.3 step 7);
+//! 6. only one visualization runs at a time: starting the second module quits
 //!    the first, and a module whose `init` refuses is not activated
 //!    (S09 §5.2, §5.3 step 1);
-//! 6. `quit` reaches the plugin and the DLL stays mapped (S09 §5.3 step 5,
+//! 7. `quit` reaches the plugin and the DLL stays mapped (S09 §5.3 step 5,
 //!    §1 line 46).
 //!
 //! The plugin's own trace file — written from inside the DLL — is checked for
@@ -322,6 +324,21 @@ fn a_real_visualization_plugin_is_loaded_listed_started_drawn_and_quit_cleanly()
         "both frames must reach the plugin, with zeroed data arrays:\n{trace}"
     );
 
+    // 7b. The player's Configure request reaches the running module's
+    //     `config` (S09 §5.2 offset 0x924, §5.3 step 7). This fixture's
+    //     `config` opens no window, so the route is proven from the plugin's
+    //     own trace.
+    loaded
+        .config()
+        .expect("the running module's config must be routed");
+    let trace =
+        std::fs::read_to_string(trace_path()).expect("the fixture must have written its own trace");
+    assert_eq!(
+        occurrences(&trace, &config_line(0)),
+        1,
+        "the config callback must reach the plugin exactly once:\n{trace}"
+    );
+
     // 8. Only one visualization runs at a time: the second module's `init`
     //    refuses, and the first one is quit before it (S09 §5.3 step 1).
     assert_eq!(
@@ -379,11 +396,12 @@ fn a_real_visualization_plugin_is_loaded_listed_started_drawn_and_quit_cleanly()
         2,
         "both starts must have run the plugin's init:\n{trace}"
     );
-    assert!(
-        !trace.contains(EVENT_CONFIG),
-        "the host must not call the module's config callback:\n{trace}"
+    assert_eq!(
+        occurrences(&trace, &config_line(0)),
+        1,
+        "the config callback must reach the plugin exactly once, and only while \
+         its module was running:\n{trace}"
     );
-
     // The visualization DLL stays mapped after its quit (S09 §1 line 46: the
     // 5.x host frees it, this host keeps the conservative policy).
     let mapped = mapped_path(loaded.hinstance());
