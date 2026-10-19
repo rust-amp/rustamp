@@ -119,6 +119,12 @@ function Assert-Inventory($Expected, $Actual, [string]$Label) {
 $genFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\gen_rustamp_fixture.dll'
 $genFixtureStaged = $false
 
+# The output plugin fixture (crates/rustamp-plughost/examples/out_rustamp_fixture.rs)
+# is the same kind of artifact for the `out_` plugin kind: our own clean-room
+# cdylib, built for i686 by the same test build, loaded through the OS loader.
+$outFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\out_rustamp_fixture.dll'
+$outFixtureStaged = $false
+
 # --- 1. compile on the host (builds, does not run) ---------------------------
 if (-not $SkipBuild) {
     Step 'compiling on the host (cargo test --no-run; nothing is executed)'
@@ -172,6 +178,7 @@ if (-not $SkipBuild) {
     # The staging receipt covers the fixture file itself, so its presence in
     # the staged tree is the ground truth here.
     $genFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\gen_rustamp_fixture.dll')
+    $outFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\out_rustamp_fixture.dll')
     Write-Host ("    verified {0} staged files against the complete receipt and current workspace/runtime inputs" -f $receipt.files.Count)
 }
 
@@ -260,6 +267,16 @@ if (Test-Path $genFixtureDll) {
     Write-Host '    staged the i686 general-purpose plugin fixture beside the binaries'
 } else {
     Write-Host '    WARNING: no i686 general-purpose plugin fixture was built; its acceptance test will report it blocked'
+}
+
+# The output plugin fixture travels with the test binaries for the same reason.
+if (Test-Path $outFixtureDll) {
+    Copy-Item $outFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
+    Copy-Item $outFixtureDll $i686TargetDeps -Force
+    $outFixtureStaged = $true
+    Write-Host '    staged the i686 output plugin fixture beside the binaries'
+} else {
+    Write-Host '    WARNING: no i686 output plugin fixture was built; its acceptance test will report it blocked'
 }
 
 foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
@@ -502,6 +519,14 @@ if ($genFixtureStaged) {
     Write-Host ('gen plugin fixture: staged (our own i686 cdylib, SHA-256 {0})' -f (Get-FileHash -LiteralPath $genFixturePath -Algorithm SHA256).Hash)
 } else {
     Write-Host 'gen plugin fixture: NOT STAGED (the i686 build produced no general-purpose fixture); its acceptance test refuses loudly and proves nothing in this run'
+}
+# Output plugin fixture status (P3): the same kind of own cdylib, for the
+# `out_` plugin kind. It needs no third-party DLL either.
+if ($outFixtureStaged) {
+    $outFixturePath = if (Test-Path $outFixtureDll) { $outFixtureDll } else { Join-Path $Stage 'target\debug\deps\out_rustamp_fixture.dll' }
+    Write-Host ('out plugin fixture: staged (our own i686 cdylib, SHA-256 {0})' -f (Get-FileHash -LiteralPath $outFixturePath -Algorithm SHA256).Hash)
+} else {
+    Write-Host 'out plugin fixture: NOT STAGED (the i686 build produced no output fixture); its acceptance test refuses loudly and proves nothing in this run'
 }
 $result.results | ForEach-Object {
     # A hung binary must be impossible to mistake for a pass or for a missing binary.

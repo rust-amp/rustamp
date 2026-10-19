@@ -13,23 +13,26 @@
 //!    Dependencies use the explicit source directory and System32, not CWD/PATH.
 //! 4. **Entry point resolution**: locates the exported entry point (`winampGetInModule2`
 //!    for input plugins, `winampDSPGetHeader2` for DSP plugins,
-//!    `winampGetGeneralPurposePlugin` for general plugins; S09 §2).
+//!    `winampGetGeneralPurposePlugin` for general plugins,
+//!    `winampGetOutModule` for output plugins; S09 §2).
 //! 5. **Calling convention**: entry points and callbacks are `cdecl` (`extern "C"`,
 //!    caller cleans stack; S09 §1 line 38).
 //! 6. **Module validation**: verifies that the returned module pointer is non-null,
 //!    validates the version field (`0x100` for input plugins per S09 §3.2 line 125,
 //!    masking 5.x flags `0x0F00_0000` per S09 §3.2 line 127 and §11 line 437; `0x20`
 //!    for DSP plugins per S09 §6.1 line 335, strict; `0x10` for
-//!    general plugins per S09 §7.1 line 367), and reads the ANSI description string
-//!    (S09 §1 line 40).
+//!    general plugins per S09 §7.1 line 367, strict; `0x10` for
+//!    output plugins per S09 §4.1 line 229, strict), and reads the ANSI
+//!    description string (S09 §1 line 40).
 //! 7. **Host fields**: fills `main_window`, `dll_instance`, and host callbacks
 //!    (`analyzer_*`, `vis_*`, `dsp_*`, `out_module`) before `init()` (S09 §3.1 lines 76–115,
 //!    §3.5 lines 153–156).
 //! 8. **Plugin initialization**: calls the plugin's `init()` callback on the UI thread
 //!    (S09 §3.5 line 156, §7.2 line 377). Sets `set_info` after `init()` returns (S09 §3.5 line 155).
 //! 9. **Unload policy**: at shutdown, calls `quit()` on loaded plugins in reverse
-//!    order (S09 §3.5 line 166, §7.2 line 380); input and general DLLs are NOT freed
-//!    at shutdown because plugins may have subclassed windows (S09 §1 line 46).
+//!    order (S09 §3.5 line 166, §7.2 line 380, §4.2 line 255); input, output and
+//!    general DLLs are NOT freed at shutdown because plugins may have subclassed
+//!    windows (S09 §1 line 46).
 //!    Reverse order across several plugins is [`crate::registry::PluginRegistry`]'s
 //!    job; a single [`LoadedPlugin`] only quits itself.
 //! 10. **Configuration**: [`LoadedPlugin::config`] calls a general plugin's
@@ -37,6 +40,15 @@
 //!     reported through [`LoadedPlugin::general_info`] / [`LoadedPlugin::dsp_info`]
 //!     and never enforced by this loader: S09 §7 requires no general plugin to
 //!     provide one, and a null slot is refused, never transmuted.
+//! 11. **Output plugins**: the host fills `main_window` and `dll_instance` in
+//!     the `Out_Module` and calls `init` (S09 §4.1 lines 233–237, §4.2 line 252).
+//!     The host calls **no other** output callback: `open`, `write`,
+//!     `can_write`, `is_playing`, `pause`, `set_volume`, `set_pan`, `flush`
+//!     and the two time queries are driven by the **input** plugin from its
+//!     decode thread (S09 §4.2 step 3, §3.7), and the host has no playback
+//!     path of its own. The `id` member is left untouched: the 5.x host
+//!     replaces it with the DLL file name (5.x-only), and whether 2.95 does is
+//!     open (S09 U-4).
 //!
 //! Structural preflight is NOT a malware detector or approval gate. A valid
 //! trusted DLL and its dependencies can run TLS/DllMain during LoadLibraryExW,
@@ -53,6 +65,8 @@ use rustamp_plugin_abi::PluginKind;
 #[cfg(any(windows, test))]
 use rustamp_plugin_abi::common::DSP_VERSION;
 #[cfg(any(windows, test))]
+use rustamp_plugin_abi::common::OUT_VERSION;
+#[cfg(any(windows, test))]
 use rustamp_plugin_abi::common::{GEN_VERSION, read_c_string_lossy};
 #[cfg(windows)]
 use rustamp_plugin_abi::common::{
@@ -64,6 +78,8 @@ use rustamp_plugin_abi::dsp::{DspHeader, DspModule};
 use rustamp_plugin_abi::general::GeneralPlugin;
 #[cfg(windows)]
 use rustamp_plugin_abi::input::InModule;
+#[cfg(any(windows, test))]
+use rustamp_plugin_abi::output::OutModule;
 #[cfg(any(windows, test))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -485,6 +501,82 @@ unsafe fn init_general_module(
 }
 
 // ---------------------------------------------------------------------------
+// Output plugin initialization (S09 §4)
+// ---------------------------------------------------------------------------
+
+/// What actually happened while an output module was initialized.
+///
+/// `init_called` is false when the plugin supplied no `init` slot, so a
+/// skipped call is never reported as a successful initialization.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct OutputInit {
+    module: *mut OutModule,
+    init_called: bool,
+}
+
+/// Validate and initialize an output plugin module (S09 §4.1, §4.2).
+///
+/// Mirrors [`init_general_module`]: the version is checked, the two host-filled
+/// members are written, and `init` is called — in that order, all on the
+/// caller's thread, which must be the UI thread owning the host window
+/// (S09 §4.2 line 252).
+///
+/// No other output callback is called here. `open`, `write`, `can_write`,
+/// `is_playing`, `close`, `pause`, `set_volume`, `set_pan`, `flush` and the
+/// two time queries belong to the **input** plugin's decode thread
+/// (S09 §4.2 step 3, §3.7); the host only builds the output list and calls
+/// `init` and `quit`.
+///
+/// # Safety
+///
+/// `module` must be null or point at a live `Out_Module` in the mapped
+/// plugin's static storage (S09 §0). `host_hwnd` must be the real main-window
+/// handle and `hinstance` the plugin's own module handle. The plugin's `init`
+/// runs here on the caller's thread.
+#[cfg(any(windows, test))]
+unsafe fn init_output_module(
+    module: *mut OutModule,
+    host_hwnd: usize,
+    hinstance: *mut core::ffi::c_void,
+) -> Result<OutputInit, PluginLoadError> {
+    if module.is_null() {
+        return Err(PluginLoadError::NullModule);
+    }
+    // SAFETY: caller guarantees a live module for these reads.
+    let version = unsafe { (*module).version };
+    // S09 §4.1 line 229: 0x10 in 2.95. 0x11 is 5.x-only and its description is
+    // a wide string, not the ANSI one this host reads, so it is refused
+    // (U-7 decision: strict equality, the general and DSP policy).
+    if version != OUT_VERSION {
+        return Err(PluginLoadError::UnsupportedVersion {
+            kind: PluginKind::Output,
+            actual: version,
+            expected: OUT_VERSION,
+        });
+    }
+    // S09 §4.1 lines 233–234: the host fills the main window and the plugin's
+    // own module handle before `init` runs. The `id` member stays as the
+    // plugin left it: the 5.x host replaces it with the DLL file name
+    // (5.x-only) and whether 2.95 does is open (U-4).
+    // SAFETY: live module in plugin static data.
+    unsafe {
+        (*module).main_window = host_hwnd as *mut core::ffi::c_void;
+        (*module).dll_instance = hinstance;
+    }
+    let mut init_called = false;
+    // SAFETY: cdecl, no arguments (S09 §4.1 offset 0x1C), non-null slot.
+    if let Some(init) = unsafe { (*module).init } {
+        init_called = true;
+        unsafe { init() };
+    }
+    Ok(OutputInit {
+        module,
+        init_called,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Error and Result Types
 // ---------------------------------------------------------------------------
 
@@ -630,6 +722,11 @@ enum LoadedPluginInner {
         init_called: bool,
         init_result: core::ffi::c_int,
     },
+    #[cfg(any(windows, test))]
+    Output {
+        module: *mut OutModule,
+        init_called: bool,
+    },
     #[allow(dead_code)]
     Unsupported,
 }
@@ -710,6 +807,16 @@ impl LoadedPlugin {
                     // SAFETY: module pointer was verified non-null at load time.
                     if let Some(quit_fn) = unsafe { (*module).quit } {
                         // SAFETY: quit() takes no arguments in GeneralPlugin (S09 §7.1 offset 0x10).
+                        unsafe { quit_fn() };
+                    }
+                }
+            }
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Output { module, .. } => {
+                if !module.is_null() {
+                    // SAFETY: module pointer was verified non-null at load time.
+                    if let Some(quit_fn) = unsafe { (*module).quit } {
+                        // SAFETY: quit() takes no arguments in OutModule (S09 §4.1 offset 0x20).
                         unsafe { quit_fn() };
                     }
                 }
@@ -819,6 +926,34 @@ impl LoadedPlugin {
         }
     }
 
+    /// Host-visible state of a loaded output module, read from the plugin's own
+    /// module struct. `None` for any other plugin kind.
+    ///
+    /// The struct lives in plugin static data, so this stays readable after
+    /// [`quit`](Self::quit) (the mapping is retained, S09 §1 line 46).
+    pub fn output_info(&self) -> Option<OutModuleInfo> {
+        match self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Output {
+                module,
+                init_called,
+            } if !module.is_null() => {
+                // SAFETY: the module pointer was verified non-null at load time
+                // and points into plugin static data of the retained mapping.
+                let m = unsafe { *module };
+                Some(OutModuleInfo {
+                    has_init: m.init.is_some(),
+                    has_quit: m.quit.is_some(),
+                    main_window: m.main_window as usize,
+                    dll_instance: m.dll_instance as usize,
+                    id: m.id,
+                    init_called,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Run interleaved 16-bit PCM through the host's `dsp_process` callback, the
     /// path a real input plugin's decode loop takes (S09 §3.1 offset 0x88).
     ///
@@ -887,6 +1022,26 @@ impl LoadedPlugin {
         }
     }
 
+    /// Wrap an already-initialized synthetic output module as a loaded plugin,
+    /// for host-side tests of the output lifecycle (`init`, `quit` order).
+    ///
+    /// No DLL is mapped and no export is resolved, so a test built on this
+    /// proves host logic only — never DLL acceptance (P3 §7 false passes).
+    #[cfg(test)]
+    pub(crate) fn output_for_test(name: &str, module: *mut OutModule, init_called: bool) -> Self {
+        Self {
+            path: PathBuf::from(name),
+            kind: PluginKind::Output,
+            hinstance: core::ptr::null_mut(),
+            description: name.to_string(),
+            inner: LoadedPluginInner::Output {
+                module,
+                init_called,
+            },
+            initialized: true,
+        }
+    }
+
     /// A loaded plugin of a kind this host has no bridge for, for tests that
     /// check what the kind-specific entry points refuse.
     #[cfg(test)]
@@ -942,12 +1097,33 @@ pub struct GeneralModuleInfo {
     pub init_result: core::ffi::c_int,
 }
 
+/// Host-visible state of a loaded output module
+/// (see [`LoadedPlugin::output_info`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutModuleInfo {
+    /// The plugin supplied an `init` callback (S09 §4.1 offset 0x1C).
+    pub has_init: bool,
+    /// The plugin supplied a `quit` callback (S09 §4.1 offset 0x20).
+    pub has_quit: bool,
+    /// `main_window` as filled by the host before `init` (S09 §4.1 offset 0x0C).
+    pub main_window: usize,
+    /// `dll_instance` as filled by the host before `init` (S09 §4.1 offset 0x10).
+    pub dll_instance: usize,
+    /// The module id as the plugin left it. The host does not overwrite it: the
+    /// 5.x host replaces it with the DLL file name, and whether 2.95 does is
+    /// open (S09 §4.1 line 231, S09 U-4).
+    pub id: i32,
+    /// `init` was actually called. False means the slot was null and skipped.
+    pub init_called: bool,
+}
+
 impl Drop for LoadedPlugin {
     fn drop(&mut self) {
         self.quit();
-        // S09 §1 line 46: Input and general DLLs are NOT freed at shutdown.
-        // DSP §6.3 frees the DLL after quit; this host retains it instead
-        // (same conservative policy) until the VM proves free-after-quit safe.
+        // S09 §1 line 46: Input, output and general DLLs are NOT freed at
+        // shutdown. DSP §6.3 frees the DLL after quit; this host retains it
+        // instead (same conservative policy) until the VM proves free-after-quit
+        // safe.
     }
 }
 
@@ -1108,7 +1284,11 @@ unsafe fn load_plugin_x86(
             rustamp_plugin_abi::common::EXPORT_GEN_GET_PLUGIN,
             "winampGetGeneralPurposePlugin",
         ),
-        _ => unreachable!("preflight selects input/dsp/general only"),
+        PluginKind::Output => (
+            rustamp_plugin_abi::common::EXPORT_OUT_GET_MODULE,
+            "winampGetOutModule",
+        ),
+        _ => unreachable!("preflight selects input/dsp/general/output only"),
     };
     // SAFETY: mapped module handle, static NUL-terminated export name.
     let export = unsafe { GetProcAddress(hinstance, name.as_ptr()) };
@@ -1124,7 +1304,11 @@ unsafe fn load_plugin_x86(
         PluginKind::General => unsafe {
             load_general_module(image.path, hinstance, export, host_hwnd)
         },
-        _ => unreachable!("preflight selects input/dsp/general only"),
+        // SAFETY: approved mapped getter and UI-thread HWND, per caller contract.
+        PluginKind::Output => unsafe {
+            load_output_module(image.path, hinstance, export, host_hwnd)
+        },
+        _ => unreachable!("preflight selects input/dsp/general/output only"),
     }
 }
 
@@ -1199,6 +1383,11 @@ unsafe fn load_input_module(
         (*module_ptr).dsp_is_active = Some(host_dsp_is_active);
         (*module_ptr).dsp_process = Some(host_dsp_process);
         (*module_ptr).set_info = None; // Cleared before init
+        // S09 §3.1 offset 0x94, §3.5 step 2: the host sets `out_module` to the
+        // selected output before `play`. No output is selected yet — the host
+        // has no playback path, and the selection itself (`config_outname`) is
+        // S12's business — so the slot stays empty instead of naming an
+        // output the input plugin would then have to use.
         (*module_ptr).out_module = core::ptr::null_mut();
     }
 
@@ -1283,6 +1472,43 @@ unsafe fn load_general_module(
             module: init.module,
             init_called: init.init_called,
             init_result: init.init_result,
+        },
+        initialized: true,
+    })
+}
+
+#[cfg(windows)]
+unsafe fn load_output_module(
+    path: PathBuf,
+    hinstance: *mut core::ffi::c_void,
+    proc_ptr: *mut core::ffi::c_void,
+    host_hwnd: usize,
+) -> Result<LoadedPlugin, PluginLoadError> {
+    // S09 §1 line 38, §2 line 57: cdecl, no arguments, returns *mut Out_Module.
+    type OutGetModuleFn = unsafe extern "C" fn() -> *mut OutModule;
+    let get_module: OutGetModuleFn = unsafe { core::mem::transmute(proc_ptr) };
+    let module_ptr = unsafe { get_module() };
+    if module_ptr.is_null() {
+        return Err(PluginLoadError::NullModule);
+    }
+
+    // The description is read before init() so a plugin that rewrites its own
+    // pointer during init cannot change what the host reported it as.
+    // SAFETY: non-null module in the mapped image's static data; a null
+    // description pointer reads as empty and is not dereferenced (S09 §4.1).
+    let description = unsafe { read_c_string_lossy((*module_ptr).description) };
+
+    // SAFETY: getter result from the approved mapped image; UI thread.
+    let init = unsafe { init_output_module(module_ptr, host_hwnd, hinstance) }?;
+
+    Ok(LoadedPlugin {
+        path,
+        kind: PluginKind::Output,
+        hinstance,
+        description,
+        inner: LoadedPluginInner::Output {
+            module: init.module,
+            init_called: init.init_called,
         },
         initialized: true,
     })
@@ -2123,5 +2349,240 @@ mod tests {
         );
         // The module struct stays readable after quit (the mapping is retained).
         assert_eq!(module.version, GEN_VERSION);
+    }
+
+    // -----------------------------------------------------------------------
+    // Output plugin lifecycle (S09 §4)
+    //
+    // Synthetic in-process modules, as the general tests above use. These
+    // prove the host's own order of operations and refusals; they map no DLL
+    // and resolve no export, so they are NOT DLL acceptance (P3 §7).
+    // -----------------------------------------------------------------------
+
+    thread_local! {
+        /// What the synthetic output callbacks recorded, in call order.
+        static OUT_LOG: std::cell::RefCell<Vec<String>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        /// The module `out_init_reading_fields` reads its host fields from.
+        static OUT_MODULE: Cell<*mut OutModule> = const { Cell::new(core::ptr::null_mut()) };
+    }
+
+    fn out_note(entry: impl Into<String>) {
+        OUT_LOG.with(|log| log.borrow_mut().push(entry.into()));
+    }
+
+    fn out_log() -> Vec<String> {
+        OUT_LOG.with(|log| log.borrow().clone())
+    }
+
+    fn out_log_clear() {
+        OUT_LOG.with(|log| log.borrow_mut().clear());
+        OUT_MODULE.with(|slot| slot.set(core::ptr::null_mut()));
+    }
+
+    /// Reads the two members the host must have filled *before* `init` runs,
+    /// so a pass pins the ordering and not just the final field values.
+    unsafe extern "C" fn out_init_reading_fields() {
+        let module = OUT_MODULE.with(|slot| slot.get());
+        if module.is_null() {
+            out_note("init with no module");
+            return;
+        }
+        // SAFETY: the test owns the module and keeps it alive across the call.
+        let (parent, instance, id) =
+            unsafe { ((*module).main_window, (*module).dll_instance, (*module).id) };
+        out_note(format!(
+            "init parent={:#x} instance={:#x} id={id}",
+            parent as usize, instance as usize
+        ));
+    }
+
+    unsafe extern "C" fn out_quit() {
+        out_note("quit");
+    }
+
+    /// The plugin's own `open`: the host must never call it (S09 §4.2 step 3
+    /// drives the output from the input plugin's decode thread).
+    unsafe extern "C" fn out_open(
+        _sample_rate: core::ffi::c_int,
+        _channels: core::ffi::c_int,
+        _bits: core::ffi::c_int,
+        _buffer_ms: core::ffi::c_int,
+        _prebuffer_ms: core::ffi::c_int,
+    ) -> core::ffi::c_int {
+        out_note("open");
+        0
+    }
+
+    fn out_module(
+        init: Option<unsafe extern "C" fn()>,
+        quit: Option<unsafe extern "C" fn()>,
+    ) -> OutModule {
+        OutModule {
+            version: OUT_VERSION,
+            description: c"synthetic output".as_ptr(),
+            // A third-party module should use a value >= 65536 (S09 §4.1).
+            id: 0x0001_0000,
+            init,
+            quit,
+            open: Some(out_open),
+            ..OutModule::default()
+        }
+    }
+
+    #[test]
+    fn output_version_refusal_precedes_any_callback() {
+        out_log_clear();
+        let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
+        // 0x11 is 5.x-only (S09 §4.1); 2.95 expects 0x10 exactly.
+        module.version = rustamp_plugin_abi::common::OUT_VERSION_WIDE_DESC;
+        OUT_MODULE.with(|slot| slot.set(&mut module));
+        // SAFETY: live stack module; no DLL is involved.
+        let err = unsafe {
+            init_output_module(&mut module, 0x1234, 0x5678_usize as *mut core::ffi::c_void)
+        }
+        .expect_err("version 0x11 must be refused");
+        assert!(
+            matches!(
+                err,
+                PluginLoadError::UnsupportedVersion {
+                    kind: PluginKind::Output,
+                    actual: 0x11,
+                    expected: 0x10,
+                }
+            ),
+            "unexpected refusal: {err}"
+        );
+        assert!(
+            out_log().is_empty(),
+            "no plugin callback may run before the version check, but ran {:?}",
+            out_log()
+        );
+        // Nothing of the host was published into a module it refused.
+        assert!(module.main_window.is_null());
+        assert!(module.dll_instance.is_null());
+    }
+
+    #[test]
+    fn output_host_fields_are_visible_to_init_and_the_id_is_untouched() {
+        out_log_clear();
+        let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
+        OUT_MODULE.with(|slot| slot.set(&mut module));
+        // SAFETY: live stack module; no DLL is involved.
+        let init = unsafe {
+            init_output_module(&mut module, 0xBEEF, 0xCAFE_usize as *mut core::ffi::c_void)
+        }
+        .expect("a 0x10 module must initialize");
+        assert!(init.init_called);
+        // The ordering: init saw both host members already filled, and the
+        // host did not touch the id (S09 §4.1 line 231, U-4).
+        assert_eq!(
+            out_log(),
+            vec!["init parent=0xbeef instance=0xcafe id=65536"]
+        );
+
+        let plugin = LoadedPlugin::output_for_test("out_synthetic", &mut module, init.init_called);
+        assert_eq!(
+            plugin.output_info().expect("output plugins report info"),
+            OutModuleInfo {
+                has_init: true,
+                has_quit: true,
+                main_window: 0xBEEF,
+                dll_instance: 0xCAFE,
+                id: 0x0001_0000,
+                init_called: true,
+            }
+        );
+        // An output plugin is neither a general nor a DSP one and says so.
+        assert_eq!(plugin.general_info(), None);
+        assert_eq!(plugin.dsp_info(), None);
+    }
+
+    #[test]
+    fn output_host_calls_no_playback_callback() {
+        out_log_clear();
+        let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
+        OUT_MODULE.with(|slot| slot.set(&mut module));
+        // SAFETY: live stack module; no DLL is involved.
+        unsafe { init_output_module(&mut module, 0x11, 0x22_usize as *mut core::ffi::c_void) }
+            .expect("a 0x10 module must initialize");
+        assert!(
+            !out_log().iter().any(|entry| entry == "open"),
+            "the host must not open the output: the input plugin drives it (S09 §4.2)"
+        );
+    }
+
+    #[test]
+    fn output_null_module_and_null_init_are_reported_not_called() {
+        out_log_clear();
+        // SAFETY: a null module is exactly the input under test.
+        let err = unsafe {
+            init_output_module(
+                core::ptr::null_mut(),
+                0x1,
+                0x2_usize as *mut core::ffi::c_void,
+            )
+        }
+        .expect_err("a null module must be refused");
+        assert!(matches!(err, PluginLoadError::NullModule), "{err}");
+
+        let mut bare = out_module(None, None);
+        // SAFETY: live stack module with every plugin slot null.
+        let init =
+            unsafe { init_output_module(&mut bare, 0x11, 0x22_usize as *mut core::ffi::c_void) }
+                .expect("S09 §4 requires no slot, so this still loads");
+        assert!(!init.init_called, "a null init must not be reported as run");
+        assert!(out_log().is_empty());
+
+        let plugin = LoadedPlugin::output_for_test("out_bare", &mut bare, init.init_called);
+        assert_eq!(
+            plugin.output_info().unwrap(),
+            OutModuleInfo {
+                has_init: false,
+                has_quit: false,
+                main_window: 0x11,
+                dll_instance: 0x22,
+                id: 0x0001_0000,
+                init_called: false,
+            },
+            "the absent slots are what an acceptance runner refuses on"
+        );
+    }
+
+    #[test]
+    fn output_quit_runs_once_and_is_idempotent() {
+        out_log_clear();
+        let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
+        let mut plugin = LoadedPlugin::output_for_test("out_quit", &mut module, true);
+        assert!(plugin.is_initialized());
+        plugin.quit();
+        assert!(!plugin.is_initialized());
+        plugin.quit();
+        drop(plugin); // Drop quits too; it must not call the plugin again.
+        assert_eq!(
+            out_log(),
+            vec!["quit"],
+            "quit must reach the plugin exactly once"
+        );
+        // The module struct stays readable after quit (the mapping is retained).
+        assert_eq!(module.version, OUT_VERSION);
+    }
+
+    #[test]
+    fn output_config_is_not_routed_by_this_host() {
+        out_log_clear();
+        let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
+        let plugin = LoadedPlugin::output_for_test("out_config", &mut module, true);
+        // The output's `config` takes the parent window and opens a dialog;
+        // it is another card, so nothing is called here.
+        assert_eq!(
+            plugin.config(),
+            Err(PluginConfigError::WrongKind(PluginKind::Output))
+        );
+        assert!(
+            out_log().is_empty(),
+            "no output callback may run for a refused config"
+        );
     }
 }

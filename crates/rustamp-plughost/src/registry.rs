@@ -445,6 +445,36 @@ mod tests {
     }
 
     #[test]
+    fn an_output_candidate_is_refused_when_another_kind_was_asked_for() {
+        // The fixture exports winampGetOutModule (S09 §2); the request asks
+        // for an input plugin. Approve the bytes, so that nothing but the
+        // kind can be what refuses this.
+        let mut bytes = test_dll(0x014c);
+        let name = b"winampGetOutModule\0";
+        bytes[0x260..0x260 + name.len()].copy_from_slice(name);
+        assert_eq!(
+            crate::pe_preflight::check_pe_i386_dll(&bytes),
+            Ok(PluginKind::Output)
+        );
+        let fixture = Fixture::new(&bytes);
+        let mut store = ApprovalStore::new();
+        store.approve_bytes("out_test.dll", &bytes).unwrap();
+        let mut registry = PluginRegistry::new(store);
+        // SAFETY: the kind mismatch refuses before any mapping.
+        let reply = unsafe {
+            registry.handle_load_request(fixture.as_str(), PluginKind::Input, &HostWindow::dummy())
+        };
+        let message = error_message(&reply);
+        assert!(
+            message.contains("refused before any mapping")
+                && message.contains("asked for Input")
+                && message.contains("winampGetOutModule"),
+            "the reply must name both kinds and say nothing ran: {message}"
+        );
+        assert!(registry.loaded_ids().is_empty());
+    }
+
+    #[test]
     fn a_missing_file_reports_the_real_io_error() {
         let mut registry = PluginRegistry::new(ApprovalStore::new());
         let missing = std::env::temp_dir().join("rustamp-registry-no-such-plugin.dll");
@@ -483,6 +513,8 @@ mod tests {
             (PluginKind::General, PluginKind::Input),
             (PluginKind::Input, PluginKind::Dsp),
             (PluginKind::Dsp, PluginKind::Visualization),
+            (PluginKind::Input, PluginKind::Output),
+            (PluginKind::Output, PluginKind::General),
         ] {
             let message = accept_loaded_kind(expected, actual)
                 .expect_err("a mismatch must never be accepted");
