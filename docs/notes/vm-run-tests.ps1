@@ -134,6 +134,14 @@ $visFixtureStaged = $false
 $dspFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\dsp_rustamp_fixture.dll'
 $dspFixtureStaged = $false
 
+# The crashing plugin fixture (crates/rustamp-plughost/examples/
+# crash_rustamp_fixture.rs) is the same kind of artifact for the crash
+# isolation acceptance (PLAN M3): our own clean-room cdylib, built for i686 by
+# the same test build, loaded through the OS loader. It faults on purpose, so
+# it must only ever run inside the guest.
+$crashFixtureDll = Join-Path $RepoRoot 'target\i686-pc-windows-msvc\debug\examples\crash_rustamp_fixture.dll'
+$crashFixtureStaged = $false
+
 # --- 1. compile on the host (builds, does not run) ---------------------------
 if (-not $SkipBuild) {
     Step 'compiling on the host (cargo test --no-run; nothing is executed)'
@@ -188,6 +196,7 @@ if (-not $SkipBuild) {
     # the staged tree is the ground truth here.
     $genFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\gen_rustamp_fixture.dll')
     $outFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\out_rustamp_fixture.dll')
+    $crashFixtureStaged = Test-Path (Join-Path $Stage 'target\debug\deps\crash_rustamp_fixture.dll')
     Write-Host ("    verified {0} staged files against the complete receipt and current workspace/runtime inputs" -f $receipt.files.Count)
 }
 
@@ -304,6 +313,17 @@ if (Test-Path $dspFixtureDll) {
     Write-Host '    staged the i686 DSP plugin fixture beside the binaries'
 } else {
     Write-Host '    WARNING: no i686 DSP plugin fixture was built; its acceptance test will report it blocked'
+}
+
+# The crashing plugin fixture travels with the test binaries too: the crash
+# isolation acceptance loads it through the OS loader and lets it fault.
+if (Test-Path $crashFixtureDll) {
+    Copy-Item $crashFixtureDll (Join-Path $Stage 'target\debug\deps') -Force
+    Copy-Item $crashFixtureDll $i686TargetDeps -Force
+    $crashFixtureStaged = $true
+    Write-Host '    staged the i686 crashing plugin fixture beside the binaries'
+} else {
+    Write-Host '    WARNING: no i686 crashing plugin fixture was built; its acceptance test will report it blocked'
 }
 
 foreach ($crt in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
@@ -554,6 +574,15 @@ if ($outFixtureStaged) {
     Write-Host ('out plugin fixture: staged (our own i686 cdylib, SHA-256 {0})' -f (Get-FileHash -LiteralPath $outFixturePath -Algorithm SHA256).Hash)
 } else {
     Write-Host 'out plugin fixture: NOT STAGED (the i686 build produced no output fixture); its acceptance test refuses loudly and proves nothing in this run'
+}
+# Crashing plugin fixture status (PLAN M3, crash isolation): the same kind of
+# own cdylib, built by the i686 test build and copied into the stage with the
+# test binaries. It faults on purpose, so it only ever runs in the guest.
+if ($crashFixtureStaged) {
+    $crashFixturePath = if (Test-Path $crashFixtureDll) { $crashFixtureDll } else { Join-Path $Stage 'target\debug\deps\crash_rustamp_fixture.dll' }
+    Write-Host ('crash plugin fixture: staged (our own i686 cdylib, SHA-256 {0})' -f (Get-FileHash -LiteralPath $crashFixturePath -Algorithm SHA256).Hash)
+} else {
+    Write-Host 'crash plugin fixture: NOT STAGED (the i686 build produced no crashing fixture); its acceptance test refuses loudly and proves nothing in this run'
 }
 $result.results | ForEach-Object {
     # A hung binary must be impossible to mistake for a pass or for a missing binary.

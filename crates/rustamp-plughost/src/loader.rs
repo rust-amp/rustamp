@@ -76,6 +76,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::fault::{PluginIdentity, plugin_call_scope};
 use crate::host_window::HostWindow;
 use crate::pe_preflight::PePreflightError;
 use rustamp_plugin_abi::PluginKind;
@@ -587,8 +588,10 @@ enum LoadedPluginInner {
 /// Pointers point into the plugin's static data and remain valid as long as the
 /// DLL is loaded (S09 §0 line 32).
 pub struct LoadedPlugin {
-    path: PathBuf,
-    kind: PluginKind,
+    /// The plugin's identity, boxed so its address does not move: a fault
+    /// report reads it from the thread-local record of the running call
+    /// (see [`crate::fault`]).
+    identity: Box<PluginIdentity>,
     hinstance: *mut core::ffi::c_void,
     /// The host's main window, handed to the plugin (S09 §1 "Parent window").
     /// A visualization module is filled when the user starts it, so the host
@@ -602,12 +605,12 @@ pub struct LoadedPlugin {
 impl LoadedPlugin {
     /// Canonical source path; the OS maps a private byte-identical snapshot.
     pub fn path(&self) -> &Path {
-        &self.path
+        self.identity.path()
     }
 
     /// Plugin kind.
     pub fn kind(&self) -> PluginKind {
-        self.kind
+        self.identity.kind()
     }
 
     /// Description string provided by the plugin (S09 §1 line 40).
@@ -651,6 +654,9 @@ impl LoadedPlugin {
         if !self.initialized {
             return;
         }
+        // `quit` is plugin code like every other call: a fault in it must
+        // name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "quit");
         match self.inner {
             #[cfg(windows)]
             LoadedPluginInner::Input { module } => {
@@ -774,6 +780,9 @@ impl LoadedPlugin {
     /// S09 U-15 (the modal/parent context of a general Config in 2.95) stays
     /// open, so no parent or modality is forced here beyond the handed parent.
     pub fn config(&self) -> Result<(), PluginConfigError> {
+        // `config` is plugin code like every other call: a fault in it must
+        // name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "config");
         match self.inner {
             #[cfg(any(windows, test))]
             LoadedPluginInner::General { module, .. } => {
@@ -816,7 +825,7 @@ impl LoadedPlugin {
                 unsafe { config_fn(module) };
                 Ok(())
             }
-            _ => Err(PluginConfigError::WrongKind(self.kind)),
+            _ => Err(PluginConfigError::WrongKind(self.kind())),
         }
     }
 
@@ -1009,15 +1018,21 @@ impl LoadedPlugin {
                 };
                 (entry.module, self.host_hwnd, self.hinstance)
             }
-            _ => return Err(VisError::WrongKind(self.kind)),
+            _ => return Err(VisError::WrongKind(self.kind())),
         };
         // S09 §5.3 step 1: a running visualization is stopped before another
-        // one starts.
+        // one starts. The module that is stopped belongs to the plugin that
+        // was running, not to this one, so no fault scope names this plugin
+        // here: a fault in that other plugin's `quit` is reported without a
+        // name rather than with the wrong one.
         crate::vis::stop_active_vis_module();
         // SAFETY: the module lives in the mapped plugin's static data, which
         // the retained mapping keeps alive; `init` runs on this thread, which
         // owns the host window.
-        let init = unsafe { crate::vis::init_vis_module(module, host_hwnd, hinstance) }?;
+        let init = {
+            let _scope = plugin_call_scope(&self.identity, "init");
+            unsafe { crate::vis::init_vis_module(module, host_hwnd, hinstance) }?
+        };
         if let LoadedPluginInner::Vis {
             active,
             init_called,
@@ -1047,12 +1062,15 @@ impl LoadedPlugin {
                 Some(module) => module,
                 None => return Err(VisError::NotRunning),
             },
-            _ => return Err(VisError::WrongKind(self.kind)),
+            _ => return Err(VisError::WrongKind(self.kind())),
         };
         if crate::vis::active_vis_module() != module {
             // Another visualization is running; this one is not.
             return Err(VisError::NotRunning);
         }
+        // `render` is plugin code like every other call: a fault in it must
+        // name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "render");
         // SAFETY: the module lives in the mapped plugin's static data, which
         // the retained mapping keeps alive.
         unsafe { crate::vis::render_vis_frame(module) }
@@ -1077,16 +1095,22 @@ impl LoadedPlugin {
                 };
                 (entry.module, self.host_hwnd, self.hinstance)
             }
-            _ => return Err(DspError::WrongKind(self.kind)),
+            _ => return Err(DspError::WrongKind(self.kind())),
         };
         // S09 §6.3 step 2: only one DSP module is active at a time, so the
         // module that was active before is quit when the selection changes.
+        // That module belongs to the plugin that was running, not to this one,
+        // so no fault scope names this plugin here: a fault in that other
+        // plugin's `quit` is reported without a name rather than with the
+        // wrong one.
         crate::dsp::stop_active_dsp_module();
         // SAFETY: the module lives in the mapped plugin's static data, which
         // the retained mapping keeps alive; `init` runs on this thread, which
         // owns the host window.
-        let Some(init) = (unsafe { crate::dsp::init_dsp_module(module, host_hwnd, hinstance) })
-        else {
+        let Some(init) = ({
+            let _scope = plugin_call_scope(&self.identity, "init");
+            unsafe { crate::dsp::init_dsp_module(module, host_hwnd, hinstance) }
+        }) else {
             return Err(DspError::NotRunning);
         };
         if init.init_result != 0 {
@@ -1138,6 +1162,9 @@ impl LoadedPlugin {
                 }
                 let frames = pcm.len() / channels;
                 pcm.resize(pcm.len() * 2, 0);
+                // `process` is plugin code like every other call: a fault in it
+                // must name this plugin.
+                let _scope = plugin_call_scope(&self.identity, "process");
                 // SAFETY: the buffer holds twice `frames * channels` samples and the
                 // callback runs the active module synchronously on this thread.
                 let out = unsafe {
@@ -1170,8 +1197,7 @@ impl LoadedPlugin {
         init_result: core::ffi::c_int,
     ) -> Self {
         Self {
-            path: PathBuf::from(name),
-            kind: PluginKind::General,
+            identity: PluginIdentity::new(Path::new(name), PluginKind::General),
             hinstance: core::ptr::null_mut(),
             host_hwnd: 0,
             description: name.to_string(),
@@ -1192,8 +1218,7 @@ impl LoadedPlugin {
     #[cfg(test)]
     pub(crate) fn output_for_test(name: &str, module: *mut OutModule, init_called: bool) -> Self {
         Self {
-            path: PathBuf::from(name),
-            kind: PluginKind::Output,
+            identity: PluginIdentity::new(Path::new(name), PluginKind::Output),
             hinstance: core::ptr::null_mut(),
             host_hwnd: 0,
             description: name.to_string(),
@@ -1219,8 +1244,7 @@ impl LoadedPlugin {
         host_hwnd: usize,
     ) -> Self {
         Self {
-            path: PathBuf::from(name),
-            kind: PluginKind::Visualization,
+            identity: PluginIdentity::new(Path::new(name), PluginKind::Visualization),
             hinstance: core::ptr::null_mut(),
             host_hwnd,
             description: name.to_string(),
@@ -1248,8 +1272,7 @@ impl LoadedPlugin {
         host_hwnd: usize,
     ) -> Self {
         Self {
-            path: PathBuf::from(name),
-            kind: PluginKind::Dsp,
+            identity: PluginIdentity::new(Path::new(name), PluginKind::Dsp),
             hinstance: core::ptr::null_mut(),
             host_hwnd,
             description: name.to_string(),
@@ -1269,8 +1292,7 @@ impl LoadedPlugin {
     #[cfg(test)]
     pub(crate) fn unsupported_for_test(kind: PluginKind) -> Self {
         Self {
-            path: PathBuf::from("unsupported"),
-            kind,
+            identity: PluginIdentity::new(Path::new("unsupported"), kind),
             hinstance: core::ptr::null_mut(),
             host_hwnd: 0,
             description: String::new(),
@@ -1554,10 +1576,15 @@ unsafe fn load_input_module(
     proc_ptr: *mut core::ffi::c_void,
     host_hwnd: usize,
 ) -> Result<LoadedPlugin, PluginLoadError> {
+    let identity = PluginIdentity::new(&path, PluginKind::Input);
     // S09 §1 line 38, §2 line 56: cdecl, no arguments, returns *mut InModule.
     type InGetModuleFn = unsafe extern "C" fn() -> *mut InModule;
     let get_module: InGetModuleFn = unsafe { core::mem::transmute(proc_ptr) };
-    let module_ptr = unsafe { get_module() };
+    // The getter is plugin code: a fault in it must name this plugin.
+    let module_ptr = {
+        let _scope = plugin_call_scope(&identity, "get module");
+        unsafe { get_module() }
+    };
     if module_ptr.is_null() {
         return Err(PluginLoadError::NullModule);
     }
@@ -1603,6 +1630,7 @@ unsafe fn load_input_module(
 
     // Call init() (S09 §3.1 offset 0x24, §3.5 line 156).
     if let Some(init_fn) = unsafe { (*module_ptr).init } {
+        let _scope = plugin_call_scope(&identity, "init");
         unsafe { init_fn() };
     }
 
@@ -1612,8 +1640,7 @@ unsafe fn load_input_module(
     }
 
     Ok(LoadedPlugin {
-        path,
-        kind: PluginKind::Input,
+        identity,
         hinstance,
         host_hwnd,
         description,
@@ -1629,15 +1656,24 @@ unsafe fn load_dsp_module(
     proc_ptr: *mut core::ffi::c_void,
     host_hwnd: usize,
 ) -> Result<LoadedPlugin, PluginLoadError> {
+    let identity = PluginIdentity::new(&path, PluginKind::Dsp);
     // S09 §1 line 38, §2 line 59: cdecl getter returning the static DSP header.
     // In 2.x it takes no arguments; a 5.x main-window argument would be a
     // harmless extra under cdecl, so calling with none is correct either way (U-9).
     type DspGetHeaderFn = unsafe extern "C" fn() -> *mut DspHeader;
     let get_header: DspGetHeaderFn = unsafe { core::mem::transmute(proc_ptr) };
-    let header_ptr = unsafe { get_header() };
+    // The getter and the module list are plugin code: a fault in them must
+    // name this plugin.
+    let header_ptr = {
+        let _scope = plugin_call_scope(&identity, "get header");
+        unsafe { get_header() }
+    };
     // SAFETY: the header lives in the mapped plugin's static data; the
     // plugin's `get_module` runs here on the UI thread (S09 §6.3 step 1).
-    let modules = unsafe { crate::dsp::list_dsp_modules(header_ptr)? };
+    let modules = {
+        let _scope = plugin_call_scope(&identity, "list modules");
+        unsafe { crate::dsp::list_dsp_modules(header_ptr)? }
+    };
     // The description is read before any module runs, so a plugin that
     // rewrites its own pointer later cannot change what the host reported.
     // SAFETY: `list_dsp_modules` refused a null header, so it is live here.
@@ -1656,7 +1692,10 @@ unsafe fn load_dsp_module(
     let module = entry.module;
     // SAFETY: live module in the mapped plugin's static data; `init` runs on
     // the UI thread that owns the host window.
-    let Some(init) = (unsafe { crate::dsp::init_dsp_module(module, host_hwnd, hinstance) }) else {
+    let Some(init) = ({
+        let _scope = plugin_call_scope(&identity, "init");
+        unsafe { crate::dsp::init_dsp_module(module, host_hwnd, hinstance) }
+    }) else {
         return Err(PluginLoadError::NullModule);
     };
     // Own choice, not S09: §6.2 says "0 on success" and nothing more about a
@@ -1671,8 +1710,7 @@ unsafe fn load_dsp_module(
     crate::dsp::set_active_dsp_module(module);
 
     Ok(LoadedPlugin {
-        path,
-        kind: PluginKind::Dsp,
+        identity,
         hinstance,
         host_hwnd,
         description,
@@ -1694,10 +1732,15 @@ unsafe fn load_general_module(
     proc_ptr: *mut core::ffi::c_void,
     host_hwnd: usize,
 ) -> Result<LoadedPlugin, PluginLoadError> {
+    let identity = PluginIdentity::new(&path, PluginKind::General);
     // S09 §1 line 38, §2 line 60: cdecl, no arguments, returns *mut GeneralPlugin.
     type GenGetModuleFn = unsafe extern "C" fn() -> *mut GeneralPlugin;
     let get_module: GenGetModuleFn = unsafe { core::mem::transmute(proc_ptr) };
-    let module_ptr = unsafe { get_module() };
+    // The getter is plugin code: a fault in it must name this plugin.
+    let module_ptr = {
+        let _scope = plugin_call_scope(&identity, "get module");
+        unsafe { get_module() }
+    };
 
     // The description is read before init() so a plugin that rewrites its own
     // pointer during init cannot change what the host reported it as.
@@ -1710,11 +1753,13 @@ unsafe fn load_general_module(
     };
 
     // SAFETY: getter result from the approved mapped image; UI thread.
-    let init = unsafe { init_general_module(module_ptr, host_hwnd, hinstance) }?;
+    let init = {
+        let _scope = plugin_call_scope(&identity, "init");
+        unsafe { init_general_module(module_ptr, host_hwnd, hinstance) }?
+    };
 
     Ok(LoadedPlugin {
-        path,
-        kind: PluginKind::General,
+        identity,
         hinstance,
         host_hwnd,
         description,
@@ -1734,10 +1779,15 @@ unsafe fn load_output_module(
     proc_ptr: *mut core::ffi::c_void,
     host_hwnd: usize,
 ) -> Result<LoadedPlugin, PluginLoadError> {
+    let identity = PluginIdentity::new(&path, PluginKind::Output);
     // S09 §1 line 38, §2 line 57: cdecl, no arguments, returns *mut Out_Module.
     type OutGetModuleFn = unsafe extern "C" fn() -> *mut OutModule;
     let get_module: OutGetModuleFn = unsafe { core::mem::transmute(proc_ptr) };
-    let module_ptr = unsafe { get_module() };
+    // The getter is plugin code: a fault in it must name this plugin.
+    let module_ptr = {
+        let _scope = plugin_call_scope(&identity, "get module");
+        unsafe { get_module() }
+    };
     if module_ptr.is_null() {
         return Err(PluginLoadError::NullModule);
     }
@@ -1749,11 +1799,13 @@ unsafe fn load_output_module(
     let description = unsafe { read_c_string_lossy((*module_ptr).description) };
 
     // SAFETY: getter result from the approved mapped image; UI thread.
-    let init = unsafe { init_output_module(module_ptr, host_hwnd, hinstance) }?;
+    let init = {
+        let _scope = plugin_call_scope(&identity, "init");
+        unsafe { init_output_module(module_ptr, host_hwnd, hinstance) }?
+    };
 
     Ok(LoadedPlugin {
-        path,
-        kind: PluginKind::Output,
+        identity,
         hinstance,
         host_hwnd,
         description,
@@ -1772,16 +1824,25 @@ unsafe fn load_vis_module(
     proc_ptr: *mut core::ffi::c_void,
     host_hwnd: usize,
 ) -> Result<LoadedPlugin, PluginLoadError> {
+    let identity = PluginIdentity::new(&path, PluginKind::Visualization);
     // S09 §1 line 38, §2 line 58: cdecl getter returning the static
     // visualization header. In 2.x it takes no arguments; a 5.x main-window
     // argument would be a harmless extra under cdecl, so calling with none is
     // correct either way (U-9).
     type VisGetHeaderFn = unsafe extern "C" fn() -> *mut VisHeader;
     let get_header: VisGetHeaderFn = unsafe { core::mem::transmute(proc_ptr) };
-    let header_ptr = unsafe { get_header() };
+    // The getter and the module list are plugin code: a fault in them must
+    // name this plugin.
+    let header_ptr = {
+        let _scope = plugin_call_scope(&identity, "get header");
+        unsafe { get_header() }
+    };
     // SAFETY: the header lives in the mapped plugin's static data; the
     // plugin's `get_module` runs here on the UI thread (S09 §5.3 step 2).
-    let modules = unsafe { crate::vis::list_vis_modules(header_ptr)? };
+    let modules = {
+        let _scope = plugin_call_scope(&identity, "list modules");
+        unsafe { crate::vis::list_vis_modules(header_ptr)? }
+    };
     // The description is read before any module runs, so a plugin that
     // rewrites its own pointer later cannot change what the host reported.
     // SAFETY: `list_vis_modules` refused a null header, so it is live here.
@@ -1790,8 +1851,7 @@ unsafe fn load_vis_module(
     // No module is initialized yet: the user picks one, and the host starts
     // it then (S09 §5.3 step 1 and step 2).
     Ok(LoadedPlugin {
-        path,
-        kind: PluginKind::Visualization,
+        identity,
         hinstance,
         host_hwnd,
         description,

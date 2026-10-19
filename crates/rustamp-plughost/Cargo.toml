@@ -38,6 +38,14 @@ crate-type = ["cdylib"]
 name = "vis_rustamp_fixture"
 crate-type = ["cdylib"]
 
+# The clean-room crashing plugin fixture, for the crash-isolation acceptance
+# (PLAN M3: "restart the host on plugin crash"). It is a separate cdylib
+# artifact like the others, and it is the only fixture that faults on
+# purpose: it is never linked into the host or into a test binary.
+[[example]]
+name = "crash_rustamp_fixture"
+crate-type = ["cdylib"]
+
 # The clean-room DSP ("dsp_") plugin fixture, for the same reason: a separate
 # cdylib artifact that the acceptance test maps through the OS loader, never
 # linked into the host or into the test binary. It opens no window at all.
@@ -54,5 +62,11 @@ rustamp-proto.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

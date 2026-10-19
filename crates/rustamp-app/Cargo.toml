@@ -30,6 +30,10 @@ rustamp-platform.workspace = true
 rustamp-prefs.workspace = true
 rustamp-plugin-abi.workspace = true
 rustamp-library.workspace = true
+# The plugin host's own crate carries the host-death contract (the exit codes
+# the host uses and the restart policy the supervisor applies), so the two
+# processes cannot drift apart: see `rustamp-plughost::restart`.
+rustamp-plughost.workspace = true
 # The app owns the OS window and the event loop, so it drives `winit` and
 # `softbuffer` directly (the `rustamp-ui` presenter is a manual example and
 # drops the commands the machine emits).
@@ -43,7 +47,6 @@ serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rustamp-plughost.workspace = true
 # Capture side of the VM-only loopback test (`tests/loopback.rs`); already a
 # workspace dependency through `rustamp-output`, so nothing new is fetched.
 cpal.workspace = true
