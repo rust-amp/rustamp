@@ -18,9 +18,12 @@
 //!    changed, measured against the unprocessed copy;
 //! 5. `quit` runs and deactivates the module.
 //!
-//! The plugin's `config` callback is deliberately NOT invoked: for a DSP it
-//! opens a dialog, which this headless run must not do. "Configured" here means
-//! initialized with host fields set, in the plugin's default state.
+//! The plugin's `config` callback is deliberately NOT invoked by this test:
+//! for a DSP it opens a dialog, which this headless run must not do. The
+//! host does route the callback (S09 §6.2, offset 0x0C) — the clean-room
+//! fixture in `tests/dsp_fixture_acceptance.rs` proves that route with a
+//! `config` that opens no window. "Configured" here means initialized with
+//! host fields set, in the plugin's default state.
 //!
 //! Must refuse loudly (not skip silently) when the VM or the DLL is missing.
 //!
@@ -172,26 +175,39 @@ fn real_dsp_plugin_loads_initializes_and_changes_audio_through_the_bridge() {
         loaded.is_initialized(),
         "plugin must be marked initialized (init returned 0)"
     );
-    let info = loaded
+    let library = loaded
         .dsp_info()
-        .expect("a loaded DSP plugin must expose its module info");
-    println!("DSP module info: {info:?}");
+        .expect("a loaded DSP plugin must expose its library info");
+    println!("DSP library info: {library:?}");
+    assert_eq!(
+        library.version, 0x20,
+        "the header version must be 0x20 (S09 §6.1)"
+    );
+    assert!(
+        !library.modules.is_empty(),
+        "the module list must not be empty: {library:?}"
+    );
+    let info = &library.modules[0];
     assert!(
         info.has_init && info.has_process && info.has_quit,
         "module callbacks missing: {info:?}"
     );
+    let run = loaded
+        .dsp_run_info()
+        .expect("the active DSP module must report its state");
+    println!("DSP run info: {run:?}");
     assert_eq!(
-        info.parent_window,
+        run.parent_window,
         window.hwnd_raw(),
         "host must fill parent_window with the main window before init"
     );
     assert_eq!(
-        info.dll_instance,
+        run.dll_instance,
         loaded.hinstance() as usize,
         "host must fill dll_instance with the plugin's own module handle before init"
     );
     assert!(
-        info.host_active,
+        run.host_active,
         "dsp_is_active must answer 1 for the loaded module"
     );
 
@@ -261,10 +277,10 @@ fn real_dsp_plugin_loads_initializes_and_changes_audio_through_the_bridge() {
     // 8. Clean shutdown: quit runs and deactivates the module.
     loaded.quit();
     assert!(!loaded.is_initialized());
-    let after = loaded
-        .dsp_info()
-        .expect("module struct stays readable after quit");
-    assert!(!after.host_active, "dsp_is_active must read 0 after quit");
+    assert!(
+        loaded.dsp_run_info().is_none(),
+        "no DSP module is active after the quit, so dsp_is_active reads 0"
+    );
     assert_eq!(
         loaded.dsp_process_i16(&mut signal_block(0, 16), CHANNELS, SAMPLE_RATE),
         None,

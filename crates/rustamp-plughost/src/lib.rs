@@ -9,7 +9,10 @@
 //! `registry` is the control-channel routing around it. `vis` is the
 //! visualization (`vis_`) bridge: the module list of a library, the
 //! `init`/`render`/`quit` lifecycle of one of its modules and the host
-//! callbacks the running visualization answers. Neither the headless surface
+//! callbacks the running visualization answers. `dsp` is the DSP (`dsp_`)
+//! bridge: the module list of a library, the `init`/`process`/`quit`/`config`
+//! lifecycle of one of its modules and the `dsp_is_active`/`dsp_process` host
+//! callbacks the input plugin's decode loop uses. Neither the headless surface
 //! tests nor `pe_preflight` (which only inspects bytes and executes no image)
 //! are DLL acceptance: that is the VM-only Group D path, see
 //! `docs/tasks/P3-dll-acceptance.md` and `docs/tasks/W23-p3-acceptance.md`.
@@ -19,6 +22,7 @@
 pub mod approval;
 mod commands;
 pub mod control;
+pub mod dsp;
 pub mod host_window;
 pub mod ipc;
 pub mod loader;
@@ -33,11 +37,12 @@ pub use commands::{
     DROPPED, Disposition, PUBLIC_IDS, TABLE as WM_COMMAND_TABLE, command_for_id, disposition,
     drop_reason,
 };
+pub use dsp::{DspError, DspLibraryInfo, DspModuleInfo, DspRunInfo};
 pub use host_window::*;
 pub use ipc::*;
 pub use loader::{
-    DspModuleInfo, GeneralModuleInfo, LoadedPlugin, OutModuleInfo, PluginConfigError,
-    PluginLoadError, load_plugin, load_plugin_with_store,
+    GeneralModuleInfo, LoadedPlugin, OutModuleInfo, PluginConfigError, PluginLoadError,
+    load_plugin, load_plugin_with_store,
 };
 pub use message_loop::*;
 pub use registry::{PluginRegistry, RegistryConfigError, accept_loaded_kind};
