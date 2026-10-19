@@ -7,7 +7,9 @@
 //! The scenarios are driven by the crate's own [`Rng`]: no new dependency is
 //! needed, and every case is reproducible from the printed seed and step.
 
-use rustamp_playlist::{PlaybackOrder, Rng};
+use std::time::{Duration, Instant};
+
+use rustamp_playlist::{MAX_SKIP_STEPS, PlaybackOrder, Rng};
 
 /// Seed of the random scenario stream.
 const SEED: u64 = 0x5EED_2060_0000_0001;
@@ -756,6 +758,62 @@ fn a_length_change_never_keeps_a_stale_plan() {
                 order.set_len(new_len + 3);
                 assert_eq!(order.shuffle_plan().len(), new_len + 3);
                 assert_permutation(order.shuffle_plan(), new_len + 3, "the grown plan");
+            }
+        }
+    }
+}
+
+/// The delta a skip is clamped to: the documented bound in the direction of
+/// the delta.
+fn clamped_delta(delta: i32) -> i32 {
+    let bound = MAX_SKIP_STEPS as i32;
+    match delta {
+        d if d > bound => bound,
+        d if d < -bound => -bound,
+        d => d,
+    }
+}
+
+/// A delta from the wire cannot turn the walk into an unbounded loop.
+///
+/// The model clamps the number of steps to [`MAX_SKIP_STEPS`], so even the
+/// largest delta returns at once and lands where the clamped semantics say:
+/// exactly where the same walk of the clamped delta lands, with the same
+/// permutation and the same place in it (S15 §3.3).
+#[test]
+fn a_huge_delta_is_clamped_to_the_documented_bound() {
+    const LEN: usize = 7;
+    for shuffle in [true, false] {
+        for repeat in [true, false] {
+            for delta in [i32::MAX, i32::MIN, 3, -3] {
+                let mut clamped = PlaybackOrder::new(LEN, shuffle, repeat, 99);
+                clamped.set_current_index(Some(0));
+                let expected = clamped.skip_by(clamped_delta(delta));
+
+                let mut huge = PlaybackOrder::new(LEN, shuffle, repeat, 99);
+                huge.set_current_index(Some(0));
+                let started = Instant::now();
+                let answer = huge.skip_by(delta);
+                let elapsed = started.elapsed();
+
+                assert_eq!(
+                    answer, expected,
+                    "shuffle {shuffle}, repeat {repeat}, delta {delta}: the clamped walk lands somewhere else"
+                );
+                assert_eq!(
+                    huge.shuffle_plan(),
+                    clamped.shuffle_plan(),
+                    "shuffle {shuffle}, repeat {repeat}, delta {delta}: the clamped walk took another number of steps"
+                );
+                assert_eq!(
+                    huge.shuffle_pos(),
+                    clamped.shuffle_pos(),
+                    "shuffle {shuffle}, repeat {repeat}, delta {delta}: the clamped walk ended somewhere else in the permutation"
+                );
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "shuffle {shuffle}, repeat {repeat}, delta {delta}: the walk took {elapsed:?}"
+                );
             }
         }
     }

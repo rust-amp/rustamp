@@ -173,9 +173,8 @@
 //!
 //! Shuffle and repeat are **not** implemented here: the traversal order lives
 //! in one place, the [`PlaybackOrder`] model of `rustamp-playlist` (S15 §1–§4).
-//! The model owns the permutation, the repeat boundaries, the traversal
-//! history and the mid-run toggles; the engine drives it and publishes what
-//! it says.
+//! The model owns the permutation, the repeat boundaries and the mid-run
+//! toggles; the engine drives it and publishes what it says.
 //!
 //! One instance is shared by the engine and the decode thread: the thread
 //! that plays a track and the thread that answers "which track comes next"
@@ -364,9 +363,9 @@ pub struct Engine {
     /// refusing forever. This is the engine's own half of the recovery split;
     /// `flush_failure` is the caller's half (see [`Engine::is_flush_failed`]).
     stream_lost: bool,
-    /// The S15 playback order: the shuffle permutation, the repeat
-    /// boundaries and the traversal history. Shared with the decode thread,
-    /// which asks it for the next track (see the module docs).
+    /// The S15 playback order: the shuffle permutation and the repeat
+    /// boundaries. Shared with the decode thread, which asks it for the next
+    /// track (see the module docs).
     order: Arc<Mutex<PlaybackOrder>>,
     /// The queue changed while the order still describes the old one; the
     /// order is brought up to date when the engine owns it again.
@@ -550,10 +549,18 @@ impl Engine {
 
     /// Set the current queue index without starting playback.
     ///
-    /// The traversal order follows: in shuffle mode the permutation is
-    /// re-anchored at the track that was selected (S15 §4). While a run is
-    /// live the decode thread owns the traversal, so the running order is
-    /// left alone.
+    /// The traversal order follows: in shuffle mode the active permutation is
+    /// kept and the cursor moves into it, at the track that was selected
+    /// (S15 §4). The traversal continues behind that track, and the entries
+    /// before it in the permutation are deferred to the next cycle. The
+    /// permutation itself is not rebuilt here; a mode toggle or a playlist
+    /// mutation rebuilds it.
+    ///
+    /// The decode thread relies on that: it re-aligns its own place in a
+    /// permutation the engine re-planned (S15 §4.1) without disturbing it.
+    ///
+    /// While a run is live the decode thread owns the traversal, so the
+    /// running order is left alone.
     pub fn set_current_index(&mut self, index: Option<u32>) {
         self.sync_order_to_queue();
         self.current = index.filter(|&i| (i as usize) < self.queue.len());
@@ -1247,8 +1254,9 @@ impl Engine {
 
     /// Play the queue entry at `index`.
     ///
-    /// The traversal order follows: in shuffle mode the permutation is
-    /// re-anchored at the track that is about to play (S15 §4).
+    /// The traversal order follows: in shuffle mode the active permutation is
+    /// kept and the cursor moves into it, at the track that is about to play
+    /// (S15 §4). The traversal continues behind that track.
     pub fn play_index(&mut self, index: u32) -> Result<()> {
         if index as usize >= self.queue.len() {
             return Err(Error::NotFound(format!("queue index {index}")));
@@ -1276,8 +1284,8 @@ impl Engine {
                 return Ok(());
             }
             self.sync_order_to_queue();
-            // The model owns the traversal: it knows the permutation, the
-            // repeat boundary and the history (S15 §3.1).
+            // The model owns the traversal: it knows the permutation and the
+            // repeat boundary (S15 §3.1).
             let next = self.order().next_index();
             if let Some(target) = next {
                 return self.play_index(target as u32);
@@ -1295,7 +1303,7 @@ impl Engine {
                 return Ok(());
             }
             self.sync_order_to_queue();
-            // In shuffle mode this walks the history of the permutation, not
+            // In shuffle mode this walks back through the permutation, not
             // the playlist (S15 §3.2).
             let prev = self.order().prev_index();
             if let Some(target) = prev {
@@ -1310,6 +1318,10 @@ impl Engine {
     /// Move the current entry by `delta` positions in the order
     /// [`Engine::next_track`]/[`Engine::prev_track`] follow, clamped or wrapped
     /// according to the repeat mode (RFC 0005 `Command::SkipBy`, ids 40195 / 40197).
+    ///
+    /// The walk is bounded: the model clamps the number of steps to
+    /// [`MAX_SKIP_STEPS`](rustamp_playlist::MAX_SKIP_STEPS), so a delta that
+    /// arrives over the wire cannot spin the audio thread.
     pub fn skip_by(&mut self, delta: i32) -> Result<()> {
         if delta == 0 || self.queue.is_empty() {
             return Ok(());

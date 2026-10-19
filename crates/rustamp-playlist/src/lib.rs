@@ -39,7 +39,7 @@
 //! ## Deliberately out of scope
 //!
 //! * **Shuffle as a mode** (spec S15): [`order::PlaybackOrder`] is the pure,
-//!   in-memory traversal model (permutation, repeat boundaries, history, mid-run
+//!   in-memory traversal model (permutation, repeat boundaries, mid-run
 //!   toggles). The audio engine owns the live runtime instance, but this crate
 //!   provides the model and the one-shot reordering helpers ([`randomize`],
 //!   [`shuffle`]).
@@ -107,5 +107,5 @@ pub use io::{
     read_playlist_report_with_hint, read_playlist_with_hint, write_playlist,
 };
 pub use location::{Base, resolve_location};
-pub use order::{PlaybackOrder, randomize, randomize_with, shuffle, shuffled_ids};
+pub use order::{MAX_SKIP_STEPS, PlaybackOrder, randomize, randomize_with, shuffle, shuffled_ids};
 pub use rng::Rng;
