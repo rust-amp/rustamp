@@ -6,8 +6,16 @@
 //! block back, repeat — the producer and the consumer progress together, so
 //! the fixed 4096-frame back-ring never has to absorb the sweep without a
 //! reader, and a wedged helper fails loudly instead of hanging the test.
+//!
+//! The kill-the-host acceptance (the DSP half of M14 §4): the helper is
+//! terminated from the outside while it waits for the next block of the
+//! in-ring. The decoder path's kill is in the *write* direction, so the two
+//! paths are not evidence for each other (M14 L2).
 
 #![cfg(windows)]
+
+#[path = "support/frame_pattern.rs"]
+mod frame_pattern;
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -50,6 +58,15 @@ fn gain(factor: f32) -> DspStageDesc {
     DspStageDesc {
         id: "gain".into(),
         params: factor.to_le_bytes().to_vec(),
+    }
+}
+
+/// A chain that changes nothing, so the frames that come back are the
+/// frames that went in — the shared frame pattern stays visible.
+fn passthrough() -> DspStageDesc {
+    DspStageDesc {
+        id: "passthrough".into(),
+        params: Vec::new(),
     }
 }
 
@@ -161,4 +178,105 @@ fn host_exits_mid_stream_and_infinite_read_survives() {
     result
         .recv_timeout(Duration::from_secs(10))
         .expect("dead DSP host must not hang the player worker");
+}
+
+/// The kill-the-host acceptance for the DSP path: the helper is terminated
+/// from the outside while it waits for the next block of the in-ring.
+///
+/// The kill is a `TerminateProcess` from the parent: no clean exit, no
+/// terminal message, no ring close - the helper leaves no goodbye at all.
+/// The consumer must then report a loud, typed error - never a silent end
+/// of stream, never a hang - and every frame it did receive must be whole.
+///
+/// The DSP path has no end-of-stream marker (RFC 0006 §6): the end of the
+/// transfer is inferred from the frame counts, and the helper returned
+/// exactly as many frames as it was given. A closed back-ring would
+/// therefore look like a complete transfer, so the death has to be seen on
+/// the control channel first - that is what this test pins, and the
+/// decoder path cannot have it: `DecoderEos` is a marker message.
+#[test]
+#[ignore = "two processes; Hyper-V VM only; requires RUSTAMP_DSP_FIXTURE"]
+fn killing_the_dsp_helper_mid_stream_is_a_loud_error_and_never_a_torn_frame() {
+    // A one-frame in-ring, so the helper is inside its read wait when the
+    // kill lands: it has taken every frame the consumer wrote and waits
+    // for the next one.
+    let mut child = DspProcess::spawn(&fixture(), SPEC, vec![passthrough()], 1, LIVENESS).unwrap();
+    assert_ne!(child.pid(), std::process::id());
+    // The handshake is complete when spawn returns: the helper answered
+    // with its latency and both rings are live.
+    assert_eq!(child.session().latency_frames(), 0);
+
+    // A few frames through the chain while the helper waits for the next
+    // block.
+    let mut out = [0.0; 2];
+    let mut delivered = 0usize;
+    while delivered < 4 {
+        write_pcm(
+            child.session(),
+            &frame_pattern::frame_samples(delivered),
+            "the frames before the kill",
+        );
+        let frames = read_pcm(child.session(), &mut out, "the frames before the kill");
+        assert_eq!(frames, 1, "one frame per round trip");
+        assert_eq!(
+            out,
+            frame_pattern::frame_samples(delivered),
+            "frame {delivered} was torn, missing or out of order"
+        );
+        delivered += 1;
+    }
+
+    // Kill the helper from the outside, mid-stream.
+    child.terminate().unwrap();
+
+    // The consumer must now fail loudly: a typed error, never a silent end
+    // of stream and never a hang. The bounded read turns a hang into a
+    // loud failure that names the step, never into a pass.
+    loop {
+        match child.session().read(&mut out, Some(STALL_WAIT)) {
+            Ok(0) => panic!("the killed helper must not look like end of stream"),
+            Ok(frames) => {
+                // A frame that was still in flight is whole: a helper that
+                // dies mid-frame must not leave a torn one behind.
+                for chunk in out[..frames * 2].as_chunks::<2>().0 {
+                    assert_eq!(
+                        *chunk,
+                        frame_pattern::frame_samples(delivered),
+                        "frame {delivered} was torn, missing or out of order"
+                    );
+                    delivered += 1;
+                }
+            }
+            Err(MediaHostError::TimedOut) => panic!(
+                "stall: the resident stopped delivering without EOS or an error \
+                 (the killed helper was not noticed within {STALL_WAIT:?})"
+            ),
+            Err(error) => {
+                let MediaHostError::Disconnected(reason) = &error else {
+                    panic!("the killed helper must report a loud, typed error: {error}");
+                };
+                assert!(
+                    reason.contains("control stream ended"),
+                    "the death must be seen on the control channel: {error}"
+                );
+                break;
+            }
+        }
+    }
+
+    // The failure must stick: a later read may not turn into end of stream.
+    let again = match child.session().read(&mut out, Some(STALL_WAIT)) {
+        Ok(frames) => panic!(
+            "the failure must stick: the killed helper turned into end of stream ({frames} frames)"
+        ),
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(_) = &again else {
+        panic!("the failure must stick as the same loud error: {again}");
+    };
+    assert!(
+        delivered >= 4,
+        "the helper must have streamed before the kill, not died before it"
+    );
+    assert_eq!(child.session().frames_dropped(), 0);
 }

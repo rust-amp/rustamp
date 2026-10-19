@@ -19,9 +19,21 @@
 //! back-ring is a finished transfer or a truncated one. The scripted-host
 //! pair at the end of this file drives both sides of that rule with a
 //! healthy control channel, so nothing but the counts can tell them apart.
+//!
+//! The kill-the-host acceptance (the DSP half of M14 §4): the last two
+//! tests kill a helper that is blocked in *reading* the in-ring. The
+//! decoder path's kill is in the *write* direction, so the two paths are
+//! not evidence for each other (M14 L2). The difference that matters here
+//! is the end of the transfer: the DSP path has no `DecoderEos` marker, so
+//! a helper that dies after returning exactly as many frames as it was
+//! given leaves a back-ring that would look like a complete transfer. Only
+//! the death on the control channel keeps that from being an end of
+//! stream, and the fake helper pins exactly that.
 
 #![cfg(windows)]
 
+#[path = "support/frame_pattern.rs"]
+mod frame_pattern;
 #[path = "support/dsp_resident.rs"]
 mod resident;
 #[path = "support/streams.rs"]
@@ -853,4 +865,265 @@ fn a_complete_transfer_after_finished_writes_is_the_end_of_stream() {
     );
     release.send(()).unwrap();
     drop(session);
+}
+
+// ---------------------------------------------------------------------------
+// The kill-the-host acceptance: the helper dies while it waits for the
+// next block of the in-ring.
+// ---------------------------------------------------------------------------
+
+/// Blocks the fake helper takes from the in-ring before it stops draining
+/// it. The consumer wrote and read back exactly this many frames, so the
+/// two frame counts match at the moment of the death — the case in which a
+/// closed back-ring would look like a complete transfer.
+const KILL_BLOCKS: usize = 3;
+/// Capacity of the fake helper's back-ring. It has to hold every block the
+/// helper publishes, because the consumer reads them back.
+const KILL_BACK_RING: u32 = 8;
+
+/// A fake DSP helper that reads from the in-ring, publishes every block it
+/// read to the back-ring and then dies without a terminal message.
+///
+/// It speaks the raw wire on purpose: a `ControlPeer` would close the
+/// rings when it is dropped, and a killed helper leaves them open (RFC 0006
+/// §8: crash detection is the control channel's job). The helper reads
+/// exactly `blocks` blocks and then stops draining the in-ring — the state
+/// a kill lands in when the helper waits for the next block.
+fn dying_dsp_helper(
+    reader: streams::ByteReader,
+    writer: streams::ByteWriter,
+    blocks: usize,
+    back_capacity: u32,
+    killed: mpsc::Receiver<()>,
+) {
+    let mut transport = StreamTransport::new(reader, writer);
+    transport.send(&Message::hello()).unwrap();
+    let mut spec = None;
+    let (mut input, mut back) = loop {
+        match transport.recv().unwrap() {
+            Message::Hello { .. } => {}
+            Message::Ping(token) => transport.send(&Message::Pong(token)).unwrap(),
+            Message::DspConfigure {
+                spec: configured, ..
+            } => spec = Some(configured),
+            offer @ Message::RingOffer { .. } => {
+                let spec = spec.expect("the configure must come before the ring offer");
+                // The consumer's in-ring: the helper reads from it.
+                let opened = NamedPcmRings
+                    .open_directed(&offer, spec, RingDirection::MainToHost)
+                    .unwrap();
+                transport
+                    .send(&Message::RingReady {
+                        kind: RingKind::Pcm,
+                        generation: opened.consumer.generation(),
+                    })
+                    .unwrap();
+                // The helper's back-ring. The production order is the in-ring
+                // Ready first and the back-ring offer second (see `serve_dsp`
+                // and `DspSession::handshake`).
+                let created = NamedPcmRings
+                    .create_directed(spec, back_capacity, RingDirection::HostToMain)
+                    .unwrap();
+                let back_generation = created.producer.generation();
+                transport.send(&created.message).unwrap();
+                // The consumer's Ready for the back-ring.
+                let ready = loop {
+                    match transport.recv().unwrap() {
+                        Message::Ping(token) => transport.send(&Message::Pong(token)).unwrap(),
+                        Message::RingReady {
+                            kind: RingKind::Pcm,
+                            generation,
+                        } => break generation,
+                        message => {
+                            panic!("unexpected message while the back-ring is opened: {message:?}")
+                        }
+                    }
+                };
+                assert_eq!(
+                    ready, back_generation,
+                    "the consumer must ready the ring the helper offered"
+                );
+                transport
+                    .send(&Message::DspReady { latency_frames: 0 })
+                    .unwrap();
+                break (opened, created);
+            }
+            message => panic!("unexpected message: {message:?}"),
+        }
+    };
+    // The transfer: the helper takes every block from the in-ring and
+    // publishes it unchanged to the back-ring.
+    let mut buf = [0.0f32; 2];
+    for _ in 0..blocks {
+        let count = input
+            .consumer
+            .read_into_blocking(&mut buf, Some(STALL_WAIT))
+            .expect("stall: the fake helper never read a block");
+        back.producer
+            .write_from_blocking(&buf[..count * 2], Some(STALL_WAIT))
+            .expect("stall: the fake helper could not publish its block");
+    }
+    // The helper stops draining the in-ring and waits for the kill: from
+    // here on nobody reads the next block.
+    killed
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the test never killed the fake helper");
+    // The helper dies here: the control channel ends and both rings stay
+    // open. A killed process leaves exactly this behind.
+    drop(transport);
+    drop(input);
+    drop(back);
+}
+
+/// The consumer of a dead helper: the player side of a session whose
+/// helper has just been killed, plus the channel that kills it.
+fn dying_dsp_session() -> (DspSession<NamedPcmRings>, mpsc::Sender<()>) {
+    let ((ar, aw), (br, bw)) = streams::streams();
+    let peer = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let (kill, killed) = mpsc::channel();
+    thread::spawn(move || dying_dsp_helper(br, bw, KILL_BLOCKS, KILL_BACK_RING, killed));
+    let session = DspSession::open(peer, NamedPcmRings, SPEC, &[], 1).unwrap();
+    (session, kill)
+}
+
+/// A helper that dies mid-stream must leave the consumer with whole frames
+/// only, and then with a loud, typed error.
+///
+/// The fake helper reads the frames the consumer writes, publishes them
+/// unchanged and then vanishes without a terminal message and without
+/// closing its rings — a crash surrogate, the same shape as a helper that
+/// is killed from the outside. The consumer must receive exactly those
+/// frames, each whole and in order (a torn, missing or reordered frame
+/// breaks the shared frame pattern), and then report `Disconnected`: never
+/// a silent end of stream, never a hang. The failure must also stick: a
+/// later read may not turn into end of stream.
+///
+/// The DSP path has no end-of-stream marker (RFC 0006 §6): the end of the
+/// transfer is inferred from the frame counts. The helper returned exactly
+/// as many frames as it was given, so a closed back-ring would look like a
+/// complete transfer — the end of the stream is only avoided because the
+/// death is seen on the control channel first. That is the trap this test
+/// pins, and the decoder path cannot have it: `DecoderEos` is a marker.
+#[test]
+fn a_dead_dsp_helper_delivers_whole_frames_and_then_fails_loudly() {
+    let (mut session, kill) = dying_dsp_session();
+
+    // The frames that made the round trip: whole, in order and nothing else.
+    let mut out = [0.0; 2];
+    for index in 0..KILL_BLOCKS {
+        write_pcm(
+            &mut session,
+            &frame_pattern::frame_samples(index),
+            "the frames before the kill",
+        );
+        let frames = read_pcm(&mut session, &mut out, "the frames before the kill").unwrap();
+        assert_eq!(frames, 1, "one frame per round trip");
+        assert_eq!(
+            out,
+            frame_pattern::frame_samples(index),
+            "frame {index} was torn, missing or out of order"
+        );
+    }
+
+    // The helper dies: the control channel ends and the rings stay open.
+    kill.send(()).unwrap();
+
+    // The consumer must now fail loudly: a typed error, never a silent end
+    // of stream and never a hang.
+    let error = match session.read(&mut out, Some(STALL_WAIT)) {
+        Ok(0) => panic!("a dead DSP helper must not look like end of stream"),
+        Ok(frames) => panic!("a dead DSP helper must not deliver more frames ({frames})"),
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: the dead helper was not noticed within {STALL_WAIT:?} \
+             (the consumer waited for a frame that never came)"
+        ),
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(reason) = &error else {
+        panic!("a dead DSP helper must report a loud, typed error: {error}");
+    };
+    assert!(
+        reason.contains("control stream ended"),
+        "the death must be seen on the control channel: {error}"
+    );
+
+    // The failure must stick: a later read may not turn into end of stream.
+    let again = match session.read(&mut out, Some(STALL_WAIT)) {
+        Ok(frames) => panic!(
+            "the failure must stick: the dead helper turned into end of stream ({frames} frames)"
+        ),
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(_) = &again else {
+        panic!("the failure must stick as the same loud error: {again}");
+    };
+
+    // The write direction is the one the decoder path does not have: the
+    // consumer pushes frames into the in-ring. A dead helper never reads
+    // them, so the write must fail loudly too — never hang and never look
+    // like a delivered frame.
+    let frame = frame_pattern::frame_samples(KILL_BLOCKS);
+    let write_error = match session.write_timeout(&frame, Some(STALL_WAIT)) {
+        Ok(()) => panic!("a dead DSP helper must not accept a frame"),
+        Err(MediaHostError::TimedOut) => {
+            panic!("stall: the write waited for space that never came")
+        }
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(_) = &write_error else {
+        panic!("the write must fail with the same loud error: {write_error}");
+    };
+}
+
+/// The write direction of the kill: a frame that has to wait for space in
+/// the in-ring must be woken by the helper's death, not hang.
+///
+/// The helper stops draining the in-ring, so the ring fills up. The next
+/// write has to wait for space that never comes — the wait the decoder
+/// path does not have, because there the consumer never writes PCM. The
+/// death must end that wait with a loud, typed error.
+#[test]
+fn a_dead_dsp_helper_wakes_a_write_that_waits_for_space() {
+    let (mut session, kill) = dying_dsp_session();
+
+    // The frames that made the round trip.
+    let mut out = [0.0; 2];
+    for index in 0..KILL_BLOCKS {
+        write_pcm(
+            &mut session,
+            &frame_pattern::frame_samples(index),
+            "the frames before the kill",
+        );
+        read_pcm(&mut session, &mut out, "the frames before the kill").unwrap();
+    }
+    // One more frame fills the in-ring: the helper has stopped draining it,
+    // so nobody will ever read this one.
+    write_pcm(
+        &mut session,
+        &frame_pattern::frame_samples(KILL_BLOCKS),
+        "the frame that fills the in-ring",
+    );
+    // The helper dies with the in-ring full.
+    kill.send(()).unwrap();
+
+    // The next write has to wait for space. The death must wake it: a
+    // silent hang and a delivered frame are both wrong.
+    let error = match session.write_timeout(
+        &frame_pattern::frame_samples(KILL_BLOCKS + 1),
+        Some(STALL_WAIT),
+    ) {
+        Ok(()) => panic!("a dead DSP helper must not accept a frame"),
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: the dead helper was not noticed within {STALL_WAIT:?} \
+             (the write waited for space in a ring nobody reads)"
+        ),
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(reason) = &error else {
+        panic!("the blocked write must fail with a loud, typed error: {error}");
+    };
+    assert!(
+        reason.contains("control stream ended"),
+        "the death must be seen on the control channel: {error}"
+    );
 }
