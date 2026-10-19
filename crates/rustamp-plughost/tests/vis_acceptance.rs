@@ -264,7 +264,7 @@ fn a_real_visualization_plugin_is_loaded_listed_started_drawn_and_quit_cleanly()
         "a visualization is not running before a module is chosen"
     );
     assert_eq!(
-        loaded.vis_render(),
+        loaded.vis_render(None),
         Err(VisError::NotRunning),
         "no frame may be drawn before a module runs"
     );
@@ -307,12 +307,12 @@ fn a_real_visualization_plugin_is_loaded_listed_started_drawn_and_quit_cleanly()
 
     // 7. A frame: the arrays are zeroed, because no frame is available yet.
     assert_eq!(
-        loaded.vis_render().expect("a frame must be drawn"),
+        loaded.vis_render(None).expect("a frame must be drawn"),
         0,
         "0 means the visualization continues (S09 §5.2)"
     );
     assert_eq!(
-        loaded.vis_render().expect("a frame must be drawn"),
+        loaded.vis_render(None).expect("a frame must be drawn"),
         0,
         "0 means the visualization continues (S09 §5.2)"
     );
@@ -368,7 +368,7 @@ fn a_real_visualization_plugin_is_loaded_listed_started_drawn_and_quit_cleanly()
         "a refused start must leave no visualization running"
     );
     assert_eq!(
-        loaded.vis_render(),
+        loaded.vis_render(None),
         Err(VisError::NotRunning),
         "no frame may be drawn after a refused start"
     );
@@ -377,7 +377,7 @@ fn a_real_visualization_plugin_is_loaded_listed_started_drawn_and_quit_cleanly()
     loaded
         .vis_start(0)
         .expect("the first module must start again");
-    assert_eq!(loaded.vis_render().expect("a frame must be drawn"), 0);
+    assert_eq!(loaded.vis_render(None).expect("a frame must be drawn"), 0);
     loaded.quit();
     assert!(!loaded.is_initialized());
     let trace =

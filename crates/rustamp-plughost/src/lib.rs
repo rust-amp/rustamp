@@ -13,11 +13,12 @@
 //! writes the selected output plugin into the input module before `play`, and
 //! it records the end-of-track notification an input plugin posts. `vis` is the
 //! visualization (`vis_`) bridge: the module list of a library, the
-//! `init`/`render`/`quit` lifecycle of one of its modules and the host
-//! callbacks the running visualization answers. `dsp` is the DSP (`dsp_`)
-//! bridge: the module list of a library, the `init`/`process`/`quit`/`config`
-//! lifecycle of one of its modules and the `dsp_is_active`/`dsp_process` host
-//! callbacks the input plugin's decode loop uses. Neither the headless surface
+//! `init`/`render`/`quit` lifecycle of one of its modules, the state of the
+//! render loop the host drives ([`vis::VisLoop`]) and the host callbacks the
+//! running visualization answers. `dsp` is the DSP (`dsp_`) bridge: the
+//! module list of a library, the `init`/`process`/`quit`/`config` lifecycle of
+//! one of its modules and the `dsp_is_active`/`dsp_process` host callbacks the
+//! input plugin's decode loop uses. Neither the headless surface
 //! tests nor `pe_preflight` (which only inspects bytes and executes no image)
 //! are DLL acceptance: that is the VM-only Group D path, see
 //! `docs/tasks/P3-dll-acceptance.md` and `docs/tasks/W23-p3-acceptance.md`.
@@ -64,4 +65,6 @@ pub use message_loop::*;
 pub use registry::{PluginRegistry, RegistryConfigError, accept_loaded_kind};
 pub use restart::{CrashLedger, HostExit, RestartDecision, RestartPolicy, classify_exit};
 pub use rustamp_plugin_abi::common;
-pub use vis::{VisError, VisLibraryInfo, VisModuleInfo, VisRunInfo};
+pub use vis::{
+    VisError, VisLibraryInfo, VisLoop, VisModuleInfo, VisPlayback, VisRows, VisRunInfo, VisStep,
+};
