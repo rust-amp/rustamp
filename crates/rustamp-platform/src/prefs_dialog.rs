@@ -377,7 +377,7 @@ fn plugin_page(caption: &'static str, hint: &'static str) -> Vec<Item> {
 /// Hint under every plug-in page's caption. The approval gate and the fact
 /// that nothing is loaded at startup yet are stated, not implied.
 const PLUGIN_HINT: &str = "Only approved plug-ins can be switched on. \
-    Your choice is saved, but the player does not load plug-ins at startup yet.";
+    The plug-ins you switch on are loaded when the plugin host starts.";
 
 /// What `node`'s page contains.
 pub fn page_items(node: PrefsNode) -> Vec<Item> {
@@ -2022,10 +2022,13 @@ mod tests {
     }
 
     #[test]
-    fn the_plugin_hint_states_the_approval_gate_and_that_nothing_loads_yet() {
+    fn the_plugin_hint_states_the_approval_gate_and_the_startup_load() {
         let hint = PLUGIN_HINT;
         assert!(hint.contains("approved"), "{hint}");
-        assert!(hint.contains("does not load plug-ins"), "{hint}");
+        assert!(
+            hint.contains("loaded when the plugin host starts"),
+            "{hint}"
+        );
     }
 
     #[test]
