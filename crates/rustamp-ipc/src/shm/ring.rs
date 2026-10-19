@@ -28,6 +28,21 @@
 //! fixed here (`docs/tasks/W19-ring-wake-root.md`). The RFC's own escape clause
 //! is this rule: unconditional signalling "costs one extra `SetEvent` per
 //! advance and is always correct".
+//!
+//! # The reset rule (RFC 0007 §5.3)
+//!
+//! A ring that is **reset** — the creator re-creates the section, so the
+//! generation moves on — signals the wake once, in both directions. The peers
+//! of the old generation are waiting on the same event objects when the
+//! section and its events are reused, and they have to learn that the
+//! generation moved on: RFC 0007 §5.3 ends such a wait with
+//! `RingError::Stale`. Without the signal they would wait for their whole
+//! timeout, and an unbounded wait (`timeout: None`) would never end.
+//!
+//! The reset is the *only* event that changes the ring's identity, so it is
+//! the only one that has to say so out loud. Everything else — a frame
+//! written, a frame read, a close — is already visible in the counters or in
+//! the state, and the waiter re-reads them after every wake.
 
 use core::sync::atomic::Ordering;
 use std::time::Duration;
@@ -226,6 +241,10 @@ pub struct RingProducer<R: MappedRegion> {
     region: R,
     meta: RingMeta,
     wake: Option<RingWake>,
+    /// This producer took over a section that already held a ring: the
+    /// generation moved on, so the peers of the old generation are stale and
+    /// have to be woken to notice (RFC 0007 §5.3).
+    replaced: bool,
 }
 
 /// The reading end of a ring. Single consumer only.
@@ -298,7 +317,6 @@ impl<R: MappedRegion> RingProducer<R> {
                 },
                 Ordering::Relaxed,
             );
-            (*h).generation.store(generation, Ordering::Relaxed);
             (*h).reserved0 = [0; 3];
             (*h).reserved1 = [0; 6];
             (*h).reserved2 = [0; 7];
@@ -306,6 +324,13 @@ impl<R: MappedRegion> RingProducer<R> {
             (*h).dropped_seq.store(0, Ordering::Relaxed);
             (*h).read_seq.store(0, Ordering::Relaxed);
             (*h).state.store(RING_STATE_LIVE, Ordering::Relaxed);
+            // The generation is stored last, with `Release`, and it publishes
+            // everything above it. That matters for the *reset* path: the
+            // magic never changes there, so a peer that waits on the ring and
+            // then re-reads the generation (RFC 0007 §5.3) has to see the new
+            // value and the restarted counters with it. The `Acquire` load in
+            // `validate_header` pairs with this store.
+            (*h).generation.store(generation, Ordering::Release);
             (*h).magic.store(RING_MAGIC, Ordering::Release);
         }
 
@@ -318,6 +343,7 @@ impl<R: MappedRegion> RingProducer<R> {
                 generation,
             },
             wake: None,
+            replaced: old_valid,
         })
     }
 
@@ -328,6 +354,7 @@ impl<R: MappedRegion> RingProducer<R> {
             region,
             meta,
             wake: None,
+            replaced: false,
         })
     }
 
@@ -335,8 +362,30 @@ impl<R: MappedRegion> RingProducer<R> {
     ///
     /// After this call the ring signals on every counter advance and supports
     /// the blocking methods. Called by the creator before sending `RingOffer`.
+    ///
+    /// If this producer **replaced** a ring — the creator re-created a section
+    /// that already held one, so the generation moved on — the attached wake is
+    /// signaled once, in both directions. The peers of the old generation are
+    /// waiting on the same event objects when the section and its events are
+    /// reused (RFC 0007 §5.3), and they must learn that the generation moved
+    /// on: the wake ends their wait, the re-check finds the new generation and
+    /// the wait ends with `RingError::Stale`. Without the signal they would
+    /// wait for their whole timeout, and an unbounded wait would never end.
+    ///
+    /// A peer whose event objects are *not* shared (a re-created ring gets new
+    /// names, RFC 0007 §5.3) cannot be reached this way; its timeout ends the
+    /// wait with `RingError::Stale` as well.
     pub fn with_wake(mut self, wake: RingWake) -> Self {
         self.wake = Some(wake);
+        if self.replaced
+            && let Some(wake) = &self.wake
+        {
+            // The generation was already stored (with `Release`) before
+            // this call, so a peer that wakes on this signal sees the new
+            // generation and the restarted counters.
+            let _ = wake.signal(Wake::Data);
+            let _ = wake.signal(Wake::Space);
+        }
         self
     }
 
@@ -2566,6 +2615,160 @@ mod tests {
             ),
             "a wait on a stale ring must report Stale"
         );
+    }
+
+    /// A PCM ring whose wake a later creator can also hold, so the "the
+    /// creator replaced the ring" case can be driven: the peers of the old
+    /// generation wait on the same event objects (RFC 0007 §5.3) and have to
+    /// be woken when the generation moves on.
+    ///
+    /// The wake is handed on by clone, which is the same kernel object that
+    /// `RingWake::open` on a reused name yields on Windows, and the same
+    /// latch the in-process backend shares on every platform.
+    fn pcm_ring_with_reusable_wake(
+        capacity: u32,
+        channels: u32,
+    ) -> (
+        RingProducer<AnonymousRegion>,
+        RingConsumer<AnonymousRegion>,
+        AnonymousRegion,
+        RingWake,
+    ) {
+        let frame_size = channels * 4;
+        let region = region_for(frame_size, capacity);
+        let producer =
+            RingProducer::create(region.clone(), RingKind::Pcm, frame_size, capacity).unwrap();
+        let wake = RingWake::create(&ring_name(RingKind::Pcm, producer.generation())).unwrap();
+        let producer = producer.with_wake(wake.clone());
+        let consumer = RingConsumer::attach(region.clone(), producer.expect())
+            .unwrap()
+            .with_wake(wake.clone());
+        (producer, consumer, region, wake)
+    }
+
+    /// How long the woken peer may take to report the new generation. The
+    /// wake is a `SetEvent`, so the peer is up in microseconds; the bound only
+    /// decides how fast a regression fails.
+    const RESET_WAKE_WAIT: Duration = Duration::from_secs(2);
+
+    /// How long the peer is given to reach its kernel wait before the ring is
+    /// reset.
+    ///
+    /// The peer cannot *prove* that it is asleep: the only way to see a
+    /// waiter is to wake it, and a wake would let it re-check the counters
+    /// on its own — which is exactly the thing under test. So the peer
+    /// announces that it is about to block, and the test gives it time to get
+    /// there. A peer that is still on its way would report the new
+    /// generation from its first counter check, so the wait below is a
+    /// *false pass* at worst, never a false failure.
+    const RESET_SETTLE: Duration = Duration::from_millis(50);
+
+    /// A ring that is **reset** — the creator re-creates the section, so the
+    /// generation moves on — wakes the peer that is blocked in an empty-ring
+    /// read (RFC 0007 §5.3).
+    ///
+    /// Before the fix the peer waited for its whole timeout and only then
+    /// noticed that its ring was gone; with `timeout: None` it would have
+    /// waited forever. The wake ends the wait, the re-check finds the new
+    /// generation, and the wait ends with `RingError::Stale` — the outcome the
+    /// wait state machine already defines (RFC 0007 §6.1).
+    #[test]
+    fn a_reset_wakes_a_blocked_reader() {
+        const CHANNELS: u32 = 2;
+        let (_producer, consumer, region, wake) = pcm_ring_with_reusable_wake(4, CHANNELS);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut consumer = consumer;
+            let mut out = [0.0f32; 4];
+            let _ = started_tx.send(());
+            let result = consumer.read_into_blocking(&mut out, TEST_WAIT);
+            let _ = result_tx.send(result);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the reader never started");
+        // The reader is blocked in an empty-ring read before the reset.
+        std::thread::sleep(RESET_SETTLE);
+
+        // The creator replaces the ring: the generation moves on and the
+        // counters restart.
+        let _second = RingProducer::create(region, RingKind::Pcm, CHANNELS * 4, 4)
+            .unwrap()
+            .with_wake(wake);
+
+        // The blocked reader must wake and report the stale generation, long
+        // before its own timeout would have expired.
+        let result = result_rx
+            .recv_timeout(RESET_WAKE_WAIT)
+            .expect("the blocked reader was not woken by the reset");
+        assert!(
+            matches!(result, Err(RingError::Stale { .. })),
+            "a reset must end the wait with the stale generation, got {result:?}"
+        );
+        reader.join().unwrap();
+    }
+
+    /// The same hole on the other side of the ring: a producer that waits for
+    /// space on a full ring is woken by a reset as well, and reports the
+    /// stale generation instead of writing into the ring that took its place.
+    #[test]
+    fn a_reset_wakes_a_blocked_writer() {
+        const CHANNELS: u32 = 2;
+        let (mut producer, _consumer, region, wake) = pcm_ring_with_reusable_wake(1, CHANNELS);
+        // Fill the ring: the writer below has to wait for space.
+        producer.write_from(&[1.0f32, -1.0]).unwrap();
+        assert_eq!(producer.free_frames(), 0, "the ring is full");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut producer = producer;
+            let _ = started_tx.send(());
+            let result = producer.write_from_blocking(&[2.0f32, -2.0], TEST_WAIT);
+            let _ = result_tx.send(result);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the writer never started");
+        // The writer is blocked on a full ring before the reset.
+        std::thread::sleep(RESET_SETTLE);
+
+        // The creator replaces the ring while the writer waits for space.
+        let _second = RingProducer::create(region, RingKind::Pcm, CHANNELS * 4, 1)
+            .unwrap()
+            .with_wake(wake);
+
+        let result = result_rx
+            .recv_timeout(RESET_WAKE_WAIT)
+            .expect("the blocked writer was not woken by the reset");
+        assert!(
+            matches!(result, Err(RingError::Stale { .. })),
+            "a reset must end the wait with the stale generation, got {result:?}"
+        );
+        writer.join().unwrap();
+    }
+
+    /// The peers of the old generation are gone; the new generation is a
+    /// normal ring again: a read/write cycle over it delivers every frame
+    /// exactly once, in order, with no drop.
+    #[test]
+    fn a_reset_leaves_the_new_generation_usable() {
+        const CHANNELS: u32 = 2;
+        let (_producer, _consumer, region, wake) = pcm_ring_with_reusable_wake(4, CHANNELS);
+        let mut second = RingProducer::create(region.clone(), RingKind::Pcm, CHANNELS * 4, 4)
+            .unwrap()
+            .with_wake(wake.clone());
+        let mut consumer = RingConsumer::attach(region, second.expect())
+            .unwrap()
+            .with_wake(wake);
+
+        assert_eq!(second.write_from(&[1.0f32, -1.0, 2.0f32, -2.0]).unwrap(), 2);
+        let mut out = [0.0f32; 4];
+        assert_eq!(consumer.read_into(&mut out).unwrap(), 2);
+        assert_eq!(out, [1.0, -1.0, 2.0, -2.0]);
+        assert_eq!(second.frames_dropped(), 0);
+        assert_eq!(consumer.frames_read(), 2);
     }
 
     /// A blocked write that runs out of time writes nothing and drops nothing
