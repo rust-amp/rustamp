@@ -41,6 +41,9 @@
 //!   library window: the columns, their widths in text cells and the row
 //!   lines as text. The library window is a modern (unskinned) window, so no
 //!   skin is involved.
+//! * [`library_render::render_library_window`] paints the media library's
+//!   content - the column titles, the rows, the selection and the status
+//!   line - into a frame, with the modern window's own palette.
 //! * [`shell::skinned_window_attributes`] is the single place that decides
 //!   what an OS window looks like outside its client area: every window of
 //!   this player is borderless, because its title bar is part of the skin.
@@ -64,6 +67,7 @@ pub use docking as windows;
 pub mod layout;
 pub mod library;
 pub mod library_layout;
+pub mod library_render;
 pub mod menu;
 pub mod playlist;
 mod playlist_font;
@@ -114,6 +118,11 @@ pub use library::{LibraryColumn, LibraryRequest, LibraryRow, LibrarySort, Librar
 pub use library_layout::{
     LIBRARY_COLUMN_GAP, LIBRARY_COLUMN_TITLES, LIBRARY_COLUMN_WIDTHS, LIBRARY_COLUMNS,
     LIBRARY_MIN_TITLE_WIDTH, LibraryLayout, format_duration,
+};
+pub use library_render::{
+    LIBRARY_CELL_WIDTH, LIBRARY_FONT_FAMILY, LIBRARY_HEADER_TEXT, LIBRARY_LINE_HEIGHT,
+    LIBRARY_PANEL_BACKGROUND, LIBRARY_ROW_TEXT, LIBRARY_SELECTION, LIBRARY_SELECTION_TEXT,
+    LIBRARY_SEPARATOR, LIBRARY_STATUS_TEXT, LIBRARY_WINDOW_BACKGROUND, render_library_window,
 };
 pub use menu::{
     CHECK_CELL_X, CLUTTER_O_POINT, CLUTTER_V_POINT, MAIN_MENU, MAIN_MENU_CLASS,
