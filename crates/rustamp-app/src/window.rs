@@ -383,6 +383,9 @@ fn apply_first_start_scale(app: &mut App) {
 
 struct Windowed {
     app: App,
+    /// Removed before the owning HWND; native callbacks never borrow App.
+    #[cfg(windows)]
+    external_control: Option<crate::external_control::native::ExternalControl>,
     /// Declared before the window/surfaces so its Drop removes the icon and
     /// callback while the owning HWND is still alive (F3/F5).
     #[cfg(windows)]
@@ -452,6 +455,8 @@ impl Windowed {
         let stack = Self::restore_stack(&app);
         Self {
             app,
+            #[cfg(windows)]
+            external_control: None,
             #[cfg(windows)]
             tray: None,
             window: None,
@@ -1518,6 +1523,15 @@ impl Windowed {
     ) -> WindowAttributes {
         let attributes =
             rustamp_ui::shell::skinned_window_attributes(title, size, window.taskbar_role());
+        #[cfg(windows)]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows as _;
+            if window == PresenterWindow::Main {
+                attributes.with_class_name("Winamp v1.x")
+            } else {
+                attributes
+            }
+        };
         match position {
             Some((x, y)) => attributes.with_position(PhysicalPosition::new(x, y)),
             None => attributes,
@@ -1882,6 +1896,16 @@ impl ApplicationHandler for Windowed {
         }
         #[cfg(windows)]
         self.attach_tray();
+        #[cfg(windows)]
+        if let Some(window) = &self.window {
+            match crate::external_control::native::ExternalControl::attach(
+                Arc::clone(window),
+                self.app.host_player_state(),
+            ) {
+                Ok(control) => self.external_control = Some(control),
+                Err(error) => eprintln!("rustamp: external control unavailable: {error}"),
+            }
+        }
         self.sync_window_state();
         self.sync_eq_window(event_loop);
         self.request_redraw();
@@ -2012,6 +2036,10 @@ impl ApplicationHandler for Windowed {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(windows)]
+        if let Some(control) = &self.external_control {
+            control.drain(&mut self.app);
+        }
         // Command lines a second launch handed over (F2) are applied here, on
         // the UI thread, through the same command path the menu uses.
         for request in single_instance::take_pending() {
@@ -2033,6 +2061,10 @@ impl ApplicationHandler for Windowed {
         self.app.drive_null_clock();
         if let Err(error) = self.app.pump() {
             eprintln!("rustamp: pump failed: {error}");
+        }
+        #[cfg(windows)]
+        if let Some(control) = &self.external_control {
+            control.publish(self.app.host_player_state());
         }
         for note in self.app.drain_notes() {
             eprintln!("rustamp: {note}");
@@ -2076,6 +2108,7 @@ impl ApplicationHandler for Windowed {
         // Remove the icon/callback before winit tears down the owning HWND.
         #[cfg(windows)]
         {
+            self.external_control = None;
             self.tray = None;
         }
     }
