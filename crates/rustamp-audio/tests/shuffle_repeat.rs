@@ -6,6 +6,12 @@
 //! 3. Manual advance (Next, Prev, SkipBy) under each mode
 //! 4. Mid-run toggling of shuffle and repeat
 //! 5. Single-entry queue behavior
+//!
+//! The traversal itself is the [`rustamp_playlist::PlaybackOrder`] model's
+//! job; these tests pin what the *engine* does with it: that the engine asks
+//! the model for the next track, that the published permutation is the one
+//! that is traversed, and that the published modes are the ones the model
+//! holds.
 
 mod common;
 
@@ -23,6 +29,29 @@ const LONG_A: &str = "track1_44100.tst";
 const LONG_B: &str = "track2_44100.tst";
 const LONG_C: &str = "track3_44100.tst";
 const LONG_D: &str = "track4_44100.tst";
+
+/// Frames a manual advance may consume before the test gives up.
+///
+/// The long tracks are a second long, and the ring holds a fraction of that,
+/// so a track cannot end — and the automatic advance cannot happen — within
+/// this budget. What the test sees is therefore the *manual* advance.
+const MANUAL_BUDGET: u64 = 8192;
+
+/// Wait until the engine's current track is `index`, pumping at most
+/// [`MANUAL_BUDGET`] frames.
+fn wait_manual_advance(h: &mut Harness, index: u32) -> bool {
+    let mut pumped = 0u64;
+    while pumped <= MANUAL_BUDGET {
+        h.engine.poll().unwrap();
+        if h.engine.current_index() == Some(index) {
+            return true;
+        }
+        h.clock.pump(256);
+        pumped += 256;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
+}
 
 #[test]
 fn mode_sequential_no_repeat_queue_end() {
@@ -392,12 +421,12 @@ fn shuffle_repeat_prev_across_cycle_boundary() {
     // S15 §3.2 requires jumping to the last track of cycle 1 (plan1[2])!
     h.engine.prev_track().unwrap();
     assert!(h.wait_pumping(
-        |e| e.current_index() == Some(plan1[2] as u32) && e.shuffle_plan() == &plan1[..],
+        |e| e.current_index() == Some(plan1[2] as u32) && e.shuffle_plan() == plan1,
         WAIT
     ));
     assert_eq!(
         h.engine.shuffle_plan(),
-        &plan1[..],
+        plan1,
         "shuffle plan must be restored to cycle 1"
     );
 }
@@ -538,4 +567,162 @@ fn regression_single_track_repeat_toggle_during_drain() {
         |e| e.transport() == TransportState::Playing && e.current_index() == Some(0),
         WAIT
     ));
+}
+
+// --- The engine drives the S15 order model ---
+
+/// The permutation the engine publishes is the permutation the traversal
+/// follows (S15 §1.1, §3.1): the engine asks the model for the next track
+/// instead of computing an index of its own.
+#[test]
+fn shuffle_traversal_follows_the_published_plan() {
+    let mut h = Harness::new(&[LONG_A, LONG_B, LONG_C, LONG_D]);
+    h.engine.set_shuffle_seed(2024);
+    h.engine.set_shuffle(true).unwrap();
+    h.engine.set_repeat(false).unwrap();
+
+    let plan = h.engine.shuffle_plan();
+    assert_eq!(plan.len(), 4);
+    let mut sorted = plan.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![0, 1, 2, 3], "the plan is a permutation");
+    assert_ne!(plan, vec![0, 1, 2, 3], "the plan is not the queue order");
+
+    h.engine.play().unwrap();
+    assert!(
+        h.wait_track(plan[0] as u32),
+        "the first entry of the permutation plays first"
+    );
+
+    for want in plan.iter().skip(1) {
+        h.engine.next_track().unwrap();
+        let want = *want as u32;
+        assert!(
+            wait_manual_advance(&mut h, want),
+            "the manual advance must follow the permutation to {want}"
+        );
+    }
+}
+
+/// Repeat changes the order the engine selects: at the end of the queue the
+/// run ends without it (S15 §2) and wraps to the first track with it
+/// (S15 §3.1).
+#[test]
+fn repeat_changes_the_live_selection_at_the_queue_end() {
+    // Without repeat the run ends at the last track.
+    {
+        let mut h = Harness::new(&[LONG_A, LONG_B]);
+        h.engine.set_shuffle(false).unwrap();
+        h.engine.set_repeat(false).unwrap();
+
+        h.engine.play_index(0).unwrap();
+        assert!(h.wait_track(0));
+        h.engine.next_track().unwrap();
+        assert!(h.wait_track(1));
+
+        h.engine.next_track().unwrap();
+        assert!(
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+            "the run must end at the queue end without repeat"
+        );
+        let events = h.drain_events();
+        assert!(
+            events.contains(&Event::PlaylistEnded),
+            "the run must publish PlaylistEnded: {events:?}"
+        );
+    }
+
+    // With repeat the traversal wraps to the first track.
+    {
+        let mut h = Harness::new(&[LONG_A, LONG_B]);
+        h.engine.set_shuffle(false).unwrap();
+        h.engine.set_repeat(true).unwrap();
+
+        h.engine.play_index(0).unwrap();
+        assert!(h.wait_track(0));
+        h.engine.next_track().unwrap();
+        assert!(h.wait_track(1));
+
+        h.engine.next_track().unwrap();
+        assert!(
+            wait_manual_advance(&mut h, 0),
+            "repeat must wrap the manual advance to the first track"
+        );
+    }
+}
+
+/// A shuffle toggle mid-run re-plans the permutation around the track that
+/// is playing, and the traversal follows the new plan (S15 §4.1).
+#[test]
+fn a_mid_run_shuffle_toggle_is_honoured() {
+    let mut h = Harness::new(&[LONG_A, LONG_B, LONG_C, LONG_D]);
+    h.engine.set_shuffle(false).unwrap();
+    h.engine.set_repeat(false).unwrap();
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    // Nothing has been consumed yet, so track 0 is the audible one.
+    assert_eq!(h.engine.audible_index(), Some(0));
+
+    h.engine.set_shuffle(true).unwrap();
+    // The published state follows the model, so the light and the traversal
+    // cannot disagree.
+    assert!(h.engine.shuffle());
+    assert!(h.engine.state().shuffle);
+
+    let plan = h.engine.shuffle_plan();
+    assert_eq!(plan.len(), 4);
+    assert_eq!(
+        plan[0], 0,
+        "the new permutation is anchored at the audible track"
+    );
+    assert_ne!(
+        plan,
+        vec![0, 1, 2, 3],
+        "the new permutation is shuffled, not the queue order"
+    );
+    let mut sorted = plan.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, vec![0, 1, 2, 3], "the new plan is a permutation");
+
+    h.engine.next_track().unwrap();
+    let want = plan[1] as u32;
+    assert!(
+        wait_manual_advance(&mut h, want),
+        "the manual advance must follow the new permutation to {want}"
+    );
+}
+
+/// A single track with repeat on loops: the same track plays again and the
+/// run never ends (S15 §6.1).
+#[test]
+fn repeat_of_one_loops_the_same_track() {
+    let mut h = Harness::new(&[SHORT_A]);
+    h.engine.set_shuffle(false).unwrap();
+    h.engine.set_repeat(true).unwrap();
+
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    let len = track_frames(SHORT_A);
+    // The decoder wraps to the same track, so the ring holds more than one
+    // iteration of it.
+    assert!(
+        h.wait_pumping(|e| e.buffered_frames() > len, WAIT),
+        "the single track must loop"
+    );
+
+    h.clock.pump(len);
+    h.engine.poll().unwrap();
+    assert_eq!(
+        h.engine.transport(),
+        TransportState::Playing,
+        "the run must not end while repeat is on"
+    );
+    assert_eq!(h.engine.current_index(), Some(0));
+    let events = h.drain_events();
+    assert!(
+        !events.contains(&Event::PlaylistEnded),
+        "a looping run must not publish PlaylistEnded: {events:?}"
+    );
 }
