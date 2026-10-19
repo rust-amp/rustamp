@@ -7,7 +7,7 @@
 //! equalizer state, and window placements).
 //!
 //! For settings that cannot be honoured yet (e.g. output backend/device selection,
-//! audio buffer lengths, ReplayGain, snap distance, shuffle/repeat playback modes,
+//! audio buffer lengths, ReplayGain, shuffle/repeat playback modes,
 //! and plugins), the configuration loader reports clear warnings rather than
 //! silently ignoring them.
 //!
@@ -137,8 +137,8 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
     if let Some(ui) = table.get("ui").and_then(toml::Value::as_table) {
         for key in ui.keys() {
             let reason = match key.as_str() {
-                "snap_distance" => Some("window snap distance is not configurable"),
-                "skin" | "double_size" | "always_on_top" | "easy_move" | "windows" => None,
+                "skin" | "double_size" | "always_on_top" | "easy_move" | "windows"
+                | "snap_distance" => None,
                 _ => Some("unrecognized UI setting"),
             };
             if let Some(r) = reason {
@@ -247,7 +247,7 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
 /// Serializes a [`Config`] to TOML, including **only** fields that the player actually honours.
 ///
 /// Unhonoured / unapplied fields (such as `audio.output`, `audio.device`, `audio.buffer_ms`,
-/// `audio.fadeout_ms`, `audio.gapless`, `audio.replaygain`, `ui.snap_distance`, `playlist.shuffle`,
+/// `audio.fadeout_ms`, `audio.gapless`, `audio.replaygain`, `playlist.shuffle`,
 /// `playlist.repeat`, `playlist.manual_advance`, `playlist.last_playlist`, and `plugins.*`) are
 /// omitted so the config file does not advertise unsupported features or mislead users.
 pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
@@ -292,9 +292,10 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
         "easy_move".into(),
         toml::Value::Boolean(config.ui.easy_move),
     );
-    // Note on deliberately unpersisted field:
-    // ui.snap_distance is deliberately not persisted because window snapping
-    // distance is fixed in the docking logic and not configurable (task card N6).
+    ui.insert(
+        "snap_distance".into(),
+        toml::Value::Integer(i64::from(config.ui.snap_distance)),
+    );
 
     if !config.ui.windows.is_empty() {
         let mut windows_array = Vec::new();
@@ -638,10 +639,7 @@ mod tests {
             loaded.config.audio.replaygain,
             Config::default().audio.replaygain
         );
-        assert_eq!(
-            loaded.config.ui.snap_distance,
-            Config::default().ui.snap_distance
-        );
+        assert_eq!(loaded.config.ui.snap_distance, 30);
         assert_eq!(loaded.config.playlist, Config::default().playlist);
         // The plug-in pages' two settings survive; the vis ones do not.
         assert_eq!(
@@ -672,7 +670,6 @@ mod tests {
             "buffer_ms",
             "fadeout_ms",
             "gapless",
-            "snap_distance",
             "manual_advance",
             "last_playlist",
             "vis_plugin",

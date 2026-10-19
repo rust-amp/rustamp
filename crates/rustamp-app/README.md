@@ -37,10 +37,9 @@ is the mode the window tests use.
 
 > **GUI must never run on the host.**
 >
-> Everything graphical runs inside the disposable headless test VM, and a
-> window on the host would break that rule. Run the windowed player only
-> inside the test VM. Everything else (builds, `cargo test`, headless
-> `--null` runs) is safe on the host.
+> Everything graphical runs inside the disposable headless test VM. Run the
+> windowed player and all tests only in the guest's interactive session.
+> Compiling/checking without executing tests is allowed on the host.
 
 ### A spawned child must never create a window either
 
@@ -93,3 +92,34 @@ tests run on harness worker threads; the product keeps the default.
 `rustamp_ui::MainWindowPresenter`, because that presenter is a manual example
 which drops the commands the UI machine emits and cannot route anything to the
 engine. See the module docs in `src/window.rs`.
+
+## Classic-window docking
+
+`window.rs` applies `rustamp_ui::docking::DockedStack` positions to the main,
+EQ and playlist windows. Main moves carry directly/transitively connected
+neighbours. Shade/double-size changes reflow existing connections, not detached
+windows. Title-bar drags move all three windows; dragging EQ/playlist moves
+only that window. Those secondary moves snap to visible classic neighbours on
+all four outside edges, with positive edge overlap and optional corner alignment.
+
+`ui.snap_distance` is honoured and persisted (default 10 physical pixels,
+inclusive; 0 disables snapping). Positions and visibility use the existing
+`ui.windows` records. Exact coincident edges reconstruct connections at restart;
+closed windows retain their geometry and follow their old connections. No core
+schema change or separate docking flag is needed. The snap policy (including
+programmatic moves), reconstruction and closed-window policy are Rustamp choices:
+S05 §§3.4, 4.1 and 7 leave those behaviours open, not measured reference facts.
+Screen/work-area snapping, monitor recovery and non-classic windows are not wired.
+
+Geometry/configuration unit tests are headless. The ignored
+`window::tests::docking_presenter_moves_snaps_detaches_reflows_and_restores`
+opens the **production presenter** and checks actual OS positions after moves,
+snapping, detaching, shade reflow and recreation from serialized configuration.
+It does not simulate a pointer drag; tracking inside the native modal drag loop
+still requires interactive VM acceptance. Run via the interactive-session runner:
+
+```powershell
+pwsh -File docs/notes/vm-run-tests.ps1 -Filter '--ignored:docking_presenter'
+```
+
+Never run the ignored test on the host; `require_test_vm()` refuses it there.

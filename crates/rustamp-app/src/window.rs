@@ -10,15 +10,13 @@
 //! system's own popup ([`Windowed::drain_main_menu`]), because the reference
 //! menus are system menus (S04 §1: class `#32768`).
 //!
-//! Two OS windows exist when the equalizer is open (specs **S07** + **S05**):
-//! the main window and the equalizer window (`Winamp EQ`, 275 x 116 at rest,
-//! 550 x 232 double-sized; `specs/S01-window-geometry.md`, `specs/S05-docking.md`).
-//! The equalizer is a **docked neighbour**: it is placed below the main
-//! window's outer frame and re-placed whenever the main moves or resizes, so it
-//! follows the main and tracks its bottom edge (S05 §4.2, §3.3). The client
-//! geometry (sizes, the 102 px shade reflow, the same-delta move) is the
-//! existing [`rustamp_ui::docking::DockedStack`], not new arithmetic; the one
-//! approximation is documented on [`Windowed::place_eq_below_main`].
+//! All three classic windows take their positions from
+//! [`rustamp_ui::docking::DockedStack`]. Coincident outside edges connect them;
+//! moving the main carries its connected neighbours and resizing reflows them.
+//! EQ/playlist title drags can detach and snap to visible neighbours. Snapping
+//! uses `UiConfig::snap_distance` (0 disables it). These snap/undock policies
+//! and restoring connections from saved geometry are Rustamp choices: S05
+//! leaves tolerance, participating edges and persistence open.
 //!
 //! # The window frame: there is none (wave122)
 //!
@@ -80,7 +78,8 @@ use rustamp_platform::{HotkeyAction, init_dpi_awareness, single_instance, take_p
 use rustamp_ui::shell::TaskbarRole;
 use rustamp_ui::{
     DEFAULT_MAIN_POSITION, DialogKind, Key, Modifiers, PLAYLIST_WINDOW_SIZE, ShortcutOutcome,
-    docking::DockedStack, menu::menu_popup_origin,
+    docking::{ClassicWindow, DockedStack, WindowKind, WindowPosition},
+    menu::menu_popup_origin,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -397,7 +396,7 @@ struct Windowed {
     eq_id: Option<WindowId>,
     /// The playlist editor window (`Winamp PE`, 275 x 116 at rest; S06, S01
     /// §4): a docked neighbour that follows the main window's bottom edge
-    /// through the S05 geometry (see [`Windowed::sync_playlist_position`]).
+    /// through the S05 geometry (see [`Windowed::apply_docking_positions`]).
     /// Created by the same shell and rail as the main window.
     playlist_window: Option<Arc<Window>>,
     playlist_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
@@ -442,18 +441,15 @@ struct Windowed {
     applied_main_visible: bool,
     /// The main window title last applied ([`App::window_title`]).
     applied_title: Option<String>,
-    /// The docked stack model (S05 §3.3, §4.2, §5): shade/double-size flags
-    /// and same-delta moves go through this instead of new arithmetic. Its
-    /// absolute positions are the S05 default model; OS placement reads the
-    /// live outer frame (see `place_eq_below_main`).
+    /// Authoritative physical geometry, including retained positions of closed
+    /// windows. Exact edge connections are reconstructed on restart.
     stack: DockedStack,
-    /// The main window's last seen outer position, for same-delta tracking.
-    last_main_outer: Option<PhysicalPosition<i32>>,
 }
 
 impl Windowed {
     fn new(app: App) -> Self {
         let applied_on_top = app.always_on_top();
+        let stack = Self::restore_stack(&app);
         Self {
             app,
             #[cfg(windows)]
@@ -486,9 +482,38 @@ impl Windowed {
             applied_on_top,
             applied_main_visible: true,
             applied_title: None,
-            stack: DockedStack::default_launch(),
-            last_main_outer: None,
+            stack,
         }
+    }
+
+    fn restore_stack(app: &App) -> DockedStack {
+        let mut stack = DockedStack::default_launch();
+        stack.set_main_shaded(app.state().windowshade);
+        stack.set_main_double_size(app.state().double_size);
+        stack.set_equalizer_double_size(app.eq_state().double_size);
+        stack.set_equalizer_shaded(app.eq_state().windowshade);
+        if let Some(layout) = app
+            .config()
+            .ui
+            .windows
+            .iter()
+            .find(|w| w.id == CoreWindowId::Main)
+        {
+            stack.move_main(
+                layout.x.saturating_sub(stack.main.x),
+                layout.y.saturating_sub(stack.main.y),
+            );
+        }
+        for (id, window) in [
+            (CoreWindowId::Equalizer, &mut stack.equalizer),
+            (CoreWindowId::Playlist, &mut stack.playlist),
+        ] {
+            if let Some(layout) = app.config().ui.windows.iter().find(|w| w.id == id) {
+                window.x = layout.x;
+                window.y = layout.y;
+            }
+        }
+        stack
     }
 
     /// Resizes the OS window so its client area is exactly the layout size, and
@@ -511,6 +536,15 @@ impl Windowed {
         if double_size != self.stack.main.double_size {
             self.stack.set_main_double_size(double_size);
         }
+        if self.app.eq_state().double_size != self.stack.equalizer.double_size {
+            self.stack
+                .set_equalizer_double_size(self.app.eq_state().double_size);
+        }
+        if self.app.eq_state().windowshade != self.stack.equalizer.shaded {
+            self.stack
+                .set_equalizer_shaded(self.app.eq_state().windowshade);
+        }
+        self.apply_docking_positions();
         if let Some(window) = &self.window {
             if self.app.main_visible() != self.applied_main_visible {
                 self.applied_main_visible = self.app.main_visible();
@@ -616,9 +650,6 @@ impl Windowed {
             self.eq_window = Some(window);
             self.eq_surface = Some(surface);
             self.applied_eq_client = Some((width, height));
-            if self.saved_position(CoreWindowId::Equalizer).is_none() {
-                self.place_eq_below_main();
-            }
         }
         let desired = self.app.eq_frame_size();
         if self.applied_eq_client != Some(desired)
@@ -629,40 +660,91 @@ impl Windowed {
         }
     }
 
-    /// Places the equalizer window directly below the main window's outer
-    /// frame, at the same x (the docked neighbour of S05 §3.3/§4.2).
-    ///
-    /// The placement is outer-frame to outer-frame, which is now exactly the
-    /// client-edge stacking the reference does (S05 §3.3): every window of
-    /// this player is borderless
-    /// ([`rustamp_ui::shell::skinned_window_attributes`]), so its outer size
-    /// *is* its client size and there is no chrome left to account for. While
-    /// the windows were decorated this was an approximation — a caption's
-    /// height of gap — which is one more thing the native frame was quietly
-    /// costing. It tracks the main window's bottom edge through every move
-    /// and resize; a shaded (shorter) main pulls the equalizer up with it.
-    fn place_eq_below_main(&mut self) {
-        let (Some(main), Some(eq)) = (self.window.as_ref(), self.eq_window.as_ref()) else {
+    /// Applies only model positions; detached windows are never forced back
+    /// into the default stack. Borderless outer/client origins coincide.
+    fn apply_docking_positions(&mut self) {
+        for (id, geometry, window) in [
+            (CoreWindowId::Main, self.stack.main, self.window.as_ref()),
+            (
+                CoreWindowId::Equalizer,
+                self.stack.equalizer,
+                self.eq_window.as_ref(),
+            ),
+            (
+                CoreWindowId::Playlist,
+                self.stack.playlist,
+                self.playlist_window.as_ref(),
+            ),
+        ] {
+            let target = PhysicalPosition::new(geometry.x, geometry.y);
+            if let Some(window) = window
+                && window.is_minimized() != Some(true)
+                && window.outer_position().ok() != Some(target)
+            {
+                window.set_outer_position(target);
+            }
+            self.app.set_window_position(id, geometry.x, geometry.y);
+        }
+    }
+
+    /// Acknowledgements of our own placement do nothing. Ignore stale queued
+    /// Moved events (the live position has already changed again), and Windows'
+    /// minimized sentinel coordinates. Secondary moves snap to visible peers;
+    /// moving the main translates its exact connected component in the model.
+    fn classic_window_moved(&mut self, kind: WindowKind, position: PhysicalPosition<i32>) {
+        let window = match kind {
+            WindowKind::Main => self.window.as_ref(),
+            WindowKind::Equalizer => self.eq_window.as_ref(),
+            WindowKind::Playlist => self.playlist_window.as_ref(),
+        };
+        let Some(window) = window else {
             return;
         };
-        if let Ok(pos) = main.outer_position() {
-            let size = main.outer_size();
-            eq.set_outer_position(PhysicalPosition::new(
-                pos.x,
-                pos.y.saturating_add(size.height as i32),
-            ));
+        if window.is_minimized() == Some(true) || window.outer_position().ok() != Some(position) {
+            return;
         }
+        let geometry = match kind {
+            WindowKind::Main => self.stack.main,
+            WindowKind::Equalizer => self.stack.equalizer,
+            WindowKind::Playlist => self.stack.playlist,
+        };
+        if (geometry.x, geometry.y) == (position.x, position.y) {
+            return;
+        }
+        if kind == WindowKind::Main {
+            self.stack.move_main(
+                position.x.saturating_sub(geometry.x),
+                position.y.saturating_sub(geometry.y),
+            );
+        } else {
+            let targets: Vec<ClassicWindow> = [
+                (self.stack.main, self.app.main_visible()),
+                (self.stack.equalizer, self.eq_window.is_some()),
+                (self.stack.playlist, self.playlist_window.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(target, visible)| (visible && target.kind != kind).then_some(target))
+            .collect();
+            let snapped = geometry.snapped_position(
+                WindowPosition::new(position.x, position.y),
+                &targets,
+                self.app.config().ui.snap_distance,
+            );
+            let moved = match kind {
+                WindowKind::Equalizer => &mut self.stack.equalizer,
+                WindowKind::Playlist => &mut self.stack.playlist,
+                WindowKind::Main => unreachable!(),
+            };
+            moved.x = snapped.x;
+            moved.y = snapped.y;
+        }
+        self.apply_docking_positions();
     }
 
     /// Synchronizes current live OS window positions, visibility, and shade states
     /// into the app configuration so they are preserved on exit.
     pub(crate) fn sync_window_layouts_to_app(&mut self) {
-        if let Some(window) = &self.window
-            && let Ok(pos) = window.outer_position()
-        {
-            self.app
-                .set_window_position(CoreWindowId::Main, pos.x, pos.y);
-        }
+        self.apply_docking_positions();
         self.app
             .set_window_shaded(CoreWindowId::Main, self.app.state().windowshade);
         self.app.set_window_visible(CoreWindowId::Main, true);
@@ -670,22 +752,12 @@ impl Windowed {
         let eq_visible = self.app.eq_open();
         self.app
             .set_window_visible(CoreWindowId::Equalizer, eq_visible);
-        if let Some(eq) = &self.eq_window
-            && let Ok(pos) = eq.outer_position()
-        {
-            self.app
-                .set_window_position(CoreWindowId::Equalizer, pos.x, pos.y);
-        }
+        self.app
+            .set_window_shaded(CoreWindowId::Equalizer, self.app.eq_state().windowshade);
 
         let pl_visible = self.app.playlist_open();
         self.app
             .set_window_visible(CoreWindowId::Playlist, pl_visible);
-        if let Some(pl) = &self.playlist_window
-            && let Ok(pos) = pl.outer_position()
-        {
-            self.app
-                .set_window_position(CoreWindowId::Playlist, pos.x, pos.y);
-        }
     }
 
     /// Converts a physical cursor position to the equalizer layout's 1x
@@ -1446,19 +1518,15 @@ impl Windowed {
         }
     }
 
-    /// The screen position the config saved for window `id`, if it saved one.
-    ///
-    /// One reader for all three classic windows, which used to repeat the
-    /// same lookup; the position is applied at creation so a restored session
-    /// opens where it closed.
+    /// Creation uses the restored/live model, including retained closed windows.
     fn saved_position(&self, id: CoreWindowId) -> Option<(i32, i32)> {
-        self.app
-            .config()
-            .ui
-            .windows
-            .iter()
-            .find(|window| window.id == id)
-            .map(|layout| (layout.x, layout.y))
+        let window = match id {
+            CoreWindowId::Main => self.stack.main,
+            CoreWindowId::Equalizer => self.stack.equalizer,
+            CoreWindowId::Playlist => self.stack.playlist,
+            _ => return None,
+        };
+        Some((window.x, window.y))
     }
 
     /// Creates or drops the playlist editor's OS window so it matches
@@ -1517,32 +1585,8 @@ impl Windowed {
         }
         self.playlist_window = Some(window);
         self.playlist_surface = Some(surface);
-        self.sync_playlist_position();
+        self.apply_docking_positions();
         self.request_playlist_redraw();
-    }
-
-    /// Keeps the playlist window docked: its screen position is the main
-    /// window's position plus the S05 docked offset (playlist origin minus the
-    /// main default position), so it follows the main window's bottom edge
-    /// through [`App::playlist_window_origin`] — including shade reflow.
-    /// Best-effort: a window whose position cannot be read keeps its own.
-    /// Undocking by dragging the playlist itself stays open (S05 §7.8).
-    fn sync_playlist_position(&self) {
-        let (Some(main), Some(playlist)) = (self.window.as_ref(), self.playlist_window.as_ref())
-        else {
-            return;
-        };
-        let Ok(main_pos) = main.outer_position() else {
-            return;
-        };
-        let (ox, oy) = self.app.playlist_window_origin();
-        let target = PhysicalPosition::new(
-            main_pos.x + ox - DEFAULT_MAIN_POSITION.x,
-            main_pos.y + oy - DEFAULT_MAIN_POSITION.y,
-        );
-        if playlist.outer_position().ok() != Some(target) {
-            playlist.set_outer_position(target);
-        }
     }
 
     /// Events for the playlist editor window, in playlist-window coordinates.
@@ -1564,8 +1608,7 @@ impl Windowed {
                 self.request_redraw();
             }
             WindowEvent::Moved(position) => {
-                self.app
-                    .set_window_position(CoreWindowId::Playlist, position.x, position.y);
+                self.classic_window_moved(WindowKind::Playlist, position);
             }
             WindowEvent::RedrawRequested => self.paint_playlist(),
             WindowEvent::Resized(size) => {
@@ -1605,6 +1648,15 @@ impl Windowed {
                 ..
             } => {
                 let (x, y) = self.playlist_cursor;
+                if state == ElementState::Pressed
+                    && (0..rustamp_ui::playlist_window::TITLE_BAR_HEIGHT).contains(&y)
+                    && rustamp_ui::playlist_window::hit_test_title_bar(x, y).is_none()
+                    && let Some(window) = &self.playlist_window
+                    && window.drag_window().is_ok()
+                {
+                    self.last_playlist_click = None;
+                    return;
+                }
                 // Drags are open (S06 Q6: reorder vs selection block), so only
                 // the press/release pair is routed; moves are not forwarded.
                 let result = match state {
@@ -1635,7 +1687,7 @@ impl Windowed {
                 // have opened the open-media dialog.
                 self.sync_playlist_window(event_loop);
                 self.sync_dialog_window(event_loop);
-                self.sync_playlist_position();
+                self.apply_docking_positions();
                 self.request_playlist_redraw();
                 self.request_redraw();
             }
@@ -1666,7 +1718,9 @@ impl Windowed {
     /// it (no window may open here); the decision itself is headless-tested
     /// on [`App::easy_drag_main`].
     fn try_easy_drag(&mut self, x: i32, y: i32) -> Option<()> {
-        if !self.app.easy_drag_main(x, y) {
+        let title = rustamp_ui::hit_test(&rustamp_ui::MainWindowLayout::CLASSIC, x, y)
+            == Some(rustamp_ui::Widget::TitleBar);
+        if !title && !self.app.easy_drag_main(x, y) {
             return None;
         }
         let window = self.window.as_ref()?;
@@ -1857,20 +1911,7 @@ impl ApplicationHandler for Windowed {
                 event_loop.exit();
             }
             WindowEvent::Moved(position) => {
-                self.app
-                    .set_window_position(CoreWindowId::Main, position.x, position.y);
-                // A docked neighbour follows the main window by the same delta
-                // (S05 §4.2): the model moves through the stack geometry, then
-                // the EQ window is re-placed below the live outer frame.
-                if let Some(last) = self.last_main_outer {
-                    self.stack.move_main(
-                        position.x.saturating_sub(last.x),
-                        position.y.saturating_sub(last.y),
-                    );
-                }
-                self.last_main_outer = Some(position);
-                self.place_eq_below_main();
-                self.sync_playlist_position();
+                self.classic_window_moved(WindowKind::Main, position);
             }
             WindowEvent::DroppedFile(path) => self.drop_file(path),
             WindowEvent::RedrawRequested => self.paint(),
@@ -1884,8 +1925,7 @@ impl ApplicationHandler for Windowed {
                 // A main resize (windowshade, double-size) re-flows the stack
                 // (S05 §3.3, §5): the equalizer tracks the new bottom edge,
                 // and so does the playlist.
-                self.place_eq_below_main();
-                self.sync_playlist_position();
+                self.sync_window_state();
                 self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged {
@@ -1999,14 +2039,14 @@ impl ApplicationHandler for Windowed {
         self.sync_eq_window(event_loop);
         // A main resize (shade, double-size) moves the docked neighbour with
         // it (S05 §3.3, §5).
-        self.place_eq_below_main();
+        self.apply_docking_positions();
         // Dialogs follow the app's open dialog (opened by menu or shortcut,
         // closed by Escape, Enter or the window's close button).
         self.sync_dialog_window(event_loop);
         // The playlist editor follows its open flag and, while open, tracks
         // the main window (moves and shade reflow).
         self.sync_playlist_window(event_loop);
-        self.sync_playlist_position();
+        self.apply_docking_positions();
         // The frame of this tick, painted here rather than asked for: see
         // [`Windowed::present_frames`].
         self.present_frames();
@@ -2054,8 +2094,7 @@ impl Windowed {
                 self.request_redraw_eq();
             }
             WindowEvent::Moved(position) => {
-                self.app
-                    .set_window_position(CoreWindowId::Equalizer, position.x, position.y);
+                self.classic_window_moved(WindowKind::Equalizer, position);
             }
             WindowEvent::RedrawRequested => self.paint_eq(),
             WindowEvent::Resized(size) => {
@@ -2098,6 +2137,15 @@ impl Windowed {
                 ..
             } => {
                 let (x, y) = self.eq_cursor;
+                if state == ElementState::Pressed
+                    && rustamp_ui::equalizer::hit_test(&rustamp_ui::EqualizerLayout::CLASSIC, x, y)
+                        == Some(rustamp_ui::EqWidget::TitleBar)
+                    && let Some(window) = &self.eq_window
+                    && window.drag_window().is_ok()
+                {
+                    self.eq_left_down = false;
+                    return;
+                }
                 let result = match state {
                     ElementState::Pressed => {
                         self.eq_left_down = true;
@@ -2255,6 +2303,181 @@ mod tests {
             .unwrap();
         }
         Windowed::new(app)
+    }
+
+    #[test]
+    fn saved_geometry_restores_connections_without_forcing_detached_windows() {
+        let mut presenter = desktop_test_presenter(false);
+        presenter.stack.move_main(-100, 80);
+        presenter.stack.equalizer.x = 700;
+        presenter.stack.equalizer.y = 400;
+        presenter
+            .app
+            .submit(Command::ToggleWindowShade(CoreWindowId::Main))
+            .unwrap();
+        presenter.sync_window_state();
+        presenter.sync_window_layouts_to_app();
+        let saved = crate::config::serialize_honest(&presenter.app.current_config()).unwrap();
+        let config = crate::config::parse(&saved).unwrap();
+        let restored_app = App::new(AppOptions {
+            config,
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            file: None,
+            seconds: None,
+        })
+        .unwrap();
+        let mut restored = Windowed::new(restored_app);
+        assert_eq!(restored.stack, presenter.stack);
+        restored.stack.move_main(30, -40);
+        assert_eq!(
+            (restored.stack.equalizer.x, restored.stack.equalizer.y),
+            (700, 400)
+        );
+        assert!(
+            restored.window.is_none(),
+            "configuration test must stay headless"
+        );
+    }
+
+    /// Exercises actual Moved events and OS readback through the production
+    /// presenter, not a lookalike Probe window. No input is synthesized: this
+    /// pins Rustamp's explicit programmatic-move snap policy. Real pointer
+    /// tracking during winit's modal drag still needs interactive VM acceptance.
+    #[test]
+    #[ignore = "VM-only: opens the real three-window presenter; run in the guest interactive session"]
+    fn docking_presenter_moves_snaps_detaches_reflows_and_restores() {
+        require_test_vm();
+        struct Probe {
+            presenter: Windowed,
+            phase: u8,
+            next: Instant,
+            deadline: Instant,
+        }
+        impl Probe {
+            fn assert_positions(&self, expected: [(i32, i32); 3]) {
+                for (window, expected) in [
+                    self.presenter.window.as_ref(),
+                    self.presenter.eq_window.as_ref(),
+                    self.presenter.playlist_window.as_ref(),
+                ]
+                .into_iter()
+                .zip(expected)
+                {
+                    let position = window.unwrap().outer_position().unwrap();
+                    assert_eq!((position.x, position.y), expected, "phase {}", self.phase);
+                }
+            }
+        }
+        impl ApplicationHandler for Probe {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.presenter.resumed(event_loop);
+            }
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                id: WindowId,
+                event: WindowEvent,
+            ) {
+                self.presenter.window_event(event_loop, id, event);
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                assert!(Instant::now() < self.deadline, "docking probe timed out");
+                self.presenter.about_to_wait(event_loop);
+                if Instant::now() < self.next {
+                    return;
+                }
+                match self.phase {
+                    0 => {
+                        self.assert_positions([(26, 29), (26, 145), (26, 261)]);
+                        self.presenter
+                            .window
+                            .as_ref()
+                            .unwrap()
+                            .set_outer_position(PhysicalPosition::new(126, 29));
+                    }
+                    1 => {
+                        self.assert_positions([(126, 29), (126, 145), (126, 261)]);
+                        self.presenter
+                            .eq_window
+                            .as_ref()
+                            .unwrap()
+                            .set_outer_position(PhysicalPosition::new(600, 400));
+                    }
+                    2 => {
+                        self.assert_positions([(126, 29), (600, 400), (126, 261)]);
+                        self.presenter
+                            .playlist_window
+                            .as_ref()
+                            .unwrap()
+                            .set_outer_position(PhysicalPosition::new(132, 150));
+                    }
+                    3 => {
+                        self.assert_positions([(126, 29), (600, 400), (126, 145)]);
+                        self.presenter
+                            .window
+                            .as_ref()
+                            .unwrap()
+                            .set_outer_position(PhysicalPosition::new(226, 129));
+                    }
+                    4 => {
+                        self.assert_positions([(226, 129), (600, 400), (226, 245)]);
+                        self.presenter
+                            .app
+                            .submit(Command::ToggleWindowShade(CoreWindowId::Main))
+                            .unwrap();
+                    }
+                    5 => {
+                        self.assert_positions([(226, 129), (600, 400), (226, 143)]);
+                        self.presenter.sync_window_layouts_to_app();
+                        let text =
+                            crate::config::serialize_honest(&self.presenter.app.current_config())
+                                .unwrap();
+                        let app = App::new(AppOptions {
+                            config: crate::config::parse(&text).unwrap(),
+                            skin: crate::skin::builtin(),
+                            output: OutputChoice::Null,
+                            volume: 200,
+                            file: None,
+                            seconds: None,
+                        })
+                        .unwrap();
+                        self.presenter = Windowed::new(app);
+                        self.presenter.resumed(event_loop);
+                    }
+                    6 => {
+                        self.assert_positions([(226, 129), (600, 400), (226, 143)]);
+                        self.presenter
+                            .window
+                            .as_ref()
+                            .unwrap()
+                            .set_outer_position(PhysicalPosition::new(326, 129));
+                    }
+                    7 => {
+                        self.assert_positions([(326, 129), (600, 400), (326, 143)]);
+                        event_loop.exit();
+                        return;
+                    }
+                    _ => unreachable!(),
+                }
+                self.phase += 1;
+                self.next = Instant::now() + Duration::from_millis(150);
+            }
+        }
+        let mut presenter = desktop_test_presenter(false);
+        presenter
+            .app
+            .submit(Command::ToggleWindow(CoreWindowId::Equalizer))
+            .unwrap();
+        let mut probe = Probe {
+            presenter,
+            phase: 0,
+            next: Instant::now() + Duration::from_millis(150),
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        build_event_loop(true).unwrap().run_app(&mut probe).unwrap();
+        assert_eq!(probe.phase, 7);
     }
 
     fn wait_for_index(presenter: &mut Windowed, index: u32) {
