@@ -94,6 +94,21 @@ mod tests {
     }
 
     #[test]
+    fn an_output_fault_keeps_its_kind_and_message() {
+        // RFC 0012 §4.3 item 7: a fatal device failure is published as
+        // `Event::Error(ErrorInfo { kind: ErrorKind::Output, .. })`. The
+        // classification of `Error::Output` is therefore part of the
+        // contract, and the message the user sees is the error's own text.
+        let e = Error::Output("Speakers: the device disappeared".into());
+        let info = ErrorInfo::from(&e);
+        assert_eq!(info.kind, ErrorKind::Output);
+        assert_eq!(
+            info.message,
+            "output error: Speakers: the device disappeared"
+        );
+    }
+
+    #[test]
     fn format_changed_keeps_its_kind_and_specs() {
         // RFC 0002, C3/C4: the engine can tell a format change from a decode
         // failure and can name both formats.
