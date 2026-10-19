@@ -398,20 +398,26 @@ foreach ($exe in $exes) {
     }
 }
 
-# Only with --bless: stage the two re-blessed images under C:\rustamp\out\bless,
-# the one tree the broker's copyout op may read. Keeping the skin sub-folder means
-# the two files with the same name cannot overwrite each other. Files that were
-# not written are simply absent; the host checks for them.
+# Only with --bless: stage the re-blessed images under C:\rustamp\out\bless, the
+# one tree the broker's copyout op may read. Keeping the skin sub-folder means the
+# files with the same name cannot overwrite each other. The names are an explicit
+# list rather than "every golden the run touched": a bless rewrites every image in
+# the golden binaries, and bringing all of them back would promote a wholesale
+# re-bless instead of the reviewed images. Files that were not written are simply
+# absent; the host checks for them and fails on a missing one.
+$blessNames = @('vis_stopped_tail', 'playlist_window_selection', 'playlist_window_mid_page')
 if ($bless) {
     $blessOut = 'C:\rustamp\out\bless'
     if (Test-Path $blessOut) { Remove-Item -Recurse -Force $blessOut }
     New-Item -ItemType Directory -Force -Path $blessOut | Out-Null
     foreach ($skin in 'lookalike', 'rust-theme') {
-        $src = Join-Path $repo "tests\golden\$skin\vis_stopped_tail.png"
-        if (Test-Path $src) {
-            $dstDir = Join-Path $blessOut $skin
-            New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-            Copy-Item -LiteralPath $src -Destination $dstDir -Force
+        foreach ($name in $blessNames) {
+            $src = Join-Path $repo "tests\golden\$skin\$name.png"
+            if (Test-Path $src) {
+                $dstDir = Join-Path $blessOut $skin
+                New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+                Copy-Item -LiteralPath $src -Destination $dstDir -Force
+            }
         }
     }
 }

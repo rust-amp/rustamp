@@ -496,8 +496,10 @@ $result.results | ForEach-Object {
 # --- 5b. bless: bring the re-blessed golden images back (only with --bless) ---
 # The guest staged them under C:\rustamp\out\bless (see run-tests.ps1). copyout
 # nests the source folder inside the destination, so the files land at
-# $BlessOut\bless\<skin>\vis_stopped_tail.png. Not run without the token: the
-# default path is unchanged.
+# $BlessOut\bless\<skin>\<name>.png. The names must match the guest's $blessNames
+# list; a missing image is a failure, not a silent partial promotion. Not run
+# without the token: the default path is unchanged.
+$blessNames = @('vis_stopped_tail', 'playlist_window_selection', 'playlist_window_mid_page')
 $blessMissing = 0
 if ($Filter -like '--bless*') {
     Step "copying the re-blessed golden images back to $BlessOut"
@@ -505,12 +507,14 @@ if ($Filter -like '--bless*') {
     $null = New-Item -ItemType Directory -Force -Path $BlessOut
     & $broker -Op copyout -Source 'C:\rustamp\out\bless' -Dest $BlessOut -TimeoutSeconds 600 | Out-Null
     foreach ($skin in 'lookalike', 'rust-theme') {
-        $p = Join-Path $BlessOut "bless\$skin\vis_stopped_tail.png"
-        if (Test-Path $p) {
-            Write-Host ("blessed: {0}  SHA-256 {1}" -f $p, (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash)
-        } else {
-            $blessMissing++
-            Write-Host ("  BLESS MISSING: {0} did not come back (the guest did not write it)" -f $p)
+        foreach ($name in $blessNames) {
+            $p = Join-Path $BlessOut "bless\$skin\$name.png"
+            if (Test-Path $p) {
+                Write-Host ("blessed: {0}  SHA-256 {1}" -f $p, (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash)
+            } else {
+                $blessMissing++
+                Write-Host ("  BLESS MISSING: {0} did not come back (the guest did not write it)" -f $p)
+            }
         }
     }
 }
