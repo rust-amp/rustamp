@@ -484,6 +484,14 @@ impl App {
                 self.submit(command.clone())?;
                 Ok(Some(ShortcutOutcome::Commands(vec![command])))
             }
+            // ----- the HTML playlist (S03 §2 `40292`) -----
+            // The document goes where the user says, so the app records the
+            // request and the presenter asks for a file: writing a file is
+            // not a player action and needs no core command (RFC 0005 §9).
+            PlaylistKeyAction::GenerateHtmlPlaylist => {
+                self.request_html_playlist = true;
+                Ok(Some(ShortcutOutcome::Handled))
+            }
             // ----- the provisional close row -----
             PlaylistKeyAction::CloseEditor => {
                 let commands = self.close_playlist_window()?;
@@ -1382,24 +1390,34 @@ mod tests {
         let menu = rustamp_ui::menu::native_playlist_misc_menu();
         let entries = app.playlist().visible_ids();
         let selection = app.playlist().selected_ids();
-        for (id, label) in [
-            (40292, "Generate HTML playlist"),
-            (40293, "Read extended info on selection"),
-        ] {
-            assert_eq!(
-                app.activate_menu_choice(menu.choice_for_id(id).unwrap())
-                    .unwrap(),
-                Some(crate::menu::MenuOutcome::Noted)
-            );
-            let notes = app.drain_notes();
-            assert_eq!(notes.len(), 1);
-            assert!(notes[0].contains(label), "{notes:?}");
-            assert!(notes[0].contains(&id.to_string()), "{notes:?}");
-            assert!(notes[0].contains("not implemented"), "{notes:?}");
-            assert_eq!(app.engine().queue().len(), 3);
-            assert_eq!(app.playlist().visible_ids(), entries);
-            assert_eq!(app.playlist().selected_ids(), selection);
-        }
+        // "Generate HTML playlist" is the editor's `Ctrl+Alt+G` row: the same
+        // command id, so the menu asks for the document like the key does.
+        assert_eq!(
+            app.activate_menu_choice(menu.choice_for_id(40292).unwrap())
+                .unwrap(),
+            None
+        );
+        assert!(app.request_html_playlist, "the document is requested");
+        assert!(app.drain_notes().is_empty());
+        assert_eq!(app.engine().queue().len(), 3);
+        assert_eq!(app.playlist().visible_ids(), entries);
+        assert_eq!(app.playlist().selected_ids(), selection);
+
+        // "Read extended info on selection" has no command yet.
+        let (id, label) = (40293, "Read extended info on selection");
+        assert_eq!(
+            app.activate_menu_choice(menu.choice_for_id(id).unwrap())
+                .unwrap(),
+            Some(crate::menu::MenuOutcome::Noted)
+        );
+        let notes = app.drain_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains(label), "{notes:?}");
+        assert!(notes[0].contains(&id.to_string()), "{notes:?}");
+        assert!(notes[0].contains("not implemented"), "{notes:?}");
+        assert_eq!(app.engine().queue().len(), 3);
+        assert_eq!(app.playlist().visible_ids(), entries);
+        assert_eq!(app.playlist().selected_ids(), selection);
     }
 
     #[test]
