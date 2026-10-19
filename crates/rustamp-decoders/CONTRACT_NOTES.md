@@ -27,6 +27,13 @@ Behaviour the core contract leaves open, and what the decoders do.
     damaged file delivers fewer frames than it declares as well - but it holds
     all of its bytes. A file that is short of frames *and* of bytes was cut; a
     file that is short of frames only is damaged and keeps playing.
+  FLAC is not on that list, and the reason is worth naming: its `STREAMINFO`
+  block states the number of samples exactly, but the format has no field for
+  the number of bytes the audio occupies, and a damaged FLAC frame is dropped
+  by the reader (its CRC-16 does not match) while the reader resynchronises at
+  the next frame. A corrupt file is therefore short of samples exactly like a
+  cut one, and it holds all of its bytes - the shortfall proves nothing. A
+  truncated FLAC file still ends with an end of stream.
 - **The MPEG audio header** (`mpeg_header.rs`). An MPEG audio file may carry a
   **Xing** (variable bitrate) or **Info** (constant bitrate) tag in its first
   frame, behind the side information. The tag states the number of MPEG frames
@@ -127,6 +134,8 @@ correct behaviour:
    without counting them - so a truncated file of those kinds still ends with
    an end of stream. The wave decoder has no such limit: it parses the `data`
    chunk itself and compares the declared length with the bytes that are there.
+   The FLAC case is item 8 below: it is the one where the container states the
+   sample count exactly and still cannot say whether the file was cut.
 2. **A damaged file whose *content signature* matches is reported as
    `UnsupportedFormat`** (symphonia). The signature tells the factory to hand the
    file to symphonia; when the probe then rejects the body, nothing is open yet,
@@ -165,6 +174,31 @@ correct behaviour:
    not evidence, so such a file ends as it always did. A header that lies
    about the frame count while the file holds every byte it declares is not
    a cut file either - it ends cleanly, like the damaged file it resembles.
+8. **A truncated FLAC file still ends with an end of stream** (symphonia),
+   because FLAC states no byte count and the sample count alone cannot tell
+   a cut file from a damaged one. The `STREAMINFO` block states the number of
+   samples exactly - the reader takes its frame count from that block, so the
+   two agree without a correction, unlike MPEG audio where the encoder delay
+   and padding have to be subtracted - but the format has no field for the
+   number of bytes the audio occupies, so the second condition of the MPEG
+   audio rule cannot be built. The sample count cannot take its place: a
+   FLAC frame whose CRC-16 does not match is dropped by the reader and the
+   reader resynchronises at the next frame, so a corrupt-but-complete file
+   delivers fewer samples than it declares while holding all of its bytes
+   (measured on the repository fixture: 61542 of 66150 samples). The MD5 in
+   the `STREAMINFO` block cannot take its place either - it covers the
+   *decoded* samples, so it fails for damage and for a cut alike, and the
+   reader only computes it when verification is asked for.
+   What the format does offer is a *proven lower bound* on the number of
+   audio bytes: the declared minimum frame size times the number of frames
+   the declared sample count needs at the declared maximum block size. A file
+   below that bound cannot hold the samples it declares, so it was cut. That
+   bound is not an oracle, though: it depends on the size of the last frame,
+   which depends on the audio (a file that ends in silence has a very small
+   last frame and a bound near zero, a file that ends loudly has a bound
+   close to its own size), so it fires for some cuts and not for others, and
+   a loud failure on such a threshold would be an unstable promise. It is
+   therefore not implemented, and the honest end of stream stays.
 
 ## Proposals
 

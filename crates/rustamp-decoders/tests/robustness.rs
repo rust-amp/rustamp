@@ -369,6 +369,312 @@ fn a_truncated_flac_is_not_mistaken_for_a_cut_file() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FLAC: the shape of its header, and why it has no truncation oracle
+// ---------------------------------------------------------------------------
+
+/// The metadata blocks of a FLAC file: their type, where their payload starts
+/// and how long it is.
+///
+/// A FLAC file is the `fLaC` marker, then a chain of metadata blocks (a type
+/// byte, a 24 bit length and the payload), then the audio frames. The tests
+/// below need the `STREAMINFO` block: it is the one that states what the file
+/// holds.
+fn flac_metadata(bytes: &[u8]) -> Vec<(u8, usize, usize)> {
+    assert_eq!(&bytes[..4], b"fLaC", "the fixture is a FLAC file");
+    let mut blocks = Vec::new();
+    let mut at = 4;
+    loop {
+        let header = *bytes.get(at).expect("a metadata block header");
+        let len = (usize::from(bytes[at + 1]) << 16)
+            | (usize::from(bytes[at + 2]) << 8)
+            | usize::from(bytes[at + 3]);
+        blocks.push((header & 0x7F, at + 4, len));
+        at += 4 + len;
+        if header & 0x80 != 0 {
+            return blocks;
+        }
+    }
+}
+
+/// The `STREAMINFO` block of a FLAC file: where its payload starts and the
+/// payload itself (34 bytes).
+fn flac_stream_info(bytes: &[u8]) -> (usize, [u8; 34]) {
+    let (_, at, _) = flac_metadata(bytes)
+        .into_iter()
+        .find(|(kind, _, _)| *kind == 0)
+        .expect("the fixture carries a STREAMINFO block");
+    let mut payload = [0u8; 34];
+    payload.copy_from_slice(&bytes[at..at + 34]);
+    (at, payload)
+}
+
+/// The offset of the first audio frame: behind every metadata block.
+fn flac_audio_start(bytes: &[u8]) -> usize {
+    let (_, at, len) = *flac_metadata(bytes)
+        .last()
+        .expect("the fixture carries metadata blocks");
+    at + len
+}
+
+/// The number of samples the `STREAMINFO` block declares.
+///
+/// The block holds the sample rate (20 bits), the channel count (3 bits) and
+/// the bit depth (5 bits) in the first 28 bits of its last eight bytes, and
+/// the total number of samples in the 36 bits behind them. A count of zero
+/// means "length unknown" in the format.
+fn flac_declared_samples(payload: &[u8; 34]) -> u64 {
+    let bits = u64::from_be_bytes(payload[10..18].try_into().expect("eight bytes"));
+    bits & ((1 << 36) - 1)
+}
+
+/// Writes the number of samples the `STREAMINFO` block declares.
+fn flac_set_declared_samples(payload: &mut [u8; 34], samples: u64) {
+    let mut bits = u64::from_be_bytes(payload[10..18].try_into().expect("eight bytes"));
+    bits = (bits & !((1 << 36) - 1)) | (samples & ((1 << 36) - 1));
+    payload[10..18].copy_from_slice(&bits.to_be_bytes());
+}
+
+/// The largest number of samples one frame of the stream carries.
+///
+/// The block states the minimum and the maximum block size in samples.
+fn flac_max_block(payload: &[u8; 34]) -> u64 {
+    u64::from(u16::from_be_bytes(
+        payload[2..4].try_into().expect("two bytes"),
+    ))
+}
+
+/// The smallest number of bytes one frame of the stream occupies.
+///
+/// The block states the minimum and the maximum frame size in bytes. Zero
+/// means "unknown" in the format.
+fn flac_min_frame(payload: &[u8; 34]) -> u64 {
+    u64::from(payload[4]) << 16 | u64::from(payload[5]) << 8 | u64::from(payload[6])
+}
+
+/// Changes the type of a metadata block, keeping its "last block" flag.
+///
+/// Type 126 is unknown to the container reader: it skips a block of that
+/// type like any other block it does not know.
+fn flac_set_block_type(bytes: &mut [u8], payload_at: usize, kind: u8) {
+    let header = payload_at - 4;
+    bytes[header] = (bytes[header] & 0x80) | kind;
+}
+
+/// The reason a FLAC file has no truncation oracle.
+///
+/// The `STREAMINFO` block states the number of samples exactly, so the file
+/// says how much audio it holds. A damaged FLAC frame is dropped by the
+/// reader - its CRC-16 does not match - and the reader resynchronises at the
+/// next frame. A corrupt file is therefore short of samples exactly like a
+/// cut one, while it holds all of its bytes: the sample count cannot tell
+/// the two apart, and FLAC states no byte count that could.
+#[test]
+fn a_corrupt_flac_is_short_of_the_samples_it_declares_and_still_ends_cleanly() {
+    let mut bytes = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let (_, payload) = flac_stream_info(&bytes);
+    let declared = flac_declared_samples(&payload);
+    assert_eq!(
+        declared, FIXTURE_FRAMES,
+        "the fixture states its sample count"
+    );
+    // Damage inside the audio: the bytes stay, the frame does not.
+    let middle = bytes.len() / 2;
+    for b in &mut bytes[middle..middle + 16] {
+        *b ^= 0xA5;
+    }
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("flac"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "a damaged file is not a cut file: {outcome:?}"
+    );
+    assert!(
+        frames < declared,
+        "the damaged frame is lost: {frames} of the {declared} samples"
+    );
+    assert!(
+        frames > declared / 2,
+        "only the damaged frame is lost: {frames} of {declared}"
+    );
+}
+
+/// A FLAC file that was cut in the middle of the audio ends cleanly.
+///
+/// The file is short of the samples its `STREAMINFO` block declares - the
+/// first half of the condition the MPEG audio rule uses. The second half is
+/// missing: FLAC states no byte count, so nothing says how many bytes the
+/// file should hold. A damaged FLAC file is short of samples in the same way
+/// (see the corrupt file above), so the shortfall alone is not evidence of a
+/// cut file.
+#[test]
+fn a_flac_cut_in_the_middle_of_the_audio_ends_cleanly_and_is_not_called_truncated() {
+    let full = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let cut = full[..full.len() / 2].to_vec();
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("flac")))
+        .expect("a truncated flac still opens");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(frames > 0, "the file holds whole frames: {frames}");
+    assert!(
+        frames < FIXTURE_FRAMES,
+        "the file is short of the samples it declares: {frames}"
+    );
+    if let Drained::Failed(e) = &outcome {
+        panic!("a FLAC file states no byte count, so it must not be called truncated: {e:?}");
+    }
+}
+
+/// An intact FLAC file delivers exactly the samples its `STREAMINFO` block
+/// declares.
+///
+/// The container reader takes its frame count from that block, so the two
+/// agree without a correction - unlike MPEG audio, where the reader has to
+/// subtract the encoder delay and padding of the LAME extension.
+#[test]
+fn an_intact_flac_delivers_exactly_the_samples_its_stream_info_declares() {
+    let bytes = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let (_, payload) = flac_stream_info(&bytes);
+    let declared = flac_declared_samples(&payload);
+    assert_eq!(
+        declared, FIXTURE_FRAMES,
+        "the fixture states its sample count"
+    );
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("flac"))).expect("open");
+    assert_eq!(
+        d.duration(),
+        Some(Duration::from_millis(1500)),
+        "the declared sample count is the duration"
+    );
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(matches!(outcome, Drained::End), "{outcome:?}");
+    assert_eq!(
+        frames, declared,
+        "the file holds every sample its STREAMINFO block declares"
+    );
+}
+
+/// A FLAC file whose `STREAMINFO` block states no sample count has no
+/// duration and nothing to compare against.
+///
+/// A total sample count of zero means "length unknown" in the format. The
+/// reader then reports no frame count at all, so there is no claim to keep:
+/// the file plays and ends as it always did.
+#[test]
+fn a_flac_that_states_no_sample_count_has_no_duration_and_no_claim() {
+    let mut bytes = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let (at, mut payload) = flac_stream_info(&bytes);
+    flac_set_declared_samples(&mut payload, 0);
+    bytes[at..at + 34].copy_from_slice(&payload);
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("flac"))).expect("open");
+    assert_eq!(
+        d.duration(),
+        None,
+        "a file of unknown length has no duration"
+    );
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(matches!(outcome, Drained::End), "{outcome:?}");
+    assert_eq!(frames, FIXTURE_FRAMES, "the audio is all there");
+}
+
+/// A header that lies is not a cut file.
+///
+/// The `STREAMINFO` block claims twice the samples the file holds. The file
+/// holds all of its bytes, so it was not cut: it ends cleanly, like the
+/// damaged file it resembles.
+#[test]
+fn a_flac_whose_stream_info_lies_about_the_sample_count_is_not_a_cut_file() {
+    let mut bytes = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let (at, mut payload) = flac_stream_info(&bytes);
+    flac_set_declared_samples(&mut payload, FIXTURE_FRAMES * 2);
+    bytes[at..at + 34].copy_from_slice(&payload);
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("flac"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "a wrong header is not a cut file: {outcome:?}"
+    );
+    assert_eq!(frames, FIXTURE_FRAMES, "the file holds all of its frames");
+}
+
+/// A FLAC file without a `STREAMINFO` block cannot be decoded.
+///
+/// The block is the one that states the audio parameters, so a file without
+/// it has nothing to decode: the reader cannot recognise a frame without them
+/// and runs into the end of the file. The file is refused with a defined
+/// error - never a panic, never a hang.
+///
+/// What the refusal *says* is the container reader's business: it reports the
+/// end of the stream, which for a file that is not at its end is a poor
+/// diagnosis. The refusal itself is the documented behaviour.
+#[test]
+fn a_flac_without_a_stream_info_block_is_refused() {
+    let mut bytes = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let (at, _) = flac_stream_info(&bytes);
+    flac_set_block_type(&mut bytes, at, 126);
+    let err = SymphoniaDecoder::open(reader_source(bytes, Some("flac")))
+        .err()
+        .expect("a FLAC file without a STREAMINFO block cannot be decoded");
+    assert_defined_open_failure(&err, "a FLAC file without a STREAMINFO block");
+}
+
+/// A metadata block the reader does not know is skipped.
+///
+/// The padding block of the fixture becomes an unknown block. The reader
+/// skips what it does not know, so the audio is unaffected and the file still
+/// holds every sample it declares.
+#[test]
+fn a_flac_with_an_unknown_metadata_block_still_decodes() {
+    let mut bytes = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let padding = flac_metadata(&bytes)
+        .into_iter()
+        .find(|(kind, _, _)| *kind == 1)
+        .expect("the fixture carries a padding block");
+    flac_set_block_type(&mut bytes, padding.1, 126);
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("flac"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(matches!(outcome, Drained::End), "{outcome:?}");
+    assert_eq!(frames, FIXTURE_FRAMES, "the audio is unaffected");
+}
+
+/// What the format does offer, and why it is not an oracle.
+///
+/// The `STREAMINFO` block declares the minimum frame size in bytes and the
+/// maximum block size in samples. Together with the sample count they give a
+/// *proven lower bound* on the number of audio bytes a complete file must
+/// hold: the number of frames the declared samples need at the declared
+/// maximum block size, times the declared minimum frame size. A file below
+/// that bound cannot hold the samples it declares, so it was cut.
+///
+/// The bound is far below the size of a real file, and it depends on the
+/// content: the smallest frame of a stream is usually its last one, and a
+/// file that ends in silence has a very small last frame. So the bound fires
+/// for some cuts and not for others - a loud failure on it would be an
+/// unstable promise, which is why the decoder does not make one.
+#[test]
+fn the_lower_bound_the_format_offers_is_too_loose_to_be_an_oracle() {
+    let bytes = std::fs::read(fixture("sine.flac")).expect("fixture");
+    let (_, payload) = flac_stream_info(&bytes);
+    let samples = flac_declared_samples(&payload);
+    let max_block = flac_max_block(&payload);
+    let min_frame = flac_min_frame(&payload);
+    assert!(
+        max_block > 0 && min_frame > 0,
+        "the fixture states its frame bounds"
+    );
+    // The fewest frames that can carry the declared samples.
+    let frames = samples.div_ceil(max_block);
+    let bound = frames * min_frame;
+    let audio = (bytes.len() - flac_audio_start(&bytes)) as u64;
+    assert!(
+        bound < audio,
+        "a complete file holds more than the bound: {bound} of {audio} bytes"
+    );
+    assert!(
+        bound * 2 < audio,
+        "the bound is far below the file: {bound} of {audio} bytes - it only catches deep cuts"
+    );
+}
+
 /// A file that holds everything its container declares ends with a plain end
 /// of stream, and the frame count is the one the container states.
 #[test]
