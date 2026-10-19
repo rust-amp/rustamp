@@ -215,6 +215,16 @@ pub enum PlaylistKeyAction {
     /// request and the presenter asks for a file, so the row carries no core
     /// command (writing a file is not a player action, RFC 0005 §9).
     GenerateHtmlPlaylist,
+    /// Ctrl+Alt+E: read the extended info of the selection (`40293`,
+    /// menu-confirmed).
+    ///
+    /// The action reads the tags of the selected entries and shows them in
+    /// the extended-info dialog. S03 §2 gives the id and the chord only, so
+    /// the content is an **own choice** (see
+    /// [`crate::dialogs::ExtendedInfo`]). No core command opens that dialog
+    /// (reading a file's tags is not a player action, RFC 0005 §9), so the
+    /// app opens it itself.
+    ReadExtendedInfo,
     /// Ctrl+F4: close the playlist editor (`40224`, provisional).
     CloseEditor,
     /// Ctrl+W: toggle the editor's windowshade (`40064`).
@@ -277,6 +287,7 @@ impl PlaylistKeyAction {
             Self::FileInfo => 40208,
             Self::BookmarkSelection => 40319,
             Self::GenerateHtmlPlaylist => 40292,
+            Self::ReadExtendedInfo => 40293,
             Self::CloseEditor => 40224,
             Self::ToggleEditorShade => 40064,
             Self::IncreaseFontSize => 40335,
@@ -314,8 +325,8 @@ const fn prow(
 
 /// The playlist editor's shortcut table (S03 §2), in the spec's row order.
 ///
-/// The 86 rows whose command this build can act on. The two remaining rows
-/// of S03 §2 have no command yet and are listed in
+/// The 87 rows whose command this build can act on. The one remaining row
+/// of S03 §2 has no command yet and is listed in
 /// [`UNIMPLEMENTED_PLAYLIST_ROWS`].
 ///
 /// The table is the playlist window's **own** table: it shadows the main
@@ -388,6 +399,12 @@ pub const PLAYLIST_TABLE: &[PlaylistBinding] = &[
         Key::Letter(b'E'),
         Modifiers::ALT,
         PlaylistKeyAction::Shared(ShortcutAction::TogglePlaylistEditor),
+        false,
+    ),
+    prow(
+        Key::Letter(b'E'),
+        Modifiers::CTRL.union(Modifiers::ALT),
+        PlaylistKeyAction::ReadExtendedInfo,
         false,
     ),
     prow(
@@ -866,26 +883,20 @@ pub struct UnimplementedPlaylistRow {
 /// * `Ctrl+E` — `40255` "Edit the playlist entry": no command edits a
 ///   playlist entry, and the target of the edit (the selected entry, not the
 ///   current track) is not specified either.
-/// * `Ctrl+Alt+E` — `40293` "Read extended info on selection": no command
-///   reads extended info.
+///
+/// The `Ctrl+Alt+E` row (`40293` "Read extended info on selection") is **not**
+/// in this list: it reads the tags of the selected entries and shows them
+/// (see [`PlaylistKeyAction::ReadExtendedInfo`]).
 ///
 /// The two font-size rows (`40335` / `40336`) are **not** in this list: they
 /// are view settings of the editor and act on the playlist machine alone
 /// (RFC 0005 §9/§11.6), so they are rows of [`PLAYLIST_TABLE`].
-pub const UNIMPLEMENTED_PLAYLIST_ROWS: &[UnimplementedPlaylistRow] = &[
-    UnimplementedPlaylistRow {
-        key: Key::Letter(b'E'),
-        modifiers: Modifiers::CTRL,
-        command_id: 40255,
-        provisional: false,
-    },
-    UnimplementedPlaylistRow {
-        key: Key::Letter(b'E'),
-        modifiers: Modifiers::CTRL.union(Modifiers::ALT),
-        command_id: 40293,
-        provisional: false,
-    },
-];
+pub const UNIMPLEMENTED_PLAYLIST_ROWS: &[UnimplementedPlaylistRow] = &[UnimplementedPlaylistRow {
+    key: Key::Letter(b'E'),
+    modifiers: Modifiers::CTRL,
+    command_id: 40255,
+    provisional: false,
+}];
 
 /// The S03 §2 row a key press names, if the table binds it.
 ///
@@ -2698,7 +2709,10 @@ mod tests {
             .iter()
             .map(|row| row.command_id)
             .collect();
-        assert_eq!(rows, vec![40255, 40293]);
+        // `Ctrl+E` (40255) is the one S03 §2 row left: no command edits a
+        // playlist entry. `Ctrl+Alt+E` (40293) reads the extended info of
+        // the selection and is a bound row of the table.
+        assert_eq!(rows, vec![40255]);
         // None of them resolves to an action.
         for row in UNIMPLEMENTED_PLAYLIST_ROWS {
             assert_eq!(
@@ -2708,6 +2722,26 @@ mod tests {
                 row.key
             );
         }
+    }
+
+    /// S03 §2 `Ctrl+Alt+E` ("Read extended info on selection", `40293`) is a
+    /// bound row: it reads the tags of the selected entries and shows them.
+    #[test]
+    fn the_extended_info_row_is_bound_and_no_longer_unimplemented() {
+        let chord = Modifiers::CTRL.union(Modifiers::ALT);
+        assert_eq!(
+            playlist_key_action(Key::Letter(b'E'), chord),
+            Some(PlaylistKeyAction::ReadExtendedInfo)
+        );
+        assert_eq!(PlaylistKeyAction::ReadExtendedInfo.command_id(), 40293);
+        assert_eq!(
+            unimplemented_playlist_row(Key::Letter(b'E'), chord),
+            None,
+            "the row is implemented, so it is not listed as unimplemented"
+        );
+        // The row is not provisional: S03 §2 confirms it through the menu.
+        let binding = playlist_key_binding(Key::Letter(b'E'), chord).expect("the row is bound");
+        assert!(!binding.provisional);
     }
 
     /// S03 §2's two font-size rows are bound and act on the playlist machine

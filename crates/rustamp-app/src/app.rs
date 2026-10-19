@@ -194,6 +194,10 @@ pub struct App {
     /// skin browser, preferences); owned here, rendered by `dialogs.rs`,
     /// hosted by `window.rs`.
     pub(crate) dialogs: DialogManager,
+    /// The tags of the selected entries, read when the playlist's
+    /// `Ctrl+Alt+E` row ran (S03 §2 `40293`). A snapshot: the extended-info
+    /// box shows it, and nothing reads the files again while it is open.
+    pub(crate) extended_info: Option<rustamp_ui::dialogs::ExtendedInfo>,
     pub(crate) last_playlist_report: Option<rustamp_playlist::PlaylistReport>,
     /// The format the currently loaded playlist was detected as (RFC 0017
     /// import). `None` means no playlist has been loaded yet, so callers
@@ -414,6 +418,7 @@ impl App {
             playlist: PlaylistWindow::new(),
             library_window: crate::library_window::LibraryWindow::default(),
             dialogs: DialogManager::new(),
+            extended_info: None,
             last_playlist_report: None,
             last_playlist_format: None,
             main_menu_open: false,
@@ -5262,8 +5267,8 @@ mod tests {
     fn rendering_a_dialog_produces_a_frame_of_the_dialog_size() {
         use rustamp_core::command::{OpenMediaKind, PrefsPage};
         use rustamp_ui::{
-            ABOUT_CLIENT_SIZE, DialogKind, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE,
-            LOAD_PLAYLIST_CLIENT_SIZE, OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE,
+            ABOUT_CLIENT_SIZE, DialogKind, EXTENDED_INFO_CLIENT_SIZE, FILE_INFO_CLIENT_SIZE,
+            JUMP_CLIENT_SIZE, LOAD_PLAYLIST_CLIENT_SIZE, OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE,
             SKIN_BROWSER_CLIENT_SIZE,
         };
 
@@ -5271,6 +5276,7 @@ mod tests {
         for (dialog, size) in [
             (DialogKind::About, ABOUT_CLIENT_SIZE),
             (DialogKind::FileInfo, FILE_INFO_CLIENT_SIZE),
+            (DialogKind::ExtendedInfo, EXTENDED_INFO_CLIENT_SIZE),
             (
                 DialogKind::Jump(rustamp_core::command::JumpTarget::Time),
                 JUMP_CLIENT_SIZE,

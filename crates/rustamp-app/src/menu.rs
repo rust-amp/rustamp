@@ -188,6 +188,16 @@ impl App {
                 self.request_html_playlist = true;
                 Ok(None)
             }
+            // The MISC popup's "Read extended info on selection" row is the
+            // editor's `Ctrl+Alt+E` row: the same command id (S03 §2
+            // `40293`), so the menu does what the key does — it reads the
+            // tags of the selection and shows them.
+            rustamp_ui::menu::MenuChoice::UnavailableCommand { command_id, .. }
+                if command_id == rustamp_ui::PlaylistKeyAction::ReadExtendedInfo.command_id() =>
+            {
+                self.show_extended_info();
+                Ok(None)
+            }
             rustamp_ui::menu::MenuChoice::UnavailableCommand { label, command_id } => {
                 self.note(format!(
                     "menu \"{label}\": command {command_id} is not implemented yet"

@@ -95,12 +95,12 @@ pub use behaviour::{
 };
 pub use cursor::{equalizer_cursor, main_window_cursor, playlist_cursor_at};
 pub use dialogs::{
-    ABOUT_CLIENT_SIZE, DialogKind, DialogManager, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE,
-    JUMP_FILE_CLIENT_SIZE, JUMP_FILE_ROWS, LOAD_PLAYLIST_CLIENT_SIZE, MAX_JUMP_FILE_LEN,
-    MAX_JUMP_LEN, MAX_MEDIA_LEN, OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE,
-    SKIN_BROWSER_CLIENT_SIZE, SkinEntry, dialog_for_command, media_item_for_url,
-    media_items_for_paths, opening_command, parse_jump_time_ms, playlist_load_summary_lines,
-    render_dialog, skin_entries,
+    ABOUT_CLIENT_SIZE, DialogKind, DialogManager, EXTENDED_INFO_CLIENT_SIZE, ExtendedInfo,
+    FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE, JUMP_FILE_CLIENT_SIZE, JUMP_FILE_ROWS,
+    LOAD_PLAYLIST_CLIENT_SIZE, MAX_JUMP_FILE_LEN, MAX_JUMP_LEN, MAX_MEDIA_LEN,
+    OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE, SkinEntry,
+    dialog_for_command, extended_info_lines, media_item_for_url, media_items_for_paths,
+    opening_command, parse_jump_time_ms, playlist_load_summary_lines, render_dialog, skin_entries,
 };
 pub use docking::{
     ClassicWindow, DEFAULT_EQUALIZER_POSITION, DEFAULT_MAIN_POSITION, DEFAULT_PLAYLIST_POSITION,
