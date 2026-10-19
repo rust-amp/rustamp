@@ -21,9 +21,16 @@
 //! * File info: the current queue entry's display name (or "no track
 //!   loaded"), the stream line (bitrate / sample rate / channels) and the
 //!   position/duration line, all from the engine snapshot.
-//! * Jump to time: the prompt plus the typed input. Jump to file opens the
-//!   same box shape; confirming it to a playlist index needs the playlist
-//!   and stays open (only the time box confirms, to [`Command::Seek`]).
+//! * Jump to time: the prompt plus the typed input; `Enter` confirms it to
+//!   [`Command::Seek`].
+//! * Jump to file (S03 id 40194): a search box over the playlist. It shows
+//!   the typed search text, the entries whose display text contains it
+//!   (ignoring case) in a scrollable window with the selected one marked,
+//!   and a count line. `Up`/`Down` move the selection, `Enter` plays the
+//!   selected entry ([`Command::PlayEntry`]) and closes the box; with no
+//!   match the box stays open so the search can be corrected. The list
+//!   layout, sorting and wording are unmeasured (S04 open), so the row
+//!   shape and the count line are own choices.
 //! * Load playlist: the spec'd title plus an entry field (or staged pick) for
 //!   the playlist file. `Enter` confirms and loads the chosen playlist file
 //!   through [`App::load_playlist_file`], enqueuing its surviving tracks in
@@ -129,13 +136,18 @@ impl App {
         }
         for (row, &index) in matches.iter().enumerate().skip(first).take(rows) {
             let marker = if row == selected { "> " } else { "  " };
+            let prefix = format!("{marker}{}. ", index + 1);
             let text = queue.get(index).map(|source| source.display());
+            // The row's own prefix takes cells of the line, so the entry's
+            // text gets only what is left; otherwise the tail the user
+            // searched for would be clipped away by the dialog's edge.
+            let cells = jump_row_cells(prefix.chars().count());
             lines.push(format!(
-                "{marker}{}. {}",
-                index + 1,
-                field_tail(&text.unwrap_or_default())
+                "{prefix}{}",
+                tail_within(&text.unwrap_or_default(), cells)
             ));
         }
+        lines.push(format!("{} of {} entries", matches.len(), queue.len()));
         lines
     }
 
@@ -680,23 +692,47 @@ pub(crate) const OPEN_MEDIA_HINT: &str = "Type a path or drop files, Enter adds.
 /// (the reference dialog is an OS picker whose labels are unmeasured, S04 open).
 pub(crate) const OPEN_PLAYLIST_HINT: &str = "Type a path or drop a file, Enter loads.";
 
+/// The width of one `text.bmp` cell in pixels. Own choice (the stand-in
+/// font's cell, see the playlist rows).
+const TEXT_CELL_PX: usize = 5;
+
 /// How many characters of a field fit on one dialog line: the open-media
 /// client width less both text pads, in `text.bmp` cells (5 px).
 const FIELD_CHARS: usize = (rustamp_ui::OPEN_MEDIA_CLIENT_SIZE.0 as usize
     - 2 * rustamp_ui::dialogs::TEXT_PAD as usize)
-    / 5;
+    / TEXT_CELL_PX;
 
-/// The visible part of a field: the whole text when it fits, else `...` plus
-/// its tail, so the end of a long path (the part being typed, and the file
-/// name) stays on screen.
-pub(crate) fn field_tail(text: &str) -> String {
+/// How many characters of a jump-to-file row fit after its own prefix.
+///
+/// The row starts with its number (`"> 12. "`), which takes cells of the
+/// line, so only the rest is left for the entry's text.
+fn jump_row_cells(prefix: usize) -> usize {
+    let cells = (rustamp_ui::JUMP_FILE_CLIENT_SIZE.0 as usize
+        - 2 * rustamp_ui::dialogs::TEXT_PAD as usize)
+        / TEXT_CELL_PX;
+    cells.saturating_sub(prefix)
+}
+
+/// The visible part of a field: the whole text when it fits in `cells`
+/// characters, else `...` plus its tail, so the end of a long path (the part
+/// being typed, and the file name) stays on screen.
+pub(crate) fn tail_within(text: &str, cells: usize) -> String {
     let count = text.chars().count();
-    if count <= FIELD_CHARS {
+    if count <= cells {
         return text.to_string();
     }
-    let keep = FIELD_CHARS - 3;
+    if cells <= 3 {
+        // No room for the ellipsis: the head of the text is all that fits.
+        return text.chars().take(cells).collect();
+    }
+    let keep = cells - 3;
     let tail: String = text.chars().skip(count - keep).collect();
     format!("...{tail}")
+}
+
+/// The visible part of a field on an open-media or load-playlist line.
+pub(crate) fn field_tail(text: &str) -> String {
+    tail_within(text, FIELD_CHARS)
 }
 
 /// The dialog manager type, re-exported for the presenter.
@@ -727,5 +763,35 @@ mod tests {
         assert!(shown.starts_with("..."), "{shown}");
         assert!(shown.ends_with(r"\song.mp3"), "{shown}");
         assert_eq!(shown.chars().count(), FIELD_CHARS);
+    }
+
+    #[test]
+    fn a_tail_fits_the_cells_it_is_given() {
+        // A text that fits is shown whole.
+        assert_eq!(tail_within("abc", 3), "abc");
+        assert_eq!(tail_within("abc", 8), "abc");
+        // A text that does not shows its tail, with the ellipsis in place of
+        // the three cells it takes.
+        let shown = tail_within("0123456789", 8);
+        assert_eq!(shown, "...56789");
+        assert_eq!(shown.chars().count(), 8);
+        // Without room for the ellipsis the head of the text is all that
+        // fits.
+        assert_eq!(tail_within("0123456789", 2), "01");
+    }
+
+    #[test]
+    fn a_jump_row_leaves_room_for_its_own_number() {
+        // The row's prefix takes cells of the line, so the text after it
+        // gets only the rest: otherwise the file name would be clipped.
+        let cells = jump_row_cells("> 12. ".len());
+        let text = "C:\\Music\\a-very-long-file-name-here.mp3";
+        let shown = tail_within(text, cells);
+        assert!(shown.ends_with(".mp3"), "{shown}");
+        let row = format!("> 12. {shown}");
+        let budget = (rustamp_ui::JUMP_FILE_CLIENT_SIZE.0 as usize
+            - 2 * rustamp_ui::dialogs::TEXT_PAD as usize)
+            / TEXT_CELL_PX;
+        assert!(row.chars().count() <= budget, "{} > {budget}", row);
     }
 }

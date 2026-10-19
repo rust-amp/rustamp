@@ -353,6 +353,25 @@ mod tests {
     }
 
     #[test]
+    fn the_jump_to_file_menu_row_opens_the_jump_box() {
+        // The `Jump to file` row (S03 §1 id 40194) runs the same dispatch the
+        // `J` and `Num.` keys run, so it opens the jump-to-file box.
+        use rustamp_core::command::JumpTarget;
+        let mut app = test_app();
+        let outcome = app
+            .activate_menu_item("Jump to file", ShortcutAction::JumpToFile)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            MenuOutcome::Commands(vec![Command::OpenJump {
+                target: JumpTarget::File
+            }])
+        );
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::Jump(JumpTarget::File)));
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
     fn clicking_a_no_action_row_closes_without_dispatching() {
         // `Library` has no S03 row (S04 §2): the popup closes, nothing is
         // submitted, no note is recorded.
