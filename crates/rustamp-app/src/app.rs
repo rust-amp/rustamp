@@ -293,7 +293,11 @@ impl App {
         let events = bus.subscribe();
         let (commands, command_rx) = command_channel();
 
-        let output = create_output(options.output, options.config.audio.output_mode);
+        let output = create_output(
+            options.output,
+            options.config.audio.device.as_deref(),
+            options.config.audio.output_mode,
+        );
 
         let cfg = EngineConfig {
             volume: options.volume,
@@ -552,7 +556,11 @@ impl App {
     /// Preserves the queue, current track index, volume, balance, equalizer
     /// settings, replaygain, limiter, shuffle, and repeat modes.
     pub fn recreate_engine(&mut self) -> Result<()> {
-        let output = create_output(self.output_choice, self.config.audio.output_mode);
+        let output = create_output(
+            self.output_choice,
+            self.config.audio.device.as_deref(),
+            self.config.audio.output_mode,
+        );
         let queue = self.engine.queue().to_vec();
         let current_index = self.engine.current_index();
         let volume = self.engine.volume();

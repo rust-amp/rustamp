@@ -141,7 +141,6 @@ fn an_ignored_field_is_not_advertised() {
     config.audio.fadeout_ms = 800;
     config.audio.gapless = false;
     config.audio.output = "cpal".to_string();
-    config.audio.device = Some("Speakers".to_string());
     config.ui.snap_distance = 25;
     config.playlist.shuffle = true;
     config.playlist.repeat = true;
@@ -159,7 +158,6 @@ fn an_ignored_field_is_not_advertised() {
         "fadeout_ms",
         "gapless",
         "output",
-        "device",
         "shuffle",
         "repeat",
         "manual_advance",
@@ -241,6 +239,57 @@ fn both_output_modes_are_honestly_serialized_without_ignored_field_warnings() {
             mode
         );
     }
+}
+
+#[test]
+fn the_configured_device_is_honestly_serialized_and_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("device.toml");
+
+    let mut config = Config::default();
+    config.audio.device = Some("Speakers (Realtek)".to_string());
+
+    let serialized = serialize_honest(&config).expect("serialize honest config");
+    let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
+    assert_eq!(
+        value["audio"]["device"].as_str(),
+        Some("Speakers (Realtek)"),
+        "the honoured device is written to the file:\n{serialized}"
+    );
+    assert!(
+        ignored_fields_in_toml(&value).is_empty(),
+        "an honoured device does not warn: {:?}",
+        ignored_fields_in_toml(&value)
+    );
+
+    save(&config, &path).expect("save config");
+    let loaded = load(Some(&path)).expect("load config");
+    assert!(
+        loaded.warnings.is_empty(),
+        "the honoured device does not warn: {:?}",
+        loaded.warnings
+    );
+    assert_eq!(
+        loaded.config.audio.device,
+        Some("Speakers (Realtek)".to_string()),
+        "the device survives the round trip"
+    );
+    assert_eq!(loaded.config, config);
+}
+
+#[test]
+fn a_configuration_without_a_device_does_not_advertise_one() {
+    let config = Config::default();
+    assert_eq!(config.audio.device, None);
+
+    let serialized = serialize_honest(&config).expect("serialize honest config");
+    assert!(
+        !serialized.lines().any(|line| line.starts_with("device =")),
+        "an unset device is not written:\n{serialized}"
+    );
+    let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
+    assert!(value["audio"].get("device").is_none());
+    assert!(ignored_fields_in_toml(&value).is_empty());
 }
 
 #[test]

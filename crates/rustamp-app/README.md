@@ -48,6 +48,34 @@ it is ignored by default and **VM-only**, just like `rustamp-output`'s
 `wasapi_exclusive` integration test. Neither is evidence of a real exclusive
 open until explicitly run against the VM's endpoint.
 
+### Audio output device
+
+`audio.device = "Speakers (Realtek)"` selects the output device by name. The
+name is matched the way the backends match it: trimmed, case-insensitive, and
+*contained* in the device's friendly name — `"Speakers"` therefore matches
+`"Speakers (Realtek)"`. Without the key the system default endpoint is used.
+
+The app builds the plan with `rustamp_output::selection::plan` and resolves it
+against the devices that exist (`rustamp_output::selection::resolve`):
+
+* a name that matches exactly one device opens that device (WASAPI on Windows,
+  cpal elsewhere);
+* a name that matches **none** is reported through the app's notes — the note
+  names the wanted device and the devices that do exist — and the player falls
+  back to the default endpoint. The user sees it; the player never switches to
+  another device silently;
+* a name that matches **several** devices is reported the same way, because the
+  player cannot know which one is meant.
+
+The name is carried into the backend that opens the device, and the cpal
+fallback behind WASAPI opens the *same* device. The device is honoured and
+persisted: `audio.device` is written back to the configuration file on a clean
+exit and is no longer reported as an unapplied setting.
+
+Outside Windows the output crate exposes no enumeration, so the name goes to
+the backend unchanged: the backend looks the device up with the same rule and
+refuses to open a device that does not exist.
+
 ### Running the windowed player
 
 ```text
