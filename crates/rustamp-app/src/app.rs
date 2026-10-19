@@ -211,6 +211,13 @@ pub struct App {
     pub(crate) pending_playlist_misc_menu: bool,
     /// A save-playlist request waiting for the presenter (Ctrl+S, S03 §2, command ID 40204).
     pub(crate) request_save_playlist: bool,
+    /// An HTML-playlist request waiting for the presenter (Ctrl+Alt+G, S03 §2,
+    /// command ID 40292).
+    ///
+    /// The document goes where the user says, so the app only records the
+    /// request; the presenter opens the save dialog and hands the answer back
+    /// through [`App::finish_html_playlist`].
+    pub(crate) request_html_playlist: bool,
     /// The user's saved equalizer presets (`presets.eqf` beside the config).
     pub(crate) eq_user_presets: Vec<crate::eq_presets::UserPreset>,
     /// The equalizer's automatic per-track preset rules (`eq-autoload.toml`
@@ -414,6 +421,7 @@ impl App {
             pending_eq_menu: false,
             pending_playlist_misc_menu: false,
             request_save_playlist: false,
+            request_html_playlist: false,
             eq_user_presets: Vec::new(),
             eq_auto_rules: crate::eq_autoload::AutoLoadRules::default(),
             notes: Vec::new(),
@@ -2478,12 +2486,23 @@ impl App {
     pub fn save_playlist_file(&mut self, path: &Path) -> Result<()> {
         let result = self.write_queue_playlist(path);
         if let Err(error) = &result {
-            let msg = format!("failed to save playlist {}: {}", path.display(), error);
-            self.note(format!("error: {msg}"));
-            self.last_error = Some(msg);
-            self.publish_error(error);
+            self.record_failure(
+                format!("failed to save playlist {}: {}", path.display(), error),
+                error,
+            );
         }
         result
+    }
+
+    /// Records a failure the way the file actions do: a note for the log, the
+    /// error the window title shows, and the published error.
+    ///
+    /// One place, so the playlist save and the HTML playlist cannot drift
+    /// apart in how they report a failed write.
+    pub(crate) fn record_failure(&mut self, message: String, error: &Error) {
+        self.note(format!("error: {message}"));
+        self.last_error = Some(message);
+        self.publish_error(error);
     }
 
     fn write_queue_playlist(&self, path: &Path) -> Result<()> {
@@ -2735,7 +2754,7 @@ impl App {
     }
 
     /// Names the last playlist load carried, by location.
-    fn loaded_titles(&self) -> HashMap<MediaLocation, String> {
+    pub(crate) fn loaded_titles(&self) -> HashMap<MediaLocation, String> {
         self.last_playlist_report
             .as_ref()
             .map(|report| {
@@ -2754,7 +2773,7 @@ impl App {
     }
 
     /// Durations the last playlist load carried, by location.
-    fn loaded_durations(&self) -> HashMap<MediaLocation, u64> {
+    pub(crate) fn loaded_durations(&self) -> HashMap<MediaLocation, u64> {
         self.last_playlist_report
             .as_ref()
             .map(|report| {

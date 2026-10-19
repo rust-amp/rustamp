@@ -172,6 +172,33 @@ the whole tree. Only the files the player's decoders claim are added; a
 playlist file inside the directory is not imported (loading a playlist is the
 LIST OPTS path). See `src/directory.rs` for the rules and their tests.
 
+## The HTML playlist
+
+`Ctrl+Alt+G` in the playlist editor (command id **40292**, S03 §2) and the MISC
+menu's "Generate HTML playlist" row — the same id — write the current queue as
+one HTML document. The document is a table of the entries (number, title,
+length, location) under a title, next to the moment it was written and the
+number of entries; it names no external file and runs no script.
+
+The document is made by a **pure** generator (`src/html_playlist.rs`): the
+entries and the date go in, the text comes out, and every text that comes
+from the playlist is escaped, so a title with a `<` in it stays a title. The
+app half collects the entries from the queue — the title the last playlist
+load carried, else the file name, and the length it carried, if any — and
+writes the document to the file the user chose.
+
+The file is asked for the same way the playlist save asks for its file: the
+app records the request, the presenter opens the native save dialog from the
+tick (`window::drain_html_playlist`,
+`rustamp_platform::save_html_playlist_file`, filter `*.html`, default name
+`playlist.html`) and hands the answer back. A cancelled dialog writes nothing
+and is noted.
+
+**Own choices.** S03 §2 fixes the id and the chord and nothing else about the
+document: its title ("Rustamp playlist"), its columns, the wording of the
+summary line, the `--:--` cell for an entry without a known length and the
+UTC date format are ours.
+
 ## The equalizer's automatic per-track presets (AUTO)
 
 The equalizer window's AUTO button (`A`, command 40245) switches the engine's

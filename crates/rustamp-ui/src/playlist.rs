@@ -209,6 +209,12 @@ pub enum PlaylistKeyAction {
     FileInfo,
     /// Alt+I: bookmark the selected item(s) (`40319`, menu-confirmed).
     BookmarkSelection,
+    /// Ctrl+Alt+G: generate an HTML playlist (`40292`, menu-confirmed).
+    ///
+    /// The document is written where the user says: the app records the
+    /// request and the presenter asks for a file, so the row carries no core
+    /// command (writing a file is not a player action, RFC 0005 §9).
+    GenerateHtmlPlaylist,
     /// Ctrl+F4: close the playlist editor (`40224`, provisional).
     CloseEditor,
     /// Ctrl+W: toggle the editor's windowshade (`40064`).
@@ -270,6 +276,7 @@ impl PlaylistKeyAction {
             Self::Reverse => 40213,
             Self::FileInfo => 40208,
             Self::BookmarkSelection => 40319,
+            Self::GenerateHtmlPlaylist => 40292,
             Self::CloseEditor => 40224,
             Self::ToggleEditorShade => 40064,
             Self::IncreaseFontSize => 40335,
@@ -307,7 +314,7 @@ const fn prow(
 
 /// The playlist editor's shortcut table (S03 §2), in the spec's row order.
 ///
-/// The 85 rows whose command this build can act on. The three remaining rows
+/// The 86 rows whose command this build can act on. The two remaining rows
 /// of S03 §2 have no command yet and are listed in
 /// [`UNIMPLEMENTED_PLAYLIST_ROWS`].
 ///
@@ -393,6 +400,12 @@ pub const PLAYLIST_TABLE: &[PlaylistBinding] = &[
         Key::Letter(b'G'),
         Modifiers::ALT,
         PlaylistKeyAction::Shared(ShortcutAction::ToggleEqualizer),
+        false,
+    ),
+    prow(
+        Key::Letter(b'G'),
+        Modifiers::CTRL.union(Modifiers::ALT),
+        PlaylistKeyAction::GenerateHtmlPlaylist,
         false,
     ),
     prow(
@@ -855,8 +868,6 @@ pub struct UnimplementedPlaylistRow {
 ///   current track) is not specified either.
 /// * `Ctrl+Alt+E` — `40293` "Read extended info on selection": no command
 ///   reads extended info.
-/// * `Ctrl+Alt+G` — `40292` "Generate HTML playlist": no command writes an
-///   HTML playlist.
 ///
 /// The two font-size rows (`40335` / `40336`) are **not** in this list: they
 /// are view settings of the editor and act on the playlist machine alone
@@ -872,12 +883,6 @@ pub const UNIMPLEMENTED_PLAYLIST_ROWS: &[UnimplementedPlaylistRow] = &[
         key: Key::Letter(b'E'),
         modifiers: Modifiers::CTRL.union(Modifiers::ALT),
         command_id: 40293,
-        provisional: false,
-    },
-    UnimplementedPlaylistRow {
-        key: Key::Letter(b'G'),
-        modifiers: Modifiers::CTRL.union(Modifiers::ALT),
-        command_id: 40292,
         provisional: false,
     },
 ];
@@ -2688,12 +2693,12 @@ mod tests {
     }
 
     #[test]
-    fn the_unimplemented_rows_are_the_three_s03_rows_without_a_command() {
+    fn the_unimplemented_rows_are_the_s03_rows_without_a_command() {
         let rows: Vec<u32> = UNIMPLEMENTED_PLAYLIST_ROWS
             .iter()
             .map(|row| row.command_id)
             .collect();
-        assert_eq!(rows, vec![40255, 40293, 40292]);
+        assert_eq!(rows, vec![40255, 40293]);
         // None of them resolves to an action.
         for row in UNIMPLEMENTED_PLAYLIST_ROWS {
             assert_eq!(

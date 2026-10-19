@@ -1579,6 +1579,43 @@ impl Windowed {
         eprintln!("rustamp: a native save dialog is only implemented on Windows");
     }
 
+    /// Shows the native save dialog for the HTML playlist (S03 §2 `40292`).
+    ///
+    /// `Ctrl+Alt+G` in the playlist editor and the MISC menu's "Generate HTML
+    /// playlist" row are the same command: the app records the request, the
+    /// presenter asks where the document goes (the platform's HTML save
+    /// dialog) and hands the answer back. A cancelled dialog writes nothing;
+    /// the app notes it.
+    fn drain_html_playlist(&mut self) {
+        if !std::mem::take(&mut self.app.request_html_playlist) {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let owner = self.raw_main_window();
+            match rustamp_platform::save_html_playlist_file(
+                owner,
+                "Generate HTML Playlist",
+                "playlist.html",
+            ) {
+                Ok(Some(path)) => match self.app.finish_html_playlist(Some(path.as_path())) {
+                    Ok(()) => println!("rustamp: HTML playlist written to {}", path.display()),
+                    Err(error) => eprintln!("rustamp: the HTML playlist was not written: {error}"),
+                },
+                // The user closed the dialog: the app notes that nothing was
+                // written.
+                Ok(None) => {
+                    if let Err(error) = self.app.finish_html_playlist(None) {
+                        eprintln!("rustamp: the HTML playlist was not written: {error}");
+                    }
+                }
+                Err(error) => eprintln!("rustamp: no save dialog: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        eprintln!("rustamp: a native save dialog is only implemented on Windows");
+    }
+
     /// Opens (or raises) the native preferences dialog, then relays what the
     /// user did in it. The dialog is modeless: it lives on this thread's
     /// message loop, so the tick only has to feed it the player's settings and
@@ -2816,6 +2853,7 @@ impl ApplicationHandler for Windowed {
         self.drain_eq_menu();
         self.drain_media_pick();
         self.drain_save_playlist();
+        self.drain_html_playlist();
         self.drain_prefs();
         self.drain_library_folder_pick();
         // After every window has been synced, so a focus request for a window

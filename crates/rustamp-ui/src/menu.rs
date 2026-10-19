@@ -1127,7 +1127,8 @@ pub fn native_visualization_menu() -> NativeMainMenu {
 /// explicitly refuted. Labels, order, separator, hints and the unchecked,
 /// enabled state below match the nothing-loaded capture. Loaded-state
 /// comparisons remain open (S04 §9). S03 §2 supplies the ids.
-/// Neither id has an app command yet, so a choice reports that limitation.
+/// Neither id is a player command, so a choice reports that limitation; the
+/// app routes the one id it implements (`40292`, the HTML playlist) itself.
 pub fn native_playlist_misc_menu() -> NativeMainMenu {
     let mut rows = Vec::new();
     let mut choices = Vec::new();

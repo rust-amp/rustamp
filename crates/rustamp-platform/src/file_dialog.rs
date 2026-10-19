@@ -243,6 +243,14 @@ pub const PLAYLIST_SAVE_FILTERS: &[(&str, &str)] = &[
     ("XSPF Playlist", "*.xspf"),
 ];
 
+/// The file types the HTML-playlist save dialog offers, in order, as
+/// (label, patterns).
+///
+/// Own choice: the generated document is one HTML file, so `*.html` is what
+/// the dialog offers. `All files` is last so a file the user names
+/// differently stays reachable.
+pub const HTML_SAVE_FILTERS: &[(&str, &str)] = &[("HTML playlist", "*.html"), ("All files", "*.*")];
+
 /// Shows the standard file-save dialog and returns the path the user chose.
 ///
 /// `raw_owner` is the owner window's handle; the dialog is modal to it.
@@ -256,6 +264,53 @@ pub fn save_playlist_file(
     title: &str,
     default_name: &str,
 ) -> Result<Option<PathBuf>, FileDialogError> {
+    save_file(raw_owner, title, default_name, PLAYLIST_SAVE_FILTERS, "m3u")
+}
+
+/// Shows the standard file-save dialog for an HTML document (`*.html`).
+///
+/// The same dialog as [`save_playlist_file`] with the HTML filter and the
+/// `html` default extension: a cancelled dialog is `Ok(None)`, and the
+/// chosen path comes back as it is.
+#[cfg(windows)]
+pub fn save_html_playlist_file(
+    raw_owner: isize,
+    title: &str,
+    default_name: &str,
+) -> Result<Option<PathBuf>, FileDialogError> {
+    save_file(raw_owner, title, default_name, HTML_SAVE_FILTERS, "html")
+}
+
+/// Stub: there is no native file dialog off Windows yet (milestone M6).
+#[cfg(not(windows))]
+pub fn save_playlist_file(
+    _raw_owner: isize,
+    _title: &str,
+    _default_name: &str,
+) -> Result<Option<PathBuf>, FileDialogError> {
+    Err(FileDialogError::Unsupported)
+}
+
+/// Stub: there is no native file dialog off Windows yet (milestone M6).
+#[cfg(not(windows))]
+pub fn save_html_playlist_file(
+    _raw_owner: isize,
+    _title: &str,
+    _default_name: &str,
+) -> Result<Option<PathBuf>, FileDialogError> {
+    Err(FileDialogError::Unsupported)
+}
+
+/// The save dialog itself, with the filter list and the default extension
+/// the caller wants.
+#[cfg(windows)]
+fn save_file(
+    raw_owner: isize,
+    title: &str,
+    default_name: &str,
+    filters: &[(&str, &str)],
+    default_extension: &str,
+) -> Result<Option<PathBuf>, FileDialogError> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Controls::Dialogs::{
         CommDlgExtendedError, GetSaveFileNameW, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
@@ -266,14 +321,16 @@ pub fn save_playlist_file(
     if raw_owner == 0 {
         return Err(FileDialogError::NullOwner);
     }
-    let mut filter = filter_string(PLAYLIST_SAVE_FILTERS);
+    let mut filter = filter_string(filters);
     let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
+    let extension: Vec<u16> = default_extension.encode_utf16().chain([0]).collect();
+    let name_units = default_name.encode_utf16().count();
     let mut selection: Vec<u16> = default_name
         .encode_utf16()
         .chain([0])
         .chain(std::iter::repeat_n(
             0,
-            SELECTION_BUFFER_UNITS - default_name.len() - 1,
+            SELECTION_BUFFER_UNITS.saturating_sub(name_units + 1),
         ))
         .collect();
     let flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
@@ -284,14 +341,15 @@ pub fn save_playlist_file(
         lpstrFile: PWSTR(selection.as_mut_ptr()),
         nMaxFile: SELECTION_BUFFER_UNITS as u32,
         lpstrTitle: PCWSTR(title.as_ptr()),
-        nFilterIndex: 1, // Default to M3U
-        lpstrDefExt: PCWSTR(['m' as u16, '3' as u16, 'u' as u16, 0].as_ptr()),
+        nFilterIndex: 1, // The first filter is the default one.
+        lpstrDefExt: PCWSTR(extension.as_ptr()),
         Flags: flags,
         ..Default::default()
     };
     // SAFETY: every pointer in `options` is to a live local buffer that
     // outlives this call, `nMaxFile` is the real length of `selection`, and
-    // the filter and title are NUL-terminated. The call is synchronous.
+    // the filter, the title and the extension are NUL-terminated. The call is
+    // synchronous.
     let chosen = unsafe { GetSaveFileNameW(&mut options) }.as_bool();
     if !chosen {
         // SAFETY: read immediately after the call, before any other OS call.
@@ -305,16 +363,6 @@ pub fn save_playlist_file(
     // Parse the single selected path (save dialog never returns multiple)
     let paths = parse_selection(&selection);
     Ok(paths.first().cloned())
-}
-
-/// Stub: there is no native save dialog off Windows yet (milestone M6).
-#[cfg(not(windows))]
-pub fn save_playlist_file(
-    _raw_owner: isize,
-    _title: &str,
-    _default_name: &str,
-) -> Result<Option<PathBuf>, FileDialogError> {
-    Err(FileDialogError::Unsupported)
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +669,31 @@ mod tests {
                 .all(|(label, patterns)| !label.is_empty() && patterns.contains('*'))
         );
         assert_eq!(MEDIA_FILTERS.last().map(|(_, p)| *p), Some("*.*"));
+    }
+
+    /// The HTML dialog offers the one file type the document is, and keeps
+    /// `All files` last so a file named otherwise stays reachable.
+    #[test]
+    fn the_html_filters_offer_the_document_and_keep_all_files_last() {
+        assert_eq!(HTML_SAVE_FILTERS[0], ("HTML playlist", "*.html"));
+        assert!(
+            HTML_SAVE_FILTERS
+                .iter()
+                .all(|(label, patterns)| !label.is_empty() && patterns.contains('*'))
+        );
+        assert_eq!(HTML_SAVE_FILTERS.last().map(|(_, p)| *p), Some("*.*"));
+    }
+
+    /// The playlist dialog keeps its own formats: the HTML filter is a
+    /// sibling of it, not a replacement.
+    #[test]
+    fn the_playlist_filters_are_the_playlist_formats_only() {
+        assert_eq!(PLAYLIST_SAVE_FILTERS.len(), 4);
+        assert!(
+            PLAYLIST_SAVE_FILTERS
+                .iter()
+                .all(|(_, patterns)| !patterns.contains("html"))
+        );
     }
 
     /// The case the whole directory contract turns on: the user closed the

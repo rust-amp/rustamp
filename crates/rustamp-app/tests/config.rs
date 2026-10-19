@@ -249,7 +249,7 @@ fn the_configured_device_is_honestly_serialized_and_round_trips() {
     let mut config = Config::default();
     config.audio.device = Some("Speakers (Realtek)".to_string());
 
-    let serialized = serialize_honest(&config).expect("serialize honest config");
+    let serialized = serialize_honest(&config, None).expect("serialize honest config");
     let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
     assert_eq!(
         value["audio"]["device"].as_str(),
@@ -262,7 +262,7 @@ fn the_configured_device_is_honestly_serialized_and_round_trips() {
         ignored_fields_in_toml(&value)
     );
 
-    save(&config, &path).expect("save config");
+    save(&config, None, &path).expect("save config");
     let loaded = load(Some(&path)).expect("load config");
     assert!(
         loaded.warnings.is_empty(),
@@ -282,7 +282,7 @@ fn a_configuration_without_a_device_does_not_advertise_one() {
     let config = Config::default();
     assert_eq!(config.audio.device, None);
 
-    let serialized = serialize_honest(&config).expect("serialize honest config");
+    let serialized = serialize_honest(&config, None).expect("serialize honest config");
     assert!(
         !serialized.lines().any(|line| line.starts_with("device =")),
         "an unset device is not written:\n{serialized}"

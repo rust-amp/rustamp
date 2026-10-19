@@ -177,6 +177,17 @@ impl App {
                 Ok(Some(MenuOutcome::Commands(vec![command])))
             }
             rustamp_ui::menu::MenuChoice::NoAction { .. } => Ok(None),
+            // The playlist MISC popup's "Generate HTML playlist" row is the
+            // editor's `Ctrl+Alt+G` row: the same command id (S03 §2
+            // `40292`), so the menu does what the key does. The app records
+            // the request and the presenter asks where the document goes.
+            rustamp_ui::menu::MenuChoice::UnavailableCommand { command_id, .. }
+                if command_id
+                    == rustamp_ui::PlaylistKeyAction::GenerateHtmlPlaylist.command_id() =>
+            {
+                self.request_html_playlist = true;
+                Ok(None)
+            }
             rustamp_ui::menu::MenuChoice::UnavailableCommand { label, command_id } => {
                 self.note(format!(
                     "menu \"{label}\": command {command_id} is not implemented yet"

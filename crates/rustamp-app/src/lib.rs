@@ -38,6 +38,9 @@
 //!   assembling [`rustamp_core::state::PlayerState`] snapshots and publishing
 //!   them as [`rustamp_ipc::Message::PlayerStateUpdate`] over the existing
 //!   control channel (RFC 0006), and reading the host's plug-in answers back.
+//! * [`html_playlist`] — the HTML playlist (S03 §2 `40292`): the pure
+//!   document generator and the app half that writes it where the user says.
+//!   Headless; the save dialog lives in `rustamp-platform`.
 //! * [`plugin_inventory`] — what the host told us about its plug-ins: the
 //!   host-assigned id, the name and the kind of every loaded plug-in. The
 //!   ids belong to one host process (RFC 0020 Q6).
@@ -89,6 +92,7 @@ pub mod eq_presets;
 mod external_control;
 pub mod focus;
 pub mod host;
+pub mod html_playlist;
 pub mod library_window;
 pub mod menu;
 pub mod modern_shell;
