@@ -59,7 +59,7 @@ pub mod webamp;
 
 pub use cursor::CursorSlot;
 pub use error::{Result, SkinError};
-pub use pledit::PlaylistStyle;
+pub use pledit::{PlaylistFont, PlaylistStyle};
 pub use raster::RasterImage;
 pub use region::{Polygon, Region, RegionSection};
 pub use region_mask::{MaskSpan, RegionMask, build_mask};

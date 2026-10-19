@@ -187,7 +187,10 @@ fn text_files_parse_results_match_rust_theme() {
     assert_eq!(pledit.current, [0xFF, 0xFF, 0xFF]);
     assert_eq!(pledit.normal_bg, [0x14, 0x15, 0x17]);
     assert_eq!(pledit.selected_bg, [0x00, 0x00, 0xC6]);
-    assert_eq!(pledit.font.as_deref(), Some("Arial"));
+    assert_eq!(
+        pledit.font.as_ref().map(|font| font.family.as_str()),
+        Some("Arial")
+    );
 
     let vis = rustamp_skin::viscolor::parse_viscolors(rust_theme::viscolor_str());
     assert_eq!(vis.len(), 24);

@@ -129,3 +129,37 @@ Three decisions are recorded here because S17 §7 does not settle them:
 The mask belongs to one window size: a window that changes its size needs a
 new mask. The application applies the mask to the client area; the crate
 never calls the system itself.
+
+## 7. The `Font=` line
+
+`PlaylistStyle::font` is an `Option<PlaylistFont>`: the family the skin asks
+for, the size in pixels when the file named one, and the two style flags.
+(The field was an `Option<String>` before; it now carries the parsed request,
+so a consumer does not have to parse the line a second time.)
+
+**What S17 §5 settles:** the key, the family name and the base skin's value
+`Font=Arial`. The list is drawn with that real font, not with the `text.bmp`
+bitmap font.
+
+**What S17 §5 does not settle:** a size, a style, and "a `Font` name that is
+not installed" — the spec lists all three as *not determined*. The syntax
+below is therefore this crate's own reading of the classic `Font=Name,size`
+form, and the decisions are recorded here:
+
+1. **The value is `Name[,size[,style...]]`.** The first comma-separated token
+   is the family name. Every later token is either a size in pixels (a
+   decimal number between 1 and 255) or one of the style flags `bold` and
+   `italic` (case-insensitive). A token that is none of these is ignored,
+   and the first size wins.
+2. **A value without a family name is malformed**, and a malformed value
+   leaves the built-in default font in place — the same rule a malformed
+   colour follows. A skin that names no `Font=` line at all keeps the
+   default too.
+3. **The size is the size the playlist rows are drawn at.** A skin that names
+   no size gets the playlist's own 13 px (S01 §4.2's row pitch); that
+   default belongs to `rustamp-ui`, not to this crate, so `PlaylistFont::size`
+   stays an `Option`.
+
+The host side of the fallback (a family the machine does not have) lives in
+`rustamp-ui`: the requested family, then the base skin's own family, then
+the generic sans-serif.

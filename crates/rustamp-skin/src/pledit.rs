@@ -5,8 +5,90 @@
 //! may carry extra characters, which are trimmed to the first colour. Missing
 //! keys and a missing or empty file keep the documented defaults (ported from
 //! webamp; see [`crate::webamp`]).
+//!
+//! # The `Font=` line
+//!
+//! S17 §5 settles the key and the family name: the base skin's file says
+//! `Font=Arial`, and the playlist list is drawn with that real font rather
+//! than with the `text.bmp` bitmap font. The spec settles **nothing** about a
+//! size or a style - it lists "a `Font` name that is not installed" as *not
+//! determined* - so the size and the style flags follow the classic
+//! `Font=Name,size` form and are this crate's own reading.
+//!
+//! ```text
+//! Font=Arial            // the family only
+//! Font=Arial,12         // the family and a size in pixels
+//! Font=Arial,12,bold    // ... and a bold face
+//! Font=Arial,12,italic  // ... and an italic face
+//! ```
+//!
+//! The family name is the first comma-separated token; every later token is
+//! either a size in pixels (a decimal number) or one of the style flags
+//! `bold` and `italic` (case-insensitive). A token that is none of these is
+//! ignored, and the first size wins. A value without a family name is
+//! malformed and - like a malformed colour - leaves the built-in default
+//! font in place.
 
 use crate::ini::parse_ini;
+
+/// The largest size a `Font=` line may ask for.
+///
+/// A size outside the range is ignored like any other unusable token, so a
+/// skin cannot make the playlist draw an unreadable row.
+const MAX_FONT_SIZE: u32 = 255;
+
+/// The font a skin's `pledit.txt` asks the playlist to draw with.
+///
+/// S17 §5 settles the family name; the size and the style flags are read
+/// from the same line in the classic `Font=Name,size` form (see the module
+/// docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistFont {
+    /// The family name, as the file wrote it.
+    pub family: String,
+    /// The size in pixels, when the file named one.
+    pub size: Option<u32>,
+    /// Whether the file asked for a bold face.
+    pub bold: bool,
+    /// Whether the file asked for an italic face.
+    pub italic: bool,
+}
+
+impl PlaylistFont {
+    /// Parses the value of a `Font=` line.
+    ///
+    /// The value is `Name[,size[,style...]]`; see the module docs for the
+    /// rules. A value without a family name is malformed and yields `None`,
+    /// which leaves the caller's default font in place.
+    pub fn parse(value: &str) -> Option<PlaylistFont> {
+        let mut tokens = value.split(',').map(str::trim);
+        let family = tokens.next()?;
+        if family.is_empty() {
+            return None;
+        }
+        let mut font = PlaylistFont {
+            family: family.to_string(),
+            size: None,
+            bold: false,
+            italic: false,
+        };
+        for token in tokens {
+            if font.size.is_none()
+                && !token.is_empty()
+                && token.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(size) = token.parse::<u32>()
+                && (1..=MAX_FONT_SIZE).contains(&size)
+            {
+                font.size = Some(size);
+            } else if token.eq_ignore_ascii_case("bold") {
+                font.bold = true;
+            } else if token.eq_ignore_ascii_case("italic") {
+                font.italic = true;
+            }
+        }
+        Some(font)
+    }
+}
 
 /// The playlist colours and font from `pledit.txt`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +105,8 @@ pub struct PlaylistStyle {
     pub menu_bar_fg: Option<[u8; 3]>,
     /// Menu-bar background colour (`mbBG`), when present.
     pub menu_bar_bg: Option<[u8; 3]>,
-    /// The playlist font, when present.
-    pub font: Option<String>,
+    /// The playlist font, when the file names one.
+    pub font: Option<PlaylistFont>,
 }
 
 impl Default for PlaylistStyle {
@@ -40,7 +122,12 @@ impl Default for PlaylistStyle {
             selected_bg: DEFAULT_PLAYLIST_SELECTED_BG,
             menu_bar_fg: None,
             menu_bar_bg: None,
-            font: Some(DEFAULT_PLAYLIST_FONT.to_string()),
+            font: Some(PlaylistFont {
+                family: DEFAULT_PLAYLIST_FONT.to_string(),
+                size: None,
+                bold: false,
+                italic: false,
+            }),
         }
     }
 }
@@ -74,9 +161,9 @@ impl PlaylistStyle {
             style.menu_bar_bg = Some(value);
         }
         if let Some(value) = section.get("font")
-            && !value.is_empty()
+            && let Some(font) = PlaylistFont::parse(value)
         {
-            style.font = Some(value.clone());
+            style.font = Some(font);
         }
         style
     }
@@ -121,6 +208,14 @@ fn parse_color(value: &str) -> Option<[u8; 3]> {
 mod tests {
     use super::*;
 
+    /// The font of a parsed style as `(family, size, bold, italic)`.
+    fn font_of(style: &PlaylistStyle) -> Option<(&str, Option<u32>, bool, bool)> {
+        style
+            .font
+            .as_ref()
+            .map(|font| (font.family.as_str(), font.size, font.bold, font.italic))
+    }
+
     #[test]
     fn defaults_when_empty() {
         assert_eq!(PlaylistStyle::parse(""), PlaylistStyle::default());
@@ -141,7 +236,51 @@ mod tests {
         );
         assert_eq!(style.normal, [0x12, 0x34, 0x56]);
         assert_eq!(style.current, [0xFF, 0xFF, 0xFF]);
-        assert_eq!(style.font.as_deref(), Some("Tahoma"));
+        assert_eq!(font_of(&style), Some(("Tahoma", None, false, false)));
+    }
+
+    /// S17 §5 settles the family name; the size and the style flags follow
+    /// the classic `Font=Name,size` form.
+    #[test]
+    fn font_line_carries_the_family_the_size_and_the_style_flags() {
+        let style = PlaylistStyle::parse("[Text]\nFont=Arial,12,bold,italic\n");
+        assert_eq!(font_of(&style), Some(("Arial", Some(12), true, true)));
+    }
+
+    #[test]
+    fn font_line_without_a_size_leaves_the_size_open() {
+        let style = PlaylistStyle::parse("[Text]\nFont=Tahoma\n");
+        assert_eq!(font_of(&style), Some(("Tahoma", None, false, false)));
+    }
+
+    #[test]
+    fn font_line_ignores_the_tokens_it_cannot_use() {
+        let style = PlaylistStyle::parse("[Text]\nFont=Arial,wide,999,bold\n");
+        // "wide" is not a token the format knows and 999 is out of range, so
+        // the family and the bold flag are the only things that survive.
+        assert_eq!(font_of(&style), Some(("Arial", None, true, false)));
+    }
+
+    #[test]
+    fn the_first_size_wins() {
+        let style = PlaylistStyle::parse("[Text]\nFont=Arial,12,14\n");
+        assert_eq!(font_of(&style), Some(("Arial", Some(12), false, false)));
+    }
+
+    /// A malformed font line is handled like a malformed colour: the
+    /// built-in default stays in place.
+    #[test]
+    fn a_malformed_font_line_keeps_the_default_font() {
+        for value in ["", " ", ",12", ",,,"] {
+            let style = PlaylistStyle::parse(&format!("[Text]\nFont={value}\n"));
+            assert_eq!(style.font, PlaylistStyle::default().font, "Font={value:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_font_line_keeps_the_default_font() {
+        let style = PlaylistStyle::parse("[Text]\nNormal=#00FF00\n");
+        assert_eq!(style.font, PlaylistStyle::default().font);
     }
 
     #[test]
@@ -170,7 +309,7 @@ mod tests {
         assert_eq!(style.current, [0xFF, 0xFF, 0xFF]);
         assert_eq!(style.normal_bg, [0x00, 0x00, 0x00]);
         assert_eq!(style.selected_bg, [0x00, 0x00, 0xC6]);
-        assert_eq!(style.font.as_deref(), Some("Arial"));
+        assert_eq!(font_of(&style), Some(("Arial", None, false, false)));
 
         // The colours S17 §5 saw without a `pledit.txt` are the defaults.
         let defaults = PlaylistStyle::default();

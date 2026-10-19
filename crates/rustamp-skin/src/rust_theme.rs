@@ -181,6 +181,9 @@ mod tests {
         assert_eq!(style.current, [0xFF; 3]);
         assert_eq!(style.normal_bg, [0x14, 0x15, 0x17]);
         assert_eq!(style.selected_bg, [0x00, 0x00, 0xC6]);
-        assert_eq!(style.font.as_deref(), Some("Arial"));
+        assert_eq!(
+            style.font.as_ref().map(|font| font.family.as_str()),
+            Some("Arial")
+        );
     }
 }

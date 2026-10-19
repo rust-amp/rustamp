@@ -110,7 +110,10 @@ fn base291_archive_native_sheets_metadata_and_tables() {
     assert_eq!(skin.pledit().current, [255; 3]);
     assert_eq!(skin.pledit().normal_bg, [0; 3]);
     assert_eq!(skin.pledit().selected_bg, [0, 0, 198]);
-    assert_eq!(skin.pledit().font.as_deref(), Some("Arial"));
+    assert_eq!(
+        skin.pledit().font.as_ref().map(|font| font.family.as_str()),
+        Some("Arial")
+    );
     assert!(skin.region().is_empty()); // All base-skin polygons are comments.
     assert_eq!(skin.viscolors(), &webamp::DEFAULT_VISCOLORS);
     for name in [
@@ -833,6 +836,28 @@ fn memory_skin(font: &str, replace_text: bool) -> Skin {
     Skin::from_source(&mut memory, &BuiltinDefaultSkin).unwrap()
 }
 
+/// Asserts that a playlist row holds nothing but the skin's ink and
+/// background colours, and that both of them reach the row.
+fn assert_row_is_pure(frame: &Image, i: usize, ink: [u8; 3], bg: [u8; 3]) {
+    let row = row_rect(i).unwrap();
+    let ink = [ink[0], ink[1], ink[2], 255];
+    let bg = [bg[0], bg[1], bg[2], 255];
+    let mut has_ink = false;
+    let mut has_bg = false;
+    for y in row.y..row.bottom() {
+        for x in row.x..row.right() {
+            let p = frame.pixel(x, y).unwrap();
+            assert!(p == ink || p == bg, "row {i}: off-palette pixel {p:?}");
+            has_bg |= p == bg;
+            has_ink |= p == ink;
+        }
+    }
+    assert!(
+        has_bg && has_ink,
+        "skin text and background colours must both reach row {i}"
+    );
+}
+
 #[test]
 fn base291_playlist_font_is_the_requested_system_family_not_text_bmp() {
     let skin = skin();
@@ -856,24 +881,45 @@ fn base291_playlist_font_is_the_requested_system_family_not_text_bmp() {
         "Font= must change actual glyph shapes"
     );
     for (i, ink, bg) in [(0, [255u8; 3], [0u8; 3]), (1, [0, 255, 0], [0, 0, 198])] {
-        let row = row_rect(i).unwrap();
-        let ink = [ink[0], ink[1], ink[2], 255];
-        let bg = [bg[0], bg[1], bg[2], 255];
-        let mut has_ink = false;
-        let mut has_bg = false;
-        for y in row.y..row.bottom() {
-            for x in row.x..row.right() {
-                let p = frame.pixel(x, y).unwrap();
-                assert!(p == ink || p == bg, "row {i}: off-palette pixel {p:?}");
-                has_bg |= p == bg;
-                has_ink |= p == ink;
-            }
-        }
-        assert!(
-            has_bg && has_ink,
-            "skin text and background colours must both reach row {i}"
-        );
+        assert_row_is_pure(&frame, i, ink, bg);
     }
+}
+
+/// S17 §5 settles the family name of the `Font=` line; the size and the
+/// style flags are read from the same line (see `rustamp_skin::pledit`).
+#[test]
+fn base291_playlist_font_size_comes_from_the_pledit_line() {
+    let mut window = PlaylistWindow::new();
+    window.set_entries(vec![EntryId(1), EntryId(2)]);
+    let labels = vec!["1. Mixed Case WWW iii".into(), "2. Track Title".into()];
+    let render = |skin: &Skin| render_playlist_window(skin, &window, &labels, true);
+
+    let plain = render(&memory_skin("Courier New", false));
+    let smaller = render(&memory_skin("Courier New,10", false));
+    assert_ne!(
+        plain, smaller,
+        "the size in the Font= line must change the row"
+    );
+    // The 1-bit contract survives the new font: a row still holds the
+    // skin's ink and its background, nothing blended.
+    for frame in [&plain, &smaller] {
+        assert_row_is_pure(frame, 0, [0x00, 0xFF, 0x00], [0, 0, 0]);
+    }
+}
+
+/// A family the host does not have must not change the picture: the
+/// fallback chain ends at the default family.
+#[test]
+fn base291_playlist_font_falls_back_when_the_family_is_missing() {
+    let mut window = PlaylistWindow::new();
+    window.set_entries(vec![EntryId(1)]);
+    let labels = vec!["1. Mixed Case WWW iii".into()];
+    let render = |skin: &Skin| render_playlist_window(skin, &window, &labels, true);
+    assert_eq!(
+        render(&memory_skin("Rustamp missing family", false)),
+        render(&memory_skin("Arial", false)),
+        "a family the host does not have must fall back to the default one"
+    );
 }
 
 /// Requires real VM screenshots captured by the interactive-session runner.
