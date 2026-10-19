@@ -82,9 +82,13 @@ pub enum Sheet {
     Main,
     /// `monoster.bmp`
     Monoster,
-    /// `numbers.bmp`
+    /// `numbers.bmp` — the classic time-display digits. A skin that carries
+    /// `nums_ex.bmp` uses that one instead (S17 §3).
     Numbers,
-    /// `nums_ex.bmp`
+    /// `nums_ex.bmp` — the optional extended digit sheet. When a skin carries
+    /// it, the time display uses it **instead of** `numbers.bmp`, and the
+    /// digit layout changes with it (S17 §3). The exact layout is still open
+    /// (S01 question 6), so the rectangles below stay provisional.
     NumsEx,
     /// `playpaus.bmp`
     Playpaus,
@@ -186,17 +190,6 @@ impl Sheet {
             Sheet::GenEx => "genex",
             Sheet::Mb => "mb",
             Sheet::Video => "video",
-        }
-    }
-
-    /// The sheet a missing sheet falls back to, if any.
-    ///
-    /// `nums_ex.bmp` is the optional 11-digit variant; when it is absent the
-    /// classic `numbers.bmp` is used.
-    pub const fn fallback(self) -> Option<Sheet> {
-        match self {
-            Sheet::NumsEx => Some(Sheet::Numbers),
-            _ => None,
         }
     }
 
@@ -550,44 +543,57 @@ pub static CURSOR_NAMES: &[&str] = &[
     "wsposbar.cur", // provisional: webamp; S17 §8 lists a subset
 ];
 
-/// The 24 default analyser colours, ported from webamp's `baseSkin.json`.
+/// The 24 default analyser colours.
+///
+/// S17 §6 lists the base skin's `viscolor.txt`: 24 entries, slot 0 the
+/// analyser background, slot 1 the grid dots, slots 2-17 the spectrum
+/// gradient, slots 18-22 the oscilloscope colours and slot 23 the peak dots.
+/// These are the built-in defaults, so a skin without a `viscolor.txt` gets
+/// the classic look.
 pub static DEFAULT_VISCOLORS: [[u8; 3]; 24] = [
-    [0, 0, 0],       // provisional: webamp, pending S01/S17
-    [24, 33, 41],    // provisional: webamp, pending S01/S17
-    [239, 49, 16],   // provisional: webamp, pending S01/S17
-    [206, 41, 16],   // provisional: webamp, pending S01/S17
-    [214, 90, 0],    // provisional: webamp, pending S01/S17
-    [214, 102, 0],   // provisional: webamp, pending S01/S17
-    [214, 115, 0],   // provisional: webamp, pending S01/S17
-    [198, 123, 8],   // provisional: webamp, pending S01/S17
-    [222, 165, 24],  // provisional: webamp, pending S01/S17
-    [214, 181, 33],  // provisional: webamp, pending S01/S17
-    [189, 222, 41],  // provisional: webamp, pending S01/S17
-    [148, 222, 33],  // provisional: webamp, pending S01/S17
-    [41, 206, 16],   // provisional: webamp, pending S01/S17
-    [50, 190, 16],   // provisional: webamp, pending S01/S17
-    [57, 181, 16],   // provisional: webamp, pending S01/S17
-    [49, 156, 8],    // provisional: webamp, pending S01/S17
-    [41, 148, 0],    // provisional: webamp, pending S01/S17
-    [24, 132, 8],    // provisional: webamp, pending S01/S17
-    [255, 255, 255], // provisional: webamp, pending S01/S17
-    [214, 214, 222], // provisional: webamp, pending S01/S17
-    [181, 189, 189], // provisional: webamp, pending S01/S17
-    [160, 170, 175], // provisional: webamp, pending S01/S17
-    [148, 156, 165], // provisional: webamp, pending S01/S17
-    [150, 150, 150], // provisional: webamp, pending S01/S17
+    [0, 0, 0],       // S17 §6 (analyser background)
+    [24, 33, 41],    // S17 §6 (grid dots)
+    [239, 49, 16],   // S17 §6 (spectrum, top)
+    [206, 41, 16],   // S17 §6
+    [214, 90, 0],    // S17 §6
+    [214, 102, 0],   // S17 §6
+    [214, 115, 0],   // S17 §6
+    [198, 123, 8],   // S17 §6
+    [222, 165, 24],  // S17 §6
+    [214, 181, 33],  // S17 §6
+    [189, 222, 41],  // S17 §6
+    [148, 222, 33],  // S17 §6
+    [41, 206, 16],   // S17 §6
+    [50, 190, 16],   // S17 §6
+    [57, 181, 16],   // S17 §6
+    [49, 156, 8],    // S17 §6
+    [41, 148, 0],    // S17 §6
+    [24, 132, 8],    // S17 §6 (spectrum, bottom)
+    [255, 255, 255], // S17 §6 (oscilloscope)
+    [214, 214, 222], // S17 §6
+    [181, 189, 189], // S17 §6
+    [160, 170, 175], // S17 §6
+    [148, 156, 165], // S17 §6
+    [150, 150, 150], // S17 §6 (analyser peak dots)
 ];
 
-/// Default playlist colour values, ported from webamp's `baseSkin.json`.
-pub const DEFAULT_PLAYLIST_NORMAL: [u8; 3] = [0x00, 0xFF, 0x00]; // provisional: webamp, pending S01/S17
+/// Default playlist colour values.
+///
+/// S17 §5 lists the base skin's `pledit.txt` and records that a playlist
+/// without a `pledit.txt` still renders green / white / black, so these are
+/// the built-in defaults of the classic look. The observation covered the
+/// three text colours; the selected-row background was not observed, so it
+/// keeps the value webamp's base skin carries (the base skin's own file uses
+/// `#0000C6`, see the table in S17 §5).
+pub const DEFAULT_PLAYLIST_NORMAL: [u8; 3] = [0x00, 0xFF, 0x00]; // S17 §5 verified
 /// Default currently-playing colour.
-pub const DEFAULT_PLAYLIST_CURRENT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // provisional: webamp, pending S01/S17
+pub const DEFAULT_PLAYLIST_CURRENT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // S17 §5 verified
 /// Default playlist background.
-pub const DEFAULT_PLAYLIST_NORMAL_BG: [u8; 3] = [0x00, 0x00, 0x00]; // provisional: webamp, pending S01/S17
+pub const DEFAULT_PLAYLIST_NORMAL_BG: [u8; 3] = [0x00, 0x00, 0x00]; // S17 §5 verified
 /// Default selected-entry background.
-pub const DEFAULT_PLAYLIST_SELECTED_BG: [u8; 3] = [0x00, 0x00, 0xFF]; // provisional: webamp, pending S01/S17
+pub const DEFAULT_PLAYLIST_SELECTED_BG: [u8; 3] = [0x00, 0x00, 0xFF]; // provisional: webamp; S17 §5 did not observe it
 /// Default playlist font.
-pub const DEFAULT_PLAYLIST_FONT: &str = "Arial"; // provisional: webamp, pending S01/S17
+pub const DEFAULT_PLAYLIST_FONT: &str = "Arial"; // provisional: webamp; S17 §5 did not observe it
 
 /// Looks up a sprite by name.
 pub fn sprite(name: &str) -> Option<&'static SpriteDef> {
@@ -664,12 +670,6 @@ mod tests {
     }
 
     #[test]
-    fn nums_ex_falls_back_to_numbers() {
-        assert_eq!(Sheet::NumsEx.fallback(), Some(Sheet::Numbers));
-        assert_eq!(Sheet::Main.fallback(), None);
-    }
-
-    #[test]
     fn nums_ex_has_the_extra_digit_cells() {
         for digit in 0..10 {
             assert!(
@@ -682,6 +682,22 @@ mod tests {
         assert!(sprite("MINUS_SIGN_EX").is_some());
         assert_eq!(sheet_extent(Sheet::Numbers), (99, 13));
         assert_eq!(sheet_extent(Sheet::NumsEx), (108, 13));
+    }
+
+    /// S17 §8: the base skin ships these eleven cursors; the loader must ask
+    /// for every one of them.
+    #[test]
+    fn the_base_skin_cursor_set_is_covered() {
+        for name in [
+            "normal", "close", "eqslid", "eqtitle", "posbar", "psize", "ptbar", "pvscroll",
+            "titlebar", "volbal", "pnormal",
+        ] {
+            let wanted = format!("{name}.cur");
+            assert!(
+                CURSOR_NAMES.iter().any(|c| c.eq_ignore_ascii_case(&wanted)),
+                "the loader never asks for {wanted}"
+            );
+        }
     }
 
     /// S01 §2.4: the transport buttons are 22 px wide at a 23 px pitch.

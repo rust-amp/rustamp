@@ -156,4 +156,26 @@ mod tests {
         let style = PlaylistStyle::parse("[Text]\nnormal=zzz\n");
         assert_eq!(style.normal, PlaylistStyle::default().normal);
     }
+
+    /// S17 §5: the base skin's `pledit.txt` is exactly this file, and a
+    /// playlist without a `pledit.txt` still renders green / white / black —
+    /// so the three text colours are the built-in defaults of the classic
+    /// look. The selected-row background and the font were not observed
+    /// without the file, so they keep their own values.
+    #[test]
+    fn the_base_skin_file_parses_to_the_built_in_defaults() {
+        let base_skin = "[Text]\nNormal=#00FF00\nCurrent=#FFFFFF\nNormalBG=#000000\nSelectedBG=#0000C6\nFont=Arial\n";
+        let style = PlaylistStyle::parse(base_skin);
+        assert_eq!(style.normal, [0x00, 0xFF, 0x00]);
+        assert_eq!(style.current, [0xFF, 0xFF, 0xFF]);
+        assert_eq!(style.normal_bg, [0x00, 0x00, 0x00]);
+        assert_eq!(style.selected_bg, [0x00, 0x00, 0xC6]);
+        assert_eq!(style.font.as_deref(), Some("Arial"));
+
+        // The colours S17 §5 saw without a `pledit.txt` are the defaults.
+        let defaults = PlaylistStyle::default();
+        assert_eq!(style.normal, defaults.normal);
+        assert_eq!(style.current, defaults.current);
+        assert_eq!(style.normal_bg, defaults.normal_bg);
+    }
 }

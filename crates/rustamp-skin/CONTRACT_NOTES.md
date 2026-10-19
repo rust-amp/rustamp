@@ -31,8 +31,29 @@ fixture. `PLACEHOLDER_RGBA` is deliberately obvious.
 and are provisional until **S01** (geometry) and **S17** (skin quirks). The
 table is isolated in one module so it can be replaced wholesale.
 
+The playlist defaults are no longer provisional: **S17 §5** lists the base
+skin's `pledit.txt` and records that a playlist without a `pledit.txt` still
+renders green / white / black, so `DEFAULT_PLAYLIST_NORMAL`,
+`DEFAULT_PLAYLIST_CURRENT` and `DEFAULT_PLAYLIST_NORMAL_BG` are the built-in
+defaults of the classic look. The selected-row background and the font were
+**not** observed without the file and keep their webamp values — adopting the
+base skin's `#0000C6` would change the rendered playlist and needs the
+look-alike golden images in `rustamp-ui` re-blessed.
+
 ## 4. What `rustamp-ui` consumes
 
 `Skin::sprite(name)` returns the rectangle plus its `Sheet`; `Skin::sheet(sheet)`
 returns the decoded image. The UI never sees a file name. `Skin::substitutions`
 and `Skin::warnings` describe anything that was missing or failed to decode.
+
+**The time display's digit sheet** is `Skin::time_digit_sheet()`, never a
+guess at the call site. **S17 §3**: when a skin carries `nums_ex.bmp`, the
+time display uses it *instead of* `numbers.bmp` and the digit layout changes
+with it, so the two sheets are never substituted for one another. The choice
+follows the file the *skin* carries — a `nums_ex.bmp` that fails to decode
+does not take the display away from the skin's `numbers.bmp`.
+
+The loader no longer reports a sheet-to-sheet substitution: with the layouts
+of S17 §3 in force, no sheet can stand in for another, so `Substitute` has
+only the two cases the spec names — the built-in default skin and the
+documented default values.

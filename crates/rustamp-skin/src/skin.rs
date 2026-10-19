@@ -36,8 +36,6 @@ pub enum CursorKind {
 /// What a missing file was replaced with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Substitute {
-    /// Another sheet from the same skin (`nums_ex.bmp` → `numbers.bmp`).
-    Sheet(Sheet),
     /// The bundled default skin.
     DefaultSkin,
     /// The documented default values (playlist colours, viscolours, region).
@@ -56,9 +54,6 @@ pub struct Substitution {
 impl fmt::Display for Substitution {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.with {
-            Substitute::Sheet(sheet) => {
-                write!(f, "{} missing, using {}", self.requested, sheet.file_name())
-            }
             Substitute::DefaultSkin => {
                 write!(f, "{} missing, using the default skin", self.requested)
             }
@@ -173,6 +168,9 @@ impl SkinFallback for BuiltinLookalikeSkin {
 pub struct Skin {
     source: String,
     sheets: HashMap<Sheet, RasterImage>,
+    /// The sheet the main window's time display takes its digits from
+    /// (S17 §3).
+    time_digit_sheet: Sheet,
     pledit: PlaylistStyle,
     viscolors: [[u8; 3]; 24],
     region: Region,
@@ -215,6 +213,11 @@ impl Skin {
         let mut sheets: HashMap<Sheet, RasterImage> = HashMap::new();
         let mut substitutions: Vec<Substitution> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
+        // S17 §3: the time display uses `nums_ex.bmp` **instead of**
+        // `numbers.bmp` when the skin carries it, and the digit layout changes
+        // with it. Which of the two the *skin* provides decides the layout, so
+        // the choice is taken from the container and never from the fallback.
+        let mut skin_has_nums_ex = false;
 
         for sheet in Sheet::ALL {
             let Some(file) = source.read_any(sheet.stem(), &["bmp"]) else {
@@ -224,6 +227,9 @@ impl Skin {
                 Ok(decoded) => {
                     let image =
                         RasterImage::new(decoded.width, decoded.height, decoded.rgba, file.bytes);
+                    if *sheet == Sheet::NumsEx {
+                        skin_has_nums_ex = true;
+                    }
                     sheets.insert(*sheet, image);
                 }
                 Err(reason) => {
@@ -233,7 +239,6 @@ impl Skin {
             }
         }
 
-        resolve_sheet_fallbacks(&mut sheets, &mut substitutions);
         resolve_default_fallbacks(&mut sheets, fallback, &mut substitutions);
 
         let pledit = match source.read_any("pledit", &["txt"]) {
@@ -296,6 +301,11 @@ impl Skin {
         Ok(Skin {
             source: source.describe(),
             sheets,
+            time_digit_sheet: if skin_has_nums_ex {
+                Sheet::NumsEx
+            } else {
+                Sheet::Numbers
+            },
             pledit,
             viscolors,
             region,
@@ -335,6 +345,17 @@ impl Skin {
         let def = webamp::sprite(name)?;
         let image = self.sheets.get(&def.sheet)?;
         Some((image, def))
+    }
+
+    /// The sheet the main window's time display takes its digits from.
+    ///
+    /// S17 §3: when the skin carries `nums_ex.bmp`, the time display uses it
+    /// **instead of** `numbers.bmp` — and the digit layout changes with it,
+    /// so the two sheets are never substituted for one another. A skin that
+    /// carries neither (or carries a `nums_ex.bmp` that does not decode) uses
+    /// the classic `numbers.bmp` layout.
+    pub fn time_digit_sheet(&self) -> Sheet {
+        self.time_digit_sheet
     }
 
     /// The playlist colours and font.
@@ -394,32 +415,11 @@ impl Skin {
     }
 }
 
-/// Fills missing sheets from another sheet of the same skin.
-fn resolve_sheet_fallbacks(
-    sheets: &mut HashMap<Sheet, RasterImage>,
-    substitutions: &mut Vec<Substitution>,
-) {
-    // `nums_ex.bmp` and `numbers.bmp` are alternatives for the time display;
-    // whichever is present covers the other.
-    let pairs = [
-        (Sheet::NumsEx, Sheet::Numbers),
-        (Sheet::Numbers, Sheet::NumsEx),
-    ];
-    for (missing, available) in pairs {
-        if sheets.contains_key(&missing) {
-            continue;
-        }
-        if let Some(image) = sheets.get(&available).cloned() {
-            sheets.insert(missing, image);
-            substitutions.push(Substitution {
-                requested: missing.file_name().to_string(),
-                with: Substitute::Sheet(available),
-            });
-        }
-    }
-}
-
-/// Fills any remaining required sheet from the fallback skin.
+/// Fills any missing sheet from the fallback skin.
+///
+/// S17 §2: the fallback is per element, not all-or-nothing — a skin that is
+/// missing one sheet keeps all its other sheets, and the missing element comes
+/// from the built-in default skin.
 fn resolve_default_fallbacks(
     sheets: &mut HashMap<Sheet, RasterImage>,
     fallback: &dyn SkinFallback,
@@ -429,6 +429,10 @@ fn resolve_default_fallbacks(
     // that is missing, say, `nums_ex.bmp` should still get a legible one from the
     // built-in skin rather than nothing at all. Sheets the fallback has no size
     // for stay absent, exactly as the trait documents.
+    //
+    // S17 §3: the fallback's `nums_ex.bmp` never takes the time display away
+    // from a skin's own `numbers.bmp` — the digit layout follows the file the
+    // *skin* carries, see [`Skin::time_digit_sheet`].
     for sheet in Sheet::ALL {
         if sheets.contains_key(sheet) {
             continue;
