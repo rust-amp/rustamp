@@ -43,6 +43,33 @@
 //! drawn, a column that does not fit is cut off, and no pixel outside the
 //! viewport is touched.
 //!
+//! # The cover column
+//!
+//! The list starts with a **cover column**: a fixed-width column that
+//! holds the album art of the row ([`LIBRARY_COVER_WIDTH`] pixels). The
+//! cover column is not a text column, so it is not part of the layout's
+//! cell grid; the renderer shifts the text columns past it and draws the
+//! cover into the cell of the row ([`cover_cell`]).
+//!
+//! The renderer takes the covers of the rows it draws as a slice - one
+//! entry per visible row, [`Option`] because a track may have no cover. A
+//! cover is a **borrowed** view of a picture ([`CoverRef`]): the renderer
+//! borrows the bytes and never owns them, so the caller hands over the
+//! picture it already has without copying it. A row without a cover keeps
+//! its cell's background; the cell is only painted when there is a picture
+//! for it.
+//!
+//! The picture **fills** its cell: it is scaled with nearest-neighbour
+//! sampling by the larger of the two cell-to-cover ratios, so the aspect
+//! ratio is kept and the cell is covered, and the part of the picture that
+//! does not fit is cropped away at the cell's edges. The scaled picture is
+//! blitted into the cell with its own alpha, so a transparent part of a
+//! cover lets the cell's background through. Nothing of a cover is ever
+//! drawn outside its cell.
+//!
+//! The cover column's **header cell** - the header band's slice of the
+//! column - is empty: the column holds pictures, not text.
+//!
 //! # The chrome (own choice)
 //!
 //! No spec measures the media library (S20 is not started), so the chrome is
@@ -78,8 +105,32 @@
 
 use rustamp_gfx::{Image, Rect};
 
-use crate::library::LibraryView;
-use crate::library_layout::LibraryLayout;
+use crate::library::{LibraryColumn, LibraryView};
+use crate::library_layout::{LIBRARY_COVER_WIDTH, LibraryLayout};
+
+// ---------------------------------------------------------------------------
+// The cover picture
+// ---------------------------------------------------------------------------
+
+/// A borrowed view of a cover picture.
+///
+/// The renderer does not need to own the picture, it needs to know its size
+/// and to read its pixels. The view borrows the bytes, so the caller can
+/// hand over a decoded cover - the artwork cache's, for instance - without
+/// copying it.
+///
+/// The pixels are 8-bit non-premultiplied RGBA, row-major, the first row on
+/// top: the same layout [`Image`] uses, so a caller that already has a
+/// picture can lend its bytes as they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverRef<'a> {
+    /// The width in pixels.
+    pub width: u32,
+    /// The height in pixels.
+    pub height: u32,
+    /// The RGBA bytes: `width * height * 4` of them.
+    pub pixels: &'a [u8],
+}
 
 // ---------------------------------------------------------------------------
 // The palette (own choice)
@@ -249,6 +300,45 @@ impl LibraryChrome {
             thumb,
         }
     }
+
+    /// The number of text cells the rows' band holds.
+    ///
+    /// The cover column takes [`LIBRARY_COVER_WIDTH`] pixels of the band,
+    /// so the text columns have the rest of it. The app sizes the layout
+    /// with it: `layout.resized_to(chrome.text_cells())`.
+    pub fn text_cells(&self) -> u32 {
+        self.rows.width.saturating_sub(LIBRARY_COVER_WIDTH) / LIBRARY_CELL_WIDTH
+    }
+}
+
+/// The cover cell of the row at `index` in the rows' band.
+///
+/// The cell is the cover column's slice of the row: [`LIBRARY_COVER_WIDTH`]
+/// pixels wide and one line high. The header's cover cell is the same
+/// column in the header's band, and it is empty.
+pub fn cover_cell(band: Rect, index: usize) -> Rect {
+    let y = band.y.saturating_add(
+        i32::try_from(index)
+            .unwrap_or(i32::MAX)
+            .saturating_mul(LIBRARY_LINE_HEIGHT as i32),
+    );
+    Rect::new(band.x, y, LIBRARY_COVER_WIDTH, LIBRARY_LINE_HEIGHT)
+}
+
+/// The pixel x of a text column in the list.
+///
+/// The cover column leads the list, so the text columns begin after it: the
+/// title stands at [`LIBRARY_COVER_WIDTH`], the next column one text cell
+/// further. The offset is the same for the header and for the rows, so the
+/// two line up.
+pub fn text_column_x(list_x: i32, layout: &LibraryLayout, column: LibraryColumn) -> i32 {
+    list_x
+        .saturating_add(LIBRARY_COVER_WIDTH as i32)
+        .saturating_add(
+            i32::try_from(layout.column_x(column))
+                .unwrap_or(i32::MAX)
+                .saturating_mul(LIBRARY_CELL_WIDTH as i32),
+        )
 }
 
 /// The scrollbar's thumb for a view.
@@ -311,10 +401,20 @@ pub fn scroll_for_click(view: &LibraryView, chrome: &LibraryChrome, y: i32) -> u
 /// `viewport` is the part of `frame` the library occupies: the app gives it
 /// the whole client area. The layout gives the columns in text cells, so
 /// the app resizes it to the list with
-/// `LibraryLayout::resized_to(chrome.rows.width / LIBRARY_CELL_WIDTH)`.
+/// `LibraryLayout::resized_to(chrome.text_cells())`.
 ///
 /// `search_focused` says whether the search field has the focus: a focused
 /// field shows a caret behind the text.
+///
+/// `covers` holds the cover of every visible row, in the order of
+/// [`LibraryView::visible_rows`]: the first entry belongs to the first
+/// visible row, the second to the second, and so on. A row whose cover is
+/// missing - or a slice that is shorter than the visible rows - is drawn
+/// without a cover, and its cell keeps the row's background.
+///
+/// A cover is a borrowed view of a picture ([`CoverRef`]): the caller lends
+/// the bytes it already has - the artwork cache's cover, for instance - and
+/// the renderer neither owns nor copies them.
 ///
 /// The chrome the renderer draws is the one
 /// [`LibraryChrome::new`](LibraryChrome::new) computes from the same
@@ -328,6 +428,7 @@ pub fn render_library_window(
     layout: &LibraryLayout,
     viewport: Rect,
     search_focused: bool,
+    covers: &[Option<CoverRef<'_>>],
 ) {
     let chrome = LibraryChrome::new(view, viewport);
     frame.fill_rect(viewport, opaque(LIBRARY_WINDOW_BACKGROUND));
@@ -342,7 +443,7 @@ pub fn render_library_window(
         chrome.header,
         LIBRARY_HEADER_TEXT,
     );
-    draw_rows(frame, view, layout, chrome.rows);
+    draw_rows(frame, view, layout, chrome.rows, covers);
     draw_text(
         frame,
         &view.status_line(),
@@ -356,8 +457,15 @@ pub fn render_library_window(
 /// Draws the rows at the scroll offset, the selected one on its background.
 ///
 /// Only the rows that fit the band are drawn: the band is the viewport's
-/// rows area, and a row below it would lie outside the window.
-fn draw_rows(frame: &mut Image, view: &LibraryView, layout: &LibraryLayout, band: Rect) {
+/// rows area, and a row below it would lie outside the window. Every row
+/// that has a cover gets it in the cover column's cell of that row.
+fn draw_rows(
+    frame: &mut Image,
+    view: &LibraryView,
+    layout: &LibraryLayout,
+    band: Rect,
+    covers: &[Option<CoverRef<'_>>],
+) {
     let capacity = (band.height / LIBRARY_LINE_HEIGHT) as usize;
     let selected = view.selected();
     for (index, row) in view.visible_rows().iter().take(capacity).enumerate() {
@@ -371,6 +479,9 @@ fn draw_rows(frame: &mut Image, view: &LibraryView, layout: &LibraryLayout, band
         if is_selected {
             frame.fill_rect(row_band, opaque(LIBRARY_SELECTION));
         }
+        if let Some(cover) = covers.get(index).and_then(|cover| *cover) {
+            draw_cover(frame, cover, cover_cell(band, index));
+        }
         let colour = if is_selected {
             LIBRARY_SELECTION_TEXT
         } else {
@@ -378,6 +489,78 @@ fn draw_rows(frame: &mut Image, view: &LibraryView, layout: &LibraryLayout, band
         };
         draw_columns(frame, layout, &layout.row_line(row), row_band, colour);
     }
+}
+
+/// Draws a cover into the cell of its row.
+///
+/// The picture is scaled to the cell and clipped to it, so nothing of the
+/// cover is drawn outside the cell it belongs to.
+fn draw_cover(frame: &mut Image, cover: CoverRef<'_>, cell: Rect) {
+    let Some(scaled) = scaled_cover(cover, cell) else {
+        return;
+    };
+    frame.blit_alpha(&scaled, scaled.bounds(), cell.x, cell.y);
+}
+
+/// The cover scaled into the cell, as an image.
+///
+/// The picture **fills** the cell: it is scaled by the larger of the two
+/// cell-to-cover ratios, so the aspect ratio is kept and the cell is
+/// covered, and the part of the picture that does not fit is cropped away
+/// at the cell's edges. The sampling is nearest-neighbour: every pixel of
+/// the cell takes the pixel of the cover nearest to it.
+///
+/// The cover's pixels are already in the [`Image`] layout - the same
+/// non-premultiplied RGBA, row by row - so the picture is read in place:
+/// there is no second image type and no copy of the whole cover.
+///
+/// `None` when the cell is empty or when the cover does not match its own
+/// size: a broken cover is drawn as no cover at all.
+fn scaled_cover(cover: CoverRef<'_>, cell: Rect) -> Option<Image> {
+    let (cover_width, cover_height) = (cover.width, cover.height);
+    if cover_width == 0 || cover_height == 0 || cell.is_empty() {
+        return None;
+    }
+    let expected = u64::from(cover_width)
+        .checked_mul(u64::from(cover_height))
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected != Some(cover.pixels.len() as u64) {
+        // A cover whose pixels do not match its size is broken: it is drawn
+        // as no cover.
+        return None;
+    }
+
+    // The scale that covers the cell: the larger of the two ratios, as a
+    // fraction. `num / den` is that factor.
+    let num = (u128::from(cell.width) * u128::from(cover_height))
+        .max(u128::from(cell.height) * u128::from(cover_width));
+    let den = u128::from(cover_width) * u128::from(cover_height);
+    let scaled_width = (u128::from(cover_width) * num).div_ceil(den);
+    let scaled_height = (u128::from(cover_height) * num).div_ceil(den);
+    // The scaled picture is at least as large as the cell, so it overflows
+    // on one axis; the overflow is the part that is cropped away.
+    let offset_x = (scaled_width - u128::from(cell.width)) / 2;
+    let offset_y = (scaled_height - u128::from(cell.height)) / 2;
+
+    let mut scaled = Image::new(cell.width, cell.height);
+    for y in 0..cell.height {
+        let source_y = (offset_y + u128::from(y)) * u128::from(cover_height) / scaled_height;
+        for x in 0..cell.width {
+            let source_x = (offset_x + u128::from(x)) * u128::from(cover_width) / scaled_width;
+            let index = (source_y as usize * cover_width as usize + source_x as usize) * 4;
+            scaled.set_pixel(
+                x as i32,
+                y as i32,
+                [
+                    cover.pixels[index],
+                    cover.pixels[index + 1],
+                    cover.pixels[index + 2],
+                    cover.pixels[index + 3],
+                ],
+            );
+        }
+    }
+    Some(scaled)
 }
 
 /// Draws the search field: the text as typed, the hint while the field is
@@ -447,7 +630,8 @@ fn draw_scrollbar(frame: &mut Image, chrome: &LibraryChrome) {
 ///
 /// The line is the layout's own text - the column titles for the header, the
 /// row's four values for a row - so the renderer never assembles a row of
-/// its own.
+/// its own. The columns start behind the cover column, so the line stands
+/// at the same place in the header and in every row.
 fn draw_columns(
     frame: &mut Image,
     layout: &LibraryLayout,
@@ -462,7 +646,7 @@ fn draw_columns(
         if text.trim().is_empty() {
             continue;
         }
-        let x = band.x + start as i32 * LIBRARY_CELL_WIDTH as i32;
+        let x = text_column_x(band.x, layout, column);
         let right = band.x + band.width as i32;
         let column_right = x + width as i32 * LIBRARY_CELL_WIDTH as i32;
         let visible = column_right.min(right);

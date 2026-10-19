@@ -16,9 +16,22 @@
 //! height. That keeps the layout free of any pixel claim, which the
 //! unmeasured library window could not justify anyway.
 //!
-//! The columns are the ones the index carries: title, artist, album and the
-//! length. The index has no column for artwork or for the file name, so the
+//! The **text** columns are the ones the index carries: title, artist,
+//! album and the length. The index has no column for the file name, so the
 //! list has none either.
+//!
+//! # The cover column
+//!
+//! In front of the text columns is the **cover column**: a fixed-width
+//! column that holds the album art of the row. It is not one of the index's
+//! columns and it cannot be sorted, so it is not part of
+//! [`LIBRARY_COLUMNS`] and it has no entry in [`LIBRARY_COLUMN_TITLES`].
+//!
+//! The cover column is measured in **pixels** and not in text cells: a
+//! picture has no font metrics, so a cell is the wrong unit for it. Its
+//! width is [`LIBRARY_COVER_WIDTH`], and the renderer shifts the text
+//! columns past it - the cell offsets below are relative to the text area
+//! that follows the cover column.
 
 use crate::library::{LibraryColumn, LibraryRow};
 
@@ -42,6 +55,14 @@ pub const LIBRARY_COLUMN_TITLES: [&str; 4] = ["Title", "Artist", "Album", "Lengt
 /// The gap between two columns, in text cells.
 pub const LIBRARY_COLUMN_GAP: u32 = 1;
 
+/// The width of the cover column, in pixels.
+///
+/// The width is **our own choice**: no spec measures the media library
+/// (S20 is not started). Forty pixels is wide enough for the thumbnail the
+/// artwork cache keeps - at most 64 pixels on its longest edge - and
+/// narrow enough to leave the text columns their room.
+pub const LIBRARY_COVER_WIDTH: u32 = 40;
+
 /// The narrowest the title column may become when a line is resized.
 pub const LIBRARY_MIN_TITLE_WIDTH: u32 = 8;
 
@@ -50,6 +71,10 @@ pub const LIBRARY_MIN_TITLE_WIDTH: u32 = 8;
 /// The default layout is [`LIBRARY_COLUMN_WIDTHS`]. A wider window keeps
 /// the three right-hand columns and gives the slack to the title, which is
 /// what [`LibraryLayout::resized_to`] does.
+///
+/// The widths cover the **text** columns only. The cover column in front of
+/// them is a fixed number of pixels wide ([`LIBRARY_COVER_WIDTH`]) and is
+/// not part of the widths: the renderer adds it to every cell offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LibraryLayout {
     widths: [u32; 4],
@@ -85,6 +110,9 @@ impl LibraryLayout {
     }
 
     /// The cell offset of a column's first cell.
+    ///
+    /// The offset is relative to the text area that follows the cover
+    /// column; the renderer adds the cover column's width to it.
     pub fn column_x(&self, column: LibraryColumn) -> u32 {
         let index = column_index(column);
         let mut x = 0;

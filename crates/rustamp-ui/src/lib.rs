@@ -40,11 +40,17 @@
 //! * [`library_layout::LibraryLayout`] is the renderer-facing layout of the
 //!   library window: the columns, their widths in text cells and the row
 //!   lines as text. The library window is a modern (unskinned) window, so no
-//!   skin is involved.
+//!   skin is involved. The **cover column** in front of the text columns is
+//!   a fixed number of pixels wide
+//!   ([`library_layout::LIBRARY_COVER_WIDTH`]): it holds the album art, and
+//!   a picture has no font metrics.
 //! * [`library_render::render_library_window`] paints the media library's
 //!   content - the search field, the column titles, the rows, the
 //!   selection, the scrollbar and the status line - into a frame, with the
-//!   modern window's own palette. [`library_render::LibraryChrome`] is the
+//!   modern window's own palette. The renderer takes the covers of the
+//!   visible rows as borrowed views
+//!   ([`library_render::CoverRef`]) and draws them into the cover column's
+//!   cell of their row. [`library_render::LibraryChrome`] is the
 //!   window's geometry: a pure function of the viewport and the view, so
 //!   the app can map a click to the band it belongs to.
 //! * [`shell::skinned_window_attributes`] is the single place that decides
@@ -120,16 +126,16 @@ pub use layout::{
 pub use library::{LibraryColumn, LibraryRequest, LibraryRow, LibrarySort, LibraryView};
 pub use library_layout::{
     LIBRARY_COLUMN_GAP, LIBRARY_COLUMN_TITLES, LIBRARY_COLUMN_WIDTHS, LIBRARY_COLUMNS,
-    LIBRARY_MIN_TITLE_WIDTH, LibraryLayout, format_duration,
+    LIBRARY_COVER_WIDTH, LIBRARY_MIN_TITLE_WIDTH, LibraryLayout, format_duration,
 };
 pub use library_render::{
-    LIBRARY_CARET_WIDTH, LIBRARY_CELL_WIDTH, LIBRARY_FONT_FAMILY, LIBRARY_HEADER_TEXT,
+    CoverRef, LIBRARY_CARET_WIDTH, LIBRARY_CELL_WIDTH, LIBRARY_FONT_FAMILY, LIBRARY_HEADER_TEXT,
     LIBRARY_LINE_HEIGHT, LIBRARY_MIN_THUMB_HEIGHT, LIBRARY_PANEL_BACKGROUND, LIBRARY_ROW_TEXT,
     LIBRARY_SCROLLBAR_THUMB, LIBRARY_SCROLLBAR_TRACK, LIBRARY_SCROLLBAR_WIDTH,
     LIBRARY_SEARCH_BACKGROUND, LIBRARY_SEARCH_CARET, LIBRARY_SEARCH_HINT, LIBRARY_SEARCH_PADDING,
     LIBRARY_SEARCH_PLACEHOLDER, LIBRARY_SEARCH_TEXT, LIBRARY_SELECTION, LIBRARY_SELECTION_TEXT,
-    LIBRARY_SEPARATOR, LIBRARY_STATUS_TEXT, LIBRARY_WINDOW_BACKGROUND, LibraryChrome,
-    render_library_window, scroll_for_click,
+    LIBRARY_SEPARATOR, LIBRARY_STATUS_TEXT, LIBRARY_WINDOW_BACKGROUND, LibraryChrome, cover_cell,
+    render_library_window, scroll_for_click, text_column_x,
 };
 pub use menu::{
     CHECK_CELL_X, CLUTTER_O_POINT, CLUTTER_V_POINT, MAIN_MENU, MAIN_MENU_CLASS,
