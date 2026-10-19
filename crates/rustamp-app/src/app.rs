@@ -60,6 +60,7 @@ use crate::host::{
     CommandOutcome, HostStateLink, PollOutcome, PublishOutcome, player_state_message,
 };
 use crate::output::create_output;
+use crate::plugin_inventory::LoadedPlugin;
 use crate::routing;
 use crate::skin::{LoadedSkin, SkinChoice, load as load_skin};
 use crate::supervise::Supervisor;
@@ -1371,6 +1372,21 @@ impl App {
         self.host.is_attached()
     }
 
+    /// The plug-ins the plugin host reported as loaded (see
+    /// [`crate::plugin_inventory`]).
+    ///
+    /// Empty while no host is attached. The ids are the host's and belong to
+    /// the host process that issued them (RFC 0020 Q6), so they are forgotten
+    /// when the host is replaced.
+    pub fn host_plugins(&self) -> &[LoadedPlugin] {
+        self.host.plugins()
+    }
+
+    /// The plug-in the plugin host reported under this id, if any.
+    pub fn host_plugin(&self, plugin_id: u32) -> Option<&LoadedPlugin> {
+        self.host.plugin(plugin_id)
+    }
+
     /// Install the plugin host supervisor (see [`crate::supervise`]).
     ///
     /// From the next [`pump`](App::pump) on, the supervisor starts
@@ -1410,7 +1426,18 @@ impl App {
     /// here, so the publish right after degrades to detached and the
     /// supervisor replaces the host on its next step.
     pub fn poll_host(&mut self) -> PollOutcome {
-        self.host.poll()
+        let outcome = self.host.poll();
+        // A load the host refused is the user's news. The host reports it on
+        // its own stderr, which the windowed player never shows, so the note
+        // is the only place the user learns about it.
+        let failures = self.host.take_plugin_failures();
+        for failure in failures {
+            self.note(format!(
+                "the plugin host could not load {}: {}",
+                failure.path, failure.message
+            ));
+        }
+        outcome
     }
 
     /// Ask the plugin host to open the visualization plug-in's configuration
@@ -3469,6 +3496,80 @@ mod tests {
                 .any(|note| note.contains("not implemented by the plugin host")),
             "{notes:?}"
         );
+    }
+
+    // ----- the plug-in inventory (the host's answers, read back) -----
+
+    #[test]
+    fn the_app_reads_the_hosts_plugin_answers() {
+        use rustamp_ipc::MemoryTransport;
+        use rustamp_plugin_abi::PluginKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+
+        // The host answers two loads.
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 1,
+                name: "MilkDrop 2".to_string(),
+                kind: PluginKind::Visualization,
+            })
+            .unwrap();
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 2,
+                name: "Sleeper".to_string(),
+                kind: PluginKind::Dsp,
+            })
+            .unwrap();
+
+        // The pump reads them, like every other host message.
+        app.pump().unwrap();
+
+        let plugins = app.host_plugins();
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0].plugin_id, 1);
+        assert_eq!(plugins[0].name, "MilkDrop 2");
+        assert_eq!(plugins[0].kind, PluginKind::Visualization);
+        assert_eq!(plugins[1].plugin_id, 2);
+        assert_eq!(plugins[1].kind, PluginKind::Dsp);
+        // The id is what a later request names, so it is reachable by it.
+        assert_eq!(
+            app.host_plugin(1).map(|plugin| plugin.name.as_str()),
+            Some("MilkDrop 2")
+        );
+        assert!(app.host_plugin(3).is_none());
+    }
+
+    #[test]
+    fn a_refused_plugin_load_reaches_the_user_as_a_note() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+
+        host_end
+            .send(&Message::PluginError {
+                path: "C:\\plugins\\bad.dll".to_string(),
+                message: "not a PE image".to_string(),
+            })
+            .unwrap();
+
+        app.pump().unwrap();
+
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("bad.dll") && note.contains("not a PE image")),
+            "{notes:?}"
+        );
+        // The note is given once, not on every pump.
+        app.pump().unwrap();
+        assert!(app.drain_notes().is_empty());
     }
 
     // ----- the equalizer window (S07; headless, no window opened) -----

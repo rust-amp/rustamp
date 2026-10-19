@@ -37,7 +37,10 @@
 //! * [`host`] — the app side of the player-state bridge to `rustamp-plughost32`:
 //!   assembling [`rustamp_core::state::PlayerState`] snapshots and publishing
 //!   them as [`rustamp_ipc::Message::PlayerStateUpdate`] over the existing
-//!   control channel (RFC 0006).
+//!   control channel (RFC 0006), and reading the host's plug-in answers back.
+//! * [`plugin_inventory`] — what the host told us about its plug-ins: the
+//!   host-assigned id, the name and the kind of every loaded plug-in. The
+//!   ids belong to one host process (RFC 0020 Q6).
 //! * [`menu`] — main-menu check flags, leaf activation (wave21b) and the
 //!   popup's open state and click routing on top of [`rustamp_ui::menu`].
 //!   Headless; the OS window lives in [`window`].
@@ -90,6 +93,7 @@ pub mod menu;
 pub mod modern_shell;
 mod output;
 pub mod playlist_window;
+pub mod plugin_inventory;
 pub mod region;
 pub mod routing;
 pub mod skin;
