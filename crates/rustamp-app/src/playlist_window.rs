@@ -24,8 +24,8 @@
 //! * the title bar has no window-menu button (S06 §1), so a click at (6,3)
 //!   does nothing; Close hides the window (`ToggleWindow(Playlist)`, the PL
 //!   button reopens it), Shade records a note (the playlist editor's shade is
-//!   open, S05 §1.5) and MISC records a note (the `#32768` popup's contents are a
-//!   visual reading, S06 §4); ADD and LIST OPTS open their real dialogs
+//!   open, S05 §1.5) and MISC requests the native popup (S04 §7);
+//!   ADD and LIST OPTS open their real dialogs
 //!   through [`App::request_playlist_dialog`] (the files face of the
 //!   open-media dialog for ADD, with the playlist path's unmeasured
 //!   `play: false`, RFC 0005 O5; the load-playlist dialog for LIST OPTS,
@@ -54,6 +54,11 @@ use rustamp_ui::{
 use crate::app::App;
 
 impl App {
+    /// Takes the MISC popup request once, for the presenter's native-menu drain.
+    pub fn take_playlist_misc_menu(&mut self) -> bool {
+        std::mem::take(&mut self.pending_playlist_misc_menu)
+    }
+
     /// The playlist window's client size at rest (S06 scope; S01 §1).
     pub fn playlist_window_size() -> (u32, u32) {
         PLAYLIST_WINDOW_SIZE
@@ -423,12 +428,7 @@ impl App {
                 Ok(commands)
             }
             PlaylistButton::Misc => {
-                // S06 §4 settles the `#32768` popup's existence and size
-                // (474 x 81); its contents are a visual reading and stay
-                // open, so the app records the request and opens nothing.
-                // S06 §5.2's "no menu stays open" (REM needs no menu choice)
-                // holds: this path opens no window either.
-                self.note("MISC popup (#32768): the popup is not implemented yet".to_string());
+                self.pending_playlist_misc_menu = true;
                 Ok(Vec::new())
             }
         }
@@ -1021,14 +1021,41 @@ mod tests {
     }
 
     #[test]
-    fn misc_records_a_note_and_opens_nothing() {
-        // S06 §4 settles the popup's existence; its contents stay open.
+    fn misc_requests_the_native_popup_without_emitting_a_command() {
         let mut app = test_app();
         add_entries(&mut app, 3);
+        assert!(!app.take_playlist_misc_menu());
         let commands = app.playlist_mouse_down(112, 92).expect("MISC applies");
         assert!(commands.is_empty());
-        let notes = app.drain_notes();
-        assert!(notes.iter().any(|n| n.contains("MISC")), "{notes:?}");
+        assert!(app.take_playlist_misc_menu());
+        assert!(!app.take_playlist_misc_menu());
+    }
+
+    #[test]
+    fn every_misc_id_uses_existing_menu_dispatch_and_only_reports_the_gap() {
+        let mut app = test_app();
+        add_entries(&mut app, 3);
+        let menu = rustamp_ui::menu::native_playlist_misc_menu();
+        let entries = app.playlist().visible_ids();
+        let selection = app.playlist().selected_ids();
+        for (id, label) in [
+            (40292, "Generate HTML playlist"),
+            (40293, "Read extended info on selection"),
+        ] {
+            assert_eq!(
+                app.activate_menu_choice(menu.choice_for_id(id).unwrap())
+                    .unwrap(),
+                Some(crate::menu::MenuOutcome::Noted)
+            );
+            let notes = app.drain_notes();
+            assert_eq!(notes.len(), 1);
+            assert!(notes[0].contains(label), "{notes:?}");
+            assert!(notes[0].contains(&id.to_string()), "{notes:?}");
+            assert!(notes[0].contains("not implemented"), "{notes:?}");
+            assert_eq!(app.engine().queue().len(), 3);
+            assert_eq!(app.playlist().visible_ids(), entries);
+            assert_eq!(app.playlist().selected_ids(), selection);
+        }
     }
 
     #[test]

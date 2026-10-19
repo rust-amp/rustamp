@@ -1058,6 +1058,42 @@ impl Windowed {
             eprintln!("rustamp: a native popup menu is only implemented on Windows");
         }
     }
+    /// Shows the S04 §7 MISC popup; choices use the existing menu dispatch.
+    /// Placement at the opening point is our choice, not a measured position.
+    fn drain_playlist_misc_menu(&mut self) {
+        if !self.app.take_playlist_misc_menu() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let Some(window) = self.playlist_window.as_ref() else {
+                return;
+            };
+            let Ok(origin) = window.outer_position() else {
+                return;
+            };
+            let menu = rustamp_ui::menu::native_playlist_misc_menu();
+            match rustamp_platform::show_popup_menu(
+                self.raw_main_window(),
+                &menu.rows,
+                (origin.x + 110, origin.y + 92),
+            ) {
+                Ok(None) => {}
+                Ok(Some(id)) => match menu.choice_for_id(id) {
+                    Some(choice) => {
+                        if let Err(error) = self.app.activate_menu_choice(choice) {
+                            eprintln!("rustamp: playlist menu item failed: {error}");
+                        }
+                    }
+                    None => eprintln!("rustamp: the playlist menu reported an unknown id {id}"),
+                },
+                Err(error) => eprintln!("rustamp: no playlist MISC menu: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        eprintln!("rustamp: a native popup menu is only implemented on Windows");
+    }
+
     /// Shows a pending equalizer Presets popup (S07 §4.2: Load / Save /
     /// Delete) as the system's own menu, below the Presets button.
     ///
@@ -2105,6 +2141,7 @@ impl ApplicationHandler for Windowed {
         // these run their own modal message loop.
         self.drain_main_menu();
         self.drain_clutter_menu();
+        self.drain_playlist_misc_menu();
         self.drain_eq_menu();
         self.drain_media_pick();
         self.drain_save_playlist();
