@@ -154,6 +154,8 @@ pub struct App {
     /// Whether the main-menu popup is open (owned here, rendered by
     /// `menu.rs`, hosted by `window.rs`; S04).
     pub(crate) main_menu_open: bool,
+    /// A clutterbar popup (Options or visualization) waiting for the presenter.
+    pub(crate) pending_clutter_menu: Option<crate::menu::ClutterMenu>,
     notes: Vec<String>,
     /// The last error the user should see (BETA-04): a failed open/decode or
     /// a rejected command. Shown in the main window's native title bar
@@ -309,6 +311,7 @@ impl App {
             dialogs: DialogManager::new(),
             last_playlist_report: None,
             main_menu_open: false,
+            pending_clutter_menu: None,
             notes: Vec::new(),
             last_error: None,
             host: HostStateLink::detached(),
@@ -1668,6 +1671,12 @@ impl App {
             // presenter hosts the OS window for it.
             C::OpenMainMenu => self.open_main_menu(),
             C::FocusNextWindow => self.focus_next_window(),
+            // The clutterbar popups (S04 §4, §5): the app owns the pending
+            // request, the presenter shows the system menu.
+            C::OpenOptionsMenu => self.open_clutter_menu(crate::menu::ClutterMenu::Options),
+            C::OpenVisualizationMenu => {
+                self.open_clutter_menu(crate::menu::ClutterMenu::Visualization);
+            }
             C::ConfigureVisPlugin | C::ToggleVisPlugin => {
                 self.note(format!("{command:?} needs the plugin host (M3)"));
             }

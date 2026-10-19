@@ -24,6 +24,15 @@ use rustamp_ui::{ShortcutAction, ShortcutOutcome};
 use crate::app::App;
 use crate::routing;
 
+/// Which clutterbar popup is waiting to be shown (RFC 0016).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClutterMenu {
+    /// The Options popup (letter O, S04 §4).
+    Options,
+    /// The visualization menu (letter V, S04 §5).
+    Visualization,
+}
+
 /// What activating one menu leaf did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuOutcome {
@@ -87,6 +96,28 @@ impl App {
         self.main_menu_open = true;
     }
 
+    /// Asks for a clutterbar popup (`Command::OpenOptionsMenu` /
+    /// `Command::OpenVisualizationMenu`). The presenter takes it from the
+    /// tick ([`App::take_clutter_menu`]); a second request replaces the first.
+    pub fn open_clutter_menu(&mut self, menu: ClutterMenu) {
+        self.pending_clutter_menu = Some(menu);
+    }
+
+    /// Takes the pending clutterbar popup request, if any.
+    pub fn take_clutter_menu(&mut self) -> Option<ClutterMenu> {
+        self.pending_clutter_menu.take()
+    }
+
+    /// The native popup tree for `menu`, with live check marks.
+    pub fn native_clutter_menu(&self, menu: ClutterMenu) -> rustamp_ui::menu::NativeMainMenu {
+        match menu {
+            ClutterMenu::Options => {
+                rustamp_ui::menu::native_options_menu(self.state(), &self.menu_flags())
+            }
+            ClutterMenu::Visualization => rustamp_ui::menu::native_visualization_menu(),
+        }
+    }
+
     /// Closes the main-menu popup, if open. The presenter drops the OS window
     /// for this state.
     pub fn close_main_menu(&mut self) {
@@ -134,6 +165,15 @@ impl App {
             }
             rustamp_ui::menu::MenuChoice::Exit => self.quit_from_menu().map(Some),
             rustamp_ui::menu::MenuChoice::NoAction { .. } => Ok(None),
+            rustamp_ui::menu::MenuChoice::SetTimeRemaining(remaining) => {
+                // Set, don't toggle: the shortcut is a flip, so only flip when
+                // the reading differs.
+                if self.state().time_remaining == remaining {
+                    return Ok(Some(MenuOutcome::TimeDisplay(remaining)));
+                }
+                self.activate_menu_item(choice.label(), ShortcutAction::ToggleTimeRemaining)
+                    .map(Some)
+            }
         }
     }
 
@@ -373,5 +413,64 @@ mod tests {
             (image.width(), image.height()),
             rustamp_ui::menu::MAIN_MENU_CLIENT_SIZE
         );
+    }
+}
+
+#[cfg(test)]
+mod clutter_tests {
+    use super::*;
+    use rustamp_core::audio::DecoderRegistry;
+    use rustamp_core::config::Config;
+
+    use crate::app::AppOptions;
+    use crate::cli::OutputChoice;
+
+    fn test_app() -> App {
+        let options = AppOptions {
+            config: Config::default(),
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            file: None,
+            seconds: None,
+        };
+        App::with_registry(options, DecoderRegistry::new()).unwrap()
+    }
+
+    #[test]
+    fn the_clutter_commands_queue_their_popup_once() {
+        let mut app = test_app();
+        assert_eq!(app.take_clutter_menu(), None);
+        app.submit(Command::OpenOptionsMenu).unwrap();
+        assert_eq!(app.take_clutter_menu(), Some(ClutterMenu::Options));
+        assert_eq!(app.take_clutter_menu(), None);
+        app.submit(Command::OpenVisualizationMenu).unwrap();
+        assert_eq!(app.take_clutter_menu(), Some(ClutterMenu::Visualization));
+    }
+
+    #[test]
+    fn the_time_rows_set_the_reading_and_never_clear_it() {
+        use rustamp_ui::menu::MenuChoice;
+        let mut app = test_app();
+        assert!(!app.state().time_remaining);
+        // Choosing the row that is already on keeps it on.
+        app.activate_menu_choice(MenuChoice::SetTimeRemaining(false))
+            .unwrap();
+        assert!(!app.state().time_remaining);
+        app.activate_menu_choice(MenuChoice::SetTimeRemaining(true))
+            .unwrap();
+        assert!(app.state().time_remaining);
+        app.activate_menu_choice(MenuChoice::SetTimeRemaining(true))
+            .unwrap();
+        assert!(app.state().time_remaining);
+        let menu = app.native_clutter_menu(ClutterMenu::Options);
+        assert!(menu.rows.iter().any(|row| matches!(
+            row,
+            rustamp_platform::PopupRow::Entry { label, checked: true, .. }
+                if label == "Time remaining"
+        )));
+        app.activate_menu_choice(MenuChoice::SetTimeRemaining(false))
+            .unwrap();
+        assert!(!app.state().time_remaining);
     }
 }
