@@ -138,9 +138,10 @@ pub struct PcmInput<R: MappedRegion> {
 /// Mapping policy. The real implementation is [`NamedPcmRings`] on Windows;
 /// tests substitute shared anonymous regions, not a second transfer algorithm.
 ///
-/// Every implementation must apply the direction rule of [`check_offer`]: a
-/// ring is offered in one direction only, and an opener refuses an offer
-/// whose direction is not the one it expects, before any mapping opens.
+/// Every implementation must apply the offer rules of [`check_offer`]: a ring
+/// is offered in one direction only and carries the spec's frame size, and an
+/// opener refuses an offer whose direction or frame size is not the one it
+/// expects, before any mapping opens.
 pub trait PcmRings: Send + 'static {
     /// Mapping backing each endpoint.
     type Region: MappedRegion + 'static;
@@ -151,8 +152,8 @@ pub trait PcmRings: Send + 'static {
     fn create(&self, spec: PcmSpecWire, capacity: u32) -> Result<PcmOffer<Self::Region>>;
     /// Validate/open the ring and wake before returning RingReady.
     ///
-    /// The decoder path: an offer in another direction is refused
-    /// ([`check_offer`]).
+    /// The decoder path: an offer in another direction or with another frame
+    /// size is refused ([`check_offer`]).
     fn open(&self, offer: &Message, spec: PcmSpecWire) -> Result<PcmInput<Self::Region>>;
 
     /// Direction-aware allocation. The default covers the decoder path
@@ -176,8 +177,8 @@ pub trait PcmRings: Send + 'static {
     /// Direction-aware open. The default covers the decoder path through
     /// [`PcmRings::open`]; see [`PcmRings::create_directed`].
     ///
-    /// An offer whose direction is not `direction` is refused
-    /// ([`check_offer`]).
+    /// An offer whose direction is not `direction`, or whose frame size is
+    /// not the spec's, is refused ([`check_offer`]).
     fn open_directed(
         &self,
         offer: &Message,
@@ -204,7 +205,8 @@ pub fn validate_spec(spec: PcmSpecWire) -> Result<()> {
     Ok(())
 }
 
-/// Refuse an offer that is not a PCM ring in the expected direction.
+/// Refuse an offer that is not a PCM ring in the expected direction with the
+/// expected frame size.
 ///
 /// The direction tells an opener which end it is (RFC 0003 §9): the decoder's
 /// PCM ring runs host -> main (`HostToMain`), the DSP in-ring main -> host
@@ -212,12 +214,21 @@ pub fn validate_spec(spec: PcmSpecWire) -> Result<()> {
 /// the other one **before** it opens a mapping, so a ring offered backwards
 /// never carries data.
 ///
-/// This is the single copy of that rule: production ([`NamedPcmRings`]) and
+/// The frame size is the other half of the same contract: a ring whose slots
+/// are not the spec's frame size cannot be read as PCM at all. A mismatch is
+/// reported as [`RingError::FrameSizeMismatch`] — the error production
+/// returns for it — and never as a panic, so an opener and its test double
+/// answer a foreign offer the same way.
+///
+/// This is the single copy of both rules: production ([`NamedPcmRings`]) and
 /// the in-process test doubles call it, so a test double cannot drift from
-/// the rule production enforces.
-pub fn check_offer(offer: &Message, expected: RingDirection) -> Result<()> {
+/// the rules production enforces.
+pub fn check_offer(offer: &Message, expected: RingDirection, spec: PcmSpecWire) -> Result<()> {
     let Message::RingOffer {
-        kind, direction, ..
+        kind,
+        direction,
+        frame_size,
+        ..
     } = offer
     else {
         return Err(MediaHostError::InvalidMessage(
@@ -228,6 +239,13 @@ pub fn check_offer(offer: &Message, expected: RingDirection) -> Result<()> {
         return Err(MediaHostError::InvalidMessage(
             "wrong ring kind/direction".into(),
         ));
+    }
+    if *frame_size != spec.frame_size() {
+        return Err(RingError::FrameSizeMismatch {
+            expected: spec.frame_size(),
+            found: *frame_size,
+        }
+        .into());
     }
     Ok(())
 }
@@ -352,9 +370,10 @@ impl NamedPcmRings {
             MAX_RING_BYTES, NamedRegion, RING_DATA_OFFSET, RingError, RingWake,
         };
         validate_spec(spec)?;
-        // The kind and the direction are checked before any mapping opens, so
-        // a ring offered backwards never carries data.
-        check_offer(offer, expected)?;
+        // The kind, the direction and the frame size are checked before any
+        // mapping opens, so a ring offered backwards or with foreign slots
+        // never carries data.
+        check_offer(offer, expected, spec)?;
         let Message::RingOffer {
             name,
             frame_size,
@@ -369,13 +388,6 @@ impl NamedPcmRings {
                 "expected PCM RingOffer".into(),
             ));
         };
-        if *frame_size != spec.frame_size() {
-            return Err(RingError::FrameSizeMismatch {
-                expected: spec.frame_size(),
-                found: *frame_size,
-            }
-            .into());
-        }
         if *capacity == 0
             || *generation == 0
             || *size > MAX_RING_BYTES
@@ -414,19 +426,33 @@ mod tests {
         }
     }
 
+    /// The spec behind [`pcm_offer`]: stereo, so a frame is 8 bytes.
+    const SPEC: PcmSpecWire = PcmSpecWire {
+        sample_rate_hz: 44100,
+        channels: 2,
+    };
+
+    /// The spec with one channel: a frame is 4 bytes, not 8.
+    const MONO: PcmSpecWire = PcmSpecWire {
+        sample_rate_hz: 44100,
+        channels: 1,
+    };
+
     #[test]
     fn an_offer_in_the_expected_direction_is_accepted() {
         assert!(
             check_offer(
                 &pcm_offer(RingDirection::HostToMain),
-                RingDirection::HostToMain
+                RingDirection::HostToMain,
+                SPEC
             )
             .is_ok()
         );
         assert!(
             check_offer(
                 &pcm_offer(RingDirection::MainToHost),
-                RingDirection::MainToHost
+                RingDirection::MainToHost,
+                SPEC
             )
             .is_ok()
         );
@@ -440,7 +466,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    check_offer(&pcm_offer(offered), expected),
+                    check_offer(&pcm_offer(offered), expected, SPEC),
                     Err(MediaHostError::InvalidMessage(_))
                 ),
                 "a ring offered {offered:?} must not open as {expected:?}"
@@ -451,7 +477,7 @@ mod tests {
     #[test]
     fn a_message_that_is_no_pcm_ring_offer_is_refused() {
         assert!(matches!(
-            check_offer(&Message::hello(), RingDirection::HostToMain),
+            check_offer(&Message::hello(), RingDirection::HostToMain, SPEC),
             Err(MediaHostError::InvalidMessage(_))
         ));
         let mut vis = pcm_offer(RingDirection::HostToMain);
@@ -459,7 +485,71 @@ mod tests {
             *kind = RingKind::Vis;
         }
         assert!(matches!(
-            check_offer(&vis, RingDirection::HostToMain),
+            check_offer(&vis, RingDirection::HostToMain, SPEC),
+            Err(MediaHostError::InvalidMessage(_))
+        ));
+    }
+
+    /// The frame size rule is the second half of the offer contract, and it
+    /// is reported with the typed error production returns — never as a
+    /// panic and never as a generic message.
+    #[test]
+    fn an_offer_with_a_foreign_frame_size_is_refused_with_the_frame_size_mismatch() {
+        // The spec expects 4 bytes per frame, the offer carries 8.
+        let error = check_offer(
+            &pcm_offer(RingDirection::HostToMain),
+            RingDirection::HostToMain,
+            MONO,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                MediaHostError::Ring(RingError::FrameSizeMismatch {
+                    expected: 4,
+                    found: 8
+                })
+            ),
+            "a foreign frame size must be reported as the frame size mismatch: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "frame size mismatch: expected 4, found 8"
+        );
+
+        // The other way round: the offer claims 4 bytes, the spec wants 8.
+        let mut lying = pcm_offer(RingDirection::HostToMain);
+        if let Message::RingOffer { frame_size, .. } = &mut lying {
+            *frame_size = 4;
+        }
+        let error = check_offer(&lying, RingDirection::HostToMain, SPEC).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                MediaHostError::Ring(RingError::FrameSizeMismatch {
+                    expected: 8,
+                    found: 4
+                })
+            ),
+            "a lying offer must be reported as the frame size mismatch: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "frame size mismatch: expected 8, found 4"
+        );
+    }
+
+    /// The direction is checked before the frame size, so an offer that is
+    /// wrong in both ways reports the direction — the order production
+    /// refuses it in.
+    #[test]
+    fn the_direction_is_refused_before_the_frame_size() {
+        let mut offer = pcm_offer(RingDirection::MainToHost);
+        if let Message::RingOffer { frame_size, .. } = &mut offer {
+            *frame_size = 4;
+        }
+        assert!(matches!(
+            check_offer(&offer, RingDirection::HostToMain, SPEC),
             Err(MediaHostError::InvalidMessage(_))
         ));
     }

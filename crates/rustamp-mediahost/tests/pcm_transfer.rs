@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustamp_ipc::shm::{
-    AnonymousRegion, RING_DATA_OFFSET, RingConsumer, RingDirection, RingKind, RingProducer,
-    RingWake,
+    AnonymousRegion, RING_DATA_OFFSET, RingConsumer, RingDirection, RingError, RingKind,
+    RingProducer, RingWake,
 };
 use rustamp_ipc::{Message, StreamTransport, Transport};
 use rustamp_mediahost::control::{ControlPeer, Liveness};
@@ -143,20 +143,17 @@ impl TestRings {
         spec: PcmSpecWire,
         expected: RingDirection,
     ) -> Result<PcmInput<AnonymousRegion>> {
-        // The same rule production enforces (`NamedPcmRings::open_impl`): an
-        // offer in another direction is refused before any mapping opens, so
-        // this double cannot run a configuration the host could never create.
-        check_offer(offer, expected)?;
-        let Message::RingOffer {
-            name, frame_size, ..
-        } = offer
-        else {
+        // The same rules production enforces (`NamedPcmRings::open_impl`): an
+        // offer in another direction or with a foreign frame size is refused
+        // before any mapping opens, so this double cannot run a configuration
+        // the host could never create.
+        check_offer(offer, expected, spec)?;
+        let Message::RingOffer { name, .. } = offer else {
             // `check_offer` already refused every other message.
             return Err(MediaHostError::InvalidMessage(
                 "expected PCM RingOffer".into(),
             ));
         };
-        assert_eq!(*frame_size, spec.frame_size());
         let region = self.0.lock().unwrap()[name].clone();
         let expect = offer.ring_expect().unwrap();
         let consumer =
@@ -248,6 +245,131 @@ fn test_rings_refuse_the_direction_production_refuses() {
         rings.open_directed(&offer.message, spec, RingDirection::MainToHost),
         Err(MediaHostError::InvalidMessage(_))
     ));
+}
+
+/// The error of a refused open. [`PcmInput`] is not `Debug`, so a refused
+/// result cannot be unwrapped with `unwrap_err`.
+fn refused<T>(result: Result<T>) -> MediaHostError {
+    match result {
+        Ok(_) => panic!("the open must be refused, not succeed"),
+        Err(error) => error,
+    }
+}
+
+/// The in-process double must report a foreign frame size the way production
+/// does: with the typed [`RingError::FrameSizeMismatch`], never with a
+/// panic.
+///
+/// Before the rule was shared, this double asserted the frame size with
+/// `assert_eq!`, so a mismatched offer aborted the test binary instead of
+/// reporting the error production returns (the drift wave184 closed for the
+/// ring direction).
+#[test]
+fn test_rings_refuse_the_frame_size_production_refuses() {
+    let rings = TestRings::default();
+    let spec = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 2,
+    };
+    // Mono: one channel is a 4-byte frame, the offer carries 8.
+    let mono = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 1,
+    };
+    let offer = rings.create(spec, 1).unwrap();
+
+    // The matching frame size opens.
+    assert!(rings.open(&offer.message, spec).is_ok());
+
+    // A spec with a different frame size is refused the way production
+    // refuses it, naming the size it expected and the one it found.
+    let error = refused(rings.open(&offer.message, mono));
+    assert!(
+        matches!(
+            &error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 4,
+                found: 8
+            })
+        ),
+        "a foreign frame size must be reported, not panicked: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "frame size mismatch: expected 4, found 8"
+    );
+
+    // An offer that lies about its frame size is refused with the same
+    // error, naming the spec's size as the expected one.
+    let mut lying = offer.message.clone();
+    if let Message::RingOffer { frame_size, .. } = &mut lying {
+        *frame_size = 16;
+    }
+    let error = refused(rings.open(&lying, spec));
+    assert!(
+        matches!(
+            &error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 8,
+                found: 16
+            })
+        ),
+        "a lying offer must be reported, not panicked: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "frame size mismatch: expected 8, found 16"
+    );
+}
+
+/// The double and production must answer the same offer with the same error:
+/// same variant, same message. A test may never see a different outcome
+/// than the host would produce.
+#[cfg(windows)]
+#[test]
+fn the_double_and_production_report_the_same_frame_size_mismatch() {
+    use rustamp_mediahost::pcm::NamedPcmRings;
+
+    let spec = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 2,
+    };
+    let mono = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 1,
+    };
+
+    // Production: the Windows named mapping. The refusal happens before any
+    // mapping opens, so nothing is left behind.
+    let production = NamedPcmRings.create(spec, 1).unwrap();
+    let production_error = refused(NamedPcmRings.open(&production.message, mono));
+
+    // The double: the in-process anonymous region.
+    let rings = TestRings::default();
+    let double = rings.create(spec, 1).unwrap();
+    let double_error = refused(rings.open(&double.message, mono));
+
+    assert!(
+        matches!(
+            &production_error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 4,
+                found: 8
+            })
+        ),
+        "production must report the frame size mismatch: {production_error}"
+    );
+    assert!(
+        matches!(
+            &double_error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 4,
+                found: 8
+            })
+        ),
+        "the double must report the frame size mismatch: {double_error}"
+    );
+    assert_eq!(double_error.to_string(), production_error.to_string());
 }
 
 fn start(

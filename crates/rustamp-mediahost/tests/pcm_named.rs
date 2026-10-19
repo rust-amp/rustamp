@@ -15,6 +15,15 @@ const SPEC: PcmSpecWire = PcmSpecWire {
     channels: 2,
 };
 
+/// The error of a refused open. `PcmInput` is not `Debug`, so a refused
+/// result cannot be unwrapped with `unwrap_err`.
+fn refused<T>(result: Result<T, MediaHostError>) -> MediaHostError {
+    match result {
+        Ok(_) => panic!("the open must be refused, not succeed"),
+        Err(error) => error,
+    }
+}
+
 #[test]
 fn named_mapping_and_wake_transfer_then_drain_closed_ring() {
     let mut offer = NamedPcmRings.create(SPEC, 1).unwrap();
@@ -47,10 +56,24 @@ fn format_direction_and_generation_are_validated_before_ready() {
         channels: 1,
         ..SPEC
     };
-    assert!(matches!(
-        NamedPcmRings.open(&offer.message, wrong),
-        Err(MediaHostError::Ring(RingError::FrameSizeMismatch { .. }))
-    ));
+    // The exact error production reports for a foreign frame size: the same
+    // variant and the same message the in-process test doubles report
+    // (`pcm_transfer`/`deaf_wake` pin the same values).
+    let error = refused(NamedPcmRings.open(&offer.message, wrong));
+    assert!(
+        matches!(
+            &error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 4,
+                found: 8
+            })
+        ),
+        "a foreign frame size must be reported, not accepted: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "frame size mismatch: expected 4, found 8"
+    );
     let mut stale = offer.message.clone();
     if let Message::RingOffer { generation, .. } = &mut stale {
         *generation = generation.wrapping_add(1);
