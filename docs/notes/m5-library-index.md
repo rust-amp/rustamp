@@ -36,6 +36,8 @@ same second.
 
 - `Library::open(path)`, `Library::in_memory()`
 - `Library::scan(root) -> ScanReport`, `Library::scan_root(root_id) -> ScanReport`
+- `Library::scan_with_progress(root, &Cancel, on_progress) -> ScanReport`,
+  `Library::scan_root_with_progress(root_id, &Cancel, on_progress) -> ScanReport`
 - `Library::add_root(path) -> Root` (idempotent, stored as given, need not
   exist yet), `Library::remove_root(path) -> usize` (tracks dropped;
   `NotFound` when the path is not a root), `Library::roots() -> Vec<Root>`
@@ -48,6 +50,9 @@ same second.
 - `Query { path_prefix, artist, album, title, genre, text, sort, descending,
   limit, offset }`; field filters are exact and case-sensitive, combined with
   AND; `path_prefix` is a literal byte prefix.
+- `Cancel { new, cancel, is_cancelled }`, `ScanPhase { Scanning, Removing,
+  Finished }`, `ScanProgress { phase, path, seen, added, updated, skipped,
+  removed }`, `SCAN_BATCH_SIZE` (64).
 
 ### Query semantics
 
@@ -94,6 +99,53 @@ of the roots table, so a path can be scanned without being registered.
 A re-scan of an unchanged tree reports zero `added`/`updated`/`removed`, zero
 `skipped`, and returns identical row ids.
 
+## Background scan with progress (wave174)
+
+`scan_with_progress` is the scan for a background thread. The crate owns no
+thread: the caller decides where the scan runs and how the events reach the
+user interface.
+
+- `Library::scan_with_progress(root, &Cancel, on_progress) -> ScanReport`
+  and `Library::scan_root_with_progress(root_id, &Cancel, on_progress)` are
+  the scanning entries; `scan`/`scan_root` are the same code path with a
+  flag that is never set and a callback that does nothing.
+- The event is `ScanProgress { phase, path, seen, added, updated, skipped,
+  removed }` with the coarse `ScanPhase { Scanning, Removing, Finished }`.
+  The callback runs on the thread that drives the scan: once before the
+  first file, once per considered file and once per phase change. The
+  counters are the live ones; they can be ahead of the index by the batch in
+  flight.
+- `Cancel` is a shared flag (`Arc<AtomicBool>`): the caller keeps one clone
+  and hands another to the scan, so the interface thread can stop a scan
+  that runs on a worker thread. The scan checks the flag between two files
+  and before the removal pass.
+
+### The batch rule
+
+A scan commits its work in batches of at most `SCAN_BATCH_SIZE` (64)
+considered files, and every batch is one transaction. The index therefore
+never holds half a batch: it holds the batches that were committed, in
+order. The batch size bounds two things at once: the work a cancelled scan
+drops (at most one batch) and the time a write transaction is open.
+
+### The cancel semantics
+
+- The scan stops at the next file boundary; the file it is on is finished.
+- The batch in flight is **not** written: it is dropped, so the index keeps
+  the batches that were committed before the cancel. At most
+  `SCAN_BATCH_SIZE` files of work are lost; the next scan picks them up.
+- The removal pass does **not** run after a cancel, so a cancelled scan
+  never deletes a row. A cancel that arrives during the removal pass rolls
+  the removal transaction back, so it deletes nothing either.
+- `ScanReport` describes the *committed* state: `added`, `updated` and
+  `removed` are the changes the index really holds, `scanned`/`skipped` are
+  the files of the committed batches, and the new `cancelled` flag says
+  whether the scan was stopped.
+
+The scan rules are unchanged: the same `(mtime_ns, size)` change detection,
+the same "unreadable file is skipped and keeps its row", and the removal
+pass only under a fully walked root.
+
 ## Tag writing (wave169)
 
 `Library::write_tags(id, &TrackMetadata) -> Result<TrackRow>` edits the tags of
@@ -128,7 +180,7 @@ write is atomic). A write that succeeded but could not be read back leaves the
 row as it was, too: the row is then stale and the next scan repairs it,
 because the file's stat no longer matches the stored one.
 
-## Tests (32, all headless on temp directories)
+## Tests (38, all headless on temp directories)
 
 Scan/query (14, wave145): `scan_indexes_and_queries`, `rescan_is_idempotent`,
 `update_on_change`, `removed_files_dropped`, `query_by_album`,
@@ -163,14 +215,31 @@ and the next scan finds no change), `the_row_follows_the_file_and_not_the_caller
 `writing_to_an_unknown_track_is_an_error`,
 `a_write_keeps_the_extra_tags_of_the_file`.
 
+Background scan with progress (6, wave174):
+`progress_events_arrive_in_order` (the phases arrive in order, one event per
+considered file, the counters rise, the ignored file produces no event),
+`a_file_that_cannot_be_read_is_reported_as_skipped`,
+`a_cancelled_scan_stops_early_and_keeps_the_committed_rows` (the cancel
+arrives in the second batch: the first batch is committed, the batch in
+flight is dropped, so the index holds exactly `SCAN_BATCH_SIZE` rows),
+`a_cancel_before_the_delete_pass_leaves_the_index_untouched` (the stale row
+survives and the changed row keeps its old tags),
+`a_normal_scan_still_behaves_as_before` (the plain scan and the scan with
+progress report the same thing),
+`a_scan_cancelled_before_it_starts_does_nothing`.
+
 Fixtures are 44-byte WAV headers written with `rustamp_meta::write_tags`, so no
 audio is decoded and no window is opened.
 
 ## What a UI needs next
 
-- A background scan trigger (own thread plus a progress channel) and progress
-  reporting; `ScanReport` is already the summary value to publish, and the UI
-  can loop over `roots()` calling `scan_root(id)` per root.
+- A background scan trigger (own thread plus a progress channel); the crate
+  now has the two halves the app needs: `scan_with_progress` /
+  `scan_root_with_progress` report the progress, and `Cancel` stops a scan
+  that runs on a worker thread. The app owns the thread and the channel, and
+  it loops over `roots()` calling `scan_root_with_progress(id, &cancel, cb)`
+  per root. `ScanReport` is the summary value to publish; `cancelled` says
+  whether the scan was stopped.
 - Display columns: title, artist, album, track, duration, genre, path; the
   index has no column for artwork or for the file name.
 - Tag editing is available now: `Library::write_tags(id, &metadata)` writes
@@ -178,8 +247,7 @@ audio is decoded and no window is opened.
   `extra` entries the target format refused uses
   `rustamp_meta::write_tags_report` directly.
 - Artwork via `rustamp_meta::read_artwork`; not stored in the index.
-- A per-root last-scan timestamp (the `roots` table has only `added_at`) and
-  scan progress.
+- A per-root last-scan timestamp (the `roots` table has only `added_at`).
 - CD playback/ripping (M5 optional) is out of scope here.
 
 ## Remaining limits
@@ -196,6 +264,13 @@ audio is decoded and no window is opened.
   `rustamp-meta` does not read audio properties.
 - A tag write cannot ask for a field to be removed: `write_tags` reads a
   `None` as "leave the value the file has".
+- The scan progress is not stored: there is no per-root last-scan time and
+  no progress row in the index, so a scan that was interrupted is resumed by
+  running it again.
+- A cancelled scan drops the batch that was in flight (at most
+  `SCAN_BATCH_SIZE` files of work); the next scan picks those files up.
+- The scan reports one event per considered file, so a caller that forwards
+  the events over a channel should throttle them if it cannot keep up.
 
 ## Dependency added
 

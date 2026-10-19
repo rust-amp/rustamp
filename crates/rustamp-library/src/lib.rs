@@ -107,6 +107,39 @@
 //! that does not exist is an error ([`Error::NotFound`]) rather than an empty
 //! report.
 //!
+//! ## Scan progress and cancellation
+//!
+//! [`Library::scan_with_progress`] is the scan for a background thread: it
+//! reports what it does through a callback and it can be stopped through a
+//! [`Cancel`] flag. The crate owns no thread - the caller decides where the
+//! scan runs and how the events reach the user interface.
+//!
+//! The event is a [`ScanProgress`]: the coarse [`ScanPhase`], the file the
+//! scan is working on, and the counters (files seen, added, updated,
+//! skipped, removed). The callback runs on the thread that drives the scan,
+//! once before the first file, once per considered file and once per phase
+//! change, so a caller can forward the events over a channel without
+//! polling.
+//!
+//! The scan commits its work in batches of at most [`SCAN_BATCH_SIZE`]
+//! considered files, and every batch is one transaction. The index
+//! therefore never holds half a batch: it holds the batches that were
+//! committed, in order. A cancelled scan keeps the batches it committed and
+//! drops the batch in flight, so at most `SCAN_BATCH_SIZE` files of work
+//! are lost.
+//!
+//! Cancellation is checked between two files and before the removal pass.
+//! A cancelled scan never deletes a row: the removal pass is the one step
+//! that can make the index smaller than the disk, and it does not run after
+//! a cancel. It also does not run when a directory could not be read, for
+//! the same reason.
+//!
+//! The [`ScanReport`] a scan returns describes the *committed* state: its
+//! `added`, `updated` and `removed` are the changes the index really
+//! holds, and `cancelled` says whether the scan was stopped. The counters
+//! of a progress event are the live ones and can be ahead of the index by
+//! the batch in flight.
+//!
 //! ## Tag writing
 //!
 //! [`Library::write_tags`] edits the tags of an indexed track. The values
@@ -144,9 +177,12 @@
 //! * `text` matches substrings of the three columns only; it is a `LIKE` scan,
 //!   not a tokenised full-text index, and cannot match across columns
 //!   (`title + artist` as one haystack) or by word prefix ranking.
-//! * `scan_root`/`scan` do not record scan progress or a per-root last-scan
-//!   time; the caller drives scanning (for example from a background thread)
-//!   and gets the [`ScanReport`] back.
+//! * `scan_root`/`scan` do not record a per-root last-scan time: the
+//!   `roots` table has only `added_at`. The scan progress is reported per
+//!   scan and is not stored in the index.
+//! * A cancelled scan drops the batch that was in flight (at most
+//!   [`SCAN_BATCH_SIZE`] files of work). The files it dropped are indexed
+//!   by the next scan.
 //! * A tag write cannot ask for a field to be removed: `write_tags` reads a
 //!   `None` as "leave the value the file has" (the `rustamp-meta`
 //!   contract).
@@ -156,6 +192,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::functions::FunctionFlags;
@@ -274,6 +312,104 @@ pub struct ScanReport {
     pub removed: usize,
     /// Considered files that could not be read or whose tags failed to parse.
     pub skipped: usize,
+    /// Whether the scan was cancelled before it was done.
+    ///
+    /// A cancelled scan reports the state it committed, so `added`,
+    /// `updated` and `removed` are the changes the index really holds.
+    pub cancelled: bool,
+}
+
+/// How many considered files a scan commits in one transaction.
+///
+/// A scan writes its rows in batches, and every batch is one transaction, so
+/// the index never holds half a batch. The batch size bounds two things at
+/// once: the work a cancelled scan drops (at most one batch) and the time a
+/// write transaction is open. Sixty-four files per transaction is the
+/// compromise: a large library commits few times, and a cancelled scan does
+/// not lose much.
+pub const SCAN_BATCH_SIZE: usize = 64;
+
+/// A cancellation flag a running scan checks between files.
+///
+/// The flag is shared and cheap to clone: the caller keeps one clone and
+/// hands another to the scan, so a scan that runs on a worker thread can be
+/// stopped from the thread that owns the user interface.
+///
+/// ```
+/// use rustamp_library::Cancel;
+///
+/// // The flag is shared: the scan gets one clone, the interface thread
+/// // keeps the other.
+/// let cancel = Cancel::new();
+/// let for_the_worker = cancel.clone();
+/// assert!(!for_the_worker.is_cancelled());
+/// cancel.cancel();
+/// assert!(for_the_worker.is_cancelled());
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct Cancel {
+    flag: Arc<AtomicBool>,
+}
+
+impl Cancel {
+    /// A fresh flag that is not cancelled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the running scan to stop.
+    ///
+    /// The scan stops at the next file boundary: it finishes the file it is
+    /// on and returns. The batch in flight is not written, but the batches
+    /// that were committed before the cancel stay in the index. Setting the
+    /// flag twice is harmless, and setting it after the scan has ended
+    /// changes nothing.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the flag is set.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
+
+/// The coarse phase a running scan is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPhase {
+    /// The scan walks the tree and indexes the files it finds.
+    Scanning,
+    /// The removal pass deletes the rows whose file is gone.
+    Removing,
+    /// The scan is over, whether it finished or it was cancelled.
+    ///
+    /// Whether the scan was cancelled is in [`ScanReport::cancelled`], not
+    /// here: the phase says that the scan ended, the report says how.
+    Finished,
+}
+
+/// One progress event of a running scan.
+///
+/// The counters are the ones of the scan so far. They include the batch that
+/// is in flight, so they can be ahead of what the index holds by up to
+/// [`SCAN_BATCH_SIZE`] files; the [`ScanReport`] a scan returns counts only
+/// the committed batches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// The phase the scan is in.
+    pub phase: ScanPhase,
+    /// The file the scan is working on, if any.
+    pub path: Option<PathBuf>,
+    /// Considered files the scan has seen.
+    pub seen: usize,
+    /// Rows the scan has added.
+    pub added: usize,
+    /// Rows the scan has updated.
+    pub updated: usize,
+    /// Files the scan could not read.
+    pub skipped: usize,
+    /// Rows the scan has removed.
+    pub removed: usize,
 }
 
 /// Persistent media library index.
@@ -345,77 +481,95 @@ impl Library {
     ///
     /// Returns [`Error::NotFound`] when `root` does not exist.
     pub fn scan(&mut self, root: &Path) -> Result<ScanReport> {
+        self.scan_with_progress(root, &Cancel::new(), |_| {})
+    }
+
+    /// Scan `root`, upserting track rows and reporting the progress.
+    ///
+    /// This is [`Library::scan`] with two extras: the scan reports what it
+    /// does through `on_progress`, and it can be stopped through `cancel`.
+    /// The crate owns no thread - the caller decides whether the scan runs
+    /// on the interface thread, on a worker thread, or wherever it likes.
+    ///
+    /// The scan follows the rules of [`Library::scan`] (see the module docs):
+    /// the same change detection on `(mtime_ns, size)`, the same treatment
+    /// of an unreadable file, and the same removal pass.
+    ///
+    /// `on_progress` runs on the thread that drives the scan, once before
+    /// the first file, once per considered file and once per phase change.
+    /// It should return quickly: a caller that forwards the events to an
+    /// interface thread blocks here until the channel takes them, and a
+    /// caller that cannot keep up with one event per file should throttle
+    /// the events it forwards.
+    ///
+    /// # Cancellation
+    ///
+    /// The scan checks `cancel` between two files. A cancelled scan stops
+    /// where it is: the batch in flight is not written, so the index keeps
+    /// the batches that were committed before the cancel and never holds
+    /// half a batch. The removal pass does not run after a cancel, so a
+    /// cancelled scan never deletes a row.
+    ///
+    /// The returned [`ScanReport`] describes the committed state: `added`,
+    /// `updated` and `removed` are the changes the index really holds, and
+    /// `cancelled` says whether the scan was stopped.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when `root` does not exist, and the error of the
+    /// database when a batch cannot be written.
+    pub fn scan_with_progress(
+        &mut self,
+        root: &Path,
+        cancel: &Cancel,
+        mut on_progress: impl FnMut(ScanProgress),
+    ) -> Result<ScanReport> {
         if fs::metadata(root).is_err() {
             return Err(Error::NotFound(root.display().to_string()));
         }
 
-        let mut files = Vec::new();
-        let mut walk_complete = true;
-        walk_dir(root, &mut files, &mut walk_complete);
-
-        // Existing rows under root, for change detection and removals.
+        // The stored rows under the root, taken before the scan writes
+        // anything: they are the baseline of the change detection and the
+        // set the removal pass works on.
         let existing = self.rows_under(root)?;
 
-        let mut report = ScanReport::default();
-        // Every considered file found on disk, whether or not it could be read.
-        // A file that is present but unreadable must not be treated as removed.
-        let mut present: HashSet<PathBuf> = HashSet::new();
+        let mut state = ScanState {
+            conn: &mut self.conn,
+            existing: &existing,
+            cancel,
+            on_progress: &mut on_progress,
+            present: HashSet::new(),
+            committed: Counters::default(),
+            pending: Counters::default(),
+            batch: Vec::with_capacity(SCAN_BATCH_SIZE),
+            files_in_batch: 0,
+            walk_complete: true,
+            cancelled: false,
+        };
 
-        let tx = self.conn.transaction().map_err(map_sqlite)?;
-        for path in files {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !rustamp_meta::supports_extension(ext) {
-                continue;
-            }
-            present.insert(path.clone());
+        state.emit(ScanPhase::Scanning, None);
 
-            let meta = match fs::metadata(&path) {
-                Ok(meta) => meta,
-                Err(_) => {
-                    report.skipped += 1;
-                    continue;
-                }
-            };
-            let mtime_ns = mtime_of(&meta);
-            let size = Some(meta.len() as i64);
-
-            if let Some((stored_mtime, stored_size)) = existing.get(&path)
-                && *stored_mtime == mtime_ns
-                && *stored_size == size
-            {
-                report.scanned += 1;
-                continue;
-            }
-
-            let tags = match rustamp_meta::read_tags(&path) {
-                Ok(tags) => tags,
-                Err(_) => {
-                    report.skipped += 1;
-                    continue;
-                }
-            };
-
-            let is_new = !existing.contains_key(&path);
-            upsert_row(&tx, &path, &tags, mtime_ns, size)?;
-            if is_new {
-                report.added += 1;
-            } else {
-                report.updated += 1;
-            }
-            report.scanned += 1;
+        if root.is_file() {
+            // A file root indexes that one file.
+            let _ = state.visit(root)?;
+        } else {
+            walk_files(&mut state, root)?;
         }
 
-        if walk_complete {
-            for path in existing.keys() {
-                if !present.contains(path) {
-                    delete_path(&tx, path)?;
-                    report.removed += 1;
-                }
+        if state.cancel.is_cancelled() {
+            // The batch in flight is dropped: its rows were never written.
+            state.cancelled = true;
+            state.discard();
+        } else {
+            // The last batch, then the removal pass.
+            state.flush()?;
+            if state.walk_complete {
+                state.removal_pass()?;
             }
         }
 
-        tx.commit().map_err(map_sqlite)?;
-        Ok(report)
+        state.emit(ScanPhase::Finished, None);
+        Ok(state.report())
     }
 
     /// Scan the root registered under `root_id`. See [`Library::scan`].
@@ -423,10 +577,24 @@ impl Library {
     /// Returns [`Error::NotFound`] when no root has that id, and when the
     /// registered directory no longer exists.
     pub fn scan_root(&mut self, root_id: i64) -> Result<ScanReport> {
+        self.scan_root_with_progress(root_id, &Cancel::new(), |_| {})
+    }
+
+    /// Scan the root registered under `root_id`, reporting the progress.
+    /// See [`Library::scan_with_progress`].
+    ///
+    /// Returns [`Error::NotFound`] when no root has that id, and when the
+    /// registered directory no longer exists.
+    pub fn scan_root_with_progress(
+        &mut self,
+        root_id: i64,
+        cancel: &Cancel,
+        on_progress: impl FnMut(ScanProgress),
+    ) -> Result<ScanReport> {
         let root = self
             .root_by_id(root_id)?
             .ok_or_else(|| Error::NotFound(format!("root {root_id}")))?;
-        self.scan(&root.path)
+        self.scan_with_progress(&root.path, cancel, on_progress)
     }
 
     /// Query rows by filter, sorted and paged. See the module docs for the
@@ -689,6 +857,247 @@ impl Library {
             }
         }
         Ok(result)
+    }
+}
+
+/// The counters of a scan.
+#[derive(Debug, Default, Clone, Copy)]
+struct Counters {
+    /// Considered files that were looked at.
+    seen: usize,
+    /// Rows that were written as a new path.
+    added: usize,
+    /// Rows that were written for a known path.
+    updated: usize,
+    /// Files that could not be read.
+    skipped: usize,
+    /// Rows that were deleted.
+    removed: usize,
+}
+
+impl std::ops::Add for Counters {
+    type Output = Counters;
+
+    fn add(self, other: Counters) -> Counters {
+        Counters {
+            seen: self.seen + other.seen,
+            added: self.added + other.added,
+            updated: self.updated + other.updated,
+            skipped: self.skipped + other.skipped,
+            removed: self.removed + other.removed,
+        }
+    }
+}
+
+/// A row the scan has read and is going to write.
+struct PendingRow {
+    /// The file the row belongs to.
+    path: PathBuf,
+    /// The tags read from the file.
+    tags: TrackMetadata,
+    /// The file's mtime, for the change detection of the next scan.
+    mtime_ns: Option<i64>,
+    /// The file's size, for the change detection of the next scan.
+    size: Option<i64>,
+}
+
+/// What the scan did with one considered file.
+enum FileOutcome {
+    /// A path the index did not know yet.
+    Added,
+    /// A known path whose stat changed.
+    Updated,
+    /// A known path with the same stat: the row is left untouched.
+    Unchanged,
+    /// A file that could not be stat'ed, read or parsed.
+    Skipped,
+}
+
+/// The state of one running scan.
+///
+/// The scan keeps two sets of counters: the committed ones describe what the
+/// index holds, the pending ones describe the batch that is in flight. A
+/// progress event reports the sum of both, the report of the scan the
+/// committed ones only.
+struct ScanState<'a> {
+    /// The database the rows are written to.
+    conn: &'a mut Connection,
+    /// The stored rows under the root, taken before the scan writes.
+    existing: &'a HashMap<PathBuf, StoredStat>,
+    /// The cancellation flag.
+    cancel: &'a Cancel,
+    /// Where the progress events go.
+    on_progress: &'a mut dyn FnMut(ScanProgress),
+    /// The considered files that were found on disk, whether or not they
+    /// could be read. A file that is present but unreadable must not be
+    /// treated as removed.
+    present: HashSet<PathBuf>,
+    /// The counters of the committed batches.
+    committed: Counters,
+    /// The counters of the batch in flight.
+    pending: Counters,
+    /// The rows of the batch in flight, not written yet.
+    batch: Vec<PendingRow>,
+    /// Considered files in the batch in flight.
+    files_in_batch: usize,
+    /// Whether the tree was walked completely.
+    walk_complete: bool,
+    /// Whether the scan was cancelled.
+    cancelled: bool,
+}
+
+impl ScanState<'_> {
+    /// Index one considered file.
+    ///
+    /// Returns `false` when the scan must stop, which is what a cancel
+    /// does.
+    fn visit(&mut self, path: &Path) -> Result<bool> {
+        if self.cancel.is_cancelled() {
+            return Ok(false);
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !rustamp_meta::supports_extension(ext) {
+            // Not a media file: ignored, and counted in no field.
+            return Ok(true);
+        }
+        self.present.insert(path.to_path_buf());
+        self.pending.seen += 1;
+        self.files_in_batch += 1;
+
+        match self.index_file(path) {
+            FileOutcome::Added => self.pending.added += 1,
+            FileOutcome::Updated => self.pending.updated += 1,
+            FileOutcome::Skipped => self.pending.skipped += 1,
+            FileOutcome::Unchanged => {}
+        }
+        self.emit(ScanPhase::Scanning, Some(path));
+
+        if self.files_in_batch >= SCAN_BATCH_SIZE {
+            self.flush()?;
+        }
+        Ok(true)
+    }
+
+    /// Decide what to do with one considered file and stage its row.
+    fn index_file(&mut self, path: &Path) -> FileOutcome {
+        let meta = match fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(_) => return FileOutcome::Skipped,
+        };
+        let mtime_ns = mtime_of(&meta);
+        let size = Some(meta.len() as i64);
+
+        if let Some((stored_mtime, stored_size)) = self.existing.get(path)
+            && *stored_mtime == mtime_ns
+            && *stored_size == size
+        {
+            // Same stat: the row is left untouched.
+            return FileOutcome::Unchanged;
+        }
+
+        let tags = match rustamp_meta::read_tags(path) {
+            Ok(tags) => tags,
+            Err(_) => return FileOutcome::Skipped,
+        };
+
+        let is_new = !self.existing.contains_key(path);
+        self.batch.push(PendingRow {
+            path: path.to_path_buf(),
+            tags,
+            mtime_ns,
+            size,
+        });
+        if is_new {
+            FileOutcome::Added
+        } else {
+            FileOutcome::Updated
+        }
+    }
+
+    /// Write the rows of the batch in one transaction and commit them.
+    ///
+    /// The batch becomes visible as a whole: the index never holds half of
+    /// it. A scan that is cancelled before the flush never writes the batch
+    /// at all.
+    fn flush(&mut self) -> Result<()> {
+        if !self.batch.is_empty() {
+            let tx = self.conn.transaction().map_err(map_sqlite)?;
+            for row in &self.batch {
+                upsert_row(&tx, &row.path, &row.tags, row.mtime_ns, row.size)?;
+            }
+            tx.commit().map_err(map_sqlite)?;
+            self.batch.clear();
+        }
+        self.committed = self.committed + self.pending;
+        self.pending = Counters::default();
+        self.files_in_batch = 0;
+        Ok(())
+    }
+
+    /// Throw the batch in flight away: its rows were never written.
+    fn discard(&mut self) {
+        self.batch.clear();
+        self.pending = Counters::default();
+        self.files_in_batch = 0;
+    }
+
+    /// Delete the rows under the root whose file is gone.
+    ///
+    /// The pass only runs when the tree was walked completely and the scan
+    /// was not cancelled. All deletions go into one transaction, so a cancel
+    /// during the pass rolls it back and no row is removed.
+    fn removal_pass(&mut self) -> Result<()> {
+        self.emit(ScanPhase::Removing, None);
+        let existing = self.existing;
+        let tx = self.conn.transaction().map_err(map_sqlite)?;
+        let mut removed = 0usize;
+        let mut aborted = false;
+        for path in existing.keys() {
+            if self.cancel.is_cancelled() {
+                aborted = true;
+                break;
+            }
+            if !self.present.contains(path) {
+                delete_path(&tx, path)?;
+                removed += 1;
+            }
+        }
+        if aborted {
+            // The transaction is dropped without a commit: the rollback
+            // leaves every row in place.
+            self.cancelled = true;
+            return Ok(());
+        }
+        tx.commit().map_err(map_sqlite)?;
+        self.committed.removed += removed;
+        Ok(())
+    }
+
+    /// Send one progress event.
+    fn emit(&mut self, phase: ScanPhase, path: Option<&Path>) {
+        let live = self.committed + self.pending;
+        let event = ScanProgress {
+            phase,
+            path: path.map(Path::to_path_buf),
+            seen: live.seen,
+            added: live.added,
+            updated: live.updated,
+            skipped: live.skipped,
+            removed: live.removed,
+        };
+        (self.on_progress)(event);
+    }
+
+    /// The report of the committed state.
+    fn report(&self) -> ScanReport {
+        ScanReport {
+            scanned: self.committed.seen.saturating_sub(self.committed.skipped),
+            added: self.committed.added,
+            updated: self.committed.updated,
+            removed: self.committed.removed,
+            skipped: self.committed.skipped,
+            cancelled: self.cancelled,
+        }
     }
 }
 
@@ -961,37 +1370,46 @@ impl RawRow {
     }
 }
 
-/// Walk `root` recursively. Unreadable directories and entries clear
-/// `complete`; symlinks are neither followed nor indexed.
-fn walk_dir(root: &Path, out: &mut Vec<PathBuf>, complete: &mut bool) {
-    if root.is_file() {
-        out.push(root.to_path_buf());
-        return;
-    }
-    let entries = match fs::read_dir(root) {
+/// Walk `dir` recursively and hand every regular file to `state`.
+///
+/// The walk stops as soon as the scan is cancelled. `state.walk_complete`
+/// is cleared when a directory or an entry cannot be read, which is what
+/// keeps the removal pass from running over a half-walked tree. Symlinks
+/// are neither followed nor indexed.
+fn walk_files(state: &mut ScanState<'_>, dir: &Path) -> Result<bool> {
+    let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => {
-            *complete = false;
-            return;
+            state.walk_complete = false;
+            return Ok(true);
         }
     };
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
-                *complete = false;
+                state.walk_complete = false;
                 continue;
             }
         };
         let path = entry.path();
         match entry.file_type() {
-            Ok(ft) if ft.is_dir() => walk_dir(&path, out, complete),
-            Ok(ft) if ft.is_file() => out.push(path),
+            Ok(ft) if ft.is_dir() => {
+                if !walk_files(state, &path)? {
+                    return Ok(false);
+                }
+            }
+            Ok(ft) if ft.is_file() => {
+                if !state.visit(&path)? {
+                    return Ok(false);
+                }
+            }
             // Symlinks and other entries are not followed.
             Ok(_) => {}
-            Err(_) => *complete = false,
+            Err(_) => state.walk_complete = false,
         }
     }
+    Ok(true)
 }
 
 /// Escape `%`, `_` and `\` in `prefix` and append the `%` that makes the
@@ -2031,5 +2449,230 @@ mod tests {
             Some("1.50 dB"),
             "the extra tag survived the write"
         );
+    }
+
+    // ---- scan progress and cancellation ----
+
+    #[test]
+    fn progress_events_arrive_in_order() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for name in ["a.wav", "b.wav", "c.wav"] {
+            let path = root.join(name);
+            make_wav(&path);
+            write_fixture_tags(&path, name, "X", "Al");
+        }
+        // A file that is not media is ignored: it produces no event.
+        fs::write(root.join("notes.txt"), b"liner notes").unwrap();
+
+        let mut lib = Library::in_memory().unwrap();
+        let cancel = Cancel::new();
+        let mut events: Vec<ScanProgress> = Vec::new();
+        let report = lib
+            .scan_with_progress(root, &cancel, |event| events.push(event))
+            .unwrap();
+
+        // The phases arrive in order: the scan, the removal pass, the end.
+        let phases: Vec<ScanPhase> = events.iter().map(|event| event.phase).collect();
+        assert_eq!(
+            phases,
+            vec![
+                ScanPhase::Scanning,
+                ScanPhase::Scanning,
+                ScanPhase::Scanning,
+                ScanPhase::Scanning,
+                ScanPhase::Removing,
+                ScanPhase::Finished,
+            ]
+        );
+
+        // The file events carry the file and a rising counter.
+        let file_events: Vec<&ScanProgress> =
+            events.iter().filter(|event| event.path.is_some()).collect();
+        assert_eq!(file_events.len(), 3);
+        for (i, event) in file_events.iter().enumerate() {
+            assert_eq!(event.seen, i + 1, "the counter rises with every file");
+            assert_eq!(event.added, i + 1);
+            assert_eq!(event.updated, 0);
+            assert_eq!(event.skipped, 0);
+        }
+        let mut seen: Vec<String> = file_events
+            .iter()
+            .map(|event| event.path.as_ref().unwrap().display().to_string())
+            .collect();
+        seen.sort();
+        let mut expected: Vec<String> = ["a.wav", "b.wav", "c.wav"]
+            .iter()
+            .map(|name| root.join(name).display().to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+
+        // The last event carries the summary of the scan.
+        let last = events.last().unwrap();
+        assert_eq!(last.phase, ScanPhase::Finished);
+        assert_eq!(last.seen, 3);
+        assert_eq!(last.added, 3);
+        assert_eq!(last.removed, 0);
+        assert_eq!(report.added, 3);
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.removed, 0);
+        assert!(!report.cancelled);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_reported_as_skipped() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let good = root.join("good.wav");
+        let broken = root.join("broken.wav");
+        make_wav(&good);
+        write_fixture_tags(&good, "A", "X", "Al");
+        // The file is not media: the tag read fails.
+        fs::write(&broken, b"this is not a media file at all").unwrap();
+
+        let mut lib = Library::in_memory().unwrap();
+        let cancel = Cancel::new();
+        let mut events: Vec<ScanProgress> = Vec::new();
+        let report = lib
+            .scan_with_progress(root, &cancel, |event| events.push(event))
+            .unwrap();
+
+        assert_eq!(report.added, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.scanned, 1);
+        // The skipped file is reported with its path.
+        let skipped: Vec<&ScanProgress> = events
+            .iter()
+            .filter(|event| event.path.as_deref() == Some(broken.as_path()))
+            .collect();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].skipped, 1);
+    }
+
+    #[test]
+    fn a_cancelled_scan_stops_early_and_keeps_the_committed_rows() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // More files than one batch holds, so the scan has to commit a
+        // batch before the cancel can stop it.
+        for i in 0..(SCAN_BATCH_SIZE + 6) {
+            make_wav(&root.join(format!("t{i:03}.wav")));
+        }
+
+        let mut lib = Library::in_memory().unwrap();
+        let cancel = Cancel::new();
+        let for_the_scan = cancel.clone();
+        let report = lib
+            .scan_with_progress(root, &for_the_scan, |event| {
+                if event.path.is_some() && event.seen == SCAN_BATCH_SIZE + 3 {
+                    for_the_scan.cancel();
+                }
+            })
+            .unwrap();
+
+        assert!(report.cancelled, "the scan was stopped");
+        assert!(cancel.is_cancelled());
+        // The first batch was committed as a whole, the batch in flight was
+        // dropped: the index never holds half a batch.
+        assert_eq!(lib.count().unwrap(), SCAN_BATCH_SIZE);
+        assert_eq!(report.added, SCAN_BATCH_SIZE);
+        assert_eq!(report.scanned, SCAN_BATCH_SIZE);
+        assert_eq!(report.removed, 0);
+    }
+
+    #[test]
+    fn a_cancel_before_the_delete_pass_leaves_the_index_untouched() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let a = root.join("a.wav");
+        let b = root.join("b.wav");
+        make_wav(&a);
+        make_wav(&b);
+        write_fixture_tags(&a, "A", "X", "Al");
+        write_fixture_tags(&b, "B", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        lib.scan(root).unwrap();
+        assert_eq!(lib.count().unwrap(), 2);
+
+        // One file is gone, so a scan that reaches the removal pass would
+        // drop its row. The other one changes, so a scan that reaches the
+        // index would rewrite its row.
+        fs::remove_file(&b).unwrap();
+        write_fixture_tags(&a, "A2", "X", "Al");
+
+        let cancel = Cancel::new();
+        let for_the_scan = cancel.clone();
+        let report = lib
+            .scan_with_progress(root, &for_the_scan, |event| {
+                if event.path.is_some() {
+                    for_the_scan.cancel();
+                }
+            })
+            .unwrap();
+
+        assert!(report.cancelled);
+        assert_eq!(report.removed, 0, "the removal pass did not run");
+        assert_eq!(lib.count().unwrap(), 2, "the stale row is still there");
+        let rows = matches(&lib, &Query::default());
+        let a_row = rows.iter().find(|row| row.path == a).unwrap();
+        assert_eq!(
+            a_row.metadata.title.as_deref(),
+            Some("A"),
+            "the batch in flight was dropped"
+        );
+    }
+
+    #[test]
+    fn a_normal_scan_still_behaves_as_before() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for (name, title) in [("a.wav", "A"), ("b.wav", "B"), ("c.wav", "C")] {
+            let path = root.join(name);
+            make_wav(&path);
+            write_fixture_tags(&path, title, "X", "Al");
+        }
+        // A file that is not media is ignored.
+        fs::write(root.join("cover.jpg"), b"not an image").unwrap();
+
+        // The plain scan.
+        let mut plain = Library::in_memory().unwrap();
+        let plain_report = plain.scan(root).unwrap();
+
+        // The same scan, with progress.
+        let mut with_progress = Library::in_memory().unwrap();
+        let cancel = Cancel::new();
+        let report = with_progress
+            .scan_with_progress(root, &cancel, |_| {})
+            .unwrap();
+
+        assert_eq!(plain_report, report);
+        assert!(!report.cancelled);
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.added, 3);
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(with_progress.count().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_scan_cancelled_before_it_starts_does_nothing() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_fixture_tags(&a, "A", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let report = lib.scan_with_progress(root, &cancel, |_| {}).unwrap();
+
+        assert!(report.cancelled);
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.added, 0);
+        assert_eq!(lib.count().unwrap(), 0);
     }
 }
