@@ -44,6 +44,10 @@
 //! A one-track album therefore reproduces that track's gain (to within the
 //! histogram's bin width) and its peak.
 //!
+//! The album's R128 gain is measured the way ITU-R BS.1770-4 measures a
+//! programme: the BS.1770 blocks of every track of the album are pooled
+//! and gated together (see the [`r128`](crate::r128) module).
+//!
 //! ## What the caller does
 //!
 //! The grouping is pure: it reads no file and touches no audio. The caller
@@ -86,6 +90,7 @@ use std::path::{Path, PathBuf};
 
 use rustamp_core::meta::TrackMetadata;
 
+use crate::r128::{LoudnessBlocks, r128_album_gain_q8};
 use crate::replaygain::{ReplayGainAnalysis, album_gain_db, album_peak};
 
 /// A track together with the loudness analysis of its audio.
@@ -143,6 +148,13 @@ pub struct AlbumValues {
     pub album_gain_db: f32,
     /// The album peak, linear: the largest track peak of the album.
     pub album_peak: f32,
+    /// The album's R128 gain, in the Q7.8 form the `R128_ALBUM_GAIN` tag
+    /// holds: the gain that brings the album to the −23 LUFS target.
+    ///
+    /// It is measured the way ITU-R BS.1770-4 measures a programme: the
+    /// BS.1770 blocks of every track are pooled and gated *together*, not
+    /// track by track.
+    pub r128_album_gain_q8: i32,
 }
 
 /// One album: the tracks that belong to it and the values computed for it.
@@ -218,6 +230,7 @@ pub fn group_albums(tracks: Vec<AnalyzedTrack>) -> AlbumGrouping {
                     values: AlbumValues {
                         album_gain_db: 0.0,
                         album_peak: 0.0,
+                        r128_album_gain_q8: 0,
                     },
                 });
             }
@@ -259,9 +272,14 @@ pub fn album_key(path: &Path, metadata: &TrackMetadata) -> AlbumKey {
 /// The album values of a group of tracks.
 fn album_values(tracks: &[AnalyzedTrack]) -> AlbumValues {
     let analyses: Vec<&ReplayGainAnalysis> = tracks.iter().map(|track| &track.analysis).collect();
+    let blocks: Vec<&LoudnessBlocks> = tracks
+        .iter()
+        .map(|track| &track.analysis.loudness_blocks)
+        .collect();
     AlbumValues {
         album_gain_db: album_gain_db(&analyses),
         album_peak: album_peak(&analyses),
+        r128_album_gain_q8: r128_album_gain_q8(&blocks),
     }
 }
 
@@ -288,6 +306,7 @@ fn normalize(text: &str) -> String {
 mod tests {
     use super::*;
 
+    use crate::r128::r128_track_gain_q8;
     use crate::replaygain::analyze_replaygain;
 
     const SAMPLE_RATE: u32 = 44_100;
@@ -480,6 +499,38 @@ mod tests {
         let grouping = group_albums(tracks);
         assert_eq!(grouping.len(), 1);
         assert_eq!(grouping.albums()[0].tracks.len(), 2);
+    }
+
+    #[test]
+    fn the_album_r128_gain_is_measured_over_the_blocks_of_all_tracks() {
+        // The R128 value of an album is measured over the blocks of all
+        // its tracks, gated together: the loud track dominates the
+        // measurement, and the album is neither the loud track nor the
+        // mean of the two.
+        let tracks = vec![
+            track("a1.flac", 0.5, album_tags("First", Some("Artist"), None)),
+            track("a2.flac", 0.1, album_tags("First", Some("Artist"), None)),
+        ];
+        let grouping = group_albums(tracks);
+        let album = &grouping.albums()[0];
+
+        let loud = r128_track_gain_q8(&album.tracks[0].analysis.loudness_blocks);
+        let quiet = r128_track_gain_q8(&album.tracks[1].analysis.loudness_blocks);
+        let pooled = album.values.r128_album_gain_q8;
+
+        assert!(
+            pooled > loud,
+            "the album {pooled} is not louder than {loud}"
+        );
+        assert!(
+            pooled < quiet,
+            "the album {pooled} is not quieter than {quiet}"
+        );
+        let mean = (loud + quiet) / 2;
+        assert!(
+            (pooled - mean).abs() > 256,
+            "the album {pooled} is the mean of the tracks {mean}"
+        );
     }
 
     #[test]

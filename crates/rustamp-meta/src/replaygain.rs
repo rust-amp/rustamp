@@ -31,7 +31,8 @@
 //! * **Not EBU R128 / ITU-R BS.1770 integrated loudness.** There is no
 //!   K-weighting, no channel weighting in the R128 sense, no gating and no
 //!   loudness-range measurement. Every 50 ms block counts towards the
-//!   percentile.
+//!   percentile. The `R128_*_GAIN` tags are measured the standard's way,
+//!   in the [`r128`](crate::r128) module.
 //! * **Not a substitute for the reference implementation's exact numbers.**
 //!   Tools such as `mp3gain`, `metaflac --add-replay-gain`, foobar2000 or
 //!   loudgain may use slightly different block sizes or filter coefficients,
@@ -57,14 +58,39 @@
 //! and the mapping from a track to its album values live in the
 //! [`album`](crate::album) module.
 //!
+//! ## R128 values
+//!
+//! The `R128_TRACK_GAIN` / `R128_ALBUM_GAIN` tags hold the gain that brings
+//! a track to the **−23 LUFS** normalization level of EBU R 128 / ITU-R
+//! BS.1770-4, in the Q7.8 fixed-point form of the Opus ecosystem (256 steps
+//! per dB).
+//!
+//! They are **not** the ReplayGain values on another scale: they are
+//! measured the way the standard measures loudness. The
+//! [`r128`](crate::r128) module holds the measurement — the K-weighting,
+//! the per-channel measurement, the 400 ms blocks and the gates — and the
+//! two functions that turn it into the values the tags hold:
+//!
+//! * [`r128_track_gain_q8`](crate::r128::r128_track_gain_q8) for a track,
+//! * [`r128_album_gain_q8`](crate::r128::r128_album_gain_q8) for an album,
+//!   whose blocks are pooled and gated together.
+//!
+//! The measurement needs the samples, so it lives in the analysis:
+//! [`ReplayGainAnalysis::loudness_blocks`] holds the BS.1770-4 blocks of
+//! the signal, next to the ReplayGain values.
+//!
 //! ## Format support (honest answers)
 //!
 //! The four classic keys round-trip on every primary tag type `lofty`
 //! supports, because each of them maps the keys: ID3v2 (`TXXX`,
 //! MP3/AAC/AIFF/WAV), Vorbis comments (FLAC/Ogg/Opus/Speex), MP4 ilst
 //! (freeform `----:com.apple.iTunes:replaygain_*`, M4A/MP4) and APEv2
-//! (APE/MPC/WavPack). `R128_TRACK_GAIN` / `R128_ALBUM_GAIN` exist only in
-//! the Vorbis map. `REPLAYGAIN_REFERENCE_LOUDNESS` has no `ItemKey` in
+//! (APE/MPC/WavPack). `R128_TRACK_GAIN` / `R128_ALBUM_GAIN` are carried by
+//! the Vorbis family (as plain comments) and by ID3v2 (as `TXXX` frames
+//! whose description is the key). `lofty` 0.25.4 has no `ItemKey` for the
+//! R128 keys in ID3v2, so this crate writes and reads those frames through
+//! the concrete ID3v2 tag — see the `write` and `read` modules.
+//! `REPLAYGAIN_REFERENCE_LOUDNESS` has no `ItemKey` in
 //! `lofty` 0.25.4 and unmapped keys are discarded, so the tag layer cannot
 //! read or write it; it is a named constant here so callers can keep it in
 //! `extra` themselves, and every write entry point reports it as skipped
@@ -84,6 +110,8 @@ use lofty::tag::{ItemKey, TagType};
 use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 
+use crate::dsp::Biquad;
+use crate::r128::LoudnessBlocks;
 use crate::write::write_tags_report;
 
 /// The track gain tag, e.g. `"-3.50 dB"`.
@@ -95,9 +123,10 @@ pub const ALBUM_GAIN_KEY: &str = "REPLAYGAIN_ALBUM_GAIN";
 /// The album peak tag, linear.
 pub const ALBUM_PEAK_KEY: &str = "REPLAYGAIN_ALBUM_PEAK";
 /// The Opus/R128 track gain tag: an integer in Q8 units (256 steps per dB).
-/// Carried by the Vorbis family only.
+/// Carried by the Vorbis family and by ID3v2 (as a `TXXX` frame).
 pub const R128_TRACK_GAIN_KEY: &str = "R128_TRACK_GAIN";
-/// The Opus/R128 album gain tag. Carried by the Vorbis family only.
+/// The Opus/R128 album gain tag. Carried by the Vorbis family and by ID3v2
+/// (as a `TXXX` frame).
 pub const R128_ALBUM_GAIN_KEY: &str = "R128_ALBUM_GAIN";
 /// The reference-loudness informational key from the original ReplayGain
 /// proposal (e.g. `"89 dB SPL"`).
@@ -358,6 +387,10 @@ pub struct ReplayGainAnalysis {
     pub histogram: ReplayGainHistogram,
     /// Alias for [`Self::histogram`].
     pub loudness_histogram: ReplayGainHistogram,
+    /// The BS.1770-4 blocks of the same signal: the channel-weighted mean
+    /// square of every 400 ms block. The R128 values are derived from them
+    /// (see the [`r128`](crate::r128) module).
+    pub loudness_blocks: LoudnessBlocks,
 }
 
 /// Estimates the ReplayGain track gain and peak of interleaved PCM samples.
@@ -455,22 +488,8 @@ pub fn analyze_replaygain(
     const BUTT_B: [f64; 3] = [0.997862928247, -1.995725856494, 0.997862928247];
     const BUTT_A: [f64; 3] = [1.0, -1.995789367305, 0.995789367305];
 
-    fn apply_iir(input: &[f64], b: [f64; 3], a: [f64; 3]) -> Vec<f64> {
-        let mut out = vec![0.0f64; input.len()];
-        let (mut x1, mut x2, mut y1, mut y2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        for (i, &x) in input.iter().enumerate() {
-            let y = b[0] * x + b[1] * x1 + b[2] * x2 - a[1] * y1 - a[2] * y2;
-            out[i] = y;
-            x2 = x1;
-            x1 = x;
-            y2 = y1;
-            y1 = y;
-        }
-        out
-    }
-
-    let filtered = apply_iir(&mono, YULE_B, YULE_A);
-    let filtered = apply_iir(&filtered, BUTT_B, BUTT_A);
+    let filtered = Biquad::new(YULE_B, YULE_A).apply(&mono);
+    let filtered = Biquad::new(BUTT_B, BUTT_A).apply(&filtered);
 
     // 50 ms blocks at 48 kHz.
     let block_size = 2400usize;
@@ -518,6 +537,10 @@ pub fn analyze_replaygain(
     // Histogram (0.01 dB bins from -100 to +20 dB).
     let histogram = histogram_of_blocks(&block_loudness);
 
+    // The BS.1770-4 blocks of the same signal: the R128 values are
+    // derived from them.
+    let loudness_blocks = LoudnessBlocks::measure(samples, channels, sample_rate_hz)?;
+
     Ok(ReplayGainAnalysis {
         track_gain_db,
         track_peak: peak,
@@ -525,6 +548,7 @@ pub fn analyze_replaygain(
         blocks_db: block_loudness,
         histogram: histogram.clone(),
         loudness_histogram: histogram,
+        loudness_blocks,
     })
 }
 
@@ -699,15 +723,19 @@ pub fn replaygain_supported_for_extension(ext: &str) -> Option<bool> {
 /// Whether files with extension `ext` keep the `R128_*_GAIN` keys through
 /// their primary tag (`None` when `ext` is unknown to `lofty`).
 ///
-/// Only the Vorbis family (FLAC/Ogg/Opus/Speex) maps these keys; everywhere
-/// else a write is refused and reported, never silently dropped.
+/// The Vorbis family (FLAC/Ogg/Opus/Speex) maps the keys directly. ID3v2
+/// (MP3/AAC/WAV/AIFF) has no `ItemKey` for them in `lofty` 0.25.4, but a
+/// `TXXX` frame whose description is the key carries them, and this crate
+/// writes and reads those frames (see the `write` and `read` modules).
+/// Everywhere else a write is refused and reported, never silently dropped.
 pub fn r128_supported_for_extension(ext: &str) -> Option<bool> {
     let primary = FileType::from_ext(ext)?.primary_tag_type();
-    Some(
-        [ItemKey::R128TrackGain, ItemKey::R128AlbumGain]
+    Some(match primary {
+        TagType::Id3v2 => true,
+        other => [ItemKey::R128TrackGain, ItemKey::R128AlbumGain]
             .iter()
-            .all(|key| key.map_key(primary).is_some()),
-    )
+            .all(|key| key.map_key(other).is_some()),
+    })
 }
 
 /// Which tag type carries ReplayGain keys, for documentation and tests.
@@ -1077,9 +1105,26 @@ mod tests {
         assert_eq!(r128_supported_for_extension("flac"), Some(true));
         assert_eq!(r128_supported_for_extension("ogg"), Some(true));
         assert_eq!(r128_supported_for_extension("opus"), Some(true));
-        assert_eq!(r128_supported_for_extension("mp3"), Some(false));
+        // ID3v2 carries the R128 keys as `TXXX` frames, even though
+        // `lofty` has no `ItemKey` for them.
+        assert_eq!(r128_supported_for_extension("mp3"), Some(true));
+        assert_eq!(r128_supported_for_extension("wav"), Some(true));
+        assert_eq!(r128_supported_for_extension("aiff"), Some(true));
         assert_eq!(r128_supported_for_extension("m4a"), Some(false));
         assert_eq!(r128_supported_for_extension("ape"), Some(false));
         assert_eq!(r128_supported_for_extension("txt"), None);
+    }
+
+    #[test]
+    fn the_q7_8_form_round_trips_exactly() {
+        // Every raw value maps back to itself: the fixed-point form is
+        // closed under the conversion.
+        for q8 in [-30_000i32, -5_120, -1, 0, 1, 256, 5_120, 30_000] {
+            assert_eq!(db_to_r128_q8(r128_q8_to_db(q8)), q8, "{q8}");
+        }
+        // And the whole range of the tag's values survives.
+        for q8 in -20_000..20_000 {
+            assert_eq!(db_to_r128_q8(r128_q8_to_db(q8)), q8, "{q8}");
+        }
     }
 }

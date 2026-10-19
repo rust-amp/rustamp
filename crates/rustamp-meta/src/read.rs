@@ -3,11 +3,27 @@
 //! Everything here parses tag containers only; no audio is decoded. See the
 //! module docs of the crate and `CONTRACT_NOTES.md` for the merge and
 //! encoding rules.
+//!
+//! ## The R128 keys of an ID3v2 tag
+//!
+//! `lofty` 0.25.4 has no `ItemKey` for the `R128_TRACK_GAIN` /
+//! `R128_ALBUM_GAIN` keys in ID3v2: a `TXXX` frame is told apart by its
+//! description, and only the descriptions `lofty` knows have an `ItemKey`.
+//! The generic tag model therefore cannot see such a frame, so the reader
+//! looks for it in the concrete ID3v2 tag of the file — which means the
+//! tag container of a file with an ID3v2 tag is parsed twice. No other tag
+//! is affected, and the R128 values of a file with an ID3v2 tag are the
+//! ones its ID3v2 tag holds.
 
 use std::path::{Path, PathBuf};
 
+use lofty::aac::AacFile;
 use lofty::config::{ParseOptions, ParsingMode};
-use lofty::file::{FileType, TaggedFile, TaggedFileExt};
+use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
+use lofty::id3::v2::Id3v2Tag;
+use lofty::iff::aiff::AiffFile;
+use lofty::iff::wav::WavFile;
+use lofty::mpeg::MpegFile;
 use lofty::picture::Picture;
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, Tag, TagType};
@@ -16,6 +32,7 @@ use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 
 use crate::artwork::{Artwork, PictureKind};
+use crate::replaygain::{R128_ALBUM_GAIN_KEY, R128_TRACK_GAIN_KEY};
 
 /// Tag types in descending precedence when a file carries more than one tag.
 ///
@@ -86,14 +103,71 @@ const EXTRA_ITEMS: &[(ItemKey, &str)] = &[
 /// [`TAG_PRECEDENCE`] (ID3v2, Vorbis comments, MP4, APE, ID3v1, RIFF INFO,
 /// AIFF text). The first tag that supplies a non-empty value for a field wins.
 ///
+/// The `R128_TRACK_GAIN` / `R128_ALBUM_GAIN` values of an ID3v2 tag are read
+/// from the concrete tag, because the generic tag model cannot see them (see
+/// the module docs).
+///
 /// # Errors
 ///
 /// * [`Error::Io`] if the file cannot be opened or read.
 /// * [`Error::UnsupportedFormat`] if the file is not a media file whose tags
 ///   [`lofty`] understands.
 pub fn read_tags(path: impl AsRef<Path>) -> Result<TrackMetadata> {
-    let file = load(path.as_ref(), tag_options())?;
-    Ok(metadata_from(&file))
+    let path = path.as_ref();
+    let file = load(path, tag_options())?;
+    let mut metadata = metadata_from(&file);
+
+    // The R128 keys of an ID3v2 tag live in `TXXX` frames that the generic
+    // tag model cannot see, so they are read from the concrete tag.
+    for (key, value) in id3v2_r128(path, file.file_type()) {
+        metadata.extra.insert(key.to_owned(), value);
+    }
+
+    Ok(metadata)
+}
+
+/// The R128 values of the file's ID3v2 tag.
+///
+/// `lofty` 0.25.4 has no `ItemKey` for the R128 keys in ID3v2: a `TXXX`
+/// frame is told apart by its description, and only the descriptions
+/// `lofty` knows have an `ItemKey`. The generic tag model therefore cannot
+/// see a `R128_TRACK_GAIN` frame — the concrete tag can.
+fn id3v2_r128(path: &Path, file_type: FileType) -> Vec<(&'static str, String)> {
+    let Some(tag) = concrete_id3v2(path, file_type) else {
+        return Vec::new();
+    };
+    [R128_TRACK_GAIN_KEY, R128_ALBUM_GAIN_KEY]
+        .into_iter()
+        .filter_map(|key| tag.get_user_text(key).map(|value| (key, value.to_owned())))
+        .collect()
+}
+
+/// The ID3v2 tag of `path`, read with the concrete reader of its format.
+///
+/// The ID3v2 tag of an MP3 or an AAC file sits at the front of the file; in
+/// a WAV or an AIFF file it sits in a chunk. `lofty` has a reader for each.
+fn concrete_id3v2(path: &Path, file_type: FileType) -> Option<Id3v2Tag> {
+    let options = ParseOptions::new().read_properties(false);
+    let mut file = std::fs::File::open(path).ok()?;
+    match file_type {
+        FileType::Mpeg => {
+            let mpeg = MpegFile::read_from(&mut file, options).ok()?;
+            mpeg.id3v2().cloned()
+        }
+        FileType::Aac => {
+            let aac = AacFile::read_from(&mut file, options).ok()?;
+            aac.id3v2().cloned()
+        }
+        FileType::Wav => {
+            let wav = WavFile::read_from(&mut file, options).ok()?;
+            wav.id3v2().cloned()
+        }
+        FileType::Aiff => {
+            let aiff = AiffFile::read_from(&mut file, options).ok()?;
+            aiff.id3v2().cloned()
+        }
+        _ => None,
+    }
 }
 
 /// Reads the front cover of `path`.

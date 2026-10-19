@@ -23,6 +23,10 @@
 //!   [`replaygain::ReplayGainTags`] value type, the pure headless analysis
 //!   ([`replaygain::analyze_replaygain`]) and an honest ReplayGain writer
 //!   ([`replaygain::write_replaygain`]).
+//! * The [`r128`] module measures the EBU R 128 / ITU-R BS.1770-4
+//!   integrated loudness and produces the values the Opus ecosystem's
+//!   `R128_TRACK_GAIN` / `R128_ALBUM_GAIN` tags hold
+//!   ([`r128::r128_track_gain_q8`], [`r128::r128_album_gain_q8`]).
 //! * The [`album`] module groups tracks into albums by their tags and
 //!   computes the album-level ReplayGain values of every group
 //!   ([`album::group_albums`]).
@@ -75,6 +79,8 @@
 pub mod album;
 mod artwork;
 mod atomic;
+mod dsp;
+pub mod r128;
 mod read;
 pub mod replaygain;
 mod write;
@@ -83,6 +89,7 @@ pub use album::{
     AlbumGroup, AlbumGrouping, AlbumKey, AlbumValues, AnalyzedTrack, album_key, group_albums,
 };
 pub use artwork::{Artwork, PictureKind};
+pub use r128::{LoudnessBlocks, R128_TARGET_LUFS, r128_album_gain_q8, r128_track_gain_q8};
 pub use read::{read_artwork, read_artworks, read_tags, scan_paths};
 pub use replaygain::{
     ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, MAX_GAIN_DB, R128_ALBUM_GAIN_KEY, R128_STEPS_PER_DB,
