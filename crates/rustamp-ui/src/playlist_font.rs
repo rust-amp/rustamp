@@ -5,6 +5,11 @@
 //! the size and the style) or from the library window's own constant. A
 //! family the host does not have falls back to the base skin's family and
 //! then to the generic sans-serif, so the list is never empty.
+//!
+//! The **size** is the one part of the request the user can change at
+//! runtime: `Ctrl+Num+` / `Ctrl+Num-` (S03 §2 `40335` / `40336`) walk it
+//! within [`MIN_FONT_SIZE`]..=[`MAX_FONT_SIZE`]. The override replaces the
+//! size only — the family and the style stay the skin's (S17 §5).
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -24,6 +29,130 @@ pub(crate) const DEFAULT_FAMILY: &str = rustamp_skin::webamp::DEFAULT_PLAYLIST_F
 /// font was rasterized at that size before a skin's `Font=` line was
 /// honoured, so a skin that names no size keeps it.
 pub(crate) const DEFAULT_SIZE: u32 = 13;
+
+/// The smallest font size the playlist accepts (own choice).
+///
+/// The row is as tall as its font, so a tiny font would make the list
+/// unreadable rather than merely small. Eight pixels is this implementation's
+/// lower bound; the spec fixes no size range (S03 §2 marks the size rows
+/// **provisional**).
+pub const MIN_FONT_SIZE: u32 = 8;
+
+/// The largest font size the playlist accepts (own choice).
+///
+/// The list page is 52 px tall (four rows of 13 px, S01 §4.2), so a font of
+/// 32 px still leaves one whole row on the page. The spec fixes no size
+/// range (S03 §2 marks the size rows **provisional**).
+pub const MAX_FONT_SIZE: u32 = 32;
+
+/// The size change of one `Ctrl+Num+` / `Ctrl+Num-` press (own choice).
+///
+/// One pixel per press: the size is a pixel count, so a step of one is the
+/// smallest change the user can see. The spec fixes no step (the rows are
+/// **provisional**).
+pub const FONT_SIZE_STEP: u32 = 1;
+
+/// Clamps a font size into the accepted range.
+fn clamp_size(size: u32) -> u32 {
+    size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
+/// The font size a skin asks for (S17 §5).
+///
+/// The `Font=` line's size when it names one, the built-in default (13 px)
+/// otherwise. The app pushes this into the playlist model, which owns the
+/// size the editor draws with (S03 §2 `40335` / `40336`), so the skin and
+/// the model never disagree about the size.
+pub fn skin_font_size(skin: &rustamp_skin::Skin) -> u32 {
+    skin.pledit()
+        .font
+        .as_ref()
+        .and_then(|font| font.size)
+        .unwrap_or(DEFAULT_SIZE)
+}
+
+/// The playlist editor's runtime font size (S03 §2 `40335` / `40336`).
+///
+/// The size is the **skin's** (`pledit.txt`) until the user changes it with
+/// `Ctrl+Num+` / `Ctrl+Num-`; the user's choice replaces the **size** only —
+/// the family and the style stay the skin's (S17 §5).
+///
+/// Both sizes are clamped into [`MIN_FONT_SIZE`]..=[`MAX_FONT_SIZE`], so a
+/// skin that asks for an extreme size and a user who walks the size to its
+/// end draw the same bounded rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaylistFontSize {
+    /// The size the skin asks for.
+    skin: u32,
+    /// The size the user chose, once they changed it.
+    user: Option<u32>,
+}
+
+impl Default for PlaylistFontSize {
+    fn default() -> Self {
+        Self::new(DEFAULT_SIZE)
+    }
+}
+
+impl PlaylistFontSize {
+    /// The size for a skin that asks for `skin_size`.
+    pub fn new(skin_size: u32) -> Self {
+        Self {
+            skin: clamp_size(skin_size),
+            user: None,
+        }
+    }
+
+    /// The size the playlist draws with.
+    pub fn size(self) -> u32 {
+        clamp_size(self.user.unwrap_or(self.skin))
+    }
+
+    /// The user's size, once they have chosen one.
+    pub fn user_size(self) -> Option<u32> {
+        self.user
+    }
+
+    /// Whether the user has changed the size away from the skin's.
+    pub fn is_overridden(self) -> bool {
+        self.user.is_some()
+    }
+
+    /// Sets the skin's size (the app syncs it when the skin changes).
+    ///
+    /// A size the user already chose wins over it.
+    pub fn set_skin_size(&mut self, skin_size: u32) {
+        self.skin = clamp_size(skin_size);
+    }
+
+    /// Restores the user's chosen size, or clears it with `None`.
+    pub fn set_user_size(&mut self, size: Option<u32>) {
+        self.user = size.map(clamp_size);
+    }
+
+    /// One step larger (S03 §2 `40335`). Returns whether the size changed.
+    ///
+    /// The step starts from the size in effect, so the first press after a
+    /// skin change steps away from the skin's size.
+    pub fn increase(&mut self) -> bool {
+        let next = clamp_size(self.size().saturating_add(FONT_SIZE_STEP));
+        if next == self.size() {
+            return false;
+        }
+        self.user = Some(next);
+        true
+    }
+
+    /// One step smaller (S03 §2 `40336`). Returns whether the size changed.
+    pub fn decrease(&mut self) -> bool {
+        let next = clamp_size(self.size().saturating_sub(FONT_SIZE_STEP));
+        if next == self.size() {
+            return false;
+        }
+        self.user = Some(next);
+        true
+    }
+}
 
 /// A system font request: the family, the size in pixels and the style.
 ///
@@ -64,6 +193,21 @@ impl<'a> SystemFont<'a> {
                 bold: false,
                 italic: false,
             },
+        }
+    }
+
+    /// The same request with another size.
+    ///
+    /// The family and the style stay the skin's; only the size changes. The
+    /// runtime size (S03 §2 `40335` / `40336`) replaces the skin's size
+    /// this way, so the family and the style of the `Font=` line survive the
+    /// user's change.
+    pub(crate) fn with_size(self, size: u32) -> SystemFont<'a> {
+        SystemFont {
+            family: self.family,
+            size: clamp_size(size),
+            bold: self.bold,
+            italic: self.italic,
         }
     }
 }

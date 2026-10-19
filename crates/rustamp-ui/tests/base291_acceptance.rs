@@ -531,7 +531,7 @@ fn base291_playlist_focus_buttons_scroll_and_skin_colours() {
                 Sheet::Pledit,
                 SCROLL_HANDLE_SRC,
                 260,
-                scroll_handle_y(offset, 60),
+                scroll_handle_y(offset, 60, ROW_PITCH),
             );
             region(&frame, &skin, Sheet::Pledit, SCROLL_ARROWS_SRC, 260, 78);
             for button in PlaylistButton::ALL {
@@ -838,8 +838,8 @@ fn memory_skin(font: &str, replace_text: bool) -> Skin {
 
 /// Asserts that a playlist row holds nothing but the skin's ink and
 /// background colours, and that both of them reach the row.
-fn assert_row_is_pure(frame: &Image, i: usize, ink: [u8; 3], bg: [u8; 3]) {
-    let row = row_rect(i).unwrap();
+fn assert_row_is_pure(frame: &Image, i: usize, pitch: i32, ink: [u8; 3], bg: [u8; 3]) {
+    let row = row_rect(i, pitch).unwrap();
     let ink = [ink[0], ink[1], ink[2], 255];
     let bg = [bg[0], bg[1], bg[2], 255];
     let mut has_ink = false;
@@ -881,7 +881,7 @@ fn base291_playlist_font_is_the_requested_system_family_not_text_bmp() {
         "Font= must change actual glyph shapes"
     );
     for (i, ink, bg) in [(0, [255u8; 3], [0u8; 3]), (1, [0, 255, 0], [0, 0, 198])] {
-        assert_row_is_pure(&frame, i, ink, bg);
+        assert_row_is_pure(&frame, i, ROW_PITCH, ink, bg);
     }
 }
 
@@ -892,19 +892,24 @@ fn base291_playlist_font_size_comes_from_the_pledit_line() {
     let mut window = PlaylistWindow::new();
     window.set_entries(vec![EntryId(1), EntryId(2)]);
     let labels = vec!["1. Mixed Case WWW iii".into(), "2. Track Title".into()];
-    let render = |skin: &Skin| render_playlist_window(skin, &window, &labels, true);
 
-    let plain = render(&memory_skin("Courier New", false));
-    let smaller = render(&memory_skin("Courier New,10", false));
+    // The size the skin asks for is the size the editor draws with: the app
+    // reads it with `skin_font_size` and pushes it into the model, which owns
+    // the runtime size (S03 §2 `40335` / `40336`).
+    let plain_skin = memory_skin("Courier New", false);
+    window.set_skin_font_size(skin_font_size(&plain_skin));
+    let plain = render_playlist_window(&plain_skin, &window, &labels, true);
+    let smaller_skin = memory_skin("Courier New,10", false);
+    window.set_skin_font_size(skin_font_size(&smaller_skin));
+    let smaller = render_playlist_window(&smaller_skin, &window, &labels, true);
     assert_ne!(
         plain, smaller,
         "the size in the Font= line must change the row"
     );
     // The 1-bit contract survives the new font: a row still holds the
     // skin's ink and its background, nothing blended.
-    for frame in [&plain, &smaller] {
-        assert_row_is_pure(frame, 0, [0x00, 0xFF, 0x00], [0, 0, 0]);
-    }
+    assert_row_is_pure(&plain, 0, ROW_PITCH, [0x00, 0xFF, 0x00], [0, 0, 0]);
+    assert_row_is_pure(&smaller, 0, 10, [0x00, 0xFF, 0x00], [0, 0, 0]);
 }
 
 /// A family the host does not have must not change the picture: the

@@ -122,6 +122,33 @@ impl App {
         &self.playlist
     }
 
+    /// The playlist editor's runtime font size, when the user chose one.
+    ///
+    /// `None` means the skin's size is in use (S17 §5). The choice is
+    /// persisted with the other UI state, so it survives a restart.
+    pub fn playlist_font_size(&self) -> Option<u32> {
+        self.playlist.font_size().user_size()
+    }
+
+    /// Restores the user's chosen playlist font size (or clears it).
+    ///
+    /// This is the path a persisted choice comes back through; the skin's
+    /// size stays in use when `None`.
+    pub fn set_playlist_font_size(&mut self, size: Option<u32>) {
+        self.playlist.set_font_size_override(size);
+    }
+
+    /// Pushes the skin's font size into the playlist model.
+    ///
+    /// The model owns the runtime font size (S03 §2 `40335` / `40336`); the
+    /// skin's `Font=` line is its default (S17 §5). The app keeps the two in
+    /// step: when the skin changes, the model's default follows it, and a
+    /// size the user chose stays.
+    pub(crate) fn sync_playlist_font_size(&mut self) {
+        let size = rustamp_ui::skin_font_size(self.skin.skin());
+        self.playlist.set_skin_font_size(size);
+    }
+
     /// Syncs the model's entry order from the app's stable entry ids.
     ///
     /// The app is the state owner; selection of live entries and the scroll
@@ -207,7 +234,7 @@ impl App {
             return Ok(Vec::new());
         }
         if in_list_area(x, y)
-            && let Some(row) = hit_test_list_row(x, y)
+            && let Some(row) = hit_test_list_row(x, y, self.playlist.row_pitch())
             && let Some(command) = self.playlist.double_click_row(row)
         {
             let commands = vec![command.clone()];
@@ -472,6 +499,18 @@ impl App {
                 self.submit(command.clone())?;
                 Ok(Some(ShortcutOutcome::Commands(vec![command])))
             }
+            // ----- the runtime font size (S03 §2 `40335` / `40336`) -----
+            // A view setting of this window: it changes the rows the editor
+            // draws and nothing else, so it needs no core command
+            // (RFC 0005 §9/§11.6).
+            PlaylistKeyAction::IncreaseFontSize => {
+                self.playlist.increase_font_size();
+                Ok(Some(ShortcutOutcome::Handled))
+            }
+            PlaylistKeyAction::DecreaseFontSize => {
+                self.playlist.decrease_font_size();
+                Ok(Some(ShortcutOutcome::Handled))
+            }
         }
     }
 
@@ -507,6 +546,10 @@ impl App {
 
     /// Renders one frame of the playlist window.
     pub fn render_playlist(&mut self) -> Image {
+        // The skin's font size is the playlist's size until the user changes
+        // it (S17 §5, S03 §2 `40335` / `40336`), so the model is told the
+        // skin's size before the frame is drawn.
+        self.sync_playlist_font_size();
         // Playback, not selection, owns Current (S17 section 5). Read the
         // engine on every paint, including natural advancement and no track.
         let index = self.engine().current_index();
@@ -825,7 +868,8 @@ mod tests {
         assert_ne!(style.normal, style.current);
         let selected = app.playlist().selected_ids();
         for (row, id) in app.playlist().visible_ids().iter().enumerate() {
-            let rect = rustamp_ui::playlist_window::row_rect(row).unwrap();
+            let rect = rustamp_ui::playlist_window::row_rect(row, app.playlist().row_pitch())
+                .expect("the visible row");
             let ink = if current == Some(*id) {
                 style.current
             } else {
@@ -889,7 +933,8 @@ mod tests {
             .set_queue(vec![rustamp_audio::TrackSource::Url(String::new())]);
         let frame = app.render_playlist();
         assert_eq!(app.playlist().current(), Some(EntryId(0)));
-        let rect = rustamp_ui::playlist_window::row_rect(0).unwrap();
+        let rect = rustamp_ui::playlist_window::row_rect(0, app.playlist().row_pitch())
+            .expect("the first visible row");
         let bg = app.skin.skin().pledit().normal_bg;
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
@@ -1170,6 +1215,153 @@ mod tests {
         app.sync_playlist_entries();
         assert!(app.playlist().is_empty());
         assert!(app.playlist().selected_ids().is_empty());
+    }
+
+    /// S03 §2's two font-size rows are bound and act on the editor alone.
+    ///
+    /// `Ctrl+Num+` (`40335`) makes the rows taller, `Ctrl+Num-` (`40336`)
+    /// shorter; the row height follows the font, so the page holds more rows
+    /// with a smaller font. Neither row sends a command: the effect is
+    /// confined to what the editor draws (RFC 0005 §9/§11.6).
+    #[test]
+    fn ctrl_num_add_and_ctrl_num_subtract_walk_the_playlist_font_size() {
+        let mut app = test_app();
+        add_entries(&mut app, 8);
+        // The skin's size is in use until the user changes it (S17 §5).
+        assert_eq!(app.playlist().font_size().size(), 13);
+        assert!(!app.playlist().font_size().is_overridden());
+        assert_eq!(app.playlist().visible_rows(), 4);
+
+        let before = app.render_playlist();
+        assert_eq!(
+            app.playlist_key_down(Key::NumAdd, Modifiers::CTRL)
+                .expect("the key applies"),
+            Some(ShortcutOutcome::Handled),
+            "a view setting sends no command"
+        );
+        assert_eq!(app.playlist().font_size().size(), 14);
+        assert!(app.playlist().font_size().is_overridden());
+        assert_eq!(app.playlist().row_pitch(), 14);
+        assert_eq!(
+            app.playlist().visible_rows(),
+            3,
+            "52 px hold three 14 px rows"
+        );
+        let bigger = app.render_playlist();
+        assert_ne!(before, bigger, "the rows must follow the font");
+
+        assert_eq!(
+            app.playlist_key_down(Key::NumSubtract, Modifiers::CTRL)
+                .expect("the key applies"),
+            Some(ShortcutOutcome::Handled)
+        );
+        assert_eq!(app.playlist().font_size().size(), 13);
+        assert_eq!(app.render_playlist(), before, "the size came back");
+
+        // The size is clamped at both ends of the range.
+        for _ in 0..100 {
+            app.playlist_key_down(Key::NumAdd, Modifiers::CTRL)
+                .expect("the key applies");
+        }
+        assert_eq!(app.playlist().font_size().size(), rustamp_ui::MAX_FONT_SIZE);
+        for _ in 0..100 {
+            app.playlist_key_down(Key::NumSubtract, Modifiers::CTRL)
+                .expect("the key applies");
+        }
+        assert_eq!(app.playlist().font_size().size(), rustamp_ui::MIN_FONT_SIZE);
+        assert!(app.drain_notes().is_empty());
+    }
+
+    /// The classic invariant at every size: a row holds the skin's ink and
+    /// its background, never a blended shade (no antialiasing).
+    #[test]
+    fn the_playlist_rows_hold_only_ink_and_background_at_every_size() {
+        let mut app = test_app();
+        add_entries(&mut app, 8);
+        let style = app.skin.skin().pledit();
+        let ink = [style.normal[0], style.normal[1], style.normal[2], 255];
+        let bg = [
+            style.normal_bg[0],
+            style.normal_bg[1],
+            style.normal_bg[2],
+            255,
+        ];
+        for size in rustamp_ui::MIN_FONT_SIZE..=rustamp_ui::MAX_FONT_SIZE {
+            app.set_playlist_font_size(Some(size));
+            let frame = app.render_playlist();
+            let pitch = app.playlist().row_pitch();
+            for row in 0..app.playlist().visible_rows() {
+                let rect =
+                    rustamp_ui::playlist_window::row_rect(row, pitch).expect("the visible row");
+                let mut ink_count = 0;
+                for y in rect.y..rect.bottom() {
+                    for x in rect.x..rect.right() {
+                        let pixel = frame.pixel(x, y).expect("a pixel");
+                        assert!(
+                            pixel == ink || pixel == bg,
+                            "size {size}, row {row}: off-palette pixel {pixel:?}"
+                        );
+                        ink_count += usize::from(pixel == ink);
+                    }
+                }
+                assert!(ink_count > 0, "size {size}, row {row}: no ink");
+            }
+        }
+    }
+
+    /// The skin's `Font=` size is the playlist's size; the user changes it
+    /// from there (S17 §5, S03 §2 `40335` / `40336`).
+    #[test]
+    fn the_skins_font_size_is_the_playlist_size_until_the_user_changes_it() {
+        let mut app = test_app();
+        add_entries(&mut app, 4);
+        // A skin folder with its own `pledit.txt`: the loader reads the font
+        // from it (the sheets fall back to the built-in default skin).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pledit.txt"),
+            b"[Text]\nNormal=#00FF00\nCurrent=#FFFFFF\nNormalBG=#000000\nSelectedBG=#0000C6\nFont=Courier New,10\n",
+        )
+        .unwrap();
+        app.submit(Command::LoadSkin(dir.path().to_owned()))
+            .expect("the skin loads");
+        assert_eq!(app.playlist().font_size().size(), 10, "the skin's size");
+        assert!(!app.playlist().font_size().is_overridden());
+        assert_eq!(app.playlist().row_pitch(), 10);
+        assert_eq!(app.playlist().visible_rows(), 5);
+
+        app.playlist_key_down(Key::NumAdd, Modifiers::CTRL)
+            .expect("the key applies");
+        assert_eq!(app.playlist().font_size().size(), 11, "one step up");
+        assert!(app.playlist().font_size().is_overridden());
+    }
+
+    /// The chosen size is persisted with the other UI state, so it survives
+    /// a restart (the app keeps it in the configuration file; see
+    /// `config::PLAYLIST_FONT_SIZE_KEY`).
+    #[test]
+    fn the_playlist_font_size_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rustamp.toml");
+        let mut app = test_app();
+        app.set_config_path(Some(path.clone()));
+        add_entries(&mut app, 4);
+        assert_eq!(app.playlist_font_size(), None, "the skin's size is in use");
+
+        app.playlist_key_down(Key::NumAdd, Modifiers::CTRL)
+            .expect("the key applies");
+        assert_eq!(app.playlist_font_size(), Some(14));
+        app.save_config().expect("the config is written");
+
+        let loaded = crate::config::load(Some(&path)).expect("the config loads");
+        assert_eq!(loaded.playlist_font_size, Some(14));
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+        // A new player built from that file comes up with the same size.
+        let mut restarted = test_app();
+        restarted.set_playlist_font_size(loaded.playlist_font_size);
+        assert_eq!(restarted.playlist().font_size().size(), 14);
+        assert_eq!(restarted.playlist_font_size(), Some(14));
     }
 
     #[test]

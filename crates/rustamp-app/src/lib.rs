@@ -133,6 +133,10 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     if let ConfigSource::File(path) = &loaded.source {
         println!("rustamp: config {}", path.display());
     }
+    // The playlist editor's runtime font size is the app's own setting (see
+    // `config::PLAYLIST_FONT_SIZE_KEY`); it is restored after the app is
+    // built, so it wins over the skin's size.
+    let playlist_font_size = loaded.playlist_font_size;
     let config = loaded.config;
 
     // ----- skin -----
@@ -158,6 +162,7 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     // enter a single-threaded apartment when it creates the window. See
     // `output::create_output`.
     let mut app = App::new(options)?;
+    app.set_playlist_font_size(playlist_font_size);
     app.set_config_path(config_path);
     for warning in &loaded.warnings {
         app.note(warning.clone());

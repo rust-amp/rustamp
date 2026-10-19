@@ -28,6 +28,15 @@ use rustamp_core::config::Config;
 /// Environment variable that overrides the config path (also the test seam).
 pub const CONFIG_ENV: &str = "RUSTAMP_CONFIG";
 
+/// The key the playlist editor's runtime font size is stored under.
+///
+/// The size is a view setting of the playlist editor (S03 §2 `40335` /
+/// `40336`), and it is **not** part of `rustamp-core`'s configuration tree:
+/// adding a field there is a contract change that needs its own RFC. The app
+/// therefore keeps the value in the same file, under the `[ui]` table, next
+/// to the other UI state it persists.
+pub const PLAYLIST_FONT_SIZE_KEY: &str = "playlist_font_size";
+
 /// Where the loaded configuration came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSource {
@@ -92,6 +101,12 @@ pub struct ConfigLoad {
     pub warnings: Vec<String>,
     /// A human-readable note when a file had unapplied settings (first warning, for backward compatibility).
     pub warning: Option<String>,
+    /// The playlist editor's runtime font size, when the file names one.
+    ///
+    /// `None` means the skin's size is in use (S17 §5); the value belongs to
+    /// the app, not to `rustamp-core`'s configuration tree (see
+    /// [`PLAYLIST_FONT_SIZE_KEY`]).
+    pub playlist_font_size: Option<u32>,
 }
 
 /// The default configuration path, or `None` when neither the override nor
@@ -136,10 +151,21 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
 
     if let Some(ui) = table.get("ui").and_then(toml::Value::as_table) {
         for key in ui.keys() {
-            let reason = match key.as_str() {
+            let reason: Option<String> = match key.as_str() {
                 "skin" | "double_size" | "always_on_top" | "easy_move" | "windows"
                 | "snap_distance" => None,
-                _ => Some("unrecognized UI setting"),
+                PLAYLIST_FONT_SIZE_KEY => {
+                    if playlist_font_size_in_toml(ui).is_some() {
+                        None
+                    } else {
+                        Some(format!(
+                            "the playlist font size must be a whole number of pixels between {} and {}",
+                            rustamp_ui::MIN_FONT_SIZE,
+                            rustamp_ui::MAX_FONT_SIZE
+                        ))
+                    }
+                }
+                _ => Some("unrecognized UI setting".to_string()),
             };
             if let Some(r) = reason {
                 warnings.push(format!("setting 'ui.{key}' is not applied: {r}"));
@@ -189,6 +215,16 @@ pub fn parse_with_warnings(
     text: &str,
     path: Option<&Path>,
 ) -> Result<(Config, Vec<String>), ConfigError> {
+    let (config, warnings, _) = parse_text(text, path)?;
+    Ok((config, warnings))
+}
+
+/// Parses TOML into the configuration, the warnings and the app-owned
+/// playlist font size.
+fn parse_text(
+    text: &str,
+    path: Option<&Path>,
+) -> Result<(Config, Vec<String>, Option<u32>), ConfigError> {
     let toml_val: toml::Value = toml::from_str(text).map_err(|e| ConfigError::Malformed {
         path: path
             .map(PathBuf::from)
@@ -202,7 +238,23 @@ pub fn parse_with_warnings(
         error: e.to_string(),
     })?;
     let warnings = ignored_fields_in_toml(&toml_val);
-    Ok((config, warnings))
+    let playlist_font_size = toml_val
+        .get("ui")
+        .and_then(toml::Value::as_table)
+        .and_then(playlist_font_size_in_toml);
+    Ok((config, warnings, playlist_font_size))
+}
+
+/// The playlist font size a `[ui]` table names, when it names a usable one.
+///
+/// A value that is not a whole number of pixels in the accepted range is
+/// unusable and read as "no size": the skin's size stays in use.
+fn playlist_font_size_in_toml(ui: &toml::Table) -> Option<u32> {
+    let raw = ui.get(PLAYLIST_FONT_SIZE_KEY)?.as_integer()?;
+    let size = u32::try_from(raw).ok()?;
+    (rustamp_ui::MIN_FONT_SIZE..=rustamp_ui::MAX_FONT_SIZE)
+        .contains(&size)
+        .then_some(size)
 }
 
 /// Loads the configuration at `path`.
@@ -218,17 +270,19 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
             source: ConfigSource::Defaults,
             warnings: Vec::new(),
             warning: None,
+            playlist_font_size: None,
         });
     };
     match std::fs::read_to_string(path) {
         Ok(text) => {
-            let (config, warnings) = parse_with_warnings(&text, Some(path))?;
+            let (config, warnings, playlist_font_size) = parse_text(&text, Some(path))?;
             let warning = warnings.first().cloned();
             Ok(ConfigLoad {
                 config,
                 source: ConfigSource::File(path.to_owned()),
                 warnings,
                 warning,
+                playlist_font_size,
             })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ConfigLoad {
@@ -236,6 +290,7 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
             source: ConfigSource::Defaults,
             warnings: Vec::new(),
             warning: None,
+            playlist_font_size: None,
         }),
         Err(error) => Err(ConfigError::Read {
             path: path.to_owned(),
@@ -250,7 +305,14 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
 /// `audio.fadeout_ms`, `audio.gapless`, `playlist.shuffle`,
 /// `playlist.repeat`, `playlist.manual_advance`, `playlist.last_playlist`, and `plugins.*`) are
 /// omitted so the config file does not advertise unsupported features or mislead users.
-pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
+///
+/// `playlist_font_size` is the playlist editor's runtime font size: it is
+/// written only when the user chose one (S03 §2 `40335` / `40336`), because
+/// the skin's size is in use otherwise.
+pub fn serialize_honest(
+    config: &Config,
+    playlist_font_size: Option<u32>,
+) -> Result<String, ConfigError> {
     let mut root = toml::Table::new();
     root.insert(
         "version".into(),
@@ -317,6 +379,14 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
         "snap_distance".into(),
         toml::Value::Integer(i64::from(config.ui.snap_distance)),
     );
+    // The playlist editor's runtime font size, when the user chose one: the
+    // skin's size is in use otherwise, so the key stays out of the file.
+    if let Some(size) = playlist_font_size {
+        ui.insert(
+            PLAYLIST_FONT_SIZE_KEY.into(),
+            toml::Value::Integer(i64::from(size)),
+        );
+    }
 
     if !config.ui.windows.is_empty() {
         let mut windows_array = Vec::new();
@@ -388,7 +458,11 @@ pub fn serialize_honest(config: &Config) -> Result<String, ConfigError> {
 /// Saves `config` to `path` using honest serialization (writing only honoured fields).
 ///
 /// Creates any missing parent directories. Returns a [`ConfigError::Write`] if writing fails.
-pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
+pub fn save(
+    config: &Config,
+    playlist_font_size: Option<u32>,
+    path: &Path,
+) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -397,7 +471,7 @@ pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
             error: e.to_string(),
         })?;
     }
-    let toml_str = serialize_honest(config)?;
+    let toml_str = serialize_honest(config, playlist_font_size)?;
     std::fs::write(path, toml_str).map_err(|e| ConfigError::Write {
         path: path.to_owned(),
         error: e.to_string(),
@@ -513,7 +587,7 @@ mod tests {
             },
         ];
 
-        save(&config, &path).expect("save succeeds");
+        save(&config, None, &path).expect("save succeeds");
         let loaded = load(Some(&path)).expect("a written file must load again");
         assert_eq!(loaded.config.ui.windows, config.ui.windows);
     }
@@ -591,7 +665,7 @@ mod tests {
         config.eq.state.preamp = 4.5;
         config.eq.state.bands = [1.0, 2.0, 3.0, 4.0, 5.0, -1.0, -2.0, -3.0, -4.0, -5.0];
 
-        save(&config, &path).expect("save succeeds");
+        save(&config, None, &path).expect("save succeeds");
         assert!(path.exists(), "config file was written");
 
         let loaded = load(Some(&path)).expect("load succeeds");
@@ -642,7 +716,7 @@ mod tests {
         // replaygain is now persisted, so set it non-default and expect it back.
         config.audio.replaygain = rustamp_core::config::ReplayGainMode::Album;
 
-        save(&config, &path).expect("save succeeds");
+        save(&config, None, &path).expect("save succeeds");
 
         let loaded = load(Some(&path)).expect("load succeeds");
         // Persisted fields survive:
@@ -676,6 +750,46 @@ mod tests {
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
     }
 
+    /// The playlist editor's runtime font size is the app's own setting
+    /// (S03 §2 `40335` / `40336`): it is written only when the user chose
+    /// one, and an unusable value is reported and ignored.
+    #[test]
+    fn the_playlist_font_size_round_trips_and_an_unusable_value_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("playlist-font.toml");
+
+        save(&Config::default(), Some(18), &path).expect("save succeeds");
+        let loaded = load(Some(&path)).expect("load succeeds");
+        assert_eq!(loaded.playlist_font_size, Some(18));
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+        // Without a chosen size the key stays out of the file: the skin's
+        // size is in use then.
+        save(&Config::default(), None, &path).expect("save succeeds");
+        let text = std::fs::read_to_string(&path).expect("the file is there");
+        assert!(!text.contains(PLAYLIST_FONT_SIZE_KEY), "{text}");
+        assert_eq!(
+            load(Some(&path)).expect("load succeeds").playlist_font_size,
+            None
+        );
+
+        // A value the playlist cannot use is reported and ignored.
+        for value in ["900", "-4", "\"big\""] {
+            std::fs::write(&path, format!("[ui]\n{PLAYLIST_FONT_SIZE_KEY} = {value}\n"))
+                .expect("the file is written");
+            let loaded = load(Some(&path)).expect("load succeeds");
+            assert_eq!(loaded.playlist_font_size, None, "{value}");
+            assert!(
+                loaded
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("ui.playlist_font_size") && w.contains("not applied")),
+                "{value}: {:?}",
+                loaded.warnings
+            );
+        }
+    }
+
     #[test]
     fn ignored_fields_are_not_advertised() {
         let mut config = Config::default();
@@ -686,7 +800,7 @@ mod tests {
         config.playlist.repeat = true;
         config.plugins.disabled = vec!["bad_plugin.dll".into()];
 
-        let serialized = serialize_honest(&config).expect("serialize honest");
+        let serialized = serialize_honest(&config, None).expect("serialize honest");
 
         // The serialized text must NOT contain any unhonoured field names.
         let ignored_keywords = [

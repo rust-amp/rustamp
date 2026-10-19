@@ -402,6 +402,9 @@ impl App {
         // (S01 §1: the shade band is 14 px tall), so a saved editor comes
         // back shaded.
         app.playlist.windowshade = pl_shaded;
+        // The skin's `Font=` size is the playlist's default size (S17 §5);
+        // the user can change it at runtime (S03 §2 `40335` / `40336`).
+        app.sync_playlist_font_size();
         app.sync_eq_from_engine();
         // The engine's snapshot is the authoritative starting state.
         app.sync_entry_ids();
@@ -778,7 +781,7 @@ impl App {
     /// Saves the current configuration to `path`.
     pub fn save_config_to(&self, path: &Path) -> Result<(), crate::config::ConfigError> {
         let config = self.current_config();
-        crate::config::save(&config, path)
+        crate::config::save(&config, self.playlist_font_size(), path)
     }
 
     /// Records a window's screen coordinates in the config.
@@ -2170,6 +2173,8 @@ impl App {
         };
         self.skin = loaded;
         self.skin_generation += 1;
+        // A new skin brings its own `Font=` size (S17 §5).
+        self.sync_playlist_font_size();
         self.publish_skin();
     }
 
@@ -2183,6 +2188,8 @@ impl App {
         self.skin = crate::skin::builtin();
         self.current_skin = None;
         self.skin_generation += 1;
+        // The built-in skin brings its own `Font=` size (S17 §5).
+        self.sync_playlist_font_size();
         self.publish_skin();
     }
 
