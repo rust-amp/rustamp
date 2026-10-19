@@ -38,6 +38,13 @@ crate-type = ["cdylib"]
 name = "vis_rustamp_fixture"
 crate-type = ["cdylib"]
 
+# The clean-room DSP ("dsp_") plugin fixture, for the same reason: a separate
+# cdylib artifact that the acceptance test maps through the OS loader, never
+# linked into the host or into the test binary. It opens no window at all.
+[[example]]
+name = "dsp_rustamp_fixture"
+crate-type = ["cdylib"]
+
 [dependencies]
 rustamp-ipc.workspace = true
 rustamp-plugin-abi.workspace = true

@@ -57,6 +57,15 @@
 //!     (S09 §5.2, §5.3 step 2). The frame loop lives in [`crate::vis`]; the
 //!     data that would fill the module's arrays comes from the audio path
 //!     and does not exist yet.
+//! 13. **DSP plugins**: the host resolves `winampDSPGetHeader2`, validates the
+//!     header and enumerates the library's modules (S09 §6.1, §6.3 step 1).
+//!     The selected module — the index the stored `config_dspplugin_num`
+//!     names, the first module while no selection is persisted — gets the
+//!     parent window and the plugin's own module handle and its `init` runs
+//!     there (S09 §6.2, §6.3 step 1). The module list, the lifecycle and the
+//!     `dsp_is_active`/`dsp_process` host callbacks live in [`crate::dsp`];
+//!     the samples that would reach them come from the audio path, which does
+//!     not exist yet.
 //!
 //! Structural preflight is NOT a malware detector or approval gate. A valid
 //! trusted DLL and its dependencies can run TLS/DllMain during LoadLibraryExW,
@@ -70,8 +79,6 @@ use std::path::{Path, PathBuf};
 use crate::host_window::HostWindow;
 use crate::pe_preflight::PePreflightError;
 use rustamp_plugin_abi::PluginKind;
-#[cfg(any(windows, test))]
-use rustamp_plugin_abi::common::DSP_VERSION;
 #[cfg(any(windows, test))]
 use rustamp_plugin_abi::common::OUT_VERSION;
 #[cfg(any(windows, test))]
@@ -90,9 +97,10 @@ use rustamp_plugin_abi::input::InModule;
 use rustamp_plugin_abi::output::OutModule;
 #[cfg(any(windows, test))]
 use rustamp_plugin_abi::vis::{VisHeader, VisModule};
-#[cfg(any(windows, test))]
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(any(windows, test))]
+use crate::dsp::DspModuleEntry;
+use crate::dsp::{DspError, DspLibraryInfo, DspRunInfo};
 use crate::vis::{VisError, VisLibraryInfo, VisModuleEntry, VisRunInfo};
 
 mod image;
@@ -198,25 +206,16 @@ unsafe extern "C" fn host_vis_set_format(
     crate::vis::vis_set_format(sample_rate, channels);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 /// Host callback: `dsp_is_active()` (S09 §3.1 offset 0x84 line 111).
 /// Returns 1 while a DSP module with a `process` callback is installed
 /// (S09 §6.3: one module active at a time), else 0. No EQ stage lives here;
 /// the EQ-vs-DSP order is an S09 open item (U-12).
 unsafe extern "C" fn host_dsp_is_active() -> core::ffi::c_int {
-    let module = active_dsp_module();
-    if module.is_null() {
-        return 0;
-    }
-    // SAFETY: the slot only ever holds a module installed by a successful DSP
-    // load, whose static storage outlives the retained DLL mapping (S09 §0).
-    match unsafe { (*module).process } {
-        Some(_) => 1,
-        None => 0,
-    }
+    if crate::dsp::dsp_is_active() { 1 } else { 0 }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 /// Host callback: `dsp_process(...)` (S09 §3.1 offset 0x88 line 112).
 /// Forwards the in-place buffer to the active DSP module on the input
 /// plugin's decode thread (S09 §3.6) and returns the validated frame count.
@@ -231,8 +230,8 @@ unsafe extern "C" fn host_dsp_process(
     // SAFETY: the buffer contract is the input plugin caller's; a missing
     // module or an out-of-range return falls back to `frames` inside.
     unsafe {
-        call_dsp_process(
-            active_dsp_module(),
+        crate::dsp::call_dsp_process(
+            crate::dsp::active_dsp_module(),
             samples,
             frames,
             bits,
@@ -250,187 +249,6 @@ unsafe extern "C" fn host_set_info(
     _channels: core::ffi::c_int,
     _synched: core::ffi::c_int,
 ) {
-}
-
-// ---------------------------------------------------------------------------
-// DSP bridge (S09 §6)
-//
-// Audio path: the input plugin owns its decode thread (S09 §3.6) and its
-// buffer. When our `host_dsp_is_active` answers nonzero it must have sized
-// that buffer for up to twice the input frames (S09 §3.5 line 207); it then
-// calls our `host_dsp_process`, which runs the active DSP module's `process`
-// synchronously in place on that same thread and returns the frame count now
-// in the buffer. Downstream the input plugin feeds the (possibly resized)
-// buffer to the vis/analyzer feed calls and the output `write` loop.
-// Position in the chain: DSP runs inside the input plugin's decode loop,
-// before the vis/analyzer feeds; where the host EQ applies relative to it is
-// an S09 open item (U-12) this bridge does not decide.
-// ---------------------------------------------------------------------------
-
-/// Module index used when the host has no stored `config_dspplugin_num`
-/// (S09 §6.3 passes the stored number; with no selection persisted yet the
-/// first module is the honest default).
-#[cfg(any(windows, test))]
-const DSP_DEFAULT_MODULE_INDEX: core::ffi::c_int = 0;
-
-/// Process-wide active DSP module backing the `dsp_is_active` / `dsp_process`
-/// host callbacks (S09 §3.1 offsets 0x84/0x88). Only one DSP module is active
-/// at a time (S09 §6.3); zero means none. An atomic suffices: the UI thread
-/// installs/clears it at load/quit, the decode thread reads it, and the
-/// pointed-to module lives in plugin static data while its DLL stays mapped.
-#[cfg(any(windows, test))]
-static ACTIVE_DSP_MODULE: AtomicUsize = AtomicUsize::new(0);
-
-/// Read the active DSP module for the decode-thread host callbacks.
-#[cfg(any(windows, test))]
-fn active_dsp_module() -> *mut DspModule {
-    ACTIVE_DSP_MODULE.load(Ordering::SeqCst) as *mut DspModule
-}
-
-/// Install `module` as the active DSP module. Called after a successful DSP
-/// `init`; a null clears the slot.
-#[cfg(any(windows, test))]
-fn set_active_dsp_module(module: *mut DspModule) {
-    ACTIVE_DSP_MODULE.store(module as usize, Ordering::SeqCst);
-}
-
-/// Clear the active slot, but only if it still holds `module`: a replaced or
-/// quitting plugin must not deactivate its successor.
-#[cfg(any(windows, test))]
-fn clear_active_dsp_module(module: *mut DspModule) {
-    let _ =
-        ACTIVE_DSP_MODULE.compare_exchange(module as usize, 0, Ordering::SeqCst, Ordering::SeqCst);
-}
-
-/// Validate a DSP `process` return value (S09 §6.2: output frames between
-/// half and double the input).
-///
-/// Own choice, not in S09: a return outside that range cannot be trusted with
-/// the shared in-place buffer, so the host keeps the input frame count and
-/// leaves the tail untouched instead of propagating garbage downstream. The
-/// cdecl contract offers the decode thread no error channel, so this fallback
-/// is silent at the audio path by necessity; misbehavior is observable only
-/// as "length unchanged". Non-positive input is passed through untouched.
-#[cfg(any(windows, test))]
-fn dsp_output_frames(
-    input_frames: core::ffi::c_int,
-    reported_frames: core::ffi::c_int,
-) -> core::ffi::c_int {
-    if input_frames <= 0 {
-        return input_frames;
-    }
-    let half = input_frames / 2 + input_frames % 2;
-    let double = input_frames.checked_mul(2).unwrap_or(core::ffi::c_int::MAX);
-    if reported_frames < half || reported_frames > double {
-        input_frames
-    } else {
-        reported_frames
-    }
-}
-
-/// Drive one DSP `process` call with validation (S09 §6.2).
-///
-/// Returns the frame count the downstream consumer must use: the plugin's
-/// validated return, or `frames` unchanged when there is no module, no
-/// `process` callback, a null sample pointer, or an out-of-range return.
-/// A crashing or wedged plugin still takes the calling thread down with it;
-/// isolation is a future milestone, documented in the task card.
-///
-/// # Safety
-///
-/// `module` must be null or a valid `*mut DspModule` whose static storage is
-/// alive. When non-null with a `process` callback and a non-null `samples`,
-/// `samples` must point to a readable/writable buffer of at least
-/// `frames * channels` samples sized for up to twice `frames` frames, and the
-/// plugin code runs synchronously on the caller's thread.
-#[cfg(any(windows, test))]
-unsafe fn call_dsp_process(
-    module: *mut DspModule,
-    samples: *mut core::ffi::c_void,
-    frames: core::ffi::c_int,
-    bits: core::ffi::c_int,
-    channels: core::ffi::c_int,
-    sample_rate: core::ffi::c_int,
-) -> core::ffi::c_int {
-    if module.is_null() || samples.is_null() || frames <= 0 {
-        return frames;
-    }
-    // SAFETY: caller guarantees a live module for this read.
-    let process = unsafe { (*module).process };
-    let Some(process) = process else {
-        return frames;
-    };
-    // SAFETY: module and buffer per the caller's contract; the trusted plugin
-    // executes here on the caller's thread.
-    let reported = unsafe { process(module, samples, frames, bits, channels, sample_rate) };
-    dsp_output_frames(frames, reported)
-}
-
-/// Validate a DSP header, select module 0, fill host fields and run `init`
-/// (S09 §6.1, §6.3). Returns the activated module. Separated from the OS
-/// mapping step so headless tests can drive it with a synthetic header.
-///
-/// # Safety
-///
-/// `header` must be null or point at a live `winampDSPHeader`. `host_hwnd`
-/// must be the real main-window handle on the UI thread; `hinstance` the
-/// mapped plugin's own module handle. The plugin's `get_module`/`init` run
-/// here on the caller's thread.
-#[cfg(any(windows, test))]
-unsafe fn init_dsp_module(
-    header: *mut DspHeader,
-    host_hwnd: usize,
-    hinstance: *mut core::ffi::c_void,
-) -> Result<*mut DspModule, PluginLoadError> {
-    if header.is_null() {
-        return Err(PluginLoadError::NullModule);
-    }
-    // SAFETY: caller guarantees a live header for these reads.
-    let version = unsafe { (*header).version };
-    // S09 §6.1 line 335: 0x20 for 2.x. The 5.x variants 0x21/0x22 are refused
-    // (U-7 decision: strict equality, mirroring the general-plugin policy).
-    if version != DSP_VERSION {
-        return Err(PluginLoadError::UnsupportedVersion {
-            kind: PluginKind::Dsp,
-            actual: version,
-            expected: DSP_VERSION,
-        });
-    }
-    // SAFETY: same live header.
-    let get_module = unsafe { (*header).get_module };
-    let Some(get_module) = get_module else {
-        return Err(PluginLoadError::MissingCallback(
-            "winampDSPHeader.get_module",
-        ));
-    };
-    // S09 §6.3: the host passes the stored module number; none is persisted
-    // yet, so module 0 is the honest default.
-    // SAFETY: cdecl getter from the approved mapped image (or the test double).
-    let module = unsafe { get_module(DSP_DEFAULT_MODULE_INDEX) };
-    if module.is_null() {
-        return Err(PluginLoadError::NullModule);
-    }
-    // S09 §6.2: host fills parent window and instance before `init`.
-    // SAFETY: live module in plugin static data.
-    unsafe {
-        (*module).parent_window = host_hwnd as *mut core::ffi::c_void;
-        (*module).dll_instance = hinstance;
-    }
-    // S09 §6.2: `init` returns 0 on success. A refusal fails loudly here,
-    // before activation: the retained mapping stays (input/general policy,
-    // S09 §1 line 46) but no DSP becomes active and no caller reaches it.
-    // SAFETY: init(module) per S09 §6.2 offset 0x10, on the UI thread.
-    if let Some(init) = unsafe { (*module).init } {
-        let code = unsafe { init(module) };
-        if code != 0 {
-            return Err(PluginLoadError::InitFailed {
-                kind: PluginKind::Dsp,
-                code,
-            });
-        }
-    }
-    set_active_dsp_module(module);
-    Ok(module)
 }
 
 // ---------------------------------------------------------------------------
@@ -697,9 +515,10 @@ pub enum PluginConfigError {
     MissingCallback,
     /// `quit` already ran (or `init` never did): the plugin is not live.
     NotInitialized,
-    /// This kind's configuration is not routed through the host here. A DSP
-    /// module's `config` opens a dialog and stays deliberately uninvoked
-    /// (see `tests/dsp_acceptance.rs`); input and output are their own cards.
+    /// This kind's configuration is not routed through the host here. A
+    /// general-purpose plugin's `config` (S09 §7.1 offset 0x0C) and a DSP
+    /// module's `config` (S09 §6.2 offset 0x0C) are routed; input, output
+    /// and visualization are their own cards.
     WrongKind(PluginKind),
 }
 
@@ -724,8 +543,17 @@ impl std::error::Error for PluginConfigError {}
 enum LoadedPluginInner {
     #[cfg(windows)]
     Input { module: *mut InModule },
-    #[cfg(windows)]
-    Dsp { module: *mut DspModule },
+    /// A DSP library: its header, the modules it hands out and the module
+    /// that is active, if any (S09 §6.1, §6.3).
+    #[cfg(any(windows, test))]
+    Dsp {
+        header: *mut DspHeader,
+        modules: Vec<DspModuleEntry>,
+        /// The module whose `init` ran and that is still the active DSP.
+        active: Option<*mut DspModule>,
+        init_called: bool,
+        init_result: core::ffi::c_int,
+    },
     #[cfg(any(windows, test))]
     General {
         module: *mut GeneralPlugin,
@@ -796,12 +624,19 @@ impl LoadedPlugin {
     ///
     /// For a visualization plugin this means that one of its modules is
     /// running: the module is chosen and initialized when the user starts the
-    /// visualization, not when the DLL is loaded (S09 §5.3 step 2).
+    /// visualization, not when the DLL is loaded (S09 §5.3 step 2). For a DSP
+    /// plugin it means that its module still owns the one active slot
+    /// (S09 §6.3 step 2).
     pub fn is_initialized(&self) -> bool {
         match self.inner {
             #[cfg(any(windows, test))]
             LoadedPluginInner::Vis { active, .. } => match active {
                 Some(module) => crate::vis::active_vis_module() == module,
+                None => false,
+            },
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Dsp { active, .. } => match active {
+                Some(module) => crate::dsp::active_dsp_module() == module,
                 None => false,
             },
             _ => self.initialized,
@@ -827,15 +662,22 @@ impl LoadedPlugin {
                     }
                 }
             }
-            #[cfg(windows)]
-            LoadedPluginInner::Dsp { module } => {
-                if !module.is_null() {
-                    // SAFETY: module pointer was verified non-null at load time.
-                    if let Some(quit_fn) = unsafe { (*module).quit } {
-                        // SAFETY: quit(module) per S09 §6.2 offset 0x18.
-                        unsafe { quit_fn(module) };
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Dsp { active, .. } => {
+                if let Some(module) = active {
+                    // Only the module that still owns the active slot is quit
+                    // here. A module another DSP replaced was already quit
+                    // when the new one started (S09 §6.3 step 2 and step 4),
+                    // and it must not be quit twice.
+                    if crate::dsp::active_dsp_module() == module {
+                        // SAFETY: module pointer was verified non-null when the
+                        // module list was read.
+                        if let Some(quit_fn) = unsafe { (*module).quit } {
+                            // SAFETY: quit(module) per S09 §6.2 offset 0x18.
+                            unsafe { quit_fn(module) };
+                        }
+                        crate::dsp::clear_active_dsp_module(module);
                     }
-                    clear_active_dsp_module(module);
                 }
             }
             #[cfg(any(windows, test))]
@@ -916,9 +758,12 @@ impl LoadedPlugin {
         }
     }
 
-    /// Open a general-purpose plugin's configuration dialog: call its `config`
-    /// callback with no arguments (S09 §7.1 offset 0x0C, §7.2 "config on the UI
-    /// thread"; P3 §4 step 9).
+    /// Open a plugin's configuration dialog: call its `config` callback
+    /// (S09 §1 "Config / About", §7.1 offset 0x0C, §6.2 offset 0x0C).
+    ///
+    /// The argument depends on the kind: a general-purpose plugin's `config`
+    /// takes no arguments (S09 §7.1 offset 0x0C), a DSP module's takes the
+    /// module pointer (S09 §6.2 offset 0x0C).
     ///
     /// Must be called on the UI thread that owns the host window, which is the
     /// parent the plugin was handed before `init`. The call is synchronous: a
@@ -948,33 +793,97 @@ impl LoadedPlugin {
                 unsafe { config_fn() };
                 Ok(())
             }
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Dsp { active, .. } => {
+                if !self.initialized {
+                    return Err(PluginConfigError::NotInitialized);
+                }
+                let Some(module) = active else {
+                    return Err(PluginConfigError::NotInitialized);
+                };
+                if module.is_null() || crate::dsp::active_dsp_module() != module {
+                    // The module is not the active one any more, so it is not
+                    // live and its dialog must not be opened (S09 §6.3 step 2).
+                    return Err(PluginConfigError::NotInitialized);
+                }
+                // SAFETY: live module in the retained mapping's static data.
+                let config_slot = unsafe { (*module).config };
+                let Some(config_fn) = config_slot else {
+                    return Err(PluginConfigError::MissingCallback);
+                };
+                // SAFETY: cdecl, one argument (S09 §6.2 offset 0x0C), non-null
+                // slot, on the UI thread owning the parent window.
+                unsafe { config_fn(module) };
+                Ok(())
+            }
             _ => Err(PluginConfigError::WrongKind(self.kind)),
         }
     }
 
-    /// Host-visible state of a loaded DSP module, read from the plugin's own
-    /// module struct. `None` for any other plugin kind (and off Windows).
+    /// The library-level state of a loaded DSP plugin: the header version, the
+    /// library's own name and the list of modules it hands out (S09 §6.1).
+    /// `None` for any other plugin kind.
     ///
-    /// The struct lives in plugin static data, so this stays readable after
-    /// [`quit`](Self::quit) (the mapping is retained); `host_active` then reads
-    /// false because `quit` clears the active slot.
-    pub fn dsp_info(&self) -> Option<DspModuleInfo> {
-        match self.inner {
-            #[cfg(windows)]
-            LoadedPluginInner::Dsp { module } if !module.is_null() => {
-                // SAFETY: the module pointer was verified non-null at load time and
-                // points into plugin static data of the retained mapping.
+    /// The module list is what the host shows in the Plug-ins list; the
+    /// selection is the index S09 §6.3 step 1 passes to `get_module`, and
+    /// [`dsp_start`](Self::dsp_start) starts it.
+    pub fn dsp_info(&self) -> Option<DspLibraryInfo> {
+        match &self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Dsp {
+                header, modules, ..
+            } => {
+                // SAFETY: the header lives in the retained mapping's static
+                // data, which outlives the plugin (S09 §1 line 46).
+                let (version, description) = unsafe {
+                    (
+                        (**header).version,
+                        read_c_string_lossy((**header).description),
+                    )
+                };
+                Some(DspLibraryInfo {
+                    version,
+                    description,
+                    modules: modules.iter().map(|entry| entry.info.clone()).collect(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Host-visible state of the active DSP module, read from the plugin's own
+    /// module struct. `None` when no module of this plugin is active (nothing
+    /// started yet, `quit` already ran, or another DSP took over).
+    pub fn dsp_run_info(&self) -> Option<DspRunInfo> {
+        match &self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Dsp {
+                modules,
+                active,
+                init_called,
+                init_result,
+                ..
+            } => {
+                let module = (*active)?;
+                if crate::dsp::active_dsp_module() != module {
+                    return None;
+                }
+                let index = modules
+                    .iter()
+                    .find(|entry| entry.module == module)
+                    .map(|entry| entry.info.index)
+                    .unwrap_or(-1);
+                // SAFETY: the module pointer was verified non-null when the
+                // module list was read and points into the retained mapping's
+                // static data.
                 let m = unsafe { *module };
-                Some(DspModuleInfo {
-                    has_config: m.config.is_some(),
-                    has_init: m.init.is_some(),
-                    has_process: m.process.is_some(),
-                    has_quit: m.quit.is_some(),
+                Some(DspRunInfo {
+                    index,
                     parent_window: m.parent_window as usize,
                     dll_instance: m.dll_instance as usize,
-                    // SAFETY: argument-free host callback reading the atomic slot.
-                    host_active: unsafe { host_dsp_is_active() } != 0
-                        && active_dsp_module() == module,
+                    init_called: *init_called,
+                    init_result: *init_result,
+                    host_active: crate::dsp::dsp_is_active(),
                 })
             }
             _ => None,
@@ -1149,14 +1058,65 @@ impl LoadedPlugin {
         unsafe { crate::vis::render_vis_frame(module) }
     }
 
+    /// Start one of the library's modules (S09 §6.3 step 1).
+    ///
+    /// The host fills the parent window and the plugin's own module handle
+    /// into the chosen module and then calls its `init`. Only one DSP module
+    /// is active at a time (S09 §6.3 step 2), so the module that was active
+    /// before is quit first (S09 §6.3 step 4).
+    ///
+    /// A nonzero `init` return aborts the start. S09 §6.2 says "0 on success"
+    /// and nothing more about a nonzero value, so refusing it is an own
+    /// choice (P6 §2), not a spec fact; the module is then not active.
+    pub fn dsp_start(&mut self, index: i32) -> Result<(), DspError> {
+        let (module, host_hwnd, hinstance) = match &self.inner {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Dsp { modules, .. } => {
+                let Some(entry) = modules.iter().find(|entry| entry.info.index == index) else {
+                    return Err(DspError::UnknownModule(index));
+                };
+                (entry.module, self.host_hwnd, self.hinstance)
+            }
+            _ => return Err(DspError::WrongKind(self.kind)),
+        };
+        // S09 §6.3 step 2: only one DSP module is active at a time, so the
+        // module that was active before is quit when the selection changes.
+        crate::dsp::stop_active_dsp_module();
+        // SAFETY: the module lives in the mapped plugin's static data, which
+        // the retained mapping keeps alive; `init` runs on this thread, which
+        // owns the host window.
+        let Some(init) = (unsafe { crate::dsp::init_dsp_module(module, host_hwnd, hinstance) })
+        else {
+            return Err(DspError::NotRunning);
+        };
+        if init.init_result != 0 {
+            return Err(DspError::InitFailed(init.init_result));
+        }
+        if let LoadedPluginInner::Dsp {
+            active,
+            init_called,
+            init_result,
+            ..
+        } = &mut self.inner
+        {
+            *active = Some(init.module);
+            *init_called = init.init_called;
+            *init_result = init.init_result;
+        }
+        self.initialized = true;
+        crate::dsp::set_active_dsp_module(init.module);
+        Ok(())
+    }
+
     /// Run interleaved 16-bit PCM through the host's `dsp_process` callback, the
     /// path a real input plugin's decode loop takes (S09 §3.1 offset 0x88).
     ///
     /// `pcm` holds `frames * channels` samples; it is grown to twice that for the
     /// plugin (S09 §3.5 line 207), processed in place and then truncated to the
     /// validated output frame count, which is returned. `None` when this is not
-    /// an initialized DSP plugin, `channels` is not positive or `pcm` is not a
-    /// whole number of frames. A crashing or wedged plugin takes this thread
+    /// an initialized DSP plugin, `channels` is not positive, `pcm` is not a
+    /// whole number of frames, or another DSP module owns the one active slot
+    /// (S09 §6.3 step 2). A crashing or wedged plugin takes this thread
     /// down with it (no isolation, P6 §4).
     pub fn dsp_process_i16(
         &self,
@@ -1168,8 +1128,14 @@ impl LoadedPlugin {
             return None;
         }
         match self.inner {
-            #[cfg(windows)]
-            LoadedPluginInner::Dsp { .. } => {
+            #[cfg(any(windows, test))]
+            LoadedPluginInner::Dsp { active, .. } => {
+                let module = active?;
+                if crate::dsp::active_dsp_module() != module {
+                    // Another DSP owns the one active slot; this one must not
+                    // be driven (S09 §6.3 step 2).
+                    return None;
+                }
                 let frames = pcm.len() / channels;
                 pcm.resize(pcm.len() * 2, 0);
                 // SAFETY: the buffer holds twice `frames * channels` samples and the
@@ -1269,6 +1235,35 @@ impl LoadedPlugin {
         }
     }
 
+    /// Wrap a synthetic DSP library as a loaded plugin, for host-side tests of
+    /// the DSP lifecycle (module list, `init`, `process`, `quit`, `config`).
+    ///
+    /// No DLL is mapped and no export is resolved, so a test built on this
+    /// proves host logic only — never DLL acceptance (P3 §7 false passes).
+    #[cfg(test)]
+    pub(crate) fn dsp_for_test(
+        name: &str,
+        header: *mut DspHeader,
+        modules: Vec<DspModuleEntry>,
+        host_hwnd: usize,
+    ) -> Self {
+        Self {
+            path: PathBuf::from(name),
+            kind: PluginKind::Dsp,
+            hinstance: core::ptr::null_mut(),
+            host_hwnd,
+            description: name.to_string(),
+            inner: LoadedPluginInner::Dsp {
+                header,
+                modules,
+                active: None,
+                init_called: false,
+                init_result: 0,
+            },
+            initialized: false,
+        }
+    }
+
     /// A loaded plugin of a kind this host has no bridge for, for tests that
     /// check what the kind-specific entry points refuse.
     #[cfg(test)]
@@ -1283,25 +1278,6 @@ impl LoadedPlugin {
             initialized: true,
         }
     }
-}
-
-/// Host-visible state of a loaded DSP module (see [`LoadedPlugin::dsp_info`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DspModuleInfo {
-    /// The plugin supplied a `config` callback (never invoked by the host here).
-    pub has_config: bool,
-    /// The plugin supplied an `init` callback.
-    pub has_init: bool,
-    /// The plugin supplied a `process` callback.
-    pub has_process: bool,
-    /// The plugin supplied a `quit` callback.
-    pub has_quit: bool,
-    /// `parent_window` as filled by the host before `init`.
-    pub parent_window: usize,
-    /// `dll_instance` as filled by the host before `init`.
-    pub dll_instance: usize,
-    /// The host's `dsp_is_active` answers nonzero for exactly this module.
-    pub host_active: bool,
 }
 
 /// Host-visible state of a loaded general-purpose module
@@ -1659,9 +1635,40 @@ unsafe fn load_dsp_module(
     type DspGetHeaderFn = unsafe extern "C" fn() -> *mut DspHeader;
     let get_header: DspGetHeaderFn = unsafe { core::mem::transmute(proc_ptr) };
     let header_ptr = unsafe { get_header() };
-    // SAFETY: header lives in plugin static data; UI thread; approved image.
-    let module_ptr = unsafe { init_dsp_module(header_ptr, host_hwnd, hinstance) }?;
-    let description = unsafe { read_c_string_lossy((*module_ptr).description) };
+    // SAFETY: the header lives in the mapped plugin's static data; the
+    // plugin's `get_module` runs here on the UI thread (S09 §6.3 step 1).
+    let modules = unsafe { crate::dsp::list_dsp_modules(header_ptr)? };
+    // The description is read before any module runs, so a plugin that
+    // rewrites its own pointer later cannot change what the host reported.
+    // SAFETY: `list_dsp_modules` refused a null header, so it is live here.
+    let description = unsafe { read_c_string_lossy((*header_ptr).description) };
+
+    // S09 §6.3 step 1: the host calls `get_module(config_dspplugin_num)` and
+    // then `init`. No selection is persisted yet (`config_dspplugin_num` is
+    // S12's business), so the first module is the honest default.
+    let Some(entry) = modules
+        .iter()
+        .find(|entry| entry.info.index == crate::dsp::DSP_DEFAULT_MODULE_INDEX)
+    else {
+        // S09 §6.3 step 1: a null header or module unloads the DLL.
+        return Err(PluginLoadError::NullModule);
+    };
+    let module = entry.module;
+    // SAFETY: live module in the mapped plugin's static data; `init` runs on
+    // the UI thread that owns the host window.
+    let Some(init) = (unsafe { crate::dsp::init_dsp_module(module, host_hwnd, hinstance) }) else {
+        return Err(PluginLoadError::NullModule);
+    };
+    // Own choice, not S09: §6.2 says "0 on success" and nothing more about a
+    // nonzero return. The host refuses before activation, so no caller can
+    // reach a module the plugin did not accept (P6 §2).
+    if init.init_result != 0 {
+        return Err(PluginLoadError::InitFailed {
+            kind: PluginKind::Dsp,
+            code: init.init_result,
+        });
+    }
+    crate::dsp::set_active_dsp_module(module);
 
     Ok(LoadedPlugin {
         path,
@@ -1669,7 +1676,13 @@ unsafe fn load_dsp_module(
         hinstance,
         host_hwnd,
         description,
-        inner: LoadedPluginInner::Dsp { module: module_ptr },
+        inner: LoadedPluginInner::Dsp {
+            header: header_ptr,
+            modules,
+            active: Some(module),
+            init_called: init.init_called,
+            init_result: init.init_result,
+        },
         initialized: true,
     })
 }
@@ -1798,6 +1811,7 @@ mod tests {
     use super::*;
     use crate::pe_preflight::test_dll;
     use rustamp_plugin_abi::common::GEN_VERSION_WIDE_DESC;
+    use std::cell::Cell;
 
     struct Fixture(PathBuf);
 
@@ -1976,312 +1990,6 @@ mod tests {
         // SAFETY: non-existent path.
         let result = unsafe { load_plugin(non_existent, &[], &window) };
         assert!(matches!(result, Err(PluginLoadError::Io(_))));
-    }
-
-    // -- DSP bridge tests: synthetic in-memory modules, no DLL is loaded. --
-
-    /// Serializes the tests that touch the process-wide active-DSP slot.
-    static DSP_SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Doubles every sample of a stereo i16 buffer in place (measurable).
-    unsafe extern "C" fn dsp_test_gain(
-        _module: *mut DspModule,
-        samples: *mut core::ffi::c_void,
-        frames: core::ffi::c_int,
-        _bits: core::ffi::c_int,
-        _channels: core::ffi::c_int,
-        _sample_rate: core::ffi::c_int,
-    ) -> core::ffi::c_int {
-        // SAFETY: tests pass a valid i16 buffer of `frames` stereo frames.
-        let out = samples as *mut i16;
-        let mut i = 0_isize;
-        while i < frames as isize * 2 {
-            // SAFETY: index bounded by the test buffer.
-            unsafe {
-                let v = *out.offset(i);
-                *out.offset(i) = v.saturating_mul(2);
-            }
-            i += 1;
-        }
-        frames
-    }
-
-    /// Lies about the output length (10x); the bridge must not propagate it.
-    unsafe extern "C" fn dsp_test_liar(
-        _module: *mut DspModule,
-        _samples: *mut core::ffi::c_void,
-        frames: core::ffi::c_int,
-        _bits: core::ffi::c_int,
-        _channels: core::ffi::c_int,
-        _sample_rate: core::ffi::c_int,
-    ) -> core::ffi::c_int {
-        frames.saturating_mul(10)
-    }
-
-    unsafe extern "C" fn dsp_test_refusing_init(_module: *mut DspModule) -> core::ffi::c_int {
-        1
-    }
-
-    fn dsp_gain_module() -> DspModule {
-        DspModule {
-            description: c"test gain".as_ptr(),
-            process: Some(dsp_test_gain),
-            ..DspModule::default()
-        }
-    }
-
-    fn dsp_liar_module() -> DspModule {
-        DspModule {
-            description: c"test liar".as_ptr(),
-            process: Some(dsp_test_liar),
-            ..DspModule::default()
-        }
-    }
-
-    fn dsp_no_process_module() -> DspModule {
-        DspModule {
-            description: c"test silent".as_ptr(),
-            process: None,
-            ..DspModule::default()
-        }
-    }
-
-    fn dsp_refusing_module() -> DspModule {
-        DspModule {
-            description: c"test refusing".as_ptr(),
-            init: Some(dsp_test_refusing_init),
-            process: Some(dsp_test_gain),
-            ..DspModule::default()
-        }
-    }
-
-    use std::cell::Cell;
-    thread_local! {
-        /// Module the shared test getter returns; each test sets its own.
-        static DSP_TEST_MODULE: Cell<*mut DspModule> = const { Cell::new(core::ptr::null_mut()) };
-    }
-
-    unsafe extern "C" fn dsp_get_test_module(_index: core::ffi::c_int) -> *mut DspModule {
-        DSP_TEST_MODULE.with(|slot| slot.get())
-    }
-
-    unsafe extern "C" fn dsp_get_null_module(_index: core::ffi::c_int) -> *mut DspModule {
-        core::ptr::null_mut()
-    }
-
-    #[test]
-    fn dsp_gain_process_is_measurable_over_the_bridge() {
-        let mut module = dsp_gain_module();
-        let mut pcm = vec![1000_i16, -1000, 2000, -2000];
-        // SAFETY: stack module and a buffer of 2 stereo frames.
-        let out = unsafe {
-            call_dsp_process(
-                &mut module,
-                pcm.as_mut_ptr() as *mut core::ffi::c_void,
-                2,
-                16,
-                2,
-                44_100,
-            )
-        };
-        assert_eq!(out, 2);
-        assert_eq!(pcm, vec![2000, -2000, 4000, -4000]);
-    }
-
-    #[test]
-    fn dsp_without_process_or_addresses_is_a_passthrough() {
-        let mut module = dsp_no_process_module();
-        let mut pcm = vec![1_i16, 2, 3, 4];
-        // SAFETY: stack module and buffer; then null addresses.
-        let out = unsafe {
-            call_dsp_process(
-                &mut module,
-                pcm.as_mut_ptr() as *mut core::ffi::c_void,
-                2,
-                16,
-                2,
-                44_100,
-            )
-        };
-        assert_eq!(out, 2);
-        assert_eq!(pcm, vec![1, 2, 3, 4]);
-        assert_eq!(
-            unsafe {
-                call_dsp_process(
-                    core::ptr::null_mut(),
-                    pcm.as_mut_ptr() as *mut core::ffi::c_void,
-                    2,
-                    16,
-                    2,
-                    44_100,
-                )
-            },
-            2
-        );
-        assert_eq!(
-            unsafe { call_dsp_process(&mut module, core::ptr::null_mut(), 2, 16, 2, 44_100) },
-            2
-        );
-    }
-
-    #[test]
-    fn dsp_output_frame_count_edges_are_honored_and_garbage_is_ignored() {
-        assert_eq!(dsp_output_frames(100, 50), 50);
-        assert_eq!(dsp_output_frames(100, 200), 200);
-        assert_eq!(dsp_output_frames(101, 51), 51);
-        for bad in [49, 201, 0, -3, i32::MAX] {
-            assert_eq!(dsp_output_frames(100, bad), 100, "bad={bad}");
-        }
-        assert_eq!(dsp_output_frames(0, 0), 0);
-        assert_eq!(dsp_output_frames(-4, 100), -4);
-    }
-
-    #[test]
-    fn dsp_lying_process_return_does_not_propagate() {
-        let mut module = dsp_liar_module();
-        let mut pcm = vec![7_i16, 8, 9, 10];
-        // SAFETY: stack module and a buffer of 2 stereo frames.
-        let out = unsafe {
-            call_dsp_process(
-                &mut module,
-                pcm.as_mut_ptr() as *mut core::ffi::c_void,
-                2,
-                16,
-                2,
-                44_100,
-            )
-        };
-        assert_eq!(out, 2, "10x return must fall back to the input count");
-    }
-
-    #[test]
-    fn dsp_header_init_refusal_version_and_null_paths() {
-        let _guard = DSP_SLOT_LOCK.lock().unwrap();
-        assert!(active_dsp_module().is_null());
-        let mut refusing = dsp_refusing_module();
-        let mut gain = dsp_gain_module();
-        // SAFETY: stack headers and modules outliving each call; no library.
-        unsafe {
-            DSP_TEST_MODULE.with(|slot| slot.set(&mut refusing));
-            let mut header = DspHeader {
-                version: DSP_VERSION,
-                description: c"refusing".as_ptr(),
-                get_module: Some(dsp_get_test_module),
-            };
-            let err = init_dsp_module(&mut header, 0x1234, core::ptr::null_mut())
-                .expect_err("refusing init was not loud");
-            assert!(
-                matches!(
-                    err,
-                    PluginLoadError::InitFailed {
-                        kind: PluginKind::Dsp,
-                        code: 1
-                    }
-                ),
-                "{err:?}"
-            );
-            assert!(
-                active_dsp_module().is_null(),
-                "refused DSP must not activate"
-            );
-
-            DSP_TEST_MODULE.with(|slot| slot.set(&mut gain));
-            let mut wrong_version = DspHeader {
-                version: 0x21,
-                description: c"5x".as_ptr(),
-                get_module: Some(dsp_get_test_module),
-            };
-            let err = init_dsp_module(&mut wrong_version, 0x1234, core::ptr::null_mut())
-                .expect_err("5.x version was not refused");
-            assert!(
-                matches!(
-                    err,
-                    PluginLoadError::UnsupportedVersion {
-                        kind: PluginKind::Dsp,
-                        actual: 0x21,
-                        expected: DSP_VERSION
-                    }
-                ),
-                "{err:?}"
-            );
-
-            let err = init_dsp_module(core::ptr::null_mut(), 0x1234, core::ptr::null_mut())
-                .expect_err("null header was not refused");
-            assert!(matches!(err, PluginLoadError::NullModule), "{err:?}");
-
-            let mut no_getter = DspHeader {
-                version: DSP_VERSION,
-                description: c"no getter".as_ptr(),
-                get_module: None,
-            };
-            let err = init_dsp_module(&mut no_getter, 0x1234, core::ptr::null_mut())
-                .expect_err("null get_module was not refused");
-            assert!(
-                matches!(err, PluginLoadError::MissingCallback(_)),
-                "{err:?}"
-            );
-
-            let mut null_module = DspHeader {
-                version: DSP_VERSION,
-                description: c"null module".as_ptr(),
-                get_module: Some(dsp_get_null_module),
-            };
-            let err = init_dsp_module(&mut null_module, 0x1234, core::ptr::null_mut())
-                .expect_err("null module was not refused");
-            assert!(matches!(err, PluginLoadError::NullModule), "{err:?}");
-
-            DSP_TEST_MODULE.with(|slot| slot.set(&mut gain));
-            let mut ok = DspHeader {
-                version: DSP_VERSION,
-                description: c"gain".as_ptr(),
-                get_module: Some(dsp_get_test_module),
-            };
-            let module = init_dsp_module(&mut ok, 0x1234, 0x5678 as *mut core::ffi::c_void)
-                .expect("valid DSP header was refused");
-            assert!(!module.is_null());
-            assert_eq!(active_dsp_module(), module);
-            assert_eq!((*module).parent_window, 0x1234 as *mut core::ffi::c_void);
-            assert_eq!((*module).dll_instance, 0x5678 as *mut core::ffi::c_void);
-            clear_active_dsp_module(module);
-            assert!(active_dsp_module().is_null());
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn dsp_host_callbacks_follow_the_active_module() {
-        let _guard = DSP_SLOT_LOCK.lock().unwrap();
-        assert!(active_dsp_module().is_null());
-        // SAFETY: callbacks take no addresses; slot starts empty.
-        assert_eq!(unsafe { host_dsp_is_active() }, 0);
-        let mut module = dsp_gain_module();
-        let mut silent = dsp_no_process_module();
-        let mut pcm = vec![3_i16, -3, 5, -5];
-        set_active_dsp_module(&mut silent);
-        // SAFETY: slot holds a live stack module for the assertions below.
-        assert_eq!(
-            unsafe { host_dsp_is_active() },
-            0,
-            "module without process must read inactive"
-        );
-        let out = unsafe {
-            host_dsp_process(pcm.as_mut_ptr() as *mut core::ffi::c_void, 2, 16, 2, 44_100)
-        };
-        assert_eq!(out, 2);
-        assert_eq!(pcm, vec![3, -3, 5, -5]);
-        set_active_dsp_module(&mut module);
-        assert_eq!(unsafe { host_dsp_is_active() }, 1);
-        let out = unsafe {
-            host_dsp_process(pcm.as_mut_ptr() as *mut core::ffi::c_void, 2, 16, 2, 44_100)
-        };
-        assert_eq!(out, 2);
-        assert_eq!(pcm, vec![6, -6, 10, -10]);
-        // A stale clear for a module that no longer owns the slot is a no-op.
-        clear_active_dsp_module(&mut silent);
-        assert_eq!(active_dsp_module(), &mut module as *mut DspModule);
-        clear_active_dsp_module(&mut module);
-        assert!(active_dsp_module().is_null());
-        assert_eq!(unsafe { host_dsp_is_active() }, 0);
     }
 
     #[test]
@@ -2594,13 +2302,11 @@ mod tests {
         assert_eq!(plugin.config(), Err(PluginConfigError::NotInitialized));
         assert_eq!(gen_log(), vec!["quit"], "only quit may have run");
 
-        // Any other kind is refused without a call: a DSP `config` opens a
-        // dialog and stays deliberately uninvoked here.
-        for kind in [
-            PluginKind::Input,
-            PluginKind::Dsp,
-            PluginKind::Visualization,
-        ] {
+        // Any other kind is refused without a call. A DSP plugin has its own
+        // `config` route (S09 §6.2, offset 0x0C) and is covered by the DSP
+        // bridge's own tests; a plugin of that kind that this host has no
+        // bridge for is refused like every other one.
+        for kind in [PluginKind::Input, PluginKind::Visualization] {
             let other = LoadedPlugin::unsupported_for_test(kind);
             assert_eq!(other.config(), Err(PluginConfigError::WrongKind(kind)));
             assert_eq!(other.general_info(), None);
