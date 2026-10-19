@@ -21,6 +21,7 @@ rustamp-proto.workspace = true
 rustamp-platform.workspace = true
 rustamp-skin.workspace = true
 rustamp-gfx.workspace = true
+rustamp-vis.workspace = true
 thiserror.workspace = true
 winit.workspace = true
 softbuffer.workspace = true

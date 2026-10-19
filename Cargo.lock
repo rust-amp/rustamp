@@ -1892,6 +1892,7 @@ dependencies = [
  "rustamp-proto",
  "rustamp-skin",
  "rustamp-testkit",
+ "rustamp-vis",
  "softbuffer",
  "thiserror 2.0.21",
  "winit",
