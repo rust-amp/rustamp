@@ -350,9 +350,9 @@ pub(crate) struct Config {
     /// still held a previous run's audio. The first write waits for its
     /// drain and the engine's clock re-base (see `crate::ring`).
     pub start_epoch: Option<u64>,
-    /// The shared playback order (spec S15): the permutation, the repeat
-    /// boundaries and the traversal history. The engine owns the model and
-    /// the worker follows it, so both traverse the same order.
+    /// The shared playback order (spec S15): the permutation and the repeat
+    /// boundaries. The engine owns the model and the worker follows it, so
+    /// both traverse the same order.
     pub order: Arc<Mutex<PlaybackOrder>>,
 }
 
@@ -559,8 +559,8 @@ impl Worker {
             }
 
             // The traversal order (spec S15) decides what comes next: the
-            // permutation, the repeat boundary and the history live in the
-            // model the engine shares with this thread.
+            // permutation and the repeat boundary live in the model the
+            // engine shares with this thread.
             let next_target = match outcome {
                 Outcome::Ended => self.advance_in_order(),
                 Outcome::SkipNext => self.next_in_order(),

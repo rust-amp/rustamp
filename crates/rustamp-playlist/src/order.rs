@@ -6,13 +6,24 @@
 //! `randomize`: a single random permutation of the current order.
 //!
 //! [`PlaybackOrder`] implements the S15 shuffle sequence and repeat traversal
-//! state machine, managing permutation plans, repeat boundaries, history for
-//! previous-track navigation, and mid-run toggling. It is a pure, in-memory model
-//! over queue indices: it does not touch the playlist's display order (S15 §5).
+//! state machine, managing permutation plans, repeat boundaries and mid-run
+//! toggling. The step back to the previous track is a walk backwards through
+//! the permutation and the cycle boundary it crossed, so the model keeps no
+//! separate history of the played tracks. It is a pure, in-memory model over
+//! queue indices: it does not touch the playlist's display order (S15 §5).
 
 use rustamp_core::playlist::{EntryId, Playlist};
 
 use crate::rng::Rng;
+
+/// The largest number of entries a single [`PlaybackOrder::skip_by`] walks.
+///
+/// The model steps through the traversal one entry at a time, so the delta
+/// decides how many steps are taken. The user interface asks for ten entries
+/// at a time (RFC 0005 §5.1), so this bound leaves every legitimate request
+/// exact. A delta that exceeds it is clamped to the bound: the walk stops
+/// there instead of spinning the audio thread for 2^31 steps.
+pub const MAX_SKIP_STEPS: u32 = 1024;
 
 /// Shuffles a slice in place with the Fisher-Yates algorithm.
 pub fn shuffle<T>(items: &mut [T], rng: &mut Rng) {
@@ -48,10 +59,9 @@ pub fn randomize_with(playlist: &mut Playlist, rng: &mut Rng) {
 
 /// Playback order traversal manager, implementing S15 shuffle and repeat modes.
 ///
-/// Tracks sequential traversal and shuffle permutations, repeat boundaries,
-/// history for previous-track navigation, and mid-run mode toggles. The plan is
-/// stored over queue indices; the visible playlist order is never reordered
-/// (S15 §5).
+/// Tracks sequential traversal and shuffle permutations, repeat boundaries and
+/// mid-run mode toggles. The plan is stored over queue indices; the visible
+/// playlist order is never reordered (S15 §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaybackOrder {
     len: usize,
@@ -60,7 +70,6 @@ pub struct PlaybackOrder {
     current_index: Option<usize>,
     shuffle_plan: Vec<usize>,
     shuffle_pos: usize,
-    history: Vec<usize>,
     prev_shuffle_plan: Option<Vec<usize>>,
     rng: Rng,
 }
@@ -75,7 +84,6 @@ impl PlaybackOrder {
             current_index: None,
             shuffle_plan: Vec::new(),
             shuffle_pos: 0,
-            history: Vec::new(),
             prev_shuffle_plan: None,
             rng: Rng::new(seed),
         };
@@ -141,8 +149,6 @@ impl PlaybackOrder {
         if let Some(idx) = index {
             if idx < self.len {
                 self.current_index = Some(idx);
-                self.history.clear();
-                self.history.push(idx);
                 if self.shuffle {
                     self.prev_shuffle_plan = None;
                     if let Some(pos) = self.shuffle_plan.iter().position(|&p| p == idx) {
@@ -156,7 +162,6 @@ impl PlaybackOrder {
             }
         } else {
             self.current_index = None;
-            self.history.clear();
         }
     }
 
@@ -189,7 +194,7 @@ impl PlaybackOrder {
     /// Invalidate the traversal order after a playlist mutation that does not
     /// change its length (e.g. sort, reverse, randomize) or on an explicit
     /// request. Regenerates the shuffle plan anchored at the current track
-    /// (S15 §4.1) and drops retained cycle history.
+    /// (S15 §4.1) and drops the retained previous cycle.
     pub fn invalidate(&mut self) {
         self.prev_shuffle_plan = None;
         if !self.shuffle || self.len == 0 {
@@ -204,10 +209,6 @@ impl PlaybackOrder {
             && let Some(pos) = self.shuffle_plan.iter().position(|&p| p == curr)
         {
             self.shuffle_pos = pos;
-        }
-        self.history.clear();
-        if let Some(curr) = self.current_index {
-            self.history.push(curr);
         }
     }
 
@@ -281,7 +282,6 @@ impl PlaybackOrder {
                 }
             };
             self.current_index = Some(next);
-            self.history.push(next);
             Some(next)
         } else {
             if self.shuffle_plan.is_empty() || self.shuffle_plan.len() != self.len {
@@ -291,14 +291,12 @@ impl PlaybackOrder {
                 self.shuffle_pos = 0;
                 let next = self.shuffle_plan[0];
                 self.current_index = Some(next);
-                self.history.push(next);
                 return Some(next);
             }
             if self.shuffle_pos + 1 < self.shuffle_plan.len() {
                 self.shuffle_pos += 1;
                 let next = self.shuffle_plan[self.shuffle_pos];
                 self.current_index = Some(next);
-                self.history.push(next);
                 Some(next)
             } else if self.repeat {
                 let last = self.shuffle_plan.last().copied();
@@ -308,7 +306,6 @@ impl PlaybackOrder {
                 self.shuffle_pos = 0;
                 let next = self.shuffle_plan[0];
                 self.current_index = Some(next);
-                self.history.push(next);
                 Some(next)
             } else {
                 None
@@ -317,7 +314,11 @@ impl PlaybackOrder {
     }
 
     /// Step back to the previous track in the active playback order.
-    /// In shuffle mode, navigates backward in shuffle history.
+    ///
+    /// In shuffle mode this walks backwards through the active permutation;
+    /// at its head it crosses into the retained previous cycle when repeat
+    /// is on (S15 §3.2). The step back is a walk over the permutation, so
+    /// the model keeps no separate history of the played tracks.
     pub fn prev_index(&mut self) -> Option<usize> {
         if self.len == 0 {
             return None;
@@ -336,7 +337,6 @@ impl PlaybackOrder {
                 }
             };
             self.current_index = Some(prev);
-            self.history.push(prev);
             Some(prev)
         } else {
             if self.shuffle_plan.is_empty() {
@@ -346,7 +346,6 @@ impl PlaybackOrder {
                 self.shuffle_pos -= 1;
                 let prev = self.shuffle_plan[self.shuffle_pos];
                 self.current_index = Some(prev);
-                self.history.push(prev);
                 Some(prev)
             } else if self.repeat && self.len > 1 {
                 // Restore the previous cycle when available (S15 §3.2).
@@ -355,13 +354,11 @@ impl PlaybackOrder {
                     self.shuffle_pos = self.shuffle_plan.len().saturating_sub(1);
                     let prev = self.shuffle_plan[self.shuffle_pos];
                     self.current_index = Some(prev);
-                    self.history.push(prev);
                     Some(prev)
                 } else {
                     self.shuffle_pos = self.shuffle_plan.len().saturating_sub(1);
                     let prev = self.shuffle_plan[self.shuffle_pos];
                     self.current_index = Some(prev);
-                    self.history.push(prev);
                     Some(prev)
                 }
             } else {
@@ -371,13 +368,20 @@ impl PlaybackOrder {
     }
 
     /// Step by signed `delta` positions in the active playback order.
+    ///
+    /// The walk is bounded: the number of steps is clamped to
+    /// [`MAX_SKIP_STEPS`], so a delta that arrives over the wire cannot turn
+    /// into an unbounded loop on the audio thread. Every delta within the
+    /// bound keeps the exact wrap semantics of S15 §3.3; a delta beyond it
+    /// walks the bound and stops there.
     pub fn skip_by(&mut self, delta: i32) -> Option<usize> {
         if self.len == 0 || delta == 0 {
             return self.current_index;
         }
+        let steps = delta.unsigned_abs().min(MAX_SKIP_STEPS);
+        let mut res = self.current_index;
         if delta > 0 {
-            let mut res = self.current_index;
-            for _ in 0..delta {
+            for _ in 0..steps {
                 match self.next_index() {
                     Some(idx) => res = Some(idx),
                     None => break,
@@ -385,8 +389,7 @@ impl PlaybackOrder {
             }
             res
         } else {
-            let mut res = self.current_index;
-            for _ in 0..delta.unsigned_abs() {
+            for _ in 0..steps {
                 match self.prev_index() {
                     Some(idx) => res = Some(idx),
                     None => break,
