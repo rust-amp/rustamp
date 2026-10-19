@@ -308,8 +308,8 @@ fn the_windowed_player_opens_a_window_inside_the_test_vm() {
         // The title and the class round-trip in full (task card N12).
         // `find_window` already matched the exact multi-character title; the
         // explicit read-backs below pin the title and add the class, which
-        // no test read before. winit 0.30 registers the user-window class
-        // as `Window Class` (Cargo.lock pins winit 0.30.13); a
+        // no test read before. S10 requires the main-window class
+        // `Winamp v1.x` for discovery by external controllers; a
         // one-character title or class is the wide/ANSI-mismatch
         // signature, not a real window property.
         assert_eq!(
@@ -319,9 +319,9 @@ fn the_windowed_player_opens_a_window_inside_the_test_vm() {
         );
         assert_eq!(
             child_windows::window_class(main),
-            "Window Class",
-            "the main window class must round-trip in full: winit 0.30's \
-             registered class; a one-character class is the wide/ANSI-mismatch \
+            "Winamp v1.x",
+            "the main window class must round-trip in full: S10's \
+             external-control class; a one-character class is the wide/ANSI-mismatch \
              signature (task card N12)"
         );
         assert_eq!(
@@ -376,6 +376,123 @@ fn the_gui_rail_refuses_the_silent_windowed_mode_too() {
         !stdout.contains("output "),
         "the run must stop before the audio device is opened; stdout:\n{stdout}"
     );
+}
+
+/// An external process drives the actual player HWND, not an emulated host.
+/// Never run this on the host: it opens the real player window.
+#[cfg(windows)]
+#[test]
+#[ignore = "VM-only: opens a real player window; requires an interactive guest session"]
+fn external_control_drives_the_player_window_in_the_test_vm() {
+    use std::ffi::c_void;
+    use std::time::Instant;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SendMessageTimeoutW(
+            hwnd: *mut c_void,
+            message: u32,
+            wparam: usize,
+            lparam: isize,
+            flags: u32,
+            timeout: u32,
+            result: *mut usize,
+        ) -> isize;
+        fn PostMessageW(hwnd: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
+    }
+
+    fn query(hwnd: *mut c_void, id: isize, argument: i32) -> u32 {
+        let mut result = 0;
+        // SAFETY: HWND belongs to our live child; the result buffer is valid,
+        // the query carries no pointers, and the send has a bounded timeout.
+        let ok = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                0x0400,
+                argument as u32 as usize,
+                id,
+                2,
+                1000,
+                &mut result,
+            )
+        };
+        assert_ne!(ok, 0, "IPC {id} timed out or failed");
+        result as u32
+    }
+
+    fn post(hwnd: *mut c_void, message: u32, argument: usize, id: isize) {
+        // SAFETY: only integer command/query parameters go to our child HWND.
+        assert_ne!(unsafe { PostMessageW(hwnd, message, argument, id) }, 0);
+    }
+
+    fn eventually(hwnd: *mut c_void, id: isize, argument: i32, expected: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let actual = query(hwnd, id, argument);
+            if actual == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "IPC {id}: expected {expected}, got {actual}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    rustamp_app::window::require_test_vm();
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = binary(); // Always CREATE_NO_WINDOW, even in the guest.
+    isolate(&mut command, &dir);
+    command.env_remove(rustamp_app::window::NO_GUI_ENV);
+    let child = ChildGuard(
+        command
+            .args(["--no-audio", "--volume", "128"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn player"),
+    );
+    let hwnd = child_windows::find_window(child.0.id(), "Rustamp", Duration::from_secs(15));
+    assert_eq!(child_windows::window_class(hwnd), "Winamp v1.x");
+    eventually(hwnd, 0, 0, 0x2905); // Wait until the subclass is installed.
+    for (id, argument, expected) in [
+        (104, -1, 0),
+        (105, 0, u32::MAX),
+        (105, 1, u32::MAX),
+        (105, 2, 0),
+        (122, -666, 128),
+        (123, -666, 0),
+        (124, 0, 0),
+        (125, 0, 0),
+        (250, 0, 0),
+        (251, 0, 0),
+        (9999, 0, 1),
+        (-1, 0, 1),
+    ] {
+        assert_eq!(query(hwnd, id, argument), expected, "IPC {id}");
+    }
+    // Sent setter replies are a spec gap: refusal must not mutate the player.
+    assert_eq!(query(hwnd, 122, 64), 1);
+    assert_eq!(query(hwnd, 122, -666), 128);
+    post(hwnd, 0x0111, (0x1234 << 16) | 40058, 0); // Existing VolumeUp path.
+    eventually(hwnd, 122, -666, 132);
+    post(hwnd, 0x0111, 40023, 0); // Existing ToggleShuffle path.
+    eventually(hwnd, 250, 0, 1);
+    post(hwnd, 0x0400, 0, 252); // Measured posted setter, not a sent-reply guess.
+    eventually(hwnd, 250, 0, 0);
+    post(hwnd, 0x0400, 255, 123);
+    eventually(hwnd, 123, -666, u32::MAX);
+    post(hwnd, 0x0400, 1, 253);
+    eventually(hwnd, 251, 0, 1);
 }
 
 // ---- spawn-site guard: the source check below ignores everything after this

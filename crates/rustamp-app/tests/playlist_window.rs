@@ -131,9 +131,9 @@ fn the_playlist_window_opens_docked_below_the_main_window() {
         );
         assert_eq!(
             child_windows::window_class(main),
-            "Window Class",
-            "the main window class must round-trip in full (winit 0.30's \
-             registered class; a one-character class is the wide/ANSI-mismatch \
+            "Winamp v1.x",
+            "the main window class must round-trip in full (S10's \
+             external-control class; a one-character class is the wide/ANSI-mismatch \
              signature, task card N12)"
         );
         assert_eq!(
