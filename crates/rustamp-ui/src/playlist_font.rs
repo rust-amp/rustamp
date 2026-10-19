@@ -46,6 +46,27 @@ fn font(family: &str) -> Option<FontArc> {
     font
 }
 
+/// The width of `text` in pixels, in the metrics [`render`] uses.
+///
+/// The width is the sum of the glyph advances plus the kerning between them,
+/// so it is the place where a caret behind the text belongs. It is `None`
+/// when the host has no font at all.
+pub(crate) fn text_width(family: &str, text: &str) -> Option<u32> {
+    let font = font(family)?;
+    let scaled = font.as_scaled(PxScale::from(13.0));
+    let mut x = 0.0;
+    let mut previous = None;
+    for ch in text.chars() {
+        let id = scaled.glyph_id(ch);
+        if let Some(previous) = previous {
+            x += scaled.kern(previous, id);
+        }
+        x += scaled.h_advance(id);
+        previous = Some(id);
+    }
+    Some(x.ceil() as u32)
+}
+
 /// Render using the requested installed family, falling back to Arial/sans.
 /// Quantize coverage to a 1-bit mask before compositing: playlist rows must
 /// contain only the skin's foreground and background, never blended shades.

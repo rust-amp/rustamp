@@ -476,7 +476,11 @@ impl LibraryView {
     }
 
     /// The largest scroll offset: the last screenful of the match set.
-    fn max_scroll(&self) -> usize {
+    ///
+    /// The match set holds `total` rows and the window shows `viewport` of
+    /// them, so the last screenful starts at `total - viewport`. A match
+    /// set that fits into the window has no scroll at all.
+    pub fn max_scroll(&self) -> usize {
         self.total.saturating_sub(self.viewport)
     }
 

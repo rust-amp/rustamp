@@ -1,11 +1,12 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! The media library window's renderer: the list, the selection and the
-//! status line, drawn into a frame.
+//! The media library window's renderer: the chrome, the list, the selection
+//! and the status line, drawn into a frame.
 //!
 //! [`crate::library::LibraryView`] is the headless model of the media library
 //! and [`crate::library_layout::LibraryLayout`] gives the list's columns in
-//! text cells. This module draws them: it paints the column titles, the rows
-//! at the scroll offset, the selection and the status line.
+//! text cells. This module draws them: it paints the search field, the
+//! column titles, the rows at the scroll offset, the selection, the
+//! scrollbar and the status line.
 //!
 //! # The library window is a modern window
 //!
@@ -27,17 +28,53 @@
 //! column box**: a proportional system font would otherwise put every row's
 //! artist under a different pixel, and the list would not read as columns.
 //!
-//! The viewport is split into four bands:
+//! The viewport is split into five bands:
 //!
-//! * the **header** at the top: the column titles on the panel background;
-//! * a one-pixel **separator** under it;
+//! * the **search field** at the top: the text as typed, a caret while the
+//!   field has the focus and a hint while it is empty;
+//! * the **header** below it: the column titles on the panel background;
+//! * a one-pixel **separator** under the header;
 //! * the **rows** in the middle: the rows at the scroll offset, the selected
-//!   one on the selection background;
+//!   one on the selection background, and the **scrollbar** in a column on
+//!   their right;
 //! * the **status line** at the bottom: the visible range and the total.
 //!
 //! Everything is clipped to the viewport: a row that does not fit is not
 //! drawn, a column that does not fit is cut off, and no pixel outside the
 //! viewport is touched.
+//!
+//! # The chrome (own choice)
+//!
+//! No spec measures the media library (S20 is not started), so the chrome is
+//! our own choice. It follows two rules:
+//!
+//! * **The geometry is a pure function of the viewport and the view.**
+//!   [`LibraryChrome::new`] computes every rectangle from the two of them
+//!   and from nothing else - no clock, no window, no mutable state. The app
+//!   can therefore hit-test against the rectangles it drew, and the same
+//!   viewport always gives the same chrome.
+//! * **The window is the list.** The search field is a convenience above the
+//!   list, so a window that is too short for everything gives its height to
+//!   the header first and to the search field last.
+//!
+//! The **search field** is one text line at the top of the window, the full
+//! width. It shows [`LibraryView::text`], the text as it was typed; while
+//! the field is empty it shows a hint ([`LIBRARY_SEARCH_PLACEHOLDER`]) in a
+//! dimmer colour, and while the field has the focus it shows a caret behind
+//! the text. The caret stands at the width the text takes in the system
+//! font, so it follows the text and not a cell grid.
+//!
+//! The **scrollbar** is a column on the right of the rows, as wide as
+//! [`LIBRARY_SCROLLBAR_WIDTH`]. The rows band is narrowed by it, so no row
+//! text ever runs under it. The **thumb** is as tall as the share of the
+//! match set the window shows (`visible / total`): it fills the whole track
+//! when everything fits, it is proportional when there is more to scroll,
+//! and it is gone when there is nothing at all. Its place in the track is
+//! the scroll's place in the range (`scroll / max_scroll`).
+//!
+//! A click in the track asks for the scroll it sits at:
+//! [`scroll_for_click`] maps the click's y to a scroll offset, and the app
+//! scrolls the view to it.
 
 use rustamp_gfx::{Image, Rect};
 
@@ -72,6 +109,24 @@ pub const LIBRARY_SELECTION_TEXT: [u8; 3] = [255, 255, 255];
 /// The status line's text.
 pub const LIBRARY_STATUS_TEXT: [u8; 3] = [200, 200, 200];
 
+/// The background of the search field's band.
+pub const LIBRARY_SEARCH_BACKGROUND: [u8; 3] = [40, 40, 44];
+
+/// The text typed into the search field.
+pub const LIBRARY_SEARCH_TEXT: [u8; 3] = [232, 232, 236];
+
+/// The hint the empty search field shows.
+pub const LIBRARY_SEARCH_HINT: [u8; 3] = [128, 128, 134];
+
+/// The caret of the focused search field.
+pub const LIBRARY_SEARCH_CARET: [u8; 3] = [255, 255, 255];
+
+/// The scrollbar's track.
+pub const LIBRARY_SCROLLBAR_TRACK: [u8; 3] = [24, 24, 28];
+
+/// The scrollbar's thumb.
+pub const LIBRARY_SCROLLBAR_THUMB: [u8; 3] = [112, 112, 118];
+
 // ---------------------------------------------------------------------------
 // The metrics (own choice)
 // ---------------------------------------------------------------------------
@@ -89,11 +144,163 @@ pub const LIBRARY_CELL_WIDTH: u32 = 7;
 /// leading between two lines.
 pub const LIBRARY_LINE_HEIGHT: u32 = 16;
 
+/// The width of the scrollbar, in pixels.
+pub const LIBRARY_SCROLLBAR_WIDTH: u32 = 12;
+
+/// The narrowest the scrollbar's thumb may become, in pixels.
+///
+/// A thumb that is thinner than this cannot be grabbed, so it keeps this
+/// height even when the match set is much longer than the window.
+pub const LIBRARY_MIN_THUMB_HEIGHT: u32 = 8;
+
+/// The width of the caret in the search field, in pixels.
+pub const LIBRARY_CARET_WIDTH: u32 = 2;
+
+/// The padding between the search field's left edge and its text, in pixels.
+///
+/// The padding is one text cell, so the text starts where a column of the
+/// list would start.
+pub const LIBRARY_SEARCH_PADDING: u32 = LIBRARY_CELL_WIDTH;
+
+/// The hint the search field shows while it is empty.
+pub const LIBRARY_SEARCH_PLACEHOLDER: &str = "Search the library";
+
 /// The system font family the library lists are drawn in.
 ///
 /// The rasterizer falls back to Arial and then to the sans-serif family, so a
 /// host without this font still draws a readable list.
 pub const LIBRARY_FONT_FAMILY: &str = "Segoe UI";
+
+// ---------------------------------------------------------------------------
+// The geometry
+// ---------------------------------------------------------------------------
+
+/// The geometry of the media library window.
+///
+/// Every rectangle is a band of the window or a part of the scrollbar, and
+/// every one of them lies inside the viewport. The geometry is a pure
+/// function of the viewport and the view ([`LibraryChrome::new`]), so the
+/// app can map a click or a key to the band it belongs to.
+///
+/// The bands are, from the top: the search field, the header, the
+/// separator, the rows and the status line. The scrollbar is a column on
+/// the right of the rows, and the rows band is narrowed by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LibraryChrome {
+    /// The search field's band: the top of the window, the full width.
+    pub search: Rect,
+    /// The column titles' band.
+    pub header: Rect,
+    /// The one-pixel line under the header.
+    pub separator: Rect,
+    /// The rows' band: the list, without the scrollbar.
+    pub rows: Rect,
+    /// The status line's band: the bottom of the window, the full width.
+    pub status: Rect,
+    /// The scrollbar's track: the right-hand column of the rows' band.
+    pub scrollbar: Rect,
+    /// The scrollbar's thumb: the part of the track that shows the scroll.
+    pub thumb: Rect,
+}
+
+impl LibraryChrome {
+    /// The chrome of a library window with the given viewport.
+    ///
+    /// The viewport is the part of the frame the window occupies. The
+    /// geometry depends on the viewport and on the view alone: the view
+    /// says how many rows the window shows, how many rows there are and
+    /// where the scroll is, and the window says how much room it has.
+    ///
+    /// A window that is too short for all its bands gives the room to the
+    /// header first and to the search field last: the list is the window.
+    pub fn new(view: &LibraryView, viewport: Rect) -> Self {
+        let header_height = LIBRARY_LINE_HEIGHT.min(viewport.height);
+        let search_height = LIBRARY_LINE_HEIGHT.min(viewport.height - header_height);
+        let bands_height = search_height + header_height;
+        let separator_height = u32::from(viewport.height > bands_height);
+        let free = viewport.height - bands_height - separator_height;
+        let status_height = LIBRARY_LINE_HEIGHT.min(free);
+        let rows_height = free - status_height;
+
+        let search_y = viewport.y;
+        let header_y = search_y + search_height as i32;
+        let separator_y = header_y + header_height as i32;
+        let rows_y = separator_y + separator_height as i32;
+        let status_y = viewport.bottom() - status_height as i32;
+
+        let scrollbar_width = LIBRARY_SCROLLBAR_WIDTH.min(viewport.width);
+        let rows_width = viewport.width - scrollbar_width;
+        let rows = Rect::new(viewport.x, rows_y, rows_width, rows_height);
+        let scrollbar = Rect::new(
+            viewport.x + rows_width as i32,
+            rows_y,
+            scrollbar_width,
+            rows_height,
+        );
+        let thumb = thumb_rect(view, scrollbar);
+
+        Self {
+            search: Rect::new(viewport.x, search_y, viewport.width, search_height),
+            header: Rect::new(viewport.x, header_y, viewport.width, header_height),
+            separator: Rect::new(viewport.x, separator_y, viewport.width, separator_height),
+            rows,
+            status: Rect::new(viewport.x, status_y, viewport.width, status_height),
+            scrollbar,
+            thumb,
+        }
+    }
+}
+
+/// The scrollbar's thumb for a view.
+///
+/// The thumb is as tall as the share of the match set the window shows: it
+/// fills the track when everything fits, it is proportional to
+/// `visible / total` when there is more to scroll, and it is gone when
+/// there is nothing at all. Its place in the track is the scroll's place in
+/// the range: `scroll / max_scroll`.
+fn thumb_rect(view: &LibraryView, track: Rect) -> Rect {
+    let total = view.total();
+    if total == 0 || track.height == 0 {
+        return Rect::new(track.x, track.y, track.width, 0);
+    }
+    let visible = view.viewport();
+    let height = if total <= visible {
+        track.height
+    } else {
+        let proportional = track.height as usize * visible / total;
+        proportional
+            .max(LIBRARY_MIN_THUMB_HEIGHT as usize)
+            .min(track.height as usize) as u32
+    };
+    let travel = track.height - height;
+    let max_scroll = view.max_scroll();
+    let offset = (travel as usize * view.scroll())
+        .checked_div(max_scroll)
+        .unwrap_or(0)
+        .min(travel as usize);
+    Rect::new(track.x, track.y + offset as i32, track.width, height)
+}
+
+/// The scroll offset a click at `y` in the scrollbar asks for.
+///
+/// The click's place in the track is the place in the scroll range: a click
+/// at the top of the track asks for the first row, a click at its bottom
+/// for the last screenful, and a click in between for the offset in
+/// between. A click outside the track asks for the nearest end.
+///
+/// The app scrolls the view to the offset and runs the view's request
+/// again; a match set that fits into the window has no scroll at all.
+pub fn scroll_for_click(view: &LibraryView, chrome: &LibraryChrome, y: i32) -> usize {
+    let max_scroll = view.max_scroll();
+    let track = chrome.scrollbar;
+    if max_scroll == 0 || track.height == 0 {
+        return 0;
+    }
+    // The last pixel of the track is the last screenful.
+    let span = (track.height - 1).max(1) as i64;
+    let offset = (y - track.y).clamp(0, span as i32) as i64;
+    ((offset * max_scroll as i64 + span / 2) / span) as usize
+}
 
 // ---------------------------------------------------------------------------
 // Drawing
@@ -102,9 +309,17 @@ pub const LIBRARY_FONT_FAMILY: &str = "Segoe UI";
 /// Draws the library window's content into `frame`, inside `viewport`.
 ///
 /// `viewport` is the part of `frame` the library occupies: the app gives it
-/// the whole client area, or the part below a search field it draws itself.
-/// The layout gives the columns in text cells, so the app resizes it to the
-/// window with `LibraryLayout::resized_to(viewport.width / LIBRARY_CELL_WIDTH)`.
+/// the whole client area. The layout gives the columns in text cells, so
+/// the app resizes it to the list with
+/// `LibraryLayout::resized_to(chrome.rows.width / LIBRARY_CELL_WIDTH)`.
+///
+/// `search_focused` says whether the search field has the focus: a focused
+/// field shows a caret behind the text.
+///
+/// The chrome the renderer draws is the one
+/// [`LibraryChrome::new`](LibraryChrome::new) computes from the same
+/// viewport and the same view, so the app can hit-test against it and get
+/// the bands that were drawn.
 ///
 /// Nothing outside `viewport` is touched.
 pub fn render_library_window(
@@ -112,83 +327,30 @@ pub fn render_library_window(
     view: &LibraryView,
     layout: &LibraryLayout,
     viewport: Rect,
+    search_focused: bool,
 ) {
-    let bands = Bands::new(viewport);
+    let chrome = LibraryChrome::new(view, viewport);
     frame.fill_rect(viewport, opaque(LIBRARY_WINDOW_BACKGROUND));
-    frame.fill_rect(bands.header, opaque(LIBRARY_PANEL_BACKGROUND));
-    frame.fill_rect(bands.separator, opaque(LIBRARY_SEPARATOR));
-    frame.fill_rect(bands.status, opaque(LIBRARY_PANEL_BACKGROUND));
+    frame.fill_rect(chrome.header, opaque(LIBRARY_PANEL_BACKGROUND));
+    frame.fill_rect(chrome.separator, opaque(LIBRARY_SEPARATOR));
+    frame.fill_rect(chrome.status, opaque(LIBRARY_PANEL_BACKGROUND));
 
     draw_columns(
         frame,
         layout,
         &layout.header_line(),
-        bands.header,
+        chrome.header,
         LIBRARY_HEADER_TEXT,
     );
-    draw_rows(frame, view, layout, bands.rows);
+    draw_rows(frame, view, layout, chrome.rows);
     draw_text(
         frame,
         &view.status_line(),
-        bands.status,
+        chrome.status,
         LIBRARY_STATUS_TEXT,
     );
-}
-
-/// The four bands the viewport is split into.
-struct Bands {
-    /// The column titles.
-    header: Rect,
-    /// The one-pixel line under the header.
-    separator: Rect,
-    /// The rows.
-    rows: Rect,
-    /// The status line.
-    status: Rect,
-}
-
-impl Bands {
-    /// Splits the viewport into its bands.
-    ///
-    /// A viewport too short for the header and the status line gives its
-    /// height to the header first; the bands never overlap and never leave
-    /// the viewport.
-    fn new(viewport: Rect) -> Self {
-        let header = Rect::new(
-            viewport.x,
-            viewport.y,
-            viewport.width,
-            LIBRARY_LINE_HEIGHT.min(viewport.height),
-        );
-        let separator_y = viewport.y + LIBRARY_LINE_HEIGHT as i32;
-        let separator = Rect::new(
-            viewport.x,
-            separator_y,
-            viewport.width,
-            u32::from(separator_y < viewport.bottom()),
-        );
-        let status_height =
-            LIBRARY_LINE_HEIGHT.min(viewport.height.saturating_sub(LIBRARY_LINE_HEIGHT + 1));
-        let status = Rect::new(
-            viewport.x,
-            viewport.bottom() - status_height as i32,
-            viewport.width,
-            status_height,
-        );
-        let rows_top = separator.y + separator.height as i32;
-        let rows = Rect::new(
-            viewport.x,
-            rows_top,
-            viewport.width,
-            (status.y - rows_top).max(0) as u32,
-        );
-        Self {
-            header,
-            separator,
-            rows,
-            status,
-        }
-    }
+    draw_search(frame, view, &chrome, search_focused);
+    draw_scrollbar(frame, &chrome);
 }
 
 /// Draws the rows at the scroll offset, the selected one on its background.
@@ -216,6 +378,68 @@ fn draw_rows(frame: &mut Image, view: &LibraryView, layout: &LibraryLayout, band
         };
         draw_columns(frame, layout, &layout.row_line(row), row_band, colour);
     }
+}
+
+/// Draws the search field: the text as typed, the hint while the field is
+/// empty and the caret while the field has the focus.
+fn draw_search(frame: &mut Image, view: &LibraryView, chrome: &LibraryChrome, focused: bool) {
+    let band = chrome.search;
+    if band.is_empty() {
+        return;
+    }
+    frame.fill_rect(band, opaque(LIBRARY_SEARCH_BACKGROUND));
+    let field = Rect::new(
+        band.x + LIBRARY_SEARCH_PADDING as i32,
+        band.y,
+        band.width.saturating_sub(LIBRARY_SEARCH_PADDING),
+        band.height,
+    );
+    let text = view.text();
+    if text.is_empty() {
+        draw_text(
+            frame,
+            LIBRARY_SEARCH_PLACEHOLDER,
+            field,
+            LIBRARY_SEARCH_HINT,
+        );
+    } else {
+        draw_text(frame, text, field, LIBRARY_SEARCH_TEXT);
+    }
+    if focused {
+        draw_caret(frame, text, field, band);
+    }
+}
+
+/// Draws the caret of the focused search field.
+///
+/// The caret stands behind the text, at the width the text takes in the
+/// system font; an empty field has its caret at the field's left edge. A
+/// text that is longer than the field is clipped, and its caret stands at
+/// the field's right edge.
+fn draw_caret(frame: &mut Image, text: &str, field: Rect, band: Rect) {
+    let width = crate::playlist_font::text_width(LIBRARY_FONT_FAMILY, text).unwrap_or(0);
+    let caret_x = field
+        .x
+        .saturating_add(width as i32)
+        .min(band.right() - LIBRARY_CARET_WIDTH as i32);
+    if caret_x < field.x {
+        return;
+    }
+    let height = band.height.saturating_sub(4);
+    if height == 0 {
+        return;
+    }
+    let y = band.y + ((band.height - height) / 2) as i32;
+    frame.fill_rect(
+        Rect::new(caret_x, y, LIBRARY_CARET_WIDTH, height),
+        opaque(LIBRARY_SEARCH_CARET),
+    );
+}
+
+/// Draws the scrollbar: the track and the thumb.
+fn draw_scrollbar(frame: &mut Image, chrome: &LibraryChrome) {
+    frame.fill_rect(chrome.scrollbar, opaque(LIBRARY_SCROLLBAR_TRACK));
+    frame.fill_rect(chrome.thumb, opaque(LIBRARY_SCROLLBAR_THUMB));
 }
 
 /// Draws one layout line: every column at its own cell offset, clipped to
