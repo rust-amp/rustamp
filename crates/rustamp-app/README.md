@@ -274,3 +274,34 @@ new height, the docked reflow and the config round-trip; the OS window's
 resize is checked by the ignored
 `window::tests::the_playlist_window_shade_resizes_the_real_window` in the
 test VM.
+
+## Double-clicking a title bar
+
+S03 §5: "Double-click the title bar: toggle windowshade" (verified on the
+2.95). The gesture works on the **main**, **equalizer** and **playlist**
+windows, and it sends `Command::ToggleWindowShade` for that window.
+
+What counts as a double click is the rule the playlist list already used —
+the second press within **500 ms** and within **4 px** of the first, on each
+axis. It lives in one place now (`src/double_click.rs`), and the playlist
+list uses it too, so there is a single threshold in the player.
+
+The press is only a title-bar press when it lands in the title bar and not
+on one of its controls:
+
+- the main window's four window buttons (the hit test answers them before
+  the band they sit in) and, in the shaded form, the position slider inside
+  the band;
+- the playlist editor's close and shade buttons;
+- the equalizer has no title-bar button at all (S05 §1.5).
+
+A press on such a control **wins**: the button's own action runs and the
+double click does not fire. It also ends the sequence, so the next title-bar
+press starts a new one.
+
+The gesture is headless (`App::title_bar_double_click`, the entry point the
+presenter asks about on every press); the tests are in
+`tests/title_bar_double_click.rs`. What only the test VM can show is the
+gesture against the real windows: the first press of a double click starts
+the operating system's title-bar drag (it moves nothing when the mouse stays
+put), and the second press is the one that toggles the shade.

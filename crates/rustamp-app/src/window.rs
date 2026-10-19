@@ -91,6 +91,7 @@ use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
 use crate::app::App;
 use crate::cursor::{CursorAction, SkinCursors, cursor_action};
+use crate::double_click::DoubleClick;
 
 /// A window this presenter creates.
 ///
@@ -494,7 +495,10 @@ struct Windowed {
     /// A shape belongs to one skin: another skin's `region.txt` means
     /// another shape, so the shapes are built again when the skin changes.
     applied_region_skin: Option<u64>,
-    last_playlist_click: Option<(Instant, (i32, i32))>,
+    /// The playlist list's double-click tracker (S03 §5: double-clicking an
+    /// entry plays it). The rule is the shared one
+    /// ([`crate::double_click`]).
+    playlist_click: DoubleClick,
     modifiers: ModifiersState,
     /// The client size last requested, so repeat requests are skipped.
     applied_client: Option<(u32, u32)>,
@@ -552,7 +556,7 @@ impl Windowed {
             library_cursor: (0, 0),
             cursors,
             applied_region_skin: None,
-            last_playlist_click: None,
+            playlist_click: DoubleClick::default(),
             modifiers: ModifiersState::empty(),
             applied_client: None,
             applied_eq_client: None,
@@ -2179,7 +2183,7 @@ impl Windowed {
         } else if self.playlist_window.is_some() {
             self.playlist_surface = None;
             self.playlist_window = None;
-            self.last_playlist_click = None;
+            self.playlist_click.clear();
             self.applied_playlist_client = None;
         }
     }
@@ -2283,7 +2287,7 @@ impl Windowed {
                     // its own back when the window loses the focus.
                     self.restore_system_cursor();
                     self.app.playlist_mouse_leave();
-                    self.last_playlist_click = None;
+                    self.playlist_click.clear();
                 }
                 self.request_playlist_redraw();
             }
@@ -2296,7 +2300,7 @@ impl Windowed {
                 self.app
                     .playlist_mouse_move(self.playlist_cursor.0, self.playlist_cursor.1);
                 if self.app.playlist().drag_insertion().is_some() {
-                    self.last_playlist_click = None;
+                    self.playlist_click.clear();
                 }
                 self.request_playlist_redraw();
             }
@@ -2305,7 +2309,7 @@ impl Windowed {
                 // this window; the system's own cursor takes over.
                 self.restore_system_cursor();
                 self.app.playlist_mouse_leave();
-                self.last_playlist_click = None;
+                self.playlist_click.clear();
                 self.request_playlist_redraw();
             }
             WindowEvent::MouseInput {
@@ -2315,35 +2319,43 @@ impl Windowed {
             } => {
                 let (x, y) = self.playlist_cursor;
                 if state == ElementState::Pressed
+                    // S03 §5: a double click on the title bar toggles the
+                    // windowshade. It is asked first, so the double click
+                    // does not start a window drag.
+                    && self.title_bar_double_click(CoreWindowId::Playlist, x, y)
+                {
+                    self.playlist_click.clear();
+                    self.sync_window_state();
+                    self.sync_playlist_window(event_loop);
+                    self.apply_docking_positions();
+                    self.request_playlist_redraw();
+                    self.request_redraw();
+                    return;
+                }
+                if state == ElementState::Pressed
                     && (0..rustamp_ui::playlist_window::TITLE_BAR_HEIGHT).contains(&y)
                     && rustamp_ui::playlist_window::hit_test_title_bar(x, y).is_none()
                     && let Some(window) = &self.playlist_window
                     && window.drag_window().is_ok()
                 {
-                    self.last_playlist_click = None;
+                    self.playlist_click.clear();
                     return;
                 }
                 // Row dragging is an own choice while S06 §8 Q6 stays open.
                 let result = match state {
                     ElementState::Pressed => {
-                        let now = Instant::now();
+                        let now = self.app.now_ms();
                         // The double-click gesture is the list's (S03 §5:
                         // double-clicking an entry plays it), so a title-bar
                         // press is never swallowed as one - the shade button
                         // must toggle on every click.
                         let is_double = rustamp_ui::in_list_area(x, y)
-                            && if let Some((last_time, (lx, ly))) = self.last_playlist_click {
-                                now.duration_since(last_time) < Duration::from_millis(500)
-                                    && (x - lx).abs() <= 4
-                                    && (y - ly).abs() <= 4
-                            } else {
-                                false
-                            };
+                            && self.playlist_click.is_double_click(now, x, y);
                         if is_double {
-                            self.last_playlist_click = None;
+                            self.playlist_click.clear();
                             self.app.playlist_double_click(x, y)
                         } else {
-                            self.last_playlist_click = Some((now, (x, y)));
+                            self.playlist_click.remember(now, x, y);
                             self.app.playlist_mouse_down(x, y)
                         }
                     }
@@ -2380,6 +2392,24 @@ impl Windowed {
                 self.request_redraw_eq();
             }
             Err(error) => eprintln!("rustamp: dropped file not added: {error}"),
+        }
+    }
+
+    /// S03 §5: a double click on a window's title bar toggles its
+    /// windowshade.
+    ///
+    /// The press is asked of the app first, so the double click never starts
+    /// a window drag: the drag belongs to the single click, the double click
+    /// to the shade. Returns whether the press completed the double click,
+    /// in which case the shade has been toggled.
+    fn title_bar_double_click(&mut self, window: CoreWindowId, x: i32, y: i32) -> bool {
+        let now = self.app.now_ms();
+        match self.app.title_bar_double_click(window, x, y, now) {
+            Ok(commands) => !commands.is_empty(),
+            Err(error) => {
+                eprintln!("rustamp: title-bar double click failed: {error}");
+                false
+            }
         }
     }
 
@@ -2672,11 +2702,19 @@ impl ApplicationHandler for Windowed {
                 let result = match state {
                     ElementState::Pressed => {
                         self.left_down = true;
-                        // Easy-move (W10 finding F5): a press no control owns
-                        // moves the window instead of reaching the machine.
-                        match self.try_easy_drag(x, y) {
-                            Some(()) => Ok(Vec::new()),
-                            None => self.app.mouse_down(x, y),
+                        // S03 §5: a double click on the title bar toggles
+                        // the windowshade. It is asked first, so the double
+                        // click does not start a window drag.
+                        if self.title_bar_double_click(CoreWindowId::Main, x, y) {
+                            Ok(Vec::new())
+                        } else {
+                            // Easy-move (W10 finding F5): a press no control
+                            // owns moves the window instead of reaching the
+                            // machine.
+                            match self.try_easy_drag(x, y) {
+                                Some(()) => Ok(Vec::new()),
+                                None => self.app.mouse_down(x, y),
+                            }
                         }
                     }
                     ElementState::Released => {
@@ -2882,6 +2920,18 @@ impl Windowed {
                 ..
             } => {
                 let (x, y) = self.eq_cursor;
+                if state == ElementState::Pressed
+                    // S03 §5: a double click on the title bar toggles the
+                    // windowshade. It is asked first, so the double click
+                    // does not start a window drag.
+                    && self.title_bar_double_click(CoreWindowId::Equalizer, x, y)
+                {
+                    self.eq_left_down = false;
+                    self.sync_window_state();
+                    self.sync_eq_window(event_loop);
+                    self.request_redraw_eq();
+                    return;
+                }
                 if state == ElementState::Pressed
                     && rustamp_ui::equalizer::hit_test(
                         &rustamp_ui::EqualizerLayout::CLASSIC,
