@@ -30,6 +30,9 @@
 //!   format states no byte count anywhere, and a damaged FLAC frame is
 //!   dropped by the reader - so a corrupt file is short of samples exactly
 //!   like a cut one. A truncated FLAC file still ends with an end of stream.
+//!   The **metadata** of a FLAC file is checked, though: a file without a
+//!   `STREAMINFO` block and a file whose metadata chain was cut are named
+//!   when they are opened (see [`flac_refusal`]).
 //! * Corrupt packets are skipped; see [`SymphoniaDecoder::skipped_packets`].
 //! * Hostile input (truncated, empty, lying headers, noise) is rejected with a
 //!   defined error or degraded to a defined end of stream; the loop in
@@ -258,6 +261,14 @@ struct HeaderProbe {
     /// The movie box can be at the end of the file and larger than the header
     /// window, so the boxes are read from the file itself.
     mp4: Option<crate::mp4_header::Mp4Header>,
+    /// What the metadata of a FLAC file says, when the file is a FLAC file.
+    ///
+    /// The chain of metadata blocks states the length of every block, so it
+    /// tells a cut file from a complete one - and it holds the
+    /// `STREAMINFO` block, the one that states the audio parameters. The
+    /// chain is read from the file itself: a block can be larger than the
+    /// header window.
+    flac: Option<crate::flac_header::FlacMetadata>,
 }
 
 /// The byte claim of a container: how many bytes the payload occupies and how
@@ -310,7 +321,9 @@ struct ByteClaim {
 /// (its CRC-16 does not match) while the reader resynchronises at the next
 /// frame - so a corrupt file is short of samples exactly like a cut one,
 /// while it holds all of its bytes. Without the byte count the two cannot be
-/// told apart, so FLAC has no oracle at all.
+/// told apart, so FLAC has no oracle at all. Its *metadata* is a different
+/// matter: the chain of metadata blocks states the length of every block and
+/// is checked when the file is opened (see [`flac_refusal`]).
 #[derive(Debug, Clone, Copy)]
 struct Declared {
     /// The number of frames the container declares the file holds.
@@ -342,6 +355,13 @@ fn declared_payload(
             bytes: None,
             source: "its container",
         });
+    }
+    // FLAC states no byte count of its audio, so it is no oracle: the
+    // sample count of its `STREAMINFO` block is short in a damaged file just
+    // as it is in a cut one (see the module docs). The check is explicit
+    // here, so that no other header of a FLAC file can make one up.
+    if header.flac.is_some() {
+        return None;
     }
     // AIFF: the `COMM` chunk states the number of sample frames and the
     // `SSND` chunk states the number of bytes of sound data. Both are exact,
@@ -443,6 +463,7 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
             window: Vec::new(),
             aiff: None,
             mp4: None,
+            flac: None,
         };
     }
     let id3v2 = crate::mpeg_header::id3v2_len(&head);
@@ -452,6 +473,7 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
             window: Vec::new(),
             aiff: None,
             mp4: None,
+            flac: None,
         };
     }
     let mut window = vec![0u8; HEADER_WINDOW];
@@ -477,11 +499,21 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
     } else {
         None
     };
+    // A FLAC file states its audio parameters in its `STREAMINFO` block, and
+    // its metadata chain states the length of every block. Both are read
+    // from the file itself: a metadata block can be larger than the header
+    // window.
+    let flac = if crate::flac_header::looks_like_flac(&window) {
+        crate::flac_header::parse(reader, id3v2 as u64, len)
+    } else {
+        None
+    };
     HeaderProbe {
         id3v2,
         window,
         aiff,
         mp4,
+        flac,
     }
 }
 
@@ -502,6 +534,46 @@ fn mp4_truncation(header: &HeaderProbe, byte_len: Option<u64>) -> Option<String>
         byte_len.saturating_sub(start),
         end - start
     ))
+}
+
+/// The message for a FLAC file that cannot be decoded, named.
+///
+/// A FLAC file states its audio parameters in the `STREAMINFO` block of its
+/// metadata chain. A file without that block has nothing to decode: the
+/// reader cannot recognise a frame without the parameters and runs into the
+/// end of the file, which it reports as an end of stream - for a file that
+/// is not at its end. The chain states the length of every block, so a file
+/// that ends inside one was cut, and that is a truncation rather than an end
+/// of stream.
+///
+/// `None` when the file is not a FLAC file or when its metadata says
+/// everything a reader needs.
+fn flac_refusal(header: &HeaderProbe) -> Option<String> {
+    use crate::flac_header::FlacMetadata;
+    match header.flac? {
+        FlacMetadata::Complete { stream_info: true } => None,
+        FlacMetadata::Complete { stream_info: false } => {
+            Some("the FLAC file has no STREAMINFO block".to_string())
+        }
+        FlacMetadata::Cut {
+            offset,
+            claimed,
+            available,
+        } => {
+            let detail = match (claimed, available) {
+                (Some(claimed), Some(available)) => format!(
+                    "the block at offset {offset} claims {claimed} bytes, the file holds {available}"
+                ),
+                (Some(claimed), None) => format!(
+                    "the block at offset {offset} claims {claimed} bytes, which the file does not hold"
+                ),
+                (None, _) => format!("no block header at offset {offset}"),
+            };
+            Some(format!(
+                "truncated stream: the FLAC file ends inside its metadata blocks ({detail})"
+            ))
+        }
+    }
 }
 
 /// Queues a detected mid-stream format change.
@@ -612,6 +684,14 @@ impl SymphoniaDecoder {
         // plays anything, so it refuses such a file with a bare "end of
         // stream" - naming the cut is the point of the oracle.
         if let Some(message) = mp4_truncation(&header, byte_len) {
+            return Err(Error::Decode(message));
+        }
+
+        // A FLAC file without a `STREAMINFO` block states no audio
+        // parameters, and a FLAC file whose metadata chain was cut never
+        // reaches its audio. The reader reports both as an end of stream,
+        // which for a file that is not at its end names the wrong problem.
+        if let Some(message) = flac_refusal(&header) {
             return Err(Error::Decode(message));
         }
 
@@ -1189,6 +1269,7 @@ mod tests {
                 window: wave.clone(),
                 aiff: None,
                 mp4: None,
+                flac: None,
             },
             &params,
             Some(4096),
@@ -1211,6 +1292,7 @@ mod tests {
                     window: avi,
                     aiff: None,
                     mp4: None,
+                    flac: None,
                 },
                 &params,
                 Some(4096)
@@ -1228,11 +1310,44 @@ mod tests {
                     window: b"fLaC\0\0\0\0\0\0\0\0".to_vec(),
                     aiff: None,
                     mp4: None,
+                    flac: Some(crate::flac_header::FlacMetadata::Complete { stream_info: true }),
                 },
                 &params,
                 Some(4096)
             )
             .is_none()
+        );
+    }
+
+    /// A FLAC file is no oracle, whatever its bytes happen to look like.
+    ///
+    /// The header of a FLAC file can hold anything - a false MPEG sync, a
+    /// "Xing" tag - and none of it states the length of the audio. The
+    /// check is explicit, so that no header of a FLAC file can make one up.
+    #[test]
+    fn a_flac_file_is_no_oracle_even_when_its_window_wears_a_xing_tag() {
+        // A window that starts with the FLAC marker and carries a Xing tag
+        // behind a MPEG frame header.
+        let mut window = b"fLaC".to_vec();
+        window.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        window.extend_from_slice(&[0u8; 32]);
+        window.extend_from_slice(b"Xing");
+        window.extend_from_slice(&0x03u32.to_be_bytes());
+        window.extend_from_slice(&59u32.to_be_bytes());
+        window.extend_from_slice(&12_537u32.to_be_bytes());
+
+        let mut params = CodecParameters::new();
+        params.with_n_frames(59 * 1152 - 1105 - 713);
+        let header = HeaderProbe {
+            id3v2: 0,
+            window,
+            aiff: None,
+            mp4: None,
+            flac: Some(crate::flac_header::FlacMetadata::Complete { stream_info: true }),
+        };
+        assert!(
+            declared_payload(&header, &params, Some(12_537)).is_none(),
+            "a FLAC file states no byte count of its audio: it is no oracle"
         );
     }
 
@@ -1253,6 +1368,7 @@ mod tests {
             window,
             aiff: None,
             mp4: None,
+            flac: None,
         };
 
         let mut params = CodecParameters::new();

@@ -24,6 +24,7 @@ pub mod symphonia_dec;
 pub mod wave_dec;
 
 mod aiff_header;
+mod flac_header;
 mod mp4_header;
 mod mpeg_header;
 

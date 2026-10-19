@@ -31,6 +31,12 @@
 //! a file was cut, so a truncated file of another kind still ends with an end
 //! of stream. Durations may be estimates as well; comparing them to decoded
 //! frames is not a format-independent truncation check.
+//!
+//! A file that cannot be decoded at all is refused when it is opened, and the
+//! refusal carries the reason the decoder named: a FLAC file without a
+//! `STREAMINFO` block states no audio parameters, so the reader cannot
+//! recognise a frame and the decoder refuses the file by name instead of
+//! letting the reader's bare "end of stream" stand.
 
 use std::path::PathBuf;
 use std::time::Duration;
