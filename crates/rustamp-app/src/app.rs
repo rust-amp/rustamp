@@ -126,6 +126,9 @@ pub struct App {
     easy_move: bool,
     pub(crate) focused: bool,
     current_skin: Option<PathBuf>,
+    /// Counts the skin loads, so a holder of skin-derived resources (the
+    /// cursor cache) can tell one skin from the next.
+    skin_generation: u64,
     quit: bool,
     /// Runtime tray/hotkey visibility; start visible even if a previous run hid
     /// the main window, so an unavailable tray can never strand the player.
@@ -348,6 +351,7 @@ impl App {
             easy_move: true,
             focused: true,
             current_skin: None,
+            skin_generation: 0,
             quit: false,
             main_visible: true,
             minimize_requested: false,
@@ -859,6 +863,15 @@ impl App {
     /// The path of the current skin, when it came from disk.
     pub fn current_skin(&self) -> Option<&PathBuf> {
         self.current_skin.as_ref()
+    }
+
+    /// The number of skin loads so far.
+    ///
+    /// The count changes whenever the app loads a skin, so a cache of
+    /// skin-derived resources (the cursor cache) knows when to drop what
+    /// it built for the previous skin.
+    pub fn skin_generation(&self) -> u64 {
+        self.skin_generation
     }
 
     /// The client area the OS window must have right now, in physical pixels.
@@ -1918,6 +1931,7 @@ impl App {
                 .map(PathBuf::from)
         };
         self.skin = loaded;
+        self.skin_generation += 1;
         self.publish_skin();
     }
 
@@ -1930,6 +1944,7 @@ impl App {
     pub(crate) fn load_builtin_skin(&mut self) {
         self.skin = crate::skin::builtin();
         self.current_skin = None;
+        self.skin_generation += 1;
         self.publish_skin();
     }
 
