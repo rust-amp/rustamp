@@ -38,6 +38,12 @@
 //! * [`menu`] — main-menu check flags, leaf activation (wave21b) and the
 //!   popup's open state and click routing on top of [`rustamp_ui::menu`].
 //!   Headless; the OS window lives in [`window`].
+//! * [`library_window`] — the media library: the app's index, the view, the
+//!   glue between them, the input map and the background scan. Headless; the
+//!   OS window lives in [`window`].
+//! * [`modern_shell`] — the window path for a window that is **not** skinned
+//!   (the media library): the shared shell's attributes with the native
+//!   frame and the resizability put back.
 //! * [`supervise`] — spawn and supervision for `rustamp-plughost32`: finding
 //!   the i686 host binary, starting it with `CREATE_NO_WINDOW` over piped
 //!   stdio, and re-attaching (or restarting) it when it dies — off the audio
@@ -75,7 +81,9 @@ pub mod eq_presets;
 mod external_control;
 pub mod focus;
 pub mod host;
+pub mod library_window;
 pub mod menu;
+pub mod modern_shell;
 mod output;
 pub mod playlist_window;
 pub mod region;

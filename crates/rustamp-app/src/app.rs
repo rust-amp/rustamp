@@ -156,6 +156,9 @@ pub struct App {
     /// The playlist editor's behaviour model (S06); owned here, rendered and
     /// fed by `playlist_window.rs`, synced from `entry_ids`.
     pub(crate) playlist: PlaylistWindow,
+    /// The media library: the app's index, its view and the background scan
+    /// (see `library_window.rs`). The OS window lives in `window.rs`.
+    pub(crate) library_window: crate::library_window::LibraryWindow,
     /// The simple modal dialogs (About, file info, jump-to, load playlist,
     /// skin browser, preferences); owned here, rendered by `dialogs.rs`,
     /// hosted by `window.rs`.
@@ -362,6 +365,7 @@ impl App {
             entry_ids: Vec::new(),
             next_entry_id: 0,
             playlist: PlaylistWindow::new(),
+            library_window: crate::library_window::LibraryWindow::default(),
             dialogs: DialogManager::new(),
             last_playlist_report: None,
             last_playlist_format: None,
@@ -896,12 +900,16 @@ impl App {
     /// The main window counts while it is shown ([`App::main_visible`]); the
     /// equalizer and the playlist editor count while their open flags say so.
     /// A closed or hidden window cannot take focus, and windows the app does
-    /// not have (`Vis`, `Gen`, `Video`) report closed.
+    /// not have (`Vis`, `Video`, every `Gen` window but the media library)
+    /// report closed.
     pub fn window_open(&self, window: WindowId) -> bool {
         match window {
             WindowId::Main => self.main_visible,
             WindowId::Equalizer => self.eq_open(),
             WindowId::Playlist => self.playlist_open(),
+            WindowId::Gen(id) if id == crate::library_window::LIBRARY_WINDOW_NUMBER => {
+                self.library_open()
+            }
             WindowId::Vis | WindowId::Gen(_) | WindowId::Video => false,
         }
     }
@@ -1043,6 +1051,9 @@ impl App {
     /// The single pump step: drain commands, poll the engine, drain events,
     /// forward the newest actual tap snapshot and refresh the UI.
     pub fn pump(&mut self) -> Result<()> {
+        // The library's scan runs on its own thread: the index comes back
+        // here, when the worker is done.
+        self.poll_library();
         let mut commands = Vec::new();
         while let Some(command) = self.command_rx.try_recv()? {
             commands.push(command);
@@ -1449,6 +1460,16 @@ impl App {
     /// A key press. Returns the machine's outcome so the caller can log an
     /// [`ShortcutOutcome::Unhandled`] action with its command id.
     pub fn key_down(&mut self, key: Key, modifiers: Modifiers) -> Result<Option<ShortcutOutcome>> {
+        // `Alt+L` opens the media library. S04 §3.3 gives the `Library` menu
+        // row that accelerator, and S03 binds no other key to `L` with Alt
+        // (`L` is "open file(s)", `Ctrl+L` "open location", `Shift+L` "open
+        // directory"), so the binding is free. The window's own command id
+        // is an own choice: see `crate::library_window`.
+        if key == Key::Letter(b'L') && modifiers == Modifiers::ALT {
+            let command = Command::ToggleWindow(crate::library_window::LIBRARY_WINDOW_ID);
+            self.submit(command.clone())?;
+            return Ok(Some(ShortcutOutcome::Commands(vec![command])));
+        }
         let outcome = self.ui.key_down(key, modifiers, self.now_ms());
         if let Some(ShortcutOutcome::Commands(commands)) = &outcome {
             let commands = commands.clone();
@@ -1841,6 +1862,11 @@ impl App {
             C::ToggleWindow(WindowId::Playlist) => {
                 // The UI machine flipped `playlist_open`; the presenter
                 // creates or drops the playlist editor's OS window to match.
+            }
+            C::ToggleWindow(window) if *window == crate::library_window::LIBRARY_WINDOW_ID => {
+                // The media library: the app owns the index and the view, the
+                // presenter creates or drops the OS window to match.
+                self.toggle_library();
             }
             C::ToggleWindow(window) => {
                 self.note(format!(

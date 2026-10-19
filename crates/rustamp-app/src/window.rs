@@ -78,7 +78,7 @@ use rustamp_platform::{HotkeyAction, init_dpi_awareness, single_instance, take_p
 use rustamp_skin::CursorSlot;
 use rustamp_ui::shell::TaskbarRole;
 use rustamp_ui::{
-    DEFAULT_MAIN_POSITION, DialogKind, Key, Modifiers, ShortcutOutcome,
+    DEFAULT_MAIN_POSITION, DialogKind, Key, LIBRARY_LINE_HEIGHT, Modifiers, ShortcutOutcome,
     docking::{ClassicWindow, DockedStack, WindowKind, WindowPosition},
     menu::menu_popup_origin,
 };
@@ -447,6 +447,19 @@ struct Windowed {
     dialog_id: Option<WindowId>,
     /// Which dialog the OS window above shows (`None` while it is closed).
     dialog_kind: Option<DialogKind>,
+    /// The media library window: a **modern** window (native title bar,
+    /// system font, its own chrome - see `crate::modern_shell`), created and
+    /// dropped to match [`App::library_open`].
+    ///
+    /// It is not one of the classic windows: it is not skinned, it is
+    /// resizable, and it is not part of the docked stack.
+    library_window: Option<Arc<Window>>,
+    library_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// The library window's caption last applied.
+    ///
+    /// The caption carries the scan's progress, so it changes while a scan
+    /// runs; the title is only set when it really changed.
+    applied_library_title: Option<String>,
     /// A native media dialog (the file-open dialog or the shell's folder
     /// dialog) waiting to be shown.
     ///
@@ -469,6 +482,8 @@ struct Windowed {
     left_down: bool,
     eq_left_down: bool,
     playlist_cursor: (i32, i32),
+    /// The media library window's pointer position, in client coordinates.
+    library_cursor: (i32, i32),
     /// The skin's cursors as the operating system knows them, one per slot.
     ///
     /// The cache belongs to one skin load: it is emptied when the app
@@ -522,6 +537,9 @@ impl Windowed {
             dialog_surface: None,
             dialog_id: None,
             dialog_kind: None,
+            library_window: None,
+            library_surface: None,
+            applied_library_title: None,
             pending_media_pick: None,
             pending_prefs: None,
             #[cfg(windows)]
@@ -531,6 +549,7 @@ impl Windowed {
             left_down: false,
             eq_left_down: false,
             playlist_cursor: (0, 0),
+            library_cursor: (0, 0),
             cursors,
             applied_region_skin: None,
             last_playlist_click: None,
@@ -707,6 +726,7 @@ impl Windowed {
             Some(CoreWindowId::Main) => self.window.as_ref(),
             Some(CoreWindowId::Equalizer) => self.eq_window.as_ref(),
             Some(CoreWindowId::Playlist) => self.playlist_window.as_ref(),
+            Some(CoreWindowId::Gen(_)) => self.library_window.as_ref(),
             _ => None,
         };
         if let Some(window) = window {
@@ -1076,6 +1096,12 @@ impl Windowed {
         }
     }
 
+    fn request_library_redraw(&self) {
+        if let Some(window) = &self.library_window {
+            window.request_redraw();
+        }
+    }
+
     fn paint(&mut self) {
         let image = self.app.render();
         let (Some(width), Some(height)) = (
@@ -1132,6 +1158,30 @@ impl Windowed {
             return;
         };
         let Some(surface) = self.playlist_surface.as_mut() else {
+            return;
+        };
+        if surface.resize(width, height).is_err() {
+            return;
+        }
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        for (pixel, rgba) in buffer.iter_mut().zip(image.as_rgba().as_chunks::<4>().0) {
+            *pixel = (u32::from(rgba[0]) << 16) | (u32::from(rgba[1]) << 8) | u32::from(rgba[2]);
+        }
+        let _ = buffer.present();
+    }
+
+    /// Blits the media library frame ([`App::render_library`]) to its surface.
+    fn paint_library(&mut self) {
+        let image = self.app.render_library();
+        let (Some(width), Some(height)) = (
+            NonZeroU32::new(image.width()),
+            NonZeroU32::new(image.height()),
+        ) else {
+            return;
+        };
+        let Some(surface) = self.library_surface.as_mut() else {
             return;
         };
         if surface.resize(width, height).is_err() {
@@ -1567,6 +1617,39 @@ impl Windowed {
         }
     }
 
+    /// Shows the folder dialog the media library asked for.
+    ///
+    /// `Ctrl+O` in the library window asks for a folder to index. The
+    /// request is drained from the tick, never from a window procedure: the
+    /// dialog runs its own modal message loop, exactly like the tray popup.
+    /// A cancelled dialog adds nothing; a chosen folder is registered as a
+    /// root and scanned.
+    fn drain_library_folder_pick(&mut self) {
+        if !self.app.take_library_folder_request() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            match rustamp_platform::pick_directory(
+                self.raw_main_window(),
+                "Add a folder to the media library",
+            ) {
+                Ok(Some(folder)) => {
+                    if let Err(error) = self.app.library_add_folder(folder) {
+                        eprintln!("rustamp: the chosen folder could not be added: {error}");
+                    }
+                }
+                // A cancelled dialog is not an error: nothing is added.
+                Ok(None) => {}
+                Err(error) => eprintln!("rustamp: no folder dialog: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("rustamp: a native folder dialog is only implemented on Windows");
+        }
+    }
+
     /// The main window's raw OS handle, or `0` when it has none yet.
     ///
     /// The one reader for the places that need the window itself rather than
@@ -1612,6 +1695,7 @@ impl Windowed {
         self.paint_eq();
         self.paint_dialog();
         self.paint_playlist();
+        self.paint_library();
     }
 
     /// Applies [`App::window_title`] to the main window when it changed.
@@ -1622,6 +1706,20 @@ impl Windowed {
         {
             window.set_title(&title);
             self.applied_title = Some(title);
+        }
+    }
+
+    /// Applies the library's caption to its window when it changed.
+    ///
+    /// The caption carries the scan's progress, so it changes while a scan
+    /// runs; the title is only set when it really changed.
+    fn sync_library_title(&mut self) {
+        let title = self.app.library_title();
+        if self.applied_library_title.as_deref() != Some(title.as_str())
+            && let Some(window) = &self.library_window
+        {
+            window.set_title(&title);
+            self.applied_library_title = Some(title);
         }
     }
 
@@ -1883,6 +1981,170 @@ impl Windowed {
             _ => return None,
         };
         Some((window.x, window.y))
+    }
+
+    /// Creates or drops the media library's OS window so it matches
+    /// [`App::library_open`].
+    ///
+    /// The library window is a **modern** window: it is not skinned, so it
+    /// is created through [`crate::modern_shell`] and not through the
+    /// classic shell. Its client area follows the window's size, so a
+    /// resize reaches the view (the number of rows it shows) and the page is
+    /// loaded again.
+    fn sync_library_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.app.library_open() {
+            self.open_library_window(event_loop);
+        } else if self.library_window.is_some() {
+            self.library_surface = None;
+            self.library_window = None;
+            self.applied_library_title = None;
+        }
+    }
+
+    /// Creates the media library window.
+    ///
+    /// The attributes come from the modern path
+    /// ([`crate::modern_shell::modern_window_attributes`]): a decorated,
+    /// resizable window without a taskbar entry of its own. The window is
+    /// sized to the client area the app draws in
+    /// ([`App::library_client_size`]).
+    fn open_library_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.library_window.is_some() {
+            return;
+        }
+        let (width, height) = self.app.library_client_size();
+        let title = self.app.library_title();
+        let attributes = crate::modern_shell::modern_window_attributes(
+            &title,
+            (width, height),
+            TaskbarRole::Secondary,
+        );
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                eprintln!("rustamp: could not create the library window: {error}");
+                return;
+            }
+        };
+        let context = match softbuffer::Context::new(Arc::clone(&window)) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("rustamp: could not create the library softbuffer context: {error}");
+                return;
+            }
+        };
+        let mut surface = match softbuffer::Surface::new(&context, Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(error) => {
+                eprintln!("rustamp: could not create the library softbuffer surface: {error}");
+                return;
+            }
+        };
+        if let (Some(width), Some(height)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
+            let _ = surface.resize(width, height);
+        }
+        self.library_window = Some(window);
+        self.library_surface = Some(surface);
+        self.applied_library_title = Some(title);
+        self.request_library_redraw();
+    }
+
+    /// Events for the media library window, in client coordinates.
+    ///
+    /// The input goes to the app's library model ([`crate::library_window`]):
+    /// the pointer picks a row or scrolls, the wheel scrolls, the keyboard
+    /// runs the library's own map, and the typed text goes into the search
+    /// field. Closing the window hides it (the same toggle the menu row and
+    /// `Alt+L` use) and never quits the player.
+    fn library_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                if let Err(error) = self.app.close_library_window() {
+                    eprintln!("rustamp: library close failed: {error}");
+                }
+                self.sync_library_window(event_loop);
+            }
+            WindowEvent::RedrawRequested => self.paint_library(),
+            WindowEvent::Resized(size) => {
+                if let Err(error) = self
+                    .app
+                    .library_resize((size.width.max(1), size.height.max(1)))
+                {
+                    eprintln!("rustamp: the library resize failed: {error}");
+                }
+                self.request_library_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                // A DPI change moves the window to another monitor: the
+                // client area follows it, and the number of rows the view
+                // shows has to follow the client area.
+                if let Some(window) = &self.library_window {
+                    let size = window.inner_size();
+                    if let Err(error) = self
+                        .app
+                        .library_resize((size.width.max(1), size.height.max(1)))
+                    {
+                        eprintln!("rustamp: the library resize failed: {error}");
+                    }
+                }
+                self.request_library_redraw();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.library_cursor = (position.x as i32, position.y as i32);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.library_cursor;
+                if let Err(error) = self.app.library_click(x, y) {
+                    eprintln!("rustamp: library pointer input failed: {error}");
+                }
+                self.request_library_redraw();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let rows = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, lines) => lines as isize,
+                    winit::event::MouseScrollDelta::PixelDelta(pixels) => {
+                        (pixels.y as isize / LIBRARY_LINE_HEIGHT as isize).clamp(-1, 1)
+                    }
+                };
+                if let Err(error) = self.app.library_scroll(-rows) {
+                    eprintln!("rustamp: library scroll failed: {error}");
+                }
+                self.request_library_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } => self.library_key_event(&event),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            _ => {}
+        }
+    }
+
+    /// A key press while the media library window is focused.
+    ///
+    /// The text of the key goes into the search field and the key itself
+    /// runs the library's own map; the map decides what a key means, so the
+    /// text never reaches the list.
+    fn library_key_event(&mut self, event: &KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        if let Some(text) = &event.text
+            && let Err(error) = self.app.library_text(text)
+        {
+            eprintln!("rustamp: the library search failed: {error}");
+        }
+        let Some(key) = map_key(event) else {
+            return;
+        };
+        let modifiers = map_modifiers(self.modifiers);
+        match self.app.library_key_down(key, modifiers) {
+            Ok(commands) if commands.is_empty() => {}
+            Ok(commands) => println!("rustamp: library shortcut {key:?} -> {commands:?}"),
+            Err(error) => eprintln!("rustamp: library shortcut dispatch failed: {error}"),
+        }
+        self.request_library_redraw();
     }
 
     /// Creates or drops the playlist editor's OS window so it matches
@@ -2316,6 +2578,14 @@ impl ApplicationHandler for Windowed {
             self.playlist_event(event_loop, event);
             return;
         }
+        if self
+            .library_window
+            .as_ref()
+            .is_some_and(|window| window.id() == id)
+        {
+            self.library_event(event_loop, event);
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.app.request_quit();
@@ -2479,6 +2749,11 @@ impl ApplicationHandler for Windowed {
         // The playlist editor follows its open flag and, while open, tracks
         // the main window (moves and shade reflow).
         self.sync_playlist_window(event_loop);
+        // The media library follows its open flag; it is a modern window, so
+        // it is not part of the docked stack.
+        self.sync_library_window(event_loop);
+        // Its caption carries the scan's progress.
+        self.sync_library_title();
         self.apply_docking_positions();
         // The frame of this tick, painted here rather than asked for: see
         // [`Windowed::present_frames`].
@@ -2492,6 +2767,7 @@ impl ApplicationHandler for Windowed {
         self.drain_media_pick();
         self.drain_save_playlist();
         self.drain_prefs();
+        self.drain_library_folder_pick();
         // After every window has been synced, so a focus request for a window
         // that opened this frame finds its OS window.
         self.apply_focus_requests();
