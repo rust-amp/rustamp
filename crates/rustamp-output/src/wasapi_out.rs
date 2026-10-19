@@ -1,15 +1,27 @@
-//! WASAPI output in **shared** mode.
+//! WASAPI output, in **shared** or **exclusive** mode.
 //!
 //! Design (see also the report for task card A1):
 //!
-//! * Format: 32-bit float at the requested sample rate and channel count
-//!   (clamped to 1..=2) with `AUTOCONVERTPCM` enabled. Windows' audio engine
-//!   converts to the mix format, so the endpoint always *grants* the requested
-//!   format and the engine never has to resample for WASAPI. That is what
-//!   shared mode is for; exclusive mode is an M4 item.
+//! The mode is chosen by the caller on the device itself
+//! ([`WasapiOutput::with_mode`]); there is one device type and one
+//! [`OutputDevice`] implementation for both modes.
+//!
+//! * Format, shared mode: 32-bit float at the requested sample rate and
+//!   channel count (clamped to 1..=2) with `AUTOCONVERTPCM` enabled. Windows'
+//!   audio engine converts to the mix format, so the endpoint always
+//!   *grants* the requested format and the engine never has to resample for
+//!   WASAPI.
+//! * Format, exclusive mode: the stream is opened on the device itself, so
+//!   the Windows mixer is not involved and the samples reach the hardware
+//!   unconverted. The device's own format is used when it accepts it, and
+//!   the engine converts the source to the device's rate; the samples are
+//!   then written in the device's own representation (16/24/32-bit integer
+//!   or 32-bit float). The period is the device's own, never below the
+//!   device's minimum. The rules and the reasoning are in
+//!   [`crate::wasapi_exclusive`].
 //! * Timing: event driven. A dedicated render thread waits on the audio event,
 //!   pulls one buffer through the engine's [`RenderFn`], converts `f32` to
-//!   little-endian bytes in a preallocated buffer and hands it to
+//!   the device's own bytes in a preallocated buffer and hands it to
 //!   `IAudioRenderClient`. **No allocation, no lock, no I/O, no logging on
 //!   that thread.**
 //! * Threading: the endpoint interfaces are *not* `Send` in `wasapi` 0.26, so
@@ -35,6 +47,23 @@
 //! [`WasapiOutput::with_device_name`] selects one render endpoint by name, like
 //! [`crate::CpalOutput::with_device_name`]; an absent or ambiguous name fails
 //! `open`.
+//!
+//! # Exclusive mode and the downgrade
+//!
+//! A device that refuses the exclusive stream — because another application
+//! holds it, or because it accepts no format the player can produce — is
+//! played in **shared** mode on the *same* endpoint instead. The downgrade
+//! is never silent:
+//!
+//! * [`WasapiOutput::mode_in_use`] reports the mode the stream really runs
+//!   in, and [`OutputDevice::name`] carries it (`"Speakers [wasapi shared]"`),
+//!   so a caller that only holds a `Box<dyn OutputDevice>` sees it too;
+//! * [`WasapiOutput::downgrade_reason`] says why the exclusive stream was
+//!   refused.
+//!
+//! The downgrade is a *mode* change, not a device change: the endpoint is
+//! the one the caller asked for, and the same rule as in shared mode holds —
+//! no backend substitutes a different device behind the caller's back.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -45,13 +74,11 @@ use std::time::Duration;
 use rustamp_core::audio::{AudioSpec, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::error::{Error, Result};
 use wasapi::{
-    AudioClient, Device, DeviceEnumerator, Direction, Handle, SampleType, ShareMode, StreamMode,
-    WaveFormat, initialize_mta,
+    AudioClient, CapabilityProbe, Device, DeviceEnumerator, Direction, Handle, SampleType,
+    ShareMode, StreamMode, WaveFormat, initialize_mta,
 };
 
-/// Channel count requested from WASAPI. More channels are downmixed by the
-/// engine; the mix format is stereo on virtually every endpoint.
-const MAX_CHANNELS: usize = 2;
+use crate::wasapi_exclusive::{DeviceFormat, MAX_CHANNELS, SampleLayout};
 
 /// Requested buffer duration in 100 ns units (200 ms). The audio engine may
 /// shorten it; it only bounds the scratch buffer we preallocate.
@@ -250,14 +277,67 @@ enum Cmd {
 /// Result of the negotiation, sent from the render thread to `open`.
 struct Opened {
     device_name: String,
+    /// The mode the stream was really opened with.
+    mode: WasapiMode,
+    /// Why the exclusive mode was refused, when it was.
+    downgrade: Option<String>,
     outcome: std::result::Result<OutputFormat, String>,
 }
 
-/// WASAPI shared-mode output device (Windows only).
+/// How a WASAPI stream is opened on the endpoint.
+///
+/// The mode is requested by the caller on the device
+/// ([`WasapiOutput::with_mode`]); there is no second device type for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WasapiMode {
+    /// Shared mode: the Windows audio engine owns the endpoint, mixes the
+    /// streams of every application and converts their formats. The default.
+    #[default]
+    Shared,
+    /// Exclusive mode: the stream is opened on the device itself, in the
+    /// device's own format, and the Windows mixer is not involved.
+    ///
+    /// A device that refuses the exclusive stream is played in shared mode
+    /// instead, and the downgrade is reported — see
+    /// [`WasapiOutput::downgrade_reason`].
+    Exclusive,
+}
+
+impl WasapiMode {
+    /// The name of the mode, as it appears in the device name.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Exclusive => "exclusive",
+        }
+    }
+}
+
+/// The name the device reports: the endpoint's name and the mode the stream
+/// runs in.
+///
+/// The mode is part of the name, so a downgrade from exclusive to shared is
+/// visible to a caller that only holds a `Box<dyn OutputDevice>`.
+fn display_name(endpoint: &str, mode: WasapiMode) -> String {
+    format!("{endpoint} [wasapi {}]", mode.label())
+}
+
+/// WASAPI output device, in shared or exclusive mode (Windows only).
 pub struct WasapiOutput {
     spec: Option<AudioSpec>,
     buffer_frames: u32,
+    /// The friendly name of the endpoint, without the mode.
     device_name: String,
+    /// The name reported through [`OutputDevice::name`]: the endpoint's name
+    /// and the mode the stream runs in.
+    display_name: String,
+    /// The mode the caller asked for.
+    mode: WasapiMode,
+    /// The mode the stream really runs in (a refusal downgrades it to
+    /// shared).
+    mode_in_use: WasapiMode,
+    /// Why the exclusive mode was refused, when it was.
+    downgrade: Option<String>,
     /// Endpoint to open instead of the default one (`with_device_name`).
     wanted: Option<String>,
     /// Whether `start` has handed a render callback to the render thread.
@@ -275,17 +355,58 @@ impl Default for WasapiOutput {
 
 impl WasapiOutput {
     /// Not opened yet; call [`OutputDevice::open`].
+    ///
+    /// The stream is opened in shared mode; use [`WasapiOutput::with_mode`]
+    /// to ask for exclusive mode instead.
     pub fn new() -> Self {
         WasapiOutput {
             spec: None,
             buffer_frames: 0,
             device_name: "wasapi".into(),
+            display_name: "wasapi".into(),
+            mode: WasapiMode::Shared,
+            mode_in_use: WasapiMode::Shared,
+            downgrade: None,
             wanted: None,
             started: false,
             shared: Arc::new(Shared::new()),
             tx: None,
             handle: None,
         }
+    }
+
+    /// Ask for the given mode. Chains after any constructor:
+    /// `WasapiOutput::with_device_name("Speakers").with_mode(WasapiMode::Exclusive)`.
+    ///
+    /// Exclusive mode is a *request*, not a guarantee: a device that refuses
+    /// it is played in shared mode, and the downgrade is reported through
+    /// [`WasapiOutput::mode_in_use`] and
+    /// [`WasapiOutput::downgrade_reason`].
+    pub fn with_mode(mut self, mode: WasapiMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// The mode the caller asked for.
+    pub fn requested_mode(&self) -> WasapiMode {
+        self.mode
+    }
+
+    /// The mode the stream really runs in.
+    ///
+    /// It is the requested mode, except when the device refused the
+    /// exclusive stream — then it is [`WasapiMode::Shared`], and
+    /// [`WasapiOutput::downgrade_reason`] says why.
+    pub fn mode_in_use(&self) -> WasapiMode {
+        self.mode_in_use
+    }
+
+    /// Why the exclusive mode was refused, when it was.
+    ///
+    /// `None` in shared mode, and `None` in an exclusive stream that was
+    /// opened as requested.
+    pub fn downgrade_reason(&self) -> Option<&str> {
+        self.downgrade.as_deref()
     }
 
     /// Not opened yet; [`OutputDevice::open`] opens the one render endpoint
@@ -324,7 +445,7 @@ impl WasapiOutput {
 
 impl OutputDevice for WasapiOutput {
     fn name(&self) -> &str {
-        &self.device_name
+        &self.display_name
     }
 
     fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
@@ -346,14 +467,12 @@ impl OutputDevice for WasapiOutput {
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Opened>();
         let shared = Arc::clone(&self.shared);
-        let want = AudioSpec::new(
-            spec.sample_rate,
-            spec.channels.clamp(1, MAX_CHANNELS as u16),
-        );
+        let want = AudioSpec::new(spec.sample_rate, spec.channels.clamp(1, MAX_CHANNELS));
         let wanted = self.wanted.clone();
+        let mode = self.mode;
         let handle = std::thread::Builder::new()
             .name("rustamp-wasapi".into())
-            .spawn(move || render_thread(shared, want, wanted, rx, ready_tx))
+            .spawn(move || render_thread(shared, want, wanted, mode, rx, ready_tx))
             .map_err(|e| Error::Output(format!("wasapi: render thread: {e}")))?;
         let opened = ready_rx
             .recv()
@@ -367,6 +486,9 @@ impl OutputDevice for WasapiOutput {
                 return Err(Error::Output(format!("wasapi: {e}")));
             }
         };
+        self.mode_in_use = opened.mode;
+        self.downgrade = opened.downgrade;
+        self.display_name = display_name(&self.device_name, self.mode_in_use);
         self.spec = Some(format.spec);
         self.buffer_frames = format.buffer_frames;
         self.tx = Some(tx);
@@ -458,12 +580,32 @@ struct Endpoint {
     event: Handle,
     spec: AudioSpec,
     buffer_frames: u32,
+    /// The sample layout the device expects. Shared mode always gets 32-bit
+    /// float (Windows converts it), exclusive mode the device's own layout.
+    layout: SampleLayout,
+    /// Whether the stream is exclusive. An exclusive stream is written one
+    /// whole buffer per event, and its first buffer is filled before the
+    /// stream starts.
+    exclusive: bool,
+}
+
+/// What an endpoint open produced.
+struct OpenedEndpoint {
+    /// The stream that was opened.
+    endpoint: Endpoint,
+    /// The friendly name of the endpoint.
+    name: String,
+    /// The mode the stream really runs in.
+    mode: WasapiMode,
+    /// Why the exclusive mode was refused, when it was.
+    downgrade: Option<String>,
 }
 
 fn open_endpoint(
     want: AudioSpec,
     wanted: Option<&str>,
-) -> std::result::Result<(Endpoint, String), OpenError> {
+    mode: WasapiMode,
+) -> std::result::Result<OpenedEndpoint, OpenError> {
     initialize_mta().ok().map_err(|e| OpenError {
         code: ERR_COM,
         device_name: "the default render endpoint".into(),
@@ -494,9 +636,61 @@ fn open_endpoint(
             (device, name)
         }
     };
+    match mode {
+        WasapiMode::Shared => {
+            let endpoint = open_shared(&device, &enumerator, &name, want)?;
+            Ok(OpenedEndpoint {
+                endpoint,
+                name,
+                mode: WasapiMode::Shared,
+                downgrade: None,
+            })
+        }
+        WasapiMode::Exclusive => match open_exclusive(&device, want) {
+            Ok(endpoint) => Ok(OpenedEndpoint {
+                endpoint,
+                name,
+                mode: WasapiMode::Exclusive,
+                downgrade: None,
+            }),
+            Err(reason) => {
+                // The device refuses the exclusive stream: play it in shared
+                // mode on the same endpoint and report the downgrade. The
+                // endpoint is not changed — only the mode is.
+                let endpoint =
+                    open_shared(&device, &enumerator, &name, want).map_err(|e| OpenError {
+                        code: e.code,
+                        device_name: e.device_name,
+                        message: format!(
+                            "{}; the exclusive stream was refused as well: {reason}",
+                            e.message
+                        ),
+                    })?;
+                Ok(OpenedEndpoint {
+                    endpoint,
+                    name: name.clone(),
+                    mode: WasapiMode::Shared,
+                    downgrade: Some(format!("{name}: {reason}")),
+                })
+            }
+        },
+    }
+}
+
+/// Open the endpoint in shared mode: 32-bit float with the automatic format
+/// conversion of the Windows audio engine.
+///
+/// The engine grants the requested format whatever the device's mix format
+/// is, so the engine never has to resample for WASAPI.
+fn open_shared(
+    device: &Device,
+    enumerator: &DeviceEnumerator,
+    name: &str,
+    want: AudioSpec,
+) -> std::result::Result<Endpoint, OpenError> {
     let mut client = device
         .get_iaudioclient()
-        .map_err(|e| named_open_error(&enumerator, ERR_OPEN, &name, &e.to_string()))?;
+        .map_err(|e| named_open_error(enumerator, ERR_OPEN, name, &e.to_string()))?;
     let format = WaveFormat::new(
         32,
         32,
@@ -511,26 +705,171 @@ fn open_endpoint(
     };
     client
         .initialize_client(&format, &Direction::Render, &mode)
-        .map_err(|e| named_open_error(&enumerator, ERR_OPEN, &name, &e.to_string()))?;
+        .map_err(|e| named_open_error(enumerator, ERR_OPEN, name, &e.to_string()))?;
     let event = client
         .set_get_eventhandle()
-        .map_err(|e| named_open_error(&enumerator, ERR_OPEN, &name, &e.to_string()))?;
+        .map_err(|e| named_open_error(enumerator, ERR_OPEN, name, &e.to_string()))?;
     let render_client = client
         .get_audiorenderclient()
-        .map_err(|e| named_open_error(&enumerator, ERR_CLIENT, &name, &e.to_string()))?;
+        .map_err(|e| named_open_error(enumerator, ERR_CLIENT, name, &e.to_string()))?;
     let buffer_frames = client
         .get_buffer_size()
-        .map_err(|e| named_open_error(&enumerator, ERR_OPEN, &name, &e.to_string()))?;
-    Ok((
-        Endpoint {
-            client,
-            render_client,
-            event,
-            spec: want,
-            buffer_frames,
-        },
-        name,
-    ))
+        .map_err(|e| named_open_error(enumerator, ERR_OPEN, name, &e.to_string()))?;
+    Ok(Endpoint {
+        client,
+        render_client,
+        event,
+        spec: want,
+        buffer_frames,
+        layout: SampleLayout::Float32,
+        exclusive: false,
+    })
+}
+
+/// Open the endpoint in exclusive mode.
+///
+/// The stream is opened on the device itself, in the device's own format
+/// when the device accepts it. The error is the reason why the device
+/// refused the exclusive stream; the caller falls back to shared mode and
+/// reports it.
+fn open_exclusive(device: &Device, want: AudioSpec) -> std::result::Result<Endpoint, String> {
+    let mut client = device
+        .get_iaudioclient()
+        .map_err(|e| format!("the audio client could not be created: {e}"))?;
+    // The device's own format: the mix format of the endpoint.
+    let mix = client
+        .get_mixformat()
+        .map_err(|e| format!("the mix format of the device could not be read: {e}"))?;
+    let native = DeviceFormat::of_wave(&mix).ok_or_else(|| {
+        format!(
+            "the device's own format ({} Hz, {} channels, {}-bit) is one the player cannot produce",
+            mix.get_samplespersec(),
+            mix.get_nchannels(),
+            mix.get_bitspersample()
+        )
+    })?;
+    // The formats the device accepts in exclusive mode.
+    let accepted = accepted_formats(device, &client, &mix, want)?;
+    // The device's periods: the default one, and the smallest it accepts.
+    let (default_period, min_period) = client
+        .get_device_period()
+        .map_err(|e| format!("the device period could not be read: {e}"))?;
+    let formats: Vec<DeviceFormat> = accepted.iter().map(|a| a.format).collect();
+    let plan = crate::wasapi_exclusive::plan(want, native, &formats, default_period, min_period)
+        .ok_or_else(|| "the device accepts no format the player can open exclusively".to_owned())?;
+    // The format the device accepted, with the channel mask it accepted.
+    let wave = accepted
+        .iter()
+        .find(|a| a.format == plan.format)
+        .map(|a| a.wave.clone())
+        .unwrap_or_else(|| wave_format_of(plan.format));
+    client
+        .initialize_client(
+            &wave,
+            &Direction::Render,
+            &StreamMode::EventsExclusive {
+                period_hns: plan.period_hns,
+            },
+        )
+        .map_err(|e| format!("the exclusive stream was refused: {e}"))?;
+    let event = client
+        .set_get_eventhandle()
+        .map_err(|e| format!("the event handle could not be created: {e}"))?;
+    let render_client = client
+        .get_audiorenderclient()
+        .map_err(|e| format!("the render client is not available: {e}"))?;
+    let buffer_frames = client
+        .get_buffer_size()
+        .map_err(|e| format!("the buffer size could not be read: {e}"))?;
+    Ok(Endpoint {
+        client,
+        render_client,
+        event,
+        spec: plan.format.spec(),
+        buffer_frames,
+        layout: plan.format.layout,
+        exclusive: true,
+    })
+}
+
+/// A format the device accepts in exclusive mode.
+struct AcceptedFormat {
+    /// The format to open the stream with, with the channel mask the device
+    /// accepted.
+    wave: WaveFormat,
+    /// The same format as plain data, for the selection.
+    format: DeviceFormat,
+}
+
+/// The formats the device accepts in exclusive mode.
+///
+/// The device's own format is asked about first, and the formats it accepts
+/// at its own rate — with the channel counts the player drives — and at the
+/// source's rate are probed with the capability probe of the `wasapi` crate.
+/// The probe only queries the device, it never initialises a client, so it
+/// does not disturb anything that is playing.
+fn accepted_formats(
+    device: &Device,
+    client: &AudioClient,
+    mix: &WaveFormat,
+    want: AudioSpec,
+) -> std::result::Result<Vec<AcceptedFormat>, String> {
+    let mut accepted: Vec<AcceptedFormat> = Vec::new();
+    if let Ok(wave) = client.is_supported_exclusive_with_quirks(mix) {
+        push_accepted(&mut accepted, wave);
+    }
+    let mut probe = CapabilityProbe::new(device)
+        .map_err(|e| format!("the exclusive capability probe could not be created: {e}"))?;
+    let native_rate = mix.get_samplespersec();
+    // The rate and channel count pairs the device is asked about: its own,
+    // its own rate with the channel counts the player drives, and the
+    // source's own pair.
+    let mut pairs: Vec<(u32, u16)> = vec![(native_rate, mix.get_nchannels())];
+    for channels in 1..=MAX_CHANNELS {
+        pairs.push((native_rate, channels));
+    }
+    pairs.push((want.sample_rate, want.channels));
+    let mut asked: Vec<(u32, u16)> = Vec::new();
+    for (rate, channels) in pairs {
+        if channels == 0 || asked.contains(&(rate, channels)) {
+            continue;
+        }
+        asked.push((rate, channels));
+        for wave in probe.supported_formats(rate as usize, channels as usize) {
+            push_accepted(&mut accepted, wave);
+        }
+    }
+    Ok(accepted)
+}
+
+/// Add a format the device accepted, unless it is already known.
+fn push_accepted(accepted: &mut Vec<AcceptedFormat>, wave: WaveFormat) {
+    let Some(format) = DeviceFormat::of_wave(&wave) else {
+        return;
+    };
+    if accepted.iter().any(|a| a.format == format) {
+        return;
+    }
+    accepted.push(AcceptedFormat { wave, format });
+}
+
+/// The WASAPI format of a device format.
+fn wave_format_of(format: DeviceFormat) -> WaveFormat {
+    let (store_bits, valid_bits, sample_type) = match format.layout {
+        SampleLayout::Float32 => (32, 32, SampleType::Float),
+        SampleLayout::Int16 => (16, 16, SampleType::Int),
+        SampleLayout::Int24Packed => (24, 24, SampleType::Int),
+        SampleLayout::Int24Padded => (32, 24, SampleType::Int),
+        SampleLayout::Int32 => (32, 32, SampleType::Int),
+    };
+    WaveFormat::new(
+        store_bits,
+        valid_bits,
+        &sample_type,
+        format.sample_rate as usize,
+        format.channels as usize,
+        None,
+    )
 }
 
 /// The audio thread: negotiate the endpoint, then render until `quit`.
@@ -538,30 +877,35 @@ fn render_thread(
     shared: Arc<Shared>,
     want: AudioSpec,
     wanted: Option<String>,
+    mode: WasapiMode,
     rx: Receiver<Cmd>,
     ready: Sender<Opened>,
 ) {
-    match open_endpoint(want, wanted.as_deref()) {
-        Ok((endpoint, name)) => {
+    match open_endpoint(want, wanted.as_deref(), mode) {
+        Ok(opened) => {
             let format = OutputFormat {
-                spec: endpoint.spec,
-                buffer_frames: endpoint.buffer_frames,
+                spec: opened.endpoint.spec,
+                buffer_frames: opened.endpoint.buffer_frames,
             };
             if ready
                 .send(Opened {
-                    device_name: name,
+                    device_name: opened.name,
+                    mode: opened.mode,
+                    downgrade: opened.downgrade,
                     outcome: Ok(format),
                 })
                 .is_err()
             {
                 return;
             }
-            render_loop(shared, endpoint, rx);
+            render_loop(shared, opened.endpoint, rx);
         }
         Err(e) => {
             shared.error.store(e.code, Ordering::Release);
             let _ = ready.send(Opened {
                 device_name: e.device_name,
+                mode,
+                downgrade: None,
                 outcome: Err(e.message),
             });
         }
@@ -588,16 +932,19 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
         event,
         spec,
         buffer_frames,
+        layout,
+        exclusive,
     } = endpoint;
     let channels = usize::from(spec.channels);
     let mut samples: Vec<f32> = vec![0.0; buffer_frames as usize * channels];
-    let mut bytes: Vec<u8> = vec![0u8; samples.len() * 4];
+    let mut bytes: Vec<u8> = vec![0u8; samples.len() * layout.bytes_per_sample()];
     let mut failures = FailureStreak::new(MAX_CONSECUTIVE_FAILURES);
 
-    // The event only fires once the stream runs, so start it before waiting and
-    // fill the first buffer, as the Core Audio documentation asks.
-    let mut streaming = client.start_stream().is_ok();
-    if streaming {
+    // An exclusive stream is written one whole buffer per event, and its
+    // first buffer is filled *before* the stream starts, so the device never
+    // plays an empty one. A shared stream is started first and filled with
+    // whatever the engine has room for.
+    if exclusive {
         write_available(
             &client,
             &render_client,
@@ -608,8 +955,31 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
             &mut failures,
             buffer_frames,
             channels,
+            layout,
         );
     }
+    // The event only fires once the stream runs, so start it before waiting and
+    // fill the first buffer, as the Core Audio documentation asks.
+    let mut streaming = client.start_stream().is_ok();
+    if streaming && !exclusive {
+        write_available(
+            &client,
+            &render_client,
+            &mut render,
+            &mut samples,
+            &mut bytes,
+            &shared,
+            &mut failures,
+            buffer_frames,
+            channels,
+            layout,
+        );
+    }
+    // The device's buffer was emptied by a reset and holds no audio yet.
+    // The next buffer is then written right away: waiting for the event
+    // would wait for the device to ask for data, and a device with an empty
+    // buffer does not necessarily ask before it is given something.
+    let mut buffer_emptied = false;
     while !shared.quit.load(Ordering::Acquire) {
         if shared.paused.load(Ordering::Acquire) {
             if streaming {
@@ -620,6 +990,7 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
                 // Drop what the device still holds (seek / stop).
                 // Reset requires the stream to be stopped.
                 let _ = client.reset_stream();
+                buffer_emptied = true;
             }
             let _ = event.wait_for_event(EVENT_TIMEOUT_MS);
             continue;
@@ -628,6 +999,7 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
             if shared.flush.swap(false, Ordering::AcqRel) {
                 // Reset requires the stream to be stopped.
                 let _ = client.reset_stream();
+                buffer_emptied = true;
             }
             match client.start_stream() {
                 Ok(()) => {
@@ -646,6 +1018,22 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
                     continue;
                 }
             }
+        }
+        if buffer_emptied {
+            buffer_emptied = false;
+            write_available(
+                &client,
+                &render_client,
+                &mut render,
+                &mut samples,
+                &mut bytes,
+                &shared,
+                &mut failures,
+                buffer_frames,
+                channels,
+                layout,
+            );
+            continue;
         }
         match event.wait_for_event(EVENT_TIMEOUT_MS) {
             Ok(()) => {}
@@ -677,6 +1065,8 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
             } else {
                 let _ = client.reset_stream();
             }
+            // The buffer is empty now, and the write below fills it right
+            // away — no event is needed for that.
         }
         write_available(
             &client,
@@ -688,6 +1078,7 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
             &mut failures,
             buffer_frames,
             channels,
+            layout,
         );
     }
     if streaming {
@@ -696,6 +1087,10 @@ fn render_loop(shared: Arc<Shared>, endpoint: Endpoint, rx: Receiver<Cmd>) {
 }
 
 /// Pull the free part of the device buffer through `render` and hand it over.
+///
+/// In shared mode the free part is what the engine has room for. In
+/// exclusive mode the device takes one whole buffer per event, and the
+/// buffer is written in the device's own sample layout.
 #[allow(clippy::too_many_arguments)]
 fn write_available(
     client: &AudioClient,
@@ -707,6 +1102,7 @@ fn write_available(
     failures: &mut FailureStreak,
     buffer_frames: u32,
     channels: usize,
+    layout: SampleLayout,
 ) {
     let available = match client.get_available_space_in_frames() {
         Ok(n) => {
@@ -727,16 +1123,10 @@ fn write_available(
     }
     let n = available * channels;
     render(&mut samples[..n]);
-    for (dst, src) in bytes[..n * 4]
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(samples[..n].iter())
-    {
-        dst.copy_from_slice(&src.to_le_bytes());
-    }
+    let width = layout.bytes_per_sample();
+    crate::wasapi_exclusive::write_samples(&samples[..n], layout, &mut bytes[..n * width]);
     if render_client
-        .write_to_device(available, &bytes[..n * 4], None)
+        .write_to_device(available, &bytes[..n * width], None)
         .is_err()
     {
         fail(shared, ERR_WRITE);
@@ -860,5 +1250,39 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("wasapi"), "{msg}");
         assert!(msg.contains("device"), "{msg}");
+    }
+
+    #[test]
+    fn the_default_mode_is_shared() {
+        let out = WasapiOutput::new();
+        assert_eq!(out.requested_mode(), WasapiMode::Shared);
+        assert_eq!(out.mode_in_use(), WasapiMode::Shared);
+        assert_eq!(out.downgrade_reason(), None);
+    }
+
+    #[test]
+    fn the_exclusive_mode_is_a_request_on_the_device() {
+        let out = WasapiOutput::new().with_mode(WasapiMode::Exclusive);
+        assert_eq!(out.requested_mode(), WasapiMode::Exclusive);
+    }
+
+    #[test]
+    fn the_mode_survives_the_device_name_selection() {
+        let out = WasapiOutput::with_device_name("Speakers").with_mode(WasapiMode::Exclusive);
+        assert_eq!(out.requested_mode(), WasapiMode::Exclusive);
+    }
+
+    #[test]
+    fn the_device_name_carries_the_mode_in_use() {
+        // The mode is part of the name, so a downgrade from exclusive to
+        // shared is visible to a caller that only holds the trait object.
+        assert_eq!(
+            display_name("Speakers (Realtek)", WasapiMode::Shared),
+            "Speakers (Realtek) [wasapi shared]"
+        );
+        assert_eq!(
+            display_name("Speakers (Realtek)", WasapiMode::Exclusive),
+            "Speakers (Realtek) [wasapi exclusive]"
+        );
     }
 }
