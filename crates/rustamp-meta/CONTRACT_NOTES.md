@@ -209,6 +209,46 @@ pictures that are *inside* the file and nothing else.
   format's primary tag type but has a secondary one (an MP3 with only an
   ID3v1 tag gets an ID3v2 tag, the ID3v1 tag stays).
 
+## Album grouping (album values)
+
+An album value is a property of a *group* of files, not of one file. The
+`album` module draws that group and computes the two album values from it.
+
+- **The grouping key** (`album::album_key`, `album::AlbumKey`): a track
+  **with** an album tag is keyed by the album title and the *effective
+  album artist* — the `album_artist` tag, or, when that tag is missing, the
+  `artist` tag. Both are trimmed and lower-cased, so `"Abbey Road"` and
+  `"abbey road "` are one album and a differently cased album artist does
+  not split an album. A track **without** an album tag is **its own
+  album**, keyed by its path: nothing says two untagged files belong
+  together, and merging them would give one of them the wrong album gain.
+- **The fallback is per track.** A track that names the album artist and a
+  track that names only the artist land in the same album when that artist
+  *is* the album artist; a track whose artist differs from the album's
+  artist starts its own group instead of dragging the album's gain onto
+  it. This is a deliberate own choice: it keeps the grouping predictable
+  from the tags alone and never merges two albums that merely share a
+  title.
+- **The album gain** is the negative of the 95th percentile of the pooled
+  per-block loudness values of the album's tracks, clamped to ±51 dB — the
+  track rule applied to the album as a whole, not an average of the track
+  gains. The blocks are pooled through their loudness histograms
+  (`replaygain::album_gain_from_histograms`), so the percentile is resolved
+  on the histogram's 0.01 dB grid and can differ from the exact percentile
+  by at most 0.005 dB. A one-track album therefore reproduces that
+  track's gain to within one bin.
+- **The album peak** is the largest track peak of the album.
+- **Silence.** An album whose blocks all sit at or below -99 dB measures as
+  the neutral 0.0 dB, not as the saturated +51 dB: a silent album must not
+  ask for a huge boost. (The *track* rule is stricter — exact zero samples
+  — so a track that is merely very quiet still asks for the clamped +51 dB.
+  That difference is inherited from the track estimator and is unchanged.)
+- **The grouping is pure.** It reads no file and touches no audio: the
+  caller reads the tags, analyzes the audio and hands the result in
+  (`album::AnalyzedTrack`). Writing the values back is the caller's job
+  (`replaygain::write_replaygain`); the crate does not scan and does not
+  write on its own.
+
 ## Audit (card E4 — ReplayGain)
 
 - **MP4 loss fixed.** `extra` used to be written through
