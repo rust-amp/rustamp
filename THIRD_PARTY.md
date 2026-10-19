@@ -117,6 +117,7 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `embed-manifest` | Build-time: embeds the Windows application manifest (Common Controls 6 for the native preferences dialog) | app (build script) |
 | `symphonia` | Audio decoding/demuxing | decoders; MPL-2.0, not permissive |
 | `hound` | WAV test fixtures | decoders (dev) |
+| `rusqlite` | SQLite-backed media library index | library |
 
 Consumer names omit the `rustamp-` prefix, except `xtask`. Other entries below
 are transitives supporting these dependencies, including non-Windows targets,
@@ -125,7 +126,7 @@ is not in this lockfile and is deliberately not recorded as already used.
 
 ## Complete Cargo.lock license inventory
 
-Snapshot: 2026-10-17, **289 external package versions**, all from crates.io.
+Snapshot: 2026-10-19, **310 external package versions**, all from crates.io.
 `Cargo.lock` records names/versions/sources/checksums, **not licenses**; licenses
 below are the exact cached package-manifest declarations returned by
 `cargo metadata --offline --locked --all-features --format-version 1`.
@@ -210,6 +211,8 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `equivalent` | `1.0.3` | `Apache-2.0 OR MIT` | `crates.io` |
 | `errno` | `0.3.14` | `MIT OR Apache-2.0` | `crates.io` |
 | `extended` | `0.1.0` | `MIT` | `crates.io` |
+| `fallible-iterator` | `0.3.0` | `MIT/Apache-2.0` | `crates.io` |
+| `fallible-streaming-iterator` | `0.1.9` | `MIT/Apache-2.0` | `crates.io` |
 | `fastrand` | `2.5.0` | `Apache-2.0 OR MIT` | `crates.io` |
 | `fdeflate` | `0.3.7` | `MIT OR Apache-2.0` | `crates.io` |
 | `find-msvc-tools` | `0.1.14` | `MIT OR Apache-2.0` | `crates.io` |
@@ -224,7 +227,9 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `getrandom` | `0.3.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `getrandom` | `0.4.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `hash32` | `0.2.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `hashbrown` | `0.14.5` | `MIT OR Apache-2.0` | `crates.io` |
 | `hashbrown` | `0.17.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `hashlink` | `0.9.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `heapless` | `0.7.17` | `MIT OR Apache-2.0` | `crates.io` |
 | `hermit-abi` | `0.5.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `hound` | `3.5.1` | `Apache-2.0` | `crates.io` |
@@ -240,6 +245,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `libc` | `0.2.190` | `MIT OR Apache-2.0` | `crates.io` |
 | `libloading` | `0.8.9` | `ISC` | `crates.io` |
 | `libredox` | `0.1.25` | `MIT` | `crates.io` |
+| `libsqlite3-sys` | `0.30.1` | `MIT` | `crates.io` |
 | `linux-raw-sys` | `0.12.1` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `linux-raw-sys` | `0.4.15` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `linux-raw-sys` | `0.9.4` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
@@ -318,6 +324,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `redox_syscall` | `0.9.4` | `MIT` | `crates.io` |
 | `rtrb` | `0.4.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `rubato` | `5.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `rusqlite` | `0.32.1` | `MIT` | `crates.io` |
 | `rustc_version` | `0.4.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `rustfft` | `6.4.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `rustix` | `0.38.44` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
@@ -385,6 +392,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `typed-path` | `0.12.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `unicode-ident` | `1.0.27` | `(MIT OR Apache-2.0) AND Unicode-3.0` | `crates.io` |
 | `unicode-segmentation` | `1.13.3` | `MIT OR Apache-2.0` | `crates.io` |
+| `vcpkg` | `0.2.15` | `MIT/Apache-2.0` | `crates.io` |
 | `version_check` | `0.9.5` | `MIT/Apache-2.0` | `crates.io` |
 | `visibility` | `0.1.1` | `Zlib OR MIT OR Apache-2.0` | `crates.io` |
 | `walkdir` | `2.5.0` | `Unlicense/MIT` | `crates.io` |
