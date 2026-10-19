@@ -304,7 +304,10 @@ next to the test binaries and reports the fixture's state on every run.
 * **No wire-level "configure plugin N".** The protocol has no such message
   (S10/RFC 0006), so routing a user-equivalent Configure request from the app
   needs an RFC and the contract lane. `PluginRegistry::config` is ready for it
-  in process.
+  in process. Follow-up: [RFC 0020](../rfc/0020-configure-plugin.md) (Draft,
+  2026-10-19) proposes the generic `Command::ConfigurePlugin { plugin_id,
+  kind }` for exactly this gap. It is not accepted, it changes no code and it
+  bumps no version.
 * **No app side.** `rustamp-app` still never sends `LoadPlugin` nor reads the
   host's stdout; that is `rustamp-app`'s path.
 * **No reference cross-check, no 2.95 comparison, no captures.**
