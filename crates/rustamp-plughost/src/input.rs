@@ -24,12 +24,15 @@
 //!   (S09 §3.6, §3.7). What the host drives is the plugin's *lifecycle* —
 //!   `play`, `pause`, `unpause`, `stop` — and its state answers.
 //! * **It does not select an output plugin.** `out_module` (S09 §3.1 offset
-//!   0x94) stays empty: the selection is the `config_outname` setting, which
-//!   is S12's business, and a plugin with flag bit 0 clear (S09 §3.3) drives
-//!   no output anyway.
+//!   0x94) stays empty here: the selection is the `config_outname` setting,
+//!   which is S12's business, and a plugin with flag bit 0 clear (S09 §3.3)
+//!   drives no output anyway. The hand-over itself — writing the selected
+//!   output into that member before `play` — lives in [`crate::handoff`] and
+//!   is driven by [`crate::registry::PluginRegistry::play_input`].
 //! * **It does not forward volume, pan, seek or the equalizer.** The host
 //!   has no path from the player's state to a classic plugin yet, so those
-//!   slots stay untouched.
+//!   slots stay untouched. The player's levels reach the *output* plugin
+//!   through the hand-over (S09 §3.5 step 2), not through these slots.
 //!
 //! Licensed `MIT OR Apache-2.0` (RFC 0004).
 
@@ -117,8 +120,9 @@ pub struct InModuleInfo {
     /// The host filled `set_info` (S09 §3.1 offset 0x90). It is set **after**
     /// `init` returned (S09 §3.5 line 155), so it is filled here.
     pub has_set_info: bool,
-    /// The host filled `out_module` (S09 §3.1 offset 0x94). No output plugin
-    /// is selected yet, so it stays empty.
+    /// The host filled `out_module` (S09 §3.1 offset 0x94). It stays empty
+    /// until the hand-over before `play` writes the selected output plugin
+    /// into it (S09 §3.5 step 2, §3.7); see [`crate::handoff`].
     pub has_out_module: bool,
     /// `main_window` as filled by the host before `init` (S09 §3.1 offset
     /// 0x08).

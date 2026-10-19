@@ -52,6 +52,7 @@ use rustamp_ipc::Message;
 use rustamp_plugin_abi::PluginKind;
 
 use crate::approval::ApprovalStore;
+use crate::handoff::HandoffError;
 use crate::host_window::HostWindow;
 use crate::loader::{LoadedPlugin, PluginConfigError, load_plugin_with_store};
 
@@ -76,6 +77,12 @@ pub struct PluginRegistry {
     approvals: Approvals,
     loaded: Vec<LoadedEntry>,
     next_id: u32,
+    /// The output plugin the host hands to input plugins (S09 §3.5 step 2).
+    ///
+    /// `None` until a caller selects one: the selection by the
+    /// `config_outname` setting is S12's business, and this host has no stock
+    /// outputs to fall back to (S09 §3.5 step 2).
+    selected_output: Option<u32>,
 }
 
 /// Why a configuration request did not reach a plugin.
@@ -147,6 +154,7 @@ impl PluginRegistry {
             approvals: Approvals::Store(store),
             loaded: Vec::new(),
             next_id: 1,
+            selected_output: None,
         }
     }
 
@@ -156,6 +164,7 @@ impl PluginRegistry {
             approvals: Approvals::Unavailable(reason.into()),
             loaded: Vec::new(),
             next_id: 1,
+            selected_output: None,
         }
     }
 
@@ -314,6 +323,113 @@ impl PluginRegistry {
         entry.plugin.config().map_err(RegistryConfigError::Plugin)
     }
 
+    /// Select the output plugin the host hands to input plugins (S09 §3.5 step 2).
+    ///
+    /// S09 names the selection by the `config_outname` setting — the output
+    /// plug-in's **file name** — and falls back to the DirectSound and then
+    /// the waveOut output when that one is unavailable. The setting does not
+    /// exist yet (S12 owns it) and this host has no stock outputs, so the
+    /// selection is made by the id the host assigned the loaded plug-in. *Which*
+    /// plug-in that is stays the caller's decision; this host only remembers
+    /// it and hands it to the input plugins.
+    ///
+    /// A plug-in of another kind is refused: only an output plugin can be the
+    /// `out_module` of an input plugin (S09 §3.1 offset 0x94, §4.1).
+    pub fn select_output(&mut self, plugin_id: u32) -> Result<(), HandoffError> {
+        let entry = self
+            .loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or(HandoffError::UnknownPlugin(plugin_id))?;
+        let actual = entry.plugin.kind();
+        if actual != PluginKind::Output {
+            return Err(HandoffError::WrongKind {
+                expected: PluginKind::Output,
+                actual,
+            });
+        }
+        self.selected_output = Some(plugin_id);
+        Ok(())
+    }
+
+    /// The id of the selected output plugin, if one is selected.
+    pub fn selected_output(&self) -> Option<u32> {
+        self.selected_output
+    }
+
+    /// Play a file through an input plugin, handing it the selected output
+    /// plugin first (S09 §3.5 steps 2–3, §3.7).
+    ///
+    /// The hand-over happens **before** `play`: the output module pointer goes
+    /// into the input module's `out_module` member (S09 §3.1 offset 0x94) and
+    /// the host's volume and pan are applied to the output (S09 §3.5 step 2).
+    /// The input plugin then drives the output itself — `open`, `write`,
+    /// `can_write`, `is_playing`, `close` (S09 §3.5 steps 3–5, §3.7).
+    ///
+    /// A plugin that does not route its audio through an output plugin (flag
+    /// bit 0 clear, S09 §3.3) is handed nothing: it supplies its own volume,
+    /// pan and timekeeping (S09 §3.7).
+    ///
+    /// `volume` is `0..=255` and `pan` the player's balance, which the host
+    /// passes on unchanged.
+    #[cfg(any(windows, test))]
+    pub fn play_input(
+        &self,
+        plugin_id: u32,
+        path: &Path,
+        volume: u8,
+        pan: i8,
+    ) -> Result<(), HandoffError> {
+        let entry = self
+            .loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or(HandoffError::UnknownPlugin(plugin_id))?;
+        let actual = entry.plugin.kind();
+        if actual != PluginKind::Input {
+            return Err(HandoffError::WrongKind {
+                expected: PluginKind::Input,
+                actual,
+            });
+        }
+        if !entry.plugin.is_initialized() {
+            return Err(HandoffError::NotInitialized);
+        }
+        let input = entry
+            .plugin
+            .input_module_ptr()
+            .ok_or(HandoffError::NullModule)?;
+        // S09 §3.5 step 2: the output is handed over only to a plugin that
+        // routes its audio through one (flag bit 0, S09 §3.3).
+        // SAFETY: live module in the plugin's static data.
+        let uses_output = unsafe { crate::handoff::uses_output_plugin(&*input) };
+        if uses_output {
+            let output_id = self.selected_output.ok_or(HandoffError::NoOutputSelected)?;
+            let output_entry = self
+                .loaded
+                .iter()
+                .find(|entry| entry.id == output_id)
+                .ok_or(HandoffError::UnknownPlugin(output_id))?;
+            let output = output_entry
+                .plugin
+                .output_module_ptr()
+                .ok_or(HandoffError::NullModule)?;
+            // SAFETY: both pointers are live modules in the mapped plugins'
+            // static data (S09 §0).
+            unsafe { crate::handoff::hand_off_output(input, output, volume, pan)? };
+        }
+        entry.plugin.input_play(path).map_err(|error| match error {
+            crate::input::InputError::PlayRefused(code) => HandoffError::PlayRefused(code),
+            crate::input::InputError::NotInitialized => HandoffError::NotInitialized,
+            crate::input::InputError::NullModule => HandoffError::NullModule,
+            crate::input::InputError::MissingCallback(name) => HandoffError::MissingCallback(name),
+            crate::input::InputError::WrongKind(actual) => HandoffError::WrongKind {
+                expected: PluginKind::Input,
+                actual,
+            },
+        })
+    }
+
     /// What the plugin with this id reports about itself, if it is a general
     /// plugin ([`LoadedPlugin::general_info`]).
     pub fn general_info(&self, plugin_id: u32) -> Option<crate::loader::GeneralModuleInfo> {
@@ -341,7 +457,7 @@ impl PluginRegistry {
     /// Take ownership of a plugin that was loaded elsewhere, for tests of the
     /// registry's ordering and dispatch that must not map a DLL.
     #[cfg(test)]
-    fn insert_for_test(&mut self, plugin: LoadedPlugin) -> u32 {
+    pub(crate) fn insert_for_test(&mut self, plugin: LoadedPlugin) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         self.loaded.push(LoadedEntry { id, plugin });
