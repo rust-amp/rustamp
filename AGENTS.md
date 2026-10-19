@@ -19,6 +19,14 @@ Read these first, in this order:
   baseline is **committed** — a worktree is cut from a commit, so uncommitted
   work in the canonical tree is invisible to every worktree.
 
+- **Garbage output → restart the task on a stronger model** (owner rule, 2026-10-19).
+  When a lane reports success but the diff is speculative — invented APIs, alias
+  functions/types that all do the same thing, dead code nothing calls — the work
+  is **rejected, not merged**. Reset the worktree to `main` and relaunch the same
+  task on a stronger model (e.g. `openai/gpt-6.1-sol#high`) with the failed
+  attempt named in the prompt so it is not repeated. A lane that "passes clippy"
+  while adding only names is a failed lane.
+
 - **Tests always run in the interactive session** (owner rule, 2026-10-18).
   The guest's session 0 has no desktop, so anything that opens a window, a
   dialog, a menu or a plugin host fails there for the wrong reason. Run the
