@@ -20,6 +20,11 @@
 //!   ends with `Ok(0)` as before. The rule is limited to the containers that
 //!   state their payload exactly (RIFF/WAVE, AIFF, and MPEG audio with a
 //!   Xing/Info header); see [`declared_payload`].
+//! * **FLAC has no such oracle** (a named limit, see `CONTRACT_NOTES.md`):
+//!   its `STREAMINFO` block states the number of samples exactly, but the
+//!   format states no byte count anywhere, and a damaged FLAC frame is
+//!   dropped by the reader - so a corrupt file is short of samples exactly
+//!   like a cut one. A truncated FLAC file still ends with an end of stream.
 //! * Corrupt packets are skipped; see [`SymphoniaDecoder::skipped_packets`].
 //! * Hostile input (truncated, empty, lying headers, noise) is rejected with a
 //!   defined error or degraded to a defined end of stream; the loop in
@@ -275,8 +280,20 @@ struct ByteClaim {
 /// the file states is the one to compare with.
 ///
 /// Every other container this crate reads either estimates the count (MPEG
-/// audio without a Xing/Info tag, MP4) or can lose frames to damage without
-/// losing any (FLAC), so their count is no evidence of a cut file.
+/// Every other container this crate reads either estimates the count (MPEG
+/// audio without a Xing/Info tag, MP4), counts it differently from what it
+/// delivers (the AIFF reader includes the `SSND` header in its frame count)
+/// or can lose frames to damage without losing any (FLAC), so their count is
+/// no evidence of a cut file.
+///
+/// FLAC is the case worth spelling out: its `STREAMINFO` block states the
+/// number of samples exactly, and the reader takes its frame count from that
+/// block, so the two agree without a correction. What the format does not
+/// state is a byte count, and a damaged FLAC frame is dropped by the reader
+/// (its CRC-16 does not match) while the reader resynchronises at the next
+/// frame - so a corrupt file is short of samples exactly like a cut one,
+/// while it holds all of its bytes. Without the byte count the two cannot be
+/// told apart, so FLAC has no oracle at all.
 #[derive(Debug, Clone, Copy)]
 struct Declared {
     /// The number of frames the container declares the file holds.
