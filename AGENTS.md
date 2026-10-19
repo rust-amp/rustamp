@@ -29,9 +29,14 @@ Read these first, in this order:
   stops has not finished; the orchestrator grants it the minimal extra scope to
   make the workspace build. The done criterion is `cargo clippy --workspace` and
   `cargo test --workspace` green, not the lane's own crate.
-  **After every merge, the orchestrator runs `cargo check --workspace` itself** —
+  **After every merge, the orchestrator runs `cargo check --workspace --all-targets --all-features` itself** —
   a lane that only ran its own crate's tests can still leave a caller broken, and
   the breakage then surfaces at the *next* merge, far from its cause.
+  **`--all-targets` is not optional:** without it the check does not build the
+  test and example targets, which is exactly where a consumer is most likely to
+  be left behind. A green merge with a test target that cannot compile is a
+  false green; it happened when a signature grew a parameter and three test call
+  sites kept the old argument list.
 
 - **Garbage output → restart the task on a stronger model** (owner rule, 2026-10-19).
   When a lane reports success but the diff is speculative — invented APIs, alias
