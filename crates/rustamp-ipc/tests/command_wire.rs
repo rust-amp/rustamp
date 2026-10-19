@@ -311,6 +311,16 @@ fn the_clutter_menu_commands_are_appended_after_open_playlist() {
 }
 
 #[test]
+fn save_playlist_is_appended_after_the_clutter_menus() {
+    // RFC 0017: `SavePlaylist` is index 59 (0x3b), after the clutter-bar menu
+    // commands (0x39, 0x3a), so no earlier byte string moves.
+    let command = Command::SavePlaylist("list.m3u".into());
+    let bytes = encode(&command);
+    assert_eq!(bytes[0], 0x3b);
+    assert_eq!(decode(&bytes), command);
+}
+
+#[test]
 fn every_new_variant_round_trips() {
     let commands = [
         Command::SkipBy { delta: -3 },

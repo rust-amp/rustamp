@@ -277,4 +277,8 @@ pub enum Command {
     /// Open the visualization menu (clutter-bar letter V, S02 §2, S04 §5).
     /// RFC 0016.
     OpenVisualizationMenu,
+    /// Write the current playlist to the given file. The format follows the
+    /// extension (`.m3u`, `.m3u8`, `.pls`, `.xspf`); any other extension is
+    /// refused. S03 records command id 40204 for it. RFC 0017.
+    SavePlaylist(PathBuf),
 }

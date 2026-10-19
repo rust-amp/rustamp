@@ -155,7 +155,8 @@ impl DialogKind {
         match self {
             DialogKind::About => ABOUT_CLIENT_SIZE,
             DialogKind::FileInfo => FILE_INFO_CLIENT_SIZE,
-            DialogKind::Jump(_) => JUMP_CLIENT_SIZE,
+            DialogKind::Jump(JumpTarget::Time) => JUMP_CLIENT_SIZE,
+            DialogKind::Jump(JumpTarget::File) => JUMP_FILE_CLIENT_SIZE,
             DialogKind::LoadPlaylist => LOAD_PLAYLIST_CLIENT_SIZE,
             DialogKind::OpenMedia { .. } => OPEN_MEDIA_CLIENT_SIZE,
             DialogKind::SkinBrowser => SKIN_BROWSER_CLIENT_SIZE,
@@ -168,8 +169,15 @@ impl DialogKind {
 pub const ABOUT_CLIENT_SIZE: (u32, u32) = (260, 110);
 /// Client size of the file-info box. Own choice (see the module docs).
 pub const FILE_INFO_CLIENT_SIZE: (u32, u32) = (300, 140);
-/// Client size of either jump box. Own choice (see the module docs).
+/// Client size of the jump-to-time box. Own choice (see the module docs).
 pub const JUMP_CLIENT_SIZE: (u32, u32) = (220, 90);
+/// Client size of the jump-to-file box: a search field plus
+/// [`JUMP_FILE_ROWS`] result rows. Own choice (see the module docs).
+pub const JUMP_FILE_CLIENT_SIZE: (u32, u32) = (300, 190);
+/// How many result rows the jump-to-file box shows at once.
+pub const JUMP_FILE_ROWS: usize = 10;
+/// The longest search text the jump-to-file box keeps.
+pub const MAX_JUMP_FILE_LEN: usize = 40;
 /// Client size of the load-playlist dialog. Own choice (see the module docs).
 pub const LOAD_PLAYLIST_CLIENT_SIZE: (u32, u32) = (300, 100);
 /// Client size of each open-media dialog. Own choice: the same box shape as
@@ -356,6 +364,10 @@ pub struct DialogManager {
     /// appear to do nothing for several presses. Zero means "not told" and the
     /// moves stay unbounded, which is what the read-side clamp then handles.
     skin_rows: usize,
+    /// The jump-to-file box's selected result row, and how many rows the app
+    /// last reported (the same bounded-move scheme as the skin browser).
+    jump_index: usize,
+    jump_rows: usize,
     /// The open-media dialog's entry field (typed path or URL text).
     media_text: String,
     /// The open-media dialog's staged picks (the stand-in for the OS picker's
@@ -381,6 +393,7 @@ impl DialogManager {
     pub fn open(&mut self, dialog: DialogKind) {
         self.open = Some(dialog);
         self.jump_text.clear();
+        self.jump_index = 0;
         self.skin_index = 0;
         self.media_text.clear();
         self.media_paths.clear();
@@ -393,6 +406,7 @@ impl DialogManager {
         if self.open == Some(dialog) {
             self.open = None;
             self.jump_text.clear();
+            self.jump_index = 0;
             self.skin_index = 0;
             self.media_text.clear();
             self.media_paths.clear();
@@ -405,6 +419,7 @@ impl DialogManager {
     pub fn close_any(&mut self) {
         self.open = None;
         self.jump_text.clear();
+        self.jump_index = 0;
         self.skin_index = 0;
         self.media_text.clear();
         self.media_paths.clear();
@@ -427,9 +442,48 @@ impl DialogManager {
         &self.jump_text
     }
 
-    /// Replaces the jump input (clamped to [`MAX_JUMP_LEN`] characters).
+    /// Replaces the jump input (clamped to [`MAX_JUMP_LEN`] characters, or
+    /// [`MAX_JUMP_FILE_LEN`] for the jump-to-file search).
     pub fn set_jump_text(&mut self, text: &str) {
-        self.jump_text = text.chars().take(MAX_JUMP_LEN).collect();
+        self.jump_text = text.chars().take(self.jump_limit()).collect();
+        self.jump_index = 0;
+    }
+
+    fn jump_limit(&self) -> usize {
+        if self.open == Some(DialogKind::Jump(JumpTarget::File)) {
+            MAX_JUMP_FILE_LEN
+        } else {
+            MAX_JUMP_LEN
+        }
+    }
+
+    /// Appends one character to the jump input (a no-op at the limit) and
+    /// puts the result selection back on the first row, since the search
+    /// text changed.
+    fn push_jump_char(&mut self, ch: char) {
+        if self.jump_text.chars().count() < self.jump_limit() {
+            self.jump_text.push(ch);
+            self.jump_index = 0;
+        }
+    }
+
+    /// The jump-to-file box's selected result row, clamped to the rows the
+    /// app last reported (see [`set_jump_rows`](Self::set_jump_rows)).
+    pub fn jump_index(&self) -> usize {
+        match self.jump_rows {
+            0 => 0,
+            rows => self.jump_index.min(rows - 1),
+        }
+    }
+
+    /// Tells the manager how many results the jump-to-file box has now, so
+    /// the selection stays inside them. The app calls it after every change
+    /// of the search text.
+    pub fn set_jump_rows(&mut self, rows: usize) {
+        self.jump_rows = rows;
+        if rows > 0 {
+            self.jump_index = self.jump_index.min(rows - 1);
+        }
     }
 
     /// Handles one key for the open dialog.
@@ -449,6 +503,7 @@ impl DialogManager {
             Key::Backspace => match self.open {
                 Some(DialogKind::Jump(_)) => {
                     self.jump_text.pop();
+                    self.jump_index = 0;
                     true
                 }
                 Some(DialogKind::OpenMedia { .. }) => {
@@ -464,9 +519,7 @@ impl DialogManager {
             Key::Digit(digit) | Key::Numpad(digit) => {
                 if matches!(self.open, Some(DialogKind::Jump(_))) {
                     let digit = digit % 10;
-                    if self.jump_text.len() < MAX_JUMP_LEN {
-                        self.jump_text.push((b'0' + digit) as char);
-                    }
+                    self.push_jump_char((b'0' + digit) as char);
                     true
                 } else if matches!(self.open, Some(DialogKind::OpenMedia { .. })) {
                     let digit = digit % 10;
@@ -482,6 +535,9 @@ impl DialogManager {
                 if matches!(self.open, Some(DialogKind::OpenMedia { .. })) {
                     self.push_media_char(letter as char);
                     true
+                } else if self.open == Some(DialogKind::Jump(JumpTarget::File)) {
+                    self.push_jump_char(letter as char);
+                    true
                 } else {
                     false
                 }
@@ -490,26 +546,38 @@ impl DialogManager {
                 if matches!(self.open, Some(DialogKind::OpenMedia { .. })) {
                     self.push_media_char(' ');
                     true
+                } else if self.open == Some(DialogKind::Jump(JumpTarget::File)) {
+                    self.push_jump_char(' ');
+                    true
                 } else {
                     false
                 }
             }
-            Key::Up => {
-                if matches!(self.open, Some(DialogKind::SkinBrowser)) {
+            Key::Up => match self.open {
+                Some(DialogKind::SkinBrowser) => {
                     self.select_prev_skin();
                     true
-                } else {
-                    false
                 }
-            }
-            Key::Down => {
-                if matches!(self.open, Some(DialogKind::SkinBrowser)) {
+                Some(DialogKind::Jump(JumpTarget::File)) => {
+                    self.jump_index = self.jump_index.saturating_sub(1);
+                    true
+                }
+                _ => false,
+            },
+            Key::Down => match self.open {
+                Some(DialogKind::SkinBrowser) => {
                     self.select_next_skin();
                     true
-                } else {
-                    false
                 }
-            }
+                Some(DialogKind::Jump(JumpTarget::File)) => {
+                    self.jump_index = self.jump_index.saturating_add(1);
+                    if self.jump_rows > 0 {
+                        self.jump_index = self.jump_index.min(self.jump_rows - 1);
+                    }
+                    true
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -551,10 +619,12 @@ impl DialogManager {
                     }
                     typed = true;
                 }
-                Some(DialogKind::Jump(_)) if ch.is_ascii_digit() || ch == ':' => {
-                    if self.jump_text.chars().count() < MAX_JUMP_LEN {
-                        self.jump_text.push(ch);
-                    }
+                Some(DialogKind::Jump(JumpTarget::Time)) if ch.is_ascii_digit() || ch == ':' => {
+                    self.push_jump_char(ch);
+                    typed = true;
+                }
+                Some(DialogKind::Jump(JumpTarget::File)) => {
+                    self.push_jump_char(ch);
                     typed = true;
                 }
                 _ => {}
@@ -965,6 +1035,10 @@ mod tests {
             JUMP_CLIENT_SIZE
         );
         assert_eq!(
+            DialogKind::Jump(JumpTarget::File).client_size(),
+            JUMP_FILE_CLIENT_SIZE
+        );
+        assert_eq!(
             DialogKind::LoadPlaylist.client_size(),
             LOAD_PLAYLIST_CLIENT_SIZE
         );
@@ -1071,6 +1145,36 @@ mod tests {
         manager.open(DialogKind::Jump(JumpTarget::File));
         manager.set_jump_text("90");
         assert_eq!(manager.confirm_jump_time(), None);
+    }
+
+    #[test]
+    fn the_jump_to_file_box_takes_any_text_and_bounds_its_selection() {
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::Jump(JumpTarget::File));
+        assert!(manager.accepts_text());
+        assert!(manager.type_text("Gamma: 3"));
+        assert_eq!(manager.jump_text(), "Gamma: 3");
+        assert!(manager.key(Key::Letter(b'X')));
+        assert!(manager.key(Key::Space));
+        assert_eq!(manager.jump_text(), "Gamma: 3X ");
+
+        // Moves saturate at the rows the app reported; typing resets them.
+        manager.set_jump_rows(3);
+        for _ in 0..5 {
+            assert!(manager.key(Key::Down));
+        }
+        assert_eq!(manager.jump_index(), 2);
+        assert!(manager.key(Key::Up));
+        assert_eq!(manager.jump_index(), 1);
+        assert!(manager.type_text("y"));
+        assert_eq!(manager.jump_index(), 0);
+
+        // The limit is the file box's own, longer than the time box's.
+        manager.set_jump_text(&"a".repeat(100));
+        assert_eq!(manager.jump_text().chars().count(), MAX_JUMP_FILE_LEN);
+        manager.open(DialogKind::Jump(JumpTarget::Time));
+        assert!(!manager.type_text("a"));
+        assert!(!manager.key(Key::Down));
     }
 
     #[test]

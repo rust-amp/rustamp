@@ -350,6 +350,15 @@ impl ApplicationHandler for MainWindowPresenter {
                 match state {
                     ElementState::Pressed => {
                         self.left_down = true;
+                        // Check if the press is on the title bar for window dragging.
+                        // Use the headless hit-test to identify the widget, but keep
+                        // the window-move itself in the presenter (it needs the OS handle).
+                        use crate::widget::{Widget, hit_test};
+                        if hit_test(&self.layout, x, y) == Some(Widget::TitleBar)
+                            && let Some(window) = &self.window_handle
+                        {
+                            let _ = window.drag_window();
+                        }
                         let _ = self.window.mouse_down(x, y, now);
                     }
                     ElementState::Released => {

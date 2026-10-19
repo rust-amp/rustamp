@@ -81,7 +81,77 @@ impl App {
         if dialog == DialogKind::SkinBrowser {
             self.dialogs.set_skin_rows(self.browser_entries().len());
         }
+        self.sync_jump_rows();
         Some(dialog)
+    }
+
+    /// The queue indices the jump-to-file box lists: every entry whose
+    /// display text contains the search text (ignoring case), in playlist
+    /// order. An empty search lists the whole playlist.
+    pub(crate) fn jump_file_matches(&self) -> Vec<usize> {
+        let needle = self.dialogs.jump_text().to_lowercase();
+        self.engine()
+            .queue()
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                needle.is_empty() || source.display().to_lowercase().contains(&needle)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Tells the dialog manager how many results the jump-to-file box has,
+    /// so its selection saturates at the ends. A no-op for other dialogs.
+    fn sync_jump_rows(&mut self) {
+        if self.dialog_is_open(DialogKind::Jump(JumpTarget::File)) {
+            let rows = self.jump_file_matches().len();
+            self.dialogs.set_jump_rows(rows);
+        }
+    }
+
+    /// The jump-to-file box's body: the search field, then a window of
+    /// [`JUMP_FILE_ROWS`](rustamp_ui::JUMP_FILE_ROWS) matches that keeps the
+    /// selected row (marked `"> "`) in view, then a count line.
+    fn jump_file_lines(&self) -> Vec<String> {
+        let matches = self.jump_file_matches();
+        let selected = self.dialogs.jump_index();
+        let rows = rustamp_ui::JUMP_FILE_ROWS;
+        let first = selected.saturating_sub(rows - 1);
+        let queue = self.engine().queue();
+        let mut lines = vec![format!("Search: {}", self.dialogs.jump_text())];
+        if matches.is_empty() {
+            lines.push(if queue.is_empty() {
+                "(the playlist is empty)".to_string()
+            } else {
+                "(no match)".to_string()
+            });
+        }
+        for (row, &index) in matches.iter().enumerate().skip(first).take(rows) {
+            let marker = if row == selected { "> " } else { "  " };
+            let text = queue.get(index).map(|source| source.display());
+            lines.push(format!(
+                "{marker}{}. {}",
+                index + 1,
+                field_tail(&text.unwrap_or_default())
+            ));
+        }
+        lines
+    }
+
+    /// Confirms the jump-to-file box: plays the selected match and closes
+    /// the dialog. With no match the dialog stays open so the search can be
+    /// corrected.
+    fn confirm_jump_file(&mut self) {
+        let matches = self.jump_file_matches();
+        let Some(&index) = matches.get(self.dialogs.jump_index()) else {
+            return;
+        };
+        let Some(&id) = self.entry_ids.get(index) else {
+            return;
+        };
+        let _ = self.submit(Command::PlayEntry(id));
+        self.dialogs.close_any();
     }
 
     /// The open dialog, if any.
@@ -155,9 +225,12 @@ impl App {
         if !consumed {
             return false;
         }
+        self.sync_jump_rows();
         match key {
             Key::Enter => {
-                if is_load_playlist {
+                if self.dialog_is_open(DialogKind::Jump(JumpTarget::File)) {
+                    self.confirm_jump_file();
+                } else if is_load_playlist {
                     if self.confirm_load_playlist() {
                         self.dialogs.close_any();
                     }
@@ -213,7 +286,9 @@ impl App {
     /// [`rustamp_ui::DialogManager::type_text`]). Returns whether anything
     /// was typed; control characters are left to [`App::dialog_key`].
     pub fn dialog_text(&mut self, text: &str) -> bool {
-        self.dialogs.type_text(text)
+        let typed = self.dialogs.type_text(text);
+        self.sync_jump_rows();
+        typed
     }
 
     /// A file dropped from the shell onto the dialog window: the open-media
@@ -411,10 +486,7 @@ impl App {
                 "Seconds or m:ss:".to_string(),
                 self.dialogs.jump_text().to_string(),
             ],
-            DialogKind::Jump(JumpTarget::File) => vec![
-                "Playlist number:".to_string(),
-                self.dialogs.jump_text().to_string(),
-            ],
+            DialogKind::Jump(JumpTarget::File) => self.jump_file_lines(),
             // Prompt plus the staged pick or typed field, then the one-line hint.
             DialogKind::LoadPlaylist => self.load_playlist_lines(),
             // Kind-specific faces with plain own-choice prompts (the

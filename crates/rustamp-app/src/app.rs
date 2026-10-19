@@ -159,6 +159,12 @@ pub struct App {
     pub(crate) main_menu_open: bool,
     /// A clutterbar popup (Options or visualization) waiting for the presenter.
     pub(crate) pending_clutter_menu: Option<crate::menu::ClutterMenu>,
+    /// The equalizer's Presets popup is waiting to be shown (S07 §4.2).
+    pub(crate) pending_eq_menu: bool,
+    /// A save-playlist request waiting for the presenter (Ctrl+S, S03 §2, command ID 40204).
+    pub(crate) request_save_playlist: bool,
+    /// The user's saved equalizer presets (`presets.eqf` beside the config).
+    pub(crate) eq_user_presets: Vec<crate::eq_presets::UserPreset>,
     notes: Vec<String>,
     /// The last error the user should see (BETA-04): a failed open/decode or
     /// a rejected command. Shown in the main window's native title bar
@@ -316,6 +322,9 @@ impl App {
             last_playlist_report: None,
             main_menu_open: false,
             pending_clutter_menu: None,
+            pending_eq_menu: false,
+            request_save_playlist: false,
+            eq_user_presets: Vec::new(),
             notes: Vec::new(),
             last_error: None,
             host: HostStateLink::detached(),
@@ -492,6 +501,7 @@ impl App {
     /// Sets the path where configuration will be persisted on exit.
     pub fn set_config_path(&mut self, path: Option<PathBuf>) {
         self.config_path = path;
+        self.load_eq_user_presets();
     }
 
     /// The path where configuration will be persisted, if set.
@@ -823,24 +833,14 @@ impl App {
     /// Asks the app to open the equalizer's presets popup (S07 §4.2).
     ///
     /// The spec settles the popup's existence (window class `#32768`), size
-    /// and top-level entries (Load/Save/Delete) and fixes nothing beyond that,
-    /// so this records the request through the existing dialog-stub path and
-    /// opens no window: menu internals, submenu contents and load/save
-    /// semantics are intentionally not implemented here (S07 §12 O12, S04).
-    /// Returns the entries the real popup must carry.
+    /// and top-level entries (Load/Save/Delete) and leaves the submenus open
+    /// (S07 §12 O12), so the submenu contents are our own choice (see
+    /// [`crate::eq_presets`]). The request is queued; the presenter takes it
+    /// on its tick ([`App::take_eq_menu`]) and shows the native popup.
+    /// Returns the entries the popup carries.
     pub fn request_eq_presets_menu(&mut self, request: EqMenuRequest) -> &'static [&'static str] {
-        let entries = request.entries();
-        let names: Vec<&str> = crate::eq_presets::presets()
-            .iter()
-            .map(|p| p.name)
-            .collect();
-        self.note(format!(
-            "open presets popup {request:?} ({}): the menu window is not implemented yet; \
-             Load offers {}",
-            entries.join("/"),
-            names.join(", ")
-        ));
-        entries
+        self.pending_eq_menu = true;
+        request.entries()
     }
 
     /// Applies the built-in equalizer preset `name` (ignoring case).
@@ -1358,7 +1358,7 @@ impl App {
     /// The equalizer machine has already applied its S07 prediction, so these
     /// go straight to the engine and the app (no second prediction) — the
     /// same shape as [`App::forward`]. A pending presets-menu request is
-    /// recorded through the dialog-stub path, which opens no window.
+    /// queued for the presenter ([`App::take_eq_menu`]).
     fn forward_eq(&mut self, commands: &[Command]) -> Result<()> {
         for command in commands {
             self.apply_from(command, true);
@@ -1746,6 +1746,10 @@ impl App {
             C::OpenVisualizationMenu => {
                 self.open_clutter_menu(crate::menu::ClutterMenu::Visualization);
             }
+            // RFC 0017: the failure is recorded by `save_playlist_file` itself.
+            C::SavePlaylist(path) => {
+                let _ = self.save_playlist_file(path);
+            }
             C::ConfigureVisPlugin | C::ToggleVisPlugin => {
                 self.note(format!("{command:?} needs the plugin host (M3)"));
             }
@@ -1857,6 +1861,50 @@ impl App {
 
         self.last_playlist_report = Some(report.clone());
         Ok(report)
+    }
+
+    /// Writes the current queue to `path` as an M3U, PLS or XSPF playlist, in
+    /// queue order (RFC 0017).
+    ///
+    /// The format follows the file extension, case-insensitively. An unknown
+    /// extension, B4S (not implemented) or a failed write records an error
+    /// like a failed load does (a note, `last_error`, and the published
+    /// error) and returns `Err`; no file is written in the first two cases.
+    pub fn save_playlist_file(&mut self, path: &Path) -> Result<()> {
+        let result = self.write_queue_playlist(path);
+        if let Err(error) = &result {
+            let msg = format!("failed to save playlist {}: {}", path.display(), error);
+            self.note(format!("error: {msg}"));
+            self.last_error = Some(msg);
+            self.publish_error(error);
+        }
+        result
+    }
+
+    fn write_queue_playlist(&self, path: &Path) -> Result<()> {
+        let format = rustamp_playlist::PlaylistFormat::from_path(path)
+            .filter(|format| format.is_supported())
+            .ok_or_else(|| {
+                Error::UnsupportedFormat(format!(
+                    "{}: save needs an .m3u, .m3u8, .pls or .xspf file name",
+                    path.display()
+                ))
+            })?;
+        let entries: Vec<rustamp_playlist::LoadedEntry> = self
+            .engine
+            .queue()
+            .iter()
+            .map(|source| {
+                let location = match source {
+                    TrackSource::Path(p) => MediaLocation::File(p.clone()),
+                    TrackSource::Url(u) => MediaLocation::Url(u.clone()),
+                };
+                rustamp_playlist::LoadedEntry::new(location)
+            })
+            .collect();
+        let bytes = rustamp_playlist::write_playlist(format, &entries)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
     }
 
     fn add_items(&mut self, items: &[MediaLocation], at: Option<u32>, play: bool) {
@@ -2106,6 +2154,53 @@ mod tests {
             seconds: None,
         };
         (App::with_registry(options, registry()).unwrap(), dir)
+    }
+
+    #[test]
+    fn save_playlist_writes_the_queue_in_the_format_the_extension_names() {
+        let (mut app, dir) = app_with_file(None);
+        let first = track(&dir, "one.mp3");
+        let stream = "http://example.test/stream".to_owned();
+        app.engine.set_queue(vec![
+            TrackSource::path(first.clone()),
+            TrackSource::Url(stream.clone()),
+        ]);
+        app.sync_entry_ids();
+
+        for name in ["list.m3u", "list.M3U8", "list.pls", "list.xspf"] {
+            let target = dir.path().join(name);
+            app.submit(Command::SavePlaylist(target.clone())).unwrap();
+            let report = rustamp_playlist::load_playlist_file_report(&target).unwrap();
+            let locations: Vec<MediaLocation> = report
+                .entries
+                .iter()
+                .map(|entry| entry.location.clone())
+                .collect();
+            assert_eq!(
+                locations,
+                vec![
+                    MediaLocation::File(first.clone()),
+                    MediaLocation::Url(stream.clone())
+                ],
+                "{name}"
+            );
+        }
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn save_playlist_refuses_an_unknown_or_unsupported_extension() {
+        let (mut app, dir) = app_with_file(None);
+        app.engine
+            .set_queue(vec![TrackSource::path(track(&dir, "one.mp3"))]);
+        app.sync_entry_ids();
+
+        for name in ["list.txt", "list", "list.b4s"] {
+            let target = dir.path().join(name);
+            assert!(app.save_playlist_file(&target).is_err(), "{name}");
+            assert!(!target.exists(), "{name} must not be written");
+        }
+        assert!(app.last_error.is_some());
     }
 
     fn widget_centre(widget: Widget) -> (i32, i32) {
@@ -2789,18 +2884,15 @@ mod tests {
     }
 
     #[test]
-    fn presets_in_the_eq_window_records_the_menu_request_and_opens_nothing() {
-        // S07 §4.2: the spec fixes the popup (class, size, Load/Save/Delete)
-        // and nothing beyond it, so the app records the request and opens no
-        // window.
+    fn presets_in_the_eq_window_queues_the_popup_request_once() {
+        // S07 §4.2: the click queues the Load/Save/Delete popup, which the
+        // presenter takes on its tick and shows.
         let (mut app, _dir) = app_with_file(None);
+        assert!(!app.take_eq_menu());
         assert!(app.eq_mouse_down(239, 24).unwrap().is_empty());
         assert!(app.eq_mouse_up(239, 24).unwrap().is_empty());
-        let notes = app.drain_notes();
-        assert!(
-            notes.iter().any(|n| n.contains("Load/Save/Delete")),
-            "{notes:?}"
-        );
+        assert!(app.take_eq_menu());
+        assert!(!app.take_eq_menu());
         assert_eq!(
             app.request_eq_presets_menu(rustamp_ui::EqMenuRequest::Presets),
             &["Load", "Save", "Delete"]
@@ -2818,6 +2910,164 @@ mod tests {
         // The window's sliders follow the engine.
         assert!(app.apply_eq_preset("Flat").unwrap());
         assert_eq!(app.current_eq_preset(), Some("Flat"));
+    }
+
+    #[test]
+    fn saved_presets_load_save_and_delete_through_the_popup_and_survive_a_restart() {
+        use crate::eq_presets::EqMenuChoice;
+        let (mut app, dir) = app_with_file(None);
+        let config = dir.path().join("config").join("rustamp.toml");
+        app.set_config_path(Some(config.clone()));
+        assert!(app.eq_user_presets().is_empty());
+
+        // Save the live curve under a fresh name.
+        app.submit(Command::SetBand {
+            band: 0,
+            gain_db: 6.0,
+        })
+        .unwrap();
+        app.submit(Command::SetPreamp(-3.0)).unwrap();
+        app.activate_eq_menu_choice(EqMenuChoice::SaveNew).unwrap();
+        assert_eq!(app.eq_user_presets().len(), 1);
+        assert_eq!(app.eq_user_presets()[0].name, "Custom 1");
+        assert!(config.with_file_name("presets.eqf").is_file());
+
+        // Flatten, then load the saved curve back.
+        app.apply_eq_preset("Flat").unwrap();
+        app.submit(Command::SetPreamp(0.0)).unwrap();
+        app.activate_eq_menu_choice(EqMenuChoice::LoadUser(0))
+            .unwrap();
+        let eq = app.engine().eq();
+        assert!((eq.bands[0] - 6.0).abs() < 0.3, "{:?}", eq.bands);
+        assert!((eq.preamp + 3.0).abs() < 0.3, "{}", eq.preamp);
+
+        // A new run reads the file; the popup lists the saved preset.
+        let (mut again, _dir2) = app_with_file(None);
+        again.set_config_path(Some(config));
+        assert_eq!(again.eq_user_presets().len(), 1);
+        assert_eq!(again.eq_user_presets()[0].name, "Custom 1");
+        let menu = again.native_eq_menu();
+        assert!(menu.choice_for_id(0).is_none());
+        let ids: Vec<_> = (1..=40).filter_map(|id| menu.choice_for_id(id)).collect();
+        assert!(ids.contains(&EqMenuChoice::LoadUser(0)));
+        assert!(ids.contains(&EqMenuChoice::SaveOver(0)));
+        assert!(ids.contains(&EqMenuChoice::Delete(0)));
+
+        again
+            .activate_eq_menu_choice(EqMenuChoice::Delete(0))
+            .unwrap();
+        assert!(again.eq_user_presets().is_empty());
+        again.load_eq_user_presets();
+        assert!(again.eq_user_presets().is_empty());
+    }
+
+    #[test]
+    fn save_over_replaces_in_place_and_builtins_keep_the_preamp() {
+        use crate::eq_presets::EqMenuChoice;
+        let (mut app, _dir) = app_with_file(None);
+        app.activate_eq_menu_choice(EqMenuChoice::SaveNew).unwrap();
+        app.submit(Command::SetBand {
+            band: 2,
+            gain_db: 6.0,
+        })
+        .unwrap();
+        app.activate_eq_menu_choice(EqMenuChoice::SaveOver(0))
+            .unwrap();
+        assert_eq!(app.eq_user_presets().len(), 1);
+        assert!((app.eq_user_presets()[0].bands[2] - 6.0).abs() < 0.3);
+        // Out-of-range indices are ignored.
+        app.activate_eq_menu_choice(EqMenuChoice::SaveOver(9))
+            .unwrap();
+        app.activate_eq_menu_choice(EqMenuChoice::LoadUser(9))
+            .unwrap();
+        app.activate_eq_menu_choice(EqMenuChoice::Delete(9))
+            .unwrap();
+        assert_eq!(app.eq_user_presets().len(), 1);
+        // A built-in preset leaves the preamp where it was.
+        app.submit(Command::SetPreamp(-4.0)).unwrap();
+        app.activate_eq_menu_choice(EqMenuChoice::LoadBuiltin(1))
+            .unwrap();
+        assert_eq!(app.engine().eq().preamp, -4.0);
+    }
+
+    #[test]
+    fn an_eqf_file_loads_with_its_preamp_and_bad_files_are_refused() {
+        use crate::eq_presets::{UserPreset, write_eqf};
+        let (mut app, dir) = app_with_file(None);
+        let good = dir.path().join("good.eqf");
+        let mut bands = [0.0; rustamp_core::state::EQ_BANDS];
+        bands[0] = 6.0;
+        let preset = UserPreset {
+            name: "Warm".to_string(),
+            bands,
+            preamp: -3.0,
+        };
+        std::fs::write(&good, write_eqf(&[preset])).unwrap();
+        assert_eq!(app.load_eq_file(&good).unwrap(), "Warm");
+        let eq = app.engine().eq();
+        assert!((eq.bands[0] - 6.0).abs() < 0.3);
+        assert!((eq.preamp + 3.0).abs() < 0.3);
+        assert!(app.eq_user_presets().is_empty());
+
+        let junk = dir.path().join("junk.eqf");
+        std::fs::write(&junk, b"not an eqf").unwrap();
+        assert!(app.load_eq_file(&junk).is_err());
+        let empty = dir.path().join("empty.eqf");
+        std::fs::write(&empty, write_eqf(&[])).unwrap();
+        assert!(app.load_eq_file(&empty).is_err());
+        assert!(app.load_eq_file(&dir.path().join("missing.eqf")).is_err());
+        // Refused files leave the curve alone.
+        assert!((app.engine().eq().bands[0] - 6.0).abs() < 0.3);
+    }
+
+    #[test]
+    fn jump_to_file_filters_the_playlist_and_plays_the_selected_match() {
+        use rustamp_core::command::JumpTarget;
+        let (mut app, dir) = app_with_file(None);
+        app.engine.set_queue(vec![
+            TrackSource::path(track(&dir, "alpha.mp3")),
+            TrackSource::path(track(&dir, "beta.mp3")),
+            TrackSource::path(track(&dir, "Gamma Beta.mp3")),
+        ]);
+        app.sync_entry_ids();
+        let jump = rustamp_ui::DialogKind::Jump(JumpTarget::File);
+        app.submit(Command::OpenJump {
+            target: JumpTarget::File,
+        })
+        .unwrap();
+        assert!(app.dialog_is_open(jump));
+        assert_eq!(app.jump_file_matches(), vec![0, 1, 2]);
+
+        // Typing narrows the list (ignoring case); Down moves, Enter plays.
+        assert!(app.dialog_text("BETA"));
+        assert_eq!(app.jump_file_matches(), vec![1, 2]);
+        assert!(app.dialog_key(Key::Down));
+        assert!(app.dialog_key(Key::Down), "clamps at the last match");
+        assert!(app.dialog_key(Key::Up));
+        assert!(app.dialog_key(Key::Down));
+        assert!(app.dialog_key(Key::Enter));
+        assert!(!app.dialog_is_open(jump));
+        assert_eq!(app.engine().current_index(), Some(2));
+    }
+
+    #[test]
+    fn jump_to_file_with_no_match_stays_open() {
+        use rustamp_core::command::JumpTarget;
+        let (mut app, dir) = app_with_file(None);
+        app.engine
+            .set_queue(vec![TrackSource::path(track(&dir, "alpha.mp3"))]);
+        app.sync_entry_ids();
+        app.submit(Command::OpenJump {
+            target: JumpTarget::File,
+        })
+        .unwrap();
+        assert!(app.dialog_text("zzz"));
+        assert!(app.jump_file_matches().is_empty());
+        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::Jump(JumpTarget::File)));
+        assert!(app.dialog_key(Key::Backspace));
+        assert!(app.dialog_key(Key::Escape));
+        assert!(app.dialog_open_kind().is_none());
     }
 
     #[test]

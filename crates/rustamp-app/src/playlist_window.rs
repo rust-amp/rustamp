@@ -160,22 +160,121 @@ impl App {
         key: Key,
         modifiers: Modifiers,
     ) -> Result<Option<ShortcutOutcome>> {
+        use rustamp_ui::playlist::{PlaylistKeyAction, playlist_key_action};
+
         self.sync_playlist_entries();
-        let command = if key == Key::Delete && modifiers == Modifiers::NONE {
-            self.playlist.press_rem()
-        } else if key == Key::Letter(b'A') && modifiers == Modifiers::CTRL {
+
+        // Handle Delete first (plain Delete returns None from playlist_key_action)
+        if key == Key::Delete && modifiers == Modifiers::NONE {
+            match self.playlist.press_rem() {
+                Some(command) => {
+                    self.submit(command.clone())?;
+                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
+                }
+                // S06 §5.3: Delete with nothing selected changes nothing
+                None => return Ok(Some(ShortcutOutcome::Handled)),
+            }
+        }
+
+        // Handle Ctrl+S (Save Playlist, command ID 40204, S03 §2)
+        // Signal to presenter to open native save-dialog
+        if key == Key::Letter(b'S') && modifiers == Modifiers::CTRL {
+            self.request_save_playlist = true;
+            return Ok(Some(ShortcutOutcome::Handled));
+        }
+
+        // Check for playlist-specific key actions (S03 §2)
+        if let Some(action) = playlist_key_action(key, modifiers) {
+            match action {
+                // Navigation actions (provisional, no measured effect)
+                PlaylistKeyAction::MoveSelectionUp => {
+                    self.playlist.move_selection_up();
+                    return Ok(Some(ShortcutOutcome::Handled));
+                }
+                PlaylistKeyAction::MoveSelectionDown => {
+                    self.playlist.move_selection_down();
+                    return Ok(Some(ShortcutOutcome::Handled));
+                }
+                PlaylistKeyAction::JumpToFirst => {
+                    self.playlist.jump_to_first();
+                    return Ok(Some(ShortcutOutcome::Handled));
+                }
+                PlaylistKeyAction::JumpToLast => {
+                    self.playlist.jump_to_last();
+                    return Ok(Some(ShortcutOutcome::Handled));
+                }
+                PlaylistKeyAction::PageUp => {
+                    self.playlist
+                        .scroll_page(rustamp_ui::playlist::ScrollDirection::Up);
+                    return Ok(Some(ShortcutOutcome::Handled));
+                }
+                PlaylistKeyAction::PageDown => {
+                    self.playlist
+                        .scroll_page(rustamp_ui::playlist::ScrollDirection::Down);
+                    return Ok(Some(ShortcutOutcome::Handled));
+                }
+                // Play selected entry (menu-confirmed)
+                PlaylistKeyAction::PlaySelected => match self.playlist.play_selected() {
+                    Some(command) => {
+                        self.submit(command.clone())?;
+                        return Ok(Some(ShortcutOutcome::Commands(vec![command])));
+                    }
+                    None => return Ok(Some(ShortcutOutcome::Handled)),
+                },
+                // Crop to selected entries (menu-confirmed, Ctrl+Delete)
+                PlaylistKeyAction::Crop => {
+                    let selected = self.playlist.selected_ids();
+                    if selected.is_empty() {
+                        return Ok(Some(ShortcutOutcome::Handled));
+                    }
+                    // Remove all entries that are NOT selected (invert the removal)
+                    let selected_set: std::collections::BTreeSet<_> =
+                        selected.iter().copied().collect();
+                    let ids_to_remove: Vec<EntryId> = self
+                        .entry_ids
+                        .iter()
+                        .copied()
+                        .filter(|id| !selected_set.contains(id))
+                        .collect();
+
+                    if ids_to_remove.is_empty() {
+                        return Ok(Some(ShortcutOutcome::Handled));
+                    }
+
+                    let command = Command::Remove(ids_to_remove);
+                    self.submit(command.clone())?;
+                    self.sync_playlist_entries();
+                    return Ok(Some(ShortcutOutcome::Commands(vec![command])));
+                }
+                // Block move actions (provisional, not implemented yet)
+                PlaylistKeyAction::MoveBlockUp | PlaylistKeyAction::MoveBlockDown => {
+                    self.note(format!(
+                        "playlist key action {action:?} is not implemented yet (provisional, no Command)"
+                    ));
+                    return Ok(Some(ShortcutOutcome::Handled));
+                }
+                // Delete already handled above
+                PlaylistKeyAction::Delete => {
+                    unreachable!("Delete is handled before playlist_key_action")
+                }
+            }
+        }
+
+        // Legacy shortcuts still handled directly (Ctrl+A, Ctrl+I)
+        let command = if key == Key::Letter(b'A') && modifiers == Modifiers::CTRL {
             Some(self.playlist.select_all())
         } else if key == Key::Letter(b'I') && modifiers == Modifiers::CTRL {
             Some(self.playlist.invert_selection())
         } else {
+            // Fall through to global shortcuts
             return self.key_down(key, modifiers);
         };
+
         match command {
             Some(command) => {
                 self.submit(command.clone())?;
                 Ok(Some(ShortcutOutcome::Commands(vec![command])))
             }
-            // S06 §5.3: Delete with nothing selected changes nothing.
             None => Ok(Some(ShortcutOutcome::Handled)),
         }
     }
@@ -277,10 +376,10 @@ impl App {
     /// Dropping is additive: it never replaces the queue, and an empty list
     /// submits nothing.
     ///
-    /// A dropped playlist file (`.m3u`, `.pls`, `.xspf`) is added as an
-    /// ordinary entry here, not loaded: the reference's drop-a-playlist
-    /// behaviour is unmeasured (S06 leaves it open) and the load path is the
-    /// LIST OPTS dialog.
+    /// A dropped playlist file (`.m3u`, `.pls`, `.xspf`) is resolved by
+    /// [`App::add_items`], appending its entries to the queue (own choice:
+    /// the reference's drop-a-playlist behaviour is unmeasured, S06 leaves it
+    /// open).
     pub fn drop_on_playlist(&mut self, paths: &[PathBuf]) -> Result<Vec<Command>> {
         let items = rustamp_ui::media_items_for_paths(paths);
         if items.is_empty() {

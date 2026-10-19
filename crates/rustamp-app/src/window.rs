@@ -70,6 +70,7 @@
 //! No test calls [`run`] outside those ignored, VM-gated cases.
 
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -980,6 +981,60 @@ impl Windowed {
             eprintln!("rustamp: a native popup menu is only implemented on Windows");
         }
     }
+    /// Shows a pending equalizer Presets popup (S07 §4.2: Load / Save /
+    /// Delete) as the system's own menu, below the Presets button.
+    ///
+    /// The button sits at (217, 18, 44, 12) in the equalizer's layout
+    /// (S07 §4.1), doubled with the double-size mode; the popup's screen
+    /// position is unmeasured, so the button's bottom-left is our choice.
+    fn drain_eq_menu(&mut self) {
+        if !self.app.take_eq_menu() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let owner = self.raw_main_window();
+            let eq_outer = self
+                .eq_window
+                .as_ref()
+                .and_then(|window| window.outer_position().ok())
+                .map(|position| (position.x, position.y))
+                .unwrap_or((DEFAULT_MAIN_POSITION.x, DEFAULT_MAIN_POSITION.y));
+            let scale = if self.app.state().double_size { 2 } else { 1 };
+            let menu = self.app.native_eq_menu();
+            match rustamp_platform::show_popup_menu(
+                owner,
+                &menu.rows,
+                (eq_outer.0 + 217 * scale, eq_outer.1 + 30 * scale),
+            ) {
+                Ok(None) => {}
+                Ok(Some(id)) => match menu.choice_for_id(id) {
+                    Some(crate::eq_presets::EqMenuChoice::LoadFromFile) => {
+                        match rustamp_platform::pick_eqf_file(owner, "Load EQ preset") {
+                            Ok(None) => {}
+                            Ok(Some(path)) => match self.app.load_eq_file(&path) {
+                                Ok(name) => println!("rustamp: loaded EQ preset {name}"),
+                                Err(error) => eprintln!("rustamp: EQ preset not loaded: {error}"),
+                            },
+                            Err(error) => eprintln!("rustamp: no file dialog: {error}"),
+                        }
+                        self.request_redraw_eq();
+                    }
+                    Some(choice) => {
+                        if let Err(error) = self.app.activate_eq_menu_choice(choice) {
+                            eprintln!("rustamp: presets menu item failed: {error}");
+                        }
+                        self.request_redraw_eq();
+                    }
+                    None => eprintln!("rustamp: the presets menu reported an unknown id {id}"),
+                },
+                Err(error) => eprintln!("rustamp: no presets menu: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        eprintln!("rustamp: a native popup menu is only implemented on Windows");
+    }
+
     /// Shows a pending standard file-open dialog and adds what was chosen.
     ///
     /// The ADD button and the open-media actions ask for files. They used to
@@ -1032,6 +1087,36 @@ impl Windowed {
             let _ = (kind, play);
             eprintln!("rustamp: a native file dialog is only implemented on Windows");
         }
+    }
+
+    /// Shows the native save-playlist dialog when Ctrl+S was pressed.
+    ///
+    /// Ctrl+S in the playlist window (command ID 40204, S03 §2) requests a
+    /// save. The presenter opens the native save dialog (modal, synchronous)
+    /// and sends [`Command::SavePlaylist`] with the chosen path. A cancelled
+    /// dialog saves nothing.
+    fn drain_save_playlist(&mut self) {
+        if !std::mem::take(&mut self.app.request_save_playlist) {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let owner = self.raw_main_window();
+            match rustamp_platform::save_playlist_file(owner, "Save Playlist", "playlist.m3u") {
+                Ok(Some(path)) => {
+                    let command = Command::SavePlaylist(path.clone());
+                    if let Err(error) = self.app.submit(command) {
+                        eprintln!("rustamp: save playlist failed: {error}");
+                    } else {
+                        println!("rustamp: playlist saved to {}", path.display());
+                    }
+                }
+                Ok(None) => {} // User cancelled
+                Err(error) => eprintln!("rustamp: no save dialog: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        eprintln!("rustamp: a native save dialog is only implemented on Windows");
     }
 
     /// Opens (or raises) the native preferences dialog, then relays what the
@@ -1502,19 +1587,7 @@ impl Windowed {
                 let _ = inner_size_writer.request_inner_size(PhysicalSize::new(width, height));
                 self.request_playlist_redraw();
             }
-            WindowEvent::DroppedFile(path) => {
-                // Dropping media on the playlist adds it, the same append the
-                // ADD button performs ([`App::drop_on_playlist`]). `winit`
-                // delivers one event per file, so a multi-file drop arrives
-                // here several times and keeps the shell's order.
-                match self.app.drop_on_playlist(std::slice::from_ref(&path)) {
-                    Ok(_) => {
-                        self.request_playlist_redraw();
-                        self.request_redraw();
-                    }
-                    Err(error) => eprintln!("rustamp: dropped file not added: {error}"),
-                }
-            }
+            WindowEvent::DroppedFile(path) => self.drop_file(path),
             WindowEvent::Focused(_) => {
                 // Per-window activation is open, so the playlist shares the
                 // main focus flag (see `App::render_playlist`).
@@ -1567,6 +1640,22 @@ impl Windowed {
                 self.request_redraw();
             }
             _ => {}
+        }
+    }
+
+    /// A file dropped from the shell onto the main, equalizer or playlist
+    /// window: appended to the playlist the way the ADD button does
+    /// ([`App::drop_on_playlist`]), whichever window received it. `winit`
+    /// delivers one event per file, so a multi-file drop arrives here several
+    /// times and keeps the shell's order.
+    fn drop_file(&mut self, path: PathBuf) {
+        match self.app.drop_on_playlist(std::slice::from_ref(&path)) {
+            Ok(_) => {
+                self.request_playlist_redraw();
+                self.request_redraw();
+                self.request_redraw_eq();
+            }
+            Err(error) => eprintln!("rustamp: dropped file not added: {error}"),
         }
     }
 
@@ -1783,6 +1872,7 @@ impl ApplicationHandler for Windowed {
                 self.place_eq_below_main();
                 self.sync_playlist_position();
             }
+            WindowEvent::DroppedFile(path) => self.drop_file(path),
             WindowEvent::RedrawRequested => self.paint(),
             WindowEvent::Resized(size) => {
                 let (width, height) = self.app.frame_size();
@@ -1924,7 +2014,9 @@ impl ApplicationHandler for Windowed {
         // these run their own modal message loop.
         self.drain_main_menu();
         self.drain_clutter_menu();
+        self.drain_eq_menu();
         self.drain_media_pick();
+        self.drain_save_playlist();
         self.drain_prefs();
         // After every window has been synced, so a focus request for a window
         // that opened this frame finds its OS window.
@@ -1983,6 +2075,7 @@ impl Windowed {
                 self.applied_eq_client = Some((width, height));
                 self.request_redraw_eq();
             }
+            WindowEvent::DroppedFile(path) => self.drop_file(path),
             WindowEvent::Focused(focused) => {
                 self.app.set_eq_focused(focused);
                 self.request_redraw_eq();

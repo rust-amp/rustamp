@@ -89,7 +89,8 @@ pub fn app_owns(command: &Command) -> bool {
         | C::ToggleVisPlugin
         | C::OpenPlaylist
         | C::OpenOptionsMenu
-        | C::OpenVisualizationMenu => true,
+        | C::OpenVisualizationMenu
+        | C::SavePlaylist(_) => true,
     }
 }
 
@@ -163,6 +164,7 @@ mod tests {
             Command::OpenOptionsMenu,
             Command::OpenVisualizationMenu,
             Command::ToggleVisPlugin,
+            Command::SavePlaylist("list.m3u".into()),
         ] {
             assert!(app_owns(&command), "{command:?} belongs to the app");
         }

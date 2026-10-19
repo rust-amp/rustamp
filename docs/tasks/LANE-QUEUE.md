@@ -9,6 +9,35 @@ Keep this list current: add what the latest audits found, remove what is done.
 Each entry names the task, the crate it owns, the source (spec or card) and the
 model class it wants.
 
+## In flight (2026-10-19, wave 127-131)
+
+Every lane owns its own worktree; the worktree path is the first line of the
+prompt (owner rule, 2026-10-19 — see `AGENTS.md`).
+
+| Worktree | Task | Owns | Model |
+|---|---|---|---|
+| `wave127-playlist-remove` | Playlist remove-all-dead-files + clear playlist (40222, 40214) | `rustamp-app`, `rustamp-proto` | free-deepseek-v4.1 |
+| `wave128-playlist-sort` | Playlist sort menu (40209-40212) | `rustamp-app`, `rustamp-ui` | free-big-pickle |
+| `wave129-jumpfile` | Jump to File dialog verification/wiring (40194) | `rustamp-app`, `rustamp-ui` | minimax-m3.1-flash-free |
+| `wave130-docking` | Window docking/snapping (S05) | `rustamp-ui` | beam-free |
+| `wave131-eqpresets-file` | EQ presets load-from-.eqf file (S07 §4.2) | `rustamp-app`, `rustamp-platform` | claude-balanced |
+
+## Next wave (ready, disjoint crates)
+
+Pick from these so no two lanes share a crate; refill each slot as soon as one
+finishes (owner rule: keep the lanes full until every open point is done).
+
+| # | Task | Owns | Source |
+|---|---|---|---|
+| A | **BETA-08** — shuffle/repeat lights vs. applied behaviour | `rustamp-audio`, `rustamp-playlist` | S15, `docs/tasks/BETA-readiness.md` |
+| B | **Playlist format detection + M3U8/XSPF import** | `rustamp-playlist` | S06, `docs/tasks/E3-playlist-skips.md` |
+| C | **ReplayGain** — scanner + playback | `rustamp-meta`, `rustamp-audio` | `docs/PLAN.md` M2 |
+| D | **RFC 0012** — the device-error hook (accepted) | `rustamp-core`, `rustamp-output` | `docs/rfc/0012-output-error-hook.md` |
+| E | **Plugin DLL acceptance** (owner-approved) | `rustamp-plughost`, `rustamp-plugin-abi` | `docs/tasks/P3-dll-acceptance.md` |
+| F | **RFC 0006** — `rustamp-mediahost` PCM transfer | `rustamp-mediahost` | `docs/rfc/0006-out-of-process-hosting.md` |
+| G | **S04 File-menu actions** — open file(s)/directory/location | `rustamp-app` | S04, S03 |
+| H | **S07 EQ auto-load per track** | `rustamp-app`, `rustamp-dsp` | S07 |
+
 ## Ready now
 
 | # | Task | Owns | Source | Wants |
@@ -52,20 +81,19 @@ model class it wants.
 - **The visualiser, MilkDrop, the media library, Linux/macOS** — later
   milestones.
 
-## Source rotation (owner rule, 2026-10-17)
+## Source rotation (owner rule, 2026-10-19)
 
-Spread the lanes over every source that has quota — **free models, OpenAI,
-Claude and Google** — instead of putting a whole wave on one provider. When a
-slot is refilled, prefer the source that is currently under-used. A source that
-refuses (unavailable model, rate limit) means the lane moves to another one; it
-never means waiting.
+**Current sources: OpenAI + the free models only.** No new Claude lanes (owner
+rule, 2026-10-19). Google is exhausted until 2026-10-24. Spread the lanes over
+what is left instead of putting a whole wave on one provider; a source that
+refuses means the lane moves to another one, never that it waits.
 
 | Source | How | Notes |
 |---|---|---|
-| **Google** | `agy_run` (`gemini-3.8-flash-high` / `-medium`) | reports its own quota; 82 % weekly at the last reading |
-| **Claude** | `subagent` with `claude-fast` / `claude-balanced` / `claude-deep` | through the **Claude provider** only, never agy's Claude bucket |
-| **OpenAI** | `subagent` with `openai/gpt-6.1-sol#high` | spend it until Sunday 2026-10-18, then stop until approved |
-| **Free** | `subagent` with `free-*` | `free-ling-3.1` and `free-muse-spark` were unavailable; `free-laguna`, `free-big-pickle` and `free-deepseek-v4.1` worked |
+| **Free** | `subagent` with `free-*`, or `general` + `model` | `free-deepseek-v4.1`, `free-big-pickle` work; `opencode/minimax-m3.1-flash-free` and `opencode/beam-free` have no visible limit — prefer them |
+| **OpenAI** | `subagent` + `model` | use while its window has quota |
+| **Claude** | — | **no new lanes** (owner rule, 2026-10-19) |
+| **Google** | — | exhausted until 2026-10-24 |
 
 ## Polling (learned the hard way, 2026-10-17)
 

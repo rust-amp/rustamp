@@ -31,7 +31,10 @@ pub use displays::{
     display_changes, dpi_at,
 };
 pub use dpi::{DpiAwareness, DpiError, WindowChrome, init_dpi_awareness, outer_size_for_client};
-pub use file_dialog::{FileDialogError, MEDIA_FILTERS, parse_selection, pick_media_files};
+pub use file_dialog::{
+    EQF_FILTERS, FileDialogError, MEDIA_FILTERS, PLAYLIST_SAVE_FILTERS, parse_selection,
+    pick_eqf_file, pick_media_files, save_playlist_file,
+};
 pub use hotkeys::{
     DEFAULT_HOTKEYS, HotkeyAction, HotkeyBackend, HotkeyCombo, HotkeyError, HotkeyId,
     HotkeyModifiers, HotkeyRegistry, HotkeySession, describe, take_pending_hotkeys,

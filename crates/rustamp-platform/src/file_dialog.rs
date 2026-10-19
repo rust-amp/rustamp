@@ -123,10 +123,35 @@ const SELECTION_BUFFER_UNITS: usize = 32 * 1024;
 ///
 /// Call on the UI thread: the dialog runs its own modal message loop, exactly
 /// as the tray's popup menu does.
-#[cfg(windows)]
 pub fn pick_media_files(
     raw_owner: isize,
     title: &str,
+    multiple: bool,
+) -> Result<Vec<PathBuf>, FileDialogError> {
+    pick_files(raw_owner, title, MEDIA_FILTERS, multiple)
+}
+
+/// The file types the equalizer-preset open dialog offers.
+///
+/// Own choice: the `.eqf` library first, `All files` last so a renamed
+/// library stays reachable.
+pub const EQF_FILTERS: &[(&str, &str)] = &[("EQ library files", "*.eqf"), ("All files", "*.*")];
+
+/// Shows the file-open dialog for one equalizer preset library (`*.eqf`).
+///
+/// Returns `None` when the user cancelled. Same contract as
+/// [`pick_media_files`]: call on the UI thread.
+pub fn pick_eqf_file(raw_owner: isize, title: &str) -> Result<Option<PathBuf>, FileDialogError> {
+    Ok(pick_files(raw_owner, title, EQF_FILTERS, false)?
+        .into_iter()
+        .next())
+}
+
+#[cfg(windows)]
+fn pick_files(
+    raw_owner: isize,
+    title: &str,
+    filters: &[(&str, &str)],
     multiple: bool,
 ) -> Result<Vec<PathBuf>, FileDialogError> {
     use windows::Win32::Foundation::HWND;
@@ -139,7 +164,7 @@ pub fn pick_media_files(
     if raw_owner == 0 {
         return Err(FileDialogError::NullOwner);
     }
-    let mut filter = filter_string(MEDIA_FILTERS);
+    let mut filter = filter_string(filters);
     let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
     let mut selection = vec![0u16; SELECTION_BUFFER_UNITS];
     // `OFN_NOCHANGEDIR` keeps the dialog from moving the process's current
@@ -182,11 +207,97 @@ pub fn pick_media_files(
 
 /// Stub: there is no native file dialog off Windows yet (milestone M6).
 #[cfg(not(windows))]
-pub fn pick_media_files(
+fn pick_files(
     _raw_owner: isize,
     _title: &str,
+    _filters: &[(&str, &str)],
     _multiple: bool,
 ) -> Result<Vec<PathBuf>, FileDialogError> {
+    Err(FileDialogError::Unsupported)
+}
+
+/// The file types the save-playlist dialog offers, in order, as (label, patterns).
+///
+/// Own choice: M3U, M3U8, PLS, and XSPF are the formats `rustamp_playlist::write_playlist`
+/// supports. The default is M3U (`.m3u` extension).
+pub const PLAYLIST_SAVE_FILTERS: &[(&str, &str)] = &[
+    ("M3U Playlist", "*.m3u"),
+    ("M3U8 Playlist (UTF-8)", "*.m3u8"),
+    ("PLS Playlist", "*.pls"),
+    ("XSPF Playlist", "*.xspf"),
+];
+
+/// Shows the standard file-save dialog and returns the path the user chose.
+///
+/// `raw_owner` is the owner window's handle; the dialog is modal to it.
+/// `default_name` is the initial filename suggestion. A cancelled dialog is
+/// **not** an error: it returns `None`.
+///
+/// Call on the UI thread: the dialog runs its own modal message loop.
+#[cfg(windows)]
+pub fn save_playlist_file(
+    raw_owner: isize,
+    title: &str,
+    default_name: &str,
+) -> Result<Option<PathBuf>, FileDialogError> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Controls::Dialogs::{
+        CommDlgExtendedError, GetSaveFileNameW, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
+        OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    if raw_owner == 0 {
+        return Err(FileDialogError::NullOwner);
+    }
+    let mut filter = filter_string(PLAYLIST_SAVE_FILTERS);
+    let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
+    let mut selection: Vec<u16> = default_name
+        .encode_utf16()
+        .chain([0])
+        .chain(std::iter::repeat_n(
+            0,
+            SELECTION_BUFFER_UNITS - default_name.len() - 1,
+        ))
+        .collect();
+    let flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    let mut options = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: HWND(raw_owner as *mut core::ffi::c_void),
+        lpstrFilter: PCWSTR(filter.as_mut_ptr()),
+        lpstrFile: PWSTR(selection.as_mut_ptr()),
+        nMaxFile: SELECTION_BUFFER_UNITS as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        nFilterIndex: 1, // Default to M3U
+        lpstrDefExt: PCWSTR(['m' as u16, '3' as u16, 'u' as u16, 0].as_ptr()),
+        Flags: flags,
+        ..Default::default()
+    };
+    // SAFETY: every pointer in `options` is to a live local buffer that
+    // outlives this call, `nMaxFile` is the real length of `selection`, and
+    // the filter and title are NUL-terminated. The call is synchronous.
+    let chosen = unsafe { GetSaveFileNameW(&mut options) }.as_bool();
+    if !chosen {
+        // SAFETY: read immediately after the call, before any other OS call.
+        // Zero means the user cancelled, which is not a failure.
+        let error = unsafe { CommDlgExtendedError() };
+        if error.0 == 0 {
+            return Ok(None);
+        }
+        return Err(FileDialogError::Failed(error.0));
+    }
+    // Parse the single selected path (save dialog never returns multiple)
+    let paths = parse_selection(&selection);
+    Ok(paths.first().cloned())
+}
+
+/// Stub: there is no native save dialog off Windows yet (milestone M6).
+#[cfg(not(windows))]
+pub fn save_playlist_file(
+    _raw_owner: isize,
+    _title: &str,
+    _default_name: &str,
+) -> Result<Option<PathBuf>, FileDialogError> {
     Err(FileDialogError::Unsupported)
 }
 

@@ -9,6 +9,16 @@ Read these first, in this order:
 
 ## Short rules
 
+- **One worktree per subagent — always, before it starts** (owner rule, 2026-10-19).
+  Every subagent gets its **own `git worktree`** created *before* the subagent is
+  launched, never after. Two agents must never share a working directory or a
+  crate. The worktree path is the **first line** of the subagent's prompt. An
+  agent that cannot show its files from its own worktree has not finished.
+  Corollary: the canonical tree `D:\code\Rustamp` is orchestrator-only; a
+  subagent writes nothing there. Before creating the worktrees, make sure the
+  baseline is **committed** — a worktree is cut from a commit, so uncommitted
+  work in the canonical tree is invisible to every worktree.
+
 - **Tests always run in the interactive session** (owner rule, 2026-10-18).
   The guest's session 0 has no desktop, so anything that opens a window, a
   dialog, a menu or a plugin host fails there for the wrong reason. Run the
