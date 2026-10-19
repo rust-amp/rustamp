@@ -2440,6 +2440,8 @@ mod tests {
     ///
     /// The window is 300 ms on purpose: Windows accounts thread time on the
     /// system timer tick, so a shorter window could not tell the two apart.
+    /// This is an observation window, not a strict minimum for one OS timeout
+    /// (RFC 0007 §6.4 and §14.5). Early expiry must not shorten the CPU sample.
     #[cfg(windows)]
     #[test]
     fn a_blocking_read_sleeps_instead_of_spinning() {
@@ -2447,23 +2449,22 @@ mod tests {
 
         let (_producer, consumer) = pcm_ring_with_wake(8, 2);
 
-        let (read, cpu_micros, wall) = std::thread::scope(|scope| {
+        let (cpu_micros, wall) = std::thread::scope(|scope| {
             let worker = scope.spawn(move || {
                 let mut consumer = consumer;
                 let mut out = [0.0f32; 8];
-                let cpu_before = thread_cpu_micros();
-                let started = Instant::now();
                 // The ring is empty and nothing signals it, so this call can
                 // only end in the timeout.
-                let read = consumer.read_into_blocking(&mut out, Some(WINDOW)).unwrap();
-                let wall = started.elapsed();
-                let cpu_after = thread_cpu_micros();
-                (read, cpu_after.saturating_sub(cpu_before), wall)
+                observe_blocked_thread(WINDOW, |remaining| {
+                    let read = consumer
+                        .read_into_blocking(&mut out, Some(remaining))
+                        .unwrap();
+                    assert_eq!(read, 0, "the empty ring must time out, not deliver");
+                })
             });
             worker.join().unwrap()
         });
 
-        assert_eq!(read, 0, "the empty ring must time out, not deliver");
         assert!(
             wall >= WINDOW,
             "the wait returned after {wall:?}, before the requested {WINDOW:?}"
@@ -2497,22 +2498,19 @@ mod tests {
         producer.write_from(&[1.0f32, -1.0]).unwrap();
         assert_eq!(producer.free_frames(), 0);
 
-        let (written, cpu_micros, wall) = std::thread::scope(|scope| {
+        let (cpu_micros, wall) = std::thread::scope(|scope| {
             let worker = scope.spawn(move || {
                 let mut producer = producer;
-                let cpu_before = thread_cpu_micros();
-                let started = Instant::now();
-                let written = producer
-                    .write_from_blocking(&[2.0f32, -2.0], Some(WINDOW))
-                    .unwrap();
-                let wall = started.elapsed();
-                let cpu_after = thread_cpu_micros();
-                (written, cpu_after.saturating_sub(cpu_before), wall)
+                observe_blocked_thread(WINDOW, |remaining| {
+                    let written = producer
+                        .write_from_blocking(&[2.0f32, -2.0], Some(remaining))
+                        .unwrap();
+                    assert_eq!(written, 0, "the full ring must time out, not accept frames");
+                })
             });
             worker.join().unwrap()
         });
 
-        assert_eq!(written, 0, "the full ring must time out, not accept frames");
         assert!(
             wall >= WINDOW,
             "the wait returned after {wall:?}, before the requested {WINDOW:?}"
@@ -2531,6 +2529,28 @@ mod tests {
             "the blocked thread burned {cpu_micros} us of CPU; a wait in the kernel costs \
              next to nothing"
         );
+    }
+
+    /// Observe the same blocked thread for the entire CPU-accounting window.
+    /// A kernel timeout can expire early; continue with only the remaining
+    /// budget, without resetting either the wall clock or the CPU baseline.
+    /// Even immediate-return polling therefore accrues CPU throughout the
+    /// window and still fails the callers' unchanged CPU limits.
+    #[cfg(windows)]
+    fn observe_blocked_thread(window: Duration, mut wait: impl FnMut(Duration)) -> (u64, Duration) {
+        let cpu_before = thread_cpu_micros();
+        let started = Instant::now();
+        let mut remaining = window;
+        let wall = loop {
+            wait(remaining);
+            let elapsed = started.elapsed();
+            if elapsed >= window {
+                break elapsed;
+            }
+            remaining = window - elapsed;
+        };
+        let cpu_after = thread_cpu_micros();
+        (cpu_after.saturating_sub(cpu_before), wall)
     }
 
     /// The state machine of a wait: a condition that is already met returns at
