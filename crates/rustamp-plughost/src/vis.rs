@@ -16,6 +16,11 @@
 //!   step 2);
 //! * draw one frame: refresh the data arrays, call `render`, report the
 //!   plugin's own return value (S09 section 5.2, section 5.3 step 4b);
+//! * keep the state of the render loop (S09 section 5.3 step 4): when a frame
+//!   is due, what the data arrays hold, when the plugin asked to stop, and
+//!   how long the caller waits between two frames (S09 section 5.3 step 4b,
+//!   step 4c). [`VisLoop`] is that state; it is **driven by the caller** and
+//!   owns no thread;
 //! * stop the running visualization with `quit` (S09 section 5.3 step 5);
 //! * answer the input plugin's `vis_get_mode` and `vis_set_format` host
 //!   callbacks for the running visualization (S09 section 3.1 offset 0x78,
@@ -29,7 +34,8 @@
 //!   frame comes from the input plugin's decode thread and from the analyzer,
 //!   which is the audio path. Until that path exists, every frame is the
 //!   zeroed one S09 section 5.3 prescribes for a visualization that has no
-//!   frame.
+//!   frame: the caller hands the loop no rows, and the loop zeroes both
+//!   arrays.
 //! * **It does not run the vis thread.** S09 section 5.3 runs the loop on a
 //!   dedicated thread that also pumps the plugin's window messages. The host
 //!   process owns that thread; this module owns the per-frame step.
@@ -50,7 +56,7 @@ use rustamp_plugin_abi::common::{
 };
 use rustamp_plugin_abi::vis::{VisHeader, VisModule};
 
-use crate::loader::PluginLoadError;
+use crate::loader::{LoadedPlugin, PluginLoadError};
 
 /// Upper bound on the number of modules the host asks a library for.
 ///
@@ -129,6 +135,320 @@ pub struct VisRunInfo {
     pub init_called: bool,
     /// The raw value `init` returned.
     pub init_result: c_int,
+}
+
+/// The plugin-ready rows of one visualization frame (S09 section 5.2, offsets
+/// 0x024 and 0x4A4).
+///
+/// The host copies the spectrum rows and then the waveform rows into the
+/// module's arrays before every `render` (S09 section 5.3 step 4b). The rows
+/// are bytes, exactly as the plugin reads them. How they are derived from the
+/// audio is the analyzer's business — the derivation is spec S08, which does
+/// not exist yet — so this type carries the bytes and nothing else: the loop
+/// either copies them or zeroes both arrays completely (S09 section 5.3
+/// step 4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisRows {
+    /// The spectrum rows. Only the first `spectrum_rows` of them are used
+    /// (S09 section 5.2, offset 0x01C).
+    pub spectrum: [[u8; VIS_ROW_LEN]; VIS_MAX_ROWS],
+    /// The waveform rows. Only the first `waveform_rows` of them are used
+    /// (S09 section 5.2, offset 0x020).
+    pub waveform: [[u8; VIS_ROW_LEN]; VIS_MAX_ROWS],
+}
+
+/// What the player is doing, as the render loop needs to know (S09 section
+/// 5.3 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisPlayback {
+    /// A track is playing: the loop refreshes the data arrays and draws a
+    /// frame.
+    Playing,
+    /// Playback is paused: the loop draws nothing and refreshes nothing
+    /// (S09 section 5.3 step 4c).
+    Paused,
+    /// Playback is stopped: the loop draws one last frame with zeroed data
+    /// and then nothing until playback restarts (S09 section 5.3 step 4b).
+    Stopped,
+}
+
+/// What one step of the render loop did (S09 section 5.3 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisStep {
+    /// Nothing was drawn and nothing is due: the playback is paused, the
+    /// playback stopped and the last frame was already drawn, or no module
+    /// runs.
+    Idle,
+    /// Nothing was drawn: the next frame is not due yet. The caller waits for
+    /// the module's own delay (S09 section 5.3 step 4b).
+    NotDue,
+    /// A frame was drawn and the plugin asked to continue: its `render`
+    /// returned 0 (S09 section 5.2, offset 0x92C).
+    Rendered,
+    /// A frame was drawn and the plugin asked to end the visualization: its
+    /// `render` returned nonzero (S09 section 5.2, offset 0x92C). The host
+    /// leaves the loop and calls [`VisLoop::stop`], which runs the module's
+    /// `quit` (S09 section 5.3 step 5).
+    Ended {
+        /// The plugin's own return value, unchanged.
+        code: c_int,
+    },
+}
+
+/// What the loop would do at this time: the decision one step acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisDecision {
+    /// Nothing to do.
+    Idle,
+    /// The next frame is not due yet.
+    NotDue,
+    /// A frame is due.
+    Draw,
+}
+
+/// The state of the render loop of one visualization module (S09 section 5.3
+/// step 4).
+///
+/// S09 section 5.3 runs the loop on a **dedicated vis thread** that also
+/// pumps the plugin's window messages. That thread belongs to the host
+/// process, not to this crate: [`VisLoop`] is the state of one step of the
+/// loop, and the caller drives it.
+///
+/// ```text
+/// loop {
+///     match vis.step(&plugin, now_ms(), frame) {
+///         VisStep::Ended { .. } => { vis.stop(&mut plugin); break; }
+///         VisStep::Rendered => sleep(vis.delay_ms()),
+///         _ => sleep(vis.idle_sleep_ms()),
+///     }
+/// }
+/// ```
+///
+/// The rules the loop applies (S09 section 5.3 step 4):
+///
+/// * a frame is drawn while a track is playing; the data arrays hold the
+///   caller's rows, or are zeroed completely when there is no frame;
+/// * a paused visualization draws nothing and refreshes nothing;
+/// * when the playback stops, one last frame with zeroed data is drawn, and
+///   nothing after it until playback restarts;
+/// * a nonzero return from `render` ends the loop;
+/// * the caller waits the module's own `delay_ms` after a frame, and the
+///   smaller of one millisecond and `delay_ms` while nothing is drawn.
+#[derive(Debug, Default)]
+pub struct VisLoop {
+    /// What the player is doing. `None` while the player has not said yet.
+    playback: Option<VisPlayback>,
+    /// Whether a module is running: `init` succeeded and `quit` has not run.
+    running: bool,
+    /// Whether the plugin asked to end the visualization.
+    ended: bool,
+    /// Whether the last frame with zeroed data after a stop is still to be
+    /// drawn.
+    final_frame: bool,
+    /// The time at which the next frame is due.
+    next_frame_ms: Option<u64>,
+    /// The running module's own pause between two frames.
+    delay_ms: u32,
+}
+
+impl VisLoop {
+    /// A loop that has started no visualization.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start the visualization: the module's `init` runs (S09 section 5.3
+    /// step 2).
+    ///
+    /// A visualization that is already running is stopped first, because only
+    /// one visualization is active at a time (S09 section 5.3 step 1). A
+    /// refusing `init` aborts the start, and nothing runs (S09 section 5.2,
+    /// offset 0x928).
+    pub fn start(&mut self, plugin: &mut LoadedPlugin, index: i32) -> Result<(), VisError> {
+        plugin.vis_start(index)?;
+        // The module's own cadence (S09 section 5.2, offsets 0x014 and 0x018).
+        // A negative delay is nonsense: the host waits no time at all then.
+        self.delay_ms = plugin
+            .vis_run_info()
+            .map(|info| u32::try_from(info.delay_ms.max(0)).unwrap_or(0))
+            .unwrap_or(0);
+        self.running = true;
+        self.ended = false;
+        self.final_frame = false;
+        self.next_frame_ms = None;
+        Ok(())
+    }
+
+    /// Stop the visualization: the module's `quit` runs (S09 section 5.3
+    /// step 5).
+    ///
+    /// The call is idempotent: a loop that runs no module quits nothing, and
+    /// a loop that already stopped does not reach the plugin twice.
+    pub fn stop(&mut self, plugin: &mut LoadedPlugin) {
+        if !self.running {
+            return;
+        }
+        self.running = false;
+        self.ended = false;
+        self.final_frame = false;
+        self.next_frame_ms = None;
+        // S09 section 5.3 step 5: `quit(module)` runs when the loop is left.
+        plugin.quit();
+    }
+
+    /// Tell the loop what the player is doing.
+    ///
+    /// The transition matters twice (S09 section 5.3 step 4b): a playback
+    /// that stops draws one last frame with zeroed data, and a playback that
+    /// restarts draws a frame again. A repeated state changes nothing, so a
+    /// player that publishes its state often does not disturb the cadence.
+    pub fn set_playback(&mut self, playback: VisPlayback) {
+        if self.playback == Some(playback) {
+            return;
+        }
+        let previous = self.playback.replace(playback);
+        // A new state starts the cadence afresh: the first frame after the
+        // change is due at once.
+        self.next_frame_ms = None;
+        // The last frame with zeroed data is drawn when the playback stops
+        // after it ran (S09 section 5.3 step 4b).
+        self.final_frame = matches!(
+            (previous, playback),
+            (
+                Some(VisPlayback::Playing | VisPlayback::Paused),
+                VisPlayback::Stopped
+            )
+        );
+    }
+
+    /// What the player is doing, as the loop last heard it. `None` while the
+    /// player has not said yet.
+    pub fn playback(&self) -> Option<VisPlayback> {
+        self.playback
+    }
+
+    /// Whether a frame is due at this time (S09 section 5.3 step 4).
+    pub fn should_render(&self, now_ms: u64) -> bool {
+        matches!(self.decision(now_ms), VisDecision::Draw)
+    }
+
+    /// One step of the render loop (S09 section 5.3 step 4).
+    ///
+    /// The data arrays are refreshed and the plugin's `render` is called when
+    /// a frame is due. The rows are the caller's frame — the one the host
+    /// picked from its frame ring — or none, in which case both arrays are
+    /// zeroed completely (S09 section 5.3 step 4b). A nonzero return from
+    /// `render` ends the loop (S09 section 5.2, offset 0x92C); the host then
+    /// calls [`stop`](Self::stop), which runs the module's `quit`.
+    pub fn step(
+        &mut self,
+        plugin: &LoadedPlugin,
+        now_ms: u64,
+        rows: Option<&VisRows>,
+    ) -> Result<VisStep, VisError> {
+        match self.decision(now_ms) {
+            VisDecision::Idle => Ok(VisStep::Idle),
+            VisDecision::NotDue => Ok(VisStep::NotDue),
+            VisDecision::Draw => {
+                // Nothing plays: the last frame after a stop is drawn with
+                // zeroed data (S09 section 5.3 step 4b).
+                let rows = match self.playback {
+                    Some(VisPlayback::Playing) => rows,
+                    _ => None,
+                };
+                let code = match plugin.vis_render(rows) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        // The loop is over, but the module still runs: the
+                        // host leaves the loop and calls `stop`, which quits
+                        // it (S09 §5.3 step 5).
+                        self.ended = true;
+                        return Err(error);
+                    }
+                };
+                // The cadence: the next frame is due one delay from now.
+                self.next_frame_ms = Some(now_ms + u64::from(self.delay_ms));
+                if self.playback == Some(VisPlayback::Stopped) {
+                    // The last frame after a stop is drawn once (S09 section
+                    // 5.3 step 4b).
+                    self.final_frame = false;
+                }
+                if code == 0 {
+                    Ok(VisStep::Rendered)
+                } else {
+                    // S09 section 5.2: a nonzero return ends the visualization.
+                    self.ended = true;
+                    Ok(VisStep::Ended { code })
+                }
+            }
+        }
+    }
+
+    /// The module's own pause between two frames, in milliseconds (S09
+    /// section 5.2, offset 0x018).
+    ///
+    /// S09 section 5.3 step 4b: the host sleeps this after every frame. The
+    /// render time is **not** subtracted, so the real interval is the render
+    /// time plus this pause.
+    pub fn delay_ms(&self) -> u32 {
+        self.delay_ms
+    }
+
+    /// The pause the loop takes when it draws nothing: the smaller of one
+    /// millisecond and the module's own delay (S09 section 5.3 step 4c).
+    pub fn idle_sleep_ms(&self) -> u32 {
+        self.delay_ms.min(1)
+    }
+
+    /// Whether a module is running: its `init` succeeded and its `quit` has
+    /// not run yet.
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// What the loop would do at this time.
+    fn decision(&self, now_ms: u64) -> VisDecision {
+        if !self.running || self.ended {
+            return VisDecision::Idle;
+        }
+        match self.playback {
+            // S09 section 5.3 step 4c: a paused visualization draws nothing
+            // and refreshes nothing.
+            Some(VisPlayback::Paused) => VisDecision::Idle,
+            // S09 section 5.3 step 4b: the last frame with zeroed data after
+            // a stop, then nothing until playback restarts.
+            Some(VisPlayback::Stopped) => {
+                if self.final_frame {
+                    VisDecision::Draw
+                } else {
+                    VisDecision::Idle
+                }
+            }
+            // S09 section 5.3 step 4b: a frame per iteration while a track
+            // plays.
+            Some(VisPlayback::Playing) => {
+                if self.frame_due(now_ms) {
+                    VisDecision::Draw
+                } else {
+                    VisDecision::NotDue
+                }
+            }
+            // The player has not said what it is doing yet.
+            None => VisDecision::Idle,
+        }
+    }
+
+    /// Whether the next frame is due at this time.
+    ///
+    /// The cadence is the module's own `delay_ms` (S09 section 5.2, offset
+    /// 0x018). The caller sleeps that long after every frame, so the frame
+    /// after it is due one delay later.
+    fn frame_due(&self, now_ms: u64) -> bool {
+        match self.next_frame_ms {
+            None => true,
+            Some(due) => now_ms >= due,
+        }
+    }
 }
 
 /// One module of a visualization library: the plugin's own struct and the
@@ -389,18 +709,51 @@ pub(crate) unsafe fn zero_vis_data(module: *mut VisModule) {
     }
 }
 
+/// Copy the frame's rows into the module's data arrays (S09 section 5.3
+/// step 4b).
+///
+/// The host copies `spectrum_rows` rows and then `waveform_rows` rows
+/// (S09 section 5.3 step 4b). A module that asks for fewer rows than the
+/// arrays hold gets exactly the rows it asked for; a module that asks for
+/// more than the two the ABI has is served the two (S09 section 5.2).
+///
+/// # Safety
+///
+/// `module` must point at a live `winampVisModule` in plugin static data.
+unsafe fn copy_vis_rows(module: *mut VisModule, rows: &VisRows) {
+    // SAFETY: the caller guarantees a live module; both counts are members.
+    let (spectrum_rows, waveform_rows) =
+        unsafe { ((*module).spectrum_rows, (*module).waveform_rows) };
+    let spectrum_rows = spectrum_rows.clamp(0, VIS_MAX_ROWS as i32) as usize;
+    let waveform_rows = waveform_rows.clamp(0, VIS_MAX_ROWS as i32) as usize;
+    // SAFETY: same live module. Both counts are clamped to the length of the
+    // inline arrays, so no index is out of bounds.
+    unsafe {
+        for row in 0..spectrum_rows {
+            (*module).spectrum_data[row] = rows.spectrum[row];
+        }
+        for row in 0..waveform_rows {
+            (*module).waveform_data[row] = rows.waveform[row];
+        }
+    }
+}
+
 /// Draw one frame (S09 section 5.3 step 4b).
 ///
-/// The data arrays are refreshed first — here: zeroed, because no frame is
-/// available — and then the plugin's `render` is called. Its return value is
-/// the plugin's own: 0 continues the visualization, a nonzero value ends it
-/// and the host then calls `quit` (S09 section 5.2, offset 0x92C).
+/// The data arrays are refreshed first: the frame's rows, or zeroed
+/// completely when there is no frame — the case until the audio path feeds
+/// the host. Then the plugin's `render` is called. Its return value is the
+/// plugin's own: 0 continues the visualization, a nonzero value ends it and
+/// the host then calls `quit` (S09 section 5.2, offset 0x92C).
 ///
 /// # Safety
 ///
 /// `module` must point at a live `winampVisModule` in plugin static data; the
 /// plugin's `render` runs here on the caller's thread.
-pub(crate) unsafe fn render_vis_frame(module: *mut VisModule) -> Result<c_int, VisError> {
+pub(crate) unsafe fn render_vis_frame(
+    module: *mut VisModule,
+    rows: Option<&VisRows>,
+) -> Result<c_int, VisError> {
     if module.is_null() {
         return Err(VisError::NotRunning);
     }
@@ -410,6 +763,10 @@ pub(crate) unsafe fn render_vis_frame(module: *mut VisModule) -> Result<c_int, V
     };
     // SAFETY: same live module.
     unsafe { zero_vis_data(module) };
+    if let Some(rows) = rows {
+        // SAFETY: same live module.
+        unsafe { copy_vis_rows(module, rows) };
+    }
     // SAFETY: cdecl, one argument (S09 section 5.2, offset 0x92C).
     Ok(unsafe { render(module) })
 }
@@ -594,6 +951,24 @@ mod tests {
         5
     }
 
+    /// `render` reads the first byte of every row of both data arrays.
+    unsafe extern "C" fn test_render_rows(module: *mut VisModule) -> c_int {
+        if module.is_null() {
+            return -1;
+        }
+        // SAFETY: the test owns the module and keeps it alive across the call.
+        let (s0, s1, w0, w1) = unsafe {
+            (
+                (*module).spectrum_data[0][0],
+                (*module).spectrum_data[1][0],
+                (*module).waveform_data[0][0],
+                (*module).waveform_data[1][0],
+            )
+        };
+        vis_note(format!("render rows s0={s0} s1={s1} w0={w0} w1={w1}"));
+        0
+    }
+
     /// `quit` records the teardown.
     unsafe extern "C" fn test_quit(_module: *mut VisModule) {
         vis_note("quit");
@@ -756,7 +1131,7 @@ mod tests {
         module.waveform_data[1][575] = 200;
         // SAFETY: live stack module; no DLL is involved.
         let code =
-            unsafe { render_vis_frame(&mut module) }.expect("a module with render must draw");
+            unsafe { render_vis_frame(&mut module, None) }.expect("a module with render must draw");
         assert_eq!(code, 0, "0 means the visualization continues (S09 §5.2)");
         assert_eq!(
             vis_log(),
@@ -768,7 +1143,7 @@ mod tests {
         ending.render = Some(test_render_ending);
         // SAFETY: live stack module; no DLL is involved.
         let code =
-            unsafe { render_vis_frame(&mut ending) }.expect("a module with render must draw");
+            unsafe { render_vis_frame(&mut ending, None) }.expect("a module with render must draw");
         assert_eq!(
             code, 5,
             "the plugin's own return value is reported unchanged"
@@ -782,7 +1157,8 @@ mod tests {
         let mut module = test_module(c"silent");
         module.render = None;
         // SAFETY: live stack module; no DLL is involved.
-        let error = unsafe { render_vis_frame(&mut module) }.expect_err("a null render must fail");
+        let error =
+            unsafe { render_vis_frame(&mut module, None) }.expect_err("a null render must fail");
         assert_eq!(error, VisError::MissingRender);
         assert!(vis_log().is_empty());
     }
@@ -863,7 +1239,7 @@ mod tests {
 
         // Nothing runs before the user picks a module.
         assert!(!plugin.is_initialized());
-        assert_eq!(plugin.vis_render(), Err(VisError::NotRunning));
+        assert_eq!(plugin.vis_render(None), Err(VisError::NotRunning));
         assert!(vis_log().is_empty());
 
         plugin.vis_start(0).expect("the module must start");
@@ -879,8 +1255,8 @@ mod tests {
         assert_eq!(run.delay_ms, 14);
         assert!(run.init_called);
         assert_eq!(run.init_result, 0);
-        assert_eq!(plugin.vis_render().expect("a frame must be drawn"), 0);
-        assert_eq!(plugin.vis_render().expect("a frame must be drawn"), 0);
+        assert_eq!(plugin.vis_render(None).expect("a frame must be drawn"), 0);
+        assert_eq!(plugin.vis_render(None).expect("a frame must be drawn"), 0);
         assert_eq!(
             vis_log(),
             vec![
@@ -896,7 +1272,7 @@ mod tests {
             plugin.vis_run_info().is_none(),
             "no module runs after the quit"
         );
-        assert_eq!(plugin.vis_render(), Err(VisError::NotRunning));
+        assert_eq!(plugin.vis_render(None), Err(VisError::NotRunning));
         assert_eq!(
             vis_log().last(),
             Some(&"quit".to_string()),
@@ -998,9 +1374,314 @@ mod tests {
             Err(VisError::WrongKind(PluginKind::Output))
         );
         assert_eq!(
-            other.vis_render(),
+            other.vis_render(None),
             Err(VisError::WrongKind(PluginKind::Output))
         );
         assert!(other.vis_info().is_none());
+    }
+
+    /// A frame whose rows carry a known byte, so a test can tell a copied row
+    /// from a zeroed one.
+    fn test_rows() -> VisRows {
+        VisRows {
+            spectrum: [[0xA0; VIS_ROW_LEN]; VIS_MAX_ROWS],
+            waveform: [[0xB0; VIS_ROW_LEN]; VIS_MAX_ROWS],
+        }
+    }
+
+    /// A synthetic library with one module, wrapped as a loaded plugin.
+    ///
+    /// The module lives on the caller's stack and stays alive as long as the
+    /// returned plugin is used.
+    fn test_plugin(module: &mut VisModule) -> LoadedPlugin {
+        let mut header = test_header(vec![module as *mut VisModule]);
+        // SAFETY: live stack header and module; no DLL is involved.
+        let modules = unsafe { list_vis_modules(&mut header) }.expect("a valid header must list");
+        LoadedPlugin::vis_for_test("vis_synthetic", &mut header, modules, 0x99)
+    }
+
+    #[test]
+    fn a_step_without_a_frame_zeroes_both_arrays() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        module.render = Some(test_render_rows);
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+        vis.set_playback(VisPlayback::Playing);
+
+        // No frame is available yet: the audio path does not exist. The
+        // arrays are zeroed completely (S09 §5.3 step 4b).
+        assert_eq!(
+            vis.step(&plugin, 0, None).expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+        assert_eq!(
+            vis_log().last(),
+            Some(&"render rows s0=0 s1=0 w0=0 w1=0".to_string()),
+            "both arrays must be zeroed before the frame is drawn"
+        );
+    }
+
+    #[test]
+    fn a_step_copies_the_rows_the_module_asked_for() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        module.render = Some(test_render_rows);
+        // The module asks for one spectrum row and two waveform rows
+        // (S09 §5.2, offsets 0x01C and 0x020).
+        module.spectrum_rows = 1;
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+        vis.set_playback(VisPlayback::Playing);
+
+        let rows = test_rows();
+        assert_eq!(
+            vis.step(&plugin, 0, Some(&rows))
+                .expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+        assert_eq!(
+            vis_log().last(),
+            Some(&"render rows s0=160 s1=0 w0=176 w1=176".to_string()),
+            "the rows the module asked for are copied, the others stay zeroed"
+        );
+    }
+
+    #[test]
+    fn a_nonzero_render_return_ends_the_loop() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        module.render = Some(test_render_ending);
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+        vis.set_playback(VisPlayback::Playing);
+
+        // S09 §5.2: a nonzero return ends the visualization.
+        assert_eq!(
+            vis.step(&plugin, 0, None).expect("a frame must be drawn"),
+            VisStep::Ended { code: 5 }
+        );
+        assert!(!vis.should_render(0), "the loop is over");
+        assert_eq!(
+            vis.step(&plugin, 1_000, None)
+                .expect("no frame may be drawn"),
+            VisStep::Idle
+        );
+        assert_eq!(
+            vis_log(),
+            vec![
+                "init parent=0x99 instance=0x0 rate=44100 channels=2",
+                "render ending",
+            ],
+            "the plugin must be called once, not once per step"
+        );
+
+        // Leaving the loop runs the module's `quit` (S09 §5.3 step 5).
+        vis.stop(&mut plugin);
+        assert_eq!(vis_log().last(), Some(&"quit".to_string()));
+    }
+
+    #[test]
+    fn a_module_without_render_is_refused_and_still_quit() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        module.render = None;
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+        vis.set_playback(VisPlayback::Playing);
+
+        // A null render slot is never called (S09 §5.2, offset 0x92C).
+        assert_eq!(
+            vis.step(&plugin, 0, None),
+            Err(VisError::MissingRender),
+            "the step must report the refusal"
+        );
+        assert!(
+            !vis_log().iter().any(|entry| entry.starts_with("render")),
+            "the plugin must not be called through a null slot: {:?}",
+            vis_log()
+        );
+
+        // The module still runs, so leaving the loop quits it (S09 §5.3
+        // step 5).
+        vis.stop(&mut plugin);
+        assert_eq!(vis_log().last(), Some(&"quit".to_string()));
+    }
+
+    #[test]
+    fn a_paused_visualization_draws_nothing() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        module.render = Some(test_render_rows);
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+        vis.set_playback(VisPlayback::Playing);
+        assert_eq!(
+            vis.step(&plugin, 0, None).expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+
+        // S09 §5.3 step 4c: a paused visualization makes no render call and
+        // no data refresh.
+        vis.set_playback(VisPlayback::Paused);
+        assert!(!vis.should_render(1_000));
+        assert_eq!(
+            vis.step(&plugin, 1_000, None)
+                .expect("no frame may be drawn"),
+            VisStep::Idle
+        );
+        assert_eq!(
+            vis_log().len(),
+            2,
+            "the paused step must not reach the plugin: {:?}",
+            vis_log()
+        );
+
+        // The pause while nothing is drawn is the smaller of one millisecond
+        // and the module's own delay (S09 §5.3 step 4c).
+        assert_eq!(vis.idle_sleep_ms(), 1);
+    }
+
+    #[test]
+    fn the_playback_stopping_draws_one_last_zeroed_frame() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        module.render = Some(test_render_rows);
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+        vis.set_playback(VisPlayback::Playing);
+        assert_eq!(
+            vis.step(&plugin, 0, None).expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+
+        // S09 §5.3 step 4b: the playback stops, one last frame with zeroed
+        // data is drawn, and nothing after it until playback restarts.
+        vis.set_playback(VisPlayback::Stopped);
+        assert_eq!(
+            vis.step(&plugin, 1_000, None)
+                .expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+        assert_eq!(
+            vis_log().last(),
+            Some(&"render rows s0=0 s1=0 w0=0 w1=0".to_string()),
+            "the last frame after a stop carries zeroed data"
+        );
+        assert_eq!(
+            vis.step(&plugin, 1_100, None)
+                .expect("no frame may be drawn"),
+            VisStep::Idle
+        );
+        assert_eq!(vis_log().len(), 3, "the last frame is drawn once");
+
+        // A restart draws a frame again.
+        vis.set_playback(VisPlayback::Playing);
+        assert_eq!(
+            vis.step(&plugin, 1_200, None)
+                .expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+        assert_eq!(vis_log().len(), 4);
+    }
+
+    #[test]
+    fn the_cadence_follows_the_modules_own_delay() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        module.delay_ms = 14;
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+        vis.set_playback(VisPlayback::Playing);
+
+        // S09 §5.2, offset 0x018: the module's own delay is the pause
+        // between two frames.
+        assert_eq!(vis.delay_ms(), 14);
+        assert_eq!(
+            vis.step(&plugin, 100, None).expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+        // The next frame is due one delay later: the render time is not
+        // subtracted, so the real interval is the render time plus the delay
+        // (S09 §5.3 step 4b).
+        assert!(!vis.should_render(113));
+        assert!(vis.should_render(114));
+        assert_eq!(
+            vis.step(&plugin, 113, None).expect("no frame may be drawn"),
+            VisStep::NotDue
+        );
+        assert_eq!(
+            vis.step(&plugin, 114, None).expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+    }
+
+    #[test]
+    fn the_stop_calls_the_plugins_quit_exactly_once() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.start(&mut plugin, 0).expect("the module must start");
+        assert!(vis.is_running());
+
+        // S09 §5.3 step 5: leaving the loop runs the module's `quit`.
+        vis.stop(&mut plugin);
+        assert!(!vis.is_running());
+        assert_eq!(
+            vis_log(),
+            vec![
+                "init parent=0x99 instance=0x0 rate=44100 channels=2",
+                "quit",
+            ],
+            "the order is init, then quit"
+        );
+
+        // A second stop must not reach the plugin again.
+        vis.stop(&mut plugin);
+        assert_eq!(vis_log().len(), 2);
+    }
+
+    #[test]
+    fn a_loop_that_never_started_quits_nothing() {
+        let _guard = VIS_SLOT_LOCK.lock().unwrap();
+        vis_log_clear();
+        let mut module = test_module(c"first");
+        let mut plugin = test_plugin(&mut module);
+
+        let mut vis = VisLoop::new();
+        vis.stop(&mut plugin);
+        assert!(
+            vis_log().is_empty(),
+            "nothing was started, so nothing is quit"
+        );
+        assert_eq!(
+            vis.step(&plugin, 0, None).expect("no frame may be drawn"),
+            VisStep::Idle
+        );
+        assert!(vis_log().is_empty());
     }
 }

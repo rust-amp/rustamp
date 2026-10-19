@@ -124,7 +124,7 @@ use crate::dsp::DspModuleEntry;
 use crate::dsp::{DspError, DspLibraryInfo, DspRunInfo};
 #[cfg(any(windows, test))]
 use crate::input::{InModuleInfo, InputError};
-use crate::vis::{VisError, VisLibraryInfo, VisModuleEntry, VisRunInfo};
+use crate::vis::{VisError, VisLibraryInfo, VisModuleEntry, VisRows, VisRunInfo};
 
 mod image;
 use image::PreparedImage;
@@ -1325,11 +1325,14 @@ impl LoadedPlugin {
 
     /// Draw one frame of the running visualization (S09 §5.3 step 4b).
     ///
-    /// The plugin's own return value is reported: 0 continues the
-    /// visualization, a nonzero value ends it and the host then calls `quit`
-    /// (S09 §5.2, offset 0x92C). With no module running — nothing started
-    /// yet, or another visualization took over — nothing is called.
-    pub fn vis_render(&self) -> Result<i32, VisError> {
+    /// The data arrays are refreshed first: the frame's rows, or zeroed
+    /// completely when there is no frame (S09 §5.3 step 4b). Then the
+    /// plugin's own `render` is called and its return value is reported: 0
+    /// continues the visualization, a nonzero value ends it and the host then
+    /// calls `quit` (S09 §5.2, offset 0x92C). With no module running —
+    /// nothing started yet, or another visualization took over — nothing is
+    /// called.
+    pub fn vis_render(&self, rows: Option<&VisRows>) -> Result<i32, VisError> {
         let module = match self.inner {
             #[cfg(any(windows, test))]
             LoadedPluginInner::Vis { active, .. } => match active {
@@ -1347,7 +1350,7 @@ impl LoadedPlugin {
         let _scope = plugin_call_scope(&self.identity, "render");
         // SAFETY: the module lives in the mapped plugin's static data, which
         // the retained mapping keeps alive.
-        unsafe { crate::vis::render_vis_frame(module) }
+        unsafe { crate::vis::render_vis_frame(module, rows) }
     }
 
     /// Start one of the library's modules (S09 §6.3 step 1).
