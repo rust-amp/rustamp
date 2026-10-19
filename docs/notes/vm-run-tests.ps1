@@ -700,9 +700,10 @@ if ($Filter -like '--ignored*') {
         [pscustomobject]@{ Group = 'Group B (VM Real Process)'; Name = 'app_published_state_reaches_the_host_window' },
         [pscustomobject]@{ Group = 'Group B (VM Real Process)'; Name = 'creates_the_real_host_window_vm_only' },
 
-        # Group C — VM two-process resident fixtures (4 tests)
+        # Group C — VM two-process resident fixtures (5 tests)
         [pscustomobject]@{ Group = 'Group C (Resident Fixtures)'; Name = 'named_pcm_two_process_transfer_and_seek' },
         [pscustomobject]@{ Group = 'Group C (Resident Fixtures)'; Name = 'pcm_process::host_exits_mid_stream_and_infinite_read_survives'; Search = 'host_exits_mid_stream_and_infinite_read_survives'; Binary = 'pcm_process' },
+        [pscustomobject]@{ Group = 'Group C (Resident Fixtures)'; Name = 'pcm_process::killing_the_helper_mid_stream_is_a_loud_error_and_never_a_torn_frame'; Search = 'killing_the_helper_mid_stream_is_a_loud_error_and_never_a_torn_frame'; Binary = 'pcm_process' },
         [pscustomobject]@{ Group = 'Group C (Resident Fixtures)'; Name = 'named_dsp_two_process_gain_round_trip_then_sticky_eos' },
         [pscustomobject]@{ Group = 'Group C (Resident Fixtures)'; Name = 'dsp_process::host_exits_mid_stream_and_infinite_read_survives'; Search = 'host_exits_mid_stream_and_infinite_read_survives'; Binary = 'dsp_process' },
 

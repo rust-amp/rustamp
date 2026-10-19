@@ -1,6 +1,8 @@
 //! Headless in-process protocol/worker tests. Run in the test VM, not the host.
 //! Channel byte streams exercise production framing and the real ring/wake API.
 
+#[path = "support/frame_pattern.rs"]
+mod frame_pattern;
 #[path = "support/resident.rs"]
 mod resident;
 
@@ -796,6 +798,153 @@ fn abrupt_control_loss_wakes_infinite_pcm_wait_without_eos() {
         .recv_timeout(STALL_WAIT)
         .expect("control EOF must wake an infinite PCM wait");
     assert!(matches!(outcome, Err(MediaHostError::Disconnected(_))));
+}
+
+/// A host that dies mid-stream must leave the consumer with whole frames
+/// only, and then with a loud, typed error.
+///
+/// The fake host publishes three frames and then vanishes without a terminal
+/// message and without closing its ring - a crash surrogate, the same shape
+/// as a helper that is killed from the outside. The consumer must receive
+/// exactly those three frames, each whole and in order (a torn, missing or
+/// reordered frame breaks the fixture's pattern), and then report
+/// `Disconnected`: never a silent end of stream, never a hang. The failure
+/// must also stick: a later read may not turn into end of stream.
+///
+/// The wake of a blocked consumer is pinned by
+/// `abrupt_control_loss_wakes_infinite_pcm_wait_without_eos`; this test pins
+/// the frames around the death and the stickiness of the failure.
+#[test]
+fn a_dead_host_delivers_whole_frames_and_then_fails_loudly() {
+    /// Frames the fake host publishes before it dies.
+    const PUBLISHED: usize = 3;
+
+    let ((ar, aw), (br, bw)) = streams();
+    let peer = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let rings = TestRings::default();
+    let host_rings = rings.clone();
+    let (die, death) = mpsc::channel();
+    thread::spawn(move || {
+        // Deliberately no ControlPeer or close guard at the fake host end.
+        let mut transport = StreamTransport::new(br, bw);
+        transport.send(&Message::hello()).unwrap();
+        let mut offer = None;
+        loop {
+            match transport.recv().unwrap() {
+                Message::Hello { .. } => {}
+                Message::Ping(token) => transport.send(&Message::Pong(token)).unwrap(),
+                Message::DecoderOpen {
+                    prefetch_frames, ..
+                } => {
+                    let spec = PcmSpecWire {
+                        sample_rate_hz: 1000,
+                        channels: 2,
+                    };
+                    transport
+                        .send(&Message::DecoderOpened {
+                            spec,
+                            duration_ms: None,
+                            seekable: false,
+                            metadata: Default::default(),
+                        })
+                        .unwrap();
+                    let ring = host_rings.create(spec, prefetch_frames).unwrap();
+                    transport.send(&ring.message).unwrap();
+                    offer = Some(ring);
+                }
+                Message::RingReady { .. } => {
+                    let mut ring = offer.take().unwrap();
+                    for index in 0..PUBLISHED {
+                        ring.producer
+                            .write_from_blocking(
+                                &frame_pattern::frame_samples(index),
+                                Some(STALL_WAIT),
+                            )
+                            .unwrap();
+                    }
+                    death
+                        .recv_timeout(STALL_WAIT)
+                        .expect("stall: the test never released the fake host");
+                    // The host dies here: the transport is dropped, so the
+                    // control channel ends, and the ring is never closed.
+                    // A killed process leaves both exactly like this.
+                    break;
+                }
+                message => panic!("unexpected {message:?}"),
+            }
+        }
+    });
+    let mut session = DecoderSession::open(
+        peer,
+        rings,
+        MediaLocationWire::Url("fake".into()),
+        PUBLISHED as u32,
+    )
+    .unwrap();
+
+    // The published frames: whole, in order and nothing else.
+    let mut out = [0.0; 8];
+    let mut delivered = 0usize;
+    while delivered < PUBLISHED {
+        match session.read(&mut out, Some(STALL_WAIT)) {
+            Ok(0) => panic!("a dead host must not look like end of stream"),
+            Ok(count) => {
+                for chunk in out[..count * 2].as_chunks::<2>().0 {
+                    assert_eq!(
+                        *chunk,
+                        frame_pattern::frame_samples(delivered),
+                        "frame {delivered} was torn, missing or out of order"
+                    );
+                    delivered += 1;
+                }
+            }
+            Err(MediaHostError::TimedOut) => panic!(
+                "stall: the resident stopped delivering without EOS or an error \
+                 (the fake host published no PCM within {STALL_WAIT:?})"
+            ),
+            Err(error) => panic!("the host was still alive: {error}"),
+        }
+    }
+    assert_eq!(delivered, PUBLISHED);
+
+    // The consumer now waits in an infinite read while the host dies. Whether
+    // the wait starts before the death or after it, the outcome must be the
+    // same loud error: a wait that is already blocked is woken by the control
+    // EOF, a wait that starts later sees the sticky failure.
+    let (done, outcome) = mpsc::channel();
+    thread::spawn(move || {
+        let mut out = [0.0; 2];
+        let first = session.read(&mut out, None);
+        // The failure must stick: a later read may not turn into end of stream.
+        let second = session.read(&mut out, Some(STALL_WAIT));
+        let _ = done.send((first, second));
+    });
+    die.send(()).unwrap();
+    let (first, second) = outcome
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: a dead host must wake the blocked consumer");
+    let error = match first {
+        Ok(frames) => panic!("a dead host must not look like end of stream ({frames} frames)"),
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(reason) = &error else {
+        panic!("a dead host must report a loud, typed error: {error}");
+    };
+    assert!(
+        reason.contains("control stream ended"),
+        "the death must be seen on the control channel: {error}"
+    );
+    let again = match second {
+        Ok(frames) => {
+            panic!(
+                "the failure must stick: a dead host turned into end of stream ({frames} frames)"
+            )
+        }
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(_) = &again else {
+        panic!("the failure must stick as the same loud error: {again}");
+    };
 }
 
 #[test]
