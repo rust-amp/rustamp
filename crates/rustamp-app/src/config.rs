@@ -6,10 +6,11 @@
 //! (volume, balance, skin path, double-size mode, always-on-top, easy-move,
 //! equalizer state, and window placements).
 //!
-//! For settings that cannot be honoured yet (e.g. output backend/device selection,
+//! For settings that cannot be honoured yet (e.g. output backend selection,
 //! audio buffer lengths, shuffle/repeat playback modes, and plugins), the
 //! configuration loader reports clear warnings rather than silently ignoring them.
-//! ReplayGain is now honoured (audio.replaygain).
+//! ReplayGain is now honoured (audio.replaygain), and so is the output device
+//! (audio.device).
 //!
 //! On clean exit, the app writes an honest configuration to `%RUSTAMP_CONFIG%`
 //! (when set) or `%APPDATA%\Rustamp\rustamp.toml`. The serialized configuration
@@ -135,12 +136,11 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
         for key in audio.keys() {
             let reason = match key.as_str() {
                 "output" => Some("only the default audio backend is supported"),
-                "device" => Some("audio device selection is not supported yet"),
                 "buffer_ms" => Some("output buffer length is fixed"),
                 "fadeout_ms" => Some("fadeout duration is not supported yet"),
                 "gapless" => Some("gapless mode is not configurable"),
                 "replaygain" => None,
-                "volume" | "balance" | "output_mode" => None,
+                "volume" | "balance" | "output_mode" | "device" => None,
                 _ => Some("unrecognized audio setting"),
             };
             if let Some(r) = reason {
@@ -301,7 +301,7 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
 
 /// Serializes a [`Config`] to TOML, including **only** fields that the player actually honours.
 ///
-/// Unhonoured / unapplied fields (such as `audio.output`, `audio.device`, `audio.buffer_ms`,
+/// Unhonoured / unapplied fields (such as `audio.output`, `audio.buffer_ms`,
 /// `audio.fadeout_ms`, `audio.gapless`, `playlist.shuffle`,
 /// `playlist.repeat`, `playlist.manual_advance`, `playlist.last_playlist`, and `plugins.*`) are
 /// omitted so the config file does not advertise unsupported features or mislead users.
@@ -349,11 +349,18 @@ pub fn serialize_honest(
             .to_owned(),
         ),
     );
+    // The device the player opens is honoured (see `crate::output`), so the
+    // name is persisted — but only when one is configured, so that the
+    // default file stays small.
+    if let Some(device) = &config.audio.device {
+        audio.insert("device".into(), toml::Value::String(device.clone()));
+    }
     // Note on deliberately unpersisted fields:
-    // audio.output, audio.device, audio.buffer_ms, audio.fadeout_ms and
-    // audio.gapless are deliberately not persisted because the audio engine
-    // does not support runtime configuration of them yet. audio.replaygain is
-    // persisted: it is honoured by the engine (task card E4/A15 wiring).
+    // audio.output, audio.buffer_ms, audio.fadeout_ms and audio.gapless are
+    // deliberately not persisted because the audio engine does not support
+    // runtime configuration of them yet. audio.replaygain and audio.device are
+    // persisted: they are honoured by the engine (task card E4/A15 wiring and
+    // the device selection).
     root.insert("audio".into(), toml::Value::Table(audio));
 
     let mut ui = toml::Table::new();
@@ -447,7 +454,7 @@ pub fn serialize_honest(
     // playlist (shuffle, repeat, manual_advance, last_playlist) and the
     // plugins' vis_plugin / vis_preset are deliberately not persisted because
     // none of those features are honoured by the player yet (task card N6).
-    // audio.replaygain is persisted (see above).
+    // audio.replaygain and audio.device are persisted (see above).
 
     toml::to_string_pretty(&toml::Value::Table(root)).map_err(|e| ConfigError::Write {
         path: PathBuf::from("<serialize>"),
@@ -699,7 +706,6 @@ mod tests {
         config.audio.volume = 180;
         // Set deliberately unpersisted fields to non-default values:
         config.audio.output = "cpal".into();
-        config.audio.device = Some("TestDevice".into());
         config.audio.buffer_ms = 450;
         config.audio.fadeout_ms = 1200;
         config.audio.gapless = false;
@@ -713,8 +719,10 @@ mod tests {
         config.plugins.vis_preset = Some("preset".into());
         config.plugins.disabled = vec!["bad.dll".into()];
 
-        // replaygain is now persisted, so set it non-default and expect it back.
+        // replaygain and the device are now persisted, so set them
+        // non-default and expect them back.
         config.audio.replaygain = rustamp_core::config::ReplayGainMode::Album;
+        config.audio.device = Some("Speakers (Realtek)".into());
 
         save(&config, None, &path).expect("save succeeds");
 
@@ -725,9 +733,13 @@ mod tests {
             loaded.config.audio.replaygain,
             rustamp_core::config::ReplayGainMode::Album
         );
+        assert_eq!(
+            loaded.config.audio.device,
+            Some("Speakers (Realtek)".to_string()),
+            "the honoured device survives the round trip"
+        );
         // Unpersisted fields cleanly revert to their documented defaults:
         assert_eq!(loaded.config.audio.output, Config::default().audio.output);
-        assert_eq!(loaded.config.audio.device, Config::default().audio.device);
         assert_eq!(
             loaded.config.audio.buffer_ms,
             Config::default().audio.buffer_ms
@@ -826,6 +838,7 @@ mod tests {
 [audio]
 volume = 180
 replaygain = \"Track\"
+device = \"Speakers (Realtek)\"
 buffer_ms = 350
 
 [playlist]
@@ -841,6 +854,16 @@ shuffle = true
         assert_eq!(
             loaded.config.audio.replaygain,
             rustamp_core::config::ReplayGainMode::Track
+        );
+        // The device is honoured too: it is loaded, and it does not warn.
+        assert_eq!(
+            loaded.config.audio.device,
+            Some("Speakers (Realtek)".to_string())
+        );
+        assert!(
+            loaded.warnings.iter().all(|w| !w.contains("audio.device")),
+            "the honoured device must not warn: {:?}",
+            loaded.warnings
         );
         assert!(
             loaded
