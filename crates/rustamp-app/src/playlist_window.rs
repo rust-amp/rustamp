@@ -23,20 +23,23 @@
 //!   one page of four rows), no command;
 //! * the title bar has no window-menu button (S06 §1), so a click at (6,3)
 //!   does nothing; Close hides the window (`ToggleWindow(Playlist)`, the PL
-//!   button reopens it), Shade records a note (the playlist editor's shade is
-//!   open, S05 §1.5) and MISC requests the native popup (S04 §7);
+//!   button reopens it), Shade toggles the editor's windowshade
+//!   (`ToggleWindowShade(Playlist)`: the editor collapses to its 14 px title
+//!   strip and expands again, S01 §1) and MISC requests the native popup
+//!   (S04 §7);
 //!   ADD and LIST OPTS open their real dialogs
 //!   through [`App::request_playlist_dialog`] (the files face of the
 //!   open-media dialog for ADD, with the playlist path's unmeasured
 //!   `play: false`, RFC 0005 O5; the load-playlist dialog for LIST OPTS,
 //!   RFC 0010).
 //!
-//! Placement: [`App::playlist_window_origin`] replays the main window's shade
-//! and double-size state through [`DockedStack`](rustamp_ui::DockedStack), so
-//! the playlist follows the main window's bottom edge via the existing S05
-//! geometry (equalizer top = main bottom, playlist top = equalizer bottom).
-//! The stack positions in the plain double-size state are open (S05 §2.2); the
-//! same bottom-edge rule is applied there.
+//! Placement: [`App::docked_stack`] replays the windows' shade and
+//! double-size state through [`DockedStack`](rustamp_ui::DockedStack), so the
+//! playlist follows the main window's bottom edge via the existing S05
+//! geometry (equalizer top = main bottom, playlist top = equalizer bottom) and
+//! a shaded editor is one row tall (S01 §1). The stack positions in the plain
+//! double-size state are open (S05 §2.2); the same bottom-edge rule is applied
+//! there.
 
 use std::path::PathBuf;
 
@@ -47,8 +50,8 @@ use rustamp_core::state::WindowId;
 use rustamp_gfx::Image;
 use rustamp_ui::{
     DockedStack, Key, Modifiers, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog,
-    PlaylistTitleButton, ShortcutOutcome, hit_test_button, hit_test_list_row, hit_test_scroll,
-    hit_test_title_bar, in_list_area, render_playlist_window,
+    PlaylistTitleButton, ShortcutOutcome, WindowKind, hit_test_button, hit_test_list_row,
+    hit_test_scroll, hit_test_title_bar, in_list_area, render_playlist_window, window_size,
 };
 
 use crate::app::App;
@@ -64,17 +67,52 @@ impl App {
         PLAYLIST_WINDOW_SIZE
     }
 
-    /// Where the playlist window's client origin sits in the docked stack.
+    /// Whether the playlist editor is drawn in its windowshade form.
     ///
-    /// Replays the main window's shade/double-size state through the S05
-    /// docked geometry, so the playlist tracks the main window's bottom edge
-    /// (through the equalizer's). At rest this is (26,261); with the main
-    /// shaded it is (26,159) (S05 §3.3).
-    pub fn playlist_window_origin(&self) -> (i32, i32) {
+    /// The editor's shade band is 14 px tall (S01 §1); the drawing itself is
+    /// the skin's ([`rustamp_ui::render_playlist_window`]).
+    pub fn playlist_shaded(&self) -> bool {
+        self.playlist.windowshade
+    }
+
+    /// The client area the playlist editor's OS window must have right now.
+    ///
+    /// 275 x 116 at rest (S06 scope, S01 §1) and 275 x 14 while it is shaded
+    /// (S01 §1). The editor ignores double-size (S05 §2.1), so the flag is
+    /// always false here.
+    pub fn playlist_frame_size(&self) -> (u32, u32) {
+        window_size(WindowKind::Playlist, self.playlist_shaded(), false)
+    }
+
+    /// The docked stack for the player's current state (S05 §3.3, §5).
+    ///
+    /// The main window's shade and double-size, the equalizer's shade and
+    /// double-size and the editor's own shade are replayed through
+    /// [`DockedStack`], so the three windows keep their edge connections
+    /// (equalizer top = main bottom, playlist top = equalizer bottom) and a
+    /// shaded editor is one row tall. The presenter keeps a *live* stack
+    /// (dragging moves it); this is the state-derived one, the same geometry
+    /// the fresh launch starts from.
+    pub fn docked_stack(&self) -> DockedStack {
         let mut stack = DockedStack::default_launch();
         let state = self.state();
         stack.set_main_shaded(state.windowshade);
         stack.set_main_double_size(state.double_size);
+        stack.set_equalizer_double_size(self.eq_state().double_size);
+        stack.set_equalizer_shaded(self.eq_state().windowshade);
+        stack.set_playlist_shaded(self.playlist_shaded());
+        stack
+    }
+
+    /// Where the playlist window's client origin sits in the docked stack.
+    ///
+    /// Replays the windows' shade and double-size state through the S05
+    /// docked geometry, so the playlist tracks the main window's bottom edge
+    /// (through the equalizer's). At rest this is (26,261); with the main
+    /// shaded it is (26,159) (S05 §3.3). The editor's own shade does not move
+    /// it: it is the bottom window of the stack.
+    pub fn playlist_window_origin(&self) -> (i32, i32) {
+        let stack = self.docked_stack();
         (stack.playlist.x, stack.playlist.y)
     }
 
@@ -102,6 +140,14 @@ impl App {
     pub fn playlist_mouse_down(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
         self.sync_playlist_entries();
         self.playlist.cancel_drag();
+        if self.playlist_shaded() {
+            // A shaded editor is a 14 px title strip (S01 §1): it has no list
+            // and no bottom bar, so only its title-bar buttons answer.
+            return match hit_test_title_bar(x, y) {
+                Some(button) => self.playlist_title_button(button),
+                None => Ok(Vec::new()),
+            };
+        }
         if let Some(button) = hit_test_button(x, y) {
             return self.playlist_press(button);
         }
@@ -155,6 +201,10 @@ impl App {
     pub fn playlist_double_click(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
         self.sync_playlist_entries();
         self.playlist.cancel_drag();
+        if self.playlist_shaded() {
+            // A shaded editor is a 14 px title strip (S01 §1): it has no list.
+            return Ok(Vec::new());
+        }
         if in_list_area(x, y)
             && let Some(row) = hit_test_list_row(x, y)
             && let Some(command) = self.playlist.double_click_row(row)
@@ -473,20 +523,23 @@ impl App {
     /// toggle window hides it (RFC 0005 `CloseFocusedWindow`; S03 §2 Ctrl+F4
     /// "Close the playlist editor"), the same `ToggleWindow` the main
     /// window's PL button and the menu row send, so all three agree and the
-    /// PL button reopens it. Shade records a note and changes nothing: the
-    /// playlist editor's windowshade size and drawing are open (S05 §1.5).
+    /// PL button reopens it.
+    ///
+    /// Shade toggles the editor's windowshade: the editor collapses to its
+    /// 14 px title strip and expands again (S01 §1; the band itself is the
+    /// skin's). The state travels as
+    /// [`Command::ToggleWindowShade`](rustamp_core::command::Command::ToggleWindowShade)
+    /// for the playlist, so the app applies it in one place and the presenter
+    /// reads the new size from [`App::playlist_frame_size`].
     /// A (6,3) click never reaches here ([`hit_test_title_bar`] returns
     /// `None`, S06 §1).
     fn playlist_title_button(&mut self, button: PlaylistTitleButton) -> Result<Vec<Command>> {
         match button {
             PlaylistTitleButton::Close => self.close_playlist_window(),
             PlaylistTitleButton::Shade => {
-                self.note(
-                    "playlist Shade button: the playlist editor's windowshade is open \
-                     (S05 §1.5), so nothing changes"
-                        .to_string(),
-                );
-                Ok(Vec::new())
+                let command = Command::ToggleWindowShade(WindowId::Playlist);
+                self.submit(command.clone())?;
+                Ok(vec![command])
             }
         }
     }
@@ -1098,15 +1151,122 @@ mod tests {
         assert!(app.playlist_open());
     }
 
+    /// The shade button is the title-bar button at (254,3) (S01 §4,
+    /// provisional rect). One click collapses the editor to its 14 px title
+    /// strip, the next one expands it again (S01 §1).
     #[test]
-    fn the_title_bar_shade_says_why_it_does_nothing() {
-        // S05 §1.5: the playlist editor's windowshade is open.
+    fn the_title_bar_shade_button_collapses_and_expands_the_editor() {
         let mut app = test_app();
+        assert!(!app.playlist_shaded());
+        assert_eq!(app.playlist_frame_size(), (275, 116));
+
         let commands = app.playlist_mouse_down(254, 3).expect("shade applies");
-        assert!(commands.is_empty());
-        assert!(app.playlist_open());
-        let notes = app.drain_notes();
-        assert!(notes.iter().any(|n| n.contains("S05 §1.5")), "{notes:?}");
+        assert_eq!(
+            commands,
+            vec![Command::ToggleWindowShade(WindowId::Playlist)]
+        );
+        assert!(app.playlist_shaded(), "the editor is in windowshade form");
+        assert_eq!(app.playlist_frame_size(), (275, 14), "one row tall");
+        assert!(app.playlist_open(), "shading does not hide the editor");
+
+        // The same button expands it again.
+        let commands = app.playlist_mouse_down(254, 3).expect("shade applies");
+        assert_eq!(
+            commands,
+            vec![Command::ToggleWindowShade(WindowId::Playlist)]
+        );
+        assert!(!app.playlist_shaded());
+        assert_eq!(app.playlist_frame_size(), (275, 116));
+        assert!(app.drain_notes().is_empty());
+    }
+
+    /// Only the shade button toggles: the rest of the title bar is the
+    /// window's drag area, the (6,3) spot has no button at all (S06 §1) and
+    /// the list and the bottom bar are not the shade.
+    #[test]
+    fn a_click_outside_the_shade_button_never_toggles_the_editor() {
+        for (x, y) in [(6, 3), (100, 5), (254, 12), (254, 20), (264, 3)] {
+            let mut app = test_app();
+            let commands = app.playlist_mouse_down(x, y).expect("click applies");
+            assert!(
+                !commands.contains(&Command::ToggleWindowShade(WindowId::Playlist)),
+                "({x},{y}) must not shade the editor: {commands:?}"
+            );
+            assert!(!app.playlist_shaded(), "({x},{y}) must not shade");
+        }
+    }
+
+    /// A shaded editor is a 14 px title strip: it has no list and no bottom
+    /// bar, so only its title-bar buttons answer a click.
+    #[test]
+    fn a_shaded_editor_answers_only_its_title_bar() {
+        let mut app = test_app();
+        add_entries(&mut app, 4);
+        app.playlist_mouse_down(254, 3).expect("shade applies");
+        assert!(app.playlist_shaded());
+
+        // The list and the bottom bar are gone with the body.
+        assert!(app.playlist_mouse_down(60, 28).expect("click").is_empty());
+        assert!(app.playlist_mouse_down(24, 92).expect("ADD").is_empty());
+        assert!(app.playlist().selected_ids().is_empty());
+        assert!(app.drain_notes().is_empty());
+
+        // The shade button still expands it.
+        let commands = app.playlist_mouse_down(254, 3).expect("shade applies");
+        assert_eq!(
+            commands,
+            vec![Command::ToggleWindowShade(WindowId::Playlist)]
+        );
+        assert!(!app.playlist_shaded());
+    }
+
+    /// The docked stack keeps its edge connections when the editor is shaded:
+    /// the editor becomes one row tall, the windows above it stay where they
+    /// are, and the main window's own shade still re-flows the editor
+    /// (S05 §3.3, §5).
+    #[test]
+    fn shading_the_editor_makes_it_one_row_tall_without_moving_its_neighbours() {
+        let mut app = test_app();
+        let before = app.docked_stack();
+        assert_eq!(before.playlist.size(), (275, 116));
+
+        app.playlist_mouse_down(254, 3).expect("shade applies");
+        let shaded = app.docked_stack();
+        assert_eq!(shaded.playlist.size(), (275, 14), "one row tall");
+        assert_eq!(
+            (shaded.playlist.x, shaded.playlist.y),
+            (before.playlist.x, before.playlist.y),
+            "the editor keeps the equalizer's bottom edge"
+        );
+        assert_eq!(
+            (shaded.equalizer, shaded.main),
+            (before.equalizer, before.main),
+            "the windows above the editor do not move"
+        );
+
+        // The main window's shade still re-flows the shaded editor up by
+        // 102 px (S05 §3.3).
+        app.submit(Command::ToggleWindowShade(WindowId::Main))
+            .expect("shade toggles");
+        let with_shaded_main = app.docked_stack();
+        assert_eq!(with_shaded_main.playlist.y, 159);
+        assert_eq!(with_shaded_main.playlist.size(), (275, 14));
+    }
+
+    /// The shaded editor paints the skin's 14 px band, so the frame the app
+    /// renders and the frame size the OS window asks for agree.
+    #[test]
+    fn the_shaded_editor_renders_the_skins_shade_band() {
+        let mut app = test_app();
+        add_entries(&mut app, 4);
+        app.playlist_mouse_down(254, 3).expect("shade applies");
+        let image = app.render_playlist();
+        assert_eq!((image.width(), image.height()), (275, 14));
+        assert_eq!(
+            (image.width(), image.height()),
+            app.playlist_frame_size(),
+            "the painted frame and the OS client area agree"
+        );
     }
 
     #[test]

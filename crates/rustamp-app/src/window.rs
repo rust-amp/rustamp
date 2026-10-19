@@ -77,7 +77,7 @@ use rustamp_core::state::WindowId as CoreWindowId;
 use rustamp_platform::{HotkeyAction, init_dpi_awareness, single_instance, take_pending_hotkeys};
 use rustamp_ui::shell::TaskbarRole;
 use rustamp_ui::{
-    DEFAULT_MAIN_POSITION, DialogKind, Key, Modifiers, PLAYLIST_WINDOW_SIZE, ShortcutOutcome,
+    DEFAULT_MAIN_POSITION, DialogKind, Key, Modifiers, ShortcutOutcome,
     docking::{ClassicWindow, DockedStack, WindowKind, WindowPosition},
     menu::menu_popup_origin,
 };
@@ -473,6 +473,9 @@ struct Windowed {
     applied_client: Option<(u32, u32)>,
     /// The equalizer's client size last requested.
     applied_eq_client: Option<(u32, u32)>,
+    /// The playlist editor's client size last requested (its shade changes
+    /// the height: 275 x 116 at rest, 275 x 14 shaded, S01 §1).
+    applied_playlist_client: Option<(u32, u32)>,
     /// The always-on-top level last applied to the OS window.
     applied_on_top: bool,
     /// Runtime show/hide state last applied to the main OS window.
@@ -519,6 +522,7 @@ impl Windowed {
             modifiers: ModifiersState::empty(),
             applied_client: None,
             applied_eq_client: None,
+            applied_playlist_client: None,
             applied_on_top,
             applied_main_visible: true,
             applied_title: None,
@@ -527,11 +531,9 @@ impl Windowed {
     }
 
     fn restore_stack(app: &App) -> DockedStack {
-        let mut stack = DockedStack::default_launch();
-        stack.set_main_shaded(app.state().windowshade);
-        stack.set_main_double_size(app.state().double_size);
-        stack.set_equalizer_double_size(app.eq_state().double_size);
-        stack.set_equalizer_shaded(app.eq_state().windowshade);
+        // The state-derived stack (the windows' shade and double-size flags),
+        // then the saved positions on top of it.
+        let mut stack = app.docked_stack();
         if let Some(layout) = app
             .config()
             .ui
@@ -583,6 +585,11 @@ impl Windowed {
         if self.app.eq_state().windowshade != self.stack.equalizer.shaded {
             self.stack
                 .set_equalizer_shaded(self.app.eq_state().windowshade);
+        }
+        if self.app.playlist_shaded() != self.stack.playlist.shaded {
+            // A shaded editor is one row tall (S01 §1); the stack keeps the
+            // edge connections and re-flows whatever hangs below it (S05 §3.3).
+            self.stack.set_playlist_shaded(self.app.playlist_shaded());
         }
         self.apply_docking_positions();
         if let Some(window) = &self.window {
@@ -798,6 +805,8 @@ impl Windowed {
         let pl_visible = self.app.playlist_open();
         self.app
             .set_window_visible(CoreWindowId::Playlist, pl_visible);
+        self.app
+            .set_window_shaded(CoreWindowId::Playlist, self.app.playlist_shaded());
     }
 
     /// Converts a physical cursor position to the equalizer layout's 1x
@@ -1730,27 +1739,39 @@ impl Windowed {
     /// Creates or drops the playlist editor's OS window so it matches
     /// [`App::playlist_open`], the way [`Windowed::sync_eq_window`] follows
     /// the equalizer: the PL button, the menu row, the playlist's own Close
-    /// and its OS close box all flip that one flag.
+    /// and its OS close box all flip that one flag. The window's client area
+    /// follows the editor's shade state ([`App::playlist_frame_size`]), so
+    /// the shade button resizes the OS window and not just the painted
+    /// surface.
     fn sync_playlist_window(&mut self, event_loop: &ActiveEventLoop) {
         if self.app.playlist_open() {
             self.open_playlist_window(event_loop);
+            let desired = self.app.playlist_frame_size();
+            if self.applied_playlist_client != Some(desired)
+                && let Some(window) = &self.playlist_window
+            {
+                let _ = window.request_inner_size(PhysicalSize::new(desired.0, desired.1));
+                self.applied_playlist_client = Some(desired);
+            }
         } else if self.playlist_window.is_some() {
             self.playlist_surface = None;
             self.playlist_window = None;
             self.last_playlist_click = None;
+            self.applied_playlist_client = None;
         }
     }
 
     /// Creates the playlist editor window with the same shell as the main
     /// window (S06, S01 §4): a non-resizable `winit` window with its own
-    /// `softbuffer` surface, sized to the spec'd 275 x 116 client area
-    /// ([`PLAYLIST_WINDOW_SIZE`]), under the same [`ensure_gui_allowed`] rail
-    /// (checked once in [`run`], before either window exists).
+    /// `softbuffer` surface, sized to the spec'd client area
+    /// ([`App::playlist_frame_size`]: 275 x 116 at rest, 275 x 14 shaded,
+    /// S01 §1), under the same [`ensure_gui_allowed`] rail (checked once in
+    /// [`run`], before either window exists).
     fn open_playlist_window(&mut self, event_loop: &ActiveEventLoop) {
         if self.playlist_window.is_some() {
             return;
         }
-        let (width, height) = PLAYLIST_WINDOW_SIZE;
+        let (width, height) = self.app.playlist_frame_size();
         let attributes = Self::window_attributes(
             PresenterWindow::Playlist,
             "Rustamp Playlist",
@@ -1783,6 +1804,7 @@ impl Windowed {
         }
         self.playlist_window = Some(window);
         self.playlist_surface = Some(surface);
+        self.applied_playlist_client = Some((width, height));
         self.apply_docking_positions();
         self.request_playlist_redraw();
     }
@@ -1810,21 +1832,23 @@ impl Windowed {
             WindowEvent::RedrawRequested => self.paint_playlist(),
             WindowEvent::Resized(size) => {
                 // The playlist never double-sizes (S05 §2.1): its client area
-                // is always exactly the spec'd 275 x 116.
-                let (width, height) = PLAYLIST_WINDOW_SIZE;
-                if (size.width != width || size.height != height)
-                    && let Some(window) = &self.playlist_window
-                {
-                    let _ = window.request_inner_size(PhysicalSize::new(width, height));
+                // is the spec'd 275 x 116, or the 275 x 14 shade band while
+                // the editor is shaded (S01 §1).
+                let (width, height) = self.app.playlist_frame_size();
+                if size.width < width || size.height < height {
+                    // Never settle below the layout (the DPI-change floor).
+                    self.applied_playlist_client = None;
                 }
+                self.sync_playlist_window(event_loop);
                 self.request_playlist_redraw();
             }
             WindowEvent::ScaleFactorChanged {
                 mut inner_size_writer,
                 ..
             } => {
-                let (width, height) = PLAYLIST_WINDOW_SIZE;
+                let (width, height) = self.app.playlist_frame_size();
                 let _ = inner_size_writer.request_inner_size(PhysicalSize::new(width, height));
+                self.applied_playlist_client = Some((width, height));
                 self.request_playlist_redraw();
             }
             WindowEvent::DroppedFile(path) => self.drop_file(path),
@@ -1873,8 +1897,12 @@ impl Windowed {
                 let result = match state {
                     ElementState::Pressed => {
                         let now = Instant::now();
-                        let is_double =
-                            if let Some((last_time, (lx, ly))) = self.last_playlist_click {
+                        // The double-click gesture is the list's (S03 §5:
+                        // double-clicking an entry plays it), so a title-bar
+                        // press is never swallowed as one - the shade button
+                        // must toggle on every click.
+                        let is_double = rustamp_ui::in_list_area(x, y)
+                            && if let Some((last_time, (lx, ly))) = self.last_playlist_click {
                                 now.duration_since(last_time) < Duration::from_millis(500)
                                     && (x - lx).abs() <= 4
                                     && (y - ly).abs() <= 4
@@ -1895,7 +1923,10 @@ impl Windowed {
                     eprintln!("rustamp: playlist pointer input failed: {error}");
                 }
                 // The title-bar Close may have hidden the editor, ADD may
-                // have opened the open-media dialog.
+                // have opened the open-media dialog, and the shade button may
+                // have made the editor one row tall (S01 §1) - the window
+                // state sync re-flows the docked stack with it (S05 §3.3).
+                self.sync_window_state();
                 self.sync_playlist_window(event_loop);
                 self.sync_dialog_window(event_loop);
                 self.apply_docking_positions();
@@ -2711,6 +2742,125 @@ mod tests {
         assert_eq!(probe.phase, 7);
     }
 
+    /// The playlist editor's windowshade, end to end through the production
+    /// presenter: the skinned shade button flips the state, the OS window's
+    /// client area becomes the 14 px shade band (S01 §1) and the editor keeps
+    /// the place the docked stack gave it (S05 §3.3).
+    ///
+    /// The click goes through the app's own handler - the same entry point
+    /// the OS click takes - so no pointer is synthesized and no window is
+    /// driven from outside.
+    ///
+    /// VM-only: it opens the real windows.
+    #[test]
+    #[ignore = "VM-only: opens the real presenter; run in the guest interactive session"]
+    fn the_playlist_window_shade_resizes_the_real_window() {
+        require_test_vm();
+        struct Probe {
+            presenter: Windowed,
+            phase: u8,
+            next: Instant,
+            deadline: Instant,
+            /// The editor's outer origin before the shade, to show that the
+            /// docked place does not move.
+            origin: Option<(i32, i32)>,
+        }
+        impl Probe {
+            fn client_size(&self) -> (u32, u32) {
+                let size = self
+                    .presenter
+                    .playlist_window
+                    .as_ref()
+                    .expect("the playlist window is open")
+                    .inner_size();
+                (size.width, size.height)
+            }
+            fn origin(&self) -> (i32, i32) {
+                let position = self
+                    .presenter
+                    .playlist_window
+                    .as_ref()
+                    .expect("the playlist window is open")
+                    .outer_position()
+                    .expect("the playlist window has a position");
+                (position.x, position.y)
+            }
+        }
+        impl ApplicationHandler for Probe {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.presenter.resumed(event_loop);
+            }
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                id: WindowId,
+                event: WindowEvent,
+            ) {
+                self.presenter.window_event(event_loop, id, event);
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                assert!(
+                    Instant::now() < self.deadline,
+                    "the playlist shade probe timed out"
+                );
+                self.presenter.about_to_wait(event_loop);
+                if Instant::now() < self.next {
+                    return;
+                }
+                match self.phase {
+                    0 => {
+                        // At rest the editor is the spec'd 275 x 116.
+                        assert_eq!(self.client_size(), (275, 116));
+                        self.origin = Some(self.origin());
+                        // The skinned shade button (S01 §4: 9 x 9 at (254,3)).
+                        self.presenter
+                            .app
+                            .playlist_mouse_down(254, 3)
+                            .expect("the shade click applies");
+                    }
+                    // The resize is requested in the tick after the click, so
+                    // the size is read one phase later.
+                    1 => {}
+                    2 => {
+                        assert_eq!(self.client_size(), (275, 14), "one row tall");
+                        assert_eq!(
+                            Some(self.origin()),
+                            self.origin,
+                            "the editor keeps its docked place"
+                        );
+                        self.presenter
+                            .app
+                            .playlist_mouse_down(254, 3)
+                            .expect("the shade click applies");
+                    }
+                    3 => {}
+                    4 => {
+                        assert_eq!(self.client_size(), (275, 116), "back to the rest size");
+                        assert_eq!(
+                            Some(self.origin()),
+                            self.origin,
+                            "the editor keeps its docked place"
+                        );
+                        event_loop.exit();
+                        return;
+                    }
+                    _ => unreachable!(),
+                }
+                self.phase += 1;
+                self.next = Instant::now() + Duration::from_millis(150);
+            }
+        }
+        let mut probe = Probe {
+            presenter: desktop_test_presenter(false),
+            phase: 0,
+            next: Instant::now() + Duration::from_millis(150),
+            deadline: Instant::now() + Duration::from_secs(10),
+            origin: None,
+        };
+        build_event_loop(true).unwrap().run_app(&mut probe).unwrap();
+        assert_eq!(probe.phase, 4);
+    }
+
     fn wait_for_index(presenter: &mut Windowed, index: u32) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while presenter.app.engine().current_index() != Some(index) {
@@ -2871,7 +3021,7 @@ mod tests {
             (
                 PresenterWindow::Playlist,
                 "Rustamp Playlist",
-                PLAYLIST_WINDOW_SIZE,
+                presenter.app.playlist_frame_size(),
             ),
             (
                 PresenterWindow::Dialog,
@@ -2896,7 +3046,8 @@ mod tests {
         // here and not only in the VM.
         assert_eq!(presenter.app.frame_size(), (275, 116));
         assert_eq!(presenter.app.eq_frame_size(), (275, 116));
-        assert_eq!(PLAYLIST_WINDOW_SIZE, (275, 116));
+        assert_eq!(presenter.app.playlist_frame_size(), (275, 116));
+        assert_eq!(rustamp_ui::PLAYLIST_WINDOW_SIZE, (275, 116));
     }
 
     /// The ADD defect: the button opened a window of ours that asked for a

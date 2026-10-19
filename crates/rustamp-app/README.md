@@ -211,3 +211,25 @@ pwsh -File docs/notes/vm-run-tests.ps1 -Filter '--ignored:docking_presenter'
 ```
 
 Never run the ignored test on the host; `require_test_vm()` refuses it there.
+
+## The playlist editor's windowshade
+
+The playlist editor's skinned **Shade** button (the 9 x 9 cell at (254,3), the
+same place the main window's shade button sits) collapses the editor to its
+14 px title strip and expands it again. The click is routed through
+`App::playlist_mouse_down` → `App::playlist_title_button`, which sends
+`Command::ToggleWindowShade(WindowId::Playlist)`; the app applies it to the
+playlist model, the presenter resizes the OS window to the new client area
+(275 x 116 at rest, 275 x 14 shaded) and the docked stack re-flows with it.
+
+A shaded editor is a title strip: it has no list and no bottom bar, so only
+its title-bar buttons answer a click. Its shade state is saved with the other
+windows (`ui.windows`), so a shaded editor comes back shaded.
+
+The button's own rect and the shade band's drawing are **provisional**
+(S01 §4; S05 §1.5 leaves the editor's shade unmeasured). The 14 px band
+height is S01 §1. The headless tests cover the click, the state flip, the
+new height, the docked reflow and the config round-trip; the OS window's
+resize is checked by the ignored
+`window::tests::the_playlist_window_shade_resizes_the_real_window` in the
+test VM.

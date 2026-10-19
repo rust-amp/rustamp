@@ -379,6 +379,44 @@ fn app_restores_eq_state_and_window_layouts_from_config() {
     );
 }
 
+/// The playlist editor's windowshade is saved with the other windows
+/// (S01 §1: the shade band is 14 px tall), so a shaded editor comes back
+/// shaded - and the live state is written back out.
+#[test]
+fn the_playlist_editors_windowshade_round_trips_through_the_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("playlist-shade.toml");
+
+    let mut app = test_app_with_config(Config::default(), Some(path.clone()));
+    assert!(!app.playlist_shaded(), "a fresh editor is not shaded");
+    assert_eq!(app.playlist_frame_size(), (275, 116));
+
+    // The title-bar shade button collapses the editor ...
+    app.playlist_mouse_down(254, 3).expect("shade applies");
+    assert!(app.playlist_shaded());
+    assert_eq!(app.playlist_frame_size(), (275, 14));
+
+    // ... and the state survives the save.
+    app.save_config().expect("save config");
+    let loaded = load(Some(&path)).expect("load config");
+    let playlist = loaded
+        .config
+        .ui
+        .windows
+        .iter()
+        .find(|w| w.id == WindowId::Playlist)
+        .expect("the editor's layout is saved");
+    assert!(playlist.shaded, "the shaded editor is saved shaded");
+
+    // A new player built from that file comes up shaded.
+    let restarted = test_app_with_config(loaded.config, None);
+    assert!(
+        restarted.playlist_shaded(),
+        "a saved shaded editor comes back shaded"
+    );
+    assert_eq!(restarted.playlist_frame_size(), (275, 14));
+}
+
 #[test]
 fn preferences_dialog_open_page_declares_settings_not_applied() {
     let config = Config::default();
