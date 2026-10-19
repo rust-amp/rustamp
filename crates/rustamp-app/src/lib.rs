@@ -28,6 +28,9 @@
 //! * [`directory`] - what a chosen directory contributes to the playlist:
 //!   the media files of the tree below it, and the command that appends
 //!   them. Pure; the folder dialog itself lives in [`window`].
+//! * [`double_click`] - the double-click rule of S03 §5: the second press
+//!   must follow the first within 500 ms and 4 px. The playlist list and the
+//!   three title bars share it.
 //! * [`focus`] — the window-focus order for `FocusNextWindow` (own choice over
 //!   [`rustamp_core::state::WindowId`], not a measurement). Pure; the model
 //!   lives in [`app::App`], the OS half in [`window`].
@@ -75,6 +78,7 @@ pub mod config;
 pub mod cursor;
 pub mod dialogs;
 pub mod directory;
+pub mod double_click;
 pub mod eq_autoload;
 pub mod eq_presets;
 #[cfg(any(windows, test))]

@@ -54,6 +54,7 @@ use rustamp_ui::{
 };
 
 use crate::cli::OutputChoice;
+use crate::double_click::TitleBarClicks;
 use crate::host::{
     CommandOutcome, HostStateLink, PollOutcome, PublishOutcome, player_state_message,
 };
@@ -94,6 +95,9 @@ pub struct App {
     /// work, so this is the UI's own prediction state).
     eq: EqualizerWindow,
     eq_layout: EqualizerLayout,
+    /// The title-bar double-click trackers (S03 §5): one per classic window,
+    /// so a press in one window never pairs with a press in another.
+    title_bar_clicks: TitleBarClicks,
     pub(crate) skin: LoadedSkin,
     config: Config,
     /// The plug-in folder as the preferences pages last scanned it
@@ -334,6 +338,7 @@ impl App {
                 ..rustamp_ui::EqualizerState::default()
             }),
             eq_layout: EqualizerLayout::CLASSIC,
+            title_bar_clicks: TitleBarClicks::default(),
             skin: options.skin,
             config: options.config,
             plugin_scan: rustamp_prefs::PluginScan::default(),
@@ -1461,6 +1466,89 @@ impl App {
         let commands = self.ui.mouse_up(x, y, self.now_ms());
         self.forward(&commands)?;
         Ok(commands)
+    }
+
+    /// A left-button press on one of the classic windows, seen for the title
+    /// bar's double click (S03 §5: "Double-click the title bar: toggle
+    /// windowshade").
+    ///
+    /// Returns the command the double click sent, if the press completed one.
+    /// A press on a title-bar **button** never counts — the button wins, and
+    /// its own action runs instead — and it ends the sequence, so the next
+    /// title-bar press starts a new one.
+    ///
+    /// `now_ms` is the press' time on the app's clock ([`App::now_ms`]). The
+    /// caller passes it in, so the rule stays testable without a clock; the
+    /// interval and the distance are the shared ones
+    /// ([`crate::double_click`]).
+    pub fn title_bar_double_click(
+        &mut self,
+        window: WindowId,
+        x: i32,
+        y: i32,
+        now_ms: u64,
+    ) -> Result<Vec<Command>> {
+        let on_title_bar = self.on_title_bar(window, x, y);
+        let doubled = match self.title_bar_clicks.tracker_mut(window) {
+            Some(tracker) => {
+                if !on_title_bar {
+                    // A press that is not on the title bar ends the sequence:
+                    // the button (or whatever owns the press) wins.
+                    tracker.clear();
+                    false
+                } else if tracker.is_double_click(now_ms, x, y) {
+                    tracker.clear();
+                    true
+                } else {
+                    tracker.remember(now_ms, x, y);
+                    false
+                }
+            }
+            None => false,
+        };
+        if !doubled {
+            return Ok(Vec::new());
+        }
+        let command = Command::ToggleWindowShade(window);
+        self.submit(command.clone())?;
+        Ok(vec![command])
+    }
+
+    /// Whether the press at `(x, y)` lands on `window`'s title bar and not on
+    /// one of its controls.
+    ///
+    /// The main window's hit test answers the four window buttons before the
+    /// band they sit in, and the shaded form carries the position slider
+    /// inside that band (S01 §2.1, webamp-provisional): S03 §5's note says
+    /// the shaded title bar leaves the windowshade only outside its middle
+    /// band, and the slider is the control ours has there. The playlist's hit
+    /// test answers its close and shade buttons, and the equalizer has no
+    /// title-bar button at all (S05 §1.5), so a title-bar press there is
+    /// always the band.
+    fn on_title_bar(&self, window: WindowId, x: i32, y: i32) -> bool {
+        match window {
+            WindowId::Main => {
+                if rustamp_ui::hit_test(&self.layout, x, y) != Some(rustamp_ui::Widget::TitleBar) {
+                    return false;
+                }
+                if self.ui.state().windowshade {
+                    let slider = &self.layout.shade_position;
+                    if x >= slider.x && x < slider.right() && y >= slider.y && y < slider.bottom() {
+                        return false;
+                    }
+                }
+                true
+            }
+            WindowId::Equalizer => {
+                rustamp_ui::eq_hit_test(&self.eq_layout, x, y, self.eq.state().windowshade)
+                    == Some(rustamp_ui::EqWidget::TitleBar)
+            }
+            WindowId::Playlist => {
+                (0..rustamp_ui::playlist_window::TITLE_BAR_HEIGHT).contains(&y)
+                    && rustamp_ui::playlist_window::hit_test_title_bar(x, y).is_none()
+            }
+            WindowId::Vis | WindowId::Gen(_) | WindowId::Video => false,
+        }
     }
 
     /// A right-button press at window-relative `(x, y)` (S03 §5).
