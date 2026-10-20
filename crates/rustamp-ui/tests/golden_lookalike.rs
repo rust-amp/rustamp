@@ -33,6 +33,8 @@ register_golden_tests!(
     golden_lookalike_equalizer_window,
     golden_lookalike_playlist_window,
     golden_lookalike_main_window_playing,
+    golden_lookalike_main_window_stream,
+    golden_lookalike_main_window_stream_remaining,
     golden_lookalike_main_window_double_size,
     golden_lookalike_equalizer_window_raised_band_and_preamp,
     golden_lookalike_equalizer_window_curve_and_track_pixels,

@@ -29,6 +29,7 @@ const MINUS: [u8; 3] = [4, 5, 6];
 const CLUTTER_BG: [u8; 3] = [8, 9, 10];
 const CLUTTER_A: [u8; 3] = [160, 170, 180];
 const POS_THUMB: [u8; 3] = [190, 200, 210];
+const SHADE_POS_THUMB: [u8; 3] = [150, 160, 170];
 const GLYPH_A: [u8; 3] = [220, 230, 240];
 const GLYPH_B: [u8; 3] = [46, 47, 48];
 const SHADE: [u8; 3] = [5, 6, 7];
@@ -150,6 +151,8 @@ fn synthetic_skin() -> Skin {
                 (304, 0, 8, 43, CLUTTER_BG),
                 (316, 55, 4, 6, CLUTTER_A),
                 (27, 29, 275, 14, SHADE),
+                // The shaded window's position thumb (S01 provisional).
+                (20, 36, 3, 7, SHADE_POS_THUMB),
                 // The four pressed window-button cells (S02 §7).
                 (0, 9, 9, 9, OPTIONS_DEPRESSED),
                 (9, 9, 9, 9, MINIMIZE_DEPRESSED),
@@ -263,6 +266,95 @@ fn no_digit_cell_and_minus_sign_follow_the_time_state() {
     };
     let frame = render_main_window(&remaining, &skin, &layout);
     assert_eq!(rgb(&frame, 38, 32), MINUS);
+}
+
+#[test]
+fn an_unknown_length_shows_the_placeholder_instead_of_a_zero() {
+    let skin = synthetic_skin();
+    let layout = MainWindowLayout::CLASSIC;
+
+    // A track whose length is unknown has no remaining time: the four cells
+    // show nothing at all and the placeholder is the skin's own dash.
+    let unknown = MainWindowState {
+        time_seconds: 12 * 60 + 34,
+        time_remaining: true,
+        duration_unknown: true,
+        ..MainWindowState::default()
+    };
+    let frame = render_main_window(&unknown, &skin, &layout);
+    for rect in layout.time_digits {
+        assert_eq!(
+            rgb(&frame, rect.x, rect.y),
+            MAIN_BG,
+            "the cell at {} must show no digit",
+            rect.x
+        );
+    }
+    assert_eq!(rgb(&frame, 38, 32), MINUS);
+
+    // The elapsed time is known and counts: its digits are the ones of the
+    // time, not the placeholder.
+    let elapsed = MainWindowState {
+        time_remaining: false,
+        ..unknown
+    };
+    let frame = render_main_window(&elapsed, &skin, &layout);
+    assert_eq!(rgb(&frame, 48, 26), DIGIT_1);
+    assert_eq!(rgb(&frame, 60, 26), DIGIT_2);
+    assert_eq!(rgb(&frame, 78, 26), DIGIT_3);
+    assert_eq!(rgb(&frame, 90, 26), DIGIT_4);
+    // The elapsed display carries no dash.
+    assert_ne!(rgb(&frame, 38, 32), MINUS);
+}
+
+#[test]
+fn a_track_that_cannot_be_seeked_draws_the_position_slider_disabled() {
+    let skin = synthetic_skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let enabled = render_main_window(&playing_state(), &skin, &layout);
+    let mut state = playing_state();
+    state.seekable = false;
+    let disabled = render_main_window(&state, &skin, &layout);
+
+    // The thumb keeps its place and is dimmed: the control reads as inactive.
+    let thumb = layout.position_thumb;
+    let lit = rgb(&enabled, thumb.x, thumb.y);
+    let dim = rgb(&disabled, thumb.x, thumb.y);
+    assert_ne!(lit, dim, "the disabled look must differ from the live one");
+    assert!(
+        dim[0] < lit[0] && dim[1] < lit[1] && dim[2] < lit[2],
+        "the disabled thumb must be dimmer: {lit:?} -> {dim:?}"
+    );
+
+    // Nothing else of the frame changes.
+    for y in 0..enabled.height() as i32 {
+        for x in 0..enabled.width() as i32 {
+            let inside = x >= thumb.x && x < thumb.right() && y >= thumb.y && y < thumb.bottom();
+            if !inside {
+                assert_eq!(rgb(&enabled, x, y), rgb(&disabled, x, y), "{x},{y}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_shaded_position_slider_is_disabled_too() {
+    let skin = synthetic_skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let mut state = playing_state();
+    state.windowshade = true;
+    let enabled = render_main_window(&state, &skin, &layout);
+    state.seekable = false;
+    let disabled = render_main_window(&state, &skin, &layout);
+
+    let thumb = Rect::new(layout.shade_position.x, layout.shade_position.y, 3, 7);
+    let lit = rgb(&enabled, thumb.x, thumb.y);
+    let dim = rgb(&disabled, thumb.x, thumb.y);
+    assert_ne!(lit, dim, "the disabled look must differ from the live one");
+    assert!(
+        dim[0] < lit[0] && dim[1] < lit[1] && dim[2] < lit[2],
+        "the disabled thumb must be dimmer: {lit:?} -> {dim:?}"
+    );
 }
 
 #[test]

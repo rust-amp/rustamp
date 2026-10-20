@@ -240,14 +240,25 @@ fn draw_shade(
     );
     let travel = layout.shade_position.width.saturating_sub(3);
     let offset = (u32::from(state.position.min(100)) * travel + 50) / 100;
-    blit_named(
-        canvas,
-        sheets,
-        skin,
-        "MAIN_SHADE_POSITION_THUMB",
-        layout.shade_position.x + offset as i32,
-        layout.shade_position.y,
-    );
+    if state.seekable {
+        blit_named(
+            canvas,
+            sheets,
+            skin,
+            "MAIN_SHADE_POSITION_THUMB",
+            layout.shade_position.x + offset as i32,
+            layout.shade_position.y,
+        );
+    } else {
+        // The shaded window carries the same disabled look.
+        let thumb = Rect::new(
+            layout.shade_position.x + offset as i32,
+            layout.shade_position.y,
+            3,
+            7,
+        );
+        draw_disabled(canvas, sheets, skin, "MAIN_SHADE_POSITION_THUMB", thumb);
+    }
     // S08 §1: the shaded main window carries its own analyser, 38 x 5 px with
     // five bands.
     crate::visualization::draw_visualization(
@@ -478,12 +489,50 @@ fn draw_position(
         layout.position_track.y,
     );
     let thumb = layout.position_thumb_at(state.position);
-    let thumb_sprite = if state.position_thumb_pressed {
-        "MAIN_POSITION_SLIDER_THUMB_SELECTED"
+    if state.seekable {
+        let thumb_sprite = if state.position_thumb_pressed {
+            "MAIN_POSITION_SLIDER_THUMB_SELECTED"
+        } else {
+            "MAIN_POSITION_SLIDER_THUMB"
+        };
+        blit_named(canvas, sheets, skin, thumb_sprite, thumb.x, thumb.y);
     } else {
-        "MAIN_POSITION_SLIDER_THUMB"
+        // The disabled look of a control that cannot be used.
+        draw_disabled(canvas, sheets, skin, "MAIN_POSITION_SLIDER_THUMB", thumb);
+    }
+}
+
+/// The opacity a disabled control's sprite is drawn with.
+///
+/// **Rustamp's own look.** The classic skin carries no "disabled" sprite for
+/// the position slider, and S19 leaves the reference's own display open (its
+/// open question 7 asks what the seek bar shows without a length), so the
+/// disabled look is ours: the skin's own sprite, dimmed over the track. The
+/// control keeps its shape and reads as inactive.
+const DISABLED_ALPHA: u8 = 96;
+
+/// Draws the named sprite dimmed over the canvas.
+///
+/// The sprite is the skin's own art; only its opacity is lowered, so the
+/// result is the skin's picture blended with what is behind it.
+fn draw_disabled(canvas: &mut Image, sheets: &Sheets, skin: &Skin, name: &str, at: Rect) {
+    let Some(def) = skin.sprite(name) else {
+        return;
     };
-    blit_named(canvas, sheets, skin, thumb_sprite, thumb.x, thumb.y);
+    let Some(src) = sheets.get(def.sheet) else {
+        return;
+    };
+    let mut scratch = Image::new(def.width, def.height);
+    scratch.blit_rect(
+        src,
+        Rect::new(def.x as i32, def.y as i32, def.width, def.height),
+        0,
+        0,
+    );
+    for pixel in scratch.as_rgba_mut().as_chunks_mut::<4>().0 {
+        pixel[3] = DISABLED_ALPHA;
+    }
+    canvas.blit_alpha(&scratch, scratch.bounds(), at.x, at.y);
 }
 
 /// The volume frame index for a 0..=100 value.
@@ -587,10 +636,18 @@ fn draw_time(
     } else {
         "NO_DIGIT"
     };
-    for (cell, rect) in state.time_cells().iter().zip(layout.time_digits.iter()) {
-        match cell {
-            Some(digit) => blit_named(canvas, sheets, skin, names[*digit as usize], rect.x, rect.y),
-            None => blit_named(canvas, sheets, skin, blank, rect.x, rect.y),
+    // A track whose length is unknown has no remaining time: the display
+    // carries the placeholder alone (the dash below) and no cells at all.
+    // Four blank cells would still read as a time, which is the thing the
+    // placeholder is there to avoid.
+    if !state.shows_time_placeholder() {
+        for (cell, rect) in state.time_cells().iter().zip(layout.time_digits.iter()) {
+            match cell {
+                Some(digit) => {
+                    blit_named(canvas, sheets, skin, names[*digit as usize], rect.x, rect.y)
+                }
+                None => blit_named(canvas, sheets, skin, blank, rect.x, rect.y),
+            }
         }
     }
     if state.time_remaining {
