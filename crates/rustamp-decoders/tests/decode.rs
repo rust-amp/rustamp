@@ -314,14 +314,96 @@ fn the_opus_audio_is_the_sine_the_file_holds() {
     );
 }
 
+/// An Opus stream in a Matroska file decodes like the same stream in an Ogg
+/// file.
+///
+/// The Matroska mapping states the channel count of an Opus track as a
+/// channel layout and not as a count, so the decoder used to refuse the
+/// stream by name ("the stream states no channel count"). The
+/// identification header the track carries states the count, and the two
+/// files hold the same encoded stream, so the decoded samples have to be the
+/// same.
+#[test]
+fn opus_in_matroska_decodes_the_same_audio_as_the_ogg_file() {
+    let mut mkv = open_path("sine_opus.mkv");
+    assert_eq!(mkv.spec(), AudioSpec::new(OPUS_RATE, 2));
+    // The container states 1508 ms for the encoded stream. The encoder's
+    // look-ahead is not audio, so the duration is that much shorter - and
+    // the container states its duration with a resolution of a millisecond.
+    let dur = mkv.duration().expect("duration known");
+    assert!(
+        dur.abs_diff(Duration::from_millis(1500)) < Duration::from_millis(2),
+        "matroska duration {dur:?}"
+    );
+    let out = read_all(mkv.as_mut());
+    let ogg = read_all(open_path("sine.opus").as_mut());
+    // The Ogg file holds exactly the samples of its audio.
+    assert_eq!(ogg.len() / 2, OPUS_FRAMES as usize);
+    // The Matroska file holds the same samples and the padding at its end.
+    // The Matroska reader does not state that padding (it ignores the
+    // `DiscardPadding` of the last block), so the decoder cannot drop it -
+    // see `CONTRACT_NOTES.md`.
+    assert!(out.len() > ogg.len(), "the padding at the end is missing");
+    assert_eq!(
+        &out[..ogg.len()],
+        &ogg[..],
+        "the two files hold the same audio"
+    );
+    let tail = &out[ogg.len()..];
+    let peak = tail.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+    assert!(peak < 0.01, "the tail is the padding: peak {peak}");
+}
+
+/// A seek in a Matroska file lands on the position the container states.
+///
+/// The Matroska reader counts its timestamps in the units of the timestamp
+/// scale of the file - a millisecond by default - so a seek cannot be
+/// sample exact there: the file states the position of a block with a
+/// resolution of a millisecond.
+#[test]
+fn opus_in_matroska_seeks_to_the_position_the_container_states() {
+    let mut d = open_path("sine_opus.mkv");
+    let ch = usize::from(d.spec().channels);
+    let full = read_all(d.as_mut());
+    for ms in [300u64, 1000, 1400] {
+        let at = Duration::from_millis(ms);
+        d.seek(at).unwrap();
+        let mut buf = vec![0.0f32; 400 * ch];
+        let n = d.read(&mut buf).unwrap();
+        assert!(n > 0, "matroska {ms} ms: nothing after the seek");
+        let expect = (at.as_secs_f64() * f64::from(OPUS_RATE)).round() as usize;
+        // The window is wider than the error the test is about, so that a
+        // seek that lands further away does not find its best match at the
+        // edge of the window.
+        let landed = best_match(&full, &buf[..n * ch], ch, expect, 512);
+        // One millisecond is 48 frames at 48 kHz; the container states the
+        // position of a block with that resolution.
+        let off = landed.abs_diff(expect);
+        assert!(
+            off * 1000 <= 2 * OPUS_RATE as usize,
+            "matroska {ms} ms: the seek landed {off} frames off"
+        );
+    }
+}
+
 /// The frame of the full decode that matches the audio after a seek best.
 ///
 /// A seek that lands on the wrong sample finds its best match a few samples
 /// away from the target, so the offset of the best match is the sample
 /// accuracy of the seek. The codec rebuilds its state from the lead-in of the
 /// seek, so the two signals are not identical - but they are the same signal.
-fn best_match(full: &[f32], seeked: &[f32], channels: usize, expect: usize) -> usize {
-    let window = 64usize;
+///
+/// `window` is the number of frames the search looks at on either side of
+/// the expected frame. A seek that lands further away than the window finds
+/// its best match at the edge of it, so the window has to be wider than the
+/// error the test is about.
+fn best_match(
+    full: &[f32],
+    seeked: &[f32],
+    channels: usize,
+    expect: usize,
+    window: usize,
+) -> usize {
     let start = expect.saturating_sub(window);
     let end = (expect + window).min(full.len() / channels);
     (start..end)
@@ -360,7 +442,7 @@ fn opus_seek_is_sample_accurate() {
         assert!(n > 0, "opus {ms} ms: nothing after the seek");
         let expect = (at.as_secs_f64() * f64::from(OPUS_RATE)).round() as usize;
         assert_eq!(
-            best_match(&full, &buf[..n * ch], ch, expect),
+            best_match(&full, &buf[..n * ch], ch, expect, 64),
             expect,
             "opus {ms} ms: the seek landed on the wrong sample"
         );
@@ -491,6 +573,7 @@ fn probe_scores() {
         "sine.mp3",
         "sine.ogg",
         "sine.opus",
+        "sine_opus.mkv",
         "sine_aac.m4a",
         "sine_alac.m4a",
     ] {

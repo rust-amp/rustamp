@@ -179,6 +179,13 @@ Behaviour the core contract leaves open, and what the decoders do.
   bounded by `MAX_SEEK_FRAMES` (2^53) instead of overflowing the frame count.
   After a seek the truncation check counts from the new position, so a seek
   cannot turn a complete file into a truncated one.
+- **Matroska.** The container counts its timestamps in the units of its
+  timestamp scale (a millisecond by default) and not in frames, so two
+  conversions happen: the frame count the container states is turned into
+  frames at the rate of the track, and the timestamps of the packets are
+  turned into frames before they are compared with the decoded ones. A seek
+  therefore lands on the position the container states, with the resolution of
+  the timestamp scale - a millisecond - and not on the sample.
 - **Empty input.** A source of zero bytes is rejected before probing with
   `Error::Decode("empty source: 0 bytes to decode")`, not with the probe's "no
   suitable format reader found" (which named the wrong problem).
@@ -205,11 +212,12 @@ Behaviour the core contract leaves open, and what the decoders do.
 
 Symphonia ships no Opus codec: no published version of the crate has an `opus`
 feature, and `symphonia-codec-opus` does not exist on crates.io. What symphonia
-does have is the Ogg mapping - its demuxer reads the Opus identification header
-and states the codec parameters - so only the codec itself was missing. This
-crate brings its own (`opus-rs`, a pure-Rust port of the reference
-implementation) and registers it in a codec registry of its own, next to the
-codecs symphonia enables.
+does have are the mappings: its Ogg demuxer reads the Opus identification header
+and states the codec parameters, and its Matroska demuxer hands the
+identification header of the track to the codec as the codec private data. So
+only the codec itself was missing. This crate brings its own (`opus-rs`, a
+pure-Rust port of the reference implementation) and registers it in a codec
+registry of its own, next to the codecs symphonia enables.
 
 - **The codec** decodes mono and stereo streams at 48 kHz, the rate Opus always
   runs at. A stream that states another rate, or more than two channels, is
@@ -224,24 +232,44 @@ codecs symphonia enables.
   reader's timestamp arithmetic does not account for that. The codec drops
   them, so a file delivers exactly the samples of its audio - the same 72000
   samples a reference decoder delivers for the repository fixture.
-- **The duration** follows from the same correction: the granule position of
-  the last page counts the pre-skip, so the number of audio frames is the
-  granule minus the pre-skip. The duration of the fixture is 1.5 s, not the
-  1.5065 s the granule alone would state.
-- **The timestamps** of an Ogg Opus stream count the pre-skip samples, so they
-  are ahead of the audio by exactly that many samples. A seek asks for the
+- **The duration of an Ogg file** follows from the same correction: the granule
+  position of the last page counts the pre-skip, so the number of audio frames
+  is the granule minus the pre-skip. The duration of the fixture is 1.5 s, not
+  the 1.5065 s the granule alone would state.
+- **The timestamps** of an Opus stream count the pre-skip samples, so they are
+  ahead of the audio by exactly that many samples. A seek asks for the
   timestamp of the sample and not the one of the audio before it, and lands on
   the exact sample it asked for.
 - **The end of the stream** is the end-of-stream flag of the last Ogg page, as
   for every other Ogg file: the oracle of the Ogg container applies to an Opus
   file unchanged (see the Ogg header above).
-- **Only the Ogg mapping carries an Opus stream.** The Matroska mapping of
-  symphonia states neither the channel count nor the rate of an Opus track
-  (it hands the codec private data to the codec and nothing else), so an Opus
-  stream in a Matroska file is refused by name
-  (`Error::UnsupportedFormat("opus: the stream states no channel count")`).
-  The pre-skip correction above is the one of the Ogg granule, and it is not
-  applied to a container whose granule convention is not known here.
+- **The Matroska mapping** states the channel count of an Opus track as a
+  channel layout and not as a count, so the parameters the container reader
+  hands to the codec do not describe the stream. The identification header the
+  track carries states the count (RFC 7845, §5.1), and that is the one that is
+  used: the parameters are completed from it before the codec is built
+  (`opus_dec::complete_parameters`), so an Opus stream in a Matroska file is
+  decoded like a stream in an Ogg file. The rate is not touched: the Matroska
+  mapping states the rate of the codec (48 kHz, as the mapping requires), and
+  a track that states another rate is still refused by name.
+- **The duration of a Matroska file** is the duration the container states,
+  less the look-ahead. The container states it in the units of its timestamp
+  scale - a millisecond by default - and the container reader reports that
+  count as the frame count, so it is turned into frames at the rate of the
+  track. The repository fixture states 1508 ms for the encoded stream; the
+  duration of the audio is 1.5015 s, the difference being the encoder's
+  look-ahead and the resolution of the container.
+- **The padding at the end of a Matroska file** is not dropped: the Matroska
+  reader ignores the `DiscardPadding` of the last block, so the decoder
+  delivers the padding as well. The fixture delivers 72648 frames instead of
+  the 72000 frames of its audio - 648 samples (13.5 ms) of the encoder's
+  flush, which is silent. The Ogg mapping does not have that problem: the
+  granule position states the end of the audio exactly.
+- **A seek in a Matroska file** lands on the position the container states,
+  and the container states the position of a block with a resolution of a
+  millisecond: the seek of the fixture lands 53 frames (1.1 ms) after the
+  sample it asked for. A seek in an Ogg file is sample exact.
+
 
 ## Wave decoder (`wave_dec.rs`)
 

@@ -15,3 +15,8 @@ The Opus fixture is the same sine wave, but at 48 kHz - the rate Opus always
 runs at - and it carries the same two tags:
 
 ffmpeg -f lavfi -i sine=frequency=440:duration=1.5:sample_rate=48000 -ac 2 -c:a libopus -b:a 96k -metadata title="Sine Title" -metadata artist="Test Artist" sine.opus
+
+The Matroska fixture holds the same encoded stream in a Matroska container,
+so the two files decode to the same samples:
+
+ffmpeg -f lavfi -i sine=frequency=440:duration=1.5:sample_rate=48000 -ac 2 -c:a libopus -b:a 96k sine_opus.mkv
