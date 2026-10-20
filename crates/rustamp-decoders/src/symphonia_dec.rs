@@ -47,7 +47,11 @@
 //!   producing samples or ending the stream. The probe of the container runs
 //!   inside a `catch_unwind`, because a container reader of a third-party
 //!   crate can panic on a broken file (the Matroska reader of symphonia does,
-//!   on every truncated Matroska file). See `tests/robustness.rs` and
+//!   on every truncated Matroska file). The **read** path runs inside a
+//!   `catch_unwind` as well - the container reader and the codecs are
+//!   third-party code too, and a panic of theirs must not take the player
+//!   down: it becomes a decode failure and the decoder stops there (see
+//!   [`SymphoniaDecoder::note_panic`]). See `tests/robustness.rs` and
 //!   `tests/oracle_properties.rs`.
 
 use std::fs::File;
@@ -63,7 +67,7 @@ use rustamp_core::state::StreamInfo;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, CODEC_TYPE_OPUS, CodecParameters, DecoderOptions};
 use symphonia::core::errors::Error as SymError;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
+use symphonia::core::formats::{FormatOptions, FormatReader, Packet, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTagKey};
 use symphonia::core::probe::Hint;
@@ -239,6 +243,20 @@ fn stream_err(e: SymError) -> Error {
         SymError::Unsupported(m) => Error::Decode(format!("mid-stream unsupported input: {m}")),
         other => Error::Decode(other.to_string()),
     }
+}
+
+/// The message a panic of the third-party code becomes.
+///
+/// The wording is the one of the probe's guard (see
+/// [`SymphoniaDecoder::open_stream`]): a file that makes the code of another
+/// crate panic is a broken file, and a broken file is a decode failure and not
+/// a crash of the player.
+///
+/// `what` names the code that panicked (the container reader, the codec) and
+/// `when` the phase it panicked in, so that the message says where it
+/// happened.
+fn panic_message(what: &str, when: &str) -> String {
+    format!("the {what} panicked {when}: it is broken")
 }
 
 /// Frame index of `at` at `rate` Hz, saturating instead of overflowing.
@@ -833,6 +851,13 @@ pub struct SymphoniaDecoder {
     /// Reported by the next `read` that writes no frames, so the frames that
     /// were decoded before the cut are still delivered.
     truncation: Option<String>,
+    /// The failure of a panic of the third-party code.
+    ///
+    /// `None` as long as nothing panicked. After a panic the decoder is
+    /// terminal: it does not call the container reader or the codec again,
+    /// and every later call says that the file is broken (see
+    /// [`SymphoniaDecoder::note_panic`]).
+    panic_failure: Option<String>,
     skipped: u64,
     consecutive_errors: u32,
     finished: bool,
@@ -931,7 +956,8 @@ impl SymphoniaDecoder {
         // panic was measured on the prefixes of the repository fixture: 22746
         // of the 23304 prefixes panicked while the file was opened). A
         // hostile file must not take the player down, so the panic is caught
-        // here and named as a decode failure.
+        // here and named as a decode failure. The read path is guarded the
+        // same way (see [`SymphoniaDecoder::note_panic`]).
         let mut probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             symphonia::default::get_probe().format(
                 &hint,
@@ -940,9 +966,7 @@ impl SymphoniaDecoder {
                 &MetadataOptions::default(),
             )
         }))
-        .map_err(|_| {
-            Error::Decode("the container reader panicked on this file: it is broken".into())
-        })?
+        .map_err(|_| Error::Decode(panic_message("container reader", "on this file")))?
         .map_err(open_err)?;
 
         let mut format = probed.format;
@@ -1008,6 +1032,7 @@ impl SymphoniaDecoder {
             ts_offset,
             time_base: params.time_base,
             truncation: None,
+            panic_failure: None,
             skipped: 0,
             consecutive_errors: 0,
             finished: false,
@@ -1049,100 +1074,150 @@ impl SymphoniaDecoder {
     /// track id, `continue` for an empty buffer) are bounded by
     /// [`MAX_NO_PROGRESS_PACKETS`], so the loop cannot spin on a source that
     /// keeps handing out packets without progress.
+    ///
+    /// The two calls into the third-party code - the container reader and the
+    /// codec - run inside a `catch_unwind`: they can panic on a file that is
+    /// broken, and a panic must not take the player down (see
+    /// [`SymphoniaDecoder::note_panic`]).
     fn fill_pending(&mut self) -> Result<bool> {
         if self.finished {
             return Ok(false);
         }
         let mut no_progress = 0u32;
         loop {
-            let packet = match self.format.next_packet() {
-                Ok(p) => p,
-                Err(SymError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            // The container reader is code of another crate: it can panic on a
+            // broken file (the Matroska reader of symphonia does), and the
+            // panic must not take the player down. The guard costs one stack
+            // frame and the landing pad of the unwind on the success path,
+            // and nothing else: the call it wraps was a virtual one already,
+            // so no inlining is lost and nothing is allocated.
+            let packet = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.format.next_packet()
+            })) {
+                Ok(Ok(p)) => p,
+                Ok(Err(SymError::IoError(e))) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     self.finished = true;
                     self.note_truncation();
                     return Ok(false);
                 }
-                Err(SymError::ResetRequired) => {
+                Ok(Err(SymError::ResetRequired)) => {
                     // A container reset (chained Ogg) cannot be continued in
                     // place; RFC 0002 C3.4 says end the stream here rather than
                     // report a format change.
                     self.finished = true;
                     return Ok(false);
                 }
-                Err(SymError::DecodeError(_)) => {
+                Ok(Err(SymError::DecodeError(_))) => {
                     self.note_skip()?;
                     continue;
                 }
-                Err(e) => return Err(stream_err(e)),
+                Ok(Err(e)) => return Err(stream_err(e)),
+                Err(_) => {
+                    return Err(self.note_panic("container reader", "while the file was read"));
+                }
             };
             if packet.track_id() != self.track_id {
                 no_progress += 1;
                 self.note_no_progress(no_progress)?;
                 continue;
             }
-            let decoded = match self.codec.decode(&packet) {
-                Ok(d) => d,
-                Err(SymError::DecodeError(_) | SymError::IoError(_) | SymError::Unsupported(_)) => {
-                    self.note_skip()?;
+            // The codec is third-party code as well, and a codec of symphonia
+            // can panic on a packet of a file that is broken. The guard costs
+            // the same as the one above: one stack frame, no allocation, no
+            // inlining that was there before lost. The decode and the
+            // conversion run inside the guard, so that nothing of the codec
+            // outlives it.
+            let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.decode_packet(&packet)
+            })) {
+                Ok(outcome) => outcome?,
+                Err(_) => {
+                    return Err(self.note_panic("codec", "while the file was decoded"));
+                }
+            };
+            match outcome {
+                PacketOutcome::Samples => {}
+                PacketOutcome::Empty => {
+                    // A buffer that decodes to zero frames is not progress.
+                    no_progress += 1;
+                    self.note_no_progress(no_progress)?;
                     continue;
                 }
-                Err(SymError::ResetRequired) => {
-                    self.finished = true;
-                    return Ok(false);
-                }
-                Err(e) => return Err(stream_err(e)),
-            };
-            self.consecutive_errors = 0;
-            if decoded.frames() == 0 {
-                no_progress += 1;
-                self.note_no_progress(no_progress)?;
-                continue;
-            }
-            // After a seek, drop the frames before the target. Buffers are aligned by their
-            // end timestamp because codecs with overlap (Vorbis, MP3, AAC) return short
-            // buffers right after a reset. A container that states no duration for its
-            // packets (Matroska) leaves the buffer at the timestamp of the packet.
-            let mut skip = 0;
-            if let Some(target) = self.seek_target {
-                let ts = frame_of(packet.ts(), self.time_base, self.spec.sample_rate);
-                let end = ts.saturating_add(frame_of(
-                    packet.dur(),
-                    self.time_base,
-                    self.spec.sample_rate,
-                ));
-                let start = end.saturating_sub(decoded.frames() as u64).max(ts);
-                skip = target.saturating_sub(start) as usize;
-                if end > target {
-                    self.seek_target = None;
-                }
-            }
-            match convert(
-                decoded,
-                &mut self.spec,
-                &mut self.sample_buf,
-                &mut self.pending,
-                skip,
-            ) {
-                Converted::Samples => {}
-                Converted::Unusable => {
-                    // Nothing to hand out and nothing to convert; stop instead
-                    // of looping on this source.
-                    self.finished = true;
-                    return Ok(false);
-                }
-                Converted::RateChanged(new_spec) => {
-                    // RFC 0002 C3.1: switch the format, but report it from a
-                    // `read` call that writes no frames (see `read`).
-                    queue_format_change(&mut self.pending_format_change, new_spec);
-                    self.finished = true;
-                    return Ok(false);
-                }
+                // The packet was counted as a skip already.
+                PacketOutcome::Skipped => continue,
+                PacketOutcome::End => return Ok(false),
             }
             self.pending_pos = 0;
             if self.pending_pos < self.pending.len() {
                 return Ok(true);
             }
         }
+    }
+
+    /// Decodes one packet and converts it into `pending`.
+    ///
+    /// The outcome is owned: the buffer of the codec does not outlive the
+    /// call, so the call can run inside a `catch_unwind` - a panic of the
+    /// codec must not take the player down (see
+    /// [`SymphoniaDecoder::note_panic`]).
+    fn decode_packet(&mut self, packet: &Packet) -> Result<PacketOutcome> {
+        let decoded = match self.codec.decode(packet) {
+            Ok(d) => d,
+            Err(SymError::DecodeError(_) | SymError::IoError(_) | SymError::Unsupported(_)) => {
+                self.note_skip()?;
+                return Ok(PacketOutcome::Skipped);
+            }
+            Err(SymError::ResetRequired) => {
+                self.finished = true;
+                return Ok(PacketOutcome::End);
+            }
+            Err(e) => return Err(stream_err(e)),
+        };
+        self.consecutive_errors = 0;
+        if decoded.frames() == 0 {
+            return Ok(PacketOutcome::Empty);
+        }
+        // After a seek, drop the frames before the target. Buffers are aligned by their
+        // end timestamp because codecs with overlap (Vorbis, MP3, AAC) return short
+        // buffers right after a reset. A container that states no duration for its
+        // packets (Matroska) leaves the buffer at the timestamp of the packet.
+        let mut skip = 0;
+        if let Some(target) = self.seek_target {
+            let ts = frame_of(packet.ts(), self.time_base, self.spec.sample_rate);
+            let end = ts.saturating_add(frame_of(
+                packet.dur(),
+                self.time_base,
+                self.spec.sample_rate,
+            ));
+            let start = end.saturating_sub(decoded.frames() as u64).max(ts);
+            skip = target.saturating_sub(start) as usize;
+            if end > target {
+                self.seek_target = None;
+            }
+        }
+        match convert(
+            decoded,
+            &mut self.spec,
+            &mut self.sample_buf,
+            &mut self.pending,
+            skip,
+        ) {
+            Converted::Samples => {}
+            Converted::Unusable => {
+                // Nothing to hand out and nothing to convert; stop instead
+                // of looping on this source.
+                self.finished = true;
+                return Ok(PacketOutcome::End);
+            }
+            Converted::RateChanged(new_spec) => {
+                // RFC 0002 C3.1: switch the format, but report it from a
+                // `read` call that writes no frames (see `read`).
+                queue_format_change(&mut self.pending_format_change, new_spec);
+                self.finished = true;
+                return Ok(PacketOutcome::End);
+            }
+        }
+        Ok(PacketOutcome::Samples)
     }
 
     /// Records that the stream ended before the container's declared payload
@@ -1197,6 +1272,25 @@ impl SymphoniaDecoder {
         Ok(())
     }
 
+    /// Records a panic of the third-party code and returns the failure.
+    ///
+    /// The state of the container reader and of the codec after a panic is
+    /// unknown: the reader may be in the middle of an element and the codec
+    /// may hold half a frame. The decoder therefore stops here - it does not
+    /// call the third-party code again, and it does not hand out what the
+    /// panic may have left behind.
+    ///
+    /// The failure is kept, so that every later call says that the file is
+    /// broken: a broken file must not look like a file that ended cleanly.
+    fn note_panic(&mut self, what: &str, when: &str) -> Error {
+        self.finished = true;
+        self.pending.clear();
+        self.pending_pos = 0;
+        let message = panic_message(what, when);
+        self.panic_failure = Some(message.clone());
+        Error::Decode(message)
+    }
+
     /// Counts an iteration of [`SymphoniaDecoder::fill_pending`] that produced
     /// neither samples nor a counted skip, and fails once a source keeps
     /// producing such packets: without this the loop would never reach an end of
@@ -1242,6 +1336,13 @@ impl Decoder for SymphoniaDecoder {
             self.delivered += (n / ch) as u64;
         }
         if written == 0
+            && let Some(message) = &self.panic_failure
+        {
+            // The file broke the third-party code: it is broken, and every
+            // call says so (see [`SymphoniaDecoder::note_panic`]).
+            return Err(Error::Decode(message.clone()));
+        }
+        if written == 0
             && let Some(message) = &self.truncation
         {
             // The file was cut: the frames it holds were delivered, and the
@@ -1262,6 +1363,12 @@ impl Decoder for SymphoniaDecoder {
     }
 
     fn seek(&mut self, to: Duration) -> Result<Duration> {
+        // A file that broke the third-party code cannot be seeked either: the
+        // state of the reader and of the codec is unknown, and a seek would
+        // call them again.
+        if let Some(message) = &self.panic_failure {
+            return Err(Error::Decode(message.clone()));
+        }
         let rate = u64::from(self.spec.sample_rate.max(1));
         let mut target = to;
         if let Some(d) = self.duration() {
@@ -1281,22 +1388,31 @@ impl Decoder for SymphoniaDecoder {
         // Half a frame of slack so the time-to-timestamp conversion cannot round down.
         let frac = ((from % rate) as f64 + 0.5) / rate as f64;
         let time = Time::new(from / rate, frac);
-        let seeked = self
-            .format
-            .seek(
+        // The container reader and the codec are third-party code here as
+        // well, and they can panic on a file that is broken. The guards cost
+        // one stack frame each on the success path and nothing else.
+        let seeked = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.format.seek(
                 SeekMode::Accurate,
                 SeekTo::Time {
                     time,
                     track_id: Some(self.track_id),
                 },
             )
-            .map_err(|e| match e {
+        })) {
+            Ok(result) => result.map_err(|e| match e {
                 SymError::Unsupported(_) | SymError::SeekError(_) => {
                     Error::Unsupported("seek not supported for this stream")
                 }
                 other => stream_err(other),
-            })?;
-        self.codec.reset();
+            })?,
+            Err(_) => {
+                return Err(self.note_panic("container reader", "while the file was sought"));
+            }
+        };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.codec.reset())).is_err() {
+            return Err(self.note_panic("codec", "while the file was sought"));
+        }
         self.pending.clear();
         self.pending_pos = 0;
         self.finished = false;
@@ -1341,6 +1457,23 @@ impl Decoder for SymphoniaDecoder {
     fn is_seekable(&self) -> bool {
         true
     }
+}
+
+/// What one packet of the read loop did.
+///
+/// The outcome is owned on purpose: the decode of a packet and the conversion
+/// of its buffer run inside a `catch_unwind` (see
+/// [`SymphoniaDecoder::decode_packet`]), and nothing of the codec may outlive
+/// that guard.
+enum PacketOutcome {
+    /// The samples are in `pending`, in the decoder's current spec.
+    Samples,
+    /// The packet could not be decoded: it was skipped and counted.
+    Skipped,
+    /// The packet decoded to zero frames: it is no progress.
+    Empty,
+    /// The stream ends here.
+    End,
 }
 
 /// What [`convert`] did with one decoded buffer.
@@ -1475,8 +1608,14 @@ mod tests {
     use super::*;
     use std::borrow::Cow;
     use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use symphonia::core::audio::{AudioBuffer, Channels, Signal, SignalSpec};
+    use symphonia::core::codecs::{CodecDescriptor, FinalizeResult};
+    use symphonia::core::formats::{Cue, SeekedTo, Track};
     use symphonia::core::io::MediaSource as _;
+    use symphonia::core::meta::{Metadata, MetadataLog};
 
     /// Compile-time proof for the `Send + Sync` requirement of symphonia's
     /// `MediaSource` (RFC 0002, C2). `ReaderSource` satisfies it through
@@ -1858,5 +1997,248 @@ mod tests {
         ));
         assert_eq!(spec, AudioSpec::new(8_000, 1));
         assert_eq!(pending, vec![0.5, -0.5]);
+    }
+
+    // -----------------------------------------------------------------------
+    // A panic of the third-party code
+    // -----------------------------------------------------------------------
+
+    /// A codec that panics on every packet, and counts the calls.
+    ///
+    /// No file of the repository makes a codec of symphonia panic, so the
+    /// guard of the decode path is pinned with one that does: the panic must
+    /// become a typed failure, and the codec must not be called again.
+    struct PanickingCodec {
+        params: CodecParameters,
+        calls: Arc<AtomicUsize>,
+        buffer: AudioBuffer<f32>,
+    }
+
+    impl PanickingCodec {
+        fn new(calls: Arc<AtomicUsize>) -> Self {
+            let mut buffer =
+                AudioBuffer::<f32>::new(1, SignalSpec::new(44_100, Channels::FRONT_LEFT));
+            buffer.render_reserved(Some(1));
+            Self {
+                params: CodecParameters::new(),
+                calls,
+                buffer,
+            }
+        }
+    }
+
+    impl symphonia::core::codecs::Decoder for PanickingCodec {
+        fn try_new(
+            _params: &CodecParameters,
+            _options: &DecoderOptions,
+        ) -> symphonia::core::errors::Result<Self> {
+            Err(SymError::Unsupported(
+                "the codec of this test is built by hand",
+            ))
+        }
+
+        fn supported_codecs() -> &'static [CodecDescriptor] {
+            &[]
+        }
+
+        fn reset(&mut self) {}
+
+        fn codec_params(&self) -> &CodecParameters {
+            &self.params
+        }
+
+        fn decode(
+            &mut self,
+            _packet: &Packet,
+        ) -> symphonia::core::errors::Result<AudioBufferRef<'_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("the codec of this test panics on every packet");
+        }
+
+        fn finalize(&mut self) -> FinalizeResult {
+            FinalizeResult::default()
+        }
+
+        fn last_decoded(&self) -> AudioBufferRef<'_> {
+            AudioBufferRef::F32(Cow::Borrowed(&self.buffer))
+        }
+    }
+
+    /// A container reader that panics on every packet, and counts the calls.
+    ///
+    /// The Matroska reader of symphonia is the reader that panics in the
+    /// wild - but it does so while the file is *opened*. This one panics
+    /// while the file is *read*, which is the phase the guard of the read
+    /// path is there for.
+    struct PanickingReader {
+        log: MetadataLog,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PanickingReader {
+        fn new(calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                log: MetadataLog::default(),
+                calls,
+            }
+        }
+    }
+
+    impl FormatReader for PanickingReader {
+        fn try_new(
+            _source: MediaSourceStream,
+            _options: &FormatOptions,
+        ) -> symphonia::core::errors::Result<Self> {
+            Err(SymError::Unsupported(
+                "the reader of this test is built by hand",
+            ))
+        }
+
+        fn cues(&self) -> &[Cue] {
+            &[]
+        }
+
+        fn metadata(&mut self) -> Metadata<'_> {
+            self.log.metadata()
+        }
+
+        fn seek(
+            &mut self,
+            _mode: SeekMode,
+            _to: SeekTo,
+        ) -> symphonia::core::errors::Result<SeekedTo> {
+            Err(SymError::Unsupported("the reader of this test cannot seek"))
+        }
+
+        fn tracks(&self) -> &[Track] {
+            &[]
+        }
+
+        fn next_packet(&mut self) -> symphonia::core::errors::Result<Packet> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("the container reader of this test panics on every packet");
+        }
+
+        fn into_inner(self: Box<Self>) -> MediaSourceStream {
+            MediaSourceStream::new(
+                Box::new(Cursor::new(Vec::<u8>::new())),
+                MediaSourceStreamOptions::default(),
+            )
+        }
+    }
+
+    /// A decoder over the MPEG fixture of the repository.
+    ///
+    /// The fixture is a real file with real audio, so the container reader
+    /// and the codec of it are the ones of symphonia - only the part under
+    /// test is replaced.
+    fn mp3_decoder() -> SymphoniaDecoder {
+        let bytes = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sine.mp3"),
+        )
+        .expect("the MPEG fixture");
+        let source = MediaSource::Reader {
+            reader: Box::new(Cursor::new(bytes)),
+            extension: Some("mp3".to_string()),
+        };
+        SymphoniaDecoder::open(source).expect("the fixture opens")
+    }
+
+    /// A panic of the codec is a decode failure, and the decoder stops there.
+    ///
+    /// The state of a codec that panicked is unknown, so the decoder must not
+    /// call it again - and it must not look like a file that ended cleanly
+    /// either: every call says that the file is broken.
+    #[test]
+    fn a_panic_of_the_codec_is_a_decode_failure_and_the_decoder_stops() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut decoder = mp3_decoder();
+        decoder.codec = Box::new(PanickingCodec::new(calls.clone()));
+
+        let mut out = [0.0f32; 1024];
+        let error = decoder
+            .read(&mut out)
+            .expect_err("a panic of the codec must be a decode failure");
+        assert!(
+            matches!(&error, Error::Decode(message) if message
+                .contains("the codec panicked while the file was decoded")),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the codec was called once");
+
+        // The decoder is terminal: the codec is not called again, and the
+        // failure is reported again - a broken file must not look like a file
+        // that ended cleanly.
+        let error = decoder
+            .read(&mut out)
+            .expect_err("the file is still broken");
+        assert!(
+            matches!(&error, Error::Decode(message) if message.contains("panicked")),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a codec that panicked must not be called again"
+        );
+
+        // A seek cannot save a broken file either: it would call the
+        // third-party code again.
+        let error = decoder
+            .seek(Duration::from_secs(1))
+            .expect_err("a broken file cannot be seeked");
+        assert!(
+            matches!(&error, Error::Decode(message) if message.contains("panicked")),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a codec that panicked must not be called again"
+        );
+    }
+
+    /// A panic of the container reader is a decode failure, and the decoder
+    /// stops there.
+    ///
+    /// The reader of the third-party crate is the code that panics in the
+    /// wild (the Matroska reader of symphonia does, on every truncated
+    /// Matroska file). This one panics while the file is *read*, which is the
+    /// phase the guard of the read path is there for.
+    #[test]
+    fn a_panic_of_the_container_reader_is_a_decode_failure_and_the_decoder_stops() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut decoder = mp3_decoder();
+        decoder.format = Box::new(PanickingReader::new(calls.clone()));
+
+        let mut out = [0.0f32; 1024];
+        let error = decoder
+            .read(&mut out)
+            .expect_err("a panic of the reader must be a decode failure");
+        assert!(
+            matches!(&error, Error::Decode(message) if message
+                .contains("the container reader panicked while the file was read")),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the reader was called once"
+        );
+
+        // The decoder is terminal: the reader is not called again, and the
+        // failure is reported again.
+        let error = decoder
+            .read(&mut out)
+            .expect_err("the file is still broken");
+        assert!(
+            matches!(&error, Error::Decode(message) if message.contains("panicked")),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a reader that panicked must not be called again"
+        );
     }
 }
