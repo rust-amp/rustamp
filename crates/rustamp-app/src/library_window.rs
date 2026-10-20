@@ -46,11 +46,36 @@
 //! | `Escape` | stops the running scan |
 //! | `F5` | scans the registered roots again |
 //! | `Ctrl+F` | focuses the search field |
+//! | `Ctrl+M` | removes the rows whose file is gone |
 //! | `Ctrl+O` | asks for a folder to add to the library |
 //!
 //! The movement keys always move the selection, whether the search field has
 //! the focus or not: the field holds one line of text, and the list is what
 //! the window is for.
+//!
+//! # The missing entries
+//!
+//! The list can show rows whose file is gone: the file was deleted or moved,
+//! or the drive it was on is not attached. `Ctrl+M` removes those rows from
+//! the index - it drops the **row**, never the file, and it needs no full
+//! rescan: the index asks the file system about every row it holds under the
+//! registered roots ([`Library::remove_missing`]).
+//!
+//! The chord is an **own choice** (S20 is not started, so nothing measures
+//! the media library): `Ctrl+M`, for "missing". It is in neither the main
+//! window's table nor the global table, and it collides with nothing the
+//! library window binds already.
+//!
+//! **A running scan refuses the action.** The worker holds the index while it
+//! scans, so the removal cannot run beside it, and stopping the scan would
+//! throw away the batches it has not committed yet. The window says so and
+//! leaves the scan alone; `Escape` stops the scan, and the action works
+//! after it.
+//!
+//! The action reloads the page afterwards: the rows that are gone are not in
+//! the list any more and the total is smaller. It leaves a **note** for the
+//! app to show: how many rows it looked at, how many it dropped, and which
+//! rows it kept because their file could not be checked.
 //!
 //! # The covers
 //!
@@ -84,8 +109,8 @@ use rustamp_core::playlist::MediaLocation;
 use rustamp_core::state::WindowId;
 use rustamp_gfx::{Image, Rect};
 use rustamp_library::{
-    ArtworkCache, Cancel, CoverImage, Library, Query, Root, ScanPhase, ScanProgress, SortKey,
-    TrackRow,
+    ArtworkCache, Cancel, CoverImage, Library, Query, RemoveReport, Root, ScanPhase, ScanProgress,
+    SortKey, TrackRow,
 };
 use rustamp_ui::library_render::{CoverRef, LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT};
 use rustamp_ui::{
@@ -170,6 +195,12 @@ pub struct LibraryWindow {
     folder_request: bool,
     /// The last failure the user should see; it is shown in the caption.
     error: Option<String>,
+    /// The note of the last action, for the app to show.
+    ///
+    /// The window does not show notes itself: the app collects them and the
+    /// presenter prints them. An action leaves its message here, and the app
+    /// takes it.
+    action_note: Option<String>,
     /// The registered roots, as the preferences page shows them.
     ///
     /// The roots live in the index. This is the list the app read last, and
@@ -203,6 +234,7 @@ impl Default for LibraryWindow {
             open: false,
             folder_request: false,
             error: None,
+            action_note: None,
             roots: Vec::new(),
             artwork: ArtworkCache::new(),
             cover_failure: None,
@@ -481,6 +513,7 @@ impl LibraryWindow {
         if modifiers == Modifiers::CTRL {
             match key {
                 Key::Letter(b'F') => self.search_focused = true,
+                Key::Letter(b'M') => self.remove_missing_entries(),
                 Key::Letter(b'O') => self.folder_request = true,
                 _ => {}
             }
@@ -682,6 +715,49 @@ impl LibraryWindow {
         self.start_scan(roots)
     }
 
+    /// The action of `Ctrl+M`: removes the rows whose file is gone.
+    ///
+    /// A running scan refuses the action: the worker holds the index while
+    /// it scans, and the removal cannot run beside it. The scan is left
+    /// alone - stopping it would throw away the batches it has not
+    /// committed yet - and the window says so.
+    fn remove_missing_entries(&mut self) {
+        if self.worker.is_some() {
+            self.action_note = Some(
+                "a scan is still running: stop it (Escape) before the missing entries are removed"
+                    .to_string(),
+            );
+            return;
+        }
+        self.action_note = Some(match self.remove_missing() {
+            Ok(report) => note_of(&report),
+            Err(error) => format!("the missing entries were not removed: {error}"),
+        });
+    }
+
+    /// Removes the rows whose file is gone and reloads the page.
+    ///
+    /// The rows are dropped from the index; the files are not touched. The
+    /// scope is every registered root ([`Library::remove_missing`] with
+    /// `None`).
+    fn remove_missing(&mut self) -> Result<RemoveReport> {
+        let report = {
+            let Some(index) = self.index.as_mut() else {
+                return Err(Error::NotFound("the library index is not open".into()));
+            };
+            index.remove_missing(None)?
+        };
+        // The page is reloaded: the rows that are gone are not in the list
+        // any more, and the total is smaller.
+        self.refresh()?;
+        Ok(report)
+    }
+
+    /// Takes the note of the last action, if there is one.
+    fn take_action_note(&mut self) -> Option<String> {
+        self.action_note.take()
+    }
+
     /// Takes the "pick a folder" request, if the library made one.
     pub fn take_folder_request(&mut self) -> bool {
         std::mem::take(&mut self.folder_request)
@@ -796,6 +872,36 @@ impl LibraryWindow {
 /// The paths of the registered roots.
 fn root_paths(roots: Vec<Root>) -> Vec<PathBuf> {
     roots.into_iter().map(|root| root.path).collect()
+}
+
+/// The note a removal report becomes.
+///
+/// The report says what the action did: how many rows it looked at, how
+/// many it dropped, and which rows it kept because their file could not be
+/// checked. A report without a checked row has nothing to say about a
+/// removal, so it says that there was nothing to remove.
+fn note_of(report: &RemoveReport) -> String {
+    let RemoveReport {
+        checked,
+        removed,
+        kept_unreadable,
+    } = report;
+    if *checked == 0 {
+        return "nothing to remove: the index holds no rows".to_string();
+    }
+    let mut note = format!("removed {removed} of {checked} entries");
+    if !kept_unreadable.is_empty() {
+        let paths = kept_unreadable
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        note.push_str(&format!(
+            "; {} kept, the file could not be checked: {paths}",
+            kept_unreadable.len()
+        ));
+    }
+    note
 }
 
 /// The covers of the rows, as borrowed views of the cache's answers.
@@ -946,8 +1052,14 @@ impl App {
     /// The commands the key produced are submitted through the app's own
     /// path, so `Enter` plays the selected row exactly like the playlist
     /// editor plays an entry.
+    ///
+    /// An action that has something to say (the removal of the missing
+    /// entries) leaves a note, which the app shows.
     pub fn library_key_down(&mut self, key: Key, modifiers: Modifiers) -> Result<Vec<Command>> {
         let commands = self.library_window.key(key, modifiers)?;
+        if let Some(note) = self.library_window.take_action_note() {
+            self.note(format!("Library: {note}"));
+        }
         self.forward(&commands)?;
         Ok(commands)
     }

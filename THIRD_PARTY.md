@@ -119,7 +119,7 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `embed-manifest` | Build-time: embeds the Windows application manifest (Common Controls 6 for the native preferences dialog) | app (build script) |
 | `symphonia` | Audio decoding/demuxing | decoders; MPL-2.0, not permissive |
 | `hound` | WAV test fixtures | decoders (dev) |
-| `rusqlite` | SQLite-backed media library index | library |
+| `rusqlite` | SQLite-backed media library index | library; app (dev, the test that writes a row whose path the file system refuses to name) |
 | `image` | Cover-art decoding for the media library's artwork cache (JPEG and PNG only) | library |
 
 Consumer names omit the `rustamp-` prefix, except `xtask`. Other entries below

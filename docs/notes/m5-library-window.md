@@ -132,6 +132,7 @@ The map follows the shape of the window - a search field above a list.
 | `Escape` | stops the running scan |
 | `F5` | scans the registered roots again |
 | `Ctrl+F` | focuses the search field |
+| `Ctrl+M` | removes the rows whose file is gone (see `m5-library-remove-missing.md`) |
 | `Ctrl+O` | asks for a folder to add to the library |
 
 The movement keys always move the selection, whether the search field has
@@ -197,6 +198,8 @@ file outside the temp directory is touched.
 
 - The window's size, the column widths, the colours and the whole input map
   are **own choices**: S20 is not started, so nothing here is measured.
+- The input map grew after this lane: `Ctrl+M` removes the rows whose file
+  is gone (`docs/notes/m5-library-remove-missing.md`).
 - The search is the index's free-text search (a case-insensitive substring
   of title, artist or album). There is no filter by artist, album or genre
   yet - the view does not own those.

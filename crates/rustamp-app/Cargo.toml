@@ -47,6 +47,11 @@ serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The library's test writes a row whose path the file system refuses to
+# name straight into the index's database, because no scan can produce such
+# a path. The same crate and the same features as `rustamp-library` use, so
+# the build is shared and no new package enters the lockfile.
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 # Capture side of the VM-only loopback test (`tests/loopback.rs`); already a
 # workspace dependency through `rustamp-output`, so nothing new is fetched.
 cpal.workspace = true

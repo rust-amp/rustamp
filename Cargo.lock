@@ -1751,6 +1751,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "embed-manifest",
+ "rusqlite",
  "rustamp-audio",
  "rustamp-core",
  "rustamp-decoders",
