@@ -226,6 +226,167 @@ fn touches(a: ClassicWindow, b: ClassicWindow) -> bool {
     ((ab == by || bb == ay) && ax < br && bx < ar) || ((ar == bx || br == ax) && ay < bb && by < ab)
 }
 
+// A window hangs on the window it is attached to: below it (the child's top
+// edge is the parent's bottom edge) or beside it (the child's left edge is
+// the parent's right edge). Those are the two edges that follow when the
+// parent is resized, so they are the connections a re-flow acts on. A window
+// that touches another one only from above or from the left still moves with
+// it - the whole group moves - but none of its edges follows a resize.
+fn hangs_below(parent: ClassicWindow, child: ClassicWindow) -> bool {
+    i64::from(parent.y) + i64::from(parent.height) == i64::from(child.y)
+}
+
+fn hangs_beside(parent: ClassicWindow, child: ClassicWindow) -> bool {
+    i64::from(parent.x) + i64::from(parent.width) == i64::from(child.x)
+}
+
+fn hangs(parent: ClassicWindow, child: ClassicWindow) -> bool {
+    hangs_below(parent, child) || hangs_beside(parent, child)
+}
+
+// The length of the edge two windows share: the horizontal contact of two
+// windows that stand above one another, the vertical contact of two that
+// stand side by side.
+fn shared_edge(parent: ClassicWindow, child: ClassicWindow) -> i64 {
+    let x_overlap = overlap(parent.x, parent.width, child.x, child.width);
+    let y_overlap = overlap(parent.y, parent.height, child.y, child.height);
+    let stacked = hangs_below(parent, child)
+        || i64::from(child.y) + i64::from(child.height) == i64::from(parent.y);
+    if stacked { x_overlap } else { y_overlap }
+}
+
+// The pixels two ranges of the same axis share.
+fn overlap(a: i32, a_size: u32, b: i32, b_size: u32) -> i64 {
+    let a_start = i64::from(a);
+    let a_end = a_start + i64::from(a_size);
+    let b_start = i64::from(b);
+    let b_end = b_start + i64::from(b_size);
+    (a_end.min(b_end) - a_start.max(b_start)).max(0)
+}
+
+// The window every window hangs on.
+//
+// The main window is the root of the stack: it hangs on nothing. Every other
+// window hangs on the window it is attached to - the one it stands below or
+// beside. When it hangs on more than one, the longest contact wins: a
+// playlist that stands below the equalizer and beside the main window hangs
+// on the equalizer, not on the main window.
+//
+// The relation is acyclic: hanging means "below" or "beside", and every such
+// step moves strictly down or strictly right, so no chain of them can come
+// back to where it started.
+fn hanging_parents(old: [ClassicWindow; 3]) -> [Option<usize>; 3] {
+    let mut hang = [None, None, None];
+    for child in 1..3 {
+        let mut best: Option<(usize, i64)> = None;
+        for parent in 0..3 {
+            if parent == child || !touches(old[parent], old[child]) {
+                continue;
+            }
+            if !hangs(old[parent], old[child]) {
+                continue;
+            }
+            let shared = shared_edge(old[parent], old[child]);
+            if best.is_none_or(|(_, longest)| shared > longest) {
+                best = Some((parent, shared));
+            }
+        }
+        hang[child] = best.map(|(parent, _)| parent);
+    }
+    hang
+}
+
+// The move every window follows: a window that touches another one moves
+// with it, and the whole group moves by the same delta (S05 §4.2, §4.3).
+fn move_deltas(old: [ClassicWindow; 3], new: [ClassicWindow; 3]) -> [(i32, i32); 3] {
+    let mut moved = [(0i32, 0i32); 3];
+    let mut visited = [false; 3];
+    for root in 0..3 {
+        if visited[root] {
+            continue;
+        }
+        visited[root] = true;
+        let delta = (
+            new[root].x.saturating_sub(old[root].x),
+            new[root].y.saturating_sub(old[root].y),
+        );
+        moved[root] = delta;
+        let mut queue = vec![root];
+        while let Some(parent) = queue.pop() {
+            for child in 0..3 {
+                if visited[child] || !touches(old[parent], old[child]) {
+                    continue;
+                }
+                visited[child] = true;
+                moved[child] = delta;
+                queue.push(child);
+            }
+        }
+    }
+    moved
+}
+
+// The shift a resize causes: a window that hangs on another one follows the
+// edge it hangs on, and the shift accumulates down the chain (S05 §3.3).
+fn resize_shifts(
+    old: [ClassicWindow; 3],
+    new: [ClassicWindow; 3],
+    hang: [Option<usize>; 3],
+) -> [(i32, i32); 3] {
+    let mut shift = [(0i32, 0i32); 3];
+    for start in 0..3 {
+        // The chain from the window up to the root of the hanging forest.
+        let mut chain = Vec::new();
+        let mut node = start;
+        while let Some(parent) = hang[node] {
+            if chain.contains(&node) {
+                break;
+            }
+            chain.push(node);
+            node = parent;
+        }
+        // The root does not shift; the chain accumulates downwards.
+        let mut accumulated = (0i32, 0i32);
+        for child in chain.iter().rev() {
+            let parent = hang[*child].expect("a chain node has a parent");
+            let own = edge_shift(old, new, parent, *child);
+            accumulated = (
+                accumulated.0.saturating_add(own.0),
+                accumulated.1.saturating_add(own.1),
+            );
+            shift[*child] = accumulated;
+        }
+    }
+    shift
+}
+
+// The shift of the edge a child hangs on when its parent changes size: the
+// bottom edge follows a height, the right edge a width.
+fn edge_shift(
+    old: [ClassicWindow; 3],
+    new: [ClassicWindow; 3],
+    parent: usize,
+    child: usize,
+) -> (i32, i32) {
+    let (dx, dy) = if hangs_below(old[parent], old[child]) {
+        (
+            0i64,
+            i64::from(new[parent].height) - i64::from(old[parent].height),
+        )
+    } else if hangs_beside(old[parent], old[child]) {
+        (
+            i64::from(new[parent].width) - i64::from(old[parent].width),
+            0i64,
+        )
+    } else {
+        (0, 0)
+    };
+    (
+        i32::try_from(dx).unwrap_or(0),
+        i32::try_from(dy).unwrap_or(0),
+    )
+}
+
 /// The three classic windows together, as a docked set (S05 §4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DockedStack {
@@ -250,40 +411,34 @@ impl DockedStack {
     // Follow existing connections, never create a connection merely because
     // two detached windows happen to have the same x coordinate. Main is the
     // anchor; a detached EQ can still carry its playlist on an EQ resize.
+    //
+    // Two relations are at work, and they are not the same:
+    //
+    // * The **move**: a window that touches another one moves with it
+    //   (S05 §4.2, §4.3). The whole group moves by the same delta.
+    // * The **resize**: a window that hangs on another one - below it or
+    //   beside it - follows the edge it hangs on when that window changes
+    //   size (S05 §3.3). A playlist below the equalizer follows the
+    //   equalizer's bottom edge, even when it also stands beside the main
+    //   window, and unshading the equalizer brings it back.
     fn reflow(&mut self, before: Self) {
         let old = [before.main, before.equalizer, before.playlist];
-        let mut new = [self.main, self.equalizer, self.playlist];
-        let mut visited = [false; 3];
-        for root in 0..3 {
-            if visited[root] {
-                continue;
-            }
-            visited[root] = true;
-            let mut queue = vec![root];
-            while let Some(parent) = queue.pop() {
-                for child in 0..3 {
-                    if visited[child] || !touches(old[parent], old[child]) {
-                        continue;
-                    }
-                    visited[child] = true;
-                    let mut dx = new[parent].x.saturating_sub(old[parent].x);
-                    let mut dy = new[parent].y.saturating_sub(old[parent].y);
-                    if i64::from(old[child].x)
-                        == i64::from(old[parent].x) + i64::from(old[parent].width)
-                    {
-                        dx = dx.saturating_add(new[parent].width as i32 - old[parent].width as i32);
-                    }
-                    if old[child].y == old[parent].bottom() {
-                        dy = dy
-                            .saturating_add(new[parent].height as i32 - old[parent].height as i32);
-                    }
-                    new[child].x = new[child].x.saturating_add(dx);
-                    new[child].y = new[child].y.saturating_add(dy);
-                    queue.push(child);
-                }
-            }
+        let new = [self.main, self.equalizer, self.playlist];
+        let hang = hanging_parents(old);
+        let moved = move_deltas(old, new);
+        let shift = resize_shifts(old, new, hang);
+        let mut placed = new;
+        for index in 0..3 {
+            placed[index].x = old[index]
+                .x
+                .saturating_add(moved[index].0)
+                .saturating_add(shift[index].0);
+            placed[index].y = old[index]
+                .y
+                .saturating_add(moved[index].1)
+                .saturating_add(shift[index].1);
         }
-        [self.main, self.equalizer, self.playlist] = new;
+        [self.main, self.equalizer, self.playlist] = placed;
     }
 
     /// Moves the whole docked set by the same delta (S05 §4.2, §5): a move of
