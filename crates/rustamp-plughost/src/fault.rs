@@ -113,6 +113,12 @@ thread_local! {
 ///
 /// The scope restores the previous record when it is dropped, so nested calls
 /// (a plugin callback that re-enters the host) name the innermost plugin.
+///
+/// The scopes of one thread must therefore be dropped in the **reverse order
+/// of their creation** — the way the call stack unwinds. A scope that is
+/// dropped out of order (one that was *replaced* rather than unwound)
+/// restores a record that names a plug-in no longer in a call, and the next
+/// fault would blame it.
 pub struct FaultScope {
     previous: Option<FaultSite>,
 }
@@ -475,5 +481,221 @@ mod tests {
             crate::restart::classify_exit(Some(0xC000_0005u32 as i32)),
             crate::restart::HostExit::Crashed(0xC000_0005)
         );
+    }
+}
+
+/// Property tests for the fault attribution.
+///
+/// The report is the only thing a crash can still say reliably, so it must
+/// say the truth: a fault is attributed to the plug-in whose call was
+/// running when it happened, and a fault that happened outside every
+/// plug-in call blames nobody. The properties drive a random sequence of
+/// plug-in calls (nested and not) and check the report after every step.
+///
+/// The report writer and the current-call record are private to this
+/// module, so the properties live here rather than in an integration test.
+#[cfg(test)]
+mod props {
+    use super::*;
+
+    /// The seeds of the property runs. A failing run prints its seed, so
+    /// the sequence is replayable.
+    const SEEDS: [u64; 12] = [
+        0x0000_0001,
+        0x0000_00a3,
+        0x0000_07ff,
+        0x0000_ffff,
+        0x0001_2345,
+        0x00c0_ffee,
+        0x0bad_c0de,
+        0x5eed_0001,
+        0x5eed_0002,
+        0xdead_beef,
+        0xface_b00c,
+        0xffff_ffff,
+    ];
+
+    /// The number of steps in one random sequence.
+    const STEPS: usize = 32;
+
+    /// The number of steps in the storm: a sequence that keeps coming must
+    /// never panic and never blame the wrong plug-in.
+    const STORM: usize = 4_000;
+
+    /// The exception the reports are written for.
+    const EXCEPTION: u32 = 0xC000_0005;
+
+    /// A xorshift64\* generator: deterministic, seeded and dependency-free.
+    ///
+    /// The same generator the property tests of the other crates use, kept
+    /// local so this module needs no path into the test tree.
+    struct Rng(u64);
+
+    impl Rng {
+        /// A generator for `seed`.
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+
+        /// The next 64 bits.
+        fn next_u64(&mut self) -> u64 {
+            let mut state = self.0;
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            self.0 = state;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        /// A number in `0..bound`.
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next_u64() % bound
+        }
+    }
+
+    /// The plug-ins the sequences call into.
+    ///
+    /// The identities are boxed because the scope holds a pointer to them:
+    /// the address of a plug-in must not move while its call runs (see
+    /// [`PluginIdentity`]). A fixed array keeps them apart.
+    fn plugins() -> [Box<PluginIdentity>; 4] {
+        [
+            PluginIdentity::new(Path::new(r"C:\plugins\gen_bad.dll"), PluginKind::General),
+            PluginIdentity::new(Path::new(r"C:\plugins\in_bad.dll"), PluginKind::Input),
+            PluginIdentity::new(Path::new(r"C:\plugins\out_bad.dll"), PluginKind::Output),
+            PluginIdentity::new(
+                Path::new(r"C:\plugins\vis_bad.dll"),
+                PluginKind::Visualization,
+            ),
+        ]
+    }
+
+    /// The calls a sequence may make.
+    const CALLS: [&str; 4] = ["init", "config", "render", "process"];
+
+    /// The report the crash handler would write right now.
+    fn report() -> String {
+        let mut buffer = [0u8; FAULT_LINE_CAPACITY];
+        let len = write_fault_line(&mut buffer, EXCEPTION, current_site());
+        String::from_utf8_lossy(&buffer[..len]).into_owned()
+    }
+
+    /// Check the report against the call stack the model keeps.
+    ///
+    /// `stack` holds the plug-ins whose calls are running, outermost first.
+    fn check(stack: &[(usize, &'static str)], plugins: &[Box<PluginIdentity>], label: &str) {
+        let line = report();
+        assert!(
+            line.contains(&format!("0x{EXCEPTION:08X}")),
+            "{label}: the report must name the exception: {line}"
+        );
+        match stack.last() {
+            None => {
+                assert!(
+                    line.contains("unhandled exception in the plugin host"),
+                    "{label}: a fault outside every plug-in call is the host's own: {line}"
+                );
+                for plugin in plugins {
+                    assert!(
+                        !line.contains(plugin.path().to_string_lossy().as_ref()),
+                        "{label}: the report must not blame a plug-in: {line}"
+                    );
+                }
+            }
+            Some(&(index, call)) => {
+                let plugin = &plugins[index];
+                assert!(
+                    line.contains(plugin.path().to_string_lossy().as_ref()),
+                    "{label}: the report must name the plug-in the fault came from: {line}"
+                );
+                assert!(
+                    line.contains(call),
+                    "{label}: the report must name the call: {line}"
+                );
+                assert!(
+                    line.contains(kind_label(plugin.kind())),
+                    "{label}: the report must name the kind: {line}"
+                );
+                // The plug-ins that are further out are not to blame — unless
+                // it is the same plug-in, which a re-entrant call nests.
+                for (other, _) in stack.iter().rev().skip(1) {
+                    if *other == index {
+                        continue;
+                    }
+                    let other = &plugins[*other];
+                    assert!(
+                        !line.contains(other.path().to_string_lossy().as_ref()),
+                        "{label}: the report must not blame an outer plug-in: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fault is attributed to the plug-in whose call was running, and an
+    /// unattributable fault blames nobody.
+    #[test]
+    fn a_fault_is_attributed_to_the_plug_in_it_came_from() {
+        for seed in SEEDS {
+            let plugins = plugins();
+            let mut rng = Rng::new(seed);
+            let mut scopes: Vec<FaultScope> = Vec::new();
+            let mut stack: Vec<(usize, &'static str)> = Vec::new();
+
+            for step in 1..=STEPS {
+                let label = format!("seed {seed}, step {step}");
+                // Enter a call, or leave the innermost one.
+                if stack.is_empty() || rng.below(3) == 0 {
+                    let index = rng.below(plugins.len() as u64) as usize;
+                    let call = CALLS[rng.below(CALLS.len() as u64) as usize];
+                    scopes.push(plugin_call_scope(&plugins[index], call));
+                    stack.push((index, call));
+                } else {
+                    scopes.pop();
+                    stack.pop();
+                }
+                check(&stack, &plugins, &label);
+            }
+            // The scopes go out the way the call stack unwinds: the last one
+            // first, so no record of a plug-in that is no longer in a call
+            // survives the sequence.
+            while let Some(scope) = scopes.pop() {
+                drop(scope);
+            }
+        }
+    }
+
+    /// No panic, whatever the sequence: an empty one and a storm of calls.
+    #[test]
+    fn no_sequence_of_plug_in_calls_panics() {
+        // An empty sequence: no call runs, so the report blames nobody.
+        let fixtures = plugins();
+        check(&[], &fixtures, "an empty sequence");
+
+        // A storm: the calls keep coming and the report stays honest.
+        for seed in SEEDS {
+            let fixtures = plugins();
+            let mut rng = Rng::new(seed);
+            let mut scopes: Vec<FaultScope> = Vec::new();
+            let mut stack: Vec<(usize, &'static str)> = Vec::new();
+            for step in 1..=STORM {
+                if stack.is_empty() || rng.below(3) == 0 {
+                    let index = rng.below(fixtures.len() as u64) as usize;
+                    let call = CALLS[rng.below(CALLS.len() as u64) as usize];
+                    scopes.push(plugin_call_scope(&fixtures[index], call));
+                    stack.push((index, call));
+                } else {
+                    scopes.pop();
+                    stack.pop();
+                }
+                let line = report();
+                assert!(!line.is_empty(), "seed {seed}, step {step}: the report");
+                check(&stack, &fixtures, &format!("seed {seed}, step {step}"));
+            }
+            // The scopes go out the way the call stack unwinds.
+            while let Some(scope) = scopes.pop() {
+                drop(scope);
+            }
+        }
     }
 }

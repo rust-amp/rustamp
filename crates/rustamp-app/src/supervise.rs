@@ -55,6 +55,9 @@
 //!   host at all. The report comes back out of
 //!   [`supervise`](Supervisor::supervise) so the app can show it to the user
 //!   (PLAN M3: "Crash isolation: restart the host on plugin crash").
+//!   The give-up is reported too, and it never promises a restart the
+//!   supervisor will not make: the player runs without plugins, and the user
+//!   is told (see [`Supervisor::give_up_report`]).
 //! * **The host is told where the operator's approvals live.** The host
 //!   approves nothing without its `--approvals` argument and refuses every
 //!   load it is asked for, so the supervisor names the store the app reads
@@ -550,12 +553,18 @@ pub enum SupervisorState {
     Running,
     /// Deliberately stopped via [`Supervisor::stop`]. Will NOT restart until [`Supervisor::resume`] is called.
     Stopped,
-    /// Persistent failure state: consecutive spawn or handshake failures exceeded the policy limit,
-    /// or the crash policy gave up after too many crashes in a row.
+    /// Persistent failure state: too many failures in a row exceeded the
+    /// policy limit, or the crash policy gave up after too many crashes in a
+    /// row. The host is not started again until [`Supervisor::resume`] is
+    /// called.
     PersistentFailure,
 }
 
-/// Default maximum consecutive spawn or handshake failures before entering [`SupervisorState::PersistentFailure`].
+/// Default maximum consecutive failures before entering [`SupervisorState::PersistentFailure`].
+///
+/// A failure is a spawn that did not work, a handshake that did not pass or
+/// a host that died: a host that came up resets the count, so a player that
+/// works is never given up on.
 pub const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// Default timeout for waiting for the child's startup [`Message::Hello`].
@@ -712,36 +721,60 @@ impl<B: HostBackend> Supervisor<B> {
         self.process.as_mut().is_some_and(|p| p.is_running())
     }
 
-    fn record_failure(&mut self) {
+    /// Count one failure and report the give-up it ends the retries with.
+    ///
+    /// Returns the report when this failure is the one that ends the
+    /// retries: the host is not started again, the player runs without
+    /// plugins, and the user has to know (see
+    /// [`Supervisor::give_up_report`]).
+    fn record_failure(&mut self) -> Option<String> {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures >= self.max_consecutive_failures {
             self.state = SupervisorState::PersistentFailure;
+            Some(self.give_up_report())
+        } else {
+            None
         }
     }
 
-    /// What to do after the host died.
+    /// Count one failure and keep the report it ends the retries with.
+    ///
+    /// A failure that ends the retries replaces the report: the supervisor
+    /// will not start a host again, so a report that promises a restart
+    /// would be a lie the user would read.
+    fn fail(&mut self, report: &mut Option<String>) {
+        if let Some(text) = self.record_failure() {
+            *report = Some(text);
+        }
+    }
+
+    /// The report for a give-up the failure counter decided.
+    ///
+    /// The crash policy has a report of its own for the other way out (a
+    /// crash loop), and it names the crash. This one covers the failures
+    /// the crash policy never saw: too many spawns, handshakes or deaths
+    /// in a row. It says what the policy's report says — the host is not
+    /// started again and the player keeps playing — so the user is never
+    /// told about a restart that will not happen.
+    fn give_up_report(&self) -> String {
+        format!(
+            "the plugin host failed {count} times in a row; it is not started again, so the \
+             player runs without plugins. The player keeps playing; restart the player to try \
+             again.",
+            count = self.consecutive_failures,
+        )
+    }
+
+    /// What the crash policy says about a dead host.
     ///
     /// The host's exit code says how it died, the policy says what happens
     /// next, and the report says it out loud. The player is never affected:
     /// the host is a separate process, so a dead host costs the plugins, not
     /// the playback.
-    fn on_host_death(&mut self, exit: HostExit) -> Option<String> {
+    fn on_host_death(&mut self, exit: HostExit) -> RestartDecision {
         let lived = self.started_at.map(|at| at.elapsed()).unwrap_or_default();
         let crashes = self.crashes.record(exit, lived, self.policy.crash_window);
-        match self.policy.decide(exit, crashes) {
-            RestartDecision::Restart { after, report } => {
-                // The next spawn waits for the policy's delay: the cooldown
-                // for the first crash, twice that for the next one.
-                self.next_spawn_at = Some(Instant::now() + after);
-                Some(report)
-            }
-            RestartDecision::GiveUp { report } => {
-                // The retries are bounded: the host stays down until the
-                // supervisor is resumed deliberately.
-                self.state = SupervisorState::PersistentFailure;
-                Some(report)
-            }
-        }
+        self.policy.decide(exit, crashes)
     }
 
     /// One non-blocking supervision step: reap a dead child, replace a
@@ -752,7 +785,9 @@ impl<B: HostBackend> Supervisor<B> {
     /// cannot be started leaves the link detached and the player unaffected.
     ///
     /// Returns the report about a host that died, if one died: the caller
-    /// shows it to the user (the app notes it, the presenter prints it).
+    /// shows it to the user (the app notes it, the presenter prints it). The
+    /// give-up is reported as well: a supervisor that stopped trying says
+    /// so, because the player runs without plugins from then on.
     pub fn supervise(&mut self, link: &mut HostStateLink) -> Option<String> {
         // Finding 12: stopped state sticks, and persistent failures halt attempts.
         if self.state == SupervisorState::Stopped
@@ -766,12 +801,10 @@ impl<B: HostBackend> Supervisor<B> {
             return None; // healthy and connected: nothing to do
         }
 
-        // A dead child, or a desynced one (a live child whose link was detached:
-        // a failed send detached it, or it was detached by hand), is reaped here
-        // and counted as a failure. The spawn path below then decides in the
-        // *same* pump whether a replacement is due, so a host that dies is
-        // replaced on one supervision step rather than on the next one.
         let mut report = None;
+        // The host died: the crash policy says what happens next. Its report
+        // names the crash, so it wins over the failure counter's report below.
+        let mut policy_gave_up = false;
         if !live && self.process.is_some() {
             // The host is gone. Its exit code says how it died, and the crash
             // policy says what happens next: a fresh host after a growing
@@ -780,15 +813,46 @@ impl<B: HostBackend> Supervisor<B> {
                 .process
                 .as_mut()
                 .and_then(|process| process.exit_code());
-            report = self.on_host_death(classify_exit(exit_code));
+            match self.on_host_death(classify_exit(exit_code)) {
+                RestartDecision::Restart {
+                    after,
+                    report: text,
+                } => {
+                    // The next spawn waits for the policy's delay: the cooldown
+                    // for the first crash, twice that for the next one.
+                    self.next_spawn_at = Some(Instant::now() + after);
+                    report = Some(text);
+                }
+                RestartDecision::GiveUp { report: text } => {
+                    // The retries are bounded: the host stays down until the
+                    // supervisor is resumed deliberately.
+                    self.state = SupervisorState::PersistentFailure;
+                    policy_gave_up = true;
+                    report = Some(text);
+                }
+            }
         }
-        if link.is_attached() {
+        // A dead child, or a desynced one (a live child whose link was
+        // detached: a failed send detached it, or it was detached by hand),
+        // is reaped here and counted as a failure. The spawn path below then
+        // decides in the *same* pump whether a replacement is due, so a host
+        // that dies is replaced on one supervision step rather than on the
+        // next one.
+        let failure_give_up = if link.is_attached() {
             self.process = None;
             link.detach();
-            self.record_failure();
+            self.record_failure()
         } else if self.process.is_some() {
             self.process = None;
-            self.record_failure();
+            self.record_failure()
+        } else {
+            None
+        };
+        // The failure counter has the last word: when it ends the retries,
+        // its report replaces the crash policy's — a report that promises a
+        // restart the supervisor will not make is a lie the user would read.
+        if !policy_gave_up && let Some(text) = failure_give_up {
+            report = Some(text);
         }
 
         // The reap above may have tripped the failure policy: stop rather than
@@ -800,11 +864,11 @@ impl<B: HostBackend> Supervisor<B> {
         // Handshake barrier (Finding 8): if we have a spawned child waiting for greeting.
         if let Some(mut pending) = self.pending.take() {
             if !pending.process.is_running() {
-                self.record_failure();
+                self.fail(&mut report);
                 return report;
             }
             if Instant::now() >= pending.deadline {
-                self.record_failure();
+                self.fail(&mut report);
                 return report;
             }
             match pending.transport.try_recv() {
@@ -822,13 +886,13 @@ impl<B: HostBackend> Supervisor<B> {
                         return report;
                     } else {
                         // Incompatible protocol version: reject and reap.
-                        self.record_failure();
+                        self.fail(&mut report);
                         return report;
                     }
                 }
                 Ok(Some(_)) => {
                     // Protocol violation: received message before startup Hello.
-                    self.record_failure();
+                    self.fail(&mut report);
                     return report;
                 }
                 Ok(None) => {
@@ -837,7 +901,7 @@ impl<B: HostBackend> Supervisor<B> {
                     return report;
                 }
                 Err(_) => {
-                    self.record_failure();
+                    self.fail(&mut report);
                     return report;
                 }
             }
@@ -861,7 +925,7 @@ impl<B: HostBackend> Supervisor<B> {
         match self.backend.spawn() {
             Ok((mut transport, mut process)) => {
                 if !process.is_running() {
-                    self.record_failure();
+                    self.fail(&mut report);
                     return report;
                 }
                 // Check if Hello is already buffered on the transport (e.g. in-memory tests or fast child):
@@ -877,11 +941,11 @@ impl<B: HostBackend> Supervisor<B> {
                             self.process = Some(process);
                             self.started_at = Some(Instant::now());
                         } else {
-                            self.record_failure();
+                            self.fail(&mut report);
                         }
                     }
                     Ok(Some(_)) => {
-                        self.record_failure();
+                        self.fail(&mut report);
                     }
                     Ok(None) => {
                         // Await greeting within handshake deadline. Link remains detached until Hello arrives!
@@ -893,12 +957,12 @@ impl<B: HostBackend> Supervisor<B> {
                         });
                     }
                     Err(_) => {
-                        self.record_failure();
+                        self.fail(&mut report);
                     }
                 }
             }
             Err(_) => {
-                self.record_failure();
+                self.fail(&mut report);
             }
         }
         report
@@ -1264,8 +1328,24 @@ mod tests {
         assert_eq!(supervisor.consecutive_failures(), 2);
         assert_eq!(supervisor.state(), SupervisorState::Running);
 
-        // Failure 3: trips DEFAULT_MAX_CONSECUTIVE_FAILURES (3) -> PersistentFailure (Finding 12)
-        assert!(supervisor.supervise(&mut link).is_none());
+        // Failure 3: trips DEFAULT_MAX_CONSECUTIVE_FAILURES (3) -> PersistentFailure (Finding 12).
+        // The give-up is reported: the host is not started again, so the
+        // player runs without plugins and the user has to know.
+        let report = supervisor
+            .supervise(&mut link)
+            .expect("the give-up must be reported");
+        assert!(
+            report.contains("not started again"),
+            "the report must say the host is not started again: {report}"
+        );
+        assert!(
+            report.contains("player keeps playing"),
+            "the report must say the player is unaffected: {report}"
+        );
+        assert!(
+            !report.contains("A fresh host starts"),
+            "the report must not promise a restart that will not happen: {report}"
+        );
         assert_eq!(supervisor.consecutive_failures(), 3);
         assert!(supervisor.is_failed());
 
