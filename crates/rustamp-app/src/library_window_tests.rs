@@ -1,11 +1,14 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! The media library's cover column: the wiring between the artwork cache
-//! and the renderer.
+//! The media library window: the cover column and the status line.
 //!
 //! Every test is headless: null output, the built-in skin, no OS window and
 //! no child process. The covers are built by the test itself - a PNG in an
 //! ID3v2 tag in front of a real MP3 - so the suite needs neither a picture
 //! library nor a network.
+//!
+//! The scan's progress is tested with a **fake** scan: a real scan of a
+//! directory is fast and hard to steer, and the status line must be proven
+//! for every phase and for the cancelled case.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -412,4 +415,232 @@ fn a_cover_that_cannot_be_read_leaves_the_frame_renderable() {
         app.drain_notes().is_empty(),
         "the failure is not noted again"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The scan's progress in the status line
+// ---------------------------------------------------------------------------
+
+/// A scan the test drives: it emits the events it was given and then waits
+/// until the scan is cancelled.
+///
+/// A real scan of a directory is fast and hard to steer, and the status line
+/// must be proven for every phase and for the cancelled case - so the test
+/// runs a scan of its own.
+struct FakeScan {
+    /// The events the fake emits, in order.
+    events: Vec<ScanProgress>,
+    /// The report the fake returns when it was cancelled.
+    report: ScanReport,
+}
+
+impl ScanJob for FakeScan {
+    fn run(self, cancel: &Cancel, on_progress: &mut dyn FnMut(ScanProgress)) -> ScanOutcome {
+        for event in &self.events {
+            on_progress(event.clone());
+        }
+        // The fake waits for the cancel, like a real scan waits for the
+        // next file: the test decides when the window stops it.
+        while !cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        ScanOutcome {
+            index: Library::in_memory().expect("an in-memory index"),
+            result: Ok(self.report),
+        }
+    }
+}
+
+/// A progress event of a running scan.
+fn event(
+    phase: ScanPhase,
+    seen: usize,
+    added: usize,
+    updated: usize,
+    skipped: usize,
+) -> ScanProgress {
+    ScanProgress {
+        phase,
+        path: None,
+        seen,
+        added,
+        updated,
+        skipped,
+        removed: 0,
+    }
+}
+
+/// Polls the window until the scan reached the phase `phase`.
+fn wait_for_phase(window: &mut LibraryWindow, phase: ScanPhase) {
+    for _ in 0..2000 {
+        window.poll().expect("poll the window");
+        if window.progress().is_some_and(|event| event.phase == phase) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the scan never reached the phase {phase:?}");
+}
+
+/// Polls the window until the status line holds `wanted`.
+fn wait_for_status(window: &mut LibraryWindow, wanted: &str) -> String {
+    for _ in 0..2000 {
+        window.poll().expect("poll the window");
+        let status = window.status_line();
+        if status.contains(wanted) {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!(
+        "the status line never held {wanted:?}: {}",
+        window.status_line()
+    );
+}
+
+/// The status band of the window, as the app draws it.
+fn status_band(window: &LibraryWindow) -> Rect {
+    let (width, height) = window.client_size();
+    LibraryChrome::new(window.view(), Rect::new(0, 0, width, height)).status
+}
+
+/// The colour of the status line's text.
+fn status_ink() -> [u8; 4] {
+    opaque(LIBRARY_STATUS_TEXT)
+}
+
+/// The x of the leftmost pixel of the given colour in the band.
+fn first_ink_x(frame: &Image, band: Rect, colour: [u8; 4]) -> Option<i32> {
+    for x in band.x..band.right() {
+        for y in band.y..band.bottom() {
+            if frame.pixel(x, y) == Some(colour) {
+                return Some(x);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn a_running_scan_shows_its_phase_and_its_counters() {
+    let mut window = LibraryWindow::default();
+    window.start_job(FakeScan {
+        events: vec![event(ScanPhase::Scanning, 120, 30, 5, 2)],
+        report: ScanReport::default(),
+    });
+    wait_for_phase(&mut window, ScanPhase::Scanning);
+
+    let status = window.status_line();
+    assert!(status.contains("scanning"), "{status}");
+    assert!(status.contains("120 seen"), "{status}");
+    assert!(status.contains("30 added"), "{status}");
+    assert!(status.contains("5 updated"), "{status}");
+    assert!(status.contains("2 skipped"), "{status}");
+}
+
+#[test]
+fn the_finished_phase_restores_the_normal_status_line() {
+    let mut window = LibraryWindow::default();
+    let normal = window.view().status_line();
+    window.start_job(FakeScan {
+        events: vec![
+            event(ScanPhase::Scanning, 10, 4, 0, 0),
+            event(ScanPhase::Finished, 10, 4, 0, 0),
+        ],
+        report: ScanReport::default(),
+    });
+    wait_for_phase(&mut window, ScanPhase::Finished);
+
+    assert_eq!(
+        window.status_line(),
+        normal,
+        "the visible range is the status line again"
+    );
+}
+
+#[test]
+fn a_cancelled_scan_shows_the_committed_numbers() {
+    let mut window = LibraryWindow::default();
+    window.start_job(FakeScan {
+        events: vec![event(ScanPhase::Scanning, 120, 30, 5, 2)],
+        report: ScanReport {
+            scanned: 40,
+            added: 12,
+            updated: 3,
+            removed: 1,
+            skipped: 2,
+            cancelled: true,
+        },
+    });
+    wait_for_phase(&mut window, ScanPhase::Scanning);
+
+    // Escape stops the scan.
+    window
+        .key(Key::Escape, Modifiers::NONE)
+        .expect("escape stops the scan");
+
+    // The worker comes back with the report it committed.
+    let status = wait_for_status(&mut window, "cancelled");
+    assert!(status.contains("12 added"), "{status}");
+    assert!(status.contains("3 updated"), "{status}");
+    assert!(status.contains("1 removed"), "{status}");
+    assert!(status.contains("2 skipped"), "{status}");
+    assert!(
+        !status.contains("30 added") && !status.contains("120 seen"),
+        "the committed numbers are shown, not the live ones: {status}"
+    );
+}
+
+#[test]
+fn without_a_scan_the_status_line_is_the_visible_range() {
+    let window = LibraryWindow::default();
+    assert_eq!(
+        window.status_line(),
+        window.view().status_line(),
+        "no scan leaves the status line alone"
+    );
+}
+
+#[test]
+fn the_status_band_shows_the_scan_progress() {
+    let mut window = LibraryWindow::default();
+    let band = status_band(&window);
+    let quiet = count(&window.render(), band, status_ink());
+
+    window.start_job(FakeScan {
+        events: vec![event(ScanPhase::Scanning, 120, 30, 5, 2)],
+        report: ScanReport::default(),
+    });
+    wait_for_phase(&mut window, ScanPhase::Scanning);
+    let busy = count(&window.render(), band, status_ink());
+
+    assert!(
+        busy > quiet,
+        "the progress is painted into the band: {quiet} ink pixels without the \
+         scan, {busy} with it"
+    );
+
+    // The text stands where the visible range stands: at the left edge of
+    // the band.
+    let frame = window.render();
+    let first = first_ink_x(&frame, band, status_ink()).expect("the band holds ink");
+    assert!(
+        first <= band.x + 3,
+        "the text starts at the left edge of the band: {first} against {}",
+        band.x
+    );
+}
+
+#[test]
+fn the_caption_carries_the_scan_progress() {
+    let mut window = LibraryWindow::default();
+    window.start_job(FakeScan {
+        events: vec![event(ScanPhase::Scanning, 120, 30, 5, 2)],
+        report: ScanReport::default(),
+    });
+    wait_for_phase(&mut window, ScanPhase::Scanning);
+
+    let title = window.title();
+    assert!(title.starts_with("Rustamp Library - scanning:"), "{title}");
+    assert!(title.contains("120 seen"), "{title}");
 }
