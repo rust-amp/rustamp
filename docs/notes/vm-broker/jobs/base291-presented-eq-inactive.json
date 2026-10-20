@@ -17,7 +17,7 @@
       "window": "Winamp EQ",
       "action": "the equalizer while it holds the focus",
       "input_method": "none",
-      "capture": "eq-inactive.presented.png"
+      "capture": "eq-inactive.before.png"
     },
     {
       "name": "focus_main",

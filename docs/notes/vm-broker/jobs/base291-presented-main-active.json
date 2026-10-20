@@ -9,7 +9,7 @@
       "window": "Winamp v1.x",
       "action": "the landmark start state: main focused, equalizer and playlist open",
       "input_method": "none",
-      "capture": "main-active.presented.png"
+      "capture": "main-active.before.png"
     },
     {
       "name": "after",

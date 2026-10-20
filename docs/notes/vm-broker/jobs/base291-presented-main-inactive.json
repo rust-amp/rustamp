@@ -9,7 +9,7 @@
       "window": "Winamp v1.x",
       "action": "the landmark start state (main focused)",
       "input_method": "none",
-      "capture": "main-inactive.presented.png"
+      "capture": "main-inactive.before.png"
     },
     {
       "name": "focus_eq",

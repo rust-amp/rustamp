@@ -2,14 +2,14 @@
   "job": "base291-presented-main-shade",
   "baseline": "base-provisioned",
   "winamp_args": "/NOREG",
-  "expect_client_size": "275x14",
   "steps": [
     {
       "name": "before",
       "window": "Winamp v1.x",
-      "action": "the landmark start state",
+      "action": "the landmark start state, main window at its normal size",
       "input_method": "none",
-      "capture": "main-shade.presented.png"
+      "capture": "main-shade.before.png",
+      "expect_client_size": "275x116"
     },
     {
       "name": "shade_main",
@@ -18,14 +18,17 @@
       "input_method": "send-message",
       "msg": 273,
       "wparam": 40064,
-      "lparam": 0
+      "lparam": 0,
+      "expect_client_size": "none",
+      "may_change_client_size": true
     },
     {
       "name": "after",
       "window": "Winamp v1.x",
       "action": "capture the shaded main window",
       "input_method": "none",
-      "capture": "main-shade.presented.png"
+      "capture": "main-shade.presented.png",
+      "expect_client_size": "275x14"
     }
   ]
 }

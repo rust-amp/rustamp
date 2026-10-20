@@ -40,6 +40,20 @@ if ($PSBoundParameters.ContainsKey('GuestArgs')) { $arguments['guestArgs'] = @($
 if ($PSBoundParameters.ContainsKey('Source')) { $arguments['source'] = $Source }
 if ($PSBoundParameters.ContainsKey('Dest')) { $arguments['dest'] = $Dest }
 
+# Wait for a broker run that is already in flight before writing: a trigger
+# issued while the task is still running is queued, and the queued run reads
+# whatever request.json holds at that moment. A client that was killed between
+# writing its request and reading the answer (2026-10-20: a host session logoff
+# killed the campaign together with such a client) leaves a stale request that
+# the next queued run then executes, while the new client waits for its own
+# nonce and never gets it. Waiting first removes that race.
+$waitForIdle = (Get-Date).AddSeconds(120)
+while ((Get-Date) -lt $waitForIdle) {
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task -or $task.State -ne 'Running') { break }
+    Start-Sleep -Seconds 2
+}
+
 @{ op = $Op; args = $arguments } | ConvertTo-Json -Depth 6 | Set-Content -Path $RequestPath -Encoding UTF8
 Remove-Item -Path $ResponsePath -ErrorAction SilentlyContinue
 
@@ -50,8 +64,17 @@ Start-ScheduledTask -TaskName $TaskName
 
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 $response = $null
+$attempt = 0
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 3
+    $attempt++
+    # Every 15 s without an answer, rewrite the request and trigger again: a
+    # lost or queued trigger must not turn into a silent five-minute timeout
+    # (that is exactly how a stale request can strand a run).
+    if ($attempt % 5 -eq 0) {
+        @{ op = $Op; args = $arguments } | ConvertTo-Json -Depth 6 | Set-Content -Path $RequestPath -Encoding UTF8
+        try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch { }
+    }
     if (-not (Test-Path $ResponsePath)) { continue }
     try { $candidate = Get-Content -Path $ResponsePath -Raw | ConvertFrom-Json } catch { continue }
     if ($candidate.nonce -eq $nonce) { $response = $candidate; break }

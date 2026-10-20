@@ -139,3 +139,122 @@ Latest verification (headless, this worktree):
 * The app's full playlist unit-test group: 29 passed, 0 failed, 1 VM-only
   ignored, including all four reported regressions unchanged.
 * `git diff --exit-code -- crates/rustamp-app`: clean, proving no app-test edits.
+
+## Presented capture runner (wave336)
+
+The presented side of the `base291` capture set — the same eleven states
+rendered by our player — is produced by a new VM runner that mirrors the
+reference path rather than inventing a second architecture.
+
+### Host runner: `vm-run-presented.ps1`
+
+`docs/notes/vm-run-presented.ps1` is the host-side entry point. It:
+
+1. Restores the `base-provisioned` checkpoint (or a named child checkpoint).
+2. Pins the virtual display to 1024×768 via the broker's `set-vdd-mode.ps1`
+   (same as the reference runner).
+3. Stages the harness, the job file, **our built tree** (taken from the
+   `vm-run-tests.ps1` staging at `D:\code\rustamp-vm\staging\code\Rustamp`) and
+   the reference skin `base-2.91.wsz`.
+4. Copies the staged tree into the guest at `C:\rustamp\capture`.
+5. Runs one job through the broker's `guest` op with the allow-listed
+   `run-presented.ps1`.
+6. Copies the results back with `copyout`, flattens the one-level nesting
+   that the broker introduces, and verifies every file against the guest's
+   `hashes.json`.
+7. Emits `run-provenance.json` with the same fields as the reference runner:
+   checkpoint name + creation time, restore timestamp, guest boot time, DPI
+   and screen readings from both the size step and the capture script, harness
+   exit code, and file count.
+
+Invocation (one case):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-presented.ps1 -Job base291-presented-main-active -DisplayPin Set1024
+```
+
+The built tree is **not rebuilt here**; `vm-run-tests.ps1` already stages a
+complete, receipt-verified tree at `D:\code\rustamp-vm\staging\code\Rustamp`.
+This runner reuses that staging. If the receipt is missing or the workspace
+inputs have changed, `vm-run-tests.ps1 -SkipBuild` will refuse and the
+orchestrator must run a fresh `vm-run-tests.ps1` first.
+
+### Guest script: `vm-broker/guest/run-presented.ps1`
+
+`docs/notes/vm-broker/guest/run-presented.ps1` runs inside the guest (session 0
+via PowerShell Direct) and:
+
+1. Proves the baseline (records guest boot time, user, OS).
+2. Re-checks the display gate (`LogPixels = 96`, virtual screen = 1024×768)
+   right before launching our player — drift between the size step and the
+   player cannot slip through.
+3. Registers a **one-shot scheduled task** as the console user with an
+   `Interactive` logon (same pattern as `run-capture.ps1` and
+   `run-gui-session.ps1`). The task payload:
+   - Launches `rustamp.exe` with `--no-audio --skin <staged base-2.91.wsz>
+     --volume 0 /NOREG /CONFIG=<fresh ini inside the run dir>`.
+   - Waits for the main window (`Class 'Winamp v1.x'`, process `rustamp`).
+   - Opens the equalizer and the playlist with `WM_COMMAND` 40036 and 40040,
+     because the recorded 1:1 landmark of the reference has both windows open
+     and the comparison must start from the same state.
+   - Runs each job step through the harness `Invoke-Capture.ps1` with the
+     exact same fields the reference jobs use:
+     `-ProcessName rustamp`, the step's `-Class`, `-InputMethod`, `-Down/-Up`,
+     `-Msg/-WParam/-LParam`, `-Out`, `-ExpectClientSize` (same schema).
+   - Captures stdout/stderr of every harness call.
+   - Writes `inner-done.json` with per-step results.
+4. Session 0 polls for `inner-done.json` (≤ 30 min), verifies the task ran in
+   the **interactive session** (not session 0), and refuses loudly otherwise.
+5. Writes `guest-transcript.txt` (human log + all harness stdout/stderr),
+   `hashes.json` (SHA-256 of every produced file), and `DONE.json` (per-step
+   results + summary).
+6. Emits **exactly one object** on stdout (the summary), like
+   `run-capture.ps1` does.
+
+### Job files: `vm-broker/jobs/base291-presented-<case>.json`
+
+Eleven jobs, one per case, with **exactly the same steps and the same client
+sizes** as the reference jobs. Capture filenames are `<case>.presented.png`
+instead of `<case>.reference.png`. The eleven cases:
+
+| Case | Window | Normal size | Shade size | Double size |
+|------|--------|-------------|------------|-------------|
+| `main-active` | Winamp v1.x | 275×116 | 275×14 | 550×232 |
+| `main-inactive` | Winamp v1.x | 275×116 | — | — |
+| `main-shade` | Winamp v1.x | — | 275×14 (gate) | — |
+| `main-double` | Winamp v1.x | — | — | 550×232 (gate) |
+| `eq-active` | Winamp EQ | 275×116 | — | — |
+| `eq-inactive` | Winamp EQ | 275×116 | — | — |
+| `eq-shade` | Winamp EQ | — | **not established** (`none`) | — |
+| `eq-double` | Winamp EQ | — | — | **not established** (`none`) |
+| `playlist-active` | Winamp PE | 275×116 | — | — |
+| `playlist-inactive` | Winamp PE | 275×116 | — | — |
+| `playlist-shade` | Winamp PE | — | **not established** (`none`) | — |
+
+The EQ and playlist shade/double sizes are **not established**; those jobs
+use `expect_client_size: "none"` so the harness measures and records them
+without gating.
+
+### Provenance
+
+Every presented capture carries the same provenance as the reference side:
+
+- **Checkpoint**: name and creation time (from `broker -Op list` before restore).
+- **Restore timestamp**: host clock when the broker reported the restore done.
+- **Guest boot time**: `Win32_OperatingSystem.LastBootUpTime` queried inside the
+  guest by the capture script (a restore-then-boot must show a boot time *after*
+  the restore timestamp).
+- **DPI/screen**: `LogPixels` and virtual screen bounds read twice — once by the
+  size step (`set-vdd-mode.ps1`) and once by the capture script's pre-gate —
+  with per-monitor bounds. Captures from runs with different display facts are
+  never compared.
+- **Input method**: recorded per step (`real-mouse`, `send-message`, `none`).
+- **Harness exit**: the exit code of the harness (0 = all steps ok).
+
+The presented runner **cannot claim** that the pixels match the reference —
+that is the comparator's job (`base291_vm_presented_pixels_match_reference_captures`,
+currently ignored). It only claims: "these are the pixels our player produced
+when driven through the same scripted steps, from the same checkpoint, at the
+same DPI, with the same skin, starting from the same window state (EQ+PL
+open)." The provenance travels with the files so the comparison can be audited
+independently.
