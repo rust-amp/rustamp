@@ -73,6 +73,10 @@
 //!   stdio (with the operator's approval store, which the host needs before
 //!   it loads anything), and re-attaching (or restarting) it when it dies —
 //!   off the audio path, degrading to detached.
+//! * [`stream_status`] — what the app shows about the stream that is playing:
+//!   the status texts of S19 §2, the phase change that is a note and the
+//!   counters that are a transient status. Headless; the window shows the
+//!   status in its status area.
 //! * [`title_format`] — the playlist's title format (spec S14) as a setting
 //!   of the app: the format string, the check that says whether it can be
 //!   used, and the fields a playlist row offers to it.
@@ -132,6 +136,7 @@ pub mod region;
 pub mod routing;
 pub mod skin;
 pub mod skin_folder;
+pub mod stream_status;
 pub mod supervise;
 pub mod title_format;
 pub mod winamp_ini;

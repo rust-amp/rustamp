@@ -26,6 +26,12 @@
 //!   stream**: the decoder reports it as a decode failure, and the frames
 //!   that did arrive are still played.
 //!
+//! What a stream is **doing** is observable too: the decode thread hands the
+//! engine an observer of the transfer (S19 §2), and the engine publishes
+//! what it sees — the phase of the exchange and the counters of the body.
+//! The observer is handed over *before* the open, so an open that fails
+//! still leaves the phase that says why.
+//!
 //! The decode order per block is decoder -> ReplayGain scale ->
 //! DSP chain -> vis tap -> format converter -> ring (see
 //! [`crate::replaygain`] for why the gain sits before every stage).
@@ -131,7 +137,8 @@ use rustamp_core::error::{Error, ErrorKind, Result};
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::StreamInfo;
 use rustamp_core::vis::VisFrame;
-use rustamp_decoders::HttpDecoder;
+use rustamp_decoders::http_source::DEFAULT_TIMEOUT;
+use rustamp_decoders::{HttpDecoder, HttpProgress};
 use rustamp_playlist::PlaybackOrder;
 
 use crate::convert::FormatConverter;
@@ -202,11 +209,29 @@ impl TrackSource {
 ///
 /// The registry's meaning is unchanged: a path still goes through it, and
 /// only a URL takes the other way.
-fn open_source(registry: &DecoderRegistry, source: &TrackSource) -> Result<Box<dyn Decoder>> {
+///
+/// A URL is opened **with an observer**: the handle is handed to the engine
+/// *before* the open, so an open that fails still leaves the phase that says
+/// why (S19 §2). The engine shows what the transfer is doing; this crate
+/// shows none of the texts (see `rustamp_decoders::http_progress`).
+fn open_source(
+    registry: &DecoderRegistry,
+    source: &TrackSource,
+    index: u32,
+    tx: &Sender<DecodeOut>,
+) -> Result<Box<dyn Decoder>> {
     match source {
         TrackSource::Path(_) => registry.open(source.media_source()),
         TrackSource::Url(url) => {
-            let decoder: Box<dyn Decoder> = Box::new(HttpDecoder::open(url).map_err(Error::from)?);
+            let progress = HttpProgress::new();
+            let _ = tx.send(DecodeOut::StreamStarted {
+                index,
+                progress: progress.clone(),
+            });
+            let decoder: Box<dyn Decoder> = Box::new(
+                HttpDecoder::open_with_progress(url, DEFAULT_TIMEOUT, &progress)
+                    .map_err(Error::from)?,
+            );
             Ok(decoder)
         }
     }
@@ -319,6 +344,18 @@ pub(crate) enum DecodeOut {
         /// New technical info.
         stream: Box<StreamInfo>,
     },
+    /// A stream transfer began: the observer of the transfer is handed to the
+    /// engine, which shows what the transfer is doing (S19 §2).
+    ///
+    /// The handle is sent **before** the open, so an open that fails still
+    /// leaves the phase that says why.
+    StreamStarted {
+        /// The queue index of the track the transfer belongs to, in the queue
+        /// the run started with.
+        index: u32,
+        /// The observer of the transfer.
+        progress: HttpProgress,
+    },
     /// The whole queue is done; `timeline_end` is the last frame written.
     EndOfStream {
         /// Absolute timeline position after the last written frame.
@@ -402,6 +439,7 @@ impl std::fmt::Debug for DecodeOut {
                 .field("to", to)
                 .field("stream", stream)
                 .finish(),
+            DecodeOut::StreamStarted { .. } => write!(f, "StreamStarted"),
             DecodeOut::EndOfStream { timeline_end } => f
                 .debug_struct("EndOfStream")
                 .field("timeline_end", timeline_end)
@@ -650,7 +688,7 @@ impl Worker {
                 });
                 break;
             };
-            let mut decoder = match open_source(&self.cfg.registry, &source) {
+            let mut decoder = match open_source(&self.cfg.registry, &source, index, &self.tx) {
                 Ok(d) => d,
                 Err(e) => {
                     self.flush_converter();
