@@ -5839,6 +5839,26 @@ mod tests {
     }
 
     #[test]
+    fn an_added_url_becomes_a_url_track_in_the_queue() {
+        // A hand-over frame carries a location, and the app's location path
+        // is the same for a URL as it is for the command line's URL: a
+        // `TrackSource::Url` in the queue, never a file the player would try
+        // to open. The item is added without being played, so the test opens
+        // no stream.
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::AddItems {
+            items: vec![MediaLocation::Url("http://127.0.0.1/stream.mp3".to_owned())],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        assert_eq!(
+            app.engine().queue(),
+            &[TrackSource::Url("http://127.0.0.1/stream.mp3".to_owned())]
+        );
+    }
+
+    #[test]
     fn confirming_an_empty_open_media_dialog_keeps_it_open() {
         // With nothing picked and a blank field there is nothing to add:
         // `Enter` stays consumed and the dialog stays open for a retry.
