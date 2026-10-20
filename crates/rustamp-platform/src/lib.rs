@@ -69,9 +69,10 @@ pub use prefs_dialog::{
 };
 pub use shell_registration::{
     DIRECTORY_HANDLER, DROP_TARGET_VALUE, Entry, Handler, MEDIA_PROG_ID, PLAYLIST_PROG_ID,
-    RegistrationError, RegistrationFlags, RegistrationStep, SKIN_PROG_ID, Verb,
-    file_type_associations, file_type_entries, install, registered_value, registration_step,
-    registry_entries, uninstall,
+    RegistrationError, RegistrationFlags, RegistrationStep, RegistryModel, SKIN_PROG_ID, Verb,
+    file_type_associations, file_type_entries, install, install_into, registered_value,
+    registration_step, registry_entries, uninstall, uninstall_from, verb_entries, verb_trees,
+    write_entries,
 };
 pub use single_instance::{
     Claim, DEFAULT_CLASS, ForwardRequest, HandOff, Instance, LockState, StartupAction, claim,
