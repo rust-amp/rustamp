@@ -57,6 +57,11 @@
 //! * [`library_window`] — the media library: the app's index, the view, the
 //!   glue between them, the input map and the background scan. Headless; the
 //!   OS window lives in [`window`].
+//! * [`library_extract`] — the playlist extraction of the media library
+//!   (spec S20 §4): the files the path template names are copied into the
+//!   target directory, the playlist lists them, and the failures are
+//!   reported in the wording of the reference. Headless; the configuration
+//!   dialog lives in `rustamp-platform`.
 //! * [`modern_shell`] — the window path for a window that is **not** skinned
 //!   (the media library): the shared shell's attributes with the native
 //!   frame and the resizability put back.
@@ -110,6 +115,7 @@ mod external_control;
 pub mod focus;
 pub mod host;
 pub mod html_playlist;
+pub mod library_extract;
 mod library_recovery;
 pub mod library_window;
 pub mod menu;

@@ -199,6 +199,15 @@ pub struct App {
     /// The media library: the app's index, its view and the background scan
     /// (see `library_window.rs`). The OS window lives in `window.rs`.
     pub(crate) library_window: crate::library_window::LibraryWindow,
+    /// The settings of the last playlist extraction: the path template and
+    /// the target directory.
+    ///
+    /// The configuration dialog starts with them, so a second extraction
+    /// needs no typing. They are **not** written into the configuration
+    /// file: a new key in `rustamp-core`'s `Config` is a contract change and
+    /// needs an RFC, and the settings of the running session are enough for
+    /// now.
+    pub(crate) last_extract_settings: rustamp_platform::ExtractSettings,
     /// The simple modal dialogs (About, file info, jump-to, load playlist,
     /// skin browser, preferences); owned here, rendered by `dialogs.rs`,
     /// hosted by `window.rs`.
@@ -502,6 +511,10 @@ impl App {
             next_entry_id: 0,
             playlist: PlaylistWindow::new(),
             library_window: crate::library_window::LibraryWindow::default(),
+            last_extract_settings: rustamp_platform::ExtractSettings {
+                template: crate::library_extract::DEFAULT_TEMPLATE.to_owned(),
+                directory: PathBuf::new(),
+            },
             dialogs: DialogManager::new(),
             extended_info: None,
             edit_entry: None,

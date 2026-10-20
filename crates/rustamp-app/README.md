@@ -184,6 +184,35 @@ the whole tree. Only the files the player's decoders claim are added; a
 playlist file inside the directory is not imported (loading a playlist is the
 LIST OPTS path). See `src/directory.rs` for the rules and their tests.
 
+## The media library's playlist extraction (S20)
+
+`Ctrl+Shift+X` in the media library window writes the selection out as a
+playlist (spec S20 §4). The chord is ours: S20 measures nothing about the
+media library, and `Ctrl+Shift+X` is in neither the main window's table nor
+the global table.
+
+Two native dialogs are involved, and both are opened **from the tick**
+(`window::drain_library_extract`), never from a window procedure:
+
+| Question | Dialog |
+|---|---|
+| the path template and the target directory | a window of ours (`rustamp_platform::ask_extract_settings`) |
+| an existing playlist: overwrite or append | the system's message box (`rustamp_platform::ask_yes_no`) |
+
+The extraction copies the files the template names into the target directory
+(the extension of the source file travels with the copy, because the template
+has no token for one) and writes an M3U playlist, `playlist.m3u`, beside them.
+A track that cannot be written is reported as `Error extracting track #N:
+<reason>` — the reference's own wording — and the other tracks are written
+anyway. A cancelled dialog writes nothing at all.
+
+**What is extracted** is the selected row when there is one, and every row the
+search matches when there is none: the page the window shows is only a window
+onto the match set.
+
+See `src/library_extract.rs` for the rules and `src/library_extract_tests.rs`
+for the tests.
+
 ## The HTML playlist
 
 `Ctrl+Alt+G` in the playlist editor (command id **40292**, S03 §2) and the MISC

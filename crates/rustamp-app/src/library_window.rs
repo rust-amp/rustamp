@@ -73,10 +73,30 @@
 //! | `Ctrl+F` | focuses the search field |
 //! | `Ctrl+M` | removes the rows whose file is gone |
 //! | `Ctrl+O` | asks for a folder to add to the library |
+//! | `Ctrl+Shift+X` | writes the selection out as a playlist (S20 §4) |
 //!
 //! The movement keys always move the selection, whether the search field has
 //! the focus or not: the field holds one line of text, and the list is what
 //! the window is for.
+//!
+//! # The extraction
+//!
+//! `Ctrl+Shift+X` asks the app to write the selection out as a playlist: the
+//! **path template** the file names come from and the **target directory**
+//! they are written into are asked in a small native dialog, and the
+//! extraction then copies the files and writes the playlist (see
+//! [`crate::library_extract`]).
+//!
+//! The chord is an **own choice** (S20 measures nothing about the media
+//! library): `Ctrl+Shift+X` is in neither the main window's table nor the
+//! global table, it collides with nothing the library window binds already,
+//! and the `X` stands for "eXtract".
+//!
+//! **What is extracted** is the selected row when there is one, and every
+//! row the search matches when there is none: the page the window shows is
+//! only a window onto the match set, so an extraction without a selection
+//! writes the whole match set and not just the rows that happen to be on
+//! the page (see [`LibraryWindow::extract_rows`]).
 //!
 //! # The missing entries
 //!
@@ -336,6 +356,11 @@ pub struct LibraryWindow {
     open: bool,
     /// A "pick a folder" request for the presenter.
     folder_request: bool,
+    /// A "write the selection out as a playlist" request for the presenter.
+    ///
+    /// The window does not ask the user anything itself: the presenter opens
+    /// the configuration dialog and hands the answer back.
+    extract_request: bool,
     /// The last failure the user should see; it is shown in the caption.
     error: Option<String>,
     /// The note of the last action, for the app to show.
@@ -389,6 +414,7 @@ impl Default for LibraryWindow {
             search_focused: true,
             open: false,
             folder_request: false,
+            extract_request: false,
             error: None,
             action_note: None,
             scan_progress: None,
@@ -741,6 +767,14 @@ impl LibraryWindow {
             }
             return Ok(Vec::new());
         }
+        if modifiers == Modifiers::CTRL.union(Modifiers::SHIFT) {
+            if key == Key::Letter(b'X') {
+                // The extraction asks the user for its settings in a native
+                // dialog; the window only records the request.
+                self.extract_request = true;
+            }
+            return Ok(Vec::new());
+        }
         if modifiers != Modifiers::NONE {
             // Alt and Shift belong to the player's own shortcuts.
             return Ok(Vec::new());
@@ -982,6 +1016,43 @@ impl LibraryWindow {
     /// Takes the "pick a folder" request, if the library made one.
     pub fn take_folder_request(&mut self) -> bool {
         std::mem::take(&mut self.folder_request)
+    }
+
+    /// Takes the "write the selection out as a playlist" request, if the
+    /// library made one.
+    pub fn take_extract_request(&mut self) -> bool {
+        std::mem::take(&mut self.extract_request)
+    }
+
+    /// The rows an extraction writes.
+    ///
+    /// The rule: the **selected** row when there is one, and every row the
+    /// current search matches when there is none. The page the window shows
+    /// is only a window onto the match set - the status line says
+    /// `1-20 of 1234` - so an extraction without a selection writes the
+    /// whole match set and not just the rows that happen to be on the page.
+    ///
+    /// A running scan holds the index, and an extraction needs it: the
+    /// rows are then not available, and the caller is told so.
+    pub fn extract_rows(&self) -> Result<Vec<TrackRow>> {
+        let Some(index) = &self.index else {
+            return Err(Error::NotFound(
+                "the library index is not open: a running scan holds it (Escape stops the scan)"
+                    .into(),
+            ));
+        };
+        if let Some(id) = self.view.selected() {
+            let row = index
+                .get(id)?
+                .ok_or_else(|| Error::NotFound(format!("track {id}")))?;
+            return Ok(vec![row]);
+        }
+        let request = self.view.request();
+        let mut query = query_of(&request);
+        // Every row of the match set, not one page of it.
+        query.limit = None;
+        query.offset = 0;
+        Ok(index.query(&query)?.rows)
     }
 
     /// Starts a scan of `roots` on the app's own worker thread.
@@ -1371,6 +1442,15 @@ impl App {
     /// Takes the "pick a folder" request, if the library made one.
     pub fn take_library_folder_request(&mut self) -> bool {
         self.library_window.take_folder_request()
+    }
+
+    /// Takes the "write the selection out as a playlist" request, if the
+    /// library made one.
+    ///
+    /// The presenter answers it with the configuration dialog and hands the
+    /// settings to [`App::library_extract`].
+    pub fn take_library_extract_request(&mut self) -> bool {
+        self.library_window.take_extract_request()
     }
 
     /// Adds a folder to the library and scans it.

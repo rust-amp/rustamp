@@ -19,6 +19,9 @@
 //! The standard file-open dialog and the directory picker live in
 //! [`file_dialog`]; the operating system's own popup menu lives in
 //! [`popup_menu`].
+//! The native dialogs of the media library's playlist extraction - the
+//! form that asks for the path template and the target directory, and the
+//! question about an existing playlist - live in [`extract_dialog`].
 //! A skin's cursor files become operating-system cursors in [`cursor`].
 //! A skin's window region becomes the operating system's window region in
 //! [`window_region`].
@@ -29,6 +32,7 @@
 pub mod cursor;
 pub mod displays;
 pub mod dpi;
+pub mod extract_dialog;
 pub mod file_dialog;
 pub mod hotkeys;
 pub mod popup_menu;
@@ -48,6 +52,7 @@ pub use displays::{
     display_changes, dpi_at,
 };
 pub use dpi::{DpiAwareness, DpiError, WindowChrome, init_dpi_awareness, outer_size_for_client};
+pub use extract_dialog::{ExtractSettings, ask_extract_settings, ask_yes_no_cancel};
 pub use file_dialog::{
     CANCELLED_HRESULT, DIRECTORY_DIALOG_OPTIONS, EQF_FILTERS, FileDialogError, HTML_SAVE_FILTERS,
     INI_FILTERS, MEDIA_FILTERS, PLAYLIST_SAVE_FILTERS, directory_dialog_options, directory_result,
