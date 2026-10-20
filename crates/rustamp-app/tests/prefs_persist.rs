@@ -134,6 +134,57 @@ fn the_replaygain_mode_follows_the_dialog_and_survives_a_restart() {
 }
 
 #[test]
+fn the_playlist_title_format_follows_the_dialog_and_survives_a_restart() {
+    // The title format (spec S14) is the app's own setting: the dialog
+    // carries the switch and the format string, and the app persists both.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("title-format.toml");
+
+    let mut app = app_with(Config::default(), Some(path.clone()));
+    let before = app.prefs_settings();
+    assert!(
+        !before.playlist_title_format,
+        "the format is off by default"
+    );
+    assert_eq!(
+        before.playlist_title_format_text,
+        rustamp_ui::title_format::DEFAULT_TEMPLATE
+    );
+
+    app.apply_prefs_action(PrefsAction::SetTitleFormat(
+        "[%artist% - ]%title%".to_string(),
+    ));
+    app.apply_prefs_action(PrefsAction::Set(Bind::PlaylistTitleFormat, true));
+    let shown = app.prefs_settings();
+    assert!(shown.playlist_title_format);
+    assert_eq!(shown.playlist_title_format_text, "[%artist% - ]%title%");
+
+    // The setting is saved at once, like the other settings of the dialog.
+    let loaded = load(Some(&path)).expect("load");
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(
+        loaded.playlist_title_format,
+        Some(rustamp_app::title_format::TitleFormatSetting::new(
+            true,
+            "[%artist% - ]%title%"
+        ))
+    );
+
+    // A new run built from the saved file shows the same values in the
+    // dialog, and the rows are formatted from the start.
+    let mut restarted = app_with(loaded.config, None);
+    let setting = loaded
+        .playlist_title_format
+        .expect("the file names a format");
+    restarted
+        .set_playlist_title_format(setting.enabled, &setting.format)
+        .expect("the format can be used");
+    let shown = restarted.prefs_settings();
+    assert!(shown.playlist_title_format);
+    assert_eq!(shown.playlist_title_format_text, "[%artist% - ]%title%");
+}
+
+#[test]
 fn the_output_mode_follows_the_dialog_and_survives_a_restart() {
     // Null output makes this a persistence test, not a real exclusive open.
     let dir = tempfile::tempdir().unwrap();

@@ -241,6 +241,18 @@ pub enum Bind {
     Shuffle,
     /// Repeat the playlist.
     Repeat,
+    /// Format the playlist's rows with a title format.
+    ///
+    /// The format string itself is a text field ([`TextBind`]); this is the
+    /// switch that says whether the format is used at all.
+    PlaylistTitleFormat,
+}
+
+/// A setting a text field is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TextBind {
+    /// The playlist's title format: the format string of spec **S14**.
+    PlaylistTitleFormat,
 }
 
 /// A setting a drop-down list is bound to.
@@ -383,6 +395,17 @@ pub enum Item {
         list: Rect,
         /// The setting it shows and changes.
         bind: ComboBind,
+    },
+    /// A text field with a label in front of it.
+    TextField {
+        /// The label's text.
+        text: &'static str,
+        /// Where the label sits.
+        label: Rect,
+        /// Where the field sits.
+        field: Rect,
+        /// The setting it shows and changes.
+        bind: TextBind,
     },
     /// The list of loadable skins; choosing a row loads it.
     SkinList {
@@ -556,6 +579,29 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
                 rect: rect(12, 22, w - 24, 20),
                 bind: Bind::DoubleSize,
             },
+            // The playlist's title format (S14). The reference's pages are
+            // unmeasured (S04 is open), so the page that carries it is an
+            // own choice: Display is the page for what the player shows, and
+            // the title format is what the playlist's rows say.
+            Item::Group {
+                text: "Playlist title format",
+                rect: rect(0, 60, w, 132),
+            },
+            Item::Check {
+                text: "Format the playlist rows",
+                rect: rect(12, 82, w - 24, 20),
+                bind: Bind::PlaylistTitleFormat,
+            },
+            Item::TextField {
+                text: "Format:",
+                label: rect(12, 112, 44, 20),
+                field: rect(60, 110, w - 72, 22),
+                bind: TextBind::PlaylistTitleFormat,
+            },
+            Item::Label {
+                text: "Fields: %title%, %artist%, %album%, %tracknumber%, %filename%, %comment%.",
+                rect: rect(12, 140, w - 24, 44),
+            },
         ],
         PrefsNode::OptionsVisualization => note_page(
             "Visualization",
@@ -694,6 +740,10 @@ pub struct PrefsSettings {
     pub shuffle: bool,
     /// Repeat.
     pub repeat: bool,
+    /// Whether the playlist's rows are formatted with a title format.
+    pub playlist_title_format: bool,
+    /// The title format string the field shows.
+    pub playlist_title_format_text: String,
     /// The ReplayGain mode.
     pub replaygain: ReplayGainMode,
     /// The output mode.
@@ -737,6 +787,14 @@ impl PrefsSettings {
             Bind::DoubleSize => self.double_size,
             Bind::Shuffle => self.shuffle,
             Bind::Repeat => self.repeat,
+            Bind::PlaylistTitleFormat => self.playlist_title_format,
+        }
+    }
+
+    /// The text the field bound to `bind` shows.
+    pub fn text(&self, bind: TextBind) -> &str {
+        match bind {
+            TextBind::PlaylistTitleFormat => &self.playlist_title_format_text,
         }
     }
 
@@ -1196,7 +1254,7 @@ impl PageLists {
 }
 
 /// What the user did in the dialog; the player turns it into a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefsAction {
     /// A check box was set to this value.
     Set(Bind, bool),
@@ -1204,6 +1262,11 @@ pub enum PrefsAction {
     SetReplayGain(ReplayGainMode),
     /// The output mode was set to this value.
     SetOutputMode(OutputMode),
+    /// The playlist's title format was typed.
+    ///
+    /// The format string travels with the action, because the field is the
+    /// user's text and the player is the one that checks it.
+    SetTitleFormat(String),
     /// A skin row was chosen.
     LoadSkin(usize),
     /// The toggle button was pressed with this plug-in selected
@@ -1263,18 +1326,19 @@ mod win32 {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         BM_GETCHECK, BM_SETCHECK, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE,
-        CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, HMENU, IDC_ARROW, IsWindow,
-        LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETHORIZONTALEXTENT,
-        LoadCursorW, NONCLIENTMETRICSW, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW,
-        SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WM_NOTIFY, WM_SETFONT, WNDCLASSEXW, WS_CAPTION,
-        WS_CHILD, WS_EX_CLIENTEDGE, WS_HSCROLL, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE, GetWindowTextW,
+        HMENU, IDC_ARROW, IsWindow, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
+        LB_SETHORIZONTALEXTENT, LoadCursorW, NONCLIENTMETRICSW, RegisterClassExW,
+        SPI_GETNONCLIENTMETRICS, SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW,
+        ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WM_NOTIFY, WM_SETFONT,
+        WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_HSCROLL, WS_SYSMENU, WS_TABSTOP,
+        WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, PWSTR};
 
     use super::{
         Bind, ComboBind, Item, NO_REPORT, PageLists, PrefsAction, PrefsError, PrefsNode,
-        PrefsSettings, Rect, TREE, page_items,
+        PrefsSettings, Rect, TREE, TextBind, page_items,
     };
 
     const CLASS_NAME: &str = "RustampPreferences";
@@ -1320,6 +1384,9 @@ mod win32 {
     /// Combo box style bit (`CBS_DROPDOWNLIST`): a list the user picks from,
     /// without an edit field. Kept as a plain number like the styles above.
     const CBS_DROPDOWNLIST: u32 = 0x3;
+    /// Edit control style bit (`ES_AUTOHSCROLL`): the text scrolls sideways
+    /// instead of wrapping. Kept as a plain number like the styles above.
+    const ES_AUTOHSCROLL: u32 = 0x0080;
 
     /// The dialog's live state. The dialog is a singleton per thread (the UI
     /// thread), so the window procedure and the handle share it here instead
@@ -1336,6 +1403,8 @@ mod win32 {
         checks: Vec<(HWND, u16, Bind)>,
         /// The drop-down lists of the current page: (window, id, binding).
         combos: Vec<(HWND, u16, ComboBind)>,
+        /// The text fields of the current page: (window, id, binding).
+        texts: Vec<(HWND, u16, TextBind)>,
         skin_list: Option<HWND>,
         /// The state of the three lists of the current page: the rows they
         /// show, the row the user picked in them and the skin the player
@@ -1479,6 +1548,7 @@ mod win32 {
                     page: Vec::new(),
                     checks: Vec::new(),
                     combos: Vec::new(),
+                    texts: Vec::new(),
                     skin_list: None,
                     lists: PageLists::default(),
                     plugin_list: None,
@@ -1600,6 +1670,9 @@ mod win32 {
             for (control, _, bind) in combos {
                 set_combo_row(control, settings.combo_row(bind));
             }
+            // The text fields are **not** pushed: a field the user is typing
+            // in must not be written over. The field is filled when the page
+            // is built, and every keystroke reaches the player from there.
             if let Some(list) = controls.1 {
                 refresh_skin_list(list, settings);
             }
@@ -1630,6 +1703,28 @@ mod win32 {
                 Some(LPARAM(0)),
             );
         }
+    }
+
+    /// Makes a text field show `text`.
+    ///
+    /// The field is filled when the page is built, and never again: a field
+    /// the user is typing in must not be written over.
+    fn set_edit_text(control: HWND, text: &str) {
+        let text = wide(text);
+        // SAFETY: the text outlives the call, and the control is our own.
+        let _ = unsafe { SetWindowTextW(control, PCWSTR(text.as_ptr())) };
+    }
+
+    /// The text a text field shows.
+    fn read_edit_text(control: HWND) -> String {
+        let mut buffer = [0u16; 1024];
+        // SAFETY: the control is our own, and the buffer is big enough for
+        // the text it holds.
+        let length = unsafe { GetWindowTextW(control, &mut buffer) };
+        if length <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buffer[..length as usize])
     }
 
     /// Makes the report line show the player's report.
@@ -1823,6 +1918,7 @@ mod win32 {
                     g.as_mut().map(|i| {
                         i.checks.clear();
                         i.combos.clear();
+                        i.texts.clear();
                         i.skin_list = None;
                         i.plugin_list = None;
                         i.library_list = None;
@@ -1848,6 +1944,7 @@ mod win32 {
         let mut page = Vec::new();
         let mut checks = Vec::new();
         let mut combos = Vec::new();
+        let mut texts = Vec::new();
         let mut skin_list = None;
         let mut plugin_list = None;
         let mut library_list = None;
@@ -1946,6 +2043,41 @@ mod win32 {
                         set_combo_row(c, settings.combo_row(bind));
                         page.push(c);
                         combos.push((c, next_id, bind));
+                    }
+                }
+                Item::TextField {
+                    text,
+                    label,
+                    field,
+                    bind,
+                } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("STATIC"),
+                        text,
+                        WS_CHILD.0 | WS_VISIBLE.0 | SS_LEFT,
+                        0,
+                        shift(label),
+                        next_id,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("EDIT"),
+                        "",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL,
+                        WS_EX_CLIENTEDGE.0,
+                        shift(field),
+                        next_id,
+                        dpi,
+                        font,
+                    ) {
+                        set_edit_text(c, settings.text(bind));
+                        page.push(c);
+                        texts.push((c, next_id, bind));
                     }
                 }
                 Item::SkinList { rect } => {
@@ -2131,6 +2263,7 @@ mod win32 {
                 inner.page = page;
                 inner.checks = checks;
                 inner.combos = combos;
+                inner.texts = texts;
                 inner.skin_list = skin_list;
                 inner.plugin_list = plugin_list;
                 inner.library_list = library_list;
@@ -2471,6 +2604,22 @@ mod win32 {
                         return LRESULT(0);
                     }
                 }
+                if code == EN_CHANGE {
+                    // A text field of the current page changed: the text is
+                    // the user's, and it travels with the action.
+                    let hit = STATE.with(|state| {
+                        state.try_borrow().ok().and_then(|g| {
+                            g.as_ref().and_then(|i| {
+                                i.texts.iter().find(|(_, cid, _)| *cid == id).copied()
+                            })
+                        })
+                    });
+                    if let Some((control, _, _)) = hit {
+                        let text = read_edit_text(control);
+                        push_action(PrefsAction::SetTitleFormat(text));
+                        return LRESULT(0);
+                    }
+                }
                 if code == BN_CLICKED {
                     let hit = STATE.with(|state| {
                         state.try_borrow().ok().and_then(|g| {
@@ -2620,6 +2769,7 @@ mod tests {
                     | Item::ImportButton { rect }
                     | Item::Report { rect } => vec![rect],
                     Item::Combo { label, list, .. } => vec![label, list],
+                    Item::TextField { label, field, .. } => vec![label, field],
                 };
                 for r in rects {
                     assert!(r.x >= 0 && r.y >= 0, "{:?}: {r:?}", entry.node);
@@ -2647,9 +2797,57 @@ mod tests {
             Bind::DoubleSize,
             Bind::Shuffle,
             Bind::Repeat,
+            Bind::PlaylistTitleFormat,
         ] {
             assert!(seen.contains(&bind), "{bind:?} has no control");
         }
+    }
+
+    /// The playlist's title format has a switch and a field, and the field is
+    /// on the page that carries the switch.
+    #[test]
+    fn the_display_page_carries_the_title_format_switch_and_its_field() {
+        let items = page_items(PrefsNode::Display);
+        let switch = items.iter().find(|item| {
+            matches!(
+                item,
+                Item::Check {
+                    bind: Bind::PlaylistTitleFormat,
+                    ..
+                }
+            )
+        });
+        assert!(switch.is_some(), "the switch is on the page");
+        let field = items.iter().find(|item| {
+            matches!(
+                item,
+                Item::TextField {
+                    bind: TextBind::PlaylistTitleFormat,
+                    ..
+                }
+            )
+        });
+        assert!(field.is_some(), "the format string has a field");
+    }
+
+    /// A setting that is typed travels with the action, so the player gets
+    /// the user's text and not only the fact that something changed.
+    #[test]
+    fn the_title_format_text_travels_with_the_action() {
+        let settings = PrefsSettings {
+            playlist_title_format: true,
+            playlist_title_format_text: "%artist% - %title%".to_string(),
+            ..PrefsSettings::default()
+        };
+        assert!(settings.get(Bind::PlaylistTitleFormat));
+        assert_eq!(
+            settings.text(TextBind::PlaylistTitleFormat),
+            "%artist% - %title%"
+        );
+        assert_eq!(
+            PrefsAction::SetTitleFormat("%artist% - %title%".to_string()),
+            PrefsAction::SetTitleFormat(settings.text(TextBind::PlaylistTitleFormat).to_string())
+        );
     }
 
     #[test]

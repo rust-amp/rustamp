@@ -162,6 +162,8 @@ fn random_settings(rng: &mut Rng) -> PrefsSettings {
         double_size: rng.index(2) == 0,
         shuffle: rng.index(2) == 0,
         repeat: rng.index(2) == 0,
+        playlist_title_format: rng.index(2) == 0,
+        playlist_title_format_text: format!("%title% {}", rng.index(100)),
         replaygain: REPLAYGAIN_CHOICES[rng.index(REPLAYGAIN_CHOICES.len())],
         output_mode: OUTPUT_MODE_CHOICES[rng.index(OUTPUT_MODE_CHOICES.len())],
         skins,

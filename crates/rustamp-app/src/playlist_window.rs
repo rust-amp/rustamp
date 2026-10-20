@@ -48,11 +48,13 @@
 
 use std::path::PathBuf;
 
+use rustamp_audio::TrackSource;
 use rustamp_core::command::{Command, OpenMediaKind};
 use rustamp_core::error::Result;
 use rustamp_core::playlist::{EntryId, SortKey};
 use rustamp_core::state::WindowId;
 use rustamp_gfx::Image;
+use rustamp_ui::title_format::TitleFormat;
 use rustamp_ui::{
     DockedStack, Key, Modifiers, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog,
     PlaylistKeyAction, PlaylistTitleButton, ShortcutOutcome, WindowKind, hit_test_button,
@@ -61,6 +63,7 @@ use rustamp_ui::{
 };
 
 use crate::app::App;
+use crate::title_format::TitleFormatSetting;
 
 impl App {
     /// Takes the MISC popup request once, for the presenter's native-menu drain.
@@ -152,6 +155,32 @@ impl App {
     pub(crate) fn sync_playlist_font_size(&mut self) {
         let size = rustamp_ui::skin_font_size(self.skin.skin());
         self.playlist.set_skin_font_size(size);
+    }
+
+    /// The playlist's title format, as the preferences page shows it.
+    ///
+    /// The user's setting, or the default: the format **off** with the
+    /// engine's default template in the field. Without a setting the rows
+    /// show their plain text, which is what the playlist shows today.
+    pub fn playlist_title_format(&self) -> TitleFormatSetting {
+        self.title_format.clone().unwrap_or_default()
+    }
+
+    /// Sets the playlist's title format.
+    ///
+    /// `enabled` is the switch, `format` the format string. The reason the
+    /// format string cannot be used is returned: the setting is kept either
+    /// way, so the preferences page shows the user's text and the user can
+    /// fix it, but the rows keep their plain text while the format cannot be
+    /// used.
+    pub fn set_playlist_title_format(&mut self, enabled: bool, format: &str) -> Result<(), String> {
+        let setting = TitleFormatSetting::new(enabled, format);
+        let problem = setting.check().err();
+        self.title_format = Some(setting);
+        match problem {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
     }
 
     /// Syncs the model's entry order from the app's stable entry ids.
@@ -615,25 +644,73 @@ impl App {
         let index = self.engine().current_index();
         let current = self.entry_id_for(index);
         self.playlist.set_current(current);
-        let ids = self.playlist.visible_ids();
-        let labels: Vec<String> = ids.iter().map(|id| self.playlist_label(*id)).collect();
+        let ids: Vec<EntryId> = self.playlist.visible_ids();
+        // The tags of the rows are read off the UI thread (see
+        // [`crate::playlist_tags`]): the ones that arrived are taken, and the
+        // rows that have none yet are asked for.
+        self.playlist_tags.poll();
+        self.request_row_tags(&ids);
+        // The format is read once for the frame: every row shows the same
+        // one.
+        let format = self.playlist_title_format().engine_format();
+        let labels: Vec<String> = ids
+            .iter()
+            .map(|id| self.playlist_label(*id, &format))
+            .collect();
         let focused = self.focused_for_playlist();
         render_playlist_window(self.skin.skin(), &self.playlist, &labels, focused)
+    }
+
+    /// Asks for the tags of the rows that have none.
+    ///
+    /// The tags are read off the UI thread, so a row shows its plain text
+    /// until its tags arrive. Only the rows the playlist shows are asked
+    /// for: a player that never shows a row never reads a file.
+    fn request_row_tags(&mut self, ids: &[EntryId]) {
+        for id in ids {
+            if self.playlist_tags.metadata(*id).is_some() {
+                continue;
+            }
+            let index = self.entry_ids.iter().position(|entry| entry == id);
+            let Some(index) = index else {
+                continue;
+            };
+            let path = match self.engine().queue().get(index) {
+                Some(TrackSource::Path(path)) => Some(path.clone()),
+                _ => None,
+            };
+            let Some(path) = path else {
+                continue;
+            };
+            self.playlist_tags.request(*id, &path);
+        }
     }
 
     /// The row text for one entry: the engine queue's display name at the
     /// entry's index, falling back to the entry id when it has no queue row
     /// (for example after a REM that the engine queue does not track yet).
-    fn playlist_label(&self, id: EntryId) -> String {
-        match self.entry_ids.iter().position(|entry| *entry == id) {
-            Some(index) => self
-                .engine()
-                .queue()
-                .get(index)
-                .map(|track| track.display())
-                .unwrap_or_else(|| format!("{id:?}")),
+    ///
+    /// With the title format turned on (spec S14), the row shows the format
+    /// the user set instead, rendered with the fields the row carries. The
+    /// format is off without a setting, so the row text is exactly what it
+    /// is today.
+    fn playlist_label(&self, id: EntryId, format: &TitleFormat) -> String {
+        let index = self.entry_ids.iter().position(|entry| *entry == id);
+        let source = index.and_then(|index| self.engine().queue().get(index));
+        let plain = match source {
+            Some(track) => track.display(),
             None => format!("{id:?}"),
+        };
+        if !format.is_enabled() {
+            return plain;
         }
+        let Some(track) = source else {
+            // A row the queue does not know has no fields: it keeps the
+            // plain text, which names the row.
+            return plain;
+        };
+        let fields = crate::title_format::row_fields(track, self.playlist_tags.metadata(id));
+        format.row_text(&plain, &fields)
     }
 
     /// Which focus variant the playlist frame renders with.
@@ -763,8 +840,11 @@ impl App {
 mod tests {
     use rustamp_core::command::{Command, OpenMediaKind, SelectOp};
     use rustamp_core::config::Config;
+    use rustamp_core::event::Event;
+    use rustamp_core::meta::TrackMetadata;
     use rustamp_core::playlist::{EntryId, MediaLocation};
     use rustamp_core::state::WindowId;
+    use rustamp_platform::PrefsAction;
 
     use super::*;
     use crate::app::AppOptions;
@@ -1516,6 +1596,173 @@ mod tests {
         restarted.set_playlist_font_size(loaded.playlist_font_size);
         assert_eq!(restarted.playlist().font_size().size(), 14);
         assert_eq!(restarted.playlist_font_size(), Some(14));
+    }
+
+    /// The playlist's title format (spec **S14**) is off without a setting,
+    /// so the rows show exactly the text they show today.
+    #[test]
+    fn without_a_setting_the_row_shows_the_text_of_today() {
+        let mut app = test_app();
+        add_entries(&mut app, 3);
+        let ids = app.playlist().visible_ids();
+        let format = app.playlist_title_format().engine_format();
+        assert!(!format.is_enabled(), "the format is off without a setting");
+        let labels: Vec<String> = ids
+            .iter()
+            .map(|id| app.playlist_label(*id, &format))
+            .collect();
+        assert_eq!(labels, ["track0.mp3", "track1.mp3", "track2.mp3"]);
+        // The frame is the frame of those texts: the drawing did not change
+        // either.
+        let expected = render_playlist_window(
+            app.skin.skin(),
+            app.playlist(),
+            &labels,
+            app.focused_for_playlist(),
+        );
+        assert_eq!(app.render_playlist(), expected);
+    }
+
+    /// A format the user set replaces the row text, rendered with the fields
+    /// the row carries.
+    #[test]
+    fn a_format_the_user_set_replaces_the_row_text() {
+        let mut app = test_app();
+        add_entries(&mut app, 3);
+        let id = app.playlist().visible_ids()[0];
+        // The engine read the tags of the track it opened: the row carries
+        // them, and nothing is read from the disk while a frame is painted.
+        app.handle_event(&Event::TrackChanged {
+            id: None,
+            index: Some(0),
+            metadata: Some(Box::new(TrackMetadata {
+                title: Some("The Title".to_string()),
+                artist: Some("The Artist".to_string()),
+                ..TrackMetadata::default()
+            })),
+            duration_ms: None,
+        });
+        app.set_playlist_title_format(true, "[%artist% - ]%title%")
+            .expect("the format can be used");
+        let format = app.playlist_title_format().engine_format();
+        assert_eq!(app.playlist_label(id, &format), "The Artist - The Title");
+        // The text is the one the engine renders for those fields.
+        let fields = crate::title_format::row_fields(
+            &TrackSource::path("track0.mp3"),
+            app.playlist_tags.metadata(id),
+        );
+        assert_eq!(
+            app.playlist_label(id, &format),
+            rustamp_ui::title_format::TitleFormat::new("[%artist% - ]%title%")
+                .row_text("track0.mp3", &fields)
+        );
+    }
+
+    /// A format string that cannot be read is reported, and the rows keep
+    /// their plain text.
+    #[test]
+    fn a_format_that_cannot_be_read_leaves_the_row_text_alone_and_is_reported() {
+        let mut app = test_app();
+        add_entries(&mut app, 3);
+        let id = app.playlist().visible_ids()[0];
+        // The preferences page reports the format it cannot use.
+        app.apply_prefs_action(PrefsAction::SetTitleFormat("%title".to_string()));
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|note| note.contains("not used")),
+            "{notes:?}"
+        );
+        // The rows keep their plain text.
+        let format = app.playlist_title_format().engine_format();
+        assert!(!format.is_enabled(), "the format is not used");
+        assert_eq!(
+            app.playlist_label(id, &format),
+            "track0.mp3",
+            "the plain text stays"
+        );
+        // And the reason names what is wrong with the format.
+        let reason = app
+            .set_playlist_title_format(true, "%title")
+            .expect_err("the format is refused");
+        assert!(reason.contains("field"), "{reason}");
+    }
+
+    /// The chosen title format is persisted with the other UI state, so it
+    /// survives a restart (the app keeps it in the configuration file; see
+    /// `config::PLAYLIST_TITLE_FORMAT_KEY`).
+    #[test]
+    fn the_playlist_title_format_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rustamp.toml");
+        let mut app = test_app();
+        app.set_config_path(Some(path.clone()));
+        add_entries(&mut app, 2);
+        app.set_playlist_title_format(true, "%filename%")
+            .expect("the format can be used");
+        app.save_config().expect("the config is written");
+
+        let loaded = crate::config::load(Some(&path)).expect("the config loads");
+        assert_eq!(
+            loaded.playlist_title_format,
+            Some(crate::title_format::TitleFormatSetting::new(
+                true,
+                "%filename%"
+            ))
+        );
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+        // A new player built from that file comes up with the same format.
+        let mut restarted = test_app();
+        let setting = loaded
+            .playlist_title_format
+            .expect("the file names a format");
+        restarted
+            .set_playlist_title_format(setting.enabled, &setting.format)
+            .expect("the format can be used");
+        assert!(restarted.playlist_title_format().enabled);
+        assert_eq!(restarted.playlist_title_format().format, "%filename%");
+    }
+
+    /// A long format does not change the row height, and its text does not
+    /// leave the row's band: the row cuts the text off at its width.
+    #[test]
+    fn a_long_format_stays_inside_the_row_band() {
+        let mut app = test_app();
+        add_entries(&mut app, 8);
+        let before = app.render_playlist();
+        let pitch = app.playlist().row_pitch();
+        let rows = app.playlist().visible_rows();
+        app.set_playlist_title_format(true, &"x".repeat(2_000))
+            .expect("the format can be used");
+        let after = app.render_playlist();
+        assert_eq!(after.width(), before.width(), "the frame is as wide");
+        assert_eq!(after.height(), before.height(), "the frame is as tall");
+        assert_eq!(
+            app.playlist().row_pitch(),
+            pitch,
+            "the row height did not change"
+        );
+        assert_eq!(
+            app.playlist().visible_rows(),
+            rows,
+            "the rows did not change"
+        );
+        // Every pixel the long format changed is inside a row: the text is
+        // cut off at the row's width, so it cannot reach the rails or the
+        // scrollbar.
+        for y in 0..after.height() as i32 {
+            for x in 0..after.width() as i32 {
+                if before.pixel(x, y) == after.pixel(x, y) {
+                    continue;
+                }
+                let inside_a_row = (0..rows).any(|row| {
+                    rustamp_ui::playlist_window::row_rect(row, pitch).is_some_and(|rect| {
+                        rect.x <= x && x < rect.right() && rect.y <= y && y < rect.bottom()
+                    })
+                });
+                assert!(inside_a_row, "the pixel at ({x}, {y}) is outside the rows");
+            }
+        }
     }
 
     #[test]

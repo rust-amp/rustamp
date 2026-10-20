@@ -3337,7 +3337,8 @@ mod tests {
             .unwrap();
         presenter.sync_window_state();
         presenter.sync_window_layouts_to_app();
-        let saved = crate::config::serialize_honest(&presenter.app.current_config(), None).unwrap();
+        let saved =
+            crate::config::serialize_honest(&presenter.app.current_config(), None, None).unwrap();
         let config = crate::config::parse(&saved).unwrap();
         let restored_app = App::new(AppOptions {
             config,
@@ -3598,6 +3599,7 @@ mod tests {
                         self.presenter.sync_window_layouts_to_app();
                         let text = crate::config::serialize_honest(
                             &self.presenter.app.current_config(),
+                            None,
                             None,
                         )
                         .unwrap();
