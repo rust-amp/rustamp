@@ -698,6 +698,39 @@ impl PluginRegistry {
         entry.plugin.input_unpause().map_err(HandoffError::from)
     }
 
+    /// Stop the input plugin's playback (S09 §3.5 step 6, S09 §3.1 offset
+    /// 0x48).
+    ///
+    /// The host calls the **input plugin's** `stop` and nothing else: "User
+    /// stop: the host calls `stop()`" (S09 §3.5 step 6). The rest of the step
+    /// is the plugin's own work — it stops its decode thread, closes the
+    /// output it drives and calls the host's `analyzer_deinit` (S09 §3.1
+    /// offset 0x48, §3.5 step 6). The host calls no output callback of its
+    /// own here: the output's `close` belongs to the plugin's decode thread
+    /// (S09 §3.6, §3.7, §4.2 step 3), and a host-side close would close the
+    /// output a second time.
+    ///
+    /// The route keeps **no playback state**, exactly like
+    /// [`play_input`](Self::play_input), [`seek_input`](Self::seek_input),
+    /// [`pause_input`](Self::pause_input) and
+    /// [`unpause_input`](Self::unpause_input): it forwards the request and
+    /// reports what the plugin did. A stop after a play therefore reaches the
+    /// plugin, which closes the output it opened; a stop without a play
+    /// reaches the plugin as well, and what a stop without a stream means is
+    /// the plugin's own business (S09 §3.1 offset 0x48). A second stop is
+    /// **not** swallowed by the host either: the plugin's `stop` runs again
+    /// and the plugin decides what that means for its stream.
+    ///
+    /// The call belongs on the UI thread and must not block for long
+    /// (S09 §3.6). A fault in the plugin's `stop` names the plugin: the call
+    /// runs inside the loader's call scope (see
+    /// [`crate::fault::plugin_call_scope`]).
+    #[cfg(any(windows, test))]
+    pub fn stop_input(&self, plugin_id: u32) -> Result<(), HandoffError> {
+        let entry = self.input_entry(plugin_id)?;
+        entry.plugin.input_stop().map_err(HandoffError::from)
+    }
+
     /// What the plugin with this id reports about itself, if it is a general
     /// plugin ([`LoadedPlugin::general_info`]).
     pub fn general_info(&self, plugin_id: u32) -> Option<crate::loader::GeneralModuleInfo> {
