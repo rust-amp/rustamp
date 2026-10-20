@@ -10,6 +10,7 @@ The binary is `rustamp`:
 
 ```text
 rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
+       [--import-winamp-ini [path]]
 ```
 
 ## Headless mode — safe to run anywhere
@@ -236,6 +237,41 @@ fallback (the file's `default`, otherwise the current curve) and the
 precedence (the auto-load runs at the track start only, so a manual change
 during the track is never overwritten; the next track start decides again) are
 Rustamp's design. See `src/eq_autoload.rs`.
+
+## Importing a Winamp `winamp.ini`
+
+A user who switches over from the reference player brings a `winamp.ini` with
+them. `--import-winamp-ini` imports it: the file is **only read**, never
+written to, and what the import produces is our own configuration
+(`rustamp.toml`), which the player saves on clean exit.
+
+```text
+rustamp --import-winamp-ini C:\Users\me\Winamp\winamp.ini   # import that file
+rustamp --import-winamp-ini                                # ask for the file
+```
+
+Without a path the presenter opens the standard file-open dialog (filter
+`*.ini`, `rustamp_platform::pick_winamp_ini_file`) from the tick and imports
+what the user picks. The path has to follow the switch directly, so the switch
+comes before the file to play.
+
+The import takes over what the running player can take over at once: the
+volume, the balance, the equalizer (the enabled flag, the auto flag, the
+preamp and the ten bands), the playback modes, the window flags (always on
+top, double size, easy move), the shade and the visibility of the windows, the
+playlist editor's font size and the skin. The window **placement** stays in the
+configuration, where the player restores it when it starts.
+
+Everything the player has no setting for is **reported**, one line per key,
+and never dropped silently. `src/winamp_ini.rs` holds the mapping table: which
+key becomes which setting, which keys we cannot honour and why, and which of
+our settings the reference has no key for. The report also names the two
+readings that are ours and not the spec's (the direction of the balance key
+and the file's own unit for the equalizer's values).
+
+The parser is pure (`IniFile::parse`): sections, `key=value`, an empty value,
+CRLF, no quoting. A line it cannot read is reported and skipped — it never
+stops the import. A key the file does not carry leaves the setting as it is.
 
 ## The skins folder
 

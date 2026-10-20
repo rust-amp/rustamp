@@ -163,6 +163,29 @@ pub fn pick_eqf_file(raw_owner: isize, title: &str) -> Result<Option<PathBuf>, F
         .next())
 }
 
+/// The file types the Winamp configuration import dialog offers.
+///
+/// Own choice: the `.ini` files first, `All files` last so a file the user
+/// named otherwise stays reachable.
+pub const INI_FILTERS: &[(&str, &str)] = &[("Winamp configuration", "*.ini"), ("All files", "*.*")];
+
+/// Shows the file-open dialog for one Winamp configuration file (`*.ini`).
+///
+/// The import reads the file the user chooses and never writes to it, so
+/// this is the plain open dialog: there is nothing to confirm and nothing to
+/// overwrite.
+///
+/// Returns `None` when the user cancelled. Same contract as
+/// [`pick_media_files`]: call on the UI thread.
+pub fn pick_winamp_ini_file(
+    raw_owner: isize,
+    title: &str,
+) -> Result<Option<PathBuf>, FileDialogError> {
+    Ok(pick_files(raw_owner, title, INI_FILTERS, false)?
+        .into_iter()
+        .next())
+}
+
 #[cfg(windows)]
 fn pick_files(
     raw_owner: isize,
@@ -669,6 +692,19 @@ mod tests {
                 .all(|(label, patterns)| !label.is_empty() && patterns.contains('*'))
         );
         assert_eq!(MEDIA_FILTERS.last().map(|(_, p)| *p), Some("*.*"));
+    }
+
+    /// The Winamp configuration dialog offers the `.ini` files, and keeps
+    /// `All files` last so a file named otherwise stays reachable.
+    #[test]
+    fn the_ini_filters_offer_the_configuration_and_keep_all_files_last() {
+        assert_eq!(INI_FILTERS[0], ("Winamp configuration", "*.ini"));
+        assert!(
+            INI_FILTERS
+                .iter()
+                .all(|(label, patterns)| !label.is_empty() && patterns.contains('*'))
+        );
+        assert_eq!(INI_FILTERS.last().map(|(_, p)| *p), Some("*.*"));
     }
 
     /// The HTML dialog offers the one file type the document is, and keeps

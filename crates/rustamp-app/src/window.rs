@@ -1618,6 +1618,50 @@ impl Windowed {
         eprintln!("rustamp: a native save dialog is only implemented on Windows");
     }
 
+    /// Shows the native dialog for a Winamp configuration file and imports
+    /// it (S12).
+    ///
+    /// The user picks the `winamp.ini` the reference player wrote, and the
+    /// import reads it: the file is never written to. What the import could
+    /// not honour is printed, so the user sees what was left out.
+    ///
+    /// The dialog runs its own modal message loop, so it is opened from the
+    /// tick and never from a window procedure (the rule the tray popup
+    /// follows).
+    fn drain_winamp_ini_import(&mut self) {
+        if !self.app.take_winamp_ini_import_request() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let owner = self.raw_main_window();
+            match rustamp_platform::pick_winamp_ini_file(owner, "Import Winamp configuration") {
+                Ok(None) => {} // User cancelled
+                Ok(Some(path)) => {
+                    match self.app.import_winamp_ini(&path) {
+                        Ok(report) => {
+                            println!(
+                                "rustamp: imported {} ({})",
+                                path.display(),
+                                report.summary()
+                            );
+                            for line in report.lines() {
+                                println!("rustamp: {line}");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("rustamp: the Winamp configuration was not imported: {error}")
+                        }
+                    }
+                    self.request_redraw();
+                }
+                Err(error) => eprintln!("rustamp: no file dialog: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        eprintln!("rustamp: a native file dialog is only implemented on Windows");
+    }
+
     /// Shows the native save dialog for the HTML playlist (S03 §2 `40292`).
     ///
     /// `Ctrl+Alt+G` in the playlist editor and the MISC menu's "Generate HTML
@@ -2909,6 +2953,7 @@ impl ApplicationHandler for Windowed {
         self.drain_playlist_misc_menu();
         self.drain_eq_menu();
         self.drain_media_pick();
+        self.drain_winamp_ini_import();
         self.drain_save_playlist();
         self.drain_html_playlist();
         self.drain_prefs();

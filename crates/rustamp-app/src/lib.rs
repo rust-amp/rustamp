@@ -66,6 +66,9 @@
 //!   it loads anything), and re-attaching (or restarting) it when it dies —
 //!   off the audio path, degrading to detached.
 //! * [`window`] — the `winit`/`softbuffer` shell for the real player.
+//! * [`winamp_ini`] — the import of a Winamp 2.95 `winamp.ini` (S12): the
+//!   parser for the file's shape, the mapper onto our configuration and the
+//!   table that says which key becomes which setting.
 //!
 //! [`run`] is the entry point the `rustamp` binary calls.
 //!
@@ -114,6 +117,7 @@ pub mod routing;
 pub mod skin;
 pub mod skin_folder;
 pub mod supervise;
+pub mod winamp_ini;
 pub mod window;
 
 use rustamp_core::command::Command;
@@ -121,6 +125,26 @@ use rustamp_core::command::Command;
 use crate::app::{App, AppOptions};
 use crate::cli::OutputChoice;
 use crate::config::ConfigSource;
+
+/// Imports a Winamp configuration and prints what the import did.
+///
+/// The file is only read: the import never writes to it, and what it
+/// produces is our own configuration, which the player saves on clean exit.
+fn import_winamp_ini(app: &mut App, path: &std::path::Path) {
+    match app.import_winamp_ini(path) {
+        Ok(report) => {
+            println!(
+                "rustamp: imported {} ({})",
+                path.display(),
+                report.summary()
+            );
+            for line in report.lines() {
+                println!("rustamp: {line}");
+            }
+        }
+        Err(error) => eprintln!("rustamp: the Winamp configuration was not imported: {error}"),
+    }
+}
 
 /// Runs the player for a parsed command line.
 ///
@@ -192,6 +216,25 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     app.manage_host(crate::supervise::Supervisor::new(
         crate::supervise::ProcessBackend::from_search().with_approvals(approvals),
     ));
+
+    // ----- a Winamp configuration to import (S12) -----
+    match &args.import_winamp_ini {
+        cli::WinampIniImport::None => {}
+        cli::WinampIniImport::File(path) => import_winamp_ini(&mut app, path),
+        cli::WinampIniImport::Ask => {
+            if args.output == OutputChoice::Null {
+                // The native dialog needs an owner window, and the headless
+                // run has none.
+                eprintln!(
+                    "rustamp: the Winamp configuration import needs a window; name the file on \
+                     the command line"
+                );
+            } else {
+                // The presenter opens the dialog and hands the file back.
+                app.request_winamp_ini_import();
+            }
+        }
+    }
 
     match args.output {
         // ----- headless test mode: no window -----
