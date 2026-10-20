@@ -2,12 +2,17 @@
 
 Lane: spec audit of the S13 draft (CLEANROOM.md §3, step 3).
 Auditor: spec auditor subagent. Audit date: 2026-10-20.
+Second pass: 2026-10-20 — a fact in the audited spec was found to be wrong
+(`/ADD` **is** a switch). The spec is amended in place; this note records what
+changed, why the first pass missed it, and what else in the spec rests on the
+same kind of evidence.
 
 | Artifact | Path in this worktree |
 |---|---|
 | Audited spec | `specs/S13-command-line.md` (new) |
 | Index row | `specs/README.md` — S13 status `not started` → `audited` |
 | This note | `docs/notes/spec-audit-s13.md` (new) |
+| Second pass | `specs/S13-command-line.md` (amended in place) and this note. `specs/README.md` is unchanged — S13's row already reads `audited`. |
 
 No code was touched. `cargo fmt --all -- --check` stays green (exit 0), which
 is expected: this lane changes Markdown only.
@@ -42,12 +47,20 @@ the draft contains no runtime observation at all.
 ## What stayed (unchanged in substance)
 
 - Every switch spelling and the complete list of seven switches: `/CLASS=`,
-  `/CONFIG=`, `/BOOKMARK`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL`.
+  `/CONFIG=`, `/BOOKMARK`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL`. —
+  the seven spellings stand, but the word "complete" was the falsified part:
+  the list has **eight** switches, `/ADD` was missing, and the completeness
+  itself is now an open question (§ *Second pass* below, §5 item 13 of the
+  spec).
 - The forms: a leading `/`; the value directly after `=` with no space; the
   bookmark form and its `%s` template; several paths per command line, mixed
-  with the switches.
+  with the switches. — the first pass's rendering of the bookmark command line
+  (`"/BOOKMARK <path>"`) was superseded by the exact string
+  `"%s" /BOOKMARK "%%1"`.
 - The negative list: no `/ADD`, `/PLAY`, `/NEW`, `/EJECT` or `/TASKBAR` in
-  this build, and an unknown token is a file argument.
+  this build, and an unknown token is a file argument. — **the `/ADD` part of
+  this bullet is wrong and is corrected in the second pass below**; the other
+  four names stand, scoped to the reference's switch list.
 - The three ProgIDs `Winamp.File`, `Winamp.PlayList`, `Winamp.SkinZip`; the
   verb names `open`, `Play`, `Enqueue`, `ListBookmark`, `install`; the
   directory row's `Play` / `Enqueue` and its `Winamp.Play` / `Winamp.Enqueue`
@@ -198,6 +211,171 @@ none of them is a fact the draft did not contain):
    given with an elided prefix, and the spec keeps the elision: the full key
    path is not in the draft.
 
+## Second pass (2026-10-20) — the `/ADD` correction
+
+| | |
+|---|---|
+| Trigger | A fact in the audited spec was found to be wrong: §1 said the reference carries no `/ADD`. |
+| Evidence | The revised draft at `D:\code\rustamp-sandbox\spec-drafts\S13-command-line.draft.md`, which now carries `/ADD` as a real switch and a note on why the first pass missed it. |
+| What was **not** done | No binary was run in this lane, no dirty material was read beyond that draft, no code was touched. The reference is still not run for this spec. |
+| Changed | `specs/S13-command-line.md` (§0, §1, §3, §4, §5) and this note. `specs/README.md` is unchanged — S13's row already reads `audited`. |
+
+### What was wrong
+
+Two sentences of the audited spec were wrong, and the second was the first's
+conclusion:
+
+1. §1: "**No** `/ADD`, `/PLAY`, `/NEW`, `/EJECT` or `/TASKBAR` is in this
+   build."
+2. §1: "The reference recognises **exactly** these switches. The list is
+   complete for this build."
+
+`/ADD` is a real switch. The reference registers the `Enqueue` verb with the
+command line `"%s" /ADD "%%1"`, so the switch means "enqueue, do not play" —
+the counterpart of `/BOOKMARK`, whose verb is registered with the same shape,
+`"%s" /BOOKMARK "%%1"`. The first pass put `/ADD` into the negative list and
+therefore also published the completeness claim that the negative list
+supported. Both are corrected.
+
+The wrong fact was not a slip in the table: it was a **conclusion drawn from a
+search that could not see the switch**.
+
+### Why the first pass missed it — the quote-prefix trap
+
+The first pass looked for the reference's switch names among the strings that
+**begin with `/`**. The reference spells `/ADD` and `/BOOKMARK` inside a
+registered command line, and there the string does not begin with the switch —
+it begins with a quote, and the switch stands in the middle of it, behind the
+program path:
+
+```
+"%s" /ADD "%%1"
+"%s" /BOOKMARK "%%1"
+```
+
+A search restricted to `/`-prefixed tokens never sees either switch. The
+result was a list that looked complete and was missing an entry — and, worse,
+an absence claim that looked proven.
+
+### The class of the error, and what it says about the rest of the spec
+
+The miss is not a one-off; it is what happens when a **method is restated as
+a fact**. Two things in S13 rested on that method:
+
+1. **The completeness claim.** "Complete for this build" was the search
+   method (`/`-prefixed strings) turned into a property of the reference. It
+   has now been falsified once, by the switch that the same method could not
+   see. The spec now states the list as the reference's own switch list and
+   puts the question "is that every switch?" into §5 (item 13).
+2. **The negative list.** "No `/PLAY`, `/NEW`, `/EJECT` or `/TASKBAR`" is the
+   same absence claim about the same string population: a switch the
+   reference spells quoted would not have been seen by that search either.
+   The second pass therefore **scopes** those four names to the reference's
+   switch list — the scope the evidence supports — and does not repeat the
+   claim at the wider scope, because nothing in the tree supports it. The
+   four names themselves are not contradicted by anything: the switch list
+   gained one entry, it did not lose any.
+
+Everything else in S13 that reads as "there is no X" was checked and does not
+belong to this class:
+
+| Claim in S13 | Kind of claim | Verdict |
+|---|---|---|
+| §1 "the list is complete for this build" | absence claim about the **binary** | **false** — corrected and scoped. |
+| §1 "No `/PLAY`, `/NEW`, `/EJECT`, `/TASKBAR` is in this build" | absence claim about the **binary** | stands only at the scope "not in the reference's switch list"; the wider claim rested on the same narrow search and is no longer made. |
+| §3 "the display names of the other verbs are not recorded" | absence in **our record** | stands. |
+| §3 "What the `DropTarget` entries carry as their value is not recorded" | absence in our record | stands. |
+| §2 "no audited spec currently names it" (the hand-over message) | absence in the **repository** | stands — a repository-wide search has no dirty-source blind spot. |
+| §5 item 7 "the default the switch table carries … was not read out" | gap in our reading | stands. |
+| §3 the verb counts (four / one / two) | completeness claim about the **verbs** per handler | **not independently established.** The counts come from the same kind of string reading that missed `/ADD`; nothing contradicts them and the table stands, but "four verbs per media file" is the table's content, not a proof that no fifth verb exists. Left as it is, and named here. |
+| §4 "do not add others: the list is complete for this build" | instruction derived from a completeness claim | **corrected.** |
+
+The generalisation this correction forces on the spec pipeline: **in a spec
+built from strings, a "there is no X" sentence is only as strong as the shape
+of the search behind it.** S13's failure mode is the sharpest version of it —
+the search looked for tokens beginning with `/`, and the two switches the
+reference spells inside a quoted command line never began with `/`.
+
+### What changed in `specs/S13-command-line.md`
+
+| Change | Reason |
+|---|---|
+| Header: `Audit date: 2026-10-20` kept, a `Second audit pass:` line added | The change history has to be visible in the file itself; the first audit date is not overwritten. |
+| §0: the string-fact row now also covers "a registered command line" | `"%s" /ADD "%%1"` is a new kind of string fact in this spec. |
+| §1: the switch table gained the `/ADD` row, with its form `/ADD <path>`, its pairing (the `Enqueue` verb, §3) and its meaning marked as a **reading** of the name | The switch exists; what it *does* is still a reading, like `Play`/`Enqueue` in §3. |
+| §1: "recognises **exactly** these switches … complete for this build" → "recognises the switches below" | The completeness claim was falsified. |
+| §1: a new **Scope of the list** bullet | The list is what the reference's switch names yield; it is not proven to be every switch (§5 item 13). |
+| §1: the negative list now names only `/PLAY`, `/NEW`, `/EJECT`, `/TASKBAR`, scoped to "the reference's switch list" | `/ADD` leaves the negative list — it is a switch. |
+| §1: the sentence "the corresponding behaviours are reached through the shell verbs … rather than through the command line" now names the exception | `Enqueue` is reached through the command line (`/ADD`) *and* through the verb; it is the one case where a verb and a switch are the same thing. |
+| §1: the forms bullets give the registered bookmark command line exactly (`"%s" /BOOKMARK "%%1"`), add the same shape for `/ADD`, and say that `/ADD` and `/BOOKMARK` take their path in the argument that follows the switch | The first pass rendered the bookmark command line as `"/BOOKMARK <path>"`; the revised draft gives the exact string. And with a third kind of switch form in the table, "the two value-taking switches" had become ambiguous. |
+| §3: the `Enqueue` cell of all three verb rows carries the arrow to `/ADD`, and a new bullet says the `Enqueue` verb **is** `/ADD`, with its registered command line | The verb rows had to become consistent with the new switch. |
+| §3: the `Play`/`Enqueue` reading bullet now says the `Enqueue` reading is corroborated by the switch name while `Play` stands on the name alone | The reading marker stays where it belongs. |
+| §4: the parse rule mentions a switch that takes the following argument as its path; the completeness note points at §5 | `/ADD <path>` is one switch and one path, not two file arguments; and "the list is complete for this build" was the wrong instruction to hand an implementer. |
+| §5: item 9 reworded to the exact registered form; item 11 now also asks for the other verbs' registered command lines; new items 13 and 14 | 13 is the completeness question the correction opened. 14 is the naming discrepancy the revised draft exposed (`Bookmark` vs. `ListBookmark`). The numbering of items 1–12 is unchanged, so the references in `crates/rustamp-app/src/cli.rs` (S13 §5.1 … §5.12) still point where they pointed. |
+
+### What the correction does not change
+
+- The other seven switches, their forms and their pairings stand.
+- `/PLAY`, `/NEW`, `/EJECT` and `/TASKBAR` are still not in the reference's
+  switch list. The list has one entry more than the first pass published, not
+  fewer.
+- The `Enqueue` verb, the `DropTarget` keys, the ProgIDs, the verb names and
+  the counts of §3 stand.
+- The single-instance shape of §2 stands.
+- The open list keeps all twelve items; the correction added two and removed
+  none.
+- The `Bookmark` / `ListBookmark` discrepancy is **not** resolved by this
+  pass: the revised draft says "the `Bookmark` verb", the audited table says
+  `ListBookmark`. The spec therefore speaks of "the verb that registers
+  `/BOOKMARK`" and leaves the name open (§5 item 14).
+
+### Open points for the dirty room
+
+1. **The placeholder spelling.** The revised draft writes the registered
+   command lines with `%%1`. The first pass had rendered the same string as
+   `"/BOOKMARK <path>"`. The spec carries `%%1` verbatim, as the draft gives
+   it; a re-read should confirm the exact placeholder (one `%1` or two).
+2. **`Bookmark` vs. `ListBookmark`** (§5 item 14) — one verb or two.
+3. **The completeness of the switch list** (§5 item 13) — the dirty room
+   should read the switch names out of the reference in a shape that is not
+   biased by a leading `/` or a leading quote.
+4. **The completeness of the verb table** — the four / one / two counts of §3
+   come from the same kind of reading that missed `/ADD`.
+5. **The measurement in `docs/HANDOFF.md`** — see below.
+
+### Downstream: what the correction breaks (not this lane's files)
+
+1. **The implementation is now non-conformant.** `crates/rustamp-app/src/cli.rs`
+   was written to the wrong §1: its module docs say "`/ADD`, `/PLAY`, `/NEW`,
+   `/EJECT` and `/TASKBAR` are **not** switches here", and two of its tests
+   assert that `/ADD` is a file argument
+   (`an_unknown_slash_token_is_a_file_argument` and
+   `the_switches_the_reference_does_not_have_are_file_arguments`). With the
+   corrected spec, `/ADD` has to be parsed as a switch that takes the path
+   behind it, the second test loses `/ADD` from its list, the conformance
+   table's row "§1 no `/ADD`, `/PLAY`, `/NEW`, `/EJECT`, `/TASKBAR` |
+   matches" has to go, and the module's "the `/` family stays exactly the
+   spec's list" sentence has to be re-worded. This lane owns no code.
+2. **`docs/tasks/F2-single-instance.md`** — its "Reconciliation with S13"
+   section states the same wrong behaviour ("`/ADD`, `/PLAY`, `/NEW`,
+   `/EJECT` and `/TASKBAR` are file arguments, not errors") and closes with
+   "All twelve stay open"; the open list has fourteen entries now. The card
+   is not this lane's file.
+3. **The tree already held a measurement that contradicts the audited spec.**
+   `docs/HANDOFF.md` (entry of 2026-10-16, run `20261016-212527`) records:
+   "`/ADD` enqueues without playing and the one-letter title keeps the marquee
+   static (both hypotheses confirmed by this run after two refused runs)". That
+   is a runtime observation of the reference with `/ADD` on the command line,
+   and it was in the tree while the spec was audited — the first pass's "no
+   `/ADD` in this build" was contradicted by the repository itself. The spec
+   still carries `/ADD` on the draft's string evidence and claims no
+   measurement, because §0 states that the reference was not run for this
+   spec and promoting a handoff summary to a spec fact needs the run record
+   behind it. The dirty room should reconcile the two: either the measurement
+   joins S13 — and §0, the header's evidence classes and the "reading" marker
+   on `/ADD` change with it — or it stays a handoff note and S13 keeps the
+   string evidence.
+
 ## Notes for the orchestrator (not this lane's files)
 
 - `docs/tasks/F2-single-instance.md` says "S13 does not exist as a spec" and
@@ -210,9 +388,16 @@ none of them is a fact the draft did not contain):
 - Neither file is owned by this lane and neither was touched.
 - The index rows for S10 and S13 disagree with the tree (S10's file exists,
   its row still reads "not started"); S13's row is fixed here.
+- The second pass (§ *Second pass*) changes the conformance picture for
+  `crates/rustamp-app/src/cli.rs` and for the F2 card: both were written
+  against the wrong §1 and need a follow-up lane. Neither file is owned by
+  this lane and neither was touched.
 
 ## Verification
 
 - `cargo fmt --all -- --check` → exit 0 (green; this lane changed Markdown
   only).
 - `git status --short` → the three artifacts above, plus nothing else.
+- Second pass: `cargo fmt --all -- --check` → exit 0 (green; Markdown only).
+- Second pass: `git status --short` → `specs/S13-command-line.md` and
+  `docs/notes/spec-audit-s13.md`, plus nothing else.
