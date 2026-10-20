@@ -47,18 +47,37 @@ fn test_app_with_config(config: Config, config_path: Option<PathBuf>) -> App {
     app
 }
 
+/// The honest serialization writes exactly the settings the player honours
+/// (the audit table in `rustamp_app::config` names them). The round trip
+/// therefore carries a **non-default value for every one of them**: a
+/// setting that stays at its default cannot be told apart from a setting the
+/// writer dropped, because the loader falls back to exactly that default.
+///
+/// The windows carry every `WindowId` variant (including `Gen(n)` and
+/// `Video`) and both a size and no size, so a writer that drops the size of
+/// a window or misformats a window id fails here.
 #[test]
 fn config_round_trip_honours_all_supported_fields() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("roundtrip.toml");
 
-    let mut config = Config::default();
+    let mut config = Config {
+        // The schema marker: a value that differs from the current version,
+        // so a writer that writes a constant instead of the configured one
+        // fails.
+        version: 7,
+        ..Config::default()
+    };
     config.audio.volume = 150;
     config.audio.balance = -40;
+    config.audio.output_mode = OutputMode::Exclusive;
+    config.audio.replaygain = ReplayGainMode::Album;
+    config.audio.device = Some("Speakers (Realtek)".to_string());
     config.ui.skin = Some(PathBuf::from("skins/amplifier.wsz"));
     config.ui.double_size = true;
     config.ui.always_on_top = true;
     config.ui.easy_move = false;
+    config.ui.snap_distance = 25;
     config.ui.windows = vec![
         WindowLayout {
             id: WindowId::Main,
@@ -119,8 +138,12 @@ fn config_round_trip_honours_all_supported_fields() {
     config.eq.state.auto = true;
     config.eq.state.preamp = 5.0;
     config.eq.state.bands = [1.5, 2.5, 3.5, 4.5, 5.5, -1.5, -2.5, -3.5, -4.5, -5.5];
+    config.plugins.plugin_dir = Some(PathBuf::from("plugins"));
+    config.plugins.disabled = vec!["bad.dll".to_string()];
 
-    save(&config, None, &path).expect("save config");
+    // The playlist editor's font size is the app's own setting outside the
+    // configuration tree; it is written only when the user chose one.
+    save(&config, Some(18), &path).expect("save config");
     assert!(path.exists(), "config file exists on disk");
 
     let loaded = load(Some(&path)).expect("load config");
@@ -130,18 +153,85 @@ fn config_round_trip_honours_all_supported_fields() {
         "honest roundtrip emits no warnings: {:?}",
         loaded.warnings
     );
+    assert_eq!(
+        loaded.playlist_font_size,
+        Some(18),
+        "the playlist font size survives the round trip"
+    );
 
-    assert_eq!(loaded.config.audio.volume, 150);
-    assert_eq!(loaded.config.audio.balance, -40);
+    // Field by field, so a failure names the setting that broke.
+    assert_eq!(loaded.config.version, 7, "version");
+    assert_eq!(loaded.config.audio.volume, 150, "audio.volume");
+    assert_eq!(loaded.config.audio.balance, -40, "audio.balance");
+    assert_eq!(
+        loaded.config.audio.output_mode,
+        OutputMode::Exclusive,
+        "audio.output_mode"
+    );
+    assert_eq!(
+        loaded.config.audio.replaygain,
+        ReplayGainMode::Album,
+        "audio.replaygain"
+    );
+    assert_eq!(
+        loaded.config.audio.device,
+        Some("Speakers (Realtek)".to_string()),
+        "audio.device"
+    );
     assert_eq!(
         loaded.config.ui.skin,
-        Some(PathBuf::from("skins/amplifier.wsz"))
+        Some(PathBuf::from("skins/amplifier.wsz")),
+        "ui.skin"
     );
-    assert!(loaded.config.ui.double_size);
-    assert!(loaded.config.ui.always_on_top);
-    assert!(!loaded.config.ui.easy_move);
-    assert_eq!(loaded.config.ui.windows, config.ui.windows);
-    assert_eq!(loaded.config.eq.state, config.eq.state);
+    assert!(loaded.config.ui.double_size, "ui.double_size");
+    assert!(loaded.config.ui.always_on_top, "ui.always_on_top");
+    assert!(!loaded.config.ui.easy_move, "ui.easy_move");
+    assert_eq!(loaded.config.ui.snap_distance, 25, "ui.snap_distance");
+    assert_eq!(loaded.config.eq.state, config.eq.state, "eq.state");
+    assert_eq!(
+        loaded.config.plugins.plugin_dir,
+        Some(PathBuf::from("plugins")),
+        "plugins.plugin_dir"
+    );
+    assert_eq!(
+        loaded.config.plugins.disabled,
+        vec!["bad.dll".to_string()],
+        "plugins.disabled"
+    );
+
+    // Every window keeps every field, including its size.
+    assert_eq!(
+        loaded.config.ui.windows.len(),
+        config.ui.windows.len(),
+        "ui.windows: every window survives"
+    );
+    for (written, loaded_window) in config
+        .ui
+        .windows
+        .iter()
+        .zip(loaded.config.ui.windows.iter())
+    {
+        assert_eq!(loaded_window.id, written.id, "ui.windows: the id survives");
+        assert_eq!(loaded_window.x, written.x, "ui.windows: x survives");
+        assert_eq!(loaded_window.y, written.y, "ui.windows: y survives");
+        assert_eq!(
+            loaded_window.visible, written.visible,
+            "ui.windows: visible survives"
+        );
+        assert_eq!(
+            loaded_window.shaded, written.shaded,
+            "ui.windows: shaded survives"
+        );
+        assert_eq!(
+            loaded_window.width, written.width,
+            "ui.windows: width survives"
+        );
+        assert_eq!(
+            loaded_window.height, written.height,
+            "ui.windows: height survives"
+        );
+    }
+
     assert_eq!(
         loaded.config, config,
         "entire loaded configuration must equal written configuration"

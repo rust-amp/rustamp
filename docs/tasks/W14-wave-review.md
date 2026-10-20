@@ -77,8 +77,8 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 
 | # | Claim | Verdict | Evidence (file:line) | Smallest reproduction |
 |---|---|---|---|---|
-| C5-1 | The new all-fields test covers every field in the configuration | **FALSE** | `crates/rustamp-app/src/config.rs:487-550` (`config_round_trip_honours_all_supported_fields`) | `config_round_trip_honours_all_supported_fields` sets `width: None, height: None` on all windows (lines 505-506, 514-515, 523-524). It does not test `width: Some(...)` or `height: Some(...)`. It also tests only unit window variants (`Main`, `Equalizer`, `Playlist`), omitting `WindowId::Gen(n)` and `WindowId::Video`. |
-| C5-2 | Core configuration serialization (`toml_roundtrip`) covers all fields | **FALSE** | `crates/rustamp-core/src/config.rs:207-238` | `toml_roundtrip` leaves `audio.balance`, `audio.output`, `audio.buffer_ms`, `audio.fadeout_ms`, `audio.gapless`, `audio.replaygain`, `ui.double_size`, `ui.always_on_top`, `ui.easy_move`, `ui.snap_distance`, `playlist.*`, and `plugins.plugin_dir` unset at their defaults. |
+| C5-1 | The new all-fields test covers every field in the configuration | **FALSE** — *was false; **fixed 2026-10-20** (finding F6 below): every honoured setting now carries a non-default value, so a writer that forgets one fails the round trip* | `crates/rustamp-app/tests/config.rs` (`config_round_trip_honours_all_supported_fields`) | The evidence the review quotes is a stale snapshot: the tree already carried `width: Some(...)` / `height: Some(...)` and the `WindowId::Gen(n)` and `WindowId::Video` variants (commit `99b2cb3`, 20 minutes before the review was recorded). What was still open: seven **honoured** settings — `version`, `audio.output_mode`, `audio.replaygain`, `audio.device`, `ui.snap_distance`, `plugins.plugin_dir`, `plugins.disabled` — stayed at their defaults, and a writer that forgot them was invisible, because the loader falls back to exactly that default. The round trip now sets every one of them to a non-default value and compares the result field by field. |
+| C5-2 | Core configuration serialization (`toml_roundtrip`) covers all fields | **FALSE** — *was false; **fixed 2026-10-20** (finding F6 below): the round trip compares field by field, and a second test proves that every field of the fixture differs from its default* | `crates/rustamp-core/src/config.rs` (`toml_roundtrip`, `every_field_of_the_configuration_differs_from_its_default`) | The evidence the review quotes is a stale snapshot: commit `99b2cb3` had already set every field of every configuration type to a non-default value, including `audio.balance`, `audio.output`, `audio.buffer_ms`, `ui.double_size`, `ui.always_on_top`, `ui.easy_move` and all of `playlist.*`. What was still open: the test compared the whole struct only, and nothing pinned the premise that every field differs from its default — a later edit that set a field to its default value would have silently weakened the test without any test failing. |
 | C5-3 | Honest serialization preserves user-configured unhonoured settings | **FALSE** — *was false; **fixed 2026-10-20** (finding F5 below): a save now keeps every setting it does not apply* | `crates/rustamp-app/src/config.rs` (`serialize_honest`, `serialize_preserving`, `save`) and `crates/rustamp-app/src/config_preserve.rs` | Before the fix: the loader warned, but the clean exit rewrote the file with `serialize_honest` and deleted every unhonoured field from disk. After the fix: the save reads the file it is about to overwrite and copies every setting it does not own back, so `playlist.shuffle = true` survives the clean exit. |
 
 ### 6. Cross-Lane Blindspots & Shared Interfaces
@@ -87,7 +87,7 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 |---|---|---|---|---|
 | C6-1 | ReplayGain is integrated end-to-end across the application | **FALSE** — *was false; **fixed 2026-10-20** (finding F7 below): the app reads `audio.replaygain`, hands it to the engine and writes it back* | `crates/rustamp-app/src/app.rs:339` (`engine.set_replaygain_mode(replaygain_mode_to_audio(options.config.audio.replaygain))`), `crates/rustamp-app/src/config.rs` (`serialize_honest` writes `audio.replaygain`; `ignored_fields_in_toml` no longer warns for it) | Before the fix: `rustamp-audio` implemented ReplayGain, but `crates/rustamp-app/src/config.rs` still hardcoded `"replaygain" => Some("ReplayGain is not supported yet")` and `serialize_honest` omitted it. After the fix: the configured mode reaches the engine at startup and survives the save. |
 | C6-2 | The M20 deadlock fix covers resident DSP engine playback | **FALSE** — *was false; **fixed 2026-10-20** (finding F1 below): the production adapter now runs the same lockstep as the helper* | `crates/rustamp-audio/src/resident.rs:1107-1155` (`process_block`, now chunked) vs `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:36-61` (the helper M20 fixed) | M20 fixed the deadlock in the standalone test helper only. The production engine adapter (`process_block` in `resident.rs`) used the single-shot un-chunked write-before-read pattern; it now writes one chunk, reads that chunk back and only then writes the next (`DSP_CHUNK_FRAMES` = 1024 frames, clamped to the in-ring capacity), so the frames in flight never exceed one chunk and the resident never blocks on its back-ring. Pinned by `resident::dsp_hosted_tests::the_lockstep_round_trip_completes_on_a_ring_smaller_than_the_block` and `…::the_un_chunked_round_trip_stalls_where_the_lockstep_one_completes`. |
-| C6-3 | Task card manifest consistency across the wave | **PARTIAL** | Prompt / handoff refers to `N9-config-class.md`, but no such file was committed (`docs/tasks/N9-config.md` or `N9-config-class.md` is absent) | The work was performed under N8 and documented in N8 / W10 finding F1, but the card reference is dangling. |
+| C6-3 | Task card manifest consistency across the wave | **PARTIAL** — *the card reference was already resolved before the review was recorded; see the note in F6 below* | Prompt / handoff refers to `N9-config-class.md`. The review's own evidence is stale: `docs/tasks/N9-config-class.md` **is** in the tree, committed with `99b2cb3` (an ancestor of the review commit `84366d5`) | The work was performed under N8 and documented in N8 / W10 finding F1. The card `docs/tasks/N9-config-class.md` exists and names the wave-67 lane; the review read a snapshot from before it was committed. |
 
 ---
 
@@ -620,6 +620,114 @@ If an advanced user edits `rustamp.toml` to configure `audio.device = "Speakers 
 ---
 
 ### F6 — LOW (proven): Incomplete test coverage in config round-trip tests: `WindowLayout` dimensions and variants remain unexercised in the all-supported-fields test
+
+**Status: FIXED (2026-10-20), with one carve-out named below.** The
+finding's *direction* was right — the round-trip tests were weaker than
+their names claimed — but the review recorded it against a **stale
+snapshot** of the tree, so its literal evidence no longer held when it was
+written.
+
+**What the review reported, and what the tree actually contained.** The
+review quotes `crates/rustamp-app/src/config.rs:487-550` with
+`width: None, height: None` on every window and only the unit window
+variants, and `crates/rustamp-core/src/config.rs:207-238` with
+`audio.balance`, `audio.output`, `audio.buffer_ms`, `ui.double_size`,
+`ui.always_on_top`, `ui.easy_move` and `playlist.*` left at their defaults.
+Commit `99b2cb3` ("Close the configuration writer drift as a class, not as
+two instances", 2026-10-18 00:20) had already rewritten both tests to carry
+a non-default value for every field — including `width: Some(...)` /
+`height: Some(...)` and the `WindowId::Gen(n)` and `WindowId::Video`
+variants. The review was recorded 20 minutes later (`84366d5`, 00:40): the
+snapshot it read was older than the tree it was committed into. The same
+staleness applies to its C6-3 ("the task card `N9-config-class.md` is
+absent") — that card was committed together with `99b2cb3` and is in the
+tree.
+
+**What was still open — and is now closed.** The class-closure card's
+premise is that a round trip sets *every* field to a non-default value. It
+held for the core fixture, but two things were missing:
+
+1. **The app-side round trip left seven honoured settings at their
+   default.** The honest serializer writes exactly the settings the player
+   honours (the audit table in `crates/rustamp-app/src/config.rs`), but the
+   round trip only set `audio.volume`, `audio.balance`, `ui.skin`,
+   `ui.double_size`, `ui.always_on_top`, `ui.easy_move`, `ui.windows` and
+   `eq.state` to a non-default value. `version`, `audio.output_mode`,
+   `audio.replaygain`, `audio.device`, `ui.snap_distance`,
+   `plugins.plugin_dir` and `plugins.disabled` stayed at their defaults — so
+   a writer that forgot one of them was invisible: the loader falls back to
+   exactly that default.
+2. **Nothing pinned the premise.** The core round trip compared the whole
+   struct (`assert_eq!(c, back)`) and set every field to a non-default value
+   by convention only. No test said so: a later edit that set a field to its
+   default value would have silently weakened the test, and no test would
+   have failed.
+
+**What changed.**
+
+| File | Change |
+|---|---|
+| `crates/rustamp-core/src/config.rs` | the fixture moved into `every_field_set()`; `toml_roundtrip` now compares **field by field** (a failure names the field) on top of the whole-struct comparison; the new `every_field_of_the_configuration_differs_from_its_default` makes the premise a checked fact instead of a convention |
+| `crates/rustamp-app/tests/config.rs` | `config_round_trip_honours_all_supported_fields` now sets **every honoured setting** to a non-default value (`version`, `audio.output_mode`, `audio.replaygain`, `audio.device`, `ui.snap_distance`, `plugins.plugin_dir`, `plugins.disabled` on top of the eight it already set), writes the app-owned `ui.playlist_font_size`, and compares the result field by field — including every field of every window layout |
+
+**The carve-out.** The unit test of the same name in
+`crates/rustamp-app/src/config.rs` still uses the old fixture (the honoured
+settings at their defaults). That file belongs to another lane (wave267),
+so it was not touched here; the coverage now lives in the integration test
+`crates/rustamp-app/tests/config.rs`, and the writer cannot lose a setting
+unnoticed any more.
+
+**The field table (the whole configuration).**
+
+| Setting | Written by the honest serializer | Non-default value in the round trip | Pinned by |
+|---|---|---|---|
+| `version` | yes | `7` | core + app |
+| `audio.volume` | yes | `150` | core + app |
+| `audio.balance` | yes | `-40` | core + app |
+| `audio.output_mode` | yes | `Exclusive` | core + app |
+| `audio.replaygain` | yes | `Album` | core + app |
+| `audio.device` | yes (when set) | `Some("Speakers (Realtek)")` | core + app |
+| `audio.output` | no (preserved) | — | core (the TOML contract) |
+| `audio.buffer_ms` | no (preserved) | — | core |
+| `audio.fadeout_ms` | no (preserved) | — | core |
+| `audio.gapless` | no (preserved) | — | core |
+| `ui.skin` | yes (when set) | `Some("skins/amplifier.wsz")` | core + app |
+| `ui.double_size` | yes | `true` | core + app |
+| `ui.always_on_top` | yes | `true` | core + app |
+| `ui.easy_move` | yes | `false` | core + app |
+| `ui.snap_distance` | yes | `25` | core + app |
+| `ui.windows` | yes (when set) | all six `WindowId` variants, four of them sized | core + app |
+| `ui.playlist_font_size` | yes (when chosen) | `Some(18)` | app |
+| `eq.state` | yes | bands, preamp, `enabled = false`, `auto = true` | core + app |
+| `plugins.plugin_dir` | yes (when set) | `Some("plugins")` | core + app |
+| `plugins.disabled` | yes (when set) | `["bad.dll"]` | core + app |
+| `plugins.vis_plugin` | no (preserved) | — | core |
+| `plugins.vis_preset` | no (preserved) | — | core |
+| `playlist.shuffle` | no (preserved) | — | core |
+| `playlist.repeat` | no (preserved) | — | core |
+| `playlist.manual_advance` | no (preserved) | — | core |
+| `playlist.last_playlist` | no (preserved) | — | core |
+
+**The evidence that the new test has teeth.** Every honoured setting was
+mutated in the writer (it writes the default instead of the configured
+value — the N9/F5 class of bug) and the two round-trip tests were run:
+
+| Mutation | the old unit test (`src/config.rs`) | the strengthened test (`tests/config.rs`) |
+|---|---|---|
+| `version` written as `1` | passes (blind) | **fails** |
+| `audio.output_mode` written as `Shared` | passes (blind) | **fails** |
+| `audio.replaygain` written as `Off` | passes (blind) | **fails** |
+| `audio.device` not written | passes (blind) | **fails** |
+| `ui.snap_distance` written as `10` | passes (blind) | **fails** |
+| `plugins.plugin_dir` not written | passes (blind) | **fails** |
+| `plugins.disabled` not written | passes (blind) | **fails** |
+
+The failure names the setting, e.g.
+`assertion 'left == right' failed: plugins.plugin_dir / left: None / right: Some("plugins")`.
+The serializer was restored after the check; the mutation left the tree
+unchanged.
+
+**The original report (unchanged, for the record):**
 
 `crates/rustamp-app/src/config.rs:487-550` contains `config_round_trip_honours_all_supported_fields`.
 Despite its name:
