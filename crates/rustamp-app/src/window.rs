@@ -1906,10 +1906,12 @@ impl Windowed {
     /// A key press while the dialog window is focused.
     ///
     /// The dialog consumes `Enter` (confirm the jump box, the skin browser,
-    /// the open-media dialog, or the load-playlist dialog, which loads the
-    /// chosen playlist file; the preferences dialog is a no-op, its contents
-    /// unmeasured), `Escape` (close), `Backspace`, typed text (the open-media
-    /// and load-playlist fields and the jump box, see [`App::dialog_text`])
+    /// the open-media dialog, the load-playlist dialog, which loads the
+    /// chosen playlist file, or the edit-entry box, which writes the changed
+    /// tags; the preferences dialog is a no-op, its contents unmeasured),
+    /// `Escape` (close), `Backspace`, `Tab` (the edit-entry box moves its
+    /// focus with it), typed text (the open-media and load-playlist fields,
+    /// the jump box and the edit-entry fields, see [`App::dialog_text`])
     /// and the arrows of the skin browser; the window closes itself when the
     /// app reports no open dialog afterwards.
     fn dialog_key_event(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
@@ -1938,11 +1940,11 @@ impl Windowed {
         let modifiers = map_modifiers(self.modifiers);
         // Modified keys stay global (the same key-event path as the main
         // window); plain keys go to the dialog first.
-        if modifiers != Modifiers::NONE {
+        if modifiers != Modifiers::NONE && !dialog_owns_key(key, modifiers) {
             self.key_event(event);
             return;
         }
-        if self.app.dialog_key(key) {
+        if self.app.dialog_key(key, modifiers) {
             self.sync_dialog_window(event_loop);
             self.request_dialog_redraw();
             // A confirmed open-media dialog adds (and may start) a track:
@@ -3012,6 +3014,18 @@ fn map_modifiers(state: ModifiersState) -> Modifiers {
     Modifiers::new(state.control_key(), state.alt_key(), state.shift_key())
 }
 
+/// Whether a key press belongs to the open dialog instead of the global
+/// shortcut path.
+///
+/// A modified key is a shortcut and stays global — except `Tab`: the
+/// edit-entry box moves its focus with `Tab` and `Shift`+`Tab`, and a
+/// `Shift`+`Tab` that went to the global path would never come back.
+/// `Ctrl`+`Tab` stays global: it is the "switch to the next window" row
+/// (S03 §1 id 40063).
+fn dialog_owns_key(key: Key, modifiers: Modifiers) -> bool {
+    key == Key::Tab && !modifiers.ctrl() && !modifiers.alt()
+}
+
 /// The window's raw OS handle, or `0` when it has none.
 ///
 /// Only the Win32 handle is of use (the platform's cursor API takes it);
@@ -3132,6 +3146,26 @@ mod tests {
         assert!(!first_start_double_size(false, None));
         // Once a config exists the saved choice rules, whatever the DPI.
         assert!(!first_start_double_size(true, Some(192)));
+    }
+
+    #[test]
+    fn tab_belongs_to_the_dialog_and_the_other_shortcuts_stay_global() {
+        // The edit-entry box moves its focus with `Tab` and `Shift`+`Tab`,
+        // so both chords belong to the dialog instead of the global path.
+        assert!(dialog_owns_key(Key::Tab, Modifiers::NONE));
+        assert!(dialog_owns_key(Key::Tab, Modifiers::SHIFT));
+        // `Ctrl`+`Tab` is the "switch to the next window" row (S03 §1 id
+        // 40063) and stays global.
+        assert!(!dialog_owns_key(Key::Tab, Modifiers::CTRL));
+        assert!(!dialog_owns_key(
+            Key::Tab,
+            Modifiers::CTRL | Modifiers::SHIFT
+        ));
+        assert!(!dialog_owns_key(Key::Tab, Modifiers::ALT));
+        // Every other key is the dialog's or the global path's, but never
+        // the focus key.
+        assert!(!dialog_owns_key(Key::Letter(b'E'), Modifiers::CTRL));
+        assert!(!dialog_owns_key(Key::Enter, Modifiers::NONE));
     }
 
     /// No event loop, window, hotkey registration, host process or audio device.

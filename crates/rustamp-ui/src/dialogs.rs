@@ -123,6 +123,14 @@ pub enum DialogKind {
     /// action, RFC 0005 §9), so the app opens it itself; the content is
     /// [`ExtendedInfo`].
     ExtendedInfo,
+    /// The edit-entry box (S03 §2 `40255` "Edit the playlist entry").
+    ///
+    /// It **edits** the tags of one playlist entry: the app reads the tags
+    /// of the selected entry, opens the box with them and hands the save
+    /// request to the tag writer. No core command opens it (editing a file's
+    /// tags is not a player action, RFC 0005 §9), so the app opens it
+    /// itself; the content is [`EditEntryDialog`].
+    EditEntry,
     /// A jump box (S03 "Jump to file/time", ids 40194/40193).
     Jump(JumpTarget),
     /// The load-playlist dialog (S06 §4 LIST OPTS, RFC 0010
@@ -163,6 +171,9 @@ impl DialogKind {
             // Own choice: S03 §2 gives the row's id and chord, not a title,
             // and no spec fixes dialog titles (S04 open).
             DialogKind::ExtendedInfo => "Extended info",
+            // Own choice: S03 §2 gives the row's id and chord, not a title,
+            // and no spec fixes dialog titles (S04 open).
+            DialogKind::EditEntry => EDIT_ENTRY_TITLE,
             DialogKind::Jump(JumpTarget::File) => "Jump to file",
             DialogKind::Jump(JumpTarget::Time) => "Jump to time",
             DialogKind::LoadPlaylist => crate::playlist::LOAD_DIALOG_TITLE,
@@ -196,6 +207,7 @@ impl DialogKind {
             DialogKind::About => ABOUT_CLIENT_SIZE,
             DialogKind::FileInfo => FILE_INFO_CLIENT_SIZE,
             DialogKind::ExtendedInfo => EXTENDED_INFO_CLIENT_SIZE,
+            DialogKind::EditEntry => EDIT_ENTRY_CLIENT_SIZE,
             DialogKind::Jump(JumpTarget::Time) => JUMP_CLIENT_SIZE,
             DialogKind::Jump(JumpTarget::File) => JUMP_FILE_CLIENT_SIZE,
             DialogKind::LoadPlaylist => LOAD_PLAYLIST_CLIENT_SIZE,
@@ -270,9 +282,10 @@ pub fn dialog_for_command(command: &Command) -> Option<DialogKind> {
 /// [`dialog_for_command`], for tests).
 ///
 /// `None` for a dialog no command opens: the extended-info box is opened
-/// by the playlist's `Ctrl+Alt+E` action (S03 §2 `40293`), because reading
-/// a file's tags is not a player action and needs no core command
-/// (RFC 0005 §9).
+/// by the playlist's `Ctrl+Alt+E` action (S03 §2 `40293`) and the
+/// edit-entry box by its `Ctrl+E` action (S03 §2 `40255`), because reading
+/// or editing a file's tags is not a player action and needs no core
+/// command (RFC 0005 §9).
 pub fn opening_command(dialog: DialogKind) -> Option<Command> {
     match dialog {
         DialogKind::About => Some(Command::OpenAbout),
@@ -284,8 +297,9 @@ pub fn opening_command(dialog: DialogKind) -> Option<Command> {
         // The page-carrying command round-trips; a bare `OpenPrefs` (which
         // opens the default page) has no exact inverse and maps back here.
         DialogKind::Preferences(page) => Some(Command::OpenPrefsPage(page)),
-        // No command opens the extended-info box; the app opens it itself.
-        DialogKind::ExtendedInfo => None,
+        // No command opens the extended-info box or the edit-entry box; the
+        // app opens them itself.
+        DialogKind::ExtendedInfo | DialogKind::EditEntry => None,
     }
 }
 
@@ -1363,8 +1377,9 @@ struct EditEntryValue {
 /// * `Enter` produces the save request and `Escape` cancels. A field that
 ///   does not validate keeps the dialog open, so the user can fix it.
 ///
-/// The dialog has no [`DialogKind`] yet: the kind is the app's window
-/// inventory, and the app opens this window in the lane that wires it.
+/// The dialog belongs to [`DialogKind::EditEntry`], the app's window
+/// inventory: the app opens the window, fills the dialog with the tags it
+/// read and hands the save request to the tag writer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditEntryDialog {
     values: Vec<EditEntryValue>,
@@ -1830,6 +1845,20 @@ mod tests {
     }
 
     #[test]
+    fn the_edit_entry_box_has_no_command_either() {
+        // The playlist's `Ctrl+E` action opens it (S03 §2 `40255`): editing
+        // a file's tags is not a player action, so no core command exists
+        // (RFC 0005 §9) and the app opens the box itself.
+        assert_eq!(opening_command(DialogKind::EditEntry), None);
+        assert_eq!(
+            DialogKind::EditEntry.title(),
+            EDIT_ENTRY_TITLE,
+            "the box carries the title the app gives its window"
+        );
+        assert_eq!(DialogKind::EditEntry.client_size(), EDIT_ENTRY_CLIENT_SIZE);
+    }
+
+    #[test]
     fn prefs_commands_open_the_prefs_dialog_on_their_page() {
         // A bare `OpenPrefs` shows the page model's own-choice default; a
         // page-carrying command shows the page it names (RFC 0005 §7).
@@ -1892,10 +1921,12 @@ mod tests {
             DialogKind::ExtendedInfo.client_size(),
             EXTENDED_INFO_CLIENT_SIZE
         );
+        assert_eq!(DialogKind::EditEntry.client_size(), EDIT_ENTRY_CLIENT_SIZE);
         for size in [
             ABOUT_CLIENT_SIZE,
             FILE_INFO_CLIENT_SIZE,
             EXTENDED_INFO_CLIENT_SIZE,
+            EDIT_ENTRY_CLIENT_SIZE,
             JUMP_CLIENT_SIZE,
             LOAD_PLAYLIST_CLIENT_SIZE,
             OPEN_MEDIA_CLIENT_SIZE,

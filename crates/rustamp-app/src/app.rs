@@ -198,6 +198,10 @@ pub struct App {
     /// `Ctrl+Alt+E` row ran (S03 §2 `40293`). A snapshot: the extended-info
     /// box shows it, and nothing reads the files again while it is open.
     pub(crate) extended_info: Option<rustamp_ui::dialogs::ExtendedInfo>,
+    /// The edit-entry session (S03 §2 `40255` "Edit the playlist entry"):
+    /// the file whose tags the dialog edits and the dialog's model. `None`
+    /// when no entry is being edited.
+    pub(crate) edit_entry: Option<crate::dialogs::EditEntrySession>,
     pub(crate) last_playlist_report: Option<rustamp_playlist::PlaylistReport>,
     /// The format the currently loaded playlist was detected as (RFC 0017
     /// import). `None` means no playlist has been loaded yet, so callers
@@ -419,6 +423,7 @@ impl App {
             library_window: crate::library_window::LibraryWindow::default(),
             dialogs: DialogManager::new(),
             extended_info: None,
+            edit_entry: None,
             last_playlist_report: None,
             last_playlist_format: None,
             main_menu_open: false,
@@ -4598,11 +4603,14 @@ mod tests {
         // Typing narrows the list (ignoring case); Down moves, Enter plays.
         assert!(app.dialog_text("BETA"));
         assert_eq!(app.jump_file_matches(), vec![1, 2]);
-        assert!(app.dialog_key(Key::Down));
-        assert!(app.dialog_key(Key::Down), "clamps at the last match");
-        assert!(app.dialog_key(Key::Up));
-        assert!(app.dialog_key(Key::Down));
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Down, Modifiers::NONE));
+        assert!(
+            app.dialog_key(Key::Down, Modifiers::NONE),
+            "clamps at the last match"
+        );
+        assert!(app.dialog_key(Key::Up, Modifiers::NONE));
+        assert!(app.dialog_key(Key::Down, Modifiers::NONE));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert!(!app.dialog_is_open(jump));
         assert_eq!(app.engine().current_index(), Some(2));
     }
@@ -4620,10 +4628,10 @@ mod tests {
         .unwrap();
         assert!(app.dialog_text("zzz"));
         assert!(app.jump_file_matches().is_empty());
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert!(app.dialog_is_open(rustamp_ui::DialogKind::Jump(JumpTarget::File)));
-        assert!(app.dialog_key(Key::Backspace));
-        assert!(app.dialog_key(Key::Escape));
+        assert!(app.dialog_key(Key::Backspace, Modifiers::NONE));
+        assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
         assert!(app.dialog_open_kind().is_none());
     }
 
@@ -4687,7 +4695,7 @@ mod tests {
         // Moving down past the window scrolls it: the selected row stays
         // visible and stays the marked one.
         for _ in 0..12 {
-            assert!(app.dialog_key(Key::Down));
+            assert!(app.dialog_key(Key::Down, Modifiers::NONE));
         }
         let lines = app.open_dialog_lines().unwrap();
         let marked: Vec<&String> = lines.iter().filter(|line| line.starts_with("> ")).collect();
@@ -4696,7 +4704,7 @@ mod tests {
 
         // Closing and opening the box again starts over: no search text and
         // the first row selected.
-        assert!(app.dialog_key(Key::Escape));
+        assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
         app.submit(Command::OpenJump {
             target: JumpTarget::File,
         })
@@ -4728,7 +4736,7 @@ mod tests {
             assert!(app.dialog_is_open(jump), "{key:?}");
 
             // Escape closes it again, so the next key starts from scratch.
-            assert!(app.dialog_key(Key::Escape));
+            assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
             assert!(app.dialog_open_kind().is_none());
         }
     }
@@ -5013,7 +5021,7 @@ mod tests {
         }));
         let before = app.engine().queue().len();
         app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
         assert_eq!(app.engine().queue().len(), before + 1);
         assert!(app.drain_notes().is_empty());
@@ -5038,7 +5046,7 @@ mod tests {
         }));
         let before = app.engine().queue().len();
         app.set_media_text("http://example.com/stream.mp3");
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
         assert_eq!(app.engine().queue().len(), before + 1);
     }
@@ -5057,7 +5065,7 @@ mod tests {
         })
         .unwrap();
         let before = app.engine().queue().len();
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert!(app.dialog_is_open(DialogKind::OpenMedia {
             kind: OpenMediaKind::Files,
             play: false,
@@ -5079,7 +5087,7 @@ mod tests {
         })
         .unwrap();
         app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
-        assert!(app.dialog_key(Key::Escape));
+        assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
         assert!(app.drain_notes().is_empty());
         assert!(app.engine().queue().is_empty());
@@ -5104,7 +5112,7 @@ mod tests {
         })
         .unwrap();
         app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.engine().queue().len(), 1);
         assert!(app.drain_notes().is_empty());
     }
@@ -5148,9 +5156,9 @@ mod tests {
         let (mut app, _dir) = app_with_file(None);
         app.submit(Command::OpenPrefsPage(PrefsPage::VisPlugin))
             .unwrap();
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.prefs_page(), Some(PrefsPage::VisPlugin));
-        assert!(app.dialog_key(Key::Escape));
+        assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
 
         app.submit(Command::OpenPrefs).unwrap();
@@ -5241,17 +5249,17 @@ mod tests {
             target: JumpTarget::Time,
         })
         .unwrap();
-        assert!(app.dialog_key(Key::Digit(9)));
-        assert!(app.dialog_key(Key::Digit(0)));
+        assert!(app.dialog_key(Key::Digit(9), Modifiers::NONE));
+        assert!(app.dialog_key(Key::Digit(0), Modifiers::NONE));
         assert_eq!(app.jump_text(), "90");
         // Enter confirms: a Seek for 90 s is submitted (the empty queue turns
         // it into an error event, which must not take the app down). The dialog
         // closes on confirm so it does not linger or double-apply.
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert!(!app.quit());
         assert_eq!(app.dialog_open_kind(), None);
         // With no dialog open no key is consumed.
-        assert!(!app.dialog_key(Key::Escape));
+        assert!(!app.dialog_key(Key::Escape, Modifiers::NONE));
         let _ = DialogKind::About;
     }
 
@@ -5359,8 +5367,8 @@ mod tests {
         // Down to the file row, Enter loads it through the existing skin
         // path and closes the dialog.
         app.submit(Command::OpenSkinBrowser).unwrap();
-        assert!(app.dialog_key(Key::Down));
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Down, Modifiers::NONE));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
         assert_eq!(app.current_skin(), Some(&dir.path().to_owned()));
         assert!(
@@ -5372,7 +5380,7 @@ mod tests {
 
         // Enter on the built-in row loads the built-in default instead.
         app.submit(Command::OpenSkinBrowser).unwrap();
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
         assert_eq!(app.current_skin(), None);
         assert_eq!(app.skin_description(), "built-in default skin");
@@ -5390,8 +5398,8 @@ mod tests {
         // Escape closes without loading; the focused-window close does too,
         // and neither quits the player.
         app.submit(Command::OpenSkinBrowser).unwrap();
-        assert!(app.dialog_key(Key::Down));
-        assert!(app.dialog_key(Key::Escape));
+        assert!(app.dialog_key(Key::Down, Modifiers::NONE));
+        assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
         assert_eq!(app.current_skin(), Some(&dir.path().to_owned()));
 
@@ -5448,10 +5456,10 @@ mod tests {
         let (mut app, _dir) = app_with_file(None);
         app.submit(Command::OpenPlaylist).unwrap();
         assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
         assert!(app.drain_notes().is_empty());
-        assert!(app.dialog_key(Key::Escape));
+        assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
 
         app.submit(Command::OpenPlaylist).unwrap();
@@ -5513,7 +5521,7 @@ mod tests {
             play: false,
         }));
         app.stage_media_paths(vec![t1]);
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
 
         // Enqueued: queue and playlist model agree
@@ -5545,7 +5553,7 @@ mod tests {
         })
         .unwrap();
         app.stage_media_paths(vec![t2]);
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert!(
             pump_until(
                 &mut app,
@@ -6222,8 +6230,8 @@ mod tests {
         crate::window::require_test_vm();
         use rustamp_core::command::{OpenMediaKind, PrefsPage};
         use rustamp_ui::{
-            DialogKind, LOAD_PLAYLIST_CLIENT_SIZE, OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE,
-            SKIN_BROWSER_CLIENT_SIZE,
+            DialogKind, EDIT_ENTRY_CLIENT_SIZE, EDIT_ENTRY_TITLE, LOAD_PLAYLIST_CLIENT_SIZE,
+            OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE,
         };
         assert_eq!(DialogKind::LoadPlaylist.title(), "Load Playlist");
         assert_eq!(
@@ -6262,6 +6270,9 @@ mod tests {
             DialogKind::Preferences(PrefsPage::VisPlugin).client_size(),
             PREFS_CLIENT_SIZE
         );
+        // The edit-entry box (S03 §2 `40255`): its own title and size.
+        assert_eq!(DialogKind::EditEntry.title(), EDIT_ENTRY_TITLE);
+        assert_eq!(DialogKind::EditEntry.client_size(), EDIT_ENTRY_CLIENT_SIZE);
     }
 
     #[test]
@@ -6308,10 +6319,10 @@ mod tests {
             app.dialog_open_kind(),
             Some(DialogKind::Jump(JumpTarget::Time))
         );
-        assert!(app.dialog_key(Key::Digit(4)));
-        assert!(app.dialog_key(Key::Digit(2)));
+        assert!(app.dialog_key(Key::Digit(4), Modifiers::NONE));
+        assert!(app.dialog_key(Key::Digit(2), Modifiers::NONE));
         assert_eq!(app.jump_text(), "42");
-        assert!(app.dialog_key(Key::Escape));
+        assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
 
         // 2. Confirmed dialog via Enter: applies exactly once and closes.
@@ -6323,14 +6334,14 @@ mod tests {
             app.dialog_open_kind(),
             Some(DialogKind::Jump(JumpTarget::Time))
         );
-        assert!(app.dialog_key(Key::Digit(1)));
-        assert!(app.dialog_key(Key::Digit(0)));
+        assert!(app.dialog_key(Key::Digit(1), Modifiers::NONE));
+        assert!(app.dialog_key(Key::Digit(0), Modifiers::NONE));
         assert_eq!(app.jump_text(), "10");
         // Enter confirms: seek is submitted, dialog closes immediately.
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
         // Pressing Enter again does NOT double-apply: no dialog is open.
-        assert!(!app.dialog_key(Key::Enter));
+        assert!(!app.dialog_key(Key::Enter, Modifiers::NONE));
 
         // 3. Closed by OS: close_dialog resets state cleanly without applying.
         app.submit(Command::OpenAbout).unwrap();
@@ -6363,7 +6374,7 @@ mod tests {
 
         // Stage playlist file and confirm
         app.stage_playlist_path(m3u_path);
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
 
         // Queue has surviving entries in order
@@ -6415,7 +6426,7 @@ mod tests {
         assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
 
         app.stage_playlist_path(m3u_path);
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
 
         // Surviving entries reach queue in order
@@ -6529,7 +6540,7 @@ mod tests {
         assert!(app.dialog_is_open(DialogKind::LoadPlaylist));
 
         app.stage_playlist_path(bad_path.clone());
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
 
         // Queue is completely unchanged
@@ -6578,11 +6589,11 @@ mod tests {
         assert_eq!(body[1], "my_list.m3u");
 
         // Backspace
-        assert!(app.dialog_key(Key::Backspace));
+        assert!(app.dialog_key(Key::Backspace, Modifiers::NONE));
         assert_eq!(app.playlist_text(), "my_list.m3");
 
         // Key letters/digits
-        assert!(app.dialog_key(Key::Letter(b'u')));
+        assert!(app.dialog_key(Key::Letter(b'u'), Modifiers::NONE));
         assert_eq!(app.playlist_text(), "my_list.m3u");
     }
 
