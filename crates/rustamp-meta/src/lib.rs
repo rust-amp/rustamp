@@ -19,6 +19,11 @@
 //!   byte for byte.
 //! * [`write_tags_report`] is the honest form of [`write_tags`]: it names
 //!   every `extra` entry the target format could not store.
+//! * [`write_tags_with`] writes the common fields back *and* removes the
+//!   fields of the removal list ([`TagField`]): a field that is `None` in
+//!   the [`TrackMetadata`](rustamp_core::meta::TrackMetadata) keeps the
+//!   value the file has, a field of the removal list is taken out of the
+//!   file. [`write_tags_with_report`] is the honest form of that.
 //! * The [`replaygain`] module holds the ReplayGain keys, the
 //!   [`replaygain::ReplayGainTags`] value type, the pure headless analysis
 //!   ([`replaygain::analyze_replaygain`]) and an honest ReplayGain writer
@@ -82,6 +87,7 @@ mod atomic;
 mod dsp;
 pub mod r128;
 mod read;
+pub mod remove;
 pub mod replaygain;
 mod write;
 
@@ -91,6 +97,7 @@ pub use album::{
 pub use artwork::{Artwork, PictureKind};
 pub use r128::{LoudnessBlocks, R128_TARGET_LUFS, r128_album_gain_q8, r128_track_gain_q8};
 pub use read::{read_artwork, read_artworks, read_tags, scan_paths};
+pub use remove::TagField;
 pub use replaygain::{
     ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, MAX_GAIN_DB, R128_ALBUM_GAIN_KEY, R128_STEPS_PER_DB,
     R128_TRACK_GAIN_KEY, REFERENCE_LOUDNESS_KEY, REFERENCE_RMS, REPLAYGAIN_KEYS,
@@ -100,7 +107,9 @@ pub use replaygain::{
     r128_q8_to_db, r128_supported_for_extension, replaygain_supported_for_extension,
     replaygain_supported_for_tag_type, write_replaygain,
 };
-pub use write::{WriteReport, write_tags, write_tags_report};
+pub use write::{
+    WriteReport, write_tags, write_tags_report, write_tags_with, write_tags_with_report,
+};
 
 /// File extensions whose tags [`lofty`] can read.
 ///

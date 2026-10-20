@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 use rustamp_core::meta::TrackMetadata;
 use rustamp_meta::{
     ALBUM_GAIN_KEY, ALBUM_PEAK_KEY, Artwork, PictureKind, R128_ALBUM_GAIN_KEY, R128_TRACK_GAIN_KEY,
-    REFERENCE_LOUDNESS_KEY, ReplayGainTags, analyze_replaygain, r128_track_gain_q8, read_artwork,
-    read_artworks, read_tags, scan_paths, supported_extensions, supports_extension,
-    write_replaygain, write_tags, write_tags_report,
+    REFERENCE_LOUDNESS_KEY, ReplayGainTags, TagField, analyze_replaygain, r128_track_gain_q8,
+    read_artwork, read_artworks, read_tags, scan_paths, supported_extensions, supports_extension,
+    write_replaygain, write_tags, write_tags_report, write_tags_with, write_tags_with_report,
 };
 use tempfile::TempDir;
 
@@ -1603,37 +1603,40 @@ fn unknown_vorbis_keys_survive_a_write() {
     );
 }
 
+/// Writes a freeform MP4 atom — one this crate has no field for — into the
+/// `ilst` of the file at `path`.
+fn write_freeform_atom(path: &std::path::Path, name: &'static str, value: &str) {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::mp4::{Atom, AtomData, AtomIdent, Mp4File};
+    use lofty::prelude::TagExt;
+    use std::io::Seek;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mp4 = Mp4File::read_from(&mut file, ParseOptions::new().read_properties(false)).unwrap();
+    let mut ilst = mp4.ilst().cloned().unwrap_or_default();
+    ilst.insert(Atom::new(
+        AtomIdent::Freeform {
+            mean: "com.apple.iTunes".into(),
+            name: name.into(),
+        },
+        AtomData::UTF8(value.into()),
+    ));
+    file.rewind().unwrap();
+    ilst.save_to(&mut file, WriteOptions::default()).unwrap();
+}
+
 #[test]
 fn unknown_mp4_atoms_survive_a_write() {
     let dir = TempDir::new().unwrap();
     let path = copy_fixture(&dir, "sine_aac.m4a");
 
     // A freeform atom that this crate has no field for.
-    {
-        use lofty::config::{ParseOptions, WriteOptions};
-        use lofty::file::AudioFile;
-        use lofty::mp4::{Atom, AtomData, AtomIdent, Mp4File};
-        use lofty::prelude::TagExt;
-        use std::io::Seek;
-
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let mp4 =
-            Mp4File::read_from(&mut file, ParseOptions::new().read_properties(false)).unwrap();
-        let mut ilst = mp4.ilst().cloned().unwrap_or_default();
-        ilst.insert(Atom::new(
-            AtomIdent::Freeform {
-                mean: "com.apple.iTunes".into(),
-                name: "CUSTOMKEY".into(),
-            },
-            AtomData::UTF8("Custom Value".into()),
-        ));
-        file.rewind().unwrap();
-        ilst.save_to(&mut file, WriteOptions::default()).unwrap();
-    }
+    write_freeform_atom(&path, "CUSTOMKEY", "Custom Value");
 
     let before = std::fs::read(&path).unwrap();
     assert!(
@@ -1788,5 +1791,275 @@ fn a_write_that_cannot_happen_leaves_the_file_alone() {
         std::fs::read(&path).unwrap(),
         before,
         "the file was modified"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Removing a value
+// ---------------------------------------------------------------------------
+
+/// Every field the writer supports.
+const ALL_FIELDS: &[TagField] = &[
+    TagField::Title,
+    TagField::Artist,
+    TagField::Album,
+    TagField::AlbumArtist,
+    TagField::Year,
+    TagField::Genre,
+    TagField::Comment,
+    TagField::Track,
+    TagField::Disc,
+];
+
+/// The files of the four families the writer writes: an MP3 (ID3v2), a FLAC
+/// and an Ogg (Vorbis comments) and an MP4 (`ilst`).
+const FAMILIES: [&str; 4] = ["sine.mp3", "sine.flac", "sine.ogg", "sine_aac.m4a"];
+
+#[test]
+fn a_removed_value_disappears_from_the_file() {
+    let dir = TempDir::new().unwrap();
+    for name in FAMILIES {
+        let path = copy_fixture(&dir, name);
+        // A file with every field filled.
+        write_tags(&path, &full_metadata()).unwrap();
+
+        let report = write_tags_with_report(&path, &TrackMetadata::default(), ALL_FIELDS).unwrap();
+        assert!(
+            report.is_complete(),
+            "{name}: the file still carries {:?}",
+            report.unremoved
+        );
+
+        let got = read_tags(&path).unwrap();
+        assert_eq!(got.title, None, "{name}: title");
+        assert_eq!(got.artist, None, "{name}: artist");
+        assert_eq!(got.album, None, "{name}: album");
+        assert_eq!(got.album_artist, None, "{name}: album artist");
+        assert_eq!(got.year, None, "{name}: year");
+        assert_eq!(got.genre, None, "{name}: genre");
+        assert_eq!(got.comment, None, "{name}: comment");
+        assert_eq!(got.track_no, None, "{name}: track no");
+        assert_eq!(got.track_total, None, "{name}: track total");
+        assert_eq!(got.disc_no, None, "{name}: disc no");
+    }
+}
+
+#[test]
+fn a_removed_value_is_gone_from_the_bytes_of_the_file() {
+    let dir = TempDir::new().unwrap();
+    for name in FAMILIES {
+        let path = copy_fixture(&dir, name);
+        write_tags(&path, &full_metadata()).unwrap();
+
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            before
+                .windows(b"Round Trip Title".len())
+                .any(|w| w == b"Round Trip Title"),
+            "{name}: the title was not written"
+        );
+
+        write_tags_with(&path, &TrackMetadata::default(), ALL_FIELDS).unwrap();
+
+        // The frame, the comment and the atom are gone: not one of the
+        // removed values is left in the file.
+        let after = std::fs::read(&path).unwrap();
+        assert!(
+            !after
+                .windows(b"Round Trip".len())
+                .any(|w| w == b"Round Trip"),
+            "{name}: a removed value is still in the file"
+        );
+    }
+}
+
+#[test]
+fn a_removal_touches_only_the_field_it_names() {
+    let dir = TempDir::new().unwrap();
+    for name in FAMILIES {
+        let path = copy_fixture(&dir, name);
+        write_tags(&path, &full_metadata()).unwrap();
+
+        // A field that is not named keeps its value: `None` still means
+        // "leave this tag as it is".
+        write_tags_with(&path, &TrackMetadata::default(), &[TagField::Title]).unwrap();
+
+        let got = read_tags(&path).unwrap();
+        assert_eq!(got.title, None, "{name}: title");
+        assert_eq!(
+            got.artist.as_deref(),
+            Some("Round Trip Artist"),
+            "{name}: artist"
+        );
+        assert_eq!(
+            got.album.as_deref(),
+            Some("Round Trip Album"),
+            "{name}: album"
+        );
+        assert_eq!(
+            got.album_artist.as_deref(),
+            Some("Round Trip Album Artist"),
+            "{name}: album artist"
+        );
+        assert_eq!(got.year, Some(2024), "{name}: year");
+        assert_eq!(
+            got.genre.as_deref(),
+            Some("Round Trip Genre"),
+            "{name}: genre"
+        );
+        assert_eq!(
+            got.comment.as_deref(),
+            Some("Round Trip Comment"),
+            "{name}: comment"
+        );
+        assert_eq!(got.track_no, Some(3), "{name}: track no");
+        assert_eq!(got.track_total, Some(9), "{name}: track total");
+        assert_eq!(got.disc_no, Some(1), "{name}: disc no");
+    }
+}
+
+#[test]
+fn a_removal_wins_over_a_value() {
+    let dir = TempDir::new().unwrap();
+    for name in FAMILIES {
+        let path = copy_fixture(&dir, name);
+
+        // The title is written and removed in the same call: the removal
+        // is the last word.
+        let metadata = TrackMetadata {
+            title: Some("Written Title".into()),
+            ..TrackMetadata::default()
+        };
+        write_tags_with(&path, &metadata, &[TagField::Title]).unwrap();
+
+        assert_eq!(read_tags(&path).unwrap().title, None, "{name}: title");
+    }
+}
+
+#[test]
+fn removing_a_field_the_file_does_not_have_is_not_an_error() {
+    let dir = TempDir::new().unwrap();
+    for name in FAMILIES {
+        let path = copy_fixture(&dir, name);
+
+        let report = write_tags_with_report(&path, &TrackMetadata::default(), ALL_FIELDS).unwrap();
+        assert!(report.is_complete(), "{name}: {:?}", report.unremoved);
+    }
+}
+
+#[test]
+fn unknown_items_survive_a_removal() {
+    let dir = TempDir::new().unwrap();
+
+    // The ID3v2 frame this crate has no field for.
+    let path = dir.path().join("unknown.mp3");
+    let mut bytes = id3v2_tag(&[
+        id3v2_text_frame(b"TIT2", "Original Title"),
+        id3v2_txxx_frame("CUSTOM_TXXX", "Custom Value"),
+    ]);
+    bytes.extend_from_slice(&mp3_audio());
+    std::fs::write(&path, &bytes).unwrap();
+
+    write_tags_with(&path, &TrackMetadata::default(), &[TagField::Title]).unwrap();
+
+    let after = std::fs::read(&path).unwrap();
+    assert!(
+        after
+            .windows(b"Custom Value".len())
+            .any(|w| w == b"Custom Value"),
+        "the unknown user text frame was dropped"
+    );
+    assert_eq!(read_tags(&path).unwrap().title, None);
+
+    // The Vorbis comment this crate has no field for.
+    let path = write_file(
+        &dir,
+        "custom.flac",
+        &synthetic_flac(&[("TITLE", "Original Title"), ("CUSTOM_KEY", "Custom Value")]),
+    );
+    write_tags_with(&path, &TrackMetadata::default(), &[TagField::Title]).unwrap();
+
+    let comments = flac_comments(&path);
+    assert_eq!(comments.get("CUSTOM_KEY"), Some("Custom Value"));
+    assert_eq!(comments.get("TITLE"), None);
+    assert_eq!(read_tags(&path).unwrap().title, None);
+
+    // The freeform MP4 atom this crate has no field for.
+    let path = copy_fixture(&dir, "sine_aac.m4a");
+    write_freeform_atom(&path, "CUSTOMKEY", "Custom Value");
+
+    write_tags_with(&path, &TrackMetadata::default(), &[TagField::Title]).unwrap();
+
+    let after = std::fs::read(&path).unwrap();
+    assert!(
+        after.windows(b"CUSTOMKEY".len()).any(|w| w == b"CUSTOMKEY"),
+        "the unknown atom was dropped"
+    );
+    assert_eq!(read_tags(&path).unwrap().title, None);
+}
+
+#[test]
+fn a_value_in_a_second_tag_is_reported_as_not_removed() {
+    // The writer only writes the primary tag of a file. An ID3v1 tag next
+    // to an ID3v2 tag keeps its value, so the removal does not take the
+    // value out of the file — and the report says so.
+    let dir = TempDir::new().unwrap();
+    let path = copy_fixture(&dir, "sine.mp3");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&id3v1("V1 Title", "", "", "", ""));
+    std::fs::write(&path, &bytes).unwrap();
+
+    let report =
+        write_tags_with_report(&path, &TrackMetadata::default(), &[TagField::Title]).unwrap();
+    assert_eq!(report.unremoved, vec![TagField::Title]);
+    assert!(!report.is_complete());
+
+    // The ID3v2 tag lost the title ...
+    let id3v2 = read_tags(&path).unwrap();
+    assert_eq!(id3v2.artist.as_deref(), Some("Test Artist"));
+    // ... and the ID3v1 tag still has it, so the file still carries the
+    // value and the reader merges the two tags.
+    assert_eq!(id3v2.title.as_deref(), Some("V1 Title"));
+}
+
+#[test]
+fn a_removal_of_the_second_tag_only_is_reported() {
+    // The same for the `RIFF INFO` of a WAV: the writer writes the ID3v2
+    // chunk and leaves the INFO chunk alone.
+    let dir = TempDir::new().unwrap();
+    let path = write_file(
+        &dir,
+        "info.wav",
+        &wav_with_info("Info Title", "Info Artist"),
+    );
+
+    let report =
+        write_tags_with_report(&path, &TrackMetadata::default(), &[TagField::Title]).unwrap();
+    assert_eq!(report.unremoved, vec![TagField::Title]);
+    assert_eq!(
+        read_tags(&path).unwrap().title.as_deref(),
+        Some("Info Title")
+    );
+}
+
+#[test]
+fn a_value_in_the_id3v2_tag_of_a_flac_file_is_reported_as_not_removed() {
+    // The ID3v2 tag of a FLAC file is read-only: the writer writes the
+    // Vorbis comments and leaves the ID3v2 tag in the file.
+    let dir = TempDir::new().unwrap();
+    let mut bytes = id3v2_tag(&[id3v2_text_frame(b"TIT2", "Id3 Title")]);
+    bytes.extend_from_slice(&synthetic_flac(&[("TITLE", "Vorbis Title")]));
+    let path = write_file(&dir, "id3.flac", &bytes);
+
+    let report =
+        write_tags_with_report(&path, &TrackMetadata::default(), &[TagField::Title]).unwrap();
+    assert_eq!(report.unremoved, vec![TagField::Title]);
+
+    // The Vorbis comment is gone, the ID3v2 tag still has the title.
+    let comments = flac_comments(&path);
+    assert_eq!(comments.get("TITLE"), None);
+    assert_eq!(
+        read_tags(&path).unwrap().title.as_deref(),
+        Some("Id3 Title")
     );
 }
