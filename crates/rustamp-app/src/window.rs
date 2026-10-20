@@ -2730,6 +2730,16 @@ impl Windowed {
             Err(error) => eprintln!("rustamp: tray menu unavailable: {error}"),
         }
     }
+
+    /// Prints the notes the app raised.
+    ///
+    /// The app's own rule ([`App::print_notes`]): the player's prefix on the
+    /// standard error, the notes in the order they were raised. The headless
+    /// run prints them the same way, so a diagnostic reads the same in
+    /// either mode — and the queue is drained, so a note is printed **once**.
+    fn print_notes(&mut self) {
+        self.app.print_notes();
+    }
 }
 
 impl ApplicationHandler for Windowed {
@@ -2994,9 +3004,9 @@ impl ApplicationHandler for Windowed {
         if let Some(control) = &self.external_control {
             control.publish(self.app.host_player_state());
         }
-        for note in self.app.drain_notes() {
-            eprintln!("rustamp: {note}");
-        }
+        // The notes the app raised, printed by the app's own rule: the
+        // headless run prints them the same way (see `App::print_notes`).
+        self.print_notes();
         if self.app.quit() {
             event_loop.exit();
             return;
@@ -4234,6 +4244,43 @@ mod tests {
             "the player says that nothing was added: {notes:?}"
         );
         assert!(notes[0].contains("no media file"), "{notes:?}");
+    }
+
+    /// The windowed path prints a note **once**.
+    ///
+    /// The presenter's rule is the app's rule ([`App::print_notes`]): the
+    /// queue is drained, so a second print has nothing left to print. A note
+    /// the tick printed is never printed again.
+    #[test]
+    fn the_presenter_prints_a_note_once() {
+        let mut presenter = desktop_test_presenter(false);
+        presenter.app.note("a note for the user".to_string());
+        presenter.print_notes();
+        // The tick printed the note: the queue is empty, and a second print
+        // finds nothing to print.
+        assert!(presenter.app.drain_notes().is_empty());
+        presenter.print_notes();
+        assert!(presenter.app.drain_notes().is_empty());
+    }
+
+    /// The tick is the only place the windowed run prints the notes.
+    ///
+    /// A second printing site in the tick would print a note twice.
+    #[test]
+    fn the_tick_prints_the_notes_once() {
+        let source = include_str!("window.rs");
+        let tick = source
+            .split("fn about_to_wait(")
+            .nth(1)
+            .unwrap()
+            .split("fn exiting(")
+            .next()
+            .unwrap();
+        assert_eq!(
+            tick.matches("print_notes(").count(),
+            1,
+            "the tick prints the notes once: {tick}"
+        );
     }
 
     /// A failed dialog adds nothing.

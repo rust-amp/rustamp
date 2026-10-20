@@ -27,6 +27,10 @@
 //! Everything in this module is headless and unit-tested with a
 //! [`NullOutput`](rustamp_output::NullOutput); the windowed presenter in
 //! [`crate::window`] only adds the `winit`/`softbuffer` shell around it.
+//!
+//! The app's diagnostics travel as **notes** ([`App::note`]): the windowed
+//! presenter and the headless run print them the same way, so a headless run
+//! shows the user what the windowed one shows (see [`App::print_notes`]).
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -70,6 +74,14 @@ use crate::supervise::Supervisor;
 
 /// How many "not implemented yet" notes the app keeps for the caller to print.
 const MAX_NOTES: usize = 64;
+
+/// The prefix every note the player prints carries.
+///
+/// The player's own lines all start with it, so a diagnostic is told apart
+/// from the rest of the output at a glance. It is the **one** prefix: the
+/// windowed presenter and the headless run print a note the same way (see
+/// [`write_notes`]).
+const NOTE_PREFIX: &str = "rustamp: ";
 
 /// Everything [`App::new`] needs.
 pub struct AppOptions {
@@ -401,6 +413,19 @@ fn window_visible(config: &Config, id: WindowId) -> Option<bool> {
         .iter()
         .find(|window| window.id == id)
         .map(|window| window.visible)
+}
+
+/// Writes the notes to `out`, one line each, in the order they were raised.
+///
+/// The player's **one** printing rule for a note: a line that starts with
+/// the player's prefix ([`NOTE_PREFIX`]). The windowed presenter and the
+/// headless run both write through here, so a diagnostic reads the same in
+/// either mode — there is no second wording and no second stream.
+fn write_notes(out: &mut dyn std::io::Write, notes: &[String]) -> std::io::Result<()> {
+    for note in notes {
+        writeln!(out, "{NOTE_PREFIX}{note}")?;
+    }
+    Ok(())
 }
 
 impl App {
@@ -1356,6 +1381,24 @@ impl App {
     pub fn drain_notes(&mut self) -> Vec<String> {
         self.collect_output_notes();
         std::mem::take(&mut self.notes)
+    }
+
+    /// Prints the accumulated notes to the standard error, in the order they
+    /// were raised.
+    ///
+    /// The player's one rule for a note (see [`write_notes`]): a line that
+    /// starts with the player's prefix, on the standard error. The windowed
+    /// presenter and the headless run both print through here, so a
+    /// diagnostic reads the same in either mode — and the headless run no
+    /// longer swallows the reports the waves added (the DSP bypass, the
+    /// fade budget, the library's scan report, the import report and the
+    /// "not implemented" notes).
+    ///
+    /// The queue is drained, so a note is printed **once**.
+    pub(crate) fn print_notes(&mut self) {
+        let notes = self.drain_notes();
+        // A standard error that cannot be written must not stop the player.
+        let _ = write_notes(&mut std::io::stderr(), &notes);
     }
 
     fn collect_output_notes(&mut self) {
@@ -2486,7 +2529,17 @@ impl App {
     /// be opened would then be announced as playing, and the report would
     /// depend on how fast the decode thread came up (see
     /// [`App::headless_track_open`]).
+    ///
+    /// The notes the app raised are **printed**, the way the windowed
+    /// presenter prints them ([`App::print_notes`]): the ones from before the
+    /// run and the ones the run itself raises. A headless run is the run
+    /// whose diagnostics nobody would see otherwise.
     pub fn run_headless(&mut self) -> Result<()> {
+        // The notes the start-up raised (the configuration warnings, the
+        // playlist's title format, the DSP bypass) are printed before the
+        // run begins: they are the user's diagnostics, and the run is the
+        // only reader of them in this mode.
+        self.print_notes();
         if self.engine.queue().is_empty() {
             println!("rustamp: no input file; nothing to play");
             return Ok(());
@@ -2513,7 +2566,12 @@ impl App {
                     clock.pump(frames);
                 }
             }
-            self.pump()?;
+            // The notes the run raised are printed as they arise, the way the
+            // presenter's tick prints them. They are printed even when the
+            // pump failed: such a diagnostic is often why the run ended.
+            let pumped = self.pump();
+            self.print_notes();
+            pumped?;
             frames_played = frames_played.max(self.engine.timeline_frames());
 
             // The run is announced when the track is open, not when the
@@ -2533,7 +2591,11 @@ impl App {
             {
                 println!("rustamp: reached --seconds {limit}, stopping");
                 self.engine.stop()?;
-                self.pump()?;
+                // The notes the stop raised are printed here too: the run's
+                // last word is a diagnostic the user reads.
+                let pumped = self.pump();
+                self.print_notes();
+                pumped?;
                 break;
             }
             if self.playlist_ended
@@ -2546,6 +2608,11 @@ impl App {
                 break;
             }
         }
+
+        // The run is over: the queue is empty. Every step printed the notes
+        // it raised, and this is the guarantee that none of them is left
+        // unread when the run returns.
+        self.print_notes();
 
         let frames = frames_played.max(self.engine.last_track_frames());
         let seconds = if rate == 0 {
@@ -3820,6 +3887,56 @@ mod tests {
             app.current_config().audio.output_mode,
             rustamp_core::config::OutputMode::Exclusive
         );
+    }
+
+    /// The player's one printing rule for a note: a line that starts with
+    /// the player's prefix, and the notes keep the order they were raised
+    /// in.
+    #[test]
+    fn a_note_is_printed_with_the_players_prefix_and_the_notes_keep_their_order() {
+        let mut out = Vec::new();
+        write_notes(
+            &mut out,
+            &["the first note".to_string(), "the second note".to_string()],
+        )
+        .expect("the notes are written");
+        assert_eq!(
+            String::from_utf8(out).expect("the notes are UTF-8"),
+            "rustamp: the first note\nrustamp: the second note\n"
+        );
+    }
+
+    /// A headless run prints the notes it was given: the one from before the
+    /// run and the one the run itself raises.
+    ///
+    /// The run drains the queue, so nothing is left in it when the run
+    /// ends: the notes were printed, and printed once.
+    #[test]
+    fn a_headless_run_prints_the_notes_it_raised() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = track(&dir, "one.tst");
+        let options = AppOptions {
+            config: Config::default(),
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            media: Some(MediaLocation::File(file)),
+            // The run stops at once: this test is about the notes, not about
+            // the playback.
+            seconds: Some(0),
+        };
+        let mut app = App::with_registry(options, registry()).unwrap();
+        // A note from before the run.
+        app.note("a note from before the run".to_string());
+        // The engine reports a failure while the run is going: the app
+        // notes it, and the run prints it as well.
+        app.bus.publish(Event::Error(ErrorInfo {
+            kind: ErrorKind::Io,
+            message: "the file could not be opened".to_string(),
+        }));
+        app.run_headless().expect("the run ends");
+        // Both notes were printed: the queue is empty afterwards.
+        assert!(app.drain_notes().is_empty());
     }
 
     #[test]

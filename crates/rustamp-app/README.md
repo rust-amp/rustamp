@@ -86,6 +86,15 @@ the mode the tests use (`tests/headless.rs` plays the repo's own 1.5 s FLAC
 fixture and checks the exit code). `--seconds <n>` bounds a run; `--null` with
 no file exits immediately.
 
+**The notes are printed here as well.** The app's diagnostics (the DSP
+bypass, the fade budget, the library's scan report, an import report, the
+"not implemented" notes) reach the user through the app's *notes*, and a
+headless run prints them the way the windowed presenter prints them: one line
+per note, `rustamp: <note>`, on the **standard error**, in the order the notes
+were raised. A note is printed **once**, and a run that raises no note prints
+none. The rule lives in one place (`App::print_notes`), so both modes say the
+same thing in the same words.
+
 ## Windowed mode — headless test VM only
 
 ### Audio output mode
