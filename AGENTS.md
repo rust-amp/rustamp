@@ -46,6 +46,15 @@ Read these first, in this order:
   attempt named in the prompt so it is not repeated. A lane that "passes clippy"
   while adding only names is a failed lane.
 
+- **Before you write "X does not exist", search the repo for a measurement of X**
+  (owner lesson, 2026-10-20). A dirty-room draft claimed `/ADD` was not a switch
+  in Winamp 2.95; `docs/HANDOFF.md` had carried a **measured** line
+  "`/ADD` enqueues without playing" for days, and the claim still went into an
+  audited spec and from there into the CLI, where a lane had to invert a test.
+  A spec claim of absence is only as strong as the search behind it: check
+  `docs/`, the audited specs and the handoff logs first, and state the search
+  that supports the absence.
+
 - **Tests always run in the interactive session** (owner rule, 2026-10-18).
   The guest's session 0 has no desktop, so anything that opens a window, a
   dialog, a menu or a plugin host fails there for the wrong reason. Run the
