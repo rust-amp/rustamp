@@ -21,3 +21,7 @@ crossbeam-channel.workspace = true
 
 [dev-dependencies]
 toml.workspace = true
+# RFC 0020 option A: the re-export test proves the kind type on the core path
+# is the ABI's own type, not a copy of it. A dev-dependency only — the crate
+# itself names the kind through `rustamp-proto`'s re-export.
+rustamp-plugin-abi.workspace = true

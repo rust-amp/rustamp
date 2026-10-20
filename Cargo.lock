@@ -1986,6 +1986,7 @@ name = "rustamp-core"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "rustamp-plugin-abi",
  "rustamp-proto",
  "serde",
  "thiserror 2.0.21",
@@ -2148,6 +2149,7 @@ name = "rustamp-proto"
 version = "0.1.0"
 dependencies = [
  "postcard",
+ "rustamp-plugin-abi",
  "serde",
 ]
 

@@ -1,10 +1,8 @@
 # RFC 0020: the missing player → host plug-in commands
 
-Status: **Draft, second revision** (2026-10-20; first draft 2026-10-19).
-**Not accepted.** Nothing in this document is implemented, no code is changed by
-it and no version number is bumped here. A wire change needs the owner's
-acceptance; the `PROTOCOL_VERSION` 4 → 5 decision belongs to the owner, the RFC
-itself to the integration lead (the pattern of RFC 0017's status line).
+Status: **Accepted** (owner decision, 2026-10-20; second revision dated
+2026-10-20, first draft 2026-10-19). Implemented by the integration lane; see
+§11 for the acceptance checklist and §12 for the owner's decision.
 
 **What the second revision adds.** The first draft proposed only
 `Command::ConfigurePlugin`. Since then the host grew four more registry routes
@@ -464,18 +462,18 @@ in session 0.
 
 ## 11. RFC acceptance (for the implementation lane, once this RFC is accepted)
 
-- The variant is appended after `RemoveDeadFiles` with a doc comment, and its
-  index is pinned in a wire test.
-- `Message` is unchanged; the request travels in `Message::CommandToHost`.
-- `PROTOCOL_VERSION` is 5, the version history names RFC 0020, and the
-  version-gate tests cover a peer one version below.
-- The host routes the new payload to the UI thread and refuses an unknown id,
-  a wrong kind and a missing `config` slot.
-- The app remembers the loaded plug-ins (id, name, kind) and sends the
-  request through the accepted carrier.
-- `rustamp-core` re-exports what `rustamp-proto` adds, at the existing paths.
-- The permissive closure stays copyleft-free; `THIRD_PARTY.md` is unchanged.
-- `cargo fmt --all -- --check`,
+- [x] The variant is appended after `RemoveDeadFiles` with a doc comment, and its
+  index is pinned in a wire test (`command_wire.rs::the_plugin_requests_are_appended_after_remove_dead_files`, `hosting_wire.rs` total count = 66).
+- [x] `Message` is unchanged; the request travels in `Message::CommandToHost` (verified by bytes `[0x0e, 0x3d, 0x07, 0x02]` and the carrier test).
+- [x] `PROTOCOL_VERSION` is 5, the version history names RFC 0020, and the
+  version-gate tests cover a peer one version below (`hello_barrier_rejects_a_peer_one_version_below` checks `PROTOCOL_VERSION - 1`).
+- [x] The host routes the new payload to the UI thread and refuses an unknown id,
+  a wrong kind and a missing `config` slot (`control.rs::the_named_plugin_requests_reach_the_ui_thread...`, `the_three_refusals_are_reported_and_call_nothing`, `an_unknown_id_is_refused_by_every_transport_route_and_calls_nothing`).
+- [x] The app remembers the loaded plug-ins (id, name, kind) and sends the
+  request through the accepted carrier (`app.rs::the_named_plugin_requests_reach_the_host_through_the_accepted_carrier`, `the_four_transport_requests_go_out_over_the_same_carrier`).
+- [x] `rustamp-core` re-exports what `rustamp-proto` adds, at the existing paths (`command.rs` re-exports `PluginKind`; `command_reexports.rs` proves it names the ABI's own type).
+- [x] The permissive closure stays copyleft-free; `THIRD_PARTY.md` is unchanged (the proto→plugin-abi edge is internal, both permissive).
+- [x] `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
   `cargo test --workspace --all-features` are green; the window-shaped
   acceptance runs in the Hyper-V test VM, not on the host.

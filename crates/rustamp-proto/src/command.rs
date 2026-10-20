@@ -18,6 +18,16 @@ use serde::{Deserialize, Serialize};
 use crate::playlist::{EntryId, MediaLocation, SortKey};
 use crate::state::WindowId;
 
+/// The kind of a plug-in that [`Command::ConfigurePlugin`] names (RFC 0020
+/// §3.3, option A).
+///
+/// This is the **ABI's** kind type, not a mirror of it: the payload and the
+/// protocol's `LoadPlugin`/`PluginLoaded` messages therefore carry one kind
+/// type and one encoding. Naming it here is the reason this crate takes exactly
+/// one internal dependency (`rustamp-plugin-abi`, `MIT OR Apache-2.0`); see the
+/// RFC 0004 §3 erratum (RFC 0004 §7) and RFC 0020 §7.
+pub use rustamp_plugin_abi::PluginKind;
+
 /// Selection operations on the playlist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectOp {
@@ -288,4 +298,51 @@ pub enum Command {
     /// stream rule is an own choice (RFC 0018). No payload: the app owns the
     /// player's state and resolves the dead entries itself. RFC 0018.
     RemoveDeadFiles,
+
+    // ----- RFC 0020: the plug-in requests the player sends to the host -----
+    //
+    // Only the host's UI thread may call into a plug-in (S09 §3.5), so these
+    // five requests travel to `rustamp-plughost32.exe` inside
+    // `Message::CommandToHost` — the carrier that already exists; `Message`
+    // itself is unchanged. They are **player-internal**: no public
+    // `WM_COMMAND` id exists for a request that names a plug-in, so the host's
+    // id table has no row for them and the host never forwards them back
+    // (RFC 0020 §3.1, §12).
+    /// Ask the host to open the configuration dialog of the plug-in with this
+    /// id. The id is the one the host assigned in its `PluginLoaded` answer and
+    /// is valid only for that host process's lifetime. `kind` is the kind the
+    /// request claims; the host compares it with the kind it recorded when the
+    /// plug-in was loaded and refuses a mismatch. RFC 0020.
+    ConfigurePlugin {
+        /// Host-assigned plug-in id.
+        plugin_id: u32,
+        /// The kind the request claims the plug-in has.
+        kind: PluginKind,
+    },
+    /// Ask the host to seek the input plug-in with this id. The plug-in flushes
+    /// its own output at the new time (S09 §3.7); the host must not. RFC 0020.
+    SeekPlugin {
+        /// Host-assigned plug-in id (valid for this host process only).
+        plugin_id: u32,
+        /// Target position in milliseconds, passed through unchanged (S09 sets
+        /// no range).
+        to_ms: i32,
+    },
+    /// Ask the host to pause the input plug-in with this id (S09 §3.1 offset
+    /// 0x3c; the plug-in pauses its output). RFC 0020.
+    PausePlugin {
+        /// Host-assigned plug-in id (valid for this host process only).
+        plugin_id: u32,
+    },
+    /// The counterpart of [`Command::PausePlugin`] (offset 0x40). RFC 0020.
+    UnpausePlugin {
+        /// Host-assigned plug-in id (valid for this host process only).
+        plugin_id: u32,
+    },
+    /// Ask the host to stop the input plug-in with this id; the plug-in closes
+    /// its own output (S09 §3.5 step 6). RFC 0020.
+    StopPlugin {
+        /// Host-assigned plug-in id (valid for this host process only).
+        plugin_id: u32,
+    },
 }

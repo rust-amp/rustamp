@@ -346,17 +346,15 @@ fn run_ui_loop(
                     let _ = outbox_tx.try_send(reply);
                     budget -= 1;
                 }
-                Ok(ControlInbound::ConfigureVis) => {
-                    // The player's Configure request for the visualization
-                    // plug-in (RFC 0005 §5.4). The plug-in opens the dialog,
-                    // so this runs here, on the thread that owns the window
-                    // the plug-in was handed as its parent. A refusal is
-                    // reported: stdout is the frame stream, so the diagnostic
-                    // goes to stderr (which the supervisor inherits).
-                    if let Err(error) = registry.configure_vis() {
-                        eprintln!(
-                            "rustamp-plughost32: cannot configure the visualization plug-in: {error}"
-                        );
+                Ok(request) => {
+                    // A plug-in request (RFC 0005 §5.4, RFC 0020): the running
+                    // visualization's Configure request, or one of the five that
+                    // name a plug-in by its id. They run here, on the thread that
+                    // owns the window the plug-in was handed as its parent, and
+                    // they are fire-and-forget: a refusal is a diagnostic on
+                    // stderr (stdout is the frame stream), never a reply frame.
+                    if let Err(message) = control::apply_plugin_request(registry, &request) {
+                        eprintln!("rustamp-plughost32: {message}");
                     }
                     budget -= 1;
                 }

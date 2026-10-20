@@ -32,7 +32,13 @@ use crate::shm::{RingDirection, RingExpect, RingKind, RingRefuseReason};
 ///   and `DspError`, whose index moves from 26 to 27 — for the same reason
 ///   the 0 → 1 and 2 → 3 bumps exist: the mismatch becomes a clean `Hello`
 ///   rejection instead of a decode error.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// * `5`: adds the RFC 0020 plug-in request `Command` variants
+///   (`ConfigurePlugin`, `SeekPlugin`, `PausePlugin`, `UnpausePlugin`,
+///   `StopPlugin`), which travel in the existing `Message::CommandToHost`
+///   carrier — `Message` itself is unchanged. A v4 peer cannot decode the
+///   appended variants, so the same rule applies: a clean `Hello` rejection
+///   instead of a postcard decode error.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Wire form of [`VisFrame`] (flat vectors, `channel-major`: all samples of
 /// channel 0, then channel 1). Each vector has `VIS_CHANNELS * VIS_SAMPLES` values.
@@ -173,6 +179,13 @@ pub enum Message {
     /// the player -> host direction of RFC 0005 §5.4
     /// (`ConfigureVisPlugin`/`ToggleVisPlugin`, which the app applies *through*
     /// the host because the plug-in runs in `rustamp-plughost32.exe`).
+    ///
+    /// RFC 0020 appends the requests that **name** a plug-in — its
+    /// host-assigned id plus, where the request has one, a small payload
+    /// (`ConfigurePlugin`, `SeekPlugin`, `PausePlugin`, `UnpausePlugin`,
+    /// `StopPlugin`) — without adding a `Message` variant: this carrier already
+    /// reaches the host's router, so the whole wire change is five `Command`
+    /// variants and one version number.
     ///
     /// Appended at the end of the enum so every earlier `Message` keeps its
     /// variant index (and its bytes). **Placeholder overlap:** how this relates
