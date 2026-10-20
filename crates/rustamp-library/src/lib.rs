@@ -374,6 +374,8 @@ use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 
 mod artwork;
+#[cfg(test)]
+mod artwork_props;
 mod open;
 #[cfg(test)]
 mod query_props;
