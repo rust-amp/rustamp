@@ -130,6 +130,12 @@ Behaviour the core contract leaves open, and what the decoders do.
   points behind the end of the file is the case the end-of-stream rule
   catches: it opens, and the stream ends before the media header's count is
   reached.
+  The **sample tables** are read from the file itself, and the length of the
+  file bounds the read: a table that claims more samples than the file holds
+  is not there, so the file states nothing about its samples and is no
+  oracle. The bound keeps the probe of a hostile file from spending the
+  memory of the player: a box that claims four billion samples would ask for
+  four gigabytes otherwise.
 - **The Ogg header** (`ogg_header.rs`). An Ogg file is a sequence of **pages**,
   and it states the end of its stream with a **flag** instead of with a count:
   the last page of a logical bitstream carries the end-of-stream flag (bit 2 of

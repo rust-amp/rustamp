@@ -33,6 +33,9 @@ mod mp4_header;
 mod mpeg_header;
 mod ogg_header;
 
+#[cfg(test)]
+mod probe_fuzz;
+
 pub use symphonia_dec::{SymphoniaDecoder, SymphoniaDecoderFactory};
 pub use wave_dec::{WaveDecoder, WaveDecoderFactory};
 

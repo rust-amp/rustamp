@@ -72,7 +72,11 @@ fn frame_samples(config: u8) -> usize {
 ///
 /// `None` when the packet does not carry a usable table of contents: an empty
 /// packet, or a code-3 packet without its frame count.
-fn packet_frames(packet: &[u8]) -> Option<usize> {
+///
+/// The function is crate-internal: the malformed-input suite
+/// (`crate::probe_fuzz`) reads the table of contents of a packet that comes
+/// from a file, and no caller outside the crate has a use for it.
+pub(crate) fn packet_frames(packet: &[u8]) -> Option<usize> {
     let toc = *packet.first()?;
     let frames = match toc & 0x03 {
         // One frame.
