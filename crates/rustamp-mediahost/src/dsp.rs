@@ -144,6 +144,19 @@ fn wait_command(peer: &ControlPeer) -> Result<Message> {
     peer.recv_blocking()
 }
 
+/// Record a terminal diagnosis in the control peer and report it.
+///
+/// The peer stores the **first** diagnosis, so a failure that reaches the
+/// caller is the session's terminal state: every later call names the same
+/// cause. A diagnosis that is only handed to one caller is not — the next
+/// call would name a different cause for the same dead host, and the session
+/// would look alive in between. The caller checks the peer first, so an
+/// earlier cause still wins.
+fn diagnose(peer: &ControlPeer, reason: &str) -> MediaHostError {
+    peer.fail(reason);
+    MediaHostError::Disconnected(reason.into())
+}
+
 fn poll_commands(peer: &ControlPeer, chain: &mut dyn ResidentChain) -> Result<Option<Transition>> {
     while let Some(message) = peer.try_recv()? {
         match message {
@@ -601,10 +614,11 @@ impl<F: PcmRings> DspSession<F> {
                 Ok(0) => return Err(MediaHostError::TimedOut),
                 Ok(written) => offset += written,
                 Err(RingError::Closed) => {
+                    // The host is gone: the ring is closed under the write.
+                    // The diagnosis becomes the session's terminal state, so
+                    // every later call names the same cause.
                     self.peer.check()?;
-                    return Err(MediaHostError::Disconnected(
-                        "DSP host closed its input ring".into(),
-                    ));
+                    return Err(diagnose(&self.peer, "DSP host closed its input ring"));
                 }
                 Err(error) => {
                     self.peer.fail(&error.to_string());
@@ -627,6 +641,9 @@ impl<F: PcmRings> DspSession<F> {
     /// control channel failed (the helper is gone: the frames are lost and
     /// the write fails loudly, naming the death), or the caller's deadline
     /// passed (a stall: the write fails loudly, never a silent success).
+    /// A closed ring ends the wait like a dead helper: the diagnosis is
+    /// recorded in the peer, so the session's terminal state names the same
+    /// cause in every later call.
     fn await_delivery(&mut self, deadline: Option<Instant>) -> Result<()> {
         // The target: the host reads the in-ring in order, so it has taken
         // this write's frames exactly when its read count reached the
@@ -642,9 +659,7 @@ impl<F: PcmRings> DspSession<F> {
             if self.to_host.is_closed() {
                 // The supervisor closed the ring, so the helper is gone.
                 self.peer.check()?;
-                return Err(MediaHostError::Disconnected(
-                    "DSP host closed its input ring".into(),
-                ));
+                return Err(diagnose(&self.peer, "DSP host closed its input ring"));
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(MediaHostError::TimedOut);
@@ -661,11 +676,12 @@ impl<F: PcmRings> DspSession<F> {
                     Ok(_) => {}
                     Err(RingError::Closed) => {
                         self.peer.check()?;
-                        return Err(MediaHostError::Disconnected(
-                            "DSP host closed its input ring".into(),
-                        ));
+                        return Err(diagnose(&self.peer, "DSP host closed its input ring"));
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        self.peer.fail(&error.to_string());
+                        return Err(error.into());
+                    }
                 }
             } else if self.from_host.frames_available() == 0 {
                 // The back-ring is empty: the host's publish signals the
@@ -674,11 +690,12 @@ impl<F: PcmRings> DspSession<F> {
                     Ok(_) => {}
                     Err(RingError::Closed) => {
                         self.peer.check()?;
-                        return Err(MediaHostError::Disconnected(
-                            "DSP host closed its back-ring".into(),
-                        ));
+                        return Err(diagnose(&self.peer, "DSP host closed its back-ring"));
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        self.peer.fail(&error.to_string());
+                        return Err(error.into());
+                    }
                 }
             } else {
                 // Both events are set, so neither wait would block: the
