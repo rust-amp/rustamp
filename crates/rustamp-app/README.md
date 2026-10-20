@@ -41,6 +41,18 @@ native prompt. The menu row that runs the same command is a row of the `Play`
 submenu: S04 §2 leaves that submenu's rows unmeasured, so the row's label is
 our own choice — the command it runs is not.
 
+**The face reads its field with the command line's own URL rule**
+(`cli::media_argument`), so the two cannot drift apart:
+
+* an `http://` URL that names a host is a stream and reaches the queue as a
+  URL track;
+* a scheme this build cannot read (`https://` for instance) is **refused in
+  the dialog**: the dialog stays open, the text stays, the reason is shown —
+  and the reason is the command line's own wording — so nothing is queued
+  that only the decoder would refuse later, at open time;
+* a path names no scheme, so it is a **file** and is opened as one;
+* an empty field confirms nothing (the existing no-op).
+
 ## Headless mode — safe to run anywhere
 
 ```text

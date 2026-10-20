@@ -57,9 +57,14 @@
 //!   ([`DialogManager::drop_media_path`], which stages them as picks).
 //!   [`DialogManager::stage_media_paths`] is the same staging for a later
 //!   native picker. Confirming produces [`Command::AddItems`] with the opening
-//!   command's `play` flag carried through untouched. Clipboard paste is not
-//!   supported: `winit` has no clipboard and a Win32 clipboard binding would
-//!   be a new dependency. The reference's real layout, filters and wording stay
+//!   command's `play` flag carried through untouched. The **location** face is
+//!   the one exception: its field is a URL, and only the app knows the rule
+//!   that says what a URL is (the command line's own URL rule), so the app
+//!   reads the field and hands the location it accepted over
+//!   ([`DialogManager::set_media_location`]); the manager confirms that one.
+//!   Clipboard paste is not supported: `winit` has no clipboard and a Win32
+//!   clipboard binding would be a new dependency. The reference's real layout,
+//!   filters and wording stay
 //!   open (a capture would need the three dialogs' geometry, filter lists and
 //!   exact labels).
 //! * Typed text keeps its case and punctuation (`C:\Music\song.mp3`); the
@@ -384,22 +389,6 @@ pub fn media_items_for_paths(paths: &[PathBuf]) -> Vec<rustamp_core::playlist::M
         .collect()
 }
 
-/// Maps a location-dialog entry to its playlist location.
-///
-/// The trimmed text becomes [`MediaLocation::Url`]; blank input is `None`
-/// (nothing to confirm). No validation beyond that: URL syntax is unmeasured,
-/// so anything non-blank is passed through. Pure function so the app and
-/// tests share it.
-pub fn media_item_for_url(text: &str) -> Option<rustamp_core::playlist::MediaLocation> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(rustamp_core::playlist::MediaLocation::Url(
-        trimmed.to_string(),
-    ))
-}
-
 /// One row of the skin browser: the skins the app can load today.
 ///
 /// The project has no skin search path (no skins-directory concept: the CLI
@@ -485,6 +474,14 @@ pub struct DialogManager {
     /// The open-media dialog's staged picks (the stand-in for the OS picker's
     /// result; see the module docs).
     media_paths: Vec<PathBuf>,
+    /// The location the location face's entry field stands for.
+    ///
+    /// The **app** reads that field, because only the app knows the rule
+    /// that says what a URL is (the command line's own URL rule, see
+    /// [`set_media_location`](Self::set_media_location)), and hands the
+    /// location it accepted over. `None` means the app has not accepted the
+    /// field, so the location face confirms nothing.
+    media_location: Option<rustamp_core::playlist::MediaLocation>,
     /// The load-playlist dialog's entry field (a typed playlist path).
     playlist_text: String,
     /// The load-playlist dialog's staged pick (the stand-in for the OS
@@ -510,6 +507,7 @@ impl DialogManager {
         self.skin_scroll = 0;
         self.media_text.clear();
         self.media_paths.clear();
+        self.media_location = None;
         self.playlist_text.clear();
         self.playlist_paths.clear();
     }
@@ -524,6 +522,7 @@ impl DialogManager {
             self.skin_scroll = 0;
             self.media_text.clear();
             self.media_paths.clear();
+            self.media_location = None;
             self.playlist_text.clear();
             self.playlist_paths.clear();
         }
@@ -538,6 +537,7 @@ impl DialogManager {
         self.skin_scroll = 0;
         self.media_text.clear();
         self.media_paths.clear();
+        self.media_location = None;
         self.playlist_text.clear();
         self.playlist_paths.clear();
     }
@@ -848,6 +848,20 @@ impl DialogManager {
         self.media_paths = paths;
     }
 
+    /// The location the location face's entry field stands for.
+    ///
+    /// The **app** reads that field: only the app knows the rule that says
+    /// what a URL is (the command line's own URL rule, so an `http://` URL
+    /// is a stream and another scheme is refused), and it hands the location
+    /// it accepted over. The manager then confirms it, so the dialog's
+    /// accept path stays the one place that builds the command.
+    ///
+    /// `None` (the default) means the app has not accepted the field: the
+    /// location face confirms nothing and stays open.
+    pub fn set_media_location(&mut self, location: Option<rustamp_core::playlist::MediaLocation>) {
+        self.media_location = location;
+    }
+
     /// The staged open-media picks, if any.
     pub fn staged_media_paths(&self) -> &[PathBuf] {
         &self.media_paths
@@ -923,8 +937,12 @@ impl DialogManager {
     /// Confirms the open-media dialog: turns the staged picks or the entry
     /// field into the resulting [`Command::AddItems`].
     ///
-    /// * `Location` reads the entry field: trimmed non-blank text becomes one
-    ///   [`MediaLocation::Url`](rustamp_core::playlist::MediaLocation::Url).
+    /// * `Location` confirms the location the **app** accepted: the app
+    ///   reads the entry field with the command line's own URL rule (only
+    ///   an `http://` URL that names a host is a stream; another scheme is
+    ///   refused) and hands the location over with
+    ///   [`set_media_location`](Self::set_media_location). Without such a
+    ///   location there is nothing to confirm.
     /// * `Files` reads the staged picks in order (each a
     ///   [`MediaLocation::File`](rustamp_core::playlist::MediaLocation::File)),
     ///   falling back to the entry field as a single file path.
@@ -944,7 +962,7 @@ impl DialogManager {
             _ => return None,
         };
         let items = match kind {
-            OpenMediaKind::Location => vec![media_item_for_url(&self.media_text)?],
+            OpenMediaKind::Location => vec![self.media_location.clone()?],
             OpenMediaKind::Files => {
                 if self.media_paths.is_empty() {
                     let trimmed = self.media_text.trim();
@@ -2797,22 +2815,43 @@ mod tests {
     }
 
     #[test]
-    fn a_location_entry_is_a_url_or_nothing() {
+    fn the_location_face_confirms_the_location_the_app_accepted() {
+        // The app reads the location face's field (it knows the rule that
+        // says what a URL is) and hands the location over; the manager
+        // confirms it. Without such a location the face confirms nothing.
         use rustamp_core::playlist::MediaLocation;
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: true,
+        });
+        manager.set_media_text("http://example.com/stream.mp3");
         assert_eq!(
-            media_item_for_url("http://example.com/stream.mp3"),
-            Some(MediaLocation::Url(
-                "http://example.com/stream.mp3".to_string()
-            ))
+            manager.confirm_open_media(),
+            None,
+            "the app has not accepted the field yet"
         );
-        // Surrounding whitespace is ignored, but the text is passed through
-        // otherwise (URL syntax is unmeasured).
+        manager.set_media_location(Some(MediaLocation::Url(
+            "http://example.com/stream.mp3".to_string(),
+        )));
         assert_eq!(
-            media_item_for_url("  http://example.com/x  "),
-            Some(MediaLocation::Url("http://example.com/x".to_string()))
+            manager.confirm_open_media(),
+            Some(Command::AddItems {
+                items: vec![MediaLocation::Url(
+                    "http://example.com/stream.mp3".to_string()
+                )],
+                at: None,
+                play: true,
+            })
         );
-        assert_eq!(media_item_for_url(""), None);
-        assert_eq!(media_item_for_url("   "), None);
+        // The location goes with the dialog: a reopened face confirms
+        // nothing, so a stale location can never be added.
+        manager.close_any();
+        manager.open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: true,
+        });
+        assert_eq!(manager.confirm_open_media(), None);
     }
 
     #[test]
@@ -2896,31 +2935,6 @@ mod tests {
                 play: true,
             })
         );
-    }
-
-    #[test]
-    fn confirming_a_location_adds_the_typed_url() {
-        use rustamp_core::playlist::MediaLocation;
-        let mut manager = DialogManager::new();
-        manager.open(DialogKind::OpenMedia {
-            kind: OpenMediaKind::Location,
-            play: true,
-        });
-        assert_eq!(manager.confirm_open_media(), None);
-        manager.set_media_text("http://example.com/stream.mp3");
-        assert_eq!(
-            manager.confirm_open_media(),
-            Some(Command::AddItems {
-                items: vec![MediaLocation::Url(
-                    "http://example.com/stream.mp3".to_string()
-                )],
-                at: None,
-                play: true,
-            })
-        );
-        // Blank input confirms nothing; the dialog stays open for a retry.
-        manager.set_media_text("   ");
-        assert_eq!(manager.confirm_open_media(), None);
     }
 
     #[test]
