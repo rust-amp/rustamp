@@ -144,7 +144,7 @@ These are documented in each module and are candidates for a spec to override:
 | M3U | most recent `#EXTINF` wins; leading number of the length; negative/unparseable length = unknown; empty title = `None`; `#` line = comment; `#EXTALBUM`/`#EXTART` recognized and dropped |
 | PLS | keys before the first section and inside `[playlist]`; ascending index order; last occurrence wins (an empty value removes the key); `NumberOfEntries`/`Version` ignored; values verbatim |
 | XSPF | every `<track>` in document order; a track without a location is dropped; `xml:base` is a directory prefix; names matched by local part, case-insensitively; a document cut off mid-track still yields that track |
-| writing | CRLF for M3U/PLS, LF for XSPF, always UTF-8; unknown duration is `#EXTINF:-1`; a duration with a sub-second part is written with three decimals so that write → read is exact |
+| writing | CRLF for M3U/PLS, LF for XSPF, always UTF-8; a metadata line is written **only when it carries information** (a title that is not empty or a duration), a title is written the way the reader hands it back (trimmed; a line break becomes a space in M3U/PLS), an entry with neither a title nor a duration is written as the bare location; unknown duration is `#EXTINF:-1`; a duration with a sub-second part is written with three decimals so that write → read is exact. The file is a fixed point of write → read → write |
 | paths | relative entries join the playlist directory; `/` and `\` are both separators; a drive prefix is never joined; `file:` → `File`, any other scheme → `Url` untouched; empty location = skipped |
 | randomize | one Fisher-Yates permutation from a seeded xorshift64\* generator, applied through `apply_order`; ids, selection and current entry unchanged |
 
@@ -152,21 +152,24 @@ These are documented in each module and are candidates for a spec to override:
 
 `write_playlist` then `read_playlist_path` is exact for locations (absolute
 files, URLs), non-empty trimmed titles and durations (whole milliseconds), in
-all four formats (`tests/formats.rs`, `tests/property.rs`). What is lost, and
-why, pinned in `tests/audit.rs`. The same rules are pinned as *properties*
-over seeded random playlists in `tests/format_properties.rs`: the round trip
-and its documented losses, the format detection (including a long comment in
-front of the file), the total behavior of the readers on malformed input, and
-the stability of the writer.
+all four formats (`tests/formats.rs`, `tests/property.rs`). Writing is also
+**idempotent**: writing the parsed entries again yields the same bytes, for
+every entry shape (an empty title, a padded title, a title with a line
+break, a duration without a title). What is lost, and why, pinned in
+`tests/audit.rs`. The same rules are pinned as *properties* over seeded random
+playlists in `tests/format_properties.rs`: the round trip and its documented
+losses, the format detection (including a long comment in front of the file),
+the total behavior of the readers on malformed input, and the idempotence of
+the writer.
 
 | Field | Loss | Reason |
 |---|---|---|
-| title with leading/trailing whitespace | comes back trimmed | every reader trims (`normalize_title`) |
-| `Some("")` title | comes back `None` | same |
-| entry with an empty title and no duration | the `#EXTINF` line is gone when the file is written again | the reader turns the empty title into "no title"; an entry with neither a title nor a duration needs no `#EXTINF` line, so the second write drops it. The file converges after one round |
-| title with CR/LF | M3U/M3U8/PLS: line break becomes a space; XSPF exact | one entry per line in those formats |
+| title with leading/trailing whitespace | comes back trimmed | every reader trims (`normalize_title`); the writers store the title trimmed as well, so the file itself does not change |
+| `Some("")` title | comes back `None` | same; an entry with neither a title nor a duration carries no information, so no metadata line is written for it |
+| title with CR/LF | M3U/M3U8/PLS: line break becomes a space; XSPF: a line break inside the title is exact | one entry per line in those formats |
 | artist, album | never stored | `LoadedEntry` has no field (2.3); `#EXTART`, `#EXTALBUM`, XSPF `creator`/`album` are parsed away. Needs a core RFC together with the S14 decision (is `title` raw or formatted; is `Artist - Title` split) |
-| relative `File` location | written as-is, resolves against the reader's base; a relative location that looks like a PLS key (`FileN=…`, `[playlist]`) is detected as a PLS and loses the key | `LoadedEntry::location` is documented as resolved; callers must resolve before writing. A `FileN=` line is a PLS marker and a content marker wins over the file name (section 3) |
+| relative `File` location | written as-is, resolves against the reader's base; a relative location that looks like a PLS key (`FileN=…`, `[playlist]`) is detected as a PLS and loses the key | `LoadedEntry::location` is documented as resolved; callers must resolve before writing. A `FileN=` line is a PLS marker and a content marker wins over the file name (section 3). The file converges after one round: from the second write on it carries the resolved path |
+| location with the other separator (`/` on Windows, `\` elsewhere) | comes back with the platform's separator | the readers treat both as the same separator (section 3, "paths"); M3U/PLS store the location verbatim, XSPF stores an absolute path as a `file:` URL and is therefore unaffected. The file converges after one round |
 | XSPF `<title>` of the list, `<meta>`, `<extension>`, per-track `<image>`/`<info>` | dropped | no field |
 | PLS/M3U unknown keys and comments | dropped | no field |
 

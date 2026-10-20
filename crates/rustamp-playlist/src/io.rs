@@ -194,6 +194,9 @@ fn check_claim(format: PlaylistFormat, bytes: &[u8]) -> Result<()> {
 /// M3U/M3U8 and PLS use CRLF line endings, XSPF uses LF; everything is UTF-8.
 /// B4S is recognized but not implemented and returns an error.
 ///
+/// The result is a **fixed point** of write → read → write: writing the
+/// entries the reader returns yields the same bytes, for every entry shape.
+///
 /// An entry the format cannot store without changing it is a
 /// [`PlaylistError::InvalidEntry`] rather than a silently altered file: an
 /// empty location, a location with leading or trailing whitespace (readers

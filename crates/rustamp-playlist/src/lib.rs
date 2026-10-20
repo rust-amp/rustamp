@@ -13,7 +13,8 @@
 //!   ([`import_playlist_file`], [`import_playlist_path`]), so a caller that
 //!   writes the playlist back can use the format it came in.
 //! * **Writes** M3U/M3U8, PLS and XSPF ([`write_playlist`]) so that
-//!   write → read round-trips order, locations, titles and durations.
+//!   write → read round-trips order, locations, titles and durations, and so
+//!   that writing the parsed entries again yields the same bytes.
 //! * **Resolves** relative entries against the playlist file's directory, not
 //!   the process working directory, including `file:` and `http(s):` URLs
 //!   ([`location`]).

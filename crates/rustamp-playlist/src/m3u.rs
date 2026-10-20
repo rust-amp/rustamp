@@ -27,6 +27,11 @@
 //! * The length is parsed from the leading number, so IPTV-style attributes
 //!   (`#EXTINF:5 tvg-id="x",Title`) do not break it.
 //! * Lines are split on LF, CRLF and lone CR.
+//!
+//! Writing follows the mirror rule: a metadata line is written only when it
+//! carries information (a title that is not empty or a duration), a title is
+//! written the way the reader hands it back, and the file is a fixed point of
+//! write → read → write.
 
 use std::path::Path;
 
@@ -127,32 +132,45 @@ pub fn read_text_report(text: &str, base: &Path) -> PlaylistReport {
 /// Writes M3U. Line endings are CRLF and the encoding is UTF-8, matching what
 /// the format conventionally uses.
 ///
-/// An entry with a title or a duration gets an `#EXTINF` line; the `#EXTM3U`
-/// header is written exactly when at least one `#EXTINF` is. An unknown
-/// duration is written as `-1`, the conventional marker that the reader maps
-/// back to "no duration".
+/// An `#EXTINF` line is written only when it **carries information**: an
+/// entry with a title that is not empty or with a duration gets one, an entry
+/// with neither is written as the bare location. The `#EXTM3U` header is
+/// written exactly when at least one `#EXTINF` is.
+///
+/// A title is written the way the reader hands it back: a line break becomes a
+/// space and the result is trimmed. An unknown duration is written as `-1`,
+/// the conventional marker that the reader maps back to "no duration".
+///
+/// The result is a **fixed point** of write → read → write: writing the
+/// entries the reader returns yields the same bytes, for every entry shape.
 pub fn write(entries: &[LoadedEntry]) -> Vec<u8> {
+    let mut body = String::new();
+    let mut has_metadata = false;
+    for entry in entries {
+        let title = entry
+            .title
+            .as_deref()
+            .map(sanitize_line)
+            .unwrap_or_default();
+        if !title.is_empty() || entry.duration_ms.is_some() {
+            has_metadata = true;
+            body.push_str("#EXTINF:");
+            match entry.duration_ms {
+                Some(ms) => body.push_str(&format_seconds(ms)),
+                None => body.push_str("-1"),
+            }
+            body.push(',');
+            body.push_str(&title);
+            body.push_str("\r\n");
+        }
+        body.push_str(&sanitize_line(&entry.location.to_display_string()));
+        body.push_str("\r\n");
+    }
     let mut out = String::new();
-    if entries
-        .iter()
-        .any(|e| e.title.is_some() || e.duration_ms.is_some())
-    {
+    if has_metadata {
         out.push_str("#EXTM3U\r\n");
     }
-    for entry in entries {
-        if entry.title.is_some() || entry.duration_ms.is_some() {
-            out.push_str("#EXTINF:");
-            match entry.duration_ms {
-                Some(ms) => out.push_str(&format_seconds(ms)),
-                None => out.push_str("-1"),
-            }
-            out.push(',');
-            out.push_str(&sanitize_line(entry.title.as_deref().unwrap_or("")));
-            out.push_str("\r\n");
-        }
-        out.push_str(&sanitize_line(&entry.location.to_display_string()));
-        out.push_str("\r\n");
-    }
+    out.push_str(&body);
     out.into_bytes()
 }
 
@@ -275,6 +293,16 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_extinf_carries_no_information() {
+        // The mirror rule of the writer: an empty title and an unknown length
+        // are "no title" and "no duration", so the entry has no metadata.
+        let entries = read_text("#EXTINF:-1,\na.mp3\n", &base());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, None);
+        assert_eq!(entries[0].duration_ms, None);
+    }
+
+    #[test]
     fn most_recent_extinf_wins() {
         let entries = read_text("#EXTINF:1,First\n#EXTINF:2,Second\na.mp3\n", &base());
         assert_eq!(entries[0].title.as_deref(), Some("Second"));
@@ -322,6 +350,31 @@ mod tests {
         let entries = vec![LoadedEntry::new(file("C:/Music/a.mp3"))];
         let bytes = write(&entries);
         assert_eq!(String::from_utf8(bytes).unwrap(), "C:/Music/a.mp3\r\n");
+    }
+
+    #[test]
+    fn a_metadata_line_is_written_only_when_it_carries_information() {
+        // An empty title is "no title" for the reader, so no `#EXTINF` line
+        // is written for it: the file is a fixed point of write → read →
+        // write.
+        let entries = vec![
+            LoadedEntry::new(file("C:/Music/a.mp3")),
+            LoadedEntry {
+                location: file("C:/Music/b.mp3"),
+                title: Some(String::new()),
+                duration_ms: None,
+            },
+        ];
+        let text = String::from_utf8(write(&entries)).unwrap();
+        assert_eq!(text, "C:/Music/a.mp3\r\nC:/Music/b.mp3\r\n");
+    }
+
+    #[test]
+    fn a_duration_without_a_title_keeps_its_extinf_line() {
+        let entries = vec![LoadedEntry::new(file("C:/Music/a.mp3")).with_duration_ms(1000)];
+        let text = String::from_utf8(write(&entries)).unwrap();
+        assert_eq!(text, "#EXTM3U\r\n#EXTINF:1,\r\nC:/Music/a.mp3\r\n");
+        assert_eq!(read_text(&text, &base()), entries);
     }
 
     #[test]
