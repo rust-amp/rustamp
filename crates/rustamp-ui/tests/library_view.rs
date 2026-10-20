@@ -219,6 +219,46 @@ fn the_total_is_displayed() {
 }
 
 #[test]
+fn a_scan_status_replaces_the_range_line() {
+    let mut view = LibraryView::new(20);
+    view.apply_page(rows(0..20), 1234, 0);
+    assert_eq!(view.status_line(), "1-20 of 1234");
+    assert_eq!(view.scan_status(), None, "there is no scan");
+
+    view.set_scan_status("scanning: 120 seen, 30 added, 5 updated, 2 skipped");
+    assert_eq!(
+        view.scan_status(),
+        Some("scanning: 120 seen, 30 added, 5 updated, 2 skipped"),
+        "the view carries the scan's text"
+    );
+    assert_eq!(
+        view.status_line(),
+        "scanning: 120 seen, 30 added, 5 updated, 2 skipped",
+        "the scan's text replaces the range"
+    );
+
+    view.clear_scan_status();
+    assert_eq!(view.scan_status(), None, "the scan's text is gone");
+    assert_eq!(
+        view.status_line(),
+        "1-20 of 1234",
+        "the visible range is the status line again"
+    );
+}
+
+#[test]
+fn an_empty_scan_status_clears_the_status() {
+    let mut view = LibraryView::new(20);
+    view.apply_page(rows(0..20), 1234, 0);
+
+    view.set_scan_status("scanning: 120 seen");
+    view.set_scan_status("");
+
+    assert_eq!(view.scan_status(), None, "an empty text is no status");
+    assert_eq!(view.status_line(), "1-20 of 1234");
+}
+
+#[test]
 fn the_scroll_follows_the_selection() {
     let mut view = LibraryView::new(10);
     view.apply_page(rows(0..50), 100, 0);

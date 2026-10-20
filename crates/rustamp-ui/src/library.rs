@@ -21,7 +21,16 @@
 //!    of matches and the index of the first row.
 //! 3. The view answers what to draw: [`LibraryView::visible_rows`] (the rows
 //!    at the scroll offset), [`LibraryView::selected_row`] (the row to play)
-//!    and [`LibraryView::status_line`] (the visible range and the total).
+//!    and [`LibraryView::status_line`] (the visible range and the total, or
+//!    the scan's status while a scan has something to say).
+//!
+//! The **status line** is the one text the view owns that is not about the
+//! rows: it is the visible range of the list (`1-20 of 1234`), and while a
+//! scan runs it is the scan's own text
+//! ([`LibraryView::set_scan_status`]). The rule is simple: a scan status
+//! **replaces** the range, and clearing it brings the range back. The
+//! renderer draws the status line into the status band, so the app never
+//! paints that band itself.
 //!
 //! The request is **scroll-aligned**: its offset is the first visible row, so
 //! the rows the app loads are exactly the rows the window shows.
@@ -142,9 +151,9 @@ pub struct LibraryRequest {
 /// The media library's headless view model.
 ///
 /// The model holds the page the app loaded, the search text, the sort key
-/// and direction, the selected row and the scroll offset. It performs no
-/// I/O: [`LibraryView::request`] asks for rows and
-/// [`LibraryView::apply_page`] takes them back.
+/// and direction, the selected row, the scroll offset and the status of a
+/// running scan. It performs no I/O: [`LibraryView::request`] asks for rows
+/// and [`LibraryView::apply_page`] takes them back.
 #[derive(Debug, Clone)]
 pub struct LibraryView {
     viewport: usize,
@@ -156,6 +165,7 @@ pub struct LibraryView {
     sort: LibrarySort,
     descending: bool,
     selected: Option<i64>,
+    scan_status: Option<String>,
 }
 
 impl LibraryView {
@@ -175,6 +185,7 @@ impl LibraryView {
             sort: LibrarySort::default(),
             descending: false,
             selected: None,
+            scan_status: None,
         }
     }
 
@@ -466,13 +477,54 @@ impl LibraryView {
     /// The status line: the visible range and the total, e.g. `1-20 of 1234`.
     ///
     /// An empty match set reads `0 of 0`.
+    ///
+    /// While a scan status is set ([`LibraryView::set_scan_status`]) it
+    /// **replaces** the range: the band shows what the scan has to say
+    /// instead of the visible range. Clearing the status brings the range
+    /// back.
     pub fn status_line(&self) -> String {
+        if let Some(status) = &self.scan_status {
+            return status.clone();
+        }
         if self.total == 0 {
             return "0 of 0".to_string();
         }
         let first = self.scroll + 1;
         let last = (self.scroll + self.viewport).min(self.total);
         format!("{first}-{last} of {}", self.total)
+    }
+
+    /// Sets the scan's status text.
+    ///
+    /// While a status is set it **replaces** the visible range in the
+    /// status line ([`LibraryView::status_line`]): the band shows what the
+    /// scan has to say. An empty text clears the status, so the range line
+    /// is the status line again.
+    ///
+    /// The text is the app's own - the scan's phase and its counters - and
+    /// the view only carries it: the renderer draws the status line into
+    /// the status band, clipped to it.
+    pub fn set_scan_status(&mut self, status: &str) {
+        if status.is_empty() {
+            self.clear_scan_status();
+            return;
+        }
+        self.scan_status = Some(status.to_string());
+    }
+
+    /// Clears the scan's status text.
+    ///
+    /// The visible range of the list is the status line again.
+    pub fn clear_scan_status(&mut self) {
+        self.scan_status = None;
+    }
+
+    /// The scan's status text, if the scan has something to say.
+    ///
+    /// `None` when there is no scan: the status line is then the visible
+    /// range of the list.
+    pub fn scan_status(&self) -> Option<&str> {
+        self.scan_status.as_deref()
     }
 
     /// The largest scroll offset: the last screenful of the match set.

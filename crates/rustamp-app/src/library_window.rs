@@ -99,6 +99,10 @@
 //! thread over a channel: the worker never waits for the interface, and the
 //! interface never waits for the worker.
 //!
+//! The text itself belongs to the **view**: the app puts the scan's text
+//! into it ([`LibraryView::set_scan_status`]), and the renderer draws the
+//! view's status line into the band. The app paints nothing itself.
+//!
 //! # The covers
 //!
 //! The list has a cover column: it shows the album art of the row. The art
@@ -135,10 +139,7 @@ use rustamp_library::{
     ArtworkCache, Cancel, CoverImage, Library, Query, RemoveReport, Root, ScanPhase, ScanProgress,
     ScanReport, SortKey, TrackRow,
 };
-use rustamp_ui::library_render::{
-    CoverRef, LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT, LIBRARY_PANEL_BACKGROUND,
-    LIBRARY_SEARCH_BACKGROUND, LIBRARY_SEARCH_PADDING, LIBRARY_STATUS_TEXT,
-};
+use rustamp_ui::library_render::{CoverRef, LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT};
 use rustamp_ui::{
     Key, LibraryChrome, LibraryColumn, LibraryLayout, LibraryRequest, LibraryRow, LibrarySort,
     LibraryView, Modifiers, scroll_for_click,
@@ -394,11 +395,11 @@ impl LibraryWindow {
     /// phase and its counters, a scan that is over shows the visible range
     /// of the list again, and a cancelled scan says so and shows the
     /// committed counters.
+    ///
+    /// The text is the **view's** ([`LibraryView::status_line`]): the app
+    /// puts the scan's text into the view, and the renderer draws it.
     pub fn status_line(&self) -> String {
-        match self.scan_text() {
-            Some(text) => text,
-            None => self.view.status_line(),
-        }
+        self.view.status_line()
     }
 
     /// What the scan has to say, if anything.
@@ -419,6 +420,19 @@ impl LibraryWindow {
         self.cancelled_scan.as_ref().map(cancelled_line)
     }
 
+    /// Puts the scan's text into the view.
+    ///
+    /// The view's status line carries the scan's text while the scan has
+    /// something to say, and the visible range of the list otherwise. The
+    /// renderer draws the view's status line into the status band, so the
+    /// app paints nothing itself.
+    fn update_scan_status(&mut self) {
+        match self.scan_text() {
+            Some(text) => self.view.set_scan_status(&text),
+            None => self.view.clear_scan_status(),
+        }
+    }
+
     /// The native caption of the window.
     ///
     /// The caption carries what the window itself cannot: the failure that
@@ -427,7 +441,7 @@ impl LibraryWindow {
         if let Some(error) = &self.error {
             return format!("Rustamp Library - {error}");
         }
-        match self.scan_text() {
+        match self.view.scan_status() {
             Some(text) => format!("Rustamp Library - {text}"),
             None => "Rustamp Library".to_string(),
         }
@@ -555,6 +569,9 @@ impl LibraryWindow {
         let mut owns: Vec<Option<Arc<CoverImage>>> = Vec::new();
         let (covers, failure) = covers_of(&self.artwork, self.view.visible_rows(), &mut owns);
         self.cover_failure = failure;
+        // The status line is the view's: the renderer draws it into the
+        // status band, whether it is the visible range of the list or the
+        // scan's own text.
         rustamp_ui::render_library_window(
             &mut frame,
             &self.view,
@@ -563,14 +580,6 @@ impl LibraryWindow {
             self.search_focused,
             &covers,
         );
-        // The status line is the app's own: the view's status line is the
-        // visible range of the list, and it cannot carry the scan's
-        // counters. While the scan has something to say, the app paints its
-        // own text over the band.
-        let status = self.status_line();
-        if status != self.view.status_line() {
-            paint_status_line(&mut frame, &self.chrome(), self.viewport(), &status);
-        }
         frame
     }
 
@@ -946,6 +955,7 @@ impl LibraryWindow {
         // The new scan has its own story: the last one is over.
         self.scan_progress = None;
         self.cancelled_scan = None;
+        self.view.clear_scan_status();
         self.worker = Some(ScanWorker {
             cancel,
             events,
@@ -1010,16 +1020,21 @@ impl LibraryWindow {
     /// what the scan does while it runs.
     pub fn poll(&mut self) -> Result<()> {
         self.drain_progress();
-        if !self
+        let finished = self
             .worker
             .as_ref()
-            .is_some_and(|worker| worker.handle.is_finished())
-        {
-            return Ok(());
+            .is_some_and(|worker| worker.handle.is_finished());
+        if finished {
+            let worker = self.worker.take().expect("the finished worker");
+            self.take_back(worker);
         }
-        let worker = self.worker.take().expect("the finished worker");
-        self.take_back(worker);
-        self.refresh()
+        // The view carries the scan's text: the renderer draws the status
+        // line into the band, and the app paints nothing itself.
+        self.update_scan_status();
+        if finished {
+            self.refresh()?;
+        }
+        Ok(())
     }
 
     /// Takes the progress events the worker sent.
@@ -1073,75 +1088,6 @@ fn cancelled_line(report: &ScanReport) -> String {
         removed = report.removed,
         skipped = report.skipped,
     )
-}
-
-/// Paints the status line's text into the status band.
-///
-/// The renderer draws the status line from the view, and the view's status
-/// line is the visible range of the list - it cannot carry the scan's
-/// counters. The renderer has no other public text path, so the app asks it
-/// for the glyphs: a scratch frame whose search field holds the text is
-/// rendered with the same font and the same size as the rest of the window,
-/// and the ink of that field is painted into the band, in the status line's
-/// own colour and over the band's own background.
-fn paint_status_line(frame: &mut Image, chrome: &LibraryChrome, viewport: Rect, text: &str) {
-    let band = chrome.status;
-    if band.is_empty() || text.is_empty() {
-        return;
-    }
-    // The band's own background: the renderer's status line is replaced.
-    frame.fill_rect(band, opaque(LIBRARY_PANEL_BACKGROUND));
-
-    // The glyphs: the search field of a scratch frame is the renderer's only
-    // public text path. The scratch holds that band alone - the rest of the
-    // window is of no use here, and a frame per paint would cost more than
-    // the text it carries.
-    let mut scratch_view = LibraryView::new(1);
-    scratch_view.set_search(text);
-    let source = LibraryChrome::new(&scratch_view, viewport).search;
-    if source.is_empty() {
-        return;
-    }
-    let mut scratch = Image::new(source.width, source.height);
-    rustamp_ui::render_library_window(
-        &mut scratch,
-        &scratch_view,
-        &LibraryLayout::new([1, 1, 1, 1]),
-        viewport,
-        false,
-        &[],
-    );
-    paint_ink(&scratch, source, frame, band);
-}
-
-/// Copies the ink of a rendered text into a band.
-///
-/// The source is a text the renderer drew: its background is the search
-/// field's own colour and its ink is the text's colour. The ink is painted
-/// in the status line's colour, and the background is left to the band.
-fn paint_ink(source: &Image, text_band: Rect, frame: &mut Image, band: Rect) {
-    let background = opaque(LIBRARY_SEARCH_BACKGROUND);
-    let ink = opaque(LIBRARY_STATUS_TEXT);
-    // The text of the search field starts at its own padding; the status
-    // line starts at the left edge of the band.
-    let source_x = text_band.x + LIBRARY_SEARCH_PADDING as i32;
-    for y in band.y..band.bottom() {
-        for x in band.x..band.right() {
-            let sx = x - band.x + source_x;
-            let sy = y - band.y + text_band.y;
-            let Some(pixel) = source.pixel(sx, sy) else {
-                continue;
-            };
-            if pixel != background {
-                frame.set_pixel(x, y, ink);
-            }
-        }
-    }
-}
-
-/// An opaque RGBA colour from an RGB triple.
-fn opaque(rgb: [u8; 3]) -> [u8; 4] {
-    [rgb[0], rgb[1], rgb[2], 255]
 }
 
 /// The paths of the registered roots.

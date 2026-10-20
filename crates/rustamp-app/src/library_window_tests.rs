@@ -16,7 +16,9 @@ use std::time::Duration;
 use rustamp_core::config::Config;
 use rustamp_gfx::{Image, Rect};
 use rustamp_ui::LibraryRow;
-use rustamp_ui::library_render::{LIBRARY_WINDOW_BACKGROUND, LibraryChrome, cover_cell};
+use rustamp_ui::library_render::{
+    LIBRARY_STATUS_TEXT, LIBRARY_WINDOW_BACKGROUND, LibraryChrome, cover_cell,
+};
 use tempfile::TempDir;
 
 use super::*;
@@ -506,7 +508,8 @@ fn status_band(window: &LibraryWindow) -> Rect {
 
 /// The colour of the status line's text.
 fn status_ink() -> [u8; 4] {
-    opaque(LIBRARY_STATUS_TEXT)
+    let [red, green, blue] = LIBRARY_STATUS_TEXT;
+    [red, green, blue, 255]
 }
 
 /// The x of the leftmost pixel of the given colour in the band.
@@ -539,6 +542,28 @@ fn a_running_scan_shows_its_phase_and_its_counters() {
 }
 
 #[test]
+fn the_scan_status_lives_in_the_view() {
+    let mut window = LibraryWindow::default();
+    window.start_job(FakeScan {
+        events: vec![event(ScanPhase::Scanning, 120, 30, 5, 2)],
+        report: ScanReport::default(),
+    });
+    wait_for_phase(&mut window, ScanPhase::Scanning);
+
+    let status = window
+        .view()
+        .scan_status()
+        .expect("the view carries the scan's text")
+        .to_string();
+    assert!(status.contains("scanning"), "{status}");
+    assert_eq!(
+        window.status_line(),
+        status,
+        "the window's status line is the view's"
+    );
+}
+
+#[test]
 fn the_finished_phase_restores_the_normal_status_line() {
     let mut window = LibraryWindow::default();
     let normal = window.view().status_line();
@@ -555,6 +580,10 @@ fn the_finished_phase_restores_the_normal_status_line() {
         window.status_line(),
         normal,
         "the visible range is the status line again"
+    );
+    assert!(
+        window.view().scan_status().is_none(),
+        "the view's scan status is cleared"
     );
 }
 
@@ -588,6 +617,11 @@ fn a_cancelled_scan_shows_the_committed_numbers() {
     assert!(
         !status.contains("30 added") && !status.contains("120 seen"),
         "the committed numbers are shown, not the live ones: {status}"
+    );
+    assert_eq!(
+        window.view().scan_status(),
+        Some(status.as_str()),
+        "the view carries the cancelled text"
     );
 }
 
