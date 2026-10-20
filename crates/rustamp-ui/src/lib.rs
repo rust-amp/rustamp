@@ -53,6 +53,10 @@
 //!   cell of their row. [`library_render::LibraryChrome`] is the
 //!   window's geometry: a pure function of the viewport and the view, so
 //!   the app can map a click to the band it belongs to.
+//! * [`placement`] is the clamp-to-screen rule: a window whose saved
+//!   position points at a screen that is gone is placed so that its title
+//!   bar - the only part of a borderless window the user can drag - stays
+//!   reachable on a screen.
 //! * [`shell::skinned_window_attributes`] is the single place that decides
 //!   what an OS window looks like outside its client area: every window of
 //!   this player is borderless, because its title bar is part of the skin.
@@ -74,10 +78,17 @@ pub mod equalizer;
 pub use docking as geometry;
 pub use docking as windows;
 pub mod layout;
+// The seeded property suite for the layout math. It lives beside the code
+// it tests because it needs the screen types of `rustamp-platform`, which is
+// a dependency of this crate; a test in `tests/` would need them as a
+// dev-dependency, and the crate takes no new dependency.
+#[cfg(test)]
+mod layout_props;
 pub mod library;
 pub mod library_layout;
 pub mod library_render;
 pub mod menu;
+pub mod placement;
 pub mod playlist;
 mod playlist_font;
 pub mod playlist_window;
@@ -150,6 +161,9 @@ pub use menu::{
     check_state, clutter_popup_origin, menu_item_at, menu_popup_origin, native_main_menu,
     native_options_menu, native_visualization_menu, render_main_menu, render_submenu, row_at_y,
     row_bands, submenu_client_size, submenu_entries, top_level,
+};
+pub use placement::{
+    clamp_into_work_area, clamp_to_screen, title_bar_height, title_bar_inside, title_bar_rect,
 };
 pub use playlist::{
     ADD_DIALOG_TITLE, BUTTON_BAND_BOTTOM, BUTTON_BAND_TOP, LIST_SELECT_POINT, LOAD_DIALOG_TITLE,
