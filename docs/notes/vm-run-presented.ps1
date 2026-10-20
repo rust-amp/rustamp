@@ -113,8 +113,17 @@ $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'tools\vm-ca
 Copy-Item (Join-Path $HarnessDir '*') (Join-Path $Stage 'tools\vm-capture') -Recurse -Force
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'captures')
 Copy-Item (Join-Path $landmarkDir '*') (Join-Path $Stage 'captures') -Recurse -Force
+# Only the built binaries go to <Stage>\built: the guest launches
+# `C:\rustamp\built\rustamp.exe` directly, and the staged repo tree keeps its
+# binaries under target\debug. Copying the whole tree (the first version did)
+# left the guest with no exe at the path it launches and the job failed on a
+# missing file instead of a measurement.
+$builtBinaries = Join-Path $BuiltTree 'target\debug'
+if (-not (Test-Path (Join-Path $builtBinaries 'rustamp.exe'))) {
+    throw ("no rustamp.exe under {0} (run vm-run-tests.ps1 first, which builds and stages the tree)" -f $builtBinaries)
+}
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'built')
-Copy-Item (Join-Path $BuiltTree '*') (Join-Path $Stage 'built') -Recurse -Force
+Copy-Item (Join-Path $builtBinaries '*') (Join-Path $Stage 'built') -Recurse -Force
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'skins')
 Copy-Item $skinFile (Join-Path $Stage 'skins\base-2.91.wsz') -Force
 

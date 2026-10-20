@@ -258,3 +258,29 @@ when driven through the same scripted steps, from the same checkpoint, at the
 same DPI, with the same skin, starting from the same window state (EQ+PL
 open)." The provenance travels with the files so the comparison can be audited
 independently.
+
+## Measured in the 2026-10-20 VM campaign (S05 open points)
+
+The eleven-state capture campaign measured two window sizes that S05 §1.1 lists
+as **unknown**, in the same guest, DPI and skin as every other fact here
+(`base-2.91.wsz`, 1024x768, 96 dpi, per-monitor-v2, input method `send-message`):
+
+| Window | Windowshade client size | Double-size client size | Evidence |
+|---|---|---|---|
+| Equalizer | **275 x 14** | **550 x 232** | `base291-eq-shade` / `base291-eq-double`, the action step's own manifest row and the following capture |
+| Playlist editor | see the campaign log | not a command state | `base291-playlist-shade` |
+
+The main window's 275x14 and 550x232 were already settled (S05 §1.1) and were
+reproduced by `base291-main-shade` / `base291-main-double`, which is a useful
+determinism check on the whole pipeline.
+
+**These are measurement results, not spec text.** S05 is audited; the lines
+above belong in a S05 revision that an auditor gates, with the manifest rows as
+the evidence. Until that happens the campaign output is the reference, not the
+spec.
+
+How the sizes were reached, so the claim can be re-run: the equalizer is open at
+launch (the recorded 1:1 landmark pins that start state), then `WM_COMMAND`
+40064 (windowshade) or 40165 (double size) is **posted to the equalizer's own
+window** — no real click, no menu, no keyboard. Each job captures the state
+before and after, which is what proves the action changed something.

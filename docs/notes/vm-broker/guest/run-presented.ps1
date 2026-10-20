@@ -28,6 +28,12 @@ $CaptureRoot = 'C:\rustamp\capture'
 $OutRoot     = 'C:\rustamp\out'
 $OutDir      = Join-Path $OutRoot $Job
 
+# The interactive payload writes its done sentinel and the per-step logs into
+# $OutDir, and the session-0 waiter polls a file there. The directory must exist
+# before the task starts: the first version never created it, so a task that ran
+# perfectly had nowhere to leave evidence and the run looked like a hang.
+$null = New-Item -ItemType Directory -Force -Path $OutDir
+
 $transcript = New-Object System.Collections.Generic.List[string]
 function Show($label, $value) { $transcript.Add(("{0,-22} {1}" -f $label, $value)) }
 
@@ -96,9 +102,9 @@ if ([string]::IsNullOrWhiteSpace($interactiveUser)) { throw 'interactive session
 
 # Paths for the inner payload
 $jobPath = Join-Path $CaptureRoot ("tools\vm-capture\jobs\" + $Job + ".json")
-$installRoot = 'C:\rustamp\built'
+$installRoot = Join-Path $CaptureRoot 'built'   # the host stages target\debug there (C:\rustamp\capture\built)
 $skinPath = Join-Path $CaptureRoot 'skins\base-2.91.wsz'
-$configPath = Join-Path $OutDir 'rustamp.ini'
+$configPath = Join-Path $OutDir 'rustamp.toml'
 $captureScript = Join-Path $CaptureRoot 'tools\vm-capture\Invoke-Capture.ps1'
 $harnessModule = Join-Path $CaptureRoot 'tools\vm-capture\RustampCapture.psm1'
 
@@ -220,8 +226,21 @@ if ($me -eq 0) {
         Write-Host ("running step '$stepName' -> $captureName")
         Write-Host ("  harness args: $($harnessArgs -join ' ')")
         $logBase = Join-Path $OutDir ("step-$stepName")
-        $result = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $CaptureScript @harnessArgs `
-            -RedirectStandardOutput ($logBase + '.stdout.txt') -RedirectStandardError ($logBase + '.stderr.txt') -Wait -PassThru
+        # Start-Process, not the call operator: the redirection parameters
+        # belong to Start-Process, and passing them to powershell.exe (the first
+        # version did exactly that) made the child fail before it ran a step,
+        # with an empty $LASTEXITCODE and no output at all.
+        #
+        # Arguments must be quoted by hand: Start-Process joins an array with
+        # spaces and would split an action text like "the landmark start state,
+        # main window at its normal size" into eight arguments.
+        $quote = { param($a) '"' + ([string]$a -replace '"', '\"') + '"' }
+        $allArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CaptureScript) + $harnessArgs
+        $argLine = (($allArgs | ForEach-Object { & $quote $_ }) -join ' ')
+        $result = Start-Process -FilePath 'powershell.exe' -ArgumentList $argLine `
+            -RedirectStandardOutput ($logBase + '.stdout.txt') `
+            -RedirectStandardError ($logBase + '.stderr.txt') `
+            -WindowStyle Hidden -Wait -PassThru
         $exitCode = $result.ExitCode
         $stdout = if (Test-Path ($logBase + '.stdout.txt')) { Get-Content -Path ($logBase + '.stdout.txt') -Raw } else { '' }
         $stderr = if (Test-Path ($logBase + '.stderr.txt')) { Get-Content -Path ($logBase + '.stderr.txt') -Raw } else { '' }
@@ -260,7 +279,7 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal
     -Trigger $trigger -Force | Out-Null
 Show 'presented task' ("registered '{0}' as {1}\{2} (Interactive, session {3})" -f $taskName, $interactiveDomain, $interactiveUser, $interactiveSession)
 Start-ScheduledTask -TaskName $taskName
-$deadline = (Get-Date).AddMinutes(30)
+$deadline = (Get-Date).AddMinutes(6)
 $innerDoneObj = $null
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 5
@@ -270,7 +289,7 @@ while ((Get-Date) -lt $deadline) {
     }
 }
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-if (-not $innerDoneObj) { throw 'the presented task produced no done sentinel within 30 minutes; refusing instead of reporting a pass' }
+if (-not $innerDoneObj) { throw 'the presented task produced no done sentinel within 6 minutes; refusing instead of reporting a pass' }
 if ($innerDoneObj.session -eq 0) { throw ("the presented task ran in session 0 ({0}); refusing" -f $innerDoneObj.failure) }
 if ($innerDoneObj.session -ne $interactiveSession) { throw ("the presented task ran in session {0}, not the interactive session {1}; refusing" -f $innerDoneObj.session, $interactiveSession) }
 $harnessExit = [int]$innerDoneObj.harnessExit
