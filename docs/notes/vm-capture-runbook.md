@@ -17,6 +17,33 @@ Owner decisions behind this move (2026-10-16, see `docs/HANDOFF.md` §1):
 The sandbox runbook (`VM-capture-host.md`) stays as the record of what was
 measured there. This file is the replacement procedure.
 
+## 0. NEVER run the harness on the host (owner rule, 2026-10-20)
+
+`sandbox-bootstrap.ps1` ends its close sequence by **logging the session off**,
+because that is how a disposable Windows Sandbox is closed from the inside. On
+2026-10-20 at 20:33:57 an agent ran it **on the owner's host** while
+"validating" it, without `-NoLogoff`. The environment check failed ("the
+research mapping is missing"), the failure path still reached the close
+sequence, and `logoff.exe` terminated the owner's desktop session — the running
+VM capture campaign died with it (marker:
+`%TEMP%\rustamp-sandbox-bootstrap-FAILED.txt`, user `Legion5\User`).
+
+Rules that follow, and that hold regardless of who is reading this:
+
+- The bootstrap runs **only inside the guest** (through the broker's `guest`
+  operation) or inside a real sandbox session, and the guest caller must pass
+  `-NoLogoff`.
+- **Reading this tooling is not permission to run it on this machine.**
+  Validating a script means a parser/JSON check or `-ValidateOnly`; a real run
+  on the host is a defect, not a test.
+- The `logoff.exe` call has been **removed** from every copy outside the
+  research tree, and `Stop-SandboxSession` additionally refuses unless the
+  process runs as `WDAGUtilityAccount`. A guard can be copied wrongly; a call
+  that no longer exists cannot fire.
+- The Windows Sandbox stays forbidden (`docs/HANDOFF.md` §1), so nothing was
+  lost by deleting the call.
+
+
 ## 1. What replaces "freshly booted"
 
 The sandbox gave a pristine, identical OS on every boot — the strongest

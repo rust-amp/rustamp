@@ -70,6 +70,23 @@ Read these first, in this order:
   Google's quota also exhausted until 2026-10-24, the remaining sources are
   **OpenAI** and the **free** models.
 
+- **NEVER run the capture harness on the host** (owner rule, 2026-10-20 —
+  "REMEMBER THIS"; it cost the owner his desktop session).
+  `tools/vm-capture/sandbox-bootstrap.ps1` ends by calling `logoff.exe`: it is
+  built to close a **disposable Windows Sandbox from the inside**. On
+  2026-10-20 at 20:33:57 an agent started it on the host while "validating" it;
+  the run failed its environment check, the failure path *still* reached the
+  logoff, and the owner's session was terminated (marker
+  `%TEMP%\rustamp-sandbox-bootstrap-FAILED.txt`, user `Legion5\User`).
+  The harness may run **only** inside the guest (through the broker's `guest`
+  op) or inside a real sandbox session, and every host-side runner must pass
+  `-NoLogoff`. The logoff itself now refuses unless the process runs as
+  `WDAGUtilityAccount`. **Corollary for agents: reading a VM or measurement
+  script is not permission to execute it on this machine** — validating a
+  script means a syntax/JSON check or `-ValidateOnly`, never a real run.
+  Running a reference binary on the host is forbidden for the same reason:
+  this machine is the clean room.
+
 - **File search: use `es.exe`, always** (`C:\Program Files\Everything 1.5a\es.exe`),
   never a recursive directory walk. `es.exe <pattern>` prints full paths;
   `es.exe -r <regex>` for a pattern. The owner's standing instruction
