@@ -31,6 +31,23 @@ pub enum OutputChoice {
     NoAudio,
 }
 
+/// What the `--import-winamp-ini` switch asks for (S12).
+///
+/// The switch is an explicit action: it imports a Winamp 2.95 `winamp.ini`
+/// into our configuration. The file is only read; the player never writes to
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WinampIniImport {
+    /// The switch was not given: nothing is imported.
+    #[default]
+    None,
+    /// The switch was given without a path: the player asks for the file
+    /// with the native file dialog.
+    Ask,
+    /// The switch named the file to import.
+    File(PathBuf),
+}
+
 /// The parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Args {
@@ -46,6 +63,8 @@ pub struct Args {
     pub skin: Option<PathBuf>,
     /// Stop after this many seconds of playback (test aid).
     pub seconds: Option<u64>,
+    /// The Winamp configuration to import (S12).
+    pub import_winamp_ini: WinampIniImport,
     /// `--help`/`-h` was given.
     pub help: bool,
 }
@@ -53,6 +72,7 @@ pub struct Args {
 /// The usage text (`--help`).
 pub const USAGE: &str = "\
 usage: rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
+           [--import-winamp-ini [path]]
 
   <file>            media file to load and play (optional)
   --null            use the deterministic null output and run headless (no window)
@@ -60,6 +80,9 @@ usage: rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path
   --volume <0..=255> initial volume (default: the config's audio.volume)
   --skin <path>     skin folder, .wsz or .zip (default: config's ui.skin, then built-in)
   --seconds <n>     stop after n seconds of playback (test aid)
+  --import-winamp-ini [path]
+                    import a Winamp 2.95 winamp.ini (the file is only read); without a path
+                    the player asks for the file with the native dialog
   -h, --help        print this help";
 
 /// Why the command line could not be parsed.
@@ -103,7 +126,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut parsed = Args::default();
-    let mut it = args.into_iter();
+    let mut it = args.into_iter().peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--null" => parsed.output = OutputChoice::Null,
@@ -125,6 +148,20 @@ where
                     option: "--seconds",
                     value,
                 })?);
+            }
+            "--import-winamp-ini" => {
+                // The path is optional: it is the argument right behind the
+                // switch, when that argument is not another option. Without
+                // a path the player asks for the file with the native
+                // dialog, so the switch has to come before the file to
+                // play.
+                let path_follows = matches!(it.peek(), Some(next) if !next.starts_with('-'));
+                parsed.import_winamp_ini = if path_follows {
+                    let path = it.next().expect("the argument was peeked");
+                    WinampIniImport::File(PathBuf::from(path))
+                } else {
+                    WinampIniImport::Ask
+                };
             }
             "--help" | "-h" => parsed.help = true,
             other if other.starts_with('-') && other.len() > 1 => {
@@ -257,9 +294,46 @@ mod tests {
             "--volume",
             "--skin",
             "--seconds",
+            "--import-winamp-ini",
             "--help",
         ] {
             assert!(USAGE.contains(option), "usage does not mention {option}");
         }
+    }
+
+    /// The import switch without a path asks for the file: the native
+    /// dialog needs a window, so the headless run cannot answer it.
+    #[test]
+    fn the_import_switch_without_a_path_asks_for_the_file() {
+        let args = parse_args(&["--import-winamp-ini"]).unwrap();
+        assert_eq!(args.import_winamp_ini, WinampIniImport::Ask);
+        assert_eq!(args.file, None);
+    }
+
+    /// The path behind the switch is the file to import.
+    #[test]
+    fn the_import_switch_names_the_file_to_import() {
+        let args = parse_args(&["--import-winamp-ini", "C:/old/winamp.ini"]).unwrap();
+        assert_eq!(
+            args.import_winamp_ini,
+            WinampIniImport::File(PathBuf::from("C:/old/winamp.ini"))
+        );
+        assert_eq!(args.file, None);
+    }
+
+    /// Another option behind the switch is not a path: the switch asks for
+    /// the file and the option keeps its own meaning.
+    #[test]
+    fn an_option_behind_the_import_switch_is_not_a_path() {
+        let args = parse_args(&["--import-winamp-ini", "--null"]).unwrap();
+        assert_eq!(args.import_winamp_ini, WinampIniImport::Ask);
+        assert_eq!(args.output, OutputChoice::Null);
+    }
+
+    /// Without the switch nothing is imported.
+    #[test]
+    fn no_import_switch_means_no_import() {
+        let args = parse_args(&["--null"]).unwrap();
+        assert_eq!(args.import_winamp_ini, WinampIniImport::None);
     }
 }

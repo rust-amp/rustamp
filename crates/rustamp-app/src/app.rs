@@ -274,6 +274,9 @@ pub struct App {
     host_supervisor: Option<Supervisor>,
     /// Where configuration is persisted on clean exit, if known.
     config_path: Option<PathBuf>,
+    /// A Winamp configuration import waiting for the presenter's file dialog
+    /// (see [`crate::winamp_ini`]).
+    pending_winamp_ini_import: bool,
 }
 
 /// Whether `path` has a recognized playlist file extension.
@@ -320,6 +323,32 @@ fn replaygain_mode_from_audio(
         rustamp_audio::ReplayGainMode::Track => rustamp_core::config::ReplayGainMode::Track,
         rustamp_audio::ReplayGainMode::Album => rustamp_core::config::ReplayGainMode::Album,
     }
+}
+
+/// Whether the configuration says the window `id` is shaded.
+///
+/// `None` when the configuration says nothing about the window: a key the
+/// imported file does not carry leaves the window as it is.
+fn window_shaded(config: &Config, id: WindowId) -> Option<bool> {
+    config
+        .ui
+        .windows
+        .iter()
+        .find(|window| window.id == id)
+        .map(|window| window.shaded)
+}
+
+/// Whether the configuration says the window `id` is visible.
+///
+/// `None` when the configuration says nothing about the window: a key the
+/// imported file does not carry leaves the window as it is.
+fn window_visible(config: &Config, id: WindowId) -> Option<bool> {
+    config
+        .ui
+        .windows
+        .iter()
+        .find(|window| window.id == id)
+        .map(|window| window.visible)
 }
 
 impl App {
@@ -479,6 +508,7 @@ impl App {
             dsp_install_pending: false,
             host: HostStateLink::detached(),
             host_supervisor: None,
+            pending_winamp_ini_import: false,
         };
         app.shuffle = app.config.playlist.shuffle;
         app.repeat = app.config.playlist.repeat;
@@ -747,12 +777,17 @@ impl App {
         let mut windows = self.config.ui.windows.clone();
         if let Some(main) = windows.iter_mut().find(|w| w.id == WindowId::Main) {
             main.shaded = self.ui.state().windowshade;
+            // The main window's visibility is the live one. The player
+            // always opens the main window when it starts (an unavailable
+            // tray must never strand the player), so the value records the
+            // state the player was in, not a "start hidden" instruction.
+            main.visible = self.main_visible;
         } else {
             windows.push(WindowLayout {
                 id: WindowId::Main,
                 x: 26,
                 y: rustamp_ui::DEFAULT_MAIN_POSITION.y,
-                visible: true,
+                visible: self.main_visible,
                 shaded: self.ui.state().windowshade,
                 width: None,
                 height: None,
@@ -895,6 +930,137 @@ impl App {
     pub fn save_config_to(&self, path: &Path) -> Result<(), crate::config::ConfigError> {
         let config = self.current_config();
         crate::config::save(&config, self.playlist_font_size(), path)
+    }
+
+    /// Imports a Winamp 2.95 `winamp.ini` into the running configuration.
+    ///
+    /// The file is only **read**: the import never writes to it, and what it
+    /// produces is our own configuration, which the player saves on clean
+    /// exit.
+    ///
+    /// What the running player can take over is taken over at once: the
+    /// volume, the balance, the equalizer, the playback modes, the window
+    /// flags, the shade and the visibility of the windows, the playlist
+    /// editor's font size and the skin. The window **placement** stays in the
+    /// configuration: the player restores it when it starts, so an import
+    /// that runs before the player starts places the windows right away and
+    /// an import that runs later waits for the next start.
+    ///
+    /// Everything the player has no setting for is **reported** and never
+    /// dropped silently — see [`crate::winamp_ini`] for the mapping table and
+    /// for the two readings that are ours and not the spec's.
+    pub fn import_winamp_ini(
+        &mut self,
+        path: &Path,
+    ) -> Result<crate::winamp_ini::ImportReport, crate::winamp_ini::ImportError> {
+        let skins = crate::skin_folder::skins_dir(self.config_path());
+        let resolve_skin = |name: &str| {
+            skins
+                .as_ref()
+                .and_then(|dir| crate::skin_folder::find_skin_by_name(dir, name))
+        };
+        let plan = crate::winamp_ini::import_file(
+            path,
+            &self.current_config(),
+            self.playlist_font_size(),
+            &resolve_skin,
+        )?;
+        let crate::winamp_ini::ImportPlan {
+            config,
+            playlist_font_size,
+            report,
+        } = plan;
+        self.apply_import(&config, playlist_font_size);
+        self.note(format!(
+            "Winamp configuration imported: {}",
+            report.summary()
+        ));
+        Ok(report)
+    }
+
+    /// Takes over the settings an import produced.
+    ///
+    /// The engine and the UI machine take the live settings over; the
+    /// configuration keeps all of them, so the window placement survives
+    /// until the next start.
+    fn apply_import(&mut self, config: &Config, playlist_font_size: Option<u32>) {
+        // The engine owns the volume, the balance and the playback modes;
+        // the commands carry them to the UI machine as well, so the sliders
+        // and the buttons agree with the engine.
+        self.apply(&Command::SetVolume(config.audio.volume));
+        self.apply(&Command::SetBalance(config.audio.balance));
+        self.apply(&Command::SetShuffle(config.playlist.shuffle));
+        self.apply(&Command::SetRepeat(config.playlist.repeat));
+        // The equalizer: the engine is the truth, the window follows it.
+        self.engine.set_eq(config.eq.state);
+        self.sync_eq_from_engine();
+        // The window flags the player owns.
+        self.always_on_top = config.ui.always_on_top;
+        self.easy_move = config.ui.easy_move;
+        if self.ui.state().double_size != config.ui.double_size {
+            self.apply(&Command::ToggleDoubleSize);
+        }
+        // The main window's shade and visibility. A window the file says
+        // nothing about keeps what it has now.
+        if let Some(shaded) = window_shaded(config, WindowId::Main)
+            && self.ui.state().windowshade != shaded
+        {
+            self.apply(&Command::ToggleWindowShade(WindowId::Main));
+        }
+        if let Some(visible) = window_visible(config, WindowId::Main)
+            && self.main_visible != visible
+        {
+            self.main_visible = visible;
+        }
+        // The equalizer's shade.
+        if let Some(shaded) = window_shaded(config, WindowId::Equalizer)
+            && self.eq_state().windowshade != shaded
+        {
+            self.apply(&Command::ToggleWindowShade(WindowId::Equalizer));
+        }
+        // The equalizer's and the playlist editor's visibility. The UI
+        // machine owns these two flags; the app's own path for the toggle
+        // records a note about the equalizer's presets submenu, which has
+        // nothing to do with an import, so the machine is asked directly.
+        if let Some(visible) = window_visible(config, WindowId::Equalizer)
+            && self.eq_open() != visible
+        {
+            self.ui
+                .handle_command(&Command::ToggleWindow(WindowId::Equalizer), self.now_ms());
+        }
+        if let Some(visible) = window_visible(config, WindowId::Playlist)
+            && self.playlist_open() != visible
+        {
+            self.ui
+                .handle_command(&Command::ToggleWindow(WindowId::Playlist), self.now_ms());
+            self.maintain_focus();
+        }
+        // The playlist editor's font size.
+        self.set_playlist_font_size(playlist_font_size);
+        // The skin: the reference names a file, we resolved it in our skins
+        // folder. A skin that cannot be loaded falls back with a warning,
+        // which is the app's own rule.
+        if let Some(skin) = &config.ui.skin
+            && self.current_skin.as_deref() != Some(skin.as_path())
+        {
+            self.load_skin(skin.clone());
+        }
+        // The configuration keeps everything, the window placement included.
+        self.config = config.clone();
+    }
+
+    /// Asks for a Winamp configuration file and imports it.
+    ///
+    /// The request is for the presenter: the native file dialog needs an
+    /// owner window, so the headless app cannot answer it.
+    pub fn request_winamp_ini_import(&mut self) {
+        self.pending_winamp_ini_import = true;
+    }
+
+    /// Takes the Winamp configuration import request once, for the
+    /// presenter's dialog.
+    pub fn take_winamp_ini_import_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_winamp_ini_import)
     }
 
     /// Records a window's screen coordinates in the config.

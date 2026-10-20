@@ -193,6 +193,23 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The skin in `dir` whose file name is `name`, if the folder holds one.
+///
+/// The reference's `skin` key holds a **file name**, not a path (S12 §3.1),
+/// so the import has to find the file the name refers to. The name is
+/// matched without regard to case: the file system's names are not case
+/// sensitive on Windows, and the reference wrote the name the skin had there.
+///
+/// `None` when the folder holds no skin with that name — the import then
+/// reports the key as not applied instead of pointing at a file that is not
+/// there.
+pub fn find_skin_by_name(dir: &Path, name: &str) -> Option<PathBuf> {
+    scan(dir)
+        .skins
+        .into_iter()
+        .find(|path| file_name(path).eq_ignore_ascii_case(name))
+}
+
 /// The cached read of the skins folder.
 ///
 /// The folder is read when the skin list is asked for and kept until the

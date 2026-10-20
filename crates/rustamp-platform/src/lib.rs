@@ -47,9 +47,9 @@ pub use displays::{
 pub use dpi::{DpiAwareness, DpiError, WindowChrome, init_dpi_awareness, outer_size_for_client};
 pub use file_dialog::{
     CANCELLED_HRESULT, DIRECTORY_DIALOG_OPTIONS, EQF_FILTERS, FileDialogError, HTML_SAVE_FILTERS,
-    MEDIA_FILTERS, PLAYLIST_SAVE_FILTERS, directory_dialog_options, directory_result,
+    INI_FILTERS, MEDIA_FILTERS, PLAYLIST_SAVE_FILTERS, directory_dialog_options, directory_result,
     parse_selection, parse_wide_path, pick_directory, pick_eqf_file, pick_media_files,
-    save_html_playlist_file, save_playlist_file,
+    pick_winamp_ini_file, save_html_playlist_file, save_playlist_file,
 };
 pub use hotkeys::{
     DEFAULT_HOTKEYS, HotkeyAction, HotkeyBackend, HotkeyCombo, HotkeyError, HotkeyId,
