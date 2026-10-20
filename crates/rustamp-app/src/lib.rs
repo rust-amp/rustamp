@@ -102,6 +102,7 @@ mod external_control;
 pub mod focus;
 pub mod host;
 pub mod html_playlist;
+mod library_recovery;
 pub mod library_window;
 pub mod menu;
 pub mod modern_shell;

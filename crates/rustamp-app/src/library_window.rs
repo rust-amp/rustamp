@@ -29,6 +29,31 @@
 //! `%APPDATA%`) has nowhere to keep one and uses an **in-memory** index
 //! instead, which lives exactly as long as the run.
 //!
+//! # A damaged database
+//!
+//! The index is opened when the window opens, and a database that cannot be
+//! used is refused with a typed reason ([`rustamp_library::OpenError`]). The
+//! file itself is never written to - that is the rule of the crate that holds
+//! it - but a refused file on its own is a dead end: the user reads the
+//! message and the library stays dead.
+//!
+//! So the window offers a way out (see [`crate::library_recovery`]):
+//!
+//! * a database that **cannot be used** - not a database, cut short,
+//!   damaged, a foreign schema, a newer version of the player - is
+//!   **renamed** to `<database>.broken-<UTC stamp>` (never deleted, and it
+//!   keeps its bytes), the reason is written next to it in
+//!   `<database>.broken-<stamp>.txt`, and a **fresh index** takes its place;
+//! * a database that is **held by another process, read-only, unreadable, or
+//!   not a file at all** is not recovered: the damage is about the machine,
+//!   not about the file, and a fresh index would only hide it. The file is
+//!   left exactly as it was, and the reason is reported;
+//! * the user is told **once**: what was wrong, where the old file went,
+//!   and that the library starts empty until the folders are added again.
+//!
+//! The recovery happens once: the fresh index is a good database, so the
+//! next open finds nothing to recover.
+//!
 //! # The input map (own choice)
 //!
 //! No spec measures the media library (S20 is not started), so the map below
@@ -151,8 +176,8 @@ use rustamp_core::playlist::MediaLocation;
 use rustamp_core::state::WindowId;
 use rustamp_gfx::{Image, Rect};
 use rustamp_library::{
-    ArtworkCache, Cancel, CoverImage, Library, Query, RemoveReport, Root, ScanPhase, ScanProgress,
-    ScanReport, SortKey, TrackRow,
+    ArtworkCache, Cancel, CoverImage, Library, OpenError, Query, RemoveReport, Root, ScanPhase,
+    ScanProgress, ScanReport, SortKey, TrackRow,
 };
 use rustamp_platform::LibraryRootRow;
 use rustamp_ui::library_render::{CoverRef, LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT};
@@ -162,6 +187,7 @@ use rustamp_ui::{
 };
 
 use crate::app::App;
+use crate::library_recovery;
 
 #[cfg(test)]
 #[path = "library_window_tests.rs"]
@@ -514,7 +540,7 @@ impl LibraryWindow {
     /// the scan is left alone.
     pub fn ensure_index(&mut self, database: Option<&Path>) -> Result<()> {
         if self.index.is_none() && self.worker.is_none() {
-            self.index = Some(Self::open_index(database)?);
+            self.index = Some(self.open_index(database)?);
             let roots = self.read_roots(database)?;
             self.roots = roots;
         }
@@ -536,7 +562,11 @@ impl LibraryWindow {
     }
 
     /// Opens the index at `database`, or an in-memory one.
-    fn open_index(database: Option<&Path>) -> Result<Library> {
+    ///
+    /// A damaged database does not end the library: the file is set aside
+    /// (renamed, never deleted) and a fresh index takes its place. The user
+    /// is told about it once, through the window's note.
+    fn open_index(&mut self, database: Option<&Path>) -> Result<Library> {
         let Some(database) = database else {
             return Library::in_memory();
         };
@@ -546,8 +576,27 @@ impl LibraryWindow {
         {
             std::fs::create_dir_all(parent)?;
         }
-        // The open names the damage the database file has; the `?` turns it
-        // into the error of this crate, which carries the same text.
+        match Library::open(database) {
+            Ok(index) => Ok(index),
+            Err(error) => self.open_fresh_index(database, error),
+        }
+    }
+
+    /// Opens a fresh index after the database at `database` was set aside.
+    ///
+    /// `error` says what was wrong with the file. The damage that is about
+    /// the file itself is recovered: the old file is renamed, the reason is
+    /// written next to it, and a fresh index takes its place. The damage
+    /// that is about the environment - a file another process holds, a
+    /// read-only file, a file that cannot be read at all - is refused: a
+    /// fresh index would hide it, so the file is left exactly as it was and
+    /// the reason is reported instead.
+    fn open_fresh_index(&mut self, database: &Path, error: OpenError) -> Result<Library> {
+        if !library_recovery::is_recoverable(&error) {
+            return Err(error.into());
+        }
+        let recovery = library_recovery::quarantine(database, &error)?;
+        self.action_note = Some(library_recovery::note(&error, &recovery));
         Ok(Library::open(database)?)
     }
 
@@ -1309,9 +1358,7 @@ impl App {
     /// entries) leaves a note, which the app shows.
     pub fn library_key_down(&mut self, key: Key, modifiers: Modifiers) -> Result<Vec<Command>> {
         let commands = self.library_window.key(key, modifiers)?;
-        if let Some(note) = self.library_window.take_action_note() {
-            self.note(format!("Library: {note}"));
-        }
+        self.take_library_note();
         self.forward(&commands)?;
         Ok(commands)
     }
@@ -1332,6 +1379,7 @@ impl App {
         // be added before the library window was ever opened.
         let database = self.library_database_path();
         self.library_window.ensure_index(database.as_deref())?;
+        self.take_library_note();
         self.library_window.scan_folder(path)
     }
 
@@ -1396,6 +1444,18 @@ impl App {
         let database = self.library_database_path();
         if let Err(error) = self.library_window.toggle(database.as_deref()) {
             self.note(format!("Library: {error}"));
+        }
+        self.take_library_note();
+    }
+
+    /// Takes the note of the library window, if it left one.
+    ///
+    /// The window does not show its notes itself: the app collects them and
+    /// the presenter prints them. A recovery of a damaged database leaves
+    /// one, and it is shown once - here, right after the window was opened.
+    fn take_library_note(&mut self) {
+        if let Some(note) = self.library_window.take_action_note() {
+            self.note(format!("Library: {note}"));
         }
     }
 
