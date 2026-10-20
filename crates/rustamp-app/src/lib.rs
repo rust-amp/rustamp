@@ -26,6 +26,9 @@
 //! * [`eq_autoload`] — the equalizer's automatic per-track preset selection
 //!   (the AUTO button): the rule table, the decision and the track-start
 //!   wiring (S07 §12 item 13).
+//! * [`fade_note`] — the report about a fade that does not fit the buffer it
+//!   is realised in: the configuration it is about and the rule that shows it
+//!   once per configuration (S18 §2.3).
 //! * [`dialogs`] - the simple modal dialogs (About, file info, jump-to) on
 //!   top of [`rustamp_ui::DialogManager`]: opening, closing, jump input and
 //!   the body lines. Headless; the OS window lives in [`window`].
@@ -107,6 +110,7 @@ pub mod eq_autoload;
 pub mod eq_presets;
 #[cfg(any(windows, test))]
 mod external_control;
+pub mod fade_note;
 pub mod focus;
 pub mod host;
 pub mod html_playlist;
