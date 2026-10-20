@@ -34,6 +34,11 @@ pub const WAIT: Duration = Duration::from_secs(30);
 
 /// The sample value at `frame` for track `seed`: never zero, so silence in the
 /// output is always detectable.
+///
+/// The range is `0.1..=1.1`, so the pattern reaches above full scale: the
+/// converter's finishing clamps it (see [`finished`]), and the limiter's
+/// ceiling (0.966) lies below the top of the range, so the default chain
+/// really limits this material.
 pub fn pattern(seed: u64, frame: u64) -> f32 {
     let x = frame
         .wrapping_mul(2_654_435_761)
@@ -568,7 +573,34 @@ impl Harness {
     }
 }
 
-/// Frames of the newest `n` frames of `seed` starting at `from`.
+/// The samples the device receives for the `n` frames of `seed` starting at
+/// `from`, when the chain leaves them alone: the source pattern, put through
+/// the converter's finishing (see [`finished`]).
 pub fn expected(seed: u64, from: u64, n: u64) -> Vec<f32> {
+    source(seed, from, n).into_iter().map(finished).collect()
+}
+
+/// The source pattern as the decoder produces it, before the chain.
+pub fn source(seed: u64, from: u64, n: u64) -> Vec<f32> {
     (0..n).map(|i| pattern(seed, from + i)).collect()
+}
+
+/// The converter's finishing, the last level decision of the chain (see
+/// `rustamp_audio::convert`): a non-finite sample becomes silence, a
+/// subnormal becomes zero, and a sample above full scale is clamped to
+/// `±1.0`.
+///
+/// The tests model it, because the device receives the *finished* samples:
+/// the source pattern reaches above full scale (`0.1..=1.1`), and the
+/// converter's ceiling holds every sample above `1.0` at exactly `1.0`. A
+/// test that compares the rendered audio with the source must therefore
+/// expect the finished source — and a test that scales the source itself
+/// (a stage gain, a ReplayGain factor) must scale the *raw* source and
+/// finish the product, because the chain runs before the converter.
+pub fn finished(x: f32) -> f32 {
+    if !x.is_finite() || x.is_subnormal() {
+        0.0
+    } else {
+        x.clamp(-1.0, 1.0)
+    }
 }

@@ -161,9 +161,11 @@
 //! (when the device rate differs from the track's) rebuilds inter-sample
 //! peaks above the ceiling, and above full scale on hostile signals (A6
 //! finding 3). The [`FormatConverter`] holds a final `±1.0` (0 dBFS) ceiling
-//! on the resampled path (A14), so the ring — and hence the device — never
-//! sees a sample above full scale however the equalizer and the limiter are
-//! set. Volume and balance after the converter only attenuate.
+//! on every path (A14; finding **F2** of
+//! `docs/tasks/W14-wave-review.md` closed the equal-rate path's gap), so the
+//! ring — and hence the device — never sees a sample above full scale
+//! however the equalizer and the limiter are set. Volume and balance after
+//! the converter only attenuate.
 //! Because [`PlayerState`] has no field for the limiter (and changing the wire
 //! contract requires an RFC), the control remains engine-side via
 //! [`Engine::limiter_enabled`], [`Engine::set_limiter_enabled`], and

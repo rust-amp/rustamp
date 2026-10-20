@@ -96,6 +96,17 @@ The equaliser side, over the measured anchors (S09: `0 = +12 dB`,
    holds a sample above full scale however the equaliser and the limiter
    are set. The equal-rate path is untouched, so its bit-exact promise
    stands.
+
+   > **Superseded (2026-10-20).** Finding **F2** of
+   > `docs/tasks/W14-wave-review.md` proved that the equal-rate path's
+   > missing clamp contradicts this card's own promise ("the ring never
+   > holds a sample above full scale"): with the limiter off, a positive
+   > ReplayGain correction or an equalizer preamp put above-full-scale
+   > samples into the ring. The ceiling now lives in the converter's
+   > **single output stage** (`convert.rs::emit_device_samples`) and holds
+   > on **both** paths; the equal-rate path stays bit-exact for in-range
+   > input. The resampled path's behaviour is unchanged. See F2 in
+   > `docs/tasks/W14-wave-review.md`.
 4. The bound is `1.0`, not the limiter's `0.9661`. The clip point is
    0 dBFS; the limiter's ceiling is a dynamics choice, and legitimate
    near-full-scale peaks must not be touched by the safety net.
@@ -121,6 +132,13 @@ plus a flat-top count of zero).
 | Non-finite (control gains) | → flat / clamped (exists) | n/a | n/a | engine `clamp_gain` (exists) |
 | Subnormal (signal) | passes through; history flushed (exists) | passes through (exact `1.0` fast path) | → `0.0` (**new**) | untouched (bit-exact promise) |
 | DC | passes (peaking unity at DC; preamp applies) | passes (delayed, or held at ceiling when hot) | passes at unity (existing test) | passes |
+
+> **Updated (2026-10-20, finding F2).** The converter's column now holds on
+> **both** paths: the finishing is the converter's single output stage, so the
+> equal-rate path turns a non-finite sample into silence, a subnormal into
+> `0.0` and a sample above full scale into `±1.0` as well. The equal-rate
+> path keeps its bit-exact promise **for in-range input**. See F2 in
+> `docs/tasks/W14-wave-review.md`.
 
 Rationale: NaN spreads (one NaN lodges in biquad history forever, and
 through a band-limited filter contaminates a whole FFT block plus overlap),

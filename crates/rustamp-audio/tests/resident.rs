@@ -37,7 +37,7 @@ use rustamp_proto::host::{MediaLocationWire, PcmSpecWire};
 
 mod common;
 
-use common::{expected, pattern};
+use common::{expected, finished, pattern};
 
 /// Stall escape for every wait in this harness and for the resident
 /// decoder's read/seek timeout (the M10 flakiness note's rule): a bound so
@@ -629,8 +629,8 @@ fn resident_to_inprocess_source_change_is_gapless() {
     assert_eq!(&left[..3000], &expected(7, 0, 3000)[..]);
     assert_eq!(&left[3000..], &expected(2, 0, 3000)[..]);
     assert!(!left.contains(&0.0), "the seam must not contain silence");
-    assert_eq!(left[2999], pattern(7, 2999));
-    assert_eq!(left[3000], pattern(2, 0));
+    assert_eq!(left[2999], finished(pattern(7, 2999)));
+    assert_eq!(left[3000], finished(pattern(2, 0)));
 
     assert!(
         h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),

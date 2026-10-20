@@ -3104,6 +3104,9 @@ mod dsp_hosted_tests {
 
     /// The sample value at `frame` for track `seed`: never zero, so silence
     /// in the output is always detectable.
+    ///
+    /// The range is `0.1..=1.1`, so the pattern reaches above full scale: the
+    /// converter's finishing clamps it (see [`finished`]).
     fn pattern(seed: u64, frame: u64) -> f32 {
         let x = frame
             .wrapping_mul(2_654_435_761)
@@ -3112,8 +3115,23 @@ mod dsp_hosted_tests {
         0.1 + x as f32 / 2000.0
     }
 
+    /// The converter's finishing, the last level decision of the chain (see
+    /// `crate::convert`): a non-finite sample becomes silence, a subnormal
+    /// becomes zero, and a sample above full scale is clamped to `±1.0`.
+    /// The device receives the *finished* samples, so the expectations
+    /// below carry the same rule.
+    fn finished(x: f32) -> f32 {
+        if !x.is_finite() || x.is_subnormal() {
+            0.0
+        } else {
+            x.clamp(-1.0, 1.0)
+        }
+    }
+
+    /// The samples the device receives for the source pattern when the chain
+    /// leaves them alone: the pattern, put through the finishing.
     fn expected(seed: u64, from: u64, n: u64) -> Vec<f32> {
-        (0..n).map(|i| pattern(seed, from + i)).collect()
+        (0..n).map(|i| finished(pattern(seed, from + i))).collect()
     }
 
     /// In-process decoder factory for `track<seed>_<frames>.tst` placeholders.
@@ -3407,8 +3425,8 @@ mod dsp_hosted_tests {
         assert_eq!(left.len(), 6000);
         assert_eq!(&left[..3000], &expected(7, 0, 3000)[..]);
         assert_eq!(&left[3000..], &expected(2, 0, 3000)[..]);
-        assert_eq!(left[2999], pattern(7, 2999));
-        assert_eq!(left[3000], pattern(2, 0));
+        assert_eq!(left[2999], finished(pattern(7, 2999)));
+        assert_eq!(left[3000], finished(pattern(2, 0)));
         assert!(!left.contains(&0.0), "the seam must not contain silence");
 
         assert!(

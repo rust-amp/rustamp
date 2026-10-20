@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{Harness, SPEC, pattern};
+use common::{Harness, SPEC, finished, pattern};
 use rustamp_audio::EngineConfig;
 use rustamp_core::command::Command;
 use rustamp_core::state::TransportState;
@@ -67,7 +67,7 @@ fn the_fade_out_ramps_the_output_down_and_stops_the_transport() {
     for (i, frame) in before.as_chunks::<2>().0.iter().enumerate() {
         assert_eq!(
             frame[0],
-            pattern(1, i as u64),
+            finished(pattern(1, i as u64)),
             "frame {i} must be the source"
         );
     }
@@ -84,12 +84,14 @@ fn the_fade_out_ramps_the_output_down_and_stops_the_transport() {
     h.clock.pump_record(fade_frames(), &mut during);
 
     // The ramp is the equal-power law over the requested duration: the gain
-    // falls from unity to silence, frame by frame.
+    // falls from unity to silence, frame by frame. The fade runs after the
+    // converter, so the divisor is the *finished* source: the ramp only
+    // attenuates, so nothing is clamped behind it.
     let span = fade_frames();
     for j in 0..span as usize {
         let t = j as f64 / (span - 1) as f64;
         let expected = (1.0 - t).sqrt() as f32;
-        let source = pattern(1, PRELUDE + j as u64);
+        let source = finished(pattern(1, PRELUDE + j as u64));
         let actual = during[j * 2] / source;
         assert!(
             (actual - expected).abs() < 1e-5,
@@ -127,7 +129,7 @@ fn a_pause_is_immediate_and_does_not_fade() {
     for (i, frame) in after.as_chunks::<2>().0.iter().enumerate() {
         assert_eq!(
             frame[0],
-            pattern(1, i as u64),
+            finished(pattern(1, i as u64)),
             "frame {i} must be the source"
         );
     }
@@ -152,8 +154,8 @@ fn the_run_after_a_fade_out_is_at_unity() {
     let mut again = Vec::new();
     h.clock.pump_record(4096, &mut again);
     // The source is a pseudo-random pattern in 0.1..=1.1 with a mean of 0.6;
-    // at unity the output has the same mean, at the latched silence it has
-    // none.
+    // at unity the output has the same mean (the converter's ceiling shaves
+    // the top of the range a little), at the latched silence it has none.
     let mean = again.iter().map(|s| s.abs()).sum::<f32>() / again.len() as f32;
     assert!(
         (0.55..0.65).contains(&mean),
@@ -189,6 +191,6 @@ fn a_play_during_the_fade_cancels_it() {
 
     // The last frame of the fade-in is at unity again.
     let last = back.len() / 2 - 1;
-    let source = pattern(1, PRELUDE + fade_frames() / 2 + last as u64);
+    let source = finished(pattern(1, PRELUDE + fade_frames() / 2 + last as u64));
     assert_eq!(back[last * 2], source, "the gain is back at unity");
 }
