@@ -65,7 +65,8 @@ pub enum Widget {
     TimeDisplay,
     /// The track-title marquee.
     Marquee,
-    /// Rustamp's UI-local analyser/scope mode cycle (S08 Q9 open, own choice).
+    /// Rustamp's UI-local analyser/scope mode cycle (S08 open question 5,
+    /// own choice).
     Visualization,
     /// The mono indicator.
     Mono,

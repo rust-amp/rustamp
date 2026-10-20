@@ -3,8 +3,9 @@
 
 use rustamp_core::command::Command;
 use rustamp_core::event::Event;
+use rustamp_core::state::WindowId;
 use rustamp_core::vis::{VIS_SAMPLES, VisFrame};
-use rustamp_ui::visualization::{VisError, VisInput, VisMode};
+use rustamp_ui::visualization::{SPECTRUM_BANDS, VisError, VisInput, VisMode};
 use rustamp_ui::{MainWindow, MainWindowLayout, TransportState, Widget, hit_test};
 use rustamp_vis::analyser::{Analyser, ClassicMode, SPECTRUM_ROWS};
 
@@ -18,6 +19,9 @@ fn frame() -> VisFrame {
     }
 }
 
+/// The band that holds the tone of [`frame`]: bin 16 of the transform.
+const TONE_BAND: usize = 4;
+
 #[test]
 fn actual_pcm_reaches_the_main_render_state_and_absence_is_not_silence() {
     let mut window = MainWindow::new();
@@ -27,10 +31,10 @@ fn actual_pcm_reaches_the_main_render_state_and_absence_is_not_silence() {
     let state = &window.state().visualization;
     assert_eq!(state.input, VisInput::Fresh);
     assert_eq!(state.source_timestamp_us, Some(12345));
-    assert_eq!(state.bars[8], 16);
+    assert_eq!(state.bars[TONE_BAND], 16);
     window.refresh(2000);
     assert_eq!(window.state().visualization.input, VisInput::Stale);
-    assert_eq!(window.state().visualization.bars, [0; 19]);
+    assert_eq!(window.state().visualization.bars, [0; SPECTRUM_BANDS]);
     assert_eq!(
         window.push_vis_frame(&frame(), 0, 2000),
         Err(VisError::MissingSampleRate)
@@ -64,7 +68,32 @@ fn pause_freezes_and_seek_and_track_change_clear_the_display_history() {
         10000,
     );
     assert_eq!(window.state().visualization.input, VisInput::Missing);
-    assert_eq!(window.state().visualization.peaks, [0; 19]);
+    assert_eq!(window.state().visualization.peaks, [0; SPECTRUM_BANDS]);
+}
+
+/// S08 §1: the shaded main window draws its own analyser, 38 x 5 px with
+/// five bands.
+#[test]
+fn the_shaded_main_window_carries_the_five_band_analyser() {
+    let mut window = MainWindow::new();
+    window.handle_event(&Event::StateChanged(TransportState::Playing), 0);
+    window.push_vis_frame(&frame(), 44100, 0).unwrap();
+    assert_eq!(window.state().visualization.bars[TONE_BAND], 16);
+    window.handle_command(&Command::ToggleWindowShade(WindowId::Main), 0);
+    assert!(window.state().windowshade);
+    // The area changed, so the display starts empty.
+    assert_eq!(window.state().visualization.bars, [0; SPECTRUM_BANDS]);
+    window.push_vis_frame(&frame(), 44100, 0).unwrap();
+    let bars = window.state().visualization.bars;
+    assert!(
+        bars.iter().all(|height| *height <= 5),
+        "a shaded bar is five rows tall"
+    );
+    assert_eq!(
+        bars.iter().filter(|height| **height > 0).count(),
+        1,
+        "the shaded area has five bands"
+    );
 }
 
 #[test]

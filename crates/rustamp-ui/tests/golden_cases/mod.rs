@@ -3,9 +3,10 @@
 
 #![allow(dead_code)] // Shared across two test binaries (lookalike and rust-theme), each using their own skin loader and namespace.
 
-use rustamp_core::command::SelectOp;
+use rustamp_core::command::{Command, SelectOp};
 use rustamp_core::event::Event;
 use rustamp_core::playlist::EntryId;
+use rustamp_core::state::WindowId;
 use rustamp_skin::{BuiltinDefaultSkin, BuiltinLookalikeSkin, Skin};
 use rustamp_testkit::{Snapshot, assert_golden};
 use rustamp_ui::equalizer::{EqSlider, EqWidget};
@@ -347,8 +348,10 @@ pub fn case_dialog_load_playlist(skin: &Skin, namespace: &str) {
     assert_golden("dialog_load_playlist", namespace, &shot.render_image());
 }
 
-/// Own-choice S08 regression states, generated from our deterministic PCM rather
-/// than hard-coded bar heights. No reference measurement or capture is implied.
+/// S08 regression states, generated from our deterministic PCM rather than
+/// hard-coded bar heights. The area, the band count and the fall-off follow
+/// the audited S08; the state itself is ours, and no reference measurement or
+/// capture is implied.
 pub fn case_visualization(skin: &Skin, namespace: &str) {
     use rustamp_core::vis::{VIS_SAMPLES, VisFrame};
     use rustamp_ui::MainWindow;
@@ -416,6 +419,26 @@ pub fn case_visualization(skin: &Skin, namespace: &str) {
     window.handle_event(&Event::StateChanged(TransportState::Stopped), 1000);
     window.refresh(1425);
     states.push(("vis_stopped_tail", window.state().clone()));
+
+    // S08 §1: the shaded main window carries its own analyser, 38 x 5 px
+    // with five bands.
+    window.handle_event(&Event::StateChanged(TransportState::Playing), 1000);
+    window.handle_command(&Command::ToggleWindowShade(WindowId::Main), 1000);
+    window.push_vis_frame(&frame, 44100, 1000).unwrap();
+    let shaded = window.state().clone();
+    {
+        // The shaded analyser is painted over the windowshade. The pixel is
+        // one to the right of the area's edge, so it is no grid dot.
+        let image = render_main_window(&shaded, skin, &MainWindowLayout::CLASSIC);
+        let area = MainWindowLayout::CLASSIC.shade_visualization;
+        let colors = skin.viscolors();
+        assert_eq!(
+            image.pixel(area.x + 1, area.y),
+            Some([colors[0][0], colors[0][1], colors[0][2], 255]),
+            "the shaded analyser covers the windowshade"
+        );
+    }
+    states.push(("vis_shaded_spectrum", shaded));
 
     let mut doubled = spectrum;
     doubled.double_size = true;

@@ -8,9 +8,11 @@
 //! implementing the classic Winamp 2.95 visualization plugin ABI (S09 §5).
 //!
 //! [`analyser`] holds the classic analyser modes - spectrum bars with
-//! falling peak markers, a triggered oscilloscope and off - as Rustamp's
-//! **own design**: spec S08 does not exist yet, so every constant there is
-//! an own choice and no reference behaviour is claimed.
+//! falling peak markers, a triggered oscilloscope and off. It follows the
+//! audited S08 for the area and the band count, the level scale, the fall-off
+//! step and the peak factor; what S08 leaves open - the band frequency edges,
+//! the update rate and the direction of the peak marker's travel - is an
+//! **own choice** there and says so.
 //!
 //! Codes against the frozen contracts in [`rustamp_core`]; see
 //! `docs/rfc/0001-core-contracts.md`.

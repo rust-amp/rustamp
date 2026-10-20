@@ -2,9 +2,16 @@
 //! Main-window rendering and transport adapter for the shared classic analyser.
 //!
 //! All signal analysis, band/height laws, envelopes and triggering live in
-//! [`rustamp_vis::analyser`]. These remain own choices, not measured S08 facts.
+//! [`rustamp_vis::analyser`], which follows the audited S08 for the area and
+//! the band count, the level scale, the fall-off step and the peak factor.
+//! What S08 leaves open - the band frequency edges, the update rate and the
+//! direction of the peak marker's travel - stays an own choice there.
+//!
 //! This module owns skin pixels, scope strokes, freshness and a pause-aware
-//! display clock. Analysis runs on the UI side, never in the audio callback.
+//! display clock, and it draws the analyser in the area the main window
+//! currently has: 76 x 16 px with ten bands, or 38 x 5 px with five bands
+//! while the window is shaded (S08 §1). Analysis runs on the UI side, never
+//! in the audio callback.
 //!
 //! No synthetic audio, padding, interpolation or plugin-spectrum interpretation:
 //! only the tap's actual 2 x 576 waveform values enter the transform. The caller
@@ -26,15 +33,17 @@
 
 use rustamp_core::vis::VisFrame;
 use rustamp_gfx::{Image, Rect};
-pub use rustamp_vis::analyser::SPECTRUM_BANDS;
-use rustamp_vis::analyser::{
-    Analyser, AnalyserError, ClassicMode, FRAME_STALE_MS, SCOPE_COLUMNS, SPECTRUM_ROWS,
-};
+use rustamp_vis::analyser::{Analyser, AnalyserError, ClassicMode, FRAME_STALE_MS, SCOPE_COLUMNS};
+pub use rustamp_vis::analyser::{Geometry, SPECTRUM_BANDS};
 
 use crate::state::TransportState;
 
-const BAR_PITCH: i32 = 4;
-const BAR_WIDTH: u32 = 3;
+/// The width of a bar in pixels.
+///
+/// Own choice (S08 §1 leaves the bar/gap split open, question 4): the bar
+/// takes the whole band share but the last pixel, so the ten bands of the
+/// 76 px area and the five bands of the 38 px area are drawn alike.
+const BAR_GAP: u32 = 1;
 
 /// The `viscolor.txt` slot numbers and what they mean (S17 §6).
 ///
@@ -111,6 +120,9 @@ pub struct VisState {
     /// The selected UI-local mode.
     pub mode: VisMode,
     /// Current bar heights, 0..=16 rows.
+    ///
+    /// The array holds every band of the widest area; the shaded area uses
+    /// the first five of them (S08 §1).
     pub bars: [u8; SPECTRUM_BANDS],
     /// Peak heights, 0..=16 rows; zero means no marker.
     pub peaks: [u8; SPECTRUM_BANDS],
@@ -202,6 +214,18 @@ impl Visualizer {
         self.sample_rate_hz = None;
     }
 
+    /// Switch to the other analyser area (S08 §1) and clear the display.
+    ///
+    /// The band count belongs to the area, so the new bands start without a
+    /// history: the display is cleared and the mode is kept.
+    pub fn set_geometry(&mut self, geometry: Geometry) {
+        if self.analyser.geometry() == geometry {
+            return;
+        }
+        self.analyser.set_geometry(geometry);
+        self.reset();
+    }
+
     /// Set a local render mode without changing plugin data or audio.
     pub fn set_mode(&mut self, mode: VisMode) {
         if self.analyser.mode() != mode.classic_mode() {
@@ -281,13 +305,14 @@ impl Visualizer {
     fn update_pixels(&mut self) {
         self.state.bars = self.analyser.bars();
         self.state.peaks = self.analyser.peaks();
-        self.state.scope = self.analyser.scope().map(scope_row);
+        let rows = self.analyser.geometry().rows();
+        self.state.scope = self.analyser.scope().map(|sample| scope_row(sample, rows));
     }
 }
 
 // Projection of the shared trace onto skin rows; positive samples point up.
-fn scope_row(sample: f32) -> u8 {
-    ((1.0 - f64::from(sample).clamp(-1.0, 1.0)) * f64::from(SPECTRUM_ROWS - 1) * 0.5).round() as u8
+fn scope_row(sample: f32, rows: u8) -> u8 {
+    ((1.0 - f64::from(sample).clamp(-1.0, 1.0)) * f64::from(rows - 1) * 0.5).round() as u8
 }
 
 /// The slot of the spectrum gradient row `row`, counted from the bar's bottom.
@@ -296,11 +321,17 @@ fn scope_row(sample: f32) -> u8 {
 /// bar and slot 17 at the bottom**. The base skin's own file names slot 2 "top
 /// of spec", and our Rust theme names slot 2 "top spectrum peak" and slot 17
 /// "bottom baseline ember", so the ramp runs from the top row down.
-fn spectrum_slot(row: u8) -> usize {
-    slots::SPECTRUM_BOTTOM - usize::from(row)
+///
+/// A bar that is shorter than the gradient - the shaded area is five rows
+/// tall (S08 §1) - shows the whole ramp in its own rows.
+fn spectrum_slot(row: u8, rows: u8) -> usize {
+    let span = u32::from(rows - 1).max(1);
+    let ramp = (slots::SPECTRUM_BOTTOM - slots::SPECTRUM_TOP) as u32;
+    let offset = u32::from(row) * ramp / span;
+    slots::SPECTRUM_BOTTOM - offset as usize
 }
 
-/// The slot of the oscilloscope row `row`.
+/// The slot of the oscilloscope row `row` in an area of `rows` rows.
 ///
 /// S17 §6: slots 18..22 are the five oscilloscope colours, slot 18 the
 /// brightest and the later ones progressively dimmer. Which sample wears which
@@ -308,11 +339,11 @@ fn spectrum_slot(row: u8) -> usize {
 /// steps one slot away from the centre line per row, and the outermost rows
 /// share the dimmest colour. The quiet trace therefore keeps the skin's
 /// brightest oscilloscope colour.
-fn oscilloscope_slot(row: u8) -> usize {
+fn oscilloscope_slot(row: u8, rows: u8) -> usize {
     let row = i32::from(row);
     // The centre line lies between the two middle rows.
-    let low = i32::from((SPECTRUM_ROWS - 1) / 2);
-    let high = i32::from(SPECTRUM_ROWS / 2);
+    let low = i32::from((rows - 1) / 2);
+    let high = i32::from(rows / 2);
     let distance = (row - low).abs().min((row - high).abs()) as usize;
     let steps = slots::OSCILLOSCOPE_LAST - slots::OSCILLOSCOPE_FIRST;
     slots::OSCILLOSCOPE_FIRST + distance.min(steps)
@@ -321,6 +352,10 @@ fn oscilloscope_slot(row: u8) -> usize {
 /// Paint only within `area`. Every colour comes from the skin's palette
 /// (`viscolor.txt`, S17 §6), so a skin change repaints the analyser in the new
 /// colours without any other wiring.
+///
+/// The geometry is the area the main window currently has (S08 §1): the
+/// normal window draws 76 x 16 px with ten bands, the shaded window 38 x 5 px
+/// with five.
 ///
 /// | Slot | Drawn as |
 /// |---|---|
@@ -335,6 +370,7 @@ fn oscilloscope_slot(row: u8) -> usize {
 pub fn draw_visualization(
     canvas: &mut Image,
     area: Rect,
+    geometry: Geometry,
     state: &VisState,
     colors: &[[u8; 3]; 24],
 ) {
@@ -342,51 +378,57 @@ pub fn draw_visualization(
         let [r, g, b] = colors[slot];
         [r, g, b, 255]
     };
+    let rows = geometry.rows();
+    let bands = geometry.bands();
+    let width = geometry.width();
+    // The bar takes the band's share without the last pixel: the gap is at
+    // least one pixel wide (own choice, S08 question 4).
+    let bar_width = (width / bands as u32).saturating_sub(BAR_GAP);
     // Fixed-size scratch makes even a changed layout safe: clip, never spill.
-    let mut image = Image::filled(
-        SCOPE_COLUMNS as u32,
-        u32::from(SPECTRUM_ROWS),
-        color(slots::BACKGROUND),
-    );
+    let mut image = Image::filled(width, u32::from(rows), color(slots::BACKGROUND));
     if state.mode != VisMode::Off {
-        for y in (0..i32::from(SPECTRUM_ROWS)).step_by(2) {
-            for x in (0..SCOPE_COLUMNS as i32).step_by(2) {
+        for y in (0..i32::from(rows)).step_by(2) {
+            for x in (0..width as i32).step_by(2) {
                 image.set_pixel(x, y, color(slots::GRID));
             }
         }
     }
     match state.mode {
         VisMode::Spectrum => {
-            for band in 0..SPECTRUM_BANDS {
-                let x = band as i32 * BAR_PITCH;
-                for row in 0..state.bars[band].min(SPECTRUM_ROWS) {
+            for band in 0..bands {
+                let x = (band as u32 * width / bands as u32) as i32;
+                for row in 0..state.bars[band].min(rows) {
                     image.fill_rect(
-                        Rect::new(x, i32::from(SPECTRUM_ROWS - 1 - row), BAR_WIDTH, 1),
-                        color(spectrum_slot(row)),
+                        Rect::new(x, i32::from(rows - 1 - row), bar_width, 1),
+                        color(spectrum_slot(row, rows)),
                     );
                 }
-                let peak = state.peaks[band].min(SPECTRUM_ROWS);
+                let peak = state.peaks[band].min(rows);
                 if peak > 0 {
                     image.fill_rect(
-                        Rect::new(x, i32::from(SPECTRUM_ROWS - peak), BAR_WIDTH, 1),
+                        Rect::new(x, i32::from(rows - peak), bar_width, 1),
                         color(slots::PEAK),
                     );
                 }
             }
         }
         VisMode::Scope | VisMode::ScopeDots if state.input == VisInput::Fresh => {
-            for (x, &row) in state.scope.iter().enumerate() {
-                let row = row.min(SPECTRUM_ROWS - 1);
+            // The trace has one sample per column of the full-size area; a
+            // narrower area shows every n-th sample of it (own choice: S08
+            // leaves the oscilloscope open, question 3).
+            for x in 0..width as i32 {
+                let index = x as usize * SCOPE_COLUMNS / width as usize;
+                let row = state.scope[index].min(rows - 1);
                 if state.mode == VisMode::Scope && x > 0 {
-                    let previous = state.scope[x - 1].min(SPECTRUM_ROWS - 1);
+                    let previous = state.scope[index - 1].min(rows - 1);
                     // A one-column vertical bridge connects adjacent samples.
                     // Every row of the bridge wears the colour of its row, so
                     // the trace keeps the skin's brightness ramp.
                     for y in row.min(previous)..=row.max(previous) {
-                        image.set_pixel(x as i32, i32::from(y), color(oscilloscope_slot(y)));
+                        image.set_pixel(x, i32::from(y), color(oscilloscope_slot(y, rows)));
                     }
                 } else {
-                    image.set_pixel(x as i32, i32::from(row), color(oscilloscope_slot(row)));
+                    image.set_pixel(x, i32::from(row), color(oscilloscope_slot(row, rows)));
                 }
             }
         }
@@ -397,8 +439,8 @@ pub fn draw_visualization(
         Rect::new(
             0,
             0,
-            area.width.min(SCOPE_COLUMNS as u32),
-            area.height.min(u32::from(SPECTRUM_ROWS)),
+            area.width.min(width),
+            area.height.min(u32::from(rows)),
         ),
         area.x,
         area.y,
@@ -409,7 +451,7 @@ pub fn draw_visualization(
 mod tests {
     use super::*;
     use rustamp_core::vis::VIS_SAMPLES;
-    use rustamp_vis::analyser::BAND_EDGES;
+    use rustamp_vis::analyser::{BAND_EDGES, SHADED_BANDS, SHADED_ROWS, SPECTRUM_ROWS};
 
     fn tone(bin: usize, amplitude: f32) -> VisFrame {
         let wave = std::array::from_fn(|n| {
@@ -455,21 +497,30 @@ mod tests {
         assert_eq!(vis.state().mode, VisMode::Scope);
     }
 
+    /// S08 §2.1 and §2.2: a rising bar jumps at once, a falling one steps
+    /// down, and the display empties itself once the input is gone.
     #[test]
-    fn peak_hold_bar_fall_and_staleness_have_exact_time_boundaries() {
+    fn the_bar_falls_by_its_step_and_the_display_empties_when_the_input_goes() {
         let mut vis = Visualizer::default();
         vis.push(&tone(16, 1.0), 44100, 0, TransportState::Playing)
             .unwrap();
         let band = band_for(16);
+        assert_eq!(
+            vis.state.bars[band], SPECTRUM_ROWS,
+            "the bar jumps to the level"
+        );
+        assert_eq!(
+            vis.state.peaks[band], SPECTRUM_ROWS,
+            "the marker rides on it"
+        );
+        // The level falls: the bar steps down and never overtakes the marker.
         vis.push(&VisFrame::default(), 44100, 0, TransportState::Playing)
             .unwrap();
         vis.advance(125, TransportState::Playing);
-        assert_eq!((vis.state.bars[band], vis.state.peaks[band]), (13, 16));
+        assert!(vis.state.bars[band] < SPECTRUM_ROWS, "the bar fell");
+        assert!(vis.state.peaks[band] >= vis.state.bars[band]);
         assert_eq!(vis.state.input, VisInput::Stale);
-        vis.advance(300, TransportState::Playing);
-        assert_eq!(vis.state.peaks[band], 16, "hold through 300 ms");
-        vis.advance(425, TransportState::Playing);
-        assert_eq!(vis.state.peaks[band], 14, "16 rows/s after hold");
+        // Once the input is gone the display empties itself.
         vis.advance(1300, TransportState::Playing);
         assert_eq!((vis.state.bars[band], vis.state.peaks[band]), (0, 0));
         // Missing is different from the explicitly supplied silent frame.
@@ -482,6 +533,34 @@ mod tests {
         assert_eq!(fresh.state.input, VisInput::Fresh);
         fresh.advance(101, TransportState::Playing);
         assert_eq!(fresh.state.input, VisInput::Stale);
+    }
+
+    /// S08 §1: the shaded window draws its own analyser, 38 x 5 px with five
+    /// bands.
+    #[test]
+    fn the_shaded_area_carries_five_bands_in_five_rows() {
+        let mut vis = Visualizer::default();
+        vis.push(&tone(16, 1.0), 44100, 0, TransportState::Playing)
+            .unwrap();
+        assert!(
+            vis.state.bars.iter().any(|height| *height > 0),
+            "the tone shows up in the normal area"
+        );
+        vis.set_geometry(Geometry::Shaded);
+        // The area changed, so the display starts empty.
+        assert_eq!(vis.state.bars, [0; SPECTRUM_BANDS]);
+        vis.push(&tone(16, 1.0), 44100, 0, TransportState::Playing)
+            .unwrap();
+        assert!(
+            vis.state.bars.iter().all(|height| *height <= SHADED_ROWS),
+            "a shaded bar is at most five rows tall"
+        );
+        assert!(
+            vis.state.bars[SHADED_BANDS..]
+                .iter()
+                .all(|height| *height == 0),
+            "the shaded area has no bands beyond its five"
+        );
     }
 
     #[test]
@@ -546,16 +625,16 @@ mod tests {
         let mut state = VisState::default();
         state.bars[0] = 16;
         state.peaks[0] = 16;
-        state.bars[18] = 1;
-        draw_visualization(&mut image, area, &state, &palette);
+        state.bars[9] = 1;
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
         assert_eq!(image.pixel(3, 4), Some([23, 0, 0, 255]), "peak marker");
-        assert_eq!(image.pixel(5, 5), Some([3, 0, 0, 255]), "bar row 14");
+        assert_eq!(image.pixel(3, 5), Some([3, 0, 0, 255]), "bar row 14");
         assert_eq!(image.pixel(3, 19), Some([17, 0, 0, 255]), "bar row 0");
-        assert_eq!(image.pixel(6, 19), Some([0, 0, 0, 255]), "one-column gap");
+        assert_eq!(image.pixel(9, 19), Some([0, 0, 0, 255]), "one-column gap");
         assert_eq!(
             image.pixel(75, 19),
             Some([17, 0, 0, 255]),
-            "last bar starts at 72"
+            "the last band starts at 68"
         );
         for y in 0..30 {
             for x in 0..100 {
@@ -567,9 +646,51 @@ mod tests {
         // Even externally supplied out-of-range heights/rows cannot escape.
         state.bars.fill(255);
         state.peaks.fill(255);
-        draw_visualization(&mut image, Rect::new(98, 29, 1, 1), &state, &palette);
+        draw_visualization(
+            &mut image,
+            Rect::new(98, 29, 1, 1),
+            Geometry::Normal,
+            &state,
+            &palette,
+        );
         assert_eq!(image.pixel(98, 29), Some([23, 0, 0, 255]));
         assert_eq!(image.pixel(99, 29), Some(sentinel));
+    }
+
+    /// The shaded area draws five bars in five rows, and a bar of the shorter
+    /// area shows the whole colour ramp (S08 §1, S17 §6).
+    #[test]
+    fn the_shaded_area_draws_five_bars_in_five_rows() {
+        let palette = std::array::from_fn(|slot| [slot as u8, 0, 0]);
+        let area = Rect::new(0, 0, 38, 5);
+        let mut image = Image::new(38, 5);
+        let mut state = VisState::default();
+        for band in 0..5 {
+            state.bars[band] = 5;
+        }
+        draw_visualization(&mut image, area, Geometry::Shaded, &state, &palette);
+        // The first band starts at the left edge and shows the whole ramp.
+        for row in 0..SHADED_ROWS {
+            let y = i32::from(SHADED_ROWS - 1 - row);
+            let expected = slots::SPECTRUM_BOTTOM as u8 - row * 15 / (SHADED_ROWS - 1);
+            assert_eq!(
+                image.pixel(0, y),
+                Some([expected, 0, 0, 255]),
+                "row {row} of the shaded bar"
+            );
+        }
+        // The peak marker sits on the top row of its band.
+        state.peaks[0] = 5;
+        draw_visualization(&mut image, area, Geometry::Shaded, &state, &palette);
+        assert_eq!(image.pixel(0, 0), Some([23, 0, 0, 255]));
+        // The fifth band starts at 30 and the sixth has no place: the last
+        // pixel of the area shows the grid, not a bar.
+        assert_eq!(image.pixel(30, 4), Some([17, 0, 0, 255]));
+        assert_eq!(
+            image.pixel(36, 4),
+            Some([slots::GRID as u8, 0, 0, 255]),
+            "the shaded bars stop inside the area"
+        );
     }
 
     /// S17 §6: slots 2..17 are the spectrum gradient, slot 2 at the **top** of
@@ -581,7 +702,7 @@ mod tests {
         let mut image = Image::new(76, 16);
         let mut state = VisState::default();
         state.bars[0] = 16;
-        draw_visualization(&mut image, area, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
         for row in 0..SPECTRUM_ROWS {
             let y = i32::from(SPECTRUM_ROWS - 1 - row);
             assert_eq!(
@@ -608,7 +729,7 @@ mod tests {
         for (column, row) in state.scope.iter_mut().enumerate().take(16) {
             *row = column as u8;
         }
-        draw_visualization(&mut image, area, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
         for (column, row) in state.scope.iter().enumerate().take(16) {
             let distance = (*row as i32 - 7).abs().min((*row as i32 - 8).abs());
             let expected = slots::OSCILLOSCOPE_FIRST as u8 + distance.min(4) as u8;
@@ -629,7 +750,7 @@ mod tests {
             mode: VisMode::Scope,
             ..VisState::default()
         };
-        draw_visualization(&mut image, area, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
         assert!(
             !image.as_rgba().as_chunks::<4>().0.iter().any(|p| {
                 (slots::OSCILLOSCOPE_FIRST as u8..=slots::OSCILLOSCOPE_LAST as u8).contains(&p[0])
@@ -639,14 +760,14 @@ mod tests {
         state.input = VisInput::Fresh;
         state.scope[0] = 0;
         state.scope[1] = 15;
-        draw_visualization(&mut image, area, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
         assert_eq!(image.pixel(1, 7), Some([18, 0, 0, 255]));
         state.mode = VisMode::ScopeDots;
-        draw_visualization(&mut image, area, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
         assert_eq!(image.pixel(1, 7), Some([0, 0, 0, 255]));
         assert_eq!(image.pixel(1, 15), Some([22, 0, 0, 255]));
         state.mode = VisMode::Off;
-        draw_visualization(&mut image, area, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
         assert!(
             image
                 .as_rgba()

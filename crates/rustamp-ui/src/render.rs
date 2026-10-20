@@ -18,6 +18,7 @@ use rustamp_skin::{Sheet, Skin, webamp};
 use crate::docking::{WindowKind, window_size};
 use crate::layout::{MainWindowLayout, SHADE_HEIGHT, WINDOW_HEIGHT, WINDOW_WIDTH};
 use crate::state::{MainWindowState, MonoStereo, TransportButton, TransportState, WindowButton};
+use crate::visualization::Geometry;
 use crate::widget::Widget;
 
 /// The digit sprite names for `numbers.bmp`, indexed by digit value.
@@ -199,6 +200,7 @@ fn render_1x(state: &MainWindowState, skin: &Skin, layout: &MainWindowLayout) ->
     crate::visualization::draw_visualization(
         &mut canvas,
         layout.visualization,
+        Geometry::Normal,
         &state.visualization,
         skin.viscolors(),
     );
@@ -245,6 +247,15 @@ fn draw_shade(
         "MAIN_SHADE_POSITION_THUMB",
         layout.shade_position.x + offset as i32,
         layout.shade_position.y,
+    );
+    // S08 §1: the shaded main window carries its own analyser, 38 x 5 px with
+    // five bands.
+    crate::visualization::draw_visualization(
+        canvas,
+        layout.shade_visualization,
+        Geometry::Shaded,
+        &state.visualization,
+        skin.viscolors(),
     );
     if state.pressed_window_button == Some(WindowButton::Shade) {
         let rect = layout.window_button(WindowButton::Shade);

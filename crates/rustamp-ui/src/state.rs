@@ -125,8 +125,8 @@ pub struct MainWindowState {
     pub volume: u8,
     /// Balance, `0..=100` (50 is centred).
     pub balance: u8,
-    /// Rustamp's own deterministic analyser/scope drawing state. Every S08
-    /// reference question remains open; see [`crate::visualization`].
+    /// Rustamp's own deterministic analyser/scope drawing state. The area and
+    /// the band count follow the audited S08; see [`crate::visualization`].
     pub visualization: crate::visualization::VisState,
 }
 

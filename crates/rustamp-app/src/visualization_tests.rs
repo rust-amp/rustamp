@@ -140,7 +140,7 @@ fn playing() -> (App, tempfile::TempDir) {
     app.submit(Command::Play).unwrap();
     until(&mut app, |app| {
         app.state().visualization.input == VisInput::Fresh
-            && app.state().visualization.bars[8] == 14
+            && app.state().visualization.bars[4] == 14
     });
     (app, dir)
 }
@@ -288,8 +288,8 @@ fn absent_tap_frames_keep_exact_freshness_hold_fall_and_refresh_partition() {
     once.refresh(425);
     assert_eq!(app.state().visualization, once.state().visualization);
     assert_eq!(app.state().visualization.source_timestamp_us, Some(12345));
-    assert_eq!(app.state().visualization.bars[8], 9);
-    assert_eq!(app.state().visualization.peaks[8], 14);
+    assert_eq!(app.state().visualization.bars[4], 9);
+    assert_eq!(app.state().visualization.peaks[4], 13);
     app.pump_visualization(1300);
     app.ui.refresh(1300);
     assert_eq!(app.state().visualization.bars, [0; SPECTRUM_BANDS]);

@@ -59,6 +59,49 @@ fn sprite(frame: &Image, skin: &Skin, name: &str, dx: i32, dy: i32) {
     );
 }
 
+/// Like [`region`], but leaves one rectangle of the destination alone.
+///
+/// The shaded main window carries its own analyser (S08 §1: 38 x 5 px). Where
+/// that area sits in the windowshade is our own choice, so the pixels below
+/// it are ours and not the reference's; everything around it still has to
+/// match the sheet.
+fn region_except(
+    frame: &Image,
+    skin: &Skin,
+    sheet: Sheet,
+    src: Rect,
+    dx: i32,
+    dy: i32,
+    skip: Rect,
+) {
+    let raster = skin.sheet(sheet).unwrap();
+    for y in 0..src.height as i32 {
+        for x in 0..src.width as i32 {
+            let sx = src.x + x;
+            let sy = src.y + y;
+            let at = Rect::new(dx + x, dy + y, 1, 1);
+            if at.x < skip.right()
+                && at.right() > skip.x
+                && at.y < skip.bottom()
+                && at.bottom() > skip.y
+            {
+                continue;
+            }
+            assert!(
+                sx >= 0 && sy >= 0 && sx < raster.width() as i32 && sy < raster.height() as i32
+            );
+            let i = ((sy as u32 * raster.width() + sx as u32) * 4) as usize;
+            assert_eq!(
+                frame.pixel(dx + x, dy + y).unwrap(),
+                raster.as_rgba()[i..i + 4],
+                "{sheet:?} source {sx},{sy} at {},{}",
+                dx + x,
+                dy + y
+            );
+        }
+    }
+}
+
 #[test]
 fn base291_archive_native_sheets_metadata_and_tables() {
     let mut source = archive();
@@ -163,8 +206,10 @@ fn base291_main_focus_shade_scale_and_pressed_buttons() {
                 (frame.width(), frame.height()),
                 (275, if shade { 14 } else { 116 })
             );
-            // Avoid the shade slider and compare the entire unoverlaid left band.
-            region(
+            // Avoid the shade slider and compare the entire unoverlaid left
+            // band. The shaded analyser (S08 §1) is drawn over that band, so
+            // its own rectangle is left out.
+            region_except(
                 &frame,
                 &skin,
                 Sheet::Titlebar,
@@ -181,6 +226,7 @@ fn base291_main_focus_shade_scale_and_pressed_buttons() {
                 ),
                 0,
                 0,
+                layout.shade_visualization,
             );
             let double = render_main_window(
                 &MainWindowState {
@@ -971,7 +1017,7 @@ fn base291_vm_presented_pixels_match_reference_captures() {
 
 #[test]
 fn base291_slider_frames_blank_readouts_and_visualization_palette() {
-    use rustamp_ui::visualization::{VisInput, VisMode, VisState, slots};
+    use rustamp_ui::visualization::{SPECTRUM_BANDS, VisInput, VisMode, VisState, slots};
     let skin = skin();
     let layout = MainWindowLayout::CLASSIC;
     for (value, volume_frame, balance_frame) in [(0, 0, 27), (50, 13, 0), (100, 27, 27)] {
@@ -1026,7 +1072,7 @@ fn base291_slider_frames_blank_readouts_and_visualization_palette() {
         let state = MainWindowState {
             visualization: VisState {
                 mode,
-                bars: [16; 19],
+                bars: [16; SPECTRUM_BANDS],
                 scope: [8; 76],
                 input: VisInput::Fresh,
                 ..Default::default()

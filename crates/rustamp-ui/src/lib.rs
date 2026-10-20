@@ -28,8 +28,10 @@
 //!   skin is asked for. The mapping is **Rustamp's own choice** (S17 §8
 //!   leaves it open) and is a pure function: it never touches the skin or
 //!   the OS.
-//! * [`visualization`] implements Rustamp's own analyser/scope and envelopes,
-//!   consuming actual waveform snapshots. S08 reference behaviour remains open.
+//! * [`visualization`] implements the classic analyser/scope and its
+//!   envelopes, consuming actual waveform snapshots. The area, the band
+//!   count, the level scale, the fall-off step and the peak factor follow
+//!   the audited S08; the rest stays an own choice there.
 //! * [`playlist::PlaylistWindow`] is the headless playlist-editor behaviour of
 //!   spec **S06**: list selection, page scrolling, REM removal and the
 //!   bottom-bar dialog requests (titles only, no dialog internals).
