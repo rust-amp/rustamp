@@ -169,13 +169,17 @@ impl CursorSlot {
     /// The slot a cursor file name belongs to.
     ///
     /// The name is matched case-insensitively and the `.cur`/`.ani` extension
-    /// is ignored, so `POSBAR.ani` fills the `posbar` slot. A name that
-    /// belongs to no slot returns `None`.
+    /// is ignored, so `POSBAR.ani` fills the `posbar` slot. A directory
+    /// prefix is ignored as well, the way the skin file lookup ignores it,
+    /// so `cursors/close.cur` fills the `close` slot. A name that belongs to
+    /// no slot returns `None`.
     pub fn from_file_name(name: &str) -> Option<CursorSlot> {
         let lower = name.to_ascii_lowercase();
-        let stem = match lower.strip_suffix(".cur") {
+        // The last path component is the file name.
+        let file_name = lower.rsplit(['/', '\\']).next().unwrap_or(lower.as_str());
+        let stem = match file_name.strip_suffix(".cur") {
             Some(stem) => stem,
-            None => lower.strip_suffix(".ani").unwrap_or(lower.as_str()),
+            None => file_name.strip_suffix(".ani").unwrap_or(file_name),
         };
         CursorSlot::ALL
             .iter()
@@ -220,6 +224,16 @@ mod tests {
         assert_eq!(
             CursorSlot::from_file_name("Close.CUR"),
             Some(CursorSlot::Close)
+        );
+        // A directory prefix is ignored, the way the skin file lookup
+        // ignores it: the file name is the last path component.
+        assert_eq!(
+            CursorSlot::from_file_name("cursors/close.cur"),
+            Some(CursorSlot::Close)
+        );
+        assert_eq!(
+            CursorSlot::from_file_name("cursors\\posbar.ani"),
+            Some(CursorSlot::PosBar)
         );
         // A name that is no classic cursor belongs to no slot.
         assert_eq!(CursorSlot::from_file_name("not-a-cursor.cur"), None);

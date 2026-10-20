@@ -67,6 +67,13 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedBmp, String> {
     }
     let data = &bytes[pixel_offset..];
 
+    // An uncompressed image is checked against the file *before* the pixel
+    // buffer is allocated: a header that claims a huge image must not make
+    // the decoder reserve the memory first and fail afterwards.
+    if header.compression == 0 {
+        check_uncompressed(&header, data)?;
+    }
+
     let mut rgba = vec![0u8; pixel_count as usize * 4];
     let top_down = header.top_down;
 
@@ -189,20 +196,13 @@ fn decode_uncompressed(
     top_down: bool,
     out: &mut [u8],
 ) -> Result<(), String> {
+    check_uncompressed(header, data)?;
+
     let width = header.width as usize;
     let height = header.height as usize;
     let bpp = header.bpp as usize;
 
-    if !matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32) {
-        return Err(format!("unsupported bit depth {bpp}"));
-    }
-
-    let row_bytes = (bpp * width).div_ceil(32) * 4;
-    let needed = row_bytes.checked_mul(height).ok_or("row size overflow")?;
-    if data.len() < needed {
-        return Err("truncated pixel data".into());
-    }
-
+    let row_bytes = uncompressed_row_bytes(header);
     for row in 0..height {
         let src_row = &data[row * row_bytes..(row + 1) * row_bytes];
         let dst_y = if top_down { row } else { height - 1 - row };
@@ -214,6 +214,31 @@ fn decode_uncompressed(
             32 => decode_bgra32(width, src_row, dst_row)?,
             _ => unreachable!(),
         }
+    }
+    Ok(())
+}
+
+/// The number of bytes one row of an uncompressed image occupies.
+fn uncompressed_row_bytes(header: &Header) -> usize {
+    let bpp = header.bpp as usize;
+    (bpp * header.width as usize).div_ceil(32) * 4
+}
+
+/// Checks that an uncompressed image of `header` fits into `data`.
+///
+/// The bit depth is checked first, so a file with an unsupported depth is
+/// reported as such even when its pixel data is short as well.
+fn check_uncompressed(header: &Header, data: &[u8]) -> Result<(), String> {
+    let bpp = header.bpp as usize;
+    if !matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32) {
+        return Err(format!("unsupported bit depth {bpp}"));
+    }
+    let row_bytes = uncompressed_row_bytes(header);
+    let needed = row_bytes
+        .checked_mul(header.height as usize)
+        .ok_or("row size overflow")?;
+    if data.len() < needed {
+        return Err("truncated pixel data".into());
     }
     Ok(())
 }
