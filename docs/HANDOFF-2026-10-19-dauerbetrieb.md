@@ -163,17 +163,30 @@ a shade/unshade that was not the identity. A further real gap: the playlist had
 **no** shift- or ctrl-selection gesture at all (`wave261` added them as
 documented own choices, because S06 settles only the single click and SEL).
 
-The review findings are nearly closed now: `F2` (equal-rate clamp), `C6-2` (the
-production adapter's deadlock), `F3` (ReplayGain across a seek) are fixed and
-their entries in `docs/tasks/W14-wave-review.md` say so; `F5`/`F7` (the honest
-serializer deleting unhonoured settings) and `F4` (a resident DSP failure
-killing every later track) are in flight. Still open after that: `C1-2`/`C1-3`
-(documentedly false, the wiring is the caller's), `C4-1..C4-3`, `C5-1`/`C5-2`
-(test gaps), `F6` and `C6-3` (card manifest).
+| `wave264` | a seek re-derives the ReplayGain multiplier (F3) |
+| `wave265` | a restored window stack is clamped onto a visible monitor, docked groups in one piece |
+| `wave266` | a failed DSP stage is bypassed and the next track plays (F4), the loss is named |
+| `wave267` | `fadeout_ms`, `shuffle` and `repeat` from the config are applied and persisted |
+| `wave268` | the playlist writers are byte-idempotent; exact ms arithmetic in `time.rs` |
+| `wave269` | the two media-host sessions are independent (C4-2 session half), five tests |
+| `wave270` | every honoured config field is non-default in the round-trip tests (C5-1/C5-2/F6) |
+| `wave271` | a damaged or foreign library database is refused with a typed error and never written to |
+| `wave273` | the config unit test is no longer blind to seven writer mutations |
 
-In flight at the time of writing: `wave262` (preserve unhonoured config
-settings), `wave265` (clamp a restored window onto a visible monitor),
-`wave266` (a failed DSP stage recovers for the next track).
+The review is closed: every finding that described a **defect** is fixed and its
+entry says so (`F2`, `F3`, `F4`, `F5`, `F7`, `C4-2`, `C4-3`, `C6-1`, `C6-2`,
+plus the test gaps `C5-1`/`C5-2`/`F6`). What remains is `C1-2`/`C1-3`, which are
+**documentedly false by design** - the caller does the wiring - and `C6-3`, a
+dangling card reference.
+
+The most serious find of the late waves was in the library: a database without
+a single Rustamp table was opened **successfully** and our schema was written
+into it (8 KiB became 44 KiB), so a user's file would have been silently
+replaced; `user_version` was ignored entirely.
+
+In flight at the time of writing: `wave272` (surface and undo a DSP bypass in
+the app), `wave274` (do not rewrite a file whose tags would not change),
+`wave275` (rename a damaged database aside and start fresh, never delete).
 
 ## Rules added to `AGENTS.md` during the session
 
