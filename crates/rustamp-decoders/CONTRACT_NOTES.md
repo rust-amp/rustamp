@@ -405,6 +405,39 @@ decode it exactly as they decode a file.
   the reference reads one), it does not use a proxy (the shape of the proxy
   setting is open - S19 §6, question 13), and it does not show the status
   texts of S19 §2 - those belong to the application, which owns the window.
+- **What the transfer is doing is observable** (`http_progress.rs`). The
+  caller hands an `HttpProgress` to the open and reads a snapshot out of it:
+  the phase of the exchange, the bytes of the body that came in and the
+  length the server declared. The shape is a **shared snapshot of atomics**,
+  not a callback: a callback would run on the decode thread, and one that
+  can block would stall the transfer, while one that cannot block cannot
+  carry what a status line needs. The read is three atomic loads, it never
+  waits for the transfer, and the transfer never waits for the application.
+  The **rate** is not carried: the application derives it from two samples
+  of the byte count and its own clock, so the transfer never reads a clock
+  on the hot path.
+- **The phases are the ones S19 §2 names**, in the order the spec lists
+  them: `Connecting`, `SendingRequest`, `ReadingResponse`, `Retrieving`,
+  `ConnectionLost`, `Closed`, `ConnectFailed`. The spec does not establish
+  the order in which the player shows them (§6, question 15) - the enum
+  follows the table of the spec, and the application picks the text.
+  - A failure **before the connection is up** is a `ConnectFailed`: a URL
+    that cannot be read, a host that does not resolve, a host that refuses
+    the connection and a host that does not answer in time are all the
+    spec's "Error connecting to host".
+  - A **timeout** is not a lost connection: the host is slow, not gone, and
+    S19 carries no text for it (§6, questions 1 and 14). The phase stays
+    where it is.
+  - A **status other than 200** is not a phase of its own either (S19 §6,
+    question 4): the phase stays at `ReadingResponse`, where the failure
+    happened, and the typed failure names the status.
+  - The body that ends **where the server said it ends** is a `Closed`; a
+    body that ends **before** that is a `ConnectionLost` - and the decoder
+    names the cut as a truncated stream in the same call.
+  - The two phases of the spec's **proxy** path ("Connecting to proxy",
+    "Error connecting to proxy") are **not** declared: this tree has no
+    proxy, so no code could ever produce them. A proxy path adds one
+    variant when it lands.
 - **The engine's URL path is not wired.** `DecoderRegistry` cannot tell a URL
   from a path: it probes a source by its extension and its first bytes, and
   a URL has no bytes to sniff. A URL with an extension the registry knows

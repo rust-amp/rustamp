@@ -23,6 +23,13 @@
 //! * There is no `Connection:` line, and HTTP/1.0 is not a keep-alive
 //!   protocol: the connection is closed at the end of the body.
 //!
+//! # What the caller can observe
+//!
+//! The source writes what it is doing into an [`HttpProgress`]: the phase of
+//! the exchange - the phases of S19 §2 - and the counters of the body. The
+//! texts of the spec are the application's; this crate shows none of them.
+//! See [`crate::http_progress`] for the shape and for what the phases are.
+//!
 //! # What the spec leaves open, and what this module decides
 //!
 //! * The **timeout** (S19 §6, questions 1 and 14): [`DEFAULT_TIMEOUT`].
@@ -46,11 +53,11 @@
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use rustamp_core::error::Error as CoreError;
+
+use crate::http_progress::{HttpPhase, HttpProgress};
 
 /// The time the source waits for the host.
 ///
@@ -457,45 +464,6 @@ fn parse_head(text: &str) -> Result<Head, HttpError> {
 // Body
 // ---------------------------------------------------------------------------
 
-/// What the body and the decoder share: what the server declared, what
-/// arrived, and whether the connection died before the declared end.
-///
-/// The counters are atomics and not a lock: the decode thread writes them
-/// and the decoder reads them, and a lock on that path would be a lock on the
-/// decode thread.
-#[derive(Debug)]
-pub(crate) struct BodyState {
-    /// The bytes the server declared (`Content-Length`), when it declared any.
-    declared: Option<u64>,
-    /// The bytes that came out of the socket.
-    received: AtomicU64,
-    /// Whether the connection ended before the declared length was there.
-    cut: AtomicBool,
-}
-
-impl BodyState {
-    /// The bytes the server declared.
-    pub(crate) fn declared(&self) -> Option<u64> {
-        self.declared
-    }
-
-    /// The message for a body that ended before the length the server
-    /// declared.
-    ///
-    /// `None` when the body was complete: a body that ends where the server
-    /// said it ends is the end of the stream, not a cut.
-    pub(crate) fn cut_message(&self) -> Option<String> {
-        if !self.cut.load(Ordering::Acquire) {
-            return None;
-        }
-        let declared = self.declared.unwrap_or(0);
-        Some(format!(
-            "truncated stream: the connection closed after {} of the {declared} bytes the server declared",
-            self.received.load(Ordering::Acquire)
-        ))
-    }
-}
-
 /// The body of the response: the bytes the server sends after the head.
 pub(crate) struct Body {
     /// The socket the body comes from.
@@ -503,43 +471,39 @@ pub(crate) struct Body {
     /// The bytes that came with the head: the server may send them and the
     /// first bytes of the body in one segment.
     leftover: Vec<u8>,
-    /// What the decoder shares with the body.
-    state: Arc<BodyState>,
+    /// What the body, the decoder and the application share: the phase of
+    /// the transfer and the counters of the body.
+    progress: HttpProgress,
     /// The body is over.
     done: bool,
 }
 
 impl Body {
-    fn new(socket: TcpStream, declared: Option<u64>, leftover: Vec<u8>) -> Self {
-        let state = Arc::new(BodyState {
-            declared,
-            received: AtomicU64::new(0),
-            cut: AtomicBool::new(false),
-        });
+    /// The body of the answer, counted by `progress`.
+    fn new(socket: TcpStream, progress: HttpProgress, leftover: Vec<u8>) -> Self {
         Body {
             socket,
             leftover,
-            state,
+            progress,
             done: false,
         }
     }
 
-    /// The state the decoder shares with the body.
-    pub(crate) fn state(&self) -> Arc<BodyState> {
-        Arc::clone(&self.state)
-    }
-
     /// The bytes the server declared.
-    pub(crate) fn declared(&self) -> Option<u64> {
-        self.state.declared()
+    fn declared(&self) -> Option<u64> {
+        self.progress.total()
     }
 
-    /// Whether the connection ended before the declared length was there.
+    /// Notes that the connection died before the declared length was there.
+    ///
+    /// Without a declared length there is no oracle: a body that ends
+    /// cannot be told from a body that was cut.
     fn note_cut(&self) {
-        let declared = self.state.declared();
-        let received = self.state.received.load(Ordering::Acquire);
-        if declared.is_some_and(|declared| received < declared) {
-            self.state.cut.store(true, Ordering::Release);
+        let Some(declared) = self.progress.total() else {
+            return;
+        };
+        if self.progress.bytes_read() < declared {
+            self.progress.mark_cut();
         }
     }
 }
@@ -551,11 +515,14 @@ impl Read for Body {
         }
         // Never read past the length the server declared: the bytes behind it
         // are not part of this body.
-        let limit = match self.state.declared {
+        let limit = match self.progress.total() {
             Some(declared) => {
-                let received = self.state.received.load(Ordering::Acquire);
+                let received = self.progress.bytes_read();
                 if received >= declared {
+                    // The body is where the server said it ends: the server
+                    // closed the connection at the end of it.
                     self.done = true;
+                    self.progress.set_phase(HttpPhase::Closed);
                     return Ok(0);
                 }
                 let left = declared - received;
@@ -569,7 +536,7 @@ impl Read for Body {
             let n = self.leftover.len().min(limit);
             buf[..n].copy_from_slice(&self.leftover[..n]);
             self.leftover.drain(..n);
-            self.state.received.fetch_add(n as u64, Ordering::Relaxed);
+            self.progress.add_bytes(n as u64);
             return Ok(n);
         }
         match self.socket.read(&mut buf[..limit]) {
@@ -580,16 +547,20 @@ impl Read for Body {
                 // it is the end of the body, which is how a response without
                 // a `Content-Length` ends.
                 self.note_cut();
-                if self.state.declared.is_some() {
+                if self.progress.total().is_some() {
+                    // The host closed the connection before the body it
+                    // promised was there: the connection was lost.
+                    self.progress.set_phase(HttpPhase::ConnectionLost);
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionReset,
                         "the connection closed before the body was complete",
                     ));
                 }
+                self.progress.set_phase(HttpPhase::Closed);
                 Ok(0)
             }
             Ok(n) => {
-                self.state.received.fetch_add(n as u64, Ordering::Relaxed);
+                self.progress.add_bytes(n as u64);
                 Ok(n)
             }
             Err(e) => {
@@ -597,12 +568,16 @@ impl Read for Body {
                     e.kind(),
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
                 ) {
+                    // A timeout is not a lost connection: the host is slow,
+                    // not gone, and S19 carries no text for it (§6,
+                    // questions 1 and 14). The phase stays where it is.
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "the stream delivered nothing for the whole timeout",
                     ));
                 }
                 self.note_cut();
+                self.progress.set_phase(HttpPhase::ConnectionLost);
                 Err(e)
             }
         }
@@ -658,9 +633,46 @@ impl HttpSource {
     /// carries no text for it (S19 §6, question 4), so the source says what
     /// the server answered and stops there - the body of an error answer is
     /// not media.
-    pub(crate) fn open(url: &str, timeout: Duration) -> Result<Self, HttpError> {
+    ///
+    /// The transfer writes what it is doing into `progress`: the phase of
+    /// the exchange and the counters of the body.
+    pub(crate) fn open(
+        url: &str,
+        timeout: Duration,
+        progress: &HttpProgress,
+    ) -> Result<Self, HttpError> {
+        progress.set_phase(HttpPhase::Connecting);
+        match Self::exchange(url, timeout, progress) {
+            Ok(source) => Ok(source),
+            Err(e) => {
+                // A failure before the connection is up is a failure to
+                // connect: the host could not be reached.
+                if progress.phase() == HttpPhase::Connecting {
+                    progress.set_phase(HttpPhase::ConnectFailed);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The exchange itself: the connect, the request and the head.
+    fn exchange(url: &str, timeout: Duration, progress: &HttpProgress) -> Result<Self, HttpError> {
         let url = parse_url(url)?;
-        let mut socket = connect(&url, timeout)?;
+        let socket = Self::send_request(&url, timeout, progress)?;
+        Self::read_response(socket, progress)
+    }
+
+    /// Connects to the host and sends the request of S19 §1.
+    ///
+    /// The phase is [`HttpPhase::SendingRequest`] from the moment the
+    /// connection is up until the answer is read.
+    fn send_request(
+        url: &Url,
+        timeout: Duration,
+        progress: &HttpProgress,
+    ) -> Result<TcpStream, HttpError> {
+        let mut socket = connect(url, timeout)?;
+        progress.set_phase(HttpPhase::SendingRequest);
         socket
             .set_read_timeout(Some(timeout))
             .map_err(HttpError::Io)?;
@@ -668,8 +680,17 @@ impl HttpSource {
             .set_write_timeout(Some(timeout))
             .map_err(HttpError::Io)?;
         socket
-            .write_all(&request_bytes(&url))
+            .write_all(&request_bytes(url))
             .map_err(|e| map_write_error(e, "sending the request"))?;
+        Ok(socket)
+    }
+
+    /// Reads the head of the answer and prepares its body.
+    ///
+    /// The phase is [`HttpPhase::ReadingResponse`] while the head is read
+    /// and [`HttpPhase::Retrieving`] from the moment the head is there.
+    fn read_response(mut socket: TcpStream, progress: &HttpProgress) -> Result<Self, HttpError> {
+        progress.set_phase(HttpPhase::ReadingResponse);
         let (head, leftover) = read_head(&mut socket)?;
         if head.code != 200 {
             return Err(HttpError::Status {
@@ -677,19 +698,19 @@ impl HttpSource {
                 reason: head.reason,
             });
         }
+        // The length the server declared is the total of the transfer: it is
+        // there from now on, and there is none when the server declared no
+        // length.
+        progress.set_total(head.length);
+        progress.set_phase(HttpPhase::Retrieving);
         Ok(HttpSource {
-            body: Body::new(socket, head.length, leftover),
+            body: Body::new(socket, progress.clone(), leftover),
         })
     }
 
     /// The body of the response, as symphonia sees it.
     pub(crate) fn into_source(self) -> BodySource {
         BodySource { body: self.body }
-    }
-
-    /// The state the decoder shares with the body.
-    pub(crate) fn state(&self) -> Arc<BodyState> {
-        self.body.state()
     }
 }
 
@@ -775,6 +796,9 @@ fn map_write_error(e: io::Error, phase: &'static str) -> HttpError {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::thread;
+
     use super::*;
 
     #[test]
@@ -856,6 +880,34 @@ mod tests {
              Accept: */*\r\n\
              \r\n"
         );
+    }
+
+    /// The request is sent before the answer is read: the phase says that
+    /// the request is on its way while it is.
+    ///
+    /// The window is too short to be caught from the outside - a request of
+    /// a hundred bytes is written in a moment - so the step that sends it
+    /// is driven here.
+    #[test]
+    fn the_request_is_sent_before_the_answer_is_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local listener");
+        let port = listener.local_addr().expect("the address").port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("a connection");
+            let mut sink = [0u8; 1024];
+            let _ = socket.read(&mut sink);
+        });
+        let url = parse_url(&format!("http://127.0.0.1:{port}/stream.mp3")).expect("a URL");
+        let progress = HttpProgress::new();
+        let socket =
+            HttpSource::send_request(&url, Duration::from_secs(5), &progress).expect("the request");
+        assert_eq!(
+            progress.snapshot().phase,
+            HttpPhase::SendingRequest,
+            "the request is on its way"
+        );
+        drop(socket);
+        server.join().expect("the server");
     }
 
     #[test]
