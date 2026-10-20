@@ -546,7 +546,9 @@ impl LibraryWindow {
         {
             std::fs::create_dir_all(parent)?;
         }
-        Library::open(database)
+        // The open names the damage the database file has; the `?` turns it
+        // into the error of this crate, which carries the same text.
+        Ok(Library::open(database)?)
     }
 
     /// Runs the view's request against the index and hands the rows back.

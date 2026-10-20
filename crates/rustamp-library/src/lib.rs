@@ -296,6 +296,33 @@
 //! cannot be read or decoded is "no cover" as well: a broken `cover.jpg`
 //! must not break the row it belongs to.
 //!
+//! ## A damaged database
+//!
+//! [`Library::open`] never writes to a file it could not read as *this*
+//! crate's index. A damaged file is refused with a typed [`OpenError`] and
+//! left exactly as it was: the index is never dropped, truncated, migrated
+//! over or replaced because a file was damaged. A player that "repairs" a
+//! damaged library by writing a fresh schema over it destroys the index
+//! without a word, and the rows, the ids and the roots are gone for good.
+//!
+//! The damage classes and the error each of them gets:
+//!
+//! | Damage | The error |
+//! |---|---|
+//! | the path is not a regular file | [`OpenError::NotAFile`] |
+//! | the file does not start with the SQLite header | [`OpenError::NotADatabase`] |
+//! | the file was cut short | [`OpenError::Truncated`] |
+//! | SQLite reports the database as damaged | [`OpenError::Corrupt`] |
+//! | the file holds another program's tables | [`OpenError::ForeignSchema`] |
+//! | a newer version of the player wrote the file | [`OpenError::FutureVersion`] |
+//! | the file cannot be written to | [`OpenError::ReadOnly`] |
+//! | another process holds the file | [`OpenError::Locked`] |
+//!
+//! A file that is not there yet, and a file without a byte in it, are the
+//! first run: the schema is created in them. A file that holds the tables
+//! of this crate is ours, even when it is older than this version: it is
+//! migrated, and its rows are kept.
+//!
 //! ## Known limits
 //!
 //! * Change detection uses the file's stat, not its contents. A rewrite that
@@ -347,6 +374,7 @@ use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 
 mod artwork;
+mod open;
 #[cfg(test)]
 mod query_props;
 
@@ -354,6 +382,9 @@ pub use artwork::{
     ArtworkCache, ArtworkCacheStats, CoverImage, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
     MAX_DECODE_BYTES, SIDECAR_NAMES, THUMBNAIL_MAX_EDGE,
 };
+// The damage a database file can have is part of this crate's own surface:
+// a caller opens the index and has to know *why* it could not be opened.
+pub use open::OpenError;
 // The types of a tag write are part of this crate's own surface: a caller
 // names the fields it wants removed and reads the report of the write
 // without depending on `rustamp-meta` itself.
@@ -618,69 +649,48 @@ pub struct Library {
 
 impl Library {
     /// Open (or create) a library database at `path`.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path.as_ref()).map_err(map_sqlite)?;
-        Self::from_connection(conn)
+    ///
+    /// The file is checked before it is used, and a file that could not be
+    /// read as *this* crate's index is **never written to**: it is refused
+    /// with a typed [`OpenError`] and left exactly as it was. The index of a
+    /// user is not lost because a file was damaged, and a damaged file is
+    /// not "repaired" by writing a fresh schema over it - that would throw
+    /// the index away without a word.
+    ///
+    /// The damage classes and the error each of them gets:
+    ///
+    /// | Damage | The error |
+    /// |---|---|
+    /// | the path is not a regular file | [`OpenError::NotAFile`] |
+    /// | the file does not start with the SQLite header | [`OpenError::NotADatabase`] |
+    /// | the file was cut short | [`OpenError::Truncated`] |
+    /// | SQLite reports the database as damaged | [`OpenError::Corrupt`] |
+    /// | the file holds another program's tables | [`OpenError::ForeignSchema`] |
+    /// | a newer version of the player wrote the file | [`OpenError::FutureVersion`] |
+    /// | the file cannot be written to | [`OpenError::ReadOnly`] |
+    /// | another process holds the file | [`OpenError::Locked`] |
+    ///
+    /// A file that is not there yet, and a file without a byte in it, are
+    /// the first run: the schema is created in them.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError`] when the file is not a database of this crate. The
+    /// error names the damage, so a caller can tell the user what happened
+    /// to the file.
+    pub fn open(path: impl AsRef<Path>) -> std::result::Result<Self, OpenError> {
+        let path = path.as_ref();
+        let conn = open::connect(path)?;
+        prepared(conn).map_err(|error| OpenError::Failed {
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        })
     }
 
     /// Open an in-memory library (useful for tests).
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(map_sqlite)?;
-        Self::from_connection(conn)
-    }
-
-    fn from_connection(conn: Connection) -> Result<Self> {
-        configure(&conn)?;
-        let mut lib = Self { conn };
-        lib.migrate()?;
-        Ok(lib)
-    }
-
-    fn migrate(&mut self) -> Result<()> {
-        self.conn
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS tracks (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    path          TEXT NOT NULL UNIQUE,
-                    title         TEXT,
-                    artist        TEXT,
-                    album         TEXT,
-                    album_artist  TEXT,
-                    year          INTEGER,
-                    genre         TEXT,
-                    comment       TEXT,
-                    track_no      INTEGER,
-                    track_total   INTEGER,
-                    disc_no       INTEGER,
-                    duration_ms   INTEGER,
-                    bitrate_kbps  INTEGER,
-                    mtime_ns      INTEGER,
-                    size          INTEGER,
-                    scanned_at    INTEGER
-                );
-                CREATE INDEX IF NOT EXISTS tracks_artist ON tracks(artist);
-                CREATE INDEX IF NOT EXISTS tracks_album ON tracks(album);
-                CREATE TABLE IF NOT EXISTS track_extra (
-                    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-                    key      TEXT NOT NULL,
-                    value    TEXT NOT NULL,
-                    PRIMARY KEY (track_id, key)
-                );
-                CREATE TABLE IF NOT EXISTS roots (
-                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                    path     TEXT NOT NULL UNIQUE,
-                    added_at INTEGER NOT NULL,
-                    last_scanned_at INTEGER
-                );",
-            )
-            .map_err(map_sqlite)?;
-
-        // A database written by an older version has a `roots` table without
-        // the last-scan column: `CREATE TABLE IF NOT EXISTS` leaves an
-        // existing table as it is. The migration adds the column and keeps
-        // the rows; it is idempotent, so it runs on every open.
-        add_column_if_missing(&self.conn, "roots", "last_scanned_at", "INTEGER")?;
-        Ok(())
+        prepared(conn).map_err(map_sqlite)
     }
 
     /// Scan `root`, upserting track rows. See module docs for the rule.
@@ -1247,6 +1257,14 @@ impl Library {
     }
 }
 
+/// The connection, prepared for use: the SQL function registered and the
+/// schema in place.
+fn prepared(mut conn: Connection) -> rusqlite::Result<Library> {
+    configure(&conn)?;
+    open::migrate(&mut conn)?;
+    Ok(Library { conn })
+}
+
 /// The counters of a scan.
 #[derive(Debug, Default, Clone, Copy)]
 struct Counters {
@@ -1488,53 +1506,10 @@ impl ScanState<'_> {
     }
 }
 
-/// Add the column `column` to the table `table` when it is not there yet.
-///
-/// The crate has no migration framework: the schema is created with
-/// `CREATE TABLE IF NOT EXISTS`, which leaves a table that already exists
-/// exactly as it is. A database written by an older version therefore keeps
-/// its old shape and misses the columns a newer version expects.
-///
-/// The guard is the table's own column list (`pragma_table_info`), so the
-/// migration is idempotent: it runs on every open and does nothing once the
-/// column is there. The new column is nullable and has no default, so the
-/// rows of the old database keep their values and read as "never scanned"
-/// until a scan fills them in.
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
-    if column_exists(conn, table, column)? {
-        return Ok(());
-    }
-    // The table and the column are constants of this crate, never caller
-    // input, so the statement cannot carry an injection.
-    conn.execute_batch(&format!(
-        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-    ))
-    .map_err(map_sqlite)?;
-    Ok(())
-}
-
-/// Whether the table `table` has a column called `column`.
-fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-            params![table, column],
-            |row| row.get(0),
-        )
-        .map_err(map_sqlite)?;
-    Ok(count > 0)
-}
-
 /// Configure a fresh connection: foreign keys on, so deleting a track also
 /// drops its `track_extra` rows, plus the Unicode lower-casing SQL function.
-fn configure(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA foreign_keys = ON;")
-        .map_err(map_sqlite)?;
+fn configure(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.create_scalar_function(
         LOWER_FN,
         1,
@@ -1544,8 +1519,6 @@ fn configure(conn: &Connection) -> Result<()> {
             Ok(value.map(|v| v.to_lowercase()))
         },
     )
-    .map_err(map_sqlite)?;
-    Ok(())
 }
 
 /// The `WHERE` clause for `filter` and its bound values, in bind order.
@@ -3725,5 +3698,406 @@ mod tests {
 
         // The cache belongs to the caller: the operation did not touch it.
         assert_eq!(cache.entry_count(), 1);
+    }
+
+    // ---- a damaged database ----
+
+    /// The bytes of the file at `path`.
+    fn bytes_of(path: &Path) -> Vec<u8> {
+        fs::read(path).expect("the file is readable")
+    }
+
+    /// A library database with a root in it.
+    fn write_library_database(path: &Path) {
+        let mut library = Library::open(path).expect("a fresh database");
+        library.add_root(Path::new("C:/music")).expect("the root");
+    }
+
+    /// The error of an open that had to fail.
+    fn open_error(path: &Path) -> OpenError {
+        match Library::open(path) {
+            Ok(_) => panic!("the database at {} was opened", path.display()),
+            Err(error) => error,
+        }
+    }
+
+    /// The tables the database at `path` holds, sorted by name.
+    fn tables_of(path: &Path) -> Vec<String> {
+        let conn = Connection::open(path).expect("the database opens");
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .expect("the schema is readable");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("the tables are readable");
+        rows.map(|row| row.expect("a table name")).collect()
+    }
+
+    /// The schema version the database at `path` carries.
+    fn user_version_of(path: &Path) -> i64 {
+        let conn = Connection::open(path).expect("the database opens");
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("the version is readable")
+    }
+
+    /// The page size the database file announces.
+    fn page_size_of(path: &Path) -> usize {
+        let bytes = bytes_of(path);
+        let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+        if raw == 1 { 65536 } else { usize::from(raw) }
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_database_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        // A file with the name of a library database and content that is
+        // not a database.
+        fs::write(&path, vec![0x5au8; 4096]).unwrap();
+        let before = bytes_of(&path);
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::NotADatabase { .. }), "{error:?}");
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_truncated_database_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        write_library_database(&path);
+
+        // The file is cut in the middle of a page.
+        let full = bytes_of(&path);
+        fs::write(&path, &full[..full.len() - 100]).unwrap();
+        let before = bytes_of(&path);
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::Truncated { .. }), "{error:?}");
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_database_that_lost_pages_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        write_library_database(&path);
+        // A write that does not change the size of the file: the header and
+        // the file are out of step, which is the normal state of a database
+        // that was written to.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("UPDATE roots SET added_at = added_at")
+                .unwrap();
+        }
+
+        // The file is cut at a page boundary: the pages are gone, and the
+        // header still announces them.
+        let full = bytes_of(&path);
+        let cut = full.len() - page_size_of(&path);
+        fs::write(&path, &full[..cut]).unwrap();
+        let before = bytes_of(&path);
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::Truncated { .. }), "{error:?}");
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_database_with_a_foreign_tracks_table_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        // Another program wrote a `tracks` table with other columns.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE tracks (id INTEGER PRIMARY KEY, name TEXT)")
+                .unwrap();
+        }
+        let before = bytes_of(&path);
+
+        let error = open_error(&path);
+        assert!(
+            matches!(error, OpenError::ForeignSchema { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_database_of_another_program_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE playlist (id INTEGER PRIMARY KEY, name TEXT)")
+                .unwrap();
+        }
+        let before = bytes_of(&path);
+
+        // The schema of the library is not written over the database of
+        // another program: the rows of the user stay as they are.
+        let error = open_error(&path);
+        assert!(
+            matches!(error, OpenError::ForeignSchema { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+        assert_eq!(
+            tables_of(&path),
+            vec!["playlist"],
+            "the library tables were not created in it"
+        );
+    }
+
+    #[test]
+    fn a_database_of_a_newer_player_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        write_library_database(&path);
+        // A newer version of the player wrote the file.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 99).unwrap();
+        }
+        let before = bytes_of(&path);
+
+        let error = open_error(&path);
+        match error {
+            OpenError::FutureVersion {
+                found, supported, ..
+            } => {
+                assert_eq!(found, 99, "the error names the version of the file");
+                assert!(
+                    supported < 99,
+                    "the error names the version this crate knows"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_read_only_database_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        write_library_database(&path);
+        let original = fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original.clone();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        let before = bytes_of(&path);
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::ReadOnly { .. }), "{error:?}");
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+
+        // The file can be removed again.
+        fs::set_permissions(&path, original).unwrap();
+    }
+
+    #[test]
+    fn a_locked_database_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        write_library_database(&path);
+        let before = bytes_of(&path);
+
+        // Another connection holds the database: it cannot be read.
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::Locked { .. }), "{error:?}");
+
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_by_another_process_is_refused() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        write_library_database(&path);
+        let before = bytes_of(&path);
+
+        // Another process holds the file open without sharing the access.
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("the file is held");
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::Locked { .. }), "{error:?}");
+
+        drop(handle);
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_directory_in_place_of_the_database_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        fs::create_dir(&path).unwrap();
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::NotAFile { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn a_damaged_database_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        write_library_database(&path);
+
+        // The header does not announce the size of the file any more, and
+        // the file is half as long as it was: the pages the schema points at
+        // are gone.
+        let full = bytes_of(&path);
+        let mut damaged = full[..full.len() / 2].to_vec();
+        damaged[28..32].copy_from_slice(&0u32.to_be_bytes());
+        damaged[92..96].copy_from_slice(&0u32.to_be_bytes());
+        fs::write(&path, &damaged).unwrap();
+        let before = bytes_of(&path);
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::Corrupt { .. }), "{error:?}");
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_database_that_cannot_be_prepared_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        write_library_database(&path);
+        // The `roots` table is a view: the column the migration adds cannot
+        // be added to it, so the database cannot be prepared.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE roots;
+                 CREATE VIEW roots AS
+                     SELECT 1 AS id, 'C:/music' AS path, 0 AS added_at;",
+            )
+            .unwrap();
+        }
+        let before = bytes_of(&path);
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::Failed { .. }), "{error:?}");
+        assert_eq!(
+            bytes_of(&path),
+            before,
+            "the file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_database_that_cannot_be_opened_is_refused() {
+        let dir = TempDir::new().unwrap();
+        // The directory of the database does not exist.
+        let path = dir.path().join("nowhere").join("library.db");
+
+        let error = open_error(&path);
+        assert!(matches!(error, OpenError::Io { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn an_empty_file_is_the_first_run() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        fs::write(&path, b"").unwrap();
+
+        let library =
+            Library::open(&path).expect("an empty file is a database that was never written to");
+        assert_eq!(library.count().unwrap(), 0);
+        drop(library);
+
+        assert_eq!(
+            tables_of(&path),
+            vec!["roots", "track_extra", "tracks"],
+            "the schema is in the file"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_the_first_run() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        assert!(!path.exists());
+
+        let library = Library::open(&path).expect("a missing file is a database that is not there");
+        assert_eq!(library.count().unwrap(), 0);
+        drop(library);
+
+        assert!(path.is_file(), "the database was created");
+        assert_eq!(tables_of(&path), vec!["roots", "track_extra", "tracks"]);
+    }
+
+    #[test]
+    fn a_valid_database_opens_again_and_keeps_its_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("library.db");
+        write_library_database(&path);
+
+        let library = Library::open(&path).expect("a valid database opens");
+        let roots = library.roots().expect("the roots are readable");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, PathBuf::from("C:/music"));
+        drop(library);
+
+        assert_eq!(
+            user_version_of(&path),
+            1,
+            "the database carries the schema version of this crate"
+        );
     }
 }
