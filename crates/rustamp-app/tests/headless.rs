@@ -102,6 +102,23 @@ fn fixture() -> PathBuf {
         .join("sine.flac")
 }
 
+/// A playlist with one playable entry and two malformed ones.
+///
+/// The app notes what it skipped: the report and one line per skipped
+/// entry, in the order it skipped them. The malformed entries are the two
+/// `#EXTINF` lines that never find their location line.
+fn playlist_with_two_skips(dir: &tempfile::TempDir) -> PathBuf {
+    let source = fixture();
+    std::fs::copy(&source, dir.path().join("sine.flac")).expect("the fixture is copied");
+    let list = dir.path().join("list.m3u");
+    std::fs::write(
+        &list,
+        "#EXTM3U\n#EXTINF:1,First\n#EXTINF:2,Second\nsine.flac\n#EXTINF:3,Third\n",
+    )
+    .expect("the playlist is written");
+    list
+}
+
 #[test]
 fn the_binary_plays_a_reference_file_headless_and_exits_cleanly() {
     let fixture = fixture();
@@ -143,6 +160,115 @@ fn the_binary_with_no_file_exits_immediately_in_headless_mode() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("nothing to play"), "stdout:\n{stdout}");
+}
+
+/// The notes reach the standard error in a headless run.
+///
+/// The windowed presenter was the only printer of a note, so a headless run
+/// swallowed every diagnostic the app raised. The playlist with two
+/// malformed entries makes the app raise three: the report and one line per
+/// skipped entry.
+#[test]
+fn a_headless_run_prints_the_notes_it_raised() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = playlist_with_two_skips(&dir);
+    let mut command = binary();
+    isolate(&mut command, &dir);
+    let output = command
+        .arg("--null")
+        .arg("--seconds")
+        .arg("2")
+        .arg(&list)
+        .output()
+        .expect("spawn rustamp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("rustamp: loaded 1 tracks, skipped 2 malformed entries from"),
+        "the note must reach the standard error: {stderr}"
+    );
+}
+
+/// The notes keep the order they were raised in.
+#[test]
+fn the_notes_of_a_headless_run_keep_their_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = playlist_with_two_skips(&dir);
+    let mut command = binary();
+    isolate(&mut command, &dir);
+    let output = command
+        .arg("--null")
+        .arg("--seconds")
+        .arg("2")
+        .arg(&list)
+        .output()
+        .expect("spawn rustamp");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report = stderr
+        .find("loaded 1 tracks, skipped 2 malformed entries from")
+        .expect("the report is printed");
+    let first = stderr
+        .find("skipped: dangling #EXTINF without a location line: First")
+        .expect("the first skipped entry is printed");
+    let second = stderr
+        .find("skipped: dangling #EXTINF without a location line: Third")
+        .expect("the second skipped entry is printed");
+    assert!(
+        report < first,
+        "the report comes before the skips: {stderr}"
+    );
+    assert!(first < second, "the skips keep their order: {stderr}");
+}
+
+/// A note the run itself raises reaches the standard error as well.
+///
+/// The file does not exist: the engine reports the failure while the run is
+/// going, and the app notes it.
+#[test]
+fn a_note_raised_during_a_headless_run_reaches_the_standard_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-file");
+    let mut command = binary();
+    isolate(&mut command, &dir);
+    let output = command
+        .arg("--null")
+        .arg(&missing)
+        .output()
+        .expect("spawn rustamp");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("rustamp: error:")),
+        "the note the run raised must reach the standard error: {stderr}"
+    );
+}
+
+/// A run that raises no note prints none.
+#[test]
+fn a_headless_run_without_notes_prints_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = binary();
+    isolate(&mut command, &dir);
+    let output = command
+        .arg("--null")
+        .arg("--seconds")
+        .arg("2")
+        .arg(fixture())
+        .output()
+        .expect("spawn rustamp");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        !stderr.lines().any(|line| line.starts_with("rustamp: ")),
+        "a run without notes must print none: {stderr}"
+    );
 }
 
 #[test]

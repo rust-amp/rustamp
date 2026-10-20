@@ -328,7 +328,12 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
             // `/BOOKMARK`), nothing plays and the loop would wait forever.
             let only_added = !added.is_empty() && !plays;
             apply_startup(&mut app, plays, added)?;
-            if !only_added {
+            if only_added {
+                // Nothing plays, so the headless loop never runs: the notes
+                // the start-up raised are printed here, the way the windowed
+                // presenter prints them.
+                app.print_notes();
+            } else {
                 app.run_headless()?;
             }
             if let Err(error) = app.save_config() {
