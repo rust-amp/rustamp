@@ -166,6 +166,29 @@ impl PresenterWindow {
             }
         }
     }
+
+    /// Whether opening this window takes the keyboard focus from the window
+    /// that has it.
+    ///
+    /// The main window does: it is the window the player starts in, and a
+    /// dialog does: it is modal. The equalizer and the playlist editor do
+    /// **not**: Winamp opens them without activating them, so the main window
+    /// keeps the focus and keeps its focused title bar.
+    ///
+    /// The measured reference start state of the base-2.91 campaign is
+    /// exactly that - "main focused, equalizer and playlist open" (the
+    /// `base291-main-active` job, 2026-10-20). Our player drew the
+    /// *unfocused* title bar there, because creating the equalizer's window
+    /// activated it and took the focus away from the main window
+    /// (2026-10-21). A real click on the equalizer's title bar still moves
+    /// the focus - that is the `base291-main-inactive` job's real-mouse step,
+    /// and it must keep working.
+    const fn activates_on_open(self) -> bool {
+        match self {
+            PresenterWindow::Main | PresenterWindow::Dialog => true,
+            PresenterWindow::Equalizer | PresenterWindow::Playlist => false,
+        }
+    }
 }
 
 /// How the presenter satisfies a dialog the app opened.
@@ -2180,6 +2203,11 @@ impl Windowed {
     /// exists for. `size` is the client size the caller already computed
     /// (`App::frame_size`, `App::eq_frame_size`, a spec'd constant), so the
     /// geometry the tests measure is passed through untouched.
+    ///
+    /// `with_active` carries the focus rule of
+    /// [`PresenterWindow::activates_on_open`]: the equalizer and the playlist
+    /// editor are shown without being activated, so they leave the keyboard
+    /// focus with the main window the way Winamp does.
     fn window_attributes(
         window: PresenterWindow,
         title: &str,
@@ -2187,7 +2215,8 @@ impl Windowed {
         position: Option<(i32, i32)>,
     ) -> WindowAttributes {
         let attributes =
-            rustamp_ui::shell::skinned_window_attributes(title, size, window.taskbar_role());
+            rustamp_ui::shell::skinned_window_attributes(title, size, window.taskbar_role())
+                .with_active(window.activates_on_open());
         #[cfg(windows)]
         let attributes = match window_class(window) {
             Some(class) => {
@@ -4431,6 +4460,34 @@ mod tests {
             vec![PresenterWindow::Main],
             "the player is one application: only the main window may carry the taskbar entry"
         );
+    }
+
+    /// The focus defect: opening the equalizer or the playlist editor took
+    /// the keyboard focus away from the main window, so the main window drew
+    /// its **unfocused** title bar while Winamp keeps the focused one. The
+    /// measured reference start state of the base-2.91 campaign is exactly
+    /// that - "main focused, equalizer and playlist open" - and our capture
+    /// of it showed the unfocused band (2026-10-21).
+    ///
+    /// What this can and cannot do: the decision is checked here, headlessly.
+    /// That the shell then shows the window without activating it needs a
+    /// desktop, so only the owner machine can confirm the rest.
+    #[test]
+    fn the_classic_sibling_windows_leave_the_focus_with_the_main_window() {
+        for window in [PresenterWindow::Equalizer, PresenterWindow::Playlist] {
+            let attributes = Windowed::window_attributes(window, "Rustamp", (275, 116), None);
+            assert!(
+                !attributes.active,
+                "{window:?}: opening it must leave the keyboard focus with the main window"
+            );
+        }
+        for window in [PresenterWindow::Main, PresenterWindow::Dialog] {
+            let attributes = Windowed::window_attributes(window, "Rustamp", (275, 116), None);
+            assert!(
+                attributes.active,
+                "{window:?}: this window takes the focus when it opens"
+            );
+        }
     }
 
     /// A restored position is applied at creation and does not bring the

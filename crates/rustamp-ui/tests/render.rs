@@ -29,7 +29,9 @@ const MINUS: [u8; 3] = [4, 5, 6];
 const CLUTTER_BG: [u8; 3] = [8, 9, 10];
 const CLUTTER_A: [u8; 3] = [160, 170, 180];
 const POS_THUMB: [u8; 3] = [190, 200, 210];
-const SHADE_POS_THUMB: [u8; 3] = [150, 160, 170];
+// The webamp-provisional `MAIN_SHADE_POSITION_THUMB` cell, painted so a
+// blit of it over the strip would be loud.
+const SHADE_POSITION_CELL: [u8; 3] = [150, 160, 170];
 const GLYPH_A: [u8; 3] = [220, 230, 240];
 const GLYPH_B: [u8; 3] = [46, 47, 48];
 const SHADE: [u8; 3] = [5, 6, 7];
@@ -151,8 +153,10 @@ fn synthetic_skin() -> Skin {
                 (304, 0, 8, 43, CLUTTER_BG),
                 (316, 55, 4, 6, CLUTTER_A),
                 (27, 29, 275, 14, SHADE),
-                // The shaded window's position thumb (S01 provisional).
-                (20, 36, 3, 7, SHADE_POS_THUMB),
+                // The leftover cell of the 9 x 9 window-button area that
+                // 2.95 never reads (S01 §2.4). The renderer must not blit
+                // it over the strip.
+                (20, 36, 3, 7, SHADE_POSITION_CELL),
                 // The four pressed window-button cells (S02 §7).
                 (0, 9, 9, 9, OPTIONS_DEPRESSED),
                 (9, 9, 9, 9, MINIMIZE_DEPRESSED),
@@ -337,24 +341,36 @@ fn a_track_that_cannot_be_seeked_draws_the_position_slider_disabled() {
     }
 }
 
+/// The shaded strip is the skin's own shade title bar and nothing else.
+///
+/// The measured shaded main window of Winamp 2.95 is pixel for pixel the
+/// skin's shade title bar (`titlebar.bmp` 27,29,275,14), so the renderer
+/// paints no slider of its own over the strip. The webamp-provisional
+/// `MAIN_SHADE_POSITION_*` cells live in the 9 x 9 window-button area that
+/// 2.95 never reads (S01 §2.4, open question 1): blitting them would cover
+/// the skin's own mini position groove with the leftovers of a button cell.
 #[test]
-fn the_shaded_position_slider_is_disabled_too() {
+fn the_shaded_strip_is_the_skins_own_shade_cell() {
     let skin = synthetic_skin();
     let layout = MainWindowLayout::CLASSIC;
     let mut state = playing_state();
     state.windowshade = true;
-    let enabled = render_main_window(&state, &skin, &layout);
-    state.seekable = false;
-    let disabled = render_main_window(&state, &skin, &layout);
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!((frame.width(), frame.height()), (275, 14));
 
-    let thumb = Rect::new(layout.shade_position.x, layout.shade_position.y, 3, 7);
-    let lit = rgb(&enabled, thumb.x, thumb.y);
-    let dim = rgb(&disabled, thumb.x, thumb.y);
-    assert_ne!(lit, dim, "the disabled look must differ from the live one");
-    assert!(
-        dim[0] < lit[0] && dim[1] < lit[1] && dim[2] < lit[2],
-        "the disabled thumb must be dimmer: {lit:?} -> {dim:?}"
-    );
+    // Everything the skin's shade title bar paints is still there. The
+    // shaded analyser is the one exception (S08 §1): it is our own area, and
+    // where it sits in the windowshade is our own choice.
+    let analyser = layout.shade_visualization;
+    for y in 0..14 {
+        for x in 0..275 {
+            let ours =
+                x >= analyser.x && x < analyser.right() && y >= analyser.y && y < analyser.bottom();
+            if !ours {
+                assert_eq!(rgb(&frame, x, y), SHADE, "{x},{y}");
+            }
+        }
+    }
 }
 
 #[test]
