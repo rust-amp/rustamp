@@ -5,7 +5,10 @@
 //! [`DecoderRegistry`](rustamp_core::audio::DecoderRegistry).
 //!
 //! * [`symphonia_dec`]: pure-Rust decoding of MP3/MP2/MP1, FLAC, Ogg Vorbis,
-//!   WAV/PCM, AIFF, CAF, MP4/M4A (AAC, ALAC), raw ADTS AAC and Matroska audio.
+//!   Ogg Opus, WAV/PCM, AIFF, CAF, MP4/M4A (AAC, ALAC), raw ADTS AAC and
+//!   Matroska audio.
+//! * [`opus_dec`]: the Opus codec for the symphonia pipeline. Symphonia ships
+//!   no Opus codec, so this crate brings its own (see the module docs).
 //! * [`wave_dec`]: a dependency-free RIFF/WAVE PCM decoder (the classic Winamp
 //!   `in_wave` format family). It overlaps symphonia on purpose - the same
 //!   extensions (`wav`, `wave`) and the same content signature (`RIFF`/`WAVE`)
@@ -20,6 +23,7 @@ use std::sync::Arc;
 
 use rustamp_core::audio::DecoderRegistry;
 
+pub mod opus_dec;
 pub mod symphonia_dec;
 pub mod wave_dec;
 
