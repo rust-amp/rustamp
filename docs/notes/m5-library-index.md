@@ -16,7 +16,9 @@ Defined in `crates/rustamp-library/src/lib.rs` (module docs and `migrate`):
   with indexes on `artist` and `album`.
 - `track_extra(track_id, key, value)` is the `TrackMetadata::extra` map.
 - `roots(id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE,
-  added_at INTEGER NOT NULL)` lists the indexed directories.
+  added_at INTEGER NOT NULL, last_scanned_at INTEGER)` lists the indexed
+  directories. `last_scanned_at` is the unix second of the last scan that
+  ran to the end; it is `NULL` for a root that was never scanned.
 
 Connections are configured with `PRAGMA foreign_keys = ON`, so deleting a track
 also deletes its `track_extra` rows; and with a registered `rustamp_lower` scalar
@@ -46,7 +48,8 @@ same second.
 - `Library::write_tags(id, &TrackMetadata) -> Result<TrackRow>` (writes the
   tags into the real file and refreshes the row from it, see below)
 - `TrackRow { id, path, metadata: TrackMetadata, mtime_ns, size }`
-- `Root { id, path, added_at }`
+- `Root { id, path, added_at, last_scanned_at }` (`last_scanned_at` is
+  `Option<i64>`: `None` means the root was never scanned)
 - `Query { path_prefix, artist, album, title, genre, text, sort, descending,
   limit, offset }`; field filters are exact and case-sensitive, combined with
   AND; `path_prefix` is a literal byte prefix.
@@ -209,7 +212,48 @@ image in the same directory.
 The "no cover" answer is cached like every other answer, so a directory
 with neither an embedded picture nor a sidecar is read once.
 
-## Tests (38, all headless on temp directories)
+## The last scan of a root (wave227)
+
+The `roots` table carries the time of the last scan of the root, so a UI can
+show "last scanned 5 minutes ago" without keeping that state itself.
+
+- The column is `roots.last_scanned_at INTEGER` (unix seconds, `NULL` = never
+  scanned). `Root` exposes it as `last_scanned_at: Option<i64>`, and
+  `roots()` returns it.
+- `Library::scan_root(id)` (and `scan_root_with_progress`) records the time
+  **after** a scan that ran to the end.
+- A **cancelled** scan records nothing: it did not finish, so it must not
+  claim that the root was scanned. The time of the last finished scan is
+  kept.
+- A **failed** scan (an error, e.g. the directory is gone) records nothing
+  either; the scan returns the error.
+- A scan that skipped files (a file that could not be read, a directory that
+  could not be walked) *is* a scan that ran to the end and records the time;
+  the skips are in the `ScanReport`.
+- The plain `Library::scan(path)` records nothing: it works on an arbitrary
+  path and does not know which root row it belongs to.
+
+### The migration
+
+The crate has no migration framework. The schema is created with
+`CREATE TABLE IF NOT EXISTS`, which leaves a table that already exists
+exactly as it is, so a database written by an older version keeps its old
+`roots` table **without** the new column.
+
+The migration therefore runs on every open and is idempotent:
+
+1. `SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2` with the
+   table and the column name bound - the column list of the table.
+2. If the column is not in the list: `ALTER TABLE roots ADD COLUMN
+   last_scanned_at INTEGER`.
+
+The column is nullable and has no default, so the rows of an old database
+keep their values and read as "never scanned" until a scan fills them in.
+Only the `ALTER` statement names the table and the column as text; they are
+constants of the crate, never caller input, so it cannot carry an
+injection.
+
+## Tests (83, all headless on temp directories)
 
 Scan/query (14, wave145): `scan_indexes_and_queries`, `rescan_is_idempotent`,
 `update_on_change`, `removed_files_dropped`, `query_by_album`,
@@ -257,6 +301,21 @@ survives and the changed row keeps its old tags),
 progress report the same thing),
 `a_scan_cancelled_before_it_starts_does_nothing`.
 
+The last scan of a root (9, wave227):
+`a_fresh_database_has_the_last_scan_column`,
+`an_old_database_migrates_and_keeps_its_rows` (a database written with the
+old `roots` table keeps its row and reads as "never scanned"),
+`the_migration_is_idempotent` (the second open finds the column and leaves
+the table alone),
+`a_scan_records_the_time_of_the_root`,
+`a_cancelled_scan_records_no_time`,
+`a_cancelled_scan_keeps_the_time_of_the_last_finished_scan` (a known time in
+the row survives the cancelled scan),
+`a_failed_scan_records_no_time` (the directory is gone: the scan is an error
+and the time is kept),
+`a_scan_of_an_unregistered_path_records_no_time`,
+`the_time_of_a_root_is_kept_when_the_root_is_removed_and_added_again`.
+
 Fixtures are 44-byte WAV headers written with `rustamp_meta::write_tags`, so no
 audio is decoded and no window is opened.
 
@@ -278,7 +337,9 @@ audio is decoded and no window is opened.
 - Artwork via `ArtworkCache::get(path)`: the embedded front cover of the
   track, or the sidecar image next to it (`cover.jpg` and friends); the
   picture is decoded on the fly and never stored in the index.
-- A per-root last-scan timestamp (the `roots` table has only `added_at`).
+- The per-root last-scan time is in the index now: `roots()` returns
+  `last_scanned_at` (`None` = never scanned). `scan_root` writes it after a
+  scan that ran to the end; a cancelled or failed scan leaves it alone.
 - CD playback/ripping (M5 optional) is out of scope here.
 
 ## Remaining limits
@@ -295,9 +356,10 @@ audio is decoded and no window is opened.
   `rustamp-meta` does not read audio properties.
 - A tag write cannot ask for a field to be removed: `write_tags` reads a
   `None` as "leave the value the file has".
-- The scan progress is not stored: there is no per-root last-scan time and
-  no progress row in the index, so a scan that was interrupted is resumed by
-  running it again.
+- The scan progress is not stored: there is no progress row in the index, so
+  a scan that was interrupted is resumed by running it again. The time of
+  the last finished scan is in the `roots` row, the counters of that scan
+  are not.
 - A cancelled scan drops the batch that was in flight (at most
   `SCAN_BATCH_SIZE` files of work); the next scan picks those files up.
 - The scan reports one event per considered file, so a caller that forwards
