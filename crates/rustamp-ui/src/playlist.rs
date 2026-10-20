@@ -19,6 +19,17 @@
 //! activate a drag. Row halves choose before/after, blank list space chooses
 //! after the visible rows. Escape, leaving the list, or an order change cancels.
 //! Playback and selection stay attached to entry ids; no auto-scroll is implied.
+//!
+//! The **selection gestures** are own choices as well. S06 §2 settles only the
+//! single click (one row) and SEL (all visible rows), and S06 §8 Q11/Q14
+//! record that "beyond the all-select of §2 nothing about SEL visuals or
+//! multi-selection is settled". The shift-range, the ctrl-toggle and the
+//! keyboard extension below are therefore *this implementation's* choice, not
+//! measurements. They mirror the reference semantics of `rustamp-playlist`'s
+//! `interact` module — a contiguous range from an anchor, a one-row toggle, an
+//! anchor clamped into the list, an empty list refusing the gesture — which
+//! `rustamp-ui` may not depend on (S06i3), so the rules are restated here and
+//! cited there.
 
 use std::collections::BTreeSet;
 
@@ -1040,7 +1051,12 @@ pub struct PlaylistWindow {
     entries: Vec<EntryId>,
     first_visible: usize,
     selected: BTreeSet<EntryId>,
+    /// The fixed end of the range gestures: the entry of the last click that
+    /// set one (own choice; S06 §2 settles only the single click).
     shift_anchor: Option<EntryId>,
+    /// The moving end of the range gestures: the entry the user pointed at
+    /// last. The anchor and the focus together span the selected range.
+    shift_focus: Option<EntryId>,
     current: Option<EntryId>,
     drag: Option<PlaylistDrag>,
 }
@@ -1054,7 +1070,9 @@ impl PlaylistWindow {
     /// Syncs the entry order (the app is the state owner).
     ///
     /// Entries that no longer exist drop out of the selection; the scroll
-    /// offset is clamped so the visible slice stays inside the list.
+    /// offset is clamped so the visible slice stays inside the list. The
+    /// anchor of the range gestures is dropped with its entry, so a stale
+    /// anchor can never name a row that is not there.
     pub fn set_entries(&mut self, entries: Vec<EntryId>) {
         if self.entries != entries {
             self.cancel_drag();
@@ -1062,10 +1080,15 @@ impl PlaylistWindow {
         self.entries = entries;
         let live: BTreeSet<EntryId> = self.entries.iter().copied().collect();
         self.selected.retain(|id| live.contains(id));
-        if let Some(anchor) = self.shift_anchor
-            && !live.contains(&anchor)
+        if self
+            .shift_anchor
+            .is_some_and(|anchor| !live.contains(&anchor))
         {
             self.shift_anchor = None;
+            self.shift_focus = None;
+        }
+        if self.shift_focus.is_some_and(|focus| !live.contains(&focus)) {
+            self.shift_focus = None;
         }
         if let Some(cur) = self.current
             && !live.contains(&cur)
@@ -1174,20 +1197,42 @@ impl PlaylistWindow {
     /// Presses a row and arms a drag, preserving an existing multi-selection
     /// when the pressed row belongs to it. Returns a selection command only
     /// when pressing an unselected row. Own choice, not settled by S06 §8 Q6.
-    pub fn mouse_down(&mut self, x: i32, y: i32) -> Option<Command> {
+    ///
+    /// The **modifiers** choose the gesture (own choice; S06 §2 settles only
+    /// the single click):
+    ///
+    /// * no modifier: the plain click of S06 §2 — the row alone replaces the
+    ///   selection and becomes the anchor of the range gestures;
+    /// * `Shift`: the contiguous range between the anchor and the pressed row
+    ///   replaces the selection, and the anchor stays;
+    /// * `Ctrl`: exactly the pressed row is toggled, the rest of the
+    ///   selection stays, and the pressed row becomes the anchor;
+    /// * `Alt` is not bound to a list gesture, so it presses like no
+    ///   modifier at all.
+    ///
+    /// A press on the **empty space** below the last entry clears the
+    /// selection (and the anchor with it); a modified press there has no row
+    /// to work on and changes nothing.
+    pub fn mouse_down(&mut self, x: i32, y: i32, modifiers: Modifiers) -> Option<Command> {
         self.cancel_drag();
         if self.windowshade {
             return None;
         }
         let row = crate::playlist_window::hit_test_list_row(x, y, self.row_pitch())?;
-        let id = *self.entries.get(self.first_visible + row)?;
-        let command = if self.selected.contains(&id) {
-            None
+        let Some(id) = self.entries.get(self.first_visible + row).copied() else {
+            // The empty space below the last entry: only the plain click
+            // clears the selection there.
+            if modifiers.shift() || modifiers.ctrl() {
+                return None;
+            }
+            return self.clear_selection();
+        };
+        let command = if modifiers.shift() {
+            self.extend_selection_to(id)
+        } else if modifiers.ctrl() {
+            self.toggle_row(id)
         } else {
-            self.selected.clear();
-            self.selected.insert(id);
-            self.shift_anchor = Some(id);
-            Some(Command::Select(SelectOp::Set(vec![id])))
+            self.select_row(id)
         };
         self.drag = Some(PlaylistDrag {
             press: (x, y),
@@ -1195,6 +1240,118 @@ impl PlaylistWindow {
             insertion: None,
         });
         command
+    }
+
+    /// The plain click (S06 §2, settled: one posted click selects the first
+    /// visible row): the pressed row alone replaces the selection and becomes
+    /// the anchor of the range gestures.
+    ///
+    /// A row that is **already** selected keeps the multi-selection: the
+    /// press arms a drag that moves the whole block (own choice, S06 §8 Q6),
+    /// so it emits no command and changes nothing.
+    fn select_row(&mut self, id: EntryId) -> Option<Command> {
+        if self.selected.contains(&id) {
+            return None;
+        }
+        self.selected.clear();
+        self.selected.insert(id);
+        self.set_anchor(id);
+        Some(Command::Select(SelectOp::Set(vec![id])))
+    }
+
+    /// The ctrl-click: exactly the pressed row is toggled, every other
+    /// selected row stays, and the pressed row becomes the anchor (own
+    /// choice; S06 §8 Q11/Q14 leave the multi-selection open).
+    ///
+    /// The command is a [`SelectOp::Set`] with the **resulting** set and not
+    /// a [`SelectOp::Toggle`]: the app applies every `Command::Select` back
+    /// onto this model (`App::apply_app` → [`PlaylistWindow::apply_select`]),
+    /// and a toggle applied twice cancels itself, while a set states the
+    /// outcome and survives the round trip unchanged.
+    fn toggle_row(&mut self, id: EntryId) -> Option<Command> {
+        if !self.selected.remove(&id) {
+            self.selected.insert(id);
+        }
+        self.set_anchor(id);
+        Some(Command::Select(SelectOp::Set(self.selected_ids())))
+    }
+
+    /// The shift-click: the contiguous range between the anchor and the
+    /// pressed row replaces the selection, and the anchor stays (own choice;
+    /// the same rule as `rustamp_playlist::interact::select_range`, which
+    /// replaces the selection instead of extending it).
+    ///
+    /// Without an anchor — nothing was clicked yet, or the anchor's entry is
+    /// gone — there is no range to extend, so the gesture behaves like a
+    /// plain click: the pressed row alone is selected and becomes the anchor.
+    fn extend_selection_to(&mut self, id: EntryId) -> Option<Command> {
+        let Some(anchor) = self.shift_anchor else {
+            return self.select_row(id);
+        };
+        let Some(anchor_index) = self.entries.iter().position(|entry| *entry == anchor) else {
+            // A stale anchor names no row: drop it and start over.
+            self.shift_anchor = None;
+            self.shift_focus = None;
+            return self.select_row(id);
+        };
+        let target_index = self.entries.iter().position(|entry| *entry == id)?;
+        let ids = range_ids(&self.entries, anchor_index, target_index);
+        self.selected = ids.iter().copied().collect();
+        self.shift_focus = Some(id);
+        Some(Command::Select(SelectOp::Set(ids)))
+    }
+
+    /// A plain click into the empty space below the last entry clears the
+    /// selection, and the anchor with it (own choice).
+    ///
+    /// Nothing is emitted when the selection was already empty: the gesture
+    /// changed nothing.
+    fn clear_selection(&mut self) -> Option<Command> {
+        self.shift_anchor = None;
+        self.shift_focus = None;
+        if self.selected.is_empty() {
+            return None;
+        }
+        self.selected.clear();
+        Some(Command::Select(SelectOp::None))
+    }
+
+    /// Sets the anchor and the focus of the range gestures to `id`.
+    fn set_anchor(&mut self, id: EntryId) {
+        self.shift_anchor = Some(id);
+        self.shift_focus = Some(id);
+    }
+
+    /// Extends the selection from the anchor by one row (own choice: S03 §2
+    /// binds neither `Shift+Up` nor `Shift+Down`, and S06 §8 Q7 leaves the
+    /// keyboard open).
+    ///
+    /// The selected range runs between the **anchor** (the fixed end) and the
+    /// **focus** (the end that moves): the focus steps one row down or up and
+    /// the selection becomes the contiguous range between the two, clamped at
+    /// the ends of the list. `None` when there is no anchor — nothing was
+    /// clicked yet, or the anchor's entry is gone — or when the step changes
+    /// nothing.
+    pub fn extend_selection(&mut self, down: bool) -> Option<Command> {
+        let anchor = self.shift_anchor?;
+        let focus = self.shift_focus.unwrap_or(anchor);
+        let focus_index = self.entries.iter().position(|entry| *entry == focus)?;
+        let anchor_index = self.entries.iter().position(|entry| *entry == anchor)?;
+        let last = self.entries.len().saturating_sub(1);
+        let target = if down {
+            (focus_index + 1).min(last)
+        } else {
+            focus_index.saturating_sub(1)
+        };
+        let ids = range_ids(&self.entries, anchor_index, target);
+        let target_id = self.entries[target];
+        self.shift_focus = Some(target_id);
+        if ids.iter().copied().collect::<BTreeSet<_>>() == self.selected {
+            return None;
+        }
+        self.selected = ids.iter().copied().collect();
+        self.reveal(target);
+        Some(Command::Select(SelectOp::Set(ids)))
     }
 
     /// Updates an armed drag. Four pixels of motion on either axis activate
@@ -1270,6 +1427,7 @@ impl PlaylistWindow {
         let id = self.visible_ids().get(row).copied()?;
         self.selected.clear();
         self.selected.insert(id);
+        self.set_anchor(id);
         Some(Command::PlayEntry(id))
     }
 
@@ -1278,6 +1436,7 @@ impl PlaylistWindow {
         let id = self.entries.get(index).copied()?;
         self.selected.clear();
         self.selected.insert(id);
+        self.set_anchor(id);
         Some(Command::PlayEntry(id))
     }
 
@@ -1353,6 +1512,9 @@ impl PlaylistWindow {
     /// current first-selected entry (the playlist-order anchor). With no
     /// selection it selects the last visible row. The view follows so the new
     /// selection stays visible. A no-op on an empty list.
+    ///
+    /// The anchor of the range gestures follows the moved row, so a later
+    /// `Shift+Up`/`Shift+Down` extends from where the user is (own choice).
     pub fn move_selection_up(&mut self) {
         let Some(index) = self.selection_anchor_index(false) else {
             return;
@@ -1459,6 +1621,7 @@ impl PlaylistWindow {
         let id = self.selected_ids().into_iter().next()?;
         self.selected.clear();
         self.selected.insert(id);
+        self.set_anchor(id);
         Some(Command::PlayEntry(id))
     }
 
@@ -1488,12 +1651,22 @@ impl PlaylistWindow {
     }
 
     /// Selects `entries[index]` alone and scrolls so it is visible.
+    ///
+    /// The anchor follows the row: a plain `Up`/`Down` moves the user's
+    /// focus, so the range gestures extend from where the user is (own
+    /// choice).
     fn select_single_and_reveal(&mut self, index: usize) {
         let Some(id) = self.entries.get(index).copied() else {
             return;
         };
         self.selected.clear();
         self.selected.insert(id);
+        self.set_anchor(id);
+        self.reveal(index);
+    }
+
+    /// Scrolls so the row at `index` is visible.
+    fn reveal(&mut self, index: usize) {
         if index < self.first_visible {
             self.scroll_to(index);
         } else if index >= self.first_visible + self.visible_rows() {
@@ -1508,6 +1681,9 @@ impl PlaylistWindow {
     /// present at capture time and no menu choice is required (S06 §5.2). With
     /// nothing selected the button is a no-op returning `None` (S06 §5.3: R2's
     /// unstaged REM second click changed 0 px).
+    ///
+    /// The anchor of the range gestures is dropped with its entry, exactly as
+    /// [`PlaylistWindow::set_entries`] does for an entry that leaves the list.
     pub fn press_rem(&mut self) -> Option<Command> {
         let ids = self.selected_ids();
         if ids.is_empty() {
@@ -1516,6 +1692,15 @@ impl PlaylistWindow {
         let gone: BTreeSet<EntryId> = ids.iter().copied().collect();
         self.entries.retain(|id| !gone.contains(id));
         self.selected.clear();
+        if self
+            .shift_anchor
+            .is_some_and(|anchor| gone.contains(&anchor))
+        {
+            self.shift_anchor = None;
+            self.shift_focus = None;
+        } else if self.shift_focus.is_some_and(|focus| gone.contains(&focus)) {
+            self.shift_focus = None;
+        }
         self.clamp_scroll();
         Some(Command::Remove(ids))
     }
@@ -1593,7 +1778,7 @@ mod tests {
     fn row_drag_crosses_slop_then_chooses_row_halves() {
         let mut window = window_with(4);
         assert_eq!(
-            window.mouse_down(60, 28),
+            window.mouse_down(60, 28, Modifiers::NONE),
             Some(Command::Select(SelectOp::Set(vec![EntryId(0)])))
         );
         window.mouse_move(63, 28);
@@ -1621,7 +1806,7 @@ mod tests {
         let selection = vec![EntryId(1), EntryId(6)];
         window.apply_select(&SelectOp::Set(vec![EntryId(6), EntryId(1)]));
         window.set_current(Some(EntryId(6)));
-        assert_eq!(window.mouse_down(60, 42), None);
+        assert_eq!(window.mouse_down(60, 42, Modifiers::NONE), None);
         window.set_entries(ids(8)); // A same-order app sync must not cancel.
         window.mouse_move(60, 23);
         assert_eq!(
@@ -1653,7 +1838,7 @@ mod tests {
     fn row_drag_uses_scrolled_gaps_and_blank_space_after_the_last_entry() {
         let mut window = window_with(8);
         window.scroll_to(4);
-        window.mouse_down(60, 28);
+        window.mouse_down(60, 28, Modifiers::NONE);
         window.mouse_move(60, 74);
         assert_eq!(window.drag_insertion(), Some(8));
         assert_eq!(
@@ -1666,11 +1851,11 @@ mod tests {
 
         let mut window = window_with(2);
         assert_eq!(
-            window.mouse_down(60, 70),
+            window.mouse_down(60, 70, Modifiers::NONE),
             None,
             "blank space cannot start a drag"
         );
-        window.mouse_down(60, 28);
+        window.mouse_down(60, 28, Modifiers::NONE);
         window.mouse_move(60, 85);
         assert_eq!(window.drag_insertion(), Some(2));
         assert_eq!(
@@ -1685,11 +1870,11 @@ mod tests {
     #[test]
     fn clicks_and_drops_around_an_unchanged_block_emit_no_move() {
         let mut window = window_with(4);
-        window.mouse_down(60, 28);
+        window.mouse_down(60, 28, Modifiers::NONE);
         assert_eq!(window.mouse_up(63, 28), None);
         for y in [36, 48, 49, 61] {
             window.apply_select(&SelectOp::Set(vec![EntryId(1), EntryId(2)]));
-            window.mouse_down(60, 42);
+            window.mouse_down(60, 42, Modifiers::NONE);
             window.mouse_move(64, y);
             assert!(window.drag_insertion().is_some());
             assert_eq!(window.mouse_up(64, y), None, "y={y}");
@@ -1707,7 +1892,7 @@ mod tests {
             Some((60, 22)),
             Some((60, 93)),
         ] {
-            window.mouse_down(60, 28);
+            window.mouse_down(60, 28, Modifiers::NONE);
             window.mouse_move(60, 74);
             assert_eq!(window.drag_insertion(), Some(4));
             if let Some((x, y)) = leave {
@@ -1720,11 +1905,11 @@ mod tests {
             assert_eq!(window.visible_ids(), ids(4));
             assert_eq!(window.selected_ids(), vec![EntryId(0)]);
         }
-        window.mouse_down(60, 28);
+        window.mouse_down(60, 28, Modifiers::NONE);
         window.mouse_move(60, 74);
         window.set_entries(vec![EntryId(1), EntryId(0), EntryId(2), EntryId(3)]);
         assert_eq!(window.mouse_up(60, 74), None, "concurrent reorder cancels");
-        window.mouse_down(60, 28);
+        window.mouse_down(60, 28, Modifiers::NONE);
         window.mouse_move(60, 74);
         window.apply_select(&SelectOp::All);
         assert_eq!(window.mouse_up(60, 74), None, "changed selection cancels");
@@ -1765,7 +1950,7 @@ mod tests {
         // S06 §2: single posted click at (60,28) selects the first visible row.
         let mut window = window_with(60);
         window.scroll_to(56);
-        let command = window.mouse_down(LIST_SELECT_POINT.0, LIST_SELECT_POINT.1);
+        let command = window.mouse_down(LIST_SELECT_POINT.0, LIST_SELECT_POINT.1, Modifiers::NONE);
         assert_eq!(
             command,
             Some(Command::Select(SelectOp::Set(vec![EntryId(56)])))
@@ -1783,10 +1968,268 @@ mod tests {
     fn clicking_an_empty_list_selects_nothing() {
         let mut window = PlaylistWindow::new();
         assert_eq!(
-            window.mouse_down(LIST_SELECT_POINT.0, LIST_SELECT_POINT.1),
+            window.mouse_down(LIST_SELECT_POINT.0, LIST_SELECT_POINT.1, Modifiers::NONE),
             None
         );
         assert!(window.selected_ids().is_empty());
+    }
+
+    /// The window-relative y of the visible row `row`.
+    ///
+    /// The list starts at the settled top of S06 §2 and the rows follow the
+    /// settled 13 px pitch of S01 §4.2.
+    fn row_y(row: usize) -> i32 {
+        crate::playlist_window::LIST_TOP + row as i32 * crate::playlist_window::ROW_PITCH
+    }
+
+    /// The shift-click selects the contiguous range between the anchor and the
+    /// pressed row, in both directions (own choice).
+    ///
+    /// S06 §2 settles only the single click and SEL; S06 §8 Q11/Q14 leave the
+    /// multi-selection open. The rule mirrors `rustamp_playlist::interact`'s
+    /// `select_range`: a contiguous range that **replaces** the selection.
+    #[test]
+    fn a_shift_click_selects_the_contiguous_range_from_the_anchor() {
+        let mut window = window_with(6);
+        assert_eq!(
+            window.mouse_down(60, row_y(1), Modifiers::NONE),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(1)])))
+        );
+        // Forward: the anchor stays, the range reaches the pressed row.
+        assert_eq!(
+            window.mouse_down(60, row_y(3), Modifiers::SHIFT),
+            Some(Command::Select(SelectOp::Set(vec![
+                EntryId(1),
+                EntryId(2),
+                EntryId(3)
+            ])))
+        );
+        assert_eq!(
+            window.selected_ids(),
+            vec![EntryId(1), EntryId(2), EntryId(3)]
+        );
+        // Backward: the same anchor, the range between anchor and pressed row.
+        assert_eq!(
+            window.mouse_down(60, row_y(0), Modifiers::SHIFT),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(0), EntryId(1)])))
+        );
+        assert_eq!(window.selected_ids(), vec![EntryId(0), EntryId(1)]);
+    }
+
+    /// The shift-range is clamped at both ends of the list (own choice).
+    #[test]
+    fn a_shift_click_is_clamped_at_both_ends_of_the_list() {
+        // The anchor is the last row: the range reaches the top of the list.
+        let mut window = window_with(4);
+        window.mouse_down(60, row_y(3), Modifiers::NONE);
+        assert_eq!(
+            window.mouse_down(60, row_y(0), Modifiers::SHIFT),
+            Some(Command::Select(SelectOp::Set(ids(4))))
+        );
+        assert_eq!(window.selected_ids(), ids(4));
+        // The anchor is the first row: the range reaches the bottom.
+        let mut window = window_with(4);
+        window.mouse_down(60, row_y(0), Modifiers::NONE);
+        assert_eq!(
+            window.mouse_down(60, row_y(3), Modifiers::SHIFT),
+            Some(Command::Select(SelectOp::Set(ids(4))))
+        );
+        assert_eq!(window.selected_ids(), ids(4));
+    }
+
+    /// The ctrl-click toggles exactly the pressed row and leaves the rest of
+    /// the selection alone (own choice).
+    #[test]
+    fn a_ctrl_click_toggles_exactly_the_pressed_row() {
+        let mut window = window_with(4);
+        window.mouse_down(60, row_y(0), Modifiers::NONE);
+        // + row 2
+        assert_eq!(
+            window.mouse_down(60, row_y(2), Modifiers::CTRL),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(0), EntryId(2)])))
+        );
+        assert_eq!(window.selected_ids(), vec![EntryId(0), EntryId(2)]);
+        // - row 0: the other row stays selected.
+        assert_eq!(
+            window.mouse_down(60, row_y(0), Modifiers::CTRL),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(2)])))
+        );
+        assert_eq!(window.selected_ids(), vec![EntryId(2)]);
+        // - row 2: the selection is empty, and the anchor is the pressed row.
+        assert_eq!(
+            window.mouse_down(60, row_y(2), Modifiers::CTRL),
+            Some(Command::Select(SelectOp::Set(Vec::new())))
+        );
+        assert!(window.selected_ids().is_empty());
+    }
+
+    /// The shift-arrows extend the selection from the anchor by one row
+    /// (own choice: S03 §2 binds neither chord, S06 §8 Q7 leaves the keyboard
+    /// open).
+    #[test]
+    fn the_shift_arrows_extend_the_selection_from_the_anchor() {
+        let mut window = window_with(8);
+        window.mouse_down(60, row_y(1), Modifiers::NONE);
+        // One row down: the range spans the anchor and the focus.
+        assert_eq!(
+            window.extend_selection(true),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(1), EntryId(2)])))
+        );
+        assert_eq!(window.selected_ids(), vec![EntryId(1), EntryId(2)]);
+        // One row more.
+        assert_eq!(
+            window.extend_selection(true),
+            Some(Command::Select(SelectOp::Set(vec![
+                EntryId(1),
+                EntryId(2),
+                EntryId(3)
+            ])))
+        );
+        // Back up: the range shrinks towards the anchor.
+        assert_eq!(
+            window.extend_selection(false),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(1), EntryId(2)])))
+        );
+        // Up over the anchor: the range grows above it.
+        assert_eq!(
+            window.extend_selection(false),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(1)])))
+        );
+        assert_eq!(
+            window.extend_selection(false),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(0), EntryId(1)])))
+        );
+        // Clamped at the top of the list: nothing changes, nothing is emitted.
+        assert_eq!(window.extend_selection(false), None);
+        assert_eq!(window.selected_ids(), vec![EntryId(0), EntryId(1)]);
+        // Clamped at the bottom of the list.
+        let mut window = window_with(4);
+        window.mouse_down(60, row_y(3), Modifiers::NONE);
+        assert_eq!(window.extend_selection(true), None);
+        assert_eq!(window.selected_ids(), vec![EntryId(3)]);
+    }
+
+    /// The anchor is an *entry*, so a reorder moves its row with it (own
+    /// choice; the same rule as `rustamp_playlist::interact`, whose caller
+    /// re-derives the anchor's row after a reorder).
+    #[test]
+    fn the_anchor_survives_a_reorder() {
+        let mut window = window_with(5);
+        // The anchor is the entry 2 (row 2).
+        window.mouse_down(60, row_y(2), Modifiers::NONE);
+        window.set_entries(vec![
+            EntryId(0),
+            EntryId(1),
+            EntryId(4),
+            EntryId(2),
+            EntryId(3),
+        ]);
+        // The anchor (entry 2) is row 3 now: the range runs from row 3 back
+        // to the pressed row 1.
+        assert_eq!(
+            window.mouse_down(60, row_y(1), Modifiers::SHIFT),
+            Some(Command::Select(SelectOp::Set(vec![
+                EntryId(1),
+                EntryId(4),
+                EntryId(2),
+            ])))
+        );
+        assert_eq!(
+            window.selected_ids(),
+            vec![EntryId(1), EntryId(4), EntryId(2)]
+        );
+    }
+
+    /// An anchor whose entry is gone names no row, so the gesture must not
+    /// select one (own choice; the same rule as `rustamp_playlist::interact`).
+    #[test]
+    fn a_removed_anchor_never_selects_a_wrong_row() {
+        let mut window = window_with(5);
+        window.mouse_down(60, row_y(2), Modifiers::NONE);
+        // The anchor's entry leaves the list: the anchor is dropped with it.
+        window.set_entries(vec![EntryId(0), EntryId(1), EntryId(3), EntryId(4)]);
+        assert!(window.selected_ids().is_empty());
+        // A shift-click without an anchor has no range to extend: it selects
+        // the pressed row alone.
+        assert_eq!(
+            window.mouse_down(60, row_y(3), Modifiers::SHIFT),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(4)])))
+        );
+        assert_eq!(window.selected_ids(), vec![EntryId(4)]);
+        // The keyboard extension refuses without an anchor.
+        let mut window = PlaylistWindow::new();
+        window.set_entries(ids(4));
+        assert_eq!(window.extend_selection(true), None);
+        assert!(window.selected_ids().is_empty());
+    }
+
+    /// An empty list refuses every gesture (own choice; the same rule as
+    /// `rustamp_playlist::interact`).
+    #[test]
+    fn an_empty_list_refuses_every_selection_gesture() {
+        let mut window = PlaylistWindow::new();
+        for modifiers in [
+            Modifiers::NONE,
+            Modifiers::SHIFT,
+            Modifiers::CTRL,
+            Modifiers::SHIFT.union(Modifiers::CTRL),
+        ] {
+            assert_eq!(
+                window.mouse_down(60, row_y(0), modifiers),
+                None,
+                "{modifiers:?}"
+            );
+        }
+        assert_eq!(window.extend_selection(true), None);
+        assert_eq!(window.extend_selection(false), None);
+        assert!(window.selected_ids().is_empty());
+    }
+
+    /// A plain click into the empty space below the last entry clears the
+    /// selection, and the anchor with it (own choice).
+    #[test]
+    fn a_plain_click_into_the_empty_space_clears_the_selection_and_the_anchor() {
+        let mut window = window_with(2);
+        window.mouse_down(60, row_y(0), Modifiers::NONE);
+        assert_eq!(window.selected_ids(), vec![EntryId(0)]);
+        // Row 2 is empty space: the list holds two entries.
+        assert_eq!(
+            window.mouse_down(60, row_y(2), Modifiers::NONE),
+            Some(Command::Select(SelectOp::None))
+        );
+        assert!(window.selected_ids().is_empty());
+        // The anchor is gone with it: the shift-click has no range to extend.
+        assert_eq!(
+            window.mouse_down(60, row_y(1), Modifiers::SHIFT),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(1)])))
+        );
+        assert_eq!(window.selected_ids(), vec![EntryId(1)]);
+    }
+
+    /// A modified click into the empty space has no row to work on and
+    /// changes nothing (own choice).
+    #[test]
+    fn a_modified_click_into_the_empty_space_changes_nothing() {
+        let mut window = window_with(2);
+        window.mouse_down(60, row_y(0), Modifiers::NONE);
+        assert_eq!(window.mouse_down(60, row_y(2), Modifiers::SHIFT), None);
+        assert_eq!(window.mouse_down(60, row_y(2), Modifiers::CTRL), None);
+        assert_eq!(window.selected_ids(), vec![EntryId(0)]);
+    }
+
+    /// The settled single click still replaces the selection with one row
+    /// (S06 §2): the gestures around it do not change that.
+    #[test]
+    fn the_plain_click_still_replaces_the_selection_with_one_row() {
+        let mut window = window_with(4);
+        window.mouse_down(60, row_y(0), Modifiers::NONE);
+        window.mouse_down(60, row_y(2), Modifiers::CTRL);
+        assert_eq!(window.selected_ids(), vec![EntryId(0), EntryId(2)]);
+        assert_eq!(
+            window.mouse_down(60, row_y(3), Modifiers::NONE),
+            Some(Command::Select(SelectOp::Set(vec![EntryId(3)])))
+        );
+        assert_eq!(window.selected_ids(), vec![EntryId(3)]);
     }
 
     #[test]
@@ -1815,7 +2258,7 @@ mod tests {
         // S06 §5: REM removes the selected entry with no menu choice required.
         let mut window = window_with(60);
         window.scroll_to(56);
-        window.mouse_down(LIST_SELECT_POINT.0, LIST_SELECT_POINT.1);
+        window.mouse_down(LIST_SELECT_POINT.0, LIST_SELECT_POINT.1, Modifiers::NONE);
         let command = window.press_rem();
         assert_eq!(command, Some(Command::Remove(vec![EntryId(56)])));
         assert_eq!(window.len(), 59);

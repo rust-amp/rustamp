@@ -13,7 +13,12 @@
 //!
 //! * list press/move/release → [`PlaylistWindow::mouse_down`],
 //!   [`PlaylistWindow::mouse_move`], [`PlaylistWindow::mouse_up`]. S06 §2
-//!   settles the first-row click; drag rules are own choices (S06 §8 Q6);
+//!   settles the first-row click; the selection gestures around it (the
+//!   shift-range, the ctrl-toggle) and the drag rules are own choices
+//!   (S06 §8 Q6/Q11/Q14);
+//! * `Shift+Up`/`Shift+Down` → [`PlaylistWindow::extend_selection`], the
+//!   keyboard face of the same range (own choice: S03 §2 binds neither
+//!   chord);
 //! * SEL → [`PlaylistWindow::press_sel`] (S06 §2: selects all visible rows),
 //!   REM → [`PlaylistWindow::press_rem`] (S06 §5: removes the selection,
 //!   no-op unstaged), ADD → [`PlaylistWindow::press_add`], LIST OPTS →
@@ -165,7 +170,18 @@ impl App {
     /// A left-button press at playlist-window-relative `(x, y)`.
     ///
     /// Buttons fire on press; rows arm a headless drag (S06 §8 Q6 is open).
-    pub fn playlist_mouse_down(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+    ///
+    /// The **modifiers** choose the list gesture (own choice; S06 §2 settles
+    /// only the single click): no modifier selects the pressed row alone,
+    /// `Shift` extends the selection from the anchor to the pressed row and
+    /// `Ctrl` toggles exactly the pressed row. The model owns the rules and
+    /// produces the [`Command::Select`] the app applies.
+    pub fn playlist_mouse_down(
+        &mut self,
+        x: i32,
+        y: i32,
+        modifiers: Modifiers,
+    ) -> Result<Vec<Command>> {
         self.sync_playlist_entries();
         self.playlist.cancel_drag();
         if self.playlist_shaded() {
@@ -180,7 +196,7 @@ impl App {
             return self.playlist_press(button);
         }
         if in_list_area(x, y) {
-            return match self.playlist.mouse_down(x, y) {
+            return match self.playlist.mouse_down(x, y, modifiers) {
                 Some(command) => {
                     let commands = vec![command.clone()];
                     self.submit(command)?;
@@ -284,6 +300,21 @@ impl App {
         // A keyboard action must not change selection/viewport underneath a
         // held row gesture. Like the drag itself this is an own-choice rule.
         self.playlist.cancel_drag();
+
+        // Own choice, and not an S03 row: `Shift+Up` and `Shift+Down` extend
+        // the selection from the anchor of the range gestures. S03 §2 binds
+        // neither chord in the playlist table, and the shared tables bind
+        // neither either, so the editor's own table has no row for them.
+        if modifiers == Modifiers::SHIFT && matches!(key, Key::Up | Key::Down) {
+            return match self.playlist.extend_selection(key == Key::Down) {
+                Some(command) => {
+                    self.submit(command.clone())?;
+                    Ok(Some(ShortcutOutcome::Commands(vec![command])))
+                }
+                // Nothing to extend: the gesture changed nothing.
+                None => Ok(Some(ShortcutOutcome::Handled)),
+            };
+        }
 
         // The playlist table (S03 §2) comes before the shared path: it is the
         // editor's own table and shadows the main and global rows where the
@@ -776,7 +807,8 @@ mod tests {
         ] {
             let mut app = test_app();
             add_entries(&mut app, count);
-            app.playlist_mouse_down(60, press_y).unwrap();
+            app.playlist_mouse_down(60, press_y, Modifiers::NONE)
+                .unwrap();
             app.playlist_mouse_move(60, drop_y);
             let commands = app.playlist_mouse_up(60, drop_y).unwrap();
             assert!(matches!(commands.as_slice(), [Command::MoveEntries { .. }]));
@@ -805,7 +837,11 @@ mod tests {
         app.engine_mut().set_current_index(Some(2));
         app.submit(Command::Select(SelectOp::Set(vec![EntryId(2), EntryId(0)])))
             .unwrap();
-        assert!(app.playlist_mouse_down(60, 54).unwrap().is_empty());
+        assert!(
+            app.playlist_mouse_down(60, 54, Modifiers::NONE)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(app.playlist().selected_ids(), vec![EntryId(0), EntryId(2)]);
         app.playlist_mouse_move(60, 74);
         assert_eq!(
@@ -837,7 +873,7 @@ mod tests {
             .map(|source| source.display())
             .collect();
         for cancellation in 0..4 {
-            app.playlist_mouse_down(60, 42).unwrap();
+            app.playlist_mouse_down(60, 42, Modifiers::NONE).unwrap();
             let drop_y = if cancellation < 2 { 42 } else { 74 };
             if cancellation > 0 {
                 app.playlist_mouse_move(64, drop_y);
@@ -1094,7 +1130,9 @@ mod tests {
         // S06 §2: single click selects the first visible row.
         let mut app = test_app();
         add_entries(&mut app, 60);
-        let commands = app.playlist_mouse_down(60, 28).expect("click applies");
+        let commands = app
+            .playlist_mouse_down(60, 28, Modifiers::NONE)
+            .expect("click applies");
         assert_eq!(
             commands,
             vec![Command::Select(SelectOp::Set(vec![EntryId(0)]))]
@@ -1102,12 +1140,88 @@ mod tests {
         assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
     }
 
+    /// The selection gestures reach the model through the modifiers, and the
+    /// commands they produce keep the app's selection in step (own choice;
+    /// S06 §2 settles only the single click).
+    #[test]
+    fn the_shift_click_extends_the_selection_and_the_ctrl_click_toggles_it() {
+        let mut app = test_app();
+        add_entries(&mut app, 6);
+        app.playlist_mouse_down(60, 28, Modifiers::NONE)
+            .expect("click applies");
+        // Shift+click on row 2: the range from the anchor (row 0) to it.
+        let commands = app
+            .playlist_mouse_down(60, 54, Modifiers::SHIFT)
+            .expect("shift click applies");
+        assert_eq!(
+            commands,
+            vec![Command::Select(SelectOp::Set(vec![
+                EntryId(0),
+                EntryId(1),
+                EntryId(2)
+            ]))]
+        );
+        assert_eq!(
+            app.playlist().selected_ids(),
+            vec![EntryId(0), EntryId(1), EntryId(2)]
+        );
+        // Ctrl+click on row 3: exactly that row is toggled in.
+        let commands = app
+            .playlist_mouse_down(60, 68, Modifiers::CTRL)
+            .expect("ctrl click applies");
+        assert_eq!(
+            commands,
+            vec![Command::Select(SelectOp::Set(vec![
+                EntryId(0),
+                EntryId(1),
+                EntryId(2),
+                EntryId(3)
+            ]))]
+        );
+        assert_eq!(
+            app.playlist().selected_ids(),
+            vec![EntryId(0), EntryId(1), EntryId(2), EntryId(3)]
+        );
+    }
+
+    /// `Shift+Up`/`Shift+Down` extend the selection from the anchor (own
+    /// choice: S03 §2 binds neither chord).
+    #[test]
+    fn the_shift_arrows_extend_the_selection_from_the_anchor() {
+        let mut app = test_app();
+        add_entries(&mut app, 6);
+        app.playlist_mouse_down(60, 28, Modifiers::NONE)
+            .expect("click applies");
+        let outcome = app
+            .playlist_key_down(Key::Down, Modifiers::SHIFT)
+            .expect("the key applies");
+        assert_eq!(
+            outcome,
+            Some(ShortcutOutcome::Commands(vec![Command::Select(
+                SelectOp::Set(vec![EntryId(0), EntryId(1)])
+            )]))
+        );
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(0), EntryId(1)]);
+        // One row more, then one row back.
+        app.playlist_key_down(Key::Down, Modifiers::SHIFT)
+            .expect("the key applies");
+        assert_eq!(
+            app.playlist().selected_ids(),
+            vec![EntryId(0), EntryId(1), EntryId(2)]
+        );
+        app.playlist_key_down(Key::Up, Modifiers::SHIFT)
+            .expect("the key applies");
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(0), EntryId(1)]);
+    }
+
     #[test]
     fn sel_selects_all_visible_rows() {
         // S06 §2: SEL selects all visible rows.
         let mut app = test_app();
         add_entries(&mut app, 60);
-        let commands = app.playlist_mouse_down(74, 92).expect("SEL applies");
+        let commands = app
+            .playlist_mouse_down(74, 92, Modifiers::NONE)
+            .expect("SEL applies");
         let all = vec![EntryId(0), EntryId(1), EntryId(2), EntryId(3)];
         assert_eq!(commands, vec![Command::Select(SelectOp::Set(all.clone()))]);
         assert_eq!(app.playlist().selected_ids(), all);
@@ -1118,8 +1232,11 @@ mod tests {
         // S06 §5: REM removes the selected entry with no menu choice.
         let mut app = test_app();
         add_entries(&mut app, 60);
-        app.playlist_mouse_down(60, 28).expect("stage a selection");
-        let commands = app.playlist_mouse_down(46, 92).expect("REM applies");
+        app.playlist_mouse_down(60, 28, Modifiers::NONE)
+            .expect("stage a selection");
+        let commands = app
+            .playlist_mouse_down(46, 92, Modifiers::NONE)
+            .expect("REM applies");
         assert_eq!(commands, vec![Command::Remove(vec![EntryId(0)])]);
         assert_eq!(app.playlist().len(), 59);
         assert_eq!(app.engine().queue().len(), 59);
@@ -1145,7 +1262,9 @@ mod tests {
         // S06 §5.3: 0 px with nothing staged.
         let mut app = test_app();
         add_entries(&mut app, 60);
-        let commands = app.playlist_mouse_down(46, 92).expect("REM applies");
+        let commands = app
+            .playlist_mouse_down(46, 92, Modifiers::NONE)
+            .expect("REM applies");
         assert!(commands.is_empty());
         assert_eq!(app.playlist().len(), 60);
     }
@@ -1158,7 +1277,9 @@ mod tests {
         // buttons open a real dialog now, so neither leaves a note.
         let mut app = test_app();
         add_entries(&mut app, 3);
-        let commands = app.playlist_mouse_down(24, 92).expect("ADD applies");
+        let commands = app
+            .playlist_mouse_down(24, 92, Modifiers::NONE)
+            .expect("ADD applies");
         assert_eq!(
             commands,
             vec![Command::OpenMedia {
@@ -1170,7 +1291,9 @@ mod tests {
             kind: OpenMediaKind::Files,
             play: false,
         }));
-        let commands = app.playlist_mouse_down(242, 92).expect("LIST OPTS applies");
+        let commands = app
+            .playlist_mouse_down(242, 92, Modifiers::NONE)
+            .expect("LIST OPTS applies");
         assert_eq!(commands, vec![Command::OpenPlaylist]);
         assert!(app.dialog_is_open(rustamp_ui::DialogKind::LoadPlaylist));
         assert!(app.drain_notes().is_empty());
@@ -1183,7 +1306,8 @@ mod tests {
         // `play: false` rides through untouched (RFC 0005 O5 stays open).
         let mut app = test_app();
         add_entries(&mut app, 3);
-        app.playlist_mouse_down(24, 92).expect("ADD applies");
+        app.playlist_mouse_down(24, 92, Modifiers::NONE)
+            .expect("ADD applies");
         app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
         assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
@@ -1224,7 +1348,8 @@ mod tests {
         // Re-syncing changes nothing: same entries, same selection, same view.
         let mut app = test_app();
         add_entries(&mut app, 6);
-        app.playlist_mouse_down(60, 28).expect("stage a selection");
+        app.playlist_mouse_down(60, 28, Modifiers::NONE)
+            .expect("stage a selection");
         let selected = app.playlist().selected_ids();
         assert_eq!(selected, vec![EntryId(0)]);
         app.sync_playlist_entries();
@@ -1398,7 +1523,9 @@ mod tests {
         let mut app = test_app();
         add_entries(&mut app, 3);
         assert!(!app.take_playlist_misc_menu());
-        let commands = app.playlist_mouse_down(112, 92).expect("MISC applies");
+        let commands = app
+            .playlist_mouse_down(112, 92, Modifiers::NONE)
+            .expect("MISC applies");
         assert!(commands.is_empty());
         assert!(app.take_playlist_misc_menu());
         assert!(!app.take_playlist_misc_menu());
@@ -1451,9 +1578,11 @@ mod tests {
         // S06 §3: one arrow step is one page of four rows.
         let mut app = test_app();
         add_entries(&mut app, 60);
-        app.playlist_mouse_down(263, 87).expect("down applies");
+        app.playlist_mouse_down(263, 87, Modifiers::NONE)
+            .expect("down applies");
         assert_eq!(app.playlist().first_visible(), 4);
-        app.playlist_mouse_down(263, 81).expect("up applies");
+        app.playlist_mouse_down(263, 81, Modifiers::NONE)
+            .expect("up applies");
         assert_eq!(app.playlist().first_visible(), 0);
     }
 
@@ -1462,7 +1591,9 @@ mod tests {
         // S06 §1: a (6,3) click does nothing.
         let mut app = test_app();
         add_entries(&mut app, 3);
-        let commands = app.playlist_mouse_down(6, 3).expect("click applies");
+        let commands = app
+            .playlist_mouse_down(6, 3, Modifiers::NONE)
+            .expect("click applies");
         assert!(commands.is_empty());
         assert!(app.drain_notes().is_empty());
     }
@@ -1474,7 +1605,9 @@ mod tests {
         // toggle brings it back. The editor is open at launch.
         let mut app = test_app();
         assert!(app.playlist_open());
-        let commands = app.playlist_mouse_down(264, 3).expect("close applies");
+        let commands = app
+            .playlist_mouse_down(264, 3, Modifiers::NONE)
+            .expect("close applies");
         assert_eq!(commands, vec![Command::ToggleWindow(WindowId::Playlist)]);
         assert!(!app.playlist_open());
         assert!(!app.quit());
@@ -1495,7 +1628,9 @@ mod tests {
         assert!(!app.playlist_shaded());
         assert_eq!(app.playlist_frame_size(), (275, 116));
 
-        let commands = app.playlist_mouse_down(254, 3).expect("shade applies");
+        let commands = app
+            .playlist_mouse_down(254, 3, Modifiers::NONE)
+            .expect("shade applies");
         assert_eq!(
             commands,
             vec![Command::ToggleWindowShade(WindowId::Playlist)]
@@ -1505,7 +1640,9 @@ mod tests {
         assert!(app.playlist_open(), "shading does not hide the editor");
 
         // The same button expands it again.
-        let commands = app.playlist_mouse_down(254, 3).expect("shade applies");
+        let commands = app
+            .playlist_mouse_down(254, 3, Modifiers::NONE)
+            .expect("shade applies");
         assert_eq!(
             commands,
             vec![Command::ToggleWindowShade(WindowId::Playlist)]
@@ -1522,7 +1659,9 @@ mod tests {
     fn a_click_outside_the_shade_button_never_toggles_the_editor() {
         for (x, y) in [(6, 3), (100, 5), (254, 12), (254, 20), (264, 3)] {
             let mut app = test_app();
-            let commands = app.playlist_mouse_down(x, y).expect("click applies");
+            let commands = app
+                .playlist_mouse_down(x, y, Modifiers::NONE)
+                .expect("click applies");
             assert!(
                 !commands.contains(&Command::ToggleWindowShade(WindowId::Playlist)),
                 "({x},{y}) must not shade the editor: {commands:?}"
@@ -1537,17 +1676,28 @@ mod tests {
     fn a_shaded_editor_answers_only_its_title_bar() {
         let mut app = test_app();
         add_entries(&mut app, 4);
-        app.playlist_mouse_down(254, 3).expect("shade applies");
+        app.playlist_mouse_down(254, 3, Modifiers::NONE)
+            .expect("shade applies");
         assert!(app.playlist_shaded());
 
         // The list and the bottom bar are gone with the body.
-        assert!(app.playlist_mouse_down(60, 28).expect("click").is_empty());
-        assert!(app.playlist_mouse_down(24, 92).expect("ADD").is_empty());
+        assert!(
+            app.playlist_mouse_down(60, 28, Modifiers::NONE)
+                .expect("click")
+                .is_empty()
+        );
+        assert!(
+            app.playlist_mouse_down(24, 92, Modifiers::NONE)
+                .expect("ADD")
+                .is_empty()
+        );
         assert!(app.playlist().selected_ids().is_empty());
         assert!(app.drain_notes().is_empty());
 
         // The shade button still expands it.
-        let commands = app.playlist_mouse_down(254, 3).expect("shade applies");
+        let commands = app
+            .playlist_mouse_down(254, 3, Modifiers::NONE)
+            .expect("shade applies");
         assert_eq!(
             commands,
             vec![Command::ToggleWindowShade(WindowId::Playlist)]
@@ -1565,7 +1715,8 @@ mod tests {
         let before = app.docked_stack();
         assert_eq!(before.playlist.size(), (275, 116));
 
-        app.playlist_mouse_down(254, 3).expect("shade applies");
+        app.playlist_mouse_down(254, 3, Modifiers::NONE)
+            .expect("shade applies");
         let shaded = app.docked_stack();
         assert_eq!(shaded.playlist.size(), (275, 14), "one row tall");
         assert_eq!(
@@ -1594,7 +1745,8 @@ mod tests {
     fn the_shaded_editor_renders_the_skins_shade_band() {
         let mut app = test_app();
         add_entries(&mut app, 4);
-        app.playlist_mouse_down(254, 3).expect("shade applies");
+        app.playlist_mouse_down(254, 3, Modifiers::NONE)
+            .expect("shade applies");
         let image = app.render_playlist();
         assert_eq!((image.width(), image.height()), (275, 14));
         assert_eq!(
@@ -1608,7 +1760,8 @@ mod tests {
     fn rendering_produces_a_frame_of_the_playlist_size() {
         let mut app = test_app();
         add_entries(&mut app, 6);
-        app.playlist_mouse_down(60, 28).expect("stage a selection");
+        app.playlist_mouse_down(60, 28, Modifiers::NONE)
+            .expect("stage a selection");
         let image = app.render_playlist();
         assert_eq!((image.width(), image.height()), (275, 116));
         assert!(
@@ -1627,7 +1780,8 @@ mod tests {
         // S03 §2: Delete (`1034`, menu) removes the selected items (S06 §5).
         let mut app = test_app();
         add_entries(&mut app, 6);
-        app.playlist_mouse_down(60, 28).expect("stage a selection");
+        app.playlist_mouse_down(60, 28, Modifiers::NONE)
+            .expect("stage a selection");
         let outcome = app
             .playlist_key_down(Key::Delete, Modifiers::NONE)
             .expect("Delete applies");
@@ -2138,7 +2292,8 @@ mod tests {
         // it reaches the shared shortcut path and does not move the selection.
         let mut app = test_app();
         add_entries(&mut app, 6);
-        app.playlist_mouse_down(60, 28).expect("stage a selection");
+        app.playlist_mouse_down(60, 28, Modifiers::NONE)
+            .expect("stage a selection");
         app.playlist_key_down(Key::Up, Modifiers::NONE)
             .expect("Up applies");
         assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);

@@ -6021,7 +6021,7 @@ mod tests {
         .unwrap();
         assert_eq!(app.playlist().selected_ids(), vec![EntryId(1)]);
 
-        let cmds = app.playlist_mouse_down(46, 92).unwrap();
+        let cmds = app.playlist_mouse_down(46, 92, Modifiers::NONE).unwrap();
         assert_eq!(cmds, vec![Command::Remove(vec![EntryId(1)])]);
 
         // Model, entry_ids, and engine queue all agree after removal
@@ -6256,7 +6256,7 @@ mod tests {
             position > 0,
             "prove a running track, not just a Play command"
         );
-        app.playlist_mouse_down(60, 42).unwrap();
+        app.playlist_mouse_down(60, 42, Modifiers::NONE).unwrap();
         app.playlist_mouse_move(60, 74);
         assert_eq!(
             app.playlist_mouse_up(60, 74).unwrap(),
