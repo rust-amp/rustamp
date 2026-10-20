@@ -140,6 +140,18 @@ if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
 $null = New-Item -ItemType Directory -Force -Path $OutDir
 & $broker -Op copyout -Source ("C:\rustamp\out\" + $Job) -Dest $OutDir -TimeoutSeconds 1800 | Out-Null
 
+# The broker's copyout nests the source folder under the destination, so a job
+# that succeeded every guest step still arrived as $OutDir\<job>\... and the
+# manifest check below then refused it ("no hashes.json came back") while the
+# guest's own DONE.json said status ok. Flatten that one level, keeping the
+# name, so the layout the rest of this script (and the capture archive) reads
+# is the one the guest wrote.
+$nested = Join-Path $OutDir $Job
+if ((-not (Test-Path (Join-Path $OutDir 'hashes.json'))) -and (Test-Path $nested)) {
+    Get-ChildItem -LiteralPath $nested -Force | Move-Item -Destination $OutDir -Force
+    Remove-Item -LiteralPath $nested -Recurse -Force
+}
+
 # --- 7. verify: recompute every hash, compare against the guest manifest --------
 Step 'verifying hashes (byte-identical or refused)'
 $manifestPath = Join-Path $OutDir 'hashes.json'

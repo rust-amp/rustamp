@@ -298,6 +298,52 @@ validation at entry), and four property waves on freshly merged code: `wave331`
 (TLS), `wave332` (`winamp.ini` import), `wave333` (S20 extractor), `wave334`
 (stream status).
 
+## 2026-10-20 (late): the owner's three answers
+
+1. **"ja erzeugen" - the `base291` reference captures are being produced.** The
+   set is eleven states x {reference, presented} plus provenance. Reference side:
+   `vm-run-capture.ps1` + the allow-listed `run-capture.ps1` + the harness, with
+   one job per state (`base291-<case>.json`, `send-message` for command 40064
+   shade / 40165 double size / 40036 equalizer / 40040 playlist, `real-mouse` only
+   where focus itself is the measured thing). The recorded 1:1 landmark pins the
+   start state: **main focused, equalizer and playlist open, volume 0, pan 0,
+   flat EQ, skin `base-2.91.wsz`** - two probe runs proved that by failing in
+   exactly the slider band (522 px with volume 128) and in exactly the EQ/PL
+   button band (70 px with those windows closed). Presented side: a lane writes
+   the mirror runner (`run-presented.ps1` + `vm-run-presented.ps1`); the
+   orchestrator runs it after the reference campaign, because the VM is single.
+2. **"A passt" - RFC 0020 is accepted with option A.** Recorded in the RFC as
+   section 12; the implementation lane is `wave335` (`rustamp-proto` depends on
+   `rustamp-plugin-abi`, RFC 0004 section 3 erratum, `PROTOCOL_VERSION` 4 -> 5).
+3. **"bitte messen" - the transfer-display placement is to be measured**, not
+   guessed. S19 section 2 has the texts but not where or in which order the
+   reference shows them (questions 6 and 15). That measurement needs the same
+   VM campaign (a slow local HTTP server + the reference player), so it follows
+   the `base291` work.
+
+**Tooling facts learned the hard way in this stretch.** The broker's `copyout`
+nests the source folder under the destination, so `vm-run-capture.ps1` refused a
+run whose guest `DONE.json` said `status ok`; the runner now flattens that one
+level. A harness directory must live at `<root>\tools\vm-capture` with the
+landmark at `<root>\captures`, and it must not live inside
+`D:\code\rustamp-vm\staging\capture` (the staging step clears that tree - the
+first attempt destroyed its own source; a lane copy at
+`D:\code\rustamp-lanes\s05p\fixture\tools\vm-capture` replaced it at
+`D:\code\rustamp-harness`). `winamp.exe.id0/.id1/.nam` in the sandbox reference
+directory are held by a host process and cannot be copied; the stable reference
+copy excludes those three cache files and says so in its provenance note.
+
+**Merged since the section above:** `38a491a` (wave328, the decoder's read path
+under the same panic guard), `12883ef` (wave329, one scheme rule for the dialog
+and the CLI), `9f980f5` (the `https` flip), `32f62fd` (RFC 0020 accepted),
+`74705f5`+`7ac57ee` (already listed), `eb7e97b` (wave333, the S20 extractor
+refuses paths outside the target - a real path-traversal defect), and
+`wave332` (the ini import reads a BOM, keeps the first section and stops lying
+in its report - four real defects).
+
+**Interrupted by provider rate limits (work preserved in their worktrees):**
+`wave331` (TLS properties) and `wave334` (stream status properties). `wave335`
+continues on another provider.
 ## Rules added to `AGENTS.md` during the session
 
 1. **One worktree per subagent, created before it starts**; delete it after the merge.
