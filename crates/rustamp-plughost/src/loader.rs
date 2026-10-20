@@ -51,24 +51,26 @@
 //!     host callbacks (the analyzer, visualization and DSP groups and
 //!     `set_info`) before `init`, and clears `set_info` first and fills it
 //!     again after `init` returned (S09 §3.5 lines 153–156). The host then
-//!     drives the plugin's playback — `play`, `pause`, `unpause`, `stop` — and
-//!     reads its own state answers (`is_paused`, `get_length`, `get_position`);
-//!     see [`crate::input`]. `out_module` is filled by the **hand-over**
-//!     before `play` (S09 §3.5 step 2, §3.7), not by the loader: the
-//!     selection is the `config_outname` setting, which is S12's business, and
-//!     the hand-over lives in [`crate::handoff`]. The host still drives no
-//!     audio itself: the plugin's decode thread, the analyzer data and the
-//!     visualization data are not here (S09 §3.6, §3.7).
+//!     drives the plugin's playback — `play`, `pause`, `unpause`, `seek`,
+//!     `stop` — and reads its own state answers (`is_paused`, `get_length`,
+//!     `get_position`); see [`crate::input`]. `out_module` is filled by the
+//!     **hand-over** before `play` (S09 §3.5 step 2, §3.7), not by the
+//!     loader: the selection is the `config_outname` setting, which is S12's
+//!     business, and the hand-over lives in [`crate::handoff`]. The host still
+//!     drives no audio itself: the plugin's decode thread, the analyzer data
+//!     and the visualization data are not here (S09 §3.6, §3.7).
 //! 12. **Output plugins**: the host fills `main_window` and `dll_instance` in
 //!     the `Out_Module` and calls `init` (S09 §4.1 lines 233–237, §4.2 line 252).
-//!     The host drives **no** playback callback of its own: `open`, `write`,
-//!     `can_write`, `is_playing`, `pause`, `flush` and the two time queries
-//!     are driven by the **input** plugin from its decode thread
-//!     (S09 §4.2 step 3, §3.7). The one exception is the hand-over: the host
-//!     applies the current volume and pan to the output before `play`
-//!     (S09 §3.5 step 2, §3.7). The `id` member is left untouched: the 5.x
-//!     host replaces it with the DLL file name (5.x-only), and whether 2.95
-//!     does is open (S09 U-4).
+//!     The host drives **no** playback callback of its own: `open`, `close`,
+//!     `write`, `can_write`, `is_playing` and `get_written_ms` are driven by
+//!     the **input** plugin from its decode thread, while `pause`, `flush`
+//!     and `get_played_ms` come from the UI or the seek path — in every case
+//!     through the input plugin, which is the only side of the hand-over that
+//!     touches them (S09 §4.2 step 3 and its threading note, §3.7). The one
+//!     exception is the hand-over: the host applies the current volume and
+//!     pan to the output before `play` (S09 §3.5 step 2, §3.7). The `id`
+//!     member is left untouched: the 5.x host replaces it with the DLL file
+//!     name (5.x-only), and whether 2.95 does is open (S09 U-4).
 //! 13. **Visualization plugins**: the host resolves `winampVisGetHeader`,
 //!     validates the header and enumerates the library's modules (S09 §5.1,
 //!     §5.3 step 2). A module is chosen and started later — the user picks
@@ -1150,6 +1152,28 @@ impl LoadedPlugin {
         // name this plugin.
         let _scope = plugin_call_scope(&self.identity, "stop");
         crate::input::call_stop(module)
+    }
+
+    /// Seek the input plugin's stream to `time_ms` milliseconds
+    /// (S09 §3.1 offset 0x54).
+    ///
+    /// The host's whole part of a seek is this one call: the plugin signals
+    /// its own decode thread to seek and then flushes the output at the new
+    /// time itself (S09 §3.1 offset 0x54, §3.7). The host calls no output
+    /// callback of its own here, or the output would be flushed twice.
+    ///
+    /// The call belongs on the UI thread and must not block for long
+    /// (S09 §3.6).
+    #[cfg(any(windows, test))]
+    pub fn input_seek(&self, time_ms: i32) -> Result<(), InputError> {
+        if !self.initialized {
+            return Err(InputError::NotInitialized);
+        }
+        let module = self.input_module()?;
+        // `seek` is plugin code like every other call: a fault in it must
+        // name this plugin.
+        let _scope = plugin_call_scope(&self.identity, "seek");
+        crate::input::call_seek(module, time_ms)
     }
 
     /// Ask the input plugin whether it is paused (S09 §3.1 offset 0x44).

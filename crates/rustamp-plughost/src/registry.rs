@@ -568,6 +568,32 @@ impl PluginRegistry {
         self.selected_output
     }
 
+    /// The loaded input plugin with this id, or the reason there is none.
+    ///
+    /// A plug-in of another kind is refused: the host compares the kind it
+    /// recorded when the plug-in was loaded with the kind the route needs,
+    /// the same check the load path makes twice. A plug-in that is not live
+    /// is refused as well: `quit` already ran, so there is nothing to drive.
+    #[cfg(any(windows, test))]
+    fn input_entry(&self, plugin_id: u32) -> Result<&LoadedEntry, HandoffError> {
+        let entry = self
+            .loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or(HandoffError::UnknownPlugin(plugin_id))?;
+        let actual = entry.plugin.kind();
+        if actual != PluginKind::Input {
+            return Err(HandoffError::WrongKind {
+                expected: PluginKind::Input,
+                actual,
+            });
+        }
+        if !entry.plugin.is_initialized() {
+            return Err(HandoffError::NotInitialized);
+        }
+        Ok(entry)
+    }
+
     /// Play a file through an input plugin, handing it the selected output
     /// plugin first (S09 §3.5 steps 2–3, §3.7).
     ///
@@ -591,21 +617,7 @@ impl PluginRegistry {
         volume: u8,
         pan: i8,
     ) -> Result<(), HandoffError> {
-        let entry = self
-            .loaded
-            .iter()
-            .find(|entry| entry.id == plugin_id)
-            .ok_or(HandoffError::UnknownPlugin(plugin_id))?;
-        let actual = entry.plugin.kind();
-        if actual != PluginKind::Input {
-            return Err(HandoffError::WrongKind {
-                expected: PluginKind::Input,
-                actual,
-            });
-        }
-        if !entry.plugin.is_initialized() {
-            return Err(HandoffError::NotInitialized);
-        }
+        let entry = self.input_entry(plugin_id)?;
         let input = entry
             .plugin
             .input_module_ptr()
@@ -629,16 +641,61 @@ impl PluginRegistry {
             // static data (S09 §0).
             unsafe { crate::handoff::hand_off_output(input, output, volume, pan)? };
         }
-        entry.plugin.input_play(path).map_err(|error| match error {
-            crate::input::InputError::PlayRefused(code) => HandoffError::PlayRefused(code),
-            crate::input::InputError::NotInitialized => HandoffError::NotInitialized,
-            crate::input::InputError::NullModule => HandoffError::NullModule,
-            crate::input::InputError::MissingCallback(name) => HandoffError::MissingCallback(name),
-            crate::input::InputError::WrongKind(actual) => HandoffError::WrongKind {
-                expected: PluginKind::Input,
-                actual,
-            },
-        })
+        entry.plugin.input_play(path).map_err(HandoffError::from)
+    }
+
+    /// Seek the input plugin's stream to `time_ms` milliseconds
+    /// (S09 §3.1 offset 0x54).
+    ///
+    /// **This one call is the whole of the host's part of a seek.** The
+    /// plugin signals its own decode thread to seek and then calls the
+    /// output's `flush(time_ms)` itself (S09 §3.1 offset 0x54, §3.7); S09
+    /// §4.2 step 3 puts the output's `flush` on the input plugin's side of
+    /// the hand-over ("from the UI or seek path through the input plugin").
+    /// The host calls no output callback here, or the output would be
+    /// flushed a second time.
+    ///
+    /// `time_ms` is the plugin's own millisecond value. S09 names no range
+    /// for it, so the host forwards the number unchanged and lets the plugin
+    /// decide what it means.
+    ///
+    /// S09 does not say whether the host must consult the input module's
+    /// `seekable` member (offset 0x14) before a seek. The host does not:
+    /// S09 §3.1 says that member "may change while playing", and the plugin
+    /// knows its own stream. A seek request is forwarded and the plugin
+    /// decides what it does with it.
+    ///
+    /// The call belongs on the UI thread and must not block for long
+    /// (S09 §3.6).
+    #[cfg(any(windows, test))]
+    pub fn seek_input(&self, plugin_id: u32, time_ms: i32) -> Result<(), HandoffError> {
+        let entry = self.input_entry(plugin_id)?;
+        entry.plugin.input_seek(time_ms).map_err(HandoffError::from)
+    }
+
+    /// Pause the input plugin's playback (S09 §3.1 offset 0x3C).
+    ///
+    /// The host pauses the **input plugin**; the plugin pauses the output it
+    /// drives with the output's own `pause(state)` (S09 §3.7, §4.1 offset
+    /// 0x38, §4.2 step 3). The host calls no output callback of its own.
+    ///
+    /// The call belongs on the UI thread and must not block for long
+    /// (S09 §3.6).
+    #[cfg(any(windows, test))]
+    pub fn pause_input(&self, plugin_id: u32) -> Result<(), HandoffError> {
+        let entry = self.input_entry(plugin_id)?;
+        entry.plugin.input_pause().map_err(HandoffError::from)
+    }
+
+    /// Resume the input plugin's playback (S09 §3.1 offset 0x40).
+    ///
+    /// The resume takes the same route as the pause: the host resumes the
+    /// input plugin, and the plugin resumes the output it drives (S09 §3.7,
+    /// §4.1 offset 0x38).
+    #[cfg(any(windows, test))]
+    pub fn unpause_input(&self, plugin_id: u32) -> Result<(), HandoffError> {
+        let entry = self.input_entry(plugin_id)?;
+        entry.plugin.input_unpause().map_err(HandoffError::from)
     }
 
     /// What the plugin with this id reports about itself, if it is a general
