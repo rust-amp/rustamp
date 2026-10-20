@@ -40,6 +40,7 @@
 //! * [`decode`] — the decode thread and the [`TrackSource`] queue.
 //! * [`ring`] — the ring and the seek/flush handshake.
 //! * [`convert`] — engine format -> device format (rate and channels).
+//! * [`fade_budget`] — the fade against the buffer it is realised in (S18).
 //! * [`gain`] — the single place where volume/balance become gains.
 //! * [`replaygain`] — the ReplayGain track multiplier, applied before the DSP chain.
 //! * [`vistap`] — [`VisTap`], the 2 x 576 waveform tap (spectrum: spec S08).
@@ -52,6 +53,7 @@
 pub mod convert;
 pub mod decode;
 pub mod engine;
+pub mod fade_budget;
 pub mod gain;
 pub mod replaygain;
 pub mod resident;
@@ -64,6 +66,7 @@ mod gain_properties;
 pub use convert::FormatConverter;
 pub use decode::TrackSource;
 pub use engine::{Engine, EngineConfig};
+pub use fade_budget::{FadeBudget, FadeBuffer, FadeNote};
 pub use replaygain::{ReplayGainControl, ReplayGainMode};
 #[cfg(windows)]
 pub use resident::ProcessDecoder;

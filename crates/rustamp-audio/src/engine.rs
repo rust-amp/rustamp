@@ -103,7 +103,7 @@
 //! `rustamp-core` contract); the application layer calls the setters below
 //! directly, as it does for [`Engine::set_limiter_enabled`].
 //!
-//! # The output fade (own design; S18 does not exist)
+//! # The output fade (own design; S18 §2.3's constraint)
 //!
 //! The engine owns a lock-free [`FadeControl`] that drives the output fade
 //! stage ([`rustamp_dsp::Fade`]) in the **render callback**, the consumer side
@@ -120,8 +120,10 @@
 //! On the consumer side the ramp covers exactly the frames the device plays,
 //! so its duration is the requested one.
 //!
-//! **Own choices** (the reference player's behaviour is unmeasured; spec S18
-//! does not exist, so nothing here may be cited as 2.95 behaviour):
+//! **Own choices** (the reference player's behaviour is unmeasured; S18
+//! describes the reference's **output plug-in**, not the player, and leaves
+//! the player's own fade open — S18 §7, item 7 — so nothing here may be
+//! cited as 2.95 behaviour):
 //!
 //! * the ramp law is **equal power** (`g = sqrt(from^2 + (to^2 - from^2) * t)`),
 //!   so the perceived loudness falls evenly;
@@ -138,6 +140,38 @@
 //!
 //! The visualization tap sits before the ring, so it shows the un-faded
 //! signal — the same split the volume/balance gain has.
+//!
+//! # The fade against the buffer (S18 §2.3)
+//!
+//! The audited spec S18 records the constraint the reference's DirectSound
+//! output plug-in states in its own words: *"Some fade times are bigger than
+//! buffer length; in order to get what you want, please increase buffer size
+//! to `<N>` ms."* The spec marks the consequence as a **reading**: a fade
+//! longer than the buffer cannot be realised inside that buffer, and the
+//! plug-in answers the conflict by naming the buffer size it would need — it
+//! does not shorten the fade silently.
+//!
+//! Our pipeline owns two buffers, and the engine resolves the conflict the
+//! same way the reference does — **by saying so**:
+//!
+//! * the **device's own buffer** ([`OutputFormat::buffer_frames`], the buffer
+//!   the device actually got) and the **engine's ring**
+//!   ([`EngineConfig::ring_frames`], the buffer the audio waits in) are both
+//!   compared against the frames the requested fade needs at the device's
+//!   rate;
+//! * **the fade is never shortened.** The ramp is counted in frames of the
+//!   output, not in buffers: it crosses the device's callback boundary as
+//!   often as it needs to, and the ring that feeds it is refilled by the
+//!   decode thread while the ramp runs (measured: a 500 ms fade on a 371 ms
+//!   ring reaches silence at exactly 500 ms, and the ring is refilled while
+//!   the ramp runs);
+//! * **the conflict is reported.** [`Engine::take_fade_note`] hands the caller
+//!   a [`FadeNote`] with the requested milliseconds, the available
+//!   milliseconds and the buffer length that would hold the whole fade. The
+//!   caller shows it to the user; the player surfaces it as a note.
+//!
+//! See [`crate::fade_budget`] for the rule and for what it accepts in
+//! exchange (a ramp that outlasts the audio ends above zero).
 //!
 //! # Restarting with a non-empty ring (A8)
 //!
@@ -208,6 +242,7 @@
 //! re-openable sources and reports indices). See the task card and the report
 //! for task card A1.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -230,8 +265,17 @@ use rustamp_playlist::PlaybackOrder;
 use rustamp_playlist::rng::DEFAULT_SEED;
 
 use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, spawn};
+use crate::fade_budget::{FadeBudget, FadeBuffer, FadeNote};
 use crate::replaygain::{IntoReplayGainValue, ReplayGainControl, ReplayGainMode};
 use crate::ring::{GainState, RingSync, make_render};
+
+/// The fade reports the engine keeps for the caller, at most.
+///
+/// The caller is expected to take them (see [`Engine::take_fade_note`]); the
+/// cap keeps an engine whose caller never takes them from growing without
+/// end. The oldest report is dropped when the cap is reached: a later report
+/// is about the same configuration and carries the same numbers.
+const MAX_FADE_NOTES: usize = 8;
 
 /// Engine configuration.
 #[derive(Debug, Clone, PartialEq)]
@@ -319,6 +363,13 @@ pub struct Engine {
     /// A fade-out that has not finished yet: the counter of the request it
     /// waits for. The transport stops when the ramp is over.
     pending_fade_stop: Option<u64>,
+    /// The fade reports the caller has not taken yet, oldest first (S18
+    /// §2.3; see [`crate::fade_budget`]).
+    fade_notes: VecDeque<FadeNote>,
+    /// The buffer the device actually got, in frames. It is the counterpart
+    /// of the reference's `cfg_buf_ms` (S18 §3) and the buffer a fade has to
+    /// fit into.
+    device_buffer_frames: u32,
     /// Where [`Engine::set_replaygain_mode`] / [`Engine::set_replaygain_preamp_db`]
     /// reaches the decode thread. Snapshotted once per track.
     replaygain_control: Arc<ReplayGainControl>,
@@ -409,6 +460,7 @@ impl Engine {
     ) -> Result<Engine> {
         let format: OutputFormat = output.open(cfg.spec)?;
         let device = format.spec;
+        let device_buffer_frames = format.buffer_frames;
         let (producer, consumer) = RingBuffer::<f32>::new(ring_samples_for(&cfg, device));
         let sync = Arc::new(RingSync::new());
         let initial_volume = cfg.volume;
@@ -439,6 +491,8 @@ impl Engine {
             limiter_control: Arc::new(LimiterControl::default()),
             fade_control,
             pending_fade_stop: None,
+            fade_notes: VecDeque::new(),
+            device_buffer_frames,
             replaygain_control: Arc::new(ReplayGainControl::default()),
             producer: Some(producer),
             to_decode: None,
@@ -1172,7 +1226,7 @@ impl Engine {
         if self.pending_fade_stop.take().is_some() {
             // A fade-out is still running: cancel it and ramp the gain back
             // up instead of stopping. The transport keeps playing.
-            self.fade_control.fade_in(self.cfg.fade_ms);
+            self.request_fade(1.0, self.cfg.fade_ms);
         }
         match self.transport {
             TransportState::Playing => Ok(()),
@@ -1253,16 +1307,41 @@ impl Engine {
     /// `0` ms means "no fade", so both stop at once. A plain
     /// [`Command::Stop`] and a [`Command::Pause`] stay immediate: the fade is
     /// an own choice for the explicit fade-out command, and the reference
-    /// player's behaviour is unmeasured (spec S18 does not exist).
+    /// player's behaviour is unmeasured (S18 describes the output plug-in and
+    /// leaves the player's own fade open — S18 §7, item 7).
+    ///
+    /// The fade is **never shortened**: if it does not fit the buffer it is
+    /// realised in, the engine keeps the requested duration and reports the
+    /// conflict (see [`Engine::take_fade_note`]).
     pub fn stop_with_fadeout(&mut self) -> Result<()> {
         if self.transport != TransportState::Playing || self.cfg.fade_ms == 0 {
             return self.stop();
         }
-        self.fade_control.fade_out(self.cfg.fade_ms);
+        self.request_fade(0.0, self.cfg.fade_ms);
         // The counter of the request this stop waits for. The stage reports
         // it back when the ramp is over; `poll` then stops the transport.
         self.pending_fade_stop = Some(self.fade_control.requested());
         Ok(())
+    }
+
+    /// Take the oldest fade report the caller has not taken yet.
+    ///
+    /// A report is queued whenever a requested fade does not fit the buffer
+    /// it is realised in (S18 §2.3's constraint; see [`crate::fade_budget`]
+    /// for the rule). The engine does not log it and does not publish it as
+    /// an error: **the caller shows it to the user**, so the caller takes it
+    /// and turns it into a note.
+    ///
+    /// The wire contract (`rustamp-proto`'s [`Event`](rustamp_core::event::Event))
+    /// is frozen, so a new event variant would need an RFC; the report
+    /// travels through this accessor instead.
+    pub fn take_fade_note(&mut self) -> Option<FadeNote> {
+        self.fade_notes.pop_front()
+    }
+
+    /// The number of fade reports waiting to be taken.
+    pub fn pending_fade_notes(&self) -> usize {
+        self.fade_notes.len()
     }
 
     /// Play the queue entry at `index`.
@@ -1844,6 +1923,9 @@ impl Engine {
         self.duration_frames = self.duration_frames.map(rescale);
         self.start_at = self.start_at.map(|(frames, seq)| (rescale(frames), seq));
         self.device = format.spec;
+        // The device may grant another buffer on its second open: the fade
+        // budget follows the buffer the device actually got.
+        self.device_buffer_frames = format.buffer_frames;
         let (producer, consumer) = RingBuffer::<f32>::new(ring_samples_for(&self.cfg, self.device));
         // A fresh handshake state alongside the fresh ring: the dead run's
         // epoch and counters describe a ring that no longer exists.
@@ -1861,6 +1943,53 @@ impl Engine {
         self.producer = Some(producer);
         self.start_drain = None;
         Ok(())
+    }
+
+    /// Publish a fade request to `gain` over `duration_ms` and report the
+    /// conflict with the buffer, if there is one.
+    ///
+    /// The request carries the duration the caller asked for: **a fade is
+    /// never shortened** (see [`crate::fade_budget`] for why our ramp does
+    /// not have to be). The report names the buffer the fade did not fit.
+    fn request_fade(&mut self, gain: f32, duration_ms: u32) {
+        self.fade_control.request(gain, duration_ms);
+        self.report_fade_budget(duration_ms);
+    }
+
+    /// Compare a requested fade with the buffers it is realised in and queue
+    /// the report when it does not fit one of them.
+    ///
+    /// The two buffers are the device's own (the buffer the device actually
+    /// got) and the engine's ring (the buffer the audio waits in). The
+    /// **binding** one is the shorter of the two — the buffer the fade
+    /// exceeds first. The fade itself is not touched: it is played in full.
+    fn report_fade_budget(&mut self, requested_ms: u32) {
+        let rate = self.device.sample_rate;
+        // The ring's real capacity: `ring_samples_for` sizes it in frames and
+        // never goes below 256.
+        let ring_frames = self.cfg.ring_frames.max(256) as u64;
+        let ring = FadeBudget::new(requested_ms, rate, FadeBuffer::Ring, ring_frames);
+        let device = FadeBudget::new(
+            requested_ms,
+            rate,
+            FadeBuffer::Device,
+            u64::from(self.device_buffer_frames),
+        );
+        let binding = if ring.available_frames() <= device.available_frames() {
+            ring
+        } else {
+            device
+        };
+        let Some(note) = binding.note() else {
+            // The fade fits: there is nothing to report.
+            return;
+        };
+        if self.fade_notes.len() >= MAX_FADE_NOTES {
+            // The caller is not taking the reports; the oldest one goes, so
+            // the queue cannot grow without end.
+            self.fade_notes.pop_front();
+        }
+        self.fade_notes.push_back(note);
     }
 
     fn report_output_error(&mut self, err: &Error) {

@@ -187,6 +187,13 @@ fn run(args: &Args) -> Result<()> {
         }
         engine.poll()?;
 
+        // The fade reports reach the caller, not the log: the engine queues
+        // them and the caller shows them (S18 §2.3's constraint; see
+        // `rustamp_audio::fade_budget`).
+        while let Some(note) = engine.take_fade_note() {
+            println!("note: {}", note.message());
+        }
+
         for event in events.try_iter() {
             match &event {
                 Event::StateChanged(TransportState::Playing) => {
