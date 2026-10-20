@@ -43,6 +43,13 @@
 //!   up/down") are **provisional** rows with no measured effect; they are the
 //!   keyboard face of the same block move.
 //!
+//! * **The shift-range anchor belongs to the caller.** This crate keeps no
+//!   anchor state: the caller keeps the *entry* of the last plain click and
+//!   hands its row to [`select_range`], which clamps the row into the list.
+//!   A stale row — one a removal or a reorder left behind — therefore names a
+//!   row inside the list or is refused, never a row that is not there. The
+//!   window half owns the anchor, because it owns the row the user clicked.
+//!
 //! Entry ids are stable and never reused, so a reorder never changes *which*
 //! entry is current: only its index moves with its row. That is the core's
 //! guarantee and the reason the current entry "keeps playing" through a drag.
@@ -58,8 +65,9 @@ use rustamp_core::playlist::{EntryId, Playlist};
 /// when `index` is past the end; an empty playlist therefore returns `false`
 /// for every index.
 ///
-/// Own choice within the settled rule: the click resets the shift-range anchor
-/// to the clicked entry, because the range rows are not settled (§8 Q14
+/// Own choice within the settled rule: the clicked entry is the new
+/// shift-range anchor. The crate keeps no anchor state, so the caller sets
+/// its anchor to the clicked entry; the range rows are not settled (§8 Q14
 /// remainder) and any anchor rule must be stated by the implementer.
 pub fn click_select(playlist: &mut Playlist, index: usize) -> bool {
     let Some(id) = playlist.get_index(index).map(|entry| entry.id) else {
@@ -78,9 +86,17 @@ pub fn click_select(playlist: &mut Playlist, index: usize) -> bool {
 ///
 /// **Own choice** (the spec does not settle multi-selection; see the module
 /// docs): the ordinary desktop shift-click meaning, a *contiguous* range that
-/// **replaces** the previous selection. The caller keeps the anchor (the entry
-/// of the last unmodified click) and must re-derive its index with
-/// [`Playlist::index_of`] after a reorder before calling this again.
+/// **replaces** the previous selection.
+///
+/// **The anchor rule (own choice).** The anchor is the *entry* of the last
+/// plain click and the caller keeps it — this crate holds no anchor state.
+/// The caller hands this function the anchor's *row*, and the row is clamped
+/// into the list here: a stale anchor, one that names a row the list no
+/// longer has because a removal shortened the list or a reorder moved the
+/// row, can never select a row outside the list, and an empty list refuses
+/// the gesture altogether. The caller therefore re-derives the anchor's row
+/// with [`Playlist::index_of`] after a reorder *or a removal*; an anchor
+/// whose entry is gone has no row, and the caller drops it.
 pub fn select_range(playlist: &mut Playlist, anchor: usize, target: usize) -> bool {
     let len = playlist.len();
     if len == 0 {
@@ -146,9 +162,11 @@ pub fn move_selected(playlist: &mut Playlist, to: usize) -> bool {
 
 /// `Alt+Up` (`40215`, provisional): move the selected block one row up.
 ///
-/// Returns `false` when nothing is selected or the block is already at the top.
-/// **Own choice** (a provisional row; see the module docs): the whole block
-/// moves, and a non-contiguous selection moves as one block.
+/// Returns `false` when nothing is selected or when the move does not change
+/// the order — for a contiguous block that is the case when the block
+/// already starts the list. **Own choice** (a provisional row; see the module
+/// docs): the whole block moves, and a non-contiguous selection moves as one
+/// block, so the gaps between the selected rows close.
 pub fn move_selected_up(playlist: &mut Playlist) -> bool {
     let Some((first, _, _)) = selection_bounds(playlist) else {
         return false;
@@ -158,8 +176,9 @@ pub fn move_selected_up(playlist: &mut Playlist) -> bool {
 
 /// `Alt+Down` (`40216`, provisional): move the selected block one row down.
 ///
-/// Returns `false` when nothing is selected or the block is already at the
-/// bottom. **Own choice**, as [`move_selected_up`].
+/// Returns `false` when nothing is selected or when the move does not change
+/// the order — for a contiguous block that is the case when the block
+/// already ends the list. **Own choice**, as [`move_selected_up`].
 pub fn move_selected_down(playlist: &mut Playlist) -> bool {
     let Some((_, last, count)) = selection_bounds(playlist) else {
         return false;
