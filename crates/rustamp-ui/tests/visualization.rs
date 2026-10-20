@@ -5,8 +5,11 @@ use rustamp_core::command::Command;
 use rustamp_core::event::Event;
 use rustamp_core::state::WindowId;
 use rustamp_core::vis::{VIS_SAMPLES, VisFrame};
+use rustamp_skin::{BuiltinDefaultSkin, Skin};
 use rustamp_ui::visualization::{SPECTRUM_BANDS, VisError, VisInput, VisMode};
-use rustamp_ui::{MainWindow, MainWindowLayout, TransportState, Widget, hit_test};
+use rustamp_ui::{
+    MainWindow, MainWindowLayout, TransportState, Widget, hit_test, render_main_window,
+};
 use rustamp_vis::analyser::{Analyser, ClassicMode, SPECTRUM_ROWS};
 
 fn frame() -> VisFrame {
@@ -140,23 +143,72 @@ fn main_window_uses_the_shared_trigger_and_dots_only_change_the_stroke() {
         let now = index as u64 * 20;
         shared.push(&frame, 44100, now).unwrap();
         window.push_vis_frame(&frame, 44100, now).unwrap();
-        let rows = shared.scope().map(|sample| {
-            ((1.0 - f64::from(sample).clamp(-1.0, 1.0)) * f64::from(SPECTRUM_ROWS - 1) * 0.5)
-                .round() as u8
-        });
+        let rows: Vec<u8> = shared
+            .scope()
+            .iter()
+            .map(|sample| {
+                ((1.0 - f64::from(*sample).clamp(-1.0, 1.0)) * f64::from(SPECTRUM_ROWS - 1) * 0.5)
+                    .round() as u8
+            })
+            .collect();
         assert!(shared.trigger().is_some());
-        assert_eq!(window.state().visualization.scope, rows);
-        if let Some(reference) = reference {
-            assert_eq!(rows, reference, "triggered UI pixels must not slide");
+        assert_eq!(
+            &window.state().visualization.scope[..rows.len()],
+            rows.as_slice()
+        );
+        window.set_vis_mode(VisMode::ScopeDots);
+        assert_eq!(
+            &window.state().visualization.scope[..rows.len()],
+            rows.as_slice()
+        );
+        assert_eq!(window.state().visualization.input, VisInput::Fresh);
+        window.set_vis_mode(VisMode::Scope);
+        if let Some(reference) = reference.as_ref() {
+            assert_eq!(&rows, reference, "triggered UI pixels must not slide");
             assert_ne!(frame.waveform[0], raw_reference.unwrap());
         } else {
             reference = Some(rows);
             raw_reference = Some(frame.waveform[0]);
         }
-        window.set_vis_mode(VisMode::ScopeDots);
-        assert_eq!(window.state().visualization.scope, rows);
-        assert_eq!(window.state().visualization.input, VisInput::Fresh);
-        window.set_vis_mode(VisMode::Scope);
+    }
+}
+
+/// S08 §1: the double-size analyser area is 152 x 32 px - the normal area
+/// doubled - and the whole window is the 1x frame scaled 2x (S01 §1). The
+/// scope therefore keeps its 76 columns: every sample of the trace covers
+/// two pixels and the signal is not sampled again.
+#[test]
+fn the_double_size_window_shows_the_same_scope_trace_scaled() {
+    let mut source = BuiltinDefaultSkin::source();
+    let skin = Skin::from_source(&mut source, &BuiltinDefaultSkin).expect("the default skin loads");
+    let mut window = MainWindow::new();
+    window.handle_event(&Event::StateChanged(TransportState::Playing), 0);
+    window.set_vis_mode(VisMode::ScopeDots);
+    window.push_vis_frame(&frame(), 44100, 0).unwrap();
+    let trace = window.state().visualization.scope;
+    assert_eq!(trace.len(), 76, "the scope has one column per pixel");
+    window.handle_command(&Command::ToggleDoubleSize, 0);
+    assert!(window.state().double_size);
+    // The trace does not change: the double-size window scales the picture.
+    assert_eq!(window.state().visualization.scope, trace);
+    let doubled = render_main_window(window.state(), &skin, &MainWindowLayout::CLASSIC);
+    assert_eq!((doubled.width(), doubled.height()), (550, 232));
+    // The same picture at 1x, so the double-size frame is its exact scale.
+    let mut single_state = window.state().clone();
+    single_state.double_size = false;
+    let single = render_main_window(&single_state, &skin, &MainWindowLayout::CLASSIC);
+    assert_eq!(doubled, single.scaled(2));
+    // Every pixel of the analyser area covers 2 x 2 pixels of the frame: the
+    // 76 columns of the trace cover the 152 px of the doubled area.
+    let area = MainWindowLayout::CLASSIC.visualization;
+    for x in 0..area.width as i32 {
+        for y in 0..area.height as i32 {
+            assert_eq!(
+                doubled.pixel(area.x * 2 + x * 2, area.y * 2 + y * 2),
+                single.pixel(area.x + x, area.y + y),
+                "pixel {x},{y}"
+            );
+        }
     }
 }
 

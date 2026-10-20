@@ -7,6 +7,13 @@
 //! What S08 leaves open - the band frequency edges, the update rate and the
 //! direction of the peak marker's travel - stays an own choice there.
 //!
+//! The scope's own choices live there as well (S08 open questions 3 and 5):
+//! the trace takes **every n-th sample** of the span it covers, the normal
+//! area draws 76 columns and the shaded area 38 - both over the same span -
+//! and the double-size window shows the normal trace scaled 2x, because the
+//! whole window is the 1x frame scaled 2x (S01 §1). This module only draws
+//! what the analyser returns: one sample per column of the area.
+//!
 //! This module owns skin pixels, scope strokes, freshness and a pause-aware
 //! display clock, and it draws the analyser in the area the main window
 //! currently has: 76 x 16 px with ten bands, or 38 x 5 px with five bands
@@ -127,6 +134,9 @@ pub struct VisState {
     /// Peak heights, 0..=16 rows; zero means no marker.
     pub peaks: [u8; SPECTRUM_BANDS],
     /// Scope row per column, 0..=15; used only with actual fresh input.
+    ///
+    /// The array holds every column of the widest area; the shaded area
+    /// fills the first 38 of them (S08 §1).
     pub scope: [u8; SCOPE_COLUMNS],
     /// Freshness rather than a fabricated quiet frame.
     pub input: VisInput,
@@ -306,7 +316,11 @@ impl Visualizer {
         self.state.bars = self.analyser.bars();
         self.state.peaks = self.analyser.peaks();
         let rows = self.analyser.geometry().rows();
-        self.state.scope = self.analyser.scope().map(|sample| scope_row(sample, rows));
+        // The trace has one sample per column of the area; the shaded area
+        // fills the first 38 of the 76 slots and leaves the rest alone.
+        for (slot, sample) in self.state.scope.iter_mut().zip(self.analyser.scope()) {
+            *slot = scope_row(*sample, rows);
+        }
     }
 }
 
@@ -413,14 +427,15 @@ pub fn draw_visualization(
             }
         }
         VisMode::Scope | VisMode::ScopeDots if state.input == VisInput::Fresh => {
-            // The trace has one sample per column of the full-size area; a
-            // narrower area shows every n-th sample of it (own choice: S08
-            // leaves the oscilloscope open, question 3).
+            // The trace has one sample per column of the area (own choice:
+            // S08 leaves the oscilloscope's sampling open, question 3). The
+            // analyser already took every n-th sample of the span, so the
+            // column of the area and the column of the trace are the same.
             for x in 0..width as i32 {
-                let index = x as usize * SCOPE_COLUMNS / width as usize;
-                let row = state.scope[index].min(rows - 1);
+                let column = x as usize;
+                let row = state.scope[column].min(rows - 1);
                 if state.mode == VisMode::Scope && x > 0 {
-                    let previous = state.scope[index - 1].min(rows - 1);
+                    let previous = state.scope[column - 1].min(rows - 1);
                     // A one-column vertical bridge connects adjacent samples.
                     // Every row of the bridge wears the colour of its row, so
                     // the trace keeps the skin's brightness ramp.
@@ -737,6 +752,36 @@ mod tests {
                 image.pixel(column as i32, i32::from(*row)),
                 Some([expected, 0, 0, 255]),
                 "row {row}"
+            );
+        }
+    }
+
+    /// S08 §1: the shaded area draws its own scope - 38 columns, one per
+    /// pixel of the 38 x 5 area.
+    #[test]
+    fn the_shaded_area_draws_its_own_scope_columns() {
+        let palette = std::array::from_fn(|slot| [slot as u8, 0, 0]);
+        let area = Rect::new(0, 0, 38, 5);
+        let mut image = Image::new(38, 5);
+        let mut state = VisState {
+            mode: VisMode::ScopeDots,
+            input: VisInput::Fresh,
+            ..VisState::default()
+        };
+        // A staircase: every column of the area carries its own row.
+        for (column, row) in state.scope.iter_mut().enumerate().take(38) {
+            *row = (column % 5) as u8;
+        }
+        draw_visualization(&mut image, area, Geometry::Shaded, &state, &palette);
+        for column in 0..38usize {
+            let row = (column % 5) as u8;
+            // The centre line of five rows is row 2.
+            let distance = (row as i32 - 2).unsigned_abs();
+            let expected = slots::OSCILLOSCOPE_FIRST as u8 + distance.min(4) as u8;
+            assert_eq!(
+                image.pixel(column as i32, i32::from(row)),
+                Some([expected, 0, 0, 255]),
+                "column {column}"
             );
         }
     }

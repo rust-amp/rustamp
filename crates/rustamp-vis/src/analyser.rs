@@ -28,6 +28,38 @@
 //! question 2), the height law, the bar/gap split (open question 4) and the
 //! **direction of the peak marker's travel** (open question 11).
 //!
+//! ## The oscilloscope
+//!
+//! S08 settles nothing about the scope: its **sampling** is open question 3
+//! and the **`sa` value that selects it** is open question 5. Our own
+//! choices, each of them pinned by a test in this module:
+//!
+//! * **The sampling rule** (open question 3): the trace takes **every n-th
+//!   sample** of the span it covers, never an averaged bucket. Every drawn
+//!   value is therefore an actual sample of the signal, which is what a
+//!   scope is for; the price is that content above half the column rate
+//!   folds back into the trace.
+//! * **The span**: [`SCOPE_SPAN_SAMPLES`] samples, the same in every area, so
+//!   the shaded area shows the same stretch of time with half the
+//!   resolution - the rule S08 §1 uses for the bands.
+//! * **The geometry**: one column per pixel of the area - 76 in the normal
+//!   window, 38 in the shaded one - so the trace takes every second sample
+//!   in the normal area and every fourth in the shaded one. The double-size
+//!   window is the 1x frame scaled 2x (S01 §1), so its scope is the normal
+//!   trace scaled: 76 samples over 152 px, the same span.
+//! * **The trigger**: a Schmitt edge on the mean-removed mono mix. The
+//!   qualifying edge closest to the middle of the usable range wins, so the
+//!   drawn trace stays where it is while the window slides. A window that
+//!   holds no qualifying edge is anchored at the **nominal trigger** - the
+//!   middle of the usable range - and the analyser reports **no trigger**:
+//!   the picture is drawn, but it slides.
+//! * **The `sa` value** (open question 5): `0` selects the oscilloscope, `1`
+//!   the bar display and `2` switches the analyser off; every other value
+//!   falls back to the bar display. `1` is the observed value of the
+//!   reference (S08 §4) and the bar display is the analyser's default, so
+//!   the two agree. S12 §3.5 carries the same mapping as an *inferred*
+//!   reading; S08 does not promote it, so this is our own choice.
+//!
 //! ## What this module does and does not do
 //!
 //! * The DSP is pure. [`analyse`] turns a frame into band magnitudes,
@@ -148,16 +180,23 @@ pub const FLOOR_DB: f64 = -60.0;
 
 /// Own choice: the number of columns of the scope trace.
 ///
-/// The analyser area the main window reserves is 76 pixels wide, so the
-/// trace uses one column per pixel.
-pub const SCOPE_COLUMNS: usize = 76;
+/// The widest area is the normal one: 76 px, so one column per pixel
+/// (S08 §1). The shaded area has 38 columns.
+pub const SCOPE_COLUMNS: usize = SPECTRUM_WIDTH as usize;
 
-/// Own choice: the number of audio samples the scope draws behind the trigger.
+/// Own choice: the number of audio samples the scope trace covers.
 ///
-/// 192 samples are about 4.4 ms at 44.1 kHz, which shows a few cycles of a
-/// musical note. The scope may therefore only trigger within the first
-/// `VIS_SAMPLES - SCOPE_SPAN_SAMPLES` samples of the window.
-pub const SCOPE_SPAN_SAMPLES: usize = 192;
+/// The span is the same in every area, so the shaded area shows the same
+/// stretch of time as the normal one - with half as many columns, so each of
+/// its columns covers twice the time. That is the rule S08 §1 uses for the
+/// bands: the shaded window keeps the band width and halves the band count.
+///
+/// 152 samples are about 3.45 ms at 44.1 kHz. The span divides the normal
+/// area's 76 columns and the shaded area's 38 columns exactly, so the trace
+/// takes every second, resp. every fourth sample. The scope may therefore
+/// only trigger within the first `VIS_SAMPLES - SCOPE_SPAN_SAMPLES` samples
+/// of the window.
+pub const SCOPE_SPAN_SAMPLES: usize = 152;
 
 /// Own choice: how long an accepted frame keeps the bar floors alive.
 ///
@@ -222,6 +261,32 @@ impl Geometry {
             Self::Shaded => &SHADED_BAND_EDGES,
         }
     }
+
+    /// The number of columns of the scope trace in this area (own choice).
+    ///
+    /// One column per pixel of the area (S08 §1): 76 in the normal window, 38
+    /// in the shaded one.
+    pub const fn scope_columns(self) -> usize {
+        self.width() as usize
+    }
+
+    /// The number of samples one column of the scope trace covers (own
+    /// choice).
+    ///
+    /// The span is the same in every area, so the shaded area covers twice
+    /// the time per column: the same stretch of time with half the
+    /// resolution.
+    pub const fn scope_decimation(self) -> usize {
+        SCOPE_SPAN_SAMPLES / self.scope_columns()
+    }
+
+    /// The number of samples the scope trace covers (own choice).
+    ///
+    /// The same in every area, so every geometry shows the same stretch of
+    /// time.
+    pub const fn scope_span(self) -> usize {
+        self.scope_columns() * self.scope_decimation()
+    }
 }
 
 /// The classic modes a caller can pick.
@@ -248,6 +313,25 @@ impl ClassicMode {
             Self::Spectrum => 1,
             Self::Oscilloscope => 2,
             Self::Off => 4,
+        }
+    }
+
+    /// Own choice: the mode an `sa` value selects (S08 open question 5).
+    ///
+    /// `0` is the oscilloscope, `1` the bar display and `2` switches the
+    /// analyser off; every other value falls back to the default mode, the
+    /// bar display.
+    ///
+    /// S08 §4 records `1` as the observed value of the reference, and the bar
+    /// display is the analyser's default, so the two agree. S12 §3.5 carries
+    /// the same mapping as an *inferred* reading; S08 does not promote it, so
+    /// this mapping is our own choice.
+    pub fn from_sa_value(value: u8) -> Self {
+        match value {
+            0 => Self::Oscilloscope,
+            1 => Self::Spectrum,
+            2 => Self::Off,
+            _ => Self::default(),
         }
     }
 }
@@ -420,16 +504,19 @@ pub fn nominal_trigger(window: &[f32]) -> usize {
 
 /// Find the point the oscilloscope locks on.
 ///
-/// The trigger is a Schmitt edge: for a rising edge the signal must first
-/// fall to `-level` and then cross `level` upwards, with
-/// `level = hysteresis * peak` and `peak` the largest magnitude in the
-/// window. Because a whole cycle has to pass before the trigger fires
-/// again, the trigger locks the *phase* of the signal instead of a single
-/// crossing, and the drawn trace stays where it is.
+/// The trigger is a Schmitt edge on the mean-removed signal: for a **rising**
+/// edge the signal must first fall to `-level` and then cross `level`
+/// upwards; for a **falling** edge it must first rise to `level` and then
+/// cross `-level` downwards. `level = hysteresis * peak`, and `peak` is the
+/// largest magnitude in the window. The band between the two levels is what
+/// makes the trigger lock on a whole cycle of the signal instead of on every
+/// crossing of the centre line, and that is what keeps the drawn trace
+/// stationary.
 ///
 /// Among the qualifying edges the one closest to [`nominal_trigger`] wins;
 /// a tie goes to the earlier edge. `None` when the window holds no
-/// qualifying edge, for instance because it is silent.
+/// qualifying edge, for instance because it is silent: the analyser then
+/// anchors the trace at the nominal trigger and reports no trigger.
 pub fn find_trigger(window: &[f32], edge: TriggerEdge, hysteresis: f32) -> Option<usize> {
     let usable = window.len().checked_sub(SCOPE_SPAN_SAMPLES)?;
     let peak = window
@@ -456,7 +543,7 @@ pub fn find_trigger(window: &[f32], edge: TriggerEdge, hysteresis: f32) -> Optio
                 if current >= level {
                     armed = true;
                 }
-                armed && current > -level && next <= level
+                armed && current > -level && next <= -level
             }
         };
         if fires {
@@ -475,19 +562,31 @@ pub fn find_trigger(window: &[f32], edge: TriggerEdge, hysteresis: f32) -> Optio
     best
 }
 
-/// Build the scope trace behind a trigger point.
+/// Build the scope trace of a window, anchored at the trigger.
 ///
-/// The trace is `SCOPE_COLUMNS` samples taken from the span behind the
-/// trigger, each the nearest actual sample of that span. A trigger outside
-/// the usable range is clamped into it, so the trace never reads past the
-/// end of the window.
-pub fn scope_trace(window: &[f32], trigger: usize) -> [f32; SCOPE_COLUMNS] {
+/// The trace holds one sample per column of the area and takes **every n-th
+/// sample** of the span (own choice, S08 open question 3): column `k` is the
+/// sample `k * n` after the anchor, where `n` is the area's decimation.
+/// Nothing is averaged and nothing is interpolated, so every drawn value is
+/// an actual sample of the signal.
+///
+/// Only the area's columns are the trace; the rest of the returned array is
+/// zero. A trigger outside the usable range is clamped into it, so the trace
+/// never reads past the end of the window; a window that is too short yields
+/// zeros.
+pub fn scope_trace(window: &[f32], trigger: usize, geometry: Geometry) -> [f32; SCOPE_COLUMNS] {
+    let columns = geometry.scope_columns();
+    let decimation = geometry.scope_decimation();
     let usable = window.len().saturating_sub(SCOPE_SPAN_SAMPLES);
     let start = trigger.min(usable);
-    std::array::from_fn(|column| {
-        let offset = column * (SCOPE_SPAN_SAMPLES - 1) / (SCOPE_COLUMNS - 1);
-        window.get(start + offset).copied().unwrap_or(0.0)
-    })
+    let mut trace = [0.0; SCOPE_COLUMNS];
+    for (column, slot) in trace.iter_mut().enumerate().take(columns) {
+        *slot = window
+            .get(start + column * decimation)
+            .copied()
+            .unwrap_or(0.0);
+    }
+    trace
 }
 
 /// The classic analyser: the mode, the tuning, the area and the display state.
@@ -514,6 +613,7 @@ pub struct Analyser {
     peak_fall: [u32; SPECTRUM_BANDS],
     /// The updates left before the input counts as gone.
     fresh_updates: u32,
+    /// The scope trace; only the area's columns belong to it.
     scope: [f32; SCOPE_COLUMNS],
     trigger: Option<usize>,
     clock_ms: u64,
@@ -597,9 +697,12 @@ impl Analyser {
         std::array::from_fn(|band| self.row(self.peaks[band]))
     }
 
-    /// The scope trace, one sample per column.
-    pub fn scope(&self) -> &[f32; SCOPE_COLUMNS] {
-        &self.scope
+    /// The scope trace, one sample per column of the area.
+    ///
+    /// The slice holds the area's columns: 76 in the normal window, 38 in
+    /// the shaded one (S08 §1).
+    pub fn scope(&self) -> &[f32] {
+        &self.scope[..self.geometry.scope_columns()]
     }
 
     /// The point the last scope trace is locked on, if the window held a
@@ -686,8 +789,11 @@ impl Analyser {
                     self.tuning.trigger_edge,
                     self.tuning.trigger_hysteresis,
                 );
-                self.scope =
-                    scope_trace(&signal, trigger.unwrap_or_else(|| nominal_trigger(&signal)));
+                self.scope = scope_trace(
+                    &signal,
+                    trigger.unwrap_or_else(|| nominal_trigger(&signal)),
+                    self.geometry,
+                );
                 self.trigger = trigger;
             }
             ClassicMode::Off => {}
@@ -877,6 +983,25 @@ mod tests {
     /// A silent frame: every level is zero.
     fn silence() -> VisFrame {
         VisFrame::default()
+    }
+
+    /// A deterministic noise signal in -1..1.
+    ///
+    /// The generator is a fixed bit mixer, so the test is reproducible
+    /// without a dependency and without a random seed.
+    fn noise(seed: u32) -> Vec<f32> {
+        (0..VIS_SAMPLES)
+            .map(|n| {
+                let mut x = seed
+                    .wrapping_mul(2_246_822_519)
+                    .wrapping_add(n as u32)
+                    .wrapping_add(1);
+                x ^= x >> 13;
+                x = x.wrapping_mul(0x5bd1_e995);
+                x ^= x >> 15;
+                (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
     }
 
     #[test]
@@ -1242,8 +1367,8 @@ mod tests {
             let trigger = find_trigger(&signal, TriggerEdge::Rising, DEFAULT_TRIGGER_HYSTERESIS)
                 .expect("a tone has a rising edge");
             trigger_points.push(trigger);
-            let trace = scope_trace(&signal, trigger);
-            let newest = scope_trace(&signal, VIS_SAMPLES - SCOPE_SPAN_SAMPLES);
+            let trace = scope_trace(&signal, trigger, Geometry::Normal);
+            let newest = scope_trace(&signal, VIS_SAMPLES - SCOPE_SPAN_SAMPLES, Geometry::Normal);
             match triggered {
                 None => {
                     triggered = Some(trace);
@@ -1283,6 +1408,180 @@ mod tests {
         // The falling edge of the same signal is a different point.
         let falling = find_trigger(&signal, TriggerEdge::Falling, 0.1).unwrap();
         assert!(falling != trigger);
+    }
+
+    /// Own choice (S08 open question 5): which `sa` value selects which mode.
+    #[test]
+    fn the_sa_value_selects_the_mode() {
+        assert_eq!(ClassicMode::from_sa_value(0), ClassicMode::Oscilloscope);
+        assert_eq!(ClassicMode::from_sa_value(1), ClassicMode::Spectrum);
+        assert_eq!(ClassicMode::from_sa_value(2), ClassicMode::Off);
+        // An unknown value falls back to the default mode, the bar display.
+        assert_eq!(ClassicMode::from_sa_value(3), ClassicMode::Spectrum);
+        assert_eq!(ClassicMode::from_sa_value(255), ClassicMode::Spectrum);
+        // `1` is the observed value of the reference (S08 §4) and the bar
+        // display is the analyser's default, so the two agree.
+        assert_eq!(ClassicMode::default(), ClassicMode::Spectrum);
+        assert_eq!(ClassicMode::from_sa_value(1), ClassicMode::default());
+    }
+
+    /// Own choice (S08 open question 3): the trace takes every n-th sample.
+    #[test]
+    fn the_scope_takes_every_nth_sample_of_the_span() {
+        // A sawtooth of eight steps: every sample of the ramp carries a
+        // different value, so the rule is visible in the trace.
+        let ramp: Vec<f32> = (0..VIS_SAMPLES).map(|n| (n % 8) as f32 / 8.0).collect();
+        let trace = scope_trace(&ramp, 100, Geometry::Normal);
+        // Column k is the sample 2k after the anchor: an actual sample, not
+        // the mean of a bucket and not an interpolated value.
+        for column in 0..Geometry::Normal.scope_columns() {
+            assert_eq!(trace[column], ramp[100 + column * 2], "column {column}");
+        }
+        // The mean of the bucket around the second column would be 0.625;
+        // the decimation gives the sample 0.75. The rule is not an average.
+        assert_eq!(trace[1], 0.75);
+        assert_ne!(trace[1], 0.625);
+        // The shaded area takes every fourth sample and covers the same span.
+        let shaded = scope_trace(&ramp, 100, Geometry::Shaded);
+        for column in 0..Geometry::Shaded.scope_columns() {
+            assert_eq!(shaded[column], ramp[100 + column * 4], "column {column}");
+        }
+        // The rest of the array is not part of the trace.
+        assert!(
+            shaded[Geometry::Shaded.scope_columns()..]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+    }
+
+    /// The trigger locks a periodic signal; noise has no phase to lock.
+    #[test]
+    fn the_trigger_locks_a_periodic_signal_and_not_noise() {
+        // A periodic signal: the trace does not move while the window slides
+        // over it, because the trigger holds the phase.
+        let mut reference: Option<[f32; SCOPE_COLUMNS]> = None;
+        for slide in 0..6 {
+            let signal: Vec<f32> = (0..VIS_SAMPLES)
+                .map(|n| {
+                    let phase = std::f32::consts::TAU * ((n + slide * 5) % 36) as f32 / 36.0;
+                    phase.sin()
+                })
+                .collect();
+            let trigger = find_trigger(&signal, TriggerEdge::Rising, DEFAULT_TRIGGER_HYSTERESIS)
+                .expect("a tone has a rising edge");
+            let trace = scope_trace(&signal, trigger, Geometry::Normal);
+            match reference {
+                None => reference = Some(trace),
+                Some(expected) => assert!(
+                    trace_difference(&expected, &trace) < 0.0001,
+                    "the triggered trace of a periodic signal does not move"
+                ),
+            }
+        }
+        // Noise crosses the band everywhere, so the trigger fires - but every
+        // window draws another picture, because there is no phase to hold.
+        let mut reference: Option<[f32; SCOPE_COLUMNS]> = None;
+        for seed in 0..4 {
+            let signal = noise(seed);
+            let trigger = find_trigger(&signal, TriggerEdge::Rising, DEFAULT_TRIGGER_HYSTERESIS)
+                .expect("noise crosses the band");
+            let trace = scope_trace(&signal, trigger, Geometry::Normal);
+            match reference {
+                None => reference = Some(trace),
+                Some(expected) => assert!(
+                    trace_difference(&expected, &trace) > 0.1,
+                    "the trace of noise moves"
+                ),
+            }
+        }
+    }
+
+    /// S08 §1: the shaded area has its own scope geometry.
+    #[test]
+    fn the_shaded_area_has_its_own_scope_geometry() {
+        assert_eq!(Geometry::Normal.scope_columns(), 76);
+        assert_eq!(Geometry::Shaded.scope_columns(), 38);
+        // The normal area takes every second sample, the shaded one every
+        // fourth: the same span, half the resolution.
+        assert_eq!(Geometry::Normal.scope_decimation(), 2);
+        assert_eq!(Geometry::Shaded.scope_decimation(), 4);
+        assert_eq!(Geometry::Normal.scope_span(), SCOPE_SPAN_SAMPLES);
+        assert_eq!(Geometry::Shaded.scope_span(), SCOPE_SPAN_SAMPLES);
+        assert_eq!(Geometry::Normal.scope_span(), Geometry::Shaded.scope_span());
+        // The shaded area is five rows tall (S08 §1).
+        assert_eq!(Geometry::Shaded.rows(), 5);
+        // The analyser follows the area: the shaded trace has 38 columns.
+        let mut analyser = Analyser::default();
+        analyser.set_mode(ClassicMode::Oscilloscope);
+        analyser.set_geometry(Geometry::Shaded);
+        analyser.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
+        assert_eq!(analyser.scope().len(), 38);
+        assert!(analyser.scope().iter().any(|value| *value != 0.0));
+        analyser.set_geometry(Geometry::Normal);
+        analyser.push(&sine(0, 36, 1.0), 44100, 10).unwrap();
+        assert_eq!(analyser.scope().len(), 76);
+    }
+
+    /// An empty or a one-sample block must not panic.
+    #[test]
+    fn an_empty_or_a_single_sample_block_does_not_panic() {
+        for block in [vec![], vec![0.5], vec![-0.5]] {
+            assert_eq!(
+                find_trigger(&block, TriggerEdge::Rising, DEFAULT_TRIGGER_HYSTERESIS),
+                None
+            );
+            assert_eq!(
+                find_trigger(&block, TriggerEdge::Falling, DEFAULT_TRIGGER_HYSTERESIS),
+                None
+            );
+            assert_eq!(nominal_trigger(&block), 0);
+        }
+        // The empty block yields an empty trace.
+        let trace = scope_trace(&[], 0, Geometry::Normal);
+        assert!(trace.iter().all(|value| *value == 0.0));
+        // A single sample is drawn in the first column and nowhere else.
+        let trace = scope_trace(&[0.5], 0, Geometry::Normal);
+        assert_eq!(trace[0], 0.5);
+        assert!(trace[1..].iter().all(|value| *value == 0.0));
+        // A trigger beyond the window is clamped into it.
+        let trace = scope_trace(&[0.5], 10_000, Geometry::Shaded);
+        assert_eq!(trace[0], 0.5);
+        assert!(trace[1..].iter().all(|value| *value == 0.0));
+    }
+
+    /// Own choice: a window without a trigger is anchored at the nominal one.
+    #[test]
+    fn a_window_without_a_trigger_is_anchored_at_the_nominal_one() {
+        // The nominal trigger is the middle of the range the scope may
+        // trigger in.
+        let window: Vec<f32> = (0..VIS_SAMPLES).map(|n| n as f32).collect();
+        assert_eq!(
+            nominal_trigger(&window),
+            (VIS_SAMPLES - SCOPE_SPAN_SAMPLES) / 2
+        );
+        // Silence holds no edge: the analyser reports no trigger and draws
+        // the trace at the nominal anchor anyway.
+        let mut analyser = Analyser::default();
+        analyser.set_mode(ClassicMode::Oscilloscope);
+        analyser.push(&silence(), 44100, 0).unwrap();
+        assert_eq!(analyser.trigger(), None);
+        assert_eq!(analyser.scope().len(), 76);
+        assert!(analyser.scope().iter().all(|value| *value == 0.0));
+        // A frame whose usable range never leaves the flat part holds no
+        // edge either: the trace is anchored in the middle of the range.
+        let mut frame = VisFrame::default();
+        frame.waveform[0][VIS_SAMPLES - 1] = 1.0;
+        frame.waveform[1][VIS_SAMPLES - 1] = 1.0;
+        analyser.push(&frame, 44100, 10).unwrap();
+        assert_eq!(analyser.trigger(), None);
+        let trace = analyser.scope();
+        assert!(
+            trace
+                .iter()
+                .all(|value| (*value - trace[0]).abs() < f32::EPSILON),
+            "the trace is anchored in the flat part of the window"
+        );
+        assert!(trace[0] < 0.0);
     }
 
     #[test]
