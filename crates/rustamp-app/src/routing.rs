@@ -88,6 +88,11 @@ pub fn app_owns(command: &Command) -> bool {
         | C::OpenMainMenu
         | C::ConfigureVisPlugin
         | C::ToggleVisPlugin
+        | C::ConfigurePlugin { .. }
+        | C::SeekPlugin { .. }
+        | C::PausePlugin { .. }
+        | C::UnpausePlugin { .. }
+        | C::StopPlugin { .. }
         | C::OpenPlaylist
         | C::OpenOptionsMenu
         | C::OpenVisualizationMenu

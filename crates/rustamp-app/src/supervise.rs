@@ -1417,6 +1417,34 @@ mod tests {
     }
 
     #[test]
+    fn hello_barrier_rejects_a_peer_one_version_below() {
+        // RFC 0020 §5.3 / §11: the version gate must refuse a peer that speaks
+        // the version just below ours (a v4 host against a v5 player), exactly
+        // as it refuses one above — the comparison is equality, not a minimum.
+        let mut backend = backend(true);
+        backend.auto_hello = false;
+        let mut supervisor = Supervisor::with_cooldown(backend, Duration::ZERO);
+        let mut link = HostStateLink::detached();
+
+        assert!(supervisor.supervise(&mut link).is_none());
+        assert!(!link.is_attached());
+
+        let peer = &mut supervisor.backend.peers[0];
+        peer.send(&Message::Hello {
+            protocol_version: rustamp_ipc::PROTOCOL_VERSION - 1,
+            pid: 4321,
+        })
+        .expect("send one-version-below greeting");
+
+        assert!(supervisor.supervise(&mut link).is_none());
+        assert!(
+            !link.is_attached(),
+            "a v4 peer must be rejected by a v5 player"
+        );
+        assert_eq!(supervisor.consecutive_failures(), 1);
+    }
+
+    #[test]
     fn pe_architecture_validation_accepts_i686_and_rejects_other() {
         // Construct valid PE header for i386 (machine 0x014c) (Finding 11)
         let mut buf = vec![0u8; 128];

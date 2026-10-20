@@ -64,21 +64,31 @@
 //! format changes. [`handle_message`], the reader-thread variant that owns the
 //! transport and has no window, therefore still ignores it.
 //!
-//! # Configure requests
+//! # Plug-in requests on the wire (RFC 0005 §5.4, RFC 0020)
 //!
-//! One Configure request exists on the wire today:
-//! [`Message::CommandToHost`] carrying [`Command::ConfigureVisPlugin`]
-//! (RFC 0005 §5.4). It asks the host to open the running visualization
-//! plug-in's configuration dialog, and it is routed to the UI thread as
-//! [`ControlInbound::ConfigureVis`] — only that thread may call into a
-//! plugin, and the dialog is opened with the parent window the plug-in was
-//! handed.
+//! Six requests arrive as [`Message::CommandToHost`] payloads. All six are
+//! routed to the UI thread, because only that thread may call into a plug-in
+//! and the dialogs are opened with the parent window the plug-in was handed:
 //!
-//! The other plug-in kinds have **no** Configure request: naming a plug-in
-//! needs a payload the protocol does not carry, and a new `Command` variant is
-//! a wire change that needs an RFC (P3 §4 step 9). None is invented here; the
-//! host-side method that would serve it is
-//! [`crate::registry::PluginRegistry::configure_plugin`].
+//! | Payload | Routed as | Acted on by |
+//! |---|---|---|
+//! | [`Command::ConfigureVisPlugin`] | [`ControlInbound::ConfigureVis`] | [`PluginRegistry::configure_vis`](crate::registry::PluginRegistry::configure_vis) |
+//! | [`Command::ConfigurePlugin`] | [`ControlInbound::ConfigurePlugin`] | [`PluginRegistry::configure_plugin`](crate::registry::PluginRegistry::configure_plugin) |
+//! | [`Command::SeekPlugin`] | [`ControlInbound::SeekPlugin`] | [`PluginRegistry::seek_input`](crate::registry::PluginRegistry::seek_input) |
+//! | [`Command::PausePlugin`] | [`ControlInbound::PausePlugin`] | [`PluginRegistry::pause_input`](crate::registry::PluginRegistry::pause_input) |
+//! | [`Command::UnpausePlugin`] | [`ControlInbound::UnpausePlugin`] | [`PluginRegistry::unpause_input`](crate::registry::PluginRegistry::unpause_input) |
+//! | [`Command::StopPlugin`] | [`ControlInbound::StopPlugin`] | [`PluginRegistry::stop_input`](crate::registry::PluginRegistry::stop_input) |
+//!
+//! The first is RFC 0005's "the running visualization plug-in"; the five after
+//! it are RFC 0020's, and each **names** a plug-in by the id the host assigned
+//! in its `PluginLoaded` answer (plus, for a configure request, the kind the
+//! request claims). [`apply_plugin_request`] is where the UI loop acts on one:
+//! it calls the registry route and turns a refusal — an unknown id, a wrong
+//! kind, a plug-in with no `config` slot, a plug-in that is not live — into the
+//! message `main` prints on stderr. Nothing is ever called through a null slot
+//! (S09 §0), and nothing is answered on the channel: the requests are
+//! **fire-and-forget** (RFC 0020 §12), so a refusal reaches the user as a
+//! diagnostic, not as a protocol message.
 //!
 //! # Start/stop requests
 //!
@@ -87,21 +97,16 @@
 //! [`crate::registry::PluginRegistry::stop_vis`]), but **no request on the
 //! wire reaches that path yet**.
 //!
-//! The only vis request the protocol carries besides the Configure one is
-//! [`Command::ToggleVisPlugin`], and it is a **unit variant**: it names
+//! The vis requests the protocol carries are the Configure ones above and
+//! [`Command::ToggleVisPlugin`], and the latter is a **unit variant**: it names
 //! neither the plug-in nor the module, so it cannot say *what* to start. The
 //! host would have to guess which of the loaded visualization plug-ins and
 //! which of their modules the player means, and a guess that starts the wrong
 //! plug-in is worse than no answer at all. A request that carries the plug-in
 //! id and the module index needs a new `Command` variant with a payload — a
-//! wire change, which needs an RFC (RFC 0020) — and none is invented here.
+//! wire change, which needs an RFC — and none is invented here.
 //! `ToggleVisPlugin` therefore still falls into the catch-all arm, like every
 //! other command the host cannot act on.
-//!
-//! The player could not send such a request even if the wire carried it: the
-//! app never reads the host's answers, so it does not know the plug-in id the
-//! host assigned (RFC 0020 §2, §3.5). Both halves of the gap are outside this
-//! crate.
 //!
 //! # Messages this module deliberately ignores
 //!
@@ -109,10 +114,9 @@
 //! surface nor the channel: `WinampIpc` has no reply variant in the protocol,
 //! so answering one over the channel would invent protocol; classic plugins
 //! keep querying the host window in-process instead. `CommandToHost` carries
-//! the player's own commands, and only the Configure request above is one the
-//! host can act on; the start/stop request of the section above is one it
-//! cannot, because the wire does not say what to start. The ring offers and
-//! the RFC 0006 decoder/DSP messages
+//! the player's own commands, and only the six requests above are ones the host
+//! can act on; `ToggleVisPlugin` is one it cannot, because the wire does not say
+//! what to start. The ring offers and the RFC 0006 decoder/DSP messages
 //! (including the RFC 0015 `DspResetAck` reply, which only a DSP session's
 //! player side expects) belong to other hosts or to future cards; acting on
 //! them here would be guessing. There is also no message for "quit plugin N":
@@ -124,6 +128,8 @@ use rustamp_ipc::{Message, Transport};
 use rustamp_plugin_abi::PluginKind;
 use rustamp_proto::command::Command;
 use rustamp_proto::state::PlayerState;
+
+use crate::registry::PluginRegistry;
 
 /// What one handled message decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +185,44 @@ pub enum ControlInbound {
     /// that thread may call into a plugin, and the dialog is opened with the
     /// parent window the plug-in was handed.
     ConfigureVis,
+    /// The parent asked the host to open the configuration dialog of the
+    /// plug-in with this id (RFC 0020: [`Command::ConfigurePlugin`]). `kind` is
+    /// the kind the request claims; the registry compares it with the kind it
+    /// recorded when the plug-in was loaded and refuses a mismatch.
+    ConfigurePlugin {
+        /// Host-assigned plug-in id, as carried by the frame.
+        plugin_id: u32,
+        /// The kind the request claims the plug-in has.
+        kind: PluginKind,
+    },
+    /// The parent asked the host to seek the input plug-in with this id
+    /// (RFC 0020: [`Command::SeekPlugin`]). The plug-in flushes its own output;
+    /// the host calls no output callback (S09 §3.7).
+    SeekPlugin {
+        /// Host-assigned plug-in id, as carried by the frame.
+        plugin_id: u32,
+        /// Target position in milliseconds, unchanged.
+        to_ms: i32,
+    },
+    /// The parent asked the host to pause the input plug-in with this id
+    /// (RFC 0020: [`Command::PausePlugin`]).
+    PausePlugin {
+        /// Host-assigned plug-in id, as carried by the frame.
+        plugin_id: u32,
+    },
+    /// The parent asked the host to resume the input plug-in with this id
+    /// (RFC 0020: [`Command::UnpausePlugin`]).
+    UnpausePlugin {
+        /// Host-assigned plug-in id, as carried by the frame.
+        plugin_id: u32,
+    },
+    /// The parent asked the host to stop the input plug-in with this id
+    /// (RFC 0020: [`Command::StopPlugin`]). The plug-in closes its own output
+    /// (S09 §3.5 step 6).
+    StopPlugin {
+        /// Host-assigned plug-in id, as carried by the frame.
+        plugin_id: u32,
+    },
 }
 
 /// Route one inbound message to an event sink.
@@ -188,9 +232,10 @@ pub enum ControlInbound {
 ///   driven by UI responsiveness rather than answering from the reader thread).
 /// * `LoadPlugin` is forwarded as `ControlInbound::Load`, for the same reason:
 ///   only the UI thread may call into a plugin.
-/// * `CommandToHost(Command::ConfigureVisPlugin)` is forwarded as
-///   `ControlInbound::ConfigureVis`, for the same reason: the Configure dialog
-///   is opened by the plugin, on the thread that owns the parent window.
+/// * `CommandToHost` carrying one of the six plug-in requests of the module
+///   docs is forwarded as its `ControlInbound` variant, for the same reason:
+///   the request calls into a plug-in on the thread that owns the parent
+///   window. Every other `CommandToHost` payload falls into the catch-all arm.
 /// * `Hello` validates protocol compatibility. If incompatible, triggers shutdown.
 /// * `Shutdown` triggers shutdown.
 /// * Other variants are ignored.
@@ -215,9 +260,70 @@ pub fn handle_message_inbound(
             on_event(ControlInbound::ConfigureVis);
             ControlStep::Continue
         }
+        Message::CommandToHost(Command::ConfigurePlugin { plugin_id, kind }) => {
+            on_event(ControlInbound::ConfigurePlugin { plugin_id, kind });
+            ControlStep::Continue
+        }
+        Message::CommandToHost(Command::SeekPlugin { plugin_id, to_ms }) => {
+            on_event(ControlInbound::SeekPlugin { plugin_id, to_ms });
+            ControlStep::Continue
+        }
+        Message::CommandToHost(Command::PausePlugin { plugin_id }) => {
+            on_event(ControlInbound::PausePlugin { plugin_id });
+            ControlStep::Continue
+        }
+        Message::CommandToHost(Command::UnpausePlugin { plugin_id }) => {
+            on_event(ControlInbound::UnpausePlugin { plugin_id });
+            ControlStep::Continue
+        }
+        Message::CommandToHost(Command::StopPlugin { plugin_id }) => {
+            on_event(ControlInbound::StopPlugin { plugin_id });
+            ControlStep::Continue
+        }
         Message::Hello { .. } => ControlStep::Continue,
         Message::Shutdown => ControlStep::Shutdown,
         _ => ControlStep::Continue,
+    }
+}
+
+/// Act on one plug-in request routed to the UI thread (the six requests of the
+/// module docs, RFC 0005 §5.4 and RFC 0020 §3.4).
+///
+/// Runs on the thread that owns the host window, because the registry calls the
+/// plug-in from there (S09 §3.5, §7.2). Returns `Ok(())` when the request
+/// reached the plug-in and `Err(message)` with the reason when it did not: an
+/// unknown id, a wrong kind, a plug-in with no `config` slot or a plug-in that
+/// is not live. The caller (`main`) writes the message to stderr, because
+/// stdout is the frame stream — the requests are fire-and-forget, so a refusal
+/// is a diagnostic and not a protocol message (RFC 0020 §12).
+///
+/// The other [`ControlInbound`] variants are not plug-in requests: they carry
+/// state, a liveness probe or a load, and the UI loop handles them itself. They
+/// do nothing here, so calling this with one cannot turn into a plug-in call.
+pub fn apply_plugin_request(
+    registry: &PluginRegistry,
+    event: &ControlInbound,
+) -> Result<(), String> {
+    match event {
+        ControlInbound::ConfigureVis => registry
+            .configure_vis()
+            .map_err(|error| format!("cannot configure the visualization plug-in: {error}")),
+        ControlInbound::ConfigurePlugin { plugin_id, kind } => registry
+            .configure_plugin(*plugin_id, *kind)
+            .map_err(|error| format!("cannot configure plugin {plugin_id} (as {kind:?}): {error}")),
+        ControlInbound::SeekPlugin { plugin_id, to_ms } => registry
+            .seek_input(*plugin_id, *to_ms)
+            .map_err(|error| format!("cannot seek plugin {plugin_id} to {to_ms} ms: {error}")),
+        ControlInbound::PausePlugin { plugin_id } => registry
+            .pause_input(*plugin_id)
+            .map_err(|error| format!("cannot pause plugin {plugin_id}: {error}")),
+        ControlInbound::UnpausePlugin { plugin_id } => registry
+            .unpause_input(*plugin_id)
+            .map_err(|error| format!("cannot resume plugin {plugin_id}: {error}")),
+        ControlInbound::StopPlugin { plugin_id } => registry
+            .stop_input(*plugin_id)
+            .map_err(|error| format!("cannot stop plugin {plugin_id}: {error}")),
+        ControlInbound::State(_) | ControlInbound::Ping(_) | ControlInbound::Load { .. } => Ok(()),
     }
 }
 
@@ -226,8 +332,9 @@ pub fn handle_message_inbound(
 /// * `PlayerStateUpdate` is forwarded to `on_state` as an owned value.
 /// * `Ping` is answered with `Pong` carrying the same token.
 /// * `Shutdown` returns [`ControlStep::Shutdown`].
-/// * A load or a Configure request is ignored here: both call into a plugin,
-///   and only the thread that owns the host window may do that.
+/// * A load request and the six plug-in requests (RFC 0005 §5.4, RFC 0020) are
+///   ignored here: they call into a plugin, and only the thread that owns the
+///   host window may do that.
 pub fn handle_message(
     message: Message,
     transport: &mut dyn Transport,
@@ -470,6 +577,349 @@ mod tests {
         // opens no dialog.
         assert!(matches!(app_end.recv().unwrap(), Message::Hello { .. }));
         assert!(app_end.try_recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_named_plugin_requests_reach_the_ui_thread_and_nothing_else_does() {
+        let (mut app_end, mut host_end) = MemoryTransport::pair();
+        // RFC 0020 §3.1.1: the five requests that name a plug-in, each with its
+        // own payload, in one frame each.
+        let requests = [
+            Command::ConfigurePlugin {
+                plugin_id: 7,
+                kind: PluginKind::General,
+            },
+            Command::SeekPlugin {
+                plugin_id: 8,
+                to_ms: 12_345,
+            },
+            Command::PausePlugin { plugin_id: 9 },
+            Command::UnpausePlugin { plugin_id: 10 },
+            Command::StopPlugin { plugin_id: 11 },
+        ];
+        for request in &requests {
+            app_end
+                .send(&Message::CommandToHost(request.clone()))
+                .unwrap();
+        }
+        // Two player→host commands the host still cannot act on. They must not
+        // reach the UI thread as events.
+        for ignored in [Command::ToggleVisPlugin, Command::Play] {
+            app_end.send(&Message::CommandToHost(ignored)).unwrap();
+        }
+        app_end.send(&Message::Shutdown).unwrap();
+
+        let mut events = Vec::new();
+        assert_eq!(
+            run_reader_events(&mut host_end, &mut |ev| events.push(ev)),
+            ControlExit::ShutdownRequested
+        );
+        assert_eq!(
+            events,
+            vec![
+                ControlInbound::ConfigurePlugin {
+                    plugin_id: 7,
+                    kind: PluginKind::General,
+                },
+                ControlInbound::SeekPlugin {
+                    plugin_id: 8,
+                    to_ms: 12_345,
+                },
+                ControlInbound::PausePlugin { plugin_id: 9 },
+                ControlInbound::UnpausePlugin { plugin_id: 10 },
+                ControlInbound::StopPlugin { plugin_id: 11 },
+            ],
+            "every named plug-in request must reach the thread that owns the window"
+        );
+        // Fire-and-forget (RFC 0020 §12): nothing was answered. Only the
+        // startup Hello went out.
+        assert!(matches!(app_end.recv().unwrap(), Message::Hello { .. }));
+        assert!(app_end.try_recv().unwrap().is_none());
+    }
+
+    // ---- applying a routed request on the UI thread (RFC 0020 §3.4) ----
+
+    thread_local! {
+        /// The general plug-in's `config` calls, in order.
+        static CONFIG_LOG: std::cell::RefCell<Vec<&'static str>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" fn general_config() {
+        CONFIG_LOG.with(|log| log.borrow_mut().push("config"));
+    }
+
+    /// A synthetic general plug-in with (or without) a `config` slot.
+    ///
+    /// Leaked on purpose: the registry holds a raw pointer to it, exactly as it
+    /// does into a mapped DLL's static data (S09 §0).
+    fn general_plugin(
+        name: &str,
+        config: Option<unsafe extern "C" fn()>,
+    ) -> crate::loader::LoadedPlugin {
+        let module: &'static mut rustamp_plugin_abi::general::GeneralPlugin =
+            Box::leak(Box::new(rustamp_plugin_abi::general::GeneralPlugin {
+                version: rustamp_plugin_abi::common::GEN_VERSION,
+                description: c"synthetic general".as_ptr(),
+                config,
+                ..rustamp_plugin_abi::general::GeneralPlugin::default()
+            }));
+        crate::loader::LoadedPlugin::general_for_test(name, module, true, 0)
+    }
+
+    /// A registry with a scripted input plug-in and a scripted output plug-in.
+    ///
+    /// The doubles are real `In_Module`/`Out_Module` structures with real cdecl
+    /// callbacks (`crate::handoff::doubles`); no DLL is mapped and no window is
+    /// created. The scripted track keeps playing, so the plug-in holds its
+    /// output open until it is told to stop (S09 §3.1 offset 0x48, §3.5 step 6).
+    fn registry_with_input() -> (PluginRegistry, u32) {
+        crate::handoff::doubles::clear();
+        let input = crate::loader::LoadedPlugin::input_for_test(
+            "scripted_in",
+            crate::handoff::doubles::input_module(crate::handoff::doubles::InputScript {
+                track_ends: false,
+                ..crate::handoff::doubles::InputScript::default()
+            }),
+            0x1234,
+        );
+        let output = crate::loader::LoadedPlugin::output_for_test(
+            "scripted_out",
+            crate::handoff::doubles::output_module(),
+            true,
+            0x1234,
+        );
+        let mut registry = PluginRegistry::new(crate::approval::ApprovalStore::new());
+        let output_id = registry.insert_for_test(output);
+        let input_id = registry.insert_for_test(input);
+        registry
+            .select_output(output_id)
+            .expect("the scripted output must be selectable");
+        // Hand the output over exactly as a play does, so the plug-in has one
+        // to drive (S09 §3.5 step 2, §3.7).
+        registry
+            .play_input(
+                input_id,
+                std::path::Path::new(r"C:\music\track.mp3"),
+                200,
+                -10,
+            )
+            .expect("the hand-over and the play must succeed");
+        crate::handoff::doubles::clear();
+        (registry, input_id)
+    }
+
+    #[test]
+    fn the_transport_requests_reach_the_input_plugin_through_the_abi() {
+        let (registry, input_id) = registry_with_input();
+
+        assert_eq!(
+            apply_plugin_request(
+                &registry,
+                &ControlInbound::SeekPlugin {
+                    plugin_id: input_id,
+                    to_ms: 12_345,
+                }
+            ),
+            Ok(())
+        );
+        // The host's whole part of a seek is the input plug-in's own `seek`,
+        // and the plug-in flushes the output at the new time itself (S09 §3.7):
+        // exactly one flush, and it came from the plug-in.
+        assert_eq!(
+            crate::handoff::doubles::calls(),
+            vec!["seek 12345", "flush 12345 input"]
+        );
+
+        crate::handoff::doubles::clear();
+        assert_eq!(
+            apply_plugin_request(
+                &registry,
+                &ControlInbound::PausePlugin {
+                    plugin_id: input_id
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            apply_plugin_request(
+                &registry,
+                &ControlInbound::UnpausePlugin {
+                    plugin_id: input_id
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            crate::handoff::doubles::calls(),
+            vec!["pause", "pause 1 input", "unpause", "pause 0 input"],
+            "the input plug-in pauses and resumes the output it drives"
+        );
+
+        crate::handoff::doubles::clear();
+        assert_eq!(
+            apply_plugin_request(
+                &registry,
+                &ControlInbound::StopPlugin {
+                    plugin_id: input_id
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            crate::handoff::doubles::calls(),
+            vec!["stop", "close input"],
+            "the plug-in closes its own output on a stop"
+        );
+    }
+
+    #[test]
+    fn a_configure_request_reaches_the_named_plugins_config_slot() {
+        CONFIG_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(crate::approval::ApprovalStore::new());
+        let id = registry.insert_for_test(general_plugin("gen_with_config", Some(general_config)));
+
+        assert_eq!(
+            apply_plugin_request(
+                &registry,
+                &ControlInbound::ConfigurePlugin {
+                    plugin_id: id,
+                    kind: PluginKind::General,
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(CONFIG_LOG.with(|log| log.borrow().clone()), vec!["config"]);
+    }
+
+    #[test]
+    fn the_three_refusals_are_reported_and_call_nothing() {
+        CONFIG_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(crate::approval::ApprovalStore::new());
+        let with_config = registry.insert_for_test(general_plugin("gen_cfg", Some(general_config)));
+        let without = registry.insert_for_test(general_plugin("gen_nocfg", None));
+
+        // An unknown id: the host has loaded nothing under it.
+        let unknown = apply_plugin_request(
+            &registry,
+            &ControlInbound::ConfigurePlugin {
+                plugin_id: 9_999,
+                kind: PluginKind::General,
+            },
+        )
+        .expect_err("an unknown id must be refused");
+        assert!(unknown.contains("no plugin with id 9999"), "{unknown}");
+
+        // A wrong kind: the request claims Dsp, the loaded plug-in is a
+        // general plug-in. Nothing may be called.
+        let wrong_kind = apply_plugin_request(
+            &registry,
+            &ControlInbound::ConfigurePlugin {
+                plugin_id: with_config,
+                kind: PluginKind::Dsp,
+            },
+        )
+        .expect_err("a wrong kind must be refused");
+        assert!(
+            wrong_kind.contains("cannot configure plugin")
+                && wrong_kind.contains("asked for a Dsp plugin"),
+            "{wrong_kind}"
+        );
+
+        // A plug-in with no `config` slot: a fact about that plug-in, and
+        // still nothing called through a null slot (S09 §0).
+        let no_slot = apply_plugin_request(
+            &registry,
+            &ControlInbound::ConfigurePlugin {
+                plugin_id: without,
+                kind: PluginKind::General,
+            },
+        )
+        .expect_err("a missing config slot must be refused");
+        assert!(no_slot.contains("no config callback"), "{no_slot}");
+
+        assert!(
+            CONFIG_LOG.with(|log| log.borrow().is_empty()),
+            "a refused request must not have called the plug-in's config"
+        );
+    }
+
+    #[test]
+    fn an_unknown_id_is_refused_by_every_transport_route_and_calls_nothing() {
+        crate::handoff::doubles::clear();
+        let mut registry = PluginRegistry::new(crate::approval::ApprovalStore::new());
+        let output = crate::loader::LoadedPlugin::output_for_test(
+            "scripted_out",
+            crate::handoff::doubles::output_module(),
+            true,
+            0x1234,
+        );
+        // An output plug-in under a known id: the transport routes need an
+        // input plug-in, so the id/kind refusal is exercised without a window.
+        let output_id = registry.insert_for_test(output);
+
+        let refusals = [
+            ControlInbound::SeekPlugin {
+                plugin_id: 9_999,
+                to_ms: 0,
+            },
+            ControlInbound::PausePlugin { plugin_id: 9_999 },
+            ControlInbound::UnpausePlugin { plugin_id: 9_999 },
+            ControlInbound::StopPlugin { plugin_id: 9_999 },
+        ];
+        for refused in refusals {
+            let message = apply_plugin_request(&registry, &refused)
+                .expect_err("an unknown id must be refused");
+            assert!(message.contains("no plugin with id 9999"), "{message}");
+        }
+
+        // A known id of the wrong kind is refused by the same routes.
+        for refused in [
+            ControlInbound::SeekPlugin {
+                plugin_id: output_id,
+                to_ms: 0,
+            },
+            ControlInbound::PausePlugin {
+                plugin_id: output_id,
+            },
+            ControlInbound::UnpausePlugin {
+                plugin_id: output_id,
+            },
+            ControlInbound::StopPlugin {
+                plugin_id: output_id,
+            },
+        ] {
+            let message = apply_plugin_request(&registry, &refused)
+                .expect_err("a wrong kind must be refused");
+            assert!(message.contains("expected a Input plugin"), "{message}");
+        }
+
+        assert!(
+            crate::handoff::doubles::calls().is_empty(),
+            "a refused request must call nothing: {:?}",
+            crate::handoff::doubles::calls()
+        );
+    }
+
+    #[test]
+    fn a_routed_state_ping_or_load_is_not_a_plugin_request() {
+        // `apply_plugin_request` only acts on the six plug-in requests; the
+        // other inbound variants carry no plug-in call and do nothing here.
+        let registry = PluginRegistry::new(crate::approval::ApprovalStore::new());
+        assert_eq!(
+            apply_plugin_request(&registry, &ControlInbound::Ping(3)),
+            Ok(())
+        );
+        assert_eq!(
+            apply_plugin_request(
+                &registry,
+                &ControlInbound::Load {
+                    path: r"C:\plugins\gen_x.dll".to_string(),
+                    kind: PluginKind::General,
+                }
+            ),
+            Ok(())
+        );
     }
 
     #[test]

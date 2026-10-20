@@ -8,8 +8,13 @@
 //! so no caller changes.
 //!
 //! Licensed **`MIT OR Apache-2.0`**: see `LICENSE-MIT` and `LICENSE-APACHE` at
-//! the repository root. This crate contains only Rustamp's own code and has no
-//! internal dependencies.
+//! the repository root. This crate contains only Rustamp's own code. It has
+//! exactly one internal dependency, `rustamp-plugin-abi` (also
+//! `MIT OR Apache-2.0`): RFC 0020's `Command::ConfigurePlugin` names the ABI's
+//! kind type instead of mirroring it, so that the wire carries one kind type
+//! (RFC 0020 §3.3, option A; the RFC 0004 §3 erratum in RFC 0004 §7). The
+//! permissive closure stays copyleft-free, and no crates.io dependency was
+//! added for it.
 //!
 //! Nothing here encodes anything by itself: the `postcard` encoding and the
 //! length-prefixed framing live in `rustamp-ipc`. The `serde` derives are part

@@ -2081,21 +2081,38 @@ impl App {
     /// reported to the user as a note, the same way an unimplemented command
     /// is.
     fn request_vis_plugin_configuration(&mut self) {
-        match self.host.send_command(Command::ConfigureVisPlugin) {
-            CommandOutcome::Sent => self.note(
-                "the visualization plug-in's configuration was requested from the plugin host"
-                    .to_string(),
-            ),
-            CommandOutcome::Detached => self.note(
-                "no plugin host is attached: the visualization plug-in's configuration \
-                 was not opened"
-                    .to_string(),
-            ),
-            CommandOutcome::HostGone => self.note(
-                "the plugin host is gone: the visualization plug-in's configuration \
-                 was not opened"
-                    .to_string(),
-            ),
+        self.request_plugin_host_command(
+            Command::ConfigureVisPlugin,
+            "the visualization plug-in's configuration",
+        );
+    }
+
+    /// Send one plug-in request to the host (RFC 0020, the player -> host
+    /// direction).
+    ///
+    /// The request names a plug-in by the id the host assigned in its
+    /// `PluginLoaded` answer (see [`crate::plugin_inventory`]) and travels in
+    /// [`Message::CommandToHost`] — the carrier the protocol already has. It is
+    /// **fire-and-forget**: there is no reply message, so the outcome reported
+    /// here is "the frame went out", not "the plug-in did it". A refusal is the
+    /// host's to report, and it reports it on its own stderr (RFC 0020 §12).
+    ///
+    /// The request is never dropped silently: a missing or dead host is
+    /// reported to the user as a note, the same way an unimplemented command
+    /// is. `what` is the phrase the notes name the request by.
+    fn request_plugin_host_command(&mut self, command: Command, what: &str) {
+        match self.host.send_command(command) {
+            CommandOutcome::Sent => {
+                self.note(format!("{what} was requested from the plugin host"));
+            }
+            CommandOutcome::Detached => self.note(format!(
+                "no plugin host is attached: {what} was not sent to it"
+            )),
+            CommandOutcome::HostGone => {
+                self.note(format!(
+                    "the plugin host is gone: {what} was not sent to it"
+                ));
+            }
         }
     }
 
@@ -3030,6 +3047,31 @@ impl App {
             // RFC 0005 §5.4: the visualization plug-in lives in the plugin
             // host, so the request travels to the host (see `crate::host`).
             C::ConfigureVisPlugin => self.request_vis_plugin_configuration(),
+            // RFC 0020: the same for the requests that *name* a plug-in. The
+            // app holds the ids it was told about (see `crate::plugin_inventory`)
+            // and only the host can call into a plug-in, so every one of them
+            // goes out over the control channel as it arrives. Each is
+            // fire-and-forget; the host reports a refusal on its own stderr.
+            C::ConfigurePlugin { plugin_id, kind } => self.request_plugin_host_command(
+                command.clone(),
+                &format!("opening the configuration of plugin {plugin_id} (a {kind:?} plugin)"),
+            ),
+            C::SeekPlugin { plugin_id, to_ms } => self.request_plugin_host_command(
+                command.clone(),
+                &format!("seeking plugin {plugin_id} to {to_ms} ms"),
+            ),
+            C::PausePlugin { plugin_id } => self.request_plugin_host_command(
+                command.clone(),
+                &format!("pausing plugin {plugin_id}"),
+            ),
+            C::UnpausePlugin { plugin_id } => self.request_plugin_host_command(
+                command.clone(),
+                &format!("resuming plugin {plugin_id}"),
+            ),
+            C::StopPlugin { plugin_id } => self.request_plugin_host_command(
+                command.clone(),
+                &format!("stopping plugin {plugin_id}"),
+            ),
             C::ToggleVisPlugin => {
                 // The host has no start/stop path yet: only the configure
                 // request is routed (RFC 0005 §5.4 defers the rest to M3).
@@ -4682,6 +4724,110 @@ mod tests {
             notes
                 .iter()
                 .any(|note| note.contains("not implemented by the plugin host")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn the_named_plugin_requests_reach_the_host_through_the_accepted_carrier() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+
+        // The host answered a load: its id, name and kind are the app's now.
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 1,
+                name: "Sleeper".to_string(),
+                kind: PluginKind::Dsp,
+            })
+            .unwrap();
+        app.pump().unwrap();
+        let loaded = app.host_plugin(1).expect("the host reported it");
+        assert_eq!(loaded.name, "Sleeper");
+        assert_eq!(loaded.kind, PluginKind::Dsp);
+
+        // RFC 0020 §3.5: the app names the plug-in it remembered, and the
+        // request travels in `Message::CommandToHost` — the accepted carrier.
+        app.submit(Command::ConfigurePlugin {
+            plugin_id: loaded.plugin_id,
+            kind: loaded.kind,
+        })
+        .expect("the app owns the request");
+
+        // Drain what the pump wrote and keep the plug-in requests.
+        let mut requests = Vec::new();
+        while let Ok(Some(message)) = host_end.try_recv() {
+            if let Message::CommandToHost(command) = message {
+                requests.push(command);
+            }
+        }
+        assert_eq!(
+            requests,
+            vec![Command::ConfigurePlugin {
+                plugin_id: 1,
+                kind: PluginKind::Dsp,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_four_transport_requests_go_out_over_the_same_carrier() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+
+        for command in [
+            Command::SeekPlugin {
+                plugin_id: 2,
+                to_ms: 12_345,
+            },
+            Command::PausePlugin { plugin_id: 2 },
+            Command::UnpausePlugin { plugin_id: 2 },
+            Command::StopPlugin { plugin_id: 2 },
+        ] {
+            app.submit(command).expect("the app owns the request");
+        }
+
+        let mut requests = Vec::new();
+        while let Ok(Some(message)) = host_end.try_recv() {
+            if let Message::CommandToHost(command) = message {
+                requests.push(command);
+            }
+        }
+        assert_eq!(
+            requests,
+            vec![
+                Command::SeekPlugin {
+                    plugin_id: 2,
+                    to_ms: 12_345,
+                },
+                Command::PausePlugin { plugin_id: 2 },
+                Command::UnpausePlugin { plugin_id: 2 },
+                Command::StopPlugin { plugin_id: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_plugin_host_a_named_plugin_request_is_reported_not_dropped() {
+        let (mut app, _dir) = app_with_file(None);
+        assert!(!app.host_attached());
+
+        app.apply(&Command::ConfigurePlugin {
+            plugin_id: 7,
+            kind: PluginKind::General,
+        });
+
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(
+                |note| note.contains("no plugin host is attached") && note.contains("plugin 7")
+            ),
             "{notes:?}"
         );
     }

@@ -27,8 +27,8 @@ use rustamp_proto::state::{EqState, PlayerState, StreamInfo, TransportState, Win
 /// The number of [`Message`] variants (declaration indices `0..=27`).
 pub const MESSAGE_VARIANT_COUNT: u8 = 28;
 
-/// The number of [`Command`] variants (declaration indices `0..=60`).
-pub const COMMAND_VARIANT_COUNT: u8 = 61;
+/// The number of [`Command`] variants (declaration indices `0..=65`).
+pub const COMMAND_VARIANT_COUNT: u8 = 66;
 
 /// A SplitMix64 generator: this file's own seeded source of randomness.
 pub struct Rng(u64);
@@ -473,6 +473,39 @@ pub fn command_variant(index: u8, rng: &mut Rng) -> Option<(&'static str, Comman
         58 => ("OpenVisualizationMenu", Command::OpenVisualizationMenu),
         59 => ("SavePlaylist", Command::SavePlaylist(rng.path())),
         60 => ("RemoveDeadFiles", Command::RemoveDeadFiles),
+        // RFC 0020's plug-in requests, appended after `RemoveDeadFiles`.
+        61 => (
+            "ConfigurePlugin",
+            Command::ConfigurePlugin {
+                plugin_id: rng.u32(),
+                kind: plugin_kind(rng),
+            },
+        ),
+        62 => (
+            "SeekPlugin",
+            Command::SeekPlugin {
+                plugin_id: rng.u32(),
+                to_ms: rng.i32(),
+            },
+        ),
+        63 => (
+            "PausePlugin",
+            Command::PausePlugin {
+                plugin_id: rng.u32(),
+            },
+        ),
+        64 => (
+            "UnpausePlugin",
+            Command::UnpausePlugin {
+                plugin_id: rng.u32(),
+            },
+        ),
+        65 => (
+            "StopPlugin",
+            Command::StopPlugin {
+                plugin_id: rng.u32(),
+            },
+        ),
         _ => return None,
     })
 }

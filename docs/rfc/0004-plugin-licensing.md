@@ -158,3 +158,15 @@ the record of what was decided.
   material) and `rustamp-skin` (webamp MIT tables). Only the copyright holder
   of a piece of code may grant the exception for it, so the exclusion list must
   be reviewed whenever third-party material enters a crate.
+
+- **§3's "no internal dependencies" rule admits one internal edge** (2026-10-20, RFC 0020).
+  RFC 0020 option A added exactly one internal dependency — `rustamp-proto`
+  → `rustamp-plugin-abi` — so that `Command::ConfigurePlugin` can carry the
+  ABI's own `PluginKind` instead of a mirror. Both crates are
+  `MIT OR Apache-2.0` (§1), so the invariant in acceptance 4 — no copyleft in
+  the permissive closure — is preserved: the license audit discovers roots and
+  closures automatically, and `rustamp-plugin-abi` simply joins `rustamp-proto`'s
+  closure. No crates.io dependency was added for it; `THIRD_PARTY.md` is
+  unchanged. The prose in §3 should be read as "no internal dependencies
+  *except* the one RFC 0020's accepted option A introduces, recorded in its
+  erratum."

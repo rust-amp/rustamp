@@ -11,7 +11,7 @@
 //! as 4 little-endian bytes, `bool` as one byte and `Option` as a one-byte tag.
 //! They are not produced by the code under test.
 
-use rustamp_proto::command::{Command, JumpTarget, OpenMediaKind, PrefsPage, SelectOp};
+use rustamp_proto::command::{Command, JumpTarget, OpenMediaKind, PluginKind, PrefsPage, SelectOp};
 use rustamp_proto::playlist::{EntryId, MediaLocation, SortKey};
 use rustamp_proto::state::{PlayerState, WindowId};
 
@@ -395,16 +395,123 @@ fn command_to_host_is_appended_to_the_end_of_message() {
 }
 
 #[test]
-fn the_protocol_version_is_four() {
+fn the_plugin_requests_are_appended_after_remove_dead_files() {
+    // RFC 0020 §3.1/§5.1: `ConfigurePlugin` is index 61 (0x3d) and the four
+    // transport requests follow it at 62..=65 (0x3e..=0x41). Every earlier
+    // variant keeps its index — and therefore its bytes — because the five are
+    // appended. The payload bytes are the hand-derived ones of RFC 0020 §5.1:
+    // `0x07` = `plugin_id` 7 as a one-byte varint, `0x02` =
+    // `PluginKind::Visualization` (declaration order: Input 0, Output 1,
+    // Visualization 2, Dsp 3, General 4), `0xf2 0xc0 0x01` = postcard's
+    // zig-zag varint for `12345` (24690 as LEB128).
+    let appended: [(u8, Command, &[u8]); 5] = [
+        (
+            0x3d,
+            Command::ConfigurePlugin {
+                plugin_id: 7,
+                kind: PluginKind::Visualization,
+            },
+            &[0x3d, 0x07, 0x02],
+        ),
+        (
+            0x3e,
+            Command::SeekPlugin {
+                plugin_id: 7,
+                to_ms: 12_345,
+            },
+            &[0x3e, 0x07, 0xf2, 0xc0, 0x01],
+        ),
+        (0x3f, Command::PausePlugin { plugin_id: 7 }, &[0x3f, 0x07]),
+        (0x40, Command::UnpausePlugin { plugin_id: 7 }, &[0x40, 0x07]),
+        (0x41, Command::StopPlugin { plugin_id: 7 }, &[0x41, 0x07]),
+    ];
+    for (index, command, bytes) in appended {
+        let encoded = encode(&command);
+        assert_eq!(encoded, bytes, "index {index:#04x}");
+        // The first byte IS the declaration index: one inserted variant would
+        // move it and fail here.
+        assert_eq!(encoded[0], index);
+        assert_eq!(decode(&encoded), command);
+    }
+    // The last variant before the block keeps its index: `RemoveDeadFiles`
+    // stays 0x3c, so 0x3d is genuinely the next free one.
+    assert_eq!(encode(&Command::RemoveDeadFiles), [0x3c]);
+}
+
+#[test]
+fn the_plugin_requests_travel_in_the_unchanged_command_to_host_carrier() {
+    use rustamp_ipc::Message;
+
+    // RFC 0020 §3.2: `Message` does not change; the requests ride in
+    // `CommandToHost`, whose index stays 14 (0x0e).
+    assert_eq!(
+        postcard::to_allocvec(&Message::CommandToHost(Command::ConfigurePlugin {
+            plugin_id: 7,
+            kind: PluginKind::Visualization,
+        }))
+        .unwrap(),
+        [0x0e, 0x3d, 0x07, 0x02]
+    );
+    assert_eq!(
+        postcard::to_allocvec(&Message::CommandToHost(Command::StopPlugin {
+            plugin_id: 7,
+        }))
+        .unwrap(),
+        [0x0e, 0x41, 0x07]
+    );
+}
+
+#[test]
+fn every_plugin_request_round_trips_for_every_plugin_kind() {
+    // RFC 0020 §8.1: the payload survives the round trip. `ConfigurePlugin`
+    // carries the kind, so it is checked for every value — the kind is the one
+    // field whose encoding could silently change.
+    for kind in PluginKind::ALL {
+        let command = Command::ConfigurePlugin {
+            plugin_id: 42,
+            kind,
+        };
+        assert_eq!(decode(&encode(&command)), command, "{kind:?}");
+    }
+
+    let transport = [
+        // A negative position is the plug-in's business (RFC 0020 §12 item 5):
+        // it must survive unchanged.
+        Command::SeekPlugin {
+            plugin_id: 1,
+            to_ms: -1,
+        },
+        Command::SeekPlugin {
+            plugin_id: u32::MAX,
+            to_ms: i32::MIN,
+        },
+        Command::SeekPlugin {
+            plugin_id: 0,
+            to_ms: 0,
+        },
+        Command::PausePlugin { plugin_id: 1 },
+        Command::UnpausePlugin { plugin_id: 1 },
+        Command::StopPlugin {
+            plugin_id: u32::MAX,
+        },
+    ];
+    for command in transport {
+        assert_eq!(decode(&encode(&command)), command, "{command:?}");
+    }
+}
+
+#[test]
+fn the_protocol_version_is_five() {
     // RFC 0005 took the protocol to 2; RFC 0006 appended its hosting messages
-    // and took it to 3; RFC 0015's DspResetAck takes it to 4, because a v3 peer
-    // would mis-decode the new variant (the project rule is a clean Hello
-    // rejection rather than a decode error).
-    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 4);
+    // and took it to 3; RFC 0015's DspResetAck takes it to 4; RFC 0020's
+    // plug-in requests take it to 5, because a v4 peer would mis-decode the
+    // appended variants (the project rule is a clean Hello rejection rather
+    // than a decode error).
+    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 5);
     assert_eq!(
         rustamp_ipc::Message::hello(),
         rustamp_ipc::Message::Hello {
-            protocol_version: 4,
+            protocol_version: 5,
             pid: std::process::id(),
         }
     );

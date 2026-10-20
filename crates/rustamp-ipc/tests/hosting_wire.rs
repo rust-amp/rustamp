@@ -24,12 +24,12 @@ fn decode(bytes: &[u8]) -> Message {
 const HOSTING_VARIANT_COUNT: usize = 13;
 
 #[test]
-fn protocol_version_is_four() {
-    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 4);
+fn protocol_version_is_five() {
+    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 5);
     assert_eq!(
         rustamp_ipc::Message::hello(),
         rustamp_ipc::Message::Hello {
-            protocol_version: 4,
+            protocol_version: 5,
             pid: std::process::id(),
         }
     );
@@ -391,7 +391,7 @@ fn total_message_variant_count() {
     // Total: 28 variants (0..27)
     let all_indices: std::collections::BTreeSet<u8> = [
         Message::Hello {
-            protocol_version: 4,
+            protocol_version: 5,
             pid: 0,
         },
         Message::Ping(0),

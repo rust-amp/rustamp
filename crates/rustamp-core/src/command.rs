@@ -12,9 +12,13 @@
 //! the wire types it re-exports, not a hand-picked subset. A re-exported variant
 //! drags its payload types with it: [`Command::OpenMedia`],
 //! [`Command::OpenJump`] and [`Command::OpenPrefsPage`] name [`OpenMediaKind`],
-//! [`JumpTarget`] and [`PrefsPage`], so a consumer that matches on those variants
-//! must be able to name them here too. When a later change adds a payload type
-//! to a re-exported variant, this list grows in the same change;
+//! [`JumpTarget`] and [`PrefsPage`], and RFC 0020's [`Command::ConfigurePlugin`]
+//! names [`PluginKind`] — the ABI's kind type, which this module re-exports from
+//! `rustamp-proto`'s re-export so a consumer never needs `rustamp-plugin-abi` to
+//! match on the variant. When a later change adds a payload type to a
+//! re-exported variant, this list grows in the same change;
 //! `tests/command_reexports.rs` stops compiling if it does not.
 
-pub use rustamp_proto::command::{Command, JumpTarget, OpenMediaKind, PrefsPage, SelectOp};
+pub use rustamp_proto::command::{
+    Command, JumpTarget, OpenMediaKind, PluginKind, PrefsPage, SelectOp,
+};
