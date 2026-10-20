@@ -284,3 +284,45 @@ launch (the recorded 1:1 landmark pins that start state), then `WM_COMMAND`
 40064 (windowshade) or 40165 (double size) is **posted to the equalizer's own
 window** — no real click, no menu, no keyboard. Each job captures the state
 before and after, which is what proves the action changed something.
+
+## Measured parity, 2026-10-21 (all eleven states, both sides captured)
+
+The comparator compares the **client area** of the reference (`Winamp 2.95`, skin
+`base-2.91.wsz`, 1024x768, 96 dpi) with ours, same state, same skin, same size.
+
+| Case | differing pixels | share |
+|---|---|---|
+| `main-active` | 3 675 / 31 900 | 11.5 % |
+| `main-inactive` | 2 099 / 31 900 | 6.6 % |
+| `main-shade` | 1 246 / 3 850 | 32.4 % |
+| `main-double` | 14 700 / 127 600 | 11.5 % |
+| `eq-active` | 7 408 / 31 900 | 23.2 % |
+| `eq-inactive` | 7 408 / 31 900 | 23.2 % |
+| `playlist-active` | 1 510 / 31 900 | 4.7 % |
+| `playlist-inactive` | 1 510 / 31 900 | 4.7 % |
+| `eq-shade`, `eq-double`, `playlist-shade` | **state not reached** | - |
+
+**Over the eight comparable states: 39 553 of 322 850 pixels differ (12.25 %).**
+
+### Three states the player does not reach at all (measured defects)
+
+The reference and our player disagree on the *size*, so these three are not pixel
+differences but missing behaviour:
+
+| Case | Reference | Ours | Command |
+|---|---|---|---|
+| equalizer, windowshade | 275x14 | 275x116 | `WM_COMMAND` 40064 to the equalizer |
+| equalizer, double size | 550x232 | 275x116 | `WM_COMMAND` 40165 to the equalizer |
+| playlist, windowshade | 275x14 | 275x116 | `WM_COMMAND` 40064 to the playlist |
+
+The **main** window answers both commands correctly (275x14, 550x232), so routing
+and resizing exist; the equalizer and the playlist never apply the command to
+themselves. `wave339` fixes it; these three rows are re-measured afterwards.
+
+### How to read the numbers
+
+A differing pixel is a pixel whose colour is not the reference's. The shares say
+**nothing** about why; the bounding boxes of each comparison do (`bounds=` in the
+comparator's stdout): the title band, the marquee, the analyser and the playlist
+rows differ in different cases. Turning a share into a work item means reading
+the diff image, not the percentage.
