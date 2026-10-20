@@ -155,6 +155,37 @@ pub fn tone(frame: u64) -> f32 {
 /// The format a `fmt<n>_<m>.tst` track switches to after `n` frames.
 pub const CHANGED_SPEC: AudioSpec = AudioSpec::new(48_000, 2);
 
+/// The sample of the seeded noise signal at `frame`: a pure function of the
+/// seed and the frame index, so a test can model every one of them.
+///
+/// The values are hostile on purpose: the range reaches far above full
+/// scale, and every 128th frame carries a value no chain may pass on (an
+/// infinity, a NaN, a value far above full scale). The chain's signal
+/// hygiene has something to catch here.
+pub fn noise_sample(seed: u64, frame: u64) -> f32 {
+    // A splitmix64-style mix of the seed and the frame index: cheap, seeded
+    // and reproducible, and spread over the whole 64-bit range.
+    let mut z = seed
+        .wrapping_mul(0xD6E8_FEB8_6659_FD93)
+        .wrapping_add(frame.wrapping_mul(0xA076_1D64_78BD_642F))
+        .wrapping_add(0xE703_7ED1_A0B4_28DB);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    match frame % 128 {
+        0 => f32::INFINITY,
+        32 => f32::NEG_INFINITY,
+        48 => f32::NAN,
+        96 => 1.0e30,
+        _ => {
+            // A finite value in -4.0..=4.0.
+            let unit = (z >> 11) as f64 / (1u64 << 53) as f64;
+            let sign = if z & 1 == 0 { 1.0 } else { -1.0 };
+            (sign * unit * 4.0) as f32
+        }
+    }
+}
+
 /// One stretch of a [`ScriptDecoder`]: a format, a length and the sample at
 /// each frame.
 struct Segment {
@@ -246,8 +277,9 @@ fn stem_numbers(name: &str, prefix: &str) -> Option<(u64, u64)> {
 
 /// The scripted decoders: `tone<start>_<frames>` (a stretch of [`tone`]),
 /// `fmt<n>_<m>` (`n` frames of track 1's pattern at [`SPEC`], a format change
-/// to [`CHANGED_SPEC`], then `m` frames of track 2's pattern) and
-/// `err<n>_<seed>` (`n` frames of [`tone`], then a decode error).
+/// to [`CHANGED_SPEC`], then `m` frames of track 2's pattern),
+/// `err<n>_<seed>` (`n` frames of [`tone`], then a decode error) and
+/// `noise<seed>_<frames>` (the seeded noise signal of [`noise_sample`]).
 fn scripted(name: &str) -> Option<ScriptDecoder> {
     let script = |segments, fail_at_end| ScriptDecoder {
         segments,
@@ -257,6 +289,17 @@ fn scripted(name: &str) -> Option<ScriptDecoder> {
     };
     if let Some((start, frames)) = stem_numbers(name, "tone") {
         let value = Box::new(move |f| tone(start + f));
+        return Some(script(
+            vec![Segment {
+                spec: SPEC,
+                frames,
+                value,
+            }],
+            false,
+        ));
+    }
+    if let Some((seed, frames)) = stem_numbers(name, "noise") {
+        let value = Box::new(move |f| noise_sample(seed, f));
         return Some(script(
             vec![Segment {
                 spec: SPEC,

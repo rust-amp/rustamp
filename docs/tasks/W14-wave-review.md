@@ -54,7 +54,7 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 |---|---|---|---|---|
 | C2-1 | Signals cannot reach the output device above full scale (> ±1.0) | **FALSE** — *was false; **fixed 2026-10-20** (finding F2 below): the converter's single output stage now finishes every sample on both paths* | `crates/rustamp-audio/src/convert.rs:437-443` vs `555-561` (before the fix) | On equal-rate playback (`same_rate == true`, e.g. 44.1 kHz file to 44.1 kHz device), `convert.rs:441` called `remix` and returned immediately without running `finish_sample` (the `clamp(-1.0, 1.0)` safety net was resampler-only). With the limiter disabled via `set_enabled(false)` or during positive ReplayGain (+51 dB) + EQ preamp (+12 dB), unclamped samples far exceeding ±1.0 entered the ring and were passed to WASAPI/CPAL. |
 | C2-2 | The true-peak limiter bounds inter-sample peaks at full scale | **PARTIAL** | `crates/rustamp-dsp/src/limiter.rs:32-48`, card `A17 §5` | A17 §5 documents that the 4× polyphase FIR oversampler has an under-read of up to 0.67 dB near Nyquist (e.g. 20 kHz sine wave at 44.1 kHz). With limiter ceiling at 0 dBFS (1.0), true inter-sample peaks up to +0.67 dB (~1.08 linear) pass the limiter unattenuated and, due to C2-1, are not clamped on equal-rate paths. |
-| C2-3 | ReplayGain gain is applied once and in the correct order | **HOLDS** | `crates/rustamp-audio/src/decode.rs:677-698` | Order is verified: ReplayGain -> Equalizer -> installed DSP stages -> Limiter -> Converter -> Output ring. |
+| C2-3 | ReplayGain gain is applied once and in the correct order | **HOLDS** - *measured 2026-10-20 (wave303)* | `crates/rustamp-audio/src/decode.rs:938-981`, `crates/rustamp-audio/tests/chain_order.rs` | Order is verified: ReplayGain -> Equalizer -> installed DSP stages -> Limiter -> Converter -> Output ring. Measured end to end on the virtual device: the factor appears exactly once (the gain-on run is the gain-off run times the factor, frame for frame on the same source frames), the limiter sees the product of the factor and the equalizer's response (8.7578), and the device's peak is the limiter's ceiling (0.9167) - not the 1.8333 the rejected order ("the boost after the limiter") would let escape. What stays unmeasurable: the factor's position relative to the equalizer, which is a linear stage, so the two orders commute. |
 | C2-4 | "A change [to ReplayGain mode] takes effect at the next track (or seek)" | **FALSE** — *was false; **fixed 2026-10-20** (finding F3 below): a seek re-derives the multiplier* | `crates/rustamp-audio/src/engine.rs:647-650` vs `crates/rustamp-audio/src/decode.rs:840-865` (before the fix) | `apply_seek` in `decode.rs` did not update `self.rg_gain`. Gain was only updated in `prepare_track`. Changing ReplayGain mode and seeking did not update the active gain; the track continued playing with the old gain. |
 
 ### 3. The Approval Store (P5, P7)
@@ -978,3 +978,103 @@ inside `mod tests`.
   --all-features -- --test-threads=1` (582 passed, 0 failed, 17 ignored —
   the ignored ones are the VM-only window and audio tests) and
   `cargo check --workspace --all-targets --all-features` are green.
+
+## 6. Follow-up (2026-10-20, `wave303`): C2-3 is measured, not read
+
+**Lane:** `crates/rustamp-audio` only — its test support and a new test file.
+No production code changed, no commit, no download, no window, no audio
+device, no spawned process. `rustamp-dsp`, `rustamp-output` and
+`rustamp-core` were not touched.
+
+**The gap that was closed.** The review's C2-3 evidence was *"Order is
+verified: ReplayGain -> Equalizer -> installed DSP stages -> Limiter ->
+Converter -> Output ring"* — a reading of `decode.rs`, not a measurement.
+Nothing in the tree could fail if the order changed.
+
+**Answer: the order holds, and it is now pinned by tests.** The measured
+order is the documented one:
+
+```text
+decoder -> ReplayGain -> Equalizer -> [installed stages] -> Limiter
+        -> FormatConverter -> ring -> volume/balance -> fade -> device
+```
+
+### 6.1 The tests (`crates/rustamp-audio/tests/chain_order.rs`)
+
+Headless, on the virtual device (`rustamp_output::NullOutput`) and the
+fixture decoders. Two instruments carry the measurements:
+
+* **a probe stage** the caller installs (`Engine::set_dsp_chain`). The engine
+  puts the equalizer first and the limiter last, so the probe sits between
+  them and measures *the level the limiter is asked to limit*;
+* **the visualization tap**, which sits between the chain and the converter
+  and therefore shows *what left the chain* — after the decode thread's
+  sanitizer, before the format converter.
+
+| Test | What it pins |
+|---|---|
+| `the_replaygain_factor_is_applied_exactly_once` | the same track and the same source frames, once with the gain off and once with it on: the output is the gain-off run times the factor (0.50003451) on 3685 of 4096 frames (the rest are held at full scale by the converter, where the factor is not visible) — and neither twice the factor nor no factor at all |
+| `the_chain_runs_in_the_documented_order` | the limiter sees the *product* of the factor (1.9998618) and the equalizer's response (3.9810717): the probe reads 8.757753, the wanted value to the last bit. The device's peak is 0.91672456 — the limiter's working level, below its 0.96605086 ceiling and below the 0.99 that would say the converter's clamp did the holding. The rejected order ("the boost after the limiter") measures 1.8333225 on the same source |
+| `the_bounds_hold_after_the_replaygain_factor` | the hot track (the factor and a +12 dB preamp, 8.757753 at the chain) stays at 0.91672456 with the limiter on, and at exactly 1.0 with the limiter off — the converter's final ceiling, on the equal-rate path and on the resampled one |
+| `volume_and_balance_are_applied_after_the_chain` | the chain's level is 1.1 with the volume at 255 and at 128 (bit-exact the same), while the device's output is 1.0 and 0.5019608 — the volume is not a chain gain. The full-left balance mutes the right channel and leaves the left at the volume's gain |
+| `the_fade_is_an_output_stage_gain` | the fade ramps the device's output down frame by frame (`sqrt(1 - t)` times the finished source) while the chain's level stays at 1.1: the ramp is between the chain and the device |
+| `a_seeded_random_signal_stays_finite_and_bounded` | a seeded signal (15 frames of infinity, NaN and 1e30 among ordinary ones) enters the chain (the probe sees 30 non-finite samples) and leaves it finite: the tap's window — the chain's own output — holds none, and every sample the device got is finite and inside full scale, with the limiter on and off |
+
+### 6.2 The tests can fail (six mutation probes, all reverted)
+
+* **The factor applied twice** (`apply_gain` called twice in `emit`): the
+  once-test fails (*"frame 1: got 0.1652728, want 0.3305228"*) and the
+  order-test's probe reads 17.514297 instead of 8.757753.
+* **The factor applied after the limiter** (moved out of `emit` into the
+  chain's end): the order-test's probe reads 4.379179 (the factor is gone
+  from the limiter's input) and the bounds-test measures 1 instead of the
+  ceiling.
+* **The limiter first instead of last** (the chain built as limiter,
+  equalizer instead of equalizer, limiter): the order-test's probe reads
+  0.91672456 instead of 8.757753 and the bounds-test measures 1 instead of
+  the ceiling.
+* **The volume/balance not applied** (`gain::apply` commented out in the
+  render callback): the volume-test fails (*"frame 0: got 1, want
+  0.5019608"*).
+* **The fade not applied** (the fade stage removed from the render
+  callback): the fade-test fails (*"frame 1: got 0.661, want
+  0.66098505"*).
+* **The sanitizer disabled** (the non-finite samples not zeroed after the
+  chain): the noise-test fails (*"no non-finite sample may leave the chain
+  (limiter false): 30"*). The device's output alone would *not* have caught
+  it — the converter's own finish zeroes the values downstream — so the
+  measurement looks at the chain's output through the tap.
+
+All probes were reverted; `git status` in the lane worktree shows only the
+new test file, the test support and this document.
+
+### 6.3 What stays open
+
+* **The factor's position relative to the equalizer is not separable in the
+  sample values.** The equalizer is a linear stage (ten peaking sections, a
+  linear preamp, a linear wet/dry mix) and the factor is a constant, so
+  "the gain before the equalizer" and "the gain after the equalizer" give
+  the same samples — bit for bit, up to the rounding of the multiply. What
+  the measurement pins is that the factor is *inside* the chain and *before*
+  the limiter, and that it is not applied after the chain (the render
+  callback), where the volume/balance sit and where nothing would catch a
+  boost any more. The remaining gap is structural: only a change of the
+  equalizer's own contract could make it observable, and that is not this
+  lane's call.
+* **A real device:** the output is a virtual one. Whether a WASAPI mixer
+  clips or soft-limits a float above 1.0 is a hardware question.
+* **Audibility:** nothing here says how the chain sounds.
+
+### 6.4 Boundary receipt of this lane
+
+- Worktree: `C:\Users\micro\.local\share\opencode\worktree\26de0e\wave303-audio-chain-order-props`.
+- Written: `crates/rustamp-audio/tests/chain_order.rs` (new),
+  `crates/rustamp-audio/tests/common/mod.rs` (the seeded noise fixture) and
+  this document. No production code changed, no commit, no download, no
+  window, no audio device, no spawned process, no `rustamp-core` contract
+  touched.
+- Gates: `cargo fmt --all -- --check`, `cargo clippy -p rustamp-audio
+  --all-targets --all-features -- -D warnings`, `cargo test -p rustamp-audio
+  --all-features -- --test-threads=1` (the new binary: 6 passed, 0 failed,
+  in 1.1 s) and `cargo check --workspace --all-targets --all-features` are
+  green.
