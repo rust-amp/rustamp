@@ -1,10 +1,19 @@
-# RFC 0020: a generic "configure plug-in N" request on the wire
+# RFC 0020: the missing player → host plug-in commands
 
-Status: **Draft** (2026-10-19). **Not accepted.** Nothing in this document is
-implemented, no code is changed by it and no version number is bumped here. A
-wire change needs the owner's acceptance; the `PROTOCOL_VERSION` 4 → 5 decision
-belongs to the owner, the RFC itself to the integration lead (the pattern of
-RFC 0017's status line).
+Status: **Draft, second revision** (2026-10-20; first draft 2026-10-19).
+**Not accepted.** Nothing in this document is implemented, no code is changed by
+it and no version number is bumped here. A wire change needs the owner's
+acceptance; the `PROTOCOL_VERSION` 4 → 5 decision belongs to the owner, the RFC
+itself to the integration lead (the pattern of RFC 0017's status line).
+
+**What the second revision adds.** The first draft proposed only
+`Command::ConfigurePlugin`. Since then the host grew four more registry routes
+that also name a plug-in and also have no wire request: `seek_input`,
+`pause_input`, `unpause_input` and `stop_input` (`wave238`, `wave241`). They are
+the same shape — a player→host request with a plug-in id — so they belong in
+the **same** append run and behind the **same** version bump. Bumping 4 → 5 for
+one variant and 5 → 6 next week for four would be two handshake breaks for one
+kind of change.
 
 ## 1. The problem
 
@@ -29,6 +38,27 @@ So the request needs a payload that names a plug-in, the protocol needs a
 variant that carries it, and the protocol version has to move so a peer that
 does not know the variant is refused at the handshake instead of mis-decoding
 it. That is what this RFC proposes.
+
+### 1.1 The same gap on the transport routes
+
+`wave238` and `wave241` added four registry routes that name a plug-in and act
+on it: `PluginRegistry::seek_input(plugin_id, to_ms)`,
+`pause_input(plugin_id)`, `unpause_input(plugin_id)` and
+`stop_input(plugin_id)`. They are in-process only, exactly like
+`configure_plugin` was before this RFC: the host's control router still accepts
+only `Load` and `ConfigureVis`, so nothing outside the host can reach them.
+
+Their semantics are settled by S09 and pinned by tests, and this RFC does **not**
+re-open any of it:
+
+| Route | S09 | What the host does |
+|---|---|---|
+| `seek_input(id, ms)` | §3.1 offset `0x54`, §3.6 | calls the input plug-in's `seek(ms)`; the **plug-in** flushes its output (`§3.7`, `§4.2` step 3) — the host must not flush |
+| `pause_input(id)` / `unpause_input(id)` | §3.1 offsets `0x3c`/`0x40`, §3.6 | calls the input's `pause`/`unpause`; the plug-in passes it to its output |
+| `stop_input(id)` | §3.5 step 6 | calls the input's `stop()`; the plug-in closes its own output |
+
+So the wire shape is the same for all five requests: a plug-in id plus, where
+the request has one, a small payload. That is why they share one append run.
 
 ## 2. Evidence — what exists on `main` today
 
@@ -93,6 +123,45 @@ RFC 0005 §3's host-forward rule the new variant is player-internal: the
 host's id → `Command` table needs no row for it, and the host never forwards
 it to the player. It travels in one direction only: player → host.
 
+### 3.1.1 The four transport variants, appended after it
+
+Same rule, same direction, same carrier: four more variants at indices **62**
+to **65**, after `ConfigurePlugin` at 61.
+
+```rust
+/// Ask the host to seek the input plug-in with this id. The plug-in flushes
+/// its own output at the new time (S09 §3.7); the host must not. RFC 0020.
+SeekPlugin {
+    /// Host-assigned plug-in id (valid for this host process only).
+    plugin_id: u32,
+    /// Target position in milliseconds, passed through unchanged (S09 sets
+    /// no range).
+    to_ms: i32,
+},
+
+/// Ask the host to pause the input plug-in with this id (S09 §3.1 offset
+/// 0x3c; the plug-in pauses its output). RFC 0020.
+PausePlugin { plugin_id: u32 },
+
+/// The counterpart of `PausePlugin` (offset 0x40). RFC 0020.
+UnpausePlugin { plugin_id: u32 },
+
+/// Ask the host to stop the input plug-in with this id; the plug-in closes
+/// its own output (S09 §3.5 step 6). RFC 0020.
+StopPlugin { plugin_id: u32 },
+```
+
+`to_ms` is `i32` because that is the ABI's `seek(int ms)` type; the value is
+passed through unchanged. A refusal (unknown id, wrong kind, missing slot) is
+reported exactly like `ConfigurePlugin`'s, on stderr — see §3.5.
+
+**Why they are not one variant with an operation enum.** A single
+`PluginRequest { plugin_id, op: PluginOp }` would be one variant instead of
+five, but it would put a *second* enum on the wire and make every future
+request grow that enum — a shape change of an existing variant, which RFC 0005
+§3 rules out. Five appended variants cost four index bytes in the enum and
+nothing else, and each keeps its own doc comment and its own test.
+
 ### 3.2 The carrier
 
 `Message::CommandToHost(Command)` — the existing carrier, unchanged. **No new
@@ -131,18 +200,23 @@ self-describing property. D is discussed in §6.
 
 ### 3.4 The host side (not a wire change)
 
-The host's control router learns one more `CommandToHost` payload:
+The host's control router learns five more `CommandToHost` payloads, each
+routed to the UI thread exactly like `ConfigureVis` is today (only the UI
+thread may call into a plug-in):
 
-- `Message::CommandToHost(Command::ConfigurePlugin { plugin_id, kind })` →
-  a new `ControlInbound::ConfigurePlugin { plugin_id, kind }` (host-local, not
-  wire) → the UI thread calls `registry.configure_plugin(plugin_id, kind)`.
-- The refusal is reported exactly as `configure_vis` reports it today: on
-  **stderr**, because stdout is the frame stream. Nothing is called through a
-  null slot; an unknown id, a wrong kind, a plug-in with no `config` slot and
-  a plug-in that refuses are all returned as `RegistryConfigError`.
+| Payload | Host-local `ControlInbound` | Called |
+|---|---|---|
+| `ConfigurePlugin { plugin_id, kind }` | `ConfigurePlugin { plugin_id, kind }` | `registry.configure_plugin(plugin_id, kind)` |
+| `SeekPlugin { plugin_id, to_ms }` | `SeekPlugin { plugin_id, to_ms }` | `registry.seek_input(plugin_id, to_ms)` |
+| `PausePlugin { plugin_id }` | `PausePlugin { plugin_id }` | `registry.pause_input(plugin_id)` |
+| `UnpausePlugin { plugin_id }` | `UnpausePlugin { plugin_id }` | `registry.unpause_input(plugin_id)` |
+| `StopPlugin { plugin_id }` | `StopPlugin { plugin_id }` | `registry.stop_input(plugin_id)` |
 
-Only the UI thread may call into a plug-in, so the request must be carried
-to the UI thread exactly like `ConfigureVis` is today.
+All five routes already exist and are pinned headless (`wave185`, `wave238`,
+`wave241`); this RFC adds **no** host behaviour, only the inbound routing. A
+refusal — unknown id, wrong kind, no such slot, plug-in already dead — is
+reported exactly as `configure_vis` reports it today: on **stderr**, because
+stdout is the frame stream. Nothing is called through a null slot (S09 §0).
 
 ### 3.5 The app side (not a wire change)
 
@@ -172,13 +246,13 @@ the version bump; the version bump is needed for the `Command` variant alone.
 
 | Item | Change |
 |---|---|
-| `rustamp-proto::command::Command` | one variant appended: `ConfigurePlugin { plugin_id: u32, kind: PluginKind }` at index 61 (0x3d) |
+| `rustamp-proto::command::Command` | five variants appended: `ConfigurePlugin { plugin_id, kind }` at 61 (0x3d), `SeekPlugin { plugin_id, to_ms }` at 62 (0x3e), `PausePlugin { plugin_id }` at 63 (0x3f), `UnpausePlugin { plugin_id }` at 64 (0x40), `StopPlugin { plugin_id }` at 65 (0x41) |
 | `rustamp-proto`'s manifest | one internal dependency on `rustamp-plugin-abi` (option A) — plus the RFC 0004 §3 erratum |
 | `rustamp-ipc::PROTOCOL_VERSION` | 4 → 5, with the version history extended |
-| `rustamp-ipc::Message` | **unchanged** — `CommandToHost` already carries it |
-| `rustamp-plughost::control::ControlInbound` | one new host-local variant: `ConfigurePlugin { plugin_id, kind }` |
-| `rustamp-plughost::control::handle_message_inbound` | one more `CommandToHost` payload routed to it; every other payload keeps falling into the catch-all arm |
-| `rustamp-app` | remember the loaded plug-ins; add a public send path to the host; map the user's choice to the new command |
+| `rustamp-ipc::Message` | **unchanged** — `CommandToHost` already carries all five |
+| `rustamp-plughost::control::ControlInbound` | five new host-local variants (the table in §3.4) |
+| `rustamp-plughost::control::handle_message_inbound` | five more `CommandToHost` payloads routed to it; every other payload keeps falling into the catch-all arm |
+| `rustamp-app` | remember the loaded plug-ins; add a public send path to the host; map the user's choice to the new commands |
 | `rustamp-core` | re-export whatever `rustamp-proto` adds, at the existing paths (RFC 0004 §3) — no caller changes |
 | `rustamp-ui` | nothing in this RFC (the entry point is a separate decision) |
 
@@ -201,11 +275,17 @@ implementation lane's test is the measurement.
 |---|---|
 | `Command::ConfigurePlugin { plugin_id: 7, kind: PluginKind::Visualization }` | `[0x3d, 0x07, 0x02]` |
 | `Message::CommandToHost(Command::ConfigurePlugin { plugin_id: 7, kind: PluginKind::Visualization })` | `[0x0e, 0x3d, 0x07, 0x02]` |
+| `Command::SeekPlugin { plugin_id: 7, to_ms: 12345 }` | `[0x3e, 0x07, 0xf2, 0xc0, 0x01]` |
+| `Command::PausePlugin { plugin_id: 7 }` | `[0x3f, 0x07]` |
+| `Command::UnpausePlugin { plugin_id: 7 }` | `[0x40, 0x07]` |
+| `Command::StopPlugin { plugin_id: 7 }` | `[0x41, 0x07]` |
+| `Message::CommandToHost(Command::StopPlugin { plugin_id: 7 })` | `[0x0e, 0x41, 0x07]` |
 
-`0x3d` = 61 = the appended declaration index; `0x07` = `plugin_id` 7 as a
-one-byte varint; `0x02` = `PluginKind::Visualization` (declaration order:
-Input 0, Output 1, Visualization 2, Dsp 3, General 4). Every earlier variant
-keeps its bytes, because the new one is appended.
+`0x3d` = 61 … `0x41` = 65, the appended declaration indices; `0x07` =
+`plugin_id` 7 as a one-byte varint; `0x02` = `PluginKind::Visualization`
+(declaration order: Input 0, Output 1, Visualization 2, Dsp 3, General 4);
+`0xf2 0xc0 0x01` = postcard's zig-zag varint for `12345` (`24690` as LEB128).
+Every earlier variant keeps its bytes, because the five are appended.
 
 ### 5.2 The version
 
@@ -323,6 +403,9 @@ tools.
 | `rustamp-app`: a `MemoryTransport` pair, a v4 host (the constant minus one) and the supervisor's handshake barrier | a v4 peer is **rejected**: the link stays detached, the failure is recorded, and no frame is written to the rejected peer |
 | `rustamp-app`: the app's send path writes `Message::CommandToHost(Command::ConfigurePlugin { .. })` onto the transport | the app uses the accepted carrier, with the right payload |
 | `rustamp-plughost`: `handle_message_inbound` maps `CommandToHost(ConfigurePlugin { .. })` to the new `ControlInbound` | the host routes the request to the UI thread; every other `CommandToHost` payload still falls into the catch-all arm |
+| `rustamp-plughost`: the same for `SeekPlugin`, `PausePlugin`, `UnpausePlugin`, `StopPlugin` | the four transport requests reach the UI thread, and each calls its own registry route with the id from the frame |
+| `rustamp-plughost`: a seek through the wire produces exactly one `flush`, and it comes from the plug-in (the `wave238` doubles) | the host still does not flush an output it does not own |
+| `rustamp-plughost`: a wrong kind, an unknown id and a dead plug-in are refused for each route | nothing is called through a null slot, and the refusal is typed |
 | `rustamp-plughost`: the registry refuses an unknown id, a wrong kind and a plug-in with no `config` slot (the `RegistryConfigError` cases) | nothing is called through a null slot (the existing in-process registry tests cover the `config` slot; the new one covers the id/kind routing) |
 
 The headless tests are the ones that must run on the host; "the tests need
@@ -370,9 +453,14 @@ in session 0.
    host's `WrongKind` refusal becomes unreachable).
 3. **Reply or not** (Q3 in §9): fire-and-forget (proposed) or a new `Message`
    variant — the latter is a second wire change and a second bump.
-4. **Whether the version bump may ride along with anything else.** The player
-   and the host ship together, so a single bump is cheap now and expensive
-   later; the project has bumped 1 → 2 → 3 → 4 for exactly this reason.
+4. **Whether the four transport variants ride along** (second revision,
+   **proposed: yes**). The player and the host ship together, so a single bump
+   is cheap now and expensive later; the project has bumped 1 → 2 → 3 → 4 for
+   exactly this reason, and the four routes are already written and tested.
+   Saying no means a second handshake break later for the same kind of change.
+5. **Whether `to_ms` is `i32` or `u32`.** S09's slot is `seek(int ms)` —
+   `i32` is the ABI's type and is passed through unchanged; S09 settles no
+   range, so a negative value is the plug-in's business. Proposal: `i32`.
 
 ## 11. RFC acceptance (for the implementation lane, once this RFC is accepted)
 
