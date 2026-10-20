@@ -119,6 +119,17 @@ after every merge), not by trusting the lane's report.
 | `wave238` | input seek/pause routes (S09 has a `seek` slot); the plugin flushes the output, the host does not |
 | `wave239` | the edit-entry save removes cleared fields and reports what the format kept |
 | `wave241` | the `stop_input` route: the plugin closes its own output |
+| `wave242` | Opus in Matroska: the channel count comes from the `OpusHead`, plus duration/seek conversions |
+| `wave243` | the skin list refills on content change and a user pick survives the tick push |
+| `wave244` | the `skins` folder beside the config, cached by folder mtime |
+| `wave245` | query property tests; `path_prefix` was an ASCII-case-insensitive `LIKE`, now a literal byte prefix |
+| `wave246` | playlist format property tests (two documented losses pinned, no product change) |
+| `wave247` | decoder probe fuzz: no panic, but the MP4 box read allocated a claimed 64 MB from a 140-byte file (DoS fixed) |
+| `wave248` | the skin browser scrolls by keyboard and never draws a clipped row (the reference has no skinned browser window) |
+| `wave249` | tag writer property tests and a per-format capability table |
+| `wave250` | ring property tests; the wake path missed the fence, so a reset could lose a wakeup |
+| `wave252` | DSP property tests; the EQ could emit `inf` (→ `NaN`), the crossfade was inexact, the dry end was not bit-exact |
+| `wave253` | `WriteReport::unstoreable` names the values a format cannot hold (MP4 `trkn`/`disk` are 16-bit) |
 
 Also this session: the post-merge check was a **false green** because it ran
 `cargo check --workspace` without `--all-targets`; three test call sites were
@@ -128,8 +139,20 @@ broken for a whole wave. The rule in `AGENTS.md` now demands
 Also this session: `docs/tasks/M14-host-framework-review.md` was brought up to
 date (L2, L4 and F-C8 are CONFIRMED now).
 
-In flight at the time of writing: `wave240` (the Preferences plug-in list after
-a page switch), `wave242` (Opus in Matroska, or the precise limit).
+Also this session: an unknown actor committed three fixes straight onto `main`
+(`cdae417` 01:12, `95a5f89` 03:11, `f527a31` 03:16, the latter two with their
+own task cards `W33`/`W34`). They are legitimate and the workspace is green,
+but they did not come from this orchestrator - worth finding out who is writing
+to the canonical tree.
+
+The property-test waves (245-253) found five real defects: the ASCII `LIKE`
+prefix, the 64 MB MP4 allocation from a 140-byte file, the missing wake fence,
+the EQ's `inf` output and its inexact crossfade, and the silently dropped 16-bit
+MP4 numbers.
+
+In flight at the time of writing: `wave251` (engine time properties),
+`wave254` (skin parser malformed input), `wave255` (output format-selection
+properties), `wave256` (surface `unstoreable` in the app).
 
 ## Rules added to `AGENTS.md` during the session
 
