@@ -132,6 +132,14 @@
 //! | `plugins.plugin_dir`, `plugins.disabled` | the reference keeps its plug-in list in its own files |
 //! | `audio.output`, `audio.buffer_ms`, `audio.gapless`, `playlist.manual_advance`, `playlist.last_playlist`, `plugins.vis_plugin`, `plugins.vis_preset` | the settings the player does not apply (see `crate::config`) |
 //!
+//! # The report the page shows
+//!
+//! The preferences page shows one line after an import: the file that was
+//! read, the settings that were taken over and the keys that could not be
+//! ([`report_line`]). The keys the player read in its own way are named in
+//! that line, so the split of the report survives on the page and the user
+//! is not told that the reference's meaning was applied.
+
 //! # What a missing key means
 //!
 //! The reference reads a missing key as the caller's default, which is the
@@ -329,6 +337,20 @@ impl Effect {
     }
 }
 
+/// How the player read a key of the reference file.
+///
+/// The mapping table reads most keys the way the spec states it. Two of
+/// them are read in **our** way: the balance's side (S12 §3.2) and the
+/// classic gain scale (S07 §7). The report keeps the two apart, so the
+/// user is never told that the reference's meaning was applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// The key means what the spec says it means.
+    Spec,
+    /// The key's meaning is our reading, not the spec's.
+    Own,
+}
+
 /// What happened to one key of the reference file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -338,6 +360,8 @@ pub enum Outcome {
         setting: String,
         /// When the setting takes effect.
         effect: Effect,
+        /// How the player read the key.
+        reading: Reading,
     },
     /// The key was not applied.
     NotApplied {
@@ -384,6 +408,24 @@ impl ImportReport {
             .filter(|entry| matches!(entry.outcome, Outcome::NotApplied { .. }))
     }
 
+    /// The keys the player read in its own way, not the spec's.
+    ///
+    /// The module docs name the two readings: the balance's side (S12
+    /// §3.2) and the classic gain scale (S07 §7). They are applied like any
+    /// other key, but the report names them, so the user sees that these
+    /// settings rest on our reading and not on a measurement.
+    pub fn own_readings(&self) -> impl Iterator<Item = &KeyOutcome> {
+        self.applied().filter(|entry| {
+            matches!(
+                entry.outcome,
+                Outcome::Applied {
+                    reading: Reading::Own,
+                    ..
+                }
+            )
+        })
+    }
+
     /// Whether the key `key` was applied.
     pub fn applied_key(&self, key: &str) -> bool {
         self.applied()
@@ -405,13 +447,23 @@ impl ImportReport {
         let mut lines = Vec::with_capacity(self.keys.len());
         for entry in &self.keys {
             let line = match &entry.outcome {
-                Outcome::Applied { setting, effect } => format!(
-                    "{}[{}] = {} -> {setting} ({})",
-                    entry.section,
-                    entry.key,
-                    entry.value,
-                    effect.description()
-                ),
+                Outcome::Applied {
+                    setting,
+                    effect,
+                    reading,
+                } => {
+                    let mut line = format!(
+                        "{}[{}] = {} -> {setting} ({})",
+                        entry.section,
+                        entry.key,
+                        entry.value,
+                        effect.description()
+                    );
+                    if *reading == Reading::Own {
+                        line.push_str("; our own reading, not the spec's");
+                    }
+                    line
+                }
                 Outcome::NotApplied { reason } => format!(
                     "{}[{}] = {} -> not applied: {reason}",
                     entry.section, entry.key, entry.value
@@ -482,6 +534,65 @@ impl std::fmt::Display for ImportError {
 }
 
 impl std::error::Error for ImportError {}
+
+/// What an import of a Winamp configuration did.
+///
+/// The preferences page shows this: the file it read and what it made of
+/// it. A cancelled import is not an outcome - nothing happened, so there is
+/// nothing to show.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportOutcome {
+    /// The file was read and its settings were taken over.
+    Imported {
+        /// The file that was read.
+        path: PathBuf,
+        /// What the import did with the file's keys.
+        report: ImportReport,
+    },
+    /// The file could not be read; the configuration stayed as it was.
+    Failed {
+        /// The error: it names the file that could not be read.
+        error: ImportError,
+    },
+}
+
+impl ImportOutcome {
+    /// The line the preferences page shows for this outcome.
+    ///
+    /// The line names the file and what the import did with it.
+    pub fn line(&self) -> String {
+        match self {
+            ImportOutcome::Imported { path, report } => report_line(path, report),
+            // The error names the file it could not read.
+            ImportOutcome::Failed { error } => format!("not imported: {error}"),
+        }
+    }
+}
+
+/// The line the preferences page shows after an import.
+///
+/// The line names the file, the settings that were taken over and the keys
+/// that could not be. It keeps the split the report makes: the keys the
+/// player read in its own way are named, so the user is never told that
+/// the reference's meaning was applied.
+pub fn report_line(path: &std::path::Path, report: &ImportReport) -> String {
+    let mut line = format!(
+        "{} — {} applied, {} not applied",
+        path.display(),
+        report.applied().count(),
+        report.not_applied().count()
+    );
+    let own = report.own_readings().count();
+    if own > 0 {
+        line.push_str(&format!(
+            " ({own} read in our own way, not the reference's)"
+        ));
+    }
+    if !report.problems.is_empty() {
+        line.push_str(&format!(", {} lines not read", report.problems.len()));
+    }
+    line
+}
 
 /// Reads the Winamp configuration at `path` and maps it onto `current`.
 ///
@@ -578,7 +689,10 @@ fn apply_key(
         "pan" => {
             if let Some(value) = int_value(&entry.value) {
                 config.audio.balance = value.clamp(-127, 127) as i8;
-                outcome = Some(applied("audio.balance", Effect::Now));
+                // Our reading: the file's balance key has an open range and
+                // an open direction (S12 §3.2), so the side is our
+                // convention and not a measurement.
+                outcome = Some(applied_own("audio.balance", Effect::Now));
             }
         }
         // ----- equalizer -----
@@ -597,7 +711,9 @@ fn apply_key(
         "preamp" => {
             if let Some(value) = int_value(&entry.value) {
                 config.eq.state.preamp = rustamp_ui::saved_to_gain_db(clamp_classic(value));
-                outcome = Some(applied("eq.state.preamp", Effect::Now));
+                // Our reading: the value is in the slider's own scale, and
+                // the conversion to dB is ours (S07 §7).
+                outcome = Some(applied_own("eq.state.preamp", Effect::Now));
             }
         }
         "eq_data" => {
@@ -610,7 +726,7 @@ fn apply_key(
                 for (band, value) in values.iter().enumerate() {
                     config.eq.state.bands[band] = rustamp_ui::saved_to_gain_db(*value);
                 }
-                outcome = Some(applied(
+                outcome = Some(applied_own(
                     &format!("eq.state.bands[0..{}]", values.len()),
                     Effect::Now,
                 ));
@@ -911,11 +1027,24 @@ fn apply_key(
     })
 }
 
-/// The outcome of an applied key.
+/// The outcome of an applied key, read the way the spec states it.
 fn applied(setting: &str, effect: Effect) -> Outcome {
     Outcome::Applied {
         setting: setting.to_string(),
         effect,
+        reading: Reading::Spec,
+    }
+}
+
+/// The outcome of an applied key whose meaning is **our** reading.
+///
+/// The two such keys are named in the module docs: the balance's side
+/// (S12 §3.2) and the classic gain scale (S07 §7).
+fn applied_own(setting: &str, effect: Effect) -> Outcome {
+    Outcome::Applied {
+        setting: setting.to_string(),
+        effect,
+        reading: Reading::Own,
     }
 }
 
@@ -1331,5 +1460,73 @@ mod tests {
             "{}",
             plan.report.summary()
         );
+    }
+
+    /// The keys the player reads in its own way are named, so the user is
+    /// not told that the reference's meaning was applied (see the module
+    /// docs).
+    #[test]
+    fn the_keys_we_read_in_our_own_way_are_named() {
+        let plan = plan(
+            "[Winamp]\npan=-40\npreamp=63\neq_data=31\nvolume=200\n",
+            &Config::default(),
+            None,
+            &no_skin,
+        );
+        let own: Vec<&str> = plan
+            .report
+            .own_readings()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(own, ["pan", "preamp", "eq_data"]);
+        // The line of such a key says so.
+        let lines = plan.report.lines();
+        let balance = lines
+            .iter()
+            .find(|line| line.contains("audio.balance"))
+            .expect("the balance's line");
+        assert!(balance.contains("our own reading"), "{balance}");
+        // A key read the way the spec states it is not marked.
+        let volume = lines
+            .iter()
+            .find(|line| line.contains("audio.volume"))
+            .expect("the volume's line");
+        assert!(!volume.contains("our own reading"), "{volume}");
+    }
+
+    /// A key that could not be read is not one of our own readings: the
+    /// split only counts what was applied.
+    #[test]
+    fn a_key_that_could_not_be_read_is_not_one_of_our_own_readings() {
+        let plan = plan("[Winamp]\npan=loud\n", &Config::default(), None, &no_skin);
+        assert_eq!(plan.report.own_readings().count(), 0);
+        assert_eq!(plan.report.not_applied().count(), 1);
+    }
+
+    /// The line the preferences page shows names the file, the settings that
+    /// were taken over and the keys that could not be.
+    #[test]
+    fn the_report_line_names_the_file_and_the_counts() {
+        let plan = plan(
+            "[Winamp]\nvolume=200\npan=-40\noutname=out_wave.dll\n",
+            &Config::default(),
+            None,
+            &no_skin,
+        );
+        let line = report_line(std::path::Path::new(r"C:\winamp.ini"), &plan.report);
+        // The file, the two counts and the honest split: the balance is
+        // read in our own way, not the reference's.
+        assert_eq!(
+            line,
+            r"C:\winamp.ini — 2 applied, 1 not applied (1 read in our own way, not the reference's)"
+        );
+    }
+
+    /// A file without a key of our own reading says nothing about one.
+    #[test]
+    fn the_report_line_stays_short_without_a_key_of_our_own_reading() {
+        let plan = plan("[Winamp]\nvolume=200\n", &Config::default(), None, &no_skin);
+        let line = report_line(std::path::Path::new(r"C:\winamp.ini"), &plan.report);
+        assert_eq!(line, r"C:\winamp.ini — 1 applied, 0 not applied");
     }
 }

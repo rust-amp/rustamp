@@ -1623,7 +1623,8 @@ impl Windowed {
     ///
     /// The user picks the `winamp.ini` the reference player wrote, and the
     /// import reads it: the file is never written to. What the import could
-    /// not honour is printed, so the user sees what was left out.
+    /// not honour is printed, so the user sees what was left out, and the
+    /// preferences page shows the report of the import.
     ///
     /// The dialog runs its own modal message loop, so it is opened from the
     /// tick and never from a window procedure (the rule the tray popup
@@ -1634,29 +1635,43 @@ impl Windowed {
         }
         #[cfg(windows)]
         {
-            let owner = self.raw_main_window();
-            match rustamp_platform::pick_winamp_ini_file(owner, "Import Winamp configuration") {
-                Ok(None) => {} // User cancelled
-                Ok(Some(path)) => {
-                    match self.app.import_winamp_ini(&path) {
-                        Ok(report) => {
-                            println!(
-                                "rustamp: imported {} ({})",
-                                path.display(),
-                                report.summary()
-                            );
-                            for line in report.lines() {
-                                println!("rustamp: {line}");
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!("rustamp: the Winamp configuration was not imported: {error}")
-                        }
-                    }
-                    self.request_redraw();
+            // The preferences dialog owns the file dialog when it is open:
+            // the file dialog then opens in front of the page the user came
+            // from, and not behind it.
+            let owner = self
+                .prefs_window
+                .as_ref()
+                .filter(|window| window.is_open())
+                .map(|window| window.raw_handle())
+                .unwrap_or_else(|| self.raw_main_window());
+            let picked = match rustamp_platform::pick_winamp_ini_file(
+                owner,
+                "Import Winamp configuration",
+            ) {
+                Ok(picked) => picked,
+                Err(error) => {
+                    eprintln!("rustamp: no file dialog: {error}");
+                    return;
                 }
-                Err(error) => eprintln!("rustamp: no file dialog: {error}"),
+            };
+            match self.app.finish_winamp_ini_import(picked.as_deref()) {
+                // The user closed the dialog: nothing was imported.
+                None => {}
+                Some(crate::winamp_ini::ImportOutcome::Imported { path, report }) => {
+                    println!(
+                        "rustamp: imported {} ({})",
+                        path.display(),
+                        report.summary()
+                    );
+                    for line in report.lines() {
+                        println!("rustamp: {line}");
+                    }
+                }
+                Some(crate::winamp_ini::ImportOutcome::Failed { error }) => {
+                    eprintln!("rustamp: the Winamp configuration was not imported: {error}")
+                }
             }
+            self.request_redraw();
         }
         #[cfg(not(windows))]
         eprintln!("rustamp: a native file dialog is only implemented on Windows");
