@@ -1781,6 +1781,7 @@ dependencies = [
  "tempfile",
  "toml",
  "winit",
+ "zip",
 ]
 
 [[package]]

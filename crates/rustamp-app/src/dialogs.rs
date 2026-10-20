@@ -51,10 +51,10 @@
 //!   plain own choices. The `play` flag rides through untouched (RFC 0005
 //!   O5: the playlist ADD path's `false` is unmeasured).
 //! * Skin browser: the skins the app can load today (the built-in default,
-//!   plus the current skin when it came from disk), with the selected row
-//!   marked. `Enter` loads the selected skin through the existing skin path
-//!   (`Command::LoadSkin` for a file row, the built-in loader otherwise) and
-//!   closes the dialog.
+//!   the skins of the folder beside the configuration and the current skin
+//!   when it is not one of them), with the selected row marked. `Enter` loads
+//!   the selected skin through the existing skin path (`Command::LoadSkin` for
+//!   a file row, the built-in loader otherwise) and closes the dialog.
 //! * Preferences: the frame shows the requested page's own-choice name
 //!   (`rustamp-prefs`) and nothing else — the reference's page contents are
 //!   unmeasured (S04 open), so there are no controls to draw, type into or
@@ -538,9 +538,14 @@ impl App {
     pub fn prefs_settings(&self) -> PrefsSettings {
         let entries = self.browser_entries();
         let current = self.current_skin();
-        let skin_selected = entries
-            .iter()
-            .position(|entry| entry.path.as_ref() == current);
+        let skin_selected = entries.iter().position(|entry| {
+            match (entry.path.as_deref(), current) {
+                // The built-in row is the skin in use when no skin was loaded.
+                (None, None) => true,
+                (Some(path), Some(current)) => crate::skin_folder::same_path(path, current),
+                _ => false,
+            }
+        });
         PrefsSettings {
             always_on_top: self.always_on_top(),
             easy_move: self.easy_move(),
@@ -820,10 +825,38 @@ impl App {
         ]
     }
 
-    /// The skin browser's rows from live app state (see
-    /// [`skin_entries`](rustamp_ui::skin_entries)).
+    /// The skin browser's rows from live app state: the built-in default
+    /// first, then the skins of the folder beside the configuration, then the
+    /// skin in use when it is not one of them.
+    ///
+    /// The folder is read when the list is asked for and kept until the
+    /// folder changes (see [`crate::skin_folder`]), so the list is not read
+    /// again for every frame.
     pub(crate) fn browser_entries(&self) -> Vec<SkinEntry> {
-        skin_entries(self.current_skin().map(PathBuf::as_path))
+        let dir = crate::skin_folder::skins_dir(self.config_path());
+        let mut folder = self.skin_folder.borrow_mut();
+        let skins = folder.skins(dir.as_deref());
+        // The built-in row comes from the UI's own list, so its name lives in
+        // one place; the folder's skins follow it.
+        let mut entries = skin_entries(None);
+        entries.extend(skins.iter().map(|path| SkinEntry {
+            // The full path, so two skins with the same file name stay
+            // distinct.
+            name: path.display().to_string(),
+            path: Some(path.clone()),
+        }));
+        // The skin in use is listed too, unless the folder already lists it.
+        if let Some(current) = self.current_skin()
+            && !skins
+                .iter()
+                .any(|skin| crate::skin_folder::same_path(skin, current))
+        {
+            entries.push(SkinEntry {
+                name: current.display().to_string(),
+                path: Some(current.clone()),
+            });
+        }
+        entries
     }
 
     /// The skin browser's body lines: one row per entry, with the selected
