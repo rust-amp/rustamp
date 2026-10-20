@@ -52,7 +52,10 @@
 //!   but flat equalizer is also bit-transparent once it has settled.
 //! * **Toggling does not click.** `enabled` drives a wet/dry mix that ramps
 //!   linearly over [`FADE_SECONDS`]; the output is `dry + mix * (wet - dry)`, so
-//!   switching on or off is a short crossfade instead of a step. Switching on
+//!   switching on or off is a short crossfade instead of a step. The crossfade
+//!   covers exactly `FADE_SECONDS * rate` frames: its first frame carries the
+//!   old mix and its last one the new mix, both exactly, so an interrupted
+//!   crossfade continues from the mix the stage sits at. Switching on
 //!   from a full bypass clears the filter history first, and the start-up
 //!   transient of the filters is inside the fade.
 //! * **Parameter changes do not click.** Band and preamp targets are approached
@@ -67,6 +70,13 @@
 //!   once NaN enters, because every comparison against NaN is false) and
 //!   poison every later frame. The decode thread already replaces non-finite
 //!   samples before the chain; this is defense in depth for any other caller.
+//! * **The output stays finite.** A boost may push a sample past full scale
+//!   — the stage does not clip — but never past what an `f32` can hold: the
+//!   result is clamped to the largest finite `f32` instead of becoming an
+//!   infinity, and the wet/dry mix is computed in `f64`, where the two ends
+//!   of the `f32` range cannot cancel each other into a `NaN`. The audio
+//!   domain is `|x| <= 1`, so this only ever bites on absurd input, but an
+//!   infinity that leaves the stage would poison everything behind it.
 //! * **Subnormals pass through.** They are finite, so they cannot poison the
 //!   history; subnormal *history* is flushed to zero instead
 //!   ([`Biquad::flush_tiny`], −4000 dBFS threshold). The resampled path
@@ -186,6 +196,20 @@ fn sanitize_db(db: f32) -> f32 {
     }
 }
 
+/// The largest finite `f32`, as an `f64`.
+const F32_MAX: f64 = f32::MAX as f64;
+
+/// Bring a value into the finite `f32` range.
+///
+/// A cast of an out-of-range value produces an infinity, and an infinity
+/// that travels through the chain becomes a `NaN` in the arithmetic that
+/// follows it. A boost may push a sample past full scale — the stage does
+/// not clip — but never past what an `f32` can hold.
+#[inline]
+fn to_f32(value: f64) -> f32 {
+    value.clamp(-F32_MAX, F32_MAX) as f32
+}
+
 fn db_to_linear(db: f32) -> f64 {
     10.0_f64.powf(f64::from(db) / 20.0)
 }
@@ -290,7 +314,14 @@ pub struct Equalizer {
     enabled: bool,
     /// Wet/dry mix, `0.0` = bypass, `1.0` = fully equalized.
     mix: f32,
-    mix_step: f32,
+    /// The mix the running crossfade started from.
+    mix_from: f32,
+    /// The mix the running crossfade heads for.
+    mix_to: f32,
+    /// Frames the running crossfade has run.
+    mix_pos: u32,
+    /// Frames the running crossfade covers.
+    mix_span: u32,
     slew_db: f32,
     /// Frame index inside the current sub-block.
     sub_pos: usize,
@@ -326,12 +357,17 @@ impl Equalizer {
             history: Vec::new(),
             enabled: false,
             mix: 0.0,
-            mix_step: 1.0,
+            mix_from: 0.0,
+            mix_to: 0.0,
+            mix_pos: 0,
+            mix_span: 1,
             slew_db: 2.0 * EqState::MAX_GAIN_DB,
             sub_pos: 0,
         };
         eq.load_control();
         eq.mix = if eq.enabled { 1.0 } else { 0.0 };
+        eq.mix_from = eq.mix;
+        eq.mix_to = eq.mix;
         eq.snap();
         eq
     }
@@ -360,6 +396,42 @@ impl Equalizer {
             // straight to the targets and start any fade-in from clean history.
             self.snap();
         }
+        // The on/off switch drives the crossfade. A switch starts a new
+        // ramp from the mix the stage sits at now, so an interrupted
+        // crossfade never jumps.
+        let target = if self.enabled { 1.0 } else { 0.0 };
+        if target != self.mix_to {
+            self.start_crossfade(target);
+        }
+    }
+
+    /// Start a crossfade from the current mix to `target`.
+    fn start_crossfade(&mut self, target: f32) {
+        self.mix_from = self.mix;
+        self.mix_to = target;
+        self.mix_pos = 0;
+    }
+
+    /// The mix of the next frame, advancing the running crossfade.
+    ///
+    /// The ramp covers `mix_span` frames: the first one carries the mix the
+    /// crossfade started from, the last one the target, exactly.
+    fn next_mix(&mut self) -> f32 {
+        if self.mix_pos >= self.mix_span {
+            // The crossfade is over: the mix rests at its target.
+            self.mix = self.mix_to;
+            return self.mix;
+        }
+        let mix = if self.mix_pos + 1 == self.mix_span {
+            // The last frame of the crossfade takes the target exactly.
+            self.mix_to
+        } else {
+            let t = self.mix_pos as f32 / (self.mix_span - 1).max(1) as f32;
+            self.mix_from + (self.mix_to - self.mix_from) * t
+        };
+        self.mix_pos += 1;
+        self.mix = mix;
+        mix
     }
 
     /// Jump every smoothed value to its target and clear the history.
@@ -433,11 +505,14 @@ impl DspStage for Equalizer {
         self.channels = usize::from(spec.channels);
         self.history = vec![[Biquad::default(); EQ_BANDS]; self.channels];
         let fade_frames = (FADE_SECONDS * self.sample_rate).max(1.0);
-        self.mix_step = (1.0 / fade_frames) as f32;
+        self.mix_span = fade_frames as u32;
         let sub_blocks = (SLEW_SECONDS * self.sample_rate / SUB_BLOCK as f64).max(1.0);
         self.slew_db = (2.0 * f64::from(EqState::MAX_GAIN_DB) / sub_blocks) as f32;
         self.load_control();
         self.mix = if self.enabled { 1.0 } else { 0.0 };
+        self.mix_from = self.mix;
+        self.mix_to = self.mix;
+        self.mix_pos = 0;
         // The band activity depends on the sample rate: recompute everything.
         self.active = [false; EQ_BANDS];
         self.snap();
@@ -461,7 +536,7 @@ impl DspStage for Equalizer {
             let t = self.sub_pos as f64 / SUB_BLOCK as f64;
             let preamp = self.pre_from + (self.pre_to - self.pre_from) * t;
             self.sub_pos = (self.sub_pos + 1) % SUB_BLOCK;
-            let mix = self.mix;
+            let mix = self.next_mix();
             for (sample, history) in frame.iter_mut().zip(self.history.iter_mut()) {
                 // Hostile input becomes silence here; subnormals and DC pass
                 // through (see the module docs). Full bypass above stays
@@ -478,19 +553,20 @@ impl DspStage for Equalizer {
                         y = section.tick(coefs, y);
                     }
                 }
-                let wet = y as f32;
-                *sample = if mix >= 1.0 {
-                    wet
+                // The wet/dry mix is computed in `f64`: in `f32` the two
+                // ends of the range would cancel each other into an
+                // infinity, and the result is clamped into the finite range
+                // so that no infinity leaves the stage. The dry end of the
+                // mix is the dry signal itself, bit for bit.
+                let out = if mix >= 1.0 {
+                    y
+                } else if mix <= 0.0 {
+                    f64::from(dry)
                 } else {
-                    dry + (wet - dry) * mix
+                    let dry = f64::from(dry);
+                    dry + (y - dry) * f64::from(mix)
                 };
-            }
-            if self.enabled {
-                if self.mix < 1.0 {
-                    self.mix = (self.mix + self.mix_step).min(1.0);
-                }
-            } else if self.mix > 0.0 {
-                self.mix = (self.mix - self.mix_step).max(0.0);
+                *sample = to_f32(out);
             }
         }
         Ok(())
@@ -499,6 +575,9 @@ impl DspStage for Equalizer {
     fn reset(&mut self) {
         self.poll_control();
         self.mix = if self.enabled { 1.0 } else { 0.0 };
+        self.mix_from = self.mix;
+        self.mix_to = self.mix;
+        self.mix_pos = 0;
         self.snap();
     }
 }
