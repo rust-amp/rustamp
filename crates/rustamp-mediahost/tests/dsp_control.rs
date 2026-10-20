@@ -717,6 +717,14 @@ fn bounded_dsp_read_timeout_is_not_eos_and_retry_delivers_pcm() {
         session.read(&mut out, Some(Duration::from_millis(10))),
         Err(MediaHostError::TimedOut)
     ));
+    // The timeout was honest: the back-ring held nothing, so the wait was not
+    // a skipped wake on processed frames the ring already had (see
+    // `RingCounters`).
+    assert_eq!(
+        session.back_ring_counters().available(),
+        0,
+        "a timed-out read must not have waited on data the ring already held"
+    );
     write_pcm(
         &mut session,
         &[0.25, -0.5],

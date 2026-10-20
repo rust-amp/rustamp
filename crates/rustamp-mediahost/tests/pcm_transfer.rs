@@ -555,6 +555,13 @@ fn bounded_read_timeout_is_not_eos_and_retry_delivers_pcm() {
         session.read(&mut out, Some(Duration::from_millis(20))),
         Err(MediaHostError::TimedOut)
     ));
+    // The timeout was honest: the ring held nothing, so the wait was not a
+    // skipped wake on data the ring already had (see `RingCounters`).
+    assert_eq!(
+        session.ring_counters().available(),
+        0,
+        "a timed-out read must not have waited on data the ring already held"
+    );
     release.send(()).unwrap();
     assert_eq!(
         read_pcm(
@@ -653,6 +660,83 @@ fn format_boundary_statistics_arrive_before_format_changed_is_returned() {
     finish(session, done);
 }
 
+/// A resident that refuses a URL the way the shipped registry resident does:
+/// network streaming is not implemented, and the refusal names the URL
+/// instead of falling back to a file or to silence.
+struct UrlRefusingResident;
+
+impl DecoderResident for UrlRefusingResident {
+    fn open(&self, location: MediaLocationWire) -> Result<Box<dyn ResidentDecoder>> {
+        match location {
+            MediaLocationWire::Url(url) => Err(MediaHostError::OperationFailed(format!(
+                "URL decoding is not supported yet (M4): {url}"
+            ))),
+            MediaLocationWire::File(path) => Err(MediaHostError::OperationFailed(format!(
+                "this fixture opens no file: {path}"
+            ))),
+        }
+    }
+}
+
+/// A session asked for a URL must be refused loudly: the resident's refusal
+/// becomes a terminal diagnostic, the session fails with a typed error that
+/// names the reason *and* the URL, the host ends with an error instead of a
+/// clean exit, and no ring is left behind.
+///
+/// Which locations a resident may open is the resident's business — the
+/// shipped registry resident refuses URLs (`rustamp-dechost`). What the
+/// framework owes is that such a refusal reaches the session as a loud,
+/// typed error: never a silent failure, never a panic, never a hang.
+#[test]
+fn a_refused_url_location_is_a_loud_typed_error_and_leaves_no_ring() {
+    let ((ar, aw), (br, bw)) = streams();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
+    let rings = TestRings::default();
+    let host_rings = rings.clone();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(serve_decoder(&host, &host_rings, &UrlRefusingResident));
+    });
+    let url = "https://example.invalid/stream.mp3";
+    let error = DecoderSession::open(client, rings.clone(), MediaLocationWire::Url(url.into()), 1)
+        .err()
+        .expect("a refused URL must fail the session");
+    // Typed and loud: the framework's terminal diagnostic, not a plain
+    // "invalid message" and not an end of stream.
+    let MediaHostError::Disconnected(reason) = &error else {
+        panic!("a refused URL must be a loud, typed error: {error}");
+    };
+    assert!(
+        reason.contains("resident decoder failed"),
+        "the refusal must reach the session as a terminal diagnostic: {error}"
+    );
+    assert!(
+        reason.contains("URL decoding is not supported yet (M4)"),
+        "the refusal must say why: {error}"
+    );
+    assert!(
+        reason.contains(url),
+        "the refusal must name the URL it refused: {error}"
+    );
+    // The host ends with the refusal, not with a clean exit, and it does not
+    // spin: it publishes its outcome. A panic in the host would leave this
+    // wait on the stall escape instead.
+    let outcome = result
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the refused host must publish its outcome instead of hanging");
+    assert!(
+        outcome.is_err(),
+        "a refused URL must end the host with an error, not with a clean exit"
+    );
+    // The refusal happens before any ring exists: nothing is left behind.
+    assert_eq!(
+        rings.0.lock().unwrap().len(),
+        0,
+        "a refused location must not leave a ring behind"
+    );
+}
+
 #[test]
 fn decoder_error_is_loud_and_never_eos() {
     let (mut session, done, _) = start("fixture:fail", 3);
@@ -730,6 +814,20 @@ fn abrupt_player_loss_wakes_a_full_ring_decoder_writer() {
         .expect("stall: the host must publish its terminal outcome instead of hanging");
     assert!(matches!(outcome, Err(MediaHostError::Disconnected(_))));
     assert!(input.consumer.is_closed(), "EOF must abort the full ring");
+    // The accounting survives the loss: the frame the host published is still
+    // there, the host published nothing past the loss (it was blocked on the
+    // full ring and the ring was closed under it), and the blocking write
+    // dropped nothing.
+    assert_eq!(
+        input.consumer.frames_published(),
+        1,
+        "the host must not publish past the loss"
+    );
+    assert_eq!(
+        input.consumer.frames_dropped(),
+        0,
+        "a lost player must not turn into a dropped frame"
+    );
 }
 
 #[test]
