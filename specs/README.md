@@ -11,18 +11,18 @@ Specs reach this directory only after the Spec Auditor has signed off. Each file
 | S01 | Window geometry, sprite rects and pixel layout deltas | audited |
 | S02 | Main window behaviors (clutterbar, title marquee, time display, kbps/kHz, mono/stereo, button states) | audited |
 | S03 | Keyboard and mouse shortcut table, per window | audited |
-| S04 | Menu trees (main, right-click, playlist buttons, EQ presets) | not started |
-| S05 | Docking and snapping rules | not started |
-| S06 | Playlist editor (selection, drag-reorder, scrolling, search, resize steps) | not started |
-| S07 | Equalizer (band centers, filter design, slider-to-dB mapping, preamp, `.eqf` formats) | not started |
+| S04 | Menu trees (main, right-click, playlist buttons, EQ presets) | audited |
+| S05 | Docking and snapping rules | audited |
+| S06 | Playlist editor (selection, drag-reorder, scrolling, search, resize steps) | audited |
+| S07 | Equalizer (band centers, filter design, slider-to-dB mapping, preamp, `.eqf` formats) | audited |
 | S08 | Classic visualization (spectrum, oscilloscope, 576-sample data for plugins) | audited |
 | S09 | Plugin ABI (in_/out_/vis_/dsp_/gen_ structs, versions, threading, call order) | audited – static; runtime confirmation pending |
-| S10 | `WM_WA_IPC` and `WM_COMMAND` catalog | not started |
+| S10 | `WM_WA_IPC` and `WM_COMMAND` catalog | revised draft, pending ratification |
 | S11 | Embed-window API and `gen.bmp` layout | audited |
 | S12 | winamp.ini keys and plugin.ini conventions | audited |
 | S13 | Command-line switches, single instance, drag-and-drop rules | audited |
 | S14 | Title formatting | audited |
-| S15 | Shuffle algorithm | not started |
+| S15 | Shuffle algorithm | audited |
 | S16 | Preferences pages and options | not started |
 | S17 | Skin-loading quirks (missing files, palette and BMP quirks, nums_ex fallback, pledit.txt, region.txt) | audited |
 | S18 | Output behaviors (fades, buffer, prebuffer) | audited |
