@@ -81,8 +81,12 @@ pub struct AppOptions {
     pub output: OutputChoice,
     /// Initial volume `0..=255`.
     pub volume: u8,
-    /// The file to queue and play, if any.
-    pub file: Option<PathBuf>,
+    /// The media to queue and play, if any: a file path or an `http://` URL.
+    ///
+    /// A file replaces the queue and starts playing (S02 §1); a URL is a
+    /// stream (S19), and it becomes the same kind of queue entry — a
+    /// `TrackSource::Url` — a playlist's URL produces.
+    pub media: Option<MediaLocation>,
     /// Stop after this many seconds (test aid).
     pub seconds: Option<u64>,
 }
@@ -441,10 +445,17 @@ impl App {
         // itself, and the button follows the engine (see `App::state`).
         engine.set_shuffle(options.config.playlist.shuffle)?;
         engine.set_repeat(options.config.playlist.repeat)?;
-        if let Some(file) = &options.file
-            && !is_playlist_file(file)
-        {
-            engine.set_queue(vec![TrackSource::path(file.clone())]);
+        // The media the command line named. A file replaces the queue and
+        // starts playing (S02 §1); a URL is a stream track (S19) — the same
+        // kind of queue entry a playlist's URL produces.
+        match &options.media {
+            Some(MediaLocation::File(path)) if !is_playlist_file(path) => {
+                engine.set_queue(vec![TrackSource::path(path.clone())]);
+            }
+            Some(MediaLocation::Url(url)) => {
+                engine.set_queue(vec![TrackSource::Url(url.clone())]);
+            }
+            _ => {}
         }
 
         let main_layout = options
@@ -594,7 +605,7 @@ impl App {
         app.install_dsp_chain(crate::dsp::DspChain::default());
         // The engine's snapshot is the authoritative starting state.
         app.sync_entry_ids();
-        if let Some(file) = &options.file
+        if let Some(MediaLocation::File(file)) = &options.media
             && is_playlist_file(file)
         {
             let _ = app.load_playlist_file(file, false);
@@ -3602,7 +3613,7 @@ mod tests {
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume: 200,
-            file: path,
+            media: path.map(MediaLocation::File),
             seconds: None,
         };
         (App::with_registry(options, registry()).unwrap(), dir)
@@ -3621,7 +3632,7 @@ mod tests {
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume: 200,
-            file,
+            media: file.map(MediaLocation::File),
             seconds: None,
         };
         let mut app = App::with_registry(options, registry()).unwrap();
@@ -5697,8 +5708,9 @@ mod tests {
 
     #[test]
     fn confirming_the_location_dialog_adds_the_typed_url() {
-        // The URL arrives through the entry field (typing cannot produce
-        // punctuation yet, so the test sets the full text programmatically).
+        // The URL arrives through the entry field (the `Key` model has no
+        // punctuation, so the test sets the full text programmatically; the
+        // window delivers the OS text of the key presses instead).
         use rustamp_core::command::OpenMediaKind;
         use rustamp_ui::DialogKind;
 
@@ -5713,10 +5725,117 @@ mod tests {
             play: true,
         }));
         let before = app.engine().queue().len();
-        app.set_media_text("http://example.com/stream.mp3");
+        app.set_media_text("http://127.0.0.1/stream.mp3");
         assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
         assert_eq!(app.engine().queue().len(), before + 1);
+    }
+
+    #[test]
+    fn the_open_location_chord_opens_the_location_dialog() {
+        // S03 §1: `Ctrl+L` is the "open location" command (id 40185); the
+        // menu row that runs the same command opens the same face. The
+        // chord reaches the dialog through the usual command path.
+        use rustamp_core::command::OpenMediaKind;
+        use rustamp_ui::{DialogKind, ShortcutOutcome};
+
+        let (mut app, _dir) = app_with_file(None);
+        let outcome = app
+            .ui_mut()
+            .key_down(Key::Letter(b'L'), Modifiers::CTRL, 0)
+            .expect("Ctrl+L is bound");
+        let ShortcutOutcome::Commands(commands) = outcome else {
+            panic!("Ctrl+L must emit a command");
+        };
+        assert_eq!(
+            commands,
+            vec![Command::OpenMedia {
+                kind: OpenMediaKind::Location,
+                play: true,
+            }]
+        );
+        for command in commands {
+            app.submit(command).unwrap();
+        }
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: true,
+        }));
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn the_typed_url_reaches_the_queue_as_a_url_track() {
+        // The location face's field becomes a `MediaLocation::Url`, and the
+        // queue holds the stream track — the same kind of entry
+        // (`TrackSource::Url`) a playlist's URL produces. The face is opened
+        // with `play: false`, so the test never opens a socket.
+        use rustamp_core::command::OpenMediaKind;
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        })
+        .unwrap();
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+        // The text arrives the way the window delivers it: the OS text of
+        // the key presses, punctuation included.
+        assert!(app.dialog_text("http://127.0.0.1/stream.mp3"));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+        assert_eq!(app.dialog_open_kind(), None);
+        assert_eq!(
+            app.engine().queue(),
+            &[TrackSource::Url("http://127.0.0.1/stream.mp3".to_owned())]
+        );
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn cancelling_the_location_dialog_changes_nothing() {
+        // `Escape` closes the face and drops the typed URL, so the queue
+        // stays as it was.
+        use rustamp_core::command::OpenMediaKind;
+        use rustamp_ui::DialogKind;
+
+        let (mut app, _dir) = app_with_file(None);
+        app.submit(Command::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        })
+        .unwrap();
+        app.dialog_text("http://127.0.0.1/stream.mp3");
+        assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
+        assert_eq!(app.dialog_open_kind(), None);
+        assert!(!app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+        assert!(app.engine().queue().is_empty());
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn a_url_media_becomes_a_url_track_in_the_queue() {
+        // The command line's URL is the queue entry a playlist's URL
+        // produces: a `TrackSource::Url`.
+        let options = AppOptions {
+            config: Config::default(),
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            media: Some(MediaLocation::Url("http://127.0.0.1/stream.mp3".to_owned())),
+            seconds: None,
+        };
+        let app = App::with_registry(options, registry()).unwrap();
+        assert_eq!(
+            app.engine().queue(),
+            &[TrackSource::Url("http://127.0.0.1/stream.mp3".to_owned())]
+        );
     }
 
     #[test]
@@ -7652,7 +7771,7 @@ mod tests {
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume: 200,
-            file: Some(missing),
+            media: Some(MediaLocation::File(missing)),
             seconds: None,
         };
         let mut app = App::new(options).unwrap();

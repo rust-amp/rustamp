@@ -324,7 +324,7 @@ mod tests {
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume: 200,
-            file: None,
+            media: None,
             seconds: None,
         };
         App::with_registry(options, DecoderRegistry::new()).unwrap()
@@ -412,6 +412,32 @@ mod tests {
             }])
         );
         assert!(app.dialog_is_open(rustamp_ui::DialogKind::Jump(JumpTarget::File)));
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn the_open_location_menu_row_opens_the_location_dialog() {
+        // The `Open location` row of the `Play` submenu runs the S03 §1 id
+        // 40185 command. S04 §2 leaves the submenu's rows unmeasured, so
+        // the row's label is our own choice; the command it runs is not.
+        // The row opens the location face of the open-media dialog — the
+        // face a URL is typed into.
+        use rustamp_core::command::OpenMediaKind;
+        let mut app = test_app();
+        let outcome = app
+            .activate_menu_item("Open location", ShortcutAction::OpenLocation)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            MenuOutcome::Commands(vec![Command::OpenMedia {
+                kind: OpenMediaKind::Location,
+                play: true,
+            }])
+        );
+        assert!(app.dialog_is_open(rustamp_ui::DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: true,
+        }));
         assert!(app.drain_notes().is_empty());
     }
 
@@ -514,7 +540,7 @@ mod clutter_tests {
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume: 200,
-            file: None,
+            media: None,
             seconds: None,
         };
         App::with_registry(options, DecoderRegistry::new()).unwrap()

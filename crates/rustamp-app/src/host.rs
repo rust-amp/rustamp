@@ -847,7 +847,7 @@ mod tests {
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume,
-            file: None,
+            media: None,
             seconds: None,
         };
         App::new(options).expect("headless app builds without media")

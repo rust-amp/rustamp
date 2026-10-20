@@ -187,13 +187,13 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut added: Vec<MediaLocation> = Vec::new();
     let mut bookmarked = false;
     match &args.bookmark {
-        Some(cli::Bookmark::Path(path)) => {
-            added.push(MediaLocation::File(path.clone()));
+        Some(cli::Bookmark::Location(location)) => {
+            added.push(location.clone());
             bookmarked = true;
             eprintln!(
                 "rustamp: the bookmark store does not exist yet (RFC 0005 O12): {} was added to \
                  the playlist instead",
-                path.display()
+                location.to_display_string()
             );
         }
         Some(cli::Bookmark::WithoutPath) => eprintln!(
@@ -201,14 +201,14 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         ),
         None => {}
     }
-    // The enqueued path (S13 §1): `/ADD <path>` names its own path and
-    // `--enqueue` names the file argument. The path is **added** to the
+    // The enqueued media (S13 §1): `/ADD <path>` names its own media and
+    // `--enqueue` names the media argument. The media is **added** to the
     // playlist and not played — the `Enqueue` shell verb is registered with
     // `/ADD`, so the verb and the switch ask for the same thing.
     let enqueued = match &args.enqueue {
         cli::Enqueue::None => None,
-        cli::Enqueue::File => args.file.clone(),
-        cli::Enqueue::Path(path) => Some(path.clone()),
+        cli::Enqueue::Argument => args.media.clone(),
+        cli::Enqueue::Location(location) => Some(location.clone()),
         cli::Enqueue::WithoutPath => {
             eprintln!(
                 "rustamp: /ADD without a path is not defined (S13 §5.3); nothing was enqueued"
@@ -216,15 +216,15 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    if let Some(path) = &enqueued {
-        added.push(MediaLocation::File(path.clone()));
+    if let Some(location) = &enqueued {
+        added.push(location.clone());
         eprintln!(
             "rustamp: {} was added to the playlist instead of being played",
-            path.display()
+            location.to_display_string()
         );
     }
-    // The file plays unless it is the one that is only added.
-    let plays = args.file.is_some() && !matches!(args.enqueue, cli::Enqueue::File);
+    // The media plays unless it is the one that is only added.
+    let plays = args.media.is_some() && !matches!(args.enqueue, cli::Enqueue::Argument);
 
     // ----- configuration -----
     // `/CONFIG=` replaces the default path (S13 §1).
@@ -262,9 +262,9 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         skin: loaded_skin,
         output: args.output,
         volume,
-        // A file that is only added must not replace the queue, so it is not
-        // handed to the app as the file to play.
-        file: if plays { args.file.clone() } else { None },
+        // A media that is only added must not replace the queue, so it is not
+        // handed to the app as the media to play.
+        media: if plays { args.media.clone() } else { None },
         seconds: args.seconds,
     };
     // The device is built here, on the thread that calls `window::run` below.

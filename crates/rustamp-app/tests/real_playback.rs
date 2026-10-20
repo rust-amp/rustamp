@@ -47,6 +47,7 @@ use rustamp_app::app::{App, AppOptions};
 use rustamp_app::cli::OutputChoice;
 use rustamp_core::command::Command;
 use rustamp_core::config::Config;
+use rustamp_core::playlist::MediaLocation;
 use rustamp_core::state::TransportState;
 
 // The shared test-VM gate lives in `rustamp_app::window::require_test_vm`:
@@ -94,7 +95,7 @@ fn the_real_device_plays_a_reference_file_to_its_end() {
         skin: rustamp_app::skin::builtin(),
         output: OutputChoice::Default,
         volume: 200,
-        file: Some(fixture.clone()),
+        media: Some(MediaLocation::File(fixture.clone())),
         seconds: None,
     };
     let mut app = match App::new(options) {

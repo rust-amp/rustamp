@@ -292,7 +292,7 @@ preset = "Rock"
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume: 200,
-            file: None,
+            media: None,
             seconds: None,
         };
         App::with_registry(options, DecoderRegistry::new()).unwrap()

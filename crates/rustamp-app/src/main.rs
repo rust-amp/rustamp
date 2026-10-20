@@ -6,7 +6,7 @@
 //! routes commands and events between the headless UI machine and the engine.
 //!
 //! ```text
-//! rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
+//! rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
 //!        [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
 //!        [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 //! ```
@@ -16,6 +16,9 @@
 //! with `--no-audio` it uses the same null output but still opens the main
 //! window (silent windowed playback, no audio device needed); with the default
 //! output it opens the main window and plays on the best device for the host.
+//!
+//! An argument that names an `http://` URL is streamed (S19); another scheme
+//! is refused by name, because this build has no TLS.
 //!
 //! # The registration step (S13 §1)
 //!
@@ -194,11 +197,11 @@ fn forward_request(args: &cli::Args) -> ForwardRequest {
             "--seconds is ignored: it is a start-up test aid on the running instance".to_owned(),
         );
     }
-    // The bookmark: a path that is added and not played (S13 §1). A bookmark
+    // The bookmark: a media that is added and not played (S13 §1). A bookmark
     // without a path is left open by S13 §5.3, so it is reported rather than
     // guessed.
     let mut added = match &args.bookmark {
-        Some(Bookmark::Path(path)) => Some(path.clone()),
+        Some(Bookmark::Location(location)) => Some(location.clone()),
         Some(Bookmark::WithoutPath) => {
             refusals.push(
                 "/BOOKMARK without a path is not defined (S13 §5.3); nothing was bookmarked"
@@ -208,19 +211,19 @@ fn forward_request(args: &cli::Args) -> ForwardRequest {
         }
         None => None,
     };
-    // The enqueued path (S13 §1): `/ADD <path>` names its own path and
-    // `--enqueue` names the file argument. Both are added and not played. A
+    // The enqueued media (S13 §1): `/ADD <path>` names its own media and
+    // `--enqueue` names the media argument. Both are added and not played. A
     // `/ADD` without a path is left open by S13 §5.3, so it is reported
     // rather than guessed.
     let (file, enqueued) = match &args.enqueue {
-        Enqueue::None => (args.file.clone(), None),
-        Enqueue::File => (None, args.file.clone()),
-        Enqueue::Path(path) => (args.file.clone(), Some(path.clone())),
+        Enqueue::None => (args.media.clone(), None),
+        Enqueue::Argument => (None, args.media.clone()),
+        Enqueue::Location(location) => (args.media.clone(), Some(location.clone())),
         Enqueue::WithoutPath => {
             refusals.push(
                 "/ADD without a path is not defined (S13 §5.3); nothing was enqueued".to_owned(),
             );
-            (args.file.clone(), None)
+            (args.media.clone(), None)
         }
     };
     // Only one path can travel that way, so the enqueued path wins and the
@@ -229,11 +232,17 @@ fn forward_request(args: &cli::Args) -> ForwardRequest {
         if let Some(bookmark) = added.take() {
             refusals.push(format!(
                 "/BOOKMARK {} was not forwarded: only one path can be added without playing it",
-                bookmark.display()
+                bookmark.to_display_string()
             ));
         }
         added = Some(enqueued);
     }
+    // The hand-off frame carries a path (the wire format of
+    // `ForwardRequest`), so a URL cannot travel that way: it is reported
+    // instead of being handed over as a path the running instance would try
+    // to open as a file.
+    let file = cli::forwarded_path(file, &mut refusals);
+    let added = cli::forwarded_path(added, &mut refusals);
     ForwardRequest {
         file,
         added,

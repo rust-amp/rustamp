@@ -9,7 +9,7 @@ the modules and `docs/tasks/N1-app-wiring.md` for the task card.
 The binary is `rustamp`:
 
 ```text
-rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
+rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
        [--seconds <n>] [--enqueue] [--import-winamp-ini [path]]
        [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
        [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
@@ -23,6 +23,23 @@ playing it (the `Enqueue` verb of S13 §3), and `/INSTALL`, `/UNREG`, `/NOREG`
 and `/ONLYINSTALL` drive the shell registration (the verbs a drop from
 Explorer offers). An unknown `/`-token is a file argument, as in the spec. The
 `--`-switches are Rustamp's own test and convenience aids.
+
+## Entering a URL
+
+A path that names an `http://` URL is **streamed**: it becomes the same kind
+of queue entry (`TrackSource::Url`) a playlist's URL produces, and the engine
+reads it through the HTTP decoder of `specs/S19-streaming.md`. Another scheme
+— `https://` for instance — is **refused by name**, because this build has no
+TLS and S19 §6 question 8 establishes no evidence for `https`. The refusal is
+a command-line error, so the URL is never taken for a file name.
+
+In the window the same URL is entered in the **location face** of the open
+media dialog: the `Open location` command (S03 §1 id 40185 — `Ctrl+L`, also
+`Ctrl+Num0` and `Ctrl+X`) opens it, `Enter` adds the typed URL to the queue,
+and `Escape` drops it. The dialog is the player's own skinned dialog, not a
+native prompt. The menu row that runs the same command is a row of the `Play`
+submenu: S04 §2 leaves that submenu's rows unmeasured, so the row's label is
+our own choice — the command it runs is not.
 
 ## Headless mode — safe to run anywhere
 

@@ -35,7 +35,7 @@ fn app() -> App {
         skin: rustamp_app::skin::builtin(),
         output: OutputChoice::Null,
         volume: 200,
-        file: None,
+        media: None,
         seconds: None,
     };
     App::new(options).expect("the headless app builds")

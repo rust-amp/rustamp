@@ -103,7 +103,7 @@ fn fixture() -> (App, tempfile::TempDir) {
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume: 0, // The tap is before the output gain, not a volume meter.
-            file: None,
+            media: None,
             seconds: None,
         },
         registry,
