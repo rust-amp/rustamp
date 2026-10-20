@@ -211,6 +211,29 @@ pub(crate) fn item_key_for_extra(name: &str) -> Option<ItemKey> {
         .map(|(_, item)| *item)
 }
 
+/// The canonical name of an R128 key, whatever spelling the caller used.
+///
+/// The name is the one the `TXXX` frames of an ID3v2 tag and the Vorbis
+/// comments carry. Returns `None` for anything else.
+pub(crate) fn canonical_r128_key(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case(R128_TRACK_GAIN_KEY) {
+        Some(R128_TRACK_GAIN_KEY)
+    } else if name.eq_ignore_ascii_case(R128_ALBUM_GAIN_KEY) {
+        Some(R128_ALBUM_GAIN_KEY)
+    } else {
+        None
+    }
+}
+
+/// Whether `name` is one of the two R128 keys.
+///
+/// The R128 keys are the ones the ID3v2 tag carries in `TXXX` frames the
+/// generic model cannot see, so the writer and the reader ask the concrete
+/// tag for them.
+pub(crate) fn is_r128_key(name: &str) -> bool {
+    canonical_r128_key(name).is_some()
+}
+
 /// ReplayGain values as held in
 /// [`TrackMetadata::extra`](rustamp_core::meta::TrackMetadata::extra).
 ///
@@ -855,6 +878,11 @@ impl ReplayGainWriteReport {
 /// cannot carry a requested key (R128 on MP3, anything on a non-media file
 /// — which is an error, not a skip) says so in
 /// [`skipped_unsupported`](ReplayGainWriteReport::skipped_unsupported).
+///
+/// A file that already holds the values does not change, so it is not
+/// touched — the same rule as [`crate::write_tags_report`] (see
+/// [`crate::WriteReport::unchanged`]). The values are in the file either
+/// way, so `written` names them either way.
 ///
 /// # Errors
 ///

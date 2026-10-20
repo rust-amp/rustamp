@@ -76,6 +76,17 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   as it was; there is no half-written media file. The replacement keeps the
   permissions of the original. A symlinked file is written *through*: the
   link stays a link and the file it points at is replaced.
+- **A write that changes nothing does not touch the file.** A request whose
+  values the file already has leaves the file alone: its bytes and its
+  modification time stay the ones it had, and the write report says so
+  (`WriteReport::unchanged`). The comparison is made on the *decoded*
+  values — the values a reader would see — and never on the bytes, because
+  the byte layout of an ID3v2 tag is not deterministic (`lofty` keeps the
+  text frames in a hash map, so two writes of the same metadata produce the
+  same frames in a different order). A no-op save that rewrote the file
+  would move its modification time for nothing, and every tool that watches
+  the file (a library scanner, a file index) would see a new file. The rule
+  is in the `unchanged` module of the crate.
 - **Only the primary tag is written.** A file may carry more than one tag
   (an MP3 with ID3v2 and ID3v1). The write replaces the format's primary
   tag and leaves the other tags byte for byte as they were; the old code
@@ -302,6 +313,56 @@ pictures that are *inside* the file and nothing else.
   of the removal list: the caller asked for it to be gone, so the format is
   not the reason it is not in the file.
 
+## Audit (wave274 — a write that changes nothing does not rewrite the file)
+
+- **The gap.** The byte layout of an ID3v2 tag is not deterministic: `lofty`
+  keeps the text frames of a tag in a hash map, so two writes of the same
+  metadata produce the same frames in a different order. A save that
+  changed nothing therefore still changed the file: the bytes were another
+  arrangement of the same frames and the modification time moved. Every
+  tool that watches the file — the library scanner, the file index, a
+  sync client — saw a new file for a save the user had not changed
+  anything in.
+- **The API.** `WriteReport` has one additive field, `unchanged: bool`: the
+  request would not have changed the file, so the file was not touched.
+  `WriteReport::is_complete()` does **not** include it: a write that
+  changed nothing is complete, because the values the caller asked for are
+  in the file — they were there already. The field is meta-internal:
+  `rustamp-core` and `rustamp-proto` are untouched, so no RFC is needed.
+  Nothing outside this crate constructs a `WriteReport`, so the field is
+  additive for every caller in the workspace.
+- **The rule.** The comparison is made on the **decoded values** — the
+  values a reader would see — and never on the bytes: the order of the
+  frames of an ID3v2 tag is not ours to compare, and two tags that hold the
+  same values are the same tag. The decoded values are the reader's (a
+  text value is trimmed, an empty one is "no value", a date is its year, a
+  number pair is split on the `/`), so the value that is compared is the
+  value a reader would see.
+  - **Only the fields the request names are compared.** A field that is
+    `None` in the metadata means "keep", so it cannot decide anything. A
+    removal of a field the primary tag does not hold changes nothing
+    either.
+  - **The comparison is made against the primary tag**, the tag the writer
+    writes. A value that only a second tag holds (an ID3v1 tag next to an
+    ID3v2 tag) is not in the primary tag, so a request for it *is* a
+    change: the write would put the value into the tag the reader prefers,
+    and the effective value of the file would change with it.
+  - **An `extra` entry the target format cannot store is not a change.** It
+    cannot be in the file and cannot be put there; it stays in
+    `WriteReport::unwritten_extra`, which is reported either way.
+- **What the rule does not decide.** The rule looks at the values, not at
+  the bytes: a write that would put the tag of the file in another shape
+  (an ID3v2 tag is written as ID3v2.4 with padding, whatever the file held
+  before) is a no-op when the values are the same. The file keeps the shape
+  it had, which is the point.
+- **The proof.** `tests/unchanged.rs` (headless, on temporary copies of the
+  fixtures): an identical write leaves the bytes *and* the modification time
+  of the file untouched; a one-field change is written; a removal of a field
+  the file does not have is not written; a value that only the ID3v1 twin
+  holds is a change; an `extra` entry the format refuses is not a change; the
+  R128 keys of an ID3v2 tag (which live in `TXXX` frames the generic model
+  cannot see) are compared through the concrete tag.
+
 ## What each format can carry
 
 The property suite (`tests/tag_properties.rs`) writes generated metadata into
@@ -348,7 +409,9 @@ year, the genre and the comment. The `extra` map is narrower:
 - **The byte layout of an ID3v2 tag is not stable.** `lofty` keeps the text
   frames of a tag in a hash map, so two writes of the same metadata produce
   the same frames in a different order. The content of the tag is stable,
-  the bytes are not. FLAC, Ogg, Opus and MP4 are byte-stable.
+  the bytes are not. FLAC, Ogg, Opus and MP4 are byte-stable. A write that
+  would not change the values of the tag does not happen at all (see the
+  wave274 audit above), so a file the user did not change keeps its bytes.
 - **The audio is never rewritten.** The property suite compares the audio of
   every file before and after every write: the frames behind the MP3 and AAC
   tags, the frames behind the FLAC metadata blocks, the audio packets of an

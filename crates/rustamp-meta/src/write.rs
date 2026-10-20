@@ -27,6 +27,37 @@
 //! where it is; the write report names every removal that is in that state
 //! ([`WriteReport::unremoved`]).
 //!
+//! ## A write that changes nothing
+//!
+//! A write that would not change the tags the file has does not touch the
+//! file: its bytes and its modification time stay the ones it had, and the
+//! report says so ([`WriteReport::unchanged`]).
+//!
+//! The question is worth asking, because the bytes of a tag are not
+//! deterministic: `lofty` keeps the text frames of an ID3v2 tag in a hash
+//! map, so two writes of the same metadata produce the same frames in a
+//! different order. Writing the same metadata twice would otherwise
+//! rewrite the file with another frame order and move its modification time
+//! — a change the user never asked for, and one every tool that watches
+//! the file (a library scanner, a file index) sees.
+//!
+//! The comparison is made on the **decoded values** — the values a reader
+//! would see — and only on the fields the request names:
+//!
+//! * A field that is `None` in the metadata means "keep", so it cannot
+//!   decide anything. A removal of a field the primary tag does not hold
+//!   changes nothing either.
+//! * The comparison is made against the **primary tag**, the tag the
+//!   writer writes. A value that only a second tag holds (an ID3v1 tag next
+//!   to an ID3v2 tag) is not in the primary tag, so a request for it is a
+//!   change: the write would put the value into the tag the reader
+//!   prefers.
+//! * An `extra` entry the target format cannot store is not a change: it
+//!   cannot be in the file and cannot be put there. It is reported
+//!   ([`WriteReport::unwritten_extra`]), not written.
+//!
+//! The rule is in the `unchanged` module of this crate.
+//!
 //! ## What the format cannot store
 //!
 //! A value the target format cannot hold is not in the file after the
@@ -80,6 +111,7 @@
 //! A symlinked file is written *through*: the link stays a link and the file
 //! it points at is replaced.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::path::Path;
 
@@ -99,7 +131,8 @@ use rustamp_core::meta::TrackMetadata;
 use crate::atomic::replace_atomically;
 use crate::read::map_lofty;
 use crate::remove::{TagField, remove_from_tag, remove_from_vorbis, unremoved_in};
-use crate::replaygain::{R128_ALBUM_GAIN_KEY, R128_TRACK_GAIN_KEY, item_key_for_extra};
+use crate::replaygain::{canonical_r128_key, is_r128_key, item_key_for_extra};
+use crate::unchanged::Before;
 
 /// The largest year a tag can hold: the readers only accept a four-digit year
 /// (`read::parse_year`), so anything larger could not be read back, and
@@ -154,12 +187,31 @@ pub struct WriteReport {
     /// a year above 9999 is refused with an error before the file is opened,
     /// and an empty text value is read back as "no value" in every format.
     pub unstoreable: Vec<TagField>,
+    /// The request would not have changed the file, so the file was not
+    /// touched: its bytes and its modification time are the ones it had.
+    ///
+    /// The comparison is made on the decoded values — the values a reader
+    /// would see — and only on the fields the request names; see the
+    /// `unchanged` module for the rule. A write that changes nothing is a
+    /// no-op: the byte layout of an ID3v2 tag is not deterministic (`lofty`
+    /// keeps the text frames in a hash map), so writing the same metadata
+    /// twice would otherwise rewrite the file with the frames in another
+    /// order and move its modification time.
+    ///
+    /// This says nothing about the other fields of the report: an `extra`
+    /// entry the format refused is still refused, and a removal a second tag
+    /// still carries is still not carried out.
+    pub unchanged: bool,
 }
 
 impl WriteReport {
     /// Returns `true` when every requested `extra` entry was written, every
     /// requested removal was carried out, and no requested value was too big
     /// for the target format.
+    ///
+    /// A write that changed nothing ([`WriteReport::unchanged`]) is
+    /// complete: the values the caller asked for are in the file, they were
+    /// there already.
     pub fn is_complete(&self) -> bool {
         self.unwritten_extra.is_empty() && self.unremoved.is_empty() && self.unstoreable.is_empty()
     }
@@ -179,6 +231,10 @@ impl WriteReport {
 /// The write is atomic: the new file is built next to the original and
 /// renamed over it, so a failure leaves the original untouched (the
 /// `atomic` module of this crate).
+///
+/// A write that would not change the tags of the file does not touch it at
+/// all — the bytes and the modification time stay the ones the file had —
+/// and the report says so ([`WriteReport::unchanged`]).
 ///
 /// ## Formats
 ///
@@ -287,7 +343,12 @@ pub fn write_tags_with_report(
 
     let mut target = Target::read(&path)?;
     let report = target.apply(metadata, removals);
-    replace_atomically(&path, |file| target.save(file))?;
+    // A request that would not change the tags of the file does not touch
+    // it: the bytes and the modification time stay the ones the file has
+    // (see the `unchanged` module).
+    if !report.unchanged {
+        replace_atomically(&path, |file| target.save(file))?;
+    }
     Ok(report)
 }
 
@@ -392,8 +453,29 @@ impl Target {
         }
     }
 
+    /// The primary tag of the file, seen through the generic model.
+    ///
+    /// The Vorbis family is written as concrete comments, but the values of
+    /// a comment are the values of the generic model — the ones the reader
+    /// sees. The second tags of the file are not part of it: the writer
+    /// does not write them.
+    fn primary(&self) -> Cow<'_, Tag> {
+        match self {
+            Self::Generic { tag, .. } => Cow::Borrowed(tag),
+            Self::Flac { flac, .. } => Cow::Owned(
+                flac.vorbis_comments()
+                    .map(|comments| Tag::from(comments.clone()))
+                    .unwrap_or_else(|| Tag::new(TagType::VorbisComments)),
+            ),
+            Self::Vorbis(comments) => Cow::Owned(Tag::from(comments.clone())),
+        }
+    }
+
     /// Applies `metadata` to the tag and removes the fields of `removals`.
     fn apply(&mut self, metadata: &TrackMetadata, removals: &[TagField]) -> WriteReport {
+        // The state of the file before the write: it decides whether the
+        // write changes anything (see the `unchanged` module).
+        let before = Before::of(&self.primary(), metadata, removals);
         match self {
             Self::Generic { tag, others } => {
                 let mut unwritten_extra = apply_to_tag(tag, metadata);
@@ -404,10 +486,12 @@ impl Target {
                 }
                 // The removals come last: a removal wins over a value.
                 remove_from_tag(tag, removals);
+                let unchanged = !before.would_change(metadata, removals, &unwritten_extra);
                 WriteReport {
                     unwritten_extra,
                     unremoved: unremoved_in(others, removals),
                     unstoreable: unstoreable_fields(tag.tag_type(), metadata, removals),
+                    unchanged,
                 }
             }
             Self::Flac { flac, others } => {
@@ -420,20 +504,24 @@ impl Target {
                     // The removals come last: a removal wins over a value.
                     remove_from_vorbis(comments, removals);
                 }
+                let unchanged = !before.would_change(metadata, removals, &unwritten_extra);
                 WriteReport {
                     unwritten_extra,
                     unremoved: unremoved_in(others, removals),
                     unstoreable: unstoreable_fields(TagType::VorbisComments, metadata, removals),
+                    unchanged,
                 }
             }
             Self::Vorbis(comments) => {
                 let unwritten_extra = apply_to_vorbis(comments, metadata);
                 // The removals come last: a removal wins over a value.
                 remove_from_vorbis(comments, removals);
+                let unchanged = !before.would_change(metadata, removals, &unwritten_extra);
                 WriteReport {
                     unwritten_extra,
                     unremoved: Vec::new(),
                     unstoreable: unstoreable_fields(TagType::VorbisComments, metadata, removals),
+                    unchanged,
                 }
             }
         }
@@ -577,11 +665,6 @@ fn apply_to_vorbis(comments: &mut VorbisComments, metadata: &TrackMetadata) -> V
     unwritten
 }
 
-/// Whether `key` names one of the two R128 keys.
-fn is_r128_key(key: &str) -> bool {
-    key.eq_ignore_ascii_case(R128_TRACK_GAIN_KEY) || key.eq_ignore_ascii_case(R128_ALBUM_GAIN_KEY)
-}
-
 /// The fields whose value the format of `tag_type` cannot store.
 ///
 /// The value is the one the caller asked for; the format has no room for
@@ -649,11 +732,9 @@ fn carries_number(tag_type: TagType, number: u32) -> bool {
 fn write_id3v2_r128(tag: &mut Tag, metadata: &TrackMetadata) -> bool {
     let mut frames: Vec<(&str, &str)> = Vec::new();
     for (key, value) in &metadata.extra {
-        let description = if key.eq_ignore_ascii_case(R128_TRACK_GAIN_KEY) {
-            R128_TRACK_GAIN_KEY
-        } else if key.eq_ignore_ascii_case(R128_ALBUM_GAIN_KEY) {
-            R128_ALBUM_GAIN_KEY
-        } else {
+        // The frame carries the canonical name of the key, whatever
+        // spelling the caller used.
+        let Some(description) = canonical_r128_key(key) else {
             continue;
         };
         frames.push((description, value.as_str()));
