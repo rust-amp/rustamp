@@ -61,11 +61,28 @@
 //!   even with a preamp dialed in. Silence about loudness is not a license
 //!   to guess.
 //!
+//! # When a change takes effect
+//!
+//! The multiplier is derived in one place: the decode thread asks the control
+//! for the current track's multiplier when it opens a track and again after
+//! every successful seek (see [`crate::decode`]). A mode or preamp change
+//! therefore takes effect at the next track **or seek**, as the engine
+//! promises.
+//!
+//! The change cannot click. A seek drops the frames the ring still holds and
+//! the engine flushes the device, so the audio is already discontinuous across
+//! it; the new multiplier starts exactly at that discontinuity and applies to
+//! whole blocks (a seek is a block boundary), so no block is scaled by two
+//! multipliers and there is no waveform to ramp against. There is no gain
+//! ramp for the ReplayGain multiplier, and none is needed: the only place
+//! the multiplier changes is a place where the signal is cut anyway.
+//!
 //! # Real-time safety
 //!
-//! [`ReplayGainControl`] is two atomics; the decode thread snapshots it once
-//! per track. [`apply_gain`] allocates nothing, takes no lock and branches
-//! once per block.
+//! [`ReplayGainControl`] is a handful of atomics; the decode thread reads it
+//! when it opens a track and when it applies a seek, never in the middle of a
+//! block. [`apply_gain`] allocates nothing, takes no lock and branches once
+//! per block.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -138,11 +155,13 @@ impl ReplayGainMode {
 }
 
 /// The user's ReplayGain settings, shared between the engine (writer) and
-/// the decode thread (reader). Lock-free: two atomics, no allocation.
+/// the decode thread (reader). Lock-free: a handful of atomics, no
+/// allocation.
 ///
-/// Takes effect per track: the decode thread snapshots the control when it
-/// opens a track, so a change mid-track applies from the next track (or a
-/// seek, which re-opens the pipeline state).
+/// Takes effect per track **or per seek**: the decode thread reads the
+/// control when it opens a track and again when it applies a seek, so a
+/// change mid-track applies from the next track or the next seek (see the
+/// module docs).
 #[derive(Debug)]
 pub struct ReplayGainControl {
     mode: AtomicU8,

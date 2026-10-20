@@ -343,8 +343,8 @@ pub(crate) struct Config {
     /// started (RFC 0005 O8); later toggles arrive as
     /// [`DecodeMsg::SetStopAfterCurrent`].
     pub stop_after_current: bool,
-    /// The user's ReplayGain settings, snapshotted once per track (see
-    /// [`crate::replaygain`]).
+    /// The user's ReplayGain settings, read once per track and once per
+    /// seek (see [`crate::replaygain`]).
     pub replay_gain: Arc<ReplayGainControl>,
     /// Ring epoch the engine bumped at the start of the run because the ring
     /// still held a previous run's audio. The first write waits for its
@@ -479,9 +479,12 @@ struct Worker {
     quitting: bool,
     stopped: bool,
     /// The current track's ReplayGain multiplier (1.0 when the mode is
-    /// disabled or the track carries no usable tag). Snapshotted in
-    /// `prepare_track`; a seek keeps the track's gain, a new track reads
-    /// its own.
+    /// disabled or the track carries no usable tag).
+    ///
+    /// Derived in one place, [`Worker::refresh_replaygain`]: a new track
+    /// derives it in `prepare_track`, a seek derives it again, so a mode or
+    /// preamp change takes effect at the next track **or seek** (the
+    /// engine's contract, see [`crate::engine`]).
     rg_gain: f32,
     /// "Stop after current track" is armed (RFC 0005 O8): the run ends at the
     /// end of the current track instead of advancing.
@@ -703,7 +706,7 @@ impl Worker {
             tags.album_gain_db,
             tags.album_peak,
         );
-        self.rg_gain = self.cfg.replay_gain.effective_gain_current();
+        self.refresh_replaygain();
         for stage in &mut self.dsp {
             let _ = stage.prepare(src);
         }
@@ -740,6 +743,21 @@ impl Worker {
             timeline_start: self.track_start,
             seekable: decoder.is_seekable(),
         });
+    }
+
+    /// The track's ReplayGain multiplier for the mode the user set.
+    ///
+    /// The one place the multiplier is derived, so the two paths that can
+    /// change it cannot drift apart: a new track derives it in
+    /// [`Worker::prepare_track`], a seek derives it again in
+    /// [`Worker::apply_seek`]. The control holds the track's tag values
+    /// (snapshotted from the decoder's metadata in `prepare_track`) next to
+    /// the mode and the preamp the user set, and the multiplier follows from
+    /// them — so a mode that needs a tag the track does not carry selects
+    /// nothing and the track plays unadjusted, exactly as the policy in
+    /// [`crate::replaygain`] says.
+    fn refresh_replaygain(&mut self) {
+        self.rg_gain = self.cfg.replay_gain.effective_gain_current();
     }
 
     /// Frames the DSP chain holds back, at the current track's rate.
@@ -1105,6 +1123,12 @@ impl Worker {
     /// *before* the engine re-bases the clock and *before* the first post-seek
     /// frame is written, so no frame is lost and the position lands exactly on
     /// the target.
+    ///
+    /// A successful seek also re-derives the track's ReplayGain multiplier
+    /// (see [`Worker::refresh_replaygain`]): the mode and the preamp may have
+    /// changed since the track was prepared, and a change takes effect at the
+    /// next track **or seek**. A refused seek changes nothing — the decoder
+    /// did not move, so the audio keeps the gain it had.
     fn apply_seek(
         &mut self,
         decoder: &mut Box<dyn Decoder>,
@@ -1114,6 +1138,19 @@ impl Worker {
     ) {
         match decoder.seek(to) {
             Ok(reached) => {
+                // A seek re-derives the ReplayGain multiplier: the mode or the
+                // preamp may have changed since the track was prepared, and
+                // the engine promises that a change takes effect at the next
+                // track *or seek*. The new multiplier applies to the first
+                // block after the seek — the seek is a block boundary — so no
+                // block ever carries two multipliers.
+                //
+                // The transition cannot click: the seek drops the frames the
+                // ring still holds and the engine flushes the device, so the
+                // audio is discontinuous across it either way. The multiplier
+                // starts at the discontinuity, with no waveform to ramp
+                // against (see `crate::replaygain`).
+                self.refresh_replaygain();
                 for stage in &mut self.dsp {
                     stage.reset();
                 }

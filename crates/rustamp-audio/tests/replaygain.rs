@@ -25,15 +25,33 @@
 //!   converter's final ceiling on the resampled path.
 //! * `replaygain_is_disabled_by_default` — the player changes no loudness
 //!   until the user asks.
+//!
+//! The last group pins the **seek** (finding F3 of
+//! `docs/tasks/W14-wave-review.md`): the engine promises that a change of the
+//! mode takes effect at the next track *or seek*, so a seek must re-derive
+//! the multiplier:
+//!
+//! * `a_mode_change_takes_effect_at_the_next_seek` — Off → Track, then a
+//!   seek: the track gain is in effect from the seek on.
+//! * `a_mode_change_back_to_off_takes_effect_at_the_next_seek` — the reverse:
+//!   Track → Off, then a seek: the track plays unadjusted again.
+//! * `a_seek_without_a_mode_change_keeps_the_gain` — a seek on its own never
+//!   touches the multiplier.
+//! * `a_seek_on_a_track_without_tags_plays_unadjusted` — a mode that needs a
+//!   tag the track does not carry plays unadjusted, before and after a seek.
+//! * `a_seek_during_a_fade_keeps_the_fade_and_derives_the_new_gain` — a seek
+//!   in the middle of a fade-out does not disturb the ramp and still picks up
+//!   the new mode.
 
 mod common;
 
 use std::collections::BTreeMap;
 
-use common::{Harness, expected, finished, pattern};
+use common::{Harness, SPEC, expected, finished, pattern};
 use rustamp_audio::replaygain::{ReplayGainMode, apply_gain, effective_gain};
 use rustamp_audio::{EngineConfig, FormatConverter};
 use rustamp_core::audio::AudioSpec;
+use rustamp_core::command::Command;
 
 /// Record `frames` left-channel samples of the current run from its start.
 fn record_left(h: &mut Harness, frames: u64) -> (u64, Vec<f32>) {
@@ -45,6 +63,48 @@ fn record_left(h: &mut Harness, frames: u64) -> (u64, Vec<f32>) {
     h.engine.poll().unwrap();
     (p0, rec.iter().step_by(2).copied().collect())
 }
+
+/// The linear factor of a −6.02 dB track gain.
+fn half() -> f32 {
+    10f32.powf(-6.02 / 20.0)
+}
+
+/// The source samples of `seed` from frame `from`, scaled by `gain` and
+/// finished: the ReplayGain scale runs before the converter, so the
+/// expectation is the gained source, finished.
+fn gained(seed: u64, from: u64, n: u64, gain: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| finished(pattern(seed, from + i) * gain))
+        .collect()
+}
+
+/// Assert that the recorded block is the expectation, frame by frame.
+///
+/// A tolerance of `0.0` demands the bit-exact passthrough; anything else
+/// allows that much difference. The first frame that differs is named, not
+/// the whole block.
+fn assert_block(got: &[f32], want: &[f32], tolerance: f32, what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: the block length");
+    for (i, (got, want)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(
+            (got - want).abs() <= tolerance,
+            "{what}: frame {i}: got {got}, want {want}"
+        );
+    }
+}
+
+/// A harness with one ReplayGain-tagged track (a −6.02 dB track gain) and
+/// the limiter off, so the ReplayGain factor is the only thing that touches
+/// the samples.
+fn tagged() -> Harness {
+    let mut h = Harness::new(&["rg_-6.02_none_1_44100.tst"]);
+    h.engine.set_limiter_enabled(false);
+    h
+}
+
+/// The seek target the seek tests use: far enough into the track that the
+/// audio before and after the seek is a different stretch of it.
+const TARGET: u64 = 20_000;
 
 #[test]
 fn track_gain_scales_samples_by_the_documented_factor() {
@@ -295,5 +355,241 @@ fn a_resampled_device_makes_no_difference_to_the_documented_order() {
     assert!(
         peak <= ceiling + 0.05,
         "a −6.02 dB cut stays near the limiter ceiling {ceiling}: {peak}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The seek (finding F3 of docs/tasks/W14-wave-review.md)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_mode_change_takes_effect_at_the_next_seek() {
+    // The F3 reproduction: the mode changes while the track plays, and the
+    // seek is where the change must become audible. The engine promises
+    // exactly that ("a change takes effect at the next track or seek").
+    let mut h = tagged();
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    // Before the change the mode is off: the track plays unadjusted.
+    let (p0, before) = record_left(&mut h, 1024);
+    assert_block(
+        &before,
+        &expected(1, p0, 1024),
+        0.0,
+        "the mode is off, so the track plays unadjusted",
+    );
+
+    // The change, and the seek that has to pick it up.
+    h.engine.set_replaygain_mode(ReplayGainMode::Track);
+    assert!(
+        h.seek_and_settle(TARGET),
+        "the seek must land on {TARGET} (it is at {})",
+        h.engine.position_frames()
+    );
+
+    // After the seek the track gain is in effect: the gained source,
+    // finished, frame by frame.
+    let (p1, after) = record_left(&mut h, 1024);
+    assert!(
+        p1 >= TARGET,
+        "the position must be at or after the target: {p1}"
+    );
+    assert_block(
+        &after,
+        &gained(1, p1, 1024, half()),
+        1e-7,
+        "the seek must apply the track gain",
+    );
+}
+
+#[test]
+fn a_mode_change_back_to_off_takes_effect_at_the_next_seek() {
+    // The reverse: the track plays with the gain, the mode goes back to off
+    // and the seek must drop the gain again.
+    let mut h = tagged();
+    h.engine.set_replaygain_mode(ReplayGainMode::Track);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    let (p0, before) = record_left(&mut h, 1024);
+    assert_block(
+        &before,
+        &gained(1, p0, 1024, half()),
+        1e-7,
+        "the track gain is in effect",
+    );
+
+    h.engine.set_replaygain_mode(ReplayGainMode::Off);
+    assert!(
+        h.seek_and_settle(TARGET),
+        "the seek must land on {TARGET} (it is at {})",
+        h.engine.position_frames()
+    );
+
+    let (p1, after) = record_left(&mut h, 1024);
+    assert!(
+        p1 >= TARGET,
+        "the position must be at or after the target: {p1}"
+    );
+    assert_block(
+        &after,
+        &expected(1, p1, 1024),
+        0.0,
+        "the mode is off again, so the track plays unadjusted after the seek",
+    );
+}
+
+#[test]
+fn a_seek_without_a_mode_change_keeps_the_gain() {
+    // A seek on its own must not touch the multiplier: the track keeps the
+    // gain it prepared with.
+    let mut h = tagged();
+    h.engine.set_replaygain_mode(ReplayGainMode::Track);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    assert!(
+        h.seek_and_settle(TARGET),
+        "the seek must land on {TARGET} (it is at {})",
+        h.engine.position_frames()
+    );
+
+    let (p1, after) = record_left(&mut h, 1024);
+    assert!(
+        p1 >= TARGET,
+        "the position must be at or after the target: {p1}"
+    );
+    assert_block(
+        &after,
+        &gained(1, p1, 1024, half()),
+        1e-7,
+        "the seek must not change the gain",
+    );
+}
+
+#[test]
+fn a_seek_on_a_track_without_tags_plays_unadjusted() {
+    // The mode needs a tag the decoder did not load: the documented policy
+    // is that such a track plays unadjusted (gain 1.0), and a seek does not
+    // change that.
+    let mut h = Harness::new(&["track1_44100.tst"]);
+    h.engine.set_limiter_enabled(false);
+    h.engine.set_replaygain_mode(ReplayGainMode::Track);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    let (p0, before) = record_left(&mut h, 1024);
+    assert_block(
+        &before,
+        &expected(1, p0, 1024),
+        0.0,
+        "no tag means bit-exact passthrough",
+    );
+
+    assert!(
+        h.seek_and_settle(TARGET),
+        "the seek must land on {TARGET} (it is at {})",
+        h.engine.position_frames()
+    );
+
+    let (p1, after) = record_left(&mut h, 1024);
+    assert!(
+        p1 >= TARGET,
+        "the position must be at or after the target: {p1}"
+    );
+    assert_block(
+        &after,
+        &expected(1, p1, 1024),
+        0.0,
+        "no tag means bit-exact passthrough, after the seek too",
+    );
+}
+
+/// The gain of the fade ramp at the frame the device played at counter
+/// `played`.
+///
+/// The ramp starts at the first callback after the request, so the frame the
+/// device played at counter `played` is the ramp's frame `played - start`.
+/// The law is the equal-power one of `rustamp-dsp`'s fade: `sqrt(1 - t)`.
+fn fade_gain(played: u64, start: u64, span: u64) -> f32 {
+    let k = played.saturating_sub(start) as f64;
+    let t = k / span.saturating_sub(1).max(1) as f64;
+    (1.0 - t).max(0.0).sqrt() as f32
+}
+
+#[test]
+fn a_seek_during_a_fade_keeps_the_fade_and_derives_the_new_gain() {
+    // A fade-out that is still running when the seek happens. The fade lives
+    // in the render callback, the seek in the decode thread: the seek must
+    // not disturb the ramp (no jump back to unity) and must still pick up the
+    // new ReplayGain mode.
+    const FADE_MS: u32 = 500;
+    let span = u64::from(FADE_MS) * u64::from(SPEC.sample_rate) / 1000;
+    let cfg = EngineConfig {
+        fade_ms: FADE_MS,
+        ..EngineConfig::default()
+    };
+    let mut h = Harness::with_config(&["rg_-6.02_none_1_44100.tst"], cfg);
+    h.engine.set_limiter_enabled(false);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+
+    // Before the fade the track plays unadjusted.
+    let (p0, before) = record_left(&mut h, 1024);
+    assert_block(
+        &before,
+        &expected(1, p0, 1024),
+        0.0,
+        "the fade has not started yet",
+    );
+
+    // The fade-out starts; the ramp begins at the next callback the device
+    // runs, which is the frame at the current position of the clock.
+    h.engine.apply(&Command::StopWithFadeout).expect("fade out");
+    let ramp_start = h.clock.frames();
+
+    // The ramp is running: the output is the source, attenuated by the
+    // ramp's gain, frame by frame.
+    let p1 = h.engine.position_frames();
+    let s1 = h.clock.frames();
+    let mut during = Vec::new();
+    h.clock.pump_record(1024, &mut during);
+    let during: Vec<f32> = during.iter().step_by(2).copied().collect();
+    let want: Vec<f32> = (0..1024)
+        .map(|j| fade_gain(s1 + j as u64, ramp_start, span) * finished(pattern(1, p1 + j as u64)))
+        .collect();
+    assert_block(&during, &want, 1e-6, "the fade must ramp down");
+
+    // The mode changes and the seek happens while the ramp runs.
+    h.engine.set_replaygain_mode(ReplayGainMode::Track);
+    assert!(
+        h.seek_and_settle(TARGET),
+        "the seek must land on {TARGET} (it is at {})",
+        h.engine.position_frames()
+    );
+
+    // After the seek the ramp continues where it was (the fade was not reset
+    // and did not jump back to unity) and the new gain is in effect. The
+    // ring has to be full again first, or the device would pull the silence
+    // of an underrun instead of the track.
+    let p2 = h
+        .wait_refilled(4096)
+        .expect("the ring must refill after the seek");
+    let s2 = h.clock.frames();
+    let mut after = Vec::new();
+    h.clock.pump_record(1024, &mut after);
+    let after: Vec<f32> = after.iter().step_by(2).copied().collect();
+    let want: Vec<f32> = (0..1024)
+        .map(|j| {
+            fade_gain(s2 + j as u64, ramp_start, span)
+                * finished(pattern(1, p2 + j as u64) * half())
+        })
+        .collect();
+    assert_block(
+        &after,
+        &want,
+        1e-6,
+        "the fade must continue and the new gain must apply",
     );
 }
