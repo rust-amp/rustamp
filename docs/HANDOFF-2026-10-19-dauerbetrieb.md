@@ -188,6 +188,55 @@ In flight at the time of writing: `wave272` (surface and undo a DSP bypass in
 the app), `wave274` (do not rewrite a file whose tags would not change),
 `wave275` (rename a damaged database aside and start fresh, never delete).
 
+## 2026-10-20: the spec pipeline, and the property waves
+
+The owner authorised the orchestrator session to take the **dirty-room role for
+spec authoring** (RFC 0021): it may run the reference binary and disassemble it,
+the only artifact is a **draft kept outside the repository**
+(`D:\code\rustamp-sandbox\spec-drafts\`), a **separate auditor agent** gates it
+into `specs/`, and **no code is written from the dirty material** - a different
+agent implements from the audited spec. `CLEANROOM.md` §2 carries the one
+authorised exception.
+
+**Result: all 20 specs now exist.** Eight were written and audited on 2026-10-20
+(`S08`, `S11`, `S12`, `S13`, `S14`, `S16`, `S18`, `S19`, `S20` - nine, in fact);
+`S10` is a revised draft pending ratification; the rest were already audited.
+
+Every audit caught real errors in the drafts, and the pattern is worth keeping:
+
+- **count errors** (`S13`'s "three verbs" against its own table of four; `S18`'s
+  "one per action" against six keys);
+- **over-claims** (`"no crossfade in this build"` from one plug-in's strings;
+  `"every error is actionable"` for four of six);
+- **wrong cross-references** (`config_proxy`/`proxy`, `S12 §3.4` for
+  `prefs_last_page`, `S12 §2.6` that did not exist);
+- and **one claim that contradicted our own repo measurement** (`/ADD`), which
+  is now an `AGENTS.md` rule.
+
+Implementations that came out of the new specs: the `winamp.ini` import (CLI +
+a Preferences page + the honest "read in our own way" split), the `S13`
+conformance including `/ADD`, the analyser on the measured 10/5 bands with the
+fall-off and peak tables, the `S14` format engine **with an app-owned setting**,
+an HTTP/1.0 stream decoder (and, in `wave319`, the engine branch), the `S20`
+path-template extractor **with the library UI**, and the fade-vs-buffer budget
+with its note.
+
+The property waves in the same period found **eleven real defects**, three of
+them serious: a foreign database overwritten with our schema (8 KiB -> 44 KiB), a
+**panic** from a half-loaded Matroska file (a foreign panic, now contained by
+`catch_unwind` and reported as a decode error), and a supervisor that **gave up
+silently** (the retries ended with no report, and a stale "a fresh host starts
+in 5s" could stand).
+
+Two environment lessons: a **full C: drive** produced a false test failure (the
+same run passed at 529/0 once space was free), and a `Copy-Item` that preserves
+mtime makes cargo skip a rebuild, so mutation proofs need a fresh mtime.
+
+## In flight after 2026-10-20
+
+`wave297` (S15 in the engine), `wave319` (the URL branch in the engine),
+`wave320` (IPC framing under short reads and writes).
+
 ## Rules added to `AGENTS.md` during the session
 
 1. **One worktree per subagent, created before it starts**; delete it after the merge.
