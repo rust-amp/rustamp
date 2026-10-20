@@ -13,6 +13,13 @@
 //! point list ends early keeps the points it has. The other polygons of the
 //! section are kept.
 //!
+//! A count that is **not a number at all** (a negative count, a word, a
+//! number too large to count points) is the one case the rule cannot cover:
+//! the point list can no longer be aligned with the counts, so the parser
+//! stops at that count and keeps the polygons it has already read. Guessing
+//! the missing count would read the *next* polygon's points as this one's —
+//! a silently wrong shape, which is worse than no shape at all.
+//!
 //! The polygons are the window's *shape*; [`crate::region_mask`] turns them
 //! into a per-pixel coverage mask for a window of a given size.
 
@@ -126,13 +133,6 @@ impl Region {
 }
 
 fn build_polygons(numpoints: &str, pointlist: &str) -> Vec<Polygon> {
-    let counts: Vec<usize> = numpoints
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<usize>().ok())
-        .collect();
-
     let tokens: Vec<i32> = pointlist
         .split([',', ' ', '\t', '\r', '\n'])
         .map(str::trim)
@@ -141,18 +141,37 @@ fn build_polygons(numpoints: &str, pointlist: &str) -> Vec<Polygon> {
         .collect();
 
     let mut polygons = Vec::new();
+    // `index` counts the points the polygons have read so far; the token
+    // list stores two numbers per point.
     let mut index = 0usize;
-    for count in counts {
+    for raw in numpoints.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            // An empty entry is no polygon at all, so it consumes no points.
+            continue;
+        }
+        let Ok(count) = raw.parse::<usize>() else {
+            // A count that is not a number cannot be aligned with the point
+            // list: the rest of the section is dropped rather than read at
+            // the wrong offset.
+            break;
+        };
         if count < 3 {
-            index += count;
+            // A polygon with fewer than three points is dropped, and the
+            // points it would have used are skipped.
+            index = index.saturating_add(count);
             continue;
         }
         // `index` counts points; the token list stores two numbers per point.
-        let start = index * 2;
-        let end = ((index + count) * 2).min(tokens.len());
+        // The arithmetic is saturating, so an absurd count cannot overflow.
+        let start = index.saturating_mul(2);
+        let end = index
+            .saturating_add(count)
+            .saturating_mul(2)
+            .min(tokens.len());
         let slice = tokens.get(start..end).unwrap_or(&[]);
         if slice.len() < 6 {
-            index += count;
+            index = index.saturating_add(count);
             continue;
         }
         let polygon: Polygon = slice
@@ -162,7 +181,7 @@ fn build_polygons(numpoints: &str, pointlist: &str) -> Vec<Polygon> {
             .map(|pair| (pair[0], pair[1]))
             .collect();
         polygons.push(polygon);
-        index += count;
+        index = index.saturating_add(count);
     }
     polygons
 }

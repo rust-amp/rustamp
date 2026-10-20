@@ -91,6 +91,10 @@ Three decisions are recorded here because they are not measurements:
    S17 §8 leaves the cursor-to-region mapping open, so the mapping from a
    hit-test result to a slot lives in `rustamp-ui` (`rustamp_ui::cursor`) as
    Rustamp's own choice, documented there.
+4. **A directory prefix is ignored**, the way the skin file lookup ignores
+   it (`source.rs`): a skin that carries `cursors/close.cur` fills the
+   `close` slot, and the skin's own cursor is not shadowed by the fallback's.
+   The slot lookup therefore works on the last path component of a name.
 
 `Skin::cursor(name)` (a lookup by file name) is gone: the slot is the one
 way to ask, and it also answers for an `.ani` file, which the name lookup
@@ -163,3 +167,25 @@ form, and the decisions are recorded here:
 The host side of the fallback (a family the machine does not have) lives in
 `rustamp-ui`: the requested family, then the base skin's own family, then
 the generic sans-serif.
+
+## 8. A malformed `region.txt`
+
+S17 §7 leaves the handling of a malformed `NumPoints`/`PointList` open. The
+parser's own rule, and the reason for it:
+
+1. **A count below three is dropped**, and the points that polygon would have
+   used are skipped, so the polygons after it keep their own points.
+2. **A polygon whose point list ends early keeps the points it has** — a
+   polygon with fewer than three points left is dropped.
+3. **A count that is not a number at all** (a negative count, a word, a
+   number too large to count points) ends the section: the point list can no
+   longer be aligned with the counts, so the parser stops there and keeps the
+   polygons it has already read.
+
+The third rule exists because the first two cannot cover it: a count whose
+size is unknown makes every later polygon ambiguous, and guessing would read
+the *next* polygon's points as this one's — a silently wrong window shape.
+A shape that is not there is better than a shape that is wrong.
+
+The arithmetic of the parser is saturating, so a count of
+`18446744073709551615` is a count, not an overflow.
