@@ -27,7 +27,8 @@
 //! roots(
 //!   id            INTEGER PRIMARY KEY AUTOINCREMENT,
 //!   path          TEXT NOT NULL UNIQUE,              -- root path as added
-//!   added_at      INTEGER NOT NULL                   -- unix seconds
+//!   added_at      INTEGER NOT NULL,                  -- unix seconds
+//!   last_scanned_at INTEGER                          -- unix seconds, NULL = never
 //! )
 //! ```
 //!
@@ -50,6 +51,25 @@
 //! arbitrary path, so a scan does not have to be registered first.
 //! [`Library::remove_root`] forgets the root and deletes every indexed track
 //! under it; the rest of the library is untouched.
+//!
+//! ## When a root was last scanned
+//!
+//! [`Library::scan_root`] records the time of its scan in the root's row:
+//! `last_scanned_at` is the unix second the scan ran to the end. A root
+//! that was never scanned has no time (`NULL`), and neither has a root whose
+//! last scan was **cancelled** or **failed**: a scan that did not finish
+//! must not claim that the root was scanned. The previous time is kept in
+//! that case, so the field answers the question "when did the index of
+//! this root last get a complete look at the disk".
+//!
+//! The time says that the scan ran to the end; the [`ScanReport`] says what
+//! it found. A scan that skipped files (a file that could not be read, a
+//! directory that could not be walked) is still a scan that ran to the end,
+//! and its skips are in the report.
+//!
+//! The column is added to an existing database when it is opened: the
+//! migration is a `pragma_table_info` check followed by an `ALTER TABLE`, so
+//! it is idempotent and keeps the rows of an older database.
 //!
 //! ## Query
 //!
@@ -265,9 +285,9 @@
 //! * `text` matches substrings of the three columns only; it is a `LIKE` scan,
 //!   not a tokenised full-text index, and cannot match across columns
 //!   (`title + artist` as one haystack) or by word prefix ranking.
-//! * `scan_root`/`scan` do not record a per-root last-scan time: the
-//!   `roots` table has only `added_at`. The scan progress is reported per
-//!   scan and is not stored in the index.
+//! * Only [`Library::scan_root`] records the last-scan time. A plain
+//!   [`Library::scan`] works on an arbitrary path and records nothing,
+//!   because it does not know which root row it belongs to.
 //! * A cancelled scan drops the batch that was in flight (at most
 //!   [`SCAN_BATCH_SIZE`] files of work). The files it dropped are indexed
 //!   by the next scan.
@@ -312,6 +332,9 @@ pub use artwork::{
 /// [`read_raw`] expects.
 const TRACK_COLUMNS: &str = "id, path, title, artist, album, album_artist, year, genre, \
      comment, track_no, track_total, disc_no, duration_ms, bitrate_kbps, mtime_ns, size";
+
+/// The column list of the `roots` table, in the order [`read_root`] expects.
+const ROOT_COLUMNS: &str = "id, path, added_at, last_scanned_at";
 
 /// SQL function that lower-cases a value with Rust's Unicode rules, so the
 /// crate is case-insensitive beyond SQLite's ASCII-only `NOCASE`. Registered on
@@ -404,6 +427,12 @@ pub struct Root {
     pub path: PathBuf,
     /// Unix seconds when the root was added.
     pub added_at: i64,
+    /// Unix seconds when the last scan of this root ran to the end.
+    ///
+    /// `None` when the root was never scanned, and also when its last scan
+    /// was cancelled or failed: a scan that did not finish must not claim
+    /// that the root was scanned. The time of the scan before it is kept.
+    pub last_scanned_at: Option<i64>,
 }
 
 /// Summary returned by [`Library::scan`].
@@ -594,10 +623,17 @@ impl Library {
                 CREATE TABLE IF NOT EXISTS roots (
                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
                     path     TEXT NOT NULL UNIQUE,
-                    added_at INTEGER NOT NULL
+                    added_at INTEGER NOT NULL,
+                    last_scanned_at INTEGER
                 );",
             )
             .map_err(map_sqlite)?;
+
+        // A database written by an older version has a `roots` table without
+        // the last-scan column: `CREATE TABLE IF NOT EXISTS` leaves an
+        // existing table as it is. The migration adds the column and keeps
+        // the rows; it is idempotent, so it runs on every open.
+        add_column_if_missing(&self.conn, "roots", "last_scanned_at", "INTEGER")?;
         Ok(())
     }
 
@@ -698,6 +734,10 @@ impl Library {
 
     /// Scan the root registered under `root_id`. See [`Library::scan`].
     ///
+    /// A scan that ran to the end records its time in the root's row; a
+    /// cancelled or failed scan records nothing. See
+    /// [`Library::scan_root_with_progress`].
+    ///
     /// Returns [`Error::NotFound`] when no root has that id, and when the
     /// registered directory no longer exists.
     pub fn scan_root(&mut self, root_id: i64) -> Result<ScanReport> {
@@ -706,6 +746,13 @@ impl Library {
 
     /// Scan the root registered under `root_id`, reporting the progress.
     /// See [`Library::scan_with_progress`].
+    ///
+    /// A scan that ran to the end records its time in the root's row
+    /// (`last_scanned_at`), so the index knows when the root was last
+    /// looked at. A scan that was **cancelled** did not finish and records
+    /// nothing: the previous time is kept, because a cancelled scan must
+    /// not claim that the root was scanned. A scan that **failed** returns
+    /// an error and records nothing either.
     ///
     /// Returns [`Error::NotFound`] when no root has that id, and when the
     /// registered directory no longer exists.
@@ -718,7 +765,11 @@ impl Library {
         let root = self
             .root_by_id(root_id)?
             .ok_or_else(|| Error::NotFound(format!("root {root_id}")))?;
-        self.scan_with_progress(&root.path, cancel, on_progress)
+        let report = self.scan_with_progress(&root.path, cancel, on_progress)?;
+        if !report.cancelled {
+            self.set_last_scanned_at(root_id)?;
+        }
+        Ok(report)
     }
 
     /// Query rows by filter, sorted and paged. See the module docs for the
@@ -887,6 +938,7 @@ impl Library {
             id: self.conn.last_insert_rowid(),
             path: path.to_path_buf(),
             added_at,
+            last_scanned_at: None,
         })
     }
 
@@ -915,7 +967,7 @@ impl Library {
     pub fn roots(&self) -> Result<Vec<Root>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path, added_at FROM roots ORDER BY id")
+            .prepare(&format!("SELECT {ROOT_COLUMNS} FROM roots ORDER BY id"))
             .map_err(map_sqlite)?;
         let rows = stmt.query_map([], read_root).map_err(map_sqlite)?;
         let mut result = Vec::new();
@@ -929,7 +981,7 @@ impl Library {
     fn root_by_path(&self, path: &str) -> Result<Option<Root>> {
         self.conn
             .query_row(
-                "SELECT id, path, added_at FROM roots WHERE path = ?1",
+                &format!("SELECT {ROOT_COLUMNS} FROM roots WHERE path = ?1"),
                 params![path],
                 read_root,
             )
@@ -941,12 +993,26 @@ impl Library {
     fn root_by_id(&self, id: i64) -> Result<Option<Root>> {
         self.conn
             .query_row(
-                "SELECT id, path, added_at FROM roots WHERE id = ?1",
+                &format!("SELECT {ROOT_COLUMNS} FROM roots WHERE id = ?1"),
                 params![id],
                 read_root,
             )
             .optional()
             .map_err(map_sqlite)
+    }
+
+    /// Set the time of the last scan of the root `id`.
+    ///
+    /// The time is the unix second of the moment, not the time of the scan's
+    /// start: the scan has already run when this is called.
+    fn set_last_scanned_at(&mut self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE roots SET last_scanned_at = ?1 WHERE id = ?2",
+                params![now_unix(), id],
+            )
+            .map_err(map_sqlite)?;
+        Ok(())
     }
 
     // ---- removing dead entries ----
@@ -1314,6 +1380,48 @@ impl ScanState<'_> {
     }
 }
 
+/// Add the column `column` to the table `table` when it is not there yet.
+///
+/// The crate has no migration framework: the schema is created with
+/// `CREATE TABLE IF NOT EXISTS`, which leaves a table that already exists
+/// exactly as it is. A database written by an older version therefore keeps
+/// its old shape and misses the columns a newer version expects.
+///
+/// The guard is the table's own column list (`pragma_table_info`), so the
+/// migration is idempotent: it runs on every open and does nothing once the
+/// column is there. The new column is nullable and has no default, so the
+/// rows of the old database keep their values and read as "never scanned"
+/// until a scan fills them in.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    if column_exists(conn, table, column)? {
+        return Ok(());
+    }
+    // The table and the column are constants of this crate, never caller
+    // input, so the statement cannot carry an injection.
+    conn.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+    ))
+    .map_err(map_sqlite)?;
+    Ok(())
+}
+
+/// Whether the table `table` has a column called `column`.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite)?;
+    Ok(count > 0)
+}
+
 /// Configure a fresh connection: foreign keys on, so deleting a track also
 /// drops its `track_extra` rows, plus the Unicode lower-casing SQL function.
 fn configure(conn: &Connection) -> Result<()> {
@@ -1398,6 +1506,7 @@ fn read_root(row: &rusqlite::Row<'_>) -> rusqlite::Result<Root> {
         id: row.get(0)?,
         path: PathBuf::from(row.get::<_, String>(1)?),
         added_at: row.get(2)?,
+        last_scanned_at: row.get(3)?,
     })
 }
 
@@ -2172,7 +2281,12 @@ mod tests {
         assert_eq!(extra_rows(&lib), 2);
 
         assert_eq!(lib.remove_root(&root_a).unwrap(), 1, "one track dropped");
-        assert_eq!(lib.roots().unwrap(), vec![entry_b.clone()]);
+        // The root that is left is the one that was registered: its id and
+        // its path are the ones `add_root` handed out.
+        let listed = lib.roots().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, entry_b.id);
+        assert_eq!(listed[0].path, entry_b.path);
         assert_eq!(lib.count().unwrap(), 1);
         let rows = matches(&lib, &Query::default());
         assert_eq!(rows[0].metadata.title.as_deref(), Some("B"));
@@ -2206,6 +2320,246 @@ mod tests {
         lib.conn
             .query_row("SELECT COUNT(*) FROM track_extra", [], |row| row.get(0))
             .unwrap()
+    }
+
+    // ---- the last scan of a root ----
+
+    /// The column names of the `roots` table, as the database sees them.
+    fn root_columns(lib: &Library) -> Vec<String> {
+        let mut stmt = lib
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('roots')")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    /// Put a known time into the root's row, so a test can tell "untouched"
+    /// from "written again in the same second".
+    fn put_last_scanned_at(lib: &Library, id: i64, at: i64) {
+        lib.conn
+            .execute(
+                "UPDATE roots SET last_scanned_at = ?1 WHERE id = ?2",
+                params![at, id],
+            )
+            .unwrap();
+    }
+
+    /// The last-scan time of the root `id`, as the database holds it.
+    fn last_scanned_at(lib: &Library, id: i64) -> Option<i64> {
+        lib.roots()
+            .unwrap()
+            .into_iter()
+            .find(|root| root.id == id)
+            .expect("the root is listed")
+            .last_scanned_at
+    }
+
+    /// Write a database with the schema of an older version: the `roots`
+    /// table without the last-scan column, and one row in it.
+    fn write_old_database(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE roots (
+                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 path     TEXT NOT NULL UNIQUE,
+                 added_at INTEGER NOT NULL
+             );
+             INSERT INTO roots (path, added_at) VALUES ('C:/old-music', 1000);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_fresh_database_has_the_last_scan_column() {
+        let lib = Library::in_memory().unwrap();
+        assert!(
+            root_columns(&lib)
+                .iter()
+                .any(|name| name == "last_scanned_at"),
+            "the roots table has the last-scan column"
+        );
+    }
+
+    #[test]
+    fn an_old_database_migrates_and_keeps_its_rows() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("old.db");
+        write_old_database(&db);
+
+        let lib = Library::open(&db).unwrap();
+
+        assert!(
+            root_columns(&lib)
+                .iter()
+                .any(|name| name == "last_scanned_at"),
+            "the migration added the column"
+        );
+
+        let roots = lib.roots().unwrap();
+        assert_eq!(roots.len(), 1, "the row of the old database is still there");
+        assert_eq!(roots[0].path, PathBuf::from("C:/old-music"));
+        assert_eq!(roots[0].added_at, 1000);
+        assert_eq!(
+            roots[0].last_scanned_at, None,
+            "a root that was never scanned has no time"
+        );
+    }
+
+    #[test]
+    fn the_migration_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("old.db");
+        write_old_database(&db);
+
+        // The first open migrates, the second one finds the column and
+        // leaves the table alone.
+        let lib = Library::open(&db).unwrap();
+        drop(lib);
+        let lib = Library::open(&db).unwrap();
+        assert_eq!(lib.roots().unwrap().len(), 1);
+        assert!(
+            root_columns(&lib)
+                .iter()
+                .any(|name| name == "last_scanned_at"),
+            "the column is still there"
+        );
+    }
+
+    #[test]
+    fn a_scan_records_the_time_of_the_root() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_fixture_tags(&a, "A", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        assert_eq!(
+            last_scanned_at(&lib, entry.id),
+            None,
+            "a root that was never scanned has no time"
+        );
+
+        let before = now_unix();
+        lib.scan_root(entry.id).unwrap();
+        let after = now_unix();
+
+        let at = last_scanned_at(&lib, entry.id).expect("the scan recorded its time");
+        assert!(
+            (before..=after).contains(&at),
+            "the time is the second the scan ran in"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_scan_records_no_time() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_fixture_tags(&a, "A", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let report = lib
+            .scan_root_with_progress(entry.id, &cancel, |_| {})
+            .unwrap();
+        assert!(report.cancelled);
+        assert_eq!(
+            last_scanned_at(&lib, entry.id),
+            None,
+            "a cancelled scan did not finish and claims no time"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_scan_keeps_the_time_of_the_last_finished_scan() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_fixture_tags(&a, "A", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        lib.scan_root(entry.id).unwrap();
+        put_last_scanned_at(&lib, entry.id, 4242);
+
+        let cancel = Cancel::new();
+        cancel.cancel();
+        lib.scan_root_with_progress(entry.id, &cancel, |_| {})
+            .unwrap();
+
+        assert_eq!(
+            last_scanned_at(&lib, entry.id),
+            Some(4242),
+            "the time of the last finished scan is kept"
+        );
+    }
+
+    #[test]
+    fn a_failed_scan_records_no_time() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+        put_last_scanned_at(&lib, entry.id, 4242);
+
+        // The directory is gone: the scan fails.
+        fs::remove_dir(&root).unwrap();
+        assert!(matches!(lib.scan_root(entry.id), Err(Error::NotFound(_))));
+
+        assert_eq!(
+            last_scanned_at(&lib, entry.id),
+            Some(4242),
+            "a failed scan records no time"
+        );
+    }
+
+    #[test]
+    fn a_scan_of_an_unregistered_path_records_no_time() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("music");
+        fs::create_dir(&root).unwrap();
+        let a = root.join("a.wav");
+        make_wav(&a);
+        write_fixture_tags(&a, "A", "X", "Al");
+
+        let mut lib = Library::in_memory().unwrap();
+        let entry = lib.add_root(&root).unwrap();
+
+        // The plain scan works on an arbitrary path: it does not know which
+        // root row it belongs to, so it records no time.
+        lib.scan(&root).unwrap();
+        assert_eq!(last_scanned_at(&lib, entry.id), None);
+
+        // The registered scan does record it.
+        lib.scan_root(entry.id).unwrap();
+        assert!(last_scanned_at(&lib, entry.id).is_some());
+    }
+
+    #[test]
+    fn the_time_of_a_root_is_kept_when_the_root_is_removed_and_added_again() {
+        let mut lib = Library::in_memory().unwrap();
+        let root = Path::new("C:/music");
+        let entry = lib.add_root(root).unwrap();
+        put_last_scanned_at(&lib, entry.id, 4242);
+        lib.remove_root(root).unwrap();
+
+        // A root that is added again is a new row: it was never scanned.
+        let again = lib.add_root(root).unwrap();
+        assert_eq!(again.last_scanned_at, None);
+        assert_eq!(last_scanned_at(&lib, again.id), None);
     }
 
     #[test]
