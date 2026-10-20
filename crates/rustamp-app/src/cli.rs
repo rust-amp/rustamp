@@ -7,22 +7,29 @@
 //! The command line carries two families of switches:
 //!
 //! * the **reference switches** of S13 §1 — `/CLASS=`, `/CONFIG=`,
-//!   `/BOOKMARK`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL` — spelled
-//!   with a leading `/`, exactly as the audited spec records them;
+//!   `/BOOKMARK`, `/ADD`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL` —
+//!   spelled with a leading `/`, exactly as the audited spec records them;
 //! * **Rustamp's own switches** (`--null`, `--no-audio`, `--volume`, `--skin`,
 //!   `--seconds`, `--enqueue`, `--import-winamp-ini`, `--help`), spelled with
 //!   a leading `--`. They are the product's own test and convenience aids; the
 //!   reference has no such switches.
 //!
-//! S13 §1's list is complete for the reference, so nothing is added to the
-//! `/` family: `/ADD`, `/PLAY`, `/NEW`, `/EJECT` and `/TASKBAR` are **not**
-//! switches here.
+//! S13 §1's list is the reference's **own** switch list, not a closed one: the
+//! second audit pass (2026-10-20) withdrew the completeness claim and moved
+//! the question into §5.13. So nothing is added to the `/` family here beyond
+//! the switches the spec names — and `/ADD`, which the first pass put on the
+//! negative list, **is** a switch: the reference registers its `Enqueue` shell
+//! verb with the command line `"%s" /ADD "%%1"` (S13 §3).
 //!
 //! A leading `/` starts a switch, `=` separates a switch's value, and
 //! **everything else is a file argument** (S13 §1). An unknown `/` token is
-//! therefore a file argument and not an error — that is the spec's rule, and
-//! it is why `/ADD` and friends land in the playlist instead of being
-//! refused.
+//! therefore a file argument and not an error — that is the spec's rule, and it
+//! is why `/PLAY`, `/NEW`, `/EJECT` and `/TASKBAR` land in the playlist
+//! instead of being refused.
+//!
+//! Two switches take their path in the argument that **follows** them:
+//! `/ADD <path>` and `/BOOKMARK <path>` (S13 §1). Both have the same shape,
+//! down to the path that arrives in one quoted argument.
 //!
 //! The optional path of `--import-winamp-ini` is the one place where the two
 //! families meet: the path is the argument behind the switch, when that
@@ -39,12 +46,13 @@
 //! | §2 the class name is case-sensitive | the class half of the instance key is not case-folded | matches | `rustamp-platform/src/single_instance.rs` |
 //! | §1 `/CONFIG=<path>` is the configuration file to use instead of the default | [`Args::config`] replaces the resolved default | matches | `cli.rs`, `lib.rs` |
 //! | §1 `/BOOKMARK <path>` adds the path as a bookmark rather than playing it | [`Args::bookmark`] carries the path; the run adds it and does not play it | matches (see the note below) | `cli.rs`, `lib.rs` |
+//! | §1 `/ADD <path>` enqueues the path instead of playing it — the `Enqueue` verb of §3, which the reference registers with the command line `"%s" /ADD "%%1"` (second audit pass, 2026-10-20) | [`Args::enqueue`] carries the path; the run adds it to the playlist and does not play it | matches | `cli.rs`, `lib.rs` |
 //! | §1 `/INSTALL` is the installer association step | [`RegistrationFlags::install`] | matches | `rustamp-platform/src/shell_registration.rs` |
 //! | §1 `/UNREG` removes the shell registration | [`RegistrationFlags::unreg`] | matches | `rustamp-platform/src/shell_registration.rs` |
 //! | §1 `/NOREG` skips the registration step | [`RegistrationFlags::noreg`] | matches | `rustamp-platform/src/shell_registration.rs` |
 //! | §1 `/ONLYINSTALL` is the install step, then exit | [`RegistrationFlags::only_install`] | matches | `main.rs` |
-//! | §1 no `/ADD`, `/PLAY`, `/NEW`, `/EJECT`, `/TASKBAR` | not implemented; such a token is a file argument | matches | `cli.rs` |
-//! | §1 a command line may carry several paths | the parser takes one file argument and refuses a second | differs (own choice) | `cli.rs` |
+//! | §1 `/PLAY`, `/NEW`, `/EJECT` and `/TASKBAR` are not in the reference's switch list | not implemented; such a token is a file argument | matches (the scope of the negative list is the reference's own switch list, S13 §5.13) | `cli.rs` |
+//! | §1 a command line may carry several paths | the parser takes one file argument and refuses a second; the path of `/ADD` is a path of its own and does not take the file argument's place | differs (own choice) | `cli.rs` |
 //! | §2 a second start looks for a **window** of that class | the check is a named mutex named after the class | differs (own choice, S13 §5.8) | `rustamp-platform/src/single_instance.rs` |
 //! | §2 the player registers a window class, and the class name is what `/CLASS=` overrides | the registered main-window class stays `Winamp v1.x` (S09 §1 and §8 item 1: an ABI fact plugins and external tools depend on); `/CLASS=` overrides the class the **check** looks for | own choice (the task's wording: "the class the single-instance check looks for") | `rustamp-app/src/window.rs`, `rustamp-platform/src/single_instance.rs` |
 //! | §2 the hand-over is a window message | the hand-over travels over a named pipe | differs (own choice, S13 §5.8) | `rustamp-platform/src/single_instance.rs` |
@@ -58,14 +66,22 @@
 //! what S13 §1 settles — and the run says that the bookmark store does not
 //! exist yet.
 //!
+//! The note on `/ADD`: the reference registers its `Enqueue` shell verb with
+//! the command line `"%s" /ADD "%%1"` (S13 §3), so the verb **is** the switch.
+//! Rustamp's own `--enqueue` asks the same thing about the file argument, and
+//! both spellings end in one [`Enqueue`] value, so the verb and the switch ask
+//! for the same thing in the same words and cannot drift apart.
+//!
 //! The open questions of S13 §5 stay open here: the in-window drop rule
 //! (§5.1), the drop of a folder (§5.2), `/BOOKMARK` without a path (§5.3),
 //! whether `/CONFIG=` moves the skin directories (§5.4), what a busy instance
 //! does (§5.5), whether `/CONFIG=` affects the class (§5.6), the reference's
 //! own default for `/CLASS=` (§5.7), the hand-over message (§5.8), the
 //! quoting of the bookmark command line (§5.9), the directory identifiers
-//! (§5.10), the display names of the other verbs (§5.11) and what the
-//! `DropTarget` entries carry (§5.12).
+//! (§5.10), the display names of the other verbs (§5.11), what the
+//! `DropTarget` entries carry (§5.12), whether the reference's switch list is
+//! complete (§5.13) and the name of the verb that registers `/BOOKMARK`
+//! (§5.14).
 
 use std::fmt;
 
@@ -105,6 +121,30 @@ pub enum Bookmark {
     WithoutPath,
 }
 
+/// What the command line asks to be enqueued instead of played.
+///
+/// S13 §1: `/ADD <path>` enqueues the path instead of playing it — the
+/// `Enqueue` verb of §3, which the reference registers with the command line
+/// `"%s" /ADD "%%1"`. Rustamp's own `--enqueue` asks the same thing about the
+/// file argument, so both spellings end in this one value: the shell's verb
+/// and the reference's switch ask for the same thing in the same words.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Enqueue {
+    /// Nothing is enqueued.
+    #[default]
+    None,
+    /// The file argument is enqueued instead of played (`--enqueue`).
+    File,
+    /// This path is enqueued instead of played (`/ADD <path>`).
+    Path(PathBuf),
+    /// `/ADD` without a path.
+    ///
+    /// S13 §5.3 leaves the form of a path-taking switch without a path open
+    /// (it asks it about `/BOOKMARK`), so the player says so and does
+    /// nothing rather than guessing.
+    WithoutPath,
+}
+
 /// What the `--import-winamp-ini` switch asks for (S12).
 ///
 /// The switch is an explicit action: it imports a Winamp 2.95 `winamp.ini`
@@ -126,7 +166,8 @@ pub enum WinampIniImport {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Args {
     /// The file to load and play. `None` starts with nothing loaded (S02 §3
-    /// shows the program name in the marquee).
+    /// shows the program name in the marquee). With [`Enqueue::File`] the
+    /// file is loaded but **not** played.
     pub file: Option<PathBuf>,
     /// Output device choice.
     pub output: OutputChoice,
@@ -141,8 +182,8 @@ pub struct Args {
     pub import_winamp_ini: WinampIniImport,
     /// `--help`/`-h` was given.
     pub help: bool,
-    /// The file is added to the playlist instead of being played (`--enqueue`).
-    pub enqueue: bool,
+    /// What is enqueued instead of played (`--enqueue`, `/ADD <path>`).
+    pub enqueue: Enqueue,
     /// The window class the single-instance check looks for (`/CLASS=`).
     pub class: Option<String>,
     /// The configuration file to use instead of the default (`/CONFIG=`).
@@ -179,7 +220,7 @@ impl Args {
 pub const USAGE: &str = "\
 usage: rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
                  [--seconds <n>] [--enqueue] [--import-winamp-ini [path]] [-h|--help]
-       rustamp [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>]
+       rustamp [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
               [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 
   <file>            media file to load and play (optional)
@@ -197,6 +238,7 @@ usage: rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path
   /CLASS=<name>     the window class the single-instance check looks for
   /CONFIG=<path>    the configuration file to use instead of the default
   /BOOKMARK <path>  add the path as a bookmark rather than playing it
+  /ADD <path>       add the path to the playlist instead of playing it
   /INSTALL          write the shell registration
   /UNREG            remove the shell registration
   /NOREG            skip the registration step
@@ -252,7 +294,18 @@ where
                 "UNREG" => parsed.registration.unreg = true,
                 "NOREG" => parsed.registration.noreg = true,
                 "ONLYINSTALL" => parsed.registration.only_install = true,
-                "BOOKMARK" => parsed.bookmark = Some(bookmark_path(&mut it)),
+                "BOOKMARK" => {
+                    parsed.bookmark = Some(match path_argument(&mut it) {
+                        Some(path) => Bookmark::Path(path),
+                        None => Bookmark::WithoutPath,
+                    })
+                }
+                "ADD" => {
+                    parsed.enqueue = match path_argument(&mut it) {
+                        Some(path) => Enqueue::Path(path),
+                        None => Enqueue::WithoutPath,
+                    }
+                }
                 _ => {
                     if let Some(value) = rest.strip_prefix("CLASS=") {
                         parsed.class = Some(class_value(value)?);
@@ -262,11 +315,16 @@ where
                         // The shell registers the bookmark form as one quoted
                         // argument (S13 §1), so the path can arrive in the
                         // same argument as the switch.
-                        parsed.bookmark = Some(Bookmark::Path(PathBuf::from(path)));
+                        parsed.bookmark = Some(Bookmark::Path(PathBuf::from(unquote(path))));
+                    } else if let Some(path) = rest.strip_prefix("ADD ") {
+                        // The same whole form for `/ADD` (S13 §1): the shell
+                        // registers the verb with `"%s" /ADD "%%1"`, so the
+                        // switch and its path can arrive in one argument.
+                        parsed.enqueue = Enqueue::Path(PathBuf::from(unquote(path)));
                     } else {
-                        // Anything else is a file argument (S13 §1): the
-                        // switch list is complete, so an unknown `/` token
-                        // is not a switch at all.
+                        // Anything else is a file argument (S13 §1): a token
+                        // the reference's switch list does not name is not a
+                        // switch at all.
                         set_file(&mut parsed, arg)?;
                     }
                 }
@@ -276,7 +334,7 @@ where
         match arg.as_str() {
             "--null" => parsed.output = OutputChoice::Null,
             "--no-audio" => parsed.output = OutputChoice::NoAudio,
-            "--enqueue" => parsed.enqueue = true,
+            "--enqueue" => parsed.enqueue = Enqueue::File,
             "--volume" => {
                 let value = it.next().ok_or(CliError::MissingValue("--volume"))?;
                 parsed.volume = Some(value.parse::<u8>().map_err(|_| CliError::BadValue {
@@ -333,21 +391,34 @@ fn class_value(value: &str) -> Result<String, CliError> {
     Ok(value.to_owned())
 }
 
-/// The path of `/BOOKMARK`: the next argument, when there is one.
+/// The path of `/ADD` or `/BOOKMARK`: the next argument, when there is one.
 ///
-/// A missing path is left open by S13 §5.3, so the parser records that the
-/// switch was given without a path instead of guessing.
-fn bookmark_path<I>(it: &mut std::iter::Peekable<I>) -> Bookmark
+/// Both switches take their path in the argument that follows them (S13 §1),
+/// so they share this one rule. A missing path is left open by S13 §5.3, so
+/// the caller records that the switch was given without a path instead of
+/// guessing.
+fn path_argument<I>(it: &mut std::iter::Peekable<I>) -> Option<PathBuf>
 where
     I: Iterator<Item = String>,
 {
     match it.peek() {
         Some(next) if !is_switch(next) => {
             let path = it.next().expect("peeked");
-            Bookmark::Path(PathBuf::from(path))
+            Some(PathBuf::from(unquote(&path)))
         }
-        _ => Bookmark::WithoutPath,
+        _ => None,
     }
+}
+
+/// The path without the quotes the shell puts around it.
+///
+/// The registered command lines quote the path (`"%s" /ADD "%%1"`,
+/// `"%s" /BOOKMARK "%%1"`, S13 §1), so a path that arrives inside a quoted
+/// argument keeps its quotes unless they are taken off here.
+fn unquote(path: &str) -> &str {
+    path.strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(path)
 }
 
 /// Whether an argument carries a switch marker rather than being a path.
@@ -491,6 +562,7 @@ mod tests {
             "/CLASS=",
             "/CONFIG=",
             "/BOOKMARK",
+            "/ADD",
             "/INSTALL",
             "/UNREG",
             "/NOREG",
@@ -663,17 +735,19 @@ mod tests {
 
     #[test]
     fn an_unknown_slash_token_is_a_file_argument() {
-        // S13 §1: the switch list is complete, so an unknown `/` token is
-        // not a switch.
-        let args = parse_args(&["/ADD"]).unwrap();
-        assert_eq!(args.file, Some(PathBuf::from("/ADD")));
+        // S13 §1: a token the reference's switch list does not name is not
+        // a switch, it is a file argument.
+        let args = parse_args(&["/UNKNOWN"]).unwrap();
+        assert_eq!(args.file, Some(PathBuf::from("/UNKNOWN")));
         assert_eq!(args.class, None);
         assert_eq!(args.registration, RegistrationFlags::default());
     }
 
     #[test]
     fn the_switches_the_reference_does_not_have_are_file_arguments() {
-        for token in ["/ADD", "/PLAY", "/NEW", "/EJECT", "/TASKBAR"] {
+        // S13 §1: the negative list is scoped to the reference's own switch
+        // list (S13 §5.13). `/ADD` is not on it — it is a switch.
+        for token in ["/PLAY", "/NEW", "/EJECT", "/TASKBAR"] {
             let args = parse_args(&[token]).unwrap();
             assert_eq!(
                 args.file,
@@ -694,7 +768,72 @@ mod tests {
     #[test]
     fn enqueue_adds_the_file_instead_of_playing_it() {
         let args = parse_args(&["--enqueue", "song.mp3"]).unwrap();
-        assert!(args.enqueue);
+        assert_eq!(args.enqueue, Enqueue::File);
+        assert_eq!(args.file, Some(PathBuf::from("song.mp3")));
+    }
+
+    // ----- S13 §1: the `/ADD` switch (second audit pass, 2026-10-20) -----
+
+    #[test]
+    fn add_takes_the_path_that_follows_it() {
+        // S13 §1: `/ADD <path>` takes its path in the argument that follows
+        // the switch — the same shape as `/BOOKMARK`.
+        let args = parse_args(&["/ADD", "C:/music/a.mp3"]).unwrap();
+        assert_eq!(args.enqueue, Enqueue::Path(PathBuf::from("C:/music/a.mp3")));
+    }
+
+    #[test]
+    fn an_added_path_is_not_the_file_that_is_played() {
+        // The path of `/ADD` is enqueued; it is not the file the player
+        // loads and plays.
+        let args = parse_args(&["/ADD", "C:/music/a.mp3"]).unwrap();
+        assert_eq!(args.file, None);
+    }
+
+    #[test]
+    fn add_also_accepts_the_quoted_whole_form() {
+        // S13 §1: the shell registers the verb with `"%s" /ADD "%%1"`, so
+        // the switch and its path can arrive in one argument.
+        let args = parse_args(&["/ADD C:/music/a.mp3"]).unwrap();
+        assert_eq!(args.enqueue, Enqueue::Path(PathBuf::from("C:/music/a.mp3")));
+    }
+
+    #[test]
+    fn the_quotes_of_a_registered_path_are_taken_off() {
+        // The registered command line quotes the path, so a path that
+        // arrives inside a quoted argument keeps its quotes.
+        let args = parse_args(&["/ADD \"C:/music/a.mp3\""]).unwrap();
+        assert_eq!(args.enqueue, Enqueue::Path(PathBuf::from("C:/music/a.mp3")));
+    }
+
+    #[test]
+    fn an_add_without_a_path_is_recorded_as_such() {
+        // S13 §5.3 leaves the form open; the parser does not guess.
+        let args = parse_args(&["/ADD"]).unwrap();
+        assert_eq!(args.enqueue, Enqueue::WithoutPath);
+        assert_eq!(args.file, None);
+    }
+
+    #[test]
+    fn an_add_does_not_swallow_the_next_switch() {
+        let args = parse_args(&["/ADD", "/INSTALL"]).unwrap();
+        assert_eq!(args.enqueue, Enqueue::WithoutPath);
+        assert!(args.registration.install);
+    }
+
+    #[test]
+    fn an_add_does_not_swallow_a_rustamp_switch_either() {
+        let args = parse_args(&["/ADD", "--volume", "128"]).unwrap();
+        assert_eq!(args.enqueue, Enqueue::WithoutPath);
+        assert_eq!(args.volume, Some(128));
+    }
+
+    #[test]
+    fn an_add_and_a_file_argument_can_be_mixed() {
+        // S13 §1: a command line may carry several paths, and the switches
+        // and the paths are mixed.
+        let args = parse_args(&["/ADD", "C:/music/a.mp3", "song.mp3"]).unwrap();
+        assert_eq!(args.enqueue, Enqueue::Path(PathBuf::from("C:/music/a.mp3")));
         assert_eq!(args.file, Some(PathBuf::from("song.mp3")));
     }
 }

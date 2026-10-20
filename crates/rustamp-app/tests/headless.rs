@@ -212,14 +212,14 @@ fn a_bookmark_is_added_and_not_played() {
 
 #[test]
 fn an_unknown_slash_token_is_a_file_argument() {
-    // S13 §1: the switch list is complete, so an unknown `/` token is a
-    // file argument and not an error.
+    // S13 §1: a token the reference's switch list does not name is a file
+    // argument and not an error.
     let dir = tempfile::tempdir().unwrap();
     let mut command = binary();
     isolate(&mut command, &dir);
     let output = command
         .arg("--null")
-        .arg("/ADD")
+        .arg("/PLAY")
         .output()
         .expect("spawn rustamp");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -230,6 +230,53 @@ fn an_unknown_slash_token_is_a_file_argument() {
         !stderr.contains("unknown option"),
         "an unknown `/` token must not be refused:\n{stderr}"
     );
+    assert!(!stdout.contains("playing"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn an_added_path_is_added_and_not_played() {
+    // S13 §1: `/ADD <path>` enqueues the path instead of playing it — the
+    // `Enqueue` verb of §3, which the reference registers with the command
+    // line `"%s" /ADD "%%1"`.
+    let fixture = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = binary();
+    isolate(&mut command, &dir);
+    let output = command
+        .arg("--null")
+        .arg("/ADD")
+        .arg(&fixture)
+        .output()
+        .expect("spawn rustamp");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("playing"),
+        "an added path must not start the playback:\n{stdout}"
+    );
+    assert!(
+        stderr.contains(&fixture.display().to_string()),
+        "the run must report the path it added:\n{stderr}"
+    );
+}
+
+#[test]
+fn an_add_without_a_path_is_reported() {
+    // S13 §5.3 leaves the form of a path-taking switch without a path open,
+    // so the run reports it instead of guessing.
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = binary();
+    isolate(&mut command, &dir);
+    let output = command
+        .arg("--null")
+        .arg("/ADD")
+        .output()
+        .expect("spawn rustamp");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stderr.contains("/ADD without a path"), "stderr:\n{stderr}");
     assert!(!stdout.contains("playing"), "stdout:\n{stdout}");
 }
 
