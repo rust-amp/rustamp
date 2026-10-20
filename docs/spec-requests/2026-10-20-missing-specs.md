@@ -21,8 +21,8 @@ measurement can turn any item below into a fact.
 |---|---|
 | S08 | the visualization analyser, its bands, its decay and its frame rate |
 | S11 | `gen.bmp` and the `embed`/video window |
-| S12 | `winamp.ini` import and the key names it carries |
-| S13 | (see §5 — the card names it, no content survives) |
+| S12 | ~~winamp.ini import and the key names it carries~~ **delivered: specs/S12-winamp-ini.md (audited 2026-10-20)** |
+| S13 | ~~the card names it, no content survives~~ **delivered: `specs/S13-command-line.md` (audited 2026-10-20)** - the command line, single instance and the shell/drag-and-drop rules |
 | S14 | playlist title formatting (`%1`, `$if`, …) |
 | S16 | the Preferences page set and their controls |
 | S18 | crossfade: length, curve, and what happens on a manual skip |
@@ -69,7 +69,7 @@ Questions:
 4. Whether `gen.bmp` is required for a window to open, and what is drawn when
    the skin has no `gen.bmp`.
 
-## 3. S12 — `winamp.ini`
+## 3. S12 - `winamp.ini` - **DELIVERED** (specs/S12-winamp-ini.md)
 
 **Not implemented**: no import, no key list.
 
@@ -85,11 +85,10 @@ Questions:
 4. Whether a missing key falls back to a documented default and what that
    default is.
 
-## 4. S13 — unknown content
+## 4. S13 - unknown content - **DELIVERED as specs/S13-command-line.md**
 
-The roadmap names an `S13` card but no content survives in the tree. One line
-from the dirty room settles it: **what was S13 meant to cover?** If the answer is
-"nothing distinct", say so and the card can be closed.
+**Answer:** S13 is the command line, single instance and the shell/drag-and-drop rules. It is delivered as `specs/S13-command-line.md` (audited 2026-10-20): seven switches (`/CLASS=`, `/CONFIG=`, `/BOOKMARK`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL`), the single-instance rule, and the `Play`/`Enqueue`/`ListBookmark`/`open` verbs that make drag-and-drop from Explorer work.
+
 
 ## 5. S14 — playlist title formatting
 

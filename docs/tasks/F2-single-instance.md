@@ -29,8 +29,13 @@ thread must drain the queue somewhere; `about_to_wait` is that seam (four lines)
   modules.
 - The vendored `windows` crate 0.62 API for the Win32 calls.
 
-S13 does not exist as a spec. The behaviours it would have fixed are therefore
-**own choices**, stated as such below; none is promoted from a guess to a fact.
+S13 did not exist as a spec when this card was written. It does now:
+`specs/S13-command-line.md` was audited on 2026-10-20 (dirty-room role under
+RFC 0021) and settles the switch set (`/CLASS=`, `/CONFIG=`, `/BOOKMARK`,
+`/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL`), the single-instance rule and
+the shell verbs. The behaviours the card had to leave as **own choices** should
+be re-checked against that spec; the card's own text is kept as the record of
+what was implemented before the spec existed.
 
 **Forbidden sources**
 - Winamp 5.x source, Winamp SDK headers or documentation, disassembly, the
