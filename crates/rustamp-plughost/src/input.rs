@@ -42,6 +42,14 @@
 //!   itself (S09 §3.1 offset 0x54, §3.7). The host calls no output
 //!   callback of its own, or the output would be flushed twice.
 //!
+//! * **It forwards a stop, and nothing of the closing.** S09 §3.1 offset
+//!   0x48 gives the input module a `stop()` slot, and S09 §3.5 step 6 says
+//!   what the host does with it: "User stop: the host calls `stop()`". The
+//!   rest of the step — the plugin stops its decode thread, closes the
+//!   output it drives and calls the host's `analyzer_deinit` — is the
+//!   plugin's own work (S09 §3.1 offset 0x48, §3.5 step 6). The host calls
+//!   no output callback of its own, or the output would be closed twice.
+//!
 //! Licensed `MIT OR Apache-2.0` (RFC 0004).
 
 use std::ffi::{c_char, c_int};
@@ -197,6 +205,12 @@ pub(crate) fn call_play(module: *mut InModule, path: &Path) -> Result<(), InputE
 }
 
 /// Call the plugin's `stop` (S09 §3.1 offset 0x48).
+///
+/// The plugin's duty is the whole of the step: it stops its decode thread,
+/// closes the output it drives and calls the host's `analyzer_deinit` before
+/// it returns (S09 §3.1 offset 0x48, §3.5 step 6). The host calls no output
+/// callback of its own here — the output's `close` is the plugin's call
+/// (S09 §3.6, §3.7, §4.2 step 3).
 ///
 /// # Safety
 ///

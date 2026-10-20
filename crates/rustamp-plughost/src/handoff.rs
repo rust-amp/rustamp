@@ -30,6 +30,13 @@
 //!   output it drives with the output's own `pause(state)` (S09 §3.7,
 //!   §4.1 offset 0x38, §4.2 step 3). The host calls no output callback
 //!   here either.
+//! * **A stop is one call, and the closing belongs to the plugin.** S09
+//!   §3.5 step 6: "User stop: the host calls `stop()`; the plugin stops its
+//!   decode thread, closes the output and calls `analyzer_deinit()`". The
+//!   host's whole part of a stop is that one call into the input module
+//!   (S09 §3.1 offset 0x48); the output's `close` is the plugin's call
+//!   (S09 §3.6, §3.7, §4.2 step 3), so the host calls no output callback
+//!   here either.
 //!
 //! # What the host does not do here
 //!
@@ -282,6 +289,21 @@ pub(crate) mod doubles {
         static INPUT_MODULE: Cell<*mut InModule> = const { Cell::new(core::ptr::null_mut()) };
     }
 
+    thread_local! {
+        /// Whether the scripted track ends on its own (S09 §3.5 step 5).
+        static TRACK_ENDS: Cell<bool> = const { Cell::new(true) };
+    }
+
+    thread_local! {
+        /// Whether the scripted output is open and still playing.
+        ///
+        /// The output's `is_playing` answers whether it is still producing
+        /// (S09 §4.1 offset 0x38), and the plugin closes the output it
+        /// drives when the track ends or when the user stops (S09 §3.1 offset
+        /// 0x48, §3.5 steps 5–6).
+        static OUTPUT_OPEN: Cell<bool> = const { Cell::new(false) };
+    }
+
     /// The calls the doubles recorded, in order.
     pub(crate) fn calls() -> Vec<String> {
         CALLS.with(|calls| calls.borrow().clone())
@@ -336,6 +358,16 @@ pub(crate) mod doubles {
         /// requires no plugin to provide one (S09 §0), so its absence is a
         /// fact about that plugin.
         pub has_seek: bool,
+        /// The plugin supplies a `stop` slot (S09 §3.1 offset 0x48). S09
+        /// requires no plugin to provide one (S09 §0), so its absence is a
+        /// fact about that plugin.
+        pub has_stop: bool,
+        /// The scripted track ends on its own right away: the plugin closes
+        /// the output once the output stops playing (S09 §3.5 steps 4–5).
+        /// With the flag clear the track keeps playing, so the output stays
+        /// open until the plugin's `stop` closes it (S09 §3.1 offset 0x48,
+        /// §3.5 step 6).
+        pub track_ends: bool,
     }
 
     impl Default for InputScript {
@@ -343,6 +375,8 @@ pub(crate) mod doubles {
             Self {
                 uses_output: true,
                 has_seek: true,
+                has_stop: true,
+                track_ends: true,
             }
         }
     }
@@ -350,8 +384,9 @@ pub(crate) mod doubles {
     /// A scripted input module (S09 §3.1).
     ///
     /// `script` says what the plugin offers: whether it routes its audio
-    /// through an output plugin (flag bit 0, S09 §3.3) and whether it
-    /// supplies a `seek` slot (S09 §3.1 offset 0x54).
+    /// through an output plugin (flag bit 0, S09 §3.3), whether it supplies a
+    /// `seek` slot (S09 §3.1 offset 0x54) and a `stop` slot (S09 §3.1 offset
+    /// 0x48), and whether its track ends on its own (S09 §3.5 step 5).
     pub(crate) fn input_module(script: InputScript) -> *mut InModule {
         // Leaked on purpose: the module must outlive the registry that holds a
         // raw pointer to it, exactly as a mapped DLL's static data does.
@@ -367,7 +402,7 @@ pub(crate) mod doubles {
             quit: Some(in_quit),
             config: Some(in_config),
             play: Some(in_play),
-            stop: Some(in_stop),
+            stop: script.has_stop.then_some(in_stop),
             pause: Some(in_pause),
             unpause: Some(in_unpause),
             is_paused: Some(in_is_paused),
@@ -378,6 +413,9 @@ pub(crate) mod doubles {
         }));
         let module = module as *mut InModule;
         INPUT_MODULE.with(|slot| slot.set(module));
+        TRACK_ENDS.with(|ends| ends.set(script.track_ends));
+        // A new scripted plugin starts with a closed output.
+        OUTPUT_OPEN.with(|open| open.set(false));
         module
     }
 
@@ -419,8 +457,26 @@ pub(crate) mod doubles {
         record("config".to_string());
     }
 
+    /// The scripted input plugin's `stop` (S09 §3.1 offset 0x48).
+    ///
+    /// S09 §3.5 step 6: "User stop: the host calls `stop()`; the plugin stops
+    /// its decode thread, closes the output and calls `analyzer_deinit()`".
+    /// The closing is the plugin's own work — the host calls no output
+    /// callback of its own.
     unsafe extern "C" fn in_stop() {
         record("stop".to_string());
+        let out = output_of_input();
+        if out.is_null() || !OUTPUT_OPEN.with(|open| open.get()) {
+            return;
+        }
+        as_input_plugin(|| {
+            // SAFETY: live output module in the test's static data.
+            unsafe {
+                if let Some(close) = (*out).close {
+                    close();
+                }
+            }
+        });
     }
 
     /// The scripted input plugin's `pause` (S09 §3.1 offset 0x3C).
@@ -493,6 +549,10 @@ pub(crate) mod doubles {
     /// `can_write`/`write`, then `is_playing`, then `close`. The output it
     /// drives is the one the host wrote into the `out_module` member
     /// (S09 §3.7) — the plugin never learns about it any other way.
+    ///
+    /// With a track that does not end on its own the output stays open: the
+    /// plugin holds it until the user stops (S09 §3.1 offset 0x48, §3.5
+    /// step 6).
     unsafe extern "C" fn in_play(_file: *const c_char) -> c_int {
         let module = INPUT_MODULE.with(|slot| slot.get());
         // SAFETY: the test installed the module before the host called `play`.
@@ -518,7 +578,11 @@ pub(crate) mod doubles {
                     if let Some(is_playing) = (*out).is_playing {
                         is_playing();
                     }
-                    if let Some(close) = (*out).close {
+                    // S09 §3.5 step 5: the track ends when the output stops
+                    // playing, and the plugin then closes the output.
+                    if TRACK_ENDS.with(|ends| ends.get())
+                        && let Some(close) = (*out).close
+                    {
                         close();
                     }
                 }
@@ -547,11 +611,13 @@ pub(crate) mod doubles {
         _prebuffer_ms: c_int,
     ) -> c_int {
         record(format!("open {}", caller()));
+        OUTPUT_OPEN.with(|open| open.set(true));
         0
     }
 
     unsafe extern "C" fn out_close() {
         record(format!("close {}", caller()));
+        OUTPUT_OPEN.with(|open| open.set(false));
     }
 
     unsafe extern "C" fn out_write(_data: *mut c_char, len: c_int) -> c_int {
@@ -566,7 +632,9 @@ pub(crate) mod doubles {
 
     unsafe extern "C" fn out_is_playing() -> c_int {
         record(format!("is_playing {}", caller()));
-        0
+        // S09 §4.1 offset 0x38: the output is still playing while it is
+        // open.
+        OUTPUT_OPEN.with(|open| c_int::from(open.get()))
     }
 
     unsafe extern "C" fn out_pause(state: c_int) -> c_int {
@@ -866,6 +934,185 @@ mod tests {
                 "pause 1 input",
                 "unpause",
                 "pause 0 input",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_stop_reaches_the_input_plugin_and_the_plugin_closes_the_output() {
+        // S09 §3.5 step 6: "User stop: the host calls `stop()`; the plugin
+        // stops its decode thread, closes the output and calls
+        // `analyzer_deinit()`". The host's whole part of a stop is that one
+        // call into the input plugin (S09 §3.1 offset 0x48).
+        doubles::clear();
+        let (mut registry, input_id, output_id) = registry_with_script(doubles::InputScript {
+            // The track keeps playing, so the output stays open until the
+            // plugin's stop closes it.
+            track_ends: false,
+            ..doubles::InputScript::default()
+        });
+        registry
+            .select_output(output_id)
+            .expect("the output plug-in must be selectable");
+        registry
+            .play_input(input_id, Path::new(TRACK), 200, -10)
+            .expect("the hand-over and the play must succeed");
+        doubles::clear();
+
+        registry
+            .stop_input(input_id)
+            .expect("the stop must reach the plugin");
+
+        assert_eq!(
+            doubles::calls(),
+            vec![
+                // The host calls the input plugin's `stop` (S09 §3.1 offset
+                // 0x48).
+                "stop",
+                // The plugin closes the output it drives (S09 §3.1 offset
+                // 0x48, §3.5 step 6).
+                "close input",
+            ]
+        );
+        assert!(
+            !doubles::calls().iter().any(|call| call.ends_with(" host")),
+            "the host must call no output callback on the stop path: {:?}",
+            doubles::calls()
+        );
+    }
+
+    #[test]
+    fn a_stop_on_a_plugin_without_an_output_closes_nothing() {
+        // S09 §3.7: without flag bit 0 the plugin drives no output, so there
+        // is no output for the stop to close.
+        doubles::clear();
+        let (mut registry, input_id, output_id) = registry_with_script(doubles::InputScript {
+            uses_output: false,
+            track_ends: false,
+            ..doubles::InputScript::default()
+        });
+        registry
+            .select_output(output_id)
+            .expect("the output plug-in must be selectable");
+        registry
+            .play_input(input_id, Path::new(TRACK), 200, -10)
+            .expect("the play must succeed");
+        doubles::clear();
+
+        registry
+            .stop_input(input_id)
+            .expect("the stop must reach the plugin");
+
+        assert_eq!(doubles::calls(), vec!["stop"]);
+    }
+
+    #[test]
+    fn a_stop_is_refused_when_there_is_no_input_plugin_to_stop() {
+        doubles::clear();
+        let (registry, input_id, output_id) = registry_with(true);
+
+        // An id no plugin carries.
+        assert_eq!(
+            registry.stop_input(9_999),
+            Err(HandoffError::UnknownPlugin(9_999))
+        );
+        // A plugin of another kind: the host must not reach into its slots.
+        assert_eq!(
+            registry.stop_input(output_id),
+            Err(HandoffError::WrongKind {
+                expected: PluginKind::Input,
+                actual: PluginKind::Output,
+            })
+        );
+        // The input plugin is reachable, so this call must reach it.
+        assert_eq!(registry.stop_input(input_id), Ok(()));
+        assert_eq!(
+            doubles::calls(),
+            vec!["stop"],
+            "only the input plugin's own stop may have been called"
+        );
+    }
+
+    #[test]
+    fn a_stop_is_refused_when_the_plugin_has_no_stop_slot() {
+        // S09 §0: a callback slot may be null and a null slot is never called
+        // through. The absence of a `stop` slot is a fact about that plugin
+        // (S09 §3.1 offset 0x48), never a verdict on its validity.
+        doubles::clear();
+        let (registry, input_id, _output_id) = registry_with_script(doubles::InputScript {
+            has_stop: false,
+            ..doubles::InputScript::default()
+        });
+
+        assert_eq!(
+            registry.stop_input(input_id),
+            Err(HandoffError::MissingCallback("stop"))
+        );
+        assert!(
+            doubles::calls().is_empty(),
+            "a refused stop must call nothing: {:?}",
+            doubles::calls()
+        );
+    }
+
+    #[test]
+    fn a_stop_is_refused_when_the_plugin_is_not_live() {
+        // `quit` already ran, so there is nothing left to drive (S09 §3.5
+        // line 166).
+        doubles::clear();
+        let (mut registry, input_id, _output_id) = registry_with(true);
+        registry.quit_all();
+        doubles::clear();
+
+        assert_eq!(
+            registry.stop_input(input_id),
+            Err(HandoffError::NotInitialized)
+        );
+        assert!(
+            doubles::calls().is_empty(),
+            "a refused stop must call nothing: {:?}",
+            doubles::calls()
+        );
+    }
+
+    #[test]
+    fn every_stop_reaches_the_plugin_and_the_plugin_owns_what_a_second_one_means() {
+        // The host keeps no playback state: `play_input` hands the output
+        // over and calls `play`, `stop_input` calls `stop` — the same shape
+        // as the seek and the pause routes. S09 §3.5 step 6 says what the
+        // host does on a user stop, and S09 §3.1 offset 0x48 says what the
+        // plugin does with it; neither says that a stop without a play is a
+        // host-side error. The host forwards it and the plugin decides.
+        doubles::clear();
+        let (mut registry, input_id, output_id) = registry_with_script(doubles::InputScript {
+            track_ends: false,
+            ..doubles::InputScript::default()
+        });
+        registry
+            .select_output(output_id)
+            .expect("the output plug-in must be selectable");
+        registry
+            .play_input(input_id, Path::new(TRACK), 200, -10)
+            .expect("the hand-over and the play must succeed");
+        doubles::clear();
+
+        registry
+            .stop_input(input_id)
+            .expect("the first stop must reach the plugin");
+        registry
+            .stop_input(input_id)
+            .expect("the second stop must reach the plugin as well");
+
+        assert_eq!(
+            doubles::calls(),
+            vec![
+                "stop",
+                // The plugin closes the output it drives (S09 §3.5 step 6).
+                "close input",
+                // The second stop reaches the plugin again. The host does not
+                // swallow it; the output is already closed, so nothing is
+                // closed twice.
+                "stop",
             ]
         );
     }
