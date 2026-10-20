@@ -9,7 +9,7 @@
 //! ```text
 //! GET http://<host>:<port>/<path> HTTP/1.0
 //! Host: <host>:<port>
-//! User-Agent: Winamp/<version>
+//! User-Agent: Rustamp/<version>
 //! Accept: */*
 //! ```
 //!
@@ -39,9 +39,11 @@
 //! * The **schemes** (S19 §6, question 8): only `http://`. An `https://` URL
 //!   is refused by name - this tree has no TLS, and S19 establishes no
 //!   evidence that the reference reads a TLS stream at all.
-//! * The **version** in the `User-Agent`: S19 §1 says the line carries a
-//!   version but does not establish the string. This source sends
-//!   `Winamp/2.95`, the version of the player this project imitates.
+//! * The **`User-Agent`**. S19 §1 records that the *reference* sends
+//!   `Winamp/<version>` and leaves the string open. **We identify as Rustamp**
+//!   (owner decision, 2026-10-20): our software is not the reference, and a
+//!   server should see whom it is talking to. The line carries this build's own
+//!   package version, so it never claims a version we do not have.
 //! * The **`Host:` line** (S19 §6, question 10): it carries the authority of
 //!   the request line - the host and the port - because that is what the
 //!   request line itself carries (RFC 7230 §5.4).
@@ -85,9 +87,11 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The `User-Agent` this source sends.
 ///
-/// S19 §1: the line names the player and carries a version; the version
-/// string itself is not established there (see the module docs).
-const USER_AGENT: &str = "Winamp/2.95";
+/// S19 §1 records that the **reference** sends `Winamp/<version>`; **we identify
+/// as Rustamp** (owner decision, 2026-10-20). Our software is not the reference,
+/// and a server should see whom it is talking to. The version is this build's own
+/// package version, so the line never claims a version we do not have.
+const USER_AGENT: &str = concat!("Rustamp/", env!("CARGO_PKG_VERSION"));
 
 /// The largest response head this source reads.
 ///
@@ -874,11 +878,13 @@ mod tests {
         let request = String::from_utf8(request_bytes(&url)).expect("text");
         assert_eq!(
             request,
-            "GET http://example.com:8080/music/song.mp3 HTTP/1.0\r\n\
-             Host: example.com:8080\r\n\
-             User-Agent: Winamp/2.95\r\n\
-             Accept: */*\r\n\
-             \r\n"
+            format!(
+                "GET http://example.com:8080/music/song.mp3 HTTP/1.0\r\n\
+                 Host: example.com:8080\r\n\
+                 User-Agent: {USER_AGENT}\r\n\
+                 Accept: */*\r\n\
+                 \r\n"
+            )
         );
     }
 

@@ -152,10 +152,11 @@ fn the_request_is_the_one_the_template_describes() {
     let expected = format!(
         "GET {url} HTTP/1.0\r\n\
          Host: 127.0.0.1:{}\r\n\
-         User-Agent: Winamp/2.95\r\n\
+         User-Agent: Rustamp/{}\r\n\
          Accept: */*\r\n\
          \r\n",
-        server.port
+        server.port,
+        env!("CARGO_PKG_VERSION")
     );
     assert_eq!(String::from_utf8_lossy(&server.request()), expected);
 }
