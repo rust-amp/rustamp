@@ -108,6 +108,22 @@ pub struct MainWindowState {
     pub time_visible: bool,
     /// Whether the time is remaining (`true`) or elapsed (`false`).
     pub time_remaining: bool,
+    /// Whether the current track can be seeked.
+    ///
+    /// The engine owns the fact (`Engine::is_seekable`): a stream has no
+    /// position to seek to, and the engine refuses such a seek. The app hands
+    /// the fact to the behaviour machine (see
+    /// [`crate::behaviour::MainWindow::set_seekable`]), and a track that
+    /// cannot be seeked draws the position slider in its disabled look and
+    /// offers no seek at all.
+    pub seekable: bool,
+    /// Whether the track's length is unknown, so the remaining time cannot be
+    /// shown.
+    ///
+    /// The time display then shows the placeholder - the skin's own dash and
+    /// no digits - instead of a `00:00` that would read as "the track is
+    /// over". The elapsed time still counts: it is known.
+    pub duration_unknown: bool,
     /// The marquee text to draw. When the title scrolls this already includes
     /// the separator and a second copy (S02 §3).
     pub title: String,
@@ -153,6 +169,8 @@ impl Default for MainWindowState {
             time_seconds: 0,
             time_visible: true,
             time_remaining: false,
+            seekable: true,
+            duration_unknown: false,
             title: String::new(),
             marquee_offset: 0,
             kbps: None,
@@ -175,7 +193,16 @@ impl MainWindowState {
     /// settle it; this renders the tens of minutes as the "no digit" cell while
     /// the track is under ten minutes. The boundaries are exercised in the
     /// behaviour tests.
+    ///
+    /// A track whose length is unknown has **no remaining time**: the cells are
+    /// all blank then, and the renderer draws the placeholder (the skin's own
+    /// dash) beside them. A remaining `00:00` would claim that nothing is
+    /// left of the track, which is a statement about a length nobody knows.
+    /// The elapsed display is untouched: the elapsed time is known and counts.
     pub fn time_cells(&self) -> [Option<u8>; 4] {
+        if self.shows_time_placeholder() {
+            return [None; 4];
+        }
         let total = self.time_seconds;
         let minutes = (total / 60).min(99);
         let seconds = total % 60;
@@ -190,6 +217,16 @@ impl MainWindowState {
             Some((seconds / 10) as u8),
             Some((seconds % 10) as u8),
         ]
+    }
+
+    /// Whether the time display shows the placeholder for an unknown
+    /// remaining time.
+    ///
+    /// A track whose length is unknown has no remaining time to show. The
+    /// display then carries the placeholder alone - the skin's own dash - and
+    /// no cells at all: four blank cells would still read as a time.
+    pub fn shows_time_placeholder(&self) -> bool {
+        self.duration_unknown && self.time_remaining
     }
 
     /// Whether the decoder-active indicator is drawn.

@@ -36,6 +36,8 @@ register_golden_tests!(
     golden_rust_theme_equalizer_window,
     golden_rust_theme_playlist_window,
     golden_rust_theme_main_window_playing,
+    golden_rust_theme_main_window_stream,
+    golden_rust_theme_main_window_stream_remaining,
     golden_rust_theme_main_window_double_size,
     golden_rust_theme_equalizer_window_raised_band_and_preamp,
     golden_rust_theme_equalizer_window_curve_and_track_pixels,

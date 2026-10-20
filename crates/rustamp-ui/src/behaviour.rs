@@ -174,6 +174,33 @@ impl MainWindow {
         self.state.title_bar_focused = focused;
     }
 
+    /// Sets whether the current track can be seeked.
+    ///
+    /// The engine owns the fact (`Engine::is_seekable`): a stream has no
+    /// position to seek to, and the engine refuses such a seek and reports the
+    /// refusal. The app hands the fact over here when a track opens, and the
+    /// machine then **offers no seek** for that track: the position slider is
+    /// inert, so a press on it emits no command and the bar shows no target.
+    ///
+    /// The flag is a fact about the *track*, so it survives until the next
+    /// track says otherwise.
+    pub fn set_seekable(&mut self, seekable: bool) {
+        self.state.seekable = seekable;
+        if !seekable {
+            // A track that cannot be seeked has no position to show: the bar
+            // must not keep the target of an earlier track.
+            self.state.position = 0;
+            if self.held == Some(Widget::PositionSlider) {
+                // The control is not held any more: a held slider shows the
+                // S02 "SEEK TO" hint, and that hint names a target the track
+                // cannot reach.
+                self.held = None;
+                self.drag = None;
+                self.drag_last_x = None;
+            }
+        }
+    }
+
     /// Feed the newest **actual** engine tap frame and its unrounded source
     /// sample rate. No PCM is invented when the caller has no frame/rate.
     ///
@@ -351,7 +378,7 @@ impl MainWindow {
     /// A press at window-relative `(x, y)`. Returns the commands the press
     /// produces (sliders jump on press).
     pub fn mouse_down(&mut self, x: i32, y: i32, now_ms: u64) -> Vec<Command> {
-        let widget = hit_test(&self.layout, x, y);
+        let widget = hit_test(&self.layout, x, y).filter(|w| self.widget_enabled(*w));
         self.held = widget;
         self.drag = None;
         self.drag_last_x = None;
@@ -547,6 +574,19 @@ impl MainWindow {
         }
     }
 
+    /// Whether the widget reacts to a press.
+    ///
+    /// The position slider of a track that cannot be seeked does not: the
+    /// engine refuses such a seek and reports it, so a control that offers
+    /// one would hand the user an error for something the window itself
+    /// suggested.
+    fn widget_enabled(&self, widget: Widget) -> bool {
+        match widget {
+            Widget::PositionSlider => self.state.seekable,
+            _ => true,
+        }
+    }
+
     /// The click/drag-to-percentage mapping for a slider.
     ///
     /// **Provisional:** S02 does not give the mapping. The cursor sets the
@@ -576,9 +616,15 @@ impl MainWindow {
 
     fn slider_command(&self, widget: Widget) -> Option<Command> {
         match widget {
-            Widget::PositionSlider => self.duration_ms.map(|duration| Command::Seek {
-                to_ms: (u128::from(duration) * u128::from(self.state.position) / 100) as u64,
-            }),
+            Widget::PositionSlider => {
+                if !self.state.seekable {
+                    // A track that cannot be seeked offers no seek at all.
+                    return None;
+                }
+                self.duration_ms.map(|duration| Command::Seek {
+                    to_ms: (u128::from(duration) * u128::from(self.state.position) / 100) as u64,
+                })
+            }
             Widget::VolumeSlider => Some(Command::SetVolume(core_volume(self.state.volume))),
             Widget::BalanceSlider => Some(Command::SetBalance(core_balance(self.state.balance))),
             _ => None,
@@ -610,6 +656,10 @@ impl MainWindow {
     }
 
     fn update_time(&mut self, now_ms: u64) {
+        // The remaining time is computed from the length. A track without one
+        // (a stream, usually) has no remaining time to show, and the display
+        // says so with the placeholder instead of a wrong `00:00`.
+        self.state.duration_unknown = self.duration_ms.is_none();
         if self.state.transport == TransportState::Stopped {
             // S02 §4: stopped (and nothing loaded) shows a blank display.
             self.state.time_visible = false;
@@ -1274,6 +1324,178 @@ mod tests {
 
         machine.handle_event(&Event::StateChanged(TransportState::Stopped), 0);
         assert!(!machine.state().time_visible);
+    }
+
+    // ----- a track whose length is unknown (S19) -----
+
+    /// A track that reports no length: a stream usually.
+    fn load_track_without_length(machine: &mut MainWindow, title: &str, now_ms: u64) {
+        machine.handle_event(
+            &Event::TrackChanged {
+                id: Some(EntryId(1)),
+                index: Some(0),
+                metadata: Some(Box::new(TrackMetadata {
+                    title: Some(title.to_string()),
+                    ..TrackMetadata::default()
+                })),
+                duration_ms: None,
+            },
+            now_ms,
+        );
+    }
+
+    #[test]
+    fn an_unknown_length_shows_the_placeholder_and_keeps_counting() {
+        let mut machine = MainWindow::new();
+        playing(&mut machine, 0);
+        load_track_without_length(&mut machine, "Stream", 0);
+        machine.handle_event(
+            &Event::PositionChanged {
+                position_ms: 83_000,
+                duration_ms: None,
+            },
+            0,
+        );
+        assert!(machine.state().duration_unknown);
+
+        // The elapsed time is known and counts.
+        assert_eq!(
+            machine.state().time_cells(),
+            [None, Some(1), Some(2), Some(3)]
+        );
+
+        // The remaining time is not: the display shows the placeholder (no
+        // digits), never a `00:00` that would read as "the track is over".
+        machine.toggle_time_remaining(0);
+        assert!(machine.state().time_remaining);
+        assert_eq!(machine.state().time_cells(), [None, None, None, None]);
+    }
+
+    #[test]
+    fn a_known_length_shows_the_time_exactly_as_before() {
+        let mut machine = MainWindow::new();
+        playing(&mut machine, 0);
+        load_track(&mut machine, "T1", 200_000, 0);
+        machine.handle_event(
+            &Event::PositionChanged {
+                position_ms: 83_000,
+                duration_ms: Some(200_000),
+            },
+            0,
+        );
+        assert!(!machine.state().duration_unknown);
+        assert_eq!(
+            machine.state().time_cells(),
+            [None, Some(1), Some(2), Some(3)]
+        );
+
+        // The remaining time of a track with a length is unchanged.
+        machine.toggle_time_remaining(0);
+        assert_eq!(
+            machine.state().time_cells(),
+            [None, Some(1), Some(5), Some(7)]
+        );
+    }
+
+    // ----- a track that cannot be seeked (S19) -----
+
+    #[test]
+    fn a_seekable_track_offers_its_seek_exactly_as_before() {
+        let mut machine = MainWindow::new();
+        playing(&mut machine, 0);
+        load_track(&mut machine, "T1", 200_000, 0);
+        assert!(machine.state().seekable);
+
+        let (x, y) = centre(Widget::PositionSlider);
+        let commands = machine.mouse_down(x, y, 0);
+        assert!(
+            matches!(commands.as_slice(), [Command::Seek { .. }]),
+            "{commands:?}"
+        );
+        // The thumb follows the press and the S02 hint names the target.
+        assert_eq!(machine.state().position, 50);
+        assert_eq!(machine.hint().as_deref(), Some("SEEK TO: 1:40/3:20 (50%)"));
+        machine.mouse_up(x, y, 0);
+    }
+
+    #[test]
+    fn a_track_that_cannot_be_seeked_offers_no_seek() {
+        let mut machine = MainWindow::new();
+        playing(&mut machine, 0);
+        load_track(&mut machine, "Stream", 200_000, 0);
+        machine.set_seekable(false);
+        assert!(!machine.state().seekable);
+
+        let (x, y) = centre(Widget::PositionSlider);
+        // The press is inert: no command, no held widget, no hint.
+        assert_eq!(machine.mouse_down(x, y, 0), []);
+        assert_eq!(machine.state().pressed_widget, None);
+        assert!(!machine.state().position_thumb_pressed);
+        assert_eq!(machine.hint(), None);
+        assert_eq!(machine.mouse_up(x, y, 0), []);
+        // The thumb did not move either: the bar shows no target.
+        assert_eq!(machine.state().position, 0);
+    }
+
+    #[test]
+    fn a_drag_over_a_track_that_cannot_be_seeked_emits_nothing() {
+        let mut machine = MainWindow::new();
+        playing(&mut machine, 0);
+        load_track(&mut machine, "Stream", 200_000, 0);
+        machine.set_seekable(false);
+
+        let (x, y) = centre(Widget::PositionSlider);
+        assert_eq!(machine.mouse_down(x, y, 0), []);
+        assert_eq!(machine.mouse_move(x + 100, y, 0), []);
+        assert_eq!(machine.mouse_up(x + 100, y, 0), []);
+        assert_eq!(machine.state().position, 0);
+    }
+
+    #[test]
+    fn a_track_that_cannot_be_seeked_drops_the_target_of_an_earlier_track() {
+        let mut machine = MainWindow::new();
+        playing(&mut machine, 0);
+        load_track(&mut machine, "T1", 200_000, 0);
+        let (x, y) = centre(Widget::PositionSlider);
+        machine.mouse_down(x, y, 0);
+        machine.mouse_up(x, y, 0);
+        assert_eq!(machine.state().position, 50);
+
+        // The next track is a stream: its bar shows no target.
+        machine.set_seekable(false);
+        assert_eq!(machine.state().position, 0);
+    }
+
+    #[test]
+    fn a_slider_held_over_a_track_that_cannot_be_seeked_offers_no_target() {
+        let mut machine = MainWindow::new();
+        playing(&mut machine, 0);
+        load_track(&mut machine, "T1", 200_000, 0);
+        let (x, y) = centre(Widget::PositionSlider);
+        machine.mouse_down(x, y, 0);
+        assert!(machine.hint().is_some());
+
+        // The track turns into a stream while the slider is held: the hint
+        // would name a target the track cannot reach.
+        machine.set_seekable(false);
+        assert_eq!(machine.hint(), None);
+        assert_eq!(machine.mouse_up(x, y, 0), []);
+    }
+
+    #[test]
+    fn the_other_sliders_are_unaffected_by_a_track_that_cannot_be_seeked() {
+        let mut machine = MainWindow::new();
+        playing(&mut machine, 0);
+        load_track(&mut machine, "Stream", 200_000, 0);
+        machine.set_seekable(false);
+
+        let (x, y) = centre(Widget::VolumeSlider);
+        let commands = machine.mouse_down(x, y, 0);
+        assert!(
+            matches!(commands.as_slice(), [Command::SetVolume(_)]),
+            "{commands:?}"
+        );
+        machine.mouse_up(x, y, 0);
     }
 
     // ----- marquee (S02 §3) -----

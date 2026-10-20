@@ -1672,9 +1672,25 @@ impl App {
         }
     }
 
+    /// Feeds the engine's seekability to the UI machine.
+    ///
+    /// The engine owns the fact (`Engine::is_seekable`): a stream has no
+    /// position to seek to, and the engine refuses such a seek and reports the
+    /// refusal. The UI needs it to draw the position slider in its disabled
+    /// look and to offer no seek, so the app hands it over whenever a track
+    /// opens.
+    fn sync_seekable(&mut self) {
+        self.ui.set_seekable(self.engine.is_seekable());
+    }
+
     /// Applies a core [`Event`]: the app's own bookkeeping first, then the UI
     /// machine (the authoritative state).
     pub fn handle_event(&mut self, event: &Event) {
+        // The track that opens decides whether it can be seeked, and the UI
+        // needs that fact before it handles the track change.
+        if matches!(event, Event::TrackChanged { .. }) {
+            self.sync_seekable();
+        }
         // A track that actually opened: read its ReplayGain tags and drive the
         // engine's ReplayGain stage from them. Absent tags leave the control's
         // values unset, so the mode stays harmless (unity).
@@ -1784,6 +1800,9 @@ impl App {
             now,
         );
         if state.current_index.is_some() || state.current_id.is_some() {
+            // The engine owns the track's seekability; the UI needs it (see
+            // `App::sync_seekable`).
+            self.sync_seekable();
             self.ui.handle_event(
                 &Event::TrackChanged {
                     id: state.current_id,
@@ -3582,9 +3601,88 @@ mod tests {
         }
     }
 
+    /// A decoder without a length and without a seek: a stream (S19).
+    struct StreamDecoder {
+        spec: AudioSpec,
+        pos: u64,
+    }
+
+    impl Decoder for StreamDecoder {
+        fn spec(&self) -> AudioSpec {
+            self.spec
+        }
+
+        fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+            let channels = usize::from(self.spec.channels);
+            let n = (out.len() / channels).min(4096);
+            for sample in &mut out[..n * channels] {
+                *sample = 0.0;
+            }
+            self.pos += n as u64;
+            Ok(n)
+        }
+
+        fn seek(&mut self, _to: Duration) -> Result<Duration> {
+            Err(rustamp_core::error::Error::Unsupported(
+                "seeking in a stream",
+            ))
+        }
+
+        fn duration(&self) -> Option<Duration> {
+            None
+        }
+
+        fn is_seekable(&self) -> bool {
+            false
+        }
+
+        fn metadata(&self) -> TrackMetadata {
+            TrackMetadata {
+                title: Some("App Test Stream".to_string()),
+                ..TrackMetadata::default()
+            }
+        }
+
+        fn stream_info(&self) -> StreamInfo {
+            StreamInfo {
+                bitrate_kbps: Some(128),
+                sample_rate_hz: self.spec.sample_rate,
+                channels: self.spec.channels,
+            }
+        }
+    }
+
+    struct StreamFactory;
+
+    impl DecoderFactory for StreamFactory {
+        fn name(&self) -> &str {
+            "app-stream"
+        }
+
+        fn extensions(&self) -> &[&str] {
+            &["strm"]
+        }
+
+        fn probe(&self, hint: &ProbeHint<'_>) -> Confidence {
+            if hint.extension == Some("strm") {
+                Confidence::CONTENT
+            } else {
+                Confidence::NONE
+            }
+        }
+
+        fn open(&self, _source: MediaSource) -> Result<Box<dyn Decoder>> {
+            Ok(Box::new(StreamDecoder {
+                spec: AudioSpec::new(44100, 2),
+                pos: 0,
+            }))
+        }
+    }
+
     fn registry() -> DecoderRegistry {
         let mut registry = DecoderRegistry::new();
         registry.register(Arc::new(TestFactory) as Arc<dyn DecoderFactory>);
+        registry.register(Arc::new(StreamFactory) as Arc<dyn DecoderFactory>);
         registry
     }
 
@@ -7675,6 +7773,77 @@ mod tests {
         assert!(
             !app.headless_track_open(),
             "a file that failed to open must never be announced"
+        );
+    }
+
+    // ----- what the window knows about a track that cannot be seeked -----
+
+    /// The centre of the position slider of the classic main window.
+    fn position_slider_centre() -> (i32, i32) {
+        let track = MainWindowLayout::CLASSIC.position_track;
+        (
+            track.x + track.width as i32 / 2,
+            track.y + track.height as i32 / 2,
+        )
+    }
+
+    #[test]
+    fn a_track_that_cannot_be_seeked_greys_the_position_bar_and_offers_no_seek() {
+        let (mut app, dir) = app_with_file(None);
+        let stream = track(&dir, "live.strm");
+        app.engine_mut().set_queue(vec![TrackSource::path(stream)]);
+        app.sync_entry_ids();
+        app.submit(Command::Play).unwrap();
+
+        // The track opened, so the window knows the engine's fact.
+        assert!(
+            pump_until(
+                &mut app,
+                |app| app.state().title.contains("App Test Stream"),
+                2_000
+            ),
+            "the stream never opened"
+        );
+        assert!(!app.engine().is_seekable());
+        assert!(
+            !app.state().seekable,
+            "the window must know that the track cannot be seeked"
+        );
+
+        // A press on the position slider offers no seek: the engine would
+        // refuse it and report the refusal.
+        let (x, y) = position_slider_centre();
+        assert!(app.ui.mouse_down(x, y, app.now_ms()).is_empty());
+        assert_eq!(app.state().position, 0);
+    }
+
+    #[test]
+    fn a_seekable_track_keeps_its_seek() {
+        let (mut app, dir) = app_with_file(None);
+        let file = track(&dir, "one.tst");
+        app.engine_mut().set_queue(vec![TrackSource::path(file)]);
+        app.sync_entry_ids();
+        app.submit(Command::Play).unwrap();
+
+        assert!(
+            pump_until(
+                &mut app,
+                |app| app.state().title.contains("App Test Track"),
+                2_000
+            ),
+            "the track never opened"
+        );
+        assert!(app.engine().is_seekable());
+        assert!(app.state().seekable);
+
+        // The seek is still offered: the window did not change for a file.
+        let (x, y) = position_slider_centre();
+        let commands = app.ui.mouse_down(x, y, app.now_ms());
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::Seek { .. })),
+            "{commands:?}"
         );
     }
 }

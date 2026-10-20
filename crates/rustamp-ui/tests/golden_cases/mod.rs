@@ -120,6 +120,33 @@ pub fn case_main_window_playing(skin: &Skin, namespace: &str) {
     assert_golden("main_window_playing", namespace, &shot.render_image());
 }
 
+/// A stream: the engine cannot seek such a track (S19), so the position
+/// slider is drawn in its disabled look.
+///
+/// The elapsed time still counts - it is known - and the bar shows no target.
+pub fn case_main_window_stream(skin: &Skin, namespace: &str) {
+    let mut state = playing_state();
+    state.seekable = false;
+    state.duration_unknown = true;
+    let shot = Shot(|| render_main_window(&state, skin, &MainWindowLayout::CLASSIC));
+    assert_golden("main_window_stream", namespace, &shot.render_image());
+}
+
+/// The same stream with the remaining time shown: the length is unknown, so
+/// the display shows the placeholder (the skin's own dash) and no digits.
+pub fn case_main_window_stream_remaining(skin: &Skin, namespace: &str) {
+    let mut state = playing_state();
+    state.seekable = false;
+    state.duration_unknown = true;
+    state.time_remaining = true;
+    let shot = Shot(|| render_main_window(&state, skin, &MainWindowLayout::CLASSIC));
+    assert_golden(
+        "main_window_stream_remaining",
+        namespace,
+        &shot.render_image(),
+    );
+}
+
 pub fn case_main_window_double_size(skin: &Skin, namespace: &str) {
     let state = MainWindowState {
         double_size: true,
@@ -465,6 +492,8 @@ macro_rules! register_golden_tests {
         $equalizer_window:ident,
         $playlist_window:ident,
         $main_window_playing:ident,
+        $main_window_stream:ident,
+        $main_window_stream_remaining:ident,
         $main_window_double_size:ident,
         $equalizer_window_raised_band_and_preamp:ident,
         $equalizer_window_curve_and_track_pixels:ident,
@@ -499,6 +528,18 @@ macro_rules! register_golden_tests {
         fn $main_window_playing() {
             let skin = $skin_fn();
             $crate::golden_cases::case_main_window_playing(&skin, $namespace);
+        }
+
+        #[test]
+        fn $main_window_stream() {
+            let skin = $skin_fn();
+            $crate::golden_cases::case_main_window_stream(&skin, $namespace);
+        }
+
+        #[test]
+        fn $main_window_stream_remaining() {
+            let skin = $skin_fn();
+            $crate::golden_cases::case_main_window_stream_remaining(&skin, $namespace);
         }
 
         #[test]
