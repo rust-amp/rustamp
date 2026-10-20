@@ -16,7 +16,9 @@
 //! * [`write_tags`] writes the common fields back, preserving whatever the
 //!   caller does not set. The write is atomic: the new file is built next
 //!   to the original and renamed over it, and the audio frames are copied
-//!   byte for byte.
+//!   byte for byte. A write that would not change the tags of the file does
+//!   not touch it at all: the bytes and the modification time stay the ones
+//!   the file had.
 //! * [`write_tags_report`] is the honest form of [`write_tags`]: it names
 //!   every `extra` entry the target format could not store and every field
 //!   whose value the format could not hold (an MP4 track number of zero or
@@ -91,6 +93,7 @@ pub mod r128;
 mod read;
 pub mod remove;
 pub mod replaygain;
+mod unchanged;
 mod write;
 
 pub use album::{

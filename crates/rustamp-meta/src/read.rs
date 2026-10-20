@@ -333,28 +333,38 @@ fn add_tag<'a>(ordered: &mut Vec<&'a Tag>, file: &'a TaggedFile, tag_type: TagTy
 
 /// Maps the merged tags of `file` onto [`TrackMetadata`].
 fn metadata_from(file: &TaggedFile) -> TrackMetadata {
-    let tags = ordered_tags(file);
+    metadata_from_tags(&ordered_tags(file))
+}
+
+/// Maps the given tags onto [`TrackMetadata`], in precedence order.
+///
+/// The first tag that supplies a non-empty value for a field wins, so the
+/// tags are given in the order they are consulted (see
+/// [`TAG_PRECEDENCE`]). A single tag is the case of one tag: the writer
+/// uses it to decode the primary tag of a file on its own (see the
+/// `unchanged` module).
+pub(crate) fn metadata_from_tags(tags: &[&Tag]) -> TrackMetadata {
     let mut metadata = TrackMetadata {
-        title: text(&tags, ItemKey::TrackTitle),
-        artist: text(&tags, ItemKey::TrackArtist),
-        album: text(&tags, ItemKey::AlbumTitle),
-        album_artist: text(&tags, ItemKey::AlbumArtist),
-        genre: text(&tags, ItemKey::Genre),
+        title: text(tags, ItemKey::TrackTitle),
+        artist: text(tags, ItemKey::TrackArtist),
+        album: text(tags, ItemKey::AlbumTitle),
+        album_artist: text(tags, ItemKey::AlbumArtist),
+        genre: text(tags, ItemKey::Genre),
         // Some taggers (for example ffmpeg's FLAC muxer) write the comment as
         // the Vorbis `DESCRIPTION` item, so fall back to it.
-        comment: text(&tags, ItemKey::Comment).or_else(|| text(&tags, ItemKey::Description)),
+        comment: text(tags, ItemKey::Comment).or_else(|| text(tags, ItemKey::Description)),
         ..TrackMetadata::default()
     };
 
-    metadata.year = date(&tags).and_then(|value| parse_year(&value));
+    metadata.year = date(tags).and_then(|value| parse_year(&value));
 
-    let (track_no, track_total) = number_pair(&tags, ItemKey::TrackNumber, ItemKey::TrackTotal);
+    let (track_no, track_total) = number_pair(tags, ItemKey::TrackNumber, ItemKey::TrackTotal);
     metadata.track_no = track_no;
     metadata.track_total = track_total;
 
     // `TrackMetadata` has no `disc_total` field yet; keep it in `extra` so it
     // is not lost. See `CONTRACT_NOTES.md` for the proposed core change.
-    let (disc_no, disc_total) = number_pair(&tags, ItemKey::DiscNumber, ItemKey::DiscTotal);
+    let (disc_no, disc_total) = number_pair(tags, ItemKey::DiscNumber, ItemKey::DiscTotal);
     metadata.disc_no = disc_no;
     if let Some(total) = disc_total {
         metadata
@@ -366,7 +376,7 @@ fn metadata_from(file: &TaggedFile) -> TrackMetadata {
         if metadata.extra.contains_key(name) {
             continue;
         }
-        if let Some(value) = text(&tags, key) {
+        if let Some(value) = text(tags, key) {
             metadata.extra.insert(name.to_owned(), value);
         }
     }
