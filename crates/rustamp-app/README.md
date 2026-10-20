@@ -41,6 +41,39 @@ native prompt. The menu row that runs the same command is a row of the `Play`
 submenu: S04 §2 leaves that submenu's rows unmeasured, so the row's label is
 our own choice — the command it runs is not.
 
+## The stream's status
+
+While an `http://` stream runs, the player says what the transfer is doing.
+The texts are the reference's own (`specs/S19-streaming.md` §2) and the app
+turns them into two kinds of display:
+
+| Phase | Text |
+|---|---|
+| before connecting | `Connecting to host...` |
+| request sent | `Sending HTTP request` |
+| response read | `Reading HTTP response` |
+| transfer, total unknown | `Retrieving file...`, then `%d bytes read @ %d.%02d KB/sec` |
+| transfer, total known | `Retrieving file (%d%% done)`, then `%d/%d bytes read @ %d.%02d KB/sec` |
+| host vanished | `Connection to host lost` |
+| server closed | a leading newline, then `Connection closed.` |
+| connect failed | `Error connecting to host` |
+
+A **phase change** is a **note**: one text per change, printed by the
+presenter (`rustamp: ...`). The **counters** are a **transient status**: one
+entry that is replaced while the transfer runs and read with
+`App::stream_status()`, never a note per sample — a long transfer would
+otherwise bury the phase changes under thousands of lines.
+
+The rate and the share are the app's own: the decoder deliberately carries no
+clock, so the rate comes from two samples of the byte count and the app's own
+clock, and the share is the byte count over the length the server declared.
+A phase the app did not see is not reported: the app reads the phase in its
+tick, and a phase that came and went between two ticks is gone.
+
+**What the UI still owes.** `rustamp-ui` has no status area of its own: the
+transient status is computed and exposed by the app, but no window draws it
+yet. The main window's status area has to show `App::stream_status()`.
+
 ## Headless mode — safe to run anywhere
 
 ```text

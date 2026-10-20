@@ -260,6 +260,7 @@ use rustamp_core::event::Event;
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::{EQ_BANDS, EqState, PlayerState, StreamInfo, TransportState};
 use rustamp_core::vis::VisFrame;
+use rustamp_decoders::{HttpProgress, HttpProgressSnapshot};
 use rustamp_dsp::{EqControl, Equalizer, FadeControl, Limiter, LimiterControl};
 use rustamp_playlist::PlaybackOrder;
 use rustamp_playlist::rng::DEFAULT_SEED;
@@ -424,6 +425,29 @@ pub struct Engine {
     /// order is brought up to date when the engine owns it again.
     order_stale: bool,
     track_starts: Vec<(u32, u64)>,
+    /// The observer of the stream transfer the run is on, if it is on one.
+    ///
+    /// The decode thread hands it over when it opens a URL, and it is
+    /// dropped again when the run ends, when a file plays and when the next
+    /// run starts — so a phase of an old transfer never shows (S19 §2). The
+    /// observer is a handle, not a copy: the app can read it even after the
+    /// open failed, which is when the phase says that the host could not be
+    /// reached.
+    stream_progress: Option<StreamObserver>,
+}
+
+/// The observer of the stream transfer the run is on.
+///
+/// The index says which track the transfer belongs to, in the queue **the run
+/// started with**: the engine's own queue may already be a different one
+/// while the run lives, so the index of the run is what a track report is
+/// compared against.
+#[derive(Debug)]
+struct StreamObserver {
+    /// The queue index of the track the transfer belongs to.
+    index: u32,
+    /// The observer of the transfer.
+    progress: HttpProgress,
 }
 
 /// Ring capacity in samples for `cfg` on a device that granted `device`.
@@ -532,6 +556,7 @@ impl Engine {
             ))),
             order_stale: true,
             track_starts: Vec::new(),
+            stream_progress: None,
         })
     }
 
@@ -697,6 +722,33 @@ impl Engine {
     /// Packets the decoder skipped in the track that ended last (RFC 0002, C1).
     pub fn skipped_packets(&self) -> u64 {
         self.skipped
+    }
+
+    /// What the stream transfer is doing right now, if the run is on one.
+    ///
+    /// The snapshot carries the phase of the exchange, the bytes of the body
+    /// that came in and the length the server declared — the facts behind the
+    /// status texts of S19 §2. The **rate** is not carried: the caller
+    /// derives it from two snapshots and its own clock.
+    ///
+    /// `None` when the run is not on a stream: a file played, the run ended,
+    /// or no stream was opened yet. The observer of a transfer that is over
+    /// stays readable until the run ends, so the phase that says how the
+    /// stream ended is not lost between two ticks.
+    pub fn stream_snapshot(&self) -> Option<HttpProgressSnapshot> {
+        self.stream_progress
+            .as_ref()
+            .map(|observer| observer.progress.snapshot())
+    }
+
+    /// Forgets the observer of the stream transfer.
+    ///
+    /// The rule is one rule with three places: a phase of a transfer that is
+    /// over must not show (S19 §2). The run ended, a file played or a new
+    /// run began — in all three the observer goes, and the next transfer
+    /// hands a fresh one over.
+    fn clear_stream_progress(&mut self) {
+        self.stream_progress = None;
     }
 
     /// Frames the track that ended last produced, in device frames.
@@ -1282,6 +1334,8 @@ impl Engine {
         self.start_at = None;
         self.end_of_stream = None;
         self.track_starts.clear();
+        // The run is over: no phase of its stream may show any more.
+        self.clear_stream_progress();
         // The run's counters end here. What it left in the ring stays there
         // (only the consumer can drop it) and is reported by
         // `buffered_frames()` until the next run drains it.
@@ -1625,6 +1679,17 @@ impl Engine {
             } => {
                 self.track_starts.push((index, timeline_start));
                 self.current = Some(index);
+                // A track that is not the one the observer belongs to played:
+                // the phase of the last transfer is stale, and the observer
+                // goes with it (S19 §2). The stream's own track keeps its
+                // observer: it is the transfer that is running now.
+                if self
+                    .stream_progress
+                    .as_ref()
+                    .is_some_and(|observer| observer.index != index)
+                {
+                    self.stream_progress = None;
+                }
                 self.src_spec = Some(src);
                 self.duration_frames = duration_frames;
                 self.duration_ms = duration_ms;
@@ -1706,6 +1771,11 @@ impl Engine {
                 }));
                 self.bus.publish(Event::StreamInfoChanged(self.stream));
             }
+            DecodeOut::StreamStarted { index, progress } => {
+                // The observer of the transfer the decode thread is running:
+                // the caller reads what it is doing out of it (S19 §2).
+                self.stream_progress = Some(StreamObserver { index, progress });
+            }
             DecodeOut::EndOfStream { timeline_end } => {
                 self.end_of_stream = Some(match self.end_of_stream {
                     Some(existing) => existing.min(timeline_end),
@@ -1756,6 +1826,8 @@ impl Engine {
         let flushed = self.flush_output();
         let _ = self.join_decode();
         self.transport = TransportState::Stopped;
+        // The run is over: no phase of its stream may show any more.
+        self.clear_stream_progress();
         // Freeze the timeline at the content end, not at the device position.
         // Re-basing the clock alone would reset `timeline_frames()` to the
         // timeline_origin (zero for a run without a seek), which would report a
@@ -1855,6 +1927,8 @@ impl Engine {
         self.pending_fade_stop = None;
         self.start_drain = None;
         self.end_of_stream = None;
+        // The run is over: no phase of its stream may show any more.
+        self.clear_stream_progress();
         self.sync.set_written(0);
         self.sync.set_consumed(0);
         self.bus
@@ -2065,6 +2139,10 @@ impl Engine {
         }
         self.current = Some(index);
         let start_at = self.start_at.take();
+        // A new run starts with no stream: the observer of an old transfer is
+        // stale, and the decode thread hands a fresh one over when it opens a
+        // URL (S19 §2).
+        self.clear_stream_progress();
         self.clock_origin = self.output.played_frames();
         // A run without an initial seek starts at zero. With one, keep the
         // target that `seek_frames` published while stopped, so the position
@@ -2287,7 +2365,9 @@ mod tests {
     use rustamp_core::bus::EventBus;
     use rustamp_core::error::{ErrorKind, Result as CoreResult};
     use rustamp_core::event::Event;
+    use rustamp_decoders::HttpPhase;
     use rustamp_output::{NullClock, NullOutput};
+    use std::net::TcpListener;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
@@ -2611,6 +2691,45 @@ mod tests {
         assert!(
             !track1_changed,
             "stop must not publish TrackChanged for prefetched track 1"
+        );
+    }
+
+    /// A port that nothing listens on: the connect is refused at once.
+    fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local listener");
+        let port = listener.local_addr().expect("the address").port();
+        drop(listener);
+        port
+    }
+
+    /// A file run is not on a stream: there is no phase to show.
+    #[test]
+    fn a_file_run_shows_no_stream_phase() {
+        let mut h = TestHarness::new(&["track7_2048.tst"]);
+        h.engine.play_index(0).unwrap();
+        assert!(
+            h.wait_pumping(|e| e.duration_frames().is_some(), Duration::from_secs(5)),
+            "the track must start"
+        );
+        assert_eq!(h.engine.stream_snapshot(), None, "a file is not a stream");
+    }
+
+    /// The observer survives a failed open: the phase that says the host
+    /// could not be reached is still readable (S19 §2).
+    #[test]
+    fn a_failed_connect_leaves_the_phase_that_says_why() {
+        let mut h = TestHarness::new(&[]);
+        let url = format!("http://127.0.0.1:{}/stream.wav", closed_port());
+        h.engine.set_queue(vec![TrackSource::Url(url)]);
+        h.engine.play_index(0).unwrap();
+        assert!(
+            h.wait_pumping(
+                |e| e
+                    .stream_snapshot()
+                    .is_some_and(|snapshot| snapshot.phase == HttpPhase::ConnectFailed),
+                Duration::from_secs(10),
+            ),
+            "the phase of the failed connect must be readable"
         );
     }
 }

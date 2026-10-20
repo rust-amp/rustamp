@@ -324,6 +324,11 @@ pub struct App {
     /// The tags of the playlist's rows, read off the UI thread
     /// (see [`crate::playlist_tags`]).
     pub(crate) playlist_tags: crate::playlist_tags::TagReader,
+    /// What the app shows about the stream that is playing (S19 §2).
+    ///
+    /// The phase the transfer is in is a note, the counters are a transient
+    /// status: see [`crate::stream_status`].
+    stream: crate::stream_status::StreamStatus,
 }
 
 /// Whether `path` has a recognized playlist file extension.
@@ -577,6 +582,7 @@ impl App {
             winamp_ini_import: None,
             title_format: None,
             playlist_tags: crate::playlist_tags::TagReader::new(),
+            stream: crate::stream_status::StreamStatus::default(),
         };
         app.shuffle = app.config.playlist.shuffle;
         app.repeat = app.config.playlist.repeat;
@@ -1479,6 +1485,12 @@ impl App {
             self.apply_from(command, false);
         }
 
+        // The stream's status is read **before** the engine polls: the engine
+        // drops the observer of a transfer when the run ends, and the phase
+        // that says how the stream ended must still be readable then
+        // (S19 §2).
+        self.pump_stream_status();
+
         self.engine.poll()?;
 
         // The engine reports a fade that does not fit the buffer it is
@@ -1534,6 +1546,53 @@ impl App {
         self.load_enabled_plugins_for_new_host();
         let _ = self.publish_host_state();
         Ok(())
+    }
+
+    /// Reads the stream's phase out of the engine and turns it into what the
+    /// user sees (S19 §2).
+    ///
+    /// The engine publishes what the transfer is doing — the phase of the
+    /// exchange and the counters of the body — and the app decides what that
+    /// means for the user:
+    ///
+    /// * a **phase change** is a note: the text of the phase, as S19 §2
+    ///   spells it. The texts are the app's, the facts are the engine's.
+    /// * the **counters** are a transient status (see [`crate::stream_status`]):
+    ///   one entry that is replaced, not a note per sample.
+    ///
+    /// A run that is not on a stream has no phase at all, and the phase of the
+    /// last transfer goes with it: a stale phase must never show.
+    fn pump_stream_status(&mut self) {
+        let Some(snapshot) = self.engine.stream_snapshot() else {
+            self.stream.reset();
+            return;
+        };
+        self.apply_stream_snapshot(snapshot, Instant::now());
+    }
+
+    /// Turns one snapshot of a transfer into the note and the status.
+    ///
+    /// The note is the text of the phase, and it is made **once per phase
+    /// change**: a transfer that runs for minutes must not make a note per
+    /// sample.
+    fn apply_stream_snapshot(
+        &mut self,
+        snapshot: rustamp_decoders::HttpProgressSnapshot,
+        now: Instant,
+    ) {
+        if let Some(note) = self.stream.update(snapshot, now) {
+            self.note(note);
+        }
+    }
+
+    /// The transient status of the stream that is playing (S19 §2).
+    ///
+    /// It is the transfer display the window shows in its status area: the
+    /// head of the display and the counters below it, empty when no transfer
+    /// runs. The text changes while the transfer runs, so it is read per
+    /// frame and never appended to the notes.
+    pub fn stream_status(&self) -> Option<&str> {
+        self.stream.status()
     }
 
     /// Turns the engine's fade reports into notes the user sees.
@@ -3501,6 +3560,10 @@ mod visualization_tests;
 #[cfg(test)]
 #[path = "fade_note_tests.rs"]
 mod fade_note_tests;
+
+#[cfg(test)]
+#[path = "stream_status_tests.rs"]
+mod stream_status_tests;
 
 #[cfg(test)]
 mod tests {
