@@ -5,7 +5,7 @@
 //! members the plugin cannot fill itself — the main window, the plugin's own
 //! module handle, the analyzer, visualization and DSP callbacks and
 //! `set_info` — calls `init`, and then drives the plugin's playback through
-//! `play`, `pause`, `unpause` and `stop` (S09 §3.1, §3.5).
+//! `play`, `pause`, `unpause`, `seek` and `stop` (S09 §3.1, §3.5).
 //!
 //! # What this module does
 //!
@@ -29,10 +29,18 @@
 //!   drives no output anyway. The hand-over itself — writing the selected
 //!   output into that member before `play` — lives in [`crate::handoff`] and
 //!   is driven by [`crate::registry::PluginRegistry::play_input`].
-//! * **It does not forward volume, pan, seek or the equalizer.** The host
-//!   has no path from the player's state to a classic plugin yet, so those
-//!   slots stay untouched. The player's levels reach the *output* plugin
-//!   through the hand-over (S09 §3.5 step 2), not through these slots.
+//! * **It does not forward volume, pan or the equalizer.** The host has no
+//!   path from the player's state to a classic plugin yet, so those slots
+//!   stay untouched. The player's levels reach the *output* plugin through
+//!   the hand-over (S09 §3.5 step 2), not through these slots.
+//!
+//! * **It forwards a seek, and nothing else of the seek.** S09 §3.1
+//!   offset 0x54 gives the input module a `seek(int ms)` slot, and S09
+//!   §3.6 lists `seek` among the calls the host makes on the UI thread. The
+//!   host calls that slot and stops there: the plugin signals its own
+//!   decode thread to seek and then flushes the output at the new time
+//!   itself (S09 §3.1 offset 0x54, §3.7). The host calls no output
+//!   callback of its own, or the output would be flushed twice.
 //!
 //! Licensed `MIT OR Apache-2.0` (RFC 0004).
 
@@ -288,6 +296,35 @@ pub(crate) fn call_get_position(module: *mut InModule) -> Result<c_int, InputErr
     // SAFETY: cdecl, no arguments, returns an int (S09 §3.1 offset 0x50),
     // non-null slot.
     Ok(unsafe { get_position() })
+}
+
+/// Call the plugin's `seek` (S09 §3.1 offset 0x54).
+///
+/// The target is the plugin's own millisecond value. S09 names no range for
+/// it, so the host forwards the number unchanged and lets the plugin decide
+/// what it means (S09 §3.1 offset 0x54: "Seek. Normally signals the decode
+/// thread to seek and then flushes the output at the new time").
+///
+/// This is the **whole** of the host's part of a seek. The output's
+/// `flush(time_ms)` is the plugin's call, not the host's (S09 §3.7: "On
+/// seeking the plugin calls the output `flush(time_ms)`"; S09 §4.2 step 3:
+/// the output's `flush` comes "from the UI or seek path through the input
+/// plugin"). A host-side flush would flush the output a second time.
+///
+/// # Safety
+///
+/// `module` must point at a live `In_Module` in the mapped plugin's static
+/// storage (S09 §0).
+pub(crate) fn call_seek(module: *mut InModule, time_ms: c_int) -> Result<(), InputError> {
+    // SAFETY: the module pointer was verified non-null when the plugin was
+    // loaded.
+    let Some(seek) = (unsafe { (*module).seek }) else {
+        return Err(InputError::MissingCallback("seek"));
+    };
+    // SAFETY: cdecl, one int argument in milliseconds (S09 §3.1 offset
+    // 0x54), non-null slot.
+    unsafe { seek(time_ms) };
+    Ok(())
 }
 
 /// The ANSI form of a path, NUL-terminated (S09 §1, §3.1 offset 0x38).

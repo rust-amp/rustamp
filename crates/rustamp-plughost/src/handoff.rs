@@ -16,6 +16,21 @@
 //!   parameters zero (S09 §3.6). The host records it and reports it to its
 //!   caller; the plugin posts it only if it was not asked to stop.
 //!
+//! * **A seek is one call, and the flush belongs to the plugin.** S09 §3.1
+//!   offset 0x54 gives the input module a `seek(int ms)` slot, and S09 §3.6
+//!   lists `seek` among the calls the host makes on the UI thread. What
+//!   happens next is the plugin's: S09 §3.7 says "On seeking the plugin
+//!   calls the output `flush(time_ms)`", and S09 §4.2 step 3 says the
+//!   output's `pause`, `set_volume`, `set_pan` and `flush` "come from the UI
+//!   or seek path **through the input plugin**". The host therefore calls
+//!   the input plugin's `seek` and **no output callback at all** — a
+//!   host-side flush would flush the output a second time.
+//! * **A pause has the same shape.** The host calls the input module's
+//!   `pause` (offset 0x3C) or `unpause` (offset 0x40); the plugin pauses the
+//!   output it drives with the output's own `pause(state)` (S09 §3.7,
+//!   §4.1 offset 0x38, §4.2 step 3). The host calls no output callback
+//!   here either.
+//!
 //! # What the host does not do here
 //!
 //! * It does not choose the output by itself. S09 §3.5 step 2 names the
@@ -29,6 +44,18 @@
 //!   arrives. S09 §3.6 says the host advances to the next item or stops; this
 //!   host owns no playlist — the player does — so the notification is
 //!   reported to the host's caller and nothing is invented beyond that.
+//! * It does not flush or pause the output itself. S09 §3.7 and §4.2 step 3
+//!   put the output's `flush` and `pause` on the input plugin's side of the
+//!   hand-over: the plugin seeks and flushes, the plugin pauses and resumes.
+//!   The host's part of a seek is the input module's `seek` call (S09 §3.1
+//!   offset 0x54) and nothing else.
+//! * It does not forward the player's levels through the input module's own
+//!   `set_volume` / `set_pan` slots (S09 §3.1 offsets 0x58 and 0x5C). S09
+//!   §3.5 step 2 has the host apply the levels to the **output**, and that
+//!   is what this host does; S09 §3.1's "normally forwarded to the output
+//!   module" describes what the plugin does when something calls its slot.
+//!   Whether the host must *also* call those slots when the user changes the
+//!   volume later is not settled by S09 — a gap, not a decision.
 //!
 //! Licensed `MIT OR Apache-2.0` (RFC 0004).
 
@@ -135,6 +162,27 @@ impl fmt::Display for HandoffError {
 
 impl std::error::Error for HandoffError {}
 
+/// A refused input-plugin call is a refused hand-over call.
+///
+/// The input bridge ([`crate::input`]) names the kind it wanted; every route
+/// that reaches an input plugin wants an input plugin, so the expected kind
+/// is fixed here.
+#[cfg(any(windows, test))]
+impl From<crate::input::InputError> for HandoffError {
+    fn from(error: crate::input::InputError) -> Self {
+        match error {
+            crate::input::InputError::PlayRefused(code) => Self::PlayRefused(code),
+            crate::input::InputError::NotInitialized => Self::NotInitialized,
+            crate::input::InputError::NullModule => Self::NullModule,
+            crate::input::InputError::MissingCallback(name) => Self::MissingCallback(name),
+            crate::input::InputError::WrongKind(actual) => Self::WrongKind {
+                expected: PluginKind::Input,
+                actual,
+            },
+        }
+    }
+}
+
 /// Does this input plugin route its audio through a Winamp output plugin?
 ///
 /// Flag bit 0 of the `flags` member (S09 §3.1 offset 0x18, §3.3). Only such a
@@ -197,9 +245,10 @@ pub(crate) mod doubles {
     //! They are not mocks of the host: they are real `In_Module` and
     //! `Out_Module` structures with real cdecl callbacks — the shape a mapped
     //! DLL's static data has (S09 §0). The scripted input plugin drives the
-    //! output exactly as S09 §3.5 steps 3–5 describe, and the scripted output
-    //! plugin records every call in order, naming the caller: the host or the
-    //! input plugin's `play`.
+    //! output exactly as S09 §3.5 steps 3–5 describe, flushes it on a seek
+    //! (S09 §3.7) and pauses it (S09 §3.7, §4.1 offset 0x38); the scripted
+    //! output plugin records every call in order, naming the caller: the
+    //! host or the input plugin's own code.
 
     use std::cell::{Cell, RefCell};
     use std::ffi::{c_char, c_int};
@@ -213,9 +262,19 @@ pub(crate) mod doubles {
         static CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
+    /// Who calls the output plugin: the host itself, or the input plugin
+    /// that drives the output (S09 §3.5 steps 3–5, §3.7, §4.2 step 3).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Caller {
+        /// The host's own code — today only the hand-over's levels.
+        Host,
+        /// The input plugin's own code.
+        InputPlugin,
+    }
+
     thread_local! {
-        /// 1 while the scripted input plugin is inside its `play`.
-        static IN_PLAY: Cell<bool> = const { Cell::new(false) };
+        /// The caller of the output callbacks.
+        static CALLER: Cell<Caller> = const { Cell::new(Caller::Host) };
     }
 
     thread_local! {
@@ -238,26 +297,72 @@ pub(crate) mod doubles {
         CALLS.with(|calls| calls.borrow_mut().push(entry));
     }
 
-    /// The caller of an output callback: the input plugin's `play` or the host.
+    /// The caller of an output callback: the input plugin's own code or the
+    /// host.
     fn caller() -> &'static str {
-        if IN_PLAY.with(|flag| flag.get()) {
-            "input"
-        } else {
-            "host"
+        match CALLER.with(|slot| slot.get()) {
+            Caller::Host => "host",
+            Caller::InputPlugin => "input",
+        }
+    }
+
+    /// Run `body` as the input plugin's own code, so the output sees the
+    /// plugin as its caller (S09 §3.7).
+    fn as_input_plugin<R>(body: impl FnOnce() -> R) -> R {
+        let previous = CALLER.with(|slot| slot.replace(Caller::InputPlugin));
+        let result = body();
+        CALLER.with(|slot| slot.set(previous));
+        result
+    }
+
+    /// The output the scripted input plugin drives, if the host handed it one
+    /// (S09 §3.1 offset 0x94).
+    fn output_of_input() -> *mut OutModule {
+        let module = INPUT_MODULE.with(|slot| slot.get());
+        if module.is_null() {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: the scripted input module lives in the test's static data.
+        unsafe { (*module).out_module }
+    }
+
+    /// What the scripted input plugin offers (S09 §3.1).
+    #[derive(Clone, Copy)]
+    pub(crate) struct InputScript {
+        /// Flag bit 0 (S09 §3.3): the plugin routes its audio through a Winamp
+        /// output plugin, so the host hands it one.
+        pub uses_output: bool,
+        /// The plugin supplies a `seek` slot (S09 §3.1 offset 0x54). S09
+        /// requires no plugin to provide one (S09 §0), so its absence is a
+        /// fact about that plugin.
+        pub has_seek: bool,
+    }
+
+    impl Default for InputScript {
+        fn default() -> Self {
+            Self {
+                uses_output: true,
+                has_seek: true,
+            }
         }
     }
 
     /// A scripted input module (S09 §3.1).
     ///
-    /// `uses_output` sets flag bit 0 (S09 §3.3): such a plugin expects the
-    /// host to hand it an output module.
-    pub(crate) fn input_module(uses_output: bool) -> *mut InModule {
+    /// `script` says what the plugin offers: whether it routes its audio
+    /// through an output plugin (flag bit 0, S09 §3.3) and whether it
+    /// supplies a `seek` slot (S09 §3.1 offset 0x54).
+    pub(crate) fn input_module(script: InputScript) -> *mut InModule {
         // Leaked on purpose: the module must outlive the registry that holds a
         // raw pointer to it, exactly as a mapped DLL's static data does.
         let module: &'static mut InModule = Box::leak(Box::new(InModule {
             version: IN_VERSION,
             description: c"scripted in".as_ptr(),
-            flags: if uses_output { IN_FLAG_USES_OUTPUT } else { 0 },
+            flags: if script.uses_output {
+                IN_FLAG_USES_OUTPUT
+            } else {
+                0
+            },
             init: Some(in_init),
             quit: Some(in_quit),
             config: Some(in_config),
@@ -268,6 +373,7 @@ pub(crate) mod doubles {
             is_paused: Some(in_is_paused),
             get_length: Some(in_get_length),
             get_position: Some(in_get_position),
+            seek: script.has_seek.then_some(in_seek),
             ..InModule::default()
         }));
         let module = module as *mut InModule;
@@ -317,12 +423,36 @@ pub(crate) mod doubles {
         record("stop".to_string());
     }
 
+    /// The scripted input plugin's `pause` (S09 §3.1 offset 0x3C).
+    ///
+    /// S09 §3.7 and §4.1 offset 0x38: the output's `pause` takes the state
+    /// and returns the previous one, and the plugin — not the host — drives
+    /// it (S09 §4.2 step 3).
     unsafe extern "C" fn in_pause() {
         record("pause".to_string());
+        forward_pause(1);
     }
 
+    /// The scripted input plugin's `unpause` (S09 §3.1 offset 0x40).
     unsafe extern "C" fn in_unpause() {
         record("unpause".to_string());
+        forward_pause(0);
+    }
+
+    /// The scripted plugin pauses or resumes the output it drives.
+    fn forward_pause(state: c_int) {
+        let out = output_of_input();
+        if out.is_null() {
+            return;
+        }
+        as_input_plugin(|| {
+            // SAFETY: live output module in the test's static data.
+            unsafe {
+                if let Some(pause) = (*out).pause {
+                    pause(state);
+                }
+            }
+        });
     }
 
     unsafe extern "C" fn in_is_paused() -> c_int {
@@ -335,6 +465,26 @@ pub(crate) mod doubles {
 
     unsafe extern "C" fn in_get_position() -> c_int {
         0
+    }
+
+    /// The scripted input plugin's `seek` (S09 §3.1 offset 0x54).
+    ///
+    /// S09 §3.7: "On seeking the plugin calls the output `flush(time_ms)`."
+    /// The host's own part of the seek is the call into this function.
+    unsafe extern "C" fn in_seek(time_ms: c_int) {
+        record(format!("seek {time_ms}"));
+        let out = output_of_input();
+        if out.is_null() {
+            return;
+        }
+        as_input_plugin(|| {
+            // SAFETY: live output module in the test's static data.
+            unsafe {
+                if let Some(flush) = (*out).flush {
+                    flush(time_ms);
+                }
+            }
+        });
     }
 
     /// The scripted input plugin's `play` (S09 §3.1 offset 0x38).
@@ -351,29 +501,29 @@ pub(crate) mod doubles {
             "play out={}",
             if out.is_null() { "none" } else { "set" }
         ));
-        IN_PLAY.with(|flag| flag.set(true));
         if !out.is_null() {
-            // SAFETY: live output module in the test's static data.
-            unsafe {
-                if let Some(open) = (*out).open {
-                    open(44_100, 2, 16, 0, 0);
+            as_input_plugin(|| {
+                // SAFETY: live output module in the test's static data.
+                unsafe {
+                    if let Some(open) = (*out).open {
+                        open(44_100, 2, 16, 0, 0);
+                    }
+                    if let Some(can_write) = (*out).can_write {
+                        can_write();
+                    }
+                    if let Some(write) = (*out).write {
+                        let mut buffer = [0_u8; 16];
+                        write(buffer.as_mut_ptr().cast::<c_char>(), buffer.len() as c_int);
+                    }
+                    if let Some(is_playing) = (*out).is_playing {
+                        is_playing();
+                    }
+                    if let Some(close) = (*out).close {
+                        close();
+                    }
                 }
-                if let Some(can_write) = (*out).can_write {
-                    can_write();
-                }
-                if let Some(write) = (*out).write {
-                    let mut buffer = [0_u8; 16];
-                    write(buffer.as_mut_ptr().cast::<c_char>(), buffer.len() as c_int);
-                }
-                if let Some(is_playing) = (*out).is_playing {
-                    is_playing();
-                }
-                if let Some(close) = (*out).close {
-                    close();
-                }
-            }
+            });
         }
-        IN_PLAY.with(|flag| flag.set(false));
         0
     }
 
@@ -459,8 +609,17 @@ mod tests {
 
     /// A registry with a scripted input and a scripted output plugin.
     fn registry_with(uses_output: bool) -> (PluginRegistry, u32, u32) {
+        registry_with_script(doubles::InputScript {
+            uses_output,
+            ..doubles::InputScript::default()
+        })
+    }
+
+    /// A registry with a scripted input plugin of the given shape and a
+    /// scripted output plugin.
+    fn registry_with_script(script: doubles::InputScript) -> (PluginRegistry, u32, u32) {
         let input =
-            LoadedPlugin::input_for_test("scripted_in", doubles::input_module(uses_output), 0x1234);
+            LoadedPlugin::input_for_test("scripted_in", doubles::input_module(script), 0x1234);
         let output =
             LoadedPlugin::output_for_test("scripted_out", doubles::output_module(), true, 0x1234);
         let mut registry = PluginRegistry::new(ApprovalStore::new());
@@ -533,8 +692,187 @@ mod tests {
     }
 
     #[test]
+    fn a_seek_reaches_the_input_plugin_and_the_plugin_flushes_the_output() {
+        doubles::clear();
+        let (mut registry, input_id, output_id) = registry_with(true);
+        registry
+            .select_output(output_id)
+            .expect("the output plug-in must be selectable");
+        registry
+            .play_input(input_id, Path::new(TRACK), 200, -10)
+            .expect("the hand-over and the play must succeed");
+        doubles::clear();
+
+        registry
+            .seek_input(input_id, 12_345)
+            .expect("the seek must reach the plugin");
+
+        assert_eq!(
+            doubles::calls(),
+            vec![
+                // The host's whole part of a seek is the input plugin's
+                // `seek` (S09 §3.1 offset 0x54, §3.6).
+                "seek 12345",
+                // The plugin flushes the output at the new time itself
+                // (S09 §3.7). The host must not flush it as well.
+                "flush 12345 input",
+            ],
+            "the output must be flushed once, and by the plugin"
+        );
+    }
+
+    #[test]
+    fn the_host_calls_no_output_callback_on_the_seek_and_pause_path() {
+        // S09 §3.7: "On seeking the plugin calls the output `flush(time_ms)`."
+        // S09 §4.2 step 3: the output's `pause`, `set_volume`, `set_pan` and
+        // `flush` come "from the UI or seek path through the input plugin".
+        // A host-side flush or pause would drive the output a second time.
+        doubles::clear();
+        let (mut registry, input_id, output_id) = registry_with(true);
+        registry
+            .select_output(output_id)
+            .expect("the output plug-in must be selectable");
+        registry
+            .play_input(input_id, Path::new(TRACK), 200, -10)
+            .expect("the hand-over and the play must succeed");
+        doubles::clear();
+
+        registry
+            .seek_input(input_id, 1_000)
+            .expect("the seek must reach the plugin");
+        registry
+            .pause_input(input_id)
+            .expect("the pause must reach the plugin");
+        registry
+            .unpause_input(input_id)
+            .expect("the resume must reach the plugin");
+
+        let calls = doubles::calls();
+        assert!(
+            !calls.iter().any(|call| call.ends_with(" host")),
+            "no output callback may come from the host here: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("flush"))
+                .count(),
+            1,
+            "the output must be flushed exactly once: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_seek_on_a_plugin_without_an_output_flushes_nothing() {
+        // S09 §3.7: without flag bit 0 the plugin supplies its own volume,
+        // pan and timekeeping and drives no output — so there is no output
+        // to flush.
+        doubles::clear();
+        let (mut registry, input_id, output_id) = registry_with(false);
+        registry
+            .select_output(output_id)
+            .expect("the output plug-in must be selectable");
+        registry
+            .play_input(input_id, Path::new(TRACK), 200, -10)
+            .expect("the play must succeed");
+        doubles::clear();
+
+        registry
+            .seek_input(input_id, 1_000)
+            .expect("the seek must reach the plugin");
+
+        assert_eq!(doubles::calls(), vec!["seek 1000"]);
+    }
+
+    #[test]
+    fn a_seek_is_refused_when_there_is_no_input_plugin_to_seek() {
+        doubles::clear();
+        let (registry, input_id, output_id) = registry_with(true);
+
+        // An id no plugin carries.
+        assert_eq!(
+            registry.seek_input(9_999, 0),
+            Err(HandoffError::UnknownPlugin(9_999))
+        );
+        // A plugin of another kind: the host must not reach into its slots.
+        assert_eq!(
+            registry.seek_input(output_id, 0),
+            Err(HandoffError::WrongKind {
+                expected: PluginKind::Input,
+                actual: PluginKind::Output,
+            })
+        );
+        // The input plugin is reachable, so this call must reach it.
+        assert_eq!(registry.seek_input(input_id, 0), Ok(()));
+        assert_eq!(
+            doubles::calls(),
+            vec!["seek 0"],
+            "only the input plugin's own seek may have been called"
+        );
+    }
+
+    #[test]
+    fn a_seek_is_refused_when_the_plugin_has_no_seek_slot() {
+        // S09 §0: a callback slot may be null and a null slot is never called
+        // through. The absence of a `seek` slot is a fact about that plugin
+        // (S09 §3.1 offset 0x54), never a verdict on its validity.
+        doubles::clear();
+        let (registry, input_id, _output_id) = registry_with_script(doubles::InputScript {
+            has_seek: false,
+            ..doubles::InputScript::default()
+        });
+
+        assert_eq!(
+            registry.seek_input(input_id, 1_000),
+            Err(HandoffError::MissingCallback("seek"))
+        );
+        assert!(
+            doubles::calls().is_empty(),
+            "a refused seek must call nothing: {:?}",
+            doubles::calls()
+        );
+    }
+
+    #[test]
+    fn a_pause_reaches_the_output_through_the_input_plugin() {
+        // S09 §3.1 offsets 0x3C and 0x40: the host pauses and resumes the
+        // input plugin. S09 §3.7 and §4.1 offset 0x38: the plugin pauses the
+        // output it drives with the output's own `pause(state)`, which takes
+        // the state and returns the previous one.
+        doubles::clear();
+        let (mut registry, input_id, output_id) = registry_with(true);
+        registry
+            .select_output(output_id)
+            .expect("the output plug-in must be selectable");
+        registry
+            .play_input(input_id, Path::new(TRACK), 200, -10)
+            .expect("the hand-over and the play must succeed");
+        doubles::clear();
+
+        registry
+            .pause_input(input_id)
+            .expect("the pause must reach the plugin");
+        registry
+            .unpause_input(input_id)
+            .expect("the resume must reach the plugin");
+
+        assert_eq!(
+            doubles::calls(),
+            vec![
+                // The host pauses the input plugin (S09 §3.1 offset 0x3C).
+                "pause",
+                // The plugin pauses the output it drives (S09 §3.7,
+                // §4.1 offset 0x38): 1 pauses, 0 resumes.
+                "pause 1 input",
+                "unpause",
+                "pause 0 input",
+            ]
+        );
+    }
+
+    #[test]
     fn the_output_pointer_is_written_into_the_input_module() {
-        let input = doubles::input_module(true);
+        let input = doubles::input_module(doubles::InputScript::default());
         let output = doubles::output_module();
         // SAFETY: live modules in the test's static data.
         assert!(
