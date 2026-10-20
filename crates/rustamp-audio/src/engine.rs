@@ -489,6 +489,14 @@ impl Engine {
     /// ends the track, and the engine publishes the error (the first failure
     /// per run sticks).
     ///
+    /// The failed stage is then **bypassed** (see [`crate::decode`]): the
+    /// engine replaces it with a pass-through, so the next track plays
+    /// without it instead of the player dying with the failed chain. The
+    /// failure is reported with the stage's name and the frames that were
+    /// lost, so the bypass is never silent. Installing a chain again undoes
+    /// the bypass — that is how a caller replaces a failed resident or
+    /// plugin with a fresh one.
+    ///
     /// To run the chain in a resident process (opt-in, RFC 0006 §6), build a
     /// stage with [`resident::DspResidentConfig::open`] (or wrap a session in
     /// [`resident::HostDspChain::new`]) and install it here. The default chain

@@ -70,8 +70,8 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 | # | Claim | Verdict | Evidence (file:line) | Smallest reproduction |
 |---|---|---|---|---|
 | C4-1 | Decoder and DSP resident latency reporting do not collide | **HOLDS** | `crates/rustamp-audio/src/decode.rs:583-588`, `crates/rustamp-audio/src/resident.rs:443-450,836-842` | `Decoder` trait reports `duration` and timestamps; `DspStage` reports `latency_frames()`. Latency queries do not collide. |
-| C4-2 | A failure in one resident leaves the other in a defined state | **PARTIAL** | `crates/rustamp-audio/src/decode.rs:643-651`, `crates/rustamp-audio/src/resident.rs:784-788,836-842` | When decoder resident fails, `Worker` flushes DSP with silence and stops; DSP resident remains in a defined, ready state. However, when DSP resident fails, `HostDspChain` is permanently poisoned. Subsequent tracks immediately fail on `prepare_track` with `CoreError::Dsp("resident DSP chain already failed; replace the stage")`, permanently halting playback until the host app replaces the stage. |
-| C4-3 | DSP latency flush compensation behaves honestly on failure | **FALSE** | `crates/rustamp-audio/src/resident.rs:836-842`, `crates/rustamp-audio/src/decode.rs:705-716` | On DSP resident failure, `latency()` drops immediately to 0. When `track_loop` exits and calls `flush_dsp()`, `flush_dsp()` queries `self.dsp_latency()` which evaluates to 0. Zero frames are flushed, silently discarding any audio remaining in stages before the failure. |
+| C4-2 | A failure in one resident leaves the other in a defined state | **PARTIAL** — *was partial; **fixed 2026-10-20** (finding F4 below): the failed stage is bypassed, so the next track plays* | `crates/rustamp-audio/src/decode.rs:643-651`, `crates/rustamp-audio/src/resident.rs:784-788,836-842` | When decoder resident fails, `Worker` flushes DSP with silence and stops; DSP resident remains in a defined, ready state. However, when DSP resident fails, `HostDspChain` is permanently poisoned. Subsequent tracks immediately fail on `prepare_track` with `CoreError::Dsp("resident DSP chain already failed; replace the stage")`, permanently halting playback until the host app replaces the stage. |
+| C4-3 | DSP latency flush compensation behaves honestly on failure | **FALSE** — *was false; **fixed 2026-10-20** (finding F4 below): the flush runs after the bypass, and the loss is reported* | `crates/rustamp-audio/src/resident.rs:836-842`, `crates/rustamp-audio/src/decode.rs:705-716` | On DSP resident failure, `latency()` drops immediately to 0. When `track_loop` exits and calls `flush_dsp()`, `flush_dsp()` queries `self.dsp_latency()` which evaluates to 0. Zero frames are flushed, silently discarding any audio remaining in stages before the failure. |
 
 ### 5. The Configuration Round Trip (N8, N9, F1)
 
@@ -317,6 +317,66 @@ fn apply_seek(
 
 ### F4 — MEDIUM (proven): Resident DSP failure drops held audio and permanently disables subsequent playback across tracks
 
+**Status: FIXED (2026-10-20).** The finding was correct on both counts, and
+both defects are closed. The fix and the tests are in
+`crates/rustamp-audio/src/decode.rs` (the engine's recovery policy and the
+failure report) and `crates/rustamp-audio/src/resident.rs` (the hold-back a
+failed chain still reports). No other crate changed; the wire, the ring
+layout, the session API and the `rustamp-core` contracts are untouched — the
+`DspStage` trait did not change, so no RFC was needed.
+
+**The recovery policy: bypass.** RFC 0014 §4.3 poisons a failed chain
+("resuming on it is an error; recovery is an explicit replacement with a
+fresh one"). That is the *contract*; what the engine does with the failed
+stage in the meantime is engine policy — the same division RFC 0006 §8 draws
+for the restart policy ("restart policy is engine policy, not contract"). The
+engine's policy is **bypass**:
+
+* The failed stage is replaced by a pass-through (`decode.rs::Bypass`, line
+  505) at the moment it fails (`decode.rs::emit`, lines 917-970). The audio
+  keeps flowing and **the next track plays**; the player does not die with
+  the poisoned chain. The pass-through keeps the chain's shape (the
+  equalizer stays first, the limiter last) and holds nothing back, so the
+  latency bookkeeping stays exact. The failed stage is dropped, so a failed
+  resident's helper process does not outlive its failure.
+* The bypass lasts until the caller installs a chain again
+  (`Engine::set_dsp_chain`, `engine.rs:504`): the engine hands the bypassed
+  chain back with the run, so a caller that wants the stage back installs a
+  fresh one. A *replacement* is the app layer's to choose, because only the
+  caller knows how the stage was built (which helper binary, which plugin).
+* The failure is reported **once** per run, and the report is the visible
+  part of the policy: it names the stage, the cause, the frames that are
+  lost and the bypass (`decode.rs::report_stage_failure`, line 1344). A
+  bypass is never silent.
+
+**What happens to the held tail.** A stage that reports a latency holds
+that many frames back; the frames live inside it (inside the resident
+helper, for the resident chain). When it fails they are gone with it, and
+the engine says so: the report names the hold-back (`up to N frames it held
+back`). Two things changed for the rest of the chain:
+
+* The failed chain no longer reports a latency of 0
+  (`resident.rs::ChainControl::latency`, line 1317). It keeps reporting the
+  hold-back it lost, so the report can count the loss instead of hiding it.
+* The end-of-track flush runs **after** the bypass, so it is no longer
+  aborted by the dead stage: the stages that are still alive keep their
+  hold-back and the flush pushes it out. What the failed stage itself held
+  is lost, and the report says how much.
+
+The track the failure happened in ends there — the stage's audio for that
+track is gone — but the queue keeps going.
+
+**Tests (all in `rustamp-audio`):**
+
+| Test | What it pins |
+|---|---|
+| `resident::dsp_hosted_tests::engine_bypasses_the_failed_resident_and_the_next_track_plays` | the scripted resident dies mid-track: exactly one `Event::Error` (kind `Dsp`) naming the chain, the bypass and the 100 lost frames; the **next track plays** bit-exactly (the resident is out of the chain); the run ends at the end of the queue (no retry loop) |
+| `resident::dsp_hosted_tests::engine_flushes_the_live_chain_after_the_resident_dies` | the flush is not aborted by the dead stage: the live chain's 32 held-back frames come out at the end of the failed track, while the dead stage's 100 frames are gone (the total is 100 frames short of a healthy chain) |
+| `resident::dsp_hosted_tests::a_poisoned_chain_still_reports_the_hold_back_it_lost` | a poisoned chain still reports the hold-back it lost (100 frames), instead of zero |
+| `engine::a_failed_stage_is_bypassed_and_the_next_track_plays` (integration) | the policy itself, platform-independent: a failed stage is bypassed, the failure is reported once with the stage named, and the next track plays (bit-exactly, without the failed stage's gain) |
+
+**The original report (unchanged, for the record):**
+
 In `crates/rustamp-audio/src/resident.rs:766-772,784-788,836-842`:
 ```rust
 fn latch(&mut self, error: CoreError) {
@@ -339,6 +399,15 @@ fn latency<F: PcmRings>(&self, session: &DspSession<F>) -> u32 {
 Two defects arise from this design:
 1. **Flushing drops held audio:** When a resident DSP failure occurs mid-stream, `self.poisoned` is set and `latency()` immediately returns 0. When the decode worker finishes the track and calls `flush_dsp()` (`decode.rs:705-716`), `self.dsp_latency()` returns 0. `flush_dsp` does not push any silence frames, silently discarding any audio frames buffered in earlier stages or previous resident blocks.
 2. **Permanent failure of subsequent tracks:** When `Engine::poll` detects the failure via `self.dsp_watch.take()`, `handle_dsp_failure` stops playback (`engine.rs:1280-1303`). However, `self.dsp` retains the poisoned `HostDspChain`. If the user subsequently advances to the next track or clicks Play, `Worker::track_loop` calls `prepare_track`, which invokes `stage.prepare(spec)`. `HostDspChain::prepare` immediately returns `Err("resident DSP chain already failed; replace the stage")`. Every subsequent track immediately aborts at startup without attempting playback. The player remains dead until the application externally calls `engine.set_dsp_chain(...)`.
+
+*(The report quotes the state of the code as the review saw it. The
+engine's failure path has since moved to the decode thread's own report
+queue (RFC 0014: `DspStage::process` is fallible, the decode thread reports
+the error and ends the track, and there is no engine-polled latch any more),
+so `handle_dsp_failure` and `dsp_watch` no longer exist. The two defects
+were still there in that shape: the poisoned chain stayed in the engine and
+failed every later track, and its zeroed latency aborted the flush.)*
+
 
 ---
 
