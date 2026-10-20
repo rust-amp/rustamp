@@ -670,12 +670,14 @@ held for the core fixture, but two things were missing:
 | `crates/rustamp-core/src/config.rs` | the fixture moved into `every_field_set()`; `toml_roundtrip` now compares **field by field** (a failure names the field) on top of the whole-struct comparison; the new `every_field_of_the_configuration_differs_from_its_default` makes the premise a checked fact instead of a convention |
 | `crates/rustamp-app/tests/config.rs` | `config_round_trip_honours_all_supported_fields` now sets **every honoured setting** to a non-default value (`version`, `audio.output_mode`, `audio.replaygain`, `audio.device`, `ui.snap_distance`, `plugins.plugin_dir`, `plugins.disabled` on top of the eight it already set), writes the app-owned `ui.playlist_font_size`, and compares the result field by field — including every field of every window layout |
 
-**The carve-out.** The unit test of the same name in
-`crates/rustamp-app/src/config.rs` still uses the old fixture (the honoured
-settings at their defaults). That file belongs to another lane (wave267),
-so it was not touched here; the coverage now lives in the integration test
-`crates/rustamp-app/tests/config.rs`, and the writer cannot lose a setting
-unnoticed any more.
+**The carve-out — closed on 2026-10-20 (`wave273`).** The unit test of the
+same name in `crates/rustamp-app/src/config.rs` still used the old fixture
+(the honoured settings at their defaults). That file belonged to another
+lane (wave267), so it was not touched here; the coverage now lived in the
+integration test `crates/rustamp-app/tests/config.rs` alone. The unit test
+module is now strengthened in place and is **not** a blind duplicate of the
+integration test any more: it is the stronger of the two. The change and its
+mutation evidence are in §5.6.
 
 **The field table (the whole configuration).**
 
@@ -726,6 +728,12 @@ The failure names the setting, e.g.
 `assertion 'left == right' failed: plugins.plugin_dir / left: None / right: Some("plugins")`.
 The serializer was restored after the check; the mutation left the tree
 unchanged.
+
+The middle column is the unit test **of that name**
+(`config_round_trip_honours_all_supported_fields` in `src/config.rs`). The
+whole unit-test *module* caught five of the seven through a different test
+whose name promises nothing about the honoured settings; that is measured,
+and the module is strengthened, in §5.6.
 
 **The original report (unchanged, for the record):**
 
@@ -866,3 +874,107 @@ new test file and this document.
   --all-targets --all-features -- -D warnings`, `cargo test -p rustamp-mediahost
   --all-features` and `cargo check --workspace --all-targets --all-features`
   are green (§4 above is the *review* lane's own receipt, not this lane's).
+
+### 5.6 Follow-up (2026-10-20, `wave273`): the app's own unit test is not blind
+
+**Lane:** `crates/rustamp-app` only — the test module of
+`crates/rustamp-app/src/config.rs`. No production code changed, no contract
+of `rustamp-core` touched, no commit, no download, no window, no spawned
+process. The integration test `crates/rustamp-app/tests/config.rs` (written
+by `wave270`) was left untouched: it is the other lane's deliverable and it
+is green.
+
+**The gap that was closed.** `wave270` proved that seven writer mutations
+(`version`, `audio.output_mode`, `audio.replaygain`, `audio.device`,
+`ui.snap_distance`, `plugins.plugin_dir`, `plugins.disabled`) left the
+app's **own** unit test green, and moved the coverage into the integration
+test. The unit test module kept the old fixture — the carve-out named
+above.
+
+**The measurement first (the "before" state, re-measured on 2026-10-20).**
+The old module was put back and run under the same seven mutations (the
+writer writes the default for one setting at a time):
+
+| Mutation | old `src/config.rs` module | old `config_round_trip_honours_all_supported_fields` |
+|---|---|---|
+| `version` written as `1` | passes (blind) | passes (blind) |
+| `audio.output_mode` written as `Shared` | passes (blind) | passes (blind) |
+| `audio.replaygain` written as `Off` | **fails** (`unpersisted_fields_deliberately_fall_back_to_defaults`) | passes (blind) |
+| `audio.device` not written | **fails** (the same test) | passes (blind) |
+| `ui.snap_distance` written as `10` | **fails** (the same test) | passes (blind) |
+| `plugins.plugin_dir` not written | **fails** (the same test) | passes (blind) |
+| `plugins.disabled` not written | **fails** (the same test) | passes (blind) |
+
+So the `wave270` table was exact about the test **of that name** — blind in
+all seven cases — and the module as a whole was caught five times, but only
+by a test whose name promises nothing about the honoured settings, while
+the test named `config_round_trip_honours_all_supported_fields` promised
+exactly that and kept silent.
+
+**What the unit test module looks like now**
+(`crates/rustamp-app/src/config.rs`):
+
+| Test | What it pins |
+|---|---|
+| `every_field_set()` (the fixture) | one fixture for the whole module: **every** field of **every** configuration type carries a non-default value — the honoured ones *and* the seven the player does not apply. The struct literals are exhaustive, so a new configuration field breaks the build until the fixture carries it |
+| `every_field_of_the_fixture_differs_from_its_default` | the premise as a checked fact: a field left at its default could not be told apart from a field the writer drops |
+| `config_round_trip_honours_all_supported_fields` | the round trip through a file, compared **field by field** (a failure names the setting) and as a whole configuration; every window keeps every field, including its size |
+| `the_honest_serialization_never_writes_an_owned_setting_as_its_default` | the structural net: for **every** path of `OWNED_PATHS` (the app's own list of the settings it owns) the written document must differ from the default's document. A writer that writes the default for one setting fails here, and so does a setting that is added to `OWNED_PATHS` and to the writer but left at its default in the fixture |
+| `the_honest_serialization_round_trips_in_memory` | the pure in-memory path (`serialize_honest` → `parse`, no file system): the writer's own output is a config file the loader reads back, and the seven settings the player does not apply are not even mentioned in the document |
+| `unpersisted_fields_deliberately_fall_back_to_defaults` (rewritten) | the settings the player does not apply are never written and come back at their documented defaults — now on the shared fixture, so the file carries a single fixture |
+
+**Why the unit test stays next to the integration test.** It is the stronger
+of the two, and it reaches what an integration test cannot:
+
+* Its round trip covers `audio.fadeout_ms`, `playlist.shuffle` and
+  `playlist.repeat` with non-default values. The integration test's round
+  trip leaves those three at their defaults, so a writer mutation there is
+  invisible **to that test** (the integration file catches it through its
+  other tests — `an_ignored_field_is_not_advertised`,
+  `the_honest_list_and_the_warning_list_stay_consistent`,
+  `the_newly_applied_settings_survive_a_save` — but not through the test
+  whose name claims the coverage).
+* It reads the private `OWNED_PATHS`, the app's own list of the settings it
+  owns, and drives the structural net from it. An integration test cannot
+  see that list.
+* It keeps the pure in-memory path (`serialize_honest` → `parse`), which the
+  file round trip cannot show on its own: a save merges the writer's output
+  with the file that was there.
+
+**The evidence that the new unit test has teeth.** The same seven
+mutations, run against the strengthened module
+(`cargo test -p rustamp-app --lib config::`):
+
+| Mutation | the strengthened unit test (`src/config.rs`) |
+|---|---|
+| `version` written as `1` | **fails** (`version` / left: 1 / right: 7) |
+| `audio.output_mode` written as `Shared` | **fails** (`audio.output_mode` / left: Shared / right: Exclusive) |
+| `audio.replaygain` written as `Off` | **fails** (`audio.replaygain` / left: Off / right: Album) |
+| `audio.device` not written | **fails** (`audio.device` / left: None / right: Some("Speakers (Realtek)")) |
+| `ui.snap_distance` written as `10` | **fails** (`ui.snap_distance` / left: 10 / right: 25) |
+| `plugins.plugin_dir` not written | **fails** (`plugins.plugin_dir` / left: None / right: Some("plugins")) |
+| `plugins.disabled` not written | **fails** (`plugins.disabled` / left: [] / right: ["bad.dll"]) |
+
+Every mutation is caught by **three** independent tests: the field-by-field
+round trip, the structural `OWNED_PATHS` net (it names the setting: *"the
+owned setting `plugins.plugin_dir` is written as its default"*) and the
+in-memory round trip.
+
+**The writer was restored byte for byte.** The SHA-256 of
+`crates/rustamp-app/src/config.rs` before the mutations and after the
+restoration is the same
+(`A71FF0264F2DD3166A51B310087518B2047ADD15EF08C57FE354FBB60E31B4E0`), and
+`git diff` shows no change to the production part of the file: every hunk is
+inside `mod tests`.
+
+### 5.7 Boundary receipt of the `wave273` lane
+
+- Worktree: `C:\Users\micro\.local\share\opencode\worktree\26de0e\wave273-app-config-unit-test`.
+- Written: `crates/rustamp-app/src/config.rs` (the test module only) and this
+  document. No production code changed, no commit, no download, no window,
+  no spawned process, no `rustamp-core` contract touched.
+- Gates: `cargo fmt --all -- --check`, `cargo clippy -p rustamp-app
+  --all-targets --all-features -- -D warnings`, `cargo test -p rustamp-app
+  --all-features -- --test-threads=1` (582 passed, 0 failed, 17 ignored —
+  the ignored ones are the VM-only window and audio tests) and
+  `cargo check --workspace --all-targets --all-features` are green.
