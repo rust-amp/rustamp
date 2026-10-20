@@ -1748,8 +1748,8 @@ fn a_decoder_error_keeps_the_audio_decoded_before_it() {
 
 /// RFC 0014 §7.2's stub: a stage that fails loudly with a message after
 /// `fail_after` blocks — the engine-side half of M14 finding F1's smallest
-/// reproduction. It reports a look-ahead so the end-of-track flush also
-/// runs the failing stage (the re-failure path).
+/// reproduction. It halves the samples it lets through, so a test can tell
+/// its blocks from the ones that ran without it.
 struct FailingDspStage {
     fail_after: usize,
     blocks: usize,
@@ -1778,16 +1778,15 @@ impl rustamp_core::audio::DspStage for FailingDspStage {
     fn reset(&mut self) {}
 
     fn latency_frames(&self) -> u32 {
-        64
+        0
     }
 }
 
 /// RFC 0014 acceptance 2: a stage returning `Err(Error::Dsp("…"))` mid-run
 /// ends the track with `Event::Error` carrying `ErrorKind::Dsp` and the
 /// message text, the transport leaves Playing, and no second error is
-/// published when the flush path re-fails — the stage fails on every later
-/// block, and it reports a look-ahead, so the end-of-track flush runs it
-/// again.
+/// published — the first failure of a run sticks (RFC 0014 §4.2), and the
+/// failed stage is bypassed, so it cannot fail again.
 #[test]
 fn a_stage_error_ends_the_track_loudly_and_only_once() {
     let mut h = Harness::new(&[TRACK_A]);
@@ -1831,7 +1830,7 @@ fn a_stage_error_ends_the_track_loudly_and_only_once() {
     assert_eq!(
         errors.len(),
         1,
-        "exactly one error event per run (the flush re-failure must not re-report): {events:?}"
+        "exactly one error event per run (the bypass must not re-report): {events:?}"
     );
     let Event::Error(published) = errors[0] else {
         unreachable!("filtered to Event::Error")
@@ -1841,6 +1840,83 @@ fn a_stage_error_ends_the_track_loudly_and_only_once() {
         published.message.contains("clipping detected"),
         "{published:?}"
     );
+}
+
+/// W14 finding F4: a failed stage must not take the player with it.
+///
+/// The engine's recovery policy is to **bypass** the failed stage: it is
+/// replaced by a pass-through, so the next track plays (without the failed
+/// stage) instead of every later track failing on the poisoned chain. The
+/// failure is reported once, and the report names the stage and says that
+/// it is bypassed — the bypass is never silent.
+#[test]
+fn a_failed_stage_is_bypassed_and_the_next_track_plays() {
+    let mut h = Harness::new(&[TRACK_A, TRACK_B]);
+    // The limiter stays off so the samples are not clamped: the test
+    // compares the audio it got with the source.
+    h.engine.set_limiter_enabled(false);
+    h.engine.set_dsp_chain(vec![Box::new(FailingDspStage {
+        fail_after: 1,
+        blocks: 0,
+    })]);
+    h.engine.play_index(0).unwrap();
+    assert!(
+        h.wait_buffered(),
+        "the queue must run to its end: the second track must play"
+    );
+
+    // The failure is reported once, and the report names the stage and the
+    // bypass.
+    let events = h.drain_events();
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event, Event::Error(_)))
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one error event per run: {events:?}"
+    );
+    let Event::Error(info) = errors[0] else {
+        unreachable!("filtered to Event::Error")
+    };
+    assert_eq!(info.kind, ErrorKind::Dsp, "{info:?}");
+    assert!(info.message.contains("failing-dsp"), "{info:?}");
+    assert!(info.message.contains("bypassed"), "{info:?}");
+    assert!(info.message.contains("clipping detected"), "{info:?}");
+
+    // The next track plays, and the failed stage is out of the chain: the
+    // second track's audio is the source, bit for bit (the failing stage
+    // would have halved it).
+    let mut rec = Vec::new();
+    let mut pumped = 0u64;
+    while pumped < 4024 {
+        let step = 500.min(4024 - pumped);
+        h.clock.pump_record(step, &mut rec);
+        pumped += step;
+        h.engine.poll().unwrap();
+    }
+    let left: Vec<f32> = rec.iter().step_by(2).copied().collect();
+    assert_eq!(left.len(), 4024);
+    // The first track ends at the failure: one block went through the stage
+    // (halved), the second one failed.
+    let halved: Vec<f32> = source(1, 0, 1024)
+        .iter()
+        .map(|sample| finished(sample * 0.5))
+        .collect();
+    assert_eq!(&left[..1024], &halved[..]);
+    assert_eq!(&left[1024..], &expected(2, 0, 3000)[..]);
+
+    assert!(
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+        "the run must finish: the bypass must not start a retry loop"
+    );
+    assert_eq!(
+        h.engine.position_frames(),
+        3000,
+        "the second track must play to its end"
+    );
+    assert_eq!(h.engine.current_index(), Some(1));
 }
 
 /// A6 finding 8. With the limiter disabled, a NaN from a stage never reaches the

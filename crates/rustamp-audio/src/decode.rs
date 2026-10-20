@@ -49,11 +49,53 @@
 //! # DSP stage failures
 //!
 //! `DspStage::process` is fallible (RFC 0014): an `Err` is terminal for the
-//! run. `emit` handles it exactly like a decoder error — report it, push the
+//! track. `emit` handles it exactly like a decoder error — report it, push the
 //! chain's held-back audio out, end the track — and the first failure sticks:
-//! one `Event::Error` per run, never a second one when the flush re-fails.
-//! The NaN sanitizer above stays as defense in depth on the Ok path; an `Err`
-//! bypasses sample post-processing entirely.
+//! one `Event::Error` per run, never a second one when a later stage fails as
+//! well. The NaN sanitizer above stays as defense in depth on the Ok path; an
+//! `Err` bypasses sample post-processing entirely.
+//!
+//! ## The engine's recovery policy: bypass
+//!
+//! RFC 0014 §4.3 poisons a failed chain: resuming on it is an error, and the
+//! recovery is an explicit replacement with a fresh one. That is the
+//! *contract*; what the engine does with a failed stage in the meantime is
+//! engine policy, the way RFC 0006 §8 puts the restart policy on the engine
+//! side. The engine's policy is **bypass**:
+//!
+//! * The failed stage is replaced by a pass-through ([`Bypass`]) at the
+//!   moment it fails, so the audio keeps flowing and **the next track
+//!   plays** — the player does not die with a poisoned chain (W14 finding
+//!   F4). The bypass lasts until the caller installs a new chain
+//!   ([`Engine::set_dsp_chain`](crate::engine::Engine::set_dsp_chain)); the
+//!   engine hands the bypassed chain back to the caller with the run, so the
+//!   bypass is visible in what the caller gets back and can be undone by
+//!   installing the stage again.
+//! * The failure is reported **once** per run, and the report names the
+//!   stage, the cause and what was lost. The bypass is not silent: the
+//!   `Event::Error` says that the stage is bypassed from now on.
+//! * The track the failure happened in ends there — the stage's audio for
+//!   that track is gone — but the queue keeps going.
+//!
+//! A *replacement* (a fresh resident, a fresh plugin) is the other possible
+//! policy, and it is the app layer's to choose: only the caller knows how
+//! the stage was built (which helper binary, which plugin), so only the
+//! caller can build a new one. The engine owns the chain, not its
+//! construction.
+//!
+//! ## What happens to the audio the failed stage held
+//!
+//! A stage that reports a latency holds that many frames back. When it
+//! fails, those frames are gone with it: they live inside the stage (inside
+//! the resident helper, for the resident chain), and nothing can get them
+//! out. The engine does not hide that: the failure report names the frames
+//! as lost.
+//!
+//! What *can* come out is the rest of the chain's hold-back: the stages that
+//! are still alive keep their audio, and the end-of-track flush pushes it
+//! out. That is why the failed stage is bypassed **before** the flush runs:
+//! a dead stage in the chain would abort the flush and take the living
+//! stages' held-back audio down with it (W14 finding F4).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -446,9 +488,40 @@ enum Emit {
     Abandoned,
     /// A DSP stage failed (RFC 0014 §3.5): the track ends loudly. The first
     /// failure was reported and the chain flushed in `emit`; a stage that
-    /// keeps failing during that flush ends the track through the same arm
-    /// without a second report.
+    /// fails during that flush ends the track through the same arm without a
+    /// second report.
     StageFailed,
+}
+
+/// The pass-through a failed stage is replaced with.
+///
+/// The engine's recovery policy on a DSP failure is to bypass the failed
+/// stage (see the module docs): the stage is dropped and this placeholder
+/// takes its place, so the audio keeps flowing and the next track plays.
+///
+/// The placeholder keeps the chain's shape — the equalizer stays first, the
+/// limiter last — and holds nothing back, so the latency bookkeeping (the
+/// trim after a `prepare`, the flush at the end of a track) stays exact.
+struct Bypass;
+
+impl DspStage for Bypass {
+    fn name(&self) -> &str {
+        "bypass"
+    }
+
+    fn prepare(&mut self, _spec: AudioSpec) -> rustamp_core::error::Result<()> {
+        Ok(())
+    }
+
+    fn process(&mut self, _buf: &mut [f32]) -> rustamp_core::error::Result<()> {
+        Ok(())
+    }
+
+    fn reset(&mut self) {}
+
+    fn latency_frames(&self) -> u32 {
+        0
+    }
 }
 
 struct Worker {
@@ -868,23 +941,43 @@ impl Worker {
         // bit-exact no-op.
         let rg_gain = self.rg_gain;
         crate::replaygain::apply_gain(&mut self.in_buf[..samples], rg_gain);
-        for stage in &mut self.dsp {
-            if let Err(e) = stage.process(&mut self.in_buf[..samples]) {
-                // RFC 0014 §3.5: a stage error is terminal for the run and is
-                // handled exactly like the decoder-error arm: report it, keep
-                // the audio the chain still holds, end the track. The first
-                // failure sticks (§4.2): a stage that keeps failing during
-                // the latency flush ends the track through this same arm
-                // without a second report.
+        let mut index = 0;
+        while index < self.dsp.len() {
+            let outcome = self.dsp[index].process(&mut self.in_buf[..samples]);
+            if let Err(error) = outcome {
+                // RFC 0014 §3.5: a stage error ends the track. The engine's
+                // own policy on top of that is to bypass the failed stage
+                // (see the module docs): it is replaced by a pass-through,
+                // so the audio keeps flowing and the next track plays
+                // instead of the player dying with the poisoned chain.
+                //
+                // The stage is dropped here: a failed resident chain owns a
+                // helper process that is dead or wedged, and it must not
+                // outlive its failure.
+                let failed = std::mem::replace(&mut self.dsp[index], Box::new(Bypass));
+                let name = failed.name().to_owned();
+                let held = failed.latency_frames();
+                drop(failed);
+                // The first failure sticks (§4.2): a stage that fails later
+                // is bypassed too, but it is not reported a second time.
                 if !self.stage_failed {
                     self.stage_failed = true;
-                    self.report_error(&e);
-                    if matches!(self.flush_dsp(), Emit::Abandoned) {
-                        return Emit::Abandoned;
-                    }
+                    self.report_stage_failure(&error, &name, held);
+                }
+                // The rest of the chain is still alive and may still hold
+                // audio back: flush it, so that audio comes out. The failed
+                // stage is out of the chain by now, so the flush is not
+                // aborted by it — that is the whole point of bypassing it
+                // first. What the failed stage itself held is lost with it,
+                // and the report above says so.
+                match self.flush_dsp() {
+                    Emit::Continue => {}
+                    Emit::Abandoned => return Emit::Abandoned,
+                    Emit::StageFailed => {}
                 }
                 return Emit::StageFailed;
             }
+            index += 1;
         }
         let skip = self.dsp_trim.min(frames);
         self.dsp_trim -= skip;
@@ -1275,5 +1368,31 @@ impl Worker {
             kind: info.kind,
             message: info.message,
         });
+    }
+
+    /// Report a stage failure: the stage's name, the cause, what is lost and
+    /// that the stage is bypassed from now on.
+    ///
+    /// The report is the only place the user learns what the failure cost,
+    /// so it names all three: the stage that failed (the chain or the
+    /// plugin behind it), the frames that are gone, and the bypass that
+    /// follows. `held` is the failed stage's own hold-back: the frames it
+    /// still held are lost with it, because they live inside it.
+    fn report_stage_failure(&self, error: &Error, name: &str, held: u32) {
+        // The cause without the `dsp error: ` prefix the report adds itself.
+        let cause = match error {
+            Error::Dsp(message) => message.clone(),
+            other => other.to_string(),
+        };
+        let lost = if held > 0 {
+            format!(
+                "the block it was processing and the audio it held back (up to {held} frames) are lost"
+            )
+        } else {
+            "the block it was processing is lost".to_owned()
+        };
+        self.report_error(&Error::Dsp(format!(
+            "stage '{name}' failed: {cause}; the track ends here and the stage is bypassed from now on; {lost}"
+        )));
     }
 }

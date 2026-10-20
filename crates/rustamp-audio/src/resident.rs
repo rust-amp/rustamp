@@ -163,13 +163,21 @@
 //! it, flush the chain, end the track loudly (RFC 0006 §8: the resident's
 //! death fails the track, never the player) — so no engine-polled latch is
 //! needed anymore. The first failure sticks on the stage: a failed chain is
-//! poisoned and resuming on it is an error (RFC 0014 §4.3); recovery is an
-//! explicit replacement with a fresh chain. A refusal at configure is a loud
-//! error at [`DspResidentConfig::open`] (or at `prepare` for a reconfigure,
-//! which the decode thread discards — the poisoned stage returns the latched
-//! refusal from its next `process`), before or instead of playback; a missing
-//! helper binary degrades to "stage unavailable", never to a silent
-//! in-process fallback.
+//! poisoned and resuming on it is an error (RFC 0014 §4.3).
+//!
+//! What happens to the player is engine policy, and the engine's policy is
+//! to **bypass** the failed chain (see [`crate::decode`]): the engine
+//! replaces it with a pass-through, so the next track plays instead of the
+//! player dying with the poisoned chain. The failure is reported once, with
+//! the chain named and the lost frames counted, so the bypass is never
+//! silent. A *replacement* — a fresh helper, a fresh plugin — is the app
+//! layer's to choose: only the caller knows how the chain was built.
+//!
+//! A refusal at configure is a loud error at [`DspResidentConfig::open`] (or
+//! at `prepare` for a reconfigure, which the decode thread discards — the
+//! poisoned stage returns the latched refusal from its next `process`),
+//! before or instead of playback; a missing helper binary degrades to
+//! "stage unavailable", never to a silent in-process fallback.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -1298,15 +1306,16 @@ impl ChainControl {
 
     /// `DspStage::latency_frames`: the resident's `DspReady` report, which the
     /// decode thread sums into its trim/flush compensation exactly like an
-    /// in-process stage's (RFC 0006 §6.2). Zero once poisoned: the stage
-    /// never processes again, so no end-of-track flush may push silence
-    /// through a dead chain.
+    /// in-process stage's (RFC 0006 §6.2).
+    ///
+    /// A failed chain keeps reporting the hold-back it lost. The frames it
+    /// still holds live inside the dead helper, so they are gone — reporting
+    /// zero would hide that loss from the engine's failure report and from
+    /// the flush compensation (W14 finding F4). The engine reads the number
+    /// when the failure happens and then bypasses the chain, so the value
+    /// never enters a later track's trim or flush.
     fn latency<F: PcmRings>(&self, session: &DspSession<F>) -> u32 {
-        if self.poisoned.is_some() {
-            0
-        } else {
-            session.latency_frames()
-        }
+        session.latency_frames()
     }
 }
 
@@ -2557,7 +2566,8 @@ mod dsp_hosted_tests {
     use std::time::Instant;
 
     use rustamp_core::audio::{
-        AudioSpec, Confidence, Decoder, DecoderFactory, DecoderRegistry, MediaSource, ProbeHint,
+        AudioSpec, Confidence, Decoder, DecoderFactory, DecoderRegistry, DspStage, MediaSource,
+        ProbeHint,
     };
     use rustamp_core::bus::{EventBus, EventReceiver};
     use rustamp_core::error::{Error as CoreError, ErrorKind, Result as CoreResult};
@@ -2848,6 +2858,14 @@ mod dsp_hosted_tests {
                             .armed_to_die(Arc::clone(die)),
                         None => FakeChain::new(Kind::Die, 2.0, 0, channels),
                     },
+                    // The same crash, but the samples pass through unchanged:
+                    // a test that compares the audio it got with the source
+                    // needs a chain that does not touch the samples.
+                    "fake:die-flat" => match &self.die {
+                        Some(die) => FakeChain::new(Kind::Die, 1.0, 0, channels)
+                            .armed_to_die(Arc::clone(die)),
+                        None => FakeChain::new(Kind::Die, 1.0, 0, channels),
+                    },
                     "fake:refuse" => {
                         return Err(MediaHostError::OperationFailed(
                             "fake resident refuses this chain".into(),
@@ -3134,7 +3152,7 @@ mod dsp_hosted_tests {
         assert_eq!(
             chain.latency_frames(),
             0,
-            "a poisoned chain reports no latency"
+            "a poisoned chain still reports the hold-back it lost (zero for this chain)"
         );
         let input = [0.5f32, -0.25];
         let mut buf = input;
@@ -3224,6 +3242,44 @@ mod dsp_hosted_tests {
         drop(chain);
         let outcome = host.recv_timeout(WAIT).expect("host must finish");
         assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    /// W14 finding F4, first half: a failed chain keeps reporting the
+    /// hold-back it lost.
+    ///
+    /// The frames a chain holds back live inside it — inside the helper, for
+    /// the resident chain. When it dies they are gone, and the engine's
+    /// failure report has to be able to say so. A poisoned chain that
+    /// reported zero would hide the loss: the report would claim that
+    /// nothing was held, and the flush compensation would skip it.
+    #[test]
+    fn a_poisoned_chain_still_reports_the_hold_back_it_lost() {
+        const LATENCY: u32 = 100;
+        let (mut chain, host) = open_chain(
+            vec![delay_desc(LATENCY), stage("fake:die-flat")],
+            SPEC_WIRE,
+            8,
+            WAIT,
+        );
+        assert_eq!(chain.latency_frames(), LATENCY);
+        // Two good blocks; the fake crashes on its third process call.
+        let mut buf = [0.5f32, -0.25, 0.125, 0.0625];
+        chain.process(&mut buf).unwrap();
+        let mut buf = [0.5f32, -0.25, 0.125, 0.0625];
+        chain.process(&mut buf).unwrap();
+        // The third round trip dies with the host.
+        let mut buf = [0.5f32, -0.25, 0.125, 0.0625];
+        assert!(matches!(
+            chain.process(&mut buf).unwrap_err(),
+            CoreError::Dsp(_)
+        ));
+        assert_eq!(
+            chain.latency_frames(),
+            LATENCY,
+            "a poisoned chain still reports the hold-back it lost"
+        );
+        drop(chain);
+        reap(host);
     }
 
     // -----------------------------------------------------------------------
@@ -3478,6 +3534,65 @@ mod dsp_hosted_tests {
         }
     }
 
+    /// A stage that holds back `latency` frames and passes the samples
+    /// through unchanged: the look-ahead shape with a known number of frames.
+    ///
+    /// It is the stage that is still alive when the resident dies, so the
+    /// frames it holds are the ones the end-of-track flush has to push out.
+    struct Delayer {
+        latency: usize,
+        channels: usize,
+        pending: VecDeque<f32>,
+    }
+
+    impl Delayer {
+        fn new(latency: usize, channels: usize) -> Self {
+            Delayer {
+                latency,
+                channels,
+                pending: VecDeque::new(),
+            }
+        }
+
+        /// The stage's start-up state: `latency` frames of silence.
+        fn clear(&mut self) {
+            self.pending.clear();
+            self.pending.resize(self.latency * self.channels, 0.0);
+        }
+    }
+
+    impl DspStage for Delayer {
+        fn name(&self) -> &str {
+            "delayer"
+        }
+
+        fn prepare(&mut self, _spec: AudioSpec) -> CoreResult<()> {
+            // The `DspStage` contract clears the stage's state at a track
+            // change, and `prepare` is what the engine calls there.
+            self.clear();
+            Ok(())
+        }
+
+        fn process(&mut self, buf: &mut [f32]) -> CoreResult<()> {
+            for frame in buf.chunks_exact_mut(self.channels) {
+                for sample in frame.iter_mut() {
+                    let delayed = self.pending.pop_front().unwrap_or(0.0);
+                    self.pending.push_back(*sample);
+                    *sample = delayed;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.clear();
+        }
+
+        fn latency_frames(&self) -> u32 {
+            self.latency as u32
+        }
+    }
+
     /// An engine whose installed DSP chain runs in the fake resident.
     struct DspHarness {
         engine: Engine,
@@ -3489,7 +3604,13 @@ mod dsp_hosted_tests {
 
     impl DspHarness {
         fn new(names: &[&str], stages: Vec<DspStageDesc>, block_timeout: Duration) -> DspHarness {
-            Self::with_resident(names, stages, block_timeout, FakeDspResident::new())
+            Self::with_chain(
+                names,
+                stages,
+                block_timeout,
+                FakeDspResident::new(),
+                Vec::new(),
+            )
         }
 
         /// A harness whose in-process fake resident is the given one — the
@@ -3500,6 +3621,19 @@ mod dsp_hosted_tests {
             stages: Vec<DspStageDesc>,
             block_timeout: Duration,
             resident: FakeDspResident,
+        ) -> DspHarness {
+            Self::with_chain(names, stages, block_timeout, resident, Vec::new())
+        }
+
+        /// A harness whose engine chain is the resident chain followed by
+        /// `extra`: the stages that are still alive when the resident dies,
+        /// and that therefore still hold audio back at the failure.
+        fn with_chain(
+            names: &[&str],
+            stages: Vec<DspStageDesc>,
+            block_timeout: Duration,
+            resident: FakeDspResident,
+            extra: Vec<Box<dyn DspStage>>,
         ) -> DspHarness {
             let dir = tempfile::tempdir().expect("temp dir");
             let (output, clock) = NullOutput::pair();
@@ -3515,7 +3649,9 @@ mod dsp_hosted_tests {
             let (session, host) =
                 open_session_with(stages.clone(), SPEC_WIRE, DEFAULT_DSP_RING_FRAMES, resident);
             let chain = HostDspChain::new(session, stages, DEFAULT_DSP_RING_FRAMES, block_timeout);
-            engine.set_dsp_chain(vec![Box::new(chain)]);
+            let mut installed: Vec<Box<dyn DspStage>> = vec![Box::new(chain)];
+            installed.extend(extra);
+            engine.set_dsp_chain(installed);
             let queue = names
                 .iter()
                 .map(|name| {
@@ -3765,25 +3901,35 @@ mod dsp_hosted_tests {
         assert_eq!(error.kind, ErrorKind::Dsp, "{error:?}");
         assert!(h.engine.last_error().is_some());
 
-        // Resuming on the failed chain is an error (RFC 0014 §4.3): the
-        // poisoned stage returns its sticky failure from `process`, so the
-        // next run fails loudly the same way instead of playing through.
+        // The failed stage is bypassed (the engine's recovery policy): the
+        // next run plays the track to its end, without the resident, and
+        // publishes no second error — the failure was reported once, and the
+        // report named the bypass. The player is not dead any more (W14
+        // finding F4).
         h.engine.play_index(0).unwrap();
         assert_eq!(h.engine.transport(), TransportState::Playing);
         assert!(
             h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
-            "the poisoned chain must fail the next run loudly"
+            "the bypassed chain must play the next run to its end"
+        );
+        assert_eq!(
+            h.engine.position_frames(),
+            44_100,
+            "the bypassed run must play the whole track"
         );
         let events = h.drain_events();
         let error_count = events
             .iter()
             .filter(|event| matches!(event, Event::Error(_)))
             .count();
-        assert_eq!(error_count, 1, "one error event per run, got {error_count}");
-        assert!(h.engine.last_error().is_some());
+        assert_eq!(
+            error_count, 0,
+            "the bypass is not a second failure: {events:?}"
+        );
 
-        // Recovery is an explicit replacement (RFC 0014 §4.3): a fresh chain
-        // with fresh rings plays the track to its end, with no error.
+        // A replacement is the app layer's own recovery (only the caller
+        // knows how the chain was built): a fresh chain with fresh rings
+        // plays the track to its end, with no error.
         let (fresh, fresh_host) = open_chain(
             vec![gain_desc(2.0)],
             SPEC_WIRE,
@@ -3805,6 +3951,145 @@ mod dsp_hosted_tests {
         );
         h.finish();
         reap(fresh_host);
+    }
+
+    /// W14 finding F4: a resident that dies mid-track must not take the
+    /// player with it.
+    ///
+    /// The failed chain is bypassed, the failure is reported **once** — with
+    /// the chain named, the bypass named and the frames that are lost with
+    /// it counted — and the **next track plays**, without the resident. The
+    /// run ends at the end of the queue: the bypass cannot start a retry
+    /// loop.
+    #[test]
+    fn engine_bypasses_the_failed_resident_and_the_next_track_plays() {
+        // The resident holds 100 frames back (the delay) and dies on its
+        // third block: the third round trip never comes back.
+        let mut h = DspHarness::new(
+            &["track7_4096.tst", "track2_4096.tst"],
+            vec![delay_desc(100), stage("fake:die-flat")],
+            WAIT,
+        );
+        h.engine.play_index(0).unwrap();
+        assert!(h.wait_track(0));
+        assert!(
+            h.wait_buffered(),
+            "the queue must run to its end: the second track must play"
+        );
+
+        // The failure is reported once, and the report names the chain, the
+        // bypass and the frames that are lost with it.
+        let events = h.drain_events();
+        let errors: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, Event::Error(_)))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "exactly one error event per run: {events:?}"
+        );
+        let Event::Error(info) = errors[0] else {
+            unreachable!("filtered to Event::Error")
+        };
+        assert_eq!(info.kind, ErrorKind::Dsp, "{info:?}");
+        assert!(info.message.contains("resident-dsp"), "{info:?}");
+        assert!(info.message.contains("bypassed"), "{info:?}");
+        assert!(
+            info.message.contains("100 frames"),
+            "the report must name the frames that are lost: {info:?}"
+        );
+        assert!(info.message.contains("resident DSP"), "{info:?}");
+
+        // The next track plays, and the resident is out of the chain: the
+        // second track's audio is the source, bit for bit.
+        //
+        // The first track ends at the failure: two blocks went through the
+        // resident (the third one dies), and the resident's 100 start-up
+        // frames are the trim, so 2048 - 100 frames of it were written.
+        let mut rec = Vec::new();
+        let mut pumped = 0u64;
+        while pumped < 6044 {
+            let step = 500.min(6044 - pumped);
+            h.clock.pump_record(step, &mut rec);
+            pumped += step;
+            h.engine.poll().unwrap();
+        }
+        let left: Vec<f32> = rec.iter().step_by(2).copied().collect();
+        assert_eq!(left.len(), 6044);
+        assert_eq!(&left[..1948], &expected(7, 0, 1948)[..]);
+        assert_eq!(&left[1948..], &expected(2, 0, 4096)[..]);
+
+        assert!(
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+            "the run must finish: the bypass must not start a retry loop"
+        );
+        // The second track played to its end (the position is the last
+        // track's), and the run wrote the first track's 1948 frames plus the
+        // second track's 4096.
+        assert_eq!(
+            h.engine.position_frames(),
+            4096,
+            "the second track must play to its end"
+        );
+        assert_eq!(h.engine.ring_counters().0, 6044);
+        assert_eq!(h.engine.current_index(), Some(1));
+        h.finish();
+    }
+
+    /// W14 finding F4, second half: a failure must not silently delete the
+    /// audio the chain still holds.
+    ///
+    /// The stages that are still alive keep their hold-back, and the
+    /// end-of-track flush pushes it out — the flush must not be aborted by
+    /// the dead stage, which is why the failed stage is bypassed *before* it
+    /// runs. The failed stage's own hold-back is gone with it, and the
+    /// report says so.
+    #[test]
+    fn engine_flushes_the_live_chain_after_the_resident_dies() {
+        // The resident holds 100 frames back and dies on its third block; a
+        // delayer after it holds 32 frames back and stays alive.
+        let mut h = DspHarness::with_chain(
+            &["track7_4096.tst"],
+            vec![delay_desc(100), stage("fake:die-flat")],
+            WAIT,
+            FakeDspResident::new(),
+            vec![Box::new(Delayer::new(32, 2))],
+        );
+        h.engine.play_index(0).unwrap();
+        assert!(h.wait_track(0));
+        assert!(h.wait_buffered(), "the run must reach the end of the track");
+
+        // The live chain's hold-back came out: the flush pushed the delayer's
+        // 32 frames out, so the ring holds them at the end. Without the
+        // flush they would be missing (1916 frames instead of 1948).
+        //
+        // The resident's own 100 frames are gone with it: a healthy chain
+        // would have written 2048 frames here (1916 plus the 132 frames both
+        // stages held back).
+        let mut rec = Vec::new();
+        let mut pumped = 0u64;
+        while pumped < 1948 {
+            let step = 500.min(1948 - pumped);
+            h.clock.pump_record(step, &mut rec);
+            pumped += step;
+            h.engine.poll().unwrap();
+        }
+        let left: Vec<f32> = rec.iter().step_by(2).copied().collect();
+        assert_eq!(left.len(), 1948);
+        assert_eq!(&left[..1916], &expected(7, 0, 1916)[..]);
+        assert_eq!(
+            &left[1916..],
+            &expected(7, 1916, 32)[..],
+            "the live chain's hold-back must come out of the flush"
+        );
+
+        assert!(
+            h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+            "the run must finish"
+        );
+        assert_eq!(h.engine.position_frames(), 1948);
+        h.finish();
     }
 
     #[test]
