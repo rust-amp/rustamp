@@ -296,6 +296,45 @@
 //! cannot be read or decoded is "no cover" as well: a broken `cover.jpg`
 //! must not break the row it belongs to.
 //!
+//! ## Playlist extraction
+//!
+//! The library can write a selection out as a playlist. The file names come
+//! from a **path template** in a language of its own (spec S20 §4.2): bare
+//! words, no `%name%` and no functions. The template engine is the
+//! `extract` module of this crate, and it is pure: it parses a template,
+//! renders a row through it and plans the extraction of a selection. It
+//! writes no file and asks the user nothing.
+//!
+//! The language carries thirteen spellings of tokens. The spelling chooses
+//! the capitalisation of the value it inserts:
+//!
+//! | Token | Inserts |
+//! |---|---|
+//! | `Artist` / `ARTIST` / `artist` | the artist, as it is / upper / lower |
+//! | `Album` / `ALBUM` / `album` | the album, the same three cases |
+//! | `Title` / `TITLE` / `title` | the title, the same three cases |
+//! | `Genre` / `GENRE` / `genre` | the genre, the same three cases |
+//! | `year` | the album year |
+//! | `#`, `##`, `###` | the track number, zero-padded to the number of `#` |
+//!
+//! A backslash separates the directories of the path, and a word that is not
+//! one of the spellings above is **literal text** - including `Year` and
+//! `YEAR`, because `year` is carried in one spelling only. A field the track
+//! does not carry renders as an empty text, and the renderer reports it, so
+//! the caller can skip the track or write the file with the hole in the
+//! name.
+//!
+//! [`PathTemplate::plan`] turns a selection into the files the extraction
+//! writes and the tracks it cannot write. Two tracks that render to the same
+//! path are an error, not a silent overwrite: the first track of the
+//! selection keeps the path, the second one is reported. The counts the
+//! report needs are in [`ExtractPlan::counts`], and the message of a failed
+//! entry is the reference's own, `Error extracting track #N: <reason>`.
+//!
+//! Writing over an existing playlist asks `Overwrite playlist (No will
+//! append)?`; [`choose_playlist_action`] is the decision behind the answer.
+//! The question itself is the caller's.
+//!
 //! ## A damaged database
 //!
 //! [`Library::open`] never writes to a file it could not read as *this*
@@ -357,6 +396,17 @@
 //!   an offline drive are therefore dropped.
 //! * `remove_missing` only reaches the rows under a registered root. A row
 //!   that a scan of an unregistered path left behind is never cleaned up.
+//! * The path template of the extraction carries no token for the file
+//!   extension, so a planned file is named exactly as the template renders
+//!   it. A caller that wants a playable file appends the extension of the
+//!   source file itself.
+//! * The extraction compares the rendered paths exactly. Two tracks whose
+//!   paths differ only in the case collide on a case-insensitive file
+//!   system; the caller, which does the writing, sees the error there.
+//! * Whether the backslash of the template is literal on every platform or a
+//!   separator that follows the platform is open (S20 §8, open question 8).
+//!   The template engine hands the caller the segments and joins them with
+//!   the separator of the platform in one place only.
 
 #![forbid(unsafe_code)]
 
@@ -376,6 +426,9 @@ use rustamp_core::meta::TrackMetadata;
 mod artwork;
 #[cfg(test)]
 mod artwork_props;
+mod extract;
+#[cfg(test)]
+mod extract_props;
 mod open;
 #[cfg(test)]
 mod query_props;
@@ -387,6 +440,15 @@ mod testsupport;
 pub use artwork::{
     ArtworkCache, ArtworkCacheStats, CoverImage, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
     MAX_DECODE_BYTES, SIDECAR_NAMES, THUMBNAIL_MAX_EDGE,
+};
+// The path template of the playlist extraction is part of this crate's own
+// surface: a caller names a template, renders a selection through it and
+// writes the files itself. The module keeps the language of the reference
+// (spec S20 §4) and nothing else.
+pub use extract::{
+    ExtractCounts, ExtractError, ExtractErrorReason, ExtractPlan, FieldCase, OVERWRITE_PROMPT,
+    OverwriteAnswer, PathTemplate, PlannedFile, PlaylistAction, RenderedPath, TemplateField,
+    TemplatePart, TemplateSegment, TemplateToken, choose_playlist_action, extracted_message,
 };
 // The damage a database file can have is part of this crate's own surface:
 // a caller opens the index and has to know *why* it could not be opened.
