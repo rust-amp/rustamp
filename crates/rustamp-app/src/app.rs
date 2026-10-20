@@ -277,6 +277,11 @@ pub struct App {
     /// A Winamp configuration import waiting for the presenter's file dialog
     /// (see [`crate::winamp_ini`]).
     pending_winamp_ini_import: bool,
+    /// The last Winamp configuration import, for the preferences page.
+    ///
+    /// The page shows what the import did, so the result is on the page and
+    /// not only in the player's status line.
+    winamp_ini_import: Option<crate::winamp_ini::ImportOutcome>,
 }
 
 /// Whether `path` has a recognized playlist file extension.
@@ -509,6 +514,7 @@ impl App {
             host: HostStateLink::detached(),
             host_supervisor: None,
             pending_winamp_ini_import: false,
+            winamp_ini_import: None,
         };
         app.shuffle = app.config.playlist.shuffle;
         app.repeat = app.config.playlist.repeat;
@@ -949,6 +955,9 @@ impl App {
     /// Everything the player has no setting for is **reported** and never
     /// dropped silently — see [`crate::winamp_ini`] for the mapping table and
     /// for the two readings that are ours and not the spec's.
+    ///
+    /// The outcome is remembered, so the preferences page can show what the
+    /// import did (see [`App::winamp_ini_report`]).
     pub fn import_winamp_ini(
         &mut self,
         path: &Path,
@@ -959,23 +968,68 @@ impl App {
                 .as_ref()
                 .and_then(|dir| crate::skin_folder::find_skin_by_name(dir, name))
         };
-        let plan = crate::winamp_ini::import_file(
+        let outcome = match crate::winamp_ini::import_file(
             path,
             &self.current_config(),
             self.playlist_font_size(),
             &resolve_skin,
-        )?;
-        let crate::winamp_ini::ImportPlan {
-            config,
-            playlist_font_size,
-            report,
-        } = plan;
-        self.apply_import(&config, playlist_font_size);
-        self.note(format!(
-            "Winamp configuration imported: {}",
-            report.summary()
-        ));
-        Ok(report)
+        ) {
+            Ok(crate::winamp_ini::ImportPlan {
+                config,
+                playlist_font_size,
+                report,
+            }) => {
+                self.apply_import(&config, playlist_font_size);
+                self.note(format!(
+                    "Winamp configuration imported: {}",
+                    report.summary()
+                ));
+                Ok(report)
+            }
+            Err(error) => Err(error),
+        };
+        // The outcome is remembered for the preferences page, whether the
+        // file was read or not: the page tells the user what happened.
+        self.winamp_ini_import = Some(match &outcome {
+            Ok(report) => crate::winamp_ini::ImportOutcome::Imported {
+                path: path.to_path_buf(),
+                report: report.clone(),
+            },
+            Err(error) => crate::winamp_ini::ImportOutcome::Failed {
+                error: error.clone(),
+            },
+        });
+        outcome
+    }
+
+    /// Ends the Winamp configuration import the user was asked for.
+    ///
+    /// `path` is the file the user chose in the file dialog; `None` means
+    /// the dialog was cancelled. A cancelled import changes nothing: the
+    /// configuration stays as it was and the preferences page keeps the
+    /// report of the last import.
+    ///
+    /// The outcome is returned, so the presenter can say what happened.
+    pub fn finish_winamp_ini_import(
+        &mut self,
+        path: Option<&Path>,
+    ) -> Option<crate::winamp_ini::ImportOutcome> {
+        let path = path?;
+        // The import remembers the outcome; it is handed back so the caller
+        // can say what happened.
+        let _ = self.import_winamp_ini(path);
+        self.winamp_ini_import.clone()
+    }
+
+    /// The report of the last Winamp configuration import, for the
+    /// preferences page.
+    ///
+    /// `None` when no import has run yet: the page then says so instead of
+    /// showing a report.
+    pub fn winamp_ini_report(&self) -> Option<String> {
+        self.winamp_ini_import
+            .as_ref()
+            .map(|outcome| outcome.line())
     }
 
     /// Takes over the settings an import produced.

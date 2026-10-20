@@ -168,6 +168,9 @@ fn random_settings(rng: &mut Rng) -> PrefsSettings {
         skin_selected,
         plugins,
         library_roots,
+        // The report of the last import is the player's own text: it is not
+        // part of the lists the model owns, so it stays empty here.
+        winamp_ini_report: None,
     }
 }
 

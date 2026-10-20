@@ -108,6 +108,24 @@
 //! The row is one line, and the list scrolls sideways, so a long path stays
 //! readable: the list box carries a horizontal scroll bar, and its scroll
 //! range reaches the end of the longest row.
+//!
+//! # The import page
+//!
+//! One more page is not the reference's: `Import`. The import of a Winamp
+//! 2.95 configuration is this player's own feature, and what the import did
+//! belongs on a page of its own: the page names the file that was read, says
+//! how many settings were taken over and how many keys could not be
+//! honoured, and names the keys the player read in its own way.
+//!
+//! The button ([`PrefsAction::ImportWinampIni`]) does not read the file
+//! itself: the native file dialog needs an owner window, so the player asks
+//! the user for the file and hands the answer back. The report the import
+//! produced is pushed into the dialog ([`PrefsSettings::winamp_ini_report`])
+//! and shown on the page, so the result is on the page and not only in the
+//! player's status line.
+//!
+//! The button's text is short enough for the page's width; the sentence it
+//! stands for is the label above it.
 
 use rustamp_core::config::{OutputMode, ReplayGainMode};
 
@@ -148,6 +166,12 @@ pub enum PrefsNode {
     /// the media library is this player's own feature, and its roots are a
     /// setting the user has to be able to change.
     Library,
+    /// `Import`.
+    ///
+    /// **Own choice.** The reference's tree has no such page (S04 is open);
+    /// the import of a Winamp 2.95 configuration is this player's own
+    /// feature, and its report is what the user has to be able to read.
+    Import,
     /// `Bookmarks`.
     Bookmarks,
 }
@@ -183,6 +207,7 @@ pub const TREE: &[TreeEntry] = &[
     entry(PrefsNode::GeneralPurpose, "General Purpose", 1),
     entry(PrefsNode::Skins, "Skins", 0),
     entry(PrefsNode::Library, "Library", 0),
+    entry(PrefsNode::Import, "Import", 0),
     entry(PrefsNode::Bookmarks, "Bookmarks", 0),
 ];
 
@@ -395,6 +420,24 @@ pub enum Item {
         /// Placement.
         rect: Rect,
     },
+    /// Reads the settings of a Winamp 2.95 installation
+    /// ([`PrefsAction::ImportWinampIni`]).
+    ///
+    /// The button does not read the file itself: the player asks the user
+    /// for it, from the tick.
+    ImportButton {
+        /// Placement.
+        rect: Rect,
+    },
+    /// The report of the last import
+    /// ([`PrefsSettings::winamp_ini_report`]).
+    ///
+    /// The text is the player's, not the dialog's: the dialog only shows
+    /// what the player pushes into it.
+    Report {
+        /// Placement.
+        rect: Rect,
+    },
 }
 
 /// Width and height of the page area.
@@ -442,6 +485,12 @@ fn plugin_page(caption: &'static str, hint: &'static str) -> Vec<Item> {
 /// that nothing is loaded at startup yet are stated, not implied.
 const PLUGIN_HINT: &str = "Only approved plug-ins can be switched on. \
     The plug-ins you switch on are loaded when the plugin host starts.";
+
+/// What the report line shows when no import has run yet.
+///
+/// The dialog's own wording: the player pushes a report as soon as an
+/// import has run.
+const NO_REPORT: &str = "Nothing imported yet.";
 
 /// What `node`'s page contains.
 pub fn page_items(node: PrefsNode) -> Vec<Item> {
@@ -564,6 +613,23 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
                 rect: rect(138, 218, 114, 26),
             },
         ],
+        PrefsNode::Import => vec![
+            Item::Group {
+                text: "Winamp 2.95 configuration",
+                rect: rect(0, 0, w, 240),
+            },
+            Item::Label {
+                text: "Import settings from a Winamp 2.95 installation. The winamp.ini is only \
+                       read, never written to.",
+                rect: rect(12, 18, w - 24, 84),
+            },
+            Item::ImportButton {
+                rect: rect(12, 108, w - 24, 26),
+            },
+            Item::Report {
+                rect: rect(12, 144, w - 24, 84),
+            },
+        ],
         PrefsNode::Bookmarks => note_page("Bookmarks", "Bookmarks are not available yet."),
     }
 }
@@ -650,6 +716,11 @@ pub struct PrefsSettings {
     /// the media library's own database, and the player reads them from
     /// there.
     pub library_roots: Vec<LibraryRootRow>,
+    /// The report of the last import of a Winamp 2.95 configuration.
+    ///
+    /// `None` when no import has run yet: the page then says so instead of
+    /// showing a report.
+    pub winamp_ini_report: Option<String>,
 }
 
 impl PrefsSettings {
@@ -1149,6 +1220,11 @@ pub enum PrefsAction {
     ///
     /// The row is a row of [`PrefsSettings::library_roots`].
     RemoveLibraryRoot(usize),
+    /// The settings of a Winamp 2.95 installation should be imported.
+    ///
+    /// The player asks the user for the file itself; the dialog only says
+    /// that the file was asked for.
+    ImportWinampIni,
 }
 
 /// Why the dialog could not be opened.
@@ -1190,15 +1266,15 @@ mod win32 {
         CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, HMENU, IDC_ARROW, IsWindow,
         LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETHORIZONTALEXTENT,
         LoadCursorW, NONCLIENTMETRICSW, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW,
-        SendMessageW, SetForegroundWindow, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-        WM_DESTROY, WM_NOTIFY, WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-        WS_HSCROLL, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+        SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WM_NOTIFY, WM_SETFONT, WNDCLASSEXW, WS_CAPTION,
+        WS_CHILD, WS_EX_CLIENTEDGE, WS_HSCROLL, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{PCWSTR, PWSTR};
 
     use super::{
-        Bind, ComboBind, Item, PageLists, PrefsAction, PrefsError, PrefsNode, PrefsSettings, Rect,
-        TREE, page_items,
+        Bind, ComboBind, Item, NO_REPORT, PageLists, PrefsAction, PrefsError, PrefsNode,
+        PrefsSettings, Rect, TREE, page_items,
     };
 
     const CLASS_NAME: &str = "RustampPreferences";
@@ -1213,6 +1289,7 @@ mod win32 {
     const ID_LIBRARY_ROOTS: u16 = 64;
     const ID_LIBRARY_ADD: u16 = 65;
     const ID_LIBRARY_REMOVE: u16 = 66;
+    const ID_IMPORT: u16 = 67;
     /// Scrollable width (unscaled pixels) of a plug-in row.
     const PLUGIN_ROW_EXTENT: i32 = 900;
     /// Scrollable width (unscaled pixels) of a library root.
@@ -1268,6 +1345,11 @@ mod win32 {
         plugin_list: Option<HWND>,
         /// The media library's root list of the current page.
         library_list: Option<HWND>,
+        /// The report line of the current page.
+        report: Option<HWND>,
+        /// The text the report line shows, so a push that changes nothing
+        /// does not set the text again.
+        report_text: String,
         actions: Vec<PrefsAction>,
         /// Tree item handles, indexed like [`TREE`].
         items: Vec<isize>,
@@ -1401,6 +1483,8 @@ mod win32 {
                     lists: PageLists::default(),
                     plugin_list: None,
                     library_list: None,
+                    report: None,
+                    report_text: String::new(),
                     actions: Vec::new(),
                     items,
                     quiet: false,
@@ -1422,6 +1506,15 @@ mod win32 {
             // SAFETY: `IsWindow` accepts any handle value.
             unsafe { IsWindow(Some(HWND(self.hwnd as *mut c_void))) }.as_bool()
                 && STATE.with(|state| state.borrow().is_some())
+        }
+
+        /// The window's raw OS handle.
+        ///
+        /// For a dialog that must be owned by this window (the file dialog
+        /// the Import page asks for), so that it opens in front of the
+        /// preferences dialog and not behind it.
+        pub fn raw_handle(&self) -> isize {
+            self.hwnd
         }
 
         /// Brings the window to the front.
@@ -1476,8 +1569,8 @@ mod win32 {
 
         /// Pushes the player's current settings into the open controls.
         pub fn set_settings(&self, settings: &PrefsSettings) {
-            let Ok((checks, combos, skin_list, plugin_list, library_list, node)) =
-                STATE.with(|state| {
+            let Ok((checks, combos, skin_list, plugin_list, library_list, node, report)) = STATE
+                .with(|state| {
                     let mut guard = state.try_borrow_mut().map_err(|_| ())?;
                     let inner = guard.as_mut().ok_or(())?;
                     inner.settings = settings.clone();
@@ -1488,6 +1581,7 @@ mod win32 {
                         inner.plugin_list,
                         inner.library_list,
                         inner.node,
+                        inner.report,
                     ))
                 })
             else {
@@ -1508,6 +1602,9 @@ mod win32 {
             }
             if let Some(list) = controls.1 {
                 refresh_skin_list(list, settings);
+            }
+            if let Some(control) = report {
+                set_report(control, settings);
             }
         }
 
@@ -1533,6 +1630,33 @@ mod win32 {
                 Some(LPARAM(0)),
             );
         }
+    }
+
+    /// Makes the report line show the player's report.
+    ///
+    /// The text is set only when it changed: the settings are pushed every
+    /// tick, and a text that is set again and again flickers.
+    fn set_report(control: HWND, settings: &PrefsSettings) {
+        let wanted = settings.winamp_ini_report.as_deref().unwrap_or(NO_REPORT);
+        let unchanged = STATE.with(|state| {
+            state
+                .try_borrow()
+                .ok()
+                .is_some_and(|g| g.as_ref().is_some_and(|i| i.report_text == wanted))
+        });
+        if unchanged {
+            return;
+        }
+        let text = wide(wanted);
+        // SAFETY: the text outlives the call, and the control is our own.
+        let _ = unsafe { SetWindowTextW(control, PCWSTR(text.as_ptr())) };
+        STATE.with(|state| {
+            if let Ok(mut guard) = state.try_borrow_mut()
+                && let Some(inner) = guard.as_mut()
+            {
+                inner.report_text = wanted.to_string();
+            }
+        });
     }
 
     /// Selects the row of a drop-down list, unless it already shows it (the
@@ -1706,6 +1830,11 @@ mod win32 {
                         // ones say nothing about them, so the new lists are
                         // filled again.
                         i.lists = PageLists::shown(node);
+                        // The report line is a new control: the text of the
+                        // old one says nothing about it, so the new line is
+                        // filled again.
+                        i.report = None;
+                        i.report_text.clear();
                         std::mem::take(&mut i.page)
                     })
                 })
@@ -1722,6 +1851,7 @@ mod win32 {
         let mut skin_list = None;
         let mut plugin_list = None;
         let mut library_list = None;
+        let mut report = None;
         for (next_id, item) in (FIRST_PAGE_ID..).zip(page_items(node)) {
             match item {
                 Item::Group { text, rect } => {
@@ -1961,6 +2091,37 @@ mod win32 {
                         page.push(c);
                     }
                 }
+                Item::ImportButton { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Import from a Winamp 2.95 installation...",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_IMPORT,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
+                Item::Report { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("STATIC"),
+                        "",
+                        WS_CHILD.0 | WS_VISIBLE.0 | SS_LEFT,
+                        0,
+                        shift(rect),
+                        next_id,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                        report = Some(c);
+                    }
+                }
             }
         }
         STATE.with(|state| {
@@ -1973,6 +2134,8 @@ mod win32 {
                 inner.skin_list = skin_list;
                 inner.plugin_list = plugin_list;
                 inner.library_list = library_list;
+                inner.report = report;
+                inner.report_text.clear();
             }
         });
         if let Some(list) = plugin_list {
@@ -1983,6 +2146,9 @@ mod win32 {
         }
         if let Some(list) = skin_list {
             refresh_skin_list(list, settings);
+        }
+        if let Some(control) = report {
+            set_report(control, settings);
         }
     }
 
@@ -2232,6 +2398,12 @@ mod win32 {
                     }
                     return LRESULT(0);
                 }
+                if id == ID_IMPORT && code == BN_CLICKED {
+                    // The dialog does not read the file itself: the player
+                    // asks the user for it, from the tick.
+                    push_action(PrefsAction::ImportWinampIni);
+                    return LRESULT(0);
+                }
                 if id == ID_PLUGIN_TOGGLE && code == BN_CLICKED {
                     // The id behind the selected row; an information row or no
                     // selection toggles nothing.
@@ -2409,6 +2581,7 @@ mod tests {
                 "General Purpose",
                 "Skins",
                 "Library",
+                "Import",
                 "Bookmarks",
             ]
         );
@@ -2443,7 +2616,9 @@ mod tests {
                     | Item::PluginRescan { rect }
                     | Item::LibraryRoots { rect }
                     | Item::LibraryAdd { rect }
-                    | Item::LibraryRemove { rect } => vec![rect],
+                    | Item::LibraryRemove { rect }
+                    | Item::ImportButton { rect }
+                    | Item::Report { rect } => vec![rect],
                     Item::Combo { label, list, .. } => vec![label, list],
                 };
                 for r in rects {
@@ -3082,5 +3257,86 @@ mod tests {
             PrefsAction::RemoveLibraryRoot(0),
             PrefsAction::RemoveLibraryRoot(1)
         );
+    }
+
+    /// The import page offers the import and has a place for its report.
+    #[test]
+    fn the_import_page_has_the_button_and_the_report_line() {
+        let items = page_items(PrefsNode::Import);
+        let count = |f: fn(&Item) -> bool| items.iter().filter(|i| f(i)).count();
+        assert_eq!(count(|i| matches!(i, Item::ImportButton { .. })), 1);
+        assert_eq!(count(|i| matches!(i, Item::Report { .. })), 1);
+        // The button is above the report: the user reads the result after
+        // the action.
+        let button = items
+            .iter()
+            .find_map(|item| match item {
+                Item::ImportButton { rect } => Some(*rect),
+                _ => None,
+            })
+            .expect("the import button");
+        let report = items
+            .iter()
+            .find_map(|item| match item {
+                Item::Report { rect } => Some(*rect),
+                _ => None,
+            })
+            .expect("the report line");
+        assert!(
+            button.y + button.h <= report.y,
+            "the button is above the report"
+        );
+    }
+
+    /// The import button spans the page's text column.
+    ///
+    /// Its text ("Import from a Winamp 2.95 installation...") is 216 pixels
+    /// wide in the system font at 96 DPI, so the button needs the whole
+    /// column: a narrower one would cut the text off.
+    #[test]
+    fn the_import_button_spans_the_text_column() {
+        let items = page_items(PrefsNode::Import);
+        let button = items
+            .iter()
+            .find_map(|item| match item {
+                Item::ImportButton { rect } => Some(*rect),
+                _ => None,
+            })
+            .expect("the import button");
+        assert_eq!(button.x, 12);
+        assert_eq!(button.w, PAGE_SIZE.0 - 24);
+    }
+
+    /// The page says what it imports and that the file is only read.
+    #[test]
+    fn the_import_page_names_the_winamp_configuration() {
+        let items = page_items(PrefsNode::Import);
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Label { text, .. } => Some(*text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert!(labels[0].contains("Winamp 2.95"), "{}", labels[0]);
+        assert!(labels[0].contains("only read"), "{}", labels[0]);
+    }
+
+    /// The report the player pushes is the report the page shows.
+    ///
+    /// The wording is the player's own: the dialog only shows it.
+    #[test]
+    fn the_report_is_the_one_the_player_pushed() {
+        let line = r"C:\winamp.ini — 2 applied, 1 not applied";
+        let settings = PrefsSettings {
+            winamp_ini_report: Some(line.to_string()),
+            ..PrefsSettings::default()
+        };
+        assert_eq!(settings.winamp_ini_report.as_deref(), Some(line));
+        // Without a report the page says so instead of showing nothing.
+        let empty = PrefsSettings::default();
+        assert_eq!(empty.winamp_ini_report, None);
+        assert_eq!(NO_REPORT, "Nothing imported yet.");
     }
 }

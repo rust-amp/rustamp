@@ -615,6 +615,7 @@ impl App {
             skin_selected,
             plugins: self.plugin_rows(),
             library_roots: self.library_roots(),
+            winamp_ini_report: self.winamp_ini_report(),
         }
     }
 
@@ -815,6 +816,11 @@ impl App {
                 if let Err(error) = self.remove_library_root(&path) {
                     self.note(format!("preferences: {error}"));
                 }
+            }
+            PrefsAction::ImportWinampIni => {
+                // The dialog does not pick the file itself: the presenter
+                // asks the user for it, from the tick.
+                self.request_winamp_ini_import();
             }
         }
     }
