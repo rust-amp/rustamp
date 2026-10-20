@@ -79,14 +79,14 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 |---|---|---|---|---|
 | C5-1 | The new all-fields test covers every field in the configuration | **FALSE** | `crates/rustamp-app/src/config.rs:487-550` (`config_round_trip_honours_all_supported_fields`) | `config_round_trip_honours_all_supported_fields` sets `width: None, height: None` on all windows (lines 505-506, 514-515, 523-524). It does not test `width: Some(...)` or `height: Some(...)`. It also tests only unit window variants (`Main`, `Equalizer`, `Playlist`), omitting `WindowId::Gen(n)` and `WindowId::Video`. |
 | C5-2 | Core configuration serialization (`toml_roundtrip`) covers all fields | **FALSE** | `crates/rustamp-core/src/config.rs:207-238` | `toml_roundtrip` leaves `audio.balance`, `audio.output`, `audio.buffer_ms`, `audio.fadeout_ms`, `audio.gapless`, `audio.replaygain`, `ui.double_size`, `ui.always_on_top`, `ui.easy_move`, `ui.snap_distance`, `playlist.*`, and `plugins.plugin_dir` unset at their defaults. |
-| C5-3 | Honest serialization preserves user-configured unhonoured settings | **FALSE** (Design flaw / Data loss) | `crates/rustamp-app/src/config.rs:253-351` (`serialize_honest`) | When a user configures unhonoured fields in `rustamp.toml` (e.g. `audio.device = "Speakers"`, `audio.replaygain = "Track"`, `playlist.shuffle = true`, or `plugins.disabled = [...]`), the loader warns, but clean exit rewrites the file using `serialize_honest`, permanently deleting all unhonoured fields from disk. |
+| C5-3 | Honest serialization preserves user-configured unhonoured settings | **FALSE** — *was false; **fixed 2026-10-20** (finding F5 below): a save now keeps every setting it does not apply* | `crates/rustamp-app/src/config.rs` (`serialize_honest`, `serialize_preserving`, `save`) and `crates/rustamp-app/src/config_preserve.rs` | Before the fix: the loader warned, but the clean exit rewrote the file with `serialize_honest` and deleted every unhonoured field from disk. After the fix: the save reads the file it is about to overwrite and copies every setting it does not own back, so `playlist.shuffle = true` survives the clean exit. |
 
 ### 6. Cross-Lane Blindspots & Shared Interfaces
 
 | # | Claim | Verdict | Evidence (file:line) | Smallest reproduction |
 |---|---|---|---|---|
-| C6-1 | ReplayGain is integrated end-to-end across the application | **FALSE** | `crates/rustamp-audio/src/engine.rs:647-665` vs `crates/rustamp-app/src/config.rs:127` | `rustamp-audio` implemented ReplayGain in tonight's wave (A15, A16), but `rustamp-app/src/config.rs:127` still hardcodes `"replaygain" => Some("ReplayGain is not supported yet")` and `serialize_honest` omits it. The app crate was not updated to expose or persist ReplayGain. |
-| C6-2 | The M20 deadlock fix covers resident DSP engine playback | **FALSE** — *was false; **fixed 2026-10-20** (finding F1 below): the production adapter now runs the same lockstep as the helper* | `crates/rustamp-audio/src/resident.rs:1107-1155` (`process_block`, now chunked) vs `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:36-61` (the helper M20 fixed) | M20 fixed the deadlock in the standalone test helper only. The production engine adapter (`process_block` in `resident.rs`) used the single-shot un-chunked write-before-read pattern; it now writes one chunk, reads that chunk back and only then writes the next (`DSP_CHUNK_FRAMES` = 1024 frames, clamped to the in-ring capacity), so the frames in flight never exceed one chunk and the resident never blocks on its back-ring. Pinned by `resident::dsp_hosted_tests::the_lockstep_round_trip_completes_on_a_ring_smaller_than_the_block` (64-frame ring, 8192-frame block: the old pattern stalls there, the new one completes) and `…::the_un_chunked_round_trip_stalls_where_the_lockstep_one_completes` (the pre-fix pattern on the same rings, timed out with the resident's back-ring full). |
+| C6-1 | ReplayGain is integrated end-to-end across the application | **FALSE** — *was false; **fixed 2026-10-20** (finding F7 below): the app reads `audio.replaygain`, hands it to the engine and writes it back* | `crates/rustamp-app/src/app.rs:339` (`engine.set_replaygain_mode(replaygain_mode_to_audio(options.config.audio.replaygain))`), `crates/rustamp-app/src/config.rs` (`serialize_honest` writes `audio.replaygain`; `ignored_fields_in_toml` no longer warns for it) | Before the fix: `rustamp-audio` implemented ReplayGain, but `crates/rustamp-app/src/config.rs` still hardcoded `"replaygain" => Some("ReplayGain is not supported yet")` and `serialize_honest` omitted it. After the fix: the configured mode reaches the engine at startup and survives the save. |
+| C6-2 | The M20 deadlock fix covers resident DSP engine playback | **FALSE** — *was false; **fixed 2026-10-20** (finding F1 below): the production adapter now runs the same lockstep as the helper* | `crates/rustamp-audio/src/resident.rs:1107-1155` (`process_block`, now chunked) vs `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:36-61` (the helper M20 fixed) | M20 fixed the deadlock in the standalone test helper only. The production engine adapter (`process_block` in `resident.rs`) used the single-shot un-chunked write-before-read pattern; it now writes one chunk, reads that chunk back and only then writes the next (`DSP_CHUNK_FRAMES` = 1024 frames, clamped to the in-ring capacity), so the frames in flight never exceed one chunk and the resident never blocks on its back-ring. Pinned by `resident::dsp_hosted_tests::the_lockstep_round_trip_completes_on_a_ring_smaller_than_the_block` and `…::the_un_chunked_round_trip_stalls_where_the_lockstep_one_completes`. |
 | C6-3 | Task card manifest consistency across the wave | **PARTIAL** | Prompt / handoff refers to `N9-config-class.md`, but no such file was committed (`docs/tasks/N9-config.md` or `N9-config-class.md` is absent) | The work was performed under N8 and documented in N8 / W10 finding F1, but the card reference is dangling. |
 
 ---
@@ -409,6 +409,103 @@ Two defects arise from this design:
 
 ### F5 — MEDIUM (proven): Honest config serialization silently deletes all unhonoured fields from user config files on clean exit
 
+**Status: FIXED (2026-10-20).** The finding was correct: the clean exit
+replaced the whole file with the honest serialization, so every setting the
+player does not apply was deleted from disk. The fix keeps the honest
+serialization as the player's **own** part of the file and adds the rest of
+the file back, unchanged.
+
+**The save rule now.** Three parts, all in `crates/rustamp-app/src/config.rs`:
+
+1. **Owned settings are written by the app.** The app reads them and acts on
+   them, so it knows their current value. The list is `OWNED_PATHS`.
+2. **Every other setting of the previous file is preserved verbatim.** It
+   belongs to the user or to a newer version of the app, and the app does not
+   understand it, so it does not touch it. The text of the file is kept, not
+   just the value: the line `shuffle = true # not yet` stays that line.
+3. **A file the app cannot read is never overwritten.** A save that cannot
+   preserve the file's settings would destroy them, so it fails loudly with
+   `ConfigError::Malformed` and the file stays as it was. A merge that would
+   not be a config file any more (a root key that collides with the table
+   the player writes) is refused the same way.
+
+**How the preservation works.** `crates/rustamp-app/src/config_preserve.rs`
+scans the previous file for its key entries (tables, keys, values that
+continue on the next line), copies every entry the app does not own with the
+text it was written with, and splices that text back into the table it came
+from. The merge is a *source-level* merge on purpose: a value-level merge
+would rewrite the spelling (an array becomes a multi-line array) and would
+drop the comment that stands on the line.
+
+A comment that documents a setting travels with it. A comment that stands on
+its own — above a setting the app owns, or at the end of the file — is not
+kept: the app rewrites the file it owns.
+
+**The audit** (what the player applies today, and what a save does with it).
+The table is also in the module docs of `crates/rustamp-app/src/config.rs`:
+
+| Setting | Applied by the player | On save |
+|---|---|---|
+| `version` | the schema marker | written |
+| `audio.volume` | `App::with_registry` → `Engine::set_volume` | written |
+| `audio.balance` | `App::with_registry` → `Engine::set_balance` | written |
+| `audio.output_mode` | `output::create_output` (RFC 0019) | written |
+| `audio.device` | `output::create_output` → `selection::plan`/`resolve` | written |
+| `audio.replaygain` | `App::with_registry` → `Engine::set_replaygain_mode` | written |
+| `ui.skin` | `crate::run` → `skin::choose` | written |
+| `ui.double_size` | `App::with_registry` → the main window's state | written |
+| `ui.always_on_top` | `App::with_registry` → `App::always_on_top` | written |
+| `ui.easy_move` | `App::with_registry` → `App::easy_move` | written |
+| `ui.snap_distance` | `window` → `rustamp_ui::docking` | written |
+| `ui.windows` | `App::with_registry` → the window placements | written |
+| `ui.playlist_font_size` | the playlist editor's font size | written; an unusable value is kept |
+| `eq.state` | `App::with_registry` → `Engine::set_eq` | written |
+| `plugins.plugin_dir` | `App::plugin_dir` → `rustamp_prefs::scan` | written |
+| `plugins.disabled` | `App::set_plugin_enabled` → `rustamp_prefs::set_enabled` | written |
+| `audio.output` | — the backend comes from the command line | **preserved** |
+| `audio.buffer_ms` | — | **preserved** |
+| `audio.fadeout_ms` | — the engine has `EngineConfig::fade_ms`, but the app never passes the configured value | **preserved** |
+| `audio.gapless` | — | **preserved** |
+| `playlist.shuffle` | — the engine implements the mode (S15), but the app never hands the configured value to it | **preserved** |
+| `playlist.repeat` | — the same | **preserved** |
+| `playlist.manual_advance` | — | **preserved** |
+| `playlist.last_playlist` | — | **preserved** |
+| `plugins.vis_plugin` | — | **preserved** |
+| `plugins.vis_preset` | — | **preserved** |
+
+Two rows of the table deserve a word, because they are *not* what the
+review assumed:
+
+* **`audio.fadeout_ms` is not applied.** `rustamp-audio` has the plumbing
+  (`EngineConfig::fade_ms`), but its default is `AudioConfig::default().fadeout_ms`
+  and `crates/rustamp-app/src/app.rs` builds the engine with
+  `EngineConfig { volume, balance, ..EngineConfig::default() }` — the
+  configured value never reaches the engine.
+* **`playlist.shuffle` / `playlist.repeat` are not applied either.** The
+  engine implements both modes (`Engine::set_shuffle`, `Engine::set_repeat`),
+  but at startup the app only lights the button from the configuration; it
+  never hands the configured value to the engine. Wiring that is a separate
+  change and is **not** part of this fix; until then the configured value is
+  preserved, not applied.
+
+**Tests** (all in `rustamp-app`, headless):
+
+| Test | What it pins |
+|---|---|
+| `tests/config.rs::a_setting_the_player_does_not_apply_keeps_its_line_after_a_save` | every one of the ten unapplied settings keeps its line, byte for byte, and is still warned about afterwards |
+| `tests/config.rs::an_applied_setting_survives_a_save` | the applied settings round-trip through a save |
+| `tests/config.rs::an_unknown_setting_survives_a_save` | a key and a table the player does not know survive |
+| `tests/config.rs::the_honest_list_and_the_warning_list_stay_consistent` | the honest serialization never warns about itself, and never writes a warned-about setting |
+| `tests/config.rs::a_malformed_file_is_not_replaced_by_a_save` | a malformed file is not overwritten, and the save says so |
+| `tests/config.rs::a_merge_that_would_break_the_file_is_refused` | a merge that would not be a config file any more is refused, and the file stays as it was |
+| `tests/config.rs::a_dotted_setting_moves_into_the_table_the_player_writes` | a dotted key moves into the table the player writes, unchanged |
+| `tests/config.rs::an_unusable_playlist_font_size_survives_a_save` | the one owned setting with an unusable value is kept, not dropped |
+| `tests/config.rs::a_comment_above_a_preserved_setting_survives_a_save` | the user's note travels with the setting it documents |
+| `tests/config.rs::the_clean_exit_keeps_the_settings_the_player_does_not_apply` | the app's clean exit is a save, so it keeps them |
+| `src/config_preserve.rs` (unit tests) | the reader: keys, dotted keys, quoted keys, values that continue on the next line, a comment on the line, a comment above a setting, a header inside a value, an array of tables |
+
+**The original report (unchanged, for the record):**
+
 In `crates/rustamp-app/src/config.rs:247-351` (`serialize_honest`), the config serializer explicitly writes only:
 - `version`
 - `audio.volume`, `audio.balance`
@@ -439,6 +536,22 @@ Despite its name:
 ---
 
 ### F7 — LOW (proven): Cross-lane disconnect: audio engine implements ReplayGain, but app config marks it unsupported and strips it
+
+**Status: FIXED (before this review; re-verified 2026-10-20).** The
+disconnect is gone on both ends:
+
+* The application reads the setting and hands it to the engine at startup:
+  `crates/rustamp-app/src/app.rs:339`
+  (`engine.set_replaygain_mode(replaygain_mode_to_audio(options.config.audio.replaygain))`).
+* The setting is written back by the honest serialization
+  (`crates/rustamp-app/src/config.rs`, `serialize_honest`), so it survives a
+  clean exit.
+* The loader does not warn about it any more: `ignored_fields_in_toml` lists
+  `"replaygain"` among the applied settings.
+* The F5 fix keeps the setting in place even for the values the player does
+  not apply, so the two findings no longer contradict each other.
+
+**The original report (unchanged, for the record):**
 
 In tonight's wave, lanes A15 and A16 implemented ReplayGain in `rustamp-audio` (`apply_gain`, `set_replaygain_mode`, `DecodeMsg::SetReplayGain`).
 However, `crates/rustamp-app/src/config.rs:127` still contains:

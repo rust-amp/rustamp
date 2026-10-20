@@ -7,7 +7,8 @@
 //!
 //! * [`cli`] — command-line parsing.
 //! * [`config`] — config file loading with defaults (RFC 0001 defines the
-//!   types, not the I/O).
+//!   types, not the I/O). The save keeps every setting the player does not
+//!   apply, so a hand-edited file is never silently trimmed.
 //! * [`cursor`] — the skin's cursors: which one a window shows and the
 //!   cache of the operating system's cursors. Headless; the `SetCursor`
 //!   half lives in [`rustamp_platform::cursor`].
@@ -85,6 +86,7 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+mod config_preserve;
 pub mod cursor;
 pub mod dialogs;
 pub mod directory;
