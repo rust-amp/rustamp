@@ -65,9 +65,9 @@ fn a_check_box_already_at_its_value_changes_nothing() {
 }
 
 #[test]
-fn shuffle_and_repeat_follow_the_dialog_but_are_not_persisted() {
-    // They are app-owned flags with no effect on playback yet (config N6), so
-    // the saved file must not advertise them.
+fn shuffle_and_repeat_follow_the_dialog_and_survive_a_restart() {
+    // The engine owns the traversal (S15), so the modes are applied and
+    // persisted: the saved file names them, and a restart comes up in them.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("modes.toml");
 
@@ -76,13 +76,23 @@ fn shuffle_and_repeat_follow_the_dialog_but_are_not_persisted() {
     app.apply_prefs_action(PrefsAction::Set(Bind::Repeat, true));
     let shown = app.prefs_settings();
     assert!(shown.shuffle && shown.repeat);
+    // The engine runs in the modes the dialog set.
+    assert!(app.engine().shuffle(), "the engine shuffles");
+    assert!(app.engine().repeat(), "the engine repeats");
 
     app.save_config().expect("save");
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(
-        !text.contains("shuffle") && !text.contains("repeat"),
-        "{text}"
-    );
+    assert!(text.contains("shuffle = true"), "{text}");
+    assert!(text.contains("repeat = true"), "{text}");
+
+    // A new run built from the saved file comes up in the same modes.
+    let loaded = load(Some(&path)).expect("load");
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert!(loaded.config.playlist.shuffle);
+    assert!(loaded.config.playlist.repeat);
+    let restarted = app_with(loaded.config, None);
+    assert!(restarted.engine().shuffle(), "the engine shuffles again");
+    assert!(restarted.engine().repeat(), "the engine repeats again");
 }
 
 #[test]

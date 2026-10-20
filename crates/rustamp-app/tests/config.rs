@@ -18,13 +18,13 @@ use rustamp_ui::Modifiers;
 /// The settings the player does not apply: the loader warns about them, and
 /// a save must keep them (F5: a setting is never destroyed by a save that
 /// did not apply it).
+///
+/// `audio.buffer_ms` is the one that has no mapping at all: the output's
+/// buffer length is the device's own, so the player cannot apply it.
 const UNAPPLIED: &[(&str, &str, &str)] = &[
     ("audio", "output", "\"cpal\""),
     ("audio", "buffer_ms", "300"),
-    ("audio", "fadeout_ms", "800"),
     ("audio", "gapless", "false"),
-    ("playlist", "shuffle", "true"),
-    ("playlist", "repeat", "true"),
     ("playlist", "manual_advance", "true"),
     ("playlist", "last_playlist", "\"list.m3u\""),
     ("plugins", "vis_plugin", "\"vis.dll\""),
@@ -172,11 +172,8 @@ fn an_ignored_field_is_not_advertised() {
 
     let ignored_names = [
         "buffer_ms",
-        "fadeout_ms",
         "gapless",
         "output",
-        "shuffle",
-        "repeat",
         "manual_advance",
         "last_playlist",
         "vis_plugin",
@@ -192,6 +189,20 @@ fn an_ignored_field_is_not_advertised() {
             "serialized honest config advertises ignored setting '{name}':\n{serialized}"
         );
     }
+    // The settings the player applies are written: the file says what the
+    // player does.
+    assert!(
+        serialized.lines().any(|line| line == "fadeout_ms = 800"),
+        "the honoured fade-out duration is written:\n{serialized}"
+    );
+    assert!(
+        serialized.lines().any(|line| line == "shuffle = true"),
+        "the honoured shuffle mode is written:\n{serialized}"
+    );
+    assert!(
+        serialized.lines().any(|line| line == "repeat = true"),
+        "the honoured repeat mode is written:\n{serialized}"
+    );
     assert_eq!(
         rustamp_app::config::parse(&serialized)
             .unwrap()
@@ -208,6 +219,7 @@ volume = 190
 replaygain = \"Track\"
 buffer_ms = 300
 gapless = false
+fadeout_ms = 800
 
 [ui]
 snap_distance = 15
@@ -215,10 +227,12 @@ snap_distance = 15
 [playlist]
 shuffle = true
 repeat = true
+manual_advance = true
 ";
     let val: toml::Value = toml::from_str(toml_input).unwrap();
     let warnings = ignored_fields_in_toml(&val);
-    // replaygain is now honoured: no warning.
+    // replaygain, the fade-out duration and the playback modes are applied:
+    // no warning.
     assert!(
         warnings
             .iter()
@@ -230,10 +244,20 @@ repeat = true
         "supported snap distance must not warn: {warnings:?}"
     );
     assert!(
+        warnings.iter().all(|w| !w.contains("audio.fadeout_ms")),
+        "the applied fade-out duration must not warn: {warnings:?}"
+    );
+    assert!(
         warnings
             .iter()
-            .any(|w| w.contains("playlist.shuffle") && w.contains("not applied")),
-        "playlist.shuffle warning missing: {warnings:?}"
+            .all(|w| !w.contains("playlist.shuffle") && !w.contains("playlist.repeat")),
+        "the applied playback modes must not warn: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("playlist.manual_advance") && w.contains("not applied")),
+        "playlist.manual_advance warning missing: {warnings:?}"
     );
 }
 
@@ -685,11 +709,14 @@ fn the_honest_list_and_the_warning_list_stay_consistent() {
     config.audio.replaygain = ReplayGainMode::Album;
     config.audio.device = Some("Speakers".to_string());
     config.audio.output_mode = OutputMode::Exclusive;
+    config.audio.fadeout_ms = 750;
     config.ui.skin = Some(PathBuf::from("skins/x.wsz"));
     config.ui.double_size = true;
     config.ui.always_on_top = true;
     config.ui.easy_move = false;
     config.ui.snap_distance = 25;
+    config.playlist.shuffle = true;
+    config.playlist.repeat = true;
     config.plugins.plugin_dir = Some(PathBuf::from("plugins"));
     config.plugins.disabled = vec!["bad.dll".to_string()];
 
@@ -706,6 +733,13 @@ fn the_honest_list_and_the_warning_list_stay_consistent() {
                 .lines()
                 .any(|line| line.starts_with(&format!("{key} ="))),
             "the honest list must not advertise {table}.{key}:\n{serialized}"
+        );
+    }
+    // The newly applied settings are in the honest list.
+    for line in ["fadeout_ms = 750", "shuffle = true", "repeat = true"] {
+        assert!(
+            serialized.lines().any(|written| written == line),
+            "the honest list must write '{line}':\n{serialized}"
         );
     }
     // And the other way round: every setting the loader warns about is a
@@ -853,7 +887,7 @@ fn a_comment_above_a_preserved_setting_survives_a_save() {
     let path = dir.path().join("comment.toml");
     std::fs::write(
         &path,
-        "[playlist]\n# I want shuffle, even if it does not work yet.\nshuffle = true\n",
+        "[playlist]\n# I want manual advance, even if it does not work yet.\nmanual_advance = true\n",
     )
     .unwrap();
 
@@ -862,11 +896,11 @@ fn a_comment_above_a_preserved_setting_survives_a_save() {
 
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(
-        saved.contains("# I want shuffle, even if it does not work yet."),
+        saved.contains("# I want manual advance, even if it does not work yet."),
         "the note survives with its setting:\n{saved}"
     );
     assert!(
-        saved.lines().any(|line| line == "shuffle = true"),
+        saved.lines().any(|line| line == "manual_advance = true"),
         "the setting survives:\n{saved}"
     );
 }
@@ -884,7 +918,7 @@ fn the_clean_exit_keeps_the_settings_the_player_does_not_apply() {
 volume = 100
 
 [playlist]
-shuffle = true
+manual_advance = true
 ",
     )
     .unwrap();
@@ -896,7 +930,7 @@ shuffle = true
 
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(
-        saved.lines().any(|line| line == "shuffle = true"),
+        saved.lines().any(|line| line == "manual_advance = true"),
         "the setting the player does not apply survives the clean exit:\n{saved}"
     );
     let again = load(Some(&path)).expect("the saved file loads");
@@ -904,4 +938,76 @@ shuffle = true
         again.config.audio.volume, 188,
         "the applied setting is written"
     );
+}
+
+/// A setting that has no mapping at all stays preserved, and it still warns:
+/// the output's buffer length is the device's own, so the player cannot
+/// apply it.
+#[test]
+fn a_setting_without_a_mapping_stays_preserved_and_still_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("buffer.toml");
+    std::fs::write(&path, "[audio]\nbuffer_ms = 300\n").unwrap();
+
+    let loaded = load(Some(&path)).expect("the file loads");
+    assert_eq!(loaded.config.audio.buffer_ms, 300);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("audio.buffer_ms") && w.contains("not applied")),
+        "the setting without a mapping is reported: {:?}",
+        loaded.warnings
+    );
+
+    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.lines().any(|line| line == "buffer_ms = 300"),
+        "the setting without a mapping survives the save:\n{saved}"
+    );
+    let again = load(Some(&path)).expect("the saved file loads");
+    assert!(
+        again
+            .warnings
+            .iter()
+            .any(|w| w.contains("audio.buffer_ms") && w.contains("not applied")),
+        "the setting without a mapping still warns: {:?}",
+        again.warnings
+    );
+}
+
+/// The settings the player applies now are written by the save, so they
+/// round-trip: the fade-out duration and the playback modes.
+#[test]
+fn the_newly_applied_settings_survive_a_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("newly-applied.toml");
+    std::fs::write(
+        &path,
+        "\
+[audio]
+fadeout_ms = 800
+
+[playlist]
+shuffle = true
+repeat = true
+",
+    )
+    .unwrap();
+
+    let loaded = load(Some(&path)).expect("the file loads");
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(loaded.config.audio.fadeout_ms, 800);
+    assert!(loaded.config.playlist.shuffle);
+    assert!(loaded.config.playlist.repeat);
+
+    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+
+    let again = load(Some(&path)).expect("the saved file loads");
+    assert_eq!(again.config, loaded.config, "the applied settings survive");
+    assert_eq!(again.config.audio.fadeout_ms, 800);
+    assert!(again.config.playlist.shuffle);
+    assert!(again.config.playlist.repeat);
 }

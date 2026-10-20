@@ -11,9 +11,10 @@
 //!   already ignores everything else, so the app forwards **every** command to
 //!   it and lets it pick;
 //! * the **application layer** owns the windows, the skin, the mode flags
-//!   (shuffle/repeat — the engine deliberately does not track them, RFC 0001 /
-//!   S15), the playlist model and the dialogs. [`app_owns`] says which commands
-//!   those are, and [`crate::app::App`] applies them.
+//!   (shuffle/repeat — the app applies them and mirrors the engine's
+//!   playback order, RFC 0001 / S15), the playlist model and the dialogs.
+//!   [`app_owns`] says which commands those are, and [`crate::app::App`]
+//!   applies them.
 //!
 //! [`app_owns`] is an exhaustive match on purpose: adding a `Command` variant
 //! must force a routing decision instead of silently falling into a catch-all.

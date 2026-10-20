@@ -422,7 +422,8 @@ the file back, unchanged.
 2. **Every other setting of the previous file is preserved verbatim.** It
    belongs to the user or to a newer version of the app, and the app does not
    understand it, so it does not touch it. The text of the file is kept, not
-   just the value: the line `shuffle = true # not yet` stays that line.
+   just the value: the line `manual_advance = true # not yet` stays that
+   line.
 3. **A file the app cannot read is never overwritten.** A save that cannot
    preserve the file's settings would destroy them, so it fails loudly with
    `ConfigError::Malformed` and the file stays as it was. A merge that would
@@ -449,6 +450,7 @@ The table is also in the module docs of `crates/rustamp-app/src/config.rs`:
 | `version` | the schema marker | written |
 | `audio.volume` | `App::with_registry` → `Engine::set_volume` | written |
 | `audio.balance` | `App::with_registry` → `Engine::set_balance` | written |
+| `audio.fadeout_ms` | `App::with_registry` → `EngineConfig::fade_ms` | written |
 | `audio.output_mode` | `output::create_output` (RFC 0019) | written |
 | `audio.device` | `output::create_output` → `selection::plan`/`resolve` | written |
 | `audio.replaygain` | `App::with_registry` → `Engine::set_replaygain_mode` | written |
@@ -462,12 +464,11 @@ The table is also in the module docs of `crates/rustamp-app/src/config.rs`:
 | `eq.state` | `App::with_registry` → `Engine::set_eq` | written |
 | `plugins.plugin_dir` | `App::plugin_dir` → `rustamp_prefs::scan` | written |
 | `plugins.disabled` | `App::set_plugin_enabled` → `rustamp_prefs::set_enabled` | written |
+| `playlist.shuffle` | `App::with_registry` → `Engine::set_shuffle` (S15) | written |
+| `playlist.repeat` | `App::with_registry` → `Engine::set_repeat` (S15) | written |
 | `audio.output` | — the backend comes from the command line | **preserved** |
-| `audio.buffer_ms` | — | **preserved** |
-| `audio.fadeout_ms` | — the engine has `EngineConfig::fade_ms`, but the app never passes the configured value | **preserved** |
+| `audio.buffer_ms` | — the output's buffer length is the device's own | **preserved** |
 | `audio.gapless` | — | **preserved** |
-| `playlist.shuffle` | — the engine implements the mode (S15), but the app never hands the configured value to it | **preserved** |
-| `playlist.repeat` | — the same | **preserved** |
 | `playlist.manual_advance` | — | **preserved** |
 | `playlist.last_playlist` | — | **preserved** |
 | `plugins.vis_plugin` | — | **preserved** |
@@ -476,23 +477,35 @@ The table is also in the module docs of `crates/rustamp-app/src/config.rs`:
 Two rows of the table deserve a word, because they are *not* what the
 review assumed:
 
-* **`audio.fadeout_ms` is not applied.** `rustamp-audio` has the plumbing
-  (`EngineConfig::fade_ms`), but its default is `AudioConfig::default().fadeout_ms`
-  and `crates/rustamp-app/src/app.rs` builds the engine with
-  `EngineConfig { volume, balance, ..EngineConfig::default() }` — the
-  configured value never reaches the engine.
-* **`playlist.shuffle` / `playlist.repeat` are not applied either.** The
-  engine implements both modes (`Engine::set_shuffle`, `Engine::set_repeat`),
-  but at startup the app only lights the button from the configuration; it
-  never hands the configured value to the engine. Wiring that is a separate
-  change and is **not** part of this fix; until then the configured value is
-  preserved, not applied.
+* **`audio.fadeout_ms` is applied now** (fixed 2026-10-20, wave 267).
+  `rustamp-audio` has the plumbing (`EngineConfig::fade_ms`); the app builds
+  the engine with `EngineConfig { volume, balance, fade_ms, .. }` and hands
+  it the configured `audio.fadeout_ms`, so a file that asks for a different
+  fade is honoured. The engine's own default happens to be the
+  configuration's default (500 ms), so the bug was invisible until the
+  configured value differed.
+* **`playlist.shuffle` / `playlist.repeat` are applied now** (fixed
+  2026-10-20, wave 267). The engine implements both modes
+  (`Engine::set_shuffle`, `Engine::set_repeat`) and owns the traversal
+  (S15); the app hands the configured modes to it at startup, so the button
+  and the traversal agree. Before the fix the app only lit the button from
+  the configuration, and the engine played in order.
+
+One row stays **preserved**, because it has no mapping at all:
+
+* **`audio.buffer_ms` has no mapping.** The output's buffer length is the
+  device's own: WASAPI opens the device's default period
+  (`IAudioClient::GetDevicePeriod` / `GetDefaultPeriod`) and cpal leaves the
+  size to the host (`BufferSize::Default`). The engine's `ring_frames` is
+  its internal decode-to-device ring, not the output buffer, and nothing in
+  the player asks a device for a buffer length. Mapping the setting would
+  mean inventing one, so it stays preserved and keeps its warning.
 
 **Tests** (all in `rustamp-app`, headless):
 
 | Test | What it pins |
 |---|---|
-| `tests/config.rs::a_setting_the_player_does_not_apply_keeps_its_line_after_a_save` | every one of the ten unapplied settings keeps its line, byte for byte, and is still warned about afterwards |
+| `tests/config.rs::a_setting_the_player_does_not_apply_keeps_its_line_after_a_save` | every unapplied setting keeps its line, byte for byte, and is still warned about afterwards |
 | `tests/config.rs::an_applied_setting_survives_a_save` | the applied settings round-trip through a save |
 | `tests/config.rs::an_unknown_setting_survives_a_save` | a key and a table the player does not know survive |
 | `tests/config.rs::the_honest_list_and_the_warning_list_stay_consistent` | the honest serialization never warns about itself, and never writes a warned-about setting |
@@ -503,6 +516,18 @@ review assumed:
 | `tests/config.rs::a_comment_above_a_preserved_setting_survives_a_save` | the user's note travels with the setting it documents |
 | `tests/config.rs::the_clean_exit_keeps_the_settings_the_player_does_not_apply` | the app's clean exit is a save, so it keeps them |
 | `src/config_preserve.rs` (unit tests) | the reader: keys, dotted keys, quoted keys, values that continue on the next line, a comment on the line, a comment above a setting, a header inside a value, an array of tables |
+
+**The wave-267 follow-up** (2026-10-20) applied the two settings the audit
+above found preserved but never applied, and left the one that has no
+mapping alone. Its tests (all headless, all in `rustamp-app`):
+
+| Test | What it pins |
+|---|---|
+| `src/app.rs::the_configured_fade_reaches_the_engine` | the configured `audio.fadeout_ms` reaches the engine: the fade-out ramps over the configured number of frames (200 ms at 44.1 kHz are 8820) and the transport stops when the ramp is over — with the engine's own default (500 ms) it would still be playing there |
+| `src/app.rs::the_configured_playback_modes_reach_the_engine_at_startup` | the configured `playlist.shuffle` / `playlist.repeat` are the engine's state at startup, and the buttons show them |
+| `src/app.rs::the_configured_playback_modes_survive_a_save` | the modes the engine runs in are the modes the save writes, and a player built from that file comes up in the same modes |
+| `tests/config.rs::the_newly_applied_settings_survive_a_save` | `audio.fadeout_ms`, `playlist.shuffle` and `playlist.repeat` round-trip through a save and do not warn |
+| `tests/config.rs::a_setting_without_a_mapping_stays_preserved_and_still_warns` | `audio.buffer_ms` has no mapping: it keeps its line after a save and still warns |
 
 **The original report (unchanged, for the record):**
 
