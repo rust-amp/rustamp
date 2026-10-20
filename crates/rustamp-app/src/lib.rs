@@ -13,6 +13,9 @@
 //!   half lives in [`rustamp_platform::cursor`].
 //! * [`skin`] — skin selection with a clear fallback to the repo's built-in
 //!   default (Rust-themed) skin.
+//! * [`skin_folder`] — the skins folder beside the configuration file: the
+//!   skins the player can load from disk, the rules of the scan and the
+//!   cache that keeps the list from being read again for every frame.
 //! * [`routing`] — which layer owns a [`rustamp_core::command::Command`].
 //! * [`region`] — the skin's window shape: the `region.txt` section a
 //!   window uses and the rectangles its mask becomes. Pure; the operating
@@ -102,6 +105,7 @@ pub mod plugin_inventory;
 pub mod region;
 pub mod routing;
 pub mod skin;
+pub mod skin_folder;
 pub mod supervise;
 pub mod window;
 

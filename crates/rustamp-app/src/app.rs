@@ -28,6 +28,7 @@
 //! [`NullOutput`](rustamp_output::NullOutput); the windowed presenter in
 //! [`crate::window`] only adds the `winit`/`softbuffer` shell around it.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -160,6 +161,14 @@ pub struct App {
     /// Counts the skin loads, so a holder of skin-derived resources (the
     /// cursor cache) can tell one skin from the next.
     skin_generation: u64,
+    /// The skins folder beside the configuration: the skins it holds and the
+    /// entries the last read skipped (see [`crate::skin_folder`]).
+    ///
+    /// The folder is read when the skin list is asked for and kept until the
+    /// folder changes, so the list is not read again for every frame. The
+    /// cache is borrowed for the length of a list build, and nothing inside
+    /// a borrow calls back into the app.
+    pub(crate) skin_folder: RefCell<crate::skin_folder::SkinFolder>,
     quit: bool,
     /// Runtime tray/hotkey visibility; start visible even if a previous run hid
     /// the main window, so an unavailable tray can never strand the player.
@@ -410,6 +419,7 @@ impl App {
             focused: true,
             current_skin: None,
             skin_generation: 0,
+            skin_folder: RefCell::default(),
             quit: false,
             main_visible: true,
             minimize_requested: false,
@@ -1134,6 +1144,14 @@ impl App {
         let events: Vec<Event> = self.events.try_iter().collect();
         for event in &events {
             self.handle_event(event);
+        }
+
+        // The skins folder is read when the skin list is asked for; an entry
+        // that is not a skin was skipped there, and the reason reaches the
+        // user here.
+        let skin_problems = self.skin_folder.borrow_mut().take_problems();
+        for problem in skin_problems {
+            self.note(problem);
         }
 
         let now_ms = self.now_ms();
@@ -5443,6 +5461,129 @@ mod tests {
             "{outcome:?}"
         );
         assert!(app.dialog_is_open(DialogKind::SkinBrowser));
+    }
+
+    /// An app whose configuration sits in `dir`, with an empty `skins` folder
+    /// beside it.
+    fn app_with_skins_folder(dir: &tempfile::TempDir) -> App {
+        let (mut app, _config) = app_with_file(None);
+        let skins = dir.path().join(crate::skin_folder::SKINS_FOLDER);
+        std::fs::create_dir_all(&skins).unwrap();
+        app.set_config_path(Some(dir.path().join("rustamp.toml")));
+        app
+    }
+
+    #[test]
+    fn the_skin_list_holds_the_skins_of_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_skins_folder(&dir);
+        let skins = dir.path().join(crate::skin_folder::SKINS_FOLDER);
+        crate::skin_folder::write_skin_archive(&skins.join("Beta.wsz"));
+        crate::skin_folder::write_skin_archive(&skins.join("alpha.wsz"));
+
+        // The built-in default first, then the folder's skins in name order.
+        let entries = app.browser_entries();
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(entries[0].path, None, "{entries:?}");
+        assert_eq!(
+            entries[1].path,
+            Some(skins.join("alpha.wsz")),
+            "{entries:?}"
+        );
+        assert_eq!(entries[2].path, Some(skins.join("Beta.wsz")), "{entries:?}");
+    }
+
+    #[test]
+    fn an_empty_skins_folder_leaves_the_built_in_skin_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_skins_folder(&dir);
+        let entries = app.browser_entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, None, "{entries:?}");
+    }
+
+    #[test]
+    fn the_skin_in_use_is_listed_after_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_skins_folder(&dir);
+        let skins = dir.path().join(crate::skin_folder::SKINS_FOLDER);
+        crate::skin_folder::write_skin_archive(&skins.join("one.wsz"));
+        // A skin from outside the folder: it is listed after the folder's
+        // skins, so the user sees what is in use.
+        let outside = tempfile::tempdir().unwrap();
+        app.submit(Command::LoadSkin(outside.path().to_owned()))
+            .unwrap();
+
+        let entries = app.browser_entries();
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(entries[0].path, None, "{entries:?}");
+        assert_eq!(entries[1].path, Some(skins.join("one.wsz")), "{entries:?}");
+        assert_eq!(
+            entries[2].path,
+            Some(outside.path().to_owned()),
+            "{entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_skin_of_the_folder_is_listed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_skins_folder(&dir);
+        let skins = dir.path().join(crate::skin_folder::SKINS_FOLDER);
+        crate::skin_folder::write_skin_archive(&skins.join("one.wsz"));
+        app.submit(Command::LoadSkin(skins.join("one.wsz")))
+            .unwrap();
+
+        // The skin in use is one of the folder's skins: it is listed there
+        // and not a second time at the end.
+        let entries = app.browser_entries();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[1].path, Some(skins.join("one.wsz")), "{entries:?}");
+    }
+
+    #[test]
+    fn a_broken_skin_in_the_folder_is_skipped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_skins_folder(&dir);
+        let skins = dir.path().join(crate::skin_folder::SKINS_FOLDER);
+        std::fs::write(skins.join("broken.wsz"), b"not a zip at all").unwrap();
+        crate::skin_folder::write_skin_archive(&skins.join("one.wsz"));
+
+        // The broken file is not offered; the skin beside it is.
+        let entries = app.browser_entries();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[1].path, Some(skins.join("one.wsz")), "{entries:?}");
+
+        // The reason reaches the user as a note.
+        app.pump().unwrap();
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|note| note.contains("broken.wsz")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn loading_a_row_of_the_skin_list_loads_that_skin() {
+        use rustamp_platform::PrefsAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_skins_folder(&dir);
+        let skins = dir.path().join(crate::skin_folder::SKINS_FOLDER);
+        crate::skin_folder::write_skin_archive(&skins.join("one.wsz"));
+        crate::skin_folder::write_skin_archive(&skins.join("two.wsz"));
+
+        // The preferences page names the skins of the folder and the skin in
+        // use.
+        let settings = app.prefs_settings();
+        assert_eq!(settings.skins.len(), 3, "{settings:?}");
+        assert_eq!(settings.skin_selected, Some(0), "{settings:?}");
+
+        // The third row is the second skin of the folder, and loading that
+        // row loads that file.
+        app.apply_prefs_action(PrefsAction::LoadSkin(2));
+        assert_eq!(app.current_skin(), Some(&skins.join("two.wsz")));
+        assert_eq!(app.prefs_settings().skin_selected, Some(2));
     }
 
     #[test]

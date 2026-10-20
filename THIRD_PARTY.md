@@ -110,7 +110,7 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `cpal` | Cross-platform audio output; loopback capture | output; app (dev) |
 | `rubato` | Band-limited sample-rate conversion (FFT engine; sinc fallback) | audio |
 | `wasapi` | Windows audio output | output |
-| `zip` | Skin archive reading | skin |
+| `zip` | Skin archive reading; writing the `.wsz` fixtures of the app's skins-folder tests | skin; app (dev) |
 | `lofty` | Audio tags and metadata | meta |
 | `winit` | Window/event-loop integration | app, ui |
 | `softbuffer` | CPU-rendered window presentation | app, ui |

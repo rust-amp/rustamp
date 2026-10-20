@@ -47,6 +47,10 @@ serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The skins-folder tests write real `.wsz` archives, so the scan sees the
+# same files a user drops into the folder. Already a workspace dependency
+# through `rustamp-skin`, so nothing new is fetched.
+zip.workspace = true
 # The library's test writes a row whose path the file system refuses to
 # name straight into the index's database, because no scan can produce such
 # a path. The same crate and the same features as `rustamp-library` use, so

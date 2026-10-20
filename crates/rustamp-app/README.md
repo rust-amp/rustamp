@@ -237,6 +237,35 @@ precedence (the auto-load runs at the track start only, so a manual change
 during the track is never overwritten; the next track start decides again) are
 Rustamp's design. See `src/eq_autoload.rs`.
 
+## The skins folder
+
+The skins the player can load live in a `skins` folder **beside the
+configuration file** — `%APPDATA%\Rustamp\skins` with the default
+configuration, next to the media library's database and the user's
+`presets.eqf`. The player never creates that folder: a missing folder is the
+normal "no skins yet" case.
+
+Two kinds of entry in the folder are skins:
+
+* a **`.wsz` archive** — the classic skin file. It must be a readable zip
+  archive that holds a `main.bmp` (the classic main-window sheet) and it
+  must not be larger than 64 MiB. A file that is not one is skipped and
+  reported, never offered.
+* a **skin folder** — a subfolder that holds a `main.bmp`. A subfolder without
+  one is not a skin and is ignored, so other files may live in subfolders.
+
+Everything else in the folder is ignored. The skin list (the preferences
+page's **Skins** page and the skin browser) shows the built-in default first,
+then the folder's skins sorted by name, then the skin in use when it is not
+one of them.
+
+The folder is read when the skin list is asked for and kept until the folder
+changes: the change is the folder's modification time, so a skin that is
+added, removed or renamed shows up right away, while a folder nobody touches
+is read once. A file that is replaced in place (the same name, new content)
+keeps the entry the list had, because the folder's time did not move. See
+`src/skin_folder.rs`.
+
 ## Classic-window docking
 
 `window.rs` applies `rustamp_ui::docking::DockedStack` positions to the main,
