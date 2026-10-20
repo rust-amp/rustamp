@@ -438,14 +438,12 @@ decode it exactly as they decode a file.
     "Error connecting to proxy") are **not** declared: this tree has no
     proxy, so no code could ever produce them. A proxy path adds one
     variant when it lands.
-- **The engine's URL path is not wired.** `DecoderRegistry` cannot tell a URL
-  from a path: it probes a source by its extension and its first bytes, and
-  a URL has no bytes to sniff. A URL with an extension the registry knows
-  therefore reaches the symphonia factory, which refuses it and names the way
-  that works (`HttpDecoder::open`). A URL without an extension is refused by
-  the registry before any factory sees it. Routing `TrackSource::Url` to
-  `HttpDecoder::open` is the wiring that is missing, and it belongs to
-  `rustamp-audio`.
+- **The engine's URL path is wired** (`wave319`): `rustamp-audio` routes
+  `TrackSource::Url` to `HttpDecoder::open`, and only a *path* still goes through
+  `DecoderRegistry` (which cannot tell a URL from a path — it probes a source by
+  its extension and its first bytes, and a URL has no bytes to sniff). The
+  registry's refusal of a URL is kept on purpose: it names the way that works, so
+  a caller that reaches it by mistake gets a sentence instead of a probe failure.
 
 ## Named collapses
 
