@@ -2099,7 +2099,10 @@ impl Windowed {
         let attributes = {
             use winit::platform::windows::WindowAttributesExtWindows as _;
             if window == PresenterWindow::Main {
-                attributes.with_class_name("Winamp v1.x")
+                // S09 §1 and §8 item 1: the main window's class is an ABI
+                // fact that plugins and external tools depend on. S13 §2
+                // points at the same name for the single-instance check.
+                attributes.with_class_name(rustamp_platform::single_instance::DEFAULT_CLASS)
             } else {
                 attributes
             }

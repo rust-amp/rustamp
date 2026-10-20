@@ -155,6 +155,82 @@ fn help_prints_the_usage_and_succeeds() {
     assert!(output.status.success());
     assert!(stdout.contains("usage: rustamp"), "stdout:\n{stdout}");
     assert!(stdout.contains("--null"), "stdout:\n{stdout}");
+    assert!(stdout.contains("/CLASS="), "stdout:\n{stdout}");
+    assert!(stdout.contains("/ONLYINSTALL"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn an_enqueued_file_is_added_and_not_played() {
+    // `--enqueue` is the file the shell's `Enqueue` verb runs: the file is
+    // added to the playlist and the playback does not start.
+    let fixture = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = binary();
+    isolate(&mut command, &dir);
+    let output = command
+        .arg("--null")
+        .arg("--enqueue")
+        .arg(&fixture)
+        .output()
+        .expect("spawn rustamp");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("playing"),
+        "an enqueued file must not start the playback:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_bookmark_is_added_and_not_played() {
+    // S13 §1: `/BOOKMARK <path>` adds the path as a bookmark rather than
+    // playing it. The bookmark store does not exist yet, so the path is
+    // added to the playlist and the run says so.
+    let fixture = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = binary();
+    isolate(&mut command, &dir);
+    let output = command
+        .arg("--null")
+        .arg("/BOOKMARK")
+        .arg(&fixture)
+        .output()
+        .expect("spawn rustamp");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("playing"),
+        "a bookmark must not start the playback:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("bookmark store does not exist"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn an_unknown_slash_token_is_a_file_argument() {
+    // S13 §1: the switch list is complete, so an unknown `/` token is a
+    // file argument and not an error.
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = binary();
+    isolate(&mut command, &dir);
+    let output = command
+        .arg("--null")
+        .arg("/ADD")
+        .output()
+        .expect("spawn rustamp");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The run does not fail on the token itself; the file it names simply
+    // does not exist.
+    assert!(
+        !stderr.contains("unknown option"),
+        "an unknown `/` token must not be refused:\n{stderr}"
+    );
+    assert!(!stdout.contains("playing"), "stdout:\n{stdout}");
 }
 
 #[test]

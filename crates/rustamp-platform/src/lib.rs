@@ -12,6 +12,8 @@
 //! discovery, scale factors and window-position clamping live in
 //! [`displays`].
 //! Single instance and command-line forwarding live in [`single_instance`].
+//! The shell registration — the verbs a drop from Explorer offers (S13 §3) —
+//! lives in [`shell_registration`].
 //! The tray menu model and the Win32 icon attach live in [`tray`]; global
 //! hotkeys live in [`hotkeys`].
 //! The standard file-open dialog and the directory picker live in
@@ -31,6 +33,7 @@ pub mod file_dialog;
 pub mod hotkeys;
 pub mod popup_menu;
 pub mod prefs_dialog;
+pub mod shell_registration;
 pub mod single_instance;
 pub mod tray;
 pub mod utc;
@@ -64,9 +67,15 @@ pub use prefs_dialog::{
     Bind, LibraryRootRow, PluginRow, PrefsAction, PrefsError, PrefsNode, PrefsSettings,
     TREE as PREFS_TREE, library_root_text,
 };
+pub use shell_registration::{
+    DIRECTORY_HANDLER, DROP_TARGET_VALUE, Entry, Handler, MEDIA_PROG_ID, PLAYLIST_PROG_ID,
+    RegistrationError, RegistrationFlags, RegistrationStep, SKIN_PROG_ID, Verb,
+    file_type_associations, file_type_entries, install, registered_value, registration_step,
+    registry_entries, uninstall,
+};
 pub use single_instance::{
-    Claim, ForwardRequest, HandOff, Instance, LockState, StartupAction, claim, forward,
-    instance_key, startup_action, take_pending,
+    Claim, DEFAULT_CLASS, ForwardRequest, HandOff, Instance, LockState, StartupAction, claim,
+    forward, instance_key, startup_action, take_pending,
 };
 pub use tray::{TRAY_CALLBACK_MESSAGE, TRAY_LEFT_CLICK, TRAY_MENU, TRAY_TOOLTIP, TrayMenuEntry};
 #[cfg(windows)]

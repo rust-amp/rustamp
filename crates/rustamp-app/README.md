@@ -9,9 +9,19 @@ the modules and `docs/tasks/N1-app-wiring.md` for the task card.
 The binary is `rustamp`:
 
 ```text
-rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
-       [--import-winamp-ini [path]]
+rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
+       [--seconds <n>] [--enqueue] [--import-winamp-ini [path]]
+       [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>]
+       [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 ```
+
+The `/`-switches are the reference switches of `specs/S13-command-line.md`:
+`/CLASS=` is the window class the single-instance check looks for, `/CONFIG=`
+the configuration file to use instead of the default, `/BOOKMARK` adds a path
+as a bookmark rather than playing it, and `/INSTALL`, `/UNREG`, `/NOREG` and
+`/ONLYINSTALL` drive the shell registration (the verbs a drop from Explorer
+offers). An unknown `/`-token is a file argument, as in the spec. The
+`--`-switches are Rustamp's own test and convenience aids.
 
 ## Headless mode — safe to run anywhere
 
@@ -254,6 +264,12 @@ Without a path the presenter opens the standard file-open dialog (filter
 `*.ini`, `rustamp_platform::pick_winamp_ini_file`) from the tick and imports
 what the user picks. The path has to follow the switch directly, so the switch
 comes before the file to play.
+
+The path is the argument behind the switch, but only when that argument is
+**not a switch of either family** — neither one of ours (`--null`,
+`--volume`, …) nor one of the reference's (`/CLASS=`, `/CONFIG=`, …). So
+`rustamp --import-winamp-ini /CLASS=Rustamp` asks for the file and still
+takes the class; the two families never eat each other.
 
 The import takes over what the running player can take over at once: the
 volume, the balance, the equalizer (the enabled flag, the auto flag, the
