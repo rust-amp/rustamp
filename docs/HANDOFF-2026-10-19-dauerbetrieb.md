@@ -106,15 +106,30 @@ after every merge), not by trusting the lane's report.
 | `wave224` | the DSP session's terminal diagnosis is sticky now (product fix found by property tests) |
 | `wave225` | the library window removes the missing entries (`Ctrl+M`): the rows whose file is gone are dropped, the unreadable ones are kept and reported, and a running scan refuses the action |
 | `wave227` | `last_scanned_at` per root with an idempotent schema migration |
+| `wave228` | the Ogg EOS flag is an exact truncation oracle (a cut file is named, damage is not) |
+| `wave229` | the library scan's progress in the status line; a cancelled scan shows the committed counts |
+| `wave230` | `write_tags_with` removes named fields, `unremoved` names what a second tag kept |
+| `wave231` | `Ctrl+E`/40255 wired end to end; `Tab`/`Shift+Tab` reach the dialog without leaking globally |
+| `wave232` | the scan status moved into the view and the renderer (the app-side painting workaround is gone) |
+| `wave233` | `Library::write_tags_with` carries removals and surfaces the format's refusals |
+| `wave234` | real Opus decoding: Symphonia has no Opus codec at all; `opus-rs` (BSD-3) fills the gap, sample-exact against ffmpeg |
+| `wave235` | the M14 gaps the card still listed are pinned (URL refusal, abrupt loss accounting, bounded-wait honesty) |
+| `wave236` | a cleared edit-entry field is a removal, the diff carries `TagField` removals |
+| `wave237` | each root's last scan time in the Preferences, with a shared UTC helper; the page-switch refill bug fixed |
+| `wave238` | input seek/pause routes (S09 has a `seek` slot); the plugin flushes the output, the host does not |
+| `wave239` | the edit-entry save removes cleared fields and reports what the format kept |
+| `wave241` | the `stop_input` route: the plugin closes its own output |
 
 Also this session: the post-merge check was a **false green** because it ran
 `cargo check --workspace` without `--all-targets`; three test call sites were
 broken for a whole wave. The rule in `AGENTS.md` now demands
 `--all-targets --all-features`.
 
-In flight at the time of writing: `wave226` (the `Ctrl+E`/40255 edit-entry
-dialog model), `wave228` (the Ogg EOS-page oracle, or the proven limit),
-`wave229` (scan progress in the library window).
+Also this session: `docs/tasks/M14-host-framework-review.md` was brought up to
+date (L2, L4 and F-C8 are CONFIRMED now).
+
+In flight at the time of writing: `wave240` (the Preferences plug-in list after
+a page switch), `wave242` (Opus in Matroska, or the precise limit).
 
 ## Rules added to `AGENTS.md` during the session
 
