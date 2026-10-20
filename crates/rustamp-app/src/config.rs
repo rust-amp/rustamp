@@ -2,20 +2,75 @@
 //! Configuration loading and persistence (task cards N1 and N6).
 //!
 //! `rustamp-core` defines the typed [`Config`] tree and its defaults. The app
-//! resolves a path, reads TOML, and applies settings that the player honours
-//! (volume, balance, skin path, double-size mode, always-on-top, easy-move,
-//! equalizer state, and window placements).
+//! resolves a path, reads TOML, and applies the settings the player honours
+//! (the audit table below names them and the place that applies each one).
 //!
 //! For settings that cannot be honoured yet (e.g. output backend selection,
 //! audio buffer lengths, shuffle/repeat playback modes, and plugins), the
 //! configuration loader reports clear warnings rather than silently ignoring them.
-//! ReplayGain is now honoured (audio.replaygain), and so is the output device
+//! ReplayGain is honoured (audio.replaygain), and so is the output device
 //! (audio.device).
 //!
 //! On clean exit, the app writes an honest configuration to `%RUSTAMP_CONFIG%`
-//! (when set) or `%APPDATA%\Rustamp\rustamp.toml`. The serialized configuration
-//! includes **only** fields that the player actually honours; ignored fields are
-//! omitted so the file never advertises unsupported settings.
+//! (when set) or `%APPDATA%\Rustamp\rustamp.toml`. The written file carries
+//! **only** the settings the player honours, so it never advertises an
+//! unsupported setting as if it were in effect.
+//!
+//! # The audit: what the player applies, and what a save does with it
+//!
+//! | Setting | Applied by the player | On save |
+//! |---|---|---|
+//! | `version` | the schema marker | written |
+//! | `audio.volume` | `App::with_registry` → `Engine::set_volume` | written |
+//! | `audio.balance` | `App::with_registry` → `Engine::set_balance` | written |
+//! | `audio.output_mode` | `output::create_output` (RFC 0019) | written |
+//! | `audio.device` | `output::create_output` → `selection::plan`/`resolve` | written |
+//! | `audio.replaygain` | `App::with_registry` → `Engine::set_replaygain_mode` | written |
+//! | `ui.skin` | `crate::run` → `skin::choose` | written |
+//! | `ui.double_size` | `App::with_registry` → the main window's state | written |
+//! | `ui.always_on_top` | `App::with_registry` → `App::always_on_top` | written |
+//! | `ui.easy_move` | `App::with_registry` → `App::easy_move` | written |
+//! | `ui.snap_distance` | `window` → `rustamp_ui::docking` | written |
+//! | `ui.windows` | `App::with_registry` → the window placements | written |
+//! | `ui.playlist_font_size` | the playlist editor's font size | written; an unusable value is kept |
+//! | `eq.state` | `App::with_registry` → `Engine::set_eq` | written |
+//! | `plugins.plugin_dir` | `App::plugin_dir` → `rustamp_prefs::scan` | written |
+//! | `plugins.disabled` | `App::set_plugin_enabled` → `rustamp_prefs::set_enabled` | written |
+//! | `audio.output` | — the backend comes from the command line | **preserved** |
+//! | `audio.buffer_ms` | — | **preserved** |
+//! | `audio.fadeout_ms` | — the engine has `EngineConfig::fade_ms`, but the app never passes the configured value | **preserved** |
+//! | `audio.gapless` | — | **preserved** |
+//! | `playlist.shuffle` | — the engine implements the mode (S15), but the app never hands the configured value to it | **preserved** |
+//! | `playlist.repeat` | — the same | **preserved** |
+//! | `playlist.manual_advance` | — | **preserved** |
+//! | `playlist.last_playlist` | — | **preserved** |
+//! | `plugins.vis_plugin` | — | **preserved** |
+//! | `plugins.vis_preset` | — | **preserved** |
+//!
+//! # The save rule: a setting is never destroyed by a save that did not apply it
+//!
+//! A setting the player does not honour (an unknown key, a setting of a newer
+//! version, `playlist.shuffle`) is **not** part of the honest serialization —
+//! but it is also **not** deleted. On every save the app reads the file it is
+//! about to overwrite and copies every setting it does not own back into it,
+//! with the text the file used (see [`crate::config_preserve`]). A user who
+//! edits `rustamp.toml` by hand keeps those lines; the loader still warns
+//! that they are not applied.
+//!
+//! The rule has three parts:
+//!
+//! 1. **Owned settings** are written by the app: it reads them and acts on
+//!    them, so it knows their current value. The list is [`OWNED_PATHS`].
+//! 2. **Every other setting** of the previous file is preserved verbatim.
+//!    It belongs to the user or to a newer version of the app, and the app
+//!    does not understand it, so it does not touch it.
+//! 3. A file the app cannot read is **never overwritten**: a save that cannot
+//!    preserve the file's settings would destroy them, so it fails loudly
+//!    instead.
+//!
+//! A comment that documents a setting travels with that setting. A comment
+//! that stands on its own — above a setting the app owns, or at the end of
+//! the file — is not kept: the app rewrites the file it owns.
 //!
 //! A missing config file is **not** an error (it means "use defaults").
 //! A malformed config file **fails loudly** with an explicit error rather than
@@ -25,6 +80,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use rustamp_core::config::Config;
+
+use crate::config_preserve;
 
 /// Environment variable that overrides the config path (also the test seam).
 pub const CONFIG_ENV: &str = "RUSTAMP_CONFIG";
@@ -37,6 +94,78 @@ pub const CONFIG_ENV: &str = "RUSTAMP_CONFIG";
 /// therefore keeps the value in the same file, under the `[ui]` table, next
 /// to the other UI state it persists.
 pub const PLAYLIST_FONT_SIZE_KEY: &str = "playlist_font_size";
+
+/// The configuration paths the app owns: the settings it reads and acts on.
+///
+/// The app decides the value of an owned setting on every save, so the
+/// previous file's value for it is replaced, not preserved. Every other
+/// setting of the file belongs to the user (or to a newer version of the
+/// app) and is preserved verbatim — see the module docs for the audit and
+/// the save rule.
+///
+/// A path is owned when the app *applies* it; the module docs' audit table
+/// names the place that applies it. `eq.state` is one table, so every key
+/// inside it belongs to the app.
+///
+/// The paths that are **not** listed here are not applied by the player:
+/// `audio.output`, `audio.buffer_ms`, `audio.fadeout_ms`, `audio.gapless`,
+/// `playlist.shuffle`, `playlist.repeat`, `playlist.manual_advance`,
+/// `playlist.last_playlist`, `plugins.vis_plugin` and `plugins.vis_preset`.
+/// They are preserved on save and warned about on load.
+const OWNED_PATHS: &[&[&str]] = &[
+    &["version"],
+    &["audio", "volume"],
+    &["audio", "balance"],
+    &["audio", "output_mode"],
+    &["audio", "replaygain"],
+    &["audio", "device"],
+    &["ui", "skin"],
+    &["ui", "double_size"],
+    &["ui", "always_on_top"],
+    &["ui", "easy_move"],
+    &["ui", "snap_distance"],
+    &["ui", "windows"],
+    &["ui", PLAYLIST_FONT_SIZE_KEY],
+    &["eq", "state"],
+    &["plugins", "plugin_dir"],
+    &["plugins", "disabled"],
+];
+
+/// Whether the app owns the setting at `path`.
+///
+/// A path is owned when it *starts* with one of the [`OWNED_PATHS`]: the
+/// equalizer's state is one table, so every key inside it belongs to the
+/// app.
+fn owns(path: &[String]) -> bool {
+    OWNED_PATHS.iter().any(|owned| {
+        owned.len() <= path.len()
+            && owned
+                .iter()
+                .zip(path.iter())
+                .all(|(name, part)| *name == part.as_str())
+    })
+}
+
+/// Whether the app owns the setting at `path` in the file `previous`.
+///
+/// The playlist font size is the one owned setting whose value the app may
+/// not be able to use: a value it cannot use is a setting the app did not
+/// apply, so it is preserved instead of dropped. A value the app can use
+/// belongs to the app, which writes its own.
+fn owns_setting(path: &[String], previous: &toml::Value) -> bool {
+    if path.len() == 2 && path[0] == "ui" && path[1] == PLAYLIST_FONT_SIZE_KEY {
+        return font_size_is_usable(previous);
+    }
+    owns(path)
+}
+
+/// Whether the file's playlist font size is one the app can use.
+fn font_size_is_usable(previous: &toml::Value) -> bool {
+    previous
+        .get("ui")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|ui| playlist_font_size_in_toml(ui).is_some())
+}
 
 /// Where the loaded configuration came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +187,9 @@ pub enum ConfigError {
         error: String,
     },
     /// A file was found and read, but contained malformed syntax or rejected structure.
+    ///
+    /// A load reports it, and a save refuses to overwrite the file: the
+    /// save would destroy the settings the app could not read.
     Malformed {
         /// The file path.
         path: PathBuf,
@@ -306,6 +438,10 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
 /// `playlist.repeat`, `playlist.manual_advance`, `playlist.last_playlist`, and `plugins.*`) are
 /// omitted so the config file does not advertise unsupported features or mislead users.
 ///
+/// This is the player's **own** part of the file. A save writes it together
+/// with the settings the player does not own, which the previous file keeps
+/// — see [`serialize_preserving`] and the module docs for the save rule.
+///
 /// `playlist_font_size` is the playlist editor's runtime font size: it is
 /// written only when the user chose one (S03 §2 `40335` / `40336`), because
 /// the skin's size is in use otherwise.
@@ -357,10 +493,11 @@ pub fn serialize_honest(
     }
     // Note on deliberately unpersisted fields:
     // audio.output, audio.buffer_ms, audio.fadeout_ms and audio.gapless are
-    // deliberately not persisted because the audio engine does not support
-    // runtime configuration of them yet. audio.replaygain and audio.device are
-    // persisted: they are honoured by the engine (task card E4/A15 wiring and
-    // the device selection).
+    // deliberately not written because the audio engine does not support
+    // runtime configuration of them yet. They are not deleted either: a save
+    // keeps the file's own value (see `serialize_preserving`).
+    // audio.replaygain and audio.device are written: they are honoured by the
+    // engine (task card E4/A15 wiring and the device selection).
     root.insert("audio".into(), toml::Value::Table(audio));
 
     let mut ui = toml::Table::new();
@@ -452,9 +589,11 @@ pub fn serialize_honest(
 
     // Note on deliberately unpersisted sections:
     // playlist (shuffle, repeat, manual_advance, last_playlist) and the
-    // plugins' vis_plugin / vis_preset are deliberately not persisted because
+    // plugins' vis_plugin / vis_preset are deliberately not written because
     // none of those features are honoured by the player yet (task card N6).
-    // audio.replaygain and audio.device are persisted (see above).
+    // They are kept, not deleted: a save copies the file's own settings back
+    // (see `serialize_preserving`).
+    // audio.replaygain and audio.device are written (see above).
 
     toml::to_string_pretty(&toml::Value::Table(root)).map_err(|e| ConfigError::Write {
         path: PathBuf::from("<serialize>"),
@@ -462,9 +601,62 @@ pub fn serialize_honest(
     })
 }
 
-/// Saves `config` to `path` using honest serialization (writing only honoured fields).
+/// Serializes a [`Config`] to TOML and keeps the settings of `previous` that
+/// the player does not own.
+///
+/// The result is the player's own serialization ([`serialize_honest`]) plus
+/// every setting of `previous` the player does not apply, copied over with
+/// the text the file used. A setting the player did not apply is never
+/// destroyed by a save that did not apply it either.
+///
+/// `previous` must be valid TOML; a file that is not is reported as
+/// [`ConfigError::Malformed`] rather than silently replaced. The same is
+/// reported when the merged document would not be a config file any more:
+/// a setting that cannot be kept must not break the file.
+pub fn serialize_preserving(
+    config: &Config,
+    playlist_font_size: Option<u32>,
+    previous: &str,
+) -> Result<String, ConfigError> {
+    merged_document(config, playlist_font_size, previous, Path::new("<memory>"))
+}
+
+/// The merged document for `previous`, or the reason why there is none.
+///
+/// `path` names the file the settings came from; it is the path the errors
+/// carry.
+fn merged_document(
+    config: &Config,
+    playlist_font_size: Option<u32>,
+    previous: &str,
+    path: &Path,
+) -> Result<String, ConfigError> {
+    let previous_value: toml::Value =
+        toml::from_str(previous).map_err(|e| ConfigError::Malformed {
+            path: path.to_owned(),
+            error: e.to_string(),
+        })?;
+    let honest = serialize_honest(config, playlist_font_size)?;
+    let merged = config_preserve::merge(&honest, previous, &|path| {
+        owns_setting(path, &previous_value)
+    });
+    // The merged file must still be a config file the player can read: a
+    // setting that cannot be kept must not break the file.
+    toml::from_str::<Config>(&merged).map_err(|e| ConfigError::Malformed {
+        path: path.to_owned(),
+        error: format!("the merged file is not a config file: {e}"),
+    })?;
+    Ok(merged)
+}
+
+/// Saves `config` to `path`, keeping the settings of the file that are not
+/// the player's own.
 ///
 /// Creates any missing parent directories. Returns a [`ConfigError::Write`] if writing fails.
+///
+/// A file that is not valid TOML is **not** overwritten: the save would
+/// destroy the settings the app could not read, so it fails loudly with
+/// [`ConfigError::Malformed`] and the file stays as it was.
 pub fn save(
     config: &Config,
     playlist_font_size: Option<u32>,
@@ -478,7 +670,26 @@ pub fn save(
             error: e.to_string(),
         })?;
     }
-    let toml_str = serialize_honest(config, playlist_font_size)?;
+    let toml_str = match std::fs::read_to_string(path) {
+        Ok(previous) => {
+            // A file the app cannot read is never overwritten: the save
+            // would destroy settings the app never understood.
+            toml::from_str::<toml::Value>(&previous).map_err(|e| ConfigError::Malformed {
+                path: path.to_owned(),
+                error: e.to_string(),
+            })?;
+            merged_document(config, playlist_font_size, &previous, path)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serialize_honest(config, playlist_font_size)?
+        }
+        Err(error) => {
+            return Err(ConfigError::Read {
+                path: path.to_owned(),
+                error: error.to_string(),
+            });
+        }
+    };
     std::fs::write(path, toml_str).map_err(|e| ConfigError::Write {
         path: path.to_owned(),
         error: e.to_string(),

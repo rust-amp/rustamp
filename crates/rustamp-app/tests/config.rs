@@ -11,8 +11,24 @@ use rustamp_app::config::{
 };
 use rustamp_app::skin::{self, SkinChoice};
 use rustamp_core::command::{Command, PrefsPage};
-use rustamp_core::config::{Config, ReplayGainMode, WindowLayout};
+use rustamp_core::config::{Config, OutputMode, ReplayGainMode, WindowLayout};
 use rustamp_core::state::{EqState, WindowId};
+
+/// The settings the player does not apply: the loader warns about them, and
+/// a save must keep them (F5: a setting is never destroyed by a save that
+/// did not apply it).
+const UNAPPLIED: &[(&str, &str, &str)] = &[
+    ("audio", "output", "\"cpal\""),
+    ("audio", "buffer_ms", "300"),
+    ("audio", "fadeout_ms", "800"),
+    ("audio", "gapless", "false"),
+    ("playlist", "shuffle", "true"),
+    ("playlist", "repeat", "true"),
+    ("playlist", "manual_advance", "true"),
+    ("playlist", "last_playlist", "\"list.m3u\""),
+    ("plugins", "vis_plugin", "\"vis.dll\""),
+    ("plugins", "vis_preset", "\"preset\""),
+];
 
 fn test_app_with_config(config: Config, config_path: Option<PathBuf>) -> App {
     let skin = skin::load(&SkinChoice::Builtin);
@@ -527,5 +543,363 @@ fn preferences_dialog_open_page_declares_settings_not_applied() {
     assert!(
         lines.iter().any(|line| line.contains("not applied yet")),
         "preferences options page must declare settings are not applied yet, got: {lines:?}"
+    );
+}
+
+/// W14 finding F5: a setting the player does not apply must survive a save
+/// that did not apply it either. The line keeps its text, byte for byte.
+#[test]
+fn a_setting_the_player_does_not_apply_keeps_its_line_after_a_save() {
+    for (table, key, value) in UNAPPLIED {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.toml");
+        let line = format!("{key} = {value}");
+        let text = format!("[{table}]\n{line}\n");
+        std::fs::write(&path, &text).unwrap();
+
+        let loaded = load(Some(&path)).expect("the file loads");
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("{table}.{key}")) && w.contains("not applied")),
+            "{table}.{key} must be reported as not applied: {:?}",
+            loaded.warnings
+        );
+
+        save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.lines().any(|written| written == line),
+            "the line {line:?} must survive the save unchanged:\n{saved}"
+        );
+
+        // A second save is stable: the file the first save wrote is read
+        // again, and the setting is still there.
+        save(&loaded.config, loaded.playlist_font_size, &path).expect("the second save succeeds");
+        let saved_again = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved_again, saved, "a second save changes nothing");
+
+        // And the setting is still reported as not applied: the save kept
+        // it, it did not apply it.
+        let again = load(Some(&path)).expect("the saved file loads");
+        assert!(
+            again
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("{table}.{key}"))),
+            "{table}.{key} must still be reported: {:?}",
+            again.warnings
+        );
+    }
+}
+
+/// The settings the player does apply are written by the save, so they
+/// round-trip.
+#[test]
+fn an_applied_setting_survives_a_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("applied.toml");
+    std::fs::write(
+        &path,
+        "\
+[audio]
+replaygain = \"Track\"
+device = \"Speakers (Realtek)\"
+output_mode = \"Exclusive\"
+
+[ui]
+snap_distance = 25
+double_size = true
+",
+    )
+    .unwrap();
+
+    let loaded = load(Some(&path)).expect("the file loads");
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+
+    let again = load(Some(&path)).expect("the saved file loads");
+    assert_eq!(again.config, loaded.config, "the applied settings survive");
+    assert_eq!(again.config.audio.replaygain, ReplayGainMode::Track);
+    assert_eq!(again.config.audio.output_mode, OutputMode::Exclusive);
+    assert_eq!(
+        again.config.audio.device,
+        Some("Speakers (Realtek)".to_string())
+    );
+    assert_eq!(again.config.ui.snap_distance, 25);
+    assert!(again.config.ui.double_size);
+}
+
+/// A setting the player does not know at all is the user's, and it survives
+/// as well.
+#[test]
+fn an_unknown_setting_survives_a_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown.toml");
+    std::fs::write(
+        &path,
+        "\
+my_own_key = 42
+
+[my_own_table]
+key = \"value\"
+",
+    )
+    .unwrap();
+
+    let loaded = load(Some(&path)).expect("the file loads");
+    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.lines().any(|line| line == "my_own_key = 42"),
+        "the unknown key survives:\n{saved}"
+    );
+    assert!(
+        saved.contains("[my_own_table]"),
+        "the unknown table survives:\n{saved}"
+    );
+    assert!(
+        saved.lines().any(|line| line == "key = \"value\""),
+        "the unknown setting survives:\n{saved}"
+    );
+    // The saved file is still a config file the player can read.
+    let again = load(Some(&path)).expect("the saved file loads");
+    assert_eq!(again.config, loaded.config);
+}
+
+/// The honest list and the warning list must not overlap: a setting the
+/// honest serialization writes is never one the loader warns about, and a
+/// setting the loader warns about is never one the honest serialization
+/// writes.
+#[test]
+fn the_honest_list_and_the_warning_list_stay_consistent() {
+    let mut config = Config::default();
+    config.audio.volume = 150;
+    config.audio.balance = -40;
+    config.audio.replaygain = ReplayGainMode::Album;
+    config.audio.device = Some("Speakers".to_string());
+    config.audio.output_mode = OutputMode::Exclusive;
+    config.ui.skin = Some(PathBuf::from("skins/x.wsz"));
+    config.ui.double_size = true;
+    config.ui.always_on_top = true;
+    config.ui.easy_move = false;
+    config.ui.snap_distance = 25;
+    config.plugins.plugin_dir = Some(PathBuf::from("plugins"));
+    config.plugins.disabled = vec!["bad.dll".to_string()];
+
+    let serialized = serialize_honest(&config, Some(18)).expect("serialize honest config");
+    let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
+    assert!(
+        ignored_fields_in_toml(&value).is_empty(),
+        "the honest list must not warn about itself: {:?}",
+        ignored_fields_in_toml(&value)
+    );
+    for (table, key, _) in UNAPPLIED {
+        assert!(
+            !serialized
+                .lines()
+                .any(|line| line.starts_with(&format!("{key} ="))),
+            "the honest list must not advertise {table}.{key}:\n{serialized}"
+        );
+    }
+    // And the other way round: every setting the loader warns about is a
+    // setting the player does not own, so a save keeps it.
+    for (table, key, value) in UNAPPLIED {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consistent.toml");
+        std::fs::write(&path, format!("[{table}]\n{key} = {value}\n")).unwrap();
+        let loaded = load(Some(&path)).expect("the file loads");
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("{table}.{key}"))),
+            "{table}.{key} must be in the warning list"
+        );
+    }
+}
+
+/// A file the player cannot read is never overwritten: the save would
+/// destroy the settings the player never understood.
+#[test]
+fn a_malformed_file_is_not_replaced_by_a_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("malformed.toml");
+    let text = "[audio\nvolume = = ";
+    std::fs::write(&path, text).unwrap();
+
+    let error = save(&Config::default(), None, &path)
+        .expect_err("a malformed file must not be overwritten");
+    match &error {
+        ConfigError::Malformed {
+            path: err_path,
+            error: message,
+        } => {
+            assert_eq!(err_path, &path);
+            assert!(!message.is_empty());
+        }
+        other => panic!("expected ConfigError::Malformed, got: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        text,
+        "the malformed file must stay as it was"
+    );
+    assert!(error.to_string().contains("is malformed"), "{error}");
+}
+
+/// A dotted key names a table. The player's own file writes that table, so
+/// the setting moves into it — unchanged, but where TOML allows it.
+#[test]
+fn a_dotted_setting_moves_into_the_table_the_player_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dotted.toml");
+    std::fs::write(&path, "audio.buffer_ms = 300\n").unwrap();
+
+    let loaded = load(Some(&path)).expect("the file loads");
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("audio.buffer_ms")),
+        "{:?}",
+        loaded.warnings
+    );
+
+    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("[audio]"), "{saved}");
+    assert!(
+        saved.lines().any(|line| line == "buffer_ms = 300"),
+        "the setting survives:\n{saved}"
+    );
+    assert!(
+        !saved.contains("audio.buffer_ms"),
+        "the dotted key moved into the table:\n{saved}"
+    );
+    // The saved file is still a config file the player can read.
+    load(Some(&path)).expect("the saved file loads");
+}
+
+/// A playlist font size the player cannot use is a setting it did not
+/// apply: the save keeps it, so the warning keeps naming it.
+#[test]
+fn an_unusable_playlist_font_size_survives_a_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("font-size.toml");
+    std::fs::write(&path, "[ui]\nplaylist_font_size = 900\n").unwrap();
+
+    let loaded = load(Some(&path)).expect("the file loads");
+    assert_eq!(loaded.playlist_font_size, None);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("ui.playlist_font_size")),
+        "{:?}",
+        loaded.warnings
+    );
+
+    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.lines().any(|line| line == "playlist_font_size = 900"),
+        "the unusable value survives the save:\n{saved}"
+    );
+}
+
+/// A setting that cannot be kept must not break the file: when the merged
+/// document would not be a config file any more, the save says so and
+/// leaves the file alone.
+#[test]
+fn a_merge_that_would_break_the_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("collide.toml");
+    // A root key that collides with the table the player writes.
+    let text = "audio = \"not a table\"\n";
+    std::fs::write(&path, text).unwrap();
+
+    let error = save(&Config::default(), None, &path).expect_err("the merge must be refused");
+    match &error {
+        ConfigError::Malformed {
+            path: err_path,
+            error: message,
+        } => {
+            assert_eq!(err_path, &path);
+            assert!(message.contains("not a config file"), "{message}");
+        }
+        other => panic!("expected ConfigError::Malformed, got: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        text,
+        "the file stays as it was"
+    );
+}
+
+/// A comment that documents a setting the player does not apply travels
+/// with it: the user's notes survive the save as well.
+#[test]
+fn a_comment_above_a_preserved_setting_survives_a_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("comment.toml");
+    std::fs::write(
+        &path,
+        "[playlist]\n# I want shuffle, even if it does not work yet.\nshuffle = true\n",
+    )
+    .unwrap();
+
+    let loaded = load(Some(&path)).expect("the file loads");
+    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.contains("# I want shuffle, even if it does not work yet."),
+        "the note survives with its setting:\n{saved}"
+    );
+    assert!(
+        saved.lines().any(|line| line == "shuffle = true"),
+        "the setting survives:\n{saved}"
+    );
+}
+
+/// The clean exit of the app is a save, so it keeps the settings the player
+/// does not apply.
+#[test]
+fn the_clean_exit_keeps_the_settings_the_player_does_not_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clean-exit.toml");
+    std::fs::write(
+        &path,
+        "\
+[audio]
+volume = 100
+
+[playlist]
+shuffle = true
+",
+    )
+    .unwrap();
+
+    let loaded = load(Some(&path)).expect("the file loads");
+    let mut app = test_app_with_config(loaded.config, Some(path.clone()));
+    app.submit(Command::SetVolume(188)).unwrap();
+    app.save_config().expect("the clean exit saves");
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.lines().any(|line| line == "shuffle = true"),
+        "the setting the player does not apply survives the clean exit:\n{saved}"
+    );
+    let again = load(Some(&path)).expect("the saved file loads");
+    assert_eq!(
+        again.config.audio.volume, 188,
+        "the applied setting is written"
     );
 }
