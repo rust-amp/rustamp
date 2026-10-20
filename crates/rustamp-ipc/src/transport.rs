@@ -19,9 +19,24 @@ pub enum IpcError {
     /// Frame exceeds `MAX_FRAME_LEN`.
     #[error("frame too large: {0} bytes")]
     FrameTooLarge(u64),
+    /// The stream ended in the middle of a frame.
+    ///
+    /// The length prefix or the payload was cut short, so the frame is
+    /// incomplete and was **not** decoded. This is not an orderly end: the
+    /// stream is inside the broken frame, and the bytes that follow belong
+    /// to it rather than to a new one.
+    #[error("truncated frame: the stream ended in the middle of a frame")]
+    Truncated,
     /// The peer closed the connection.
     #[error("connection closed")]
     Closed,
+    /// The stream cannot carry frames any more.
+    ///
+    /// A frame was started but neither finished nor refused, so the position
+    /// in the stream is unknown. A transport refuses to read or write
+    /// further frames instead of handing the peer bytes it would misread.
+    #[error("the stream is out of sync: a frame was not completed")]
+    Desynchronized,
     /// No message is available right now, and this transport cannot say
     /// whether one will arrive: only in-memory transports support a real
     /// non-blocking read. A [`StreamTransport`] over blocking stdio always
@@ -40,6 +55,10 @@ pub trait Transport: Send {
     /// Send one message.
     fn send(&mut self, msg: &Message) -> Result<(), IpcError>;
     /// Block until the next message arrives; `Err(Closed)` at end of stream.
+    ///
+    /// A stream that ends inside a frame is `Err(Truncated)`, and a stream
+    /// that cannot carry frames any more is `Err(Desynchronized)`; neither
+    /// is a message and neither is an orderly end.
     fn recv(&mut self) -> Result<Message, IpcError>;
     /// Non-blocking receive: `Ok(None)` when nothing is queued right now.
     ///
@@ -109,25 +128,77 @@ impl Transport for MemoryTransport {
 /// read half belongs to a reader thread that blocks in
 /// [`Transport::recv`], while the app thread keeps the write half and polls
 /// the reader's handover (see `rustamp-app/src/supervise.rs`).
+///
+/// # A broken frame ends the stream
+///
+/// A frame that was not completed leaves the byte stream at an unknown
+/// position: the bytes that follow belong to the broken frame, not to a new
+/// one. Reading or writing another frame would hand the peer bytes it would
+/// misread - the tail of a broken frame read as the next length prefix. The
+/// transport therefore refuses further frames with
+/// [`IpcError::Desynchronized`] once a frame was cut short, refused before
+/// its payload was read, or left half written.
 #[derive(Debug)]
 pub struct StreamTransport<R, W> {
     reader: R,
     writer: W,
+    /// The read half lost its place in the stream.
+    read_broken: bool,
+    /// The write half may have left a half frame in the stream.
+    write_broken: bool,
 }
 
 impl<R: Read + Send, W: Write + Send> StreamTransport<R, W> {
     /// Wrap a reader and writer.
     pub fn new(reader: R, writer: W) -> Self {
-        StreamTransport { reader, writer }
+        StreamTransport {
+            reader,
+            writer,
+            read_broken: false,
+            write_broken: false,
+        }
     }
 }
 
 impl<R: Read + Send, W: Write + Send> Transport for StreamTransport<R, W> {
     fn send(&mut self, msg: &Message) -> Result<(), IpcError> {
-        write_frame(&mut self.writer, msg)
+        if self.write_broken {
+            return Err(IpcError::Desynchronized);
+        }
+        match write_frame(&mut self.writer, msg) {
+            Ok(()) => Ok(()),
+            // Nothing went out, so the stream is still framed.
+            Err(error @ (IpcError::FrameTooLarge(_) | IpcError::Codec(_))) => Err(error),
+            // The frame may be half written: the peer would read the rest of
+            // it as the next frame, so no further frame goes out.
+            Err(error) => {
+                self.write_broken = true;
+                Err(error)
+            }
+        }
     }
     fn recv(&mut self) -> Result<Message, IpcError> {
-        read_frame(&mut self.reader)
+        if self.read_broken {
+            return Err(IpcError::Desynchronized);
+        }
+        match read_frame(&mut self.reader) {
+            Ok(message) => Ok(message),
+            // The frame was refused before its payload was read, or it was
+            // cut short: the stream is inside the broken frame.
+            Err(error @ (IpcError::Truncated | IpcError::FrameTooLarge(_))) => {
+                self.read_broken = true;
+                Err(error)
+            }
+            // A read that failed leaves the stream where the failure hit it,
+            // which is inside the frame.
+            Err(error @ IpcError::Io(_)) => {
+                self.read_broken = true;
+                Err(error)
+            }
+            // A codec error means the frame was read whole: the stream is
+            // still framed and the next frame is the next one.
+            Err(error) => Err(error),
+        }
     }
 }
 
