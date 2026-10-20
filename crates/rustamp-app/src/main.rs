@@ -17,8 +17,9 @@
 //! window (silent windowed playback, no audio device needed); with the default
 //! output it opens the main window and plays on the best device for the host.
 //!
-//! An argument that names an `http://` URL is streamed (S19); another scheme
-//! is refused by name, because this build has no TLS.
+//! An argument that names an `http://` or `https://` URL is streamed (S19 —
+//! `https` is our own extension: the spec records only the plain stream);
+//! any other scheme is refused by name.
 //!
 //! # The registration step (S13 §1)
 //!

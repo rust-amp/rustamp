@@ -41,21 +41,23 @@
 //!
 //! S13 §1 says that everything which is not a switch is a **file argument**.
 //! A URL is not a file: it names a stream, and the player can read one
-//! (S19 §1: the request template is plain `http://`). So the bare argument —
+//! (S19 §1: the request template is plain `http://`). So the bare argument -
 //! and every other path the command line names, the path of `/ADD` and the
-//! path of `/BOOKMARK` — is read by one rule, [`media_argument`]:
+//! path of `/BOOKMARK` - is read by one rule, [`media_argument`]:
 //!
 //! * an argument that names an `http://` URL is a **URL**;
-//! * an argument that names **another scheme** is refused **by name**: this
-//!   build reads `http://` URLs only — there is no TLS, and S19 §6 question 8
-//!   establishes no evidence for `https`;
+//! * an `https://` URL is a **URL** too: TLS is **our own extension**, not an
+//!   S19 fact (S19 §6 question 8 leaves the other schemes open, and the spec
+//!   records no evidence that the reference reads a TLS stream at all);
+//! * an argument that names **any other scheme** is refused **by name**, so a
+//!   typo cannot silently become a file path;
 //! * everything else is a **file path**, untouched.
 //!
 //! The refusal is a parse error: the player says which scheme it cannot
 //! read and starts nothing, rather than taking the URL for a file name.
 //!
 //! The same rule decides what a **hand-over to a running instance** carries
-//! (see [`forwarded_location`]): an `http://` URL travels in the hand-off
+//! (see [`forwarded_location`]): a stream URL travels in the hand-off
 //! frame and is streamed by the running player, and another scheme is
 //! refused with the very same words.
 //!
@@ -63,7 +65,7 @@
 //!
 //! | S13 fact | Our behaviour | State | Where |
 //! |---|---|---|---|
-//! | §1 everything else on the command line is a file argument | an argument that names an `http://` URL is a URL; every other argument is a file path | differs (own choice: a URL is not a file, and S19 gives the player a stream to read) | `cli.rs`, [`media_argument`] |
+//! | §1 everything else on the command line is a file argument | an argument that names an `http://` or `https://` URL is a URL; every other argument is a file path | differs (own choice: a URL is not a file, and S19 gives the player a stream to read; `https` is our extension) | `cli.rs`, [`media_argument`] |
 //! | §1 `/CLASS=<name>` overrides the class the single-instance check looks for | [`Args::class`] carries the value; [`Args::instance_class`] hands it to the check | matches | `cli.rs`, [`rustamp_platform::single_instance`] |
 //! | §2 the default class is the main window's class `Winamp v1.x` (S09 §1, §8 item 1) | [`rustamp_platform::single_instance::DEFAULT_CLASS`] | matches | `rustamp-platform/src/single_instance.rs` |
 //! | §2 the class name is case-sensitive | the class half of the instance key is not case-folded | matches | `rustamp-platform/src/single_instance.rs` |
@@ -252,7 +254,7 @@ usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <
        rustamp [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
               [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 
-  <file|url>        media file to load and play, or an http:// URL to stream (optional)
+  <file|url>        media file to load and play, or an http(s):// URL to stream (optional)
   --null            use the deterministic null output and run headless (no window)
   --no-audio        open the window but play on the null output (silent; no audio device needed)
   --volume <0..=255> initial volume (default: the config's audio.volume)
@@ -273,8 +275,8 @@ usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <
   /NOREG            skip the registration step
   /ONLYINSTALL      write the shell registration, then exit
 
-  An argument that names an http:// URL is streamed. Another scheme (https://
-  for instance) is refused: this build reads http:// URLs only.";
+  An argument that names an http:// or https:// URL is streamed. Another scheme
+  (ftp:// for instance) is refused.";
 
 /// Why the command line could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,7 +301,7 @@ pub enum CliError {
         /// The scheme of the URL, lower case.
         scheme: String,
     },
-    /// An `http://` URL that names no host.
+    /// An `http://` or `https://` URL that names no host.
     MalformedUrl(String),
 }
 
@@ -317,11 +319,11 @@ impl fmt::Display for CliError {
             CliError::UnsupportedUrl { url, scheme } => write!(
                 f,
                 "{url} was refused: unsupported URL scheme {scheme:?}: this build reads http:// \
-                 URLs only (there is no TLS, and S19 §6 question 8 leaves the other schemes open)"
+                 and https:// URLs (S19 §6 question 8 leaves the other schemes open)"
             ),
             CliError::MalformedUrl(url) => write!(
                 f,
-                "{url} was refused: it is not a usable http:// URL (it names no host)"
+                "{url} was refused: it is not a usable http(s):// URL (it names no host)"
             ),
         }
     }
@@ -447,7 +449,7 @@ fn class_value(value: &str) -> Result<String, CliError> {
 /// so they share this one rule. A missing path is left open by S13 §5.3, so
 /// the caller records that the switch was given without a path instead of
 /// guessing. A path that names a URL is read by [`media_argument`], so it
-/// may be an `http://` URL — and a URL this build cannot read is refused.
+/// may be an `http://` or `https://` URL - and a URL this build cannot read is refused.
 fn path_argument<I>(it: &mut std::iter::Peekable<I>) -> Result<Option<MediaLocation>, CliError>
 where
     I: Iterator<Item = String>,
@@ -466,15 +468,15 @@ where
 /// S13 §1 says that everything which is not a switch is a file argument. A
 /// URL is not a file: it names a stream, and the player can read one (S19).
 /// This is an **own choice** on top of S13 §1, and it is the same rule for
-/// every path the command line names — the bare argument, the path of `/ADD`
+/// every path the command line names - the bare argument, the path of `/ADD`
 /// and the path of `/BOOKMARK`:
 ///
 /// * an argument that names an `http://` URL is a **URL** (S19 §1: the
-///   request template is plain `http://`); the host must be there, or the
-///   argument is refused;
-/// * an argument that names **another scheme** is refused **by name**: this
-///   build reads `http://` URLs only — there is no TLS, and S19 §6 question 8
-///   establishes no evidence for `https`;
+///   request template is plain `http://`), and an `https://` one is a URL too
+///   (TLS is our own extension - S19 establishes no evidence for it); the
+///   host must be there, or the argument is refused;
+/// * an argument that names **any other scheme** is refused **by name**, so a
+///   typo cannot silently become a file path;
 /// * everything else is a **file path**, untouched.
 ///
 /// A one-letter scheme is a Windows drive letter (`C://Music`), not a scheme,
@@ -484,7 +486,8 @@ pub fn media_argument(argument: &str) -> Result<MediaLocation, CliError> {
     let Some((scheme, rest)) = split_scheme(trimmed) else {
         return Ok(MediaLocation::File(PathBuf::from(argument)));
     };
-    if !scheme.eq_ignore_ascii_case("http") {
+    let readable = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+    if !readable {
         return Err(CliError::UnsupportedUrl {
             url: trimmed.to_owned(),
             scheme: scheme.to_ascii_lowercase(),
@@ -501,7 +504,7 @@ pub fn media_argument(argument: &str) -> Result<MediaLocation, CliError> {
 ///
 /// The frame of the single-instance hand-over carries a **location**: a file
 /// path or a URL (S19 §1). The URL is read by the same rule as the command
-/// line reads one — only an `http://` URL that names a host can be read — and
+/// line reads one - only an `http(s)://` URL that names a host can be read - and
 /// a URL that fails it is refused with the command line's own wording, so
 /// the two cannot drift apart. A media that is no media at all carries
 /// nothing and refuses nothing.
@@ -1137,21 +1140,34 @@ mod tests {
     }
 
     #[test]
-    fn an_https_url_is_refused_by_name() {
-        // S19 §6 question 8: the request template is plain `http://`, so
-        // there is no evidence for `https`, and this build has no TLS. The
-        // refusal names the scheme; the URL is not taken for a file name.
-        let error = parse_args(&["https://example.test/stream.mp3"]).unwrap_err();
+    fn an_https_url_is_a_stream_too() {
+        // `https` is **our own extension**, not an S19 fact: S19 §1's template
+        // is plain `http://`, and §6 question 8 leaves the other schemes open.
+        // The rule is the same one that reads `http://`, so the URL is a URL
+        // and not a file name.
+        let args = parse_args(&["https://example.test/stream.mp3"]).unwrap();
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::Url(
+                "https://example.test/stream.mp3".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_scheme_this_build_cannot_read_is_refused_by_name() {
+        // The refusal names the scheme; the URL is not taken for a file name.
+        let error = parse_args(&["ftp://example.test/stream.mp3"]).unwrap_err();
         assert_eq!(
             error,
             CliError::UnsupportedUrl {
-                url: "https://example.test/stream.mp3".to_owned(),
-                scheme: "https".to_owned(),
+                url: "ftp://example.test/stream.mp3".to_owned(),
+                scheme: "ftp".to_owned(),
             }
         );
         let message = error.to_string();
-        assert!(message.contains("https"), "{message}");
-        assert!(message.contains("http://"), "{message}");
+        assert!(message.contains("ftp"), "{message}");
+        assert!(message.contains("https://"), "{message}");
     }
 
     #[test]
@@ -1216,12 +1232,12 @@ mod tests {
 
     #[test]
     fn the_add_switch_refuses_a_scheme_it_cannot_read() {
-        let error = parse_args(&["/ADD", "https://example.test/stream.mp3"]).unwrap_err();
+        let error = parse_args(&["/ADD", "ftp://example.test/stream.mp3"]).unwrap_err();
         assert_eq!(
             error,
             CliError::UnsupportedUrl {
-                url: "https://example.test/stream.mp3".to_owned(),
-                scheme: "https".to_owned(),
+                url: "ftp://example.test/stream.mp3".to_owned(),
+                scheme: "ftp".to_owned(),
             }
         );
     }
@@ -1275,13 +1291,13 @@ mod tests {
 
     #[test]
     fn a_refused_scheme_is_refused_with_the_command_lines_wording() {
-        // The command line refuses another scheme by name (S19 §6 question 8),
-        // and the hand-over refuses it with the same words: the player reads
-        // `http://` URLs only, and there is no TLS.
+        // The command line refuses a scheme it cannot read by name (S19 §6
+        // question 8 leaves the other schemes open), and the hand-over refuses
+        // it with the same words.
         let mut refusals = Vec::new();
         let location = forwarded_location(
             Some(MediaLocation::Url(
-                "https://example.test/stream.mp3".to_owned(),
+                "ftp://example.test/stream.mp3".to_owned(),
             )),
             &mut refusals,
         );
@@ -1290,19 +1306,37 @@ mod tests {
         assert_eq!(
             refusals[0],
             CliError::UnsupportedUrl {
-                url: "https://example.test/stream.mp3".to_owned(),
-                scheme: "https".to_owned(),
+                url: "ftp://example.test/stream.mp3".to_owned(),
+                scheme: "ftp".to_owned(),
             }
             .to_string(),
             "the refusal must be the command line's own wording"
         );
         // The command line refuses the same argument with the same words.
         assert_eq!(
-            parse_args(&["https://example.test/stream.mp3"]),
+            parse_args(&["ftp://example.test/stream.mp3"]),
             Err(CliError::UnsupportedUrl {
-                url: "https://example.test/stream.mp3".to_owned(),
-                scheme: "https".to_owned(),
+                url: "ftp://example.test/stream.mp3".to_owned(),
+                scheme: "ftp".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn a_hand_over_carries_an_https_url_too() {
+        let mut refusals = Vec::new();
+        let location = forwarded_location(
+            Some(MediaLocation::Url(
+                "https://example.test/stream.mp3".to_owned(),
+            )),
+            &mut refusals,
+        );
+        assert!(refusals.is_empty(), "{refusals:?}");
+        assert_eq!(
+            location,
+            Some(MediaLocation::Url(
+                "https://example.test/stream.mp3".to_owned()
+            ))
         );
     }
 

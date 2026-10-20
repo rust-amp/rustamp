@@ -476,8 +476,11 @@ day. Only S16 was not.
 
 ## Decisions Needed
 
-1. **URL support:** which schemes? `http` only (the decoder refuses `https`
-   by name - there is no TLS in this tree), or `https` too?
+1. **URL support:** which schemes? — **decided 2026-10-20: `http` and
+   `https`.** `https` is our own extension (S19 records only the reference's
+   plain HTTP stream); TLS is implemented with the OS trust store and typed
+   certificate refusals, never a fallback to plain HTTP. Every other scheme is
+   refused by name.
 2. **Plugin Approval:** auto-approve signed plugins? Manual only?
 3. **Installer:** NSIS or MSI? (the portable ZIP exists; code signing is
    decided **no** for 0.1.0)

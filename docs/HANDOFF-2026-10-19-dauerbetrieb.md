@@ -232,10 +232,71 @@ Two environment lessons: a **full C: drive** produced a false test failure (the
 same run passed at 529/0 once space was free), and a `Copy-Item` that preserves
 mtime makes cargo skip a rebuild, so mutation proofs need a fresh mtime.
 
-## In flight after 2026-10-20
+## 2026-10-20 (evening): identity, `https`, and two VM runs
 
-`wave297` (S15 in the engine), `wave319` (the URL branch in the engine),
-`wave320` (IPC framing under short reads and writes).
+**Identity (owner decision).** Our software is Rustamp, and it must not claim to
+be another product. Two strings did exactly that and are gone:
+
+| Was | Now |
+|---|---|
+| `User-Agent: Winamp/2.95` (`http_source.rs`) | `Rustamp/<this build's package version>` (`concat!("Rustamp/", env!("CARGO_PKG_VERSION"))`) |
+| shell ProgIDs `Winamp.File` / `.PlayList` / `.SkinZip`, directory verbs `Winamp.Play` / `.Enqueue` / `.Bookmark` | `Rustamp.*` |
+
+The ProgID change is a **deliberate deviation from S13 section 3** and is
+documented where it lives: a player must not claim another product's ProgIDs,
+and writing them collides with a real Winamp installation (the extension
+associations then point at whichever program wrote last). The shell integration
+is unaffected, because we write both the ProgID tree and the extension
+associations.
+
+**Kept on purpose, and why** - these are contract, not branding:
+
+- the window classes (`Winamp v1.x`, `Winamp EQ`, `Winamp PE`, `Winamp MB`,
+  `Winamp Video`, `Winamp Gen`), the `winampGet*` export names and the
+  `WinampIpc` message: plug-ins and external tools *find* us through them;
+- the file formats: `winamp.ini`, the `[Winamp]` section, the `.eqf` magic
+  (`Winamp EQ library file v1.1`), the `winamp` prefix in playlist sniffing;
+- descriptive labels that name the **source** we import ("Winamp 2.95
+  configuration", the "Winamp configuration" file filter).
+
+The window title and the About box already said "Rustamp".
+
+**`https` is supported** (owner decision; S19 records only the reference's plain
+HTTP, so TLS is **our own extension**, documented in `tls.rs`, `http_source.rs`
+and `CONTRACT_NOTES.md`). Implementation: `rustls` 0.23 with the `ring` provider
+(no async runtime, no OpenSSL, no NASM) and `rustls-platform-verifier` for the
+**OS trust store** - not `rustls-native-certs`, whose Windows path opens only
+the CurrentUser\ROOT store and would refuse every real connection. Certificate
+policy: the OS store by default, `TlsAnchors::only(..)` for a private authority,
+typed refusals (`UnknownIssuer`, `BadSignature`, `Expired`, `NotValidYet`,
+`NotValidForName`, `Revoked`, `InvalidPurpose`), **never** a fallback to plain
+HTTP. Request shape: 443 by default, SNI from the host name (an address literal
+is not a name), **origin form** request line (direct to origin; the absolute form
+is the proxy form), `Host:` names the port only when it is not 443. The licence
+inventory was regenerated: 359 package versions, audit OK.
+
+**VM runs (interactive session 1, never session 0).**
+
+- `--ignored`: **24 ran, 0 failed, 3 blocked.** All of group A (VM GUI), B (real
+  processes), C (resident fixtures) and D (i686 DLL acceptance - the real 32-bit
+  `in_openmpt.dll` loads, plays and quits; a general-purpose DLL answers from its
+  own code; a DSP plug-in changes audio through the bridge) pass. Blocked:
+  `base291` pixel acceptance (the **reference captures are missing on the host**:
+  `D:\code\rustamp-testcaptures\base291\session-proof.json` plus 22 files) and the
+  two audio-endpoint tests (Hyper-V redirection / VB-Cable).
+- full suite: **159 test binaries, 0 failures.**
+
+Merged after the ledger above: `4207ccf` (ProgIDs), `b7f02a0` (User-Agent),
+`7ac57ee` (wave325 - the stream phase chain and counters reach the user through
+the note path plus a transient status entry), `74705f5` (wave327 - one print rule
+for notes, so a `--null` run is no longer silent), `20e0ea1` (wave330 - `https`).
+
+## In flight after 2026-10-20 (evening)
+
+`wave328` (panic guard for the decoder's read path), `wave329` (scheme
+validation at entry), and four property waves on freshly merged code: `wave331`
+(TLS), `wave332` (`winamp.ini` import), `wave333` (S20 extractor), `wave334`
+(stream status).
 
 ## Rules added to `AGENTS.md` during the session
 

@@ -383,9 +383,9 @@ impl App {
     ///
     /// * an `http://` URL that names a host is a **stream** (S19 §1: the
     ///   request template is plain `http://`) and reaches the queue as a
-    ///   URL track;
-    /// * a **scheme this build cannot read** (`https://` for instance — there
-    ///   is no TLS, and S19 §6 question 8 establishes no evidence for it) is
+    ///   URL track; an `https://` one is a stream too, as this build's own
+    ///   extension (S19 §6 question 8 leaves the other schemes open);
+    /// * a **scheme this build cannot read** (`ftp://` for instance) is
     ///   **refused in the dialog**: the dialog stays open, the text stays,
     ///   the reason is shown (the command line's own wording) and nothing
     ///   reaches the queue. Without this the face would queue a track that
@@ -2073,14 +2073,35 @@ mod tests {
     }
 
     #[test]
-    fn an_https_url_is_refused_in_the_location_dialog() {
-        // S19 §6 question 8: the request template is plain `http://`, so
-        // there is no evidence for `https` and this build has no TLS. The
-        // face refuses the entry instead of queueing a track that only the
-        // decoder would refuse, much later, at open time.
+    fn an_https_url_reaches_the_queue_from_the_location_dialog() {
+        // `https` is our own extension (S19 §6 question 8 leaves the other
+        // schemes open), and the face reads its field with the command line's
+        // one rule: an `https://` URL that names a host is a stream, and it
+        // reaches the queue as a URL track - never as a file path, and never
+        // refused only later by the decoder at open time.
         let mut app = test_app();
         open_location_face(&mut app);
-        let url = "https://example.test/stream.mp3";
+        let url = "https://127.0.0.1/stream.mp3";
+        assert!(app.dialog_text(url));
+
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        assert!(!app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+        assert_eq!(app.engine().queue(), &[TrackSource::Url(url.to_owned())]);
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn a_scheme_the_player_cannot_read_keeps_the_dialog_open() {
+        // A scheme that is not ours to read (`ftp://`) is refused before
+        // anything is queued: the face refuses the entry instead of queueing a
+        // track that only the decoder would refuse, much later, at open time.
+        let mut app = test_app();
+        open_location_face(&mut app);
+        let url = "ftp://example.test/stream.mp3";
         assert!(app.dialog_text(url));
 
         assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
@@ -2114,7 +2135,7 @@ mod tests {
         // not against a literal.
         let mut app = test_app();
         open_location_face(&mut app);
-        let url = "https://example.test/stream.mp3";
+        let url = "ftp://example.test/stream.mp3";
         app.set_media_text(url);
         assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
 
@@ -2127,8 +2148,8 @@ mod tests {
 
     #[test]
     fn every_other_scheme_is_refused_in_the_location_dialog() {
-        // S19 §6 question 8 asks about the other schemes too, and the answer
-        // is the same: only `http://` is read.
+        // S19 §6 question 8 asks about the other schemes too: `http` and
+        // `https` are read, and everything else is refused.
         let mut app = test_app();
         open_location_face(&mut app);
         for url in [
