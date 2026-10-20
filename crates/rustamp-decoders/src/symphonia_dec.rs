@@ -63,7 +63,7 @@ use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTagKey};
 use symphonia::core::probe::Hint;
-use symphonia::core::units::Time;
+use symphonia::core::units::{Time, TimeBase};
 
 /// Consecutive undecodable packets tolerated before giving up.
 const MAX_CONSECUTIVE_ERRORS: u32 = 512;
@@ -97,6 +97,9 @@ const EXTENSIONS: &[&str] = &[
     "mp3", "mp2", "mp1", "flac", "ogg", "oga", "opus", "wav", "wave", "aif", "aiff", "aifc", "caf",
     "m4a", "m4b", "mp4", "aac", "mkv", "mka",
 ];
+
+/// The signature of an EBML file, and so of a Matroska or WebM file.
+const EBML_MAGIC: &[u8] = &[0x1A, 0x45, 0xDF, 0xA3];
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -134,7 +137,7 @@ fn sniff_content(h: &[u8]) -> bool {
         || h.starts_with(b"fLaC")
         || h.starts_with(b"OggS")
         || h.starts_with(b"caff")
-        || h.starts_with(&[0x1A, 0x45, 0xDF, 0xA3])
+        || h.starts_with(EBML_MAGIC)
         || (h.len() >= 12 && &h[0..4] == b"RIFF" && &h[8..12] == b"WAVE")
         || (h.len() >= 12 && &h[0..4] == b"FORM" && (&h[8..12] == b"AIFF" || &h[8..12] == b"AIFC"))
         || (h.len() >= 8 && &h[4..8] == b"ftyp")
@@ -283,6 +286,12 @@ struct HeaderProbe {
     /// the pages of the file are walked to find it. The walk is read from
     /// the file itself: an Ogg file has no header that states its payload.
     ogg: Option<crate::ogg_header::OggPages>,
+    /// Whether the file is a Matroska (or WebM) file.
+    ///
+    /// A Matroska file states its duration in the units of its timestamp
+    /// scale and not in frames, so its frame count is a conversion (see
+    /// [`container_frames`]).
+    matroska: bool,
 }
 
 /// The byte claim of a container: how many bytes the payload occupies and how
@@ -382,6 +391,13 @@ fn declared_payload(
     // end-of-stream flag (see [`ogg_truncation`]), and the check is explicit
     // here, so that no other header of an Ogg file can make one up.
     if header.ogg.is_some() {
+        return None;
+    }
+    // A Matroska file states the duration of its segment in the units of its
+    // timestamp scale - a millisecond by default - and no byte count of its
+    // audio at all, so it states no exact payload: it is no oracle. The check
+    // is explicit here, so that no header of a Matroska file can make one up.
+    if header.matroska {
         return None;
     }
     // AIFF: the `COMM` chunk states the number of sample frames and the
@@ -486,6 +502,7 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
             mp4: None,
             flac: None,
             ogg: None,
+            matroska: false,
         };
     }
     let id3v2 = crate::mpeg_header::id3v2_len(&head);
@@ -497,6 +514,7 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
             mp4: None,
             flac: None,
             ogg: None,
+            matroska: false,
         };
     }
     let mut window = vec![0u8; HEADER_WINDOW];
@@ -539,6 +557,9 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
     } else {
         None
     };
+    // A Matroska file states its duration in the units of its timestamp
+    // scale, so its frame count is a conversion (see `container_frames`).
+    let matroska = window.starts_with(EBML_MAGIC);
     HeaderProbe {
         id3v2,
         window,
@@ -546,7 +567,43 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
         mp4,
         flac,
         ogg,
+        matroska,
     }
+}
+
+/// The frame a timestamp of the container points at.
+///
+/// The timestamps of a stream are counted in the units of its time base, and
+/// the time base is not always the frame rate: a Matroska file counts its
+/// timestamps in the units of its timestamp scale (a millisecond by default),
+/// while the decoder counts frames. The conversion is exact integer
+/// arithmetic, so a container whose time base is the frame rate (every other
+/// container this crate reads) is left alone.
+///
+/// A stream without a time base counts its timestamps in frames.
+fn frame_of(ts: u64, time_base: Option<TimeBase>, rate: u32) -> u64 {
+    let Some(time_base) = time_base.filter(|_| rate > 0) else {
+        return ts;
+    };
+    let frames = (ts as u128)
+        .saturating_mul(u128::from(time_base.numer))
+        .saturating_mul(u128::from(rate))
+        / u128::from(time_base.denom);
+    u64::try_from(frames).unwrap_or(u64::MAX)
+}
+
+/// The number of frames the container states.
+///
+/// A Matroska file states the duration of its segment in the units of its
+/// timestamp scale, and the container reader reports that count as the frame
+/// count. The two are not the same thing: the count is a number of ticks,
+/// and the frame count is that number of ticks at the rate of the track.
+fn container_frames(header: &HeaderProbe, params: &CodecParameters) -> Option<u64> {
+    if !header.matroska {
+        return params.n_frames;
+    }
+    let ticks = params.n_frames?;
+    Some(frame_of(ticks, params.time_base, params.sample_rate?))
 }
 
 /// The message for a file that ends before the media data box says it does.
@@ -724,11 +781,18 @@ pub struct SymphoniaDecoder {
     /// The number of samples the container's timestamps are ahead of the
     /// audio.
     ///
-    /// The timestamps of an Ogg Opus stream count the pre-skip samples - the
+    /// The timestamps of an Opus stream count the pre-skip samples - the
     /// encoder's look-ahead, which the codec drops (see
     /// [`crate::opus_dec`]). A seek has to ask for the timestamp of the
     /// sample, not the one of the audio before it.
     ts_offset: u64,
+    /// The time base of the container's timestamps.
+    ///
+    /// The timestamps of a stream are counted in the units of its time base,
+    /// and the time base is not always the frame rate: a Matroska file counts
+    /// its timestamps in the units of its timestamp scale (a millisecond by
+    /// default), while the decoder counts frames (see [`frame_of`]).
+    time_base: Option<TimeBase>,
     /// A truncation found at the end of the stream.
     ///
     /// Reported by the next `read` that writes no frames, so the frames that
@@ -819,7 +883,14 @@ impl SymphoniaDecoder {
             .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
             .ok_or_else(|| Error::UnsupportedFormat("no decodable audio track".into()))?;
         let track_id = track.id;
-        let params = track.codec_params.clone();
+        let mut params = track.codec_params.clone();
+        // The Matroska mapping states the channel count of an Opus track as a
+        // channel layout and not as a count, so the parameters of the track
+        // are completed from the identification header it carries before the
+        // codec is built (see `opus_dec::complete_parameters`).
+        if params.codec == CODEC_TYPE_OPUS {
+            crate::opus_dec::complete_parameters(&mut params);
+        }
         let codec = crate::opus_dec::codec_registry()
             .make(&params, &DecoderOptions::default())
             .map_err(open_err)?;
@@ -837,12 +908,15 @@ impl SymphoniaDecoder {
         }
 
         // The frame count the container states is not always the number of
-        // audio frames: the Ogg Opus granule counts the pre-skip samples
-        // (see `opus_dec::audio_frames`).
-        let is_ogg = header.ogg.is_some();
-        // The timestamps of an Ogg Opus stream count the pre-skip samples, so
-        // they are ahead of the audio by exactly that many samples.
-        let ts_offset = if is_ogg && params.codec == CODEC_TYPE_OPUS {
+        // audio frames: the count of a Matroska file is a number of ticks
+        // (see `container_frames`) and the Ogg Opus granule counts the
+        // pre-skip samples (see `opus_dec::audio_frames`).
+        //
+        // The timestamps of an Opus stream count the pre-skip samples, so
+        // they are ahead of the audio by exactly that many samples. Both
+        // mappings that carry an Opus stream count them: the granule of an
+        // Ogg stream and the block timestamps of a Matroska file.
+        let ts_offset = if params.codec == CODEC_TYPE_OPUS {
             crate::opus_dec::pre_skip(params.extra_data.as_deref()) as u64
         } else {
             0
@@ -853,7 +927,7 @@ impl SymphoniaDecoder {
             codec,
             track_id,
             spec: AudioSpec::new(params.sample_rate.unwrap_or(0), 0),
-            n_frames: crate::opus_dec::audio_frames(&params, is_ogg),
+            n_frames: crate::opus_dec::audio_frames(&params, container_frames(&header, &params)),
             sample_buf: None,
             pending: Vec::new(),
             pending_pos: 0,
@@ -863,6 +937,7 @@ impl SymphoniaDecoder {
             declared: declared_payload(&header, &params, byte_len),
             ogg: header.ogg,
             ts_offset,
+            time_base: params.time_base,
             truncation: None,
             skipped: 0,
             consecutive_errors: 0,
@@ -956,11 +1031,17 @@ impl SymphoniaDecoder {
             }
             // After a seek, drop the frames before the target. Buffers are aligned by their
             // end timestamp because codecs with overlap (Vorbis, MP3, AAC) return short
-            // buffers right after a reset.
+            // buffers right after a reset. A container that states no duration for its
+            // packets (Matroska) leaves the buffer at the timestamp of the packet.
             let mut skip = 0;
             if let Some(target) = self.seek_target {
-                let end = packet.ts().saturating_add(packet.dur());
-                let start = end.saturating_sub(decoded.frames() as u64);
+                let ts = frame_of(packet.ts(), self.time_base, self.spec.sample_rate);
+                let end = ts.saturating_add(frame_of(
+                    packet.dur(),
+                    self.time_base,
+                    self.spec.sample_rate,
+                ));
+                let start = end.saturating_sub(decoded.frames() as u64).max(ts);
                 skip = target.saturating_sub(start) as usize;
                 if end > target {
                     self.seek_target = None;
@@ -1124,7 +1205,7 @@ impl Decoder for SymphoniaDecoder {
         // Seek slightly early and discard the lead-in: overlapping transforms (MP3, Vorbis,
         // AAC) need previous blocks to reconstruct the first samples exactly.
         let pre = target_frames.min(SEEK_PREROLL_FRAMES);
-        // The container's timestamps can be ahead of the audio (the Ogg Opus
+        // The container's timestamps can be ahead of the audio (the Opus
         // timestamps count the pre-skip samples), so the target is asked for
         // in the container's timeline.
         let from = (target_frames + self.ts_offset).saturating_sub(pre);
@@ -1154,7 +1235,10 @@ impl Decoder for SymphoniaDecoder {
         // A seek restarts the packet walk, so a change detected before it is
         // stale; the format of the reopened position is what matters.
         self.pending_format_change = None;
-        self.seek_target = Some(seeked.required_ts + pre);
+        // The timestamp the container reports is in its own units, so it is
+        // turned into frames before it is compared with the decoded ones.
+        let required = frame_of(seeked.required_ts, self.time_base, self.spec.sample_rate);
+        self.seek_target = Some(required + pre);
         // After a seek the stream is read from the target, so the frames still
         // to come are counted from there and the declared count is what is
         // left of it. A seek that lands before the target only makes the
@@ -1163,8 +1247,7 @@ impl Decoder for SymphoniaDecoder {
         self.delivered = 0;
         self.truncation = None;
         if let Some(declared) = &mut self.declared {
-            let target = seeked.required_ts.saturating_add(pre);
-            declared.frames = declared.frames.saturating_sub(target);
+            declared.frames = declared.frames.saturating_sub(required + pre);
         }
         Ok(self.spec.duration_of(target_frames))
     }
@@ -1403,6 +1486,7 @@ mod tests {
                 mp4: None,
                 flac: None,
                 ogg: None,
+                matroska: false,
             },
             &params,
             Some(4096),
@@ -1427,6 +1511,7 @@ mod tests {
                     mp4: None,
                     flac: None,
                     ogg: None,
+                    matroska: false,
                 },
                 &params,
                 Some(4096)
@@ -1446,6 +1531,7 @@ mod tests {
                     mp4: None,
                     flac: Some(crate::flac_header::FlacMetadata::Complete { stream_info: true }),
                     ogg: None,
+                    matroska: false,
                 },
                 &params,
                 Some(4096)
@@ -1480,6 +1566,7 @@ mod tests {
             mp4: None,
             flac: Some(crate::flac_header::FlacMetadata::Complete { stream_info: true }),
             ogg: None,
+            matroska: false,
         };
         assert!(
             declared_payload(&header, &params, Some(12_537)).is_none(),
@@ -1506,6 +1593,7 @@ mod tests {
             mp4: None,
             flac: None,
             ogg: None,
+            matroska: false,
         };
 
         let mut params = CodecParameters::new();
