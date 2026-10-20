@@ -52,6 +52,12 @@
 //!   a separator in it, or one that names the directory above the target -
 //!   is refused: the extraction writes inside the target directory and
 //!   nowhere else;
+//! * two tracks whose **final** file names - the rendered name with the
+//!   extension of the source - are the same are reported, not written over
+//!   each other: the first track of the selection keeps the name and the
+//!   second one is an error. The rendered names alone cannot decide this,
+//!   because the extension is what makes the name a playable file and it is
+//!   added after the plan compared them;
 //! * the number in `Error extracting track #N` is the position of the track
 //!   in the selection, counted from one.
 //!
@@ -73,12 +79,13 @@
 //! `rustamp_platform::ask_extract_settings`), and the **selection** is the
 //! library window's own (see [`crate::library_window`]).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rustamp_core::playlist::MediaLocation;
 use rustamp_library::{
-    OVERWRITE_PROMPT, OverwriteAnswer, PathTemplate, PlannedFile, PlaylistAction, TrackRow,
-    choose_playlist_action, extracted_message,
+    ExtractError, ExtractErrorReason, OVERWRITE_PROMPT, OverwriteAnswer, PathTemplate, PlannedFile,
+    PlaylistAction, TrackRow, choose_playlist_action, extracted_message,
 };
 use rustamp_platform::ExtractSettings;
 use rustamp_playlist::{LoadedEntry, PlaylistFormat, write_playlist};
@@ -213,15 +220,26 @@ pub fn extract(
         .map(|error| (error.number, error.to_string()))
         .collect();
     let mut written: Vec<PathBuf> = Vec::new();
+    // The final names the extraction writes, with the extension of the source
+    // carried. The plan decides on the rendered names, so two tracks whose
+    // rendered names differ only by the extension they end up carrying would
+    // write the same file: the first track of the selection keeps the name
+    // and the second one is reported, never written over silently.
+    let mut taken: BTreeSet<PathBuf> = BTreeSet::new();
     for file in &plan.files {
         let number = number_in(rows, file.track_id);
-        let Some(relative) = relative_path(file) else {
-            errors.push((
+        let relative = final_path(file);
+        if !taken.insert(relative.clone()) {
+            let error = ExtractError {
+                track_id: file.track_id,
                 number,
-                format!("Error extracting track #{number}: the path leaves the target directory"),
-            ));
+                reason: ExtractErrorReason::DuplicatePath {
+                    path: relative.display().to_string(),
+                },
+            };
+            errors.push((number, error.to_string()));
             continue;
-        };
+        }
         match copy_into(&file.source, &settings.directory.join(&relative)) {
             Ok(()) => written.push(relative),
             Err(error) => errors.push((
@@ -268,35 +286,19 @@ fn names_a_file(template: &PathTemplate) -> bool {
         .is_some_and(|segment| !segment.parts().is_empty())
 }
 
-/// The path of a planned file, relative to the target directory.
+/// The path a planned file is written to, relative to the target directory.
 ///
-/// `None` when the rendered path would leave the target directory: a segment
-/// with a separator in it (a tag can carry one) or one that names the
-/// directory above the target.
-fn relative_path(file: &PlannedFile) -> Option<PathBuf> {
-    let (name, directories) = file.path.segments.split_last()?;
-    let mut relative = PathBuf::new();
-    for segment in directories {
-        if !is_safe_segment(segment) {
-            return None;
-        }
-        relative.push(segment);
-    }
-    if !is_safe_segment(name) {
-        return None;
-    }
-    relative.push(file_name(file));
-    Some(relative)
-}
-
-/// Whether a rendered segment can be a directory or a file name.
-///
-/// A segment comes from the template and from the tags of the track, so it
-/// can carry a separator (`..\..`) or a name that points above the target
-/// directory. The extraction writes inside the target directory and nowhere
-/// else, so such a segment is refused.
-fn is_safe_segment(segment: &str) -> bool {
-    !segment.is_empty() && segment != "." && segment != ".." && !segment.contains(['/', '\\', ':'])
+/// The rendered name of the template carries the extension of the source file
+/// (see [`file_name`]); the directories are the rendered segments. The plan
+/// refuses a path that leaves the target directory, so a planned file always
+/// has a relative path.
+fn final_path(file: &PlannedFile) -> PathBuf {
+    let mut path = file
+        .path
+        .relative_path()
+        .expect("the plan only hands out paths inside the target directory");
+    path.set_file_name(file_name(file));
+    path
 }
 
 /// The name of the copied file: the rendered name with the extension of the
