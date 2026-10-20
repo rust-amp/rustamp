@@ -7,6 +7,8 @@
 //!
 //! ```text
 //! rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
+//!        [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>]
+//!        [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 //! ```
 //!
 //! With `--null` the app uses the deterministic null output and runs
@@ -15,14 +17,25 @@
 //! window (silent windowed playback, no audio device needed); with the default
 //! output it opens the main window and plays on the best device for the host.
 //!
-//! # Single instance (task card F2)
+//! # The registration step (S13 §1)
+//!
+//! Before the player starts, the command line decides what happens to the
+//! shell registration (the verbs a drop from Explorer offers, S13 §3):
+//! `/INSTALL` writes it, `/UNREG` removes it, `/NOREG` skips the step and
+//! `/ONLYINSTALL` writes it and ends the run right there. A failed write is a
+//! warning, never a reason to stop the music — except for `/ONLYINSTALL`,
+//! where the registration is the whole job.
+//!
+//! # Single instance (task card F2, S13 §2)
 //!
 //! A windowed launch (the default output or `--no-audio`) first claims the
-//! single-instance lock ([`rustamp_platform::single_instance`]). The first
-//! instance holds it and listens for forwarded command lines for its whole
-//! life; a second launch forwards its command line to the running player and
-//! exits without opening a second window. `--null` is the headless test mode
-//! and never claims the lock, so a test can run beside a normal player.
+//! single-instance lock ([`rustamp_platform::single_instance`]). The instance
+//! is the **window class** — `Winamp v1.x` by default, `/CLASS=<name>` when
+//! the command line says otherwise (S13 §2). The first instance holds the lock
+//! and listens for forwarded command lines for its whole life; a second launch
+//! forwards its command line to the running player and exits without opening a
+//! second window. `--null` is the headless test mode and never claims the
+//! lock, so a test can run beside a normal player.
 //!
 //! # Global hotkeys (task card F3)
 //!
@@ -37,8 +50,9 @@
 
 use std::process::ExitCode;
 
-use rustamp_app::cli::{self, OutputChoice, USAGE};
+use rustamp_app::cli::{self, Bookmark, OutputChoice, USAGE};
 use rustamp_platform::HotkeySession;
+use rustamp_platform::shell_registration::{self, RegistrationError, RegistrationStep};
 use rustamp_platform::single_instance::{self, Claim, ForwardRequest, HandOff};
 
 fn main() -> ExitCode {
@@ -55,6 +69,31 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // S13 §1: the registration step comes before the player starts, and
+    // `/ONLYINSTALL` ends the run right after it.
+    match shell_registration::registration_step(args.registration) {
+        RegistrationStep::Skip => {}
+        RegistrationStep::Install => {
+            if let Err(error) = install_registration() {
+                eprintln!("rustamp: {error}");
+            }
+        }
+        RegistrationStep::Uninstall => {
+            if let Err(error) = shell_registration::uninstall() {
+                eprintln!("rustamp: {error}");
+            }
+        }
+        RegistrationStep::InstallAndExit => {
+            return match install_registration() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("rustamp: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
+
     // `--null` is the headless test mode: it never participates in the
     // single-instance protocol (no window, no config-derived instance) and
     // registers no hotkeys. Every other output mode is a real player and
@@ -63,9 +102,12 @@ fn main() -> ExitCode {
         return run_player(args, None, None);
     }
 
-    // The key follows the resolved config path, so two normal launches share
-    // one instance while tests with their own `RUSTAMP_CONFIG` never collide.
-    let key = single_instance::instance_key(rustamp_app::config::default_path().as_deref());
+    // The instance is the window class (S13 §2) and the configuration: the
+    // class is what `/CLASS=` overrides, the configuration keeps two normal
+    // launches in one instance while tests with their own `RUSTAMP_CONFIG`
+    // never collide.
+    let config_path = args.resolved_config_path();
+    let key = single_instance::instance_key(args.instance_class(), config_path.as_deref());
     match single_instance::claim(&key) {
         Claim::First(instance) => {
             // The session thread registers the default global hotkeys for the
@@ -78,6 +120,13 @@ fn main() -> ExitCode {
         }
         Claim::AlreadyRunning => forward(&key, &args),
     }
+}
+
+/// Writes the shell registration (S13 §1, `/INSTALL`).
+fn install_registration() -> Result<(), RegistrationError> {
+    let exe =
+        std::env::current_exe().map_err(|error| RegistrationError::Path(error.to_string()))?;
+    shell_registration::install(&exe)
 }
 
 /// Runs the player, keeping `instance` (when present) and the hotkey `session`
@@ -126,7 +175,9 @@ fn forward(key: &str, args: &cli::Args) -> ExitCode {
 ///
 /// A file and an initial volume still make sense; the output mode, the skin and
 /// the `--seconds` test aid were chosen when the first instance started, so
-/// they become refusals.
+/// they become refusals. A file that is only **added** (`--enqueue`, S13 §1's
+/// `/BOOKMARK`) travels as such, so the running instance does not start
+/// playing it.
 fn forward_request(args: &cli::Args) -> ForwardRequest {
     let mut refusals = Vec::new();
     if args.output == OutputChoice::NoAudio {
@@ -143,8 +194,37 @@ fn forward_request(args: &cli::Args) -> ForwardRequest {
             "--seconds is ignored: it is a start-up test aid on the running instance".to_owned(),
         );
     }
+    // The bookmark: a path that is added and not played (S13 §1). A bookmark
+    // without a path is left open by S13 §5.3, so it is reported rather than
+    // guessed.
+    let mut added = match &args.bookmark {
+        Some(Bookmark::Path(path)) => Some(path.clone()),
+        Some(Bookmark::WithoutPath) => {
+            refusals.push(
+                "/BOOKMARK without a path is not defined (S13 §5.3); nothing was bookmarked"
+                    .to_owned(),
+            );
+            None
+        }
+        None => None,
+    };
+    // `--enqueue` means the file is added and not played. Only one path can
+    // travel that way, so the file wins and the bookmark is reported.
+    let file = if args.enqueue {
+        if let Some(bookmark) = added.take() {
+            refusals.push(format!(
+                "/BOOKMARK {} was not forwarded: only one path can be added without playing it",
+                bookmark.display()
+            ));
+        }
+        added = args.file.clone();
+        None
+    } else {
+        args.file.clone()
+    };
     ForwardRequest {
-        file: args.file.clone(),
+        file,
+        added,
         volume: args.volume,
         refusals,
     }

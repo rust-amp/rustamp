@@ -131,3 +131,25 @@ what was implemented before the spec existed.
 Files and line counts; the design and why; own-choice vs spec-settled; the test
 list and what still needs the VM; the stale-instance story; the
 `window.rs` boundary note; fmt/clippy/build results.
+
+## Reconciliation with S13 (2026-10-20)
+
+S13 is audited now, so the own choices above were re-checked against it. The
+card's text stays as the record of what was implemented before the spec
+existed; this section says what the spec settled and what the implementation
+looks like now. The conformance table itself lives in the module docs:
+`crates/rustamp-app/src/cli.rs` (the command line) and
+`crates/rustamp-platform/src/shell_registration.rs` (the shell verbs).
+
+| S13 fact | What changed |
+|---|---|
+| §1 the seven switches `/CLASS=`, `/CONFIG=`, `/BOOKMARK`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL` | They are parsed in `crates/rustamp-app/src/cli.rs`, spelled exactly as the spec records them. The Rustamp-only switches keep their `--` spelling, so the reference's `/` family stays exactly the spec's list. |
+| §1 an unknown `/` token is a file argument | The parser follows the spec: `/ADD`, `/PLAY`, `/NEW`, `/EJECT` and `/TASKBAR` are file arguments, not errors. |
+| §2 the class the single-instance check looks for | The instance key is now derived from the **window class** (`Winamp v1.x` by default, S09 §1 and §8 item 1) and the configuration path. `/CLASS=` reaches the check, and the class name is not case-folded (S13 §2). The configuration half stays this card's own choice: it keeps the tests with their own `RUSTAMP_CONFIG` apart. |
+| §2 the hand-over is a window message | Unchanged: the pipe is the channel. Which message the reference uses is open (S13 §5.8), so the pipe stays an own choice. |
+| §3 the shell verbs | New module `crates/rustamp-platform/src/shell_registration.rs`: the model of the verb table (four verbs per media and playlist file, one per skin archive, two per directory) plus the `DropTarget` keys under `Play` and `Enqueue`. The Win32 write is VM-only. |
+| §1 `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL` | They drive the registration step in `crates/rustamp-app/src/main.rs`. `/ONLYINSTALL` writes the registration and ends the run; `/NOREG` skips the step; `/UNREG` removes it. |
+| §1 `/BOOKMARK <path>` adds rather than plays | The path is added to the playlist without starting playback. The bookmark store does not exist yet (RFC 0005 O12), so the run says so. A `/BOOKMARK` in a **second** launch travels in the hand-off frame (protocol 2) and is added, not played. |
+| §1 `/CONFIG=<path>` | The configuration file replaces the resolved default. |
+| §5 the open questions | All twelve stay open; the own choices that touch them are named in the module docs. |
+

@@ -121,6 +121,7 @@ pub mod winamp_ini;
 pub mod window;
 
 use rustamp_core::command::Command;
+use rustamp_core::playlist::MediaLocation;
 
 use crate::app::{App, AppOptions};
 use crate::cli::OutputChoice;
@@ -161,8 +162,39 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         window::ensure_gui_allowed()?;
     }
 
+    // ----- what the command line asks for -----
+    // `/BOOKMARK <path>` adds the path and does not play it (S13 §1), and
+    // `--enqueue` does the same for the file argument. The bookmark store
+    // does not exist yet (RFC 0005 O12), so the path is added to the
+    // playlist and the run says so.
+    let mut added: Vec<MediaLocation> = Vec::new();
+    let mut bookmarked = false;
+    match &args.bookmark {
+        Some(cli::Bookmark::Path(path)) => {
+            added.push(MediaLocation::File(path.clone()));
+            bookmarked = true;
+            eprintln!(
+                "rustamp: the bookmark store does not exist yet (RFC 0005 O12): {} was added to \
+                 the playlist instead",
+                path.display()
+            );
+        }
+        Some(cli::Bookmark::WithoutPath) => eprintln!(
+            "rustamp: /BOOKMARK without a path is not defined (S13 §5.3); nothing was bookmarked"
+        ),
+        None => {}
+    }
+    // The file plays unless it is only to be added.
+    let plays = args.file.is_some() && !args.enqueue;
+    if args.enqueue
+        && let Some(file) = &args.file
+    {
+        added.push(MediaLocation::File(file.clone()));
+    }
+
     // ----- configuration -----
-    let config_path = config::default_path();
+    // `/CONFIG=` replaces the default path (S13 §1).
+    let config_path = args.resolved_config_path();
     // The error is returned, not printed here: the caller (`main`) prints it
     // once, so a config failure is not reported twice.
     let loaded = config::load(config_path.as_deref())?;
@@ -192,7 +224,9 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         skin: loaded_skin,
         output: args.output,
         volume,
-        file: args.file.clone(),
+        // A file that is only added must not replace the queue, so it is not
+        // handed to the app as the file to play.
+        file: if plays { args.file.clone() } else { None },
         seconds: args.seconds,
     };
     // The device is built here, on the thread that calls `window::run` below.
@@ -206,7 +240,13 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     for warning in &loaded.warnings {
         app.note(warning.clone());
     }
-    // Start the plugin host when it is resolvable (see `crate::supervise`):
+    if bookmarked {
+        app.note(
+            "the bookmark store does not exist yet (RFC 0005 O12): the path was added to the \
+             playlist instead"
+                .to_owned(),
+        );
+    } // Start the plugin host when it is resolvable (see `crate::supervise`):
     // best-effort by contract, so a missing binary only means the player runs
     // detached — it never fails startup and never opens a window. The host
     // reads the operator's approval decisions from the store beside the
@@ -240,10 +280,14 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         // ----- headless test mode: no window -----
         OutputChoice::Null => {
             println!("rustamp: output null (headless; no window)");
-            if args.file.is_some() {
-                app.submit(Command::Play)?;
+            // The headless loop plays the queue to its end. When the command
+            // line only asked for an item to be added (`--enqueue`,
+            // `/BOOKMARK`), nothing plays and the loop would wait forever.
+            let only_added = !added.is_empty() && !plays;
+            apply_startup(&mut app, plays, added)?;
+            if !only_added {
+                app.run_headless()?;
             }
-            app.run_headless()?;
             if let Err(error) = app.save_config() {
                 eprintln!("rustamp: {error}");
             }
@@ -264,11 +308,31 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
                 // run reached the windowed path without a device.
                 println!("rustamp: output null (windowed; silent, no audio device)");
             }
-            if args.file.is_some() {
-                // S02 §1: a file given on the command line starts playing.
-                app.submit(Command::Play)?;
-            }
+            apply_startup(&mut app, plays, added)?;
             window::run(app)
         }
     }
+}
+
+/// Applies what the command line asked the player to do.
+///
+/// The items that are only **added** come first (a bookmark, an enqueued
+/// file), then the playback of the file argument (S02 §1: a file given on the
+/// command line starts playing it).
+fn apply_startup(
+    app: &mut App,
+    plays: bool,
+    added: Vec<MediaLocation>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !added.is_empty() {
+        app.submit(Command::AddItems {
+            items: added,
+            at: None,
+            play: false,
+        })?;
+    }
+    if plays {
+        app.submit(Command::Play)?;
+    }
+    Ok(())
 }

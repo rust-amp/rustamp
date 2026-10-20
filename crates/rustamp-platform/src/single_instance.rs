@@ -7,6 +7,19 @@
 //! (`--volume`), and reports the flags that were fixed at the first launch
 //! (`--skin`, `--no-audio`, the `--seconds` test aid).
 //!
+//! # What the check looks for (S13 §2)
+//!
+//! The spec says the player registers a **window class**, that the class name
+//! is what `/CLASS=` overrides, and that a second start looks for a window of
+//! that class and hands its arguments over instead of opening a second
+//! player. The class name is the identity of the running instance here: the
+//! lock and the channel are named after it, so `/CLASS=` reaches the check.
+//!
+//! The default is the main window's class, `Winamp v1.x` — S09 §1 and S09 §8
+//! item 1 publish that name as an ABI fact that plugins and external tools
+//! depend on, and S13 §2 points at S09 for it. The class name is
+//! **case-sensitive** (S13 §2), so the key does not fold its case.
+//!
 //! # How the "is one running?" question is answered
 //!
 //! The lock is a **named mutex** (`Local\Rustamp.SingleInstance.<key>`). Its
@@ -22,12 +35,19 @@
 //! instance listens on for its whole life; a second instance connects, writes
 //! one length-framed [`ForwardRequest`] and exits.
 //!
+//! S13 §2 says the hand-over is a window message but does not name it
+//! (S13 §5.8), so the pipe is this implementation's own channel. What the
+//! second instance does when the first is busy is open as well (S13 §5.5); it
+//! hands over either way.
+//!
 //! # Instance key
 //!
-//! The key is derived from the resolved config path ([`instance_key`]), so two
-//! normal launches (same config) share one instance, while tests that point
-//! `RUSTAMP_CONFIG` at their own temp file never collide with each other or
-//! with a player the developer is running.
+//! The key is derived from the window class and the resolved config path
+//! ([`instance_key`]). The class is the half S13 §2 fixes; the configuration
+//! path is task card F2's own choice and keeps two normal launches (same
+//! configuration) in one instance, while tests that point `RUSTAMP_CONFIG` at
+//! their own temp file never collide with each other or with a player the
+//! developer is running.
 //!
 //! # Testing seam
 //!
@@ -55,7 +75,11 @@ pub use imp::{Claim, Instance, claim, forward};
 pub const MAGIC: [u8; 4] = *b"RSF1";
 
 /// Wire protocol version of [`ForwardRequest`].
-pub const PROTOCOL: u16 = 1;
+///
+/// Version 2 added the "added without playing" field (S13 §1: `/BOOKMARK
+/// <path>` adds the path as a bookmark rather than playing it), so a frame of
+/// version 1 is refused instead of being misread.
+pub const PROTOCOL: u16 = 2;
 
 /// Largest accepted hand-off frame, in bytes.
 ///
@@ -92,16 +116,34 @@ pub fn startup_action(state: LockState) -> StartupAction {
     }
 }
 
-/// Derives the instance key from the resolved config path.
+/// The main window's class, and the class the single-instance check looks for
+/// by default (S13 §2).
 ///
-/// The same path yields the same key (one instance per configuration); a
-/// `None` path yields a fixed fallback key. Case is folded and the result is a
-/// 64-bit FNV-1a hash in hex, so the key is a safe object-name component.
-pub fn instance_key(config_path: Option<&Path>) -> String {
-    let source = match config_path {
-        Some(path) => path.to_string_lossy().to_lowercase(),
-        None => String::from("<no-config-path>"),
-    };
+/// S09 §1 and S09 §8 item 1 publish the name as an ABI fact that plugins and
+/// external tools depend on; S13 §2 names it as the default of the check.
+/// `/CLASS=` overrides it (S13 §1).
+pub const DEFAULT_CLASS: &str = "Winamp v1.x";
+
+/// Derives the instance key from the window class and the resolved config
+/// path.
+///
+/// The class is the half S13 §2 fixes: it is the class the single-instance
+/// check looks for, it is **case-sensitive** ("The class name is a
+/// case-sensitive string"), and `/CLASS=` changes it. The configuration path
+/// is task card F2's own choice: the same path yields the same key (one
+/// instance per configuration), a `None` path yields a fixed fallback, and
+/// case is folded because Windows paths are case-insensitive.
+///
+/// The result is a 64-bit FNV-1a hash in hex, so the key is a safe
+/// object-name component.
+pub fn instance_key(class: &str, config_path: Option<&Path>) -> String {
+    let mut source = String::with_capacity(class.len() + 32);
+    source.push_str(class);
+    source.push('\0');
+    match config_path {
+        Some(path) => source.push_str(&path.to_string_lossy().to_lowercase()),
+        None => source.push_str("<no-config-path>"),
+    }
     format!("{:016x}", fnv1a_64(source.as_bytes()))
 }
 
@@ -128,14 +170,21 @@ fn pipe_name(key: &str) -> String {
 /// The command line a second launch hands to the running instance.
 ///
 /// Only the parts of the command line that can still take effect are carried:
-/// a file to enqueue and play, and an initial volume. Flags that were fixed
-/// when the first instance started (output mode, skin, the `--seconds` test
-/// aid) are listed in [`ForwardRequest::refusals`] and reported to the user by
-/// the sender rather than silently dropped.
+/// a file to play, a path to add without playing it, and an initial volume.
+/// Flags that were fixed when the first instance started (output mode, skin,
+/// the `--seconds` test aid) are listed in [`ForwardRequest::refusals`] and
+/// reported to the user by the sender rather than silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ForwardRequest {
-    /// The file to enqueue and play, if any.
+    /// The file to play, if any.
     pub file: Option<PathBuf>,
+    /// A path to add to the playlist **without** playing it, if any.
+    ///
+    /// `/BOOKMARK <path>` (S13 §1) and `--enqueue` both land here: the
+    /// reference adds a bookmark, and Rustamp has no bookmark store yet
+    /// (RFC 0005 O12), so the path is added to the playlist instead — added
+    /// rather than played, which is what S13 §1 settles.
+    pub added: Option<PathBuf>,
     /// The volume to apply (`0..=255`), if any.
     pub volume: Option<u8>,
     /// Human-readable notes for flags the running instance cannot apply.
@@ -194,13 +243,21 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Appends a length-prefixed UTF-8 path to a frame.
+fn push_path(out: &mut Vec<u8>, path: &Path) {
+    let text = path.to_string_lossy();
+    out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+    out.extend_from_slice(text.as_bytes());
+}
+
 impl ForwardRequest {
     /// Encodes the request into the hand-off wire format.
     ///
     /// Layout (all integers little-endian): `MAGIC` (4), protocol (u16), a
     /// file present flag (u8) and, if present, its length (u32) and UTF-8
-    /// bytes, a volume present flag (u8) and, if present, the byte, then a
-    /// refusal count (u16) and that many length-prefixed UTF-8 strings.
+    /// bytes, an added present flag (u8) and, if present, its length (u32)
+    /// and UTF-8 bytes, a volume present flag (u8) and, if present, the byte,
+    /// a refusal count (u16) and that many length-prefixed UTF-8 strings.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&MAGIC);
@@ -208,9 +265,14 @@ impl ForwardRequest {
         match &self.file {
             Some(path) => {
                 out.push(1);
-                let bytes = path.to_string_lossy();
-                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(bytes.as_bytes());
+                push_path(&mut out, path);
+            }
+            None => out.push(0),
+        }
+        match &self.added {
+            Some(path) => {
+                out.push(1);
+                push_path(&mut out, path);
             }
             None => out.push(0),
         }
@@ -249,6 +311,13 @@ impl ForwardRequest {
         } else {
             None
         };
+        let added = if reader.u8()? == 1 {
+            let len = reader.u32()? as usize;
+            let text = std::str::from_utf8(reader.take(len)?).map_err(|_| DecodeError::Utf8)?;
+            Some(PathBuf::from(text))
+        } else {
+            None
+        };
         let volume = if reader.u8()? == 1 {
             Some(reader.u8()?)
         } else {
@@ -263,6 +332,7 @@ impl ForwardRequest {
         }
         Ok(ForwardRequest {
             file,
+            added,
             volume,
             refusals,
         })
@@ -271,7 +341,9 @@ impl ForwardRequest {
     /// The commands the running first instance should apply, in order.
     ///
     /// The volume lands before the file, so a forwarded `--volume` is in force
-    /// when playback starts.
+    /// when playback starts. An added path is **added** and not played (S13
+    /// §1: `/BOOKMARK <path>` adds the path as a bookmark rather than playing
+    /// it).
     pub fn commands(&self) -> Vec<Command> {
         let mut commands = Vec::new();
         if let Some(volume) = self.volume {
@@ -282,6 +354,13 @@ impl ForwardRequest {
                 items: vec![MediaLocation::File(file.clone())],
                 at: None,
                 play: true,
+            });
+        }
+        if let Some(added) = &self.added {
+            commands.push(Command::AddItems {
+                items: vec![MediaLocation::File(added.clone())],
+                at: None,
+                play: false,
             });
         }
         commands
@@ -666,15 +745,21 @@ mod tests {
 
     #[test]
     fn the_instance_key_is_stable_and_path_derived() {
-        let a = instance_key(Some(Path::new("C:/Users/x/Rustamp/rustamp.toml")));
-        let same = instance_key(Some(Path::new("C:/Users/x/Rustamp/rustamp.toml")));
+        let a = instance_key(
+            DEFAULT_CLASS,
+            Some(Path::new("C:/Users/x/Rustamp/rustamp.toml")),
+        );
+        let same = instance_key(
+            DEFAULT_CLASS,
+            Some(Path::new("C:/Users/x/Rustamp/rustamp.toml")),
+        );
         assert_eq!(a, same, "the same path always yields the same key");
         assert_eq!(a.len(), 16, "the key is 64 bits of hex");
 
-        let other = instance_key(Some(Path::new("C:/tmp/other.toml")));
+        let other = instance_key(DEFAULT_CLASS, Some(Path::new("C:/tmp/other.toml")));
         assert_ne!(a, other, "different configs must not share an instance");
 
-        let none = instance_key(None);
+        let none = instance_key(DEFAULT_CLASS, None);
         assert_ne!(none, a);
         assert_ne!(none, other);
     }
@@ -682,9 +767,33 @@ mod tests {
     #[test]
     fn the_instance_key_folds_case() {
         assert_eq!(
-            instance_key(Some(Path::new("C:/Users/X/Rustamp.toml"))),
-            instance_key(Some(Path::new("c:/users/x/rustamp.toml"))),
+            instance_key(DEFAULT_CLASS, Some(Path::new("C:/Users/X/Rustamp.toml"))),
+            instance_key(DEFAULT_CLASS, Some(Path::new("c:/users/x/rustamp.toml"))),
             "Windows paths are case-insensitive, so the key must be too"
+        );
+    }
+
+    #[test]
+    fn the_class_reaches_the_instance_check() {
+        // S13 §2: the class name is what the single-instance check looks for,
+        // so `/CLASS=` must change the key.
+        let config = Some(Path::new("C:/Users/x/Rustamp/rustamp.toml"));
+        let default = instance_key(DEFAULT_CLASS, config);
+        let other = instance_key("Rustamp second", config);
+        assert_ne!(
+            default, other,
+            "a different class must be a different instance"
+        );
+    }
+
+    #[test]
+    fn the_class_name_is_case_sensitive() {
+        // S13 §2: "The class name is a case-sensitive string."
+        let config = Some(Path::new("C:/Users/x/Rustamp/rustamp.toml"));
+        assert_ne!(
+            instance_key("Winamp v1.x", config),
+            instance_key("winamp v1.x", config),
+            "the class name must not be case-folded"
         );
     }
 
@@ -692,6 +801,7 @@ mod tests {
     fn a_full_request_round_trips() {
         let request = ForwardRequest {
             file: Some(PathBuf::from(r"C:\music\a b.mp3")),
+            added: Some(PathBuf::from(r"C:\music\bookmark.mp3")),
             volume: Some(200),
             refusals: vec![
                 "--skin is ignored by the running instance".to_owned(),
@@ -759,9 +869,28 @@ mod tests {
         frame.push(1); // a file is present
         frame.extend_from_slice(&2u32.to_le_bytes());
         frame.extend_from_slice(&[0xff, 0xfe]); // not UTF-8
+        frame.push(0); // nothing is added
         frame.push(0); // no volume
         frame.extend_from_slice(&0u16.to_le_bytes()); // no refusals
         assert_eq!(ForwardRequest::decode(&frame), Err(DecodeError::Utf8));
+    }
+
+    #[test]
+    fn an_added_path_is_added_and_not_played() {
+        // S13 §1: `/BOOKMARK <path>` adds the path as a bookmark rather than
+        // playing it.
+        let request = ForwardRequest {
+            added: Some(PathBuf::from("bookmark.mp3")),
+            ..ForwardRequest::default()
+        };
+        assert_eq!(
+            request.commands(),
+            vec![Command::AddItems {
+                items: vec![MediaLocation::File(PathBuf::from("bookmark.mp3"))],
+                at: None,
+                play: false,
+            }]
+        );
     }
 
     #[test]
@@ -770,6 +899,7 @@ mod tests {
             file: Some(PathBuf::from("a.mp3")),
             volume: Some(42),
             refusals: vec!["nope".to_owned()],
+            ..ForwardRequest::default()
         };
         assert_eq!(
             request.commands(),
@@ -845,6 +975,7 @@ mod tests {
             file: Some(PathBuf::from("forwarded.mp3")),
             volume: Some(128),
             refusals: vec!["--skin is ignored".to_owned()],
+            ..ForwardRequest::default()
         };
         assert_eq!(forward(&key, &request), HandOff::Delivered);
 
