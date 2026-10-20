@@ -195,6 +195,18 @@ Behaviour the core contract leaves open, and what the decoders do.
 - **Empty input.** A source of zero bytes is rejected before probing with
   `Error::Decode("empty source: 0 bytes to decode")`, not with the probe's "no
   suitable format reader found" (which named the wrong problem).
+- **A container reader that panics.** The Matroska reader of symphonia asks
+  for an element header it has not read yet, and every truncated Matroska file
+  trips it (measured on the prefixes of the repository fixture: 22746 of the
+  23304 prefixes panicked while the file was *opened*, none of them while it
+  was read). A hostile file must not take the player down, so the probe of the
+  container runs inside a `catch_unwind`: such a panic becomes
+  `Error::Decode("the container reader panicked on this file: it is broken")`
+  and the file is refused like any other broken file. The panic hook of the
+  standard library still prints the panic of the third-party reader; the file
+  is refused either way. The **read** path is not protected: a panic of a
+  codec or of a container reader while the file is read still unwinds (none
+  was found on the prefixes of the repository fixtures).
 - **Bounded read loop.** Every iteration of `fill_pending` produces samples,
   counts a skipped packet, or ends the stream. The two arms that do none of
   those (a foreign track id, a buffer that decodes to zero frames) are counted
