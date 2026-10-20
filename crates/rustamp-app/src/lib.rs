@@ -32,6 +32,9 @@
 //! * [`directory`] - what a chosen directory contributes to the playlist:
 //!   the media files of the tree below it, and the command that appends
 //!   them. Pure; the folder dialog itself lives in [`window`].
+//! * [`dsp`] — the app's DSP chain: the stages the app installs in the
+//!   engine, the bypass the engine reports when a stage fails, and the
+//!   manual recovery from it (W14 finding F4).
 //! * [`double_click`] - the double-click rule of S03 §5: the second press
 //!   must follow the first within 500 ms and 4 px. The playlist list and the
 //!   three title bars share it.
@@ -91,6 +94,7 @@ pub mod cursor;
 pub mod dialogs;
 pub mod directory;
 pub mod double_click;
+pub mod dsp;
 pub mod eq_autoload;
 pub mod eq_presets;
 #[cfg(any(windows, test))]
