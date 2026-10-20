@@ -62,6 +62,23 @@
 //! The platform crate cannot reach a running [`rustamp_core`]-level `App`, so
 //! the listener only queues decoded requests; the app drains them on its own
 //! thread with [`take_pending`] and turns each into [`ForwardRequest::commands`].
+//!
+//! # The hand-off frame
+//!
+//! A frame carries a **location** in each of its two media slots: a file
+//! path or a URL (S19 §1). The kind is in the frame — the first byte of the
+//! slot — so the receiver never has to guess whether it got a path or a
+//! URL, and a URL is applied the way the command line applies one: as a
+//! `MediaLocation::Url`, which the app turns into a stream track.
+//!
+//! The frame has two versions, and they do not mean "old build" and "new
+//! build": they mean what the frame may carry. A frame that carries a URL
+//! is written in [`PROTOCOL`] (3), the version that knows the URL kind. A
+//! frame that carries paths only is written in [`PROTOCOL_PATHS_ONLY`] (2),
+//! the layout of the player before a URL could be handed over — such a frame
+//! is the frame of the older build byte for byte, so a player that predates
+//! the change still reads a path hand-over. A frame of any other version is
+//! refused instead of being misread.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -74,18 +91,29 @@ pub use imp::{Claim, Instance, claim, forward};
 /// Magic marking a hand-off frame (`Rustamp Single-instance Forward`, v1).
 pub const MAGIC: [u8; 4] = *b"RSF1";
 
-/// Wire protocol version of [`ForwardRequest`].
+/// Wire protocol version of a hand-off frame that carries a URL.
 ///
-/// Version 2 added the "added without playing" field (S13 §1: `/BOOKMARK
-/// <path>` adds the path as a bookmark rather than playing it), so a frame of
-/// version 1 is refused instead of being misread.
-pub const PROTOCOL: u16 = 2;
+/// Version 3 added the location kind: a media slot of a frame may carry a
+/// URL and not only a path (S19 §1). A frame that carries a URL is written
+/// in this version; a frame that carries paths only is written in
+/// [`PROTOCOL_PATHS_ONLY`].
+pub const PROTOCOL: u16 = 3;
+
+/// Wire protocol version of a hand-off frame that carries paths only.
+///
+/// This is the layout of the player before a URL could be handed over, and a
+/// frame that carries no URL is still written in it. Such a frame is the
+/// frame of the older build byte for byte, so a player that predates the
+/// change still reads a path hand-over instead of refusing it. A frame that
+/// carries a URL is written in [`PROTOCOL`], which that older build refuses
+/// instead of misreading.
+pub const PROTOCOL_PATHS_ONLY: u16 = 2;
 
 /// Largest accepted hand-off frame, in bytes.
 ///
-/// A frame only carries one path, one volume and a handful of refusal strings,
-/// so this is a generous ceiling that still bounds a malicious or corrupt
-/// client's allocation.
+/// A frame only carries two locations, one volume and a handful of refusal
+/// strings, so this is a generous ceiling that still bounds a malicious or
+/// corrupt client's allocation.
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 
 /// Whether the single-instance lock was free or already held.
@@ -170,25 +198,77 @@ fn pipe_name(key: &str) -> String {
 /// The command line a second launch hands to the running instance.
 ///
 /// Only the parts of the command line that can still take effect are carried:
-/// a file to play, a path to add without playing it, and an initial volume.
-/// Flags that were fixed when the first instance started (output mode, skin,
-/// the `--seconds` test aid) are listed in [`ForwardRequest::refusals`] and
-/// reported to the user by the sender rather than silently dropped.
+/// a media to play, a media to add without playing it, and an initial
+/// volume. Flags that were fixed when the first instance started (output
+/// mode, skin, the `--seconds` test aid) are listed in
+/// [`ForwardRequest::refusals`] and reported to the user by the sender
+/// rather than silently dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ForwardRequest {
-    /// The file to play, if any.
-    pub file: Option<PathBuf>,
-    /// A path to add to the playlist **without** playing it, if any.
+    /// The media to play, if any: a file path or a URL (S19 §1).
+    pub file: Option<MediaLocation>,
+    /// A media to add to the playlist **without** playing it, if any: a file
+    /// path or a URL.
     ///
     /// `/BOOKMARK <path>` (S13 §1) and `--enqueue` both land here: the
     /// reference adds a bookmark, and Rustamp has no bookmark store yet
-    /// (RFC 0005 O12), so the path is added to the playlist instead — added
-    /// rather than played, which is what S13 §1 settles.
-    pub added: Option<PathBuf>,
+    /// (RFC 0005 O12), so the media is added to the playlist instead —
+    /// added rather than played, which is what S13 §1 settles.
+    pub added: Option<MediaLocation>,
     /// The volume to apply (`0..=255`), if any.
     pub volume: Option<u8>,
     /// Human-readable notes for flags the running instance cannot apply.
     pub refusals: Vec<String>,
+}
+
+/// The kind of media one media slot of a hand-off frame carries.
+///
+/// The values are the wire format: `0` is an empty slot, `1` a path and
+/// `2` a URL. `1` is the flag the frame used before the kind existed, so a
+/// path-only frame is the frame of the older build byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocationKind {
+    /// The slot is empty.
+    Empty = 0,
+    /// The slot carries a file path.
+    Path = 1,
+    /// The slot carries a URL.
+    Url = 2,
+}
+
+impl LocationKind {
+    /// The kind a location has, or [`LocationKind::Empty`] for none.
+    fn of(location: Option<&MediaLocation>) -> Self {
+        match location {
+            None => LocationKind::Empty,
+            Some(MediaLocation::File(_)) => LocationKind::Path,
+            Some(MediaLocation::Url(_)) => LocationKind::Url,
+        }
+    }
+
+    /// The wire value of the kind.
+    fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The kind a wire value names, or `None` when the value names none.
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(LocationKind::Empty),
+            1 => Some(LocationKind::Path),
+            2 => Some(LocationKind::Url),
+            _ => None,
+        }
+    }
+
+    /// The location a slot of this kind carries, or `None` for an empty slot.
+    fn location(self, text: &str) -> Option<MediaLocation> {
+        match self {
+            LocationKind::Empty => None,
+            LocationKind::Path => Some(MediaLocation::File(PathBuf::from(text))),
+            LocationKind::Url => Some(MediaLocation::Url(text.to_owned())),
+        }
+    }
 }
 
 /// Why a hand-off frame could not be decoded.
@@ -209,6 +289,12 @@ pub enum DecodeError {
     /// A path or refusal was not valid UTF-8.
     #[error("hand-off frame contains invalid UTF-8")]
     Utf8,
+    /// The frame names a location kind that does not exist.
+    #[error("hand-off frame carries an unknown location kind {0}")]
+    UnknownKind(u8),
+    /// The frame carries a URL in a version whose frames carry paths only.
+    #[error("hand-off frame of version {0} may not carry a URL")]
+    UrlInPathsOnlyFrame(u16),
 }
 
 /// A forward cursor over a frame, with checked reads.
@@ -243,39 +329,75 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Appends a length-prefixed UTF-8 path to a frame.
-fn push_path(out: &mut Vec<u8>, path: &Path) {
-    let text = path.to_string_lossy();
+/// Appends one media slot to a frame: the kind and, if the slot is not
+/// empty, the length-prefixed UTF-8 text of the location.
+fn push_location(out: &mut Vec<u8>, location: Option<&MediaLocation>) {
+    out.push(LocationKind::of(location).code());
+    let Some(location) = location else {
+        return;
+    };
+    let text = location.to_display_string();
     out.extend_from_slice(&(text.len() as u32).to_le_bytes());
     out.extend_from_slice(text.as_bytes());
 }
 
+/// Reads one media slot from a frame.
+///
+/// A frame of version [`PROTOCOL_PATHS_ONLY`] may carry paths only: the kind
+/// of a URL did not exist in that version, so a frame that carries one
+/// anyway is refused instead of being read.
+fn read_location(
+    reader: &mut Reader<'_>,
+    protocol: u16,
+) -> Result<Option<MediaLocation>, DecodeError> {
+    let code = reader.u8()?;
+    let kind = LocationKind::from_code(code).ok_or(DecodeError::UnknownKind(code))?;
+    if kind == LocationKind::Empty {
+        return Ok(None);
+    }
+    if kind == LocationKind::Url && protocol == PROTOCOL_PATHS_ONLY {
+        return Err(DecodeError::UrlInPathsOnlyFrame(protocol));
+    }
+    let len = reader.u32()? as usize;
+    let text = std::str::from_utf8(reader.take(len)?).map_err(|_| DecodeError::Utf8)?;
+    Ok(kind.location(text))
+}
+
 impl ForwardRequest {
+    /// The protocol version the frame is written in.
+    ///
+    /// A frame that carries a URL needs the location kind of version 3. A
+    /// frame that carries paths only is written in version 2, the layout of
+    /// the player before URLs could be handed over, so that it is the frame
+    /// of the older build byte for byte.
+    fn version(&self) -> u16 {
+        let carries_url = matches!(self.file, Some(MediaLocation::Url(_)))
+            || matches!(self.added, Some(MediaLocation::Url(_)));
+        if carries_url {
+            PROTOCOL
+        } else {
+            PROTOCOL_PATHS_ONLY
+        }
+    }
+
     /// Encodes the request into the hand-off wire format.
     ///
-    /// Layout (all integers little-endian): `MAGIC` (4), protocol (u16), a
-    /// file present flag (u8) and, if present, its length (u32) and UTF-8
-    /// bytes, an added present flag (u8) and, if present, its length (u32)
-    /// and UTF-8 bytes, a volume present flag (u8) and, if present, the byte,
-    /// a refusal count (u16) and that many length-prefixed UTF-8 strings.
+    /// Layout (all integers little-endian): `MAGIC` (4), the protocol
+    /// version (u16), the kind of the file slot (u8) and, if the slot is
+    /// not empty, its length (u32) and UTF-8 bytes, the kind of the added
+    /// slot (u8) and, if that slot is not empty, its length (u32) and UTF-8
+    /// bytes, a volume present flag (u8) and, if present, the byte, a
+    /// refusal count (u16) and that many length-prefixed UTF-8 strings.
+    ///
+    /// The kinds are `0` for an empty slot, `1` for a path and `2` for a
+    /// URL. The version is [`PROTOCOL`] when the frame carries a URL and
+    /// [`PROTOCOL_PATHS_ONLY`] when it does not.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&PROTOCOL.to_le_bytes());
-        match &self.file {
-            Some(path) => {
-                out.push(1);
-                push_path(&mut out, path);
-            }
-            None => out.push(0),
-        }
-        match &self.added {
-            Some(path) => {
-                out.push(1);
-                push_path(&mut out, path);
-            }
-            None => out.push(0),
-        }
+        out.extend_from_slice(&self.version().to_le_bytes());
+        push_location(&mut out, self.file.as_ref());
+        push_location(&mut out, self.added.as_ref());
         match self.volume {
             Some(volume) => {
                 out.push(1);
@@ -292,6 +414,12 @@ impl ForwardRequest {
     }
 
     /// Decodes a hand-off frame produced by [`ForwardRequest::encode`].
+    ///
+    /// The versions [`PROTOCOL`] and [`PROTOCOL_PATHS_ONLY`] are read, so a
+    /// frame of the player before URLs could be handed over still reads as
+    /// the paths it carries. A frame of any other version is refused
+    /// instead of being misread, and so is a frame of
+    /// [`PROTOCOL_PATHS_ONLY`] that carries a URL.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(DecodeError::TooLarge(bytes.len()));
@@ -301,23 +429,11 @@ impl ForwardRequest {
             return Err(DecodeError::BadMagic);
         }
         let protocol = reader.u16()?;
-        if protocol != PROTOCOL {
+        if protocol != PROTOCOL && protocol != PROTOCOL_PATHS_ONLY {
             return Err(DecodeError::Protocol(protocol));
         }
-        let file = if reader.u8()? == 1 {
-            let len = reader.u32()? as usize;
-            let text = std::str::from_utf8(reader.take(len)?).map_err(|_| DecodeError::Utf8)?;
-            Some(PathBuf::from(text))
-        } else {
-            None
-        };
-        let added = if reader.u8()? == 1 {
-            let len = reader.u32()? as usize;
-            let text = std::str::from_utf8(reader.take(len)?).map_err(|_| DecodeError::Utf8)?;
-            Some(PathBuf::from(text))
-        } else {
-            None
-        };
+        let file = read_location(&mut reader, protocol)?;
+        let added = read_location(&mut reader, protocol)?;
         let volume = if reader.u8()? == 1 {
             Some(reader.u8()?)
         } else {
@@ -341,9 +457,10 @@ impl ForwardRequest {
     /// The commands the running first instance should apply, in order.
     ///
     /// The volume lands before the file, so a forwarded `--volume` is in force
-    /// when playback starts. An added path is **added** and not played (S13
-    /// §1: `/BOOKMARK <path>` adds the path as a bookmark rather than playing
-    /// it).
+    /// when playback starts. An added location is **added** and not played
+    /// (S13 §1: `/BOOKMARK <path>` adds the path as a bookmark rather than
+    /// playing it). A URL is applied the way the command line applies one:
+    /// as a `MediaLocation::Url`, which the app turns into a stream track.
     pub fn commands(&self) -> Vec<Command> {
         let mut commands = Vec::new();
         if let Some(volume) = self.volume {
@@ -351,14 +468,14 @@ impl ForwardRequest {
         }
         if let Some(file) = &self.file {
             commands.push(Command::AddItems {
-                items: vec![MediaLocation::File(file.clone())],
+                items: vec![file.clone()],
                 at: None,
                 play: true,
             });
         }
         if let Some(added) = &self.added {
             commands.push(Command::AddItems {
-                items: vec![MediaLocation::File(added.clone())],
+                items: vec![added.clone()],
                 at: None,
                 play: false,
             });
@@ -673,6 +790,11 @@ mod imp {
 
     /// Reads one `[u32 length][frame]` from `file`; `None` on any short or
     /// malformed read (the connection is simply dropped).
+    ///
+    /// A frame this build cannot read — a version it does not know, a
+    /// truncated frame — is dropped, and the drop is reported: the sender
+    /// believes the hand-over went through, so a silent drop would look
+    /// like a player that ignored the file.
     fn read_frame(file: &mut File) -> Option<ForwardRequest> {
         let mut length_bytes = [0u8; 4];
         file.read_exact(&mut length_bytes).ok()?;
@@ -682,7 +804,13 @@ mod imp {
         }
         let mut frame = vec![0u8; length];
         file.read_exact(&mut frame).ok()?;
-        ForwardRequest::decode(&frame).ok()
+        match ForwardRequest::decode(&frame) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                eprintln!("note: a forwarded command line was refused: {error}");
+                None
+            }
+        }
     }
 
     /// UTF-16, NUL-terminated, for the `*W` Win32 calls.
@@ -800,8 +928,8 @@ mod tests {
     #[test]
     fn a_full_request_round_trips() {
         let request = ForwardRequest {
-            file: Some(PathBuf::from(r"C:\music\a b.mp3")),
-            added: Some(PathBuf::from(r"C:\music\bookmark.mp3")),
+            file: Some(MediaLocation::File(PathBuf::from(r"C:\music\a b.mp3"))),
+            added: Some(MediaLocation::File(PathBuf::from(r"C:\music\bookmark.mp3"))),
             volume: Some(200),
             refusals: vec![
                 "--skin is ignored by the running instance".to_owned(),
@@ -820,10 +948,119 @@ mod tests {
     #[test]
     fn a_request_with_only_a_file_round_trips() {
         let request = ForwardRequest {
-            file: Some(PathBuf::from("song.ogg")),
+            file: Some(MediaLocation::File(PathBuf::from("song.ogg"))),
             ..ForwardRequest::default()
         };
         assert_eq!(ForwardRequest::decode(&request.encode()), Ok(request));
+    }
+
+    #[test]
+    fn a_url_round_trips() {
+        let request = ForwardRequest {
+            file: Some(MediaLocation::Url(
+                "http://example.com/stream.mp3".to_owned(),
+            )),
+            added: Some(MediaLocation::Url(
+                "http://example.com/other.mp3".to_owned(),
+            )),
+            volume: Some(200),
+            refusals: vec!["--skin is ignored by the running instance".to_owned()],
+        };
+        assert_eq!(ForwardRequest::decode(&request.encode()), Ok(request));
+    }
+
+    /// A frame of the player before a URL could be handed over, written by
+    /// hand: the layout of version 2.
+    fn legacy_frame(
+        file: Option<&str>,
+        added: Option<&str>,
+        volume: Option<u8>,
+        refusals: &[&str],
+    ) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC);
+        frame.extend_from_slice(&PROTOCOL_PATHS_ONLY.to_le_bytes());
+        for slot in [file, added] {
+            match slot {
+                Some(text) => {
+                    frame.push(1);
+                    frame.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                    frame.extend_from_slice(text.as_bytes());
+                }
+                None => frame.push(0),
+            }
+        }
+        match volume {
+            Some(volume) => {
+                frame.push(1);
+                frame.push(volume);
+            }
+            None => frame.push(0),
+        }
+        frame.extend_from_slice(&(refusals.len() as u16).to_le_bytes());
+        for refusal in refusals {
+            frame.extend_from_slice(&(refusal.len() as u32).to_le_bytes());
+            frame.extend_from_slice(refusal.as_bytes());
+        }
+        frame
+    }
+
+    #[test]
+    fn a_path_only_frame_is_the_frame_of_the_older_build() {
+        // A frame that carries no URL is written in the version of the
+        // player before URLs could be handed over, byte for byte: a player
+        // that predates the change must still read a path hand-over.
+        let request = ForwardRequest {
+            file: Some(MediaLocation::File(PathBuf::from(r"C:\music\a b.mp3"))),
+            added: Some(MediaLocation::File(PathBuf::from(r"C:\music\bookmark.mp3"))),
+            volume: Some(200),
+            refusals: vec!["--skin is ignored by the running instance".to_owned()],
+        };
+        assert_eq!(
+            request.encode(),
+            legacy_frame(
+                Some(r"C:\music\a b.mp3"),
+                Some(r"C:\music\bookmark.mp3"),
+                Some(200),
+                &["--skin is ignored by the running instance"],
+            ),
+            "a path-only frame must be the frame of the older build, byte for byte"
+        );
+    }
+
+    #[test]
+    fn a_legacy_frame_reads_as_a_path() {
+        let frame = legacy_frame(
+            Some(r"C:\music\a b.mp3"),
+            Some(r"C:\music\bookmark.mp3"),
+            Some(200),
+            &["--skin is ignored by the running instance"],
+        );
+        assert_eq!(
+            ForwardRequest::decode(&frame),
+            Ok(ForwardRequest {
+                file: Some(MediaLocation::File(PathBuf::from(r"C:\music\a b.mp3"))),
+                added: Some(MediaLocation::File(PathBuf::from(r"C:\music\bookmark.mp3"))),
+                volume: Some(200),
+                refusals: vec!["--skin is ignored by the running instance".to_owned()],
+            }),
+            "a frame of the older build must still read as the paths it carries"
+        );
+    }
+
+    #[test]
+    fn a_frame_with_a_url_is_written_in_the_current_version() {
+        // The older build refuses a frame of an unknown version instead of
+        // misreading it, so a frame that carries a URL must announce the
+        // version that knows the URL kind.
+        let request = ForwardRequest {
+            file: Some(MediaLocation::Url(
+                "http://example.com/stream.mp3".to_owned(),
+            )),
+            ..ForwardRequest::default()
+        };
+        let frame = request.encode();
+        assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), PROTOCOL);
     }
 
     #[test]
@@ -844,8 +1081,66 @@ mod tests {
     }
 
     #[test]
+    fn a_version_that_is_neither_two_nor_three_is_refused() {
+        // Version 1 had no "added" slot at all, so it must not be read as
+        // one that has.
+        let mut frame = ForwardRequest::default().encode();
+        frame[4] = 1;
+        assert_eq!(
+            ForwardRequest::decode(&frame),
+            Err(DecodeError::Protocol(1))
+        );
+    }
+
+    #[test]
+    fn an_unknown_location_kind_is_refused() {
+        let mut frame = ForwardRequest::default().encode();
+        frame[6] = 7; // the file slot names a kind that does not exist
+        assert_eq!(
+            ForwardRequest::decode(&frame),
+            Err(DecodeError::UnknownKind(7))
+        );
+    }
+
+    #[test]
+    fn a_url_in_a_paths_only_frame_is_refused() {
+        // A frame of the paths-only version may not carry a URL: the kind
+        // did not exist in that version, so the frame is refused instead of
+        // being read.
+        let mut frame = ForwardRequest {
+            file: Some(MediaLocation::Url(
+                "http://example.com/stream.mp3".to_owned(),
+            )),
+            ..ForwardRequest::default()
+        }
+        .encode();
+        frame[4] = PROTOCOL_PATHS_ONLY as u8;
+        assert_eq!(
+            ForwardRequest::decode(&frame),
+            Err(DecodeError::UrlInPathsOnlyFrame(PROTOCOL_PATHS_ONLY))
+        );
+    }
+
+    #[test]
     fn a_truncated_frame_is_rejected() {
         let frame = ForwardRequest::default().encode();
+        for cut in 0..frame.len() {
+            let result = ForwardRequest::decode(&frame[..cut]);
+            assert!(result.is_err(), "a frame cut at {cut} must not decode");
+        }
+    }
+
+    #[test]
+    fn a_truncated_url_frame_is_rejected() {
+        let request = ForwardRequest {
+            file: Some(MediaLocation::Url(
+                "http://example.com/stream.mp3".to_owned(),
+            )),
+            volume: Some(200),
+            refusals: vec!["--skin is ignored".to_owned()],
+            ..ForwardRequest::default()
+        };
+        let frame = request.encode();
         for cut in 0..frame.len() {
             let result = ForwardRequest::decode(&frame[..cut]);
             assert!(result.is_err(), "a frame cut at {cut} must not decode");
@@ -866,7 +1161,7 @@ mod tests {
         let mut frame = Vec::new();
         frame.extend_from_slice(&MAGIC);
         frame.extend_from_slice(&PROTOCOL.to_le_bytes());
-        frame.push(1); // a file is present
+        frame.push(1); // a path is present
         frame.extend_from_slice(&2u32.to_le_bytes());
         frame.extend_from_slice(&[0xff, 0xfe]); // not UTF-8
         frame.push(0); // nothing is added
@@ -880,7 +1175,7 @@ mod tests {
         // S13 §1: `/BOOKMARK <path>` adds the path as a bookmark rather than
         // playing it.
         let request = ForwardRequest {
-            added: Some(PathBuf::from("bookmark.mp3")),
+            added: Some(MediaLocation::File(PathBuf::from("bookmark.mp3"))),
             ..ForwardRequest::default()
         };
         assert_eq!(
@@ -894,9 +1189,43 @@ mod tests {
     }
 
     #[test]
+    fn a_url_is_played_and_an_added_url_is_not() {
+        // A URL is applied the way the command line applies one: as a
+        // `MediaLocation::Url`, which the app turns into a stream track.
+        let request = ForwardRequest {
+            file: Some(MediaLocation::Url(
+                "http://example.com/stream.mp3".to_owned(),
+            )),
+            added: Some(MediaLocation::Url(
+                "http://example.com/other.mp3".to_owned(),
+            )),
+            ..ForwardRequest::default()
+        };
+        assert_eq!(
+            request.commands(),
+            vec![
+                Command::AddItems {
+                    items: vec![MediaLocation::Url(
+                        "http://example.com/stream.mp3".to_owned()
+                    )],
+                    at: None,
+                    play: true,
+                },
+                Command::AddItems {
+                    items: vec![MediaLocation::Url(
+                        "http://example.com/other.mp3".to_owned()
+                    )],
+                    at: None,
+                    play: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn commands_put_the_volume_before_the_file() {
         let request = ForwardRequest {
-            file: Some(PathBuf::from("a.mp3")),
+            file: Some(MediaLocation::File(PathBuf::from("a.mp3"))),
             volume: Some(42),
             refusals: vec!["nope".to_owned()],
             ..ForwardRequest::default()
@@ -972,7 +1301,7 @@ mod tests {
         let _ = take_pending();
 
         let request = ForwardRequest {
-            file: Some(PathBuf::from("forwarded.mp3")),
+            file: Some(MediaLocation::File(PathBuf::from("forwarded.mp3"))),
             volume: Some(128),
             refusals: vec!["--skin is ignored".to_owned()],
             ..ForwardRequest::default()
@@ -1000,7 +1329,7 @@ mod tests {
     fn forwarding_to_a_key_nobody_owns_is_unreachable() {
         let key = unique_key("nobody");
         let request = ForwardRequest {
-            file: Some(PathBuf::from("x.mp3")),
+            file: Some(MediaLocation::File(PathBuf::from("x.mp3"))),
             ..ForwardRequest::default()
         };
         assert_eq!(forward(&key, &request), HandOff::Unreachable);

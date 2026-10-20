@@ -54,6 +54,11 @@
 //! The refusal is a parse error: the player says which scheme it cannot
 //! read and starts nothing, rather than taking the URL for a file name.
 //!
+//! The same rule decides what a **hand-over to a running instance** carries
+//! (see [`forwarded_location`]): an `http://` URL travels in the hand-off
+//! frame and is streamed by the running player, and another scheme is
+//! refused with the very same words.
+//!
 //! # Conformance with S13
 //!
 //! | S13 fact | Our behaviour | State | Where |
@@ -107,6 +112,7 @@ use std::path::PathBuf;
 
 use rustamp_core::playlist::MediaLocation;
 use rustamp_platform::shell_registration::RegistrationFlags;
+use rustamp_platform::single_instance::ForwardRequest;
 
 /// Where the audio goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -490,26 +496,113 @@ pub fn media_argument(argument: &str) -> Result<MediaLocation, CliError> {
     Ok(MediaLocation::Url(trimmed.to_owned()))
 }
 
-/// The path a hand-off frame can carry, or a refusal when the media is a
-/// URL.
+/// The location a hand-off frame can carry, or a refusal when the media is a
+/// URL this build cannot read.
 ///
-/// The frame of the single-instance hand-over carries a path, and the
-/// running instance would try to open a URL as a file. The URL is therefore
-/// reported instead of being turned into a path that cannot be played. A
-/// media that is no media at all carries nothing and refuses nothing.
-pub fn forwarded_path(
+/// The frame of the single-instance hand-over carries a **location**: a file
+/// path or a URL (S19 §1). The URL is read by the same rule as the command
+/// line reads one — only an `http://` URL that names a host can be read — and
+/// a URL that fails it is refused with the command line's own wording, so
+/// the two cannot drift apart. A media that is no media at all carries
+/// nothing and refuses nothing.
+pub fn forwarded_location(
     location: Option<MediaLocation>,
     refusals: &mut Vec<String>,
-) -> Option<PathBuf> {
+) -> Option<MediaLocation> {
     match location {
         None => None,
-        Some(MediaLocation::File(path)) => Some(path),
-        Some(MediaLocation::Url(url)) => {
-            refusals.push(format!(
-                "a URL cannot be handed to the running instance: {url}"
-            ));
+        Some(MediaLocation::File(path)) => Some(MediaLocation::File(path)),
+        Some(MediaLocation::Url(url)) => match media_argument(&url) {
+            Ok(MediaLocation::Url(url)) => Some(MediaLocation::Url(url)),
+            // The location claims to be a URL but names no scheme: there is
+            // nothing to read, so it is refused like a malformed URL.
+            Ok(MediaLocation::File(_)) => {
+                refusals.push(CliError::MalformedUrl(url.clone()).to_string());
+                None
+            }
+            Err(error) => {
+                refusals.push(error.to_string());
+                None
+            }
+        },
+    }
+}
+
+/// The part of a second launch's command line the running instance can apply.
+///
+/// The media and an initial volume still make sense; the output mode, the
+/// skin and the `--seconds` test aid were chosen when the first instance
+/// started, so they become refusals. A media that is only **added**
+/// (`--enqueue`, S13 §1's `/ADD` and `/BOOKMARK`) travels as such, so the
+/// running instance does not start playing it. The media itself may be a
+/// file path or a URL (S19 §1): the frame carries the kind, so the running
+/// instance applies a URL the way the command line applies one.
+pub fn forward_request(args: &Args) -> ForwardRequest {
+    let mut refusals = Vec::new();
+    if args.output == OutputChoice::NoAudio {
+        refusals.push(
+            "--no-audio is ignored: the running instance fixed its output at start-up".to_owned(),
+        );
+    }
+    if args.skin.is_some() {
+        refusals
+            .push("--skin is ignored: the running instance chose its skin at start-up".to_owned());
+    }
+    if args.seconds.is_some() {
+        refusals.push(
+            "--seconds is ignored: it is a start-up test aid on the running instance".to_owned(),
+        );
+    }
+    // The bookmark: a media that is added and not played (S13 §1). A bookmark
+    // without a path is left open by S13 §5.3, so it is reported rather than
+    // guessed.
+    let mut added = match &args.bookmark {
+        Some(Bookmark::Location(location)) => Some(location.clone()),
+        Some(Bookmark::WithoutPath) => {
+            refusals.push(
+                "/BOOKMARK without a path is not defined (S13 §5.3); nothing was bookmarked"
+                    .to_owned(),
+            );
             None
         }
+        None => None,
+    };
+    // The enqueued media (S13 §1): `/ADD <path>` names its own media and
+    // `--enqueue` names the media argument. Both are added and not played. A
+    // `/ADD` without a path is left open by S13 §5.3, so it is reported
+    // rather than guessed.
+    let (file, enqueued) = match &args.enqueue {
+        Enqueue::None => (args.media.clone(), None),
+        Enqueue::Argument => (None, args.media.clone()),
+        Enqueue::Location(location) => (args.media.clone(), Some(location.clone())),
+        Enqueue::WithoutPath => {
+            refusals.push(
+                "/ADD without a path is not defined (S13 §5.3); nothing was enqueued".to_owned(),
+            );
+            (args.media.clone(), None)
+        }
+    };
+    // Only one media can travel that way, so the enqueued one wins and the
+    // bookmark is reported.
+    if let Some(enqueued) = enqueued {
+        if let Some(bookmark) = added.take() {
+            refusals.push(format!(
+                "/BOOKMARK {} was not forwarded: only one path can be added without playing it",
+                bookmark.to_display_string()
+            ));
+        }
+        added = Some(enqueued);
+    }
+    // The frame carries a location: a path or a URL. A URL this build cannot
+    // read is reported instead of being handed over (see
+    // [`forwarded_location`]).
+    let file = forwarded_location(file, &mut refusals);
+    let added = forwarded_location(added, &mut refusals);
+    ForwardRequest {
+        file,
+        added,
+        volume: args.volume,
+        refusals,
     }
 }
 
@@ -1149,30 +1242,141 @@ mod tests {
     #[test]
     fn a_file_is_handed_over_as_its_path() {
         let mut refusals = Vec::new();
-        let path = forwarded_path(
+        let location = forwarded_location(
             Some(MediaLocation::File(PathBuf::from("song.mp3"))),
             &mut refusals,
         );
-        assert_eq!(path, Some(PathBuf::from("song.mp3")));
+        assert_eq!(
+            location,
+            Some(MediaLocation::File(PathBuf::from("song.mp3")))
+        );
         assert!(refusals.is_empty(), "{refusals:?}");
     }
 
     #[test]
-    fn a_url_is_refused_instead_of_becoming_a_path() {
-        // The hand-off frame carries a path, and the running instance would
-        // try to open a URL as a file. The URL is reported instead.
+    fn a_url_is_handed_over_as_its_url() {
+        // The frame carries a location, and the kind is in the frame: a URL
+        // reaches the running instance instead of being refused.
         let mut refusals = Vec::new();
-        let path = forwarded_path(
+        let location = forwarded_location(
             Some(MediaLocation::Url(
                 "http://example.test/stream.mp3".to_owned(),
             )),
             &mut refusals,
         );
-        assert_eq!(path, None);
-        assert_eq!(refusals.len(), 1, "{refusals:?}");
-        assert!(
-            refusals[0].contains("http://example.test/stream.mp3"),
-            "{refusals:?}"
+        assert_eq!(
+            location,
+            Some(MediaLocation::Url(
+                "http://example.test/stream.mp3".to_owned()
+            ))
         );
+        assert!(refusals.is_empty(), "{refusals:?}");
+    }
+
+    #[test]
+    fn a_refused_scheme_is_refused_with_the_command_lines_wording() {
+        // The command line refuses another scheme by name (S19 §6 question 8),
+        // and the hand-over refuses it with the same words: the player reads
+        // `http://` URLs only, and there is no TLS.
+        let mut refusals = Vec::new();
+        let location = forwarded_location(
+            Some(MediaLocation::Url(
+                "https://example.test/stream.mp3".to_owned(),
+            )),
+            &mut refusals,
+        );
+        assert_eq!(location, None);
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(
+            refusals[0],
+            CliError::UnsupportedUrl {
+                url: "https://example.test/stream.mp3".to_owned(),
+                scheme: "https".to_owned(),
+            }
+            .to_string(),
+            "the refusal must be the command line's own wording"
+        );
+        // The command line refuses the same argument with the same words.
+        assert_eq!(
+            parse_args(&["https://example.test/stream.mp3"]),
+            Err(CliError::UnsupportedUrl {
+                url: "https://example.test/stream.mp3".to_owned(),
+                scheme: "https".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_url_that_names_no_host_is_refused() {
+        let mut refusals = Vec::new();
+        let location = forwarded_location(
+            Some(MediaLocation::Url("http://".to_owned())),
+            &mut refusals,
+        );
+        assert_eq!(location, None);
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(
+            refusals[0],
+            CliError::MalformedUrl("http://".to_owned()).to_string()
+        );
+    }
+
+    #[test]
+    fn a_location_that_names_no_scheme_is_refused() {
+        // A location that claims to be a URL and names no scheme has nothing
+        // to read, so it is refused instead of being read as a stream.
+        let mut refusals = Vec::new();
+        let location = forwarded_location(
+            Some(MediaLocation::Url("song.mp3".to_owned())),
+            &mut refusals,
+        );
+        assert_eq!(location, None);
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(
+            refusals[0],
+            CliError::MalformedUrl("song.mp3".to_owned()).to_string()
+        );
+    }
+
+    #[test]
+    fn the_request_of_a_second_launch_carries_the_url() {
+        // The whole way from the parsed command line to the frame: a second
+        // launch that names a URL hands it over.
+        let args = parse_args(&["http://example.test/stream.mp3"]).unwrap();
+        let request = forward_request(&args);
+        assert_eq!(
+            request.file,
+            Some(MediaLocation::Url(
+                "http://example.test/stream.mp3".to_owned()
+            ))
+        );
+        assert_eq!(request.added, None);
+        assert!(request.refusals.is_empty(), "{:?}", request.refusals);
+    }
+
+    #[test]
+    fn the_request_of_a_second_launch_carries_a_path() {
+        let args = parse_args(&["song.mp3"]).unwrap();
+        let request = forward_request(&args);
+        assert_eq!(
+            request.file,
+            Some(MediaLocation::File(PathBuf::from("song.mp3")))
+        );
+        assert!(request.refusals.is_empty(), "{:?}", request.refusals);
+    }
+
+    #[test]
+    fn an_added_url_travels_as_an_added_url() {
+        // `/ADD <url>` adds the URL to the playlist and does not play it.
+        let args = parse_args(&["/ADD", "http://example.test/stream.mp3"]).unwrap();
+        let request = forward_request(&args);
+        assert_eq!(request.file, None);
+        assert_eq!(
+            request.added,
+            Some(MediaLocation::Url(
+                "http://example.test/stream.mp3".to_owned()
+            ))
+        );
+        assert!(request.refusals.is_empty(), "{:?}", request.refusals);
     }
 }

@@ -160,3 +160,42 @@ looks like now. The conformance table itself lives in the module docs:
 | §1 `/CONFIG=<path>` | The configuration file replaces the resolved default. |
 | §5 the open questions | All fourteen stay open; the own choices that touch them are named in the module docs. The two the second audit pass added are §5.13 (whether the reference's switch list is complete) and §5.14 (the name of the verb that registers `/BOOKMARK`). |
 
+## The hand-off frame after the URL change (2026-10-20)
+
+A second launch that names an `http://` URL used to be refused: the frame
+carried a **path**, and a URL handed over as a path is a file the running
+player cannot open. The frame now carries a **location** — a file path or a
+URL (S19 §1) — and the **kind** is in the frame: the first byte of a media
+slot is `0` for an empty slot, `1` for a path and `2` for a URL. A URL is
+applied the way the command line applies one: as a `MediaLocation::Url`,
+which the app turns into a stream track.
+
+The frame has two versions, and they do not mean "old build" and "new build":
+they mean what the frame may carry.
+
+| Frame | Version | Who reads it |
+|---|---|---|
+| paths only | 2 (`PROTOCOL_PATHS_ONLY`) | this build **and** every build before it: the bytes are the frame of the older build, byte for byte |
+| carries a URL | 3 (`PROTOCOL`) | this build |
+
+So a **mismatched pair** — the running player is older than the launching
+one, which happens when the executable is replaced while the player runs —
+behaves like this:
+
+* a **path** hand-over is written in version 2 and the older player applies
+  it, exactly as before;
+* a **URL** hand-over is written in version 3, and the older player refuses
+  the frame instead of misreading it. The running player says so
+  (`note: a forwarded command line was refused: ...`), and the URL is not
+  played — which is what that older player could not do anyway.
+
+A frame of any other version is refused, and so is a frame of version 2 that
+carries a URL: the kind of a URL did not exist in that version.
+
+The decision that a URL may travel lives in the app:
+`rustamp_app::cli::forwarded_location` reads a URL by the command line's own
+rule, so a URL the player cannot read (`https://` and the like) is refused
+with the command line's own words. The building of the frame moved with it,
+from `main.rs` into `cli.rs` (`cli::forward_request`), so that the sending
+side is unit-tested instead of only reachable through the binary.
+

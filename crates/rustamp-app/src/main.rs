@@ -53,10 +53,10 @@
 
 use std::process::ExitCode;
 
-use rustamp_app::cli::{self, Bookmark, Enqueue, OutputChoice, USAGE};
+use rustamp_app::cli::{self, OutputChoice, USAGE};
 use rustamp_platform::HotkeySession;
 use rustamp_platform::shell_registration::{self, RegistrationError, RegistrationStep};
-use rustamp_platform::single_instance::{self, Claim, ForwardRequest, HandOff};
+use rustamp_platform::single_instance::{self, Claim, HandOff};
 
 fn main() -> ExitCode {
     let args = match cli::parse(std::env::args().skip(1)) {
@@ -150,7 +150,7 @@ fn run_player(
 
 /// Hands the second launch's command line to the running instance and exits.
 fn forward(key: &str, args: &cli::Args) -> ExitCode {
-    let request = forward_request(args);
+    let request = cli::forward_request(args);
     // The running instance's output mode, skin and `--seconds` were fixed at
     // its start-up; report each one we cannot apply rather than drop it.
     for refusal in &request.refusals {
@@ -171,82 +171,5 @@ fn forward(key: &str, args: &cli::Args) -> ExitCode {
             );
             ExitCode::FAILURE
         }
-    }
-}
-
-/// The part of a second launch's command line the running instance can apply.
-///
-/// A file and an initial volume still make sense; the output mode, the skin and
-/// the `--seconds` test aid were chosen when the first instance started, so
-/// they become refusals. A path that is only **added** (`--enqueue`, S13 §1's
-/// `/ADD` and `/BOOKMARK`) travels as such, so the running instance does not
-/// start playing it.
-fn forward_request(args: &cli::Args) -> ForwardRequest {
-    let mut refusals = Vec::new();
-    if args.output == OutputChoice::NoAudio {
-        refusals.push(
-            "--no-audio is ignored: the running instance fixed its output at start-up".to_owned(),
-        );
-    }
-    if args.skin.is_some() {
-        refusals
-            .push("--skin is ignored: the running instance chose its skin at start-up".to_owned());
-    }
-    if args.seconds.is_some() {
-        refusals.push(
-            "--seconds is ignored: it is a start-up test aid on the running instance".to_owned(),
-        );
-    }
-    // The bookmark: a media that is added and not played (S13 §1). A bookmark
-    // without a path is left open by S13 §5.3, so it is reported rather than
-    // guessed.
-    let mut added = match &args.bookmark {
-        Some(Bookmark::Location(location)) => Some(location.clone()),
-        Some(Bookmark::WithoutPath) => {
-            refusals.push(
-                "/BOOKMARK without a path is not defined (S13 §5.3); nothing was bookmarked"
-                    .to_owned(),
-            );
-            None
-        }
-        None => None,
-    };
-    // The enqueued media (S13 §1): `/ADD <path>` names its own media and
-    // `--enqueue` names the media argument. Both are added and not played. A
-    // `/ADD` without a path is left open by S13 §5.3, so it is reported
-    // rather than guessed.
-    let (file, enqueued) = match &args.enqueue {
-        Enqueue::None => (args.media.clone(), None),
-        Enqueue::Argument => (None, args.media.clone()),
-        Enqueue::Location(location) => (args.media.clone(), Some(location.clone())),
-        Enqueue::WithoutPath => {
-            refusals.push(
-                "/ADD without a path is not defined (S13 §5.3); nothing was enqueued".to_owned(),
-            );
-            (args.media.clone(), None)
-        }
-    };
-    // Only one path can travel that way, so the enqueued path wins and the
-    // bookmark is reported.
-    if let Some(enqueued) = enqueued {
-        if let Some(bookmark) = added.take() {
-            refusals.push(format!(
-                "/BOOKMARK {} was not forwarded: only one path can be added without playing it",
-                bookmark.to_display_string()
-            ));
-        }
-        added = Some(enqueued);
-    }
-    // The hand-off frame carries a path (the wire format of
-    // `ForwardRequest`), so a URL cannot travel that way: it is reported
-    // instead of being handed over as a path the running instance would try
-    // to open as a file.
-    let file = cli::forwarded_path(file, &mut refusals);
-    let added = cli::forwarded_path(added, &mut refusals);
-    ForwardRequest {
-        file,
-        added,
-        volume: args.volume,
-        refusals,
     }
 }
