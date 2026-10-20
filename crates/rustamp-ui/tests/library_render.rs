@@ -383,6 +383,102 @@ fn the_status_line_starts_at_the_left_edge_of_the_viewport() {
 }
 
 #[test]
+fn the_scan_status_is_drawn_in_the_status_band() {
+    let mut view = view(
+        vec![
+            row(1, "One", "Artist", "Album"),
+            row(2, "Two", "Artist", "Album"),
+        ],
+        1234,
+    );
+    let layout = LibraryLayout::default();
+    let viewport = Rect::new(0, 0, 400, 100);
+    let status = status_band(viewport);
+
+    // The range line alone.
+    let mut frame = Image::filled(400, 100, [0, 0, 0, 255]);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
+    let range = ink_profile(&frame, status, LIBRARY_STATUS_TEXT);
+
+    // The scan's text takes the band's place.
+    view.set_scan_status("scanning: 120 seen, 30 added, 5 updated, 2 skipped");
+    let mut frame = Image::filled(400, 100, [0, 0, 0, 255]);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
+
+    assert!(
+        count(&frame, status, LIBRARY_STATUS_TEXT) > 0,
+        "the scan's text is drawn"
+    );
+    assert_ne!(
+        ink_profile(&frame, status, LIBRARY_STATUS_TEXT),
+        range,
+        "the scan's text replaces the range line"
+    );
+    assert_only_colours(
+        &frame,
+        status,
+        LIBRARY_PANEL_BACKGROUND,
+        LIBRARY_STATUS_TEXT,
+    );
+
+    // The text belongs to the status band alone.
+    let above = Rect::new(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        viewport.height - LIBRARY_LINE_HEIGHT,
+    );
+    assert_eq!(
+        count(&frame, above, LIBRARY_STATUS_TEXT),
+        0,
+        "the scan's text stays in the status band"
+    );
+
+    // It stands where the range stands: at the left edge of the band.
+    let first = first_ink_x(&frame, status, LIBRARY_STATUS_TEXT).expect("the band holds ink");
+    assert!(
+        (viewport.x..viewport.x + 4).contains(&first),
+        "the scan's text starts at the left edge, not at {first}"
+    );
+}
+
+#[test]
+fn a_long_scan_status_is_clipped_to_the_status_band() {
+    let mut view = view(vec![row(1, "One", "Artist", "Album")], 1234);
+    view.set_scan_status(&"scanning: 120 seen, ".repeat(40));
+    let layout = LibraryLayout::default();
+    let viewport = Rect::new(0, 0, 200, 100);
+    let status = status_band(viewport);
+    let mut frame = Image::filled(200, 100, [0, 0, 0, 255]);
+    render_library_window(&mut frame, &view, &layout, viewport, false, &[]);
+
+    assert!(
+        count(&frame, status, LIBRARY_STATUS_TEXT) > 0,
+        "the scan's text is drawn"
+    );
+
+    // The text is cut off at the band's edge, not shortened before it.
+    let last = last_ink_x(&frame, status, LIBRARY_STATUS_TEXT).expect("the band holds ink");
+    assert!(
+        last >= status.right() - 2 * LIBRARY_CELL_WIDTH as i32,
+        "the text reaches the band's edge, it ends at {last}"
+    );
+
+    // Nothing of it reaches into the rows above the band.
+    let above = Rect::new(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        viewport.height - LIBRARY_LINE_HEIGHT,
+    );
+    assert_eq!(
+        count(&frame, above, LIBRARY_STATUS_TEXT),
+        0,
+        "the scan's text stays in the status band"
+    );
+}
+
+#[test]
 fn a_viewport_that_is_too_short_shows_the_header_and_nothing_else() {
     let view = view(
         vec![

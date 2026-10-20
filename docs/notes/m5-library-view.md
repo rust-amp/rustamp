@@ -16,7 +16,7 @@ Files:
 
 - `crates/rustamp-ui/src/library.rs` - the model and the paging helper.
 - `crates/rustamp-ui/src/library_layout.rs` - the renderer-facing layout.
-- `crates/rustamp-ui/tests/library_view.rs` - the headless tests (18).
+- `crates/rustamp-ui/tests/library_view.rs` - the headless tests (20).
 
 ## The API
 
@@ -35,7 +35,8 @@ State and accessors:
 | `selected()` | the id of the selected row |
 | `selected_row()` / `selected_index()` | the selected row / its index in the loaded page |
 | `visible_rows()` | the rows at the scroll offset, at most one viewportful |
-| `status_line()` | the visible range and the total, e.g. `1-20 of 1234` |
+| `status_line()` | the visible range and the total, e.g. `1-20 of 1234`, or the scan's status while one is set |
+| `scan_status()` | the scan's status text, if there is one |
 | `page()` / `page_count()` | the screenful the scroll is on / how many there are |
 
 Mutators:
@@ -50,6 +51,7 @@ Mutators:
 | `select(id)` / `select_index(i)` / `clear_selection()` | the selection |
 | `move_selection_up/down()` / `move_selection_to_first/last()` | the selection moves |
 | `scroll_to(offset)` / `scroll_by(delta)` / `scroll_page(direction)` | the scroll |
+| `set_scan_status(text)` / `clear_scan_status()` | the scan's status text |
 
 ### `LibraryRequest`
 
@@ -113,6 +115,28 @@ A *page* is one screenful of rows (the view's viewport). `page_count` is
 `row / page_size`, and `page_start` is its inverse. The app uses it to
 serve a request from a page cache.
 
+## The status line
+
+The status line is the one text the view owns that is not about the rows:
+it is the **visible range** of the list (`1-20 of 1234`), and while a scan
+runs it is the **scan's** own text.
+
+The rule is one line: a scan status **replaces** the range, and clearing
+the status brings the range back.
+
+```rust
+view.set_scan_status("scanning: 120 seen, 30 added");
+view.status_line();          // "scanning: 120 seen, 30 added"
+view.clear_scan_status();
+view.status_line();          // "1-20 of 1234"
+```
+
+The text belongs to the view because the **renderer** owns the status band:
+it draws the view's status line into the band, in the status line's own
+colour and clipped to the band. The app never paints that band itself - it
+writes the scan's text into the view and takes it away again (see
+`docs/notes/m5-library-scan-progress.md`).
+
 ## The layout
 
 The library window is a **modern** window, not a skinned one: it has an OS
@@ -174,7 +198,7 @@ The playlist's conventions are the model: a movement with no selection
 takes the first (down) or the last (up) visible row, and the view follows
 the selection so it stays on the screen.
 
-## Tests (18, all headless)
+## Tests (20, all headless)
 
 `crates/rustamp-ui/tests/library_view.rs`:
 
@@ -187,6 +211,8 @@ the selection so it stays on the screen.
 - the paging boundaries (0, 1, an exact multiple, a partial page, a page
   size of 0) and the scroll-to-page rule,
 - the total is reported in the status line (`1-20 of 1234`, `0 of 0`),
+- a scan status replaces the range line and clearing it brings the range
+  back; an empty status is no status,
 - the scroll follows the selection and stays inside the match set,
 - the visible rows are the loaded window at the scroll,
 - the request asks for the rows the window shows,
@@ -205,6 +231,8 @@ the selection so it stays on the screen.
 - The window's own chrome (the search box, the column headers, the status
   bar) is not modelled: the layout gives the column headers and the row
   lines, the rest belongs to the window.
+- The scan's status is one text: it replaces the whole line, so the visible
+  range is not shown while a scan has something to say.
 - Nothing here is measured: S20 (the media library) is not started, so the
   column set, the widths and the scroll rules are own choices, made to
   mirror the playlist editor's conventions.

@@ -12,9 +12,9 @@ commits (`wave174`). The window ran that scan since `wave177`, but it showed
 the progress **in the caption only** and it kept the newest event in a shared
 slot that the interface thread polled.
 
-`rustamp-library` and `rustamp-ui` are untouched: the crate that owns the
-library window's renderer is owned by another lane, so the app owns the
-status line itself.
+`rustamp-library` is untouched. The status line itself was the app's own
+text in `wave229`; `wave232` moved it into the view and the renderer (see
+the last section).
 
 Files:
 
@@ -24,6 +24,10 @@ Files:
   fake scan (6 new).
 - `crates/rustamp-app/tests/library_window.rs` - the headless test of the app's
   own path (1 new).
+- `crates/rustamp-ui/src/library.rs` - the scan's status in the view
+  (`wave232`).
+- `crates/rustamp-ui/tests/library_view.rs`, `crates/rustamp-ui/tests/library_render.rs` -
+  the headless tests of the new home (`wave232`).
 
 ## What existed
 
@@ -91,43 +95,74 @@ that a test can run a **fake** scan: a real scan of a directory is fast and
 hard to steer, and the status line must be proven for every phase and for
 the cancelled case.
 
-## The band is painted by the app
+## The band is drawn by the renderer
 
-The renderer draws the status line from the view
-(`LibraryView::status_line()`), and the view's status line is the visible
-range: it cannot carry the scan's counters. The renderer has no other public
-text path, and `rustamp-ui` is owned by another lane, so the app paints the
-band itself: it asks the renderer for the glyphs - a scratch frame whose
-search field holds the text, rendered with the same font and the same size as
-the rest of the window - and paints the ink of that field into the band, in
-the status line's own colour and over the band's own background.
+The status band belongs to the **view** and the **renderer**: the view holds
+the scan's text, and the renderer draws the view's status line into the
+band. The text is drawn in the status line's own colour, with the same
+font and the same size as the rest of the window, and it is clipped to the
+band: a text that is wider than the band is cut off at its edge.
 
-The scratch frame holds the search band alone: the rest of the window is of
-no use there, and a whole frame per paint would cost more than the text it
-carries. The band is only painted while the scan has something to say.
+The app therefore paints nothing itself. It only puts the scan's text into
+the view and takes it away again.
+
+In `wave229` this was not possible: `rustamp-ui` was owned by another lane,
+so the app painted the band itself - it asked the renderer for the glyphs
+(a scratch frame whose search field held the text) and painted the ink of
+that field into the band. That workaround is gone.
+
+## The text lives in the view (wave232)
+
+`rustamp-ui` owns the status band, so the text is the view's:
+
+| Item | Meaning |
+| --- | --- |
+| `LibraryView::set_scan_status(text)` | the scan's text; an empty text clears it |
+| `LibraryView::clear_scan_status()` | the scan's text is gone |
+| `LibraryView::scan_status()` | the scan's text, if there is one |
+| `LibraryView::status_line()` | the scan's text while it is set, the visible range otherwise |
+
+The **rule**: a scan status **replaces** the visible range in the status
+line, and clearing it brings the range back. The renderer draws the status
+line, so the band needs no second text path.
+
+The app side follows the rule of the table above unchanged: a running scan
+shows its phase and its counters, a scan that is over shows the visible
+range again, and a cancelled scan says so and shows the committed counters.
+The app writes that text into the view while it polls
+(`LibraryWindow::update_scan_status`) and clears it when the scan is over.
+
+The caption carries the same text: it reads the view's scan status, so the
+caption and the band cannot disagree.
 
 ## Tests
 
-`crates/rustamp-app/src/library_window_tests.rs` (6 new, all headless, with a
+`crates/rustamp-app/src/library_window_tests.rs` (7 new, all headless, with a
 fake scan):
 
 - a running scan shows its phase and its counters,
+- the scan's text lives in the view,
 - the `Finished` phase restores the normal status line,
 - a cancelled scan shows the cancelled state with the committed numbers (and
   not with the live ones),
 - without a scan the status line is the visible range,
-- the status band is painted with the progress, at the left edge like the
+- the status band shows the progress, at the left edge like the
   visible range,
 - the caption carries the scan's progress.
 
 `crates/rustamp-app/tests/library_window.rs` (1 new, headless): without a
 scan the app's status line is the visible range (`1-3 of 3`).
 
+`crates/rustamp-ui/tests/library_view.rs` (2 new, headless): a scan status
+replaces the range line and clearing it brings the range back; an empty
+status is no status.
+
+`crates/rustamp-ui/tests/library_render.rs` (2 new, headless): the scan's
+text is drawn in the status band - in the status line's own colour, at the
+left edge, and nowhere outside the band; a long text is clipped to the band.
+
 ## Remaining limits
 
-- The status line is the app's text, and the app has to paint it: the
-  renderer would be the better home for it, but `rustamp-ui` is owned by
-  another lane.
 - The counters of a running scan are the live ones, so they can be ahead of
   the index by one batch. The report of a finished scan is the honest
   number, and it is not shown: a finished scan shows the visible range

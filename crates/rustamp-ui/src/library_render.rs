@@ -37,7 +37,8 @@
 //! * the **rows** in the middle: the rows at the scroll offset, the selected
 //!   one on the selection background, and the **scrollbar** in a column on
 //!   their right;
-//! * the **status line** at the bottom: the visible range and the total.
+//! * the **status line** at the bottom: the visible range and the total, or
+//!   the scan's status while a scan has something to say.
 //!
 //! Everything is clipped to the viewport: a row that does not fit is not
 //! drawn, a column that does not fit is cut off, and no pixel outside the
@@ -432,6 +433,12 @@ pub fn scroll_for_click(view: &LibraryView, chrome: &LibraryChrome, y: i32) -> u
 /// viewport and the same view, so the app can hit-test against it and get
 /// the bands that were drawn.
 ///
+/// The **status band** carries the view's status line
+/// ([`LibraryView::status_line`]): the visible range of the list, or the
+/// scan's status while a scan has something to say. The text stands at the
+/// left edge of the band, in the status line's own colour, and it is
+/// clipped to the band.
+///
 /// Nothing outside `viewport` is touched.
 pub fn render_library_window(
     frame: &mut Image,
@@ -674,6 +681,10 @@ fn draw_columns(
 }
 
 /// Draws `text` at the left edge of `band`, clipped to the band.
+///
+/// The glyphs are rasterized into a scratch of the band's own size, so a
+/// text that is wider than the band is cut off at its edge and never
+/// reaches a neighbouring band.
 fn draw_text(frame: &mut Image, text: &str, band: Rect, colour: [u8; 3]) {
     if text.is_empty() || band.is_empty() {
         return;
