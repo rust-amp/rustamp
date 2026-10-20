@@ -47,6 +47,11 @@ same second.
   `Library::get(id)`
 - `Library::write_tags(id, &TrackMetadata) -> Result<TrackRow>` (writes the
   tags into the real file and refreshes the row from it, see below)
+- `Library::write_tags_with(id, &TrackMetadata, &[TagField]) -> Result<TagWrite>`
+  (the same write with the removals, and the report of what the format
+  refused, see below)
+- `TagWrite { row: TrackRow, report: WriteReport }`; `TagField` and
+  `WriteReport` are re-exported from `rustamp-meta`
 - `TrackRow { id, path, metadata: TrackMetadata, mtime_ns, size }`
 - `Root { id, path, added_at, last_scanned_at }` (`last_scanned_at` is
   `Option<i64>`: `None` means the root was never scanned)
@@ -152,11 +157,11 @@ pass only under a fully walked root.
 ## Tag writing (wave169)
 
 `Library::write_tags(id, &TrackMetadata) -> Result<TrackRow>` edits the tags of
-an indexed track. The values go into the **real file** through
-`rustamp_meta::write_tags`, which replaces the file atomically (the file is
-either the old one or the new one). A field that is `None` is left as the file
-has it (the `rustamp-meta` contract), so one field can be edited without the
-others being lost.
+an indexed track. The values go into the **real file** through the
+`rustamp-meta` writer (`rustamp_meta::write_tags_with_report`), which replaces
+the file atomically (the file is either the old one or the new one). A field
+that is `None` is left as the file has it (the `rustamp-meta` contract), so
+one field can be edited without the others being lost.
 
 The row is then rebuilt from the file: the tags are **read back** after the
 write, and it is those values that land in the index - never the values the
@@ -182,6 +187,37 @@ A failed write leaves the row exactly as it was, and the file untouched (the
 write is atomic). A write that succeeded but could not be read back leaves the
 row as it was, too: the row is then stale and the next scan repairs it,
 because the file's stat no longer matches the stored one.
+
+## Tag removal (wave233)
+
+`Library::write_tags_with(id, &TrackMetadata, &[TagField]) -> Result<TagWrite>`
+is the write with the removals. It is **additive**: `write_tags` keeps its
+signature and its meaning (no removal, a `TrackRow` back), so no caller
+breaks; the new method is the one that can take a value *away* and the one
+that reports what the format refused.
+
+- A field of the metadata that is `None` keeps the value the file has. A
+  field of the removal list (`TagField`: `Title`, `Artist`, `Album`,
+  `AlbumArtist`, `Year`, `Genre`, `Comment`, `Track`, `Disc`) is taken out of
+  the file. A removal wins over a value: a field that is in both is removed.
+- The write is the same atomic one (`rustamp_meta::write_tags_with_report`),
+  and the **read-back rule** is the same: the row is rebuilt from the file,
+  never from the caller's input. A removed value is therefore gone from the
+  row exactly when it is gone from the file.
+- The result is a `TagWrite { row, report }`. The `report` is the
+  `rustamp_meta::WriteReport`, whose `unremoved` names every removal the
+  file still carries. The writer only writes the *primary* tag of a file: a
+  value in a second tag (an ID3v1 next to an ID3v2, the `RIFF INFO` of a
+  WAV, the text chunks of an AIFF) is not written and stays in the file, so
+  such a removal does not take the value out of the file. The report says so,
+  and the row shows the value the file still has - a caller that only looks
+  at the row cannot tell a removed value from a value that survived.
+- The error cases are the ones of the plain write: `NotFound` for an unknown
+  row and for a file that vanished, the error of the write itself, and the
+  error of the read-back. A failed removal leaves the row exactly as it was.
+
+`write_tags` is now `write_tags_with(id, metadata, &[])` with the report
+dropped, so the two share one code path.
 
 ## Sidecar cover art (wave203)
 
@@ -253,7 +289,7 @@ Only the `ALTER` statement names the table and the column as text; they are
 constants of the crate, never caller input, so it cannot carry an
 injection.
 
-## Tests (83, all headless on temp directories)
+## Tests (87, all headless on temp directories)
 
 Scan/query (14, wave145): `scan_indexes_and_queries`, `rescan_is_idempotent`,
 `update_on_change`, `removed_files_dropped`, `query_by_album`,
@@ -288,6 +324,15 @@ and the next scan finds no change), `the_row_follows_the_file_and_not_the_caller
 `writing_to_an_unknown_track_is_an_error`,
 `a_write_keeps_the_extra_tags_of_the_file`.
 
+Tag removal (4, wave233): `a_removal_clears_the_tag_and_the_row_follows_the_file`
+(the title is gone from the file and from the row, the fields the removal did
+not name keep their value, the id survives, the report is complete),
+`a_value_in_a_second_tag_is_reported_as_not_removed` (a WAV with a `LIST
+INFO` chunk: the value survives in the tag the writer does not touch, the
+report names it, and the row shows the value the file still carries),
+`a_failed_removal_leaves_the_row_unchanged` (a year a tag cannot hold),
+`a_removal_to_a_vanished_file_is_reported` (`NotFound`, the row is untouched).
+
 Background scan with progress (6, wave174):
 `progress_events_arrive_in_order` (the phases arrive in order, one event per
 considered file, the counters rise, the ignored file produces no event),
@@ -316,8 +361,9 @@ and the time is kept),
 `a_scan_of_an_unregistered_path_records_no_time`,
 `the_time_of_a_root_is_kept_when_the_root_is_removed_and_added_again`.
 
-Fixtures are 44-byte WAV headers written with `rustamp_meta::write_tags`, so no
-audio is decoded and no window is opened.
+Fixtures are WAV headers written with `rustamp_meta::write_tags` (44 bytes, or
+a `LIST INFO` chunk for the second-tag case), so no audio is decoded and no
+window is opened.
 
 ## What a UI needs next
 
@@ -331,9 +377,12 @@ audio is decoded and no window is opened.
 - Display columns: title, artist, album, track, duration, genre, path; the
   index has no column for artwork or for the file name.
 - Tag editing is available now: `Library::write_tags(id, &metadata)` writes
-  the file and returns the refreshed row. A caller that needs to know which
-  `extra` entries the target format refused uses
-  `rustamp_meta::write_tags_report` directly.
+  the file and returns the refreshed row, and
+  `Library::write_tags_with(id, &metadata, &removals)` writes the file, takes
+  the named fields out of it and returns the refreshed row together with the
+  report of what the format refused. A caller that needs to know which
+  `extra` entries the target format refused reads `report.unwritten_extra`
+  of the same result.
 - Artwork via `ArtworkCache::get(path)`: the embedded front cover of the
   track, or the sidecar image next to it (`cover.jpg` and friends); the
   picture is decoded on the fly and never stored in the index.
@@ -354,8 +403,9 @@ audio is decoded and no window is opened.
   full-text index; there is no ranking and no cross-column matching.
 - Sorting by duration is mostly a stable order over `NULL`s today, because
   `rustamp-meta` does not read audio properties.
-- A tag write cannot ask for a field to be removed: `write_tags` reads a
-  `None` as "leave the value the file has".
+- A removal reaches the primary tag of the file only: a value in a second
+  tag (an ID3v1 next to an ID3v2, the `RIFF INFO` of a WAV) survives it,
+  and the write report names it (`WriteReport::unremoved`).
 - The scan progress is not stored: there is no progress row in the index, so
   a scan that was interrupted is resumed by running it again. The time of
   the last finished scan is in the `roots` row, the counters of that scan
