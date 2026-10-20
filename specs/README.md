@@ -20,7 +20,7 @@ Specs reach this directory only after the Spec Auditor has signed off. Each file
 | S10 | `WM_WA_IPC` and `WM_COMMAND` catalog | not started |
 | S11 | Embed-window API and `gen.bmp` layout | not started |
 | S12 | winamp.ini keys and plugin.ini conventions | audited |
-| S13 | Command-line switches, single instance, drag-and-drop rules | not started |
+| S13 | Command-line switches, single instance, drag-and-drop rules | audited |
 | S14 | Title formatting | not started |
 | S15 | Shuffle algorithm | not started |
 | S16 | Preferences pages and options | not started |
