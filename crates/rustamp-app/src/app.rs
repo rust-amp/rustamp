@@ -5463,6 +5463,91 @@ mod tests {
         assert!(app.dialog_is_open(DialogKind::SkinBrowser));
     }
 
+    /// The browser shows a window of the skins, not all of them: the rows
+    /// that fit into its client area are drawn and the rest is reached by
+    /// scrolling.
+    #[test]
+    fn the_skin_browser_scrolls_its_window() {
+        use rustamp_ui::{DialogKind, Key, Modifiers, skin_browser_visible_rows};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_skins_folder(&dir);
+        let skins = dir.path().join(crate::skin_folder::SKINS_FOLDER);
+        for index in 0..20 {
+            crate::skin_folder::write_skin_archive(&skins.join(format!("skin {index:02}.wsz")));
+        }
+        app.submit(Command::OpenSkinBrowser).unwrap();
+        assert!(app.dialog_is_open(DialogKind::SkinBrowser));
+        // The built-in default plus the twenty folder skins.
+        assert_eq!(app.browser_entries().len(), 21);
+
+        // The rows that fit into the client area are on screen; the rest is
+        // not drawn at all.
+        let visible =
+            skin_browser_visible_rows(rustamp_ui::DialogKind::SkinBrowser.client_size().1);
+        assert_eq!(visible, 9);
+        let lines = app.open_dialog_lines().unwrap();
+        assert_eq!(lines.len(), visible, "{lines:?}");
+        assert!(lines[0].contains("built-in default skin"), "{lines:?}");
+
+        // Down past the window scrolls it: the ninth row is the last one on
+        // screen, the tenth moves the window on.
+        for _ in 0..8 {
+            assert!(app.dialog_key(Key::Down, Modifiers::NONE));
+        }
+        let lines = app.open_dialog_lines().unwrap();
+        assert_eq!(lines.len(), visible, "{lines:?}");
+        assert!(lines[0].contains("built-in default skin"), "{lines:?}");
+        assert!(lines[8].contains("skin 07"), "{lines:?}");
+        assert!(lines[8].starts_with("> "), "{lines:?}");
+        assert!(app.dialog_key(Key::Down, Modifiers::NONE));
+        let lines = app.open_dialog_lines().unwrap();
+        assert_eq!(lines.len(), visible, "{lines:?}");
+        assert!(lines[0].contains("skin 00"), "{lines:?}");
+        assert!(lines[8].contains("skin 08"), "{lines:?}");
+        assert!(lines[8].starts_with("> "), "{lines:?}");
+
+        // End jumps to the last row, Home back to the first.
+        assert!(app.dialog_key(Key::End, Modifiers::NONE));
+        let lines = app.open_dialog_lines().unwrap();
+        assert_eq!(lines.len(), visible, "{lines:?}");
+        assert!(lines[8].contains("skin 19"), "{lines:?}");
+        assert!(app.dialog_key(Key::Home, Modifiers::NONE));
+        let lines = app.open_dialog_lines().unwrap();
+        assert!(lines[0].contains("built-in default skin"), "{lines:?}");
+    }
+
+    /// The frame of the browser never draws a row that would cross the
+    /// bottom of its client area.
+    #[test]
+    fn the_skin_browser_draws_no_row_outside_its_client_area() {
+        use rustamp_ui::dialogs::{BODY_TOP, TEXT_LINE_PX};
+        use rustamp_ui::{DialogKind, SKIN_BROWSER_CLIENT_SIZE};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_skins_folder(&dir);
+        let skins = dir.path().join(crate::skin_folder::SKINS_FOLDER);
+        for index in 0..20 {
+            crate::skin_folder::write_skin_archive(&skins.join(format!("skin {index:02}.wsz")));
+        }
+        app.submit(Command::OpenSkinBrowser).unwrap();
+
+        let frame = app.render_dialog(DialogKind::SkinBrowser);
+        assert_eq!(
+            (frame.width(), frame.height()),
+            SKIN_BROWSER_CLIENT_SIZE,
+            "the frame is the client area"
+        );
+        // The band of the tenth row crosses the bottom, so it is not drawn.
+        let background = Some([0x18, 0x18, 0x20, 255]);
+        let last_row = BODY_TOP + 9 * TEXT_LINE_PX;
+        for y in last_row..frame.height() as i32 {
+            for x in 0..frame.width() as i32 {
+                assert_eq!(frame.pixel(x, y), background, "{x},{y}");
+            }
+        }
+    }
+
     /// An app whose configuration sits in `dir`, with an empty `skins` folder
     /// beside it.
     fn app_with_skins_folder(dir: &tempfile::TempDir) -> App {

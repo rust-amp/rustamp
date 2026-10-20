@@ -71,6 +71,17 @@
 //!   the project has no skin search path (no skins-directory concept: the CLI
 //!   takes one `--skin` path, the config holds one `ui.skin` path).
 //!   Confirming a row loads it through the app's existing skin path.
+//! * The skin browser **scrolls**: it shows a window of rows that fits its
+//!   client area ([`skin_browser_visible_rows`]), the arrow keys move the
+//!   selection and scroll with it so the selected row stays visible,
+//!   `PageUp`/`PageDown` page and `Home`/`End` jump to the first and the last
+//!   row. The reference has **no skinned skin-browser window** to copy: the
+//!   skin-browser command (S03 id 40219) opens the *native* Preferences frame
+//!   on its Skins page, whose skin list is a system list control with the
+//!   system's own scrollbar. S01 §1 lists the classic windows and no skin
+//!   browser is among them, and neither S04 nor S06 fixes a layout for one —
+//!   so there is no measured geometry for a scrollbar of our own, and the
+//!   browser scrolls with the keyboard.
 //! * The preferences dialog is a **frame**: the reference's pages,
 //!   controls and layout are unmeasured (S04 open), so it shows the requested
 //!   page's name and nothing else. The page list, names and default live in
@@ -97,6 +108,7 @@
 //! * Rendering uses the `text.bmp` bitmap font as a stand-in (the same choice
 //!   as the playlist rows; the reference's real dialog font is unknown).
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
@@ -421,14 +433,42 @@ pub fn skin_entries(current: Option<&Path>) -> Vec<SkinEntry> {
     entries
 }
 
+/// How many rows the skin browser shows at once, for a client height.
+///
+/// The rule (own choice, see the module docs): the body of a dialog frame
+/// starts below the title strip and the text pad, and every row takes
+/// [`TEXT_LINE_PX`] pixels, so the last row's band ends at or before the
+/// client bottom:
+///
+/// ```text
+/// rows = (client_height - TITLE_STRIP_HEIGHT - TEXT_PAD) / TEXT_LINE_PX
+/// ```
+///
+/// For the browser's own client size ([`SKIN_BROWSER_CLIENT_SIZE`]) that is
+/// nine rows. A row whose band would cross the bottom is not drawn, so the
+/// browser never shows a clipped row — it scrolls instead.
+pub fn skin_browser_visible_rows(client_height: u32) -> usize {
+    let body = client_height.saturating_sub(BODY_TOP as u32);
+    (body / TEXT_LINE_PX as u32).max(1) as usize
+}
+
 /// The headless dialog state: which dialog (if any) is open, plus the jump
-/// box's input text, the skin browser's selected row and the open-media
-/// dialog's entry field and staged picks.
+/// box's input text, the skin browser's selected row and its scroll window
+/// and the open-media dialog's entry field and staged picks.
 #[derive(Debug, Clone, Default)]
 pub struct DialogManager {
     open: Option<DialogKind>,
     jump_text: String,
+    /// The skin browser's selected row.
     skin_index: usize,
+    /// The skin browser's scroll offset: the index of the first row it
+    /// shows.
+    skin_scroll: usize,
+    /// The client height of the skin browser, in pixels. The number of rows
+    /// it shows at once follows from it (see
+    /// [`skin_browser_visible_rows`]); zero means "not told yet", and the
+    /// browser then shows every row it has.
+    skin_client_height: u32,
     /// How many rows the skin browser has, told to the manager when it opens.
     ///
     /// The manager cannot know the list itself, and without the count a held
@@ -461,12 +501,13 @@ impl DialogManager {
     /// Opens `dialog`, replacing whatever is open. Clears the jump input, the
     /// open-media entry field and its staged picks, the load-playlist field
     /// and its staged pick, and resets the skin
-    /// selection to the first row.
+    /// selection and its scroll window to the first row.
     pub fn open(&mut self, dialog: DialogKind) {
         self.open = Some(dialog);
         self.jump_text.clear();
         self.jump_index = 0;
         self.skin_index = 0;
+        self.skin_scroll = 0;
         self.media_text.clear();
         self.media_paths.clear();
         self.playlist_text.clear();
@@ -480,6 +521,7 @@ impl DialogManager {
             self.jump_text.clear();
             self.jump_index = 0;
             self.skin_index = 0;
+            self.skin_scroll = 0;
             self.media_text.clear();
             self.media_paths.clear();
             self.playlist_text.clear();
@@ -493,6 +535,7 @@ impl DialogManager {
         self.jump_text.clear();
         self.jump_index = 0;
         self.skin_index = 0;
+        self.skin_scroll = 0;
         self.media_text.clear();
         self.media_paths.clear();
         self.playlist_text.clear();
@@ -571,7 +614,9 @@ impl DialogManager {
     /// open-media entry field (open-media dialogs only; the [`Key`] model has
     /// no punctuation, so full paths and URLs arrive through
     /// [`set_media_text`](Self::set_media_text)), `Up`/`Down` move the skin
-    /// browser's selection (skin browser only), `Backspace` deletes the last
+    /// browser's selection and scroll its window, `PageUp`/`PageDown` page
+    /// through it and `Home`/`End` jump to its first and its last row (skin
+    /// browser only), `Backspace` deletes the last
     /// character of the jump input or the open-media field, `Enter` and
     /// `Escape` are consumed by any open dialog so the app can confirm or
     /// close it. Everything else falls through (`false`).
@@ -652,6 +697,38 @@ impl DialogManager {
                     if self.jump_rows > 0 {
                         self.jump_index = self.jump_index.min(self.jump_rows - 1);
                     }
+                    true
+                }
+                _ => false,
+            },
+            // The skin browser's window: a page is as many rows as the
+            // browser shows at once, and `Home`/`End` jump to the first and
+            // the last row. Every one of them scrolls the window so the
+            // selected row stays visible.
+            Key::PageUp => match self.open {
+                Some(DialogKind::SkinBrowser) => {
+                    self.page_skin_up();
+                    true
+                }
+                _ => false,
+            },
+            Key::PageDown => match self.open {
+                Some(DialogKind::SkinBrowser) => {
+                    self.page_skin_down();
+                    true
+                }
+                _ => false,
+            },
+            Key::Home => match self.open {
+                Some(DialogKind::SkinBrowser) => {
+                    self.select_first_skin();
+                    true
+                }
+                _ => false,
+            },
+            Key::End => match self.open {
+                Some(DialogKind::SkinBrowser) => {
+                    self.select_last_skin();
                     true
                 }
                 _ => false,
@@ -909,44 +986,189 @@ impl DialogManager {
         self.skin_index
     }
 
-    /// Moves the skin browser's selection one row down. A no-op unless the
-    /// skin browser is open. Clamped to the last row when the row count is
-    /// known (see [`set_skin_rows`](Self::set_skin_rows)).
-    pub fn select_next_skin(&mut self) {
-        if matches!(self.open, Some(DialogKind::SkinBrowser)) {
-            self.skin_index = self.skin_index.saturating_add(1);
-            if self.skin_rows > 0 {
-                self.skin_index = self.skin_index.min(self.skin_rows - 1);
-            }
+    /// The skin browser's scroll offset: the index of the first row it
+    /// shows.
+    pub fn skin_scroll(&self) -> usize {
+        self.skin_scroll
+    }
+
+    /// How many rows the skin browser shows at once.
+    ///
+    /// The rule is [`skin_browser_visible_rows`]: the rows that fit into the
+    /// client area below the title strip. A browser whose client height was
+    /// never told shows every row it has, so nothing is hidden before the
+    /// app says how much room there is.
+    pub fn skin_visible_rows(&self) -> usize {
+        if self.skin_client_height == 0 {
+            return self.skin_rows;
         }
+        skin_browser_visible_rows(self.skin_client_height)
+    }
+
+    /// The largest scroll offset: the last page shows the last rows of the
+    /// list. A list that fits the window has no scroll at all.
+    pub fn skin_max_scroll(&self) -> usize {
+        self.skin_rows.saturating_sub(self.skin_visible_rows())
+    }
+
+    /// The rows the skin browser shows, as a range of indices into the list
+    /// it has.
+    ///
+    /// The range starts at the scroll offset and holds as many rows as the
+    /// window shows; it never reaches past the end of the list, so the last
+    /// page is short when the list is.
+    pub fn skin_visible_range(&self, entries: &[SkinEntry]) -> Range<usize> {
+        let visible = self.skin_visible_rows();
+        let first = self.skin_scroll.min(entries.len().saturating_sub(visible));
+        let end = first.saturating_add(visible).min(entries.len());
+        first..end
+    }
+
+    /// The index of the selected row, clamped to the list the browser has.
+    ///
+    /// `None` when the skin browser is not open or the list is empty.
+    pub fn skin_selected_index(&self, entries: &[SkinEntry]) -> Option<usize> {
+        if self.open != Some(DialogKind::SkinBrowser) || entries.is_empty() {
+            return None;
+        }
+        Some(self.skin_index.min(entries.len() - 1))
+    }
+
+    /// Moves the skin browser's selection one row down and scrolls the window
+    /// so the selected row stays visible. A no-op unless the skin browser is
+    /// open. Clamped to the last row when the row count is known (see
+    /// [`set_skin_rows`](Self::set_skin_rows)).
+    pub fn select_next_skin(&mut self) {
+        if !self.skin_browser_open() {
+            return;
+        }
+        self.skin_index = self.skin_index.saturating_add(1);
+        if self.skin_rows > 0 {
+            self.skin_index = self.skin_index.min(self.skin_rows - 1);
+        }
+        self.reveal_skin();
+    }
+
+    /// Moves the skin browser's selection one row up and scrolls the window
+    /// so the selected row stays visible. A no-op unless the skin browser is
+    /// open.
+    pub fn select_prev_skin(&mut self) {
+        if !self.skin_browser_open() {
+            return;
+        }
+        self.skin_index = self.skin_index.saturating_sub(1);
+        self.reveal_skin();
+    }
+
+    /// Moves the skin browser's selection to the first row and scrolls the
+    /// window to the top. A no-op unless the skin browser is open.
+    pub fn select_first_skin(&mut self) {
+        if !self.skin_browser_open() {
+            return;
+        }
+        self.skin_index = 0;
+        self.reveal_skin();
+    }
+
+    /// Moves the skin browser's selection to the last row and scrolls the
+    /// window to the last page. A no-op unless the skin browser is open.
+    pub fn select_last_skin(&mut self) {
+        if !self.skin_browser_open() {
+            return;
+        }
+        if self.skin_rows > 0 {
+            self.skin_index = self.skin_rows - 1;
+        }
+        self.reveal_skin();
+    }
+
+    /// Moves the skin browser's selection one page down and scrolls the
+    /// window with it. A page is as many rows as the browser shows at once.
+    /// A no-op unless the skin browser is open.
+    pub fn page_skin_down(&mut self) {
+        if !self.skin_browser_open() {
+            return;
+        }
+        self.skin_index = self
+            .skin_index
+            .saturating_add(self.skin_visible_rows().max(1));
+        if self.skin_rows > 0 {
+            self.skin_index = self.skin_index.min(self.skin_rows - 1);
+        }
+        self.reveal_skin();
+    }
+
+    /// Moves the skin browser's selection one page up and scrolls the window
+    /// with it. A page is as many rows as the browser shows at once. A no-op
+    /// unless the skin browser is open.
+    pub fn page_skin_up(&mut self) {
+        if !self.skin_browser_open() {
+            return;
+        }
+        self.skin_index = self
+            .skin_index
+            .saturating_sub(self.skin_visible_rows().max(1));
+        self.reveal_skin();
     }
 
     /// Tells the manager how many rows the skin browser has, so that moving the
-    /// selection saturates at the last row instead of overrunning it. Call it
+    /// selection saturates at the last row instead of overrunning it and the
+    /// scroll window stays inside the list. Call it
     /// when opening the browser; `0` means "unknown" and leaves moves unbounded.
     pub fn set_skin_rows(&mut self, rows: usize) {
         self.skin_rows = rows;
         if rows > 0 && self.skin_index >= rows {
             self.skin_index = rows - 1;
         }
+        self.clamp_skin_scroll();
     }
 
-    /// Moves the skin browser's selection one row up. A no-op unless the skin
-    /// browser is open.
-    pub fn select_prev_skin(&mut self) {
-        if matches!(self.open, Some(DialogKind::SkinBrowser)) {
-            self.skin_index = self.skin_index.saturating_sub(1);
-        }
+    /// Tells the manager the client height of the skin browser, so it knows
+    /// how many rows the window shows at once (see
+    /// [`skin_browser_visible_rows`]).
+    ///
+    /// A change of the height changes the window: the scroll offset is
+    /// clamped into the new range, so the last page stays full.
+    pub fn set_skin_client_height(&mut self, height: u32) {
+        self.skin_client_height = height;
+        self.clamp_skin_scroll();
     }
 
     /// The selected skin-browser row, or `None` when the skin browser is not
     /// open or there are no rows. An overrun index clamps to the last row, so
     /// holding `Down` past the end keeps the last row selected.
     pub fn selected_skin<'a>(&self, entries: &'a [SkinEntry]) -> Option<&'a SkinEntry> {
-        if self.open != Some(DialogKind::SkinBrowser) {
-            return None;
+        self.skin_selected_index(entries)
+            .and_then(|index| entries.get(index))
+    }
+
+    /// Whether the skin browser is the open dialog.
+    fn skin_browser_open(&self) -> bool {
+        self.open == Some(DialogKind::SkinBrowser)
+    }
+
+    /// Scrolls the window so the selected row is inside it.
+    ///
+    /// The window keeps its offset when the selected row is already visible
+    /// and moves the least it has to otherwise: a row above the window pulls
+    /// it up, a row below it pushes it down until the row is the last one on
+    /// screen.
+    fn reveal_skin(&mut self) {
+        let visible = self.skin_visible_rows();
+        if visible == 0 {
+            return;
         }
-        entries.get(self.skin_index).or(entries.last())
+        if self.skin_index < self.skin_scroll {
+            self.skin_scroll = self.skin_index;
+        } else if self.skin_index >= self.skin_scroll + visible {
+            self.skin_scroll = self.skin_index + 1 - visible;
+        }
+        self.clamp_skin_scroll();
+    }
+
+    /// Keeps the scroll offset inside the list.
+    fn clamp_skin_scroll(&mut self) {
+        self.skin_scroll = self.skin_scroll.min(self.skin_max_scroll());
     }
 
     /// The preferences dialog's current page, when it is open.
@@ -1862,6 +2084,11 @@ pub fn playlist_load_summary_lines(path: &Path, loaded: usize, skips: &[String])
 /// lines, the jump prompt plus input). Colours and padding are own choices;
 /// a skin without the text sheet still yields the right-sized frame with no
 /// text (same fallback shape as the playlist rows).
+///
+/// A body line whose band would cross the bottom of the client area is not
+/// drawn: the frame never shows a clipped row. A dialog whose body is longer
+/// than its client area (the skin browser with many skins) scrolls instead —
+/// see [`skin_browser_visible_rows`].
 pub fn render_dialog(kind: DialogKind, skin: &Skin, body: &[&str]) -> Image {
     let (width, height) = kind.client_size();
     let mut canvas = Image::filled(width, height, [0x18, 0x18, 0x20, 0xff]);
@@ -1873,8 +2100,13 @@ pub fn render_dialog(kind: DialogKind, skin: &Skin, body: &[&str]) -> Image {
     let font = text_font(skin);
     if let Some(font) = font.as_ref() {
         font.render_text(&mut canvas, TEXT_PAD, 3, kind.title());
-        let mut y = TITLE_STRIP_HEIGHT as i32 + TEXT_PAD;
+        let mut y = BODY_TOP;
         for line in body {
+            // The line's band has to fit into the client area; a line that
+            // would cross the bottom is left out instead of being cut off.
+            if y + TEXT_LINE_PX > height as i32 {
+                break;
+            }
             font.render_text(&mut canvas, TEXT_PAD, y, line);
             y += TEXT_LINE_PX;
         }
@@ -1888,6 +2120,9 @@ pub const TITLE_STRIP_HEIGHT: u32 = 16;
 pub const TEXT_PAD: i32 = 8;
 /// Line advance for dialog body text. Own choice.
 pub const TEXT_LINE_PX: i32 = 12;
+/// The top of the first body row in a dialog frame: below the title strip
+/// and the text pad.
+pub const BODY_TOP: i32 = TITLE_STRIP_HEIGHT as i32 + TEXT_PAD;
 
 /// The `text.bmp` bitmap font as a stand-in for the dialogs' real font.
 ///
@@ -2298,6 +2533,167 @@ mod tests {
         assert!(!manager.key(Key::Up));
         assert!(manager.key(Key::Enter));
         assert!(manager.key(Key::Escape));
+    }
+
+    /// A skin browser with `count` rows, opened at the browser's own client
+    /// size, and the list it looks at.
+    fn browser_with(count: usize) -> (DialogManager, Vec<SkinEntry>) {
+        let entries: Vec<SkinEntry> = (0..count)
+            .map(|index| SkinEntry {
+                name: format!("skin {index}"),
+                path: Some(std::path::PathBuf::from(format!("skin {index}.wsz"))),
+            })
+            .collect();
+        let mut manager = DialogManager::new();
+        manager.open(DialogKind::SkinBrowser);
+        manager.set_skin_client_height(SKIN_BROWSER_CLIENT_SIZE.1);
+        manager.set_skin_rows(count);
+        (manager, entries)
+    }
+
+    #[test]
+    fn the_browser_shows_the_rows_that_fit_its_client_area() {
+        // Nine rows fit below the title strip of the 300 x 140 client area.
+        assert_eq!(skin_browser_visible_rows(SKIN_BROWSER_CLIENT_SIZE.1), 9);
+        let (manager, entries) = browser_with(20);
+        assert_eq!(manager.skin_visible_rows(), 9);
+        assert_eq!(manager.skin_visible_range(&entries), 0..9);
+        // A list that fits shows every row and has no scroll.
+        let (small, few) = browser_with(3);
+        assert_eq!(small.skin_visible_range(&few), 0..3);
+        assert_eq!(small.skin_max_scroll(), 0);
+    }
+
+    #[test]
+    fn the_arrows_scroll_the_window_with_the_selection() {
+        let (mut manager, entries) = browser_with(20);
+        // The first nine rows are on screen; the tenth scrolls the window.
+        for _ in 0..8 {
+            manager.select_next_skin();
+        }
+        assert_eq!(manager.skin_index(), 8);
+        assert_eq!(manager.skin_scroll(), 0);
+        manager.select_next_skin();
+        assert_eq!(manager.skin_index(), 9);
+        assert_eq!(
+            manager.skin_scroll(),
+            1,
+            "the window followed the selection"
+        );
+        assert_eq!(manager.skin_visible_range(&entries), 1..10);
+        assert!(
+            manager
+                .skin_visible_range(&entries)
+                .contains(&manager.skin_index()),
+            "the selected row is on screen"
+        );
+        // Up scrolls the window back as far as the selection needs: the row
+        // is still on screen, so the window keeps its offset.
+        manager.select_prev_skin();
+        assert_eq!(manager.skin_index(), 8);
+        assert_eq!(manager.skin_scroll(), 1);
+        assert!(
+            manager
+                .skin_visible_range(&entries)
+                .contains(&manager.skin_index()),
+            "the selected row is on screen"
+        );
+        // Up past the top of the window pulls it up again.
+        for _ in 0..8 {
+            manager.select_prev_skin();
+        }
+        assert_eq!(manager.skin_index(), 0);
+        assert_eq!(manager.skin_scroll(), 0);
+    }
+
+    #[test]
+    fn end_and_home_jump_to_the_last_and_the_first_row() {
+        let (mut manager, entries) = browser_with(20);
+        manager.select_last_skin();
+        assert_eq!(manager.skin_index(), 19);
+        assert_eq!(manager.skin_scroll(), 11);
+        assert_eq!(manager.skin_visible_range(&entries), 11..20);
+        manager.select_first_skin();
+        assert_eq!(manager.skin_index(), 0);
+        assert_eq!(manager.skin_scroll(), 0);
+        assert_eq!(manager.skin_visible_range(&entries), 0..9);
+    }
+
+    #[test]
+    fn a_client_height_change_changes_the_window() {
+        let (mut manager, entries) = browser_with(20);
+        manager.select_last_skin();
+        assert_eq!(manager.skin_scroll(), 11);
+        // A shorter client area shows fewer rows.
+        manager.set_skin_client_height(80);
+        assert_eq!(manager.skin_visible_rows(), 4);
+        assert_eq!(manager.skin_visible_range(&entries), 11..15);
+        // A taller one shows the whole list, so the window is back at the top.
+        manager.set_skin_client_height(400);
+        assert_eq!(manager.skin_visible_rows(), 31);
+        assert_eq!(manager.skin_scroll(), 0);
+        assert_eq!(manager.skin_visible_range(&entries), 0..20);
+    }
+
+    #[test]
+    fn the_browser_keys_page_and_jump() {
+        let (mut manager, entries) = browser_with(20);
+        // A page is as many rows as the browser shows.
+        assert!(manager.key(Key::PageDown));
+        assert_eq!(manager.skin_index(), 9);
+        assert_eq!(manager.skin_scroll(), 1);
+        assert!(manager.key(Key::PageDown));
+        assert_eq!(manager.skin_index(), 18);
+        assert_eq!(manager.skin_scroll(), 10);
+        assert!(manager.key(Key::PageUp));
+        assert_eq!(manager.skin_index(), 9);
+        assert_eq!(manager.skin_scroll(), 9);
+        assert!(manager.key(Key::End));
+        assert_eq!(manager.skin_index(), 19);
+        assert_eq!(manager.skin_scroll(), 11);
+        assert!(manager.key(Key::Home));
+        assert_eq!(manager.skin_index(), 0);
+        assert_eq!(manager.skin_scroll(), 0);
+        assert_eq!(manager.skin_visible_range(&entries), 0..9);
+        // The keys belong to the browser alone.
+        manager.open(DialogKind::About);
+        for key in [Key::PageUp, Key::PageDown, Key::Home, Key::End] {
+            assert!(!manager.key(key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_frame_draws_no_row_outside_the_client_area() {
+        use rustamp_skin::BuiltinDefaultSkin;
+
+        let mut source = BuiltinDefaultSkin::source();
+        let skin = Skin::from_source(&mut source, &BuiltinDefaultSkin).unwrap();
+        let body: Vec<String> = (0..12).map(|index| format!("row {index}")).collect();
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let frame = render_dialog(DialogKind::SkinBrowser, &skin, &refs);
+        assert_eq!(
+            (frame.width(), frame.height()),
+            SKIN_BROWSER_CLIENT_SIZE,
+            "the frame is the client area"
+        );
+        let background = Some([0x18, 0x18, 0x20, 255]);
+        // The first row is drawn, so the check below is about the tenth.
+        let mut drawn = false;
+        for y in BODY_TOP..(BODY_TOP + TEXT_LINE_PX) {
+            for x in 0..frame.width() as i32 {
+                if frame.pixel(x, y) != background {
+                    drawn = true;
+                }
+            }
+        }
+        assert!(drawn, "the first row is on the frame");
+        // The band of the tenth row crosses the bottom of the client area, so
+        // that row is not drawn at all.
+        for y in (BODY_TOP + 9 * TEXT_LINE_PX)..frame.height() as i32 {
+            for x in 0..frame.width() as i32 {
+                assert_eq!(frame.pixel(x, y), background, "{x},{y}");
+            }
+        }
     }
 
     #[test]
