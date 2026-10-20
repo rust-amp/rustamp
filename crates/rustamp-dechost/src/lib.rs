@@ -26,11 +26,13 @@
 //! reports it as a terminal `DecoderError` instead of an end of stream. A
 //! half-downloaded track therefore fails loudly instead of playing short.
 //!
-//! The limit of that rule is where the decoder has no oracle: only a
-//! container that states its payload length exactly (RIFF/WAVE) can say that
-//! a file was cut, so a truncated file of another kind still ends with an end
-//! of stream. Durations may be estimates as well; comparing them to decoded
-//! frames is not a format-independent truncation check.
+//! The limit of that rule is where the decoder has no oracle: a container
+//! that states its payload exactly (RIFF/WAVE, AIFF, MPEG audio with a
+//! Xing/Info header, MP4/M4A) or states the end of its stream (Ogg, whose
+//! last page carries the end-of-stream flag) can say that a file was cut, so
+//! a truncated file of another kind still ends with an end of stream.
+//! Durations may be estimates as well; comparing them to decoded frames is
+//! not a format-independent truncation check.
 //!
 //! A file that cannot be decoded at all is refused when it is opened, and the
 //! refusal carries the reason the decoder named: a FLAC file without a

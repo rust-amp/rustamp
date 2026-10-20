@@ -37,6 +37,9 @@ Behaviour the core contract leaves open, and what the decoders do.
     the number of frames and the bytes of the audio itself (see below). The
     claim of the media data box is the one that survives the loss of the movie
     box, so it is the one that names a cut file.
+  - **Ogg** states the end of its stream with a **flag**, not with a count: the
+    last page of a logical bitstream carries the end-of-stream flag. The
+    oracle is that flag (see the Ogg header below).
   FLAC is not on that list, and the reason is worth naming: its `STREAMINFO`
   block states the number of samples exactly, but the format has no field for
   the number of bytes the audio occupies, and a damaged FLAC frame is dropped
@@ -127,6 +130,48 @@ Behaviour the core contract leaves open, and what the decoders do.
   points behind the end of the file is the case the end-of-stream rule
   catches: it opens, and the stream ends before the media header's count is
   reached.
+- **The Ogg header** (`ogg_header.rs`). An Ogg file is a sequence of **pages**,
+  and it states the end of its stream with a **flag** instead of with a count:
+  the last page of a logical bitstream carries the end-of-stream flag (bit 2 of
+  the header type byte), so an intact file ends with a page that has it. The
+  pages are walked - the capture pattern, the stream structure version, the
+  flags, the granule position, the serial number, the sequence number, the
+  segment table and the checksum - and the walk yields one of three verdicts:
+  - **The file ends at the end of a page.** The last page is intact (its
+    checksum matches) and carries the end-of-stream flag: the stream ends
+    where the file ends, and the file ends with a plain end of stream. The
+    last page is intact and does *not* carry the flag: the bitstream itself
+    says that more is to come, so the file was cut and the decoder says so
+    (`Error::Decode("truncated stream: the Ogg file ends with a page that has
+    no end-of-stream flag")`).
+  - **The file ends inside a page.** An intact file always ends at the
+    boundary of a page, so a file that ends inside one was cut
+    (`Error::Decode("truncated stream: the Ogg file ends inside the page at
+    offset N")`).
+  - **The pages show damage.** A page whose checksum does not match, or a gap
+    in the page sequence numbers of a logical bitstream, means that pages are
+    missing or broken. That is damage, not a cut: the page that would say
+    "the stream ends here" cannot be read, so nothing is claimed and the file
+    keeps playing as it always did.
+  The walk reads every page and checks its checksum, so it reads the whole
+  file once when the decoder is opened - like the MP4 container reader, which
+  scans the whole file before it plays anything. A file whose length is
+  unknown (a reader that cannot report its end) is walked the same way: the
+  walk stops at the end of the file itself.
+  The **granule position** of the last page is the second half of the check.
+  The container reader reports a frame count only when it has seen an
+  end-of-stream page, and that count is derived from the granule position of
+  that page (measured on the repository fixture: the last page states 66150
+  samples at 44.1 kHz and the reader reports 66150 frames). The count and the
+  granule position therefore have to agree; a count that is larger than the
+  granule position of the last page means that the reader knows more about the
+  stream than the pages do, and then nothing is claimed. (The OggFLAC mapping
+  is the one exception: it states the sample count in its `STREAMINFO` block
+  instead of in the end-of-stream page.)
+  What the granule position cannot do is tell a cut file from a damaged one
+  on its own: the granule position of the last page states the samples *up to
+  that page*, which is exactly what a cut file holds. It is the flag, not the
+  count, that says that more is to come.
 - **Seek.** `SeekMode::Accurate` plus a 4096-frame pre-roll that is decoded and
   discarded, because MP3/Vorbis/AAC need previous blocks for exact output.
   Returns the requested position clamped to the duration (it is sample exact).
@@ -224,6 +269,10 @@ correct behaviour:
    the bytes of the audio - but its container reader scans the whole file
    before it plays anything, so the cut is named when the file is *opened*
    rather than at the end of the stream (see above).
+   Ogg is the one container that states its end with a **flag** instead of a
+   count: the last page of a logical bitstream carries the end-of-stream flag,
+   and a file that does not end with such a page was cut (see above and item
+   10 below).
    The FLAC case is item 8 below: it is the one where the container states the
    sample count exactly and still cannot say whether the file was cut.
 2. **A damaged file whose *content signature* matches is reported as
@@ -325,6 +374,31 @@ correct behaviour:
      damaged ALAC file, 64512 of 67584 for the damaged AAC file) while it
      holds all of its bytes. It ends cleanly, like the damaged file it
      resembles.
+10. **An Ogg file is only a loud failure when its last page can be read**
+    (symphonia). The end-of-stream flag is an exact oracle: a file whose last
+    page is intact and does not carry it was cut, and the bitstream says so
+    itself. Two limits follow from the way the format stores the flag:
+    - The flag lives in the **page header**, and the header is covered by the
+      page checksum. A last page whose checksum does not match cannot be read
+      at all, so it cannot say whether the stream ended there. Such a file is
+      damage, not a cut: it keeps playing and nothing is claimed.
+    - The **segment table** of the last page states the length of its body,
+      and it is covered by the checksum as well. A file whose last page has a
+      damaged segment table therefore cannot be told from a file that was cut
+      inside that page: the walk believes the segment table and names the
+      cut. This is the same trust model the other containers use (an AIFF
+      `SSND` chunk or an MP4 `mdat` box with a damaged size field gives a
+      wrong verdict in the same way), and it is the price of the loud
+      failure: a half-downloaded track must not play short as if it were
+      complete.
+    A file that was cut **before** its end-of-stream page is named in both
+    cases (the last page is intact and has no flag, or the file ends inside a
+    page), and a file whose pages show damage anywhere - a page with a wrong
+    checksum, a gap in the page sequence numbers - is never named.
+    A **chained** Ogg file (several logical bitstreams in one file) is not
+    judged either: the container reader ends the stream at the chain boundary
+    (C3.4), so the end of the file is never reached and no verdict is
+    reported.
 
 ## Proposals
 

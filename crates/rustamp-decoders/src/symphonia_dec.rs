@@ -33,6 +33,13 @@
 //!   The **metadata** of a FLAC file is checked, though: a file without a
 //!   `STREAMINFO` block and a file whose metadata chain was cut are named
 //!   when they are opened (see [`flac_refusal`]).
+//! * **Ogg states the end of its stream with a flag, not with a count**
+//!   (see [`ogg_header`]): the last page of a logical bitstream carries the
+//!   end-of-stream flag, so a file whose last page is intact and does not
+//!   carry it was cut - the bitstream itself says that more is to come. A
+//!   file that ends inside a page was cut as well. Damage is not a cut: a
+//!   page whose checksum does not match and a gap in the page sequence
+//!   numbers are damage, and such a file keeps playing.
 //! * Corrupt packets are skipped; see [`SymphoniaDecoder::skipped_packets`].
 //! * Hostile input (truncated, empty, lying headers, noise) is rejected with a
 //!   defined error or degraded to a defined end of stream; the loop in
@@ -269,6 +276,13 @@ struct HeaderProbe {
     /// chain is read from the file itself: a block can be larger than the
     /// header window.
     flac: Option<crate::flac_header::FlacMetadata>,
+    /// What the pages of an Ogg file say about the end of the stream, when
+    /// the file is an Ogg file.
+    ///
+    /// The end of an Ogg stream is a flag on its last page, not a count, so
+    /// the pages of the file are walked to find it. The walk is read from
+    /// the file itself: an Ogg file has no header that states its payload.
+    ogg: Option<crate::ogg_header::OggPages>,
 }
 
 /// The byte claim of a container: how many bytes the payload occupies and how
@@ -361,6 +375,13 @@ fn declared_payload(
     // as it is in a cut one (see the module docs). The check is explicit
     // here, so that no other header of a FLAC file can make one up.
     if header.flac.is_some() {
+        return None;
+    }
+    // Ogg states the end of its stream with a flag on its last page, not with
+    // a count, so it has no frame count to compare with. Its oracle is the
+    // end-of-stream flag (see [`ogg_truncation`]), and the check is explicit
+    // here, so that no other header of an Ogg file can make one up.
+    if header.ogg.is_some() {
         return None;
     }
     // AIFF: the `COMM` chunk states the number of sample frames and the
@@ -464,6 +485,7 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
             aiff: None,
             mp4: None,
             flac: None,
+            ogg: None,
         };
     }
     let id3v2 = crate::mpeg_header::id3v2_len(&head);
@@ -474,6 +496,7 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
             aiff: None,
             mp4: None,
             flac: None,
+            ogg: None,
         };
     }
     let mut window = vec![0u8; HEADER_WINDOW];
@@ -508,12 +531,21 @@ fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
     } else {
         None
     };
+    // An Ogg file states the end of its stream with a flag on its last page,
+    // so its pages are walked to find it. The walk reads the whole file: an
+    // Ogg file has no header that states its payload.
+    let ogg = if crate::ogg_header::looks_like_ogg(&window) {
+        crate::ogg_header::parse(reader)
+    } else {
+        None
+    };
     HeaderProbe {
         id3v2,
         window,
         aiff,
         mp4,
         flac,
+        ogg,
     }
 }
 
@@ -576,6 +608,65 @@ fn flac_refusal(header: &HeaderProbe) -> Option<String> {
     }
 }
 
+/// The message for an Ogg file that was cut, when its pages prove it.
+///
+/// The end of an Ogg stream is a flag on the last page of the logical
+/// bitstream, not a count: an intact file ends with a page that carries the
+/// end-of-stream flag. A file whose last page is intact and does not carry
+/// it was cut - the bitstream itself says that more is to come - and so was a
+/// file that ends inside a page.
+///
+/// Damage is not a cut: a file whose pages show damage (a page whose
+/// checksum does not match, a gap in the page sequence numbers) keeps
+/// playing, because the page that would say "the stream ends here" cannot be
+/// read.
+///
+/// `reader_frames` is the frame count the container reader reported. The
+/// reader derives that count from the granule position of the end-of-stream
+/// page (the OggFLAC mapping states it in its `STREAMINFO` block instead), so
+/// the two have to agree: a count that is larger than the granule position of
+/// the last page means that the reader knows more about the stream than the
+/// pages do, and then the two disagree about where the stream ends. Nothing
+/// is claimed then.
+fn ogg_truncation(
+    pages: &crate::ogg_header::OggPages,
+    reader_frames: Option<u64>,
+) -> Option<String> {
+    use crate::ogg_header::OggPages;
+    // The reader's count and the granule position of the last page have to
+    // agree. A count that is larger than the granule position means that the
+    // reader knows more about the stream than the pages do, and then the two
+    // disagree about where the stream ends: nothing is claimed then.
+    if let (OggPages::Complete { granule, .. }, Some(frames)) = (pages, reader_frames)
+        && frames > *granule
+    {
+        return None;
+    }
+    match pages {
+        // The file ends with a page that carries the end-of-stream flag: the
+        // stream ended where the file ends.
+        OggPages::Complete {
+            end_of_stream: true,
+            ..
+        } => None,
+        // The file ends with an intact page that says the stream goes on: it
+        // was cut.
+        OggPages::Complete {
+            end_of_stream: false,
+            ..
+        } => Some(
+            "truncated stream: the Ogg file ends with a page that has no end-of-stream flag"
+                .to_string(),
+        ),
+        // The file ends inside a page: it was cut.
+        OggPages::Cut { offset } => Some(format!(
+            "truncated stream: the Ogg file ends inside the page at offset {offset}"
+        )),
+        // The pages show damage: nothing can be said about the file.
+        OggPages::Damaged => None,
+    }
+}
+
 /// Queues a detected mid-stream format change.
 ///
 /// `spec` is deliberately not switched here: RFC 0002 C3 has `spec()` report the
@@ -624,6 +715,12 @@ pub struct SymphoniaDecoder {
     /// `None` means "no oracle": either the container does not state a count
     /// or it states an estimate (see [`declared_payload`]).
     declared: Option<Declared>,
+    /// What the pages of an Ogg file say about the end of the stream.
+    ///
+    /// `None` for every file that is not an Ogg file. An Ogg file states the
+    /// end of its stream with a flag on its last page instead of with a
+    /// count, so it has no entry in [`declared`] (see [`ogg_truncation`]).
+    ogg: Option<crate::ogg_header::OggPages>,
     /// A truncation found at the end of the stream.
     ///
     /// Reported by the next `read` that writes no frames, so the frames that
@@ -744,6 +841,7 @@ impl SymphoniaDecoder {
             pending_format_change: None,
             delivered: 0,
             declared: declared_payload(&header, &params, byte_len),
+            ogg: header.ogg,
             truncation: None,
             skipped: 0,
             consecutive_errors: 0,
@@ -881,8 +979,18 @@ impl SymphoniaDecoder {
     ///
     /// Only a container that states an exact frame count can say this (see
     /// [`declared_payload`]); without that oracle the end of the stream stays
-    /// an end of stream.
+    /// an end of stream. An Ogg file is the other kind of oracle: it states
+    /// the end of its stream with a flag on its last page (see
+    /// [`ogg_truncation`]).
     fn note_truncation(&mut self) {
+        // The Ogg container states the end of its stream with a flag on its
+        // last page, not with a count.
+        if let Some(pages) = &self.ogg {
+            if let Some(message) = ogg_truncation(pages, self.n_frames) {
+                self.truncation = Some(message);
+            }
+            return;
+        }
         let Some(declared) = &self.declared else {
             return;
         };
@@ -1270,6 +1378,7 @@ mod tests {
                 aiff: None,
                 mp4: None,
                 flac: None,
+                ogg: None,
             },
             &params,
             Some(4096),
@@ -1293,6 +1402,7 @@ mod tests {
                     aiff: None,
                     mp4: None,
                     flac: None,
+                    ogg: None,
                 },
                 &params,
                 Some(4096)
@@ -1311,6 +1421,7 @@ mod tests {
                     aiff: None,
                     mp4: None,
                     flac: Some(crate::flac_header::FlacMetadata::Complete { stream_info: true }),
+                    ogg: None,
                 },
                 &params,
                 Some(4096)
@@ -1344,6 +1455,7 @@ mod tests {
             aiff: None,
             mp4: None,
             flac: Some(crate::flac_header::FlacMetadata::Complete { stream_info: true }),
+            ogg: None,
         };
         assert!(
             declared_payload(&header, &params, Some(12_537)).is_none(),
@@ -1369,6 +1481,7 @@ mod tests {
             aiff: None,
             mp4: None,
             flac: None,
+            ogg: None,
         };
 
         let mut params = CodecParameters::new();
