@@ -130,6 +130,16 @@ after every merge), not by trusting the lane's report.
 | `wave250` | ring property tests; the wake path missed the fence, so a reset could lose a wakeup |
 | `wave252` | DSP property tests; the EQ could emit `inf` (→ `NaN`), the crossfade was inexact, the dry end was not bit-exact |
 | `wave253` | `WriteReport::unstoreable` names the values a format cannot hold (MP4 `trkn`/`disk` are 16-bit) |
+| `wave254` | skin parsers against malformed input: a `region.txt` overflow panic, two silent misparses, an allocation before the length check |
+| `wave255` | output selection/format properties; `±∞` was written as full scale instead of silence |
+| `wave256` | the edit-entry save names a value the format cannot hold |
+| `wave257` | gain/balance properties; the frame-versus-sample buffer size documented |
+| `wave258` | playlist selection properties and the anchor rule |
+| `wave259` | window layout properties; shade+unshade is the identity again; the title-strip clamp rule |
+| `wave260` | one output stage clamps both converter paths (F2) |
+| `wave261` | shift-range and ctrl-toggle selection gestures (own choices, S06 is silent) |
+| `wave263` | the engine adapter pumps in lockstep chunks, the resident deadlock is unreachable (C6-2) |
+| `wave264` | a seek re-derives the ReplayGain multiplier (F3) |
 
 Also this session: the post-merge check was a **false green** because it ran
 `cargo check --workspace` without `--all-targets`; three test call sites were
@@ -145,14 +155,25 @@ own task cards `W33`/`W34`). They are legitimate and the workspace is green,
 but they did not come from this orchestrator - worth finding out who is writing
 to the canonical tree.
 
-The property-test waves (245-253) found five real defects: the ASCII `LIKE`
+The property-test waves (245-259) found seven real defects: the ASCII `LIKE`
 prefix, the 64 MB MP4 allocation from a 140-byte file, the missing wake fence,
-the EQ's `inf` output and its inexact crossfade, and the silently dropped 16-bit
-MP4 numbers.
+the EQ's `inf` output and its inexact crossfade, the silently dropped 16-bit
+MP4 numbers, the `region.txt` overflow panic with its two silent misparses, and
+a shade/unshade that was not the identity. A further real gap: the playlist had
+**no** shift- or ctrl-selection gesture at all (`wave261` added them as
+documented own choices, because S06 settles only the single click and SEL).
 
-In flight at the time of writing: `wave251` (engine time properties),
-`wave254` (skin parser malformed input), `wave255` (output format-selection
-properties), `wave256` (surface `unstoreable` in the app).
+The review findings are nearly closed now: `F2` (equal-rate clamp), `C6-2` (the
+production adapter's deadlock), `F3` (ReplayGain across a seek) are fixed and
+their entries in `docs/tasks/W14-wave-review.md` say so; `F5`/`F7` (the honest
+serializer deleting unhonoured settings) and `F4` (a resident DSP failure
+killing every later track) are in flight. Still open after that: `C1-2`/`C1-3`
+(documentedly false, the wiring is the caller's), `C4-1..C4-3`, `C5-1`/`C5-2`
+(test gaps), `F6` and `C6-3` (card manifest).
+
+In flight at the time of writing: `wave262` (preserve unhonoured config
+settings), `wave265` (clamp a restored window onto a visible monitor),
+`wave266` (a failed DSP stage recovers for the next track).
 
 ## Rules added to `AGENTS.md` during the session
 
