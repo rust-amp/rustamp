@@ -206,9 +206,17 @@ fn base291_main_focus_shade_scale_and_pressed_buttons() {
                 (frame.width(), frame.height()),
                 (275, if shade { 14 } else { 116 })
             );
-            // Avoid the shade slider and compare the entire unoverlaid left
-            // band. The shaded analyser (S08 §1) is drawn over that band, so
-            // its own rectangle is left out.
+            // The whole title band is the skin's own title-bar cell: the
+            // renderer paints nothing over it, neither the windowshade
+            // position slider (the skin's shade cell carries the groove
+            // itself) nor anything else. The shaded analyser (S08 §1) is our
+            // own area and sits in the shaded band, so its rectangle is left
+            // out there.
+            let skip = if shade {
+                layout.shade_visualization
+            } else {
+                Rect::new(0, 0, 0, 0)
+            };
             region_except(
                 &frame,
                 &skin,
@@ -221,12 +229,12 @@ fn base291_main_focus_shade_scale_and_pressed_buttons() {
                         (true, true) => 29,
                         (true, false) => 42,
                     },
-                    220,
+                    275,
                     14,
                 ),
                 0,
                 0,
-                layout.shade_visualization,
+                skip,
             );
             let double = render_main_window(
                 &MainWindowState {
@@ -303,6 +311,68 @@ fn base291_main_focus_shade_scale_and_pressed_buttons() {
             rect.y,
         );
     }
+}
+
+/// The shaded main window against the measured reference capture.
+///
+/// The capture directory holds the approved client captures of Winamp 2.95
+/// (skin base-2.91, 96 dpi, 1024x768 guest). `main-shade.reference.png` is
+/// the shaded main window, 275 x 14. This renders the same state headlessly
+/// (the same skin, the same size, the same focus) and compares it pixel by
+/// pixel. No capture is taken here and no pixel is fabricated: the reference
+/// is a file, the other side is this renderer's output.
+///
+/// The shaded analyser (S08 §1) is our own area: the reference keeps the
+/// skin's own art there, and those pixels are ours and not the reference's.
+/// So the difference must be exactly that rectangle and nothing else.
+#[test]
+fn base291_shade_strip_matches_the_reference_capture() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("RUSTAMP_BASE291_CAPTURES")
+            .unwrap_or_else(|| "D:/code/rustamp-testcaptures/base291".into()),
+    );
+    let reference_path = root.join("main-shade.reference.png");
+    if !reference_path.is_file() {
+        eprintln!(
+            "SKIP base291_shade_strip_matches_the_reference_capture: the reference capture {} is not available",
+            reference_path.display()
+        );
+        return;
+    }
+    let skin = skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let state = MainWindowState {
+        windowshade: true,
+        title_bar_focused: true,
+        ..Default::default()
+    };
+    let frame = render_main_window(&state, &skin, &layout);
+    assert_eq!((frame.width(), frame.height()), (275, 14));
+    let (width, height, rgba) = frame.into_raw();
+    let ours = rustamp_testkit::RgbaImage::from_raw(width, height, rgba).unwrap();
+    let reference = rustamp_testkit::RgbaImage::load_png(&reference_path).unwrap();
+    let diff = rustamp_testkit::compare(&reference, &ours, 0);
+    assert_eq!(diff.size_mismatch, None, "{}", diff.summary());
+
+    // Every pixel that differs must be one of ours: the shaded analyser.
+    let area = layout.shade_visualization;
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            if reference.pixel(x as u32, y as u32) != ours.pixel(x as u32, y as u32) {
+                assert!(
+                    x >= area.x && x < area.right() && y >= area.y && y < area.bottom(),
+                    "{x},{y} differs from the reference but is not the shaded analyser: {}",
+                    diff.summary()
+                );
+            }
+        }
+    }
+    assert_eq!(
+        diff.mismatched_pixels,
+        u64::from(area.width) * u64::from(area.height),
+        "{}: only the shaded analyser may differ from the reference",
+        diff.summary()
+    );
 }
 
 #[test]

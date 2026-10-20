@@ -137,8 +137,14 @@ pub struct MainWindowLayout {
     /// The kHz numeral field: first digit cell at (156,43) (S01 §2.2,
     /// verified). The 10 px width (two cells) is **provisional** (webamp).
     pub khz: Rect,
-    /// The windowshade position slider at (226,4), 17 x 7. **Provisional**: S01
-    /// does not cover the shade internals, so this comes from webamp.
+    /// The windowshade strip's own mini position groove at (226,4), 17 x 7.
+    ///
+    /// **Measured** (2026-10-21): the shaded main window of Winamp 2.95 is
+    /// pixel for pixel the skin's shade title bar (`titlebar.bmp`
+    /// 27,29,275,14), and that cell carries the groove itself - the renderer
+    /// draws no slider of its own over the strip. This rectangle names where
+    /// the groove sits, so a press there is a seek and not a title-bar drag
+    /// (S03 §5's note); the skin carries no thumb sprite for it.
     pub shade_position: Rect,
 }
 

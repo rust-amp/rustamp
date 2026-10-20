@@ -215,8 +215,19 @@ fn draw_shade(
     layout: &MainWindowLayout,
     state: &MainWindowState,
 ) {
-    // S01 §2.1 lists the shade title bars (provisional); S01 does not cover the
-    // shade position slider, so that part stays webamp-provisional.
+    // S01 §2.1 lists the shade title bars (provisional).
+    //
+    // The strip is the skin's own shade title bar and nothing else: the
+    // measured shaded main window of Winamp 2.95 (base-2.91, client capture
+    // of 2026-10-21) is pixel for pixel `titlebar.bmp` (27,29,275,14), so
+    // 2.95 paints no slider of its own over the strip - the mini position
+    // groove it shows there is part of that cell. The webamp-provisional
+    // `MAIN_SHADE_POSITION_*` cells live in the 9 x 9 window-button area
+    // that 2.95 never reads (S01 §2.4, open question 1), so blitting them
+    // would only cover the skin's own art with the leftovers of a button
+    // cell. The groove stays the seek target of the strip (see
+    // `MainWindowLayout::shade_position`); the renderer draws no thumb over
+    // it, because the skin carries no thumb sprite for it.
     let title = if state.title_bar_focused {
         "MAIN_SHADE_BACKGROUND_SELECTED"
     } else {
@@ -230,35 +241,6 @@ fn draw_shade(
         layout.shade_title_bar.x,
         layout.shade_title_bar.y,
     );
-    blit_named(
-        canvas,
-        sheets,
-        skin,
-        "MAIN_SHADE_POSITION_BACKGROUND",
-        layout.shade_position.x,
-        layout.shade_position.y,
-    );
-    let travel = layout.shade_position.width.saturating_sub(3);
-    let offset = (u32::from(state.position.min(100)) * travel + 50) / 100;
-    if state.seekable {
-        blit_named(
-            canvas,
-            sheets,
-            skin,
-            "MAIN_SHADE_POSITION_THUMB",
-            layout.shade_position.x + offset as i32,
-            layout.shade_position.y,
-        );
-    } else {
-        // The shaded window carries the same disabled look.
-        let thumb = Rect::new(
-            layout.shade_position.x + offset as i32,
-            layout.shade_position.y,
-            3,
-            7,
-        );
-        draw_disabled(canvas, sheets, skin, "MAIN_SHADE_POSITION_THUMB", thumb);
-    }
     // S08 §1: the shaded main window carries its own analyser, 38 x 5 px with
     // five bands.
     crate::visualization::draw_visualization(
