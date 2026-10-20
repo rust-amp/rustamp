@@ -377,6 +377,10 @@ mod artwork;
 mod open;
 #[cfg(test)]
 mod query_props;
+#[cfg(test)]
+mod scan_props;
+#[cfg(test)]
+mod testsupport;
 
 pub use artwork::{
     ArtworkCache, ArtworkCacheStats, CoverImage, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
@@ -1866,30 +1870,11 @@ fn map_sqlite<E: std::fmt::Display>(e: E) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testsupport::{last_scanned_at, make_wav, put_last_scanned_at};
     use rustamp_core::meta::TrackMetadata;
     use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
-
-    fn make_wav(path: &Path) {
-        // Minimal 44-byte WAV header (no audio).
-        let mut buf = Vec::with_capacity(44);
-        buf.extend_from_slice(b"RIFF");
-        buf.extend_from_slice(&36u32.to_le_bytes());
-        buf.extend_from_slice(b"WAVE");
-        buf.extend_from_slice(b"fmt ");
-        buf.extend_from_slice(&16u32.to_le_bytes());
-        buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        buf.extend_from_slice(&1u16.to_le_bytes()); // channels
-        buf.extend_from_slice(&44100u32.to_le_bytes()); // sample rate
-        buf.extend_from_slice(&88200u32.to_le_bytes()); // byte rate
-        buf.extend_from_slice(&2u16.to_le_bytes()); // block align
-        buf.extend_from_slice(&16u16.to_le_bytes()); // bits
-        buf.extend_from_slice(b"data");
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        let mut f = File::create(path).unwrap();
-        f.write_all(&buf).unwrap();
-    }
 
     /// A WAV file with a RIFF `LIST INFO` chunk.
     ///
@@ -2466,27 +2451,6 @@ mod tests {
             .unwrap();
         let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
         rows.map(|row| row.unwrap()).collect()
-    }
-
-    /// Put a known time into the root's row, so a test can tell "untouched"
-    /// from "written again in the same second".
-    fn put_last_scanned_at(lib: &Library, id: i64, at: i64) {
-        lib.conn
-            .execute(
-                "UPDATE roots SET last_scanned_at = ?1 WHERE id = ?2",
-                params![at, id],
-            )
-            .unwrap();
-    }
-
-    /// The last-scan time of the root `id`, as the database holds it.
-    fn last_scanned_at(lib: &Library, id: i64) -> Option<i64> {
-        lib.roots()
-            .unwrap()
-            .into_iter()
-            .find(|root| root.id == id)
-            .expect("the root is listed")
-            .last_scanned_at
     }
 
     /// Write a database with the schema of an older version: the `roots`
