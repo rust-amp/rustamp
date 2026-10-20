@@ -28,6 +28,8 @@ Rustamp's **own** license is split by [RFC 0004](docs/rfc/0004-plugin-licensing.
 
 **Orchestrator and integration lead.** These roles stay clean too. They write task cards from specs and merge PRs, but they must not read dirty sources to resolve an implementation question. If a question needs dirty knowledge, it goes back to the dirty room as a request for a spec.
 
+**One owner-authorised exception (RFC 0021, 2026-10-20).** A session may take the dirty-room role for a single spec: it may run the reference binary and disassemble it, provided the only artifact it produces is a spec **draft** kept outside this repository (`D:\code\rustamp-sandbox\spec-drafts\`), the draft is audited by a separate agent before it reaches `specs/`, and **no code is written from the dirty material** — implementation is done by a different agent working only from the audited spec. §4's content rules and §5's rule for implementers are unchanged.
+
 ## 3. Spec pipeline
 
 1. **Dirty-room agent** studies the 2.95 binary and dirty sources and writes a draft spec in private.
