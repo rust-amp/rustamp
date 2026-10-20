@@ -15,7 +15,7 @@ Specs reach this directory only after the Spec Auditor has signed off. Each file
 | S05 | Docking and snapping rules | not started |
 | S06 | Playlist editor (selection, drag-reorder, scrolling, search, resize steps) | not started |
 | S07 | Equalizer (band centers, filter design, slider-to-dB mapping, preamp, `.eqf` formats) | not started |
-| S08 | Classic visualization (spectrum, oscilloscope, 576-sample data for plugins) | not started |
+| S08 | Classic visualization (spectrum, oscilloscope, 576-sample data for plugins) | audited |
 | S09 | Plugin ABI (in_/out_/vis_/dsp_/gen_ structs, versions, threading, call order) | audited – static; runtime confirmation pending |
 | S10 | `WM_WA_IPC` and `WM_COMMAND` catalog | not started |
 | S11 | Embed-window API and `gen.bmp` layout | not started |
