@@ -100,6 +100,7 @@ after every merge), not by trusting the lane's report.
 | `wave217` | the ReplayGain filter is designed at the source rate (44.1 kHz was up to 4.6 dB off at 20 kHz) |
 | `wave218` | "Generate HTML playlist" (40292) with escaping and a native save dialog |
 | `wave220` | the library removes rows whose files are gone, keeps unreadable ones and reports them |
+| `wave225` | the library window removes the missing entries (`Ctrl+M`): the rows whose file is gone are dropped, the unreadable ones are kept and reported, and a running scan refuses the action |
 
 Also this session: the post-merge check was a **false green** because it ran
 `cargo check --workspace` without `--all-targets`; three test call sites were

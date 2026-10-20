@@ -88,6 +88,11 @@ fn chrome(app: &App) -> LibraryChrome {
 fn scan(app: &mut App, media: &Path) {
     app.library_add_folder(media.to_path_buf())
         .expect("add the folder");
+    wait_for_rows(app);
+}
+
+/// Pumps the app until the running scan has committed its rows.
+fn wait_for_rows(app: &mut App) {
     for _ in 0..600 {
         app.pump().expect("pump");
         if app.library_view().total() > 0 {
@@ -96,6 +101,22 @@ fn scan(app: &mut App, media: &Path) {
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("the library scan did not finish");
+}
+
+/// Writes a row whose path the file system refuses to name.
+///
+/// The path holds a NUL byte, so the file system cannot even answer whether
+/// the file is there: such a row is one the removal must keep, and report.
+/// No scan can produce such a path, so the row is written straight into the
+/// index's own database.
+fn insert_unreadable_row(database: &Path, path: &Path) {
+    let connection = rusqlite::Connection::open(database).expect("open the library database");
+    connection
+        .execute(
+            "INSERT INTO tracks (path, title) VALUES (?1, ?2)",
+            rusqlite::params![path.to_string_lossy().to_string(), "Odd"],
+        )
+        .expect("insert the row");
 }
 
 /// A player with an open library window and an indexed folder.
@@ -390,6 +411,144 @@ fn enter_without_a_selection_plays_nothing() {
         "nothing is selected, so nothing is played"
     );
     assert!(app.engine().queue().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Ctrl+M removes the rows whose file is gone
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctrl_m_removes_the_row_whose_file_is_gone() {
+    let (_dir, media, mut app) = library_with_tracks(2);
+    assert_eq!(app.library_view().total(), 2, "the index holds both tracks");
+
+    // The file of the second track is gone: the index still lists it.
+    std::fs::remove_file(media.join("track1.mp3")).expect("remove the track");
+
+    app.library_key_down(Key::Letter(b'M'), Modifiers::CTRL)
+        .expect("ctrl+m");
+
+    // The view is reloaded: the row of the gone file is not in the list.
+    let view = app.library_view();
+    assert_eq!(view.total(), 1, "the row of the gone file is gone");
+    assert_eq!(view.rows().len(), 1, "the page holds the row that is left");
+    assert_eq!(
+        view.rows()[0].path,
+        media.join("track0.mp3"),
+        "the row that is left is the track that is still there"
+    );
+
+    // The report is a note.
+    let notes = app.drain_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("removed 1 of 2 entries")),
+        "the report is a note: {notes:?}"
+    );
+}
+
+#[test]
+fn ctrl_m_reports_a_path_it_cannot_check_and_keeps_the_row() {
+    let (dir, media, mut app) = library_with_tracks(1);
+    // A row whose path the system refuses to name: the file system cannot
+    // even answer whether the file is there, so the row is not a dead row.
+    let odd = media.join("odd\0name.mp3");
+    insert_unreadable_row(&dir.path().join(LIBRARY_DATABASE_NAME), &odd);
+
+    app.library_key_down(Key::Letter(b'M'), Modifiers::CTRL)
+        .expect("ctrl+m");
+
+    let notes = app.drain_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("could not be checked") && note.contains("odd")),
+        "the path that could not be checked is reported: {notes:?}"
+    );
+
+    // The row is kept: a path that cannot be checked is not a dead path.
+    let view = app.library_view();
+    assert_eq!(view.total(), 2, "the row that could not be checked stays");
+    assert!(
+        view.rows().iter().any(|row| row.path == odd),
+        "the row that could not be checked is still in the list"
+    );
+}
+
+#[test]
+fn ctrl_m_refuses_while_a_scan_is_running() {
+    let (dir, media) = media_library(2);
+    let mut app = library_app(&dir);
+    app.submit(Command::ToggleWindow(LIBRARY_WINDOW_ID))
+        .expect("open the library");
+
+    // The scan holds the index: the action must not run beside it.
+    app.library_add_folder(media.clone())
+        .expect("add the folder");
+    app.library_key_down(Key::Letter(b'M'), Modifiers::CTRL)
+        .expect("ctrl+m");
+
+    let notes = app.drain_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("a scan is still running")),
+        "the action refuses while the scan runs: {notes:?}"
+    );
+
+    // The scan is over: the action works then.
+    wait_for_rows(&mut app);
+    std::fs::remove_file(media.join("track1.mp3")).expect("remove the track");
+    app.library_key_down(Key::Letter(b'M'), Modifiers::CTRL)
+        .expect("ctrl+m");
+
+    let notes = app.drain_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("removed 1 of 2 entries")),
+        "the action runs once the scan is done: {notes:?}"
+    );
+    assert_eq!(
+        app.library_view().total(),
+        1,
+        "the row of the gone file is gone"
+    );
+}
+
+#[test]
+fn ctrl_m_on_an_empty_library_is_a_no_op_with_a_note() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut app = library_app(&dir);
+    app.submit(Command::ToggleWindow(LIBRARY_WINDOW_ID))
+        .expect("open the library");
+
+    app.library_key_down(Key::Letter(b'M'), Modifiers::CTRL)
+        .expect("ctrl+m");
+
+    let notes = app.drain_notes();
+    assert!(
+        notes.iter().any(|note| note.contains("nothing to remove")),
+        "the empty library is a no-op with a note: {notes:?}"
+    );
+    assert_eq!(app.library_view().total(), 0, "the list stays empty");
+}
+
+#[test]
+fn the_plain_letter_removes_nothing() {
+    let (_dir, media, mut app) = library_with_tracks(2);
+    std::fs::remove_file(media.join("track1.mp3")).expect("remove the track");
+
+    app.library_key_down(Key::Letter(b'M'), Modifiers::NONE)
+        .expect("m");
+
+    assert_eq!(
+        app.library_view().total(),
+        2,
+        "the letter without the modifier removes nothing"
+    );
+    assert!(app.drain_notes().is_empty(), "the letter notes nothing");
 }
 
 // ---------------------------------------------------------------------------
