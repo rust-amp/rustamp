@@ -23,10 +23,14 @@
 //! Real exclusive opens are VM-only; headless tests cover selection/reporting,
 //! not a claim that a device grants (or refuses) exclusive access.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Duration;
 
-use rustamp_core::audio::OutputDevice;
+use rustamp_core::audio::{AudioSpec, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::config::OutputMode;
+use rustamp_core::error::{Error, Result};
 use rustamp_output::selection::{self, DeviceTarget, OutputPlan};
 use rustamp_output::{CpalOutput, NullClock, NullOutput, default_output};
 
@@ -189,6 +193,95 @@ pub(crate) struct CreatedOutput {
     pub device: Box<dyn OutputDevice>,
     pub clock: Option<NullClock>,
     pub notes: Receiver<String>,
+    /// The buffer the device granted, as the app sees it (see
+    /// [`GrantedBuffer`]).
+    pub granted: GrantedBuffer,
+}
+
+/// The buffer length the device granted, as the app sees it.
+///
+/// The engine opens the device and keeps the granted format to itself, so
+/// the app learns the buffer length through this handle: the device is
+/// wrapped (see [`RecordingDevice`]) and the wrapper records what `open`
+/// was granted. The app reads the number when it needs it — the report
+/// about a fade is about the buffer the device actually got (see
+/// [`crate::fade_note`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GrantedBuffer {
+    frames: Arc<AtomicU32>,
+}
+
+impl GrantedBuffer {
+    /// The buffer length the device granted, in frames.
+    ///
+    /// Zero when the device has not granted one yet.
+    pub(crate) fn frames(&self) -> u32 {
+        self.frames.load(Ordering::Acquire)
+    }
+
+    /// Records the buffer the device granted.
+    fn record(&self, format: &OutputFormat) {
+        self.frames.store(format.buffer_frames, Ordering::Release);
+    }
+}
+
+/// The device the app hands to the engine, with the granted buffer recorded.
+///
+/// Everything is forwarded unchanged: the wrapper only remembers the format
+/// the device granted, so that the app can name the buffer in its report
+/// about a fade (see [`crate::fade_note`]). A device that grants another
+/// buffer on a second open (RFC 0012) is recorded as well.
+struct RecordingDevice {
+    inner: Box<dyn OutputDevice>,
+    granted: GrantedBuffer,
+}
+
+impl OutputDevice for RecordingDevice {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
+        let format = self.inner.open(spec)?;
+        self.granted.record(&format);
+        Ok(format)
+    }
+
+    fn start(&mut self, render: RenderFn) -> Result<()> {
+        self.inner.start(render)
+    }
+
+    fn pause(&mut self) -> Result<()> {
+        self.inner.pause()
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        self.inner.resume()
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
+    }
+
+    fn latency(&self) -> Duration {
+        self.inner.latency()
+    }
+
+    fn played_frames(&self) -> u64 {
+        self.inner.played_frames()
+    }
+
+    fn set_volume(&mut self, volume: f32) -> Result<()> {
+        self.inner.set_volume(volume)
+    }
+
+    fn stream_error(&self) -> Option<Error> {
+        self.inner.stream_error()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
 }
 
 pub(crate) fn create_output(
@@ -241,10 +334,16 @@ pub(crate) fn create_output(
             (output, None)
         }
     };
+    let granted = GrantedBuffer::default();
+    let device: Box<dyn OutputDevice> = Box::new(RecordingDevice {
+        inner: device,
+        granted: granted.clone(),
+    });
     CreatedOutput {
         device,
         clock,
         notes,
+        granted,
     }
 }
 

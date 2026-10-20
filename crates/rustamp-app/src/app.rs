@@ -58,6 +58,7 @@ use rustamp_ui::{
 
 use crate::cli::OutputChoice;
 use crate::double_click::TitleBarClicks;
+use crate::fade_note::{FadeConfiguration, SeenFadeReports};
 use crate::host::{
     CommandOutcome, HostStateLink, PollOutcome, PublishOutcome, player_state_message,
 };
@@ -250,6 +251,25 @@ pub struct App {
     /// beside the config); see [`crate::eq_autoload`].
     pub(crate) eq_auto_rules: crate::eq_autoload::AutoLoadRules,
     notes: Vec<String>,
+    /// The fade reports the user has already seen (see [`crate::fade_note`]).
+    ///
+    /// The engine reports a fade that does not fit the buffer it is realised
+    /// in, and it does so on every fade-out. The app shows the report once
+    /// per configuration, and this is where the configuration it showed last
+    /// is kept.
+    seen_fade_reports: SeenFadeReports,
+    /// The device's granted buffer, as the app sees it (see
+    /// [`crate::output::GrantedBuffer`]).
+    ///
+    /// The engine opens the device and keeps the granted format to itself;
+    /// the app learns the buffer length through this handle, because its
+    /// report about a fade is about the buffer the device actually got.
+    device_buffer: crate::output::GrantedBuffer,
+    /// The engine's ring, in frames.
+    ///
+    /// The ring is the app's own configuration: the engine never changes it,
+    /// and the report about a fade names it.
+    ring_frames: usize,
     /// The last error the user should see (BETA-04): a failed open/decode or
     /// a rejected command. Shown in the main window's native title bar
     /// ([`App::window_title`]); cleared when a track starts.
@@ -402,6 +422,10 @@ impl App {
             fade_ms: options.config.audio.fadeout_ms,
             ..EngineConfig::default()
         };
+        // The ring is the app's own configuration and the engine never
+        // changes it: the app keeps the number, because its report about a
+        // fade names the ring the fade is realised in (see `crate::fade_note`).
+        let ring_frames = cfg.ring_frames;
         let mut engine = Engine::new(registry.clone(), output.device, bus.clone(), cfg)?;
         // `Engine::new` initialises its gain from the config but reports
         // `volume: 255, balance: 0` in `PlayerState` (an engine-side
@@ -529,6 +553,9 @@ impl App {
             eq_user_presets: Vec::new(),
             eq_auto_rules: crate::eq_autoload::AutoLoadRules::default(),
             notes: Vec::new(),
+            seen_fade_reports: SeenFadeReports::default(),
+            device_buffer: output.granted.clone(),
+            ring_frames,
             last_error: None,
             dsp_chain: crate::dsp::DspChain::default(),
             bypassed_dsp: None,
@@ -734,6 +761,9 @@ impl App {
         self.collect_output_notes();
         self.output_notes = output.notes;
         self.clock = output.clock;
+        // The new device granted its own buffer: the report about a fade is
+        // about the buffer the device actually got (see `crate::fade_note`).
+        self.device_buffer = output.granted;
         Ok(())
     }
 
@@ -1440,6 +1470,12 @@ impl App {
 
         self.engine.poll()?;
 
+        // The engine reports a fade that does not fit the buffer it is
+        // realised in (S18 §2.3's constraint). The report is the engine's
+        // own sentence; the app only decides when the user sees it (see
+        // `crate::fade_note`).
+        self.drain_fade_reports();
+
         let events: Vec<Event> = self.events.try_iter().collect();
         for event in &events {
             self.handle_event(event);
@@ -1487,6 +1523,48 @@ impl App {
         self.load_enabled_plugins_for_new_host();
         let _ = self.publish_host_state();
         Ok(())
+    }
+
+    /// Turns the engine's fade reports into notes the user sees.
+    ///
+    /// The engine compares every requested fade with the buffers the fade is
+    /// realised in and reports the conflict when it does not fit them
+    /// (`rustamp_audio::fade_budget`; S18 §2.3's constraint). The report
+    /// fires on **every** fade-out — with the shipped configuration a 500 ms
+    /// fade does not fit the device's 23 ms buffer — so the app shows it
+    /// once per configuration (see [`crate::fade_note`]).
+    ///
+    /// The wording is the engine's own: the app decides *when* the user
+    /// reads the report, never *what* it says.
+    fn drain_fade_reports(&mut self) {
+        while let Some(report) = self.engine.take_fade_note() {
+            let configuration = self.fade_configuration(report.requested_ms);
+            if !self.seen_fade_reports.should_show(configuration) {
+                // The same configuration was reported already: the sentence
+                // would say the same thing, so the user reads it once.
+                continue;
+            }
+            self.note(report.message());
+        }
+    }
+
+    /// The configuration a fade report about `fade_ms` is about.
+    ///
+    /// The three numbers are the ones the conflict is made of: the buffer
+    /// the device granted, the engine's ring and the fade that was asked
+    /// for. They are counted in milliseconds, the unit the report reads in.
+    fn fade_configuration(&self, fade_ms: u32) -> FadeConfiguration {
+        // The device's rate: the fade is realised at it, so it is the rate
+        // the buffers are counted in.
+        let rate = u64::from(self.engine.device_spec().sample_rate).max(1);
+        // The ring's real capacity: the engine never sizes it below 256
+        // frames.
+        let ring_frames = self.ring_frames.max(256) as u64;
+        FadeConfiguration {
+            device_buffer_ms: u64::from(self.device_buffer.frames()).saturating_mul(1000) / rate,
+            ring_ms: ring_frames.saturating_mul(1000) / rate,
+            fade_ms,
+        }
     }
 
     /// UI-thread only: drain once, analyse at most one snapshot. Missing input
@@ -3408,6 +3486,10 @@ impl App {
 #[cfg(test)]
 #[path = "visualization_tests.rs"]
 mod visualization_tests;
+
+#[cfg(test)]
+#[path = "fade_note_tests.rs"]
+mod fade_note_tests;
 
 #[cfg(test)]
 mod tests {
