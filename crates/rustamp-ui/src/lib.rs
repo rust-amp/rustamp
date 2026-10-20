@@ -163,7 +163,8 @@ pub use menu::{
     row_bands, submenu_client_size, submenu_entries, top_level,
 };
 pub use placement::{
-    clamp_into_work_area, clamp_to_screen, title_bar_height, title_bar_inside, title_bar_rect,
+    clamp_into_work_area, clamp_stack_to_screen, clamp_to_screen, title_bar_height,
+    title_bar_inside, title_bar_rect,
 };
 pub use playlist::{
     ADD_DIALOG_TITLE, BUTTON_BAND_BOTTOM, BUTTON_BAND_TOP, LIST_SELECT_POINT, LOAD_DIALOG_TITLE,

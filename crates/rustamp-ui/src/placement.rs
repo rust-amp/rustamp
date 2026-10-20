@@ -36,10 +36,15 @@
 //! answers a different question - *which* screen the window belongs to and
 //! whether it is on any screen at all - and this module composes with it:
 //! the platform's answer is the input, the title-bar rule is the guarantee.
+//!
+//! [`clamp_stack_to_screen`] applies the rule to the three classic windows
+//! of a docked stack: the windows that hang on the anchor come back in one
+//! piece, so a player that returns from a vanished monitor shows its windows
+//! stacked, not piled on the same pixel.
 
 use rustamp_platform::{DisplaySnapshot, ScreenRect};
 
-use crate::docking::{ClassicWindow, WindowKind};
+use crate::docking::{ClassicWindow, DockedStack, WindowKind, touches};
 use crate::equalizer::EqualizerLayout;
 use crate::layout::MainWindowLayout;
 use crate::playlist_window::TITLE_BAR_HEIGHT;
@@ -163,4 +168,53 @@ fn clamp_axis(value: i32, low: i64, high: i64) -> i32 {
     let value = i64::from(value);
     let clamped = value.max(low).min(high);
     i32::try_from(clamped).unwrap_or(if clamped > 0 { i32::MAX } else { i32::MIN })
+}
+
+/// Clamps the three classic windows of a docked stack onto the screens.
+///
+/// The main window is the anchor: it is clamped first, and a window that is
+/// **docked** to it (their outside edges coincide, S05 §4.3) follows the
+/// anchor. A group that pointed at a monitor that is gone therefore keeps its
+/// shape instead of piling three windows on the same pixel. Every window is
+/// then clamped on its own, because a docked window can still hang off the
+/// far edge of the work area the anchor sits in - and the reachability of the
+/// title strip wins over the shape of the group.
+///
+/// The windows that are not docked to the anchor keep their own place and
+/// are clamped on their own, exactly as [`clamp_to_screen`] does.
+///
+/// With no screen at all every window keeps its place.
+pub fn clamp_stack_to_screen(snapshot: &DisplaySnapshot, stack: DockedStack) -> DockedStack {
+    let main = clamp_to_screen(snapshot, stack.main);
+    let equalizer_source = if touches(stack.main, stack.equalizer) {
+        shifted(stack.equalizer, delta(stack.main, main))
+    } else {
+        stack.equalizer
+    };
+    let equalizer = clamp_to_screen(snapshot, equalizer_source);
+    let playlist_source = if touches(stack.equalizer, stack.playlist) {
+        shifted(stack.playlist, delta(stack.equalizer, equalizer))
+    } else {
+        stack.playlist
+    };
+    let playlist = clamp_to_screen(snapshot, playlist_source);
+    DockedStack {
+        main,
+        equalizer,
+        playlist,
+    }
+}
+
+/// The distance a window moved, without the overflow of an `i32` difference.
+fn delta(from: ClassicWindow, to: ClassicWindow) -> (i32, i32) {
+    (to.x.saturating_sub(from.x), to.y.saturating_sub(from.y))
+}
+
+/// A window moved by a distance, without the overflow of an `i32` sum.
+fn shifted(window: ClassicWindow, (dx, dy): (i32, i32)) -> ClassicWindow {
+    ClassicWindow {
+        x: window.x.saturating_add(dx),
+        y: window.y.saturating_add(dy),
+        ..window
+    }
 }

@@ -18,6 +18,11 @@
 //! and restoring connections from saved geometry are Rustamp choices: S05
 //! leaves tolerance, participating edges and persistence open.
 //!
+//! The saved positions are restored onto the screens that exist **now**
+//! ([`rustamp_ui::placement`]): a window whose title strip - the only part of
+//! a borderless window the user can drag - lies on no work area is pulled
+//! back until it does. See `Windowed::restore_stack` for the rule.
+//!
 //! # The window frame: there is none (wave122)
 //!
 //! Every window here is **borderless**: the title bar is part of the skin
@@ -74,11 +79,14 @@ use std::time::{Duration, Instant};
 
 use rustamp_core::command::{Command, OpenMediaKind, PrefsPage};
 use rustamp_core::state::WindowId as CoreWindowId;
-use rustamp_platform::{HotkeyAction, init_dpi_awareness, single_instance, take_pending_hotkeys};
+use rustamp_platform::{
+    DisplaySnapshot, HotkeyAction, init_dpi_awareness, single_instance, take_pending_hotkeys,
+};
 use rustamp_skin::CursorSlot;
 use rustamp_ui::shell::TaskbarRole;
 use rustamp_ui::{
     DEFAULT_MAIN_POSITION, DialogKind, Key, LIBRARY_LINE_HEIGHT, Modifiers, ShortcutOutcome,
+    clamp_stack_to_screen,
     docking::{ClassicWindow, DockedStack, WindowKind, WindowPosition},
     menu::menu_popup_origin,
 };
@@ -368,8 +376,12 @@ pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let mut app = app;
-    apply_first_start_scale(&mut app);
-    let mut presenter = Windowed::new(app);
+    // The screens are read once, at the start: the first-start scale needs the
+    // primary monitor's DPI, and the restore needs to know which screens the
+    // saved window positions can point at.
+    let snapshot = DisplaySnapshot::capture().ok();
+    apply_first_start_scale(&mut app, snapshot.as_ref());
+    let mut presenter = Windowed::new(app, snapshot.as_ref());
     // The product owns the main thread, so the default mode: exactly
     // `EventLoop::new()`. The off-main-thread opt-in (`true`) exists only
     // for the VM-gated window tests, which run on harness worker threads.
@@ -400,14 +412,15 @@ fn first_start_double_size(config_exists: bool, primary_dpi: Option<u32>) -> boo
 
 /// Applies [`first_start_double_size`] to `app`. Runs after DPI awareness is
 /// set, so the monitor DPI is the real one and not the virtualized 96.
-fn apply_first_start_scale(app: &mut App) {
+///
+/// The display set is the one the start captured: without it the DPI is
+/// unknown and the first start keeps the classic size.
+fn apply_first_start_scale(app: &mut App, snapshot: Option<&DisplaySnapshot>) {
     let Some(path) = app.config_path() else {
         return;
     };
     let exists = path.exists();
-    let dpi = rustamp_platform::DisplaySnapshot::capture()
-        .ok()
-        .and_then(|snapshot| snapshot.primary().map(|monitor| monitor.dpi));
+    let dpi = snapshot.and_then(|snapshot| snapshot.primary().map(|monitor| monitor.dpi));
     if first_start_double_size(exists, dpi)
         && !app.state().double_size
         && let Err(error) = app.submit(Command::ToggleDoubleSize)
@@ -519,9 +532,13 @@ struct Windowed {
 }
 
 impl Windowed {
-    fn new(app: App) -> Self {
+    /// Builds the presenter around the app.
+    ///
+    /// `snapshot` is the display set the restore is clamped against; `None`
+    /// means the screens could not be enumerated, and nothing is clamped.
+    fn new(app: App, snapshot: Option<&DisplaySnapshot>) -> Self {
         let applied_on_top = app.always_on_top();
-        let stack = Self::restore_stack(&app);
+        let stack = Self::restore_stack(&app, snapshot);
         let cursors = SkinCursors::new(app.skin_generation());
         Self {
             app,
@@ -568,7 +585,26 @@ impl Windowed {
         }
     }
 
-    fn restore_stack(app: &App) -> DockedStack {
+    /// Rebuilds the docked stack from the saved window positions.
+    ///
+    /// The saved positions are the user's own and are restored verbatim; they
+    /// are then clamped onto the screens that exist **now**
+    /// ([`clamp_stack_to_screen`]). A monitor can vanish between two runs -
+    /// it was unplugged, the resolution changed, the file was edited by hand -
+    /// and a window that points at it would come back where the user cannot
+    /// reach it. The clamp pulls such a window back until its title strip
+    /// lies on a screen. A window that is already reachable - its title strip
+    /// lies inside a work area - does not move at all, so the player does not
+    /// jitter on every start.
+    ///
+    /// The **save** is not clamped: the configuration records the position the
+    /// user actually had, and the screen set can change before the next
+    /// start. The clamp belongs where the saved position meets the current
+    /// screens, and that is the restore.
+    ///
+    /// Without a display set (the enumeration failed) nothing is clamped:
+    /// there is no screen to place a window on.
+    fn restore_stack(app: &App, snapshot: Option<&DisplaySnapshot>) -> DockedStack {
         // The state-derived stack (the windows' shade and double-size flags),
         // then the saved positions on top of it.
         let mut stack = app.docked_stack();
@@ -593,7 +629,10 @@ impl Windowed {
                 window.y = layout.y;
             }
         }
-        stack
+        match snapshot {
+            Some(snapshot) => clamp_stack_to_screen(snapshot, stack),
+            None => stack,
+        }
     }
 
     /// Resizes the OS window so its client area is exactly the layout size, and
@@ -3153,10 +3192,11 @@ mod tests {
     use super::*;
     use crate::app::AppOptions;
     use crate::cli::OutputChoice;
-    use rustamp_core::config::Config;
+    use rustamp_core::config::{Config, WindowLayout};
     use rustamp_core::playlist::MediaLocation;
     use rustamp_core::state::TransportState;
-    use rustamp_platform::TrayMenuEntry;
+    use rustamp_platform::{DisplaySnapshot, Monitor, ScreenRect, TrayMenuEntry};
+    use rustamp_ui::title_bar_inside;
 
     #[test]
     fn double_size_is_a_first_start_default_on_high_dpi_only() {
@@ -3192,6 +3232,9 @@ mod tests {
     }
 
     /// No event loop, window, hotkey registration, host process or audio device.
+    ///
+    /// No display set: the docking tests need no screen clamp, and the
+    /// presenter's placement is not what they measure.
     fn desktop_test_presenter(with_tracks: bool) -> Windowed {
         let mut app = App::new(AppOptions {
             config: Config::default(),
@@ -3216,7 +3259,7 @@ mod tests {
             })
             .unwrap();
         }
-        Windowed::new(app)
+        Windowed::new(app, None)
     }
 
     #[test]
@@ -3242,7 +3285,7 @@ mod tests {
             seconds: None,
         })
         .unwrap();
-        let mut restored = Windowed::new(restored_app);
+        let mut restored = Windowed::new(restored_app, None);
         assert_eq!(restored.stack, presenter.stack);
         restored.stack.move_main(30, -40);
         assert_eq!(
@@ -3253,6 +3296,146 @@ mod tests {
             restored.window.is_none(),
             "configuration test must stay headless"
         );
+    }
+
+    /// One monitor: the classic 1920x1080 desktop with a 40 px taskbar at the
+    /// bottom, so the work area is 1920x1040.
+    fn single_monitor() -> DisplaySnapshot {
+        DisplaySnapshot::new(vec![Monitor {
+            id: "\\\\.\\DISPLAY1".to_string(),
+            bounds: ScreenRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            work_area: ScreenRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1040,
+            },
+            is_primary: true,
+            dpi: 96,
+        }])
+    }
+
+    /// A saved window position.
+    fn saved(id: CoreWindowId, x: i32, y: i32) -> WindowLayout {
+        WindowLayout {
+            id,
+            x,
+            y,
+            visible: true,
+            shaded: false,
+            width: None,
+            height: None,
+        }
+    }
+
+    /// An app whose configuration carries the given saved window positions.
+    fn app_with_saved_windows(windows: Vec<WindowLayout>) -> App {
+        let mut config = Config::default();
+        config.ui.windows = windows;
+        App::new(AppOptions {
+            config,
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            file: None,
+            seconds: None,
+        })
+        .unwrap()
+    }
+
+    /// A saved position that is still on a screen stays exactly where it was:
+    /// the player must not move a window the user placed on every start.
+    #[test]
+    fn a_visible_saved_position_is_not_moved() {
+        let app = app_with_saved_windows(vec![
+            saved(CoreWindowId::Main, 100, 100),
+            saved(CoreWindowId::Equalizer, 100, 216),
+            saved(CoreWindowId::Playlist, 100, 332),
+        ]);
+        let stack = Windowed::restore_stack(&app, Some(&single_monitor()));
+        assert_eq!((stack.main.x, stack.main.y), (100, 100));
+        assert_eq!((stack.equalizer.x, stack.equalizer.y), (100, 216));
+        assert_eq!((stack.playlist.x, stack.playlist.y), (100, 332));
+    }
+
+    /// A window that points at a monitor that is gone comes back where its
+    /// title strip can be reached: the saved position was far to the left of
+    /// the desktop and above its top edge.
+    #[test]
+    fn a_saved_position_on_a_vanished_monitor_is_pulled_back() {
+        let app = app_with_saved_windows(vec![saved(CoreWindowId::Main, -2000, -2000)]);
+        let snapshot = single_monitor();
+        let stack = Windowed::restore_stack(&app, Some(&snapshot));
+        assert!(
+            snapshot
+                .monitors()
+                .iter()
+                .any(|monitor| title_bar_inside(&stack.main, &monitor.work_area)),
+            "the title strip of {:?} is on no screen",
+            stack.main
+        );
+    }
+
+    /// The playlist's title strip is 20 px high, the other windows' 14 px: a
+    /// playlist whose 14 px strip would still fit is pulled in, while the
+    /// main window at the same height keeps its place.
+    #[test]
+    fn the_playlist_uses_its_own_title_strip() {
+        let app = app_with_saved_windows(vec![
+            saved(CoreWindowId::Main, 100, 1024),
+            saved(CoreWindowId::Equalizer, 100, 400),
+            saved(CoreWindowId::Playlist, 100, 1024),
+        ]);
+        let stack = Windowed::restore_stack(&app, Some(&single_monitor()));
+        assert_eq!(
+            stack.main.y, 1024,
+            "the 14 px strip fits, so the main window stays"
+        );
+        assert_eq!(
+            stack.playlist.y, 1020,
+            "the 20 px strip does not fit, so the playlist moves up"
+        );
+    }
+
+    /// A group that pointed at a monitor that is gone comes back in one
+    /// piece: the equalizer hangs on the main window and the playlist on the
+    /// equalizer, instead of all three landing on the same pixel.
+    #[test]
+    fn a_vanished_monitor_brings_the_docked_group_back_in_one_piece() {
+        let app = app_with_saved_windows(vec![
+            saved(CoreWindowId::Main, -2000, -2000),
+            saved(CoreWindowId::Equalizer, -2000, -1884),
+            saved(CoreWindowId::Playlist, -2000, -1768),
+        ]);
+        let stack = Windowed::restore_stack(&app, Some(&single_monitor()));
+        assert_eq!(
+            stack.equalizer.y,
+            stack.main.bottom(),
+            "the equalizer hangs on the main window"
+        );
+        assert_eq!(
+            stack.playlist.y,
+            stack.equalizer.bottom(),
+            "the playlist hangs on the equalizer"
+        );
+    }
+
+    /// Without a screen there is nothing to place a window on: the saved
+    /// position is kept and no monitor is invented.
+    #[test]
+    fn a_snapshot_without_a_monitor_leaves_the_position_alone() {
+        let app = app_with_saved_windows(vec![saved(CoreWindowId::Main, -2000, -2000)]);
+        let empty = DisplaySnapshot::new(Vec::new());
+        let stack = Windowed::restore_stack(&app, Some(&empty));
+        assert_eq!((stack.main.x, stack.main.y), (-2000, -2000));
+        // And without a display set at all: the enumeration failed.
+        let stack = Windowed::restore_stack(&app, None);
+        assert_eq!((stack.main.x, stack.main.y), (-2000, -2000));
     }
 
     /// Exercises actual Moved events and OS readback through the production
@@ -3364,7 +3547,7 @@ mod tests {
                             seconds: None,
                         })
                         .unwrap();
-                        self.presenter = Windowed::new(app);
+                        self.presenter = Windowed::new(app, None);
                         self.presenter.resumed(event_loop);
                     }
                     6 => {

@@ -32,6 +32,8 @@
 //! * **The clamp leaves the title bar reachable** for any off-screen
 //!   input, including the negative coordinates of a monitor to the left of
 //!   or above the primary one.
+//! * **The stack clamp leaves every title bar of the three windows
+//!   reachable**, and it does not move a stack that already is.
 //! * **Nothing panics** - not an empty target list, not a window that is
 //!   its own snap target, not an extreme coordinate.
 //!
@@ -58,7 +60,9 @@ use rustamp_platform::{DisplaySnapshot, Monitor, ScreenRect};
 use crate::docking::{
     ClassicWindow, DockedStack, WindowKind, WindowPosition, WindowSize, window_size,
 };
-use crate::placement::{clamp_into_work_area, clamp_to_screen, title_bar_inside};
+use crate::placement::{
+    clamp_into_work_area, clamp_stack_to_screen, clamp_to_screen, title_bar_inside,
+};
 
 /// The seeds every property runs over. Fixed on purpose: a failure names the
 /// seed that produced it.
@@ -371,6 +375,27 @@ fn random_tolerance(rng: &mut Rng) -> u32 {
         1 => rng.below(4) as u32,
         2 => rng.below(41) as u32,
         _ => rng.below(200) as u32,
+    }
+}
+
+/// A docked column of the three classic windows that lies on the primary
+/// monitor, so every title bar of it is reachable.
+fn reachable_stack(rng: &mut Rng) -> DockedStack {
+    let x = rng.range(0, 400);
+    let y = rng.range(0, 200);
+    let main = window(WindowKind::Main, x, y, false, false);
+    let equalizer = window(WindowKind::Equalizer, x, y + px(main.height), false, false);
+    let playlist = window(
+        WindowKind::Playlist,
+        x,
+        y + px(main.height) + px(equalizer.height),
+        false,
+        false,
+    );
+    DockedStack {
+        main,
+        equalizer,
+        playlist,
     }
 }
 
@@ -728,6 +753,50 @@ fn the_clamp_does_not_move_a_reachable_window() {
                     "seed {seed:#x}, case {case}: a reachable window was moved"
                 );
             }
+        }
+    }
+}
+
+/// The stack clamp leaves the title bar of **every** window reachable: the
+/// strip of each of the three lies inside a work area, for any input,
+/// including the negative coordinates of a monitor to the left of or above
+/// the primary one.
+#[test]
+fn the_stack_clamp_leaves_every_title_bar_reachable() {
+    for seed in SEEDS {
+        let mut rng = Rng::new(seed);
+        for case in 0..CASES {
+            let snapshot = random_snapshot(&mut rng);
+            let stack = random_arrangement(&mut rng).stack;
+            let placed = clamp_stack_to_screen(&snapshot, stack);
+            for window in windows(&placed) {
+                assert!(
+                    snapshot
+                        .monitors()
+                        .iter()
+                        .any(|monitor| title_bar_inside(&window, &monitor.work_area)),
+                    "seed {seed:#x}, case {case}: the title bar of {window:?} is on no screen"
+                );
+            }
+        }
+    }
+}
+
+/// The stack clamp does not move a stack that is already reachable: the
+/// player must not shift the windows the user placed on every start.
+#[test]
+fn the_stack_clamp_does_not_move_a_reachable_stack() {
+    for seed in SEEDS {
+        let mut rng = Rng::new(seed);
+        for case in 0..CASES {
+            let snapshot = random_snapshot(&mut rng);
+            let stack = reachable_stack(&mut rng);
+            let placed = clamp_stack_to_screen(&snapshot, stack);
+            assert_eq!(
+                windows(&placed),
+                windows(&stack),
+                "seed {seed:#x}, case {case}: a reachable stack was moved"
+            );
         }
     }
 }
