@@ -1987,6 +1987,7 @@ dependencies = [
  "fontdb",
  "rustamp-core",
  "rustamp-gfx",
+ "rustamp-meta",
  "rustamp-platform",
  "rustamp-prefs",
  "rustamp-proto",

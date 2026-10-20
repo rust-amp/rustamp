@@ -10,6 +10,10 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+# The tag field the writer removes: the edit-entry box names the fields the
+# user cleared the way the writer names them, so the removal list needs the
+# writer's own type.
+rustamp-meta.workspace = true
 # The page list, names, default page and command mapping behind the
 # preferences dialog (`DialogKind::Preferences`).
 rustamp-prefs.workspace = true
