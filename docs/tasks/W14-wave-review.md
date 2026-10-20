@@ -70,7 +70,7 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 | # | Claim | Verdict | Evidence (file:line) | Smallest reproduction |
 |---|---|---|---|---|
 | C4-1 | Decoder and DSP resident latency reporting do not collide | **HOLDS** | `crates/rustamp-audio/src/decode.rs:583-588`, `crates/rustamp-audio/src/resident.rs:443-450,836-842` | `Decoder` trait reports `duration` and timestamps; `DspStage` reports `latency_frames()`. Latency queries do not collide. |
-| C4-2 | A failure in one resident leaves the other in a defined state | **PARTIAL** | `crates/rustamp-audio/src/decode.rs:643-651`, `crates/rustamp-audio/src/resident.rs:784-788,836-842` | When decoder resident fails, `Worker` flushes DSP with silence and stops; DSP resident remains in a defined, ready state. However, when DSP resident fails, `HostDspChain` is permanently poisoned. Subsequent tracks immediately fail on `prepare_track` with `CoreError::Dsp("resident DSP chain already failed; replace the stage")`, permanently halting playback until the host app replaces the stage. |
+| C4-2 | A failure in one resident leaves the other in a defined state | **PARTIAL** — *the **media-host session** half is **CONFIRMED** (2026-10-20, `wave269`); the engine-adapter half below is unchanged and still open* | `crates/rustamp-audio/src/decode.rs:643-651`, `crates/rustamp-audio/src/resident.rs:784-788,836-842` (the engine adapter, untouched); `crates/rustamp-mediahost/tests/session_independence.rs` (the two sessions side by side) | When decoder resident fails, `Worker` flushes DSP with silence and stops; DSP resident remains in a defined, ready state. However, when DSP resident fails, `HostDspChain` is permanently poisoned. Subsequent tracks immediately fail on `prepare_track` with `CoreError::Dsp("resident DSP chain already failed; replace the stage")`, permanently halting playback until the host app replaces the stage. **The two sessions themselves are independent** — each owns its control peer, its rings and its terminal state — so a failed or killed decoder leaves the DSP session fully usable and a failed or killed DSP leaves the decoder session fully usable; pinned by the five tests of `session_independence.rs` (names in §5). The still-open PARTIAL is the *engine adapter* in `rustamp-audio`, which the `wave269` lane did not touch. |
 | C4-3 | DSP latency flush compensation behaves honestly on failure | **FALSE** | `crates/rustamp-audio/src/resident.rs:836-842`, `crates/rustamp-audio/src/decode.rs:705-716` | On DSP resident failure, `latency()` drops immediately to 0. When `track_loop` exits and calls `flush_dsp()`, `flush_dsp()` queries `self.dsp_latency()` which evaluates to 0. Zero frames are flushed, silently discarding any audio remaining in stages before the failure. |
 
 ### 5. The Configuration Round Trip (N8, N9, F1)
@@ -606,3 +606,86 @@ Verification of workspace cleanliness:
 - No files outside `C:\Users\micro\.local\share\opencode\worktree\26de0e\wave67-wave-review` were touched.
 - No git commits were made.
 - Clean formatting, clippy, and build gates passed.
+
+---
+
+## 5. Follow-up (2026-10-20, `wave269`): C4-2 at the media-host session level
+
+**Lane:** `crates/rustamp-mediahost` only (the framework). The engine
+adapter (`rustamp-audio`) and C4-3 were **not** touched.
+
+### 5.1 What was re-checked
+
+The review's C4-2 evidence is in the **engine adapter**
+(`rustamp-audio/src/decode.rs`, `rustamp-audio/src/resident.rs`): when the
+resident DSP fails, `HostDspChain` is poisoned and every later track fails
+in `prepare_track`. That half is unchanged.
+
+The half that lives in this crate is the **session** layer: the media host
+runs a `DecoderSession` and a `DspSession` side by side, and each of them
+owns its own `ControlPeer`, its own rings and its own terminal state. The
+question the lane answered is the one the claim asks at that level: *does a
+failure or a kill of one session corrupt, stall or silently end the other?*
+
+**Answer: no.** The independence is structural — no shared mutable state
+between the two sessions — and it is now pinned by tests instead of being an
+inspection result.
+
+### 5.2 The tests (`crates/rustamp-mediahost/tests/session_independence.rs`)
+
+Headless and in-process: a fake resident behind the production
+`serve_decoder`/`serve_dsp` workers, or a fake helper on the raw wire that
+dies the way a killed helper dies (control EOF, rings open). No process is
+spawned, no window is opened, no audio device is touched.
+
+| Test | What it pins |
+|---|---|
+| `a_failed_decoder_session_leaves_the_dsp_session_fully_usable` | a decoder resident that fails: the DSP session still takes writes and returns the frame bit-exact, its four ring counters follow the loop's own traffic and nothing else (the failure contributes nothing to them), neither of its rings is closed, it drops no frame, and its host is still serving |
+| `a_killed_decoder_session_leaves_the_dsp_session_fully_usable` | the same with the crash surrogate (the helper's control channel ends, its ring stays open): the DSP session is untouched and fully usable |
+| `a_failed_dsp_session_leaves_the_decoder_session_fully_usable` | the mirror image: a chain that fails leaves the decoder session delivering its frames, its counters following its own traffic, and its host still serving |
+| `a_killed_dsp_session_leaves_the_decoder_session_fully_usable` | the same with the killed helper |
+| `the_control_loop_keeps_running_and_does_not_spin_after_a_failure` | the host's control loop: it reports the failed session **once**, asks it no further, keeps running, and stays inside a sane turn rate (it blocks in the live session's own bounded wait instead of spinning on the dead one) |
+
+The failed session stays **terminal** in every case: the sticky diagnosis
+(`wave224`) is asserted with the *same* text on every later call — the
+resident's own diagnosis (`resident decoder failed: …` /
+`resident DSP failed: …`) or the control channel's (`control stream ended:
+…`) — never a fresh success and never a false end of stream.
+
+### 5.3 The tests can fail (two mutation probes, both reverted)
+
+* **Cross-contamination probe.** A temporary global sticky failure in
+  `ControlPeer` (one peer's failure poisons every peer in the process) makes
+  **all five** tests fail — the clearest symptom being *"the loop must
+  report the failed session once: left 2, right 1"*, i.e. the healthy
+  session was reported as failed too.
+* **Delivery-fence probe.** Removing `DspSession::write_timeout`'s
+  `await_delivery` (the write returns before the chain has taken the frames)
+  makes `a_killed_dsp_session_leaves_the_decoder_session_fully_usable` fail:
+  the round trip never completes.
+
+Both probes were reverted; `git status` in the lane worktree shows only the
+new test file and this document.
+
+### 5.4 What stays open
+
+* **C4-2, engine-adapter half:** the poisoned `HostDspChain`
+  (`rustamp-audio/src/resident.rs`) still fails every later track with
+  `CoreError::Dsp("resident DSP chain already failed; replace the stage")`.
+  Fixing it is a `rustamp-audio` change and needs its own lane.
+* **C4-3:** untouched — the latency flush compensation on a DSP failure is
+  an engine-adapter question as well.
+* **Two real processes:** the tests drive both sessions in one process. The
+  two-process kill of a *real* helper stays VM-only
+  (`tests/pcm_process.rs`, `tests/dsp_process.rs`, both `#[ignore]`).
+
+### 5.5 Boundary receipt of this lane
+
+- Worktree: `C:\Users\micro\.local\share\opencode\worktree\26de0e\wave269-mediahost-independent`.
+- Written: `crates/rustamp-mediahost/tests/session_independence.rs` (new) and
+  this document. No production code changed, no commit, no download, no
+  window, no audio device, no spawned process.
+- Gates: `cargo fmt --all -- --check`, `cargo clippy -p rustamp-mediahost
+  --all-targets --all-features -- -D warnings`, `cargo test -p rustamp-mediahost
+  --all-features` and `cargo check --workspace --all-targets --all-features`
+  are green (§4 above is the *review* lane's own receipt, not this lane's).
