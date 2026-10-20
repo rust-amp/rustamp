@@ -5,6 +5,27 @@
 //! channels (control in, reports out) plus the atomics of
 //! [`crate::ring::RingSync`] for the seek handshake.
 //!
+//! # Where the decoder comes from
+//!
+//! A **path** is opened by the registry, which knows a source by its
+//! extension and by its first bytes. A **URL** is opened by the HTTP decoder
+//! (S19): the registry cannot open one, because a URL has no bytes to sniff
+//! (see [`open_source`]).
+//!
+//! # What a stream changes
+//!
+//! An `http://` stream is not a file: it has no position to seek to, and its
+//! length is often unknown. Both are reported, never papered over:
+//!
+//! * a seek on a stream is refused by the decoder
+//!   ([`Error::Unsupported`]), and the engine publishes the refusal and
+//!   leaves the position where it was;
+//! * a stream whose container states no length leaves the length unknown
+//!   (`None`), so the window shows no total time instead of a wrong one;
+//! * a connection that dies in the middle of the body is a **truncated
+//!   stream**: the decoder reports it as a decode failure, and the frames
+//!   that did arrive are still played.
+//!
 //! The decode order per block is decoder -> ReplayGain scale ->
 //! DSP chain -> vis tap -> format converter -> ring (see
 //! [`crate::replaygain`] for why the gain sits before every stage).
@@ -106,10 +127,11 @@ use std::time::Duration;
 
 use rtrb::{Consumer, Producer, RingBuffer};
 use rustamp_core::audio::{AudioSpec, Decoder, DecoderRegistry, DspStage, MediaSource};
-use rustamp_core::error::{Error, ErrorKind};
+use rustamp_core::error::{Error, ErrorKind, Result};
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::StreamInfo;
 use rustamp_core::vis::VisFrame;
+use rustamp_decoders::HttpDecoder;
 use rustamp_playlist::PlaybackOrder;
 
 use crate::convert::FormatConverter;
@@ -131,8 +153,10 @@ const IDLE_SLEEP: Duration = Duration::from_millis(2);
 pub enum TrackSource {
     /// A local file.
     Path(PathBuf),
-    /// A network stream (opening it is the decoder's business; URL support
-    /// itself is an M4 item).
+    /// A network stream. It is opened by the HTTP decoder, which reads the
+    /// body of an `http://` response (S19); the registry cannot open a URL,
+    /// because it knows a source by its extension and by its first bytes and
+    /// a URL has no bytes.
     Url(String),
 }
 
@@ -161,6 +185,30 @@ impl TrackSource {
     /// Lower-case extension without the dot.
     pub fn extension(&self) -> Option<String> {
         self.media_source().extension()
+    }
+}
+
+/// Opens the decoder for a queue entry.
+///
+/// A **path** goes through the registry, exactly as it always has: the
+/// registry knows a source by its extension and by its first bytes, and a
+/// file answers both.
+///
+/// A **URL** cannot go through the registry. The registry probes by extension
+/// and sniffs bytes, and a URL has no bytes to sniff: a URL without an
+/// extension is refused outright, and a URL with one reaches a factory that
+/// opens files. The stream is opened here instead, by the decoder that reads
+/// the body of an `http://` response (S19).
+///
+/// The registry's meaning is unchanged: a path still goes through it, and
+/// only a URL takes the other way.
+fn open_source(registry: &DecoderRegistry, source: &TrackSource) -> Result<Box<dyn Decoder>> {
+    match source {
+        TrackSource::Path(_) => registry.open(source.media_source()),
+        TrackSource::Url(url) => {
+            let decoder: Box<dyn Decoder> = Box::new(HttpDecoder::open(url).map_err(Error::from)?);
+            Ok(decoder)
+        }
     }
 }
 
@@ -602,7 +650,7 @@ impl Worker {
                 });
                 break;
             };
-            let mut decoder = match self.cfg.registry.open(source.media_source()) {
+            let mut decoder = match open_source(&self.cfg.registry, &source) {
                 Ok(d) => d,
                 Err(e) => {
                     self.flush_converter();
