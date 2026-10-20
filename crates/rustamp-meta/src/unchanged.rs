@@ -24,7 +24,10 @@
 //! * **Only the fields the request names are compared.** A field that is
 //!   `None` in the metadata means "keep", so it cannot decide anything. A
 //!   field of the removal list is compared as well: a removal of a field the
-//!   primary tag does not hold changes nothing.
+//!   primary tag holds no value for changes nothing.
+//! * **A removal wins over a value.** A field that is in the metadata *and*
+//!   in the removal list is removed, so the value of such a field cannot
+//!   decide anything: the removal is the whole request for that field.
 //! * **The comparison is made against the primary tag**, the tag the writer
 //!   writes. A value that only a second tag holds (an ID3v1 tag next to an
 //!   ID3v2 tag) is not in the primary tag, so a request for it is a change:
@@ -32,6 +35,11 @@
 //! * **An `extra` entry the target format cannot store is not a change.** It
 //!   cannot be in the file and cannot be put there; it is reported
 //!   ([`WriteReport::unwritten_extra`]), not written.
+//! * **A number the target format cannot carry is not a change either.** The
+//!   MP4 `trkn` and `disk` atoms hold a pair of 16-bit numbers, and a zero
+//!   means "no number at all": such a number cannot be put in the file, so
+//!   it only matters when the file has a number the write would take with it
+//!   (see [`WriteReport::unstoreable`]).
 //! * **The values are the reader's.** A text value is trimmed and an empty
 //!   one is "no value", a date is its year and a number pair is split on the
 //!   `/` — the rules the tag reader applies, so the value that is compared
@@ -55,19 +63,21 @@ use rustamp_core::meta::TrackMetadata;
 use crate::read::metadata_from_tags;
 use crate::remove::TagField;
 use crate::replaygain::{canonical_r128_key, item_key_for_extra};
+use crate::write::carries_number;
 
 /// The state of the primary tag before the write.
 ///
 /// Only the values a request can decide on are kept: the standard fields,
-/// the `extra` entries the request names and the fields of the removal list
-/// the tag holds.
+/// the `extra` entries the request names and the type of the tag, which
+/// decides what the format can carry.
 pub(crate) struct Before {
     /// The standard fields of the tag, decoded.
     fields: TrackMetadata,
+    /// The type of the primary tag: the format decides which numbers it can
+    /// carry.
+    tag_type: TagType,
     /// The values of the `extra` entries the request names.
     extra: BTreeMap<String, Option<String>>,
-    /// The fields of the removal list the tag holds.
-    held: Vec<TagField>,
 }
 
 impl Before {
@@ -75,21 +85,16 @@ impl Before {
     ///
     /// `tag` is the primary tag of the file on its own — the second tags of
     /// the file are not part of it, because the writer does not write them.
-    pub(crate) fn of(tag: &Tag, metadata: &TrackMetadata, removals: &[TagField]) -> Self {
+    pub(crate) fn of(tag: &Tag, metadata: &TrackMetadata) -> Self {
         let extra = metadata
             .extra
             .keys()
             .map(|key| (key.clone(), extra_value(tag, key)))
             .collect();
-        let held = removals
-            .iter()
-            .copied()
-            .filter(|field| field.is_held_by(tag))
-            .collect();
         Self {
             fields: metadata_from_tags(&[tag]),
+            tag_type: tag.tag_type(),
             extra,
-            held,
         }
     }
 
@@ -106,37 +111,70 @@ impl Before {
     ) -> bool {
         let current = &self.fields;
 
+        // The removals: a removal of a field the tag holds a value for is a
+        // change. A removal wins over a value, so the value of a removed
+        // field cannot decide anything.
+        if removals.iter().any(|field| holds(current, *field)) {
+            return true;
+        }
+        let removed = |field: TagField| removals.contains(&field);
+
         // The named fields. A field that is `None` keeps the value the file
         // has, so it cannot decide anything.
-        if text_changed(current.title.as_deref(), metadata.title.as_deref())
-            || text_changed(current.artist.as_deref(), metadata.artist.as_deref())
-            || text_changed(current.album.as_deref(), metadata.album.as_deref())
-            || text_changed(
-                current.album_artist.as_deref(),
-                metadata.album_artist.as_deref(),
-            )
-            || text_changed(current.genre.as_deref(), metadata.genre.as_deref())
-            || text_changed(current.comment.as_deref(), metadata.comment.as_deref())
+        if !removed(TagField::Title)
+            && text_changed(current.title.as_deref(), metadata.title.as_deref())
         {
             return true;
         }
-        if let Some(year) = metadata.year
+        if !removed(TagField::Artist)
+            && text_changed(current.artist.as_deref(), metadata.artist.as_deref())
+        {
+            return true;
+        }
+        if !removed(TagField::Album)
+            && text_changed(current.album.as_deref(), metadata.album.as_deref())
+        {
+            return true;
+        }
+        if !removed(TagField::AlbumArtist)
+            && text_changed(
+                current.album_artist.as_deref(),
+                metadata.album_artist.as_deref(),
+            )
+        {
+            return true;
+        }
+        if !removed(TagField::Genre)
+            && text_changed(current.genre.as_deref(), metadata.genre.as_deref())
+        {
+            return true;
+        }
+        if !removed(TagField::Comment)
+            && text_changed(current.comment.as_deref(), metadata.comment.as_deref())
+        {
+            return true;
+        }
+        if !removed(TagField::Year)
+            && let Some(year) = metadata.year
             && current.year != Some(year)
         {
             return true;
         }
-        if let Some(number) = metadata.track_no
-            && current.track_no != Some(number)
-        {
-            return true;
+        if !removed(TagField::Track) {
+            if let Some(number) = metadata.track_no
+                && number_changed(self.tag_type, current.track_no, number)
+            {
+                return true;
+            }
+            if let Some(number) = metadata.track_total
+                && number_changed(self.tag_type, current.track_total, number)
+            {
+                return true;
+            }
         }
-        if let Some(total) = metadata.track_total
-            && current.track_total != Some(total)
-        {
-            return true;
-        }
-        if let Some(number) = metadata.disc_no
-            && current.disc_no != Some(number)
+        if !removed(TagField::Disc)
+            && let Some(number) = metadata.disc_no
+            && number_changed(self.tag_type, current.disc_no, number)
         {
             return true;
         }
@@ -152,9 +190,38 @@ impl Before {
             }
         }
 
-        // The removals: a removal of a field the tag does not hold changes
-        // nothing.
-        removals.iter().any(|field| self.held.contains(field))
+        false
+    }
+}
+
+/// Whether the tag holds a value for the field a reader sees.
+///
+/// The comparison is made on the decoded values: a field the tag holds an
+/// empty value for holds no value a reader can see.
+fn holds(fields: &TrackMetadata, field: TagField) -> bool {
+    match field {
+        TagField::Title => fields.title.is_some(),
+        TagField::Artist => fields.artist.is_some(),
+        TagField::Album => fields.album.is_some(),
+        TagField::AlbumArtist => fields.album_artist.is_some(),
+        TagField::Year => fields.year.is_some(),
+        TagField::Genre => fields.genre.is_some(),
+        TagField::Comment => fields.comment.is_some(),
+        TagField::Track => fields.track_no.is_some() || fields.track_total.is_some(),
+        TagField::Disc => fields.disc_no.is_some(),
+    }
+}
+
+/// Whether the requested number changes the value the tag holds.
+///
+/// A number the format cannot carry is not in the file: it cannot be put
+/// there, so it only matters when the file has a number the write would take
+/// with it.
+fn number_changed(tag_type: TagType, current: Option<u32>, requested: u32) -> bool {
+    if carries_number(tag_type, requested) {
+        current != Some(requested)
+    } else {
+        current.is_some()
     }
 }
 

@@ -85,8 +85,10 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   text frames in a hash map, so two writes of the same metadata produce the
   same frames in a different order). A no-op save that rewrote the file
   would move its modification time for nothing, and every tool that watches
-  the file (a library scanner, a file index) would see a new file. The rule
-  is in the `unchanged` module of the crate.
+  the file (a library scanner, a file index) would see a new file. A removal
+  wins over a value: a field that is in both the metadata and the removal
+  list is removed, so the value of such a field cannot decide whether the
+  write changes anything. The rule is in the `unchanged` module of the crate.
 - **Only the primary tag is written.** A file may carry more than one tag
   (an MP3 with ID3v2 and ID3v1). The write replaces the format's primary
   tag and leaves the other tags byte for byte as they were; the old code

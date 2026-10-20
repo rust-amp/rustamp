@@ -27,6 +27,15 @@
 //! where it is; the write report names every removal that is in that state
 //! ([`WriteReport::unremoved`]).
 //!
+//! ## A comment that is empty
+//!
+//! A comment of zero length is "no value" to a reader: the reader drops it
+//! in every format. A write of such a comment therefore takes the comment
+//! away, and it takes the description with it — the reader takes a
+//! description as the comment when a file has no comment of its own, so a
+//! comment that is empty has to take the description with it, exactly as a
+//! removal does.
+//!
 //! ## A write that changes nothing
 //!
 //! A write that would not change the tags the file has does not touch the
@@ -45,8 +54,11 @@
 //! would see — and only on the fields the request names:
 //!
 //! * A field that is `None` in the metadata means "keep", so it cannot
-//!   decide anything. A removal of a field the primary tag does not hold
-//!   changes nothing either.
+//!   decide anything. A removal of a field the primary tag holds no value
+//!   for changes nothing either.
+//! * A removal wins over a value: a field that is in both the metadata and
+//!   the removal list is removed, so the value of such a field cannot decide
+//!   anything.
 //! * The comparison is made against the **primary tag**, the tag the
 //!   writer writes. A value that only a second tag holds (an ID3v1 tag next
 //!   to an ID3v2 tag) is not in the primary tag, so a request for it is a
@@ -54,7 +66,10 @@
 //!   prefers.
 //! * An `extra` entry the target format cannot store is not a change: it
 //!   cannot be in the file and cannot be put there. It is reported
-//!   ([`WriteReport::unwritten_extra`]), not written.
+//!   ([`WriteReport::unwritten_extra`]), not written. The same holds for a
+//!   number the format cannot carry: it is not in the file, so it only
+//!   matters when the file has a number the write would take with it (see
+//!   [`WriteReport::unstoreable`]).
 //!
 //! The rule is in the `unchanged` module of this crate.
 //!
@@ -197,6 +212,10 @@ pub struct WriteReport {
     /// keeps the text frames in a hash map), so writing the same metadata
     /// twice would otherwise rewrite the file with the frames in another
     /// order and move its modification time.
+    ///
+    /// A removal wins over a value: a field that is in both the metadata
+    /// and the removal list is removed, and the value of such a field cannot
+    /// decide whether the write changes anything.
     ///
     /// This says nothing about the other fields of the report: an `extra`
     /// entry the format refused is still refused, and a removal a second tag
@@ -475,7 +494,7 @@ impl Target {
     fn apply(&mut self, metadata: &TrackMetadata, removals: &[TagField]) -> WriteReport {
         // The state of the file before the write: it decides whether the
         // write changes anything (see the `unchanged` module).
-        let before = Before::of(&self.primary(), metadata, removals);
+        let before = Before::of(&self.primary(), metadata);
         match self {
             Self::Generic { tag, others } => {
                 let mut unwritten_extra = apply_to_tag(tag, metadata);
@@ -611,8 +630,18 @@ fn apply_to_tag(tag: &mut Tag, metadata: &TrackMetadata) -> Vec<String> {
     if let Some(value) = &metadata.genre {
         tag.set_genre(value.clone());
     }
-    if let Some(value) = &metadata.comment {
-        tag.set_comment(value.clone());
+    match &metadata.comment {
+        // The reader takes a description as the comment when a file has no
+        // comment of its own, so a comment that is empty has to take the
+        // description with it: the same reason a removal takes it.
+        Some(value) if value.trim().is_empty() => {
+            tag.remove_key(ItemKey::Comment);
+            tag.remove_key(ItemKey::Description);
+        }
+        Some(value) => {
+            tag.set_comment(value.clone());
+        }
+        None => {}
     }
     if let Some(year) = metadata.year {
         tag.set_date(Timestamp {
@@ -661,6 +690,16 @@ fn apply_to_vorbis(comments: &mut VorbisComments, metadata: &TrackMetadata) -> V
             continue;
         };
         comments.insert(key.to_owned(), value.to_owned());
+    }
+    // The concrete comments keep the description the generic model does not
+    // hold, so an empty comment has to take it with it here as well (see
+    // `apply_to_tag`).
+    if metadata
+        .comment
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        remove_from_vorbis(comments, &[TagField::Comment]);
     }
     unwritten
 }
@@ -711,7 +750,7 @@ fn unstoreable_fields(
 /// zero means "no number at all": the MP4 family carries neither a zero nor
 /// a number above 65535. Every other format the writer targets stores the
 /// number as text, so it carries every `u32`.
-fn carries_number(tag_type: TagType, number: u32) -> bool {
+pub(crate) fn carries_number(tag_type: TagType, number: u32) -> bool {
     match tag_type {
         TagType::Mp4Ilst => (1..=u32::from(u16::MAX)).contains(&number),
         _ => true,
