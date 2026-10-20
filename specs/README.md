@@ -26,7 +26,7 @@ Specs reach this directory only after the Spec Auditor has signed off. Each file
 | S16 | Preferences pages and options | not started |
 | S17 | Skin-loading quirks (missing files, palette and BMP quirks, nums_ex fallback, pledit.txt, region.txt) | audited |
 | S18 | Output behaviors (fades, buffer, prebuffer) | not started |
-| S19 | Streaming and ICY metadata display | not started |
+| S19 | Streaming and ICY metadata display | audited |
 | S20 | Media Library (2.9x) and CD playback (later milestones) | not started |
 
 ## D-notes
