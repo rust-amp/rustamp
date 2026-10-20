@@ -18,7 +18,7 @@ Specs reach this directory only after the Spec Auditor has signed off. Each file
 | S08 | Classic visualization (spectrum, oscilloscope, 576-sample data for plugins) | audited |
 | S09 | Plugin ABI (in_/out_/vis_/dsp_/gen_ structs, versions, threading, call order) | audited – static; runtime confirmation pending |
 | S10 | `WM_WA_IPC` and `WM_COMMAND` catalog | not started |
-| S11 | Embed-window API and `gen.bmp` layout | not started |
+| S11 | Embed-window API and `gen.bmp` layout | audited |
 | S12 | winamp.ini keys and plugin.ini conventions | audited |
 | S13 | Command-line switches, single instance, drag-and-drop rules | audited |
 | S14 | Title formatting | audited |
