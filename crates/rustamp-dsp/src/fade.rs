@@ -2,11 +2,15 @@
 //!
 //! # What is measured and what is chosen here
 //!
-//! **Nothing in this module is measured.** The spec that would describe the
-//! reference player's output fades — S18 ("Output behaviors (out_ds-style
-//! fades, buffer, prebuffer)") — **does not exist**. Every number, every law
-//! and every rule below is therefore **our own engineering choice**, and none
-//! of it may be cited as 2.95 behaviour.
+//! **Nothing in this module is measured.** S18
+//! ([`specs/S18-output-behaviour.md`](../../../specs/S18-output-behaviour.md))
+//! was audited on 2026-10-20, but it describes the reference's **output
+//! plug-in** — its five per-action fade keys, its buffer and prebuffer, and the
+//! constraint that a fade longer than the buffer cannot be honoured. It settles
+//! **no** curve, no duration and no law for *our* stage, so every number, every
+//! law and every rule below remains **our own engineering choice**, and none of
+//! it may be cited as 2.95 behaviour. (The audit's reading of the reference's
+//! fade table, and what it leaves open, is in that spec's §6.)
 //!
 //! The only thing the frozen contracts fix is the *shape* of the request:
 //! `rustamp-core`'s
