@@ -44,7 +44,11 @@
 //! * Hostile input (truncated, empty, lying headers, noise) is rejected with a
 //!   defined error or degraded to a defined end of stream; the loop in
 //!   [`SymphoniaDecoder::fill_pending`] is bounded, so it cannot spin without
-//!   producing samples or ending the stream. See `tests/robustness.rs`.
+//!   producing samples or ending the stream. The probe of the container runs
+//!   inside a `catch_unwind`, because a container reader of a third-party
+//!   crate can panic on a broken file (the Matroska reader of symphonia does,
+//!   on every truncated Matroska file). See `tests/robustness.rs` and
+//!   `tests/oracle_properties.rs`.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -921,9 +925,25 @@ impl SymphoniaDecoder {
             enable_gapless: true,
             ..FormatOptions::default()
         };
-        let mut probed = symphonia::default::get_probe()
-            .format(&hint, mss, &fmt_opts, &MetadataOptions::default())
-            .map_err(open_err)?;
+        // A container reader of a third-party crate can panic on a broken
+        // file: the Matroska reader of symphonia asks for an element header
+        // it has not read, and every truncated Matroska file trips it (the
+        // panic was measured on the prefixes of the repository fixture: 22746
+        // of the 23304 prefixes panicked while the file was opened). A
+        // hostile file must not take the player down, so the panic is caught
+        // here and named as a decode failure.
+        let mut probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            symphonia::default::get_probe().format(
+                &hint,
+                mss,
+                &fmt_opts,
+                &MetadataOptions::default(),
+            )
+        }))
+        .map_err(|_| {
+            Error::Decode("the container reader panicked on this file: it is broken".into())
+        })?
+        .map_err(open_err)?;
 
         let mut format = probed.format;
         let track = format
