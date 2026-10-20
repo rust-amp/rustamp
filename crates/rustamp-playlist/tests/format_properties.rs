@@ -16,15 +16,15 @@
 //!   or with an error, never with a panic.
 //! * **M2 — a contradicting format is refused**: reading explicitly as `f`
 //!   fails when the content carries another format's marker.
-//! * **W1 — writing is a fixed point**: writing the parsed entries again
-//!   yields the same bytes.
-//! * **W2 — the file converges**: after one write → read → write round the
-//!   bytes do not change any more.
+//! * **W1 — writing is a fixed point**: `write(parse(write(entries, f)), f)`
+//!   yields the same bytes as `write(entries, f)`, for every entry shape.
+//! * **W2 — the file converges**: a playlist with relative locations changes
+//!   once (the reader resolves them) and is stable from then on.
 //! * **D1 — the readers are deterministic**: the same bytes always give the
 //!   same report.
 //!
-//! Two instabilities that the contract already documents are pinned at the
-//! end of the file, so they cannot change silently.
+//! One instability that the contract already documents is pinned at the end
+//! of the file, so it cannot change silently.
 //!
 //! The generator is the crate's own seeded [`Rng`]; there is no new
 //! dependency. Every seed is fixed, so a failure is reproducible.
@@ -64,6 +64,33 @@ const TITLE_CHARS: &[char] = &[
     '[', ']', '!', '?', '%', '#', '=', '+', '\u{00E4}', '\u{00FC}', '\u{20AC}',
 ];
 
+/// The title shapes a writer has to survive: no title at all, an empty one,
+/// one that is only whitespace, a padded one, one with a line break and one
+/// with a character that separates the fields of a format.
+const TITLE_SHAPES: &[Option<&str>] = &[
+    None,
+    Some(""),
+    Some("   "),
+    Some("\t"),
+    Some(" padded "),
+    Some("a\r\nb"),
+    Some("a\nb"),
+    Some("\r\n"),
+    Some("A, B"),
+    Some("A = B"),
+    Some("A & B"),
+];
+
+/// The duration shapes a writer has to survive: no duration, zero, whole
+/// seconds, a sub-second value and a value a `f64` cannot hold exactly.
+const DURATION_SHAPES: &[Option<u64>] = &[
+    None,
+    Some(0),
+    Some(1000),
+    Some(123_456),
+    Some(9_007_199_254_740_991),
+];
+
 /// The content markers of the formats, plus the B4S root element.
 const MARKERS: &[&str] = &["#EXTM3U", "[playlist]", "File1=", "<playlist", "<winamp"];
 
@@ -78,6 +105,20 @@ const ALPHABET: &[u8] = b"<>/=\"'&;#[]()!%\\ \t\r\nabc0123playlisttracklocationt
 /// The directory the playlists are read against.
 fn base() -> PathBuf {
     PathBuf::from("C:/Music/Lists")
+}
+
+/// An **absolute** directory the playlists are read against, in the spelling
+/// of the platform.
+///
+/// [`base`] is a relative path on Unix, so a relative location would be
+/// joined onto it again and again; a test about relative locations needs a
+/// real directory.
+fn absolute_base() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from("C:\\Music\\Lists")
+    } else {
+        PathBuf::from("/music/lists")
+    }
 }
 
 /// The file a playlist of this format is read from. Its name carries the
@@ -208,6 +249,25 @@ fn lossy_entry(rng: &mut Rng, coverage: &mut Coverage) -> LoadedEntry {
 /// A random list of entries whose titles are not canonical.
 fn lossy_entries(rng: &mut Rng, count: usize, coverage: &mut Coverage) -> Vec<LoadedEntry> {
     (0..count).map(|_| lossy_entry(rng, coverage)).collect()
+}
+
+/// A random list of entries with a **relative** location.
+///
+/// A relative location is resolved by the reader against the playlist's
+/// directory, so the file changes in the first round. That is the documented
+/// loss for a relative location (CONTRACT_NOTES.md §4); the contract asks the
+/// caller to resolve the locations before writing.
+fn relative_entries(rng: &mut Rng, count: usize, coverage: &mut Coverage) -> Vec<LoadedEntry> {
+    (0..count)
+        .map(|_| {
+            let mut entry = random_entry(rng, coverage);
+            entry.location = MediaLocation::File(PathBuf::from(normalized(&format!(
+                "sub/{}.mp3",
+                random_text(rng, NAME_CHARS, 1, 12)
+            ))));
+            entry
+        })
+        .collect()
 }
 
 /// An entry that always carries a title and a duration.
@@ -632,16 +692,69 @@ fn writing_the_parsed_entries_again_yields_the_same_bytes() {
 }
 
 #[test]
-fn a_playlist_converges_after_one_write_read_write_round() {
+fn writing_is_idempotent_for_entries_that_are_not_canonical() {
     // A title that is not canonical (padded, empty or with a line break) is
-    // normalized by the first round. From then on the bytes do not change.
-    let mut rng = Rng::new(SEED ^ 0x99);
+    // stored the way the reader hands it back, so the very first write is
+    // already a fixed point.
+    let mut rng = Rng::new(SEED ^ 0x89);
     let mut coverage = Coverage::default();
     for round in 0..200 {
         let count = rng.below(24);
         let entries = lossy_entries(&mut rng, count, &mut coverage);
         for format in SUPPORTED {
-            let path = path_of(format);
+            let first = write_playlist(format, &entries).expect("writing never fails");
+            let parsed = read_playlist_path(&first, &path_of(format)).expect("reading never fails");
+            let second = write_playlist(format, &parsed).expect("writing never fails");
+            assert_eq!(first, second, "round {round}, format {format}");
+        }
+    }
+    assert!(coverage.padded_title);
+    assert!(coverage.empty_title);
+    assert!(coverage.title_with_line_break);
+}
+
+#[test]
+fn writing_is_idempotent_for_every_entry_shape() {
+    // Every combination of a title shape and a duration shape: the file that
+    // comes out of the first write is the file that comes out of the second
+    // one, byte for byte.
+    let location = normalized("C:/Music/Lists/a.mp3");
+    for title in TITLE_SHAPES {
+        for duration in DURATION_SHAPES {
+            for format in SUPPORTED {
+                let entries = vec![LoadedEntry {
+                    location: MediaLocation::File(PathBuf::from(&location)),
+                    title: (*title).map(str::to_owned),
+                    duration_ms: *duration,
+                }];
+                let first = write_playlist(format, &entries).expect("writing never fails");
+                let parsed =
+                    read_playlist_path(&first, &path_of(format)).expect("reading never fails");
+                assert_eq!(parsed.len(), 1, "format {format}, title {title:?}");
+                let second = write_playlist(format, &parsed).expect("writing never fails");
+                assert_eq!(
+                    first, second,
+                    "format {format}, title {title:?}, duration {duration:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_playlist_converges_after_one_write_read_write_round() {
+    // A relative location is resolved by the reader, so the first write and
+    // the second one differ: from the second write on the file carries the
+    // resolved path and the bytes do not change any more. That is the
+    // documented loss for a relative location (CONTRACT_NOTES.md §4).
+    let mut rng = Rng::new(SEED ^ 0x99);
+    let mut coverage = Coverage::default();
+    let base = absolute_base();
+    for round in 0..200 {
+        let count = rng.below(24);
+        let entries = relative_entries(&mut rng, count, &mut coverage);
+        for format in SUPPORTED {
+            let path = base.join(format!("list.{}", format.extension()));
             let first = write_playlist(format, &entries).expect("writing never fails");
             let parsed = read_playlist_path(&first, &path).expect("reading never fails");
             let second = write_playlist(format, &parsed).expect("writing never fails");
@@ -650,9 +763,7 @@ fn a_playlist_converges_after_one_write_read_write_round() {
             assert_eq!(second, third, "round {round}, format {format}");
         }
     }
-    assert!(coverage.padded_title);
-    assert!(coverage.empty_title);
-    assert!(coverage.title_with_line_break);
+    assert!(coverage.with_title && coverage.with_duration);
 }
 
 // ---------------------------------------------------------------------------
@@ -681,36 +792,48 @@ fn reading_the_same_bytes_twice_gives_the_same_result() {
 }
 
 // ---------------------------------------------------------------------------
-// Two documented instabilities
+// One documented instability
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_entry_with_an_empty_title_loses_its_extinf_line_when_it_is_written_again() {
-    // An entry with an empty title and no duration is written with an
-    // `#EXTINF` line (`#EXTINF:-1,`), but the reader turns the empty title
-    // into "no title" (CONTRACT_NOTES.md §4). The entry then has neither a
-    // title nor a duration, so the second write drops the line. The file
-    // converges after one round; it is not byte-identical to the first one.
+fn an_entry_without_metadata_is_written_as_the_bare_location() {
+    // An entry with an empty title and no duration carries no information:
+    // no metadata line is written for it, because the reader would turn the
+    // empty title into "no title" anyway (CONTRACT_NOTES.md §4). The file is
+    // a fixed point of write → read → write.
     let location = normalized("C:/Music/Lists/a.mp3");
     let entries = vec![LoadedEntry {
         location: MediaLocation::File(PathBuf::from(&location)),
         title: Some(String::new()),
         duration_ms: None,
     }];
-    let first = write_playlist(PlaylistFormat::M3u, &entries).expect("writing never fails");
+    for format in SUPPORTED {
+        let first = write_playlist(format, &entries).expect("writing never fails");
+        let parsed = read_playlist_path(&first, &path_of(format)).expect("reading never fails");
+        assert_eq!(parsed.len(), 1, "{format}");
+        assert_eq!(parsed[0].title, None, "{format}");
+        assert_eq!(parsed[0].duration_ms, None, "{format}");
+        let second = write_playlist(format, &parsed).expect("writing never fails");
+        assert_eq!(first, second, "{format}");
+    }
+
+    // The line-based formats write the bare location ...
+    let m3u = write_playlist(PlaylistFormat::M3u, &entries).expect("writing never fails");
+    assert_eq!(m3u, format!("{location}\r\n").as_bytes());
+    let m3u8 = write_playlist(PlaylistFormat::M3u8, &entries).expect("writing never fails");
+    assert_eq!(m3u8, m3u);
+    let pls = write_playlist(PlaylistFormat::Pls, &entries).expect("writing never fails");
     assert_eq!(
-        first,
-        format!("#EXTM3U\r\n#EXTINF:-1,\r\n{location}\r\n").as_bytes()
+        pls,
+        format!("[playlist]\r\nFile1={location}\r\nNumberOfEntries=1\r\nVersion=2\r\n").as_bytes()
     );
 
-    let parsed =
-        read_playlist_path(&first, &path_of(PlaylistFormat::M3u)).expect("reading never fails");
-    assert_eq!(parsed.len(), 1);
-    assert_eq!(parsed[0].title, None);
-    assert_eq!(parsed[0].duration_ms, None);
-
-    let second = write_playlist(PlaylistFormat::M3u, &parsed).expect("writing never fails");
-    assert_eq!(second, format!("{location}\r\n").as_bytes());
+    // ... and XSPF writes a track with a location and nothing else.
+    let xspf = write_playlist(PlaylistFormat::Xspf, &entries).expect("writing never fails");
+    let text = String::from_utf8(xspf).expect("the writer writes UTF-8");
+    assert!(text.contains("<location>"), "{text}");
+    assert!(!text.contains("<title>"), "{text}");
+    assert!(!text.contains("<duration>"), "{text}");
 }
 
 #[test]

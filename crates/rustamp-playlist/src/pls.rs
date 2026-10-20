@@ -32,6 +32,10 @@
 //!   *not* interpreted: stripping them would make a title that begins and ends
 //!   with a quote character impossible to represent. `File1=""` is a file
 //!   whose name is two quote characters.
+//!
+//! Writing follows the mirror rule: a `TitleN` line is written only when the
+//! title carries information, a title is written the way the reader hands it
+//! back, and the file is a fixed point of write → read → write.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -164,7 +168,12 @@ pub fn read_text_report(text: &str, base: &Path) -> PlaylistReport {
 /// `NumberOfEntries`.
 ///
 /// `TitleN` and `LengthN` are written only when the entry has them, so an
-/// absent title or duration survives a round-trip.
+/// absent title or duration survives a round-trip. A title that is empty
+/// after the line break replacement and the trim carries no information and
+/// is left out; the entry is then a `FileN=` line and nothing else.
+///
+/// The result is a **fixed point** of write → read → write: writing the
+/// entries the reader returns yields the same bytes, for every entry shape.
 pub fn write(entries: &[LoadedEntry]) -> Vec<u8> {
     let mut out = String::new();
     out.push_str("[playlist]\r\n");
@@ -175,10 +184,10 @@ pub fn write(entries: &[LoadedEntry]) -> Vec<u8> {
             crate::m3u::sanitize_line(&entry.location.to_display_string())
         ));
         if let Some(title) = &entry.title {
-            out.push_str(&format!(
-                "Title{index}={}\r\n",
-                crate::m3u::sanitize_line(title)
-            ));
+            let title = crate::m3u::sanitize_line(title);
+            if !title.is_empty() {
+                out.push_str(&format!("Title{index}={title}\r\n"));
+            }
         }
         if let Some(ms) = entry.duration_ms {
             out.push_str(&format!("Length{index}={}\r\n", format_seconds(ms)));
@@ -312,6 +321,16 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_title_key_carries_no_information() {
+        // The mirror rule of the writer: an empty value removes the key, so
+        // the entry has no title.
+        let text = "[playlist]\nFile1=a.mp3\nTitle1=\n";
+        let entries = read_text(text, &base());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, None);
+    }
+
+    #[test]
     fn write_then_read_round_trips() {
         let entries = vec![
             LoadedEntry::new(file("C:/Music/a.mp3"))
@@ -331,6 +350,42 @@ mod tests {
         let entries = vec![LoadedEntry::new(file("C:/a=b.mp3"))];
         let back = read(&write(&entries), &base());
         assert_eq!(back, entries);
+    }
+
+    #[test]
+    fn an_empty_title_is_not_written() {
+        // A `TitleN` line is written only when the title carries information:
+        // an empty title is "no title" for the reader, so the entry is a
+        // `FileN` line and nothing else.
+        let entries = vec![LoadedEntry {
+            location: file("C:/Music/a.mp3"),
+            title: Some(String::new()),
+            duration_ms: None,
+        }];
+        let text = String::from_utf8(write(&entries)).unwrap();
+        assert_eq!(
+            text,
+            "[playlist]\r\nFile1=C:/Music/a.mp3\r\nNumberOfEntries=1\r\nVersion=2\r\n"
+        );
+        assert_eq!(
+            read_text(&text, &base()),
+            vec![LoadedEntry::new(file("C:/Music/a.mp3"))]
+        );
+    }
+
+    #[test]
+    fn a_title_is_written_the_way_the_reader_hands_it_back() {
+        let entries = vec![LoadedEntry {
+            location: file("C:/Music/a.mp3"),
+            title: Some("  padded  ".into()),
+            duration_ms: None,
+        }];
+        let text = String::from_utf8(write(&entries)).unwrap();
+        assert!(text.contains("Title1=padded\r\n"), "{text}");
+        assert_eq!(
+            read_text(&text, &base())[0].title.as_deref(),
+            Some("padded")
+        );
     }
 
     #[test]

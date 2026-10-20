@@ -35,6 +35,10 @@
 //!   still yields that track. That leniency belongs to [`read`]/[`read_text`];
 //!   [`crate::io::read_playlist_as`] (and so every top-level entry point)
 //!   runs [`validate`] first and rejects such a document.
+//!
+//! Writing follows the mirror rule: a `<title>` is written only when it
+//! carries information, a title is written the way the reader hands it back,
+//! and the file is a fixed point of write → read → write.
 
 use std::path::Path;
 
@@ -225,6 +229,14 @@ fn push_track(
 /// A [`MediaLocation::File`] that is absolute is written as a `file:` URL
 /// (percent-encoded, so the round-trip is exact); a relative one is written as
 /// a relative location and therefore resolves against the reading base.
+///
+/// A `<title>` is written only when it **carries information**: a title that
+/// is empty after the trim is left out, and a title that is not empty is
+/// written trimmed, the way the reader hands it back. An entry with neither a
+/// title nor a duration is a `<track>` with a `<location>` and nothing else.
+///
+/// The result is a **fixed point** of write → read → write: writing the
+/// entries the reader returns yields the same bytes, for every entry shape.
 pub fn write(entries: &[LoadedEntry]) -> Vec<u8> {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -236,8 +248,8 @@ pub fn write(entries: &[LoadedEntry]) -> Vec<u8> {
             "      <location>{}</location>\n",
             escape_text(&location_text(&entry.location))
         ));
-        if let Some(title) = &entry.title {
-            out.push_str(&format!("      <title>{}</title>\n", escape_text(title)));
+        if let Some(title) = entry.title.as_deref().and_then(normalize_title) {
+            out.push_str(&format!("      <title>{}</title>\n", escape_text(&title)));
         }
         if let Some(ms) = entry.duration_ms {
             out.push_str(&format!("      <duration>{ms}</duration>\n"));
@@ -419,6 +431,17 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_title_element_carries_no_information() {
+        // The mirror rule of the writer: an empty `<title>` is "no title".
+        let text = "<playlist><trackList><track><location>a.mp3</location>\
+                    <title></title><duration></duration></track></trackList></playlist>";
+        let entries = read_text(text, &base());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, None);
+        assert_eq!(entries[0].duration_ms, None);
+    }
+
+    #[test]
     fn names_are_matched_case_insensitively_and_by_local_name() {
         let text = r#"<x:PLAYLIST xmlns:x="urn:x"><X:TrackList><X:TRACK>
           <X:Location>a.mp3</X:Location><X:Title>A</X:Title></X:TRACK>
@@ -474,6 +497,32 @@ mod tests {
         assert!(text.contains("<title>a&#10;b&#13;c</title>"));
         let back = read(text.as_bytes(), &base());
         assert_eq!(back[0].title.as_deref(), Some("a\nb\rc"));
+    }
+
+    #[test]
+    fn a_title_is_written_only_when_it_carries_information() {
+        // An empty title is "no title" for the reader, so no `<title>` element
+        // is written for it; a title that is not empty is written trimmed, the
+        // way the reader hands it back.
+        let entries = vec![
+            LoadedEntry {
+                location: file("C:/Music/a.mp3"),
+                title: Some(String::new()),
+                duration_ms: None,
+            },
+            LoadedEntry {
+                location: file("C:/Music/b.mp3"),
+                title: Some("  padded  ".into()),
+                duration_ms: None,
+            },
+        ];
+        let text = String::from_utf8(write(&entries)).unwrap();
+        assert!(!text.contains("<title></title>"), "{text}");
+        assert!(!text.contains("<title/>"), "{text}");
+        assert!(text.contains("<title>padded</title>"), "{text}");
+        let back = read(text.as_bytes(), &base());
+        assert_eq!(back[0].title, None);
+        assert_eq!(back[1].title.as_deref(), Some("padded"));
     }
 
     #[test]
