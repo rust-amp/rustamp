@@ -29,6 +29,12 @@
 //! is this rule: unconditional signalling "costs one extra `SetEvent` per
 //! advance and is always correct".
 //!
+//! A signal is only a hint, so the store it announces must be visible to the
+//! peer when the signal is delivered: the peer re-reads the counters after
+//! every wake, and a re-read that still sees the old counters would send it
+//! back to sleep with the wakeup lost. `shm::wake` therefore puts a barrier
+//! before every signal and after every wait; see the module docs there.
+//!
 //! # The reset rule (RFC 0007 §5.3)
 //!
 //! A ring that is **reset** — the creator re-creates the section, so the
@@ -673,7 +679,12 @@ impl<R: MappedRegion> RingProducer<R> {
     fn state(&self) -> u32 {
         let h = header_ptr(&self.region);
         // SAFETY: `h` points to a live header; `state` is a whole atomic.
-        unsafe { (*h).state.load(Ordering::Relaxed) }
+        //
+        // The load is `Acquire` because the store in `close` is `Release`, and
+        // the release/acquire pair is what makes the close visible to a peer
+        // that was woken by the signal (RFC 0007 section 6.5). A `Relaxed`
+        // load would leave the store without a partner.
+        unsafe { (*h).state.load(Ordering::Acquire) }
     }
 
     fn write_seq(&self, order: Ordering) -> u64 {
@@ -835,7 +846,12 @@ impl<R: MappedRegion> RingConsumer<R> {
     pub fn is_closed(&self) -> bool {
         let h = header_ptr(&self.region);
         // SAFETY: `h` points to a live header; `state` is a whole atomic.
-        unsafe { (*h).state.load(Ordering::Relaxed) == RING_STATE_CLOSED }
+        //
+        // The load is `Acquire` because the store in `close` is `Release`, and
+        // the release/acquire pair is what makes the close visible to a peer
+        // that was woken by the signal (RFC 0007 section 6.5). A `Relaxed`
+        // load would leave the store without a partner.
+        unsafe { (*h).state.load(Ordering::Acquire) == RING_STATE_CLOSED }
     }
 
     /// Mark the ring closed.

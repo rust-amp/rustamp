@@ -390,7 +390,33 @@ impl RingWake {
     /// non-blocking paths after the counter store (RFC 0007 §6.2). Returns
     /// `Ok(())` on success; a signaling failure is reported as
     /// [`RingError::WakeOpenFailed`] but does not affect ring data.
+    ///
+    /// # The barrier before the signal
+    ///
+    /// The store that precedes the signal (the counter advance, or the closed
+    /// state) must be **visible to the peer before the signal is delivered**,
+    /// because the peer's whole protocol is "wake up, then re-read the
+    /// counters" (RFC 0007 §6.1). Without a barrier in between, nothing
+    /// orders the two:
+    ///
+    /// * In the memory model, a call to an external function is not a
+    ///   synchronisation edge, so the peer's re-read has no happens-before
+    ///   relation with the store that this signal announces.
+    /// * On the hardware, the store can still sit in this core's store buffer
+    ///   when the kernel releases the waiter: the peer, running on another
+    ///   core, then reads the *old* counter, finds its condition unmet, and
+    ///   goes back to sleep. The wakeup is lost, and the peer waits for its
+    ///   whole timeout - forever, with `timeout: None`.
+    ///
+    /// The `SeqCst` fence is the barrier that closes the window: on x86-64 it
+    /// is an `mfence`, which drains the store buffer, so the store is
+    /// globally visible before `SetEvent` even reaches the kernel. It costs a
+    /// few nanoseconds next to the `SetEvent` syscall it guards, and it is
+    /// paid only where a peer can be waiting: a ring without a wake has no
+    /// signal and does not pay for it.
     pub(crate) fn signal(&self, which: Wake) -> Result<(), RingError> {
+        // The barrier between the caller's counter store and the signal.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let handle = match which {
             Wake::Data => &self.data,
             Wake::Space => &self.space,
@@ -407,6 +433,12 @@ impl RingWake {
     /// Returns [`RingError::NoWakeObject`] when this side has no handle for the
     /// requested direction (should not happen for a properly constructed
     /// `RingWake`).
+    ///
+    /// The `Acquire` fence after the wait orders the caller's re-read of the
+    /// counters after the wait, so the re-read cannot be hoisted above it
+    /// (RFC 0007 §6.1). On x86-64 it compiles to nothing; on a weakly ordered
+    /// architecture it is what makes the re-read see the store that the
+    /// signaler's fence published.
     pub(crate) fn wait(
         &self,
         which: Wake,
@@ -416,10 +448,13 @@ impl RingWake {
             Wake::Data => &self.data,
             Wake::Space => &self.space,
         };
-        match handle {
-            Some(h) => backend::do_wait(h, timeout),
-            None => Err(RingError::NoWakeObject),
-        }
+        let outcome = match handle {
+            Some(h) => backend::do_wait(h, timeout)?,
+            None => return Err(RingError::NoWakeObject),
+        };
+        // The barrier between the wait and the caller's re-read.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        Ok(outcome)
     }
 
     /// Take one direction's pending signal, if there is one, without waiting.
