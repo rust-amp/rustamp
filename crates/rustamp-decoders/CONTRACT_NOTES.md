@@ -315,6 +315,93 @@ the core contract leaves room:
 - **Bitrate** is the uncompressed sample format
   (`rate * channels * container_bits`), not a file average.
 
+## HTTP source (`http_source.rs`, `http_dec.rs`)
+
+An `http://` stream is played by `rustamp_decoders::HttpDecoder`: the body of
+the response is the byte source, and the containers and codecs of this crate
+decode it exactly as they decode a file.
+
+- **The request** is the one of S19 §1: `GET http://<host>:<port>/<path>
+  HTTP/1.0`, then `Host:`, `User-Agent: Winamp/<version>` and `Accept: */*`,
+  in that order, and no other header. The request line carries the absolute
+  form (scheme, host, port, path), the path is the one of the URL (`/` when
+  the URL names none) and the query of the URL goes with it; the fragment
+  does not, because it belongs to the client. The lines are separated by
+  CRLF. The template has one slot for extra headers and what it carries is
+  open (S19 §6, question 9), so none is sent.
+- **The `Host:` line** carries the authority of the request line - the host
+  and the port - because that is what the request line itself carries
+  (RFC 7230 §5.4). S19 §6, question 10 leaves this open.
+- **The `User-Agent`** names the player and carries a version; S19 §1 says so
+  and does not establish the string. The source sends `Winamp/2.95`, the
+  version of the player this project imitates.
+- **The timeout** is ten seconds (`http_source::DEFAULT_TIMEOUT`) and it
+  bounds the connect, the read of the response head and the gap between two
+  reads of the body. S19 §6 (questions 1 and 14) records that the
+  reference's string table carries no timeout text, so neither the existence
+  nor the value of a timeout is established there: this is a decision of this
+  implementation. Ten seconds is long enough for one round trip to a distant
+  server and short enough that a dead host reads as a failure instead of a
+  hang. The bound on the gap between two body reads is what the core
+  contract asks for: a `read` "must not block indefinitely on live streams
+  without returning data or an error".
+- **The name resolution is not bounded by it.** `std` has no bound for a name
+  lookup, so a host whose resolver hangs hangs the source too.
+- **The status codes**: only `200` is a body. Every other status is a typed
+  failure that names the status (`HttpError::Status { code, reason }`), and
+  the body of an error answer is not played. S19 §6, question 4 leaves this
+  open and the spec carries no text for it - the source names the status
+  instead of pretending to know what the reference shows. A redirect is not
+  followed: a `3xx` is a status failure like every other status.
+- **The schemes**: only `http://`. An `https://` URL is refused by name
+  (`HttpError::UnsupportedScheme`): this tree has no TLS, and S19 §6,
+  question 8 records that the spec establishes no evidence for a TLS stream
+  at all. A URL that carries credentials is refused as well - the shape of a
+  proxy with credentials is open (S19 §6, question 13) and nothing here
+  sends them.
+- **A body that is not media** is refused when the decoder is opened, with
+  the failure of the decoder itself (`HttpError::Media`). A container that
+  needs the whole file before it plays anything (MP4/M4A: its reader scans
+  the file to the end and then seeks) cannot be streamed this way - a stream
+  cannot be rewound - and the failure is reported when the decoder is
+  opened.
+- **A connection that dies in the middle** is a **truncated stream**, not a
+  clean end. The length the server declared (`Content-Length`) is the oracle:
+  a body that ends before that length is a cut, and the decoder says so with
+  `Error::Decode("truncated stream: the connection closed after N of the M
+  bytes the server declared")`, in a call that writes no frames - the frames
+  that did arrive are still delivered. A body that ends where the server
+  said it ends is the end of the stream.
+- **A body without a length** ends when the connection closes, which is how
+  a response without a `Content-Length` ends. There is then no oracle, so a
+  stream that dies cannot be told from a stream that ended: it ends cleanly.
+- **Seeking is refused** (`Error::Unsupported`): a stream has no position to
+  seek to, and `is_seekable` says so even when the container states a
+  duration.
+- **The head of a stream is not analysed.** A stream cannot be rewound, so
+  the analyses that need the head of the file - the Xing/Info tag of MPEG
+  audio, the metadata chain of FLAC, the payload claims of AIFF and MP4 -
+  do not run for it (`HeaderProbe::unknown`). The length the server declares
+  is the oracle instead. A consequence: a stream whose *media* is cut, but
+  whose transfer is complete, ends cleanly, where the same file on disk is a
+  loud failure.
+- **What the source does not do**: it does not read a chunked body (a
+  response to an HTTP/1.0 request is not chunked - S19 §1), it does not
+  follow a redirect, it does not send a `Range` header (a seek is not
+  negotiated with the server - S19 §1), it does not read an ICY metadata
+  block (S19 §6, question 12 is open and the spec carries no evidence that
+  the reference reads one), it does not use a proxy (the shape of the proxy
+  setting is open - S19 §6, question 13), and it does not show the status
+  texts of S19 §2 - those belong to the application, which owns the window.
+- **The engine's URL path is not wired.** `DecoderRegistry` cannot tell a URL
+  from a path: it probes a source by its extension and its first bytes, and
+  a URL has no bytes to sniff. A URL with an extension the registry knows
+  therefore reaches the symphonia factory, which refuses it and names the way
+  that works (`HttpDecoder::open`). A URL without an extension is refused by
+  the registry before any factory sees it. Routing `TrackSource::Url` to
+  `HttpDecoder::open` is the wiring that is missing, and it belongs to
+  `rustamp-audio`.
+
 ## Named collapses
 
 Distinctions the decoders still cannot make, named so they are not mistaken for
@@ -475,6 +562,19 @@ correct behaviour:
     judged either: the container reader ends the stream at the chain boundary
     (C3.4), so the end of the file is never reached and no verdict is
     reported.
+11. **A cut HTTP stream is only a loud failure when the server declared a
+    length** (`http_source.rs`). The `Content-Length` of the response is the
+    oracle of a network transfer: a body that ends before it is a cut, and
+    the decoder names it (`Error::Decode("truncated stream: the connection
+    closed after N of the M bytes the server declared")`). A response
+    without a `Content-Length` ends when the connection closes - that is how
+    such a response ends - and a stream that dies in the middle of it
+    cannot be told from a stream that ended, so it ends cleanly.
+    The head of a stream is not analysed either (a stream cannot be
+    rewound), so the container oracles - the Xing/Info tag of MPEG audio, the
+    metadata chain of FLAC, the payload claims of AIFF and MP4 - do not run
+    for it. A stream whose *media* is cut while its transfer is complete
+    therefore ends cleanly, where the same file on disk is a loud failure.
 
 ## Proposals
 

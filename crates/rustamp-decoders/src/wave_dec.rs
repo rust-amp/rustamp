@@ -478,7 +478,7 @@ impl WaveDecoder {
         let (mut reader, file_len) = match source {
             MediaSource::Url(_) => {
                 return Err(Error::Unsupported(
-                    "URL sources are not supported by the wave decoder; network streaming comes in M4",
+                    "a URL is not opened by the wave decoder; an http:// stream is opened with rustamp_decoders::HttpDecoder",
                 ));
             }
             MediaSource::Path(p) => {
