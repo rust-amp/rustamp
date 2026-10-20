@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+rustamp-decoders.workspace = true
 rustamp-dsp.workspace = true
 rustamp-mediahost.workspace = true
 rustamp-meta.workspace = true
@@ -19,6 +20,5 @@ rtrb.workspace = true
 rubato.workspace = true
 
 [dev-dependencies]
-rustamp-decoders.workspace = true
 rustamp-output.workspace = true
 tempfile.workspace = true
