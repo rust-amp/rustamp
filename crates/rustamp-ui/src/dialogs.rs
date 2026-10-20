@@ -86,11 +86,14 @@
 //! * The edit-entry box (S03 §2 `40255` "Edit the playlist entry") **edits**
 //!   the tags of one playlist entry: a field per tag, pre-filled with the
 //!   value the file has, with its own focus, validation and a save request
-//!   that carries the changed fields only (see [`EditEntryDialog`]). The box
-//!   writes nothing itself: the app reads the tags, opens the box with them
-//!   and hands the request to the tag writer. S03 §2 gives the id and the
-//!   chord only, so the fields, the layout and the validation are own
-//!   choices.
+//!   that carries the changed fields only (see [`EditEntryDialog`]). A field
+//!   the user clears is a **removal** and not an empty value: the request
+//!   names the tag field that goes away
+//!   ([`EditEntryChanges::removals`]), so the writer can take it out of the
+//!   file. The box writes nothing itself: the app reads the tags, opens the
+//!   box with them and hands the request to the tag writer. S03 §2 gives the
+//!   id and the chord only, so the fields, the layout and the validation are
+//!   own choices.
 //! * Rendering uses the `text.bmp` bitmap font as a stand-in (the same choice
 //!   as the playlist rows; the reference's real dialog font is unknown).
 
@@ -103,6 +106,10 @@ use rustamp_prefs::DEFAULT_PAGE;
 use rustamp_skin::{Sheet, Skin, webamp};
 
 use crate::{Key, Modifiers};
+
+// The tag field the writer removes. The crate re-exports it so a caller of
+// the edit-entry box can name the type of the removal list it gets.
+pub use rustamp_meta::TagField;
 
 /// A dialog the app can open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1186,12 +1193,25 @@ pub enum EditEntryChange<T> {
     Unchanged,
     /// The field was edited: the file gets this value.
     Edited(T),
+    /// The field was cleared: the value goes away from the file.
+    ///
+    /// The value is **not** written as an empty one — it is removed, and
+    /// the removal list of the writer
+    /// ([`EditEntryChanges::removals`]) names the tag field. A field that
+    /// was empty before stays [`Unchanged`](Self::Unchanged): there is
+    /// nothing in the file to take away.
+    Removed,
 }
 
 impl<T> EditEntryChange<T> {
     /// Whether the field was not touched.
     pub fn is_unchanged(&self) -> bool {
         matches!(self, Self::Unchanged)
+    }
+
+    /// Whether the field was cleared, so its value goes away.
+    pub fn is_removed(&self) -> bool {
+        matches!(self, Self::Removed)
     }
 }
 
@@ -1208,6 +1228,11 @@ impl<T> Default for EditEntryChange<T> {
 /// [`EditEntryChange::Unchanged`]. The app hands the request to the tag
 /// writer (through [`Self::to_metadata`]), so the fields the user did not
 /// touch keep the value the file has.
+///
+/// A field the user **cleared** is a removal and not an empty value: the
+/// field is [`EditEntryChange::Removed`] and the tag field it names is in
+/// the removal list ([`Self::removals`]), which the writer takes out of the
+/// file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EditEntryChanges {
     /// The title.
@@ -1228,6 +1253,14 @@ pub struct EditEntryChanges {
     pub disc: EditEntryChange<EditEntryNumber>,
     /// The comment.
     pub comment: EditEntryChange<String>,
+    /// The tag fields the user cleared, in the order the dialog shows the
+    /// fields.
+    ///
+    /// This is the removal list of the writer: every field in it is taken
+    /// out of the file. The dialog fills it from the same source as the
+    /// [`Removed`](EditEntryChange::Removed) changes above, so the two
+    /// agree.
+    pub removed_fields: Vec<TagField>,
 }
 
 impl EditEntryChanges {
@@ -1244,19 +1277,37 @@ impl EditEntryChanges {
             && self.comment.is_unchanged()
     }
 
+    /// The tag fields the user cleared: the removal list of the writer.
+    ///
+    /// Every field in the list is taken out of the file, and a field is a
+    /// *whole* field: the track takes the total number of tracks with it.
+    /// The list is empty when the user only edited values.
+    ///
+    /// The app hands the list to the writer next to the patch of
+    /// [`Self::to_metadata`]:
+    ///
+    /// ```text
+    /// library.write_tags_with(id, &changes.to_metadata(), changes.removals())
+    /// ```
+    pub fn removals(&self) -> &[TagField] {
+        &self.removed_fields
+    }
+
     /// The patch the app hands to the tag writer.
     ///
-    /// Only the changed fields are set; the rest stay `None`, which the
+    /// Only the edited fields are set; the rest stay `None`, which the
     /// writer reads as "leave this tag as it is" (`write_tags` keeps every
-    /// field the caller does not set).
+    /// field the caller does not set). A field the user cleared is not in
+    /// the patch at all: it goes away through the removal list
+    /// ([`Self::removals`]), not through an empty value.
     ///
     /// Two limits of the writer show up here, and they are the writer's, not
     /// the dialog's:
     ///
-    /// * A value the writer cannot clear keeps the value the file has.
-    ///   Dropping the total of a `3/12` track leaves the total in the file,
-    ///   and a number the user empties keeps the number the file has (a
-    ///   number has no empty value).
+    /// * A part of a field the writer cannot clear keeps the value the file
+    ///   has. Dropping the total of a `3/12` track leaves the total in the
+    ///   file, because a metadata field that is `None` keeps the value the
+    ///   file has. Clearing the whole field can: that is a removal.
     /// * The disc total has no field in [`TrackMetadata`], so it rides in the
     ///   `extra` map under [`DISC_TOTAL_KEY`] — the key `rustamp-meta`'s
     ///   reader parks it in.
@@ -1374,6 +1425,10 @@ struct EditEntryValue {
 ///   [`MIN_EDIT_ENTRY_YEAR`] and [`MAX_EDIT_ENTRY_YEAR`]. The track and the
 ///   disc field take `n` or `n/total`.
 /// * A field keeps at most [`EditEntryField::max_len`] characters.
+/// * A field the user **clears** is a removal and not an empty value: the
+///   tag field goes away through the removal list of the writer
+///   ([`EditEntryChanges::removals`]). A field that was empty before stays
+///   untouched — there is nothing in the file to take away.
 /// * `Enter` produces the save request and `Escape` cancels. A field that
 ///   does not validate keeps the dialog open, so the user can fix it.
 ///
@@ -1524,7 +1579,25 @@ impl EditEntryDialog {
             track: self.changed_number(EditEntryField::Track)?,
             disc: self.changed_number(EditEntryField::Disc)?,
             comment: self.changed_text(EditEntryField::Comment),
+            // The fields the user cleared: the removal list of the writer.
+            // The list names the fields in the order the dialog shows them.
+            removed_fields: EditEntryField::ALL
+                .iter()
+                .filter(|field| self.is_cleared(**field))
+                .map(|field| edit_entry_tag_field(*field))
+                .collect(),
         })
+    }
+
+    /// Whether the user cleared `field`: the field is empty now and the file
+    /// had a value there.
+    ///
+    /// This is the rule of the [`Removed`](EditEntryChange::Removed) change:
+    /// a field that was empty before stays untouched, because there is
+    /// nothing in the file to take away.
+    fn is_cleared(&self, field: EditEntryField) -> bool {
+        let value = &self.values[field.index()];
+        value.current.trim().is_empty() && !value.original.trim().is_empty()
     }
 
     /// The first field that does not validate, in the order the dialog shows
@@ -1542,8 +1615,8 @@ impl EditEntryDialog {
     fn field_error(&self, field: EditEntryField) -> Option<EditEntryError> {
         let text = self.values[field.index()].current.trim();
         if text.is_empty() {
-            // An empty number field keeps the value the file has: a number
-            // has no empty value.
+            // An empty field is not a problem: it is a removal (the value
+            // goes away) or nothing at all.
             return None;
         }
         match field {
@@ -1567,28 +1640,43 @@ impl EditEntryDialog {
     }
 
     /// The change of a free-text field.
+    ///
+    /// A field the user cleared is a [`Removed`](EditEntryChange::Removed)
+    /// change and not an empty value: the value goes away through the
+    /// removal list of the writer.
     fn changed_text(&self, field: EditEntryField) -> EditEntryChange<String> {
         let value = &self.values[field.index()];
-        if value.current == value.original {
-            EditEntryChange::Unchanged
-        } else {
-            EditEntryChange::Edited(value.current.clone())
+        if value.current.trim().is_empty() {
+            // The field is empty now: the value goes away if the file had
+            // one, and there is nothing to take away if it had none.
+            return if self.is_cleared(field) {
+                EditEntryChange::Removed
+            } else {
+                EditEntryChange::Unchanged
+            };
         }
+        if value.current == value.original {
+            return EditEntryChange::Unchanged;
+        }
+        EditEntryChange::Edited(value.current.clone())
     }
 
     /// The change of the year field.
     fn changed_year(&self) -> Result<EditEntryChange<u32>, EditEntryInvalid> {
         let value = &self.values[EditEntryField::Year.index()];
+        if value.current.trim().is_empty() {
+            // The field is empty now: the year goes away if the file had
+            // one, and there is nothing to take away if it had none.
+            return Ok(if self.is_cleared(EditEntryField::Year) {
+                EditEntryChange::Removed
+            } else {
+                EditEntryChange::Unchanged
+            });
+        }
         if value.current == value.original {
             return Ok(EditEntryChange::Unchanged);
         }
-        let text = value.current.trim();
-        if text.is_empty() {
-            // A year has no empty value: the field keeps the year the file
-            // has.
-            return Ok(EditEntryChange::Unchanged);
-        }
-        match parse_edit_year(text) {
+        match parse_edit_year(value.current.trim()) {
             Some(year) => Ok(EditEntryChange::Edited(year)),
             None => Err(EditEntryInvalid {
                 field: EditEntryField::Year,
@@ -1603,16 +1691,19 @@ impl EditEntryDialog {
         field: EditEntryField,
     ) -> Result<EditEntryChange<EditEntryNumber>, EditEntryInvalid> {
         let value = &self.values[field.index()];
+        if value.current.trim().is_empty() {
+            // The field is empty now: the number goes away if the file had
+            // one, and there is nothing to take away if it had none.
+            return Ok(if self.is_cleared(field) {
+                EditEntryChange::Removed
+            } else {
+                EditEntryChange::Unchanged
+            });
+        }
         if value.current == value.original {
             return Ok(EditEntryChange::Unchanged);
         }
-        let text = value.current.trim();
-        if text.is_empty() {
-            // A number has no empty value: the field keeps the number the
-            // file has.
-            return Ok(EditEntryChange::Unchanged);
-        }
-        match parse_edit_number(text) {
+        match parse_edit_number(value.current.trim()) {
             Some(number) => Ok(EditEntryChange::Edited(number)),
             None => Err(EditEntryInvalid {
                 field,
@@ -1663,6 +1754,26 @@ fn edit_entry_initial_text(field: EditEntryField, metadata: &TrackMetadata) -> S
             edit_entry_number_text(metadata.disc_no, edit_entry_disc_total(metadata))
         }
         EditEntryField::Comment => metadata.comment.clone().unwrap_or_default(),
+    }
+}
+
+/// The tag field an edit-entry field is: the bridge to the writer's removal
+/// list.
+///
+/// The two lists hold the same nine fields; this is the mapping between
+/// them, so a field the user cleared can be named the way the writer names
+/// it.
+fn edit_entry_tag_field(field: EditEntryField) -> TagField {
+    match field {
+        EditEntryField::Title => TagField::Title,
+        EditEntryField::Artist => TagField::Artist,
+        EditEntryField::Album => TagField::Album,
+        EditEntryField::AlbumArtist => TagField::AlbumArtist,
+        EditEntryField::Year => TagField::Year,
+        EditEntryField::Genre => TagField::Genre,
+        EditEntryField::Track => TagField::Track,
+        EditEntryField::Disc => TagField::Disc,
+        EditEntryField::Comment => TagField::Comment,
     }
 }
 
@@ -2921,19 +3032,101 @@ mod tests {
     }
 
     #[test]
-    fn an_emptied_field_tells_the_writer_what_it_can_do() {
+    fn a_cleared_field_is_a_removal_and_not_an_empty_value() {
         let mut dialog = EditEntryDialog::new(&tagged_metadata());
-        // A text field the user empties is written as an empty value.
+        // The user clears a field the file has a value for.
         dialog.set_field_text(EditEntryField::Comment, "");
         let changes = dialog.save_request().expect("the fields validate");
-        assert_eq!(changes.comment, EditEntryChange::Edited(String::new()));
-        assert_eq!(changes.to_metadata().comment.as_deref(), Some(""));
-        // A number has no empty value: the field keeps the value the file
-        // has.
-        dialog.set_field_text(EditEntryField::Year, "");
+        assert_eq!(changes.comment, EditEntryChange::Removed);
+        assert!(changes.comment.is_removed());
+        // The value is not written as an empty one: it goes away through the
+        // removal list of the writer.
+        assert_eq!(changes.to_metadata().comment, None);
+        assert_eq!(changes.removals(), &[TagField::Comment]);
+        // The fields the user did not touch keep the value the file has.
+        assert!(changes.title.is_unchanged());
+        assert_eq!(changes.to_metadata().title, None);
+        // A change set with a removal is not empty: there is something to
+        // write.
+        assert!(!changes.is_empty());
+    }
+
+    #[test]
+    fn a_field_that_was_empty_stays_untouched() {
+        let mut dialog = EditEntryDialog::new(&TrackMetadata::default());
+        // The field was empty and the user clears it: there is nothing in
+        // the file to take away.
+        dialog.set_field_text(EditEntryField::Title, "");
         let changes = dialog.save_request().expect("the fields validate");
-        assert!(changes.year.is_unchanged());
-        assert_eq!(changes.to_metadata().year, None);
+        assert!(changes.title.is_unchanged());
+        assert!(!changes.title.is_removed());
+        assert!(changes.removals().is_empty());
+        assert!(changes.is_empty());
+        // A field with nothing but spaces is empty as well.
+        dialog.set_field_text(EditEntryField::Album, "   ");
+        let changes = dialog.save_request().expect("the fields validate");
+        assert!(changes.album.is_unchanged());
+        assert!(changes.removals().is_empty());
+    }
+
+    #[test]
+    fn the_removal_list_names_the_cleared_fields() {
+        let mut dialog = EditEntryDialog::new(&tagged_metadata());
+        // A text field, the year and a number field: three ways to clear a
+        // value the file has.
+        dialog.set_field_text(EditEntryField::Title, "");
+        dialog.set_field_text(EditEntryField::Year, "");
+        dialog.set_field_text(EditEntryField::Track, "");
+        let changes = dialog.save_request().expect("the fields validate");
+        // The list names the fields in the order the dialog shows them.
+        assert_eq!(
+            changes.removals(),
+            &[TagField::Title, TagField::Year, TagField::Track]
+        );
+        // The patch carries none of them: a removal is not an empty value.
+        let patch = changes.to_metadata();
+        assert_eq!(patch.title, None);
+        assert_eq!(patch.year, None);
+        assert_eq!(patch.track_no, None);
+        assert_eq!(patch.track_total, None);
+        // The fields the user did not touch keep the value the file has.
+        assert_eq!(patch.artist, None);
+        assert_eq!(changes.artist, EditEntryChange::Unchanged);
+    }
+
+    #[test]
+    fn an_edited_field_and_a_removed_field_travel_together() {
+        let mut dialog = EditEntryDialog::new(&tagged_metadata());
+        dialog.set_field_text(EditEntryField::Artist, "Another Artist");
+        dialog.set_field_text(EditEntryField::Genre, "");
+        let changes = dialog.save_request().expect("the fields validate");
+        // The edit travels in the patch.
+        assert_eq!(
+            changes.artist,
+            EditEntryChange::Edited("Another Artist".to_string())
+        );
+        assert_eq!(
+            changes.to_metadata().artist.as_deref(),
+            Some("Another Artist")
+        );
+        // The removal travels in the removal list, and not in the patch.
+        assert_eq!(changes.genre, EditEntryChange::Removed);
+        assert_eq!(changes.to_metadata().genre, None);
+        assert_eq!(changes.removals(), &[TagField::Genre]);
+    }
+
+    #[test]
+    fn the_whole_track_goes_away_when_the_field_is_cleared() {
+        // A removal is a whole field: the track takes the total number of
+        // tracks with it.
+        let mut dialog = EditEntryDialog::new(&tagged_metadata());
+        dialog.set_field_text(EditEntryField::Track, "");
+        let changes = dialog.save_request().expect("the fields validate");
+        assert_eq!(changes.track, EditEntryChange::Removed);
+        assert_eq!(changes.removals(), &[TagField::Track]);
+        let patch = changes.to_metadata();
+        assert_eq!(patch.track_no, None);
+        assert_eq!(patch.track_total, None);
     }
 
     #[test]
