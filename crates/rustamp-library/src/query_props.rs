@@ -21,6 +21,7 @@
 //! `%` in its name - things a WAV fixture cannot express. The generator is
 //! seeded, so a failing case is reproducible from its seed alone.
 
+use crate::testsupport::Rng;
 use crate::{Library, Query, SortKey, TrackRow};
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -115,46 +116,6 @@ const TERMS: &[&str] = &[
     "alpha",
     "nothing at all",
 ];
-
-/// A deterministic pseudo random generator (xorshift64*).
-///
-/// The tests need data that is random enough to hit the corners and
-/// reproducible enough to replay a failure: the seed is the whole case.
-struct Rng(u64);
-
-impl Rng {
-    /// A generator for `seed`. The state is never zero: xorshift needs a
-    /// non-zero state to leave.
-    fn new(seed: u64) -> Self {
-        Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
-    }
-
-    /// The next number of the sequence.
-    fn next_u64(&mut self) -> u64 {
-        let mut state = self.0;
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        self.0 = state;
-        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-
-    /// A number in `0..bound`.
-    fn below(&mut self, bound: usize) -> usize {
-        assert!(bound > 0, "the bound must not be empty");
-        (self.next_u64() % bound as u64) as usize
-    }
-
-    /// `true` in half of the cases.
-    fn flip(&mut self) -> bool {
-        self.next_u64() & 1 == 1
-    }
-
-    /// One of `items`.
-    fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
-        &items[self.below(items.len())]
-    }
-}
 
 /// A synthetic library: the index and the rows it holds.
 struct Fixture {
