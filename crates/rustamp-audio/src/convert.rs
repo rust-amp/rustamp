@@ -418,8 +418,9 @@ impl FormatConverter {
     }
 
     /// Convert `input` (whole frames in the source format) into `out` (device
-    /// frames). Returns the number of output frames written; `out` must hold at
-    /// least [`Self::max_out_frames`] frames for the input length.
+    /// frames). Returns the number of output frames written; `out` must hold
+    /// at least [`Self::max_out_frames`] frames for the input length, that is
+    /// `max_out_frames * device channels` samples.
     ///
     /// When resampling, input is collected into fixed chunks and the
     /// resampler's look-ahead is held back (see [`Self::latency_frames`]); it
@@ -470,8 +471,9 @@ impl FormatConverter {
     /// `ceil(input_frames * dst_rate / src_rate)` frames for the whole stream,
     /// so a resampled stream has the length its duration implies.
     ///
-    /// `out` must hold `max_out_frames(2 * latency_frames())` frames. Returns
-    /// the number of frames written; `0` for equal rates. Allocation-free.
+    /// `out` must hold `max_out_frames(2 * latency_frames())` frames, that is
+    /// that many times the device channels in samples. Returns the number of
+    /// frames written; `0` for equal rates. Allocation-free.
     pub fn flush(&mut self, out: &mut [f32]) -> usize {
         if self.same_rate || self.engine.is_none() {
             self.reset();
@@ -569,7 +571,7 @@ impl FormatConverter {
 /// The last level decision in the chain, on the resampled path only: silence
 /// for non-finite samples, zero for subnormals, and a hard clamp at full
 /// scale. Finite in-band samples pass through bit for bit.
-fn finish_sample(x: f32) -> f32 {
+pub(crate) fn finish_sample(x: f32) -> f32 {
     if !x.is_finite() || x.is_subnormal() {
         0.0
     } else {
