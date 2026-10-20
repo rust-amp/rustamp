@@ -28,7 +28,7 @@ fn the_registration_lands_in_the_registry_and_can_be_removed_again() {
     shell_registration::install(std::path::Path::new(&exe)).expect("write the registration");
 
     // The `open` verb of the media handler (S13 §3).
-    let command = shell_registration::registered_value(r"Winamp.File\shell\open\command")
+    let command = shell_registration::registered_value(r"Rustamp.File\shell\open\command")
         .expect("the open command must be registered");
     assert!(
         command.contains(&exe),
@@ -36,7 +36,7 @@ fn the_registration_lands_in_the_registry_and_can_be_removed_again() {
     );
 
     // The bookmark verb carries the form S13 §1 records.
-    let bookmark = shell_registration::registered_value(r"Winamp.File\shell\ListBookmark\command")
+    let bookmark = shell_registration::registered_value(r"Rustamp.File\shell\ListBookmark\command")
         .expect("the ListBookmark command must be registered");
     assert!(
         bookmark.contains("/BOOKMARK"),
@@ -46,7 +46,7 @@ fn the_registration_lands_in_the_registry_and_can_be_removed_again() {
     // The `DropTarget` values of `Play` and `Enqueue` (S13 §3).
     for verb in ["Play", "Enqueue"] {
         assert!(
-            shell_registration::registered_value(&format!(r"Winamp.File\shell\{verb}\DropTarget"))
+            shell_registration::registered_value(&format!(r"Rustamp.File\shell\{verb}\DropTarget"))
                 .is_some(),
             "the {verb} verb must carry a DropTarget value"
         );
@@ -54,7 +54,7 @@ fn the_registration_lands_in_the_registry_and_can_be_removed_again() {
 
     // The skin archive's one verb (S13 §3).
     assert!(
-        shell_registration::registered_value(r"Winamp.SkinZip\shell\install\command").is_some(),
+        shell_registration::registered_value(r"Rustamp.SkinZip\shell\install\command").is_some(),
         "the skin handler must carry its install verb"
     );
 
@@ -72,7 +72,7 @@ fn the_registration_lands_in_the_registry_and_can_be_removed_again() {
 
     shell_registration::uninstall().expect("remove the registration");
     assert!(
-        shell_registration::registered_value(r"Winamp.File\shell\open\command").is_none(),
+        shell_registration::registered_value(r"Rustamp.File\shell\open\command").is_none(),
         "the removal must take the verb keys with it"
     );
 }

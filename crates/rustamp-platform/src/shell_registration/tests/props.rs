@@ -134,17 +134,18 @@ const SPEC_SKIN_VERBS: &[&str] = &["install"];
 /// The two verbs of a directory (S13 §3).
 const SPEC_DIRECTORY_VERBS: &[&str] = &["Play", "Enqueue"];
 
-/// The verb table of S13 §3, as the spec writes it.
+/// The verb table of S13 §3, as **we** write it.
 ///
-/// The first column is the key the verbs live under: `Winamp.File`,
-/// `Winamp.PlayList` and `Winamp.SkinZip` are S13 §3's own ProgIDs, and
-/// `Directory` is the shell's own key - the spec leaves the directory
-/// handler's identifiers open (S13 §5.10), so the model's own choice is
-/// what this table reads.
+/// The verb sets are the spec's; the **ProgIDs are ours** (`Rustamp.File`,
+/// `Rustamp.PlayList`, `Rustamp.SkinZip`) — a deliberate deviation from the
+/// reference's `Winamp.*` ones, see the module doc: a player must not claim
+/// another product's ProgIDs and must not collide with a real Winamp
+/// installation. `Directory` is the shell's own key (S13 §5.10 leaves the
+/// directory handler's identifiers open).
 const SPEC_TABLE: &[(&str, &[&str])] = &[
-    ("Winamp.File", SPEC_FILE_VERBS),
-    ("Winamp.PlayList", SPEC_FILE_VERBS),
-    ("Winamp.SkinZip", SPEC_SKIN_VERBS),
+    ("Rustamp.File", SPEC_FILE_VERBS),
+    ("Rustamp.PlayList", SPEC_FILE_VERBS),
+    ("Rustamp.SkinZip", SPEC_SKIN_VERBS),
     ("Directory", SPEC_DIRECTORY_VERBS),
 ];
 

@@ -8,20 +8,31 @@
 //!
 //! | Handler | Key the verbs live under | Verbs (S13 §3) |
 //! |---|---|---|
-//! | media file | `Winamp.File` | `open`, `Play`, `Enqueue`, `ListBookmark` |
-//! | playlist file | `Winamp.PlayList` | `open`, `Play`, `Enqueue`, `ListBookmark` |
-//! | skin archive | `Winamp.SkinZip` | `install` |
+//! | media file | `Rustamp.File` | `open`, `Play`, `Enqueue`, `ListBookmark` |
+//! | playlist file | `Rustamp.PlayList` | `open`, `Play`, `Enqueue`, `ListBookmark` |
+//! | skin archive | `Rustamp.SkinZip` | `install` |
 //! | directory | `Directory` (the shell's own handler) | `Play`, `Enqueue` |
 //!
 //! So a media file and a playlist file get **four** verbs each, a skin
 //! archive gets **one**, and a directory gets **two** — the counts S13 §3
 //! states.
 //!
+//! # The ProgIDs are ours, not the reference's (deliberate deviation)
+//!
+//! S13 §3 records the reference's own ProgIDs (`Winamp.File`,
+//! `Winamp.PlayList`, `Winamp.SkinZip`). **We register `Rustamp.*` instead**
+//! (owner decision, 2026-10-20): a player must not claim another product's
+//! ProgIDs, and writing them would collide with a real Winamp installation on
+//! the same machine — the extension associations would then point at whichever
+//! program wrote last. The shell integration is unaffected, because this module
+//! writes **both** the ProgID tree and the extension associations: Explorer
+//! follows the association, not the name of the class it points at.
+//!
 //! # Conformance with S13 §3
 //!
 //! | S13 fact | Our behaviour | State |
 //! |---|---|---|
-//! | the ProgIDs `Winamp.File`, `Winamp.PlayList`, `Winamp.SkinZip` | [`MEDIA_PROG_ID`], [`PLAYLIST_PROG_ID`], [`SKIN_PROG_ID`] | matches |
+//! | the reference's ProgIDs | ours are `Rustamp.File`, `Rustamp.PlayList`, `Rustamp.SkinZip` ([`MEDIA_PROG_ID`], [`PLAYLIST_PROG_ID`], [`SKIN_PROG_ID`]) | **deliberate deviation** (see above) |
 //! | four verbs per media and playlist file | [`Handler::MediaFile`], [`Handler::PlaylistFile`] carry `open`, `Play`, `Enqueue`, `ListBookmark` | matches |
 //! | one verb (`install`) per skin archive | [`Handler::SkinArchive`] | matches |
 //! | two verbs (`Play`, `Enqueue`) per directory | [`Handler::Directory`] | matches |
@@ -74,18 +85,18 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The ProgID of the media file handler (S13 §3).
-pub const MEDIA_PROG_ID: &str = "Winamp.File";
+pub const MEDIA_PROG_ID: &str = "Rustamp.File";
 
 /// The ProgID of the playlist file handler (S13 §3).
-pub const PLAYLIST_PROG_ID: &str = "Winamp.PlayList";
+pub const PLAYLIST_PROG_ID: &str = "Rustamp.PlayList";
 
 /// The ProgID of the skin archive handler (S13 §3).
-pub const SKIN_PROG_ID: &str = "Winamp.SkinZip";
+pub const SKIN_PROG_ID: &str = "Rustamp.SkinZip";
 
 /// The shell's own directory handler (S13 §3, the directory row).
 ///
 /// The spec does not name the directory handler's identifiers (S13 §5.10 asks
-/// what `Winamp.Play` and `Winamp.Enqueue` are), so the shell's own
+/// what `Rustamp.Play` and `Rustamp.Enqueue` are), so the shell's own
 /// `Directory` key is used: it is the key the shell itself looks at when it
 /// offers verbs for a folder.
 pub const DIRECTORY_HANDLER: &str = "Directory";
@@ -193,11 +204,11 @@ const DIRECTORY_VERBS: &[Verb] = &[
 /// What the player registers shell verbs for (S13 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handler {
-    /// A media file: `Winamp.File`, four verbs.
+    /// A media file: `Rustamp.File`, four verbs.
     MediaFile,
-    /// A playlist file: `Winamp.PlayList`, four verbs.
+    /// A playlist file: `Rustamp.PlayList`, four verbs.
     PlaylistFile,
-    /// A skin archive: `Winamp.SkinZip`, one verb.
+    /// A skin archive: `Rustamp.SkinZip`, one verb.
     SkinArchive,
     /// A directory: the shell's own handler, two verbs.
     Directory,
@@ -297,7 +308,7 @@ pub fn registry_entries(exe: &Path) -> Vec<Entry> {
 /// The verb trees the removal step removes (S13 §3).
 ///
 /// The tree of a verb is the key its own keys live under
-/// (`Winamp.File\shell\Play`): the removal step takes the whole tree with
+/// (`Rustamp.File\shell\Play`): the removal step takes the whole tree with
 /// it, not only the keys the player wrote under it.
 pub fn verb_trees() -> Vec<String> {
     let mut trees = Vec::new();
@@ -345,7 +356,7 @@ pub fn file_type_associations() -> Vec<(&'static str, &'static str)> {
 ///
 /// The model is flat: an entry is a key path, a value name and the value's
 /// data — the three things [`Entry`] carries. The keys above them
-/// (`Winamp.File\shell\open`) exist in a real registry, but the registry
+/// (`Rustamp.File\shell\open`) exist in a real registry, but the registry
 /// creates them on the way, so the model does not hold them.
 ///
 /// A key path is held as it was written. The registry's key names are
@@ -519,7 +530,7 @@ pub fn uninstall() -> Result<(), RegistrationError> {
 ///
 /// The counterpart of [`install`]: it is how a VM test proves that the
 /// registration really landed in the registry. `key` is a path below the
-/// classes root, e.g. `Winamp.File\shell\open\command`.
+/// classes root, e.g. `Rustamp.File\shell\open\command`.
 #[cfg(windows)]
 pub fn registered_value(key: &str) -> Option<String> {
     imp::read_value(key)
@@ -824,9 +835,9 @@ mod tests {
 
     #[test]
     fn the_prog_ids_are_the_specs_prog_ids() {
-        assert_eq!(Handler::MediaFile.key(), "Winamp.File");
-        assert_eq!(Handler::PlaylistFile.key(), "Winamp.PlayList");
-        assert_eq!(Handler::SkinArchive.key(), "Winamp.SkinZip");
+        assert_eq!(Handler::MediaFile.key(), "Rustamp.File");
+        assert_eq!(Handler::PlaylistFile.key(), "Rustamp.PlayList");
+        assert_eq!(Handler::SkinArchive.key(), "Rustamp.SkinZip");
     }
 
     #[test]
@@ -854,10 +865,10 @@ mod tests {
         assert_eq!(
             drop_targets,
             vec![
-                r"Winamp.File\shell\Play\DropTarget",
-                r"Winamp.File\shell\Enqueue\DropTarget",
-                r"Winamp.PlayList\shell\Play\DropTarget",
-                r"Winamp.PlayList\shell\Enqueue\DropTarget",
+                r"Rustamp.File\shell\Play\DropTarget",
+                r"Rustamp.File\shell\Enqueue\DropTarget",
+                r"Rustamp.PlayList\shell\Play\DropTarget",
+                r"Rustamp.PlayList\shell\Enqueue\DropTarget",
                 r"Directory\shell\Play\DropTarget",
                 r"Directory\shell\Enqueue\DropTarget",
             ]
@@ -875,15 +886,15 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                r"Winamp.File\shell\open\command",
-                r"Winamp.File\shell\Play\command",
-                r"Winamp.File\shell\Enqueue\command",
-                r"Winamp.File\shell\ListBookmark\command",
-                r"Winamp.PlayList\shell\open\command",
-                r"Winamp.PlayList\shell\Play\command",
-                r"Winamp.PlayList\shell\Enqueue\command",
-                r"Winamp.PlayList\shell\ListBookmark\command",
-                r"Winamp.SkinZip\shell\install\command",
+                r"Rustamp.File\shell\open\command",
+                r"Rustamp.File\shell\Play\command",
+                r"Rustamp.File\shell\Enqueue\command",
+                r"Rustamp.File\shell\ListBookmark\command",
+                r"Rustamp.PlayList\shell\open\command",
+                r"Rustamp.PlayList\shell\Play\command",
+                r"Rustamp.PlayList\shell\Enqueue\command",
+                r"Rustamp.PlayList\shell\ListBookmark\command",
+                r"Rustamp.SkinZip\shell\install\command",
                 r"Directory\shell\Play\command",
                 r"Directory\shell\Enqueue\command",
             ]
@@ -895,7 +906,7 @@ mod tests {
         let entries = registry_entries(Path::new("C:/games/rustamp.exe"));
         let command = entries
             .iter()
-            .find(|entry| entry.key == r"Winamp.File\shell\ListBookmark\command")
+            .find(|entry| entry.key == r"Rustamp.File\shell\ListBookmark\command")
             .expect("the ListBookmark command");
         assert_eq!(
             command.value, r#""C:/games/rustamp.exe" /BOOKMARK "%1""#,
