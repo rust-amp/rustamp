@@ -46,6 +46,22 @@
 //! "switch on / off" button always names the plug-in of the row that is on
 //! screen.
 //!
+//! # The skin list
+//!
+//! The Skins page lists the skins the player can load. The rows come from
+//! the player ([`PrefsSettings::skins`]) and they can change while the
+//! dialog is open: the skin in use is one of the rows, so loading another
+//! skin changes the list. The list therefore compares the rows it shows
+//! with the rows the player pushes and refills itself only when they
+//! differ - a push that changes nothing does not flicker the list.
+//!
+//! The selection is the user's row. The player pushes the skin in use with
+//! every frame, and such a push must not take back a row the user picked
+//! before the player got the pick: the pick wins until the player names
+//! that skin or names another one. A skin that is not among the rows any
+//! more is gone: the first row takes its place, or nothing when the list is
+//! empty.
+//!
 //! # The library page
 //!
 //! One page is not the reference's: `Library`. The media library is this
@@ -599,8 +615,14 @@ pub struct PrefsSettings {
     /// The output mode.
     pub output_mode: OutputMode,
     /// The skins that can be loaded, one row each.
+    ///
+    /// The rows can change while the dialog is open (the skin in use is one
+    /// of them), so the dialog compares them with the rows it shows and
+    /// refills the list only when they differ.
     pub skins: Vec<String>,
-    /// The row of the skin in use.
+    /// The row of the skin in use, counted in [`skins`](Self::skins).
+    ///
+    /// `None` when the player has no skin in use.
     pub skin_selected: Option<usize>,
     /// The rows of every plug-in page's list.
     pub plugins: Vec<PluginRow>,
@@ -699,6 +721,145 @@ impl PluginListState {
     }
 }
 
+/// What the skin list shows, and what the user picked in it.
+///
+/// The rows of the list come from the player ([`PrefsSettings::skins`]) and
+/// they can change while the dialog is open: a skin that appears in the
+/// folder, or the skin that is in use, changes them. The state therefore
+/// remembers the rows it shows and compares them with the rows the player
+/// pushes: only a change refills the list, so the per-tick push does not
+/// flicker it.
+///
+/// The rows belong to the page they are shown on, exactly like the plug-in
+/// list's rows: the list of one page never passes for the list of another,
+/// so a page switch refills it.
+///
+/// The selection is part of the state as well, because the player pushes the
+/// skin in use **every frame** and such a push must not take back the row
+/// the user picked before the player got the pick:
+///
+/// * the user's pick wins until the player names that skin or names another
+///   one;
+/// * a skin that is not among the rows any more is gone: the first row
+///   takes its place, or nothing when there is no row at all.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SkinListState {
+    /// The page the rows belong to; `None` when no page was shown yet.
+    node: Option<PrefsNode>,
+    /// The row texts the list shows.
+    skins: Vec<String>,
+    /// The skin the user picked, waiting for the player to confirm it.
+    picked: Option<String>,
+    /// The skin the player last reported as the one in use.
+    player: Option<String>,
+}
+
+/// What the skin list does with a push from the player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SkinListUpdate {
+    /// The rows changed: the list must be refilled before the selection is
+    /// set.
+    pub(crate) refill: bool,
+    /// The row to select; `None` when no row is selected.
+    pub(crate) selected: Option<usize>,
+}
+
+impl SkinListState {
+    /// The state of the Skins page's list: the rows `settings` pushes and
+    /// the skin in use among them.
+    pub(crate) fn of(settings: &PrefsSettings) -> Self {
+        let skins = settings.skins.clone();
+        let player = settings
+            .skin_selected
+            .and_then(|row| skins.get(row))
+            .cloned();
+        Self {
+            node: Some(PrefsNode::Skins),
+            skins,
+            picked: None,
+            player,
+        }
+    }
+
+    /// Whether a list that shows these rows already shows `state`.
+    ///
+    /// The rows of another page are never the rows of this one, so the page
+    /// is part of the comparison: a list that showed nothing yet is never
+    /// the list of the Skins page.
+    pub(crate) fn shows(&self, state: &SkinListState) -> bool {
+        self.node == state.node && self.skins == state.skins
+    }
+
+    /// The user picked the row `row` of the list.
+    ///
+    /// The pick is the skin's **name**, not its row: the rows can change
+    /// while the pick waits for the player, and the skin the user picked is
+    /// then found in the new rows.
+    pub(crate) fn pick(&mut self, row: usize) {
+        if let Some(skin) = self.skins.get(row) {
+            self.picked = Some(skin.clone());
+        }
+    }
+
+    /// What the list does with the player's push.
+    ///
+    /// The rows are refilled only when they differ from the rows the list
+    /// shows. The selection is the user's pick while the player has not
+    /// named it, else the skin the player says is in use. A skin that is not
+    /// among the rows any more is gone: the first row takes its place, or
+    /// nothing when there is no row at all.
+    pub(crate) fn apply(&mut self, settings: &PrefsSettings) -> SkinListUpdate {
+        let wanted = SkinListState::of(settings);
+        let refill = !self.shows(&wanted);
+        let player = wanted.player.clone();
+        let pick = self.picked.clone();
+
+        // The user's pick wins while the player has not named it: a push
+        // that still names the old skin must not take the pick back.
+        let player_wins = match pick.as_deref() {
+            Some(pick) if player.as_deref() == Some(pick) => {
+                // The player took the pick: it is the skin in use now.
+                self.picked = None;
+                true
+            }
+            Some(_) if player.is_some() && player != self.player => {
+                // The player changed the skin on its own: it wins over the
+                // pick the player has not got yet.
+                self.picked = None;
+                true
+            }
+            Some(_) => false,
+            // Without a pick the player decides.
+            None => true,
+        };
+        let chosen = if player_wins { player.clone() } else { pick };
+        self.player = player;
+
+        // The row of the chosen skin. A skin that is not among the rows any
+        // more is gone: the first row takes its place, or nothing when the
+        // list is empty.
+        let selected = match chosen {
+            Some(skin) => match wanted.skins.iter().position(|row| *row == skin) {
+                Some(row) => Some(row),
+                None => {
+                    // The skin is gone: the pick can never be confirmed.
+                    self.picked = None;
+                    if wanted.skins.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    }
+                }
+            },
+            None => None,
+        };
+
+        self.node = wanted.node;
+        self.skins = wanted.skins;
+        SkinListUpdate { refill, selected }
+    }
+}
+
 /// What the user did in the dialog; the player turns it into a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefsAction {
@@ -773,7 +934,7 @@ mod win32 {
 
     use super::{
         Bind, ComboBind, Item, PluginListState, PrefsAction, PrefsError, PrefsNode, PrefsSettings,
-        Rect, TREE, library_root_text, page_items,
+        Rect, SkinListState, TREE, library_root_text, page_items,
     };
 
     const CLASS_NAME: &str = "RustampPreferences";
@@ -835,6 +996,9 @@ mod win32 {
         /// The drop-down lists of the current page: (window, id, binding).
         combos: Vec<(HWND, u16, ComboBind)>,
         skin_list: Option<HWND>,
+        /// What the skin list shows: the rows it lists, the skin the user
+        /// picked in it and the skin the player says is in use.
+        skin_state: SkinListState,
         /// The plug-in list of the current page.
         plugin_list: Option<HWND>,
         /// What the plug-in list shows: the page it belongs to, the player's
@@ -975,6 +1139,7 @@ mod win32 {
                     checks: Vec::new(),
                     combos: Vec::new(),
                     skin_list: None,
+                    skin_state: SkinListState::default(),
                     plugin_list: None,
                     plugin_state: PluginListState::default(),
                     library_list: None,
@@ -1084,11 +1249,8 @@ mod win32 {
             for (control, _, bind) in combos {
                 set_combo_row(control, settings.combo_row(bind));
             }
-            if let (Some(list), Some(row)) = (controls.1, settings.skin_selected) {
-                // SAFETY: selecting a row of our own list box.
-                unsafe {
-                    SendMessageW(list, LB_SETCURSEL, Some(WPARAM(row)), Some(LPARAM(0)));
-                }
+            if let Some(list) = controls.1 {
+                refresh_skin_list(list, settings);
             }
         }
 
@@ -1281,6 +1443,10 @@ mod win32 {
                         i.checks.clear();
                         i.combos.clear();
                         i.skin_list = None;
+                        // The skin list is a new control: the rows of the
+                        // old one say nothing about it, so the new list is
+                        // filled again.
+                        i.skin_state = SkinListState::default();
                         i.plugin_list = None;
                         // The plug-in list is a new control: the rows of the
                         // old one say nothing about it, so the new list is
@@ -1412,24 +1578,6 @@ mod win32 {
                         dpi,
                         font,
                     ) {
-                        for skin in &settings.skins {
-                            let text = wide(skin);
-                            // SAFETY: the text outlives the call.
-                            unsafe {
-                                SendMessageW(
-                                    c,
-                                    LB_ADDSTRING,
-                                    Some(WPARAM(0)),
-                                    Some(LPARAM(text.as_ptr() as isize)),
-                                );
-                            }
-                        }
-                        if let Some(row) = settings.skin_selected {
-                            // SAFETY: selecting a row of our own list box.
-                            unsafe {
-                                SendMessageW(c, LB_SETCURSEL, Some(WPARAM(row)), Some(LPARAM(0)));
-                            }
-                        }
                         page.push(c);
                         skin_list = Some(c);
                     }
@@ -1584,6 +1732,48 @@ mod win32 {
         }
         if let Some(list) = library_list {
             refresh_root_list(list, settings);
+        }
+        if let Some(list) = skin_list {
+            refresh_skin_list(list, settings);
+        }
+    }
+
+    /// Makes the skin list show `settings`' skins, keeping the user's pick.
+    ///
+    /// Does nothing when the list already shows exactly them, so the
+    /// per-tick settings push does not flicker the list.
+    ///
+    /// The rows can change while the dialog is open (a skin that appears in
+    /// the folder, or the skin in use), so the list is refilled when the
+    /// content changed - not only when the page was built.
+    fn refresh_skin_list(list: HWND, settings: &PrefsSettings) {
+        let Some(update) = STATE.with(|state| {
+            let mut guard = state.try_borrow_mut().ok()?;
+            let inner = guard.as_mut()?;
+            Some(inner.skin_state.apply(settings))
+        }) else {
+            return;
+        };
+        if update.refill {
+            // SAFETY: refilling our own list box.
+            unsafe {
+                SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+                for skin in &settings.skins {
+                    let wide_text = wide(skin);
+                    SendMessageW(
+                        list,
+                        LB_ADDSTRING,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(wide_text.as_ptr() as isize)),
+                    );
+                }
+            }
+        }
+        if let Some(row) = update.selected {
+            // SAFETY: selecting a row of our own list box.
+            unsafe {
+                SendMessageW(list, LB_SETCURSEL, Some(WPARAM(row)), Some(LPARAM(0)));
+            }
         }
     }
 
@@ -1827,7 +2017,18 @@ mod win32 {
                     }
                     .0;
                     if row >= 0 {
-                        push_action(PrefsAction::LoadSkin(row as usize));
+                        let row = row as usize;
+                        // The pick belongs to the list's state: the player's
+                        // push must not take it back before the player got
+                        // it.
+                        STATE.with(|state| {
+                            if let Ok(mut guard) = state.try_borrow_mut()
+                                && let Some(inner) = guard.as_mut()
+                            {
+                                inner.skin_state.pick(row);
+                            }
+                        });
+                        push_action(PrefsAction::LoadSkin(row));
                     }
                     return LRESULT(0);
                 }
@@ -2372,6 +2573,135 @@ mod tests {
             assert_eq!(state.id(0), Some(index), "{node:?}: the first row");
             assert_eq!(state.id(pages.len()), None, "{node:?}: no such row");
         }
+    }
+
+    /// Settings with the skins `skins` and the skin in use in the row
+    /// `selected`.
+    fn skin_settings(skins: &[&str], selected: Option<usize>) -> PrefsSettings {
+        PrefsSettings {
+            skins: skins.iter().map(|skin| skin.to_string()).collect(),
+            skin_selected: selected,
+            ..PrefsSettings::default()
+        }
+    }
+
+    #[test]
+    fn the_skin_list_refills_only_when_the_rows_change() {
+        let settings = skin_settings(&["a", "b"], Some(0));
+        let mut state = SkinListState::default();
+        // The page build leaves the list empty: the first push fills it.
+        let update = state.apply(&settings);
+        assert!(update.refill, "the first push fills the list");
+        assert_eq!(update.selected, Some(0), "the skin in use is selected");
+        // The same rows: the list must not flicker.
+        let update = state.apply(&settings);
+        assert!(!update.refill, "the same rows do not refill the list");
+        assert_eq!(update.selected, Some(0), "the selection stays");
+        // A skin that appeared in the folder: the rows changed.
+        let more = skin_settings(&["a", "b", "c"], Some(0));
+        let update = state.apply(&more);
+        assert!(update.refill, "a new skin refills the list");
+        assert_eq!(update.selected, Some(0), "the selection stays");
+        // A skin that left the folder: the rows changed.
+        let fewer = skin_settings(&["a", "c"], Some(0));
+        let update = state.apply(&fewer);
+        assert!(update.refill, "a removed skin refills the list");
+    }
+
+    #[test]
+    fn a_selection_survives_a_change_of_the_rows() {
+        let settings = skin_settings(&["a", "b"], Some(1));
+        let mut state = SkinListState::default();
+        state.apply(&settings);
+        // A new skin appears in the folder: the row of the skin in use
+        // moves, but the skin in use stays selected.
+        let more = skin_settings(&["a", "b", "c"], Some(1));
+        let update = state.apply(&more);
+        assert!(update.refill, "the rows changed");
+        assert_eq!(update.selected, Some(1), "the skin in use stays selected");
+        // The skin in use is the first row now, and it stays selected.
+        let first = skin_settings(&["b", "c"], Some(0));
+        let update = state.apply(&first);
+        assert!(update.refill, "the rows changed");
+        assert_eq!(update.selected, Some(0), "the skin in use stays selected");
+    }
+
+    #[test]
+    fn a_vanished_selection_falls_back_to_the_first_row() {
+        let settings = skin_settings(&["a", "b"], Some(0));
+        let mut state = SkinListState::default();
+        state.apply(&settings);
+        // The user picks the second skin; the player has not got the pick
+        // yet.
+        state.pick(1);
+        // The picked skin leaves the folder before the player takes the
+        // pick: the first row takes its place.
+        let fewer = skin_settings(&["a"], Some(0));
+        let update = state.apply(&fewer);
+        assert!(update.refill, "the rows changed");
+        assert_eq!(update.selected, Some(0), "the first row took the place");
+        // With no row at all, nothing is selected.
+        let none = skin_settings(&[], None);
+        let update = state.apply(&none);
+        assert!(update.refill, "the rows changed");
+        assert_eq!(update.selected, None, "no row took the place");
+    }
+
+    #[test]
+    fn the_push_does_not_take_back_the_user_s_pick() {
+        let settings = skin_settings(&["a", "b"], Some(0));
+        let mut state = SkinListState::default();
+        state.apply(&settings);
+        // The user picks the second row; the player still says that the
+        // first skin is in use.
+        state.pick(1);
+        let update = state.apply(&settings);
+        assert!(!update.refill, "the rows did not change");
+        assert_eq!(update.selected, Some(1), "the user's row stays");
+        // The player took the pick: it is the skin in use now.
+        let taken = skin_settings(&["a", "b"], Some(1));
+        let update = state.apply(&taken);
+        assert_eq!(update.selected, Some(1), "the picked skin is selected");
+        // A later push that names another skin wins over the pick.
+        let other = skin_settings(&["a", "b"], Some(0));
+        let update = state.apply(&other);
+        assert_eq!(update.selected, Some(0), "the player wins");
+    }
+
+    #[test]
+    fn a_pick_survives_a_change_of_the_rows() {
+        let settings = skin_settings(&["a", "b"], Some(0));
+        let mut state = SkinListState::default();
+        state.apply(&settings);
+        // The user picks the second skin; the player has not got the pick
+        // yet.
+        state.pick(1);
+        // A new skin appears in the folder before the pick: the picked skin
+        // is found in the new rows.
+        let more = skin_settings(&["a", "b", "c"], Some(0));
+        let update = state.apply(&more);
+        assert!(update.refill, "the rows changed");
+        assert_eq!(update.selected, Some(1), "the picked skin stays selected");
+    }
+
+    #[test]
+    fn a_list_that_showed_nothing_is_not_the_skins_page_s_list() {
+        let settings = skin_settings(&["a", "b"], Some(0));
+        let empty = SkinListState::default();
+        assert!(
+            !empty.shows(&SkinListState::of(&settings)),
+            "a list that showed nothing is not the list of the Skins page"
+        );
+        let mut state = SkinListState::default();
+        state.apply(&settings);
+        assert!(
+            state.shows(&SkinListState::of(&settings)),
+            "the list shows the rows of the Skins page"
+        );
+        assert!(
+            !state.shows(&SkinListState::of(&skin_settings(&["a"], Some(0)))),
+            "other rows are not the rows of the Skins page"
+        );
     }
 
     #[test]
