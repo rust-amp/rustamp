@@ -578,3 +578,62 @@ fn without_a_scan_the_status_line_is_the_visible_range() {
     assert_eq!(app.library_status_line(), app.library_view().status_line());
     assert_eq!(app.library_status_line(), "1-3 of 3");
 }
+
+// ---------------------------------------------------------------------------
+// The recovery of a damaged database
+// ---------------------------------------------------------------------------
+
+/// The files of `dir` that are a backup of a damaged database.
+fn backups(dir: &TempDir) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir.path())
+        .expect("read the folder")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".broken-") && !name.ends_with(".txt"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn a_damaged_database_is_set_aside_and_the_library_starts_empty() {
+    let dir = TempDir::new().expect("temp dir");
+    let database = dir.path().join(LIBRARY_DATABASE_NAME);
+    let damaged = b"this is not a database, not even a little one";
+    std::fs::write(&database, damaged).expect("write the damaged file");
+    let mut app = library_app(&dir);
+
+    app.submit(Command::ToggleWindow(LIBRARY_WINDOW_ID))
+        .expect("open the library");
+
+    // The user is told once: what was wrong, where the old file went, and
+    // that the library starts empty.
+    let notes = app.drain_notes();
+    let recovery: Vec<&String> = notes
+        .iter()
+        .filter(|note| note.contains("set aside"))
+        .collect();
+    assert_eq!(recovery.len(), 1, "the recovery is told once: {notes:?}");
+    assert!(recovery[0].contains("starts empty"), "{recovery:?}");
+
+    // The old file is kept, with its bytes: the user has it.
+    let backup = backups(&dir);
+    assert_eq!(backup.len(), 1, "the damaged file was set aside");
+    assert_eq!(
+        std::fs::read(&backup[0]).expect("read the backup"),
+        damaged,
+        "the backup keeps the bytes of the damaged file"
+    );
+
+    // The library works, and it starts empty: the roots are in the index
+    // that was just replaced, so they have to be added again.
+    assert!(app.library_open(), "the window is open");
+    assert_eq!(app.library_view().total(), 0, "the library starts empty");
+    assert!(
+        database.is_file(),
+        "the fresh index is where the damaged file was"
+    );
+}

@@ -678,3 +678,274 @@ fn the_caption_carries_the_scan_progress() {
     assert!(title.starts_with("Rustamp Library - scanning:"), "{title}");
     assert!(title.contains("120 seen"), "{title}");
 }
+
+// ---------------------------------------------------------------------------
+// The recovery of a damaged database
+// ---------------------------------------------------------------------------
+
+/// A database file that is not a database.
+fn damaged_database(dir: &TempDir) -> PathBuf {
+    let path = dir.path().join(LIBRARY_DATABASE_NAME);
+    std::fs::write(&path, b"this is not a database, not even a little one")
+        .expect("write the damaged file");
+    path
+}
+
+/// The files of `dir` that are a backup of a damaged database.
+fn backups(dir: &TempDir) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir.path())
+        .expect("read the folder")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".broken-") && !name.ends_with(".txt"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The files of `dir` that hold the reason of a recovery.
+fn reasons(dir: &TempDir) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir.path())
+        .expect("read the folder")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".broken-") && name.ends_with(".txt"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Runs one damage class through the window's branch.
+///
+/// A damage that is about the file sets the file aside and tells the user;
+/// a damage that is about the machine leaves everything alone.
+fn branch(make_error: impl Fn(PathBuf) -> OpenError, recovered: bool) {
+    let dir = TempDir::new().expect("temp dir");
+    let database = damaged_database(&dir);
+    let bytes = std::fs::read(&database).expect("read the damaged file");
+    let mut window = LibraryWindow::default();
+
+    let outcome = window.open_fresh_index(&database, make_error(database.clone()));
+
+    if recovered {
+        assert!(outcome.is_ok(), "the damaged file is recovered");
+        let backup = backups(&dir);
+        assert_eq!(backup.len(), 1, "the file was set aside: {backup:?}");
+        assert_eq!(
+            std::fs::read(&backup[0]).expect("read the backup"),
+            bytes,
+            "the backup keeps the bytes of the damaged file"
+        );
+        // A fresh index takes the place of the damaged file.
+        assert!(
+            Library::open(&database).is_ok(),
+            "a fresh index took the place of the damaged file"
+        );
+        assert_ne!(
+            std::fs::read(&database).expect("read the fresh index"),
+            bytes,
+            "the file at the old name is the fresh index, not the damaged file"
+        );
+        let note = window.action_note.clone().expect("the user is told");
+        assert!(note.contains("set aside"), "{note}");
+        assert!(note.contains("starts empty"), "{note}");
+    } else {
+        assert!(outcome.is_err(), "the damage is refused");
+        assert_eq!(
+            std::fs::read(&database).expect("read the file"),
+            bytes,
+            "the file is left exactly as it was"
+        );
+        assert!(backups(&dir).is_empty(), "nothing was renamed");
+        assert!(window.action_note.is_none(), "nothing is told");
+    }
+}
+
+#[test]
+fn a_damaged_file_is_set_aside_and_a_fresh_index_takes_its_place() {
+    branch(
+        |path| OpenError::NotADatabase {
+            path,
+            detail: "the file does not start with the SQLite header".to_owned(),
+        },
+        true,
+    );
+    branch(
+        |path| OpenError::Truncated {
+            path,
+            detail: "the header is cut short".to_owned(),
+        },
+        true,
+    );
+    branch(
+        |path| OpenError::Corrupt {
+            path,
+            detail: "database disk image is malformed".to_owned(),
+        },
+        true,
+    );
+    branch(
+        |path| OpenError::ForeignSchema {
+            path,
+            detail: "the table tracks is missing".to_owned(),
+        },
+        true,
+    );
+    branch(
+        |path| OpenError::FutureVersion {
+            path,
+            found: 2,
+            supported: 1,
+        },
+        true,
+    );
+}
+
+#[test]
+fn the_damage_of_the_machine_is_refused_and_nothing_is_renamed() {
+    branch(|path| OpenError::NotAFile { path }, false);
+    branch(|path| OpenError::ReadOnly { path }, false);
+    branch(
+        |path| OpenError::Locked {
+            path,
+            detail: "database is locked".to_owned(),
+        },
+        false,
+    );
+    branch(
+        |path| OpenError::Io {
+            path,
+            detail: "access is denied".to_owned(),
+        },
+        false,
+    );
+    branch(
+        |path| OpenError::Failed {
+            path,
+            detail: "no such table: tracks".to_owned(),
+        },
+        false,
+    );
+}
+
+#[test]
+fn a_damaged_database_is_recovered_when_the_library_opens() {
+    let dir = TempDir::new().expect("temp dir");
+    let database = damaged_database(&dir);
+    let bytes = std::fs::read(&database).expect("read the damaged file");
+
+    let mut window = LibraryWindow::default();
+    window
+        .ensure_index(Some(&database))
+        .expect("the library opens");
+
+    let backup = backups(&dir);
+    assert_eq!(backup.len(), 1, "the damaged file was set aside");
+    assert_eq!(
+        std::fs::read(&backup[0]).expect("read the backup"),
+        bytes,
+        "the backup keeps the bytes of the damaged file"
+    );
+    let reason = reasons(&dir);
+    assert_eq!(reason.len(), 1, "the reason was written next to it");
+    let text = std::fs::read_to_string(&reason[0]).expect("read the reason");
+    assert!(
+        text.contains("not a database"),
+        "the reason is typed: {text}"
+    );
+    assert!(
+        text.contains(&database.display().to_string()),
+        "the reason names the file: {text}"
+    );
+
+    // The fresh index is a good database, and it knows no root: the library
+    // starts empty.
+    let index = Library::open(&database).expect("the fresh index opens");
+    assert!(
+        index.roots().expect("the roots").is_empty(),
+        "the library starts empty"
+    );
+    assert!(
+        window.roots().expect("the roots").is_empty(),
+        "the window knows no root"
+    );
+}
+
+#[test]
+fn a_read_only_database_is_refused_and_left_alone() {
+    let dir = TempDir::new().expect("temp dir");
+    let database = damaged_database(&dir);
+    let bytes = std::fs::read(&database).expect("read the damaged file");
+    // The file's own permissions are kept, so that the folder can be
+    // cleaned up after the test.
+    let original = std::fs::metadata(&database)
+        .expect("stat the file")
+        .permissions();
+    let mut read_only = original.clone();
+    read_only.set_readonly(true);
+    std::fs::set_permissions(&database, read_only).expect("make the file read-only");
+
+    let mut window = LibraryWindow::default();
+    let outcome = window.ensure_index(Some(&database));
+
+    assert!(outcome.is_err(), "the read-only database is refused");
+    assert_eq!(
+        std::fs::read(&database).expect("read the file"),
+        bytes,
+        "the file is left exactly as it was"
+    );
+    assert!(backups(&dir).is_empty(), "nothing was renamed");
+    assert!(window.action_note.is_none(), "nothing is told");
+
+    std::fs::set_permissions(&database, original).expect("give the file its permissions back");
+}
+
+#[test]
+fn a_database_that_is_not_a_file_is_refused_and_left_alone() {
+    let dir = TempDir::new().expect("temp dir");
+    let database = dir.path().join(LIBRARY_DATABASE_NAME);
+    std::fs::create_dir(&database).expect("make a folder where the database should be");
+
+    let mut window = LibraryWindow::default();
+    let outcome = window.ensure_index(Some(&database));
+
+    assert!(outcome.is_err(), "the folder is refused");
+    assert!(database.is_dir(), "the folder is left alone");
+    assert!(backups(&dir).is_empty(), "nothing was renamed");
+    assert!(window.action_note.is_none(), "nothing is told");
+}
+
+#[test]
+fn the_recovery_is_told_to_the_user_once() {
+    let dir = TempDir::new().expect("temp dir");
+    damaged_database(&dir);
+    let mut app = library_app(&dir);
+
+    app.toggle_library();
+
+    let notes = app.drain_notes();
+    let recovery: Vec<&String> = notes
+        .iter()
+        .filter(|note| note.contains("set aside"))
+        .collect();
+    assert_eq!(recovery.len(), 1, "the recovery is told once: {notes:?}");
+    let note = recovery[0];
+    assert!(note.starts_with("Library: "), "{note}");
+    assert!(note.contains("starts empty"), "{note}");
+
+    // The window is closed and opened again: the index is open, so there is
+    // nothing to recover and nothing to tell.
+    app.toggle_library();
+    app.toggle_library();
+    let notes = app.drain_notes();
+    assert!(
+        !notes.iter().any(|note| note.contains("set aside")),
+        "the recovery is not told again: {notes:?}"
+    );
+}
