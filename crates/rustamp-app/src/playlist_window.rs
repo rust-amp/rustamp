@@ -24,8 +24,10 @@
 //!   no-op unstaged), ADD → [`PlaylistWindow::press_add`], LIST OPTS →
 //!   [`PlaylistWindow::press_list_opts`] whose opening command is
 //!   [`Command::OpenPlaylist`] (RFC 0010, S06 §4);
-//! * scrollbar arrows → [`PlaylistWindow::scroll_page`] (S06 §3: one step is
-//!   one page of four rows), no command;
+//! * the scrollbar → [`PlaylistWindow::press_scrollbar`]: the arrow pair
+//!   pages the view (S06 §3: one step is one page of four rows), the handle
+//!   takes hold of it and a drag moves the view, not a selection (S06 §3),
+//!   and a press on the track pages the view (own choice); no command;
 //! * the title bar has no window-menu button (S06 §1), so a click at (6,3)
 //!   does nothing; Close hides the window (`ToggleWindow(Playlist)`, the PL
 //!   button reopens it), Shade toggles the editor's windowshade
@@ -58,8 +60,7 @@ use rustamp_ui::title_format::TitleFormat;
 use rustamp_ui::{
     DockedStack, Key, Modifiers, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog,
     PlaylistKeyAction, PlaylistTitleButton, ShortcutOutcome, WindowKind, hit_test_button,
-    hit_test_list_row, hit_test_scroll, hit_test_title_bar, in_list_area, render_playlist_window,
-    window_size,
+    hit_test_list_row, hit_test_title_bar, in_list_area, render_playlist_window, window_size,
 };
 
 use crate::app::App;
@@ -198,7 +199,8 @@ impl App {
 
     /// A left-button press at playlist-window-relative `(x, y)`.
     ///
-    /// Buttons fire on press; rows arm a headless drag (S06 §8 Q6 is open).
+    /// Buttons fire on press; rows arm a headless drag (S06 §8 Q6 is open);
+    /// the scrollbar pages the view or takes hold of its handle (S06 §3).
     ///
     /// The **modifiers** choose the list gesture (own choice; S06 §2 settles
     /// only the single click): no modifier selects the pressed row alone,
@@ -234,8 +236,12 @@ impl App {
                 None => Ok(Vec::new()),
             };
         }
-        if let Some(direction) = hit_test_scroll(x, y) {
-            self.playlist.scroll_page(direction);
+        // The scrollbar answers in three parts (S06 §3): the arrow pair pages
+        // the view, the handle takes hold of it (a dragged handle moves the
+        // view, not a selection) and the track pages it as well (own choice,
+        // see `PlaylistWindow::press_scrollbar`). The view is the model's own
+        // state, so a scrollbar press sends no command.
+        if self.playlist.press_scrollbar(x, y) {
             return Ok(Vec::new());
         }
         if let Some(button) = hit_test_title_bar(x, y) {
@@ -248,8 +254,12 @@ impl App {
     ///
     /// A completed drag uses `MoveEntries`, sharing the sort/reorder application
     /// path. Plain releases and cancelled/unchanged drags emit nothing.
+    ///
+    /// The release also ends a held scrollbar handle: the view stays where
+    /// the drag left it (S06 §3).
     pub fn playlist_mouse_up(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
         self.sync_playlist_entries();
+        self.playlist.release_scrollbar();
         if let Some(command) = self.playlist.mouse_up(x, y) {
             self.submit(command.clone())?;
             return Ok(vec![command]);
@@ -258,13 +268,24 @@ impl App {
     }
 
     /// Feeds a playlist-relative pointer position to the headless drag model.
+    ///
+    /// A held scrollbar handle takes the pointer first: it moves the view
+    /// (S06 §3) and the row drag stays unarmed. Without a held handle the
+    /// pointer feeds the row drag.
     pub fn playlist_mouse_move(&mut self, x: i32, y: i32) {
+        if self.playlist.drag_scrollbar(y) {
+            return;
+        }
         self.playlist.mouse_move(x, y);
     }
 
     /// Cancels a row drag on pointer leave or focus loss, without moving rows.
+    ///
+    /// A held scrollbar handle is released with it: the view stays where the
+    /// drag left it.
     pub fn playlist_mouse_leave(&mut self) {
         self.playlist.cancel_drag();
+        self.playlist.release_scrollbar();
     }
 
     /// A double-click at playlist-window-relative `(x, y)` (S03 §5, S06 §8 Q5).
@@ -323,12 +344,19 @@ impl App {
 
         self.sync_playlist_entries();
 
-        if key == Key::Escape && self.playlist.cancel_drag() {
-            return Ok(Some(ShortcutOutcome::Handled));
+        if key == Key::Escape {
+            // Escape ends a held gesture: the row drag and the scrollbar
+            // handle (own choice, like the row drag below).
+            let cancelled = self.playlist.cancel_drag();
+            let released = self.playlist.release_scrollbar();
+            if cancelled || released {
+                return Ok(Some(ShortcutOutcome::Handled));
+            }
         }
         // A keyboard action must not change selection/viewport underneath a
         // held row gesture. Like the drag itself this is an own-choice rule.
         self.playlist.cancel_drag();
+        self.playlist.release_scrollbar();
 
         // Own choice, and not an S03 row: `Shift+Up` and `Shift+Down` extend
         // the selection from the anchor of the range gestures. S03 §2 binds
