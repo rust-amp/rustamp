@@ -57,13 +57,20 @@ same second.
   `Option<i64>`: `None` means the root was never scanned)
 - `Query { path_prefix, artist, album, title, genre, text, sort, descending,
   limit, offset }`; field filters are exact and case-sensitive, combined with
-  AND; `path_prefix` is a literal byte prefix.
+  AND; `path_prefix` is a literal byte prefix: the comparison is exact, so a
+  spelling that differs in case matches nothing, and a prefix that is not a
+  directory boundary still matches (`C:\music` also matches `C:\music2`).
 - `Cancel { new, cancel, is_cancelled }`, `ScanPhase { Scanning, Removing,
   Finished }`, `ScanProgress { phase, path, seen, added, updated, skipped,
   removed }`, `SCAN_BATCH_SIZE` (64).
 
 ### Query semantics
 
+- `path_prefix` is a literal byte prefix: the comparison is exact
+  (`instr(path, prefix) = 1`), not a `LIKE` - SQLite's `LIKE` ignores the
+  case of ASCII letters, so a `LIKE` matched a spelling that differs in
+  case. It is not a directory boundary either: `C:\music` also matches
+  `C:\music2`.
 - `text` is the free-text search: one string, matched as a literal
   case-insensitive substring of `title`, `artist` or `album`
   (`LIKE ... ESCAPE '\'`, `%`/`_`/`\` literal, both sides folded with
@@ -289,7 +296,7 @@ Only the `ALTER` statement names the table and the column as text; they are
 constants of the crate, never caller input, so it cannot carry an
 injection.
 
-## Tests (87, all headless on temp directories)
+## Tests (94, all headless on temp directories)
 
 Scan/query (14, wave145): `scan_indexes_and_queries`, `rescan_is_idempotent`,
 `update_on_change`, `removed_files_dropped`, `query_by_album`,
@@ -312,6 +319,28 @@ straight in the index, because a WAV tag cannot carry `duration_ms`),
 `sort_descending_reverses_order_with_stable_ties`,
 `pagination_reports_the_unpaged_total` (boundaries: first/next/last page, past
 the end, `None` limit, `limit 0`, filter-scoped total).
+
+Query properties (7, wave245): the invariants of the query layer, over
+synthetic libraries whose rows go straight into the index (so a row can
+carry a missing title, a missing duration, a Unicode value or a `%` in its
+name). The generator is seeded, so a failure is reproducible from its seed:
+`total_counts_the_matches_before_the_window` (the total is the number of
+matches and the window does not change it),
+`paging_walks_the_result_without_gap_or_repeat` (the pages together are the
+unpaged result, no row twice),
+`the_sort_order_is_a_total_order` (no two rows compare equal, the order is
+the promised one and it does not change between two queries),
+`filters_compose_with_and` (the result of two filters is a subset of both,
+the empty filter is the identity),
+`the_free_text_matches_the_contained_rows` (the term matches exactly the
+rows whose title, artist or album contains it; the album artist is not
+searched),
+`the_path_prefix_is_a_literal_byte_prefix` (a spelling that differs in case
+matches nothing, a prefix that is not a directory boundary still matches),
+`a_limit_of_zero_returns_no_rows_and_the_full_total`. The property tests
+live in `crates/rustamp-library/src/query_props.rs`; they need no new
+dependency (the crate's own seeded generator) and run in about a tenth of a
+second.
 
 Tag writing (8, wave169): `writing_tags_updates_the_row_without_a_rescan`
 (the row follows the write, the id survives, the file carries the new value

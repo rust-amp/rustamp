@@ -79,6 +79,10 @@
 //! `total` is the number of matches *before* `limit`/`offset` is applied, so a
 //! UI can size a scrollbar without issuing a second query.
 //!
+//! `path_prefix` is a literal byte prefix: the comparison is exact, so a
+//! spelling that differs in case matches nothing, and a prefix that is not a
+//! directory boundary still matches (`C:\music` also matches `C:\music2`).
+//!
 //! `text` is the free-text search: one string matched as a literal
 //! case-insensitive substring of `title`, `artist` or `album` (`LIKE` with
 //! `ESCAPE`), so `%`, `_` and `\` are searched literally. Both the columns and
@@ -343,6 +347,8 @@ use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 
 mod artwork;
+#[cfg(test)]
+mod query_props;
 
 pub use artwork::{
     ArtworkCache, ArtworkCacheStats, CoverImage, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
@@ -388,8 +394,9 @@ pub struct TrackRow {
 /// combined with AND; `None` means "no constraint".
 ///
 /// Text filters are exact, case-sensitive matches. `path_prefix` is a literal
-/// byte prefix, not a directory boundary: a prefix of `C:\music` also matches
-/// `C:\music2`. The remaining fields shape the result (see the module docs):
+/// byte prefix, not a directory boundary and not a case-insensitive one: a
+/// prefix of `C:\music` also matches `C:\music2`, but `c:\music` matches
+/// nothing. The remaining fields shape the result (see the module docs):
 /// [`Query::text`] searches, [`Query::sort`] and [`Query::descending`] order,
 /// [`Query::limit`] and [`Query::offset`] page.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1546,8 +1553,12 @@ fn filter_sql(filter: &Query) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let mut sql = String::from(" WHERE 1=1");
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(prefix) = &filter.path_prefix {
-        sql.push_str(" AND path LIKE ? ESCAPE '\\'");
-        binds.push(Box::new(like_prefix(&prefix.to_string_lossy())));
+        // A literal byte prefix: `instr` finds the prefix at the start of
+        // the path. A `LIKE` would not do: SQLite's `LIKE` ignores the
+        // case of ASCII letters, and the prefix is a byte prefix, not a
+        // case-insensitive one.
+        sql.push_str(" AND instr(path, ?) = 1");
+        binds.push(Box::new(prefix.to_string_lossy().to_string()));
     }
     if let Some(v) = &filter.artist {
         sql.push_str(" AND artist = ?");
