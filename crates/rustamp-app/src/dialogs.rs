@@ -79,8 +79,10 @@
 //!   tags when the action runs, opens the box with them and writes the
 //!   fields the user changed back into the file with `rustamp-meta`. A
 //!   field the user **cleared** is removed from the file instead of being
-//!   written as an empty value, and a value the file keeps in a second tag
-//!   (an ID3v1 tag next to an ID3v2 tag) is reported rather than hidden.
+//!   written as an empty value, a value the file keeps in a second tag
+//!   (an ID3v1 tag next to an ID3v2 tag) is reported rather than hidden,
+//!   and a value the format cannot hold at all (the track number of an MP4
+//!   file) is reported as not in the file.
 //!   A stream has no local file and therefore no tags to edit: the action
 //!   says so and opens nothing, and so does an empty selection. A field
 //!   that does not validate keeps the box open, so the user can fix it;
@@ -411,14 +413,31 @@ impl App {
     /// is taken out of the file (the removal list of the request names it),
     /// and the report names what the file could not do:
     ///
-    /// * an `extra` key the target format refused — a field the format has
-    ///   no place for (the total of a disc on an MP3, for example);
+    /// * an `extra` key the target format refused — the format has no field
+    ///   for that key (the total of a disc on an MP3, for example);
     /// * a removal the file still carries, because the value is in a second
     ///   tag of the file (an ID3v1 tag next to an ID3v2 tag) and the writer
-    ///   writes only the primary tag.
+    ///   writes only the primary tag;
+    /// * a value the target format cannot hold: the format has the field,
+    ///   but not for this value (the track number of an MP4 file, whose
+    ///   `trkn` atom holds 16-bit numbers and reads a zero as "no number at
+    ///   all").
     ///
-    /// Neither is a failure: the rest of the write landed, so the box closes
-    /// and the limitation is reported.
+    /// The three are told apart by their reason, so the user knows what the
+    /// file has and what it does not: a key the format does not know, a
+    /// value that is still in a second tag, and a value the format has no
+    /// room for.
+    ///
+    /// The last one is a loss: the value the user typed is not in the file,
+    /// and the value the file had is gone with it (the writer replaces the
+    /// number). The write is therefore **not** a clean success, and the note
+    /// says so.
+    ///
+    /// The box closes in every case: the write landed — the other fields
+    /// are in the file — and a value the format cannot hold cannot be
+    /// recovered by writing it again. The user opens the box again
+    /// (`Ctrl`+`E`) to enter a value the format can carry; the box then
+    /// shows the state the file really has.
     ///
     /// A failed write (an unreadable file, a format that cannot hold the
     /// fields) keeps the box open, so the user can correct the fields and
@@ -444,7 +463,7 @@ impl App {
         };
         if !report.unwritten_extra.is_empty() {
             self.note(format!(
-                "edit entry: {} did not store: {}",
+                "edit entry: {} did not store: {} (the format has no field for this key)",
                 path.display(),
                 report.unwritten_extra.join(", ")
             ));
@@ -457,6 +476,18 @@ impl App {
                 .collect();
             self.note(format!(
                 "edit entry: {} did not remove: {} (the value is in a second tag of the file)",
+                path.display(),
+                fields.join(", ")
+            ));
+        }
+        if !report.unstoreable.is_empty() {
+            let fields: Vec<&str> = report
+                .unstoreable
+                .iter()
+                .map(|field| tag_field_name(*field))
+                .collect();
+            self.note(format!(
+                "edit entry: {} could not store the {} (the format cannot hold this value, so it is not in the file)",
                 path.display(),
                 fields.join(", ")
             ));
@@ -1248,7 +1279,7 @@ mod tests {
     use rustamp_core::command::{Command, SelectOp};
     use rustamp_core::config::Config;
     use rustamp_core::playlist::{EntryId, MediaLocation};
-    use rustamp_ui::ShortcutOutcome;
+    use rustamp_ui::{EditEntryChange, EditEntryNumber, ShortcutOutcome};
 
     use super::*;
     use crate::app::AppOptions;
@@ -1267,16 +1298,25 @@ mod tests {
         App::new(options).expect("the test app builds headless")
     }
 
+    /// A copy of a fixture of the decoders' test data, in a temporary
+    /// directory.
+    ///
+    /// The fixture is copied, never written to.
+    fn fixture_copy(dir: &tempfile::TempDir, fixture: &str, name: &str) -> PathBuf {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rustamp-decoders/tests/fixtures")
+            .join(fixture);
+        let path = dir.path().join(name);
+        std::fs::copy(&source, &path).expect("copy the fixture");
+        path
+    }
+
     /// A copy of the tagged MP3 fixture, in a temporary directory.
     ///
     /// The fixture lives in the decoders' test data (`sine.mp3`); it is
     /// copied, never written to.
     fn tagged_mp3(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../rustamp-decoders/tests/fixtures/sine.mp3");
-        let path = dir.path().join(name);
-        std::fs::copy(&fixture, &path).expect("copy the tagged fixture");
-        path
+        fixture_copy(dir, "sine.mp3", name)
     }
 
     /// A copy of the tagged MP3 fixture with an ID3v1 tag behind it.
@@ -1635,6 +1675,119 @@ mod tests {
         assert_eq!(metadata.title.as_deref(), Some("V1 Title"));
         // The other fields are untouched.
         assert_eq!(metadata.artist.as_deref(), Some("Test Artist"));
+    }
+
+    #[test]
+    fn a_value_the_format_cannot_hold_is_reported_as_not_in_the_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = fixture_copy(&dir, "sine_alac.m4a", "tagged.m4a");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+        assert!(app.dialog_is_open(DialogKind::EditEntry));
+
+        // A track number the MP4 family cannot hold: the `trkn` atom holds
+        // 16-bit numbers, and a zero means "no number at all". The request
+        // is built by hand, because the dialog caps a number at 9999 — the
+        // app writes the request it gets, and the report is the same.
+        app.save_edit_entry(EditEntryChanges {
+            track: EditEntryChange::Edited(EditEntryNumber {
+                number: 70_000,
+                total: None,
+            }),
+            ..EditEntryChanges::default()
+        });
+
+        // The write landed, so the box closed ...
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        // ... but the value is not in the file, and the app says so: the
+        // note names the field and the reason.
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|note| {
+                note.contains("could not store the track")
+                    && note.contains("the format cannot hold this value")
+                    && note.contains("not in the file")
+            }),
+            "{notes:?}"
+        );
+        // The number is not in the file: the writer replaced the number the
+        // file had, and the format had no room for the new one.
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.track_no, None);
+    }
+
+    #[test]
+    fn the_same_value_in_an_id3v2_file_is_not_reported() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        // The same number in an ID3v2 tag: the format stores the number as
+        // text, so it carries every one of them.
+        app.save_edit_entry(EditEntryChanges {
+            track: EditEntryChange::Edited(EditEntryNumber {
+                number: 70_000,
+                total: None,
+            }),
+            ..EditEntryChanges::default()
+        });
+
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        // Nothing was refused, so nothing is reported.
+        assert!(app.drain_notes().is_empty());
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.track_no, Some(70_000));
+    }
+
+    #[test]
+    fn a_normal_edit_of_the_same_file_is_not_reported() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = fixture_copy(&dir, "sine_aac.m4a", "tagged.m4a");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        // A title the MP4 family can hold: the write is a clean success and
+        // the app says nothing.
+        app.save_edit_entry(EditEntryChanges {
+            title: EditEntryChange::Edited("Round Trip Title".to_string()),
+            ..EditEntryChanges::default()
+        });
+
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        assert!(app.drain_notes().is_empty());
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.title.as_deref(), Some("Round Trip Title"));
+    }
+
+    #[test]
+    fn a_zero_the_mp4_family_cannot_carry_is_reported_too() {
+        // The value the user can type: the dialog caps a number at 9999, so
+        // the MP4 family (which carries 1..=65535) can only lose a number
+        // to a zero — and a zero is "no number at all" in the `trkn` atom.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = fixture_copy(&dir, "sine_alac.m4a", "tagged.m4a");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        focus(&mut app, "Track");
+        assert!(app.dialog_text("0"));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("could not store the track")),
+            "{notes:?}"
+        );
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.track_no, None);
     }
 
     #[test]
