@@ -479,3 +479,22 @@ in session 0.
   `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
   `cargo test --workspace --all-features` are green; the window-shaped
   acceptance runs in the Hyper-V test VM, not on the host.
+
+## 12. Owner decision (recorded 2026-10-20)
+
+**Accepted.** The owner accepted the revision as proposed and chose **option A**
+for the kind type (section 3.3): `rustamp-proto` takes one internal dependency
+on `rustamp-plugin-abi` and reuses the ABI's kind type, with an **RFC 0004
+section 3 erratum** recording that the proto crate names the ABI's type instead
+of mirroring it. The answers to section 10 in full:
+
+1. **The wire change is accepted**: one appended `Command` variant travelling in
+   `Message::CommandToHost`, and `PROTOCOL_VERSION` 4 -> 5.
+2. **Kind type: A** (as above).
+3. **Fire-and-forget** (Q3): no reply message, no second wire change.
+4. **The four transport variants ride along** (second revision): one bump for
+   configure plus seek/pause/unpause/stop.
+5. **`to_ms` is `i32`**: S09's slot is `seek(int ms)`, and a negative value is
+   the plug-in's business.
+
+The implementation lane works from section 11.
