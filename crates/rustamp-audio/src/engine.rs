@@ -89,13 +89,13 @@
 //!
 //! The engine owns a [`ReplayGainControl`](crate::replaygain::ReplayGainControl)
 //! that selects the per-track correction ([`ReplayGainMode`](crate::replaygain::ReplayGainMode)
-//! plus a preamp in dB). The decode thread snapshots it when it opens a
-//! track and scales the raw decoder output before the DSP chain, so the
-//! limiter (-0.3 dBFS ceiling) and the converter's final ±1.0 ceiling still
-//! bound the normalized signal (see [`crate::replaygain`] for the placement
-//! and the policy). The mode defaults to disabled — loudness never changes
-//! until the user asks — and a track without a usable tag plays unadjusted
-//! whatever the settings say.
+//! plus a preamp in dB). The decode thread reads it when it opens a track
+//! and again after every successful seek, and scales the raw decoder output
+//! before the DSP chain, so the limiter (-0.3 dBFS ceiling) and the
+//! converter's final ±1.0 ceiling still bound the normalized signal (see
+//! [`crate::replaygain`] for the placement and the policy). The mode defaults
+//! to disabled — loudness never changes until the user asks — and a track
+//! without a usable tag plays unadjusted whatever the settings say.
 //!
 //! The settings live engine-side, like the limiter switch: [`PlayerState`]
 //! has no ReplayGain field, and changing the wire contract requires an RFC.
@@ -1006,8 +1006,10 @@ impl Engine {
     /// ([`ReplayGainMode::Off`], [`ReplayGainMode::Track`] or
     /// [`ReplayGainMode::Album`]).
     ///
-    /// Takes effect from the next track (or seek): the decode thread
-    /// snapshots the setting when it opens a track.
+    /// Takes effect from the next track **or the next seek**: the decode
+    /// thread reads the setting when it opens a track and derives the
+    /// multiplier again after every successful seek, so a change made
+    /// mid-track is heard from the next seek on.
     pub fn set_replaygain_mode(&mut self, mode: ReplayGainMode) {
         self.replaygain_control.set_mode(mode);
     }
@@ -1023,7 +1025,8 @@ impl Engine {
 
     /// Set the ReplayGain preamp in dB (clamped to
     /// `±`[`crate::replaygain::MAX_PREAMP_DB`]; non-finite keeps the
-    /// previous value). Takes effect from the next track (or seek).
+    /// previous value). Takes effect from the next track **or the next
+    /// seek**, like the mode.
     pub fn set_replaygain_preamp_db(&mut self, preamp_db: f32) {
         self.replaygain_control.set_preamp_db(preamp_db);
     }

@@ -55,7 +55,7 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 | C2-1 | Signals cannot reach the output device above full scale (> ±1.0) | **FALSE** — *was false; **fixed 2026-10-20** (finding F2 below): the converter's single output stage now finishes every sample on both paths* | `crates/rustamp-audio/src/convert.rs:437-443` vs `555-561` (before the fix) | On equal-rate playback (`same_rate == true`, e.g. 44.1 kHz file to 44.1 kHz device), `convert.rs:441` called `remix` and returned immediately without running `finish_sample` (the `clamp(-1.0, 1.0)` safety net was resampler-only). With the limiter disabled via `set_enabled(false)` or during positive ReplayGain (+51 dB) + EQ preamp (+12 dB), unclamped samples far exceeding ±1.0 entered the ring and were passed to WASAPI/CPAL. |
 | C2-2 | The true-peak limiter bounds inter-sample peaks at full scale | **PARTIAL** | `crates/rustamp-dsp/src/limiter.rs:32-48`, card `A17 §5` | A17 §5 documents that the 4× polyphase FIR oversampler has an under-read of up to 0.67 dB near Nyquist (e.g. 20 kHz sine wave at 44.1 kHz). With limiter ceiling at 0 dBFS (1.0), true inter-sample peaks up to +0.67 dB (~1.08 linear) pass the limiter unattenuated and, due to C2-1, are not clamped on equal-rate paths. |
 | C2-3 | ReplayGain gain is applied once and in the correct order | **HOLDS** | `crates/rustamp-audio/src/decode.rs:677-698` | Order is verified: ReplayGain -> Equalizer -> installed DSP stages -> Limiter -> Converter -> Output ring. |
-| C2-4 | "A change [to ReplayGain mode] takes effect at the next track (or seek)" | **FALSE** | `crates/rustamp-audio/src/engine.rs:647-650` vs `crates/rustamp-audio/src/decode.rs:840-865` | `apply_seek` in `decode.rs` does not update `self.rg_gain`. Gain is only updated in `prepare_track`. Changing ReplayGain mode and seeking does not update the active gain; the track continues playing with the old gain. |
+| C2-4 | "A change [to ReplayGain mode] takes effect at the next track (or seek)" | **FALSE** — *was false; **fixed 2026-10-20** (finding F3 below): a seek re-derives the multiplier* | `crates/rustamp-audio/src/engine.rs:647-650` vs `crates/rustamp-audio/src/decode.rs:840-865` (before the fix) | `apply_seek` in `decode.rs` did not update `self.rg_gain`. Gain was only updated in `prepare_track`. Changing ReplayGain mode and seeking did not update the active gain; the track continued playing with the old gain. |
 
 ### 3. The Approval Store (P5, P7)
 
@@ -279,6 +279,71 @@ In `crates/rustamp-audio/src/decode.rs:670-698`:
 ---
 
 ### F3 — MEDIUM (proven): ReplayGain mode change is ignored across seeks, contradicting the engine contract
+
+**Status: FIXED (2026-10-20).** The finding was correct: the multiplier was
+derived in `prepare_track` only, so a seek kept the gain the track had
+prepared with and the engine's promise ("a change takes effect at the next
+track **or seek**") was broken. The fix is in
+`crates/rustamp-audio/src/decode.rs`, the tests in
+`crates/rustamp-audio/tests/replaygain.rs`.
+
+**Where the gain is re-derived.** One place, `Worker::refresh_replaygain`:
+it asks the shared `ReplayGainControl` for the current track's multiplier
+(`effective_gain_current`, the very call `prepare_track` used) and stores it
+in `self.rg_gain`. `prepare_track` calls it after it has stored the track's
+tag values, and `apply_seek` calls it again **after the decoder accepted the
+seek**. The two paths therefore cannot drift apart, and the formula is not
+duplicated: the mode, the preamp and the tag selection stay in
+`crate::replaygain`.
+
+**What a seek now does to the gain.** The multiplier is re-derived from the
+*current* mode, so:
+
+| Situation | Result |
+|---|---|
+| `Off` → `Track`, then a seek | the track gain is in effect from the seek on |
+| `Track` → `Off`, then a seek | the track plays unadjusted again |
+| a seek without a mode change | the multiplier is untouched (the track keeps the gain it prepared with) |
+| a mode that needs a tag the decoder did not load | the track plays unadjusted, before and after the seek (the documented policy: a missing tag is not a license to guess) |
+
+A **refused** seek changes nothing: the decoder did not move, so the audio
+keeps the gain it had, and only the matching request is completed.
+
+**No jump in the middle of a block.** The gain is read once per block
+(`emit` takes `self.rg_gain` into a local and scales the whole block), and a
+seek is handled between two blocks in the track loop. The new multiplier
+therefore applies from the first block after the seek — never half-way
+through one.
+
+**The click.** The engine has **no** gain ramp for the ReplayGain
+multiplier: the only ramp in the audio path is the output fade
+(`rustamp_dsp::Fade`, in the render callback) and the equalizer's own slew,
+and neither is a general gain ramp. None is needed, because the multiplier
+only ever changes where the signal is cut anyway: a seek drops the frames
+the ring still holds (the render callback drains it on the new epoch) and
+the engine flushes the device (`Engine::on_decode_out` → `flush_output`), so
+the audio is already discontinuous across the seek. The new multiplier
+starts exactly at that discontinuity, with no waveform to ramp against. The
+argument is written down in `crate::replaygain`'s module docs ("When a change
+takes effect") and in `decode.rs`'s `apply_seek`.
+
+**Tests (all in `crates/rustamp-audio/tests/replaygain.rs`, headless — the
+virtual `NullOutput` device, no window and no audio device):**
+
+| Test | What it pins |
+|---|---|
+| `a_mode_change_takes_effect_at_the_next_seek` | the F3 reproduction: `Off` → `Track` → seek ⇒ the post-seek audio is the gained source, frame by frame |
+| `a_mode_change_back_to_off_takes_effect_at_the_next_seek` | the reverse: `Track` → `Off` → seek ⇒ the post-seek audio is the unadjusted source, bit-exact |
+| `a_seek_without_a_mode_change_keeps_the_gain` | a seek on its own never touches the multiplier |
+| `a_seek_on_a_track_without_tags_plays_unadjusted` | a mode that needs a tag the track does not carry plays unadjusted, before and after the seek |
+| `a_seek_during_a_fade_keeps_the_fade_and_derives_the_new_gain` | a seek in the middle of a fade-out neither disturbs the ramp (the equal-power law continues where it was) nor misses the new mode |
+
+The last test models the fade exactly: the ramp starts at the first callback
+after the request, so the frame the device played at counter `played` is the
+ramp's frame `played - start`, and the expectation of every post-seek frame is
+`equal-power gain × (the gained source, finished)`.
+
+**The original report (unchanged, for the record):**
 
 In `crates/rustamp-audio/src/engine.rs:647-650`:
 ```rust
