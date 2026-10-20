@@ -117,16 +117,42 @@
 //! the first `latency` frames the chain emits are dropped, and at the end of
 //! every track `latency` frames of silence are pushed through so the audio
 //! the chain still holds comes out. Because the adapter's `process` is one
-//! synchronous block round-trip (write the block, read the same block back,
-//! delayed by the chain's latency), that machinery is correct across a seek
-//! (`reset` + trim) and across a gapless seam (flush at the track end + trim
-//! at the next track's start) with no extra wiring: no frame is lost, none is
-//! duplicated and no silence enters either seam. If the resident's report
-//! disagrees with reality (a lying or buggy stage), the compensation trims or
-//! flushes the wrong number of frames — the error is bounded by the reported
-//! latency and shows up as a small shift or a short tail, never as a hang or
-//! a crash; the report is trusted because RFC 0006 §6.2 makes it the
-//! contract, exactly as for an in-process stage's `latency_frames`.
+//! synchronous block round-trip (write the block in lockstep chunks, read
+//! every chunk back, delayed by the chain's latency), that machinery is
+//! correct across a seek (`reset` + trim) and across a gapless seam (flush
+//! at the track end + trim at the next track's start) with no extra wiring:
+//! no frame is lost, none is duplicated and no silence enters either seam.
+//! If the resident's report disagrees with reality (a lying or buggy stage),
+//! the compensation trims or flushes the wrong number of frames — the error
+//! is bounded by the reported latency and shows up as a small shift or a
+//! short tail, never as a hang or a crash; the report is trusted because
+//! RFC 0006 §6.2 makes it the contract, exactly as for an in-process
+//! stage's `latency_frames`.
+//!
+//! # The lockstep round-trip (no deadlock by construction)
+//!
+//! The adapter's block round-trip is a **lockstep**: the block is split into
+//! chunks of at most [`DSP_CHUNK_FRAMES`] frames, and the adapter writes one
+//! chunk, reads that chunk back, and only then writes the next one. The
+//! resident worker moves frames strictly in order from the in-ring to its
+//! back-ring, so the frames a chunk's read-back waits for are exactly that
+//! chunk, and the frames in flight (written, not yet read back) never exceed
+//! one chunk.
+//!
+//! That is what makes the round trip deadlock-free. A single write of the
+//! whole block — the pattern the W14 review found in this adapter (finding
+//! F1, claim C6-2) — fills the resident's back-ring before a single frame is
+//! read back; the resident then blocks on its back-ring, stops taking from
+//! the in-ring, and the player's write waits for a resident that waits for
+//! the player's read: the bounded-buffer deadlock, bounded only by the block
+//! timeout. With the lockstep the resident's back-ring holds at most one
+//! chunk plus the block it keeps in hand, so it never blocks there, never
+//! stops draining the in-ring, and the player's write always finds room.
+//!
+//! The chunk size is the resident worker's own block size, so the frames the
+//! chain processes, their order and the values it returns do not change; the
+//! chunk is additionally clamped to the in-ring capacity the caller chose, so
+//! one chunk is always one ring write.
 //!
 //! # Mid-run failures
 //!
@@ -146,7 +172,7 @@
 //! in-process fallback.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustamp_core::audio::{
     AudioSpec, Confidence, Decoder, DecoderFactory, DspStage, MediaSource, ProbeHint,
@@ -962,8 +988,36 @@ pub const DEFAULT_DSP_RING_FRAMES: u32 = 4096;
 ///
 /// Own choice: long enough for a loaded helper to answer, short enough that
 /// a wedged resident fails the track instead of hanging the decode thread.
-/// The engine's join of the decode thread is bounded by this too.
+/// The engine's join of the decode thread is bounded by this too. The bound
+/// covers the **whole** round trip, every lockstep chunk included, so a
+/// block of any size fails the track after the same time.
 pub const DEFAULT_DSP_BLOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Frames per lockstep chunk in one resident block round-trip.
+///
+/// Own choice, and the number the deadlock fix turns on. The resident
+/// worker moves frames strictly in order from the in-ring to its own
+/// back-ring (4096 frames, `rustamp-mediahost`'s capacity) and keeps at
+/// most one block (1024 frames) in hand while it does so. A player that
+/// writes a whole block before it reads a single frame back therefore
+/// fills the resident's back-ring, the resident stops taking from the
+/// in-ring, and the two sides wait for each other — the bounded-buffer
+/// deadlock (W14 finding F1).
+///
+/// The chunk is the lockstep unit: the adapter writes one chunk, reads
+/// that chunk back, and only then writes the next one. The frames in
+/// flight (written, not yet read back) never exceed one chunk, so the
+/// resident's back-ring holds at most one chunk plus the block it keeps
+/// in hand — 2048 of its 4096 frames — and the resident never blocks on
+/// its back-ring, never stops draining the in-ring, and the player's
+/// write always finds room. Neither wait can be permanent.
+///
+/// 1024 is also the resident worker's own block size, so the chunk
+/// boundaries are the boundaries the chain already saw: the frames the
+/// chain processes, their order and the values it returns do not change.
+/// The chunk is additionally clamped to the in-ring capacity the caller
+/// chose, so one chunk is always one ring write.
+pub const DSP_CHUNK_FRAMES: usize = 1024;
 
 /// Wire spec for a core spec. The wire carries `u8` channels, so a wider spec
 /// is refused loudly instead of truncated.
@@ -1028,33 +1082,74 @@ fn spawn_error_to_core(error: MediaHostError) -> CoreError {
     }
 }
 
-/// One bounded block round-trip through the resident: write the whole block,
-/// read the same number of frames back. The resident processes strictly in
-/// order, so the block comes back delayed by the chain's latency — exactly
-/// the `DspStage` contract the decode thread compensates (`dsp_trim` after
-/// every prepare/reset, `flush_dsp` at the end of every track). `Ok(0)` from
-/// a read is the session's sticky EOS, which the adapter never asks for
-/// mid-stream: it is a loud failure, never silence.
+/// One bounded block round-trip through the resident, in lockstep chunks.
+///
+/// The block is split into chunks of at most `chunk_frames` frames: write
+/// one chunk, read that chunk back, then write the next. The resident
+/// processes strictly in order, so the frames a chunk's read-back waits
+/// for are exactly that chunk, and the block comes back delayed by the
+/// chain's latency — exactly the `DspStage` contract the decode thread
+/// compensates (`dsp_trim` after every prepare/reset, `flush_dsp` at the
+/// end of every track). `Ok(0)` from a read is the session's sticky EOS,
+/// which the adapter never asks for mid-stream: it is a loud failure,
+/// never silence.
+///
+/// The lockstep is what makes the round trip deadlock-free. A single
+/// write of the whole block fills the resident's back-ring before a
+/// single frame is read back; the resident then blocks on its back-ring,
+/// stops taking from the in-ring, and the write waits for a resident
+/// that waits for the read — the deadlock the W14 review found in this
+/// adapter (finding F1, claim C6-2). See [`DSP_CHUNK_FRAMES`].
+///
+/// The bound covers the **whole** round trip, not one chunk: the deadline
+/// is taken once, so a wedged resident fails the track after
+/// `block_timeout` however many chunks the block had.
 fn process_block<F: PcmRings>(
     session: &mut DspSession<F>,
     buf: &mut [f32],
     block_timeout: Duration,
+    chunk_frames: usize,
 ) -> CoreResult<()> {
-    session
-        .write_timeout(buf, Some(block_timeout))
-        .map_err(|error| dsp_error_to_core(error, "write"))?;
     let channels = usize::from(session.spec().channels.max(1));
-    let mut filled = 0;
-    while filled < buf.len() {
-        let frames = session
-            .read(&mut buf[filled..], Some(block_timeout))
-            .map_err(|error| dsp_error_to_core(error, "read"))?;
-        if frames == 0 {
-            return Err(CoreError::Dsp(
-                "resident DSP closed its output mid-stream".into(),
-            ));
+    if buf.is_empty() || !buf.len().is_multiple_of(channels) {
+        // The `DspStage` contract promises whole frames; a block that is
+        // not one is the caller's mistake, and it is refused before the
+        // block is split — a partial frame is never dropped silently.
+        return Err(CoreError::InvalidArgument(
+            "resident DSP block must hold whole frames".into(),
+        ));
+    }
+    let chunk_frames = chunk_frames.max(1);
+    let total_frames = buf.len() / channels;
+    let deadline = Instant::now() + block_timeout;
+    let mut frame = 0usize;
+    while frame < total_frames {
+        let end = (frame + chunk_frames).min(total_frames);
+        let chunk = &mut buf[frame * channels..end * channels];
+        // The fence: the write returns only once the resident has taken
+        // these frames, so a successful chunk write is a delivery.
+        session
+            .write_timeout(
+                chunk,
+                Some(deadline.saturating_duration_since(Instant::now())),
+            )
+            .map_err(|error| dsp_error_to_core(error, "write"))?;
+        let mut filled = 0;
+        while filled < chunk.len() {
+            let frames = session
+                .read(
+                    &mut chunk[filled..],
+                    Some(deadline.saturating_duration_since(Instant::now())),
+                )
+                .map_err(|error| dsp_error_to_core(error, "read"))?;
+            if frames == 0 {
+                return Err(CoreError::Dsp(
+                    "resident DSP closed its output mid-stream".into(),
+                ));
+            }
+            filled += frames * channels;
         }
-        filled += frames * channels;
+        frame = end;
     }
     Ok(())
 }
@@ -1090,6 +1185,17 @@ impl ChainControl {
         if self.poisoned.is_none() {
             self.poisoned = Some(error.to_string());
         }
+    }
+
+    /// The lockstep chunk size in frames.
+    ///
+    /// The smaller of the in-ring capacity the caller chose and the
+    /// ceiling that keeps the resident's back-ring free
+    /// ([`DSP_CHUNK_FRAMES`]); at least one frame, because a chunk of
+    /// zero would never advance.
+    fn chunk_frames(&self) -> usize {
+        let ring = usize::try_from(self.ring_frames).unwrap_or(usize::MAX);
+        ring.clamp(1, DSP_CHUNK_FRAMES)
     }
 
     /// `DspStage::prepare`: reconfigure the resident on a format change,
@@ -1131,10 +1237,11 @@ impl ChainControl {
         Ok(())
     }
 
-    /// `DspStage::process`: one bounded block round-trip. A failure is
-    /// returned as `Err` (RFC 0014 §3.5) and latched: the chain is poisoned
-    /// and returns the sticky first failure from then on, without touching
-    /// the session or the buffer again.
+    /// `DspStage::process`: one bounded block round-trip, in lockstep
+    /// chunks. A failure is returned as `Err` (RFC 0014 §3.5) and
+    /// latched: the chain is poisoned and returns the sticky first
+    /// failure from then on, without touching the session or the buffer
+    /// again.
     fn process<F: PcmRings>(
         &mut self,
         session: &mut DspSession<F>,
@@ -1143,7 +1250,7 @@ impl ChainControl {
         if let Some(message) = &self.poisoned {
             return Err(CoreError::Dsp(message.clone()));
         }
-        if let Err(error) = process_block(session, buf, self.block_timeout) {
+        if let Err(error) = process_block(session, buf, self.block_timeout, self.chunk_frames()) {
             self.latch(&error);
             return Err(error);
         }
@@ -2383,6 +2490,27 @@ mod dsp_tests {
     }
 
     #[test]
+    fn the_lockstep_chunk_is_the_smaller_of_the_ring_and_the_ceiling() {
+        // The chunk bounds the frames in flight, so it is the smaller of
+        // the in-ring capacity the caller chose and the ceiling that
+        // keeps the resident's back-ring free.
+        let control =
+            ChainControl::new(Vec::new(), DEFAULT_DSP_RING_FRAMES, Duration::from_secs(5));
+        assert_eq!(control.chunk_frames(), DSP_CHUNK_FRAMES);
+        let control = ChainControl::new(Vec::new(), 64, Duration::from_secs(5));
+        assert_eq!(control.chunk_frames(), 64, "a small ring bounds the chunk");
+        let control = ChainControl::new(Vec::new(), 0, Duration::from_secs(5));
+        assert_eq!(
+            control.chunk_frames(),
+            1,
+            "a chunk of zero would never advance"
+        );
+        // The ceiling is the resident worker's own block size, so the
+        // chain sees the same block boundaries as before the fix.
+        assert_eq!(DSP_CHUNK_FRAMES, 1024);
+    }
+
+    #[test]
     fn dsp_zero_ring_frames_is_rejected_loudly() {
         let config =
             DspResidentConfig::new(PathBuf::from("helper.exe"), Vec::new()).with_ring_frames(0);
@@ -3096,6 +3224,130 @@ mod dsp_hosted_tests {
         drop(chain);
         let outcome = host.recv_timeout(WAIT).expect("host must finish");
         assert!(outcome.is_ok(), "{outcome:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The lockstep round-trip: no deadlock by construction
+    // -----------------------------------------------------------------------
+
+    /// The in-ring capacity the deadlock tests use: far smaller than the
+    /// block, so the block has to wrap the ring many times over.
+    const DEADLOCK_RING_FRAMES: u32 = 64;
+
+    /// The block the deadlock tests push through the resident.
+    ///
+    /// Larger than the resident's whole absorption: its 4096-frame
+    /// back-ring plus the block it keeps in hand while it writes back (at
+    /// most the resident's own 1024-frame block). A single write of that
+    /// block cannot be taken back by the resident before the player reads,
+    /// so the un-chunked round trip stalls — while the lockstep round
+    /// trip, which never has more than one chunk in flight, completes.
+    const DEADLOCK_BLOCK_FRAMES: usize = 8192;
+
+    /// The resident worker's back-ring capacity in frames
+    /// (`rustamp-mediahost`'s own constant). The coupling is pinned here
+    /// on purpose: the chunk ceiling [`DSP_CHUNK_FRAMES`] must stay
+    /// below it, and this assertion is what notices when it does not.
+    const BACK_RING_FRAMES: u64 = 4096;
+
+    /// A stereo block of `frames` frames with a per-frame ramp.
+    ///
+    /// The values are exact in `f32` (a frame index below 2^24 divided
+    /// by four), so a gain of 2.0 is exact too and the comparison can be
+    /// a bit-for-bit one.
+    fn block(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|frame| [frame as f32 / 4.0, -(frame as f32 / 4.0)])
+            .collect()
+    }
+
+    /// The pre-fix round-trip: one write of the whole block, then the
+    /// read-back.
+    ///
+    /// This is the pattern the W14 review found in the production adapter
+    /// (finding F1, claim C6-2). It is kept here as the contrast case:
+    /// the fix's evidence is that this pattern stalls on exactly the
+    /// rings the lockstep path survives.
+    fn un_chunked_round_trip(
+        session: &mut DspSession<NamedPcmRings>,
+        buf: &mut [f32],
+        bound: Duration,
+    ) -> HostResult<()> {
+        session.write_timeout(buf, Some(bound))?;
+        let channels = usize::from(session.spec().channels.max(1));
+        let mut filled = 0;
+        while filled < buf.len() {
+            let frames = session.read(&mut buf[filled..], Some(bound))?;
+            if frames == 0 {
+                return Err(MediaHostError::OperationFailed(
+                    "the resident closed its output mid-stream".into(),
+                ));
+            }
+            filled += frames * channels;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_lockstep_round_trip_completes_on_a_ring_smaller_than_the_block() {
+        // The ring is far smaller than the block: 64 frames of in-ring
+        // against 8192 frames of block. The lockstep round trip splits
+        // the block into chunks of one ring's worth, so the resident
+        // never stops taking and the block comes back whole and exact.
+        let (mut chain, host) =
+            open_chain(vec![gain_desc(2.0)], SPEC_WIRE, DEADLOCK_RING_FRAMES, WAIT);
+        let input = block(DEADLOCK_BLOCK_FRAMES);
+        let mut buf = input.clone();
+        chain
+            .process(&mut buf)
+            .expect("the lockstep round trip must complete");
+        for (index, (got, want)) in buf.iter().zip(input.iter()).enumerate() {
+            assert_eq!(*got, want * 2.0, "sample {index}");
+        }
+        assert_eq!(chain.session().frames_dropped(), 0);
+        drop(chain);
+        reap(host);
+    }
+
+    #[test]
+    fn the_un_chunked_round_trip_stalls_where_the_lockstep_one_completes() {
+        // The pre-fix pattern on the same rings: one write of the whole
+        // block, no read until it is done. The resident fills its
+        // back-ring, stops taking from the in-ring, and the write waits
+        // for a resident that waits for the read: the deadlock.
+        //
+        // A deadlock cannot be observed directly — the proof is a bound
+        // expiring without progress — so the test pins three things: the
+        // round trip does not finish inside the bound, it fails on the
+        // write (not on the read), and the ring counters show why.
+        let (mut session, host) =
+            open_session(vec![gain_desc(2.0)], SPEC_WIRE, DEADLOCK_RING_FRAMES);
+        let mut buf = block(DEADLOCK_BLOCK_FRAMES);
+        let bound = Duration::from_secs(1);
+        let start = Instant::now();
+        let error = un_chunked_round_trip(&mut session, &mut buf, bound)
+            .expect_err("the un-chunked round trip must not complete");
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(error, MediaHostError::TimedOut),
+            "the un-chunked round trip must stall on the write, got {error}"
+        );
+        assert!(
+            elapsed >= bound,
+            "the stall must last the whole bound, took {elapsed:?}"
+        );
+        // The mechanism, observed: the resident published everything its
+        // back-ring holds and the player read none of it, so the
+        // resident stopped taking and the write can never complete.
+        let counters = session.back_ring_counters();
+        assert_eq!(
+            counters.available(),
+            BACK_RING_FRAMES,
+            "the resident's back-ring must be full: {counters:?}"
+        );
+        assert_eq!(counters.read, 0, "the player must not have read anything");
+        drop(session);
+        reap(host);
     }
 
     // -----------------------------------------------------------------------
