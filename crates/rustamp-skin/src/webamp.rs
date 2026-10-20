@@ -560,7 +560,12 @@ pub const DEFAULT_PLAYLIST_CURRENT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // S17 §5 ver
 /// Default playlist background.
 pub const DEFAULT_PLAYLIST_NORMAL_BG: [u8; 3] = [0x00, 0x00, 0x00]; // S17 §5 verified
 /// Default selected-entry background.
-pub const DEFAULT_PLAYLIST_SELECTED_BG: [u8; 3] = [0x00, 0x00, 0xFF]; // provisional: webamp; S17 §5 did not observe it
+///
+/// The base skin's own `pledit.txt` carries `SelectedBG=#0000C6` (S17 §5's
+/// table); the observed default until now was webamp's `#0000FF`. The owner
+/// chose to follow the base skin (2026-10-20), so the built-in default is the
+/// value the reference's own file states.
+pub const DEFAULT_PLAYLIST_SELECTED_BG: [u8; 3] = [0x00, 0x00, 0xC6]; // base skin pledit.txt, owner decision 2026-10-20
 /// Default playlist font.
 pub const DEFAULT_PLAYLIST_FONT: &str = "Arial"; // provisional: webamp; S17 §5 did not observe it
 
