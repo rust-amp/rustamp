@@ -519,3 +519,116 @@ fn without_a_selection_the_whole_match_set_is_written() {
         "{notes:?}"
     );
 }
+
+#[test]
+fn two_tracks_that_collide_only_after_the_extension_is_reported() {
+    let dir = TempDir::new().expect("temp dir");
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).expect("the media folder");
+    // The first track renders to `Song`, the second to `Song.mp3`. The
+    // extension of the source makes both end up as `Song.mp3`, so the plan
+    // sees two names and the disk would see one file written twice.
+    track(&media, "one.mp3", "Song", "Abba Gold", "Greatest Hits", 7);
+    track(
+        &media,
+        "two.mp3",
+        "Song.mp3",
+        "Abba Gold",
+        "Greatest Hits",
+        8,
+    );
+
+    let mut app = library_app(&dir);
+    scan(&mut app, &media, 2);
+
+    let target = target_dir(&dir, "target");
+    let mut ask = |_: &str| Some(OverwriteAnswer::Yes);
+    app.library_extract(Some(&settings("Title", &target)), &mut ask)
+        .expect("the extraction");
+
+    // One file is written, not two: the first track of the selection keeps
+    // the name, and the second is reported instead of overwriting it.
+    assert!(target.join("Song.mp3").is_file());
+    assert!(!target.join("Song.mp3.mp3").exists());
+
+    let notes = notes(&mut app);
+    assert!(
+        notes.iter().any(|note| note.contains("1 tracks extracted")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note
+            .contains("Error extracting track #2: another track already extracts to Song.mp3")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn a_rendered_name_that_already_carries_the_extension_is_not_extended_twice() {
+    let dir = TempDir::new().expect("temp dir");
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).expect("the media folder");
+    track(
+        &media,
+        "one.mp3",
+        "Song.mp3",
+        "Abba Gold",
+        "Greatest Hits",
+        7,
+    );
+
+    let mut app = library_app(&dir);
+    scan(&mut app, &media, 1);
+
+    let target = target_dir(&dir, "target");
+    let mut ask = |_: &str| Some(OverwriteAnswer::Yes);
+    app.library_extract(Some(&settings("Title", &target)), &mut ask)
+        .expect("the extraction");
+
+    // The title already carries the extension: the copy keeps it once.
+    assert!(target.join("Song.mp3").is_file());
+    assert!(!target.join("Song.mp3.mp3").exists());
+    let notes = notes(&mut app);
+    assert!(
+        notes.iter().any(|note| note.contains("1 tracks extracted")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn the_file_name_of_a_planned_track_carries_the_extension_of_its_source_once() {
+    // A unit test of the name rule itself: the rendered name with the
+    // extension of the source, and a name that already carries it unchanged.
+    let plan = |rendered: &str, source: &str| PlannedFile {
+        track_id: 1,
+        source: PathBuf::from(source),
+        path: PathTemplate::parse("Title").render(&title_row(1, rendered)),
+    };
+
+    assert_eq!(file_name(&plan("Song", r"C:\music\one.mp3")), "Song.mp3");
+    assert_eq!(
+        file_name(&plan("Song.mp3", r"C:\music\one.mp3")),
+        "Song.mp3"
+    );
+    assert_eq!(
+        file_name(&plan("song.MP3", r"C:\music\one.mp3")),
+        "song.MP3"
+    );
+    assert_eq!(file_name(&plan("Song", r"C:\music\one.wav")), "Song.wav");
+    // A source without an extension leaves the rendered name as it is.
+    assert_eq!(file_name(&plan("Song", r"C:\music\one")), "Song");
+}
+
+/// A row whose title is `title`.
+fn title_row(id: i64, title: &str) -> TrackRow {
+    TrackRow {
+        id,
+        path: PathBuf::from(format!(r"C:\music\{id}.mp3")),
+        metadata: TrackMetadata {
+            title: Some(title.to_owned()),
+            ..Default::default()
+        },
+        mtime_ns: None,
+        size: None,
+    }
+}
