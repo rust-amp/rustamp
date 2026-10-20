@@ -73,7 +73,10 @@
 //!   one** selected playlist entry, one field per tag. The app reads the
 //!   tags when the action runs, opens the box with them and writes the
 //!   fields the user changed back into the file with `rustamp-meta`. A
-//!   stream has no local file and therefore no tags to edit: the action
+//!   field the user **cleared** is removed from the file instead of being
+//!   written as an empty value, and a value the file keeps in a second tag
+//!   (an ID3v1 tag next to an ID3v2 tag) is reported rather than hidden.
+//!   A stream has no local file and therefore no tags to edit: the action
 //!   says so and opens nothing, and so does an empty selection. A field
 //!   that does not validate keeps the box open, so the user can fix it;
 //!   `Escape` closes the box and writes nothing. S03 §2 gives the id and
@@ -86,6 +89,7 @@ use rustamp_audio::TrackSource;
 use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
 use rustamp_core::meta::TrackMetadata;
 use rustamp_gfx::Image;
+use rustamp_meta::TagField;
 use rustamp_platform::{Bind, PluginRow, PrefsAction, PrefsNode, PrefsSettings};
 use rustamp_plugin_abi::PluginKind;
 use rustamp_prefs::page_name;
@@ -375,12 +379,20 @@ impl App {
 
     /// Writes the changed fields into the file's tags and closes the box.
     ///
-    /// The write is the honest one ([`rustamp_meta::write_tags_report`]):
-    /// the fields the user did not touch keep the value the file has, and
-    /// the report names every `extra` key the format refused — a field the
-    /// target format has no place for (the total of a disc on an MP3, for
-    /// example). A refused key is not a failure: the rest of the write
-    /// landed, so the box closes and the refusal is reported.
+    /// The write is the honest one
+    /// ([`rustamp_meta::write_tags_with_report`]): the fields the user did
+    /// not touch keep the value the file has, a field the user **cleared**
+    /// is taken out of the file (the removal list of the request names it),
+    /// and the report names what the file could not do:
+    ///
+    /// * an `extra` key the target format refused — a field the format has
+    ///   no place for (the total of a disc on an MP3, for example);
+    /// * a removal the file still carries, because the value is in a second
+    ///   tag of the file (an ID3v1 tag next to an ID3v2 tag) and the writer
+    ///   writes only the primary tag.
+    ///
+    /// Neither is a failure: the rest of the write landed, so the box closes
+    /// and the limitation is reported.
     ///
     /// A failed write (an unreadable file, a format that cannot hold the
     /// fields) keeps the box open, so the user can correct the fields and
@@ -390,7 +402,11 @@ impl App {
             return;
         };
         let path = session.path.clone();
-        let report = match rustamp_meta::write_tags_report(&path, &changes.to_metadata()) {
+        let report = match rustamp_meta::write_tags_with_report(
+            &path,
+            &changes.to_metadata(),
+            changes.removals(),
+        ) {
             Ok(report) => report,
             Err(error) => {
                 self.note(format!(
@@ -405,6 +421,18 @@ impl App {
                 "edit entry: {} did not store: {}",
                 path.display(),
                 report.unwritten_extra.join(", ")
+            ));
+        }
+        if !report.unremoved.is_empty() {
+            let fields: Vec<&str> = report
+                .unremoved
+                .iter()
+                .map(|field| tag_field_name(*field))
+                .collect();
+            self.note(format!(
+                "edit entry: {} did not remove: {} (the value is in a second tag of the file)",
+                path.display(),
+                fields.join(", ")
             ));
         }
         self.edit_entry = None;
@@ -1048,6 +1076,25 @@ fn push_field(fields: &mut Vec<(String, String)>, name: &str, value: Option<Stri
     }
 }
 
+/// The name of a tag field, as the notes of the app write it.
+///
+/// The writer names a field it could not remove with the type of the
+/// removal ([`rustamp_meta::TagField`]); the note needs a name a reader can
+/// make sense of, so the fields are named here.
+fn tag_field_name(field: TagField) -> &'static str {
+    match field {
+        TagField::Title => "title",
+        TagField::Artist => "artist",
+        TagField::Album => "album",
+        TagField::AlbumArtist => "album artist",
+        TagField::Year => "year",
+        TagField::Genre => "genre",
+        TagField::Comment => "comment",
+        TagField::Track => "track",
+        TagField::Disc => "disc",
+    }
+}
+
 /// The five plug-in pages of the native preferences dialog.
 const PLUGIN_NODES: [PrefsNode; 5] = [
     PrefsNode::Input,
@@ -1167,6 +1214,26 @@ mod tests {
         path
     }
 
+    /// A copy of the tagged MP3 fixture with an ID3v1 tag behind it.
+    ///
+    /// The ID3v1 tag is a **second** tag of the file: the writer writes only
+    /// the primary tag (the ID3v2 tag here), so a value in the ID3v1 tag
+    /// survives a removal.
+    fn tagged_mp3_with_id3v1(dir: &tempfile::TempDir, name: &str, title: &str) -> PathBuf {
+        let path = tagged_mp3(dir, name);
+        let mut bytes = std::fs::read(&path).expect("read the copied fixture");
+        // A 128-byte ID3v1 tag: the magic, the title and the genre "none".
+        let mut tag = vec![0u8; 128];
+        tag[0..3].copy_from_slice(b"TAG");
+        let bytes_of_title = title.as_bytes();
+        let length = bytes_of_title.len().min(30);
+        tag[3..3 + length].copy_from_slice(&bytes_of_title[..length]);
+        tag[127] = 255;
+        bytes.extend_from_slice(&tag);
+        std::fs::write(&path, &bytes).expect("write the file with the ID3v1 tag");
+        path
+    }
+
     /// Adds one entry to the queue, selects it and returns its id.
     fn add_and_select(app: &mut App, location: MediaLocation) -> EntryId {
         app.submit(Command::AddItems {
@@ -1212,6 +1279,16 @@ mod tests {
             }
         }
         assert!(app.dialog_text(text), "the text was not typed");
+    }
+
+    /// Clears the focused field: every character of it goes away.
+    fn clear(app: &mut App) {
+        for _ in 0..300 {
+            if !app.dialog_key(Key::Backspace, Modifiers::NONE) {
+                return;
+            }
+        }
+        panic!("the field was not cleared");
     }
 
     /// Moves the focus to the field `label` with `Tab`.
@@ -1381,6 +1458,118 @@ mod tests {
             notes.iter().any(|note| note.contains("DISCTOTAL")),
             "{notes:?}"
         );
+    }
+
+    #[test]
+    fn a_cleared_field_is_removed_from_the_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        // The title is cleared: the value goes away from the file instead of
+        // being written as an empty one.
+        focus(&mut app, "Title");
+        clear(&mut app);
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        // The box closed and the file lost the title.
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.title, None);
+        // The fields the user did not touch keep the value the file had.
+        assert_eq!(metadata.artist.as_deref(), Some("Test Artist"));
+        assert_eq!(metadata.album.as_deref(), Some("Test Album"));
+        assert_eq!(metadata.year, Some(2001));
+        assert_eq!(metadata.genre.as_deref(), Some("Test"));
+        // Nothing was refused, so nothing is reported.
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn a_cleared_field_that_was_empty_removes_nothing() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        // The comment is empty in the file: there is nothing to take away.
+        focus(&mut app, "Comment");
+        clear(&mut app);
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.comment, None);
+        // The file kept everything it had.
+        assert_eq!(metadata.title.as_deref(), Some("Sine Title"));
+        assert_eq!(metadata.artist.as_deref(), Some("Test Artist"));
+        assert_eq!(metadata.album.as_deref(), Some("Test Album"));
+        assert_eq!(metadata.year, Some(2001));
+        assert_eq!(metadata.track_no, Some(3));
+        assert_eq!(metadata.track_total, Some(9));
+        // Nothing was refused, so nothing is reported.
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn an_edit_and_a_removal_travel_together() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        // A new title ...
+        retype(&mut app, "Edited Title");
+        // ... and a cleared artist: the one is written, the other goes away.
+        focus(&mut app, "Artist");
+        clear(&mut app);
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.title.as_deref(), Some("Edited Title"));
+        assert_eq!(metadata.artist, None);
+        // The fields the user did not touch keep the value the file had.
+        assert_eq!(metadata.album.as_deref(), Some("Test Album"));
+        assert_eq!(metadata.year, Some(2001));
+        assert_eq!(metadata.genre.as_deref(), Some("Test"));
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn a_value_in_a_second_tag_is_reported_as_not_removed() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3_with_id3v1(&dir, "tagged.mp3", "V1 Title");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        // The box shows the title of the primary tag.
+        assert_eq!(field_line(&app, "Title"), "> Title: Sine Title");
+        focus(&mut app, "Title");
+        clear(&mut app);
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        // The write landed and the box closed ...
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        // ... but the ID3v1 tag still has the title, so the file still carries
+        // the value and the app says so.
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("did not remove") && note.contains("title")),
+            "{notes:?}"
+        );
+        // The reader merges the two tags: the title comes from the ID3v1 tag.
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.title.as_deref(), Some("V1 Title"));
+        // The other fields are untouched.
+        assert_eq!(metadata.artist.as_deref(), Some("Test Artist"));
     }
 
     #[test]
