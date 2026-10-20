@@ -75,11 +75,17 @@ const CONNECT_FAILED: &str = "Error connecting to host";
 ///
 /// A body that is longer than the length the server declared is counted at
 /// 100: the transfer is over, whatever the extra bytes were.
+///
+/// The product is taken in `u128`: a `u64` count times a hundred overflows
+/// above 180 PB, and a saturated product makes the share a wrong number — a
+/// transfer that was over came out as `11% done`. A wide local is cheaper
+/// than a wrong share.
 fn percent(bytes_read: u64, total: u64) -> u64 {
     if total == 0 {
         return 0;
     }
-    (bytes_read.saturating_mul(100) / total).min(100)
+    let share = u128::from(bytes_read) * 100 / u128::from(total);
+    u64::try_from(share.min(100)).expect("a share below a hundred fits a u64")
 }
 
 /// The rate of the transfer in KB/s, from two samples.
@@ -93,7 +99,10 @@ fn rate_kb_per_sec(bytes: u64, elapsed: Duration) -> f64 {
 
 /// The rate as S19 §2 writes it: `%d.%02d KB/sec`.
 fn format_rate(kb_per_sec: f64) -> String {
-    let hundredths = (kb_per_sec * 100.0).round().max(0.0) as u64;
+    let hundredths = (kb_per_sec * 100.0).round().max(0.0);
+    // Clamp to u64::MAX before casting to avoid UB when the rate is
+    // astronomically large (e.g. u64::MAX bytes in 1 ns).
+    let hundredths = hundredths.min(u64::MAX as f64) as u64;
     format!("{}.{:02}", hundredths / 100, hundredths % 100)
 }
 
@@ -324,5 +333,457 @@ mod tests {
             status.status(),
             Some("Retrieving file (50% done)\n1000/2000 bytes read @ 0.98 KB/sec")
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The seeded generator the property cases draw from
+    // -----------------------------------------------------------------
+
+    /// How many random scenarios one property runs.
+    const CASES: usize = 512;
+
+    /// A seeded xorshift64 generator.
+    ///
+    /// A failing property has to be replayable from its seed and the crate
+    /// takes no dependency, so the generator lives here. It is not a quality
+    /// generator: it only has to spread the drawn values widely enough for
+    /// the properties to mean something.
+    struct Rng(u64);
+
+    impl Rng {
+        /// A generator for `seed`. The state must not be zero.
+        fn new(seed: u64) -> Self {
+            Rng(seed | 1)
+        }
+
+        /// The next 64 random bits.
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        /// A uniform index in `0..n`.
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+
+        /// A byte count: zero, one, a file's worth, or anywhere in the range
+        /// a `u64` counter can reach.
+        fn bytes(&mut self) -> u64 {
+            match self.below(8) {
+                0 => 0,
+                1 => self.below(8),
+                2 => self.below(1 << 20),
+                3 => u64::MAX - self.below(3),
+                4 => u64::MAX / 100,
+                5 => u64::MAX / 3,
+                _ => self.next_u64(),
+            }
+        }
+
+        /// A declared length: unknown, zero, a file's worth or the whole
+        /// range.
+        fn total(&mut self) -> Option<u64> {
+            match self.below(8) {
+                0 | 1 => None,
+                2 => Some(0),
+                3 => Some(self.below(1 << 20)),
+                4 => Some(u64::MAX),
+                _ => Some(self.next_u64()),
+            }
+        }
+
+        /// The clock step between two samples, from none at all to years.
+        fn step(&mut self) -> Duration {
+            match self.below(6) {
+                0 => Duration::ZERO,
+                1 => Duration::from_nanos(self.below(1_000)),
+                2 => Duration::from_micros(self.below(1_000)),
+                3 => Duration::from_millis(self.below(1_000)),
+                4 => Duration::from_secs(self.below(1_000)),
+                _ => Duration::from_nanos(self.next_u64()),
+            }
+        }
+
+        /// One of the seven phases of S19 §2.
+        fn phase(&mut self) -> HttpPhase {
+            match self.below(7) {
+                0 => HttpPhase::Connecting,
+                1 => HttpPhase::SendingRequest,
+                2 => HttpPhase::ReadingResponse,
+                3 => HttpPhase::Retrieving,
+                4 => HttpPhase::ConnectionLost,
+                5 => HttpPhase::Closed,
+                _ => HttpPhase::ConnectFailed,
+            }
+        }
+    }
+
+    /// Every rate S19 §2 writes is `%d.%02d KB/sec`: two decimals, digits and
+    /// a point, and never `NaN`, `inf` or `-0.00` — whatever the counters and
+    /// the clock did.
+    #[test]
+    fn the_rate_text_always_has_two_decimals_and_no_non_finite_word() {
+        let mut rng = Rng::new(0x5eed_0001);
+        for case in 0..CASES {
+            let bytes = rng.bytes();
+            let elapsed = rng.step();
+            let rate = rate_kb_per_sec(bytes, elapsed);
+            assert!(
+                rate.is_finite(),
+                "case {case}: {bytes} bytes in {elapsed:?}"
+            );
+            assert!(rate >= 0.0, "case {case}: {bytes} bytes in {elapsed:?}");
+            let text = format_rate(rate);
+            let (whole, fraction) = text.split_once('.').expect("a decimal point");
+            assert!(!whole.is_empty(), "case {case}: {text:?}");
+            assert!(
+                whole.bytes().all(|b| b.is_ascii_digit()),
+                "case {case}: {text:?}"
+            );
+            assert_eq!(fraction.len(), 2, "case {case}: {text:?}");
+            assert!(
+                fraction.bytes().all(|b| b.is_ascii_digit()),
+                "case {case}: {text:?}"
+            );
+            assert_ne!(text, "-0.00", "case {case}");
+        }
+    }
+
+    /// An astronomically large rate does not cause UB in `format_rate`.
+    ///
+    /// The previous implementation cast a potentially huge f64 directly to
+    /// `u64`, which is undefined behaviour when the value exceeds `u64::MAX`.
+    /// This test exercises the extreme corner: `u64::MAX` bytes in one
+    /// nanosecond.
+    #[test]
+    fn format_rate_handles_astronomical_rates_without_ub() {
+        let rate = rate_kb_per_sec(u64::MAX, Duration::from_nanos(1));
+        let text = format_rate(rate);
+        // The value is clamped to u64::MAX hundredths, so the whole part is
+        // u64::MAX / 100 and the fraction is u64::MAX % 100.
+        let expected_whole = u64::MAX / 100;
+        let expected_frac = u64::MAX % 100;
+        assert_eq!(
+            text,
+            format!("{expected_whole}.{expected_frac:02}"),
+            "rate text was clamped correctly"
+        );
+        // Also verify the general format invariants.
+        let (whole, fraction) = text.split_once('.').expect("a decimal point");
+        assert!(!whole.is_empty());
+        assert!(whole.bytes().all(|b| b.is_ascii_digit()));
+        assert_eq!(fraction.len(), 2);
+        assert!(fraction.bytes().all(|b| b.is_ascii_digit()));
+        assert_ne!(text, "-0.00");
+    }
+
+    /// The share is the count over the declared length, and it is a hundred
+    /// at most — for every pair of counts a `u64` can hold.
+    #[test]
+    fn the_share_is_exact_for_every_count_and_total() {
+        // 200 PB of a 1 EB body is 20%, not "done": the product used to
+        // saturate at `u64::MAX` and report a share of 100.
+        assert_eq!(
+            percent(200_000_000_000_000_000, 1_000_000_000_000_000_000),
+            20
+        );
+        assert_eq!(percent(0, 0), 0, "no total, no share");
+        assert_eq!(percent(u64::MAX, 0), 0, "no total, no share");
+        assert_eq!(percent(u64::MAX, 1), 100, "a share stops at a hundred");
+        let mut rng = Rng::new(0x5eed_0002);
+        for case in 0..CASES {
+            let bytes = rng.bytes();
+            let total = rng.bytes();
+            let expected = if total == 0 {
+                0
+            } else {
+                u128::from(bytes) * 100 / u128::from(total)
+            };
+            assert_eq!(
+                u128::from(percent(bytes, total)),
+                expected.min(100),
+                "case {case}: {bytes}/{total}"
+            );
+        }
+    }
+
+    /// The share truncates: it never rounds up, so it does not say "done"
+    /// while bytes are still missing.
+    #[test]
+    fn the_share_truncates_at_the_boundaries() {
+        let cases = [
+            (0u64, "Retrieving file (0% done)"),
+            (994, "Retrieving file (99% done)"),
+            (995, "Retrieving file (99% done)"),
+            (999, "Retrieving file (99% done)"),
+            (1000, "Retrieving file (100% done)"),
+            (1040, "Retrieving file (100% done)"),
+        ];
+        for (bytes, text) in cases {
+            let snapshot = snapshot(HttpPhase::Retrieving, bytes, Some(1000));
+            assert_eq!(phase_text(HttpPhase::Retrieving, &snapshot), text);
+        }
+        let third = snapshot(HttpPhase::Retrieving, 1, Some(3));
+        assert_eq!(
+            phase_text(HttpPhase::Retrieving, &third),
+            "Retrieving file (33% done)"
+        );
+        let two_thirds = snapshot(HttpPhase::Retrieving, 2, Some(3));
+        assert_eq!(
+            phase_text(HttpPhase::Retrieving, &two_thirds),
+            "Retrieving file (66% done)"
+        );
+    }
+
+    /// A server that declares a length of zero breaks nothing: no share to
+    /// divide by, and the counters still name the ratio the spec spells.
+    #[test]
+    fn a_declared_length_of_zero_breaks_nothing() {
+        let start = Instant::now();
+        let mut status = StreamStatus::default();
+        assert_eq!(
+            status.update(snapshot(HttpPhase::Retrieving, 0, Some(0)), start),
+            Some("Retrieving file (0% done)".to_string())
+        );
+        assert_eq!(
+            status.update(
+                snapshot(HttpPhase::Retrieving, 10, Some(0)),
+                start + Duration::from_secs(1)
+            ),
+            None,
+            "the phase did not change"
+        );
+        assert_eq!(
+            status.status(),
+            Some("Retrieving file (0% done)\n10/0 bytes read @ 0.01 KB/sec")
+        );
+    }
+
+    /// A body that is longer than the length the server declared is counted
+    /// at a hundred; the counters still name the bytes that came in.
+    #[test]
+    fn a_body_longer_than_its_total_is_counted_at_a_hundred() {
+        let start = Instant::now();
+        let mut status = StreamStatus::default();
+        assert_eq!(
+            status.update(snapshot(HttpPhase::Retrieving, 2000, Some(1000)), start),
+            Some("Retrieving file (100% done)".to_string())
+        );
+        assert_eq!(
+            status.update(
+                snapshot(HttpPhase::Retrieving, 3000, Some(1000)),
+                start + Duration::from_secs(1)
+            ),
+            None
+        );
+        assert_eq!(
+            status.status(),
+            Some("Retrieving file (100% done)\n3000/1000 bytes read @ 0.98 KB/sec")
+        );
+    }
+
+    /// Two samples at the same clock reading have no rate to report, and the
+    /// line says so instead of `inf` or `NaN`.
+    #[test]
+    fn two_samples_with_no_time_between_them_report_a_zero_rate() {
+        let start = Instant::now();
+        let mut status = StreamStatus::default();
+        status.update(snapshot(HttpPhase::Retrieving, 0, None), start);
+        status.update(snapshot(HttpPhase::Retrieving, 100_000, None), start);
+        assert_eq!(
+            status.status(),
+            Some("Retrieving file...\n100000 bytes read @ 0.00 KB/sec")
+        );
+    }
+
+    /// A count that goes back is a new transfer: its phase is reported again
+    /// and its rate starts over.
+    #[test]
+    fn a_count_that_goes_back_starts_a_fresh_transfer() {
+        let start = Instant::now();
+        let mut status = StreamStatus::default();
+        assert_eq!(
+            status.update(snapshot(HttpPhase::Retrieving, 5000, None), start),
+            Some("Retrieving file...".to_string())
+        );
+        assert_eq!(
+            status.update(
+                snapshot(HttpPhase::Retrieving, 6000, None),
+                start + Duration::from_secs(1)
+            ),
+            None,
+            "the same phase makes no new note"
+        );
+        assert_eq!(
+            status.update(
+                snapshot(HttpPhase::Retrieving, 100, None),
+                start + Duration::from_secs(2)
+            ),
+            Some("Retrieving file...".to_string()),
+            "the transfer started over, so its phase is new"
+        );
+        assert_eq!(
+            status.status(),
+            None,
+            "a new transfer has no rate before its second sample"
+        );
+        assert_eq!(
+            status.update(
+                snapshot(HttpPhase::Retrieving, 1124, None),
+                start + Duration::from_secs(3)
+            ),
+            None
+        );
+        assert_eq!(
+            status.status(),
+            Some("Retrieving file...\n1124 bytes read @ 1.00 KB/sec")
+        );
+    }
+
+    /// Every terminal phase is reported once, and its counters go with it.
+    #[test]
+    fn every_terminal_phase_is_reported_once() {
+        let start = Instant::now();
+        for phase in [
+            HttpPhase::Closed,
+            HttpPhase::ConnectionLost,
+            HttpPhase::ConnectFailed,
+        ] {
+            let mut status = StreamStatus::default();
+            status.update(snapshot(HttpPhase::Retrieving, 10, None), start);
+            let text = phase_text(phase, &snapshot(phase, 10, None));
+            assert_eq!(
+                status.update(snapshot(phase, 10, None), start + Duration::from_secs(1)),
+                Some(text.clone()),
+                "the end of the transfer is a note"
+            );
+            for tick in 2..4 {
+                assert_eq!(
+                    status.update(snapshot(phase, 10, None), start + Duration::from_secs(tick)),
+                    None,
+                    "the end of the transfer is reported once"
+                );
+            }
+            assert_eq!(
+                status.status(),
+                None,
+                "the counters exist only while the body is read"
+            );
+        }
+    }
+
+    /// A transfer that comes after a finished one starts a fresh chain: its
+    /// first phase is a note even though the last transfer already reported
+    /// that same phase.
+    #[test]
+    fn a_new_transfer_after_a_finished_one_reports_its_first_phase() {
+        let start = Instant::now();
+        let mut status = StreamStatus::default();
+        // A transfer that the user stops while the body is read: the app
+        // calls `reset` then, and the last phase it saw was `Retrieving`.
+        status.update(snapshot(HttpPhase::Retrieving, 0, None), start);
+        status.update(
+            snapshot(HttpPhase::Retrieving, 1024, None),
+            start + Duration::from_secs(1),
+        );
+        status.reset();
+        assert_eq!(status.status(), None, "a reset withdraws the status");
+        // The next transfer is on its way before the app reads it again.
+        assert_eq!(
+            status.update(
+                snapshot(HttpPhase::Retrieving, 0, None),
+                start + Duration::from_secs(2)
+            ),
+            Some("Retrieving file...".to_string()),
+            "the old chain must not suppress the new transfer"
+        );
+    }
+
+    /// A phase that came and went between two ticks is not invented.
+    #[test]
+    fn a_phase_that_came_and_went_between_two_ticks_is_not_invented() {
+        let start = Instant::now();
+        let mut status = StreamStatus::default();
+        assert_eq!(
+            status.update(snapshot(HttpPhase::Connecting, 0, None), start),
+            Some("Connecting to host...".to_string())
+        );
+        // The request and the head were over before the app read again.
+        assert_eq!(
+            status.update(
+                snapshot(HttpPhase::Retrieving, 0, None),
+                start + Duration::from_millis(16)
+            ),
+            Some("Retrieving file...".to_string()),
+            "only the phase that is still current is reported"
+        );
+    }
+
+    /// A note is made exactly when the phase changes or the transfer starts
+    /// over, it carries the text of the phase it names, and the status is the
+    /// two-line transfer display of the phase that is running.
+    #[test]
+    fn a_note_is_made_only_on_a_phase_change() {
+        let mut rng = Rng::new(0x5eed_0003);
+        for case in 0..64 {
+            let mut status = StreamStatus::default();
+            let mut now = Instant::now();
+            let mut last_phase: Option<HttpPhase> = None;
+            let mut last_bytes: Option<u64> = None;
+            for tick in 0..64 {
+                let snapshot = snapshot(rng.phase(), rng.bytes(), rng.total());
+                let backwards = last_bytes.is_some_and(|bytes| bytes > snapshot.bytes_read);
+                let changed = last_phase != Some(snapshot.phase);
+                let note = status.update(snapshot, now);
+                assert_eq!(
+                    note.is_some(),
+                    changed || backwards,
+                    "case {case}, tick {tick}: {note:?} for {snapshot:?} after {last_phase:?}/{last_bytes:?}"
+                );
+                if let Some(note) = note {
+                    assert_eq!(
+                        note,
+                        phase_text(snapshot.phase, &snapshot),
+                        "case {case}, tick {tick}: the text of the phase it names"
+                    );
+                }
+                if let Some(line) = status.status() {
+                    assert_eq!(
+                        snapshot.phase,
+                        HttpPhase::Retrieving,
+                        "case {case}, tick {tick}: counters only while the body is read"
+                    );
+                    let (head, counters) = line.split_once('\n').expect("the two-line display");
+                    assert_eq!(head, phase_text(HttpPhase::Retrieving, &snapshot));
+                    let expected = match snapshot.total {
+                        Some(total) => {
+                            format!("{}/{} bytes read @ ", snapshot.bytes_read, total)
+                        }
+                        None => format!("{} bytes read @ ", snapshot.bytes_read),
+                    };
+                    assert!(
+                        counters.starts_with(&expected),
+                        "case {case}, tick {tick}: {counters:?}"
+                    );
+                    let rate = &counters[expected.len()..];
+                    let rate = rate.strip_suffix(" KB/sec").expect("the unit");
+                    let (whole, fraction) = rate.split_once('.').expect("two decimals");
+                    assert!(
+                        whole.bytes().all(|b| b.is_ascii_digit())
+                            && fraction.len() == 2
+                            && fraction.bytes().all(|b| b.is_ascii_digit()),
+                        "case {case}, tick {tick}: {rate:?}"
+                    );
+                }
+                last_phase = Some(snapshot.phase);
+                last_bytes = Some(snapshot.bytes_read);
+                now = now.checked_add(rng.step()).unwrap_or(now);
+            }
+        }
     }
 }

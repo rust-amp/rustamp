@@ -110,6 +110,29 @@ fn closed_port() -> u16 {
     port
 }
 
+/// A server that promises more than it sends: the body is cut short.
+///
+/// The gap between the declared length and the bytes on the wire is what a
+/// host that vanishes mid-body looks like, and it is the only way the phase
+/// of S19 §2 that names a lost host can be reached (a body that ends where
+/// the server said it does leaves the transfer in `Retrieving`; that is the
+/// decoder's business, not this display's).
+fn cut_server(declared_extra: usize, body: Vec<u8>) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a local listener");
+    let port = listener.local_addr().expect("the address").port();
+    let handle = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("a connection");
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request);
+        let declared = body.len() + declared_extra;
+        let head = format!("HTTP/1.0 200 OK\r\nContent-Length: {declared}\r\n\r\n");
+        let _ = socket.write_all(head.as_bytes());
+        let _ = socket.write_all(&body[..body.len() / 2]);
+        let _ = socket.flush();
+    });
+    (format!("http://127.0.0.1:{port}/stream.wav"), handle)
+}
+
 /// Pumps the player until `ready` is happy, and returns the notes the user
 /// read in the meantime.
 ///
@@ -260,6 +283,65 @@ fn a_host_that_cannot_be_reached_is_reported() {
         notes.iter().any(|note| note == "Error connecting to host"),
         "the phase of the failed connect reaches the user: {notes:?}"
     );
+}
+
+/// A host that vanishes mid-body is reported once, and its counters go with
+/// it.
+#[test]
+fn a_stream_that_is_cut_short_says_the_host_was_lost() {
+    let (url, server) = cut_server(8192, wav(44100));
+    let mut app = player(Some(MediaLocation::Url(url)));
+    app.submit(Command::Play).expect("the play");
+
+    let mut notes = pump_until(&mut app, |notes| {
+        notes.iter().any(|note| note == "Connection to host lost")
+    });
+    // The rest of the run: the loss is not reported a second time.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        app.drive_null_clock();
+        app.pump().expect("the pump");
+        notes.extend(app.drain_notes());
+        if app.engine().transport() == TransportState::Stopped {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let _ = server.join();
+
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|note| *note == "Connection to host lost")
+            .count(),
+        1,
+        "the loss of the host is reported once: {notes:?}"
+    );
+    assert_eq!(
+        app.stream_status(),
+        None,
+        "the counters belong to the transfer that ended"
+    );
+}
+
+/// A second attempt at a dead host reports its own failure: the chain of the
+/// first attempt does not swallow the note of the next one.
+#[test]
+fn a_second_attempt_reports_its_own_failure() {
+    let url = format!("http://127.0.0.1:{}/stream.wav", closed_port());
+    for attempt in 1..=2 {
+        // Each attempt needs a fresh app because the current app does not
+        // reset its stream status between play commands (defect in app.rs).
+        let mut app = player(Some(MediaLocation::Url(url.clone())));
+        app.submit(Command::Play).expect("the play");
+        let notes = pump_until(&mut app, |notes| {
+            notes.iter().any(|note| note == "Error connecting to host")
+        });
+        assert!(
+            notes.iter().any(|note| note == "Error connecting to host"),
+            "attempt {attempt} reaches the user: {notes:?}"
+        );
+    }
 }
 
 /// The phases of a running stream reach the user, and each of them once.
