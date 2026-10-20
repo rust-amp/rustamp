@@ -9,7 +9,9 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Harness, SPEC, TONE_AMPLITUDE, TONE_HZ, WAIT, expected, pattern, track_frames};
+use common::{
+    Harness, SPEC, TONE_AMPLITUDE, TONE_HZ, WAIT, expected, finished, pattern, source, track_frames,
+};
 use rustamp_audio::EngineConfig;
 use rustamp_core::audio::{AudioSpec, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::bus::command_channel;
@@ -225,8 +227,8 @@ fn gapless_join_has_no_silence_and_no_dropped_frames() {
     );
     assert!(!left.contains(&0.0), "the seam must not contain silence");
     // The seam itself: last frame of track 1, then first frame of track 2.
-    assert_eq!(left[a as usize - 1], pattern(1, a - 1));
-    assert_eq!(left[a as usize], pattern(2, 0));
+    assert_eq!(left[a as usize - 1], finished(pattern(1, a - 1)));
+    assert_eq!(left[a as usize], finished(pattern(2, 0)));
 
     // Position continuity across the seam: the per-track position is the
     // timeline minus the track's start, so it keeps running in track 2.
@@ -703,8 +705,10 @@ fn the_preamp_reaches_the_rendered_audio() {
     };
     let (p0, left) = record_left_with_eq(eq, 1024);
     let factor = 10.0_f64.powf(-6.0 / 20.0);
-    for (got, source) in left.iter().zip(expected(1, p0, 1024)) {
-        let want = f64::from(source) * factor;
+    // The preamp runs in the chain, before the converter: the expectation is
+    // the scaled source, finished.
+    for (got, raw) in left.iter().zip(source(1, p0, 1024)) {
+        let want = f64::from(finished(raw * factor as f32));
         assert!(
             (f64::from(*got) - want).abs() < 1e-6,
             "got {got}, want {want}"
@@ -1509,9 +1513,10 @@ fn limiter_limits_hot_signal_to_ceiling_and_disabling_returns_to_bit_exact() {
         peak_disabled > ceiling,
         "unlimited signal must exceed ceiling ({peak_disabled} > {ceiling})"
     );
-    // Exact bypass: each sample is exactly 2.0 * source.
-    for (out, src) in left_disabled.iter().zip(expected(1, p0_disabled, 2048)) {
-        assert_eq!(*out, src * 2.0);
+    // Exact bypass: each sample is exactly 2.0 * source, finished by the
+    // converter's ceiling.
+    for (out, raw) in left_disabled.iter().zip(source(1, p0_disabled, 2048)) {
+        assert_eq!(*out, finished(raw * 2.0));
     }
 
     // --- Phase 3: The control round-trips back to enabled ---
@@ -1694,10 +1699,10 @@ fn the_enabled_limiter_keeps_a_gapless_join_exact_and_undelayed() {
     assert_eq!(h.engine.ring_counters(), (total, 0));
 
     let left = play_out(&mut h, total);
-    let want: Vec<f32> = expected(1, 0, a)
+    let want: Vec<f32> = source(1, 0, a)
         .into_iter()
-        .chain(expected(2, 0, b))
-        .map(|s| s * 0.5)
+        .chain(source(2, 0, b))
+        .map(|s| finished(s * 0.5))
         .collect();
     assert_eq!(left, want, "the delayed limiter output, re-aligned");
     assert_eq!(h.engine.last_track_frames(), b);
@@ -1880,7 +1885,7 @@ fn a_non_finite_sample_never_reaches_the_device() {
     let silenced = rec.iter().filter(|s| **s == 0.0).count();
     assert!(silenced > 0, "the poisoned samples are silenced");
     for (frame, pair) in rec.as_chunks::<2>().0.iter().enumerate() {
-        let want = pattern(1, frame as u64);
+        let want = finished(pattern(1, frame as u64));
         for s in pair {
             assert!(*s == 0.0 || *s == want, "frame {frame}: {s} != {want}");
         }
@@ -2076,10 +2081,10 @@ fn the_default_limiter_loses_no_tail_and_adds_no_seam_silence() {
     assert_eq!(h.engine.ring_counters(), (total, 0));
 
     let left = play_out(&mut h, total);
-    let want: Vec<f32> = expected(1, 0, a)
+    let want: Vec<f32> = source(1, 0, a)
         .into_iter()
-        .chain(expected(2, 0, b))
-        .map(|s| s * 0.5)
+        .chain(source(2, 0, b))
+        .map(|s| finished(s * 0.5))
         .collect();
     assert_eq!(
         left, want,

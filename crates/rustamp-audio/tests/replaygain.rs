@@ -30,7 +30,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{Harness, expected, pattern};
+use common::{Harness, expected, finished, pattern};
 use rustamp_audio::replaygain::{ReplayGainMode, apply_gain, effective_gain};
 use rustamp_audio::{EngineConfig, FormatConverter};
 use rustamp_core::audio::AudioSpec;
@@ -63,7 +63,9 @@ fn track_gain_scales_samples_by_the_documented_factor() {
     let (p0, left) = record_left(&mut h, 1024);
     assert_eq!(left.len(), 1024);
     for (i, got) in left.iter().enumerate() {
-        let want = pattern(1, p0 + i as u64) * factor;
+        // The ReplayGain factor runs in the chain, before the converter: the
+        // expectation is the gained source, finished.
+        let want = finished(pattern(1, p0 + i as u64) * factor);
         assert!(
             (got - want).abs() < 1e-7,
             "frame {}: got {got}, want {want}",
@@ -113,7 +115,9 @@ fn volume_balance_and_replaygain_combine_in_documented_order() {
     h.engine.poll().unwrap();
     assert_eq!(rec.len(), 2048);
     for (i, frame) in rec.as_chunks::<2>().0.iter().enumerate() {
-        let want = pattern(1, p0 + i as u64) * replay * volume;
+        // ReplayGain runs before the converter, the volume after it: the
+        // expectation is the gained source, finished, times the volume.
+        let want = finished(pattern(1, p0 + i as u64) * replay) * volume;
         assert!(
             (frame[0] - want).abs() < 1e-7,
             "left frame {}: got {}, want {want}",
@@ -137,7 +141,7 @@ fn album_mode_uses_album_gain_and_falls_back_to_track() {
         let factor = 10f32.powf(gain_db / 20.0);
         let (p0, left) = record_left(&mut h, 1024);
         for (i, got) in left.iter().enumerate() {
-            let want = pattern(1, p0 + i as u64) * factor;
+            let want = finished(pattern(1, p0 + i as u64) * factor);
             assert!(
                 (got - want).abs() < 1e-7,
                 "mode {mode:?} frame {}: got {got}, want {want}",
@@ -155,7 +159,7 @@ fn album_mode_uses_album_gain_and_falls_back_to_track() {
     let factor = 10f32.powf(-6.02 / 20.0);
     let (p0, left) = record_left(&mut h, 1024);
     for (i, got) in left.iter().enumerate() {
-        let want = pattern(1, p0 + i as u64) * factor;
+        let want = finished(pattern(1, p0 + i as u64) * factor);
         assert!(
             (got - want).abs() < 1e-7,
             "fallback frame {}: got {got}, want {want}",
@@ -189,9 +193,9 @@ fn hot_replaygain_is_held_at_the_limiter_ceiling() {
         "a +6.02 dB correction must not pass the ceiling {ceiling}: {peak}"
     );
 
-    // Control: the same track with the limiter off is the doubled pattern —
-    // the ceiling above came from the limiter, not from a quiet source or a
-    // hidden pre-attenuation.
+    // Control: the same track with the limiter off is the doubled pattern,
+    // held at full scale by the converter's ceiling — the ceiling above came
+    // from the limiter, not from a quiet source or a hidden pre-attenuation.
     h.engine.stop().unwrap();
     h.engine.set_limiter_enabled(false);
     h.engine.play_index(0).unwrap();
@@ -205,7 +209,9 @@ fn hot_replaygain_is_held_at_the_limiter_ceiling() {
         "unlimited, the boosted signal must clear the ceiling: {peak}"
     );
     for (i, got) in left.iter().enumerate() {
-        let want = pattern(1, p0 + i as u64) * factor;
+        // The boosted source, finished: the converter's ceiling holds
+        // everything above full scale at exactly 1.0.
+        let want = finished(pattern(1, p0 + i as u64) * factor);
         assert!(
             (got - want).abs() < 1e-7,
             "unlimited frame {}: got {got}, want {want}",

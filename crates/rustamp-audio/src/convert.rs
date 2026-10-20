@@ -7,8 +7,11 @@
 //! callback never resamples.
 //!
 //! * **Equal sample rates** take an exact remix path: no filter, no buffering,
-//!   no held-back frame. With equal channel counts it is a bit-exact copy,
-//!   which the engine's bit-transparency tests depend on.
+//!   no held-back frame. With equal channel counts the samples are copied bit
+//!   for bit, so an in-range signal is bit-identical to its source, which the
+//!   engine's bit-transparency tests depend on. The chain's finishing (see
+//!   below) is the only thing that can still change a sample, and only
+//!   outside the range.
 //! * **Different sample rates** go through the band-limited resampler of the
 //!   `rubato` crate (MIT OR Apache-2.0, recorded in `THIRD_PARTY.md`). It
 //!   replaces the linear interpolation this module used before, which let
@@ -22,7 +25,10 @@
 //! # What is fixed and what is chosen here
 //!
 //! Fixed by the contracts: the converter adapts to the device format (RFC 0001),
-//! the ring holds device-format audio, and an equal-rate conversion is exact.
+//! the ring holds device-format audio, and an equal-rate conversion adds no
+//! error of its own — no resampling, no filtering, no rounding. The finishing
+//! below is a level decision of the chain, not an error of the conversion, and
+//! it applies to every path alike.
 //! No spec measures the reference player's resampler; **everything below is an
 //! own engineering choice**, not 2.95 behaviour:
 //!
@@ -79,19 +85,33 @@
 //!   rubato's own state across those calls, so no frame is dropped or repeated
 //!   at a block seam.
 //! * **Precision:** the resampler runs in `f32`, the format of the whole path.
-//! * **Final ceiling (own choice).** On the resampled path every output frame
+//! * **Final ceiling (own choice).** Every sample that leaves the converter
 //!   is passed through [`finish_sample`]: non-finite samples become silence,
 //!   subnormals become zero, and anything above full scale is clamped to
-//!   `±1.0` (0 dBFS). The limiter before the converter can only promise a
-//!   *sample*-peak ceiling at its own output, and the band-limited resampler
-//!   rebuilds inter-sample peaks above it (A6 finding 3: about +2.7 dBFS on a
-//!   simple tone, more on pathological sequences). Volume and balance after
-//!   the converter only attenuate (see `gain`), so this is the last point
-//!   that can raise the level — a bound here is a bound at the device, and the
+//!   `±1.0` (0 dBFS). The finishing is the converter's single output stage
+//!   (see [`emit_device_samples`]), so the equal-rate path and the resampled
+//!   path finish alike — finding **F2** of
+//!   `docs/tasks/W14-wave-review.md` was that the equal-rate path had no
+//!   clamp at all.
+//!
+//!   Two things need it. The band-limited resampler rebuilds inter-sample
+//!   peaks above the limiter's sample-peak ceiling (A6 finding 3: about
+//!   +2.7 dBFS on a simple tone, more on pathological sequences). And the
+//!   chain itself can run above unity: a positive ReplayGain correction (up
+//!   to +51 dB per the RG spec), an equalizer preamp (+12 dB) or a stage's
+//!   own gain, with the limiter switched off. Volume and balance after the
+//!   converter only attenuate (see `gain`), so this is the last point that
+//!   can raise the level — a bound here is a bound at the device, and the
 //!   ring never holds a sample above full scale. The bound is `1.0`, not the
-//!   limiter's −0.3 dB ceiling: the limiter's ceiling is a dynamics choice, and
-//!   legitimate near-full-scale peaks must not be touched by the safety net.
-//!   The equal-rate path is untouched, so its bit-exact promise stands.
+//!   limiter's −0.3 dB ceiling: the limiter's ceiling is a dynamics choice,
+//!   and legitimate near-full-scale peaks must not be touched by the safety
+//!   net.
+//!
+//!   What the finishing costs: nothing inside the range. A finite, normal
+//!   sample within `±1.0` passes through bit for bit, so the equal-rate
+//!   path stays bit-exact for in-range input; only a sample above full
+//!   scale (a flat top at exactly `±1.0`), a subnormal (exactly `0.0`) and
+//!   a non-finite one (silence) change.
 //!
 //! # Real-time safety
 //!
@@ -438,7 +458,7 @@ impl FormatConverter {
         if self.same_rate {
             let out_capacity = out.len() / out_ch;
             let n = in_frames.min(out_capacity);
-            remix(&input[..n * in_ch], &mut out[..n * out_ch], in_ch, out_ch);
+            emit_device_samples(&input[..n * in_ch], &mut out[..n * out_ch], in_ch, out_ch);
             self.in_total += n as u64;
             return n;
         }
@@ -550,27 +570,39 @@ impl FormatConverter {
         let room = out.len() / out_ch;
         debug_assert!(n <= room, "output buffer smaller than max_out_frames");
         n = n.min(room);
-        remix(
+        // The single output stage: the channel remap and the chain's
+        // finishing, on the resampled path as on the equal-rate one.
+        emit_device_samples(
             &self.block[skip * in_ch..(skip + n) * in_ch],
             &mut out[..n * out_ch],
             in_ch,
             out_ch,
         );
-        // The final ceiling (see the module docs). This path only runs when
-        // resampling: the equal-rate path returns before reaching `run_block`
-        // and keeps its bit-exact promise for every input, including
-        // subnormals.
-        for s in &mut out[..n * out_ch] {
-            *s = finish_sample(*s);
-        }
         self.out_total += n as u64;
         n
     }
 }
 
-/// The last level decision in the chain, on the resampled path only: silence
-/// for non-finite samples, zero for subnormals, and a hard clamp at full
-/// scale. Finite in-band samples pass through bit for bit.
+/// The converter's single output stage: the channel remap, then the chain's
+/// finishing. Every sample that leaves the converter passes through here, on
+/// the equal-rate path and on the resampled path alike, so the two paths
+/// cannot drift apart again (finding **F2** of
+/// `docs/tasks/W14-wave-review.md`).
+///
+/// The finishing runs on the **device-format** samples, after the remap: the
+/// stereo-to-mono average of two hot samples is one hot sample, and it is
+/// the average that reaches the device.
+fn emit_device_samples(input: &[f32], out: &mut [f32], in_ch: usize, out_ch: usize) {
+    remix(input, out, in_ch, out_ch);
+    for sample in out.iter_mut() {
+        *sample = finish_sample(*sample);
+    }
+}
+
+/// The last level decision in the chain, on **both** conversion paths:
+/// silence for a non-finite sample, zero for a subnormal, and a hard clamp
+/// at full scale. A finite, normal sample inside the range passes through
+/// bit for bit, so the equal-rate path stays bit-exact for in-range input.
 pub(crate) fn finish_sample(x: f32) -> f32 {
     if !x.is_finite() || x.is_subnormal() {
         0.0
@@ -710,11 +742,73 @@ mod tests {
     fn same_format_is_a_bit_exact_passthrough() {
         let spec = AudioSpec::new(44100, 2);
         let mut c = FormatConverter::new(spec, spec);
-        let input = ramp(20);
+        // In-range samples: the equal-rate path copies them bit for bit.
+        let input: Vec<f32> = (0..20).map(|i| (i as f32 - 10.0) / 10.0).collect();
         let mut out = vec![0.0; c.max_out_frames(10) * 2];
         let n = c.convert(&input, &mut out);
         assert_eq!(n, 10);
         assert_eq!(&out[..20], &input[..]);
+    }
+
+    /// Finding **F2**: the equal-rate path finishes its samples like the
+    /// resampled one. A sample above full scale is clamped, a non-finite
+    /// sample is silence, a subnormal is zero, and an in-range sample is
+    /// bit-identical.
+    #[test]
+    fn the_equal_rate_path_finishes_its_samples() {
+        let spec = AudioSpec::new(48_000, 1);
+        let mut c = FormatConverter::new(spec, spec);
+        let input = vec![
+            2.0,
+            -2.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(1),
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+        ];
+        let mut out = vec![0.0; c.max_out_frames(input.len())];
+        let n = c.convert(&input, &mut out);
+        assert_eq!(n, input.len());
+        let want: [f32; 10] = [1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, -0.5, 1.0, -1.0];
+        for (i, (got, expected)) in out.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "sample {i}: {got} is not {expected}"
+            );
+        }
+    }
+
+    /// The two paths finish alike: a constant above unity comes out at
+    /// exactly full scale on the equal-rate path and on the resampled one.
+    /// The resampled path is checked on its settled middle, where the
+    /// resampler's step response has reached the input's level.
+    #[test]
+    fn both_paths_hold_a_hot_signal_at_full_scale() {
+        let hot = 4.0_f32;
+
+        let spec = AudioSpec::new(48_000, 1);
+        let mut c = FormatConverter::new(spec, spec);
+        let input = vec![hot; 64];
+        let mut out = vec![0.0; c.max_out_frames(input.len())];
+        let n = c.convert(&input, &mut out);
+        assert_eq!(n, input.len());
+        assert!(
+            out[..n].iter().all(|s| *s == 1.0),
+            "the equal-rate path must hold the hot signal at full scale"
+        );
+
+        let out = resample(44_100, 48_000, &vec![hot; 44_100], 1024);
+        assert_eq!(out.len(), 48_000);
+        let middle = settled(&out, 48_000);
+        assert!(
+            middle.iter().all(|s| *s == 1.0),
+            "the resampled path must hold the hot signal at full scale"
+        );
     }
 
     #[test]
@@ -726,6 +820,8 @@ mod tests {
             assert_eq!(c.latency_frames(), 0);
             assert_eq!(c.max_out_frames(block), block);
             let out = run(&mut c, &input, block);
+            // The noise is in range, and the finishing leaves an in-range
+            // sample alone: the path stays bit-exact for in-range input.
             assert_eq!(bits(&out), bits(&input), "block {block}");
         }
     }
@@ -733,21 +829,22 @@ mod tests {
     #[test]
     fn mono_to_stereo_duplicates() {
         let mut c = FormatConverter::new(AudioSpec::new(8000, 1), AudioSpec::new(8000, 2));
-        let input = ramp(4);
+        // In-range samples: the remap is what this test is about.
+        let input = vec![0.1, 0.2, 0.3, 0.4];
         let mut out = vec![0.0; 16];
         let n = c.convert(&input, &mut out);
         assert_eq!(n, 4);
-        assert_eq!(&out[..8], &[0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        assert_eq!(&out[..8], &[0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4]);
     }
 
     #[test]
     fn stereo_to_mono_averages() {
         let mut c = FormatConverter::new(AudioSpec::new(8000, 2), AudioSpec::new(8000, 1));
-        let input = vec![1.0, 3.0, 2.0, 4.0];
+        let input = vec![0.5, 0.25, 0.75, 0.1];
         let mut out = vec![0.0; 8];
         let n = c.convert(&input, &mut out);
         assert_eq!(n, 2);
-        assert_eq!(&out[..2], &[2.0, 3.0]);
+        assert_eq!(&out[..2], &[0.375, 0.425]);
     }
 
     /// Restated from `upsample_2x_interpolates_the_midpoint`, which pinned the
@@ -1086,15 +1183,28 @@ mod tests {
         assert!(clamped > 0, "the safety net never engaged");
     }
 
-    /// Subnormal inputs come out as silence on the resampled path (denormal
-    /// hygiene for the render thread). The equal-rate path is untouched by
-    /// `finish_sample` and keeps its bit-exact promise.
+    /// Subnormal inputs come out as silence (denormal hygiene for the
+    /// render thread). The finishing is the converter's single output stage,
+    /// so this holds on the equal-rate path as well; only the *in-range*
+    /// samples keep their bits there.
     #[test]
     fn resampled_subnormals_come_out_silent() {
         let input: Vec<f32> = noise(4096).iter().map(|s| s * 1e-40).collect();
         assert!(input.iter().all(|s| s.is_subnormal() || *s == 0.0));
         let out = resample(44_100, 48_000, &input, 1024);
         assert!(out.iter().all(|s| *s == 0.0), "subnormals must not pass");
+    }
+
+    /// The equal-rate path is finished too: a subnormal is silence there as
+    /// well.
+    #[test]
+    fn equal_rate_subnormals_come_out_silent() {
+        let spec = AudioSpec::new(48_000, 1);
+        let mut c = FormatConverter::new(spec, spec);
+        let input = vec![f32::from_bits(1), -f32::from_bits(1), 0.5];
+        let mut out = vec![0.0; c.max_out_frames(input.len())];
+        let n = c.convert(&input, &mut out);
+        assert_eq!(out[..n], [0.0, 0.0, 0.5]);
     }
 
     /// Non-finite inputs come out as silence, not as spread NaNs: one NaN

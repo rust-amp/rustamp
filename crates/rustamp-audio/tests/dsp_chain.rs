@@ -6,9 +6,9 @@
 //! Since A17 the limiter is a true-peak limiter: its 4x-oversampled sidechain
 //! estimates the reconstructed peak and limits that to the ceiling, so the
 //! band-limited resampler after it has nothing left to rebuild above full
-//! scale. The converter keeps its final `±1.0` (0 dBFS) ceiling on the
-//! resampled path as the last resort, so the ring never holds a sample above
-//! full scale.
+//! scale. The converter keeps its final `±1.0` (0 dBFS) ceiling on every
+//! path as the last resort, so the ring never holds a sample above full
+//! scale.
 //!
 //! What each test proves, and what it cannot:
 //!

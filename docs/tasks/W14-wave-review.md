@@ -52,7 +52,7 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 
 | # | Claim | Verdict | Evidence (file:line) | Smallest reproduction |
 |---|---|---|---|---|
-| C2-1 | Signals cannot reach the output device above full scale (> ±1.0) | **FALSE** | `crates/rustamp-audio/src/convert.rs:437-443` vs `555-561` | On equal-rate playback (`same_rate == true`, e.g. 44.1 kHz file to 44.1 kHz device), `convert.rs:441` calls `remix` and returns immediately without running `finish_sample` (the `clamp(-1.0, 1.0)` safety net is resampler-only). If limiter is disabled via `set_enabled(false)` or during positive ReplayGain (+51 dB) + EQ preamp (+12 dB), unclamped samples far exceeding ±1.0 enter the ring and are passed to WASAPI/CPAL. |
+| C2-1 | Signals cannot reach the output device above full scale (> ±1.0) | **FALSE** — *was false; **fixed 2026-10-20** (finding F2 below): the converter's single output stage now finishes every sample on both paths* | `crates/rustamp-audio/src/convert.rs:437-443` vs `555-561` (before the fix) | On equal-rate playback (`same_rate == true`, e.g. 44.1 kHz file to 44.1 kHz device), `convert.rs:441` called `remix` and returned immediately without running `finish_sample` (the `clamp(-1.0, 1.0)` safety net was resampler-only). With the limiter disabled via `set_enabled(false)` or during positive ReplayGain (+51 dB) + EQ preamp (+12 dB), unclamped samples far exceeding ±1.0 entered the ring and were passed to WASAPI/CPAL. |
 | C2-2 | The true-peak limiter bounds inter-sample peaks at full scale | **PARTIAL** | `crates/rustamp-dsp/src/limiter.rs:32-48`, card `A17 §5` | A17 §5 documents that the 4× polyphase FIR oversampler has an under-read of up to 0.67 dB near Nyquist (e.g. 20 kHz sine wave at 44.1 kHz). With limiter ceiling at 0 dBFS (1.0), true inter-sample peaks up to +0.67 dB (~1.08 linear) pass the limiter unattenuated and, due to C2-1, are not clamped on equal-rate paths. |
 | C2-3 | ReplayGain gain is applied once and in the correct order | **HOLDS** | `crates/rustamp-audio/src/decode.rs:677-698` | Order is verified: ReplayGain -> Equalizer -> installed DSP stages -> Limiter -> Converter -> Output ring. |
 | C2-4 | "A change [to ReplayGain mode] takes effect at the next track (or seek)" | **FALSE** | `crates/rustamp-audio/src/engine.rs:647-650` vs `crates/rustamp-audio/src/decode.rs:840-865` | `apply_seek` in `decode.rs` does not update `self.rg_gain`. Gain is only updated in `prepare_track`. Changing ReplayGain mode and seeking does not update the active gain; the track continues playing with the old gain. |
@@ -133,6 +133,54 @@ While `crates/rustamp-audio/src/decode.rs:620` currently uses `READ_FRAMES = 102
 ---
 
 ### F2 — HIGH (proven): Unclamped equal-rate path allows signals exceeding 1.0 (clipping/distortion) directly into the audio backend
+
+**Status: FIXED (2026-10-20).** The finding was correct; the equal-rate path
+had no clamp at all. The fix and the tests are in
+`crates/rustamp-audio/src/convert.rs` (the converter's single output stage)
+and `crates/rustamp-audio/src/gain_properties.rs` (the property suite). The
+RFC 0014 §4.5 non-finite policy is untouched: the sanitizer in
+`decode.rs` stays where it is, and the converter's finishing is a *later*,
+second bound on the Ok path.
+
+**Where the clamp lives now.** One place, not two: the converter's output
+stage (`convert.rs::emit_device_samples`) remaps the channels and then
+finishes every sample with `finish_sample` — non-finite ⇒ silence, subnormal
+⇒ 0, clamp to `±1.0`. The equal-rate path (`convert`) and the resampled path
+(`run_block`, which `flush` uses as well) both go through it, so the two
+paths cannot drift apart again. The finishing runs on the **device-format**
+samples, after the remap, exactly as the resampled path already did.
+
+**Why one place and not two.** The rule is a level decision of the chain, not
+a property of a path: a sample that reaches the device must be bounded
+whatever route it took. Two call sites meant two chances to forget one, and
+that is precisely what happened (the resample path had it, the equal-rate
+path did not). One output stage makes the equal-rate path and the resampled
+path *the same path* for the last step, and it keeps the resampled path's
+behaviour byte-identical (the existing resample tests are unchanged).
+
+**The bit-exactness promise, restated.** The equal-rate path is bit-exact
+**for in-range input**: a finite, normal sample within `±1.0` passes through
+bit for bit, so the engine's bit-transparency tests still hold. Outside the
+range the promise never held in the first place — an above-unity sample
+reaches the device as `±1.0` (a flat top), a subnormal as exactly `0.0`, and
+a non-finite one as silence. The module docs of `convert.rs`,
+`gain_properties.rs`, `decode.rs` and `engine.rs` now say so.
+
+**Tests (all in `rustamp-audio`):**
+
+| Test | What it pins |
+|---|---|
+| `convert::tests::the_equal_rate_path_finishes_its_samples` | the equal-rate path clamps, silences and zeroes exactly like `finish_sample` |
+| `convert::tests::both_paths_hold_a_hot_signal_at_full_scale` | a constant above unity comes out at exactly `1.0` on **both** paths |
+| `convert::tests::equal_rate_subnormals_come_out_silent` | a subnormal is silence on the equal-rate path too |
+| `convert::tests::same_format_is_a_bit_exact_passthrough` | an in-range signal is copied bit for bit |
+| `convert::tests::equal_rate_path_is_bit_exact_and_holds_nothing_back` | the same for a whole block, whatever the block size |
+| `gain_properties::paths::the_equal_rate_path_finishes_every_sample` | property: the equal-rate output is `finish_sample(input)`, bit for bit, over random finite input |
+| `gain_properties::paths::the_equal_rate_path_keeps_in_range_samples_bit_identical` | property: an in-range signal keeps its bits on the equal-rate path |
+| `gain_properties::paths::both_paths_bound_their_output` | property: a hostile input leaves nothing non-finite and nothing above full scale on either path |
+| `gain_properties::paths::both_paths_clamp_an_above_unity_signal` | property: an above-unity signal is clamped at exactly full scale on either path |
+
+**The original report (unchanged, for the record):**
 
 In `crates/rustamp-audio/src/convert.rs:437-443`:
 ```rust

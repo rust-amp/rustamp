@@ -30,8 +30,9 @@
 //!   ones the right gain.
 //!
 //! The converter's `finish_sample` is the last level decision of the chain
-//! on the resampled path: a non-finite sample becomes silence, a subnormal
-//! becomes zero, and a sample above full scale is clamped to `±1.0`.
+//! on **both** conversion paths: a non-finite sample becomes silence, a
+//! subnormal becomes zero, and a sample above full scale is clamped to
+//! `±1.0`.
 //!
 //! # The invariants
 //!
@@ -76,6 +77,13 @@
 //! * **A finite sample inside the range passes through bit for bit.**
 //! * **The finishing is monotone and idempotent**, and it never leaves a
 //!   non-finite sample behind.
+//! * **Both conversion paths finish alike.** The finishing is the
+//!   converter's single output stage, not a stage of the resampler: the
+//!   equal-rate path is finished exactly like the resampled one (finding
+//!   **F2** of `docs/tasks/W14-wave-review.md`).
+//! * **An in-range sample stays bit-identical on the equal-rate path**: the
+//!   path is a copy plus the finishing, and the finishing is a no-op inside
+//!   the range.
 //!
 //! # What is not claimed
 //!
@@ -86,10 +94,6 @@
 //!   Every property of the gain stage is therefore stated for a finite
 //!   input. The same convention holds for the DSP stages (see `rustamp-dsp`'s
 //!   property suite).
-//! * The finishing runs on the **resampled path only**; the equal-rate path
-//!   is a bit-exact copy (`crate::convert`). The missing clamp of the
-//!   equal-rate path is the open finding F2 of
-//!   `docs/tasks/W14-wave-review.md`, not a property of this suite.
 //! * The stage says nothing about a buffer whose length is not a multiple of
 //!   the channel count: the render callback always hands it whole frames.
 
@@ -643,6 +647,158 @@ mod finishing {
         assert!(
             finished.clone().any(|sample| sample.abs() == 1.0),
             "the finishing never clamped"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two conversion paths
+// ---------------------------------------------------------------------------
+
+/// The properties of the converter's two paths: they must finish their
+/// samples the same way, and the equal-rate path must stay bit-exact for
+/// in-range input.
+mod paths {
+    use super::{CASES, Rng, bits, random_finite};
+    use crate::convert::{FormatConverter, finish_sample};
+    use rustamp_core::audio::AudioSpec;
+
+    /// Run `input` through `converter` and return every output sample, the
+    /// flushed tail included.
+    fn run(converter: &mut FormatConverter, input: &[f32], channels: usize) -> Vec<f32> {
+        let frames = input.len() / channels;
+        let mut out = vec![0.0; converter.max_out_frames(frames) * channels];
+        let written = converter.convert(input, &mut out);
+        let mut tail =
+            vec![0.0; converter.max_out_frames(2 * converter.latency_frames()) * channels];
+        let tail_frames = converter.flush(&mut tail);
+        let mut all = out[..written * channels].to_vec();
+        all.extend_from_slice(&tail[..tail_frames * channels]);
+        all
+    }
+
+    /// The equal-rate path finishes every sample exactly like
+    /// [`finish_sample`]: the finishing is the converter's single output
+    /// stage, so the two paths cannot drift apart (finding **F2** of
+    /// `docs/tasks/W14-wave-review.md`).
+    #[test]
+    fn the_equal_rate_path_finishes_every_sample() {
+        let mut rng = Rng::new(0x2A7A_0001);
+        let spec = AudioSpec::new(44_100, 2);
+        for _ in 0..CASES {
+            let frames = 1 + rng.index(16);
+            let samples = frames * 2;
+            let input: Vec<f32> = (0..samples).map(|_| random_finite(&mut rng)).collect();
+            let mut converter = FormatConverter::new(spec, spec);
+            let out = run(&mut converter, &input, 2);
+            assert_eq!(out.len(), samples);
+            for (i, (got, want)) in out.iter().zip(input.iter()).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    finish_sample(*want).to_bits(),
+                    "sample {i}: {got} is not the finished {want}"
+                );
+            }
+        }
+    }
+
+    /// An in-range sample stays bit-identical on the equal-rate path: the
+    /// path is a copy plus the finishing, and the finishing is a no-op
+    /// inside the range.
+    #[test]
+    fn the_equal_rate_path_keeps_in_range_samples_bit_identical() {
+        let mut rng = Rng::new(0x2A7A_0002);
+        let spec = AudioSpec::new(44_100, 2);
+        for _ in 0..CASES {
+            let frames = 1 + rng.index(16);
+            let samples = frames * 2;
+            let mut input: Vec<f32> = (0..samples).map(|_| rng.range(-1.0, 1.0)).collect();
+            // The edges of the range belong to it as well.
+            for (i, edge) in [0.0_f32, -0.0, 1.0, -1.0].into_iter().enumerate() {
+                if let Some(slot) = input.get_mut(i * 3) {
+                    *slot = edge;
+                }
+            }
+            assert!(input.iter().all(|s| s.is_finite() && !s.is_subnormal()));
+            let mut converter = FormatConverter::new(spec, spec);
+            let out = run(&mut converter, &input, 2);
+            assert_eq!(bits(&out), bits(&input), "an in-range signal is a copy");
+        }
+    }
+
+    /// Both paths bound their output: a hostile input (a NaN, an infinity, a
+    /// sample far above full scale) leaves nothing non-finite and nothing
+    /// above full scale behind, on the equal-rate path and on the resampled
+    /// one alike.
+    #[test]
+    fn both_paths_bound_their_output() {
+        let mut rng = Rng::new(0x2A7A_0003);
+        for _ in 0..CASES {
+            let frames = 1 + rng.index(16);
+            let samples = frames * 2;
+            let mut input: Vec<f32> = (0..samples).map(|_| rng.range(-4.0, 4.0)).collect();
+            // The hostile values are spread over the stream, so that none of
+            // them is cut away by the resampler's start-up delay.
+            for (i, hostile) in [
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                1e30,
+                -1e30,
+                f32::from_bits(1),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let Some(slot) = input.get_mut(i * 5) {
+                    *slot = hostile;
+                }
+            }
+
+            let spec = AudioSpec::new(44_100, 2);
+            let mut equal_rate = FormatConverter::new(spec, spec);
+            let out = run(&mut equal_rate, &input, 2);
+            for (i, sample) in out.iter().enumerate() {
+                assert!(sample.is_finite(), "sample {i} left as {sample}");
+                assert!(sample.abs() <= 1.0, "sample {i} left as {sample}");
+            }
+
+            let dst = AudioSpec::new(48_000, 2);
+            let mut resampled = FormatConverter::new(spec, dst);
+            let out = run(&mut resampled, &input, 2);
+            for (i, sample) in out.iter().enumerate() {
+                assert!(sample.is_finite(), "sample {i} left as {sample}");
+                assert!(sample.abs() <= 1.0, "sample {i} left as {sample}");
+            }
+        }
+    }
+
+    /// An above-unity signal is clamped to exactly full scale on both paths:
+    /// the equal-rate path has no resampler to hide behind, and the
+    /// resampled path has the same finishing.
+    #[test]
+    fn both_paths_clamp_an_above_unity_signal() {
+        let hot = 4.0_f32;
+
+        let spec = AudioSpec::new(48_000, 1);
+        let mut equal_rate = FormatConverter::new(spec, spec);
+        let out = run(&mut equal_rate, &vec![hot; 64], 1);
+        assert_eq!(out.len(), 64);
+        assert!(
+            out.iter().all(|s| *s == 1.0),
+            "the equal-rate path must clamp at full scale"
+        );
+
+        // The resampled path is checked on its settled middle, where the
+        // resampler's step response has reached the input's level.
+        let mut resampled =
+            FormatConverter::new(AudioSpec::new(44_100, 1), AudioSpec::new(48_000, 1));
+        let out = run(&mut resampled, &vec![hot; 44_100], 1);
+        assert_eq!(out.len(), 48_000);
+        let middle = &out[12_000..36_000];
+        assert!(
+            middle.iter().all(|s| *s == 1.0),
+            "the resampled path must clamp at full scale"
         );
     }
 }
