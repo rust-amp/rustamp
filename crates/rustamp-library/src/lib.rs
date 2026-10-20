@@ -196,11 +196,17 @@
 //! ## Tag writing
 //!
 //! [`Library::write_tags`] edits the tags of an indexed track. The values
-//! are written into the **real file** with [`rustamp_meta::write_tags`],
-//! which replaces the file atomically: after the call the file is either the
-//! old one or the new one, never a half-written mixture. A field that is
-//! `None` is left as the file has it (the `rustamp-meta` contract), so one
-//! field can be edited without the others being lost.
+//! are written into the **real file** with the `rustamp-meta` writer
+//! ([`rustamp_meta::write_tags_with_report`]), which replaces the file
+//! atomically: after the call the file is either the old one or the new
+//! one, never a half-written mixture. A field that is `None` is left as the
+//! file has it (the `rustamp-meta` contract), so one field can be edited
+//! without the others being lost.
+//!
+//! [`Library::write_tags_with`] is the same write with the **removals**: a
+//! field of the removal list ([`TagField`]) is taken out of the file, while
+//! a field that is `None` in the metadata keeps the value the file has. A
+//! removal wins over a value: a field that is in both is removed.
 //!
 //! The row is then rebuilt from the file: the tags are **read back** after
 //! the write and it is *those* values that land in the index, never the
@@ -216,6 +222,20 @@
 //! between the scan and the write is an error ([`Error::NotFound`]) and not
 //! a silent row update: the index must not describe a file that is not
 //! there any more.
+//!
+//! ## What the format refused
+//!
+//! The writer only writes the *primary* tag of a file. A value in a second
+//! tag - an ID3v1 tag next to an ID3v2 tag, the `RIFF INFO` of a WAV, the
+//! text chunks of an AIFF - is not written and stays in the file, so a
+//! removal of that value does not take it out of the file.
+//!
+//! [`Library::write_tags_with`] says so: the [`WriteReport`] of its
+//! [`TagWrite`] names every removal the file still carries
+//! ([`WriteReport::unremoved`]), and the row shows the value the file still
+//! has. A caller that only looks at the row cannot tell a removed value
+//! from a value that survived - which is why the report is part of the
+//! result.
 //!
 //! ## Artwork cache
 //!
@@ -291,9 +311,10 @@
 //! * A cancelled scan drops the batch that was in flight (at most
 //!   [`SCAN_BATCH_SIZE`] files of work). The files it dropped are indexed
 //!   by the next scan.
-//! * A tag write cannot ask for a field to be removed: `write_tags` reads a
-//!   `None` as "leave the value the file has" (the `rustamp-meta`
-//!   contract).
+//! * A removal reaches the primary tag of the file only. A value in a
+//!   second tag (an ID3v1 next to an ID3v2, the `RIFF INFO` of a WAV)
+//!   survives it, and the write report names it
+//!   ([`WriteReport::unremoved`]).
 //! * The artwork cache notices a changed file through its stat, like the
 //!   index does: a rewrite that keeps both the size and the modification
 //!   time keeps the old cover. The same holds for a sidecar image.
@@ -327,6 +348,10 @@ pub use artwork::{
     ArtworkCache, ArtworkCacheStats, CoverImage, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
     MAX_DECODE_BYTES, SIDECAR_NAMES, THUMBNAIL_MAX_EDGE,
 };
+// The types of a tag write are part of this crate's own surface: a caller
+// names the fields it wants removed and reads the report of the write
+// without depending on `rustamp-meta` itself.
+pub use rustamp_meta::{TagField, WriteReport};
 
 /// The column list shared by every row-returning statement, in the order
 /// [`read_raw`] expects.
@@ -470,6 +495,20 @@ pub struct RemoveReport {
     ///
     /// The paths are sorted, so the list is the same for the same index.
     pub kept_unreadable: Vec<PathBuf>,
+}
+
+/// The outcome of a tag write: the refreshed row and what the format refused.
+///
+/// The row is what the **file** says after the write, never what the caller
+/// asked for (see [`Library::write_tags_with`]). The report names the
+/// values the target format could not take out of the file: a removal that
+/// the format refused is in [`WriteReport::unremoved`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagWrite {
+    /// The row, rebuilt from the file after the write.
+    pub row: TrackRow,
+    /// What the target tag format could not do.
+    pub report: WriteReport,
 }
 
 /// How many considered files a scan commits in one transaction.
@@ -844,12 +883,17 @@ impl Library {
     /// Write `metadata` into the tags of the indexed track `id` and refresh
     /// the row from the file.
     ///
+    /// This is the write without removals: a field that is `None` in
+    /// `metadata` is left as the file has it (the `rustamp-meta` contract),
+    /// so one field can be edited without losing the others. A caller that
+    /// wants a field to *go away* uses [`Library::write_tags_with`]; a
+    /// caller that wants to know which values the format refused uses it
+    /// too, with an empty removal list.
+    ///
     /// The values are written into the **real file** with
-    /// [`rustamp_meta::write_tags`], which replaces it atomically: after the
-    /// call the file is either the old one or the new one, never a
-    /// half-written mixture. A field that is `None` in `metadata` is left as
-    /// the file has it (the `rustamp-meta` contract), so one field can be
-    /// edited without losing the others.
+    /// [`rustamp_meta::write_tags_with_report`], which replaces it
+    /// atomically: after the call the file is either the old one or the new
+    /// one, never a half-written mixture.
     ///
     /// The row is then rebuilt from the file: the tags are **read back**
     /// after the write, and it is *those* values that land in the index,
@@ -879,6 +923,58 @@ impl Library {
     /// the row is then stale, and the next scan repairs it, because the
     /// file's stat no longer matches the stored one.
     pub fn write_tags(&mut self, id: i64, metadata: &TrackMetadata) -> Result<TrackRow> {
+        self.write_tags_with(id, metadata, &[])
+            .map(|write| write.row)
+    }
+
+    /// Write `metadata` into the tags of the indexed track `id`, remove the
+    /// fields of `removals` and refresh the row from the file.
+    ///
+    /// This is [`Library::write_tags`] with the removals: a field of
+    /// `metadata` that is `None` keeps the value the file has, and a field
+    /// of `removals` ([`TagField`]) is taken out of the file. A removal wins
+    /// over a value: a field that is in both is removed.
+    ///
+    /// The write is the atomic one of the `rustamp-meta` writer
+    /// ([`rustamp_meta::write_tags_with_report`]): after the call the file
+    /// is either the old one or the new one, never a half-written mixture.
+    ///
+    /// The row is then rebuilt from the file: the tags are **read back**
+    /// after the write, and it is *those* values that land in the index,
+    /// never the values the caller passed in. A format that stores a value
+    /// differently, or cannot store it at all, therefore shows up in the
+    /// index as the file really is.
+    ///
+    /// ## What the format refused
+    ///
+    /// The writer only writes the *primary* tag of the file. A value in a
+    /// second tag - an ID3v1 tag next to an ID3v2 tag, the `RIFF INFO` of a
+    /// WAV, the text chunks of an AIFF - is not written and stays in the
+    /// file, so a removal of that value does not take it out of the file.
+    /// The returned [`TagWrite`] names every removal that is in that state
+    /// ([`WriteReport::unremoved`]), and the row carries the value the file
+    /// still has.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::NotFound`] if no row has the id `id`, or if the file the
+    ///   row points at is gone. A file that vanished between the scan and
+    ///   the write is reported, never written into the row silently.
+    /// * The error of the write itself: an unreadable file, a format whose
+    ///   tags cannot be written, a year a tag cannot hold.
+    /// * The error of reading the tags back, if the written file cannot be
+    ///   read any more.
+    ///
+    /// A failed write leaves the row exactly as it was. A write that
+    /// succeeded but could not be read back leaves the row as it was, too:
+    /// the row is then stale, and the next scan repairs it, because the
+    /// file's stat no longer matches the stored one.
+    pub fn write_tags_with(
+        &mut self,
+        id: i64,
+        metadata: &TrackMetadata,
+        removals: &[TagField],
+    ) -> Result<TagWrite> {
         let row = self
             .get(id)?
             .ok_or_else(|| Error::NotFound(format!("track {id}")))?;
@@ -891,7 +987,10 @@ impl Library {
             return Err(Error::NotFound(path.display().to_string()));
         }
 
-        rustamp_meta::write_tags(&path, metadata)?;
+        // The report says what the format refused: a removal the file
+        // still carries in a second tag, an `extra` entry the target format
+        // has no field for.
+        let report = rustamp_meta::write_tags_with_report(&path, metadata, removals)?;
 
         // What the file says now, not what the caller asked for.
         let tags = rustamp_meta::read_tags(&path)?;
@@ -910,8 +1009,10 @@ impl Library {
         let row_id = upsert_row(&tx, &path, &tags, mtime_ns, size)?;
         tx.commit().map_err(map_sqlite)?;
 
-        self.get(row_id)?
-            .ok_or_else(|| Error::NotFound(format!("track {row_id}")))
+        let row = self
+            .get(row_id)?
+            .ok_or_else(|| Error::NotFound(format!("track {row_id}")))?;
+        Ok(TagWrite { row, report })
     }
 
     // ---- roots ----
@@ -1804,6 +1905,55 @@ mod tests {
         buf.extend_from_slice(&0u32.to_le_bytes());
         let mut f = File::create(path).unwrap();
         f.write_all(&buf).unwrap();
+    }
+
+    /// A WAV file with a RIFF `LIST INFO` chunk.
+    ///
+    /// The chunk is a **second** tag: the writer writes the ID3v2 chunk of
+    /// a WAV and leaves the `INFO` chunk alone, so a value the `INFO` chunk
+    /// holds survives a removal.
+    fn make_wav_with_info(path: &Path, title: &str, artist: &str) {
+        /// A RIFF chunk: the id, the size, the data, padded to an even size.
+        fn chunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(8 + data.len() + 1);
+            out.extend_from_slice(id);
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                out.push(0);
+            }
+            out
+        }
+
+        // The `fmt ` chunk: 8-bit mono PCM.
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // mono
+        fmt.extend_from_slice(&44100u32.to_le_bytes()); // sample rate
+        fmt.extend_from_slice(&44100u32.to_le_bytes()); // byte rate
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // block align
+        fmt.extend_from_slice(&8u16.to_le_bytes()); // bits per sample
+
+        // The `LIST INFO` chunk: the title and the artist.
+        let mut info = b"INFO".to_vec();
+        let mut inam = title.as_bytes().to_vec();
+        inam.push(0);
+        let mut iart = artist.as_bytes().to_vec();
+        iart.push(0);
+        info.extend_from_slice(&chunk(b"INAM", &inam));
+        info.extend_from_slice(&chunk(b"IART", &iart));
+
+        let mut body = b"WAVE".to_vec();
+        body.extend_from_slice(&chunk(b"fmt ", &fmt));
+        body.extend_from_slice(&chunk(b"data", &[0u8; 16]));
+        body.extend_from_slice(&chunk(b"LIST", &info));
+
+        let mut file = b"RIFF".to_vec();
+        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        file.extend_from_slice(&body);
+
+        let mut f = File::create(path).unwrap();
+        f.write_all(&file).unwrap();
     }
 
     /// Writes a title/artist/album fixture into `path`. Named apart from
@@ -3016,6 +3166,108 @@ mod tests {
             Some("1.50 dB"),
             "the extra tag survived the write"
         );
+    }
+
+    // ---- tag removal ----
+
+    #[test]
+    fn a_removal_clears_the_tag_and_the_row_follows_the_file() {
+        let (_dir, mut lib, path, before) = library_with_one_track();
+
+        // Nothing is written, one field is removed.
+        let write = lib
+            .write_tags_with(before.id, &TrackMetadata::default(), &[TagField::Title])
+            .unwrap();
+
+        // The row is what the file says: the title is gone.
+        assert_eq!(write.row.metadata.title, None);
+        assert_eq!(rustamp_meta::read_tags(&path).unwrap().title, None);
+
+        // The fields the removal did not name keep their value: a `None`
+        // still means "leave the value the file has".
+        assert_eq!(write.row.metadata.artist.as_deref(), Some("Artist X"));
+        assert_eq!(write.row.metadata.album.as_deref(), Some("Album 1"));
+        assert_eq!(write.row.metadata.genre.as_deref(), Some("Rock"));
+
+        // The id is the one the row had, and the stored row is the one the
+        // write returned.
+        assert_eq!(write.row.id, before.id, "stable id preserved");
+        assert_eq!(lib.get(before.id).unwrap().unwrap(), write.row);
+
+        // The format had nothing to refuse.
+        assert!(write.report.unremoved.is_empty());
+        assert!(write.report.is_complete());
+    }
+
+    #[test]
+    fn a_value_in_a_second_tag_is_reported_as_not_removed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.wav");
+        // The `INFO` chunk is a second tag: the writer writes the ID3v2
+        // chunk and leaves the `INFO` chunk alone.
+        make_wav_with_info(&path, "Info Title", "Info Artist");
+        write_fixture_tags(&path, "Id3 Title", "Artist X", "Album 1");
+
+        let mut lib = Library::in_memory().unwrap();
+        lib.scan(dir.path()).unwrap();
+        let before = only_row(&lib);
+        assert_eq!(before.metadata.title.as_deref(), Some("Id3 Title"));
+
+        let write = lib
+            .write_tags_with(before.id, &TrackMetadata::default(), &[TagField::Title])
+            .unwrap();
+
+        // The title of the ID3v2 tag is gone, but the file still carries the
+        // value in the tag the writer does not touch: the report says so.
+        assert_eq!(write.report.unremoved, vec![TagField::Title]);
+        assert!(!write.report.is_complete());
+
+        // The row follows the file, so it still shows the value the file
+        // carries.
+        assert_eq!(write.row.metadata.title.as_deref(), Some("Info Title"));
+        assert_eq!(
+            rustamp_meta::read_tags(&path).unwrap().title.as_deref(),
+            Some("Info Title")
+        );
+    }
+
+    #[test]
+    fn a_failed_removal_leaves_the_row_unchanged() {
+        let (_dir, mut lib, path, before) = library_with_one_track();
+
+        // A year no tag can hold: the write is refused before the file is
+        // opened, so neither the file nor the row changes.
+        let mut edited = before.metadata.clone();
+        edited.title = Some("Song A2".to_owned());
+        edited.year = Some(70_000);
+        let error = lib
+            .write_tags_with(before.id, &edited, &[TagField::Artist])
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+
+        let after = only_row(&lib);
+        assert_eq!(after, before, "the row is untouched");
+        let on_disk = rustamp_meta::read_tags(&path).unwrap();
+        assert_eq!(on_disk.title.as_deref(), Some("Song A"));
+        assert_eq!(on_disk.artist.as_deref(), Some("Artist X"));
+    }
+
+    #[test]
+    fn a_removal_to_a_vanished_file_is_reported() {
+        let (_dir, mut lib, path, before) = library_with_one_track();
+
+        // The file is gone between the scan and the write.
+        fs::remove_file(&path).unwrap();
+
+        let error = lib
+            .write_tags_with(before.id, &TrackMetadata::default(), &[TagField::Title])
+            .unwrap_err();
+        assert!(matches!(error, Error::NotFound(_)), "{error:?}");
+
+        // The row is not updated with values no file has.
+        let after = only_row(&lib);
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.metadata.title.as_deref(), Some("Song A"));
     }
 
     // ---- scan progress and cancellation ----
