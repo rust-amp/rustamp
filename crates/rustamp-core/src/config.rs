@@ -222,13 +222,20 @@ pub struct PluginsConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn toml_roundtrip() {
-        // Sets EVERY field of EVERY configuration type to a non-default value
-        // and asserts that the loaded configuration equals the written one.
-        // Exhaustive struct literals ensure at compile time that no field can
-        // ever be added to any config struct without being tested here.
-        let c = Config {
+    /// A configuration in which **every** field of **every** configuration
+    /// type carries a value that differs from the default.
+    ///
+    /// Two properties make this the fixture of the round trip below:
+    ///
+    /// * The struct literals are exhaustive, so a new field cannot be added
+    ///   to a configuration struct without this function failing to compile.
+    /// * Every value differs from the default, so a field the serialization
+    ///   drops cannot hide behind the value the loader falls back to.
+    ///
+    /// The window list covers every `WindowId` variant (including
+    /// `Gen(n)` and `Video`) and both a sized and an unsized window.
+    fn every_field_set() -> Config {
+        Config {
             version: 42,
             audio: AudioConfig {
                 output: "cpal".into(),
@@ -324,10 +331,155 @@ mod tests {
                 vis_preset: Some("preset_1.milk".into()),
                 disabled: vec!["vis_x.dll".into(), "bad_dsp.dll".into()],
             },
-        };
+        }
+    }
+
+    /// The premise of the round trip, made checkable: every field of the
+    /// fixture differs from its default.
+    ///
+    /// A field that stayed at its default could not be distinguished from a
+    /// field the serialization drops, because the loader falls back to
+    /// exactly that default. The guard makes the premise a fact instead of
+    /// an assumption, and it fails loudly when a default changes under the
+    /// fixture.
+    #[test]
+    fn every_field_of_the_configuration_differs_from_its_default() {
+        let c = every_field_set();
+        let d = Config::default();
+
+        assert_ne!(c.version, d.version, "version");
+        assert_ne!(c.audio.output, d.audio.output, "audio.output");
+        assert_ne!(c.audio.device, d.audio.device, "audio.device");
+        assert_ne!(
+            c.audio.output_mode, d.audio.output_mode,
+            "audio.output_mode"
+        );
+        assert_ne!(c.audio.buffer_ms, d.audio.buffer_ms, "audio.buffer_ms");
+        assert_ne!(c.audio.fadeout_ms, d.audio.fadeout_ms, "audio.fadeout_ms");
+        assert_ne!(c.audio.gapless, d.audio.gapless, "audio.gapless");
+        assert_ne!(c.audio.replaygain, d.audio.replaygain, "audio.replaygain");
+        assert_ne!(c.audio.volume, d.audio.volume, "audio.volume");
+        assert_ne!(c.audio.balance, d.audio.balance, "audio.balance");
+
+        assert_ne!(c.ui.skin, d.ui.skin, "ui.skin");
+        assert_ne!(c.ui.double_size, d.ui.double_size, "ui.double_size");
+        assert_ne!(c.ui.always_on_top, d.ui.always_on_top, "ui.always_on_top");
+        assert_ne!(c.ui.easy_move, d.ui.easy_move, "ui.easy_move");
+        assert_ne!(c.ui.snap_distance, d.ui.snap_distance, "ui.snap_distance");
+        assert_ne!(c.ui.windows, d.ui.windows, "ui.windows");
+
+        assert_ne!(c.eq.state.bands, d.eq.state.bands, "eq.state.bands");
+        assert_ne!(c.eq.state.preamp, d.eq.state.preamp, "eq.state.preamp");
+        assert_ne!(c.eq.state.enabled, d.eq.state.enabled, "eq.state.enabled");
+        assert_ne!(c.eq.state.auto, d.eq.state.auto, "eq.state.auto");
+
+        assert_ne!(c.playlist.shuffle, d.playlist.shuffle, "playlist.shuffle");
+        assert_ne!(c.playlist.repeat, d.playlist.repeat, "playlist.repeat");
+        assert_ne!(
+            c.playlist.manual_advance, d.playlist.manual_advance,
+            "playlist.manual_advance"
+        );
+        assert_ne!(
+            c.playlist.last_playlist, d.playlist.last_playlist,
+            "playlist.last_playlist"
+        );
+
+        assert_ne!(
+            c.plugins.plugin_dir, d.plugins.plugin_dir,
+            "plugins.plugin_dir"
+        );
+        assert_ne!(
+            c.plugins.vis_plugin, d.plugins.vis_plugin,
+            "plugins.vis_plugin"
+        );
+        assert_ne!(
+            c.plugins.vis_preset, d.plugins.vis_preset,
+            "plugins.vis_preset"
+        );
+        assert_ne!(c.plugins.disabled, d.plugins.disabled, "plugins.disabled");
+    }
+
+    #[test]
+    fn toml_roundtrip() {
+        let c = every_field_set();
         let s = toml::to_string(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
-        assert_eq!(c, back);
+
+        // Field by field, so a failure names the field that broke. The
+        // whole-struct comparison below is the second, independent check.
+        assert_eq!(c.version, back.version, "version");
+        assert_eq!(c.audio.output, back.audio.output, "audio.output");
+        assert_eq!(c.audio.device, back.audio.device, "audio.device");
+        assert_eq!(
+            c.audio.output_mode, back.audio.output_mode,
+            "audio.output_mode"
+        );
+        assert_eq!(c.audio.buffer_ms, back.audio.buffer_ms, "audio.buffer_ms");
+        assert_eq!(
+            c.audio.fadeout_ms, back.audio.fadeout_ms,
+            "audio.fadeout_ms"
+        );
+        assert_eq!(c.audio.gapless, back.audio.gapless, "audio.gapless");
+        assert_eq!(
+            c.audio.replaygain, back.audio.replaygain,
+            "audio.replaygain"
+        );
+        assert_eq!(c.audio.volume, back.audio.volume, "audio.volume");
+        assert_eq!(c.audio.balance, back.audio.balance, "audio.balance");
+
+        assert_eq!(c.ui.skin, back.ui.skin, "ui.skin");
+        assert_eq!(c.ui.double_size, back.ui.double_size, "ui.double_size");
+        assert_eq!(
+            c.ui.always_on_top, back.ui.always_on_top,
+            "ui.always_on_top"
+        );
+        assert_eq!(c.ui.easy_move, back.ui.easy_move, "ui.easy_move");
+        assert_eq!(
+            c.ui.snap_distance, back.ui.snap_distance,
+            "ui.snap_distance"
+        );
+        assert_eq!(c.ui.windows, back.ui.windows, "ui.windows");
+
+        assert_eq!(c.eq.state.bands, back.eq.state.bands, "eq.state.bands");
+        assert_eq!(c.eq.state.preamp, back.eq.state.preamp, "eq.state.preamp");
+        assert_eq!(
+            c.eq.state.enabled, back.eq.state.enabled,
+            "eq.state.enabled"
+        );
+        assert_eq!(c.eq.state.auto, back.eq.state.auto, "eq.state.auto");
+
+        assert_eq!(
+            c.playlist.shuffle, back.playlist.shuffle,
+            "playlist.shuffle"
+        );
+        assert_eq!(c.playlist.repeat, back.playlist.repeat, "playlist.repeat");
+        assert_eq!(
+            c.playlist.manual_advance, back.playlist.manual_advance,
+            "playlist.manual_advance"
+        );
+        assert_eq!(
+            c.playlist.last_playlist, back.playlist.last_playlist,
+            "playlist.last_playlist"
+        );
+
+        assert_eq!(
+            c.plugins.plugin_dir, back.plugins.plugin_dir,
+            "plugins.plugin_dir"
+        );
+        assert_eq!(
+            c.plugins.vis_plugin, back.plugins.vis_plugin,
+            "plugins.vis_plugin"
+        );
+        assert_eq!(
+            c.plugins.vis_preset, back.plugins.vis_preset,
+            "plugins.vis_preset"
+        );
+        assert_eq!(
+            c.plugins.disabled, back.plugins.disabled,
+            "plugins.disabled"
+        );
+
+        assert_eq!(c, back, "the whole configuration survives the round trip");
     }
 
     #[test]
