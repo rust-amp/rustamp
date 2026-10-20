@@ -2262,8 +2262,28 @@ impl App {
         }
     }
 
+    /// Whether the headless run may announce a track: the track must be
+    /// **open**.
+    ///
+    /// The transport is not the signal. The engine sets the transport when
+    /// the run starts, a moment before the decode thread has opened the
+    /// file, so the transport would announce a file that never plays — and
+    /// the report would depend on how fast the decode thread came up. The
+    /// engine's own "a track is open" signal is the decoder's format, which
+    /// is known exactly when the track opened.
+    fn headless_track_open(&self) -> bool {
+        self.engine.source_spec().is_some()
+    }
+
     /// Plays the queue to its end (or to `--seconds`) on a virtual device whose
     /// clock this loop drives in real time. No window is opened.
+    ///
+    /// The run is announced when the track is **open**, not when the transport
+    /// says `Playing`: the engine sets the transport when the run starts, a
+    /// moment before the decode thread has opened the file. A file that cannot
+    /// be opened would then be announced as playing, and the report would
+    /// depend on how fast the decode thread came up (see
+    /// [`App::headless_track_open`]).
     pub fn run_headless(&mut self) -> Result<()> {
         if self.engine.queue().is_empty() {
             println!("rustamp: no input file; nothing to play");
@@ -2294,7 +2314,12 @@ impl App {
             self.pump()?;
             frames_played = frames_played.max(self.engine.timeline_frames());
 
-            if !announced && self.engine.transport() == TransportState::Playing {
+            // The run is announced when the track is open, not when the
+            // transport says `Playing`. The transport is set when the run
+            // starts, before the decode thread has opened the file, so the
+            // transport would announce a file that never plays — and the
+            // report would depend on how fast the decode thread came up.
+            if !announced && self.headless_track_open() {
                 announced = true;
                 println!("rustamp: playing {}", self.engine.queue()[0].display());
             }
@@ -7487,5 +7512,52 @@ mod tests {
         assert!(!app.engine().is_stream_lost());
         assert!(!clock.is_failed(), "the reopen cleared the device latch");
         assert_eq!(app.engine().transport(), TransportState::Playing);
+    }
+
+    // ----- the headless run's report -----
+
+    /// The headless run announces a track only when the track is **open**.
+    ///
+    /// The transport is the wrong signal: the engine sets it when the run
+    /// starts, a moment before the decode thread has opened the file. A file
+    /// that cannot be opened would then be announced as playing, and the
+    /// report would depend on how fast the decode thread came up — the race
+    /// this test pins. The rule is checked here, in the crate, so it is
+    /// decided by a fact and not by a timing.
+    #[test]
+    fn a_track_that_never_opened_is_not_announced() {
+        // The real registry: the test registry opens every file it is given,
+        // so it cannot produce a file that fails to open.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-written.flac");
+        let options = AppOptions {
+            config: Config::default(),
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            file: Some(missing),
+            seconds: None,
+        };
+        let mut app = App::new(options).unwrap();
+
+        // The run starts: the transport says `Playing` right away, before
+        // the decode thread has opened anything. That is the intermediate
+        // state the report must not follow.
+        app.submit(Command::Play).unwrap();
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+        assert!(
+            !app.headless_track_open(),
+            "a file that has not opened must not be announced"
+        );
+
+        // The decode thread's error arrives; the track never opened.
+        assert!(
+            pump_until(&mut app, |app| app.engine().last_error().is_some(), 2_000),
+            "the missing file must fail the run"
+        );
+        assert!(
+            !app.headless_track_open(),
+            "a file that failed to open must never be announced"
+        );
     }
 }

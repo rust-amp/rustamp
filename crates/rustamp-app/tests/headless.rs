@@ -230,6 +230,23 @@ fn an_unknown_slash_token_is_a_file_argument() {
         !stderr.contains("unknown option"),
         "an unknown `/` token must not be refused:\n{stderr}"
     );
+    // The outcome the token leads to: the token was taken as a file
+    // argument, so the run tried to open it and failed with the file's own
+    // error. The **exit** is the outcome — the transport's state while the
+    // run starts is not: the engine sets it before the decode thread has
+    // opened the file, so it says `Playing` for a file that never plays.
+    assert!(
+        !output.status.success(),
+        "the run must fail on the file the token names:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("I/O error"),
+        "the failure must be the file that does not exist:\n{stderr}"
+    );
+    // Nothing plays: the file never opened, so the run never announced a
+    // track. The announcement follows the opened track, not the transport
+    // (see `App::run_headless`), so this is a fact about the run and not a
+    // race with the decode thread.
     assert!(!stdout.contains("playing"), "stdout:\n{stdout}");
 }
 
