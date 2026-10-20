@@ -261,20 +261,20 @@ fn a_connection_dropped_mid_body_is_a_loud_failure() {
     );
 }
 
-/// `https` is refused by name: there is no TLS in this tree.
+/// `ftp` is refused by name: this source reads `http://` and `https://`.
 #[test]
-fn https_is_refused_by_name() {
-    let err = HttpDecoder::open("https://example.invalid/a.mp3").expect_err("https is not read");
+fn ftp_is_refused_by_name() {
+    let err = HttpDecoder::open("ftp://example.invalid/a.mp3").expect_err("ftp is not read");
     match err {
-        HttpError::UnsupportedScheme { ref scheme } => assert_eq!(scheme, "https"),
+        HttpError::UnsupportedScheme { ref scheme } => assert_eq!(scheme, "ftp"),
         other => panic!("unexpected {other:?}"),
     }
-    let message = HttpDecoder::open("https://example.invalid/a.mp3")
-        .expect_err("https is not read")
+    let message = HttpDecoder::open("ftp://example.invalid/a.mp3")
+        .expect_err("ftp is not read")
         .to_string();
     assert!(
-        message.contains("TLS"),
-        "the message names the reason: {message}"
+        message.contains("ftp"),
+        "the message names the scheme: {message}"
     );
 }
 

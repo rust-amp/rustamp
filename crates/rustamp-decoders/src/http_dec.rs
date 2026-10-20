@@ -1,4 +1,4 @@
-//! The decoder that plays an `http://` stream.
+//! The decoder that plays an `http://` or an `https://` stream.
 //!
 //! The decoder is the crate's [`Decoder`] over a socket: the body of the
 //! response is the byte source, and the containers and codecs of the crate
@@ -16,6 +16,11 @@
 //!   frames that did arrive are still delivered. A body that ends where the
 //!   server said it ends is the end of the stream.
 //!
+//! An `https://` stream is the same stream behind a TLS connection; the
+//! certificate of the host is checked against the trust store of the
+//! operating system, and a refused certificate is a failure that names
+//! itself (see [`crate::tls`]).
+//!
 //! What the transport does is in [`crate::http_source`], and what the
 //! transfer is doing is observable in [`crate::http_progress`].
 
@@ -30,8 +35,9 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use crate::http_progress::HttpProgress;
 use crate::http_source::{DEFAULT_TIMEOUT, HttpError, HttpSource};
 use crate::symphonia_dec::{HeaderProbe, SymphoniaDecoder};
+use crate::tls::TlsAnchors;
 
-/// A decoder that plays an `http://` stream.
+/// A decoder that plays an `http://` or an `https://` stream.
 ///
 /// The stream is opened and the container is probed when the decoder is
 /// opened, so a failure of the transport or of the container is reported
@@ -56,8 +62,8 @@ impl HttpDecoder {
     ///
     /// The failures are typed ([`HttpError`]): a URL that names another
     /// scheme, a server that answers with a status other than 200, a host
-    /// that does not answer in time and a body that is not media are four
-    /// different things, and a caller can tell them apart.
+    /// that does not answer in time, a refused certificate and a body that is
+    /// not media are five different things, and a caller can tell them apart.
     pub fn open(url: &str) -> Result<Self, HttpError> {
         Self::open_with_timeout(url, DEFAULT_TIMEOUT)
     }
@@ -83,7 +89,23 @@ impl HttpDecoder {
         timeout: Duration,
         progress: &HttpProgress,
     ) -> Result<Self, HttpError> {
-        let source = HttpSource::open(url, timeout, progress)?;
+        Self::open_with_anchors(url, timeout, progress, &TlsAnchors::system())
+    }
+
+    /// Opens the stream at `url` and checks the certificate of an `https://`
+    /// host against `anchors`.
+    ///
+    /// The anchors are the trust store of the operating system
+    /// ([`TlsAnchors::system`]) or a named set of certificates
+    /// ([`TlsAnchors::only`]). An `http://` stream has no certificate and
+    /// ignores them.
+    pub fn open_with_anchors(
+        url: &str,
+        timeout: Duration,
+        progress: &HttpProgress,
+        anchors: &TlsAnchors,
+    ) -> Result<Self, HttpError> {
+        let source = HttpSource::open(url, timeout, progress, anchors)?;
         // The extension of the URL is the hint for the container probe. A URL
         // without one is sniffed by the content, like a file without a name.
         let extension = MediaSource::Url(url.to_string()).extension();

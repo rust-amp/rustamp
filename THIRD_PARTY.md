@@ -119,7 +119,10 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `embed-manifest` | Build-time: embeds the Windows application manifest (Common Controls 6 for the native preferences dialog) | app (build script) |
 | `symphonia` | Audio decoding/demuxing | decoders; MPL-2.0, not permissive |
 | `opus-rs` | Opus codec for the symphonia pipeline (symphonia ships no Opus codec) | decoders; BSD-3-Clause, permissive |
+| `rustls` | TLS for the `https://` streams of the HTTP decoder (blocking, no async runtime; the `ring` provider) | decoders; Apache-2.0 OR ISC OR MIT, permissive |
+| `rustls-platform-verifier` | The certificate check of the `https://` streams: the trust store and the policy of the operating system | decoders; MIT OR Apache-2.0, permissive |
 | `hound` | WAV test fixtures | decoders (dev) |
+| `rcgen` | The certificates of the local TLS server of the `https://` tests | decoders (dev) |
 | `rusqlite` | SQLite-backed media library index | library; app (dev, the test that writes a row whose path the file system refuses to name) |
 | `image` | Cover-art decoding for the media library's artwork cache (JPEG and PNG only) | library |
 
@@ -130,7 +133,7 @@ is not in this lockfile and is deliberately not recorded as already used.
 
 ## Complete Cargo.lock license inventory
 
-Snapshot: 2026-10-20, **320 external package versions**, all from crates.io.
+Snapshot: 2026-10-20, **359 external package versions**, all from crates.io.
 `Cargo.lock` records names/versions/sources/checksums, **not licenses**; licenses
 below are the exact cached package-manifest declarations returned by
 `cargo metadata --offline --locked --all-features --format-version 1`.
@@ -139,6 +142,13 @@ The Symphonia family is MPL-2.0; `r-efi` has an LGPL alternative but also MIT
 and Apache alternatives. Neither is in a protected Windows normal closure.
 `opus-rs` (BSD-3-Clause) is the Opus codec of `rustamp-decoders`; it is
 permissive and enters the GPL player, not a protected closure.
+`rustls` (Apache-2.0 OR ISC OR MIT), `rustls-platform-verifier`
+(MIT OR Apache-2.0) and their transitives (`ring` Apache-2.0 AND ISC,
+`rustls-webpki` ISC, `rustls-pki-types` MIT OR Apache-2.0, `log` MIT OR
+Apache-2.0) are the TLS of the `https://` streams of `rustamp-decoders`; all
+of them are permissive and enter the GPL player, not a protected closure.
+`rcgen` (MIT OR Apache-2.0) is a dev dependency: it generates the
+certificates of the local TLS server of the `https://` tests.
 
 Regenerate the marked block with
 `python .github/scripts/license-audit.py --inventory`, review the lock/manifest
@@ -161,6 +171,9 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `arrayref` | `0.3.9` | `BSD-2-Clause` | `crates.io` |
 | `arrayvec` | `0.7.8` | `MIT OR Apache-2.0` | `crates.io` |
 | `as-raw-xcb-connection` | `1.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `asn1-rs` | `0.7.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `asn1-rs-derive` | `0.6.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `asn1-rs-impl` | `0.2.0` | `MIT/Apache-2.0` | `crates.io` |
 | `atomic-polyfill` | `1.0.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `atomic-waker` | `1.1.2` | `Apache-2.0 OR MIT` | `crates.io` |
 | `audio-codec-algorithms` | `0.8.1` | `0BSD OR Apache-2.0` | `crates.io` |
@@ -168,6 +181,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `audioadapter-buffers` | `5.2.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `audioadapter-sample` | `5.2.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `autocfg` | `1.5.1` | `Apache-2.0 OR MIT` | `crates.io` |
+| `bit-vec` | `0.9.1` | `Apache-2.0 OR MIT` | `crates.io` |
 | `bitflags` | `1.3.2` | `MIT/Apache-2.0` | `crates.io` |
 | `bitflags` | `2.13.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `block2` | `0.5.1` | `MIT` | `crates.io` |
@@ -186,6 +200,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `cobs` | `0.3.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `combine` | `4.6.8` | `MIT` | `crates.io` |
 | `concurrent-queue` | `2.5.0` | `Apache-2.0 OR MIT` | `crates.io` |
+| `core-foundation` | `0.10.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `core-foundation` | `0.9.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `core-foundation-sys` | `0.8.7` | `MIT OR Apache-2.0` | `crates.io` |
 | `core-graphics` | `0.23.2` | `MIT OR Apache-2.0` | `crates.io` |
@@ -201,8 +216,11 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `cursor-icon` | `1.2.0` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
 | `dasp_sample` | `0.11.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `data-encoding` | `2.11.1` | `MIT` | `crates.io` |
+| `der-parser` | `10.0.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `deranged` | `0.5.9` | `MIT OR Apache-2.0` | `crates.io` |
 | `dispatch` | `0.2.0` | `MIT` | `crates.io` |
 | `dispatch2` | `0.3.1` | `Zlib OR Apache-2.0 OR MIT` | `crates.io` |
+| `displaydoc` | `0.2.7` | `MIT OR Apache-2.0` | `crates.io` |
 | `dlib` | `0.5.3` | `MIT` | `crates.io` |
 | `downcast-rs` | `1.2.1` | `MIT/Apache-2.0` | `crates.io` |
 | `dpi` | `0.1.2` | `Apache-2.0 AND MIT` | `crates.io` |
@@ -232,6 +250,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `futures-task` | `0.3.34` | `MIT OR Apache-2.0` | `crates.io` |
 | `futures-util` | `0.3.34` | `MIT OR Apache-2.0` | `crates.io` |
 | `gethostname` | `1.1.0` | `Apache-2.0` | `crates.io` |
+| `getrandom` | `0.2.17` | `MIT OR Apache-2.0` | `crates.io` |
 | `getrandom` | `0.3.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `getrandom` | `0.4.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `hash32` | `0.2.1` | `MIT OR Apache-2.0` | `crates.io` |
@@ -265,6 +284,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `mach2` | `0.6.0` | `BSD-2-Clause OR MIT OR Apache-2.0` | `crates.io` |
 | `memchr` | `2.8.3` | `Unlicense OR MIT` | `crates.io` |
 | `memmap2` | `0.9.11` | `MIT OR Apache-2.0` | `crates.io` |
+| `minimal-lexical` | `0.2.1` | `MIT/Apache-2.0` | `crates.io` |
 | `miniz_oxide` | `0.8.9` | `MIT OR Zlib OR Apache-2.0` | `crates.io` |
 | `miniz_oxide` | `0.9.1` | `MIT OR Zlib OR Apache-2.0` | `crates.io` |
 | `moxcms` | `0.8.1` | `BSD-3-Clause OR Apache-2.0` | `crates.io` |
@@ -273,7 +293,10 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `ndk-context` | `0.1.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `ndk-sys` | `0.6.0+11769913` | `MIT OR Apache-2.0` | `crates.io` |
 | `nix` | `0.31.3` | `MIT` | `crates.io` |
+| `nom` | `7.1.3` | `MIT` | `crates.io` |
+| `num-bigint` | `0.4.8` | `MIT OR Apache-2.0` | `crates.io` |
 | `num-complex` | `0.4.6` | `MIT OR Apache-2.0` | `crates.io` |
+| `num-conv` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `num-derive` | `0.4.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `num-integer` | `0.1.47` | `MIT OR Apache-2.0` | `crates.io` |
 | `num-traits` | `0.2.19` | `MIT OR Apache-2.0` | `crates.io` |
@@ -307,7 +330,9 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `objc2-uniform-type-identifiers` | `0.2.2` | `MIT` | `crates.io` |
 | `objc2-user-notifications` | `0.2.2` | `MIT` | `crates.io` |
 | `ogg_pager` | `0.7.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `oid-registry` | `0.8.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `once_cell` | `1.21.4` | `MIT OR Apache-2.0` | `crates.io` |
+| `openssl-probe` | `0.2.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `opus-rs` | `0.1.37` | `BSD-3-Clause` | `crates.io` |
 | `orbclient` | `0.3.55` | `MIT` | `crates.io` |
 | `owned_ttf_parser` | `0.25.1` | `Apache-2.0` | `crates.io` |
@@ -321,6 +346,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `png` | `0.18.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `polling` | `3.11.0` | `Apache-2.0 OR MIT` | `crates.io` |
 | `postcard` | `1.1.3` | `MIT OR Apache-2.0` | `crates.io` |
+| `powerfmt` | `0.2.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `primal-check` | `0.3.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `proc-macro-crate` | `3.5.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `proc-macro2` | `1.0.107` | `MIT OR Apache-2.0` | `crates.io` |
@@ -330,22 +356,34 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `r-efi` | `5.3.0` | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | `crates.io` |
 | `r-efi` | `6.0.0` | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | `crates.io` |
 | `raw-window-handle` | `0.6.2` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
+| `rcgen` | `0.14.10` | `MIT OR Apache-2.0` | `crates.io` |
 | `realfft` | `3.5.0` | `MIT` | `crates.io` |
 | `redox_syscall` | `0.4.1` | `MIT` | `crates.io` |
 | `redox_syscall` | `0.5.18` | `MIT` | `crates.io` |
 | `redox_syscall` | `0.9.4` | `MIT` | `crates.io` |
+| `ring` | `0.17.14` | `Apache-2.0 AND ISC` | `crates.io` |
 | `rtrb` | `0.4.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `rubato` | `5.0.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `rusqlite` | `0.32.1` | `MIT` | `crates.io` |
 | `rustc_version` | `0.4.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `rustfft` | `6.4.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `rusticata-macros` | `4.1.0` | `MIT/Apache-2.0` | `crates.io` |
 | `rustix` | `0.38.44` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `rustix` | `1.1.5` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
+| `rustls` | `0.23.46` | `Apache-2.0 OR ISC OR MIT` | `crates.io` |
+| `rustls-native-certs` | `0.8.5` | `Apache-2.0 OR ISC OR MIT` | `crates.io` |
+| `rustls-pki-types` | `1.15.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `rustls-platform-verifier` | `0.7.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `rustls-platform-verifier-android` | `0.2.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `rustls-webpki` | `0.103.16` | `ISC` | `crates.io` |
 | `rustversion` | `1.0.23` | `MIT OR Apache-2.0` | `crates.io` |
 | `same-file` | `1.0.6` | `Unlicense/MIT` | `crates.io` |
+| `schannel` | `0.1.30` | `MIT` | `crates.io` |
 | `scoped-tls` | `1.0.1` | `MIT/Apache-2.0` | `crates.io` |
 | `scopeguard` | `1.2.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `sctk-adwaita` | `0.10.1` | `MIT` | `crates.io` |
+| `security-framework` | `3.7.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `security-framework-sys` | `2.17.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `semver` | `1.0.28` | `MIT OR Apache-2.0` | `crates.io` |
 | `serde` | `1.0.229` | `MIT OR Apache-2.0` | `crates.io` |
 | `serde_core` | `1.0.229` | `MIT OR Apache-2.0` | `crates.io` |
@@ -365,6 +403,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `stable_deref_trait` | `1.2.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `strength_reduce` | `0.2.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `strict-num` | `0.1.1` | `MIT` | `crates.io` |
+| `subtle` | `2.6.1` | `BSD-3-Clause` | `crates.io` |
 | `symphonia` | `0.5.5` | `MPL-2.0` | `crates.io` |
 | `symphonia-bundle-flac` | `0.5.5` | `MPL-2.0` | `crates.io` |
 | `symphonia-bundle-mp3` | `0.5.5` | `MPL-2.0` | `crates.io` |
@@ -383,11 +422,15 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `symphonia-utils-xiph` | `0.5.5` | `MPL-2.0` | `crates.io` |
 | `syn` | `2.0.119` | `MIT OR Apache-2.0` | `crates.io` |
 | `syn` | `3.0.9` | `MIT OR Apache-2.0` | `crates.io` |
+| `synstructure` | `0.13.2` | `MIT` | `crates.io` |
 | `tempfile` | `3.27.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `thiserror` | `1.0.69` | `MIT OR Apache-2.0` | `crates.io` |
 | `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | `crates.io` |
 | `thiserror-impl` | `1.0.69` | `MIT OR Apache-2.0` | `crates.io` |
 | `thiserror-impl` | `2.0.21` | `MIT OR Apache-2.0` | `crates.io` |
+| `time` | `0.3.55` | `MIT OR Apache-2.0` | `crates.io` |
+| `time-core` | `0.1.9` | `MIT OR Apache-2.0` | `crates.io` |
+| `time-macros` | `0.2.32` | `MIT OR Apache-2.0` | `crates.io` |
 | `tiny-skia` | `0.11.4` | `BSD-3-Clause` | `crates.io` |
 | `tiny-skia-path` | `0.11.4` | `BSD-3-Clause` | `crates.io` |
 | `tiny-xlib` | `0.2.5` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
@@ -406,11 +449,13 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `typed-path` | `0.12.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `unicode-ident` | `1.0.27` | `(MIT OR Apache-2.0) AND Unicode-3.0` | `crates.io` |
 | `unicode-segmentation` | `1.13.3` | `MIT OR Apache-2.0` | `crates.io` |
+| `untrusted` | `0.9.0` | `ISC` | `crates.io` |
 | `vcpkg` | `0.2.15` | `MIT/Apache-2.0` | `crates.io` |
 | `version_check` | `0.9.5` | `MIT/Apache-2.0` | `crates.io` |
 | `visibility` | `0.1.1` | `Zlib OR MIT OR Apache-2.0` | `crates.io` |
 | `walkdir` | `2.5.0` | `Unlicense/MIT` | `crates.io` |
 | `wasapi` | `0.26.0` | `MIT` | `crates.io` |
+| `wasi` | `0.11.1+wasi-snapshot-preview1` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `wasip2` | `1.0.4+wasi-0.2.12` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `wasm-bindgen` | `0.2.129` | `MIT OR Apache-2.0` | `crates.io` |
 | `wasm-bindgen-futures` | `0.4.79` | `MIT OR Apache-2.0` | `crates.io` |
@@ -428,6 +473,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `wayland-sys` | `0.31.11` | `MIT` | `crates.io` |
 | `web-sys` | `0.3.106` | `MIT OR Apache-2.0` | `crates.io` |
 | `web-time` | `1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `webpki-root-certs` | `1.0.10` | `CDLA-Permissive-2.0` | `crates.io` |
 | `winapi-util` | `0.1.11` | `Unlicense OR MIT` | `crates.io` |
 | `windowfunctions` | `0.1.1` | `MIT` | `crates.io` |
 | `windows` | `0.62.2` | `MIT OR Apache-2.0` | `crates.io` |
@@ -460,11 +506,14 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `x11-dl` | `2.21.0` | `MIT` | `crates.io` |
 | `x11rb` | `0.13.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `x11rb-protocol` | `0.13.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `x509-parser` | `0.18.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `xcursor` | `0.3.11` | `MIT` | `crates.io` |
 | `xkbcommon-dl` | `0.4.2` | `MIT` | `crates.io` |
 | `xkeysym` | `0.2.1` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
+| `yasna` | `0.6.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `zerocopy` | `0.8.63` | `BSD-2-Clause OR Apache-2.0 OR MIT` | `crates.io` |
 | `zerocopy-derive` | `0.8.63` | `BSD-2-Clause OR Apache-2.0 OR MIT` | `crates.io` |
+| `zeroize` | `1.9.1` | `Apache-2.0 OR MIT` | `crates.io` |
 | `zip` | `9.0.3` | `MIT` | `crates.io` |
 | `zlib-rs` | `0.6.8` | `Zlib` | `crates.io` |
 | `zopfli` | `0.8.4` | `Apache-2.0` | `crates.io` |
