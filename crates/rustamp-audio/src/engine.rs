@@ -1694,26 +1694,41 @@ impl Engine {
         // "Stop after current track" (RFC 0005 O8) halts the run at the end of
         // the current track instead of advancing; that is a stop, not the end
         // of the playlist. `PlaylistEnded` fires iff the queue was actually
-        // exhausted — the entry that just ended is the last one — so arming
-        // the mode on the last track still ends the playlist. The RFC leaves
-        // the exact interaction open (it rides on S02 open question 5); this
-        // is the implemented reading.
-        let queue_exhausted = !self.repeat()
-            && self
-                .current
-                .map(|index| {
-                    if self.stop_after_current {
-                        index as usize + 1 >= self.queue.len()
-                    } else {
-                        true
-                    }
-                })
-                .unwrap_or(true);
+        // exhausted — the entry that just ended is the last one of the
+        // traversal — so arming the mode on the last track still ends the
+        // playlist. The RFC leaves the exact interaction open (it rides on S02
+        // open question 5); this is the implemented reading.
+        let queue_exhausted =
+            !self.repeat() && (!self.stop_after_current || self.traversal_exhausted());
         if queue_exhausted {
             self.bus.publish(Event::PlaylistEnded);
         }
         if let Err(err) = flushed {
             self.report_output_error(&err);
+        }
+    }
+
+    /// Whether the traversal has reached the end of the queue.
+    ///
+    /// The end of the traversal belongs to the order (S15 §2), not to the
+    /// index of the entry that just ended: under shuffle the last entry of a
+    /// cycle is the last entry of the active permutation, which is not the
+    /// entry with the highest index. A run that ends anywhere else did not
+    /// exhaust the queue, whatever the index of the entry that just ended
+    /// is — the halt of the "stop after current track" mode (RFC 0005 O8) is
+    /// a stop, not the end of the playlist.
+    fn traversal_exhausted(&self) -> bool {
+        let Some(current) = self.current else {
+            return true;
+        };
+        let order = self.order();
+        if order.shuffle() {
+            match order.shuffle_plan().last() {
+                Some(&last) => current as usize == last,
+                None => true,
+            }
+        } else {
+            current as usize + 1 >= self.queue.len()
         }
     }
 
@@ -1930,8 +1945,13 @@ impl Engine {
         self.timeline_origin = start_at.as_ref().map(|(frames, _)| *frames).unwrap_or(0);
         self.track_start = 0;
         self.end_of_stream = None;
+        // The track starts are the decode thread's to report: it opens every
+        // track of the run and reports the timeline position each one starts
+        // at. The list therefore holds **one entry per track**, in play
+        // order, and the cycle arithmetic of `current_cycle_end` counts on
+        // that. A speculative entry for the track the run starts on would
+        // duplicate it and shift every count by one.
         self.track_starts.clear();
-        self.track_starts.push((index, 0));
         self.pending_seek = start_at.map(|(_, seq)| PendingSeek { seq });
         self.sync.set_written(0);
         // Reset the consumer-side counter alongside written so the invariant
