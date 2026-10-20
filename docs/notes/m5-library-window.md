@@ -115,6 +115,11 @@ two files, so the batches that were committed stay in the index.
 The worker is stopped and joined when the window is closed and when the app
 goes away, so no thread outlives the database.
 
+The scan runs on the root's **id** (`Library::scan_root_with_progress`), so a
+scan that ran to the end records the time in the root's row. The preferences
+page shows that time next to the root; see
+[`m5-library-last-scan.md`](m5-library-last-scan.md).
+
 ## The input map
 
 Own choice: S20 (the media library) is not started, so no spec measures it.

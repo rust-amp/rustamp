@@ -103,6 +103,21 @@
 //! into it ([`LibraryView::set_scan_status`]), and the renderer draws the
 //! view's status line into the band. The app paints nothing itself.
 //!
+//! # The roots
+//!
+//! The registered roots live in the index, and the app keeps them as the
+//! index's own records ([`Root`]), not as bare paths: the time of the
+//! root's last finished scan travels with the path.
+//!
+//! The **preferences page** shows the roots, one row each, with that time
+//! (see `docs/notes/m5-library-last-scan.md`). The window itself shows
+//! tracks, not roots.
+//!
+//! The scan runs on the root's **id**
+//! ([`Library::scan_root_with_progress`]): only the scan of a registered
+//! root records the time it ran to the end, and that time is what the
+//! page shows.
+//!
 //! # The covers
 //!
 //! The list has a cover column: it shows the album art of the row. The art
@@ -139,6 +154,7 @@ use rustamp_library::{
     ArtworkCache, Cancel, CoverImage, Library, Query, RemoveReport, Root, ScanPhase, ScanProgress,
     ScanReport, SortKey, TrackRow,
 };
+use rustamp_platform::LibraryRootRow;
 use rustamp_ui::library_render::{CoverRef, LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT};
 use rustamp_ui::{
     Key, LibraryChrome, LibraryColumn, LibraryLayout, LibraryRequest, LibraryRow, LibrarySort,
@@ -231,7 +247,7 @@ struct RootScan {
     /// The index, with the rows the scan will commit.
     index: Library,
     /// The roots to scan, in order.
-    roots: Vec<PathBuf>,
+    roots: Vec<Root>,
 }
 
 impl ScanJob for RootScan {
@@ -245,7 +261,10 @@ impl ScanJob for RootScan {
                 report.cancelled = true;
                 break;
             }
-            match index.scan_with_progress(&root, cancel, &mut *on_progress) {
+            // The root is scanned by its id, not by its path: only the scan of
+            // a registered root records the time it ran to the end, and that
+            // time is what the preferences page shows.
+            match index.scan_root_with_progress(root.id, cancel, &mut *on_progress) {
                 Ok(scanned) => merge_report(&mut report, scanned),
                 Err(error) => {
                     return ScanOutcome {
@@ -315,8 +334,9 @@ pub struct LibraryWindow {
     ///
     /// The roots live in the index. This is the list the app read last, and
     /// it answers while a scan holds the index: a scan does not change the
-    /// roots, so the list is still the truth.
-    roots: Vec<PathBuf>,
+    /// roots, so the list is still the truth. A finished scan does change
+    /// the time of the last scan, and the list is read again then.
+    roots: Vec<Root>,
     /// The decoded covers of the rows the window shows.
     ///
     /// The cache is the app's: it is asked once per frame and it keeps the
@@ -772,12 +792,11 @@ impl LibraryWindow {
         let Some(index) = self.index.as_mut() else {
             return Err(Error::NotFound("the library index is not open".into()));
         };
-        index.add_root(&path)?;
+        let root = index.add_root(&path)?;
         // The new root is in the index now: the list the app keeps says so
         // before the scan takes the index away.
-        let roots = root_paths(index.roots()?);
-        self.roots = roots;
-        self.start_scan(vec![path])
+        self.roots = index.roots()?;
+        self.start_scan(vec![root])
     }
 
     /// The registered roots, oldest first.
@@ -786,9 +805,9 @@ impl LibraryWindow {
     /// never opened, or a scan holds the index - the list the app read last
     /// answers: a scan does not change the roots, so the list is still the
     /// truth.
-    pub fn roots(&self) -> Result<Vec<PathBuf>> {
+    pub fn roots(&self) -> Result<Vec<Root>> {
         match self.index.as_ref() {
-            Some(index) => Ok(root_paths(index.roots()?)),
+            Some(index) => Ok(index.roots()?),
             None => Ok(self.roots.clone()),
         }
     }
@@ -839,9 +858,9 @@ impl LibraryWindow {
 
     /// The roots of the index, read from the index that is open or from a
     /// short connection to the database file.
-    fn read_roots(&self, database: Option<&Path>) -> Result<Vec<PathBuf>> {
+    fn read_roots(&self, database: Option<&Path>) -> Result<Vec<Root>> {
         if let Some(index) = self.index.as_ref() {
-            return Ok(root_paths(index.roots()?));
+            return index.roots();
         }
         let Some(database) = database else {
             // Without a database file the roots live in the in-memory index,
@@ -854,7 +873,7 @@ impl LibraryWindow {
             return Ok(Vec::new());
         }
         let index = Library::open(database)?;
-        Ok(root_paths(index.roots()?))
+        index.roots()
     }
 
     /// Scans the registered roots again.
@@ -862,7 +881,7 @@ impl LibraryWindow {
         let Some(index) = &self.index else {
             return Ok(());
         };
-        let roots = root_paths(index.roots()?);
+        let roots = index.roots()?;
         self.start_scan(roots)
     }
 
@@ -919,7 +938,7 @@ impl LibraryWindow {
     /// The index travels to the worker and comes back with it. While the
     /// scan runs the app cannot query the index, so the view keeps the page
     /// it has and is refreshed when the worker returns.
-    fn start_scan(&mut self, roots: Vec<PathBuf>) -> Result<()> {
+    fn start_scan(&mut self, roots: Vec<Root>) -> Result<()> {
         if roots.is_empty() {
             return Ok(());
         }
@@ -989,6 +1008,13 @@ impl LibraryWindow {
             Ok(outcome) => {
                 let ScanOutcome { index, result } = outcome;
                 self.index = Some(index);
+                // The scan may have recorded the time of its last run in the
+                // roots' rows: the list the app keeps follows the index, so
+                // the preferences page shows the time of the scan that just
+                // ran.
+                if let Ok(roots) = self.read_roots(None) {
+                    self.roots = roots;
+                }
                 match result {
                     Ok(report) => {
                         if report.cancelled {
@@ -1088,11 +1114,6 @@ fn cancelled_line(report: &ScanReport) -> String {
         removed = report.removed,
         skipped = report.skipped,
     )
-}
-
-/// The paths of the registered roots.
-fn root_paths(roots: Vec<Root>) -> Vec<PathBuf> {
-    roots.into_iter().map(|root| root.path).collect()
 }
 
 /// The note a removal report becomes.
@@ -1315,15 +1336,19 @@ impl App {
     /// The media library's roots, as the preferences page shows them.
     ///
     /// The roots live in the media library's own database, not in the
-    /// configuration file: the page reads them from the index. A database
-    /// that cannot be read leaves the page empty; the failure is reported
-    /// when the roots are read for the page (see
+    /// configuration file: the page reads them from the index. Every row
+    /// carries the time of the root's last finished scan, and the page
+    /// names it. A database that cannot be read leaves the page empty; the
+    /// failure is reported when the roots are read for the page (see
     /// [`App::refresh_library_roots`]).
-    pub(crate) fn library_roots(&self) -> Vec<String> {
+    pub(crate) fn library_roots(&self) -> Vec<LibraryRootRow> {
         match self.library_window.roots() {
             Ok(roots) => roots
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|root| LibraryRootRow {
+                    path: root.path.display().to_string(),
+                    last_scanned_at: root.last_scanned_at,
+                })
                 .collect(),
             Err(_) => Vec::new(),
         }

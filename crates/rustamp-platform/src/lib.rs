@@ -20,6 +20,9 @@
 //! A skin's cursor files become operating-system cursors in [`cursor`].
 //! A skin's window region becomes the operating system's window region in
 //! [`window_region`].
+//! The UTC calendar - a unix second as a date and a time of day - lives in
+//! [`utc`]; the preferences dialog shows the time of a media library root
+//! with it.
 
 pub mod cursor;
 pub mod displays;
@@ -30,6 +33,7 @@ pub mod popup_menu;
 pub mod prefs_dialog;
 pub mod single_instance;
 pub mod tray;
+pub mod utc;
 pub mod window_region;
 
 pub use cursor::{
@@ -57,7 +61,8 @@ pub use popup_menu::{PopupMenuError, PopupRow, item_text, show_popup_menu};
 #[cfg(windows)]
 pub use prefs_dialog::PrefsWindow;
 pub use prefs_dialog::{
-    Bind, PluginRow, PrefsAction, PrefsError, PrefsNode, PrefsSettings, TREE as PREFS_TREE,
+    Bind, LibraryRootRow, PluginRow, PrefsAction, PrefsError, PrefsNode, PrefsSettings,
+    TREE as PREFS_TREE, library_root_text,
 };
 pub use single_instance::{
     Claim, ForwardRequest, HandOff, Instance, LockState, StartupAction, claim, forward,
@@ -66,4 +71,5 @@ pub use single_instance::{
 pub use tray::{TRAY_CALLBACK_MESSAGE, TRAY_LEFT_CLICK, TRAY_MENU, TRAY_TOOLTIP, TrayMenuEntry};
 #[cfg(windows)]
 pub use tray::{TrayError, TrayIcon};
+pub use utc::{UtcCalendar, utc_calendar};
 pub use window_region::{RegionRect, apply_window_region, window_region_contains};
