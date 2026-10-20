@@ -50,6 +50,13 @@
 //!   reference's layout, filters and wording are unmeasured, so prompts are
 //!   plain own choices. The `play` flag rides through untouched (RFC 0005
 //!   O5: the playlist ADD path's `false` is unmeasured).
+//!   The **location face** reads its field with the **command line's own URL
+//!   rule** ([`crate::cli::media_argument`]): an `http://` URL that names a
+//!   host is a stream, a path is a file, and a scheme this build cannot read
+//!   is **refused in the dialog** — the dialog stays open, the text stays,
+//!   the reason is shown (the command line's own wording) and nothing is
+//!   queued. Without that refusal the face would queue a track that only the
+//!   decoder refuses, much later, at open time.
 //! * Skin browser: the skins the app can load today (the built-in default,
 //!   the skins of the folder beside the configuration and the current skin
 //!   when it is not one of them), with the selected row marked. `Enter` loads
@@ -133,6 +140,9 @@ impl App {
     pub fn open_dialog_for(&mut self, command: &Command) -> Option<DialogKind> {
         let dialog = dialog_for_command(command)?;
         self.dialogs.open(dialog);
+        // A new dialog starts without a reason: the refusal of the previous
+        // location entry belonged to the dialog that showed it.
+        self.location_refusal = None;
         // The new dialog replaces the open one, so the edit-entry session
         // (the file it edits) goes with it.
         self.edit_entry = None;
@@ -323,6 +333,12 @@ impl App {
         if !consumed {
             return false;
         }
+        // A key that changes the entry field retires the reason of the last
+        // refusal: that reason was about the text that was there. `Enter` is
+        // the exception — it judges the field again and sets its own reason.
+        if key != Key::Enter {
+            self.location_refusal = None;
+        }
         self.sync_jump_rows();
         self.sync_skin_view();
         match key {
@@ -342,7 +358,7 @@ impl App {
                     }
                 } else if self.dialogs.open_kind() == Some(DialogKind::SkinBrowser) {
                     self.confirm_skin_browser();
-                } else if let Some(add) = self.dialogs.confirm_open_media() {
+                } else if let Some(add) = self.confirm_open_media() {
                     // A failed submit still consumed the key; the dialog closes
                     // only on a real confirm so an empty pick cannot trap the
                     // player and a confirmed one does not linger.
@@ -357,6 +373,60 @@ impl App {
             _ => {}
         }
         true
+    }
+
+    /// Confirms the open-media dialog: the command the accept path submits.
+    ///
+    /// The **location face** reads its entry field with the **command line's
+    /// own URL rule** ([`crate::cli::media_argument`]), so the two cannot
+    /// drift apart:
+    ///
+    /// * an `http://` URL that names a host is a **stream** (S19 §1: the
+    ///   request template is plain `http://`) and reaches the queue as a
+    ///   URL track;
+    /// * a **scheme this build cannot read** (`https://` for instance — there
+    ///   is no TLS, and S19 §6 question 8 establishes no evidence for it) is
+    ///   **refused in the dialog**: the dialog stays open, the text stays,
+    ///   the reason is shown (the command line's own wording) and nothing
+    ///   reaches the queue. Without this the face would queue a track that
+    ///   only the decoder refuses, at open time, long after the entry;
+    /// * a **path** is a **file**, exactly as the command line reads it;
+    /// * an **empty** field confirms nothing — the existing no-op, so the
+    ///   dialog stays open for a retry.
+    ///
+    /// The files and the directory face keep their own behaviour: they read
+    /// the staged picks (or the typed path).
+    ///
+    /// `None` when there is nothing to confirm.
+    fn confirm_open_media(&mut self) -> Option<Command> {
+        let Some(DialogKind::OpenMedia { kind, .. }) = self.dialogs.open_kind() else {
+            return None;
+        };
+        if kind != OpenMediaKind::Location {
+            return self.dialogs.confirm_open_media();
+        }
+        let text = self.dialogs.media_text().trim();
+        if text.is_empty() {
+            // The existing no-op: an empty field confirms nothing.
+            self.dialogs.set_media_location(None);
+            return None;
+        }
+        match crate::cli::media_argument(text) {
+            Ok(location) => {
+                self.location_refusal = None;
+                self.dialogs.set_media_location(Some(location));
+            }
+            Err(error) => {
+                // The command line's own wording, so the player says the same
+                // thing wherever the URL came from.
+                let reason = error.to_string();
+                self.dialogs.set_media_location(None);
+                self.location_refusal = Some(reason.clone());
+                self.note(reason);
+                return None;
+            }
+        }
+        self.dialogs.confirm_open_media()
     }
 
     /// The edit-entry session, when the edit-entry box is the open dialog.
@@ -529,6 +599,11 @@ impl App {
             return session.dialog.type_text(text);
         }
         let typed = self.dialogs.type_text(text);
+        if typed {
+            // The typed text is a new entry: the reason of the last refusal
+            // was about the old one.
+            self.location_refusal = None;
+        }
         self.sync_jump_rows();
         typed
     }
@@ -558,6 +633,9 @@ impl App {
             self.dialogs.set_playlist_text(text);
             return;
         }
+        // The new text is a new entry: the reason of the last refusal was
+        // about the old one.
+        self.location_refusal = None;
         self.dialogs.set_media_text(text);
     }
 
@@ -949,11 +1027,18 @@ impl App {
                 lines
             }
             OpenMediaKind::Location => {
-                vec![
+                let mut lines = vec![
                     "Location (URL):".to_string(),
                     field_tail(field),
                     "Type the URL, Enter adds it.".to_string(),
-                ]
+                ];
+                if let Some(reason) = &self.location_refusal {
+                    // The reason the last entry was refused, in the command
+                    // line's own wording: the dialog says what the command
+                    // line says, so the two cannot drift apart.
+                    lines.push(reason.clone());
+                }
+                lines
             }
         }
     }
@@ -1955,5 +2040,170 @@ mod tests {
         use rustamp_ui::{EDIT_ENTRY_CLIENT_SIZE, EDIT_ENTRY_TITLE};
         assert_eq!(DialogKind::EditEntry.title(), EDIT_ENTRY_TITLE);
         assert_eq!(DialogKind::EditEntry.client_size(), EDIT_ENTRY_CLIENT_SIZE);
+    }
+
+    // ----- the location face: the command line's own URL rule -----
+
+    /// Opens the location face of the open-media dialog.
+    ///
+    /// The face is opened with `play: false`, so a confirmed entry reaches
+    /// the queue without starting playback — and no test of this file ever
+    /// opens a socket.
+    fn open_location_face(app: &mut App) {
+        app.submit(Command::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        })
+        .expect("the location face opens");
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+    }
+
+    /// The command line's own message for a URL it cannot read.
+    ///
+    /// The message comes from the command line's own function, so the two
+    /// places are compared against each other and not against a literal: the
+    /// wording lives in one place and both places follow it.
+    fn cli_refusal(url: &str) -> String {
+        crate::cli::media_argument(url)
+            .expect_err("the command line refuses that URL too")
+            .to_string()
+    }
+
+    #[test]
+    fn an_https_url_is_refused_in_the_location_dialog() {
+        // S19 §6 question 8: the request template is plain `http://`, so
+        // there is no evidence for `https` and this build has no TLS. The
+        // face refuses the entry instead of queueing a track that only the
+        // decoder would refuse, much later, at open time.
+        let mut app = test_app();
+        open_location_face(&mut app);
+        let url = "https://example.test/stream.mp3";
+        assert!(app.dialog_text(url));
+
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        // The dialog stays open and the text stays, so the user can correct
+        // the entry.
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+        assert_eq!(app.media_text(), url);
+        // The reason is shown, in the command line's own wording.
+        let expected = cli_refusal(url);
+        let lines = app.open_dialog_lines().expect("the dialog is open");
+        assert!(lines.contains(&expected), "{lines:?}");
+        // Nothing reached the queue.
+        assert!(app.engine().queue().is_empty());
+
+        // The reason belongs to the entry that was refused: correcting the
+        // entry retires it.
+        assert!(app.dialog_text("x"));
+        let lines = app.open_dialog_lines().expect("the dialog is open");
+        assert!(!lines.contains(&expected), "{lines:?}");
+    }
+
+    #[test]
+    fn the_refusal_says_what_the_command_line_says() {
+        // One source of truth: the face refuses with the command line's own
+        // wording, so the player says the same thing wherever the URL came
+        // from. The comparison is against the command line's own function,
+        // not against a literal.
+        let mut app = test_app();
+        open_location_face(&mut app);
+        let url = "https://example.test/stream.mp3";
+        app.set_media_text(url);
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        let expected = cli_refusal(url);
+        let notes = app.drain_notes();
+        assert_eq!(notes, vec![expected.clone()], "{notes:?}");
+        let lines = app.open_dialog_lines().expect("the dialog is open");
+        assert!(lines.contains(&expected), "{lines:?}");
+    }
+
+    #[test]
+    fn every_other_scheme_is_refused_in_the_location_dialog() {
+        // S19 §6 question 8 asks about the other schemes too, and the answer
+        // is the same: only `http://` is read.
+        let mut app = test_app();
+        open_location_face(&mut app);
+        for url in [
+            "ftp://example.test/stream.mp3",
+            "rtsp://example.test/stream",
+            "file:///C:/Music/song.mp3",
+        ] {
+            app.set_media_text(url);
+            assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+            let expected = cli_refusal(url);
+            let notes = app.drain_notes();
+            assert_eq!(notes, vec![expected.clone()], "{url}: {notes:?}");
+            assert!(app.engine().queue().is_empty(), "{url}");
+        }
+    }
+
+    #[test]
+    fn an_http_url_reaches_the_queue_from_the_location_dialog() {
+        // S19 §1: the request template is plain `http://`, so an `http://`
+        // URL that names a host names a stream the player can read. The
+        // entry reaches the queue as a URL track — the same kind of entry a
+        // playlist's URL produces.
+        let mut app = test_app();
+        open_location_face(&mut app);
+        let url = "http://127.0.0.1/stream.mp3";
+        assert!(app.dialog_text(url));
+
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        assert!(!app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+        assert_eq!(app.engine().queue(), &[TrackSource::Url(url.to_owned())]);
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn a_path_in_the_location_dialog_is_opened_as_a_file() {
+        // The command line's rule is one rule: everything that names no
+        // scheme is a file path, untouched. The face reads its field with
+        // that rule, so a path is a file and not a stream.
+        let mut app = test_app();
+        open_location_face(&mut app);
+        let path = r"C:\Music\song.mp3";
+        assert!(app.dialog_text(path));
+
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        assert!(!app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+        assert_eq!(
+            app.engine().queue(),
+            &[TrackSource::path(PathBuf::from(path))]
+        );
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn an_empty_location_field_changes_nothing() {
+        // The existing no-op: an empty field confirms nothing, the dialog
+        // stays open and no entry is added.
+        let mut app = test_app();
+        open_location_face(&mut app);
+
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+        assert!(app.engine().queue().is_empty());
+        assert!(app.drain_notes().is_empty());
     }
 }

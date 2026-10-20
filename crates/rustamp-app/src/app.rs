@@ -290,6 +290,15 @@ pub struct App {
     /// a rejected command. Shown in the main window's native title bar
     /// ([`App::window_title`]); cleared when a track starts.
     last_error: Option<String>,
+    /// The reason the **location face** of the open-media dialog refused the
+    /// last entry, if it refused one.
+    ///
+    /// The face's field is a URL, and the app reads it with the command
+    /// line's own URL rule (see [`crate::cli::media_argument`]): a scheme
+    /// this build cannot read is refused in the dialog — the dialog stays
+    /// open, the text stays, and this is the reason it shows. The reason is
+    /// the command line's own wording, so the two cannot drift apart.
+    pub(crate) location_refusal: Option<String>,
     /// The DSP chain the app installed in the engine (see [`crate::dsp`]).
     ///
     /// The engine takes the stages' ownership and drops the ones that fail,
@@ -598,6 +607,7 @@ impl App {
             device_buffer: output.granted.clone(),
             ring_frames,
             last_error: None,
+            location_refusal: None,
             dsp_chain: crate::dsp::DspChain::default(),
             bypassed_dsp: None,
             dsp_install_pending: false,

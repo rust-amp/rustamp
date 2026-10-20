@@ -41,6 +41,7 @@ native prompt. The menu row that runs the same command is a row of the `Play`
 submenu: S04 §2 leaves that submenu's rows unmeasured, so the row's label is
 our own choice — the command it runs is not.
 
+<<<<<<< HEAD
 ## The stream's status
 
 While an `http://` stream runs, the player says what the transfer is doing.
@@ -73,6 +74,18 @@ tick, and a phase that came and went between two ticks is gone.
 **What the UI still owes.** `rustamp-ui` has no status area of its own: the
 transient status is computed and exposed by the app, but no window draws it
 yet. The main window's status area has to show `App::stream_status()`.
+
+**The face reads its field with the command line's own URL rule**
+(`cli::media_argument`), so the two cannot drift apart:
+
+* an `http://` or `https://` URL that names a host is a stream and reaches the
+  queue as a URL track;
+* a scheme this build cannot read (`ftp://` for instance) is **refused in the
+  dialog**: the dialog stays open, the text stays, the reason is shown - and the
+  reason is the command line's own wording - so nothing is queued that only the
+  decoder would refuse later, at open time;
+* a path names no scheme, so it is a **file** and is opened as one;
+* an empty field confirms nothing (the existing no-op).
 
 ## Headless mode — safe to run anywhere
 
