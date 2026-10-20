@@ -158,6 +158,8 @@
 //!   insensitive.
 //! * A value is everything behind the first `=` on the line; the whitespace
 //!   around the key and the value is dropped.
+//! * A value longer than the reference's 2048-byte staging buffer is cut
+//!   short there (S12 §4.3, §9), on a character boundary.
 //! * A line the parser cannot read (no `=`, an unterminated section header,
 //!   an empty key) is **reported** and skipped: it never stops the import.
 //! * A key that appears twice keeps its **first** value and the repetition is
@@ -176,6 +178,13 @@ pub const CLASSIC_MIN: i64 = 0;
 
 /// The classic gain scale's highest value (S12 §9).
 pub const CLASSIC_MAX: i64 = 63;
+
+/// The longest value a read of the reference file yields (S12 §4.3, §9).
+///
+/// The reference reads a value through a 2048-byte staging buffer, and a
+/// value longer than the buffer is cut short by the profile API. A value
+/// beyond this many bytes is therefore cut short at the same place.
+pub const VALUE_LIMIT: usize = 2048;
 
 /// One key of an INI file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,7 +276,7 @@ impl IniFile {
                     .push(format!("line {}: a key without a name", number + 1));
                 continue;
             }
-            let value = value.trim().to_string();
+            let value = cut_short(value.trim());
             let section = match current {
                 Some(index) => index,
                 // A key before the first section header belongs to no section:
@@ -1054,6 +1063,22 @@ fn not_honoured(outcome: &mut Option<Outcome>, reason: &str) {
     *outcome = Some(Outcome::NotApplied {
         reason: reason.to_string(),
     });
+}
+
+/// Cuts a value short at the reference's staging buffer (S12 §4.3, §9).
+///
+/// The reference reads a value through a 2048-byte buffer, so a longer
+/// value is cut short. The cut falls on a character boundary: the file is
+/// read as text, and half a character is not a value.
+fn cut_short(value: &str) -> String {
+    if value.len() <= VALUE_LIMIT {
+        return value.to_string();
+    }
+    let mut end = VALUE_LIMIT;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 /// The integer a value holds, when it holds one.
