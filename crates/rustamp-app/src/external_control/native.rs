@@ -14,6 +14,9 @@ use winit::window::Window;
 use super::{Request, UNSUPPORTED, answer, decode};
 use crate::app::App;
 
+#[path = "readiness.rs"]
+mod readiness;
+
 type SubclassProc =
     unsafe extern "system" fn(*mut c_void, u32, usize, isize, usize, usize) -> isize;
 
@@ -27,6 +30,8 @@ unsafe extern "system" {
 #[link(name = "user32")]
 unsafe extern "system" {
     fn InSendMessageEx(reserved: *const c_void) -> u32;
+    fn SetPropW(hwnd: *mut c_void, name: *const u16, data: *mut c_void) -> i32;
+    fn RemovePropW(hwnd: *mut c_void, name: *const u16) -> *mut c_void;
 }
 
 struct Bridge {
@@ -41,6 +46,8 @@ pub(crate) struct ExternalControl {
     _window: Arc<Window>,
     hwnd: *mut c_void,
     bridge: Rc<RefCell<Bridge>>,
+    ready_property: Vec<u16>,
+    ready: bool,
 }
 
 impl ExternalControl {
@@ -57,6 +64,11 @@ impl ExternalControl {
                 pending: Vec::new(),
                 attached: false,
             })),
+            ready_property: readiness::READY_PROPERTY
+                .encode_utf16()
+                .chain([0])
+                .collect(),
+            ready: false,
         };
         let data = (&*this.bridge as *const RefCell<Bridge>) as usize;
         // SAFETY: winit's window belongs to this thread. The Rc allocation
@@ -68,6 +80,29 @@ impl ExternalControl {
         }
         this.bridge.borrow_mut().attached = true;
         Ok(this)
+    }
+
+    /// Called only after the first complete UI tick, outside native callbacks.
+    /// Cross-process observers can poll this without sending into a UI thread
+    /// which may still be in a slow/reentrant startup operation.
+    pub(crate) fn mark_ready(&mut self) -> std::io::Result<()> {
+        if !self.ready {
+            // SAFETY: the HWND and NUL-terminated name are owned by self. The
+            // non-null value is a flag, never a pointer to be dereferenced.
+            if unsafe {
+                SetPropW(
+                    self.hwnd,
+                    self.ready_property.as_ptr(),
+                    std::ptr::without_provenance_mut(1),
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            self.ready = true;
+            eprintln!("rustamp: external-control handler ready after first UI tick");
+        }
+        Ok(())
     }
 
     /// Drained before the normal app pump, never while a native procedure is
@@ -95,6 +130,9 @@ impl ExternalControl {
 
 impl Drop for ExternalControl {
     fn drop(&mut self) {
+        // SAFETY: this guard owns the live HWND/name; removing an absent
+        // property (including after WM_NCDESTROY) is harmless.
+        unsafe { RemovePropW(self.hwnd, self.ready_property.as_ptr()) };
         if !self.bridge.borrow().attached {
             return;
         }
@@ -123,6 +161,12 @@ unsafe extern "system" fn callback(
     let bridge = unsafe { &*(data as *const RefCell<Bridge>) };
     if message == 0x0082 {
         // WM_NCDESTROY
+        let name: Vec<u16> = readiness::READY_PROPERTY
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: the window is being destroyed; the name outlives the call.
+        unsafe { RemovePropW(hwnd, name.as_ptr()) };
         // SAFETY: the OS is destroying this HWND on its owner thread.
         if unsafe { RemoveWindowSubclass(hwnd, callback, id) } != 0
             && let Ok(mut state) = bridge.try_borrow_mut()
@@ -134,6 +178,12 @@ unsafe extern "system" fn callback(
     if request == Request::NotOurs {
         // SAFETY: original parameters are forwarded along the subclass chain.
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    }
+    // Constant replies require neither a published snapshot nor a mutable
+    // command queue. In particular a reentrant version request must not be
+    // discarded just because the bridge is being published/drained.
+    if let Request::Reply(value) = request {
+        return value as isize;
     }
     let Ok(mut bridge) = bridge.try_borrow_mut() else {
         return UNSUPPORTED as isize;
@@ -157,4 +207,65 @@ unsafe extern "system" fn callback(
     };
     // Preserve the classic unsigned-32-bit result shape, including -1 pan.
     reply as isize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustamp_plugin_abi::common::WM_WA_IPC;
+
+    fn bridge() -> RefCell<Bridge> {
+        RefCell::new(Bridge {
+            state: PlayerState {
+                volume: 173,
+                ..PlayerState::default()
+            },
+            pending: Vec::new(),
+            attached: true,
+        })
+    }
+
+    #[test]
+    fn version_is_answered_even_during_a_bridge_borrow_before_readiness() {
+        let bridge = bridge();
+        let _publishing = bridge.borrow_mut();
+        // SAFETY: our pointer stays live through the call. IPC 0 uses no HWND
+        // operation, creates no window and does not dereference IPC parameters.
+        let reply = unsafe {
+            callback(
+                std::ptr::null_mut(),
+                WM_WA_IPC,
+                0,
+                0,
+                0,
+                &bridge as *const _ as usize,
+            )
+        };
+        assert_eq!(reply, 0x2905);
+    }
+
+    #[test]
+    fn installed_handler_answers_and_retains_commands_before_first_tick() {
+        let bridge = bridge();
+        let data = &bridge as *const _ as usize;
+        // SAFETY: these supported integer requests only use the live bridge,
+        // not the null HWND. No window or event loop exists in this test.
+        unsafe {
+            assert_eq!(
+                callback(
+                    std::ptr::null_mut(),
+                    WM_WA_IPC,
+                    (-666_i32) as usize,
+                    122,
+                    0,
+                    data
+                ),
+                173
+            );
+            assert_eq!(callback(std::ptr::null_mut(), 0x0111, 40058, 0, 0, data), 0);
+        }
+        let pending = std::mem::take(&mut bridge.borrow_mut().pending);
+        assert_eq!(pending, vec![decode(0x0111, 40058, 0)]);
+        assert!(bridge.borrow().pending.is_empty());
+    }
 }

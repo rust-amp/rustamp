@@ -2582,7 +2582,11 @@ impl ApplicationHandler for Windowed {
             "Rustamp",
             (width, height),
             self.saved_position(CoreWindowId::Main),
-        );
+        )
+        // Discovery of a visible main window must not expose a bare winit
+        // procedure. Install external control before surface/tray setup and
+        // before sync_window_state can show the window.
+        .with_visible(false);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -2591,6 +2595,23 @@ impl ApplicationHandler for Windowed {
                 return;
             }
         };
+        #[cfg(windows)]
+        match crate::external_control::native::ExternalControl::attach(
+            Arc::clone(&window),
+            self.app.host_player_state(),
+        ) {
+            Ok(control) => {
+                self.external_control = Some(control);
+                eprintln!("rustamp: external-control handler installed (window still hidden)");
+            }
+            Err(error) => {
+                // A discoverable player without its answering handler is not
+                // a usable external-control endpoint. Do not silently show it.
+                eprintln!("rustamp: external control unavailable: {error}");
+                event_loop.exit();
+                return;
+            }
+        }
         let context = match softbuffer::Context::new(Arc::clone(&window)) {
             Ok(context) => context,
             Err(error) => {
@@ -2612,21 +2633,12 @@ impl ApplicationHandler for Windowed {
         }
         self.window = Some(window);
         self.surface = Some(surface);
+        self.applied_main_visible = false;
         if let Some(window) = &self.window {
             self.main_id = Some(window.id());
         }
         #[cfg(windows)]
         self.attach_tray();
-        #[cfg(windows)]
-        if let Some(window) = &self.window {
-            match crate::external_control::native::ExternalControl::attach(
-                Arc::clone(window),
-                self.app.host_player_state(),
-            ) {
-                Ok(control) => self.external_control = Some(control),
-                Err(error) => eprintln!("rustamp: external control unavailable: {error}"),
-            }
-        }
         self.sync_window_state();
         // The skin's shape is cut out of the main window; the equalizer
         // gets its own shape when it is created below.
@@ -2637,6 +2649,7 @@ impl ApplicationHandler for Windowed {
         self.sync_dialog_window(event_loop);
         self.request_dialog_redraw();
         self.sync_playlist_window(event_loop);
+        eprintln!("rustamp: main-window startup complete; awaiting first full UI tick");
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -2872,6 +2885,13 @@ impl ApplicationHandler for Windowed {
             self.sync_window_regions();
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
+        #[cfg(windows)]
+        if let Some(control) = &mut self.external_control
+            && let Err(error) = control.mark_ready()
+        {
+            eprintln!("rustamp: external-control readiness unavailable: {error}");
+            event_loop.exit();
+        }
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {

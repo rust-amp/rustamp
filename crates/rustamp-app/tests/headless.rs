@@ -40,6 +40,10 @@ use std::time::Duration;
 #[path = "child_windows/mod.rs"]
 mod child_windows;
 
+#[cfg(windows)]
+#[path = "../src/external_control/readiness.rs"]
+mod ipc_readiness;
+
 /// `CreateProcess` flag: run the child with a console but **no console window**
 /// (`CREATE_NO_WINDOW`).
 ///
@@ -399,6 +403,7 @@ fn external_control_drives_the_player_window_in_the_test_vm() {
             result: *mut usize,
         ) -> isize;
         fn PostMessageW(hwnd: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
+        fn GetPropW(hwnd: *mut c_void, name: *const u16) -> *mut c_void;
     }
 
     fn try_query(hwnd: *mut c_void, id: isize, argument: i32) -> std::io::Result<u32> {
@@ -486,10 +491,14 @@ fn external_control_drives_the_player_window_in_the_test_vm() {
     };
     let hwnd = child_windows::find_window(child.child.id(), "Rustamp", Duration::from_secs(15));
     assert_eq!(child_windows::window_class(hwnd), "Winamp v1.x");
-    // Visibility precedes surface/tray/subclass setup in Windowed::resumed.
-    // Only this startup barrier retries a failed send. A discovered HWND is
-    // not yet a responsive player. After readiness EVERY query below still
-    // fails immediately on its original 1 s timeout (including the version).
+    // A version reply may arrive reentrantly during startup and does not prove
+    // that startup finished. Wait without sending for the installed handler's
+    // first complete UI tick. EVERY IPC send, including the first version
+    // query, retains its strict 1 s timeout with no failed-send retry.
+    let ready_property: Vec<u16> = ipc_readiness::READY_PROPERTY
+        .encode_utf16()
+        .chain([0])
+        .collect();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(10);
     let mut retries = 0;
@@ -498,8 +507,11 @@ fn external_control_drives_the_player_window_in_the_test_vm() {
             child.child.try_wait().unwrap().is_none(),
             "player exited before IPC readiness"
         );
-        let reply = try_query(hwnd, 0, 0);
-        if matches!(reply, Ok(0x2905)) {
+        // SAFETY: this is our child's HWND and a live NUL-terminated name.
+        // GetPropW reads window-manager data without dispatching into the UI
+        // thread; a stuck player therefore cannot stall this bounded barrier.
+        let ready = unsafe { GetPropW(hwnd, ready_property.as_ptr()) } as usize;
+        if ready == 1 {
             eprintln!(
                 "player IPC ready after {:?}; startup retries={retries}",
                 started.elapsed()
@@ -507,10 +519,9 @@ fn external_control_drives_the_player_window_in_the_test_vm() {
             break;
         }
         retries += 1;
-        eprintln!("player IPC startup probe {retries}: {reply:?}");
         assert!(
             Instant::now() < deadline,
-            "player HWND never became IPC-ready: last version reply {reply:?}"
+            "player handler never completed its first UI tick: readiness marker={ready}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -551,6 +562,64 @@ fn external_control_drives_the_player_window_in_the_test_vm() {
 
 /// The split marker for [`every_spawn_site_is_guarded`].
 const SPAWN_GUARD_MARKER: &str = "// ---- spawn-site guard";
+
+/// Structural startup/lifetime regression, without creating an HWND. Actual
+/// Win32 scheduling and cross-process marker visibility still need the VM.
+#[test]
+fn ipc_handler_precedes_visibility_and_readiness_follows_the_full_ui_tick() {
+    let source = include_str!("../src/window.rs");
+    let resumed = source
+        .split("fn resumed(")
+        .nth(1)
+        .unwrap()
+        .split("fn window_event(")
+        .next()
+        .unwrap();
+    let mut previous = 0;
+    for step in [
+        ".with_visible(false)",
+        "event_loop.create_window(attributes)",
+        "ExternalControl::attach(",
+        "softbuffer::Context::new(",
+        "self.applied_main_visible = false",
+        "self.attach_tray()",
+        "self.sync_window_state()",
+    ] {
+        let position = resumed
+            .find(step)
+            .unwrap_or_else(|| panic!("missing startup step: {step}"));
+        assert!(position > previous, "startup step is out of order: {step}");
+        previous = position;
+    }
+    assert!(
+        !resumed.contains(".mark_ready()"),
+        "resumed is still allowed to dispatch reentrantly"
+    );
+    let tick = source
+        .split("fn about_to_wait(")
+        .nth(1)
+        .unwrap()
+        .split("fn exiting(")
+        .next()
+        .unwrap();
+    let ready = tick.find("control.mark_ready()").unwrap();
+    for step in [
+        "control.publish(",
+        "self.present_frames()",
+        "self.sync_title()",
+        "event_loop.set_control_flow(",
+    ] {
+        assert!(
+            tick.find(step).unwrap() < ready,
+            "readiness precedes full tick: {step}"
+        );
+    }
+    let exiting = source.split("fn exiting(").nth(1).unwrap();
+    assert!(
+        exiting.contains("self.external_control = None"),
+        "exiting must remove handler/readiness"
+    );
+}
 
 /// Asserts the flag the spawn helper applies, **without spawning anything**
 /// (it only builds a `Command` and never calls `spawn`).

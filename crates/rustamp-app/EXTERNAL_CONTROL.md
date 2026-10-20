@@ -12,6 +12,23 @@ published after each UI-thread pump (normally every 16 ms), not fixture
 defaults. Commands are queued and drained before the next pump; neither a
 dialog nor application code runs inside the native callback.
 
+The main window is created hidden. Its handler is installed before softbuffer,
+tray setup and visibility; failure to install aborts window startup instead of
+exposing an unanswerable endpoint. Already-installed handlers answer constant
+queries without borrowing the snapshot/command queue and retain commands that
+arrive before the first app pump. Messages sent to a not-yet-attached, hidden
+HWND still belong to winit and are not replayed later.
+
+For the regression harness only, the private HWND property
+`Rustamp.ExternalControl.Ready` becomes the integer flag 1 after the first full
+UI tick, not merely after a version response or subclass installation. Win32
+can dispatch sent queries reentrantly during startup: even an exact version
+does not prove that subsequent surface/shell/window initialization is finished.
+The marker is removed with the handler/on HWND destruction. It is not an S10
+extension or a guarantee of future responsiveness: the guest test waits for it
+within 10 s without sending, then every IPC send (including its first version
+check) must succeed within 1000 ms, with no retry of timed-out sends.
+
 ## Coverage
 
 S10 is still a revised draft. This implementation uses its explicit measured
