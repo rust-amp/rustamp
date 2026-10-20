@@ -64,6 +64,8 @@ const LIVENESS: Liveness = Liveness {
 const STUB_SPEC: AudioSpec = AudioSpec::new(1000, 2);
 /// Frames the stub resident serves.
 const STUB_FRAMES: u64 = 4099;
+/// Maximum frames in one read from the stub resident, before `fixture:exit` dies.
+const STUB_BLOCK_FRAMES: u64 = 257;
 
 /// The stub resident's telemetry (`DecoderStats`), as the fixture reports it.
 const STUB_SKIPPED: u64 = 7;
@@ -165,6 +167,19 @@ fn bits(samples: &[f32]) -> Vec<u32> {
     samples.iter().map(|s| s.to_bits()).collect()
 }
 
+/// Check every whole frame, independently of how the ring splits the block.
+fn check_stub_frames(samples: &[f32], frames: usize, first: u64) {
+    for (index, frame) in samples[..frames * 2].as_chunks::<2>().0.iter().enumerate() {
+        let value = (first + index as u64) as f32 / 8.0;
+        assert_eq!(
+            *frame,
+            [value, -value],
+            "stub frame {} was torn, missing or out of order",
+            first + index as u64
+        );
+    }
+}
+
 /// Read a decoder to its end and return every interleaved sample.
 fn read_all(decoder: &mut dyn Decoder, spec: AudioSpec) -> Vec<f32> {
     let channels = usize::from(spec.channels);
@@ -220,11 +235,7 @@ fn the_stub_resident_decodes_through_the_engine_adapter() {
     let mut buf = vec![0.0f32; 2 * 8];
     let frames = decoder.read(&mut buf).expect("the stub delivers");
     assert!(frames > 0, "the stub must deliver frames");
-    for index in 0..frames {
-        let value = index as f32 / 8.0;
-        assert_eq!(buf[index * 2], value);
-        assert_eq!(buf[index * 2 + 1], -value);
-    }
+    check_stub_frames(&buf, frames, 0);
 
     // The seek handshake runs for real: the host closes the ring, offers a
     // fresh one with a new generation and answers with the reached position.
@@ -241,8 +252,10 @@ fn the_stub_resident_decodes_through_the_engine_adapter() {
         frames > 0,
         "a seek inside the stream must keep yielding audio"
     );
-    assert_eq!(buf[0], 100.0 / 8.0);
-    assert_eq!(buf[1], -100.0 / 8.0);
+    check_stub_frames(&buf, frames, 100);
+    // This preview already consumed post-seek audio. Include it in the total,
+    // even when a partial ring read returns fewer than the requested 8 frames.
+    let mut total = frames as u64;
 
     // The telemetry the host reported is replayed on the engine's side.
     assert_eq!(decoder.skipped_packets(), STUB_SKIPPED);
@@ -250,12 +263,15 @@ fn the_stub_resident_decodes_through_the_engine_adapter() {
 
     // The end of the stream is sticky, and it comes only after the ring is
     // drained: the stub's own frame count is delivered first.
-    let mut total = 0u64;
     let mut buf = vec![0.0f32; 2 * 257];
     loop {
         match decoder.read(&mut buf).expect("the stub delivers") {
             0 => break,
-            frames => total += frames as u64,
+            frames => {
+                check_stub_frames(&buf, frames, 100 + total);
+                total += frames as u64;
+                assert!(total <= STUB_FRAMES - 100, "the stub invented frames");
+            }
         }
     }
     assert_eq!(
@@ -277,48 +293,57 @@ fn a_helper_that_dies_mid_stream_is_a_loud_decode_error() {
     let Some(helper) = stub_helper() else {
         return;
     };
-    let factory = ResidentFactory::new(config(helper));
+    // Backpressure is the precondition for a mid-stream death: the stub must
+    // publish its first 257-frame block before its next read exits. A one-frame
+    // ring makes it wait for the consumer, so even a slow guest gets audio
+    // before the death; no sleep or process-scheduling assumption is needed.
+    let factory = ResidentFactory::new(config(helper).with_prefetch_frames(1));
     let mut decoder = factory
         .open(MediaSource::Url(STUB_EXIT.into()))
         .expect("the stub resident opens");
 
-    // The first block arrives; the helper dies right after it.
+    // A producer block is not a consumer read: drain its partial reads until
+    // the observable terminal error, just like pcm_process. The adapter also
+    // retries once; the fresh helper seeks to our positive position and dies
+    // without producing more audio (fixture:exit exits whenever frame > 0).
     let mut buf = vec![0.0f32; 2 * 64];
-    match decoder.read(&mut buf) {
-        Ok(frames) => {
-            assert!(frames > 0, "the stub must deliver one block before it dies");
-            // The next read must be a loud failure. It must never look like
-            // the end of the stream, and it must never hang: the control EOF
-            // wakes the blocked read through the framework's close-only ring
-            // view.
-            let error = decoder
-                .read(&mut buf)
-                .expect_err("a dead helper must not look like the end of the stream");
-            assert!(
-                matches!(&error, CoreError::Decode(message) if !message.is_empty()),
-                "the death must surface as a loud decode error, got {error:?}"
-            );
-            // RFC 0006 §8: the engine restarts the helper once before it gives
-            // up on the track, and the second death is what ends it.
-            assert!(
-                error.to_string().contains("resident restart"),
-                "the track must have been restarted once, got {error}"
-            );
+    let mut delivered = 0u64;
+    let deadline = Instant::now() + WAIT;
+    let error = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the dead helper must fail, not hang"
+        );
+        match decoder.read(&mut buf) {
+            Ok(0) => panic!("a dead helper must not look like the end of the stream"),
+            Ok(frames) => {
+                check_stub_frames(&buf, frames, delivered);
+                delivered += frames as u64;
+                assert!(
+                    delivered <= STUB_BLOCK_FRAMES,
+                    "the dying stub must not invent or replay audio"
+                );
+            }
+            Err(error) => break error,
         }
-        Err(error) => {
-            // The helper died before its first block could be read (a heavily
-            // loaded guest). The contract still holds: the death is loud and
-            // never an end of stream.
-            assert!(
-                matches!(&error, CoreError::Decode(message) if !message.is_empty()),
-                "the death must surface as a loud decode error, got {error:?}"
-            );
-            assert!(
-                error.to_string().contains("resident restart"),
-                "the track must have been restarted once, got {error}"
-            );
-        }
-    }
+    };
+    assert!(delivered > 0, "the stub must deliver audio before it dies");
+    assert!(
+        matches!(&error, CoreError::Decode(message) if !message.is_empty()),
+        "the death must surface as a loud decode error, got {error:?}"
+    );
+    // RFC 0006 §8: the engine restarts the helper once before giving up.
+    assert!(
+        error.to_string().contains("resident restart"),
+        "the track must have been restarted once, got {error}"
+    );
+    let again = decoder
+        .read(&mut buf)
+        .expect_err("the terminal failure must stick, never turn into audio or EOS");
+    assert!(
+        matches!(&again, CoreError::Decode(message) if !message.is_empty()),
+        "the failure must stay a loud decode error, got {again:?}"
+    );
 }
 
 #[test]
