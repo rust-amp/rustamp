@@ -82,15 +82,23 @@ function Assert-I686Pe([string]$Path) {
     }
 }
 
-function Assert-Base291Captures([string]$Root) {
-    Assert-RequiredFile (Join-Path $Root 'session-proof.json')
+function Get-Base291MissingFiles([string]$Root) {
+    $paths = @(Join-Path $Root 'session-proof.json')
     foreach ($case in 'main-active', 'main-inactive', 'main-shade', 'main-double',
         'eq-active', 'eq-inactive', 'eq-shade', 'eq-double',
         'playlist-active', 'playlist-inactive', 'playlist-shade') {
         foreach ($kind in 'presented', 'reference') {
-            Assert-RequiredFile (Join-Path $Root "$case.$kind.png")
+            $paths += Join-Path $Root "$case.$kind.png"
         }
     }
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path -ErrorAction Stop).Length -eq 0) { $path }
+    }
+}
+
+function Assert-Base291Captures([string]$Root) {
+    $missing = @(Get-Base291MissingFiles $Root)
+    if ($missing.Count) { throw ('required base291 capture missing or empty: ' + ($missing -join '; ')) }
 }
 
 function Assert-SeparateFixturePaths([string]$Source, [string]$Destination) {
@@ -460,7 +468,8 @@ function Test-SelectedIgnoredBinary([string]$Pattern) {
 }
 
 # External fixtures use the existing wholesale staging + broker copyin below.
-# Fail BEFORE any guest operation when a selected ignored binary needs one.
+# Buildable/staged plugin fixtures still fail BEFORE any guest operation.
+# Unavailable external captures block only their consuming test, in the guest.
 $pluginsDir = 'D:\code\rustamp-testplugins'
 $skinsDir = 'D:\code\rustamp-testskins'
 if ($Filter -notlike '--ignored*' -and @($selected | Where-Object { $_.Name -like 'base291_acceptance-*' }).Count -gt 0) {
@@ -485,13 +494,22 @@ if (Test-SelectedIgnoredBinary 'dsp_acceptance-*') {
 }
 $captureRequired = Test-SelectedIgnoredBinary 'base291_acceptance-*'
 if ($captureRequired) {
-    Assert-Base291Captures $Base291Captures
-    Step 'staging the real base291 VM capture pairs (read-only copies)'
+    $captureMissing = @(Get-Base291MissingFiles $Base291Captures)
     if (Test-Path -LiteralPath $captureStage) { Remove-Item -LiteralPath $captureStage -Recurse -Force }
-    Copy-Item -LiteralPath $Base291Captures -Destination $captureStage -Recurse -Force -ErrorAction Stop
-    Assert-Base291Captures $captureStage
-    Assert-Inventory @(Get-Inventory @(Get-ChildItem -LiteralPath $Base291Captures -Recurse -File) $Base291Captures) `
-        @(Get-Inventory @(Get-ChildItem -LiteralPath $captureStage -Recurse -File) $captureStage) 'capture'
+    if ($captureMissing.Count) {
+        $null = New-Item -ItemType Directory -Path $captureStage
+        Write-Host ('base291 BLOCKED / NOT RUN: required capture missing or empty: {0} ({1} missing/empty files; full list in runner-status.json); other tests will continue; this is not a pass' -f $captureMissing[0], $captureMissing.Count)
+    } else {
+        Step 'staging the real base291 VM capture pairs (read-only copies)'
+        Copy-Item -LiteralPath $Base291Captures -Destination $captureStage -Recurse -Force -ErrorAction Stop
+        Assert-Base291Captures $captureStage
+        Assert-Inventory @(Get-Inventory @(Get-ChildItem -LiteralPath $Base291Captures -Recurse -File) $Base291Captures) `
+            @(Get-Inventory @(Get-ChildItem -LiteralPath $captureStage -Recurse -File) $captureStage) 'capture'
+    }
+    # Always overwrite the guest's availability decision, even without -Reset:
+    # old capture bytes must not turn today's missing source into a pass.
+    [pscustomobject]@{ version = 1; ready = ($captureMissing.Count -eq 0); source = $Base291Captures; missing = $captureMissing } |
+        ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $captureStage 'runner-status.json') -Encoding UTF8
 }
 
 # --- 3. optional reset, then start (the broker ejects the DVD) --------------
@@ -513,7 +531,7 @@ Write-Host ("    pre-staging cleanup: {0:F3} s (no reboot)" -f $cleanupClock.Ela
 Step 'copying the staged tree into the guest'
 & $broker -Op copyin -Source $Stage -Dest 'C:\rustamp\code\Rustamp' -TimeoutSeconds 1800 | Out-Null
 if ($captureRequired) {
-    Step 'copying approved base291 VM captures into the guest'
+    Step 'copying base291 capture availability (and approved pairs when present) into the guest'
     & $broker -Op copyin -Source $captureStage -Dest 'C:\rustamp\base291-captures' -TimeoutSeconds 600 | Out-Null
 }
 
@@ -607,11 +625,13 @@ try {
 # lost it instead of printing empty columns below.
 if (-not $result) { throw "STEP guest FAILED: the broker returned no result object for $guestScript (see D:\code\rustamp-vm\broker\broker.log)" }
 if ($null -eq $result.results) { throw "STEP guest FAILED: the guest result object carries no results (see D:\code\rustamp-vm\broker\broker.log)" }
+$captureUnconfirmed = ($captureRequired -and $result.base291captures -ne 'C:\rustamp\base291-captures')
 if ($captureRequired) {
-    if ($result.base291captures -ne 'C:\rustamp\base291-captures') {
-        throw 'STEP guest FAILED: required base291 capture environment was not confirmed by the guest'
+    if ($result.base291captures -eq 'C:\rustamp\base291-captures') {
+        Write-Host ('base291 captures: staged and guest-confirmed (RUSTAMP_BASE291_VM_CAPTURES={0}; 11 real pairs plus capture-session proof)' -f $result.base291captures)
+    } else {
+        Write-Host 'base291 captures: NOT CONFIRMED; see the named BLOCKED / NOT RUN result and missing paths below; not a pass'
     }
-    Write-Host ('base291 captures: staged and guest-confirmed (RUSTAMP_BASE291_VM_CAPTURES={0}; 11 real pairs plus capture-session proof)' -f $result.base291captures)
 }
 if (-not $DesktopFreeResidentFixtures) {
     if ($null -eq $result.session -or $result.session -le 0 -or -not $result.marker -or -not $result.screen) {
@@ -728,7 +748,7 @@ $result.results | ForEach-Object {
         Write-Host ("         HUNG after {0} - binary was killed, last output captured" -f $bound)
         foreach ($d in $_.diagnostic) { Write-Host ("         | $d") }
     } else {
-        $status = if ($_.exit -eq 0) {
+        $status = if ($_.blocked) { 'BLOCKED' } elseif ($_.exit -eq 0) {
             if ($_.summary -like 'LEFT OUT*') { 'SKIP' } else { 'ok  ' }
         } else { 'FAIL' }
         Write-Host ("  [{0}] {1,-46} {2}" -f $status, $_.exe, $_.summary)
@@ -778,6 +798,7 @@ if ($Filter -like '--ignored*') {
         [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'the_new_dialogs_pin_their_os_window_parameters' },
         [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'opening_the_playlist_window_needs_an_os_window' },
         [pscustomobject]@{ Group = 'Group A (VM GUI)'; Name = 'opening_either_dialog_needs_an_os_window' },
+        [pscustomobject]@{ Group = 'Group A (VM Captures)'; Name = 'base291_vm_presented_pixels_match_reference_captures'; Binary = 'base291_acceptance' },
 
         # Group B — VM real-process (3 tests)
         [pscustomobject]@{ Group = 'Group B (VM Real Process)'; Name = 'spawns_the_real_host_without_a_window' },
@@ -813,10 +834,12 @@ if ($Filter -like '--ignored*') {
         $searchName = if ($item.Search) { $item.Search } else { $item.Name }
         $passed = $false
         $failed = $false
+        $blockedReason = $null
         foreach ($r in $result.results) {
             if ($item.Binary -and $r.exe -notlike "*$($item.Binary)*") { continue }
             if ($r.passed -and ($r.passed | Where-Object { $_ -like "*$searchName*" })) { $passed = $true }
             if ($r.failed -and ($r.failed | Where-Object { $_ -like "*$searchName*" })) { $failed = $true }
+            if ($r.blockedTests -contains $searchName) { $blockedReason = $r.summary }
         }
 
         if ($passed) {
@@ -825,6 +848,9 @@ if ($Filter -like '--ignored*') {
         } elseif ($failed) {
             $ranCount++
             Write-Host ("  [FAIL] {0,-30} {1}" -f $item.Group, $item.Name)
+        } elseif ($blockedReason) {
+            $blockedCount++
+            Write-Host ("  [BLOCKED] {0,-27} {1} ({2})" -f $item.Group, $item.Name, $blockedReason)
         } elseif ($item.Blocker) {
             $blockedCount++
             Write-Host ("  [BLOCKED] {0,-27} {1} ({2})" -f $item.Group, $item.Name, $item.Blocker)
@@ -858,12 +884,12 @@ if ($Filter -like '--ignored*') {
             Write-Host ("  [NOT RUN] {0,-27} {1}" -f $item.Group, $item.Name)
         }
     }
-    Write-Host ("`nIgnored tests: {0} ran, {1} blocked pending host/VM decisions, {2} missing plugin fixture, {3} total in inventory" -f $ranCount, $blockedCount, $missingFixtureCount, $inventory.Count)
+    Write-Host ("`nIgnored tests: {0} ran, {1} blocked (named reasons above; NOT RUN is not a pass), {2} missing plugin fixture, {3} total in inventory" -f $ranCount, $blockedCount, $missingFixtureCount, $inventory.Count)
 }
 
 # A stall must never be reported as a green run: the hung count is a second,
 # independent gate on the exit code, so a counting drift cannot hide a hang.
-$runFailed = ($result.failed -ne 0 -or $hungCount -ne 0 -or $blessMissing -ne 0 -or $stallCount -ne 0)
+$runFailed = ($result.failed -ne 0 -or $hungCount -ne 0 -or $blessMissing -ne 0 -or $stallCount -ne 0 -or $captureUnconfirmed)
 
 # A run that executed no binary at all proves nothing, so it must never exit
 # zero. Without this gate a filter that matches nothing - or a staging that lost

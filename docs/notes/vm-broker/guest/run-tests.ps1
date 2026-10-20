@@ -113,7 +113,7 @@ if (Test-Path $dspFixture) { $env:RUSTAMP_DSP_FIXTURE = $dspFixture }
 
 function Assert-RequiredFixture([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Get-Item -LiteralPath $Path -ErrorAction Stop).Length -eq 0) {
-        throw "required staged fixture missing or empty: $Path; refusing before any test binary runs"
+        throw "required staged fixture missing or empty: $Path; refusing its consumer"
     }
 }
 
@@ -158,18 +158,29 @@ if ($extra -contains '--ignored' -and -not $desktopFree) {
 }
 
 Remove-Item Env:\RUSTAMP_BASE291_VM_CAPTURES -ErrorAction SilentlyContinue
-if (Test-SelectedIgnoredBinary 'base291_acceptance-*') {
-    $captureRoot = 'C:\rustamp\base291-captures'
-    Assert-RequiredFixture (Join-Path $captureRoot 'session-proof.json')
-    foreach ($case in 'main-active', 'main-inactive', 'main-shade', 'main-double',
-        'eq-active', 'eq-inactive', 'eq-shade', 'eq-double',
-        'playlist-active', 'playlist-inactive', 'playlist-shade') {
-        foreach ($kind in 'presented', 'reference') {
-            Assert-RequiredFixture (Join-Path $captureRoot "$case.$kind.png")
+$captureRoot = 'C:\rustamp\base291-captures'
+function Get-Base291BlockReason([string]$Root) {
+    # The fresh host decision outranks leftover captures from a previous run.
+    # Missing/invalid status is a named blocker too, never a fallback to stale data.
+    $statusPath = Join-Path $Root 'runner-status.json'
+    try {
+        Assert-RequiredFixture $statusPath
+        $status = Get-Content -LiteralPath $statusPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($status.version -ne 1 -or $status.ready -isnot [bool]) { throw "invalid capture availability status: $statusPath" }
+        if (-not $status.ready) {
+            return ('required capture missing or empty: {0}; host source {1}; {2} missing/empty files (full list: {3})' -f @($status.missing)[0], $status.source, @($status.missing).Count, $statusPath)
         }
+        Assert-RequiredFixture (Join-Path $Root 'session-proof.json')
+        foreach ($case in 'main-active', 'main-inactive', 'main-shade', 'main-double',
+            'eq-active', 'eq-inactive', 'eq-shade', 'eq-double',
+            'playlist-active', 'playlist-inactive', 'playlist-shade') {
+            foreach ($kind in 'presented', 'reference') {
+                Assert-RequiredFixture (Join-Path $Root "$case.$kind.png")
+            }
+        }
+    } catch {
+        return $_.Exception.Message
     }
-    $env:RUSTAMP_BASE291_VM_CAPTURES = $captureRoot
-    Write-Host "base291 captures: $captureRoot (11 real pairs and capture-session proof present)"
 }
 
 # --- launch one test binary, bounded, and bring its output back as text -------
@@ -309,6 +320,27 @@ foreach ($exe in $exes) {
 
     # Skip non-test helper binaries staged beside test binaries for candidate lookup
     if ($name -eq 'rustamp-plughost32.exe' -or $name -eq 'rustamp.exe') { continue }
+
+    # This binary has exactly one ignored capture test. Check at its selection,
+    # not before the suite: unavailable captures are a nonzero NOT RUN result,
+    # with no passed/failed test claim, and must not prevent other binaries running.
+    if ($extra -contains '--ignored' -and $name -like 'base291_acceptance-*') {
+        $blockReason = Get-Base291BlockReason $captureRoot
+        if ($blockReason) {
+            $testName = 'base291_vm_presented_pixels_match_reference_captures'
+            $summary = "NOT RUN: $testName; $blockReason"
+            Write-Host "BLOCKED: $summary"
+            if ($logDir) { $summary | Set-Content -LiteralPath (Join-Path $logDir ($name + '.log')) -Encoding UTF8 -ErrorAction Stop }
+            $results += [pscustomobject]@{
+                exe = $name; exit = -1; summary = $summary
+                blocked = $true; blockedTests = @($testName)
+                passed = @(); failed = @(); diagnostic = @($blockReason)
+                hung = $false; timeoutSeconds = $TestTimeoutSeconds
+            }
+            continue
+        }
+        $env:RUSTAMP_BASE291_VM_CAPTURES = $captureRoot
+    }
 
     # Group E tests: real audio endpoint tests cannot run in headless VM without a
     # hardware/VM redirection decision. When running a general --ignored pass (not
@@ -502,7 +534,7 @@ if ($bless) {
     testplugindsp = $env:RUSTAMP_TESTPLUGIN_DSP
     testplugindspsha256 = $dspPluginHash
     base291captures = $env:RUSTAMP_BASE291_VM_CAPTURES
-    # LEFT OUT / MISSING / DID NOT START rows are not executed binaries.
+    # BLOCKED / LEFT OUT / MISSING / DID NOT START rows are not executed binaries.
     ran       = $executedCount
     testsRun  = (@($results | ForEach-Object { $_.passed }).Count + @($results | ForEach-Object { $_.failed }).Count)
     failed    = @($results | Where-Object { $_.exit -ne 0 }).Count

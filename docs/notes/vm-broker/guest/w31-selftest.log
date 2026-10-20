@@ -1,0 +1,47 @@
+base291 BLOCKED / NOT RUN: required capture missing or empty: C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\absent-captures\session-proof.json (23 missing/empty files; full list in runner-status.json); other tests will continue; this is not a pass
+BLOCKED: NOT RUN: base291_vm_presented_pixels_match_reference_captures; required capture missing or empty: C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\absent-captures\session-proof.json; host source C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\absent-captures; 23 missing/empty files (full list: C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\availability-stage\runner-status.json)
+running: gen_acceptance-012345.exe
+
+--- Ignored Tests Execution Summary (W12 Inventory) ---
+  [NOT RUN] Group A (VM GUI)            the_menu_popup_opens_at_the_measured_size
+  [NOT RUN] Group A (VM GUI)            the_windowed_player_opens_a_window_inside_the_test_vm
+  [NOT RUN] Group A (VM GUI)            the_equalizer_window_opens_at_its_docked_size_and_position
+  [NOT RUN] Group A (VM GUI)            the_main_menu_popup_opens_at_the_measured_client_size
+  [NOT RUN] Group A (VM GUI)            the_playlist_window_opens_docked_below_the_main_window
+  [NOT RUN] Group A (VM GUI)            the_new_dialogs_pin_their_os_window_parameters
+  [NOT RUN] Group A (VM GUI)            opening_the_playlist_window_needs_an_os_window
+  [NOT RUN] Group A (VM GUI)            opening_either_dialog_needs_an_os_window
+  [BLOCKED] Group A (VM Captures)       base291_vm_presented_pixels_match_reference_captures (NOT RUN: base291_vm_presented_pixels_match_reference_captures; required capture missing or empty: C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\absent-captures\session-proof.json; host source C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\absent-captures; 23 missing/empty files (full list: C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\availability-stage\runner-status.json))
+  [NOT RUN] Group B (VM Real Process)   spawns_the_real_host_without_a_window
+  [NOT RUN] Group B (VM Real Process)   app_published_state_reaches_the_host_window
+  [NOT RUN] Group B (VM Real Process)   creates_the_real_host_window_vm_only
+  [NOT RUN] Group C (Resident Fixtures) named_pcm_two_process_transfer_and_seek
+  [NOT RUN] Group C (Resident Fixtures) pcm_process::host_exits_mid_stream_and_infinite_read_survives
+  [NOT RUN] Group C (Resident Fixtures) pcm_process::killing_the_helper_mid_stream_is_a_loud_error_and_never_a_torn_frame
+  [NOT RUN] Group C (Resident Fixtures) named_dsp_two_process_gain_round_trip_then_sticky_eos
+  [NOT RUN] Group C (Resident Fixtures) dsp_process::host_exits_mid_stream_and_infinite_read_survives
+  [NOT RUN] Group C (Resident Fixtures) dsp_process::killing_the_dsp_helper_mid_stream_is_a_loud_error_and_never_a_torn_frame
+  [NOT RUN] Group D (i686 DLL Acceptance) loads_real_32bit_in_openmpt_dll_and_proves_host_interaction
+  [NOT RUN] Group D (i686 DLL Acceptance) approved_real_dll_maps_headlessly_from_verified_snapshot
+  [NOT RUN] Group D (i686 DLL Acceptance) real_dsp_plugin_loads_initializes_and_changes_audio_through_the_bridge
+  [NOT RUN] Group D (i686 DLL Acceptance) a_real_general_purpose_plugin_is_loaded_answers_from_its_own_code_and_quits_cleanly
+  [NOT RUN] Group D (i686 DLL Acceptance) the_real_host_process_loads_a_general_purpose_dll_and_quits_it_cleanly
+  [NOT RUN] Group D (i686 DLL Acceptance) a_real_input_plugin_is_loaded_filled_plays_and_quits_cleanly
+  [NOT RUN] Group D (i686 DLL Acceptance) a_real_input_plugin_hands_its_audio_to_the_selected_output_plugin
+  [BLOCKED] Group E (Real Audio Endpoint) the_real_device_plays_a_reference_file_to_its_end (Real audio endpoint decision (WASAPI default device))
+  [BLOCKED] Group E (Real Audio Endpoint) the_cable_carries_the_fixture_tone (VB-Audio Virtual Cable installation in VM)
+
+Ignored tests: 0 ran, 3 blocked (named reasons above; NOT RUN is not a pass), 0 missing plugin fixture, 27 total in inventory
+BLOCKED: NOT RUN: base291_vm_presented_pixels_match_reference_captures; required capture missing or empty: C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\absent-captures\session-proof.json; host source C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\absent-captures; 23 missing/empty files (full list: C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\availability-stage\runner-status.json)
+running: base291_acceptance-012345.exe
+running: gen_acceptance-012345.exe
+running: base291_acceptance-012345.exe
+base291 BLOCKED / NOT RUN: required capture missing or empty: C:\Users\micro\.local\share\opencode\worktree\26de0e\wave131-update\docs\notes\vm-broker\guest\fixture-staging-selftest-6de533830a0c4f6ab02df386ec2af9e4\absent-again\session-proof.json (23 missing/empty files; full list in runner-status.json); other tests will continue; this is not a pass
+    staged required i686 gen_rustamp_fixture.dll beside both sets of binaries
+    staged required i686 out_rustamp_fixture.dll beside both sets of binaries
+    staged required i686 in_rustamp_fixture.dll beside both sets of binaries
+    staged required i686 in_handoff_rustamp_fixture.dll beside both sets of binaries
+    staged required i686 vis_rustamp_fixture.dll beside both sets of binaries
+    staged required i686 dsp_rustamp_fixture.dll beside both sets of binaries
+    staged required i686 crash_rustamp_fixture.dll beside both sets of binaries
+fixture staging self-test: 63 checks passed; no guest operation or binary execution

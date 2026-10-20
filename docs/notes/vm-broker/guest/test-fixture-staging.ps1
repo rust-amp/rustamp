@@ -10,7 +10,7 @@ $hostAst = [Management.Automation.Language.Parser]::ParseFile($hostRunner, [ref]
 if ($errors) { throw ($errors -join "`n") }
 $guestAst = [Management.Automation.Language.Parser]::ParseFile($guestRunner, [ref]$tokens, [ref]$errors)
 if ($errors) { throw ($errors -join "`n") }
-foreach ($name in 'Assert-RequiredFile', 'Copy-RequiredFile', 'Assert-I686Pe', 'Assert-Base291Captures',
+foreach ($name in 'Assert-RequiredFile', 'Copy-RequiredFile', 'Assert-I686Pe', 'Get-Base291MissingFiles', 'Assert-Base291Captures',
     'Assert-SeparateFixturePaths', 'Get-Inventory', 'Assert-Inventory', 'Test-SelectedIgnoredBinary') {
     $definition = $hostAst.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -18,10 +18,13 @@ foreach ($name in 'Assert-RequiredFile', 'Copy-RequiredFile', 'Assert-I686Pe', '
     if (-not $definition) { throw "host helper missing: $name" }
     . ([scriptblock]::Create($definition.Extent.Text))
 }
-$guestDefinition = $guestAst.Find({ param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RequiredFixture'
-}, $true)
-. ([scriptblock]::Create($guestDefinition.Extent.Text))
+foreach ($name in 'Assert-RequiredFixture', 'Get-Base291BlockReason') {
+    $guestDefinition = $guestAst.Find({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    if (-not $guestDefinition) { throw "guest helper missing: $name" }
+    . ([scriptblock]::Create($guestDefinition.Extent.Text))
+}
 $checks = 0
 function Assert-Check([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -34,6 +37,7 @@ function Assert-Refuses([scriptblock]$Action, [string]$Message) {
 }
 
 $scratch = Join-Path $PSScriptRoot ('fixture-staging-selftest-' + [guid]::NewGuid().ToString('N'))
+$previousCaptures = $env:RUSTAMP_BASE291_VM_CAPTURES
 try {
     $null = New-Item -ItemType Directory -Path $scratch
     $source = Join-Path $scratch 'fixture.dll'
@@ -87,6 +91,119 @@ try {
         Assert-Inventory @(Get-Inventory @(Get-ChildItem $captureSource -File) $captureSource) `
             @(Get-Inventory @(Get-ChildItem $captureCopy -File) $captureCopy) 'capture'
     } 'incomplete capture inventory did not refuse'
+
+    # Run the production host capture staging clause, then the production guest
+    # loop with a fake child launcher. No actual test binary, GUI or broker runs.
+    $captureClause = $hostAst.Find({ param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Extent.Text.StartsWith('if ($captureRequired)') -and
+        $node.Extent.Text.Contains('runner-status.json')
+    }, $true)
+    $guestLoop = $guestAst.Find({ param($node)
+        $node -is [Management.Automation.Language.ForEachStatementAst] -and
+        $node.Extent.Text.StartsWith('foreach ($exe in $exes)')
+    }, $true)
+    Assert-Check ($null -ne $captureClause -and $null -ne $guestLoop) 'production capture staging/guest loop missing'
+    function Step($Text) { }
+    function Invoke-TestBinary {
+        param($Exe, $ArgList, $TimeoutSeconds)
+        $script:launched += Split-Path $Exe -Leaf
+        [pscustomobject]@{
+            started = $true; hung = $false; exit = 0; notes = @(); stderr = ''
+            stdout = "test unrelated_fixture_test ... ok`ntest result: ok. 1 passed; 0 failed; 0 ignored"
+        }
+    }
+    $Base291Captures = Join-Path $scratch 'absent-captures'
+    $captureStage = Join-Path $scratch 'availability-stage'
+    $captureRequired = $true
+    . ([scriptblock]::Create($captureClause.Extent.Text))
+    $availability = Get-Content (Join-Path $captureStage 'runner-status.json') -Raw | ConvertFrom-Json
+    Assert-Check (-not $availability.ready) 'missing source was certified ready'
+    Assert-Check ($availability.missing -contains (Join-Path $Base291Captures 'session-proof.json')) 'host proof path missing from availability record'
+    $captureRoot = $captureStage
+    $reason = Get-Base291BlockReason $captureRoot
+    Assert-Check ($reason.Contains((Join-Path $Base291Captures 'session-proof.json'))) 'guest blocker lost original host lookup path'
+    $deps = Join-Path $scratch 'fake-binaries'
+    $logDir = Join-Path $scratch 'logs'
+    $null = New-Item -ItemType Directory -Path $deps, $logDir
+    $baseExe = Join-Path $deps 'base291_acceptance-012345.exe'
+    $otherExe = Join-Path $deps 'gen_acceptance-012345.exe'
+    Set-Content $baseExe 'never executed'
+    Set-Content $otherExe 'never executed'
+    $exes = @($baseExe, $otherExe)
+    $extra = @('--ignored', '--test-threads=1')
+    $filter = ''
+    $desktopFree = $false
+    $TestTimeoutSeconds = 300
+    $results = @(); $executedCount = 0; $script:launched = @()
+    . ([scriptblock]::Create($guestLoop.Extent.Text))
+    Assert-Check ($executedCount -eq 1 -and $script:launched.Count -eq 1 -and $script:launched[0] -like 'gen_acceptance-*') 'capture blocker prevented unrelated ignored binary from running'
+    Assert-Check ($results.Count -eq 2 -and $results[0].blocked -and $results[0].exit -ne 0) 'missing captures were not a nonzero named blocked result'
+    Assert-Check ($results[0].passed.Count -eq 0 -and $results[0].failed.Count -eq 0) 'NOT RUN capture case was reported as executed'
+    Assert-Check ($results[0].blockedTests -contains 'base291_vm_presented_pixels_match_reference_captures') 'blocked test name missing'
+    Assert-Check ((Get-Content (Join-Path $logDir ((Split-Path $baseExe -Leaf) + '.log')) -Raw).Contains($reason)) 'blocked per-binary log lost reason'
+    Assert-Check (@($results | Where-Object { $_.exit -ne 0 }).Count -eq 1) 'mixed pass would exit green despite selected missing fixture'
+    $result = . ([scriptblock]::Create($guestAst.EndBlock.Statements[-1].Extent.Text))
+    Assert-Check ($result.failed -eq 1 -and $result.ran -eq 1 -and $result.testsRun -eq 1) 'guest aggregate lost blocker or counted NOT RUN as executed'
+    $failureGate = $hostAst.Find({ param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Extent.Text.StartsWith('$runFailed =')
+    }, $true)
+    Assert-Check ($null -ne $failureGate) 'host result failure gate missing'
+    $hungCount = $blessMissing = $stallCount = 0
+    $captureUnconfirmed = $true
+    . ([scriptblock]::Create($failureGate.Extent.Text))
+    Assert-Check $runFailed 'host failure gate certified mixed blocked run green'
+    $result.failed = 0
+    . ([scriptblock]::Create($failureGate.Extent.Text))
+    Assert-Check $runFailed 'host accepted unconfirmed capture environment despite selected capture test'
+    $result.failed = 1
+    $inventoryClause = $hostAst.Find({ param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Extent.Text.StartsWith("if (`$Filter -like '--ignored*')") -and
+        $node.Extent.Text.Contains('Ignored Tests Execution Summary')
+    }, $true)
+    Assert-Check ($null -ne $inventoryClause) 'ignored inventory missing'
+    $Filter = '--ignored'
+    $pluginsStaged = $dspStaged = $genFixtureStaged = $inFixtureStaged = $inHandoffFixtureStaged = $true
+    . ([scriptblock]::Create($inventoryClause.Extent.Text))
+    Assert-Check ($blockedCount -eq 3) 'inventory did not count base291 alongside two existing audio blockers'
+    $filter = 'base291_acceptance'
+    $results = @(); $executedCount = 0; $script:launched = @()
+    . ([scriptblock]::Create($guestLoop.Extent.Text))
+    Assert-Check ($executedCount -eq 0 -and $results.Count -eq 1 -and $results[0].exit -ne 0) 'explicit base291 selection did not fail loudly as NOT RUN'
+    $extra = @('--test-threads=1')
+    $results = @(); $executedCount = 0; $script:launched = @()
+    . ([scriptblock]::Create($guestLoop.Extent.Text))
+    Assert-Check ($executedCount -eq 1 -and -not $results[0].blocked) 'normal non-capture base291 tests were blocked'
+    $extra = @('--ignored', '--test-threads=1')
+    $filter = 'gen_acceptance'
+    $results = @(); $executedCount = 0; $script:launched = @()
+    . ([scriptblock]::Create($guestLoop.Extent.Text))
+    Assert-Check ($executedCount -eq 1 -and -not $results[0].blocked) 'unrelated targeted ignored selection was blocked'
+
+    $Base291Captures = $captureSource
+    . ([scriptblock]::Create($captureClause.Extent.Text))
+    Assert-Check (-not (Get-Base291BlockReason $captureRoot)) 'complete capture sentinels were blocked by runner presence gate'
+    $stagedProof = Join-Path $captureRoot 'session-proof.json'
+    [IO.File]::WriteAllBytes($stagedProof, [byte[]]@())
+    Assert-Check ((Get-Base291BlockReason $captureRoot).Contains($stagedProof)) 'empty guest capture proof was accepted'
+    Copy-Item -LiteralPath (Join-Path $captureSource 'session-proof.json') -Destination $stagedProof
+    $filter = 'base291_acceptance'
+    $results = @(); $executedCount = 0; $script:launched = @()
+    . ([scriptblock]::Create($guestLoop.Extent.Text))
+    Assert-Check ($executedCount -eq 1 -and -not $results[0].blocked -and $env:RUSTAMP_BASE291_VM_CAPTURES -eq $captureRoot) 'complete captures did not reach consumer with environment'
+    $lostPair = Join-Path $captureRoot 'eq-double.reference.png'
+    Remove-Item -LiteralPath $lostPair
+    Assert-Check ((Get-Base291BlockReason $captureRoot).Contains($lostPair)) 'guest did not recheck a pair lost after host staging'
+    $Base291Captures = Join-Path $scratch 'absent-again'
+    . ([scriptblock]::Create($captureClause.Extent.Text))
+    Copy-Item -Path (Join-Path $captureSource '*') -Destination $captureRoot
+    Assert-Check ((Get-Base291BlockReason $captureRoot).Contains($Base291Captures)) 'stale guest pairs overrode current missing host fixture'
+    Remove-Item -LiteralPath (Join-Path $captureRoot 'runner-status.json')
+    Assert-Check ((Get-Base291BlockReason $captureRoot).Contains('runner-status.json')) 'missing availability record silently accepted stale captures'
+    Set-Content -LiteralPath (Join-Path $captureRoot 'runner-status.json') -Value '{"version":1,"ready":"true"}'
+    Assert-Check ((Get-Base291BlockReason $captureRoot).Contains('invalid capture availability status')) 'malformed availability was accepted'
 
     $selected = @([pscustomobject]@{ Name = 'base291_acceptance-012345.exe' })
     $Filter = '--ignored'
@@ -165,5 +282,6 @@ try {
     Assert-Refuses { . ([scriptblock]::Create($stageLoop.Extent.Text)) } 'missing source fixture did not stop staging'
     Write-Output "fixture staging self-test: $checks checks passed; no guest operation or binary execution"
 } finally {
+    if ($null -eq $previousCaptures) { Remove-Item Env:\RUSTAMP_BASE291_VM_CAPTURES -ErrorAction SilentlyContinue } else { $env:RUSTAMP_BASE291_VM_CAPTURES = $previousCaptures }
     if (Test-Path -LiteralPath $scratch) { Remove-Item -LiteralPath $scratch -Recurse -Force }
 }
