@@ -58,6 +58,9 @@ pub mod resident;
 pub mod ring;
 pub mod vistap;
 
+#[cfg(test)]
+mod gain_properties;
+
 pub use convert::FormatConverter;
 pub use decode::TrackSource;
 pub use engine::{Engine, EngineConfig};
