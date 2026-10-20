@@ -60,7 +60,8 @@ fn beta07_default_launch_starts_open_and_checked() {
 fn beta07_skinned_close_emits_a_toggle_not_quit() {
     let mut app = headless_app(Config::default());
     assert_eq!(
-        app.playlist_mouse_down(264, 3).expect("skinned close"),
+        app.playlist_mouse_down(264, 3, Modifiers::NONE)
+            .expect("skinned close"),
         vec![Command::ToggleWindow(WindowId::Playlist)]
     );
     assert_playlist_state(&app, false);

@@ -13,6 +13,7 @@ use rustamp_app::skin::{self, SkinChoice};
 use rustamp_core::command::{Command, PrefsPage};
 use rustamp_core::config::{Config, ReplayGainMode, WindowLayout};
 use rustamp_core::state::{EqState, WindowId};
+use rustamp_ui::Modifiers;
 
 fn test_app_with_config(config: Config, config_path: Option<PathBuf>) -> App {
     let skin = skin::load(&SkinChoice::Builtin);
@@ -441,7 +442,8 @@ fn the_playlist_editors_windowshade_round_trips_through_the_config() {
     assert_eq!(app.playlist_frame_size(), (275, 116));
 
     // The title-bar shade button collapses the editor ...
-    app.playlist_mouse_down(254, 3).expect("shade applies");
+    app.playlist_mouse_down(254, 3, Modifiers::NONE)
+        .expect("shade applies");
     assert!(app.playlist_shaded());
     assert_eq!(app.playlist_frame_size(), (275, 14));
 

@@ -223,7 +223,9 @@ fn add_then_double_click_plays_the_typed_file() {
     let mut app = app(None);
 
     // ADD (S06 §4) opens the same files face, without playing (RFC 0005 O5).
-    let commands = app.playlist_mouse_down(24, 92).expect("ADD");
+    let commands = app
+        .playlist_mouse_down(24, 92, Modifiers::NONE)
+        .expect("ADD");
     assert_eq!(
         commands,
         vec![Command::OpenMedia {
@@ -405,7 +407,8 @@ fn the_playlist_close_hides_it_and_the_pl_button_brings_it_back() {
     let mut app = app(None);
     assert!(app.playlist_open());
     assert_eq!(
-        app.playlist_mouse_down(264, 3).expect("close"),
+        app.playlist_mouse_down(264, 3, Modifiers::NONE)
+            .expect("close"),
         vec![Command::ToggleWindow(WindowId::Playlist)]
     );
     assert!(!app.playlist_open());

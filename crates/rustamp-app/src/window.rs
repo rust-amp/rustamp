@@ -2395,7 +2395,10 @@ impl Windowed {
                             self.app.playlist_double_click(x, y)
                         } else {
                             self.playlist_click.remember(now, x, y);
-                            self.app.playlist_mouse_down(x, y)
+                            // The modifiers choose the list gesture: the
+                            // shift-range and the ctrl-toggle need them.
+                            self.app
+                                .playlist_mouse_down(x, y, map_modifiers(self.modifiers))
                         }
                     }
                     ElementState::Released => self.app.playlist_mouse_up(x, y),
@@ -3481,7 +3484,7 @@ mod tests {
                         // The skinned shade button (S01 §4: 9 x 9 at (254,3)).
                         self.presenter
                             .app
-                            .playlist_mouse_down(254, 3)
+                            .playlist_mouse_down(254, 3, Modifiers::NONE)
                             .expect("the shade click applies");
                     }
                     // The resize is requested in the tick after the click, so
@@ -3496,7 +3499,7 @@ mod tests {
                         );
                         self.presenter
                             .app
-                            .playlist_mouse_down(254, 3)
+                            .playlist_mouse_down(254, 3, Modifiers::NONE)
                             .expect("the shade click applies");
                     }
                     3 => {}

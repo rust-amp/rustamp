@@ -17,7 +17,7 @@ use rustamp_app::cli::OutputChoice;
 use rustamp_core::command::Command;
 use rustamp_core::config::Config;
 use rustamp_core::state::WindowId;
-use rustamp_ui::{MainWindowLayout, Widget, playlist_window};
+use rustamp_ui::{MainWindowLayout, Modifiers, Widget, playlist_window};
 
 /// A spot on the main window's title bar that is not a control.
 const MAIN_TITLE: (i32, i32) = (137, 7);
@@ -78,7 +78,10 @@ fn press_playlist(app: &mut App, x: i32, y: i32, now_ms: u64) -> Vec<Command> {
         .title_bar_double_click(WindowId::Playlist, x, y, now_ms)
         .expect("press");
     if commands.is_empty() {
-        commands.extend(app.playlist_mouse_down(x, y).expect("press"));
+        commands.extend(
+            app.playlist_mouse_down(x, y, Modifiers::NONE)
+                .expect("press"),
+        );
     }
     commands
 }

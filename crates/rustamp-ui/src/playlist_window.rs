@@ -760,7 +760,7 @@ mod tests {
             let skin = Skin::from_source(&mut source, &BuiltinDefaultSkin).unwrap();
             let mut window = PlaylistWindow::new();
             window.set_entries((0..4).map(EntryId).collect());
-            window.mouse_down(60, 28);
+            window.mouse_down(60, 28, crate::shortcuts::Modifiers::NONE);
             let before = render_playlist_window(&skin, &window, &[], true);
             for (pointer_y, line_y) in [
                 (23, LIST_TOP),
