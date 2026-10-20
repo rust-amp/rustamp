@@ -424,7 +424,8 @@ fn s06_section_3_the_pages_leave_no_gap_and_the_last_page_is_full() {
 /// the view follows the handle and the selection stays where it was.
 ///
 /// Only the model's half is pinned here: the app's scrollbar input routes
-/// the arrow pair (S06 §3) and does not yet route a handle drag.
+/// the arrow pair and the handle drag (S06 §3) - see the app's
+/// `s06_playlist_conformance.rs`.
 #[test]
 fn s06_section_3_the_handle_drag_moves_the_view_and_not_the_selection() {
     let mut window = window_with(60);

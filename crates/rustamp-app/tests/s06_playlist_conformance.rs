@@ -12,7 +12,7 @@
 //! * §2 - the single click at (60,28) selects the first visible row; SEL at
 //!   (74,92) selects all visible rows.
 //! * §3 - the arrows at (263,81) and (263,87) move the view by one page of
-//!   four rows.
+//!   four rows, and a dragged handle moves the view, not a selection.
 //! * §4 - ADD at (23,92) opens "Add file(s) to playlist", LIST OPTS at
 //!   (242,92) opens "Load Playlist", MISC at (110,92) opens the `#32768`
 //!   popup.
@@ -28,6 +28,7 @@ use rustamp_app::cli::OutputChoice;
 use rustamp_core::command::{Command, OpenMediaKind, SelectOp};
 use rustamp_core::config::Config;
 use rustamp_core::playlist::{EntryId, MediaLocation};
+use rustamp_ui::playlist_window::scroll_offset_for_handle_y;
 use rustamp_ui::{DialogKind, Modifiers};
 
 /// The headless app the cases drive (null output, no window).
@@ -126,6 +127,134 @@ fn s06_section_3_the_settled_arrow_points_page_the_view() {
     }
     assert_eq!(app.playlist().first_visible(), 56);
     assert_eq!(app.playlist().visible_ids().len(), 4);
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §3: a dragged handle **moves the view, not a selection**, and the
+/// drag reaches the model through the app's own pointer routing.
+///
+/// The handle's positions are settled (S01 §4.2: y = 20 at the scroll top and
+/// y = 60 at the bottom of a 60-entry list), so the pixel-to-row mapping is
+/// this implementation's own choice - the one
+/// [`scroll_offset_for_handle_y`] owns. What the spec settles is the effect:
+/// the view follows the handle and the selection stays where it was.
+#[test]
+fn s06_section_3_the_handle_drag_moves_the_view_through_the_app() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    // One row staged (S06 §2's click), so the selection can be watched.
+    app.playlist_mouse_down(60, 28, Modifiers::NONE)
+        .expect("the click applies");
+    assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+
+    // At the scroll top the handle sits at the top of the track (S01 §4.2).
+    let commands = app
+        .playlist_mouse_down(263, 20, Modifiers::NONE)
+        .expect("the handle applies");
+    assert!(commands.is_empty(), "the scrollbar sends no command");
+    assert_eq!(
+        app.playlist().first_visible(),
+        0,
+        "the press did not move it"
+    );
+
+    // The drag to the bottom of the track moves the view ...
+    app.playlist_mouse_move(263, 60);
+    assert_eq!(
+        app.playlist().first_visible(),
+        scroll_offset_for_handle_y(60, app.playlist().len(), app.playlist().row_pitch())
+    );
+    assert_eq!(app.playlist().first_visible(), 56, "the bottom page");
+    assert_eq!(app.playlist().visible_ids()[0], EntryId(56));
+    // ... and the selection stays where it was.
+    assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+
+    // The release ends the drag and sends nothing.
+    let commands = app.playlist_mouse_up(263, 60).expect("the release applies");
+    assert!(commands.is_empty());
+    assert_eq!(app.playlist().first_visible(), 56);
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §3: the drag clamps at both ends of the track - the view never leaves
+/// the list, whatever the pointer does.
+#[test]
+fn s06_section_3_the_handle_drag_clamps_at_the_ends_of_the_track() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    app.playlist_mouse_down(263, 20, Modifiers::NONE)
+        .expect("the handle applies");
+    // Far above the track: the view is at the top of the list.
+    app.playlist_mouse_move(263, -400);
+    assert_eq!(app.playlist().first_visible(), 0);
+    // Far below the track: the view is at the bottom page, and no further.
+    app.playlist_mouse_move(263, 4_000);
+    assert_eq!(app.playlist().first_visible(), 56);
+    // The offset never leaves the list's range.
+    for y in -20..120 {
+        app.playlist_mouse_move(263, y);
+        assert!(app.playlist().first_visible() <= 56);
+    }
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §2/§8 Q6: the list gestures survive the scrollbar wiring - a click on
+/// a row still selects it and a drag of the selection still reorders it.
+#[test]
+fn s06_section_3_the_list_gestures_survive_the_scrollbar_wiring() {
+    let mut app = test_app();
+    add_entries(&mut app, 4);
+    // A click on a row still selects exactly that row (S06 §2).
+    let commands = app
+        .playlist_mouse_down(60, 42, Modifiers::NONE)
+        .expect("the click applies");
+    assert_eq!(
+        commands,
+        vec![Command::Select(SelectOp::Set(vec![EntryId(1)]))]
+    );
+    assert_eq!(app.playlist().selected_ids(), vec![EntryId(1)]);
+    // A drag of the selection still reorders it (S06 §8 Q6, own choice).
+    app.playlist_mouse_move(60, 74);
+    let commands = app.playlist_mouse_up(60, 74).expect("the drop applies");
+    assert_eq!(
+        commands,
+        vec![Command::MoveEntries {
+            ids: vec![EntryId(1)],
+            to: 3
+        }]
+    );
+    assert_eq!(
+        app.playlist().visible_ids(),
+        vec![EntryId(0), EntryId(2), EntryId(3), EntryId(1)]
+    );
+    assert!(app.drain_notes().is_empty());
+}
+
+/// A press on the scrollbar **track** pages the view.
+///
+/// **Own choice**: S06 §3 settles the two arrow points and the handle drag
+/// and says nothing about the track. This is the usual track behaviour - one
+/// page up above the handle, one page down below it - and it uses the same
+/// one-page step the arrows use.
+#[test]
+fn the_scrollbar_track_pages_the_view() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    // At the scroll top the handle is at the top of the track, so a press
+    // below it pages down.
+    let commands = app
+        .playlist_mouse_down(263, 60, Modifiers::NONE)
+        .expect("the track applies");
+    assert!(commands.is_empty(), "the scrollbar sends no command");
+    assert_eq!(app.playlist().first_visible(), 4);
+    // Below the handle: one page down.
+    app.playlist_mouse_down(263, 70, Modifiers::NONE)
+        .expect("the track applies");
+    assert_eq!(app.playlist().first_visible(), 8);
+    // Above the handle: one page up.
+    app.playlist_mouse_down(263, 21, Modifiers::NONE)
+        .expect("the track applies");
+    assert_eq!(app.playlist().first_visible(), 4);
     assert!(app.drain_notes().is_empty());
 }
 

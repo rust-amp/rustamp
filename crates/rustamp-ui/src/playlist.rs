@@ -1059,6 +1059,14 @@ pub struct PlaylistWindow {
     shift_focus: Option<EntryId>,
     current: Option<EntryId>,
     drag: Option<PlaylistDrag>,
+    /// The scrollbar handle drag: how far below the handle's top the pointer
+    /// took hold of it, while the handle is held.
+    ///
+    /// `None` when no handle is held. The grab offset keeps the handle under
+    /// the pointer exactly as it was grabbed, so taking hold of the handle
+    /// never moves the view (own choice: S06 §3 settles that a dragged
+    /// handle moves the view, not how the grab behaves).
+    scrollbar_grab: Option<i32>,
 }
 
 impl PlaylistWindow {
@@ -1740,6 +1748,94 @@ impl PlaylistWindow {
         }
     }
 
+    /// A press on the scrollbar at `(x, y)`.
+    ///
+    /// The scrollbar answers three parts, each with its own rule:
+    ///
+    /// * the **arrow pair** pages the view one page per press (S06 §3,
+    ///   settled);
+    /// * the **handle** takes hold of it: the drag capture starts and the
+    ///   view does not move yet. A dragged handle moves the view, not a
+    ///   selection (S06 §3);
+    /// * the **track** pages the view one page up (above the handle) or one
+    ///   page down (below it) - **own choice**: S06 §3 settles the arrows
+    ///   and the handle drag and says nothing about the track. It is the
+    ///   usual track behaviour and it uses the same one-page step the arrows
+    ///   use.
+    ///
+    /// Returns whether the scrollbar took the press. The view is the model's
+    /// own state, so a scrollbar press produces no command.
+    pub fn press_scrollbar(&mut self, x: i32, y: i32) -> bool {
+        if self.windowshade {
+            return false;
+        }
+        if let Some(direction) = crate::playlist_window::hit_test_scroll(x, y) {
+            self.scroll_page(direction);
+            return true;
+        }
+        let Some(hit) = crate::playlist_window::hit_test_scrollbar(
+            x,
+            y,
+            self.first_visible,
+            self.len(),
+            self.row_pitch(),
+        ) else {
+            return false;
+        };
+        match hit {
+            crate::playlist_window::ScrollbarHit::Handle => {
+                let top = crate::playlist_window::scroll_handle_y(
+                    self.first_visible,
+                    self.len(),
+                    self.row_pitch(),
+                );
+                self.scrollbar_grab = Some(y - top);
+                true
+            }
+            crate::playlist_window::ScrollbarHit::TrackAbove => {
+                self.scroll_page(ScrollDirection::Up);
+                true
+            }
+            crate::playlist_window::ScrollbarHit::TrackBelow => {
+                self.scroll_page(ScrollDirection::Down);
+                true
+            }
+        }
+    }
+
+    /// Moves the held scrollbar handle to the pointer at `y`.
+    ///
+    /// Returns whether a handle was held. The pointer's position maps to the
+    /// handle's top through the grab offset, and the handle's top maps to the
+    /// scroll offset through
+    /// [`scroll_offset_for_handle_y`](crate::playlist_window::scroll_offset_for_handle_y),
+    /// so the handle follows the pointer and the view follows the handle
+    /// (S06 §3: a dragged handle moves the view, not a selection). The
+    /// mapping clamps at both ends of the track and the offset is clamped
+    /// into the list, so the view never leaves it.
+    pub fn drag_scrollbar(&mut self, y: i32) -> bool {
+        let Some(grab) = self.scrollbar_grab else {
+            return false;
+        };
+        let top = y - grab;
+        let offset =
+            crate::playlist_window::scroll_offset_for_handle_y(top, self.len(), self.row_pitch());
+        self.scroll_to(offset);
+        true
+    }
+
+    /// Ends the scrollbar handle drag.
+    ///
+    /// Returns whether a handle was held.
+    pub fn release_scrollbar(&mut self) -> bool {
+        self.scrollbar_grab.take().is_some()
+    }
+
+    /// Whether the scrollbar handle is held.
+    pub fn scrollbar_captured(&self) -> bool {
+        self.scrollbar_grab.is_some()
+    }
+
     /// Scrolls so `index` is the first visible entry, clamped into the list.
     pub fn scroll_to(&mut self, index: usize) {
         self.first_visible = index.min(self.max_first_visible());
@@ -2386,6 +2482,149 @@ mod tests {
             ),
             60
         );
+    }
+
+    /// S06 §3: a dragged handle **moves the view, not a selection**.
+    ///
+    /// The handle's positions are settled (S01 §4.2: y = 20 at the scroll top
+    /// and y = 60 at the bottom of a 60-entry list), so the pixel-to-row
+    /// mapping is this implementation's own choice - the one
+    /// [`scroll_offset_for_handle_y`](crate::playlist_window::scroll_offset_for_handle_y)
+    /// owns. What the spec settles is the effect: the view follows the
+    /// handle and the selection stays where it was.
+    #[test]
+    fn a_dragged_handle_moves_the_view_and_not_the_selection() {
+        let mut window = window_with(60);
+        window.apply_select(&SelectOp::Set(vec![EntryId(0)]));
+        // At the scroll top the handle sits at the top of the track (y = 20).
+        assert_eq!(
+            crate::playlist_window::scroll_handle_y(0, 60, window.row_pitch()),
+            20
+        );
+        // A press on the handle takes hold of it; the view does not move yet.
+        assert!(window.press_scrollbar(263, 20));
+        assert!(window.scrollbar_captured());
+        assert_eq!(window.first_visible(), 0);
+        // The drag to the bottom of the track maps through the model's helper.
+        window.drag_scrollbar(60);
+        assert_eq!(
+            window.first_visible(),
+            crate::playlist_window::scroll_offset_for_handle_y(60, 60, window.row_pitch())
+        );
+        assert_eq!(window.first_visible(), 56, "the bottom page of 60 entries");
+        // The view moved ...
+        assert_eq!(window.visible_ids()[0], EntryId(56));
+        // ... and the selection did not move with it.
+        assert_eq!(window.selected_ids(), vec![EntryId(0)]);
+        // The release ends the capture; a later move changes nothing.
+        assert!(window.release_scrollbar());
+        assert!(!window.scrollbar_captured());
+        window.drag_scrollbar(20);
+        assert_eq!(window.first_visible(), 56);
+        assert!(!window.release_scrollbar(), "the capture was already gone");
+    }
+
+    /// The drag clamps at both ends of the track: the view never leaves the
+    /// list, whatever the pointer does.
+    #[test]
+    fn the_handle_drag_clamps_at_both_ends_of_the_track() {
+        let mut window = window_with(60);
+        assert!(window.press_scrollbar(263, 20));
+        // Far above the track: the view is at the top of the list.
+        window.drag_scrollbar(-500);
+        assert_eq!(window.first_visible(), 0);
+        // Far below the track: the view is at the bottom page, and no further.
+        window.drag_scrollbar(5_000);
+        assert_eq!(window.first_visible(), 56);
+        // The offset never leaves the list's range.
+        for y in -100..200 {
+            window.drag_scrollbar(y);
+            assert!(window.first_visible() <= window.max_first_visible());
+        }
+    }
+
+    /// Taking hold of the handle does not move the view: the handle keeps
+    /// the place the pointer took hold of it (own choice - the spec settles
+    /// that a dragged handle moves the view, not how the grab behaves).
+    #[test]
+    fn taking_hold_of_the_handle_keeps_the_grab_and_the_view() {
+        let mut window = window_with(60);
+        window.scroll_to(56);
+        // At the bottom page the handle is at y = 60..77; the pointer takes
+        // hold of it eight pixels below its top.
+        assert_eq!(
+            crate::playlist_window::scroll_handle_y(56, 60, window.row_pitch()),
+            60
+        );
+        assert!(window.press_scrollbar(263, 68));
+        assert_eq!(
+            window.first_visible(),
+            56,
+            "the press did not move the view"
+        );
+        // The handle follows the pointer: eight pixels below the pointer, its
+        // top reaches the top of the track.
+        window.drag_scrollbar(28);
+        assert_eq!(window.first_visible(), 0, "the handle's top reached y = 20");
+    }
+
+    /// S06 §3's visual reading of the handle drag lines up with the settled
+    /// handle positions.
+    ///
+    /// The spec quotes the rows `44 ref`, `45 tl`, `47` for a drag from
+    /// (263,20) to (263,60) - the last page of a 48-entry list. The handle's
+    /// positions are settled (S01 §4.2: y = 20 at the scroll top, y = 60 at
+    /// the bottom), so a drag to the bottom of the track shows the bottom
+    /// page. The spec's own phrase ("moves the view toward the top of the
+    /// list") does not match the rows it quotes; the rows match the settled
+    /// positions, and this mapping reproduces them.
+    #[test]
+    fn the_handle_drag_reproduces_the_rows_s06_quotes() {
+        let mut window = window_with(48);
+        assert!(window.press_scrollbar(263, 20));
+        window.drag_scrollbar(60);
+        assert_eq!(window.first_visible(), 44);
+        let visible = window.visible_ids();
+        assert_eq!(visible[0], EntryId(44));
+        assert_eq!(visible[3], EntryId(47));
+    }
+
+    /// A press on the track pages the view.
+    ///
+    /// **Own choice**: S06 §3 settles the arrow points and the handle drag
+    /// and says nothing about the track. This is the usual track behaviour,
+    /// and it uses the same one-page step the arrows use.
+    #[test]
+    fn a_press_on_the_track_pages_the_view() {
+        let mut window = window_with(60);
+        window.scroll_to(28);
+        // In the middle of the list the handle is in the middle of the track
+        // (y = 40..57).
+        assert_eq!(
+            crate::playlist_window::scroll_handle_y(28, 60, window.row_pitch()),
+            40
+        );
+        // Above the handle: one page up.
+        assert!(window.press_scrollbar(263, 25));
+        assert_eq!(window.first_visible(), 24);
+        // Below the handle: one page down.
+        assert!(window.press_scrollbar(263, 70));
+        assert_eq!(window.first_visible(), 28);
+    }
+
+    /// The arrow pair keeps its settled one-page step (S06 §3) through the
+    /// same press, and a press outside the scrollbar is not the scrollbar's.
+    #[test]
+    fn the_arrow_pair_pages_the_view_through_the_same_press() {
+        let mut window = window_with(60);
+        assert!(window.press_scrollbar(263, 87));
+        assert_eq!(window.first_visible(), 4);
+        assert!(window.press_scrollbar(263, 81));
+        assert_eq!(window.first_visible(), 0);
+        // Outside the scrollbar column nothing hits.
+        assert!(!window.press_scrollbar(259, 30));
+        assert!(!window.press_scrollbar(268, 30));
+        assert!(!window.press_scrollbar(60, 30));
     }
 
     #[test]
