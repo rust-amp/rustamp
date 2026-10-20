@@ -160,10 +160,17 @@
 //!   around the key and the value is dropped.
 //! * A value longer than the reference's 2048-byte staging buffer is cut
 //!   short there (S12 §4.3, §9), on a character boundary.
+//! * A UTF-8 byte order mark in front of the first line is dropped: editors
+//!   add one, and left in place it would hide the first section header.
 //! * A line the parser cannot read (no `=`, an unterminated section header,
 //!   an empty key) is **reported** and skipped: it never stops the import.
 //! * A key that appears twice keeps its **first** value and the repetition is
 //!   reported. The spec does not say which value wins, so this is our choice.
+//! * A section header that appears twice is **one** section (S12 §2 gives the
+//!   file one section per name): its keys join the first section, the
+//!   repetition is reported, and a key the two headers share keeps its first
+//!   value - so a repeated `[Winamp]` cannot silently overwrite what the
+//!   first one said.
 
 use std::path::PathBuf;
 
@@ -222,7 +229,8 @@ impl IniSection {
 pub struct IniFile {
     /// The sections, in the order the file wrote them.
     pub sections: Vec<IniSection>,
-    /// The lines the parser could not read, each with the reason.
+    /// The parser's notes, each with the reason: a line it could not read, and
+    /// a section header or a key that appears more than once.
     pub problems: Vec<String>,
 }
 
@@ -233,6 +241,10 @@ impl IniFile {
     /// [`problem`](Self::problems) and the rest of the file is read as usual.
     pub fn parse(text: &str) -> IniFile {
         let mut file = IniFile::default();
+        // A UTF-8 byte order mark in front of the first line is not text the
+        // reference wrote: editors add it, and if it stays it hides the first
+        // section header (the whole file would land in no section).
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         // The index of the section the keys belong to; `None` means the key
         // came before the first section header.
         let mut current: Option<usize> = None;
@@ -252,11 +264,33 @@ impl IniFile {
                             ));
                             continue;
                         }
-                        file.sections.push(IniSection {
-                            name: name.to_string(),
-                            entries: Vec::new(),
-                        });
-                        current = Some(file.sections.len() - 1);
+                        // A repeated header names the same section: the file is
+                        // one section per name (S12 §2), so the keys join the
+                        // first section and the repetition is reported. A key
+                        // the two headers share then follows the usual rule -
+                        // the first value wins - instead of the later section
+                        // silently overwriting the earlier one.
+                        match file
+                            .sections
+                            .iter()
+                            .position(|section| section.name.eq_ignore_ascii_case(name))
+                        {
+                            Some(index) => {
+                                file.problems.push(format!(
+                                    "line {}: the section `[{name}]` appears more than once; \
+                                     its keys join the first section",
+                                    number + 1
+                                ));
+                                current = Some(index);
+                            }
+                            None => {
+                                file.sections.push(IniSection {
+                                    name: name.to_string(),
+                                    entries: Vec::new(),
+                                });
+                                current = Some(file.sections.len() - 1);
+                            }
+                        }
                     }
                     None => file.problems.push(format!(
                         "line {}: a section header without a closing bracket",
@@ -399,7 +433,8 @@ pub struct ImportReport {
     /// What happened to every key of the file, in the order the file wrote
     /// them.
     pub keys: Vec<KeyOutcome>,
-    /// The lines the parser could not read.
+    /// The parser's notes: a line it could not read, and a section header or a
+    /// key that appears more than once.
     pub problems: Vec<String>,
 }
 
@@ -453,6 +488,11 @@ impl ImportReport {
     }
 
     /// One line per key, for the report the user reads.
+    ///
+    /// The parser's notes come last, each one prefixed with `warning: `. A
+    /// note is not always an unreadable line - a repeated key is read, its
+    /// repetition is what the note is about - so the prefix does not claim
+    /// that the line was not read.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::with_capacity(self.keys.len());
         for entry in &self.keys {
@@ -482,7 +522,7 @@ impl ImportReport {
             lines.push(line);
         }
         for problem in &self.problems {
-            lines.push(format!("not read: {problem}"));
+            lines.push(format!("warning: {problem}"));
         }
         lines
     }
@@ -490,10 +530,10 @@ impl ImportReport {
     /// A one-line summary of the import.
     pub fn summary(&self) -> String {
         format!(
-            "{} applied, {} not applied, {} lines not read",
+            "{} applied, {} not applied, {}",
             self.applied().count(),
             self.not_applied().count(),
-            self.problems.len()
+            warnings_phrase(self.problems.len())
         )
     }
 }
@@ -599,9 +639,21 @@ pub fn report_line(path: &std::path::Path, report: &ImportReport) -> String {
         ));
     }
     if !report.problems.is_empty() {
-        line.push_str(&format!(", {} lines not read", report.problems.len()));
+        line.push_str(&format!(", {}", warnings_phrase(report.problems.len())));
     }
     line
+}
+
+/// The number of the parser's notes, in words: `1 warning`, `2 warnings`.
+///
+/// A note is not always an unreadable line (a repeated key is read), so the
+/// report counts warnings and does not claim that the lines were skipped.
+fn warnings_phrase(count: usize) -> String {
+    if count == 1 {
+        "1 warning".to_string()
+    } else {
+        format!("{count} warnings")
+    }
 }
 
 /// Reads the Winamp configuration at `path` and maps it onto `current`.
@@ -1033,8 +1085,21 @@ fn apply_key(
     }
 
     outcome.unwrap_or_else(|| Outcome::NotApplied {
-        reason: "the value is not a number".to_string(),
+        reason: refusal_reason(&entry.value).to_string(),
     })
+}
+
+/// Why a value the mapper could not take became no setting.
+///
+/// The two cases are kept apart: a value that holds no number is a spelling
+/// problem, while a number the setting's own range cannot hold is a **range**
+/// problem. The report must not call `3000000000` "not a number".
+fn refusal_reason(value: &str) -> &'static str {
+    if int_value(value).is_some() {
+        "the value is outside the range the setting can hold"
+    } else {
+        "the value is not a number"
+    }
 }
 
 /// The outcome of an applied key, read the way the spec states it.
