@@ -253,7 +253,11 @@ pub(crate) fn frames_at(rate: u64, at: Duration) -> u64 {
 }
 
 /// The beginning of a file, as the header parse needs it.
-struct HeaderProbe {
+///
+/// The type is crate-internal: the malformed-input suite
+/// (`crate::probe_fuzz`) reads the probe of a file that cannot be a media
+/// file, and no caller outside the crate has a use for it.
+pub(crate) struct HeaderProbe {
     /// The length of the ID3v2 tag at the start of the file (0 when there is
     /// none).
     id3v2: usize,
@@ -492,7 +496,11 @@ const HEADER_WINDOW: usize = 512;
 ///
 /// `len` is the length of the file when it is known; it bounds the AIFF chunk
 /// walk.
-fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
+///
+/// The function is crate-internal: the malformed-input suite
+/// (`crate::probe_fuzz`) reads the probe of a file that cannot be a media
+/// file, and no caller outside the crate has a use for it.
+pub(crate) fn header_probe(reader: &mut dyn ReadSeek, len: Option<u64>) -> HeaderProbe {
     let mut head = [0u8; 10];
     if reader.read_exact(&mut head).is_err() {
         return HeaderProbe {

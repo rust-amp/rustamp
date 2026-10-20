@@ -193,7 +193,18 @@ fn top_level_boxes(reader: &mut dyn ReadSeek, from: u64, file_len: u64) -> Vec<M
 }
 
 /// Reads `len` bytes at `pos`.
-fn read_at(reader: &mut dyn ReadSeek, pos: u64, len: usize) -> Option<Vec<u8>> {
+///
+/// `file_len` is the length of the file: a read that reaches beyond it is
+/// refused, because the file cannot hold those bytes. The bound matters. A
+/// box states the number of its samples, and a hostile file states a number
+/// of four billion: a probe that read the table would allocate four
+/// gigabytes for a file of a few hundred bytes, and the probe of a file must
+/// not be a way to spend the memory of the player.
+fn read_at(reader: &mut dyn ReadSeek, pos: u64, len: usize, file_len: u64) -> Option<Vec<u8>> {
+    let end = pos.checked_add(u64::try_from(len).ok()?)?;
+    if end > file_len {
+        return None;
+    }
     reader.seek(SeekFrom::Start(pos)).ok()?;
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).ok()?;
@@ -252,13 +263,13 @@ fn trak(reader: &mut dyn ReadSeek, trak: &Mp4Box, file_len: u64) -> Option<Mp4Tr
 
     // The handler reference names what the track holds.
     let hdlr = mdia_boxes.iter().find(|b| b.is(b"hdlr"))?;
-    if read_at(reader, hdlr.start + 8, 4)? != *b"soun" {
+    if read_at(reader, hdlr.start + 8, 4, file_len)? != *b"soun" {
         return None;
     }
 
     // The media header states the duration of the track.
     let mdhd = mdia_boxes.iter().find(|b| b.is(b"mdhd"))?;
-    let (timescale, frames) = media_header(reader, mdhd)?;
+    let (timescale, frames) = media_header(reader, mdhd, file_len)?;
 
     // The sample tables state where the samples are and how big they are.
     let minf = mdia_boxes.iter().find(|b| b.is(b"minf"))?;
@@ -266,12 +277,13 @@ fn trak(reader: &mut dyn ReadSeek, trak: &Mp4Box, file_len: u64) -> Option<Mp4Tr
         .into_iter()
         .find(|b| b.is(b"stbl"))?;
     let stbl_boxes = boxes(reader, stbl.start, stbl.end, file_len);
-    let sizes = sample_sizes(reader, stbl_boxes.iter().find(|b| b.is(b"stsz"))?)?;
-    let mapping = sample_to_chunk(reader, stbl_boxes.iter().find(|b| b.is(b"stsc"))?)?;
+    let sizes = sample_sizes(reader, stbl_boxes.iter().find(|b| b.is(b"stsz"))?, file_len)?;
+    let mapping = sample_to_chunk(reader, stbl_boxes.iter().find(|b| b.is(b"stsc"))?, file_len)?;
     let chunks = chunk_offsets(
         reader,
         stbl_boxes.iter().find(|b| b.is(b"stco")),
         stbl_boxes.iter().find(|b| b.is(b"co64")),
+        file_len,
     )?;
     let (data_start, data_end) = sample_extent(&sizes, &mapping, &chunks)?;
 
@@ -284,18 +296,18 @@ fn trak(reader: &mut dyn ReadSeek, trak: &Mp4Box, file_len: u64) -> Option<Mp4Tr
 }
 
 /// The timescale and the duration of a track, as the media header states them.
-fn media_header(reader: &mut dyn ReadSeek, b: &Mp4Box) -> Option<(u32, u64)> {
-    let version = read_at(reader, b.start, 1)?[0];
+fn media_header(reader: &mut dyn ReadSeek, b: &Mp4Box, file_len: u64) -> Option<(u32, u64)> {
+    let version = read_at(reader, b.start, 1, file_len)?[0];
     let (timescale, duration) = match version {
         0 => {
-            let raw = read_at(reader, b.start + 4, 16)?;
+            let raw = read_at(reader, b.start + 4, 16, file_len)?;
             (
                 u32::from_be_bytes(raw[8..12].try_into().ok()?),
                 u64::from(u32::from_be_bytes(raw[12..16].try_into().ok()?)),
             )
         }
         1 => {
-            let raw = read_at(reader, b.start + 4, 28)?;
+            let raw = read_at(reader, b.start + 4, 28, file_len)?;
             (
                 u32::from_be_bytes(raw[16..20].try_into().ok()?),
                 u64::from_be_bytes(raw[20..28].try_into().ok()?),
@@ -332,8 +344,8 @@ impl SampleSizes {
 }
 
 /// Reads the sample size box: the number of samples and the size of each.
-fn sample_sizes(reader: &mut dyn ReadSeek, b: &Mp4Box) -> Option<SampleSizes> {
-    let head = read_at(reader, b.start, 12)?;
+fn sample_sizes(reader: &mut dyn ReadSeek, b: &Mp4Box, file_len: u64) -> Option<SampleSizes> {
+    let head = read_at(reader, b.start, 12, file_len)?;
     let uniform = u32::from_be_bytes(head[4..8].try_into().ok()?);
     let count = u32::from_be_bytes(head[8..12].try_into().ok()?);
     if uniform != 0 {
@@ -349,7 +361,8 @@ fn sample_sizes(reader: &mut dyn ReadSeek, b: &Mp4Box) -> Option<SampleSizes> {
     if u64::from(count) > room {
         return None;
     }
-    let raw = read_at(reader, b.start + 12, count as usize * 4)?;
+    let bytes = usize::try_from(u64::from(count) * 4).ok()?;
+    let raw = read_at(reader, b.start + 12, bytes, file_len)?;
     let sizes = raw
         .as_chunks::<4>()
         .0
@@ -373,14 +386,15 @@ struct StscEntry {
 }
 
 /// Reads the sample to chunk table: how many samples each chunk holds.
-fn sample_to_chunk(reader: &mut dyn ReadSeek, b: &Mp4Box) -> Option<Vec<StscEntry>> {
-    let head = read_at(reader, b.start, 8)?;
+fn sample_to_chunk(reader: &mut dyn ReadSeek, b: &Mp4Box, file_len: u64) -> Option<Vec<StscEntry>> {
+    let head = read_at(reader, b.start, 8, file_len)?;
     let count = u32::from_be_bytes(head[4..8].try_into().ok()?);
     let room = b.end.saturating_sub(b.start + 8) / 12;
     if u64::from(count) > room {
         return None;
     }
-    let raw = read_at(reader, b.start + 8, count as usize * 12)?;
+    let bytes = usize::try_from(u64::from(count) * 12).ok()?;
+    let raw = read_at(reader, b.start + 8, bytes, file_len)?;
     let mut out = Vec::with_capacity(count as usize);
     for e in raw.as_chunks::<12>().0 {
         out.push(StscEntry {
@@ -396,6 +410,7 @@ fn chunk_offsets(
     reader: &mut dyn ReadSeek,
     stco: Option<&Mp4Box>,
     co64: Option<&Mp4Box>,
+    file_len: u64,
 ) -> Option<Vec<u64>> {
     let (b, wide) = match (stco, co64) {
         (Some(b), _) => (b, false),
@@ -404,14 +419,15 @@ fn chunk_offsets(
         // samples are.
         (None, None) => return None,
     };
-    let head = read_at(reader, b.start, 8)?;
+    let head = read_at(reader, b.start, 8, file_len)?;
     let count = u32::from_be_bytes(head[4..8].try_into().ok()?);
     let width = if wide { 8usize } else { 4usize };
     let room = b.end.saturating_sub(b.start + 8) / width as u64;
     if u64::from(count) > room {
         return None;
     }
-    let raw = read_at(reader, b.start + 8, count as usize * width)?;
+    let bytes = usize::try_from(u64::from(count) * width as u64).ok()?;
+    let raw = read_at(reader, b.start + 8, bytes, file_len)?;
     let mut out = Vec::with_capacity(count as usize);
     for e in raw.chunks_exact(width) {
         let offset = if wide {
