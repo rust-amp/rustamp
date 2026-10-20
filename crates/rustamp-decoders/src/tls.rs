@@ -17,6 +17,10 @@
 //!   certificate is refused ([`CertificateFailure`]). A refused certificate
 //!   never becomes a plain connection: the failure names itself and the
 //!   stream ends there.
+//! * **The deadline of the handshake**: the timeout of the source bounds the
+//!   handshake as a whole and not only the gap between two reads, so a host
+//!   that trickles bytes into the connection cannot keep the client waiting
+//!   ([`DeadlineSocket`]).
 //! * **The cryptography**: TLS 1.3 and TLS 1.2 with the `ring` provider of
 //!   the `rustls` crate. `rustls` is a blocking library, so this crate stays
 //!   a decoder and pulls in no async runtime.
@@ -46,13 +50,93 @@ use std::fmt;
 use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use rustls_platform_verifier::BuilderVerifierExt;
 
 /// The stream of a TLS connection: the TLS layer over a socket.
-pub(crate) type TlsStream = StreamOwned<ClientConnection, TcpStream>;
+pub(crate) type TlsStream = StreamOwned<ClientConnection, DeadlineSocket>;
+
+/// The socket of a TLS connection, with the deadline of the handshake.
+///
+/// The timeout of the source bounds the **gap between two reads**, not the
+/// handshake as a whole: a host that trickles a byte into the connection
+/// every few milliseconds keeps every single read below that timeout and
+/// would keep the client waiting for as long as it keeps talking. While the
+/// handshake runs, every read of the socket therefore waits no longer than
+/// the time the handshake has left, and the socket gets its own timeout back
+/// when the handshake is over.
+pub(crate) struct DeadlineSocket {
+    /// The socket of the connection.
+    socket: TcpStream,
+    /// The moment the handshake has to be done by, while it runs.
+    deadline: Option<Instant>,
+    /// The read timeout of the socket: the budget of the source.
+    budget: Option<Duration>,
+}
+
+impl DeadlineSocket {
+    /// The socket of a connection, with the budget of the source.
+    ///
+    /// The budget is the read timeout the socket carries: the source sets it
+    /// before the connection is made, and it is the time the handshake may
+    /// take as a whole.
+    fn new(socket: TcpStream) -> Self {
+        let budget = socket.read_timeout().ok().flatten();
+        DeadlineSocket {
+            socket,
+            deadline: None,
+            budget,
+        }
+    }
+
+    /// Gives the socket a deadline for the handshake.
+    fn start_handshake(&mut self) {
+        self.deadline = self
+            .budget
+            .and_then(|budget| Instant::now().checked_add(budget));
+    }
+
+    /// Takes the deadline away and gives the socket its own timeout back.
+    fn end_handshake(&mut self) {
+        self.deadline = None;
+        if let Some(budget) = self.budget {
+            let _ = self.socket.set_read_timeout(Some(budget));
+        }
+    }
+}
+
+impl io::Read for DeadlineSocket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the TLS handshake ran out of time",
+                ));
+            }
+            // The socket waits no longer than the time that is left. A
+            // millisecond is the shortest wait a socket can be given.
+            let _ = self
+                .socket
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))));
+        }
+        self.socket.read(buf)
+    }
+}
+
+impl io::Write for DeadlineSocket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.socket.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
 
 /// The trust anchors a TLS connection is checked against.
 ///
@@ -116,16 +200,26 @@ impl TlsAnchors {
                 .with_no_client_auth()),
             // Only the named certificates: `rustls` checks the certificate.
             Some(certificates) => {
-                let mut roots = RootCertStore::empty();
-                for certificate in certificates {
-                    roots
-                        .add(CertificateDer::from(certificate.clone()))
-                        .map_err(|e| TlsError::Setup(e.to_string()))?;
-                }
+                let roots = root_store(certificates)?;
                 Ok(builder.with_root_certificates(roots).with_no_client_auth())
             }
         }
     }
+}
+
+/// The trust store of the named anchors.
+///
+/// The named certificates are the **only** anchors: the store of the
+/// operating system is not consulted, and an empty set of names is an empty
+/// store - it trusts nothing at all.
+fn root_store(certificates: &[Vec<u8>]) -> Result<RootCertStore, TlsError> {
+    let mut roots = RootCertStore::empty();
+    for certificate in certificates {
+        roots
+            .add(CertificateDer::from(certificate.clone()))
+            .map_err(|e| TlsError::Setup(e.to_string()))?;
+    }
+    Ok(roots)
 }
 
 /// Why the certificate of a host was refused.
@@ -170,6 +264,9 @@ impl fmt::Display for CertificateFailure {
     }
 }
 
+/// The failure of a handshake that the host ended in the middle of it.
+const CLOSED_IN_THE_MIDDLE: &str = "the host closed the connection before the handshake was done";
+
 /// The failures of the TLS layer.
 #[derive(Debug)]
 pub(crate) enum TlsError {
@@ -202,28 +299,40 @@ pub(crate) fn client_stream(
         .map_err(|_| TlsError::Setup(format!("{host:?} is not a host name")))?;
     let connection = ClientConnection::new(Arc::new(config), name)
         .map_err(|e| TlsError::Handshake(e.to_string()))?;
-    Ok(StreamOwned::new(connection, socket))
+    Ok(StreamOwned::new(connection, DeadlineSocket::new(socket)))
 }
 
 /// The handshake of a TLS stream.
 ///
 /// The handshake belongs to the connection: it happens while the source says
 /// that it is reaching the host, and a failure of it is a failure to connect.
+///
+/// The handshake has a **deadline of its own**: the timeout of the socket
+/// bounds the gap between two reads, and a host that trickles a byte into the
+/// connection every few milliseconds keeps every single read below that
+/// timeout. Without a deadline the client would wait for as long as the host
+/// keeps talking, so the socket waits no longer than the time the handshake
+/// has left. The deadline is the budget of the source, and the socket gets its
+/// own timeout back when the handshake is over.
 pub(crate) fn handshake(stream: &mut TlsStream) -> Result<(), TlsError> {
-    loop {
+    stream.sock.start_handshake();
+    let result = loop {
         let TlsStream { conn, sock } = stream;
         let (read, written) = conn.complete_io(sock).map_err(map_io_error)?;
         if !conn.is_handshaking() {
-            return Ok(());
+            break Ok(());
         }
         if read == 0 && written == 0 {
             // The host said nothing and the handshake is not done: the
-            // connection ended in the middle of it.
-            return Err(TlsError::Handshake(
-                "the host closed the connection before the handshake was done".into(),
-            ));
+            // connection ended in the middle of it. The TLS layer reports
+            // that as a failure of its own, so this is the net for a layer
+            // that reports no progress at all - without it the loop would
+            // spin.
+            break Err(TlsError::Handshake(CLOSED_IN_THE_MIDDLE.into()));
         }
-    }
+    };
+    stream.sock.end_handshake();
+    result
 }
 
 /// The failure of a read or a write of the TLS layer.
@@ -240,6 +349,12 @@ fn map_io_error(e: io::Error) -> TlsError {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     ) {
         return TlsError::Timeout;
+    }
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        // The host closed the connection in the middle of the handshake. The
+        // failure names what the host did: the text of the standard library
+        // ("unexpected end of file") says nothing about the handshake.
+        return TlsError::Handshake(CLOSED_IN_THE_MIDDLE.into());
     }
     TlsError::Handshake(e.to_string())
 }
@@ -280,6 +395,8 @@ fn map_certificate_error(e: rustls::CertificateError) -> CertificateFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
 
     #[test]
     fn the_anchors_of_the_operating_system_can_be_used() {
@@ -303,6 +420,49 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_set_of_anchors_is_an_empty_trust_store() {
+        // The named anchors are the only anchors, so an empty set of them is
+        // a store that holds nothing: it trusts nothing at all. This is the
+        // half of the property that no black box test can see - a store of
+        // the machine refuses an unknown authority with the same reason an
+        // empty store does.
+        let roots = root_store(&[]).expect("the store of the anchors");
+        assert!(roots.is_empty(), "an empty set of anchors trusts nothing");
+    }
+
+    #[test]
+    fn the_named_anchors_are_the_anchors_of_the_store() {
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .expect("the parameters of the certificate");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "an anchor");
+        let key = rcgen::KeyPair::generate().expect("the key of the certificate");
+        let certificate = params.self_signed(&key).expect("the certificate");
+        let roots = root_store(&[certificate.der().to_vec()]).expect("the store of the anchors");
+        assert_eq!(roots.len(), 1, "the named certificate is an anchor");
+    }
+
+    #[test]
+    fn a_peer_that_presents_no_certificate_is_a_failure_of_the_handshake() {
+        // An empty certificate chain cannot be produced with the server API
+        // of `rustls` - a server that has no certificate answers with an
+        // alert instead - so the mapping is pinned here rather than on the
+        // wire: a chain without a certificate is a failure of the handshake.
+        // It is not a refused certificate (there is none to name) and it is
+        // certainly not a stream.
+        match map_error(rustls::Error::NoCertificatesPresented) {
+            TlsError::Handshake(reason) => {
+                assert!(
+                    reason.contains("no certificates"),
+                    "it names the chain: {reason}"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_certificate_failure_names_itself() {
         assert_eq!(
             CertificateFailure::UnknownIssuer.to_string(),
@@ -316,5 +476,41 @@ mod tests {
             CertificateFailure::Other("it is odd".into()).to_string(),
             "it is odd"
         );
+    }
+
+    /// A socket on this machine, with the timeout of the source.
+    fn local_socket(timeout: Duration) -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local listener");
+        let port = listener.local_addr().expect("the address").port();
+        let socket = TcpStream::connect(("127.0.0.1", port)).expect("a local socket");
+        socket
+            .set_read_timeout(Some(timeout))
+            .expect("the timeout of the source");
+        socket
+    }
+
+    #[test]
+    fn the_socket_keeps_the_timeout_of_the_source_after_the_handshake() {
+        let mut socket = DeadlineSocket::new(local_socket(Duration::from_secs(1)));
+        socket.start_handshake();
+        socket.end_handshake();
+        assert_eq!(
+            socket.socket.read_timeout().expect("the timeout"),
+            Some(Duration::from_secs(1)),
+            "the reads that follow the handshake wait as long as the source says"
+        );
+    }
+
+    #[test]
+    fn a_read_of_the_handshake_fails_when_the_deadline_is_over() {
+        let mut socket = DeadlineSocket::new(local_socket(Duration::from_secs(1)));
+        socket.start_handshake();
+        // The deadline is the moment of the handshake itself: no time is left.
+        socket.deadline = Some(Instant::now());
+        let mut buffer = [0u8; 16];
+        let error = socket
+            .read(&mut buffer)
+            .expect_err("the read waits for a deadline that is over");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }
