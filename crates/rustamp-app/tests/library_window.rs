@@ -569,3 +569,12 @@ fn the_window_title_names_the_library() {
     let app = library_app(&dir);
     assert_eq!(app.library_title(), "Rustamp Library");
 }
+
+#[test]
+fn without_a_scan_the_status_line_is_the_visible_range() {
+    let (_dir, _media, app) = library_with_tracks(3);
+    // The scan is over: the status line is the visible range again, and not
+    // the counters of the scan that is done.
+    assert_eq!(app.library_status_line(), app.library_view().status_line());
+    assert_eq!(app.library_status_line(), "1-3 of 3");
+}

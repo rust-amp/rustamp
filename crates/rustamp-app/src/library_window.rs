@@ -77,6 +77,28 @@
 //! app to show: how many rows it looked at, how many it dropped, and which
 //! rows it kept because their file could not be checked.
 //!
+//! # The status line
+//!
+//! The bottom of the window is the **status line**. It shows the visible
+//! range of the list - the `1-20 of 1234` of the view - and, while a scan
+//! runs, the scan itself: its phase and its counters.
+//!
+//! The rules are:
+//!
+//! * a scan that runs shows its phase and its counters (`scanning: 120
+//!   seen, 30 added, 5 updated, 2 skipped`),
+//! * a scan that is over shows the visible range again,
+//! * a scan that was **cancelled** says so and shows the **committed**
+//!   counters (`cancelled: 30 added, 5 updated, 0 removed, 2 skipped
+//!   (committed)`). The live counters of a scan include the batch that is
+//!   in flight, so they can be ahead of the index by one batch; the report
+//!   the scan returns counts the committed batches only, and that is what a
+//!   cancelled scan shows.
+//!
+//! The scan runs on its own thread and its events travel to the interface
+//! thread over a channel: the worker never waits for the interface, and the
+//! interface never waits for the worker.
+//!
 //! # The covers
 //!
 //! The list has a cover column: it shows the album art of the row. The art
@@ -100,7 +122,8 @@
 //! served from the cache.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 
 use rustamp_core::command::Command;
@@ -110,9 +133,12 @@ use rustamp_core::state::WindowId;
 use rustamp_gfx::{Image, Rect};
 use rustamp_library::{
     ArtworkCache, Cancel, CoverImage, Library, Query, RemoveReport, Root, ScanPhase, ScanProgress,
-    SortKey, TrackRow,
+    ScanReport, SortKey, TrackRow,
 };
-use rustamp_ui::library_render::{CoverRef, LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT};
+use rustamp_ui::library_render::{
+    CoverRef, LIBRARY_CELL_WIDTH, LIBRARY_LINE_HEIGHT, LIBRARY_PANEL_BACKGROUND,
+    LIBRARY_SEARCH_BACKGROUND, LIBRARY_SEARCH_PADDING, LIBRARY_STATUS_TEXT,
+};
 use rustamp_ui::{
     Key, LibraryChrome, LibraryColumn, LibraryLayout, LibraryRequest, LibraryRow, LibrarySort,
     LibraryView, Modifiers, scroll_for_click,
@@ -160,11 +186,12 @@ pub const LIBRARY_DATABASE_NAME: &str = "library.sqlite3";
 struct ScanWorker {
     /// The flag the scan checks between two files.
     cancel: Cancel,
-    /// The latest progress event.
+    /// The progress events the worker sent.
     ///
-    /// One slot, not a queue: the interface shows the newest value and the
-    /// older ones are worthless.
-    progress: Arc<Mutex<Option<ScanProgress>>>,
+    /// The events travel over a channel: the worker sends them and the
+    /// interface thread takes them, so neither side ever waits for the
+    /// other. Only the newest event is kept - the older ones are worthless.
+    events: Receiver<ScanProgress>,
     /// The worker thread; it gives the index back when it is done.
     handle: JoinHandle<ScanOutcome>,
 }
@@ -173,8 +200,78 @@ struct ScanWorker {
 struct ScanOutcome {
     /// The index, with the rows the scan committed.
     index: Library,
-    /// The scan's result: the first error that stopped it.
-    result: Result<()>,
+    /// The scan's result: the report it committed, or the error that
+    /// stopped it.
+    ///
+    /// A cancelled scan still reports what it committed: the batches it
+    /// wrote are in the index, and the batch in flight is not.
+    result: Result<ScanReport>,
+}
+
+/// What the worker runs.
+///
+/// The app scans the registered roots ([`RootScan`]); the trait is the seam
+/// the tests use, because a real scan of a directory is fast and hard to
+/// steer, and the window's status line must be proven for every phase and
+/// for the cancelled case.
+trait ScanJob: Send + 'static {
+    /// Runs the scan, reporting what it does through `on_progress`.
+    ///
+    /// The report describes the **committed** state: a cancelled scan
+    /// reports the batches it wrote, not the files it saw.
+    fn run(self, cancel: &Cancel, on_progress: &mut dyn FnMut(ScanProgress)) -> ScanOutcome;
+}
+
+/// The scan of the registered roots.
+///
+/// The index travels to the worker and comes back with it: a scan writes to
+/// the database, and the app must not query it while that happens.
+struct RootScan {
+    /// The index, with the rows the scan will commit.
+    index: Library,
+    /// The roots to scan, in order.
+    roots: Vec<PathBuf>,
+}
+
+impl ScanJob for RootScan {
+    fn run(self, cancel: &Cancel, on_progress: &mut dyn FnMut(ScanProgress)) -> ScanOutcome {
+        let RootScan { mut index, roots } = self;
+        let mut report = ScanReport::default();
+        for root in roots {
+            if cancel.is_cancelled() {
+                // The scan was stopped before this root: what the earlier
+                // roots committed is what the index holds.
+                report.cancelled = true;
+                break;
+            }
+            match index.scan_with_progress(&root, cancel, &mut *on_progress) {
+                Ok(scanned) => merge_report(&mut report, scanned),
+                Err(error) => {
+                    return ScanOutcome {
+                        index,
+                        result: Err(error),
+                    };
+                }
+            }
+        }
+        ScanOutcome {
+            index,
+            result: Ok(report),
+        }
+    }
+}
+
+/// Adds the counters of one root's report to the report of the whole scan.
+///
+/// The report of a scan describes the **committed** state, so the counters
+/// of the roots are added up: they are the changes the index really holds.
+fn merge_report(report: &mut ScanReport, scanned: ScanReport) {
+    report.scanned += scanned.scanned;
+    report.added += scanned.added;
+    report.updated += scanned.updated;
+    report.removed += scanned.removed;
+    report.skipped += scanned.skipped;
+    report.cancelled |= scanned.cancelled;
 }
 
 /// The app's media library: the index, the view and the scan.
@@ -201,6 +298,18 @@ pub struct LibraryWindow {
     /// presenter prints them. An action leaves its message here, and the app
     /// takes it.
     action_note: Option<String>,
+    /// The latest progress event of the scan.
+    ///
+    /// The event arrives on the interface thread, over the channel the
+    /// worker sends it on. Only the newest one is kept: the older ones are
+    /// worthless.
+    scan_progress: Option<ScanProgress>,
+    /// The committed report of the scan that was cancelled.
+    ///
+    /// A cancelled scan keeps the batches it committed and drops the batch
+    /// in flight, so the numbers it shows are the ones the report carries -
+    /// the changes the index really holds.
+    cancelled_scan: Option<ScanReport>,
     /// The registered roots, as the preferences page shows them.
     ///
     /// The roots live in the index. This is the list the app read last, and
@@ -235,6 +344,8 @@ impl Default for LibraryWindow {
             folder_request: false,
             error: None,
             action_note: None,
+            scan_progress: None,
+            cancelled_scan: None,
             roots: Vec::new(),
             artwork: ArtworkCache::new(),
             cover_failure: None,
@@ -272,9 +383,40 @@ impl LibraryWindow {
         self.size
     }
 
-    /// The latest scan progress, if a scan is running.
+    /// The latest scan progress, if a scan has reported one.
     pub fn progress(&self) -> Option<ScanProgress> {
-        self.worker.as_ref()?.progress.lock().ok()?.clone()
+        self.scan_progress.clone()
+    }
+
+    /// The text the window's status line shows.
+    ///
+    /// The rules are the ones of the module docs: a running scan shows its
+    /// phase and its counters, a scan that is over shows the visible range
+    /// of the list again, and a cancelled scan says so and shows the
+    /// committed counters.
+    pub fn status_line(&self) -> String {
+        match self.scan_text() {
+            Some(text) => text,
+            None => self.view.status_line(),
+        }
+    }
+
+    /// What the scan has to say, if anything.
+    ///
+    /// `None` when the scan has nothing to say: the status line is then the
+    /// visible range of the list.
+    ///
+    /// The progress belongs to a scan that **runs**: the worker is alive and
+    /// the scan did not reach its end yet. A scan that was cancelled says so
+    /// instead, and it says what it committed.
+    fn scan_text(&self) -> Option<String> {
+        if self.worker.is_some()
+            && let Some(progress) = &self.scan_progress
+            && progress.phase != ScanPhase::Finished
+        {
+            return Some(progress_line(progress));
+        }
+        self.cancelled_scan.as_ref().map(cancelled_line)
     }
 
     /// The native caption of the window.
@@ -285,18 +427,10 @@ impl LibraryWindow {
         if let Some(error) = &self.error {
             return format!("Rustamp Library - {error}");
         }
-        if let Some(progress) = self.progress() {
-            let phase = match progress.phase {
-                ScanPhase::Scanning => "scanning",
-                ScanPhase::Removing => "removing",
-                ScanPhase::Finished => "finished",
-            };
-            return format!(
-                "Rustamp Library - {phase}: {} files (Esc stops the scan)",
-                progress.seen
-            );
+        match self.scan_text() {
+            Some(text) => format!("Rustamp Library - {text}"),
+            None => "Rustamp Library".to_string(),
         }
-        "Rustamp Library".to_string()
     }
 
     /// The viewport of the window: its whole client area.
@@ -429,6 +563,14 @@ impl LibraryWindow {
             self.search_focused,
             &covers,
         );
+        // The status line is the app's own: the view's status line is the
+        // visible range of the list, and it cannot carry the scan's
+        // counters. While the scan has something to say, the app paints its
+        // own text over the band.
+        let status = self.status_line();
+        if status != self.view.status_line() {
+            paint_status_line(&mut frame, &self.chrome(), self.viewport(), &status);
+        }
         frame
     }
 
@@ -777,40 +919,38 @@ impl LibraryWindow {
         let Some(index) = self.index.take() else {
             return Ok(());
         };
+        self.start_job(RootScan { index, roots });
+        Ok(())
+    }
+
+    /// Starts a job on the app's own worker thread.
+    ///
+    /// The job runs on the worker; the progress events travel to the
+    /// interface thread over a channel, and the index comes back with the
+    /// worker. Neither side waits for the other: the worker never blocks on
+    /// the interface, and the interface never blocks on the worker.
+    fn start_job(&mut self, job: impl ScanJob) {
         let cancel = Cancel::new();
-        let progress = Arc::new(Mutex::new(None));
+        let (sender, events) = mpsc::channel();
         let worker_cancel = cancel.clone();
-        let worker_progress = Arc::clone(&progress);
         let handle = std::thread::spawn(move || {
-            let mut outcome = ScanOutcome {
-                index,
-                result: Ok(()),
-            };
-            for root in roots {
-                if worker_cancel.is_cancelled() {
-                    break;
+            job.run(&worker_cancel, &mut |event| {
+                // A send that fails means that nobody listens any more: the
+                // window is gone, and the scan stops then.
+                if sender.send(event).is_err() {
+                    worker_cancel.cancel();
                 }
-                let scanned = outcome
-                    .index
-                    .scan_with_progress(&root, &worker_cancel, |event| {
-                        if let Ok(mut slot) = worker_progress.lock() {
-                            *slot = Some(event);
-                        }
-                    });
-                if let Err(error) = scanned {
-                    outcome.result = Err(error);
-                    break;
-                }
-            }
-            outcome
+            })
         });
         self.error = None;
+        // The new scan has its own story: the last one is over.
+        self.scan_progress = None;
+        self.cancelled_scan = None;
         self.worker = Some(ScanWorker {
             cancel,
-            progress,
+            events,
             handle,
         });
-        Ok(())
     }
 
     /// Asks the running scan to stop.
@@ -837,9 +977,20 @@ impl LibraryWindow {
     fn take_back(&mut self, worker: ScanWorker) {
         match worker.handle.join() {
             Ok(outcome) => {
-                self.index = Some(outcome.index);
-                if let Err(error) = outcome.result {
-                    self.error = Some(error.to_string());
+                let ScanOutcome { index, result } = outcome;
+                self.index = Some(index);
+                match result {
+                    Ok(report) => {
+                        if report.cancelled {
+                            // The scan was stopped: what it committed is
+                            // what the index holds, and that is what the
+                            // status line says.
+                            self.cancelled_scan = Some(report);
+                        }
+                    }
+                    Err(error) => {
+                        self.error = Some(error.to_string());
+                    }
                 }
             }
             Err(_) => {
@@ -855,7 +1006,10 @@ impl LibraryWindow {
     ///
     /// The app calls this from its pump: the scan runs on its own thread,
     /// and the interface only learns about it when the worker is finished.
+    /// The progress events are taken on the way, so the status line shows
+    /// what the scan does while it runs.
     pub fn poll(&mut self) -> Result<()> {
+        self.drain_progress();
         if !self
             .worker
             .as_ref()
@@ -867,6 +1021,127 @@ impl LibraryWindow {
         self.take_back(worker);
         self.refresh()
     }
+
+    /// Takes the progress events the worker sent.
+    ///
+    /// The events arrive on the interface thread: the worker sends them and
+    /// this takes them, so neither side ever waits for the other. Only the
+    /// newest event is kept - the older ones are worthless.
+    fn drain_progress(&mut self) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        while let Ok(event) = worker.events.try_recv() {
+            self.scan_progress = Some(event);
+        }
+    }
+}
+
+/// The status line of a running scan: its phase and its counters.
+///
+/// The counters are the **live** ones: they include the batch that is in
+/// flight, so they can be ahead of the index by one batch. They are the
+/// truth about the scan; the truth about the index is the report the scan
+/// returns.
+fn progress_line(progress: &ScanProgress) -> String {
+    let phase = match progress.phase {
+        ScanPhase::Scanning => "scanning",
+        ScanPhase::Removing => "removing",
+        ScanPhase::Finished => "finished",
+    };
+    format!(
+        "{phase}: {seen} seen, {added} added, {updated} updated, {skipped} skipped \
+         (Esc stops the scan)",
+        seen = progress.seen,
+        added = progress.added,
+        updated = progress.updated,
+        skipped = progress.skipped,
+    )
+}
+
+/// The status line of a scan that was cancelled.
+///
+/// The numbers are the **committed** ones - the changes the index really
+/// holds. The live counters of a scan include the batch that was in
+/// flight, and that batch was never written.
+fn cancelled_line(report: &ScanReport) -> String {
+    format!(
+        "cancelled: {added} added, {updated} updated, {removed} removed, \
+         {skipped} skipped (committed)",
+        added = report.added,
+        updated = report.updated,
+        removed = report.removed,
+        skipped = report.skipped,
+    )
+}
+
+/// Paints the status line's text into the status band.
+///
+/// The renderer draws the status line from the view, and the view's status
+/// line is the visible range of the list - it cannot carry the scan's
+/// counters. The renderer has no other public text path, so the app asks it
+/// for the glyphs: a scratch frame whose search field holds the text is
+/// rendered with the same font and the same size as the rest of the window,
+/// and the ink of that field is painted into the band, in the status line's
+/// own colour and over the band's own background.
+fn paint_status_line(frame: &mut Image, chrome: &LibraryChrome, viewport: Rect, text: &str) {
+    let band = chrome.status;
+    if band.is_empty() || text.is_empty() {
+        return;
+    }
+    // The band's own background: the renderer's status line is replaced.
+    frame.fill_rect(band, opaque(LIBRARY_PANEL_BACKGROUND));
+
+    // The glyphs: the search field of a scratch frame is the renderer's only
+    // public text path. The scratch holds that band alone - the rest of the
+    // window is of no use here, and a frame per paint would cost more than
+    // the text it carries.
+    let mut scratch_view = LibraryView::new(1);
+    scratch_view.set_search(text);
+    let source = LibraryChrome::new(&scratch_view, viewport).search;
+    if source.is_empty() {
+        return;
+    }
+    let mut scratch = Image::new(source.width, source.height);
+    rustamp_ui::render_library_window(
+        &mut scratch,
+        &scratch_view,
+        &LibraryLayout::new([1, 1, 1, 1]),
+        viewport,
+        false,
+        &[],
+    );
+    paint_ink(&scratch, source, frame, band);
+}
+
+/// Copies the ink of a rendered text into a band.
+///
+/// The source is a text the renderer drew: its background is the search
+/// field's own colour and its ink is the text's colour. The ink is painted
+/// in the status line's colour, and the background is left to the band.
+fn paint_ink(source: &Image, text_band: Rect, frame: &mut Image, band: Rect) {
+    let background = opaque(LIBRARY_SEARCH_BACKGROUND);
+    let ink = opaque(LIBRARY_STATUS_TEXT);
+    // The text of the search field starts at its own padding; the status
+    // line starts at the left edge of the band.
+    let source_x = text_band.x + LIBRARY_SEARCH_PADDING as i32;
+    for y in band.y..band.bottom() {
+        for x in band.x..band.right() {
+            let sx = x - band.x + source_x;
+            let sy = y - band.y + text_band.y;
+            let Some(pixel) = source.pixel(sx, sy) else {
+                continue;
+            };
+            if pixel != background {
+                frame.set_pixel(x, y, ink);
+            }
+        }
+    }
+}
+
+/// An opaque RGBA colour from an RGB triple.
+fn opaque(rgb: [u8; 3]) -> [u8; 4] {
+    [rgb[0], rgb[1], rgb[2], 255]
 }
 
 /// The paths of the registered roots.
@@ -1018,6 +1293,14 @@ impl App {
     /// The native caption of the library window.
     pub fn library_title(&self) -> String {
         self.library_window.title()
+    }
+
+    /// The text the library window's status line shows.
+    ///
+    /// It is the visible range of the list, or what the running scan has to
+    /// say.
+    pub fn library_status_line(&self) -> String {
+        self.library_window.status_line()
     }
 
     /// Renders one frame of the library window.

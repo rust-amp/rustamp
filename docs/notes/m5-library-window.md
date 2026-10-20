@@ -210,5 +210,6 @@ file outside the temp directory is touched.
 - The window is not skinned and has no skin-aware behaviour: it does not
   follow the player's double-size mode, and it is not part of the docked
   stack.
-- The scan's progress is shown in the window's caption, not in a progress
-  bar inside the window.
+- The scan's progress is shown in the window's caption and in its status
+  line, not in a progress bar inside the window (see
+  `m5-library-scan-progress.md`).
