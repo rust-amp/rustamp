@@ -100,15 +100,21 @@ after every merge), not by trusting the lane's report.
 | `wave217` | the ReplayGain filter is designed at the source rate (44.1 kHz was up to 4.6 dB off at 20 kHz) |
 | `wave218` | "Generate HTML playlist" (40292) with escaping and a native save dialog |
 | `wave220` | the library removes rows whose files are gone, keeps unreadable ones and reports them |
+| `wave219` | the MP4 oracle exists (`mdhd` + `mdat`); a cut file is named at open instead of a bare I/O error |
+| `wave221` | "Read extended info on selection" (40293) with tags or a stated reason (own choices) |
+| `wave223` | a FLAC without `STREAMINFO` and a cut metadata chain are named, not "end of stream" |
+| `wave224` | the DSP session's terminal diagnosis is sticky now (product fix found by property tests) |
 | `wave225` | the library window removes the missing entries (`Ctrl+M`): the rows whose file is gone are dropped, the unreadable ones are kept and reported, and a running scan refuses the action |
+| `wave227` | `last_scanned_at` per root with an idempotent schema migration |
 
 Also this session: the post-merge check was a **false green** because it ran
 `cargo check --workspace` without `--all-targets`; three test call sites were
 broken for a whole wave. The rule in `AGENTS.md` now demands
 `--all-targets --all-features`.
 
-In flight at the time of writing: `wave219` (MP4 truncation oracle, or the
-proven limit), `wave221` ("Read extended info on selection", 40293).
+In flight at the time of writing: `wave226` (the `Ctrl+E`/40255 edit-entry
+dialog model), `wave228` (the Ogg EOS-page oracle, or the proven limit),
+`wave229` (scan progress in the library window).
 
 ## Rules added to `AGENTS.md` during the session
 
