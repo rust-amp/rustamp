@@ -32,6 +32,8 @@
 //! * The MP4 `trkn` and `disk` atoms hold a pair of 16-bit numbers, and a
 //!   zero is "no number at all". The MP4 family therefore carries neither a
 //!   zero nor a number above 65535; the other formats carry every `u32`.
+//!   The write report names the fields whose value the format could not
+//!   store, so the loss is never silent.
 //! * The Vorbis family does not store an empty value at all: the key is
 //!   gone. ID3v2 and MP4 store it as an empty item. The reader cannot tell
 //!   the two apart, because it drops an empty value either way.
@@ -964,6 +966,35 @@ fn refused_extra(format: &Format, written: &TrackMetadata) -> Vec<String> {
         .collect()
 }
 
+/// The fields the writer must report as unstoreable.
+///
+/// The report names every field whose value the target format cannot hold,
+/// and nothing else. The MP4 `trkn` and `disk` atoms hold a pair of 16-bit
+/// numbers, and a zero is "no number at all", so the MP4 family is the one
+/// that has to report a number.
+fn unstoreable_fields(format: &Format, written: &TrackMetadata) -> Vec<TagField> {
+    let mut fields = Vec::new();
+
+    // The track is a whole field: the number and the total belong together.
+    let track = written
+        .track_no
+        .into_iter()
+        .chain(written.track_total)
+        .any(|number| !carries_number(format.kind, number));
+    if track {
+        fields.push(TagField::Track);
+    }
+
+    if written
+        .disc_no
+        .is_some_and(|number| !carries_number(format.kind, number))
+    {
+        fields.push(TagField::Disc);
+    }
+
+    fields
+}
+
 /// The metadata the reader must see after a write of `written` over a file
 /// that held `before`.
 fn expected_metadata(
@@ -1120,7 +1151,11 @@ fn patch(field: Field, rng: &mut Rng) -> TrackMetadata {
 
 #[test]
 fn a_write_round_trips_the_values_the_format_can_carry() {
-    for format in FORMATS {
+    // How many cases of each format named a field the format could not
+    // store.
+    let mut named = vec![0usize; FORMATS.len()];
+
+    for (index, format) in FORMATS.iter().enumerate() {
         for seed in SEEDS {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join(format.name);
@@ -1147,8 +1182,28 @@ fn a_write_round_trips_the_values_the_format_can_carry() {
                     "{}: seed {seed:#x}, case {case}: the report names the wrong entries",
                     format.name
                 );
+                assert_eq!(
+                    report.unstoreable,
+                    unstoreable_fields(format, &written),
+                    "{}: seed {seed:#x}, case {case}: the report names the wrong fields",
+                    format.name
+                );
+                if !report.unstoreable.is_empty() {
+                    named[index] += 1;
+                }
                 assert_audio_unchanged(format, &path, &audio);
             }
+        }
+
+        // The MP4 family cannot hold a zero or a number above 65535, so the
+        // cases that reach those numbers have to be reported. Without this
+        // the assertion above could pass on an empty list.
+        if format.kind == TagKind::Ilst {
+            assert!(
+                named[index] > 0,
+                "{}: no case named a field the format could not store",
+                format.name
+            );
         }
     }
 }

@@ -257,6 +257,51 @@ pictures that are *inside* the file and nothing else.
   limitation is loud, not silent. The `extra` map is not a field list: a key
   of `extra` is not removed by a `TagField`.
 
+## Audit (wave253 — the write report names what the format cannot store)
+
+- **The gap.** The MP4 `trkn` and `disk` atoms hold a pair of 16-bit
+  numbers, and a zero is "no number at all". A track or disc number of zero,
+  or one above 65535, was therefore written into the tag and dropped by the
+  format on the way out — and because the writer *replaces* the number, the
+  number the file had before was gone with it. The write report named the
+  refused `extra` keys and the removals the file still carries, but not the
+  value the format could not hold: the loss was silent.
+- **The API.** `WriteReport` has one additive field, `unstoreable:
+  Vec<TagField>`: the fields whose value the target format could not store.
+  `WriteReport::is_complete()` includes it, so a caller that asks "did the
+  write land?" hears "no" when a value is missing. The field is
+  meta-internal: `rustamp-core` and `rustamp-proto` are untouched, so no RFC
+  is needed.
+- **How the loss is detected.** A per-format *range check*, not a read-back
+  of the written file. The writer knows what each format can hold, the check
+  costs nothing, and it has no error path and no false positives (a
+  read-back would have to know the reader's trimming rules, would have to
+  look at the primary tag alone so a second tag cannot hide a loss, and
+  could fail after a write that succeeded). The check runs on every write
+  path — the generic path (ID3v2, MP4, APEv2), the FLAC path and the Vorbis
+  path — and the table is the one below.
+- **The table.**
+
+  | Tag written | Files | Track/disc number | `0` | `> 65535` |
+  |---|---|---|---|---|
+  | ID3v2 | MP3, AAC, WAV, AIFF | any `u32` | kept | kept |
+  | Vorbis comments | FLAC, Ogg Vorbis, Opus, Speex | any `u32` | kept | kept |
+  | MP4 `ilst` | M4A, ALAC | 1..=65535 | lost | lost |
+  | APEv2 | APE, MPC, WavPack | any `u32` | kept | kept |
+
+- **What the app must surface.** A field of `unstoreable` is a value the
+  user asked for that the file does not have. The app should say which
+  field it was and that the format cannot hold it — "the track number is not
+  in the file: MP4 stores 1..=65535" — and not present the write as a
+  success. The value itself is not in the report: the app has it in the
+  metadata it sent, and the report names the field.
+- **What is not reported.** The year: a year above 9999 is refused with
+  `Error::InvalidArgument` before the file is opened, so it is loud
+  already. An empty text value: the reader drops an empty value in every
+  format, so no format loses anything the caller could read back. A field
+  of the removal list: the caller asked for it to be gone, so the format is
+  not the reason it is not in the file.
+
 ## What each format can carry
 
 The property suite (`tests/tag_properties.rs`) writes generated metadata into
@@ -269,6 +314,7 @@ differences a caller has to know about.
 | MP3, AAC, WAV, AIFF | ID3v2 | any `u32` | an empty item |
 | FLAC, Ogg Vorbis, Opus | Vorbis comments | any `u32` | not stored |
 | MP4 (AAC, ALAC) | `ilst` | 1..=65535 | an empty item |
+| APE, MPC, WavPack | APEv2 | any `u32` | an empty item |
 
 Every format carries the title, the artist, the album, the album artist, the
 year, the genre and the comment. The `extra` map is narrower:
@@ -285,7 +331,9 @@ year, the genre and the comment. The `extra` map is narrower:
 - **The MP4 numbers are 16-bit.** The `trkn` and `disk` atoms hold a pair of
   `u16`, and a zero is "no number at all". A number above 65535 and a zero
   are therefore lost — and because the writer *replaces* the number of the
-  file, the old number is lost with them, not kept.
+  file, the old number is lost with them, not kept. The write report names
+  the field whose value is lost (`WriteReport::unstoreable`), so the loss is
+  loud.
 - **ID3v2 keeps the track number and the total in one frame.** A total
   without a number is written as the pair `0/total`, so the file gains a
   track number of zero. The Vorbis family keeps the two in comments of their

@@ -27,6 +27,44 @@
 //! where it is; the write report names every removal that is in that state
 //! ([`WriteReport::unremoved`]).
 //!
+//! ## What the format cannot store
+//!
+//! A value the target format cannot hold is not in the file after the
+//! write, and the write report names it. There are two kinds:
+//!
+//! * An `extra` entry the format has no field for: the report names the
+//!   key ([`WriteReport::unwritten_extra`]).
+//! * A value the format has a field for, but no room: the report names the
+//!   field ([`WriteReport::unstoreable`]).
+//!
+//! | File | Tag written | The numbers it can carry |
+//! |---|---|---|
+//! | MP3, AAC, WAV, AIFF | ID3v2 | any `u32` |
+//! | FLAC, Ogg Vorbis, Opus, Speex | Vorbis comments | any `u32` |
+//! | MP4 (M4A, ALAC) | iTunes `ilst` | 1..=65535 |
+//! | APE, MPC, WavPack | APEv2 | any `u32` |
+//!
+//! The MP4 `trkn` and `disk` atoms hold a pair of 16-bit numbers, and a zero
+//! means "no number at all". A track or disc number of zero, or one above
+//! 65535, is therefore not in the file after the write — and because the
+//! writer *replaces* the number, the number the file had before is gone with
+//! it. The report says so; the file does not.
+//!
+//! The check is a range check per format, not a read-back of the written
+//! file: the writer knows what each format can hold, the check costs
+//! nothing, and it has no error path and no false positives. A read-back
+//! would have to know the reader's trimming rules, would have to look at
+//! the primary tag alone so that a second tag cannot hide a loss, and
+//! could fail after a write that succeeded.
+//!
+//! Two things are not in that list, because nothing is lost with them:
+//!
+//! * The year. A year above 9999 is refused with an error before the file
+//!   is opened (see `MAX_YEAR`), and a year below is written as a
+//!   four-digit year, which every format reads back.
+//! * An empty text value. The reader drops an empty value in every format,
+//!   so no format loses anything the caller could read back.
+//!
 //! ## The R128 keys of an ID3v2 tag
 //!
 //! `lofty` 0.25.4 has no `ItemKey` for the `R128_TRACK_GAIN` /
@@ -69,12 +107,14 @@ use crate::replaygain::{R128_ALBUM_GAIN_KEY, R128_TRACK_GAIN_KEY, item_key_for_e
 const MAX_YEAR: u32 = 9999;
 
 /// Outcome of [`write_tags_report`]: which `extra` entries the target tag
-/// format could not store, and which removals the file still carries.
+/// format could not store, which removals the file still carries, and which
+/// fields the target format could not store at all.
 ///
-/// Standard fields are always written (they map on every primary tag type);
-/// only `extra` entries can be refused, and only when the target format has
-/// no field for them. Nothing is dropped silently: the refused key names are
-/// the report.
+/// A standard field always has a place in every primary tag type, so it is
+/// always written; only `extra` entries can be refused, and only when the
+/// target format has no field for them. A standard field can still be
+/// *too big* for the format — see [`WriteReport::unstoreable`]. Nothing is
+/// dropped silently: the report names every one of them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WriteReport {
     /// `extra` keys that were not written because the target tag format has
@@ -91,13 +131,37 @@ pub struct WriteReport {
     /// value is still in the file, in the second tag. A caller that needs
     /// to know whether the value is gone uses this.
     pub unremoved: Vec<TagField>,
+    /// The fields whose value the target format could not store.
+    ///
+    /// The MP4 `trkn` and `disk` atoms hold a pair of 16-bit numbers, and a
+    /// zero means "no number at all": the MP4 family carries neither a zero
+    /// nor a number above 65535. Every other format the writer targets
+    /// stores the number as text:
+    ///
+    /// | File | Tag written | The numbers it can carry |
+    /// |---|---|---|
+    /// | MP3, AAC, WAV, AIFF | ID3v2 | any `u32` |
+    /// | FLAC, Ogg Vorbis, Opus, Speex | Vorbis comments | any `u32` |
+    /// | MP4 (M4A, ALAC) | iTunes `ilst` | 1..=65535 |
+    /// | APE, MPC, WavPack | APEv2 | any `u32` |
+    ///
+    /// The value the caller asked for is gone, and so is the value the file
+    /// had before: the writer replaces the number, so a number the format
+    /// cannot hold takes the old one with it. A field that was removed on
+    /// request is not in this list — the caller asked for it to be gone.
+    ///
+    /// Two values are never in this list, because nothing is lost with them:
+    /// a year above 9999 is refused with an error before the file is opened,
+    /// and an empty text value is read back as "no value" in every format.
+    pub unstoreable: Vec<TagField>,
 }
 
 impl WriteReport {
-    /// Returns `true` when every requested `extra` entry was written and
-    /// every requested removal was carried out.
+    /// Returns `true` when every requested `extra` entry was written, every
+    /// requested removal was carried out, and no requested value was too big
+    /// for the target format.
     pub fn is_complete(&self) -> bool {
-        self.unwritten_extra.is_empty() && self.unremoved.is_empty()
+        self.unwritten_extra.is_empty() && self.unremoved.is_empty() && self.unstoreable.is_empty()
     }
 }
 
@@ -107,9 +171,10 @@ impl WriteReport {
 /// This is the honest form of [`write_tags`]: fields that are `None` are
 /// left untouched, so a read → edit → write cycle keeps every value the
 /// caller does not set, and the returned [`WriteReport`] names every `extra`
-/// entry the target format refused. A caller that needs to know whether a
-/// write happened uses this; [`write_tags`] keeps the old best-effort
-/// signature for existing callers.
+/// entry the target format refused and every field the target format could
+/// not store ([`WriteReport::unstoreable`]). A caller that needs to know
+/// whether a write happened uses this; [`write_tags`] keeps the old
+/// best-effort signature for existing callers.
 ///
 /// The write is atomic: the new file is built next to the original and
 /// renamed over it, so a failure leaves the original untouched (the
@@ -186,6 +251,11 @@ pub fn write_tags_report(path: impl AsRef<Path>, metadata: &TrackMetadata) -> Re
 /// disc number and the total number of discs. The comment takes the
 /// `DESCRIPTION` item with it, because the reader takes a description as
 /// the comment when a file has no comment of its own.
+///
+/// A removed field is not in [`WriteReport::unstoreable`], even when the
+/// metadata named a value the format could not store: the caller asked for
+/// the field to be gone, so the format is not the reason it is not in the
+/// file.
 ///
 /// # Errors
 ///
@@ -337,6 +407,7 @@ impl Target {
                 WriteReport {
                     unwritten_extra,
                     unremoved: unremoved_in(others, removals),
+                    unstoreable: unstoreable_fields(tag.tag_type(), metadata, removals),
                 }
             }
             Self::Flac { flac, others } => {
@@ -352,6 +423,7 @@ impl Target {
                 WriteReport {
                     unwritten_extra,
                     unremoved: unremoved_in(others, removals),
+                    unstoreable: unstoreable_fields(TagType::VorbisComments, metadata, removals),
                 }
             }
             Self::Vorbis(comments) => {
@@ -361,6 +433,7 @@ impl Target {
                 WriteReport {
                     unwritten_extra,
                     unremoved: Vec::new(),
+                    unstoreable: unstoreable_fields(TagType::VorbisComments, metadata, removals),
                 }
             }
         }
@@ -507,6 +580,59 @@ fn apply_to_vorbis(comments: &mut VorbisComments, metadata: &TrackMetadata) -> V
 /// Whether `key` names one of the two R128 keys.
 fn is_r128_key(key: &str) -> bool {
     key.eq_ignore_ascii_case(R128_TRACK_GAIN_KEY) || key.eq_ignore_ascii_case(R128_ALBUM_GAIN_KEY)
+}
+
+/// The fields whose value the format of `tag_type` cannot store.
+///
+/// The value is the one the caller asked for; the format has no room for
+/// it, so the file does not carry it after the write.
+///
+/// The check is a range check per format, not a read-back of the written
+/// file: the writer knows what each format can hold, and the check costs
+/// nothing. The table is in the module docs.
+///
+/// A field of `removals` is not in the list: the caller asked for it to be
+/// gone, so the format is not the reason it is not in the file.
+fn unstoreable_fields(
+    tag_type: TagType,
+    metadata: &TrackMetadata,
+    removals: &[TagField],
+) -> Vec<TagField> {
+    let mut fields = Vec::new();
+
+    // The track is a whole field: the number and the total belong together,
+    // and half the formats keep the two in one place.
+    let track = metadata
+        .track_no
+        .into_iter()
+        .chain(metadata.track_total)
+        .any(|number| !carries_number(tag_type, number));
+    if track {
+        fields.push(TagField::Track);
+    }
+
+    if metadata
+        .disc_no
+        .is_some_and(|number| !carries_number(tag_type, number))
+    {
+        fields.push(TagField::Disc);
+    }
+
+    fields.retain(|field| !removals.contains(field));
+    fields
+}
+
+/// Whether the format of `tag_type` can carry `number`.
+///
+/// The MP4 `trkn` and `disk` atoms hold a pair of 16-bit numbers, and a
+/// zero means "no number at all": the MP4 family carries neither a zero nor
+/// a number above 65535. Every other format the writer targets stores the
+/// number as text, so it carries every `u32`.
+fn carries_number(tag_type: TagType, number: u32) -> bool {
+    match tag_type {
+        TagType::Mp4Ilst => (1..=u32::from(u16::MAX)).contains(&number),
+        _ => true,
+    }
 }
 
 /// Writes the R128 values of `metadata` into an ID3v2 tag as `TXXX` frames.
