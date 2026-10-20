@@ -43,9 +43,9 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 
 | # | Claim | Verdict | Evidence (file:line) | Smallest reproduction |
 |---|---|---|---|---|
-| C1-1 | "The invariant that now guarantees progress: the producer never starts chunk n+1 before the consumer has drained chunk n." | **PARTIAL** — holds only in one test helper; **FALSE** for the engine adapter | `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:36-61` chunks writes, but `crates/rustamp-audio/src/resident.rs:718-732` (`process_block`) writes the entire incoming buffer in one call before reading any samples back | Feed `process_block` an input slice with > 4096 frames (the default back-ring capacity `DEFAULT_DSP_RING_FRAMES`). Helper fills back-ring and blocks; `write_timeout` blocks on in-ring; deadlock occurs until the 5 s timeout. |
-| C1-2 | `DspSession` enforces lockstep progress by construction | **FALSE** | `crates/rustamp-mediahost/src/dsp.rs:188-210` — no chunking, no lockstep, and no progress invariants were added to `DspSession::write` or `write_timeout` (only doc comments were touched in M20) | `session.write_timeout(large_buf, Some(t))` writes as much as ring permits; caller is responsible for reading back, which `process_block` fails to interleave. |
-| C1-3 | The producer never gets ahead of the consumer | **FALSE** | `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:43-51` | Even in the test helper `round_trip`, within each chunk of 257 frames, the producer writes all 257 frames into the in-ring before the consumer reads a single frame back. The producer is ahead by up to 257 frames. |
+| C1-1 | "The invariant that now guarantees progress: the producer never starts chunk n+1 before the consumer has drained chunk n." | **HOLDS** — *was PARTIAL; the engine adapter's half is **fixed 2026-10-20** (finding F1 below)* | `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:36-61` chunks writes (257 frames), and `crates/rustamp-audio/src/resident.rs:1107-1155` (`process_block`) now does the same (at most `DSP_CHUNK_FRAMES` = 1024 frames, clamped to the in-ring capacity): write one chunk, read that chunk back, then write the next | Before the fix, an input slice larger than the resident's absorption (4096-frame back-ring + 1024-frame in-hand block) filled the back-ring, the resident stopped taking and `write_timeout` blocked until the 5 s timeout. Pinned now by `resident::dsp_hosted_tests::the_lockstep_round_trip_completes_on_a_ring_smaller_than_the_block`. |
+| C1-2 | `DspSession` enforces lockstep progress by construction | **FALSE** (unchanged by the fix) | `crates/rustamp-mediahost/src/dsp.rs:188-210` — no chunking, no lockstep, and no progress invariants were added to `DspSession::write` or `write_timeout` (only doc comments were touched in M20) | `session.write_timeout(large_buf, Some(t))` writes as much as ring permits; the caller is responsible for reading back. Since 2026-10-20 the production adapter does interleave it (the lockstep, F1 below), but the session itself still enforces nothing — the invariant lives in the caller, not in the framework. |
+| C1-3 | The producer never gets ahead of the consumer | **FALSE** (unchanged by the fix) | `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:43-51`, `crates/rustamp-audio/src/resident.rs:1128-1152` | Even in the test helper `round_trip`, within each chunk of 257 frames, the producer writes all 257 frames into the in-ring before the consumer reads a single frame back. The producer is ahead by up to 257 frames. The production adapter has the same shape since the fix (ahead by at most one chunk, ≤ 1024 frames) — the invariant is chunk-granular, not frame-granular. |
 | C1-4 | Reconfigure and reset progress safely during active resident session | **HOLDS** | `crates/rustamp-mediahost/src/dsp.rs:141-177`, `crates/rustamp-audio/src/resident.rs:774-830` | Handshake requires session reset/drain before reconfigure messages are sent. |
 
 ### 2. True-peak and ReplayGain Together (A14, A15, A16, A17, E4)
@@ -86,7 +86,7 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 | # | Claim | Verdict | Evidence (file:line) | Smallest reproduction |
 |---|---|---|---|---|
 | C6-1 | ReplayGain is integrated end-to-end across the application | **FALSE** | `crates/rustamp-audio/src/engine.rs:647-665` vs `crates/rustamp-app/src/config.rs:127` | `rustamp-audio` implemented ReplayGain in tonight's wave (A15, A16), but `rustamp-app/src/config.rs:127` still hardcodes `"replaygain" => Some("ReplayGain is not supported yet")` and `serialize_honest` omits it. The app crate was not updated to expose or persist ReplayGain. |
-| C6-2 | The M20 deadlock fix covers resident DSP engine playback | **FALSE** | `crates/rustamp-audio/src/resident.rs:712-734` vs `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:36-61` | M20 fixed the deadlock in the standalone test helper only. The actual production engine adapter (`process_block` in `resident.rs`) still uses the single-shot un-chunked write-before-read pattern. |
+| C6-2 | The M20 deadlock fix covers resident DSP engine playback | **FALSE** — *was false; **fixed 2026-10-20** (finding F1 below): the production adapter now runs the same lockstep as the helper* | `crates/rustamp-audio/src/resident.rs:1107-1155` (`process_block`, now chunked) vs `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:36-61` (the helper M20 fixed) | M20 fixed the deadlock in the standalone test helper only. The production engine adapter (`process_block` in `resident.rs`) used the single-shot un-chunked write-before-read pattern; it now writes one chunk, reads that chunk back and only then writes the next (`DSP_CHUNK_FRAMES` = 1024 frames, clamped to the in-ring capacity), so the frames in flight never exceed one chunk and the resident never blocks on its back-ring. Pinned by `resident::dsp_hosted_tests::the_lockstep_round_trip_completes_on_a_ring_smaller_than_the_block` (64-frame ring, 8192-frame block: the old pattern stalls there, the new one completes) and `…::the_un_chunked_round_trip_stalls_where_the_lockstep_one_completes` (the pre-fix pattern on the same rings, timed out with the resident's back-ring full). |
 | C6-3 | Task card manifest consistency across the wave | **PARTIAL** | Prompt / handoff refers to `N9-config-class.md`, but no such file was committed (`docs/tasks/N9-config.md` or `N9-config-class.md` is absent) | The work was performed under N8 and documented in N8 / W10 finding F1, but the card reference is dangling. |
 
 ---
@@ -94,6 +94,79 @@ Verdicts: **HOLDS**, **PARTIAL**, **FALSE**, **UNVERIFIABLE**.
 ## 2. Findings by severity
 
 ### F1 — HIGH (proven): The deadlock rebuild invariant is absent in the engine adapter: `process_block` writes the entire block before reading back, causing deadlock for buffers > ring capacity
+
+**Status: FIXED (2026-10-20).** The finding was correct: the production
+adapter wrote the whole block before it read a single frame back, and the
+resident's back-ring filled up under it. The fix and the tests are in
+`crates/rustamp-audio/src/resident.rs` (the adapter's `process_block` and its
+new `DSP_CHUNK_FRAMES` ceiling). No other crate changed; the wire, the ring
+layout, the session API and the `rustamp-core` contracts are untouched.
+
+**The mechanism (unchanged by the fix).** The resident worker moves frames
+strictly in order from the in-ring to its own back-ring
+(`rustamp-mediahost/src/dsp.rs`: `BACK_RING_FRAMES = 4096`, `BLOCK_FRAMES =
+1024`) and keeps at most one block in hand while it writes back. So it can
+absorb at most **4096 + 1024 = 5120 frames** without a reader. The player's
+write is fenced (RFC 0006 §6): it returns only once the resident has *taken*
+every frame it published. A single write of a block larger than the
+resident's absorption therefore cannot complete:
+
+1. the player writes the whole block into the in-ring;
+2. the resident takes frames, fills its 4096-frame back-ring and blocks on
+   it — it stops taking from the in-ring;
+3. the player's write waits for a resident that has stopped taking (and for
+   the fence, which can never be reached);
+4. the player has not reached its read-back yet, so nothing ever drains the
+   back-ring.
+
+Neither side can move: the bounded-buffer deadlock, bounded only by the block
+timeout (`DEFAULT_DSP_BLOCK_TIMEOUT` = 5 s), after which the track fails with
+`CoreError::Dsp("resident DSP write timed out")`. The engine's own block size
+(1024 frames, `decode.rs::READ_FRAMES`) is below the threshold today, which
+is why the defect was latent rather than visible — the invariant was simply
+not true by construction.
+
+**The rule now in the code.** The adapter's round trip is a **lockstep**, the
+same shape M20 gave the test helper: the block is split into chunks of at
+most `DSP_CHUNK_FRAMES` (1024 frames) — clamped to the in-ring capacity the
+caller chose, so one chunk is always one ring write — and the adapter
+
+* writes one chunk (`write_timeout`, still fenced: `Ok` means the resident
+  has taken those frames),
+* reads exactly that chunk back,
+* and only then writes the next one.
+
+The frames in flight (written, not yet read back) never exceed one chunk, so
+the resident's back-ring holds at most one chunk plus its in-hand block —
+2048 of its 4096 frames. The resident therefore never blocks on its
+back-ring, never stops draining the in-ring, and the player's write always
+finds room: neither wait can be permanent, and the deadlock boundary is
+unreachable by construction. The chunk size is the resident worker's own
+block size, so the frames the chain processes, their order and the values it
+returns do not change; the block timeout still covers the **whole** round
+trip (one deadline for every chunk), so a wedged resident fails the track
+after the same time as before.
+
+**Tests (all in `rustamp-audio`):**
+
+| Test | What it pins |
+|---|---|
+| `resident::dsp_hosted_tests::the_lockstep_round_trip_completes_on_a_ring_smaller_than_the_block` | the production path (`HostDspChain::process`) with a 64-frame in-ring and an 8192-frame block: the block comes back whole and bit-exact (gain ×2), zero frames dropped |
+| `resident::dsp_hosted_tests::the_un_chunked_round_trip_stalls_where_the_lockstep_one_completes` | the pre-fix pattern (one write of the whole block, then the read-back) on the same rings: it times out on the **write**, and the ring counters show the mechanism (the resident's back-ring is full at 4096 frames, the player read none) |
+| `resident::dsp_tests::the_lockstep_chunk_is_the_smaller_of_the_ring_and_the_ceiling` | the chunk rule itself: `min(in-ring capacity, 1024)`, at least one frame |
+
+**How far the proof goes.** A deadlock cannot be observed directly, only
+that no progress happened inside a bound — so the contrast test is a *timing*
+proof: the pre-fix pattern does not finish within its 1 s bound and fails on
+the write, while the lockstep path finishes the same 8192 frames in
+milliseconds. The positive test is the regression test: with the pre-fix
+`process_block` restored (verified by the lane that fixed this), it fails
+after the block timeout with `Dsp("resident DSP write timed out")`; with the
+fix it is green. The ring counters turn the timing proof into a mechanism
+proof: the resident's back-ring is full and the player has read nothing, so
+the resident stopped taking — exactly the deadlock the review described.
+
+**The original report (unchanged, for the record):**
 
 `crates/rustamp-dsphost/tests/dsp_roundtrip.rs:36-61` demonstrates the lockstep chunking principle: write a small chunk (257 frames), read it back, repeat. Task card M20 claimed this "kills the deadlock by construction: write a chunk, read that chunk back. The invariant that now guarantees progress: the producer never starts chunk n+1 before the consumer has drained chunk n."
 
