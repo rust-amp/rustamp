@@ -238,7 +238,9 @@ fn the_plan_adds_up_and_never_hands_a_path_out_twice() {
                 assert!(
                     matches!(
                         error.reason,
-                        ExtractErrorReason::EmptyPath | ExtractErrorReason::DuplicatePath { .. }
+                        ExtractErrorReason::EmptyPath
+                            | ExtractErrorReason::DuplicatePath { .. }
+                            | ExtractErrorReason::UnsafePath { .. }
                     ),
                     "seed {seed:#x}: an error names its reason"
                 );

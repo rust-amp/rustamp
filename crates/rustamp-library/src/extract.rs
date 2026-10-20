@@ -75,6 +75,13 @@
 //!
 //! * A track whose template renders **no file name** is an error: there is
 //!   nothing to write.
+//! * A track whose rendered path is **not one path inside the target
+//!   directory** is an error too. The segments come from the template and
+//!   from the tags, and either can name a level that is not there: an empty
+//!   segment, `.`, `..`, a separator or a drive letter (`..\Album`,
+//!   `C:evil`, `a/b`). Writing such a path would put the file outside the
+//!   target directory, or a level away from the one the template names, so
+//!   the plan refuses the track instead of handing the path out.
 //! * A track that renders a path **another track of the same extraction
 //!   already renders** is an error too. The first track of the selection
 //!   keeps the path, the second one is reported - two tracks must not
@@ -101,10 +108,18 @@
 //!   table of S20 §4.2 covers five of the seven field names of §3 - so the
 //!   planned file name is exactly what the template renders. A caller that
 //!   wants a playable file appends the extension of the source file.
-//! * The duplicate check compares the paths **exactly**. Two tracks whose
+//! * The duplicate check compares the segments **exactly**. Two tracks whose
 //!   paths differ only in the case collide on a case-insensitive file
 //!   system; the caller, which does the writing, sees the error of the file
-//!   system there.
+//!   system there. The same holds for the normalisation a file system
+//!   applies to a name itself: a name that ends in a space or a dot is the
+//!   name without it on Windows, and `CON` or `NUL` are names Windows
+//!   refuses. None of them is a path outside the target directory, so the
+//!   plan does not refuse them; the file system reports them to the caller.
+//! * A plan that refuses a track's path says so in the wording of the
+//!   module, `the path is not one path inside the target directory: <path>`.
+//!   The reference carries no message for this case: it is our own rule (S20
+//!   §4 measures the reference's wording only), and it is marked as one.
 //! * The number of the failed track in `Error extracting track #N` is the
 //!   position of the track in the selection, counted from one. The material
 //!   does not say what the number counts (S20 §4 carries the message only),
@@ -376,7 +391,10 @@ impl PathTemplate {
     /// Plans the extraction of `rows` through the template.
     ///
     /// The plan holds the files the extraction writes and the tracks it
-    /// cannot write; see the module documentation for the rules.
+    /// cannot write; see the module documentation for the rules. A track
+    /// whose rendered path is not one path inside the target directory
+    /// ([`ExtractErrorReason::UnsafePath`]) is an error, not a file: the
+    /// extraction writes inside the target directory and nowhere else.
     pub fn plan(&self, rows: &[TrackRow]) -> ExtractPlan {
         let mut files: Vec<PlannedFile> = Vec::new();
         let mut errors: Vec<ExtractError> = Vec::new();
@@ -393,6 +411,20 @@ impl PathTemplate {
                     track_id: row.id,
                     number,
                     reason: ExtractErrorReason::EmptyPath,
+                });
+                continue;
+            }
+
+            if !path.is_inside_target() {
+                // A segment the join cannot use: the file would land outside
+                // the target directory, or a level away from the one the
+                // template names. Handing it out would write there.
+                errors.push(ExtractError {
+                    track_id: row.id,
+                    number,
+                    reason: ExtractErrorReason::UnsafePath {
+                        path: join_segments(&path.segments),
+                    },
                 });
                 continue;
             }
@@ -449,11 +481,30 @@ fn join_segments(segments: &[String]) -> String {
     segments.join(std::path::MAIN_SEPARATOR_STR)
 }
 
+/// Whether a rendered segment is a plain name: one level of a path and
+/// nothing else.
+///
+/// A segment carries the literal text of the template and the values of the
+/// tags, so it can be empty (`Artist\\Title`), name the directory itself or
+/// the one above it (`.`, `..`), or carry a separator or a drive letter
+/// (`a\b`, `C:evil`). Joining such a segment writes a level deeper than the
+/// template names, or outside the target directory altogether, so this
+/// module does not hand out a path built from one.
+fn is_plain_name(segment: &str) -> bool {
+    !segment.is_empty() && segment != "." && segment != ".." && !segment.contains(['/', '\\', ':'])
+}
+
 /// The path a row renders to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedPath {
     /// The segments of the path, relative to the target directory: the
     /// directories first, the file name last.
+    ///
+    /// A segment is the text the template rendered, so it can be a value of
+    /// a tag that is not a plain path component - `..`, `a/b`, `C:evil`.
+    /// Such a path is not one path inside the target directory:
+    /// [`RenderedPath::relative_path`] answers `None` for it and
+    /// [`PathTemplate::plan`] refuses the track.
     pub segments: Vec<String>,
     /// The fields the row does not carry: the template asked for them and
     /// the row has no value. The value renders as an empty text.
@@ -462,6 +513,11 @@ pub struct RenderedPath {
 
 impl RenderedPath {
     /// The name of the file, without the directories.
+    ///
+    /// This is the last segment the template rendered. A value of a tag can
+    /// make that segment something no file can be called (`..`, `a/b`):
+    /// [`RenderedPath::relative_path`] answers `None` for such a path and
+    /// [`PathTemplate::plan`] refuses the track.
     pub fn file_name(&self) -> &str {
         self.segments.last().map(String::as_str).unwrap_or("")
     }
@@ -469,12 +525,30 @@ impl RenderedPath {
     /// The path of the file, relative to the target directory, with the
     /// separator of the platform.
     ///
+    /// `None` when the segments are not one path inside the target
+    /// directory: a segment that is empty, that names `.` or `..`, or that
+    /// carries a separator or a drive letter cannot be one level of a
+    /// relative path (see [`PathTemplate::plan`]).
+    ///
     /// Whether the backslash of the template is literal on every platform or
     /// a separator that follows the platform is open (S20 §8, open question
     /// 8). This is the one place that joins the segments, so a caller that
     /// wants the other reading joins [`RenderedPath::segments`] itself.
-    pub fn relative_path(&self) -> PathBuf {
-        self.segments.iter().collect()
+    pub fn relative_path(&self) -> Option<PathBuf> {
+        if !self.is_inside_target() {
+            return None;
+        }
+        let mut path = PathBuf::new();
+        for segment in &self.segments {
+            path.push(segment);
+        }
+        Some(path)
+    }
+
+    /// Whether every segment is a plain name, so the segments are one path
+    /// inside the target directory with one level per segment.
+    fn is_inside_target(&self) -> bool {
+        self.segments.iter().all(|segment| is_plain_name(segment))
     }
 }
 
@@ -499,6 +573,16 @@ pub enum ExtractErrorReason {
         /// The path both tracks render to.
         path: String,
     },
+    /// The rendered path is not one path inside the target directory.
+    ///
+    /// A segment cannot be a level of a relative path: it is empty, it names
+    /// the directory itself or the one above it, or it carries a separator
+    /// or a drive letter. Writing such a path would put the file outside the
+    /// target directory, or one level away from where the template names it.
+    UnsafePath {
+        /// The path the template rendered.
+        path: String,
+    },
 }
 
 impl fmt::Display for ExtractErrorReason {
@@ -507,6 +591,12 @@ impl fmt::Display for ExtractErrorReason {
             ExtractErrorReason::EmptyPath => write!(f, "the template rendered no file name"),
             ExtractErrorReason::DuplicatePath { path } => {
                 write!(f, "another track already extracts to {path}")
+            }
+            ExtractErrorReason::UnsafePath { path } => {
+                write!(
+                    f,
+                    "the path is not one path inside the target directory: {path}"
+                )
             }
         }
     }
@@ -901,7 +991,7 @@ mod tests {
         let path = template.render(&full_row(1));
         assert_eq!(
             path.relative_path(),
-            PathBuf::from("Abba Gold").join("Dancing Queen")
+            Some(PathBuf::from("Abba Gold").join("Dancing Queen"))
         );
     }
 
