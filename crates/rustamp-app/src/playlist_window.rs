@@ -501,6 +501,21 @@ impl App {
                 self.show_extended_info();
                 Ok(Some(ShortcutOutcome::Handled))
             }
+            // ----- the edit-entry dialog (S03 §2 `40255`) -----
+            // The row is bound: the dialog's model (the fields, the
+            // validation and the save request) lives in `rustamp-ui`'s
+            // `dialogs` module. The app half — reading the tags of the
+            // selected entry, opening the dialog and writing the changed
+            // fields back with `rustamp-meta` — is not wired yet, so the row
+            // says so. It does not fall through to the main table's `40186`
+            // "Toggle easy move".
+            PlaylistKeyAction::EditEntry => {
+                self.note(
+                    "playlist command 40255 (edit the playlist entry) is not implemented yet"
+                        .to_string(),
+                );
+                Ok(Some(ShortcutOutcome::Handled))
+            }
             // ----- the provisional close row -----
             PlaylistKeyAction::CloseEditor => {
                 let commands = self.close_playlist_window()?;
@@ -1949,9 +1964,10 @@ mod tests {
 
     #[test]
     fn the_rows_without_a_command_do_nothing_and_are_noted() {
-        // S03 §2's `40255` "Edit the playlist entry" has no command yet, so
-        // the row is listed as unimplemented: it must not fall through to the
-        // main table's `40186` "Toggle easy move".
+        // S03 §2's `40255` "Edit the playlist entry" has its own row now (the
+        // dialog's model is in `rustamp-ui`'s `dialogs` module), but the app
+        // half is not wired yet: the row must not fall through to the main
+        // table's `40186` "Toggle easy move".
         let mut app = test_app();
         let easy_move = app.easy_move();
         let outcome = app

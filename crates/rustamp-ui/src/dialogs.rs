@@ -83,17 +83,26 @@
 //!   It is **not** the file-info box, which shows the current track as the
 //!   engine sees it. S03 §2 gives the id and the chord only, so the content
 //!   is an own choice (see [`ExtendedInfo`]).
+//! * The edit-entry box (S03 §2 `40255` "Edit the playlist entry") **edits**
+//!   the tags of one playlist entry: a field per tag, pre-filled with the
+//!   value the file has, with its own focus, validation and a save request
+//!   that carries the changed fields only (see [`EditEntryDialog`]). The box
+//!   writes nothing itself: the app reads the tags, opens the box with them
+//!   and hands the request to the tag writer. S03 §2 gives the id and the
+//!   chord only, so the fields, the layout and the validation are own
+//!   choices.
 //! * Rendering uses the `text.bmp` bitmap font as a stand-in (the same choice
 //!   as the playlist rows; the reference's real dialog font is unknown).
 
 use std::path::{Path, PathBuf};
 
 use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
+use rustamp_core::meta::TrackMetadata;
 use rustamp_gfx::{BitmapFont, GlyphMap, Image};
 use rustamp_prefs::DEFAULT_PAGE;
 use rustamp_skin::{Sheet, Skin, webamp};
 
-use crate::Key;
+use crate::{Key, Modifiers};
 
 /// A dialog the app can open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1007,6 +1016,698 @@ pub fn extended_info_lines(info: &ExtendedInfo) -> Vec<String> {
         );
     }
     lines
+}
+
+/// The title of the edit-entry dialog. Own choice: no spec fixes a dialog
+/// title (S04 open).
+pub const EDIT_ENTRY_TITLE: &str = "Edit playlist entry";
+/// Client size of the edit-entry dialog: the nine field lines, the hint line
+/// and the title strip. Own choice (no spec fixes dialog geometry, S04 open).
+pub const EDIT_ENTRY_CLIENT_SIZE: (u32, u32) = (320, 150);
+/// The hint the edit-entry dialog shows when every field is valid. Own
+/// choice.
+pub const EDIT_ENTRY_HINT: &str = "Tab moves between the fields, Enter saves, Escape cancels.";
+/// The longest text the edit-entry dialog keeps in a free-text field. Own
+/// choice: the reference's limits are unmeasured (S04 open).
+pub const MAX_EDIT_ENTRY_TEXT_LEN: usize = 256;
+/// The longest genre text the edit-entry dialog keeps. Own choice.
+pub const MAX_EDIT_ENTRY_GENRE_LEN: usize = 64;
+/// The longest year text the edit-entry dialog keeps. Own choice: a `u32`
+/// fits in ten digits, and the range check does the rest.
+pub const MAX_EDIT_ENTRY_YEAR_LEN: usize = 10;
+/// The longest track or disc text the edit-entry dialog keeps. Own choice:
+/// two numbers and the separator between them.
+pub const MAX_EDIT_ENTRY_NUMBER_LEN: usize = 21;
+/// The smallest year the edit-entry dialog accepts. Own choice: the writer
+/// takes every year up to [`MAX_EDIT_ENTRY_YEAR`], and the reader can produce
+/// a zero year (`0000`).
+pub const MIN_EDIT_ENTRY_YEAR: u32 = 0;
+/// The largest year the edit-entry dialog accepts. Own choice, and the one
+/// the writer enforces: `rustamp-meta` refuses a year above 9999.
+pub const MAX_EDIT_ENTRY_YEAR: u32 = 9999;
+/// The largest track or disc number the edit-entry dialog accepts. Own
+/// choice.
+pub const MAX_EDIT_ENTRY_NUMBER: u32 = 9999;
+/// The key the total of a disc is carried in.
+///
+/// [`TrackMetadata`] has no `disc_total` field, so the total of a `1/2` disc
+/// rides in the `extra` map under this key — the key `rustamp-meta`'s reader
+/// parks it in. A read → edit → write cycle therefore keeps it for the tag
+/// formats that have a field for it (the Vorbis family); the other formats
+/// refuse it, and the write report names it.
+pub const DISC_TOTAL_KEY: &str = "DISCTOTAL";
+
+/// The editable tag fields of the edit-entry dialog, in the order the dialog
+/// shows them.
+///
+/// The list is the tag fields [`TrackMetadata`] carries that the writer can
+/// store: title, artist, album, album artist, year, genre, track, disc and
+/// comment. What the contract does not carry for a tag
+/// ([`TrackMetadata::duration_ms`], [`TrackMetadata::bitrate_kbps`]) and the
+/// free-form `extra` map are not editable here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditEntryField {
+    /// The track title.
+    Title,
+    /// The artist.
+    Artist,
+    /// The album.
+    Album,
+    /// The album artist.
+    AlbumArtist,
+    /// The release year.
+    Year,
+    /// The genre.
+    Genre,
+    /// The track number, with the total when the file carries one.
+    Track,
+    /// The disc number, with the total when the file carries one.
+    Disc,
+    /// The comment.
+    Comment,
+}
+
+impl EditEntryField {
+    /// Every field, in the order the dialog shows them.
+    pub const ALL: [EditEntryField; 9] = [
+        Self::Title,
+        Self::Artist,
+        Self::Album,
+        Self::AlbumArtist,
+        Self::Year,
+        Self::Genre,
+        Self::Track,
+        Self::Disc,
+        Self::Comment,
+    ];
+
+    /// The label the dialog shows in front of the field.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+            Self::AlbumArtist => "Album artist",
+            Self::Year => "Year",
+            Self::Genre => "Genre",
+            Self::Track => "Track",
+            Self::Disc => "Disc",
+            Self::Comment => "Comment",
+        }
+    }
+
+    /// The longest text the field keeps.
+    ///
+    /// Own choice (the reference's limits are unmeasured, S04 open): the
+    /// free-text fields keep [`MAX_EDIT_ENTRY_TEXT_LEN`] characters, the
+    /// genre [`MAX_EDIT_ENTRY_GENRE_LEN`], the year [`MAX_EDIT_ENTRY_YEAR_LEN`]
+    /// (a `u32` fits in ten digits; the range check does the rest) and the
+    /// number fields [`MAX_EDIT_ENTRY_NUMBER_LEN`] (two numbers and the
+    /// separator).
+    pub const fn max_len(self) -> usize {
+        match self {
+            Self::Title | Self::Artist | Self::Album | Self::AlbumArtist | Self::Comment => {
+                MAX_EDIT_ENTRY_TEXT_LEN
+            }
+            Self::Genre => MAX_EDIT_ENTRY_GENRE_LEN,
+            Self::Year => MAX_EDIT_ENTRY_YEAR_LEN,
+            Self::Track | Self::Disc => MAX_EDIT_ENTRY_NUMBER_LEN,
+        }
+    }
+
+    /// The field's index in [`Self::ALL`].
+    const fn index(self) -> usize {
+        match self {
+            Self::Title => 0,
+            Self::Artist => 1,
+            Self::Album => 2,
+            Self::AlbumArtist => 3,
+            Self::Year => 4,
+            Self::Genre => 5,
+            Self::Track => 6,
+            Self::Disc => 7,
+            Self::Comment => 8,
+        }
+    }
+}
+
+/// A number with an optional total: the shape of a track (`3` or `3/12`) and
+/// of a disc (`1` or `1/2`) in every tag format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditEntryNumber {
+    /// The number itself.
+    pub number: u32,
+    /// The total, when the field carried one.
+    pub total: Option<u32>,
+}
+
+/// What the edit-entry dialog does to one tag field.
+///
+/// The type parameter is the value the field carries: the text for the
+/// free-text fields, the year for the year field and an [`EditEntryNumber`]
+/// for the track and the disc field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditEntryChange<T> {
+    /// The field was not touched: the file keeps the value it has.
+    Unchanged,
+    /// The field was edited: the file gets this value.
+    Edited(T),
+}
+
+impl<T> EditEntryChange<T> {
+    /// Whether the field was not touched.
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, Self::Unchanged)
+    }
+}
+
+impl<T> Default for EditEntryChange<T> {
+    /// The change of an untouched field.
+    fn default() -> Self {
+        Self::Unchanged
+    }
+}
+
+/// The changed fields of the edit-entry dialog: the save request.
+///
+/// Only the fields the user edited carry a value; every other field is
+/// [`EditEntryChange::Unchanged`]. The app hands the request to the tag
+/// writer (through [`Self::to_metadata`]), so the fields the user did not
+/// touch keep the value the file has.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EditEntryChanges {
+    /// The title.
+    pub title: EditEntryChange<String>,
+    /// The artist.
+    pub artist: EditEntryChange<String>,
+    /// The album.
+    pub album: EditEntryChange<String>,
+    /// The album artist.
+    pub album_artist: EditEntryChange<String>,
+    /// The year.
+    pub year: EditEntryChange<u32>,
+    /// The genre.
+    pub genre: EditEntryChange<String>,
+    /// The track number.
+    pub track: EditEntryChange<EditEntryNumber>,
+    /// The disc number.
+    pub disc: EditEntryChange<EditEntryNumber>,
+    /// The comment.
+    pub comment: EditEntryChange<String>,
+}
+
+impl EditEntryChanges {
+    /// Whether no field changed.
+    pub fn is_empty(&self) -> bool {
+        self.title.is_unchanged()
+            && self.artist.is_unchanged()
+            && self.album.is_unchanged()
+            && self.album_artist.is_unchanged()
+            && self.year.is_unchanged()
+            && self.genre.is_unchanged()
+            && self.track.is_unchanged()
+            && self.disc.is_unchanged()
+            && self.comment.is_unchanged()
+    }
+
+    /// The patch the app hands to the tag writer.
+    ///
+    /// Only the changed fields are set; the rest stay `None`, which the
+    /// writer reads as "leave this tag as it is" (`write_tags` keeps every
+    /// field the caller does not set).
+    ///
+    /// Two limits of the writer show up here, and they are the writer's, not
+    /// the dialog's:
+    ///
+    /// * A value the writer cannot clear keeps the value the file has.
+    ///   Dropping the total of a `3/12` track leaves the total in the file,
+    ///   and a number the user empties keeps the number the file has (a
+    ///   number has no empty value).
+    /// * The disc total has no field in [`TrackMetadata`], so it rides in the
+    ///   `extra` map under [`DISC_TOTAL_KEY`] — the key `rustamp-meta`'s
+    ///   reader parks it in.
+    pub fn to_metadata(&self) -> TrackMetadata {
+        let mut metadata = TrackMetadata::default();
+        if let EditEntryChange::Edited(value) = &self.title {
+            metadata.title = Some(value.clone());
+        }
+        if let EditEntryChange::Edited(value) = &self.artist {
+            metadata.artist = Some(value.clone());
+        }
+        if let EditEntryChange::Edited(value) = &self.album {
+            metadata.album = Some(value.clone());
+        }
+        if let EditEntryChange::Edited(value) = &self.album_artist {
+            metadata.album_artist = Some(value.clone());
+        }
+        if let EditEntryChange::Edited(year) = self.year {
+            metadata.year = Some(year);
+        }
+        if let EditEntryChange::Edited(value) = &self.genre {
+            metadata.genre = Some(value.clone());
+        }
+        if let EditEntryChange::Edited(number) = &self.track {
+            metadata.track_no = Some(number.number);
+            metadata.track_total = number.total;
+        }
+        if let EditEntryChange::Edited(number) = &self.disc {
+            metadata.disc_no = Some(number.number);
+            if let Some(total) = number.total {
+                metadata
+                    .extra
+                    .insert(DISC_TOTAL_KEY.to_owned(), total.to_string());
+            }
+        }
+        if let EditEntryChange::Edited(value) = &self.comment {
+            metadata.comment = Some(value.clone());
+        }
+        metadata
+    }
+}
+
+/// Why a field of the edit-entry dialog does not validate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditEntryError {
+    /// The year is not a number between [`MIN_EDIT_ENTRY_YEAR`] and
+    /// [`MAX_EDIT_ENTRY_YEAR`].
+    InvalidYear,
+    /// The track or the disc field is neither `n` nor `n/total`.
+    InvalidNumber,
+}
+
+/// The field of the edit-entry dialog that does not validate, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditEntryInvalid {
+    /// The field that does not validate.
+    pub field: EditEntryField,
+    /// Why it does not validate.
+    pub error: EditEntryError,
+}
+
+impl EditEntryInvalid {
+    /// The message the dialog shows for the problem.
+    pub fn message(&self) -> String {
+        match self.error {
+            EditEntryError::InvalidYear => format!(
+                "the year must be a number between {MIN_EDIT_ENTRY_YEAR} and {MAX_EDIT_ENTRY_YEAR}"
+            ),
+            EditEntryError::InvalidNumber => "the number must be `n` or `n/total`".to_string(),
+        }
+    }
+}
+
+/// What a key press did in the edit-entry dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditEntryOutcome {
+    /// The key was not consumed by the dialog.
+    Unhandled,
+    /// The key changed the dialog: text was typed, a character was deleted or
+    /// the focus moved.
+    Edited,
+    /// `Enter`: the dialog can be saved, and the request carries the changed
+    /// fields.
+    Save(EditEntryChanges),
+    /// `Enter`: a field does not validate, so the dialog stays open.
+    Invalid(EditEntryInvalid),
+    /// `Escape`: the dialog is cancelled and nothing is written.
+    Cancel,
+}
+
+/// One field of the edit-entry dialog: the text it holds now and the text it
+/// was opened with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditEntryValue {
+    current: String,
+    original: String,
+}
+
+/// The edit-entry dialog (S03 §2 `40255` "Edit the playlist entry").
+///
+/// The dialog edits the **tags of one playlist entry**: it shows a field per
+/// tag [`TrackMetadata`] carries, pre-filled with the value the file has, and
+/// reports the fields the user changed. It does **not** write anything: the
+/// app reads the tags of the selected entry, opens the dialog with them and
+/// hands the save request to the tag writer (see
+/// [`EditEntryChanges::to_metadata`]).
+///
+/// S03 §2 gives the command id and the chord only, so everything about the
+/// dialog — its fields, its layout and its validation — is an **own choice**
+/// (the reference's dialog is unmeasured, S04 open). The rules it follows:
+///
+/// * The focus starts on the first field. `Tab` moves it to the next field
+///   and `Shift`+`Tab` to the previous one; both wrap around.
+/// * The free-text fields take any text. The year takes a number between
+///   [`MIN_EDIT_ENTRY_YEAR`] and [`MAX_EDIT_ENTRY_YEAR`]. The track and the
+///   disc field take `n` or `n/total`.
+/// * A field keeps at most [`EditEntryField::max_len`] characters.
+/// * `Enter` produces the save request and `Escape` cancels. A field that
+///   does not validate keeps the dialog open, so the user can fix it.
+///
+/// The dialog has no [`DialogKind`] yet: the kind is the app's window
+/// inventory, and the app opens this window in the lane that wires it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditEntryDialog {
+    values: Vec<EditEntryValue>,
+    focus: usize,
+}
+
+impl EditEntryDialog {
+    /// Opens the dialog on `metadata`: every field starts with the value the
+    /// file carries, and the focus starts on the first field.
+    pub fn new(metadata: &TrackMetadata) -> Self {
+        let values = EditEntryField::ALL
+            .iter()
+            .map(|field| {
+                let text = edit_entry_initial_text(*field, metadata);
+                EditEntryValue {
+                    current: text.clone(),
+                    original: text,
+                }
+            })
+            .collect();
+        Self { values, focus: 0 }
+    }
+
+    /// The index of the focused field.
+    pub fn focus(&self) -> usize {
+        self.focus
+    }
+
+    /// The focused field.
+    pub fn focused_field(&self) -> EditEntryField {
+        EditEntryField::ALL[self.focus]
+    }
+
+    /// Moves the focus to the next field (wrapping around).
+    pub fn focus_next(&mut self) {
+        self.focus = (self.focus + 1) % self.values.len();
+    }
+
+    /// Moves the focus to the previous field (wrapping around).
+    pub fn focus_prev(&mut self) {
+        self.focus = if self.focus == 0 {
+            self.values.len() - 1
+        } else {
+            self.focus - 1
+        };
+    }
+
+    /// The text `field` holds.
+    pub fn field_text(&self, field: EditEntryField) -> &str {
+        &self.values[field.index()].current
+    }
+
+    /// Replaces the text of `field` (clamped to the field's cap).
+    ///
+    /// Typing goes through [`type_text`](Self::type_text) instead; this
+    /// replaces the whole field at once (embedding and tests).
+    pub fn set_field_text(&mut self, field: EditEntryField, text: &str) {
+        let value = &mut self.values[field.index()];
+        value.current = text.chars().take(field.max_len()).collect();
+    }
+
+    /// Types `text` into the focused field.
+    ///
+    /// The text is what the OS produced for the key press (layout-aware, with
+    /// case and punctuation). Control characters are dropped: `Tab`, `Enter`,
+    /// `Backspace` and `Escape` take the [`key`](Self::key) path. Returns
+    /// whether anything was typed.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        let mut typed = false;
+        for ch in text.chars().filter(|ch| !ch.is_control()) {
+            self.push_char(ch);
+            typed = true;
+        }
+        typed
+    }
+
+    /// Deletes the last character of the focused field. Returns whether a
+    /// character was deleted.
+    pub fn backspace(&mut self) -> bool {
+        self.values[self.focus].current.pop().is_some()
+    }
+
+    /// Handles one key press.
+    ///
+    /// `Tab` moves the focus (`Shift`+`Tab` moves it back), `Backspace`
+    /// deletes the last character of the focused field, the letter, digit and
+    /// space keys type into it, `Enter` saves and `Escape` cancels.
+    pub fn key(&mut self, key: Key, modifiers: Modifiers) -> EditEntryOutcome {
+        match key {
+            Key::Tab => {
+                if modifiers.shift() {
+                    self.focus_prev();
+                } else {
+                    self.focus_next();
+                }
+                EditEntryOutcome::Edited
+            }
+            Key::Backspace => {
+                if self.backspace() {
+                    EditEntryOutcome::Edited
+                } else {
+                    EditEntryOutcome::Unhandled
+                }
+            }
+            Key::Letter(letter) => {
+                self.push_char(letter as char);
+                EditEntryOutcome::Edited
+            }
+            Key::Digit(digit) => {
+                self.push_char((b'0' + digit % 10) as char);
+                EditEntryOutcome::Edited
+            }
+            Key::Numpad(digit) => {
+                self.push_char((b'0' + digit % 10) as char);
+                EditEntryOutcome::Edited
+            }
+            Key::Space => {
+                self.push_char(' ');
+                EditEntryOutcome::Edited
+            }
+            Key::Enter => match self.save_request() {
+                Ok(changes) => EditEntryOutcome::Save(changes),
+                Err(invalid) => EditEntryOutcome::Invalid(invalid),
+            },
+            Key::Escape => EditEntryOutcome::Cancel,
+            _ => EditEntryOutcome::Unhandled,
+        }
+    }
+
+    /// The save request: the fields the user changed.
+    ///
+    /// `Err` when a field does not validate: the dialog stays open so the
+    /// user can fix it, and there is nothing to write yet.
+    pub fn save_request(&self) -> Result<EditEntryChanges, EditEntryInvalid> {
+        Ok(EditEntryChanges {
+            title: self.changed_text(EditEntryField::Title),
+            artist: self.changed_text(EditEntryField::Artist),
+            album: self.changed_text(EditEntryField::Album),
+            album_artist: self.changed_text(EditEntryField::AlbumArtist),
+            year: self.changed_year()?,
+            genre: self.changed_text(EditEntryField::Genre),
+            track: self.changed_number(EditEntryField::Track)?,
+            disc: self.changed_number(EditEntryField::Disc)?,
+            comment: self.changed_text(EditEntryField::Comment),
+        })
+    }
+
+    /// The first field that does not validate, in the order the dialog shows
+    /// the fields.
+    pub fn validation_error(&self) -> Option<EditEntryInvalid> {
+        EditEntryField::ALL.iter().find_map(|field| {
+            self.field_error(*field).map(|error| EditEntryInvalid {
+                field: *field,
+                error,
+            })
+        })
+    }
+
+    /// The problem with `field`, if it has one.
+    fn field_error(&self, field: EditEntryField) -> Option<EditEntryError> {
+        let text = self.values[field.index()].current.trim();
+        if text.is_empty() {
+            // An empty number field keeps the value the file has: a number
+            // has no empty value.
+            return None;
+        }
+        match field {
+            EditEntryField::Year => parse_edit_year(text)
+                .is_none()
+                .then_some(EditEntryError::InvalidYear),
+            EditEntryField::Track | EditEntryField::Disc => parse_edit_number(text)
+                .is_none()
+                .then_some(EditEntryError::InvalidNumber),
+            _ => None,
+        }
+    }
+
+    /// Appends one character to the focused field (a no-op at the cap).
+    fn push_char(&mut self, ch: char) {
+        let field = self.focused_field();
+        let value = &mut self.values[self.focus];
+        if value.current.chars().count() < field.max_len() {
+            value.current.push(ch);
+        }
+    }
+
+    /// The change of a free-text field.
+    fn changed_text(&self, field: EditEntryField) -> EditEntryChange<String> {
+        let value = &self.values[field.index()];
+        if value.current == value.original {
+            EditEntryChange::Unchanged
+        } else {
+            EditEntryChange::Edited(value.current.clone())
+        }
+    }
+
+    /// The change of the year field.
+    fn changed_year(&self) -> Result<EditEntryChange<u32>, EditEntryInvalid> {
+        let value = &self.values[EditEntryField::Year.index()];
+        if value.current == value.original {
+            return Ok(EditEntryChange::Unchanged);
+        }
+        let text = value.current.trim();
+        if text.is_empty() {
+            // A year has no empty value: the field keeps the year the file
+            // has.
+            return Ok(EditEntryChange::Unchanged);
+        }
+        match parse_edit_year(text) {
+            Some(year) => Ok(EditEntryChange::Edited(year)),
+            None => Err(EditEntryInvalid {
+                field: EditEntryField::Year,
+                error: EditEntryError::InvalidYear,
+            }),
+        }
+    }
+
+    /// The change of the track or the disc field.
+    fn changed_number(
+        &self,
+        field: EditEntryField,
+    ) -> Result<EditEntryChange<EditEntryNumber>, EditEntryInvalid> {
+        let value = &self.values[field.index()];
+        if value.current == value.original {
+            return Ok(EditEntryChange::Unchanged);
+        }
+        let text = value.current.trim();
+        if text.is_empty() {
+            // A number has no empty value: the field keeps the number the
+            // file has.
+            return Ok(EditEntryChange::Unchanged);
+        }
+        match parse_edit_number(text) {
+            Some(number) => Ok(EditEntryChange::Edited(number)),
+            None => Err(EditEntryInvalid {
+                field,
+                error: EditEntryError::InvalidNumber,
+            }),
+        }
+    }
+}
+
+/// The edit-entry dialog's body lines.
+///
+/// One line per field, in the order the dialog shows the fields, with the
+/// focused field marked (`> `) and an empty field shown as a dash. The last
+/// line names the keys, or the field that does not validate.
+pub fn edit_entry_lines(dialog: &EditEntryDialog) -> Vec<String> {
+    let mut lines = Vec::with_capacity(EditEntryField::ALL.len() + 1);
+    for field in EditEntryField::ALL {
+        let marker = if field == dialog.focused_field() {
+            "> "
+        } else {
+            "  "
+        };
+        let text = dialog.field_text(field);
+        let shown = if text.is_empty() { "-" } else { text };
+        lines.push(format!("{marker}{}: {shown}", field.label()));
+    }
+    match dialog.validation_error() {
+        Some(invalid) => lines.push(format!("{}: {}", invalid.field.label(), invalid.message())),
+        None => lines.push(EDIT_ENTRY_HINT.to_string()),
+    }
+    lines
+}
+
+/// The text a field starts with: the value the file carries.
+fn edit_entry_initial_text(field: EditEntryField, metadata: &TrackMetadata) -> String {
+    match field {
+        EditEntryField::Title => metadata.title.clone().unwrap_or_default(),
+        EditEntryField::Artist => metadata.artist.clone().unwrap_or_default(),
+        EditEntryField::Album => metadata.album.clone().unwrap_or_default(),
+        EditEntryField::AlbumArtist => metadata.album_artist.clone().unwrap_or_default(),
+        EditEntryField::Year => metadata
+            .year
+            .map(|year| year.to_string())
+            .unwrap_or_default(),
+        EditEntryField::Genre => metadata.genre.clone().unwrap_or_default(),
+        EditEntryField::Track => edit_entry_number_text(metadata.track_no, metadata.track_total),
+        EditEntryField::Disc => {
+            edit_entry_number_text(metadata.disc_no, edit_entry_disc_total(metadata))
+        }
+        EditEntryField::Comment => metadata.comment.clone().unwrap_or_default(),
+    }
+}
+
+/// The text of a number field: `n` or `n/total`.
+fn edit_entry_number_text(number: Option<u32>, total: Option<u32>) -> String {
+    match (number, total) {
+        (Some(number), Some(total)) => format!("{number}/{total}"),
+        (Some(number), None) => number.to_string(),
+        // A total without a number has no place in the field's shape.
+        (None, _) => String::new(),
+    }
+}
+
+/// The disc total the metadata carries.
+///
+/// [`TrackMetadata`] has no `disc_total` field, so the total of a `1/2` disc
+/// rides in the `extra` map under [`DISC_TOTAL_KEY`] — the key
+/// `rustamp-meta`'s reader parks it in.
+fn edit_entry_disc_total(metadata: &TrackMetadata) -> Option<u32> {
+    metadata.extra.get(DISC_TOTAL_KEY)?.parse().ok()
+}
+
+/// Parses the year field's text: a plain decimal number between
+/// [`MIN_EDIT_ENTRY_YEAR`] and [`MAX_EDIT_ENTRY_YEAR`].
+fn parse_edit_year(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let year: u32 = text.parse().ok()?;
+    (MIN_EDIT_ENTRY_YEAR..=MAX_EDIT_ENTRY_YEAR)
+        .contains(&year)
+        .then_some(year)
+}
+
+/// Parses a track or disc field's text: `n` or `n/total`.
+fn parse_edit_number(text: &str) -> Option<EditEntryNumber> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut parts = text.split('/');
+    let number = parse_edit_count(parts.next()?)?;
+    let total = match parts.next() {
+        Some(part) => Some(parse_edit_count(part)?),
+        None => None,
+    };
+    if parts.next().is_some() {
+        // A second separator is not a number pair.
+        return None;
+    }
+    Some(EditEntryNumber { number, total })
+}
+
+/// Parses one part of a number pair: a plain decimal number up to
+/// [`MAX_EDIT_ENTRY_NUMBER`].
+fn parse_edit_count(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value: u32 = text.parse().ok()?;
+    (value <= MAX_EDIT_ENTRY_NUMBER).then_some(value)
 }
 
 /// The note lines the app surfaces after reading a playlist file.
@@ -1928,5 +2629,316 @@ mod tests {
         // A clean file still names its counts.
         let lines = playlist_load_summary_lines(Path::new("clean.pls"), 1, &[]);
         assert_eq!(lines, vec!["loaded 1 track (0 skipped) from clean.pls"]);
+    }
+
+    /// The tags of a file, as the edit-entry dialog opens on them.
+    fn tagged_metadata() -> TrackMetadata {
+        TrackMetadata {
+            title: Some("A Song".to_string()),
+            artist: Some("An Artist".to_string()),
+            album: Some("The Album".to_string()),
+            album_artist: Some("The Album Artist".to_string()),
+            year: Some(1999),
+            genre: Some("Rock".to_string()),
+            comment: Some("A comment".to_string()),
+            track_no: Some(3),
+            track_total: Some(12),
+            disc_no: Some(1),
+            ..TrackMetadata::default()
+        }
+    }
+
+    #[test]
+    fn the_edit_entry_dialog_starts_with_the_tags_of_the_file() {
+        let mut metadata = tagged_metadata();
+        metadata
+            .extra
+            .insert(DISC_TOTAL_KEY.to_string(), "2".to_string());
+        let dialog = EditEntryDialog::new(&metadata);
+        // The focus starts on the first field.
+        assert_eq!(dialog.focus(), 0);
+        assert_eq!(dialog.focused_field(), EditEntryField::Title);
+        // Every field starts with the value the file carries.
+        assert_eq!(dialog.field_text(EditEntryField::Title), "A Song");
+        assert_eq!(dialog.field_text(EditEntryField::Artist), "An Artist");
+        assert_eq!(dialog.field_text(EditEntryField::Album), "The Album");
+        assert_eq!(
+            dialog.field_text(EditEntryField::AlbumArtist),
+            "The Album Artist"
+        );
+        assert_eq!(dialog.field_text(EditEntryField::Year), "1999");
+        assert_eq!(dialog.field_text(EditEntryField::Genre), "Rock");
+        assert_eq!(dialog.field_text(EditEntryField::Track), "3/12");
+        assert_eq!(dialog.field_text(EditEntryField::Disc), "1/2");
+        assert_eq!(dialog.field_text(EditEntryField::Comment), "A comment");
+        // Nothing changed yet: the request is empty.
+        let changes = dialog.save_request().expect("the fields validate");
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_the_focused_field() {
+        let mut dialog = EditEntryDialog::new(&TrackMetadata::default());
+        assert!(dialog.type_text("A Song"));
+        assert_eq!(dialog.field_text(EditEntryField::Title), "A Song");
+        assert!(dialog.backspace());
+        assert_eq!(dialog.field_text(EditEntryField::Title), "A Son");
+        // The other fields are untouched.
+        assert_eq!(dialog.field_text(EditEntryField::Artist), "");
+        // The key path types what the key model stores (upper-case letters).
+        assert_eq!(
+            dialog.key(Key::Letter(b'B'), Modifiers::NONE),
+            EditEntryOutcome::Edited
+        );
+        assert_eq!(dialog.field_text(EditEntryField::Title), "A SonB");
+        assert_eq!(
+            dialog.key(Key::Digit(4), Modifiers::NONE),
+            EditEntryOutcome::Edited
+        );
+        assert_eq!(dialog.field_text(EditEntryField::Title), "A SonB4");
+        // Backspace on an empty field changes nothing.
+        dialog.set_field_text(EditEntryField::Title, "");
+        assert!(!dialog.backspace());
+        assert_eq!(
+            dialog.key(Key::Backspace, Modifiers::NONE),
+            EditEntryOutcome::Unhandled
+        );
+        // Control characters are not text.
+        assert!(!dialog.type_text("\r"));
+    }
+
+    #[test]
+    fn tab_and_shift_tab_move_the_focus() {
+        let mut dialog = EditEntryDialog::new(&TrackMetadata::default());
+        assert_eq!(dialog.focused_field(), EditEntryField::Title);
+        assert_eq!(
+            dialog.key(Key::Tab, Modifiers::NONE),
+            EditEntryOutcome::Edited
+        );
+        assert_eq!(dialog.focused_field(), EditEntryField::Artist);
+        assert_eq!(
+            dialog.key(Key::Tab, Modifiers::SHIFT),
+            EditEntryOutcome::Edited
+        );
+        assert_eq!(dialog.focused_field(), EditEntryField::Title);
+        // The focus wraps around at both ends.
+        assert_eq!(
+            dialog.key(Key::Tab, Modifiers::SHIFT),
+            EditEntryOutcome::Edited
+        );
+        assert_eq!(dialog.focused_field(), EditEntryField::Comment);
+        assert_eq!(
+            dialog.key(Key::Tab, Modifiers::NONE),
+            EditEntryOutcome::Edited
+        );
+        assert_eq!(dialog.focused_field(), EditEntryField::Title);
+    }
+
+    #[test]
+    fn the_year_field_takes_a_number_in_the_sane_range() {
+        let mut dialog = EditEntryDialog::new(&TrackMetadata::default());
+        dialog.set_field_text(EditEntryField::Year, "1999");
+        assert!(dialog.validation_error().is_none());
+        assert!(dialog.save_request().is_ok());
+        for bad in ["abcd", "19x9", "10000", "-1", "1.5", "99999999999"] {
+            dialog.set_field_text(EditEntryField::Year, bad);
+            let invalid = dialog
+                .validation_error()
+                .expect("the year does not validate");
+            assert_eq!(invalid.field, EditEntryField::Year, "{bad}");
+            assert_eq!(invalid.error, EditEntryError::InvalidYear, "{bad}");
+            assert!(dialog.save_request().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_number_fields_take_a_number_or_a_number_pair() {
+        let mut dialog = EditEntryDialog::new(&TrackMetadata::default());
+        for good in ["3", "3/12", "0"] {
+            dialog.set_field_text(EditEntryField::Track, good);
+            assert!(dialog.validation_error().is_none(), "{good}");
+            assert!(dialog.save_request().is_ok(), "{good}");
+        }
+        for bad in ["x", "3/", "/12", "3/12/4", "3.5", "3/99999"] {
+            dialog.set_field_text(EditEntryField::Track, bad);
+            let invalid = dialog
+                .validation_error()
+                .expect("the track does not validate");
+            assert_eq!(invalid.field, EditEntryField::Track, "{bad}");
+            assert_eq!(invalid.error, EditEntryError::InvalidNumber, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_save_request_carries_only_the_changed_fields() {
+        let mut dialog = EditEntryDialog::new(&tagged_metadata());
+        dialog.set_field_text(EditEntryField::Title, "Another Song");
+        dialog.set_field_text(EditEntryField::Track, "4/13");
+        let changes = dialog.save_request().expect("the fields validate");
+        assert_eq!(
+            changes.title,
+            EditEntryChange::Edited("Another Song".to_string())
+        );
+        assert_eq!(
+            changes.track,
+            EditEntryChange::Edited(EditEntryNumber {
+                number: 4,
+                total: Some(13),
+            })
+        );
+        // Everything else is untouched.
+        assert!(changes.artist.is_unchanged());
+        assert!(changes.album.is_unchanged());
+        assert!(changes.album_artist.is_unchanged());
+        assert!(changes.year.is_unchanged());
+        assert!(changes.genre.is_unchanged());
+        assert!(changes.disc.is_unchanged());
+        assert!(changes.comment.is_unchanged());
+        assert!(!changes.is_empty());
+
+        // The patch the writer gets names the changed fields only: every
+        // other field stays unset, which the writer reads as "leave it as it
+        // is".
+        let patch = changes.to_metadata();
+        assert_eq!(patch.title.as_deref(), Some("Another Song"));
+        assert_eq!(patch.track_no, Some(4));
+        assert_eq!(patch.track_total, Some(13));
+        assert_eq!(patch.artist, None);
+        assert_eq!(patch.album, None);
+        assert_eq!(patch.year, None);
+        assert_eq!(patch.disc_no, None);
+        assert!(patch.extra.is_empty());
+    }
+
+    #[test]
+    fn enter_saves_the_changed_fields_and_escape_cancels() {
+        let mut dialog = EditEntryDialog::new(&TrackMetadata::default());
+        assert_eq!(
+            dialog.key(Key::Escape, Modifiers::NONE),
+            EditEntryOutcome::Cancel
+        );
+        dialog.set_field_text(EditEntryField::Title, "A Song");
+        match dialog.key(Key::Enter, Modifiers::NONE) {
+            EditEntryOutcome::Save(changes) => {
+                assert_eq!(changes.title, EditEntryChange::Edited("A Song".to_string()));
+                assert!(changes.artist.is_unchanged());
+            }
+            other => panic!("Enter saves the dialog: {other:?}"),
+        }
+        // A field that does not validate keeps the dialog open.
+        dialog.set_field_text(EditEntryField::Year, "abcd");
+        match dialog.key(Key::Enter, Modifiers::NONE) {
+            EditEntryOutcome::Invalid(invalid) => {
+                assert_eq!(invalid.field, EditEntryField::Year);
+                assert_eq!(invalid.error, EditEntryError::InvalidYear);
+            }
+            other => panic!("Enter names the field that does not validate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_dialog_lines_show_every_field_and_the_focused_one() {
+        let dialog = EditEntryDialog::new(&tagged_metadata());
+        let lines = edit_entry_lines(&dialog);
+        assert_eq!(lines.len(), EditEntryField::ALL.len() + 1);
+        assert_eq!(lines[0], "> Title: A Song");
+        assert_eq!(lines[1], "  Artist: An Artist");
+        assert_eq!(lines[4], "  Year: 1999");
+        assert_eq!(lines[6], "  Track: 3/12");
+        assert_eq!(lines.last().map(String::as_str), Some(EDIT_ENTRY_HINT));
+        // An empty field shows a dash.
+        let empty = EditEntryDialog::new(&TrackMetadata::default());
+        let lines = edit_entry_lines(&empty);
+        assert_eq!(lines[1], "  Artist: -");
+        // A field that does not validate replaces the hint with the problem.
+        let mut broken = EditEntryDialog::new(&tagged_metadata());
+        broken.set_field_text(EditEntryField::Year, "abcd");
+        let lines = edit_entry_lines(&broken);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("Year: the year must be a number between 0 and 9999")
+        );
+    }
+
+    #[test]
+    fn a_field_keeps_at_most_its_cap() {
+        let mut dialog = EditEntryDialog::new(&TrackMetadata::default());
+        dialog.type_text(&"a".repeat(MAX_EDIT_ENTRY_TEXT_LEN + 50));
+        assert_eq!(
+            dialog.field_text(EditEntryField::Title).chars().count(),
+            MAX_EDIT_ENTRY_TEXT_LEN
+        );
+        // The genre has its own, shorter cap.
+        for _ in 0..5 {
+            dialog.focus_next();
+        }
+        assert_eq!(dialog.focused_field(), EditEntryField::Genre);
+        dialog.type_text(&"g".repeat(MAX_EDIT_ENTRY_GENRE_LEN + 10));
+        assert_eq!(
+            dialog.field_text(EditEntryField::Genre).chars().count(),
+            MAX_EDIT_ENTRY_GENRE_LEN
+        );
+        // The setter clamps as well.
+        dialog.set_field_text(
+            EditEntryField::Title,
+            &"b".repeat(MAX_EDIT_ENTRY_TEXT_LEN + 10),
+        );
+        assert_eq!(
+            dialog.field_text(EditEntryField::Title).chars().count(),
+            MAX_EDIT_ENTRY_TEXT_LEN
+        );
+    }
+
+    #[test]
+    fn an_emptied_field_tells_the_writer_what_it_can_do() {
+        let mut dialog = EditEntryDialog::new(&tagged_metadata());
+        // A text field the user empties is written as an empty value.
+        dialog.set_field_text(EditEntryField::Comment, "");
+        let changes = dialog.save_request().expect("the fields validate");
+        assert_eq!(changes.comment, EditEntryChange::Edited(String::new()));
+        assert_eq!(changes.to_metadata().comment.as_deref(), Some(""));
+        // A number has no empty value: the field keeps the value the file
+        // has.
+        dialog.set_field_text(EditEntryField::Year, "");
+        let changes = dialog.save_request().expect("the fields validate");
+        assert!(changes.year.is_unchanged());
+        assert_eq!(changes.to_metadata().year, None);
+    }
+
+    #[test]
+    fn the_dialog_is_big_enough_for_its_title_and_its_lines() {
+        let dialog = EditEntryDialog::new(&tagged_metadata());
+        let lines = edit_entry_lines(&dialog);
+        let (width, height) = EDIT_ENTRY_CLIENT_SIZE;
+        // The title strip holds the title.
+        let title_width = EDIT_ENTRY_TITLE.chars().count() as u32 * webamp::TEXT_CELL.0;
+        assert!(title_width <= width, "{title_width} > {width}");
+        // The body holds every line.
+        let body = TITLE_STRIP_HEIGHT + TEXT_PAD as u32 + lines.len() as u32 * TEXT_LINE_PX as u32;
+        assert!(body <= height, "{body} > {height}");
+    }
+
+    #[test]
+    fn the_disc_total_rides_in_the_extra_map() {
+        // `TrackMetadata` has no `disc_total` field: the total of a `1/2`
+        // disc rides in the `extra` map under `DISC_TOTAL_KEY`.
+        let mut metadata = TrackMetadata {
+            disc_no: Some(1),
+            ..TrackMetadata::default()
+        };
+        metadata
+            .extra
+            .insert(DISC_TOTAL_KEY.to_string(), "2".to_string());
+        let mut dialog = EditEntryDialog::new(&metadata);
+        assert_eq!(dialog.field_text(EditEntryField::Disc), "1/2");
+        // Changing the disc keeps the total in the patch.
+        dialog.set_field_text(EditEntryField::Disc, "2/3");
+        let changes = dialog.save_request().expect("the fields validate");
+        let patch = changes.to_metadata();
+        assert_eq!(patch.disc_no, Some(2));
+        assert_eq!(
+            patch.extra.get(DISC_TOTAL_KEY).map(String::as_str),
+            Some("3")
+        );
     }
 }

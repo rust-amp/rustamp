@@ -225,6 +225,15 @@ pub enum PlaylistKeyAction {
     /// (reading a file's tags is not a player action, RFC 0005 §9), so the
     /// app opens it itself.
     ReadExtendedInfo,
+    /// Ctrl+E: edit the playlist entry (`40255`, menu-confirmed).
+    ///
+    /// The action edits the **tags of the selected entry**: the dialog model
+    /// is [`crate::dialogs::EditEntryDialog`], which shows a field per tag
+    /// and reports the changed fields. S03 §2 gives the id and the chord
+    /// only, so the dialog's content is an **own choice**. No core command
+    /// opens that dialog (writing a file's tags is not a player action,
+    /// RFC 0005 §9), so the app opens it itself.
+    EditEntry,
     /// Ctrl+F4: close the playlist editor (`40224`, provisional).
     CloseEditor,
     /// Ctrl+W: toggle the editor's windowshade (`40064`).
@@ -288,6 +297,7 @@ impl PlaylistKeyAction {
             Self::BookmarkSelection => 40319,
             Self::GenerateHtmlPlaylist => 40292,
             Self::ReadExtendedInfo => 40293,
+            Self::EditEntry => 40255,
             Self::CloseEditor => 40224,
             Self::ToggleEditorShade => 40064,
             Self::IncreaseFontSize => 40335,
@@ -325,9 +335,9 @@ const fn prow(
 
 /// The playlist editor's shortcut table (S03 §2), in the spec's row order.
 ///
-/// The 87 rows whose command this build can act on. The one remaining row
-/// of S03 §2 has no command yet and is listed in
-/// [`UNIMPLEMENTED_PLAYLIST_ROWS`].
+/// The 88 rows whose command this build can act on — every row of S03 §2.
+/// The rows this build cannot act on would be listed in
+/// [`UNIMPLEMENTED_PLAYLIST_ROWS`], which is empty.
 ///
 /// The table is the playlist window's **own** table: it shadows the main
 /// window's table (S03 §1) and the global one (S03 §4) wherever the two
@@ -393,6 +403,12 @@ pub const PLAYLIST_TABLE: &[PlaylistBinding] = &[
         Key::Letter(b'D'),
         Modifiers::CTRL,
         PlaylistKeyAction::Shared(ShortcutAction::ToggleDoubleSize),
+        false,
+    ),
+    prow(
+        Key::Letter(b'E'),
+        Modifiers::CTRL,
+        PlaylistKeyAction::EditEntry,
         false,
     ),
     prow(
@@ -880,23 +896,19 @@ pub struct UnimplementedPlaylistRow {
 
 /// The S03 §2 rows this build cannot act on yet.
 ///
-/// * `Ctrl+E` — `40255` "Edit the playlist entry": no command edits a
-///   playlist entry, and the target of the edit (the selected entry, not the
-///   current track) is not specified either.
+/// The list is **empty**: every row of S03 §2 has an action now. The last
+/// gap was `Ctrl+E` (`40255` "Edit the playlist entry"), which the
+/// [`PlaylistKeyAction::EditEntry`] row fills: the dialog model is
+/// [`crate::dialogs::EditEntryDialog`].
 ///
-/// The `Ctrl+Alt+E` row (`40293` "Read extended info on selection") is **not**
-/// in this list: it reads the tags of the selected entries and shows them
+/// The `Ctrl+Alt+E` row (`40293` "Read extended info on selection") is a
+/// bound row too: it reads the tags of the selected entries and shows them
 /// (see [`PlaylistKeyAction::ReadExtendedInfo`]).
 ///
-/// The two font-size rows (`40335` / `40336`) are **not** in this list: they
+/// The two font-size rows (`40335` / `40336`) are bound rows as well: they
 /// are view settings of the editor and act on the playlist machine alone
 /// (RFC 0005 §9/§11.6), so they are rows of [`PLAYLIST_TABLE`].
-pub const UNIMPLEMENTED_PLAYLIST_ROWS: &[UnimplementedPlaylistRow] = &[UnimplementedPlaylistRow {
-    key: Key::Letter(b'E'),
-    modifiers: Modifiers::CTRL,
-    command_id: 40255,
-    provisional: false,
-}];
+pub const UNIMPLEMENTED_PLAYLIST_ROWS: &[UnimplementedPlaylistRow] = &[];
 
 /// The S03 §2 row a key press names, if the table binds it.
 ///
@@ -2655,16 +2667,16 @@ mod tests {
             playlist_key_action(Key::Up, Modifiers::NONE),
             Some(PlaylistKeyAction::MoveSelectionUp)
         );
-        // Ctrl+E has no command yet, so it is listed as unimplemented and
-        // never reaches the main table's `40186` "Toggle easy move".
+        // Ctrl+E is the playlist's own row (`40255` "Edit the playlist
+        // entry"); it never reaches the main table's `40186` "Toggle easy
+        // move".
         assert_eq!(
             playlist_key_action(Key::Letter(b'E'), Modifiers::CTRL),
-            None
+            Some(PlaylistKeyAction::EditEntry)
         );
         assert_eq!(
-            unimplemented_playlist_row(Key::Letter(b'E'), Modifiers::CTRL)
-                .map(|row| row.command_id),
-            Some(40255)
+            unimplemented_playlist_row(Key::Letter(b'E'), Modifiers::CTRL),
+            None
         );
     }
 
@@ -2709,10 +2721,11 @@ mod tests {
             .iter()
             .map(|row| row.command_id)
             .collect();
-        // `Ctrl+E` (40255) is the one S03 §2 row left: no command edits a
-        // playlist entry. `Ctrl+Alt+E` (40293) reads the extended info of
-        // the selection and is a bound row of the table.
-        assert_eq!(rows, vec![40255]);
+        // Every row of S03 §2 has an action now: `Ctrl+E` (`40255` "Edit the
+        // playlist entry") was the last gap, and it is a bound row of the
+        // table. `Ctrl+Alt+E` (`40293`) reads the extended info of the
+        // selection and is a bound row as well.
+        assert!(rows.is_empty(), "{rows:?}");
         // None of them resolves to an action.
         for row in UNIMPLEMENTED_PLAYLIST_ROWS {
             assert_eq!(
@@ -2722,6 +2735,27 @@ mod tests {
                 row.key
             );
         }
+    }
+
+    /// S03 §2's `Ctrl+E` ("Edit the playlist entry", `40255`) is a bound row:
+    /// it opens the edit-entry dialog, whose model is
+    /// `rustamp_ui::dialogs::EditEntryDialog`.
+    #[test]
+    fn the_edit_entry_row_is_bound_and_no_longer_unimplemented() {
+        assert_eq!(
+            playlist_key_action(Key::Letter(b'E'), Modifiers::CTRL),
+            Some(PlaylistKeyAction::EditEntry)
+        );
+        assert_eq!(PlaylistKeyAction::EditEntry.command_id(), 40255);
+        assert_eq!(
+            unimplemented_playlist_row(Key::Letter(b'E'), Modifiers::CTRL),
+            None,
+            "the row is implemented, so it is not listed as unimplemented"
+        );
+        // The row is not provisional: S03 §2 confirms it through the menu.
+        let binding =
+            playlist_key_binding(Key::Letter(b'E'), Modifiers::CTRL).expect("the row is bound");
+        assert!(!binding.provisional);
     }
 
     /// S03 §2 `Ctrl+Alt+E` ("Read extended info on selection", `40293`) is a
