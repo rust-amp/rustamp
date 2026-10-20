@@ -401,7 +401,7 @@ fn external_control_drives_the_player_window_in_the_test_vm() {
         fn PostMessageW(hwnd: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
     }
 
-    fn query(hwnd: *mut c_void, id: isize, argument: i32) -> u32 {
+    fn try_query(hwnd: *mut c_void, id: isize, argument: i32) -> std::io::Result<u32> {
         let mut result = 0;
         // SAFETY: HWND belongs to our live child; the result buffer is valid,
         // the query carries no pointers, and the send has a bounded timeout.
@@ -416,8 +416,16 @@ fn external_control_drives_the_player_window_in_the_test_vm() {
                 &mut result,
             )
         };
-        assert_ne!(ok, 0, "IPC {id} timed out or failed");
-        result as u32
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(result as u32)
+        }
+    }
+
+    fn query(hwnd: *mut c_void, id: isize, argument: i32) -> u32 {
+        try_query(hwnd, id, argument)
+            .unwrap_or_else(|error| panic!("IPC {id} timed out or failed: {error}"))
     }
 
     fn post(hwnd: *mut c_void, message: u32, argument: usize, id: isize) {
@@ -440,11 +448,22 @@ fn external_control_drives_the_player_window_in_the_test_vm() {
         }
     }
 
-    struct ChildGuard(std::process::Child);
+    struct ChildGuard {
+        child: std::process::Child,
+        stdout: PathBuf,
+        stderr: PathBuf,
+    }
     impl Drop for ChildGuard {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if std::thread::panicking() {
+                eprintln!(
+                    "player stdout:\n{}\nplayer stderr:\n{}",
+                    std::fs::read_to_string(&self.stdout).unwrap_or_default(),
+                    std::fs::read_to_string(&self.stderr).unwrap_or_default()
+                );
+            }
         }
     }
 
@@ -453,17 +472,49 @@ fn external_control_drives_the_player_window_in_the_test_vm() {
     let mut command = binary(); // Always CREATE_NO_WINDOW, even in the guest.
     isolate(&mut command, &dir);
     command.env_remove(rustamp_app::window::NO_GUI_ENV);
-    let child = ChildGuard(
-        command
+    let stdout = dir.path().join("player.stdout");
+    let stderr = dir.path().join("player.stderr");
+    let mut child = ChildGuard {
+        child: command
             .args(["--no-audio", "--volume", "128"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap())
             .spawn()
             .expect("spawn player"),
-    );
-    let hwnd = child_windows::find_window(child.0.id(), "Rustamp", Duration::from_secs(15));
+        stdout,
+        stderr,
+    };
+    let hwnd = child_windows::find_window(child.child.id(), "Rustamp", Duration::from_secs(15));
     assert_eq!(child_windows::window_class(hwnd), "Winamp v1.x");
-    eventually(hwnd, 0, 0, 0x2905); // Wait until the subclass is installed.
+    // Visibility precedes surface/tray/subclass setup in Windowed::resumed.
+    // Only this startup barrier retries a failed send. A discovered HWND is
+    // not yet a responsive player. After readiness EVERY query below still
+    // fails immediately on its original 1 s timeout (including the version).
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let mut retries = 0;
+    loop {
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "player exited before IPC readiness"
+        );
+        let reply = try_query(hwnd, 0, 0);
+        if matches!(reply, Ok(0x2905)) {
+            eprintln!(
+                "player IPC ready after {:?}; startup retries={retries}",
+                started.elapsed()
+            );
+            break;
+        }
+        retries += 1;
+        eprintln!("player IPC startup probe {retries}: {reply:?}");
+        assert!(
+            Instant::now() < deadline,
+            "player HWND never became IPC-ready: last version reply {reply:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(query(hwnd, 0, 0), 0x2905, "version after readiness");
     for (id, argument, expected) in [
         (104, -1, 0),
         (105, 0, u32::MAX),

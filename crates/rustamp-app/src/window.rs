@@ -3108,6 +3108,10 @@ fn map_key(event: &KeyEvent) -> Option<Key> {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/window_probe.rs"]
+mod window_probe;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::AppOptions;
@@ -3202,6 +3206,11 @@ mod tests {
     #[ignore = "VM-only: opens the real three-window presenter; run in the guest interactive session"]
     fn docking_presenter_moves_snaps_detaches_reflows_and_restores() {
         require_test_vm();
+        if window_probe::isolated(
+            "window::tests::docking_presenter_moves_snaps_detaches_reflows_and_restores",
+        ) {
+            return;
+        }
         struct Probe {
             presenter: Windowed,
             phase: u8,
@@ -3349,6 +3358,11 @@ mod tests {
     #[ignore = "VM-only: opens the real presenter; run in the guest interactive session"]
     fn the_playlist_window_shade_resizes_the_real_window() {
         require_test_vm();
+        if window_probe::isolated(
+            "window::tests::the_playlist_window_shade_resizes_the_real_window",
+        ) {
+            return;
+        }
         struct Probe {
             presenter: Windowed,
             phase: u8,
@@ -3360,12 +3374,17 @@ mod tests {
         }
         impl Probe {
             fn client_size(&self) -> (u32, u32) {
-                let size = self
+                let window = self
                     .presenter
                     .playlist_window
                     .as_ref()
-                    .expect("the playlist window is open")
-                    .inner_size();
+                    .expect("the playlist window is open");
+                let size = window.inner_size();
+                assert_eq!(
+                    window.outer_size(),
+                    size,
+                    "the shade must remain borderless"
+                );
                 (size.width, size.height)
             }
             fn origin(&self) -> (i32, i32) {
@@ -3452,6 +3471,57 @@ mod tests {
         };
         build_event_loop(true).unwrap().run_app(&mut probe).unwrap();
         assert_eq!(probe.phase, 4);
+    }
+
+    /// Keep the runner's inventory name, but measure the system popup rather
+    /// than the retired skin-painted 323 x 569 client window (S04 §1).
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "VM-only: opens and measures the production native main menu"]
+    fn the_menu_popup_opens_at_the_measured_size() {
+        require_test_vm();
+        if window_probe::isolated("window::tests::the_menu_popup_opens_at_the_measured_size") {
+            return;
+        }
+        struct Probe {
+            presenter: Windowed,
+            measured: bool,
+        }
+        impl ApplicationHandler for Probe {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.presenter.resumed(event_loop);
+                let origin = self
+                    .presenter
+                    .window
+                    .as_ref()
+                    .unwrap()
+                    .outer_position()
+                    .unwrap();
+                let menu = self.presenter.app.native_main_menu();
+                let observer = window_probe::observe_popup(
+                    self.presenter.raw_main_window(),
+                    menu_popup_origin((origin.x, origin.y)),
+                    menu.rows,
+                );
+                self.presenter.app.submit(Command::OpenMainMenu).unwrap();
+                self.presenter.drain_main_menu();
+                observer.join().expect("popup observer panicked").unwrap();
+                assert!(!self.presenter.app.main_menu_is_open());
+                assert!(!self.presenter.app.quit(), "dismissal must not choose Exit");
+                self.measured = true;
+                event_loop.exit();
+            }
+            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+        }
+        let mut probe = Probe {
+            presenter: desktop_test_presenter(false),
+            measured: false,
+        };
+        build_event_loop(true).unwrap().run_app(&mut probe).unwrap();
+        assert!(
+            probe.measured,
+            "the real presenter must show its native popup"
+        );
     }
 
     fn wait_for_index(presenter: &mut Windowed, index: u32) {

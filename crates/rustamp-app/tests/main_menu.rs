@@ -1,12 +1,12 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! The main-menu popup wiring, end to end but **headless** (task card wave21b).
+//! The main-menu popup wiring, headless by default (task card wave21b).
 //!
 //! GUI must never run on the host, so every test here drives [`App`] with the
-//! null output and opens **no window**. That is now the whole file: the menu
-//! is the operating system's own popup (wave122), so there is no window of
-//! ours left to measure, and the probe that used to check this popup's
-//! 323 x 569 client size is gone with it. That probe is also the lesson: it
-//! measured a size and passed while the popup carried a standard window
+//! null output and opens **no window**, except the explicitly ignored and
+//! VM-gated native-popup probe below. The menu is the operating system's own
+//! popup (wave122), so that probe measures the actual system menu and its
+//! screen-space rows, not our retired 323 x 569 client window. The old probe
+//! is also the lesson: it measured a size and passed while the popup carried a standard window
 //! caption and drew unreadable text.
 //!
 //! What the headless tests pin:
@@ -33,6 +33,71 @@ use rustamp_core::command::Command;
 use rustamp_core::config::Config;
 use rustamp_ui::ShortcutAction;
 use rustamp_ui::menu::{MainMenuId, MenuCheck, SubmenuId, submenu_entries, top_level};
+
+#[cfg(windows)]
+#[path = "support/window_probe.rs"]
+mod window_probe;
+
+/// Historical inventory name retained: the native popup's size belongs to the
+/// OS font, DPI and theme. Assert its real rows/footprint and caption-free class
+/// rather than forcing the old self-painted window's screenshot dimensions.
+#[cfg(windows)]
+#[test]
+#[ignore = "VM-only: opens and measures the system main-menu popup"]
+fn the_main_menu_popup_opens_at_the_measured_client_size() {
+    use winit::application::ApplicationHandler;
+    use winit::event::WindowEvent;
+    use winit::event_loop::ActiveEventLoop;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::WindowId;
+
+    rustamp_app::window::require_test_vm();
+    if window_probe::isolated("the_main_menu_popup_opens_at_the_measured_client_size") {
+        return;
+    }
+    struct Probe {
+        measured: bool,
+    }
+    impl ApplicationHandler for Probe {
+        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            let window = event_loop
+                .create_window(
+                    rustamp_ui::skinned_window_attributes(
+                        "Rustamp native menu probe",
+                        (275, 116),
+                        rustamp_ui::TaskbarRole::Application,
+                    )
+                    .with_position(winit::dpi::PhysicalPosition::new(26, 29)),
+                )
+                .unwrap();
+            let RawWindowHandle::Win32(handle) = window.window_handle().unwrap().as_raw() else {
+                panic!("requires Win32")
+            };
+            let origin = window.outer_position().unwrap();
+            let anchor = rustamp_ui::menu::menu_popup_origin((origin.x, origin.y));
+            let app = headless_app();
+            let menu = app.native_main_menu();
+            let observer =
+                window_probe::observe_popup(handle.hwnd.get(), anchor, menu.rows.clone());
+            let choice = rustamp_platform::show_popup_menu(handle.hwnd.get(), &menu.rows, anchor);
+            observer.join().expect("popup observer panicked").unwrap();
+            assert_eq!(
+                choice.unwrap(),
+                None,
+                "cancellation is not a menu selection"
+            );
+            self.measured = true;
+            event_loop.exit();
+        }
+        fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+    }
+    let mut probe = Probe { measured: false };
+    rustamp_app::window::build_event_loop(true)
+        .unwrap()
+        .run_app(&mut probe)
+        .unwrap();
+    assert!(probe.measured);
+}
 
 /// A headless player: null output, built-in skin, nothing queued.
 fn headless_app() -> App {
