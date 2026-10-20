@@ -247,20 +247,30 @@ mtime makes cargo skip a rebuild, so mutation proofs need a fresh mtime.
 
 ## Open points
 
-- **Specs that do not exist yet (dirty room):** S08 (vis measurement), S11 (embed
-  frames / `gen.bmp`), S12 (`winamp.ini` keys), S13 (drag-drop rules), S14 (title
-  formatting), S16 (more preferences pages), S18 (fades), S19 (streaming), S20
-  (media library).
-- **S04 does not export the playlist menu trees** (File/Sort/List/Selection) — only
+- **All 20 specs exist** (19 audited, `S10` a revised draft pending ratification).
+  What remains in them are **measurement** questions, not missing documents: the
+  shuffle **morph** behaviour that collides with S15 §1, the `gen.bmp` **sprite
+  rectangles** (S11), the Preferences **tree hierarchy and control types** (S16),
+  and the library's **default columns and sort** (S20). Each needs a reference run
+  or screenshot, not another disassembly.
+- **S04 does not export the playlist menu trees** (File/Sort/List/Selection) - only
   the MISC menu is settled; no provisional labels were invented.
-- **RFC 0020** is needed for a generic "configure plugin N" wire message
-  (`PROTOCOL_VERSION` 4 → 5); the host-side API is ready (`wave185`).
+- **RFC 0020** has a second revision (five appended commands - configure, seek,
+  pause, unpause, stop - behind **one** `PROTOCOL_VERSION` 4 -> 5 bump). The
+  owner's decision is open: option **A** (a `rustamp-proto` dependency on
+  `rustamp-plugin-abi` plus an RFC 0004 erratum) is recommended; the reply stays
+  fire-and-forget.
+- **The streaming entry point**: the decoder and (in flight) the engine branch
+  exist; the app has no way to *enter* a URL yet (no field, no playlist entry).
 - **VM verification** of everything window-shaped is still outstanding: the
   library window, the folder picker, the prefs pages, window shaping, skin cursors,
-  the plugin acceptance tests, the exclusive output, the device-loss test.
+  the plugin acceptance tests, the exclusive output, the device-loss test, the new
+  extraction dialogs and the prefs text field.
 - **The `resident_to_inprocess_source_change_is_gapless` flake** is pre-existing
   and load-dependent; it passes in isolation. `--test-threads=1` helps but is not
   a guarantee under heavy parallel builds.
-- The `SelectedBG` colour question from the base skin (`#0000C6` vs the built-in
-  `#0000FF`) still needs an owner decision: adopting it requires re-blessing two
-  playlist goldens.
+- **`SelectedBG`** is decided: the built-in default is now the base skin's
+  `#0000C6`, and the two playlist goldens were re-blessed (2026-10-20).
+- **The decoder's read path is not panic-protected** (only the container probe is;
+  no panic was found there, but it is not covered).
+
