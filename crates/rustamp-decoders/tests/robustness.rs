@@ -18,6 +18,8 @@ use rustamp_core::audio::{
 use rustamp_core::error::{Error, Result};
 use rustamp_core::mock::MockDecoder;
 use rustamp_decoders::{SymphoniaDecoder, SymphoniaDecoderFactory, default_registry};
+use symphonia::core::checksum::Crc32;
+use symphonia::core::io::Monitor;
 
 const RATE: u32 = 44_100;
 const FIXTURE_FRAMES: u64 = RATE as u64 * 3 / 2;
@@ -1523,6 +1525,263 @@ fn a_seek_in_an_intact_mp4_does_not_turn_it_into_a_truncation() {
         "a seek is not a cut file: {outcome:?}"
     );
     assert!(frames > 0, "the rest of the file is still there");
+}
+
+// ---------------------------------------------------------------------------
+// Ogg: the end-of-stream page as a truncation oracle
+// ---------------------------------------------------------------------------
+
+/// The pages of an Ogg file: where every page starts and where it ends.
+///
+/// The segment table of a page states the length of its body, so the pages
+/// of a file can be walked without decoding anything.
+fn ogg_pages(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut pages = Vec::new();
+    let mut at = 0usize;
+    while at + 27 <= bytes.len() {
+        assert_eq!(&bytes[at..at + 4], b"OggS", "a page starts at {at}");
+        let segments = usize::from(bytes[at + 26]);
+        let table_at = at + 27;
+        let body: usize = bytes[table_at..table_at + segments]
+            .iter()
+            .map(|&lacing| usize::from(lacing))
+            .sum();
+        let end = table_at + segments + body;
+        pages.push((at, end));
+        at = end;
+    }
+    assert_eq!(at, bytes.len(), "the file ends at the end of a page");
+    pages
+}
+
+/// The checksum of the Ogg page that starts at `at`.
+///
+/// The checksum covers the header with its checksum field zeroed, the segment
+/// table and the body of the page.
+fn ogg_checksum(bytes: &[u8], at: usize) -> u32 {
+    let segments = usize::from(bytes[at + 26]);
+    let table_at = at + 27;
+    let body_at = table_at + segments;
+    let end = ogg_pages(bytes)
+        .into_iter()
+        .find(|(start, _)| *start == at)
+        .map(|(_, end)| end)
+        .expect("the page is in the file");
+    let mut crc = Crc32::new(0);
+    let mut head = bytes[at..at + 27].to_vec();
+    head[22..26].fill(0);
+    crc.process_buf_bytes(&head);
+    crc.process_buf_bytes(&bytes[table_at..body_at]);
+    crc.process_buf_bytes(&bytes[body_at..end]);
+    crc.crc()
+}
+
+/// Clears the end-of-stream flag of the page at `at` and fixes its checksum.
+///
+/// The file is then complete in every other respect: it holds every page of
+/// the original file, and the audio of the last page is still there. Only
+/// the marker that says "the stream ends here" is gone.
+fn ogg_clear_end_of_stream(bytes: &mut [u8], at: usize) {
+    bytes[at + 5] &= !0x04;
+    let checksum = ogg_checksum(bytes, at);
+    bytes[at + 22..at + 26].copy_from_slice(&checksum.to_le_bytes());
+}
+
+/// The intact Ogg file plays to its end and ends with a plain end of stream.
+///
+/// The last page of the file carries the end-of-stream flag, so the file says
+/// that its stream ends where the file ends.
+#[test]
+fn an_intact_ogg_ends_with_a_clean_end_of_stream() {
+    let bytes = std::fs::read(fixture("sine.ogg")).expect("fixture");
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("ogg"))).expect("open");
+    // The reader's frame count is the granule position of the end-of-stream
+    // page: the fixture states 66150 samples at 44.1 kHz.
+    assert_eq!(
+        d.duration().map(|d| d.as_millis()),
+        Some(1500),
+        "the reader's count is the granule position of the end-of-stream page"
+    );
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(matches!(outcome, Drained::End), "{outcome:?}");
+    assert_eq!(
+        frames, FIXTURE_FRAMES,
+        "the file holds every sample its end-of-stream page states"
+    );
+}
+
+/// A file that was cut before its end-of-stream page is a loud failure.
+///
+/// The end of an Ogg stream is a flag on the last page, so a file whose last
+/// page does not carry it was cut: the bitstream itself says that more is to
+/// come. The cut file is cut at the boundary of a page here, so the last page
+/// of the file is intact and does not carry the flag.
+#[test]
+fn an_ogg_cut_before_the_end_of_stream_page_is_a_loud_failure() {
+    let bytes = std::fs::read(fixture("sine.ogg")).expect("fixture");
+    let pages = ogg_pages(&bytes);
+    let (last_at, _) = *pages.last().expect("the fixture has pages");
+    // The file ends where the last page starts: the end-of-stream page and
+    // everything behind it is gone.
+    let cut = bytes[..last_at].to_vec();
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("ogg"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        frames < FIXTURE_FRAMES,
+        "a cut file must not yield the full {FIXTURE_FRAMES} frames: {frames}"
+    );
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => {
+            assert!(
+                message.contains("truncated"),
+                "the failure must name the truncation: {message}"
+            );
+            assert!(
+                message.contains("end-of-stream flag"),
+                "the failure must name the missing marker: {message}"
+            );
+        }
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// A file that was cut inside a page is a loud failure as well.
+///
+/// An intact file always ends at the boundary of a page, so a file that ends
+/// inside one was cut.
+#[test]
+fn an_ogg_cut_inside_a_page_is_a_loud_failure() {
+    let bytes = std::fs::read(fixture("sine.ogg")).expect("fixture");
+    let (last_at, last_end) = *ogg_pages(&bytes).last().expect("the fixture has pages");
+    // Cut in the middle of the body of the last page.
+    let cut = bytes[..last_at + (last_end - last_at) / 2].to_vec();
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("ogg"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        frames < FIXTURE_FRAMES,
+        "a cut file must not yield the full {FIXTURE_FRAMES} frames: {frames}"
+    );
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => {
+            assert!(
+                message.contains("truncated"),
+                "the failure must name the truncation: {message}"
+            );
+            assert!(
+                message.contains("inside the page"),
+                "the failure must name the page the file ends in: {message}"
+            );
+        }
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// A complete file whose end-of-stream flag is gone is a cut file.
+///
+/// This is the decision the oracle rests on: the marker is the only thing
+/// that says where the stream ends, so a file without it says that more is
+/// to come - even when every byte of its audio is there. The file keeps
+/// playing until it ends and fails then, loudly.
+#[test]
+fn an_ogg_without_an_end_of_stream_flag_is_called_truncated() {
+    let mut bytes = std::fs::read(fixture("sine.ogg")).expect("fixture");
+    let (last_at, _) = *ogg_pages(&bytes).last().expect("the fixture has pages");
+    ogg_clear_end_of_stream(&mut bytes, last_at);
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("ogg"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        frames >= FIXTURE_FRAMES,
+        "the audio of the file is all there: {frames} frames"
+    );
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => {
+            assert!(
+                message.contains("truncated"),
+                "the failure must name the truncation: {message}"
+            );
+        }
+        other => panic!("a file without the end-of-stream flag must fail loudly: {other:?}"),
+    }
+}
+
+/// Damage is not a cut file.
+///
+/// The last page of the file is damaged: its checksum does not match, so the
+/// page that would say "the stream ends here" cannot be read. The file holds
+/// all of its bytes and plays them, and it is not called truncated.
+#[test]
+fn a_damaged_ogg_page_is_not_called_truncated() {
+    let mut bytes = std::fs::read(fixture("sine.ogg")).expect("fixture");
+    let (last_at, last_end) = *ogg_pages(&bytes).last().expect("the fixture has pages");
+    // Damage the body of the last page: the page is still there, but its
+    // checksum does not match any more. The segment table is left alone: it
+    // states the length of the body, and a file whose last page lies about
+    // it cannot be told from a cut one (see `CONTRACT_NOTES.md`).
+    let segments = usize::from(bytes[last_at + 26]);
+    for byte in &mut bytes[last_at + 27 + segments..last_end] {
+        *byte ^= 0xA5;
+    }
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("ogg"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    if let Drained::Failed(Error::Decode(message)) = &outcome {
+        assert!(
+            !message.contains("truncated"),
+            "a damaged file is not a cut file: {message}"
+        );
+    }
+    assert!(
+        frames <= FIXTURE_FRAMES,
+        "the file holds no more than its samples: {frames}"
+    );
+}
+
+/// Damage in the middle of the file is not a cut file either.
+///
+/// The damaged page is skipped by the reader, the file keeps playing and it
+/// ends cleanly: the pages behind the damage still carry the end-of-stream
+/// flag. The reader may also refuse the file when it is opened - that is a
+/// defined failure too, and it does not name a truncation.
+#[test]
+fn a_damaged_ogg_page_in_the_middle_is_not_called_truncated() {
+    let mut bytes = std::fs::read(fixture("sine.ogg")).expect("fixture");
+    let (at, end) = ogg_pages(&bytes)[1];
+    let segments = usize::from(bytes[at + 26]);
+    for byte in &mut bytes[at + 27 + segments..end] {
+        *byte ^= 0xA5;
+    }
+    match SymphoniaDecoder::open(reader_source(bytes, Some("ogg"))) {
+        Err(error) => {
+            assert_defined_open_failure(&error, "a damaged ogg page");
+            assert!(
+                !error.to_string().contains("truncated"),
+                "a damaged file is not a cut file: {error}"
+            );
+        }
+        Ok(mut d) => {
+            let (_, outcome) = drain_bounded(&mut d);
+            if let Drained::Failed(Error::Decode(message)) = &outcome {
+                assert!(
+                    !message.contains("truncated"),
+                    "a damaged file is not a cut file: {message}"
+                );
+            }
+        }
+    }
+}
+
+/// A file that is not an Ogg file is not judged by the Ogg oracle.
+///
+/// The pages of another file are not pages, so the walk says nothing about
+/// it and the file keeps the behaviour it had.
+#[test]
+fn a_file_that_is_not_an_ogg_is_not_named_as_one() {
+    let bytes = std::fs::read(fixture("sine.mp3")).expect("fixture");
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("mp3"))).expect("open");
+    let (_, outcome) = drain_bounded(&mut d);
+    assert!(
+        matches!(outcome, Drained::End),
+        "another format is not an Ogg file: {outcome:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

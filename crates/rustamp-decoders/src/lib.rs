@@ -27,6 +27,7 @@ mod aiff_header;
 mod flac_header;
 mod mp4_header;
 mod mpeg_header;
+mod ogg_header;
 
 pub use symphonia_dec::{SymphoniaDecoder, SymphoniaDecoderFactory};
 pub use wave_dec::{WaveDecoder, WaveDecoderFactory};

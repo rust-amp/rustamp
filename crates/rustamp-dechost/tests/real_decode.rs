@@ -512,6 +512,77 @@ fn a_truncated_file_is_a_loud_decode_failure_and_not_an_end_of_stream() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A truncated Ogg file is a loud decode failure, not an end of stream.
+///
+/// The end of an Ogg stream is a flag on its last page: a file whose last
+/// page does not carry it says that more is to come, so it was cut. The cut
+/// file below ends where the end-of-stream page starts, so the pages it holds
+/// are intact and the file is named as a cut file.
+#[test]
+fn a_truncated_ogg_file_is_a_loud_decode_failure_and_not_an_end_of_stream() {
+    let bytes = std::fs::read(repo_fixture("sine.ogg")).expect("fixture");
+    // The last page of the file is the one that carries the end-of-stream
+    // flag: the file is cut where that page starts.
+    let cut_at = ogg_last_page(&bytes);
+    let cut = bytes[..cut_at].to_vec();
+    let path = temp_file("truncated.ogg", &cut);
+
+    // The same decoder in-process: the frames the file holds, then the
+    // failure. A truncated file must not look like a finished one.
+    let (expected, failure) = direct_decode_terminal(&path);
+    let failure = failure.expect("a truncated file must fail, not end the stream");
+    assert!(
+        failure.contains("truncated"),
+        "the failure must name the truncation: {failure}"
+    );
+    assert!(!expected.is_empty(), "the file holds whole frames");
+
+    let (mut session, done) = start(file_location(&path), 7);
+    let (frames, failure) = drain_pcm(&mut session, "the truncated-ogg transfer");
+    let failure =
+        failure.expect("a truncated file must be a loud failure, never a clean end of stream");
+    assert!(
+        failure.contains("truncated"),
+        "the failure must name the truncation: {failure}"
+    );
+    assert!(
+        frames > 0 && frames <= expected.len(),
+        "the frames the file holds are delivered before the failure, and no more: {frames}"
+    );
+    // The host ends with the resident's failure, not with a clean shutdown.
+    let error = done
+        .recv_timeout(JOIN_WAIT)
+        .expect("the host must end after a failed decode instead of stalling")
+        .expect_err("a failed decode must end the host with an error");
+    assert!(
+        error.to_string().contains("truncated"),
+        "the host error must name the truncation: {error}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The offset at which the last page of an Ogg file starts.
+///
+/// The segment table of a page states the length of its body, so the pages of
+/// a file can be walked without decoding anything.
+fn ogg_last_page(bytes: &[u8]) -> usize {
+    let mut at = 0usize;
+    let mut start = 0usize;
+    while at + 27 <= bytes.len() {
+        assert_eq!(&bytes[at..at + 4], b"OggS", "a page starts at {at}");
+        let segments = usize::from(bytes[at + 26]);
+        let table_at = at + 27;
+        let body: usize = bytes[table_at..table_at + segments]
+            .iter()
+            .map(|&lacing| usize::from(lacing))
+            .sum();
+        start = at;
+        at = table_at + segments + body;
+    }
+    assert_eq!(at, bytes.len(), "the file ends at the end of a page");
+    start
+}
+
 #[test]
 fn an_intact_file_ends_with_a_clean_end_of_stream() {
     let full: Vec<[f32; 2]> = (0..4000)
