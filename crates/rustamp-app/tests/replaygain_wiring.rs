@@ -19,7 +19,7 @@ fn test_app() -> App {
         skin,
         output: OutputChoice::Null,
         volume,
-        file: None,
+        media: None,
         seconds: Some(1),
     };
     App::new(options).expect("build headless app")

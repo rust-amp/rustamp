@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::*;
 use rustamp_core::audio::{AudioSpec, Confidence, Decoder, DecoderFactory, MediaSource, ProbeHint};
 use rustamp_core::meta::TrackMetadata;
+use rustamp_core::playlist::MediaLocation;
 use rustamp_core::state::StreamInfo;
 
 /// A silent decoder: enough to open a queue entry without a media file.
@@ -102,7 +103,7 @@ fn fixture() -> (App, tempfile::TempDir) {
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume: 200,
-            file: Some(path),
+            media: Some(MediaLocation::File(path)),
             seconds: None,
         },
         registry,

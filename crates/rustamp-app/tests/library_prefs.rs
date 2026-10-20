@@ -36,7 +36,7 @@ fn prefs_app(dir: &TempDir) -> App {
         skin: rustamp_app::skin::builtin(),
         output: OutputChoice::Null,
         volume: 200,
-        file: None,
+        media: None,
         seconds: None,
     };
     let mut app = App::new(options).expect("create the player");

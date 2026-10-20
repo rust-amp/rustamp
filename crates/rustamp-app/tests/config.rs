@@ -39,7 +39,7 @@ fn test_app_with_config(config: Config, config_path: Option<PathBuf>) -> App {
         skin,
         output: OutputChoice::Null,
         volume,
-        file: None,
+        media: None,
         seconds: Some(1),
     };
     let mut app = App::new(options).expect("build headless app");

@@ -31,6 +31,7 @@ use rustamp_core::command::Command;
 use rustamp_core::config::Config;
 use rustamp_core::error::{Error, ErrorInfo, ErrorKind, Result};
 use rustamp_core::event::Event;
+use rustamp_core::playlist::MediaLocation;
 use rustamp_core::state::TransportState;
 use rustamp_platform::{PrefsAction, PrefsNode};
 
@@ -92,7 +93,7 @@ fn app_playing_the_fixture() -> App {
         skin: skin::load(&SkinChoice::Builtin),
         output: OutputChoice::Null,
         volume: 200,
-        file: Some(file),
+        media: Some(MediaLocation::File(file)),
         seconds: None,
     };
     App::new(options).expect("build headless app")
@@ -314,7 +315,7 @@ fn switching_the_dsp_off_and_on_again_installs_the_chain_again() {
         skin: skin::load(&SkinChoice::Builtin),
         output: OutputChoice::Null,
         volume: 200,
-        file: None,
+        media: None,
         seconds: None,
     };
     let mut app = App::new(options).expect("build headless app");

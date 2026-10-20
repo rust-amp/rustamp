@@ -21,7 +21,7 @@ fn headless_app(config: Config) -> App {
         config,
         skin: rustamp_app::skin::builtin(),
         output: OutputChoice::Null,
-        file: None,
+        media: None,
         seconds: None,
     };
     App::new(options).expect("create headless app")

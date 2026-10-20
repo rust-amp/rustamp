@@ -37,10 +37,28 @@
 //! swallows a `/CLASS=` or a `--null`, and it has to come **before** the file
 //! to play.
 //!
+//! # The URL on the command line (own choice on top of S13 §1)
+//!
+//! S13 §1 says that everything which is not a switch is a **file argument**.
+//! A URL is not a file: it names a stream, and the player can read one
+//! (S19 §1: the request template is plain `http://`). So the bare argument —
+//! and every other path the command line names, the path of `/ADD` and the
+//! path of `/BOOKMARK` — is read by one rule, [`media_argument`]:
+//!
+//! * an argument that names an `http://` URL is a **URL**;
+//! * an argument that names **another scheme** is refused **by name**: this
+//!   build reads `http://` URLs only — there is no TLS, and S19 §6 question 8
+//!   establishes no evidence for `https`;
+//! * everything else is a **file path**, untouched.
+//!
+//! The refusal is a parse error: the player says which scheme it cannot
+//! read and starts nothing, rather than taking the URL for a file name.
+//!
 //! # Conformance with S13
 //!
 //! | S13 fact | Our behaviour | State | Where |
 //! |---|---|---|---|
+//! | §1 everything else on the command line is a file argument | an argument that names an `http://` URL is a URL; every other argument is a file path | differs (own choice: a URL is not a file, and S19 gives the player a stream to read) | `cli.rs`, [`media_argument`] |
 //! | §1 `/CLASS=<name>` overrides the class the single-instance check looks for | [`Args::class`] carries the value; [`Args::instance_class`] hands it to the check | matches | `cli.rs`, [`rustamp_platform::single_instance`] |
 //! | §2 the default class is the main window's class `Winamp v1.x` (S09 §1, §8 item 1) | [`rustamp_platform::single_instance::DEFAULT_CLASS`] | matches | `rustamp-platform/src/single_instance.rs` |
 //! | §2 the class name is case-sensitive | the class half of the instance key is not case-folded | matches | `rustamp-platform/src/single_instance.rs` |
@@ -87,6 +105,7 @@ use std::fmt;
 
 use std::path::PathBuf;
 
+use rustamp_core::playlist::MediaLocation;
 use rustamp_platform::shell_registration::RegistrationFlags;
 
 /// Where the audio goes.
@@ -112,8 +131,10 @@ pub enum OutputChoice {
 /// What `/BOOKMARK` asks for (S13 §1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bookmark {
-    /// `/BOOKMARK <path>`: the path is added as a bookmark rather than played.
-    Path(PathBuf),
+    /// `/BOOKMARK <path>`: the media is added as a bookmark rather than
+    /// played. The path is read by [`media_argument`], so it may be an
+    /// `http://` URL.
+    Location(MediaLocation),
     /// `/BOOKMARK` without a path.
     ///
     /// S13 §5.3 leaves this form open, so the player says so and does
@@ -133,10 +154,11 @@ pub enum Enqueue {
     /// Nothing is enqueued.
     #[default]
     None,
-    /// The file argument is enqueued instead of played (`--enqueue`).
-    File,
-    /// This path is enqueued instead of played (`/ADD <path>`).
-    Path(PathBuf),
+    /// The media argument is enqueued instead of played (`--enqueue`).
+    Argument,
+    /// This media is enqueued instead of played (`/ADD <path>`). The path is
+    /// read by [`media_argument`], so it may be an `http://` URL.
+    Location(MediaLocation),
     /// `/ADD` without a path.
     ///
     /// S13 §5.3 leaves the form of a path-taking switch without a path open
@@ -165,10 +187,11 @@ pub enum WinampIniImport {
 /// The parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Args {
-    /// The file to load and play. `None` starts with nothing loaded (S02 §3
-    /// shows the program name in the marquee). With [`Enqueue::File`] the
-    /// file is loaded but **not** played.
-    pub file: Option<PathBuf>,
+    /// The media to load and play: a file path or an `http://` URL (see
+    /// [`media_argument`]). `None` starts with nothing loaded (S02 §3 shows
+    /// the program name in the marquee). With [`Enqueue::Argument`] the media
+    /// is loaded but **not** played.
+    pub media: Option<MediaLocation>,
     /// Output device choice.
     pub output: OutputChoice,
     /// Initial volume `0..=255`; `None` uses the config's `audio.volume`.
@@ -218,12 +241,12 @@ impl Args {
 
 /// The usage text (`--help`).
 pub const USAGE: &str = "\
-usage: rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
+usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
                  [--seconds <n>] [--enqueue] [--import-winamp-ini [path]] [-h|--help]
        rustamp [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
               [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 
-  <file>            media file to load and play (optional)
+  <file|url>        media file to load and play, or an http:// URL to stream (optional)
   --null            use the deterministic null output and run headless (no window)
   --no-audio        open the window but play on the null output (silent; no audio device needed)
   --volume <0..=255> initial volume (default: the config's audio.volume)
@@ -242,7 +265,10 @@ usage: rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path
   /INSTALL          write the shell registration
   /UNREG            remove the shell registration
   /NOREG            skip the registration step
-  /ONLYINSTALL      write the shell registration, then exit";
+  /ONLYINSTALL      write the shell registration, then exit
+
+  An argument that names an http:// URL is streamed. Another scheme (https://
+  for instance) is refused: this build reads http:// URLs only.";
 
 /// Why the command line could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +286,15 @@ pub enum CliError {
     },
     /// More than one input file was given.
     TooManyFiles(String),
+    /// A URL named a scheme this build cannot read.
+    UnsupportedUrl {
+        /// The URL as it was written.
+        url: String,
+        /// The scheme of the URL, lower case.
+        scheme: String,
+    },
+    /// An `http://` URL that names no host.
+    MalformedUrl(String),
 }
 
 impl fmt::Display for CliError {
@@ -273,6 +308,15 @@ impl fmt::Display for CliError {
             CliError::TooManyFiles(extra) => {
                 write!(f, "only one input file is supported, got another: {extra}")
             }
+            CliError::UnsupportedUrl { url, scheme } => write!(
+                f,
+                "{url} was refused: unsupported URL scheme {scheme:?}: this build reads http:// \
+                 URLs only (there is no TLS, and S19 §6 question 8 leaves the other schemes open)"
+            ),
+            CliError::MalformedUrl(url) => write!(
+                f,
+                "{url} was refused: it is not a usable http:// URL (it names no host)"
+            ),
         }
     }
 }
@@ -295,14 +339,14 @@ where
                 "NOREG" => parsed.registration.noreg = true,
                 "ONLYINSTALL" => parsed.registration.only_install = true,
                 "BOOKMARK" => {
-                    parsed.bookmark = Some(match path_argument(&mut it) {
-                        Some(path) => Bookmark::Path(path),
+                    parsed.bookmark = Some(match path_argument(&mut it)? {
+                        Some(location) => Bookmark::Location(location),
                         None => Bookmark::WithoutPath,
                     })
                 }
                 "ADD" => {
-                    parsed.enqueue = match path_argument(&mut it) {
-                        Some(path) => Enqueue::Path(path),
+                    parsed.enqueue = match path_argument(&mut it)? {
+                        Some(location) => Enqueue::Location(location),
                         None => Enqueue::WithoutPath,
                     }
                 }
@@ -315,17 +359,17 @@ where
                         // The shell registers the bookmark form as one quoted
                         // argument (S13 §1), so the path can arrive in the
                         // same argument as the switch.
-                        parsed.bookmark = Some(Bookmark::Path(PathBuf::from(unquote(path))));
+                        parsed.bookmark = Some(Bookmark::Location(media_argument(unquote(path))?));
                     } else if let Some(path) = rest.strip_prefix("ADD ") {
                         // The same whole form for `/ADD` (S13 §1): the shell
                         // registers the verb with `"%s" /ADD "%%1"`, so the
                         // switch and its path can arrive in one argument.
-                        parsed.enqueue = Enqueue::Path(PathBuf::from(unquote(path)));
+                        parsed.enqueue = Enqueue::Location(media_argument(unquote(path))?);
                     } else {
                         // Anything else is a file argument (S13 §1): a token
                         // the reference's switch list does not name is not a
                         // switch at all.
-                        set_file(&mut parsed, arg)?;
+                        set_media(&mut parsed, arg)?;
                     }
                 }
             }
@@ -334,7 +378,7 @@ where
         match arg.as_str() {
             "--null" => parsed.output = OutputChoice::Null,
             "--no-audio" => parsed.output = OutputChoice::NoAudio,
-            "--enqueue" => parsed.enqueue = Enqueue::File,
+            "--enqueue" => parsed.enqueue = Enqueue::Argument,
             "--volume" => {
                 let value = it.next().ok_or(CliError::MissingValue("--volume"))?;
                 parsed.volume = Some(value.parse::<u8>().map_err(|_| CliError::BadValue {
@@ -377,7 +421,7 @@ where
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(CliError::UnknownOption(other.to_owned()));
             }
-            other => set_file(&mut parsed, other.to_owned())?,
+            other => set_media(&mut parsed, other.to_owned())?,
         }
     }
     Ok(parsed)
@@ -396,18 +440,109 @@ fn class_value(value: &str) -> Result<String, CliError> {
 /// Both switches take their path in the argument that follows them (S13 §1),
 /// so they share this one rule. A missing path is left open by S13 §5.3, so
 /// the caller records that the switch was given without a path instead of
-/// guessing.
-fn path_argument<I>(it: &mut std::iter::Peekable<I>) -> Option<PathBuf>
+/// guessing. A path that names a URL is read by [`media_argument`], so it
+/// may be an `http://` URL — and a URL this build cannot read is refused.
+fn path_argument<I>(it: &mut std::iter::Peekable<I>) -> Result<Option<MediaLocation>, CliError>
 where
     I: Iterator<Item = String>,
 {
     match it.peek() {
         Some(next) if !is_switch(next) => {
             let path = it.next().expect("peeked");
-            Some(PathBuf::from(unquote(&path)))
+            Ok(Some(media_argument(unquote(&path))?))
         }
-        _ => None,
+        _ => Ok(None),
     }
+}
+
+/// Reads a command-line argument as the media it names.
+///
+/// S13 §1 says that everything which is not a switch is a file argument. A
+/// URL is not a file: it names a stream, and the player can read one (S19).
+/// This is an **own choice** on top of S13 §1, and it is the same rule for
+/// every path the command line names — the bare argument, the path of `/ADD`
+/// and the path of `/BOOKMARK`:
+///
+/// * an argument that names an `http://` URL is a **URL** (S19 §1: the
+///   request template is plain `http://`); the host must be there, or the
+///   argument is refused;
+/// * an argument that names **another scheme** is refused **by name**: this
+///   build reads `http://` URLs only — there is no TLS, and S19 §6 question 8
+///   establishes no evidence for `https`;
+/// * everything else is a **file path**, untouched.
+///
+/// A one-letter scheme is a Windows drive letter (`C://Music`), not a scheme,
+/// so such a path stays a path.
+pub fn media_argument(argument: &str) -> Result<MediaLocation, CliError> {
+    let trimmed = argument.trim();
+    let Some((scheme, rest)) = split_scheme(trimmed) else {
+        return Ok(MediaLocation::File(PathBuf::from(argument)));
+    };
+    if !scheme.eq_ignore_ascii_case("http") {
+        return Err(CliError::UnsupportedUrl {
+            url: trimmed.to_owned(),
+            scheme: scheme.to_ascii_lowercase(),
+        });
+    }
+    if !names_a_host(rest) {
+        return Err(CliError::MalformedUrl(trimmed.to_owned()));
+    }
+    Ok(MediaLocation::Url(trimmed.to_owned()))
+}
+
+/// The path a hand-off frame can carry, or a refusal when the media is a
+/// URL.
+///
+/// The frame of the single-instance hand-over carries a path, and the
+/// running instance would try to open a URL as a file. The URL is therefore
+/// reported instead of being turned into a path that cannot be played. A
+/// media that is no media at all carries nothing and refuses nothing.
+pub fn forwarded_path(
+    location: Option<MediaLocation>,
+    refusals: &mut Vec<String>,
+) -> Option<PathBuf> {
+    match location {
+        None => None,
+        Some(MediaLocation::File(path)) => Some(path),
+        Some(MediaLocation::Url(url)) => {
+            refusals.push(format!(
+                "a URL cannot be handed to the running instance: {url}"
+            ));
+            None
+        }
+    }
+}
+
+/// The scheme and the rest of an argument that names a URL, or `None` when
+/// the argument names no scheme.
+///
+/// A scheme starts with a letter and carries at least two characters: a
+/// one-letter scheme is a Windows drive letter (`C://Music`), which is a
+/// path and not a URL.
+fn split_scheme(argument: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = argument.split_once("://")?;
+    let mut chars = scheme.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() || scheme.len() < 2 {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return None;
+    }
+    Some((scheme, rest))
+}
+
+/// Whether the part of an `http://` URL behind the scheme names a host.
+///
+/// The authority may carry a userinfo and a port; what is left of it is the
+/// host, and a URL without a host is not a usable one.
+fn names_a_host(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_userinfo, host)| host);
+    let host = host.rsplit_once(':').map_or(host, |(host, _port)| host);
+    !host.is_empty()
 }
 
 /// The path without the quotes the shell puts around it.
@@ -431,12 +566,12 @@ fn is_switch(arg: &str) -> bool {
     arg.starts_with('/') || (arg.starts_with('-') && arg.len() > 1)
 }
 
-/// Records the file argument; a second one is refused.
-fn set_file(parsed: &mut Args, value: String) -> Result<(), CliError> {
-    if parsed.file.is_some() {
+/// Records the media argument; a second one is refused.
+fn set_media(parsed: &mut Args, value: String) -> Result<(), CliError> {
+    if parsed.media.is_some() {
         return Err(CliError::TooManyFiles(value));
     }
-    parsed.file = Some(PathBuf::from(value));
+    parsed.media = Some(media_argument(&value)?);
     Ok(())
 }
 
@@ -451,7 +586,10 @@ mod tests {
     #[test]
     fn a_bare_file_is_the_input() {
         let args = parse_args(&["music.mp3"]).unwrap();
-        assert_eq!(args.file, Some(PathBuf::from("music.mp3")));
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("music.mp3")))
+        );
         assert_eq!(args.output, OutputChoice::Default);
         assert_eq!(args.volume, None);
         assert_eq!(args.skin, None);
@@ -462,14 +600,20 @@ mod tests {
     fn null_selects_the_test_output() {
         let args = parse_args(&["--null", "music.flac"]).unwrap();
         assert_eq!(args.output, OutputChoice::Null);
-        assert_eq!(args.file, Some(PathBuf::from("music.flac")));
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("music.flac")))
+        );
     }
 
     #[test]
     fn no_audio_selects_the_silent_windowed_output() {
         let args = parse_args(&["--no-audio", "music.flac"]).unwrap();
         assert_eq!(args.output, OutputChoice::NoAudio);
-        assert_eq!(args.file, Some(PathBuf::from("music.flac")));
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("music.flac")))
+        );
     }
 
     #[test]
@@ -492,7 +636,7 @@ mod tests {
     #[test]
     fn no_file_is_allowed() {
         let args = parse_args(&["--null"]).unwrap();
-        assert_eq!(args.file, None);
+        assert_eq!(args.media, None);
         assert_eq!(args.output, OutputChoice::Null);
     }
 
@@ -570,6 +714,12 @@ mod tests {
         ] {
             assert!(USAGE.contains(option), "usage does not mention {option}");
         }
+        // The URL rule is part of the usage: the user has to know that an
+        // `http://` argument is streamed and that another scheme is refused.
+        assert!(
+            USAGE.contains("http://"),
+            "usage does not mention the URL rule"
+        );
     }
 
     // ----- S12: the Winamp configuration import -----
@@ -580,7 +730,7 @@ mod tests {
     fn the_import_switch_without_a_path_asks_for_the_file() {
         let args = parse_args(&["--import-winamp-ini"]).unwrap();
         assert_eq!(args.import_winamp_ini, WinampIniImport::Ask);
-        assert_eq!(args.file, None);
+        assert_eq!(args.media, None);
     }
 
     /// The path behind the switch is the file to import.
@@ -591,7 +741,7 @@ mod tests {
             args.import_winamp_ini,
             WinampIniImport::File(PathBuf::from("C:/old/winamp.ini"))
         );
-        assert_eq!(args.file, None);
+        assert_eq!(args.media, None);
     }
 
     /// Another option behind the switch is not a path: the switch asks for
@@ -679,7 +829,9 @@ mod tests {
         let args = parse_args(&["/BOOKMARK", "C:/music/a.mp3"]).unwrap();
         assert_eq!(
             args.bookmark,
-            Some(Bookmark::Path(PathBuf::from("C:/music/a.mp3")))
+            Some(Bookmark::Location(MediaLocation::File(PathBuf::from(
+                "C:/music/a.mp3"
+            ))))
         );
     }
 
@@ -690,7 +842,9 @@ mod tests {
         let args = parse_args(&["/BOOKMARK C:/music/a.mp3"]).unwrap();
         assert_eq!(
             args.bookmark,
-            Some(Bookmark::Path(PathBuf::from("C:/music/a.mp3")))
+            Some(Bookmark::Location(MediaLocation::File(PathBuf::from(
+                "C:/music/a.mp3"
+            ))))
         );
     }
 
@@ -738,7 +892,10 @@ mod tests {
         // S13 §1: a token the reference's switch list does not name is not
         // a switch, it is a file argument.
         let args = parse_args(&["/UNKNOWN"]).unwrap();
-        assert_eq!(args.file, Some(PathBuf::from("/UNKNOWN")));
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("/UNKNOWN")))
+        );
         assert_eq!(args.class, None);
         assert_eq!(args.registration, RegistrationFlags::default());
     }
@@ -750,8 +907,8 @@ mod tests {
         for token in ["/PLAY", "/NEW", "/EJECT", "/TASKBAR"] {
             let args = parse_args(&[token]).unwrap();
             assert_eq!(
-                args.file,
-                Some(PathBuf::from(token)),
+                args.media,
+                Some(MediaLocation::File(PathBuf::from(token))),
                 "{token} must not be a switch"
             );
         }
@@ -761,15 +918,21 @@ mod tests {
     fn switches_and_paths_are_mixed() {
         let args = parse_args(&["/CLASS=Foo", "song.mp3", "/NOREG"]).unwrap();
         assert_eq!(args.class.as_deref(), Some("Foo"));
-        assert_eq!(args.file, Some(PathBuf::from("song.mp3")));
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("song.mp3")))
+        );
         assert!(args.registration.noreg);
     }
 
     #[test]
     fn enqueue_adds_the_file_instead_of_playing_it() {
         let args = parse_args(&["--enqueue", "song.mp3"]).unwrap();
-        assert_eq!(args.enqueue, Enqueue::File);
-        assert_eq!(args.file, Some(PathBuf::from("song.mp3")));
+        assert_eq!(args.enqueue, Enqueue::Argument);
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("song.mp3")))
+        );
     }
 
     // ----- S13 §1: the `/ADD` switch (second audit pass, 2026-10-20) -----
@@ -779,7 +942,10 @@ mod tests {
         // S13 §1: `/ADD <path>` takes its path in the argument that follows
         // the switch — the same shape as `/BOOKMARK`.
         let args = parse_args(&["/ADD", "C:/music/a.mp3"]).unwrap();
-        assert_eq!(args.enqueue, Enqueue::Path(PathBuf::from("C:/music/a.mp3")));
+        assert_eq!(
+            args.enqueue,
+            Enqueue::Location(MediaLocation::File(PathBuf::from("C:/music/a.mp3")))
+        );
     }
 
     #[test]
@@ -787,7 +953,7 @@ mod tests {
         // The path of `/ADD` is enqueued; it is not the file the player
         // loads and plays.
         let args = parse_args(&["/ADD", "C:/music/a.mp3"]).unwrap();
-        assert_eq!(args.file, None);
+        assert_eq!(args.media, None);
     }
 
     #[test]
@@ -795,7 +961,10 @@ mod tests {
         // S13 §1: the shell registers the verb with `"%s" /ADD "%%1"`, so
         // the switch and its path can arrive in one argument.
         let args = parse_args(&["/ADD C:/music/a.mp3"]).unwrap();
-        assert_eq!(args.enqueue, Enqueue::Path(PathBuf::from("C:/music/a.mp3")));
+        assert_eq!(
+            args.enqueue,
+            Enqueue::Location(MediaLocation::File(PathBuf::from("C:/music/a.mp3")))
+        );
     }
 
     #[test]
@@ -803,7 +972,10 @@ mod tests {
         // The registered command line quotes the path, so a path that
         // arrives inside a quoted argument keeps its quotes.
         let args = parse_args(&["/ADD \"C:/music/a.mp3\""]).unwrap();
-        assert_eq!(args.enqueue, Enqueue::Path(PathBuf::from("C:/music/a.mp3")));
+        assert_eq!(
+            args.enqueue,
+            Enqueue::Location(MediaLocation::File(PathBuf::from("C:/music/a.mp3")))
+        );
     }
 
     #[test]
@@ -811,7 +983,7 @@ mod tests {
         // S13 §5.3 leaves the form open; the parser does not guess.
         let args = parse_args(&["/ADD"]).unwrap();
         assert_eq!(args.enqueue, Enqueue::WithoutPath);
-        assert_eq!(args.file, None);
+        assert_eq!(args.media, None);
     }
 
     #[test]
@@ -833,7 +1005,174 @@ mod tests {
         // S13 §1: a command line may carry several paths, and the switches
         // and the paths are mixed.
         let args = parse_args(&["/ADD", "C:/music/a.mp3", "song.mp3"]).unwrap();
-        assert_eq!(args.enqueue, Enqueue::Path(PathBuf::from("C:/music/a.mp3")));
-        assert_eq!(args.file, Some(PathBuf::from("song.mp3")));
+        assert_eq!(
+            args.enqueue,
+            Enqueue::Location(MediaLocation::File(PathBuf::from("C:/music/a.mp3")))
+        );
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("song.mp3")))
+        );
+    }
+
+    // ----- S19: the URL on the command line -----
+
+    #[test]
+    fn an_http_url_argument_is_a_url() {
+        // S19 §1: the request template is plain `http://`, so an `http://`
+        // URL names a stream the player can read.
+        let args = parse_args(&["http://example.test/stream.mp3"]).unwrap();
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::Url(
+                "http://example.test/stream.mp3".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_scheme_of_a_url_is_not_case_sensitive() {
+        // A URL's scheme is case-insensitive (RFC 3986), and the reader of
+        // the stream compares it the same way.
+        let args = parse_args(&["HTTP://example.test/stream.mp3"]).unwrap();
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::Url(
+                "HTTP://example.test/stream.mp3".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn an_https_url_is_refused_by_name() {
+        // S19 §6 question 8: the request template is plain `http://`, so
+        // there is no evidence for `https`, and this build has no TLS. The
+        // refusal names the scheme; the URL is not taken for a file name.
+        let error = parse_args(&["https://example.test/stream.mp3"]).unwrap_err();
+        assert_eq!(
+            error,
+            CliError::UnsupportedUrl {
+                url: "https://example.test/stream.mp3".to_owned(),
+                scheme: "https".to_owned(),
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("https"), "{message}");
+        assert!(message.contains("http://"), "{message}");
+    }
+
+    #[test]
+    fn another_scheme_is_refused_by_name() {
+        // S19 §6 question 8 asks about the other schemes too, and the
+        // answer is the same: only `http://` is read.
+        let error = parse_args(&["ftp://example.test/stream.mp3"]).unwrap_err();
+        assert_eq!(
+            error,
+            CliError::UnsupportedUrl {
+                url: "ftp://example.test/stream.mp3".to_owned(),
+                scheme: "ftp".to_owned(),
+            }
+        );
+        assert!(error.to_string().contains("ftp"));
+    }
+
+    #[test]
+    fn an_http_url_without_a_host_is_refused() {
+        assert_eq!(
+            parse_args(&["http://"]),
+            Err(CliError::MalformedUrl("http://".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_path_stays_a_path() {
+        let args = parse_args(&["song.mp3"]).unwrap();
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("song.mp3")))
+        );
+        let args = parse_args(&[r"C:\Music\song.mp3"]).unwrap();
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from(r"C:\Music\song.mp3")))
+        );
+    }
+
+    #[test]
+    fn a_drive_letter_is_not_a_scheme() {
+        // `C://Music` is a Windows path, not a URL with the scheme "c".
+        let args = parse_args(&["C://Music/song.mp3"]).unwrap();
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("C://Music/song.mp3")))
+        );
+    }
+
+    #[test]
+    fn the_add_switch_reads_a_url_the_same_way() {
+        // The rule is one rule: every path the command line names is read by
+        // `media_argument`, so `/ADD` can enqueue a stream as well.
+        let args = parse_args(&["/ADD", "http://example.test/stream.mp3"]).unwrap();
+        assert_eq!(
+            args.enqueue,
+            Enqueue::Location(MediaLocation::Url(
+                "http://example.test/stream.mp3".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_add_switch_refuses_a_scheme_it_cannot_read() {
+        let error = parse_args(&["/ADD", "https://example.test/stream.mp3"]).unwrap_err();
+        assert_eq!(
+            error,
+            CliError::UnsupportedUrl {
+                url: "https://example.test/stream.mp3".to_owned(),
+                scheme: "https".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_bookmark_switch_reads_a_url_the_same_way() {
+        let args = parse_args(&["/BOOKMARK", "http://example.test/stream.mp3"]).unwrap();
+        assert_eq!(
+            args.bookmark,
+            Some(Bookmark::Location(MediaLocation::Url(
+                "http://example.test/stream.mp3".to_owned()
+            )))
+        );
+    }
+
+    // ----- the hand-over to a running instance -----
+
+    #[test]
+    fn a_file_is_handed_over_as_its_path() {
+        let mut refusals = Vec::new();
+        let path = forwarded_path(
+            Some(MediaLocation::File(PathBuf::from("song.mp3"))),
+            &mut refusals,
+        );
+        assert_eq!(path, Some(PathBuf::from("song.mp3")));
+        assert!(refusals.is_empty(), "{refusals:?}");
+    }
+
+    #[test]
+    fn a_url_is_refused_instead_of_becoming_a_path() {
+        // The hand-off frame carries a path, and the running instance would
+        // try to open a URL as a file. The URL is reported instead.
+        let mut refusals = Vec::new();
+        let path = forwarded_path(
+            Some(MediaLocation::Url(
+                "http://example.test/stream.mp3".to_owned(),
+            )),
+            &mut refusals,
+        );
+        assert_eq!(path, None);
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert!(
+            refusals[0].contains("http://example.test/stream.mp3"),
+            "{refusals:?}"
+        );
     }
 }

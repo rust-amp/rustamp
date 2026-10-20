@@ -884,7 +884,7 @@ mod tests {
             skin: crate::skin::builtin(),
             output: OutputChoice::Null,
             volume: 200,
-            file: None,
+            media: None,
             seconds: None,
         };
         App::new(options).expect("the test app builds headless")

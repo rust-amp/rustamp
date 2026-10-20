@@ -32,6 +32,7 @@ use rustamp_core::config::Config;
 use rustamp_core::error::Result;
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::playlist::EntryId;
+use rustamp_core::playlist::MediaLocation;
 use rustamp_core::state::{TransportState, WindowId};
 use rustamp_ui::{DialogKind, Key, MainWindowLayout, Modifiers, Widget};
 
@@ -106,7 +107,7 @@ fn app(file: Option<PathBuf>) -> App {
         skin: rustamp_app::skin::builtin(),
         output: OutputChoice::Null,
         volume: 200,
-        file,
+        media: file.map(MediaLocation::File),
         seconds: None,
     };
     App::with_registry(options, registry).expect("the headless app builds")

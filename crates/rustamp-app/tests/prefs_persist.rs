@@ -18,7 +18,7 @@ fn app_with(config: Config, path: Option<PathBuf>) -> App {
         skin: skin::load(&SkinChoice::Builtin),
         output: OutputChoice::Null,
         volume,
-        file: None,
+        media: None,
         seconds: Some(1),
     };
     let mut app = App::new(options).expect("build headless app");
