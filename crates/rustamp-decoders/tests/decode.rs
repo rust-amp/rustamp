@@ -593,12 +593,15 @@ fn registry_lists_extensions() {
 
 #[test]
 fn url_is_rejected_with_clear_error() {
+    // The symphonia factory reads files and readers. An `http://` stream is
+    // opened with `rustamp_decoders::HttpDecoder` (see `tests/http_stream.rs`),
+    // so the refusal names the way that works.
     let err = SymphoniaDecoderFactory::new()
         .open(MediaSource::Url("http://example.com/a.mp3".into()))
         .err()
         .expect("must fail");
     match err {
-        Error::Unsupported(m) => assert!(m.contains("M4"), "{m}"),
+        Error::Unsupported(m) => assert!(m.contains("HttpDecoder"), "{m}"),
         e => panic!("unexpected {e:?}"),
     }
 }

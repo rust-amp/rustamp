@@ -14,6 +14,8 @@
 //!   extensions (`wav`, `wave`) and the same content signature (`RIFF`/`WAVE`)
 //!   at the same confidence - so RFC 0013's selection rule has two real
 //!   claimants in [`default_registry`] instead of a test double.
+//! * [`http_dec`]: a decoder over an `http://` stream (S19). The request it
+//!   sends and the failures it names are in [`http_source`].
 //! * Later FFI decoders (libopenmpt, game-music-emu, ...) are added in
 //!   [`default_registry`].
 //!
@@ -23,6 +25,8 @@ use std::sync::Arc;
 
 use rustamp_core::audio::DecoderRegistry;
 
+pub mod http_dec;
+pub mod http_source;
 pub mod opus_dec;
 pub mod symphonia_dec;
 pub mod wave_dec;
@@ -36,6 +40,8 @@ mod ogg_header;
 #[cfg(test)]
 mod probe_fuzz;
 
+pub use http_dec::HttpDecoder;
+pub use http_source::HttpError;
 pub use symphonia_dec::{SymphoniaDecoder, SymphoniaDecoderFactory};
 pub use wave_dec::{WaveDecoder, WaveDecoderFactory};
 

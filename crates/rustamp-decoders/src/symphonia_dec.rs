@@ -482,6 +482,29 @@ fn declared_payload(
     })
 }
 
+impl HeaderProbe {
+    /// The probe of a source whose head is not known.
+    ///
+    /// A network source has no head before the stream starts: the head is
+    /// what the stream delivers first, and a stream cannot be rewound to
+    /// look at it again. The analyses that need one therefore do not run -
+    /// the Xing/Info tag of MPEG audio, the metadata chain of FLAC, the
+    /// payload claims of AIFF and MP4 - and the probe decides nothing. The
+    /// length the server declares is the oracle of such a source instead
+    /// (see [`crate::http_dec`]).
+    pub(crate) fn unknown() -> Self {
+        HeaderProbe {
+            id3v2: 0,
+            window: Vec::new(),
+            aiff: None,
+            mp4: None,
+            flac: None,
+            ogg: None,
+            matroska: false,
+        }
+    }
+}
+
 /// How many bytes of the file the header parse reads.
 ///
 /// The Xing/Info tag sits behind the side information of the first MPEG
@@ -823,7 +846,7 @@ impl SymphoniaDecoder {
         let (mss, byte_len, header) = match source {
             MediaSource::Url(_) => {
                 return Err(Error::Unsupported(
-                    "URL sources are not supported yet; network streaming comes in M4",
+                    "a URL is not opened by this factory: an http:// stream is opened with rustamp_decoders::HttpDecoder",
                 ));
             }
             MediaSource::Path(p) => {
@@ -848,6 +871,24 @@ impl SymphoniaDecoder {
             }
         };
 
+        Self::open_stream(mss, byte_len, header, ext)
+    }
+
+    /// Open a decoder over a byte stream that is already prepared.
+    ///
+    /// The file path builds the stream, the length of the source and the
+    /// header probe and hands them over. The HTTP source builds them itself:
+    /// its stream cannot be seeked and its head is not known before the
+    /// stream starts (see [`HeaderProbe::unknown`]).
+    ///
+    /// `byte_len` is the length of the source when it is known, and `header`
+    /// is what the head of the source says.
+    pub(crate) fn open_stream(
+        mss: MediaSourceStream,
+        byte_len: Option<u64>,
+        header: HeaderProbe,
+        ext: Option<String>,
+    ) -> Result<Self> {
         // An empty source can never hold a container. Naming that directly is
         // more useful to a caller than the probe's "no suitable format reader
         // found", and it is the one case where "the file itself is the problem"
