@@ -257,6 +257,56 @@ pictures that are *inside* the file and nothing else.
   limitation is loud, not silent. The `extra` map is not a field list: a key
   of `extra` is not removed by a `TagField`.
 
+## What each format can carry
+
+The property suite (`tests/tag_properties.rs`) writes generated metadata into
+every format the writer supports, reads it back and compares the result with
+what the format can hold. The table is the outcome; the notes below are the
+differences a caller has to know about.
+
+| File | Tag written | Numbers | Empty value |
+|---|---|---|---|
+| MP3, AAC, WAV, AIFF | ID3v2 | any `u32` | an empty item |
+| FLAC, Ogg Vorbis, Opus | Vorbis comments | any `u32` | not stored |
+| MP4 (AAC, ALAC) | `ilst` | 1..=65535 | an empty item |
+
+Every format carries the title, the artist, the album, the album artist, the
+year, the genre and the comment. The `extra` map is narrower:
+
+| Key | ID3v2 | Vorbis comments | `ilst` |
+|---|---|---|---|
+| `REPLAYGAIN_TRACK_GAIN` | yes | yes | yes |
+| `R128_TRACK_GAIN` | yes | yes | no |
+| `DISCTOTAL` | no | yes | no |
+
+- **The reader trims.** A value of `"  Song  "` is read back as `"Song"`, and
+  a value of blanks is read back as "no value". The trim belongs to the
+  reader, not to the writer: the bytes of the file keep the blanks.
+- **The MP4 numbers are 16-bit.** The `trkn` and `disk` atoms hold a pair of
+  `u16`, and a zero is "no number at all". A number above 65535 and a zero
+  are therefore lost — and because the writer *replaces* the number of the
+  file, the old number is lost with them, not kept.
+- **ID3v2 keeps the track number and the total in one frame.** A total
+  without a number is written as the pair `0/total`, so the file gains a
+  track number of zero. The Vorbis family keeps the two in comments of their
+  own and MP4 in one atom, so the same write leaves the number alone.
+- **The Vorbis family does not store an empty value.** The key is gone.
+  ID3v2 and MP4 store an empty item instead. The reader cannot tell the two
+  apart, because it drops an empty value either way.
+- **An `extra` key can overwrite a field of the metadata.** On the Vorbis
+  family `extra["ALBUM"]` is the `ALBUM` comment, so it replaces the album
+  the metadata named. ID3v2 and MP4 have no such key, so the entry is
+  refused and reported instead.
+- **The byte layout of an ID3v2 tag is not stable.** `lofty` keeps the text
+  frames of a tag in a hash map, so two writes of the same metadata produce
+  the same frames in a different order. The content of the tag is stable,
+  the bytes are not. FLAC, Ogg, Opus and MP4 are byte-stable.
+- **The audio is never rewritten.** The property suite compares the audio of
+  every file before and after every write: the frames behind the MP3 and AAC
+  tags, the frames behind the FLAC metadata blocks, the audio packets of an
+  Ogg stream (its page headers change), the `mdat` payload of an MP4 file,
+  the `data` chunk of a WAV file and the `SSND` chunk of an AIFF file.
+
 ## Album grouping (album values)
 
 An album value is a property of a *group* of files, not of one file. The
