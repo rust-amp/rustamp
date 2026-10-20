@@ -21,7 +21,7 @@ Specs reach this directory only after the Spec Auditor has signed off. Each file
 | S11 | Embed-window API and `gen.bmp` layout | not started |
 | S12 | winamp.ini keys and plugin.ini conventions | audited |
 | S13 | Command-line switches, single instance, drag-and-drop rules | audited |
-| S14 | Title formatting | not started |
+| S14 | Title formatting | audited |
 | S15 | Shuffle algorithm | not started |
 | S16 | Preferences pages and options | not started |
 | S17 | Skin-loading quirks (missing files, palette and BMP quirks, nums_ex fallback, pledit.txt, region.txt) | audited |
