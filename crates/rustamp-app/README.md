@@ -282,7 +282,8 @@ closed windows retain their geometry and follow their old connections. No core
 schema change or separate docking flag is needed. The snap policy (including
 programmatic moves), reconstruction and closed-window policy are Rustamp choices:
 S05 §§3.4, 4.1 and 7 leave those behaviours open, not measured reference facts.
-Screen/work-area snapping, monitor recovery and non-classic windows are not wired.
+Screen/work-area snapping and non-classic windows are not wired; monitor recovery
+is the restore clamp below.
 
 Geometry/configuration unit tests are headless. The ignored
 `window::tests::docking_presenter_moves_snaps_detaches_reflows_and_restores`
@@ -296,6 +297,27 @@ pwsh -File docs/notes/vm-run-tests.ps1 -Filter '--ignored:docking_presenter'
 ```
 
 Never run the ignored test on the host; `require_test_vm()` refuses it there.
+
+## Restoring onto the screens that exist
+
+The saved positions are the user's own and are restored verbatim; they are then
+clamped onto the screens that exist **now** (`rustamp_ui::placement`). The
+reachable strip of a classic window is its title bar - the only part of a
+borderless window the user can drag - and a window whose strip lies on no
+work area is pulled back until it does. A monitor can vanish between two runs
+(it was unplugged, the resolution changed, the file was edited by hand), and a
+window that points at it would come back where the user cannot reach it. A
+window whose saved position is still reachable does not move at all, so the
+player does not jitter on every start. The docked group keeps its shape: a
+window that hangs on the main window follows it.
+
+The **save** is not clamped: `ui.windows` records the position the user
+actually had, and the screen set can change before the next start. The clamp
+belongs where the saved position meets the current screens, and that is the
+restore.
+
+Without a display set (the enumeration failed) nothing is clamped: there is no
+screen to place a window on.
 
 ## The skin's window shape (`region.txt`)
 

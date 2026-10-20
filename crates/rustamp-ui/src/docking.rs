@@ -210,7 +210,10 @@ impl ClassicWindow {
 
 // Exact coincident outside edges with positive overlap form a connection.
 // This is Rustamp's reconstructible docking policy; S05 leaves undocking open.
-fn touches(a: ClassicWindow, b: ClassicWindow) -> bool {
+//
+// The connection is crate-internal: the placement rule asks it whether a
+// window belongs to the group of the window it is anchored to.
+pub(crate) fn touches(a: ClassicWindow, b: ClassicWindow) -> bool {
     let (ax, ay, bx, by) = (
         i64::from(a.x),
         i64::from(a.y),
