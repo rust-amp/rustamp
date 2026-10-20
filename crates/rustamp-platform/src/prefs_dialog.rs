@@ -46,8 +46,25 @@
 //! the media library's own database, and the player reads them from there.
 //! The dialog only shows them and says what the user did; the player turns
 //! the action into a change of the index.
+//!
+//! # The row of a root
+//!
+//! A row is the root's path and the time of its last **finished** scan
+//! ([`LibraryRootRow`]): `C:\Music — last scanned 2026-10-20 03:11 UTC`, or
+//! `C:\Music — never scanned` for a root that was not scanned yet.
+//!
+//! The time is **UTC** and it names the **minute**, not the second: the row
+//! says when the root was looked at, and a minute is what that means for the
+//! user. UTC is the choice because it does not depend on the time zone of
+//! the machine that shows the row.
+//!
+//! The row is one line, and the list scrolls sideways, so a long path stays
+//! readable: the list box carries a horizontal scroll bar, and its scroll
+//! range reaches the end of the longest row.
 
 use rustamp_core::config::{OutputMode, ReplayGainMode};
+
+use crate::utc::utc_calendar;
 
 /// One node of the page tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -517,6 +534,40 @@ pub struct PluginRow {
     pub text: String,
 }
 
+/// One row of the media library's root list.
+///
+/// The row is a root of the media library's index and the time of its last
+/// finished scan. The time is a unix second; `None` means the root was
+/// never scanned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryRootRow {
+    /// The root's path, as it was added.
+    pub path: String,
+    /// Unix seconds of the root's last **finished** scan.
+    ///
+    /// `None` when the root was never scanned. A scan that was cancelled or
+    /// that failed does not count: it did not finish, so it must not claim
+    /// that the root was scanned.
+    pub last_scanned_at: Option<i64>,
+}
+
+/// The text of a media library root's row.
+///
+/// The path, and the time of the root's last finished scan as
+/// `YYYY-MM-DD HH:MM UTC`. A root that was never scanned says so.
+pub fn library_root_text(path: &str, last_scanned_at: Option<i64>) -> String {
+    match last_scanned_at {
+        Some(at) => {
+            let when = utc_calendar(at);
+            format!(
+                "{path} — last scanned {:04}-{:02}-{:02} {:02}:{:02} UTC",
+                when.year, when.month, when.day, when.hour, when.minute
+            )
+        }
+        None => format!("{path} — never scanned"),
+    }
+}
+
 /// The settings the dialog shows, pushed in by the player.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrefsSettings {
@@ -545,7 +596,7 @@ pub struct PrefsSettings {
     /// The roots are not a setting of the configuration file: they live in
     /// the media library's own database, and the player reads them from
     /// there.
-    pub library_roots: Vec<String>,
+    pub library_roots: Vec<LibraryRootRow>,
 }
 
 impl PrefsSettings {
@@ -578,7 +629,7 @@ impl PrefsSettings {
     /// `None` for a row that does not exist: the row is the one the user
     /// picked, and a stale one must not remove another root.
     pub fn library_root(&self, row: usize) -> Option<&str> {
-        self.library_roots.get(row).map(String::as_str)
+        self.library_roots.get(row).map(|root| root.path.as_str())
     }
 }
 
@@ -628,9 +679,10 @@ mod win32 {
     use std::cell::RefCell;
     use std::ffi::c_void;
 
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        COLOR_BTNFACE, CreateFontIndirectW, DeleteObject, GetSysColorBrush, HFONT,
+        COLOR_BTNFACE, CreateFontIndirectW, DeleteObject, GetDC, GetSysColorBrush,
+        GetTextExtentPoint32W, HFONT, ReleaseDC,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Controls::{
@@ -655,7 +707,7 @@ mod win32 {
 
     use super::{
         Bind, ComboBind, Item, PrefsAction, PrefsError, PrefsNode, PrefsSettings, Rect, TREE,
-        page_items,
+        library_root_text, page_items,
     };
 
     const CLASS_NAME: &str = "RustampPreferences";
@@ -673,7 +725,10 @@ mod win32 {
     /// Scrollable width (unscaled pixels) of a plug-in row.
     const PLUGIN_ROW_EXTENT: i32 = 900;
     /// Scrollable width (unscaled pixels) of a library root.
-    const ROOT_ROW_EXTENT: i32 = 900;
+    ///
+    /// The floor of the list's scroll range: a row is the path and the time
+    /// of the last scan, and the range grows with the widest row.
+    const ROOT_ROW_EXTENT: i32 = 1080;
 
     /// Layout of the frame in unscaled pixels (client area).
     const CLIENT: (i32, i32) = (440, 300);
@@ -1394,7 +1449,8 @@ mod win32 {
                     ) {
                         // A row is a path, and a path can be longer than the
                         // list: let the list scroll sideways instead of
-                        // cutting the row off.
+                        // cutting the row off. The range grows with the
+                        // widest row once the rows are in.
                         // SAFETY: sizing the scroll range of our own list box.
                         unsafe {
                             SendMessageW(
@@ -1450,6 +1506,10 @@ mod win32 {
                 inner.skin_list = skin_list;
                 inner.plugin_list = plugin_list;
                 inner.library_list = library_list;
+                // The list of the roots is a new control: the texts of the
+                // old one say nothing about it, so the new list is filled
+                // again.
+                inner.library_texts.clear();
             }
         });
         if let Some(list) = plugin_list {
@@ -1513,7 +1573,11 @@ mod win32 {
     /// selected row. Does nothing when the list already shows exactly them, so
     /// the per-tick settings push does not flicker the list.
     fn refresh_root_list(list: HWND, settings: &PrefsSettings) {
-        let texts = settings.library_roots.clone();
+        let texts: Vec<String> = settings
+            .library_roots
+            .iter()
+            .map(|root| library_root_text(&root.path, root.last_scanned_at))
+            .collect();
         let unchanged = STATE.with(|state| {
             state
                 .try_borrow()
@@ -1545,6 +1609,10 @@ mod win32 {
                 );
             }
         }
+        // The rows are one line each, and the list scrolls sideways: the
+        // scroll range must reach the end of the longest row, or a long path
+        // is cut off.
+        set_row_extent(list, &texts);
         STATE.with(|state| {
             if let Ok(mut guard) = state.try_borrow_mut()
                 && let Some(inner) = guard.as_mut()
@@ -1552,6 +1620,59 @@ mod win32 {
                 inner.library_texts = texts;
             }
         });
+    }
+
+    /// Makes the list scroll sideways as far as its widest row.
+    ///
+    /// The range is never smaller than [`ROOT_ROW_EXTENT`], so the list looks
+    /// the same as it did, and it is never smaller than the widest row, so
+    /// the row stays readable.
+    fn set_row_extent(list: HWND, texts: &[String]) {
+        let dpi = STATE.with(|state| {
+            state
+                .try_borrow()
+                .ok()
+                .and_then(|g| g.as_ref().map(|i| i.dpi))
+                .unwrap_or(96)
+        });
+        let measured = widest_row(list, texts).unwrap_or(0);
+        let extent = scale(ROOT_ROW_EXTENT, dpi).max(measured + 8);
+        // SAFETY: sizing the scroll range of our own list box.
+        unsafe {
+            SendMessageW(
+                list,
+                LB_SETHORIZONTALEXTENT,
+                Some(WPARAM(extent as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+    }
+
+    /// The width, in pixels, of the widest row, measured with the list's own
+    /// font.
+    ///
+    /// `None` when the width could not be measured: the caller then keeps the
+    /// constant extent.
+    fn widest_row(list: HWND, texts: &[String]) -> Option<i32> {
+        // SAFETY: the list is our own window, so its device context is ours
+        // to take and to release again. The font of the list is the one the
+        // rows are drawn with.
+        unsafe {
+            let dc = GetDC(Some(list));
+            if dc.is_invalid() {
+                return None;
+            }
+            let mut widest = 0;
+            for text in texts {
+                let wide_text = wide(text);
+                let mut size = SIZE::default();
+                if GetTextExtentPoint32W(dc, &wide_text, &mut size).as_bool() {
+                    widest = widest.max(size.cx);
+                }
+            }
+            let _ = ReleaseDC(Some(list), dc);
+            Some(widest)
+        }
     }
 
     /// Records a user action from the window procedure (queue only: no
@@ -2105,16 +2226,70 @@ mod tests {
     #[test]
     fn the_library_page_lists_the_roots_the_player_pushed_in() {
         let settings = PrefsSettings {
-            library_roots: vec![r"C:\Music".to_string(), r"D:\Tunes".to_string()],
+            library_roots: vec![
+                LibraryRootRow {
+                    path: r"C:\Music".to_string(),
+                    last_scanned_at: None,
+                },
+                LibraryRootRow {
+                    path: r"D:\Tunes".to_string(),
+                    last_scanned_at: None,
+                },
+            ],
             ..PrefsSettings::default()
         };
-        assert_eq!(settings.library_roots, [r"C:\Music", r"D:\Tunes"]);
+        assert_eq!(settings.library_roots.len(), 2);
+        assert_eq!(settings.library_root(0), Some(r"C:\Music"));
+        assert_eq!(settings.library_root(1), Some(r"D:\Tunes"));
+    }
+
+    #[test]
+    fn a_root_that_was_never_scanned_says_so() {
+        assert_eq!(
+            library_root_text(r"C:\Music", None),
+            r"C:\Music — never scanned"
+        );
+    }
+
+    #[test]
+    fn a_root_names_the_utc_minute_of_its_last_scan() {
+        // 2023-11-14 22:13:20 UTC.
+        assert_eq!(
+            library_root_text(r"C:\Music", Some(1_700_000_000)),
+            r"C:\Music — last scanned 2023-11-14 22:13 UTC"
+        );
+        // The epoch itself.
+        assert_eq!(
+            library_root_text(r"C:\Music", Some(0)),
+            r"C:\Music — last scanned 1970-01-01 00:00 UTC"
+        );
+    }
+
+    #[test]
+    fn the_row_text_carries_the_path_and_the_time() {
+        let row = LibraryRootRow {
+            path: r"D:\Tunes".to_string(),
+            last_scanned_at: Some(1_700_000_000),
+        };
+        let text = library_root_text(&row.path, row.last_scanned_at);
+        assert!(text.starts_with(r"D:\Tunes"), "{text}");
+        assert!(text.contains("last scanned"), "{text}");
+        assert!(text.contains("2023-11-14 22:13 UTC"), "{text}");
     }
 
     #[test]
     fn the_library_actions_say_what_the_user_wanted() {
         let settings = PrefsSettings {
-            library_roots: vec![r"C:\Music".to_string(), r"D:\Tunes".to_string()],
+            library_roots: vec![
+                LibraryRootRow {
+                    path: r"C:\Music".to_string(),
+                    last_scanned_at: None,
+                },
+                LibraryRootRow {
+                    path: r"D:\Tunes".to_string(),
+                    last_scanned_at: None,
+                },
+            ],
             ..PrefsSettings::default()
         };
         // The row the user picked names the root; a row that does not exist
