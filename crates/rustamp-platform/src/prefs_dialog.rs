@@ -46,6 +46,11 @@
 //! "switch on / off" button always names the plug-in of the row that is on
 //! screen.
 //!
+//! The selection is the user's row, and it is part of the state as well: the
+//! "switch on / off" button acts on the row that is on screen. A plug-in
+//! that is not among the rows any more is gone: the first row takes its
+//! place, or nothing when the list is empty.
+//!
 //! # The skin list
 //!
 //! The Skins page lists the skins the player can load. The rows come from
@@ -62,6 +67,13 @@
 //! more is gone: the first row takes its place, or nothing when the list is
 //! empty.
 //!
+//! # The three lists
+//!
+//! The plug-in list, the skin list and the media library's root list are one
+//! state (`PageLists`): a page switch builds new controls, so the lists
+//! start empty - the rows of the page the user came from say nothing about
+//! the new one - and the player pushes into the lists the page has.
+//!
 //! # The library page
 //!
 //! One page is not the reference's: `Library`. The media library is this
@@ -75,6 +87,12 @@
 //! the media library's own database, and the player reads them from there.
 //! The dialog only shows them and says what the user did; the player turns
 //! the action into a change of the index.
+//!
+//! The list of the roots is a state like the other two: it compares the rows
+//! it shows with the rows the player pushes, so a push that changes nothing
+//! does not flicker it, and the selection is the user's row. A root that is
+//! not among the rows any more is gone: the first row takes its place, or
+//! nothing when the list is empty.
 //!
 //! # The row of a root
 //!
@@ -668,7 +686,7 @@ impl PrefsSettings {
     }
 }
 
-/// What the plug-in list of a page shows.
+/// What the plug-in list of a page shows, and which row is selected.
 ///
 /// The rows of the plug-in list belong to the page they are shown on: the
 /// input page's rows say nothing about the output page's rows. The page is
@@ -678,7 +696,11 @@ impl PrefsSettings {
 ///
 /// The state also carries the player's id behind each row, so that the id
 /// always belongs to the row that is on screen.
-#[derive(Debug, Clone, Default)]
+///
+/// The selection is the user's row. A plug-in that is not among the rows any
+/// more is gone: the first row takes its place, or nothing when the list is
+/// empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PluginListState {
     /// The page the rows belong to; `None` when no page was shown yet.
     node: Option<PrefsNode>,
@@ -686,6 +708,18 @@ pub(crate) struct PluginListState {
     ids: Vec<Option<usize>>,
     /// The text of each row.
     texts: Vec<String>,
+    /// The row the user picked.
+    selected: Option<usize>,
+}
+
+/// What the plug-in list does with a push from the player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PluginListUpdate {
+    /// The rows changed: the list must be refilled before the selection is
+    /// set.
+    pub(crate) refill: bool,
+    /// The row to select; `None` when no row is selected.
+    pub(crate) selected: Option<usize>,
 }
 
 impl PluginListState {
@@ -699,6 +733,18 @@ impl PluginListState {
             node: Some(node),
             ids,
             texts,
+            selected: None,
+        }
+    }
+
+    /// The list of the page `node` that was just built: it shows nothing yet.
+    ///
+    /// A page switch builds new controls, so the list starts empty: the rows
+    /// of the page the user came from say nothing about the new one.
+    pub(crate) fn shown(node: PrefsNode) -> Self {
+        Self {
+            node: Some(node),
+            ..Self::default()
         }
     }
 
@@ -718,6 +764,40 @@ impl PluginListState {
     /// their texts are the same: the list is rebuilt for every page.
     pub(crate) fn shows(&self, state: &PluginListState) -> bool {
         self.node == state.node && self.ids == state.ids && self.texts == state.texts
+    }
+
+    /// The user picked the row `row` of the list.
+    ///
+    /// A row that does not exist is not a pick: the selection stays what it
+    /// was.
+    pub(crate) fn pick(&mut self, row: usize) {
+        if row < self.texts.len() {
+            self.selected = Some(row);
+        }
+    }
+
+    /// What the list does with the player's push.
+    ///
+    /// The rows are refilled only when they differ from the rows the list
+    /// shows. The selection is the row the user picked, as long as that row
+    /// is still there: a plug-in that is gone leaves the first row in its
+    /// place, or nothing when the list is empty.
+    pub(crate) fn apply(&mut self, settings: &PrefsSettings, node: PrefsNode) -> PluginListUpdate {
+        let wanted = PluginListState::of(settings, node);
+        let refill = !self.shows(&wanted);
+        let selected = match self.selected {
+            Some(row) if row < wanted.texts.len() => Some(row),
+            // The row is gone: the first row takes its place, or nothing when
+            // the list is empty.
+            Some(_) if wanted.texts.is_empty() => None,
+            Some(_) => Some(0),
+            None => None,
+        };
+        self.node = wanted.node;
+        self.ids = wanted.ids;
+        self.texts = wanted.texts;
+        self.selected = selected;
+        PluginListUpdate { refill, selected }
     }
 }
 
@@ -742,7 +822,7 @@ impl PluginListState {
 ///   one;
 /// * a skin that is not among the rows any more is gone: the first row
 ///   takes its place, or nothing when there is no row at all.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SkinListState {
     /// The page the rows belong to; `None` when no page was shown yet.
     node: Option<PrefsNode>,
@@ -779,6 +859,22 @@ impl SkinListState {
             picked: None,
             player,
         }
+    }
+
+    /// The list of the Skins page that was just built: it shows nothing yet.
+    ///
+    /// A page switch builds new controls, so the list starts empty: the rows
+    /// of the page the user came from say nothing about the new one.
+    pub(crate) fn shown() -> Self {
+        Self {
+            node: Some(PrefsNode::Skins),
+            ..Self::default()
+        }
+    }
+
+    /// The text of each row, in order.
+    pub(crate) fn texts(&self) -> &[String] {
+        &self.skins
     }
 
     /// Whether a list that shows these rows already shows `state`.
@@ -860,6 +956,174 @@ impl SkinListState {
     }
 }
 
+/// What the media library's root list shows, and which row is selected.
+///
+/// The rows come from the player ([`PrefsSettings::library_roots`]) and they
+/// can change while the dialog is open: a root that is added or removed
+/// changes them. The state therefore remembers the rows it shows and
+/// compares them with the rows the player pushes: only a change refills the
+/// list, so the per-tick push does not flicker it.
+///
+/// The rows belong to the page they are shown on, exactly like the plug-in
+/// list's rows: the list of one page never passes for the list of another,
+/// so a page switch refills it.
+///
+/// The selection is the user's row. A root that is not among the rows any
+/// more is gone: the first row takes its place, or nothing when the list is
+/// empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RootListState {
+    /// The page the rows belong to; `None` when no page was shown yet.
+    node: Option<PrefsNode>,
+    /// The text of each row.
+    texts: Vec<String>,
+    /// The row the user picked.
+    selected: Option<usize>,
+}
+
+/// What the media library's root list does with a push from the player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RootListUpdate {
+    /// The rows changed: the list must be refilled before the selection is
+    /// set.
+    pub(crate) refill: bool,
+    /// The row to select; `None` when no row is selected.
+    pub(crate) selected: Option<usize>,
+}
+
+impl RootListState {
+    /// The state of the Library page's list: the rows `settings` pushes.
+    pub(crate) fn of(settings: &PrefsSettings) -> Self {
+        let texts = settings
+            .library_roots
+            .iter()
+            .map(|root| library_root_text(&root.path, root.last_scanned_at))
+            .collect();
+        Self {
+            node: Some(PrefsNode::Library),
+            texts,
+            selected: None,
+        }
+    }
+
+    /// The list of the Library page that was just built: it shows nothing
+    /// yet.
+    ///
+    /// A page switch builds new controls, so the list starts empty: the rows
+    /// of the page the user came from say nothing about the new one.
+    pub(crate) fn shown() -> Self {
+        Self {
+            node: Some(PrefsNode::Library),
+            ..Self::default()
+        }
+    }
+
+    /// The text of each row, in order.
+    pub(crate) fn texts(&self) -> &[String] {
+        &self.texts
+    }
+
+    /// Whether a list that shows these rows already shows `state`.
+    ///
+    /// The rows of another page are never the rows of this one, so the page
+    /// is part of the comparison: a list that showed nothing yet is never
+    /// the list of the Library page.
+    pub(crate) fn shows(&self, state: &RootListState) -> bool {
+        self.node == state.node && self.texts == state.texts
+    }
+
+    /// The user picked the row `row` of the list.
+    ///
+    /// A row that does not exist is not a pick: the selection stays what it
+    /// was.
+    pub(crate) fn pick(&mut self, row: usize) {
+        if row < self.texts.len() {
+            self.selected = Some(row);
+        }
+    }
+
+    /// What the list does with the player's push.
+    ///
+    /// The rows are refilled only when they differ from the rows the list
+    /// shows. The selection is the row the user picked, as long as that row
+    /// is still there: a root that is gone leaves the first row in its
+    /// place, or nothing when the list is empty.
+    pub(crate) fn apply(&mut self, settings: &PrefsSettings) -> RootListUpdate {
+        let wanted = RootListState::of(settings);
+        let refill = !self.shows(&wanted);
+        let selected = match self.selected {
+            Some(row) if row < wanted.texts.len() => Some(row),
+            // The row is gone: the first row takes its place, or nothing when
+            // the list is empty.
+            Some(_) if wanted.texts.is_empty() => None,
+            Some(_) => Some(0),
+            None => None,
+        };
+        self.node = wanted.node;
+        self.texts = wanted.texts;
+        self.selected = selected;
+        RootListUpdate { refill, selected }
+    }
+}
+
+/// The state of the three lists of the dialog.
+///
+/// A page switch builds new controls, so the lists start empty: the rows of
+/// the page the user came from say nothing about the new one. The three
+/// states therefore belong together - they are built and filled together,
+/// and a page switch replaces all three.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PageLists {
+    /// The plug-in list of the page.
+    plugins: PluginListState,
+    /// The skin list of the page.
+    skins: SkinListState,
+    /// The media library's root list of the page.
+    roots: RootListState,
+}
+
+impl PageLists {
+    /// The lists of the page `node` that was just built: they show nothing
+    /// yet.
+    pub(crate) fn shown(node: PrefsNode) -> Self {
+        Self {
+            plugins: PluginListState::shown(node),
+            skins: SkinListState::shown(),
+            roots: RootListState::shown(),
+        }
+    }
+
+    /// The plug-in list of the page.
+    pub(crate) fn plugins(&self) -> &PluginListState {
+        &self.plugins
+    }
+
+    /// The skin list of the page.
+    pub(crate) fn skins(&self) -> &SkinListState {
+        &self.skins
+    }
+
+    /// The media library's root list of the page.
+    pub(crate) fn roots(&self) -> &RootListState {
+        &self.roots
+    }
+
+    /// The plug-in list of the page, for the user's pick.
+    pub(crate) fn plugins_mut(&mut self) -> &mut PluginListState {
+        &mut self.plugins
+    }
+
+    /// The skin list of the page, for the user's pick.
+    pub(crate) fn skins_mut(&mut self) -> &mut SkinListState {
+        &mut self.skins
+    }
+
+    /// The media library's root list of the page, for the user's pick.
+    pub(crate) fn roots_mut(&mut self) -> &mut RootListState {
+        &mut self.roots
+    }
+}
+
 /// What the user did in the dialog; the player turns it into a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefsAction {
@@ -933,8 +1197,8 @@ mod win32 {
     use windows::core::{PCWSTR, PWSTR};
 
     use super::{
-        Bind, ComboBind, Item, PluginListState, PrefsAction, PrefsError, PrefsNode, PrefsSettings,
-        Rect, SkinListState, TREE, library_root_text, page_items,
+        Bind, ComboBind, Item, PageLists, PrefsAction, PrefsError, PrefsNode, PrefsSettings, Rect,
+        TREE, page_items,
     };
 
     const CLASS_NAME: &str = "RustampPreferences";
@@ -996,19 +1260,14 @@ mod win32 {
         /// The drop-down lists of the current page: (window, id, binding).
         combos: Vec<(HWND, u16, ComboBind)>,
         skin_list: Option<HWND>,
-        /// What the skin list shows: the rows it lists, the skin the user
-        /// picked in it and the skin the player says is in use.
-        skin_state: SkinListState,
+        /// The state of the three lists of the current page: the rows they
+        /// show, the row the user picked in them and the skin the player
+        /// says is in use.
+        lists: PageLists,
         /// The plug-in list of the current page.
         plugin_list: Option<HWND>,
-        /// What the plug-in list shows: the page it belongs to, the player's
-        /// id behind each of its rows and the row texts it shows.
-        plugin_state: PluginListState,
         /// The media library's root list of the current page.
         library_list: Option<HWND>,
-        /// The row texts the root list shows, so a push that changes
-        /// nothing does not rebuild the list.
-        library_texts: Vec<String>,
         actions: Vec<PrefsAction>,
         /// Tree item handles, indexed like [`TREE`].
         items: Vec<isize>,
@@ -1139,11 +1398,9 @@ mod win32 {
                     checks: Vec::new(),
                     combos: Vec::new(),
                     skin_list: None,
-                    skin_state: SkinListState::default(),
+                    lists: PageLists::default(),
                     plugin_list: None,
-                    plugin_state: PluginListState::default(),
                     library_list: None,
-                    library_texts: Vec::new(),
                     actions: Vec::new(),
                     items,
                     quiet: false,
@@ -1443,17 +1700,12 @@ mod win32 {
                         i.checks.clear();
                         i.combos.clear();
                         i.skin_list = None;
-                        // The skin list is a new control: the rows of the
-                        // old one say nothing about it, so the new list is
-                        // filled again.
-                        i.skin_state = SkinListState::default();
                         i.plugin_list = None;
-                        // The plug-in list is a new control: the rows of the
-                        // old one say nothing about it, so the new list is
-                        // filled again.
-                        i.plugin_state = PluginListState::default();
                         i.library_list = None;
-                        i.library_texts.clear();
+                        // The lists are new controls: the rows of the old
+                        // ones say nothing about them, so the new lists are
+                        // filled again.
+                        i.lists = PageLists::shown(node);
                         std::mem::take(&mut i.page)
                     })
                 })
@@ -1721,10 +1973,6 @@ mod win32 {
                 inner.skin_list = skin_list;
                 inner.plugin_list = plugin_list;
                 inner.library_list = library_list;
-                // The list of the roots is a new control: the texts of the
-                // old one say nothing about it, so the new list is filled
-                // again.
-                inner.library_texts.clear();
             }
         });
         if let Some(list) = plugin_list {
@@ -1747,10 +1995,12 @@ mod win32 {
     /// the folder, or the skin in use), so the list is refilled when the
     /// content changed - not only when the page was built.
     fn refresh_skin_list(list: HWND, settings: &PrefsSettings) {
-        let Some(update) = STATE.with(|state| {
+        let Some((update, texts)) = STATE.with(|state| {
             let mut guard = state.try_borrow_mut().ok()?;
             let inner = guard.as_mut()?;
-            Some(inner.skin_state.apply(settings))
+            let update = inner.lists.skins_mut().apply(settings);
+            let texts = inner.lists.skins().texts().to_vec();
+            Some((update, texts))
         }) else {
             return;
         };
@@ -1758,7 +2008,7 @@ mod win32 {
             // SAFETY: refilling our own list box.
             unsafe {
                 SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
-                for skin in &settings.skins {
+                for skin in &texts {
                     let wide_text = wide(skin);
                     SendMessageW(
                         list,
@@ -1784,98 +2034,92 @@ mod win32 {
     /// The rows belong to the page: the list of another page is never the
     /// list of this one, so a page switch always refills the list.
     fn refresh_plugin_list(list: HWND, node: PrefsNode, settings: &PrefsSettings) {
-        let wanted = PluginListState::of(settings, node);
-        let unchanged = STATE.with(|state| {
-            state
-                .try_borrow()
-                .ok()
-                .is_some_and(|g| g.as_ref().is_some_and(|i| i.plugin_state.shows(&wanted)))
-        });
-        if unchanged {
+        // The user's pick is in the control: the model must know it before
+        // the rows change under it.
+        // SAFETY: querying our own list box.
+        let picked =
+            unsafe { SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))) }.0;
+        let Some((update, texts)) = STATE.with(|state| {
+            let mut guard = state.try_borrow_mut().ok()?;
+            let inner = guard.as_mut()?;
+            if let Ok(row) = usize::try_from(picked) {
+                inner.lists.plugins_mut().pick(row);
+            }
+            let update = inner.lists.plugins_mut().apply(settings, node);
+            let texts = inner.lists.plugins().texts().to_vec();
+            Some((update, texts))
+        }) else {
             return;
-        }
-        // SAFETY: querying and refilling our own list box.
-        unsafe {
-            let selected = SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
-            SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
-            for text in wanted.texts() {
-                let wide_text = wide(text);
-                SendMessageW(
-                    list,
-                    LB_ADDSTRING,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(wide_text.as_ptr() as isize)),
-                );
-            }
-            if selected >= 0 && (selected as usize) < wanted.texts().len() {
-                SendMessageW(
-                    list,
-                    LB_SETCURSEL,
-                    Some(WPARAM(selected as usize)),
-                    Some(LPARAM(0)),
-                );
+        };
+        if update.refill {
+            // SAFETY: refilling our own list box.
+            unsafe {
+                SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+                for text in &texts {
+                    let wide_text = wide(text);
+                    SendMessageW(
+                        list,
+                        LB_ADDSTRING,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(wide_text.as_ptr() as isize)),
+                    );
+                }
             }
         }
-        STATE.with(|state| {
-            if let Ok(mut guard) = state.try_borrow_mut()
-                && let Some(inner) = guard.as_mut()
-            {
-                inner.plugin_state = wanted;
+        if let Some(row) = update.selected {
+            // SAFETY: selecting a row of our own list box.
+            unsafe {
+                SendMessageW(list, LB_SETCURSEL, Some(WPARAM(row)), Some(LPARAM(0)));
             }
-        });
+        }
     }
 
     /// Makes the media library's root list show `settings`' roots, keeping the
     /// selected row. Does nothing when the list already shows exactly them, so
     /// the per-tick settings push does not flicker the list.
     fn refresh_root_list(list: HWND, settings: &PrefsSettings) {
-        let texts: Vec<String> = settings
-            .library_roots
-            .iter()
-            .map(|root| library_root_text(&root.path, root.last_scanned_at))
-            .collect();
-        let unchanged = STATE.with(|state| {
-            state
-                .try_borrow()
-                .ok()
-                .is_some_and(|g| g.as_ref().is_some_and(|i| i.library_texts == texts))
-        });
-        if unchanged {
+        // The user's pick is in the control: the model must know it before
+        // the rows change under it.
+        // SAFETY: querying our own list box.
+        let picked =
+            unsafe { SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))) }.0;
+        let Some((update, texts)) = STATE.with(|state| {
+            let mut guard = state.try_borrow_mut().ok()?;
+            let inner = guard.as_mut()?;
+            if let Ok(row) = usize::try_from(picked) {
+                inner.lists.roots_mut().pick(row);
+            }
+            let update = inner.lists.roots_mut().apply(settings);
+            let texts = inner.lists.roots().texts().to_vec();
+            Some((update, texts))
+        }) else {
             return;
+        };
+        if update.refill {
+            // SAFETY: refilling our own list box.
+            unsafe {
+                SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+                for text in &texts {
+                    let wide_text = wide(text);
+                    SendMessageW(
+                        list,
+                        LB_ADDSTRING,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(wide_text.as_ptr() as isize)),
+                    );
+                }
+            }
+            // The rows are one line each, and the list scrolls sideways: the
+            // scroll range must reach the end of the longest row, or a long path
+            // is cut off.
+            set_row_extent(list, &texts);
         }
-        // SAFETY: querying and refilling our own list box.
-        unsafe {
-            let selected = SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
-            SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
-            for text in &texts {
-                let wide_text = wide(text);
-                SendMessageW(
-                    list,
-                    LB_ADDSTRING,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(wide_text.as_ptr() as isize)),
-                );
-            }
-            if selected >= 0 && (selected as usize) < texts.len() {
-                SendMessageW(
-                    list,
-                    LB_SETCURSEL,
-                    Some(WPARAM(selected as usize)),
-                    Some(LPARAM(0)),
-                );
+        if let Some(row) = update.selected {
+            // SAFETY: selecting a row of our own list box.
+            unsafe {
+                SendMessageW(list, LB_SETCURSEL, Some(WPARAM(row)), Some(LPARAM(0)));
             }
         }
-        // The rows are one line each, and the list scrolls sideways: the
-        // scroll range must reach the end of the longest row, or a long path
-        // is cut off.
-        set_row_extent(list, &texts);
-        STATE.with(|state| {
-            if let Ok(mut guard) = state.try_borrow_mut()
-                && let Some(inner) = guard.as_mut()
-            {
-                inner.library_texts = texts;
-            }
-        });
     }
 
     /// Makes the list scroll sideways as far as its widest row.
@@ -2002,7 +2246,7 @@ mod win32 {
                         .0;
                         usize::try_from(row)
                             .ok()
-                            .and_then(|row| inner.plugin_state.id(row))
+                            .and_then(|row| inner.lists.plugins().id(row))
                     });
                     if let Some(plugin) = picked {
                         push_action(PrefsAction::TogglePlugin(plugin));
@@ -2025,7 +2269,7 @@ mod win32 {
                             if let Ok(mut guard) = state.try_borrow_mut()
                                 && let Some(inner) = guard.as_mut()
                             {
-                                inner.skin_state.pick(row);
+                                inner.lists.skins_mut().pick(row);
                             }
                         });
                         push_action(PrefsAction::LoadSkin(row));
@@ -2142,6 +2386,8 @@ mod win32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod props;
 
     #[test]
     fn the_tree_lists_the_reference_pages_with_children_after_their_parent() {
