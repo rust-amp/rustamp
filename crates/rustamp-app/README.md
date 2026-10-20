@@ -11,16 +11,17 @@ The binary is `rustamp`:
 ```text
 rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
        [--seconds <n>] [--enqueue] [--import-winamp-ini [path]]
-       [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>]
+       [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
        [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 ```
 
 The `/`-switches are the reference switches of `specs/S13-command-line.md`:
 `/CLASS=` is the window class the single-instance check looks for, `/CONFIG=`
 the configuration file to use instead of the default, `/BOOKMARK` adds a path
-as a bookmark rather than playing it, and `/INSTALL`, `/UNREG`, `/NOREG` and
-`/ONLYINSTALL` drive the shell registration (the verbs a drop from Explorer
-offers). An unknown `/`-token is a file argument, as in the spec. The
+as a bookmark rather than playing it, `/ADD` enqueues a path rather than
+playing it (the `Enqueue` verb of S13 §3), and `/INSTALL`, `/UNREG`, `/NOREG`
+and `/ONLYINSTALL` drive the shell registration (the verbs a drop from
+Explorer offers). An unknown `/`-token is a file argument, as in the spec. The
 `--`-switches are Rustamp's own test and convenience aids.
 
 ## Headless mode — safe to run anywhere

@@ -32,10 +32,16 @@ thread must drain the queue somewhere; `about_to_wait` is that seam (four lines)
 S13 did not exist as a spec when this card was written. It does now:
 `specs/S13-command-line.md` was audited on 2026-10-20 (dirty-room role under
 RFC 0021) and settles the switch set (`/CLASS=`, `/CONFIG=`, `/BOOKMARK`,
-`/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL`), the single-instance rule and
-the shell verbs. The behaviours the card had to leave as **own choices** should
-be re-checked against that spec; the card's own text is kept as the record of
-what was implemented before the spec existed.
+`/ADD`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL`), the single-instance
+rule and the shell verbs. The behaviours the card had to leave as **own
+choices** should be re-checked against that spec; the card's own text is kept
+as the record of what was implemented before the spec existed.
+
+The **second audit pass** (2026-10-20) added `/ADD` to that set: the reference
+registers its `Enqueue` shell verb with the command line `"%s" /ADD "%%1"`, so
+`/ADD` is a switch and not a file argument. The pass also withdrew the
+completeness claim of the switch list — it is the reference's own list, not a
+closed one (S13 §5.13) — and added two open questions (§5.13, §5.14).
 
 **Forbidden sources**
 - Winamp 5.x source, Winamp SDK headers or documentation, disassembly, the
@@ -143,13 +149,14 @@ looks like now. The conformance table itself lives in the module docs:
 
 | S13 fact | What changed |
 |---|---|
-| §1 the seven switches `/CLASS=`, `/CONFIG=`, `/BOOKMARK`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL` | They are parsed in `crates/rustamp-app/src/cli.rs`, spelled exactly as the spec records them. The Rustamp-only switches keep their `--` spelling, so the reference's `/` family stays exactly the spec's list. |
-| §1 an unknown `/` token is a file argument | The parser follows the spec: `/ADD`, `/PLAY`, `/NEW`, `/EJECT` and `/TASKBAR` are file arguments, not errors. |
+| §1 the eight switches `/CLASS=`, `/CONFIG=`, `/BOOKMARK`, `/ADD`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL` | They are parsed in `crates/rustamp-app/src/cli.rs`, spelled exactly as the spec records them. The Rustamp-only switches keep their `--` spelling, so the reference's `/` family stays exactly the spec's list — which is the reference's own switch list, not a closed one (S13 §5.13). |
+| §1 an unknown `/` token is a file argument | The parser follows the spec: `/PLAY`, `/NEW`, `/EJECT` and `/TASKBAR` are file arguments, not errors. `/ADD` is **no longer** one of them: the second audit pass (2026-10-20) found the reference's `Enqueue` verb registered with `"%s" /ADD "%%1"`, so `/ADD` is a switch that takes the path behind it. |
+| §1 `/ADD <path>` enqueues the path instead of playing it | The path is added to the playlist without starting playback — the same effect `--enqueue` has on the file argument. Both spellings end in one `cli::Enqueue` value, so the shell's `Enqueue` verb and the reference's switch ask for the same thing and cannot drift apart. A `/ADD` without a path is reported, not guessed (S13 §5.3). A `/ADD` in a **second** launch travels in the hand-off frame as the "added" path and is added, not played. |
 | §2 the class the single-instance check looks for | The instance key is now derived from the **window class** (`Winamp v1.x` by default, S09 §1 and §8 item 1) and the configuration path. `/CLASS=` reaches the check, and the class name is not case-folded (S13 §2). The configuration half stays this card's own choice: it keeps the tests with their own `RUSTAMP_CONFIG` apart. |
 | §2 the hand-over is a window message | Unchanged: the pipe is the channel. Which message the reference uses is open (S13 §5.8), so the pipe stays an own choice. |
-| §3 the shell verbs | New module `crates/rustamp-platform/src/shell_registration.rs`: the model of the verb table (four verbs per media and playlist file, one per skin archive, two per directory) plus the `DropTarget` keys under `Play` and `Enqueue`. The Win32 write is VM-only. |
+| §3 the shell verbs | New module `crates/rustamp-platform/src/shell_registration.rs`: the model of the verb table (four verbs per media and playlist file, one per skin archive, two per directory) plus the `DropTarget` keys under `Play` and `Enqueue`. The Win32 write is VM-only. The **command** a verb runs is still our own choice: the `Enqueue` verb is registered with `--enqueue "%1"`, where S13 §3 (second audit pass) records the reference's `"%s" /ADD "%%1"`. The CLI answers both spellings with the same effect — one `cli::Enqueue` value, one "added, not played" path — so the verb and the switch cannot drift apart; the registered string itself is a `rustamp-platform` item. |
 | §1 `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL` | They drive the registration step in `crates/rustamp-app/src/main.rs`. `/ONLYINSTALL` writes the registration and ends the run; `/NOREG` skips the step; `/UNREG` removes it. |
 | §1 `/BOOKMARK <path>` adds rather than plays | The path is added to the playlist without starting playback. The bookmark store does not exist yet (RFC 0005 O12), so the run says so. A `/BOOKMARK` in a **second** launch travels in the hand-off frame (protocol 2) and is added, not played. |
 | §1 `/CONFIG=<path>` | The configuration file replaces the resolved default. |
-| §5 the open questions | All twelve stay open; the own choices that touch them are named in the module docs. |
+| §5 the open questions | All fourteen stay open; the own choices that touch them are named in the module docs. The two the second audit pass added are §5.13 (whether the reference's switch list is complete) and §5.14 (the name of the verb that registers `/BOOKMARK`). |
 

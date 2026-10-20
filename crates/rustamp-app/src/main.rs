@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! rustamp [<file>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
-//!        [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>]
+//!        [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
 //!        [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 //! ```
 //!
@@ -50,7 +50,7 @@
 
 use std::process::ExitCode;
 
-use rustamp_app::cli::{self, Bookmark, OutputChoice, USAGE};
+use rustamp_app::cli::{self, Bookmark, Enqueue, OutputChoice, USAGE};
 use rustamp_platform::HotkeySession;
 use rustamp_platform::shell_registration::{self, RegistrationError, RegistrationStep};
 use rustamp_platform::single_instance::{self, Claim, ForwardRequest, HandOff};
@@ -175,9 +175,9 @@ fn forward(key: &str, args: &cli::Args) -> ExitCode {
 ///
 /// A file and an initial volume still make sense; the output mode, the skin and
 /// the `--seconds` test aid were chosen when the first instance started, so
-/// they become refusals. A file that is only **added** (`--enqueue`, S13 §1's
-/// `/BOOKMARK`) travels as such, so the running instance does not start
-/// playing it.
+/// they become refusals. A path that is only **added** (`--enqueue`, S13 §1's
+/// `/ADD` and `/BOOKMARK`) travels as such, so the running instance does not
+/// start playing it.
 fn forward_request(args: &cli::Args) -> ForwardRequest {
     let mut refusals = Vec::new();
     if args.output == OutputChoice::NoAudio {
@@ -208,20 +208,32 @@ fn forward_request(args: &cli::Args) -> ForwardRequest {
         }
         None => None,
     };
-    // `--enqueue` means the file is added and not played. Only one path can
-    // travel that way, so the file wins and the bookmark is reported.
-    let file = if args.enqueue {
+    // The enqueued path (S13 §1): `/ADD <path>` names its own path and
+    // `--enqueue` names the file argument. Both are added and not played. A
+    // `/ADD` without a path is left open by S13 §5.3, so it is reported
+    // rather than guessed.
+    let (file, enqueued) = match &args.enqueue {
+        Enqueue::None => (args.file.clone(), None),
+        Enqueue::File => (None, args.file.clone()),
+        Enqueue::Path(path) => (args.file.clone(), Some(path.clone())),
+        Enqueue::WithoutPath => {
+            refusals.push(
+                "/ADD without a path is not defined (S13 §5.3); nothing was enqueued".to_owned(),
+            );
+            (args.file.clone(), None)
+        }
+    };
+    // Only one path can travel that way, so the enqueued path wins and the
+    // bookmark is reported.
+    if let Some(enqueued) = enqueued {
         if let Some(bookmark) = added.take() {
             refusals.push(format!(
                 "/BOOKMARK {} was not forwarded: only one path can be added without playing it",
                 bookmark.display()
             ));
         }
-        added = args.file.clone();
-        None
-    } else {
-        args.file.clone()
-    };
+        added = Some(enqueued);
+    }
     ForwardRequest {
         file,
         added,
