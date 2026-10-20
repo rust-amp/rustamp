@@ -56,8 +56,20 @@ Decisions this crate makes where the frozen contracts leave room, plus the
   caller does not set. A missing primary tag is created. The year is written
   as a recording date (ID3v2 `TDRC`, Vorbis `DATE`, MP4 `©day`). `extra`
   entries are written best-effort (only keys that map to the target format).
-  Clearing a field is not supported yet; a tag editor (S06 era) will need an
-  explicit "remove" form.
+- **Removing a field.** `write_tags_with(path, &metadata, &removals)` takes a
+  field *out* of the file: the ID3v2 frame, the Vorbis comment or the MP4
+  atom is deleted. The list is the one the writer supports (`TagField`:
+  title, artist, album, album artist, year, genre, comment, track, disc).
+  `None` still means "leave this tag as it is" — the two never mean the same
+  thing — and a removal wins over a value in `metadata`. A field is removed
+  as a whole: the track takes the track number and the total with it, the
+  disc takes the disc number and the total, and the comment takes the
+  `DESCRIPTION` item with it (the reader takes a description as the comment
+  when a file has no comment of its own). Only the *primary* tag is
+  written, so a value in a second tag (an ID3v1 tag next to an ID3v2 tag,
+  the `RIFF INFO` of a WAV, the text chunks of an AIFF, the ID3v2 tag of a
+  FLAC file) survives a removal; `WriteReport::unremoved` names every
+  removal that is in that state, so the limitation is never silent.
 - **Writing is atomic.** The new file is built next to the original (same
   directory, so the rename stays on one volume) and renamed over it. A
   failed or interrupted write therefore leaves the original byte for byte
@@ -167,13 +179,16 @@ pictures that are *inside* the file and nothing else.
 - Still silent, by documented design: `extra` keys the target format has no
   field for (best-effort write, e.g. ReplayGain in MP4, tested); `DISCTOTAL`
   has no field in `TrackMetadata`, so it travels in `extra` and is written only
-  where lofty has a matching key (not enumerated); clearing a field is not
-  possible; a date or number that does not parse (`"01.01.2001"`, `"3/x"`)
-  becomes `None`; `ParsingMode::BestAttempt` drops a malformed tag item rather
-  than failing the file; a file with a media extension but unparseable body
-  may read as empty metadata (`non_media_files_error_or_stay_default` accepts
-  both outcomes). Making those errors needs a decision on strict parsing
-  (`ParsingMode::Strict`) and a "report skipped items" API; no spec asks for it.
+  where lofty has a matching key (not enumerated); a date or number that does
+  not parse (`"01.01.2001"`, `"3/x"`) becomes `None`; `ParsingMode::BestAttempt`
+  drops a malformed tag item rather than failing the file; a file with a media
+  extension but unparseable body may read as empty metadata
+  (`non_media_files_error_or_stay_default` accepts both outcomes). Making those
+  errors needs a decision on strict parsing (`ParsingMode::Strict`) and a
+  "report skipped items" API; no spec asks for it.
+- **A field is removed with `write_tags_with`** (the `TagField` list); the
+  removal is applied to the primary tag and is reported when a second tag
+  still carries the value (`WriteReport::unremoved`).
 - Round trip losses: total/track strings are numbers only.
 
 ## Audit (tag writing)
@@ -204,10 +219,43 @@ pictures that are *inside* the file and nothing else.
   (`lofty`'s generic model has no place for them), and the ID3v2 tag of a
   FLAC file (the format does not allow it; the copy in the file is left
   alone).
-- **Not supported yet:** clearing a field (a tag editor needs an explicit
-  "remove" form), and writing a tag into a file that has none of the
+- **Not supported yet:** writing a tag into a file that has none of the
   format's primary tag type but has a secondary one (an MP3 with only an
   ID3v1 tag gets an ID3v2 tag, the ID3v1 tag stays).
+
+## Audit (removing a value)
+
+- **The gap.** A field of `TrackMetadata` that is `None` means "leave this
+  tag as it is", so the writer could not say "this value goes away": a
+  cleared text field was written as an empty value and a cleared number
+  kept the old one. `None` still means "keep" — every existing caller
+  depends on it — so the removal is a separate, additive list.
+- **The API.** `TagField` names the nine fields the writer supports;
+  `write_tags_with(path, &metadata, &removals)` writes the metadata and
+  removes the fields; `write_tags_with_report` is the honest form and names
+  the removals the file still carries. `write_tags` and `write_tags_report`
+  are the same functions with an empty removal list, so no existing caller
+  changed.
+- **What the removal does per format.** The removal deletes the item of the
+  *primary* tag: the ID3v2 frame (`TIT2`, `TPE1`, `TDRC`, `TRCK`, …) for
+  MP3/AAC/WAV/AIFF, the Vorbis comment (`TITLE`, `ARTIST`, `DATE`,
+  `TRACKNUMBER`, …) for FLAC/Ogg/Opus/Speex, the `ilst` atom (`©nam`,
+  `©ART`, `©day`, `trkn`, …) for MP4/ALAC, the APEv2 item for
+  APE/MPC/WavPack. The Vorbis removal is spelled per key, so every
+  spelling of a key goes (`ALBUMARTIST` and `ALBUM ARTIST`, `TRACKTOTAL`
+  and `TOTALTRACKS`, `DISCTOTAL` and `TOTALDISCS`).
+- **A field is a whole field.** The track is the number *and* the total, the
+  disc is the number *and* the total: half the formats keep the two in one
+  place (the ID3v2 `TRCK` frame, the MP4 `trkn` atom), so only the pair can
+  be removed as a unit. The comment takes the `DESCRIPTION` item with it,
+  because the reader takes a description as the comment when a file has no
+  comment of its own — the ffmpeg FLAC muxer writes the comment that way.
+- **The limits.** Only the primary tag is written, so a value in a second
+  tag (an ID3v1 tag next to an ID3v2 tag, the `RIFF INFO` of a WAV, the text
+  chunks of an AIFF, the ID3v2 tag of a FLAC file) survives a removal. The
+  report names every such removal (`WriteReport::unremoved`) — the
+  limitation is loud, not silent. The `extra` map is not a field list: a key
+  of `extra` is not removed by a `TagField`.
 
 ## Album grouping (album values)
 
