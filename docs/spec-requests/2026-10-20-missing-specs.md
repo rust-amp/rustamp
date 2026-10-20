@@ -27,7 +27,7 @@ measurement can turn any item below into a fact.
 | S16 | the Preferences page set and their controls |
 | S18 | crossfade: length, curve, and what happens on a manual skip |
 | S19 | streaming: buffering, the status line, and the failure states |
-| S20 | the media library's columns, views and sort semantics |
+| S20 | ~~the media library's columns, views and sort semantics~~ **delivered: `specs/S20-media-library.md` (audited 2026-10-20)** — the reference ships a media library as a **plug-in**; the columns, the views and the sort semantics stay open (open questions 1–3) |
 
 ## 1. S08 — the visualization analyser
 
@@ -149,14 +149,35 @@ Questions:
 
 ## 9. S20 — the media library
 
-**Implemented as a modern own design** (index, search, cover column, roots);
-2.95 has no media library in the modern sense, so this may be "no reference
-behaviour" rather than a gap.
+**Implemented as a modern own design** (index, search, cover column, roots).
 
-One line from the dirty room settles it: **does 2.95 have an equivalent view
-(the "Load" dialog's file view? the playlist's own columns?), or is this a
-deliberate extension?** If it is an extension, the card closes as "own feature"
-and the parity list should say so.
+**Answer:** 2.95 has a media library, and it is a **plug-in** — the reference
+ships a general-purpose plug-in that identifies itself as
+`Nullsoft Winamp Library v1.3` and has a window of its own. It is not a player
+feature and not a page inside the player. The audited spec is
+`specs/S20-media-library.md` (audited 2026-10-20).
+
+What that spec settles, and what it does not:
+
+- It settles the plug-in's identity, its **four view names** (`Local Media`,
+  `Internet Radio`, `Playlists`, `New View`), its **seven field names**
+  (`title`, `artist`, `album`, `year`, `genre`, `track`, `ntracks`), its
+  **path template** and the **template language** of that template (bare words
+  — not S14's `%name%` language), its **seven configuration keys** and the
+  radio directory file `radio.vmd`.
+- The **columns, the views and the sort semantics** this section asked for
+  stay **open**: the column layout (order, widths, labels) is open question 1,
+  the default view set is open question 2, the sort semantics are open
+  question 3.
+- **CD playback** is out of scope for the spec; no CD path was examined.
+
+So the question asked here — "does 2.95 have an equivalent view (the "Load"
+dialog's file view? the playlist's own columns?), or is this a deliberate
+extension?" — is answered **both ways**: 2.95 has a media library, but as a
+**peer plug-in**, not as a player feature. Our own library is a first-class
+part of the player, so where the two differ that is our own design and not a
+deviation from the reference. The card therefore closes as "own feature" for
+the parity list, with the plug-in's behaviour documented as a peer reference.
 
 ## What the dirty room should return
 
