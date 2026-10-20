@@ -185,6 +185,10 @@ Behaviour the core contract leaves open, and what the decoders do.
   bounded by `MAX_SEEK_FRAMES` (2^53) instead of overflowing the frame count.
   After a seek the truncation check counts from the new position, so a seek
   cannot turn a complete file into a truncated one.
+  The seek calls the container reader and the codec as well, and both are
+  guarded like the read path is: a panic of either is a decode failure, not a
+  crash. A file that already broke them cannot be seeked either - the seek
+  refuses with the failure of the panic instead of calling them again.
 - **Matroska.** The container counts its timestamps in the units of its
   timestamp scale (a millisecond by default) and not in frames, so two
   conversions happen: the frame count the container states is turned into
@@ -195,18 +199,47 @@ Behaviour the core contract leaves open, and what the decoders do.
 - **Empty input.** A source of zero bytes is rejected before probing with
   `Error::Decode("empty source: 0 bytes to decode")`, not with the probe's "no
   suitable format reader found" (which named the wrong problem).
-- **A container reader that panics.** The Matroska reader of symphonia asks
-  for an element header it has not read yet, and every truncated Matroska file
-  trips it (measured on the prefixes of the repository fixture: 22746 of the
-  23304 prefixes panicked while the file was *opened*, none of them while it
-  was read). A hostile file must not take the player down, so the probe of the
-  container runs inside a `catch_unwind`: such a panic becomes
-  `Error::Decode("the container reader panicked on this file: it is broken")`
-  and the file is refused like any other broken file. The panic hook of the
-  standard library still prints the panic of the third-party reader; the file
-  is refused either way. The **read** path is not protected: a panic of a
-  codec or of a container reader while the file is read still unwinds (none
-  was found on the prefixes of the repository fixtures).
+- **A container reader or a codec that panics.** The Matroska reader of
+  symphonia asks for an element header it has not read yet, and every
+  truncated Matroska file trips it (measured on the prefixes of the
+  repository fixture: 22746 of the 23304 prefixes panicked while the file was
+  *opened*, none of them while it was read). A hostile file must not take the
+  player down, so **every** call into the third-party code runs inside a
+  `catch_unwind`:
+  - The **probe** of the container: such a panic becomes
+    `Error::Decode("the container reader panicked on this file: it is broken")`
+    and the file is refused like any other broken file.
+  - The **read** path: the container reader (`next_packet`) and the codec
+    (`decode`) are guarded as well. A panic becomes
+    `Error::Decode("the container reader panicked while the file was read: it
+    is broken")` or `Error::Decode("the codec panicked while the file was
+    decoded: it is broken")`. The **decoder is terminal** after such a panic:
+    the state of a reader or a codec that panicked is unknown, so it is not
+    called again, and what the panic may have left behind is not handed out.
+    Every later `read` reports the same failure - a broken file must not look
+    like a file that ended cleanly - and a `seek` refuses with it instead of
+    calling the third-party code again.
+  The panic hook of the standard library still prints the panic of the
+  third-party code; the file is refused either way. The hook is **not**
+  suppressed: it is a process-wide setting, it would hide the panics of this
+  crate as well, and the noise is the price of the guard - the same price the
+  probe's guard already pays.
+  The guard costs **nothing on the success path** beyond the `catch_unwind`
+  frame: the call it wraps was a virtual one already (`Box<dyn FormatReader>`
+  and `Box<dyn Decoder>`), so no inlining is lost and nothing is allocated.
+  Measured on this machine, 20 million guarded calls cost the same as 20
+  million plain ones in a release build (the guard is free there) and 10 ns
+  more per call in a debug build. The guard is entered twice per packet, and
+  a packet is a few hundred frames of audio - 26 ms of an MPEG frame at
+  44.1 kHz - so the whole fixture costs about a microsecond of it.
+  The corpus says that the read path of symphonia 0.5.5 does not panic:
+  measured on **every** prefix of every fixture of the repository (132773
+  prefixes, byte by byte), 22746 panicked while the file was opened - the
+  Matroska reader, and the same count as the measurement above - and **none**
+  of them while it was read. The suite walks the same corpus with a stride of
+  64 (3850 prefixes) and pins that count. The guard is therefore pinned with
+  a synthetic panicking codec and a synthetic panicking container reader
+  (`symphonia_dec::tests`), not with a file.
 - **Bounded read loop.** Every iteration of `fill_pending` produces samples,
   counts a skipped packet, or ends the stream. The two arms that do none of
   those (a foreign track id, a buffer that decodes to zero frames) are counted
@@ -642,6 +675,16 @@ correct behaviour:
     metadata chain of FLAC, the payload claims of AIFF and MP4 - do not run
     for it. A stream whose *media* is cut while its transfer is complete
     therefore ends cleanly, where the same file on disk is a loud failure.
+12. **A panic of the third-party code is caught, but what it left behind is
+    not repaired** (symphonia). The guard around the container reader and the
+    codec turns a panic into a decode failure and stops the decoder, because
+    the state of a reader or a codec that panicked is unknown: this crate
+    cannot repair it, and a file that makes the code of another crate panic
+    is broken beyond what this crate can do about it. The file is therefore
+    over after the panic - the frames that were decoded before it are
+    delivered, and every call from then on says that the file is broken.
+    The guard needs a build that unwinds (`panic = "unwind"`, the default): a
+    build that aborts on a panic cannot catch it, and the process is gone.
 
 ## Proposals
 

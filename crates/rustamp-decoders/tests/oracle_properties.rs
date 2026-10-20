@@ -1319,8 +1319,15 @@ fn extension_of(name: &str) -> &'static str {
 /// A file that was half downloaded is the normal case for a player, and the
 /// length of the prefix is the only thing that changes. Every one of them has
 /// to be refused, decoded or named as a cut - never a panic, never a hang.
+///
+/// A panic of the third-party code is caught by the decoder and named as a
+/// typed failure (see `symphonia_dec`): the counters below are the
+/// measurement the contract notes carry - the panics of the Matroska reader
+/// all happen while the file is *opened*, none of them while it is *read*.
 #[test]
 fn no_prefix_of_a_fixture_panics() {
+    let mut panicked_on_open = 0usize;
+    let mut panicked_on_read = 0usize;
     for name in [
         "sine.mp3",
         "sine.flac",
@@ -1337,10 +1344,35 @@ fn no_prefix_of_a_fixture_panics() {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 symphonia_verdict(prefix, ext)
             }));
+            let verdict =
+                result.unwrap_or_else(|_| panic!("{name} cut at {cut} bytes panicked the decoder"));
+            let message = match &verdict {
+                Verdict::Refused { message } => message,
+                Verdict::Failed { message, .. } => message,
+                Verdict::Clean { .. } => continue,
+            };
+            if !message.contains("panicked") {
+                continue;
+            }
+            // A panic of the third-party code is named by the guard of the
+            // decoder: a typed failure, not a crash.
             assert!(
-                result.is_ok(),
-                "{name} cut at {cut} bytes panicked the decoder"
+                message.contains("it is broken"),
+                "{name} cut at {cut} bytes: a panic must be named by the guard ({message})"
             );
+            if message.contains("while the file was read") {
+                panicked_on_read += 1;
+            } else {
+                panicked_on_open += 1;
+            }
         }
     }
+    assert_eq!(
+        panicked_on_read, 0,
+        "no prefix of a fixture makes the third-party code panic while it is read"
+    );
+    assert!(
+        panicked_on_open > 0,
+        "the corpus must exercise the guard: the Matroska reader panics on the prefixes of its fixture"
+    );
 }
