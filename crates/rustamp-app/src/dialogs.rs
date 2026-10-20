@@ -107,6 +107,7 @@ use rustamp_ui::{
 };
 
 use crate::app::App;
+use crate::title_format::TitleFormatSetting;
 
 /// The edit-entry session: the file whose tags the dialog edits and the
 /// dialog's model.
@@ -603,12 +604,15 @@ impl App {
                 _ => false,
             }
         });
+        let title_format = self.playlist_title_format();
         PrefsSettings {
             always_on_top: self.always_on_top(),
             easy_move: self.easy_move(),
             double_size: self.state().double_size,
             shuffle: self.state().shuffle,
             repeat: self.state().repeat,
+            playlist_title_format: title_format.enabled,
+            playlist_title_format_text: title_format.format,
             replaygain: self.replaygain_mode(),
             output_mode: self.config().audio.output_mode,
             skins: entries.into_iter().map(|entry| entry.name).collect(),
@@ -690,6 +694,14 @@ impl App {
                     Bind::DoubleSize => Command::ToggleDoubleSize,
                     Bind::Shuffle => Command::SetShuffle(on),
                     Bind::Repeat => Command::SetRepeat(on),
+                    // The playlist's title format is the app's own setting: it
+                    // is not part of `rustamp-core`'s configuration tree, so it
+                    // has no command there. The app sets it itself.
+                    Bind::PlaylistTitleFormat => {
+                        let setting = self.playlist_title_format();
+                        self.apply_title_format(on, &setting.format);
+                        return;
+                    }
                 };
                 if let Err(error) = self.submit(command) {
                     self.note(format!("preferences: {error}"));
@@ -817,11 +829,41 @@ impl App {
                     self.note(format!("preferences: {error}"));
                 }
             }
+            PrefsAction::SetTitleFormat(format) => {
+                // The user typed a format string: the switch stays as it is.
+                let setting = self.playlist_title_format();
+                self.apply_title_format(setting.enabled, &format);
+            }
             PrefsAction::ImportWinampIni => {
                 // The dialog does not pick the file itself: the presenter
                 // asks the user for it, from the tick.
                 self.request_winamp_ini_import();
             }
+        }
+    }
+
+    /// Applies the playlist's title format and saves it.
+    ///
+    /// A format string that cannot be used is reported: the rows keep their
+    /// plain text. The report says what **changed**, so typing a format
+    /// reports once and not once per keystroke. The user's text is kept
+    /// either way, so the page shows it and the user can fix it.
+    fn apply_title_format(&mut self, enabled: bool, format: &str) {
+        // A value the app already has changes nothing: the page is built
+        // with the value in use, and the field says it back.
+        if self.playlist_title_format() == TitleFormatSetting::new(enabled, format) {
+            return;
+        }
+        let was_usable = self.playlist_title_format().is_usable();
+        let problem = self.set_playlist_title_format(enabled, format).err();
+        if was_usable && let Some(reason) = problem {
+            self.note(format!(
+                "preferences: the playlist title format is not used: {reason}"
+            ));
+        }
+        // Saved at once: the choice must not wait for a clean exit to count.
+        if let Err(error) = self.save_config() {
+            self.note(format!("preferences: {error}"));
         }
     }
 

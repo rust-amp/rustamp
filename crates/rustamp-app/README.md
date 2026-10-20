@@ -434,6 +434,43 @@ resize is checked by the ignored
 `window::tests::the_playlist_window_shade_resizes_the_real_window` in the
 test VM.
 
+## The playlist's title format (S14)
+
+The playlist editor can show its rows in a **title format**: the format
+string of spec **S14**, rendered with the fields a row carries
+(`%title%`, `%artist%`, `%album%`, `%tracknumber%`, `%filename%`,
+`%comment%`). The language itself is the engine of `rustamp-ui`
+(`src/title_format.rs` there); the app owns the **setting**.
+
+The setting is the app's own, like the editor's font size: it is not part of
+`rustamp-core`'s configuration tree, so it lives in the configuration file
+under the `[ui]` table, in a table of its own:
+
+```toml
+[ui.playlist_title_format]
+enabled = true
+format = "[%artist% - ]%title%"
+```
+
+The key is written **only when the user set one**: without it the rows show
+their plain text, which is what the playlist shows today. The switch and the
+format string are on the preferences page **Options > Display** (the page for
+what the player shows; the reference's pages are unmeasured, S04 is open, so
+the placement is our own choice).
+
+A format string the app cannot read is **reported** and **not used**: the
+rows keep their plain text, the reason is in the player's status line, and
+the user's text is kept so it can be fixed in the page. The app's check is
+stricter than the engine, which reads a malformed format string as literal
+text: a `%` without its partner, a `[` without its `]` and a `$name(` without
+its `)` are reported, because the engine would render them as nonsense.
+
+The fields come from what the row has, and **nothing is read from the disk
+while a frame is painted**: the file name comes from the row's path, the tags
+from the metadata the engine reported when the track opened, and the tags of
+the rows the editor shows from the reader thread of
+`src/playlist_tags.rs`. A row shows its plain text until its tags arrive.
+
 ## Double-clicking a title bar
 
 S03 §5: "Double-click the title bar: toggle windowshade" (verified on the

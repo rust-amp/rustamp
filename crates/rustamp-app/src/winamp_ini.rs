@@ -129,6 +129,7 @@
 //! | `audio.replaygain` | the reference has no ReplayGain setting |
 //! | `audio.device` | the reference has no device setting |
 //! | `ui.snap_distance` | the reference has `snap` and `snaplen`, but the classic unit and range are open (S12 §9) |
+//! | `ui.playlist_title_format` | the reference has no global title-format setting: the format belongs to the input plug-ins (S14 §1) |
 //! | `plugins.plugin_dir`, `plugins.disabled` | the reference keeps its plug-in list in its own files |
 //! | `audio.output`, `audio.buffer_ms`, `audio.gapless`, `playlist.manual_advance`, `playlist.last_playlist`, `plugins.vis_plugin`, `plugins.vis_preset` | the settings the player does not apply (see `crate::config`) |
 //!

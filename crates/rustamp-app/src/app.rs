@@ -282,6 +282,15 @@ pub struct App {
     /// The page shows what the import did, so the result is on the page and
     /// not only in the player's status line.
     winamp_ini_import: Option<crate::winamp_ini::ImportOutcome>,
+    /// The playlist's title format (spec S14), when the user set one.
+    ///
+    /// `None` means the user never set one: the rows show their plain text.
+    /// The setting belongs to the app, not to `rustamp-core`'s configuration
+    /// tree (see [`crate::config::PLAYLIST_TITLE_FORMAT_KEY`]).
+    pub(crate) title_format: Option<crate::title_format::TitleFormatSetting>,
+    /// The tags of the playlist's rows, read off the UI thread
+    /// (see [`crate::playlist_tags`]).
+    pub(crate) playlist_tags: crate::playlist_tags::TagReader,
 }
 
 /// Whether `path` has a recognized playlist file extension.
@@ -515,6 +524,8 @@ impl App {
             host_supervisor: None,
             pending_winamp_ini_import: false,
             winamp_ini_import: None,
+            title_format: None,
+            playlist_tags: crate::playlist_tags::TagReader::new(),
         };
         app.shuffle = app.config.playlist.shuffle;
         app.repeat = app.config.playlist.repeat;
@@ -935,7 +946,12 @@ impl App {
     /// Saves the current configuration to `path`.
     pub fn save_config_to(&self, path: &Path) -> Result<(), crate::config::ConfigError> {
         let config = self.current_config();
-        crate::config::save(&config, self.playlist_font_size(), path)
+        crate::config::save(
+            &config,
+            self.playlist_font_size(),
+            self.title_format.as_ref(),
+            path,
+        )
     }
 
     /// Imports a Winamp 2.95 `winamp.ini` into the running configuration.
@@ -1634,6 +1650,12 @@ impl App {
         } = event
         {
             let id = self.entry_id_for(*index);
+            // The engine read the tags of the track it opened: they are in
+            // memory already, so the row can show them without reading the
+            // file (see `crate::playlist_tags`).
+            if let (Some(id), Some(metadata)) = (id, metadata) {
+                self.playlist_tags.remember(id, metadata.as_ref().clone());
+            }
             let normalised = Event::TrackChanged {
                 id,
                 index: *index,

@@ -65,6 +65,11 @@
 //!   stdio (with the operator's approval store, which the host needs before
 //!   it loads anything), and re-attaching (or restarting) it when it dies —
 //!   off the audio path, degrading to detached.
+//! * [`title_format`] — the playlist's title format (spec S14) as a setting
+//!   of the app: the format string, the check that says whether it can be
+//!   used, and the fields a playlist row offers to it.
+//! * [`playlist_tags`] — the tags of the playlist's rows, read off the UI
+//!   thread so that painting a frame never touches the disk.
 //! * [`window`] — the `winit`/`softbuffer` shell for the real player.
 //! * [`winamp_ini`] — the import of a Winamp 2.95 `winamp.ini` (S12): the
 //!   parser for the file's shape, the mapper onto our configuration and the
@@ -110,6 +115,7 @@ pub mod library_window;
 pub mod menu;
 pub mod modern_shell;
 mod output;
+pub mod playlist_tags;
 pub mod playlist_window;
 pub mod plugin_inventory;
 pub mod region;
@@ -117,6 +123,7 @@ pub mod routing;
 pub mod skin;
 pub mod skin_folder;
 pub mod supervise;
+pub mod title_format;
 pub mod winamp_ini;
 pub mod window;
 
@@ -225,6 +232,10 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     // `config::PLAYLIST_FONT_SIZE_KEY`); it is restored after the app is
     // built, so it wins over the skin's size.
     let playlist_font_size = loaded.playlist_font_size;
+    // The playlist's title format is the app's own setting as well (see
+    // `config::PLAYLIST_TITLE_FORMAT_KEY`). A format string that cannot be
+    // used is reported, and the rows keep their plain text.
+    let playlist_title_format = loaded.playlist_title_format;
     let config = loaded.config;
 
     // ----- skin -----
@@ -253,6 +264,11 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     // `output::create_output`.
     let mut app = App::new(options)?;
     app.set_playlist_font_size(playlist_font_size);
+    if let Some(setting) = playlist_title_format
+        && let Err(reason) = app.set_playlist_title_format(setting.enabled, &setting.format)
+    {
+        app.note(format!("the playlist title format is not used: {reason}"));
+    }
     app.set_config_path(config_path);
     for warning in &loaded.warnings {
         app.note(warning.clone());

@@ -143,7 +143,7 @@ fn config_round_trip_honours_all_supported_fields() {
 
     // The playlist editor's font size is the app's own setting outside the
     // configuration tree; it is written only when the user chose one.
-    save(&config, Some(18), &path).expect("save config");
+    save(&config, Some(18), None, &path).expect("save config");
     assert!(path.exists(), "config file exists on disk");
 
     let loaded = load(Some(&path)).expect("load config");
@@ -258,7 +258,7 @@ fn an_ignored_field_is_not_advertised() {
     config.plugins.vis_preset = Some("preset.milk".to_string());
     config.plugins.disabled = vec!["bad.dll".to_string()];
 
-    let serialized = serialize_honest(&config, None).expect("serialize honest config");
+    let serialized = serialize_honest(&config, None, None).expect("serialize honest config");
 
     let ignored_names = [
         "buffer_ms",
@@ -358,7 +358,7 @@ fn both_output_modes_are_honestly_serialized_without_ignored_field_warnings() {
     for mode in [OutputMode::Shared, OutputMode::Exclusive] {
         let mut config = Config::default();
         config.audio.output_mode = mode;
-        let serialized = serialize_honest(&config, None).expect("serialize");
+        let serialized = serialize_honest(&config, None, None).expect("serialize");
         let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
         assert!(value["audio"].get("output_mode").is_some());
         assert!(ignored_fields_in_toml(&value).is_empty());
@@ -380,7 +380,7 @@ fn the_configured_device_is_honestly_serialized_and_round_trips() {
     let mut config = Config::default();
     config.audio.device = Some("Speakers (Realtek)".to_string());
 
-    let serialized = serialize_honest(&config, None).expect("serialize honest config");
+    let serialized = serialize_honest(&config, None, None).expect("serialize honest config");
     let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
     assert_eq!(
         value["audio"]["device"].as_str(),
@@ -393,7 +393,7 @@ fn the_configured_device_is_honestly_serialized_and_round_trips() {
         ignored_fields_in_toml(&value)
     );
 
-    save(&config, None, &path).expect("save config");
+    save(&config, None, None, &path).expect("save config");
     let loaded = load(Some(&path)).expect("load config");
     assert!(
         loaded.warnings.is_empty(),
@@ -413,7 +413,7 @@ fn a_configuration_without_a_device_does_not_advertise_one() {
     let config = Config::default();
     assert_eq!(config.audio.device, None);
 
-    let serialized = serialize_honest(&config, None).expect("serialize honest config");
+    let serialized = serialize_honest(&config, None, None).expect("serialize honest config");
     assert!(
         !serialized.lines().any(|line| line.starts_with("device =")),
         "an unset device is not written:\n{serialized}"
@@ -683,7 +683,13 @@ fn a_setting_the_player_does_not_apply_keeps_its_line_after_a_save() {
             loaded.warnings
         );
 
-        save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+        save(
+            &loaded.config,
+            loaded.playlist_font_size,
+            loaded.playlist_title_format.as_ref(),
+            &path,
+        )
+        .expect("the save succeeds");
 
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -693,7 +699,13 @@ fn a_setting_the_player_does_not_apply_keeps_its_line_after_a_save() {
 
         // A second save is stable: the file the first save wrote is read
         // again, and the setting is still there.
-        save(&loaded.config, loaded.playlist_font_size, &path).expect("the second save succeeds");
+        save(
+            &loaded.config,
+            loaded.playlist_font_size,
+            loaded.playlist_title_format.as_ref(),
+            &path,
+        )
+        .expect("the second save succeeds");
         let saved_again = std::fs::read_to_string(&path).unwrap();
         assert_eq!(saved_again, saved, "a second save changes nothing");
 
@@ -735,7 +747,13 @@ double_size = true
     let loaded = load(Some(&path)).expect("the file loads");
     assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
 
-    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+    save(
+        &loaded.config,
+        loaded.playlist_font_size,
+        loaded.playlist_title_format.as_ref(),
+        &path,
+    )
+    .expect("the save succeeds");
 
     let again = load(Some(&path)).expect("the saved file loads");
     assert_eq!(again.config, loaded.config, "the applied settings survive");
@@ -767,7 +785,13 @@ key = \"value\"
     .unwrap();
 
     let loaded = load(Some(&path)).expect("the file loads");
-    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+    save(
+        &loaded.config,
+        loaded.playlist_font_size,
+        loaded.playlist_title_format.as_ref(),
+        &path,
+    )
+    .expect("the save succeeds");
 
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -810,7 +834,7 @@ fn the_honest_list_and_the_warning_list_stay_consistent() {
     config.plugins.plugin_dir = Some(PathBuf::from("plugins"));
     config.plugins.disabled = vec!["bad.dll".to_string()];
 
-    let serialized = serialize_honest(&config, Some(18)).expect("serialize honest config");
+    let serialized = serialize_honest(&config, Some(18), None).expect("serialize honest config");
     let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
     assert!(
         ignored_fields_in_toml(&value).is_empty(),
@@ -858,7 +882,7 @@ fn a_malformed_file_is_not_replaced_by_a_save() {
     let text = "[audio\nvolume = = ";
     std::fs::write(&path, text).unwrap();
 
-    let error = save(&Config::default(), None, &path)
+    let error = save(&Config::default(), None, None, &path)
         .expect_err("a malformed file must not be overwritten");
     match &error {
         ConfigError::Malformed {
@@ -896,7 +920,13 @@ fn a_dotted_setting_moves_into_the_table_the_player_writes() {
         loaded.warnings
     );
 
-    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+    save(
+        &loaded.config,
+        loaded.playlist_font_size,
+        loaded.playlist_title_format.as_ref(),
+        &path,
+    )
+    .expect("the save succeeds");
 
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(saved.contains("[audio]"), "{saved}");
@@ -931,7 +961,13 @@ fn an_unusable_playlist_font_size_survives_a_save() {
         loaded.warnings
     );
 
-    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+    save(
+        &loaded.config,
+        loaded.playlist_font_size,
+        loaded.playlist_title_format.as_ref(),
+        &path,
+    )
+    .expect("the save succeeds");
 
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -951,7 +987,7 @@ fn a_merge_that_would_break_the_file_is_refused() {
     let text = "audio = \"not a table\"\n";
     std::fs::write(&path, text).unwrap();
 
-    let error = save(&Config::default(), None, &path).expect_err("the merge must be refused");
+    let error = save(&Config::default(), None, None, &path).expect_err("the merge must be refused");
     match &error {
         ConfigError::Malformed {
             path: err_path,
@@ -982,7 +1018,13 @@ fn a_comment_above_a_preserved_setting_survives_a_save() {
     .unwrap();
 
     let loaded = load(Some(&path)).expect("the file loads");
-    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+    save(
+        &loaded.config,
+        loaded.playlist_font_size,
+        loaded.playlist_title_format.as_ref(),
+        &path,
+    )
+    .expect("the save succeeds");
 
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -1050,7 +1092,13 @@ fn a_setting_without_a_mapping_stays_preserved_and_still_warns() {
         loaded.warnings
     );
 
-    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+    save(
+        &loaded.config,
+        loaded.playlist_font_size,
+        loaded.playlist_title_format.as_ref(),
+        &path,
+    )
+    .expect("the save succeeds");
 
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -1093,7 +1141,13 @@ repeat = true
     assert!(loaded.config.playlist.shuffle);
     assert!(loaded.config.playlist.repeat);
 
-    save(&loaded.config, loaded.playlist_font_size, &path).expect("the save succeeds");
+    save(
+        &loaded.config,
+        loaded.playlist_font_size,
+        loaded.playlist_title_format.as_ref(),
+        &path,
+    )
+    .expect("the save succeeds");
 
     let again = load(Some(&path)).expect("the saved file loads");
     assert_eq!(again.config, loaded.config, "the applied settings survive");

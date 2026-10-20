@@ -35,6 +35,7 @@
 //! | `ui.snap_distance` | `window` → `rustamp_ui::docking` | written |
 //! | `ui.windows` | `App::with_registry` → the window placements | written |
 //! | `ui.playlist_font_size` | the playlist editor's font size | written; an unusable value is kept |
+//! | `ui.playlist_title_format` | the playlist's row text | written when the user set one; a format that cannot be read is reported and the plain text stays |
 //! | `eq.state` | `App::with_registry` → `Engine::set_eq` | written |
 //! | `plugins.plugin_dir` | `App::plugin_dir` → `rustamp_prefs::scan` | written |
 //! | `plugins.disabled` | `App::set_plugin_enabled` → `rustamp_prefs::set_enabled` | written |
@@ -97,6 +98,7 @@ use std::path::{Path, PathBuf};
 use rustamp_core::config::Config;
 
 use crate::config_preserve;
+use crate::title_format::TitleFormatSetting;
 
 /// Environment variable that overrides the config path (also the test seam).
 pub const CONFIG_ENV: &str = "RUSTAMP_CONFIG";
@@ -109,6 +111,26 @@ pub const CONFIG_ENV: &str = "RUSTAMP_CONFIG";
 /// therefore keeps the value in the same file, under the `[ui]` table, next
 /// to the other UI state it persists.
 pub const PLAYLIST_FONT_SIZE_KEY: &str = "playlist_font_size";
+
+/// The key the playlist's title format is stored under.
+///
+/// The title format (spec **S14**) is a view setting of the playlist editor
+/// as well, and it is not part of `rustamp-core`'s configuration tree either:
+/// the app keeps it in the same file, under the `[ui]` table, next to the
+/// other UI state it persists.
+///
+/// The value is a table of its own, so that the switch and the format string
+/// travel together:
+///
+/// ```toml
+/// [ui.playlist_title_format]
+/// enabled = true
+/// format = "[%artist% - ]%title%"
+/// ```
+///
+/// The key is written only when the user set one: without it the rows show
+/// their plain text.
+pub const PLAYLIST_TITLE_FORMAT_KEY: &str = "playlist_title_format";
 
 /// The configuration paths the app owns: the settings it reads and acts on.
 ///
@@ -142,6 +164,7 @@ const OWNED_PATHS: &[&[&str]] = &[
     &["ui", "snap_distance"],
     &["ui", "windows"],
     &["ui", PLAYLIST_FONT_SIZE_KEY],
+    &["ui", PLAYLIST_TITLE_FORMAT_KEY],
     &["eq", "state"],
     &["playlist", "shuffle"],
     &["playlist", "repeat"],
@@ -170,11 +193,45 @@ fn owns(path: &[String]) -> bool {
 /// not be able to use: a value it cannot use is a setting the app did not
 /// apply, so it is preserved instead of dropped. A value the app can use
 /// belongs to the app, which writes its own.
+///
+/// The playlist's title format is the same: a table the app cannot read is a
+/// setting the app did not apply, so the save keeps it. A table the app
+/// **can** read belongs to the app, which writes its own — the app keeps the
+/// user's format string as it is, so a format that cannot be parsed comes
+/// back unchanged and can be fixed in the preferences page.
 fn owns_setting(path: &[String], previous: &toml::Value) -> bool {
     if path.len() == 2 && path[0] == "ui" && path[1] == PLAYLIST_FONT_SIZE_KEY {
         return font_size_is_usable(previous);
     }
+    if is_title_format_path(path) {
+        return title_format_is_readable(previous);
+    }
     owns(path)
+}
+
+/// Whether the path names a setting of the playlist's title format.
+fn is_title_format_path(path: &[String]) -> bool {
+    path.len() >= 2 && path[0] == "ui" && path[1] == PLAYLIST_TITLE_FORMAT_KEY
+}
+
+/// Whether the file's title format is one the app can read.
+fn title_format_is_readable(previous: &toml::Value) -> bool {
+    previous
+        .get("ui")
+        .and_then(toml::Value::as_table)
+        .and_then(title_format_in_toml)
+        .is_some()
+}
+
+/// The title format a `[ui]` table names, when it names one the app can read.
+///
+/// A table that is not one (a missing `enabled`, a `format` that is not a
+/// string) is a setting the app cannot use: it is reported and kept.
+fn title_format_in_toml(ui: &toml::Table) -> Option<TitleFormatSetting> {
+    let table = ui.get(PLAYLIST_TITLE_FORMAT_KEY)?.as_table()?;
+    let enabled = table.get("enabled")?.as_bool()?;
+    let format = table.get("format")?.as_str()?;
+    Some(TitleFormatSetting::new(enabled, format))
 }
 
 /// Whether the file's playlist font size is one the app can use.
@@ -258,6 +315,12 @@ pub struct ConfigLoad {
     /// the app, not to `rustamp-core`'s configuration tree (see
     /// [`PLAYLIST_FONT_SIZE_KEY`]).
     pub playlist_font_size: Option<u32>,
+    /// The playlist's title format, when the file names one.
+    ///
+    /// `None` means the user never set one: the rows show their plain text.
+    /// The value belongs to the app, not to `rustamp-core`'s configuration
+    /// tree (see [`PLAYLIST_TITLE_FORMAT_KEY`]).
+    pub playlist_title_format: Option<TitleFormatSetting>,
 }
 
 /// The default configuration path, or `None` when neither the override nor
@@ -314,6 +377,16 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
                         ))
                     }
                 }
+                PLAYLIST_TITLE_FORMAT_KEY => {
+                    if title_format_in_toml(ui).is_some() {
+                        None
+                    } else {
+                        Some(
+                            "the playlist title format must be a table with 'enabled' and 'format'"
+                                .to_string(),
+                        )
+                    }
+                }
                 _ => Some("unrecognized UI setting".to_string()),
             };
             if let Some(r) = reason {
@@ -361,16 +434,17 @@ pub fn parse_with_warnings(
     text: &str,
     path: Option<&Path>,
 ) -> Result<(Config, Vec<String>), ConfigError> {
-    let (config, warnings, _) = parse_text(text, path)?;
+    let (config, warnings, _, _) = parse_text(text, path)?;
     Ok((config, warnings))
 }
 
+/// What a configuration file yields: the configuration, the warnings about
+/// the settings the player does not apply, and the settings the app owns.
+type ParsedFile = (Config, Vec<String>, Option<u32>, Option<TitleFormatSetting>);
+
 /// Parses TOML into the configuration, the warnings and the app-owned
-/// playlist font size.
-fn parse_text(
-    text: &str,
-    path: Option<&Path>,
-) -> Result<(Config, Vec<String>, Option<u32>), ConfigError> {
+/// settings of the playlist editor.
+fn parse_text(text: &str, path: Option<&Path>) -> Result<ParsedFile, ConfigError> {
     let toml_val: toml::Value = toml::from_str(text).map_err(|e| ConfigError::Malformed {
         path: path
             .map(PathBuf::from)
@@ -384,11 +458,10 @@ fn parse_text(
         error: e.to_string(),
     })?;
     let warnings = ignored_fields_in_toml(&toml_val);
-    let playlist_font_size = toml_val
-        .get("ui")
-        .and_then(toml::Value::as_table)
-        .and_then(playlist_font_size_in_toml);
-    Ok((config, warnings, playlist_font_size))
+    let ui = toml_val.get("ui").and_then(toml::Value::as_table);
+    let playlist_font_size = ui.and_then(playlist_font_size_in_toml);
+    let playlist_title_format = ui.and_then(title_format_in_toml);
+    Ok((config, warnings, playlist_font_size, playlist_title_format))
 }
 
 /// The playlist font size a `[ui]` table names, when it names a usable one.
@@ -417,11 +490,13 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
             warnings: Vec::new(),
             warning: None,
             playlist_font_size: None,
+            playlist_title_format: None,
         });
     };
     match std::fs::read_to_string(path) {
         Ok(text) => {
-            let (config, warnings, playlist_font_size) = parse_text(&text, Some(path))?;
+            let (config, warnings, playlist_font_size, playlist_title_format) =
+                parse_text(&text, Some(path))?;
             let warning = warnings.first().cloned();
             Ok(ConfigLoad {
                 config,
@@ -429,6 +504,7 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
                 warnings,
                 warning,
                 playlist_font_size,
+                playlist_title_format,
             })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ConfigLoad {
@@ -437,6 +513,7 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
             warnings: Vec::new(),
             warning: None,
             playlist_font_size: None,
+            playlist_title_format: None,
         }),
         Err(error) => Err(ConfigError::Read {
             path: path.to_owned(),
@@ -459,9 +536,14 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
 /// `playlist_font_size` is the playlist editor's runtime font size: it is
 /// written only when the user chose one (S03 §2 `40335` / `40336`), because
 /// the skin's size is in use otherwise.
+///
+/// `playlist_title_format` is the playlist's title format (spec S14): it is
+/// written only when the user set one, because the rows show their plain
+/// text otherwise.
 pub fn serialize_honest(
     config: &Config,
     playlist_font_size: Option<u32>,
+    playlist_title_format: Option<&TitleFormatSetting>,
 ) -> Result<String, ConfigError> {
     let mut root = toml::Table::new();
     root.insert(
@@ -550,6 +632,17 @@ pub fn serialize_honest(
         ui.insert(
             PLAYLIST_FONT_SIZE_KEY.into(),
             toml::Value::Integer(i64::from(size)),
+        );
+    }
+    // The playlist's title format, when the user set one: the rows show
+    // their plain text otherwise, so the key stays out of the file.
+    if let Some(setting) = playlist_title_format {
+        let mut title_format = toml::Table::new();
+        title_format.insert("enabled".into(), toml::Value::Boolean(setting.enabled));
+        title_format.insert("format".into(), toml::Value::String(setting.format.clone()));
+        ui.insert(
+            PLAYLIST_TITLE_FORMAT_KEY.into(),
+            toml::Value::Table(title_format),
         );
     }
 
@@ -651,9 +744,16 @@ pub fn serialize_honest(
 pub fn serialize_preserving(
     config: &Config,
     playlist_font_size: Option<u32>,
+    playlist_title_format: Option<&TitleFormatSetting>,
     previous: &str,
 ) -> Result<String, ConfigError> {
-    merged_document(config, playlist_font_size, previous, Path::new("<memory>"))
+    merged_document(
+        config,
+        playlist_font_size,
+        playlist_title_format,
+        previous,
+        Path::new("<memory>"),
+    )
 }
 
 /// The merged document for `previous`, or the reason why there is none.
@@ -663,6 +763,7 @@ pub fn serialize_preserving(
 fn merged_document(
     config: &Config,
     playlist_font_size: Option<u32>,
+    playlist_title_format: Option<&TitleFormatSetting>,
     previous: &str,
     path: &Path,
 ) -> Result<String, ConfigError> {
@@ -671,7 +772,7 @@ fn merged_document(
             path: path.to_owned(),
             error: e.to_string(),
         })?;
-    let honest = serialize_honest(config, playlist_font_size)?;
+    let honest = serialize_honest(config, playlist_font_size, playlist_title_format)?;
     let merged = config_preserve::merge(&honest, previous, &|path| {
         owns_setting(path, &previous_value)
     });
@@ -695,6 +796,7 @@ fn merged_document(
 pub fn save(
     config: &Config,
     playlist_font_size: Option<u32>,
+    playlist_title_format: Option<&TitleFormatSetting>,
     path: &Path,
 ) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent()
@@ -713,10 +815,16 @@ pub fn save(
                 path: path.to_owned(),
                 error: e.to_string(),
             })?;
-            merged_document(config, playlist_font_size, &previous, path)?
+            merged_document(
+                config,
+                playlist_font_size,
+                playlist_title_format,
+                &previous,
+                path,
+            )?
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            serialize_honest(config, playlist_font_size)?
+            serialize_honest(config, playlist_font_size, playlist_title_format)?
         }
         Err(error) => {
             return Err(ConfigError::Read {
@@ -1035,7 +1143,7 @@ mod tests {
             },
         ];
 
-        save(&config, None, &path).expect("save succeeds");
+        save(&config, None, None, &path).expect("save succeeds");
         let loaded = load(Some(&path)).expect("a written file must load again");
         assert_eq!(loaded.config.ui.windows, config.ui.windows);
     }
@@ -1056,7 +1164,7 @@ mod tests {
 
         let config = every_field_set();
 
-        save(&config, Some(18), &path).expect("save succeeds");
+        save(&config, Some(18), None, &path).expect("save succeeds");
         assert!(path.exists(), "config file was written");
 
         let loaded = load(Some(&path)).expect("load succeeds");
@@ -1194,12 +1302,17 @@ mod tests {
     /// document then say the same thing at that path.
     #[test]
     fn the_honest_serialization_never_writes_an_owned_setting_as_its_default() {
+        // The app's own settings are part of the fixture: the playlist font
+        // size and the playlist's title format are the two settings the app
+        // owns beside the configuration tree.
+        let title_format = TitleFormatSetting::new(true, "[%artist% - ]%title%");
         let written = toml::from_str::<toml::Value>(
-            &serialize_honest(&every_field_set(), Some(18)).expect("serialize the fixture"),
+            &serialize_honest(&every_field_set(), Some(18), Some(&title_format))
+                .expect("serialize the fixture"),
         )
         .expect("the writer's output is valid TOML");
         let default = toml::from_str::<toml::Value>(
-            &serialize_honest(&Config::default(), None).expect("serialize the default"),
+            &serialize_honest(&Config::default(), None, None).expect("serialize the default"),
         )
         .expect("the default's document is valid TOML");
 
@@ -1224,7 +1337,7 @@ mod tests {
     #[test]
     fn the_honest_serialization_round_trips_in_memory() {
         let config = every_field_set();
-        let text = serialize_honest(&config, Some(18)).expect("serialize");
+        let text = serialize_honest(&config, Some(18), None).expect("serialize");
 
         let back = parse(&text).expect("the writer's output is a config file");
         assert_eq!(back.version, config.version, "version");
@@ -1304,7 +1417,7 @@ mod tests {
 
         let config = every_field_set();
 
-        save(&config, None, &path).expect("save succeeds");
+        save(&config, None, None, &path).expect("save succeeds");
 
         let text = std::fs::read_to_string(&path).expect("the file is there");
         for (table, key) in [
@@ -1346,14 +1459,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("playlist-font.toml");
 
-        save(&Config::default(), Some(18), &path).expect("save succeeds");
+        save(&Config::default(), Some(18), None, &path).expect("save succeeds");
         let loaded = load(Some(&path)).expect("load succeeds");
         assert_eq!(loaded.playlist_font_size, Some(18));
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
 
         // Without a chosen size the key stays out of the file: the skin's
         // size is in use then.
-        save(&Config::default(), None, &path).expect("save succeeds");
+        save(&Config::default(), None, None, &path).expect("save succeeds");
         let text = std::fs::read_to_string(&path).expect("the file is there");
         assert!(!text.contains(PLAYLIST_FONT_SIZE_KEY), "{text}");
         assert_eq!(
@@ -1378,6 +1491,68 @@ mod tests {
         }
     }
 
+    /// The playlist's title format is the app's own setting (spec S14): it
+    /// is written only when the user set one, and a table the app cannot
+    /// read is reported and kept.
+    #[test]
+    fn the_playlist_title_format_round_trips_and_a_table_it_cannot_read_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("playlist-title-format.toml");
+        let setting = TitleFormatSetting::new(true, "[%artist% - ]%title%");
+
+        save(&Config::default(), None, Some(&setting), &path).expect("save succeeds");
+        let loaded = load(Some(&path)).expect("load succeeds");
+        assert_eq!(loaded.playlist_title_format, Some(setting));
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+        // Without a setting the key stays out of the file: the rows show
+        // their plain text then.
+        save(&Config::default(), None, None, &path).expect("save succeeds");
+        let text = std::fs::read_to_string(&path).expect("the file is there");
+        assert!(!text.contains(PLAYLIST_TITLE_FORMAT_KEY), "{text}");
+        assert_eq!(
+            load(Some(&path))
+                .expect("load succeeds")
+                .playlist_title_format,
+            None
+        );
+
+        // A table the app cannot read is reported, and the save keeps it: a
+        // setting the app did not apply is never destroyed.
+        let broken = "[ui.playlist_title_format]\nenabled = true\nformat = 42\n";
+        std::fs::write(&path, broken).expect("the file is written");
+        let loaded = load(Some(&path)).expect("load succeeds");
+        assert_eq!(loaded.playlist_title_format, None);
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("ui.playlist_title_format") && w.contains("not applied")),
+            "{:?}",
+            loaded.warnings
+        );
+        save(&Config::default(), None, None, &path).expect("save succeeds");
+        let saved = std::fs::read_to_string(&path).expect("the file is there");
+        assert!(
+            saved.lines().any(|line| line == "format = 42"),
+            "the table the app cannot read survives:\n{saved}"
+        );
+    }
+
+    /// A format string the user typed comes back as it is, even when it
+    /// cannot be used: the app keeps the text, so the user can fix it.
+    #[test]
+    fn a_format_string_that_cannot_be_used_survives_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken-format.toml");
+        let setting = TitleFormatSetting::new(true, "%title");
+
+        save(&Config::default(), None, Some(&setting), &path).expect("save succeeds");
+        let loaded = load(Some(&path)).expect("load succeeds");
+        assert_eq!(loaded.playlist_title_format, Some(setting));
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
     #[test]
     fn ignored_fields_are_not_advertised() {
         let mut config = Config::default();
@@ -1389,7 +1564,7 @@ mod tests {
         config.playlist.repeat = true;
         config.plugins.disabled = vec!["bad_plugin.dll".into()];
 
-        let serialized = serialize_honest(&config, None).expect("serialize honest");
+        let serialized = serialize_honest(&config, None, None).expect("serialize honest");
 
         // The serialized text must NOT contain any unhonoured field names.
         let ignored_keywords = [

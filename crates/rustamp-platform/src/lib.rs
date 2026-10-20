@@ -65,7 +65,7 @@ pub use popup_menu::{PopupMenuError, PopupRow, item_text, show_popup_menu};
 pub use prefs_dialog::PrefsWindow;
 pub use prefs_dialog::{
     Bind, LibraryRootRow, PluginRow, PrefsAction, PrefsError, PrefsNode, PrefsSettings,
-    TREE as PREFS_TREE, library_root_text,
+    TREE as PREFS_TREE, TextBind, library_root_text,
 };
 pub use shell_registration::{
     DIRECTORY_HANDLER, DROP_TARGET_VALUE, Entry, Handler, MEDIA_PROG_ID, PLAYLIST_PROG_ID,
