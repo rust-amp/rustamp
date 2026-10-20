@@ -6,10 +6,11 @@
 //! (the audit table below names them and the place that applies each one).
 //!
 //! For settings that cannot be honoured yet (e.g. output backend selection,
-//! audio buffer lengths, shuffle/repeat playback modes, and plugins), the
-//! configuration loader reports clear warnings rather than silently ignoring them.
+//! audio buffer lengths, gapless playback, and plugins), the configuration
+//! loader reports clear warnings rather than silently ignoring them.
 //! ReplayGain is honoured (audio.replaygain), and so is the output device
-//! (audio.device).
+//! (audio.device). The fade-out duration (audio.fadeout_ms) and the playback
+//! modes (playlist.shuffle, playlist.repeat) are honoured as well.
 //!
 //! On clean exit, the app writes an honest configuration to `%RUSTAMP_CONFIG%`
 //! (when set) or `%APPDATA%\Rustamp\rustamp.toml`. The written file carries
@@ -23,6 +24,7 @@
 //! | `version` | the schema marker | written |
 //! | `audio.volume` | `App::with_registry` → `Engine::set_volume` | written |
 //! | `audio.balance` | `App::with_registry` → `Engine::set_balance` | written |
+//! | `audio.fadeout_ms` | `App::with_registry` → `EngineConfig::fade_ms` | written |
 //! | `audio.output_mode` | `output::create_output` (RFC 0019) | written |
 //! | `audio.device` | `output::create_output` → `selection::plan`/`resolve` | written |
 //! | `audio.replaygain` | `App::with_registry` → `Engine::set_replaygain_mode` | written |
@@ -36,26 +38,39 @@
 //! | `eq.state` | `App::with_registry` → `Engine::set_eq` | written |
 //! | `plugins.plugin_dir` | `App::plugin_dir` → `rustamp_prefs::scan` | written |
 //! | `plugins.disabled` | `App::set_plugin_enabled` → `rustamp_prefs::set_enabled` | written |
+//! | `playlist.shuffle` | `App::with_registry` → `Engine::set_shuffle` (S15) | written |
+//! | `playlist.repeat` | `App::with_registry` → `Engine::set_repeat` (S15) | written |
 //! | `audio.output` | — the backend comes from the command line | **preserved** |
-//! | `audio.buffer_ms` | — | **preserved** |
-//! | `audio.fadeout_ms` | — the engine has `EngineConfig::fade_ms`, but the app never passes the configured value | **preserved** |
+//! | `audio.buffer_ms` | — the output's buffer length is the device's own | **preserved** |
 //! | `audio.gapless` | — | **preserved** |
-//! | `playlist.shuffle` | — the engine implements the mode (S15), but the app never hands the configured value to it | **preserved** |
-//! | `playlist.repeat` | — the same | **preserved** |
 //! | `playlist.manual_advance` | — | **preserved** |
 //! | `playlist.last_playlist` | — | **preserved** |
 //! | `plugins.vis_plugin` | — | **preserved** |
 //! | `plugins.vis_preset` | — | **preserved** |
 //!
+//! Two points of the table need a word, because they are easy to misread:
+//!
+//! * **`audio.buffer_ms` has no mapping.** The output's buffer length is the
+//!   device's own: WASAPI opens the device's default period and cpal leaves
+//!   the size to the host. The engine's `ring_frames` is its internal
+//!   decode-to-device ring, not the output buffer. Nothing in the player
+//!   asks for a buffer length, so the setting stays preserved and warned
+//!   about — a mapping would have to be invented.
+//! * **`audio.fadeout_ms` and the playback modes are applied.** The app hands
+//!   the configured fade to the engine (`EngineConfig::fade_ms`) and the
+//!   configured modes to the engine's playback order (`Engine::set_shuffle`,
+//!   `Engine::set_repeat`), so the buttons and the traversal agree with the
+//!   file.
+//!
 //! # The save rule: a setting is never destroyed by a save that did not apply it
 //!
 //! A setting the player does not honour (an unknown key, a setting of a newer
-//! version, `playlist.shuffle`) is **not** part of the honest serialization —
-//! but it is also **not** deleted. On every save the app reads the file it is
-//! about to overwrite and copies every setting it does not own back into it,
-//! with the text the file used (see [`crate::config_preserve`]). A user who
-//! edits `rustamp.toml` by hand keeps those lines; the loader still warns
-//! that they are not applied.
+//! version, `playlist.manual_advance`) is **not** part of the honest
+//! serialization — but it is also **not** deleted. On every save the app reads
+//! the file it is about to overwrite and copies every setting it does not own
+//! back into it, with the text the file used (see [`crate::config_preserve`]).
+//! A user who edits `rustamp.toml` by hand keeps those lines; the loader still
+//! warns that they are not applied.
 //!
 //! The rule has three parts:
 //!
@@ -108,14 +123,15 @@ pub const PLAYLIST_FONT_SIZE_KEY: &str = "playlist_font_size";
 /// inside it belongs to the app.
 ///
 /// The paths that are **not** listed here are not applied by the player:
-/// `audio.output`, `audio.buffer_ms`, `audio.fadeout_ms`, `audio.gapless`,
-/// `playlist.shuffle`, `playlist.repeat`, `playlist.manual_advance`,
-/// `playlist.last_playlist`, `plugins.vis_plugin` and `plugins.vis_preset`.
-/// They are preserved on save and warned about on load.
+/// `audio.output`, `audio.buffer_ms`, `audio.gapless`,
+/// `playlist.manual_advance`, `playlist.last_playlist`, `plugins.vis_plugin`
+/// and `plugins.vis_preset`. They are preserved on save and warned about on
+/// load.
 const OWNED_PATHS: &[&[&str]] = &[
     &["version"],
     &["audio", "volume"],
     &["audio", "balance"],
+    &["audio", "fadeout_ms"],
     &["audio", "output_mode"],
     &["audio", "replaygain"],
     &["audio", "device"],
@@ -127,6 +143,8 @@ const OWNED_PATHS: &[&[&str]] = &[
     &["ui", "windows"],
     &["ui", PLAYLIST_FONT_SIZE_KEY],
     &["eq", "state"],
+    &["playlist", "shuffle"],
+    &["playlist", "repeat"],
     &["plugins", "plugin_dir"],
     &["plugins", "disabled"],
 ];
@@ -268,10 +286,9 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
         for key in audio.keys() {
             let reason = match key.as_str() {
                 "output" => Some("only the default audio backend is supported"),
-                "buffer_ms" => Some("output buffer length is fixed"),
-                "fadeout_ms" => Some("fadeout duration is not supported yet"),
+                "buffer_ms" => Some("the output buffer length is the device's own"),
                 "gapless" => Some("gapless mode is not configurable"),
-                "replaygain" => None,
+                "replaygain" | "fadeout_ms" => None,
                 "volume" | "balance" | "output_mode" | "device" => None,
                 _ => Some("unrecognized audio setting"),
             };
@@ -308,12 +325,9 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
     if let Some(playlist) = table.get("playlist").and_then(toml::Value::as_table) {
         for key in playlist.keys() {
             let reason = match key.as_str() {
-                "shuffle" => Some(
-                    "playback shuffle is not supported yet (engine does not implement shuffle)",
-                ),
-                "repeat" => {
-                    Some("playback repeat is not supported yet (engine does not implement repeat)")
-                }
+                // The engine owns the traversal (S15): the app hands the
+                // configured modes to it at startup.
+                "shuffle" | "repeat" => None,
                 "manual_advance" => Some("manual advance is not supported yet"),
                 "last_playlist" => Some("restoring playlist at startup is not supported yet"),
                 _ => Some("unrecognized playlist setting"),
@@ -434,9 +448,9 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
 /// Serializes a [`Config`] to TOML, including **only** fields that the player actually honours.
 ///
 /// Unhonoured / unapplied fields (such as `audio.output`, `audio.buffer_ms`,
-/// `audio.fadeout_ms`, `audio.gapless`, `playlist.shuffle`,
-/// `playlist.repeat`, `playlist.manual_advance`, `playlist.last_playlist`, and `plugins.*`) are
-/// omitted so the config file does not advertise unsupported features or mislead users.
+/// `audio.gapless`, `playlist.manual_advance`, `playlist.last_playlist`, and
+/// `plugins.*`) are omitted so the config file does not advertise unsupported
+/// features or mislead users.
 ///
 /// This is the player's **own** part of the file. A save writes it together
 /// with the settings the player does not own, which the previous file keeps
@@ -463,6 +477,12 @@ pub fn serialize_honest(
     audio.insert(
         "balance".into(),
         toml::Value::Integer(i64::from(config.audio.balance)),
+    );
+    // The fade-out duration: the engine runs it (`EngineConfig::fade_ms`),
+    // so the value the player applies is the one worth keeping.
+    audio.insert(
+        "fadeout_ms".into(),
+        toml::Value::Integer(i64::from(config.audio.fadeout_ms)),
     );
     // Persist the request, not a device-specific downgrade. Like the native
     // preferences label says, a change takes effect at the next startup
@@ -492,12 +512,13 @@ pub fn serialize_honest(
         audio.insert("device".into(), toml::Value::String(device.clone()));
     }
     // Note on deliberately unpersisted fields:
-    // audio.output, audio.buffer_ms, audio.fadeout_ms and audio.gapless are
-    // deliberately not written because the audio engine does not support
-    // runtime configuration of them yet. They are not deleted either: a save
+    // audio.output, audio.buffer_ms and audio.gapless are deliberately not
+    // written because the audio engine does not support runtime
+    // configuration of them yet. They are not deleted either: a save
     // keeps the file's own value (see `serialize_preserving`).
-    // audio.replaygain and audio.device are written: they are honoured by the
-    // engine (task card E4/A15 wiring and the device selection).
+    // audio.replaygain, audio.device and audio.fadeout_ms are written: they
+    // are honoured by the engine (task card E4/A15 wiring, the device
+    // selection and the fade-out duration).
     root.insert("audio".into(), toml::Value::Table(audio));
 
     let mut ui = toml::Table::new();
@@ -549,6 +570,19 @@ pub fn serialize_honest(
     }
     root.insert("ui".into(), toml::Value::Table(ui));
 
+    // The playback modes: the engine owns the traversal (S15) and the app
+    // hands the configured modes to it, so they are the player's own.
+    let mut playlist = toml::Table::new();
+    playlist.insert(
+        "shuffle".into(),
+        toml::Value::Boolean(config.playlist.shuffle),
+    );
+    playlist.insert(
+        "repeat".into(),
+        toml::Value::Boolean(config.playlist.repeat),
+    );
+    root.insert("playlist".into(), toml::Value::Table(playlist));
+
     let mut eq = toml::Table::new();
     // Serialize EqState via serde directly. Hand-rolling eq_state fields risks
     // field omission and drift. Delegating to serde ensures all bands, preamp,
@@ -588,12 +622,13 @@ pub fn serialize_honest(
     }
 
     // Note on deliberately unpersisted sections:
-    // playlist (shuffle, repeat, manual_advance, last_playlist) and the
-    // plugins' vis_plugin / vis_preset are deliberately not written because
-    // none of those features are honoured by the player yet (task card N6).
+    // the playlist's manual_advance / last_playlist and the plugins'
+    // vis_plugin / vis_preset are deliberately not written because none of
+    // those features are honoured by the player yet (task card N6).
     // They are kept, not deleted: a save copies the file's own settings back
     // (see `serialize_preserving`).
-    // audio.replaygain and audio.device are written (see above).
+    // The playlist's shuffle / repeat, audio.replaygain, audio.device and
+    // audio.fadeout_ms are written (see above).
 
     toml::to_string_pretty(&toml::Value::Table(root)).map_err(|e| ConfigError::Write {
         path: PathBuf::from("<serialize>"),
@@ -930,8 +965,8 @@ mod tests {
         config.plugins.vis_preset = Some("preset".into());
         config.plugins.disabled = vec!["bad.dll".into()];
 
-        // replaygain and the device are now persisted, so set them
-        // non-default and expect them back.
+        // replaygain, the device and the fade-out duration are now
+        // persisted, so set them non-default and expect them back.
         config.audio.replaygain = rustamp_core::config::ReplayGainMode::Album;
         config.audio.device = Some("Speakers (Realtek)".into());
 
@@ -949,19 +984,28 @@ mod tests {
             Some("Speakers (Realtek)".to_string()),
             "the honoured device survives the round trip"
         );
+        assert_eq!(
+            loaded.config.audio.fadeout_ms, 1200,
+            "the honoured fade-out duration survives the round trip"
+        );
+        assert!(
+            loaded.config.playlist.shuffle,
+            "the honoured shuffle mode survives the round trip"
+        );
+        assert!(
+            loaded.config.playlist.repeat,
+            "the honoured repeat mode survives the round trip"
+        );
         // Unpersisted fields cleanly revert to their documented defaults:
         assert_eq!(loaded.config.audio.output, Config::default().audio.output);
         assert_eq!(
             loaded.config.audio.buffer_ms,
             Config::default().audio.buffer_ms
         );
-        assert_eq!(
-            loaded.config.audio.fadeout_ms,
-            Config::default().audio.fadeout_ms
-        );
         assert_eq!(loaded.config.audio.gapless, Config::default().audio.gapless);
         assert_eq!(loaded.config.ui.snap_distance, 30);
-        assert_eq!(loaded.config.playlist, Config::default().playlist);
+        assert!(!loaded.config.playlist.manual_advance);
+        assert_eq!(loaded.config.playlist.last_playlist, None);
         // The plug-in pages' two settings survive; the vis ones do not.
         assert_eq!(
             loaded.config.plugins.plugin_dir,
@@ -1019,6 +1063,7 @@ mod tests {
         config.audio.volume = 200;
         config.audio.replaygain = rustamp_core::config::ReplayGainMode::Album;
         config.audio.buffer_ms = 400;
+        config.audio.fadeout_ms = 900;
         config.playlist.shuffle = true;
         config.playlist.repeat = true;
         config.plugins.disabled = vec!["bad_plugin.dll".into()];
@@ -1028,14 +1073,11 @@ mod tests {
         // The serialized text must NOT contain any unhonoured field names.
         let ignored_keywords = [
             "buffer_ms",
-            "fadeout_ms",
             "gapless",
             "manual_advance",
             "last_playlist",
             "vis_plugin",
             "vis_preset",
-            "shuffle",
-            "repeat",
         ];
         for keyword in ignored_keywords {
             assert!(
@@ -1044,6 +1086,21 @@ mod tests {
             );
         }
 
+        // The honoured settings are written: the file says what the player
+        // does.
+        assert!(
+            serialized.contains("fadeout_ms = 900"),
+            "the honoured fade-out duration is written:\n{serialized}"
+        );
+        assert!(
+            serialized.contains("shuffle = true"),
+            "the honoured shuffle mode is written:\n{serialized}"
+        );
+        assert!(
+            serialized.contains("repeat = true"),
+            "the honoured repeat mode is written:\n{serialized}"
+        );
+
         // When a file *does* contain ignored fields, loading it reports them in warnings.
         let toml_with_ignored = "\
 [audio]
@@ -1051,9 +1108,12 @@ volume = 180
 replaygain = \"Track\"
 device = \"Speakers (Realtek)\"
 buffer_ms = 350
+fadeout_ms = 900
 
 [playlist]
 shuffle = true
+repeat = true
+manual_advance = true
 ";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ignored.toml");
@@ -1084,12 +1144,33 @@ shuffle = true
             "expected warning for audio.buffer_ms in {:?}",
             loaded.warnings
         );
+        // The fade-out duration and the playback modes are honoured too, so
+        // they do not warn.
+        assert_eq!(loaded.config.audio.fadeout_ms, 900);
+        assert!(loaded.config.playlist.shuffle);
+        assert!(loaded.config.playlist.repeat);
         assert!(
             loaded
                 .warnings
                 .iter()
-                .any(|w| w.contains("playlist.shuffle") && w.contains("not applied")),
-            "expected warning for playlist.shuffle in {:?}",
+                .all(|w| !w.contains("audio.fadeout_ms")),
+            "the honoured fade-out duration must not warn: {:?}",
+            loaded.warnings
+        );
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .all(|w| !w.contains("playlist.shuffle") && !w.contains("playlist.repeat")),
+            "the honoured playback modes must not warn: {:?}",
+            loaded.warnings
+        );
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("playlist.manual_advance") && w.contains("not applied")),
+            "expected warning for playlist.manual_advance in {:?}",
             loaded.warnings
         );
     }

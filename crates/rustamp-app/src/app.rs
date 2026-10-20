@@ -326,6 +326,11 @@ impl App {
         let cfg = EngineConfig {
             volume: options.volume,
             balance: options.config.audio.balance,
+            // The fade-out duration is the configured one. The engine's own
+            // default happens to be the configuration's default, so the two
+            // agree by accident — the configured value must be handed over
+            // explicitly, or a file that asks for a different fade is ignored.
+            fade_ms: options.config.audio.fadeout_ms,
             ..EngineConfig::default()
         };
         let mut engine = Engine::new(registry.clone(), output.device, bus.clone(), cfg)?;
@@ -337,6 +342,12 @@ impl App {
         engine.set_balance(options.config.audio.balance)?;
         engine.set_eq(options.config.eq.state);
         engine.set_replaygain_mode(replaygain_mode_to_audio(options.config.audio.replaygain));
+        // The playback modes are the configured ones. The engine owns the
+        // traversal (S15), so a configured shuffle that only lit the button
+        // would leave the engine playing in order: the modes go to the engine
+        // itself, and the button follows the engine (see `App::state`).
+        engine.set_shuffle(options.config.playlist.shuffle)?;
+        engine.set_repeat(options.config.playlist.repeat)?;
         if let Some(file) = &options.file
             && !is_playlist_file(file)
         {
@@ -607,6 +618,9 @@ impl App {
         let cfg = EngineConfig {
             volume,
             balance,
+            // The fade-out duration is a configuration setting, not a runtime
+            // one: the new engine runs the configured fade as well.
+            fade_ms: self.config.audio.fadeout_ms,
             ..EngineConfig::default()
         };
         let mut new_engine =
@@ -762,7 +776,13 @@ impl App {
             eq: EqConfig {
                 state: self.engine.eq(),
             },
-            playlist: PlaylistConfig::default(),
+            playlist: PlaylistConfig {
+                // The playback modes are applied (the engine owns the
+                // traversal, S15), so the live ones are the file's.
+                shuffle: self.shuffle,
+                repeat: self.repeat,
+                ..PlaylistConfig::default()
+            },
             plugins: PluginsConfig {
                 // What the plug-in pages edit: the folder and the off-list.
                 // The rest stays unpersisted (see `config::serialize_honest`).
@@ -1413,12 +1433,14 @@ impl App {
     ///
     /// The engine owns transport, position, duration, volume, balance, the
     /// queue (length and current index), the stream and stop-after-current;
-    /// the app owns shuffle/repeat (the engine deliberately reports `false`)
-    /// and the stable entry ids (the engine reports `None`). The equalizer
-    /// state is the engine's, which owns the S07 stage.
+    /// the app owns shuffle/repeat (the engine's own snapshot is the truth
+    /// for them, and the app mirrors it) and the stable entry ids (the engine
+    /// reports `None`). The equalizer state is the engine's, which owns the
+    /// S07 stage.
     pub fn host_player_state(&mut self) -> PlayerState {
         let mut state = self.engine.state();
-        // App-owned modes: the engine does not track them (RFC 0001 / S15).
+        // App-owned modes: the app mirrors the engine's playback order, so
+        // the snapshot the host sees and the traversal agree (RFC 0001 / S15).
         state.shuffle = self.shuffle;
         state.repeat = self.repeat;
         // Stable entry id for the engine's current index (the engine has no
@@ -3074,6 +3096,27 @@ mod tests {
         (App::with_registry(options, registry()).unwrap(), dir)
     }
 
+    /// An app built from `config`, with the file it plays and the path it
+    /// saves to.
+    fn app_with_config(
+        config: Config,
+        file: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+    ) -> (App, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let options = AppOptions {
+            config,
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            file,
+            seconds: None,
+        };
+        let mut app = App::with_registry(options, registry()).unwrap();
+        app.set_config_path(config_path);
+        (app, dir)
+    }
+
     #[test]
     fn output_open_notes_reach_the_presenter_without_erasing_the_saved_request() {
         let (mut app, _dir) = app_with_file(None);
@@ -3528,6 +3571,101 @@ mod tests {
         app.mouse_up(x, y).unwrap();
         assert!(app.state().repeat);
         assert!(app.repeat);
+    }
+
+    /// The playback modes are the engine's (S15): a configured shuffle that
+    /// only lit the button would leave the engine playing in order.
+    #[test]
+    fn the_configured_playback_modes_reach_the_engine_at_startup() {
+        let mut config = Config::default();
+        config.playlist.shuffle = true;
+        config.playlist.repeat = true;
+        let (mut app, _dir) = app_with_config(config, None, None);
+
+        assert!(app.engine().shuffle(), "the engine shuffles");
+        assert!(app.engine().repeat(), "the engine repeats");
+        // The buttons tell the truth: they show the modes the engine runs in.
+        assert!(app.state().shuffle, "the shuffle button is lit");
+        assert!(app.state().repeat, "the repeat button is lit");
+
+        // And they still do after the engine's own mode events have been
+        // drained: the app and the engine do not drift apart.
+        app.pump().unwrap();
+        assert!(app.engine().shuffle(), "the engine still shuffles");
+        assert!(app.engine().repeat(), "the engine still repeats");
+        assert!(app.state().shuffle, "the shuffle button is still lit");
+        assert!(app.state().repeat, "the repeat button is still lit");
+    }
+
+    /// The fade-out duration is the configured one: the engine ramps the
+    /// output down over it and stops the transport when the ramp is over.
+    ///
+    /// The ramp is counted in frames (200 ms at 44.1 kHz are 8820), so the
+    /// test is exact: the transport is still playing halfway through the
+    /// configured ramp and stopped once it is over. With the engine's own
+    /// default (500 ms) the transport would still be playing there.
+    #[test]
+    fn the_configured_fade_reaches_the_engine() {
+        let mut config = Config::default();
+        config.audio.fadeout_ms = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let file = track(&dir, "track1_44100.tst");
+        let (mut app, _dir) = app_with_config(config, Some(file), None);
+
+        app.submit(Command::Play).unwrap();
+        assert_eq!(app.engine().transport(), TransportState::Playing);
+
+        app.submit(Command::StopWithFadeout).unwrap();
+        // Half the ramp: the transport is still playing, the fade is running.
+        app.advance_null_clock(4096);
+        app.pump().unwrap();
+        assert_eq!(
+            app.engine().transport(),
+            TransportState::Playing,
+            "the configured fade is still running"
+        );
+
+        // The ramp is over: the transport stopped.
+        app.advance_null_clock(8192);
+        app.pump().unwrap();
+        assert_eq!(
+            app.engine().transport(),
+            TransportState::Stopped,
+            "the configured fade is over"
+        );
+    }
+
+    /// The configured modes survive a save: the file the app writes names
+    /// the modes the engine runs in.
+    #[test]
+    fn the_configured_playback_modes_survive_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("modes.toml");
+        let mut config = Config::default();
+        config.playlist.shuffle = true;
+        config.playlist.repeat = true;
+        let (app, _dir) = app_with_config(config, None, Some(path.clone()));
+
+        app.save_config().expect("the clean exit saves");
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.lines().any(|line| line == "shuffle = true"),
+            "the shuffle mode is written:\n{saved}"
+        );
+        assert!(
+            saved.lines().any(|line| line == "repeat = true"),
+            "the repeat mode is written:\n{saved}"
+        );
+
+        // And a player built from that file comes up in the same modes.
+        let loaded = crate::config::load(Some(&path)).expect("the file loads");
+        assert!(loaded.config.playlist.shuffle);
+        assert!(loaded.config.playlist.repeat);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let (restarted, _dir) = app_with_config(loaded.config, None, None);
+        assert!(restarted.engine().shuffle(), "the engine shuffles again");
+        assert!(restarted.engine().repeat(), "the engine repeats again");
     }
 
     // ----- the Unhandled shortcut path -----
