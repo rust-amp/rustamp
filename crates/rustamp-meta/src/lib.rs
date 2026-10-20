@@ -18,7 +18,9 @@
 //!   to the original and renamed over it, and the audio frames are copied
 //!   byte for byte.
 //! * [`write_tags_report`] is the honest form of [`write_tags`]: it names
-//!   every `extra` entry the target format could not store.
+//!   every `extra` entry the target format could not store and every field
+//!   whose value the format could not hold (an MP4 track number of zero or
+//!   above 65535, for example).
 //! * [`write_tags_with`] writes the common fields back *and* removes the
 //!   fields of the removal list ([`TagField`]): a field that is `None` in
 //!   the [`TrackMetadata`](rustamp_core::meta::TrackMetadata) keeps the
