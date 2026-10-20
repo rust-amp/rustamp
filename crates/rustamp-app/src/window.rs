@@ -1801,6 +1801,63 @@ impl Windowed {
         }
     }
 
+    /// Asks for the settings of the playlist extraction and runs it.
+    ///
+    /// `Ctrl+Shift+X` in the media library asks for the path template and
+    /// the target directory, and the extraction writes the selection into
+    /// that directory (see [`crate::library_extract`]).
+    ///
+    /// The dialogs run their own modal message loops, so they are opened
+    /// from the tick and never from a window procedure (the rule the tray
+    /// popup follows). A cancelled dialog writes nothing: the first one is
+    /// the configuration, the second one the question about an existing
+    /// playlist.
+    fn drain_library_extract(&mut self) {
+        if !self.app.take_library_extract_request() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let owner = self.raw_main_window();
+            let answered = {
+                let last = self.app.extract_settings();
+                rustamp_platform::ask_extract_settings(
+                    owner,
+                    &last.template,
+                    &last.directory.display().to_string(),
+                )
+            };
+            let settings = match answered {
+                Ok(settings) => settings,
+                Err(error) => {
+                    eprintln!("rustamp: no extraction dialog: {error}");
+                    None
+                }
+            };
+            let mut ask = |question: &str| {
+                match rustamp_platform::ask_yes_no_cancel(owner, question) {
+                    Ok(Some(true)) => Some(rustamp_library::OverwriteAnswer::Yes),
+                    Ok(Some(false)) => Some(rustamp_library::OverwriteAnswer::No),
+                    // The question was not answered: nothing is written.
+                    Ok(None) => None,
+                    Err(error) => {
+                        eprintln!("rustamp: no question dialog: {error}");
+                        None
+                    }
+                }
+            };
+            // A cancelled configuration dialog is not an error: the app
+            // writes nothing.
+            if let Err(error) = self.app.library_extract(settings.as_ref(), &mut ask) {
+                eprintln!("rustamp: the extraction failed: {error}");
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("rustamp: a native extraction dialog is only implemented on Windows");
+        }
+    }
+
     /// The main window's raw OS handle, or `0` when it has none yet.
     ///
     /// The one reader for the places that need the window itself rather than
@@ -2976,6 +3033,7 @@ impl ApplicationHandler for Windowed {
         self.drain_html_playlist();
         self.drain_prefs();
         self.drain_library_folder_pick();
+        self.drain_library_extract();
         // After every window has been synced, so a focus request for a window
         // that opened this frame finds its OS window.
         self.apply_focus_requests();
