@@ -101,7 +101,11 @@ pub mod playlist;
 mod playlist_font;
 pub mod playlist_window;
 pub mod presenter;
+// The seeded property suite for the renderers. It lives beside the code it
+// tests because it renders the windows of this crate into in-memory frames.
 pub mod render;
+#[cfg(test)]
+mod render_props;
 pub mod shell;
 pub mod shortcuts;
 pub mod state;
