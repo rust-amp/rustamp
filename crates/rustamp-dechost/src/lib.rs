@@ -39,6 +39,17 @@
 //! `STREAMINFO` block states no audio parameters, so the reader cannot
 //! recognise a frame and the decoder refuses the file by name instead of
 //! letting the reader's bare "end of stream" stand.
+//!
+//! The **metadata** of a FLAC file is a different matter from its audio: the
+//! chain of metadata blocks states the length of every block, so a file that
+//! ends inside the chain was cut, and the refusal names the cut instead of
+//! letting the reader's bare "end of stream" stand.
+//!
+//! The cases that pin this decision for every format family - a cut file, a
+//! damaged file and a file with a lying header, each with the verdict and the
+//! frame count the format allows - are in `tests/terminal_classification.rs`.
+//! They run in this process: the resident is the one below, so no resident
+//! binary is spawned.
 
 use std::path::PathBuf;
 use std::time::Duration;
