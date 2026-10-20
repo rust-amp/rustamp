@@ -45,6 +45,7 @@ toml.workspace = true
 # it is deserialized through serde's derive.
 serde.workspace = true
 
+
 [dev-dependencies]
 tempfile.workspace = true
 # The skins-folder tests write real `.wsz` archives, so the scan sees the
@@ -59,6 +60,12 @@ rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 # Capture side of the VM-only loopback test (`tests/loopback.rs`); already a
 # workspace dependency through `rustamp-output`, so nothing new is fetched.
 cpal.workspace = true
+# The local TLS server of the `https://` CLI tests: rcgen mints the certificate,
+# rustls serves it. Both are test-only - the player itself never names rustls;
+# it asks the decoders for a stream. Same versions/features as rustamp-decoders
+# uses, so nothing new enters the lock.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
+rustls = "0.23"
 
 [build-dependencies]
 embed-manifest = "1.5.1"
