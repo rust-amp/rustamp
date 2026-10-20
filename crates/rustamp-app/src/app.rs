@@ -245,6 +245,23 @@ pub struct App {
     /// a rejected command. Shown in the main window's native title bar
     /// ([`App::window_title`]); cleared when a track starts.
     last_error: Option<String>,
+    /// The DSP chain the app installed in the engine (see [`crate::dsp`]).
+    ///
+    /// The engine takes the stages' ownership and drops the ones that fail,
+    /// so the app keeps the recipe and builds a fresh chain whenever one is
+    /// installed.
+    dsp_chain: crate::dsp::DspChain,
+    /// The DSP stage the engine bypassed after it failed, if one was
+    /// bypassed (see [`crate::dsp`]).
+    ///
+    /// The app remembers it so the preferences page does not claim that a
+    /// DSP is running while the engine runs without it.
+    bypassed_dsp: Option<crate::dsp::BypassedDsp>,
+    /// Whether the app's DSP chain still waits for its installation.
+    ///
+    /// A live run owns the chain, so an install during a run waits for the
+    /// run to end (see [`App::install_dsp_chain`]).
+    dsp_install_pending: bool,
     /// The app's end of the player-state bridge to the plugin host
     /// (see [`crate::host`]): detached until a supervisor attaches a
     /// control-channel transport, so publishing without a host is a no-op.
@@ -457,6 +474,9 @@ impl App {
             eq_auto_rules: crate::eq_autoload::AutoLoadRules::default(),
             notes: Vec::new(),
             last_error: None,
+            dsp_chain: crate::dsp::DspChain::default(),
+            bypassed_dsp: None,
+            dsp_install_pending: false,
             host: HostStateLink::detached(),
             host_supervisor: None,
         };
@@ -475,6 +495,16 @@ impl App {
         // the user can change it at runtime (S03 §2 `40335` / `40336`).
         app.sync_playlist_font_size();
         app.sync_eq_from_engine();
+        // The DSP chain the app installs in the engine.
+        //
+        // The chain is empty today: a classic DSP plug-in runs in the 32-bit
+        // plug-in host, and the host has no message that could carry a block
+        // of audio to the engine's decode thread, so the app has no
+        // engine-side stage for a plug-in yet (RFC 0020 Q6 is open). The app
+        // installs the chain at start-up anyway, so the policy around it —
+        // the note, the remembered state and the manual recovery — is in
+        // place for the first real stage.
+        app.install_dsp_chain(crate::dsp::DspChain::default());
         // The engine's snapshot is the authoritative starting state.
         app.sync_entry_ids();
         if let Some(file) = &options.file
@@ -1166,6 +1196,13 @@ impl App {
             self.handle_event(event);
         }
 
+        // A DSP chain that was installed while a run was live waits for that
+        // run to end: the engine takes the run's chain back when the run
+        // ends, so an install during the run would be dropped then.
+        if self.dsp_install_pending && self.engine.transport() == TransportState::Stopped {
+            self.install_dsp_chain_now();
+        }
+
         // The skins folder is read when the skin list is asked for; an entry
         // that is not a skin was skipped there, and the reason reaches the
         // user here.
@@ -1350,7 +1387,16 @@ impl App {
             Event::EqChanged(eq) => {
                 self.eq.sync_from_eq_state(eq);
             }
-            Event::Error(info) => self.surface_error(info),
+            Event::Error(info) => {
+                // A DSP failure is the engine's bypass policy, not a generic
+                // engine error: it has its own note, its own remembered state
+                // and its own recovery (see `crate::dsp`).
+                if info.kind == ErrorKind::Dsp {
+                    self.surface_dsp_bypass(info);
+                } else {
+                    self.surface_error(info);
+                }
+            }
             // A track that actually opened clears the error it replaced.
             Event::TrackChanged { index: Some(_), .. } => self.last_error = None,
             _ => {}
@@ -2131,6 +2177,110 @@ impl App {
 
     fn publish_error(&self, error: &Error) {
         self.bus.publish(Event::Error(ErrorInfo::from(error)));
+    }
+
+    /// Makes a bypassed DSP stage reach the user, and remembers the bypass.
+    ///
+    /// The engine's policy for a failed DSP stage is the **bypass** (W14
+    /// finding F4): the failed stage is replaced by a pass-through, the
+    /// failure is reported once per run, and the chain runs without that
+    /// stage until the caller installs a chain again. The app is that
+    /// caller, so:
+    ///
+    /// * the user gets a note that says what was bypassed and why — not the
+    ///   generic engine error, which would name a failure and stop the
+    ///   playback;
+    /// * the app remembers the bypass, so the preferences page does not
+    ///   claim that a DSP is running while the engine runs without it;
+    /// * the transport is **not** stopped: the engine ends the track the
+    ///   failure happened in and goes on with the next one, and stopping
+    ///   here would undo that. The next track plays without the failed
+    ///   stage.
+    fn surface_dsp_bypass(&mut self, info: &ErrorInfo) {
+        let bypass = crate::dsp::BypassedDsp::from_error(info);
+        let message = format!(
+            "the DSP was bypassed: stage '{}' failed ({}); switch the DSP off and on again in \
+             the preferences to install it again",
+            bypass.stage, bypass.cause
+        );
+        self.note(message.clone());
+        self.last_error = Some(message);
+        self.bypassed_dsp = Some(bypass);
+    }
+
+    /// Installs the app's DSP chain in the engine.
+    ///
+    /// The chain is the app's own: the engine runs it, and a stage that
+    /// fails is bypassed by the engine's policy (W14 finding F4) — the app
+    /// then remembers the bypass (see [`App::dsp_bypass`]).
+    ///
+    /// Installing a chain again undoes a bypass: that is how a failed stage
+    /// is replaced by a fresh one.
+    ///
+    /// A live run owns the chain: the engine takes the chain back when the
+    /// run ends, so an install during a run would be thrown away. The
+    /// install waits for the run to end in that case (see
+    /// [`App::pump`]).
+    pub fn install_dsp_chain(&mut self, chain: crate::dsp::DspChain) {
+        self.dsp_chain = chain;
+        self.install_dsp_chain_now();
+    }
+
+    /// Installs the app's DSP chain again: the manual recovery from a
+    /// bypass.
+    ///
+    /// The engine's policy is that a bypass lasts until the caller installs
+    /// a chain again, and this is that call. The app never makes it by
+    /// itself: a stage that failed would fail again, so a retry loop would
+    /// only repeat the failure. The user asks for the recovery by switching
+    /// the DSP off and on again (Preferences → DSP/Effect), which is the one
+    /// action that says "try again".
+    ///
+    /// Returns whether the chain is in the engine now. A live run owns the
+    /// chain, so the install waits for that run to end (see
+    /// [`App::install_dsp_chain`]).
+    pub fn reenable_dsp_chain(&mut self) -> bool {
+        self.install_dsp_chain_now()
+    }
+
+    /// Hands the app's chain to the engine, if no run owns it.
+    ///
+    /// A live run took the chain with it, and the engine hands that chain
+    /// back when the run ends — an install during a run would be dropped
+    /// then. So the install waits for the run to end.
+    ///
+    /// Returns whether the chain is in the engine now.
+    fn install_dsp_chain_now(&mut self) -> bool {
+        if self.engine.transport() != TransportState::Stopped {
+            self.dsp_install_pending = true;
+            return false;
+        }
+        self.dsp_install_pending = false;
+        self.bypassed_dsp = None;
+        let stages = self.dsp_chain.build();
+        self.engine.set_dsp_chain(stages);
+        true
+    }
+
+    /// The DSP stage the engine bypassed after it failed, if one was
+    /// bypassed.
+    pub fn dsp_bypass(&self) -> Option<&crate::dsp::BypassedDsp> {
+        self.bypassed_dsp.as_ref()
+    }
+
+    /// The names of the stages the app's DSP chain has, in order.
+    pub(crate) fn dsp_chain_stage_names(&self) -> Vec<&str> {
+        self.dsp_chain.stage_names()
+    }
+
+    /// The user switched the DSP off.
+    ///
+    /// The bypassed stage is out of the chain, so the preferences page must
+    /// not keep naming it. A chain that was waiting for its installation is
+    /// not installed any more: the user said off.
+    pub(crate) fn disable_dsp(&mut self) {
+        self.bypassed_dsp = None;
+        self.dsp_install_pending = false;
     }
 
     /// Makes an [`Event::Error`] reach the user and leaves the transport in a

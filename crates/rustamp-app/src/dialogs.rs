@@ -622,6 +622,10 @@ impl App {
     /// lists its own kind; a page with nothing to list, and any problem with
     /// the folder or the approval store, gets an information row (`id: None`)
     /// instead of an empty list that looks like a working one.
+    ///
+    /// The DSP/Effect page names a bypassed stage (see [`crate::dsp`]): the
+    /// engine runs the chain without the stage that failed, so the page must
+    /// not read as if the whole chain were running.
     fn plugin_rows(&self) -> Vec<PluginRow> {
         let scan = self.plugin_scan();
         let config = self.plugins_config();
@@ -638,6 +642,15 @@ impl App {
             if let Some(problem) = &scan.store_problem {
                 rows.push(info(format!(
                     "Approval list unusable, nothing is approved: {problem}"
+                )));
+            }
+            if node == PrefsNode::DspEffect
+                && let Some(bypass) = self.dsp_bypass()
+            {
+                rows.push(info(format!(
+                    "The DSP was bypassed: stage '{}' failed ({}). Switch the DSP off and on \
+                     again to install it again.",
+                    bypass.stage, bypass.cause
                 )));
             }
             let before = rows.len();
@@ -740,6 +753,32 @@ impl App {
                             // `set_plugin_enabled` refuses the rest, so the
                             // host is never asked for an unapproved image.
                             self.request_plugin_load(&path, kind);
+                            if kind == PluginKind::Dsp {
+                                // The manual recovery from a bypass: the
+                                // engine's policy is that a bypass lasts
+                                // until the caller installs a chain again,
+                                // and switching the DSP on again is the
+                                // action that says "try again". The app
+                                // never does this by itself (see
+                                // `crate::dsp`).
+                                let bypassed = self.dsp_bypass().is_some();
+                                let installed = self.reenable_dsp_chain();
+                                let names = self.dsp_chain_stage_names().join(", ");
+                                if !names.is_empty() {
+                                    let again = if bypassed { " again" } else { "" };
+                                    let note = if installed {
+                                        format!("the DSP chain was installed{again} ({names})")
+                                    } else {
+                                        // A live run owns the chain: the
+                                        // install waits for that run to end.
+                                        format!(
+                                            "the DSP chain is installed{again} with the next \
+                                             track ({names})"
+                                        )
+                                    };
+                                    self.note(note);
+                                }
+                            }
                         } else {
                             // The protocol has no unload request, so the
                             // plug-in stays loaded in the host until the host
@@ -750,6 +789,12 @@ impl App {
                                  the host restarts",
                                 path.display()
                             ));
+                            if kind == PluginKind::Dsp {
+                                // The user switched the DSP off: the bypassed
+                                // stage is out of the chain, so the page must
+                                // stop naming it.
+                                self.disable_dsp();
+                            }
                         }
                     }
                     Err(refused) => self.note(format!("preferences: {refused}")),
