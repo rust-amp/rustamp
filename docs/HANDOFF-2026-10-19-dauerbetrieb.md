@@ -344,6 +344,95 @@ in its report - four real defects).
 **Interrupted by provider rate limits (work preserved in their worktrees):**
 `wave331` (TLS properties) and `wave334` (stream status properties). `wave335`
 continues on another provider.
+## 2026-10-20 (night) / 2026-10-21: the base291 set, and what it measured
+
+**The reference half was produced** (owner: "ja erzeugen"): eleven states, one
+job per state, every run restoring `base-provisioned`, pinning the display to
+1024x768/96 dpi, passing the recorded 1:1 landmark with **0 differing pixels**
+and a byte-identical twin, and coming back hash-verified (31-39 files per run).
+The recorded landmark fixed the start state: main focused, equalizer and
+playlist **open**, volume 0, pan 0, flat EQ, skin `base-2.91.wsz`. Two probe
+runs proved that by failing in exactly the volume-slider band (522 px with
+volume 128) and exactly the EQ/PL button band (70 px with those windows closed).
+
+**The presented half needed three runner fixes and one product fix.** The
+runner had a dead `$bootstrapPath`, an `$installRoot` that pointed at
+`C:\rustamp\built` while the host stages `C:\rustamp\capture\built`, and a
+`Start-Process` parameter list handed to `powershell.exe` (so `$LASTEXITCODE`
+was always empty and every step "failed with exit "). Then the real find: our
+equalizer and playlist windows carried **winit's default class**, not the ABI
+names - only the main window got `with_class_name`. Measured by the capture
+harness and by a trap that dumps the process's windows:
+
+```
+2024A class='Winamp PE'      title='Rustamp Playlist'
+2023C class='Winamp v1.x'    title='Rustamp'
+```
+
+Fixed: `Winamp EQ` / `Winamp PE` are set, with a headless test pinning the
+mapping (`window_class`). A fourth runner problem was the reason six runs
+looked like timeouts: the payload died without writing its sentinel, so the
+session-0 waiter reported a six-minute timeout instead of the error. It now has
+a `trap` that always writes the record, including the window list - which is
+what produced the diagnosis above. `PostMessage` was called on a type that has
+no such method; with `$ErrorActionPreference = 'Continue'` the error scrolled
+past and the equalizer never opened.
+
+**The measurement** (`docs/notes/base291-skin-acceptance.md`): over the eight
+states both sides reach, **39 553 of 322 850 pixels differ (12.25 %)**;
+playlist 4.7 %, main-inactive 6.6 %, main 11.5 %, equalizer 23.2 %, main-shade
+32.4 %. **Three states are not reached at all**: the equalizer ignores
+windowshade (40064) and double size (40165), the playlist ignores windowshade -
+all three stay 275x116 where the reference is 275x14 / 550x232 / 275x14. The
+main window answers both, so routing exists; only those two windows never apply
+the command to themselves. `wave339` fixes it, then the three rows are
+re-measured.
+
+**Tooling bug found on the way:** the broker's `copyout` nests the source folder
+under the destination, and `vm-run-capture.ps1` refused runs whose guest
+`DONE.json` said `status ok` because it looked for `hashes.json` one level too
+high. The runner now flattens that level. `invoke-broker.ps1` also waits for a
+running task before writing its request and re-triggers every 15 s: a client
+killed mid-wait (the logoff below) left a stale request that the next queued run
+executed, so a later call waited for an answer that was never going to come.
+
+**Spec gaps closed by measurement** (S05 section 1.1 listed them as unknown):
+equalizer windowshade **275x14**, equalizer double size **550x232**, playlist
+windowshade **275x14**. Recorded in `docs/notes/base291-skin-acceptance.md` as
+measurements, not spec text: S05 is audited, and these lines belong in a
+revision an auditor gates.
+
+**The logoff incident (owner rule, "REMEMBER THIS").** At 20:33:57 a lane
+dot-sourced `sandbox-bootstrap.ps1` **on the host** while "validating" it. That
+script ends by calling `logoff.exe` - it exists to close a disposable Windows
+Sandbox from the inside - and it ended the owner's session, killing the running
+campaign and the client. The marker it left (`%TEMP%\rustamp-sandbox-bootstrap-FAILED.txt`,
+user `Legion5\User`) is the evidence. Fixed three ways: the `logoff.exe` call is
+**removed** from every copy outside the research tree, `Stop-SandboxSession`
+refuses unless the process runs as `WDAGUtilityAccount`, and `AGENTS.md` now
+carries the rule (including "reading a VM or measurement script is not
+permission to execute it"). The lane's own artifacts were audited before use and
+three throwaway helpers that dot-sourced the bootstrap were deleted.
+
+**Agent configurations cleaned** (`~/.config/opencode/agents`, backup kept):
+seven entries referenced models that no longer exist in the registry
+(`space-bunny`, `cat-jam`, `exo`, `ling-3.0`, `ling-3.1`, `muse-spark`,
+`step-5`); the Space Bunny slot is now `free-minimax-m3.1`
+(`opencode/minimax-m3.1-flash-free`).
+
+**Merged since the last section:** `301429c` (TLS: a host that trickles the
+handshake no longer holds the client - a whole-call deadline; a silent close is
+named), `674675e` (extraction: two tracks that would write one file are a
+reported error), `43c689d` (`https` proven through the real binary: `ftp`
+refused at parse time, untrusted certificate loud, **no plaintext fallback**),
+`1150678` (the ABI window classes), plus `bd4ce3f`, `71e8083`, `c0faf2d` and
+the stream-status wave (an `f64 as u64` cast that was UB at astronomical rates,
+percent arithmetic in `u128`).
+
+**In flight:** `wave339` (equalizer/playlist windowshade and double size),
+`wave340` (the measured transfer display - where and in which order the
+reference shows S19 section 2's texts), `wave341` (the 1 246-pixel shade strip,
+broken into rectangles).
 ## Rules added to `AGENTS.md` during the session
 
 1. **One worktree per subagent, created before it starts**; delete it after the merge.
