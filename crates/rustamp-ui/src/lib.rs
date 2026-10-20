@@ -95,12 +95,17 @@ pub use behaviour::{
 };
 pub use cursor::{equalizer_cursor, main_window_cursor, playlist_cursor_at};
 pub use dialogs::{
-    ABOUT_CLIENT_SIZE, DialogKind, DialogManager, EXTENDED_INFO_CLIENT_SIZE, ExtendedInfo,
-    FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE, JUMP_FILE_CLIENT_SIZE, JUMP_FILE_ROWS,
-    LOAD_PLAYLIST_CLIENT_SIZE, MAX_JUMP_FILE_LEN, MAX_JUMP_LEN, MAX_MEDIA_LEN,
+    ABOUT_CLIENT_SIZE, DISC_TOTAL_KEY, DialogKind, DialogManager, EDIT_ENTRY_CLIENT_SIZE,
+    EDIT_ENTRY_HINT, EDIT_ENTRY_TITLE, EXTENDED_INFO_CLIENT_SIZE, EditEntryChange,
+    EditEntryChanges, EditEntryDialog, EditEntryError, EditEntryField, EditEntryInvalid,
+    EditEntryNumber, EditEntryOutcome, ExtendedInfo, FILE_INFO_CLIENT_SIZE, JUMP_CLIENT_SIZE,
+    JUMP_FILE_CLIENT_SIZE, JUMP_FILE_ROWS, LOAD_PLAYLIST_CLIENT_SIZE, MAX_EDIT_ENTRY_GENRE_LEN,
+    MAX_EDIT_ENTRY_NUMBER, MAX_EDIT_ENTRY_NUMBER_LEN, MAX_EDIT_ENTRY_TEXT_LEN, MAX_EDIT_ENTRY_YEAR,
+    MAX_EDIT_ENTRY_YEAR_LEN, MAX_JUMP_FILE_LEN, MAX_JUMP_LEN, MAX_MEDIA_LEN, MIN_EDIT_ENTRY_YEAR,
     OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE, SkinEntry,
-    dialog_for_command, extended_info_lines, media_item_for_url, media_items_for_paths,
-    opening_command, parse_jump_time_ms, playlist_load_summary_lines, render_dialog, skin_entries,
+    dialog_for_command, edit_entry_lines, extended_info_lines, media_item_for_url,
+    media_items_for_paths, opening_command, parse_jump_time_ms, playlist_load_summary_lines,
+    render_dialog, skin_entries,
 };
 pub use docking::{
     ClassicWindow, DEFAULT_EQUALIZER_POSITION, DEFAULT_MAIN_POSITION, DEFAULT_PLAYLIST_POSITION,
