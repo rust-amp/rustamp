@@ -153,15 +153,20 @@ These are documented in each module and are candidates for a spec to override:
 `write_playlist` then `read_playlist_path` is exact for locations (absolute
 files, URLs), non-empty trimmed titles and durations (whole milliseconds), in
 all four formats (`tests/formats.rs`, `tests/property.rs`). What is lost, and
-why, pinned in `tests/audit.rs`:
+why, pinned in `tests/audit.rs`. The same rules are pinned as *properties*
+over seeded random playlists in `tests/format_properties.rs`: the round trip
+and its documented losses, the format detection (including a long comment in
+front of the file), the total behavior of the readers on malformed input, and
+the stability of the writer.
 
 | Field | Loss | Reason |
 |---|---|---|
 | title with leading/trailing whitespace | comes back trimmed | every reader trims (`normalize_title`) |
 | `Some("")` title | comes back `None` | same |
+| entry with an empty title and no duration | the `#EXTINF` line is gone when the file is written again | the reader turns the empty title into "no title"; an entry with neither a title nor a duration needs no `#EXTINF` line, so the second write drops it. The file converges after one round |
 | title with CR/LF | M3U/M3U8/PLS: line break becomes a space; XSPF exact | one entry per line in those formats |
 | artist, album | never stored | `LoadedEntry` has no field (2.3); `#EXTART`, `#EXTALBUM`, XSPF `creator`/`album` are parsed away. Needs a core RFC together with the S14 decision (is `title` raw or formatted; is `Artist - Title` split) |
-| relative `File` location | written as-is, resolves against the reader's base | `LoadedEntry::location` is documented as resolved; callers must resolve before writing |
+| relative `File` location | written as-is, resolves against the reader's base; a relative location that looks like a PLS key (`FileN=…`, `[playlist]`) is detected as a PLS and loses the key | `LoadedEntry::location` is documented as resolved; callers must resolve before writing. A `FileN=` line is a PLS marker and a content marker wins over the file name (section 3) |
 | XSPF `<title>` of the list, `<meta>`, `<extension>`, per-track `<image>`/`<info>` | dropped | no field |
 | PLS/M3U unknown keys and comments | dropped | no field |
 
