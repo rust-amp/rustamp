@@ -101,6 +101,12 @@ use crate::app::App;
 use crate::cursor::{CursorAction, SkinCursors, cursor_action};
 use crate::double_click::DoubleClick;
 
+/// The equalizer window's class (S01 §1, ABI per S09 §1).
+const EQUALIZER_CLASS: &str = "Winamp EQ";
+
+/// The playlist editor's class (S01 §1, ABI per S09 §1).
+const PLAYLIST_CLASS: &str = "Winamp PE";
+
 /// A window this presenter creates.
 ///
 /// It exists for the decisions that belong to the *window* rather than to the
@@ -117,6 +123,21 @@ enum PresenterWindow {
     Playlist,
     /// One of the dialog frames ([`DialogKind`]).
     Dialog,
+}
+
+/// The OS window class of each window, when it has an ABI one.
+///
+/// S09 §1 lists the classes plugins and external tools find the player by, and
+/// S01 §1 names them for the three classic windows. The main window's name is
+/// the single-instance class of S13 §2, so it comes from one place. Dialogs are
+/// the player's own windows and carry none of these names.
+fn window_class(window: PresenterWindow) -> Option<&'static str> {
+    match window {
+        PresenterWindow::Main => Some(rustamp_platform::single_instance::DEFAULT_CLASS),
+        PresenterWindow::Equalizer => Some(EQUALIZER_CLASS),
+        PresenterWindow::Playlist => Some(PLAYLIST_CLASS),
+        PresenterWindow::Dialog => None,
+    }
 }
 
 impl PresenterWindow {
@@ -2168,16 +2189,12 @@ impl Windowed {
         let attributes =
             rustamp_ui::shell::skinned_window_attributes(title, size, window.taskbar_role());
         #[cfg(windows)]
-        let attributes = {
-            use winit::platform::windows::WindowAttributesExtWindows as _;
-            if window == PresenterWindow::Main {
-                // S09 §1 and §8 item 1: the main window's class is an ABI
-                // fact that plugins and external tools depend on. S13 §2
-                // points at the same name for the single-instance check.
-                attributes.with_class_name(rustamp_platform::single_instance::DEFAULT_CLASS)
-            } else {
-                attributes
+        let attributes = match window_class(window) {
+            Some(class) => {
+                use winit::platform::windows::WindowAttributesExtWindows as _;
+                attributes.with_class_name(class)
             }
+            None => attributes,
         };
         match position {
             Some((x, y)) => attributes.with_position(PhysicalPosition::new(x, y)),
@@ -3320,6 +3337,27 @@ mod window_probe;
 
 #[cfg(test)]
 mod tests {
+    /// The three classic windows carry the ABI classes of S09 §1 (S01 §1 names
+    /// them); the dialog does not. Pinned here because a window's class cannot
+    /// be read back without opening one, and the capture harness finds the
+    /// equalizer and playlist by exactly these strings.
+    #[test]
+    fn the_classic_windows_carry_their_abi_classes() {
+        assert_eq!(
+            super::window_class(super::PresenterWindow::Main),
+            Some("Winamp v1.x")
+        );
+        assert_eq!(
+            super::window_class(super::PresenterWindow::Equalizer),
+            Some("Winamp EQ")
+        );
+        assert_eq!(
+            super::window_class(super::PresenterWindow::Playlist),
+            Some("Winamp PE")
+        );
+        assert_eq!(super::window_class(super::PresenterWindow::Dialog), None);
+    }
+
     use super::*;
     use crate::app::AppOptions;
     use crate::cli::OutputChoice;
