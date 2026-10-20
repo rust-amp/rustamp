@@ -735,8 +735,203 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustamp_core::config::WindowLayout;
-    use rustamp_core::state::WindowId;
+    use rustamp_core::config::{
+        AudioConfig, EqConfig, OutputMode, PlaylistConfig, PluginsConfig, ReplayGainMode, UiConfig,
+        WindowLayout,
+    };
+    use rustamp_core::state::{EqState, WindowId};
+
+    /// A configuration in which **every** field of **every** configuration
+    /// type carries a value that differs from the default.
+    ///
+    /// Two properties make this the fixture of the round trips below:
+    ///
+    /// * The struct literals are exhaustive, so a new field cannot be added
+    ///   to a configuration struct without this function failing to compile.
+    /// * Every value differs from the default, so a field the writer drops
+    ///   cannot hide behind the value the loader falls back to.
+    ///
+    /// The window list covers every `WindowId` variant (including `Gen(n)`
+    /// and `Video`) and both a sized and an unsized window.
+    ///
+    /// The settings the player does **not** honour are set as well
+    /// (`audio.output`, `audio.buffer_ms`, `audio.gapless`,
+    /// `playlist.manual_advance`, `playlist.last_playlist`,
+    /// `plugins.vis_plugin`, `plugins.vis_preset`): the writer must not
+    /// advertise them, and a fixture that left them at their default could
+    /// not tell an advertised setting from an omitted one.
+    fn every_field_set() -> Config {
+        Config {
+            version: 7,
+            audio: AudioConfig {
+                output: "cpal".into(),
+                device: Some("Speakers (Realtek)".into()),
+                output_mode: OutputMode::Exclusive,
+                buffer_ms: 350,
+                fadeout_ms: 800,
+                gapless: false,
+                replaygain: ReplayGainMode::Album,
+                volume: 150,
+                balance: -40,
+            },
+            ui: UiConfig {
+                skin: Some(PathBuf::from("skins/amplifier.wsz")),
+                double_size: true,
+                always_on_top: true,
+                easy_move: false,
+                snap_distance: 25,
+                windows: vec![
+                    WindowLayout {
+                        id: WindowId::Main,
+                        x: 50,
+                        y: 75,
+                        visible: true,
+                        shaded: true,
+                        width: None,
+                        height: None,
+                    },
+                    WindowLayout {
+                        id: WindowId::Equalizer,
+                        x: 50,
+                        y: 191,
+                        visible: true,
+                        shaded: false,
+                        width: None,
+                        height: None,
+                    },
+                    WindowLayout {
+                        id: WindowId::Playlist,
+                        x: 50,
+                        y: 307,
+                        visible: false,
+                        shaded: false,
+                        width: Some(275),
+                        height: Some(116),
+                    },
+                    WindowLayout {
+                        id: WindowId::Vis,
+                        x: 330,
+                        y: 75,
+                        visible: true,
+                        shaded: false,
+                        width: Some(275),
+                        height: Some(200),
+                    },
+                    WindowLayout {
+                        id: WindowId::Gen(42),
+                        x: 330,
+                        y: 285,
+                        visible: true,
+                        shaded: false,
+                        width: Some(300),
+                        height: Some(250),
+                    },
+                    WindowLayout {
+                        id: WindowId::Video,
+                        x: 610,
+                        y: 75,
+                        visible: false,
+                        shaded: false,
+                        width: Some(352),
+                        height: Some(240),
+                    },
+                ],
+            },
+            eq: EqConfig {
+                state: EqState {
+                    bands: [1.5, 2.5, 3.5, 4.5, 5.5, -1.5, -2.5, -3.5, -4.5, -5.5],
+                    preamp: 5.0,
+                    enabled: false,
+                    auto: true,
+                },
+            },
+            playlist: PlaylistConfig {
+                shuffle: true,
+                repeat: true,
+                manual_advance: true,
+                last_playlist: Some(PathBuf::from("playlists/favs.m3u")),
+            },
+            plugins: PluginsConfig {
+                plugin_dir: Some(PathBuf::from("plugins")),
+                vis_plugin: Some("vis_milk2.dll".into()),
+                vis_preset: Some("preset_1.milk".into()),
+                disabled: vec!["bad.dll".into()],
+            },
+        }
+    }
+
+    /// The premise of the round trips, made checkable: every field of the
+    /// fixture differs from its default.
+    ///
+    /// A field that stayed at its default could not be distinguished from a
+    /// field the writer drops, because the loader falls back to exactly that
+    /// default. The guard makes the premise a fact instead of an assumption,
+    /// and it fails loudly when a default changes under the fixture.
+    #[test]
+    fn every_field_of_the_fixture_differs_from_its_default() {
+        let c = every_field_set();
+        let d = Config::default();
+
+        assert_ne!(c.version, d.version, "version");
+        assert_ne!(c.audio.output, d.audio.output, "audio.output");
+        assert_ne!(c.audio.device, d.audio.device, "audio.device");
+        assert_ne!(
+            c.audio.output_mode, d.audio.output_mode,
+            "audio.output_mode"
+        );
+        assert_ne!(c.audio.buffer_ms, d.audio.buffer_ms, "audio.buffer_ms");
+        assert_ne!(c.audio.fadeout_ms, d.audio.fadeout_ms, "audio.fadeout_ms");
+        assert_ne!(c.audio.gapless, d.audio.gapless, "audio.gapless");
+        assert_ne!(c.audio.replaygain, d.audio.replaygain, "audio.replaygain");
+        assert_ne!(c.audio.volume, d.audio.volume, "audio.volume");
+        assert_ne!(c.audio.balance, d.audio.balance, "audio.balance");
+
+        assert_ne!(c.ui.skin, d.ui.skin, "ui.skin");
+        assert_ne!(c.ui.double_size, d.ui.double_size, "ui.double_size");
+        assert_ne!(c.ui.always_on_top, d.ui.always_on_top, "ui.always_on_top");
+        assert_ne!(c.ui.easy_move, d.ui.easy_move, "ui.easy_move");
+        assert_ne!(c.ui.snap_distance, d.ui.snap_distance, "ui.snap_distance");
+        assert_ne!(c.ui.windows, d.ui.windows, "ui.windows");
+
+        assert_ne!(c.eq.state.bands, d.eq.state.bands, "eq.state.bands");
+        assert_ne!(c.eq.state.preamp, d.eq.state.preamp, "eq.state.preamp");
+        assert_ne!(c.eq.state.enabled, d.eq.state.enabled, "eq.state.enabled");
+        assert_ne!(c.eq.state.auto, d.eq.state.auto, "eq.state.auto");
+
+        assert_ne!(c.playlist.shuffle, d.playlist.shuffle, "playlist.shuffle");
+        assert_ne!(c.playlist.repeat, d.playlist.repeat, "playlist.repeat");
+        assert_ne!(
+            c.playlist.manual_advance, d.playlist.manual_advance,
+            "playlist.manual_advance"
+        );
+        assert_ne!(
+            c.playlist.last_playlist, d.playlist.last_playlist,
+            "playlist.last_playlist"
+        );
+
+        assert_ne!(
+            c.plugins.plugin_dir, d.plugins.plugin_dir,
+            "plugins.plugin_dir"
+        );
+        assert_ne!(
+            c.plugins.vis_plugin, d.plugins.vis_plugin,
+            "plugins.vis_plugin"
+        );
+        assert_ne!(
+            c.plugins.vis_preset, d.plugins.vis_preset,
+            "plugins.vis_preset"
+        );
+        assert_ne!(c.plugins.disabled, d.plugins.disabled, "plugins.disabled");
+    }
+
+    /// The value at `path` in a TOML document, when the document has one.
+    fn value_at<'a>(document: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+        let mut current = document;
+        for name in path {
+            current = current.get(name)?;
+        }
+        Some(current)
+    }
 
     #[test]
     fn a_missing_file_is_all_defaults() {
@@ -845,173 +1040,299 @@ mod tests {
         assert_eq!(loaded.config.ui.windows, config.ui.windows);
     }
 
+    /// The honest serialization writes exactly the settings the player
+    /// honours (the audit table in this module names them). The round trip
+    /// therefore carries a **non-default value for every one of them**: a
+    /// setting that stays at its default cannot be told apart from a setting
+    /// the writer dropped, because the loader falls back to exactly that
+    /// default.
+    ///
+    /// The comparison is field by field, so a failure names the setting that
+    /// broke, and the whole configuration is compared on top of it.
     #[test]
     fn config_round_trip_honours_all_supported_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("saved.toml");
 
-        let mut config = Config::default();
-        config.audio.volume = 175;
-        config.audio.balance = -30;
-        config.ui.skin = Some(PathBuf::from("skins/classic.wsz"));
-        config.ui.double_size = true;
-        config.ui.always_on_top = true;
-        config.ui.easy_move = false;
-        config.ui.windows = vec![
-            WindowLayout {
-                id: WindowId::Main,
-                x: 120,
-                y: 80,
-                visible: true,
-                shaded: true,
-                width: None,
-                height: None,
-            },
-            WindowLayout {
-                id: WindowId::Equalizer,
-                x: 120,
-                y: 196,
-                visible: true,
-                shaded: false,
-                width: None,
-                height: None,
-            },
-            WindowLayout {
-                id: WindowId::Playlist,
-                x: 120,
-                y: 312,
-                visible: false,
-                shaded: false,
-                width: Some(275),
-                height: Some(116),
-            },
-            WindowLayout {
-                id: WindowId::Vis,
-                x: 400,
-                y: 80,
-                visible: true,
-                shaded: false,
-                width: Some(275),
-                height: Some(200),
-            },
-            WindowLayout {
-                id: WindowId::Gen(42),
-                x: 400,
-                y: 290,
-                visible: true,
-                shaded: false,
-                width: Some(300),
-                height: Some(250),
-            },
-            WindowLayout {
-                id: WindowId::Video,
-                x: 700,
-                y: 80,
-                visible: false,
-                shaded: false,
-                width: Some(352),
-                height: Some(240),
-            },
-        ];
-        config.eq.state.enabled = false;
-        config.eq.state.auto = true;
-        config.eq.state.preamp = 4.5;
-        config.eq.state.bands = [1.0, 2.0, 3.0, 4.0, 5.0, -1.0, -2.0, -3.0, -4.0, -5.0];
+        let config = every_field_set();
 
-        save(&config, None, &path).expect("save succeeds");
+        save(&config, Some(18), &path).expect("save succeeds");
         assert!(path.exists(), "config file was written");
 
         let loaded = load(Some(&path)).expect("load succeeds");
         assert_eq!(loaded.source, ConfigSource::File(path));
-        assert!(loaded.warnings.is_empty(), "honest save emits no warnings");
-
-        assert_eq!(loaded.config.audio.volume, 175);
-        assert_eq!(loaded.config.audio.balance, -30);
-        assert_eq!(
-            loaded.config.ui.skin,
-            Some(PathBuf::from("skins/classic.wsz"))
+        assert!(
+            loaded.warnings.is_empty(),
+            "honest save emits no warnings: {:?}",
+            loaded.warnings
         );
-        assert!(loaded.config.ui.double_size);
-        assert!(loaded.config.ui.always_on_top);
-        assert!(!loaded.config.ui.easy_move);
-        assert_eq!(loaded.config.ui.windows, config.ui.windows);
-        assert_eq!(loaded.config.eq.state, config.eq.state);
-        // Assert the full configuration equals the written one.
         assert_eq!(
-            loaded.config, config,
-            "entire loaded configuration must equal written configuration"
+            loaded.playlist_font_size,
+            Some(18),
+            "the playlist font size survives the round trip"
+        );
+
+        // Field by field, so a failure names the setting that broke.
+        assert_eq!(loaded.config.version, config.version, "version");
+        assert_eq!(
+            loaded.config.audio.volume, config.audio.volume,
+            "audio.volume"
+        );
+        assert_eq!(
+            loaded.config.audio.balance, config.audio.balance,
+            "audio.balance"
+        );
+        assert_eq!(
+            loaded.config.audio.fadeout_ms, config.audio.fadeout_ms,
+            "audio.fadeout_ms"
+        );
+        assert_eq!(
+            loaded.config.audio.output_mode, config.audio.output_mode,
+            "audio.output_mode"
+        );
+        assert_eq!(
+            loaded.config.audio.replaygain, config.audio.replaygain,
+            "audio.replaygain"
+        );
+        assert_eq!(
+            loaded.config.audio.device, config.audio.device,
+            "audio.device"
+        );
+        assert_eq!(loaded.config.ui.skin, config.ui.skin, "ui.skin");
+        assert_eq!(
+            loaded.config.ui.double_size, config.ui.double_size,
+            "ui.double_size"
+        );
+        assert_eq!(
+            loaded.config.ui.always_on_top, config.ui.always_on_top,
+            "ui.always_on_top"
+        );
+        assert_eq!(
+            loaded.config.ui.easy_move, config.ui.easy_move,
+            "ui.easy_move"
+        );
+        assert_eq!(
+            loaded.config.ui.snap_distance, config.ui.snap_distance,
+            "ui.snap_distance"
+        );
+        assert_eq!(loaded.config.eq.state, config.eq.state, "eq.state");
+        assert_eq!(
+            loaded.config.playlist.shuffle, config.playlist.shuffle,
+            "playlist.shuffle"
+        );
+        assert_eq!(
+            loaded.config.playlist.repeat, config.playlist.repeat,
+            "playlist.repeat"
+        );
+        assert_eq!(
+            loaded.config.plugins.plugin_dir, config.plugins.plugin_dir,
+            "plugins.plugin_dir"
+        );
+        assert_eq!(
+            loaded.config.plugins.disabled, config.plugins.disabled,
+            "plugins.disabled"
+        );
+
+        // Every window keeps every field, including its size.
+        assert_eq!(
+            loaded.config.ui.windows.len(),
+            config.ui.windows.len(),
+            "ui.windows: every window survives"
+        );
+        for (written, read_back) in config
+            .ui
+            .windows
+            .iter()
+            .zip(loaded.config.ui.windows.iter())
+        {
+            assert_eq!(read_back.id, written.id, "ui.windows: the id survives");
+            assert_eq!(read_back.x, written.x, "ui.windows: x survives");
+            assert_eq!(read_back.y, written.y, "ui.windows: y survives");
+            assert_eq!(
+                read_back.visible, written.visible,
+                "ui.windows: visible survives"
+            );
+            assert_eq!(
+                read_back.shaded, written.shaded,
+                "ui.windows: shaded survives"
+            );
+            assert_eq!(read_back.width, written.width, "ui.windows: width survives");
+            assert_eq!(
+                read_back.height, written.height,
+                "ui.windows: height survives"
+            );
+        }
+
+        // The whole configuration, with the settings the player does not
+        // apply back at their defaults: they are not written, so the loader
+        // falls back to the default for every one of them.
+        let mut expected = config.clone();
+        expected.audio.output = Config::default().audio.output;
+        expected.audio.buffer_ms = Config::default().audio.buffer_ms;
+        expected.audio.gapless = Config::default().audio.gapless;
+        expected.playlist.manual_advance = Config::default().playlist.manual_advance;
+        expected.playlist.last_playlist = Config::default().playlist.last_playlist;
+        expected.plugins.vis_plugin = Config::default().plugins.vis_plugin;
+        expected.plugins.vis_preset = Config::default().plugins.vis_preset;
+        assert_eq!(
+            loaded.config, expected,
+            "the whole configuration survives the round trip, except the settings the player does not apply"
         );
     }
 
+    /// The honest serialization must never write an owned setting as its
+    /// default: the file says what the player does, and the player's state
+    /// differs from the default in every setting the app owns.
+    ///
+    /// The check is driven by [`OWNED_PATHS`] — the list of the settings the
+    /// app owns — so it covers the whole owned set: a setting that is added
+    /// to that list and to the writer, but left at its default in the
+    /// fixture, fails here instead of passing unnoticed.
+    ///
+    /// A writer that writes the default for one setting (the N9/F5 class of
+    /// bug) fails here as well: the written document and the default's
+    /// document then say the same thing at that path.
+    #[test]
+    fn the_honest_serialization_never_writes_an_owned_setting_as_its_default() {
+        let written = toml::from_str::<toml::Value>(
+            &serialize_honest(&every_field_set(), Some(18)).expect("serialize the fixture"),
+        )
+        .expect("the writer's output is valid TOML");
+        let default = toml::from_str::<toml::Value>(
+            &serialize_honest(&Config::default(), None).expect("serialize the default"),
+        )
+        .expect("the default's document is valid TOML");
+
+        for owned in OWNED_PATHS {
+            let path: Vec<&str> = owned.to_vec();
+            assert_ne!(
+                value_at(&written, &path),
+                value_at(&default, &path),
+                "the owned setting {} is written as its default",
+                path.join(".")
+            );
+        }
+    }
+
+    /// The writer's output is a config file the loader reads back, without
+    /// the file system in between: the in-memory path of the honest
+    /// serialization, which the file round trip cannot show on its own — the
+    /// save merges the writer's output with the file that was there.
+    ///
+    /// The settings the player does not apply are not advertised: the
+    /// document does not mention them at all.
+    #[test]
+    fn the_honest_serialization_round_trips_in_memory() {
+        let config = every_field_set();
+        let text = serialize_honest(&config, Some(18)).expect("serialize");
+
+        let back = parse(&text).expect("the writer's output is a config file");
+        assert_eq!(back.version, config.version, "version");
+        assert_eq!(back.audio.volume, config.audio.volume, "audio.volume");
+        assert_eq!(back.audio.balance, config.audio.balance, "audio.balance");
+        assert_eq!(
+            back.audio.fadeout_ms, config.audio.fadeout_ms,
+            "audio.fadeout_ms"
+        );
+        assert_eq!(
+            back.audio.output_mode, config.audio.output_mode,
+            "audio.output_mode"
+        );
+        assert_eq!(
+            back.audio.replaygain, config.audio.replaygain,
+            "audio.replaygain"
+        );
+        assert_eq!(back.audio.device, config.audio.device, "audio.device");
+        assert_eq!(back.ui.skin, config.ui.skin, "ui.skin");
+        assert_eq!(back.ui.double_size, config.ui.double_size, "ui.double_size");
+        assert_eq!(
+            back.ui.always_on_top, config.ui.always_on_top,
+            "ui.always_on_top"
+        );
+        assert_eq!(back.ui.easy_move, config.ui.easy_move, "ui.easy_move");
+        assert_eq!(
+            back.ui.snap_distance, config.ui.snap_distance,
+            "ui.snap_distance"
+        );
+        assert_eq!(back.ui.windows, config.ui.windows, "ui.windows");
+        assert_eq!(back.eq.state, config.eq.state, "eq.state");
+        assert_eq!(
+            back.playlist.shuffle, config.playlist.shuffle,
+            "playlist.shuffle"
+        );
+        assert_eq!(
+            back.playlist.repeat, config.playlist.repeat,
+            "playlist.repeat"
+        );
+        assert_eq!(
+            back.plugins.plugin_dir, config.plugins.plugin_dir,
+            "plugins.plugin_dir"
+        );
+        assert_eq!(
+            back.plugins.disabled, config.plugins.disabled,
+            "plugins.disabled"
+        );
+
+        let document = toml::from_str::<toml::Value>(&text).expect("valid TOML");
+        for (table, key) in [
+            ("audio", "output"),
+            ("audio", "buffer_ms"),
+            ("audio", "gapless"),
+            ("playlist", "manual_advance"),
+            ("playlist", "last_playlist"),
+            ("plugins", "vis_plugin"),
+            ("plugins", "vis_preset"),
+        ] {
+            assert!(
+                value_at(&document, &[table, key]).is_none(),
+                "the setting {table}.{key} is not applied and must not be advertised:\n{text}"
+            );
+        }
+    }
+
+    /// The settings the player does not apply are never written, and they
+    /// come back at their documented defaults: the loader falls back to the
+    /// default for every one of them.
+    ///
+    /// The fixture sets them to non-default values, so the file would say
+    /// something different if the writer advertised them. The settings the
+    /// player *does* apply are the subject of the round trip above.
     #[test]
     fn unpersisted_fields_deliberately_fall_back_to_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unpersisted.toml");
 
-        let mut config = Config::default();
-        config.audio.volume = 180;
-        // Set deliberately unpersisted fields to non-default values:
-        config.audio.output = "cpal".into();
-        config.audio.buffer_ms = 450;
-        config.audio.fadeout_ms = 1200;
-        config.audio.gapless = false;
-        config.ui.snap_distance = 30;
-        config.playlist.shuffle = true;
-        config.playlist.repeat = true;
-        config.playlist.manual_advance = true;
-        config.playlist.last_playlist = Some(PathBuf::from("test.m3u"));
-        config.plugins.plugin_dir = Some(PathBuf::from("plugins"));
-        config.plugins.vis_plugin = Some("vis.dll".into());
-        config.plugins.vis_preset = Some("preset".into());
-        config.plugins.disabled = vec!["bad.dll".into()];
-
-        // replaygain, the device and the fade-out duration are now
-        // persisted, so set them non-default and expect them back.
-        config.audio.replaygain = rustamp_core::config::ReplayGainMode::Album;
-        config.audio.device = Some("Speakers (Realtek)".into());
+        let config = every_field_set();
 
         save(&config, None, &path).expect("save succeeds");
 
+        let text = std::fs::read_to_string(&path).expect("the file is there");
+        for (table, key) in [
+            ("audio", "output"),
+            ("audio", "buffer_ms"),
+            ("audio", "gapless"),
+            ("playlist", "manual_advance"),
+            ("playlist", "last_playlist"),
+            ("plugins", "vis_plugin"),
+            ("plugins", "vis_preset"),
+        ] {
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{key} ="))),
+                "the setting {table}.{key} is not applied and must not be written:\n{text}"
+            );
+        }
+
         let loaded = load(Some(&path)).expect("load succeeds");
-        // Persisted fields survive:
-        assert_eq!(loaded.config.audio.volume, 180);
-        assert_eq!(
-            loaded.config.audio.replaygain,
-            rustamp_core::config::ReplayGainMode::Album
-        );
-        assert_eq!(
-            loaded.config.audio.device,
-            Some("Speakers (Realtek)".to_string()),
-            "the honoured device survives the round trip"
-        );
-        assert_eq!(
-            loaded.config.audio.fadeout_ms, 1200,
-            "the honoured fade-out duration survives the round trip"
-        );
-        assert!(
-            loaded.config.playlist.shuffle,
-            "the honoured shuffle mode survives the round trip"
-        );
-        assert!(
-            loaded.config.playlist.repeat,
-            "the honoured repeat mode survives the round trip"
-        );
-        // Unpersisted fields cleanly revert to their documented defaults:
         assert_eq!(loaded.config.audio.output, Config::default().audio.output);
         assert_eq!(
             loaded.config.audio.buffer_ms,
             Config::default().audio.buffer_ms
         );
         assert_eq!(loaded.config.audio.gapless, Config::default().audio.gapless);
-        assert_eq!(loaded.config.ui.snap_distance, 30);
         assert!(!loaded.config.playlist.manual_advance);
         assert_eq!(loaded.config.playlist.last_playlist, None);
-        // The plug-in pages' two settings survive; the vis ones do not.
-        assert_eq!(
-            loaded.config.plugins.plugin_dir,
-            Some(PathBuf::from("plugins"))
-        );
-        assert_eq!(loaded.config.plugins.disabled, vec!["bad.dll".to_string()]);
         assert_eq!(loaded.config.plugins.vis_plugin, None);
         assert_eq!(loaded.config.plugins.vis_preset, None);
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
@@ -1061,7 +1382,7 @@ mod tests {
     fn ignored_fields_are_not_advertised() {
         let mut config = Config::default();
         config.audio.volume = 200;
-        config.audio.replaygain = rustamp_core::config::ReplayGainMode::Album;
+        config.audio.replaygain = ReplayGainMode::Album;
         config.audio.buffer_ms = 400;
         config.audio.fadeout_ms = 900;
         config.playlist.shuffle = true;
@@ -1122,10 +1443,7 @@ manual_advance = true
         let loaded = load(Some(&path)).expect("load succeeds");
         assert_eq!(loaded.config.audio.volume, 180);
         // replaygain is now honoured, so it no longer warns.
-        assert_eq!(
-            loaded.config.audio.replaygain,
-            rustamp_core::config::ReplayGainMode::Track
-        );
+        assert_eq!(loaded.config.audio.replaygain, ReplayGainMode::Track);
         // The device is honoured too: it is loaded, and it does not warn.
         assert_eq!(
             loaded.config.audio.device,
