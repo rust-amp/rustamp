@@ -27,6 +27,7 @@
 //! | two verbs (`Play`, `Enqueue`) per directory | [`Handler::Directory`] | matches |
 //! | the verbs live under the ProgIDs (S13 §4) | every key starts with the handler's key | matches |
 //! | `…\shell\Play\DropTarget` and `…\shell\Enqueue\DropTarget` exist | the model writes exactly those two key shapes per handler that has the verbs | matches (key shape) |
+//! | registration writes the same key set each time, and `/UNREG` is the matching removal (S13 §3, a reading) | [`install_into`] writes the same entries every time, [`uninstall_from`] takes exactly those back and leaves every foreign key | matches (reading) |
 //! | what the `DropTarget` entries carry | [`DROP_TARGET_VALUE`] | own choice (S13 §5.12) |
 //! | `Enqueue` is the display name of that verb | [`Verb::label`] is `Enqueue` | matches |
 //! | the display names of the other verbs | the verb name | own choice (S13 §5.11) |
@@ -62,7 +63,14 @@
 //! [`registry_entries`] is the whole registration as plain data — the keys and
 //! the values — and it is unit-tested without an operating system. Writing it
 //! needs the registry, so [`install`] and [`uninstall`] are VM-only.
+//!
+//! [`RegistryModel`] is the registry as plain data too: the values a
+//! registration owns. [`install_into`] and [`uninstall_from`] are the model's
+//! own install and removal steps, so that the properties can ask what the
+//! registration writes and what the removal takes with it — and what it
+//! leaves alone — without an operating system.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The ProgID of the media file handler (S13 §3).
@@ -249,30 +257,56 @@ pub struct Entry {
     pub value: String,
 }
 
+/// The entries a handler's verbs write (S13 §3).
+///
+/// The key of a verb is the key the handler's verbs live under, the verb's
+/// own name and the shape the shell expects: the `command` key of the verb
+/// and, for a verb that has one, its `DropTarget` key (S13 §3).
+pub fn verb_entries(handler: &str, verbs: &[Verb], exe: &Path) -> Vec<Entry> {
+    let exe = exe.display().to_string();
+    let mut entries = Vec::new();
+    for verb in verbs {
+        entries.push(Entry {
+            key: format!(r"{}\shell\{}\command", handler, verb.name),
+            name: String::new(),
+            value: format!("\"{exe}\" {}", verb.arguments),
+        });
+        if verb.drop_target {
+            entries.push(Entry {
+                key: format!(r"{}\shell\{}\DropTarget", handler, verb.name),
+                name: String::new(),
+                value: DROP_TARGET_VALUE.to_owned(),
+            });
+        }
+    }
+    entries
+}
+
 /// The registration's verb keys and values (S13 §3).
 ///
 /// The whole registration as plain data: the model is what the tests read,
 /// and [`install`] is what writes it.
 pub fn registry_entries(exe: &Path) -> Vec<Entry> {
-    let exe = exe.display().to_string();
     let mut entries = Vec::new();
     for handler in Handler::ALL {
-        for verb in handler.verbs() {
-            entries.push(Entry {
-                key: format!(r"{}\shell\{}\command", handler.key(), verb.name),
-                name: String::new(),
-                value: format!("\"{exe}\" {}", verb.arguments),
-            });
-            if verb.drop_target {
-                entries.push(Entry {
-                    key: format!(r"{}\shell\{}\DropTarget", handler.key(), verb.name),
-                    name: String::new(),
-                    value: DROP_TARGET_VALUE.to_owned(),
-                });
-            }
-        }
+        entries.extend(verb_entries(handler.key(), handler.verbs(), exe));
     }
     entries
+}
+
+/// The verb trees the removal step removes (S13 §3).
+///
+/// The tree of a verb is the key its own keys live under
+/// (`Winamp.File\shell\Play`): the removal step takes the whole tree with
+/// it, not only the keys the player wrote under it.
+pub fn verb_trees() -> Vec<String> {
+    let mut trees = Vec::new();
+    for handler in Handler::ALL {
+        for verb in handler.verbs() {
+            trees.push(format!(r"{}\shell\{}", handler.key(), verb.name));
+        }
+    }
+    trees
 }
 
 /// The file type entries of the registration (own choice; S13 §3 names the
@@ -301,6 +335,83 @@ pub fn file_type_associations() -> Vec<(&'static str, &'static str)> {
         out.push((*extension, SKIN_PROG_ID));
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// The registry as plain data
+// ---------------------------------------------------------------------------
+
+/// The registry as the model holds it.
+///
+/// The model is flat: an entry is a key path, a value name and the value's
+/// data — the three things [`Entry`] carries. The keys above them
+/// (`Winamp.File\shell\open`) exist in a real registry, but the registry
+/// creates them on the way, so the model does not hold them.
+///
+/// A key path is held as it was written. The registry's key names are
+/// case-insensitive, so the removal finds a key in any spelling; the model
+/// does not fold the spelling on the way in.
+pub type RegistryModel = BTreeMap<(String, String), String>;
+
+/// Writes `entries` into the model (the model's write step).
+///
+/// The same step as the Win32 half's write, but on plain data: a key that is
+/// written twice keeps the value of the last write, as the registry does.
+pub fn write_entries(model: &mut RegistryModel, entries: &[Entry]) {
+    for entry in entries {
+        model.insert((entry.key.clone(), entry.name.clone()), entry.value.clone());
+    }
+}
+
+/// Writes the registration into the model (the model's install step).
+///
+/// The same step as [`install`], without a registry: the model is the plain
+/// data the Win32 half writes.
+pub fn install_into(model: &mut RegistryModel, exe: &Path) {
+    write_entries(model, &registry_entries(exe));
+    write_entries(model, &file_type_entries());
+}
+
+/// Removes the registration from the model (the model's removal step).
+///
+/// The same step as [`uninstall`]: the verb trees of the player's own
+/// handlers go, and so does a file type association that points at the
+/// player. A foreign key stays — the player removes what it wrote, not what
+/// it finds.
+pub fn uninstall_from(model: &mut RegistryModel) {
+    for tree in verb_trees() {
+        model.retain(|(key, _), _| !is_below(key, &tree));
+    }
+    for (extension, prog_id) in file_type_associations() {
+        let association = format!(".{extension}");
+        // The association is the key's default value, and the key's name is
+        // case-insensitive in the registry: the association is found in any
+        // spelling. The value itself is compared as it is.
+        let ours: Vec<(String, String)> = model
+            .iter()
+            .filter(|((key, name), value)| {
+                name.is_empty() && is_the_key(key, &association) && value.as_str() == prog_id
+            })
+            .map(|((key, name), _)| (key.clone(), name.clone()))
+            .collect();
+        for key in ours {
+            model.remove(&key);
+        }
+    }
+}
+
+/// Whether the key `key` is the key `tree`, whatever its spelling.
+///
+/// The registry's key names are case-insensitive, so the comparison is too.
+fn is_the_key(key: &str, tree: &str) -> bool {
+    key.to_lowercase() == tree.to_lowercase()
+}
+
+/// Whether the key `key` is the tree `tree` or lies below it.
+fn is_below(key: &str, tree: &str) -> bool {
+    let key = key.to_lowercase();
+    let tree = tree.to_lowercase();
+    key == tree || key.starts_with(&format!("{tree}\\"))
 }
 
 /// The registration switches of the command line (S13 §1).
@@ -388,7 +499,7 @@ pub fn install(exe: &Path) -> Result<(), RegistrationError> {
 /// player loses the association.
 #[cfg(windows)]
 pub fn uninstall() -> Result<(), RegistrationError> {
-    imp::uninstall(&Handler::ALL, &file_type_associations())
+    imp::uninstall()
 }
 
 /// Writes the registration (S13 §1, `/INSTALL`).
@@ -433,7 +544,7 @@ mod imp {
     };
     use windows::core::PCWSTR;
 
-    use super::{Entry, Handler, RegistrationError};
+    use super::{Entry, RegistrationError};
 
     /// The classes root the registration lives under (own choice).
     const CLASSES: &str = r"Software\Classes";
@@ -441,34 +552,30 @@ mod imp {
     /// Writes every entry below the classes root.
     pub fn install(entries: &[Entry], file_types: &[Entry]) -> Result<(), RegistrationError> {
         let root = open_key(HKEY_CURRENT_USER, CLASSES, KEY_ALL_ACCESS)?;
-        let result = write_entries(root, entries).and_then(|()| write_entries(root, file_types));
+        let result = write_all(root, entries).and_then(|()| write_all(root, file_types));
         close_key(root);
         result
     }
 
     /// Removes the verb keys and the file type associations of the player.
-    pub fn uninstall(
-        handlers: &[Handler],
-        file_types: &[(&'static str, &'static str)],
-    ) -> Result<(), RegistrationError> {
+    pub fn uninstall() -> Result<(), RegistrationError> {
         let root = open_key(HKEY_CURRENT_USER, CLASSES, KEY_ALL_ACCESS)?;
         let mut result = Ok(());
-        for handler in handlers {
-            for verb in handler.verbs() {
-                let key = format!(r"{}\shell\{}", handler.key(), verb.name);
-                if let Err(error) = delete_tree(root, &key) {
-                    result = Err(error);
-                }
+        for tree in super::verb_trees() {
+            if let Err(error) = delete_tree(root, &tree) {
+                result = Err(error);
             }
+        }
+        for handler in super::Handler::ALL {
             // The handler key itself is removed when the player wrote all of
             // it; a handler that carries more (another player's registration)
             // keeps its content and only loses the verbs above.
             let _ = delete_key(root, &format!(r"{}\shell", handler.key()));
             let _ = delete_key(root, handler.key());
         }
-        for (extension, prog_id) in file_types {
+        for (extension, prog_id) in super::file_type_associations() {
             let key = format!(".{extension}");
-            if read_default_value(root, &key).as_deref() == Some(*prog_id) {
+            if read_default_value(root, &key).as_deref() == Some(prog_id) {
                 if let Err(error) = delete_value(root, &key, "") {
                     result = Err(error);
                 }
@@ -491,7 +598,7 @@ mod imp {
     }
 
     /// Writes every entry below `root`.
-    fn write_entries(root: HKEY, entries: &[Entry]) -> Result<(), RegistrationError> {
+    fn write_all(root: HKEY, entries: &[Entry]) -> Result<(), RegistrationError> {
         for entry in entries {
             let handle = open_key(root, &entry.key, KEY_WRITE)?;
             let status = unsafe {
@@ -673,6 +780,8 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod props;
 
     /// The verbs of a handler, by name.
     fn verb_names(handler: Handler) -> Vec<&'static str> {
