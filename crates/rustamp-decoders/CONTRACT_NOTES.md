@@ -201,6 +201,48 @@ Behaviour the core contract leaves open, and what the decoders do.
   estimate is used for the duration: good enough for a display, and no
   evidence at all that the file was cut.
 
+## Opus decoder (`opus_dec.rs`)
+
+Symphonia ships no Opus codec: no published version of the crate has an `opus`
+feature, and `symphonia-codec-opus` does not exist on crates.io. What symphonia
+does have is the Ogg mapping - its demuxer reads the Opus identification header
+and states the codec parameters - so only the codec itself was missing. This
+crate brings its own (`opus-rs`, a pure-Rust port of the reference
+implementation) and registers it in a codec registry of its own, next to the
+codecs symphonia enables.
+
+- **The codec** decodes mono and stereo streams at 48 kHz, the rate Opus always
+  runs at. A stream that states another rate, or more than two channels, is
+  refused by name when it is opened
+  (`Error::UnsupportedFormat("opus: only mono and stereo streams are
+  supported")`). A packet the codec cannot decode is skipped and counted like
+  any other damaged packet.
+- **The pre-skip** is the number of samples at the start of an Opus stream that
+  are the encoder's look-ahead and not audio; the identification header states
+  it. Symphonia's Ogg reader leaves those samples in the stream: the granule
+  position of an Ogg Opus stream counts the pre-skip (RFC 7845), and the
+  reader's timestamp arithmetic does not account for that. The codec drops
+  them, so a file delivers exactly the samples of its audio - the same 72000
+  samples a reference decoder delivers for the repository fixture.
+- **The duration** follows from the same correction: the granule position of
+  the last page counts the pre-skip, so the number of audio frames is the
+  granule minus the pre-skip. The duration of the fixture is 1.5 s, not the
+  1.5065 s the granule alone would state.
+- **The timestamps** of an Ogg Opus stream count the pre-skip samples, so they
+  are ahead of the audio by exactly that many samples. A seek asks for the
+  timestamp of the sample and not the one of the audio before it, and lands on
+  the exact sample it asked for.
+- **The end of the stream** is the end-of-stream flag of the last Ogg page, as
+  for every other Ogg file: the oracle of the Ogg container applies to an Opus
+  file unchanged (see the Ogg header above).
+- **Only the Ogg mapping carries an Opus stream.** The Matroska mapping of
+  symphonia states neither the channel count nor the rate of an Opus track
+  (it hands the codec private data to the codec and nothing else), so an Opus
+  stream in a Matroska file is refused by name
+  (`Error::UnsupportedFormat("opus: the stream states no channel count")`).
+  The pre-skip correction above is the one of the Ogg granule, and it is not
+  applied to a container whose granule convention is not known here.
+
 ## Wave decoder (`wave_dec.rs`)
 
 The RIFF/WAVE PCM decoder is the second factory (see below). What it does where

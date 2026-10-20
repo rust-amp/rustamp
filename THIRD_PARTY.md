@@ -118,6 +118,7 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `ab_glyph` | Safe CPU rasterization of playlist system-font glyphs | ui |
 | `embed-manifest` | Build-time: embeds the Windows application manifest (Common Controls 6 for the native preferences dialog) | app (build script) |
 | `symphonia` | Audio decoding/demuxing | decoders; MPL-2.0, not permissive |
+| `opus-rs` | Opus codec for the symphonia pipeline (symphonia ships no Opus codec) | decoders; BSD-3-Clause, permissive |
 | `hound` | WAV test fixtures | decoders (dev) |
 | `rusqlite` | SQLite-backed media library index | library; app (dev, the test that writes a row whose path the file system refuses to name) |
 | `image` | Cover-art decoding for the media library's artwork cache (JPEG and PNG only) | library |
@@ -129,13 +130,15 @@ is not in this lockfile and is deliberately not recorded as already used.
 
 ## Complete Cargo.lock license inventory
 
-Snapshot: 2026-10-19, **319 external package versions**, all from crates.io.
+Snapshot: 2026-10-20, **320 external package versions**, all from crates.io.
 `Cargo.lock` records names/versions/sources/checksums, **not licenses**; licenses
 below are the exact cached package-manifest declarations returned by
 `cargo metadata --offline --locked --all-features --format-version 1`.
 Legacy `/` means alternative licensing; do not replace `AND` with `OR`.
 The Symphonia family is MPL-2.0; `r-efi` has an LGPL alternative but also MIT
 and Apache alternatives. Neither is in a protected Windows normal closure.
+`opus-rs` (BSD-3-Clause) is the Opus codec of `rustamp-decoders`; it is
+permissive and enters the GPL player, not a protected closure.
 
 Regenerate the marked block with
 `python .github/scripts/license-audit.py --inventory`, review the lock/manifest
@@ -305,6 +308,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `objc2-user-notifications` | `0.2.2` | `MIT` | `crates.io` |
 | `ogg_pager` | `0.7.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `once_cell` | `1.21.4` | `MIT OR Apache-2.0` | `crates.io` |
+| `opus-rs` | `0.1.37` | `BSD-3-Clause` | `crates.io` |
 | `orbclient` | `0.3.55` | `MIT` | `crates.io` |
 | `owned_ttf_parser` | `0.25.1` | `Apache-2.0` | `crates.io` |
 | `paste` | `1.0.15` | `MIT OR Apache-2.0` | `crates.io` |

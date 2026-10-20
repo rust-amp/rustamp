@@ -57,7 +57,7 @@ use rustamp_core::error::{Error, Result};
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::state::StreamInfo;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{CODEC_TYPE_NULL, CodecParameters, DecoderOptions};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, CODEC_TYPE_OPUS, CodecParameters, DecoderOptions};
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
@@ -94,8 +94,8 @@ const SEEK_PREROLL_FRAMES: u64 = 4096;
 pub(crate) const MAX_SEEK_FRAMES: u64 = 1 << 53;
 
 const EXTENSIONS: &[&str] = &[
-    "mp3", "mp2", "mp1", "flac", "ogg", "oga", "wav", "wave", "aif", "aiff", "aifc", "caf", "m4a",
-    "m4b", "mp4", "aac", "mkv", "mka",
+    "mp3", "mp2", "mp1", "flac", "ogg", "oga", "opus", "wav", "wave", "aif", "aiff", "aifc", "caf",
+    "m4a", "m4b", "mp4", "aac", "mkv", "mka",
 ];
 
 // ---------------------------------------------------------------------------
@@ -721,6 +721,14 @@ pub struct SymphoniaDecoder {
     /// end of its stream with a flag on its last page instead of with a
     /// count, so it has no entry in [`declared`] (see [`ogg_truncation`]).
     ogg: Option<crate::ogg_header::OggPages>,
+    /// The number of samples the container's timestamps are ahead of the
+    /// audio.
+    ///
+    /// The timestamps of an Ogg Opus stream count the pre-skip samples - the
+    /// encoder's look-ahead, which the codec drops (see
+    /// [`crate::opus_dec`]). A seek has to ask for the timestamp of the
+    /// sample, not the one of the audio before it.
+    ts_offset: u64,
     /// A truncation found at the end of the stream.
     ///
     /// Reported by the next `read` that writes no frames, so the frames that
@@ -812,7 +820,7 @@ impl SymphoniaDecoder {
             .ok_or_else(|| Error::UnsupportedFormat("no decodable audio track".into()))?;
         let track_id = track.id;
         let params = track.codec_params.clone();
-        let codec = symphonia::default::get_codecs()
+        let codec = crate::opus_dec::codec_registry()
             .make(&params, &DecoderOptions::default())
             .map_err(open_err)?;
 
@@ -828,12 +836,24 @@ impl SymphoniaDecoder {
             apply_tags(&mut meta, rev);
         }
 
+        // The frame count the container states is not always the number of
+        // audio frames: the Ogg Opus granule counts the pre-skip samples
+        // (see `opus_dec::audio_frames`).
+        let is_ogg = header.ogg.is_some();
+        // The timestamps of an Ogg Opus stream count the pre-skip samples, so
+        // they are ahead of the audio by exactly that many samples.
+        let ts_offset = if is_ogg && params.codec == CODEC_TYPE_OPUS {
+            crate::opus_dec::pre_skip(params.extra_data.as_deref()) as u64
+        } else {
+            0
+        };
+
         let mut this = SymphoniaDecoder {
             format,
             codec,
             track_id,
             spec: AudioSpec::new(params.sample_rate.unwrap_or(0), 0),
-            n_frames: params.n_frames,
+            n_frames: crate::opus_dec::audio_frames(&params, is_ogg),
             sample_buf: None,
             pending: Vec::new(),
             pending_pos: 0,
@@ -842,6 +862,7 @@ impl SymphoniaDecoder {
             delivered: 0,
             declared: declared_payload(&header, &params, byte_len),
             ogg: header.ogg,
+            ts_offset,
             truncation: None,
             skipped: 0,
             consecutive_errors: 0,
@@ -1103,7 +1124,10 @@ impl Decoder for SymphoniaDecoder {
         // Seek slightly early and discard the lead-in: overlapping transforms (MP3, Vorbis,
         // AAC) need previous blocks to reconstruct the first samples exactly.
         let pre = target_frames.min(SEEK_PREROLL_FRAMES);
-        let from = target_frames - pre;
+        // The container's timestamps can be ahead of the audio (the Ogg Opus
+        // timestamps count the pre-skip samples), so the target is asked for
+        // in the container's timeline.
+        let from = (target_frames + self.ts_offset).saturating_sub(pre);
         // Half a frame of slack so the time-to-timestamp conversion cannot round down.
         let frac = ((from % rate) as f64 + 0.5) / rate as f64;
         let time = Time::new(from / rate, frac);

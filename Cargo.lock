@@ -1496,6 +1496,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "opus-rs"
+version = "0.1.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1880f411a21320dcb546c8f38f05ffb75643362ee0235437487999ed543e26ae"
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1820,6 +1826,7 @@ name = "rustamp-decoders"
 version = "0.1.0"
 dependencies = [
  "hound",
+ "opus-rs",
  "rustamp-core",
  "symphonia",
  "tempfile",

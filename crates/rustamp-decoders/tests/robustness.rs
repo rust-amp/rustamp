@@ -1583,6 +1583,14 @@ fn ogg_checksum(bytes: &[u8], at: usize) -> u32 {
 /// the marker that says "the stream ends here" is gone.
 fn ogg_clear_end_of_stream(bytes: &mut [u8], at: usize) {
     bytes[at + 5] &= !0x04;
+    ogg_write_checksum(bytes, at);
+}
+
+/// Writes the checksum of the page at `at` into its header.
+///
+/// A page whose content changed needs a new checksum, otherwise the reader
+/// skips it as damaged - and the test would measure the wrong thing.
+fn ogg_write_checksum(bytes: &mut [u8], at: usize) {
     let checksum = ogg_checksum(bytes, at);
     bytes[at + 22..at + 26].copy_from_slice(&checksum.to_le_bytes());
 }
@@ -1782,6 +1790,140 @@ fn a_file_that_is_not_an_ogg_is_not_named_as_one() {
         matches!(outcome, Drained::End),
         "another format is not an Ogg file: {outcome:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Opus: the same Ogg oracle, and the codec behind it
+// ---------------------------------------------------------------------------
+
+/// The number of frames the Opus fixture holds: 1.5 s at 48 kHz.
+const OPUS_FRAMES: u64 = 48_000 * 3 / 2;
+
+/// The intact Opus file plays to its end and ends with a plain end of stream.
+///
+/// An Opus file is an Ogg file, so the oracle of the Ogg container applies to
+/// it unchanged: the last page of the file carries the end-of-stream flag.
+#[test]
+fn an_intact_opus_ends_with_a_clean_end_of_stream() {
+    let bytes = std::fs::read(fixture("sine.opus")).expect("fixture");
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("opus"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(matches!(outcome, Drained::End), "{outcome:?}");
+    assert_eq!(
+        frames, OPUS_FRAMES,
+        "the file holds every sample of its audio"
+    );
+}
+
+/// A complete Opus file whose end-of-stream flag is gone is a cut file.
+///
+/// The decision the oracle rests on does not depend on the codec: the marker
+/// is the only thing that says where the stream ends, so a file without it
+/// says that more is to come - even when every byte of its audio is there.
+#[test]
+fn an_opus_without_an_end_of_stream_flag_is_called_truncated() {
+    let mut bytes = std::fs::read(fixture("sine.opus")).expect("fixture");
+    let (last_at, _) = *ogg_pages(&bytes).last().expect("the fixture has pages");
+    ogg_clear_end_of_stream(&mut bytes, last_at);
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("opus"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        frames >= OPUS_FRAMES,
+        "the audio of the file is all there: {frames} frames"
+    );
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => {
+            assert!(
+                message.contains("truncated"),
+                "the failure must name the truncation: {message}"
+            );
+            assert!(
+                message.contains("end-of-stream flag"),
+                "the failure must name the missing marker: {message}"
+            );
+        }
+        other => panic!("a file without the end-of-stream flag must fail loudly: {other:?}"),
+    }
+}
+
+/// An Opus file that was cut before its end-of-stream page is a loud failure.
+///
+/// The end of an Ogg stream is a flag on the last page, so a file whose last
+/// page does not carry it was cut.
+#[test]
+fn an_opus_cut_before_the_end_of_stream_page_is_a_loud_failure() {
+    let bytes = std::fs::read(fixture("sine.opus")).expect("fixture");
+    let pages = ogg_pages(&bytes);
+    let (last_at, _) = *pages.last().expect("the fixture has pages");
+    let cut = bytes[..last_at].to_vec();
+    let mut d = SymphoniaDecoder::open(reader_source(cut, Some("opus"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    assert!(
+        frames < OPUS_FRAMES,
+        "a cut file must not yield the full {OPUS_FRAMES} frames: {frames}"
+    );
+    match outcome {
+        Drained::Failed(Error::Decode(message)) => assert!(
+            message.contains("truncated"),
+            "the failure must name the truncation: {message}"
+        ),
+        other => panic!("a cut file must fail loudly, not end the stream: {other:?}"),
+    }
+}
+
+/// Damage is not a cut file.
+///
+/// The last page of the file is damaged: its checksum does not match, so the
+/// page that would say "the stream ends here" cannot be read. The file holds
+/// all of its bytes and plays them, and it is not called truncated.
+#[test]
+fn a_damaged_opus_page_is_not_called_truncated() {
+    let mut bytes = std::fs::read(fixture("sine.opus")).expect("fixture");
+    let (last_at, last_end) = *ogg_pages(&bytes).last().expect("the fixture has pages");
+    let segments = usize::from(bytes[last_at + 26]);
+    for byte in &mut bytes[last_at + 27 + segments..last_end] {
+        *byte ^= 0xA5;
+    }
+    let mut d = SymphoniaDecoder::open(reader_source(bytes, Some("opus"))).expect("open");
+    let (frames, outcome) = drain_bounded(&mut d);
+    if let Drained::Failed(Error::Decode(message)) = &outcome {
+        assert!(
+            !message.contains("truncated"),
+            "a damaged file is not a cut file: {message}"
+        );
+    }
+    assert!(
+        frames <= OPUS_FRAMES,
+        "the file holds no more than its samples: {frames}"
+    );
+}
+
+/// An Opus stream with more than two channels is refused by name.
+///
+/// The Opus codec decodes one or two channels; a stream that states more
+/// needs the multistream decoder, which this crate does not have. The
+/// refusal names the reason instead of failing somewhere inside the codec.
+#[test]
+fn an_opus_stream_with_more_than_two_channels_is_refused_by_name() {
+    let mut bytes = std::fs::read(fixture("sine.opus")).expect("fixture");
+    // The identification header of the stream: the signature, the version,
+    // the channel count, the pre-skip, the rate of the original material, the
+    // gain and the channel mapping family.
+    let (head_at, _) = ogg_pages(&bytes)[0];
+    let header_at = head_at + 28;
+    bytes[header_at + 9] = 3; // three channels
+    bytes[header_at + 18] = 1; // the Vorbis channel mapping
+    ogg_write_checksum(&mut bytes, head_at);
+    let err = SymphoniaDecoder::open(reader_source(bytes, Some("opus")))
+        .err()
+        .expect("a stream with three channels cannot be decoded");
+    match err {
+        Error::UnsupportedFormat(message) => assert!(
+            message.contains("mono and stereo"),
+            "the refusal must name the reason: {message}"
+        ),
+        other => panic!("unexpected error kind: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

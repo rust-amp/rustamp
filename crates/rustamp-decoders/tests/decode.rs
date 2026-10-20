@@ -15,6 +15,15 @@ use rustamp_decoders::{SymphoniaDecoder, SymphoniaDecoderFactory, default_regist
 const RATE: u32 = 44_100;
 const FIXTURE_FRAMES: u64 = RATE as u64 * 3 / 2;
 
+/// The rate an Opus stream is decoded at.
+///
+/// Opus always runs at 48 kHz: the rate of the codec is fixed and the
+/// container states it.
+const OPUS_RATE: u32 = 48_000;
+
+/// The number of frames the Opus fixture holds: 1.5 s at 48 kHz.
+const OPUS_FRAMES: u64 = OPUS_RATE as u64 * 3 / 2;
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -255,6 +264,109 @@ fn vorbis_decodes_gapless_length() {
     check_fixture("sine.ogg", 1);
 }
 
+/// An Opus file holds exactly the samples of its audio.
+///
+/// The count is the point: the samples at the start of an Opus stream are the
+/// encoder's look-ahead and the samples at its end are padding, and neither is
+/// audio. A decoder that delivers them would play 312 samples too much and
+/// would place the start of the file 6.5 ms late.
+#[test]
+fn opus_decodes_exact_length() {
+    let mut d = open_path("sine.opus");
+    assert_eq!(d.spec(), AudioSpec::new(OPUS_RATE, 2));
+    assert_eq!(d.duration(), Some(Duration::from_millis(1500)));
+    let out = read_all(d.as_mut());
+    let frames = (out.len() / 2) as u64;
+    assert_eq!(
+        frames, OPUS_FRAMES,
+        "the file holds every sample of its audio, and nothing else"
+    );
+    let mid = &out[out.len() / 2..out.len() / 2 + 2000];
+    let peak = mid.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+    assert!(peak > 0.05 && peak <= 1.05, "opus: peak {peak}");
+    let info = d.stream_info();
+    assert_eq!(info.sample_rate_hz, OPUS_RATE);
+    assert_eq!(info.channels, 2);
+    assert!(info.bitrate_kbps.is_some_and(|b| b > 0), "opus bitrate");
+    assert!(d.is_seekable());
+}
+
+/// The decoded audio is the sine the file holds, not noise.
+///
+/// The fixture is a 440 Hz sine wave, so the decoded signal crosses zero
+/// twice per period and the number of crossings names the frequency. A
+/// decoder that produced noise or silence would not cross zero at that rate.
+#[test]
+fn the_opus_audio_is_the_sine_the_file_holds() {
+    let mut d = open_path("sine.opus");
+    let out = read_all(d.as_mut());
+    // The left channel of the second half of the file.
+    let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+    let mid = &left[OPUS_RATE as usize / 2..OPUS_RATE as usize];
+    let crossings = mid
+        .windows(2)
+        .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+        .count();
+    let hz = crossings as f64 * f64::from(OPUS_RATE) / 2.0 / mid.len() as f64;
+    assert!(
+        (hz - 440.0).abs() < 2.0,
+        "the decoded signal is not a 440 Hz sine: {hz} Hz"
+    );
+}
+
+/// The frame of the full decode that matches the audio after a seek best.
+///
+/// A seek that lands on the wrong sample finds its best match a few samples
+/// away from the target, so the offset of the best match is the sample
+/// accuracy of the seek. The codec rebuilds its state from the lead-in of the
+/// seek, so the two signals are not identical - but they are the same signal.
+fn best_match(full: &[f32], seeked: &[f32], channels: usize, expect: usize) -> usize {
+    let window = 64usize;
+    let start = expect.saturating_sub(window);
+    let end = (expect + window).min(full.len() / channels);
+    (start..end)
+        .map(|frame| {
+            let mut sum = 0.0f64;
+            for i in 0..seeked.len() {
+                let d = f64::from(full[frame * channels + i]) - f64::from(seeked[i]);
+                sum += d * d;
+            }
+            (sum, frame)
+        })
+        .min_by(|a, b| a.0.partial_cmp(&b.0).expect("no NaN in the signal"))
+        .expect("the window holds frames")
+        .1
+}
+
+/// A seek lands on the exact sample it asked for.
+///
+/// The Opus codec rebuilds its state from the lead-in of the seek, so the
+/// first samples after the seek differ a little from the ones of a decode
+/// that ran from the beginning - but the seek lands on the right sample.
+#[test]
+fn opus_seek_is_sample_accurate() {
+    let mut d = open_path("sine.opus");
+    let ch = usize::from(d.spec().channels);
+    let full = read_all(d.as_mut());
+    for ms in [0u64, 300, 1000, 1400] {
+        let at = Duration::from_millis(ms);
+        let got = d.seek(at).unwrap();
+        assert!(
+            got.abs_diff(at) < Duration::from_millis(1),
+            "opus {ms} ms: {got:?}"
+        );
+        let mut buf = vec![0.0f32; 400 * ch];
+        let n = d.read(&mut buf).unwrap();
+        assert!(n > 0, "opus {ms} ms: nothing after the seek");
+        let expect = (at.as_secs_f64() * f64::from(OPUS_RATE)).round() as usize;
+        assert_eq!(
+            best_match(&full, &buf[..n * ch], ch, expect),
+            expect,
+            "opus {ms} ms: the seek landed on the wrong sample"
+        );
+    }
+}
+
 #[test]
 fn aac_m4a_decodes() {
     check_fixture("sine_aac.m4a", 2048);
@@ -340,6 +452,12 @@ fn metadata_roundtrip() {
     let m = open_path("sine.ogg").metadata();
     assert_eq!(m.title.as_deref(), Some("Sine Title"));
     assert_eq!(m.artist.as_deref(), Some("Test Artist"));
+
+    // An Opus file carries its tags in the Opus comment header, which holds
+    // the same Vorbis comments as an Ogg Vorbis file.
+    let m = open_path("sine.opus").metadata();
+    assert_eq!(m.title.as_deref(), Some("Sine Title"));
+    assert_eq!(m.artist.as_deref(), Some("Test Artist"));
 }
 
 #[test]
@@ -353,6 +471,7 @@ fn probe_scores() {
     };
     assert_eq!(p(Some("mp3"), b""), Confidence::EXTENSION);
     assert_eq!(p(Some("FLAC"), b""), Confidence::EXTENSION);
+    assert_eq!(p(Some("opus"), b""), Confidence::EXTENSION);
     assert_eq!(p(Some("txt"), b""), Confidence::NONE);
     assert_eq!(p(None, b"hello world, not audio"), Confidence::NONE);
     assert_eq!(p(None, b"ID3\x04\0\0\0\0\0\0"), Confidence::CONTENT);
@@ -371,6 +490,7 @@ fn probe_scores() {
         "sine.flac",
         "sine.mp3",
         "sine.ogg",
+        "sine.opus",
         "sine_aac.m4a",
         "sine_alac.m4a",
     ] {
@@ -383,7 +503,7 @@ fn probe_scores() {
 #[test]
 fn registry_lists_extensions() {
     let exts = default_registry().extensions();
-    for e in ["mp3", "flac", "ogg", "wav", "aiff", "m4a"] {
+    for e in ["mp3", "flac", "ogg", "opus", "wav", "aiff", "m4a"] {
         assert!(exts.iter().any(|x| x == e), "{e}");
     }
 }
