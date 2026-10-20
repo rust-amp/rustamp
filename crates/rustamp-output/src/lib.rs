@@ -90,6 +90,9 @@
 
 mod null;
 
+#[cfg(test)]
+mod properties;
+
 pub mod recovery;
 pub mod selection;
 

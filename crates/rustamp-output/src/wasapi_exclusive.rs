@@ -32,11 +32,30 @@
 //!    played in shared mode instead, and the downgrade is reported — never
 //!    silent. See [`crate::WasapiOutput::downgrade_reason`].
 //!
+//! # The sample conversion
+//!
+//! The engine hands the backend interleaved `f32` frames, and the device
+//! wants its own representation. The conversion is the last step of the
+//! chain, and it has two rules:
+//!
+//! * **A sample outside `-1.0..=1.0` is clamped** to full scale. It never
+//!   wraps around into the other half of the range.
+//! * **A sample that is not a number is silence.** NaN, +∞ and -∞ carry no
+//!   information, and a device that is handed a full-scale step would click.
+//!   This is the policy of the whole chain — the engine cleans the samples
+//!   before they reach a device, and so does the limiter — and the backend
+//!   keeps it in the conversion itself.
+//!
+//! The **float layout is a pass-through**: the device wants `f32`, so the
+//! sample is copied bit for bit and the two rules above do not apply to it.
+//!
 //! # What is testable here and what is not
 //!
 //! Everything in this module that does not need a device is a pure function
 //! over plain data: the format selection, the period selection and the
-//! sample conversion. Those are unit tested without an audio endpoint.
+//! sample conversion. Those are unit tested without an audio endpoint, and
+//! the property suite of this crate states their invariants over randomly
+//! drawn inputs.
 //!
 //! The real exclusive open — a device that really grants an exclusive
 //! stream, or really refuses one — needs real hardware and is therefore
@@ -190,16 +209,18 @@ pub(crate) struct ExclusivePlan {
 ///    exclusive mode and the player can drive its channel count. The stream
 ///    then runs at the rate the device wants, and the engine converts the
 ///    source to it — or not at all, when the rates agree.
-/// 2. **The device's own rate and layout win** when its own format has more
-///    channels than the player drives: the stream is then opened with the
-///    channel count the player can fill.
-/// 3. **A format that matches the source wins** when the device's own
-///    format is refused: the engine then needs no conversion at all.
+/// 2. **The device's own rate and layout win** when the device does not
+///    accept its own format: the stream is then opened with the channel
+///    count the player can fill, and the device's rate needs no
+///    resampling.
+/// 3. **A format that matches the source wins** when the device does not
+///    accept its own format and no accepted format keeps the device's own
+///    rate and layout: the engine then needs no conversion at all.
 /// 4. **The best remaining accepted format wins** otherwise, the one at the
 ///    device's own rate first.
-/// 5. **No accepted format at all** means there is no exclusive stream. The
-///    answer is `None`, and the caller falls back to shared mode and reports
-///    the downgrade — it is never a silent success.
+/// 5. **No accepted format the player can drive at all** means there is no
+///    exclusive stream. The answer is `None`, and the caller falls back to
+///    shared mode and reports the downgrade — it is never a silent success.
 pub(crate) fn plan(
     source: AudioSpec,
     native: DeviceFormat,
@@ -404,19 +425,38 @@ pub(crate) fn write_samples(samples: &[f32], layout: SampleLayout, out: &mut [u8
 ///
 /// The sample is scaled to the full-scale value of the format and clamped,
 /// so a sample outside `-1.0..=1.0` cannot wrap around.
+///
+/// A sample that is **not a number** — NaN, +∞ or -∞ — becomes silence: it
+/// carries no information, and a device that is handed a full-scale step
+/// would click. This is the policy of the whole chain (the engine cleans the
+/// samples before they reach a device, and so does the limiter), and the
+/// backend keeps it in the conversion itself.
 fn to_i16(value: f32) -> i16 {
+    if !value.is_finite() {
+        return 0;
+    }
     let scaled = (f64::from(value) * 32_767.0).round();
     scaled.clamp(-32_768.0, 32_767.0) as i16
 }
 
 /// A `f32` sample as a 24-bit integer.
+///
+/// A sample that is not a number becomes silence, as in [`to_i16`].
 fn to_i24(value: f32) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
     let scaled = (f64::from(value) * 8_388_607.0).round();
     scaled.clamp(-8_388_608.0, 8_388_607.0) as i32
 }
 
 /// A `f32` sample as a 32-bit integer.
+///
+/// A sample that is not a number becomes silence, as in [`to_i16`].
 fn to_i32(value: f32) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
     let scaled = (f64::from(value) * 2_147_483_647.0).round();
     scaled.clamp(-2_147_483_648.0, 2_147_483_647.0) as i32
 }
@@ -688,7 +728,10 @@ mod tests {
     }
 
     #[test]
-    fn a_non_finite_sample_does_not_become_noise() {
+    fn a_non_finite_sample_becomes_silence() {
+        // A sample that is not a number carries no information, and a device
+        // that is handed a full-scale step would click: the conversion writes
+        // silence for it. (The property suite covers every integer layout.)
         let samples = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
         let mut out = vec![0u8; samples.len() * 2];
         write_samples(&samples, SampleLayout::Int16, &mut out);
@@ -698,6 +741,6 @@ mod tests {
             .iter()
             .map(|c| i16::from_le_bytes(*c))
             .collect();
-        assert_eq!(read, vec![0, 32_767, -32_768]);
+        assert_eq!(read, vec![0, 0, 0]);
     }
 }
