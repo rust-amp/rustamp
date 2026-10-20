@@ -23,7 +23,7 @@ use rustamp_core::state::{StreamInfo, TransportState, WindowId};
 
 use crate::layout::{BALANCE_THUMB_SIZE, MainWindowLayout, VOLUME_THUMB_SIZE};
 use crate::state::{MainWindowState, MonoStereo};
-use crate::visualization::{VisError, VisMode, Visualizer};
+use crate::visualization::{Geometry, VisError, VisMode, Visualizer};
 use crate::widget::{Widget, hit_test};
 use rustamp_core::vis::VisFrame;
 
@@ -152,6 +152,9 @@ impl MainWindow {
         machine
             .visualization
             .set_mode(machine.state.visualization.mode);
+        machine
+            .visualization
+            .set_geometry(analyser_geometry(machine.state.windowshade));
         machine.refresh(0);
         machine
     }
@@ -176,7 +179,8 @@ impl MainWindow {
     ///
     /// The app must drain `Engine::take_vis_frame()` in its pump, after transport
     /// and stream events. This UI-only method does not depend on the engine.
-    /// Decode-ahead selection/latency and all reference S08 laws remain open.
+    /// Decode-ahead selection/latency and the S08 laws that are still open
+    /// remain open.
     ///
     /// A returned [`VisError`] is an analysis report, never a playback error:
     /// [`VisError::NonFinitePcm`] is an offline validation invariant that the
@@ -464,6 +468,10 @@ impl MainWindow {
             }
             Command::ToggleWindowShade(WindowId::Main) => {
                 self.state.windowshade = !self.state.windowshade;
+                // S08 §1: the shaded window has its own analyser, five bands
+                // in 38 x 5 px, so the display starts empty again.
+                self.visualization
+                    .set_geometry(analyser_geometry(self.state.windowshade));
             }
             _ => {}
         }
@@ -687,6 +695,18 @@ fn clamp_position(to_ms: u64, duration_ms: Option<u64>) -> u64 {
     match duration_ms {
         Some(duration) => to_ms.min(duration),
         None => to_ms,
+    }
+}
+
+/// The analyser area the main window has in its current form (S08 §1).
+///
+/// The normal window shows 76 x 16 px with ten bands, the shaded window
+/// 38 x 5 px with five.
+fn analyser_geometry(windowshade: bool) -> Geometry {
+    if windowshade {
+        Geometry::Shaded
+    } else {
+        Geometry::Normal
     }
 }
 

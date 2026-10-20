@@ -109,10 +109,20 @@ pub struct MainWindowLayout {
     pub play_indicator: Rect,
     /// The decoder-active/idle indicator at (24,28), 3 x 9 (S01 §2.1, verified).
     pub decoder_indicator: Rect,
-    /// Own-choice spectrum/scope area below the time display: (24,43,76,16).
-    /// S01 only anchors the indicator, not the analyser extent. Reference grade
-    /// **open**, S08 measurement Q8; this must not be called S01-measured.
+    /// Spectrum/scope area below the time display: (24,43,76,16).
+    ///
+    /// S01 only anchors the indicator, not the analyser extent, so this must
+    /// not be called S01-measured. S08 §1 settles the area's **size**, 76 x 16
+    /// px with ten bands; its **position** is still our own choice (S08 open
+    /// question 13).
     pub visualization: Rect,
+    /// Own-choice spectrum/scope area of the **shaded** main window:
+    /// (188,5,38,5).
+    ///
+    /// S08 §1 settles the shaded area's size, 38 x 5 px with five bands, but
+    /// not where it sits in the windowshade; the place next to the position
+    /// slider is our own choice.
+    pub shade_visualization: Rect,
     /// The stereo indicator (S01 §2.1, verified).
     pub stereo: Rect,
     /// The mono indicator (S01 §2.1, verified).
@@ -173,6 +183,7 @@ impl MainWindowLayout {
         play_indicator: Rect::new(26, 28, 9, 9),
         decoder_indicator: Rect::new(24, 28, 3, 9),
         visualization: Rect::new(24, 43, 76, 16),
+        shade_visualization: Rect::new(188, 5, 38, 5),
         stereo: Rect::new(239, 41, 29, 12),
         mono: Rect::new(212, 41, 27, 12),
         marquee: Rect::new(111, 27, 154, 6),
@@ -339,6 +350,11 @@ mod tests {
         assert_eq!(l.kbps, Rect::new(111, 43, 15, 6));
         assert_eq!(l.khz, Rect::new(156, 43, 10, 6));
         assert_eq!(l.shade_position, Rect::new(226, 4, 17, 7));
+        // S08 §1 settles the size of the analyser area - 76 x 16 px in the
+        // normal window and 38 x 5 px in the shaded one - but not where it
+        // sits (open question 13): the places are our own choice.
+        assert_eq!(l.visualization, Rect::new(24, 43, 76, 16));
+        assert_eq!(l.shade_visualization, Rect::new(188, 5, 38, 5));
         // S02 §7 window buttons: the sheet cells are verified, the window
         // positions are provisional (webamp cross-check).
         assert_eq!(l.window_button(WindowButton::Menu), Rect::new(6, 3, 9, 9));

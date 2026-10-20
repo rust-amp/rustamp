@@ -5,22 +5,38 @@
 //! player offers: **spectrum bars with falling peak markers**, a **triggered
 //! oscilloscope** whose trace does not slide, and **off**.
 //!
-//! ## Own design, not a measurement
+//! ## What the audited S08 settles
 //!
-//! Spec **S08** does not exist yet (`specs/README.md` lists it as "not
-//! started"), so **every number in this module is an own choice**. Nothing
-//! here claims to match a reference player's analyser; each constant says
-//! what a future S08 measurement would refine. The one borrowed fact is the
-//! S09 `analyzer_get_mode` bit layout, which that audited spec states.
+//! `specs/S08-visualization.md` is audited and settles the numbers this module
+//! used to choose for itself:
+//!
+//! * the area and its band count: **76 x 16 px with ten bands** in the normal
+//!   main window and **38 x 5 px with five bands** in the shaded one (S08 §1);
+//! * the level scale: a level is kept in **sixteenths of a pixel**, and the
+//!   drawn height is the stored value divided by sixteen, rounded down
+//!   (S08 §2.1);
+//! * the fall-off: a **fixed step per update**, from a five-entry table that
+//!   the `safalloff` setting selects (S08 §2.2);
+//! * the peak markers: one per band or none (`sa_peaks`, S08 §3.1), and a
+//!   **multiplicative factor per update** from a five-entry table that the
+//!   `sa_peak_falloff` setting selects (S08 §3.2).
+//!
+//! ## What stays an own choice
+//!
+//! S08 leaves the rest open, and every own choice below says so where it is
+//! made: the band frequency edges (open question 1), the update rate (open
+//! question 2), the height law, the bar/gap split (open question 4) and the
+//! **direction of the peak marker's travel** (open question 11).
 //!
 //! ## What this module does and does not do
 //!
 //! * The DSP is pure. [`analyse`] turns a frame into band magnitudes,
-//!   [`magnitude_rows`] turns a magnitude into rows, [`decay_rows`] is the
-//!   fall rule and [`find_trigger`] finds the scope's anchor. Each is a
-//!   function of its arguments alone, so each is testable on its own.
-//! * [`Analyser`] adds the state - attack, hold, fall - and reads no clock:
-//!   the caller passes the time in milliseconds.
+//!   [`magnitude_rows`] turns a magnitude into rows and [`find_trigger`]
+//!   finds the scope's anchor. Each is a function of its arguments alone, so
+//!   each is testable on its own.
+//! * [`Analyser`] adds the state - the levels, the peak markers and the
+//!   trigger - and reads no clock: the caller passes the time in
+//!   milliseconds.
 //! * The renderer is the caller's business. This module returns bar heights
 //!   and peak heights in rows and the scope trace as samples; colours, pixel
 //!   layout and the dot/line stroke are not decided here.
@@ -35,41 +51,99 @@
 //! ## Relationship to the main window's analyser
 //!
 //! The main window uses this analyser through `rustamp-ui`, which supplies
-//! the transport-aware clock and draws the returned rows and trace using
-//! the skin palette. Dot versus line strokes remain a renderer choice.
+//! the transport-aware clock and draws the returned rows and trace using the
+//! skin palette. Dot versus line strokes remain a renderer choice.
 
 use std::fmt;
 
 use rustamp_core::vis::{VIS_SAMPLES, VisFrame};
 
-/// Own choice: the number of spectrum bands (bars) the analyser draws.
+/// The level scale of S08 §2.1: a level counts **sixteenths of a pixel**.
 ///
-/// Nineteen bands of four pixels fill the 76-pixel area the main window
-/// reserves. An S08 measurement would replace the count and the band table.
-pub const SPECTRUM_BANDS: usize = 19;
+/// A stored value of 16 is one pixel of bar height, and the drawn height in
+/// whole pixels is the stored value divided by 16, rounded down.
+pub const SIXTEENTHS_PER_PIXEL: u32 = 16;
 
-/// Own choice: the half-open DFT-bin boundaries of the bands.
-///
-/// Bin 0 (DC) is excluded and every bin from 1 to 288 is used exactly once.
-/// Bin `k` of a 576-point transform sits at `k * rate / 576` Hz, so at
-/// 44.1 kHz the first bin is already 76.5625 Hz. The bands are therefore
-/// *not* nineteen independently resolved low-Hz bands; an S08 measurement
-/// would replace the table.
-pub const BAND_EDGES: [usize; SPECTRUM_BANDS + 1] = [
-    1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 28, 37, 49, 65, 86, 114, 151, 200, 264, 289,
-];
+/// S08 §1: the normal main window's analyser area is 76 px wide.
+pub const SPECTRUM_WIDTH: u32 = 76;
 
-/// Own choice: the height of the spectrum display in rows, 0..=`SPECTRUM_ROWS`.
-///
-/// Sixteen rows fill the analyser area the main window reserves. A peak
-/// marker rests on the top row of its bar, so a full-height bar and its
-/// marker share that row.
+/// S08 §1: the normal main window's analyser area is 16 px tall.
 pub const SPECTRUM_ROWS: u8 = 16;
+
+/// S08 §1: the normal main window's analyser carries **ten bands**.
+pub const SPECTRUM_BANDS: usize = 10;
+
+/// S08 §1: the shaded main window's analyser area is 38 px wide.
+pub const SHADED_WIDTH: u32 = 38;
+
+/// S08 §1: the shaded main window's analyser area is 5 px tall.
+pub const SHADED_ROWS: u8 = 5;
+
+/// S08 §1: the shaded main window's analyser carries **five bands**.
+pub const SHADED_BANDS: usize = 5;
+
+/// Own choice: the half-open DFT-bin boundaries of the ten normal bands.
+///
+/// S08 §1 settles the band count but not the frequency edges (open question
+/// 1), so this table is ours. It follows one rule: the ten bands cover the
+/// bins 1..=288 (bin 0 is the DC bin) with a constant frequency ratio, so the
+/// axis is logarithmic. The ratio is the tenth root of 289, the number of bins
+/// the bands cover, which puts the last edge on the Nyquist bin: the edges
+/// are `round(289^(k/10))` for `k = 0..=10`.
+///
+/// Bin `k` of the 576-point transform sits at `k * rate / 576` Hz, so at
+/// 44.1 kHz the bands start at 77, 153, 230, 383, 766, 1302, 2297, 4057, 7122
+/// and 12556 Hz. The first two bands hold a single bin each: one bin is
+/// already 76.6 Hz at 44.1 kHz, so the low bands cannot be resolved finer.
+pub const BAND_EDGES: [usize; SPECTRUM_BANDS + 1] = [1, 2, 3, 5, 10, 17, 30, 53, 93, 164, 289];
+
+/// Own choice: the half-open DFT-bin boundaries of the five shaded bands.
+///
+/// S08 §1 says the shaded window keeps the band width and halves the band
+/// count and the height, so the five shaded bands are the ten normal bands
+/// merged pairwise: every second edge of [`BAND_EDGES`]. S08 leaves open
+/// whether the shaded analyser uses the same band set (open question 7); we
+/// use the same spectrum, half as many bands.
+pub const SHADED_BAND_EDGES: [usize; SHADED_BANDS + 1] = [1, 3, 10, 30, 93, 289];
+
+/// S08 §2.2: the fall-off step table, in **sixteenths of a pixel per update**.
+///
+/// The `safalloff` setting selects the entry and is clamped to 0..=4. The
+/// step is looked up, never interpolated. In pixels the five steps are
+/// 0.1875, 0.375, 0.75, 1.0 and 2.0 px per update, because a row is one
+/// pixel and a pixel is sixteen stored units.
+pub const FALL_STEPS: [u32; 5] = [3, 6, 12, 16, 32];
+
+/// S08 §3.2: the peak factor table, one **exact rational** per setting.
+///
+/// The `sa_peak_falloff` setting selects the entry and is clamped to 0..=4.
+/// The five factors are 1.05, 1.10, 1.20, 1.40 and 1.60 per update; they are
+/// kept as rationals so the marker moves by an exact integer and never
+/// drifts with a floating-point multiplication.
+pub const PEAK_FACTORS: [(u32, u32); 5] = [(21, 20), (11, 10), (6, 5), (7, 5), (8, 5)];
+
+/// Own choice: the number of analyser updates per second.
+///
+/// S08 §2.2 and §3.2 settle the fall-off **per update** and leave the rate
+/// open (open question 2), so the rate is ours. Thirty updates a second
+/// keeps the fall speed of the previous, time-based law: the default step of
+/// twelve sixteenths is 0.75 px, and 0.75 px times 30 updates is 22.5 px per
+/// second, close to the 24 px per second the old law used.
+pub const UPDATES_PER_SECOND: u32 = 30;
+
+/// Own choice: the seed of the peak marker's fall distance, in sixteenths.
+///
+/// S08 §3.2 settles the factor but not what it multiplies (open question 11).
+/// We multiply the distance the marker has already fallen below the peak it
+/// fell from, so the distance starts at one pixel and grows by the factor
+/// from there. A seed of zero could not grow: every factor is above one, but
+/// zero times any factor is zero.
+const PEAK_FALL_SEED: u32 = SIXTEENTHS_PER_PIXEL;
 
 /// Own choice: the display floor in dBFS.
 ///
-/// A -60 dBFS floor gives a quiet-to-loud range that still fits into
-/// sixteen rows; anything below it draws nothing.
+/// A -60 dBFS floor gives a quiet-to-loud range that still fits into the
+/// area's rows; anything below it draws nothing.
 pub const FLOOR_DB: f64 = -60.0;
 
 /// Own choice: the number of columns of the scope trace.
@@ -85,25 +159,12 @@ pub const SCOPE_COLUMNS: usize = 76;
 /// `VIS_SAMPLES - SCOPE_SPAN_SAMPLES` samples of the window.
 pub const SCOPE_SPAN_SAMPLES: usize = 192;
 
-/// Own choice: the default fall rate of the bars, in rows per second.
-///
-/// The fall is linear and independent of the paint rate, so a slow and a
-/// fast frame rate draw the same envelope.
-pub const DEFAULT_BAR_FALL_ROWS_PER_SECOND: f32 = 24.0;
-
-/// Own choice: the default fall rate of the peak marker, in rows per second.
-///
-/// The marker falls slower than the bars, so it stays readable above them.
-pub const DEFAULT_PEAK_FALL_ROWS_PER_SECOND: f32 = 16.0;
-
-/// Own choice: the default rest of the peak marker on its top, in milliseconds.
-pub const DEFAULT_PEAK_HOLD_MS: u64 = 300;
-
 /// Own choice: how long an accepted frame keeps the bar floors alive.
 ///
 /// After that the input counts as gone and the bars fall freely. The input
 /// is not turned into a silence frame: the analyser simply stops holding
-/// the last value up.
+/// the last value up. The window is counted in analyser updates, so it is
+/// `FRAME_STALE_MS` of display time at [`UPDATES_PER_SECOND`].
 pub const FRAME_STALE_MS: u64 = 100;
 
 /// Own choice: the trigger's hysteresis band, as a fraction of the frame peak.
@@ -118,6 +179,50 @@ pub const DEFAULT_TRIGGER_HYSTERESIS: f32 = 0.1;
 /// A band of the full peak could never be crossed, so the value is capped
 /// below it.
 const MAX_TRIGGER_HYSTERESIS: f32 = 0.95;
+
+/// The area the analyser draws in, and with it the band count (S08 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Geometry {
+    /// The normal main window: 76 x 16 px with ten bands (S08 §1).
+    #[default]
+    Normal,
+    /// The shaded main window: 38 x 5 px with five bands (S08 §1).
+    Shaded,
+}
+
+impl Geometry {
+    /// The number of bands the area carries (S08 §1).
+    pub const fn bands(self) -> usize {
+        match self {
+            Self::Normal => SPECTRUM_BANDS,
+            Self::Shaded => SHADED_BANDS,
+        }
+    }
+
+    /// The height of the area in pixels (S08 §1).
+    pub const fn rows(self) -> u8 {
+        match self {
+            Self::Normal => SPECTRUM_ROWS,
+            Self::Shaded => SHADED_ROWS,
+        }
+    }
+
+    /// The width of the area in pixels (S08 §1).
+    pub const fn width(self) -> u32 {
+        match self {
+            Self::Normal => SPECTRUM_WIDTH,
+            Self::Shaded => SHADED_WIDTH,
+        }
+    }
+
+    /// The half-open DFT-bin boundaries of the area's bands (own choice).
+    pub const fn edges(self) -> &'static [usize] {
+        match self {
+            Self::Normal => &BAND_EDGES,
+            Self::Shaded => &SHADED_BAND_EDGES,
+        }
+    }
+}
 
 /// The classic modes a caller can pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -160,12 +265,19 @@ pub enum TriggerEdge {
 /// The analyser's own choices that a caller may change.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
-    /// How fast the bars fall after their attack, in rows per second.
-    pub bar_fall_rows_per_second: f32,
-    /// How fast the peak marker falls after its hold, in rows per second.
-    pub peak_fall_rows_per_second: f32,
-    /// How long the peak marker rests on its top, in milliseconds.
-    pub peak_hold_ms: u64,
+    /// The fall-off setting of S08 §2.2 (`safalloff`), clamped to 0..=4.
+    ///
+    /// The observed value of the reference is 2, so the default is 2.
+    pub falloff: u8,
+    /// Whether peak markers are drawn (S08 §3.1, `sa_peaks`).
+    ///
+    /// The observed value of the reference is 1, so the default is on.
+    pub peaks: bool,
+    /// The peak fall-off setting of S08 §3.2 (`sa_peak_falloff`), clamped
+    /// to 0..=4.
+    ///
+    /// The observed value of the reference is 1, so the default is 1.
+    pub peak_falloff: u8,
     /// The edge the oscilloscope locks on.
     pub trigger_edge: TriggerEdge,
     /// The trigger's hysteresis band, as a fraction of the frame peak.
@@ -175,12 +287,28 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Self {
-            bar_fall_rows_per_second: DEFAULT_BAR_FALL_ROWS_PER_SECOND,
-            peak_fall_rows_per_second: DEFAULT_PEAK_FALL_ROWS_PER_SECOND,
-            peak_hold_ms: DEFAULT_PEAK_HOLD_MS,
+            falloff: 2,
+            peaks: true,
+            peak_falloff: 1,
             trigger_edge: TriggerEdge::default(),
             trigger_hysteresis: DEFAULT_TRIGGER_HYSTERESIS,
         }
+    }
+}
+
+impl Tuning {
+    /// The fall-off step in sixteenths of a pixel per update (S08 §2.2).
+    ///
+    /// The setting is clamped to 0..=4: a value of 4 or more behaves like 4.
+    pub fn fall_step(&self) -> u32 {
+        FALL_STEPS[(self.falloff as usize).min(FALL_STEPS.len() - 1)]
+    }
+
+    /// The peak factor per update, as an exact rational (S08 §3.2).
+    ///
+    /// The setting is clamped to 0..=4: a value of 4 or more behaves like 4.
+    pub fn peak_factor(&self) -> (u32, u32) {
+        PEAK_FACTORS[(self.peak_falloff as usize).min(PEAK_FACTORS.len() - 1)]
     }
 }
 
@@ -214,7 +342,8 @@ pub struct Analysis {
     /// The largest normalised magnitude per band, over both channels.
     ///
     /// A full-scale sine on an integer bin reaches 1.0; the value is linear
-    /// in the amplitude, not logarithmic.
+    /// in the amplitude, not logarithmic. Only the bands of the geometry that
+    /// was analysed are filled; the rest are zero.
     pub magnitudes: [f32; SPECTRUM_BANDS],
 }
 
@@ -237,34 +366,33 @@ pub fn bin_frequency_hz(bin: usize, sample_rate_hz: u32) -> Option<f64> {
 /// sine 1.0 and does not double the Nyquist bin. The larger magnitude of
 /// the two channels wins, so an out-of-phase stereo pair does not cancel.
 ///
+/// The bands are the ones of the given area (S08 §1): ten in the normal
+/// main window, five in the shaded one.
+///
 /// The frame's `spectrum` field is ignored: it carries the engine's neutral
 /// data, not a measurement.
-pub fn analyse(frame: &VisFrame, sample_rate_hz: u32) -> Result<Analysis, AnalyserError> {
+pub fn analyse(
+    frame: &VisFrame,
+    sample_rate_hz: u32,
+    geometry: Geometry,
+) -> Result<Analysis, AnalyserError> {
     check_frame(frame, sample_rate_hz)?;
-    Ok(analyse_validated(frame))
+    Ok(analyse_validated(frame, geometry))
 }
 
-/// The own-choice height law: -60..0 dBFS maps to 0..=`SPECTRUM_ROWS` rows.
+/// The height law: -60..0 dBFS maps to 0..=`rows` rows.
 ///
 /// The nearest row wins, anything above the floor is drawn, and a magnitude
-/// that is not finite or not positive draws nothing.
-pub fn magnitude_rows(magnitude: f32) -> u8 {
+/// that is not finite or not positive draws nothing. The floor in dBFS and
+/// the shape of the curve are our own choice; the *scale* of the result is
+/// the area's height (S08 §1).
+pub fn magnitude_rows(magnitude: f32, rows: u8) -> u8 {
     if !magnitude.is_finite() || magnitude <= 0.0 {
         return 0;
     }
     let db = 20.0 * f64::from(magnitude).log10();
-    let rows = ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0) * f64::from(SPECTRUM_ROWS);
-    rows.round() as u8
-}
-
-/// The fall rule: the height drops by `rows_per_second` per second.
-///
-/// The fall is linear and independent of how often it is applied, so one
-/// long step and many short steps reach the same height. The result never
-/// goes below zero.
-pub fn decay_rows(rows: f32, elapsed_ms: u64, rows_per_second: f32) -> f32 {
-    let fallen = elapsed_ms as f32 / 1000.0 * rows_per_second;
-    (rows - fallen).max(0.0)
+    let value = ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0) * f64::from(rows);
+    value.round() as u8
 }
 
 /// The signal the oscilloscope draws: the mono mix of the two channels with
@@ -328,7 +456,7 @@ pub fn find_trigger(window: &[f32], edge: TriggerEdge, hysteresis: f32) -> Optio
                 if current >= level {
                     armed = true;
                 }
-                armed && current > -level && next <= -level
+                armed && current > -level && next <= level
             }
         };
         if fires {
@@ -362,23 +490,35 @@ pub fn scope_trace(window: &[f32], trigger: usize) -> [f32; SCOPE_COLUMNS] {
     })
 }
 
-/// The classic analyser: the mode, the tuning and the display state.
+/// The classic analyser: the mode, the tuning, the area and the display state.
 ///
 /// The analyser keeps no clock of its own. Every entry point takes the
 /// current time in milliseconds, so the same input always produces the same
-/// output.
+/// output. The fall-off and the peak markers move in **updates** (S08 §2.2,
+/// §3.2): the elapsed time is turned into a number of updates at
+/// [`UPDATES_PER_SECOND`].
 #[derive(Debug, Clone)]
 pub struct Analyser {
     mode: ClassicMode,
     tuning: Tuning,
-    bars: [f32; SPECTRUM_BANDS],
-    peaks: [f32; SPECTRUM_BANDS],
-    floors: [f32; SPECTRUM_BANDS],
-    peak_hold_until_ms: [u64; SPECTRUM_BANDS],
+    geometry: Geometry,
+    /// The bar heights in sixteenths of a pixel.
+    bars: [u32; SPECTRUM_BANDS],
+    /// The last analysed level per band, in whole pixels.
+    levels: [u8; SPECTRUM_BANDS],
+    /// The peak marker heights in sixteenths of a pixel.
+    peaks: [u32; SPECTRUM_BANDS],
+    /// The peak the marker of a band fell from, in sixteenths of a pixel.
+    peak_origin: [u32; SPECTRUM_BANDS],
+    /// The distance the marker has already fallen below its peak.
+    peak_fall: [u32; SPECTRUM_BANDS],
+    /// The updates left before the input counts as gone.
+    fresh_updates: u32,
     scope: [f32; SCOPE_COLUMNS],
     trigger: Option<usize>,
     clock_ms: u64,
-    last_frame_ms: Option<u64>,
+    /// The updates owed, in thousandths of an update.
+    pending_updates: u64,
 }
 
 impl Default for Analyser {
@@ -386,14 +526,17 @@ impl Default for Analyser {
         Self {
             mode: ClassicMode::default(),
             tuning: Tuning::default(),
-            bars: [0.0; SPECTRUM_BANDS],
-            peaks: [0.0; SPECTRUM_BANDS],
-            floors: [0.0; SPECTRUM_BANDS],
-            peak_hold_until_ms: [0; SPECTRUM_BANDS],
+            geometry: Geometry::default(),
+            bars: [0; SPECTRUM_BANDS],
+            levels: [0; SPECTRUM_BANDS],
+            peaks: [0; SPECTRUM_BANDS],
+            peak_origin: [0; SPECTRUM_BANDS],
+            peak_fall: [0; SPECTRUM_BANDS],
+            fresh_updates: 0,
             scope: [0.0; SCOPE_COLUMNS],
             trigger: None,
             clock_ms: 0,
-            last_frame_ms: None,
+            pending_updates: 0,
         }
     }
 }
@@ -427,14 +570,31 @@ impl Analyser {
         self.tuning = tuning;
     }
 
-    /// The bar heights in rows, 0..=`SPECTRUM_ROWS`.
-    pub fn bars(&self) -> [u8; SPECTRUM_BANDS] {
-        std::array::from_fn(|band| quantise_rows(self.bars[band]))
+    /// The area the analyser draws in (S08 §1).
+    pub fn geometry(&self) -> Geometry {
+        self.geometry
     }
 
-    /// The peak marker heights in rows, 0..=`SPECTRUM_ROWS`.
+    /// Switch to another area and clear the display.
+    ///
+    /// The band count belongs to the area (S08 §1), so the new bands have no
+    /// history: the display starts empty.
+    pub fn set_geometry(&mut self, geometry: Geometry) {
+        if self.geometry == geometry {
+            return;
+        }
+        self.geometry = geometry;
+        self.reset();
+    }
+
+    /// The bar heights in rows, 0..=the area's rows.
+    pub fn bars(&self) -> [u8; SPECTRUM_BANDS] {
+        std::array::from_fn(|band| self.row(self.bars[band]))
+    }
+
+    /// The peak marker heights in rows, 0..=the area's rows.
     pub fn peaks(&self) -> [u8; SPECTRUM_BANDS] {
-        std::array::from_fn(|band| quantise_rows(self.peaks[band]))
+        std::array::from_fn(|band| self.row(self.peaks[band]))
     }
 
     /// The scope trace, one sample per column.
@@ -453,60 +613,36 @@ impl Analyser {
     /// The clock keeps running, so a timestamp that goes backwards cannot
     /// resurrect an old envelope.
     pub fn reset(&mut self) {
-        self.bars = [0.0; SPECTRUM_BANDS];
-        self.peaks = [0.0; SPECTRUM_BANDS];
-        self.floors = [0.0; SPECTRUM_BANDS];
-        self.peak_hold_until_ms = [0; SPECTRUM_BANDS];
+        self.bars = [0; SPECTRUM_BANDS];
+        self.levels = [0; SPECTRUM_BANDS];
+        self.peaks = [0; SPECTRUM_BANDS];
+        self.peak_origin = [0; SPECTRUM_BANDS];
+        self.peak_fall = [0; SPECTRUM_BANDS];
+        self.fresh_updates = 0;
         self.scope = [0.0; SCOPE_COLUMNS];
         self.trigger = None;
-        self.last_frame_ms = None;
     }
 
-    /// Let the envelopes fall for the time that passed since the last call.
+    /// Let the display move on for the time that passed since the last call.
     ///
-    /// A caller that paints without a new frame calls this, so the bars and
-    /// the peak marker keep falling while the input is gone. A timestamp
-    /// that goes backwards is not elapsed time and changes nothing.
+    /// The fall-off is a fixed step **per update** (S08 §2.2), so the elapsed
+    /// time is turned into a number of updates. The count is exact and does
+    /// not depend on how the elapsed time is split into calls: the updates
+    /// that are owed are kept in thousandths, so a long run neither loses nor
+    /// gains an update.
     pub fn advance(&mut self, now_ms: u64) {
         let start = self.clock_ms;
         let now = now_ms.max(start);
-        let elapsed = now - start;
         self.clock_ms = now;
+        let elapsed = now - start;
         if elapsed == 0 {
             return;
         }
-        let stale_at = self.last_frame_ms.map(|frame| frame + FRAME_STALE_MS);
-        let fresh_ms = stale_at.map_or(elapsed, |stale| elapsed.min(stale.saturating_sub(start)));
-        let stale_ms = elapsed - fresh_ms;
-        for band in 0..SPECTRUM_BANDS {
-            // While the input is fresh the bar rests on the last analysed
-            // value; once it is gone the bar falls freely.
-            let bar = if fresh_ms > 0 {
-                decay_rows(
-                    self.bars[band],
-                    fresh_ms,
-                    self.tuning.bar_fall_rows_per_second,
-                )
-                .max(self.floors[band])
-            } else {
-                self.bars[band]
-            };
-            self.bars[band] = decay_rows(bar, stale_ms, self.tuning.bar_fall_rows_per_second);
-            // The peak marker rests for its hold and only then falls.
-            let hold_ms = self.peak_hold_until_ms[band]
-                .saturating_sub(start)
-                .min(elapsed);
-            let fall_ms = elapsed - hold_ms;
-            let peak = if fall_ms > 0 {
-                decay_rows(
-                    self.peaks[band],
-                    fall_ms,
-                    self.tuning.peak_fall_rows_per_second,
-                )
-            } else {
-                self.peaks[band]
-            };
-            self.peaks[band] = peak.max(self.bars[band]);
+        self.pending_updates += elapsed * u64::from(UPDATES_PER_SECOND);
+        let updates = (self.pending_updates / 1000) as u32;
+        self.pending_updates %= 1000;
+        for _ in 0..updates {
+            self.step();
         }
     }
 
@@ -527,17 +663,21 @@ impl Analyser {
         self.advance(now_ms);
         match self.mode {
             ClassicMode::Spectrum => {
-                let analysis = analyse_validated(frame);
-                for (band, magnitude) in analysis.magnitudes.iter().enumerate() {
-                    let target = f32::from(magnitude_rows(*magnitude));
-                    self.floors[band] = target;
-                    // The attack is instant: a bar jumps to the new height.
-                    self.bars[band] = self.bars[band].max(target);
-                    if target >= self.peaks[band] {
-                        self.peaks[band] = target;
-                        self.peak_hold_until_ms[band] = self.clock_ms + self.tuning.peak_hold_ms;
+                let analysis = analyse_validated(frame, self.geometry);
+                for band in 0..self.geometry.bands() {
+                    let level = magnitude_rows(analysis.magnitudes[band], self.geometry.rows());
+                    self.levels[band] = level;
+                    let level16 = u32::from(level) * SIXTEENTHS_PER_PIXEL;
+                    if level16 >= self.bars[band] {
+                        // A rising bar jumps to the new level at once
+                        // (S08 §2.1), and the marker rides on it.
+                        self.bars[band] = level16;
+                        self.peaks[band] = level16;
+                        self.peak_origin[band] = level16;
+                        self.peak_fall[band] = 0;
                     }
                 }
+                self.fresh_updates = fresh_updates();
             }
             ClassicMode::Oscilloscope => {
                 let signal = scope_signal(frame);
@@ -552,17 +692,96 @@ impl Analyser {
             }
             ClassicMode::Off => {}
         }
-        self.last_frame_ms = Some(self.clock_ms);
         Ok(())
+    }
+
+    /// One analyser update: the bars fall by the configured step and the peak
+    /// markers descend.
+    ///
+    /// A rising bar is instantaneous (S08 §2.1): a bar that is at or below
+    /// the current level jumps to it. A bar that is above the level falls by
+    /// the fixed step of the table (S08 §2.2) and rests on the level while
+    /// the input is fresh; once the input is gone it falls freely to the
+    /// bottom.
+    ///
+    /// The marker descends towards the bar. The distance it has already
+    /// fallen below the peak it fell from grows by the factor of the table
+    /// (S08 §3.2), so the marker's step grows with every update (S08 §3.3).
+    /// S08 leaves the direction of that travel open (open question 11); ours
+    /// is the falling one, because that is the only direction in which a
+    /// peak marker still means "the peak the bar reached".
+    fn step(&mut self) {
+        let step = self.tuning.fall_step();
+        let (num, den) = self.tuning.peak_factor();
+        let fresh = self.fresh_updates > 0;
+        if fresh {
+            self.fresh_updates -= 1;
+        }
+        for band in 0..self.geometry.bands() {
+            // The level is only live while the input is fresh. Once it is
+            // gone the bar has nothing to rest on and falls freely.
+            let level = if fresh {
+                u32::from(self.levels[band]) * SIXTEENTHS_PER_PIXEL
+            } else {
+                0
+            };
+            if level >= self.bars[band] {
+                self.bars[band] = level;
+            } else {
+                // The bar falls by the fixed step and rests on the level while
+                // the input is fresh. Once the input is gone the level is
+                // zero, so the bar falls freely to the bottom.
+                self.bars[band] = self.bars[band].saturating_sub(step).max(level);
+            }
+            if self.tuning.peaks {
+                let marker = self.peak_origin[band].saturating_sub(self.peak_fall[band]);
+                if self.bars[band] >= marker {
+                    // The bar reached the marker: it is re-seated on the top
+                    // of the bar and starts falling again from there.
+                    self.peaks[band] = self.bars[band];
+                    self.peak_origin[band] = self.bars[band];
+                    self.peak_fall[band] = 0;
+                } else {
+                    // The marker descends. Its distance below the peak grows
+                    // by the factor, so its step grows with every update.
+                    self.peak_fall[band] = peak_fall_step(self.peak_fall[band], (num, den));
+                    let marker = self.peak_origin[band].saturating_sub(self.peak_fall[band]);
+                    // The marker never draws below the bar it belongs to.
+                    self.peaks[band] = marker.max(self.bars[band]);
+                }
+            } else {
+                self.peaks[band] = 0;
+                self.peak_origin[band] = 0;
+                self.peak_fall[band] = 0;
+            }
+        }
+    }
+
+    /// The drawn height of a stored level: the stored value divided by
+    /// sixteen, rounded down (S08 §2.1).
+    fn row(&self, level: u32) -> u8 {
+        let row = level / SIXTEENTHS_PER_PIXEL;
+        row.min(u32::from(self.geometry.rows())) as u8
     }
 }
 
-/// Quantise a height to whole rows.
+/// The number of updates an accepted frame keeps the bar floors alive.
+fn fresh_updates() -> u32 {
+    (FRAME_STALE_MS * u64::from(UPDATES_PER_SECOND) / 1000) as u32
+}
+
+/// The distance the peak marker has fallen after one more update (S08 §3.2).
 ///
-/// The ceiling keeps a bar that is still falling visible until it really
-/// reached the row below.
-fn quantise_rows(rows: f32) -> u8 {
-    rows.ceil().clamp(0.0, f32::from(SPECTRUM_ROWS)) as u8
+/// The distance below the peak grows by the factor of the table, so the
+/// marker's step grows with every update. The first step after the marker was
+/// re-seated is the seed, because a distance of zero could not grow: every
+/// factor is above one, but zero times any factor is zero.
+fn peak_fall_step(fall: u32, (num, den): (u32, u32)) -> u32 {
+    if fall == 0 {
+        PEAK_FALL_SEED
+    } else {
+        (fall * num + den / 2) / den
+    }
 }
 
 /// Refuse a frame that cannot be analysed.
@@ -582,18 +801,19 @@ fn check_frame(frame: &VisFrame, sample_rate_hz: u32) -> Result<(), AnalyserErro
 }
 
 /// The transform of an already checked frame.
-fn analyse_validated(frame: &VisFrame) -> Analysis {
+fn analyse_validated(frame: &VisFrame, geometry: Geometry) -> Analysis {
     let window: [f64; VIS_SAMPLES] = std::array::from_fn(|n| {
         0.5 - 0.5 * (std::f64::consts::TAU * n as f64 / VIS_SAMPLES as f64).cos()
     });
     let gain: f64 = window.iter().sum();
+    let edges = geometry.edges();
     let mut magnitudes = [0.0f32; SPECTRUM_BANDS];
     for channel in &frame.waveform {
         let mean = channel.iter().map(|&x| f64::from(x)).sum::<f64>() / VIS_SAMPLES as f64;
         let samples: [f64; VIS_SAMPLES] =
             std::array::from_fn(|n| (f64::from(channel[n]) - mean) * window[n]);
-        for (band, magnitude) in magnitudes.iter_mut().enumerate() {
-            for bin in BAND_EDGES[band]..BAND_EDGES[band + 1] {
+        for (band, magnitude) in magnitudes.iter_mut().enumerate().take(geometry.bands()) {
+            for bin in edges[band]..edges[band + 1] {
                 let angle = std::f64::consts::TAU * bin as f64 / VIS_SAMPLES as f64;
                 let (sin, cos) = angle.sin_cos();
                 let (mut re, mut im) = (0.0, 0.0);
@@ -647,25 +867,30 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    /// The band that holds a bin.
+    /// The band of the normal geometry that holds a bin.
     fn band_of(bin: usize) -> usize {
         (0..SPECTRUM_BANDS)
             .find(|&band| (BAND_EDGES[band]..BAND_EDGES[band + 1]).contains(&bin))
             .expect("the bin is in a band")
     }
 
+    /// A silent frame: every level is zero.
+    fn silence() -> VisFrame {
+        VisFrame::default()
+    }
+
     #[test]
     fn a_tone_scales_to_its_amplitude_and_lands_in_its_band() {
         // A period of 36 samples is bin 16 of the 576-point transform.
-        let analysis = analyse(&sine(0, 36, 1.0), 44100).unwrap();
+        let analysis = analyse(&sine(0, 36, 1.0), 44100, Geometry::Normal).unwrap();
         let loudest = analysis.magnitudes.iter().copied().fold(0.0f32, f32::max);
         assert!((loudest - 1.0).abs() < 0.0001, "{loudest}");
         assert!((analysis.magnitudes[band_of(16)] - 1.0).abs() < 0.0001);
         // Half the amplitude is half the magnitude: the scaling is linear.
-        let half = analyse(&sine(0, 36, 0.5), 44100).unwrap();
+        let half = analyse(&sine(0, 36, 0.5), 44100, Geometry::Normal).unwrap();
         assert!((half.magnitudes[band_of(16)] - 0.5).abs() < 0.0001);
         // A different bin lands in a different band.
-        let other = analyse(&sine(0, 4, 0.5), 44100).unwrap();
+        let other = analyse(&sine(0, 4, 0.5), 44100, Geometry::Normal).unwrap();
         assert!((other.magnitudes[band_of(144)] - 0.5).abs() < 0.0001);
         // The bands carry the frequency of their bins.
         assert_eq!(bin_frequency_hz(16, 44100), Some(1225.0));
@@ -681,167 +906,327 @@ mod tests {
                 ..VisFrame::default()
             };
             assert_eq!(
-                analyse(&frame, 44100).unwrap().magnitudes,
+                analyse(&frame, 44100, Geometry::Normal).unwrap().magnitudes,
                 [0.0; SPECTRUM_BANDS]
             );
             assert_eq!(scope_signal(&frame), [0.0; VIS_SAMPLES]);
         }
         let mut frame = sine(0, 36, 0.5);
-        let expected = analyse(&frame, 44100).unwrap();
+        let expected = analyse(&frame, 44100, Geometry::Normal).unwrap();
         frame.spectrum = [[f32::NAN; VIS_SAMPLES]; 2];
-        assert_eq!(analyse(&frame, 44100).unwrap(), expected);
+        assert_eq!(analyse(&frame, 44100, Geometry::Normal).unwrap(), expected);
     }
 
     #[test]
     fn independent_channels_do_not_cancel_and_two_tones_survive() {
         let mono = sine(0, 36, 0.5);
-        let expected = analyse(&mono, 44100).unwrap().magnitudes;
+        let expected = analyse(&mono, 44100, Geometry::Normal).unwrap().magnitudes;
         let mut frame = mono.clone();
         frame.waveform[1].fill(0.0);
-        assert_eq!(analyse(&frame, 44100).unwrap().magnitudes, expected);
+        assert_eq!(
+            analyse(&frame, 44100, Geometry::Normal).unwrap().magnitudes,
+            expected
+        );
         frame.waveform.swap(0, 1);
-        assert_eq!(analyse(&frame, 44100).unwrap().magnitudes, expected);
+        assert_eq!(
+            analyse(&frame, 44100, Geometry::Normal).unwrap().magnitudes,
+            expected
+        );
         frame = mono;
         frame.waveform[1]
             .iter_mut()
             .for_each(|sample| *sample = -*sample);
-        assert_eq!(analyse(&frame, 44100).unwrap().magnitudes, expected);
+        assert_eq!(
+            analyse(&frame, 44100, Geometry::Normal).unwrap().magnitudes,
+            expected
+        );
         assert_eq!(scope_signal(&frame), [0.0; VIS_SAMPLES]);
         frame.waveform[1] = sine(0, 4, 0.25).waveform[0];
-        let two = analyse(&frame, 44100).unwrap();
+        let two = analyse(&frame, 44100, Geometry::Normal).unwrap();
         assert!((two.magnitudes[band_of(16)] - 0.5).abs() < 0.00001);
         assert!((two.magnitudes[band_of(144)] - 0.25).abs() < 0.00001);
     }
 
     #[test]
     fn bands_cover_the_half_spectrum_once_and_nyquist_is_not_doubled() {
-        let bins: Vec<_> = BAND_EDGES
-            .windows(2)
-            .flat_map(|pair| pair[0]..pair[1])
-            .collect();
-        assert_eq!(bins, (1..=288).collect::<Vec<_>>());
+        for geometry in [Geometry::Normal, Geometry::Shaded] {
+            let bins: Vec<_> = geometry
+                .edges()
+                .windows(2)
+                .flat_map(|pair| pair[0]..pair[1])
+                .collect();
+            assert_eq!(bins, (1..=288).collect::<Vec<_>>());
+        }
         let frame = VisFrame {
             waveform: [std::array::from_fn(|n| if n % 2 == 0 { 0.5 } else { -0.5 }); 2],
             ..VisFrame::default()
         };
-        assert!((analyse(&frame, 48000).unwrap().magnitudes[band_of(288)] - 0.5).abs() < 0.00001);
+        assert!(
+            (analyse(&frame, 48000, Geometry::Normal).unwrap().magnitudes[band_of(288)] - 0.5)
+                .abs()
+                < 0.00001
+        );
     }
 
     #[test]
     fn the_height_law_is_the_own_d_b_scale() {
-        assert_eq!(magnitude_rows(1.0), SPECTRUM_ROWS);
-        assert_eq!(magnitude_rows(0.5), 14);
-        assert_eq!(magnitude_rows(0.25), 13);
-        assert_eq!(magnitude_rows(0.01), 5);
-        assert_eq!(magnitude_rows(0.001), 0);
-        assert_eq!(magnitude_rows(0.0), 0);
-        assert_eq!(magnitude_rows(-1.0), 0);
-        assert_eq!(magnitude_rows(2.0), SPECTRUM_ROWS);
-        assert_eq!(magnitude_rows(f32::NAN), 0);
+        assert_eq!(magnitude_rows(1.0, SPECTRUM_ROWS), SPECTRUM_ROWS);
+        assert_eq!(magnitude_rows(0.5, SPECTRUM_ROWS), 14);
+        assert_eq!(magnitude_rows(0.25, SPECTRUM_ROWS), 13);
+        assert_eq!(magnitude_rows(0.01, SPECTRUM_ROWS), 5);
+        assert_eq!(magnitude_rows(0.001, SPECTRUM_ROWS), 0);
+        assert_eq!(magnitude_rows(0.0, SPECTRUM_ROWS), 0);
+        assert_eq!(magnitude_rows(-1.0, SPECTRUM_ROWS), 0);
+        assert_eq!(magnitude_rows(2.0, SPECTRUM_ROWS), SPECTRUM_ROWS);
+        assert_eq!(magnitude_rows(f32::NAN, SPECTRUM_ROWS), 0);
+        // The shaded area is five rows tall (S08 §1): the same law, less room.
+        assert_eq!(magnitude_rows(1.0, SHADED_ROWS), SHADED_ROWS);
+        assert_eq!(magnitude_rows(0.5, SHADED_ROWS), 4);
+        assert_eq!(magnitude_rows(0.0, SHADED_ROWS), 0);
     }
 
+    /// S08 §1: ten bands in the normal area, five in the shaded one.
     #[test]
-    fn the_fall_rule_is_linear_and_never_negative() {
-        assert_eq!(decay_rows(16.0, 0, 24.0), 16.0);
-        assert_eq!(decay_rows(16.0, 500, 24.0), 4.0);
-        assert_eq!(decay_rows(16.0, 1000, 24.0), 0.0);
-        assert_eq!(decay_rows(1.0, 10_000, 24.0), 0.0);
-        // One long step and many short steps reach the same height.
-        let mut stepped = 16.0f32;
-        for _ in 0..10 {
-            stepped = decay_rows(stepped, 50, 24.0);
-        }
-        assert!((stepped - decay_rows(16.0, 500, 24.0)).abs() < 0.0001);
-    }
+    fn the_band_count_follows_the_area() {
+        assert_eq!(Geometry::Normal.bands(), 10);
+        assert_eq!(Geometry::Shaded.bands(), 5);
+        assert_eq!(Geometry::Normal.rows(), 16);
+        assert_eq!(Geometry::Shaded.rows(), 5);
+        assert_eq!(Geometry::Normal.width(), 76);
+        assert_eq!(Geometry::Shaded.width(), 38);
+        assert_eq!(BAND_EDGES.len(), SPECTRUM_BANDS + 1);
+        assert_eq!(SHADED_BAND_EDGES.len(), SHADED_BANDS + 1);
 
-    #[test]
-    fn the_bars_fall_at_the_configured_rate_and_stop_at_the_last_value() {
-        let mut analyser = Analyser::default();
-        analyser.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
-        let band = band_of(16);
-        assert_eq!(analyser.bars()[band], SPECTRUM_ROWS);
-        // While the input is fresh the bar rests on the last value.
-        analyser.advance(50);
-        assert_eq!(analyser.bars()[band], SPECTRUM_ROWS);
-        // Once the input is gone the bar falls at the configured rate.
-        analyser.advance(350);
-        assert_eq!(
-            analyser.bars()[band],
-            10,
-            "16 rows minus 24 rows/s over 250 ms"
+        // The normal area analyses ten bands, the shaded one five.
+        let frame = sine(0, 36, 1.0);
+        let normal = analyse(&frame, 44100, Geometry::Normal).unwrap();
+        let shaded = analyse(&frame, 44100, Geometry::Shaded).unwrap();
+        assert!((normal.magnitudes[band_of(16)] - 1.0).abs() < 0.0001);
+        assert!(
+            (shaded.magnitudes[SHADED_BAND_EDGES.partition_point(|&edge| edge <= 16) - 1] - 1.0)
+                .abs()
+                < 0.0001
         );
-        // A slower fall rate is honoured.
-        let mut slow = Analyser::default();
-        slow.set_tuning(Tuning {
-            bar_fall_rows_per_second: 4.0,
+        assert!(
+            shaded.magnitudes[SHADED_BANDS..]
+                .iter()
+                .all(|magnitude| *magnitude == 0.0),
+            "the shaded area has no bands beyond its five"
+        );
+
+        // The analyser follows the area: five bands in the shaded window.
+        let mut analyser = Analyser::default();
+        analyser.push(&frame, 44100, 0).unwrap();
+        assert!(analyser.bars()[band_of(16)] > 0);
+        analyser.set_geometry(Geometry::Shaded);
+        assert_eq!(analyser.geometry(), Geometry::Shaded);
+        assert_eq!(analyser.bars(), [0; SPECTRUM_BANDS]);
+        analyser.push(&frame, 44100, 0).unwrap();
+        let lit = analyser.bars().iter().filter(|height| **height > 0).count();
+        assert!(
+            (1..=SHADED_BANDS).contains(&lit),
+            "the shaded area has five bands"
+        );
+        assert!(
+            analyser.bars()[SHADED_BANDS..]
+                .iter()
+                .all(|height| *height == 0),
+            "the shaded area has no bands beyond its five"
+        );
+    }
+
+    /// S08 §2.2: the fall-off is the table's step, per update.
+    #[test]
+    fn the_fall_off_step_is_the_table_entry_per_setting() {
+        for (setting, step) in FALL_STEPS.iter().enumerate() {
+            let mut analyser = Analyser::default();
+            analyser.set_tuning(Tuning {
+                falloff: setting as u8,
+                ..Tuning::default()
+            });
+            analyser.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
+            let band = band_of(16);
+            let full = SPECTRUM_ROWS as u32 * SIXTEENTHS_PER_PIXEL;
+            assert_eq!(analyser.bars[band], full);
+            // The level drops: the next update falls by exactly the step.
+            analyser.push(&silence(), 44100, 0).unwrap();
+            analyser.step();
+            assert_eq!(
+                analyser.bars[band],
+                full - step,
+                "setting {setting} falls by {step} sixteenths"
+            );
+        }
+        // The step is counted in sixteenths of a pixel: a row is one pixel, so
+        // the five steps are 0.1875, 0.375, 0.75, 1.0 and 2.0 rows.
+        for (step, rows) in FALL_STEPS.iter().zip([0.1875f32, 0.375, 0.75, 1.0, 2.0]) {
+            assert_eq!(*step as f32 / SIXTEENTHS_PER_PIXEL as f32, rows);
+        }
+        // The setting is clamped to 0..=4 (S08 §2.2).
+        let mut clamped = Analyser::default();
+        clamped.set_tuning(Tuning {
+            falloff: 9,
             ..Tuning::default()
         });
-        slow.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
-        slow.advance(350);
-        assert_eq!(slow.bars()[band], 15, "4 rows/s over 250 ms");
+        assert_eq!(clamped.tuning().fall_step(), FALL_STEPS[4]);
+        assert_eq!(clamped.tuning().fall_step(), 32);
     }
 
+    /// S08 §2.1: a rising bar jumps to the new level at once.
     #[test]
-    fn stale_floors_do_not_raise_the_bars_again_on_later_refreshes() {
-        let mut once = Analyser::default();
-        once.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
-        let mut many = once.clone();
-        once.advance(425);
-        for time in [25, 80, 100, 101, 180, 299, 300, 425] {
-            many.advance(time);
+    fn a_rising_bar_jumps_at_once() {
+        let mut analyser = Analyser::default();
+        analyser.push(&silence(), 44100, 0).unwrap();
+        let band = band_of(16);
+        assert_eq!(analyser.bars[band], 0);
+        // One frame with a tone: the bar is at the level at once, not after
+        // a fall and a rise.
+        analyser.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
+        assert_eq!(
+            analyser.bars[band],
+            SPECTRUM_ROWS as u32 * SIXTEENTHS_PER_PIXEL
+        );
+        assert_eq!(analyser.bars()[band], SPECTRUM_ROWS);
+        // A level below the bar does not jump: the bar falls by the step at
+        // the next update.
+        analyser.push(&silence(), 44100, 0).unwrap();
+        assert_eq!(
+            analyser.bars[band],
+            SPECTRUM_ROWS as u32 * SIXTEENTHS_PER_PIXEL
+        );
+        analyser.step();
+        assert_eq!(
+            analyser.bars[band],
+            SPECTRUM_ROWS as u32 * SIXTEENTHS_PER_PIXEL - FALL_STEPS[2]
+        );
+    }
+
+    /// S08 §3.1 and §3.2: the markers are switched off and on, and their
+    /// fall distance grows by the factor of the table.
+    #[test]
+    fn the_peak_markers_follow_the_factor_table() {
+        for (setting, (num, den)) in PEAK_FACTORS.iter().enumerate() {
+            // The distance below the peak grows by the factor, step by step.
+            assert_eq!(peak_fall_step(0, (*num, *den)), PEAK_FALL_SEED);
+            let mut fall = PEAK_FALL_SEED;
+            for _ in 0..8 {
+                let next = peak_fall_step(fall, (*num, *den));
+                assert_eq!(next, (fall * num + den / 2) / den, "setting {setting}");
+                assert!(next > fall, "the distance grows with every update");
+                fall = next;
+            }
         }
-        assert_eq!(once.bars(), many.bars());
-        assert_eq!(once.peaks(), many.peaks());
-        many.advance(2000);
-        many.advance(2001);
-        assert_eq!(many.bars(), [0; SPECTRUM_BANDS]);
-        assert_eq!(many.peaks(), [0; SPECTRUM_BANDS]);
-    }
-
-    #[test]
-    fn the_peak_marker_holds_then_falls_and_stays_above_the_bar() {
+        // The analyser moves its marker with the same rule.
         let mut analyser = Analyser::default();
         analyser.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
         let band = band_of(16);
+        // The marker rests on the top of the bar.
+        assert_eq!(analyser.peaks[band], analyser.bars[band]);
+        assert_eq!(analyser.peak_fall[band], 0);
+        // The bar falls; the marker leaves it and its distance grows.
+        analyser.push(&silence(), 44100, 0).unwrap();
+        analyser.step();
+        assert_eq!(analyser.peak_fall[band], PEAK_FALL_SEED);
+        let mut previous = analyser.peak_fall[band];
+        for _ in 0..4 {
+            analyser.step();
+            let current = analyser.peak_fall[band];
+            assert_eq!(
+                current,
+                peak_fall_step(previous, PEAK_FACTORS[1]),
+                "the distance grows by the factor"
+            );
+            previous = current;
+        }
+        // The marker never falls below the bar it belongs to.
+        assert!(analyser.peaks[band] >= analyser.bars[band]);
+        // The setting is clamped to 0..=4 (S08 §3.2).
+        let mut clamped = Analyser::default();
+        clamped.set_tuning(Tuning {
+            peak_falloff: 9,
+            ..Tuning::default()
+        });
+        assert_eq!(clamped.tuning().peak_factor(), PEAK_FACTORS[4]);
+        assert_eq!(clamped.tuning().peak_factor(), (8, 5));
+    }
+
+    /// S08 §3.1: `sa_peaks` = 0 draws no marker at all.
+    #[test]
+    fn the_peak_markers_can_be_switched_off() {
+        let mut analyser = Analyser::default();
+        analyser.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
+        let band = band_of(16);
+        assert!(analyser.peaks[band] > 0);
+        analyser.set_tuning(Tuning {
+            peaks: false,
+            ..Tuning::default()
+        });
+        analyser.push(&silence(), 44100, 0).unwrap();
+        analyser.step();
+        assert_eq!(analyser.peaks[band], 0);
+        assert!(analyser.bars[band] > 0, "the bars keep going");
+    }
+
+    /// A long run must not overflow, drift or hang.
+    #[test]
+    fn a_long_run_stays_bounded() {
+        let mut analyser = Analyser::default();
+        let mut time = 0;
+        for step in 0..20_000u64 {
+            time += 20;
+            if step % 3 == 0 {
+                analyser
+                    .push(&sine((step % 36) as usize, 36, 1.0), 44100, time)
+                    .unwrap();
+            } else {
+                analyser.advance(time);
+            }
+            assert!(
+                analyser
+                    .bars()
+                    .iter()
+                    .all(|height| *height <= SPECTRUM_ROWS)
+            );
+            assert!(
+                analyser
+                    .peaks()
+                    .iter()
+                    .all(|height| *height <= SPECTRUM_ROWS)
+            );
+            assert!(
+                analyser
+                    .bars()
+                    .iter()
+                    .zip(analyser.peaks().iter())
+                    .all(|(bar, peak)| peak >= bar),
+                "the marker never falls below its bar"
+            );
+        }
+        // After the input is gone the display empties itself.
+        analyser.advance(time + 10_000);
+        assert_eq!(analyser.bars(), [0; SPECTRUM_BANDS]);
+        assert_eq!(analyser.peaks(), [0; SPECTRUM_BANDS]);
+    }
+
+    /// The whole law in one receipt: a full-scale tone, then twelve updates
+    /// without a new frame, leave the bar at nine rows and the marker at
+    /// thirteen.
+    #[test]
+    fn the_frozen_display_has_the_expected_rows() {
+        let mut analyser = Analyser::default();
+        analyser.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
+        let band = band_of(16);
+        assert_eq!(analyser.bars()[band], SPECTRUM_ROWS);
         assert_eq!(analyser.peaks()[band], SPECTRUM_ROWS);
-        analyser.advance(299);
-        assert_eq!(
-            analyser.peaks()[band],
-            SPECTRUM_ROWS,
-            "the hold lasts 300 ms"
-        );
+        // 425 ms are twelve updates at thirty a second. The first three
+        // still hold the input, the other nine let the bar fall.
+        analyser.advance(100);
+        analyser.advance(101);
         analyser.advance(300);
-        assert_eq!(
-            analyser.peaks()[band],
-            SPECTRUM_ROWS,
-            "the fall starts after the hold"
-        );
         analyser.advance(425);
-        assert_eq!(analyser.peaks()[band], 14, "16 rows/s after the hold");
-        // The marker never drops below the bar it belongs to.
+        assert_eq!(analyser.bars()[band], 9, "256 - 9 x 12 sixteenths");
+        assert_eq!(analyser.peaks()[band], 13);
         assert!(analyser.peaks()[band] >= analyser.bars()[band]);
-        // A new frame that reaches the top renews the marker and its hold.
-        analyser.push(&sine(0, 36, 1.0), 44100, 500).unwrap();
-        assert_eq!(analyser.peaks()[band], SPECTRUM_ROWS);
-        analyser.advance(800);
-        assert_eq!(
-            analyser.peaks()[band],
-            SPECTRUM_ROWS,
-            "the hold starts again"
-        );
-        // The fall rate of the marker is configurable, too.
-        let mut slow = Analyser::default();
-        slow.set_tuning(Tuning {
-            peak_fall_rows_per_second: 4.0,
-            ..Tuning::default()
-        });
-        slow.push(&sine(0, 36, 1.0), 44100, 0).unwrap();
-        slow.advance(600);
-        assert_eq!(
-            slow.peaks()[band],
-            15,
-            "4 rows/s over the 300 ms after the hold"
-        );
     }
 
     #[test]

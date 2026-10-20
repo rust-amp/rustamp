@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use rustamp_skin::{
     BuiltinDefaultSkin, BuiltinLookalikeSkin, MemorySource, Skin, webamp::DEFAULT_VISCOLORS,
 };
-use rustamp_ui::visualization::{VisInput, VisMode, VisState, slots};
+use rustamp_ui::visualization::{SPECTRUM_BANDS, VisInput, VisMode, VisState, slots};
 use rustamp_ui::{MainWindowLayout, MainWindowState, render_main_window};
 
 /// 24 distinct colours, one per slot.
@@ -49,7 +49,7 @@ fn spectrum_state() -> MainWindowState {
     MainWindowState {
         visualization: VisState {
             mode: VisMode::Spectrum,
-            bars: [16; 19],
+            bars: [16; SPECTRUM_BANDS],
             scope: [8; 76],
             input: VisInput::Fresh,
             ..VisState::default()
@@ -134,7 +134,7 @@ fn the_peak_marker_uses_slot_23() {
     let colors = palette();
     let skin = skin_with_viscolors(&colors);
     let mut state = spectrum_state();
-    state.visualization.peaks = [8; 19];
+    state.visualization.peaks = [8; SPECTRUM_BANDS];
     let frame = render_main_window(&state, &skin, &MainWindowLayout::CLASSIC);
     let area = area();
     // The marker rides above the bar's top: 16 rows minus a peak of 8.
