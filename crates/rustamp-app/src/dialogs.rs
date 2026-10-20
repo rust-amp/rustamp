@@ -69,6 +69,16 @@
 //!   read, or it carries no tags. S03 §2 gives the id and the chord only, so
 //!   the content is an own choice (see
 //!   [`rustamp_ui::dialogs::ExtendedInfo`]).
+//! * Edit entry (S03 §2 `40255` "Edit the playlist entry"): the **tags of
+//!   one** selected playlist entry, one field per tag. The app reads the
+//!   tags when the action runs, opens the box with them and writes the
+//!   fields the user changed back into the file with `rustamp-meta`. A
+//!   stream has no local file and therefore no tags to edit: the action
+//!   says so and opens nothing, and so does an empty selection. A field
+//!   that does not validate keeps the box open, so the user can fix it;
+//!   `Escape` closes the box and writes nothing. S03 §2 gives the id and
+//!   the chord only, so the fields and the validation are an own choice
+//!   (see [`rustamp_ui::dialogs::EditEntryDialog`]).
 
 use std::path::PathBuf;
 
@@ -80,11 +90,26 @@ use rustamp_platform::{Bind, PluginRow, PrefsAction, PrefsNode, PrefsSettings};
 use rustamp_plugin_abi::PluginKind;
 use rustamp_prefs::page_name;
 use rustamp_ui::{
-    DialogKind, ExtendedInfo, Key, SkinEntry, dialog_for_command, extended_info_lines,
-    render_dialog, skin_entries,
+    DialogKind, EditEntryChanges, EditEntryDialog, EditEntryOutcome, ExtendedInfo, Key, Modifiers,
+    SkinEntry, dialog_for_command, edit_entry_lines, extended_info_lines, render_dialog,
+    skin_entries,
 };
 
 use crate::app::App;
+
+/// The edit-entry session: the file whose tags the dialog edits and the
+/// dialog's model.
+///
+/// The session lives as long as the dialog is open. The file is named here
+/// because the dialog itself only knows the tag fields: writing the changed
+/// fields back into the file is the app's job, and the app needs the path
+/// for it.
+pub(crate) struct EditEntrySession {
+    /// The file whose tags are edited.
+    pub(crate) path: PathBuf,
+    /// The dialog's model: the fields, the focus and the validation.
+    pub(crate) dialog: EditEntryDialog,
+}
 
 impl App {
     /// Opens the dialog `command` asks for, when it asks for one the app now
@@ -96,6 +121,9 @@ impl App {
     pub fn open_dialog_for(&mut self, command: &Command) -> Option<DialogKind> {
         let dialog = dialog_for_command(command)?;
         self.dialogs.open(dialog);
+        // The new dialog replaces the open one, so the edit-entry session
+        // (the file it edits) goes with it.
+        self.edit_entry = None;
         // The browser moves its selection with the arrow keys, and without the
         // row count a held Down would overrun the end and a following Up would
         // appear dead. Tell the manager how many rows it is looking at.
@@ -209,12 +237,16 @@ impl App {
     /// Closes `dialog` when it is open.
     pub fn close_dialog(&mut self, dialog: DialogKind) {
         self.dialogs.close(dialog);
+        if dialog == DialogKind::EditEntry {
+            self.edit_entry = None;
+        }
     }
 
     /// Closes whatever dialog is open, if any. Returns whether one was open.
     pub fn close_open_dialog(&mut self) -> bool {
         let open = self.dialogs.open_kind().is_some();
         self.dialogs.close_any();
+        self.edit_entry = None;
         open
     }
 
@@ -222,14 +254,22 @@ impl App {
     ///
     /// `Enter` confirms the jump-to-time box (submitting the resulting
     /// [`Command::Seek`]), the skin browser's selected skin, the
-    /// load-playlist dialog (loading the file and closing the dialog), or the
+    /// load-playlist dialog (loading the file and closing the dialog), the
     /// open-media dialog (submitting the resulting [`Command::AddItems`] and
-    /// closing it; with nothing to confirm the dialog stays open);
+    /// closing it; with nothing to confirm the dialog stays open) or the
+    /// edit-entry box (writing the changed tags into the file);
     /// `Escape` closes the open dialog; digits type into the jump box (and
     /// letters/digits/spaces into the open-media and load-playlist fields) and
     /// arrows move the skin selection.
     /// Returns `true` when the key was consumed.
-    pub fn dialog_key(&mut self, key: Key) -> bool {
+    ///
+    /// The modifiers belong to the key: the edit-entry box moves its focus
+    /// with `Tab` and `Shift`+`Tab`, and the two are the same key with a
+    /// modifier the box has to see.
+    pub fn dialog_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
+        if self.edit_entry_session().is_some() {
+            return self.edit_entry_key(key, modifiers);
+        }
         let is_load_playlist = self.dialog_is_open(DialogKind::LoadPlaylist);
         if is_load_playlist {
             match key {
@@ -286,6 +326,91 @@ impl App {
         true
     }
 
+    /// The edit-entry session, when the edit-entry box is the open dialog.
+    ///
+    /// A session belongs to the box that opened it: another dialog replaces
+    /// the box, and the session goes with it, so a stale one never takes a
+    /// key press or a typed text that belongs to the dialog in front.
+    fn edit_entry_session(&self) -> Option<&EditEntrySession> {
+        if self.dialog_is_open(DialogKind::EditEntry) {
+            self.edit_entry.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// A key press in the edit-entry box (S03 §2 `40255`).
+    ///
+    /// The box owns the fields: `Tab` and `Shift`+`Tab` move the focus, the
+    /// text keys type into the focused field, `Backspace` deletes, `Enter`
+    /// saves and `Escape` cancels. The app's part is the save: the changed
+    /// fields go into the file's tags, and the box closes when that worked.
+    ///
+    /// A field that does not validate keeps the box open (the message is in
+    /// the box's last line) and a failed write keeps it open too, so the
+    /// user can try again. Returns whether the key was consumed.
+    fn edit_entry_key(&mut self, key: Key, modifiers: Modifiers) -> bool {
+        let outcome = match self.edit_entry.as_mut() {
+            Some(session) => session.dialog.key(key, modifiers),
+            None => return false,
+        };
+        match outcome {
+            EditEntryOutcome::Unhandled => false,
+            EditEntryOutcome::Edited => true,
+            EditEntryOutcome::Cancel => {
+                self.edit_entry = None;
+                self.dialogs.close(DialogKind::EditEntry);
+                true
+            }
+            EditEntryOutcome::Invalid(invalid) => {
+                self.note(format!("edit entry: {}", invalid.message()));
+                true
+            }
+            EditEntryOutcome::Save(changes) => {
+                self.save_edit_entry(changes);
+                true
+            }
+        }
+    }
+
+    /// Writes the changed fields into the file's tags and closes the box.
+    ///
+    /// The write is the honest one ([`rustamp_meta::write_tags_report`]):
+    /// the fields the user did not touch keep the value the file has, and
+    /// the report names every `extra` key the format refused — a field the
+    /// target format has no place for (the total of a disc on an MP3, for
+    /// example). A refused key is not a failure: the rest of the write
+    /// landed, so the box closes and the refusal is reported.
+    ///
+    /// A failed write (an unreadable file, a format that cannot hold the
+    /// fields) keeps the box open, so the user can correct the fields and
+    /// try again.
+    fn save_edit_entry(&mut self, changes: EditEntryChanges) {
+        let Some(session) = self.edit_entry.as_ref() else {
+            return;
+        };
+        let path = session.path.clone();
+        let report = match rustamp_meta::write_tags_report(&path, &changes.to_metadata()) {
+            Ok(report) => report,
+            Err(error) => {
+                self.note(format!(
+                    "edit entry: {} could not be written: {error}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+        if !report.unwritten_extra.is_empty() {
+            self.note(format!(
+                "edit entry: {} did not store: {}",
+                path.display(),
+                report.unwritten_extra.join(", ")
+            ));
+        }
+        self.edit_entry = None;
+        self.dialogs.close(DialogKind::EditEntry);
+    }
+
     /// Confirms the load-playlist dialog: loads the chosen playlist file
     /// through [`App::load_playlist_file`]. Returns whether a path was chosen
     /// and confirmed (the dialog closes on confirm); with nothing chosen the
@@ -303,7 +428,7 @@ impl App {
     /// text of a key press there instead of the key, see
     /// [`App::dialog_text`]).
     pub fn dialog_accepts_text(&self) -> bool {
-        self.dialogs.accepts_text()
+        self.edit_entry_session().is_some() || self.dialogs.accepts_text()
     }
 
     /// Text the OS produced for a key press while a dialog is focused
@@ -312,6 +437,11 @@ impl App {
     /// [`rustamp_ui::DialogManager::type_text`]). Returns whether anything
     /// was typed; control characters are left to [`App::dialog_key`].
     pub fn dialog_text(&mut self, text: &str) -> bool {
+        if self.edit_entry_session().is_some()
+            && let Some(session) = self.edit_entry.as_mut()
+        {
+            return session.dialog.type_text(text);
+        }
         let typed = self.dialogs.type_text(text);
         self.sync_jump_rows();
         typed
@@ -572,6 +702,7 @@ impl App {
             ],
             DialogKind::FileInfo => self.file_info_lines(),
             DialogKind::ExtendedInfo => self.extended_info_lines(),
+            DialogKind::EditEntry => self.edit_entry_lines(),
             DialogKind::Jump(JumpTarget::Time) => vec![
                 "Seconds or m:ss:".to_string(),
                 self.dialogs.jump_text().to_string(),
@@ -758,6 +889,9 @@ impl App {
         };
         self.extended_info = Some(extended_info_for(sources.len(), &first));
         self.dialogs.open(DialogKind::ExtendedInfo);
+        // The extended-info box replaces the open one, so the edit-entry
+        // session (the file it edits) goes with it.
+        self.edit_entry = None;
     }
 
     /// The queue sources of the selected entries, in playlist order.
@@ -786,6 +920,62 @@ impl App {
         match &self.extended_info {
             Some(info) => extended_info_lines(info),
             None => vec!["no extended info was read".to_string()],
+        }
+    }
+
+    /// Opens the edit-entry box for the selected entry (S03 §2 `40255`
+    /// "Edit the playlist entry").
+    ///
+    /// The box edits the tags of **one** entry: the first selected one, in
+    /// playlist order — the same rule the extended-info box uses, so a
+    /// multi-selection is summarised instead of read entry by entry.
+    ///
+    /// The tags are read once, when the action runs, and the box is filled
+    /// with them; nothing reads the files again while it is open. The
+    /// cases that cannot be edited are reported and open no box:
+    ///
+    /// * nothing is selected;
+    /// * the entry is a stream — it has no local file and therefore no tags
+    ///   to edit;
+    /// * the file cannot be read.
+    pub(crate) fn show_edit_entry(&mut self) {
+        let sources = self.selected_sources();
+        let Some(first) = sources.first().cloned() else {
+            self.note("edit entry: nothing is selected".to_string());
+            return;
+        };
+        let TrackSource::Path(path) = first else {
+            self.note(format!(
+                "edit entry: {} is a stream and has no tags to edit",
+                first.display()
+            ));
+            return;
+        };
+        let metadata = match rustamp_meta::read_tags(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.note(format!(
+                    "edit entry: {} could not be read: {error}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+        self.edit_entry = Some(EditEntrySession {
+            path,
+            dialog: EditEntryDialog::new(&metadata),
+        });
+        self.dialogs.open(DialogKind::EditEntry);
+    }
+
+    /// The edit-entry box's body lines: the fields of the entry being edited.
+    ///
+    /// An empty session (the box was opened without a reading) says so
+    /// instead of showing nothing.
+    pub(crate) fn edit_entry_lines(&self) -> Vec<String> {
+        match &self.edit_entry {
+            Some(session) => edit_entry_lines(&session.dialog),
+            None => vec!["no entry is being edited".to_string()],
         }
     }
 }
@@ -943,7 +1133,100 @@ pub use rustamp_ui::DialogManager as Dialogs;
 
 #[cfg(test)]
 mod tests {
+    use rustamp_core::command::{Command, SelectOp};
+    use rustamp_core::config::Config;
+    use rustamp_core::playlist::{EntryId, MediaLocation};
+    use rustamp_ui::ShortcutOutcome;
+
     use super::*;
+    use crate::app::AppOptions;
+    use crate::cli::OutputChoice;
+
+    /// A headless app (no window, no audio device).
+    fn test_app() -> App {
+        let options = AppOptions {
+            config: Config::default(),
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            file: None,
+            seconds: None,
+        };
+        App::new(options).expect("the test app builds headless")
+    }
+
+    /// A copy of the tagged MP3 fixture, in a temporary directory.
+    ///
+    /// The fixture lives in the decoders' test data (`sine.mp3`); it is
+    /// copied, never written to.
+    fn tagged_mp3(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rustamp-decoders/tests/fixtures/sine.mp3");
+        let path = dir.path().join(name);
+        std::fs::copy(&fixture, &path).expect("copy the tagged fixture");
+        path
+    }
+
+    /// Adds one entry to the queue, selects it and returns its id.
+    fn add_and_select(app: &mut App, location: MediaLocation) -> EntryId {
+        app.submit(Command::AddItems {
+            items: vec![location],
+            at: None,
+            play: false,
+        })
+        .expect("AddItems applies");
+        let id = *app.entry_ids.last().expect("the entry has an id");
+        app.submit(Command::Select(SelectOp::Set(vec![id])))
+            .expect("Select applies");
+        id
+    }
+
+    /// Presses the playlist's `Ctrl+E` row (S03 §2 `40255`).
+    fn edit_entry(app: &mut App) -> Option<ShortcutOutcome> {
+        app.playlist_key_down(Key::Letter(b'E'), Modifiers::CTRL)
+            .expect("Ctrl+E applies")
+    }
+
+    /// The open box's body lines.
+    fn lines(app: &App) -> Vec<String> {
+        app.open_dialog_lines().expect("the box has lines")
+    }
+
+    /// The line of the field `label` in the box's body.
+    fn field_line(app: &App, label: &str) -> String {
+        lines(app)
+            .into_iter()
+            .find(|line| {
+                line.trim_start()
+                    .trim_start_matches("> ")
+                    .starts_with(label)
+            })
+            .unwrap_or_else(|| panic!("the box has no {label} line"))
+    }
+
+    /// Clears the focused field and types `text` into it.
+    fn retype(app: &mut App, text: &str) {
+        for _ in 0..64 {
+            if !app.dialog_key(Key::Backspace, Modifiers::NONE) {
+                break;
+            }
+        }
+        assert!(app.dialog_text(text), "the text was not typed");
+    }
+
+    /// Moves the focus to the field `label` with `Tab`.
+    fn focus(app: &mut App, label: &str) {
+        for _ in 0..16 {
+            if field_line(app, label).starts_with("> ") {
+                return;
+            }
+            assert!(
+                app.dialog_key(Key::Tab, Modifiers::NONE),
+                "Tab was not consumed"
+            );
+        }
+        panic!("the box has no {label} field");
+    }
 
     #[test]
     fn the_two_measured_pages_open_their_native_pages() {
@@ -996,5 +1279,181 @@ mod tests {
             - 2 * rustamp_ui::dialogs::TEXT_PAD as usize)
             / TEXT_CELL_PX;
         assert!(row.chars().count() <= budget, "{} > {budget}", row);
+    }
+
+    // ----- the edit-entry box (S03 §2 `40255`) -----
+
+    #[test]
+    fn the_edit_entry_row_opens_the_box_with_the_tags_of_the_selected_entry() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path));
+
+        let outcome = edit_entry(&mut app);
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert!(app.dialog_is_open(DialogKind::EditEntry));
+        // Every field starts with the value the file carries.
+        assert_eq!(field_line(&app, "Title"), "> Title: Sine Title");
+        assert_eq!(field_line(&app, "Artist"), "  Artist: Test Artist");
+        assert_eq!(field_line(&app, "Album"), "  Album: Test Album");
+        assert_eq!(field_line(&app, "Year"), "  Year: 2001");
+        assert_eq!(field_line(&app, "Genre"), "  Genre: Test");
+        // The last line names the keys, not an error.
+        assert!(
+            lines(&app).last().expect("a last line").contains("Tab"),
+            "{:?}",
+            lines(&app)
+        );
+    }
+
+    #[test]
+    fn typing_and_tab_reach_the_fields() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path));
+        edit_entry(&mut app);
+
+        // The text of a key press goes into the focused field.
+        assert!(app.dialog_text("!"));
+        assert_eq!(field_line(&app, "Title"), "> Title: Sine Title!");
+        // `Tab` moves the focus to the next field.
+        assert!(app.dialog_key(Key::Tab, Modifiers::NONE));
+        assert_eq!(field_line(&app, "Artist"), "> Artist: Test Artist");
+        assert!(app.dialog_text("?"));
+        assert_eq!(field_line(&app, "Artist"), "> Artist: Test Artist?");
+        // `Shift`+`Tab` moves it back: the box sees the modifier, so the
+        // focus does not run forward.
+        assert!(app.dialog_key(Key::Tab, Modifiers::SHIFT));
+        assert_eq!(field_line(&app, "Title"), "> Title: Sine Title!");
+        assert_eq!(field_line(&app, "Artist"), "  Artist: Test Artist?");
+    }
+
+    #[test]
+    fn a_bad_year_keeps_the_box_open_with_the_error() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        // The year field gets a letter: it is not a number any more.
+        focus(&mut app, "Year");
+        assert!(app.dialog_text("x"));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+        // The box stays open and names the field that does not validate.
+        assert!(app.dialog_is_open(DialogKind::EditEntry));
+        let last = lines(&app).last().expect("a last line").clone();
+        assert!(last.starts_with("Year: "), "{last}");
+        assert!(last.contains("must be a number"), "{last}");
+        // Nothing was written.
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.year, Some(2001));
+    }
+
+    #[test]
+    fn save_writes_the_tags_and_reports_the_formats_refusals() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        // A new title.
+        retype(&mut app, "Edited Title");
+        // A disc with a total: the total has no field in an ID3v2 tag, so
+        // the format refuses it and the write report says so.
+        focus(&mut app, "Disc");
+        assert!(app.dialog_text("1/2"));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        // The box closed and the file carries the new title.
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.title.as_deref(), Some("Edited Title"));
+        // The fields the user did not touch keep the value the file had.
+        assert_eq!(metadata.artist.as_deref(), Some("Test Artist"));
+        assert_eq!(metadata.year, Some(2001));
+        // The refusal is reported.
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|note| note.contains("DISCTOTAL")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_stream_and_an_empty_selection_report_instead_of_opening() {
+        let mut app = test_app();
+        // Nothing selected: the action says so and opens no box.
+        app.submit(Command::AddItems {
+            items: vec![MediaLocation::File(PathBuf::from("track.mp3"))],
+            at: None,
+            play: false,
+        })
+        .expect("AddItems applies");
+        let outcome = edit_entry(&mut app);
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        let notes = app.drain_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("nothing is selected")),
+            "{notes:?}"
+        );
+
+        // A stream has no local file and therefore no tags to edit.
+        add_and_select(
+            &mut app,
+            MediaLocation::Url("http://example.com/stream".to_string()),
+        );
+        let outcome = edit_entry(&mut app);
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|note| note.contains("is a stream")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_box_without_writing() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = tagged_mp3(&dir, "tagged.mp3");
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(path.clone()));
+        edit_entry(&mut app);
+
+        retype(&mut app, "Never Written");
+        assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        // The file kept its title: the box wrote nothing.
+        let metadata = rustamp_meta::read_tags(&path).expect("the file is readable");
+        assert_eq!(metadata.title.as_deref(), Some("Sine Title"));
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_reported_and_opens_no_box() {
+        let mut app = test_app();
+        add_and_select(&mut app, MediaLocation::File(PathBuf::from("gone.mp3")));
+        let outcome = edit_entry(&mut app);
+        assert_eq!(outcome, Some(ShortcutOutcome::Handled));
+        assert!(!app.dialog_is_open(DialogKind::EditEntry));
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|note| note.contains("could not be read")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn the_box_window_carries_its_own_title_and_size() {
+        use rustamp_ui::{EDIT_ENTRY_CLIENT_SIZE, EDIT_ENTRY_TITLE};
+        assert_eq!(DialogKind::EditEntry.title(), EDIT_ENTRY_TITLE);
+        assert_eq!(DialogKind::EditEntry.client_size(), EDIT_ENTRY_CLIENT_SIZE);
     }
 }

@@ -33,7 +33,7 @@ use rustamp_core::error::Result;
 use rustamp_core::meta::TrackMetadata;
 use rustamp_core::playlist::EntryId;
 use rustamp_core::state::{TransportState, WindowId};
-use rustamp_ui::{DialogKind, Key, MainWindowLayout, Widget};
+use rustamp_ui::{DialogKind, Key, MainWindowLayout, Modifiers, Widget};
 
 /// Seconds of silence each test track lasts (long enough to stay playing).
 const TRACK_FRAMES: u64 = 44_100 * 30;
@@ -184,9 +184,9 @@ fn eject_then_a_typed_path_queues_and_plays_the_file() {
     // typo fixed with Backspace.
     type_path(&mut app, &song);
     assert!(app.dialog_text("x"));
-    assert!(app.dialog_key(Key::Backspace));
+    assert!(app.dialog_key(Key::Backspace, Modifiers::NONE));
     assert_eq!(app.media_text(), song.display().to_string());
-    assert!(app.dialog_key(Key::Enter));
+    assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
     assert_eq!(app.dialog_open_kind(), None);
 
     // The path reached the queue and the playlist shows the entry.
@@ -233,7 +233,7 @@ fn add_then_double_click_plays_the_typed_file() {
     );
     assert_eq!(app.dialog_open_kind(), Some(FILES_ADD));
     type_path(&mut app, &song);
-    assert!(app.dialog_key(Key::Enter));
+    assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
     assert_eq!(app.engine().queue().len(), 1);
     assert_eq!(app.playlist().visible_ids(), vec![EntryId(0)]);
     assert_eq!(app.engine().transport(), TransportState::Stopped);
@@ -257,7 +257,7 @@ fn a_file_dropped_on_the_dialog_is_queued_and_played() {
     let mut app = app(None);
     click(&mut app, Widget::Eject);
     assert!(app.dialog_drop_file(song));
-    assert!(app.dialog_key(Key::Enter));
+    assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
     assert_eq!(app.engine().queue().len(), 1);
     assert!(pump_until(&mut app, |app| app.engine().transport()
         == TransportState::Playing));
@@ -298,7 +298,7 @@ fn an_unsupported_file_typed_into_the_dialog_stops_and_says_why() {
     let mut app = app(None);
     click(&mut app, Widget::Eject);
     type_path(&mut app, &odd);
-    assert!(app.dialog_key(Key::Enter));
+    assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
     assert!(
         pump_until(&mut app, |app| app.last_error().is_some()
             && app.engine().transport() == TransportState::Stopped
@@ -312,7 +312,7 @@ fn an_unsupported_file_typed_into_the_dialog_stops_and_says_why() {
     let song = file(&dir, "good.tst");
     click(&mut app, Widget::Eject);
     type_path(&mut app, &song);
-    assert!(app.dialog_key(Key::Enter));
+    assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
     assert!(pump_until(&mut app, |app| app.engine().transport()
         == TransportState::Playing
         && app.last_error().is_none()));

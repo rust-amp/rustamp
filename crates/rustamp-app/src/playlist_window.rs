@@ -504,16 +504,13 @@ impl App {
             // ----- the edit-entry dialog (S03 §2 `40255`) -----
             // The row is bound: the dialog's model (the fields, the
             // validation and the save request) lives in `rustamp-ui`'s
-            // `dialogs` module. The app half — reading the tags of the
+            // `dialogs` module, and the app half — reading the tags of the
             // selected entry, opening the dialog and writing the changed
-            // fields back with `rustamp-meta` — is not wired yet, so the row
-            // says so. It does not fall through to the main table's `40186`
-            // "Toggle easy move".
+            // fields back with `rustamp-meta` — is in `crate::dialogs`. The
+            // action is handled either way; it does not fall through to the
+            // main table's `40186` "Toggle easy move".
             PlaylistKeyAction::EditEntry => {
-                self.note(
-                    "playlist command 40255 (edit the playlist entry) is not implemented yet"
-                        .to_string(),
-                );
+                self.show_edit_entry();
                 Ok(Some(ShortcutOutcome::Handled))
             }
             // ----- the provisional close row -----
@@ -1188,7 +1185,7 @@ mod tests {
         add_entries(&mut app, 3);
         app.playlist_mouse_down(24, 92).expect("ADD applies");
         app.stage_media_paths(vec![PathBuf::from("picked.mp3")]);
-        assert!(app.dialog_key(Key::Enter));
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.dialog_open_kind(), None);
         // The engine queue is the source of truth for the add; the id-table
         // growth re-syncs the playlist model at once, with no button press.
@@ -1963,11 +1960,11 @@ mod tests {
     }
 
     #[test]
-    fn the_rows_without_a_command_do_nothing_and_are_noted() {
-        // S03 §2's `40255` "Edit the playlist entry" has its own row now (the
-        // dialog's model is in `rustamp-ui`'s `dialogs` module), but the app
-        // half is not wired yet: the row must not fall through to the main
-        // table's `40186` "Toggle easy move".
+    fn the_edit_entry_row_does_not_fall_through_to_the_main_table() {
+        // S03 §2's `40255` "Edit the playlist entry" has its own row: the
+        // dialog's model is in `rustamp-ui`'s `dialogs` module and the app
+        // half is in `crate::dialogs`. The row must not fall through to the
+        // main table's `40186` "Toggle easy move".
         let mut app = test_app();
         let easy_move = app.easy_move();
         let outcome = app
@@ -1979,8 +1976,19 @@ mod tests {
             easy_move,
             "the main table's Ctrl+E must not run"
         );
+        // With nothing selected the row says so and opens no box.
+        assert!(!app.dialog_is_open(rustamp_ui::DialogKind::EditEntry));
         let notes = app.drain_notes();
-        assert!(notes.iter().any(|note| note.contains("40255")), "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("nothing is selected")),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("40255")),
+            "{notes:?}"
+        );
     }
 
     /// A copy of the tagged MP3 fixture, in a temporary directory.
