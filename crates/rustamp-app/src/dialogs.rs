@@ -55,6 +55,11 @@
 //!   when it is not one of them), with the selected row marked. `Enter` loads
 //!   the selected skin through the existing skin path (`Command::LoadSkin` for
 //!   a file row, the built-in loader otherwise) and closes the dialog.
+//!   The list is longer than the browser's client area, so the browser shows
+//!   a **window** of it: the rows that fit are drawn (see
+//!   [`rustamp_ui::skin_browser_visible_rows`]), the arrow keys move the
+//!   selection and scroll the window with it, `PageUp`/`PageDown` page
+//!   through the list and `Home`/`End` jump to the first and the last row.
 //! * Preferences: the frame shows the requested page's own-choice name
 //!   (`rustamp-prefs`) and nothing else — the reference's page contents are
 //!   unmeasured (S04 open), so there are no controls to draw, type into or
@@ -128,14 +133,34 @@ impl App {
         // The new dialog replaces the open one, so the edit-entry session
         // (the file it edits) goes with it.
         self.edit_entry = None;
-        // The browser moves its selection with the arrow keys, and without the
-        // row count a held Down would overrun the end and a following Up would
-        // appear dead. Tell the manager how many rows it is looking at.
+        // The browser moves its selection with the arrow keys and scrolls its
+        // window, and without the row count and the client height a held
+        // Down would overrun the end (a following Up would appear dead) and
+        // the window would not know how many rows it shows. Tell the manager
+        // both.
         if dialog == DialogKind::SkinBrowser {
-            self.dialogs.set_skin_rows(self.browser_entries().len());
+            self.sync_skin_view();
         }
         self.sync_jump_rows();
         Some(dialog)
+    }
+
+    /// Tells the dialog manager how many rows the skin browser has and how
+    /// much room it has for them, so the selection and the scroll window stay
+    /// inside the list.
+    ///
+    /// The row count follows the skins folder, which can change while the
+    /// browser is open (a skin added or removed), so the count is told to
+    /// the manager whenever a key is pressed and when the browser opens. The
+    /// client height is the browser's own size, so a change of that size
+    /// changes the number of rows the window shows.
+    fn sync_skin_view(&mut self) {
+        if !self.dialog_is_open(DialogKind::SkinBrowser) {
+            return;
+        }
+        self.dialogs
+            .set_skin_client_height(DialogKind::SkinBrowser.client_size().1);
+        self.dialogs.set_skin_rows(self.browser_entries().len());
     }
 
     /// The queue indices the jump-to-file box lists: every entry whose
@@ -296,6 +321,7 @@ impl App {
             return false;
         }
         self.sync_jump_rows();
+        self.sync_skin_view();
         match key {
             Key::Enter => {
                 if self.dialog_is_open(DialogKind::Jump(JumpTarget::File)) {
@@ -859,16 +885,22 @@ impl App {
         entries
     }
 
-    /// The skin browser's body lines: one row per entry, with the selected
-    /// row marked. The `"> "` marker uses glyphs the stand-in bitmap font
-    /// has; like every dialog line it is own-choice chrome (S04 open).
+    /// The skin browser's body lines: the window of rows it shows, with the
+    /// selected row marked.
+    ///
+    /// The window holds the rows that fit into the browser's client area (see
+    /// [`rustamp_ui::skin_browser_visible_rows`]) and starts at the scroll
+    /// offset, so a list longer than the client area scrolls instead of being
+    /// clipped. The `"> "` marker uses glyphs the stand-in bitmap font has;
+    /// like every dialog line it is own-choice chrome (S04 open).
     pub(crate) fn skin_browser_lines(&self) -> Vec<String> {
         let entries = self.browser_entries();
-        let selected = self.dialogs.selected_skin(&entries);
-        entries
-            .iter()
-            .map(|entry| {
-                let marker = if Some(entry) == selected { "> " } else { "  " };
+        let selected = self.dialogs.skin_selected_index(&entries);
+        self.dialogs
+            .skin_visible_range(&entries)
+            .map(|index| {
+                let entry = &entries[index];
+                let marker = if Some(index) == selected { "> " } else { "  " };
                 format!("{marker}{}", entry.name)
             })
             .collect()

@@ -105,7 +105,7 @@ pub use dialogs::{
     OPEN_MEDIA_CLIENT_SIZE, PREFS_CLIENT_SIZE, SKIN_BROWSER_CLIENT_SIZE, SkinEntry, TagField,
     dialog_for_command, edit_entry_lines, extended_info_lines, media_item_for_url,
     media_items_for_paths, opening_command, parse_jump_time_ms, playlist_load_summary_lines,
-    render_dialog, skin_entries,
+    render_dialog, skin_browser_visible_rows, skin_entries,
 };
 pub use docking::{
     ClassicWindow, DEFAULT_EQUALIZER_POSITION, DEFAULT_MAIN_POSITION, DEFAULT_PLAYLIST_POSITION,
