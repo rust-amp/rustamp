@@ -35,6 +35,12 @@
 //! * [`playlist::PlaylistWindow`] is the headless playlist-editor behaviour of
 //!   spec **S06**: list selection, page scrolling, REM removal and the
 //!   bottom-bar dialog requests (titles only, no dialog internals).
+//! * [`title_format::TitleFormat`] is the title-format language of spec
+//!   **S14** as a pure engine: the field lookup, the twelve function
+//!   names, the conditional group and the switch that keeps the format
+//!   **off** by default. The language belongs to the reference's input
+//!   plug-ins, not to the player (S14 §1), so nothing of it is wired into
+//!   the app yet.
 //! * [`library::LibraryView`] is the headless media-library view model: the
 //!   loaded page of rows, the search text, the sort key and direction, the
 //!   selected row and the scroll offset. It never touches SQLite - the app
@@ -99,6 +105,7 @@ pub mod render;
 pub mod shell;
 pub mod shortcuts;
 pub mod state;
+pub mod title_format;
 pub mod visualization;
 pub mod widget;
 
@@ -199,4 +206,7 @@ pub use shortcuts::{
     ShortcutWindow, TEN_TRACK_STEP, VOLUME_STEP, lookup,
 };
 pub use state::{MainWindowState, MonoStereo, TransportButton, TransportState, WindowButton};
+pub use title_format::{
+    DEFAULT_TEMPLATE, FIELD_NAMES, MAX_NESTING_DEPTH, TitleFields, TitleFormat,
+};
 pub use widget::{Widget, hit_test};
