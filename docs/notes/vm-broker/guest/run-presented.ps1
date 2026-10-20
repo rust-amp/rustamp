@@ -136,6 +136,36 @@ if ($me -eq 0) {
 } else {
     Import-Module $HarnessModule -Force
 
+    # Always leave the sentinel. Without this, a terminating error anywhere in
+    # this payload (a window that never appears, a player that will not start,
+    # a harness call that throws) left session 0 polling for six minutes and
+    # then reporting "no done sentinel" - the failure said nothing about what
+    # went wrong. A trap catches that at any point and still writes the record,
+    # including the window list, which is what tells a missing class apart from
+    # a window that was never created.
+    trap {
+        $message = ($_ | Out-String).Trim()
+        $windows = @()
+        try {
+            $rustampPids = @(Get-Process -Name rustamp -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+            $windows = @([RustampCapture.Native]::EnumTopLevelWindows() |
+                Where-Object { $rustampPids -contains [int]$_.Pid } |
+                ForEach-Object { "{0:X} class='{1}' title='{2}' visible={3} pid={4}" -f [int64]$_.Hwnd, $_.ClassName, $_.Title, $_.Visible, $_.Pid })
+        } catch { }
+        $record = [ordered]@{
+            session      = $me
+            user         = $env:USERNAME
+            computer     = $env:COMPUTERNAME
+            harnessExit  = -1
+            failure      = $message
+            steps        = @($stepOutputs)
+            stdoutStderr = @($stdoutStderr) + @('trap: ' + $message) + @($windows)
+            windows      = $windows
+        }
+        $record | ConvertTo-Json -Depth 5 | Set-Content -Path $InnerDone -Encoding UTF8
+        exit 1
+    }
+
     # Parse the job file to get steps, winamp_args, expect_client_size
     $jobRaw = Get-Content -Path $JobFile -Raw -Encoding UTF8
     $job = $jobRaw | ConvertFrom-Json
@@ -162,19 +192,56 @@ if ($me -eq 0) {
     }
     if (-not $mainHwnd) { throw "no 'Winamp v1.x' window for rustamp.exe within 60 s" }
 
-    # Open the equalizer (WM_COMMAND 40036) and playlist (WM_COMMAND 40040)
-    # The recorded 1:1 landmark of the reference has both windows open and
-    # the comparison must start from the same state.
+    # Open the equalizer (WM_COMMAND 40036) and playlist (WM_COMMAND 40040).
+    # The recorded 1:1 landmark of the reference has both windows open and the
+    # comparison must start from the same state.
+    #
+    # A single post is not enough: our player installs its WM_COMMAND hook with
+    # the first UI tick, so a message posted the instant the window exists is
+    # dropped - six presented runs failed that way (main-inactive, eq-*), each
+    # one waiting for a window that never opened. Post, then wait for the window
+    # to exist, and post again only while it is still absent (the command is a
+    # toggle, so it must never be posted twice after the window appeared).
     $n = [RustampCapture.Native]
     $WM_COMMAND = 273
     $EQ_CMD = 40036
     $PL_CMD = 40040
-    Write-Host "sending WM_COMMAND $EQ_CMD (open equalizer) to main window"
-    [void]$n::PostMessage($mainHwnd, $WM_COMMAND, $EQ_CMD, 0)
-    Start-Sleep -Milliseconds 200
-    Write-Host "sending WM_COMMAND $PL_CMD (open playlist) to main window"
-    [void]$n::PostMessage($mainHwnd, $WM_COMMAND, $PL_CMD, 0)
-    Start-Sleep -Milliseconds 500
+
+    # The harness's Native type has no PostMessage (the first version of this
+    # runner called one anyway; with $ErrorActionPreference = 'Continue' the
+    # error scrolled past and the equalizer simply never opened, so every
+    # `eq-*` capture waited for a window that did not exist). Declare the one
+    # call this needs under our own type name so it cannot collide with the
+    # module's.
+    if (-not ('RustampPresented.User32' -as [type])) {
+        Add-Type -Namespace RustampPresented -Name User32 -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)] public static extern bool PostMessageW(System.IntPtr hWnd, uint msg, System.IntPtr wParam, System.IntPtr lParam);'
+    }
+
+    function Open-WindowByCommand {
+        param([string]$Label, [int]$Command, [string]$Class, [int]$Seconds = 20)
+        $attempts = 0
+        $deadline = (Get-Date).AddSeconds($Seconds)
+        while ((Get-Date) -lt $deadline) {
+            $present = $false
+            try { $null = Resolve-CaptureWindow -Class $Class -ProcessName 'rustamp'; $present = $true } catch { $present = $false }
+            if ($present) {
+                Write-Host ("{0} window present after {1} post(s): {2}" -f $Label, $attempts, $Class)
+                return $true
+            }
+            $attempts++
+            Write-Host ("posting WM_COMMAND {0} ({1}) to the main window, attempt {2}" -f $Command, $Label, $attempts)
+            [void][RustampPresented.User32]::PostMessageW($mainHwnd, [uint32]$WM_COMMAND, [IntPtr]$Command, [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 700
+        }
+        Write-Host ("{0} window still absent after {1} post(s) in {2} s (class '{3}')" -f $Label, $attempts, $Seconds, $Class)
+        return $false
+    }
+
+    $eqOpened = Open-WindowByCommand -Label 'equalizer' -Command $EQ_CMD -Class 'Winamp EQ'
+    $plOpened = Open-WindowByCommand -Label 'playlist' -Command $PL_CMD -Class 'Winamp PE'
+    if (-not ($eqOpened -and $plOpened)) {
+        throw ("the start state could not be reached: equalizer={0}, playlist={1} - every capture would be of the wrong state" -f $eqOpened, $plOpened)
+    }
 
     # Run each step through Invoke-Capture.ps1
     foreach ($step in $job.steps) {
