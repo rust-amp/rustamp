@@ -33,6 +33,19 @@
 //! The reference's preferences pages are unmeasured (S04 is open), so the page
 //! that carries them and the wording of their labels are own choices.
 //!
+//! # The plug-in list
+//!
+//! Five of the pages list plug-ins: one page per kind. The rows of such a
+//! list belong to the page they are shown on - the input page's rows say
+//! nothing about the output page's rows - so the list remembers the page it
+//! shows. A page switch therefore refills the list, even when the two pages
+//! have the same rows: the player says the same thing on every plug-in page
+//! when it has nothing to list.
+//!
+//! The player's id behind a row is part of that state as well, so that the
+//! "switch on / off" button always names the plug-in of the row that is on
+//! screen.
+//!
 //! # The library page
 //!
 //! One page is not the reference's: `Library`. The media library is this
@@ -633,6 +646,59 @@ impl PrefsSettings {
     }
 }
 
+/// What the plug-in list of a page shows.
+///
+/// The rows of the plug-in list belong to the page they are shown on: the
+/// input page's rows say nothing about the output page's rows. The page is
+/// therefore part of the state, so that a page switch refills the list even
+/// when the two pages have the same rows - which they do when the player has
+/// nothing to list and says so with the same text on every page.
+///
+/// The state also carries the player's id behind each row, so that the id
+/// always belongs to the row that is on screen.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PluginListState {
+    /// The page the rows belong to; `None` when no page was shown yet.
+    node: Option<PrefsNode>,
+    /// The player's id behind each row.
+    ids: Vec<Option<usize>>,
+    /// The text of each row.
+    texts: Vec<String>,
+}
+
+impl PluginListState {
+    /// The rows `node`'s list shows, with the player's id behind each.
+    pub(crate) fn of(settings: &PrefsSettings, node: PrefsNode) -> Self {
+        let (ids, texts): (Vec<Option<usize>>, Vec<String>) = settings
+            .plugin_rows(node)
+            .map(|row| (row.id, row.text.clone()))
+            .unzip();
+        Self {
+            node: Some(node),
+            ids,
+            texts,
+        }
+    }
+
+    /// The text of each row, in order.
+    pub(crate) fn texts(&self) -> &[String] {
+        &self.texts
+    }
+
+    /// The player's id behind the row `row`, if that row has one.
+    pub(crate) fn id(&self, row: usize) -> Option<usize> {
+        self.ids.get(row).copied().flatten()
+    }
+
+    /// Whether a list that shows these rows already shows `state`.
+    ///
+    /// The rows of another page are never the rows of this page, even when
+    /// their texts are the same: the list is rebuilt for every page.
+    pub(crate) fn shows(&self, state: &PluginListState) -> bool {
+        self.node == state.node && self.ids == state.ids && self.texts == state.texts
+    }
+}
+
 /// What the user did in the dialog; the player turns it into a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefsAction {
@@ -706,8 +772,8 @@ mod win32 {
     use windows::core::{PCWSTR, PWSTR};
 
     use super::{
-        Bind, ComboBind, Item, PrefsAction, PrefsError, PrefsNode, PrefsSettings, Rect, TREE,
-        library_root_text, page_items,
+        Bind, ComboBind, Item, PluginListState, PrefsAction, PrefsError, PrefsNode, PrefsSettings,
+        Rect, TREE, library_root_text, page_items,
     };
 
     const CLASS_NAME: &str = "RustampPreferences";
@@ -769,11 +835,11 @@ mod win32 {
         /// The drop-down lists of the current page: (window, id, binding).
         combos: Vec<(HWND, u16, ComboBind)>,
         skin_list: Option<HWND>,
-        /// The plug-in list of the current page, the player's id behind each
-        /// of its rows and the row texts it shows.
+        /// The plug-in list of the current page.
         plugin_list: Option<HWND>,
-        plugin_ids: Vec<Option<usize>>,
-        plugin_texts: Vec<String>,
+        /// What the plug-in list shows: the page it belongs to, the player's
+        /// id behind each of its rows and the row texts it shows.
+        plugin_state: PluginListState,
         /// The media library's root list of the current page.
         library_list: Option<HWND>,
         /// The row texts the root list shows, so a push that changes
@@ -910,8 +976,7 @@ mod win32 {
                     combos: Vec::new(),
                     skin_list: None,
                     plugin_list: None,
-                    plugin_ids: Vec::new(),
-                    plugin_texts: Vec::new(),
+                    plugin_state: PluginListState::default(),
                     library_list: None,
                     library_texts: Vec::new(),
                     actions: Vec::new(),
@@ -1217,8 +1282,10 @@ mod win32 {
                         i.combos.clear();
                         i.skin_list = None;
                         i.plugin_list = None;
-                        i.plugin_ids.clear();
-                        i.plugin_texts.clear();
+                        // The plug-in list is a new control: the rows of the
+                        // old one say nothing about it, so the new list is
+                        // filled again.
+                        i.plugin_state = PluginListState::default();
                         i.library_list = None;
                         i.library_texts.clear();
                         std::mem::take(&mut i.page)
@@ -1523,16 +1590,16 @@ mod win32 {
     /// Makes the plug-in list show `settings`' rows for `node`, keeping the
     /// selected row. Does nothing when the list already shows exactly them, so
     /// the per-tick settings push does not flicker the list.
+    ///
+    /// The rows belong to the page: the list of another page is never the
+    /// list of this one, so a page switch always refills the list.
     fn refresh_plugin_list(list: HWND, node: PrefsNode, settings: &PrefsSettings) {
-        let (ids, texts): (Vec<Option<usize>>, Vec<String>) = settings
-            .plugin_rows(node)
-            .map(|row| (row.id, row.text.clone()))
-            .unzip();
+        let wanted = PluginListState::of(settings, node);
         let unchanged = STATE.with(|state| {
-            state.try_borrow().ok().is_some_and(|g| {
-                g.as_ref()
-                    .is_some_and(|i| i.plugin_ids == ids && i.plugin_texts == texts)
-            })
+            state
+                .try_borrow()
+                .ok()
+                .is_some_and(|g| g.as_ref().is_some_and(|i| i.plugin_state.shows(&wanted)))
         });
         if unchanged {
             return;
@@ -1541,7 +1608,7 @@ mod win32 {
         unsafe {
             let selected = SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
             SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
-            for text in &texts {
+            for text in wanted.texts() {
                 let wide_text = wide(text);
                 SendMessageW(
                     list,
@@ -1550,7 +1617,7 @@ mod win32 {
                     Some(LPARAM(wide_text.as_ptr() as isize)),
                 );
             }
-            if selected >= 0 && (selected as usize) < texts.len() {
+            if selected >= 0 && (selected as usize) < wanted.texts().len() {
                 SendMessageW(
                     list,
                     LB_SETCURSEL,
@@ -1563,8 +1630,7 @@ mod win32 {
             if let Ok(mut guard) = state.try_borrow_mut()
                 && let Some(inner) = guard.as_mut()
             {
-                inner.plugin_ids = ids;
-                inner.plugin_texts = texts;
+                inner.plugin_state = wanted;
             }
         });
     }
@@ -1746,7 +1812,7 @@ mod win32 {
                         .0;
                         usize::try_from(row)
                             .ok()
-                            .and_then(|row| inner.plugin_ids.get(row).copied().flatten())
+                            .and_then(|row| inner.plugin_state.id(row))
                     });
                     if let Some(plugin) = picked {
                         push_action(PrefsAction::TogglePlugin(plugin));
@@ -2173,6 +2239,139 @@ mod tests {
             .collect();
         assert_eq!(input, ["in_a", "note"]);
         assert_eq!(settings.plugin_rows(PrefsNode::DspEffect).count(), 0);
+    }
+
+    /// The pages whose list shows plug-ins, in the order of the tree.
+    fn plugin_pages() -> Vec<PrefsNode> {
+        TREE.iter()
+            .map(|entry| entry.node)
+            .filter(|node| {
+                page_items(*node)
+                    .iter()
+                    .any(|item| matches!(item, Item::PluginList { .. }))
+            })
+            .collect()
+    }
+
+    /// Settings with one plug-in row on every plug-in page.
+    fn settings_with_plugin_rows() -> PrefsSettings {
+        PrefsSettings {
+            plugins: plugin_pages()
+                .iter()
+                .enumerate()
+                .map(|(index, node)| PluginRow {
+                    node: *node,
+                    id: Some(index),
+                    text: format!("{node:?} plug-in"),
+                })
+                .collect(),
+            ..PrefsSettings::default()
+        }
+    }
+
+    #[test]
+    fn five_pages_list_plug_ins() {
+        let pages = plugin_pages();
+        assert_eq!(pages.len(), 5, "{pages:?}");
+        assert_eq!(
+            pages,
+            [
+                PrefsNode::Input,
+                PrefsNode::Output,
+                PrefsNode::PlugInVisualization,
+                PrefsNode::DspEffect,
+                PrefsNode::GeneralPurpose,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_plugin_list_of_a_page_shows_the_rows_of_that_page() {
+        let settings = settings_with_plugin_rows();
+        for node in plugin_pages() {
+            let state = PluginListState::of(&settings, node);
+            let rows: Vec<(Option<usize>, String)> = settings
+                .plugin_rows(node)
+                .map(|row| (row.id, row.text.clone()))
+                .collect();
+            let texts: Vec<String> = rows.iter().map(|(_, text)| text.clone()).collect();
+            assert_eq!(state.texts(), texts, "{node:?}");
+            for (row, (id, _)) in rows.iter().enumerate() {
+                assert_eq!(state.id(row), *id, "{node:?}: row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_switch_refills_the_plugin_list_even_when_the_rows_are_the_same() {
+        // The player says the same thing on every plug-in page when it has
+        // nothing to list, so two pages can have the very same rows. The
+        // list of one page must not pass for the list of another one: it
+        // would keep the rows of the page the user came from.
+        let same = "No plug-ins of this type in C:\\Plugins";
+        let settings = PrefsSettings {
+            plugins: plugin_pages()
+                .iter()
+                .map(|node| PluginRow {
+                    node: *node,
+                    id: None,
+                    text: same.to_string(),
+                })
+                .collect(),
+            ..PrefsSettings::default()
+        };
+        for node in plugin_pages() {
+            let state = PluginListState::of(&settings, node);
+            for other in plugin_pages() {
+                if other == node {
+                    continue;
+                }
+                let other_state = PluginListState::of(&settings, other);
+                assert_eq!(state.texts(), other_state.texts(), "the rows are the same");
+                assert!(
+                    !state.shows(&other_state),
+                    "the list of {node:?} must not pass for the list of {other:?}"
+                );
+            }
+        }
+        // Two pages without a single row are not the same list either.
+        let empty = PrefsSettings::default();
+        for node in plugin_pages() {
+            let state = PluginListState::of(&empty, node);
+            assert!(state.texts().is_empty());
+            for other in plugin_pages() {
+                if other == node {
+                    continue;
+                }
+                assert!(
+                    !state.shows(&PluginListState::of(&empty, other)),
+                    "the empty list of {node:?} must not pass for the empty list of {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_list_that_showed_nothing_is_not_the_list_of_a_page() {
+        let settings = settings_with_plugin_rows();
+        let empty = PluginListState::default();
+        for node in plugin_pages() {
+            assert!(
+                !empty.shows(&PluginListState::of(&settings, node)),
+                "{node:?}: a list that showed nothing shows nothing of this page"
+            );
+        }
+    }
+
+    #[test]
+    fn the_id_behind_a_row_is_the_id_of_the_row_of_that_page() {
+        let settings = settings_with_plugin_rows();
+        let pages = plugin_pages();
+        for (index, node) in pages.iter().enumerate() {
+            let state = PluginListState::of(&settings, *node);
+            assert_eq!(state.id(0), Some(index), "{node:?}: the first row");
+            assert_eq!(state.id(pages.len()), None, "{node:?}: no such row");
+        }
     }
 
     #[test]
