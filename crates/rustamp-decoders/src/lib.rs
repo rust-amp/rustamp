@@ -14,9 +14,10 @@
 //!   extensions (`wav`, `wave`) and the same content signature (`RIFF`/`WAVE`)
 //!   at the same confidence - so RFC 0013's selection rule has two real
 //!   claimants in [`default_registry`] instead of a test double.
-//! * [`http_dec`]: a decoder over an `http://` stream (S19). The request it
-//!   sends and the failures it names are in [`http_source`], and what the
-//!   transfer is doing is observable in [`http_progress`].
+//! * [`http_dec`]: a decoder over an `http://` or an `https://` stream (S19).
+//!   The request it sends and the failures it names are in [`http_source`],
+//!   what the transfer is doing is observable in [`http_progress`], and the
+//!   certificate of an `https://` host is checked in [`tls`].
 //! * Later FFI decoders (libopenmpt, game-music-emu, ...) are added in
 //!   [`default_registry`].
 //!
@@ -31,6 +32,7 @@ pub mod http_progress;
 pub mod http_source;
 pub mod opus_dec;
 pub mod symphonia_dec;
+pub mod tls;
 pub mod wave_dec;
 
 mod aiff_header;
@@ -46,6 +48,7 @@ pub use http_dec::HttpDecoder;
 pub use http_progress::{HttpPhase, HttpProgress, HttpProgressSnapshot};
 pub use http_source::HttpError;
 pub use symphonia_dec::{SymphoniaDecoder, SymphoniaDecoderFactory};
+pub use tls::{CertificateFailure, TlsAnchors};
 pub use wave_dec::{WaveDecoder, WaveDecoderFactory};
 
 /// Registry with every decoder this crate provides, in priority order.

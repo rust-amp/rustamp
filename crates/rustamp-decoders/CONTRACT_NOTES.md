@@ -329,9 +329,10 @@ the core contract leaves room:
 
 ## HTTP source (`http_source.rs`, `http_dec.rs`)
 
-An `http://` stream is played by `rustamp_decoders::HttpDecoder`: the body of
-the response is the byte source, and the containers and codecs of this crate
-decode it exactly as they decode a file.
+An `http://` or an `https://` stream is played by
+`rustamp_decoders::HttpDecoder`: the body of the response is the byte source,
+and the containers and codecs of this crate decode it exactly as they decode
+a file.
 
 - **The request** is the one of S19 §1: `GET http://<host>:<port>/<path>
   HTTP/1.0`, then `Host:`, `User-Agent: Winamp/<version>` and `Accept: */*`,
@@ -365,12 +366,35 @@ decode it exactly as they decode a file.
   open and the spec carries no text for it - the source names the status
   instead of pretending to know what the reference shows. A redirect is not
   followed: a `3xx` is a status failure like every other status.
-- **The schemes**: only `http://`. An `https://` URL is refused by name
-  (`HttpError::UnsupportedScheme`): this tree has no TLS, and S19 §6,
+- **The schemes**: `http://` and `https://`. Every other scheme - `ftp://`
+  and the rest - is refused by name (`HttpError::UnsupportedScheme`). A URL
+  that carries credentials is refused as well - the shape of a proxy with
+  credentials is open (S19 §6, question 13) and nothing here sends them.
+- **`https://` is an extension of this implementation** (`tls.rs`), not a fact
+  of the spec: S19 §1 documents a plain `http://` request and S19 §6,
   question 8 records that the spec establishes no evidence for a TLS stream
-  at all. A URL that carries credentials is refused as well - the shape of a
-  proxy with credentials is open (S19 §6, question 13) and nothing here
-  sends them.
+  at all. Everything about the secure stream is our own decision:
+  - The port of an `https://` URL that names none is 443.
+  - The request line carries the **origin form** (`GET /<path> HTTP/1.0`),
+    because the source connects straight to the origin; the absolute form of
+    the template is the form of a request to a proxy (RFC 7230 §5.3.1). The
+    `Host:` line of an `https://` request names the port only when it is not
+    the default port of the scheme (RFC 7230 §5.4); the `http://` request
+    keeps the line of the template, which names the port always.
+  - The **certificate** of the host is checked against the trust store of the
+    operating system (`TlsAnchors::system()`): on Windows the certificate
+    engine of the machine builds the chain and judges it with the stores and
+    the policies of the machine, so an authority that the machine trusts - a
+    corporate one included - is trusted here too. The anchors can also be
+    named outright (`TlsAnchors::only()`); then they are the **only** anchors
+    and the store of the operating system is not consulted.
+  - A **refused certificate** is a typed failure that names the reason
+    (`HttpError::Certificate { reason }`, `CertificateFailure`): it is never a
+    plain connection, and the stream ends there.
+  - The **handshake** belongs to the connection: the phase that says that the
+    host is being reached covers it, and a failure of it is a `ConnectFailed`.
+  - The TLS is **blocking** (`rustls`): this crate is a decoder and pulls in
+    no async runtime.
 - **A body that is not media** is refused when the decoder is opened, with
   the failure of the decoder itself (`HttpError::Media`). A container that
   needs the whole file before it plays anything (MP4/M4A: its reader scans

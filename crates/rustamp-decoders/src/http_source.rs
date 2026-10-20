@@ -1,5 +1,5 @@
-//! The transport of an `http://` stream: the URL, the request of S19 §1 and
-//! the body of the response.
+//! The transport of an `http://` or an `https://` stream: the URL, the request
+//! of S19 §1 and the body of the response.
 //!
 //! # What the spec settles
 //!
@@ -13,8 +13,8 @@
 //! Accept: */*
 //! ```
 //!
-//! * The request line carries the **absolute** form - scheme, host, port and
-//!   path in one URI - and names **HTTP/1.0**.
+//! * The request line of the `http://` request carries the **absolute** form
+//!   - scheme, host, port and path in one URI - and names **HTTP/1.0**.
 //! * The head carries a `Host:` line, a `User-Agent:` line and an
 //!   `Accept: */*` line, in that order.
 //! * The template has one slot for extra header lines between the
@@ -36,9 +36,10 @@
 //! * The **status codes** (S19 §6, question 4): only `200` is a body. Every
 //!   other status is an error that names the status; the spec carries no
 //!   text for it.
-//! * The **schemes** (S19 §6, question 8): only `http://`. An `https://` URL
-//!   is refused by name - this tree has no TLS, and S19 establishes no
-//!   evidence that the reference reads a TLS stream at all.
+//! * The **schemes** (S19 §6, question 8): `http://` as the spec's template
+//!   has it, and `https://` as **our own extension** (S19 establishes no
+//!   evidence that the reference reads a TLS stream at all; see the section
+//!   below). Every other scheme is refused by name.
 //! * The **`User-Agent`**. S19 §1 records that the *reference* sends
 //!   `Winamp/<version>` and leaves the string open. **We identify as Rustamp**
 //!   (owner decision, 2026-10-20): our software is not the reference, and a
@@ -47,6 +48,31 @@
 //! * The **`Host:` line** (S19 §6, question 10): it carries the authority of
 //!   the request line - the host and the port - because that is what the
 //!   request line itself carries (RFC 7230 §5.4).
+//!
+//! # `https://` is an extension of this implementation
+//!
+//! S19 establishes **no evidence** that the reference player reads a TLS
+//! stream: the template of §1 is plain `http://`, and the spec settles no
+//! question about a secure stream. Reading an `https://` URL is therefore
+//! **our own extension**, and everything about it is our own decision:
+//!
+//! * The **port** of an `https://` URL that names none is 443.
+//! * The **request line** of an `https://` stream carries the **origin form**
+//!   (`GET /<path> HTTP/1.0`) and not the absolute form of the template. The
+//!   absolute form is the form of a request to a proxy (RFC 7230 §5.3.1);
+//!   this source connects straight to the origin, and the origin form is the
+//!   request target of such a request.
+//! * The **`Host:` line** of an `https://` stream names the port only when it
+//!   is not the default port of the scheme (RFC 7230 §5.4). The `http://`
+//!   request keeps the line of the template, which names the port always.
+//! * The **certificate** of the host is checked against the trust store of
+//!   the operating system. A refused certificate is a failure that names
+//!   itself, never a plain connection (see [`crate::tls`]).
+//! * The **handshake** belongs to the connection: the phase that says that
+//!   the host is being reached covers it (see [`crate::http_progress`]).
+//!
+//! Every other scheme - `ftp://` and the rest - is refused by name, as
+//! before.
 //!
 //! Nothing in this module was taken from a Winamp source, from SDK material
 //! or from a disassembly: the request shape comes from S19 §1 and everything
@@ -60,6 +86,7 @@ use std::time::Duration;
 use rustamp_core::error::Error as CoreError;
 
 use crate::http_progress::{HttpPhase, HttpProgress};
+use crate::tls::{self, CertificateFailure, TlsAnchors, TlsError};
 
 /// The time the source waits for the host.
 ///
@@ -99,9 +126,6 @@ const USER_AGENT: &str = concat!("Rustamp/", env!("CARGO_PKG_VERSION"));
 /// the source refuses it instead of filling its memory with it.
 const MAX_HEAD_LEN: usize = 64 * 1024;
 
-/// The port of the `http` scheme, for a URL that names none.
-const DEFAULT_PORT: u16 = 80;
-
 /// The failures of the HTTP source.
 ///
 /// The core error type has no variant for "the server answered with an
@@ -118,7 +142,7 @@ pub enum HttpError {
         /// The scheme of the URL, lower case.
         scheme: String,
     },
-    /// The URL is not a usable absolute `http://` URL.
+    /// The URL is not a usable absolute `http://` or `https://` URL.
     InvalidUrl(String),
     /// The host name could not be resolved.
     Resolve {
@@ -148,6 +172,21 @@ pub enum HttpError {
     },
     /// The answer was not a response this source can read.
     Protocol(String),
+    /// The TLS handshake refused the certificate of the host.
+    ///
+    /// A refused certificate is a failure of its own: the source does not
+    /// fall back to a plain connection and does not read the stream without a
+    /// certificate it trusts.
+    Certificate {
+        /// Why the certificate was refused.
+        reason: CertificateFailure,
+    },
+    /// The TLS connection failed: the handshake, the anchors or the name of
+    /// the host were not usable.
+    Tls {
+        /// What the TLS layer said.
+        reason: String,
+    },
     /// The body is not media this crate can decode.
     ///
     /// The failure of the decoder is the core error it raised, unchanged.
@@ -161,11 +200,10 @@ impl fmt::Display for HttpError {
         match self {
             Self::UnsupportedScheme { scheme } => write!(
                 f,
-                "unsupported URL scheme {scheme:?}: this source reads http:// URLs only \
-                 (this build has no TLS, and S19 establishes no evidence for https)"
+                "unsupported URL scheme {scheme:?}: this source reads http:// and https:// URLs only"
             ),
             Self::InvalidUrl(message) => {
-                write!(f, "not a usable http:// URL: {message}")
+                write!(f, "not a usable http:// or https:// URL: {message}")
             }
             Self::Resolve { host, source } => {
                 write!(f, "cannot resolve the host {host:?}: {source}")
@@ -181,6 +219,12 @@ impl fmt::Display for HttpError {
             }
             Self::Protocol(message) => {
                 write!(f, "not a usable HTTP response: {message}")
+            }
+            Self::Certificate { reason } => {
+                write!(f, "the certificate of the host was refused: {reason}")
+            }
+            Self::Tls { reason } => {
+                write!(f, "the TLS connection failed: {reason}")
             }
             Self::Media(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
@@ -217,20 +261,59 @@ impl From<HttpError> for CoreError {
     }
 }
 
+impl From<TlsError> for HttpError {
+    /// The failure of the TLS layer as a failure of this source.
+    ///
+    /// The certificate keeps its own kind: a refused certificate is a
+    /// failure a caller can tell apart from a handshake that broke for
+    /// another reason.
+    fn from(e: TlsError) -> Self {
+        match e {
+            TlsError::Certificate(reason) => HttpError::Certificate { reason },
+            TlsError::Timeout => HttpError::Timeout {
+                phase: "the TLS handshake",
+            },
+            TlsError::Handshake(reason) => HttpError::Tls { reason },
+            TlsError::Setup(reason) => HttpError::Tls { reason },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // URL
 // ---------------------------------------------------------------------------
 
-/// The parts of an `http://` URL that the request needs.
+/// The scheme of a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    /// `http://`: a plain socket.
+    Http,
+    /// `https://`: a TLS stream.
+    Https,
+}
+
+impl Scheme {
+    /// The port of the scheme, for a URL that names none.
+    const fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https => 443,
+        }
+    }
+}
+
+/// The parts of an `http://` or `https://` URL that the request needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Url {
+    /// The scheme of the URL.
+    scheme: Scheme,
     /// The host, without the brackets of an IPv6 literal.
     host: String,
     /// Whether the host is an IPv6 literal. It keeps its brackets in the
     /// request line and in the `Host:` line, where an address literal needs
     /// them.
     ipv6: bool,
-    /// The port; [`DEFAULT_PORT`] when the URL names none.
+    /// The port; the default port of the scheme when the URL names none.
     port: u16,
     /// The path and the query: the request target behind the authority.
     target: String,
@@ -249,25 +332,61 @@ impl Url {
         }
     }
 
-    /// The request target of the request line: the absolute URI.
+    /// The host of the URL, with the brackets of an IPv6 literal.
+    fn host_only(&self) -> String {
+        if self.ipv6 {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        }
+    }
+
+    /// The authority of the `Host:` line.
+    ///
+    /// The `http://` request carries the line of the template of S19 §1, and
+    /// that line names the port always. The `https://` request is our own:
+    /// it names the port only when it is not the default port of the scheme
+    /// (RFC 7230 §5.4).
+    fn host_authority(&self) -> String {
+        if self.scheme == Scheme::Https && self.port == Scheme::Https.default_port() {
+            self.host_only()
+        } else {
+            self.authority()
+        }
+    }
+
+    /// The request target of the request line.
+    ///
+    /// The `http://` request carries the absolute form of the template of
+    /// S19 §1. The `https://` request is our own and connects straight to the
+    /// origin: the origin form is the request target of such a request, and
+    /// the absolute form is the form of a request to a proxy (RFC 7230
+    /// §5.3.1).
     fn request_target(&self) -> String {
-        format!("http://{}{}", self.authority(), self.target)
+        match self.scheme {
+            Scheme::Http => format!("http://{}{}", self.authority(), self.target),
+            Scheme::Https => self.target.clone(),
+        }
     }
 }
 
-/// Reads an `http://` URL.
+/// Reads an `http://` or an `https://` URL.
 ///
-/// The scheme decides first: only `http` is read, and every other scheme is
-/// refused by name (S19 §6, question 8).
+/// The scheme decides first: only `http` and `https` are read, and every
+/// other scheme is refused by name (S19 §6, question 8).
 fn parse_url(url: &str) -> Result<Url, HttpError> {
     let Some((scheme, rest)) = url.split_once("://") else {
         return Err(HttpError::InvalidUrl("the URL names no scheme".into()));
     };
-    if !scheme.eq_ignore_ascii_case("http") {
+    let scheme = if scheme.eq_ignore_ascii_case("http") {
+        Scheme::Http
+    } else if scheme.eq_ignore_ascii_case("https") {
+        Scheme::Https
+    } else {
         return Err(HttpError::UnsupportedScheme {
             scheme: scheme.to_ascii_lowercase(),
         });
-    }
+    };
     let (authority, path) = match rest.find(['/', '?', '#']) {
         Some(at) => (&rest[..at], &rest[at..]),
         None => (rest, ""),
@@ -277,7 +396,7 @@ fn parse_url(url: &str) -> Result<Url, HttpError> {
             "the URL carries credentials, which this source does not send".into(),
         ));
     }
-    let (host, ipv6, port) = split_authority(authority)?;
+    let (host, ipv6, port) = split_authority(authority, scheme)?;
     // The fragment belongs to the client, not to the request.
     let path = path.split('#').next().unwrap_or("");
     let target = if path.is_empty() {
@@ -288,6 +407,7 @@ fn parse_url(url: &str) -> Result<Url, HttpError> {
         format!("/{path}")
     };
     Ok(Url {
+        scheme,
         host,
         ipv6,
         port,
@@ -296,7 +416,7 @@ fn parse_url(url: &str) -> Result<Url, HttpError> {
 }
 
 /// The host and the port of an authority.
-fn split_authority(authority: &str) -> Result<(String, bool, u16), HttpError> {
+fn split_authority(authority: &str, scheme: Scheme) -> Result<(String, bool, u16), HttpError> {
     let (host, ipv6, port) = if let Some(rest) = authority.strip_prefix('[') {
         // An IPv6 literal: "[::1]" or "[::1]:8080".
         let Some(end) = rest.find(']') else {
@@ -307,7 +427,7 @@ fn split_authority(authority: &str) -> Result<(String, bool, u16), HttpError> {
         let after = &rest[end + 1..];
         let port = match after.strip_prefix(':') {
             Some(port) => parse_port(port)?,
-            None if after.is_empty() => DEFAULT_PORT,
+            None if after.is_empty() => scheme.default_port(),
             None => {
                 return Err(HttpError::InvalidUrl(
                     "the URL carries something behind its IPv6 literal".into(),
@@ -318,7 +438,7 @@ fn split_authority(authority: &str) -> Result<(String, bool, u16), HttpError> {
     } else {
         match authority.rsplit_once(':') {
             Some((host, port)) => (host.to_string(), false, parse_port(port)?),
-            None => (authority.to_string(), false, DEFAULT_PORT),
+            None => (authority.to_string(), false, scheme.default_port()),
         }
     };
     if host.is_empty() {
@@ -340,14 +460,15 @@ fn parse_port(port: &str) -> Result<u16, HttpError> {
 /// The request bytes of S19 §1.
 ///
 /// The lines are separated by CRLF, as HTTP requires; the template of the
-/// spec shows the lines, not their line ending.
+/// spec shows the lines, not their line ending. The `https://` request is our
+/// own and carries the origin form; see the module docs.
 fn request_bytes(url: &Url) -> Vec<u8> {
     let mut request = Vec::with_capacity(160);
     request.extend_from_slice(b"GET ");
     request.extend_from_slice(url.request_target().as_bytes());
     request.extend_from_slice(b" HTTP/1.0\r\n");
     request.extend_from_slice(b"Host: ");
-    request.extend_from_slice(url.authority().as_bytes());
+    request.extend_from_slice(url.host_authority().as_bytes());
     request.extend_from_slice(b"\r\n");
     request.extend_from_slice(b"User-Agent: ");
     request.extend_from_slice(USER_AGENT.as_bytes());
@@ -355,6 +476,43 @@ fn request_bytes(url: &Url) -> Vec<u8> {
     request.extend_from_slice(b"Accept: */*\r\n");
     request.extend_from_slice(b"\r\n");
     request
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+/// The transport under an HTTP exchange: a plain socket or a TLS stream.
+enum Transport {
+    /// A plain socket: the transport of an `http://` stream.
+    Plain(TcpStream),
+    /// A TLS stream: the transport of an `https://` stream.
+    Tls(Box<tls::TlsStream>),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(socket) => socket.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(socket) => socket.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(socket) => socket.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +535,7 @@ struct Head {
 /// The bytes that came with the head are returned with it: a server that
 /// sends the head and the first bytes of the body in one segment must not
 /// lose them.
-fn read_head(socket: &mut TcpStream) -> Result<(Head, Vec<u8>), HttpError> {
+fn read_head(socket: &mut Transport) -> Result<(Head, Vec<u8>), HttpError> {
     let mut buffer: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -470,8 +628,8 @@ fn parse_head(text: &str) -> Result<Head, HttpError> {
 
 /// The body of the response: the bytes the server sends after the head.
 pub(crate) struct Body {
-    /// The socket the body comes from.
-    socket: TcpStream,
+    /// The transport the body comes from.
+    transport: Transport,
     /// The bytes that came with the head: the server may send them and the
     /// first bytes of the body in one segment.
     leftover: Vec<u8>,
@@ -484,9 +642,9 @@ pub(crate) struct Body {
 
 impl Body {
     /// The body of the answer, counted by `progress`.
-    fn new(socket: TcpStream, progress: HttpProgress, leftover: Vec<u8>) -> Self {
+    fn new(transport: Transport, progress: HttpProgress, leftover: Vec<u8>) -> Self {
         Body {
-            socket,
+            transport,
             leftover,
             progress,
             done: false,
@@ -543,7 +701,7 @@ impl Read for Body {
             self.progress.add_bytes(n as u64);
             return Ok(n);
         }
-        match self.socket.read(&mut buf[..limit]) {
+        match self.transport.read(&mut buf[..limit]) {
             Ok(0) => {
                 self.done = true;
                 // The connection ended. With a declared length that is a cut:
@@ -638,15 +796,20 @@ impl HttpSource {
     /// the server answered and stops there - the body of an error answer is
     /// not media.
     ///
+    /// The certificate of an `https://` host is checked against `anchors`:
+    /// the trust store of the operating system, or the anchors the caller
+    /// names.
+    ///
     /// The transfer writes what it is doing into `progress`: the phase of
     /// the exchange and the counters of the body.
     pub(crate) fn open(
         url: &str,
         timeout: Duration,
         progress: &HttpProgress,
+        anchors: &TlsAnchors,
     ) -> Result<Self, HttpError> {
         progress.set_phase(HttpPhase::Connecting);
-        match Self::exchange(url, timeout, progress) {
+        match Self::exchange(url, timeout, progress, anchors) {
             Ok(source) => Ok(source),
             Err(e) => {
                 // A failure before the connection is up is a failure to
@@ -660,42 +823,63 @@ impl HttpSource {
     }
 
     /// The exchange itself: the connect, the request and the head.
-    fn exchange(url: &str, timeout: Duration, progress: &HttpProgress) -> Result<Self, HttpError> {
+    fn exchange(
+        url: &str,
+        timeout: Duration,
+        progress: &HttpProgress,
+        anchors: &TlsAnchors,
+    ) -> Result<Self, HttpError> {
         let url = parse_url(url)?;
-        let socket = Self::send_request(&url, timeout, progress)?;
-        Self::read_response(socket, progress)
+        let transport = Self::send_request(&url, timeout, progress, anchors)?;
+        Self::read_response(transport, progress)
     }
 
     /// Connects to the host and sends the request of S19 §1.
     ///
     /// The phase is [`HttpPhase::SendingRequest`] from the moment the
-    /// connection is up until the answer is read.
+    /// connection is up until the answer is read. The handshake of an
+    /// `https://` stream belongs to the connection and happens before that:
+    /// the phase says that the host is being reached while it runs.
     fn send_request(
         url: &Url,
         timeout: Duration,
         progress: &HttpProgress,
-    ) -> Result<TcpStream, HttpError> {
-        let mut socket = connect(url, timeout)?;
-        progress.set_phase(HttpPhase::SendingRequest);
+        anchors: &TlsAnchors,
+    ) -> Result<Transport, HttpError> {
+        let socket = connect(url, timeout)?;
         socket
             .set_read_timeout(Some(timeout))
             .map_err(HttpError::Io)?;
         socket
             .set_write_timeout(Some(timeout))
             .map_err(HttpError::Io)?;
-        socket
+        let mut transport = match url.scheme {
+            Scheme::Http => Transport::Plain(socket),
+            Scheme::Https => {
+                let mut stream = tls::client_stream(&url.host, anchors, socket)?;
+                tls::handshake(&mut stream)?;
+                Transport::Tls(Box::new(stream))
+            }
+        };
+        progress.set_phase(HttpPhase::SendingRequest);
+        transport
             .write_all(&request_bytes(url))
             .map_err(|e| map_write_error(e, "sending the request"))?;
-        Ok(socket)
+        // The request is on the wire when the flush is done: a TLS stream
+        // keeps the bytes in its own buffer until then.
+        transport
+            .flush()
+            .map_err(|e| map_write_error(e, "sending the request"))?;
+        Ok(transport)
     }
 
     /// Reads the head of the answer and prepares its body.
     ///
     /// The phase is [`HttpPhase::ReadingResponse`] while the head is read
     /// and [`HttpPhase::Retrieving`] from the moment the head is there.
-    fn read_response(mut socket: TcpStream, progress: &HttpProgress) -> Result<Self, HttpError> {
+    fn read_response(mut transport: Transport, progress: &HttpProgress) -> Result<Self, HttpError> {
         progress.set_phase(HttpPhase::ReadingResponse);
-        let (head, leftover) = read_head(&mut socket)?;
+        let (head, leftover) = read_head(&mut transport)?;
         if head.code != 200 {
             return Err(HttpError::Status {
                 code: head.code,
@@ -708,7 +892,7 @@ impl HttpSource {
         progress.set_total(head.length);
         progress.set_phase(HttpPhase::Retrieving);
         Ok(HttpSource {
-            body: Body::new(socket, progress.clone(), leftover),
+            body: Body::new(transport, progress.clone(), leftover),
         })
     }
 
@@ -756,8 +940,8 @@ fn connect(url: &Url, timeout: Duration) -> Result<TcpStream, HttpError> {
     })
 }
 
-/// Reads from the socket, turning a timeout into the timeout of the source.
-fn read_socket(socket: &mut TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+/// Reads from the transport, turning a timeout into the timeout of the source.
+fn read_socket(socket: &mut Transport, buf: &mut [u8]) -> io::Result<usize> {
     match socket.read(buf) {
         Err(e)
             if matches!(
@@ -849,11 +1033,52 @@ mod tests {
 
     #[test]
     fn another_scheme_is_refused_by_name() {
-        let err = parse_url("https://example.com/a.mp3").expect_err("https is not read");
+        let err = parse_url("ftp://example.com/a.mp3").expect_err("ftp is not read");
         match err {
-            HttpError::UnsupportedScheme { scheme } => assert_eq!(scheme, "https"),
+            HttpError::UnsupportedScheme { scheme } => assert_eq!(scheme, "ftp"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_https_url_names_the_default_port_of_its_scheme() {
+        let url = parse_url("https://example.com/music/song.mp3").expect("a URL");
+        assert_eq!(url.scheme, Scheme::Https);
+        assert_eq!(url.host, "example.com");
+        assert_eq!(url.port, 443);
+        assert_eq!(url.target, "/music/song.mp3");
+    }
+
+    #[test]
+    fn an_https_request_carries_the_origin_form() {
+        let url = parse_url("https://example.com/music/song.mp3?x=1").expect("a URL");
+        let request = String::from_utf8(request_bytes(&url)).expect("text");
+        assert_eq!(
+            request,
+            format!(
+                "GET /music/song.mp3?x=1 HTTP/1.0\r\n\
+                 Host: example.com\r\n\
+                 User-Agent: {USER_AGENT}\r\n\
+                 Accept: */*\r\n\
+                 \r\n"
+            )
+        );
+    }
+
+    #[test]
+    fn the_host_line_of_an_https_request_names_a_port_that_is_not_the_default() {
+        let url = parse_url("https://example.com:8443/music/song.mp3").expect("a URL");
+        assert_eq!(url.host_authority(), "example.com:8443");
+        let url = parse_url("https://example.com/music/song.mp3").expect("a URL");
+        assert_eq!(url.host_authority(), "example.com");
+    }
+
+    #[test]
+    fn the_host_line_of_an_http_request_names_the_port_always() {
+        // The request of S19 §1 names the port in the `Host:` line, and the
+        // `http://` request keeps that line.
+        let url = parse_url("http://example.com/music/song.mp3").expect("a URL");
+        assert_eq!(url.host_authority(), "example.com:80");
     }
 
     #[test]
@@ -905,14 +1130,19 @@ mod tests {
         });
         let url = parse_url(&format!("http://127.0.0.1:{port}/stream.mp3")).expect("a URL");
         let progress = HttpProgress::new();
-        let socket =
-            HttpSource::send_request(&url, Duration::from_secs(5), &progress).expect("the request");
+        let transport = HttpSource::send_request(
+            &url,
+            Duration::from_secs(5),
+            &progress,
+            &TlsAnchors::system(),
+        )
+        .expect("the request");
         assert_eq!(
             progress.snapshot().phase,
             HttpPhase::SendingRequest,
             "the request is on its way"
         );
-        drop(socket);
+        drop(transport);
         server.join().expect("the server");
     }
 
