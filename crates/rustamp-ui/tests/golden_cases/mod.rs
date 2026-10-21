@@ -178,15 +178,20 @@ pub fn case_equalizer_window_curve_and_track_pixels(skin: &Skin) {
             .unwrap();
     let image =
         render_equalizer_window(&EqualizerState::default(), skin, &EqualizerLayout::CLASSIC);
-    for x in 0..113 {
-        assert_eq!(image.pixel(86 + x, 25), sheet.pixel(115, 302));
+    // The flat curve lies on the graph's centre row and runs from the
+    // graph's second to its second-to-last column; the preamp strip shows
+    // at the two outer columns on each side.
+    for x in 2..=110 {
+        assert_eq!(image.pixel(86 + x, 26), sheet.pixel(115, 303));
+    }
+    for x in [0, 1, 111, 112] {
         assert_eq!(image.pixel(86 + x, 26), sheet.pixel(x, 314));
     }
     for slider in EqSlider::ALL_BANDS {
-        let x = EqualizerLayout::slider_x(slider);
-        // Track sample at its unfilled left edge, body sample below the thumb.
-        assert_eq!(image.pixel(x, 50), sheet.pixel(13, 241));
-        assert_eq!(image.pixel(x + 2, 74), sheet.pixel(115, 303));
+        // The track is one 14-px sheet column, one pixel left of the thumb.
+        let track = EqualizerLayout::track_rect(slider);
+        assert_eq!(image.pixel(track.x, 50), sheet.pixel(13, 241));
+        assert_eq!(image.pixel(track.x + 6, 50), sheet.pixel(19, 241));
     }
 }
 
