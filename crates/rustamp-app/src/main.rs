@@ -1,5 +1,5 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! `rustamp` — the application binary (task card N1).
+//! `rustamp` - the application binary (task card N1).
 //!
 //! Parses the command line and hands it to [`rustamp_app::run`], which loads
 //! the config and the skin, builds the audio engine, opens the main window and
@@ -10,6 +10,14 @@
 //!        [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
 //!        [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 //! ```
+
+// A release build is a **GUI** program: double-clicking `rustamp.exe` must not
+// open a console window (owner report, 2026-10-21 - the release zip started with
+// one). Debug builds keep the console, because that is where a developer wants
+// the notes. `--console` reattaches one in a release build (see
+// [`ensure_console`]), which is also how the release binary can be watched.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //!
 //! With `--null` the app uses the deterministic null output and runs
 //! **headless** (no window), so the binary can be exercised in a headless test;
@@ -60,6 +68,16 @@ use rustamp_platform::shell_registration::{self, RegistrationError, Registration
 use rustamp_platform::single_instance::{self, Claim, HandOff};
 
 fn main() -> ExitCode {
+    // Attach the console (or open one) BEFORE anything is printed: in a release
+    // build this process is a GUI program, so `rustamp: ...` notes would go
+    // nowhere without it. Scanning the raw arguments keeps this ahead of the
+    // parse, which may itself print.
+    if std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--console")
+    {
+        rustamp_platform::console::ensure_console();
+    }
     let args = match cli::parse(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(error) => {

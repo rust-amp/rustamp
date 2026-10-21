@@ -29,6 +29,7 @@
 //! [`utc`]; the preferences dialog shows the time of a media library root
 //! with it.
 
+pub mod console;
 pub mod cursor;
 pub mod displays;
 pub mod dpi;

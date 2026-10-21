@@ -213,6 +213,13 @@ pub struct Args {
     pub import_winamp_ini: WinampIniImport,
     /// `--help`/`-h` was given.
     pub help: bool,
+    /// `--console`: keep a console window for the notes.
+    ///
+    /// A release build is linked as a GUI program, so it has no console of its
+    /// own (owner report, 2026-10-21). Own choice on top of S13 §1, which has no
+    /// switch for this; the alternative was a debug window in the menu, and a
+    /// console that the notes already go to is the smaller change.
+    pub console: bool,
     /// What is enqueued instead of played (`--enqueue`, `/ADD <path>`).
     pub enqueue: Enqueue,
     /// The window class the single-instance check looks for (`/CLASS=`).
@@ -256,6 +263,8 @@ usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <
 
   <file|url>        media file to load and play, or an http(s):// URL to stream (optional)
   --null            use the deterministic null output and run headless (no window)
+  --console         keep a console window for the player's notes (release builds
+                    are GUI programs; without this, notes go nowhere)
   --no-audio        open the window but play on the null output (silent; no audio device needed)
   --volume <0..=255> initial volume (default: the config's audio.volume)
   --skin <path>     skin folder, .wsz or .zip (default: config's ui.skin, then built-in)
@@ -385,6 +394,7 @@ where
         }
         match arg.as_str() {
             "--null" => parsed.output = OutputChoice::Null,
+            "--console" => parsed.console = true,
             "--no-audio" => parsed.output = OutputChoice::NoAudio,
             "--enqueue" => parsed.enqueue = Enqueue::Argument,
             "--volume" => {
@@ -674,6 +684,20 @@ fn set_media(parsed: &mut Args, value: String) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_console_switch_is_off_by_default_and_parses() {
+        // A release build has no console of its own (owner report, 2026-10-21),
+        // so the notes need an explicit switch; it must not read as an unknown
+        // option and must not change what the rest of the line means.
+        let plain = parse_args(&[]).unwrap();
+        assert!(!plain.console, "no console unless asked for");
+        let media = parse_args(&["music.flac"]).unwrap().media;
+
+        let with_console = parse_args(&["--console", "music.flac"]).unwrap();
+        assert!(with_console.console, "the switch is accepted");
+        assert_eq!(with_console.media, media, "and changes nothing else");
+    }
 
     fn parse_args(args: &[&str]) -> Result<Args, CliError> {
         parse(args.iter().map(|s| (*s).to_owned()))
