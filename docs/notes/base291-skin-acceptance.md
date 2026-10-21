@@ -285,7 +285,7 @@ launch (the recorded 1:1 landmark pins that start state), then `WM_COMMAND`
 window** — no real click, no menu, no keyboard. Each job captures the state
 before and after, which is what proves the action changed something.
 
-## Measured parity, 2026-10-21 (all eleven states, both sides captured)
+## First measurement, 2026-10-21 (superseded by the section below)
 
 The comparator compares the **client area** of the reference (`Winamp 2.95`, skin
 `base-2.91.wsz`, 1024x768, 96 dpi) with ours, same state, same skin, same size.
@@ -326,3 +326,51 @@ A differing pixel is a pixel whose colour is not the reference's. The shares say
 comparator's stdout): the title band, the marquee, the analyser and the playlist
 rows differ in different cases. Turning a share into a work item means reading
 the diff image, not the percentage.
+
+## Measured parity after the fixes, 2026-10-21 (all eleven states)
+
+Supersedes the first table above. Between the two measurements the player gained
+the ABI window classes (`Winamp EQ`, `Winamp PE`), sibling windows that no longer
+take the focus, and a Win32 seam that delivers `WM_COMMAND` 40064/40165 to the
+equalizer and the playlist - so the three states that were previously
+*unreachable* now have their sizes, and the focus states are real states.
+
+| Case | differing pixels | share | before |
+|---|---|---|---|
+| `main-shade` | 190 / 3 850 | **4.9 %** | 32.4 % |
+| `playlist-active` | 1 510 / 31 900 | **4.7 %** | 4.7 % |
+| `playlist-inactive` | 1 510 / 31 900 | **4.7 %** | 4.7 % |
+| `main-active` | 2 099 / 31 900 | **6.6 %** | 11.5 % |
+| `main-inactive` | 2 099 / 31 900 | **6.6 %** | 6.6 % |
+| `main-double` | 8 396 / 127 600 | **6.6 %** | 11.5 % |
+| `playlist-shade` | 507 / 3 850 | **13.2 %** | unreachable |
+| `eq-active` | 7 408 / 31 900 | **23.2 %** | 23.2 % |
+| `eq-inactive` | 7 408 / 31 900 | **23.2 %** | 23.2 % |
+| `eq-double` | 29 632 / 127 600 | **23.2 %** | unreachable |
+| `eq-shade` | 1 072 / 3 850 | **27.8 %** | unreachable |
+| **all eleven** | **61 831 / 458 150** | **13.5 %** | - |
+
+**The focus rendering is right.** Our `main-active` and `main-inactive` captures
+differ by 1 576 pixels in the title band `(6,4)-(271,10)`; the reference's two
+captures differ by **the same 1 576** in the same band. Same for the equalizer
+(1 435) and the playlist (1 388). The focused and unfocused title bands are
+therefore pixel-identical to the reference's; none of the remaining differences
+is a focus problem.
+
+**Where the remaining differences live** (from each comparison's bounding box):
+
+- `main-*`: the whole client area, `(16,27)-(263,105)` - the readout, the
+  marquee text and the analyser. `main-shade` is down to its 38x5 analyser
+  rectangle `(188,5)-(225,9)`, the one difference S08 has to decide (the
+  reference leaves its own skin graphic there).
+- `eq-*`: the interior, `(22,18)-(253,100)` - the slider frames, the graph ramp
+  and the value strip. This is the largest single gap in the set.
+- `playlist-*`: the rows and the title cells, `(6,4)-(271,93)`; the shade strip
+  is `(6,1)-(271,12)`.
+
+**Double size is global, windowshade is not.** Measured with two jobs that send
+the command to the equalizer and capture the **main** window: 40165 took the
+main window from 275x116 to 550x232 (`base291-global-double`), 40064 left it at
+275x116 (`base291-global-shade`). One `dsize` flag for the player (S01 section
+1), windowshade per window. The player's command handler was corrected to match,
+and `window_commands.rs` pins it.

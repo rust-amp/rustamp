@@ -1677,9 +1677,16 @@ impl App {
             (WindowId::Equalizer, WindowCommand::ToggleWindowShade) => {
                 self.submit(Command::ToggleWindowShade(WindowId::Equalizer))
             }
+            // Double size is ONE flag for the player, not a per-window one.
+            // Measured 2026-10-21: `WM_COMMAND` 40165 posted to the equalizer
+            // took the MAIN window from 275x116 to 550x232 (capture jobs
+            // `base291-global-double`), while the same treatment with 40064
+            // left the main window alone (`base291-global-shade`). So this
+            // answer is the global command, which also carries the equalizer
+            // (S05 §2.1) - not `toggle_eq_double_size`, which the first version
+            // of this match called.
             (WindowId::Equalizer, WindowCommand::ToggleDoubleSize) => {
-                self.toggle_eq_double_size();
-                Ok(())
+                self.submit(Command::ToggleDoubleSize)
             }
             (WindowId::Playlist, WindowCommand::ToggleWindowShade) => {
                 self.submit(Command::ToggleWindowShade(WindowId::Playlist))
@@ -1692,20 +1699,6 @@ impl App {
                 "{window:?} is not a window that answers a window command"
             ))),
         }
-    }
-
-    /// Toggles the equalizer's own double size (S05 §2.1: 275 x 116 ↔ 550 x
-    /// 232).
-    ///
-    /// The flag is the equalizer's own, so a double-size command addressed to
-    /// the equalizer changes the equalizer and nothing else. The main
-    /// window's own double size stays where the user left it: the reference
-    /// keeps one `dsize` flag for the player (S01 §1), but the only measured
-    /// case is the equalizer's own size (S05 §2.1), and the command is
-    /// addressed to the equalizer.
-    fn toggle_eq_double_size(&mut self) {
-        let double_size = !self.eq_state().double_size;
-        self.eq.set_double_size(double_size);
     }
 
     /// Reads the stream's phase out of the engine and turns it into what the

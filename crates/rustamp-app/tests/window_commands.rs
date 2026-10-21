@@ -108,11 +108,26 @@ fn a_double_size_command_addressed_to_the_equalizer_doubles_it() {
     assert!(app.eq_state().double_size, "the equalizer is double-sized");
     // S05 §2.1: the equalizer's double size is 550 x 232.
     assert_eq!(app.eq_frame_size(), (550, 232));
+    // Measured 2026-10-21 (capture job `base291-global-double`): the same
+    // command posted to the equalizer also took the MAIN window from 275x116 to
+    // 550x232, while the same treatment with the windowshade command left it
+    // alone. Double size is one `dsize` flag for the player (S01 §1), not a
+    // per-window one - the first version of this code had that wrong.
+    assert_eq!(
+        app.frame_size(),
+        (550, 232),
+        "one double-size flag for the player"
+    );
 
     // The same command again restores it.
     post(&mut app, WindowId::Equalizer, TOGGLE_DOUBLE_SIZE);
     assert!(!app.eq_state().double_size, "the equalizer is 1x again");
     assert_eq!(app.eq_frame_size(), (275, 116));
+    assert_eq!(
+        app.frame_size(),
+        (275, 116),
+        "and the main window follows the same flag back"
+    );
 }
 
 /// The size a window comes back to is the one it had, not a fixed default:
