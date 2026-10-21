@@ -374,3 +374,25 @@ main window from 275x116 to 550x232 (`base291-global-double`), 40064 left it at
 275x116 (`base291-global-shade`). One `dsize` flag for the player (S01 section
 1), windowshade per window. The player's command handler was corrected to match,
 and `window_commands.rs` pins it.
+
+## The equalizer interior, re-measured in the VM after `wave342` (2026-10-21)
+
+The headless claim was 0 differing pixels; the real OS window confirms it to
+within a state difference:
+
+| Case | before | after | where the remainder is |
+|---|---|---|---|
+| `eq-active` | 7 408 (23.2 %) | **6** | `(44,22)-(46,23)` - the auto indicator |
+| `eq-inactive` | 7 408 (23.2 %) | **6** | same rectangle |
+| `eq-double` | 29 632 (23.2 %) | **24** | the same 6 px at 2x |
+
+Six pixels in a 3x2 rectangle are the **auto flag**, not a drawing error: the
+indicator is lit on one side and dark on the other. That is a state question
+(does our player start with auto enabled?), not a renderer question, and it is
+the last thing the equalizer still owes.
+
+`eq-shade` stays at 1 072 / 3 850 (27.8 %) for a reason outside the interior:
+the reference capture shows the **unfocused** shade band (`eq_ex.bmp` row 15)
+while ours shows the focused one, and Winamp additionally draws an "EQ" label in
+the band with a system font that the skin does not carry. Both are their own
+cases - focus state, and system-font text - not slider drawing.
