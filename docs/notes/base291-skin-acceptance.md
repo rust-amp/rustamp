@@ -396,3 +396,30 @@ the reference capture shows the **unfocused** shade band (`eq_ex.bmp` row 15)
 while ours shows the focused one, and Winamp additionally draws an "EQ" label in
 the band with a system font that the skin does not carry. Both are their own
 cases - focus state, and system-font text - not slider drawing.
+
+## Open, and named so it is not lost: the shade bands' focus state
+
+`eq-shade` (1 072 / 3 850) and `playlist-shade` (507 / 3 850) both compare a
+**focused** strip of ours against an **unfocused** strip of the reference. The
+skin carries both variants (`eq_ex.bmp` row 0 vs row 15), and the focus
+rendering itself is proven exact by the active/inactive pairs (their deltas match
+the reference's to the pixel). So this is a **state** difference in the capture
+job, not a drawing defect:
+
+- the reference job toggles the shade with a posted command and the window is
+  not focused afterwards,
+- our presented job opens the equalizer with a posted command, and the window is
+  focused when it is captured.
+
+Two things to settle before either number can be read as a drawing difference:
+1. does our player take the focus when a window command arrives (a posted
+   `WM_COMMAND` should not change the focus at all)? If it does, that is a real
+   defect in the seam, not in the renderer;
+2. the capture job should put both sides in the same focus state - add a variant
+   that clicks the main title bar before capturing the shaded strip, and keep the
+   existing one, so the two states are both recorded instead of compared against
+   each other.
+
+`eq-shade` also carries the "EQ" label Winamp draws into the band with a system
+font the skin does not ship - its own case (system-font text), not a strip
+drawing question.
