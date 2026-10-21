@@ -89,9 +89,24 @@ impl App {
     ///
     /// 275 x 116 at rest (S06 scope, S01 §1) and 275 x 14 while it is shaded
     /// (S01 §1). The editor ignores double-size (S05 §2.1), so the flag is
-    /// always false here.
+    /// always false here. When the user has resized the playlist by dragging
+    /// its corner (Bug 1), the custom size persists as pe_width/pe_height
+    /// (S12 §3.4) and is returned instead of the default.
     pub fn playlist_frame_size(&self) -> (u32, u32) {
-        window_size(WindowKind::Playlist, self.playlist_shaded(), false)
+        if self.playlist_shaded() {
+            window_size(WindowKind::Playlist, true, false)
+        } else if let Some(layout) = self
+            .config()
+            .ui
+            .windows
+            .iter()
+            .find(|w| w.id == WindowId::Playlist)
+            && let (Some(w), Some(h)) = (layout.width, layout.height)
+        {
+            (w, h)
+        } else {
+            window_size(WindowKind::Playlist, false, false)
+        }
     }
 
     /// The docked stack for the player's current state (S05 §3.3, §5).

@@ -43,6 +43,7 @@ pub mod single_instance;
 pub mod tray;
 pub mod utc;
 pub mod window_region;
+pub mod window_zorder;
 
 pub use cursor::{
     CursorError, CursorFormat, OsCursor, cursor_payload, pointer_window, restore_cursor,
@@ -89,3 +90,4 @@ pub use tray::{TRAY_CALLBACK_MESSAGE, TRAY_LEFT_CLICK, TRAY_MENU, TRAY_TOOLTIP, 
 pub use tray::{TrayError, TrayIcon};
 pub use utc::{UtcCalendar, utc_calendar};
 pub use window_region::{RegionRect, apply_window_region, window_region_contains};
+pub use window_zorder::raise_classic_group;
