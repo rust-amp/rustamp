@@ -193,10 +193,11 @@ pub use playlist_window::{
     BOTTOM_BAR_RECT, BUTTON_SRC_Y, CLOSE_BUTTON_RECT, LIST_BOTTOM, LIST_LEFT, LIST_OPTS_SRC_X,
     LIST_PAGE_HEIGHT, LIST_RIGHT, LIST_TOP, PlaylistTitleButton, ROW_PITCH, SCROLL_ARROWS_RECT,
     SCROLL_ARROWS_SRC, SCROLL_HANDLE_SRC, SCROLL_HANDLE_X, SCROLL_SPLIT_Y, SCROLL_TOP_Y,
-    SCROLL_TRACK_RECT, SCROLL_TRAVEL_PX, SHADE_BUTTON_RECT, ScrollbarHit, TITLE_BAR_HEIGHT,
-    TITLE_STRIP_WIDTH, TITLE_STRIP_X, TITLE_TILE_WIDTH, button_rect, hit_test_list_row,
-    hit_test_scroll, hit_test_scrollbar, hit_test_title_bar, in_list_area, list_area,
-    render_playlist_window, row_pitch, row_rect, scroll_handle_rect, scroll_handle_y,
+    SCROLL_TRACK_RECT, SCROLL_TRAVEL_PX, SHADE_BODY_SRC, SHADE_BUTTON_RECT, SHADE_CORNER_SRC,
+    SHADE_RIGHT_FOCUSED_SRC, SHADE_RIGHT_SRC, SHADE_RIGHT_X, SHADE_TITLE_HEIGHT, ScrollbarHit,
+    TITLE_BAR_HEIGHT, TITLE_STRIP_WIDTH, TITLE_STRIP_X, TITLE_TILE_WIDTH, button_rect,
+    hit_test_list_row, hit_test_scroll, hit_test_scrollbar, hit_test_title_bar, in_list_area,
+    list_area, render_playlist_window, row_pitch, row_rect, scroll_handle_rect, scroll_handle_y,
     scroll_offset_for_handle_y, visible_rows,
 };
 pub use presenter::{MainWindowPresenter, PresenterError, map_key, map_key_code, map_modifiers};

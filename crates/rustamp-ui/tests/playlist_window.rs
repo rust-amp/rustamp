@@ -29,6 +29,10 @@ const ARROWS: [u8; 3] = [221, 231, 241];
 const CLOSEC: [u8; 3] = [222, 232, 242];
 const SHADEC: [u8; 3] = [223, 233, 243];
 const RAIL: [u8; 3] = [224, 234, 244];
+const SHADE_CORNER: [u8; 3] = [240, 241, 242];
+const SHADE_BODY: [u8; 3] = [243, 244, 245];
+const SHADE_RIGHT_FOCUSED: [u8; 3] = [246, 247, 248];
+const SHADE_RIGHT: [u8; 3] = [249, 250, 251];
 // `pledit.txt` colours under test.
 const NORMAL_BG: [u8; 3] = [0x0A, 0x0A, 0x0B];
 const SELECTED_BG: [u8; 3] = [0x14, 0x14, 0xC8];
@@ -124,12 +128,20 @@ fn synthetic_playlist_skin() -> Skin {
                 (72, 86, 24, 18, BTN_SEL),
                 (101, 86, 24, 18, BTN_MISC),
                 (229, 86, 24, 18, BTN_LIST),
-                // Scrollbar handle and arrows (S01 §4.2).
-                (52, 53, 7, 17, HANDLE),
+                // Scrollbar handle and arrows (S01 §4.2; the handle's own cell
+                // is 8 x 18, see `SCROLL_HANDLE_SRC`).
+                (52, 53, 8, 18, HANDLE),
                 (261, 72, 8, 10, ARROWS),
                 // Close/shade cells (S01 §4, provisional).
                 (52, 42, 9, 9, CLOSEC),
                 (62, 42, 9, 9, SHADEC),
+                // Windowshade band: corner, body tile and the two right
+                // corners (S01 §4; the composition is measured, see
+                // `SHADE_CORNER_SRC`).
+                (72, 42, 25, 14, SHADE_CORNER),
+                (72, 57, 25, 14, SHADE_BODY),
+                (120, 42, 29, 14, SHADE_RIGHT_FOCUSED),
+                (120, 57, 29, 14, SHADE_RIGHT),
             ],
         ),
     );
@@ -233,6 +245,50 @@ fn scrollbar_handle_tracks_the_scroll_offset() {
     assert_eq!(rgb(&frame, 261, 61), HANDLE);
     // The top slot is the side rail again, not the handle.
     assert_eq!(rgb(&frame, 261, 21), RAIL);
+}
+
+/// The handle is the sprite's own cell: 8 x 18, not the 7 x 17 sub-rect
+/// S01 §4.2 verified. The base291 `playlist-active` capture shows its right
+/// border column (window x = 267) and its bottom border row (window y = 37).
+#[test]
+fn scrollbar_handle_is_its_own_eight_by_eighteen_cell() {
+    let skin = synthetic_playlist_skin();
+    let frame = render_playlist_window(&skin, &window_with(60), &[], true);
+    for (x, y) in [(260, 20), (267, 20), (260, 37), (267, 37), (266, 21)] {
+        assert_eq!(rgb(&frame, x, y), HANDLE, "{x},{y} is the handle");
+    }
+    assert_ne!(rgb(&frame, 268, 20), HANDLE, "the handle ends at x = 267");
+    assert_ne!(rgb(&frame, 260, 38), HANDLE, "the handle ends at y = 37");
+}
+
+/// The shade band is its left corner cell, the borderless body tile and the
+/// right corner cell - never the corner cell repeated (that drew a four-pixel
+/// seam every 25 px). The corner is the same cell in both focus states; the
+/// right corner is the focused or the unfocused row.
+#[test]
+fn shade_band_uses_the_corner_body_and_right_cells() {
+    let skin = synthetic_playlist_skin();
+    let mut window = PlaylistWindow::new();
+    window.windowshade = true;
+    for focused in [false, true] {
+        let frame = render_playlist_window(&skin, &window, &[], focused);
+        assert_eq!((frame.width(), frame.height()), (275, 14));
+        for (x, y) in [(0, 0), (1, 5), (3, 12)] {
+            assert_eq!(rgb(&frame, x, y), SHADE_CORNER, "{x},{y} is the corner");
+        }
+        // No seam at the 25 px steps: the body tile is the borderless cell.
+        for (x, y) in [(25, 5), (30, 5), (50, 5), (200, 12), (245, 5)] {
+            assert_eq!(rgb(&frame, x, y), SHADE_BODY, "{x},{y} is the body tile");
+        }
+        let right = if focused {
+            SHADE_RIGHT_FOCUSED
+        } else {
+            SHADE_RIGHT
+        };
+        for (x, y) in [(246, 0), (250, 5), (274, 13)] {
+            assert_eq!(rgb(&frame, x, y), right, "{x},{y} is the right corner");
+        }
+    }
 }
 
 #[test]

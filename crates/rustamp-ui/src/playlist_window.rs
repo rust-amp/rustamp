@@ -22,11 +22,28 @@
 //! * Selection fill: the `SelectedBG` colour from `pledit.txt` over the list
 //!   area (S01 §4, verified by diff); entry text in the `Normal` colour
 //!   (`#00FF00` in the base skin), or `Current` for the current playback entry.
-//! * Scrollbar handle `PLEDIT.BMP` (52,53,7,17) at (260,y) with y = 20 at the
-//!   scroll top, 40 in the middle and 60 at the bottom (S01 §4.2, round 2,
-//!   verified); the arrow pair `PLEDIT.BMP` (261,72,8,10) fixed at (260,78)
-//!   (S01 §4.2, verified). Arrow click points (263,81) up / (263,87) down and
-//!   the one-page step (S06 §3, settled).
+//! * Scrollbar handle `PLEDIT.BMP` (52,53,8,18) at (260,y) with y = 20 at the
+//!   scroll top, 40 in the middle and 60 at the bottom (the three y values:
+//!   S01 §4.2, round 2, verified). The sprite's own cell is 8 x 18: the
+//!   base291 `playlist-active` capture shows the handle's right border column
+//!   (x = 267) and its bottom border row (y = 37), and that 8 x 18 rectangle
+//!   at (260,20) matches the capture pixel for pixel. S01 §4.2's (52,53,7,17)
+//!   is the subset it verified by mean difference, which a smaller rect is;
+//!   the drawn cell is the larger one. The arrow pair `PLEDIT.BMP`
+//!   (261,72,8,10) is fixed at (260,78) (S01 §4.2, verified). Arrow click
+//!   points (263,81) up / (263,87) down and the one-page step (S06 §3,
+//!   settled).
+//! * Windowshade band: 275 x 14 (S01 §1, verified), assembled from three
+//!   cells of `PLEDIT.BMP` (S01 §4 calls the shade rects provisional): the
+//!   25 x 14 left corner at sheet (72,42), the borderless 25 x 14 body tile
+//!   at sheet (72,57) tiled from x = 25, and the 29 x 14 right corner at
+//!   sheet (120,y) drawn at x = 246. The base291 `playlist-shade` capture
+//!   pins all three: the window's four-pixel left border is drawn at x = 0 in
+//!   both focus states, the body has **no** seam at the 25 px steps (so the
+//!   border-carrying cell must not be tiled), and the right corner comes from
+//!   row 42 while focused and row 57 while unfocused (lit vs dim window
+//!   buttons). Tiling the corner cell instead, as an earlier revision did,
+//!   drew a four-pixel seam every 25 px.
 //! * Bottom bar blocks (0,72,125,38) at (0,78) and (126,72,150,38) at (125,78)
 //!   (S01 §4, verified with a small residual). Buttons from sheet y = 86 drawn
 //!   at window y = 92-109, x ≈ 11/43/72/101/228, widths ≈ 22-25 px (S01 §4.1,
@@ -77,6 +94,38 @@ pub const CLOSE_BUTTON_RECT: Rect = Rect::new(264, 3, 9, 9);
 
 /// Shade button rect (S01 §4, provisional: 9 x 9 at (254,3)).
 pub const SHADE_BUTTON_RECT: Rect = Rect::new(254, 3, 9, 9);
+
+// ---------------------------------------------------------------------------
+// Windowshade band (S01 §1 for the size, S01 §4 for the sheet cells)
+// ---------------------------------------------------------------------------
+
+/// Height of the shaded playlist window: one 14 px title row (S01 §1).
+pub const SHADE_TITLE_HEIGHT: i32 = 14;
+
+/// The shade band's left corner: `PLEDIT.BMP` (72,42,25,14).
+///
+/// This cell carries the window's own four-pixel left border (a dark, a
+/// light and two mid columns at x = 0-3), so it is drawn once at x = 0 in
+/// **both** focus states - the cell below it, (72,57), is borderless.
+pub const SHADE_CORNER_SRC: Rect = Rect::new(72, 42, 25, 14);
+
+/// The shade band's repeating body tile: `PLEDIT.BMP` (72,57,25,14).
+///
+/// Borderless on purpose: the base291 `playlist-shade` capture has no seam at
+/// the 25 px steps, so the border-carrying corner cell above must not be
+/// tiled. Its 25 px width is also the tile pitch.
+pub const SHADE_BODY_SRC: Rect = Rect::new(72, 57, 25, 14);
+
+/// x of the shade band's right corner: 275 - its 29 px width.
+pub const SHADE_RIGHT_X: i32 = 246;
+
+/// The right corner of a **focused** shade band: `PLEDIT.BMP` (120,42,29,14),
+/// the cell with the lit window buttons.
+pub const SHADE_RIGHT_FOCUSED_SRC: Rect = Rect::new(120, 42, 29, 14);
+
+/// The right corner of an **unfocused** shade band: `PLEDIT.BMP`
+/// (120,57,29,14), the same cell with the dim window buttons.
+pub const SHADE_RIGHT_SRC: Rect = Rect::new(120, 57, 29, 14);
 
 /// The playlist title bar's buttons.
 ///
@@ -227,8 +276,14 @@ pub const SCROLL_TRAVEL_PX: i32 = 40;
 /// verified; no pressed sprite).
 pub const SCROLL_ARROWS_RECT: Rect = Rect::new(260, 78, 8, 10);
 
-/// Source rect of the handle in `PLEDIT.BMP` (S01 §4.2, verified: 7 x 17).
-pub const SCROLL_HANDLE_SRC: Rect = Rect::new(52, 53, 7, 17);
+/// Source rect of the handle in `PLEDIT.BMP`: 8 x 18 at (52,53).
+///
+/// S01 §4.2 records (52,53,7,17) - the rectangle whose mean difference it
+/// verified, which a smaller sub-rect is. The base291 `playlist-active`
+/// capture shows the sprite's own right border column (window x = 267) and
+/// bottom border row (window y = 37), and the full 8 x 18 cell at (260,20)
+/// matches that capture pixel for pixel (measured 2026-10-21).
+pub const SCROLL_HANDLE_SRC: Rect = Rect::new(52, 53, 8, 18);
 
 /// Source rect of the arrow pair in `PLEDIT.BMP` (S01 §4.2, verified).
 pub const SCROLL_ARROWS_SRC: Rect = Rect::new(261, 72, 8, 10);
@@ -284,17 +339,17 @@ pub fn hit_test_scroll(x: i32, y: i32) -> Option<ScrollDirection> {
 /// Own choice, stated plainly: no spec fixes the track rectangle — only the
 /// three handle points and the arrow rect are settled — so the track is the
 /// 8 px column from the top settled point down to the arrow pair, wide enough
-/// to hold the 7 px handle and the 8 px arrows.
+/// to hold the 8 px handle and the 8 px arrows.
 pub const SCROLL_TRACK_RECT: Rect = Rect::new(260, 20, 8, 58);
 
 /// The handle rectangle for a scroll offset of `first_visible` in a list of
-/// `len` (S01 §4.2: `PLEDIT.BMP` (52,53,7,17) drawn at (260,y)).
+/// `len` (S01 §4.2: `PLEDIT.BMP` (52,53,8,18) drawn at (260,y)).
 pub fn scroll_handle_rect(first_visible: usize, len: usize, pitch: i32) -> Rect {
     Rect::new(
         SCROLL_HANDLE_X,
         scroll_handle_y(first_visible, len, pitch),
-        7,
-        17,
+        SCROLL_HANDLE_SRC.width,
+        SCROLL_HANDLE_SRC.height,
     )
 }
 
@@ -412,18 +467,26 @@ pub fn render_playlist_window(
     focused: bool,
 ) -> Image {
     if window.windowshade {
-        let mut canvas = Image::filled(275, 14, [0, 0, 0, 255]);
+        let mut canvas = Image::filled(275, SHADE_TITLE_HEIGHT as u32, [0, 0, 0, 255]);
         let pledit = load_sheet(skin, Sheet::Pledit);
-        // S01 §4 provisional webamp shade rectangles. Playlist ignores 2x.
-        let y = if focused { 42 } else { 57 };
-        for x in (0..225).step_by(25) {
-            blit_region(&mut canvas, pledit.as_ref(), Rect::new(72, y, 25, 14), x, 0);
+        // Playlist ignores 2x. Corner once (it carries the window's left
+        // border), then the borderless body tile, then the right corner taken
+        // from the focused or the unfocused row (S01 §4, measured).
+        blit_region(&mut canvas, pledit.as_ref(), SHADE_CORNER_SRC, 0, 0);
+        for x in
+            (SHADE_CORNER_SRC.width as i32..SHADE_RIGHT_X).step_by(SHADE_BODY_SRC.width as usize)
+        {
+            blit_region(&mut canvas, pledit.as_ref(), SHADE_BODY_SRC, x, 0);
         }
         blit_region(
             &mut canvas,
             pledit.as_ref(),
-            Rect::new(99, y, 50, 14),
-            225,
+            if focused {
+                SHADE_RIGHT_FOCUSED_SRC
+            } else {
+                SHADE_RIGHT_SRC
+            },
+            SHADE_RIGHT_X,
             0,
         );
         draw_title_buttons(&mut canvas, pledit.as_ref(), skin, window);
@@ -1188,7 +1251,7 @@ mod tests {
         // A 60-entry list at the bottom page: handle at y = 60..77.
         assert_eq!(
             scroll_handle_rect(56, 60, ROW_PITCH),
-            Rect::new(260, 60, 7, 17)
+            Rect::new(260, 60, 8, 18)
         );
         assert_eq!(
             hit_test_scrollbar(263, 65, 56, 60, ROW_PITCH),
