@@ -743,10 +743,12 @@ impl App {
 
     /// Which focus variant the playlist frame renders with.
     ///
-    /// Simplification, stated: the app tracks one focus flag for the main
-    /// window; per-window activation is open, so the playlist shares it.
+    /// The playlist's OWN focus flag. Sharing the main window's flag swapped
+    /// both states in the capture set (measured 2026-10-21): `playlist-active`
+    /// showed the unfocused band and `playlist-inactive` the focused one, each
+    /// by exactly the 1 388 pixels S06 section 5.1 names for the band change.
     fn focused_for_playlist(&self) -> bool {
-        self.focused
+        self.playlist_focused
     }
 
     /// One bottom-bar button press (S06 §4/§5).
@@ -877,6 +879,24 @@ mod tests {
     use super::*;
     use crate::app::AppOptions;
     use crate::cli::OutputChoice;
+
+    /// The playlist's title band has a focused and an unfocused variant (S01
+    /// §4.1), and the captures proved the two windows disagree: sharing the
+    /// main window's flag swapped both playlist states by the 1 388 pixels S06
+    /// §5.1 names. This pins the separation; before the fix, `set_focused(true)`
+    /// alone flipped the playlist.
+    #[test]
+    fn the_playlist_uses_its_own_focus_and_not_the_main_windows() {
+        let mut app = test_app();
+        assert!(!app.focused_for_playlist(), "the playlist opens unfocused");
+        app.set_focused(true);
+        assert!(
+            !app.focused_for_playlist(),
+            "the main window's focus is not the playlist's"
+        );
+        app.set_playlist_focused(true);
+        assert!(app.focused_for_playlist(), "the playlist's own flag counts");
+    }
 
     fn test_app() -> App {
         let options = AppOptions {

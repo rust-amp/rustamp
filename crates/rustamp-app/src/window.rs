@@ -2606,8 +2606,7 @@ impl Windowed {
             }
             WindowEvent::DroppedFile(path) => self.drop_file(path),
             WindowEvent::Focused(focused) => {
-                // Per-window activation is open, so the playlist shares the
-                // main focus flag (see `App::render_playlist`).
+                self.app.set_playlist_focused(focused);
                 if !focused {
                     // The pointer keeps the cursor it had; give the system
                     // its own back when the window loses the focus.

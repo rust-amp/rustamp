@@ -217,6 +217,12 @@ pub struct App {
     always_on_top: bool,
     easy_move: bool,
     pub(crate) focused: bool,
+
+    /// Whether the playlist editor owns the focus (S01 §4.1: its title band has
+    /// a focused and an unfocused variant). The main window's flag is not a
+    /// stand-in: the captures showed the two windows disagree, and sharing the
+    /// flag swapped both playlist states.
+    pub(crate) playlist_focused: bool,
     current_skin: Option<PathBuf>,
     /// Counts the skin loads, so a holder of skin-derived resources (the
     /// cursor cache) can tell one skin from the next.
@@ -614,6 +620,7 @@ impl App {
             always_on_top: false,
             easy_move: true,
             focused: true,
+            playlist_focused: false,
             current_skin: None,
             skin_generation: 0,
             skin_folder: RefCell::default(),
@@ -1555,6 +1562,11 @@ impl App {
     /// bar is the window's active render).
     pub fn set_eq_focused(&mut self, focused: bool) {
         self.eq.set_focused(focused);
+    }
+
+    /// Records the playlist editor's own focus state (S01 §4.1).
+    pub fn set_playlist_focused(&mut self, focused: bool) {
+        self.playlist_focused = focused;
     }
 
     /// Sends a command into the command channel and processes it immediately.
