@@ -489,12 +489,23 @@ struct Windowed {
     eq_window: Option<Arc<Window>>,
     eq_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     eq_id: Option<WindowId>,
+    /// The equalizer's `WM_COMMAND` seam: the window answers the commands
+    /// addressed to it (S05 §1.1, §2.1: its shade is 275 x 14, its double
+    /// size 550 x 232). Windows-only; without it the equalizer keeps its
+    /// size and ignores the command.
+    #[cfg(windows)]
+    eq_commands: Option<classic_window_commands::WindowCommands>,
     /// The playlist editor window (`Winamp PE`, 275 x 116 at rest; S06, S01
     /// §4): a docked neighbour that follows the main window's bottom edge
     /// through the S05 geometry (see [`Windowed::apply_docking_positions`]).
     /// Created by the same shell and rail as the main window.
     playlist_window: Option<Arc<Window>>,
     playlist_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// The playlist editor's `WM_COMMAND` seam: the editor answers the
+    /// commands addressed to it (S01 §1: its shade is 275 x 14; S05 §2.1: it
+    /// is not affected by double size). Windows-only.
+    #[cfg(windows)]
+    playlist_commands: Option<classic_window_commands::WindowCommands>,
     /// The simple modal dialog window (About, file info, jump-to,
     /// load-playlist, open-media, skin browser, preferences; see `dialogs.rs`): at most one is open,
     /// created by the same shell and rail as the main window. Sizes and
@@ -596,8 +607,12 @@ impl Windowed {
             eq_window: None,
             eq_surface: None,
             eq_id: None,
+            #[cfg(windows)]
+            eq_commands: None,
             playlist_window: None,
             playlist_surface: None,
+            #[cfg(windows)]
+            playlist_commands: None,
             dialog_window: None,
             dialog_surface: None,
             dialog_id: None,
@@ -821,6 +836,40 @@ impl Windowed {
         }
     }
 
+    /// Applies the commands the operating system posted to the classic
+    /// windows.
+    ///
+    /// The native callback only queued them (see
+    /// [`classic_window_commands`]): the message may have arrived on the
+    /// thread that sent it, so the command is applied here, on the
+    /// presenter's thread, through the same command path a menu or a
+    /// shortcut uses. The windows are resized later in this tick
+    /// ([`Windowed::sync_eq_window`], [`Windowed::sync_playlist_window`]),
+    /// which read their size from the app.
+    #[cfg(windows)]
+    fn drain_window_commands(&mut self) {
+        let mut commands = Vec::new();
+        if let Some(seam) = &self.eq_commands {
+            commands.extend(
+                seam.take()
+                    .into_iter()
+                    .map(|command| (CoreWindowId::Equalizer, command)),
+            );
+        }
+        if let Some(seam) = &self.playlist_commands {
+            commands.extend(
+                seam.take()
+                    .into_iter()
+                    .map(|command| (CoreWindowId::Playlist, command)),
+            );
+        }
+        for (window, command) in commands {
+            if let Err(error) = self.app.apply_window_command(window, command) {
+                eprintln!("rustamp: the window command was refused: {error}");
+            }
+        }
+    }
+
     /// Creates, resizes or closes the equalizer's OS window so it matches
     /// `eq_open` and [`App::eq_frame_size`].
     ///
@@ -830,6 +879,12 @@ impl Windowed {
     fn sync_eq_window(&mut self, event_loop: &ActiveEventLoop) {
         if !self.app.eq_open() {
             if self.eq_window.is_some() {
+                // The command seam goes first: it removes the native
+                // subclass, which needs a live window.
+                #[cfg(windows)]
+                {
+                    self.eq_commands = None;
+                }
                 self.eq_window = None;
                 self.eq_surface = None;
                 self.eq_id = None;
@@ -875,6 +930,17 @@ impl Windowed {
             };
             if let (Some(width), Some(height)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
                 let _ = surface.resize(width, height);
+            }
+            // The equalizer answers the commands addressed to it (S05 §1.1,
+            // §2.1). The seam is installed before the window is handed to the
+            // rest of the presenter, so a command that arrives right after
+            // the window exists is not lost.
+            #[cfg(windows)]
+            match classic_window_commands::WindowCommands::attach(&window) {
+                Ok(commands) => self.eq_commands = Some(commands),
+                Err(error) => {
+                    eprintln!("rustamp: the equalizer window ignores window commands: {error}");
+                }
             }
             self.eq_window = Some(window);
             self.eq_surface = Some(surface);
@@ -2424,6 +2490,12 @@ impl Windowed {
                 self.applied_playlist_client = Some(desired);
             }
         } else if self.playlist_window.is_some() {
+            // The command seam goes first: it removes the native subclass,
+            // which needs a live window.
+            #[cfg(windows)]
+            {
+                self.playlist_commands = None;
+            }
             self.playlist_surface = None;
             self.playlist_window = None;
             self.playlist_click.clear();
@@ -2471,6 +2543,17 @@ impl Windowed {
         };
         if let (Some(width), Some(height)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
             let _ = surface.resize(width, height);
+        }
+        // The playlist editor answers the commands addressed to it (S01 §1:
+        // its shade is 275 x 14). The seam is installed before the window is
+        // handed to the rest of the presenter, so a command that arrives
+        // right after the window exists is not lost.
+        #[cfg(windows)]
+        match classic_window_commands::WindowCommands::attach(&window) {
+            Ok(commands) => self.playlist_commands = Some(commands),
+            Err(error) => {
+                eprintln!("rustamp: the playlist window ignores window commands: {error}");
+            }
         }
         self.playlist_window = Some(window);
         self.playlist_surface = Some(surface);
@@ -3024,6 +3107,11 @@ impl ApplicationHandler for Windowed {
         if let Some(control) = &self.external_control {
             control.drain(&mut self.app);
         }
+        // The commands the operating system posted to the equalizer and the
+        // playlist editor (S05 §1.1, §2.1; S01 §1) are applied before the
+        // windows are resized below, so the resize follows in the same tick.
+        #[cfg(windows)]
+        self.drain_window_commands();
         // Command lines a second launch handed over (F2) are applied here, on
         // the UI thread, through the same command path the menu uses.
         for request in single_instance::take_pending() {
@@ -3357,6 +3445,268 @@ fn map_key(event: &KeyEvent) -> Option<Key> {
     match event.physical_key {
         PhysicalKey::Code(code) => map_key_code(code),
         PhysicalKey::Unidentified(_) => None,
+    }
+}
+
+/// The `WM_COMMAND` seam of the classic windows that are not the main one.
+///
+/// The main window answers a posted `WM_COMMAND` through the external
+/// control ([`crate::external_control`]). The equalizer and the playlist
+/// editor had **no** answer at all: `winit` lets the message fall through
+/// to `DefWindowProc`, the window keeps its size, and a windowshade or a
+/// double-size command addressed to them changed nothing (S05 §1.1: the
+/// equalizer's shade is 275 x 14 and its double size 550 x 232; S01 §1:
+/// the playlist editor's shade is 275 x 14).
+///
+/// The reference applies such a command to the window it was addressed to
+/// (S01 §1: the equalizer's shade has its own flag, `eq_ws`, and the
+/// playlist editor's its own, `pe_height_ws`, beside the main window's
+/// `windowshade`), so the subclass below answers the two ids that carry a
+/// window's own geometry: 40064 (windowshade) and 40165 (double size),
+/// S03 §1.
+///
+/// The native callback only **queues** the command. The message may arrive
+/// on the thread that sent it — a `SendMessage` from another process runs
+/// the receiver's window procedure on the *sender's* thread — so the queue
+/// is shared and locked, and the presenter applies the command on its own
+/// thread (see [`Windowed::drain_window_commands`]).
+#[cfg(windows)]
+#[allow(unsafe_code)] // the Win32 subclass boundary only; the rest of the app denies unsafe.
+mod classic_window_commands {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::Window;
+
+    use crate::app::WindowCommand;
+
+    /// The message the reference's commands arrive as (S03 §1).
+    const WM_COMMAND: u32 = 0x0111;
+    /// The message the operating system sends before it destroys a window.
+    const WM_NCDESTROY: u32 = 0x0082;
+
+    /// The callback type `SetWindowSubclass` takes.
+    type SubclassProc =
+        unsafe extern "system" fn(*mut c_void, u32, usize, isize, usize, usize) -> isize;
+
+    #[link(name = "comctl32")]
+    unsafe extern "system" {
+        fn SetWindowSubclass(
+            hwnd: *mut c_void,
+            callback: SubclassProc,
+            id: usize,
+            data: usize,
+        ) -> i32;
+        fn RemoveWindowSubclass(hwnd: *mut c_void, callback: SubclassProc, id: usize) -> i32;
+        fn DefSubclassProc(hwnd: *mut c_void, message: u32, wparam: usize, lparam: isize) -> isize;
+    }
+
+    /// The subclass's id inside a window's subclass chain.
+    ///
+    /// One id for every window: the chain belongs to one window, so the id
+    /// only has to be unique there.
+    const SUBCLASS_ID: usize = 0x5241_4d50; // "RAMP"
+
+    /// The shared state of one window's seam.
+    struct Seam {
+        /// The commands the operating system posted, waiting for the
+        /// presenter to apply them.
+        pending: Mutex<Vec<WindowCommand>>,
+        /// Whether the subclass is still installed.
+        ///
+        /// The window's own destruction removes it (see the callback), and
+        /// the seam must not remove it a second time.
+        attached: AtomicBool,
+    }
+
+    impl Seam {
+        /// Queues a command the operating system posted.
+        fn push(&self, command: WindowCommand) {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.push(command);
+            }
+        }
+
+        /// Takes the queued commands, in the order they arrived.
+        fn take(&self) -> Vec<WindowCommand> {
+            match self.pending.lock() {
+                Ok(mut pending) => std::mem::take(&mut *pending),
+                Err(_) => Vec::new(),
+            }
+        }
+    }
+
+    /// The command a window message carries for one of the player's classic
+    /// windows, if any.
+    ///
+    /// `WM_COMMAND` carries the id in the low word of `wparam`; the high
+    /// word is the notification code, which the two ids this player answers
+    /// do not use (S03 §1).
+    fn command_from_message(message: u32, wparam: usize) -> Option<WindowCommand> {
+        if message != WM_COMMAND {
+            return None;
+        }
+        WindowCommand::from_command_id((wparam & 0xffff) as u32)
+    }
+
+    /// The native callback: it queues the command and lets the rest of the
+    /// message chain run.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be the live [`Seam`] allocation the subclass was
+    /// installed with; [`WindowCommands::attach`] keeps it alive until the
+    /// subclass is removed.
+    unsafe extern "system" fn callback(
+        hwnd: *mut c_void,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        id: usize,
+        data: usize,
+    ) -> isize {
+        // SAFETY: `data` is the live `Seam` allocation of the subclass.
+        let seam = unsafe { &*(data as *const Seam) };
+        if message == WM_NCDESTROY {
+            // The window is going away, so the subclass must not outlive it.
+            // SAFETY: the OS destroys this HWND on its owner thread.
+            unsafe { RemoveWindowSubclass(hwnd, callback, id) };
+            seam.attached.store(false, Ordering::SeqCst);
+        }
+        if let Some(command) = command_from_message(message, wparam) {
+            seam.push(command);
+            // `WM_COMMAND` has no reply contract (S10 §4 / §9).
+            return 0;
+        }
+        // SAFETY: the original parameters are forwarded along the chain.
+        unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    }
+
+    /// The `WM_COMMAND` seam of one classic window.
+    ///
+    /// It owns the window — so the handle stays valid while the subclass is
+    /// installed — and the shared state the callback writes into.
+    pub(crate) struct WindowCommands {
+        /// The window the subclass is installed on.
+        _window: Arc<Window>,
+        hwnd: *mut c_void,
+        seam: Arc<Seam>,
+    }
+
+    impl WindowCommands {
+        /// Installs the seam on `window`.
+        pub(crate) fn attach(window: &Arc<Window>) -> std::io::Result<Self> {
+            let hwnd = match window.window_handle().map(|handle| handle.as_raw()) {
+                Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get() as *mut c_void,
+                _ => return Err(std::io::Error::other("the window has no Win32 handle")),
+            };
+            let seam = Arc::new(Seam {
+                pending: Mutex::new(Vec::new()),
+                attached: AtomicBool::new(true),
+            });
+            let data = Arc::as_ptr(&seam) as usize;
+            // SAFETY: the window belongs to this thread, and the `Seam`
+            // allocation outlives the subclass (it is dropped only after the
+            // removal).
+            if unsafe { SetWindowSubclass(hwnd, callback, SUBCLASS_ID, data) } == 0 {
+                return Err(std::io::Error::other(
+                    "could not install the window-command subclass",
+                ));
+            }
+            Ok(Self {
+                _window: Arc::clone(window),
+                hwnd,
+                seam,
+            })
+        }
+
+        /// Takes the commands the operating system posted, in order.
+        pub(crate) fn take(&self) -> Vec<WindowCommand> {
+            self.seam.take()
+        }
+    }
+
+    impl Drop for WindowCommands {
+        fn drop(&mut self) {
+            if !self.seam.attached.load(Ordering::SeqCst) {
+                return;
+            }
+            // SAFETY: the window is still alive (the seam holds it) and the
+            // `Seam` allocation outlives the callback.
+            if unsafe { RemoveWindowSubclass(self.hwnd, callback, SUBCLASS_ID) } == 0 {
+                // A failed removal must never leave a dangling callback data
+                // pointer. Retain the allocation rather than risk a UAF.
+                std::mem::forget(self.seam.clone());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use rustamp_ui::ShortcutAction;
+
+        /// The `WM_COMMAND` id sits in the low word of `wparam`; the high word
+        /// is the notification code, which these two ids do not use (S03 §1).
+        #[test]
+        fn the_command_id_is_the_low_word_of_the_message() {
+            for (action, command) in [
+                (
+                    ShortcutAction::ToggleWindowShade,
+                    WindowCommand::ToggleWindowShade,
+                ),
+                (
+                    ShortcutAction::ToggleDoubleSize,
+                    WindowCommand::ToggleDoubleSize,
+                ),
+            ] {
+                let id = action.command_id() as usize;
+                assert_eq!(command_from_message(WM_COMMAND, id), Some(command));
+                assert_eq!(
+                    command_from_message(WM_COMMAND, (0x1234 << 16) | id),
+                    Some(command),
+                    "the notification code in the high word must not matter"
+                );
+            }
+        }
+
+        /// Every other message is none of this seam's business: it belongs
+        /// to `winit` or to the window procedure below it.
+        #[test]
+        fn other_messages_carry_no_command() {
+            for message in [0x0000, 0x0002, 0x0010, 0x0082, 0x0112] {
+                assert_eq!(
+                    command_from_message(message, 40064),
+                    None,
+                    "message {message:#06x} carries no window command"
+                );
+            }
+        }
+
+        /// The commands wait for the presenter and keep their order: the
+        /// first one posted is the first one applied.
+        #[test]
+        fn the_queued_commands_keep_their_order() {
+            let seam = Seam {
+                pending: Mutex::new(Vec::new()),
+                attached: AtomicBool::new(true),
+            };
+            seam.push(WindowCommand::ToggleWindowShade);
+            seam.push(WindowCommand::ToggleDoubleSize);
+            assert_eq!(
+                seam.take(),
+                vec![
+                    WindowCommand::ToggleWindowShade,
+                    WindowCommand::ToggleDoubleSize
+                ]
+            );
+            assert!(
+                seam.take().is_empty(),
+                "the queue is empty once it was taken"
+            );
+        }
     }
 }
 

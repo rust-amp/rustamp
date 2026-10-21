@@ -103,6 +103,49 @@ pub struct AppOptions {
     pub seconds: Option<u64>,
 }
 
+/// A command the operating system posted to one of the player's classic
+/// windows.
+///
+/// The reference carries its commands as `WM_COMMAND` ids (S03 §1): 40064
+/// toggles the windowshade, 40165 toggles the double size. The command
+/// applies to the window it was addressed to: the reference gives the
+/// equalizer its own shade flag (`eq_ws`) and the playlist editor its own
+/// (`pe_height_ws`), beside the main window's (`windowshade`), S01 §1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCommand {
+    /// Toggle the window's windowshade (S03 id 40064).
+    ///
+    /// The window's shade is the 14-px title strip alone (S01 §1: 275 x 14;
+    /// S05 §1.2: no body rows are drawn).
+    ToggleWindowShade,
+    /// Toggle the window's double size (S03 id 40165).
+    ///
+    /// The window's size is the 2x scale of its 1x size (S05 §2.1: the
+    /// equalizer is 275 x 116 at 1x and 550 x 232 at 2x; the playlist
+    /// editor is not affected by double size at all).
+    ToggleDoubleSize,
+}
+
+impl WindowCommand {
+    /// The command the `WM_COMMAND` id `id` carries, if any (S03 §1).
+    ///
+    /// The id is the low word of the message's `wparam`; the high word is
+    /// the notification code, which the two ids this player answers do not
+    /// use. The ids come from the shortcut table, which is the audited S03
+    /// id table, so there is one place that names them. Every other id
+    /// belongs to a command the classic windows do not answer here, so it
+    /// carries nothing.
+    pub fn from_command_id(id: u32) -> Option<Self> {
+        if id == ShortcutAction::ToggleWindowShade.command_id() {
+            Some(Self::ToggleWindowShade)
+        } else if id == ShortcutAction::ToggleDoubleSize.command_id() {
+            Some(Self::ToggleDoubleSize)
+        } else {
+            None
+        }
+    }
+}
+
 /// The player.
 pub struct App {
     engine: Engine,
@@ -1599,6 +1642,70 @@ impl App {
         self.load_enabled_plugins_for_new_host();
         let _ = self.publish_host_state();
         Ok(())
+    }
+
+    /// Applies `command` to the classic window `window`.
+    ///
+    /// The command applies to the window it was addressed to, which is what
+    /// the reference does: the equalizer's shade is its own flag (`eq_ws`)
+    /// and the playlist editor's is its own (`pe_height_ws`), beside the main
+    /// window's (`windowshade`), S01 §1.
+    ///
+    /// * The **equalizer** answers both commands: its shade is the 14-px
+    ///   strip (S01 §1: 275 x 14) and its double size is 275 x 116 ↔ 550 x 232
+    ///   (S05 §2.1).
+    /// * The **playlist editor** answers the windowshade (S01 §1: 275 x 14) and
+    ///   ignores the double size: it is not affected by double-size mode at
+    ///   all (S05 §2.1, S01 §1: it stays 275 x 116), so the command has no
+    ///   geometry to change there.
+    /// * The **main window** keeps the answer it always had: its windowshade
+    ///   is the main window's, and its double size is the player's flag, which
+    ///   the equalizer follows (S05 §2.1).
+    ///
+    /// The sizes are not computed here: the presenter reads them from
+    /// [`App::frame_size`], [`App::eq_frame_size`] and
+    /// [`App::playlist_frame_size`], which are the one place the geometry
+    /// lives (S05 §1.1, §2.1).
+    pub fn apply_window_command(&mut self, window: WindowId, command: WindowCommand) -> Result<()> {
+        match (window, command) {
+            (WindowId::Main, WindowCommand::ToggleWindowShade) => {
+                self.submit(Command::ToggleWindowShade(WindowId::Main))
+            }
+            (WindowId::Main, WindowCommand::ToggleDoubleSize) => {
+                self.submit(Command::ToggleDoubleSize)
+            }
+            (WindowId::Equalizer, WindowCommand::ToggleWindowShade) => {
+                self.submit(Command::ToggleWindowShade(WindowId::Equalizer))
+            }
+            (WindowId::Equalizer, WindowCommand::ToggleDoubleSize) => {
+                self.toggle_eq_double_size();
+                Ok(())
+            }
+            (WindowId::Playlist, WindowCommand::ToggleWindowShade) => {
+                self.submit(Command::ToggleWindowShade(WindowId::Playlist))
+            }
+            // The playlist editor has no double size (S05 §2.1, S01 §1): the
+            // command changes nothing there, and saying so is the whole
+            // answer.
+            (WindowId::Playlist, WindowCommand::ToggleDoubleSize) => Ok(()),
+            _ => Err(Error::InvalidArgument(format!(
+                "{window:?} is not a window that answers a window command"
+            ))),
+        }
+    }
+
+    /// Toggles the equalizer's own double size (S05 §2.1: 275 x 116 ↔ 550 x
+    /// 232).
+    ///
+    /// The flag is the equalizer's own, so a double-size command addressed to
+    /// the equalizer changes the equalizer and nothing else. The main
+    /// window's own double size stays where the user left it: the reference
+    /// keeps one `dsize` flag for the player (S01 §1), but the only measured
+    /// case is the equalizer's own size (S05 §2.1), and the command is
+    /// addressed to the equalizer.
+    fn toggle_eq_double_size(&mut self) {
+        let double_size = !self.eq_state().double_size;
+        self.eq.set_double_size(double_size);
     }
 
     /// Reads the stream's phase out of the engine and turns it into what the
