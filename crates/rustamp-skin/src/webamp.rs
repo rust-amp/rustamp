@@ -238,8 +238,8 @@ const fn def(
 pub static SPRITES: &[SpriteDef] = &[
     // --- balance.bmp (S01 open question 4: frame-to-value mapping unresolved) ---
     def("MAIN_BALANCE_BACKGROUND", Sheet::Balance, 9, 0, 38, 420), // S01 §2.4 provisional: 28 frames of 15 rows, mapping unresolved (open question 4)
-    def("MAIN_BALANCE_THUMB", Sheet::Balance, 15, 420, 14, 11), // S01 §2.4 provisional: thumb strip starts at y=420; mapping unresolved (open question 4)
-    def("MAIN_BALANCE_THUMB_ACTIVE", Sheet::Balance, 0, 420, 14, 11), // S01 §2.4 provisional: thumb strip starts at y=420; mapping unresolved (open question 4)
+    def("MAIN_BALANCE_THUMB", Sheet::Balance, 15, 422, 14, 11), // measured 2026-10-21: the thumb is the strip's last 11 rows (the strip starts at y=420); the value-to-frame mapping is still unresolved (open question 4)
+    def("MAIN_BALANCE_THUMB_ACTIVE", Sheet::Balance, 0, 422, 14, 11), // measured 2026-10-21: the pressed thumb is the strip's last 11 rows, like the resting one
     // --- cbuttons.bmp ---
     def("MAIN_PREVIOUS_BUTTON", Sheet::Cbuttons, 0, 0, 22, 18), // S01 §2.1 verified (22 px wide at pitch 23)
     def("MAIN_PREVIOUS_BUTTON_ACTIVE", Sheet::Cbuttons, 0, 18, 22, 18), // S01 §2.1 provisional (pressed states never captured)
@@ -456,8 +456,8 @@ pub static SPRITES: &[SpriteDef] = &[
     def("MAIN_SHADE_POSITION_THUMB_RIGHT", Sheet::Titlebar, 23, 36, 3, 7), // provisional: webamp; not in S01
     // --- volume.bmp (S01 open question 4: frame-to-value mapping unresolved) ---
     def("MAIN_VOLUME_BACKGROUND", Sheet::Volume, 0, 0, 68, 420), // S01 §2.4 provisional: 28 frames of 15 rows, mapping unresolved (open question 4)
-    def("MAIN_VOLUME_THUMB", Sheet::Volume, 15, 420, 14, 11), // S01 §2.4 provisional: thumb strip starts at y=420; mapping unresolved (open question 4)
-    def("MAIN_VOLUME_THUMB_SELECTED", Sheet::Volume, 0, 420, 14, 11), // S01 §2.4 provisional: thumb strip starts at y=420; mapping unresolved (open question 4)
+    def("MAIN_VOLUME_THUMB", Sheet::Volume, 15, 422, 14, 11), // measured 2026-10-21: the thumb is the strip's last 11 rows (the strip starts at y=420); the value-to-frame mapping is still unresolved (open question 4)
+    def("MAIN_VOLUME_THUMB_SELECTED", Sheet::Volume, 0, 422, 14, 11), // measured 2026-10-21: the pressed thumb is the strip's last 11 rows, like the resting one
     // --- gen.bmp (generic-plugin window; S11, later card) ---
     def("GEN_TOP_LEFT_SELECTED", Sheet::Gen, 0, 0, 25, 20), // provisional: webamp; S11 out of scope
     def("GEN_TOP_LEFT_END_SELECTED", Sheet::Gen, 26, 0, 25, 20), // provisional: webamp; S11 out of scope
@@ -707,8 +707,10 @@ mod tests {
         }
     }
 
-    /// S01 §2.4: the position thumb starts at the measured x, the volume and
-    /// balance thumb strips begin at y = 420.
+    /// S01 §2.4: the position thumb starts at the measured x. Measured
+    /// 2026-10-21: the volume and balance thumbs are the **last 11 rows** of
+    /// their 13-row thumb strip - the strip begins at y = 420, the thumb at
+    /// y = 422.
     #[test]
     fn slider_thumb_rects_follow_s01() {
         let pos = sprite("MAIN_POSITION_SLIDER_THUMB").unwrap();
@@ -720,7 +722,7 @@ mod tests {
             "MAIN_BALANCE_THUMB_ACTIVE",
         ] {
             let s = sprite(name).unwrap();
-            assert_eq!(s.y, 420, "{name} thumb strip should start at y = 420");
+            assert_eq!(s.y, 422, "{name} thumb is the strip's last 11 rows");
             assert_eq!((s.width, s.height), (14, 11), "{name}");
         }
     }

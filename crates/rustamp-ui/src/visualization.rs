@@ -85,7 +85,8 @@ pub enum VisMode {
     Scope,
     /// The same samples as unconnected dots.
     ScopeDots,
-    /// Background only; does not disable the engine tap or a plugin.
+    /// No analyser at all: the area keeps the skin's own art. Does not
+    /// disable the engine tap or a plugin.
     Off,
 }
 
@@ -363,6 +364,25 @@ fn oscilloscope_slot(row: u8, rows: u8) -> usize {
     slots::OSCILLOSCOPE_FIRST + distance.min(steps)
 }
 
+/// Whether the analyser has something to show in its area.
+///
+/// Measured 2026-10-21 (base-2.91 client capture of Winamp 2.95): while
+/// nothing plays, the reference draws **no** analyser - the skin's own
+/// `main.bmp` shows through the whole area. The area is therefore painted
+/// only when the display has content, and the skin's own art is what an empty
+/// analyser shows (S08 open question 9).
+fn has_content(state: &VisState, geometry: Geometry) -> bool {
+    let bands = geometry.bands().min(SPECTRUM_BANDS);
+    match state.mode {
+        VisMode::Spectrum => {
+            state.bars[..bands].iter().any(|bar| *bar > 0)
+                || state.peaks[..bands].iter().any(|peak| *peak > 0)
+        }
+        VisMode::Scope | VisMode::ScopeDots => state.input == VisInput::Fresh,
+        VisMode::Off => false,
+    }
+}
+
 /// Paint only within `area`. Every colour comes from the skin's palette
 /// (`viscolor.txt`, S17 §6), so a skin change repaints the analyser in the new
 /// colours without any other wiring.
@@ -370,6 +390,9 @@ fn oscilloscope_slot(row: u8, rows: u8) -> usize {
 /// The geometry is the area the main window currently has (S08 §1): the
 /// normal window draws 76 x 16 px with ten bands, the shaded window 38 x 5 px
 /// with five.
+///
+/// An area with nothing to show is not painted at all: the skin's own art
+/// stays visible there (measured 2026-10-21).
 ///
 /// | Slot | Drawn as |
 /// |---|---|
@@ -388,6 +411,9 @@ pub fn draw_visualization(
     state: &VisState,
     colors: &[[u8; 3]; 24],
 ) {
+    if !has_content(state, geometry) {
+        return;
+    }
     let color = |slot: usize| {
         let [r, g, b] = colors[slot];
         [r, g, b, 255]
@@ -400,11 +426,9 @@ pub fn draw_visualization(
     let bar_width = (width / bands as u32).saturating_sub(BAR_GAP);
     // Fixed-size scratch makes even a changed layout safe: clip, never spill.
     let mut image = Image::filled(width, u32::from(rows), color(slots::BACKGROUND));
-    if state.mode != VisMode::Off {
-        for y in (0..i32::from(rows)).step_by(2) {
-            for x in (0..width as i32).step_by(2) {
-                image.set_pixel(x, y, color(slots::GRID));
-            }
+    for y in (0..i32::from(rows)).step_by(2) {
+        for x in (0..width as i32).step_by(2) {
+            image.set_pixel(x, y, color(slots::GRID));
         }
     }
     match state.mode {
@@ -426,11 +450,12 @@ pub fn draw_visualization(
                 }
             }
         }
-        VisMode::Scope | VisMode::ScopeDots if state.input == VisInput::Fresh => {
+        VisMode::Scope | VisMode::ScopeDots => {
             // The trace has one sample per column of the area (own choice:
             // S08 leaves the oscilloscope's sampling open, question 3). The
             // analyser already took every n-th sample of the span, so the
             // column of the area and the column of the trace are the same.
+            // The area is painted only with fresh input, so the trace is there.
             for x in 0..width as i32 {
                 let column = x as usize;
                 let row = state.scope[column].min(rows - 1);
@@ -447,7 +472,7 @@ pub fn draw_visualization(
                 }
             }
         }
-        _ => {}
+        VisMode::Off => {}
     }
     canvas.blit_rect(
         &image,
@@ -812,14 +837,18 @@ mod tests {
         assert_eq!(image.pixel(1, 7), Some([0, 0, 0, 255]));
         assert_eq!(image.pixel(1, 15), Some([22, 0, 0, 255]));
         state.mode = VisMode::Off;
-        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
+        // The "off" mode paints nothing at all: the area keeps the skin's own
+        // art (measured 2026-10-21), so a fresh canvas stays untouched.
+        let mut fresh = Image::filled(76, 16, [1, 2, 3, 255]);
+        draw_visualization(&mut fresh, area, Geometry::Normal, &state, &palette);
         assert!(
-            image
+            fresh
                 .as_rgba()
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .all(|p| *p == [0, 0, 0, 255])
+                .all(|p| *p == [1, 2, 3, 255]),
+            "the off mode paints nothing"
         );
     }
 }

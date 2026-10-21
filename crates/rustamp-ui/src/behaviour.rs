@@ -302,6 +302,11 @@ impl MainWindow {
         self.update_time(now_ms);
         self.update_marquee(now_ms);
         self.update_held();
+        // A track is loaded as long as the machine carries a title for one
+        // (`Event::TrackChanged` with an id). The reference draws no position
+        // bar without a track (measured 2026-10-21), so the flag belongs to
+        // the render state.
+        self.state.track_loaded = self.track_title.is_some();
         self.visualization.advance(now_ms, self.state.transport);
         self.state.visualization = self.visualization.state().clone();
     }

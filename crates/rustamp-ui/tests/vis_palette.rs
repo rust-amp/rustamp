@@ -75,17 +75,14 @@ fn the_analyser_draws_with_the_skins_own_colours_only() {
     let skin = skin_with_viscolors(&colors);
     assert_eq!(skin.viscolors(), &colors);
     let area = area();
-    // The full bars hide the grid dots, so the empty state shows them.
-    let empty = MainWindowState {
-        visualization: VisState {
-            mode: VisMode::Spectrum,
-            input: VisInput::Fresh,
-            ..VisState::default()
-        },
-        ..MainWindowState::default()
-    };
+    // The full bars hide the grid dots, so a state with one raised band and
+    // the rest empty shows them. (An area with nothing at all is not painted
+    // at all: the skin's own art stays there - measured 2026-10-21.)
+    let mut partial = spectrum_state();
+    partial.visualization.bars = [0; SPECTRUM_BANDS];
+    partial.visualization.bars[0] = 16;
     let mut seen: HashSet<[u8; 3]> = HashSet::new();
-    for state in [spectrum_state(), empty] {
+    for state in [spectrum_state(), partial] {
         let frame = render_main_window(&state, &skin, &MainWindowLayout::CLASSIC);
         for y in area.y..area.bottom() {
             for x in area.x..area.right() {

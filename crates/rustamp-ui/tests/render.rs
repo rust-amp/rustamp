@@ -219,7 +219,34 @@ fn playing_state() -> MainWindowState {
         time_seconds: 12 * 60 + 34,
         title: "A".to_string(),
         position: 0,
+        // A loaded track: the position bar is drawn only then.
+        track_loaded: true,
         ..MainWindowState::default()
+    }
+}
+
+/// Without a track, the reference draws no position bar at all.
+///
+/// Measured 2026-10-21 (base-2.91 client capture of Winamp 2.95): with
+/// nothing loaded, the whole track band (16,72)-(263,81) shows the skin's own
+/// `main.bmp` art.
+#[test]
+fn without_a_track_no_position_bar_is_drawn() {
+    let skin = synthetic_skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let mut state = playing_state();
+    state.track_loaded = false;
+    let frame = render_main_window(&state, &skin, &layout);
+
+    let track = layout.position_track;
+    for y in track.y..track.bottom() {
+        for x in track.x..track.right() {
+            assert_eq!(
+                rgb(&frame, x, y),
+                MAIN_BG,
+                "the track band at {x},{y} must show the skin's own art"
+            );
+        }
     }
 }
 

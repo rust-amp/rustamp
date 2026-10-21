@@ -322,9 +322,9 @@ fn base291_main_focus_shade_scale_and_pressed_buttons() {
 /// pixel. No capture is taken here and no pixel is fabricated: the reference
 /// is a file, the other side is this renderer's output.
 ///
-/// The shaded analyser (S08 §1) is our own area: the reference keeps the
-/// skin's own art there, and those pixels are ours and not the reference's.
-/// So the difference must be exactly that rectangle and nothing else.
+/// The strip matches the reference pixel for pixel: the shaded analyser
+/// (S08 §1) has nothing to show, so the area keeps the skin's own art -
+/// exactly what the reference shows there (measured 2026-10-21).
 #[test]
 fn base291_shade_strip_matches_the_reference_capture() {
     let root = std::path::PathBuf::from(
@@ -353,26 +353,149 @@ fn base291_shade_strip_matches_the_reference_capture() {
     let reference = rustamp_testkit::RgbaImage::load_png(&reference_path).unwrap();
     let diff = rustamp_testkit::compare(&reference, &ours, 0);
     assert_eq!(diff.size_mismatch, None, "{}", diff.summary());
-
-    // Every pixel that differs must be one of ours: the shaded analyser.
-    let area = layout.shade_visualization;
-    for y in 0..height as i32 {
-        for x in 0..width as i32 {
-            if reference.pixel(x as u32, y as u32) != ours.pixel(x as u32, y as u32) {
-                assert!(
-                    x >= area.x && x < area.right() && y >= area.y && y < area.bottom(),
-                    "{x},{y} differs from the reference but is not the shaded analyser: {}",
-                    diff.summary()
-                );
-            }
-        }
-    }
     assert_eq!(
         diff.mismatched_pixels,
-        u64::from(area.width) * u64::from(area.height),
-        "{}: only the shaded analyser may differ from the reference",
+        0,
+        "{}: the shaded main window must match the reference pixel for pixel",
         diff.summary()
     );
+}
+
+/// The normal main window against the measured reference capture.
+///
+/// The capture directory holds the approved client capture of Winamp 2.95
+/// (skin base-2.91, 96 dpi, 1024x768 guest). `main-active.reference.png` is
+/// the focused main window with nothing loaded, 275 x 116. This renders the
+/// same state headlessly (the same skin, the same size, the same focus, the
+/// same empty playlist, the same volume) and compares it pixel by pixel. No
+/// capture is taken here and no pixel is fabricated: the reference is a file,
+/// the other side is this renderer's output.
+///
+/// The one documented difference is the **program name** in the marquee: the
+/// reference shows Winamp's own name (`WINAMP 2.95`), ours shows ours
+/// (`RUSTAMP`). The decoder indicator's idle cell is the second one. Every
+/// other pixel must match the reference.
+#[test]
+fn base291_main_window_matches_the_reference_capture() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("RUSTAMP_BASE291_CAPTURES")
+            .unwrap_or_else(|| "D:/code/rustamp-testcaptures/base291".into()),
+    );
+    if !root.join("main-active.reference.png").is_file() {
+        eprintln!(
+            "SKIP base291_main_window_matches_the_reference_capture: the reference captures in {} are not available",
+            root.display()
+        );
+        return;
+    }
+    let skin = skin();
+    let layout = MainWindowLayout::CLASSIC;
+    let state = MainWindowState {
+        title_bar_focused: true,
+        // The capture was taken with the equalizer and the playlist open and
+        // with the volume at 0.
+        eq_open: true,
+        playlist_open: true,
+        volume: 0,
+        // Nothing is loaded: the time display and the readouts are blank and
+        // no position bar is drawn.
+        transport: TransportState::Stopped,
+        time_visible: false,
+        track_loaded: false,
+        seekable: false,
+        kbps: None,
+        khz: None,
+        title: PROGRAM_NAME.to_string(),
+        ..Default::default()
+    };
+    // The focused and the unfocused window at 1x, and the double-size one:
+    // the double-size window is the exact integer 2x of the 1x frame
+    // (S01 §1), so its differences are the same ones, four times as many.
+    for (case, double_size, focused) in [
+        ("main-active", false, true),
+        ("main-inactive", false, false),
+        ("main-double", true, true),
+    ] {
+        let frame = render_main_window(
+            &MainWindowState {
+                title_bar_focused: focused,
+                double_size,
+                // The latched clutter letter `D` is lit while the double-size
+                // mode is on (S02 §2).
+                clutter_d: double_size,
+                ..state.clone()
+            },
+            &skin,
+            &layout,
+        );
+        let scale: i32 = if double_size { 2 } else { 1 };
+        assert_eq!(
+            (frame.width(), frame.height()),
+            (275 * scale as u32, 116 * scale as u32),
+            "{case}"
+        );
+        let (width, height, rgba) = frame.into_raw();
+        let ours = rustamp_testkit::RgbaImage::from_raw(width, height, rgba).unwrap();
+        let reference =
+            rustamp_testkit::RgbaImage::load_png(root.join(format!("{case}.reference.png")))
+                .unwrap();
+        let diff = rustamp_testkit::compare(&reference, &ours, 0);
+        assert_eq!(diff.size_mismatch, None, "{case}: {}", diff.summary());
+
+        // Every pixel that differs must lie in one of the two documented
+        // rectangles: the marquee band (the program name) and the decoder
+        // indicator's own cell (the idle decoder look, see the lane report).
+        let band = layout.marquee;
+        let decoder = layout.decoder_indicator;
+        let mut in_band = 0u64;
+        let mut in_decoder = 0u64;
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                if reference.pixel(x as u32, y as u32) == ours.pixel(x as u32, y as u32) {
+                    continue;
+                }
+                if x >= band.x * scale
+                    && x < (band.x + band.width as i32) * scale
+                    && y >= band.y * scale
+                    && y < (band.y + band.height as i32) * scale
+                {
+                    in_band += 1;
+                    continue;
+                }
+                assert!(
+                    x >= decoder.x * scale
+                        && x < (decoder.x + decoder.width as i32) * scale
+                        && y >= decoder.y * scale
+                        && y < (decoder.y + decoder.height as i32) * scale,
+                    "{case}: {x},{y} differs from the reference but is neither the marquee band nor the decoder cell: {}",
+                    diff.summary()
+                );
+                in_decoder += 1;
+            }
+        }
+        assert_eq!(
+            in_band,
+            120 * scale as u64 * scale as u64,
+            "{case}: the marquee must differ in exactly the program-name glyphs: {}",
+            diff.summary()
+        );
+        assert_eq!(
+            in_decoder,
+            12 * scale as u64 * scale as u64,
+            "{case}: the decoder cell must differ in exactly the idle indicator: {}",
+            diff.summary()
+        );
+        assert_eq!(
+            diff.mismatched_pixels,
+            in_band + in_decoder,
+            "{case}: {}",
+            diff.summary()
+        );
+        eprintln!(
+            "{case}: {} differing pixels ({in_band} in the marquee band, {in_decoder} in the decoder cell)",
+            diff.mismatched_pixels
+        );
+    }
 }
 
 #[test]
@@ -390,6 +513,8 @@ fn base291_main_readouts_marquee_clutter_toggles_and_sliders() {
                 volume: value,
                 balance: value,
                 position: value,
+                // A loaded track: the position bar is drawn only then.
+                track_loaded: true,
                 title: "ABC".into(),
                 kbps: Some(192),
                 khz: Some(44),
