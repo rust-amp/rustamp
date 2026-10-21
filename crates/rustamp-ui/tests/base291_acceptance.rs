@@ -548,16 +548,16 @@ fn base291_equalizer_focus_shade_scale_buttons_thumbs_and_curve() {
                     EqWidget::Auto => (
                         Rect::new(
                             match (engaged, held) {
-                                (false, false) => 36,
-                                (true, false) => 95,
+                                (false, false) => 35,
+                                (true, false) => 94,
                                 (false, true) => 153,
                                 (true, true) => 212,
                             },
                             119,
-                            if held { 33 } else { 32 },
+                            33,
                             12,
                         ),
-                        if held { 39 } else { 40 },
+                        39,
                     ),
                     _ => (Rect::new(224, if held { 176 } else { 164 }, 44, 12), 217),
                 };
@@ -585,9 +585,43 @@ fn base291_equalizer_focus_shade_scale_buttons_thumbs_and_curve() {
                     rect.x,
                     rect.y,
                 );
+                // The track is one 14 x 63 sheet column, drawn one pixel left
+                // of the thumb: the measured reference capture's column. The
+                // thumb covers its middle, so that part is left alone.
+                let track = EqualizerLayout::track_rect(slider);
+                if value == 31 {
+                    // The flat value's column is the measured one.
+                    region_except(
+                        &frame,
+                        &skin,
+                        Sheet::EqMain,
+                        Rect::new(13, 229, 14, 63),
+                        track.x,
+                        track.y,
+                        rect,
+                    );
+                }
+                // The body colour is the sheet's colour scale: red at the
+                // most boost value, green at the most cut one (S01 §3.1).
+                let body = frame.pixel(rect.x + 5, 50).unwrap();
+                let scale = skin.sheet(Sheet::EqMain).unwrap();
+                let scale = rustamp_gfx::Image::from_rgba(
+                    scale.width(),
+                    scale.height(),
+                    scale.as_rgba().to_vec(),
+                )
+                .unwrap();
+                let expected = match value {
+                    0 => scale.pixel(115, 294),
+                    63 => scale.pixel(115, 294 + 18),
+                    _ => continue,
+                };
+                assert_eq!(Some(body), expected, "the track body colour of {value}");
+                // The curve's row: the flat value lies on the graph's centre
+                // row, the ends on the outermost ones.
                 let row = match value {
                     0 => 0,
-                    31 => 8,
+                    31 => 9,
                     _ => 18,
                 };
                 region(
@@ -595,7 +629,7 @@ fn base291_equalizer_focus_shade_scale_buttons_thumbs_and_curve() {
                     &skin,
                     Sheet::EqMain,
                     Rect::new(115, 294 + row, 1, 1),
-                    86,
+                    88,
                     17 + row,
                 );
             }
@@ -1041,6 +1075,61 @@ fn base291_playlist_font_falls_back_when_the_family_is_missing() {
         render(&memory_skin("Arial", false)),
         "a family the host does not have must fall back to the default one"
     );
+}
+
+/// The equalizer against the measured reference captures.
+///
+/// The capture directory holds the approved client captures of Winamp 2.95
+/// (skin base-2.91, 96 dpi, 1024x768 guest): `eq-active.reference.png` is the
+/// equalizer while it holds the focus, `eq-inactive.reference.png` the same
+/// window while the main window holds the focus and `eq-double.reference.png`
+/// the window at double size. All three show a flat equalizer with the EQ
+/// engaged and the AUTO button engaged. This renders the same states
+/// headlessly (the same skin, the same sizes, the same focus) and compares
+/// them pixel by pixel. No capture is taken here and no pixel is fabricated:
+/// the references are files, the other side is this renderer's output.
+#[test]
+fn base291_equalizer_matches_the_reference_captures() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("RUSTAMP_BASE291_CAPTURES")
+            .unwrap_or_else(|| "D:/code/rustamp-testcaptures/base291".into()),
+    );
+    if !root.join("eq-active.reference.png").is_file() {
+        eprintln!(
+            "SKIP base291_equalizer_matches_the_reference_captures: the reference captures in {} are not available",
+            root.display()
+        );
+        return;
+    }
+    let skin = skin();
+    let layout = EqualizerLayout::CLASSIC;
+    for (case, focused, double_size) in [
+        ("eq-active", true, false),
+        ("eq-inactive", false, false),
+        ("eq-double", true, true),
+    ] {
+        let state = EqualizerState {
+            focused,
+            double_size,
+            enabled: true,
+            auto: true,
+            ..Default::default()
+        };
+        let frame = render_equalizer_window(&state, &skin, &layout);
+        let (width, height, rgba) = frame.into_raw();
+        let ours = rustamp_testkit::RgbaImage::from_raw(width, height, rgba).unwrap();
+        let reference =
+            rustamp_testkit::RgbaImage::load_png(root.join(format!("{case}.reference.png")))
+                .unwrap();
+        let diff = rustamp_testkit::compare(&reference, &ours, 0);
+        assert_eq!(diff.size_mismatch, None, "{case}: {}", diff.summary());
+        assert_eq!(
+            diff.mismatched_pixels,
+            0,
+            "{case}: the equalizer must match the reference capture pixel for pixel: {}",
+            diff.summary()
+        );
+    }
 }
 
 /// Requires real VM screenshots captured by the interactive-session runner.

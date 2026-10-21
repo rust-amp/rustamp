@@ -14,34 +14,39 @@
 //!   unfocused at (0,0) — both round-2 verified.
 //! * On/Auto buttons (S07 §3.1/§3.2): normal, engaged, held and held-engaged
 //!   sheet rects at the measured held footprints (On (14,18,25,12), Auto
-//!   held (39,18,33,12)); engagement adds only the 6 px indicator cell.
+//!   (39,18,33,12)); engagement adds only the 6 px indicator cell.
 //! * Presets button (S01 §3, held-states run): normal (224,164,44,12),
 //!   held (224,176,44,12), drawn at (217,18).
 //! * Graph background (S01 §3, round 2): (0,294,113,19) at (86,17).
-//! * Slider thumbs (S01 §3.1): resting (0,164,11,11), dragged (0,176,11,11),
-//!   at the mapped thumb-y.
+//! * Slider tracks and thumbs (S01 §3.1, measured 2026-10-21 against the
+//!   reference capture): the track is the sheet's own 14 x 63 column, drawn
+//!   one pixel left of the thumb; the thumb is (0,164,11,11) resting and
+//!   (0,176,11,11) dragged, at the mapped thumb-y.
 //!
 //! Provisional drawing rules (own choices, **not** a measured DSP response):
 //!
 //! * The ten bands form a one-pixel, unsmoothed polyline across the graph,
-//!   equally spaced in x. Saved values 0/31/63 map to graph rows 0/8/18;
-//!   the two intervals are linear and rounded to nearest. Colours are sampled
-//!   from the sheet's 19-row ramp at the plotted y (S01 §3.1).
+//!   with the control points spread evenly over the graph's inner width
+//!   (two pixels in from each edge). Saved values 0/31/63 map to graph rows
+//!   0/9/18; the two intervals are linear and rounded to nearest. Colours
+//!   are sampled from the sheet's 19-row ramp at the plotted y (S01 §3.1).
 //! * The eleventh value, preamp, moves a separate full-width reference strip,
 //!   not the band curve: `18 - round(value * 18 / 63)`. The two endpoints
 //!   agree with S07 §8.2 (saved 0 -> window y35, 63 -> y17); the strip's
 //!   identity and intermediate mapping remain provisional (S07 §7.3 O8).
 //!   It is painted first, so the curve wins intersections. Enabled/Auto do not
 //!   hide the configured curve (own choice).
-//! * Each slider restores an 11-px-wide sheet column at y38..99, then fills
-//!   a centred 7-px body below the thumb to y99 with a constant ramp colour,
-//!   `round(value * 18 / 63)`. S01 fixes the groove's column/y offset and
-//!   fill direction/end colours, **not** this width, extent, recipe or rounding.
-//!   Preamp shares the band ramp and fills update during drags (own choices).
+//! * Which of the sheet's 26 track sprites a saved value picks is an own
+//!   choice: the sheet's own colour order, the most cut value first. The two
+//!   anchors S01 §3.1 gives hold (value 0 is the red body, the ramp's row 0,
+//!   value 63 the green one, row 18), and the flat value 31 lands on the
+//!   sprite the measured reference capture draws. S07 §12 O5 leaves the
+//!   intermediate mapping open.
 //!
 //! The track atlas (13,164,209,129) is **not** blitted as a whole (S01 refutes
-//! that). Shade drawing remains provisional (S01 §3,
-//! S05 §1.5). See `docs/tasks/S07r-eq-renderer.md` for settling measurements.
+//! that); each slider takes one 14 x 63 column of it. Shade drawing remains
+//! provisional (S01 §3, S05 §1.5). See `docs/tasks/S07r-eq-renderer.md` for
+//! settling measurements.
 //!
 //! # The windowshade form
 //!
@@ -58,8 +63,8 @@ use rustamp_skin::{Sheet, Skin};
 
 use crate::docking::{WindowKind, window_size};
 use crate::equalizer::{
-    EqSlider, EqWidget, EqualizerLayout, EqualizerState, FLAT_VALUE, MAX_VALUE, THUMB_BOTTOM_Y,
-    THUMB_SIZE, THUMB_TOP_Y,
+    EqSlider, EqWidget, EqualizerLayout, EqualizerState, FLAT_VALUE, MAX_VALUE, TRACK_HEIGHT,
+    TRACK_WIDTH,
 };
 use crate::layout::SHADE_HEIGHT;
 
@@ -134,32 +139,107 @@ fn on_sheet_rect(state: &EqualizerState) -> Rect {
 
 /// The `eqmain.bmp` sheet rect for the Auto button in its current state
 /// (S07 §3.1).
+///
+/// The sheet keeps the Auto button in four columns 59 px apart, each 33 px
+/// wide: the normal one at x = 35, the engaged at 94, the held at 153 and the
+/// held-engaged at 212. The measured reference capture draws the resting
+/// button in the same 33-px footprint as the held one, at window x = 39.
 fn auto_sheet_rect(state: &EqualizerState) -> Rect {
     let held = state.held == Some(EqWidget::Auto);
-    match (state.auto, held) {
-        (false, false) => Rect::new(36, 119, 32, 12),
-        (true, false) => Rect::new(95, 119, 32, 12),
-        (false, true) => Rect::new(153, 119, 33, 12),
-        (true, true) => Rect::new(212, 119, 33, 12),
-    }
+    let column = match (state.auto, held) {
+        (false, false) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (true, true) => 3,
+    };
+    Rect::new(35 + column * 59, 119, 33, 12)
 }
 
-/// S01 §3.1 fixes the two ramp endpoints, not intermediate quantization.
-/// Nearest-row rounding, shared by preamp and band bodies, is our choice.
-fn body_colour_row(value: u8) -> i32 {
+/// The number of track sprites the sheet's atlas holds (13 per row band).
+const TRACK_SPRITE_COUNT: i32 = 26;
+/// The atlas' first track column (S01 §3.1: the atlas starts at x = 13).
+const TRACK_ATLAS_X: i32 = 13;
+/// The distance between two track columns in the sheet.
+const TRACK_CELL_PITCH: i32 = 15;
+/// The row band of the most cut half of the value range.
+const TRACK_CUT_ROW: i32 = 164;
+/// The row band of the most boost half of the value range.
+const TRACK_BOOST_ROW: i32 = 229;
+/// The curve's row at the flat value: the graph's centre row.
+const CURVE_FLAT_ROW: i32 = 9;
+/// The curve's row at the ends of the value range (the graph has 19 rows).
+const CURVE_MAX_ROW: i32 = 18;
+/// The graph's margin, in pixels, that the curve keeps on each side.
+///
+/// The measured reference capture draws the flat curve from the graph's
+/// second to its second-to-last column.
+const GRAPH_MARGIN: i32 = 2;
+
+/// The track sprite's index in the sheet's own colour order, 0 = the most cut
+/// value and 25 the most boost one.
+///
+/// **Own choice:** the sheet's 26 sprites in their own order, the highest
+/// value first. The two anchors S01 §3.1 gives hold: value 0 is the red body
+/// (the ramp's row 0) and value 63 the green one (row 18). The flat value 31
+/// lands on the first sprite of the boost band, which is the one the
+/// measured reference capture draws.
+fn track_sprite_index(value: u8) -> i32 {
+    let value = i32::from(value.min(MAX_VALUE));
+    ((i32::from(MAX_VALUE) - value) * (TRACK_SPRITE_COUNT - 1) + 31) / i32::from(MAX_VALUE)
+}
+
+/// The `eqmain.bmp` track sprite for a saved value.
+///
+/// The sheet's slider atlas (S01 §3.1: (13,164,209,129), never blitted as a
+/// whole) holds 26 complete track sprites: 13 columns in the row band at
+/// y = 164 and 13 in the band at y = 229, the columns 15 px apart. Each
+/// sprite is 14 x 63 px and carries the groove, the coloured body, its bright
+/// core and the end caps.
+fn track_sheet_rect(value: u8) -> Rect {
+    let index = track_sprite_index(value);
+    let (cell, row) = if index < TRACK_SPRITE_COUNT / 2 {
+        (index, TRACK_CUT_ROW)
+    } else {
+        (index - TRACK_SPRITE_COUNT / 2, TRACK_BOOST_ROW)
+    };
+    Rect::new(
+        TRACK_ATLAS_X + cell * TRACK_CELL_PITCH,
+        row,
+        TRACK_WIDTH,
+        TRACK_HEIGHT,
+    )
+}
+
+/// The row of the sheet's 19-row colour scale (115,294) for a saved value.
+///
+/// S01 §3.1 fixes the two ends of the scale: value 0 is row 0 (red) and
+/// value 63 row 18 (green). The intermediate rows are a nearest-row
+/// rounding, shared by the preamp strip and the curve.
+fn colour_scale_row(value: u8) -> i32 {
     (i32::from(value.min(MAX_VALUE)) * 18 + 31) / 63
 }
 
-/// Own-choice band-value law, not a frequency-response calculation. The flat
-/// anchor lies in S01's measured row range 7..=9; its exact row is our choice.
+/// The curve's row for a saved value.
+///
+/// The flat anchor lies on the graph's centre row: the measured reference
+/// capture draws the flat curve there, and S01 §3.1's measured range is
+/// rows 7..=9.
 fn curve_row(value: u8) -> i32 {
     let value = i32::from(value.min(MAX_VALUE));
     let flat = i32::from(FLAT_VALUE);
     if value <= flat {
-        (value * 8 + flat / 2) / flat
+        (value * CURVE_FLAT_ROW + flat / 2) / flat
     } else {
-        8 + ((value - flat) * 10 + 16) / 32
+        CURVE_FLAT_ROW + ((value - flat) * (CURVE_MAX_ROW - CURVE_FLAT_ROW) + 16) / 32
     }
+}
+
+/// The graph's control point x for band `band`.
+///
+/// The ten control points are spread evenly over the graph's inner width.
+fn curve_x(band: usize, graph: Rect) -> i32 {
+    let last = graph.width as i32 - GRAPH_MARGIN - 1;
+    GRAPH_MARGIN + (band as i32 * (last - GRAPH_MARGIN)) / 9
 }
 
 /// Sample the colour scale, never paste its vertical strip as graph artwork
@@ -177,20 +257,19 @@ fn draw_graph(canvas: &mut Image, sheets: &EqSheets, state: &EqualizerState, gra
         sheets,
         Rect::new(0, 314, 113, 1),
         graph.x,
-        graph.y + 18 - body_colour_row(state.preamp),
+        graph.y + CURVE_MAX_ROW - colour_scale_row(state.preamp),
     );
 
-    // Own choice: distribute ten control points evenly across all 113 pixels,
-    // not by log-frequency or a DSP filter response; no preamp addition.
+    // Own choice: the ten control points spread evenly over the graph's
+    // inner width, not by log-frequency or a DSP filter response; no preamp
+    // addition.
     for band in 0..9 {
-        let x0 = (band as i32 * 112 + 4) / 9;
-        let x1 = ((band as i32 + 1) * 112 + 4) / 9;
         draw_graph_segment(
             canvas,
             sheets,
             graph,
-            (x0, curve_row(state.bands[band])),
-            (x1, curve_row(state.bands[band + 1])),
+            (curve_x(band, graph), curve_row(state.bands[band])),
+            (curve_x(band + 1, graph), curve_row(state.bands[band + 1])),
         );
     }
 }
@@ -230,37 +309,12 @@ fn draw_graph_segment(
     }
 }
 
-fn draw_slider_body(canvas: &mut Image, sheets: &EqSheets, thumb: Rect, value: u8) {
-    let bottom = THUMB_BOTTOM_Y + THUMB_SIZE as i32;
-    // Verified groove: sheet col14 (identical to col15), y = window y +191
-    // (S01 §3.1). Extending the empty (13,229,11,11) cell vertically along
-    // that offset is our provisional recipe; do not paste the 209x129 atlas.
-    blit_eqmain(
-        canvas,
-        sheets,
-        Rect::new(
-            13,
-            THUMB_TOP_Y + 191,
-            THUMB_SIZE,
-            (bottom - THUMB_TOP_Y) as u32,
-        ),
-        thumb.x,
-        THUMB_TOP_Y,
-    );
-    if let Some(colour) = ramp_colour(sheets, body_colour_row(value)) {
-        // S01 fixes a constant fill from thumb to track bottom. The centred
-        // 7-px width and y100 exclusive bottom are own choices, derived from
-        // the 11-px thumb and measured travel endpoints; no caps invented.
-        canvas.fill_rect(
-            Rect::new(
-                thumb.x + 2,
-                thumb.bottom(),
-                7,
-                (bottom - thumb.bottom()) as u32,
-            ),
-            colour,
-        );
-    }
+/// Draws the slider's track: the sheet's own column with the groove, the
+/// coloured body and the end caps (measured 2026-10-21 against the reference
+/// capture). The thumb is drawn on top of it.
+fn draw_slider_track(canvas: &mut Image, sheets: &EqSheets, slider: EqSlider, value: u8) {
+    let track = EqualizerLayout::track_rect(slider);
+    blit_eqmain(canvas, sheets, track_sheet_rect(value), track.x, track.y);
 }
 
 fn render_1x(state: &EqualizerState, skin: &Skin, layout: &EqualizerLayout) -> Image {
@@ -333,16 +387,11 @@ fn render_1x(state: &EqualizerState, skin: &Skin, layout: &EqualizerLayout) -> I
         layout.on.x,
         layout.on.y,
     );
-    let auto_x = if state.held == Some(EqWidget::Auto) {
-        layout.auto_held.x
-    } else {
-        layout.auto.x
-    };
     blit_eqmain(
         &mut canvas,
         &sheets,
         auto_sheet_rect(state),
-        auto_x,
+        layout.auto.x,
         layout.auto.y,
     );
 
@@ -364,11 +413,11 @@ fn render_1x(state: &EqualizerState, skin: &Skin, layout: &EqualizerLayout) -> I
         layout.presets.y,
     );
 
-    // Restore each track and colour its body before the measured thumb sprite.
+    // Draw each track, then the measured thumb sprite on top of it.
     for slider in EqSlider::ALL_BANDS {
         let value = state.slider_value(slider);
+        draw_slider_track(&mut canvas, &sheets, slider, value);
         let thumb = EqualizerLayout::thumb_rect(slider, value);
-        draw_slider_body(&mut canvas, &sheets, thumb, value);
         let dragged = state.thumb_dragged && state.held == Some(EqWidget::Slider(slider));
         // A lone down already starts the dragged state (S07 §8.2: 73 px
         // without movement); EqualizerWindow sets thumb_dragged on that down.
@@ -407,15 +456,37 @@ mod tests {
 
     #[test]
     fn provisional_row_laws_clamp_and_preserve_their_declared_anchors() {
-        assert_eq!([curve_row(0), curve_row(31), curve_row(63)], [0, 8, 18]);
-        assert_eq!([body_colour_row(0), body_colour_row(63)], [0, 18]);
+        assert_eq!([curve_row(0), curve_row(31), curve_row(63)], [0, 9, 18]);
+        assert_eq!([colour_scale_row(0), colour_scale_row(63)], [0, 18]);
         for value in 0..=255 {
             assert!((0..=18).contains(&curve_row(value)));
-            assert!((0..=18).contains(&body_colour_row(value)));
+            assert!((0..=18).contains(&colour_scale_row(value)));
             if value > 0 {
                 assert!(curve_row(value) >= curve_row(value - 1));
-                assert!(body_colour_row(value) >= body_colour_row(value - 1));
+                assert!(colour_scale_row(value) >= colour_scale_row(value - 1));
             }
+        }
+    }
+
+    #[test]
+    fn the_track_sprites_cover_the_sheets_own_colour_order() {
+        // The most cut value is the green body (the ramp's row 18), the most
+        // boost one the red body (row 0) and the flat value the sprite the
+        // measured reference capture draws.
+        assert_eq!(track_sheet_rect(63), Rect::new(13, 164, 14, 63));
+        assert_eq!(track_sheet_rect(31), Rect::new(13, 229, 14, 63));
+        assert_eq!(track_sheet_rect(0), Rect::new(193, 229, 14, 63));
+        // Every sprite is inside the atlas and the value order is monotone.
+        let mut previous = i32::MAX;
+        for value in 0..=MAX_VALUE {
+            let rect = track_sheet_rect(value);
+            assert!(rect.x >= TRACK_ATLAS_X);
+            assert!(rect.x + rect.width as i32 <= 275);
+            assert_eq!(rect.height, TRACK_HEIGHT);
+            assert_eq!(rect.width, TRACK_WIDTH);
+            let index = track_sprite_index(value);
+            assert!(index <= previous, "the track order must not go backwards");
+            previous = index;
         }
     }
 
@@ -434,7 +505,7 @@ mod tests {
             let mut canvas = Image::filled(275, 116, untouched);
             draw_graph(&mut canvas, &sheets, &state, graph);
             for band in 0..10 {
-                let x = (band as i32 * 112 + 4) / 9;
+                let x = curve_x(band, graph);
                 let y = curve_row(state.bands[band]);
                 assert_eq!(
                     canvas.pixel(graph.x + x, graph.y + y),
@@ -443,7 +514,7 @@ mod tests {
             }
             // The left endpoint is never at reference row9, or at the
             // opposite extreme: this checks preamp mapping independently.
-            let reference = 18 - body_colour_row(preamp);
+            let reference = CURVE_MAX_ROW - colour_scale_row(preamp);
             let x = if reference == 0 { 112 } else { 0 };
             assert_eq!(
                 canvas.pixel(graph.x + x, graph.y + reference),
@@ -460,28 +531,29 @@ mod tests {
     }
 
     #[test]
-    fn body_restores_sheet_track_and_fills_only_below_the_thumb() {
+    fn the_track_is_one_sheet_column_left_of_the_thumb() {
         let sheets = marked_sheets();
         let sheet = sheets.eqmain.as_ref().unwrap();
         for value in [0, 15, 31, 46, 63, 255] {
-            let thumb = EqualizerLayout::thumb_rect(EqSlider::Preamp, value);
+            let track = EqualizerLayout::track_rect(EqSlider::Preamp);
             let untouched = [1, 2, 3, 255];
             let mut canvas = Image::filled(275, 116, untouched);
-            draw_slider_body(&mut canvas, &sheets, thumb, value);
-            for y in 38..100 {
-                assert_eq!(canvas.pixel(thumb.x, y), sheet.pixel(13, y + 191));
-                let expected = if y >= thumb.bottom() {
-                    sheet.pixel(115, 294 + body_colour_row(value))
-                } else {
-                    sheet.pixel(15, y + 191)
-                };
-                assert_eq!(canvas.pixel(thumb.x + 2, y), expected);
+            draw_slider_track(&mut canvas, &sheets, EqSlider::Preamp, value);
+            let src = track_sheet_rect(value);
+            for y in 0..TRACK_HEIGHT as i32 {
+                for x in 0..TRACK_WIDTH as i32 {
+                    assert_eq!(
+                        canvas.pixel(track.x + x, track.y + y),
+                        sheet.pixel(src.x + x, src.y + y)
+                    );
+                }
             }
+            // The column stops at the track's own rectangle.
             for (x, y) in [
-                (thumb.x - 1, 50),
-                (thumb.x + 11, 50),
-                (thumb.x, 37),
-                (thumb.x, 100),
+                (track.x - 1, 50),
+                (track.right(), 50),
+                (track.x, 37),
+                (track.x, track.bottom()),
             ] {
                 assert_eq!(canvas.pixel(x, y), Some(untouched));
             }
@@ -503,12 +575,7 @@ mod tests {
                 &EqualizerState::default(),
                 EqualizerLayout::CLASSIC.graph,
             );
-            draw_slider_body(
-                &mut canvas,
-                &sheets,
-                EqualizerLayout::thumb_rect(EqSlider::Preamp, 31),
-                31,
-            );
+            draw_slider_track(&mut canvas, &sheets, EqSlider::Preamp, 31);
             assert_eq!(canvas, before);
         }
     }

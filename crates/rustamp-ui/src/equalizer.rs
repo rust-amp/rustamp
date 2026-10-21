@@ -71,6 +71,24 @@ pub const FLAT_VALUE: u8 = 31;
 /// Largest saved band/preamp value (S01 §3.1: `preamp` / `eq_data` are 0..63).
 pub const MAX_VALUE: u8 = 63;
 
+/// The slider track sprite's width in pixels.
+///
+/// The measured reference capture (2026-10-21) shows the track as one
+/// 14-px-wide column: the sheet's groove column, the coloured body with its
+/// bright core and the end caps.
+pub const TRACK_WIDTH: u32 = 14;
+/// The slider track sprite's height in rows.
+///
+/// The measured reference capture shows the track running from the top of
+/// travel (y = 38) down to y = 100 inclusive.
+pub const TRACK_HEIGHT: u32 = 63;
+/// The track sprite's left edge relative to the thumb's top-left x.
+///
+/// The measured reference capture puts the track's left column one pixel left
+/// of the drawn thumb (S01 §3.1: the track-slot origin is one pixel left of
+/// the thumb's top-left).
+pub const TRACK_LEFT_OFFSET: i32 = -1;
+
 /// Thumb top-left y for a saved value `0..=63` (S01 §3.1).
 ///
 /// The three measured points (0 -> 38, 31 -> 63, 63 -> 89) are linear at
@@ -196,12 +214,10 @@ pub struct EqualizerLayout {
     /// The On button while held: (14,18,25,12), 300/300 px in both engagement
     /// states (S07 §3.2, settled).
     pub on_held: Rect,
-    /// The Auto button at rest (S01 §3: 32 px wide at (40,18)).
+    /// The Auto button: (39,18,33,12), 395/396 px changed under a lone down
+    /// (S07 §3.2, settled) and 33 px wide at rest as well — the measured
+    /// reference capture draws the resting button in the same footprint.
     pub auto: Rect,
-    /// The Auto button while held: (39,18,33,12), 395/396 px in both
-    /// engagement states (S07 §3.2, settled; supersedes the (40,18,32,12)
-    /// working value).
-    pub auto_held: Rect,
     /// The Presets button: (217,18,44,12), 528/528 px change on a lone down
     /// and back on release (S07 §4.1, settled).
     pub presets: Rect,
@@ -217,8 +233,7 @@ impl EqualizerLayout {
         title_bar: Rect::new(0, 0, 275, 14),
         on: Rect::new(14, 18, 25, 12),
         on_held: Rect::new(14, 18, 25, 12),
-        auto: Rect::new(40, 18, 32, 12),
-        auto_held: Rect::new(39, 18, 33, 12),
+        auto: Rect::new(39, 18, 33, 12),
         presets: Rect::new(217, 18, 44, 12),
         graph: Rect::new(86, 17, 113, 19),
     };
@@ -238,6 +253,19 @@ impl EqualizerLayout {
             thumb_y_for_value(value),
             THUMB_SIZE,
             THUMB_SIZE,
+        )
+    }
+
+    /// The track sprite's window rectangle of `slider`.
+    ///
+    /// The track is one sheet column: 14 px wide, starting one pixel left of
+    /// the drawn thumb, and running from the top of travel down to y = 100.
+    pub fn track_rect(slider: EqSlider) -> Rect {
+        Rect::new(
+            Self::slider_x(slider) + TRACK_LEFT_OFFSET,
+            THUMB_TOP_Y,
+            TRACK_WIDTH,
+            TRACK_HEIGHT,
         )
     }
 
@@ -315,11 +343,9 @@ impl EqWidget {
     /// The widget's window-relative rectangle.
     pub fn rect(self, layout: &EqualizerLayout) -> Rect {
         match self {
-            // The held rects cover the resting ones (Auto's held rect is one
-            // column wider to the left), so hit-testing the union keeps a hold
-            // inside its own button.
+            // The On button's held rect covers its resting one.
             EqWidget::On => layout.on_held,
-            EqWidget::Auto => layout.auto_held,
+            EqWidget::Auto => layout.auto,
             EqWidget::Presets => layout.presets,
             EqWidget::TitleBar => layout.title_bar,
             EqWidget::Slider(slider) => EqualizerLayout::slider_hit(slider),
@@ -684,10 +710,12 @@ mod tests {
     fn held_rects_match_s07_3_2() {
         let l = EqualizerLayout::CLASSIC;
         assert_eq!(l.on_held, Rect::new(14, 18, 25, 12));
-        assert_eq!(l.auto_held, Rect::new(39, 18, 33, 12));
-        // The resting rects: On is 25 px wide (not 26), Auto 32 px at x = 40.
+        // The Auto button is 33 px wide at x = 39 at rest as well: the
+        // measured reference capture draws the resting button in the same
+        // footprint as the held one.
+        assert_eq!(l.auto, Rect::new(39, 18, 33, 12));
+        // The resting rects: On is 25 px wide (not 26).
         assert_eq!(l.on, Rect::new(14, 18, 25, 12));
-        assert_eq!(l.auto, Rect::new(40, 18, 32, 12));
         assert_eq!(l.presets, Rect::new(217, 18, 44, 12));
         assert_eq!(l.graph, Rect::new(86, 17, 113, 19));
     }

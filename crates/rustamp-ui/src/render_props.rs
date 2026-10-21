@@ -53,9 +53,7 @@ use rustamp_skin::{BuiltinDefaultSkin, Skin};
 use rustamp_vis::analyser::{Geometry, SCOPE_COLUMNS};
 
 use crate::eq_render::render_equalizer_window;
-use crate::equalizer::{
-    EqSlider, EqualizerLayout, EqualizerState, THUMB_BOTTOM_Y, THUMB_SIZE, THUMB_TOP_Y,
-};
+use crate::equalizer::{EqSlider, EqualizerLayout, EqualizerState};
 use crate::library::{LibraryRow, LibraryView};
 use crate::library_layout::LibraryLayout;
 use crate::library_render::{CoverRef, LIBRARY_LINE_HEIGHT, LibraryChrome, render_library_window};
@@ -246,17 +244,6 @@ fn in_any(rects: &[Rect], x: i32, y: i32) -> bool {
     rects
         .iter()
         .any(|rect| x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom())
-}
-
-/// The slider column of an equalizer slider: the thumb's own column over the
-/// whole travel.
-fn slider_column(slider: EqSlider) -> Rect {
-    Rect::new(
-        EqualizerLayout::slider_x(slider),
-        THUMB_TOP_Y,
-        THUMB_SIZE,
-        (THUMB_BOTTOM_Y + THUMB_SIZE as i32 - THUMB_TOP_Y) as u32,
-    )
 }
 
 /// A library row with random display values.
@@ -887,7 +874,7 @@ fn the_equalizer_draws_nothing_outside_the_graph_and_the_sliders() {
     let layout = EqualizerLayout::CLASSIC;
     let mut allowed = vec![layout.graph];
     for slider in EqSlider::ALL_BANDS {
-        allowed.push(slider_column(slider));
+        allowed.push(EqualizerLayout::track_rect(slider));
     }
     for seed in SEEDS {
         let mut rng = Rng::new(seed);
