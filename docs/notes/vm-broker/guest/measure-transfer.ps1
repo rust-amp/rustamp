@@ -24,7 +24,12 @@ if ($Mode -notin @('normal', 'refused', 'cut')) {
 }
 
 $OutRoot = 'C:\rustamp\out'
-$JobName = "transfer-$Mode-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+# The run directory name is FIXED by mode, because the host runner copies
+# `C:\rustamp\out\transfer-<mode>` back and a timestamped name made that copy
+# fail ("path not found") after a measurement that had actually succeeded. The
+# timestamp lives in summary.json instead.
+$JobName = "transfer-$Mode"
+$script:RunStamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
 $OutDir = Join-Path $OutRoot $JobName
 $null = New-Item -ItemType Directory -Force -Path $OutDir
 
@@ -326,6 +331,7 @@ if (Test-Path $serverLogPath) {
 # Write summary
 $summary = [pscustomobject]@{
     Job        = $JobName
+    Stamp      = $script:RunStamp
     Mode       = $Mode
     WinampPid  = $winampPid
     StartTime  = $startTime.ToString('o')
