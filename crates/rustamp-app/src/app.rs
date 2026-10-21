@@ -895,6 +895,11 @@ impl App {
         &self.config
     }
 
+    /// The loaded configuration (mutable).
+    pub fn config_mut(&mut self) -> &mut Config {
+        &mut self.config
+    }
+
     /// The ReplayGain mode the engine currently runs in.
     ///
     /// The engine is the live truth: the saved configuration takes the mode

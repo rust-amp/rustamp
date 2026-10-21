@@ -80,7 +80,8 @@ use std::time::{Duration, Instant};
 use rustamp_core::command::{Command, OpenMediaKind, PrefsPage};
 use rustamp_core::state::WindowId as CoreWindowId;
 use rustamp_platform::{
-    DisplaySnapshot, HotkeyAction, init_dpi_awareness, single_instance, take_pending_hotkeys,
+    DisplaySnapshot, HotkeyAction, init_dpi_awareness, raise_classic_group, single_instance,
+    take_pending_hotkeys,
 };
 use rustamp_skin::CursorSlot;
 use rustamp_ui::shell::TaskbarRole;
@@ -551,6 +552,11 @@ struct Windowed {
     left_down: bool,
     eq_left_down: bool,
     playlist_cursor: (i32, i32),
+    /// The playlist editor's pointer position when a corner resize drag
+    /// started, in client coordinates. `None` when not resizing.
+    playlist_resize_start: Option<(i32, i32)>,
+    /// The playlist editor's size when the corner resize drag started.
+    playlist_resize_start_size: Option<(u32, u32)>,
     /// The media library window's pointer position, in client coordinates.
     library_cursor: (i32, i32),
     /// The skin's cursors as the operating system knows them, one per slot.
@@ -629,6 +635,8 @@ impl Windowed {
             left_down: false,
             eq_left_down: false,
             playlist_cursor: (0, 0),
+            playlist_resize_start: None,
+            playlist_resize_start_size: None,
             library_cursor: (0, 0),
             cursors,
             applied_region_skin: None,
@@ -2482,12 +2490,16 @@ impl Windowed {
     fn sync_playlist_window(&mut self, event_loop: &ActiveEventLoop) {
         if self.app.playlist_open() {
             self.open_playlist_window(event_loop);
-            let desired = self.app.playlist_frame_size();
-            if self.applied_playlist_client != Some(desired)
-                && let Some(window) = &self.playlist_window
-            {
-                let _ = window.request_inner_size(PhysicalSize::new(desired.0, desired.1));
-                self.applied_playlist_client = Some(desired);
+            // During a corner resize drag, the size is driven by the mouse
+            // move handler; skip the config-based sync to avoid fighting it.
+            if self.playlist_resize_start.is_none() {
+                let desired = self.app.playlist_frame_size();
+                if self.applied_playlist_client != Some(desired)
+                    && let Some(window) = &self.playlist_window
+                {
+                    let _ = window.request_inner_size(PhysicalSize::new(desired.0, desired.1));
+                    self.applied_playlist_client = Some(desired);
+                }
             }
         } else if self.playlist_window.is_some() {
             // The command seam goes first: it removes the native subclass,
@@ -2499,6 +2511,8 @@ impl Windowed {
             self.playlist_surface = None;
             self.playlist_window = None;
             self.playlist_click.clear();
+            self.playlist_resize_start = None;
+            self.playlist_resize_start_size = None;
             self.applied_playlist_client = None;
         }
     }
@@ -2592,6 +2606,20 @@ impl Windowed {
                     // Never settle below the layout (the DPI-change floor).
                     self.applied_playlist_client = None;
                 }
+                // Persist the size to config (pe_width/pe_height) when not in a
+                // corner resize drag (the drag handler persists on release).
+                if self.playlist_resize_start.is_none()
+                    && let Some(layout) = self
+                        .app
+                        .config_mut()
+                        .ui
+                        .windows
+                        .iter_mut()
+                        .find(|w| w.id == CoreWindowId::Playlist)
+                {
+                    layout.width = Some(size.width);
+                    layout.height = Some(size.height);
+                }
                 self.sync_playlist_window(event_loop);
                 self.request_playlist_redraw();
             }
@@ -2607,7 +2635,12 @@ impl Windowed {
             WindowEvent::DroppedFile(path) => self.drop_file(path),
             WindowEvent::Focused(focused) => {
                 self.app.set_playlist_focused(focused);
-                if !focused {
+                if focused {
+                    // Winamp treats the three classic windows as one player:
+                    // activating any of them raises the whole group.
+                    let others = [self.raw_main_window(), self.raw_eq_window()];
+                    raise_classic_group(self.raw_playlist_window(), &others);
+                } else {
                     // The pointer keeps the cursor it had; give the system
                     // its own back when the window loses the focus.
                     self.restore_system_cursor();
@@ -2621,11 +2654,27 @@ impl Windowed {
             WindowEvent::CursorMoved { position, .. } => {
                 // No double-size scale: the playlist ignores it (S05 §2.1).
                 self.playlist_cursor = (position.x as i32, position.y as i32);
-                self.apply_playlist_cursor();
-                self.app
-                    .playlist_mouse_move(self.playlist_cursor.0, self.playlist_cursor.1);
-                if self.app.playlist().drag_insertion().is_some() {
-                    self.playlist_click.clear();
+                // Playlist corner resize drag: update window size during drag.
+                if let (Some((start_x, start_y)), Some((start_w, start_h))) =
+                    (self.playlist_resize_start, self.playlist_resize_start_size)
+                {
+                    let dx = self.playlist_cursor.0 - start_x;
+                    let dy = self.playlist_cursor.1 - start_y;
+                    // Minimum size is the classic 275 x 116 (S01 §1, S05 §2.1).
+                    const MIN_WIDTH: u32 = 275;
+                    const MIN_HEIGHT: u32 = 116;
+                    let new_w = (start_w as i32 + dx).max(MIN_WIDTH as i32) as u32;
+                    let new_h = (start_h as i32 + dy).max(MIN_HEIGHT as i32) as u32;
+                    if let Some(window) = &self.playlist_window {
+                        let _ = window.request_inner_size(PhysicalSize::new(new_w, new_h));
+                    }
+                } else {
+                    self.apply_playlist_cursor();
+                    self.app
+                        .playlist_mouse_move(self.playlist_cursor.0, self.playlist_cursor.1);
+                    if self.app.playlist().drag_insertion().is_some() {
+                        self.playlist_click.clear();
+                    }
                 }
                 self.request_playlist_redraw();
             }
@@ -2665,6 +2714,51 @@ impl Windowed {
                 {
                     self.playlist_click.clear();
                     return;
+                }
+                // Playlist corner resize drag (Bug 1): drag from the bottom-right
+                // corner resizes the playlist editor. The grip is a small region
+                // (16 x 16 px) at the corner; the minimum size is the classic
+                // 275 x 116 (S01 §1, S05 §2.1). The size persists as
+                // pe_width/pe_height (S12 §3.4).
+                const PLAYLIST_RESIZE_GRIP: i32 = 16;
+                let (pl_width, pl_height) = self.app.playlist_frame_size();
+                let in_resize_grip = x >= pl_width as i32 - PLAYLIST_RESIZE_GRIP
+                    && y >= pl_height as i32 - PLAYLIST_RESIZE_GRIP;
+                if in_resize_grip {
+                    match state {
+                        ElementState::Pressed => {
+                            self.playlist_resize_start = Some((x, y));
+                            self.playlist_resize_start_size = Some((pl_width, pl_height));
+                            self.playlist_click.clear();
+                            return;
+                        }
+                        ElementState::Released => {
+                            if self.playlist_resize_start.is_some() {
+                                self.playlist_resize_start = None;
+                                self.playlist_resize_start_size = None;
+                                // Persist the size to config (pe_width/pe_height).
+                                if let Some(window) = &self.playlist_window {
+                                    let size = window.inner_size();
+                                    let (w, h) = (size.width, size.height);
+                                    if let Some(layout) = self
+                                        .app
+                                        .config_mut()
+                                        .ui
+                                        .windows
+                                        .iter_mut()
+                                        .find(|w| w.id == CoreWindowId::Playlist)
+                                    {
+                                        layout.width = Some(w);
+                                        layout.height = Some(h);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // During a resize drag, skip the normal control handling.
+                    if self.playlist_resize_start.is_some() {
+                        return;
+                    }
                 }
                 // Row dragging is an own choice while S06 §8 Q6 stays open.
                 let result = match state {
@@ -3016,7 +3110,12 @@ impl ApplicationHandler for Windowed {
             }
             WindowEvent::Focused(focused) => {
                 self.app.set_focused(focused);
-                if !focused {
+                if focused {
+                    // Winamp treats the three classic windows as one player:
+                    // activating any of them raises the whole group.
+                    let others = [self.raw_eq_window(), self.raw_playlist_window()];
+                    raise_classic_group(self.raw_main_window(), &others);
+                } else {
                     // The pointer keeps the cursor it had; give the system
                     // its own back when the window loses the focus.
                     self.restore_system_cursor();
@@ -3255,7 +3354,12 @@ impl Windowed {
             WindowEvent::DroppedFile(path) => self.drop_file(path),
             WindowEvent::Focused(focused) => {
                 self.app.set_eq_focused(focused);
-                if !focused {
+                if focused {
+                    // Winamp treats the three classic windows as one player:
+                    // activating any of them raises the whole group.
+                    let others = [self.raw_main_window(), self.raw_playlist_window()];
+                    raise_classic_group(self.raw_eq_window(), &others);
+                } else {
                     // The pointer keeps the cursor it had; give the system
                     // its own back when the window loses the focus.
                     self.restore_system_cursor();
