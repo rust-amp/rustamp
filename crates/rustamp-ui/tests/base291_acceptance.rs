@@ -933,16 +933,40 @@ fn base291_playlist_shade_and_held_title_controls_use_pledit() {
                 (275, if shade { 14 } else { 116 })
             );
             if shade {
-                let y = if focused { 42 } else { 57 };
-                for x in (0..225).step_by(25) {
-                    region(&frame, &skin, Sheet::Pledit, Rect::new(72, y, 25, 14), x, 0);
+                // S01 §4 / measured: the left corner in both focus states, the
+                // borderless body tile, then the right corner from the focused
+                // or the unfocused row.
+                region(&frame, &skin, Sheet::Pledit, SHADE_CORNER_SRC, 0, 0);
+                for x in (SHADE_BODY_SRC.width as i32..SHADE_RIGHT_X)
+                    .step_by(SHADE_BODY_SRC.width as usize)
+                {
+                    // The last body tile runs under the right corner, which is
+                    // drawn after it; only its visible columns are asserted.
+                    let width = (SHADE_RIGHT_X - x).min(SHADE_BODY_SRC.width as i32) as u32;
+                    region(
+                        &frame,
+                        &skin,
+                        Sheet::Pledit,
+                        Rect::new(
+                            SHADE_BODY_SRC.x,
+                            SHADE_BODY_SRC.y,
+                            width,
+                            SHADE_BODY_SRC.height,
+                        ),
+                        x,
+                        0,
+                    );
                 }
                 region(
                     &frame,
                     &skin,
                     Sheet::Pledit,
-                    Rect::new(99, y, 50, 14),
-                    225,
+                    if focused {
+                        SHADE_RIGHT_FOCUSED_SRC
+                    } else {
+                        SHADE_RIGHT_SRC
+                    },
+                    SHADE_RIGHT_X,
                     0,
                 );
             }
@@ -1075,6 +1099,97 @@ fn base291_playlist_font_falls_back_when_the_family_is_missing() {
         render(&memory_skin("Arial", false)),
         "a family the host does not have must fall back to the default one"
     );
+}
+
+/// The playlist editor against the measured reference captures.
+///
+/// The capture directory holds the approved client captures of Winamp 2.95
+/// (skin base-2.91, 96 dpi, 1024x768 guest): `playlist-active` and
+/// `playlist-inactive` are the 275 x 116 window with the focused and the
+/// unfocused title band, `playlist-shade` is the 275 x 14 windowshade band in
+/// the **unfocused** variant (its right corner carries the dim window
+/// buttons, `PLEDIT.BMP` row 57, where the focused band takes row 42). All
+/// three show an empty list. This renders the same states headlessly and
+/// compares them pixel by pixel. No capture is taken here and no pixel is
+/// fabricated: the references are files, the other side is this renderer.
+///
+/// Two rectangles in the references are **text the reference draws and the
+/// skin does not carry**: it is painted by GDI in (0,226,0) with a 6 px
+/// system font, six pixels high, at (6,4)-(48,9) in the shade band (the
+/// window's label) and at (132,88)-(175,93) in the bottom bar. Our renderer
+/// draws no such text: the string of the bottom-bar line is unread and the
+/// raster is GDI's hinting, which the notes already record as its own case for
+/// the shaded equalizer's label. So those two rectangles are named and
+/// excluded, and the assertion is the sharp one: **every** pixel that differs
+/// is reference text ink, and every one of the reference's ink pixels differs.
+/// Nothing else may differ, which is what pins the title cells, the row band,
+/// the five buttons, the scrollbar (its 8 x 18 handle cell) and the shade
+/// band's corner, body and right cells.
+#[test]
+fn base291_playlist_matches_the_reference_captures() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("RUSTAMP_BASE291_CAPTURES")
+            .unwrap_or_else(|| "D:/code/rustamp-testcaptures/base291".into()),
+    );
+    if !root.join("playlist-active.reference.png").is_file() {
+        eprintln!(
+            "SKIP base291_playlist_matches_the_reference_captures: the reference captures in {} are not available",
+            root.display()
+        );
+        return;
+    }
+    /// The reference's system-font ink (GDI text the skin does not carry).
+    const TEXT_INK: [u8; 4] = [0, 226, 0, 255];
+    let skin = skin();
+    let mut window = PlaylistWindow::new();
+    for (case, shade, focused, text) in [
+        ("playlist-active", false, true, Rect::new(132, 88, 44, 6)),
+        ("playlist-inactive", false, false, Rect::new(132, 88, 44, 6)),
+        ("playlist-shade", true, false, Rect::new(6, 4, 43, 6)),
+    ] {
+        window.windowshade = shade;
+        let frame = render_playlist_window(&skin, &window, &[], focused);
+        let (width, height, rgba) = frame.into_raw();
+        let ours = rustamp_testkit::RgbaImage::from_raw(width, height, rgba).unwrap();
+        let reference =
+            rustamp_testkit::RgbaImage::load_png(root.join(format!("{case}.reference.png")))
+                .unwrap();
+        let diff = rustamp_testkit::compare(&reference, &ours, 0);
+        assert_eq!(diff.size_mismatch, None, "{case}: {}", diff.summary());
+        let mut ink = 0;
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                let wanted = reference.pixel(x as u32, y as u32);
+                let ink_here = wanted == TEXT_INK
+                    && x >= text.x
+                    && x < text.right()
+                    && y >= text.y
+                    && y < text.bottom();
+                if ink_here {
+                    ink += 1;
+                }
+                if ours.pixel(x as u32, y as u32) == wanted {
+                    assert!(!ink_here, "{case}: {x},{y} must differ from the reference");
+                } else {
+                    assert!(
+                        ink_here,
+                        "{case}: {x},{y} differs from the reference outside the reference's system-font text: {}",
+                        diff.summary()
+                    );
+                }
+            }
+        }
+        assert!(
+            ink > 0,
+            "{case}: the reference's text ink at {text:?} was not found"
+        );
+        assert_eq!(
+            diff.mismatched_pixels,
+            u64::try_from(ink).unwrap(),
+            "{case}: only the reference's system-font text may differ: {}",
+            diff.summary()
+        );
+    }
 }
 
 /// The equalizer against the measured reference captures.
