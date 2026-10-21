@@ -102,8 +102,10 @@
 //! test and tool code passes `CREATE_NO_WINDOW`. See `crates/rustamp-app/README.md`
 //! for how to run the windowed player (test VM only).
 
-// Only the Win32 external-control subclass needs FFI. All other app code
-// remains unsafe-free; the exception is scoped to that private module.
+// Only the Win32 window subclasses need FFI: the external-control subclass
+// on the main window and the window-command seam on the equalizer and the
+// playlist editor. All other app code remains unsafe-free; the exceptions
+// are scoped to those private modules.
 #![deny(unsafe_code)]
 
 pub mod app;
