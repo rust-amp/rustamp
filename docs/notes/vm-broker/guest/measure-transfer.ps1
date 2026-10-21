@@ -8,12 +8,14 @@
 #   refused: TCP reject (no listener on the target port)
 #   cut: send headers + ~10% body, then close
 #
-# The script:
-# 1. Starts a slow HttpListener on 127.0.0.1 inside the guest
-# 2. Launches the reference Winamp 2.95 with the URL as argument
-# 3. Captures every visible top-level window of the player process once per second
-# 4. Reports each capture's class, title, client size, and window rect
-# 5. Writes a JSONL file with all observations
+# The script follows the run-presented.ps1 pattern:
+# - The HTTP server stays in session 0 (a listener needs no desktop)
+# - The player launch and the ENTIRE observation loop run inside the
+#   interactive session via a one-shot scheduled task (Interactive logon)
+# - Session 0 only polls for a done sentinel and refuses loudly if the
+#   task landed in session 0
+# - Fixed run-directory name (transfer-<mode>) and summary.json/hash outputs
+#   the host runner already expects
 
 param([string]$Mode = 'normal')
 
@@ -24,10 +26,6 @@ if ($Mode -notin @('normal', 'refused', 'cut')) {
 }
 
 $OutRoot = 'C:\rustamp\out'
-# The run directory name is FIXED by mode, because the host runner copies
-# `C:\rustamp\out\transfer-<mode>` back and a timestamped name made that copy
-# fail ("path not found") after a measurement that had actually succeeded. The
-# timestamp lives in summary.json instead.
 $JobName = "transfer-$Mode"
 $script:RunStamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
 $OutDir = Join-Path $OutRoot $JobName
@@ -39,35 +37,61 @@ function Log($msg) { $transcript.Add(("{0:HH:mm:ss.fff} {1}" -f (Get-Date), $msg
 $logPath = Join-Path $OutDir 'guest-transcript.txt'
 $observationsPath = Join-Path $OutDir 'observations.jsonl'
 $serverLogPath = Join-Path $OutDir 'server-log.txt'
+$innerDonePath = Join-Path $OutDir 'inner-done.json'
 
 # -----------------------------------------------------------------------------
-# 1. Slow HTTP server (HttpListener) - runs in a separate PowerShell process
+# 0. Find the interactive session (same logic as run-presented.ps1)
+# -----------------------------------------------------------------------------
+$interactiveSession = $null
+$interactiveUser = $null
+$interactiveDomain = $null
+$explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($explorer) {
+    $interactiveSession = $explorer.SessionId
+    $owner = (Get-CimInstance Win32_Process -Filter ("ProcessId = " + $explorer.Id) | Invoke-CimMethod -MethodName GetOwner)
+    $interactiveUser = $owner.User
+    $interactiveDomain = $owner.Domain
+    Log "interactive session {0} via explorer (user {1}\{2})" -f $interactiveSession, $interactiveDomain, $interactiveUser
+} else {
+    Log 'no explorer; falling back to `query session`'
+    foreach ($line in (query session 2>$null)) {
+        if ($line -match '^\s*>?\s*console\s+(\S+)\s+(\d+)\s+Active') {
+            $interactiveUser = $Matches[1]
+            $interactiveSession = [int]$Matches[2]
+            $interactiveDomain = $env:COMPUTERNAME
+            break
+        }
+    }
+}
+if ($null -eq $interactiveSession) { throw 'no interactive session found: explorer is not running and `query session` shows no Active console; the player has no desktop to appear on' }
+if ($interactiveSession -eq 0) { throw 'the "interactive" session resolved to session 0, which has no desktop; refusing instead of reporting a pass' }
+if ([string]::IsNullOrWhiteSpace($interactiveUser)) { throw 'interactive session found but its user could not be resolved; refusing' }
+
+# -----------------------------------------------------------------------------
+# 1. Slow HTTP server (HttpListener) - runs in session 0 (this process)
 # -----------------------------------------------------------------------------
 $serverPort = 18080
 $serverUrl = "http://127.0.0.1:$serverPort/"
 $audioPath = 'C:\rustamp\testmedia\jingle-rockdown.mp3'
 $audioBytes = if (Test-Path $audioPath) { [IO.File]::ReadAllBytes($audioPath) } else {
     Log "No test media at $audioPath, generating a small WAV"
-    # Generate a tiny valid WAV file (1 second, 440 Hz, 8-bit mono, 8 kHz)
     $sampleRate = 8000
     $durationSec = 1
     $samples = $sampleRate * $durationSec
     $wave = New-Object byte[] (44 + $samples)
-    # RIFF header
     [Text.Encoding]::ASCII.GetBytes('RIFF').CopyTo($wave, 0)
     [BitConverter]::GetBytes(36 + $samples).CopyTo($wave, 4)
     [Text.Encoding]::ASCII.GetBytes('WAVE').CopyTo($wave, 8)
     [Text.Encoding]::ASCII.GetBytes('fmt ').CopyTo($wave, 12)
-    [BitConverter]::GetBytes(16).CopyTo($wave, 16)   # fmt chunk size
-    [BitConverter]::GetBytes([System.UInt16]1).CopyTo($wave, 20)  # PCM
-    [BitConverter]::GetBytes([System.UInt16]1).CopyTo($wave, 22)  # mono
+    [BitConverter]::GetBytes(16).CopyTo($wave, 16)
+    [BitConverter]::GetBytes([System.UInt16]1).CopyTo($wave, 20)
+    [BitConverter]::GetBytes([System.UInt16]1).CopyTo($wave, 22)
     [BitConverter]::GetBytes($sampleRate).CopyTo($wave, 24)
-    [BitConverter]::GetBytes($sampleRate).CopyTo($wave, 28)  # byte rate = sample rate * 1 * 1
-    [BitConverter]::GetBytes([System.UInt16]1).CopyTo($wave, 32)  # block align
-    [BitConverter]::GetBytes([System.UInt16]8).CopyTo($wave, 34)  # bits per sample
+    [BitConverter]::GetBytes($sampleRate).CopyTo($wave, 28)
+    [BitConverter]::GetBytes([System.UInt16]1).CopyTo($wave, 32)
+    [BitConverter]::GetBytes([System.UInt16]8).CopyTo($wave, 34)
     [Text.Encoding]::ASCII.GetBytes('data').CopyTo($wave, 36)
     [BitConverter]::GetBytes($samples).CopyTo($wave, 40)
-    # 440 Hz sine wave, 8-bit unsigned
     for ($i = 0; $i -lt $samples; $i++) {
         $val = [math]::Sin(2 * [math]::PI * 440 * $i / $sampleRate)
         $wave[44 + $i] = [byte](128 + [math]::Round($val * 127))
@@ -75,7 +99,6 @@ $audioBytes = if (Test-Path $audioPath) { [IO.File]::ReadAllBytes($audioPath) } 
     $wave
 }
 $contentLength = $audioBytes.Length
-
 Log "Audio file: $contentLength bytes"
 
 # Write the server script to a temporary file
@@ -108,14 +131,22 @@ try {
         }
 
         # Send headers
-        $resp.ProtocolVersion = New-Object Version(1,0)
-        $resp.StatusCode = 200
-        $resp.ContentType = 'audio/mpeg'
-        $resp.ContentLength64 = $ContentLength
-        $resp.Headers.Add('Accept-Ranges', 'bytes')
-        $resp.SendHeaders()
+        try {
+            $resp.ProtocolVersion = New-Object Version(1,0)
+            $resp.StatusCode = 200
+            $resp.ContentType = 'audio/mpeg'
+            $resp.ContentLength64 = $ContentLength
+            $resp.Headers.Add('Accept-Ranges', 'bytes')
+            # Headers are sent automatically on first write to OutputStream in .NET Framework
+            # No SendHeaders() method exists
+        }
+        catch {
+            "$(Get-Date -Format 'HH:mm:ss.fff') SET HEADERS ERROR: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Encoding UTF8 -Append
+            $resp.Close()
+            continue
+        }
 
-        "$(Get-Date -Format 'HH:mm:ss.fff') HEADERS SENT" | Out-File -FilePath $LogPath -Encoding UTF8 -Append
+        "$(Get-Date -Format 'HH:mm:ss.fff') HEADERS SET" | Out-File -FilePath $LogPath -Encoding UTF8 -Append
 
         $total = $ContentLength
         $sent = 0
@@ -150,6 +181,9 @@ try {
         }
     }
 }
+catch {
+    "$(Get-Date -Format 'HH:mm:ss.fff') LISTENER LOOP ERROR: $($_.Exception.Message)" | Out-File -FilePath $LogPath -Encoding UTF8 -Append
+}
 finally {
     $listener.Stop()
     "$(Get-Date -Format 'HH:mm:ss.fff') LISTENER STOPPED" | Out-File -FilePath $LogPath -Encoding UTF8 -Append
@@ -174,11 +208,8 @@ if ($Mode -ne 'refused') {
 }
 
 # -----------------------------------------------------------------------------
-# 2. Find reference Winamp 2.95
+# 2. Find reference Winamp 2.95 (staged by host)
 # -----------------------------------------------------------------------------
-# The reference is STAGED (the host copies the player directory in), so the
-# staged path comes first. The Program Files entries stay as a fallback for a
-# guest that happens to have an installed copy.
 $winampPath = @(
     'C:\rustamp\capture\winamp295\winamp.exe',
     'C:\Program Files\Winamp\winamp.exe',
@@ -192,19 +223,48 @@ if (-not $winampPath) {
 Log "Found Winamp at $winampPath"
 
 # -----------------------------------------------------------------------------
-# 3. Launch Winamp with the streaming URL
+# 3. Write the INNER payload script directly to a file (avoids here-string expansion issues)
 # -----------------------------------------------------------------------------
-$streamUrl = "$serverUrl/stream.mp3"
-Log "Launching Winamp with URL: $streamUrl"
+$innerPath = Join-Path $OutDir 'inner.ps1'
+$streamUrl = "$serverUrl" + "stream.mp3"
 
-$proc = Start-Process -FilePath $winampPath -ArgumentList $streamUrl -PassThru -WorkingDirectory (Split-Path $winampPath)
-$winampPid = $proc.Id
-Log "Winamp PID: $winampPid"
+# Pre-compute values to avoid complex expressions in here-string
+$serverProcId = if ($serverProc) { $serverProc.Id } else { 0 }
+$innerTranscriptPath = Join-Path $OutDir 'inner-transcript.txt'
 
-# -----------------------------------------------------------------------------
-# 4. Capture loop - enumerate all visible top-level windows of the process
-# -----------------------------------------------------------------------------
-Add-Type @'
+$innerScript = @"
+`$ErrorActionPreference = 'Continue'
+`$InnerDone = '$innerDonePath'
+`$OutDir = '$OutDir'
+`$WinampPath = '$winampPath'
+`$StreamUrl = '$streamUrl'
+`$ServerProcId = $serverProcId
+`$Mode = '$Mode'
+`$RunStamp = '$($script:RunStamp)'
+`$ObservationsPath = '$observationsPath'
+`$ServerLogPath = '$serverLogPath'
+`$TranscriptPath = '$logPath'
+`$InnerTranscriptPath = '$innerTranscriptPath'
+`$AudioBytesPath = '$audioBytesPath'
+`$ContentLength = $contentLength
+`$ServerPort = $serverPort
+
+`$transcript = New-Object System.Collections.Generic.List[string]
+function Log(`$msg) { `$transcript.Add(('{0:HH:mm:ss.fff} {1}' -f (Get-Date), `$msg)); Write-Host `$msg }
+
+# Fail loudly in session 0: the player cannot show a window there, and a
+# pass from there would be a lie.
+`$me = (Get-Process -Id `$PID).SessionId
+`$failure = ''
+`$observationCount = 0
+
+if (`$me -eq 0) {
+    `$failure = 'refusing: the measurement task landed in session 0, which has no desktop'
+} else {
+    Log "Running in interactive session `$me as `$env:USERNAME"
+
+    # Win32 interop for window enumeration
+    Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
@@ -242,79 +302,231 @@ public static class Win32 {
 }
 '@
 
-function Get-WinampWindows {
-    param($TargetPid)
-    $windows = @()
-    $callback = {
-        param($hWnd, $lParam)
-        $pidOut = 0
-        [Win32]::GetWindowThreadProcessId($hWnd, [ref]$pidOut) | Out-Null
-        if ($pidOut -eq $TargetPid) {
-            $visible = [Win32]::IsWindowVisible($hWnd)
-            if ($visible) {
-                $classSb = New-Object System.Text.StringBuilder(256)
-                [Win32]::GetClassName($hWnd, $classSb, $classSb.Capacity) | Out-Null
-                $titleSb = New-Object System.Text.StringBuilder(256)
-                [Win32]::GetWindowText($hWnd, $titleSb, $titleSb.Capacity) | Out-Null
-                $clientRect = New-Object Win32+RECT
-                $winRect = New-Object Win32+RECT
-                $hasClient = [Win32]::GetClientRect($hWnd, [ref]$clientRect)
-                $hasWin = [Win32]::GetWindowRect($hWnd, [ref]$winRect)
-                $windows += [pscustomobject]@{
-                    Hwnd       = "0x{0:X}" -f [int64]$hWnd
-                    Class      = $classSb.ToString()
-                    Title      = $titleSb.ToString()
-                    ClientRect = if ($hasClient) { @{ Left=$clientRect.Left; Top=$clientRect.Top; Right=$clientRect.Right; Bottom=$clientRect.Bottom; Width=$clientRect.Right-$clientRect.Left; Height=$clientRect.Bottom-$clientRect.Top } } else { $null }
-                    WindowRect = if ($hasWin) { @{ Left=$winRect.Left; Top=$winRect.Top; Right=$winRect.Right; Bottom=$winRect.Bottom; Width=$winRect.Right-$winRect.Left; Height=$winRect.Bottom-$winRect.Top } } else { $null }
+    # Use a script-scope variable for the target PID to avoid closure issues with EnumWindows callback
+    `$script:TargetPidForEnum = 0
+    function Get-WinampWindows {
+        param(`$TargetPid)
+        `$script:TargetPidForEnum = `$TargetPid
+        `$windows = New-Object System.Collections.Generic.List[pscustomobject]
+        `$callback = {
+            param(`$hWnd, `$lParam)
+            `$pidOut = 0
+            [Win32]::GetWindowThreadProcessId(`$hWnd, [ref]`$pidOut) | Out-Null
+            if (`$pidOut -eq `$script:TargetPidForEnum) {
+                `$visible = [Win32]::IsWindowVisible(`$hWnd)
+                if (`$visible) {
+                    `$classSb = New-Object System.Text.StringBuilder(256)
+                    [Win32]::GetClassName(`$hWnd, `$classSb, `$classSb.Capacity) | Out-Null
+                    `$titleSb = New-Object System.Text.StringBuilder(256)
+                    [Win32]::GetWindowText(`$hWnd, `$titleSb, `$titleSb.Capacity) | Out-Null
+                    `$clientRect = New-Object Win32+RECT
+                    `$winRect = New-Object Win32+RECT
+                    `$hasClient = [Win32]::GetClientRect(`$hWnd, [ref]`$clientRect)
+                    `$hasWin = [Win32]::GetWindowRect(`$hWnd, [ref]`$winRect)
+                    `$windows.Add([pscustomobject]@{
+                        Hwnd       = '0x{0:X}' -f [int64]`$hWnd
+                        Class      = `$classSb.ToString()
+                        Title      = `$titleSb.ToString()
+                        ClientRect = if (`$hasClient) { @{ Left=`$clientRect.Left; Top=`$clientRect.Top; Right=`$clientRect.Right; Bottom=`$clientRect.Bottom; Width=`$clientRect.Right-`$clientRect.Left; Height=`$clientRect.Bottom-`$clientRect.Top } } else { `$null }
+                        WindowRect = if (`$hasWin) { @{ Left=`$winRect.Left; Top=`$winRect.Top; Right=`$winRect.Right; Bottom=`$winRect.Bottom; Width=`$winRect.Right-`$winRect.Left; Height=`$winRect.Bottom-`$winRect.Top } } else { `$null }
+                    })
                 }
             }
+            return `$true
         }
-        return $true
+        [Win32]::EnumWindows(`$callback, [IntPtr]::Zero) | Out-Null
+        return `$windows
     }
-    [Win32]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
-    return $windows
+
+    trap {
+        `$message = (`$_ | Out-String).Trim()
+        Log "TRAP: `$message"
+        `$record = [ordered]@{
+            session      = `$me
+            user         = `$env:USERNAME
+            computer     = `$env:COMPUTERNAME
+            failure      = `$message
+            observations = `$observationCount
+        }
+        `$record | ConvertTo-Json -Depth 5 | Set-Content -Path `$InnerDone -Encoding UTF8
+        `$transcript | Set-Content -Path `$InnerTranscriptPath -Encoding UTF8
+        exit 1
+    }
+
+    # Launch Winamp with the streaming URL, using /NOREG to skip setup wizard
+    Log "Launching Winamp with URL: `$StreamUrl"
+    `$proc = Start-Process -FilePath `$WinampPath -ArgumentList "/NOREG", `$StreamUrl -PassThru -WorkingDirectory (Split-Path `$WinampPath)
+    `$winampPid = `$proc.Id
+    Log "Winamp PID: `$winampPid"
+
+    # Wait longer for Winamp to initialize and create windows
+    Start-Sleep -Seconds 5
+
+    # Use List to avoid scriptblock variable capture issues with EnumWindows callback
+    `$allWindows = New-Object System.Collections.Generic.List[pscustomobject]
+    `$callbackAll = {
+        param(`$hWnd, `$lParam)
+        `$pidOut = 0
+        [Win32]::GetWindowThreadProcessId(`$hWnd, [ref]`$pidOut) | Out-Null
+        if (`$pidOut -eq `$winampPid) {
+            `$visible = [Win32]::IsWindowVisible(`$hWnd)
+            `$classSb = New-Object System.Text.StringBuilder(256)
+            [Win32]::GetClassName(`$hWnd, `$classSb, `$classSb.Capacity) | Out-Null
+            `$titleSb = New-Object System.Text.StringBuilder(256)
+            [Win32]::GetWindowText(`$hWnd, `$titleSb, `$titleSb.Capacity) | Out-Null
+            `$allWindows.Add([pscustomobject]@{
+                Hwnd       = '0x{0:X}' -f [int64]`$hWnd
+                Class      = `$classSb.ToString()
+                Title      = `$titleSb.ToString()
+                Visible    = `$visible
+            })
+        }
+        return `$true
+    }
+    [Win32]::EnumWindows(`$callbackAll, [IntPtr]::Zero) | Out-Null
+    Log "ALL Winamp windows after 5s: `$(`$allWindows.Count)"
+    `$allWindows | ForEach-Object { Log "  HWND=`$(`$_.Hwnd) Class=`$(`$_.Class) Title=`$(`$_.Title) Visible=`$(`$_.Visible)" }
+
+    # Also enumerate ALL windows on desktop to see if EnumWindows works at all
+    `$allDesktopWindows = New-Object System.Collections.Generic.List[pscustomobject]
+    `$callbackDesktop = {
+        param(`$hWnd, `$lParam)
+        `$pidOut = 0
+        [Win32]::GetWindowThreadProcessId(`$hWnd, [ref]`$pidOut) | Out-Null
+        `$visible = [Win32]::IsWindowVisible(`$hWnd)
+        `$classSb = New-Object System.Text.StringBuilder(256)
+        [Win32]::GetClassName(`$hWnd, `$classSb, `$classSb.Capacity) | Out-Null
+        `$titleSb = New-Object System.Text.StringBuilder(256)
+        [Win32]::GetWindowText(`$hWnd, `$titleSb, `$titleSb.Capacity) | Out-Null
+        `$allDesktopWindows.Add([pscustomobject]@{
+            Hwnd       = '0x{0:X}' -f [int64]`$hWnd
+            Class      = `$classSb.ToString()
+            Title      = `$titleSb.ToString()
+            Visible    = `$visible
+            Pid        = `$pidOut
+        })
+        return `$true
+    }
+    [Win32]::EnumWindows(`$callbackDesktop, [IntPtr]::Zero) | Out-Null
+    Log "Total desktop windows: `$(`$allDesktopWindows.Count)"
+    `$winampDesktop = `$allDesktopWindows | Where-Object { `$_.Pid -eq `$winampPid }
+    Log "Desktop windows for Winamp PID: `$(`$winampDesktop.Count)"
+    `$winampDesktop | ForEach-Object { Log "  HWND=`$(`$_.Hwnd) Class=`$(`$_.Class) Title=`$(`$_.Title) Visible=`$(`$_.Visible) Pid=`$(`$_.Pid)" }
+
+    # Also check MainWindowHandle from process
+    `$procCheck = Get-Process -Id `$winampPid -ErrorAction SilentlyContinue
+    if (`$procCheck) {
+        Log "Winamp process alive: HasExited=`$(`$procCheck.HasExited), MainWindowTitle='`$(`$procCheck.MainWindowTitle)', MainWindowHandle=0x{0:X}" -f `$procCheck.MainWindowHandle
+        if (`$procCheck.MainWindowHandle -ne 0) {
+            `$hwnd = `$procCheck.MainWindowHandle
+            `$visible = [Win32]::IsWindowVisible(`$hwnd)
+            `$classSb = New-Object System.Text.StringBuilder(256)
+            [Win32]::GetClassName(`$hwnd, `$classSb, `$classSb.Capacity) | Out-Null
+            `$titleSb = New-Object System.Text.StringBuilder(256)
+            [Win32]::GetWindowText(`$hwnd, `$titleSb, `$titleSb.Capacity) | Out-Null
+            Log "MainWindowHandle details: Class=`$(`$classSb.ToString()) Title=`$(`$titleSb.ToString()) Visible=`$visible"
+        }
+    } else {
+        Log "Winamp process NOT found!"
+    }
+
+    # Capture loop
+    `$maxDurationSec = 40
+    `$startTime = Get-Date
+    `$deadline = `$startTime.AddSeconds(`$maxDurationSec)
+
+    Log "Starting capture loop (max `$maxDurationSec seconds)"
+
+    while ((Get-Date) -lt `$deadline) {
+        `$loopStart = Get-Date
+        `$windows = Get-WinampWindows -TargetPid `$winampPid
+
+        `$obs = [pscustomobject]@{
+            Timestamp   = `$loopStart.ToString('o')
+            ElapsedSec  = [math]::Round((`$loopStart - `$startTime).TotalSeconds, 3)
+            WindowCount = `$windows.Count
+            Windows     = `$windows
+        }
+
+        `$obs | ConvertTo-Json -Depth 5 | Out-File -FilePath `$ObservationsPath -Encoding UTF8 -Append
+        `$observationCount++
+
+        `$winDesc = (`$windows | ForEach-Object { '[{0}] ''{1}'' {2}x{3}' -f `$_.Class, `$_.Title, `$_.ClientRect.Width, `$_.ClientRect.Height }) -join ' | '
+        Log "  t=`$([math]::Round((`$loopStart - `$startTime).TotalSeconds,1))s windows=`$(`$windows.Count) `$winDesc"
+
+        # Check if process exited
+        `$proc = Get-Process -Id `$winampPid -ErrorAction SilentlyContinue
+        if (-not `$proc -or `$proc.HasExited) {
+            Log "Winamp process exited"
+            break
+        }
+
+        # Sleep to maintain ~1 Hz
+        `$elapsed = (Get-Date) - `$loopStart
+        `$sleepMs = [int][math]::Max(100, 1000 - `$elapsed.TotalMilliseconds)
+        Start-Sleep -Milliseconds `$sleepMs
+    }
 }
 
-# Capture loop
-$maxDurationSec = 40
-$startTime = Get-Date
-$deadline = $startTime.AddSeconds($maxDurationSec)
-$observationCount = 0
-
-Log "Starting capture loop (max $maxDurationSec seconds)"
-
-while ((Get-Date) -lt $deadline) {
-    $loopStart = Get-Date
-    $windows = Get-WinampWindows -TargetPid $winampPid
-
-    $obs = [pscustomobject]@{
-        Timestamp   = $loopStart.ToString('o')
-        ElapsedSec  = [math]::Round(($loopStart - $startTime).TotalSeconds, 3)
-        WindowCount = $windows.Count
-        Windows     = $windows
-    }
-
-    $obs | ConvertTo-Json -Depth 5 | Out-File -FilePath $observationsPath -Encoding UTF8 -Append
-    $observationCount++
-
-    $winDesc = ($windows | ForEach-Object { "[{0}] '{1}' {2}x{3}" -f $_.Class, $_.Title, $_.ClientRect.Width, $_.ClientRect.Height }) -join ' | '
-    Log "  t=$([math]::Round(($loopStart - $startTime).TotalSeconds,1))s windows=$($windows.Count) $winDesc"
-
-    # Check if process exited
-    $proc = Get-Process -Id $winampPid -ErrorAction SilentlyContinue
-    if (-not $proc -or $proc.HasExited) {
-        Log "Winamp process exited"
-        break
-    }
-
-    # Sleep to maintain ~1 Hz
-    $elapsed = (Get-Date) - $loopStart
-    $sleepMs = [int][math]::Max(100, 1000 - $elapsed.TotalMilliseconds)
-    Start-Sleep -Milliseconds $sleepMs
+# Write final summary/record
+`$record = [ordered]@{
+    session       = `$me
+    user          = `$env:USERNAME
+    computer      = `$env:COMPUTERNAME
+    failure       = `$failure
+    observations  = `$observationCount
+    winampPid     = if (`$winampPid) { `$winampPid } else { `$null }
+    startTime     = if (`$startTime) { `$startTime.ToString('o') } else { `$null }
+    endTime       = (Get-Date).ToString('o')
+    durationSec   = if (`$startTime) { [math]::Round(((Get-Date) - `$startTime).TotalSeconds, 3) } else { 0 }
 }
+`$record | ConvertTo-Json -Depth 5 | Set-Content -Path `$InnerDone -Encoding UTF8
+`$transcript | Set-Content -Path `$InnerTranscriptPath -Encoding UTF8
+Log "Inner payload done. Observations: `$observationCount. Session: `$me. Failure: `$failure"
+exit 0
+"@
+
+$innerScript | Set-Content -Path $innerPath -Encoding UTF8
 
 # -----------------------------------------------------------------------------
-# 5. Cleanup
+# 4. Register and start the one-shot scheduled task in the interactive session
+# -----------------------------------------------------------------------------
+$taskName = 'RustampMeasureTransfer'
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$innerPath`"")
+$principal = New-ScheduledTaskPrincipal -UserId ("{0}\{1}" -f $interactiveDomain, $interactiveUser) `
+    -LogonType Interactive -RunLevel Limited
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal `
+    -Trigger $trigger -Force | Out-Null
+Log "Registered task '$taskName' as $interactiveDomain\$interactiveUser (Interactive, session $interactiveSession)"
+Start-ScheduledTask -TaskName $taskName
+
+# -----------------------------------------------------------------------------
+# 5. Session 0 waits for the done sentinel
+# -----------------------------------------------------------------------------
+$deadline = (Get-Date).AddMinutes(6)
+$innerDoneObj = $null
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 5
+    if (Test-Path $innerDonePath) {
+        try { $innerDoneObj = Get-Content -Path $innerDonePath -Raw | ConvertFrom-Json } catch { continue }
+        break
+    }
+}
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+if (-not $innerDoneObj) { throw 'the measurement task produced no done sentinel within 6 minutes; refusing instead of reporting a pass' }
+if ($innerDoneObj.session -eq 0) { throw ("the measurement task ran in session 0 ({0}); refusing" -f $innerDoneObj.failure) }
+if ($innerDoneObj.session -ne $interactiveSession) { throw ("the measurement task ran in session {0}, not the interactive session {1}; refusing" -f $innerDoneObj.session, $interactiveSession) }
+
+Log "Inner task ran in session $($innerDoneObj.session) as $($innerDoneObj.user) - OK"
+Log "Observations recorded: $($innerDoneObj.observations)"
+
+# -----------------------------------------------------------------------------
+# 6. Cleanup server process
 # -----------------------------------------------------------------------------
 if ($serverProc) {
     Log "Stopping HTTP server process"
@@ -322,28 +534,24 @@ if ($serverProc) {
     Start-Sleep -Seconds 1
 }
 
-# Get server log
-if (Test-Path $serverLogPath) {
-    $serverLog = Get-Content $serverLogPath -Raw
-    Log "Server log captured ($($serverLog.Length) chars)"
-}
-
-# Write summary
+# -----------------------------------------------------------------------------
+# 7. Write summary (matching the host runner's expected format)
+# -----------------------------------------------------------------------------
 $summary = [pscustomobject]@{
     Job        = $JobName
     Stamp      = $script:RunStamp
     Mode       = $Mode
-    WinampPid  = $winampPid
-    StartTime  = $startTime.ToString('o')
-    EndTime    = (Get-Date).ToString('o')
-    DurationSec = [math]::Round(((Get-Date) - $startTime).TotalSeconds, 3)
-    Observations = $observationCount
+    WinampPid  = $innerDoneObj.winampPid
+    StartTime  = $innerDoneObj.startTime
+    EndTime    = $innerDoneObj.endTime
+    DurationSec = $innerDoneObj.durationSec
+    Observations = $innerDoneObj.observations
     OutDir     = $OutDir
 }
 $summary | ConvertTo-Json -Depth 3 | Set-Content -Path (Join-Path $OutDir 'summary.json') -Encoding UTF8
 $transcript | Set-Content -Path $logPath -Encoding UTF8
 
-Log "Done. Observations: $observationCount. Output: $OutDir"
+Log "Done. Observations: $($innerDoneObj.observations). Output: $OutDir"
 
 # Emit exactly one summary object on stdout
 $summary
