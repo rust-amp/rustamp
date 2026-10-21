@@ -108,6 +108,14 @@ pub struct MainWindowState {
     pub time_visible: bool,
     /// Whether the time is remaining (`true`) or elapsed (`false`).
     pub time_remaining: bool,
+    /// Whether a track is loaded.
+    ///
+    /// **Measured** (2026-10-21, base-2.91 client capture of Winamp 2.95):
+    /// while nothing is loaded, the reference draws **no position bar at
+    /// all** - the skin's own `main.bmp` shows through the whole track band
+    /// (client 16,72 - 263,81). A track that is loaded but cannot be seeked
+    /// (a stream) is a different case and keeps the disabled look.
+    pub track_loaded: bool,
     /// Whether the current track can be seeked.
     ///
     /// The engine owns the fact (`Engine::is_seekable`): a stream has no
@@ -169,6 +177,7 @@ impl Default for MainWindowState {
             time_seconds: 0,
             time_visible: true,
             time_remaining: false,
+            track_loaded: false,
             seekable: true,
             duration_unknown: false,
             title: String::new(),

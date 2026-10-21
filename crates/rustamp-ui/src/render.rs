@@ -366,22 +366,69 @@ fn draw_transport(
     layout: &MainWindowLayout,
     state: &MainWindowState,
 ) {
-    for (button, rect) in [
+    // The sheet's transport row is five 22-px buttons at a 23-px pitch
+    // (S01 §2.4), so a one-pixel separator column stands between them.
+    // Measured 2026-10-21 (base-2.91 client capture of Winamp 2.95): the
+    // reference draws that column too - the column left of the play button is
+    // `cbuttons.bmp`'s column 22, pixel for pixel. The first button has no
+    // column to its left, and the eject stands six pixels away from the next
+    // button, so it has none either.
+    let row = [
         (TransportButton::Previous, layout.previous),
         (TransportButton::Play, layout.play),
         (TransportButton::Pause, layout.pause),
         (TransportButton::Stop, layout.stop),
         (TransportButton::Next, layout.next),
-        (TransportButton::Eject, layout.eject),
-    ] {
+    ];
+    for (index, (button, rect)) in row.into_iter().enumerate() {
         let (normal, pressed) = button_sprites(button);
         let name = if state.is_pressed(button) {
             pressed
         } else {
             normal
         };
+        if index > 0 {
+            draw_transport_separator(canvas, sheets, skin, name, rect);
+        }
         blit_named(canvas, sheets, skin, name, rect.x, rect.y);
     }
+    let (normal, pressed) = button_sprites(TransportButton::Eject);
+    let name = if state.is_pressed(TransportButton::Eject) {
+        pressed
+    } else {
+        normal
+    };
+    blit_named(canvas, sheets, skin, name, layout.eject.x, layout.eject.y);
+}
+
+/// Draws the one-pixel separator column in front of a transport button.
+///
+/// The column belongs to the same sheet row as the button it stands in front
+/// of, so the resting row brings the skin's own separator and the pressed row
+/// its dark one. The source column is the button's own column minus one, so
+/// the sheet stays the only place that knows the cells.
+fn draw_transport_separator(
+    canvas: &mut Image,
+    sheets: &Sheets,
+    skin: &Skin,
+    name: &str,
+    at: Rect,
+) {
+    let Some(def) = skin.sprite(name) else {
+        return;
+    };
+    if def.x == 0 {
+        return;
+    }
+    let Some(src) = sheets.get(def.sheet) else {
+        return;
+    };
+    canvas.blit_rect(
+        src,
+        Rect::new(def.x as i32 - 1, def.y as i32, 1, def.height),
+        at.x - 1,
+        at.y,
+    );
 }
 
 fn draw_toggles(
@@ -462,6 +509,14 @@ fn draw_position(
     layout: &MainWindowLayout,
     state: &MainWindowState,
 ) {
+    // Measured 2026-10-21 (base-2.91 client capture of Winamp 2.95): while
+    // nothing is loaded, the reference draws **no** position bar - the skin's
+    // own `main.bmp` shows through the whole track band (16,72)-(263,81).
+    // Only a loaded track gets the track and the thumb; a track that cannot
+    // be seeked keeps the disabled look below.
+    if !state.track_loaded {
+        return;
+    }
     blit_named(
         canvas,
         sheets,

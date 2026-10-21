@@ -239,15 +239,17 @@ impl MainWindowLayout {
 
     /// The volume thumb rectangle for a 0..=100 value.
     ///
-    /// **Provisional** (S01 open question 4): S01 records that at value 0 the
-    /// thumb's left edge sits at window x ~= 108 but not the exact blit origin.
+    /// **Measured** (2026-10-21, base-2.91 client capture of Winamp 2.95):
+    /// at volume 0 the thumb's left edge sits on the track's left edge, so the
+    /// thumb travels the whole track width minus its own width. The
+    /// value-to-frame mapping of the track itself stays **provisional**
+    /// (S01 open question 4).
     pub fn volume_thumb_at(&self, value: u8) -> Rect {
         let value = value.min(100);
-        // One pixel of inset at value 0, as S01's measurement suggests.
-        let travel = self.volume_track.width - VOLUME_THUMB_SIZE.0 - 1;
+        let travel = self.volume_track.width - VOLUME_THUMB_SIZE.0;
         let offset = (u32::from(value) * travel + 50) / 100;
         Rect::new(
-            self.volume_track.x + 1 + offset as i32,
+            self.volume_track.x + offset as i32,
             self.volume_track.y + 1,
             VOLUME_THUMB_SIZE.0,
             VOLUME_THUMB_SIZE.1,
@@ -395,7 +397,10 @@ mod tests {
     #[test]
     fn volume_and_balance_thumbs_stay_on_their_tracks() {
         let l = MainWindowLayout::CLASSIC;
-        assert_eq!(l.volume_thumb_at(0).x, 108);
+        // Measured 2026-10-21: at volume 0 the thumb sits on the track's left
+        // edge, and at volume 100 its right edge on the track's right edge.
+        assert_eq!(l.volume_thumb_at(0).x, 107);
+        assert_eq!(l.volume_thumb_at(100).right(), l.volume_track.right());
         for v in 0..=100u8 {
             let thumb = l.volume_thumb_at(v);
             assert!(thumb.x >= l.volume_track.x);
