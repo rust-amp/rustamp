@@ -490,3 +490,113 @@ commit that was supposed to fix it before opening a lane on a number.
 `eq-shade` (1 072) is still unresolved: it needs a capture pair in the same
 focus state before the number means anything.
 
+## Measured 2026-10-22 (wave349): the four EQ states re-captured from the current build
+
+Both halves of this section close the point above: the assembler now refuses
+to let a stale capture pass silently, and the four EQ states were re-captured
+from a fresh build of `0f44e55` (debug binary
+`D1E5AA148E8D1A38F2A70C12DFE3AC55F46F2E81CA2D62EA6E20A43547CC371F`, staged
+into the VM tree and byte-verified before the runs). Until this re-capture
+the four EQ presented captures still dated **2026-10-21 08:59-09:13**, so
+their numbers (6 / 6 / 24 / 1072) were *carried*, not *measured*, against the
+current code.
+
+### The freshness guard in `assemble-base291.ps1`
+
+Rule: the presented side is a capture of our player, so it must not predate
+the newest commit that touched code. The guard takes
+`git -C D:\code\Rustamp log -1 --format=%cs -- crates/` (2026-10-22 at the
+time of writing, commit `4478a0e`) and, after copying each case, compares the
+presented capture's file date against it: **capture date < commit date ⇒ the
+case is STALE**. Only the presented side is checked; the reference side comes
+from the immutable Winamp 2.95 binary.
+
+It reports in two places: the console summary (a `STALE presented captures
+(N): ...` warning block, with the baseline date and the instruction not to
+read a stale case as a product defect, plus exit code **2** — the set never
+passes silently) and `session-proof.json` (per-case `stale` field, top-level
+`stale_cases` list, and the `codeCommitDate` it compared against). A stale
+capture is never deleted or overwritten; a fresh case keeps its previous
+output shape (`stale: false`, exit 0). Run against the 2026-10-21 captures it
+flagged exactly `eq-active, eq-inactive, eq-shade, eq-double` and exited 2;
+after the re-capture it reports `none stale` and exits 0.
+
+### Re-captured and measured (all four runs exit 0, files hash-verified)
+
+`vm-run-presented.ps1 -Job base291-presented-<case>` for each of the four
+states (18 / 22 / 18 / 18 files verified byte-identical), then
+`assemble-base291.ps1`, then `Compare-Images.ps1` per case:
+
+| case | before (21.10. captures) | after (current build) | bounds |
+|---|---|---|---|
+| `eq-active` | 6 | **6** | `(44,22)-(46,23)` - the auto flag |
+| `eq-inactive` | 6 | **6** | same rectangle |
+| `eq-shade` | 1 072 | **1 072** | `(0,4)-(274,13)` |
+| `eq-double` | 24 | **24** | `(88,44)-(93,47)` - the same 6 px at 2x |
+
+The numbers did not move, which is the point: no EQ-relevant code changed
+between 21.10. and this build, so the carried numbers were right — but now
+they are *measured* against the current binary instead of assumed.
+
+### New total, all eleven states measured from the current build
+
+| state | differing pixels |
+|---|---|
+| `main-active` / `main-inactive` | 132 each |
+| `main-shade` | 0 |
+| `main-double` | 528 |
+| `eq-active` / `eq-inactive` | 6 each |
+| `eq-double` | 24 |
+| `eq-shade` | 1 072 |
+| `playlist-active` / `playlist-inactive` | 97 each |
+| `playlist-shade` | 86 |
+| **all eleven** | **2 180 / 458 150 = 0.48 %** |
+
+Numerically the total is unchanged from the wave348 re-measurement; what
+changed is the evidence: every presented capture in the set now comes from
+the current build, and the guard says so in the proof.
+
+### What `eq-shade` is, measured pixel-exact
+
+One sentence: `eq-shade` is a **state difference, not a rendering defect** —
+the reference band is the skin's *unfocused* shade variant with Winamp's two
+3x7 gold slider thumbs drawn on top, while our band is the *focused* variant
+with no thumbs, and every pixel of each band matches its own skin row
+exactly.
+
+The evidence, from `Compare-Images.ps1 -DiffOut` plus a sliding-window match
+of both bands against `eq_ex.bmp` (275x82) from `base-2.91.wsz`:
+
+* our presented band vs sheet rows **0-13** (the focused shade strip):
+  **0** differing pixels — we render the focused variant pixel-perfectly;
+* the reference band vs sheet rows **15-28** (the unfocused shade strip):
+  **42** differing pixels — exactly the two slider thumbs Winamp draws over
+  the strip, gold `(236,206,122)`, volume at cols 61-63 rows 4-10 and
+  balance at cols 183-185 rows 4-10 (3x7 each);
+* the 1 072 px of the comparison therefore decompose as: the skin's two
+  focus variants themselves (1 030 px) + the thumbs we do not draw (42 px).
+
+Where the focus-variant difference sits, rectangle by rectangle (from the
+diff image; all rows 4-10 unless noted):
+
+| rectangle | px | reference draws (unfocused variant) | we draw (focused variant) |
+|---|---|---|---|
+| `(6,4)-(58,10)` volume slider frame | 367 | dim lines: gold `(134,119,77)`, gray `(144,144,144)`, dark `(49,48,45)` | bright lines: gold `(236,206,122)`, white `(255,255,255)`, dark `(66,65,59)` |
+| `(61,4)-(63,10)` volume thumb | 21 | gold `(236,206,122)` 3x7 thumb | nothing (shade-mode controls not implemented) |
+| `(183,4)-(185,10)` balance thumb | 21 | gold `(236,206,122)` 3x7 thumb | nothing (shade-mode controls not implemented) |
+| `(209,4)-(252,10)` balance slider frame | 304 | same dim frame lines as the left one | same bright frame lines as the left one |
+| `(255,4)-(261,10)` shade button | 41 | dim unfocused glyph | bright focused glyph, same columns |
+| `(265,4)-(271,10)` close "X" button | 43 | dim unfocused glyph | bright focused glyph, same columns |
+| `(0,13)-(274,13)` bottom edge row | 275 | textured blue-gray `(31..33, 31..34, 50..52)` | solid `(0,0,8)` / `(0,0,0)` |
+| | **1 072** | | |
+
+The earlier note in this file attributed part of the remainder to a
+system-font "EQ" label Winamp draws into the band; the pixel-exact check
+shows **no such label in this capture** — the reference band differs from
+its own skin row only by the 42 thumb pixels. What remains is two open
+questions, not defects: (1) the capture pair compares our focused strip
+against the reference's unfocused one — both focus states should be captured
+on both sides; (2) our player does not yet draw the shade-mode
+volume/balance thumbs (the documented boundary in the "Remaining boundaries"
+section).
+
