@@ -423,3 +423,33 @@ Two things to settle before either number can be read as a drawing difference:
 `eq-shade` also carries the "EQ" label Winamp draws into the band with a system
 font the skin does not ship - its own case (system-font text), not a strip
 drawing question.
+
+## Measured 2026-10-22 (after the resize-storm fix `4478a0e`)
+
+The six states the last three UI lanes changed were re-captured in the guest
+(`campaign6`, all runs exit 0, every file verified byte-identical) and compared
+against the reference captures pixel-exactly with
+`tools/vm-capture/Compare-Images.ps1`.
+
+| state | differing pixels | what is left |
+|---|---|---|
+| `main-active` / `-inactive` | 132 | 120 are "RUSTAMP" where the reference draws "WINAMP 2.95" (our identity, not a defect); 12 are the idle decoder cell |
+| `main-shade` | 190 | the shade strip's remaining glyph cells |
+| `main-double` | 528 | the 2x text run of the same title row |
+| `eq-active` / `-inactive` | 6 | the auto indicator's state |
+| `eq-double` | 24 | the same indicator at 2x |
+| `eq-shade` | 1 072 | focused strip vs the reference's unfocused one, plus the system-font "EQ" label |
+| `playlist-active` / `-inactive` | 97 | GDI text the skin does not ship |
+| `playlist-shade` | 86 | the same text on the band |
+| **total** | **2 370 / 458 150 = 0.52 %** | |
+
+Before this measurement the set stood at 17 419 / 458 150 (3.8 %). The two
+largest single findings on the way are recorded above: the reference draws no
+position bar and no analyser while nothing is loaded, and our playlist rendered
+its focus state from the main window's flag.
+
+The three states that still dominate are all **not rendering defects** but open
+questions: `eq-shade` needs both sides captured in the same focus state,
+`main-double` shares the identity text, and the playlist rows are text the skin
+does not carry.
+
