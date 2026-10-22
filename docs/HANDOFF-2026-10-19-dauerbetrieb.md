@@ -535,3 +535,49 @@ frame analysis instead of geometry only.
 auto button rects, the slider track as one blit, the flat curve's row) and
 `S19-transfer-display.draft.md` (what the capture did and did not show).
 
+
+## 2026-10-22: the resize storm that stopped the player
+
+The six re-captures after wave345/346/347 failed **all** with
+`equalizer=False, playlist=True`. That was not a harness quirk: the player was
+frozen.
+
+How it was found (and what it cost): a posted `WM_COMMAND` 40036 produced no
+equalizer, the player's stderr came back **empty**, so the diagnosis had to be
+built. What it showed, in order:
+
+1. The resolved main window and the external-control subclass were on the same
+   HWND (trace in `external_control::native`), and the redirect of the player's
+   stderr is worthless in this environment - `eprintln!` writes nothing to the
+   file even though the app prints its startup notes. The file channel is the
+   only reliable one.
+2. `PostMessageW` reported success, `IsHungAppWindow` was false, and a
+   `SendMessageTimeout(WM_SETTEXT)` never changed the title: nothing was
+   processed.
+3. A trace in `about_to_wait` and `window_event` named it: **21 985 resize
+   events in a few seconds**, before the first tick ever ran.
+
+The cause is in wave347: the playlist's `Resized` handler wrote every reported
+size into the configuration (`pe_width`/`pe_height`) and then asked for a size
+derived from it, so each resize produced the next one. Fixed by letting only the
+corner-drag release write the size. Verified in the guest: the `WM_SETTEXT` probe
+changes the title, the equalizer opens after **one** post, and the `eq-active`
+job produced its three captures.
+
+**The shipped zips are affected:** `46b18e6` and `ce48e47` contain the storm.
+They are moved to `D:\code\rustamp-release\superseded\` and must not be handed
+out; `855b3ef` (the one the owner tested) is older than the storm.
+
+**New release:** `rustamp-0.1.0+2026-10-22.4478a0e.zip`,
+sha256 `5a2cb40e112213a5dcd5b3c7319d907af1e5619d22d8a15a2782fcb53c61c591`.
+Checked the same way as before: every shipped EXE imports only system DLLs, the
+player is a GUI subsystem binary (2), and a packaged `--null --seconds 1` run
+plays 44 281 frames in 1.00 s.
+
+**Harness lessons that are now built in** (`run-presented.ps1`): every job starts
+from a fresh configuration (the out directory survives, so a broken build's
+layout was inherited and poisoned the next run), the payload's `Write-Host`
+lines go to `inner-session<session>.log`, the hash of the EXE about to run is
+logged, message delivery is probed with `WM_SETTEXT`, and the player is stopped
+before the results are collected (it held the redirected stderr open).
+
