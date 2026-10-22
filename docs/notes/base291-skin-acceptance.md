@@ -424,7 +424,7 @@ Two things to settle before either number can be read as a drawing difference:
 font the skin does not ship - its own case (system-font text), not a strip
 drawing question.
 
-## Measured 2026-10-22 (after the resize-storm fix `4478a0e`)
+## Measured 2026-10-22 (after the resize-storm fix `4478a0e`) - `main-shade` superseded below
 
 The six states the last three UI lanes changed were re-captured in the guest
 (`campaign6`, all runs exit 0, every file verified byte-identical) and compared
@@ -434,14 +434,14 @@ against the reference captures pixel-exactly with
 | state | differing pixels | what is left |
 |---|---|---|
 | `main-active` / `-inactive` | 132 | 120 are "RUSTAMP" where the reference draws "WINAMP 2.95" (our identity, not a defect); 12 are the idle decoder cell |
-| `main-shade` | 190 | the shade strip's remaining glyph cells |
+| `main-shade` | 190 (**stale artefact**, see below) | the row was carried over from a capture made before `c04b8ff` |
 | `main-double` | 528 | the 2x text run of the same title row |
 | `eq-active` / `-inactive` | 6 | the auto indicator's state |
 | `eq-double` | 24 | the same indicator at 2x |
 | `eq-shade` | 1 072 | focused strip vs the reference's unfocused one, plus the system-font "EQ" label |
 | `playlist-active` / `-inactive` | 97 | GDI text the skin does not ship |
 | `playlist-shade` | 86 | the same text on the band |
-| **total** | **2 370 / 458 150 = 0.52 %** | |
+| **total** | **2 370 / 458 150 = 0.52 %** (with the stale `main-shade` row; **2 180 = 0.48 %** after the re-measurement below) | |
 
 Before this measurement the set stood at 17 419 / 458 150 (3.8 %). The two
 largest single findings on the way are recorded above: the reference draws no
@@ -454,17 +454,39 @@ questions: `eq-shade` needs both sides captured in the same focus state,
 does not carry.
 
 
-### What the remaining `main-shade` pixels are (diff image, 2026-10-22)
+### The `main-shade` row above is a stale artefact, not a rendering gap
 
-`diff-main-shade.png` (from `Compare-Images.ps1 -DiffOut`) shows the difference is
-one contiguous run: after the play button the reference draws the shade strip's
-transport glyphs (pause, stop, next, eject), and our strip draws a row of dark,
-near-empty cells instead. Nothing else in the 275 x 14 strip differs - logo,
-"WINAMP"/"RUSTAMP" text, the EQ and PL toggle icons, the green indicator, the
-volume bar and the window buttons all match.
+`main-shade.presented.png` carried a timestamp of **2026-10-21 03:56**, while
+every other presented capture in the set was refreshed on 2026-10-22 between
+10:54 and 11:18: `main-shade` was never re-captured after `c04b8ff` ("the main
+window draws no empty position bar or analyser"). That commit added the
+`has_content` gate in `crates/rustamp-ui/src/visualization.rs`, and the old
+capture predates it by ten hours.
 
-So `main-shade` is a **missing sprite row in the shade strip**, not a state or
-focus question, and it is the last rendering gap in the main window. `eq-shade`
-(1 072) is still unresolved: it needs a capture pair in the same focus state
-before the number means anything.
+The 190 pixels were therefore the **empty analyser** the old build painted
+unconditionally: a 38 x 5 block of `viscolor` slot 0 (black) with slot 1
+`(24, 33, 41)` grid dots, at `(188, 5)-(225, 9)` - which is exactly
+`MainWindowLayout::shade_visualization`. The reference's strip is pixel for
+pixel `titlebar.bmp` (27,29,275,14), and that cell itself carries the mini
+transport row (previous, play, pause, stop, next, eject) across exactly that
+38-pixel run. The coarse diff read those baked-in glyphs as missing sprites;
+the renderer was never missing them, the overlay was covering them.
+
+**Re-measured 2026-10-22, `wave348`** with the current build
+(`vm-run-presented.ps1 -Job base291-presented-main-shade`, exit 0, 18 files
+verified byte-identical, then `assemble-base291.ps1`):
+
+| state | before | after |
+|---|---|---|
+| `main-shade` | 190 / 3 850 | **0 / 3 850, identical=True** |
+
+The other three main states keep their numbers (`main-active` 132,
+`main-inactive` 132, `main-double` 528), so nothing else moved.
+
+**Lesson for the ledger:** the comparison set has no freshness guard. A cell
+in the table can outlive the artefact it was measured from, and a stale PNG
+then reads as a product defect. Check the capture's timestamp against the
+commit that was supposed to fix it before opening a lane on a number.
+`eq-shade` (1 072) is still unresolved: it needs a capture pair in the same
+focus state before the number means anything.
 
