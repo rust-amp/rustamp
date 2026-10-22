@@ -470,3 +470,68 @@ broken into rectangles).
 - **The decoder's read path is not panic-protected** (only the container probe is;
   no panic was found there, but it is not covered).
 
+
+## 2026-10-21/22: the release zip, the owner's three bugs, and the parity
+
+**A release zip exists** (owner: "erstell eine komplette aktuelle version zum test
+als release zip"): `cargo xtask package --release --zip`, verified end to end -
+the checksum matches, every shipped EXE imports only system DLLs, the host
+closure is GPL-free, and the packaged player runs (`--null`, 44 176 frames in
+1.00 s). The artefact is copied to `D:\code\rustamp-release\` so `cargo clean`
+cannot eat it.
+
+**The owner ran it and found three bugs; all three are fixed** (zip
+`rustamp-0.1.0+2026-10-21.ce48e47.zip`):
+
+1. **A console window opened on start.** The binary was a console program. A
+   release build is now a GUI program (`windows_subsystem`), which the packaged
+   PE confirms (subsystem 2), and `--console` reattaches a console for the notes
+   (`rustamp-platform/src/console.rs`, because the app crate forbids `unsafe`).
+   Launched from a terminal the notes still arrive - the child inherits the
+   handles - so CLI use did not regress.
+2. **The playlist could not be resized by its corner.** It had no resize state
+   machine and the size was never stored. Now: a 16x16 grip at the bottom-right
+   (an **own choice**, no spec covers it), growth to the right and down, floor
+   275x116 (S01 section 1 / S05 section 2.1), persisted as `pe_width`/`pe_height`
+   (S12 section 3.4), and the presenter's size sync pauses during the drag.
+3. **Clicking a partly hidden window raised only that window.** There was no
+   Z-order management at all. Activating one of the three classic windows now
+   raises the other two **behind** it. The first version used `HWND_TOP`, which
+   would have covered the clicked window - corrected to insert behind the
+   focused handle. The OS-level result is VM-only; the decision and the clamps
+   are headless-tested.
+
+**Parity, measured against the reference captures** (`docs/notes/base291-skin-acceptance.md`):
+
+| state | before | after |
+|---|---|---|
+| `main-shade` | 1 246 | **0** |
+| `main-active` / `-inactive` | 2 099 | **132** (120 are "RUSTAMP" vs "WINAMP 2.95" - our identity, not a defect; 12 are the idle decoder cell) |
+| `main-double` | 14 700 | **528** |
+| `eq-active` / `-inactive` | 7 408 | **6** (the auto indicator, a state question) |
+| `eq-double` | 29 632 | **24** |
+| `playlist-active` / `-inactive` | 1 510 | **97** (GDI text the skin does not ship) |
+| `playlist-shade` | 507 | **86** |
+| `eq-shade` | 1 072 | 1 072 (focused strip vs the reference's unfocused, plus the system-font "EQ" label) |
+
+The three biggest single findings on the way: the reference draws **no position
+bar and no analyser** while nothing is loaded (1 096 + 608 px); our equalizer
+drew a self-invented slider body instead of the skin's one blit (7 168 px); and
+the playlist rendered its focus from the **main window's** flag, which swapped
+both playlist states (1 388 px).
+
+**A second measurement attempt for the S19 transfer display was rejected.** The
+lane built a slower server and per-second PNG captures but produced no evidence:
+the scheduled task ran an inner script from a different path than the one it
+wrote, plus two logging defects. It then left 23 scratch scripts in the guest
+folder **and in the canonical tree**. Rejected, cleaned, worktree deleted; the
+`wave343` evidence still stands (the stream title is in the main window's title
+bar, three windows are open from the start, a refused connection ends the
+process). The S19 section 2 status texts remain unmeasured; the next attempt
+needs one script, a hash check of the deployed inner file before the run, and
+frame analysis instead of geometry only.
+
+**Drafts waiting for an auditor:** `S01-corrections-round3.draft.md` (equalizer
+auto button rects, the slider track as one blit, the flat curve's row) and
+`S19-transfer-display.draft.md` (what the capture did and did not show).
+
