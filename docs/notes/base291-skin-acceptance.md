@@ -453,3 +453,18 @@ questions: `eq-shade` needs both sides captured in the same focus state,
 `main-double` shares the identity text, and the playlist rows are text the skin
 does not carry.
 
+
+### What the remaining `main-shade` pixels are (diff image, 2026-10-22)
+
+`diff-main-shade.png` (from `Compare-Images.ps1 -DiffOut`) shows the difference is
+one contiguous run: after the play button the reference draws the shade strip's
+transport glyphs (pause, stop, next, eject), and our strip draws a row of dark,
+near-empty cells instead. Nothing else in the 275 x 14 strip differs - logo,
+"WINAMP"/"RUSTAMP" text, the EQ and PL toggle icons, the green indicator, the
+volume bar and the window buttons all match.
+
+So `main-shade` is a **missing sprite row in the shade strip**, not a state or
+focus question, and it is the last rendering gap in the main window. `eq-shade`
+(1 072) is still unresolved: it needs a capture pair in the same focus state
+before the number means anything.
+
