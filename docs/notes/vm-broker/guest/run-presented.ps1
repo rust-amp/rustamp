@@ -126,6 +126,15 @@ $HarnessModule = '__HARNESSMODULE__'
 # Fail loudly in session 0: our player cannot show a window there, and a
 # pass from there would be a lie.
 $me = (Get-Process -Id $PID).SessionId
+
+# The payload's Write-Host lines used to go to the console of the scheduled
+# task and were lost, so a failure said "equalizer=False" and nothing about the
+# posting attempts that led there. Keep them in the out directory instead.
+try {
+    Start-Transcript -Path (Join-Path $OutDir ("inner-session{0}.log" -f $me)) -Force | Out-Null
+} catch {
+    # A transcript is diagnostic; its absence must not fail a capture.
+}
 $harnessExit = -1
 $failure = ''
 $stepOutputs = @()
@@ -175,8 +184,31 @@ if ($me -eq 0) {
     # Launch our player with the required arguments
     # --no-audio --skin <skin> --volume 0 /NOREG /CONFIG=<config>
     $ourArgs = "--no-audio --skin `"$SkinPath`" --volume 0 $winampArgs /CONFIG=`"$ConfigPath`""
+    # A fresh configuration per run, like the reference's checkpoint restore. The
+    # out directory survives between runs, so without this a run inherits the
+    # layout the previous (possibly broken) build wrote - a stale playlist size
+    # was what made every capture fail on 2026-10-22.
+    if (Test-Path $ConfigPath) { Remove-Item $ConfigPath -Force }
+    # Which binary is actually about to run: a stale copy in the guest looks
+    # exactly like a product regression, and the first diagnosis of the missing
+    # equalizer window had no way to tell them apart (2026-10-22).
+    $exePath = Join-Path $InstallRoot 'rustamp.exe'
+    if (Test-Path $exePath) {
+        $exeItem = Get-Item $exePath
+        $exeHash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash
+        Write-Host ("exe {0} {1} bytes, written {2:o}, sha256 {3}" -f $exePath, $exeItem.Length, $exeItem.LastWriteTime, $exeHash)
+    } else {
+        Write-Host ("exe {0} is MISSING" -f $exePath)
+    }
     Write-Host "starting rustamp.exe $ourArgs (cwd $InstallRoot)"
-    $proc = Start-Process -FilePath (Join-Path $InstallRoot 'rustamp.exe') -ArgumentList $ourArgs -WorkingDirectory $InstallRoot -PassThru
+    # The player's own stderr goes to a file: without it, a window that fails to
+    # be created is invisible (the app reports "could not create the equalizer
+    # window" and the harness only sees the missing window). Six runs were
+    # undiagnosable for exactly this reason on 2026-10-22.
+    $playerOut = Join-Path $OutDir 'player.stdout.txt'
+    $playerErr = Join-Path $OutDir 'player.stderr.txt'
+    $proc = Start-Process -FilePath (Join-Path $InstallRoot 'rustamp.exe') -ArgumentList $ourArgs -WorkingDirectory $InstallRoot `
+        -RedirectStandardOutput $playerOut -RedirectStandardError $playerErr -PassThru
 
     # Wait for the main window (Class 'Winamp v1.x', process 'rustamp')
     $deadline = (Get-Date).AddSeconds(60)
@@ -191,6 +223,7 @@ if ($me -eq 0) {
         catch { Start-Sleep -Milliseconds 500 }
     }
     if (-not $mainHwnd) { throw "no 'Winamp v1.x' window for rustamp.exe within 60 s" }
+
 
     # Open the equalizer (WM_COMMAND 40036) and playlist (WM_COMMAND 40040).
     # The recorded 1:1 landmark of the reference has both windows open and the
@@ -214,23 +247,76 @@ if ($me -eq 0) {
     # call this needs under our own type name so it cannot collide with the
     # module's.
     if (-not ('RustampPresented.User32' -as [type])) {
-        Add-Type -Namespace RustampPresented -Name User32 -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)] public static extern bool PostMessageW(System.IntPtr hWnd, uint msg, System.IntPtr wParam, System.IntPtr lParam);'
+        # No here-string here: this payload is itself inside one, and a line
+        # holding only the closing marker would end the outer string.
+        $memberDefinition = @(
+            '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)] public static extern bool PostMessageW(System.IntPtr hWnd, uint msg, System.IntPtr wParam, System.IntPtr lParam);',
+            '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)] public static extern bool IsHungAppWindow(System.IntPtr hWnd);',
+            '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)] public static extern System.IntPtr SendMessageTimeoutW(System.IntPtr hWnd, uint msg, System.IntPtr wParam, System.IntPtr lParam, uint flags, uint timeout, out System.IntPtr result);'
+        ) -join [Environment]::NewLine
+        Add-Type -Namespace RustampPresented -Name User32 -MemberDefinition $memberDefinition
+    }
+
+    # Probe: can a message reach this window at all? WM_SETTEXT changes the
+    # title, so the answer is visible in the enumerator without trusting our own
+    # subclass. A player whose subclass is installed and whose posted commands
+    # never arrive needs this split: delivery broken, or command not understood.
+    try {
+        $probeText = "Rustamp probe {0}" -f (Get-Random)
+        $probePtr = [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($probeText)
+        $probeResult = [IntPtr]::Zero
+        try {
+            $probeSent = [RustampPresented.User32]::SendMessageTimeoutW(
+                $mainHwnd, 0x000C, [IntPtr]::Zero, $probePtr, 0, 2000, [ref]$probeResult)
+        } finally {
+            [void][System.Runtime.InteropServices.Marshal]::FreeHGlobal($probePtr)
+        }
+        Start-Sleep -Milliseconds 300
+        $probeWindow = @([RustampCapture.Native]::EnumTopLevelWindows() |
+            Where-Object { [int64]$_.Hwnd -eq [int64]$mainHwnd }) | Select-Object -First 1
+        $probeTitle = if ($probeWindow) { $probeWindow.Title } else { '<window gone>' }
+        Write-Host ("probe: SendMessageTimeout(WM_SETTEXT) sent={0}, wanted '{1}', title now '{2}'" -f $probeSent, $probeText, $probeTitle)
+    } catch {
+        Write-Host ("probe failed: {0}" -f $_.Exception.Message)
     }
 
     function Open-WindowByCommand {
-        param([string]$Label, [int]$Command, [string]$Class, [int]$Seconds = 20)
-        $attempts = 0
+        param([string]$Label, [int]$Command, [string]$Class, [int]$Seconds = 20)        $attempts = 0
         $deadline = (Get-Date).AddSeconds($Seconds)
         while ((Get-Date) -lt $deadline) {
+            # Ask the RAW window list, not the harness's resolver: the resolver
+            # wants exactly one *visible* top-level window of the class, and a
+            # window that exists but is not visible yet must still stop us from
+            # posting again. Re-posting here toggles the window open and shut -
+            # that is how six runs ended with no equalizer at all (2026-10-22).
             $present = $false
-            try { $null = Resolve-CaptureWindow -Class $Class -ProcessName 'rustamp'; $present = $true } catch { $present = $false }
+            try {
+                $pids = @(Get-Process -Name 'rustamp' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+                $hit = @([RustampCapture.Native]::EnumTopLevelWindows() |
+                    Where-Object { $pids -contains [int]$_.Pid -and $_.ClassName -eq $Class })
+                $present = $hit.Count -gt 0
+            } catch { $present = $false }
             if ($present) {
-                Write-Host ("{0} window present after {1} post(s): {2}" -f $Label, $attempts, $Class)
+                Write-Host ("{0} window exists after {1} post(s): {2}" -f $Label, $attempts, $Class)
                 return $true
             }
             $attempts++
             Write-Host ("posting WM_COMMAND {0} ({1}) to the main window, attempt {2}" -f $Command, $Label, $attempts)
             [void][RustampPresented.User32]::PostMessageW($mainHwnd, [uint32]$WM_COMMAND, [IntPtr]$Command, [IntPtr]::Zero)
+            if ($attempts -eq 1) {
+                # A posted message is only delivered when the target thread
+                # pumps its queue. "The subclass is installed, the handle is
+                # right, and nothing arrives" is exactly what a player that
+                # stopped pumping looks like, so measure that instead of
+                # guessing (2026-10-22).
+                $lastError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                $hung = [RustampPresented.User32]::IsHungAppWindow($mainHwnd)
+                Start-Sleep -Milliseconds 300
+                $probe = [IntPtr]::Zero
+                $answered = [RustampPresented.User32]::SendMessageTimeoutW(
+                    $mainHwnd, 0, [IntPtr]::Zero, [IntPtr]::Zero, 2, 2000, [ref]$probe)
+                Write-Host ("post last error {0}; hung={1}; SendMessageTimeout(WM_NULL) returned {2} (0 = the thread never pumped)" -f $lastError, $hung, $answered)
+            }
             Start-Sleep -Milliseconds 700
         }
         Write-Host ("{0} window still absent after {1} post(s) in {2} s (class '{3}')" -f $Label, $attempts, $Seconds, $Class)
@@ -240,6 +326,16 @@ if ($me -eq 0) {
     $eqOpened = Open-WindowByCommand -Label 'equalizer' -Command $EQ_CMD -Class 'Winamp EQ'
     $plOpened = Open-WindowByCommand -Label 'playlist' -Command $PL_CMD -Class 'Winamp PE'
     if (-not ($eqOpened -and $plOpened)) {
+        # The raw list, invisible windows included: it separates "the command
+        # never arrived" (no window of the class at all) from "the window exists
+        # but is not visible yet" (a second post would close it again).
+        try {
+            $rawPids = @(Get-Process -Name rustamp -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+            Write-Host '--- raw top-level windows of the player at the failed start state ---'
+            [RustampCapture.Native]::EnumTopLevelWindows() |
+                Where-Object { $rawPids -contains [int]$_.Pid } |
+                ForEach-Object { Write-Host ("    {0:X} class='{1}' title='{2}' visible={3}" -f [int64]$_.Hwnd, $_.ClassName, $_.Title, $_.Visible) }
+        } catch { Write-Host ("raw window dump failed: {0}" -f $_.Exception.Message) }
         throw ("the start state could not be reached: equalizer={0}, playlist={1} - every capture would be of the wrong state" -f $eqOpened, $plOpened)
     }
 
@@ -326,6 +422,12 @@ if ($me -eq 0) {
             break
         }
     }
+    # The player's stdout/stderr are redirected into this directory and the app
+    # holds both files open, so it has to be gone before anything reads or
+    # copies the results (2026-10-22).
+    try {
+        if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+    } catch { }
     $harnessExit = if ($failure) { 1 } else { 0 }
 }
 

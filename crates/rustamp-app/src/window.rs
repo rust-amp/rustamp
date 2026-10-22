@@ -2606,20 +2606,10 @@ impl Windowed {
                     // Never settle below the layout (the DPI-change floor).
                     self.applied_playlist_client = None;
                 }
-                // Persist the size to config (pe_width/pe_height) when not in a
-                // corner resize drag (the drag handler persists on release).
-                if self.playlist_resize_start.is_none()
-                    && let Some(layout) = self
-                        .app
-                        .config_mut()
-                        .ui
-                        .windows
-                        .iter_mut()
-                        .find(|w| w.id == CoreWindowId::Playlist)
-                {
-                    layout.width = Some(size.width);
-                    layout.height = Some(size.height);
-                }
+                // The size is NOT persisted here: only a corner drag writes
+                // pe_width/pe_height (the release handler). Persisting every
+                // resize made the stored size feed the next request and the
+                // player never reached another tick (resize storm, 2026-10-22).
                 self.sync_playlist_window(event_loop);
                 self.request_playlist_redraw();
             }
