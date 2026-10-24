@@ -8,14 +8,39 @@ use rustamp_skin::{
 };
 use rustamp_ui::*;
 
-fn archive() -> ArchiveSource {
-    let path = std::env::var_os("RUSTAMP_BASE291_SKIN")
+fn skin_path() -> std::path::PathBuf {
+    std::env::var_os("RUSTAMP_BASE291_SKIN")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("RUSTAMP_TESTSKINS")
                 .map(|root| std::path::PathBuf::from(root).join("base-2.91.wsz"))
         })
-        .unwrap_or_else(|| "D:/code/rustamp-testskins/base-2.91.wsz".into());
+        .unwrap_or_else(|| "D:/code/rustamp-testskins/base-2.91.wsz".into())
+}
+
+/// Whether the base skin is there. The skin is Winamp's own and is **not** in
+/// the repository (it is a separate optional download), so a machine without
+/// it (CI) skips these tests, loudly. `RUSTAMP_REQUIRE_BASE291=1` turns a
+/// missing skin back into a failure, for the machine that holds the skin.
+fn skin_available() -> bool {
+    skin_path().is_file() || std::env::var_os("RUSTAMP_REQUIRE_BASE291").is_some()
+}
+
+macro_rules! skip_without_skin {
+    () => {
+        if !skin_available() {
+            eprintln!(
+                "SKIP {}: the base-2.91 skin is not available at {}",
+                module_path!(),
+                skin_path().display()
+            );
+            return;
+        }
+    };
+}
+
+fn archive() -> ArchiveSource {
+    let path = skin_path();
     ArchiveSource::open(&path)
         .unwrap_or_else(|e| panic!("base-2.91 acceptance requires {}: {e}", path.display()))
 }
@@ -104,6 +129,7 @@ fn region_except(
 
 #[test]
 fn base291_archive_native_sheets_metadata_and_tables() {
+    skip_without_skin!();
     let mut source = archive();
     assert_eq!(source.list().len(), 32);
     let skin = Skin::from_source(&mut source, &BuiltinDefaultSkin).unwrap();
@@ -191,6 +217,7 @@ fn base291_archive_native_sheets_metadata_and_tables() {
 
 #[test]
 fn base291_main_focus_shade_scale_and_pressed_buttons() {
+    skip_without_skin!();
     let skin = skin();
     let layout = MainWindowLayout::CLASSIC;
     for shade in [false, true] {
@@ -327,6 +354,7 @@ fn base291_main_focus_shade_scale_and_pressed_buttons() {
 /// exactly what the reference shows there (measured 2026-10-21).
 #[test]
 fn base291_shade_strip_matches_the_reference_capture() {
+    skip_without_skin!();
     let root = std::path::PathBuf::from(
         std::env::var_os("RUSTAMP_BASE291_CAPTURES")
             .unwrap_or_else(|| "D:/code/rustamp-testcaptures/base291".into()),
@@ -377,6 +405,7 @@ fn base291_shade_strip_matches_the_reference_capture() {
 /// other pixel must match the reference.
 #[test]
 fn base291_main_window_matches_the_reference_capture() {
+    skip_without_skin!();
     let root = std::path::PathBuf::from(
         std::env::var_os("RUSTAMP_BASE291_CAPTURES")
             .unwrap_or_else(|| "D:/code/rustamp-testcaptures/base291".into()),
@@ -500,6 +529,7 @@ fn base291_main_window_matches_the_reference_capture() {
 
 #[test]
 fn base291_main_readouts_marquee_clutter_toggles_and_sliders() {
+    skip_without_skin!();
     let skin = skin();
     let layout = MainWindowLayout::CLASSIC;
     for (transport, name) in [
@@ -603,6 +633,7 @@ fn base291_main_readouts_marquee_clutter_toggles_and_sliders() {
 
 #[test]
 fn base291_equalizer_focus_shade_scale_buttons_thumbs_and_curve() {
+    skip_without_skin!();
     let skin = skin();
     let layout = EqualizerLayout::CLASSIC;
     for shade in [false, true] {
@@ -764,6 +795,7 @@ fn base291_equalizer_focus_shade_scale_buttons_thumbs_and_curve() {
 
 #[test]
 fn base291_playlist_focus_buttons_scroll_and_skin_colours() {
+    skip_without_skin!();
     let skin = skin();
     let mut window = PlaylistWindow::new();
     window.set_entries((0..60).map(EntryId).collect());
@@ -838,6 +870,7 @@ fn base291_playlist_focus_buttons_scroll_and_skin_colours() {
 
 #[test]
 fn base291_missing_sheet_is_local_documented_fallback() {
+    skip_without_skin!();
     struct WithoutTitle(ArchiveSource);
     impl SkinSource for WithoutTitle {
         fn read_any(&mut self, base: &str, exts: &[&str]) -> Option<rustamp_skin::SkinFile> {
@@ -881,6 +914,7 @@ fn base291_missing_sheet_is_local_documented_fallback() {
 
 #[test]
 fn base291_shipped_extended_digits_are_selected_without_sheet_aliases() {
+    skip_without_skin!();
     struct WithExtended {
         base: ArchiveSource,
         digits: rustamp_skin::SkinFile,
@@ -950,6 +984,7 @@ fn base291_shipped_extended_digits_are_selected_without_sheet_aliases() {
 
 #[test]
 fn base291_held_toggles_and_slider_sprites_follow_real_mouse_state() {
+    skip_without_skin!();
     let skin = skin();
     let layout = MainWindowLayout::CLASSIC;
     for (widget, name, rect) in [
@@ -1047,6 +1082,7 @@ fn base291_held_toggles_and_slider_sprites_follow_real_mouse_state() {
 
 #[test]
 fn base291_playlist_shade_and_held_title_controls_use_pledit() {
+    skip_without_skin!();
     let skin = skin();
     for shade in [false, true] {
         for focused in [false, true] {
@@ -1159,6 +1195,7 @@ fn assert_row_is_pure(frame: &Image, i: usize, pitch: i32, ink: [u8; 3], bg: [u8
 
 #[test]
 fn base291_playlist_font_is_the_requested_system_family_not_text_bmp() {
+    skip_without_skin!();
     let skin = skin();
     let different_bitmap = memory_skin("Arial", true);
     let courier = memory_skin("Courier New", false);
@@ -1188,6 +1225,7 @@ fn base291_playlist_font_is_the_requested_system_family_not_text_bmp() {
 /// style flags are read from the same line (see `rustamp_skin::pledit`).
 #[test]
 fn base291_playlist_font_size_comes_from_the_pledit_line() {
+    skip_without_skin!();
     let mut window = PlaylistWindow::new();
     window.set_entries(vec![EntryId(1), EntryId(2)]);
     let labels = vec!["1. Mixed Case WWW iii".into(), "2. Track Title".into()];
@@ -1215,6 +1253,7 @@ fn base291_playlist_font_size_comes_from_the_pledit_line() {
 /// fallback chain ends at the default family.
 #[test]
 fn base291_playlist_font_falls_back_when_the_family_is_missing() {
+    skip_without_skin!();
     let mut window = PlaylistWindow::new();
     window.set_entries(vec![EntryId(1)]);
     let labels = vec!["1. Mixed Case WWW iii".into()];
@@ -1252,6 +1291,7 @@ fn base291_playlist_font_falls_back_when_the_family_is_missing() {
 /// band's corner, body and right cells.
 #[test]
 fn base291_playlist_matches_the_reference_captures() {
+    skip_without_skin!();
     let root = std::path::PathBuf::from(
         std::env::var_os("RUSTAMP_BASE291_CAPTURES")
             .unwrap_or_else(|| "D:/code/rustamp-testcaptures/base291".into()),
@@ -1330,6 +1370,7 @@ fn base291_playlist_matches_the_reference_captures() {
 /// the references are files, the other side is this renderer's output.
 #[test]
 fn base291_equalizer_matches_the_reference_captures() {
+    skip_without_skin!();
     let root = std::path::PathBuf::from(
         std::env::var_os("RUSTAMP_BASE291_CAPTURES")
             .unwrap_or_else(|| "D:/code/rustamp-testcaptures/base291".into()),
@@ -1431,6 +1472,7 @@ fn base291_vm_presented_pixels_match_reference_captures() {
 
 #[test]
 fn base291_slider_frames_blank_readouts_and_visualization_palette() {
+    skip_without_skin!();
     use rustamp_ui::visualization::{SPECTRUM_BANDS, VisInput, VisMode, VisState, slots};
     let skin = skin();
     let layout = MainWindowLayout::CLASSIC;
