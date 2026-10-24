@@ -21,9 +21,16 @@ param([string]$Mode = 'normal')
 
 $ErrorActionPreference = 'Stop'
 
-if ($Mode -notin @('normal', 'refused', 'cut')) {
-    throw "mode must be 'normal', 'refused', or 'cut', got '$Mode'"
+# '-run' modes start the player WITHOUT the URL, wait for its windows, then
+# hand the URL to the running instance: a failing stream then cannot take the
+# only window down with it (the 2026-10-21/24 runs of 'refused' and 'cut'
+# ended the process within ~1.5 s with no window at all).
+# 'slow' answers normally but waits 3 s before sending the headers, so the
+# connect/request/response phases last long enough to be photographed.
+if ($Mode -notin @('normal', 'refused', 'cut', 'slow', 'refused-run', 'cut-run')) {
+    throw "mode must be normal, refused, cut, slow, refused-run or cut-run, got '$Mode'"
 }
+$ServerMode = $Mode -replace '-run$', ''
 
 $OutRoot = 'C:\rustamp\out'
 $JobName = "transfer-$Mode"
@@ -130,6 +137,11 @@ try {
             continue
         }
 
+        if ($Mode -eq 'slow') {
+            "$(Get-Date -Format 'HH:mm:ss.fff') SLOW: waiting 3 s before the headers" | Out-File -FilePath $LogPath -Encoding UTF8 -Append
+            Start-Sleep -Seconds 3
+        }
+
         # Send headers
         try {
             $resp.ProtocolVersion = New-Object Version(1,0)
@@ -202,8 +214,8 @@ $audioBytesPath = Join-Path $OutDir 'audio.bin'
 
 # Start server in a separate process (unless refused mode)
 $serverProc = $null
-if ($Mode -ne 'refused') {
-    $serverArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$serverScriptPath`" -Mode $Mode -Port $serverPort -AudioBytesPath `"$audioBytesPath`" -ContentLength $contentLength -LogPath `"$serverLogPath`""
+if ($ServerMode -ne 'refused') {
+    $serverArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$serverScriptPath`" -Mode $ServerMode -Port $serverPort -AudioBytesPath `"$audioBytesPath`" -ContentLength $contentLength -LogPath `"$serverLogPath`""
     $serverProc = Start-Process -FilePath 'powershell.exe' -ArgumentList $serverArgs -WindowStyle Hidden -PassThru
     Log "Started HTTP server process ID $($serverProc.Id) on port $serverPort"
     Start-Sleep -Seconds 2  # Give it time to start
@@ -359,7 +371,16 @@ public static class Win32 {
 
     # Launch Winamp with the streaming URL, using /NOREG to skip setup wizard
     Log "Launching Winamp with URL: `$StreamUrl"
-    `$proc = Start-Process -FilePath `$WinampPath -ArgumentList "/NOREG", `$StreamUrl -PassThru -WorkingDirectory (Split-Path `$WinampPath)
+    if (`$Mode -like '*-run') {
+        `$proc = Start-Process -FilePath `$WinampPath -ArgumentList "/NOREG" -PassThru -WorkingDirectory (Split-Path `$WinampPath)
+        Start-Sleep -Seconds 3
+        `$alive = Get-Process -Id `$proc.Id -ErrorAction SilentlyContinue
+        Log "First instance after 3 s: pid `$(`$proc.Id) alive=`$([bool]`$alive) hasExited=`$(if (`$alive) { `$alive.HasExited } else { 'n/a' }) mainWindow='`$(if (`$alive) { `$alive.MainWindowTitle } else { '' })'"
+        Log "Handing the URL to the running instance"
+        Start-Process -FilePath `$WinampPath -ArgumentList "/NOREG", `$StreamUrl -WorkingDirectory (Split-Path `$WinampPath) | Out-Null
+    } else {
+        `$proc = Start-Process -FilePath `$WinampPath -ArgumentList "/NOREG", `$StreamUrl -PassThru -WorkingDirectory (Split-Path `$WinampPath)
+    }
     `$winampPid = `$proc.Id
     Log "Winamp PID: `$winampPid"
 

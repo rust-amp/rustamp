@@ -85,3 +85,48 @@ Contains no code and no text copied from the reference's binaries or SDK: the
 bracketed words are what a screenshot shows. The auditor should confirm that,
 and decide whether the prefixes belong in S19 §2 or in a new section on the
 marquee (S02 owns the marquee).
+
+## Update, same day: the runs that were asked for (slow, refused, cut)
+
+New harness modes (`measure-transfer.ps1`): `slow` (the server waits 3 s before
+the headers), `refused-run` and `cut-run` (the player starts **without** the
+URL and is handed the URL once its windows exist, because with the URL on the
+command line a refused or cut stream ended the whole process within ~1.5 s and
+left nothing to observe). Frames at ~10 Hz plus the OS title of every window
+at every step (`inner-transcript.txt` of each job).
+
+**The same status words appear in the OS title bar**, in a different case, as
+a bracketed prefix between the index and the title: `1. [Connecting]
+http://...`, `1. [reading id3] http://...`, `1. [Buffer: N%] stream.mp3`.
+So claim 7 above ("window titles only ever changed by...") was **wrong** and
+is withdrawn: the earlier title polling had simply run too late.
+
+Per mode, in order (distinct states, 10 Hz):
+
+| mode | states seen |
+|---|---|
+| normal | bare URL (~0.2 s) -> `[reading id3]` -> `[Buffer: N%]` (the long phase) -> plain title -> `[Stopped]` suffix |
+| slow (3 s before the headers) | `[Connecting]` (about the 3 s of the delay and more) -> `[reading id3]` -> `[Buffer: N%]` -> plain title -> `[Stopped]` |
+| refused (handed to a running player) | `[Connecting]` (~1.5 s) -> `[could not connect]`, which **stays**; the entry stays in the list and the player is `[Stopped]`. The marquee shows `[COULD NOT CONNECT]` in capitals with the URL, and repeats with a ` *** ` separator |
+| cut (10 % of the body, then close) | `[Connecting]` -> `[HTTP/1.1 200 OK]` which **stays** for the rest of the run: the server's **status line** is the prefix once the transfer ended early |
+
+New facts:
+
+* **Marquee separator:** the scrolling line wraps with a gap of ` *** `.
+* **Case:** the marquee shows the prefixes in capitals (the skin's font is
+  capitals-only); the OS title bar keeps the original case. The original case
+  is `Connecting`, `reading id3`, `Buffer: N%`, `could not connect`,
+  `HTTP/1.1 200 OK` (the last one is the server's own text).
+* **Command-line vs running:** a stream given on the command line that refuses
+  the connection **ends the player's process within ~1.5 s**, with no window
+  left to read (also for the cut case). Handed to a running player, the same
+  streams leave the player alive and show the prefixes above.
+* S19 §2's ten texts are **still not seen** anywhere, even with a 3 s server
+  delay; the prefixes are what the reference shows while a stream runs.
+
+Answers to the questions above: 1. partly - set seen is {`Connecting`,
+`reading id3`, `Buffer: N%`, `could not connect`, a server status line}; a
+lost connection mid-play is not yet exercised. 4. answered for a slow connect
+(no §2 text). 2, 3, 5, 6 remain open.
+
+The frames and transcripts stay under `D:\codeustamp-vm\staging\out	ransfer-*`.

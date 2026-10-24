@@ -1,4 +1,4 @@
-# Stage and run the transfer display measurement in the guest.
+﻿# Stage and run the transfer display measurement in the guest.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File docs\notes\vm-run-measure-transfer.ps1 [-Baseline base-provisioned]
@@ -18,7 +18,8 @@ param(
     [string]$BuiltTree = 'D:\code\rustamp-vm\staging\code\Rustamp',
     [string]$SkinDir = 'D:\code\rustamp-testskins',
     [string]$StageRoot = 'D:\code\rustamp-vm\staging',
-    [int]$TimeoutSeconds = 3600
+    [int]$TimeoutSeconds = 3600,
+    [ValidateSet('normal', 'refused', 'cut', 'slow', 'refused-run', 'cut-run')][string[]]$Modes = @('normal', 'refused', 'cut')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -113,7 +114,7 @@ if (Test-Path $mediaStage) {
 
 
 # --- 6. Run three modes ---
-$modes = @('normal', 'refused', 'cut')
+$modes = @($Modes)
 $allResults = @()
 $allProvenance = @()
 
