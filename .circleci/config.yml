@@ -13,6 +13,20 @@ orbs:
   win: circleci/windows@5.0
 
 commands:
+  fetch_source:
+    description: >-
+      HTTPS checkout. The built-in `checkout` clones over SSH with a deploy key
+      whose format the Windows OpenSSH cannot load (libcrypto: unsupported).
+    steps:
+      - run:
+          name: Checkout (HTTPS)
+          command: |
+            set -eu
+            : "${GITLAB_TOKEN:?set GITLAB_TOKEN in the project settings}"
+            git clone --quiet "https://oauth2:${GITLAB_TOKEN}@gitlab.com/rustamp/rustamp.git" .
+            git checkout --quiet "${CIRCLE_TAG:-$CIRCLE_SHA1}"
+            git remote set-url origin https://gitlab.com/rustamp/rustamp.git
+
   rust:
     description: Install Rust (stable, MSVC, plus the i686 target) once per job.
     steps:
@@ -39,7 +53,7 @@ jobs:
       size: large
       shell: bash.exe
     steps:
-      - checkout
+      - fetch_source
       - rust
       - run:
           name: Format
@@ -76,7 +90,7 @@ jobs:
       size: large
       shell: bash.exe
     steps:
-      - checkout
+      - fetch_source
       - rust
       - run:
           name: Package (release build + portable zip)
