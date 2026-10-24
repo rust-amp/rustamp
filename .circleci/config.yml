@@ -133,8 +133,14 @@ jobs:
               links="$links{\"name\":\"$name\",\"url\":\"$url\",\"link_type\":\"package\"},"
             done
             body="{\"tag_name\":\"$tag\",\"name\":\"Rustamp $tag\",\"description\":\"Portable Windows build ($tag). Unzip anywhere; no installer. Verify the .sha256 next to the zip.\",\"assets\":{\"links\":[${links%,}]}}"
-            curl --fail -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-              -H "Content-Type: application/json" -d "$body" "$api/releases"
+            code=$(curl -sS -o release.json -w '%{http_code}' -X POST \n              -H "PRIVATE-TOKEN: $GITLAB_TOKEN" -H "Content-Type: application/json" \n              -d "$body" "$api/releases")
+            if [ "$code" = 409 ]; then
+              # A re-run of the same tag: the release and its asset links exist;
+              # the packages above were replaced under the same URLs.
+              echo "release $tag already exists, keeping it"
+            elif [ "$code" != 201 ]; then
+              cat release.json; exit 1
+            fi
 
 workflows:
   test-every-push:
