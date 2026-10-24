@@ -2104,8 +2104,17 @@ mod tests {
         lib.scan(root).unwrap();
         let id_before = only_row(&lib).id;
 
-        // Rewrite the tags. No sleep: change detection uses nanoseconds.
+        // Rewrite the tags. The new title is one byte longer, but the size is
+        // not what this test is about: a filesystem with a coarse clock (the
+        // CI Windows image) gives both writes the same mtime, so the mtime is
+        // moved forward explicitly instead of trusting the clock.
         write_fixture_tags(&a, "Song A2", "Artist X", "Album 1");
+        let file = fs::OpenOptions::new().write(true).open(&a).unwrap();
+        file.set_modified(
+            file.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        drop(file);
         let rep = lib.scan(root).unwrap();
         assert_eq!(rep.updated, 1);
         assert_eq!(rep.added, 0);
