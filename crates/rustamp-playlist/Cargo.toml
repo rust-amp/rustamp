@@ -1,0 +1,12 @@
+[package]
+name = "rustamp-playlist"
+description = "Rustamp: Playlist behaviors on top of the core model: shuffle (S15), one-shot randomize, M3U/M3U8/PLS/XSPF I/O (B4S is recognized and rejected, not implemented)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true

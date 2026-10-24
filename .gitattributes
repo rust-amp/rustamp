@@ -1,0 +1,5 @@
+* text=auto
+
+*.bmp binary
+*.wsz binary
+*.png binary

@@ -1,0 +1,19 @@
+[package]
+name = "rustamp-dsp"
+description = "Rustamp: Winamp-style 10-band equalizer and preamp (spec S07), limiter and output fade, as DspStage implementations."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true
+
+[dev-dependencies]
+# The S09 anchor tests reuse the measured dB -> 0..63 conversion, which now
+# lives beside `EqState` in `rustamp-proto` (RFC 0011) instead of in the
+# plugin host. Test-only, so it stays a dev-dependency.
+rustamp-proto.workspace = true
+

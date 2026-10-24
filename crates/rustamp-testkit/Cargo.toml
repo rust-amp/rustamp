@@ -1,0 +1,16 @@
+[package]
+name = "rustamp-testkit"
+description = "Rustamp: headless image comparison and golden-test helpers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+png.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

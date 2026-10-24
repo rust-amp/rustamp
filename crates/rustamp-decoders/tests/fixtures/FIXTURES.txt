@@ -1,0 +1,22 @@
+Fixtures are 1.5 s, 440 Hz, 44.1 kHz stereo sine waves generated with ffmpeg
+(never downloaded). Regenerate with, from this directory:
+
+S="-f lavfi -i sine=frequency=440:duration=1.5:sample_rate=44100 -ac 2 -y"
+M='-metadata title="Sine Title" -metadata artist="Test Artist" -metadata album="Test Album" -metadata date=2001 -metadata genre=Test'
+ffmpeg $S -c:a flac $M -metadata comment=hello -metadata track=3 sine.flac
+ffmpeg $S -c:a libmp3lame -b:a 64k $M -metadata track=3/9 sine.mp3
+ffmpeg $S -c:a libvorbis -q:a 1 -metadata title="Sine Title" -metadata artist="Test Artist" sine.ogg
+ffmpeg $S -c:a aac -b:a 64k sine_aac.m4a
+ffmpeg $S -c:a alac sine_alac.m4a
+
+WAV and AIFF test inputs are generated in memory by the tests.
+
+The Opus fixture is the same sine wave, but at 48 kHz - the rate Opus always
+runs at - and it carries the same two tags:
+
+ffmpeg -f lavfi -i sine=frequency=440:duration=1.5:sample_rate=48000 -ac 2 -c:a libopus -b:a 96k -metadata title="Sine Title" -metadata artist="Test Artist" sine.opus
+
+The Matroska fixture holds the same encoded stream in a Matroska container,
+so the two files decode to the same samples:
+
+ffmpeg -f lavfi -i sine=frequency=440:duration=1.5:sample_rate=48000 -ac 2 -c:a libopus -b:a 96k sine_opus.mkv

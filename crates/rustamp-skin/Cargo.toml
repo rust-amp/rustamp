@@ -1,0 +1,18 @@
+[package]
+name = "rustamp-skin"
+description = "Rustamp: Skin loading (.wsz/.zip/folders), BMP decoding, pledit.txt, viscolor.txt, region.txt, cursors, default-skin fallback and sprite tables."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core.workspace = true
+zip.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rustamp-gfx.workspace = true

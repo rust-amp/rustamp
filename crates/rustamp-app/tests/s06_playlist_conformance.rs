@@ -1,0 +1,366 @@
+// Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
+//! S06 conformance at the app seam: the rules the model alone cannot carry.
+//!
+//! `rustamp-ui`'s `s06_playlist_conformance.rs` pins the model and the
+//! renderer. The cases here pin what only the app can enforce: that the
+//! settled click and arrow points **reach** the model, that the buttons
+//! **open** the dialogs and the popup the spec names, and that the removal
+//! reaches the engine queue.
+//!
+//! The spec's facts under test (S06 §2, §3, §4, §5):
+//!
+//! * §2 - the single click at (60,28) selects the first visible row; SEL at
+//!   (74,92) selects all visible rows.
+//! * §3 - the arrows at (263,81) and (263,87) move the view by one page of
+//!   four rows, and a dragged handle moves the view, not a selection.
+//! * §4 - ADD at (23,92) opens "Add file(s) to playlist", LIST OPTS at
+//!   (242,92) opens "Load Playlist", MISC at (110,92) opens the `#32768`
+//!   popup.
+//! * §5 - REM at (46,92) removes the staged entry, with no menu choice
+//!   required, and leaves the list renumbered.
+//!
+//! No window is opened: the app runs on the null output.
+
+use std::path::PathBuf;
+
+use rustamp_app::app::{App, AppOptions};
+use rustamp_app::cli::OutputChoice;
+use rustamp_core::command::{Command, OpenMediaKind, SelectOp};
+use rustamp_core::config::Config;
+use rustamp_core::playlist::{EntryId, MediaLocation};
+use rustamp_ui::playlist_window::scroll_offset_for_handle_y;
+use rustamp_ui::{DialogKind, Modifiers};
+
+/// The headless app the cases drive (null output, no window).
+fn test_app() -> App {
+    let options = AppOptions {
+        config: Config::default(),
+        skin: rustamp_app::skin::builtin(),
+        output: OutputChoice::Null,
+        volume: 200,
+        media: None,
+        seconds: None,
+    };
+    App::new(options).expect("the test app builds headless")
+}
+
+/// Grows the engine queue (no decoding: the queue only stores) so the app
+/// assigns the stable entry ids the playlist shows.
+fn add_entries(app: &mut App, n: u32) {
+    let items = (0..n)
+        .map(|i| MediaLocation::File(PathBuf::from(format!("track{i}.mp3"))))
+        .collect::<Vec<_>>();
+    app.submit(Command::AddItems {
+        items,
+        at: None,
+        play: false,
+    })
+    .expect("AddItems applies");
+}
+
+/// S06 §2: the settled click at (60,28) reaches the model and selects
+/// exactly one row - the first visible one.
+#[test]
+fn s06_section_2_the_settled_click_selects_one_row_through_the_app() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    let commands = app
+        .playlist_mouse_down(60, 28, Modifiers::NONE)
+        .expect("the click applies");
+    assert_eq!(
+        commands,
+        vec![Command::Select(SelectOp::Set(vec![EntryId(0)]))]
+    );
+    assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+    assert_eq!(app.playlist().selected_ids().len(), 1);
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §2: SEL at (74,92) selects exactly the visible rows - the four rows of
+/// the page, not the whole list.
+#[test]
+fn s06_section_2_sel_selects_the_visible_rows_through_the_app() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    let commands = app
+        .playlist_mouse_down(74, 92, Modifiers::NONE)
+        .expect("SEL applies");
+    let visible = vec![EntryId(0), EntryId(1), EntryId(2), EntryId(3)];
+    assert_eq!(
+        commands,
+        vec![Command::Select(SelectOp::Set(visible.clone()))]
+    );
+    assert_eq!(app.playlist().selected_ids(), visible);
+    assert_eq!(app.playlist().selected_ids().len(), 4);
+    assert_ne!(app.playlist().selected_ids().len(), app.playlist().len());
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §3: the settled arrow points move the view by one page of four rows,
+/// at the top, in the middle and at the end of the list.
+#[test]
+fn s06_section_3_the_settled_arrow_points_page_the_view() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    // The down arrow at (263,87): one page.
+    app.playlist_mouse_down(263, 87, Modifiers::NONE)
+        .expect("the down arrow applies");
+    assert_eq!(app.playlist().first_visible(), 4);
+    // The up arrow at (263,81): one page back.
+    app.playlist_mouse_down(263, 81, Modifiers::NONE)
+        .expect("the up arrow applies");
+    assert_eq!(app.playlist().first_visible(), 0);
+    // In the middle: seven pages down is row 29 (the spec's own reading of
+    // the first visible row), and one page up is row 25.
+    for _ in 0..7 {
+        app.playlist_mouse_down(263, 87, Modifiers::NONE)
+            .expect("the down arrow applies");
+    }
+    assert_eq!(app.playlist().first_visible(), 28);
+    app.playlist_mouse_down(263, 81, Modifiers::NONE)
+        .expect("the up arrow applies");
+    assert_eq!(app.playlist().first_visible(), 24);
+    // At the end of the list: the down arrow is clamped at the bottom page.
+    for _ in 0..30 {
+        app.playlist_mouse_down(263, 87, Modifiers::NONE)
+            .expect("the down arrow applies");
+    }
+    assert_eq!(app.playlist().first_visible(), 56);
+    assert_eq!(app.playlist().visible_ids().len(), 4);
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §3: a dragged handle **moves the view, not a selection**, and the
+/// drag reaches the model through the app's own pointer routing.
+///
+/// The handle's positions are settled (S01 §4.2: y = 20 at the scroll top and
+/// y = 60 at the bottom of a 60-entry list), so the pixel-to-row mapping is
+/// this implementation's own choice - the one
+/// [`scroll_offset_for_handle_y`] owns. What the spec settles is the effect:
+/// the view follows the handle and the selection stays where it was.
+#[test]
+fn s06_section_3_the_handle_drag_moves_the_view_through_the_app() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    // One row staged (S06 §2's click), so the selection can be watched.
+    app.playlist_mouse_down(60, 28, Modifiers::NONE)
+        .expect("the click applies");
+    assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+
+    // At the scroll top the handle sits at the top of the track (S01 §4.2).
+    let commands = app
+        .playlist_mouse_down(263, 20, Modifiers::NONE)
+        .expect("the handle applies");
+    assert!(commands.is_empty(), "the scrollbar sends no command");
+    assert_eq!(
+        app.playlist().first_visible(),
+        0,
+        "the press did not move it"
+    );
+
+    // The drag to the bottom of the track moves the view ...
+    app.playlist_mouse_move(263, 60);
+    assert_eq!(
+        app.playlist().first_visible(),
+        scroll_offset_for_handle_y(60, app.playlist().len(), app.playlist().row_pitch())
+    );
+    assert_eq!(app.playlist().first_visible(), 56, "the bottom page");
+    assert_eq!(app.playlist().visible_ids()[0], EntryId(56));
+    // ... and the selection stays where it was.
+    assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+
+    // The release ends the drag and sends nothing.
+    let commands = app.playlist_mouse_up(263, 60).expect("the release applies");
+    assert!(commands.is_empty());
+    assert_eq!(app.playlist().first_visible(), 56);
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §3: the drag clamps at both ends of the track - the view never leaves
+/// the list, whatever the pointer does.
+#[test]
+fn s06_section_3_the_handle_drag_clamps_at_the_ends_of_the_track() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    app.playlist_mouse_down(263, 20, Modifiers::NONE)
+        .expect("the handle applies");
+    // Far above the track: the view is at the top of the list.
+    app.playlist_mouse_move(263, -400);
+    assert_eq!(app.playlist().first_visible(), 0);
+    // Far below the track: the view is at the bottom page, and no further.
+    app.playlist_mouse_move(263, 4_000);
+    assert_eq!(app.playlist().first_visible(), 56);
+    // The offset never leaves the list's range.
+    for y in -20..120 {
+        app.playlist_mouse_move(263, y);
+        assert!(app.playlist().first_visible() <= 56);
+    }
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §2/§8 Q6: the list gestures survive the scrollbar wiring - a click on
+/// a row still selects it and a drag of the selection still reorders it.
+#[test]
+fn s06_section_3_the_list_gestures_survive_the_scrollbar_wiring() {
+    let mut app = test_app();
+    add_entries(&mut app, 4);
+    // A click on a row still selects exactly that row (S06 §2).
+    let commands = app
+        .playlist_mouse_down(60, 42, Modifiers::NONE)
+        .expect("the click applies");
+    assert_eq!(
+        commands,
+        vec![Command::Select(SelectOp::Set(vec![EntryId(1)]))]
+    );
+    assert_eq!(app.playlist().selected_ids(), vec![EntryId(1)]);
+    // A drag of the selection still reorders it (S06 §8 Q6, own choice).
+    app.playlist_mouse_move(60, 74);
+    let commands = app.playlist_mouse_up(60, 74).expect("the drop applies");
+    assert_eq!(
+        commands,
+        vec![Command::MoveEntries {
+            ids: vec![EntryId(1)],
+            to: 3
+        }]
+    );
+    assert_eq!(
+        app.playlist().visible_ids(),
+        vec![EntryId(0), EntryId(2), EntryId(3), EntryId(1)]
+    );
+    assert!(app.drain_notes().is_empty());
+}
+
+/// A press on the scrollbar **track** pages the view.
+///
+/// **Own choice**: S06 §3 settles the two arrow points and the handle drag
+/// and says nothing about the track. This is the usual track behaviour - one
+/// page up above the handle, one page down below it - and it uses the same
+/// one-page step the arrows use.
+#[test]
+fn the_scrollbar_track_pages_the_view() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    // At the scroll top the handle is at the top of the track, so a press
+    // below it pages down.
+    let commands = app
+        .playlist_mouse_down(263, 60, Modifiers::NONE)
+        .expect("the track applies");
+    assert!(commands.is_empty(), "the scrollbar sends no command");
+    assert_eq!(app.playlist().first_visible(), 4);
+    // Below the handle: one page down.
+    app.playlist_mouse_down(263, 70, Modifiers::NONE)
+        .expect("the track applies");
+    assert_eq!(app.playlist().first_visible(), 8);
+    // Above the handle: one page up.
+    app.playlist_mouse_down(263, 21, Modifiers::NONE)
+        .expect("the track applies");
+    assert_eq!(app.playlist().first_visible(), 4);
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §4: ADD opens the **"Add file(s) to playlist"** dialog and LIST OPTS
+/// opens **"Load Playlist"** - the settled titles, read from the reference's
+/// window metadata.
+#[test]
+fn s06_section_4_add_and_list_opts_open_the_settled_dialogs() {
+    let mut app = test_app();
+    add_entries(&mut app, 3);
+    // ADD at (23,92).
+    let commands = app
+        .playlist_mouse_down(23, 92, Modifiers::NONE)
+        .expect("ADD applies");
+    assert_eq!(
+        commands,
+        vec![Command::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        }]
+    );
+    let dialog = app
+        .dialog_open_kind()
+        .expect("the add dialog is open (S06 §4)");
+    assert_eq!(
+        dialog,
+        DialogKind::OpenMedia {
+            kind: OpenMediaKind::Files,
+            play: false,
+        }
+    );
+    assert_eq!(dialog.title(), "Add file(s) to playlist");
+
+    // LIST OPTS at (242,92).
+    let commands = app
+        .playlist_mouse_down(242, 92, Modifiers::NONE)
+        .expect("LIST OPTS applies");
+    assert_eq!(commands, vec![Command::OpenPlaylist]);
+    let dialog = app
+        .dialog_open_kind()
+        .expect("the load-playlist dialog is open (S06 §4)");
+    assert_eq!(dialog, DialogKind::LoadPlaylist);
+    assert_eq!(dialog.title(), "Load Playlist");
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §4: MISC opens the **`#32768` popup** - a request the presenter
+/// takes, not a command the player sends.
+#[test]
+fn s06_section_4_misc_requests_the_popup() {
+    let mut app = test_app();
+    add_entries(&mut app, 3);
+    assert!(!app.take_playlist_misc_menu(), "no popup is pending");
+    let commands = app
+        .playlist_mouse_down(110, 92, Modifiers::NONE)
+        .expect("MISC applies");
+    assert!(commands.is_empty(), "the popup is not a command");
+    assert!(app.take_playlist_misc_menu(), "the popup was requested");
+    assert!(!app.take_playlist_misc_menu(), "the request is taken once");
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §5: REM at (46,92) removes the staged entry, **with no menu choice
+/// required** (§5.2), and the list renumbers after it (§5.4).
+#[test]
+fn s06_section_5_rem_removes_the_staged_entry_without_a_menu() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    // One row staged (S06 §5.3's staged selection).
+    app.playlist_mouse_down(60, 28, Modifiers::NONE)
+        .expect("the click applies");
+    assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+
+    // REM at (46,92).
+    let commands = app
+        .playlist_mouse_down(46, 92, Modifiers::NONE)
+        .expect("REM applies");
+    assert_eq!(commands, vec![Command::Remove(vec![EntryId(0)])]);
+    // No popup and no dialog were involved in the removal (§5.2).
+    assert!(!app.take_playlist_misc_menu());
+    assert_eq!(app.dialog_open_kind(), None);
+
+    // The after-state: the queue, the id table and the model all lost the
+    // entry, the selection is gone and the list renumbered.
+    assert_eq!(app.engine().queue().len(), 59);
+    assert_eq!(app.playlist().len(), 59);
+    assert!(app.playlist().selected_ids().is_empty());
+    assert_eq!(
+        app.playlist().visible_ids(),
+        vec![EntryId(1), EntryId(2), EntryId(3), EntryId(4)],
+        "the rows below the removed one shift up"
+    );
+    assert!(app.drain_notes().is_empty());
+}
+
+/// S06 §5.3: without a staged selection the button is a no-op - the
+/// reference's unstaged REM click changed **0 px**.
+#[test]
+fn s06_section_5_rem_without_a_staged_selection_changes_nothing() {
+    let mut app = test_app();
+    add_entries(&mut app, 60);
+    let commands = app
+        .playlist_mouse_down(46, 92, Modifiers::NONE)
+        .expect("REM applies");
+    assert!(commands.is_empty());
+    assert_eq!(app.engine().queue().len(), 60);
+    assert_eq!(app.playlist().len(), 60);
+    assert!(app.drain_notes().is_empty());
+}

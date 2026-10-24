@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  licenses:
+    name: Permissive crates stay GPL-free (required)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Python (standard library license auditor)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # A fresh checkout has a lockfile, not cached package manifests.
+      # This is the explicit network step; the actual audit stays offline.
+      - name: Fetch locked dependency manifests
+        run: cargo fetch --locked
+
+      # RFC 0004 acceptance 4, the load-bearing invariant of the licensing
+      # split: proto, plugin-abi, ipc, plughost and mediahost are permissive.
+      # Discover any additional permissive members; check normal closures with
+      # all features on both Windows targets and the complete lock inventory.
+      # Metadata never builds; the i686 target's std is not needed here.
+      - name: Check the permissive crates' dependency closures
+        shell: bash
+        run: bash .github/scripts/check-permissive-licenses.sh
+
+      - name: Check license auditor failure paths (metadata fixtures only)
+        run: python .github/scripts/check-license-audit.py
+
+  windows:
+    name: Windows (required)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: i686-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      - name: Build plugin host (i686)
+        run: cargo build -p rustamp-plughost --target i686-pc-windows-msvc
+
+  linux:
+    name: Linux (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace
+        run: cargo check --workspace

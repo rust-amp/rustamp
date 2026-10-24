@@ -1,0 +1,1103 @@
+//! Headless in-process protocol/worker tests. Run in the test VM, not the host.
+//! Channel byte streams exercise production framing and the real ring/wake API.
+
+#[path = "support/frame_pattern.rs"]
+mod frame_pattern;
+#[path = "support/resident.rs"]
+mod resident;
+
+use std::collections::HashMap;
+use std::io::{Cursor, Read, Write};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use rustamp_ipc::shm::{
+    AnonymousRegion, RING_DATA_OFFSET, RingConsumer, RingDirection, RingError, RingKind,
+    RingProducer, RingWake,
+};
+use rustamp_ipc::{Message, StreamTransport, Transport};
+use rustamp_mediahost::control::{ControlPeer, Liveness};
+use rustamp_mediahost::decoder::{
+    DecoderInfo, DecoderResident, DecoderSession, ResidentDecoder, serve_decoder,
+};
+use rustamp_mediahost::pcm::{CloseRing, PcmInput, PcmOffer, PcmRings, check_offer};
+use rustamp_mediahost::{MediaHostError, Result};
+use rustamp_proto::host::{MediaLocationWire, PcmSpecWire};
+
+/// Stall bound for every wait that waits on the host worker: the M10
+/// flakiness note's sanctioned form — a bound so generous that only a real
+/// stall reaches it, with the message saying which. A timeout is always a
+/// loud failure that names the step, never a pass.
+const STALL_WAIT: Duration = Duration::from_secs(30);
+/// Liveness policy for the in-process control peers. The framework default
+/// (`Liveness::default()`: 100 ms interval, 5 s timeout) is a wall-clock
+/// bound a healthy-but-slow VM schedule can trip — the flake class M24
+/// proved in this guest and fixed in the dechost/audio/dsphost suites
+/// (M24 §1.3, M25). A dead resident never answers a Ping and is caught by
+/// the control EOF regardless, so only the trip wire moves.
+const LIVENESS: Liveness = Liveness {
+    interval: Duration::from_millis(100),
+    timeout: STALL_WAIT,
+};
+
+struct ByteReader {
+    rx: mpsc::Receiver<Vec<u8>>,
+    bytes: Cursor<Vec<u8>>,
+}
+struct ByteWriter(mpsc::Sender<Vec<u8>>);
+
+impl Read for ByteReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let count = self.bytes.read(out)?;
+            if count > 0 {
+                return Ok(count);
+            }
+            match self.rx.recv() {
+                Ok(bytes) => self.bytes = Cursor::new(bytes),
+                Err(_) => return Ok(0),
+            }
+        }
+    }
+}
+
+impl Write for ByteWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .send(bytes.to_vec())
+            .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn streams() -> ((ByteReader, ByteWriter), (ByteReader, ByteWriter)) {
+    let (a_tx, b_rx) = mpsc::channel();
+    let (b_tx, a_rx) = mpsc::channel();
+    (
+        (
+            ByteReader {
+                rx: a_rx,
+                bytes: Cursor::new(Vec::new()),
+            },
+            ByteWriter(a_tx),
+        ),
+        (
+            ByteReader {
+                rx: b_rx,
+                bytes: Cursor::new(Vec::new()),
+            },
+            ByteWriter(b_tx),
+        ),
+    )
+}
+
+#[derive(Clone, Default)]
+struct TestRings(Arc<Mutex<HashMap<String, AnonymousRegion>>>);
+
+impl TestRings {
+    fn create_impl(
+        &self,
+        spec: PcmSpecWire,
+        capacity: u32,
+        direction: RingDirection,
+    ) -> Result<PcmOffer<AnonymousRegion>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let size = RING_DATA_OFFSET + spec.frame_size() as usize * capacity as usize;
+        let region = AnonymousRegion::new(size)?;
+        let producer =
+            RingProducer::create(region.clone(), RingKind::Pcm, spec.frame_size(), capacity)?;
+        let name = format!(
+            "mediahost-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let producer = producer.with_wake(RingWake::create(&name)?);
+        let abort = RingConsumer::attach(region.clone(), producer.expect())?
+            .with_wake(RingWake::open(&name)?);
+        self.0.lock().unwrap().insert(name.clone(), region);
+        let message = Message::RingOffer {
+            name,
+            kind: RingKind::Pcm,
+            frame_size: spec.frame_size(),
+            capacity,
+            size: size as u64,
+            generation: producer.generation(),
+            direction,
+        };
+        Ok(PcmOffer {
+            producer,
+            message,
+            abort: Box::new(CloseRing(abort)),
+        })
+    }
+
+    fn open_impl(
+        &self,
+        offer: &Message,
+        spec: PcmSpecWire,
+        expected: RingDirection,
+    ) -> Result<PcmInput<AnonymousRegion>> {
+        // The same rules production enforces (`NamedPcmRings::open_impl`): an
+        // offer in another direction or with a foreign frame size is refused
+        // before any mapping opens, so this double cannot run a configuration
+        // the host could never create.
+        check_offer(offer, expected, spec)?;
+        let Message::RingOffer { name, .. } = offer else {
+            // `check_offer` already refused every other message.
+            return Err(MediaHostError::InvalidMessage(
+                "expected PCM RingOffer".into(),
+            ));
+        };
+        let region = self.0.lock().unwrap()[name].clone();
+        let expect = offer.ring_expect().unwrap();
+        let consumer =
+            RingConsumer::attach(region.clone(), expect)?.with_wake(RingWake::open(name)?);
+        let abort = RingConsumer::attach(region, expect)?.with_wake(RingWake::open(name)?);
+        Ok(PcmInput {
+            consumer,
+            abort: Box::new(CloseRing(abort)),
+        })
+    }
+}
+
+impl PcmRings for TestRings {
+    type Region = AnonymousRegion;
+
+    fn create(&self, spec: PcmSpecWire, capacity: u32) -> Result<PcmOffer<Self::Region>> {
+        self.create_impl(spec, capacity, RingDirection::HostToMain)
+    }
+
+    fn open(&self, offer: &Message, spec: PcmSpecWire) -> Result<PcmInput<Self::Region>> {
+        self.open_impl(offer, spec, RingDirection::HostToMain)
+    }
+
+    fn create_directed(
+        &self,
+        spec: PcmSpecWire,
+        capacity: u32,
+        direction: RingDirection,
+    ) -> Result<PcmOffer<Self::Region>> {
+        self.create_impl(spec, capacity, direction)
+    }
+
+    fn open_directed(
+        &self,
+        offer: &Message,
+        spec: PcmSpecWire,
+        direction: RingDirection,
+    ) -> Result<PcmInput<Self::Region>> {
+        self.open_impl(offer, spec, direction)
+    }
+}
+
+/// The in-process double must enforce the direction rule production
+/// enforces: an opener refuses an offer whose direction is not the one it
+/// expects, before any mapping opens.
+///
+/// Before the rule was shared, this double opened a `MainToHost` ring on the
+/// decoder path happily, so a test could pass with a configuration the host
+/// could never create (M14 finding F4).
+#[test]
+fn test_rings_refuse_the_direction_production_refuses() {
+    let rings = TestRings::default();
+    let spec = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 2,
+    };
+
+    // The decoder path runs host -> main: the accepted direction builds and
+    // opens.
+    let offer = rings.create(spec, 1).unwrap();
+    let Message::RingOffer { direction, .. } = &offer.message else {
+        panic!("expected a ring offer");
+    };
+    assert_eq!(*direction, RingDirection::HostToMain);
+    assert!(rings.open(&offer.message, spec).is_ok());
+
+    // The refused direction: a main -> host ring on the decoder path. This is
+    // the configuration production refuses with `InvalidMessage`.
+    let backwards = rings
+        .create_directed(spec, 1, RingDirection::MainToHost)
+        .unwrap();
+    let Message::RingOffer { direction, .. } = &backwards.message else {
+        panic!("expected a ring offer");
+    };
+    assert_eq!(*direction, RingDirection::MainToHost);
+    assert!(matches!(
+        rings.open(&backwards.message, spec),
+        Err(MediaHostError::InvalidMessage(_))
+    ));
+
+    // The same ring opens when its direction is the expected one, and the
+    // host -> main ring does not open as a main -> host ring either.
+    assert!(
+        rings
+            .open_directed(&backwards.message, spec, RingDirection::MainToHost)
+            .is_ok()
+    );
+    assert!(matches!(
+        rings.open_directed(&offer.message, spec, RingDirection::MainToHost),
+        Err(MediaHostError::InvalidMessage(_))
+    ));
+}
+
+/// The error of a refused open. [`PcmInput`] is not `Debug`, so a refused
+/// result cannot be unwrapped with `unwrap_err`.
+fn refused<T>(result: Result<T>) -> MediaHostError {
+    match result {
+        Ok(_) => panic!("the open must be refused, not succeed"),
+        Err(error) => error,
+    }
+}
+
+/// The in-process double must report a foreign frame size the way production
+/// does: with the typed [`RingError::FrameSizeMismatch`], never with a
+/// panic.
+///
+/// Before the rule was shared, this double asserted the frame size with
+/// `assert_eq!`, so a mismatched offer aborted the test binary instead of
+/// reporting the error production returns (the drift wave184 closed for the
+/// ring direction).
+#[test]
+fn test_rings_refuse_the_frame_size_production_refuses() {
+    let rings = TestRings::default();
+    let spec = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 2,
+    };
+    // Mono: one channel is a 4-byte frame, the offer carries 8.
+    let mono = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 1,
+    };
+    let offer = rings.create(spec, 1).unwrap();
+
+    // The matching frame size opens.
+    assert!(rings.open(&offer.message, spec).is_ok());
+
+    // A spec with a different frame size is refused the way production
+    // refuses it, naming the size it expected and the one it found.
+    let error = refused(rings.open(&offer.message, mono));
+    assert!(
+        matches!(
+            &error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 4,
+                found: 8
+            })
+        ),
+        "a foreign frame size must be reported, not panicked: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "frame size mismatch: expected 4, found 8"
+    );
+
+    // An offer that lies about its frame size is refused with the same
+    // error, naming the spec's size as the expected one.
+    let mut lying = offer.message.clone();
+    if let Message::RingOffer { frame_size, .. } = &mut lying {
+        *frame_size = 16;
+    }
+    let error = refused(rings.open(&lying, spec));
+    assert!(
+        matches!(
+            &error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 8,
+                found: 16
+            })
+        ),
+        "a lying offer must be reported, not panicked: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "frame size mismatch: expected 8, found 16"
+    );
+}
+
+/// The double and production must answer the same offer with the same error:
+/// same variant, same message. A test may never see a different outcome
+/// than the host would produce.
+#[cfg(windows)]
+#[test]
+fn the_double_and_production_report_the_same_frame_size_mismatch() {
+    use rustamp_mediahost::pcm::NamedPcmRings;
+
+    let spec = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 2,
+    };
+    let mono = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 1,
+    };
+
+    // Production: the Windows named mapping. The refusal happens before any
+    // mapping opens, so nothing is left behind.
+    let production = NamedPcmRings.create(spec, 1).unwrap();
+    let production_error = refused(NamedPcmRings.open(&production.message, mono));
+
+    // The double: the in-process anonymous region.
+    let rings = TestRings::default();
+    let double = rings.create(spec, 1).unwrap();
+    let double_error = refused(rings.open(&double.message, mono));
+
+    assert!(
+        matches!(
+            &production_error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 4,
+                found: 8
+            })
+        ),
+        "production must report the frame size mismatch: {production_error}"
+    );
+    assert!(
+        matches!(
+            &double_error,
+            MediaHostError::Ring(RingError::FrameSizeMismatch {
+                expected: 4,
+                found: 8
+            })
+        ),
+        "the double must report the frame size mismatch: {double_error}"
+    );
+    assert_eq!(double_error.to_string(), production_error.to_string());
+}
+
+fn start(
+    mode: &str,
+    capacity: u32,
+) -> (
+    DecoderSession<TestRings>,
+    mpsc::Receiver<Result<()>>,
+    TestRings,
+) {
+    start_resident(mode, capacity, resident::StubResident)
+}
+
+fn start_resident(
+    mode: &str,
+    capacity: u32,
+    resident: impl DecoderResident + Send + 'static,
+) -> (
+    DecoderSession<TestRings>,
+    mpsc::Receiver<Result<()>>,
+    TestRings,
+) {
+    let ((ar, aw), (br, bw)) = streams();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
+    let rings = TestRings::default();
+    let host_rings = rings.clone();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        let outcome = serve_decoder(&host, &host_rings, &resident);
+        let _ = done.send(outcome);
+    });
+    let session = DecoderSession::open(
+        client,
+        rings.clone(),
+        MediaLocationWire::Url(mode.into()),
+        capacity,
+    )
+    .unwrap();
+    (session, result, rings)
+}
+
+struct GatedResident(Mutex<Option<mpsc::Receiver<()>>>);
+
+struct GatedDecoder {
+    inner: Box<dyn ResidentDecoder>,
+    release: Option<mpsc::Receiver<()>>,
+}
+
+impl DecoderResident for GatedResident {
+    fn open(&self, location: MediaLocationWire) -> Result<Box<dyn ResidentDecoder>> {
+        Ok(Box::new(GatedDecoder {
+            inner: resident::StubResident.open(location)?,
+            release: self.0.lock().unwrap().take(),
+        }))
+    }
+}
+
+impl ResidentDecoder for GatedDecoder {
+    fn info(&self) -> DecoderInfo {
+        self.inner.info()
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        if let Some(release) = self.release.take() {
+            release
+                .recv_timeout(STALL_WAIT)
+                .expect("stall: the test never released the gated decode");
+        }
+        self.inner.read(out)
+    }
+
+    fn seek(&mut self, to_ms: u64) -> Result<u64> {
+        self.inner.seek(to_ms)
+    }
+}
+
+fn finish(session: DecoderSession<TestRings>, done: mpsc::Receiver<Result<()>>) {
+    drop(session);
+    done.recv_timeout(STALL_WAIT)
+        .expect("stall: the host worker must publish its shutdown outcome instead of hanging")
+        .unwrap();
+}
+
+/// Read PCM with a stall escape. A healthy host delivers within
+/// milliseconds, so a timeout means it stopped answering without EOS or an
+/// error; that is a stall and fails loudly, never a pass.
+fn read_pcm(session: &mut DecoderSession<TestRings>, out: &mut [f32], step: &str) -> Result<usize> {
+    match session.read(out, Some(STALL_WAIT)) {
+        Err(MediaHostError::TimedOut) => panic!(
+            "stall: {step} received no PCM within {STALL_WAIT:?} \
+             (the resident stopped delivering without EOS or an error)"
+        ),
+        other => other,
+    }
+}
+
+#[test]
+fn stub_transfer_short_ring_is_exact_lossless_and_eos_is_drained() {
+    let (mut session, done, _) = start("fixture:plain", 3);
+    let mut received = Vec::new();
+    let mut out = [0.0; 22];
+    loop {
+        let frames = read_pcm(&mut session, &mut out, "the stub transfer").unwrap();
+        if frames == 0 {
+            break;
+        }
+        received.extend_from_slice(&out[..frames * 2]);
+    }
+    let expected: Vec<f32> = (0..resident::TOTAL)
+        .flat_map(|index| [index as f32 / 8.0, -(index as f32 / 8.0)])
+        .collect();
+    assert_eq!(
+        received.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+        expected.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(session.frames_dropped(), 0);
+    assert_eq!(session.stats(), (7, Some(128)));
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the sticky EOS read").unwrap(),
+        0
+    );
+    finish(session, done);
+}
+
+#[test]
+fn format_change_drains_old_pcm_before_new_channel_count() {
+    let (mut session, done, rings) = start("fixture:format", 3);
+    let mut frame = 0;
+    let mut changes = 0;
+    let mut out = [0.0; 14];
+    loop {
+        let channels = usize::from(session.info().spec.channels);
+        match read_pcm(&mut session, &mut out, "the format-change drain") {
+            Ok(0) => break,
+            Ok(frames) => {
+                for samples in out[..frames * channels].chunks_exact(channels) {
+                    assert_eq!(samples[0], frame as f32 / 8.0);
+                    if channels == 2 {
+                        assert_eq!(samples[1], -samples[0]);
+                    }
+                    frame += 1;
+                }
+            }
+            Err(MediaHostError::FormatChanged) => {
+                assert_eq!(frame, resident::CHANGE);
+                assert_eq!(session.info().spec.channels, 1);
+                changes += 1;
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+        }
+    }
+    assert_eq!(frame, resident::TOTAL);
+    assert_eq!(changes, 1);
+    assert_eq!(rings.0.lock().unwrap().len(), 2);
+    assert_eq!(session.frames_dropped(), 0);
+    finish(session, done);
+}
+
+#[test]
+fn seek_interrupts_full_ring_and_discards_prefetch() {
+    let (mut session, done, rings) = start("fixture:plain", 1);
+    assert_eq!(session.seek(29, STALL_WAIT).unwrap(), 29);
+    let mut out = [0.0; 2];
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the post-seek read").unwrap(),
+        1
+    );
+    assert_eq!(out, [29.0 / 8.0, -29.0 / 8.0]);
+    assert_eq!(rings.0.lock().unwrap().len(), 2);
+    finish(session, done);
+}
+
+#[test]
+fn bounded_read_timeout_is_not_eos_and_retry_delivers_pcm() {
+    let (release, blocked) = mpsc::channel();
+    let (mut session, done, _) =
+        start_resident("fixture:plain", 1, GatedResident(Mutex::new(Some(blocked))));
+    let mut out = [0.0; 2];
+    assert!(matches!(
+        session.read(&mut out, Some(Duration::from_millis(20))),
+        Err(MediaHostError::TimedOut)
+    ));
+    // The timeout was honest: the ring held nothing, so the wait was not a
+    // skipped wake on data the ring already had (see `RingCounters`).
+    assert_eq!(
+        session.ring_counters().available(),
+        0,
+        "a timed-out read must not have waited on data the ring already held"
+    );
+    release.send(()).unwrap();
+    assert_eq!(
+        read_pcm(
+            &mut session,
+            &mut out,
+            "the retry after the bounded timeout"
+        )
+        .unwrap(),
+        1
+    );
+    finish(session, done);
+}
+
+/// Changes telemetry only on a read that produces no PCM. The normal fixture
+/// changes it on every successful first block, which cannot catch lost final
+/// packet/format telemetry.
+struct BoundaryStatsResident;
+
+struct BoundaryStatsDecoder {
+    inner: Box<dyn ResidentDecoder>,
+    boundaries: u64,
+}
+
+impl DecoderResident for BoundaryStatsResident {
+    fn open(&self, location: MediaLocationWire) -> Result<Box<dyn ResidentDecoder>> {
+        Ok(Box::new(BoundaryStatsDecoder {
+            inner: resident::StubResident.open(location)?,
+            boundaries: 0,
+        }))
+    }
+}
+
+impl ResidentDecoder for BoundaryStatsDecoder {
+    fn info(&self) -> DecoderInfo {
+        self.inner.info()
+    }
+
+    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        let result = self.inner.read(out);
+        if matches!(result, Ok(0) | Err(MediaHostError::FormatChanged)) {
+            self.boundaries += 1;
+        }
+        result
+    }
+
+    fn seek(&mut self, to_ms: u64) -> Result<u64> {
+        self.inner.seek(to_ms)
+    }
+
+    fn stats(&self) -> (u64, Option<u32>) {
+        (self.boundaries, (self.boundaries > 0).then_some(64))
+    }
+}
+
+#[test]
+fn final_packet_statistics_arrive_before_eos_without_another_pcm_block() {
+    let (mut session, done, _) = start_resident("fixture:plain", 3, BoundaryStatsResident);
+    let mut out = [0.0; 22];
+    let mut received = 0;
+    loop {
+        let frames = read_pcm(&mut session, &mut out, "the final statistics drain").unwrap();
+        if frames == 0 {
+            break;
+        }
+        received += frames;
+    }
+    assert_eq!(received, resident::TOTAL, "statistics must not drop PCM");
+    assert_eq!(
+        session.stats(),
+        (1, Some(64)),
+        "final read telemetry was lost"
+    );
+    finish(session, done);
+}
+
+#[test]
+fn format_boundary_statistics_arrive_before_format_changed_is_returned() {
+    let (mut session, done, _) = start_resident("fixture:format", 3, BoundaryStatsResident);
+    let mut out = [0.0; 22];
+    let mut received = 0;
+    loop {
+        match read_pcm(&mut session, &mut out, "the format statistics drain") {
+            Ok(0) => panic!("EOS must not hide the format transition"),
+            Ok(frames) => received += frames,
+            Err(MediaHostError::FormatChanged) => break,
+            Err(error) => panic!("unexpected error: {error}"),
+        }
+    }
+    assert_eq!(received, resident::CHANGE);
+    assert_eq!(session.info().spec.channels, 1);
+    assert_eq!(
+        session.stats(),
+        (1, Some(64)),
+        "format read telemetry was lost"
+    );
+    finish(session, done);
+}
+
+/// A resident that refuses a URL the way the shipped registry resident does:
+/// network streaming is not implemented, and the refusal names the URL
+/// instead of falling back to a file or to silence.
+struct UrlRefusingResident;
+
+impl DecoderResident for UrlRefusingResident {
+    fn open(&self, location: MediaLocationWire) -> Result<Box<dyn ResidentDecoder>> {
+        match location {
+            MediaLocationWire::Url(url) => Err(MediaHostError::OperationFailed(format!(
+                "URL decoding is not supported yet (M4): {url}"
+            ))),
+            MediaLocationWire::File(path) => Err(MediaHostError::OperationFailed(format!(
+                "this fixture opens no file: {path}"
+            ))),
+        }
+    }
+}
+
+/// A session asked for a URL must be refused loudly: the resident's refusal
+/// becomes a terminal diagnostic, the session fails with a typed error that
+/// names the reason *and* the URL, the host ends with an error instead of a
+/// clean exit, and no ring is left behind.
+///
+/// Which locations a resident may open is the resident's business — the
+/// shipped registry resident refuses URLs (`rustamp-dechost`). What the
+/// framework owes is that such a refusal reaches the session as a loud,
+/// typed error: never a silent failure, never a panic, never a hang.
+#[test]
+fn a_refused_url_location_is_a_loud_typed_error_and_leaves_no_ring() {
+    let ((ar, aw), (br, bw)) = streams();
+    let client = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
+    let rings = TestRings::default();
+    let host_rings = rings.clone();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(serve_decoder(&host, &host_rings, &UrlRefusingResident));
+    });
+    let url = "https://example.invalid/stream.mp3";
+    let error = DecoderSession::open(client, rings.clone(), MediaLocationWire::Url(url.into()), 1)
+        .err()
+        .expect("a refused URL must fail the session");
+    // Typed and loud: the framework's terminal diagnostic, not a plain
+    // "invalid message" and not an end of stream.
+    let MediaHostError::Disconnected(reason) = &error else {
+        panic!("a refused URL must be a loud, typed error: {error}");
+    };
+    assert!(
+        reason.contains("resident decoder failed"),
+        "the refusal must reach the session as a terminal diagnostic: {error}"
+    );
+    assert!(
+        reason.contains("URL decoding is not supported yet (M4)"),
+        "the refusal must say why: {error}"
+    );
+    assert!(
+        reason.contains(url),
+        "the refusal must name the URL it refused: {error}"
+    );
+    // The host ends with the refusal, not with a clean exit, and it does not
+    // spin: it publishes its outcome. A panic in the host would leave this
+    // wait on the stall escape instead.
+    let outcome = result
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the refused host must publish its outcome instead of hanging");
+    assert!(
+        outcome.is_err(),
+        "a refused URL must end the host with an error, not with a clean exit"
+    );
+    // The refusal happens before any ring exists: nothing is left behind.
+    assert_eq!(
+        rings.0.lock().unwrap().len(),
+        0,
+        "a refused location must not leave a ring behind"
+    );
+}
+
+#[test]
+fn decoder_error_is_loud_and_never_eos() {
+    let (mut session, done, _) = start("fixture:fail", 3);
+    let mut out = [0.0; 14];
+    loop {
+        match read_pcm(&mut session, &mut out, "the failing decode") {
+            Ok(0) => panic!("failure must not turn into EOS"),
+            Ok(_) => {}
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("fixture decode failure"),
+                    "{error}"
+                );
+                break;
+            }
+        }
+    }
+    drop(session);
+    assert!(
+        done.recv_timeout(STALL_WAIT)
+            .expect("stall: the failing host must publish its outcome instead of hanging")
+            .is_err()
+    );
+}
+
+#[test]
+fn abrupt_player_loss_wakes_a_full_ring_decoder_writer() {
+    let ((ar, aw), (br, bw)) = streams();
+    let host = ControlPeer::start(br, bw, LIVENESS, true).unwrap();
+    let rings = TestRings::default();
+    let host_rings = rings.clone();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(serve_decoder(&host, &host_rings, &resident::StubResident));
+    });
+    // Raw player: dropping this stream sends no Shutdown and closes no ring.
+    let mut player = StreamTransport::new(ar, aw);
+    player.send(&Message::hello()).unwrap();
+    player
+        .send(&Message::DecoderOpen {
+            location: MediaLocationWire::Url("fixture:plain".into()),
+            prefetch_frames: 1,
+        })
+        .unwrap();
+    let mut spec = None;
+    let input = loop {
+        match player.recv().unwrap() {
+            Message::Hello { .. } => {}
+            Message::Ping(token) => player.send(&Message::Pong(token)).unwrap(),
+            Message::DecoderOpened { spec: opened, .. } => spec = Some(opened),
+            offer @ Message::RingOffer { .. } => {
+                let input = rings.open(&offer, spec.unwrap()).unwrap();
+                player
+                    .send(&Message::RingReady {
+                        kind: RingKind::Pcm,
+                        generation: input.consumer.generation(),
+                    })
+                    .unwrap();
+                break input;
+            }
+            message => panic!("unexpected handshake message: {message:?}"),
+        }
+    };
+    // Wait on publication, not a sleep: with no consumer, capacity one leaves
+    // the decoder's remaining block waiting for space forever.
+    input
+        .consumer
+        .wait_readable(Some(STALL_WAIT))
+        .expect("stall: the decoder never published into the full ring");
+    assert_eq!(input.consumer.frames_available(), 1);
+    assert!(!input.consumer.is_closed());
+    drop(player);
+    let outcome = result
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: the host must publish its terminal outcome instead of hanging");
+    assert!(matches!(outcome, Err(MediaHostError::Disconnected(_))));
+    assert!(input.consumer.is_closed(), "EOF must abort the full ring");
+    // The accounting survives the loss: the frame the host published is still
+    // there, the host published nothing past the loss (it was blocked on the
+    // full ring and the ring was closed under it), and the blocking write
+    // dropped nothing.
+    assert_eq!(
+        input.consumer.frames_published(),
+        1,
+        "the host must not publish past the loss"
+    );
+    assert_eq!(
+        input.consumer.frames_dropped(),
+        0,
+        "a lost player must not turn into a dropped frame"
+    );
+}
+
+#[test]
+fn abrupt_control_loss_wakes_infinite_pcm_wait_without_eos() {
+    let ((ar, aw), (br, bw)) = streams();
+    let peer = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let rings = TestRings::default();
+    let host_rings = rings.clone();
+    let (die, death) = mpsc::channel();
+    thread::spawn(move || {
+        // Deliberately no ControlPeer or close guard at the fake host end.
+        let mut transport = StreamTransport::new(br, bw);
+        transport.send(&Message::hello()).unwrap();
+        let mut offer = None;
+        loop {
+            match transport.recv().unwrap() {
+                Message::Hello { .. } => {}
+                Message::Ping(token) => transport.send(&Message::Pong(token)).unwrap(),
+                Message::DecoderOpen {
+                    prefetch_frames, ..
+                } => {
+                    let spec = PcmSpecWire {
+                        sample_rate_hz: 1000,
+                        channels: 2,
+                    };
+                    transport
+                        .send(&Message::DecoderOpened {
+                            spec,
+                            duration_ms: None,
+                            seekable: false,
+                            metadata: Default::default(),
+                        })
+                        .unwrap();
+                    let ring = host_rings.create(spec, prefetch_frames).unwrap();
+                    transport.send(&ring.message).unwrap();
+                    offer = Some(ring);
+                }
+                Message::RingReady { .. } => {
+                    let mut ring = offer.take().unwrap();
+                    ring.producer
+                        .write_from_blocking(&[0.25, -0.25], Some(STALL_WAIT))
+                        .unwrap();
+                    death
+                        .recv_timeout(STALL_WAIT)
+                        .expect("stall: the test never released the fake host");
+                    // RingProducer::Drop does NOT close the ring.
+                    break;
+                }
+                message => panic!("unexpected {message:?}"),
+            }
+        }
+    });
+    let mut session =
+        DecoderSession::open(peer, rings, MediaLocationWire::Url("fake".into()), 1).unwrap();
+    let mut out = [0.0; 2];
+    assert_eq!(
+        read_pcm(&mut session, &mut out, "the fake host's first block").unwrap(),
+        1
+    );
+    die.send(()).unwrap();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(session.read(&mut out, None));
+    });
+    let outcome = result
+        .recv_timeout(STALL_WAIT)
+        .expect("control EOF must wake an infinite PCM wait");
+    assert!(matches!(outcome, Err(MediaHostError::Disconnected(_))));
+}
+
+/// A host that dies mid-stream must leave the consumer with whole frames
+/// only, and then with a loud, typed error.
+///
+/// The fake host publishes three frames and then vanishes without a terminal
+/// message and without closing its ring - a crash surrogate, the same shape
+/// as a helper that is killed from the outside. The consumer must receive
+/// exactly those three frames, each whole and in order (a torn, missing or
+/// reordered frame breaks the fixture's pattern), and then report
+/// `Disconnected`: never a silent end of stream, never a hang. The failure
+/// must also stick: a later read may not turn into end of stream.
+///
+/// The wake of a blocked consumer is pinned by
+/// `abrupt_control_loss_wakes_infinite_pcm_wait_without_eos`; this test pins
+/// the frames around the death and the stickiness of the failure.
+#[test]
+fn a_dead_host_delivers_whole_frames_and_then_fails_loudly() {
+    /// Frames the fake host publishes before it dies.
+    const PUBLISHED: usize = 3;
+
+    let ((ar, aw), (br, bw)) = streams();
+    let peer = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let rings = TestRings::default();
+    let host_rings = rings.clone();
+    let (die, death) = mpsc::channel();
+    thread::spawn(move || {
+        // Deliberately no ControlPeer or close guard at the fake host end.
+        let mut transport = StreamTransport::new(br, bw);
+        transport.send(&Message::hello()).unwrap();
+        let mut offer = None;
+        loop {
+            match transport.recv().unwrap() {
+                Message::Hello { .. } => {}
+                Message::Ping(token) => transport.send(&Message::Pong(token)).unwrap(),
+                Message::DecoderOpen {
+                    prefetch_frames, ..
+                } => {
+                    let spec = PcmSpecWire {
+                        sample_rate_hz: 1000,
+                        channels: 2,
+                    };
+                    transport
+                        .send(&Message::DecoderOpened {
+                            spec,
+                            duration_ms: None,
+                            seekable: false,
+                            metadata: Default::default(),
+                        })
+                        .unwrap();
+                    let ring = host_rings.create(spec, prefetch_frames).unwrap();
+                    transport.send(&ring.message).unwrap();
+                    offer = Some(ring);
+                }
+                Message::RingReady { .. } => {
+                    let mut ring = offer.take().unwrap();
+                    for index in 0..PUBLISHED {
+                        ring.producer
+                            .write_from_blocking(
+                                &frame_pattern::frame_samples(index),
+                                Some(STALL_WAIT),
+                            )
+                            .unwrap();
+                    }
+                    death
+                        .recv_timeout(STALL_WAIT)
+                        .expect("stall: the test never released the fake host");
+                    // The host dies here: the transport is dropped, so the
+                    // control channel ends, and the ring is never closed.
+                    // A killed process leaves both exactly like this.
+                    break;
+                }
+                message => panic!("unexpected {message:?}"),
+            }
+        }
+    });
+    let mut session = DecoderSession::open(
+        peer,
+        rings,
+        MediaLocationWire::Url("fake".into()),
+        PUBLISHED as u32,
+    )
+    .unwrap();
+
+    // The published frames: whole, in order and nothing else.
+    let mut out = [0.0; 8];
+    let mut delivered = 0usize;
+    while delivered < PUBLISHED {
+        match session.read(&mut out, Some(STALL_WAIT)) {
+            Ok(0) => panic!("a dead host must not look like end of stream"),
+            Ok(count) => {
+                for chunk in out[..count * 2].as_chunks::<2>().0 {
+                    assert_eq!(
+                        *chunk,
+                        frame_pattern::frame_samples(delivered),
+                        "frame {delivered} was torn, missing or out of order"
+                    );
+                    delivered += 1;
+                }
+            }
+            Err(MediaHostError::TimedOut) => panic!(
+                "stall: the resident stopped delivering without EOS or an error \
+                 (the fake host published no PCM within {STALL_WAIT:?})"
+            ),
+            Err(error) => panic!("the host was still alive: {error}"),
+        }
+    }
+    assert_eq!(delivered, PUBLISHED);
+
+    // The consumer now waits in an infinite read while the host dies. Whether
+    // the wait starts before the death or after it, the outcome must be the
+    // same loud error: a wait that is already blocked is woken by the control
+    // EOF, a wait that starts later sees the sticky failure.
+    let (done, outcome) = mpsc::channel();
+    thread::spawn(move || {
+        let mut out = [0.0; 2];
+        let first = session.read(&mut out, None);
+        // The failure must stick: a later read may not turn into end of stream.
+        let second = session.read(&mut out, Some(STALL_WAIT));
+        let _ = done.send((first, second));
+    });
+    die.send(()).unwrap();
+    let (first, second) = outcome
+        .recv_timeout(STALL_WAIT)
+        .expect("stall: a dead host must wake the blocked consumer");
+    let error = match first {
+        Ok(frames) => panic!("a dead host must not look like end of stream ({frames} frames)"),
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(reason) = &error else {
+        panic!("a dead host must report a loud, typed error: {error}");
+    };
+    assert!(
+        reason.contains("control stream ended"),
+        "the death must be seen on the control channel: {error}"
+    );
+    let again = match second {
+        Ok(frames) => {
+            panic!(
+                "the failure must stick: a dead host turned into end of stream ({frames} frames)"
+            )
+        }
+        Err(error) => error,
+    };
+    let MediaHostError::Disconnected(_) = &again else {
+        panic!("the failure must stick as the same loud error: {again}");
+    };
+}
+
+#[test]
+fn missing_pong_is_bounded_even_with_an_open_control_stream() {
+    let ((ar, aw), (br, bw)) = streams();
+    let policy = Liveness {
+        interval: Duration::from_millis(20),
+        timeout: Duration::from_millis(200),
+    };
+    let peer = ControlPeer::start(ar, aw, policy, false).unwrap();
+    let rings = TestRings::default();
+    let spec = PcmSpecWire {
+        sample_rate_hz: 1000,
+        channels: 2,
+    };
+    let offer = rings.create(spec, 1).unwrap();
+    let mut input = rings.open(&offer.message, spec).unwrap();
+    peer.set_abort(input.abort).unwrap();
+    let (woke, waiter) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = woke.send(input.consumer.read_into_blocking(&mut [0.0; 2], None));
+    });
+    let mut unresponsive = StreamTransport::new(br, bw);
+    unresponsive.send(&Message::hello()).unwrap();
+    let start = Instant::now();
+    let outcome = peer.recv(STALL_WAIT);
+    assert!(matches!(outcome, Err(MediaHostError::Disconnected(_))));
+    // Kept at the original 5 s (not the widened stall escape): the 200 ms
+    // policy above is the claim; this only proves the liveness fired, it
+    // did not hang.
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(matches!(
+        waiter.recv_timeout(STALL_WAIT).unwrap(),
+        Err(rustamp_ipc::shm::RingError::Closed)
+    ));
+    assert!(
+        outcome
+            .unwrap_err()
+            .to_string()
+            .contains("liveness deadline")
+    );
+}
+
+#[test]
+fn old_hello_is_rejected_before_decoder_open() {
+    let ((ar, aw), (br, bw)) = streams();
+    let peer = ControlPeer::start(ar, aw, LIVENESS, false).unwrap();
+    let mut old = StreamTransport::new(br, bw);
+    old.send(&Message::Hello {
+        protocol_version: 2,
+        pid: 1,
+    })
+    .unwrap();
+    assert!(matches!(
+        peer.recv(STALL_WAIT),
+        Err(MediaHostError::Disconnected(_))
+    ));
+}

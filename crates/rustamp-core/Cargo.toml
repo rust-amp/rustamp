@@ -1,0 +1,27 @@
+[package]
+name = "rustamp-core"
+description = "Rustamp: contract crate: domain types, Command/Event, traits, config (frozen early)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Mock decoder / output / DSP implementations for tests in other lanes.
+mock = []
+
+[dependencies]
+rustamp-proto.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+crossbeam-channel.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+# RFC 0020 option A: the re-export test proves the kind type on the core path
+# is the ABI's own type, not a copy of it. A dev-dependency only — the crate
+# itself names the kind through `rustamp-proto`'s re-export.
+rustamp-plugin-abi.workspace = true

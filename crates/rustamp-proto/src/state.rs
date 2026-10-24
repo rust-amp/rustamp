@@ -1,0 +1,161 @@
+//! Player state snapshot types.
+
+use serde::{Deserialize, Serialize};
+
+use crate::playlist::EntryId;
+
+/// Number of equalizer bands (60, 170, 310, 600, 1k, 3k, 6k, 12k, 14k, 16k Hz;
+/// exact centers are defined by spec S07).
+pub const EQ_BANDS: usize = 10;
+
+/// Identifies one of the player's windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum WindowId {
+    /// Main player window.
+    Main,
+    /// Equalizer window.
+    Equalizer,
+    /// Playlist editor.
+    Playlist,
+    /// Visualization window.
+    Vis,
+    /// Generic / plugin window (`gen_*` plugins, library, ...), by number.
+    Gen(u32),
+    /// Video window (RFC 0005 owner decision O2: the 2.95 video window is *not*
+    /// the visualization window).
+    ///
+    /// Appended after [`WindowId::Gen`] on purpose: `postcard` encodes an enum
+    /// by its declaration index, so inserting it next to [`WindowId::Vis`]
+    /// would change the bytes of `Gen`. It therefore sorts after `Gen` in the
+    /// `Ord` order that [`Command::FocusNextWindow`](crate::command::Command)
+    /// follows.
+    Video,
+}
+
+/// Transport state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TransportState {
+    /// Nothing playing.
+    #[default]
+    Stopped,
+    /// Playing.
+    Playing,
+    /// Paused.
+    Paused,
+}
+
+/// Technical info about the current stream, shown in the main window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StreamInfo {
+    /// Bitrate in kbps, if known.
+    pub bitrate_kbps: Option<u32>,
+    /// Sample rate in Hz (the UI shows kHz).
+    pub sample_rate_hz: u32,
+    /// Channel count (1 = mono, 2 = stereo).
+    pub channels: u16,
+}
+
+/// Equalizer state. Gains are in dB, nominally `-12.0..=12.0`; mapping to the
+/// slider scale is a UI concern (spec S07).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EqState {
+    /// Per-band gain in dB.
+    pub bands: [f32; EQ_BANDS],
+    /// Preamp gain in dB.
+    pub preamp: f32,
+    /// EQ processing enabled ("ON" button).
+    pub enabled: bool,
+    /// Auto-load presets per track ("AUTO" button).
+    pub auto: bool,
+}
+
+impl Default for EqState {
+    fn default() -> Self {
+        EqState {
+            bands: [0.0; EQ_BANDS],
+            preamp: 0.0,
+            enabled: false,
+            auto: false,
+        }
+    }
+}
+
+impl EqState {
+    /// Gain limit in dB (absolute value) accepted by the engine.
+    pub const MAX_GAIN_DB: f32 = 12.0;
+}
+
+/// Convert one equalizer gain from the protocol domain (dB, nominally
+/// `-12.0..=12.0`) to the classic surface domain (`0..=63`, `i32`).
+///
+/// Anchor points from spec S09 (audited): `0 = +12 dB`, `31 = 0 dB`,
+/// `63 = -12 dB`. The linear law through the endpoints is
+/// `(12 - db) * 63 / 24`, which is exactly `31.5` at `0 dB`; the `floor`
+/// quantizes the centre down to the documented `31` so all three anchors hold
+/// exactly. Out-of-range gains saturate to `0`/`63`. Non-finite input cannot
+/// be mapped honestly and yields the flat value `31`.
+pub fn eq_classic_from_db(db: f32) -> i32 {
+    if !db.is_finite() {
+        return 31;
+    }
+    ((12.0_f32 - db) * 63.0_f32 / 24.0_f32)
+        .floor()
+        .clamp(0.0, 63.0) as i32
+}
+
+/// Snapshot of the whole player; the app state store publishes these.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayerState {
+    /// Transport state.
+    pub transport: TransportState,
+    /// Current position in milliseconds.
+    pub position_ms: u64,
+    /// Duration of the current track in ms, if known.
+    pub duration_ms: Option<u64>,
+    /// Volume, `0..=255` (Winamp style).
+    pub volume: u8,
+    /// Balance, `-127..=127` (negative = left).
+    pub balance: i8,
+    /// Shuffle enabled.
+    pub shuffle: bool,
+    /// Repeat enabled.
+    pub repeat: bool,
+    /// Index of the current playlist entry.
+    pub current_index: Option<u32>,
+    /// Stable id of the current playlist entry.
+    pub current_id: Option<EntryId>,
+    /// Number of playlist entries.
+    pub playlist_len: u32,
+    /// Info about the current stream.
+    pub stream: Option<StreamInfo>,
+    /// Equalizer state.
+    pub eq: EqState,
+    /// "Stop after current track" is armed (RFC 0005 O8): when the current
+    /// track ends the transport stops instead of advancing.
+    ///
+    /// Appended at the **end** of the struct on purpose: `postcard` encodes a
+    /// struct positionally, so every field declared before it keeps its bytes.
+    /// The struct itself is still a wire change (an old peer cannot decode the
+    /// longer form) — that is what the RFC 0005 v2 bump covers.
+    pub stop_after_current: bool,
+}
+
+impl Default for PlayerState {
+    fn default() -> Self {
+        PlayerState {
+            transport: TransportState::Stopped,
+            position_ms: 0,
+            duration_ms: None,
+            volume: 255,
+            balance: 0,
+            shuffle: false,
+            repeat: false,
+            current_index: None,
+            current_id: None,
+            playlist_len: 0,
+            stream: None,
+            eq: EqState::default(),
+            stop_after_current: false,
+        }
+    }
+}

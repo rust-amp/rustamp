@@ -1,0 +1,29 @@
+[package]
+name = "rustamp-ipc"
+description = "Rustamp: protocol and transports between rustamp.exe (x64) and rustamp-plughost32.exe (i686)"
+version.workspace = true
+edition.workspace = true
+# Permissive on purpose (RFC 0004): this crate must not carry copyleft into the
+# plugin host or into modules that speak the documented IPC protocol.
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-plugin-abi.workspace = true
+rustamp-proto.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+postcard.workspace = true
+crossbeam-channel.workspace = true
+
+# The cross-process transport needs the Win32 file-mapping API. `rtrb` is not
+# used: the ring has to live in shared memory, which `rtrb` does not support.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }

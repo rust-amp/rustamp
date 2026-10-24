@@ -1,0 +1,34 @@
+[package]
+name = "rustamp-mediahost"
+description = "Rustamp: out-of-process decoder and DSP host binaries (RFC 0006)"
+version.workspace = true
+edition.workspace = true
+# MIT OR Apache-2.0: this is only the PROTOCOL FRAMEWORK (the message loop and
+# supervision) and links no decoder at all. A per-resident crate
+# (`rustamp-mediahost-<decoder>`) carries the resident's own license - the
+# sidplayfp host is GPL because sidplayfp is, and a symphonia host would be
+# MPL-2.0 because symphonia is (weak copyleft, **not** permissive). That keeps
+# the copyleft in the resident crate instead of in the framework, and keeps this
+# crate inside the permissive set.
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-ipc = { workspace = true }
+rustamp-proto = { workspace = true }
+thiserror = { workspace = true }
+
+# Only 64-bit hosts; the residents are native 64-bit libraries.
+# Unlike classic plugins, nothing here needs i686.
+[target.'cfg(not(target_pointer_width = "64"))'.dependencies]
+# Empty: this crate only builds for x86_64.
+
+[[bin]]
+name = "rustamp-dechost"
+path = "src/bin/dechost.rs"
+
+[[bin]]
+name = "rustamp-dsphost"
+path = "src/bin/dsphost.rs"

@@ -1,0 +1,62 @@
+name: Release
+
+# Builds the portable release zip with the same command the maintainers use
+# locally (`cargo xtask package --release --zip`). Triggered by a version tag
+# or by hand; a tag also creates a DRAFT GitHub release so nothing is published
+# without a human pressing the button.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Release build and zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The release must not ship on a red tree: run the same gate as CI.
+      - name: Test (headless)
+        run: cargo test --workspace --all-features
+
+      - name: Package
+        run: cargo xtask package --release --zip
+
+      - name: Collect archive
+        id: collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          find target/package -maxdepth 1 -name 'rustamp-*.zip*' \
+            -exec cp {} dist/ \;
+          ls -l dist
+          test -n "$(ls dist/*.zip 2>/dev/null)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustamp-release
+          path: dist/*
+
+      - name: Draft GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*

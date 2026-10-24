@@ -1,0 +1,22 @@
+[package]
+name = "rustamp-proto"
+description = "Rustamp: wire types shared across the rustamp.exe <-> rustamp-plughost32.exe process boundary (RFC 0004)"
+version.workspace = true
+edition.workspace = true
+# Permissive on purpose (RFC 0004): this crate must carry no copyleft into the
+# plugin host or into modules that speak the documented IPC protocol.
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+# RFC 0020 (option A) names the ABI's kind type in `Command::ConfigurePlugin`
+# instead of mirroring it: the wire carries one kind type, as it already does in
+# `Message::LoadPlugin`/`PluginLoaded`. One internal, permissive -> permissive
+# edge; see the RFC 0004 §3 erratum (RFC 0004 §7) and RFC 0020 §3.3.
+rustamp-plugin-abi.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true

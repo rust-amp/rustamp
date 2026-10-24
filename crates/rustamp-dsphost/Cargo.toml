@@ -1,0 +1,19 @@
+[package]
+name = "rustamp-dsphost"
+description = "Rustamp: first real DSP resident behind the media host (gain/passthrough DspStage chain, RFC 0006)"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustamp-core = { workspace = true }
+rustamp-ipc = { workspace = true }
+rustamp-mediahost = { workspace = true }
+rustamp-proto = { workspace = true }
+
+[[bin]]
+name = "rustamp-dsphost-stages"
+path = "src/main.rs"

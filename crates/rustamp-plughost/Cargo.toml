@@ -1,0 +1,89 @@
+[package]
+name = "rustamp-plughost"
+description = "Rustamp: 32-bit plugin host process (rustamp-plughost32.exe)"
+version.workspace = true
+edition.workspace = true
+# Permissive on purpose (RFC 0004): this process loads plugin DLLs, so its
+# license must impose no copyleft on any plugin, of any license.
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rustamp-plughost32"
+path = "src/main.rs"
+
+# The clean-room input ("in_") plugin fixture, for the same reason: a
+# separate cdylib artifact that the acceptance test maps through the OS
+# loader, never linked into the host or into a test binary. It opens no
+# window and no audio device.
+[[example]]
+name = "in_rustamp_fixture"
+crate-type = ["cdylib"]
+
+# The clean-room general-purpose ("gen_") plugin fixture for the P3 DLL
+# acceptance (docs/tasks/P3-dll-acceptance.md §2). It is a separate cdylib
+# artifact that the acceptance test loads through the OS loader; it is never
+# linked into the host or into the test binary, so it cannot be mistaken for
+# a mocked or statically linked plugin.
+[[example]]
+name = "gen_rustamp_fixture"
+crate-type = ["cdylib"]
+
+# The clean-room output ("out_") plugin fixture, for the same reason: a
+# separate cdylib artifact that the acceptance test maps through the OS
+# loader, never linked into the host or into the test binary.
+[[example]]
+name = "out_rustamp_fixture"
+crate-type = ["cdylib"]
+
+# The clean-room input ("in_") plugin fixture for the **hand-over** (S09
+# §3.5 step 2, §3.7): it sets flag bit 0 and drives the output plug-in the
+# host hands it. A separate cdylib artifact like the others, so the
+# hand-over acceptance maps both plug-ins through the OS loader instead of
+# linking them into a test binary. It opens no window and no audio device.
+[[example]]
+name = "in_handoff_rustamp_fixture"
+crate-type = ["cdylib"]
+
+# The clean-room visualization ("vis_") plugin fixture, for the same reason:
+# a separate cdylib artifact that the acceptance test maps through the OS
+# loader, never linked into the host or into the test binary. It opens no
+# window at all.
+[[example]]
+name = "vis_rustamp_fixture"
+crate-type = ["cdylib"]
+
+# The clean-room crashing plugin fixture, for the crash-isolation acceptance
+# (PLAN M3: "restart the host on plugin crash"). It is a separate cdylib
+# artifact like the others, and it is the only fixture that faults on
+# purpose: it is never linked into the host or into a test binary.
+[[example]]
+name = "crash_rustamp_fixture"
+crate-type = ["cdylib"]
+
+# The clean-room DSP ("dsp_") plugin fixture, for the same reason: a separate
+# cdylib artifact that the acceptance test maps through the OS loader, never
+# linked into the host or into the test binary. It opens no window at all.
+[[example]]
+name = "dsp_rustamp_fixture"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustamp-ipc.workspace = true
+rustamp-plugin-abi.workspace = true
+rustamp-proto.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,0 +1,33 @@
+{
+  "job": "base291-presented-playlist-active",
+  "baseline": "base-provisioned",
+  "winamp_args": "/NOREG",
+  "steps": [
+    {
+      "name": "before",
+      "window": "Winamp PE",
+      "action": "the playlist editor while the main window holds the focus",
+      "input_method": "none",
+      "capture": "playlist-active.before.png",
+      "expect_client_size": "275x116"
+    },
+    {
+      "name": "focus_pe",
+      "window": "Winamp PE",
+      "action": "a real click on the playlist title bar gives it the focus",
+      "input_method": "real-mouse",
+      "down": "100,3",
+      "up": "100,3",
+      "expect_client_size": "none",
+      "may_change_client_size": true
+    },
+    {
+      "name": "after",
+      "window": "Winamp PE",
+      "action": "capture the playlist editor while it holds the focus",
+      "input_method": "none",
+      "capture": "playlist-active.presented.png",
+      "expect_client_size": "275x116"
+    }
+  ]
+}

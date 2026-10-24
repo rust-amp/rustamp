@@ -1,0 +1,1631 @@
+//! The host's loaded-plugin registry and its control-channel routing
+//! (`docs/tasks/P3-dll-acceptance.md` §5.3, "Control routing").
+//!
+//! The app asks for a load with [`Message::LoadPlugin`] and the host answers
+//! with [`Message::PluginLoaded`] or [`Message::PluginError`]. All three
+//! variants already exist in `rustamp-ipc` with their directions documented,
+//! so **this module changes no wire format and needs no RFC**. What it adds is
+//! the host side that P3 §5.3 asked for: dispatch the request on the UI
+//! thread, report the *actual* loader error rather than a generic failure, and
+//! answer through the framed channel rather than printing (a stray line on
+//! stdout would corrupt the frame stream — see `src/main.rs`).
+//!
+//! # Configuration
+//!
+//! [`PluginRegistry::configure_plugin`] opens the configuration dialog of a
+//! loaded plug-in on the UI thread, and [`PluginRegistry::configure_vis`] does
+//! the same for the running visualization plug-in — the request the player
+//! sends as `Message::CommandToHost(Command::ConfigureVisPlugin)`
+//! (RFC 0005 §5.4). Every refusal (an unknown id, a kind that does not match
+//! the loaded plug-in, a plug-in with no `config` slot, a plug-in that is not
+//! live) is returned to the caller: nothing is ever called through a null slot
+//! or a signature the host would have to guess (S09 §0, P3 §3).
+//!
+//! # Starting and stopping a visualization
+//!
+//! [`PluginRegistry::start_vis`] starts one module of a loaded visualization
+//! plug-in and [`PluginRegistry::stop_vis`] stops the running one (S09 §5.3
+//! step 1 and step 5). The registry owns the **state** of the render loop
+//! ([`crate::vis::VisLoop`]); it owns **no thread**. The host's caller drives
+//! the loop: it says when a step is due ([`PluginRegistry::step_vis`]), which
+//! frame the step draws and what the player is doing
+//! ([`PluginRegistry::set_vis_playback`]), and it reads the cadence the loop
+//! waits with from [`PluginRegistry::vis_loop`].
+//!
+//! Starting a second visualization stops the first, because only one
+//! visualization is active at a time (S09 §5.3 step 1). A refusal — an
+//! unknown id, a plug-in of another kind, a module the library does not have,
+//! a module whose `init` refuses — is returned as a
+//! [`RegistryVisError`]; nothing is ever called through a slot the host would
+//! have to guess.
+//!
+//! **No request on the wire reaches this path yet.** The only vis request the
+//! protocol carries besides the Configure one is
+//! `Command::ToggleVisPlugin`, and it is a **unit variant**: it names neither
+//! the plug-in nor the module, so it cannot say what to start. A request that
+//! carries both needs a new `Command` variant with a payload — a wire change,
+//! which needs an RFC (RFC 0020) — and none is invented here. See
+//! [`crate::control`] for the same honesty on the control channel.
+//!
+//! # What this module does not decide
+//!
+//! * **Approval.** The registry never approves anything. It holds the
+//!   [`ApprovalStore`] the operator supplied and passes it to the loader,
+//!   which requires full-byte equality against it. With no store the store is
+//!   empty, which approves nothing; with a malformed store the registry is
+//!   [`Approvals::Unavailable`] and refuses every request with the reason.
+//!   **A missing or broken store is never an empty allowlist by accident.**
+//! * **`PluginLoaded` is not acceptance.** P3 §7 lists it among the false
+//!   passes. It records that the real loader mapped approved bytes, resolved
+//!   the kind's export and ran the getter; it proves nothing about windows,
+//!   dialogs, audio or any other plugin kind.
+//!
+//! # Threading and lifetime
+//!
+//! Every method runs on the UI thread that owns the [`HostWindow`]: a plugin's
+//! `init`/`config`/`quit` run there (S09 §3.5, §7.2), and `HostWindow` is
+//! neither `Send` nor `Sync`, so holding one is the proof. The registry quits
+//! its plugins in **reverse load order** (S09 §3.5 line 166, §7.2 line 380) and
+//! never frees a DLL (S09 §1 line 46): a plugin may have subclassed the host
+//! window or spawned threads. The host window must therefore outlive the
+//! registry.
+//!
+//! Licensed `MIT OR Apache-2.0` (RFC 0004).
+
+use std::fmt;
+use std::path::Path;
+
+use rustamp_ipc::Message;
+use rustamp_plugin_abi::PluginKind;
+
+use crate::approval::ApprovalStore;
+use crate::handoff::HandoffError;
+use crate::host_window::HostWindow;
+use crate::loader::{LoadedPlugin, PluginConfigError, load_plugin_with_store};
+use crate::vis::{VisError, VisLoop, VisPlayback, VisRows, VisRunInfo, VisStep};
+
+/// Where the registry's approval decisions come from.
+enum Approvals {
+    /// The operator's allowlist. An empty one approves nothing.
+    Store(ApprovalStore),
+    /// The allowlist could not be read. Every load is refused with this reason;
+    /// it is deliberately **not** treated as "nothing approved yet", so a
+    /// broken store can never look like a working one.
+    Unavailable(String),
+}
+
+/// One plugin the host holds, with the id the protocol hands back to the app.
+struct LoadedEntry {
+    id: u32,
+    plugin: LoadedPlugin,
+}
+
+/// Plugins this host has loaded, in load order.
+pub struct PluginRegistry {
+    approvals: Approvals,
+    loaded: Vec<LoadedEntry>,
+    next_id: u32,
+    /// The output plugin the host hands to input plugins (S09 §3.5 step 2).
+    ///
+    /// `None` until a caller selects one: the selection by the
+    /// `config_outname` setting is S12's business, and this host has no stock
+    /// outputs to fall back to (S09 §3.5 step 2).
+    selected_output: Option<u32>,
+    /// The state of the running visualization's render loop (S09 §5.3 step 4).
+    ///
+    /// The registry owns the state and **no thread**: the host's caller drives
+    /// the loop through [`PluginRegistry::step_vis`].
+    vis_loop: VisLoop,
+}
+
+/// Why a visualization start or stop did not reach a module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryVisError {
+    /// No plugin carries this id.
+    UnknownPlugin(u32),
+    /// The request named a kind the loaded plugin does not have. The plugin
+    /// was not touched: the host compares the kind the request carries with
+    /// the kind it recorded when the plugin was loaded.
+    WrongKind {
+        /// The kind the request asked for.
+        expected: PluginKind,
+        /// The kind the loaded plugin actually has.
+        actual: PluginKind,
+    },
+    /// No visualization module is running, so there is nothing to stop.
+    NotRunning,
+    /// The visualization bridge refused the call: an unknown module index, a
+    /// module whose `init` refuses, a module that is not live.
+    Vis(VisError),
+}
+
+impl fmt::Display for RegistryVisError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownPlugin(id) => write!(f, "no plugin with id {id} is loaded"),
+            Self::WrongKind { expected, actual } => write!(
+                f,
+                "the request asked for a {expected:?} plugin, but the loaded one is a {actual:?} plugin"
+            ),
+            Self::NotRunning => {
+                f.write_str("no visualization module is running; nothing was stopped")
+            }
+            Self::Vis(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RegistryVisError {}
+
+/// The visualization module that is running, and the plugin that owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningVis {
+    /// The id the host assigned to the plugin that owns the running module.
+    pub plugin_id: u32,
+    /// What the running module reports about itself (S09 §5.2).
+    pub info: VisRunInfo,
+}
+
+/// Why a configuration request did not reach a plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryConfigError {
+    /// No plugin carries this id.
+    UnknownPlugin(u32),
+    /// The request named a kind the loaded plugin does not have. The plugin
+    /// was not touched: the host compares the kind the request carries with
+    /// the kind it recorded when the plugin was loaded, the same check the
+    /// load path makes twice.
+    WrongKind {
+        /// The kind the request asked for.
+        expected: PluginKind,
+        /// The kind the loaded plugin actually has.
+        actual: PluginKind,
+    },
+    /// No visualization plug-in is running, so there is none to configure.
+    NoRunningVis,
+    /// The plugin refused the call; nothing was invoked.
+    Plugin(PluginConfigError),
+}
+
+impl std::fmt::Display for RegistryConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPlugin(id) => write!(f, "no plugin with id {id} is loaded"),
+            Self::WrongKind { expected, actual } => write!(
+                f,
+                "the request asked for a {expected:?} plugin, but the loaded one is a {actual:?} plugin"
+            ),
+            Self::NoRunningVis => {
+                f.write_str("no visualization plug-in is running; nothing was configured")
+            }
+            Self::Plugin(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RegistryConfigError {}
+
+/// Is a plugin of kind `actual` what the request asked for?
+///
+/// Pure and deliberately separate from the load: it is applied twice — once on
+/// the kind passive preflight selects, before anything is mapped, and once on
+/// the kind the loader actually produced, which is the authoritative answer
+/// (the pre-check reads its own copy of the file and cannot bind the bytes the
+/// loader later seals). Returns the message the `PluginError` carries.
+pub fn accept_loaded_kind(expected: PluginKind, actual: PluginKind) -> Result<(), String> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(format!(
+            "plugin is a {actual:?} plugin (export {}), but the request asked for {expected:?}",
+            String::from_utf8_lossy(
+                actual
+                    .export_name()
+                    .strip_suffix(&[0])
+                    .unwrap_or(actual.export_name())
+            )
+        ))
+    }
+}
+
+impl PluginRegistry {
+    /// A registry over the operator's allowlist.
+    pub fn new(store: ApprovalStore) -> Self {
+        Self {
+            approvals: Approvals::Store(store),
+            loaded: Vec::new(),
+            next_id: 1,
+            selected_output: None,
+            vis_loop: VisLoop::new(),
+        }
+    }
+
+    /// A registry that refuses every load, naming why the allowlist is missing.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            approvals: Approvals::Unavailable(reason.into()),
+            loaded: Vec::new(),
+            next_id: 1,
+            selected_output: None,
+            vis_loop: VisLoop::new(),
+        }
+    }
+
+    /// Read the allowlist from `path`, or an empty one when no path was given.
+    ///
+    /// `None` means the operator named no store: the result approves nothing,
+    /// which is the safe default, not an error. A path that cannot be read or
+    /// parsed yields [`Self::unavailable`] — never a silent empty allowlist.
+    pub fn from_store_path(path: Option<&Path>) -> Self {
+        match path {
+            None => Self::new(ApprovalStore::new()),
+            Some(path) => match ApprovalStore::load_from_file(path) {
+                Ok(store) => Self::new(store),
+                Err(error) => {
+                    Self::unavailable(format!("{} could not be read: {error}", path.display()))
+                }
+            },
+        }
+    }
+
+    /// How many entries the allowlist holds, or `None` when it is unavailable.
+    pub fn approved_count(&self) -> Option<usize> {
+        match &self.approvals {
+            Approvals::Store(store) => Some(store.len()),
+            Approvals::Unavailable(_) => None,
+        }
+    }
+
+    /// The ids of the loaded plugins, in load order.
+    pub fn loaded_ids(&self) -> Vec<u32> {
+        self.loaded.iter().map(|entry| entry.id).collect()
+    }
+
+    /// Handle one [`Message::LoadPlugin`], returning the reply to send back.
+    ///
+    /// The order is the point: the allowlist must exist, the kind the request
+    /// asked for must match the kind the passive preflight selects (so a
+    /// wrong-kind request never reaches `LoadLibraryExW` and never runs a
+    /// `DllMain`), only then does the loader seal and map the approved bytes,
+    /// and finally the kind the loader actually produced is checked again.
+    ///
+    /// # Safety
+    ///
+    /// Must be called on the UI thread owning `window`. The plugin bytes the
+    /// allowlist approves, and their transitive dependencies, must be code the
+    /// operator explicitly trusts to execute in this process: approval decides
+    /// that, and neither the preflight nor this routing can establish it.
+    pub unsafe fn handle_load_request(
+        &mut self,
+        path: &str,
+        expected: PluginKind,
+        window: &HostWindow,
+    ) -> Message {
+        let error = |message: String| Message::PluginError {
+            path: path.to_string(),
+            message,
+        };
+
+        let store = match &self.approvals {
+            Approvals::Unavailable(reason) => {
+                return error(format!(
+                    "no plugin is approved because the approval store is unavailable: {reason}"
+                ));
+            }
+            Approvals::Store(store) => store,
+        };
+
+        // Pre-mapping kind check on our own read of the candidate. This read is
+        // not the approval basis and not the bytes that get loaded; the loader
+        // re-reads and seals its own copy. Its only job is to refuse an
+        // obviously wrong-kind request before any plugin code can run.
+        let candidate = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => return error(format!("plugin image could not be read: {e}")),
+        };
+        let selected = match crate::pe_preflight::check_pe_i386_dll(&candidate) {
+            Ok(kind) => kind,
+            Err(e) => return error(format!("PE DLL preflight refused the plugin: {e}")),
+        };
+        if let Err(message) = accept_loaded_kind(expected, selected) {
+            return error(format!("{message}; refused before any mapping"));
+        }
+        drop(candidate);
+
+        // SAFETY: the caller's UI-thread and approved-code invariants are
+        // forwarded unchanged; the store is the operator's approval decision.
+        let loaded = match unsafe { load_plugin_with_store(Path::new(path), store, window) } {
+            Ok(loaded) => loaded,
+            Err(e) => return error(e.to_string()),
+        };
+
+        // Authoritative check: this is the kind of the image that was actually
+        // sealed, mapped and called.
+        if let Err(message) = accept_loaded_kind(expected, loaded.kind()) {
+            let mut loaded = loaded;
+            loaded.quit();
+            return error(format!("{message}; the loaded plugin was quit again"));
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let reply = Message::PluginLoaded {
+            plugin_id: id,
+            name: loaded.description().to_string(),
+            kind: loaded.kind(),
+        };
+        self.loaded.push(LoadedEntry { id, plugin: loaded });
+        reply
+    }
+
+    /// Open the configuration dialog of the loaded plugin with this id, on this
+    /// thread (P3 §4 step 9). Synchronous: a modal dialog returns only when
+    /// the plugin closes it.
+    ///
+    /// `kind` is the kind the request carries. The host compares it with the
+    /// kind it recorded when the plugin was loaded and refuses a mismatch
+    /// before anything is called: a request that names the wrong kind is a
+    /// reported error, never a call through a signature the host would have
+    /// to guess. The plugin's own `config` slot then runs on the UI thread
+    /// that owns the host window, with the parent window the plugin was
+    /// handed (S09 §3.1 offset 0x1C, §4.1 offset 0x14, §5.2 offset 0x924,
+    /// §6.2 offset 0x0C, §7.1 offset 0x0C).
+    pub fn configure_plugin(
+        &self,
+        plugin_id: u32,
+        kind: PluginKind,
+    ) -> Result<(), RegistryConfigError> {
+        let entry = self
+            .loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or(RegistryConfigError::UnknownPlugin(plugin_id))?;
+        let actual = entry.plugin.kind();
+        if actual != kind {
+            return Err(RegistryConfigError::WrongKind {
+                expected: kind,
+                actual,
+            });
+        }
+        entry.plugin.config().map_err(RegistryConfigError::Plugin)
+    }
+
+    /// Open the configuration dialog of the running visualization plug-in, on
+    /// this thread.
+    ///
+    /// The player's request names no plug-in: `Command::ConfigureVisPlugin`
+    /// (RFC 0005 §5.4) means "the current vis plug-in", which is the one
+    /// whose module is running. With no visualization running there is none
+    /// to configure, and the request is refused.
+    pub fn configure_vis(&self) -> Result<(), RegistryConfigError> {
+        let entry = self
+            .loaded
+            .iter()
+            .find(|entry| entry.plugin.vis_run_info().is_some())
+            .ok_or(RegistryConfigError::NoRunningVis)?;
+        entry.plugin.config().map_err(RegistryConfigError::Plugin)
+    }
+
+    /// Start the visualization: the module `module_index` of the plugin with
+    /// the id `plugin_id` runs (S09 §5.3 step 2).
+    ///
+    /// The host fills the parent window, the plugin's own module handle, the
+    /// sample rate and the channel count into the chosen module and calls its
+    /// `init` (S09 §5.3 step 2). A visualization that is already running is
+    /// stopped first, because only one visualization is active at a time
+    /// (S09 §5.3 step 1) — that is the plugin's own `quit`, run by
+    /// [`crate::vis::VisLoop::start`].
+    ///
+    /// The render loop belongs to the registry from here on: the caller drives
+    /// it with [`step_vis`](Self::step_vis) and reads its cadence from
+    /// [`vis_loop`](Self::vis_loop). A refusal — an unknown id, a plugin of
+    /// another kind, a module the library does not have, a module whose `init`
+    /// refuses — is returned to the caller as a [`RegistryVisError`]; nothing
+    /// is ever called through a slot the host would have to guess.
+    ///
+    /// The call belongs on the UI thread that owns the host window: the
+    /// module's `init` runs there and creates the plugin's windows
+    /// (S09 §5.3 step 2).
+    pub fn start_vis(&mut self, plugin_id: u32, module_index: i32) -> Result<(), RegistryVisError> {
+        let entry = self
+            .loaded
+            .iter_mut()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or(RegistryVisError::UnknownPlugin(plugin_id))?;
+        let actual = entry.plugin.kind();
+        if actual != PluginKind::Visualization {
+            return Err(RegistryVisError::WrongKind {
+                expected: PluginKind::Visualization,
+                actual,
+            });
+        }
+        // S09 §5.3 step 1 and step 2: the visualization that runs is stopped
+        // first, then the chosen module's `init` runs. The loop takes the
+        // module's own cadence from there on.
+        self.vis_loop
+            .start(&mut entry.plugin, module_index)
+            .map_err(RegistryVisError::Vis)
+    }
+
+    /// Stop the running visualization: the module's `quit` runs (S09 §5.3
+    /// step 5).
+    ///
+    /// The plugin's `quit` runs exactly once: a visualization that is already
+    /// stopped quits nothing again. With nothing running there is nothing to
+    /// stop, and the refusal says so instead of guessing.
+    pub fn stop_vis(&mut self) -> Result<(), RegistryVisError> {
+        if !self.vis_loop.is_running() {
+            return Err(RegistryVisError::NotRunning);
+        }
+        let index = self
+            .running_vis_index()
+            .ok_or(RegistryVisError::NotRunning)?;
+        // S09 §5.3 step 5: leaving the loop runs the module's `quit`, once.
+        self.vis_loop.stop(&mut self.loaded[index].plugin);
+        Ok(())
+    }
+
+    /// The visualization module that is running, and the plugin that owns it.
+    ///
+    /// `None` while no module runs: nothing started yet, the visualization was
+    /// stopped, or the start was refused (S09 §5.3 step 1).
+    pub fn running_vis(&self) -> Option<RunningVis> {
+        if !self.vis_loop.is_running() {
+            return None;
+        }
+        let entry = self
+            .loaded
+            .iter()
+            .find(|entry| entry.plugin.vis_run_info().is_some())?;
+        let info = entry.plugin.vis_run_info()?;
+        Some(RunningVis {
+            plugin_id: entry.id,
+            info,
+        })
+    }
+
+    /// One step of the running visualization's render loop (S09 §5.3 step 4).
+    ///
+    /// The caller drives the loop: it says when a step is due (`now_ms`) and
+    /// which frame the step draws (`rows`). With no visualization running
+    /// there is nothing to draw, and the step is [`VisStep::Idle`].
+    ///
+    /// The rows are the caller's frame — the one the host picked from its
+    /// frame ring — or none, in which case both arrays are zeroed completely
+    /// (S09 §5.3 step 4b).
+    pub fn step_vis(
+        &mut self,
+        now_ms: u64,
+        rows: Option<&VisRows>,
+    ) -> Result<VisStep, RegistryVisError> {
+        let Some(index) = self.running_vis_index() else {
+            return Ok(VisStep::Idle);
+        };
+        self.vis_loop
+            .step(&self.loaded[index].plugin, now_ms, rows)
+            .map_err(RegistryVisError::Vis)
+    }
+
+    /// Tell the running visualization's loop what the player is doing
+    /// (S09 §5.3 step 4).
+    ///
+    /// The transition matters twice: a playback that stops draws one last
+    /// frame with zeroed data, and a playback that restarts draws a frame
+    /// again (S09 §5.3 step 4b). A repeated state changes nothing, so a
+    /// player that publishes its state often does not disturb the cadence.
+    pub fn set_vis_playback(&mut self, playback: VisPlayback) {
+        self.vis_loop.set_playback(playback);
+    }
+
+    /// The state of the visualization render loop (S09 §5.3 step 4).
+    ///
+    /// The loop's cadence — the module's own `delay_ms` and the shorter pause
+    /// the loop takes while it draws nothing — is what the caller waits
+    /// between two steps (S09 §5.3 step 4b, step 4c). The loop owns no
+    /// thread: the caller drives it (see [`step_vis`](Self::step_vis)).
+    pub fn vis_loop(&self) -> &VisLoop {
+        &self.vis_loop
+    }
+
+    /// The index of the loaded plugin that owns the running module.
+    fn running_vis_index(&self) -> Option<usize> {
+        self.loaded
+            .iter()
+            .position(|entry| entry.plugin.vis_run_info().is_some())
+    }
+
+    /// Select the output plugin the host hands to input plugins (S09 §3.5 step 2).
+    ///
+    /// S09 names the selection by the `config_outname` setting — the output
+    /// plug-in's **file name** — and falls back to the DirectSound and then
+    /// the waveOut output when that one is unavailable. The setting does not
+    /// exist yet (S12 owns it) and this host has no stock outputs, so the
+    /// selection is made by the id the host assigned the loaded plug-in. *Which*
+    /// plug-in that is stays the caller's decision; this host only remembers
+    /// it and hands it to the input plugins.
+    ///
+    /// A plug-in of another kind is refused: only an output plugin can be the
+    /// `out_module` of an input plugin (S09 §3.1 offset 0x94, §4.1).
+    pub fn select_output(&mut self, plugin_id: u32) -> Result<(), HandoffError> {
+        let entry = self
+            .loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or(HandoffError::UnknownPlugin(plugin_id))?;
+        let actual = entry.plugin.kind();
+        if actual != PluginKind::Output {
+            return Err(HandoffError::WrongKind {
+                expected: PluginKind::Output,
+                actual,
+            });
+        }
+        self.selected_output = Some(plugin_id);
+        Ok(())
+    }
+
+    /// The id of the selected output plugin, if one is selected.
+    pub fn selected_output(&self) -> Option<u32> {
+        self.selected_output
+    }
+
+    /// The loaded input plugin with this id, or the reason there is none.
+    ///
+    /// A plug-in of another kind is refused: the host compares the kind it
+    /// recorded when the plug-in was loaded with the kind the route needs,
+    /// the same check the load path makes twice. A plug-in that is not live
+    /// is refused as well: `quit` already ran, so there is nothing to drive.
+    #[cfg(any(windows, test))]
+    fn input_entry(&self, plugin_id: u32) -> Result<&LoadedEntry, HandoffError> {
+        let entry = self
+            .loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)
+            .ok_or(HandoffError::UnknownPlugin(plugin_id))?;
+        let actual = entry.plugin.kind();
+        if actual != PluginKind::Input {
+            return Err(HandoffError::WrongKind {
+                expected: PluginKind::Input,
+                actual,
+            });
+        }
+        if !entry.plugin.is_initialized() {
+            return Err(HandoffError::NotInitialized);
+        }
+        Ok(entry)
+    }
+
+    /// Play a file through an input plugin, handing it the selected output
+    /// plugin first (S09 §3.5 steps 2–3, §3.7).
+    ///
+    /// The hand-over happens **before** `play`: the output module pointer goes
+    /// into the input module's `out_module` member (S09 §3.1 offset 0x94) and
+    /// the host's volume and pan are applied to the output (S09 §3.5 step 2).
+    /// The input plugin then drives the output itself — `open`, `write`,
+    /// `can_write`, `is_playing`, `close` (S09 §3.5 steps 3–5, §3.7).
+    ///
+    /// A plugin that does not route its audio through an output plugin (flag
+    /// bit 0 clear, S09 §3.3) is handed nothing: it supplies its own volume,
+    /// pan and timekeeping (S09 §3.7).
+    ///
+    /// `volume` is `0..=255` and `pan` the player's balance, which the host
+    /// passes on unchanged.
+    #[cfg(any(windows, test))]
+    pub fn play_input(
+        &self,
+        plugin_id: u32,
+        path: &Path,
+        volume: u8,
+        pan: i8,
+    ) -> Result<(), HandoffError> {
+        let entry = self.input_entry(plugin_id)?;
+        let input = entry
+            .plugin
+            .input_module_ptr()
+            .ok_or(HandoffError::NullModule)?;
+        // S09 §3.5 step 2: the output is handed over only to a plugin that
+        // routes its audio through one (flag bit 0, S09 §3.3).
+        // SAFETY: live module in the plugin's static data.
+        let uses_output = unsafe { crate::handoff::uses_output_plugin(&*input) };
+        if uses_output {
+            let output_id = self.selected_output.ok_or(HandoffError::NoOutputSelected)?;
+            let output_entry = self
+                .loaded
+                .iter()
+                .find(|entry| entry.id == output_id)
+                .ok_or(HandoffError::UnknownPlugin(output_id))?;
+            let output = output_entry
+                .plugin
+                .output_module_ptr()
+                .ok_or(HandoffError::NullModule)?;
+            // SAFETY: both pointers are live modules in the mapped plugins'
+            // static data (S09 §0).
+            unsafe { crate::handoff::hand_off_output(input, output, volume, pan)? };
+        }
+        entry.plugin.input_play(path).map_err(HandoffError::from)
+    }
+
+    /// Seek the input plugin's stream to `time_ms` milliseconds
+    /// (S09 §3.1 offset 0x54).
+    ///
+    /// **This one call is the whole of the host's part of a seek.** The
+    /// plugin signals its own decode thread to seek and then calls the
+    /// output's `flush(time_ms)` itself (S09 §3.1 offset 0x54, §3.7); S09
+    /// §4.2 step 3 puts the output's `flush` on the input plugin's side of
+    /// the hand-over ("from the UI or seek path through the input plugin").
+    /// The host calls no output callback here, or the output would be
+    /// flushed a second time.
+    ///
+    /// `time_ms` is the plugin's own millisecond value. S09 names no range
+    /// for it, so the host forwards the number unchanged and lets the plugin
+    /// decide what it means.
+    ///
+    /// S09 does not say whether the host must consult the input module's
+    /// `seekable` member (offset 0x14) before a seek. The host does not:
+    /// S09 §3.1 says that member "may change while playing", and the plugin
+    /// knows its own stream. A seek request is forwarded and the plugin
+    /// decides what it does with it.
+    ///
+    /// The call belongs on the UI thread and must not block for long
+    /// (S09 §3.6).
+    #[cfg(any(windows, test))]
+    pub fn seek_input(&self, plugin_id: u32, time_ms: i32) -> Result<(), HandoffError> {
+        let entry = self.input_entry(plugin_id)?;
+        entry.plugin.input_seek(time_ms).map_err(HandoffError::from)
+    }
+
+    /// Pause the input plugin's playback (S09 §3.1 offset 0x3C).
+    ///
+    /// The host pauses the **input plugin**; the plugin pauses the output it
+    /// drives with the output's own `pause(state)` (S09 §3.7, §4.1 offset
+    /// 0x38, §4.2 step 3). The host calls no output callback of its own.
+    ///
+    /// The call belongs on the UI thread and must not block for long
+    /// (S09 §3.6).
+    #[cfg(any(windows, test))]
+    pub fn pause_input(&self, plugin_id: u32) -> Result<(), HandoffError> {
+        let entry = self.input_entry(plugin_id)?;
+        entry.plugin.input_pause().map_err(HandoffError::from)
+    }
+
+    /// Resume the input plugin's playback (S09 §3.1 offset 0x40).
+    ///
+    /// The resume takes the same route as the pause: the host resumes the
+    /// input plugin, and the plugin resumes the output it drives (S09 §3.7,
+    /// §4.1 offset 0x38).
+    #[cfg(any(windows, test))]
+    pub fn unpause_input(&self, plugin_id: u32) -> Result<(), HandoffError> {
+        let entry = self.input_entry(plugin_id)?;
+        entry.plugin.input_unpause().map_err(HandoffError::from)
+    }
+
+    /// Stop the input plugin's playback (S09 §3.5 step 6, S09 §3.1 offset
+    /// 0x48).
+    ///
+    /// The host calls the **input plugin's** `stop` and nothing else: "User
+    /// stop: the host calls `stop()`" (S09 §3.5 step 6). The rest of the step
+    /// is the plugin's own work — it stops its decode thread, closes the
+    /// output it drives and calls the host's `analyzer_deinit` (S09 §3.1
+    /// offset 0x48, §3.5 step 6). The host calls no output callback of its
+    /// own here: the output's `close` belongs to the plugin's decode thread
+    /// (S09 §3.6, §3.7, §4.2 step 3), and a host-side close would close the
+    /// output a second time.
+    ///
+    /// The route keeps **no playback state**, exactly like
+    /// [`play_input`](Self::play_input), [`seek_input`](Self::seek_input),
+    /// [`pause_input`](Self::pause_input) and
+    /// [`unpause_input`](Self::unpause_input): it forwards the request and
+    /// reports what the plugin did. A stop after a play therefore reaches the
+    /// plugin, which closes the output it opened; a stop without a play
+    /// reaches the plugin as well, and what a stop without a stream means is
+    /// the plugin's own business (S09 §3.1 offset 0x48). A second stop is
+    /// **not** swallowed by the host either: the plugin's `stop` runs again
+    /// and the plugin decides what that means for its stream.
+    ///
+    /// The call belongs on the UI thread and must not block for long
+    /// (S09 §3.6). A fault in the plugin's `stop` names the plugin: the call
+    /// runs inside the loader's call scope (see
+    /// [`crate::fault::plugin_call_scope`]).
+    #[cfg(any(windows, test))]
+    pub fn stop_input(&self, plugin_id: u32) -> Result<(), HandoffError> {
+        let entry = self.input_entry(plugin_id)?;
+        entry.plugin.input_stop().map_err(HandoffError::from)
+    }
+
+    /// What the plugin with this id reports about itself, if it is a general
+    /// plugin ([`LoadedPlugin::general_info`]).
+    pub fn general_info(&self, plugin_id: u32) -> Option<crate::loader::GeneralModuleInfo> {
+        self.loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)?
+            .plugin
+            .general_info()
+    }
+
+    /// What the plugin with this id reports about itself, if it is an input
+    /// plugin ([`LoadedPlugin::input_info`]).
+    ///
+    /// The report is read back out of the plugin's own module struct, so it
+    /// shows the members the host filled — including `out_module`, which the
+    /// hand-over writes before `play` (S09 §3.1 offset 0x94, §3.5 step 2).
+    #[cfg(any(windows, test))]
+    pub fn input_info(&self, plugin_id: u32) -> Option<crate::input::InModuleInfo> {
+        self.loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)?
+            .plugin
+            .input_info()
+    }
+
+    /// What the plugin with this id reports about itself, if it is an output
+    /// plugin ([`LoadedPlugin::output_info`]).
+    ///
+    /// The report is read back out of the plugin's own module struct, so it
+    /// shows the members the host filled (S09 §4.1).
+    pub fn output_info(&self, plugin_id: u32) -> Option<crate::loader::OutModuleInfo> {
+        self.loaded
+            .iter()
+            .find(|entry| entry.id == plugin_id)?
+            .plugin
+            .output_info()
+    }
+
+    /// Quit every loaded plugin in **reverse** load order (S09 §3.5 line 166,
+    /// §7.2 line 380) and return the ids in the order they were quit.
+    ///
+    /// The DLLs stay mapped (S09 §1 line 46). Idempotent: a second call quits
+    /// nothing again, because [`LoadedPlugin::quit`] is.
+    pub fn quit_all(&mut self) -> Vec<u32> {
+        let mut order = Vec::with_capacity(self.loaded.len());
+        for entry in self.loaded.iter_mut().rev() {
+            entry.plugin.quit();
+            order.push(entry.id);
+        }
+        order
+    }
+
+    /// Take ownership of a plugin that was loaded elsewhere, for tests of the
+    /// registry's ordering and dispatch that must not map a DLL.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, plugin: LoadedPlugin) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.loaded.push(LoadedEntry { id, plugin });
+        id
+    }
+}
+
+impl Drop for PluginRegistry {
+    fn drop(&mut self) {
+        // Reverse order here too: dropping the Vec would quit in load order.
+        self.quit_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pe_preflight::test_dll;
+    use rustamp_plugin_abi::general::GeneralPlugin;
+    use rustamp_plugin_abi::vis::{VisHeader, VisModule};
+
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new(bytes: &[u8]) -> Self {
+            use std::io::Write;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "rustamp-registry-test-{}-{}.dll",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+            Self(path)
+        }
+
+        fn as_str(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn error_message(reply: &Message) -> &str {
+        match reply {
+            Message::PluginError { message, .. } => message,
+            other => panic!("expected a PluginError, got {other:?}"),
+        }
+    }
+
+    // ---- synthetic general plugins, for ordering and dispatch -------------
+
+    thread_local! {
+        static QUIT_LOG: std::cell::RefCell<Vec<&'static str>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        static CONFIG_LOG: std::cell::RefCell<Vec<&'static str>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    unsafe extern "C" fn quit_a() {
+        QUIT_LOG.with(|log| log.borrow_mut().push("a"));
+    }
+    unsafe extern "C" fn quit_b() {
+        QUIT_LOG.with(|log| log.borrow_mut().push("b"));
+    }
+    unsafe extern "C" fn quit_c() {
+        QUIT_LOG.with(|log| log.borrow_mut().push("c"));
+    }
+    unsafe extern "C" fn config_a() {
+        CONFIG_LOG.with(|log| log.borrow_mut().push("a"));
+    }
+
+    fn general(
+        config: Option<unsafe extern "C" fn()>,
+        quit: Option<unsafe extern "C" fn()>,
+    ) -> &'static mut GeneralPlugin {
+        // Leaked on purpose: the module must outlive the registry that holds a
+        // raw pointer to it, exactly as a mapped DLL's static data does.
+        Box::leak(Box::new(GeneralPlugin {
+            version: rustamp_plugin_abi::common::GEN_VERSION,
+            description: c"synthetic general".as_ptr(),
+            config,
+            quit,
+            ..GeneralPlugin::default()
+        }))
+    }
+
+    // ---- a synthetic visualization library, for the vis configure route ----
+
+    thread_local! {
+        /// The module the synthetic vis getter hands out.
+        static VIS_MODULE: std::cell::Cell<*mut VisModule> = const {
+            std::cell::Cell::new(core::ptr::null_mut())
+        };
+    }
+
+    unsafe extern "C" fn vis_get_module(index: core::ffi::c_int) -> *mut VisModule {
+        if index != 0 {
+            return core::ptr::null_mut();
+        }
+        VIS_MODULE.with(|slot| slot.get())
+    }
+
+    unsafe extern "C" fn vis_config(_module: *mut VisModule) {
+        CONFIG_LOG.with(|log| log.borrow_mut().push("vis"));
+    }
+
+    /// A synthetic visualization library with one module that has a `config`
+    /// slot (S09 §5.2 offset 0x924). The module and the header are leaked on
+    /// purpose: the registry holds raw pointers into them, exactly as it does
+    /// into a mapped DLL's static data.
+    fn vis_library() -> (*mut VisHeader, Vec<crate::vis::VisModuleEntry>) {
+        let module: &'static mut VisModule = Box::leak(Box::new(VisModule {
+            description: c"synthetic vis".as_ptr(),
+            config: Some(vis_config),
+            ..VisModule::default()
+        }));
+        VIS_MODULE.with(|slot| slot.set(module as *mut VisModule));
+        let header: &'static mut VisHeader = Box::leak(Box::new(VisHeader {
+            version: rustamp_plugin_abi::common::VIS_VERSION,
+            description: c"synthetic vis library".as_ptr(),
+            get_module: Some(vis_get_module),
+        }));
+        // SAFETY: live leaked header and module; no DLL is involved.
+        let modules = unsafe { crate::vis::list_vis_modules(header) }
+            .expect("a valid header must list its modules");
+        (header as *mut VisHeader, modules)
+    }
+
+    #[test]
+    fn an_unavailable_approval_store_refuses_every_load_with_its_reason() {
+        let fixture = Fixture::new(&test_dll(0x014c));
+        let mut registry =
+            PluginRegistry::unavailable("plugins-approved.toml: line 3 is malformed");
+        assert_eq!(registry.approved_count(), None);
+        // SAFETY: the refusal happens before any approval or mapping.
+        let reply = unsafe {
+            registry.handle_load_request(fixture.as_str(), PluginKind::Input, &HostWindow::dummy())
+        };
+        let message = error_message(&reply);
+        assert!(
+            message.contains("approval store is unavailable")
+                && message.contains("line 3 is malformed"),
+            "the reason must survive into the reply: {message}"
+        );
+        assert!(registry.loaded_ids().is_empty());
+    }
+
+    #[test]
+    fn an_empty_store_approves_nothing_even_for_a_structurally_valid_dll() {
+        let fixture = Fixture::new(&test_dll(0x014c));
+        // The candidate passes passive preflight as an input plugin...
+        assert_eq!(
+            crate::pe_preflight::check_pe_i386_dll(&test_dll(0x014c)),
+            Ok(PluginKind::Input)
+        );
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        assert_eq!(registry.approved_count(), Some(0));
+        // ... and is still refused, because preflight is not approval.
+        // SAFETY: an empty allowlist refuses before any mapping.
+        let reply = unsafe {
+            registry.handle_load_request(fixture.as_str(), PluginKind::Input, &HostWindow::dummy())
+        };
+        let message = error_message(&reply);
+        assert!(
+            message.contains("do not match the approved image"),
+            "expected the loader's own refusal: {message}"
+        );
+        assert!(registry.loaded_ids().is_empty());
+    }
+
+    #[test]
+    fn a_wrong_expected_kind_is_refused_before_any_mapping() {
+        // The fixture exports winampGetInModule2; the request asks for a
+        // general plugin. Approve the bytes, so that nothing but the kind can
+        // be what refuses this.
+        let bytes = test_dll(0x014c);
+        let fixture = Fixture::new(&bytes);
+        let mut store = ApprovalStore::new();
+        store.approve_bytes("test.dll", &bytes).unwrap();
+        let mut registry = PluginRegistry::new(store);
+        // SAFETY: the kind mismatch refuses before any mapping.
+        let reply = unsafe {
+            registry.handle_load_request(
+                fixture.as_str(),
+                PluginKind::General,
+                &HostWindow::dummy(),
+            )
+        };
+        let message = error_message(&reply);
+        assert!(
+            message.contains("refused before any mapping")
+                && message.contains("asked for General")
+                && message.contains("winampGetInModule2"),
+            "the reply must name both kinds and say nothing ran: {message}"
+        );
+        assert!(registry.loaded_ids().is_empty());
+    }
+
+    #[test]
+    fn an_output_candidate_is_refused_when_another_kind_was_asked_for() {
+        // The fixture exports winampGetOutModule (S09 §2); the request asks
+        // for an input plugin. Approve the bytes, so that nothing but the
+        // kind can be what refuses this.
+        let mut bytes = test_dll(0x014c);
+        let name = b"winampGetOutModule\0";
+        bytes[0x260..0x260 + name.len()].copy_from_slice(name);
+        assert_eq!(
+            crate::pe_preflight::check_pe_i386_dll(&bytes),
+            Ok(PluginKind::Output)
+        );
+        let fixture = Fixture::new(&bytes);
+        let mut store = ApprovalStore::new();
+        store.approve_bytes("out_test.dll", &bytes).unwrap();
+        let mut registry = PluginRegistry::new(store);
+        // SAFETY: the kind mismatch refuses before any mapping.
+        let reply = unsafe {
+            registry.handle_load_request(fixture.as_str(), PluginKind::Input, &HostWindow::dummy())
+        };
+        let message = error_message(&reply);
+        assert!(
+            message.contains("refused before any mapping")
+                && message.contains("asked for Input")
+                && message.contains("winampGetOutModule"),
+            "the reply must name both kinds and say nothing ran: {message}"
+        );
+        assert!(registry.loaded_ids().is_empty());
+    }
+
+    #[test]
+    fn a_visualization_candidate_is_refused_when_another_kind_was_asked_for() {
+        // The fixture exports winampVisGetHeader (S09 §2); the request asks
+        // for an input plugin. Approve the bytes, so that nothing but the
+        // kind can be what refuses this.
+        let mut bytes = test_dll(0x014c);
+        let name = b"winampVisGetHeader\0";
+        bytes[0x260..0x260 + name.len()].copy_from_slice(name);
+        assert_eq!(
+            crate::pe_preflight::check_pe_i386_dll(&bytes),
+            Ok(PluginKind::Visualization)
+        );
+        let fixture = Fixture::new(&bytes);
+        let mut store = ApprovalStore::new();
+        store.approve_bytes("vis_test.dll", &bytes).unwrap();
+        let mut registry = PluginRegistry::new(store);
+        // SAFETY: the kind mismatch refuses before any mapping.
+        let reply = unsafe {
+            registry.handle_load_request(fixture.as_str(), PluginKind::Input, &HostWindow::dummy())
+        };
+        let message = error_message(&reply);
+        assert!(
+            message.contains("refused before any mapping")
+                && message.contains("asked for Input")
+                && message.contains("winampVisGetHeader"),
+            "the reply must name both kinds and say nothing ran: {message}"
+        );
+        assert!(registry.loaded_ids().is_empty());
+    }
+
+    #[test]
+    fn a_dsp_candidate_is_refused_when_another_kind_was_asked_for() {
+        // The fixture exports winampDSPGetHeader2 (S09 §2); the request asks
+        // for an input plugin. Approve the bytes, so that nothing but the
+        // kind can be what refuses this.
+        let mut bytes = test_dll(0x014c);
+        let name = b"winampDSPGetHeader2\0";
+        bytes[0x260..0x260 + name.len()].copy_from_slice(name);
+        assert_eq!(
+            crate::pe_preflight::check_pe_i386_dll(&bytes),
+            Ok(PluginKind::Dsp)
+        );
+        let fixture = Fixture::new(&bytes);
+        let mut store = ApprovalStore::new();
+        store.approve_bytes("dsp_test.dll", &bytes).unwrap();
+        let mut registry = PluginRegistry::new(store);
+        // SAFETY: the kind mismatch refuses before any mapping.
+        let reply = unsafe {
+            registry.handle_load_request(fixture.as_str(), PluginKind::Input, &HostWindow::dummy())
+        };
+        let message = error_message(&reply);
+        assert!(
+            message.contains("refused before any mapping")
+                && message.contains("asked for Input")
+                && message.contains("winampDSPGetHeader2"),
+            "the reply must name both kinds and say nothing ran: {message}"
+        );
+        assert!(registry.loaded_ids().is_empty());
+    }
+
+    #[test]
+    fn a_missing_file_reports_the_real_io_error() {
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        let missing = std::env::temp_dir().join("rustamp-registry-no-such-plugin.dll");
+        // SAFETY: nothing is mapped; the read fails first.
+        let reply = unsafe {
+            registry.handle_load_request(
+                missing.to_str().unwrap(),
+                PluginKind::Input,
+                &HostWindow::dummy(),
+            )
+        };
+        let message = error_message(&reply);
+        assert!(
+            message.contains("could not be read"),
+            "the I/O error must not be swallowed: {message}"
+        );
+        match &reply {
+            Message::PluginError { path, .. } => {
+                assert_eq!(
+                    path,
+                    missing.to_str().unwrap(),
+                    "the reply names the request"
+                )
+            }
+            other => panic!("expected PluginError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_loaded_kind_is_authoritative_after_the_load() {
+        assert_eq!(
+            accept_loaded_kind(PluginKind::General, PluginKind::General),
+            Ok(())
+        );
+        for (expected, actual) in [
+            (PluginKind::General, PluginKind::Input),
+            (PluginKind::Input, PluginKind::Dsp),
+            (PluginKind::Dsp, PluginKind::Visualization),
+            (PluginKind::Input, PluginKind::Output),
+            (PluginKind::Output, PluginKind::General),
+        ] {
+            let message = accept_loaded_kind(expected, actual)
+                .expect_err("a mismatch must never be accepted");
+            assert!(message.contains(&format!("{actual:?}")));
+            assert!(message.contains(&format!("{expected:?}")));
+        }
+    }
+
+    #[test]
+    fn plugins_quit_in_reverse_load_order() {
+        QUIT_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        let a = registry.insert_for_test(LoadedPlugin::general_for_test(
+            "gen_a",
+            general(None, Some(quit_a)),
+            true,
+            0,
+        ));
+        let b = registry.insert_for_test(LoadedPlugin::general_for_test(
+            "gen_b",
+            general(None, Some(quit_b)),
+            true,
+            0,
+        ));
+        let c = registry.insert_for_test(LoadedPlugin::general_for_test(
+            "gen_c",
+            general(None, Some(quit_c)),
+            true,
+            0,
+        ));
+        assert_eq!(registry.loaded_ids(), vec![a, b, c]);
+
+        assert_eq!(registry.quit_all(), vec![c, b, a]);
+        assert_eq!(
+            QUIT_LOG.with(|log| log.borrow().clone()),
+            vec!["c", "b", "a"],
+            "the plugins themselves must see reverse load order"
+        );
+
+        // Idempotent, including through Drop.
+        assert_eq!(registry.quit_all(), vec![c, b, a]);
+        drop(registry);
+        assert_eq!(
+            QUIT_LOG.with(|log| log.borrow().clone()),
+            vec!["c", "b", "a"],
+            "no plugin may be quit twice"
+        );
+    }
+
+    #[test]
+    fn configure_reaches_exactly_the_named_plugin_and_refuses_an_unknown_id_or_a_wrong_kind() {
+        CONFIG_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        let with_config = registry.insert_for_test(LoadedPlugin::general_for_test(
+            "gen_with_config",
+            general(Some(config_a), None),
+            true,
+            0,
+        ));
+        let without = registry.insert_for_test(LoadedPlugin::general_for_test(
+            "gen_without_config",
+            general(None, None),
+            true,
+            0,
+        ));
+
+        assert_eq!(
+            registry.configure_plugin(with_config, PluginKind::General),
+            Ok(())
+        );
+        assert_eq!(CONFIG_LOG.with(|log| log.borrow().clone()), vec!["a"]);
+
+        assert_eq!(
+            registry.configure_plugin(without, PluginKind::General),
+            Err(RegistryConfigError::Plugin(
+                PluginConfigError::MissingCallback
+            ))
+        );
+        // The request named a kind the loaded plugin does not have: nothing
+        // may be called, and the refusal names both kinds.
+        assert_eq!(
+            registry.configure_plugin(with_config, PluginKind::Dsp),
+            Err(RegistryConfigError::WrongKind {
+                expected: PluginKind::Dsp,
+                actual: PluginKind::General,
+            })
+        );
+        assert_eq!(
+            registry.configure_plugin(9_999, PluginKind::General),
+            Err(RegistryConfigError::UnknownPlugin(9_999))
+        );
+        assert_eq!(
+            CONFIG_LOG.with(|log| log.borrow().clone()),
+            vec!["a"],
+            "only the plugin that has a config slot may have been called"
+        );
+
+        // And the info an acceptance runner checks before calling anything.
+        let info = registry
+            .general_info(without)
+            .expect("a general plugin reports its slots");
+        assert!(!info.has_config && !info.has_quit);
+        assert!(registry.general_info(9_999).is_none());
+    }
+
+    #[test]
+    fn the_vis_configure_request_reaches_the_running_visualization() {
+        // The running-visualization slot is process-global, so this test takes
+        // the same lock the visualization bridge's own tests take.
+        let _guard = crate::vis::VIS_SLOT_LOCK.lock().unwrap();
+        CONFIG_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+
+        // No visualization runs: there is none to configure.
+        assert_eq!(
+            registry.configure_vis(),
+            Err(RegistryConfigError::NoRunningVis)
+        );
+        assert!(CONFIG_LOG.with(|log| log.borrow().is_empty()));
+
+        let (header, modules) = vis_library();
+        let mut plugin = LoadedPlugin::vis_for_test("vis_synthetic", header, modules, 0x99);
+        plugin.vis_start(0).expect("the module must start");
+        let id = registry.insert_for_test(plugin);
+
+        assert_eq!(registry.configure_vis(), Ok(()));
+        assert_eq!(
+            CONFIG_LOG.with(|log| log.borrow().clone()),
+            vec!["vis"],
+            "the config callback must run exactly once"
+        );
+
+        // The id-addressed route reaches the same plugin.
+        assert_eq!(
+            registry.configure_plugin(id, PluginKind::Visualization),
+            Ok(())
+        );
+        assert_eq!(
+            CONFIG_LOG.with(|log| log.borrow().clone()),
+            vec!["vis", "vis"]
+        );
+    }
+
+    // ---- a scripted visualization library, for the start/stop route ----
+
+    thread_local! {
+        /// The modules the scripted getter hands out, in index order.
+        static SCRIPTED_MODULES: std::cell::RefCell<Vec<*mut VisModule>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        /// What the scripted callbacks recorded, in call order.
+        static VIS_LOG: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Record one scripted event.
+    fn vis_note(entry: impl Into<String>) {
+        VIS_LOG.with(|log| log.borrow_mut().push(entry.into()));
+    }
+
+    /// The scripted events so far.
+    fn vis_log() -> Vec<String> {
+        VIS_LOG.with(|log| log.borrow().clone())
+    }
+
+    /// The scripted getter: it hands out the modules of the library it was
+    /// built for and answers null past the last one (S09 §5.1).
+    unsafe extern "C" fn scripted_get_module(index: core::ffi::c_int) -> *mut VisModule {
+        SCRIPTED_MODULES.with(|modules| {
+            let modules = modules.borrow();
+            let index = usize::try_from(index).unwrap_or(usize::MAX);
+            modules.get(index).copied().unwrap_or(core::ptr::null_mut())
+        })
+    }
+
+    /// The name a scripted module carries, read out of its own struct.
+    fn scripted_name(module: *mut VisModule) -> String {
+        if module.is_null() {
+            return "no module".to_string();
+        }
+        // SAFETY: the module is live in the test's own leaked storage.
+        let description = unsafe { (*module).description };
+        if description.is_null() {
+            return "no name".to_string();
+        }
+        // SAFETY: the description is a NUL-terminated static string.
+        unsafe { core::ffi::CStr::from_ptr(description) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The scripted `init`: it records the module's own name and the parent
+    /// window the host filled in before the call (S09 §5.2, §5.3 step 2).
+    unsafe extern "C" fn scripted_init(module: *mut VisModule) -> core::ffi::c_int {
+        let name = scripted_name(module);
+        let parent = if module.is_null() {
+            0
+        } else {
+            // SAFETY: the module is live in the test's own leaked storage.
+            unsafe { (*module).parent_window as usize }
+        };
+        vis_note(format!("init {name} parent={parent:#x}"));
+        0
+    }
+
+    /// The scripted `init` of a module that refuses to start (S09 §5.2).
+    unsafe extern "C" fn scripted_init_refusing(_module: *mut VisModule) -> core::ffi::c_int {
+        vis_note("init refused");
+        1
+    }
+
+    /// The scripted `render`: it records that a frame was drawn.
+    unsafe extern "C" fn scripted_render(_module: *mut VisModule) -> core::ffi::c_int {
+        vis_note("render");
+        0
+    }
+
+    /// The scripted `quit`: it records the teardown.
+    unsafe extern "C" fn scripted_quit(module: *mut VisModule) {
+        let name = scripted_name(module);
+        vis_note(format!("quit {name}"));
+    }
+
+    /// A scripted module. Its name says which module of the library it is.
+    fn scripted_module(index: usize, refuses: bool) -> VisModule {
+        // The name is leaked on purpose: the module's description member points
+        // at it for as long as the library lives.
+        let description: &'static mut core::ffi::CStr = Box::leak(
+            std::ffi::CString::new(format!("module {index}"))
+                .expect("a module name without a NUL is buildable")
+                .into_boxed_c_str(),
+        );
+        VisModule {
+            description: description.as_ptr(),
+            latency_ms: 14,
+            delay_ms: 14,
+            spectrum_rows: 2,
+            waveform_rows: 2,
+            init: Some(if refuses {
+                scripted_init_refusing
+            } else {
+                scripted_init
+            }),
+            render: Some(scripted_render),
+            quit: Some(scripted_quit),
+            ..VisModule::default()
+        }
+    }
+
+    /// A scripted visualization library, wrapped as a loaded plugin.
+    ///
+    /// The library hands out `module_count` modules; the last one refuses to
+    /// start when `refusing` is set. The modules and the header are leaked on
+    /// purpose: the registry holds raw pointers into them, exactly as it does
+    /// into a mapped DLL's static data.
+    fn scripted_library(
+        name: &str,
+        module_count: usize,
+        refusing: bool,
+        host_hwnd: usize,
+    ) -> LoadedPlugin {
+        let mut modules = Vec::new();
+        for index in 0..module_count {
+            let refuses = refusing && index + 1 == module_count;
+            let module: &'static mut VisModule =
+                Box::leak(Box::new(scripted_module(index, refuses)));
+            modules.push(module as *mut VisModule);
+        }
+        SCRIPTED_MODULES.with(|slot| *slot.borrow_mut() = modules.clone());
+        let header: &'static mut VisHeader = Box::leak(Box::new(VisHeader {
+            version: rustamp_plugin_abi::common::VIS_VERSION,
+            description: c"scripted vis library".as_ptr(),
+            get_module: Some(scripted_get_module),
+        }));
+        // SAFETY: live leaked header and modules; no DLL is involved.
+        let entries = unsafe { crate::vis::list_vis_modules(header) }
+            .expect("a valid header must list its modules");
+        LoadedPlugin::vis_for_test(name, header as *mut VisHeader, entries, host_hwnd)
+    }
+
+    #[test]
+    fn the_start_route_fills_the_module_and_the_running_one_is_reported() {
+        // The running-visualization slot is process-global, so this test takes
+        // the same lock the visualization bridge's own tests take.
+        let _guard = crate::vis::VIS_SLOT_LOCK.lock().unwrap();
+        VIS_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        let id = registry.insert_for_test(scripted_library("vis_first", 2, false, 0x99));
+
+        // Nothing runs before the user picks a module (S09 §5.3 step 1).
+        assert!(registry.running_vis().is_none());
+        assert_eq!(
+            registry.step_vis(0, None).expect("no frame may be drawn"),
+            VisStep::Idle
+        );
+
+        // S09 §5.3 step 2: the host fills the members and calls `init` on the
+        // module the request named.
+        registry.start_vis(id, 1).expect("the module must start");
+        assert_eq!(
+            vis_log(),
+            vec!["init module 1 parent=0x99"],
+            "the chosen module's own init must run with the parent window filled"
+        );
+
+        // The registry reports the truth about what runs.
+        let running = registry.running_vis().expect("a visualization must run");
+        assert_eq!(running.plugin_id, id);
+        assert_eq!(running.info.index, 1, "the running module's own index");
+        assert_eq!(running.info.parent_window, 0x99);
+        assert_eq!(running.info.delay_ms, 14);
+        assert!(running.info.init_called);
+        assert_eq!(running.info.init_result, 0);
+        // The loop's cadence is the module's own delay (S09 §5.2, offset 0x018).
+        assert_eq!(registry.vis_loop().delay_ms(), 14);
+    }
+
+    #[test]
+    fn a_second_start_stops_the_running_visualization() {
+        let _guard = crate::vis::VIS_SLOT_LOCK.lock().unwrap();
+        VIS_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        let first = registry.insert_for_test(scripted_library("vis_first", 2, false, 0x99));
+        let second = registry.insert_for_test(scripted_library("vis_second", 1, false, 0xAB));
+
+        registry
+            .start_vis(first, 0)
+            .expect("the first module must start");
+        // S09 §5.3 step 1: the running visualization is stopped first.
+        registry
+            .start_vis(second, 0)
+            .expect("the second module must start");
+        assert_eq!(
+            vis_log(),
+            vec![
+                "init module 0 parent=0x99",
+                "quit module 0",
+                "init module 0 parent=0xab",
+            ],
+            "the running visualization must be quit before the next one starts"
+        );
+        let running = registry
+            .running_vis()
+            .expect("the second visualization must run");
+        assert_eq!(running.plugin_id, second);
+        assert_eq!(running.info.parent_window, 0xAB);
+    }
+
+    #[test]
+    fn the_stop_route_quits_the_module_exactly_once() {
+        let _guard = crate::vis::VIS_SLOT_LOCK.lock().unwrap();
+        VIS_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        let id = registry.insert_for_test(scripted_library("vis_first", 1, false, 0x99));
+
+        registry.start_vis(id, 0).expect("the module must start");
+        // S09 §5.3 step 5: leaving the loop runs the module's `quit`.
+        registry.stop_vis().expect("the visualization must stop");
+        assert_eq!(
+            vis_log(),
+            vec!["init module 0 parent=0x99", "quit module 0"]
+        );
+        assert!(
+            registry.running_vis().is_none(),
+            "nothing runs after the stop"
+        );
+
+        // A second stop quits nothing again.
+        assert_eq!(registry.stop_vis(), Err(RegistryVisError::NotRunning));
+        assert_eq!(vis_log().len(), 2, "the plugin must not be quit twice");
+    }
+
+    #[test]
+    fn a_wrong_id_or_a_wrong_kind_is_a_typed_error() {
+        let _guard = crate::vis::VIS_SLOT_LOCK.lock().unwrap();
+        VIS_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        let vis_id = registry.insert_for_test(scripted_library("vis_first", 1, false, 0x99));
+        let general_id = registry.insert_for_test(LoadedPlugin::general_for_test(
+            "gen_a",
+            general(None, None),
+            true,
+            0,
+        ));
+
+        assert_eq!(
+            registry.start_vis(9_999, 0),
+            Err(RegistryVisError::UnknownPlugin(9_999)),
+            "no plugin carries that id"
+        );
+        assert_eq!(
+            registry.start_vis(general_id, 0),
+            Err(RegistryVisError::WrongKind {
+                expected: PluginKind::Visualization,
+                actual: PluginKind::General,
+            }),
+            "the request named a kind the loaded plugin does not have"
+        );
+        assert_eq!(
+            registry.start_vis(vis_id, 7),
+            Err(RegistryVisError::Vis(VisError::UnknownModule(7))),
+            "the library has no module with that index"
+        );
+        assert!(vis_log().is_empty(), "nothing may be called");
+        assert!(registry.running_vis().is_none());
+        assert_eq!(registry.stop_vis(), Err(RegistryVisError::NotRunning));
+    }
+
+    #[test]
+    fn a_refusing_start_leaves_nothing_running() {
+        let _guard = crate::vis::VIS_SLOT_LOCK.lock().unwrap();
+        VIS_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        let id = registry.insert_for_test(scripted_library("vis_first", 1, true, 0x99));
+
+        // S09 §5.2: a nonzero `init` return aborts the start.
+        assert_eq!(
+            registry.start_vis(id, 0),
+            Err(RegistryVisError::Vis(VisError::InitFailed(1)))
+        );
+        assert_eq!(vis_log(), vec!["init refused"]);
+        assert!(
+            registry.running_vis().is_none(),
+            "a refused start must leave no visualization running"
+        );
+        assert_eq!(
+            registry.step_vis(0, None).expect("no frame may be drawn"),
+            VisStep::Idle
+        );
+    }
+
+    #[test]
+    fn the_caller_drives_the_render_loop() {
+        let _guard = crate::vis::VIS_SLOT_LOCK.lock().unwrap();
+        VIS_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        let id = registry.insert_for_test(scripted_library("vis_first", 1, false, 0x99));
+
+        registry.start_vis(id, 0).expect("the module must start");
+        // The loop draws nothing while the player has not said what it is
+        // doing (S09 §5.3 step 4).
+        assert_eq!(
+            registry.step_vis(0, None).expect("no frame may be drawn"),
+            VisStep::Idle
+        );
+        assert!(vis_log().iter().all(|entry| entry != "render"));
+
+        registry.set_vis_playback(VisPlayback::Playing);
+        assert_eq!(registry.vis_loop().playback(), Some(VisPlayback::Playing));
+        assert_eq!(
+            registry.step_vis(0, None).expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+        assert_eq!(vis_log().last(), Some(&"render".to_string()));
+
+        // The module's own delay is the pause between two frames
+        // (S09 §5.3 step 4b).
+        assert_eq!(
+            registry.step_vis(13, None).expect("no frame may be drawn"),
+            VisStep::NotDue
+        );
+        assert_eq!(
+            registry.step_vis(14, None).expect("a frame must be drawn"),
+            VisStep::Rendered
+        );
+    }
+
+    #[test]
+    fn the_registry_is_neither_send_nor_sync() {
+        // The registry holds the loaded plugins, and a plugin holds raw
+        // pointers into its mapped DLL. The render loop it owns must
+        // therefore be driven on the thread that owns the host window — a
+        // dedicated vis thread (S09 §5.3 step 4) cannot own the plugin
+        // without an explicit `unsafe impl Send` wrapper, which this host
+        // does not have.
+        //
+        // If either bound becomes true, two trait implementations match and
+        // inference fails at compile time. This requires no runtime/thread
+        // work.
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        trait AmbiguousIfSync<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+        let _ = <PluginRegistry as AmbiguousIfSend<_>>::check;
+        let _ = <PluginRegistry as AmbiguousIfSync<_>>::check;
+    }
+
+    #[test]
+    fn a_fresh_registry_holds_nothing_and_hands_out_ids_from_one() {
+        let registry = PluginRegistry::new(ApprovalStore::new());
+        assert!(registry.loaded_ids().is_empty());
+        assert_eq!(registry.next_id, 1, "0 is not handed out as a plugin id");
+        assert_eq!(registry.approved_count(), Some(0));
+    }
+}

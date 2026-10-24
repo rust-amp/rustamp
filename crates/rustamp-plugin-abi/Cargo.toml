@@ -1,0 +1,14 @@
+[package]
+name = "rustamp-plugin-abi"
+description = "Rustamp: Winamp classic plugin ABI"
+version.workspace = true
+edition.workspace = true
+# Permissive on purpose (RFC 0004): plugin authors must be able to reuse this
+# ABI crate under a permissive license, whatever their own plugin's license is.
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
