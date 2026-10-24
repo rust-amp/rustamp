@@ -129,4 +129,4 @@ Answers to the questions above: 1. partly - set seen is {`Connecting`,
 lost connection mid-play is not yet exercised. 4. answered for a slow connect
 (no §2 text). 2, 3, 5, 6 remain open.
 
-The frames and transcripts stay under `D:\codeustamp-vm\staging\out	ransfer-*`.
+The frames and transcripts stay under `D:\code\rustamp-vm\staging\out\transfer-*`.
