@@ -99,3 +99,24 @@ with no frames.
 
 Frames and logs stay under `D:\code\rustamp-vm\staging\out\transfer-normal\`
 (reference-binary output: dirty-room evidence, not copied into this repo).
+
+## Fourth attempt, 2026-10-24: from the first window at ~9 Hz
+
+The diagnostics now run after the loop and the cadence is ~10 Hz (353 frames in
+40 s; `frames\f000` is the first frame in which the main window exists).
+Contact sheet of f000-f023 (the scroller crop):
+
+* **f000-f001:** the scroller reads the bare URL: `1. HTTP://127.0.0.1:18080/STREA...` -
+  no bracket prefix, the title is the URL itself.
+* **f002 onward** (about 0.1-0.2 s later): `1. [READING ID3] HTTP://127.0.0...`,
+  unchanged through f023 (~2.4 s), so `[READING ID3]` is the long phase.
+* **No `Connecting to host...`, `Sending HTTP request`, `Reading HTTP
+  response` or counter text** appears in the scroller in any of the first 24
+  frames at 0.1 s resolution. Together with the 2 Hz run above this makes it
+  unlikely that S19 §2's two-line texts are drawn in the main window's client
+  area during a local, fast connect; they may exist only for slow connects or
+  in another place. S19 §2 stays **unmeasured**, with this negative on record.
+* The bracketed prefixes seen in the run (`[READING ID3]`, `[BUFFER: n%]`) are
+  the stream status the player must reproduce in the scroller.
+
+The rest of the 353 frames are not analysed yet.

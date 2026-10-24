@@ -366,13 +366,16 @@ public static class Win32 {
     # Wait longer for Winamp to initialize and create windows
     # One second only: the status texts exist during the transfer, and the
     # transfer is paced to ~30 s from the first request.
-    Start-Sleep -Seconds 1
+    Start-Sleep -Milliseconds 100
 
     Add-Type -AssemblyName System.Drawing
     `$FramesDir = Join-Path (Split-Path `$ObservationsPath) 'frames'
     New-Item -ItemType Directory -Force -Path `$FramesDir | Out-Null
     `$frameNo = 0
 
+    # The window diagnostics run AFTER the loop (Show-Diag): before it they
+    # cost the first seconds of the transfer, which is what we want to see.
+    function Show-Diag {
     # Use List to avoid scriptblock variable capture issues with EnumWindows callback
     `$allWindows = New-Object System.Collections.Generic.List[pscustomobject]
     `$callbackAll = {
@@ -441,6 +444,8 @@ public static class Win32 {
         Log "Winamp process NOT found!"
     }
 
+    }
+
     # Capture loop
     `$maxDurationSec = 40
     `$startTime = Get-Date
@@ -489,11 +494,12 @@ public static class Win32 {
             break
         }
 
-        # Sleep to maintain ~2 Hz
+        # Sleep to maintain ~10 Hz (the status texts may live < 0.5 s)
         `$elapsed = (Get-Date) - `$loopStart
-        `$sleepMs = [int][math]::Max(50, 500 - `$elapsed.TotalMilliseconds)
+        `$sleepMs = [int][math]::Max(20, 100 - `$elapsed.TotalMilliseconds)
         Start-Sleep -Milliseconds `$sleepMs
     }
+    Show-Diag
 }
 
 # Write final summary/record
