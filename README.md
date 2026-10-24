@@ -17,8 +17,8 @@ modern backend written in Rust.
 - **Classic plugins:** Winamp 2.x input, output, visualization, DSP and general
   purpose plugins run in a separate 32-bit helper process
   (`rustamp-plughost`), so a crashing plugin cannot take the player down. The
-  loader works and is tested; a plugin picker in the user interface is not
-  there yet.
+  loader works with our own fixtures, `in_openmpt` and one third-party DSP;
+  Winamp 5.x plug-ins are a work in progress.
 - **Platforms:** Windows first. Linux and macOS come later, with classic plugins
   under Wine.
 
@@ -29,9 +29,9 @@ it is not finished:
 
 | Works | Not yet |
 |---|---|
-| Main, equalizer and playlist windows, skins, shade and double-size | A spectrum / oscilloscope in the main window (the analyser draws nothing yet) |
-| Playback, seeking, gapless, EQ, volume and balance | MilkDrop / projectM visualization in the shipped build |
-| Playlists: M3U, M3U8, PLS, XSPF; Add file / folder / URL (`Ctrl+L`) | A plugin picker and plugin configuration in the UI |
+| Main, equalizer and playlist windows, skins, shade and double-size; the spectrum analyser and oscilloscope (real PCM through analysis to pixels, covered by headless tests, not yet confirmed in a captured live window) | MilkDrop 2 itself: `rustamp-milkdrop` is a skeleton; the projectM sources are vendored in `third_party/` but not wired in |
+| Playback, seeking, gapless, EQ, volume and balance | Real Winamp 5 plug-ins: of eleven tried, none loaded yet (a silent host, a 5.x DSP header, a crash; see [docs/notes/real-plugin-survey.md](docs/notes/real-plugin-survey.md)) |
+| Playlists: M3U, M3U8, PLS, XSPF; Add file / folder / URL (`Ctrl+L`) | Plug-ins are listed, switched on and off and configured (`Configure`) in Preferences → Plug-ins; the first real-world check of that path is the survey above |
 | Streaming over `http://` and `https://` with Winamp's status prefixes in the title (`[Connecting]`, `[Buffer: 42%]`) | Crossfade, the media library window, the Preferences pages (partly) |
 | Media library database, tag editing | Real-hardware audio verification, a clean-machine install test |
 

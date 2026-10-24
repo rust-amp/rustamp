@@ -422,6 +422,12 @@ pub enum Item {
         /// Placement.
         rect: Rect,
     },
+    /// Opens the configuration dialog of the selected plug-in
+    /// ([`PrefsAction::ConfigurePlugin`]).
+    PluginConfigure {
+        /// Placement.
+        rect: Rect,
+    },
     /// Reads the plug-in folder again ([`PrefsAction::RescanPlugins`]).
     PluginRescan {
         /// Placement.
@@ -496,10 +502,13 @@ fn plugin_page(caption: &'static str, hint: &'static str) -> Vec<Item> {
             rect: rect(10, 80, w - 20, 158),
         },
         Item::PluginToggle {
-            rect: rect(10, 246, 150, 26),
+            rect: rect(10, 246, 104, 26),
+        },
+        Item::PluginConfigure {
+            rect: rect(118, 246, 78, 26),
         },
         Item::PluginRescan {
-            rect: rect(168, 246, w - 178, 26),
+            rect: rect(200, 246, w - 210, 26),
         },
     ]
 }
@@ -1274,6 +1283,9 @@ pub enum PrefsAction {
     TogglePlugin(usize),
     /// The plug-in folder should be read again.
     RescanPlugins,
+    /// Opens the configuration dialog of the plug-in of the selected row
+    /// ([`PluginRow::id`]); the player maps the row to the host's plug-in id.
+    ConfigurePlugin(usize),
     /// A folder should be added to the media library.
     ///
     /// The player asks the user for the folder itself; the dialog only says
@@ -1354,6 +1366,7 @@ mod win32 {
     const ID_LIBRARY_ADD: u16 = 65;
     const ID_LIBRARY_REMOVE: u16 = 66;
     const ID_IMPORT: u16 = 67;
+    const ID_PLUGIN_CONFIGURE: u16 = 68;
     /// Scrollable width (unscaled pixels) of a plug-in row.
     const PLUGIN_ROW_EXTENT: i32 = 900;
     /// Scrollable width (unscaled pixels) of a library root.
@@ -2144,6 +2157,21 @@ mod win32 {
                         page.push(c);
                     }
                 }
+                Item::PluginConfigure { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Configure",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_PLUGIN_CONFIGURE,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
                 Item::PluginRescan { rect } => {
                     if let Ok(c) = child(
                         hwnd,
@@ -2537,6 +2565,27 @@ mod win32 {
                     push_action(PrefsAction::ImportWinampIni);
                     return LRESULT(0);
                 }
+                if id == ID_PLUGIN_CONFIGURE && code == BN_CLICKED {
+                    // The same selection as the toggle: an information row or
+                    // no selection configures nothing.
+                    let picked = STATE.with(|state| {
+                        let guard = state.try_borrow().ok()?;
+                        let inner = guard.as_ref()?;
+                        let list = inner.plugin_list?;
+                        // SAFETY: querying our own list box.
+                        let row = unsafe {
+                            SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)))
+                        }
+                        .0;
+                        usize::try_from(row)
+                            .ok()
+                            .and_then(|row| inner.lists.plugins().id(row))
+                    });
+                    if let Some(plugin) = picked {
+                        push_action(PrefsAction::ConfigurePlugin(plugin));
+                    }
+                    return LRESULT(0);
+                }
                 if id == ID_PLUGIN_TOGGLE && code == BN_CLICKED {
                     // The id behind the selected row; an information row or no
                     // selection toggles nothing.
@@ -2762,6 +2811,7 @@ mod tests {
                     | Item::SkinList { rect }
                     | Item::PluginList { rect }
                     | Item::PluginToggle { rect }
+                    | Item::PluginConfigure { rect }
                     | Item::PluginRescan { rect }
                     | Item::LibraryRoots { rect }
                     | Item::LibraryAdd { rect }
@@ -3017,6 +3067,11 @@ mod tests {
             );
             assert_eq!(
                 count(|i| matches!(i, Item::PluginToggle { .. })),
+                1,
+                "{node:?}"
+            );
+            assert_eq!(
+                count(|i| matches!(i, Item::PluginConfigure { .. })),
                 1,
                 "{node:?}"
             );

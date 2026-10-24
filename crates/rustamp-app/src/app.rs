@@ -2127,6 +2127,53 @@ impl App {
         self.host.plugins()
     }
 
+    /// The plug-in the host reported for the scanned file `file` of `kind`.
+    ///
+    /// The host answers a load with the plug-in's **display name**, not the
+    /// file it came from, so the file cannot be matched exactly. Own choice,
+    /// stated plainly: the only loaded plug-in of that kind is it; among
+    /// several, the one whose name contains the file's stem (`in_openmpt.dll`
+    /// -> `openmpt`, ignoring case and the kind prefix); otherwise none, and
+    /// the caller says why instead of guessing.
+    pub fn loaded_plugin_for_file(&self, file: &str, kind: PluginKind) -> Option<&LoadedPlugin> {
+        let mut of_kind = self.host.plugins().iter().filter(|p| p.kind == kind);
+        let first = of_kind.next()?;
+        let Some(second) = of_kind.next() else {
+            return Some(first);
+        };
+        let stem = file
+            .rsplit_once('.')
+            .map_or(file, |(stem, _)| stem)
+            .to_ascii_lowercase();
+        let stem = stem
+            .split_once('_')
+            .map_or(stem.as_str(), |(_, rest)| rest)
+            .to_owned();
+        std::iter::once(first)
+            .chain(std::iter::once(second))
+            .chain(of_kind)
+            .find(|p| p.name.to_ascii_lowercase().contains(&stem))
+    }
+
+    /// Opens the configuration dialog of the plug-in in row `index` of the
+    /// scan (the Configure button of the Preferences plug-in pages).
+    pub(crate) fn configure_plugin_at(&mut self, index: usize) {
+        let Some(entry) = self.plugin_scan().entries.get(index) else {
+            return;
+        };
+        let (file, kind) = (entry.file.clone(), entry.kind);
+        let Some(plugin) = self.loaded_plugin_for_file(&file, kind) else {
+            self.note(format!(
+                "{file} is not loaded in the plugin host (switch it on first), or the host                  reported several {kind:?} plug-ins and none of them names it"
+            ));
+            return;
+        };
+        let (plugin_id, kind) = (plugin.plugin_id, plugin.kind);
+        if let Err(error) = self.submit(Command::ConfigurePlugin { plugin_id, kind }) {
+            self.note(format!("preferences: {error}"));
+        }
+    }
+
     /// The plug-in the plugin host reported under this id, if any.
     pub fn host_plugin(&self, plugin_id: u32) -> Option<&LoadedPlugin> {
         self.host.plugin(plugin_id)
@@ -5219,6 +5266,79 @@ mod tests {
         assert_eq!(plugins[0].plugin_id, 1);
         assert_eq!(plugins[0].name, "Rustamp Fixture");
         assert_eq!(plugins[0].kind, PluginKind::General);
+    }
+
+    /// The Configure button: the scanned row becomes the host's plug-in id.
+    #[test]
+    fn configure_in_the_plugin_page_names_the_loaded_plugin_of_that_file() {
+        use rustamp_ipc::MemoryTransport;
+        use rustamp_platform::PrefsAction;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+        scan_with_one_plugin(&mut app); // gen_one.dll, a general-purpose plug-in
+
+        // Nothing is loaded yet: the button says so and sends nothing.
+        app.apply_prefs_action(PrefsAction::ConfigurePlugin(0));
+        assert!(app.drain_notes().iter().any(|n| n.contains("not loaded")));
+        assert!(host_end.try_recv().ok().flatten().is_none());
+
+        host_end
+            .send(&Message::PluginLoaded {
+                plugin_id: 7,
+                name: "Rustamp Fixture".to_string(),
+                kind: PluginKind::General,
+            })
+            .unwrap();
+        app.pump().unwrap();
+
+        app.apply_prefs_action(PrefsAction::ConfigurePlugin(0));
+        let mut requests = Vec::new();
+        while let Ok(Some(message)) = host_end.try_recv() {
+            if let Message::CommandToHost(command) = message {
+                requests.push(command);
+            }
+        }
+        assert_eq!(
+            requests,
+            vec![Command::ConfigurePlugin {
+                plugin_id: 7,
+                kind: PluginKind::General,
+            }]
+        );
+    }
+
+    /// Several plug-ins of one kind: the file's stem picks the name.
+    #[test]
+    fn the_file_stem_picks_among_several_loaded_plugins_of_one_kind() {
+        use rustamp_ipc::MemoryTransport;
+
+        let (mut app, _dir) = app_with_file(None);
+        let (app_end, mut host_end) = MemoryTransport::pair();
+        app.attach_host(app_end);
+        for (id, name) in [(1, "Nullsoft Wave"), (2, "OpenMPT Player")] {
+            host_end
+                .send(&Message::PluginLoaded {
+                    plugin_id: id,
+                    name: name.to_string(),
+                    kind: PluginKind::Input,
+                })
+                .unwrap();
+        }
+        app.pump().unwrap();
+        let found = app.loaded_plugin_for_file("in_openmpt.dll", PluginKind::Input);
+        assert_eq!(found.map(|p| p.plugin_id), Some(2));
+        // No name carries the stem: no guess.
+        assert!(
+            app.loaded_plugin_for_file("in_flac.dll", PluginKind::Input)
+                .is_none()
+        );
+        // A kind with nothing loaded.
+        assert!(
+            app.loaded_plugin_for_file("out_wasapi.dll", PluginKind::Output)
+                .is_none()
+        );
     }
 
     // ----- the startup load (the enabled plug-ins, once per host) -----
