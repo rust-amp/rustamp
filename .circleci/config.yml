@@ -1,0 +1,136 @@
+# CircleCI: test every push, and build + publish a release for every `v*` tag.
+#
+# Runs on the Windows executor: the player is a 64-bit Windows program and the
+# plug-in host is 32-bit (i686), both MSVC. Only the HEADLESS tests run here;
+# the window tests are `#[ignore]`d and run in the Hyper-V test VM (AGENTS.md).
+#
+# Project environment variables (Project Settings > Environment Variables):
+#   GITLAB_TOKEN       a GitLab token with the `api` scope (publishes the release)
+#   GITLAB_PROJECT_ID  numeric GitLab project id (88040400 for rustamp/rustamp)
+version: 2.1
+
+orbs:
+  win: circleci/windows@5.0
+
+commands:
+  rust:
+    description: Install Rust (stable, MSVC, plus the i686 target) once per job.
+    steps:
+      - run:
+          name: Install Rust
+          command: |
+            if ! command -v rustup >/dev/null 2>&1; then
+              curl -sSf -o rustup-init.exe https://win.rustup.rs/x86_64
+              ./rustup-init.exe -y --default-toolchain stable --profile minimal \
+                --component rustfmt --component clippy
+            fi
+            export PATH="$USERPROFILE/.cargo/bin:$PATH"
+            rustup target add i686-pc-windows-msvc
+            cargo --version
+      - restore_cache:
+          keys:
+            - cargo-v1-{{ arch }}-{{ checksum "Cargo.lock" }}
+            - cargo-v1-{{ arch }}-
+
+jobs:
+  test:
+    executor:
+      name: win/server-2022
+      size: large
+      shell: bash.exe
+    steps:
+      - checkout
+      - rust
+      - run:
+          name: Format
+          command: |
+            export PATH="$USERPROFILE/.cargo/bin:$PATH"
+            cargo fmt --all -- --check
+      - run:
+          name: Clippy
+          no_output_timeout: 30m
+          command: |
+            export PATH="$USERPROFILE/.cargo/bin:$PATH"
+            cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run:
+          name: Test (headless)
+          no_output_timeout: 30m
+          command: |
+            export PATH="$USERPROFILE/.cargo/bin:$PATH"
+            cargo test --workspace --all-features
+      - run:
+          name: Build the 32-bit plug-in host
+          command: |
+            export PATH="$USERPROFILE/.cargo/bin:$PATH"
+            cargo build -p rustamp-plughost --target i686-pc-windows-msvc
+      - save_cache:
+          key: cargo-v1-{{ arch }}-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+            - target
+
+  release:
+    executor:
+      name: win/server-2022
+      size: large
+      shell: bash.exe
+    steps:
+      - checkout
+      - rust
+      - run:
+          name: Package (release build + portable zip)
+          no_output_timeout: 45m
+          command: |
+            export PATH="$USERPROFILE/.cargo/bin:$PATH"
+            cargo xtask package --release --zip
+            mkdir -p dist
+            cp target/package/rustamp-*.zip* dist/
+            ls -l dist
+      - store_artifacts:
+          path: dist
+          destination: release
+      - run:
+          name: Publish to the GitLab release
+          command: |
+            set -eu
+            : "${GITLAB_TOKEN:?set GITLAB_TOKEN in the project settings}"
+            : "${GITLAB_PROJECT_ID:?set GITLAB_PROJECT_ID in the project settings}"
+            tag="$CIRCLE_TAG"
+            api="https://gitlab.com/api/v4/projects/$GITLAB_PROJECT_ID"
+            links=""
+            for f in dist/*; do
+              name=$(basename "$f")
+              curl --fail -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" -T "$f" \
+                "$api/packages/generic/rustamp/$tag/$name"
+              url="$api/packages/generic/rustamp/$tag/$name"
+              links="$links{\"name\":\"$name\",\"url\":\"$url\",\"link_type\":\"package\"},"
+            done
+            body="{\"tag_name\":\"$tag\",\"name\":\"Rustamp $tag\",\"description\":\"Portable Windows build ($tag). Unzip anywhere; no installer. Verify the .sha256 next to the zip.\",\"assets\":{\"links\":[${links%,}]}}"
+            curl --fail -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+              -H "Content-Type: application/json" -d "$body" "$api/releases"
+
+workflows:
+  test-every-push:
+    jobs:
+      - test:
+          filters:
+            tags:
+              ignore: /.*/
+  release-on-tag:
+    jobs:
+      - test:
+          name: test-before-release
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v.*/
+      - release:
+          requires:
+            - test-before-release
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v.*/
