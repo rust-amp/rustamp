@@ -1,4 +1,4 @@
-# Measure the reference player's transfer display texts and window geometry.
+﻿# Measure the reference player's transfer display texts and window geometry.
 #
 # Allow-listed guest script. Called by the broker:
 #   -Op guest -Script measure-transfer.ps1 -GuestArgs <mode>
@@ -150,8 +150,12 @@ try {
 
         $total = $ContentLength
         $sent = 0
-        $chunkSize = 1024  # 1 KB per chunk
-        $delayMs = 50      # ~20 KB/s -> ~25 s for 500 KB file
+        # Pace by SIZE, not by a fixed rate: the 2026-10-21 run used 20 KB/s on a
+        # 35 KB file, so the whole transfer ended in 2.3 s, before the first
+        # observation. The body now always takes ~30 s (256-byte chunks).
+        $chunkSize = 256
+        $chunks = [math]::Max(1, [math]::Ceiling($total / $chunkSize))
+        $delayMs = [int][math]::Max(20, [math]::Ceiling(30000 / $chunks))
 
         if ($Mode -eq 'cut') {
             $cutAt = [math]::Max(1, [math]::Floor($total * 0.1))
@@ -360,7 +364,14 @@ public static class Win32 {
     Log "Winamp PID: `$winampPid"
 
     # Wait longer for Winamp to initialize and create windows
-    Start-Sleep -Seconds 5
+    # One second only: the status texts exist during the transfer, and the
+    # transfer is paced to ~30 s from the first request.
+    Start-Sleep -Seconds 1
+
+    Add-Type -AssemblyName System.Drawing
+    `$FramesDir = Join-Path (Split-Path `$ObservationsPath) 'frames'
+    New-Item -ItemType Directory -Force -Path `$FramesDir | Out-Null
+    `$frameNo = 0
 
     # Use List to avoid scriptblock variable capture issues with EnumWindows callback
     `$allWindows = New-Object System.Collections.Generic.List[pscustomobject]
@@ -454,6 +465,23 @@ public static class Win32 {
         `$winDesc = (`$windows | ForEach-Object { '[{0}] ''{1}'' {2}x{3}' -f `$_.Class, `$_.Title, `$_.ClientRect.Width, `$_.ClientRect.Height }) -join ' | '
         Log "  t=`$([math]::Round((`$loopStart - `$startTime).TotalSeconds,1))s windows=`$(`$windows.Count) `$winDesc"
 
+        # The status texts are drawn into the client area, never into a title:
+        # keep a PNG of the main window (class Winamp v1.x) at every step.
+        `$main = `$windows | Where-Object { `$_.Class -eq 'Winamp v1.x' } | Select-Object -First 1
+        if (`$main -and `$main.WindowRect) {
+            try {
+                `$wr = `$main.WindowRect
+                `$bmp = New-Object System.Drawing.Bitmap(`$wr.Width, `$wr.Height)
+                `$g = [System.Drawing.Graphics]::FromImage(`$bmp)
+                `$g.CopyFromScreen(`$wr.Left, `$wr.Top, 0, 0, `$bmp.Size)
+                `$g.Dispose()
+                `$bmp.Save((Join-Path `$FramesDir ('f{0:D3}.png' -f `$frameNo)), [System.Drawing.Imaging.ImageFormat]::Png)
+                `$bmp.Dispose()
+                Log "  frame f`$('{0:D3}' -f `$frameNo) saved at t=`$([math]::Round((`$loopStart - `$startTime).TotalSeconds,1))s"
+                `$frameNo++
+            } catch { Log "  frame capture failed: `$(`$_.Exception.Message)" }
+        }
+
         # Check if process exited
         `$proc = Get-Process -Id `$winampPid -ErrorAction SilentlyContinue
         if (-not `$proc -or `$proc.HasExited) {
@@ -461,9 +489,9 @@ public static class Win32 {
             break
         }
 
-        # Sleep to maintain ~1 Hz
+        # Sleep to maintain ~2 Hz
         `$elapsed = (Get-Date) - `$loopStart
-        `$sleepMs = [int][math]::Max(100, 1000 - `$elapsed.TotalMilliseconds)
+        `$sleepMs = [int][math]::Max(50, 500 - `$elapsed.TotalMilliseconds)
         Start-Sleep -Milliseconds `$sleepMs
     }
 }

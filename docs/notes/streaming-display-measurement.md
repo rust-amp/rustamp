@@ -62,3 +62,40 @@ Outputs land in `D:\code\rustamp-vm\staging\out\transfer-{normal,refused,cut}\` 
 ## Spec Reference
 
 See `specs/S19-streaming.md` §2 (string facts) and §6 (open questions 6, 15). Draft with evidence at `D:\code\rustamp-sandbox\spec-drafts\S19-transfer-display.draft.md`.
+## Third attempt, 2026-10-24: the status texts, seen (normal mode)
+
+Changes to the harness (`vm-broker/guest/measure-transfer.ps1`): the server
+paces the body by **size** (~30 s for any file; the 2026-10-21 run ended the
+35 KB transfer in 2.3 s, before the first observation), the first observation
+follows 1 s after the launch, and a **PNG of the main window is saved every
+0.5 s** (`out\transfer-normal\frames\fNNN.png`, 79 frames over ~32 s, of which
+the consecutive frames differ). The status texts are drawn into the client
+area, which is why title polling could never see them.
+
+Observed (frames f000-f078, `Winamp v1.x` client, 275x116):
+
+| frames | what the main window shows |
+|---|---|
+| f000-f005 | the title scroller reads `1. [READING ID3] HTTP://127.0.…` (the URL scrolls); `0 kbps` / `0 kHz`; time `00:00`; no seek bar |
+| f010 | `1. [BUFFER: 0%] STREAM.MP3 (0:02)`; the readouts already say `128 kbps` / `44 kHz`; the seek bar appears |
+| f020 | the same line scrolling, `[BUFFER: 22%]` |
+| f040 | `[BUFFER: 65%]`, the visualisation shows bars |
+| f060 | `[BUFFER: 0%]` again with the time at `00:02` (a re-buffer while playing) |
+| f078 | `1. STREAM.MP3 (0:02)` (no bracket), readouts blank, stopped |
+
+So: the transfer status is **not a separate display and not in the title bar**;
+it is **the main window's scrolling title text**, as a bracketed prefix between
+the playlist index and the title: first `[READING ID3]` (before the stream's
+format is known, with the URL as the title), then `[BUFFER: n%]` with a percent
+that counts up and can fall back to 0%. The two-line transfer display of S19 §2
+(`Connecting to host...`, `Sending HTTP request`, ...) was **not** seen in this
+window at 2 Hz; those strings are either shorter-lived than 0.5 s or live
+elsewhere (the pre-play phase before f000 is not covered: the first frame is
+taken ~1 s after the launch).
+
+Open for the next run: capture at >= 10 Hz from process start (a hook before
+the launch), and the `cut`/`refused` modes still end the process within ~5 s
+with no frames.
+
+Frames and logs stay under `D:\code\rustamp-vm\staging\out\transfer-normal\`
+(reference-binary output: dirty-room evidence, not copied into this repo).
