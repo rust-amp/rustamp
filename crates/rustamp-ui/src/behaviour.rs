@@ -97,6 +97,9 @@ pub struct MainWindow {
     duration_ms: Option<u64>,
     position_ms: u64,
     track_title: Option<String>,
+    /// The stream status the title carries between the position and the name
+    /// (`[Connecting]`, `[Buffer: 22%]`, ...), while a transfer runs.
+    stream_prefix: Option<String>,
     always_on_top: bool,
     held: Option<Widget>,
     drag: Option<Widget>,
@@ -138,6 +141,7 @@ impl MainWindow {
             duration_ms: None,
             position_ms: 0,
             track_title,
+            stream_prefix: None,
             always_on_top: false,
             held: None,
             drag: None,
@@ -250,10 +254,27 @@ impl MainWindow {
     pub fn logical_title(&self) -> String {
         match self.hint() {
             Some(hint) => hint,
-            None => self
-                .track_title
-                .clone()
-                .unwrap_or_else(|| PROGRAM_NAME.to_string()),
+            None => self.shown_title(),
+        }
+    }
+
+    /// Sets the stream status the title carries (`[Connecting]`,
+    /// `[Buffer: 22%]`, ...), or clears it when no transfer has one. The
+    /// marquee follows on the next tick.
+    pub fn set_stream_prefix(&mut self, prefix: Option<String>) {
+        self.stream_prefix = prefix;
+    }
+
+    /// The current entry's title with the stream status in it, else the
+    /// program name. The status sits between the position and the name:
+    /// `1. [Buffer: 22%] stream.mp3`.
+    fn shown_title(&self) -> String {
+        let Some(title) = self.track_title.as_deref() else {
+            return PROGRAM_NAME.to_string();
+        };
+        match (&self.stream_prefix, title.split_once(". ")) {
+            (Some(prefix), Some((position, name))) => format!("{position}. {prefix} {name}"),
+            _ => title.to_string(),
         }
     }
 
@@ -705,11 +726,7 @@ impl MainWindow {
     fn update_marquee(&mut self, now_ms: u64) {
         let hint = self.hint();
         let is_hint = hint.is_some();
-        let text = hint.unwrap_or_else(|| {
-            self.track_title
-                .clone()
-                .unwrap_or_else(|| PROGRAM_NAME.to_string())
-        });
+        let text = hint.unwrap_or_else(|| self.shown_title());
         let cells = text.chars().count();
         let fits = cells as u32 * MARQUEE_CELL_WIDTH <= self.layout.marquee.width;
         if is_hint || fits {
@@ -1334,6 +1351,24 @@ mod tests {
     // ----- a track whose length is unknown (S19) -----
 
     /// A track that reports no length: a stream usually.
+    #[test]
+    fn the_stream_status_sits_between_the_position_and_the_name() {
+        let mut machine = MainWindow::new();
+        load_track(&mut machine, "stream.mp3", 2000, 0);
+        let plain = machine.logical_title();
+        assert!(plain.starts_with("1. stream.mp3"), "{plain}");
+        machine.set_stream_prefix(Some("[Buffer: 22%]".to_string()));
+        assert!(
+            machine
+                .logical_title()
+                .starts_with("1. [Buffer: 22%] stream.mp3"),
+            "{}",
+            machine.logical_title()
+        );
+        machine.set_stream_prefix(None);
+        assert_eq!(machine.logical_title(), plain);
+    }
+
     fn load_track_without_length(machine: &mut MainWindow, title: &str, now_ms: u64) {
         machine.handle_event(
             &Event::TrackChanged {

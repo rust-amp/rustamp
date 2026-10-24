@@ -130,3 +130,18 @@ lost connection mid-play is not yet exercised. 4. answered for a slow connect
 (no §2 text). 2, 3, 5, 6 remain open.
 
 The frames and transcripts stay under `D:\code\rustamp-vm\staging\out\transfer-*`.
+
+## Implemented provisionally (2026-10-24), pending the audit
+
+The player now shows the measured prefixes in the title scroller, marked as
+**own choices** in the code (`stream_status.rs::title_prefix_of`,
+`MainWindow::set_stream_prefix`): `Connecting`/`SendingRequest` ->
+`[Connecting]`, `ReadingResponse` -> `[reading id3]`, the body ->
+`[Buffer: N%]` (N = the share of the declared length; no declared length, no
+prefix), a refused connect -> `[could not connect]` (stays), a lost or closed
+connection -> no prefix. The position stays in front: `1. [Buffer: 22%] name`.
+Not done: the server status line as a prefix (`[HTTP/1.1 200 OK]`), the
+native title bar's copy of the prefix (the app's own title stays `Rustamp`),
+and the `reading id3` -> `Buffer` trigger, which the audit has to settle
+(open questions 2, 3). Headless tests only; not checked against the reference
+frame by frame.

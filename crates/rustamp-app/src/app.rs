@@ -1735,9 +1735,12 @@ impl App {
     fn pump_stream_status(&mut self) {
         let Some(snapshot) = self.engine.stream_snapshot() else {
             self.stream.reset();
+            self.ui.set_stream_prefix(None);
             return;
         };
         self.apply_stream_snapshot(snapshot, Instant::now());
+        self.ui
+            .set_stream_prefix(self.stream.title_prefix().map(str::to_owned));
     }
 
     /// Turns one snapshot of a transfer into the note and the status.

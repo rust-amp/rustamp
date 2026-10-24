@@ -149,6 +149,28 @@ fn phase_text(phase: HttpPhase, snapshot: &HttpProgressSnapshot) -> String {
     }
 }
 
+/// The bracketed prefix the title scroller carries while a stream is on its
+/// way (`docs/spec-requests/2026-10-24-s19-status-prefixes.md`, measured on the
+/// reference; **not yet in an audited spec**).
+///
+/// Own choices, marked as such: the phases map as `Connecting` and
+/// `SendingRequest` to `[Connecting]`, `ReadingResponse` to `[reading id3]`,
+/// the body to `[Buffer: N%]` with `N` the share of the declared length (a
+/// body with no declared length has no share, so it gets no prefix), and a
+/// refused connection to `[could not connect]`, which stays. A lost or closed
+/// connection shows no prefix.
+fn title_prefix_of(snapshot: &HttpProgressSnapshot) -> Option<String> {
+    match snapshot.phase {
+        HttpPhase::Connecting | HttpPhase::SendingRequest => Some("[Connecting]".to_string()),
+        HttpPhase::ReadingResponse => Some("[reading id3]".to_string()),
+        HttpPhase::Retrieving => snapshot
+            .total
+            .map(|total| format!("[Buffer: {}%]", percent(snapshot.bytes_read, total))),
+        HttpPhase::ConnectFailed => Some("[could not connect]".to_string()),
+        HttpPhase::ConnectionLost | HttpPhase::Closed => None,
+    }
+}
+
 /// What the app shows about the stream that is playing.
 ///
 /// The app keeps the phase it reported last, the sample it needs for the
@@ -163,6 +185,8 @@ pub(crate) struct StreamStatus {
     /// The transient status: the transfer display, empty when no transfer
     /// runs.
     status: Option<String>,
+    /// The prefix of the title scroller, if the transfer has one.
+    prefix: Option<String>,
 }
 
 /// A sample of the byte count, with the clock reading it was taken at.
@@ -204,6 +228,7 @@ impl StreamStatus {
             let bytes = snapshot.bytes_read.saturating_sub(sample.bytes);
             rate_kb_per_sec(bytes, elapsed)
         });
+        self.prefix = title_prefix_of(&snapshot);
         self.sample = Some(Sample {
             bytes: snapshot.bytes_read,
             at: now,
@@ -228,6 +253,12 @@ impl StreamStatus {
         self.phase = None;
         self.sample = None;
         self.status = None;
+        self.prefix = None;
+    }
+
+    /// The bracketed prefix of the title scroller, if the transfer has one.
+    pub(crate) fn title_prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
     }
 
     /// The transient status: the transfer display of S19 §2.
@@ -251,6 +282,54 @@ mod tests {
             bytes_read,
             total,
         }
+    }
+
+    /// The scroller prefix follows the phase (measured words, own mapping).
+    #[test]
+    fn the_title_prefix_follows_the_phase() {
+        let cases = [
+            (
+                snapshot(HttpPhase::Connecting, 0, Some(100)),
+                Some("[Connecting]"),
+            ),
+            (
+                snapshot(HttpPhase::SendingRequest, 0, None),
+                Some("[Connecting]"),
+            ),
+            (
+                snapshot(HttpPhase::ReadingResponse, 0, Some(100)),
+                Some("[reading id3]"),
+            ),
+            (
+                snapshot(HttpPhase::Retrieving, 22, Some(100)),
+                Some("[Buffer: 22%]"),
+            ),
+            (snapshot(HttpPhase::Retrieving, 5, None), None),
+            (
+                snapshot(HttpPhase::ConnectFailed, 0, None),
+                Some("[could not connect]"),
+            ),
+            (snapshot(HttpPhase::ConnectionLost, 9, Some(100)), None),
+            (snapshot(HttpPhase::Closed, 100, Some(100)), None),
+        ];
+        for (snapshot, expected) in cases {
+            assert_eq!(
+                title_prefix_of(&snapshot).as_deref(),
+                expected,
+                "{snapshot:?}"
+            );
+        }
+    }
+
+    /// A reset forgets the prefix with the transfer.
+    #[test]
+    fn a_reset_forgets_the_prefix() {
+        let mut status = StreamStatus::default();
+        let now = Instant::now();
+        status.update(snapshot(HttpPhase::Connecting, 0, None), now);
+        assert_eq!(status.title_prefix(), Some("[Connecting]"));
+        status.reset();
+        assert_eq!(status.title_prefix(), None);
     }
 
     /// The texts of S19 §2, one per phase.
