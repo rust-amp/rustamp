@@ -33,6 +33,36 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // this file keeps no copy of it. There is deliberately **no** override:
 // this test opens the app's windows.
 
+/// Kills the spawned player **and its children** when it goes out of scope.
+///
+/// The player starts a plug-in host child that inherits the redirected
+/// stdout/stderr. A panicking assertion (or a plain `child.kill()`, which ends
+/// the player only) would leave that tree holding the pipes open, and the VM
+/// runner then reports "stdout was still open" with no test summary instead of
+/// the real failure.
+#[cfg(windows)]
+struct KillTree(u32);
+
+#[cfg(windows)]
+impl KillTree {
+    fn kill(&self) {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &self.0.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KillTree {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 fn fixture() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -92,6 +122,8 @@ fn the_playlist_window_opens_docked_below_the_main_window() {
         .spawn()
         .expect("spawn rustamp");
     let pid = child.id();
+    #[cfg(windows)]
+    let tree = KillTree(pid);
 
     // If it is still running after three seconds, the windows opened and the
     // event loop is live. If it exited, the smoke test failed (and
@@ -114,11 +146,11 @@ fn the_playlist_window_opens_docked_below_the_main_window() {
     {
         let main = child_windows::find_window(pid, "Rustamp", Duration::from_secs(10));
         let playlist = child_windows::find_window(pid, "Rustamp Playlist", Duration::from_secs(10));
-        // The titles and the class round-trip in full (task card N12): both
-        // windows are winit windows and carry winit 0.30's registered class
-        // `Window Class` (Cargo.lock pins winit 0.30.13). `find_window`
-        // already matched the exact multi-character titles; the explicit
-        // read-backs pin them and add the class.
+        // The titles and the classes round-trip in full (task card N12): the
+        // main window carries S10's `Winamp v1.x`, the playlist the classic
+        // `Winamp PE`. `find_window` already matched the exact
+        // multi-character titles; the explicit read-backs pin them and add
+        // the class.
         assert_eq!(
             child_windows::window_title(main),
             "Rustamp",
@@ -138,10 +170,10 @@ fn the_playlist_window_opens_docked_below_the_main_window() {
         );
         assert_eq!(
             child_windows::window_class(playlist),
-            "Window Class",
-            "the playlist window class must round-trip in full (winit 0.30's \
-             registered class; a one-character class is the wide/ANSI-mismatch \
-             signature, task card N12)"
+            "Winamp PE",
+            "the playlist window class must round-trip in full (the classic \
+             playlist-editor class, S01 §1; a one-character class is the \
+             wide/ANSI-mismatch signature, task card N12)"
         );
         assert_eq!(
             child_windows::client_size(main),
@@ -163,6 +195,9 @@ fn the_playlist_window_opens_docked_below_the_main_window() {
             "the playlist must sit docked below the main window (S05 §3.1/§4.2)"
         );
     }
+    #[cfg(windows)]
+    tree.kill();
+    #[cfg(not(windows))]
     child.kill().expect("kill the windowed player");
     let output = child.wait_with_output().expect("wait_with_output");
     let stdout = String::from_utf8_lossy(&output.stdout);
