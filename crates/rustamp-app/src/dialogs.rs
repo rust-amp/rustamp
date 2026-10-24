@@ -892,6 +892,7 @@ impl App {
                 }
             }
             PrefsAction::RescanPlugins => self.rescan_plugins(),
+            PrefsAction::ConfigurePlugin(index) => self.configure_plugin_at(index),
             PrefsAction::AddLibraryRoot => {
                 // The dialog does not pick the folder itself: the presenter
                 // asks the user for it, from the tick.
