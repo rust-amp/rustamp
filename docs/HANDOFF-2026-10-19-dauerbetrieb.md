@@ -581,3 +581,29 @@ lines go to `inner-session<session>.log`, the hash of the EXE about to run is
 logged, message delivery is probed with `WM_SETTEXT`, and the player is stopped
 before the results are collected (it held the redirected stderr open).
 
+
+
+## 2026-10-23/24: gate, VM run, release workflow
+
+* **Gate green on the host:** fmt, clippy `-D warnings`, 182 test binaries, 0 failures.
+* **Stale items in `HANDOFF.md` / the open points above, now settled:** the
+  streaming entry point exists (Ctrl+L, Shift+Ins, main menu, playlist Add
+  location; http/https by the command line's own rule, tests in
+  `rustamp-app/src/dialogs.rs`), and RFC 0020 is accepted with option A,
+  `PROTOCOL_VERSION` 5 (see the RFC's §11/§12).
+* **VM broker:** the run failed first because `vmms` was stopped (started
+  again) and the `RustampVmBroker` task is **Disabled** (enabling needs an
+  elevated shell; not done). A per-run hidden loop around `vm-broker.ps1`
+  stands in for it and is stopped afterwards.
+* **VM results:** all window tests, the i686 plug-in acceptance and the resident
+  fixtures pass. Two fixes (`57412bd`): the pixel acceptance now asserts the
+  measured per-state residual as a budget, and `playlist_window` kills the
+  player's process tree and expects the class `Winamp PE`.
+* **Still blocked:** the two real-audio-endpoint tests (WASAPI default device,
+  VB-Cable) - an owner decision on VM audio is open.
+* **Release:** `.github/workflows/release.yml` (tag `v*` or manual) tests,
+  runs `cargo xtask package --release --zip`, uploads the zip, drafts a
+  release. Not run on GitHub yet; the repo has **no remote**.
+* **Still open:** S19 section 2 transfer texts (unmeasured), shade-mode EQ
+  volume/balance thumbs (42 px, needs a measured position law), the other
+  measurement questions listed in the open points above.
