@@ -149,6 +149,7 @@ unsafe extern "system" {
     fn GetLastError() -> u32;
     fn AddDllDirectory(path: *const u16) -> *mut core::ffi::c_void;
     fn RemoveDllDirectory(cookie: *mut core::ffi::c_void) -> i32;
+    fn SetDefaultDllDirectories(directory_flags: u32) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,6 +1791,18 @@ unsafe fn map_plugin_image(
     }
     let sealed = image.seal()?;
     let directory = wide_path(image.path.parent().expect("canonical file has parent"))?;
+    // A plug-in may load a library of its own later, in `init`, by a plain
+    // `LoadLibrary` (the 5.x input plug-ins delay-load their codec libraries).
+    // That call uses the process's default search, so the default is set once to
+    // the application directory, System32 and the directories added below:
+    // LOAD_LIBRARY_SEARCH_DEFAULT_DIRS. This also keeps the current directory and
+    // PATH out of every later search of this process.
+    static DEFAULT_DIRECTORIES: std::sync::Once = std::sync::Once::new();
+    DEFAULT_DIRECTORIES.call_once(|| {
+        // SAFETY: no pointer arguments.
+        let ok = unsafe { SetDefaultDllDirectories(0x0000_1000) };
+        crate::fault::trace_event(&format!("SetDefaultDllDirectories(DEFAULT_DIRS) -> {ok}"));
+    });
     // AddDllDirectory changes only the explicitly selected USER_DIRS set. Never
     // enable legacy CWD/PATH search. The caller trusts dependencies separately.
     // SAFETY: directory is an absolute, NUL-terminated Windows path.
@@ -1825,15 +1838,30 @@ unsafe fn map_plugin_image(
     // SAFETY: capture this thread's loader failure before anything else can
     // overwrite it (the context's own release must not).
     let load_error = unsafe { GetLastError() };
-    drop(runtime);
     if hinstance.is_null() {
+        // The load failed: the context has done its job, take it off again.
+        drop(runtime);
         let err = load_error;
         crate::fault::trace_event(&format!("<- LoadLibraryExW failed: {err}"));
         return Err(PluginLoadError::OsLoadFailed(err));
     }
     crate::fault::trace_event("<- LoadLibraryExW");
     sealed.retain_for_process();
-    drop(search_directory);
+    // The directory stays registered for the life of the process, like the
+    // plug-in itself: its own later `LoadLibrary` calls (see above) must find
+    // the libraries that sit beside it. It is the directory of the approved
+    // plug-in, whose dependencies the operator already trusts.
+    core::mem::forget(search_directory);
+    // The runtime context stays active on this (the UI) thread too. A plug-in
+    // without a manifest of its own inherits what is active when it loads a
+    // library later; the 5.x input plug-ins delay-load their codec libraries in
+    // `init` and those need the runtime again. Every call into plug-in code
+    // happens on this thread, so this is what a host that declares the runtime
+    // in its own manifest would provide, without needing the files to exist for
+    // plug-ins that do not use them.
+    if let Some(runtime) = runtime {
+        core::mem::forget(runtime);
+    }
     Ok(hinstance)
 }
 
@@ -1957,14 +1985,6 @@ unsafe fn load_input_module(
         });
     }
 
-    let description = unsafe {
-        if base_version == IN_VERSION_WIDE_DESC {
-            read_marked_wide_string_lossy((*module_ptr).description)
-        } else {
-            read_c_string_lossy((*module_ptr).description)
-        }
-    };
-
     // S09 §3.1 lines 76–115, §3.5 lines 153–156: write host-filled members before init().
     unsafe {
         (*module_ptr).main_window = host_hwnd as *mut core::ffi::c_void;
@@ -1988,6 +2008,21 @@ unsafe fn load_input_module(
         // output the input plugin would then have to use.
         (*module_ptr).out_module = core::ptr::null_mut();
     }
+    // S21 §6: the input modules of 5.x plug-ins that carry the version value
+    // 0xFF000101 have one more member, at offset 0x98, which they expect to hold
+    // the service manager when `init` runs. A plain module is shorter and the
+    // bytes there belong to something else, so only this version gets it.
+    if version as u32 == crate::host_services::INPUT_VERSION_WITH_SERVICES {
+        // SAFETY: the plug-in's own static module of that version is at least
+        // 0x9C bytes long (S21 §6); the member is written before `init` reads it.
+        unsafe {
+            module_ptr
+                .cast::<u8>()
+                .add(crate::host_services::INPUT_SERVICE_MANAGER_OFFSET)
+                .cast::<usize>()
+                .write_unaligned(crate::host_services::service_manager() as usize);
+        }
+    }
 
     // Call init() (S09 §3.1 offset 0x24, §3.5 line 156).
     let mut init_called = false;
@@ -2001,6 +2036,16 @@ unsafe fn load_input_module(
     unsafe {
         (*module_ptr).set_info = Some(host_set_info);
     }
+
+    // S21 §6: a 5.x input plug-in rewrites its description in `init` (as wide
+    // text where its version says so), so it is read now, not before.
+    let description = unsafe {
+        if base_version == IN_VERSION_WIDE_DESC {
+            read_marked_wide_string_lossy((*module_ptr).description)
+        } else {
+            read_c_string_lossy((*module_ptr).description)
+        }
+    };
 
     Ok(LoadedPlugin {
         identity,
@@ -2024,15 +2069,16 @@ unsafe fn load_dsp_module(
 ) -> Result<LoadedPlugin, PluginLoadError> {
     let identity = PluginIdentity::new(&path, PluginKind::Dsp);
     // S09 §1 line 38, §2 line 59: cdecl getter returning the static DSP header.
-    // In 2.x it takes no arguments; a 5.x main-window argument would be a
-    // harmless extra under cdecl, so calling with none is correct either way (U-9).
-    type DspGetHeaderFn = unsafe extern "C" fn() -> *mut DspHeader;
+    // In 2.x it takes no arguments; the 5.x one takes the main window and uses it
+    // at once (S21 §6). Under cdecl the caller removes the argument, so passing it
+    // is harmless to a getter that takes none.
+    type DspGetHeaderFn = unsafe extern "C" fn(main_window: usize) -> *mut DspHeader;
     let get_header: DspGetHeaderFn = unsafe { core::mem::transmute(proc_ptr) };
     // The getter and the module list are plugin code: a fault in them must
     // name this plugin.
     let header_ptr = {
         let _scope = plugin_call_scope(&identity, "get header");
-        unsafe { get_header() }
+        unsafe { get_header(host_hwnd) }
     };
     // SAFETY: the header lives in the mapped plugin's static data; the
     // plugin's `get_module` runs here on the UI thread (S09 §6.3 step 1).
@@ -2164,8 +2210,14 @@ unsafe fn load_output_module(
         return Err(PluginLoadError::NullModule);
     }
 
-    // The description is read before init() so a plugin that rewrites its own
-    // pointer during init cannot change what the host reported it as.
+    // SAFETY: getter result from the approved mapped image; UI thread.
+    let init = {
+        let _scope = plugin_call_scope(&identity, "init");
+        unsafe { init_output_module(module_ptr, host_hwnd, hinstance) }?
+    };
+
+    // S21 §6: a 5.x output plug-in sets its description in `init`, so it is read
+    // after it (as wide text where its version says so).
     // SAFETY: non-null module in the mapped image's static data; a null
     // description pointer reads as empty and is not dereferenced (S09 §4.1).
     let description = unsafe {
@@ -2174,12 +2226,6 @@ unsafe fn load_output_module(
         } else {
             read_c_string_lossy((*module_ptr).description)
         }
-    };
-
-    // SAFETY: getter result from the approved mapped image; UI thread.
-    let init = {
-        let _scope = plugin_call_scope(&identity, "init");
-        unsafe { init_output_module(module_ptr, host_hwnd, hinstance) }?
     };
 
     Ok(LoadedPlugin {
@@ -2204,16 +2250,16 @@ unsafe fn load_vis_module(
 ) -> Result<LoadedPlugin, PluginLoadError> {
     let identity = PluginIdentity::new(&path, PluginKind::Visualization);
     // S09 §1 line 38, §2 line 58: cdecl getter returning the static
-    // visualization header. In 2.x it takes no arguments; a 5.x main-window
-    // argument would be a harmless extra under cdecl, so calling with none is
-    // correct either way (U-9).
-    type VisGetHeaderFn = unsafe extern "C" fn() -> *mut VisHeader;
+    // visualization header. In 2.x it takes no arguments; the 5.x one takes the
+    // main window and uses it at once (S21 §6). Under cdecl the caller removes
+    // the argument, so passing it is harmless to a getter that takes none.
+    type VisGetHeaderFn = unsafe extern "C" fn(main_window: usize) -> *mut VisHeader;
     let get_header: VisGetHeaderFn = unsafe { core::mem::transmute(proc_ptr) };
     // The getter and the module list are plugin code: a fault in them must
     // name this plugin.
     let header_ptr = {
         let _scope = plugin_call_scope(&identity, "get header");
-        unsafe { get_header() }
+        unsafe { get_header(host_hwnd) }
     };
     // SAFETY: the header lives in the mapped plugin's static data; the
     // plugin's `get_module` runs here on the UI thread (S09 §5.3 step 2).

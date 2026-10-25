@@ -116,3 +116,32 @@ faulting `out_disk` asked for ids 334 and 3025, `in_vorbis` for 3015 and
 nothing. The 5.x service layer is **not built**: its layout comes from the
 Winamp SDK headers, which the clean room does not read. The request to the dirty
 room is `docs/spec-requests/2026-10-25-s21-winamp5-host-services.md`.
+
+
+## Run 7 (2026-10-25): S21 implemented - 10 of 11 plug-ins load
+
+`specs/S21-winamp5-host-services.md` (audited, see `spec-audit-s21.md`) is
+implemented in `host_services.rs` and the loader: a service manager with the
+language service, the settings paths and random generators for the 5.x start-up
+requests (answered only to requests from the host's own thread; everything else
+keeps the 2.95 answers of S10), the header getters of visualization and DSP
+plug-ins take the main window, 5.x input modules get the service manager
+pointer, and descriptions are read after `init`.
+
+Two more things the survey found that the spec could not know:
+
+* A plug-in's directory has to stay in the process's library search, and the
+  default search is set to application directory, System32 and the added
+  directories, because `in_wave` loads `libsndfile.dll` by a plain
+  `LoadLibrary` inside `init`.
+* The VC++ runtime context must stay active on the UI thread after the load,
+  for the same reason: those later loads inherit it.
+
+Result in the Hyper-V guest, all plug-ins of the Winamp 5.66 installer that were
+extracted: **loaded** `dsp_sps`, `gen_hotkeys`, `gen_jumpex`, `in_flac`,
+`in_vorbis`, `in_wave`, `out_disk`, `out_wave`, `vis_avs` and **`vis_milk2`
+(MilkDrop 2.25c)**; refused `vis_nsfs`, which returns no module on a current
+Windows for its own reasons (S21 section 7). "Loaded" means the host mapped the
+plug-in, ran its getter and `init` and read its description; playing audio
+through them, a visualization window and the configuration dialogs are not
+exercised yet.
