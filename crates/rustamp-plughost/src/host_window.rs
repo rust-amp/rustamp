@@ -407,6 +407,16 @@ unsafe fn handle_window_message(
         DefWindowProcW, GWLP_USERDATA, GetWindowLongPtrW, PostQuitMessage, SetWindowLongPtrW,
         WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_USER,
     };
+    // Messages that are not the system's own (WM_USER and up, registered
+    // messages, WM_COPYDATA) are what a plug-in sends the host: with
+    // RUSTAMP_HOST_TRACE set they are written down, so a plug-in that wants
+    // something the host does not answer shows what it asked for.
+    if msg >= WM_USER || msg == windows::Win32::UI::WindowsAndMessaging::WM_COPYDATA {
+        crate::fault::trace_event(&format!(
+            "window message {msg:#x} wparam={:#x} lparam={:#x}",
+            wparam.0, lparam.0
+        ));
+    }
     match msg {
         WM_NCCREATE => {
             let cs = lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW;
