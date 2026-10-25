@@ -103,3 +103,16 @@ means answering that request with the Wasabi services they use
 The survey stays informational: it prints each plug-in's outcome, the host's
 trace of calls into plug-in code (`RUSTAMP_HOST_TRACE`) and, for a refusal, the
 dialogs the watchdog dismissed.
+
+
+## Run 6 (2026-10-25): what the faults read
+
+The fault report now names the faulting instruction and the address it used,
+and `RUSTAMP_HOST_TRACE` records every non-system window message a plug-in sends
+the host. Seven plug-ins fault; six read through a **null** pointer and
+`dsp_sps` through the value **1** (the host's answer for "unsupported"). Before
+faulting `out_disk` asked for ids 334 and 3025, `in_vorbis` for 3015 and
+`dsp_sps` for 336; `in_flac`, `in_wave`, `vis_avs` and `vis_milk2` asked for
+nothing. The 5.x service layer is **not built**: its layout comes from the
+Winamp SDK headers, which the clean room does not read. The request to the dirty
+room is `docs/spec-requests/2026-10-25-s21-winamp5-host-services.md`.

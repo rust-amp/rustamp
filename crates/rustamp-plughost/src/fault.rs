@@ -194,6 +194,12 @@ impl<'a> LineWriter<'a> {
         Self { buffer, len: 0 }
     }
 
+    /// Continues a line already written into `buffer[..len]`.
+    fn resume(buffer: &'a mut [u8], len: usize) -> Self {
+        let len = len.min(buffer.len());
+        Self { buffer, len }
+    }
+
     /// Append `text`, stopping at the buffer's end.
     fn push_str(&mut self, text: &str) {
         for byte in text.as_bytes() {
@@ -240,6 +246,45 @@ fn kind_label(kind: PluginKind) -> &'static str {
         PluginKind::Dsp => "DSP",
         PluginKind::General => "general-purpose",
     }
+}
+
+/// Where the faulting instruction was and what it touched, from the exception
+/// record (`ExceptionAddress`; for an access violation, `ExceptionInformation`
+/// 0 = read/write/execute and 1 = the address it tried to use).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FaultDetail {
+    /// The address of the faulting instruction.
+    pub instruction: u32,
+    /// For an access violation: `(kind, address)`, kind 0 read, 1 write, 8 execute.
+    pub access: Option<(u32, u32)>,
+}
+
+/// Appends ` at 0x<instruction>` and, for an access violation, what it was
+/// doing to the line in `buffer[..len]`, replacing its trailing newline.
+///
+/// The target address tells a null dereference (`0x00000000` and small
+/// offsets) from a wild pointer, and `0x00000001` is the value a host that
+/// answers "unsupported" with 1 hands to a plug-in that expects a pointer.
+fn append_fault_detail(buffer: &mut [u8], len: usize, detail: FaultDetail) -> usize {
+    let len = if len > 0 && buffer[len - 1] == b'\n' {
+        len - 1
+    } else {
+        len
+    };
+    let mut line = LineWriter::resume(buffer, len);
+    line.push_str(" at ");
+    line.push_hex(detail.instruction);
+    if let Some((kind, address)) = detail.access {
+        line.push_str(match kind {
+            0 => ", reading ",
+            1 => ", writing ",
+            8 => ", executing ",
+            _ => ", touching ",
+        });
+        line.push_hex(address);
+    }
+    line.push_str("\n");
+    line.len
 }
 
 /// The name of a well-known Windows exception status, if it has one.
@@ -324,11 +369,40 @@ mod windows_filter {
         let code = exception_code(exception_info);
         let mut buffer = [0u8; FAULT_LINE_CAPACITY];
         let len = write_fault_line(&mut buffer, code, current_site());
+        let len = match exception_detail(exception_info) {
+            Some(detail) => super::append_fault_detail(&mut buffer, len, detail),
+            None => len,
+        };
         write_stderr(&buffer[..len]);
         // The supervisor reads this exit code and knows that the host caught a
         // plugin fault (see `crate::restart`).
         let _ = unsafe { TerminateProcess(GetCurrentProcess(), PLUGIN_FAULT_EXIT_CODE) };
         EXCEPTION_EXECUTE_HANDLER
+    }
+
+    /// The instruction address and, for an access violation, the access.
+    fn exception_detail(exception_info: *const EXCEPTION_POINTERS) -> Option<super::FaultDetail> {
+        if exception_info.is_null() {
+            return None;
+        }
+        // SAFETY: the filter is called with the OS's own exception pointers.
+        let record = unsafe { (*exception_info).ExceptionRecord };
+        if record.is_null() {
+            return None;
+        }
+        // SAFETY: the record belongs to the exception being reported.
+        let record = unsafe { &*record };
+        let access = (record.ExceptionCode.0 as u32 == 0xC000_0005 && record.NumberParameters >= 2)
+            .then(|| {
+                (
+                    record.ExceptionInformation[0] as u32,
+                    record.ExceptionInformation[1] as u32,
+                )
+            });
+        Some(super::FaultDetail {
+            instruction: record.ExceptionAddress as usize as u32,
+            access,
+        })
     }
 
     /// The exception status of the exception being reported.
@@ -459,6 +533,29 @@ mod tests {
             "the line must name the exception: {line}"
         );
         assert!(line.ends_with('\n'), "the line must end the report: {line}");
+    }
+
+    #[test]
+    fn the_detail_names_the_instruction_and_the_address_it_touched() {
+        let mut buffer = [0u8; FAULT_LINE_CAPACITY];
+        let len = write_fault_line(&mut buffer, 0xC000_0005, None);
+        let len = append_fault_detail(
+            &mut buffer,
+            len,
+            FaultDetail {
+                instruction: 0x1000_2030,
+                access: Some((0, 1)),
+            },
+        );
+        let line = String::from_utf8_lossy(&buffer[..len]);
+        assert!(
+            line.contains("(access violation) at 0x10002030, reading 0x00000001"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with('\n') && line.matches('\n').count() == 1,
+            "{line}"
+        );
     }
 
     #[test]

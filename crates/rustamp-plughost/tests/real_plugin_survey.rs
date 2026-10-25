@@ -244,7 +244,7 @@ fn survey_one(exe: &Path, dll: &Path, kind: PluginKind) -> Outcome {
     };
     // Trace lines are `<unix ms> <event>`: shown relative to the load request, so
     // a slow return reads as a number, not as a guess.
-    let trace = tail("trace.txt", 12)
+    let trace = tail("trace.txt", 40)
         .split(" | ")
         .map(|line| match line.split_once(' ') {
             Some((ms, event)) => match ms.parse::<u128>() {
