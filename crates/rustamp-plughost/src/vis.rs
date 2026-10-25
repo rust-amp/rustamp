@@ -553,9 +553,9 @@ pub(crate) unsafe fn list_vis_modules(
     }
     // SAFETY: caller guarantees a live header for this read.
     let version = unsafe { (*header).version };
-    // S09 section 5.1: 0x101 in 2.x. 0x102 is 5.x-only and refused (U-7
-    // decision: strict equality, the general, output and DSP policy).
-    if version != VIS_VERSION {
+    // S09 section 5.1: 0x101 in 2.x. 0x102 is 5.x-only and accepted (owner
+    // decision 2026-10-25: 5.x plug-ins are welcome; U-7 closes as a range).
+    if version != VIS_VERSION && version != rustamp_plugin_abi::common::VIS_VERSION_5X {
         return Err(PluginLoadError::UnsupportedVersion {
             kind: PluginKind::Visualization,
             actual: version,
@@ -1037,16 +1037,17 @@ mod tests {
         vis_log_clear();
         let mut module = test_module(c"first");
         let mut header = test_header(vec![&mut module]);
-        // 0x102 is the 5.x-only main-window-taking entry point (S09 §5.1).
-        header.version = rustamp_plugin_abi::common::VIS_VERSION_5X;
+        // 0x103 is not a visualization header this host knows (0x102 is the
+        // accepted 5.x main-window-taking one, S09 §5.1).
+        header.version = 0x103;
         // SAFETY: live stack header; no DLL is involved.
-        let error = unsafe { list_vis_modules(&mut header) }.expect_err("0x102 must be refused");
+        let error = unsafe { list_vis_modules(&mut header) }.expect_err("0x103 must be refused");
         assert!(
             matches!(
                 error,
                 PluginLoadError::UnsupportedVersion {
                     kind: PluginKind::Visualization,
-                    actual: 0x102,
+                    actual: 0x103,
                     expected: VIS_VERSION,
                 }
             ),

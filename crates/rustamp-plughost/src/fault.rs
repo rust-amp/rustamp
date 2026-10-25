@@ -121,6 +121,30 @@ thread_local! {
 /// fault would blame it.
 pub struct FaultScope {
     previous: Option<FaultSite>,
+    call: &'static str,
+}
+
+/// Appends one line to the file named by `RUSTAMP_HOST_TRACE`, if that
+/// variable is set; does nothing otherwise.
+///
+/// A plug-in that never returns leaves no other trace: the last `->` line
+/// without its `<-` names the call the host is stuck in. Opened per line and
+/// closed again, so a killed process loses nothing.
+pub fn trace_event(line: &str) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("RUSTAMP_HOST_TRACE") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let _ = writeln!(file, "{ms} {line}");
+    }
 }
 
 /// Record that a call into `identity`'s plugin is running on this thread.
@@ -133,12 +157,14 @@ pub fn plugin_call_scope(identity: &PluginIdentity, call: &'static str) -> Fault
         call,
     };
     let previous = CURRENT_SITE.with(|cell| cell.replace(Some(site)));
-    FaultScope { previous }
+    trace_event(&format!("-> {call}"));
+    FaultScope { previous, call }
 }
 
 impl Drop for FaultScope {
     fn drop(&mut self) {
         let previous = self.previous;
+        trace_event(&format!("<- {}", self.call));
         // `try_with` never panics: the thread-local is gone only while the
         // thread is being destroyed, and a missing restore is better than a
         // panic in a drop.
