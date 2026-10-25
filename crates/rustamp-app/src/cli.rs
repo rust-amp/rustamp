@@ -260,6 +260,7 @@ usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <
                  [--seconds <n>] [--enqueue] [--import-winamp-ini [path]] [-h|--help]
        rustamp [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
               [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
+       rustamp --approve-plugin [/CONFIG=<path>] <plug-in.dll> [<plug-in.dll> ...]
 
   <file|url>        media file to load and play, or an http(s):// URL to stream (optional)
   --null            use the deterministic null output and run headless (no window)
@@ -274,6 +275,9 @@ usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <
                     import a Winamp 2.95 winamp.ini (the file is only read); without a path
                     the player asks for the file with the native dialog
   -h, --help        print this help
+  --approve-plugin  put the exact image of each plug-in on the allowlist
+                    (plugins-approved.toml beside the configuration file) and exit; the
+                    plug-in then may run inside the plug-in host. Nothing is run.
 
   /CLASS=<name>     the window class the single-instance check looks for
   /CONFIG=<path>    the configuration file to use instead of the default

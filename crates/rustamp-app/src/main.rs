@@ -78,6 +78,31 @@ fn main() -> ExitCode {
     {
         rustamp_platform::console::ensure_console();
     }
+    // `--approve-plugin <file>...` is an operator command, not a player run: it
+    // records the exact images in the approval store (see `plugin_approval`) and
+    // ends. It is recognised on the raw arguments, before the player's own parse.
+    {
+        let raw: Vec<String> = std::env::args().skip(1).collect();
+        if raw.first().map(String::as_str) == Some("--approve-plugin") {
+            // `/CONFIG=<path>` picks the configuration (and so the store) as it
+            // does for the player; the rest are the plug-in files.
+            let (configs, files): (Vec<&String>, Vec<&String>) = raw[1..]
+                .iter()
+                .partition(|argument| argument.to_ascii_uppercase().starts_with("/CONFIG="));
+            let config = configs
+                .last()
+                .map(|argument| std::path::PathBuf::from(&argument["/CONFIG=".len()..]))
+                .or_else(rustamp_app::config::default_path);
+            let files: Vec<String> = files.into_iter().cloned().collect();
+            let (text, code) = rustamp_app::plugin_approval::run(config.as_deref(), &files);
+            if code == 0 {
+                println!("{text}");
+            } else {
+                eprintln!("{text}");
+            }
+            return ExitCode::from(code);
+        }
+    }
     let args = match cli::parse(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(error) => {
