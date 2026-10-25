@@ -454,6 +454,16 @@ fn run_ui_loop(
             break;
         }
         if !message_loop::pump_once(window) {
+            // A quit message while a visualization runs is the user closing the
+            // plug-in's own window (it posts quit to the thread that started
+            // it, S21 addendum 1): the visualization stops and the host stays.
+            if registry.running_vis().is_some() {
+                eprintln!("rustamp-plughost32: the visualization window was closed");
+                if let Err(error) = registry.stop_vis() {
+                    eprintln!("rustamp-plughost32: cannot stop it: {error}");
+                }
+                continue;
+            }
             exit_reason = UiLoopExit::WmQuit;
             break;
         }

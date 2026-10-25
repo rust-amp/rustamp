@@ -64,10 +64,19 @@ pub struct Host {
 impl Host {
     pub fn spawn(exe: &Path, approvals: &Path, scratch: &Path) -> Self {
         let stderr = std::fs::File::create(scratch.join("stderr.txt")).expect("stderr file");
-        let mut child = Command::new(exe)
+        // MilkDrop keeps its shader files below `<settings folder>\Plugins\Milkdrop2`:
+        // when the staged plug-in folder has a `milkdrop2-data` sibling, the host's
+        // settings folder (what IPC 336 and 1335 answer) is that one.
+        let data = survey_dir().parent().map(|p| p.join("milkdrop2-data"));
+        let mut command = Command::new(exe);
+        command
             .arg("--approvals")
             .arg(approvals)
-            .env("RUSTAMP_HOST_TRACE", scratch.join("trace.txt"))
+            .env("RUSTAMP_HOST_TRACE", scratch.join("trace.txt"));
+        if let Some(data) = data.filter(|d| d.is_dir()) {
+            command.env("RUSTAMP_PLUGIN_SETTINGS", data);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
