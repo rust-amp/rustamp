@@ -451,17 +451,15 @@ unsafe fn handle_window_message(
             // Classic IPC carries its id in LPARAM. Reinterpret WPARAM through
             // isize so the -666 sentinel remains signed on either pointer width.
             let ipc_id = lparam.0 as u32;
-            // S21: a plug-in's own code, running on this thread during its load or
-            // init, asks for the 5.x start-up answers (the service manager, the
-            // settings paths, the random generators). A request from another
-            // thread or process is not that and keeps the 2.95 answers of S10.
-            // SAFETY: no pointer arguments; reads the state of this window's
-            // current message.
-            let from_this_thread =
-                unsafe { windows::Win32::UI::WindowsAndMessaging::InSendMessageEx(None) } == 0;
-            if from_this_thread
-                && let Some(answer) = crate::host_services::ipc_answer(ipc_id, wparam.0)
-            {
+            // S21: a plug-in's own code asks for the 5.x start-up answers (the
+            // service manager, the settings paths, the random generators). They
+            // go to **every sender in this window's process and beyond**: MilkDrop
+            // asks from a thread of its own, and Windows does not say which
+            // process sent a message. No other client asks the plug-in host's
+            // window for these six ids (the player talks over the control
+            // channel), so nothing that is not a plug-in sees them in practice;
+            // the 2.95 answers of S10 belong to the player's own window.
+            if let Some(answer) = crate::host_services::ipc_answer(ipc_id, wparam.0) {
                 crate::fault::trace_event(&format!("5.x answer for IPC {ipc_id}: {answer:#x}"));
                 return LRESULT(answer as isize);
             }

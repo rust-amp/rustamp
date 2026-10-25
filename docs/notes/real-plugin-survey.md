@@ -145,3 +145,28 @@ Windows for its own reasons (S21 section 7). "Loaded" means the host mapped the
 plug-in, ran its getter and `init` and read its description; playing audio
 through them, a visualization window and the configuration dialogs are not
 exercised yet.
+
+## Run 8 (2026-10-25): MilkDrop in the player's path
+
+`milkdrop_in_host.rs` (VM-only) loads `vis_milk2.dll` into the production host,
+sends the player's own messages (state "playing", `ToggleVisPlugin`, a stream of
+`Vis` frames) and reports once a second what the host said, the plug-in calls it
+made and, at 3 s and 8 s, a screenshot. What it found, in order:
+
+1. The test itself stalled once the host's UI thread was inside the plug-in's
+   `init` (the control pipe fills); the frames are fed from a thread of their own.
+2. MilkDrop asks the host whether music plays when it starts and shows "No Music
+   Playing" otherwise. The host applied the player state only after the
+   inbound queue was drained, so the toggle (same batch) saw "stopped"; the state
+   is now applied before the toggle.
+3. MilkDrop 2.25c names exactly `d3dx9_31.dll`: "DirectX Missing or Corrupt"
+   (a Yes/No box; the watchdog now declines with Cancel/No, never Yes).
+4. It asks the host window from a thread of its own; the 5.x answers go to every
+   sender (see `host_window.rs`).
+5. IPC 505 (the embedding function): the 2.95 answer 1 is called as a function
+   and faults at address 1; the host answers 0 ("none").
+6. Language-service message 52 (3 arguments) is not in S21; unanswered it ends
+   in "Error loading main menu" and `init` returns 1. A dirty-room addendum to
+   S21 is under way; the clean room does not guess the contract.
+
+The visualization is therefore **not drawing yet**.

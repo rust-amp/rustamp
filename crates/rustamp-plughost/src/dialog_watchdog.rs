@@ -28,6 +28,13 @@ use std::time::{Duration, Instant};
 /// is still up after this is stuck. Own choice.
 pub const DIALOG_GRACE: Duration = Duration::from_secs(3);
 
+/// The button commands the watchdog posts to a dialog, in this order: Cancel,
+/// No, OK, Ignore, Abort. **Never Yes or Retry**: "Yes" can start something
+/// (MilkDrop's missing-DirectX box offers to open a download page), and a retry
+/// would only raise the same dialog again. A dialog that offers none of these
+/// is closed with its close box afterwards.
+pub const DISMISS_COMMANDS: [usize; 5] = [2, 7, 1, 5, 3];
+
 /// How often the watchdog looks, once the grace period is over.
 const POLL: Duration = Duration::from_millis(150);
 
@@ -184,10 +191,12 @@ fn dismiss_dialogs(ui_thread: u32) -> Vec<String> {
             .filter(|text| !text.is_empty())
             .collect();
         said.push(format!("{:?}: {}", text_of(hwnd), body.join(" ")));
-        // OK first (a message box with one button), then the close box.
+        // The buttons that decline or acknowledge, then the close box.
         // SAFETY: posting to a window of this process.
         unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(1), LPARAM(0));
+            for command in DISMISS_COMMANDS {
+                let _ = PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(command), LPARAM(0));
+            }
             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
@@ -204,6 +213,15 @@ mod tests {
         let watchdog = LoadWatchdog::start(Duration::from_secs(60));
         assert!(watchdog.finish().is_empty());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_watchdog_never_presses_yes_or_retry() {
+        // IDYES = 6 and IDRETRY = 4.
+        assert!(!DISMISS_COMMANDS.contains(&6));
+        assert!(!DISMISS_COMMANDS.contains(&4));
+        // Declining comes before acknowledging.
+        assert_eq!(&DISMISS_COMMANDS[..2], &[2, 7]);
     }
 
     #[test]

@@ -17,55 +17,18 @@
 //!
 //! Licensed `MIT OR Apache-2.0` (RFC 0004).
 
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use rustamp_ipc::{Message, StreamTransport, Transport};
+use rustamp_ipc::{Message, Transport};
 use rustamp_plughost::approval::ApprovalStore;
 use rustamp_plughost::host_window::require_test_vm;
 use rustamp_plugin_abi::PluginKind;
 
-const REPLY_DEADLINE: Duration = Duration::from_secs(12);
-
-fn survey_dir() -> PathBuf {
-    let mut candidates = Vec::new();
-    if let Some(base) = std::env::var_os("RUSTAMP_TESTPLUGINS") {
-        candidates.push(PathBuf::from(&base).join("w566"));
-        candidates.push(PathBuf::from(base));
-    }
-    candidates.push(PathBuf::from(r"C:\rustamp\testplugins\w566"));
-    candidates.push(PathBuf::from(r"D:\code\rustamp-testplugins\w566"));
-    candidates
-        .iter()
-        .find(|dir| dir.join("PROVENANCE.txt").is_file())
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "REFUSING LOUDLY: no survey directory (with PROVENANCE.txt) in {candidates:?}; \
-                 the runner stages the test plug-in directory into the guest"
-            )
-        })
-}
-
-fn host_exe() -> PathBuf {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(deps) = exe.parent()
-    {
-        candidates.push(deps.join("rustamp-plughost32.exe"));
-        if let Some(debug) = deps.parent() {
-            candidates.push(debug.join("rustamp-plughost32.exe"));
-        }
-    }
-    candidates.push(PathBuf::from(env!("CARGO_BIN_EXE_rustamp-plughost32")));
-    candidates
-        .into_iter()
-        .find(|p| p.is_file())
-        .expect("REFUSING LOUDLY: no rustamp-plughost32.exe beside the test binaries")
-}
+#[path = "common/plugin_host.rs"]
+mod plugin_host;
+use plugin_host::*;
 
 fn kind_of(file: &str) -> Option<PluginKind> {
     let lower = file.to_ascii_lowercase();
@@ -79,43 +42,6 @@ fn kind_of(file: &str) -> Option<PluginKind> {
     .into_iter()
     .find(|(prefix, _)| lower.starts_with(prefix))
     .map(|(_, kind)| kind)
-}
-
-struct Host {
-    child: Child,
-    writer: StreamTransport<io::Empty, std::process::ChildStdin>,
-    replies: mpsc::Receiver<Message>,
-}
-
-impl Host {
-    fn spawn(exe: &Path, approvals: &Path, scratch: &Path) -> Self {
-        let stderr = std::fs::File::create(scratch.join("stderr.txt")).expect("stderr file");
-        let mut child = Command::new(exe)
-            .arg("--approvals")
-            .arg(approvals)
-            .env("RUSTAMP_HOST_TRACE", scratch.join("trace.txt"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr)
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawning {} failed: {e}", exe.display()));
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stdin = child.stdin.take().expect("piped stdin");
-        let (tx, replies) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut reader = StreamTransport::new(stdout, io::sink());
-            while let Ok(message) = reader.recv() {
-                if tx.send(message).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            child,
-            writer: StreamTransport::new(io::empty(), stdin),
-            replies,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -141,26 +67,6 @@ impl Outcome {
     }
 }
 
-/// The window title `tasklist` reports for a process (`N/A` when it has none).
-fn window_title_of(pid: u32) -> String {
-    let out = Command::new("tasklist")
-        .args(["/v", "/fo", "csv", "/nh", "/fi", &format!("PID eq {pid}")])
-        .output();
-    match out {
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            // The title is the last CSV column.
-            text.trim()
-                .rsplit("\",\"")
-                .next()
-                .unwrap_or("")
-                .trim_matches('"')
-                .to_string()
-        }
-        Err(error) => format!("tasklist failed: {error}"),
-    }
-}
-
 /// The `Microsoft.VC*.CRT` assembly (and version) named in the DLL's embedded
 /// manifest, if there is one: a plain byte search, the manifest is XML text.
 fn wanted_runtime(dll: &Path) -> Option<String> {
@@ -178,12 +84,6 @@ fn wanted_runtime(dll: &Path) -> Option<String> {
         .take_while(|c| !c.is_whitespace() && *c != '"')
         .collect();
     Some(format!("{name} {version}"))
-}
-
-fn now_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis())
 }
 
 fn survey_one(exe: &Path, dll: &Path, kind: PluginKind) -> Outcome {

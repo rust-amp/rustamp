@@ -738,6 +738,26 @@ impl HostStateLink {
         }
     }
 
+    /// Sends one frame of audio data for the visualization plug-in running in
+    /// the host ([`Message::Vis`]).
+    ///
+    /// Same rules as [`send_command`](Self::send_command): never blocks the
+    /// player, nothing goes out with no host attached, and a failed send
+    /// detaches the link so the supervisor replaces the host.
+    pub fn send_vis_frame(&mut self, frame: &rustamp_core::vis::VisFrame) -> CommandOutcome {
+        if self.transport.is_none() {
+            return CommandOutcome::Detached;
+        }
+        let wire = rustamp_ipc::message::VisFrameWire::from(frame);
+        match self.send(&Message::Vis(Box::new(wire))) {
+            Ok(()) => CommandOutcome::Sent,
+            Err(_) => {
+                self.detach();
+                CommandOutcome::HostGone
+            }
+        }
+    }
+
     /// Asks the host to load the plug-in at `path` (the protocol's
     /// [`Message::LoadPlugin`] request).
     ///
@@ -839,6 +859,28 @@ mod tests {
             },
             stop_after_current: true,
         }
+    }
+
+    #[test]
+    fn a_visualization_frame_goes_out_only_with_a_host() {
+        use rustamp_core::vis::VisFrame;
+        let frame = VisFrame {
+            timestamp_us: 7,
+            ..VisFrame::default()
+        };
+        let mut link = HostStateLink::detached();
+        assert_eq!(link.send_vis_frame(&frame), CommandOutcome::Detached);
+
+        let (app_end, mut host_end) = rustamp_ipc::MemoryTransport::pair();
+        link.attach(app_end);
+        assert_eq!(link.send_vis_frame(&frame), CommandOutcome::Sent);
+        let mut received = None;
+        while let Ok(Some(message)) = host_end.try_recv() {
+            if let Message::Vis(wire) = message {
+                received = wire.to_frame();
+            }
+        }
+        assert_eq!(received, Some(frame));
     }
 
     fn headless_app(volume: u8) -> App {
