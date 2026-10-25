@@ -1791,6 +1791,11 @@ unsafe fn map_plugin_image(
     }
     let sealed = image.seal()?;
     let directory = wide_path(image.path.parent().expect("canonical file has parent"))?;
+    // The plug-ins ask the host for their own folder (and the one above it): the
+    // answers follow the plug-in being loaded (S21 addendum 1).
+    if let Some(folder) = image.path.parent() {
+        crate::host_services::note_plugin_folder(folder);
+    }
     // A plug-in may load a library of its own later, in `init`, by a plain
     // `LoadLibrary` (the 5.x input plug-ins delay-load their codec libraries).
     // That call uses the process's default search, so the default is set once to

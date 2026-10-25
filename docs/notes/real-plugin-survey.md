@@ -195,3 +195,25 @@ player's own messages (state, toggle, frames) through the control channel. The
 plug-in is loaded) is covered by headless tests only; no player window has been
 driven end to end, the data folder and the plug-in approval are test staging, and
 the audio data are synthetic.
+
+## Run 10 (2026-10-25): the player starts MilkDrop, end to end
+
+`vis_plugin_end_to_end.rs` (VM-only) runs the **real `rustamp.exe`** (silent
+windowed mode) with `vis_milk2.dll` in a Winamp-shaped folder (`Plugins\`,
+`Plugins\Milkdrop2\data`, the runtime assembly one level up), the plug-in
+approved with `rustamp --approve-plugin` and a two-minute synthetic tone to play:
+
+1. the approval command records the exact image (sha256, size) and exits 0;
+2. the player starts, its host loads the approved plug-in at start-up;
+3. `WM_COMMAND 40192` (Start/Stop plug-in, the id behind the Visualization
+   menu entry and `Ctrl+Shift+K`) reaches the host: `visualization of plugin 1
+   started`;
+4. MilkDrop's `render` is called every ~30 ms, the host's window is titled
+   `MilkDrop 2`, and the screenshot shows a live preset in motion.
+
+The audio data MilkDrop draws from are what the player's own engine decodes
+(the tone), sent over the control channel as `Vis` frames; the host answers the
+plug-in's folder questions from the folder the plug-in sits in. Same limits as
+run 9: GPU-less guest, fixed-function path (`MaxPSVersion=0` in the staged
+`milk2.ini`), no real audio device, and the data files and presets are staged,
+not shipped.

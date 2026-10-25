@@ -133,6 +133,7 @@ pub mod modern_shell;
 mod output;
 pub mod playlist_tags;
 pub mod playlist_window;
+pub mod plugin_approval;
 pub mod plugin_inventory;
 pub mod region;
 pub mod routing;

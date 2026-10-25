@@ -18,8 +18,8 @@ modern backend written in Rust.
   purpose plugins run in a separate 32-bit helper process
   (`rustamp-plughost`), so a crashing plugin cannot take the player down. The
   loader works with our own fixtures, `in_openmpt` and one third-party DSP;
-  Winamp 5.x plug-ins load, and MilkDrop 2.25c runs in the test VM; the player-side
-  start-up of a visualization is not yet driven end to end.
+  Winamp 5.x plug-ins load, and the player runs MilkDrop 2.25c end to end in the
+  test VM (see Status below for the limits).
 - **Platforms:** Windows first. Linux and macOS come later, with classic plugins
   under Wine.
 
@@ -31,7 +31,7 @@ it is not finished:
 | Works | Not yet |
 |---|---|
 | Main, equalizer and playlist windows, skins, shade and double-size; the spectrum analyser and oscilloscope (real PCM through analysis to pixels, covered by headless tests, not yet confirmed in a captured live window) | MilkDrop 2 itself: `rustamp-milkdrop` is a skeleton; the projectM sources are vendored in `third_party/` but not wired in |
-| Playback, seeking, gapless, EQ, volume and balance | Winamp 5.x plug-ins: of the 11 extracted from the 5.66 installer, 10 load in the plug-in host; **MilkDrop 2.25c runs and draws in the test VM** (software renderer, fixed-function path, synthetic audio data). Not yet: the player's own UI starting it end to end, real audio data, a plug-in picker flow with approval, a GPU test; see [docs/notes/real-plugin-survey.md](docs/notes/real-plugin-survey.md) |
+| Playback, seeking, gapless, EQ, volume and balance | Winamp 5.x plug-ins: of the 11 extracted from the 5.66 installer, 10 load in the plug-in host. **The player starts MilkDrop 2.25c end to end in the test VM** (approve with `rustamp --approve-plugin`, start with Start/Stop plug-in; the player's own decoded audio feeds it; software renderer, fixed-function path). Not yet: a GPU run, a first-run flow that fetches or ships the MilkDrop data and presets, and the other classic plug-in kinds beyond start-up; see [docs/notes/real-plugin-survey.md](docs/notes/real-plugin-survey.md) |
 | Playlists: M3U, M3U8, PLS, XSPF; Add file / folder / URL (`Ctrl+L`) | Plug-ins are listed, switched on and off and configured (`Configure`) in Preferences → Plug-ins; the first real-world check of that path is the survey above |
 | Streaming over `http://` and `https://` with Winamp's status prefixes in the title (`[Connecting]`, `[Buffer: 42%]`) | Crossfade, the media library window, the Preferences pages (partly) |
 | Media library database, tag editing | Real-hardware audio verification, a clean-machine install test |

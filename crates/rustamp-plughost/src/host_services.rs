@@ -517,37 +517,89 @@ struct Paths {
     directory_wide: Vec<u16>,
 }
 
+/// Builds the answers for a settings folder `base` and a plug-ins folder
+/// `directory` (a sub-folder of it, in the classic layout).
+fn build_paths(base: &std::path::Path, directory: &std::path::Path) -> Paths {
+    // Created so a plug-in that makes a sub-directory below it can (S21 §4).
+    let _ = std::fs::create_dir_all(directory);
+    let file = base.join("plugin-settings.ini");
+    let lossy = |path: &std::path::Path| path.to_string_lossy().into_owned();
+    let ansi = |text: String| {
+        let mut bytes = text.into_bytes();
+        bytes.push(0);
+        bytes
+    };
+    let wide = |text: String| {
+        let mut units: Vec<u16> = text.encode_utf16().collect();
+        units.push(0);
+        units
+    };
+    Paths {
+        file_ansi: ansi(lossy(&file)),
+        directory_ansi: ansi(lossy(directory)),
+        file_wide: wide(lossy(&file)),
+        base_wide: wide(lossy(base)),
+        directory_wide: wide(lossy(directory)),
+    }
+}
+
+/// The folder of the plug-in loaded last, as the host knows it.
+static PLUGIN_FOLDER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Records the folder a plug-in is being loaded from (the loader calls this).
+///
+/// In a classic layout that folder is named `Plugins`; the plug-ins ask the host
+/// for it (IPC 336, 1336) and for the folder above it (1335) and look for their
+/// own data below (`Milkdrop2\data` for MilkDrop), so the answers follow the
+/// plug-in: a player installed as `<root>\Plugins\vis_milk2.dll` with
+/// `<root>\Plugins\Milkdrop2\data` beside it needs no other setup. A plug-in
+/// in a folder with another name, or `RUSTAMP_PLUGIN_SETTINGS` set (the test
+/// seam), keeps the default settings folder of the host.
+pub fn note_plugin_folder(folder: &std::path::Path) {
+    // The canonical path carries the `\\?\` prefix; the plug-ins get plain paths.
+    let text = folder.to_string_lossy();
+    let plain = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    if let Ok(mut slot) = PLUGIN_FOLDER.lock() {
+        *slot = Some(std::path::PathBuf::from(plain));
+    }
+}
+
+/// The answer set to use now: the host's default, or the one that follows the
+/// folder of the plug-in loaded last (see [`note_plugin_folder`]).
+///
+/// Every set is kept for the rest of the process: a pointer handed to a plug-in
+/// must stay valid.
 fn paths() -> &'static Paths {
-    static PATHS: OnceLock<Paths> = OnceLock::new();
-    PATHS.get_or_init(|| {
-        let base = std::env::var_os("RUSTAMP_PLUGIN_SETTINGS")
-            .map(std::path::PathBuf::from)
+    use std::collections::HashMap;
+    static DEFAULT: OnceLock<Paths> = OnceLock::new();
+    static BY_FOLDER: Mutex<Option<HashMap<std::path::PathBuf, &'static Paths>>> = Mutex::new(None);
+
+    let override_dir = std::env::var_os("RUSTAMP_PLUGIN_SETTINGS").map(std::path::PathBuf::from);
+    let folder = PLUGIN_FOLDER.lock().ok().and_then(|slot| slot.clone());
+    let classic = folder.filter(|folder| {
+        override_dir.is_none()
+            && folder
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("plugins"))
+            && folder.parent().is_some()
+    });
+    if let Some(folder) = classic
+        && let Ok(mut map) = BY_FOLDER.lock()
+    {
+        let map = map.get_or_insert_with(HashMap::new);
+        let base = folder.parent().expect("checked above").to_path_buf();
+        let paths: &'static Paths = map
+            .entry(folder.clone())
+            .or_insert_with(|| Box::leak(Box::new(build_paths(&base, &folder))));
+        return paths;
+    }
+    DEFAULT.get_or_init(|| {
+        let base = override_dir
             .or_else(|| {
                 std::env::var_os("APPDATA").map(|dir| std::path::Path::new(&dir).join("Rustamp"))
             })
             .unwrap_or_else(|| std::env::temp_dir().join("Rustamp"));
-        let directory = base.join("plugins");
-        // Created so a plug-in that makes a sub-directory below it can (S21 §4).
-        let _ = std::fs::create_dir_all(&directory);
-        let file = base.join("plugin-settings.ini");
-        let lossy = |path: &std::path::Path| path.to_string_lossy().into_owned();
-        let ansi = |text: String| {
-            let mut bytes = text.into_bytes();
-            bytes.push(0);
-            bytes
-        };
-        let wide = |text: String| {
-            let mut units: Vec<u16> = text.encode_utf16().collect();
-            units.push(0);
-            units
-        };
-        Paths {
-            file_ansi: ansi(lossy(&file)),
-            directory_ansi: ansi(lossy(&directory)),
-            file_wide: wide(lossy(&file)),
-            base_wide: wide(lossy(&base)),
-            directory_wide: wide(lossy(&directory)),
-        }
+        build_paths(&base, &base.join("plugins"))
     })
 }
 
@@ -617,6 +669,16 @@ pub const INPUT_VERSION_WITH_SERVICES: u32 = 0xFF00_0101;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The answers follow a process-wide "plug-in folder"; tests that read the
+    /// paths or change that folder take turns.
+    static PATHS_LOCK: Mutex<()> = Mutex::new(());
+
+    fn paths_turn() -> std::sync::MutexGuard<'static, ()> {
+        PATHS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Calls the generic call the way a plug-in's argument array looks: every
     /// argument passed by its address.
@@ -758,6 +820,7 @@ mod tests {
 
     #[test]
     fn the_settings_paths_are_terminated_strings_that_stay_valid() {
+        let _turn = paths_turn();
         let file = ipc_answer(IPC_GETINIFILE, 0).unwrap() as *const u8;
         // SAFETY: the answer is a pointer into the process-lifetime storage.
         let text = unsafe { std::ffi::CStr::from_ptr(file.cast()) }.to_string_lossy();
@@ -794,6 +857,7 @@ mod tests {
 
     #[test]
     fn the_wide_paths_are_the_same_paths() {
+        let _turn = paths_turn();
         assert_eq!(wide_text(IPC_GETINIFILEW), ansi_text(IPC_GETINIFILE));
         // 1336 is the plug-ins folder (what 336 gives as ANSI); 1335 is the
         // folder that contains it, the way a plug-in expects its `Plugins` parent.
@@ -809,6 +873,35 @@ mod tests {
             "no trailing backslash"
         );
         assert!(wide_text(IPC_GETPLUGINDIRECTORYW).len() < 240);
+    }
+
+    #[test]
+    fn a_plugin_in_a_plugins_folder_gets_that_folder_and_its_parent() {
+        let _turn = paths_turn();
+        // The test seam must not be set for this (it overrides the layout).
+        if std::env::var_os("RUSTAMP_PLUGIN_SETTINGS").is_some() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("rustamp-layout-{}", std::process::id()));
+        let plugins = root.join("Plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        // The canonical path of a loaded plug-in carries the extended prefix.
+        note_plugin_folder(std::path::Path::new(&format!(r"\\?\{}", plugins.display())));
+
+        assert_eq!(
+            wide_text(IPC_GETPLUGINDIRECTORYW),
+            plugins.to_string_lossy()
+        );
+        assert_eq!(wide_text(IPC_GETINIDIRECTORYW), root.to_string_lossy());
+        assert_eq!(ansi_text(IPC_GETINIDIRECTORY), plugins.to_string_lossy());
+        // The same answers every time: the pointers must stay valid.
+        assert_eq!(
+            ipc_answer(IPC_GETPLUGINDIRECTORYW, 0),
+            ipc_answer(IPC_GETPLUGINDIRECTORYW, 0)
+        );
+        // Leave the process the way the other tests expect it.
+        *PLUGIN_FOLDER.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
