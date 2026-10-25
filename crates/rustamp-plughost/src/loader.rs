@@ -103,13 +103,16 @@ use crate::host_window::HostWindow;
 use crate::pe_preflight::PePreflightError;
 use rustamp_plugin_abi::PluginKind;
 #[cfg(any(windows, test))]
-use rustamp_plugin_abi::common::OUT_VERSION;
-#[cfg(any(windows, test))]
-use rustamp_plugin_abi::common::{GEN_VERSION, read_c_string_lossy};
+use rustamp_plugin_abi::common::{
+    GEN_VERSION, GEN_VERSION_WIDE_DESC, IN_VERSION_WIDE_DESC, read_c_string_lossy,
+    read_marked_wide_string_lossy,
+};
 #[cfg(windows)]
 use rustamp_plugin_abi::common::{
     IN_VERSION, IN_VERSION_FLAG_INIT_STATUS, IN_VERSION_FLAG_WIDE_FILENAMES,
 };
+#[cfg(any(windows, test))]
+use rustamp_plugin_abi::common::{OUT_VERSION, OUT_VERSION_WIDE_DESC};
 #[cfg(any(windows, test))]
 use rustamp_plugin_abi::dsp::{DspHeader, DspModule};
 #[cfg(any(windows, test))]
@@ -324,9 +327,11 @@ unsafe fn init_general_module(
     }
     // SAFETY: caller guarantees a live module for these reads.
     let version = unsafe { (*module).version };
-    // S09 §7.1 line 367: 0x10 in 2.95; 0x11 is 5.x-only. Checked before any
-    // host field is written and before `init` can run.
-    if version != GEN_VERSION {
+    // S09 §7.1 line 367: 0x10 in 2.95; 0x11 (wide description) is 5.x-only and
+    // accepted (owner decision 2026-10-25: 5.x plug-ins are welcome; this
+    // closes S09 U-7 as a range). Checked before any host field is written and
+    // before `init` can run.
+    if version != GEN_VERSION && version != GEN_VERSION_WIDE_DESC {
         return Err(PluginLoadError::UnsupportedVersion {
             kind: PluginKind::General,
             actual: version,
@@ -398,10 +403,10 @@ unsafe fn init_output_module(
     }
     // SAFETY: caller guarantees a live module for these reads.
     let version = unsafe { (*module).version };
-    // S09 §4.1 line 229: 0x10 in 2.95. 0x11 is 5.x-only and its description is
-    // a wide string, not the ANSI one this host reads, so it is refused
-    // (U-7 decision: strict equality, the general and DSP policy).
-    if version != OUT_VERSION {
+    // S09 §4.1 line 229: 0x10 in 2.95. 0x11 is 5.x-only, its description is a
+    // wide string (read as one, see the loader), and it is accepted (owner
+    // decision 2026-10-25: 5.x plug-ins are welcome; U-7 closes as a range).
+    if version != OUT_VERSION && version != OUT_VERSION_WIDE_DESC {
         return Err(PluginLoadError::UnsupportedVersion {
             kind: PluginKind::Output,
             actual: version,
@@ -1797,6 +1802,17 @@ unsafe fn map_plugin_image(
     }
     let search_directory = SearchDirectory(cookie);
     let wide_path = wide_path(&sealed.path())?;
+    // A plug-in without a manifest of its own inherits the process's: give it
+    // the VC++ runtime it links, for the duration of the load only.
+    let runtime = image.path.parent().and_then(|plugin_dir| {
+        let host_dir = std::env::current_exe().ok();
+        crate::side_by_side::activate_for(
+            plugin_dir,
+            host_dir.as_deref().and_then(Path::parent),
+            sealed.path().parent()?,
+        )
+    });
+    crate::fault::trace_event("-> LoadLibraryExW (DllMain runs here)");
     // SAFETY: the snapshot and its namespace stay pinned through this call.
     // Caller approves execution; structural checks do not establish trust.
     let hinstance = unsafe {
@@ -1806,11 +1822,16 @@ unsafe fn map_plugin_image(
             0x0000_0100 | 0x0000_0400 | 0x0000_0800, // DLL_LOAD_DIR | USER_DIRS | SYSTEM32
         )
     };
+    // SAFETY: capture this thread's loader failure before anything else can
+    // overwrite it (the context's own release must not).
+    let load_error = unsafe { GetLastError() };
+    drop(runtime);
     if hinstance.is_null() {
-        // SAFETY: capture this thread's loader failure immediately.
-        let err = unsafe { GetLastError() };
+        let err = load_error;
+        crate::fault::trace_event(&format!("<- LoadLibraryExW failed: {err}"));
         return Err(PluginLoadError::OsLoadFailed(err));
     }
+    crate::fault::trace_event("<- LoadLibraryExW");
     sealed.retain_for_process();
     drop(search_directory);
     Ok(hinstance)
@@ -1928,7 +1949,7 @@ unsafe fn load_input_module(
     let version = unsafe { (*module_ptr).version };
     let base_version =
         version & !(IN_VERSION_FLAG_WIDE_FILENAMES as i32 | IN_VERSION_FLAG_INIT_STATUS as i32);
-    if base_version != IN_VERSION {
+    if base_version != IN_VERSION && base_version != IN_VERSION_WIDE_DESC {
         return Err(PluginLoadError::UnsupportedVersion {
             kind: PluginKind::Input,
             actual: version,
@@ -1936,7 +1957,13 @@ unsafe fn load_input_module(
         });
     }
 
-    let description = unsafe { read_c_string_lossy((*module_ptr).description) };
+    let description = unsafe {
+        if base_version == IN_VERSION_WIDE_DESC {
+            read_marked_wide_string_lossy((*module_ptr).description)
+        } else {
+            read_c_string_lossy((*module_ptr).description)
+        }
+    };
 
     // S09 §3.1 lines 76–115, §3.5 lines 153–156: write host-filled members before init().
     unsafe {
@@ -2088,7 +2115,13 @@ unsafe fn load_general_module(
     } else {
         // SAFETY: non-null module in the mapped image's static data; a null
         // description pointer reads as empty and is not dereferenced (S09 §3).
-        unsafe { read_c_string_lossy((*module_ptr).description) }
+        unsafe {
+            if (*module_ptr).version == GEN_VERSION_WIDE_DESC {
+                read_marked_wide_string_lossy((*module_ptr).description)
+            } else {
+                read_c_string_lossy((*module_ptr).description)
+            }
+        }
     };
 
     // SAFETY: getter result from the approved mapped image; UI thread.
@@ -2135,7 +2168,13 @@ unsafe fn load_output_module(
     // pointer during init cannot change what the host reported it as.
     // SAFETY: non-null module in the mapped image's static data; a null
     // description pointer reads as empty and is not dereferenced (S09 §4.1).
-    let description = unsafe { read_c_string_lossy((*module_ptr).description) };
+    let description = unsafe {
+        if (*module_ptr).version == OUT_VERSION_WIDE_DESC {
+            read_marked_wide_string_lossy((*module_ptr).description)
+        } else {
+            read_c_string_lossy((*module_ptr).description)
+        }
+    };
 
     // SAFETY: getter result from the approved mapped image; UI thread.
     let init = {
@@ -2540,6 +2579,25 @@ mod tests {
     }
 
     #[test]
+    fn a_5x_general_plugin_with_a_wide_description_is_accepted() {
+        gen_log_clear();
+        let mut module = gen_module(
+            Some(gen_init_reading_fields),
+            Some(gen_config),
+            Some(gen_quit),
+        );
+        // 0x11 is the 5.x version with a wide description (S09 §7.1): accepted
+        // since the owner's decision of 2026-10-25.
+        module.version = GEN_VERSION_WIDE_DESC;
+        GEN_MODULE.with(|slot| slot.set(&mut module));
+        // SAFETY: live stack module; no DLL is involved.
+        unsafe { init_general_module(&mut module, 0x1234, 0x5678_usize as *mut core::ffi::c_void) }
+            .expect("version 0x11 must be accepted");
+        assert_eq!(module.parent_window as usize, 0x1234);
+        assert!(!module.dll_instance.is_null());
+    }
+
+    #[test]
     fn general_version_refusal_precedes_any_callback() {
         gen_log_clear();
         let mut module = gen_module(
@@ -2547,20 +2605,21 @@ mod tests {
             Some(gen_config),
             Some(gen_quit),
         );
-        // 0x11 is 5.x-only (S09 §7.1); 2.95 expects 0x10 exactly.
-        module.version = GEN_VERSION_WIDE_DESC;
+        // 0x12 is no general-purpose version this host knows (0x10 is 2.95's,
+        // 0x11 the accepted 5.x wide-description one, S09 §7.1).
+        module.version = 0x12;
         GEN_MODULE.with(|slot| slot.set(&mut module));
         // SAFETY: live stack module; no DLL is involved.
         let err = unsafe {
             init_general_module(&mut module, 0x1234, 0x5678_usize as *mut core::ffi::c_void)
         }
-        .expect_err("version 0x11 must be refused");
+        .expect_err("version 0x12 must be refused");
         assert!(
             matches!(
                 err,
                 PluginLoadError::UnsupportedVersion {
                     kind: PluginKind::General,
-                    actual: 0x11,
+                    actual: 0x12,
                     expected: 0x10,
                 }
             ),
@@ -2823,23 +2882,38 @@ mod tests {
     }
 
     #[test]
+    fn a_5x_output_plugin_with_a_wide_description_is_accepted() {
+        out_log_clear();
+        let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
+        // 0x11 is the 5.x version with a wide description (S09 §4.1): accepted
+        // since the owner's decision of 2026-10-25.
+        module.version = rustamp_plugin_abi::common::OUT_VERSION_WIDE_DESC;
+        OUT_MODULE.with(|slot| slot.set(&mut module));
+        // SAFETY: live stack module; no DLL is involved.
+        unsafe { init_output_module(&mut module, 0x1234, 0x5678_usize as *mut core::ffi::c_void) }
+            .expect("version 0x11 must be accepted");
+        assert_eq!(module.main_window as usize, 0x1234);
+    }
+
+    #[test]
     fn output_version_refusal_precedes_any_callback() {
         out_log_clear();
         let mut module = out_module(Some(out_init_reading_fields), Some(out_quit));
-        // 0x11 is 5.x-only (S09 §4.1); 2.95 expects 0x10 exactly.
-        module.version = rustamp_plugin_abi::common::OUT_VERSION_WIDE_DESC;
+        // 0x12 is no output version this host knows (0x10 is 2.95's, 0x11 the
+        // accepted 5.x wide-description one, S09 §4.1).
+        module.version = 0x12;
         OUT_MODULE.with(|slot| slot.set(&mut module));
         // SAFETY: live stack module; no DLL is involved.
         let err = unsafe {
             init_output_module(&mut module, 0x1234, 0x5678_usize as *mut core::ffi::c_void)
         }
-        .expect_err("version 0x11 must be refused");
+        .expect_err("version 0x12 must be refused");
         assert!(
             matches!(
                 err,
                 PluginLoadError::UnsupportedVersion {
                     kind: PluginKind::Output,
-                    actual: 0x11,
+                    actual: 0x12,
                     expected: 0x10,
                 }
             ),

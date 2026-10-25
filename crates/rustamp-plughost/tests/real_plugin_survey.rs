@@ -28,7 +28,7 @@ use rustamp_plughost::approval::ApprovalStore;
 use rustamp_plughost::host_window::require_test_vm;
 use rustamp_plugin_abi::PluginKind;
 
-const REPLY_DEADLINE: Duration = Duration::from_secs(10);
+const REPLY_DEADLINE: Duration = Duration::from_secs(12);
 
 fn survey_dir() -> PathBuf {
     let mut candidates = Vec::new();
@@ -88,13 +88,15 @@ struct Host {
 }
 
 impl Host {
-    fn spawn(exe: &Path, approvals: &Path) -> Self {
+    fn spawn(exe: &Path, approvals: &Path, scratch: &Path) -> Self {
+        let stderr = std::fs::File::create(scratch.join("stderr.txt")).expect("stderr file");
         let mut child = Command::new(exe)
             .arg("--approvals")
             .arg(approvals)
+            .env("RUSTAMP_HOST_TRACE", scratch.join("trace.txt"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .unwrap_or_else(|e| panic!("spawning {} failed: {e}", exe.display()));
         let stdout = child.stdout.take().expect("piped stdout");
@@ -122,6 +124,8 @@ enum Outcome {
     Refused(String),
     Hung,
     Died,
+    HungAt(String),
+    DiedWith(String),
 }
 
 impl Outcome {
@@ -131,8 +135,55 @@ impl Outcome {
             Outcome::Refused(why) => format!("REFUSED: {why}"),
             Outcome::Hung => "HUNG (no reply)".to_string(),
             Outcome::Died => "DIED (the host's channel closed)".to_string(),
+            Outcome::HungAt(trace) => format!("HUNG, last calls: {trace}"),
+            Outcome::DiedWith(what) => format!("DIED, {what}"),
         }
     }
+}
+
+/// The window title `tasklist` reports for a process (`N/A` when it has none).
+fn window_title_of(pid: u32) -> String {
+    let out = Command::new("tasklist")
+        .args(["/v", "/fo", "csv", "/nh", "/fi", &format!("PID eq {pid}")])
+        .output();
+    match out {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            // The title is the last CSV column.
+            text.trim()
+                .rsplit("\",\"")
+                .next()
+                .unwrap_or("")
+                .trim_matches('"')
+                .to_string()
+        }
+        Err(error) => format!("tasklist failed: {error}"),
+    }
+}
+
+/// The `Microsoft.VC*.CRT` assembly (and version) named in the DLL's embedded
+/// manifest, if there is one: a plain byte search, the manifest is XML text.
+fn wanted_runtime(dll: &Path) -> Option<String> {
+    let bytes = std::fs::read(dll).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let at = text.find("Microsoft.VC")?;
+    let window = &text[at..(at + 160).min(text.len())];
+    let version = window
+        .split("version=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or("?");
+    let name: String = window
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '"')
+        .collect();
+    Some(format!("{name} {version}"))
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 fn survey_one(exe: &Path, dll: &Path, kind: PluginKind) -> Outcome {
@@ -149,7 +200,8 @@ fn survey_one(exe: &Path, dll: &Path, kind: PluginKind) -> Outcome {
     }
     store.save_to_file(&approvals).unwrap();
 
-    let mut host = Host::spawn(exe, &approvals);
+    let mut host = Host::spawn(exe, &approvals, &scratch);
+    let mut sent_at_ms = 0u128;
     let outcome = (|| {
         match host.replies.recv_timeout(REPLY_DEADLINE) {
             Ok(Message::Hello { .. }) => {}
@@ -157,6 +209,7 @@ fn survey_one(exe: &Path, dll: &Path, kind: PluginKind) -> Outcome {
             Err(mpsc::RecvTimeoutError::Timeout) => return Outcome::Hung,
             Err(mpsc::RecvTimeoutError::Disconnected) => return Outcome::Died,
         }
+        sent_at_ms = now_ms();
         host.writer
             .send(&Message::LoadPlugin {
                 path: dll.to_string_lossy().into_owned(),
@@ -171,12 +224,45 @@ fn survey_one(exe: &Path, dll: &Path, kind: PluginKind) -> Outcome {
             Err(mpsc::RecvTimeoutError::Disconnected) => Outcome::Died,
         }
     })();
+    // A host that is stuck may be stuck behind a dialog the plug-in or its
+    // runtime raised (a missing runtime shows one and waits for a click): the
+    // window title of the process says so before the host is told to quit.
+    let stuck_window = if matches!(outcome, Outcome::Hung) {
+        window_title_of(host.child.id())
+    } else {
+        String::new()
+    };
     let _ = host.writer.send(&Message::Shutdown);
     std::thread::sleep(Duration::from_millis(500));
     let _ = host.child.kill();
     let _ = host.child.wait();
+    // What the host last did, and what it said, is the whole point of a hang.
+    let tail = |name: &str, lines: usize| -> String {
+        let text = std::fs::read_to_string(scratch.join(name)).unwrap_or_default();
+        let all: Vec<&str> = text.lines().collect();
+        all[all.len().saturating_sub(lines)..].join(" | ")
+    };
+    // Trace lines are `<unix ms> <event>`: shown relative to the load request, so
+    // a slow return reads as a number, not as a guess.
+    let trace = tail("trace.txt", 12)
+        .split(" | ")
+        .map(|line| match line.split_once(' ') {
+            Some((ms, event)) => match ms.parse::<u128>() {
+                Ok(ms) => format!("+{}ms {event}", ms as i128 - sent_at_ms as i128),
+                Err(_) => line.to_string(),
+            },
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let said = tail("stderr.txt", 4);
     let _ = std::fs::remove_dir_all(&scratch);
-    outcome
+    match outcome {
+        Outcome::Hung => Outcome::HungAt(format!("{trace}; window of the host: {stuck_window:?}")),
+        Outcome::Died => Outcome::DiedWith(format!("trace: {trace}; stderr: {said}")),
+        Outcome::Refused(why) => Outcome::Refused(format!("{why}; trace: {trace}")),
+        other => other,
+    }
 }
 
 #[test]
@@ -185,6 +271,20 @@ fn survey_of_real_plugins_through_the_production_host() {
     require_test_vm();
     let dir = survey_dir();
     let exe = host_exe();
+    // The VC++ 2008 runtime is a side-by-side assembly: a plug-in's manifest is
+    // resolved against the folder of the **process** (the host), not against the
+    // plug-in's own folder, which is where Winamp keeps it. Staging it beside
+    // the host mirrors a Winamp install.
+    let crt = dir.join("Microsoft.VC90.CRT");
+    if crt.is_dir()
+        && let Some(host_dir) = exe.parent()
+    {
+        let target = host_dir.join("Microsoft.VC90.CRT");
+        let _ = std::fs::create_dir_all(&target);
+        for entry in std::fs::read_dir(&crt).unwrap().filter_map(Result::ok) {
+            let _ = std::fs::copy(entry.path(), target.join(entry.file_name()));
+        }
+    }
     let mut dlls: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(Result::ok)
@@ -213,11 +313,15 @@ fn survey_of_real_plugins_through_the_production_host() {
             continue;
         };
         let outcome = survey_one(&exe, dll, kind);
+        // The runtime assembly the plug-in's embedded manifest asks for.
+        if let Some(wanted) = wanted_runtime(dll) {
+            table.push(format!("SURVEY   {file} wants {wanted}"));
+        }
         table.push(format!("SURVEY {file} [{kind:?}]: {}", outcome.describe()));
         match outcome {
             Outcome::Loaded(_) => loaded += 1,
-            Outcome::Hung => hung.push(file),
-            Outcome::Refused(_) | Outcome::Died => {}
+            Outcome::Hung | Outcome::HungAt(_) => hung.push(file),
+            Outcome::Refused(_) | Outcome::Died | Outcome::DiedWith(_) => {}
         }
     }
     table.push(format!("SURVEY loaded {loaded} of {}", dlls.len()));

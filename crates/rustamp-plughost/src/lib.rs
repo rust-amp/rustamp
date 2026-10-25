@@ -29,6 +29,7 @@
 pub mod approval;
 mod commands;
 pub mod control;
+pub mod dialog_watchdog;
 pub mod dsp;
 pub mod fault;
 pub mod handoff;
@@ -41,6 +42,7 @@ pub mod message_loop;
 pub mod pe_preflight;
 pub mod registry;
 pub mod restart;
+pub mod side_by_side;
 pub mod state_bridge;
 pub mod vis;
 

@@ -30,7 +30,7 @@ it is not finished:
 | Works | Not yet |
 |---|---|
 | Main, equalizer and playlist windows, skins, shade and double-size; the spectrum analyser and oscilloscope (real PCM through analysis to pixels, covered by headless tests, not yet confirmed in a captured live window) | MilkDrop 2 itself: `rustamp-milkdrop` is a skeleton; the projectM sources are vendored in `third_party/` but not wired in |
-| Playback, seeking, gapless, EQ, volume and balance | Real Winamp 5 plug-ins: of eleven tried, none loaded yet (a silent host, a 5.x DSP header, a crash; see [docs/notes/real-plugin-survey.md](docs/notes/real-plugin-survey.md)) |
+| Playback, seeking, gapless, EQ, volume and balance | Winamp 5.x plug-ins are accepted, but most need Winamp 5's service API, which the host does not provide yet: of 14 tried 3 load (`gen_hotkeys`, `gen_jumpex`, `out_wave`), the rest fault in their own start-up; see [docs/notes/real-plugin-survey.md](docs/notes/real-plugin-survey.md) |
 | Playlists: M3U, M3U8, PLS, XSPF; Add file / folder / URL (`Ctrl+L`) | Plug-ins are listed, switched on and off and configured (`Configure`) in Preferences → Plug-ins; the first real-world check of that path is the survey above |
 | Streaming over `http://` and `https://` with Winamp's status prefixes in the title (`[Connecting]`, `[Buffer: 42%]`) | Crossfade, the media library window, the Preferences pages (partly) |
 | Media library database, tag editing | Real-hardware audio verification, a clean-machine install test |

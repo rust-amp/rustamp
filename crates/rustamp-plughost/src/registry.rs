@@ -334,9 +334,22 @@ impl PluginRegistry {
 
         // SAFETY: the caller's UI-thread and approved-code invariants are
         // forwarded unchanged; the store is the operator's approval decision.
-        let loaded = match unsafe { load_plugin_with_store(Path::new(path), store, window) } {
+        //
+        // A dialog the plug-in (or its C runtime) raises on this thread would
+        // hold the host in its message loop and leave the request unanswered; the
+        // watchdog records and dismisses it, and the refusal says what it said.
+        let watchdog =
+            crate::dialog_watchdog::LoadWatchdog::start(crate::dialog_watchdog::DIALOG_GRACE);
+        let result = unsafe { load_plugin_with_store(Path::new(path), store, window) };
+        let dialogs = watchdog.finish();
+        let loaded = match result {
             Ok(loaded) => loaded,
-            Err(e) => return error(e.to_string()),
+            Err(e) => {
+                return error(match crate::dialog_watchdog::describe(&dialogs) {
+                    Some(dialog) => format!("{e}; {dialog}"),
+                    None => e.to_string(),
+                });
+            }
         };
 
         // Authoritative check: this is the kind of the image that was actually

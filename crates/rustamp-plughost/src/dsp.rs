@@ -43,7 +43,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustamp_plugin_abi::PluginKind;
-use rustamp_plugin_abi::common::{DSP_VERSION, read_c_string_lossy};
+use rustamp_plugin_abi::common::{
+    DSP_VERSION, DSP_VERSION_21, DSP_VERSION_22, read_c_string_lossy,
+};
 use rustamp_plugin_abi::dsp::{DspHeader, DspModule};
 
 use crate::loader::PluginLoadError;
@@ -195,9 +197,11 @@ pub(crate) unsafe fn list_dsp_modules(
     }
     // SAFETY: caller guarantees a live header for this read.
     let version = unsafe { (*header).version };
-    // S09 section 6.1: 0x20 for 2.x. The 5.x variants 0x21/0x22 are refused
-    // (U-7 decision: strict equality, the general, output and vis policy).
-    if version != DSP_VERSION {
+    // S09 section 6.1: 0x20 for 2.x. The 5.x variants 0x21/0x22 are accepted
+    // (owner decision 2026-10-25: 5.x plug-ins are welcome; U-7 closes as a
+    // range). Their header is 16 bytes (a trailing `key_check` the host never
+    // calls); the module layout is the same.
+    if version != DSP_VERSION && version != DSP_VERSION_21 && version != DSP_VERSION_22 {
         return Err(PluginLoadError::UnsupportedVersion {
             kind: PluginKind::Dsp,
             actual: version,
@@ -588,15 +592,12 @@ mod tests {
         dsp_log_clear();
         let mut module = test_module(c"first");
         let mut header = test_header(vec![&mut module]);
-        // 0x21 and 0x22 are the 5.x-only main-window-taking headers (S09 §6.1).
-        for version in [
-            rustamp_plugin_abi::common::DSP_VERSION_21,
-            rustamp_plugin_abi::common::DSP_VERSION_22,
-        ] {
+        // Anything outside 0x20..=0x22 is not a DSP header this host knows.
+        for version in [0x1F, 0x23, 0x100, -1] {
             header.version = version;
             // SAFETY: live stack header; no DLL is involved.
             let error = unsafe { list_dsp_modules(&mut header) }
-                .expect_err("a 5.x header version must be refused");
+                .expect_err("an unknown header version must be refused");
             assert!(
                 matches!(
                     error,

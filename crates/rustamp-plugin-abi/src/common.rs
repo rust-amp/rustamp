@@ -149,6 +149,61 @@ pub unsafe fn read_c_string_lossy(ptr: *const c_char) -> String {
     cstr.to_string_lossy().into_owned()
 }
 
+/// Reads a NUL-terminated UTF-16 string (a 5.x wide description), lossily.
+///
+/// # Safety
+///
+/// `ptr` must be null, or point to a readable NUL-terminated `u16` string that
+/// stays valid and unmodified for the duration of the call. The read is
+/// bounded at 4096 units, so a string that is never terminated cannot run on.
+pub unsafe fn read_wide_string_lossy(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut units = Vec::new();
+    for i in 0..4096 {
+        // SAFETY: the caller guarantees a terminated string; the bound stops an
+        // unterminated one at a fixed distance.
+        let unit = unsafe { ptr.add(i).read_unaligned() };
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    String::from_utf16_lossy(&units)
+}
+
+/// Reads a description that a 5.x header marks as "wide" (version 0x11 / 0x101),
+/// whichever encoding it really has.
+///
+/// Observed on the Winamp 5.66 plug-ins: a header with the wide version can
+/// still point at an ANSI literal. A UTF-16 string of Latin text has a zero
+/// second byte (`N u ...`); an ANSI one does not. The first two bytes decide.
+///
+/// # Safety
+///
+/// `ptr` must be null, or point to a readable NUL-terminated string (ANSI or
+/// UTF-16) that stays valid for the call.
+pub unsafe fn read_marked_wide_string_lossy(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let bytes = ptr.cast::<u8>();
+    // SAFETY: a non-null string has at least its terminator; reading the second
+    // byte is covered unless the first is the terminator, which is checked first.
+    let (first, second) = unsafe {
+        let first = bytes.read();
+        (first, if first == 0 { 0 } else { bytes.add(1).read() })
+    };
+    if first != 0 && second == 0 {
+        // SAFETY: forwarded; the string is UTF-16 by the test above.
+        unsafe { read_wide_string_lossy(ptr.cast()) }
+    } else {
+        // SAFETY: forwarded; the string is ANSI.
+        unsafe { read_c_string_lossy(ptr) }
+    }
+}
+
 /// Asserts struct size and field offsets on 32-bit x86 only (S09 section 0:
 /// layouts are exact on x86; the plugin host is 32-bit only, so the 64-bit
 /// layout is unused and only has to compile).
@@ -162,3 +217,61 @@ macro_rules! layout_asserts {
     };
 }
 pub(crate) use layout_asserts;
+
+#[cfg(test)]
+mod wide_string_tests {
+    use super::read_wide_string_lossy;
+
+    #[test]
+    fn a_wide_description_is_read_to_its_terminator() {
+        let text: Vec<u16> = "Nullsoft Wave".encode_utf16().chain([0, 0x41]).collect();
+        // SAFETY: a live, NUL-terminated buffer.
+        assert_eq!(
+            unsafe { read_wide_string_lossy(text.as_ptr()) },
+            "Nullsoft Wave"
+        );
+    }
+
+    #[test]
+    fn a_null_pointer_reads_as_empty() {
+        // SAFETY: null is the documented empty case.
+        assert_eq!(unsafe { read_wide_string_lossy(core::ptr::null()) }, "");
+    }
+
+    #[test]
+    fn an_unterminated_string_stops_at_the_bound() {
+        let text = vec![0x41u16; 5000];
+        // SAFETY: the buffer is longer than the bound the reader stops at.
+        assert_eq!(unsafe { read_wide_string_lossy(text.as_ptr()) }.len(), 4096);
+    }
+}
+
+#[cfg(test)]
+mod marked_wide_tests {
+    use super::read_marked_wide_string_lossy;
+
+    #[test]
+    fn an_ansi_string_behind_a_wide_version_is_read_as_ansi() {
+        let text = b"Nullsoft Global Hotkeys\0";
+        // SAFETY: a live NUL-terminated buffer.
+        let read = unsafe { read_marked_wide_string_lossy(text.as_ptr().cast()) };
+        assert_eq!(read, "Nullsoft Global Hotkeys");
+    }
+
+    #[test]
+    fn a_utf16_string_behind_a_wide_version_is_read_as_utf16() {
+        let text: Vec<u16> = "Nullsoft WaveOut".encode_utf16().chain([0]).collect();
+        // SAFETY: a live NUL-terminated buffer.
+        let read = unsafe { read_marked_wide_string_lossy(text.as_ptr().cast()) };
+        assert_eq!(read, "Nullsoft WaveOut");
+    }
+
+    #[test]
+    fn null_and_empty_read_as_empty() {
+        // SAFETY: null is the documented empty case; the other is a lone terminator.
+        unsafe {
+            assert_eq!(read_marked_wide_string_lossy(core::ptr::null()), "");
+            assert_eq!(read_marked_wide_string_lossy(c"".as_ptr()), "");
+        }
+    }
+}
