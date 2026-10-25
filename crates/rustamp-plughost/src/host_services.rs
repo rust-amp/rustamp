@@ -36,6 +36,15 @@ pub const IPC_GETINIFILEW: u32 = 1334;
 pub const IPC_GETINIDIRECTORYW: u32 = 1335;
 /// IPC id: the addresses of two random generators (wparam 0 int, 1 float).
 pub const IPC_GET_RANDFUNC: u32 = 3015;
+/// IPC id: the plug-ins folder as wide text; `Milkdrop2\data` sits below it
+/// (S21 addendum 1, notes 5).
+pub const IPC_GETPLUGINDIRECTORYW: u32 = 1336;
+/// IPC id: which d3dx9 library the host has loaded (0 = none, the plug-in loads
+/// its own by name; S21 addendum 1).
+pub const IPC_GET_D3DX9: u32 = 3044;
+/// IPC id: the wide title of a playlist position, as a pointer to a wide string
+/// that stays valid for the call; asked every frame by MilkDrop.
+pub const IPC_GETPLAYLISTTITLEW: u32 = 213;
 /// IPC id 505: asks for a function that embeds a window in the host (the
 /// answer is called as a function when it is not 0). **Not in S21**: found when
 /// MilkDrop ran past its start-up checks (it called the answer 1 of the 2.95
@@ -52,6 +61,7 @@ const MSG_LOOKUP_SERVICE: i32 = 50;
 const MSG_FACTORY_GET: i32 = 300;
 const MSG_FACTORY_RELEASE: i32 = 310;
 const MSG_LANGUAGE_START: i32 = 30;
+const MSG_LANGUAGE_MENU: i32 = 52;
 const MSG_LANGUAGE_ANSI: i32 = 10;
 const MSG_LANGUAGE_WIDE: i32 = 11;
 
@@ -62,7 +72,24 @@ pub const LANGUAGE_SERVICE_ID: [u8; 16] = [
     0xE5, 0xD4, 0xAE, 0x30, 0x10, 0xEF, 0x77, 0x42, 0x8D, 0x49, 0x27, 0xAB, 0x55, 0x70, 0xE8, 0x91,
 ];
 
-/// What a language "handle" is: any non-zero number works (S21 §5.1).
+/// The application service and the service MilkDrop looks up beside it
+/// (23B96771-09D7-46D3-9AE2-20DCEA6C86EA and 57B7A1B6-700E-44FF-9CB0-70B92BAF3959):
+/// the host has nothing to offer for them, but the plug-in calls what it gets
+/// unchecked from user actions (help, web links), so it gets a service that
+/// answers every message with "not understood" (S21 addendum 1, notes 6).
+pub const NULL_SERVICE_IDS: [[u8; 16]; 2] = [
+    [
+        0x71, 0x67, 0xB9, 0x23, 0xD7, 0x09, 0xD3, 0x46, 0x9A, 0xE2, 0x20, 0xDC, 0xEA, 0x6C, 0x86,
+        0xEA,
+    ],
+    [
+        0xB6, 0xA1, 0xB7, 0x57, 0x0E, 0x70, 0xFF, 0x44, 0x9C, 0xB0, 0x70, 0xB9, 0x2B, 0xAF, 0x39,
+        0x59,
+    ],
+];
+
+/// What a language "handle" is when the plug-in gave no module: any non-zero
+/// number (S21 §5.1). With a module, the handle IS the module (addendum 1).
 const LANGUAGE_HANDLE: usize = 0x4C41_4E47;
 
 /// Which of the three objects a call is addressed to.
@@ -75,6 +102,10 @@ pub enum ObjectKind {
     LanguageFactory = 2,
     /// The language service itself.
     Language = 3,
+    /// The factory of a service the host does not provide but must hand out.
+    NullFactory = 4,
+    /// That service: it answers every message with "not understood".
+    Null = 5,
 }
 
 /// An object in the shape every caller expects: the first word points at a
@@ -116,6 +147,14 @@ static LANGUAGE: ServiceObject = ServiceObject {
     table: TABLE.0.as_ptr(),
     kind: ObjectKind::Language,
 };
+static NULL_FACTORY: ServiceObject = ServiceObject {
+    table: TABLE.0.as_ptr(),
+    kind: ObjectKind::NullFactory,
+};
+static NULL_SERVICE: ServiceObject = ServiceObject {
+    table: TABLE.0.as_ptr(),
+    kind: ObjectKind::Null,
+};
 
 /// The pointer a plug-in is given for IPC 3025 and in the input module's
 /// service-manager member (S21 §1 question 1).
@@ -128,6 +167,8 @@ fn object_of(kind: ObjectKind) -> *const ServiceObject {
         ObjectKind::Manager => &MANAGER,
         ObjectKind::LanguageFactory => &LANGUAGE_FACTORY,
         ObjectKind::Language => &LANGUAGE,
+        ObjectKind::NullFactory => &NULL_FACTORY,
+        ObjectKind::Null => &NULL_SERVICE,
     }
 }
 
@@ -206,6 +247,17 @@ pub unsafe fn generic_call_host(
             _ => 0,
         },
         ObjectKind::Language => unsafe { language_call(message, result, args, count) },
+        ObjectKind::NullFactory => match message {
+            MSG_FACTORY_GET => {
+                // SAFETY: a writable result cell.
+                unsafe { *result = object_of(ObjectKind::Null) as usize };
+                1
+            }
+            MSG_FACTORY_RELEASE => 1,
+            _ => 0,
+        },
+        // Every message of this service is "not understood".
+        ObjectKind::Null => 0,
     }
 }
 
@@ -231,6 +283,10 @@ unsafe fn manager_call(
                 // SAFETY: a writable result cell.
                 unsafe { *result = object_of(ObjectKind::LanguageFactory) as usize };
                 1
+            } else if NULL_SERVICE_IDS.contains(&id) {
+                // SAFETY: a writable result cell.
+                unsafe { *result = object_of(ObjectKind::NullFactory) as usize };
+                1
             } else {
                 // The other services are looked up null-checked at start-up (S21 §5).
                 crate::fault::trace_event(&format!("service lookup: unknown identifier {id:02X?}"));
@@ -252,8 +308,31 @@ unsafe fn language_call(
 ) -> i32 {
     match message {
         MSG_LANGUAGE_START => {
+            // The result is used as a module handle to find the plug-in's own
+            // resources: it is the module the plug-in passed (S21 addendum 1,
+            // notes 1). Without one, any non-zero number.
+            // SAFETY: the caller's contract.
+            let module = unsafe { word_arg(args, count, 0) }.unwrap_or(LANGUAGE_HANDLE);
             // SAFETY: a writable result cell.
-            unsafe { *result = LANGUAGE_HANDLE };
+            unsafe { *result = if module == 0 { LANGUAGE_HANDLE } else { module } };
+            1
+        }
+        MSG_LANGUAGE_MENU => {
+            // Arguments: language handle (ignored), module handle, resource id.
+            // The menu is the plug-in's own resource; the plug-in destroys the
+            // handle, so every call makes a fresh one (S21 addendum 1, notes 2).
+            // SAFETY: the caller's contract.
+            let (Some(module), Some(id)) = (unsafe { word_arg(args, count, 1) }, unsafe {
+                word_arg(args, count, 2)
+            }) else {
+                return 0;
+            };
+            let menu = load_menu(module, id as u32);
+            if menu == 0 {
+                return 0;
+            }
+            // SAFETY: a writable result cell.
+            unsafe { *result = menu };
             1
         }
         MSG_LANGUAGE_ANSI | MSG_LANGUAGE_WIDE => {
@@ -382,6 +461,27 @@ fn load_units_ansi(module: usize, id: u32) -> Vec<u16> {
         .collect()
 }
 
+/// Loads menu resource `id` of `module`; 0 when there is none.
+#[cfg(windows)]
+fn load_menu(module: usize, id: u32) -> usize {
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::UI::WindowsAndMessaging::LoadMenuW;
+    // A resource id is passed in the low word of the name pointer.
+    // SAFETY: a bad module handle or id makes the call fail, not fault.
+    unsafe {
+        LoadMenuW(
+            Some(HINSTANCE(module as *mut c_void)),
+            windows::core::PCWSTR(id as usize as *const u16),
+        )
+    }
+    .map_or(0, |menu| menu.0 as usize)
+}
+
+#[cfg(not(windows))]
+fn load_menu(_module: usize, _id: u32) -> usize {
+    0
+}
+
 #[cfg(not(windows))]
 fn load_units_wide(_module: usize, _id: u32) -> Vec<u16> {
     Vec::new()
@@ -411,6 +511,9 @@ struct Paths {
     file_ansi: Vec<u8>,
     directory_ansi: Vec<u8>,
     file_wide: Vec<u16>,
+    /// The settings folder: it already holds a `Plugins` folder (IPC 1335).
+    base_wide: Vec<u16>,
+    /// The plug-ins folder (IPC 1336).
     directory_wide: Vec<u16>,
 }
 
@@ -442,10 +545,20 @@ fn paths() -> &'static Paths {
             file_ansi: ansi(lossy(&file)),
             directory_ansi: ansi(lossy(&directory)),
             file_wide: wide(lossy(&file)),
+            base_wide: wide(lossy(&base)),
             directory_wide: wide(lossy(&directory)),
         }
     })
 }
+
+/// An empty wide string, for answers that must be a valid pointer but have no
+/// text to give (the title of a playlist position the host does not hold).
+struct EmptyWide([u16; 1]);
+
+// SAFETY: immutable.
+unsafe impl Sync for EmptyWide {}
+
+static EMPTY_WIDE: EmptyWide = EmptyWide([0]);
 
 /// A random non-negative int, 15 bits (S21 §4: what the plug-ins index with).
 extern "C" fn random_int() -> i32 {
@@ -480,7 +593,10 @@ pub fn ipc_answer(id: u32, wparam: usize) -> Option<usize> {
         IPC_GETINIFILE => paths().file_ansi.as_ptr() as usize,
         IPC_GETINIDIRECTORY => paths().directory_ansi.as_ptr() as usize,
         IPC_GETINIFILEW => paths().file_wide.as_ptr() as usize,
-        IPC_GETINIDIRECTORYW => paths().directory_wide.as_ptr() as usize,
+        IPC_GETINIDIRECTORYW => paths().base_wide.as_ptr() as usize,
+        IPC_GETPLUGINDIRECTORYW => paths().directory_wide.as_ptr() as usize,
+        IPC_GET_D3DX9 => 0,
+        IPC_GETPLAYLISTTITLEW => EMPTY_WIDE.0.as_ptr() as usize,
         IPC_GET_RANDFUNC => {
             if wparam == 1 {
                 random_float as extern "C" fn() -> f32 as usize
@@ -654,9 +770,8 @@ mod tests {
         assert_eq!(ipc_answer(IPC_GETINIFILE, 0), ipc_answer(IPC_GETINIFILE, 0));
     }
 
-    #[test]
-    fn the_wide_paths_are_the_same_paths() {
-        let wide = ipc_answer(IPC_GETINIFILEW, 0).unwrap() as *const u16;
+    fn wide_text(id: u32) -> String {
+        let wide = ipc_answer(id, 0).unwrap() as *const u16;
         let mut units = Vec::new();
         for i in 0.. {
             // SAFETY: a terminated string in process-lifetime storage.
@@ -666,11 +781,101 @@ mod tests {
             }
             units.push(unit);
         }
-        let wide = String::from_utf16_lossy(&units);
-        let ansi = ipc_answer(IPC_GETINIFILE, 0).unwrap() as *const u8;
-        // SAFETY: as above.
-        let ansi = unsafe { std::ffi::CStr::from_ptr(ansi.cast()) }.to_string_lossy();
-        assert_eq!(wide, ansi);
+        String::from_utf16_lossy(&units)
+    }
+
+    fn ansi_text(id: u32) -> String {
+        let ansi = ipc_answer(id, 0).unwrap() as *const u8;
+        // SAFETY: a terminated string in process-lifetime storage.
+        unsafe { std::ffi::CStr::from_ptr(ansi.cast()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn the_wide_paths_are_the_same_paths() {
+        assert_eq!(wide_text(IPC_GETINIFILEW), ansi_text(IPC_GETINIFILE));
+        // 1336 is the plug-ins folder (what 336 gives as ANSI); 1335 is the
+        // folder that contains it, the way a plug-in expects its `Plugins` parent.
+        assert_eq!(
+            wide_text(IPC_GETPLUGINDIRECTORYW),
+            ansi_text(IPC_GETINIDIRECTORY)
+        );
+        let plugins = std::path::PathBuf::from(wide_text(IPC_GETPLUGINDIRECTORYW));
+        let base = std::path::PathBuf::from(wide_text(IPC_GETINIDIRECTORYW));
+        assert_eq!(plugins.parent(), Some(base.as_path()));
+        assert!(
+            !wide_text(IPC_GETPLUGINDIRECTORYW).ends_with('\\'),
+            "no trailing backslash"
+        );
+        assert!(wide_text(IPC_GETPLUGINDIRECTORYW).len() < 240);
+    }
+
+    #[test]
+    fn the_playlist_title_is_a_valid_empty_wide_string_and_no_d3dx9_is_loaded() {
+        assert_eq!(wide_text(IPC_GETPLAYLISTTITLEW), "");
+        assert_eq!(ipc_answer(IPC_GET_D3DX9, 0), Some(0));
+    }
+
+    #[test]
+    fn the_services_milkdrop_calls_unchecked_answer_every_message_with_no() {
+        for id in NULL_SERVICE_IDS {
+            let (handled, factory) =
+                call(service_manager(), MSG_LOOKUP_SERVICE, &[id.as_ptr().cast()]);
+            assert_eq!(handled, 1);
+            let one = 1usize;
+            let (handled, service) = call(
+                object_at(factory),
+                MSG_FACTORY_GET,
+                &[(&one as *const usize).cast()],
+            );
+            assert_eq!(handled, 1);
+            for message in [0, 10, 30, 365, 9999] {
+                assert_eq!(
+                    call(object_at(service), message, &[]).0,
+                    0,
+                    "message {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn language_start_hands_back_the_module_the_plugin_passed() {
+        let module = 0x0040_0000usize;
+        let id = [1u8; 16];
+        let (handled, handle) = call(
+            object_of(ObjectKind::Language),
+            MSG_LANGUAGE_START,
+            &[(&module as *const usize).cast(), id.as_ptr().cast()],
+        );
+        assert_eq!(handled, 1);
+        assert_eq!(handle, module);
+    }
+
+    #[test]
+    fn a_menu_that_does_not_exist_is_not_understood() {
+        // Module 0 (this test process) has no menu 110.
+        let (handle, module, id) = (LANGUAGE_HANDLE, 0usize, 110usize);
+        let args: [*const c_void; 3] = [
+            (&handle as *const usize).cast(),
+            (&module as *const usize).cast(),
+            (&id as *const usize).cast(),
+        ];
+        assert_eq!(
+            call(object_of(ObjectKind::Language), MSG_LANGUAGE_MENU, &args).0,
+            0
+        );
+        // A call with too few arguments is refused too.
+        assert_eq!(
+            call(
+                object_of(ObjectKind::Language),
+                MSG_LANGUAGE_MENU,
+                &args[..1]
+            )
+            .0,
+            0
+        );
     }
 
     #[test]

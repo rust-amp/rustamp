@@ -170,3 +170,28 @@ made and, at 3 s and 8 s, a screenshot. What it found, in order:
    S21 is under way; the clean room does not guess the contract.
 
 The visualization is therefore **not drawing yet**.
+
+## Run 9 (2026-10-25): MilkDrop 2.25c draws in the host
+
+With S21 addendum 1 (audited; `specs/S21-addendum-1-milkdrop.md`) implemented -
+the language service's menu loader (message 52) and module handle (message 30),
+the plug-ins folder and its parent (IPC 1336/1335), `d3dx9` 0, an empty wide
+title (IPC 213), services that answer every message with "no", and a host that
+survives the visualization window closing - `milkdrop_in_host.rs` reports in the
+Hyper-V guest: `visualization of plugin 1 started`, the window title
+`MilkDrop 2`, `render` called about every 30 ms for ten seconds, and two
+screenshots whose pictures differ (a live preset in motion).
+
+The guest has no GPU: with pixel shaders MilkDrop stops with "Error compiling
+ps_2_0 warp shader ... your hardware says that it supports shader model 3.0 but it
+doesn't seem to do it properly". The test therefore stages a `milk2.ini` with
+`MaxPSVersion=0` next to the data files, which makes it use its fixed-function
+path (S21 addendum 1 section 6). On a machine with a real GPU the automatic level
+is expected to work; that is not verified.
+
+What this is and is not: the production **host** runs the real plug-in, fed by the
+player's own messages (state, toggle, frames) through the control channel. The
+**player** side (the app sending the toggle and the frames while a visualization
+plug-in is loaded) is covered by headless tests only; no player window has been
+driven end to end, the data folder and the plug-in approval are test staging, and
+the audio data are synthetic.
