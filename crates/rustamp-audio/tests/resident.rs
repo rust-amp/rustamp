@@ -609,8 +609,22 @@ fn resident_to_inprocess_source_change_is_gapless() {
     // decoder, because both present the same Decoder trait.
     let mut h = Harness::new(&["track7_3000.rtst", "track2_3000.tst"]);
     h.engine.play_index(0).unwrap();
-    assert!(h.wait_track(0));
+    // `current_index` follows the decode thread, not the device: with the
+    // clock unpumped it runs ahead to track 1 as soon as track 0's frames
+    // are written, so under load the first poll can already see index 1 and
+    // `wait_track(0)` would wait for a state that is gone (the W350 flake).
+    // Wait on the monotone condition instead: both tracks buffered, and the
+    // event stream proves track 0 was opened before track 1.
     assert!(h.wait_buffered(), "both tracks must buffer");
+    let started: Vec<Option<u32>> = h
+        .drain_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::TrackChanged { index, .. } => Some(index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started, [Some(0), Some(1)], "both tracks open, in order");
 
     let total = 6000u64;
     assert_eq!(h.engine.buffered_frames(), total);
