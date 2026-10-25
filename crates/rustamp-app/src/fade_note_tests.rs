@@ -209,7 +209,9 @@ fn another_note_is_not_suppressed_by_the_fade_dedupe() {
         "the fade report reaches the user: {notes:?}"
     );
     assert!(
-        notes.iter().any(|note| note.contains("ToggleVisPlugin")),
+        notes
+            .iter()
+            .any(|note| note.contains("visualization plug-in toggle")),
         "the other note reaches the user too: {notes:?}"
     );
 }

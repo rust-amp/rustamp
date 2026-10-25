@@ -178,7 +178,7 @@ pub unsafe fn read_wide_string_lossy(ptr: *const u16) -> String {
 ///
 /// Observed on the Winamp 5.66 plug-ins: a header with the wide version can
 /// still point at an ANSI literal. A UTF-16 string of Latin text has a zero
-/// second byte (`N u ...`); an ANSI one does not. The first two bytes decide.
+/// second byte (`N, 0, u, 0, ...` in bytes); an ANSI one does not. The first two bytes decide.
 ///
 /// # Safety
 ///

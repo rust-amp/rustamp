@@ -134,6 +134,8 @@ pub enum RegistryVisError {
     },
     /// No visualization module is running, so there is nothing to stop.
     NotRunning,
+    /// No visualization plug-in is loaded, so there is nothing to start.
+    NoVisualization,
     /// The visualization bridge refused the call: an unknown module index, a
     /// module whose `init` refuses, a module that is not live.
     Vis(VisError),
@@ -150,12 +152,27 @@ impl fmt::Display for RegistryVisError {
             Self::NotRunning => {
                 f.write_str("no visualization module is running; nothing was stopped")
             }
+            Self::NoVisualization => {
+                f.write_str("no visualization plug-in is loaded; nothing was started")
+            }
             Self::Vis(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for RegistryVisError {}
+
+/// What [`PluginRegistry::toggle_vis`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisToggle {
+    /// A module of this plug-in was started.
+    Started {
+        /// The id the host assigned to the plug-in.
+        plugin_id: u32,
+    },
+    /// The running module was stopped.
+    Stopped,
+}
 
 /// The visualization module that is running, and the plugin that owns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +493,31 @@ impl PluginRegistry {
         // S09 §5.3 step 5: leaving the loop runs the module's `quit`, once.
         self.vis_loop.stop(&mut self.loaded[index].plugin);
         Ok(())
+    }
+
+    /// Start or stop the visualization the way the player's toggle command asks
+    /// (`Command::ToggleVisPlugin` names neither plug-in nor module).
+    ///
+    /// Own choice, stated plainly: a running visualization is stopped; with none
+    /// running, **module 0 of the visualization plug-in that was loaded last**
+    /// starts. "Loaded last" is what the user switched on last, and a plug-in
+    /// that offers several modules has its first one started until the protocol
+    /// can name one. With no visualization plug-in loaded the request is refused
+    /// and says so.
+    pub fn toggle_vis(&mut self) -> Result<VisToggle, RegistryVisError> {
+        if self.vis_loop.is_running() {
+            self.stop_vis()?;
+            return Ok(VisToggle::Stopped);
+        }
+        let plugin_id = self
+            .loaded
+            .iter()
+            .rev()
+            .find(|entry| entry.plugin.kind() == PluginKind::Visualization)
+            .map(|entry| entry.id)
+            .ok_or(RegistryVisError::NoVisualization)?;
+        self.start_vis(plugin_id, 0)?;
+        Ok(VisToggle::Started { plugin_id })
     }
 
     /// The visualization module that is running, and the plugin that owns it.
@@ -1456,6 +1498,31 @@ mod tests {
         assert_eq!(running.info.init_result, 0);
         // The loop's cadence is the module's own delay (S09 §5.2, offset 0x018).
         assert_eq!(registry.vis_loop().delay_ms(), 14);
+    }
+
+    #[test]
+    fn the_toggle_starts_the_last_loaded_visualization_and_then_stops_it() {
+        let _guard = crate::vis::VIS_SLOT_LOCK.lock().unwrap();
+        VIS_LOG.with(|log| log.borrow_mut().clear());
+        let mut registry = PluginRegistry::new(ApprovalStore::new());
+        assert_eq!(
+            registry.toggle_vis(),
+            Err(RegistryVisError::NoVisualization)
+        );
+
+        let _first = registry.insert_for_test(scripted_library("vis_first", 2, false, 0x99));
+        let second = registry.insert_for_test(scripted_library("vis_second", 1, false, 0xAB));
+
+        assert_eq!(
+            registry.toggle_vis(),
+            Ok(VisToggle::Started { plugin_id: second })
+        );
+        let running = registry.running_vis().expect("it runs");
+        assert_eq!(running.plugin_id, second, "the one loaded last");
+        assert_eq!(running.info.index, 0, "its first module");
+
+        assert_eq!(registry.toggle_vis(), Ok(VisToggle::Stopped));
+        assert!(registry.running_vis().is_none());
     }
 
     #[test]

@@ -79,11 +79,13 @@ use rustamp_plughost::control::{self, ControlExit, ControlInbound};
 #[cfg(windows)]
 use rustamp_plughost::message_loop;
 #[cfg(windows)]
-use rustamp_plughost::registry::PluginRegistry;
+use rustamp_plughost::registry::{PluginRegistry, VisToggle};
+use rustamp_plughost::vis::{VisPlayback, VisRows, VisStep};
+use rustamp_plughost::vis_rows::rows_from_frame;
 #[cfg(windows)]
 use rustamp_plughost::{HostWindow, IpcSurface};
 #[cfg(windows)]
-use rustamp_proto::state::PlayerState;
+use rustamp_proto::state::{PlayerState, TransportState};
 
 /// Poll quantum of the UI loop: one non-blocking window pump plus one state
 /// drain per quantum. Small enough that a plugin `SendMessage` never waits
@@ -314,6 +316,20 @@ fn run_windows() -> i32 {
 /// thread, and why the reply goes out through `outbox_tx` instead of a print:
 /// stdout is the frame stream.
 #[cfg(windows)]
+/// Applies one player state: to the host window's surface (what the plug-ins'
+/// own queries read) and to the visualization loop (what it draws: data while
+/// playing, one empty frame on stop, S09 §5.3 step 4).
+fn apply_state(window: &HostWindow, registry: &mut PluginRegistry, state: &PlayerState) {
+    window
+        .apply_player_state(state)
+        .expect("UI state updates do not reenter surface access");
+    registry.set_vis_playback(match state.transport {
+        TransportState::Playing => VisPlayback::Playing,
+        TransportState::Paused => VisPlayback::Paused,
+        TransportState::Stopped => VisPlayback::Stopped,
+    });
+}
+
 fn run_ui_loop(
     window: &HostWindow,
     registry: &mut PluginRegistry,
@@ -322,6 +338,11 @@ fn run_ui_loop(
     reader_done: &AtomicBool,
 ) -> UiLoopExit {
     let exit_reason;
+    // The newest frame of audio data for the visualization, the clock its loop
+    // runs on, and the last problem it reported (printed once, not per step).
+    let started = std::time::Instant::now();
+    let mut vis_rows: Option<VisRows> = None;
+    let mut last_vis_problem: Option<String> = None;
 
     loop {
         // Finding 9: Work budget per pump and coalesced snapshots.
@@ -346,6 +367,47 @@ fn run_ui_loop(
                     let _ = outbox_tx.try_send(reply);
                     budget -= 1;
                 }
+                Ok(ControlInbound::ToggleVis) => {
+                    // The player's toggle: start the visualization or stop the
+                    // running one. On this thread, because the module's `init` and
+                    // `quit` and its windows belong to the UI thread.
+                    //
+                    // The state that came in before the request counts: a plug-in
+                    // asks the host whether music plays when it starts (MilkDrop
+                    // refuses to run without), and the coalesced state is applied
+                    // only after the drain.
+                    if let Some(state) = latest_state.take() {
+                        apply_state(window, registry, &state);
+                    }
+                    // A dialog the plug-in raises while it starts would hold this
+                    // thread; the watchdog records and dismisses it.
+                    let watchdog = rustamp_plughost::dialog_watchdog::LoadWatchdog::start(
+                        rustamp_plughost::dialog_watchdog::DIALOG_GRACE,
+                    );
+                    let toggled = registry.toggle_vis();
+                    let dialogs = watchdog.finish();
+                    if let Some(said) = rustamp_plughost::dialog_watchdog::describe(&dialogs) {
+                        eprintln!("rustamp-plughost32: {said}");
+                    }
+                    match toggled {
+                        Ok(VisToggle::Started { plugin_id }) => {
+                            eprintln!(
+                                "rustamp-plughost32: visualization of plugin {plugin_id} started"
+                            );
+                        }
+                        Ok(VisToggle::Stopped) => {
+                            eprintln!("rustamp-plughost32: visualization stopped");
+                        }
+                        Err(error) => eprintln!(
+                            "rustamp-plughost32: cannot toggle the visualization: {error}"
+                        ),
+                    }
+                    budget -= 1;
+                }
+                Ok(ControlInbound::Vis(frame)) => {
+                    vis_rows = Some(rows_from_frame(&frame));
+                    budget -= 1;
+                }
                 Ok(request) => {
                     // A plug-in request (RFC 0005 §5.4, RFC 0020): the running
                     // visualization's Configure request, or one of the five that
@@ -364,9 +426,27 @@ fn run_ui_loop(
 
         // Apply only the latest state from the drained quantum (coalesced).
         if let Some(state) = latest_state {
-            window
-                .apply_player_state(&state)
-                .expect("UI state updates do not reenter surface access");
+            apply_state(window, registry, &state);
+        }
+        // One step of the running visualization's render loop; with none running
+        // it is a no-op. The loop paces itself by the module's own delay.
+        match registry.step_vis(started.elapsed().as_millis() as u64, vis_rows.as_ref()) {
+            Ok(VisStep::Ended { code }) => {
+                eprintln!(
+                    "rustamp-plughost32: the visualization ended itself (render returned {code})"
+                );
+                if let Err(error) = registry.stop_vis() {
+                    eprintln!("rustamp-plughost32: cannot stop it: {error}");
+                }
+            }
+            Ok(_) => last_vis_problem = None,
+            Err(error) => {
+                let text = error.to_string();
+                if last_vis_problem.as_deref() != Some(text.as_str()) {
+                    eprintln!("rustamp-plughost32: the visualization cannot draw: {text}");
+                    last_vis_problem = Some(text);
+                }
+            }
         }
 
         if reader_done.load(Ordering::SeqCst) {

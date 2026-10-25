@@ -46,6 +46,7 @@ pub mod restart;
 pub mod side_by_side;
 pub mod state_bridge;
 pub mod vis;
+pub mod vis_rows;
 
 pub use approval::{ApprovalEntry, ApprovalStore, ApprovalStoreError};
 pub use commands::{

@@ -1826,6 +1826,20 @@ impl App {
             return;
         }
         if let Some(frame) = frame {
+            // A visualization plug-in in the host draws from the same frames the
+            // main window's analyser does: they go over the control channel
+            // while one is loaded (nothing is sent for a host that has none).
+            if self
+                .host
+                .plugins_of_kind(PluginKind::Visualization)
+                .next()
+                .is_some()
+                && self.host.send_vis_frame(&frame) == CommandOutcome::HostGone
+            {
+                self.note(
+                    "the plugin host is gone: the visualization frame was not sent".to_string(),
+                );
+            }
             let source_rate_hz = self.engine.source_spec().map_or(0, |s| s.sample_rate);
             if let Err(error) = self.ui.push_vis_frame(&frame, source_rate_hz, now_ms) {
                 self.note(error.to_string());
@@ -3239,15 +3253,14 @@ impl App {
                 command.clone(),
                 &format!("stopping plugin {plugin_id}"),
             ),
-            C::ToggleVisPlugin => {
-                // The host has no start/stop path yet: only the configure
-                // request is routed (RFC 0005 §5.4 defers the rest to M3).
-                self.note(
-                    "ToggleVisPlugin is not implemented by the plugin host yet \
-                     (only the configure request is routed)"
-                        .to_string(),
-                );
-            }
+            // The visualization plug-in lives in the plugin host: the toggle goes
+            // there, and the host decides what to start (the visualization plug-in
+            // loaded last, its first module) or stops the one that runs. The
+            // audio data it draws from follows in `pump_visualization`.
+            C::ToggleVisPlugin => self.request_plugin_host_command(
+                Command::ToggleVisPlugin,
+                "the visualization plug-in toggle",
+            ),
             // The remaining variants are the engine's (see `routing::app_owns`).
             _ => {}
         }
@@ -4880,19 +4893,31 @@ mod tests {
     }
 
     #[test]
-    fn the_toggle_vis_action_still_reports_that_the_host_cannot_do_it_yet() {
+    fn the_toggle_vis_action_goes_to_the_host_and_says_so_when_there_is_none() {
         let (mut app, _dir) = app_with_file(None);
 
+        // No host attached: the request is reported, not dropped.
         app.apply(&Command::ToggleVisPlugin);
-
-        // The host has no start/stop path: the request is not sent anywhere.
         let notes = app.drain_notes();
         assert!(
             notes
                 .iter()
-                .any(|note| note.contains("not implemented by the plugin host")),
+                .any(|note| note.contains("no plugin host is attached")
+                    && note.contains("visualization plug-in toggle")),
             "{notes:?}"
         );
+
+        // With a host attached the request goes out as the toggle command.
+        let (app_end, mut host_end) = rustamp_ipc::MemoryTransport::pair();
+        app.attach_host(app_end);
+        app.apply(&Command::ToggleVisPlugin);
+        let mut sent = Vec::new();
+        while let Ok(Some(message)) = host_end.try_recv() {
+            if let Message::CommandToHost(command) = message {
+                sent.push(command);
+            }
+        }
+        assert_eq!(sent, vec![Command::ToggleVisPlugin]);
     }
 
     #[test]

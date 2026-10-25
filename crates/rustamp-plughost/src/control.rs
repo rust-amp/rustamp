@@ -223,6 +223,14 @@ pub enum ControlInbound {
         /// Host-assigned plug-in id, as carried by the frame.
         plugin_id: u32,
     },
+    /// The player asked the host to start or stop the visualization
+    /// ([`Command::ToggleVisPlugin`]); the registry decides which plug-in and
+    /// module (see [`PluginRegistry::toggle_vis`]). The UI loop acts on it,
+    /// because it needs the registry mutably.
+    ToggleVis,
+    /// A frame of audio data for the running visualization
+    /// ([`Message::Vis`]): the UI loop keeps the newest one.
+    Vis(Box<rustamp_proto::vis::VisFrame>),
 }
 
 /// Route one inbound message to an event sink.
@@ -258,6 +266,18 @@ pub fn handle_message_inbound(
         }
         Message::CommandToHost(Command::ConfigureVisPlugin) => {
             on_event(ControlInbound::ConfigureVis);
+            ControlStep::Continue
+        }
+        Message::CommandToHost(Command::ToggleVisPlugin) => {
+            on_event(ControlInbound::ToggleVis);
+            ControlStep::Continue
+        }
+        Message::Vis(wire) => {
+            // A frame whose shape does not decode is dropped: the visualization
+            // keeps the last good one (and the stale-frame rule of the loop).
+            if let Some(frame) = wire.to_frame() {
+                on_event(ControlInbound::Vis(Box::new(frame)));
+            }
             ControlStep::Continue
         }
         Message::CommandToHost(Command::ConfigurePlugin { plugin_id, kind }) => {
@@ -323,7 +343,13 @@ pub fn apply_plugin_request(
         ControlInbound::StopPlugin { plugin_id } => registry
             .stop_input(*plugin_id)
             .map_err(|error| format!("cannot stop plugin {plugin_id}: {error}")),
-        ControlInbound::State(_) | ControlInbound::Ping(_) | ControlInbound::Load { .. } => Ok(()),
+        // Not plug-in requests of this function: the UI loop acts on them itself
+        // (it needs the registry mutably, or it keeps the frame).
+        ControlInbound::State(_)
+        | ControlInbound::Ping(_)
+        | ControlInbound::Load { .. }
+        | ControlInbound::ToggleVis
+        | ControlInbound::Vis(_) => Ok(()),
     }
 }
 
@@ -556,10 +582,15 @@ mod tests {
         app_end
             .send(&Message::CommandToHost(Command::ConfigureVisPlugin))
             .unwrap();
-        // Another player→host command the host cannot act on: it must not
-        // reach the UI thread as an event.
+        // The toggle starts or stops the visualization: it reaches the UI
+        // thread too (the registry decides what to start).
         app_end
             .send(&Message::CommandToHost(Command::ToggleVisPlugin))
+            .unwrap();
+        // A player→host command the host cannot act on: it must not reach the
+        // UI thread as an event.
+        app_end
+            .send(&Message::CommandToHost(Command::Play))
             .unwrap();
         app_end.send(&Message::Shutdown).unwrap();
 
@@ -570,8 +601,8 @@ mod tests {
         );
         assert_eq!(
             events,
-            vec![ControlInbound::ConfigureVis],
-            "the Configure request must reach the thread that owns the window"
+            vec![ControlInbound::ConfigureVis, ControlInbound::ToggleVis],
+            "the Configure and the toggle request must reach the thread that owns the window"
         );
         // Only the startup Hello went out: the reader thread has no window and
         // opens no dialog.
@@ -602,9 +633,9 @@ mod tests {
                 .send(&Message::CommandToHost(request.clone()))
                 .unwrap();
         }
-        // Two player→host commands the host still cannot act on. They must not
-        // reach the UI thread as events.
-        for ignored in [Command::ToggleVisPlugin, Command::Play] {
+        // A player→host command the host cannot act on. It must not reach the
+        // UI thread as an event.
+        for ignored in [Command::Play, Command::Pause] {
             app_end.send(&Message::CommandToHost(ignored)).unwrap();
         }
         app_end.send(&Message::Shutdown).unwrap();
@@ -1042,5 +1073,34 @@ mod tests {
             window.hwnd_raw() as u32
         );
         window.destroy();
+    }
+}
+
+#[cfg(test)]
+mod vis_feed_tests {
+    use super::*;
+    use rustamp_ipc::message::VisFrameWire;
+    use rustamp_ipc::{MemoryTransport, Message};
+    use rustamp_proto::vis::VisFrame;
+
+    #[test]
+    fn a_visualization_frame_reaches_the_ui_thread_decoded() {
+        let (mut app_end, mut host_end) = MemoryTransport::pair();
+        let mut frame = VisFrame {
+            timestamp_us: 42,
+            ..VisFrame::default()
+        };
+        frame.waveform[0][5] = 0.5;
+        app_end
+            .send(&Message::Vis(Box::new(VisFrameWire::from(&frame))))
+            .unwrap();
+        app_end.send(&Message::Shutdown).unwrap();
+
+        let mut events = Vec::new();
+        assert_eq!(
+            run_reader_events(&mut host_end, &mut |ev| events.push(ev)),
+            ControlExit::ShutdownRequested
+        );
+        assert_eq!(events, vec![ControlInbound::Vis(Box::new(frame))]);
     }
 }
