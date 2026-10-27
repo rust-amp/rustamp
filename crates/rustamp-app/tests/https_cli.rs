@@ -120,7 +120,7 @@ fn ok(body: &[u8]) -> Vec<u8> {
 
 /// Reads the repository fixture.
 fn fixture(name: &str) -> Vec<u8> {
-    let path = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("rustamp-decoders")
         .join("tests")

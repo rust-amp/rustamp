@@ -735,6 +735,9 @@ impl Windowed {
             // edge connections and re-flows whatever hangs below it (S05 §3.3).
             self.stack.set_playlist_shaded(self.app.playlist_shaded());
         }
+        let (playlist_width, playlist_height) = self.app.playlist_frame_size();
+        self.stack.playlist.width = playlist_width;
+        self.stack.playlist.height = playlist_height;
         self.apply_docking_positions();
         let mut shown = false;
         if let Some(window) = &self.window {
@@ -1142,7 +1145,8 @@ impl Windowed {
     /// pointer.
     fn apply_playlist_cursor(&mut self) {
         let (x, y) = self.playlist_cursor;
-        let slot = rustamp_ui::playlist_cursor_at(x, y);
+        let scale = self.app.playlist_scale() as i32;
+        let slot = rustamp_ui::playlist_cursor_at(x / scale, y / scale);
         let raw = self.raw_playlist_window();
         self.apply_cursor(slot, raw);
     }
@@ -1481,10 +1485,12 @@ impl Windowed {
                 return;
             };
             let menu = rustamp_ui::menu::native_playlist_misc_menu();
+            let scale = self.app.playlist_scale() as i32;
+            let height = self.app.playlist_frame_size().1 as i32;
             match rustamp_platform::show_popup_menu(
                 self.raw_main_window(),
                 &menu.rows,
-                (origin.x + 110, origin.y + 92),
+                (origin.x + 110 * scale, origin.y + height - 24 * scale),
             ) {
                 Ok(None) => {}
                 Ok(Some(id)) => match menu.choice_for_id(id) {
@@ -2598,9 +2604,8 @@ impl Windowed {
             }
             WindowEvent::RedrawRequested => self.paint_playlist(),
             WindowEvent::Resized(size) => {
-                // The playlist never double-sizes (S05 §2.1): its client area
-                // is the spec'd 275 x 116, or the 275 x 14 shade band while
-                // the editor is shaded (S01 §1).
+                // Keep the client aligned with the app's configured size and
+                // optional playlist scale, including the shade band.
                 let (width, height) = self.app.playlist_frame_size();
                 if size.width < width || size.height < height {
                     // Never settle below the layout (the DPI-change floor).
@@ -2642,7 +2647,7 @@ impl Windowed {
             WindowEvent::KeyboardInput { event, .. } => self.playlist_key_event(&event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
-                // No double-size scale: the playlist ignores it (S05 §2.1).
+                // Keep physical coordinates for the resize gesture.
                 self.playlist_cursor = (position.x as i32, position.y as i32);
                 // Playlist corner resize drag: update window size during drag.
                 if let (Some((start_x, start_y)), Some((start_w, start_h))) =
@@ -2651,12 +2656,13 @@ impl Windowed {
                     let dx = self.playlist_cursor.0 - start_x;
                     let dy = self.playlist_cursor.1 - start_y;
                     // Minimum size is the classic 275 x 116 (S01 §1, S05 §2.1).
-                    const MIN_WIDTH: u32 = 275;
-                    const MIN_HEIGHT: u32 = 116;
-                    let new_w = (start_w as i32 + dx).max(MIN_WIDTH as i32) as u32;
-                    let new_h = (start_h as i32 + dy).max(MIN_HEIGHT as i32) as u32;
+                    let scale = self.app.playlist_scale();
+                    let new_w = (start_w as i32 + dx).clamp((275 * scale) as i32, 4096) as u32;
+                    let new_h = (start_h as i32 + dy).clamp((116 * scale) as i32, 4096) as u32;
+                    self.app.set_playlist_size(new_w, new_h);
                     if let Some(window) = &self.playlist_window {
-                        let _ = window.request_inner_size(PhysicalSize::new(new_w, new_h));
+                        let (width, height) = self.app.playlist_frame_size();
+                        let _ = window.request_inner_size(PhysicalSize::new(width, height));
                     }
                 } else {
                     self.apply_playlist_cursor();
@@ -2682,11 +2688,21 @@ impl Windowed {
                 ..
             } => {
                 let (x, y) = self.playlist_cursor;
+                let scale = self.app.playlist_scale() as i32;
+                let (layout_x, layout_y) = (x / scale, y / scale);
+                if state == ElementState::Released && self.playlist_resize_start.is_some() {
+                    self.playlist_resize_start = None;
+                    self.playlist_resize_start_size = None;
+                    self.applied_playlist_client = None;
+                    self.sync_playlist_window(event_loop);
+                    self.request_playlist_redraw();
+                    return;
+                }
                 if state == ElementState::Pressed
                     // S03 §5: a double click on the title bar toggles the
                     // windowshade. It is asked first, so the double click
                     // does not start a window drag.
-                    && self.title_bar_double_click(CoreWindowId::Playlist, x, y)
+                    && self.title_bar_double_click(CoreWindowId::Playlist, layout_x, layout_y)
                 {
                     self.playlist_click.clear();
                     self.sync_window_state();
@@ -2697,8 +2713,12 @@ impl Windowed {
                     return;
                 }
                 if state == ElementState::Pressed
-                    && (0..rustamp_ui::playlist_window::TITLE_BAR_HEIGHT).contains(&y)
-                    && rustamp_ui::playlist_window::hit_test_title_bar(x, y).is_none()
+                    && (0..rustamp_ui::playlist_window::TITLE_BAR_HEIGHT).contains(&layout_y)
+                    && rustamp_ui::playlist_window::hit_test_title_bar(
+                        layout_x - (self.app.playlist_frame_size().0 as i32 / scale - 275),
+                        layout_y,
+                    )
+                    .is_none()
                     && let Some(window) = &self.playlist_window
                     && window.drag_window().is_ok()
                 {
@@ -2714,41 +2734,11 @@ impl Windowed {
                 let (pl_width, pl_height) = self.app.playlist_frame_size();
                 let in_resize_grip = x >= pl_width as i32 - PLAYLIST_RESIZE_GRIP
                     && y >= pl_height as i32 - PLAYLIST_RESIZE_GRIP;
-                if in_resize_grip {
-                    match state {
-                        ElementState::Pressed => {
-                            self.playlist_resize_start = Some((x, y));
-                            self.playlist_resize_start_size = Some((pl_width, pl_height));
-                            self.playlist_click.clear();
-                            return;
-                        }
-                        ElementState::Released => {
-                            if self.playlist_resize_start.is_some() {
-                                self.playlist_resize_start = None;
-                                self.playlist_resize_start_size = None;
-                                // Persist the size to config (pe_width/pe_height).
-                                if let Some(window) = &self.playlist_window {
-                                    let size = window.inner_size();
-                                    let (w, h) = (size.width, size.height);
-                                    if let Some(layout) = self
-                                        .app
-                                        .config_mut()
-                                        .ui
-                                        .windows
-                                        .iter_mut()
-                                        .find(|w| w.id == CoreWindowId::Playlist)
-                                    {
-                                        layout.width = Some(w);
-                                        layout.height = Some(h);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // During a resize drag, skip the normal control handling.
-                    if self.playlist_resize_start.is_some() {
-                        return;
-                    }
+                if in_resize_grip && !self.app.playlist_shaded() && state == ElementState::Pressed {
+                    self.playlist_resize_start = Some((x, y));
+                    self.playlist_resize_start_size = Some((pl_width, pl_height));
+                    self.playlist_click.clear();
+                    return;
                 }
                 // Row dragging is an own choice while S06 §8 Q6 stays open.
                 let result = match state {
@@ -2758,7 +2748,7 @@ impl Windowed {
                         // double-clicking an entry plays it), so a title-bar
                         // press is never swallowed as one - the shade button
                         // must toggle on every click.
-                        let is_double = rustamp_ui::in_list_area(x, y)
+                        let is_double = self.app.playlist().contains_list_point(layout_x, layout_y)
                             && self.playlist_click.is_double_click(now, x, y);
                         if is_double {
                             self.playlist_click.clear();
@@ -4336,6 +4326,30 @@ mod tests {
                             self.origin,
                             "the editor keeps its docked place"
                         );
+                        self.presenter.app.set_playlist_size(550, 348);
+                    }
+                    5 => {}
+                    6 => {
+                        assert_eq!(self.client_size(), (550, 348));
+                        let image = self.presenter.app.render_playlist();
+                        assert_eq!((image.width(), image.height()), self.client_size());
+                        self.presenter.paint_playlist();
+                        self.presenter.app.set_playlist_size(275, 116);
+                    }
+                    7 => {}
+                    8 => {
+                        assert_eq!(self.client_size(), (275, 116));
+                        self.presenter
+                            .app
+                            .submit(Command::ToggleDoubleSize)
+                            .unwrap();
+                    }
+                    9 => {}
+                    10 => {
+                        assert_eq!(self.client_size(), (550, 232));
+                        let image = self.presenter.app.render_playlist();
+                        assert_eq!((image.width(), image.height()), self.client_size());
+                        self.presenter.paint_playlist();
                         event_loop.exit();
                         return;
                     }
@@ -4353,7 +4367,7 @@ mod tests {
             origin: None,
         };
         build_event_loop(true).unwrap().run_app(&mut probe).unwrap();
-        assert_eq!(probe.phase, 4);
+        assert_eq!(probe.phase, 10);
     }
 
     /// Keep the runner's inventory name, but measure the system popup rather

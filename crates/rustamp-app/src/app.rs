@@ -262,6 +262,9 @@ pub struct App {
     /// The playlist editor's behaviour model (S06); owned here, rendered and
     /// fed by `playlist_window.rs`, synced from `entry_ids`.
     pub(crate) playlist: PlaylistWindow,
+    /// The user's optional 2x enlargement for a playlist smaller than 550x232.
+    pub(crate) playlist_double_size: bool,
+    pub(crate) playlist_resized_in_double_size: bool,
     /// The media library: the app's index, its view and the background scan
     /// (see `library_window.rs`). The OS window lives in `window.rs`.
     pub(crate) library_window: crate::library_window::LibraryWindow,
@@ -634,6 +637,8 @@ impl App {
             entry_ids: Vec::new(),
             next_entry_id: 0,
             playlist: PlaylistWindow::new(),
+            playlist_double_size: false,
+            playlist_resized_in_double_size: false,
             library_window: crate::library_window::LibraryWindow::default(),
             last_extract_settings: rustamp_platform::ExtractSettings {
                 template: crate::library_extract::DEFAULT_TEMPLATE.to_owned(),
@@ -680,6 +685,7 @@ impl App {
         // (S01 §1: the shade band is 14 px tall), so a saved editor comes
         // back shaded.
         app.playlist.windowshade = pl_shaded;
+        app.update_playlist_double_size(app.ui.state().double_size);
         // The skin's `Font=` size is the playlist's default size (S17 §5);
         // the user can change it at runtime (S03 §2 `40335` / `40336`).
         app.sync_playlist_font_size();
@@ -1095,7 +1101,20 @@ impl App {
 
     /// Saves the current configuration to `path`.
     pub fn save_config_to(&self, path: &Path) -> Result<(), crate::config::ConfigError> {
-        let config = self.current_config();
+        let mut config = self.current_config();
+        // A manual resize in 2x mode is a deliberate physical size. Keep that
+        // size across restart even though the saved geometry is normally 1x.
+        if self.playlist_double_size
+            && self.playlist_resized_in_double_size
+            && let Some(layout) = config
+                .ui
+                .windows
+                .iter_mut()
+                .find(|w| w.id == WindowId::Playlist)
+        {
+            layout.width = layout.width.map(|width| width * 2);
+            layout.height = layout.height.map(|height| height * 2);
+        }
         crate::config::save(
             &config,
             self.playlist_font_size(),
@@ -1267,6 +1286,7 @@ impl App {
         }
         // The configuration keeps everything, the window placement included.
         self.config = config.clone();
+        self.update_playlist_double_size(self.ui.state().double_size);
     }
 
     /// Asks for a Winamp configuration file and imports it.
@@ -1708,9 +1728,8 @@ impl App {
             (WindowId::Playlist, WindowCommand::ToggleWindowShade) => {
                 self.submit(Command::ToggleWindowShade(WindowId::Playlist))
             }
-            // The playlist editor has no double size (S05 §2.1, S01 §1): the
-            // command changes nothing there, and saying so is the whole
-            // answer.
+            // The playlist-targeted native command remains a no-op as in S05.
+            // The user's global 2x setting can separately scale a small playlist.
             (WindowId::Playlist, WindowCommand::ToggleDoubleSize) => Ok(()),
             _ => Err(Error::InvalidArgument(format!(
                 "{window:?} is not a window that answers a window command"
@@ -1886,6 +1905,7 @@ impl App {
         // `eq_frame_size`; shading the main never resizes it, S05 §3.2).
         if matches!(command, Command::ToggleDoubleSize) {
             self.eq.set_double_size(self.ui.state().double_size);
+            self.update_playlist_double_size(self.ui.state().double_size);
         }
         // A toggle may have closed the focused window underneath the focus.
         self.maintain_focus();
@@ -2537,8 +2557,11 @@ impl App {
                     == Some(rustamp_ui::EqWidget::TitleBar)
             }
             WindowId::Playlist => {
+                let width = self.playlist_frame_size().0 as i32 / self.playlist_scale() as i32;
                 (0..rustamp_ui::playlist_window::TITLE_BAR_HEIGHT).contains(&y)
-                    && rustamp_ui::playlist_window::hit_test_title_bar(x, y).is_none()
+                    && (0..width).contains(&x)
+                    && rustamp_ui::playlist_window::hit_test_title_bar(x - (width - 275), y)
+                        .is_none()
             }
             WindowId::Vis | WindowId::Gen(_) | WindowId::Video => false,
         }

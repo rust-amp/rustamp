@@ -69,9 +69,7 @@
 use rustamp_gfx::{BitmapFont, GlyphMap, Image, Rect};
 use rustamp_skin::{Sheet, Skin, webamp};
 
-use crate::playlist::{
-    PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistWindow, ScrollDirection, VISIBLE_ROWS,
-};
+use crate::playlist::{PlaylistButton, PlaylistWindow, ScrollDirection, VISIBLE_ROWS};
 
 // ---------------------------------------------------------------------------
 // Title bar (S01 §4.1; S06 §1: no window-menu button)
@@ -467,15 +465,15 @@ pub fn render_playlist_window(
     focused: bool,
 ) -> Image {
     if window.windowshade {
-        let mut canvas = Image::filled(275, SHADE_TITLE_HEIGHT as u32, [0, 0, 0, 255]);
+        let width = window.size().0;
+        let right_x = width as i32 - 29;
+        let mut canvas = Image::filled(width, SHADE_TITLE_HEIGHT as u32, [0, 0, 0, 255]);
         let pledit = load_sheet(skin, Sheet::Pledit);
         // Playlist ignores 2x. Corner once (it carries the window's left
         // border), then the borderless body tile, then the right corner taken
         // from the focused or the unfocused row (S01 §4, measured).
         blit_region(&mut canvas, pledit.as_ref(), SHADE_CORNER_SRC, 0, 0);
-        for x in
-            (SHADE_CORNER_SRC.width as i32..SHADE_RIGHT_X).step_by(SHADE_BODY_SRC.width as usize)
-        {
+        for x in (SHADE_CORNER_SRC.width as i32..right_x).step_by(SHADE_BODY_SRC.width as usize) {
             blit_region(&mut canvas, pledit.as_ref(), SHADE_BODY_SRC, x, 0);
         }
         blit_region(
@@ -486,13 +484,13 @@ pub fn render_playlist_window(
             } else {
                 SHADE_RIGHT_SRC
             },
-            SHADE_RIGHT_X,
+            right_x,
             0,
         );
         draw_title_buttons(&mut canvas, pledit.as_ref(), skin, window);
         return canvas;
     }
-    let (width, height) = PLAYLIST_WINDOW_SIZE;
+    let (width, height) = window.size();
     let style = skin.pledit();
     let mut canvas = Image::filled(
         width,
@@ -533,7 +531,14 @@ fn draw_title_buttons(
                 SHADE_BUTTON_RECT,
             ),
         };
-        blit_sprite(canvas, pledit, skin, name, rect.x, rect.y);
+        blit_sprite(
+            canvas,
+            pledit,
+            skin,
+            name,
+            rect.x + canvas.width() as i32 - 275,
+            rect.y,
+        );
     }
 }
 
@@ -574,6 +579,8 @@ fn blit_region(canvas: &mut Image, pledit: Option<&Image>, src: Rect, dx: i32, d
 }
 
 fn draw_title_bar(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin, focused: bool) {
+    let width = canvas.width() as i32;
+    let title_x = (width - TITLE_STRIP_WIDTH as i32) / 2;
     // Focused vs unfocused rows (S01 §4.1, verified); the SELECTED-means-focused
     // reading follows the main-window convention in `render::render_1x`.
     let (corner, strip, tile, right) = if focused {
@@ -595,7 +602,7 @@ fn draw_title_bar(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin, focus
     // S01 §4.1: fresh partial tiles at each band's left edge, then full
     // tiles anchored to the fixed piece on its right (not to the window).
     if let Some(def) = skin.sprite(tile) {
-        for (left, right) in [(25, TITLE_STRIP_X), (187, 250)] {
+        for (left, right) in [(25, title_x), (title_x + 100, width - 25)] {
             let partial = (right - left) % TITLE_TILE_WIDTH as i32;
             let mut dx = left;
             while dx < right {
@@ -615,8 +622,8 @@ fn draw_title_bar(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin, focus
             }
         }
     }
-    blit_sprite(canvas, pledit, skin, strip, TITLE_STRIP_X, 0);
-    blit_sprite(canvas, pledit, skin, right, 250, 0);
+    blit_sprite(canvas, pledit, skin, strip, title_x, 0);
+    blit_sprite(canvas, pledit, skin, right, width - 25, 0);
     // Resting window buttons are already in the title body; only a held
     // button overlays the separate selected cell (see draw_title_buttons).
 }
@@ -626,22 +633,57 @@ fn draw_side_rails(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin) {
     // provisional there but is drawn the same way. Tiles stop at the bottom
     // bar (y = 78).
     let mut dy = LIST_TOP - 3;
-    while dy + 29 <= BOTTOM_BAR_RECT.y {
-        blit_sprite(canvas, pledit, skin, "PLAYLIST_LEFT_TILE", 0, dy);
-        blit_sprite(canvas, pledit, skin, "PLAYLIST_RIGHT_TILE", 255, dy);
+    let bottom = canvas.height() as i32 - 38;
+    let right_x = canvas.width() as i32 - 20;
+    while dy < bottom {
+        let tile_height = (bottom - dy).min(29) as u32;
+        for (name, x) in [("PLAYLIST_LEFT_TILE", 0), ("PLAYLIST_RIGHT_TILE", right_x)] {
+            if let Some(def) = skin.sprite(name) {
+                blit_region(
+                    canvas,
+                    pledit,
+                    Rect::new(def.x as i32, def.y as i32, def.width, tile_height),
+                    x,
+                    dy,
+                );
+            }
+        }
         dy += 29;
     }
 }
 
 fn draw_bottom_bar(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin) {
-    blit_sprite(canvas, pledit, skin, "PLAYLIST_BOTTOM_LEFT_CORNER", 0, 78);
+    let width = canvas.width() as i32;
+    let bottom = canvas.height() as i32 - 38;
+    blit_sprite(
+        canvas,
+        pledit,
+        skin,
+        "PLAYLIST_BOTTOM_LEFT_CORNER",
+        0,
+        bottom,
+    );
+    if let Some(def) = skin.sprite("PLAYLIST_BOTTOM_TILE") {
+        let mut x = 125;
+        while x < width - 150 {
+            let tile_width = (width - 150 - x).min(25) as u32;
+            blit_region(
+                canvas,
+                pledit,
+                Rect::new(def.x as i32, def.y as i32, tile_width, 38),
+                x,
+                bottom,
+            );
+            x += tile_width as i32;
+        }
+    }
     blit_sprite(
         canvas,
         pledit,
         skin,
         "PLAYLIST_BOTTOM_RIGHT_CORNER",
-        125,
-        78,
+        width - 150,
+        bottom,
     );
     // Button faces from sheet y = 86 at the drawn destinations (S01 §4.1).
     // No bottom-bar button draws a pressed sprite (S01 §4.1, round 2).
@@ -655,8 +697,13 @@ fn draw_bottom_bar(canvas: &mut Image, pledit: Option<&Image>, skin: &Skin) {
             canvas,
             pledit,
             Rect::new(src_x, BUTTON_SRC_Y, dst.width, dst.height),
-            dst.x,
-            dst.y,
+            dst.x
+                + if *button == PlaylistButton::ListOpts {
+                    width - 275
+                } else {
+                    0
+                },
+            dst.y + bottom - 78,
         );
     }
 }
@@ -728,9 +775,12 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
     let visible = window.visible_ids();
     let selected_ids = window.selected_ids();
     for (i, id) in visible.iter().enumerate() {
-        let Some(rect) = row_rect(i, pitch) else {
-            continue;
-        };
+        let rect = Rect::new(
+            LIST_LEFT,
+            LIST_TOP + i as i32 * pitch,
+            window.size().0 - 33,
+            pitch as u32,
+        );
         if selected_ids.contains(id) {
             canvas.fill_rect(rect, selected);
         }
@@ -773,15 +823,15 @@ fn draw_scrollbar(canvas: &mut Image, pledit: Option<&Image>, window: &PlaylistW
         canvas,
         pledit,
         SCROLL_HANDLE_SRC,
-        SCROLL_HANDLE_X,
-        scroll_handle_y(window.first_visible(), window.len(), window.row_pitch()),
+        window.size().0 as i32 - 15,
+        window.scrollbar_handle_y(),
     );
     blit_region(
         canvas,
         pledit,
         SCROLL_ARROWS_SRC,
-        SCROLL_ARROWS_RECT.x,
-        SCROLL_ARROWS_RECT.y,
+        window.size().0 as i32 - 15,
+        window.size().1 as i32 - 38,
     );
 }
 
@@ -798,10 +848,10 @@ fn draw_drag_insertion(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow)
     }
     // Own-choice geometry, not reference pixels: integer, opaque, skin-coloured
     // and clipped to the list. No extra asset or antialiased overlay is used.
-    let y = (LIST_TOP + row as i32 * pitch).min(LIST_BOTTOM - 1);
+    let y = (LIST_TOP + row as i32 * pitch).min(window.size().1 as i32 - 24);
     let colour = skin.pledit().normal;
     canvas.fill_rect(
-        Rect::new(LIST_LEFT, y, (LIST_RIGHT - LIST_LEFT) as u32, 1),
+        Rect::new(LIST_LEFT, y, window.size().0 - 33, 1),
         [colour[0], colour[1], colour[2], 255],
     );
 }
@@ -809,6 +859,36 @@ fn draw_drag_insertion(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playlist::PLAYLIST_WINDOW_SIZE;
+
+    #[test]
+    fn resized_playlist_draws_the_skin_and_uses_the_larger_viewport() {
+        use rustamp_core::playlist::EntryId;
+        use rustamp_skin::BuiltinDefaultSkin;
+
+        let skin = Skin::from_source(&mut BuiltinDefaultSkin::source(), &BuiltinDefaultSkin)
+            .expect("skin");
+        let mut window = PlaylistWindow::new();
+        window.set_entries((0..30).map(EntryId).collect());
+        window.set_size(550, 348);
+        let frame = render_playlist_window(&skin, &window, &[], true);
+        assert_eq!((frame.width(), frame.height()), (550, 348));
+        assert_eq!(
+            frame.pixel(300, 100),
+            Some([
+                skin.pledit().normal_bg[0],
+                skin.pledit().normal_bg[1],
+                skin.pledit().normal_bg[2],
+                255
+            ])
+        );
+        assert_ne!(frame.pixel(549, 347), Some([0, 0, 0, 255]));
+        assert!(window.visible_rows() > 4);
+        assert_eq!(window.row_at(400, 23 + 13 * 8), Some(8));
+        window.scroll_to(usize::MAX);
+        assert_eq!(window.scrollbar_handle_y(), 20 + 348 - 76);
+        assert!(window.press_scrollbar(535, 310));
+    }
 
     #[test]
     fn drag_indicator_is_one_opaque_skin_coloured_line_and_disappears_on_cancel() {

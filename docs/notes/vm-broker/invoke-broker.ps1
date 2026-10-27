@@ -57,10 +57,20 @@ while ((Get-Date) -lt $waitForIdle) {
 @{ op = $Op; args = $arguments } | ConvertTo-Json -Depth 6 | Set-Content -Path $RequestPath -Encoding UTF8
 Remove-Item -Path $ResponsePath -ErrorAction SilentlyContinue
 
-# Trigger now instead of waiting for the one-minute schedule. This is an
-# unelevated cmdlet call; the orchestrator's shells are not on the interactive
-# desktop, so nothing appears on the owner's screen.
-Start-ScheduledTask -TaskName $TaskName
+# The owner may grant this user direct Hyper-V access. In that case the same
+# allow-listed worker can run under the caller's token, without enabling an
+# elevated scheduled task. Opt in explicitly; never use it as an automatic
+# fallback if a task fails.
+$direct = $env:RUSTAMP_VM_DIRECT -eq '1'
+if ($direct) {
+    $worker = Join-Path $PSScriptRoot 'vm-broker.ps1'
+    $process = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $worker + '"')
+    ) -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -ne 0) { throw "direct broker exited with $($process.ExitCode)" }
+} else {
+    Start-ScheduledTask -TaskName $TaskName
+}
 
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 $response = $null
@@ -71,7 +81,7 @@ while ((Get-Date) -lt $deadline) {
     # Every 15 s without an answer, rewrite the request and trigger again: a
     # lost or queued trigger must not turn into a silent five-minute timeout
     # (that is exactly how a stale request can strand a run).
-    if ($attempt % 5 -eq 0) {
+    if (-not $direct -and $attempt % 5 -eq 0) {
         @{ op = $Op; args = $arguments } | ConvertTo-Json -Depth 6 | Set-Content -Path $RequestPath -Encoding UTF8
         try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch { }
     }

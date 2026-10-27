@@ -3,7 +3,7 @@
 Rustamp is a media player that looks, feels and works like **Winamp 2.95**, on a
 modern backend written in Rust.
 
-![status](https://img.shields.io/badge/status-early%20release-orange)
+![version](https://img.shields.io/badge/version-1.0.0-blue)
 
 - **Look and feel:** the classic Main, Equalizer and Playlist windows, with
   docking, windowshade, double-size, the original keyboard shortcuts and
@@ -25,12 +25,12 @@ modern backend written in Rust.
 
 ## Status
 
-This is an **early release (0.1.x)**. It plays music and looks like Winamp, but
-it is not finished:
+Version **1.0.0** plays music and supports classic skins and plugins. The
+following capabilities and verification still have limitations:
 
 | Works | Not yet |
 |---|---|
-| Main, equalizer and playlist windows, skins, shade and double-size; the spectrum analyser and oscilloscope (real PCM through analysis to pixels, covered by headless tests, not yet confirmed in a captured live window) | MilkDrop 2 itself: `rustamp-milkdrop` is a skeleton; the projectM sources are vendored in `third_party/` but not wired in |
+| Main, equalizer and playlist windows, skins, shade and double-size; the spectrum analyser and oscilloscope (real PCM through analysis to pixels, covered by headless tests, not yet confirmed in a captured live window) | Native MilkDrop: `rustamp-milkdrop` is a skeleton; the projectM sources are vendored in `third_party/` but not wired in |
 | Playback, seeking, gapless, EQ, volume and balance | Winamp 5.x plug-ins: of the 11 extracted from the 5.66 installer, 10 load in the plug-in host. **The player starts MilkDrop 2.25c end to end in the test VM** (approve with `rustamp --approve-plugin`, start with Start/Stop plug-in; the player's own decoded audio feeds it; software renderer, fixed-function path). Not yet: a GPU run, a first-run flow that fetches or ships the MilkDrop data and presets, and the other classic plug-in kinds beyond start-up; see [docs/notes/real-plugin-survey.md](docs/notes/real-plugin-survey.md) |
 | Playlists: M3U, M3U8, PLS, XSPF; Add file / folder / URL (`Ctrl+L`) | Plug-ins are listed, switched on and off and configured (`Configure`) in Preferences → Plug-ins; the first real-world check of that path is the survey above |
 | Streaming over `http://` and `https://` with Winamp's status prefixes in the title (`[Connecting]`, `[Buffer: 42%]`) | Crossfade, the media library window, the Preferences pages (partly) |
@@ -47,8 +47,8 @@ a portable zip and a `.sha256` file next to it:
 
 ```powershell
 # verify, then unzip anywhere and run rustamp.exe
-(Get-FileHash .\rustamp-0.1.0+*.zip -Algorithm SHA256).Hash
-Get-Content .\rustamp-0.1.0+*.zip.sha256
+(Get-FileHash .\rustamp-1.0.0+*.zip -Algorithm SHA256).Hash
+Get-Content .\rustamp-1.0.0+*.zip.sha256
 ```
 
 The zip bundles the 64-bit player, its helper processes, the 32-bit plugin host,
@@ -67,8 +67,8 @@ rustamp [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
 - A file path or an `http(s)://` URL starts playback. `--enqueue` / `/ADD` adds
   without playing.
 - `Ctrl+L` opens a URL, `L` opens files, `Shift+L` a folder, the same as in Winamp.
-- `--skin` takes a folder, `.wsz` or `.zip`; the default is a look-alike skin
-  drawn from scratch.
+- `--skin` takes a folder, `.wsz` or `.zip`; the default is the Rust-themed
+  skin, and `--skin lookalike` selects the classic look-alike.
 - `--import-winamp-ini` reads (never writes) a Winamp 2.95 `winamp.ini`.
 - Release builds are GUI programs; add `--console` to see the player's notes.
 
@@ -162,8 +162,8 @@ SDK headers or disassembly. The binding rules are in [CLEANROOM.md](CLEANROOM.md
 
 ## Skins
 
-Rustamp ships an **original look-alike default skin**. Its artwork was drawn from
-scratch to resemble the classic base skin, and it contains no pixels from Winamp.
+Rustamp ships a **Rust-themed default skin** and a selectable look-alike skin.
+Their artwork was drawn from scratch and contains no pixels from Winamp.
 
 The original base skin is a **separate, optional download** with its own
 package. It is not bundled. Rustamp can load any classic `.wsz` skin.

@@ -123,9 +123,9 @@ impl ClassicWindow {
         }
     }
 
-    /// The client size this window has in its current state (S05 §1.1, §2.1).
+    /// The current client size, including user-resized windows.
     pub fn size(&self) -> (u32, u32) {
-        window_size(self.kind, self.shaded, self.double_size)
+        (self.width, self.height)
     }
 
     /// The bottom edge (`top + height`).

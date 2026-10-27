@@ -60,7 +60,7 @@ use rustamp_ui::title_format::TitleFormat;
 use rustamp_ui::{
     DockedStack, Key, Modifiers, PLAYLIST_WINDOW_SIZE, PlaylistButton, PlaylistDialog,
     PlaylistKeyAction, PlaylistTitleButton, ShortcutOutcome, WindowKind, hit_test_button,
-    hit_test_list_row, hit_test_title_bar, in_list_area, render_playlist_window, window_size,
+    hit_test_title_bar, render_playlist_window, window_size,
 };
 
 use crate::app::App;
@@ -87,15 +87,9 @@ impl App {
 
     /// The client area the playlist editor's OS window must have right now.
     ///
-    /// 275 x 116 at rest (S06 scope, S01 §1) and 275 x 14 while it is shaded
-    /// (S01 §1). The editor ignores double-size (S05 §2.1), so the flag is
-    /// always false here. When the user has resized the playlist by dragging
-    /// its corner (Bug 1), the custom size persists as pe_width/pe_height
-    /// (S12 §3.4) and is returned instead of the default.
-    pub fn playlist_frame_size(&self) -> (u32, u32) {
-        if self.playlist_shaded() {
-            window_size(WindowKind::Playlist, true, false)
-        } else if let Some(layout) = self
+    /// The unscaled size persisted for the playlist, regardless of shade.
+    fn playlist_logical_size(&self) -> (u32, u32) {
+        if let Some(layout) = self
             .config()
             .ui
             .windows
@@ -103,10 +97,72 @@ impl App {
             .find(|w| w.id == WindowId::Playlist)
             && let (Some(w), Some(h)) = (layout.width, layout.height)
         {
-            (w, h)
+            (w.clamp(275, 4096), h.clamp(116, 4096))
         } else {
             window_size(WindowKind::Playlist, false, false)
         }
+    }
+
+    /// Apply the user's 2x policy without resizing an already large playlist.
+    pub(crate) fn update_playlist_double_size(&mut self, enabled: bool) {
+        if !enabled && self.playlist_double_size && self.playlist_resized_in_double_size {
+            let (width, height) = self.playlist_logical_size();
+            self.playlist_double_size = false;
+            self.playlist_resized_in_double_size = false;
+            self.set_playlist_size(width * 2, height * 2);
+            return;
+        }
+        let (width, height) = self.playlist_logical_size();
+        self.playlist_double_size = enabled && width < 550 && height < 232;
+        self.playlist_resized_in_double_size = false;
+    }
+
+    /// Scaling used for the playlist's pixels and pointer coordinates.
+    pub fn playlist_scale(&self) -> u32 {
+        if self.playlist_double_size { 2 } else { 1 }
+    }
+
+    /// Current physical client size, including the optional 2x skin scale.
+    pub fn playlist_frame_size(&self) -> (u32, u32) {
+        let size = self.playlist_logical_size();
+        let scale = self.playlist_scale();
+        if self.playlist_shaded() {
+            (size.0 * scale, 14 * scale)
+        } else {
+            (size.0 * scale, size.1 * scale)
+        }
+    }
+
+    /// Update the playlist's saved and live dimensions during a resize.
+    pub fn set_playlist_size(&mut self, width: u32, height: u32) {
+        let scale = self.playlist_scale();
+        let width = (width / scale).clamp(275, 4096 / scale);
+        let height = (height / scale).clamp(116, 4096 / scale);
+        if self.playlist_double_size && self.playlist_logical_size() != (width, height) {
+            self.playlist_resized_in_double_size = true;
+        }
+        if let Some(layout) = self
+            .config_mut()
+            .ui
+            .windows
+            .iter_mut()
+            .find(|w| w.id == WindowId::Playlist)
+        {
+            layout.width = Some(width);
+            layout.height = Some(height);
+        } else {
+            let layout = rustamp_core::config::WindowLayout {
+                id: WindowId::Playlist,
+                x: 0,
+                y: 0,
+                visible: true,
+                shaded: false,
+                width: Some(width),
+                height: Some(height),
+            };
+            self.config_mut().ui.windows.push(layout);
+        }
+        self.playlist.set_size(width, height);
     }
 
     /// The docked stack for the player's current state (S05 §3.3, §5).
@@ -126,6 +182,9 @@ impl App {
         stack.set_equalizer_double_size(self.eq_state().double_size);
         stack.set_equalizer_shaded(self.eq_state().windowshade);
         stack.set_playlist_shaded(self.playlist_shaded());
+        let (width, height) = self.playlist_frame_size();
+        stack.playlist.width = width;
+        stack.playlist.height = height;
         stack
     }
 
@@ -228,20 +287,31 @@ impl App {
         y: i32,
         modifiers: Modifiers,
     ) -> Result<Vec<Command>> {
+        let (width, height) = self.playlist_logical_size();
+        let scale = self.playlist_scale() as i32;
+        let (x, y) = (x / scale, y / scale);
+        self.playlist.set_size(width, height);
         self.sync_playlist_entries();
         self.playlist.cancel_drag();
         if self.playlist_shaded() {
             // A shaded editor is a 14 px title strip (S01 §1): it has no list
             // and no bottom bar, so only its title-bar buttons answer.
-            return match hit_test_title_bar(x, y) {
+            return match hit_test_title_bar(x - (width as i32 - 275), y) {
                 Some(button) => self.playlist_title_button(button),
                 None => Ok(Vec::new()),
             };
         }
-        if let Some(button) = hit_test_button(x, y) {
+        let bottom_y = y - (height as i32 - 116);
+        let right_x = x - (width as i32 - 275);
+        let button = hit_test_button(x, bottom_y)
+            .filter(|b| *b != PlaylistButton::ListOpts)
+            .or_else(|| {
+                hit_test_button(right_x, bottom_y).filter(|b| *b == PlaylistButton::ListOpts)
+            });
+        if let Some(button) = button {
             return self.playlist_press(button);
         }
-        if in_list_area(x, y) {
+        if self.playlist.contains_list_point(x, y) {
             return match self.playlist.mouse_down(x, y, modifiers) {
                 Some(command) => {
                     let commands = vec![command.clone()];
@@ -259,7 +329,7 @@ impl App {
         if self.playlist.press_scrollbar(x, y) {
             return Ok(Vec::new());
         }
-        if let Some(button) = hit_test_title_bar(x, y) {
+        if let Some(button) = hit_test_title_bar(right_x, y) {
             return self.playlist_title_button(button);
         }
         Ok(Vec::new())
@@ -273,6 +343,8 @@ impl App {
     /// The release also ends a held scrollbar handle: the view stays where
     /// the drag left it (S06 §3).
     pub fn playlist_mouse_up(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+        let scale = self.playlist_scale() as i32;
+        let (x, y) = (x / scale, y / scale);
         self.sync_playlist_entries();
         self.playlist.release_scrollbar();
         if let Some(command) = self.playlist.mouse_up(x, y) {
@@ -288,6 +360,8 @@ impl App {
     /// (S06 §3) and the row drag stays unarmed. Without a held handle the
     /// pointer feeds the row drag.
     pub fn playlist_mouse_move(&mut self, x: i32, y: i32) {
+        let scale = self.playlist_scale() as i32;
+        let (x, y) = (x / scale, y / scale);
         if self.playlist.drag_scrollbar(y) {
             return;
         }
@@ -308,14 +382,15 @@ impl App {
     /// Double-clicking a visible row selects it and starts playback of that
     /// entry ([`Command::PlayEntry`]).
     pub fn playlist_double_click(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+        let scale = self.playlist_scale() as i32;
+        let (x, y) = (x / scale, y / scale);
         self.sync_playlist_entries();
         self.playlist.cancel_drag();
         if self.playlist_shaded() {
             // A shaded editor is a 14 px title strip (S01 §1): it has no list.
             return Ok(Vec::new());
         }
-        if in_list_area(x, y)
-            && let Some(row) = hit_test_list_row(x, y, self.playlist.row_pitch())
+        if let Some(row) = self.playlist.row_at(x, y)
             && let Some(command) = self.playlist.double_click_row(row)
         {
             let commands = vec![command.clone()];
@@ -678,6 +753,8 @@ impl App {
 
     /// Renders one frame of the playlist window.
     pub fn render_playlist(&mut self) -> Image {
+        let (width, height) = self.playlist_logical_size();
+        self.playlist.set_size(width, height);
         // The skin's font size is the playlist's size until the user changes
         // it (S17 §5, S03 §2 `40335` / `40336`), so the model is told the
         // skin's size before the frame is drawn.
@@ -701,7 +778,12 @@ impl App {
             .map(|id| self.playlist_label(*id, &format))
             .collect();
         let focused = self.focused_for_playlist();
-        render_playlist_window(self.skin.skin(), &self.playlist, &labels, focused)
+        let image = render_playlist_window(self.skin.skin(), &self.playlist, &labels, focused);
+        if self.playlist_scale() == 2 {
+            image.scaled(2)
+        } else {
+            image
+        }
     }
 
     /// Asks for the tags of the rows that have none.
@@ -923,6 +1005,78 @@ mod tests {
             seconds: None,
         };
         App::new(options).expect("the test app builds headless")
+    }
+
+    #[test]
+    fn resized_playlist_frame_and_controls_follow_saved_size() {
+        let mut app = test_app();
+        app.set_playlist_size(550, 348);
+        let frame = app.render_playlist();
+        assert_eq!((frame.width(), frame.height()), (550, 348));
+        let commands = app.playlist_mouse_down(24, 324, Modifiers::NONE).unwrap();
+        assert!(!commands.is_empty(), "ADD moves with the bottom edge");
+        let commands = app.playlist_mouse_down(517, 324, Modifiers::NONE).unwrap();
+        assert!(!commands.is_empty(), "LIST OPTS moves with the right edge");
+        app.playlist_mouse_down(529, 3, Modifiers::NONE).unwrap();
+        assert_eq!(app.playlist_frame_size(), (550, 14));
+        assert_eq!(app.render_playlist().width(), 550);
+        app.playlist_mouse_down(529, 3, Modifiers::NONE).unwrap();
+        assert_eq!(app.playlist_frame_size(), (550, 348));
+        app.set_playlist_size(275, 116);
+        let frame = app.render_playlist();
+        assert_eq!((frame.width(), frame.height()), (275, 116));
+    }
+
+    #[test]
+    fn double_size_scales_a_small_playlist_and_restores_it() {
+        let mut app = test_app();
+        let original = app.render_playlist();
+        app.submit(Command::ToggleDoubleSize).unwrap();
+        assert_eq!(app.playlist_frame_size(), (550, 232));
+        assert_eq!(app.render_playlist(), original.scaled(2));
+        let commands = app.playlist_mouse_down(48, 184, Modifiers::NONE).unwrap();
+        assert!(!commands.is_empty(), "the scaled ADD button is clickable");
+        app.playlist_mouse_down(508, 6, Modifiers::NONE).unwrap();
+        assert_eq!(app.playlist_frame_size(), (550, 28));
+        app.playlist_mouse_down(508, 6, Modifiers::NONE).unwrap();
+        assert_eq!(app.playlist_frame_size(), (550, 232));
+        app.submit(Command::ToggleDoubleSize).unwrap();
+        assert_eq!(app.playlist_frame_size(), (275, 116));
+    }
+
+    #[test]
+    fn double_size_leaves_a_large_playlist_untouched() {
+        let mut app = test_app();
+        app.set_playlist_size(900, 584);
+        let before = app.render_playlist();
+        app.submit(Command::ToggleDoubleSize).unwrap();
+        assert_eq!(app.playlist_frame_size(), (900, 584));
+        assert_eq!(app.render_playlist(), before);
+        app.submit(Command::ToggleDoubleSize).unwrap();
+        assert_eq!(app.playlist_frame_size(), (900, 584));
+    }
+
+    #[test]
+    fn manually_resizing_a_double_sized_playlist_keeps_the_new_size_on_exit() {
+        let mut app = test_app();
+        app.submit(Command::ToggleDoubleSize).unwrap();
+        app.set_playlist_size(800, 400);
+        assert_eq!(app.playlist_frame_size(), (800, 400));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rustamp.toml");
+        app.save_config_to(&path).unwrap();
+        let saved = crate::config::load(Some(&path)).unwrap();
+        let layout = saved
+            .config
+            .ui
+            .windows
+            .iter()
+            .find(|w| w.id == WindowId::Playlist)
+            .unwrap();
+        assert_eq!((layout.width, layout.height), (Some(800), Some(400)));
+        app.submit(Command::ToggleDoubleSize).unwrap();
+        assert_eq!(app.playlist_frame_size(), (800, 400));
+        assert_eq!(app.playlist_scale(), 1);
     }
 
     /// Grows the engine queue (no decoding: [`Engine::set_queue`] only stores)

@@ -181,6 +181,8 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `audioadapter-buffers` | `5.2.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `audioadapter-sample` | `5.2.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `autocfg` | `1.5.1` | `Apache-2.0 OR MIT` | `crates.io` |
+| `aws-lc-rs` | `1.18.2` | `ISC AND (Apache-2.0 OR ISC)` | `crates.io` |
+| `aws-lc-sys` | `0.46.0` | `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)` | `crates.io` |
 | `bit-vec` | `0.9.1` | `Apache-2.0 OR MIT` | `crates.io` |
 | `bitflags` | `1.3.2` | `MIT/Apache-2.0` | `crates.io` |
 | `bitflags` | `2.13.2` | `MIT OR Apache-2.0` | `crates.io` |
@@ -197,6 +199,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `cc` | `1.8.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `cfg-if` | `1.0.5` | `MIT OR Apache-2.0` | `crates.io` |
 | `cfg_aliases` | `0.2.2` | `MIT` | `crates.io` |
+| `cmake` | `0.1.58` | `MIT OR Apache-2.0` | `crates.io` |
 | `cobs` | `0.3.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `combine` | `4.6.8` | `MIT` | `crates.io` |
 | `concurrent-queue` | `2.5.0` | `Apache-2.0 OR MIT` | `crates.io` |
@@ -229,6 +232,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `drm-fourcc` | `2.2.0` | `MIT` | `crates.io` |
 | `drm-sys` | `0.8.1` | `MIT` | `crates.io` |
 | `dtor` | `0.8.1` | `Apache-2.0 OR MIT` | `crates.io` |
+| `dunce` | `1.0.5` | `CC0-1.0 OR MIT-0 OR Apache-2.0` | `crates.io` |
 | `embed-manifest` | `1.5.1` | `MIT` | `crates.io` |
 | `embedded-io` | `0.4.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `embedded-io` | `0.6.1` | `MIT OR Apache-2.0` | `crates.io` |
@@ -246,6 +250,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `foreign-types` | `0.5.0` | `MIT/Apache-2.0` | `crates.io` |
 | `foreign-types-macros` | `0.2.4` | `MIT/Apache-2.0` | `crates.io` |
 | `foreign-types-shared` | `0.3.1` | `MIT/Apache-2.0` | `crates.io` |
+| `fs_extra` | `1.3.0` | `MIT` | `crates.io` |
 | `futures-core` | `0.3.34` | `MIT OR Apache-2.0` | `crates.io` |
 | `futures-task` | `0.3.34` | `MIT OR Apache-2.0` | `crates.io` |
 | `futures-util` | `0.3.34` | `MIT OR Apache-2.0` | `crates.io` |

@@ -1067,6 +1067,8 @@ pub struct PlaylistWindow {
     /// never moves the view (own choice: S06 §3 settles that a dragged
     /// handle moves the view, not how the grab behaves).
     scrollbar_grab: Option<i32>,
+    /// Client dimensions; `None` retains the classic default size.
+    size: Option<(u32, u32)>,
 }
 
 impl PlaylistWindow {
@@ -1132,7 +1134,35 @@ impl PlaylistWindow {
 
     /// How many rows the list page holds at the current font size.
     pub fn visible_rows(&self) -> usize {
-        crate::playlist_window::visible_rows(self.row_pitch())
+        let height = self.size().1.saturating_sub(PLAYLIST_WINDOW_SIZE.1);
+        ((crate::playlist_window::LIST_PAGE_HEIGHT + height as i32) / self.row_pitch()).max(1)
+            as usize
+    }
+
+    /// Set the unshaded client size and clamp the scroll offset to the new page.
+    pub fn set_size(&mut self, width: u32, height: u32) {
+        self.size = Some((width.clamp(275, 4096), height.clamp(116, 4096)));
+        self.clamp_scroll();
+    }
+
+    /// The unshaded playlist client size.
+    pub fn size(&self) -> (u32, u32) {
+        self.size.unwrap_or(PLAYLIST_WINDOW_SIZE)
+    }
+
+    /// Whether a point is inside the current list area.
+    pub fn contains_list_point(&self, x: i32, y: i32) -> bool {
+        let (width, height) = self.size();
+        (12..width as i32 - 21).contains(&x) && (23..height as i32 - 23).contains(&y)
+    }
+
+    /// The visible row under a point in the current list area.
+    pub fn row_at(&self, x: i32, y: i32) -> Option<usize> {
+        if !self.contains_list_point(x, y) {
+            return None;
+        }
+        let row = ((y - 23) / self.row_pitch()) as usize;
+        (row < self.visible_rows()).then_some(row)
     }
 
     /// Sets the skin's font size; the playlist uses it until the user
@@ -1226,7 +1256,7 @@ impl PlaylistWindow {
         if self.windowshade {
             return None;
         }
-        let row = crate::playlist_window::hit_test_list_row(x, y, self.row_pitch())?;
+        let row = self.row_at(x, y)?;
         let Some(id) = self.entries.get(self.first_visible + row).copied() else {
             // The empty space below the last entry: only the plain click
             // clears the selection there.
@@ -1366,19 +1396,19 @@ impl PlaylistWindow {
     /// it; leaving the list cancels instead of clamping or auto-scrolling.
     /// Upper/lower row halves mean insert-before/after (own choices, Q6).
     pub fn mouse_move(&mut self, x: i32, y: i32) {
-        use crate::playlist_window::{LIST_TOP, in_list_area};
+        use crate::playlist_window::LIST_TOP;
 
         // The row geometry is read before the drag is borrowed: the pitch
         // follows the font, so it can change while a drag is armed.
         let pitch = self.row_pitch();
         let rows = self.visible_rows();
-        let Some(drag) = self.drag.as_mut() else {
-            return;
-        };
-        if self.windowshade || !in_list_area(x, y) {
+        if self.windowshade || !self.contains_list_point(x, y) {
             self.cancel_drag();
             return;
         }
+        let Some(drag) = self.drag.as_mut() else {
+            return;
+        };
         if drag.insertion.is_none()
             && x.abs_diff(drag.press.0).max(y.abs_diff(drag.press.1)) < DRAG_THRESHOLD
         {
@@ -1769,38 +1799,40 @@ impl PlaylistWindow {
         if self.windowshade {
             return false;
         }
-        if let Some(direction) = crate::playlist_window::hit_test_scroll(x, y) {
-            self.scroll_page(direction);
-            return true;
-        }
-        let Some(hit) = crate::playlist_window::hit_test_scrollbar(
-            x,
-            y,
-            self.first_visible,
-            self.len(),
-            self.row_pitch(),
-        ) else {
+        let (width, height) = self.size();
+        let scroll_x = width as i32 - 15;
+        let arrows_y = height as i32 - 38;
+        if !(scroll_x..scroll_x + 8).contains(&x) || !(20..arrows_y + 10).contains(&y) {
             return false;
-        };
-        match hit {
-            crate::playlist_window::ScrollbarHit::Handle => {
-                let top = crate::playlist_window::scroll_handle_y(
-                    self.first_visible,
-                    self.len(),
-                    self.row_pitch(),
-                );
+        }
+        if y >= arrows_y {
+            self.scroll_page(if y < arrows_y + 5 {
+                ScrollDirection::Up
+            } else {
+                ScrollDirection::Down
+            });
+        } else {
+            let top = self.scrollbar_handle_y();
+            if (top..top + 18).contains(&y) {
                 self.scrollbar_grab = Some(y - top);
-                true
-            }
-            crate::playlist_window::ScrollbarHit::TrackAbove => {
-                self.scroll_page(ScrollDirection::Up);
-                true
-            }
-            crate::playlist_window::ScrollbarHit::TrackBelow => {
-                self.scroll_page(ScrollDirection::Down);
-                true
+            } else {
+                self.scroll_page(if y < top {
+                    ScrollDirection::Up
+                } else {
+                    ScrollDirection::Down
+                });
             }
         }
+        true
+    }
+
+    /// Top of the scroll handle within the current client size.
+    pub fn scrollbar_handle_y(&self) -> i32 {
+        let travel = self.size().1 as usize - 76;
+        let max_first = self.len().saturating_sub(self.visible_rows());
+        20 + (travel * self.first_visible.min(max_first) + max_first / 2)
+            .checked_div(max_first)
+            .unwrap_or(0) as i32
     }
 
     /// Moves the held scrollbar handle to the pointer at `y`.
@@ -1818,8 +1850,10 @@ impl PlaylistWindow {
             return false;
         };
         let top = y - grab;
-        let offset =
-            crate::playlist_window::scroll_offset_for_handle_y(top, self.len(), self.row_pitch());
+        let travel = self.size().1 as usize - 76;
+        let max_first = self.len().saturating_sub(self.visible_rows());
+        let position = (top - 20).clamp(0, travel as i32) as usize;
+        let offset = (position * max_first + travel / 2) / travel;
         self.scroll_to(offset);
         true
     }
