@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::bmp;
 use crate::cursor::CursorSlot;
+use crate::diagnostics;
 use crate::error::{Result, SkinError};
 use crate::pledit::PlaylistStyle;
 use crate::raster::RasterImage;
@@ -231,6 +232,21 @@ impl Skin {
                     if *sheet == Sheet::NumsEx {
                         skin_has_nums_ex = true;
                     }
+                    if carries_background(*sheet) {
+                        // A blank background paints an empty window and would
+                        // otherwise leave no trace at all; report it once, at
+                        // load time. Sheets the fallback supplies are not
+                        // measured: they are known good.
+                        let stats = diagnostics::stats(&image);
+                        if stats.is_mostly_near_white_opaque() {
+                            warnings.push(format!(
+                                "{}: {} of {} pixels are opaque near-white; the sheet may be blank",
+                                sheet.file_name(),
+                                stats.near_white_opaque,
+                                stats.pixels()
+                            ));
+                        }
+                    }
                     sheets.insert(*sheet, image);
                 }
                 Err(reason) => {
@@ -405,7 +421,8 @@ impl Skin {
     }
 
     /// Non-fatal problems found while loading (for example a sheet that failed
-    /// to decode and was therefore treated as missing).
+    /// to decode and was therefore treated as missing, or a background sheet
+    /// that decoded to a near-white blank).
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -425,6 +442,16 @@ impl Skin {
             .filter(|sheet| !self.sheets.contains_key(sheet))
             .collect()
     }
+}
+
+/// The sheets that are a window background from edge to edge.
+///
+/// A blank one paints a flat, empty window and carries no other evidence of
+/// the problem; the loader reports such a sheet instead of accepting it
+/// silently. Buttons and digits are excluded: their unused filler is
+/// legitimately a single colour.
+const fn carries_background(sheet: Sheet) -> bool {
+    matches!(sheet, Sheet::Main | Sheet::Titlebar | Sheet::Pledit)
 }
 
 /// Fills any missing sheet from the fallback skin.

@@ -5,7 +5,12 @@
 //! UI components implement [`Snapshot`]; tests call [`assert_golden`] (or
 //! [`assert_golden_snapshot`]). See `tests/golden/README.md` in the
 //! repository for the workflow.
+//!
+//! [`control`] is the other half of the player's local control channel
+//! (`rustamp --control`): a client for the typed JSON-lines named pipe, so a
+//! test can drive and inspect the real binary instead of grepping its output.
 
+pub mod control;
 mod golden;
 mod image;
 

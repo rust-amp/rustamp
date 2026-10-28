@@ -48,7 +48,7 @@ const DSPHOST_CRATE: &str = "rustamp-dsphost";
 const DSPHOST_BIN: &str = "rustamp-dsphost-stages";
 const DSPHOST_TARGET: &str = "x86_64-pc-windows-msvc";
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub use rustamp_ipc::PROTOCOL_VERSION;
 pub const CONFIG_VERSION: u32 = 1;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
 
@@ -1608,7 +1608,7 @@ fn check_runtime_contract(root: &Path) -> Result<(), String> {
             "\"artifact_imports_verified\":false",
             "\"schema_version\": 3",
             "\"product_version\": \"0.0.1\"",
-            "\"protocol_version\": 4",
+            &format!("\"protocol_version\": {PROTOCOL_VERSION}"),
         ] {
             if !manifest.contains(required) {
                 return Err(format!("runtime manifest contract missing {required}"));
@@ -2502,7 +2502,10 @@ mod tests {
         );
         assert!(with.contains("\"schema_version\": 3"), "{with}");
         assert!(with.contains("\"product_version\": \"0.0.1\""), "{with}");
-        assert!(with.contains("\"protocol_version\": 4"), "{with}");
+        assert!(
+            with.contains(&format!("\"protocol_version\": {PROTOCOL_VERSION}")),
+            "{with}"
+        );
         assert!(with.contains("\"config_version\": 1"), "{with}");
         assert!(!with.contains("LICENSE-MIT"), "{with}");
         assert!(!with.contains("LICENSE-APACHE"), "{with}");
@@ -2577,7 +2580,10 @@ mod tests {
         );
         assert!(both.contains("\"schema_version\": 3"), "{both}");
         assert!(both.contains("\"product_version\": \"0.0.1\""), "{both}");
-        assert!(both.contains("\"protocol_version\": 4"), "{both}");
+        assert!(
+            both.contains(&format!("\"protocol_version\": {PROTOCOL_VERSION}")),
+            "{both}"
+        );
 
         let player_only = build_top_manifest("release", true, false, false, &meta);
         assert!(

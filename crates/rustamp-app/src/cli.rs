@@ -10,9 +10,9 @@
 //!   `/BOOKMARK`, `/ADD`, `/INSTALL`, `/UNREG`, `/NOREG`, `/ONLYINSTALL` —
 //!   spelled with a leading `/`, exactly as the audited spec records them;
 //! * **Rustamp's own switches** (`--null`, `--no-audio`, `--volume`, `--skin`,
-//!   `--seconds`, `--enqueue`, `--import-winamp-ini`, `--help`), spelled with
-//!   a leading `--`. They are the product's own test and convenience aids; the
-//!   reference has no such switches.
+//!   `--seconds`, `--enqueue`, `--control`, `--import-winamp-ini`, `--help`),
+//!   spelled with a leading `--`. They are the product's own test and
+//!   convenience aids; the reference has no such switches.
 //!
 //! S13 §1's list is the reference's **own** switch list, not a closed one: the
 //! second audit pass (2026-10-20) withdrew the completeness claim and moved
@@ -81,6 +81,7 @@
 //! | §2 a second start looks for a **window** of that class | the check is a named mutex named after the class | differs (own choice, S13 §5.8) | `rustamp-platform/src/single_instance.rs` |
 //! | §2 the player registers a window class, and the class name is what `/CLASS=` overrides | the registered main-window class stays `Winamp v1.x` (S09 §1 and §8 item 1: an ABI fact plugins and external tools depend on); `/CLASS=` overrides the class the **check** looks for | own choice (the task's wording: "the class the single-instance check looks for") | `rustamp-app/src/window.rs`, `rustamp-platform/src/single_instance.rs` |
 //! | §2 the hand-over is a window message | the hand-over travels over a named pipe | differs (own choice, S13 §5.8) | `rustamp-platform/src/single_instance.rs` |
+//! | §1 (no fact) — there is no local control channel | `--control[=<name>]` opens a named pipe named after the instance key and answers typed JSON lines (ping, snapshot, wait, commands) | own choice (a test and tool aid; gated by the same window rail as the run) | `cli.rs`, [`Control`], `src/control.rs` |
 //! | §3 the four verbs per media and playlist file | four verbs each | matches | `rustamp-platform/src/shell_registration.rs` |
 //! | §3 the two verbs per directory | `Play` and `Enqueue` | matches | `rustamp-platform/src/shell_registration.rs` |
 //! | §3 the one verb of a skin archive | `install` | matches | `rustamp-platform/src/shell_registration.rs` |
@@ -114,7 +115,7 @@ use std::path::PathBuf;
 
 use rustamp_core::playlist::MediaLocation;
 use rustamp_platform::shell_registration::RegistrationFlags;
-use rustamp_platform::single_instance::ForwardRequest;
+use rustamp_platform::single_instance::{ForwardRequest, instance_key};
 
 /// Where the audio goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -192,6 +193,30 @@ pub enum WinampIniImport {
     File(PathBuf),
 }
 
+/// What `--control[=<name>]` asks for: the local control and inspection
+/// channel.
+///
+/// Own choice on top of S13 §1, next to the other non-reference switches
+/// (`--null`, `--no-audio`, `--seconds`): the reference has no local control
+/// channel. The switch is a **gate**, never a default — without it the player
+/// opens no pipe at all, and it is a command-line switch rather than an
+/// environment variable or a `debug_assertions` test, so a release build has
+/// exactly the same rule as a debug build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Control {
+    /// `--control`: the channel is named after the running instance — the
+    /// [`instance_key`] of the class the single-instance check looks for
+    /// (`/CLASS=`) and the configuration the run uses (`/CONFIG=`), exactly
+    /// the key the single-instance lock is named after.
+    Instance,
+    /// `--control=<name>`: the channel is named after `name`.
+    ///
+    /// A test names its own channel, so it never reaches — and never collides
+    /// with — a player the developer is running. The name is one path
+    /// component: letters, digits, `-`, `_` and `.`.
+    Named(String),
+}
+
 /// The parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Args {
@@ -209,6 +234,9 @@ pub struct Args {
     pub skin: Option<PathBuf>,
     /// Stop after this many seconds of playback (test aid).
     pub seconds: Option<u64>,
+    /// The local control and inspection channel (`--control`, see
+    /// [`Control`]); `None` opens no channel at all.
+    pub control: Option<Control>,
     /// The Winamp configuration to import (S12).
     pub import_winamp_ini: WinampIniImport,
     /// `--help`/`-h` was given.
@@ -252,12 +280,31 @@ impl Args {
     pub fn resolved_config_path(&self) -> Option<PathBuf> {
         self.config.clone().or_else(crate::config::default_path)
     }
+
+    /// The instance key the control channel is named after, or `None` when the
+    /// run was asked for no channel (`--control`).
+    ///
+    /// Without a name the key is the single-instance key
+    /// ([`instance_key`]): the class the single-instance check looks for and
+    /// the configuration the run uses. The control channel therefore follows
+    /// the player it belongs to, and a second player with its own
+    /// `/CONFIG=`/`/CLASS=` is a different channel.
+    pub fn control_key(&self) -> Option<String> {
+        match self.control.as_ref()? {
+            Control::Instance => Some(instance_key(
+                self.instance_class(),
+                self.resolved_config_path().as_deref(),
+            )),
+            Control::Named(name) => Some(name.clone()),
+        }
+    }
 }
 
 /// The usage text (`--help`).
 pub const USAGE: &str = "\
 usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
-                 [--seconds <n>] [--enqueue] [--import-winamp-ini [path]] [-h|--help]
+                 [--seconds <n>] [--enqueue] [--control[=<name>]]
+                 [--import-winamp-ini [path]] [-h|--help]
        rustamp [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
               [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
        rustamp --approve-plugin [/CONFIG=<path>] <plug-in.dll> [<plug-in.dll> ...]
@@ -271,6 +318,10 @@ usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <
   --skin <path>     skin folder, .wsz or .zip (default: config's ui.skin, then built-in)
   --seconds <n>     stop after n seconds of playback (test aid)
   --enqueue         add the file to the playlist instead of playing it
+  --control[=<name>]
+                    open the local control and inspection channel on the named pipe
+                    \\\\.\\pipe\\rustamp-ctl-<name> (without a name: the instance key of
+                    this player); one JSON object per line, requests carry an id
   --import-winamp-ini [path]
                     import a Winamp 2.95 winamp.ini (the file is only read); without a path
                     the player asks for the file with the native dialog
@@ -418,6 +469,22 @@ where
                     option: "--seconds",
                     value,
                 })?);
+            }
+            "--control" => parsed.control = Some(Control::Instance),
+            option if option.starts_with("--control=") => {
+                // `--control=<name>`: the channel is named after the value, so
+                // a test never reaches the player the developer is running.
+                let name = &option["--control=".len()..];
+                if name.is_empty() {
+                    return Err(CliError::MissingValue("--control"));
+                }
+                if !is_channel_name(name) {
+                    return Err(CliError::BadValue {
+                        option: "--control",
+                        value: name.to_owned(),
+                    });
+                }
+                parsed.control = Some(Control::Named(name.to_owned()));
             }
             "--import-winamp-ini" => {
                 // The path is optional: it is the argument right behind the
@@ -685,6 +752,20 @@ fn set_media(parsed: &mut Args, value: String) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Whether `name` can be one component of a pipe name.
+///
+/// The name is the part behind `\\.\pipe\rustamp-ctl-`, so a separator (`\`,
+/// `/`) or a character a client cannot type back would make the channel
+/// unreachable or ambiguous. Letters, digits, `-`, `_` and `.` are enough for
+/// a test name and for a key.
+fn is_channel_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +838,72 @@ mod tests {
         assert_eq!(args.seconds, Some(3));
     }
 
+    // ----- the local control channel (`--control`, own choice) -----
+
+    #[test]
+    fn without_the_control_switch_there_is_no_channel() {
+        let args = parse_args(&["--null", "song.ogg"]).unwrap();
+        assert_eq!(args.control, None, "the channel is opt-in, never a default");
+        assert_eq!(args.control_key(), None);
+    }
+
+    #[test]
+    fn the_control_switch_without_a_name_uses_the_instance_key() {
+        // The channel follows the player it belongs to: the key is the one
+        // the single-instance lock is named after.
+        let args = parse_args(&["--control"]).unwrap();
+        assert_eq!(args.control, Some(Control::Instance));
+        assert_eq!(
+            args.control_key(),
+            Some(instance_key(
+                args.instance_class(),
+                args.resolved_config_path().as_deref()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_control_switch_named_names_its_own_channel() {
+        let args = parse_args(&["--control=test-channel.1"]).unwrap();
+        assert_eq!(args.control, Some(Control::Named("test-channel.1".into())));
+        assert_eq!(args.control_key().as_deref(), Some("test-channel.1"));
+    }
+
+    #[test]
+    fn an_empty_control_name_is_refused() {
+        assert_eq!(
+            parse_args(&["--control="]),
+            Err(CliError::MissingValue("--control"))
+        );
+    }
+
+    #[test]
+    fn a_control_name_that_is_not_one_path_component_is_refused() {
+        // The name is part of `\\.\pipe\rustamp-ctl-<name>`, so a separator
+        // would make the channel unreachable or ambiguous.
+        for name in ["a\\b", "a/b", "a b", "a:b"] {
+            assert_eq!(
+                parse_args(&[&format!("--control={name}")]),
+                Err(CliError::BadValue {
+                    option: "--control",
+                    value: name.to_owned(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn the_control_switch_does_not_eat_the_next_argument() {
+        // The optional name is behind `=`, so the media argument keeps its
+        // meaning (`--control s.mp3` names no channel `s.mp3`).
+        let args = parse_args(&["--control", "song.mp3"]).unwrap();
+        assert_eq!(args.control, Some(Control::Instance));
+        assert_eq!(
+            args.media,
+            Some(MediaLocation::File(PathBuf::from("song.mp3")))
+        );
+    }
+
     #[test]
     fn no_file_is_allowed() {
         let args = parse_args(&["--null"]).unwrap();
@@ -825,6 +972,7 @@ mod tests {
             "--skin",
             "--seconds",
             "--enqueue",
+            "--control",
             "--import-winamp-ini",
             "--help",
             "/CLASS=",

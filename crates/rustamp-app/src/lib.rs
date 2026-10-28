@@ -32,9 +32,19 @@
 //! * [`dialogs`] - the simple modal dialogs (About, file info, jump-to) on
 //!   top of [`rustamp_ui::DialogManager`]: opening, closing, jump input and
 //!   the body lines. Headless; the OS window lives in [`window`].
+//! * [`diag`] - diagnostics for the binary: the panic hook that names its
+//!   place and prints a backtrace, the `tracing` subscriber filtered by
+//!   `RUST_LOG`, and the startup banner (version, OS, arguments, executable,
+//!   working directory). Everything goes to stderr; stdout stays the headless
+//!   protocol's.
 //! * [`directory`] - what a chosen directory contributes to the playlist:
 //!   the media files of the tree below it, and the command that appends
 //!   them. Pure; the folder dialog itself lives in [`window`].
+//! * [`control`] — the local control and inspection channel (`--control`): a
+//!   named pipe named after the instance key that answers one typed JSON
+//!   object per line (ping, snapshot, wait, commands), so the real binary can
+//!   be driven and inspected without a window and without string-grepping its
+//!   output.
 //! * [`dsp`] — the app's DSP chain: the stages the app installs in the
 //!   engine, the bypass the engine reports when a stage fails, and the
 //!   manual recovery from it (W14 finding F4).
@@ -112,7 +122,9 @@ pub mod app;
 pub mod cli;
 pub mod config;
 mod config_preserve;
+pub mod control;
 pub mod cursor;
+pub mod diag;
 pub mod dialogs;
 pub mod directory;
 pub mod double_click;
@@ -326,6 +338,33 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // ----- the local control channel (`--control`) -----
+    // The channel is gated by the same window rail as the run itself: a
+    // windowed run the rail refuses never reaches this point, and a headless
+    // run cannot open a window at all. The server lives as long as `run`,
+    // so the pipe is served for the whole playback.
+    let _control = match args.control_key() {
+        Some(key) => {
+            control::gate(args.output)?;
+            match control::Server::start(&key, app.control_handles()) {
+                Ok(server) => {
+                    println!("rustamp: control channel {}", control::pipe_name(&key));
+                    // A served channel makes this run a session: the headless
+                    // loop stays up for it even with nothing queued.
+                    app.set_control_channel(true);
+                    Some(server)
+                }
+                Err(error) => {
+                    // A channel that cannot be opened is a diagnostic, not a
+                    // reason to refuse to play: the player itself is fine.
+                    eprintln!("rustamp: the control channel was not started: {error}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
 
     match args.output {
         // ----- headless test mode: no window -----

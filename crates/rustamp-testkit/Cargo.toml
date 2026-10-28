@@ -11,6 +11,13 @@ publish = false
 
 [dependencies]
 png.workspace = true
+# The control client speaks the app's line format with the `rustamp-proto`
+# wire types (`Command`, `Event`, `PlayerState`), unchanged: the envelope
+# around them is this crate's own mirror of `rustamp_app::control`, which a
+# testkit cannot depend on (it is the app's dev-dependency).
+rustamp-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

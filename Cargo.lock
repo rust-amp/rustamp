@@ -38,6 +38,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "alsa"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -960,6 +969,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "itoa"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1149,6 +1164,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1255,6 +1279,15 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1926,6 +1959,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex-automata"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax",
+]
+
+[[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1977,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-app"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "cpal",
  "embed-manifest",
@@ -1999,20 +2049,26 @@ dependencies = [
  "rustamp-plugin-abi",
  "rustamp-prefs",
  "rustamp-skin",
+ "rustamp-testkit",
  "rustamp-ui",
  "rustamp-vis",
  "rustls",
  "serde",
+ "serde_json",
  "softbuffer",
  "tempfile",
  "toml",
+ "tracing",
+ "tracing-subscriber",
+ "windows",
  "winit",
+ "winresource",
  "zip",
 ]
 
 [[package]]
 name = "rustamp-audio"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rtrb",
  "rubato",
@@ -2029,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "crossbeam-channel",
  "rustamp-plugin-abi",
@@ -2041,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-dechost"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
  "rustamp-decoders",
@@ -2051,7 +2107,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-decoders"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "hound",
  "opus-rs",
@@ -2065,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-dsp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
  "rustamp-proto",
@@ -2073,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-dsphost"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
  "rustamp-ipc",
@@ -2083,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-gfx"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
  "thiserror 2.0.21",
@@ -2091,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-ipc"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "crossbeam-channel",
  "postcard",
@@ -2104,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-library"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "image",
  "rusqlite",
@@ -2115,7 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-mediahost"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-ipc",
  "rustamp-proto",
@@ -2124,7 +2180,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-meta"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "lofty",
  "rustamp-core",
@@ -2133,14 +2189,14 @@ dependencies = [
 
 [[package]]
 name = "rustamp-milkdrop"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
 ]
 
 [[package]]
 name = "rustamp-output"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "cpal",
  "rustamp-core",
@@ -2150,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-platform"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
  "thiserror 2.0.21",
@@ -2159,14 +2215,14 @@ dependencies = [
 
 [[package]]
 name = "rustamp-playlist"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
 ]
 
 [[package]]
 name = "rustamp-plughost"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-ipc",
  "rustamp-plugin-abi",
@@ -2176,14 +2232,14 @@ dependencies = [
 
 [[package]]
 name = "rustamp-plugin-abi"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "rustamp-prefs"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
  "rustamp-plughost",
@@ -2192,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-proto"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "postcard",
  "rustamp-plugin-abi",
@@ -2201,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-skin"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
  "rustamp-gfx",
@@ -2212,15 +2268,18 @@ dependencies = [
 
 [[package]]
 name = "rustamp-testkit"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "png",
+ "rustamp-proto",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
 [[package]]
 name = "rustamp-ui"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -2240,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "rustamp-vis"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rustamp-core",
  "rustamp-plugin-abi",
@@ -2489,12 +2548,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "sharded-slab"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]
@@ -2927,6 +3008,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3076,7 +3166,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "pin-project-lite",
+ "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3084,6 +3186,25 @@ name = "tracing-core"
 version = "0.1.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+dependencies = [
+ "once_cell",
+]
+
+[[package]]
+name = "tracing-subscriber"
+version = "0.3.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
+dependencies = [
+ "matchers",
+ "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
+ "sharded-slab",
+ "thread_local",
+ "tracing",
+ "tracing-core",
+]
 
 [[package]]
 name = "transpose"
@@ -3667,6 +3788,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "winresource"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
+dependencies = [
+ "version_check",
+]
+
+[[package]]
 name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3749,8 +3879,9 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xtask"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
+ "rustamp-ipc",
  "rustamp-testkit",
  "windows",
 ]
@@ -3811,6 +3942,12 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zopfli"

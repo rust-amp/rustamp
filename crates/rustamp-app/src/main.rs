@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>] [--seconds <n>]
-//!        [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
+//!        [--control[=<name>]] [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
 //!        [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 //! ```
 
@@ -57,6 +57,20 @@
 //! stderr warning, never a startup failure. `--null` starts no session.
 //! Fired actions queue in the platform crate; `Windowed::about_to_wait` drains
 //! them through the normal command path (see the F3/F5 cards).
+//!
+//! # The local control channel (`--control`, own choice)
+//!
+//! `--control[=<name>]` opens a named pipe that another process on the same
+//! machine can drive and inspect: `\\.\pipe\rustamp-ctl-<key>`, where the key
+//! is the instance key (the class `/CLASS=` picks and the configuration
+//! `/CONFIG=` names) unless `--control=<name>` names its own. One JSON object
+//! per line, typed (`rustamp-app::control`): `ping`, `snapshot`, `wait` and
+//! the player's own [`Command`](rustamp_core::command::Command)s, which travel
+//! the same funnel a keystroke uses. The channel is gated by the same window
+//! rail as a windowed run, so it cannot smuggle a window onto the host. A run
+//! that serves it is a **session**: with nothing queued it stays up instead of
+//! ending (bounded by `--seconds`), which is what a headless control test
+//! uses.
 
 #![forbid(unsafe_code)]
 
@@ -78,6 +92,14 @@ fn main() -> ExitCode {
     {
         rustamp_platform::console::ensure_console();
     }
+    // Diagnostics first, before anything else can panic or log: the hook names
+    // the place of a panic (with a backtrace) and the subscriber turns the
+    // `tracing` events into stderr lines; the banner says which build, machine
+    // and command line this run is. All of it is stderr - the headless mode's
+    // stdout is the test protocol's and must stay untouched.
+    rustamp_app::diag::install_panic_hook();
+    rustamp_app::diag::init_tracing();
+    rustamp_app::diag::log_startup_banner();
     // `--approve-plugin <file>...` is an operator command, not a player run: it
     // records the exact images in the approval store (see `plugin_approval`) and
     // ends. It is recognised on the raw arguments, before the player's own parse.

@@ -100,12 +100,13 @@ replacement for license texts, source-offer obligations or an artifact review.
 |---|---|---|
 | `thiserror` | Error definitions | core, gfx, ipc, mediahost, output, platform, skin, ui |
 | `serde` | Serializable state and wire types | app, core, ipc, plugin-abi, proto |
+| `serde_json` | The local control channel's one-JSON-object-per-line format (`--control`) | app, testkit |
 | `postcard` | Wire serialization | ipc; proto (dev) |
 | `crossbeam-channel` | Cross-thread channels | core, ipc |
 | `toml` | Config serialization and I/O | app; core (dev) |
 | `png` | Golden-image I/O | testkit |
 | `tempfile` | Temporary files: the temporary file of the atomic tag write, and the test files of the crates below | meta; app, audio, decoders, skin, testkit (dev) |
-| `windows` | Windows API bindings | ipc, platform, plughost, xtask (Windows only) |
+| `windows` | Windows API bindings | app, ipc, platform, plughost, xtask (Windows only) |
 | `rtrb` | Lock-free audio ring | audio |
 | `cpal` | Cross-platform audio output; loopback capture | output; app (dev) |
 | `rubato` | Band-limited sample-rate conversion (FFT engine; sinc fallback) | audio |
@@ -117,6 +118,9 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `fontdb` | Headless discovery of the installed family requested by `pledit.txt` (`fs` feature only, no mmap/fontconfig) | ui |
 | `ab_glyph` | Safe CPU rasterization of playlist system-font glyphs | ui |
 | `embed-manifest` | Build-time: embeds the Windows application manifest (Common Controls 6 for the native preferences dialog) | app (build script) |
+| `winresource` | Build-time: embeds the executable's icon and its VERSIONINFO block; the icon is drawn by our own `build.rs` (own art, no asset is copied) | app (build script) |
+| `tracing` | Structured diagnostic events: the startup banner and the notes of the event loops | app |
+| `tracing-subscriber` | The `tracing` subscriber: one fmt layer on stderr with target, file, line and thread id, filtered by `RUST_LOG` (default `info`); the `env-filter` feature supplies the filter | app |
 | `symphonia` | Audio decoding/demuxing | decoders; MPL-2.0, not permissive |
 | `opus-rs` | Opus codec for the symphonia pipeline (symphonia ships no Opus codec) | decoders; BSD-3-Clause, permissive |
 | `rustls` | TLS for the `https://` streams of the HTTP decoder (blocking, no async runtime; the `ring` provider) | decoders; Apache-2.0 OR ISC OR MIT, permissive |
@@ -133,7 +137,7 @@ is not in this lockfile and is deliberately not recorded as already used.
 
 ## Complete Cargo.lock license inventory
 
-Snapshot: 2026-10-20, **359 external package versions**, all from crates.io.
+Snapshot: 2026-10-28, **377 external package versions**, all from crates.io.
 `Cargo.lock` records names/versions/sources/checksums, **not licenses**; licenses
 below are the exact cached package-manifest declarations returned by
 `cargo metadata --offline --locked --all-features --format-version 1`.
@@ -149,6 +153,21 @@ Apache-2.0) are the TLS of the `https://` streams of `rustamp-decoders`; all
 of them are permissive and enter the GPL player, not a protected closure.
 `rcgen` (MIT OR Apache-2.0) is a dev dependency: it generates the
 certificates of the local TLS server of the `https://` tests.
+`tracing` (MIT), now a direct dependency, and its new transitives
+`tracing-subscriber` (MIT), `tracing-attributes`, `sharded-slab`,
+`thread_local`, `matchers`, `regex-automata`, `regex-syntax`, `aho-corasick`
+and `nu-ansi-term` (all MIT or MIT OR Apache-2.0) are the diagnostics of
+`rustamp-app`; all are permissive and enter the GPL player, not a protected
+closure. `tracing-subscriber`'s default `tracing-log` feature is switched
+off (the subscriber is a registry with our own fmt layer), so that crate is
+not in the lock.
+`winresource` (MIT) embeds the executable's icon and VERSIONINFO; it is a
+build dependency and links nothing, and `version_check` was already in the
+lock through another build dependency.
+`serde_json` (MIT OR Apache-2.0) is the line format of the local control
+channel (`--control`); its transitives `itoa` (MIT OR Apache-2.0) and `zmij`
+(MIT) are the integer and float formatting of that format. All three are
+permissive and enter the GPL player, not a protected closure.
 
 Regenerate the marked block with
 `python .github/scripts/license-audit.py --inventory`, review the lock/manifest
@@ -164,6 +183,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `ab_glyph_rasterizer` | `0.1.10` | `Apache-2.0` | `crates.io` |
 | `adler2` | `2.0.1` | `0BSD OR MIT OR Apache-2.0` | `crates.io` |
 | `ahash` | `0.8.12` | `MIT OR Apache-2.0` | `crates.io` |
+| `aho-corasick` | `1.1.5` | `Unlicense OR MIT` | `crates.io` |
 | `alsa` | `0.11.0` | `Apache-2.0/MIT` | `crates.io` |
 | `alsa-sys` | `0.4.0` | `MIT` | `crates.io` |
 | `android-activity` | `0.6.1` | `MIT OR Apache-2.0` | `crates.io` |
@@ -267,6 +287,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `hound` | `3.5.1` | `Apache-2.0` | `crates.io` |
 | `image` | `0.25.10` | `MIT OR Apache-2.0` | `crates.io` |
 | `indexmap` | `2.14.2` | `Apache-2.0 OR MIT` | `crates.io` |
+| `itoa` | `1.0.18` | `MIT OR Apache-2.0` | `crates.io` |
 | `jni` | `0.22.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `jni-macros` | `0.22.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `jni-sys` | `0.3.1` | `MIT OR Apache-2.0` | `crates.io` |
@@ -287,6 +308,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `lofty_attr` | `0.13.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `log` | `0.4.34` | `MIT OR Apache-2.0` | `crates.io` |
 | `mach2` | `0.6.0` | `BSD-2-Clause OR MIT OR Apache-2.0` | `crates.io` |
+| `matchers` | `0.2.0` | `MIT` | `crates.io` |
 | `memchr` | `2.8.3` | `Unlicense OR MIT` | `crates.io` |
 | `memmap2` | `0.9.11` | `MIT OR Apache-2.0` | `crates.io` |
 | `minimal-lexical` | `0.2.1` | `MIT/Apache-2.0` | `crates.io` |
@@ -299,6 +321,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `ndk-sys` | `0.6.0+11769913` | `MIT OR Apache-2.0` | `crates.io` |
 | `nix` | `0.31.3` | `MIT` | `crates.io` |
 | `nom` | `7.1.3` | `MIT` | `crates.io` |
+| `nu-ansi-term` | `0.50.3` | `MIT` | `crates.io` |
 | `num-bigint` | `0.4.8` | `MIT OR Apache-2.0` | `crates.io` |
 | `num-complex` | `0.4.6` | `MIT OR Apache-2.0` | `crates.io` |
 | `num-conv` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
@@ -366,6 +389,8 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `redox_syscall` | `0.4.1` | `MIT` | `crates.io` |
 | `redox_syscall` | `0.5.18` | `MIT` | `crates.io` |
 | `redox_syscall` | `0.9.4` | `MIT` | `crates.io` |
+| `regex-automata` | `0.4.18` | `MIT OR Apache-2.0` | `crates.io` |
+| `regex-syntax` | `0.8.11` | `MIT OR Apache-2.0` | `crates.io` |
 | `ring` | `0.17.14` | `Apache-2.0 AND ISC` | `crates.io` |
 | `rtrb` | `0.4.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `rubato` | `5.0.1` | `MIT OR Apache-2.0` | `crates.io` |
@@ -393,7 +418,9 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `serde` | `1.0.229` | `MIT OR Apache-2.0` | `crates.io` |
 | `serde_core` | `1.0.229` | `MIT OR Apache-2.0` | `crates.io` |
 | `serde_derive` | `1.0.229` | `MIT OR Apache-2.0` | `crates.io` |
+| `serde_json` | `1.0.154` | `MIT OR Apache-2.0` | `crates.io` |
 | `serde_spanned` | `1.1.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `sharded-slab` | `0.1.7` | `MIT` | `crates.io` |
 | `shlex` | `2.0.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `simd-adler32` | `0.3.10` | `MIT` | `crates.io` |
 | `simd_cesu8` | `1.2.0` | `Apache-2.0 OR MIT` | `crates.io` |
@@ -433,6 +460,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | `crates.io` |
 | `thiserror-impl` | `1.0.69` | `MIT OR Apache-2.0` | `crates.io` |
 | `thiserror-impl` | `2.0.21` | `MIT OR Apache-2.0` | `crates.io` |
+| `thread_local` | `1.1.10` | `MIT OR Apache-2.0` | `crates.io` |
 | `time` | `0.3.55` | `MIT OR Apache-2.0` | `crates.io` |
 | `time-core` | `0.1.9` | `MIT OR Apache-2.0` | `crates.io` |
 | `time-macros` | `0.2.32` | `MIT OR Apache-2.0` | `crates.io` |
@@ -448,7 +476,9 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `toml_parser` | `1.1.5+spec-1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `toml_writer` | `1.1.3+spec-1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `tracing` | `0.1.44` | `MIT` | `crates.io` |
+| `tracing-attributes` | `0.1.31` | `MIT` | `crates.io` |
 | `tracing-core` | `0.1.36` | `MIT` | `crates.io` |
+| `tracing-subscriber` | `0.3.23` | `MIT` | `crates.io` |
 | `transpose` | `0.2.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `ttf-parser` | `0.25.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `typed-path` | `0.12.3` | `MIT OR Apache-2.0` | `crates.io` |
@@ -507,6 +537,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `winit` | `0.30.13` | `Apache-2.0` | `crates.io` |
 | `winnow` | `0.7.15` | `MIT` | `crates.io` |
 | `winnow` | `1.0.4` | `MIT` | `crates.io` |
+| `winresource` | `0.1.34` | `MIT` | `crates.io` |
 | `wit-bindgen` | `0.57.1` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `x11-dl` | `2.21.0` | `MIT` | `crates.io` |
 | `x11rb` | `0.13.2` | `MIT OR Apache-2.0` | `crates.io` |
@@ -521,6 +552,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `zeroize` | `1.9.1` | `Apache-2.0 OR MIT` | `crates.io` |
 | `zip` | `9.0.3` | `MIT` | `crates.io` |
 | `zlib-rs` | `0.6.8` | `Zlib` | `crates.io` |
+| `zmij` | `1.0.23` | `MIT` | `crates.io` |
 | `zopfli` | `0.8.4` | `Apache-2.0` | `crates.io` |
 | `zune-core` | `0.5.3` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
 | `zune-jpeg` | `0.5.15` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |

@@ -29,7 +29,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://gitlab.com/rustamp/rustamp"
@@ -62,6 +62,9 @@ rustamp-testkit = { path = "crates/rustamp-testkit" }
 # external
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+# The control channel's line format (`--control`, `rustamp-testkit::control`):
+# one JSON object per line in both directions.
+serde_json = "1"
 postcard = { version = "1", features = ["use-std"] }
 crossbeam-channel = "0.5"
 toml = "0.9"
@@ -76,3 +79,10 @@ lofty = "0.25"
 winit = "0.30"
 softbuffer = "0.4"
 rubato = "5"
+
+# A release build is what users run, so it is optimised for the audio path:
+# one codegen unit so LLVM can inline across crates, thin LTO so the link
+# stays fast. Neither changes behaviour, only speed and size.
+[profile.release]
+lto = "thin"
+codegen-units = 1

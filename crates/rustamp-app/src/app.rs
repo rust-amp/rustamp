@@ -35,6 +35,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustamp_audio::{Engine, EngineConfig, TrackSource};
@@ -46,7 +47,7 @@ use rustamp_core::config::{
 };
 use rustamp_core::error::{Error, ErrorInfo, ErrorKind, Result};
 use rustamp_core::event::Event;
-use rustamp_core::playlist::{EntryId, MediaLocation, SortKey};
+use rustamp_core::playlist::{EntryId, MediaLocation, PlaylistChangeKind, SortKey};
 use rustamp_core::state::{PlayerState, TransportState, WindowId};
 use rustamp_gfx::Image;
 use rustamp_ipc::{Message, Transport};
@@ -194,6 +195,21 @@ pub struct App {
     events: EventReceiver,
     commands: CommandSender,
     command_rx: CommandReceiver,
+
+    /// The snapshot the local control channel hands out (`--control`).
+    ///
+    /// The pump writes it ([`App::update_control_snapshot`]) from
+    /// [`App::host_player_state`], so a `snapshot` answer reads the state the
+    /// player already computed and never round-trips through the UI thread: a
+    /// modal dialog cannot block it. The channel reads it through
+    /// [`App::control_handles`].
+    control_state: Arc<Mutex<PlayerState>>,
+    /// Whether this run serves the local control channel (`--control`).
+    ///
+    /// A run that serves a channel is a **session**: the headless loop stays
+    /// up even when nothing is queued, because the client's commands are what
+    /// the run is for (see [`App::run_headless`]).
+    control_channel: bool,
 
     output_choice: OutputChoice,
     /// Control-thread output-open diagnostics, including later engine reopens.
@@ -610,6 +626,8 @@ impl App {
             events,
             commands,
             command_rx,
+            control_state: Arc::new(Mutex::new(PlayerState::default())),
+            control_channel: false,
             output_choice: options.output,
             output_notes: output.notes,
             registry,
@@ -1677,6 +1695,9 @@ impl App {
         // host: the request needs the channel, so it waits for the attach
         // the supervisor made above (see `App::load_enabled_plugins`).
         self.load_enabled_plugins_for_new_host();
+        // The local control channel's snapshot (`--control`) is assembled here,
+        // on the app's own thread, from the same state the host mirror reads.
+        self.update_control_snapshot();
         let _ = self.publish_host_state();
         Ok(())
     }
@@ -2131,6 +2152,59 @@ impl App {
     /// [`crate::host`] stays checkable in one place.
     pub fn player_state_update(&mut self) -> Message {
         player_state_message(self.host_player_state())
+    }
+
+    /// The handles the local control channel answers from (`--control`).
+    ///
+    /// The snapshot is refreshed first, so a client that connects before the
+    /// first pump of a run already sees the player's state and not the
+    /// default. The channel sends its commands into [`App::commands`] — the
+    /// same funnel a keystroke uses — and reads its events off [`App::bus`].
+    pub fn control_handles(&mut self) -> crate::control::Handles {
+        self.update_control_snapshot();
+        crate::control::Handles {
+            commands: self.commands.clone(),
+            bus: self.bus.clone(),
+            state: Arc::clone(&self.control_state),
+        }
+    }
+
+    /// Records whether this run serves the local control channel (`--control`).
+    ///
+    /// A run that serves a channel stays up as a **session** even while
+    /// nothing is queued: what it is for is the client's commands. Without a
+    /// channel an empty queue still ends the headless run at once (see
+    /// [`App::run_headless`]).
+    pub fn set_control_channel(&mut self, served: bool) {
+        self.control_channel = served;
+    }
+
+    /// Publishes the current player state to the local control channel.
+    ///
+    /// Called by [`App::pump`], so the snapshot a control client reads is one
+    /// the player computed anyway. A poisoned lock is recovered: a panic in
+    /// the player must not wedge the channel.
+    fn update_control_snapshot(&mut self) {
+        let state = self.host_player_state();
+        let mut guard = self
+            .control_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = state;
+    }
+
+    /// Publishes an [`Event::PlaylistChanged`] with the queue's new length.
+    ///
+    /// The app owns the playlist model (RFC 0005 §5), so the app is the
+    /// publisher the playlist contract names: "the owner mutates it and
+    /// publishes `PlaylistChanged` events". A local control client waits on
+    /// this event (or on the snapshot) to confirm that a `cmd` it sent was
+    /// applied, instead of sleeping and re-reading the state.
+    fn publish_playlist_change(&self, kind: PlaylistChangeKind) {
+        self.bus.publish(Event::PlaylistChanged {
+            kind,
+            len: self.engine.queue().len() as u32,
+        });
     }
 
     /// Attach the host's control-channel transport (see
@@ -2751,6 +2825,38 @@ impl App {
         self.engine.source_spec().is_some()
     }
 
+    /// Serves the local control channel while nothing is queued (`--control`).
+    ///
+    /// This is the session a control client drives: the loop pumps like the
+    /// playing one, so commands are applied and events published, but it has no
+    /// track of its own to end. It ends on `Quit`, when `--seconds` of
+    /// wall-clock time has passed (the playback position does not advance while
+    /// nothing plays, so the playback limit cannot bound it), or with the
+    /// process.
+    fn run_control_session(&mut self) -> Result<()> {
+        let deadline = self
+            .seconds
+            .map(|limit| self.started + Duration::from_secs(limit));
+        loop {
+            std::thread::sleep(Duration::from_millis(5));
+            // The null device's clock is driven by the loop, exactly as the
+            // windowed presenter drives it: without it a track a client starts
+            // would never advance.
+            self.drive_null_clock();
+            self.pump()?;
+            self.print_notes();
+            if self.quit {
+                return Ok(());
+            }
+            if let Some(limit) = self.seconds
+                && deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                println!("rustamp: reached --seconds {limit}, stopping");
+                return Ok(());
+            }
+        }
+    }
+
     /// Plays the queue to its end (or to `--seconds`) on a virtual device whose
     /// clock this loop drives in real time. No window is opened.
     ///
@@ -2772,8 +2878,16 @@ impl App {
         // only reader of them in this mode.
         self.print_notes();
         if self.engine.queue().is_empty() {
-            println!("rustamp: no input file; nothing to play");
-            return Ok(());
+            if !self.control_channel {
+                println!("rustamp: no input file; nothing to play");
+                return Ok(());
+            }
+            // A served control channel is a session: nothing is queued yet, and
+            // the client's commands are what the run is for. It ends on
+            // `Quit`, when `--seconds` of wall-clock time passed, or when the
+            // process is killed.
+            println!("rustamp: no input file; waiting for control commands");
+            return self.run_control_session();
         }
         let rate = self.engine.device_spec().sample_rate;
         let mut last_tick = Instant::now();
@@ -3197,7 +3311,12 @@ impl App {
                     self.note("refresh skin: the current skin is the built-in default".to_string());
                 }
             }
-            C::AddItems { items, at, play } => self.add_items(items, *at, *play),
+            C::AddItems { items, at, play } => {
+                self.add_items(items, *at, *play);
+                if !items.is_empty() {
+                    self.publish_playlist_change(PlaylistChangeKind::Inserted);
+                }
+            }
             C::SetBand { .. } | C::SetPreamp(_) | C::SetEqEnabled(_) | C::SetEqAuto(_) => {
                 // S07/Wave 35: The engine owns the authoritative EqState.
                 // The equalizer window machine is driven directly from it so that
@@ -3206,13 +3325,46 @@ impl App {
                 self.sync_eq_from_engine();
             }
             C::PlayEntry(id) => self.play_entry(*id),
-            C::Remove(ids) => self.remove_entries(ids),
-            C::Clear => self.clear_entries(),
+            C::Remove(ids) => {
+                self.remove_entries(ids);
+                if !ids.is_empty() {
+                    self.publish_playlist_change(PlaylistChangeKind::Removed);
+                }
+            }
+            C::Clear => {
+                let had_entries = !self.entry_ids.is_empty();
+                self.clear_entries();
+                if had_entries {
+                    self.publish_playlist_change(PlaylistChangeKind::Cleared);
+                }
+            }
             C::Select(op) => self.playlist.apply_select(op),
-            C::Sort(key) => self.sort_entries(*key),
-            C::Randomize => self.randomize_entries(),
-            C::MoveEntries { ids, to } => self.move_entries(ids, *to as usize),
-            C::Reverse => self.reverse_entries(),
+            C::Sort(key) => {
+                // `sort_entries` does nothing on fewer than two entries, so a
+                // no-op sort publishes nothing either.
+                if self.entry_ids.len() >= 2 {
+                    self.sort_entries(*key);
+                    self.publish_playlist_change(PlaylistChangeKind::Reordered);
+                }
+            }
+            C::Randomize => {
+                if self.entry_ids.len() >= 2 {
+                    self.randomize_entries();
+                    self.publish_playlist_change(PlaylistChangeKind::Reordered);
+                }
+            }
+            C::MoveEntries { ids, to } => {
+                self.move_entries(ids, *to as usize);
+                if !ids.is_empty() {
+                    self.publish_playlist_change(PlaylistChangeKind::Moved);
+                }
+            }
+            C::Reverse => {
+                if self.entry_ids.len() >= 2 {
+                    self.reverse_entries();
+                    self.publish_playlist_change(PlaylistChangeKind::Reordered);
+                }
+            }
             C::OpenAbout
             | C::OpenFileInfo
             | C::OpenJump { .. }

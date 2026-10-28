@@ -642,3 +642,48 @@ fn ani_variant_carries_the_cur_slot() {
         "an .ani-shipped slot must not record a substitution"
     );
 }
+
+/// A background sheet that decodes to a flat near-white image would paint an
+/// empty window; the load reports it instead of accepting it silently.
+#[test]
+fn a_near_white_background_sheet_is_reported() {
+    let mut entries = synthetic_entries();
+    entries.retain(|(name, _)| !name.eq_ignore_ascii_case("main.bmp"));
+    entries.push((
+        "main.bmp".to_string(),
+        bmp24_solid(275, 116, [255, 255, 255]),
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    write_folder(dir.path(), &entries);
+    let skin = Skin::load(dir.path()).unwrap();
+
+    assert!(
+        skin.warnings()
+            .iter()
+            .any(|w| w.contains("main.bmp") && w.contains("near-white")),
+        "a blank main.bmp must be reported: {:?}",
+        skin.warnings()
+    );
+}
+
+/// An ordinary background is not reported, and a near-white button sheet is
+/// not either: the diagnostics follow the sheets that are a window
+/// background, not every sheet.
+#[test]
+fn ordinary_sheets_are_not_reported_as_blank() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut entries = synthetic_entries();
+    entries.retain(|(name, _)| !name.eq_ignore_ascii_case("cbuttons.bmp"));
+    entries.push((
+        "cbuttons.bmp".to_string(),
+        bmp24_solid(136, 36, [255, 255, 255]),
+    ));
+    write_folder(dir.path(), &entries);
+    let skin = Skin::load(dir.path()).unwrap();
+
+    assert!(
+        skin.warnings().is_empty(),
+        "no sheet of this skin is a blank background: {:?}",
+        skin.warnings()
+    );
+}

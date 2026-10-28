@@ -538,9 +538,9 @@ impl MainWindow {
     /// which this machine does not receive, and stays a gap. The four window
     /// buttons act per S03 §5 (main menu / minimize / windowshade / close):
     /// the shade button's effect is measured (S05 §1.3), close quits because
-    /// this is the main window (RFC 0005 O3). The clutter-bar O and V emit
-    /// `OpenOptionsMenu` / `OpenVisualizationMenu` (RFC 0016, S02 §2); the
-    /// app does not render those popups yet.
+    /// this is the main window (RFC 0005 O3). The clutter-bar O and V open
+    /// the Options popup and the visualization menu (S02 §2, RFC 0016),
+    /// which the app renders as native popups at the letter point.
     fn release_command(&mut self, widget: Widget) -> Option<Command> {
         match widget {
             Widget::Previous => Some(Command::Prev),

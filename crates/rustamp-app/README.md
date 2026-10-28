@@ -10,7 +10,7 @@ The binary is `rustamp`:
 
 ```text
 rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
-       [--seconds <n>] [--enqueue] [--import-winamp-ini [path]]
+       [--seconds <n>] [--enqueue] [--control[=<name>]] [--import-winamp-ini [path]]
        [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
        [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 ```
@@ -41,7 +41,6 @@ native prompt. The menu row that runs the same command is a row of the `Play`
 submenu: S04 §2 leaves that submenu's rows unmeasured, so the row's label is
 our own choice — the command it runs is not.
 
-<<<<<<< HEAD
 ## The stream's status
 
 While an `http://` stream runs, the player says what the transfer is doing.
@@ -97,7 +96,8 @@ cargo run -p rustamp-app -- --null <file>
 drives a virtual device instead of WASAPI/cpal and opens **no window**. This is
 the mode the tests use (`tests/headless.rs` plays the repo's own 1.5 s FLAC
 fixture and checks the exit code). `--seconds <n>` bounds a run; `--null` with
-no file exits immediately.
+no file exits immediately — unless the run serves the control channel
+(`--control`, below), which keeps it up as a session.
 
 **The notes are printed here as well.** The app's diagnostics (the DSP
 bypass, the fade budget, the library's scan report, an import report, the
@@ -107,6 +107,30 @@ per note, `rustamp: <note>`, on the **standard error**, in the order the notes
 were raised. A note is printed **once**, and a run that raises no note prints
 none. The rule lives in one place (`App::print_notes`), so both modes say the
 same thing in the same words.
+
+## The local control channel — `--control` (own choice)
+
+`--control[=<name>]` opens a **named pipe** (`\\.\pipe\rustamp-ctl-<key>`) on
+which the running player answers **one JSON object per line**; without a name
+the key is the instance key of the run (the `/CLASS=` and `/CONFIG=` it uses),
+so two players never share a channel and a test never reaches the player the
+developer is running. Requests carry a mandatory `id` and one of
+
+* `"op":"ping"` — the player is listening, here is the snapshot;
+* `"op":"snapshot"` — the state the pump already computed, so a modal dialog
+  never blocks the answer;
+* `"op":"wait"` with an `"event"` filter and `"timeout_ms"` — the first matching
+  event, waited for on the connection's own subscription;
+* `"cmd"` — a player command, which travels the same funnel a menu click or a
+  keystroke uses.
+
+The idea comes from `oofz/rustamp`'s dev_server/dev_client (MIT OR
+Apache-2.0); this implementation is ours (named pipe, typed serde, request ids)
+and no source text was copied. The channel is gated by the same window rail as
+the run itself: a windowed run the rail refuses never opens one, and `--null`
+opens no window at all. `rustamp-testkit::control` is the client half, and
+`tests/control.rs` drives the real binary through it headless, so the typed
+assertions replace output greps.
 
 ## Windowed mode — headless test VM only
 

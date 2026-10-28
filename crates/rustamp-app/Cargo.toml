@@ -44,10 +44,26 @@ toml.workspace = true
 # The equalizer's auto-load rules file is TOML with a hand-written shape, so
 # it is deserialized through serde's derive.
 serde.workspace = true
+# The local control channel (`src/control.rs`, `--control`): one JSON object
+# per line over a named pipe. Already in the workspace for the same switch;
+# `serde` carries the types, `serde_json` the line.
+serde_json.workspace = true
+# Diagnostics: the startup banner and the notes of the event loops are
+# `tracing` events, and `RUST_LOG` decides which of them reach stderr. See
+# `src/diag.rs`; stdout stays the headless protocol's alone. The default
+# feature set is narrowed to the fmt layer, its ANSI colouring and the
+# `RUST_LOG` filter: `tracing-log` (and the private `smallvec` that only the
+# default set needs) would be an unused dependency, because the subscriber is
+# a registry with our own layer, not `fmt::init`.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
 
 [dev-dependencies]
 tempfile.workspace = true
+# The control-channel test (`tests/control.rs`) drives the real binary through
+# this crate's client half.
+rustamp-testkit.workspace = true
 # The skins-folder tests write real `.wsz` archives, so the scan sees the
 # same files a user drops into the folder. Already a workspace dependency
 # through `rustamp-skin`, so nothing new is fetched.
@@ -69,3 +85,21 @@ rustls = "0.23"
 
 [build-dependencies]
 embed-manifest = "1.5.1"
+# Build-time resources: the executable's icon and its VERSIONINFO block. The
+# manifest stays with `embed-manifest` above, which hands it to the linker
+# directly, so the two do not fight over the resource section. The `toml`
+# default feature (a second, private `toml` for manifest metadata) is not
+# used: every property is set from this crate's `build.rs`.
+winresource = { version = "0.1.34", default-features = false }
+
+# The control channel's pipe (`src/control.rs`): `CreateNamedPipeW` and friends
+# are the `windows` crate, the same dependency and the same mechanism the
+# single-instance channel in `rustamp-platform` uses. No new package enters
+# the lockfile; the three features are the ones the pipe and its handles need.
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+]

@@ -55,6 +55,13 @@
 //!   [`SINC_OVERSAMPLING`] sub-phases, automatic cutoff), which rubato states
 //!   are equivalent in quality to the FFT engine; it is just slower. Its ratio
 //!   is fixed (never adjusted), so it behaves as a synchronous converter.
+//! * **A pair with no buildable resampler is an error, not silence.** If both
+//!   engines refuse a rate pair, the converter has no engine at all and
+//!   [`FormatConverter::convert`] can only produce 0 frames. That is not a
+//!   quiet passthrough: [`FormatConverter::resample_unavailable`] says so and
+//!   the decode thread reports it and ends the track. Playing the track in
+//!   silence with the position running would be the one outcome a user cannot
+//!   tell from a working player.
 //! * **Delay compensation.** Both engines delay their output by a fixed number
 //!   of output frames ([`Resampler::output_delay`]). The converter discards
 //!   exactly that many frames after every [`FormatConverter::prepare`] and
@@ -154,10 +161,51 @@ enum Engine {
     Sinc(Box<Async<f32>>),
 }
 
+/// Test seam: rate pairs whose resampler construction is forced to fail, so a
+/// test can prove that the engine reports an unavailable resampler instead of
+/// playing silence (see [`FormatConverter::resample_unavailable`]). Empty in
+/// every non-test build.
+#[cfg(test)]
+static FORCED_ENGINE_FAILURES: std::sync::Mutex<Vec<(u32, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Force `rate_in -> rate_out` to have no resampler in this test process.
+#[cfg(test)]
+pub(crate) fn force_no_resampler(rate_in: u32, rate_out: u32) {
+    let mut forced = FORCED_ENGINE_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    forced.push((rate_in, rate_out));
+}
+
+/// Undo every [`force_no_resampler`] of this test process.
+#[cfg(test)]
+pub(crate) fn clear_forced_no_resampler() {
+    FORCED_ENGINE_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// Whether an earlier test forced `rate_in -> rate_out` to fail.
+fn resampler_is_forced_off(rate_in: u32, rate_out: u32) -> bool {
+    #[cfg(test)]
+    {
+        if let Ok(forced) = FORCED_ENGINE_FAILURES.lock() {
+            return forced.contains(&(rate_in, rate_out));
+        }
+    }
+    let _ = (rate_in, rate_out);
+    false
+}
+
 impl Engine {
     /// Build the engine for `rate_in -> rate_out`; `up / down` is the ratio in
     /// lowest terms.
     fn new(rate_in: u32, rate_out: u32, up: u64, down: u64, channels: usize) -> Option<Engine> {
+        if resampler_is_forced_off(rate_in, rate_out) {
+            return None;
+        }
         if up.max(down) <= MAX_FFT_UNIT
             && let Ok(fft) = Fft::<f32>::new_custom(
                 rate_in as usize,
@@ -229,6 +277,11 @@ pub struct FormatConverter {
     down: u64,
     /// The resampler; `None` for equal rates.
     engine: Option<Engine>,
+    /// No resampler could be built for a rate-changing pair, so this converter
+    /// can produce no audio at all. [`Self::convert`] returns 0 frames then;
+    /// the decode thread turns the flag into a reported error instead of
+    /// playing the track in silence (see [`Self::resample_unavailable`]).
+    resample_unavailable: bool,
     /// Input frames per resampler call (constant for the configured engine).
     chunk: usize,
     /// Largest number of output frames one resampler call can produce.
@@ -304,6 +357,7 @@ impl FormatConverter {
             up: 1,
             down: 1,
             engine: None,
+            resample_unavailable: false,
             chunk: 0,
             block_max: 0,
             delay: 0,
@@ -334,6 +388,7 @@ impl FormatConverter {
         self.up = rate_out / g;
 
         self.engine = None;
+        self.resample_unavailable = false;
         self.chunk = 0;
         self.block_max = 0;
         self.delay = 0;
@@ -359,6 +414,7 @@ impl FormatConverter {
                 self.engine = Some(engine);
             }
         }
+        self.resample_unavailable = !self.same_rate && self.engine.is_none();
         self.reset();
     }
 
@@ -367,13 +423,27 @@ impl FormatConverter {
         (self.src, self.dst)
     }
 
+    /// No resampler exists for the configured rate pair, so the conversion
+    /// cannot produce audio: every [`Self::convert`] returns 0 frames and
+    /// [`Self::flush`] emits nothing. The decode thread must turn this into a
+    /// reported error (and end the track) rather than let it play as silence
+    /// with the position advancing.
+    ///
+    /// `false` for equal rates, which need no resampler.
+    pub fn resample_unavailable(&self) -> bool {
+        self.resample_unavailable
+    }
+
     /// Whether `prepare(src, dst)` would configure exactly the conversion in
     /// use. Then a new track can continue the running stream (a gapless join)
     /// instead of flushing it and starting a fresh one; see the module docs.
     pub fn continues(&self, src: AudioSpec, dst: AudioSpec) -> bool {
         let src = AudioSpec::new(src.sample_rate.max(1), src.channels.max(1));
         let dst = AudioSpec::new(dst.sample_rate.max(1), dst.channels.max(1));
-        src == self.src && dst == self.dst
+        // A rate-changing pair with no resampler is never a continuation: the
+        // failed configuration has to be prepared again (and reported again)
+        // instead of silently carrying on with a converter that emits nothing.
+        src == self.src && dst == self.dst && !self.resample_unavailable
     }
 
     /// Output frames the input since the last reset maps to:
@@ -448,6 +518,10 @@ impl FormatConverter {
     /// same, sample for sample, however the input is split into blocks.
     ///
     /// Allocation-free and lock-free.
+    ///
+    /// Returns 0 frames when the configured rate pair has no resampler (see
+    /// [`Self::resample_unavailable`]): the call cannot produce audio, and the
+    /// caller must report that instead of treating the silence as audio.
     pub fn convert(&mut self, input: &[f32], out: &mut [f32]) -> usize {
         let in_ch = usize::from(self.src.channels);
         let out_ch = usize::from(self.dst.channels);
@@ -1181,6 +1255,38 @@ mod tests {
         assert!((post - 1.0).abs() < 1e-6, "post {post}, want exactly 1.0");
         let clamped = out.iter().filter(|s| s.abs() == 1.0).count();
         assert!(clamped > 0, "the safety net never engaged");
+    }
+
+    /// A rate pair with no buildable resampler is flagged, not silently
+    /// zeroed: `convert` can only return 0 frames for it, and the flag is what
+    /// lets the decode thread report the track instead of playing it as
+    /// silence.
+    #[test]
+    fn a_pair_without_a_resampler_is_flagged_not_silently_empty() {
+        // A pair no other test uses, forced to fail through the test seam.
+        let (rate_in, rate_out) = (31_337u32, 27_183u32);
+        force_no_resampler(rate_in, rate_out);
+        let mut c = FormatConverter::new(AudioSpec::new(rate_in, 1), AudioSpec::new(rate_out, 1));
+        clear_forced_no_resampler();
+
+        assert!(
+            c.resample_unavailable(),
+            "a rate pair with no engine must be flagged"
+        );
+        assert_eq!(c.engine.as_ref().map(Engine::name), None);
+        assert!(!c.continues(AudioSpec::new(rate_in, 1), AudioSpec::new(rate_out, 1)));
+        let input = sine(1_000.0, 0.5, rate_in);
+        let mut out = vec![0.0; c.max_out_frames(1024)];
+        assert_eq!(c.convert(&input[..1024], &mut out), 0);
+        let mut tail = vec![0.0; 64];
+        assert_eq!(c.flush(&mut tail), 0);
+
+        // The same pair builds a working converter when nothing is forced off,
+        // so the flag is about the construction and not about the pair itself.
+        let mut ok = FormatConverter::new(AudioSpec::new(rate_in, 1), AudioSpec::new(rate_out, 1));
+        assert!(!ok.resample_unavailable());
+        let mut ok_out = vec![0.0; ok.max_out_frames(1024)];
+        assert!(ok.convert(&input[..1024], &mut ok_out) > 0);
     }
 
     /// Subnormal inputs come out as silence (denormal hygiene for the

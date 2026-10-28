@@ -495,6 +495,55 @@ impl App {
 mod tests {
     use super::*;
 
+    /// A headless player (null output, no window, no media) to apply presets
+    /// to.
+    fn headless_app() -> App {
+        use crate::app::AppOptions;
+        use crate::cli::OutputChoice;
+        use rustamp_core::config::Config;
+
+        App::new(AppOptions {
+            config: Config::default(),
+            skin: crate::skin::builtin(),
+            output: OutputChoice::Null,
+            volume: 200,
+            media: None,
+            seconds: None,
+        })
+        .expect("the test app builds headless")
+    }
+
+    #[test]
+    fn every_builtin_preset_applies_within_the_gain_range() {
+        let mut app = headless_app();
+        for preset in &BUILTIN_PRESETS {
+            for gain in preset.bands {
+                assert!(
+                    gain.is_finite(),
+                    "{} carries a non-finite gain",
+                    preset.name
+                );
+                assert!(
+                    gain.abs() <= EqState::MAX_GAIN_DB,
+                    "{} gains {gain} dB exceed the engine's +-{} dB",
+                    preset.name,
+                    EqState::MAX_GAIN_DB
+                );
+            }
+            // The engine takes the curve and reports exactly those bands, and
+            // the resulting state names the same preset again.
+            assert!(app.apply_eq_preset(preset.name).unwrap(), "{}", preset.name);
+            let state = app.engine().eq();
+            assert_eq!(state.bands, preset.bands, "{} after applying", preset.name);
+            assert_eq!(preset_name_for(&state), Some(preset.name));
+        }
+        // Flat is the neutral curve, all ten bands at 0 dB.
+        assert_eq!(
+            find_preset("Flat").map(|preset| preset.bands),
+            Some([0.0; EQ_BANDS])
+        );
+    }
+
     #[test]
     fn names_are_unique_and_gains_are_in_range() {
         for (i, preset) in BUILTIN_PRESETS.iter().enumerate() {

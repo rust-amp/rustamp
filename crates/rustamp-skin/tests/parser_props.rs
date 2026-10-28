@@ -295,7 +295,17 @@ fn unsupported_encodings_are_rejected() {
             "a {bpp}-bit image must be rejected"
         );
     }
-    for compression in [2u32, 3, 4, 5, 99] {
+    for compression in [2u32, 3] {
+        // 4-bit RLE and bitfields are implemented, but only for their own bit
+        // depths: in a 24-bit image they are still rejected.
+        let mut image = valid_image(24);
+        image[30..34].copy_from_slice(&compression.to_le_bytes());
+        assert!(
+            bmp::decode(&image).is_err(),
+            "the compression {compression} must be rejected at 24 bits per pixel"
+        );
+    }
+    for compression in [4u32, 5, 99] {
         let mut image = valid_image(24);
         image[30..34].copy_from_slice(&compression.to_le_bytes());
         assert!(

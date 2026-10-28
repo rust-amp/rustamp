@@ -65,7 +65,10 @@
 //!   a seam between two formats, before a mid-stream format change and before
 //!   a run ends on an error. A track's `timeline_start` is where its first
 //!   frame lands on the output timeline, which with a continued resampler is
-//!   ahead of what has been written when the track opens.
+//!   ahead of what has been written when the track opens. A rate pair with no
+//!   resampler at all is an **error**, never silence: the converter flags it
+//!   ([`FormatConverter::resample_unavailable`]), the worker reports it as an
+//!   `Error::Unsupported` and ends the track instead of running it in silence.
 //!
 //! A non-finite sample (NaN, infinity) leaving the DSP chain is replaced by
 //! silence before it reaches the vis tap, the converter or the ring. The
@@ -126,10 +129,11 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 use rustamp_core::audio::{AudioSpec, Decoder, DecoderRegistry, DspStage, MediaSource};
@@ -484,6 +488,55 @@ pub(crate) struct Config {
     pub order: Arc<Mutex<PlaybackOrder>>,
 }
 
+/// The decode thread of a run: its handle and the flag that says whether it
+/// has actually finished.
+///
+/// The thread owns the ring's producer and the DSP chain and hands both back
+/// through [`DecodeOut::Returned`], so it cannot simply be detached when it
+/// does not finish: a join needs a budget and a way to tell "finished" from
+/// "still stuck in a source read" (see [`Engine::join_decode`]).
+pub(crate) struct DecodeThread {
+    handle: JoinHandle<()>,
+    /// Set by the thread's drop guard as its last act, so it is true once the
+    /// thread has left `run` — after the producer and the chain were handed
+    /// back — and also when it unwound through a panic.
+    finished: Arc<AtomicBool>,
+}
+
+impl DecodeThread {
+    /// Wait up to `budget` for the thread to finish. `true` when it did; then
+    /// [`Self::join`] returns without blocking.
+    pub(crate) fn wait_finished(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.finished.load(Ordering::Acquire) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Join the thread. Only call it after [`Self::wait_finished`] returned
+    /// `true` — otherwise this blocks exactly as long as the thread does.
+    pub(crate) fn join(self) {
+        let _ = self.handle.join();
+    }
+}
+
+/// Sets a [`DecodeThread`]'s completion flag when the decode run ends,
+/// including on a panic, so a waiting join can never mistake a finished (or
+/// unwound) thread for a stuck one.
+struct FinishGuard(Arc<AtomicBool>);
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// Start the decode thread. Returns its handle and the vis consumer.
 pub(crate) fn spawn(
     cfg: Config,
@@ -493,7 +546,7 @@ pub(crate) fn spawn(
     start_at: Option<(u64, u32)>,
     rx: Receiver<DecodeMsg>,
     tx: Sender<DecodeOut>,
-) -> (JoinHandle<()>, Consumer<VisFrame>) {
+) -> (DecodeThread, Consumer<VisFrame>) {
     let (vis, vis_rx) = VisTap::new(cfg.vis_capacity);
     let stop_after_current = cfg.stop_after_current;
     let start_epoch = cfg.start_epoch;
@@ -533,9 +586,14 @@ pub(crate) fn spawn(
         (order.shuffle(), order.repeat())
     };
     worker.sync_modes(shuffle, repeat);
+    let finished = Arc::new(AtomicBool::new(false));
+    let thread_finished = Arc::clone(&finished);
     let handle = std::thread::Builder::new()
         .name("rustamp-decode".into())
         .spawn(move || {
+            // Dropped last, so the flag turns true only after the producer and
+            // the user's stages were sent back to the engine.
+            let _finished = FinishGuard(thread_finished);
             worker.run(start_index, start_at);
             let producer = worker.take_ring();
             // Drop the per-run stages (Equalizer at index 0, Limiter at the end)
@@ -546,7 +604,7 @@ pub(crate) fn spawn(
             let _ = worker.tx.send(DecodeOut::Returned { producer, dsp });
         })
         .expect("spawning the decode thread");
-    (handle, vis_rx)
+    (DecodeThread { handle, finished }, vis_rx)
 }
 
 /// What the per-track loop decided.
@@ -572,11 +630,24 @@ enum Emit {
     Continue,
     /// The write was cut short; the track must be abandoned.
     Abandoned,
-    /// A DSP stage failed (RFC 0014 §3.5): the track ends loudly. The first
-    /// failure was reported and the chain flushed in `emit`; a stage that
-    /// fails during that flush ends the track through the same arm without a
-    /// second report.
+    /// The track ends loudly: a DSP stage failed (RFC 0014 §3.5) or the
+    /// converter has no resampler for the stream's rate pair. The error was
+    /// already reported; a failing stage's chain was flushed in `emit`, and a
+    /// stage that fails during that flush ends the track through this same arm
+    /// without a second report.
     StageFailed,
+}
+
+/// The report for a rate pair the converter cannot resample.
+///
+/// The converter would emit 0 frames for it (see
+/// [`FormatConverter::resample_unavailable`]), so the track cannot play at all
+/// — the run reports that instead of letting silence run with the position.
+fn resample_unavailable_error() -> Error {
+    Error::Unsupported(
+        "the track's sample rate cannot be converted to the output device's rate; \
+         no resampler is available for this rate pair, so the track cannot be played",
+    )
 }
 
 /// The pass-through a failed stage is replaced with.
@@ -701,13 +772,24 @@ impl Worker {
                 // A seam between two formats: the first stream ends here.
                 self.flush_converter();
             }
-            self.prepare_track(index, decoder.as_ref(), continues);
-            if let Some((frames, seq)) = start_at.take() {
-                let to = self.frames_to_duration(frames);
-                self.apply_seek(&mut decoder, to, seq, true);
-            }
-            let outcome = self.track_loop(&mut decoder);
-            carry = outcome == Outcome::Ended;
+            let prepared = self.prepare_track(index, decoder.as_ref(), continues);
+            let start = start_at.take();
+            let outcome = if prepared {
+                if let Some((frames, seq)) = start {
+                    let to = self.frames_to_duration(frames);
+                    self.apply_seek(&mut decoder, to, seq, true);
+                }
+                self.track_loop(&mut decoder)
+            } else {
+                // The converter refused this track's rate pair; the error was
+                // reported in `prepare_track`. Nothing of the track can reach
+                // the device format, so it ends here (the same shape as a
+                // failed DSP stage) instead of running silent.
+                Outcome::Ended
+            };
+            // A track that never prepared its stream has nothing for the next
+            // one to continue.
+            carry = prepared && outcome == Outcome::Ended;
             if outcome == Outcome::Ended && self.stop_after_current {
                 // "Stop after current track" (RFC 0005 O8): the run ends here
                 // instead of opening the next entry. Reporting the end of the
@@ -851,7 +933,13 @@ impl Worker {
     /// Configure the DSP chain, the converter and the tap for a new track.
     /// With `continues`, the converter keeps running from the previous track
     /// (a same-format gapless seam, see the module docs).
-    fn prepare_track(&mut self, index: u32, decoder: &dyn Decoder, continues: bool) {
+    ///
+    /// Returns `false` when the converter has no resampler for this track's
+    /// rate pair: the error was already reported and the track must end here.
+    /// Resampling is not optional — without it the converter can only emit 0
+    /// frames, and a track that "plays" as silence with the position running
+    /// is the one failure a user cannot tell from a working player.
+    fn prepare_track(&mut self, index: u32, decoder: &dyn Decoder, continues: bool) -> bool {
         let src = decoder.spec();
         self.src = src;
         // The track's ReplayGain multiplier, before every stage: the limiter
@@ -872,6 +960,10 @@ impl Worker {
         self.dsp_trim = self.dsp_latency();
         if !continues {
             self.conv.prepare(src, self.cfg.device);
+            if self.conv.resample_unavailable() {
+                self.report_error(&resample_unavailable_error());
+                return false;
+            }
             self.stream_base = self.timeline;
         }
         self.vis.set_enabled(self.cfg.vis_enabled);
@@ -902,6 +994,7 @@ impl Worker {
             timeline_start: self.track_start,
             seekable: decoder.is_seekable(),
         });
+        true
     }
 
     /// The track's ReplayGain multiplier for the mode the user set.
@@ -1424,6 +1517,13 @@ impl Worker {
         }
         self.src = to;
         self.conv.prepare(to, self.cfg.device);
+        if self.conv.resample_unavailable() {
+            // The new format needs a resampler that does not exist for this
+            // rate pair: the rest of the track would be silence. Report it and
+            // end the track loudly (the stream ended, nothing can follow it).
+            self.report_error(&resample_unavailable_error());
+            return Emit::StageFailed;
+        }
         for stage in &mut self.dsp {
             let _ = stage.prepare(to);
         }

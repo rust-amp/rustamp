@@ -44,6 +44,7 @@
 
 pub mod bmp;
 pub mod cursor;
+pub mod diagnostics;
 pub mod error;
 pub mod ini;
 pub mod lookalike;
@@ -58,6 +59,7 @@ pub mod viscolor;
 pub mod webamp;
 
 pub use cursor::CursorSlot;
+pub use diagnostics::{SheetStats, stats};
 pub use error::{Result, SkinError};
 pub use pledit::{PlaylistFont, PlaylistStyle};
 pub use raster::RasterImage;

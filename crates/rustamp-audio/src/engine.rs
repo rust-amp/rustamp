@@ -11,6 +11,13 @@
 //!   thread and publishes events. The audio path takes no lock and allocates
 //!   nothing.
 //!
+//! The decode thread is joined with a budget (`join_decode`,
+//! `SHUTDOWN_JOIN_TIMEOUT`), never unbounded: it can block in a source `read`
+//! forever, and `stop()`/`Drop` must not hang on it. A join that misses its
+//! budget leaves the thread alone — it still owns the ring producer and the
+//! DSP chain — and the run ends loudly instead of being published as a clean
+//! stop.
+//!
 //! # The audio clock
 //!
 //! Position comes from [`OutputDevice::played_frames`], never from the decode
@@ -245,7 +252,6 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -265,7 +271,7 @@ use rustamp_dsp::{EqControl, Equalizer, FadeControl, Limiter, LimiterControl};
 use rustamp_playlist::PlaybackOrder;
 use rustamp_playlist::rng::DEFAULT_SEED;
 
-use crate::decode::{Config, DecodeMsg, DecodeOut, TrackSource, spawn};
+use crate::decode::{Config, DecodeMsg, DecodeOut, DecodeThread, TrackSource, spawn};
 use crate::fade_budget::{FadeBudget, FadeBuffer, FadeNote};
 use crate::replaygain::{IntoReplayGainValue, ReplayGainControl, ReplayGainMode};
 use crate::ring::{GainState, RingSync, make_render};
@@ -277,6 +283,17 @@ use crate::ring::{GainState, RingSync, make_render};
 /// end. The oldest report is dropped when the cap is reached: a later report
 /// is about the same configuration and carries the same numbers.
 const MAX_FADE_NOTES: usize = 8;
+
+/// How long [`Engine::join_decode`] waits for the decode thread to finish
+/// before it treats it as stuck.
+///
+/// The decode thread runs a source `read` that can block indefinitely (a
+/// stalled network read, a hung file system), so an unbounded join would hang
+/// the caller — `stop()` and `Drop` included. Two seconds is far more than a
+/// well-behaved thread needs to leave its loop (it polls its command channel
+/// every few milliseconds), and short enough that a shutdown is not held up by
+/// a dead source.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Engine configuration.
 #[derive(Debug, Clone, PartialEq)]
@@ -379,7 +396,12 @@ pub struct Engine {
 
     to_decode: Option<Sender<DecodeMsg>>,
     from_decode: Option<Receiver<DecodeOut>>,
-    handle: Option<JoinHandle<()>>,
+    /// The decode thread of the live run, see [`Engine::join_decode`].
+    handle: Option<DecodeThread>,
+    /// The last [`Engine::join_decode`] gave up on its thread: the run it
+    /// belonged to is half dead, and the caller of the join reports that
+    /// (`take_stuck_decode_error`).
+    decode_stuck: bool,
 
     queue: Vec<TrackSource>,
     current: Option<u32>,
@@ -522,6 +544,7 @@ impl Engine {
             to_decode: None,
             from_decode: None,
             handle: None,
+            decode_stuck: false,
             queue: Vec::new(),
             current: None,
             transport: TransportState::Stopped,
@@ -1325,6 +1348,15 @@ impl Engine {
         let _ = self.output.pause();
         let flushed = self.flush_output();
         let _ = self.join_decode();
+        if let Some(err) = self.take_stuck_decode_error() {
+            // The decode thread did not finish: the run is half dead, and a
+            // clean stop over it would claim a teardown that did not happen.
+            // End it through the output-failure path, which publishes the
+            // error and the stopped state in one place (the frozen position is
+            // the position playback reached, not zero).
+            self.handle_output_error(err, OutputFailure::OnLiveDevice);
+            return Err(stuck_decode_error());
+        }
         self.transport = TransportState::Stopped;
         self.clock_origin = self.output.played_frames();
         self.timeline_origin = 0;
@@ -1825,6 +1857,7 @@ impl Engine {
         let _ = self.output.pause();
         let flushed = self.flush_output();
         let _ = self.join_decode();
+        let stuck = self.take_stuck_decode_error();
         self.transport = TransportState::Stopped;
         // The run is over: no phase of its stream may show any more.
         self.clear_stream_progress();
@@ -1853,6 +1886,12 @@ impl Engine {
             !self.repeat() && (!self.stop_after_current || self.traversal_exhausted());
         if queue_exhausted {
             self.bus.publish(Event::PlaylistEnded);
+        }
+        if let Some(err) = stuck {
+            // The run ended while its decode thread was stuck in the source:
+            // say so, on top of the stopped state, instead of letting the end
+            // of the stream look clean.
+            self.report_output_error(&err);
         }
         if let Err(err) = flushed {
             self.report_output_error(&err);
@@ -2287,13 +2326,28 @@ impl Engine {
     /// decode thread's own report queue, so the start is published first.
     /// Every other caller discards it — the run it belongs to is over, and the
     /// next run publishes its own start.
+    ///
+    /// The wait is **bounded** ([`SHUTDOWN_JOIN_TIMEOUT`]): the decode thread
+    /// blocks in the source's `read`, and a source that never returns must not
+    /// hang `stop()` or `Drop`. When the budget is missed, the thread is not
+    /// joined (it is still alive and still owns the ring producer and the DSP
+    /// chain) and [`Engine::take_stuck_decode_error`] reports the half-dead run
+    /// instead of a clean stop. Leaving the thread alone is the only safe
+    /// choice: detaching it would let it write into a ring the engine already
+    /// gave to the next run, and the producer it holds cannot be recovered
+    /// from any other place.
     fn join_decode(&mut self) -> Option<DecodeOut> {
         // A thread waiting for a ring drain must not block the join; nothing is
         // consuming the ring at this point anyway.
         self.sync.set_active(false);
         self.to_decode = None;
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        self.decode_stuck = false;
+        if let Some(thread) = self.handle.take() {
+            if thread.wait_finished(SHUTDOWN_JOIN_TIMEOUT) {
+                thread.join();
+            } else {
+                self.decode_stuck = true;
+            }
         }
         // Drain any remaining messages from the decode thread. If `Returned`
         // was not handled in `poll`, recover both the ring producer and the
@@ -2301,6 +2355,11 @@ impl Engine {
         // stages are cleanly retrieved and dropped in order with the engine.
         // A queued `TrackStarted` is held for the caller: the last one wins,
         // naming the track the decode thread had open when the run ended.
+        //
+        // A stuck thread has not sent `Returned` and will not: its producer
+        // stays with it (there is nothing to park here), so a later `start()`
+        // fails with "the ring producer was lost" rather than silently
+        // publishing a half-dead run.
         let mut held_start = None;
         if let Some(rx) = self.from_decode.take() {
             while let Ok(out) = rx.try_recv() {
@@ -2318,6 +2377,16 @@ impl Engine {
         }
         self.to_decode = None;
         held_start
+    }
+
+    /// The error that reports a decode thread the last join gave up on, if
+    /// there is one. Taking it clears the flag, so the run is reported once.
+    fn take_stuck_decode_error(&mut self) -> Option<Error> {
+        if !self.decode_stuck {
+            return None;
+        }
+        self.decode_stuck = false;
+        Some(stuck_decode_error())
     }
 
     fn publish_state(&self) {
@@ -2348,6 +2417,18 @@ fn clamp_gain(gain_db: f32) -> Option<f32> {
         .then(|| gain_db.clamp(-EqState::MAX_GAIN_DB, EqState::MAX_GAIN_DB))
 }
 
+/// The report for a decode thread that did not finish within
+/// [`SHUTDOWN_JOIN_TIMEOUT`]: the thread is stuck in the source, so the run
+/// cannot be torn down and the next one cannot get the ring back.
+fn stuck_decode_error() -> Error {
+    Error::Output(format!(
+        "the decode thread did not finish within {} ms: the source is not returning, \
+         so the run cannot be torn down; the thread still holds the ring and the DSP chain, \
+         and playback needs a new engine",
+        SHUTDOWN_JOIN_TIMEOUT.as_millis()
+    ))
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         self.send(DecodeMsg::Quit);
@@ -2369,6 +2450,7 @@ mod tests {
     use rustamp_output::{NullClock, NullOutput};
     use std::net::TcpListener;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -2377,11 +2459,14 @@ mod tests {
     struct PatternDecoder {
         total: u64,
         pos: u64,
+        /// The rate the decoder claims; [`SPEC`] unless the track name carries
+        /// an `@<rate>` suffix (see `PatternFactory::open`).
+        rate: u32,
     }
 
     impl Decoder for PatternDecoder {
         fn spec(&self) -> AudioSpec {
-            SPEC
+            AudioSpec::new(self.rate, SPEC.channels)
         }
 
         fn read(&mut self, out: &mut [f32]) -> CoreResult<usize> {
@@ -2394,13 +2479,13 @@ mod tests {
         }
 
         fn seek(&mut self, to: Duration) -> CoreResult<Duration> {
-            let frames = (to.as_secs_f64() * f64::from(SPEC.sample_rate)).round() as u64;
+            let frames = (to.as_secs_f64() * f64::from(self.rate)).round() as u64;
             self.pos = frames.min(self.total);
-            Ok(SPEC.duration_of(self.pos))
+            Ok(AudioSpec::new(self.rate, SPEC.channels).duration_of(self.pos))
         }
 
         fn duration(&self) -> Option<Duration> {
-            Some(SPEC.duration_of(self.total))
+            Some(AudioSpec::new(self.rate, SPEC.channels).duration_of(self.total))
         }
     }
 
@@ -2435,6 +2520,12 @@ mod tests {
             };
             let stem = name.rsplit(['/', '\\']).next().unwrap_or(name.as_str());
             let stem = stem.strip_suffix(".tst").unwrap_or(stem);
+            // `track0_1000@31337.tst`: the decoder reports 31337 Hz, for the
+            // converter tests that need a rate pair of their own.
+            let (stem, rate) = match stem.split_once('@') {
+                Some((stem, rate)) => (stem, rate.parse().unwrap_or(SPEC.sample_rate)),
+                None => (stem, SPEC.sample_rate),
+            };
             let frames = stem
                 .strip_prefix("track")
                 .and_then(|rest| rest.split_once('_'))
@@ -2443,6 +2534,78 @@ mod tests {
             Ok(Box::new(PatternDecoder {
                 total: frames,
                 pos: 0,
+                rate,
+            }))
+        }
+    }
+
+    /// Control for a `.blk` track: its `read` blocks while `hold` is set.
+    ///
+    /// A real source can block in `read` without ever returning (a stalled
+    /// network read, a hung file system). `MockDecoder` in `rustamp-core` does
+    /// not, so the wrapper lives here.
+    #[derive(Default)]
+    struct HoldControl {
+        /// The decode thread has entered the blocking read.
+        entered: AtomicBool,
+        /// Kept by the test: the read blocks while this is set.
+        hold: AtomicBool,
+    }
+
+    /// A track whose `read` does not return while the test holds it.
+    struct BlockedDecoder {
+        control: Arc<HoldControl>,
+    }
+
+    impl Decoder for BlockedDecoder {
+        fn spec(&self) -> AudioSpec {
+            SPEC
+        }
+
+        fn read(&mut self, out: &mut [f32]) -> CoreResult<usize> {
+            self.control.entered.store(true, Ordering::Release);
+            while self.control.hold.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            out.fill(0.0);
+            Ok(0)
+        }
+
+        fn seek(&mut self, _to: Duration) -> CoreResult<Duration> {
+            Err(rustamp_core::error::Error::Unsupported(
+                "the test source does not seek",
+            ))
+        }
+
+        fn duration(&self) -> Option<Duration> {
+            Some(Duration::from_secs(1))
+        }
+    }
+
+    struct BlockedFactory {
+        control: Arc<HoldControl>,
+    }
+
+    impl DecoderFactory for BlockedFactory {
+        fn name(&self) -> &str {
+            "blocked"
+        }
+
+        fn extensions(&self) -> &[&str] {
+            &["blk"]
+        }
+
+        fn probe(&self, hint: &ProbeHint<'_>) -> Confidence {
+            if hint.extension == Some("blk") {
+                Confidence::CONTENT
+            } else {
+                Confidence::NONE
+            }
+        }
+
+        fn open(&self, _source: MediaSource) -> CoreResult<Box<dyn Decoder>> {
+            Ok(Box::new(BlockedDecoder {
+                control: Arc::clone(&self.control),
             }))
         }
     }
@@ -2451,6 +2614,8 @@ mod tests {
         engine: Engine,
         clock: NullClock,
         events: rustamp_core::bus::EventReceiver,
+        /// Control for the `.blk` tracks (a source whose `read` can block).
+        blocked: Arc<HoldControl>,
         _dir: tempfile::TempDir,
     }
 
@@ -2460,8 +2625,12 @@ mod tests {
             let (output, clock) = NullOutput::pair();
             let bus = EventBus::new();
             let events = bus.subscribe();
+            let blocked = Arc::new(HoldControl::default());
             let mut registry = DecoderRegistry::new();
             registry.register(Arc::new(PatternFactory));
+            registry.register(Arc::new(BlockedFactory {
+                control: Arc::clone(&blocked),
+            }));
             let mut engine = Engine::new(registry, Box::new(output), bus, EngineConfig::default())
                 .expect("engine construction");
             engine.set_limiter_enabled(false);
@@ -2478,6 +2647,7 @@ mod tests {
                 engine,
                 clock,
                 events,
+                blocked,
                 _dir: dir,
             }
         }
@@ -2731,5 +2901,106 @@ mod tests {
             ),
             "the phase of the failed connect must be readable"
         );
+    }
+
+    /// A track whose rate pair has no resampler must end with a reported error
+    /// and not a single frame in the ring. Before the fix the converter's
+    /// `convert` returned 0 frames and the track "played" as silence with the
+    /// position running.
+    #[test]
+    fn an_unavailable_resampler_ends_the_track_with_an_error() {
+        // The device grants 44.1 kHz (the harness's `EngineConfig`); this
+        // track reports 31337 Hz, a pair no other test uses.
+        const TRACK_RATE: u32 = 31_337;
+        crate::convert::force_no_resampler(TRACK_RATE, SPEC.sample_rate);
+        let mut h = TestHarness::new(&["track0_1000@31337.tst"]);
+
+        h.engine.play_index(0).unwrap();
+        let reported = h.wait_pumping(|e| e.last_error().is_some(), Duration::from_secs(10));
+        // The forced pair only exists for this test; take it back before the
+        // assertions so a failure cannot leak into another test.
+        crate::convert::clear_forced_no_resampler();
+        assert!(reported, "the unavailable resampler must be reported");
+
+        let (written, _) = h.engine.sync.counters();
+        assert_eq!(written, 0, "no frame may reach the ring");
+
+        let events = h.drain_events();
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Error(info) => Some(info),
+                _ => None,
+            })
+            .expect("the missing resampler must publish an error event");
+        assert_eq!(error.kind, ErrorKind::Other);
+        assert!(
+            error.message.contains("no resampler"),
+            "the report must name the cause: {error:?}"
+        );
+        // The run is still alive at the end of the stream, not silently playing.
+        assert_eq!(h.engine.current_index(), Some(0));
+        h.engine.stop().unwrap();
+    }
+
+    /// A decode thread stuck in a source read must not hang `stop()`: the join
+    /// gives up after [`SHUTDOWN_JOIN_TIMEOUT`] and the half-dead run is
+    /// reported instead of being published as a clean stop.
+    #[test]
+    fn a_stuck_decode_thread_does_not_hang_stop_and_is_reported() {
+        let mut h = TestHarness::new(&["stuck.blk"]);
+        h.blocked.hold.store(true, Ordering::Release);
+        h.engine.play_index(0).unwrap();
+
+        // Wait until the decode thread is inside the source read: from here on
+        // it can neither see `Stop` nor reach the end of the run.
+        let entered = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if h.blocked.entered.load(Ordering::Acquire) {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                h.clock.pump(256);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        assert!(entered, "the decode thread must reach the source read");
+
+        let started = std::time::Instant::now();
+        let stopped = h.engine.stop();
+        let elapsed = started.elapsed();
+        h.blocked.hold.store(false, Ordering::Release);
+
+        assert!(
+            stopped.is_err(),
+            "a run whose thread never finished must not stop cleanly"
+        );
+        assert!(
+            elapsed >= SHUTDOWN_JOIN_TIMEOUT - Duration::from_millis(50),
+            "the join must wait for its budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < SHUTDOWN_JOIN_TIMEOUT + Duration::from_secs(2),
+            "the join must give up after its budget: {elapsed:?}"
+        );
+        assert_eq!(h.engine.transport(), TransportState::Stopped);
+
+        let events = h.drain_events();
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Error(info) => Some(info),
+                _ => None,
+            })
+            .expect("the stuck run must be reported");
+        assert_eq!(error.kind, ErrorKind::Output);
+        assert!(
+            error.message.contains("did not finish"),
+            "the report must name the stuck join: {error:?}"
+        );
+        assert!(h.engine.last_error().is_some());
     }
 }
