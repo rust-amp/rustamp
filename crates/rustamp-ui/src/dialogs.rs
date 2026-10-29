@@ -62,8 +62,12 @@
 //!   that says what a URL is (the command line's own URL rule), so the app
 //!   reads the field and hands the location it accepted over
 //!   ([`DialogManager::set_media_location`]); the manager confirms that one.
-//!   Clipboard paste is not supported: `winit` has no clipboard and a Win32
-//!   clipboard binding would be a new dependency. The reference's real layout,
+//!   Clipboard paste arrives as **text**: `winit` has no clipboard, so the
+//!   app's presenter reads the Win32 clipboard on a worker thread and types
+//!   the result into the field through [`DialogManager::type_text`] — the
+//!   same path a key press's OS text takes. The model has no caret, so a
+//!   paste appends at the end of the field, exactly as typing there does, and
+//!   the field's own limit clamps it. The reference's real layout,
 //!   filters and wording stay
 //!   open (a capture would need the three dialogs' geometry, filter lists and
 //!   exact labels).

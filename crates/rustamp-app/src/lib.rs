@@ -6,6 +6,10 @@
 //! stays headless.
 //!
 //! * [`cli`] — command-line parsing.
+//! * [`clipboard`] — the clipboard read behind `Ctrl`+`V` in a dialog's entry
+//!   field: the text is read on a worker thread (the UI thread never waits on
+//!   a clipboard another process may hold) and typed into the field through
+//!   the app's ordinary text path. Headless; the Win32 half is Windows-only.
 //! * [`config`] — config file loading with defaults (RFC 0001 defines the
 //!   types, not the I/O). The save keeps every setting the player does not
 //!   apply, so a hand-edited file is never silently trimmed.
@@ -120,6 +124,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod clipboard;
 pub mod config;
 mod config_preserve;
 pub mod control;

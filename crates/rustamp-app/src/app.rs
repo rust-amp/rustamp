@@ -147,6 +147,135 @@ impl WindowCommand {
     }
 }
 
+/// The windows whose pixels a pump step can have changed.
+///
+/// The app owns the state the windows draw, so it is the one place that can
+/// say which frame moved. The presenter ([`crate::window`]) asks for the mask
+/// after every pump ([`App::take_window_dirty`]) and paints only the windows
+/// in it, so a tick whose mask is empty paints nothing at all; the 16 ms tick
+/// stays the upper bound the clock-driven content needs.
+///
+/// The mask is bookkeeping only: it never reaches the event bus, the output or
+/// the control channel, so a `--null` run prints the same thing whether or not
+/// a presenter reads it (a headless run never does).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowDirty {
+    /// The main window: the clock digits, the marquee, the analyser, and every
+    /// toggle and slider the frame draws.
+    pub main: bool,
+    /// The equalizer window.
+    pub equalizer: bool,
+    /// The playlist editor.
+    pub playlist: bool,
+    /// The media library window.
+    pub library: bool,
+    /// The own-window dialog (at most one is open at a time).
+    pub dialog: bool,
+}
+
+impl WindowDirty {
+    /// Nothing changed: a tick with this mask paints no window.
+    pub const NONE: Self = Self {
+        main: false,
+        equalizer: false,
+        playlist: false,
+        library: false,
+        dialog: false,
+    };
+
+    /// Every window changed: a command or a skin load may touch any frame.
+    pub const ALL: Self = Self {
+        main: true,
+        equalizer: true,
+        playlist: true,
+        library: true,
+        dialog: true,
+    };
+
+    /// Adds `other` to this mask.
+    pub fn merge(&mut self, other: Self) {
+        self.main |= other.main;
+        self.equalizer |= other.equalizer;
+        self.playlist |= other.playlist;
+        self.library |= other.library;
+        self.dialog |= other.dialog;
+    }
+}
+
+/// The main window's render inputs at the last pump that reported a change.
+///
+/// The frame is drawn from the UI machine's state (transport, clock, marquee,
+/// analyser, toggles, title), the frame size, the focus variant and the skin,
+/// so those four are what a new frame is recognized by.
+struct MainFrame {
+    size: (u32, u32),
+    skin: u64,
+    focused: bool,
+    state: MainWindowState,
+}
+
+/// The equalizer frame's render inputs at the last pump that reported a
+/// change. The equalizer has no clock: its state is the whole frame.
+struct EqFrame {
+    skin: u64,
+    state: rustamp_ui::EqualizerState,
+}
+
+/// The media library's view at the last pump that reported a change.
+///
+/// The list is filled by the scan's worker thread, which has no call site in
+/// the app to mark a frame from, so the view itself is the signal.
+#[derive(PartialEq)]
+struct LibraryFrame {
+    size: (u32, u32),
+    total: usize,
+    offset: usize,
+    scroll: usize,
+    selected: Option<i64>,
+    sort: rustamp_ui::LibrarySort,
+    descending: bool,
+    text: String,
+    scan: Option<String>,
+}
+
+/// The windows an event can change a frame of.
+///
+/// The main window and the equalizer are absent on purpose: their frames are
+/// compared against their render inputs in [`App::report_window_changes`],
+/// which already covers every event that reaches them. The playlist and the
+/// dialog have no such comparison (their models are far larger than a frame),
+/// so their frames are marked here, where the event is applied.
+fn event_windows(event: &Event) -> WindowDirty {
+    match event {
+        // The highlighted row and the rows' labels.
+        Event::TrackChanged { .. } | Event::PlaylistChanged { .. } | Event::PlaylistEnded => {
+            WindowDirty {
+                playlist: true,
+                dialog: true,
+                ..WindowDirty::NONE
+            }
+        }
+        // A dialog's body carries live track data: the file info shows the
+        // position, the jump box the queue, the edit box the metadata.
+        Event::StateChanged(_)
+        | Event::PositionChanged { .. }
+        | Event::StreamInfoChanged(_)
+        | Event::VolumeChanged { .. }
+        | Event::ModesChanged { .. }
+        | Event::EqChanged(_)
+        | Event::Error(_) => WindowDirty {
+            dialog: true,
+            ..WindowDirty::NONE
+        },
+        // A skin reaches every frame the app draws.
+        Event::SkinChanged(_) => WindowDirty::ALL,
+        // Neither has a frame of its own.
+        Event::WindowVisibilityChanged { .. } | Event::Quit => WindowDirty::NONE,
+        // Every variant is listed: a new event must decide which frame it can
+        // change rather than inherit a default.
+    }
+}
+
 /// The player.
 pub struct App {
     engine: Engine,
@@ -160,6 +289,16 @@ pub struct App {
     /// work, so this is the UI's own prediction state).
     eq: EqualizerWindow,
     eq_layout: EqualizerLayout,
+    /// The windows whose pixels changed since the presenter last painted (see
+    /// [`WindowDirty`]).
+    window_dirty: WindowDirty,
+    /// The main window's render inputs at the last pump that reported a
+    /// change, and the equalizer's.
+    main_frame: Option<MainFrame>,
+    eq_frame: Option<EqFrame>,
+    /// The media library's view at the last pump that reported a change; `None`
+    /// while the window is closed.
+    library_frame: Option<LibraryFrame>,
     /// The title-bar double-click trackers (S03 §5): one per classic window,
     /// so a press in one window never pairs with a press in another.
     title_bar_clicks: TitleBarClicks,
@@ -320,6 +459,17 @@ pub struct App {
     pub(crate) pending_eq_menu: bool,
     /// The playlist MISC popup awaits the presenter's modal-menu drain.
     pub(crate) pending_playlist_misc_menu: bool,
+    /// A right click on a playlist entry waiting for the presenter: the
+    /// request for the playlist's **context menu** (S03 §5).
+    ///
+    /// **Blocked on S04**: the menu's rows, wording and enabled states are
+    /// S04's, and S03 §5 measures only that a right click on an entry opens
+    /// one. The measured part of the gesture — the pressed row is selected
+    /// through the ordinary `Command::Select` path — already happened when
+    /// the click was routed, so this field carries nothing but the request,
+    /// and the presenter's tick takes it once
+    /// ([`App::take_pending_playlist_context`]).
+    pub(crate) pending_playlist_context: Option<crate::playlist_window::PlaylistContextRequest>,
     /// A save-playlist request waiting for the presenter (Ctrl+S, S03 §2, command ID 40204).
     pub(crate) request_save_playlist: bool,
     /// An HTML-playlist request waiting for the presenter (Ctrl+Alt+G, S03 §2,
@@ -613,6 +763,10 @@ impl App {
                 ..rustamp_ui::EqualizerState::default()
             }),
             eq_layout: EqualizerLayout::CLASSIC,
+            window_dirty: WindowDirty::NONE,
+            main_frame: None,
+            eq_frame: None,
+            library_frame: None,
             title_bar_clicks: TitleBarClicks::default(),
             skin: options.skin,
             config: options.config,
@@ -671,6 +825,7 @@ impl App {
             pending_clutter_menu: None,
             pending_eq_menu: false,
             pending_playlist_misc_menu: false,
+            pending_playlist_context: None,
             request_save_playlist: false,
             request_html_playlist: false,
             eq_user_presets: Vec::new(),
@@ -1702,6 +1857,109 @@ impl App {
         Ok(())
     }
 
+    /// Takes the windows whose pixels changed since the last call.
+    ///
+    /// The presenter calls this once per tick, after [`App::pump`], and paints
+    /// the windows in the answer. The mask is computed **here**, on the
+    /// presenter's request: a `--null` run never asks, so its pump does no
+    /// comparison and no tag poll, and its output is exactly what it was.
+    ///
+    /// Taking clears the mask, so a change is painted exactly once even if the
+    /// presenter has no OS window for it yet (a closed window paints nothing;
+    /// a window's own creation asks for a frame, see `crate::window`).
+    pub fn take_window_dirty(&mut self) -> WindowDirty {
+        // A row whose tags arrived draws its real text; no other signal
+        // reports that.
+        if self.poll_row_tags() {
+            self.window_dirty.playlist = true;
+        }
+        self.report_window_changes();
+        std::mem::take(&mut self.window_dirty)
+    }
+
+    /// Notes which windows' render inputs moved since the last report.
+    ///
+    /// This is the half of the paint gate that the presenter cannot compute:
+    /// the clock (time digits, marquee, analyser) and the scan's worker thread
+    /// change a frame without any call site the presenter can see, so the app
+    /// compares the inputs each frame was drawn from. Everything a command, an
+    /// event or a skin load touches is marked where it is applied
+    /// ([`App::apply_from`], [`App::handle_event`], [`App::load_skin`]).
+    fn report_window_changes(&mut self) {
+        let skin = self.skin_generation;
+        let size = self.frame_size();
+        let unchanged = self.main_frame.as_ref().is_some_and(|last| {
+            last.size == size
+                && last.skin == skin
+                && last.focused == self.focused
+                && &last.state == self.ui.state()
+        });
+        if !unchanged {
+            self.window_dirty.main = true;
+            self.main_frame = Some(MainFrame {
+                size,
+                skin,
+                focused: self.focused,
+                state: self.ui.state().clone(),
+            });
+        }
+        let unchanged = self
+            .eq_frame
+            .as_ref()
+            .is_some_and(|last| last.skin == skin && &last.state == self.eq.state());
+        if !unchanged {
+            self.window_dirty.equalizer = true;
+            self.eq_frame = Some(EqFrame {
+                skin,
+                state: self.eq.state().clone(),
+            });
+        }
+        if !self.library_window.is_open() {
+            self.library_frame = None;
+        } else {
+            let size = self.library_window.client_size();
+            let view = self.library_window.view();
+            let frame = LibraryFrame {
+                size,
+                total: view.total(),
+                offset: view.offset(),
+                scroll: view.scroll(),
+                selected: view.selected(),
+                sort: view.sort(),
+                descending: view.descending(),
+                text: view.text().to_owned(),
+                scan: view.scan_status().map(str::to_owned),
+            };
+            if self.library_frame.as_ref() != Some(&frame) {
+                self.window_dirty.library = true;
+                self.library_frame = Some(frame);
+            }
+        }
+    }
+
+    /// Takes the playlist rows' tags that arrived, reporting whether any did.
+    ///
+    /// The tags are read off the UI thread (see [`crate::playlist_tags`]), and
+    /// a shown row that gains them draws its real text, so their arrival is a
+    /// change of the playlist frame. The count of the **shown** rows that have
+    /// tags is the signal: a tag for a row the editor does not show cannot
+    /// change a frame. A closed editor is skipped altogether.
+    fn poll_row_tags(&mut self) -> bool {
+        if !self.playlist_open() {
+            return false;
+        }
+        let shown = self.playlist.visible_ids();
+        let known = |tags: &crate::playlist_tags::TagReader| {
+            shown
+                .iter()
+                .filter(|id| tags.metadata(**id).is_some())
+                .count()
+        };
+        let before = known(&self.playlist_tags);
+        self.playlist_tags.poll();
+        known(&self.playlist_tags) != before
+    }
+
     /// Applies `command` to the classic window `window`.
     ///
     /// The command applies to the window it was addressed to, which is what
@@ -1901,6 +2159,11 @@ impl App {
     /// to the UI machine unless the UI produced it (the UI machine already
     /// applied its own S02 prediction for its own commands).
     fn apply_from(&mut self, command: &Command, from_ui: bool) {
+        // A command is the user's own action: it may change any frame (a
+        // toggle, a new skin, a new size, an open dialog), and commands are
+        // rare next to the frames, so every window is marked rather than
+        // tracking which one the command reaches.
+        self.window_dirty.merge(WindowDirty::ALL);
         if matches!(command, Command::Seek { .. } | Command::SeekRelative { .. }) {
             // Includes external/plugin commands as well as the UI's predicted
             // seek. No public seek-completion/generation tag exists on frames.
@@ -1984,6 +2247,14 @@ impl App {
     /// Applies a core [`Event`]: the app's own bookkeeping first, then the UI
     /// machine (the authoritative state).
     pub fn handle_event(&mut self, event: &Event) {
+        // The frames this event can change (see [`event_windows`]). The dialog
+        // is only a frame while it is open: an event for a closed dialog marks
+        // nothing.
+        let mut changed = event_windows(event);
+        if self.dialog_open_kind().is_none() {
+            changed.dialog = false;
+        }
+        self.window_dirty.merge(changed);
         // The track that opens decides whether it can be seeked, and the UI
         // needs that fact before it handles the track change.
         if matches!(event, Event::TrackChanged { .. }) {
@@ -3008,6 +3279,9 @@ impl App {
         }
         if self.entry_ids.len() != before {
             self.sync_playlist_entries();
+            // The editor's model grew (see `App::sync_playlist_entries`): its
+            // frame changed without a command or an event.
+            self.window_dirty.playlist = true;
         }
     }
 
@@ -3456,6 +3730,8 @@ impl App {
         };
         self.skin = loaded;
         self.skin_generation += 1;
+        // Every window draws from the skin.
+        self.window_dirty.merge(WindowDirty::ALL);
         // A new skin brings its own `Font=` size (S17 §5).
         self.sync_playlist_font_size();
         self.publish_skin();
@@ -3471,6 +3747,8 @@ impl App {
         self.skin = crate::skin::builtin();
         self.current_skin = None;
         self.skin_generation += 1;
+        // Every window draws from the skin.
+        self.window_dirty.merge(WindowDirty::ALL);
         // The built-in skin brings its own `Font=` size (S17 §5).
         self.sync_playlist_font_size();
         self.publish_skin();

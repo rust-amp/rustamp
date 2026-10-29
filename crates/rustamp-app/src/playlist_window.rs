@@ -66,10 +66,39 @@ use rustamp_ui::{
 use crate::app::App;
 use crate::title_format::TitleFormatSetting;
 
+/// A right click on a playlist entry asking for that entry's **context menu**
+/// (S03 §5).
+///
+/// S03 §5 measures the gesture — a right click on an entry opens the
+/// playlist's context menu for it — and the menu itself is **blocked on
+/// S04**: its rows, wording and enabled states are S04's, not this build's
+/// to invent. This type therefore names only what the click settled: the row
+/// the pointer was on and the entry that row shows. The app records one and
+/// the presenter's tick takes it once
+/// ([`App::take_pending_playlist_context`]); until S04 builds the menu from
+/// it, taking the request is all that happens to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaylistContextRequest {
+    /// The visible row the pointer was on (0-based, in the list).
+    pub row: usize,
+    /// The entry that row shows: the subject the menu would act on.
+    pub entry: EntryId,
+}
+
 impl App {
     /// Takes the MISC popup request once, for the presenter's native-menu drain.
     pub fn take_playlist_misc_menu(&mut self) -> bool {
         std::mem::take(&mut self.pending_playlist_misc_menu)
+    }
+
+    /// Takes the pending right-click context-menu request once (S03 §5), for
+    /// the presenter's tick.
+    ///
+    /// **Blocked on S04**: the playlist's context menu — its rows, wording and
+    /// enabled states — is not implemented yet, so the request is taken and
+    /// nothing is shown. S04 builds the menu from this value.
+    pub fn take_pending_playlist_context(&mut self) -> Option<PlaylistContextRequest> {
+        self.pending_playlist_context.take()
     }
 
     /// The playlist window's client size at rest (S06 scope; S01 §1).
@@ -333,6 +362,58 @@ impl App {
             return self.playlist_title_button(button);
         }
         Ok(Vec::new())
+    }
+
+    /// A **right**-button press at playlist-window-relative `(x, y)`, S03 §5.
+    ///
+    /// The measured gesture is a right click on a playlist **entry**: it
+    /// selects that entry and opens the playlist's context menu for it. The
+    /// menu is **blocked on S04** — its rows, wording and enabled states are
+    /// not measured in this build and are not invented here — so this half
+    /// does exactly what S03 §5 settles for the click itself:
+    ///
+    /// * a press on an entry **selects** it through the selection machinery
+    ///   the left click uses (`PlaylistWindow::mouse_down` with no modifier,
+    ///   whose [`Command::Select`] the app submits like any other click), so
+    ///   there is one selection path and no second one for the right button;
+    /// * the row drag that press arms is cancelled again: the right button
+    ///   moves no rows and its release must not turn into a `MoveEntries`;
+    /// * the request for the menu is recorded on the app
+    ///   ([`App::take_pending_playlist_context`]), where the presenter's tick
+    ///   takes it once.
+    ///
+    /// A press that lands on **no entry** — the space below the last one, the
+    /// bottom bar, the title bar, a shaded editor — changes nothing and asks
+    /// for no menu: there is no entry for a menu to act on. The reference's
+    /// behaviour there is unmeasured.
+    pub fn playlist_right_mouse_down(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
+        let (width, height) = self.playlist_logical_size();
+        let scale = self.playlist_scale() as i32;
+        let (x, y) = (x / scale, y / scale);
+        self.playlist.set_size(width, height);
+        self.sync_playlist_entries();
+        if self.playlist_shaded() {
+            return Ok(Vec::new());
+        }
+        let Some(row) = self.playlist.row_at(x, y) else {
+            return Ok(Vec::new());
+        };
+        // A row band below the last entry holds no entry: nothing to select
+        // and no menu to ask for.
+        let Some(entry) = self.playlist.visible_ids().get(row).copied() else {
+            return Ok(Vec::new());
+        };
+        let commands = match self.playlist.mouse_down(x, y, Modifiers::NONE) {
+            Some(command) => {
+                let commands = vec![command.clone()];
+                self.submit(command)?;
+                commands
+            }
+            None => Vec::new(),
+        };
+        self.playlist.cancel_drag();
+        self.pending_playlist_context = Some(PlaylistContextRequest { row, entry });
+        Ok(commands)
     }
 
     /// A left-button release at playlist-window-relative `(x, y)`.
@@ -1435,6 +1516,92 @@ mod tests {
             vec![Command::Select(SelectOp::Set(vec![EntryId(0)]))]
         );
         assert_eq!(app.playlist().selected_ids(), vec![EntryId(0)]);
+    }
+
+    #[test]
+    fn a_right_click_selects_the_row_and_asks_for_its_menu() {
+        // S03 §5 measures a right click on a playlist entry: it opens the
+        // playlist's context menu for that entry. The menu is S04's (blocked
+        // on S04), so the click's own part is what is pinned here — one
+        // `Command::Select` from the ordinary selection path, the row
+        // selected, the request recorded exactly once, and no row drag left
+        // armed for the release.
+        let mut app = test_app();
+        add_entries(&mut app, 6);
+        let commands = app
+            .playlist_right_mouse_down(60, 54)
+            .expect("the right press applies");
+        assert_eq!(
+            commands,
+            vec![Command::Select(SelectOp::Set(vec![EntryId(2)]))]
+        );
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(2)]);
+        assert_eq!(
+            app.take_pending_playlist_context(),
+            Some(PlaylistContextRequest {
+                row: 2,
+                entry: EntryId(2),
+            })
+        );
+        // Taken once: the next tick has nothing to take.
+        assert_eq!(app.take_pending_playlist_context(), None);
+        // The right press armed no drag: a release over another row would
+        // otherwise move the selection there.
+        assert!(app.playlist_mouse_up(60, 74).unwrap().is_empty());
+        assert_eq!(app.entry_ids, (0..6).map(EntryId).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_right_click_on_an_already_selected_row_keeps_the_selection() {
+        // The menu acts on the **selection**, and the selection rule is the
+        // one the left click already has: a press on a row that is part of the
+        // selection changes nothing (a plain click on a selected row behaves
+        // the same way), so the right click adds no command and only records
+        // the request.
+        let mut app = test_app();
+        add_entries(&mut app, 6);
+        app.playlist_mouse_down(60, 28, Modifiers::NONE)
+            .expect("the first click selects row 0");
+        app.playlist_mouse_down(60, 54, Modifiers::CTRL)
+            .expect("the ctrl click adds row 2");
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(0), EntryId(2)]);
+        let commands = app
+            .playlist_right_mouse_down(60, 54)
+            .expect("the right press applies");
+        assert!(commands.is_empty(), "{commands:?}");
+        assert_eq!(app.playlist().selected_ids(), vec![EntryId(0), EntryId(2)]);
+        assert_eq!(
+            app.take_pending_playlist_context(),
+            Some(PlaylistContextRequest {
+                row: 2,
+                entry: EntryId(2),
+            })
+        );
+    }
+
+    #[test]
+    fn a_right_click_on_no_entry_selects_nothing_and_asks_nothing() {
+        // The empty space below the last entry holds no entry for a menu to
+        // act on: no selection change, no command and no request. The same
+        // holds for the title bar, the bottom bar and a shaded editor.
+        let mut app = test_app();
+        add_entries(&mut app, 2);
+        // The row bands below the two entries, the title strip and the bottom
+        // bar: none of them names an entry.
+        for (x, y) in [(60, 92), (254, 3), (24, 92)] {
+            assert!(
+                app.playlist_right_mouse_down(x, y).unwrap().is_empty(),
+                "({x}, {y})"
+            );
+            assert_eq!(app.take_pending_playlist_context(), None, "({x}, {y})");
+        }
+        assert!(app.playlist().selected_ids().is_empty());
+        // A shaded editor is one title strip and has no list at all.
+        app.submit(Command::ToggleWindowShade(WindowId::Playlist))
+            .expect("the editor shades");
+        assert!(app.playlist_shaded());
+        assert!(app.playlist_right_mouse_down(60, 3).unwrap().is_empty());
+        assert_eq!(app.take_pending_playlist_context(), None);
     }
 
     /// The selection gestures reach the model through the modifiers, and the

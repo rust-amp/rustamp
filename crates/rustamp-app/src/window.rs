@@ -98,7 +98,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
-use crate::app::App;
+use crate::app::{App, WindowDirty};
+use crate::clipboard::Clipboard;
 use crate::cursor::{CursorAction, SkinCursors, cursor_action};
 use crate::double_click::DoubleClick;
 
@@ -476,6 +477,15 @@ fn apply_first_start_scale(app: &mut App, snapshot: Option<&DisplaySnapshot>) {
 
 struct Windowed {
     app: App,
+    /// The windows whose pixels changed since the last frame was presented
+    /// (see [`WindowDirty`]): the tick paints only the windows in it, so a
+    /// tick with no change draws nothing. The 16 ms tick stays the upper bound
+    /// the clock-driven content needs.
+    dirty: WindowDirty,
+    /// The clipboard read behind `Ctrl`+`V` in a dialog's entry field (see
+    /// [`crate::clipboard`]): the text is read on a worker thread and typed
+    /// into the open field in [`Windowed::about_to_wait`].
+    clipboard: Clipboard,
     /// Removed before the owning HWND; native callbacks never borrow App.
     #[cfg(windows)]
     external_control: Option<crate::external_control::native::ExternalControl>,
@@ -603,6 +613,8 @@ impl Windowed {
         let cursors = SkinCursors::new(app.skin_generation());
         Self {
             app,
+            dirty: WindowDirty::ALL,
+            clipboard: Clipboard::new(),
             #[cfg(windows)]
             external_control: None,
             #[cfg(windows)]
@@ -1248,39 +1260,48 @@ impl Windowed {
         self.request_redraw_eq();
     }
 
-    fn request_redraw(&self) {
+    fn request_redraw(&mut self) {
+        // A request is made where a frame changes (input, focus, a window
+        // that opened): it is the presenter's own half of the paint gate.
+        self.dirty.main = true;
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
 
-    fn request_redraw_eq(&self) {
+    fn request_redraw_eq(&mut self) {
+        self.dirty.equalizer = true;
         if let Some(window) = &self.eq_window {
             window.request_redraw();
         }
     }
 
-    fn request_playlist_redraw(&self) {
+    fn request_playlist_redraw(&mut self) {
+        self.dirty.playlist = true;
         if let Some(window) = &self.playlist_window {
             window.request_redraw();
         }
     }
 
-    fn request_library_redraw(&self) {
+    fn request_library_redraw(&mut self) {
+        self.dirty.library = true;
         if let Some(window) = &self.library_window {
             window.request_redraw();
         }
     }
 
     fn paint(&mut self) {
+        // Nothing to present without an OS window: a closed window is not
+        // drawn (that used to be invisible work, since the gate only asks for
+        // a frame when one changed).
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
         let image = self.app.render();
         let (Some(width), Some(height)) = (
             NonZeroU32::new(image.width()),
             NonZeroU32::new(image.height()),
         ) else {
-            return;
-        };
-        let Some(surface) = self.surface.as_mut() else {
             return;
         };
         if surface.resize(width, height).is_err() {
@@ -1297,14 +1318,14 @@ impl Windowed {
 
     /// Blits the equalizer frame ([`App::render_eq`]) to its surface.
     fn paint_eq(&mut self) {
+        let Some(surface) = self.eq_surface.as_mut() else {
+            return;
+        };
         let image = self.app.render_eq();
         let (Some(width), Some(height)) = (
             NonZeroU32::new(image.width()),
             NonZeroU32::new(image.height()),
         ) else {
-            return;
-        };
-        let Some(surface) = self.eq_surface.as_mut() else {
             return;
         };
         if surface.resize(width, height).is_err() {
@@ -1320,14 +1341,14 @@ impl Windowed {
     }
 
     fn paint_playlist(&mut self) {
+        let Some(surface) = self.playlist_surface.as_mut() else {
+            return;
+        };
         let image = self.app.render_playlist();
         let (Some(width), Some(height)) = (
             NonZeroU32::new(image.width()),
             NonZeroU32::new(image.height()),
         ) else {
-            return;
-        };
-        let Some(surface) = self.playlist_surface.as_mut() else {
             return;
         };
         if surface.resize(width, height).is_err() {
@@ -1344,14 +1365,14 @@ impl Windowed {
 
     /// Blits the media library frame ([`App::render_library`]) to its surface.
     fn paint_library(&mut self) {
+        let Some(surface) = self.library_surface.as_mut() else {
+            return;
+        };
         let image = self.app.render_library();
         let (Some(width), Some(height)) = (
             NonZeroU32::new(image.width()),
             NonZeroU32::new(image.height()),
         ) else {
-            return;
-        };
-        let Some(surface) = self.library_surface.as_mut() else {
             return;
         };
         if surface.resize(width, height).is_err() {
@@ -2000,7 +2021,7 @@ impl Windowed {
         raw_handle(self.playlist_window.as_deref())
     }
 
-    /// Paints every open window with this tick's frame.
+    /// Paints the windows this tick changed with this tick's frame.
     ///
     /// The animated parts of the main window - the visualization (the "VU
     /// meter"), the marquee and the time display - are driven by the clock in
@@ -2019,15 +2040,34 @@ impl Windowed {
     /// tick paints directly and the animation runs whether or not the window
     /// is focused or in the foreground.
     ///
+    /// The frame is only drawn for a window whose pixels changed (see
+    /// [`WindowDirty`]): the app marks the windows its pump and events moved,
+    /// and the presenter marks its own input paths ([`Windowed::request_redraw`]
+    /// and its siblings). A window that is not marked keeps the frame it
+    /// already has, so an idle player draws nothing. The tick itself stays the
+    /// upper bound: the clock still marks the main window whenever its digits,
+    /// marquee or analyser moved, exactly as often as before.
+    ///
     /// `RedrawRequested` is still handled for repaints the OS itself asks for
     /// (an uncovered or resized window), and the input paths still request
     /// one so a press is reflected without waiting for the next tick.
     fn present_frames(&mut self) {
-        self.paint();
-        self.paint_eq();
-        self.paint_dialog();
-        self.paint_playlist();
-        self.paint_library();
+        if self.dirty.main {
+            self.paint();
+        }
+        if self.dirty.equalizer {
+            self.paint_eq();
+        }
+        if self.dirty.dialog {
+            self.paint_dialog();
+        }
+        if self.dirty.playlist {
+            self.paint_playlist();
+        }
+        if self.dirty.library {
+            self.paint_library();
+        }
+        self.dirty = WindowDirty::NONE;
     }
 
     /// Applies [`App::window_title`] to the main window when it changed.
@@ -2149,7 +2189,8 @@ impl Windowed {
         self.dialog_id == Some(id)
     }
 
-    fn request_dialog_redraw(&self) {
+    fn request_dialog_redraw(&mut self) {
+        self.dirty.dialog = true;
         if let Some(window) = &self.dialog_window {
             window.request_redraw();
         }
@@ -2217,6 +2258,20 @@ impl Windowed {
             return;
         };
         let modifiers = map_modifiers(self.modifiers);
+        // `Ctrl`+`V` pastes the clipboard into a dialog with an entry field
+        // (the open-location face and the other text dialogs). The clipboard
+        // is read on a worker thread (see [`crate::clipboard`]) and its text
+        // reaches the field in [`Windowed::about_to_wait`], through the same
+        // path a key press's text takes. The key is consumed here so it does
+        // not also run its global shortcut (`Ctrl`+`V` is "stop after
+        // current").
+        if key == Key::Letter(b'V')
+            && modifiers == Modifiers::CTRL
+            && self.app.dialog_accepts_text()
+        {
+            self.clipboard.request();
+            return;
+        }
         // Modified keys stay global (the same key-event path as the main
         // window); plain keys go to the dialog first.
         if modifiers != Modifiers::NONE && !dialog_owns_key(key, modifiers) {
@@ -2680,6 +2735,22 @@ impl Windowed {
                 self.restore_system_cursor();
                 self.app.playlist_mouse_leave();
                 self.playlist_click.clear();
+                self.request_playlist_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                // S03 §5: a right click on a playlist entry selects that
+                // entry and asks for the playlist's context menu. The app
+                // records the request (blocked on S04: the menu's rows and
+                // wording are S04's) and the tick in `about_to_wait` takes it
+                // once; a press that names no entry does nothing.
+                let (x, y) = self.playlist_cursor;
+                if let Err(error) = self.app.playlist_right_mouse_down(x, y) {
+                    eprintln!("rustamp: playlist right-click failed: {error}");
+                }
                 self.request_playlist_redraw();
             }
             WindowEvent::MouseInput {
@@ -3204,6 +3275,18 @@ impl ApplicationHandler for Windowed {
         self.submit_hotkeys(take_pending_hotkeys());
         #[cfg(windows)]
         self.drain_tray();
+        // A playlist right click already selected its row and recorded the
+        // request for the playlist's context menu (S03 §5). TODO(S04): the
+        // menu — its rows, wording and enabled states — is S04's and is not
+        // invented here; the request is taken once so it cannot leak into a
+        // later tick, and only the diagnostics see it until then.
+        if let Some(request) = self.app.take_pending_playlist_context() {
+            tracing::debug!(
+                row = request.row,
+                entry = request.entry.0,
+                "playlist context menu requested (blocked on S04)"
+            );
+        }
         // A `--no-audio` run has no device pulling on its own thread, so the
         // virtual clock is driven here, once per frame, exactly as
         // `run_headless` drives it headless. With a real device this is a
@@ -3212,6 +3295,22 @@ impl ApplicationHandler for Windowed {
         if let Err(error) = self.app.pump() {
             eprintln!("rustamp: pump failed: {error}");
         }
+        // The text the clipboard worker read for `Ctrl`+`V` (see
+        // [`crate::clipboard`]) reaches the open dialog's field through the
+        // same path a key press's text takes, so paste and typing cannot
+        // drift. An empty or unreadable clipboard leaves nothing to take — the
+        // press is a silent no-op — and a dialog that closed or lost its
+        // field in the meantime takes nothing either. Only a text that really
+        // landed marks the dialog's frame.
+        if let Some(text) = self.clipboard.take()
+            && self.app.dialog_text(&text)
+        {
+            self.dirty.dialog = true;
+        }
+        // The windows the app's commands, events and clock moved (see
+        // [`WindowDirty`]); the presenter's own marks came from input and
+        // window events. The app computes its half here, on this request.
+        self.dirty.merge(self.app.take_window_dirty());
         #[cfg(windows)]
         if let Some(control) = &self.external_control {
             control.publish(self.app.host_player_state());
@@ -3256,6 +3355,9 @@ impl ApplicationHandler for Windowed {
         self.drain_prefs();
         self.drain_library_folder_pick();
         self.drain_library_extract();
+        // The drains applied commands of their own (a picked file, a
+        // preference): their marks stay in the app's mask and reach the next
+        // tick's paint, which is the frame after the one just presented.
         // After every window has been synced, so a focus request for a window
         // that opened this frame finds its OS window.
         self.apply_focus_requests();
@@ -4897,6 +4999,81 @@ mod tests {
         );
         assert!(!presenter.app.focused, "focus was never touched");
         assert!(presenter.window.is_none(), "the test must stay headless");
+    }
+
+    /// The paint gate: a tick with nothing new draws nothing.
+    ///
+    /// What a headless test can pin is the mask the presenter paints from:
+    /// the tick still runs (the app's pump is unchanged), but no window is
+    /// marked, so `present_frames` draws no frame. That the blit itself is
+    /// skipped only a profile can show.
+    #[test]
+    fn a_tick_with_nothing_new_has_no_frame_to_present() {
+        let mut presenter = desktop_test_presenter(false);
+        // The first frame is new to every window.
+        assert!(
+            presenter.dirty.main,
+            "a fresh presenter paints its first frame"
+        );
+        presenter.dirty.merge(presenter.app.take_window_dirty());
+        presenter.present_frames();
+        assert_eq!(presenter.dirty, WindowDirty::NONE);
+        // Nothing at all happens: no track, stopped, no input, no scan.
+        presenter.app.pump().unwrap();
+        presenter.dirty.merge(presenter.app.take_window_dirty());
+        assert_eq!(
+            presenter.dirty,
+            WindowDirty::NONE,
+            "an idle tick has no frame to draw"
+        );
+    }
+
+    /// The clock still marks frames: the analyser ages from the clock alone,
+    /// in the same tick cadence as before the gate.
+    #[test]
+    fn the_clock_still_marks_the_main_window() {
+        use rustamp_core::event::Event;
+        use rustamp_core::vis::{VIS_SAMPLES, VisFrame};
+
+        let mut presenter = desktop_test_presenter(false);
+        presenter
+            .app
+            .ui_mut()
+            .handle_event(&Event::StateChanged(TransportState::Playing), 0);
+        let frame = VisFrame {
+            timestamp_us: 1,
+            waveform: [std::array::from_fn(|n| {
+                (std::f64::consts::TAU * 16.0 * n as f64 / VIS_SAMPLES as f64).sin() as f32
+            }); 2],
+            ..VisFrame::default()
+        };
+        presenter
+            .app
+            .ui_mut()
+            .push_vis_frame(&frame, 32_000, 0)
+            .expect("the analyser accepts a finite frame");
+        // The first report is discarded: the frame itself is the baseline.
+        let _ = presenter.app.take_window_dirty();
+        // Time passes with no input at all.
+        presenter.app.ui_mut().refresh(400);
+        assert!(
+            presenter.app.take_window_dirty().main,
+            "the aged analyser is a changed main-window frame"
+        );
+    }
+
+    /// A command is the user's own action and may change any frame, so it
+    /// marks every window rather than deciding which one it reaches.
+    #[test]
+    fn a_command_marks_the_windows_it_can_change() {
+        let mut presenter = desktop_test_presenter(false);
+        let _ = presenter.app.take_window_dirty();
+        presenter.app.submit(Command::SetVolume(40)).unwrap();
+        assert_eq!(
+            presenter.app.take_window_dirty(),
+            WindowDirty::ALL,
+            "a command marks every window it could have changed"
+        );
     }
 
     /// The taskbar defect: the shell lists top-level windows, so the player

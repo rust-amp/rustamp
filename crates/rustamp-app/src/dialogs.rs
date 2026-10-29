@@ -42,8 +42,12 @@
 //!   The field takes the OS text of each key press ([`App::dialog_text`]),
 //!   so a full path is typeable, and files dropped from the shell become
 //!   picks ([`App::dialog_drop_file`]); a long field shows its tail. There
-//!   is no OS picker and no clipboard paste (both would need a new Win32
-//!   binding). This is the target of the main window's Eject and the
+//!   is no OS picker. `Ctrl`+`V` **pastes** the clipboard: the text is read
+//!   on a worker thread ([`crate::clipboard`]) and typed into the field
+//!   through the same [`App::dialog_text`] path, so a copied path or URL
+//!   arrives with its case and punctuation; the model has no caret, so it
+//!   appends at the end of the field, and an empty clipboard is a silent
+//!   no-op. This is the target of the main window's Eject and the
 //!   playlist's ADD (BETA-03). Confirming adds the
 //!   picks (`Enter` submits the resulting [`Command::AddItems`] and closes
 //!   the dialog); with nothing to confirm the dialog stays open. The
@@ -1400,7 +1404,8 @@ pub fn prefs_node_for(page: PrefsPage) -> PrefsNode {
 
 /// The open-media file faces' last line: how to reach a file. Own wording
 /// (the reference dialog is an OS picker whose labels are unmeasured, S04
-/// open); paste is not offered because there is no clipboard binding.
+/// open); it names typing and dropping only — `Ctrl`+`V` paste works in the
+/// field (see [`crate::clipboard`]) but is not a label of this hint.
 pub(crate) const OPEN_MEDIA_HINT: &str = "Type a path or drop files, Enter adds.";
 
 /// The load-playlist dialog's last line: how to reach a file. Own wording
@@ -2227,5 +2232,89 @@ mod tests {
         }));
         assert!(app.engine().queue().is_empty());
         assert!(app.drain_notes().is_empty());
+    }
+
+    // ----- clipboard paste (Ctrl+V) in the entry fields -----
+
+    /// What the presenter does with the clipboard text on its next tick
+    /// (see [`crate::clipboard`] and `Windowed::about_to_wait`): ask for a
+    /// text only while the open dialog has a field, and type the result
+    /// through the **ordinary** text path ([`App::dialog_text`]) — the same
+    /// one a key press's OS text takes. There is no caret in the dialog
+    /// model, so this is an append; the Win32 read itself is not part of this
+    /// headless test.
+    fn paste(app: &mut App, clipboard: &str) -> bool {
+        app.dialog_accepts_text() && app.dialog_text(clipboard)
+    }
+
+    #[test]
+    fn a_pasted_url_lands_at_the_end_of_the_location_field() {
+        // A URL copied from a browser usually carries a line break; the field
+        // is one line, so the control characters are dropped and the URL
+        // arrives intact. The paste **appends** (the model has no caret), and
+        // the confirmed entry is the stream the URL names.
+        let mut app = test_app();
+        open_location_face(&mut app);
+        assert!(app.dialog_text("http://"));
+        let rest = "127.0.0.1/stream.mp3\r\n";
+        assert!(paste(&mut app, rest));
+        assert_eq!(app.media_text(), "http://127.0.0.1/stream.mp3");
+        assert!(app.drain_notes().is_empty());
+
+        assert!(app.dialog_key(Key::Enter, Modifiers::NONE));
+
+        assert!(!app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+        assert_eq!(
+            app.engine().queue(),
+            &[TrackSource::Url("http://127.0.0.1/stream.mp3".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_empty_clipboard_pastes_nothing() {
+        // A clipboard with no text (or none at all) is a **silent no-op**: no
+        // character reaches the field, no note is raised, no error box opens
+        // and the dialog stays as it was.
+        let mut app = test_app();
+        open_location_face(&mut app);
+        assert!(!paste(&mut app, ""));
+        // A clipboard that holds only line breaks carries no text either.
+        assert!(!paste(&mut app, "\r\n"));
+        assert_eq!(app.media_text(), "");
+        assert!(app.drain_notes().is_empty());
+        assert!(app.dialog_is_open(DialogKind::OpenMedia {
+            kind: OpenMediaKind::Location,
+            play: false,
+        }));
+    }
+
+    #[test]
+    fn a_paste_into_a_dialog_without_a_field_does_nothing() {
+        // Only a dialog with an entry field takes a paste: the About box, the
+        // skin browser and no dialog at all leave the text alone (and the
+        // presenter asks for the clipboard only when `dialog_accepts_text`).
+        let mut app = test_app();
+        assert!(!app.dialog_accepts_text());
+        assert!(!paste(&mut app, "http://127.0.0.1/stream.mp3"));
+        for dialog in [DialogKind::About, DialogKind::SkinBrowser] {
+            app.dialogs.open(dialog);
+            assert!(!app.dialog_accepts_text(), "{dialog:?}");
+            assert!(!paste(&mut app, "x"), "{dialog:?}");
+        }
+        assert!(app.drain_notes().is_empty());
+    }
+
+    #[test]
+    fn a_long_paste_is_clamped_to_the_field() {
+        // The field's own limit decides how much of a long paste it keeps;
+        // paste introduces no second limit.
+        let mut app = test_app();
+        open_location_face(&mut app);
+        let long = "x".repeat(rustamp_ui::MAX_MEDIA_LEN + 100);
+        assert!(paste(&mut app, &long));
+        assert_eq!(app.media_text().chars().count(), rustamp_ui::MAX_MEDIA_LEN);
     }
 }
