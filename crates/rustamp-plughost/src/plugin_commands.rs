@@ -150,6 +150,28 @@ pub fn set_now_playing(position: u32, title: &str, file: &str) -> String {
     format!("{}. {title} - Winamp", position + 1)
 }
 
+/// IPC id of the event that names the file that starts to play.
+#[cfg(windows)]
+const IPC_PLAYING_FILE: u32 = 3003;
+/// IPC id of the event that says something about the player changed.
+#[cfg(windows)]
+pub const IPC_CB_MISC: u32 = 603;
+/// What [`IPC_CB_MISC`] says when the title changed.
+#[cfg(windows)]
+const IPC_CB_MISC_TITLE: usize = 0;
+
+/// Makes `title` and `file` the current track of this process: plug-ins read it
+/// through the playlist IPCs and the window's title, and those that watch the
+/// player hear of it. Runs on the thread that owns `window`.
+#[cfg(windows)]
+pub fn announce_track(window: &crate::HostWindow, position: u32, title: &str, file: &str) {
+    let text = set_now_playing(position, title, file);
+    crate::fault::trace_event(&format!("now playing: {text}"));
+    window.set_title(&text);
+    window.notify_plugins(current_file_ansi(), IPC_PLAYING_FILE);
+    window.notify_plugins(IPC_CB_MISC_TITLE, IPC_CB_MISC);
+}
+
 fn current(index: usize) -> Option<NowPlaying> {
     let now = NOW_PLAYING.lock().ok().and_then(|slot| *slot)?;
     (now.position as usize == index).then_some(now)

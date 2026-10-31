@@ -39,6 +39,7 @@
 //! | `eq.state` | `App::with_registry` → `Engine::set_eq` | written |
 //! | `plugins.plugin_dir` | `App::plugin_dir` → `rustamp_prefs::scan` | written |
 //! | `plugins.disabled` | `App::set_plugin_enabled` → `rustamp_prefs::set_enabled` | written |
+//! | `plugins.dsp_module` | `App::install_plugin_dsp` → `dsp::classic_dsp_chain` (the module of the DSP library) | written when it is not 0 |
 //! | `playlist.shuffle` | `App::with_registry` → `Engine::set_shuffle` (S15) | written |
 //! | `playlist.repeat` | `App::with_registry` → `Engine::set_repeat` (S15) | written |
 //! | `audio.output` | — the backend comes from the command line | **preserved** |
@@ -170,6 +171,7 @@ const OWNED_PATHS: &[&[&str]] = &[
     &["playlist", "repeat"],
     &["plugins", "plugin_dir"],
     &["plugins", "disabled"],
+    &["plugins", "dsp_module"],
 ];
 
 /// Whether the app owns the setting at `path`.
@@ -415,7 +417,7 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
         for key in plugins.keys() {
             let reason = match key.as_str() {
                 // The plug-in pages edit and save these two.
-                "plugin_dir" | "disabled" => None,
+                "plugin_dir" | "disabled" | "dsp_module" => None,
                 "vis_plugin" => Some("visualization plugin loading is not supported yet"),
                 "vis_preset" => Some("visualization preset is not supported yet"),
                 _ => Some("unrecognized plugins setting"),
@@ -710,6 +712,12 @@ pub fn serialize_honest(
             ),
         );
     }
+    if config.plugins.dsp_module != 0 {
+        plugins.insert(
+            "dsp_module".into(),
+            toml::Value::Integer(i64::from(config.plugins.dsp_module)),
+        );
+    }
     if !plugins.is_empty() {
         root.insert("plugins".into(), toml::Value::Table(plugins));
     }
@@ -964,6 +972,7 @@ mod tests {
                 vis_plugin: Some("vis_milk2.dll".into()),
                 vis_preset: Some("preset_1.milk".into()),
                 disabled: vec!["bad.dll".into()],
+                dsp_module: 2,
             },
         }
     }

@@ -40,7 +40,10 @@ use crate::shm::{RingDirection, RingExpect, RingKind, RingRefuseReason};
 ///   instead of a postcard decode error.
 /// * `6`: adds [`Message::NowPlaying`], the track plug-ins read from the main
 ///   window.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// * `7`: adds [`Message::EmbedSkin`], the sheet the host's embed frames draw
+///   from, and [`Message::OutputClock`], what an output plug-in has played
+///   (RFC 0024).
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Wire form of [`VisFrame`] (flat vectors, `channel-major`: all samples of
 /// channel 0, then channel 1). Each vector has `VIS_CHANNELS * VIS_SAMPLES` values.
@@ -276,6 +279,24 @@ pub enum Message {
         title: String,
         /// The track's path or URL.
         file: String,
+    },
+    /// M: the skin's `gen.bmp` as pixels, for the embed frames plug-ins ask the
+    /// host for. The player decodes skins, the host only draws (RFC 0024). Empty
+    /// pixels: the skin has no such sheet, and the frames are plain windows.
+    EmbedSkin {
+        /// Width of the sheet in pixels.
+        width: u32,
+        /// Height of the sheet in pixels.
+        height: u32,
+        /// The pixels, 8-bit RGBA, top row first.
+        rgba: Vec<u8>,
+    },
+    /// H: what an output plug-in has played so far, by its own clock: the
+    /// player's clock for a device that buffers (RFC 0024). Never falls: the
+    /// plug-in's own count starting over does not take it back.
+    OutputClock {
+        /// Milliseconds played since the helper started.
+        played_ms: u64,
     },
 }
 

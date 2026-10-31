@@ -216,6 +216,8 @@ pub struct PluginsConfig {
     pub vis_preset: Option<String>,
     /// Plugin file names that must not be loaded.
     pub disabled: Vec<String>,
+    /// Which module of the active DSP library runs (S09 section 6.3).
+    pub dsp_module: u32,
 }
 
 #[cfg(test)]
@@ -330,6 +332,7 @@ mod tests {
                 vis_plugin: Some("vis_milk2.dll".into()),
                 vis_preset: Some("preset_1.milk".into()),
                 disabled: vec!["vis_x.dll".into(), "bad_dsp.dll".into()],
+                dsp_module: 1,
             },
         }
     }

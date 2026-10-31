@@ -30,10 +30,166 @@
 //! whenever one is installed.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
+use rustamp_audio::resident::DspResidentConfig;
 use rustamp_core::audio::{AudioSpec, DspStage};
-use rustamp_core::error::{ErrorInfo, Result};
+use rustamp_core::error::{Error, ErrorInfo, Result};
+use rustamp_ipc::Message;
+use rustamp_mediahost::control::{ControlSender, OutputClock};
+use rustamp_plugin_abi::PluginKind;
+use rustamp_proto::command::Command;
+
+/// What plays, for the plug-ins in helper processes: the player names it here,
+/// and whoever talks to a helper carries the news over.
+#[derive(Default)]
+pub struct NowPlaying {
+    generation: AtomicU64,
+    track: Mutex<Option<(u32, String, String)>>,
+}
+
+impl NowPlaying {
+    /// Names the current track; the same track again is no news.
+    pub fn publish(&self, position: u32, title: &str, file: &str) {
+        let Ok(mut track) = self.track.lock() else {
+            return;
+        };
+        if track
+            .as_ref()
+            .is_some_and(|now| now.0 == position && now.1 == title && now.2 == file)
+        {
+            return;
+        }
+        *track = Some((position, title.to_owned(), file.to_owned()));
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether a track has been named.
+    pub fn has_track(&self) -> bool {
+        self.generation.load(Ordering::Acquire) > 0
+    }
+
+    /// The message for a helper that last saw generation `seen`, if there is news.
+    pub(crate) fn message_since(&self, seen: &mut u64) -> Option<Message> {
+        let generation = self.generation.load(Ordering::Acquire);
+        if generation == *seen {
+            return None;
+        }
+        let track = self.track.lock().ok()?;
+        let (position, title, file) = track.as_ref()?;
+        *seen = generation;
+        Some(Message::NowPlaying {
+            position: *position,
+            title: title.clone(),
+            file: file.clone(),
+        })
+    }
+}
+
+/// What the player holds of a running helper besides its blocks.
+#[derive(Clone)]
+pub(crate) struct HelperLink {
+    #[cfg(not(test))]
+    sender: ControlSender,
+    #[cfg(test)]
+    sender: LinkEnd,
+    clock: Option<OutputClock>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum LinkEnd {
+    Helper(ControlSender),
+    Recording(std::sync::mpsc::Sender<Message>),
+}
+
+impl HelperLink {
+    fn new(sender: ControlSender, clock: OutputClock) -> Self {
+        HelperLink {
+            #[cfg(not(test))]
+            sender,
+            #[cfg(test)]
+            sender: LinkEnd::Helper(sender),
+            clock: Some(clock),
+        }
+    }
+
+    /// A link that records what is sent, for the tests of what goes out.
+    #[cfg(test)]
+    pub(crate) fn recording(sent: std::sync::mpsc::Sender<Message>) -> Self {
+        HelperLink {
+            sender: LinkEnd::Recording(sent),
+            clock: None,
+        }
+    }
+
+    /// Sends `message`; a helper that is gone is its stage's failure to report.
+    pub(crate) fn send(&self, message: Message) {
+        #[cfg(not(test))]
+        let _ = self.sender.send(message);
+        #[cfg(test)]
+        match &self.sender {
+            LinkEnd::Helper(sender) => {
+                let _ = sender.send(message);
+            }
+            LinkEnd::Recording(sent) => {
+                let _ = sent.send(message);
+            }
+        }
+    }
+
+    /// What the helper's output plug-in reports it has played.
+    pub(crate) fn played_ms(&self) -> Option<u64> {
+        self.clock.as_ref().and_then(OutputClock::played_ms)
+    }
+}
+
+/// Opens `config`'s chain in a helper and keeps a link to it. The same as
+/// [`DspResidentConfig::open`], which keeps none.
+#[cfg(windows)]
+pub(crate) fn open_helper(
+    config: &DspResidentConfig,
+    spec: AudioSpec,
+) -> Result<(Box<dyn DspStage>, HelperLink)> {
+    use rustamp_audio::resident::ProcessDspChain;
+    use rustamp_mediahost::control::Liveness;
+    use rustamp_mediahost::dsp::DspProcess;
+    use rustamp_proto::host::PcmSpecWire;
+
+    let channels = u8::try_from(spec.channels)
+        .map_err(|_| Error::Dsp(format!("{} channels cross no helper", spec.channels)))?;
+    let wire = PcmSpecWire {
+        sample_rate_hz: spec.sample_rate,
+        channels,
+    };
+    let process = DspProcess::spawn_with_args(
+        &config.helper,
+        &config.helper_args,
+        wire,
+        config.stages.clone(),
+        config.ring_frames,
+        Liveness::default(),
+    )
+    .map_err(|error| Error::Dsp(error.to_string()))?;
+    let link = HelperLink::new(process.control_sender(), process.output_clock());
+    let chain = ProcessDspChain::new(
+        process,
+        config.stages.clone(),
+        config.ring_frames,
+        config.block_timeout,
+    );
+    Ok((Box::new(chain), link))
+}
+
+/// There are no helpers without Windows.
+#[cfg(not(windows))]
+pub(crate) fn open_helper(
+    _config: &DspResidentConfig,
+    _spec: AudioSpec,
+) -> Result<(Box<dyn DspStage>, HelperLink)> {
+    Err(Error::Unsupported("helpers need Windows"))
+}
 
 /// The app's DSP chain: the stages the app installs in the engine, in order.
 ///
@@ -48,6 +204,16 @@ pub struct DspChain {
     /// They are the stages' own names ([`DspStage::name`]), so the app and
     /// the engine name a stage the same way.
     names: Vec<String>,
+    /// The classic plug-in of the chain, if it has one.
+    classic: Option<ClassicPlugin>,
+}
+
+/// A chain's classic DSP plug-in and how to reach its running helper.
+#[derive(Clone)]
+struct ClassicPlugin {
+    dll: PathBuf,
+    /// The helper of the newest stage, for as long as that stage lives.
+    running: Arc<Mutex<Weak<HelperLink>>>,
 }
 
 impl DspChain {
@@ -62,6 +228,28 @@ impl DspChain {
     ) -> Self {
         self.recipes.push(Arc::new(build));
         self
+    }
+
+    /// Opens the dialog of the plug-in `dll` in the helper that processes the
+    /// audio, when one is running for it. A dialog changes what the instance it
+    /// belongs to does, so this is the only instance whose dialog is heard.
+    pub fn configure_running(&self, dll: &Path) -> bool {
+        let Some(classic) = self.classic.as_ref().filter(|classic| classic.dll == dll) else {
+            return false;
+        };
+        let running = classic
+            .running
+            .lock()
+            .ok()
+            .and_then(|running| running.upgrade());
+        let Some(link) = running else {
+            return false;
+        };
+        link.send(Message::CommandToHost(Command::ConfigurePlugin {
+            plugin_id: 0,
+            kind: PluginKind::Dsp,
+        }));
+        true
     }
 
     /// Whether the chain has no stages.
@@ -85,8 +273,13 @@ impl DspChain {
 /// The classic DSP plug-in as a stage: it runs in a helper process, which starts
 /// when the first track is prepared, so a player that plays nothing runs none.
 struct ClassicDspStage {
-    config: rustamp_audio::resident::DspResidentConfig,
+    config: DspResidentConfig,
     chain: Option<Box<dyn DspStage>>,
+    /// Keeps the chain's [`ClassicPlugin::running`] alive for this stage.
+    link: Option<Arc<HelperLink>>,
+    running: Arc<Mutex<Weak<HelperLink>>>,
+    now_playing: Arc<NowPlaying>,
+    seen_track: u64,
 }
 
 impl DspStage for ClassicDspStage {
@@ -96,12 +289,23 @@ impl DspStage for ClassicDspStage {
 
     fn prepare(&mut self, spec: AudioSpec) -> Result<()> {
         if self.chain.is_none() {
-            self.chain = Some(self.config.open(spec)?);
+            let (chain, link) = open_helper(&self.config, spec)?;
+            let link = Arc::new(link);
+            if let Ok(mut running) = self.running.lock() {
+                *running = Arc::downgrade(&link);
+            }
+            self.chain = Some(chain);
+            self.link = Some(link);
         }
         self.chain.as_mut().expect("opened above").prepare(spec)
     }
 
     fn process(&mut self, buf: &mut [f32]) -> Result<()> {
+        if let Some(link) = &self.link
+            && let Some(message) = self.now_playing.message_since(&mut self.seen_track)
+        {
+            link.send(message);
+        }
         match &mut self.chain {
             Some(chain) => chain.process(buf),
             None => Ok(()),
@@ -121,19 +325,80 @@ impl DspStage for ClassicDspStage {
     }
 }
 
-/// The chain that runs the classic DSP plug-in `dll` through `helper`, the
-/// 32-bit plug-in host.
-pub fn classic_dsp_chain(helper: PathBuf, dll: &Path, approvals: &Path) -> DspChain {
-    let stage = rustamp_plughost::dsp_resident::stage(dll, approvals);
-    DspChain::default().with_stage(move || {
-        let config =
-            rustamp_audio::resident::DspResidentConfig::new(helper.clone(), vec![stage.clone()])
-                .with_helper_args(vec![rustamp_plughost::dsp_resident::MODE_ARG.to_owned()]);
+/// The chain that runs module `module` of the classic DSP plug-in `dll` through
+/// `helper`, the 32-bit plug-in host. `now_playing` is where the player names the
+/// track.
+pub fn classic_dsp_chain(
+    helper: PathBuf,
+    dll: &Path,
+    approvals: &Path,
+    module: u32,
+    now_playing: Arc<NowPlaying>,
+) -> DspChain {
+    let stage = rustamp_plughost::dsp_resident::stage(dll, approvals, module);
+    let running: Arc<Mutex<Weak<HelperLink>>> = Arc::default();
+    let recipe_running = Arc::clone(&running);
+    let mut chain = DspChain::default().with_stage(move || {
+        let config = DspResidentConfig::new(helper.clone(), vec![stage.clone()])
+            .with_helper_args(vec![rustamp_plughost::dsp_resident::MODE_ARG.to_owned()]);
         Box::new(ClassicDspStage {
             config,
             chain: None,
+            link: None,
+            running: Arc::clone(&recipe_running),
+            now_playing: Arc::clone(&now_playing),
+            seen_track: 0,
         })
-    })
+    });
+    chain.classic = Some(ClassicPlugin {
+        dll: dll.to_owned(),
+        running,
+    });
+    chain
+}
+
+/// Bounds the question what a library holds: a plug-in's `init` runs for it.
+#[cfg(windows)]
+const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The names of the modules of the DSP library `dll`, in the order of their
+/// indices, asked of the helper: the 64-bit player cannot map it. The seam for
+/// the preferences' module list.
+#[cfg(windows)]
+pub fn dsp_module_names(
+    helper: &Path,
+    dll: &Path,
+    approvals: &Path,
+) -> std::result::Result<Vec<String>, String> {
+    use rustamp_plughost::dsp_resident::modules_args;
+    let output = crate::plugin_input::ask_helper(helper, &modules_args(dll, approvals), ASK_WAIT)?;
+    Ok(output.lines().map(str::to_owned).collect())
+}
+
+/// Shows the dialog of module `module` of `dll` in a process of its own, for a
+/// plug-in that is not running: the plug-in reads what it saves when it next
+/// starts. Does not wait for the user.
+#[cfg(windows)]
+pub fn configure_in_own_process(
+    helper: &Path,
+    dll: &Path,
+    approvals: &Path,
+    module: u32,
+) -> std::result::Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let mut child = std::process::Command::new(helper)
+        .args(rustamp_plughost::dsp_resident::configure_args(
+            dll, approvals, module,
+        ))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .map_err(|error| format!("{}: {error}", helper.display()))?;
+    // Reaps the child when the user is done with the dialog.
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 /// A DSP stage the engine bypassed after it failed.
@@ -213,6 +478,64 @@ mod tests {
         });
         assert_eq!(bypass.stage, "dsp error: something else went wrong");
         assert_eq!(bypass.cause, "dsp error: something else went wrong");
+    }
+
+    #[test]
+    fn a_track_is_news_once_per_helper() {
+        let now = NowPlaying::default();
+        let mut seen = 0;
+        assert!(!now.has_track());
+        assert_eq!(now.message_since(&mut seen), None);
+        now.publish(1, "title", "file");
+        assert!(now.has_track());
+        assert!(matches!(
+            now.message_since(&mut seen),
+            Some(Message::NowPlaying { position: 1, .. })
+        ));
+        assert_eq!(now.message_since(&mut seen), None);
+        now.publish(1, "title", "file");
+        assert_eq!(now.message_since(&mut seen), None);
+        // A helper that starts later hears the current track.
+        let mut later = 0;
+        assert!(now.message_since(&mut later).is_some());
+    }
+
+    #[test]
+    fn a_chain_without_a_running_helper_has_no_dialog_to_open() {
+        let chain = classic_dsp_chain(
+            PathBuf::from("host.exe"),
+            Path::new(r"C:\dsp_x.dll"),
+            Path::new(r"C:\dsp_x.toml"),
+            0,
+            Arc::default(),
+        );
+        assert!(!chain.configure_running(Path::new(r"C:\dsp_x.dll")));
+        assert!(!chain.configure_running(Path::new(r"C:\dsp_y.dll")));
+        assert!(!DspChain::default().configure_running(Path::new(r"C:\dsp_x.dll")));
+    }
+
+    #[test]
+    fn the_dialog_opens_in_the_newest_live_helper_of_that_plugin() {
+        let (sent, heard) = std::sync::mpsc::channel();
+        let chain = classic_dsp_chain(
+            PathBuf::from("host.exe"),
+            Path::new(r"C:\dsp_x.dll"),
+            Path::new(r"C:\dsp_x.toml"),
+            0,
+            Arc::default(),
+        );
+        let link = Arc::new(HelperLink::recording(sent));
+        let classic = chain.classic.as_ref().unwrap();
+        *classic.running.lock().unwrap() = Arc::downgrade(&link);
+        assert!(chain.configure_running(Path::new(r"C:\dsp_x.dll")));
+        assert!(matches!(
+            heard.try_recv(),
+            Ok(Message::CommandToHost(Command::ConfigurePlugin { .. }))
+        ));
+        assert!(!chain.configure_running(Path::new(r"C:\dsp_y.dll")));
+        // The stage is gone: nothing to reach.
+        drop(link);
+        assert!(!chain.configure_running(Path::new(r"C:\dsp_x.dll")));
     }
 
     #[test]

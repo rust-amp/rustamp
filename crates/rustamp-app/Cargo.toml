@@ -26,6 +26,11 @@ rustamp-ui.workspace = true
 rustamp-vis.workspace = true
 rustamp-milkdrop.workspace = true
 rustamp-ipc.workspace = true
+# The wire types the media host speaks (`EmbedSkin`'s pixels arrive as
+# `rustamp-proto` types through the control channel); the app decodes the skin
+# sheet and hands it over, so it names the same wire form the host reads.
+rustamp-proto.workspace = true
+rustamp-mediahost.workspace = true
 rustamp-platform.workspace = true
 rustamp-prefs.workspace = true
 rustamp-plugin-abi.workspace = true

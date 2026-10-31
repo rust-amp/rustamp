@@ -137,14 +137,8 @@ fn main() {
     std::process::exit(run());
 }
 
-/// The events a player sends its plug-ins (the numbers of the headers in free
-/// plug-ins' sources).
-#[cfg(windows)]
-const IPC_PLAYING_FILE: u32 = 3003;
-#[cfg(windows)]
-const IPC_CB_MISC: u32 = 603;
-#[cfg(windows)]
-const IPC_CB_MISC_TITLE: usize = 0;
+/// What the misc event says when the volume or the status changed (the numbers
+/// of the headers in free plug-ins' sources).
 #[cfg(windows)]
 const IPC_CB_MISC_VOLUME: usize = 1;
 #[cfg(windows)]
@@ -155,6 +149,12 @@ fn run() -> i32 {
     {
         if std::env::args_os().any(|arg| arg == rustamp_plughost::dsp_resident::MODE_ARG) {
             return rustamp_plughost::dsp_resident::run();
+        }
+        if std::env::args_os().any(|arg| arg == rustamp_plughost::dsp_resident::MODULES_ARG) {
+            return rustamp_plughost::dsp_resident::print_modules();
+        }
+        if std::env::args_os().any(|arg| arg == rustamp_plughost::dsp_resident::CONFIGURE_ARG) {
+            return rustamp_plughost::dsp_resident::configure();
         }
         if std::env::args_os().any(|arg| arg == rustamp_plughost::input_resident::MODE_ARG) {
             return rustamp_plughost::input_resident::run();
@@ -350,10 +350,16 @@ fn apply_state(window: &HostWindow, registry: &mut PluginRegistry, state: &Playe
     let now = (state.transport, state.volume, state.balance);
     let last = LAST.lock().ok().and_then(|mut last| last.replace(now));
     if last.is_some_and(|last| last.0 != now.0) {
-        window.notify_plugins(IPC_CB_MISC_STATUS, IPC_CB_MISC);
+        window.notify_plugins(
+            IPC_CB_MISC_STATUS,
+            rustamp_plughost::plugin_commands::IPC_CB_MISC,
+        );
     }
     if last.is_some_and(|last| (last.1, last.2) != (now.1, now.2)) {
-        window.notify_plugins(IPC_CB_MISC_VOLUME, IPC_CB_MISC);
+        window.notify_plugins(
+            IPC_CB_MISC_VOLUME,
+            rustamp_plughost::plugin_commands::IPC_CB_MISC,
+        );
     }
     registry.set_vis_playback(match state.transport {
         TransportState::Playing => VisPlayback::Playing,
@@ -391,16 +397,17 @@ fn run_ui_loop(
                     title,
                     file,
                 }) => {
-                    let text =
-                        rustamp_plughost::plugin_commands::set_now_playing(position, &title, &file);
-                    rustamp_plughost::fault::trace_event(&format!("now playing: {text}"));
-                    window.set_title(&text);
-                    // A plug-in that watches the player hears of the new track.
-                    window.notify_plugins(
-                        rustamp_plughost::plugin_commands::current_file_ansi(),
-                        IPC_PLAYING_FILE,
+                    rustamp_plughost::plugin_commands::announce_track(
+                        window, position, &title, &file,
                     );
-                    window.notify_plugins(IPC_CB_MISC_TITLE, IPC_CB_MISC);
+                    budget -= 1;
+                }
+                Ok(ControlInbound::EmbedSkin {
+                    width,
+                    height,
+                    rgba,
+                }) => {
+                    rustamp_plughost::embed_frame::set_skin(width, height, rgba);
                     budget -= 1;
                 }
                 Ok(ControlInbound::Ping(token)) => {

@@ -2292,7 +2292,15 @@ unsafe fn load_vis_module(
     // name this plugin.
     let header_ptr = {
         let _scope = plugin_call_scope(&identity, "get header");
-        unsafe { get_header(host_hwnd) }
+        let header = unsafe { get_header(host_hwnd) };
+        // A library that refuses here may have looked at the system's version
+        // (`vis_nsfs`): it gets one more chance, told the version it was built
+        // for. See `crate::os_version`.
+        if header.is_null() && unsafe { crate::os_version::report_old_system(hinstance) } {
+            unsafe { get_header(host_hwnd) }
+        } else {
+            header
+        }
     };
     // SAFETY: the header lives in the mapped plugin's static data; the
     // plugin's `get_module` runs here on the UI thread (S09 §5.3 step 2).

@@ -1408,3 +1408,100 @@ fn a_dead_dsp_helper_wakes_a_write_that_waits_for_space() {
         "the death must be seen on the control channel: {error}"
     );
 }
+
+/// Records what the player tells it, and reports a clock.
+struct NotedChain {
+    titles: mpsc::Sender<String>,
+    played_ms: u64,
+}
+
+impl ResidentChain for NotedChain {
+    fn latency_frames(&self) -> u32 {
+        0
+    }
+
+    fn process(&mut self, _buf: &mut [f32]) -> Result<()> {
+        self.played_ms += 10;
+        Ok(())
+    }
+
+    fn reset(&mut self) {}
+
+    fn note(&mut self, message: &rustamp_ipc::Message) {
+        if let rustamp_ipc::Message::NowPlaying { title, .. } = message {
+            self.titles.send(title.clone()).unwrap();
+        }
+    }
+
+    fn played_ms(&mut self) -> Option<u64> {
+        Some(self.played_ms)
+    }
+}
+
+struct NotedResident(mpsc::Sender<String>);
+
+impl DspResident for NotedResident {
+    fn open(&self, _spec: PcmSpecWire, _stages: &[DspStageDesc]) -> Result<Box<dyn ResidentChain>> {
+        Ok(Box::new(NotedChain {
+            titles: self.0.clone(),
+            played_ms: 0,
+        }))
+    }
+}
+
+#[test]
+fn a_note_reaches_the_running_chain_and_its_clock_reaches_the_player() {
+    let (titles, heard) = mpsc::channel();
+    let (mut session, done) = start(NotedResident(titles));
+    let clock = session.output_clock();
+    let sender = session.control_sender();
+    // The pump reports its clock before it waits for input, and the chain has
+    // played nothing yet: the first report says zero.
+    let waited_from = std::time::Instant::now();
+    while clock.played_ms().is_none() {
+        assert!(
+            waited_from.elapsed() < STALL_WAIT,
+            "the first clock report never arrived"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(clock.played_ms(), Some(0), "the clock starts at zero");
+
+    // Idle: the note arrives without any block.
+    sender
+        .send(rustamp_ipc::Message::NowPlaying {
+            position: 1,
+            title: "the title".to_owned(),
+            file: "the file".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(heard.recv_timeout(STALL_WAIT).unwrap(), "the title");
+
+    // A block moves the clock, and the session is not disturbed by the report.
+    let block = vec![0.0; 256];
+    write_pcm(&mut session, &block, "the block");
+    // `DspSession::read` fills whole frames and answers the frames it filled,
+    // so the sample offset of the next read is the frames read so far times the
+    // channel count.
+    let channels = usize::from(SPEC.channels);
+    let frames_written = block.len() / channels;
+    let mut out = vec![0.0; block.len()];
+    let mut frames = 0;
+    while frames < frames_written {
+        let read = read_pcm(
+            &mut session,
+            &mut out[frames * channels..],
+            "the block back",
+        )
+        .unwrap();
+        assert!(read > 0, "a read that delivers no frame");
+        frames += read;
+    }
+    assert_eq!(frames, frames_written, "the whole block comes back");
+    let start = std::time::Instant::now();
+    while clock.played_ms().unwrap_or(0) < 10 {
+        assert!(start.elapsed() < STALL_WAIT, "the clock never arrived");
+        thread::sleep(Duration::from_millis(2));
+    }
+    finish(session, done);
+}

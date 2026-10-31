@@ -561,6 +561,8 @@ pub struct App {
     bypassed_dsp: Option<crate::dsp::BypassedDsp>,
     /// The output plug-in the engine plays through, by its device name.
     plugin_output_name: Option<String>,
+    /// What plays, for the plug-ins in helper processes of the audio path.
+    now_playing: Arc<crate::dsp::NowPlaying>,
     /// A change of output plug-in that waits for playback to stop.
     plugin_output_pending: bool,
     /// Whether the installed chain is one a caller of the app gave it.
@@ -886,6 +888,7 @@ impl App {
             location_refusal: None,
             dsp_chain: crate::dsp::DspChain::default(),
             plugin_output_name: None,
+            now_playing: Arc::default(),
             plugin_output_pending: false,
             caller_dsp_chain: false,
             plugin_dsp_installed: false,
@@ -1256,6 +1259,7 @@ impl App {
                 // The rest stays unpersisted (see `config::serialize_honest`).
                 plugin_dir: self.config.plugins.plugin_dir.clone(),
                 disabled: self.config.plugins.disabled.clone(),
+                dsp_module: self.config.plugins.dsp_module,
                 ..PluginsConfig::default()
             },
         }
@@ -2652,6 +2656,12 @@ impl App {
             return;
         };
         let (file, kind) = (entry.file.clone(), entry.kind);
+        #[cfg(windows)]
+        if kind == PluginKind::Dsp {
+            let dll = entry.path.clone();
+            self.configure_dsp(&dll);
+            return;
+        }
         let Some(plugin) = self.loaded_plugin_for_file(&file, kind) else {
             self.note(format!(
                 "{file} is not loaded in the plugin host (switch it on first), or the host                  reported several {kind:?} plug-ins and none of them names it"
@@ -2662,6 +2672,53 @@ impl App {
         if let Err(error) = self.submit(Command::ConfigurePlugin { plugin_id, kind }) {
             self.note(format!("preferences: {error}"));
         }
+    }
+
+    /// Opens a DSP plug-in's dialog where it is heard: in the helper that
+    /// processes the audio, or, while nothing plays, in a process of its own
+    /// whose plug-in saves for the next start.
+    #[cfg(windows)]
+    fn configure_dsp(&mut self, dll: &Path) {
+        if self.dsp_chain.configure_running(dll) {
+            return;
+        }
+        let Some(helper) = crate::supervise::find_plugin_host() else {
+            self.note(format!(
+                "{} cannot be configured: the plug-in host binary was not found",
+                dll.display()
+            ));
+            return;
+        };
+        let approvals = self.plugin_approvals_path();
+        let module = self.config.plugins.dsp_module;
+        if let Err(problem) = crate::dsp::configure_in_own_process(&helper, dll, &approvals, module)
+        {
+            self.note(format!("{} cannot be configured: {problem}", dll.display()));
+        }
+    }
+
+    /// Which module of the active DSP library runs.
+    pub fn dsp_module(&self) -> u32 {
+        self.config.plugins.dsp_module
+    }
+
+    /// Chooses which module of the active DSP library runs, and puts it in the
+    /// audio path. The caller saves the configuration, as for the plug-ins' off
+    /// list. A library without that module runs its first.
+    pub fn set_dsp_module(&mut self, module: u32) {
+        if self.config.plugins.dsp_module != module {
+            self.config.plugins.dsp_module = module;
+            self.install_plugin_dsp();
+        }
+    }
+
+    /// The names of the modules of the DSP library `dll`, in index order: what
+    /// [`App::set_dsp_module`] chooses from.
+    #[cfg(windows)]
+    pub fn dsp_module_names(&self, dll: &Path) -> std::result::Result<Vec<String>, String> {
+        let helper = crate::supervise::find_plugin_host()
+            .ok_or_else(|| "the plug-in host binary was not found".to_owned())?;
+        crate::dsp::dsp_module_names(&helper, dll, &self.plugin_approvals_path())
     }
 
     /// The plug-in the plugin host reported under this id, if any.
@@ -2703,7 +2760,15 @@ impl App {
                 .entry_name(index as usize)
                 .unwrap_or_else(|| file.clone());
             self.host.publish_now_playing(index, &title, &file);
+            self.now_playing.publish(index, &title, &file);
         }
+        let skin = self.skin.skin();
+        self.host.publish_embed_skin(self.skin_generation, || {
+            match skin.sheet(rustamp_skin::webamp::Sheet::Gen) {
+                Some(sheet) => (sheet.width(), sheet.height(), sheet.as_rgba().to_vec()),
+                None => (0, 0, Vec::new()),
+            }
+        });
         let state = self.host_player_state();
         self.host.publish(&state)
     }
@@ -3660,6 +3725,7 @@ impl App {
             helper,
             &dll,
             &self.plugin_approvals_path(),
+            Arc::clone(&self.now_playing),
         )))
     }
 
@@ -3742,7 +3808,13 @@ impl App {
             (Some(dll), Some(helper)) => {
                 let approvals = self.plugin_approvals_path();
                 self.plugin_dsp_installed = true;
-                self.dsp_chain = crate::dsp::classic_dsp_chain(helper, &dll, &approvals);
+                self.dsp_chain = crate::dsp::classic_dsp_chain(
+                    helper,
+                    &dll,
+                    &approvals,
+                    self.config.plugins.dsp_module,
+                    Arc::clone(&self.now_playing),
+                );
                 self.install_dsp_chain_now();
                 true
             }

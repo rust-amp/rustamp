@@ -62,6 +62,11 @@ pub const IPC_KNOWN_WITHOUT_ANSWER: [u32; 29] = [
     100, 103, 120, 129, 200, 202, 241, 243, 245, 246, 247, 248, 249, 280, 362, 364, 503, 606, 611,
     628, 631, 633, 635, 638, 639, 640, 3002, 3004, 3010,
 ];
+/// IPC id: a number of its own for the message a plug-in names with a string.
+/// Plug-ins compare it with what later reaches the window (`gen_thinger`,
+/// `gen_waveseek`), so two names must not get the same number, and the 2.95 answer
+/// of S10 (1) stays for the player's own window.
+pub const IPC_REGISTER_WINAMP_IPCMESSAGE: u32 = 65536;
 /// IPC ids of the playlist's strings (S10 §8.2): `index` in, a pointer out, null
 /// when the host does not know the entry (see [`crate::plugin_commands`]).
 pub const IPC_GETPLAYLISTFILE: u32 = 211;
@@ -677,6 +682,7 @@ pub fn ipc_answer(id: u32, wparam: usize) -> Option<usize> {
         IPC_GETPLAYLISTTITLE => crate::plugin_commands::title_ansi(wparam),
         IPC_GETPLAYLISTFILEW => crate::plugin_commands::file_wide(wparam),
         IPC_GET_API_SERVICE => service_manager() as usize,
+        IPC_REGISTER_WINAMP_IPCMESSAGE => registered_message(wparam)?,
         // With a state block as its parameter the request is the call itself
         // (S10 §13).
         IPC_GET_EMBEDIF if wparam != 0 => crate::embed_frame::embed_now(wparam),
@@ -699,6 +705,31 @@ pub fn ipc_answer(id: u32, wparam: usize) -> Option<usize> {
         }
         _ => return None,
     })
+}
+
+/// The system's number for the message named by the string at `name`: unique per
+/// name, the same for the same name.
+#[cfg(windows)]
+fn registered_message(name: usize) -> Option<usize> {
+    unsafe extern "system" {
+        fn IsBadStringPtrA(text: *const u8, max: usize) -> i32;
+        fn RegisterWindowMessageA(name: *const u8) -> u32;
+    }
+    const MAX_NAME_BYTES: usize = 4096;
+    let text = name as *const u8;
+    // SAFETY: the call only probes the memory; a message from elsewhere must not
+    // take the host down.
+    if text.is_null() || unsafe { IsBadStringPtrA(text, MAX_NAME_BYTES) } != 0 {
+        return None;
+    }
+    // SAFETY: probed above, up to its terminator.
+    let number = unsafe { RegisterWindowMessageA(text) };
+    (number != 0).then_some(number as usize)
+}
+
+#[cfg(not(windows))]
+fn registered_message(_name: usize) -> Option<usize> {
+    None
 }
 
 /// The offset of the service-manager member in a 5.x input module (S21 §6).
@@ -1033,7 +1064,7 @@ mod tests {
 
     #[test]
     fn the_ids_outside_the_start_up_set_are_left_to_the_surface() {
-        for id in [0, 104, 105, 3014, 3016, 3026, 335, 65536] {
+        for id in [0, 104, 105, 3014, 3016, 3026, 335] {
             assert_eq!(ipc_answer(id, 0), None, "{id}");
         }
         assert_ne!(ipc_answer(IPC_GET_API_SERVICE, 0), None);
@@ -1066,6 +1097,22 @@ mod tests {
             ipc_answer(IPC_GET_EMBEDIF, 0),
             Some(crate::embed_frame::embed_function())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_registered_message_has_a_number_per_name() {
+        let first = c"RustampTestMessageOne".as_ptr() as usize;
+        let second = c"RustampTestMessageTwo".as_ptr() as usize;
+        let one = ipc_answer(IPC_REGISTER_WINAMP_IPCMESSAGE, first).unwrap();
+        assert_ne!(one, 1);
+        assert_ne!(
+            one,
+            ipc_answer(IPC_REGISTER_WINAMP_IPCMESSAGE, second).unwrap()
+        );
+        assert_eq!(Some(one), ipc_answer(IPC_REGISTER_WINAMP_IPCMESSAGE, first));
+        // Not a string: the answer of an id nobody serves.
+        assert_eq!(ipc_answer(IPC_REGISTER_WINAMP_IPCMESSAGE, 0), None);
     }
 
     #[test]

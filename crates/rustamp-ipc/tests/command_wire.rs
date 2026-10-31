@@ -501,17 +501,18 @@ fn every_plugin_request_round_trips_for_every_plugin_kind() {
 }
 
 #[test]
-fn the_protocol_version_is_six() {
+fn the_protocol_version_is_seven() {
     // RFC 0005 took the protocol to 2; RFC 0006 appended its hosting messages
     // and took it to 3; RFC 0015's DspResetAck takes it to 4; RFC 0020's
-    // plug-in requests take it to 5, because a v4 peer would mis-decode the
-    // appended variants (the project rule is a clean Hello rejection rather
-    // than a decode error).
-    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 6);
+    // plug-in requests take it to 5, and the track the plug-ins read took it to
+    // 6; RFC 0024's EmbedSkin and OutputClock take it to 7, because a v6 peer
+    // would mis-decode the appended variants (the project rule is a clean Hello
+    // rejection rather than a decode error).
+    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 7);
     assert_eq!(
         rustamp_ipc::Message::hello(),
         rustamp_ipc::Message::Hello {
-            protocol_version: 6,
+            protocol_version: 7,
             pid: std::process::id(),
         }
     );
