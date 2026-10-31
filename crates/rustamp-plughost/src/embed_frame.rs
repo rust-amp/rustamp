@@ -67,9 +67,13 @@ unsafe extern "system" fn frame_proc(
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, GW_CHILD, GetClientRect, GetWindow, MoveWindow, WM_SIZE,
+        DefWindowProcW, GW_CHILD, GetClientRect, GetWindow, MoveWindow, WM_CREATE, WM_PARENTNOTIFY,
+        WM_SIZE,
     };
-    if message == WM_SIZE {
+    // A plug-in creates its window after the frame, at a size of its own: the
+    // birth of the child is the frame's first chance to fit it.
+    let child_born = message == WM_PARENTNOTIFY && (wparam.0 & 0xFFFF) as u32 == WM_CREATE;
+    if message == WM_SIZE || child_born {
         let mut client = RECT::default();
         // SAFETY: our own window, a writable rectangle.
         if unsafe { GetClientRect(window, &mut client) }.is_ok()
@@ -92,6 +96,7 @@ unsafe extern "system" fn frame_proc(
 #[cfg(windows)]
 unsafe extern "C" fn embed_window(state: *mut EmbedState) -> usize {
     use windows::Win32::Foundation::{HINSTANCE, RECT};
+    use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject, HBRUSH};
     use windows::Win32::UI::WindowsAndMessaging::{
         AdjustWindowRect, CW_USEDEFAULT, CreateWindowExW, RegisterClassW, WINDOW_EX_STYLE,
         WNDCLASSW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
@@ -110,6 +115,8 @@ unsafe extern "C" fn embed_window(state: *mut EmbedState) -> usize {
     let description = WNDCLASSW {
         lpfnWndProc: Some(frame_proc),
         hInstance: HINSTANCE(std::ptr::null_mut()),
+        // SAFETY: a stock object, which needs no release.
+        hbrBackground: HBRUSH(unsafe { GetStockObject(BLACK_BRUSH) }.0),
         lpszClassName: PCWSTR(class.as_ptr()),
         ..Default::default()
     };
