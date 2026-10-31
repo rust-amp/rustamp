@@ -30,28 +30,48 @@ following capabilities and verification still have limitations:
 
 | Works | Not yet |
 |---|---|
-| Main, equalizer and playlist windows, skins, shade and double-size; the spectrum analyser and oscilloscope (real PCM through analysis to pixels, covered by headless tests, not yet confirmed in a captured live window) | Native MilkDrop: `rustamp-milkdrop` is a skeleton; the projectM sources are vendored in `third_party/` but not wired in |
-| Playback, seeking, gapless, EQ, volume and balance | Winamp 5.x plug-ins: of the 11 extracted from the 5.66 installer, 10 load in the plug-in host. **The player starts MilkDrop 2.25c end to end in the test VM** (approve with `rustamp --approve-plugin`, start with Start/Stop plug-in; the player's own decoded audio feeds it; software renderer, fixed-function path). Not yet: a GPU run, a first-run flow that fetches or ships the MilkDrop data and presets, and the other classic plug-in kinds beyond start-up; see [docs/notes/real-plugin-survey.md](docs/notes/real-plugin-survey.md) |
-| Playlists: M3U, M3U8, PLS, XSPF; Add file / folder / URL (`Ctrl+L`) | Plug-ins are listed, switched on and off and configured (`Configure`) in Preferences → Plug-ins; the first real-world check of that path is the survey above |
-| Streaming over `http://` and `https://` with Winamp's status prefixes in the title (`[Connecting]`, `[Buffer: 42%]`) | Crossfade, the media library window, the Preferences pages (partly) |
-| Media library database, tag editing | Real-hardware audio verification, a clean-machine install test |
+| Main, equalizer and playlist windows, skins, shade and double-size; the spectrum analyser and oscilloscope | Real-hardware audio and GPU verification |
+| Playback, seeking, gapless, EQ, volume and balance, and a crossfade of 0 to 30 seconds | A clean-machine install test: CI builds the installer and audits its files, but it has not been installed on a fresh Windows |
+| Classic plug-ins in the separate 32-bit host: input, output, visualization, DSP and general purpose. The test VM runs real ones end to end, see [Classic plug-ins](#classic-plug-ins) | Winamp 5 plug-ins that need the Wasabi APIs (`dsp_sps` refuses the host's header version) |
+| MilkDrop: our own window on the `lactea` engine, and MilkDrop 2 inside the plug-in host | A GPU run of MilkDrop 2 (the test VM has no GPU) |
+| Playlists: M3U, M3U8, PLS, XSPF; Add file / folder / URL (`Ctrl+L`) | The remaining measured pixel differences (equalizer curve, paused peak mark, playlist thumb) |
+| Streaming over `http://` and `https://` with Winamp's status prefixes in the title (`[Connecting]`, `[Buffer: 42%]`) | |
+| Media library database, tag editing | |
+| Preferences: plug-in pages with an explicit switch-on and an Approve step, the output page with the player's own output, the visualization mode, snap distance, the skin folder and the plug-in folder | |
+
+## Classic plug-ins
+
+The player hosts Winamp 2.x plug-ins of every kind in a separate 32-bit helper
+process, so a plug-in that crashes cannot take the player down. The end-to-end
+tests in the test VM run these real plug-ins; the survey behind them and its
+measurements are in [docs/notes/real-plugin-survey.md](docs/notes/real-plugin-survey.md).
+
+- Input: `in_wave`, `in_flac`, `in_vorbis` (the Winamp 5.66 set) and `in_openmpt`.
+- Output: `out_wave` and `out_disk`; the first output plug-in switched on is the
+  player's device, and its own clock decides how much of a track counts as played.
+- Visualization: `vis_avs` (AVS 2.82), `vis_milk2` (MilkDrop 2.25c) and
+  `vis_chavs` (Cockos Happy AVS, the 2.91 fork with the newer EEL).
+- DSP: `dsp_optilab_core`; a library's second and later modules can be chosen.
+- General purpose plug-ins are loaded, answered and quit cleanly.
 
 The binaries are **unsigned**, so Windows SmartScreen may warn on first start.
-There is no installer and no auto-update: unzip and run.
+There is no auto-update. There are two packages: the portable zip, and a
+per-user installer that needs no administrator rights.
 
 ## Download
 
 Releases are built by CI from version tags and published on the
 [releases page](https://gitlab.com/rustamp/rustamp/-/releases). Each release has
-a portable zip and a `.sha256` file next to it:
+a portable zip and a per-user installer, each with a `.sha256` file next to it:
 
 ```powershell
-# verify, then unzip anywhere and run rustamp.exe
+# verify, then unzip anywhere and run rustamp.exe, or run the setup
 (Get-FileHash .\rustamp-1.2.0+*.zip -Algorithm SHA256).Hash
+(Get-FileHash .\rustamp-1.2.0+*-setup.exe -Algorithm SHA256).Hash
 Get-Content .\rustamp-1.2.0+*.zip.sha256
 ```
 
-The zip bundles the 64-bit player, its helper processes, the 32-bit plugin host,
+The zip and the installer bundle the 64-bit player, its helper processes, the 32-bit plugin host,
 the licenses and a quickstart (`QUICKSTART.md`). The C runtime is linked statically, so no Visual C++
 redistributable is needed.
 
@@ -90,10 +110,11 @@ rustup target add i686-pc-windows-msvc
 cargo build -p rustamp-plughost --target i686-pc-windows-msvc
 ```
 
-The portable release zip is built with the same command CI uses:
+The release packages are built with the same command CI uses. The installer
+needs NSIS 3.13 (`makensis` on `PATH` or in `MAKENSIS`):
 
 ```sh
-cargo xtask package --release --zip     # output in target/package/
+cargo xtask package --release --zip --installer   # output in target/package/
 ```
 
 ## Testing
