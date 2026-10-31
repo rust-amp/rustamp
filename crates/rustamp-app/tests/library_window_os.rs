@@ -14,13 +14,10 @@
 //! ([`rustamp_app::modern_shell::modern_window_attributes`]) and reads back
 //! the client size and the outer size.
 //!
-//! The outer size is the frame check, and it is the **opposite** of the
-//! classic windows' check: the classic windows are borderless, so their
-//! outer size equals their client size (`tests/eq_window.rs`), while the
-//! library is a modern window and carries the operating system's caption,
-//! so its outer size is larger than its client area. A library window
-//! without a caption would be a modern window that looks like a classic
-//! one — with the wrong buttons for a window that has no skinned title bar.
+//! The outer size is the frame check: the library draws the skin's title bar
+//! itself, like the classic windows, so it is borderless and its outer size
+//! equals its client size (`tests/eq_window.rs`). A system caption here would be
+//! a second title bar.
 //!
 //! The loop is built off the main thread on purpose: tests run on harness
 //! worker threads, so `EventLoop::new()` would panic. See
@@ -43,7 +40,7 @@ use rustamp_app::modern_shell::modern_window_attributes;
 /// Opens the real media library window and checks its client size.
 #[test]
 #[ignore = "VM-only: opens the media library window; run inside the headless test VM"]
-fn the_library_window_opens_with_its_client_size_and_a_native_frame() {
+fn the_library_window_opens_with_its_client_size_and_no_system_frame() {
     // The gate, before any window exists.
     rustamp_app::window::require_test_vm();
 
@@ -97,9 +94,9 @@ fn the_library_window_opens_with_its_client_size_and_a_native_frame() {
         "the client area must be the size the app draws in"
     );
     let (outer_width, outer_height) = seen_outer.lock().unwrap().expect("read the outer size");
-    assert!(
-        outer_width > LIBRARY_CLIENT_SIZE.0 && outer_height > LIBRARY_CLIENT_SIZE.1,
-        "the media library is a modern window: the native caption makes the outer \
-         size larger than the client area (outer {outer_width}x{outer_height})"
+    assert_eq!(
+        (outer_width, outer_height),
+        LIBRARY_CLIENT_SIZE,
+        "the media library draws its own skinned title bar, so the system adds none"
     );
 }
