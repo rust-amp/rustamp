@@ -190,6 +190,21 @@ fn the_player_starts_chavs_and_feeds_it_what_it_plays() {
     );
 }
 
+/// The same fork with the older syntax: its difference from the test above is
+/// the new EEL.
+#[test]
+#[ignore = "VM-only: runs the real player, the real plug-in host and CHAVS; run in the test VM"]
+fn the_player_starts_chavs_with_a_classic_preset() {
+    the_player_runs(
+        "chavs",
+        "vis_chavs.dll",
+        &[],
+        "AVS",
+        "vis-chavs-classic.png",
+        Some("t=t-0.05"),
+    );
+}
+
 /// A preset as AVS keeps it in `vis_avs.dat`: the list clears every frame and
 /// holds one SuperScope, whose per-frame code is `frame`. (The format is in the
 /// BSD-licensed AVS source, `r_list.cpp` and `r_sscope.cpp`.)

@@ -344,6 +344,82 @@ pub(crate) fn call_seek(module: *mut InModule, time_ms: c_int) -> Result<(), Inp
     Ok(())
 }
 
+/// The title and the length an input plug-in reads from a file (S09 §3.1 offset
+/// 0x2C), without playing it. Either can be missing.
+pub(crate) fn call_get_file_info(
+    module: *mut InModule,
+    path: &Path,
+) -> (Option<String>, Option<u64>) {
+    /// The size of the title buffer plug-ins assume.
+    const TITLE_BYTES: usize = 2048 * 2;
+    // SAFETY: the module pointer was verified non-null when the plugin was
+    // loaded.
+    let (get_file_info, version) = unsafe { ((*module).get_file_info, (*module).version) };
+    let Some(get_file_info) = get_file_info else {
+        return (None, None);
+    };
+    let file = path_argument(version, path);
+    let mut title = vec![0u8; TITLE_BYTES];
+    let mut length: c_int = -1;
+    // SAFETY: a terminated path, a buffer of the size plug-ins assume, and a
+    // writable length, all alive for the call.
+    unsafe {
+        get_file_info(
+            file.as_ptr().cast::<c_char>(),
+            title.as_mut_ptr().cast::<c_char>(),
+            &mut length,
+        );
+    }
+    let text = if version & WIDE_PATH_FLAG == WIDE_PATH_FLAG {
+        let units: Vec<u16> = title
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|unit| u16::from_le_bytes(*unit))
+            .take_while(|unit| *unit != 0)
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        let end = title
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(title.len());
+        from_ansi(&title[..end])
+    };
+    let text = (!text.trim().is_empty()).then_some(text);
+    (text, u64::try_from(length).ok().filter(|ms| *ms > 0))
+}
+
+/// Text in the system's ANSI code page.
+#[cfg(windows)]
+pub(crate) fn from_ansi(bytes: &[u8]) -> String {
+    unsafe extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            text: *const u8,
+            text_len: i32,
+            wide: *mut u16,
+            wide_len: i32,
+        ) -> i32;
+    }
+    let Ok(len) = i32::try_from(bytes.len()) else {
+        return String::new();
+    };
+    if len == 0 {
+        return String::new();
+    }
+    let mut wide = vec![0u16; bytes.len()];
+    // SAFETY: both buffers are alive and their lengths are the ones passed.
+    let written = unsafe { MultiByteToWideChar(0, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), len) };
+    String::from_utf16_lossy(&wide[..usize::try_from(written).unwrap_or(0)])
+}
+
+#[cfg(not(windows))]
+pub(crate) fn from_ansi(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// `text` in the system's ANSI code page, NUL-terminated.
 pub(crate) fn ansi_text(text: &str) -> Vec<u8> {
     ansi_path(Path::new(text))

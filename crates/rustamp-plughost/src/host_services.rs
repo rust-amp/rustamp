@@ -53,6 +53,16 @@ pub const IPC_GET_EMBEDIF: u32 = 505;
 /// and "1", the answer for an unknown id, would be read as a string at address 1.
 /// `vis_avs` does, and tests for null.
 pub const IPC_GETSKIN: u32 = 201;
+/// IPC ids a plug-in asks of a real player, for which the host has nothing to give
+/// or do. "1", the answer for an id nobody knows, would be taken for a handle or a
+/// state (`gen_win7shell` asks for ratings, `gen_thinger` for a skin bitmap), so
+/// these answer 0. The list is what free plug-ins' sources ask for, by the numbers
+/// of their own headers, and `docs/spec-requests/2026-10-31-host-measurements.md`
+/// says where it comes from.
+pub const IPC_KNOWN_WITHOUT_ANSWER: [u32; 29] = [
+    100, 103, 120, 129, 200, 202, 241, 243, 245, 246, 247, 248, 249, 280, 362, 364, 503, 606, 611,
+    628, 631, 633, 635, 638, 639, 640, 3002, 3004, 3010,
+];
 /// IPC ids of the playlist's strings (S10 §8.2): `index` in, a pointer out, null
 /// when the host does not know the entry (see [`crate::plugin_commands`]).
 pub const IPC_GETPLAYLISTFILE: u32 = 211;
@@ -660,6 +670,9 @@ fn next_random() -> u32 {
 ///
 /// Only for requests sent by code inside this process: the caller decides.
 pub fn ipc_answer(id: u32, wparam: usize) -> Option<usize> {
+    if IPC_KNOWN_WITHOUT_ANSWER.contains(&id) {
+        return Some(0);
+    }
     Some(match id {
         IPC_GETSKIN => 0,
         IPC_GETPLAYLISTFILE => crate::plugin_commands::file_ansi(wparam),
@@ -1026,6 +1039,13 @@ mod tests {
             assert_eq!(ipc_answer(id, 0), None, "{id}");
         }
         assert_ne!(ipc_answer(IPC_GET_API_SERVICE, 0), None);
+    }
+
+    #[test]
+    fn an_id_a_real_player_knows_is_never_taken_for_unknown() {
+        for id in IPC_KNOWN_WITHOUT_ANSWER {
+            assert_eq!(ipc_answer(id, 0), Some(0), "{id}");
+        }
     }
 
     #[test]

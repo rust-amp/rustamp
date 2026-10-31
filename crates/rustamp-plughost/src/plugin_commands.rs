@@ -10,9 +10,11 @@
 //! (`WM_GETTEXT`, `vis_avs`'s Text effect) and from the playlist IPCs 211-214, so
 //! the player tells the host what plays ([`set_now_playing`]).
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use rustamp_proto::command::Command;
+use rustamp_proto::playlist::MediaLocation;
 
 use crate::commands::command_for_id;
 
@@ -52,6 +54,16 @@ pub fn note_key(virtual_key: u32) {
 /// carry out. `wparam` is the raw message parameter.
 pub fn note_ipc(ipc_id: u32, wparam: isize) {
     match ipc_id {
+        // A file for the playlist, as a string of the plug-in's.
+        100 => {
+            if let Some(path) = file_argument(wparam) {
+                push(Command::AddItems {
+                    items: vec![MediaLocation::File(PathBuf::from(path))],
+                    at: None,
+                    play: false,
+                });
+            }
+        }
         102 => push(Command::Play),
         106 => {
             if let Ok(to_ms) = u64::try_from(wparam) {
@@ -66,6 +78,30 @@ pub fn note_ipc(ipc_id: u32, wparam: isize) {
         }
         _ => {}
     }
+}
+
+/// The string a plug-in passed as a message parameter, if it is one. Only a
+/// plug-in in this process can hand a pointer that means anything, and a message
+/// from elsewhere must not take the host down.
+#[cfg(windows)]
+fn file_argument(wparam: isize) -> Option<String> {
+    unsafe extern "system" {
+        fn IsBadStringPtrA(text: *const u8, max: usize) -> i32;
+    }
+    const MAX_PATH_BYTES: usize = 4096;
+    let text = wparam as *const u8;
+    // SAFETY: the call only probes the memory.
+    if text.is_null() || unsafe { IsBadStringPtrA(text, MAX_PATH_BYTES) } != 0 {
+        return None;
+    }
+    // SAFETY: probed above, up to its terminator.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(text.cast()) }.to_bytes();
+    (!bytes.is_empty()).then(|| crate::input::from_ansi(bytes))
+}
+
+#[cfg(not(windows))]
+fn file_argument(_wparam: isize) -> Option<String> {
+    None
 }
 
 /// What the plug-ins asked for since the last call.
@@ -117,6 +153,15 @@ pub fn set_now_playing(position: u32, title: &str, file: &str) -> String {
 fn current(index: usize) -> Option<NowPlaying> {
     let now = NOW_PLAYING.lock().ok().and_then(|slot| *slot)?;
     (now.position as usize == index).then_some(now)
+}
+
+/// The current path in the form IPC 3003 hands it to plug-ins.
+pub fn current_file_ansi() -> usize {
+    NOW_PLAYING
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map_or(0, |now| now.file_ansi.as_ptr() as usize)
 }
 
 /// IPC 211, the path at `index`, or 0 when it is not the current track: the

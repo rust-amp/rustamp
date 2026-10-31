@@ -137,6 +137,19 @@ fn main() {
     std::process::exit(run());
 }
 
+/// The events a player sends its plug-ins (the numbers of the headers in free
+/// plug-ins' sources).
+#[cfg(windows)]
+const IPC_PLAYING_FILE: u32 = 3003;
+#[cfg(windows)]
+const IPC_CB_MISC: u32 = 603;
+#[cfg(windows)]
+const IPC_CB_MISC_TITLE: usize = 0;
+#[cfg(windows)]
+const IPC_CB_MISC_VOLUME: usize = 1;
+#[cfg(windows)]
+const IPC_CB_MISC_STATUS: usize = 2;
+
 fn run() -> i32 {
     #[cfg(windows)]
     {
@@ -332,6 +345,16 @@ fn apply_state(window: &HostWindow, registry: &mut PluginRegistry, state: &Playe
     window
         .apply_player_state(state)
         .expect("UI state updates do not reenter surface access");
+    // A plug-in that watches the player hears of what changed.
+    static LAST: std::sync::Mutex<Option<(TransportState, u8, i8)>> = std::sync::Mutex::new(None);
+    let now = (state.transport, state.volume, state.balance);
+    let last = LAST.lock().ok().and_then(|mut last| last.replace(now));
+    if last.is_some_and(|last| last.0 != now.0) {
+        window.notify_plugins(IPC_CB_MISC_STATUS, IPC_CB_MISC);
+    }
+    if last.is_some_and(|last| (last.1, last.2) != (now.1, now.2)) {
+        window.notify_plugins(IPC_CB_MISC_VOLUME, IPC_CB_MISC);
+    }
     registry.set_vis_playback(match state.transport {
         TransportState::Playing => VisPlayback::Playing,
         TransportState::Paused => VisPlayback::Paused,
@@ -372,6 +395,12 @@ fn run_ui_loop(
                         rustamp_plughost::plugin_commands::set_now_playing(position, &title, &file);
                     rustamp_plughost::fault::trace_event(&format!("now playing: {text}"));
                     window.set_title(&text);
+                    // A plug-in that watches the player hears of the new track.
+                    window.notify_plugins(
+                        rustamp_plughost::plugin_commands::current_file_ansi(),
+                        IPC_PLAYING_FILE,
+                    );
+                    window.notify_plugins(IPC_CB_MISC_TITLE, IPC_CB_MISC);
                     budget -= 1;
                 }
                 Ok(ControlInbound::Ping(token)) => {

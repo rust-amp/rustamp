@@ -208,6 +208,24 @@ impl HostWindow {
     pub const CLASS_NAME: &'static str = HOST_WINDOW_CLASS;
 
     /// Return the raw window handle without exposing the owned surface.
+    /// Sends the plug-ins an event, the way a player does: to its own main window,
+    /// where a plug-in that wants it has subclassed the procedure.
+    pub fn notify_plugins(&self, parameter: usize, ipc_id: u32) {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_USER};
+        // SAFETY: our own window, on its own thread. A plug-in that subclassed
+        // it sees the message first; the window itself has nothing to do.
+        unsafe {
+            SendMessageW(
+                HWND(self.hwnd_raw() as *mut _),
+                WM_USER,
+                Some(WPARAM(parameter)),
+                Some(LPARAM(ipc_id as isize)),
+            );
+        }
+    }
+
+    /// Sets the window's title, the track as `WM_GETTEXT` reads it.
     pub fn set_title(&self, title: &str) {
         use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
         use windows::core::PCWSTR;

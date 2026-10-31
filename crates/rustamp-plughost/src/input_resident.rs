@@ -15,8 +15,8 @@
 //! As in the DSP resident the main thread is the plug-in's UI thread, where it
 //! is loaded and where `play`, `seek` and `stop` run (S09 section 3.6).
 //!
-//! Own choices: a queue of about a second, a plug-in's position counted from
-//! what it wrote, and no tags: the player reads a file's tags itself.
+//! Own choices: a queue of about a second, and a plug-in's position counted from
+//! what it wrote. The title is what the plug-in says of the file.
 
 use std::path::PathBuf;
 
@@ -277,7 +277,7 @@ mod imp {
     enum Request {
         Play {
             path: PathBuf,
-            reply: Sender<std::result::Result<Option<u64>, String>>,
+            reply: Sender<std::result::Result<(Option<String>, Option<u64>), String>>,
         },
         Seek {
             to_ms: u64,
@@ -303,7 +303,7 @@ mod imp {
             self.requests
                 .send(Request::Play { path, reply })
                 .map_err(|_| gone())?;
-            let duration_ms = answer
+            let (title, duration_ms) = answer
                 .recv()
                 .map_err(|_| gone())?
                 .map_err(MediaHostError::OperationFailed)?;
@@ -335,7 +335,10 @@ mod imp {
                     },
                     duration_ms,
                     seekable: true,
-                    metadata: TrackMetadata::default(),
+                    metadata: TrackMetadata {
+                        title,
+                        ..TrackMetadata::default()
+                    },
                 },
                 requests: self.requests.clone(),
             }))
@@ -435,8 +438,10 @@ mod imp {
                         .input_play(&path)
                         .map_err(|error| format!("{error:?}"))?;
                     crate::fault::trace_event(&format!("play {} returned", path.display()));
+                    let (title, known) = plugin.input_file_info(&path).unwrap_or((None, None));
                     let length = plugin.input_length_ms().unwrap_or(-1);
-                    Ok(u64::try_from(length).ok().filter(|ms| *ms > 0))
+                    let length = u64::try_from(length).ok().filter(|ms| *ms > 0);
+                    Ok((title, length.or(known)))
                 })();
                 let _ = reply.send(result);
             }
