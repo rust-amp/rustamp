@@ -239,6 +239,9 @@ mod imp {
             // SAFETY: the plug-in's own callback; -1 asks for its default
             // buffer and prebuffer (S09 section 4.2).
             let latency = unsafe { open(rate, channels, 16, -1, -1) };
+            crate::fault::trace_event(&format!(
+                "output open {rate} Hz {channels} ch: latency {latency}"
+            ));
             if latency < 0 {
                 return Err(MediaHostError::OperationFailed(format!(
                     "the output plug-in refused {rate} Hz, {channels} channels"

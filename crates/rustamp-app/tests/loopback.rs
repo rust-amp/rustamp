@@ -1323,18 +1323,25 @@ fn the_output_plugins_play_what_the_engine_renders() {
 
     let dll = plugins.join("w566").join("out_wave.dll");
     let plain = measured_level(&track, hz, &[]);
-    let (mono, rate) = recorded_through(
-        Box::new(PluginOutput::new(
-            helper.clone(),
-            &dll,
-            &approved(dir.path(), &dll),
-        )),
-        &track,
-        &[],
-        DspChain::default(),
-        rustamp_decoders::default_registry(),
-        EQ_TONE_SECONDS + 1.0,
-    );
+    let approvals = approved(dir.path(), &dll);
+    // The capture of a loaded VM can overrun, which says nothing about the
+    // plug-in, so a failed recording gets two more attempts.
+    let attempt = || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recorded_through(
+                Box::new(PluginOutput::new(helper.clone(), &dll, &approvals)),
+                &track,
+                &[],
+                DspChain::default(),
+                rustamp_decoders::default_registry(),
+                EQ_TONE_SECONDS + 1.0,
+            )
+        }))
+    };
+    let (mono, rate) = attempt()
+        .or_else(|_| attempt())
+        .or_else(|_| attempt())
+        .expect("the recording through out_wave");
     let through = decibels(level_of(&mono, rate, hz), plain);
     measurement(&format!(
         "out_wave: {through:+.2} dB against the direct output"

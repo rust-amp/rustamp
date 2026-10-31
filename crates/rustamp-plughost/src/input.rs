@@ -193,7 +193,10 @@ pub(crate) fn call_play(module: *mut InModule, path: &Path) -> Result<(), InputE
     let Some(play) = (unsafe { (*module).play }) else {
         return Err(InputError::MissingCallback("play"));
     };
-    let bytes = ansi_path(path);
+    // SAFETY: the module pointer was verified non-null when the plugin was
+    // loaded.
+    let version = unsafe { (*module).version };
+    let bytes = path_argument(version, path);
     // SAFETY: cdecl, one ANSI path argument (S09 §3.1 offset 0x38), a
     // non-null slot, and a NUL-terminated buffer that is alive for the call.
     let code = unsafe { play(bytes.as_ptr().cast::<c_char>()) };
@@ -341,16 +344,127 @@ pub(crate) fn call_seek(module: *mut InModule, time_ms: c_int) -> Result<(), Inp
     Ok(())
 }
 
+/// The bits of an input module's version that say its calls take wide paths
+/// (S09 §3.2).
+const WIDE_PATH_FLAG: c_int = 0x0F00_0000;
+
+/// The path as this module's `play` reads it, terminated.
+fn path_argument(version: c_int, path: &Path) -> Vec<u8> {
+    if version & WIDE_PATH_FLAG == WIDE_PATH_FLAG {
+        let mut bytes = Vec::new();
+        for unit in wide_units(path) {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0]);
+        bytes
+    } else {
+        ansi_path(path)
+    }
+}
+
+#[cfg(windows)]
+fn wide_units(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().collect()
+}
+
+#[cfg(not(windows))]
+fn wide_units(path: &Path) -> Vec<u16> {
+    path.to_string_lossy().encode_utf16().collect()
+}
+
 /// The ANSI form of a path, NUL-terminated (S09 §1, §3.1 offset 0x38).
 ///
-/// The plugin ABI takes ANSI strings. On Windows the byte form of a path is
-/// what the `…A` calls take, so the path's own bytes are handed over
-/// unchanged and NUL-terminated. A path that is not representable in the
-/// system ANSI code page reaches the plugin as its UTF-8 bytes: S09 does not
-/// say what a 2.95 host does with such a path, and inventing a code-page
-/// conversion here would be a guess.
+/// The plugin ABI takes strings in the system's ANSI code page. A path that
+/// code page cannot spell (a Japanese file name on a German system) goes as its
+/// short 8.3 form, which is the same file in plain ASCII, when the volume has
+/// one.
+#[cfg(windows)]
+fn ansi_path(path: &Path) -> Vec<u8> {
+    unsafe extern "system" {
+        fn WideCharToMultiByte(
+            code_page: u32,
+            flags: u32,
+            wide: *const u16,
+            wide_len: i32,
+            out: *mut u8,
+            out_len: i32,
+            default_char: *const u8,
+            used_default: *mut i32,
+        ) -> i32;
+        fn GetShortPathNameW(long: *const u16, short: *mut u16, length: u32) -> u32;
+    }
+    const CP_ACP: u32 = 0;
+    let convert = |units: &[u16]| -> Option<(Vec<u8>, bool)> {
+        let len = i32::try_from(units.len()).ok()?;
+        let mut out = vec![0u8; units.len() * 2 + 1];
+        let mut lossy = 0;
+        // SAFETY: both buffers are alive and their lengths are the ones passed.
+        let written = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                units.as_ptr(),
+                len,
+                out.as_mut_ptr(),
+                out.len() as i32,
+                core::ptr::null(),
+                &mut lossy,
+            )
+        };
+        out.truncate(usize::try_from(written).ok()?);
+        Some((out, lossy != 0))
+    };
+    let units = wide_units(path);
+    let (mut bytes, lossy) = convert(&units).unwrap_or_default();
+    if lossy {
+        let mut long = units.clone();
+        long.push(0);
+        let mut short = vec![0u16; 1024];
+        // SAFETY: a terminated path and a buffer of the length passed.
+        let written =
+            unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), short.len() as u32) };
+        if written > 0 && (written as usize) < short.len() {
+            short.truncate(written as usize);
+            if let Some((converted, false)) = convert(&short) {
+                bytes = converted;
+            }
+        }
+    }
+    bytes.push(0);
+    bytes
+}
+
+#[cfg(not(windows))]
 fn ansi_path(path: &Path) -> Vec<u8> {
     let mut bytes = path.as_os_str().as_encoded_bytes().to_vec();
     bytes.push(0);
     bytes
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn a_wide_module_gets_a_wide_path_and_a_classic_one_ansi() {
+        let path = Path::new(r"C:.wav");
+        assert_eq!(
+            path_argument(0xFF00_0101_u32 as c_int, path),
+            b"C\0:\0\\\0a\0.\0w\0a\0v\0\0\0".as_slice()
+        );
+        assert_eq!(path_argument(0x100, path), b"C:\\a.wav\0".as_slice());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_classic_module_gets_umlauts_in_its_code_page_not_as_utf8() {
+        // Whatever the code page is, it spells `ü` in one byte or as a
+        // replacement, and never as the two UTF-8 bytes.
+        let bytes = ansi_path(Path::new("C:\\M\u{fc}sik.wav"));
+        assert!(
+            !bytes.windows(2).any(|pair| pair == [0xC3, 0xBC]),
+            "{bytes:?}"
+        );
+    }
 }
