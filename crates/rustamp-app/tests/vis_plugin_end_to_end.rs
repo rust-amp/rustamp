@@ -150,6 +150,24 @@ fn tail(path: &Path, lines: usize) -> String {
 #[test]
 #[ignore = "VM-only: runs the real player, the real plug-in host and MilkDrop; run in the test VM"]
 fn the_player_starts_milkdrop_and_feeds_it_what_it_plays() {
+    the_player_runs(
+        "vis_milk2.dll",
+        &["d3dx9_31.dll"],
+        "MilkDrop",
+        "vis-end-to-end.png",
+    );
+}
+
+#[test]
+#[ignore = "VM-only: runs the real player, the real plug-in host and AVS; run in the test VM"]
+fn the_player_starts_avs_and_feeds_it_what_it_plays() {
+    the_player_runs("vis_avs.dll", &[], "AVS", "vis-avs.png");
+}
+
+/// Starts `plugin` in the real player and waits for its `render`, then for a
+/// host window whose title holds `title_part`. `companions` are the DLLs it
+/// needs beside it, and `shot` names the screenshot.
+fn the_player_runs(plugin: &str, companions: &[&str], title_part: &str, shot: &str) {
     rustamp_app::window::require_test_vm();
     let out = PathBuf::from(r"C:\rustamp\out\gui-session");
     let _ = std::fs::create_dir_all(&out);
@@ -161,7 +179,7 @@ fn the_player_starts_milkdrop_and_feeds_it_what_it_plays() {
     let root = work.path();
     let plugins = root.join("Plugins");
     std::fs::create_dir_all(&plugins).unwrap();
-    for file in ["vis_milk2.dll", "d3dx9_31.dll"] {
+    for file in std::iter::once(&plugin).chain(companions) {
         std::fs::copy(staged.join("w566").join(file), plugins.join(file)).unwrap();
     }
     copy_tree(
@@ -190,7 +208,7 @@ fn the_player_starts_milkdrop_and_feeds_it_what_it_plays() {
     // ---- the operator's act: approve this exact image ----
     let approve = Command::new(env!("CARGO_BIN_EXE_rustamp"))
         .arg("--approve-plugin")
-        .arg(plugins.join("vis_milk2.dll"))
+        .arg(plugins.join(plugin))
         .env("RUSTAMP_CONFIG", &config)
         .output()
         .expect("run --approve-plugin");
@@ -257,7 +275,7 @@ fn the_player_starts_milkdrop_and_feeds_it_what_it_plays() {
             &mut report,
             &out,
             format!(
-                "MilkDrop's render was called: {rendering}; trace: {}",
+                "{plugin}'s render was called: {rendering}; trace: {}",
                 tail(&trace, 4)
             ),
         );
@@ -268,7 +286,7 @@ fn the_player_starts_milkdrop_and_feeds_it_what_it_plays() {
             10,
         );
         note(&mut report, &out, format!("host window title: {title:?}"));
-        let png = out.join("vis-end-to-end.png");
+        let png = out.join(shot);
         powershell(
             &format!(
                 "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
@@ -287,8 +305,8 @@ fn the_player_starts_milkdrop_and_feeds_it_what_it_plays() {
             tail(&trace, 8)
         );
         assert!(
-            title.contains("MilkDrop"),
-            "no MilkDrop window: {title:?}; player said: {}",
+            title.contains(title_part),
+            "no {title_part} window: {title:?}; player said: {}",
             tail(&stderr_path, 6)
         );
     }));

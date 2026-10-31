@@ -1348,3 +1348,95 @@ fn the_output_plugins_play_what_the_engine_renders() {
     ));
     assert!(through.abs() <= 3.0, "out_wave: {through:+.2} dB");
 }
+
+/// `out_disk` writes what the engine renders into a WAV file. It keeps to real
+/// time like every output (see `rustamp_app::plugin_output`).
+#[test]
+#[ignore = "VM-only: runs a real output plug-in"]
+fn out_disk_writes_what_the_engine_renders() {
+    use rustamp_app::plugin_output::PluginOutput;
+
+    rustamp_app::window::require_test_vm();
+    let dir = tempfile::tempdir().unwrap();
+    let track = dir.path().join("written tone.wav");
+    write_tone(&track, 1000.0, EQ_TONE_SECONDS);
+    let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
+    let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
+        .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
+    let dll = plugins.join("w566").join("out_disk.dll");
+    let started = std::time::SystemTime::now();
+    let approvals = approved(dir.path(), &dll);
+    {
+        let mut engine = Engine::new(
+            rustamp_decoders::default_registry(),
+            Box::new(PluginOutput::new(helper, &dll, &approvals)),
+            EventBus::new(),
+            EngineConfig::default(),
+        )
+        .expect("the output plug-in");
+        engine.set_queue(vec![TrackSource::path(track.clone())]);
+        engine.play_index(0).expect("playing through out_disk");
+        let start = Instant::now();
+        while engine.transport() != TransportState::Stopped {
+            engine.poll().expect("polling the engine");
+            assert!(start.elapsed() < DEADLINE, "the track never finished");
+            std::thread::sleep(PUMP_INTERVAL);
+        }
+    }
+    // The helper closes the file when it ends.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Where the plug-in writes is its own setting, so look where it can be.
+    fn newest_wav(
+        dir: &std::path::Path,
+        since: std::time::SystemTime,
+        depth: u32,
+        found: &mut Vec<PathBuf>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                if depth > 0 {
+                    newest_wav(&path, since, depth - 1, found);
+                }
+            } else if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+                && meta.modified().is_ok_and(|time| time >= since)
+                && path != track_path_guard(&path)
+            {
+                found.push(path);
+            }
+        }
+    }
+    fn track_path_guard(path: &std::path::Path) -> PathBuf {
+        if path
+            .file_name()
+            .is_some_and(|name| name == "written tone.wav")
+        {
+            path.to_path_buf()
+        } else {
+            PathBuf::new()
+        }
+    }
+    let mut found = Vec::new();
+    for root in [r"C:\", r"C:\rustamp", r"C:\Users\rustamp"] {
+        newest_wav(std::path::Path::new(root), started, 4, &mut found);
+    }
+    found.sort();
+    found.dedup();
+    measurement(&format!("out_disk wrote: {found:?}"));
+    let written = found.first().expect("out_disk wrote no file");
+    let bytes = std::fs::metadata(written).unwrap().len();
+    measurement(&format!("out_disk: {} is {bytes} bytes", written.display()));
+    // A second of 44.1 kHz stereo at 16 bits, give or take the pacing.
+    assert!(
+        bytes > 150_000,
+        "{} holds only {bytes} bytes",
+        written.display()
+    );
+}
