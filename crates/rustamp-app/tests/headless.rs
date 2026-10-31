@@ -374,10 +374,9 @@ fn an_unknown_slash_token_is_a_file_argument() {
 }
 
 #[test]
-fn an_added_path_is_added_and_not_played() {
-    // S13 §1: `/ADD <path>` enqueues the path instead of playing it — the
-    // `Enqueue` verb of §3, which the reference registers with the command
-    // line `"%s" /ADD "%%1"`.
+fn a_first_start_with_an_added_path_plays_it() {
+    // S13 §1: a first start with `/ADD <path>` appends the path and plays the
+    // list. Only a running instance adds without playing.
     let fixture = fixture();
     let dir = tempfile::tempdir().unwrap();
     let mut command = binary();
@@ -392,8 +391,8 @@ fn an_added_path_is_added_and_not_played() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
     assert!(
-        !stdout.contains("playing"),
-        "an added path must not start the playback:\n{stdout}"
+        stdout.contains("playing"),
+        "a first start with an added path plays:\n{stdout}"
     );
     assert!(
         stderr.contains(&fixture.display().to_string()),

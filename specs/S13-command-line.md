@@ -41,7 +41,7 @@ is treated as a file argument.
 | `/CLASS=` | `/CLASS=<name>` | the window class the single-instance check looks for (§2) |
 | `/CONFIG=` | `/CONFIG=<path>` | the configuration file to use instead of the default |
 | `/BOOKMARK` | `/BOOKMARK <path>` | adds the path as a bookmark rather than playing it |
-| `/ADD` | `/ADD <path>` | the `Enqueue` verb of §3: the reference registers that verb with the command line `"%s" /ADD "%%1"` — the program path, the switch, then the item's path. What the switch *does* is a **reading** of the name — "enqueue, do not play", the counterpart of `/BOOKMARK` |
+| `/ADD` | `/ADD <path>` | the `Enqueue` verb of §3: the reference registers that verb with the command line `"%s" /ADD "%%1"` — the program path, the switch, then the item's path. The path is appended to the list. A **running** instance only appends and nothing starts; a **first start** then plays the list from its first entry, so a list restored from the last session plays before the added path. No `winamp.ini` key was found to change this |
 | `/INSTALL` | flag | the installer association step — the shell registration of §3 |
 | `/UNREG` | flag | removal of the shell registration |
 | `/NOREG` | flag | skipping the registration step |

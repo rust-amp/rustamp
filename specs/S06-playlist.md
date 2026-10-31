@@ -95,10 +95,21 @@ activation behaviour, and carry no behavioural claim:
 
 | Behaviour | Evidence |
 |---|---|
-| Single posted click at (60,28) selects the first visible row | **2918 px**, bbox (12,23)-(254,93) (Verified by R2 step 26 vs step 25; reproduced three times: R2 step 26 and R3 `rem_select_control` / `rem_posted_select`, each 2918 px vs fresh) |
-| SEL (second real click at (74,92)) selects all visible rows | click2-vs-click1 **12203 px**, bbox (12,23)-(254,93); after-vs-before **13591 px**; step 16 byte-identical to step 15 (Verified by R2 steps 14–16). "All" is a visual/blue-band inference consistent with the counts |
+| Single posted click at (60,28) selects the first visible row | **2918 px**, bbox (12,23)-(256,93) (Verified by R2 step 26 vs step 25; reproduced three times: R2 step 26 and R3 `rem_select_control` / `rem_posted_select`, each 2918 px vs fresh) |
+| SEL (second real click at (74,92)) selects all visible rows | click2-vs-click1 **12203 px**, bbox (12,23)-(256,93); after-vs-before **13591 px**; step 16 byte-identical to step 15 (Verified by R2 steps 14–16). "All" is a visual/blue-band inference consistent with the counts |
 
-- Selection highlight colour (0,0,198), one row band at x ≈ 12–254,
+- **List-band right edge: the band is (12,23)-(256,93)**, half-open — columns
+  12–255, rows 23–92, 244 x 70 px. The bounding boxes in the table above read
+  (12,23)-(254,93) until 2026-10-31; that right edge was 2 px short and is
+  corrected here. Source: a pixel comparison of a `PrintWindow` capture of the
+  running 2.95 playlist window against Rustamp's render, together with posted
+  clicks at the row's edge (2026-10-31) — a **measurement**, not a reading and
+  not an inference. It found the selection colour `0000c6` at x = 254 and 255
+  of a selected row, where Rustamp had drawn its background, and clicks at 253,
+  254 and 255 all select the row while clicks at 11 and 256 do not (x = 256 is
+  the side rail's art). The whole-window counts recorded above (2918, 12203,
+  13591 px) are unchanged by this correction.
+- Selection highlight colour (0,0,198), one row band at x ≈ 12–255,
   y ≈ 23–34: **visual reading** (offline pixel scan of
   `026_pe_list_single_click.png` vs `025_pe_list_single_before.png`), stated as
   corroboration only.
@@ -165,11 +176,11 @@ frozen S01 states):
 ### 5.1 The removal
 
 - Real path: `004_rem_open_click2` differs from `003_rem_open_click1` by
-  **3475 px**, bounds (12,23)-(254,93) — the list band only. The post-click
+  **3475 px**, bounds (12,23)-(256,93) — the list band only. The post-click
   state (`007`) is byte-identical to it (SHA `0a4355ddaa862f65…` =
   recorded round-3b real-click removal `081_o5real_rem_click2_pe.png`).
 - Posted path: `011_rem_posted_click2` differs from `010_rem_posted_click1`
-  by **3475 px**, same bounds (12,23)-(254,93). `012` is byte-identical to
+  by **3475 px**, same bounds (12,23)-(256,93). `012` is byte-identical to
   `011` (SHA `6ac754b2c11acb06…` = frozen S01 grid removal
   `008_o5b_grid_x046_pe.png` from run 20261015-163106). Same bytes, same
   state: the posted pair removes standalone, outside the cumulative grid
@@ -265,7 +276,7 @@ auditor re-measured):
    loaded multi-entry list (order, stability, selection after sort,
    duplicates/dead handling) was never driven. Settle with a posted click on
    a menu item inside a captured popup plus before/after list captures.
-2. **Q5 — Double-click semantics.** S03 §5 claims the effect as **verified** (double-click a playlist entry → play that entry), based on resource-table and menu-label evidence. S06's pixel-count runs (R1: 4465 px via step 24 vs 23, R2: 3077 px via step 27 vs 26, bbox (12,23)-(254,93) list band only) differ unexplainedly and could not establish the playback action from counts alone; the auditor cross-check (`027` vs `025` = 364 px, bounds (12,25)-(68,70)) is consistent with the double clearing the single-click highlight back near baseline, but whether a double click plays, edits or opens file info is not established from counts alone. The row-level claims are OCR-uncertain. Following the evidence hierarchy, S03's resource-table-verified claim governs; S06 should cite S03 §5 for the double-click plays behaviour. What would overturn S03's verdict: a sandbox run that measures IPC playback state (`IPC_ISPLAYING`) in conjunction with the double-click.
+2. **Q5 — Double-click semantics.** S03 §5 claims the effect as **verified** (double-click a playlist entry → play that entry), based on resource-table and menu-label evidence. S06's pixel-count runs (R1: 4465 px via step 24 vs 23, R2: 3077 px via step 27 vs 26, bbox (12,23)-(256,93) list band only) differ unexplainedly and could not establish the playback action from counts alone; the auditor cross-check (`027` vs `025` = 364 px, bounds (12,25)-(68,70)) is consistent with the double clearing the single-click highlight back near baseline, but whether a double click plays, edits or opens file info is not established from counts alone. The row-level claims are OCR-uncertain. Following the evidence hierarchy, S03's resource-table-verified claim governs; S06 should cite S03 §5 for the double-click plays behaviour. What would overturn S03's verdict: a sandbox run that measures IPC playback state (`IPC_ISPLAYING`) in conjunction with the double-click.
 3. **Q6 — Drag semantics.** **Provisional, not settled.** Both drags (R1 step
    25, R2 step 28: 4932 px, bbox (6,4)-(271,93)) include the title band, so
    the capture mixes activation/focus with the drag effect — an

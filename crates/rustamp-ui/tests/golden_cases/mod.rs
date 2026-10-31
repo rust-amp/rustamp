@@ -22,14 +22,23 @@ pub const SKIN_LOOKALIKE: &str = rustamp_testkit::SKIN_LOOKALIKE;
 /// Namespace for the built-in default Rust theme skin.
 pub const SKIN_RUST_THEME: &str = "rust-theme";
 
-/// Loads the classic look-alike skin via its memory source.
+/// The face all golden text is drawn in: a golden must not depend on the host's
+/// fonts or on its smoothing setting. The real GDI text has its own tests in
+/// `rustamp-platform` and in the library tests of this crate.
+const GOLDEN_FACE: &[u8] = include_bytes!("Tuffy.ttf");
+
+/// Loads the classic look-alike skin via its memory source. Every case starts
+/// from a skin, so this is also where the golden face is set.
 pub fn lookalike_skin() -> Skin {
+    rustamp_ui::draw_all_text_in(GOLDEN_FACE);
     let mut source = BuiltinLookalikeSkin::source();
     Skin::from_source(&mut source, &BuiltinLookalikeSkin).expect("the lookalike skin must load")
 }
 
-/// Loads the built-in default Rust-themed skin via its memory source.
+/// Loads the built-in default Rust-themed skin via its memory source. Every
+/// case starts from a skin, so this is also where the golden face is set.
 pub fn rust_theme_skin() -> Skin {
+    rustamp_ui::draw_all_text_in(GOLDEN_FACE);
     let mut source = BuiltinDefaultSkin::source();
     Skin::from_source(&mut source, &BuiltinDefaultSkin)
         .expect("the built-in default skin must load")

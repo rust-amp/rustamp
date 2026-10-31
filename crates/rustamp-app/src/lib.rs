@@ -213,7 +213,7 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // ----- what the command line asks for -----
     // `/BOOKMARK <path>` bookmarks the path and does not play it (S13 §1); the
-    // store opens with the configuration, below. `/ADD <path>` enqueues a path.
+    // store opens with the configuration, below. `/ADD <path>` adds a path.
     let mut added: Vec<MediaLocation> = Vec::new();
     if let Some(cli::Bookmark::WithoutPath) = &args.bookmark {
         eprintln!(
@@ -221,9 +221,8 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     // The enqueued media (S13 §1): `/ADD <path>` names its own media and
-    // `--enqueue` names the media argument. The media is **added** to the
-    // playlist and not played — the `Enqueue` shell verb is registered with
-    // `/ADD`, so the verb and the switch ask for the same thing.
+    // `--enqueue` names the media argument. Either is **added** to the
+    // playlist, behind what the session restored.
     let enqueued = match &args.enqueue {
         cli::Enqueue::None => None,
         cli::Enqueue::Argument => args.media.clone(),
@@ -238,12 +237,20 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(location) = &enqueued {
         added.push(location.clone());
         eprintln!(
-            "rustamp: {} was added to the playlist instead of being played",
+            "rustamp: {} was added to the playlist",
             location.to_display_string()
         );
     }
-    // The media plays unless it is the one that is only added.
-    let plays = args.media.is_some() && !matches!(args.enqueue, cli::Enqueue::Argument);
+    // A start with a file on its command line plays, and `/ADD` is no exception
+    // (S13 §1): the list plays from its current entry, which on a start is the
+    // first, so a restored list plays before the added path. Only Rustamp's own
+    // `--enqueue` stays silent. A running instance only appends (see
+    // `cli::forward_request`).
+    let plays = match args.enqueue {
+        cli::Enqueue::Argument => false,
+        cli::Enqueue::Location(_) => true,
+        cli::Enqueue::None | cli::Enqueue::WithoutPath => args.media.is_some(),
+    };
 
     // ----- configuration -----
     // `/CONFIG=` replaces the default path (S13 §1).
@@ -368,7 +375,7 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
         OutputChoice::Null => {
             println!("rustamp: output null (headless; no window)");
             // The headless loop plays the queue to its end. When the command
-            // line only asked for an item to be added (`--enqueue`, `/ADD`,
+            // line only asked for an item to be added (`--enqueue`,
             // `/BOOKMARK`), nothing plays and the loop would wait forever.
             let only_added = (!added.is_empty() || args.bookmark.is_some()) && !plays;
             apply_startup(&mut app, plays, added)?;

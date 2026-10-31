@@ -299,6 +299,9 @@ fn lacks(face: &FontArc, ch: char) -> bool {
 /// The fallback face that has the most of `text`, stopping at the first that
 /// has all of it, with the number of characters it lacks.
 fn best_fallback(text: &str) -> Option<(FontArc, usize)> {
+    if ONLY_FACE.get().is_some() {
+        return None;
+    }
     let mut fonts = fonts().lock().ok()?;
     let mut best: Option<(FontArc, usize)> = None;
     for (index, family) in FALLBACK_FAMILIES.iter().enumerate() {
@@ -369,6 +372,9 @@ fn face_for_char(chosen: &FontArc, ch: char) -> (FontArc, bool) {
 /// installed" *not determined*; falling back to a real font instead of
 /// drawing nothing is this implementation's own choice.
 fn font(request: SystemFont<'_>) -> Option<FontArc> {
+    if let Some(face) = ONLY_FACE.get() {
+        return Some(face.clone());
+    }
     let mut fonts = fonts().lock().ok()?;
     let key = FaceKey {
         family: request.family.to_string(),
@@ -411,6 +417,29 @@ fn font(request: SystemFont<'_>) -> Option<FontArc> {
     font
 }
 
+/// The face set by [`draw_all_text_in`].
+static ONLY_FACE: OnceLock<FontArc> = OnceLock::new();
+
+/// Draws all text of this process in the font file `bytes`, from its outlines,
+/// for the rest of its life. Neither GDI nor an installed font is asked again.
+///
+/// GDI smooths with the user's own setting and the installed fonts are the
+/// host's, so their pixels differ between machines. A picture compared against
+/// a committed golden needs neither. The player never calls this.
+///
+/// # Panics
+///
+/// When `bytes` is not a font file.
+pub fn draw_all_text_in(bytes: &'static [u8]) {
+    let face = FontArc::try_from_slice(bytes).expect("a font file");
+    let _ = ONLY_FACE.set(face);
+}
+
+/// Whether GDI draws the text.
+fn uses_gdi() -> bool {
+    ONLY_FACE.get().is_none()
+}
+
 /// The width of `text` in pixels, in the metrics [`render`] uses.
 ///
 /// The width is the sum of the glyph advances plus the kerning between them,
@@ -436,8 +465,13 @@ pub(crate) fn text_width_as_part_of(
     whole: &str,
     text: &str,
 ) -> Option<u32> {
-    if let Some(width) =
-        rustamp_platform::gdi_text::text_width(gdi_font(request), FALLBACK_FAMILIES, whole, text)
+    if uses_gdi()
+        && let Some(width) = rustamp_platform::gdi_text::text_width(
+            gdi_font(request),
+            FALLBACK_FAMILIES,
+            whole,
+            text,
+        )
     {
         return Some(width);
     }
@@ -491,16 +525,18 @@ pub(crate) fn render_as_part_of(
 ) -> Option<Image> {
     // GDI where there is one (see `rustamp_platform::gdi_text`), the outlines
     // of the installed fonts elsewhere.
-    if let Some(rgba) = rustamp_platform::gdi_text::render_text(
-        gdi_font(request),
-        FALLBACK_FAMILIES,
-        whole,
-        text,
-        width,
-        height,
-        colour,
-        background,
-    ) {
+    if uses_gdi()
+        && let Some(rgba) = rustamp_platform::gdi_text::render_text(
+            gdi_font(request),
+            FALLBACK_FAMILIES,
+            whole,
+            text,
+            width,
+            height,
+            colour,
+            background,
+        )
+    {
         return Image::from_rgba(width, height, rgba).ok();
     }
     let primary = font(request)?;

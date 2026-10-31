@@ -61,7 +61,7 @@ pub const BUTTON_BAND_TOP: i32 = 92;
 pub const BUTTON_BAND_BOTTOM: i32 = 110;
 
 /// The list click that selects the first visible row (S06 §2, settled: a
-/// single posted click at (60,28) changes 2918 px, bbox (12,23)-(254,93)).
+/// single posted click at (60,28) changes 2918 px, bbox (12,23)-(256,93)).
 pub const LIST_SELECT_POINT: (i32, i32) = (60, 28);
 
 // Own-choice drag slop in playlist client pixels (S06 §8 Q6 is open).
@@ -1520,7 +1520,7 @@ impl PlaylistWindow {
     }
 
     /// SEL selects all visible rows (S06 §2, settled: click2-vs-click1 12203
-    /// px, bbox (12,23)-(254,93); "all" is a visual/blue-band inference
+    /// px, bbox (12,23)-(256,93); "all" is a visual/blue-band inference
     /// consistent with the counts).
     pub fn press_sel(&mut self) -> Command {
         let visible = self.visible_ids();
@@ -1718,7 +1718,7 @@ impl PlaylistWindow {
     }
 
     /// REM removes the selected entries (S06 §5, settled on both the real and
-    /// the posted path: 3475 px, same bounds (12,23)-(254,93)).
+    /// the posted path: 3475 px, same bounds (12,23)-(256,93)).
     ///
     /// The removal is a normal [`Command::Remove`]: no `#32768` window is
     /// present at capture time and no menu choice is required (S06 §5.2). With
@@ -2023,7 +2023,7 @@ mod tests {
         for leave in [
             None,
             Some((11, 50)),
-            Some((254, 50)),
+            Some((256, 50)),
             Some((60, 22)),
             Some((60, 93)),
         ] {
