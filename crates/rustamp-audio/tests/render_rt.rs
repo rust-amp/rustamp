@@ -11,7 +11,8 @@
 //! 1. A soak of several seconds of virtual audio through the engine's
 //!    [`RenderFn`] (the callback the device calls), after the decode thread has
 //!    gone idle. The decode thread is not touched: it allocates by design.
-//! 2. [`rustamp_audio::VisTap::push`], the other hot loop of the engine.
+//! 2. The same through a crossfade.
+//! 3. [`rustamp_audio::VisTap::push`], the other hot loop of the engine.
 
 mod common;
 
@@ -105,6 +106,29 @@ fn render_path_and_vis_tap_allocate_nothing() {
         }
     });
     assert_eq!(soak, 0, "the render path allocated {soak} times");
+
+    // --- a crossfade -----------------------------------------------------------
+    // The mix is the decode thread's: once the decode thread is idle, the
+    // callback plays an overlap like anything else that is in the ring.
+    let cfg = rustamp_audio::EngineConfig {
+        crossfade_ms: 20,
+        ..rustamp_audio::EngineConfig::default()
+    };
+    let mut fading = Harness::with_config(&["track1_3000.tst", "track2_3000.tst"], cfg);
+    fading.engine.play_index(0).unwrap();
+    assert!(fading.wait_buffered(), "stall: the queue was never written");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let through_the_fade = count_allocations(|| {
+        let mut frames = 0u64;
+        while frames < 8192 {
+            fading.clock.pump(1024);
+            frames += 1024;
+        }
+    });
+    assert_eq!(
+        through_the_fade, 0,
+        "the render path allocated {through_the_fade} times through a crossfade"
+    );
 
     // --- vis tap ------------------------------------------------------------
     let (mut tap, _consumer) = VisTap::new(4);

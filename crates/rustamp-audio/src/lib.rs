@@ -51,6 +51,7 @@
 #![warn(missing_docs)]
 
 pub mod convert;
+pub mod crossfade;
 pub mod decode;
 pub mod engine;
 pub mod fade_budget;

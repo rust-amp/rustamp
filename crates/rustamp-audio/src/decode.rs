@@ -42,6 +42,12 @@
 //! is the "stop after current track" mode (RFC 0005 O8): when it is armed the
 //! run ends at the end of the current track instead of opening the next entry.
 //!
+//! # Crossfade
+//!
+//! With a crossfade duration set, a seam overlaps instead of joining; see
+//! [`crate::crossfade`] for the mix point, the rules and why nothing of it runs
+//! with the duration at `0`.
+//!
 //! # Latency at the seams
 //!
 //! Two parts of the path hold audio back, and both are accounted for so that
@@ -143,9 +149,11 @@ use rustamp_core::state::StreamInfo;
 use rustamp_core::vis::VisFrame;
 use rustamp_decoders::http_source::DEFAULT_TIMEOUT;
 use rustamp_decoders::{HttpDecoder, HttpProgress};
+use rustamp_dsp::LimiterControl;
 use rustamp_playlist::PlaybackOrder;
 
 use crate::convert::FormatConverter;
+use crate::crossfade::Crossfade;
 use crate::replaygain::ReplayGainControl;
 use crate::ring::RingSync;
 use crate::vistap::VisTap;
@@ -290,6 +298,9 @@ pub(crate) enum DecodeMsg {
     /// Arm/disarm "stop after current track" (RFC 0005 O8): when armed, the run
     /// ends at the end of the current track instead of advancing.
     SetStopAfterCurrent(bool),
+    /// The crossfade duration changed, in milliseconds (see
+    /// [`crate::crossfade`]).
+    SetCrossfade(u32),
     /// The engine changed the playback modes (spec S15).
     ///
     /// The engine writes the modes into the shared model at once, so the
@@ -516,6 +527,12 @@ pub(crate) struct Config {
     /// boundaries. The engine owns the model and the worker follows it, so
     /// both traverse the same order.
     pub order: Arc<Mutex<PlaybackOrder>>,
+    /// The crossfade duration at the moment the run started; later changes
+    /// arrive as [`DecodeMsg::SetCrossfade`].
+    pub crossfade_ms: u32,
+    /// The limiter's switch, shared by the chain's limiter and the one on the
+    /// crossfade's sum.
+    pub limiter: Arc<LimiterControl>,
 }
 
 /// The decode thread of a run: its handle and the flag that says whether it
@@ -580,6 +597,7 @@ pub(crate) fn spawn(
     let (vis, vis_rx) = VisTap::new(cfg.vis_capacity);
     let stop_after_current = cfg.stop_after_current;
     let start_epoch = cfg.start_epoch;
+    let crossfade = Crossfade::new(cfg.device, cfg.crossfade_ms, Arc::clone(&cfg.limiter));
     let mut worker = Worker {
         cfg,
         ring,
@@ -608,6 +626,9 @@ pub(crate) fn spawn(
         drain_epoch: start_epoch,
         report_start: start_epoch.is_some(),
         stage_failed: false,
+        track_frames: None,
+        keep: 0,
+        crossfade,
     };
     // The modes live in the shared model; the worker remembers them only to
     // notice a change.
@@ -767,6 +788,13 @@ struct Worker {
     /// A DSP stage failure was already reported this run (RFC 0014 §4.2,
     /// first failure sticks): the worker is one run, so the flag is per run.
     stage_failed: bool,
+    /// The current track's length in device frames, if it states one.
+    track_frames: Option<u64>,
+    /// Frames the hold-back kept of the current track's last write; the
+    /// converter's flush at the end of the track keeps the same amount.
+    keep: usize,
+    /// What the crossfade holds back and mixes.
+    crossfade: Crossfade,
 }
 
 impl Worker {
@@ -786,10 +814,7 @@ impl Worker {
             }
             self.current_index = index;
             let Some(source) = self.queue_entry(index) else {
-                self.flush_converter();
-                let _ = self.tx.send(DecodeOut::EndOfStream {
-                    timeline_end: self.timeline,
-                });
+                self.end_stream();
                 break;
             };
             let mut decoder = match open_source(&self.cfg.registry, &source, index, &self.tx) {
@@ -813,18 +838,27 @@ impl Worker {
                     }
                     // The end of the list: what earlier entries wrote still
                     // plays out, and then the run ends the ordinary way.
-                    let _ = self.tx.send(DecodeOut::EndOfStream {
-                        timeline_end: self.timeline,
-                    });
+                    self.end_stream();
                     break;
                 }
             };
-            let continues = carry && self.conv.continues(decoder.spec(), self.cfg.device);
+            // A held-back tail needs the whole of its track, so a crossfade
+            // never continues the converter.
+            let idle = self.crossfade.is_idle();
+            let continues = carry && idle && self.conv.continues(decoder.spec(), self.cfg.device);
             if carry && !continues {
                 // A seam between two formats: the first stream ends here.
                 self.flush_converter();
             }
+            if !idle {
+                self.begin_fade(decoder.as_ref());
+            }
             let prepared = self.prepare_track(index, decoder.as_ref(), continues);
+            if !prepared {
+                // The track that was to take the tail over cannot play: the
+                // tail waits for the next one.
+                self.crossfade.abort_overlap();
+            }
             let start = start_at.take();
             let outcome = if prepared {
                 if let Some((frames, seq)) = start {
@@ -842,15 +876,17 @@ impl Worker {
             // A track that never prepared its stream has nothing for the next
             // one to continue.
             carry = prepared && outcome == Outcome::Ended;
+            if outcome != Outcome::Ended {
+                // A skip never crossfades: what was held of the abandoned
+                // track goes with it.
+                self.crossfade.clear();
+            }
             if outcome == Outcome::Ended && self.stop_after_current {
                 // "Stop after current track" (RFC 0005 O8): the run ends here
                 // instead of opening the next entry. Reporting the end of the
                 // stream is what lets the engine stop the transport and park the
                 // device, exactly as it does at the end of the queue.
-                self.flush_converter();
-                let _ = self.tx.send(DecodeOut::EndOfStream {
-                    timeline_end: self.timeline,
-                });
+                self.end_stream();
                 break;
             }
 
@@ -869,10 +905,7 @@ impl Worker {
                 Some(idx) => idx,
                 None => {
                     if matches!(outcome, Outcome::Ended | Outcome::SkipNext) {
-                        self.flush_converter();
-                        let _ = self.tx.send(DecodeOut::EndOfStream {
-                            timeline_end: self.timeline,
-                        });
+                        self.end_stream();
                         match self.wait_at_eos() {
                             Some(idx) => {
                                 carry = false;
@@ -887,6 +920,61 @@ impl Worker {
             };
             index = next_idx;
         }
+    }
+
+    /// The stream ends here: emit everything still held back and say where it
+    /// ended.
+    fn end_stream(&mut self) {
+        let busy = !self.crossfade.is_idle();
+        self.flush_converter();
+        if busy {
+            self.finish_overlap();
+            self.drain_held(0);
+            self.flush_sum_limiter();
+            // A skip that cut this short has nothing left to act on: the end
+            // of the stream is reported either way.
+            self.crossfade.clear();
+            self.pending_skip = None;
+        }
+        let _ = self.tx.send(DecodeOut::EndOfStream {
+            timeline_end: self.timeline,
+        });
+    }
+
+    /// Start the overlap of the held-back tail with the track `decoder` opened:
+    /// the part of the tail the fade does not cover plays first, at unity.
+    fn begin_fade(&mut self, decoder: &dyn Decoder) {
+        self.finish_overlap();
+        let incoming = decoder.duration().map(|d| self.device_frames(d));
+        let overlap = self.crossfade.overlap_frames(incoming);
+        self.drain_held(overlap);
+        self.crossfade.start_overlap();
+        if self.crossfade.hold_frames() == 0 {
+            // The setting was switched off: the sum limiter leaves the path at
+            // this seam.
+            self.flush_sum_limiter();
+        }
+    }
+
+    /// A track that ended before its overlap did leaves the rest of the
+    /// outgoing tail: it keeps fading, over silence.
+    fn finish_overlap(&mut self) {
+        let channels = usize::from(self.cfg.device.channels.max(1));
+        while self.crossfade.overlap_left() > 0 {
+            let n = self
+                .crossfade
+                .overlap_left()
+                .min(self.out_buf.len() / channels);
+            self.out_buf[..n * channels].fill(0.0);
+            if self.write_out(n) != n {
+                break;
+            }
+        }
+    }
+
+    /// `duration` in device frames.
+    fn device_frames(&self, duration: Duration) -> u64 {
+        (duration.as_secs_f64() * f64::from(self.cfg.device.sample_rate)).round() as u64
     }
 
     /// The shared play queue.
@@ -1034,7 +1122,7 @@ impl Worker {
                 self.report_error(&resample_unavailable_error());
                 return false;
             }
-            self.stream_base = self.timeline;
+            self.stream_base = self.timeline + self.crossfade.pending_frames();
         }
         self.vis.set_enabled(self.cfg.vis_enabled);
         self.vis.prepare(src);
@@ -1051,9 +1139,10 @@ impl Worker {
         // previous track's tail is still inside it, so this is ahead of
         // `timeline`.
         self.track_start = self.stream_pos();
-        let duration_frames = decoder
-            .duration()
-            .map(|d| (d.as_secs_f64() * f64::from(self.cfg.device.sample_rate)).round() as u64);
+        let duration_frames = decoder.duration().map(|d| self.device_frames(d));
+        self.track_frames = duration_frames;
+        // Nothing of this track is held back yet.
+        self.keep = 0;
         let _ = self.tx.send(DecodeOut::TrackStarted {
             index,
             src,
@@ -1246,7 +1335,7 @@ impl Worker {
         }
         self.vis.push(block);
         let out_frames = self.conv.convert(block, &mut self.out_buf);
-        let written = self.write_all(self.cfg.device.samples_for(out_frames));
+        let written = self.write_out(out_frames);
         if written == out_frames {
             Emit::Continue
         } else {
@@ -1275,11 +1364,104 @@ impl Worker {
     /// timeline position. Emits nothing when the rates are equal (the
     /// converter holds nothing back then).
     fn flush_converter(&mut self) {
+        // The flush resets the converter, and with it what `hold_now` reads, so
+        // the hold is taken from the last write of the track being flushed: at
+        // a seam the traversal has already moved on to the next entry, and
+        // `hold_now` would answer for that track's successor instead.
+        let keep = self.keep;
         let out_frames = self.conv.flush(&mut self.out_buf);
         if out_frames > 0 {
-            self.write_all(self.cfg.device.samples_for(out_frames));
+            self.write_out_keeping(out_frames, keep);
         }
-        self.stream_base = self.timeline;
+        self.stream_base = self.timeline + self.crossfade.pending_frames();
+    }
+
+    /// Hand the first `frames` frames of `out_buf` on: straight into the ring
+    /// with the crossfade off, else through the overlap and the hold-back.
+    /// Returns the frames accepted; fewer than `frames` when the track must be
+    /// abandoned.
+    fn write_out(&mut self, frames: usize) -> usize {
+        let keep = self.hold_now();
+        self.keep = keep;
+        self.write_out_keeping(frames, keep)
+    }
+
+    /// [`Worker::write_out`] with `keep` frames to keep back.
+    fn write_out_keeping(&mut self, frames: usize, keep: usize) -> usize {
+        let samples = self.cfg.device.samples_for(frames);
+        if self.crossfade.is_idle() {
+            return self.write_all(samples);
+        }
+        self.crossfade.mix(&mut self.out_buf[..samples]);
+        self.crossfade.hold(&self.out_buf[..samples]);
+        if self.drain_held(keep) { frames } else { 0 }
+    }
+
+    /// How many frames to keep back right now.
+    ///
+    /// Only the end of a track is held, so a change of the equalizer reaches
+    /// the ear after the ring's backlog everywhere else, and a track nothing
+    /// follows is not held at all: it plays to its end at unity. A track that
+    /// states no length (a stream) has no end to fade.
+    fn hold_now(&self) -> usize {
+        let hold = self.crossfade.hold_frames();
+        let Some(length) = self.track_frames else {
+            return 0;
+        };
+        let produced = self.stream_pos().saturating_sub(self.track_start);
+        if hold == 0
+            || produced + (hold as u64) < length
+            || self.stop_after_current
+            || !self.order().has_next()
+        {
+            return 0;
+        }
+        hold
+    }
+
+    /// Write what the hold-back holds beyond `keep` frames. `false` when the
+    /// track must be abandoned.
+    fn drain_held(&mut self, keep: usize) -> bool {
+        let block = self.out_buf.len() / usize::from(self.cfg.device.channels.max(1));
+        while self.crossfade.held_frames() > keep {
+            let n = (self.crossfade.held_frames() - keep).min(block);
+            self.crossfade.take_held(&mut self.out_buf, n);
+            if !self.write_limited(n) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Run the first `frames` frames of `out_buf` through the sum limiter and
+    /// write what comes out. `false` when the track must be abandoned.
+    fn write_limited(&mut self, frames: usize) -> bool {
+        let channels = usize::from(self.cfg.device.channels.max(1));
+        let samples = frames * channels;
+        let trimmed = self.crossfade.limit(&mut self.out_buf[..samples]);
+        self.out_buf.copy_within(trimmed * channels..samples, 0);
+        let left = frames - trimmed;
+        self.write_all(left * channels) == left
+    }
+
+    /// Take the sum limiter out of the path: push silence through it so that
+    /// what it holds back comes out.
+    fn flush_sum_limiter(&mut self) {
+        if !self.crossfade.limiter_live() {
+            return;
+        }
+        let channels = usize::from(self.cfg.device.channels.max(1));
+        let block = self.out_buf.len() / channels;
+        let mut left = self.crossfade.limiter_latency();
+        while left > 0 {
+            let n = left.min(block);
+            self.out_buf[..n * channels].fill(0.0);
+            if !self.write_limited(n) {
+                break;
+            }
+            left -= n;
+        }
+        self.crossfade.retire_limiter();
     }
 
     /// Write up to `samples` device-format samples from `out_buf` into the
@@ -1364,6 +1546,7 @@ impl Worker {
                 }
                 Ok(DecodeMsg::CurrentMoved(index)) => self.current_index = index,
                 Ok(DecodeMsg::SetStopAfterCurrent(armed)) => self.stop_after_current = armed,
+                Ok(DecodeMsg::SetCrossfade(ms)) => self.crossfade.set_ms(ms),
                 Ok(DecodeMsg::ModesChanged { shuffle, repeat }) => {
                     let (shuffle_changed, _) = self.sync_modes(shuffle, repeat);
                     if shuffle_changed && shuffle {
@@ -1452,6 +1635,7 @@ impl Worker {
                 Ok(DecodeMsg::SetStopAfterCurrent(armed)) => {
                     self.stop_after_current = armed;
                 }
+                Ok(DecodeMsg::SetCrossfade(ms)) => self.crossfade.set_ms(ms),
                 Ok(DecodeMsg::Seek { .. }) => {}
                 Err(_) => {
                     return None;
@@ -1501,8 +1685,10 @@ impl Worker {
                 self.dsp_trim = self.dsp_latency();
                 self.conv.reset();
                 self.vis.reset();
-                let frames =
-                    (reached.as_secs_f64() * f64::from(self.cfg.device.sample_rate)).round() as u64;
+                // A seek ends a running fade: the outgoing tail is dropped with
+                // the ring, and the track plays on at unity from the target.
+                self.crossfade.clear();
+                let frames = self.device_frames(reached);
                 self.timeline = self.track_start + frames;
                 self.stream_base = self.timeline;
                 // `written` first, the epoch second (A6 finding 2): the drain

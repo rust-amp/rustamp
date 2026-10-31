@@ -101,6 +101,18 @@ fn equal_power(from: f32, to: f32, t: f64) -> f32 {
     power.max(0.0).sqrt() as f32
 }
 
+/// The gains `(outgoing, incoming)` at the fraction `t` of a crossfade.
+///
+/// An equal-power pair: the squares add up to one at every `t`, so two
+/// uncorrelated signals keep their summed power across the fade. It is the
+/// quarter-circle pair and not the stage's `sqrt` ramp, whose start is infinitely
+/// steep: the incoming track's first frames rise from silence with a finite
+/// slope here. An own choice, like everything in this module.
+pub fn crossfade_gains(t: f64) -> (f32, f32) {
+    let angle = t.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2;
+    (angle.cos() as f32, angle.sin() as f32)
+}
+
 /// The requests of a [`Fade`] stage, shared with the owner of the playback.
 ///
 /// The owner publishes a request and the stage carries it out; the stage

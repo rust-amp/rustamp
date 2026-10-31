@@ -990,6 +990,142 @@ fn level_of(mono: &[f32], rate: u32, hz: f64) -> f64 {
     levels[levels.len() / 2]
 }
 
+// ----- a crossfade, measured on the cable -----
+
+/// Two tones in a row with a crossfade between them: both sound in the fade, the
+/// summed power stays where it was, and the run is shorter by the fade.
+#[test]
+#[ignore = "VM-only: needs the VB-Audio Virtual Cable; run inside the headless test VM"]
+fn the_cable_carries_a_crossfade() {
+    const TONE_SECONDS: f64 = 3.0;
+    const FADE_MS: u32 = 1000;
+    const WINDOW_SECONDS: f64 = 0.1;
+    const TOLERANCE_DB: f64 = 1.5;
+    const OUTGOING_HZ: f64 = 440.0;
+    const INCOMING_HZ: f64 = 1000.0;
+
+    rustamp_app::window::require_test_vm();
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.wav");
+    let second = dir.path().join("second.wav");
+    write_tone(&first, OUTGOING_HZ, TONE_SECONDS);
+    write_tone(&second, INCOMING_HZ, TONE_SECONDS);
+
+    let mut engine = Engine::new(
+        rustamp_decoders::default_registry(),
+        Box::new(CpalOutput::with_device_name(CABLE_MATCH)),
+        EventBus::new(),
+        EngineConfig {
+            crossfade_ms: FADE_MS,
+            ..EngineConfig::default()
+        },
+    )
+    .expect("the playback endpoint of the cable");
+    let granted = engine.device_spec();
+    let host = cpal::default_host();
+    let capture = find_input_device(&host, CABLE_MATCH);
+    let (config, format) = pick_capture_config(&capture, granted.sample_rate);
+    let rate = config.sample_rate;
+    let channels = usize::from(config.channels);
+    let recording = Arc::new(Mutex::new(Recording::default()));
+    let stream = start_capture(&capture, config, format, &recording);
+    let pre_roll = (f64::from(rate) * PRE_ROLL.as_secs_f64()) as usize;
+    let start = Instant::now();
+    while recorded_frames(&recording, channels) < pre_roll {
+        assert!(start.elapsed() < DEADLINE, "the capture is not running");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    let mark = recorded_frames(&recording, channels);
+
+    engine.set_queue(vec![TrackSource::path(first), TrackSource::path(second)]);
+    engine
+        .play_index(0)
+        .expect("starting playback on the cable");
+    let start = Instant::now();
+    while engine.transport() != TransportState::Stopped {
+        engine.poll().expect("polling the engine");
+        assert!(start.elapsed() < DEADLINE, "the two tones never finished");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    let heard = 2.0 * TONE_SECONDS - f64::from(FADE_MS) / 1000.0;
+    let wanted = mark + (f64::from(rate) * (heard + TAIL.as_secs_f64())) as usize;
+    let start = Instant::now();
+    while recorded_frames(&recording, channels) < wanted {
+        assert!(start.elapsed() < DEADLINE, "the capture stalled");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    drop(stream);
+
+    let recording = std::mem::take(&mut *recording.lock().expect("the capture lock"));
+    assert_eq!(recording.fatal_error, None, "the capture failed");
+    let mono: Vec<f32> = recording
+        .samples
+        .chunks_exact(channels)
+        .skip(mark)
+        .map(|frame| frame[0])
+        .collect();
+
+    // One level per window for each tone.
+    let window = (f64::from(rate) * WINDOW_SECONDS).round() as usize;
+    let levels: Vec<(f64, f64)> = mono
+        .chunks_exact(window)
+        .map(|chunk| {
+            (
+                tone_in_window(chunk, f64::from(rate), OUTGOING_HZ).0,
+                tone_in_window(chunk, f64::from(rate), INCOMING_HZ).0,
+            )
+        })
+        .collect();
+    let reference = levels.iter().fold(0.0f64, |peak, level| peak.max(level.0));
+    assert!(reference > 0.001, "no tone on the cable");
+    let sounding = |level: &(f64, f64)| level.0.max(level.1) > reference / 2.0;
+    let onset = levels.iter().position(sounding).expect("a tone starts");
+    let end = levels.iter().rposition(sounding).expect("a tone ends");
+    let length = (end - onset + 1) as f64 * WINDOW_SECONDS;
+
+    let report = levels[onset..=end]
+        .iter()
+        .enumerate()
+        .map(|(i, (a, b))| {
+            let power = (a * a + b * b).sqrt();
+            format!(
+                "{:.1} s: {OUTGOING_HZ} Hz {:+.2} dB, {INCOMING_HZ} Hz {:+.2} dB, sum {:+.2} dB",
+                i as f64 * WINDOW_SECONDS,
+                decibels(a.max(1e-9), reference),
+                decibels(b.max(1e-9), reference),
+                decibels(power, reference),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    measurement(&format!(
+        "crossfade: {length:.1} s of {heard:.1} s\n{report}"
+    ));
+
+    assert!(
+        (length - heard).abs() <= 2.0 * WINDOW_SECONDS,
+        "the run lasted {length:.1} s, the fade should leave {heard:.1} s:\n{report}"
+    );
+    // The windows whole inside the run: its first and last one straddle an edge.
+    for (a, b) in &levels[onset + 1..end] {
+        let sum = decibels((a * a + b * b).sqrt(), reference);
+        assert!(
+            sum.abs() <= TOLERANCE_DB,
+            "the summed level left its place by {sum:+.2} dB:\n{report}"
+        );
+    }
+    // In the middle of the fade both tones sound, each about 3 dB down.
+    let middle = onset + ((TONE_SECONDS - 0.5) / WINDOW_SECONDS).round() as usize;
+    let (a, b) = levels[middle];
+    for (name, level) in [("outgoing", a), ("incoming", b)] {
+        let db = decibels(level, reference);
+        assert!(
+            (db + 3.0).abs() <= TOLERANCE_DB,
+            "the {name} tone is at {db:+.2} dB in the middle of the fade:\n{report}"
+        );
+    }
+}
+
 /// Keeps a measured value where the VM run copies its results back from: a
 /// passing test's output is not shown.
 fn measurement(line: &str) {

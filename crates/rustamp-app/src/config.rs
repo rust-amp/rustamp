@@ -25,6 +25,7 @@
 //! | `audio.volume` | `App::with_registry` → `Engine::set_volume` | written |
 //! | `audio.balance` | `App::with_registry` → `Engine::set_balance` | written |
 //! | `audio.fadeout_ms` | `App::with_registry` → `EngineConfig::fade_ms` | written |
+//! | `audio.crossfade_ms` | `App::with_registry` → `EngineConfig::crossfade_ms` | written |
 //! | `audio.output_mode` | `output::create_output` (RFC 0019) | written |
 //! | `audio.device` | `output::create_output` → `selection::plan`/`resolve` | written |
 //! | `audio.replaygain` | `App::with_registry` → `Engine::set_replaygain_mode` | written |
@@ -155,6 +156,7 @@ const OWNED_PATHS: &[&[&str]] = &[
     &["audio", "volume"],
     &["audio", "balance"],
     &["audio", "fadeout_ms"],
+    &["audio", "crossfade_ms"],
     &["audio", "output_mode"],
     &["audio", "replaygain"],
     &["audio", "device"],
@@ -353,7 +355,7 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
                 "output" => Some("only the default audio backend is supported"),
                 "buffer_ms" => Some("the output buffer length is the device's own"),
                 "gapless" => Some("gapless mode is not configurable"),
-                "replaygain" | "fadeout_ms" => None,
+                "replaygain" | "fadeout_ms" | "crossfade_ms" => None,
                 "volume" | "balance" | "output_mode" | "device" => None,
                 _ => Some("unrecognized audio setting"),
             };
@@ -567,6 +569,11 @@ pub fn serialize_honest(
     audio.insert(
         "fadeout_ms".into(),
         toml::Value::Integer(i64::from(config.audio.fadeout_ms)),
+    );
+    // The crossfade duration: the engine runs it as well.
+    audio.insert(
+        "crossfade_ms".into(),
+        toml::Value::Integer(i64::from(config.audio.crossfade_ms)),
     );
     // Persist the request, not a device-specific downgrade. Like the native
     // preferences label says, a change takes effect at the next startup
@@ -885,6 +892,7 @@ mod tests {
                 output_mode: OutputMode::Exclusive,
                 buffer_ms: 350,
                 fadeout_ms: 800,
+                crossfade_ms: 2500,
                 gapless: false,
                 replaygain: ReplayGainMode::Album,
                 volume: 150,
@@ -998,6 +1006,10 @@ mod tests {
         );
         assert_ne!(c.audio.buffer_ms, d.audio.buffer_ms, "audio.buffer_ms");
         assert_ne!(c.audio.fadeout_ms, d.audio.fadeout_ms, "audio.fadeout_ms");
+        assert_ne!(
+            c.audio.crossfade_ms, d.audio.crossfade_ms,
+            "audio.crossfade_ms"
+        );
         assert_ne!(c.audio.gapless, d.audio.gapless, "audio.gapless");
         assert_ne!(c.audio.replaygain, d.audio.replaygain, "audio.replaygain");
         assert_ne!(c.audio.volume, d.audio.volume, "audio.volume");
@@ -1204,6 +1216,10 @@ mod tests {
             "audio.fadeout_ms"
         );
         assert_eq!(
+            loaded.config.audio.crossfade_ms, config.audio.crossfade_ms,
+            "audio.crossfade_ms"
+        );
+        assert_eq!(
             loaded.config.audio.output_mode, config.audio.output_mode,
             "audio.output_mode"
         );
@@ -1355,6 +1371,10 @@ mod tests {
         assert_eq!(
             back.audio.fadeout_ms, config.audio.fadeout_ms,
             "audio.fadeout_ms"
+        );
+        assert_eq!(
+            back.audio.crossfade_ms, config.audio.crossfade_ms,
+            "audio.crossfade_ms"
         );
         assert_eq!(
             back.audio.output_mode, config.audio.output_mode,
