@@ -1916,6 +1916,40 @@ impl Windowed {
         eprintln!("rustamp: a native save dialog is only implemented on Windows");
     }
 
+    /// Shows the folder dialog a preferences page asked for.
+    ///
+    /// The Skins page's `Change folder...` and every plug-in page's
+    /// `Folder...` ask for a folder. The dialog runs its own modal message
+    /// loop, so it is opened from the tick and never from a window procedure
+    /// (the rule the library's folder pick follows). A cancelled dialog
+    /// changes nothing.
+    fn drain_prefs_folder_pick(&mut self) {
+        let Some(request) = self.app.take_folder_request() else {
+            return;
+        };
+        let title = match request {
+            crate::app::FolderRequest::Skins => "Choose the folder that holds your skins",
+            crate::app::FolderRequest::Plugins => "Choose the plug-in folder",
+        };
+        #[cfg(windows)]
+        {
+            match rustamp_platform::pick_directory(self.raw_main_window(), title) {
+                Ok(Some(folder)) => match request {
+                    crate::app::FolderRequest::Skins => self.app.set_skins_folder(folder),
+                    crate::app::FolderRequest::Plugins => self.app.set_plugin_folder(folder),
+                },
+                // A cancelled dialog is not an error: nothing changes.
+                Ok(None) => {}
+                Err(error) => eprintln!("rustamp: no folder dialog: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = title;
+            eprintln!("rustamp: a native folder dialog is only implemented on Windows");
+        }
+    }
+
     /// Shows the warning of an approval the Preferences asked for and hands the
     /// user's answer back. A message box runs its own modal loop, so it is opened
     /// from the tick and never from a window procedure.
@@ -3620,6 +3654,7 @@ impl ApplicationHandler for Windowed {
         self.drain_media_pick();
         self.drain_winamp_ini_import();
         self.drain_plugin_approval();
+        self.drain_prefs_folder_pick();
         self.drain_save_playlist();
         self.drain_html_playlist();
         self.drain_prefs();
@@ -4383,8 +4418,11 @@ mod tests {
             .unwrap();
         presenter.sync_window_state();
         presenter.sync_window_layouts_to_app();
-        let saved =
-            crate::config::serialize_honest(&presenter.app.current_config(), None, None).unwrap();
+        let saved = crate::config::serialize_honest(
+            &presenter.app.current_config(),
+            &crate::config::AppUi::default(),
+        )
+        .unwrap();
         let config = crate::config::parse(&saved).unwrap();
         let restored_app = App::new(AppOptions {
             config,
@@ -4645,8 +4683,7 @@ mod tests {
                         self.presenter.sync_window_layouts_to_app();
                         let text = crate::config::serialize_honest(
                             &self.presenter.app.current_config(),
-                            None,
-                            None,
+                            &crate::config::AppUi::default(),
                         )
                         .unwrap();
                         let app = App::new(AppOptions {

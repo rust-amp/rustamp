@@ -117,7 +117,7 @@ use rustamp_ui::{
     skin_entries,
 };
 
-use crate::app::App;
+use crate::app::{App, FolderRequest};
 use crate::title_format::TitleFormatSetting;
 
 /// The edit-entry session: the file whose tags the dialog edits and the
@@ -715,6 +715,11 @@ impl App {
             playlist_title_format_text: title_format.format,
             replaygain: self.replaygain_mode(),
             output_mode: self.config().audio.output_mode,
+            vis_mode_row: vis_mode_row(self.vis_mode()),
+            snap_distance_text: rustamp_platform::snap_distance_text(
+                self.config().ui.snap_distance,
+            ),
+            skins_dir_text: self.skins_dir_text(),
             skins: entries.into_iter().map(|entry| entry.name).collect(),
             skin_selected,
             plugins: self.plugin_rows(),
@@ -722,6 +727,20 @@ impl App {
             winamp_ini_report: self.winamp_ini_report(),
             file_types_report: self.file_types_report.clone(),
             plugins_report: self.plugins_report.clone(),
+        }
+    }
+
+    /// The line the Skins page shows: the folder the skin browser reads.
+    ///
+    /// The folder the user chose, or the `skins` folder beside the
+    /// configuration; a player without a configuration file has no folder to
+    /// sit beside, and says so.
+    pub fn skins_dir_text(&self) -> String {
+        match self.skins_dir() {
+            Some(dir) => format!("Skins folder: {}", dir.display()),
+            None => "No configuration file, so there is no skins folder to sit beside. \
+                     Choose one."
+                .to_string(),
         }
     }
 
@@ -843,6 +862,36 @@ impl App {
                 // when a run owns it, when playback has stopped.
                 self.change_output();
             }
+            // The visualization mode is the app's own setting: it is not part
+            // of `rustamp-core`'s configuration tree, so it has no command
+            // there (see `config::VIS_MODE_KEY`).
+            PrefsAction::SetVisMode(row) => {
+                let Some(mode) = vis_mode_at(row) else {
+                    return;
+                };
+                if self.vis_mode() == mode {
+                    return;
+                }
+                self.set_vis_mode(mode);
+                if let Err(error) = self.save_config() {
+                    self.note(format!("preferences: {error}"));
+                }
+            }
+            PrefsAction::SetSnapDistance(pixels) => {
+                if self.config().ui.snap_distance == pixels {
+                    return;
+                }
+                // The windows read the distance when they move, so the value
+                // takes effect with the next drag.
+                self.config_mut().ui.snap_distance = pixels;
+                if let Err(error) = self.save_config() {
+                    self.note(format!("preferences: {error}"));
+                }
+            }
+            // The page does not open a folder dialog itself: it asks, and the
+            // presenter shows the dialog from the tick.
+            PrefsAction::ChooseSkinFolder => self.request_folder(FolderRequest::Skins),
+            PrefsAction::ChoosePluginFolder => self.request_folder(FolderRequest::Plugins),
             PrefsAction::LoadSkin(row) => {
                 let Some(entry) = self.browser_entries().into_iter().nth(row) else {
                     return;
@@ -1205,7 +1254,8 @@ impl App {
     /// folder changes (see [`crate::skin_folder`]), so the list is not read
     /// again for every frame.
     pub(crate) fn browser_entries(&self) -> Vec<SkinEntry> {
-        let dir = crate::skin_folder::skins_dir(self.config_path());
+        // The folder the user chose, or the one beside the configuration.
+        let dir = self.skins_dir();
         let mut folder = self.skin_folder.borrow_mut();
         let skins = folder.skins(dir.as_deref());
         // The built-in row comes from the UI's own list, so its name lives in
@@ -1514,6 +1564,33 @@ const PLUGIN_NODES: [PrefsNode; 5] = [
     PrefsNode::DspEffect,
     PrefsNode::GeneralPurpose,
 ];
+
+/// The row of [`rustamp_platform::VIS_MODE_CHOICES`] that shows `mode`.
+///
+/// The order is the list's, and the platform crate cannot name the mode itself
+/// (it does not depend on `rustamp-ui`), so the two sides are pinned together
+/// by `tests/prefs_pages.rs`.
+pub fn vis_mode_row(mode: rustamp_ui::visualization::VisMode) -> usize {
+    use rustamp_ui::visualization::VisMode;
+    match mode {
+        VisMode::Spectrum => 0,
+        VisMode::Scope => 1,
+        VisMode::ScopeDots => 2,
+        VisMode::Off => 3,
+    }
+}
+
+/// The visualization mode the row `row` of the list stands for.
+pub fn vis_mode_at(row: usize) -> Option<rustamp_ui::visualization::VisMode> {
+    use rustamp_ui::visualization::VisMode;
+    match row {
+        0 => Some(VisMode::Spectrum),
+        1 => Some(VisMode::Scope),
+        2 => Some(VisMode::ScopeDots),
+        3 => Some(VisMode::Off),
+        _ => None,
+    }
+}
 
 /// The plug-in page that lists plug-ins of `kind`.
 fn plugin_node_for(kind: PluginKind) -> PrefsNode {

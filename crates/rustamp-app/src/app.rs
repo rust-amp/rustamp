@@ -85,6 +85,19 @@ const MAX_NOTES: usize = 64;
 /// [`write_notes`]).
 const NOTE_PREFIX: &str = "rustamp: ";
 
+/// A folder a preferences page asked the player for.
+///
+/// The page does not open the folder dialog itself: it asks, and the presenter
+/// opens [`rustamp_platform::pick_directory`] from the tick, because the dialog
+/// runs its own modal message loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderRequest {
+    /// The folder the skin browser reads (the Skins page).
+    Skins,
+    /// The folder the plug-in pages scan (every plug-in page).
+    Plugins,
+}
+
 /// Everything [`App::new`] needs.
 pub struct AppOptions {
     /// The loaded configuration.
@@ -608,6 +621,16 @@ pub struct App {
     /// The setting belongs to the app, not to `rustamp-core`'s configuration
     /// tree (see [`crate::config::PLAYLIST_TITLE_FORMAT_KEY`]).
     pub(crate) title_format: Option<crate::title_format::TitleFormatSetting>,
+    /// The skins folder the user chose, when they chose one.
+    ///
+    /// `None` means the `skins` folder beside the configuration file is read
+    /// (see [`crate::skin_folder::skins_dir`]). The setting belongs to the app,
+    /// not to `rustamp-core`'s configuration tree (see
+    /// [`crate::config::SKINS_DIR_KEY`]).
+    pub(crate) user_skins_dir: Option<PathBuf>,
+    /// The folder a preferences page asked the presenter for, until the
+    /// dialog answers (see [`FolderRequest`]).
+    pending_folder_request: Option<FolderRequest>,
     /// The tags of the playlist's rows, read off the UI thread
     /// (see [`crate::playlist_tags`]).
     pub(crate) playlist_tags: crate::playlist_tags::TagReader,
@@ -827,6 +850,8 @@ impl App {
             config_path: None,
             file_types_report: None,
             plugins_report: None,
+            user_skins_dir: None,
+            pending_folder_request: None,
             bookmarks: crate::bookmarks::Bookmarks::default(),
             bus,
             events,
@@ -1180,6 +1205,90 @@ impl App {
         self.config_path.as_deref()
     }
 
+    /// The visualization mode the main window draws (S08).
+    pub fn vis_mode(&self) -> rustamp_ui::visualization::VisMode {
+        self.ui.state().visualization.mode
+    }
+
+    /// Sets the visualization mode: the Visualization page's drop-down list.
+    ///
+    /// The mode is the player's own render choice; it takes effect on the next
+    /// frame. The caller saves when the choice is the user's (see
+    /// [`App::apply_prefs_action`]).
+    pub fn set_vis_mode(&mut self, mode: rustamp_ui::visualization::VisMode) {
+        self.ui.set_vis_mode(mode);
+    }
+
+    /// The folder the skin browser reads.
+    ///
+    /// The folder the user chose, or the `skins` folder beside the
+    /// configuration file when they never chose one (see
+    /// [`crate::skin_folder::skins_dir`]).
+    pub fn skins_dir(&self) -> Option<PathBuf> {
+        self.user_skins_dir
+            .clone()
+            .or_else(|| crate::skin_folder::skins_dir(self.config_path()))
+    }
+
+    /// Makes `dir` the folder the skin browser reads, and saves the choice.
+    ///
+    /// The skin list follows the new folder on its own: the cache reads a
+    /// folder it has not read before.
+    pub fn set_skins_folder(&mut self, dir: PathBuf) {
+        self.user_skins_dir = Some(dir);
+        if let Err(error) = self.save_config() {
+            self.note(format!("preferences: {error}"));
+        }
+    }
+
+    /// Restores the skins folder a configuration load named.
+    ///
+    /// Nothing is saved: this is the value coming out of the file, not a
+    /// choice the user made now (see [`App::set_skins_folder`]).
+    pub fn set_skins_dir_from_load(&mut self, dir: Option<PathBuf>) {
+        self.user_skins_dir = dir;
+    }
+
+    /// Makes `dir` the folder the plug-in pages scan, and saves the choice.
+    ///
+    /// The folder is read again at once, so the pages show what the new folder
+    /// holds; nothing in it is loaded.
+    pub fn set_plugin_folder(&mut self, dir: PathBuf) {
+        self.config_mut().plugins.plugin_dir = Some(dir);
+        if let Err(error) = self.save_config() {
+            self.note(format!("preferences: {error}"));
+        }
+        self.rescan_plugins();
+        self.plugins_report = Some(format!(
+            "The plug-in folder is {}.",
+            self.plugin_dir().display()
+        ));
+    }
+
+    /// The `[ui]` settings the app keeps itself, for a save.
+    pub(crate) fn app_ui(&self) -> crate::config::AppUi {
+        crate::config::AppUi {
+            playlist_font_size: self.playlist_font_size(),
+            playlist_title_format: self.title_format.clone(),
+            vis_mode: self.vis_mode(),
+            skins_dir: self.user_skins_dir.clone(),
+        }
+    }
+
+    /// The folder a preferences page asked the presenter for, taking it.
+    ///
+    /// The dialog runs its own modal loop, so the request is drained from the
+    /// tick, never from a window procedure (the rule the library's folder
+    /// pick follows).
+    pub fn take_folder_request(&mut self) -> Option<FolderRequest> {
+        self.pending_folder_request.take()
+    }
+
+    /// Asks the presenter for a folder (see [`FolderRequest`]).
+    pub(crate) fn request_folder(&mut self, request: FolderRequest) {
+        self.pending_folder_request = Some(request);
+    }
+
     /// Returns the live configuration reflecting the player's current runtime state.
     pub fn current_config(&self) -> Config {
         let player_state = self.engine.state();
@@ -1354,12 +1463,7 @@ impl App {
             layout.width = layout.width.map(|width| width * 2);
             layout.height = layout.height.map(|height| height * 2);
         }
-        crate::config::save(
-            &config,
-            self.playlist_font_size(),
-            self.title_format.as_ref(),
-            path,
-        )
+        crate::config::save(&config, &self.app_ui(), path)
     }
 
     /// Imports a Winamp 2.95 `winamp.ini` into the running configuration.
@@ -1386,7 +1490,7 @@ impl App {
         &mut self,
         path: &Path,
     ) -> Result<crate::winamp_ini::ImportReport, crate::winamp_ini::ImportError> {
-        let skins = crate::skin_folder::skins_dir(self.config_path());
+        let skins = self.skins_dir();
         let resolve_skin = |name: &str| {
             skins
                 .as_ref()

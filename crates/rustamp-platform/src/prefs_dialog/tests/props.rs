@@ -45,7 +45,8 @@
 use super::plugin_pages;
 use crate::prefs_dialog::{
     Item, LibraryRootRow, OUTPUT_MODE_CHOICES, PageLists, PluginListState, PluginRow, PrefsNode,
-    PrefsSettings, REPLAYGAIN_CHOICES, RootListState, RowId, SkinListState, TREE, page_items,
+    PrefsSettings, REPLAYGAIN_CHOICES, RootListState, RowId, SkinListState, TREE, VIS_MODE_CHOICES,
+    page_items, snap_distance_text,
 };
 
 // ---------------------------------------------------------------------------
@@ -166,6 +167,10 @@ fn random_settings(rng: &mut Rng) -> PrefsSettings {
         playlist_title_format_text: format!("%title% {}", rng.index(100)),
         replaygain: REPLAYGAIN_CHOICES[rng.index(REPLAYGAIN_CHOICES.len())],
         output_mode: OUTPUT_MODE_CHOICES[rng.index(OUTPUT_MODE_CHOICES.len())],
+        // A row that does not exist as well: the list must show a mode anyway.
+        vis_mode_row: rng.index(VIS_MODE_CHOICES.len() + 2),
+        snap_distance_text: snap_distance_text(rng.index(1_100) as u32),
+        skins_dir_text: format!(r"C:\skins {}", rng.index(10)),
         skins,
         skin_selected,
         plugins,

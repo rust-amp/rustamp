@@ -262,6 +262,10 @@ pub enum Bind {
 pub enum TextBind {
     /// The playlist's title format: the format string of spec **S14**.
     PlaylistTitleFormat,
+    /// The distance, in pixels, at which windows snap to each other and to the
+    /// screen edge (S16 §3.2). A field that does not hold a number changes
+    /// nothing.
+    SnapDistance,
 }
 
 /// A setting a drop-down list is bound to.
@@ -271,6 +275,12 @@ pub enum ComboBind {
     ReplayGain,
     /// The output mode: shared or exclusive.
     OutputMode,
+    /// The visualization mode: spectrum, scope, scope dots or off.
+    ///
+    /// The rows are [`VIS_MODE_CHOICES`]. The mode itself is the player's
+    /// (`rustamp_ui`'s `VisMode`), which this crate does not depend on: the
+    /// dialog names the row, the player maps it ([`PrefsAction::SetVisMode`]).
+    VisMode,
 }
 
 /// The ReplayGain modes the list shows, in order.
@@ -288,6 +298,38 @@ pub const REPLAYGAIN_CHOICES: [ReplayGainMode; 3] = [
 /// The order is the list's row order, so it is also the order the rows are
 /// numbered by. Every mode of the configuration is in it.
 pub const OUTPUT_MODE_CHOICES: [OutputMode; 2] = [OutputMode::Shared, OutputMode::Exclusive];
+
+/// The visualization modes the list shows, in order.
+///
+/// The order is the list's row order, so it is also the row number
+/// [`PrefsAction::SetVisMode`] carries. The player maps a row to its own
+/// `rustamp_ui` mode, and a test on both sides pins the order (this crate does
+/// not depend on `rustamp-ui`).
+pub const VIS_MODE_CHOICES: [&str; 4] = ["Spectrum", "Scope", "Scope dots", "Off"];
+
+/// The largest snap distance the field accepts, in pixels.
+///
+/// Own choice: a snap distance is a few pixels, and a longer one is a typo
+/// rather than a request. The field refuses more instead of passing a number
+/// the player would then have to honour.
+pub const MAX_SNAP_DISTANCE: u32 = 1000;
+
+/// The snap distance `text` names: a whole number of pixels in
+/// `0..=MAX_SNAP_DISTANCE`, or `None` for anything else.
+///
+/// The field shows the setting as a number, so the text is the user's; a text
+/// that is not a number changes nothing.
+pub fn parse_snap_distance(text: &str) -> Option<u32> {
+    text.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pixels| *pixels <= MAX_SNAP_DISTANCE)
+}
+
+/// The field text that shows the snap distance `pixels`.
+pub fn snap_distance_text(pixels: u32) -> String {
+    pixels.to_string()
+}
 
 /// The text of the list row that shows `mode`.
 pub fn replaygain_label(mode: ReplayGainMode) -> &'static str {
@@ -352,6 +394,7 @@ impl ComboBind {
                 .copied()
                 .map(output_mode_label)
                 .collect(),
+            ComboBind::VisMode => VIS_MODE_CHOICES.to_vec(),
         }
     }
 
@@ -361,6 +404,9 @@ impl ComboBind {
         match self {
             ComboBind::ReplayGain => replaygain_at(row).map(PrefsAction::SetReplayGain),
             ComboBind::OutputMode => output_mode_at(row).map(PrefsAction::SetOutputMode),
+            ComboBind::VisMode => {
+                (row < VIS_MODE_CHOICES.len()).then_some(PrefsAction::SetVisMode(row))
+            }
         }
     }
 }
@@ -452,6 +498,18 @@ pub enum Item {
         /// Placement.
         rect: Rect,
     },
+    /// Asks the user for another plug-in folder
+    /// ([`PrefsAction::ChoosePluginFolder`]).
+    PluginFolder {
+        /// Placement.
+        rect: Rect,
+    },
+    /// Asks the user for another skins folder
+    /// ([`PrefsAction::ChooseSkinFolder`]).
+    SkinFolder {
+        /// Placement.
+        rect: Rect,
+    },
     /// The media library's roots, one row each.
     LibraryRoots {
         /// Placement.
@@ -488,11 +546,13 @@ pub enum Item {
         /// Placement.
         rect: Rect,
     },
-    /// The report of the last import
-    /// ([`PrefsSettings::winamp_ini_report`]).
+    /// The line of text a page shows under its controls
+    /// ([`PrefsSettings::report`]).
     ///
     /// The text is the player's, not the dialog's: the dialog only shows
-    /// what the player pushes into it.
+    /// what the player pushes into it. The import and file-type pages show
+    /// what their last action did, the skins page the folder it reads, and the
+    /// plug-in pages what their last action did.
     Report {
         /// Placement.
         rect: Rect,
@@ -515,12 +575,14 @@ fn note_page(group: &'static str, text: &'static str) -> Vec<Item> {
     ]
 }
 
-/// The layout every plug-in page shares: the caption, a hint, the list, the
-/// buttons under it and the line that says what the last action did. `switch`
-/// is the page's way to turn a plug-in on.
+/// The layout every plug-in page shares: the caption, a hint, the list, two
+/// rows of buttons under it and the line that says what the last action did.
+/// `switch` is the page's way to turn a plug-in on; the folder button is the
+/// same on every page.
 fn plugin_page(caption: &'static str, hint: &'static str, switch: Item) -> Vec<Item> {
     let w = PAGE_SIZE.0;
     let half = (w - 28) / 2;
+    let third = (w - 32) / 3;
     vec![
         Item::Group {
             text: caption,
@@ -531,20 +593,23 @@ fn plugin_page(caption: &'static str, hint: &'static str, switch: Item) -> Vec<I
             rect: rect(12, 20, w - 24, 56),
         },
         Item::PluginList {
-            rect: rect(10, 78, w - 20, 98),
+            rect: rect(10, 78, w - 20, 94),
         },
         Item::PluginApprove {
-            rect: rect(10, 180, half, 24),
+            rect: rect(10, 176, half, 24),
         },
         switch,
         Item::PluginConfigure {
-            rect: rect(10, 208, half, 24),
+            rect: rect(10, 204, third, 24),
         },
         Item::PluginRescan {
-            rect: rect(18 + half, 208, half, 24),
+            rect: rect(16 + third, 204, third, 24),
+        },
+        Item::PluginFolder {
+            rect: rect(22 + 2 * third, 204, third, 24),
         },
         Item::Report {
-            rect: rect(12, 236, w - 24, 42),
+            rect: rect(12, 232, w - 24, 44),
         },
     ]
 }
@@ -552,7 +617,7 @@ fn plugin_page(caption: &'static str, hint: &'static str, switch: Item) -> Vec<I
 /// Where a plug-in page's second button of the first row sits.
 const fn switch_rect() -> Rect {
     let half = (PAGE_SIZE.0 - 28) / 2;
-    rect(18 + half, 180, half, 24)
+    rect(18 + half, 176, half, 24)
 }
 
 /// Hint under every plug-in page's caption: what a plug-in is, and that approving
@@ -581,11 +646,12 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
         // The audio settings live on the Setup page: it is the page for the
         // device, and both settings are about how the player sounds. The
         // group box is tall enough for the drop-down lists, so that a list
-        // never reaches over the group's frame.
+        // never reaches over the group's frame. The line under the lists says
+        // what a change of the mode does while a track plays.
         PrefsNode::Setup => vec![
             Item::Group {
                 text: "Audio",
-                rect: rect(0, 0, w, 160),
+                rect: rect(0, 0, w, 190),
             },
             Item::Combo {
                 text: "ReplayGain:",
@@ -595,17 +661,13 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
             },
             Item::Combo {
                 text: "Output mode:",
-                label: rect(12, 100, 100, 20),
-                list: rect(118, 98, 132, 60),
+                label: rect(12, 84, 100, 20),
+                list: rect(118, 82, 132, 60),
                 bind: ComboBind::OutputMode,
             },
-            Item::Group {
-                text: "General",
-                rect: rect(0, 168, w, 72),
-            },
             Item::Label {
-                text: "Language: English.\nSettings are saved to the player's configuration file when it closes.",
-                rect: rect(12, 188, w - 24, 48),
+                text: "A new output mode applies when playback has stopped.",
+                rect: rect(12, 150, w - 24, 34),
             },
         ],
         PrefsNode::FileTypes => vec![
@@ -632,7 +694,7 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
         PrefsNode::Options => vec![
             Item::Group {
                 text: "Windows",
-                rect: rect(0, 0, w, 76),
+                rect: rect(0, 0, w, 150),
             },
             Item::Check {
                 text: "Always on top",
@@ -643,6 +705,19 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
                 text: "Easy move (drag windows from anywhere)",
                 rect: rect(12, 46, w - 24, 20),
                 bind: Bind::EasyMove,
+            },
+            // The snap distance the docking honours (S16 §3.2,
+            // `ui.snap_distance`): a number of pixels, 0 turns snapping off.
+            Item::TextField {
+                text: "Snap distance:",
+                label: rect(12, 74, 92, 20),
+                field: rect(108, 72, 56, 22),
+                bind: TextBind::SnapDistance,
+            },
+            Item::Label {
+                text: "How close two windows must come, in pixels, before they snap together. \
+                       0 turns snapping off.",
+                rect: rect(12, 102, w - 24, 44),
             },
         ],
         PrefsNode::Display => vec![
@@ -679,10 +754,26 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
                 rect: rect(12, 140, w - 24, 44),
             },
         ],
-        PrefsNode::OptionsVisualization => note_page(
-            "Visualization",
-            "The visualization options are not configurable yet.",
-        ),
+        // The analyzer the main window draws (S08). A visualization *plug-in*
+        // has its own window and its own page (Plug-ins > Visualization); this
+        // page is the player's own analyser, which has nothing to do with it.
+        PrefsNode::OptionsVisualization => vec![
+            Item::Group {
+                text: "Visualization",
+                rect: rect(0, 0, w, 128),
+            },
+            Item::Combo {
+                text: "Mode:",
+                label: rect(12, 22, 54, 20),
+                list: rect(72, 20, 178, 80),
+                bind: ComboBind::VisMode,
+            },
+            Item::Label {
+                text: "The analyzer the player draws in the main window. A visualization \
+                       plug-in draws in its own window; the two are separate.",
+                rect: rect(12, 76, w - 24, 44),
+            },
+        ],
         PrefsNode::Shuffle => vec![
             Item::Group {
                 text: "Playback order",
@@ -715,13 +806,21 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
         }
         PrefsNode::DspEffect => plugin_page("DSP/Effect plug-ins", PLUGIN_HINT, toggle()),
         PrefsNode::GeneralPurpose => plugin_page("General purpose plug-ins", PLUGIN_HINT, toggle()),
+        // The skins folder can be changed (S16 §3.3): the list above reads it,
+        // and the line under the buttons says which folder that is.
         PrefsNode::Skins => vec![
             Item::Group {
                 text: "Select skin",
                 rect: rect(0, 0, w, PAGE_SIZE.1),
             },
             Item::SkinList {
-                rect: rect(10, 20, w - 20, PAGE_SIZE.1 - 30),
+                rect: rect(10, 20, w - 20, 158),
+            },
+            Item::SkinFolder {
+                rect: rect(10, 184, 130, 26),
+            },
+            Item::Report {
+                rect: rect(12, 216, w - 24, 60),
             },
         ],
         PrefsNode::Library => vec![
@@ -846,6 +945,17 @@ pub struct PrefsSettings {
     pub replaygain: ReplayGainMode,
     /// The output mode.
     pub output_mode: OutputMode,
+    /// The row of [`VIS_MODE_CHOICES`] the player's visualization mode shows.
+    ///
+    /// The mode is the player's own (`rustamp_ui`'s `VisMode`, which this crate
+    /// does not depend on), so the settings carry the row and the player maps
+    /// it back in [`PrefsAction::SetVisMode`].
+    pub vis_mode_row: usize,
+    /// The snap distance the field shows, as text.
+    pub snap_distance_text: String,
+    /// The line the Skins page shows under its buttons: the folder the skin
+    /// browser reads.
+    pub skins_dir_text: String,
     /// The skins that can be loaded, one row each.
     ///
     /// The rows can change while the dialog is open (the skin in use is one
@@ -897,6 +1007,7 @@ impl PrefsSettings {
     pub fn text(&self, bind: TextBind) -> &str {
         match bind {
             TextBind::PlaylistTitleFormat => &self.playlist_title_format_text,
+            TextBind::SnapDistance => &self.snap_distance_text,
         }
     }
 
@@ -905,13 +1016,21 @@ impl PrefsSettings {
         match bind {
             ComboBind::ReplayGain => replaygain_row(self.replaygain),
             ComboBind::OutputMode => output_mode_row(self.output_mode),
+            // A row the player cannot use would select nothing, so it is
+            // clamped: the list always shows a mode.
+            ComboBind::VisMode => self.vis_mode_row.min(VIS_MODE_CHOICES.len() - 1),
         }
     }
 
     /// The text of `node`'s report line.
+    ///
+    /// The file-types page, the import page and the skins page each have their
+    /// own line; the plug-in pages share theirs, and a page without a report
+    /// control shows nothing at all.
     pub fn report(&self, node: PrefsNode) -> &str {
         match node {
             PrefsNode::FileTypes => self.file_types_report.as_deref().unwrap_or(""),
+            PrefsNode::Skins => &self.skins_dir_text,
             PrefsNode::Import => self.winamp_ini_report.as_deref().unwrap_or(NO_REPORT),
             _ => self.plugins_report.as_deref().unwrap_or(""),
         }
@@ -1379,6 +1498,25 @@ pub enum PrefsAction {
     /// The format string travels with the action, because the field is the
     /// user's text and the player is the one that checks it.
     SetTitleFormat(String),
+    /// The visualization mode in this row of [`VIS_MODE_CHOICES`] was chosen.
+    ///
+    /// The player maps the row to its own mode (`rustamp_ui`'s `VisMode`).
+    SetVisMode(usize),
+    /// The snap distance was set to this number of pixels, in `0..=` the
+    /// largest the field accepts.
+    ///
+    /// Only a number the field can read travels: a text that is not one
+    /// changes nothing.
+    SetSnapDistance(u32),
+    /// The user asked for another skins folder.
+    ///
+    /// The player opens the folder dialog itself (a native dialog runs its own
+    /// message loop, so it is opened from the tick, never from a window
+    /// procedure); the page only says that a folder was asked for.
+    ChooseSkinFolder,
+    /// The user asked for another plug-in folder; see
+    /// [`PrefsAction::ChooseSkinFolder`].
+    ChoosePluginFolder,
     /// A skin row was chosen.
     LoadSkin(usize),
     /// The toggle button was pressed with this plug-in selected
@@ -1463,7 +1601,7 @@ mod win32 {
 
     use super::{
         Bind, ComboBind, Item, PageLists, PrefsAction, PrefsError, PrefsNode, PrefsSettings, Rect,
-        RowId, TREE, TextBind, page_items,
+        RowId, TREE, TextBind, page_items, parse_snap_distance,
     };
 
     const CLASS_NAME: &str = "RustampPreferences";
@@ -1484,6 +1622,8 @@ mod win32 {
     const ID_UNREGISTER: u16 = 70;
     const ID_PLUGIN_APPROVE: u16 = 71;
     const ID_OUTPUT_USE: u16 = 72;
+    const ID_PLUGIN_FOLDER: u16 = 73;
+    const ID_SKINS_FOLDER: u16 = 74;
     /// Scrollable width (unscaled pixels) of a plug-in row.
     const PLUGIN_ROW_EXTENT: i32 = 900;
     /// Scrollable width (unscaled pixels) of a library root.
@@ -2340,6 +2480,36 @@ mod win32 {
                         page.push(c);
                     }
                 }
+                Item::PluginFolder { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Folder...",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_PLUGIN_FOLDER,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
+                Item::SkinFolder { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Change folder...",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_SKINS_FOLDER,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
                 Item::LibraryRoots { rect } => {
                     if let Ok(c) = child(
                         hwnd,
@@ -2761,6 +2931,16 @@ mod win32 {
                     push_action(PrefsAction::ImportWinampIni);
                     return LRESULT(0);
                 }
+                if code == BN_CLICKED && matches!(id, ID_PLUGIN_FOLDER | ID_SKINS_FOLDER) {
+                    // A folder dialog runs its own message loop, so the player
+                    // opens it from the tick, never from here.
+                    push_action(if id == ID_SKINS_FOLDER {
+                        PrefsAction::ChooseSkinFolder
+                    } else {
+                        PrefsAction::ChoosePluginFolder
+                    });
+                    return LRESULT(0);
+                }
                 if code == BN_CLICKED
                     && matches!(
                         id,
@@ -2838,7 +3018,8 @@ mod win32 {
                 }
                 if code == EN_CHANGE {
                     // A text field of the current page changed: the text is
-                    // the user's, and it travels with the action.
+                    // the user's, and it travels with the action when the
+                    // field's setting can use it.
                     let hit = STATE.with(|state| {
                         state.try_borrow().ok().and_then(|g| {
                             g.as_ref().and_then(|i| {
@@ -2846,9 +3027,21 @@ mod win32 {
                             })
                         })
                     });
-                    if let Some((control, _, _)) = hit {
+                    if let Some((control, _, bind)) = hit {
                         let text = read_edit_text(control);
-                        push_action(PrefsAction::SetTitleFormat(text));
+                        let action = match bind {
+                            TextBind::PlaylistTitleFormat => {
+                                Some(PrefsAction::SetTitleFormat(text))
+                            }
+                            // A text that is not a number changes nothing: the
+                            // setting keeps its value until the field holds one.
+                            TextBind::SnapDistance => {
+                                parse_snap_distance(&text).map(PrefsAction::SetSnapDistance)
+                            }
+                        };
+                        if let Some(action) = action {
+                            push_action(action);
+                        }
                         return LRESULT(0);
                     }
                 }
@@ -2998,6 +3191,8 @@ mod tests {
                     | Item::PluginApprove { rect }
                     | Item::PluginConfigure { rect }
                     | Item::PluginRescan { rect }
+                    | Item::PluginFolder { rect }
+                    | Item::SkinFolder { rect }
                     | Item::LibraryRoots { rect }
                     | Item::LibraryAdd { rect }
                     | Item::LibraryRemove { rect }
@@ -3204,6 +3399,128 @@ mod tests {
     }
 
     #[test]
+    fn the_visualization_mode_list_shows_every_mode_in_order() {
+        assert_eq!(VIS_MODE_CHOICES, ["Spectrum", "Scope", "Scope dots", "Off"]);
+        assert_eq!(ComboBind::VisMode.labels(), VIS_MODE_CHOICES.to_vec());
+        // Every row stands for choosing that mode.
+        for row in 0..VIS_MODE_CHOICES.len() {
+            assert_eq!(
+                ComboBind::VisMode.action(row),
+                Some(PrefsAction::SetVisMode(row))
+            );
+        }
+        assert_eq!(ComboBind::VisMode.action(VIS_MODE_CHOICES.len()), None);
+    }
+
+    #[test]
+    fn the_visualization_page_carries_the_mode_list_and_no_placeholder() {
+        let items = page_items(PrefsNode::OptionsVisualization);
+        let combo = items
+            .iter()
+            .find_map(|item| match item {
+                Item::Combo { bind, .. } if *bind == ComboBind::VisMode => Some(*bind),
+                _ => None,
+            })
+            .expect("the visualization page carries the mode list");
+        assert_eq!(combo, ComboBind::VisMode);
+        for item in &items {
+            if let Item::Label { text, .. } = item {
+                assert!(
+                    !text.contains("not configurable"),
+                    "the page still has a placeholder: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_setup_page_says_when_a_new_output_mode_applies() {
+        let items = page_items(PrefsNode::Setup);
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Label { text, .. } => Some(*text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|text| text.contains("applies when playback has stopped")),
+            "{labels:?}"
+        );
+        // The old "General" group claimed a language setting and a save
+        // moment the player does not have.
+        for item in &items {
+            let text = match item {
+                Item::Group { text, .. } | Item::Label { text, .. } => *text,
+                _ => continue,
+            };
+            assert!(!text.contains("Language: English"), "{text}");
+        }
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    Item::Combo {
+                        bind: ComboBind::OutputMode,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_options_page_has_the_snap_distance_field() {
+        let items = page_items(PrefsNode::Options);
+        let field = items
+            .iter()
+            .find_map(|item| match item {
+                Item::TextField { bind, .. } => Some(*bind),
+                _ => None,
+            })
+            .expect("the options page carries a text field");
+        assert_eq!(field, TextBind::SnapDistance);
+        let settings = PrefsSettings {
+            snap_distance_text: snap_distance_text(25),
+            ..PrefsSettings::default()
+        };
+        assert_eq!(settings.text(TextBind::SnapDistance), "25");
+    }
+
+    #[test]
+    fn the_snap_distance_field_reads_a_whole_number_of_pixels() {
+        assert_eq!(parse_snap_distance("0"), Some(0));
+        assert_eq!(parse_snap_distance(" 25 "), Some(25));
+        assert_eq!(parse_snap_distance("1000"), Some(MAX_SNAP_DISTANCE));
+        // A typo is not a distance: too large, negative, not a number or empty.
+        assert_eq!(parse_snap_distance("1001"), None);
+        assert_eq!(parse_snap_distance("-5"), None);
+        assert_eq!(parse_snap_distance("12px"), None);
+        assert_eq!(parse_snap_distance(""), None);
+        assert_eq!(parse_snap_distance("2.5"), None);
+    }
+
+    #[test]
+    fn the_skins_page_has_the_folder_button_and_its_line() {
+        let items = page_items(PrefsNode::Skins);
+        let count = |f: fn(&Item) -> bool| items.iter().filter(|i| f(i)).count();
+        assert_eq!(count(|i| matches!(i, Item::SkinList { .. })), 1);
+        assert_eq!(count(|i| matches!(i, Item::SkinFolder { .. })), 1);
+        assert_eq!(count(|i| matches!(i, Item::Report { .. })), 1);
+        let settings = PrefsSettings {
+            skins_dir_text: "Skins folder: C:\\players\\skins".into(),
+            plugins_report: Some("a plug-in report".into()),
+            ..PrefsSettings::default()
+        };
+        // The skins page shows its own line, not the plug-in pages'.
+        assert_eq!(settings.report(PrefsNode::Skins), settings.skins_dir_text);
+    }
+
+    #[test]
     fn a_value_survives_the_way_through_the_dialog() {
         // The whole path of a change: the configuration's value becomes the
         // list's row, the row becomes the action, and the action carries the
@@ -3280,6 +3597,11 @@ mod tests {
             );
             assert_eq!(
                 count(|i| matches!(i, Item::PluginRescan { .. })),
+                1,
+                "{node:?}"
+            );
+            assert_eq!(
+                count(|i| matches!(i, Item::PluginFolder { .. })),
                 1,
                 "{node:?}"
             );
@@ -3792,6 +4114,11 @@ mod tests {
             for item in page_items(entry.node) {
                 if let Item::Label { text, .. } = item {
                     assert!(!text.contains("not available"), "{:?}: {text}", entry.node);
+                    assert!(
+                        !text.contains("not configurable"),
+                        "{:?}: {text}",
+                        entry.node
+                    );
                 }
             }
         }

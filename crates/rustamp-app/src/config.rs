@@ -25,7 +25,7 @@
 //! | `audio.volume` | `App::with_registry` → `Engine::set_volume` | written |
 //! | `audio.balance` | `App::with_registry` → `Engine::set_balance` | written |
 //! | `audio.fadeout_ms` | `App::with_registry` → `EngineConfig::fade_ms` | written |
-//! | `audio.output_mode` | `output::create_output` (RFC 0019) | written |
+//! | `audio.output_mode` | `App::change_output` → `output::create_output` (RFC 0019) | written; a running track keeps its device until it stops |
 //! | `audio.device` | `output::create_output` → `selection::plan`/`resolve` | written |
 //! | `audio.replaygain` | `App::with_registry` → `Engine::set_replaygain_mode` | written |
 //! | `ui.skin` | `crate::run` → `skin::choose` | written |
@@ -36,6 +36,8 @@
 //! | `ui.windows` | `App::with_registry` → the window placements | written |
 //! | `ui.playlist_font_size` | the playlist editor's font size | written; an unusable value is kept |
 //! | `ui.playlist_title_format` | the playlist's row text | written when the user set one; a format that cannot be read is reported and the plain text stays |
+//! | `ui.vis_mode` | `App::with_registry` → `rustamp_ui::MainWindow::set_vis_mode` | written when it is not the default spectrum |
+//! | `ui.skins_dir` | `App::skins_dir` → the skin browser's list | written when the user chose one; otherwise the folder beside the configuration is read |
 //! | `eq.state` | `App::with_registry` → `Engine::set_eq` | written |
 //! | `plugins.plugin_dir` | `App::plugin_dir` → `rustamp_prefs::scan` | written |
 //! | `plugins.enabled` | `App::set_plugin_enabled` → `rustamp_prefs::set_enabled` | written |
@@ -141,6 +143,24 @@ pub const PLAYLIST_FONT_SIZE_KEY: &str = "playlist_font_size";
 /// their plain text.
 pub const PLAYLIST_TITLE_FORMAT_KEY: &str = "playlist_title_format";
 
+/// The key the visualization mode is stored under.
+///
+/// The mode is the main window's own render choice (`rustamp_ui`'s
+/// `VisMode`: spectrum, scope, scope dots or off, see S08). It is not part of
+/// `rustamp-core`'s configuration tree, so the app keeps it in the same file,
+/// under the `[ui]` table, next to the other UI state it persists.
+///
+/// The value is one of the names [`vis_mode_name`] writes; a name the app does
+/// not know is reported and the default mode stays.
+pub const VIS_MODE_KEY: &str = "vis_mode";
+
+/// The key the skins folder is stored under.
+///
+/// Without it the player reads the `skins` folder beside its configuration
+/// file (see [`crate::skin_folder`]); the key makes the folder the user chose
+/// survive a restart. It is not part of `rustamp-core`'s configuration tree.
+pub const SKINS_DIR_KEY: &str = "skins_dir";
+
 /// The configuration paths the app owns: the settings it reads and acts on.
 ///
 /// The app decides the value of an owned setting on every save, so the
@@ -174,6 +194,8 @@ const OWNED_PATHS: &[&[&str]] = &[
     &["ui", "windows"],
     &["ui", PLAYLIST_FONT_SIZE_KEY],
     &["ui", PLAYLIST_TITLE_FORMAT_KEY],
+    &["ui", VIS_MODE_KEY],
+    &["ui", SKINS_DIR_KEY],
     &["eq", "state"],
     &["playlist", "shuffle"],
     &["playlist", "repeat"],
@@ -218,6 +240,20 @@ fn owns_setting(path: &[String], previous: &toml::Value) -> bool {
     }
     if is_title_format_path(path) {
         return title_format_is_readable(previous);
+    }
+    if path.len() == 2 && path[0] == "ui" && path[1] == VIS_MODE_KEY {
+        return previous
+            .get("ui")
+            .and_then(toml::Value::as_table)
+            .and_then(vis_mode_in_toml)
+            .is_some();
+    }
+    if path.len() == 2 && path[0] == "ui" && path[1] == SKINS_DIR_KEY {
+        return previous
+            .get("ui")
+            .and_then(toml::Value::as_table)
+            .and_then(skins_dir_in_toml)
+            .is_some();
     }
     owns(path)
 }
@@ -311,6 +347,27 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// The settings the app keeps in the `[ui]` table itself.
+///
+/// `rustamp_core`'s `UiConfig` carries the settings of the window layer;
+/// these are the player's own values that no core type has, and adding one
+/// there would be a contract change that needs its own RFC. A save writes
+/// them, a load reads them (see [`ConfigLoad::app_ui`]).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AppUi {
+    /// The playlist editor's runtime font size; `None` means the skin's size
+    /// is in use.
+    pub playlist_font_size: Option<u32>,
+    /// The playlist's title format; `None` means the rows show their plain
+    /// text.
+    pub playlist_title_format: Option<TitleFormatSetting>,
+    /// The main window's visualization mode.
+    pub vis_mode: rustamp_ui::visualization::VisMode,
+    /// The skins folder the user chose; `None` means the `skins` folder beside
+    /// the configuration file.
+    pub skins_dir: Option<PathBuf>,
+}
+
 /// The result of a configuration load.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigLoad {
@@ -322,18 +379,8 @@ pub struct ConfigLoad {
     pub warnings: Vec<String>,
     /// A human-readable note when a file had unapplied settings (first warning, for backward compatibility).
     pub warning: Option<String>,
-    /// The playlist editor's runtime font size, when the file names one.
-    ///
-    /// `None` means the skin's size is in use (S17 §5); the value belongs to
-    /// the app, not to `rustamp-core`'s configuration tree (see
-    /// [`PLAYLIST_FONT_SIZE_KEY`]).
-    pub playlist_font_size: Option<u32>,
-    /// The playlist's title format, when the file names one.
-    ///
-    /// `None` means the user never set one: the rows show their plain text.
-    /// The value belongs to the app, not to `rustamp-core`'s configuration
-    /// tree (see [`PLAYLIST_TITLE_FORMAT_KEY`]).
-    pub playlist_title_format: Option<TitleFormatSetting>,
+    /// The settings the app keeps in `[ui]` itself (see [`AppUi`]).
+    pub app_ui: AppUi,
 }
 
 /// The default configuration path, or `None` when neither the override nor
@@ -400,6 +447,23 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
                         )
                     }
                 }
+                VIS_MODE_KEY => {
+                    if vis_mode_in_toml(ui).is_some() {
+                        None
+                    } else {
+                        Some(format!(
+                            "the visualization mode must be one of {}",
+                            vis_mode_names().join(", ")
+                        ))
+                    }
+                }
+                SKINS_DIR_KEY => {
+                    if skins_dir_in_toml(ui).is_some() {
+                        None
+                    } else {
+                        Some("the skins folder must be a folder path".to_string())
+                    }
+                }
                 _ => Some("unrecognized UI setting".to_string()),
             };
             if let Some(r) = reason {
@@ -448,16 +512,16 @@ pub fn parse_with_warnings(
     text: &str,
     path: Option<&Path>,
 ) -> Result<(Config, Vec<String>), ConfigError> {
-    let (config, warnings, _, _) = parse_text(text, path)?;
+    let (config, warnings, _) = parse_text(text, path)?;
     Ok((config, warnings))
 }
 
 /// What a configuration file yields: the configuration, the warnings about
 /// the settings the player does not apply, and the settings the app owns.
-type ParsedFile = (Config, Vec<String>, Option<u32>, Option<TitleFormatSetting>);
+type ParsedFile = (Config, Vec<String>, AppUi);
 
 /// Parses TOML into the configuration, the warnings and the app-owned
-/// settings of the playlist editor.
+/// settings of the `[ui]` table.
 fn parse_text(text: &str, path: Option<&Path>) -> Result<ParsedFile, ConfigError> {
     let toml_val: toml::Value = toml::from_str(text).map_err(|e| ConfigError::Malformed {
         path: path
@@ -475,9 +539,60 @@ fn parse_text(text: &str, path: Option<&Path>) -> Result<ParsedFile, ConfigError
     migrate_plugin_list(&mut config, &toml_val, path, &mut warnings);
     rustamp_prefs::keep_one_output(&mut config.plugins);
     let ui = toml_val.get("ui").and_then(toml::Value::as_table);
-    let playlist_font_size = ui.and_then(playlist_font_size_in_toml);
-    let playlist_title_format = ui.and_then(title_format_in_toml);
-    Ok((config, warnings, playlist_font_size, playlist_title_format))
+    let app_ui = AppUi {
+        playlist_font_size: ui.and_then(playlist_font_size_in_toml),
+        playlist_title_format: ui.and_then(title_format_in_toml),
+        // A mode the app does not know keeps the default, and the warning the
+        // list above built says why.
+        vis_mode: ui.and_then(vis_mode_in_toml).unwrap_or_default(),
+        skins_dir: ui.and_then(skins_dir_in_toml),
+    };
+    Ok((config, warnings, app_ui))
+}
+
+/// The names [`VIS_MODE_KEY`] accepts, in the order of the mode list.
+pub fn vis_mode_names() -> [&'static str; 4] {
+    [
+        vis_mode_name(rustamp_ui::visualization::VisMode::Spectrum),
+        vis_mode_name(rustamp_ui::visualization::VisMode::Scope),
+        vis_mode_name(rustamp_ui::visualization::VisMode::ScopeDots),
+        vis_mode_name(rustamp_ui::visualization::VisMode::Off),
+    ]
+}
+
+/// The text [`VIS_MODE_KEY`] carries for `mode`.
+pub fn vis_mode_name(mode: rustamp_ui::visualization::VisMode) -> &'static str {
+    use rustamp_ui::visualization::VisMode;
+    match mode {
+        VisMode::Spectrum => "spectrum",
+        VisMode::Scope => "scope",
+        VisMode::ScopeDots => "scope_dots",
+        VisMode::Off => "off",
+    }
+}
+
+/// The mode a `[ui.vis_mode]` text names; `None` for a name the app does not
+/// know (the names are spelled exactly as [`vis_mode_name`] writes them).
+pub fn vis_mode_from_name(name: &str) -> Option<rustamp_ui::visualization::VisMode> {
+    use rustamp_ui::visualization::VisMode;
+    match name {
+        "spectrum" => Some(VisMode::Spectrum),
+        "scope" => Some(VisMode::Scope),
+        "scope_dots" => Some(VisMode::ScopeDots),
+        "off" => Some(VisMode::Off),
+        _ => None,
+    }
+}
+
+/// The mode a `[ui]` table names, when it names one the app knows.
+fn vis_mode_in_toml(ui: &toml::Table) -> Option<rustamp_ui::visualization::VisMode> {
+    vis_mode_from_name(ui.get(VIS_MODE_KEY)?.as_str()?)
+}
+
+/// The skins folder a `[ui]` table names, when it names a non-empty path.
+fn skins_dir_in_toml(ui: &toml::Table) -> Option<PathBuf> {
+    let text = ui.get(SKINS_DIR_KEY)?.as_str()?;
+    (!text.is_empty()).then(|| PathBuf::from(text))
 }
 
 /// Turns schema 1's off-list into the explicit list of schema 2 (see the module
@@ -543,22 +658,19 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
             source: ConfigSource::Defaults,
             warnings: Vec::new(),
             warning: None,
-            playlist_font_size: None,
-            playlist_title_format: None,
+            app_ui: AppUi::default(),
         });
     };
     match std::fs::read_to_string(path) {
         Ok(text) => {
-            let (config, warnings, playlist_font_size, playlist_title_format) =
-                parse_text(&text, Some(path))?;
+            let (config, warnings, app_ui) = parse_text(&text, Some(path))?;
             let warning = warnings.first().cloned();
             Ok(ConfigLoad {
                 config,
                 source: ConfigSource::File(path.to_owned()),
                 warnings,
                 warning,
-                playlist_font_size,
-                playlist_title_format,
+                app_ui,
             })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ConfigLoad {
@@ -566,8 +678,7 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
             source: ConfigSource::Defaults,
             warnings: Vec::new(),
             warning: None,
-            playlist_font_size: None,
-            playlist_title_format: None,
+            app_ui: AppUi::default(),
         }),
         Err(error) => Err(ConfigError::Read {
             path: path.to_owned(),
@@ -594,11 +705,13 @@ pub fn load(path: Option<&Path>) -> Result<ConfigLoad, ConfigError> {
 /// `playlist_title_format` is the playlist's title format (spec S14): it is
 /// written only when the user set one, because the rows show their plain
 /// text otherwise.
-pub fn serialize_honest(
-    config: &Config,
-    playlist_font_size: Option<u32>,
-    playlist_title_format: Option<&TitleFormatSetting>,
-) -> Result<String, ConfigError> {
+///
+/// `vis_mode` is written only when the analyser draws anything but the
+/// default spectrum: a value the app cannot read stays the file's own
+/// setting, and the key then is not the app's to write. `skins_dir` is
+/// written only when the user chose a folder, so that a default file keeps
+/// reading the `skins` folder beside itself.
+pub fn serialize_honest(config: &Config, app_ui: &AppUi) -> Result<String, ConfigError> {
     let mut root = toml::Table::new();
     root.insert(
         "version".into(),
@@ -620,9 +733,9 @@ pub fn serialize_honest(
         "fadeout_ms".into(),
         toml::Value::Integer(i64::from(config.audio.fadeout_ms)),
     );
-    // Persist the request, not a device-specific downgrade. Like the native
-    // preferences label says, a change takes effect at the next startup
-    // (also used when the app recreates the engine and device).
+    // Persist the request, not a device-specific downgrade. The app opens the
+    // device again when the mode changes (`App::change_output`), and a running
+    // track keeps its device until it stops.
     audio.insert(
         "output_mode".into(),
         toml::Value::try_from(config.audio.output_mode).map_err(|e| ConfigError::Write {
@@ -682,7 +795,7 @@ pub fn serialize_honest(
     );
     // The playlist editor's runtime font size, when the user chose one: the
     // skin's size is in use otherwise, so the key stays out of the file.
-    if let Some(size) = playlist_font_size {
+    if let Some(size) = app_ui.playlist_font_size {
         ui.insert(
             PLAYLIST_FONT_SIZE_KEY.into(),
             toml::Value::Integer(i64::from(size)),
@@ -690,13 +803,30 @@ pub fn serialize_honest(
     }
     // The playlist's title format, when the user set one: the rows show
     // their plain text otherwise, so the key stays out of the file.
-    if let Some(setting) = playlist_title_format {
+    if let Some(setting) = &app_ui.playlist_title_format {
         let mut title_format = toml::Table::new();
         title_format.insert("enabled".into(), toml::Value::Boolean(setting.enabled));
         title_format.insert("format".into(), toml::Value::String(setting.format.clone()));
         ui.insert(
             PLAYLIST_TITLE_FORMAT_KEY.into(),
             toml::Value::Table(title_format),
+        );
+    }
+    // The analyzer mode, when it is not the default: like the font size, a
+    // value the app could not read is not the app's to overwrite, so the key
+    // exists only when the app has a mode of its own to state.
+    if app_ui.vis_mode != rustamp_ui::visualization::VisMode::default() {
+        ui.insert(
+            VIS_MODE_KEY.into(),
+            toml::Value::String(vis_mode_name(app_ui.vis_mode).to_string()),
+        );
+    }
+    // The skins folder, when the user chose one: the `skins` folder beside the
+    // configuration is read otherwise.
+    if let Some(dir) = &app_ui.skins_dir {
+        ui.insert(
+            SKINS_DIR_KEY.into(),
+            toml::Value::String(dir.to_string_lossy().into_owned()),
         );
     }
 
@@ -797,17 +927,10 @@ pub fn serialize_honest(
 /// a setting that cannot be kept must not break the file.
 pub fn serialize_preserving(
     config: &Config,
-    playlist_font_size: Option<u32>,
-    playlist_title_format: Option<&TitleFormatSetting>,
+    app_ui: &AppUi,
     previous: &str,
 ) -> Result<String, ConfigError> {
-    merged_document(
-        config,
-        playlist_font_size,
-        playlist_title_format,
-        previous,
-        Path::new("<memory>"),
-    )
+    merged_document(config, app_ui, previous, Path::new("<memory>"))
 }
 
 /// The merged document for `previous`, or the reason why there is none.
@@ -816,8 +939,7 @@ pub fn serialize_preserving(
 /// carry.
 fn merged_document(
     config: &Config,
-    playlist_font_size: Option<u32>,
-    playlist_title_format: Option<&TitleFormatSetting>,
+    app_ui: &AppUi,
     previous: &str,
     path: &Path,
 ) -> Result<String, ConfigError> {
@@ -826,7 +948,7 @@ fn merged_document(
             path: path.to_owned(),
             error: e.to_string(),
         })?;
-    let honest = serialize_honest(config, playlist_font_size, playlist_title_format)?;
+    let honest = serialize_honest(config, app_ui)?;
     let merged = config_preserve::merge(&honest, previous, &|path| {
         owns_setting(path, &previous_value)
     });
@@ -847,12 +969,7 @@ fn merged_document(
 /// A file that is not valid TOML is **not** overwritten: the save would
 /// destroy the settings the app could not read, so it fails loudly with
 /// [`ConfigError::Malformed`] and the file stays as it was.
-pub fn save(
-    config: &Config,
-    playlist_font_size: Option<u32>,
-    playlist_title_format: Option<&TitleFormatSetting>,
-    path: &Path,
-) -> Result<(), ConfigError> {
+pub fn save(config: &Config, app_ui: &AppUi, path: &Path) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -869,16 +986,10 @@ pub fn save(
                 path: path.to_owned(),
                 error: e.to_string(),
             })?;
-            merged_document(
-                config,
-                playlist_font_size,
-                playlist_title_format,
-                &previous,
-                path,
-            )?
+            merged_document(config, app_ui, &previous, path)?
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            serialize_honest(config, playlist_font_size, playlist_title_format)?
+            serialize_honest(config, app_ui)?
         }
         Err(error) => {
             return Err(ConfigError::Read {
@@ -916,6 +1027,20 @@ mod tests {
     /// The window list covers every `WindowId` variant (including `Gen(n)`
     /// and `Video`) and both a sized and an unsized window.
     ///
+    /// The app-owned `[ui]` settings of a fixture.
+    ///
+    /// Every field differs from its default, because the owned-setting check
+    /// below needs a value at every owned path: a fixture that left one at the
+    /// default could not tell a written setting from an omitted one.
+    fn app_ui(font_size: Option<u32>, title_format: Option<&TitleFormatSetting>) -> AppUi {
+        AppUi {
+            playlist_font_size: font_size,
+            playlist_title_format: title_format.cloned(),
+            vis_mode: rustamp_ui::visualization::VisMode::ScopeDots,
+            skins_dir: Some(PathBuf::from("skins")),
+        }
+    }
+
     /// The settings the player does **not** honour are set as well
     /// (`audio.output`, `audio.buffer_ms`, `audio.gapless`,
     /// `playlist.manual_advance`, `playlist.last_playlist`,
@@ -1197,7 +1322,7 @@ mod tests {
             },
         ];
 
-        save(&config, None, None, &path).expect("save succeeds");
+        save(&config, &AppUi::default(), &path).expect("save succeeds");
         let loaded = load(Some(&path)).expect("a written file must load again");
         assert_eq!(loaded.config.ui.windows, config.ui.windows);
     }
@@ -1218,7 +1343,7 @@ mod tests {
 
         let config = every_field_set();
 
-        save(&config, Some(18), None, &path).expect("save succeeds");
+        save(&config, &app_ui(Some(18), None), &path).expect("save succeeds");
         assert!(path.exists(), "config file was written");
 
         let loaded = load(Some(&path)).expect("load succeeds");
@@ -1229,7 +1354,7 @@ mod tests {
             loaded.warnings
         );
         assert_eq!(
-            loaded.playlist_font_size,
+            loaded.app_ui.playlist_font_size,
             Some(18),
             "the playlist font size survives the round trip"
         );
@@ -1361,12 +1486,13 @@ mod tests {
         // owns beside the configuration tree.
         let title_format = TitleFormatSetting::new(true, "[%artist% - ]%title%");
         let written = toml::from_str::<toml::Value>(
-            &serialize_honest(&every_field_set(), Some(18), Some(&title_format))
+            &serialize_honest(&every_field_set(), &app_ui(Some(18), Some(&title_format)))
                 .expect("serialize the fixture"),
         )
         .expect("the writer's output is valid TOML");
         let default = toml::from_str::<toml::Value>(
-            &serialize_honest(&Config::default(), None, None).expect("serialize the default"),
+            &serialize_honest(&Config::default(), &AppUi::default())
+                .expect("serialize the default"),
         )
         .expect("the default's document is valid TOML");
 
@@ -1391,7 +1517,7 @@ mod tests {
     #[test]
     fn the_honest_serialization_round_trips_in_memory() {
         let config = every_field_set();
-        let text = serialize_honest(&config, Some(18), None).expect("serialize");
+        let text = serialize_honest(&config, &app_ui(Some(18), None)).expect("serialize");
 
         let back = parse(&text).expect("the writer's output is a config file");
         assert_eq!(back.version, config.version, "version");
@@ -1471,7 +1597,7 @@ mod tests {
 
         let config = every_field_set();
 
-        save(&config, None, None, &path).expect("save succeeds");
+        save(&config, &AppUi::default(), &path).expect("save succeeds");
 
         let text = std::fs::read_to_string(&path).expect("the file is there");
         for (table, key) in [
@@ -1513,18 +1639,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("playlist-font.toml");
 
-        save(&Config::default(), Some(18), None, &path).expect("save succeeds");
+        save(&Config::default(), &app_ui(Some(18), None), &path).expect("save succeeds");
         let loaded = load(Some(&path)).expect("load succeeds");
-        assert_eq!(loaded.playlist_font_size, Some(18));
+        assert_eq!(loaded.app_ui.playlist_font_size, Some(18));
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
 
         // Without a chosen size the key stays out of the file: the skin's
         // size is in use then.
-        save(&Config::default(), None, None, &path).expect("save succeeds");
+        save(&Config::default(), &AppUi::default(), &path).expect("save succeeds");
         let text = std::fs::read_to_string(&path).expect("the file is there");
         assert!(!text.contains(PLAYLIST_FONT_SIZE_KEY), "{text}");
         assert_eq!(
-            load(Some(&path)).expect("load succeeds").playlist_font_size,
+            load(Some(&path))
+                .expect("load succeeds")
+                .app_ui
+                .playlist_font_size,
             None
         );
 
@@ -1533,7 +1662,7 @@ mod tests {
             std::fs::write(&path, format!("[ui]\n{PLAYLIST_FONT_SIZE_KEY} = {value}\n"))
                 .expect("the file is written");
             let loaded = load(Some(&path)).expect("load succeeds");
-            assert_eq!(loaded.playlist_font_size, None, "{value}");
+            assert_eq!(loaded.app_ui.playlist_font_size, None, "{value}");
             assert!(
                 loaded
                     .warnings
@@ -1554,19 +1683,20 @@ mod tests {
         let path = dir.path().join("playlist-title-format.toml");
         let setting = TitleFormatSetting::new(true, "[%artist% - ]%title%");
 
-        save(&Config::default(), None, Some(&setting), &path).expect("save succeeds");
+        save(&Config::default(), &app_ui(None, Some(&setting)), &path).expect("save succeeds");
         let loaded = load(Some(&path)).expect("load succeeds");
-        assert_eq!(loaded.playlist_title_format, Some(setting));
+        assert_eq!(loaded.app_ui.playlist_title_format, Some(setting));
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
 
         // Without a setting the key stays out of the file: the rows show
         // their plain text then.
-        save(&Config::default(), None, None, &path).expect("save succeeds");
+        save(&Config::default(), &AppUi::default(), &path).expect("save succeeds");
         let text = std::fs::read_to_string(&path).expect("the file is there");
         assert!(!text.contains(PLAYLIST_TITLE_FORMAT_KEY), "{text}");
         assert_eq!(
             load(Some(&path))
                 .expect("load succeeds")
+                .app_ui
                 .playlist_title_format,
             None
         );
@@ -1576,7 +1706,7 @@ mod tests {
         let broken = "[ui.playlist_title_format]\nenabled = true\nformat = 42\n";
         std::fs::write(&path, broken).expect("the file is written");
         let loaded = load(Some(&path)).expect("load succeeds");
-        assert_eq!(loaded.playlist_title_format, None);
+        assert_eq!(loaded.app_ui.playlist_title_format, None);
         assert!(
             loaded
                 .warnings
@@ -1585,7 +1715,7 @@ mod tests {
             "{:?}",
             loaded.warnings
         );
-        save(&Config::default(), None, None, &path).expect("save succeeds");
+        save(&Config::default(), &AppUi::default(), &path).expect("save succeeds");
         let saved = std::fs::read_to_string(&path).expect("the file is there");
         assert!(
             saved.lines().any(|line| line == "format = 42"),
@@ -1601,9 +1731,9 @@ mod tests {
         let path = dir.path().join("broken-format.toml");
         let setting = TitleFormatSetting::new(true, "%title");
 
-        save(&Config::default(), None, Some(&setting), &path).expect("save succeeds");
+        save(&Config::default(), &app_ui(None, Some(&setting)), &path).expect("save succeeds");
         let loaded = load(Some(&path)).expect("load succeeds");
-        assert_eq!(loaded.playlist_title_format, Some(setting));
+        assert_eq!(loaded.app_ui.playlist_title_format, Some(setting));
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
     }
 
@@ -1618,7 +1748,7 @@ mod tests {
         config.playlist.repeat = true;
         config.plugins.enabled = vec!["bad_plugin.dll".into()];
 
-        let serialized = serialize_honest(&config, None, None).expect("serialize honest");
+        let serialized = serialize_honest(&config, &AppUi::default()).expect("serialize honest");
 
         // The serialized text must NOT contain any unhonoured field names.
         let ignored_keywords = [

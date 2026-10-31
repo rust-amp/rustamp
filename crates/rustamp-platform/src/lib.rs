@@ -74,8 +74,9 @@ pub use popup_menu::{PopupMenuError, PopupRow, item_text, show_popup_menu};
 #[cfg(windows)]
 pub use prefs_dialog::PrefsWindow;
 pub use prefs_dialog::{
-    Bind, LibraryRootRow, PluginRow, PrefsAction, PrefsError, PrefsNode, PrefsSettings, RowId,
-    TREE as PREFS_TREE, TextBind, library_root_text,
+    Bind, LibraryRootRow, MAX_SNAP_DISTANCE, PluginRow, PrefsAction, PrefsError, PrefsNode,
+    PrefsSettings, RowId, TREE as PREFS_TREE, TextBind, VIS_MODE_CHOICES, library_root_text,
+    parse_snap_distance, snap_distance_text,
 };
 pub use shell_registration::{
     DIRECTORY_HANDLER, DROP_TARGET_VALUE, Entry, Handler, MEDIA_PROG_ID, PLAYLIST_PROG_ID,
