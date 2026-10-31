@@ -151,23 +151,88 @@ fn tail(path: &Path, lines: usize) -> String {
 #[ignore = "VM-only: runs the real player, the real plug-in host and MilkDrop; run in the test VM"]
 fn the_player_starts_milkdrop_and_feeds_it_what_it_plays() {
     the_player_runs(
+        "w566",
         "vis_milk2.dll",
         &["d3dx9_31.dll"],
         "MilkDrop",
         "vis-end-to-end.png",
+        None,
     );
 }
 
 #[test]
 #[ignore = "VM-only: runs the real player, the real plug-in host and AVS; run in the test VM"]
 fn the_player_starts_avs_and_feeds_it_what_it_plays() {
-    the_player_runs("vis_avs.dll", &[], "AVS", "vis-avs.png");
+    the_player_runs(
+        "w566",
+        "vis_avs.dll",
+        &[],
+        "AVS",
+        "vis-avs.png",
+        Some("t=t-0.05"),
+    );
+}
+
+/// Cockos Happy AVS, the 2.91 fork with the newer EEL. Its preset is written in
+/// that syntax, which the older AVS cannot read: a picture proves the new EEL.
+#[test]
+#[ignore = "VM-only: runs the real player, the real plug-in host and CHAVS; run in the test VM"]
+fn the_player_starts_chavs_and_feeds_it_what_it_plays() {
+    the_player_runs(
+        "chavs",
+        "vis_chavs.dll",
+        &[],
+        "AVS",
+        "vis-chavs.png",
+        Some("t > -100 ? t = t - 0.05 : t = 0;"),
+    );
+}
+
+/// A preset as AVS keeps it in `vis_avs.dat`: the list clears every frame and
+/// holds one SuperScope, whose per-frame code is `frame`. (The format is in the
+/// BSD-licensed AVS source, `r_list.cpp` and `r_sscope.cpp`.)
+fn superscope_preset(frame: &str) -> Vec<u8> {
+    const SUPERSCOPE: u32 = 36;
+    let mut scope = vec![1u8];
+    for code in [
+        "d=i+v*0.2; r=t+i*$PI*4; x=cos(r)*d; y=sin(r)*d",
+        frame,
+        "",
+        "n=100",
+    ] {
+        if code.is_empty() {
+            scope.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            scope.extend_from_slice(&(code.len() as u32 + 1).to_le_bytes());
+            scope.extend_from_slice(code.as_bytes());
+            scope.push(0);
+        }
+    }
+    // Both channels, one white colour, lines.
+    for value in [2u32, 1, 0x00FF_FFFF, 1] {
+        scope.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut preset = b"Nullsoft AVS Preset 0.2\x1a".to_vec();
+    preset.push(1);
+    preset.extend_from_slice(&SUPERSCOPE.to_le_bytes());
+    preset.extend_from_slice(&(scope.len() as u32).to_le_bytes());
+    preset.extend_from_slice(&scope);
+    preset
 }
 
 /// Starts `plugin` in the real player and waits for its `render`, then for a
-/// host window whose title holds `title_part`. `companions` are the DLLs it
-/// needs beside it, and `shot` names the screenshot.
-fn the_player_runs(plugin: &str, companions: &[&str], title_part: &str, shot: &str) {
+/// host window whose title holds `title_part`. `plugin` and its `companions`,
+/// the DLLs it needs beside it, come from the staged `folder`, and `shot` names
+/// the screenshot. `preset_frame` asks for a SuperScope preset with that
+/// per-frame code, and for its picture on the screen.
+fn the_player_runs(
+    folder: &str,
+    plugin: &str,
+    companions: &[&str],
+    title_part: &str,
+    shot: &str,
+    preset_frame: Option<&str>,
+) {
     rustamp_app::window::require_test_vm();
     let out = PathBuf::from(r"C:\rustamp\out\gui-session");
     let _ = std::fs::create_dir_all(&out);
@@ -180,7 +245,10 @@ fn the_player_runs(plugin: &str, companions: &[&str], title_part: &str, shot: &s
     let plugins = root.join("Plugins");
     std::fs::create_dir_all(&plugins).unwrap();
     for file in std::iter::once(&plugin).chain(companions) {
-        std::fs::copy(staged.join("w566").join(file), plugins.join(file)).unwrap();
+        std::fs::copy(staged.join(folder).join(file), plugins.join(file)).unwrap();
+    }
+    if let Some(frame) = preset_frame {
+        std::fs::write(plugins.join("vis_avs.dat"), superscope_preset(frame)).unwrap();
     }
     copy_tree(
         &staged.join("w566").join("Microsoft.VC90.CRT"),
@@ -299,6 +367,23 @@ fn the_player_runs(plugin: &str, companions: &[&str], title_part: &str, shot: &s
             15,
         );
         note(&mut report, &out, "screenshot taken".to_string());
+        if preset_frame.is_some() {
+            // The picture: the frame sits at the top left of the screen, and a
+            // scope's line is white on black.
+            let bright = powershell(
+                &format!(
+                    "Add-Type -AssemblyName System.Drawing; \
+                     $b = New-Object System.Drawing.Bitmap '{}'; $n = 0; \
+                     for ($y = 70; $y -lt 295; $y += 1) {{ for ($x = 45; $x -lt 355; $x += 1) {{ \
+                     if ($b.GetPixel($x,$y).GetBrightness() -gt 0.2) {{ $n++ }} }} }}; $n",
+                    png.display()
+                ),
+                60,
+            );
+            note(&mut report, &out, format!("bright pixels: {bright}"));
+            let bright: u32 = bright.trim().parse().unwrap_or(0);
+            assert!(bright > 50, "{plugin} drew nothing: {bright} bright pixels");
+        }
         assert!(
             rendering,
             "the toggle never reached a render: {}",
