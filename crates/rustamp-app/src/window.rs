@@ -527,6 +527,8 @@ struct Windowed {
     dialog_id: Option<WindowId>,
     /// Which dialog the OS window above shows (`None` while it is closed).
     dialog_kind: Option<DialogKind>,
+    /// No fresh key press reached the dialog window yet.
+    dialog_awaits_press: bool,
     /// The media library window: a **modern** window (native title bar,
     /// system font, its own chrome - see `crate::modern_shell`), created and
     /// dropped to match [`App::library_open`].
@@ -635,6 +637,7 @@ impl Windowed {
             dialog_surface: None,
             dialog_id: None,
             dialog_kind: None,
+            dialog_awaits_press: false,
             library_window: None,
             library_surface: None,
             applied_library_title: None,
@@ -2150,6 +2153,7 @@ impl Windowed {
         if self.route_open_dialog(kind) {
             return;
         }
+        self.dialog_awaits_press = true;
         let (width, height) = kind.client_size();
         let attributes =
             Self::window_attributes(PresenterWindow::Dialog, kind.title(), (width, height), None);
@@ -2238,6 +2242,12 @@ impl Windowed {
         if event.state != ElementState::Pressed {
             return;
         }
+        // The auto-repeat of the key that opened the dialog is not typing
+        // either; the first fresh press ends the wait.
+        if event.repeat && self.dialog_awaits_press {
+            return;
+        }
+        self.dialog_awaits_press = false;
         // A dialog with a text field takes the OS text of the press first:
         // it is layout-aware and carries case and punctuation (`:`, `\`,
         // `.`, AltGr characters), so an ordinary path can be typed (BETA-03).
@@ -2319,6 +2329,12 @@ impl Windowed {
                 }
                 self.request_dialog_redraw();
             }
+            // The press that opened the dialog is still down when the new
+            // window takes the focus, and the system reports held keys to it
+            // as presses. They are not typed text.
+            WindowEvent::KeyboardInput {
+                is_synthetic: true, ..
+            } => {}
             WindowEvent::KeyboardInput { event, .. } => {
                 self.dialog_key_event(event_loop, &event);
             }

@@ -2578,3 +2578,120 @@ fn buffered_device_drops_tail_on_stop_preventing_stale_replay() {
     assert_ne!(left2, track1_expected, "must NOT replay track 1 audio!");
     assert_eq!(left2, track2_expected, "must play track 2 audio cleanly!");
 }
+
+/// A path beside the harness's tracks that holds nothing.
+fn missing_track(h: &Harness) -> rustamp_audio::TrackSource {
+    let dir = std::path::Path::new(&h.paths[0]).parent().unwrap();
+    rustamp_audio::TrackSource::path(dir.join("missing.tst"))
+}
+
+#[test]
+fn next_and_previous_while_stopped_move_without_starting_playback() {
+    // S02 §1: the playlist position moves by one, the state stays stopped.
+    let mut h = Harness::new(&[LONG_A, LONG_B, LONG_A]);
+    h.engine.play().unwrap();
+    assert!(h.wait_track(0));
+    h.engine.stop().unwrap();
+    h.drain_events();
+
+    h.engine.next_track().unwrap();
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+    assert_eq!(h.engine.current_index(), Some(1));
+    let events = h.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::TrackChanged { index: Some(1), .. })),
+        "the marquee is told: {events:?}"
+    );
+
+    h.engine.prev_track().unwrap();
+    assert_eq!(h.engine.transport(), TransportState::Stopped);
+    assert_eq!(h.engine.current_index(), Some(0));
+
+    // A later play starts from the moved entry.
+    h.engine.next_track().unwrap();
+    h.engine.play().unwrap();
+    assert!(h.wait_track(1));
+    assert_eq!(h.engine.transport(), TransportState::Playing);
+}
+
+#[test]
+fn an_entry_added_during_a_run_is_the_next_one() {
+    let mut h = Harness::new(&[LONG_A, LONG_B]);
+    let first = rustamp_audio::TrackSource::path(&h.paths[0]);
+    let second = rustamp_audio::TrackSource::path(&h.paths[1]);
+    h.engine.set_queue(vec![first.clone()]);
+    h.engine.play().unwrap();
+    assert!(h.wait_track(0));
+
+    h.engine.set_queue(vec![first, second]);
+    h.engine.pause().unwrap();
+    h.engine.next_track().unwrap();
+    assert!(h.wait_track(1), "the run knows the added entry");
+    assert_eq!(h.engine.transport(), TransportState::Paused);
+}
+
+#[test]
+fn removing_an_entry_before_the_playing_one_keeps_the_traversal_on_it() {
+    let mut h = Harness::new(&[LONG_A, LONG_B, LONG_A]);
+    let tracks: Vec<_> = h
+        .paths
+        .iter()
+        .map(rustamp_audio::TrackSource::path)
+        .collect();
+    h.engine.play_index(1).unwrap();
+    assert!(h.wait_track(1));
+
+    h.engine.set_queue(tracks[1..].to_vec());
+    h.engine.set_current_index(Some(0));
+    assert_eq!(h.engine.current_index(), Some(0));
+
+    h.engine.next_track().unwrap();
+    assert!(h.wait_track(1), "the entry behind the playing one is next");
+}
+
+#[test]
+fn an_entry_that_will_not_open_is_skipped_and_named() {
+    // S02 §1.1: the list goes on behind an entry that does not open.
+    let mut h = Harness::new(&[TRACK_A, TRACK_B]);
+    let missing = missing_track(&h);
+    let queue = vec![
+        missing.clone(),
+        rustamp_audio::TrackSource::path(&h.paths[0]),
+    ];
+    h.engine.set_queue(queue);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(1), "the entry behind the dead one plays");
+    let events = h.drain_events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::Error(info) if info.message.starts_with(&format!(
+                "{}{}",
+                rustamp_audio::decode::CANNOT_PLAY,
+                missing.display()
+            ))
+        )),
+        "the report names the dead entry: {events:?}"
+    );
+}
+
+#[test]
+fn a_list_of_dead_entries_ends_even_with_repeat_on() {
+    let mut h = Harness::new(&[TRACK_A]);
+    let missing = missing_track(&h);
+    h.engine.set_queue(vec![missing.clone(), missing]);
+    h.engine.set_repeat(true).unwrap();
+    h.engine.play_index(0).unwrap();
+    assert!(
+        h.wait_pumping(|e| e.transport() == TransportState::Stopped, WAIT),
+        "a repeating list of dead entries must not spin"
+    );
+    let errors = h
+        .drain_events()
+        .iter()
+        .filter(|e| matches!(e, Event::Error(_)))
+        .count();
+    assert_eq!(errors, 2, "each entry is reported once");
+}

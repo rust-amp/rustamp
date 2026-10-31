@@ -892,19 +892,29 @@ impl App {
         }
     }
 
-    /// The row text for one entry: the engine queue's display name at the
-    /// entry's index, falling back to the entry id when it has no queue row
-    /// (for example after a REM that the engine queue does not track yet).
+    /// The row text for one entry: its position in the list (S06 §5: the rows
+    /// renumber after a removal) and its name, which is the tags once they
+    /// arrived and the file name until then. It falls back to the entry id when
+    /// it has no queue row (for example after a REM that the engine queue does
+    /// not track yet).
     ///
     /// With the title format turned on (spec S14), the row shows the format
-    /// the user set instead, rendered with the fields the row carries. The
-    /// format is off without a setting, so the row text is exactly what it
-    /// is today.
+    /// the user set instead, rendered with the fields the row carries.
     fn playlist_label(&self, id: EntryId, format: &TitleFormat) -> String {
         let index = self.entry_ids.iter().position(|entry| *entry == id);
         let source = index.and_then(|index| self.engine().queue().get(index));
         let plain = match source {
-            Some(track) => track.display(),
+            Some(_) => {
+                let name = index
+                    .and_then(|index| self.entry_name(index))
+                    .unwrap_or_default();
+                // A row without a name stays an empty row.
+                if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}. {name}", index.map_or(0, |index| index + 1))
+                }
+            }
             None => format!("{id:?}"),
         };
         if !format.is_enabled() {
@@ -1985,7 +1995,7 @@ mod tests {
     /// The playlist's title format (spec **S14**) is off without a setting,
     /// so the rows show exactly the text they show today.
     #[test]
-    fn without_a_setting_the_row_shows_the_text_of_today() {
+    fn without_a_setting_the_row_shows_its_number_and_name() {
         let mut app = test_app();
         add_entries(&mut app, 3);
         let ids = app.playlist().visible_ids();
@@ -1995,7 +2005,7 @@ mod tests {
             .iter()
             .map(|id| app.playlist_label(*id, &format))
             .collect();
-        assert_eq!(labels, ["track0.mp3", "track1.mp3", "track2.mp3"]);
+        assert_eq!(labels, ["1. track0", "2. track1", "3. track2"]);
         // The frame is the frame of those texts: the drawing did not change
         // either.
         let expected = render_playlist_window(
@@ -2061,7 +2071,7 @@ mod tests {
         assert!(!format.is_enabled(), "the format is not used");
         assert_eq!(
             app.playlist_label(id, &format),
-            "track0.mp3",
+            "1. track0",
             "the plain text stays"
         );
         // And the reason names what is wrong with the format.

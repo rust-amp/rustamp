@@ -363,6 +363,7 @@ impl MainWindow {
                 if duration_ms.is_some() {
                     self.duration_ms = *duration_ms;
                 }
+                self.follow_position();
             }
             Event::StreamInfoChanged(info) => self.stream = *info,
             Event::VolumeChanged { volume, balance } => {
@@ -588,6 +589,20 @@ impl MainWindow {
             }
             _ => None,
         }
+    }
+
+    /// Moves the position thumb to where the track is. A held thumb stays with
+    /// the pointer, and a track without a length has no place to show.
+    fn follow_position(&mut self) {
+        if self.held == Some(Widget::PositionSlider) || !self.state.seekable {
+            return;
+        }
+        self.state.position = match self.duration_ms {
+            Some(duration) if duration > 0 => {
+                (u128::from(self.position_ms.min(duration)) * 100 / u128::from(duration)) as u8
+            }
+            _ => 0,
+        };
     }
 
     fn set_slider(&mut self, widget: Widget, x: i32) {
@@ -1438,6 +1453,31 @@ mod tests {
     }
 
     // ----- a track that cannot be seeked (S19) -----
+
+    #[test]
+    fn the_position_thumb_follows_the_track_unless_it_is_held() {
+        let mut machine = MainWindow::new();
+        playing(&mut machine, 0);
+        load_track(&mut machine, "T1", 200_000, 0);
+        let position = |ms| Event::PositionChanged {
+            position_ms: ms,
+            duration_ms: Some(200_000),
+        };
+
+        machine.handle_event(&position(50_000), 0);
+        assert_eq!(machine.state().position, 25);
+        machine.handle_event(&position(150_000), 0);
+        assert_eq!(machine.state().position, 75);
+
+        // A held thumb stays with the pointer.
+        let (x, y) = centre(Widget::PositionSlider);
+        machine.mouse_down(x, y, 0);
+        machine.handle_event(&position(10_000), 0);
+        assert_eq!(machine.state().position, 50);
+        machine.mouse_up(x, y, 0);
+        machine.handle_event(&position(10_000), 0);
+        assert_eq!(machine.state().position, 5);
+    }
 
     #[test]
     fn a_seekable_track_offers_its_seek_exactly_as_before() {

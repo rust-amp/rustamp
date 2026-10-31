@@ -2121,7 +2121,12 @@ pub fn render_dialog(kind: DialogKind, skin: &Skin, body: &[&str]) -> Image {
     );
     let font = text_font(skin);
     if let Some(font) = font.as_ref() {
-        font.render_text(&mut canvas, TEXT_PAD, 3, kind.title());
+        font.render_text(
+            &mut canvas,
+            TEXT_PAD,
+            3,
+            &crate::render::text_font_chars(kind.title()),
+        );
         let mut y = BODY_TOP;
         for line in body {
             // The line's band has to fit into the client area; a line that
@@ -2129,7 +2134,12 @@ pub fn render_dialog(kind: DialogKind, skin: &Skin, body: &[&str]) -> Image {
             if y + TEXT_LINE_PX > height as i32 {
                 break;
             }
-            font.render_text(&mut canvas, TEXT_PAD, y, line);
+            font.render_text(
+                &mut canvas,
+                TEXT_PAD,
+                y,
+                &crate::render::text_font_chars(line),
+            );
             y += TEXT_LINE_PX;
         }
     }

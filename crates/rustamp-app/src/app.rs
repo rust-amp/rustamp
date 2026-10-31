@@ -47,6 +47,7 @@ use rustamp_core::config::{
 };
 use rustamp_core::error::{Error, ErrorInfo, ErrorKind, Result};
 use rustamp_core::event::Event;
+use rustamp_core::meta::TrackMetadata;
 use rustamp_core::playlist::{EntryId, MediaLocation, PlaylistChangeKind, SortKey};
 use rustamp_core::state::{PlayerState, TransportState, WindowId};
 use rustamp_gfx::Image;
@@ -2335,7 +2336,7 @@ impl App {
             let normalised = Event::TrackChanged {
                 id,
                 index: *index,
-                metadata: metadata.clone(),
+                metadata: self.metadata_with_name(*index, metadata.as_deref()),
                 duration_ms: *duration_ms,
             };
             self.ui.handle_event(&normalised, self.now_ms());
@@ -2343,6 +2344,43 @@ impl App {
         }
 
         self.ui.handle_event(event, self.now_ms());
+    }
+
+    /// The metadata the marquee gets for the entry at `index`: a track without
+    /// a title shows its file name, never a blank (S02 §3 item 2).
+    fn metadata_with_name(
+        &self,
+        index: Option<u32>,
+        metadata: Option<&TrackMetadata>,
+    ) -> Option<Box<TrackMetadata>> {
+        // A stopped player that moved to an entry has opened nothing: the tags
+        // the playlist read for its row say the same thing the row says.
+        let index = index.map(|index| index as usize);
+        let tags = || {
+            let id = self.entry_ids.get(index?)?;
+            self.playlist_tags.metadata(*id).cloned()
+        };
+        let mut shown = metadata.cloned().or_else(tags).unwrap_or_default();
+        if shown.title.is_none()
+            && let Some(track) = index.and_then(|index| self.engine.queue().get(index))
+        {
+            shown.title = Some(track.display_name());
+        }
+        Some(Box::new(shown))
+    }
+
+    /// The name a listing shows for a queue entry: its tags once they arrived,
+    /// its file name until then.
+    pub(crate) fn entry_name(&self, index: usize) -> Option<String> {
+        let track = self.engine.queue().get(index)?;
+        let tags = self
+            .entry_ids
+            .get(index)
+            .and_then(|id| self.playlist_tags.metadata(*id));
+        Some(
+            tags.and_then(TrackMetadata::display_title)
+                .unwrap_or_else(|| track.display_name()),
+        )
     }
 
     /// Applies a [`PlayerState`] snapshot by translating it into the events the
@@ -2376,7 +2414,7 @@ impl App {
                 &Event::TrackChanged {
                     id: state.current_id,
                     index: state.current_index,
-                    metadata: None,
+                    metadata: self.metadata_with_name(state.current_index, None),
                     duration_ms: state.duration_ms,
                 },
                 now,
@@ -3443,6 +3481,10 @@ impl App {
             .and_then(|index| self.engine.queue().get(index as usize))
             .map(|track| track.display());
         let message = match entry {
+            // An entry that would not open was named by the run itself.
+            _ if info.message.starts_with(rustamp_audio::decode::CANNOT_PLAY) => {
+                info.message.clone()
+            }
             Some(entry) if self.engine.transport() != TransportState::Stopped => {
                 format!("cannot play {entry}: {}", info.message)
             }
@@ -3469,8 +3511,10 @@ impl App {
         } else {
             self.last_error = Some(message);
         }
+        // A run that skipped a dead entry goes on by itself (S02 §1.1).
         if self.engine.transport() != TransportState::Stopped
             && self.engine.end_of_stream().is_none()
+            && !info.message.starts_with(rustamp_audio::decode::CANNOT_PLAY)
             && let Err(error) = self.engine.stop()
         {
             self.note(format!("error: stopping after the failure failed: {error}"));
@@ -6487,11 +6531,11 @@ mod tests {
         assert_eq!(lines.first().map(String::as_str), Some("Search: "));
         assert_eq!(lines.len(), 1 + 3 + 1, "{lines:?}");
         assert!(lines[1].starts_with("> 1. "), "{lines:?}");
-        assert!(lines[1].ends_with("alpha.mp3"), "{lines:?}");
+        assert!(lines[1].ends_with("alpha"), "{lines:?}");
         assert!(lines[2].starts_with("  2. "), "{lines:?}");
-        assert!(lines[2].ends_with("beta.mp3"), "{lines:?}");
+        assert!(lines[2].ends_with("beta"), "{lines:?}");
         assert!(lines[3].starts_with("  3. "), "{lines:?}");
-        assert!(lines[3].ends_with("Gamma Beta.mp3"), "{lines:?}");
+        assert!(lines[3].ends_with("Gamma Beta"), "{lines:?}");
         assert_eq!(lines.last().map(String::as_str), Some("3 of 3 entries"));
 
         // A search narrows the list and the count.
@@ -6499,7 +6543,7 @@ mod tests {
         let lines = app.open_dialog_lines().unwrap();
         assert_eq!(lines.first().map(String::as_str), Some("Search: BETA"));
         assert!(lines[1].starts_with("> 2. "), "{lines:?}");
-        assert!(lines[1].ends_with("beta.mp3"), "{lines:?}");
+        assert!(lines[1].ends_with("beta"), "{lines:?}");
         assert!(lines[2].starts_with("  3. "), "{lines:?}");
         assert_eq!(lines.last().map(String::as_str), Some("2 of 3 entries"));
     }

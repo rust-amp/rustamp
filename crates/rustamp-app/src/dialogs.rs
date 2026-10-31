@@ -189,8 +189,12 @@ impl App {
             .queue()
             .iter()
             .enumerate()
-            .filter(|(_, source)| {
-                needle.is_empty() || source.display().to_lowercase().contains(&needle)
+            .filter(|(index, source)| {
+                needle.is_empty()
+                    || source.display().to_lowercase().contains(&needle)
+                    || self
+                        .entry_name(*index)
+                        .is_some_and(|name| name.to_lowercase().contains(&needle))
             })
             .map(|(index, _)| index)
             .collect()
@@ -225,7 +229,7 @@ impl App {
         for (row, &index) in matches.iter().enumerate().skip(first).take(rows) {
             let marker = if row == selected { "> " } else { "  " };
             let prefix = format!("{marker}{}. ", index + 1);
-            let text = queue.get(index).map(|source| source.display());
+            let text = self.entry_name(index);
             // The row's own prefix takes cells of the line, so the entry's
             // text gets only what is left; otherwise the tail the user
             // searched for would be clipped away by the dialog's edge.

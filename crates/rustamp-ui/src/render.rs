@@ -784,6 +784,40 @@ fn text_font(sheets: &Sheets) -> Option<BitmapFont> {
     Some(BitmapFont::new(image, glyphs, None, 0))
 }
 
+/// `text` in the characters the `text.bmp` font can draw, one for one, so the
+/// text keeps its length.
+///
+/// The classic font has no lowercase: lowercase letters select the uppercase
+/// glyphs (S01 §2.2), and a capital selects the same one. An accented Latin
+/// letter loses its accent unless the font has it (Å, Ö, Ä), and anything else
+/// without a glyph shows as `?`, because a blank cell would read as a space.
+pub(crate) fn text_font_chars(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            let ch = match ch {
+                'å' => 'Å',
+                'ö' => 'Ö',
+                'ä' => 'Ä',
+                'à' | 'á' | 'â' | 'ã' | 'æ' | 'À' | 'Á' | 'Â' | 'Ã' | 'Æ' => 'a',
+                'ç' | 'Ç' => 'c',
+                'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => 'e',
+                'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' => 'i',
+                'ñ' | 'Ñ' => 'n',
+                'ò' | 'ó' | 'ô' | 'õ' | 'ø' | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ø' => 'o',
+                'ß' => 's',
+                'ù' | 'ú' | 'û' | 'ü' | 'Ù' | 'Ú' | 'Û' | 'Ü' => 'u',
+                'ý' | 'ÿ' | 'Ý' => 'y',
+                other => other.to_ascii_lowercase(),
+            };
+            if webamp::TEXT_GLYPHS.iter().any(|(glyph, _, _)| *glyph == ch) {
+                ch
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 /// Renders `text` into a `field`-sized scratch buffer and composites it, so the
 /// text cannot spill outside the field.
 fn draw_text_field(canvas: &mut Image, sheets: &Sheets, field: Rect, text: Option<u32>) {
@@ -808,13 +842,12 @@ fn draw_marquee(
         return;
     };
     let mut scratch = Image::new(layout.marquee.width, layout.marquee.height);
-    // The classic font has no lowercase; lowercase letters select the uppercase
-    // glyphs (S01 §2.2). The offset is the marquee scroll (S02 §3).
+    // The offset is the marquee scroll (S02 §3).
     font.render_text(
         &mut scratch,
         -state.marquee_offset,
         0,
-        &state.title.to_ascii_lowercase(),
+        &text_font_chars(&state.title),
     );
     canvas.blit_alpha(
         &scratch,
@@ -826,6 +859,16 @@ fn draw_marquee(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_text_font_draws_every_character_of_a_title() {
+        assert_eq!(text_font_chars("Jump To File"), "jump to file");
+        assert_eq!(text_font_chars("Ünïcödé"), "unicÖde");
+        assert_eq!(text_font_chars("Åäö"), "ÅÄÖ");
+        assert_eq!(text_font_chars("日本語"), "???");
+        assert_eq!(text_font_chars(r"a:\b-c.wav"), r"a:\b-c.wav");
+    }
+
     use super::*;
 
     #[test]

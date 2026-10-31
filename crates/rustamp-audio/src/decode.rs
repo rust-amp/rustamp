@@ -193,6 +193,18 @@ impl TrackSource {
         }
     }
 
+    /// The name a listing shows for an entry without tags: a file's name
+    /// without its extension, a URL as it is.
+    pub fn display_name(&self) -> String {
+        match self {
+            TrackSource::Path(p) => p
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string()),
+            TrackSource::Url(u) => u.clone(),
+        }
+    }
+
     /// Lower-case extension without the dot.
     pub fn extension(&self) -> Option<String> {
         self.media_source().extension()
@@ -241,6 +253,10 @@ fn open_source(
     }
 }
 
+/// How the report of an entry that would not open begins. It names the entry
+/// itself, so a reader must not name one again.
+pub const CANNOT_PLAY: &str = "cannot play ";
+
 /// Control messages, engine -> decode thread.
 #[derive(Debug)]
 pub(crate) enum DecodeMsg {
@@ -268,6 +284,9 @@ pub(crate) enum DecodeMsg {
     /// Abandon the current track and jump `delta` entries (RFC 0005
     /// `Command::SkipBy`); the target is clamped to the queue.
     SkipBy(i32),
+    /// The playlist changed under the run and the track being decoded now
+    /// sits at this queue index.
+    CurrentMoved(u32),
     /// Arm/disarm "stop after current track" (RFC 0005 O8): when armed, the run
     /// ends at the end of the current track instead of advancing.
     SetStopAfterCurrent(bool),
@@ -354,8 +373,8 @@ pub(crate) enum DecodeOut {
     /// The handle is sent **before** the open, so an open that fails still
     /// leaves the phase that says why.
     StreamStarted {
-        /// The queue index of the track the transfer belongs to, in the queue
-        /// the run started with.
+        /// The queue index of the track the transfer belongs to, when the
+        /// transfer started.
         index: u32,
         /// The observer of the transfer.
         progress: HttpProgress,
@@ -367,6 +386,11 @@ pub(crate) enum DecodeOut {
     },
     /// A previously reported EndOfStream is revoked (e.g. repeat toggled on).
     EndOfStreamRevoked,
+    /// The entry at `index` would not open and was skipped (S02 §1.1).
+    TrackSkipped {
+        /// The queue index of the skipped entry.
+        index: u32,
+    },
     /// A decoder or output error.
     Error {
         /// Classification.
@@ -449,6 +473,10 @@ impl std::fmt::Debug for DecodeOut {
                 .field("timeline_end", timeline_end)
                 .finish(),
             DecodeOut::EndOfStreamRevoked => write!(f, "EndOfStreamRevoked"),
+            DecodeOut::TrackSkipped { index } => f
+                .debug_struct("TrackSkipped")
+                .field("index", index)
+                .finish(),
             DecodeOut::Error { kind, message } => f
                 .debug_struct("Error")
                 .field("kind", kind)
@@ -466,7 +494,9 @@ impl std::fmt::Debug for DecodeOut {
 /// Everything the decode thread needs.
 pub(crate) struct Config {
     pub registry: DecoderRegistry,
-    pub queue: Vec<TrackSource>,
+    /// The play queue, shared with the engine: an entry added or removed while
+    /// the run is live reaches the traversal at once.
+    pub queue: Arc<Mutex<Vec<TrackSource>>>,
     pub device: AudioSpec,
     pub sync: Arc<RingSync>,
     pub vis_enabled: bool,
@@ -747,12 +777,15 @@ impl Worker {
         // The previous track ran to its end and the converter still holds its
         // tail: a next track in the same format continues that stream.
         let mut carry = false;
+        // Entries in a row that would not open: with repeat on, a list of
+        // nothing but dead entries must not spin forever.
+        let mut failed_opens = 0;
         loop {
             if self.quitting || self.stopped {
                 break;
             }
             self.current_index = index;
-            let Some(source) = self.cfg.queue.get(index as usize).cloned() else {
+            let Some(source) = self.queue_entry(index) else {
                 self.flush_converter();
                 let _ = self.tx.send(DecodeOut::EndOfStream {
                     timeline_end: self.timeline,
@@ -760,10 +793,29 @@ impl Worker {
                 break;
             };
             let mut decoder = match open_source(&self.cfg.registry, &source, index, &self.tx) {
-                Ok(d) => d,
+                Ok(d) => {
+                    failed_opens = 0;
+                    d
+                }
                 Err(e) => {
+                    // S02 §1.1: an entry that does not open is skipped; the
+                    // list goes on, and its end is the ordinary end.
                     self.flush_converter();
-                    self.report_error(&e);
+                    carry = false;
+                    self.report_open_error(&source, &e);
+                    let _ = self.tx.send(DecodeOut::TrackSkipped { index });
+                    failed_opens += 1;
+                    if failed_opens < self.queue_len()
+                        && let Some(next) = self.advance_in_order()
+                    {
+                        index = next;
+                        continue;
+                    }
+                    // The end of the list: what earlier entries wrote still
+                    // plays out, and then the run ends the ordinary way.
+                    let _ = self.tx.send(DecodeOut::EndOfStream {
+                        timeline_end: self.timeline,
+                    });
                     break;
                 }
             };
@@ -835,6 +887,24 @@ impl Worker {
             };
             index = next_idx;
         }
+    }
+
+    /// The shared play queue.
+    fn queue(&self) -> MutexGuard<'_, Vec<TrackSource>> {
+        self.cfg
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The queue entry at `index`, if it still exists.
+    fn queue_entry(&self, index: u32) -> Option<TrackSource> {
+        self.queue().get(index as usize).cloned()
+    }
+
+    /// How many entries the queue has.
+    fn queue_len(&self) -> usize {
+        self.queue().len()
     }
 
     /// The shared playback order (spec S15).
@@ -1292,6 +1362,7 @@ impl Worker {
                     self.pending_skip = Some(Outcome::SkipBy(delta));
                     return true;
                 }
+                Ok(DecodeMsg::CurrentMoved(index)) => self.current_index = index,
                 Ok(DecodeMsg::SetStopAfterCurrent(armed)) => self.stop_after_current = armed,
                 Ok(DecodeMsg::ModesChanged { shuffle, repeat }) => {
                     let (shuffle_changed, _) = self.sync_modes(shuffle, repeat);
@@ -1344,7 +1415,7 @@ impl Worker {
                     // playing (S15 §4.1) and this thread keeps the place it
                     // had in it.
                     let (_, repeat_changed) = self.sync_modes(shuffle, repeat);
-                    if repeat_changed && repeat && !self.cfg.queue.is_empty() {
+                    if repeat_changed && repeat && self.queue_len() > 0 {
                         // Repeat was turned on at the end of the queue: the
                         // traversal continues with the next cycle (S15 §2).
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
@@ -1354,7 +1425,7 @@ impl Worker {
                     }
                 }
                 Ok(DecodeMsg::Next) => {
-                    if self.repeat && !self.cfg.queue.is_empty() {
+                    if self.repeat && self.queue_len() > 0 {
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
                         if let Some(next) = self.next_in_order() {
                             return Some(next);
@@ -1362,7 +1433,7 @@ impl Worker {
                     }
                 }
                 Ok(DecodeMsg::Prev) => {
-                    if !self.cfg.queue.is_empty() {
+                    if self.queue_len() > 0 {
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
                         if let Some(prev) = self.prev_in_order() {
                             return Some(prev);
@@ -1370,13 +1441,14 @@ impl Worker {
                     }
                 }
                 Ok(DecodeMsg::SkipBy(delta)) => {
-                    if delta != 0 && !self.cfg.queue.is_empty() && self.repeat {
+                    if delta != 0 && self.queue_len() > 0 && self.repeat {
                         let _ = self.tx.send(DecodeOut::EndOfStreamRevoked);
                         if let Some(target) = self.skip_in_order(delta) {
                             return Some(target);
                         }
                     }
                 }
+                Ok(DecodeMsg::CurrentMoved(index)) => self.current_index = index,
                 Ok(DecodeMsg::SetStopAfterCurrent(armed)) => {
                     self.stop_after_current = armed;
                 }
@@ -1553,6 +1625,17 @@ impl Worker {
         let _ = self.tx.send(DecodeOut::Error {
             kind: info.kind,
             message: info.message,
+        });
+    }
+
+    /// Report an entry that would not open, by its own name: the run moves on
+    /// at once, so by the time anyone reads the report the current entry is
+    /// another one.
+    fn report_open_error(&self, source: &TrackSource, e: &Error) {
+        let info = rustamp_core::error::ErrorInfo::from(e);
+        let _ = self.tx.send(DecodeOut::Error {
+            kind: info.kind,
+            message: format!("{CANNOT_PLAY}{}: {}", source.display(), info.message),
         });
     }
 

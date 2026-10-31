@@ -404,6 +404,8 @@ pub struct Engine {
     decode_stuck: bool,
 
     queue: Vec<TrackSource>,
+    /// The same queue, as the decode thread reads it.
+    shared_queue: Arc<Mutex<Vec<TrackSource>>>,
     current: Option<u32>,
     transport: TransportState,
     volume: u8,
@@ -546,6 +548,7 @@ impl Engine {
             handle: None,
             decode_stuck: false,
             queue: Vec::new(),
+            shared_queue: Arc::new(Mutex::new(Vec::new())),
             current: None,
             transport: TransportState::Stopped,
             volume: initial_volume,
@@ -613,11 +616,19 @@ impl Engine {
     /// permutation and the cursor (S15 §4), so the plan is regenerated around
     /// the current track.
     ///
-    /// A live run keeps the queue it started with — its decode thread still
-    /// holds that snapshot — so the order keeps describing that queue and is
-    /// brought up to date when the run ends.
+    /// A live run follows at once: its decode thread reads the same queue, so
+    /// an entry added while a track plays is the next one to play.
     pub fn set_queue(&mut self, queue: Vec<TrackSource>) {
         self.queue = queue;
+        *self
+            .shared_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.queue.clone();
+        // The run's history speaks in the old indices, and only the track that
+        // is playing still counts.
+        if self.track_starts.len() > 1 {
+            self.track_starts.drain(..self.track_starts.len() - 1);
+        }
         if let Some(current) = self.current
             && (current as usize) >= self.queue.len()
         {
@@ -628,14 +639,7 @@ impl Engine {
     }
 
     /// Bring the traversal order in line with the queue.
-    ///
-    /// While a run is live the decode thread plays the queue that run started
-    /// with, so the order describes that queue until the run ends; the engine
-    /// queue takes over afterwards.
     fn sync_order_to_queue(&mut self) {
-        if self.to_decode.is_some() {
-            return;
-        }
         if !self.order_stale {
             return;
         }
@@ -671,14 +675,20 @@ impl Engine {
     /// The decode thread relies on that: it re-aligns its own place in a
     /// permutation the engine re-planned (S15 §4.1) without disturbing it.
     ///
-    /// While a run is live the decode thread owns the traversal, so the
-    /// running order is left alone.
+    /// During a live run this says where the playing track sits after a
+    /// playlist edit, so the run's bookkeeping moves with it.
     pub fn set_current_index(&mut self, index: Option<u32>) {
         self.sync_order_to_queue();
         self.current = index.filter(|&i| (i as usize) < self.queue.len());
-        if self.to_decode.is_none() {
-            self.order()
-                .set_current_index(self.current.map(|i| i as usize));
+        self.order()
+            .set_current_index(self.current.map(|i| i as usize));
+        if let Some(current) = self.current
+            && self.to_decode.is_some()
+        {
+            if let Some(last) = self.track_starts.last_mut() {
+                last.0 = current;
+            }
+            self.send(DecodeMsg::CurrentMoved(current));
         }
     }
 
@@ -1456,6 +1466,8 @@ impl Engine {
     }
 
     /// Skip to the next queue entry. Under S15 modes, respects shuffle and repeat.
+    ///
+    /// While stopped this only moves the current entry (S02 §1).
     pub fn next_track(&mut self) -> Result<()> {
         if self.transport == TransportState::Stopped || self.to_decode.is_none() {
             if self.queue.is_empty() {
@@ -1466,7 +1478,7 @@ impl Engine {
             // repeat boundary (S15 §3.1).
             let next = self.order().next_index();
             if let Some(target) = next {
-                return self.play_index(target as u32);
+                return self.move_or_play(target as u32);
             }
             return Ok(());
         }
@@ -1474,7 +1486,33 @@ impl Engine {
         Ok(())
     }
 
+    /// A navigation target outside a run: while stopped the entry changes and
+    /// playback does not start (S02 §1), and the marquee shows the new entry.
+    fn move_or_play(&mut self, target: u32) -> Result<()> {
+        if self.transport != TransportState::Stopped {
+            return self.play_index(target);
+        }
+        self.move_while_stopped(target);
+        Ok(())
+    }
+
+    /// Make `target` the current entry of a stopped player and say so.
+    fn move_while_stopped(&mut self, target: u32) {
+        self.current = Some(target);
+        self.duration_ms = None;
+        self.duration_frames = None;
+        self.metadata = TrackMetadata::default();
+        self.bus.publish(Event::TrackChanged {
+            id: None,
+            index: Some(target),
+            metadata: None,
+            duration_ms: None,
+        });
+    }
+
     /// Go back to the previous queue entry. Under S15 modes, respects shuffle and repeat.
+    ///
+    /// While stopped this only moves the current entry (S02 §1).
     pub fn prev_track(&mut self) -> Result<()> {
         if self.transport == TransportState::Stopped || self.to_decode.is_none() {
             if self.queue.is_empty() {
@@ -1485,7 +1523,7 @@ impl Engine {
             // the playlist (S15 §3.2).
             let prev = self.order().prev_index();
             if let Some(target) = prev {
-                return self.play_index(target as u32);
+                return self.move_or_play(target as u32);
             }
             return Ok(());
         }
@@ -1518,7 +1556,7 @@ impl Engine {
             // (S15 §3.3) and reports where that lands.
             let target = self.order().skip_by(delta);
             if let Some(target) = target {
-                self.current = Some(target as u32);
+                self.move_while_stopped(target as u32);
             }
             return Ok(());
         }
@@ -1817,6 +1855,9 @@ impl Engine {
             DecodeOut::EndOfStreamRevoked => {
                 self.end_of_stream = None;
             }
+            DecodeOut::TrackSkipped { index } => {
+                self.current = Some(index);
+            }
             DecodeOut::Error { kind, message } => {
                 let info = ErrorInfo { kind, message };
                 self.error = Some(info.clone());
@@ -1859,8 +1900,11 @@ impl Engine {
         let _ = self.join_decode();
         let stuck = self.take_stuck_decode_error();
         self.transport = TransportState::Stopped;
-        // The run is over: no phase of its stream may show any more.
-        self.clear_stream_progress();
+        // The run is over: no phase of its stream may show any more, unless
+        // nothing played and that phase is what says why (S19 §2).
+        if self.sync.counters().0 > 0 {
+            self.clear_stream_progress();
+        }
         // Freeze the timeline at the content end, not at the device position.
         // Re-basing the clock alone would reset `timeline_frames()` to the
         // timeline_origin (zero for a run without a seek), which would report a
@@ -2234,7 +2278,7 @@ impl Engine {
         let (out_tx, out_rx) = std::sync::mpsc::channel::<DecodeOut>();
         let cfg = Config {
             registry: self.registry.clone(),
-            queue: self.queue.clone(),
+            queue: Arc::clone(&self.shared_queue),
             device: self.device,
             sync: Arc::clone(&self.sync),
             vis_enabled: self.cfg.vis_enabled,
