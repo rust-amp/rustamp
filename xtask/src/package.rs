@@ -891,15 +891,40 @@ fn makensis_command(
     let mut cmd = no_window_command(makensis);
     cmd.args(["/V2", "/WX"]);
     cmd.arg(format!("/DVERSION={}", meta.product_version));
-    cmd.arg(format!("/DPLAYER_DIR={}", out_dir.join("player").display()));
-    cmd.arg(format!("/DHOST_DIR={}", out_dir.join("host").display()));
+    // NSIS resolves a relative `File` path against the directory of the script,
+    // not against the caller's working directory, so the three paths are made
+    // absolute here. `--out` is relative in the CI release step.
+    let player_dir = absolute(&out_dir.join("player"))?;
+    let host_dir = absolute(&out_dir.join("host"))?;
+    let installer = absolute(installer)?;
+    let script = absolute(&root.join(NSIS_SCRIPT))?;
+    cmd.arg(format!("/DPLAYER_DIR={}", player_dir.display()));
+    cmd.arg(format!("/DHOST_DIR={}", host_dir.display()));
     cmd.arg(format!("/DOUTFILE={}", installer.display()));
     if signed {
         let xtask = std::env::current_exe().map_err(|e| format!("own path: {e}"))?;
         cmd.arg(format!("/DSIGN_UNINSTALLER={}", xtask.display()));
     }
-    cmd.arg(root.join(NSIS_SCRIPT));
+    cmd.arg(script);
     Ok(cmd)
+}
+
+/// The absolute form of a path that may not exist yet: its directory is
+/// canonicalised and the last part is kept.
+fn absolute(path: &Path) -> Result<PathBuf, String> {
+    let resolved = match fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent = fs::canonicalize(parent)
+                .map_err(|e| format!("directory {}: {e}", parent.display()))?;
+            match path.file_name() {
+                Some(name) => parent.join(name),
+                None => parent,
+            }
+        }
+    };
+    Ok(resolved)
 }
 
 /// Offline: the file is a PE image and its checksum file matches. Nothing is run.
