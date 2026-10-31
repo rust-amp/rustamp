@@ -383,6 +383,11 @@ static SKIN: Mutex<Option<Arc<Sheet>>> = Mutex::new(None);
 #[cfg(windows)]
 static FRAMES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// The frame's own message that fits the child once more, after a child's
+/// creation returned (`WM_APP + 0x51`, reserved for this module).
+#[cfg(windows)]
+const FIT_AGAIN: u32 = 0x8000 + 0x51;
+
 fn current_sheet() -> Option<Arc<Sheet>> {
     SKIN.lock().ok().and_then(|skin| skin.clone())
 }
@@ -391,6 +396,7 @@ fn current_sheet() -> Option<Arc<Sheet>> {
 /// thread of the frames.
 pub fn set_skin(width: u32, height: u32, rgba: Vec<u8>) {
     let sheet = Sheet::new(width, height, rgba).map(Arc::new);
+    let have_sheet = sheet.is_some();
     if let Ok(mut skin) = SKIN.lock() {
         *skin = sheet;
     }
@@ -399,8 +405,14 @@ pub fn set_skin(width: u32, height: u32, rgba: Vec<u8>) {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::Graphics::Gdi::InvalidateRect;
         for frame in frames.iter() {
+            let window = HWND(*frame as *mut _);
+            // A frame opened before the sheet existed still wears the system
+            // frame; it takes the skinned kind now, before it repaints.
+            if have_sheet {
+                win::make_skinned(window);
+            }
             // SAFETY: a frame of this thread; a frame's end takes it off the list.
-            let _ = unsafe { InvalidateRect(Some(HWND(*frame as *mut _)), None, false) };
+            let _ = unsafe { InvalidateRect(Some(window), None, false) };
         }
     }
 }
@@ -455,10 +467,11 @@ mod win {
     use windows::Win32::UI::WindowsAndMessaging::{
         DefWindowProcW, GW_CHILD, GWL_STYLE, GWL_USERDATA, GetClientRect, GetWindow,
         GetWindowLongW, GetWindowRect, GetWindowTextW, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT,
-        MINMAXINFO, MoveWindow, PostMessageW, SendMessageW, SetWindowLongW, WM_ACTIVATE, WM_CLOSE,
-        WM_CREATE, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCCALCSIZE,
-        WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_PARENTNOTIFY, WM_SETTEXT, WM_SHOWWINDOW, WM_SIZE,
-        WM_SIZING, WS_POPUP,
+        MINMAXINFO, MoveWindow, PostMessageW, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SetWindowLongW, SetWindowPos, WM_ACTIVATE, WM_CLOSE, WM_CREATE,
+        WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCDESTROY,
+        WM_NCHITTEST, WM_PAINT, WM_PARENTNOTIFY, WM_SETTEXT, WM_SIZE, WM_SIZING,
+        WM_WINDOWPOSCHANGED, WS_CLIPCHILDREN, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
     };
 
     use super::{
@@ -544,19 +557,55 @@ mod win {
     }
 
     /// Puts the plug-in's window where the chrome leaves room.
-    fn fit_child(window: HWND) {
+    ///
+    /// `child` is the window the caller already knows about (a child's birth
+    /// notice names it); without one the frame's first child is used.
+    fn fit_child(window: HWND, child: Option<HWND>) {
         let (width, height) = size_of(window);
         let (x, y, width, height) = if is_skinned(window) {
             content_rect(width, height)
         } else {
             (0, 0, width, height)
         };
-        // SAFETY: our own window.
-        if let Ok(child) = unsafe { GetWindow(window, GW_CHILD) } {
-            // SAFETY: the plug-in's child of our own window. A failed move
-            // leaves the child where it was.
-            let _ = unsafe { MoveWindow(child, x, y, width, height, true) };
+        let child = match child {
+            Some(child) => child,
+            // SAFETY: our own window.
+            None => match unsafe { GetWindow(window, GW_CHILD) } {
+                Ok(child) => child,
+                Err(_) => return,
+            },
+        };
+        // SAFETY: the plug-in's child of our own window. A failed move leaves
+        // the child where it was.
+        let _ = unsafe { MoveWindow(child, x, y, width, height, true) };
+    }
+
+    /// Gives a frame that was made before the sheet arrived the skinned kind.
+    ///
+    /// A skin can reach the host after a visualization window is already open
+    /// (the player sends its sheet when it starts and when the skin changes),
+    /// and the kind of a window cannot be chosen later by itself: the style is
+    /// what `is_skinned` answers, so the frame is switched over and fitted
+    /// again before it repaints.
+    pub(super) fn make_skinned(window: HWND) {
+        if is_skinned(window) || current_sheet().is_none() {
+            return;
         }
+        // SAFETY: our own window, on its own thread.
+        unsafe {
+            let style = WS_POPUP.0 | WS_THICKFRAME.0 | WS_VISIBLE.0 | WS_CLIPCHILDREN.0;
+            SetWindowLongW(window, GWL_STYLE, style as i32);
+            let _ = SetWindowPos(
+                window,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
+        fit_child(window, None);
     }
 
     /// What a message means to a frame that draws itself; `None` passes it on.
@@ -664,8 +713,12 @@ mod win {
         if message == WM_CLOSE {
             // SAFETY: our own window.
             if let Ok(child) = unsafe { GetWindow(window, GW_CHILD) } {
-                // SAFETY: the plug-in's child of our own window.
-                unsafe { SendMessageW(child, WM_CLOSE, None, None) };
+                // SAFETY: the plug-in's child of our own window. Posted, not
+                // sent: `vis_avs` destroys the frame from inside its own close
+                // handling, and a sent message would return into a dead window.
+                unsafe {
+                    let _ = PostMessageW(Some(child), WM_CLOSE, WPARAM(0), LPARAM(0));
+                };
                 return LRESULT(0);
             }
         }
@@ -675,12 +728,29 @@ mod win {
             frames.retain(|frame| *frame != window.0 as usize);
         }
         // A plug-in creates its window after the frame, at a size of its own:
-        // the birth of the child is the frame's first chance to fit it. One
-        // created without that notice is fitted when the frame is shown.
+        // the birth of the child is the frame's first chance to fit it, and its
+        // own handle comes with that notice. A host-side size change, a move
+        // that changes the client and the frame's own fit message follow.
         let child_born = message == WM_PARENTNOTIFY && (wparam.0 & 0xFFFF) as u32 == WM_CREATE;
-        let shown = message == WM_SHOWWINDOW && wparam.0 != 0;
-        if message == WM_SIZE || child_born || shown {
-            fit_child(window);
+        let born_child = if child_born {
+            Some(HWND(lparam.0 as *mut _))
+        } else {
+            None
+        };
+        if message == WM_SIZE
+            || message == WM_WINDOWPOSCHANGED
+            || message == super::FIT_AGAIN
+            || child_born
+        {
+            fit_child(window, born_child);
+        }
+        if child_born {
+            // Fit once more after the plug-in's own creation has returned: a
+            // child is still being made while its parent's notice runs.
+            // SAFETY: our own window.
+            unsafe {
+                let _ = PostMessageW(Some(window), super::FIT_AGAIN, WPARAM(0), LPARAM(0));
+            };
         }
         if is_skinned(window)
             && let Some(answer) = skinned_message(window, message, wparam, lparam)
