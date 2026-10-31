@@ -905,11 +905,21 @@ fn recorded(
         .play_index(0)
         .expect("starting playback on the cable");
     let start = Instant::now();
+    // The flush refusal at the natural end replaces the last error, so a real
+    // failure is kept as it happens.
+    let mut failure = None;
     while engine.transport() != TransportState::Stopped {
         engine.poll().expect("polling the engine");
+        if let Some(error) = engine
+            .last_error()
+            .filter(|error| error.kind != ErrorKind::Output)
+        {
+            failure.get_or_insert_with(|| error.clone());
+        }
         assert!(start.elapsed() < DEADLINE, "the tone never finished");
         std::thread::sleep(PUMP_INTERVAL);
     }
+    let played_frames = engine.played_frames();
     let wanted = mark + (f64::from(rate) * (seconds + TAIL.as_secs_f64())) as usize;
     let start = Instant::now();
     while recorded_frames(&recording, channels) < wanted {
@@ -926,13 +936,13 @@ fn recorded(
         .skip(mark)
         .map(|frame| frame[0])
         .collect();
-    assert_eq!(
-        engine
-            .last_error()
-            .filter(|error| error.kind != ErrorKind::Output),
-        None,
-        "the track failed"
-    );
+    assert_eq!(failure, None, "the track failed");
+    measurement(&format!(
+        "{}: played {played_frames} frames, recorded peak {:.4}",
+        track.display(),
+        mono.iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+    ));
     (mono, rate)
 }
 
@@ -952,6 +962,20 @@ fn level_of(mono: &[f32], rate: u32, hz: f64) -> f64 {
     );
     levels.sort_by(f64::total_cmp);
     levels[levels.len() / 2]
+}
+
+/// Keeps a measured value where the VM run copies its results back from: a
+/// passing test's output is not shown.
+fn measurement(line: &str) {
+    use std::io::Write;
+    println!("{line}");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"C:\rustamp\out\gui-session\cable-measurements.txt")
+    {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 fn decibels(level: f64, reference: f64) -> f64 {
@@ -992,7 +1016,7 @@ fn the_cable_carries_what_the_equalizer_says() {
         .map(|(band, hz, want, got)| format!("band {band} ({hz} Hz) {want:+} dB: {got:+.2} dB"))
         .collect::<Vec<_>>()
         .join("\n");
-    println!("{report}");
+    measurement(&report);
     for (_, _, want, got) in &results {
         assert!(
             (f64::from(*want) - got).abs() <= TOLERANCE_DB,
@@ -1080,7 +1104,7 @@ fn the_cable_carries_what_a_dsp_plugin_does() {
     let fixture = beside_the_test("dsp_rustamp_fixture.dll");
     let chain = classic_dsp_chain(helper.clone(), &fixture, &approved(dir.path(), &fixture));
     let doubled = decibels(measured_level_through(&track, hz, &[], chain), plain);
-    println!("dsp_rustamp_fixture: {doubled:+.2} dB");
+    measurement(&format!("dsp_rustamp_fixture: {doubled:+.2} dB"));
     assert!(
         (doubled - 6.02).abs() <= 1.0,
         "the fixture doubles every sample, the cable shows {doubled:+.2} dB"
@@ -1091,7 +1115,7 @@ fn the_cable_carries_what_a_dsp_plugin_does() {
     let optilab = plugins.join("dsp").join("dsp_optilab_core.dll");
     let chain = classic_dsp_chain(helper, &optilab, &approved(dir.path(), &optilab));
     let changed = decibels(measured_level_through(&track, hz, &[], chain), plain);
-    println!("dsp_optilab_core: {changed:+.2} dB");
+    measurement(&format!("dsp_optilab_core: {changed:+.2} dB"));
     assert!(
         changed.abs() >= 0.05,
         "the Optilab plug-in left the level at {changed:+.3} dB"
@@ -1137,6 +1161,14 @@ fn the_cable_carries_what_an_input_plugin_decodes() {
     use rustamp_core::audio::DecoderRegistry;
 
     rustamp_app::window::require_test_vm();
+    // SAFETY: the VM runs this binary's tests one at a time, and the variable
+    // only tells the helper processes where their trace goes.
+    unsafe {
+        std::env::set_var(
+            "RUSTAMP_HOST_TRACE",
+            r"C:\rustamp\out\gui-session\input-trace.txt",
+        );
+    }
     let dir = tempfile::tempdir().unwrap();
     let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
     let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
@@ -1172,10 +1204,10 @@ fn the_cable_carries_what_an_input_plugin_decodes() {
             level_of(&through.0, through.1, hz),
             level_of(&builtin.0, builtin.1, hz),
         );
-        println!(
+        measurement(&format!(
             "{}: {difference:+.2} dB against the built-in decoder",
             dll.display()
-        );
+        ));
         assert!(
             difference.abs() <= 1.0,
             "{} played at {difference:+.2} dB",
@@ -1194,6 +1226,6 @@ fn the_cable_carries_what_an_input_plugin_decodes() {
     let peak = mono
         .iter()
         .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-    println!("in_openmpt: peak {peak:.4}");
+    measurement(&format!("in_openmpt: peak {peak:.4}"));
     assert!(peak > 0.01, "in_openmpt played silence (peak {peak})");
 }

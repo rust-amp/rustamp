@@ -182,6 +182,7 @@ mod imp {
         _buffer_ms: c_int,
         _prebuffer_ms: c_int,
     ) -> c_int {
+        crate::fault::trace_event(&format!("output open {rate} Hz {channels} ch {bits} bits"));
         with_capture(|capture| {
             capture.spec = Some((rate, channels, bits));
             capture.closed = false;
@@ -189,6 +190,7 @@ mod imp {
         0
     }
     unsafe extern "C" fn out_close() {
+        crate::fault::trace_event("output close");
         with_capture(|capture| capture.closed = true);
     }
     unsafe extern "C" fn out_write(data: *mut c_char, len: c_int) -> c_int {
@@ -432,6 +434,7 @@ mod imp {
                     plugin
                         .input_play(&path)
                         .map_err(|error| format!("{error:?}"))?;
+                    crate::fault::trace_event(&format!("play {} returned", path.display()));
                     let length = plugin.input_length_ms().unwrap_or(-1);
                     Ok(u64::try_from(length).ok().filter(|ms| *ms > 0))
                 })();
