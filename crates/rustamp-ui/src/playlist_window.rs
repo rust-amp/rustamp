@@ -16,7 +16,8 @@
 //!   y 0-19, unfocused rows y 21-40 (S01 §4.1, round 2, verified).
 //! * **No window-menu button** (S06 §1, settled with qualification): only Close
 //!   at (264,3) and Shade at (254,3), 9 x 9 each (S01 §4, provisional).
-//! * List band bbox (12,23)-(254,93) (S06 §2, settled: the single-click change).
+//! * List band bbox (12,23)-(256,93) (S06 §2: the `PrintWindow` measurement of
+//!   2026-10-31 puts the band's last column at 255, see [`LIST_RIGHT`]).
 //!   Rows at 13 px pitch (S01 §4.2: the captured list "shows four rows at 13 px
 //!   pitch"). The band below the fourth row is list background (own reading).
 //! * Selection fill: the `SelectedBG` colour from `pledit.txt` over the list
@@ -162,14 +163,21 @@ fn in_rect(x: i32, y: i32, rect: Rect) -> bool {
 // List area (S06 §2; S01 §4.2)
 // ---------------------------------------------------------------------------
 
-/// Left edge of the list band (S06 §2, settled bbox (12,23)-(254,93)).
+/// Left edge of the list band (S06 §2, settled bbox (12,23)-(256,93)).
 pub const LIST_LEFT: i32 = 12;
 
 /// Top edge of the list band (S06 §2, settled).
 pub const LIST_TOP: i32 = 23;
 
-/// Right edge (exclusive) of the list band (S06 §2, settled).
-pub const LIST_RIGHT: i32 = 254;
+/// Right edge (exclusive) of the list band (S06 §2).
+///
+/// The band's last column is 255, not 253: through `PrintWindow`, Winamp 2.95
+/// carries its selection colour (`0000c6`) at x = 254 and 255 of a selected
+/// row, and posted clicks at 253, 254 and 255 all select the row while clicks
+/// at 11 and 256 do not - x = 256 is the right rail's art (measured against
+/// 2.95 on 2026-10-31). The band is therefore 244 px wide, and the row band is
+/// drawn over the rail tile's first column.
+pub const LIST_RIGHT: i32 = 256;
 
 /// Bottom edge (exclusive) of the list band (S06 §2, settled).
 pub const LIST_BOTTOM: i32 = 93;
@@ -515,6 +523,19 @@ pub fn render_playlist_window(
     let pledit = load_sheet(skin, Sheet::Pledit);
     draw_title_bar(&mut canvas, pledit.as_ref(), skin, focused);
     draw_side_rails(&mut canvas, pledit.as_ref(), skin);
+    // The list band owns its whole width, its last column (x = 255) included:
+    // Winamp's band reaches the right rail's art at x = 256 (S06 §2, measured),
+    // so the rail tile's first column is the list's last column and carries the
+    // list background, not the rail's art.
+    canvas.fill_rect(
+        list_area(),
+        [
+            style.normal_bg[0],
+            style.normal_bg[1],
+            style.normal_bg[2],
+            255,
+        ],
+    );
     draw_bottom_bar(&mut canvas, pledit.as_ref(), skin);
     draw_rows(&mut canvas, skin, window, labels);
     draw_status_fields(&mut canvas, skin, window);
@@ -785,19 +806,26 @@ fn draw_status_fields(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow) 
 const ROW_DRAW_OFFSET: i32 = -1;
 
 /// The room kept between a row's text and its length (own choice).
-const LENGTH_GAP: u32 = 4;
+///
+/// Raised with [`LENGTH_RIGHT`] when the band grew by 2 px, so the length
+/// glyphs keep the place the measurement gave them.
+const LENGTH_GAP: u32 = 6;
 
 /// The room right of a row's length (measured against Winamp 2.95, 2026-10-31).
-const LENGTH_RIGHT: u32 = 2;
+///
+/// 2 px from the band's right edge, which is x = 256 exclusive (see
+/// [`LIST_RIGHT`]); the value carries the 2 px the band gained, so the length
+/// column itself does not move.
+const LENGTH_RIGHT: u32 = 4;
 
 /// Paints the visible rows: the selection band first, then the labels.
 ///
 /// The selected row's colour is the **skin's** `SelectedBG` from
 /// `pledit.txt` ([`rustamp_skin::PlaylistStyle::selected_bg`]), never a
 /// colour of ours - the skin decides what a selected row looks like. The
-/// band is one row of the settled list area ([`row_rect`], S06 §2: x 12-254,
-/// the row pitch of the current font), so it cannot reach the side rails or
-/// the scrollbar.
+/// band is one row of the settled list area ([`row_rect`], S06 §2: x 12-256,
+/// the row pitch of the current font), so it stops at the right rail's art
+/// (x = 256) and never reaches the scrollbar.
 ///
 /// `Normal` and `Current` tint the glyph ink independently of selection;
 /// `Current` applies only to the app-supplied current entry, not the clicked
@@ -823,7 +851,7 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
         let nominal = row_top(i, pitch);
         let band_top = nominal.max(LIST_TOP);
         let clipped = (band_top - nominal) as u32;
-        let rect = Rect::new(LIST_LEFT, nominal, window.size().0 - 33, pitch as u32);
+        let rect = Rect::new(LIST_LEFT, nominal, window.size().0 - 31, pitch as u32);
         let band = Rect::new(rect.x, band_top, rect.width, rect.height - clipped);
         if selected_ids.contains(id) {
             canvas.fill_rect(band, selected);
@@ -931,7 +959,7 @@ fn draw_drag_insertion(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow)
     let y = (LIST_TOP + row as i32 * pitch).min(window.size().1 as i32 - 24);
     let colour = skin.pledit().normal;
     canvas.fill_rect(
-        Rect::new(LIST_LEFT, y, window.size().0 - 33, 1),
+        Rect::new(LIST_LEFT, y, window.size().0 - 31, 1),
         [colour[0], colour[1], colour[2], 255],
     );
 }
@@ -1149,14 +1177,16 @@ mod tests {
             let rgba = &frame.as_rgba()[index..index + 3];
             [rgba[0], rgba[1], rgba[2]]
         };
-        // Inside the band: the skin's colour, at both ends of the row.
+        // Inside the band: the skin's colour, at both ends of the row, the
+        // last column included (measured: Winamp's band runs x 12..=255).
         assert_eq!(pixel(row.x, row.y), wanted);
+        assert_eq!(pixel(255, row.y + ROW_PITCH - 1), wanted);
         assert_eq!(pixel(LIST_RIGHT - 1, row.y + ROW_PITCH - 1), wanted);
         // Outside it: the side rails are the skin's art, never the fill.
         assert_ne!(
             pixel(LIST_LEFT - 1, row.y),
             wanted,
-            "the band must stop at the list area (S06 section 2: x 12-254)"
+            "the band must stop at the list area (S06 section 2: x 12-256)"
         );
         assert_ne!(
             pixel(LIST_RIGHT, row.y),
@@ -1269,12 +1299,12 @@ mod tests {
 
     #[test]
     fn list_rows_follow_the_settled_band_and_pitch() {
-        // S06 §2 bbox (12,23)-(254,93); S01 §4.2 13 px pitch, four rows.
-        assert_eq!(list_area(), Rect::new(12, 23, 242, 70));
+        // S06 §2 bbox (12,23)-(256,93); S01 §4.2 13 px pitch, four rows.
+        assert_eq!(list_area(), Rect::new(12, 23, 244, 70));
         // The band cuts the first row's top pixel (measured 2026-10-31).
-        assert_eq!(row_rect(0, ROW_PITCH), Some(Rect::new(12, 23, 242, 12)));
-        assert_eq!(row_rect(1, ROW_PITCH), Some(Rect::new(12, 35, 242, 13)));
-        assert_eq!(row_rect(3, ROW_PITCH), Some(Rect::new(12, 61, 242, 13)));
+        assert_eq!(row_rect(0, ROW_PITCH), Some(Rect::new(12, 23, 244, 12)));
+        assert_eq!(row_rect(1, ROW_PITCH), Some(Rect::new(12, 35, 244, 13)));
+        assert_eq!(row_rect(3, ROW_PITCH), Some(Rect::new(12, 61, 244, 13)));
         assert_eq!(row_rect(4, ROW_PITCH), None);
     }
 
@@ -1315,9 +1345,13 @@ mod tests {
         // Below the fourth row is background (own reading).
         assert_eq!(hit_test_list_row(60, 75, ROW_PITCH), None);
         assert_eq!(hit_test_list_row(60, 92, ROW_PITCH), None);
-        // Outside the band horizontally.
+        // Outside the band horizontally: 11 is the left rail, 256 the right
+        // rail's art (measured 2026-10-31: clicks at 253, 254 and 255 select).
         assert_eq!(hit_test_list_row(11, 28, ROW_PITCH), None);
-        assert_eq!(hit_test_list_row(254, 28, ROW_PITCH), None);
+        assert_eq!(hit_test_list_row(253, 28, ROW_PITCH), Some(0));
+        assert_eq!(hit_test_list_row(254, 28, ROW_PITCH), Some(0));
+        assert_eq!(hit_test_list_row(255, 28, ROW_PITCH), Some(0));
+        assert_eq!(hit_test_list_row(256, 28, ROW_PITCH), None);
         assert!(in_list_area(60, 92));
         assert!(!in_list_area(60, 93));
     }

@@ -14,7 +14,7 @@
 //! rasterizer on its own skin and font, so a headless Rustamp frame cannot
 //! reproduce them - the reference's glyphs are not ours. What a Rustamp frame
 //! *can* pin is the geometry those counts' bounding boxes name (the list band
-//! (12,23)-(254,93), the row band inside it, the arrow column) and the
+//! (12,23)-(256,93), the row band inside it, the arrow column) and the
 //! behaviour the counts measured (one row selected, all visible rows
 //! selected, one page per arrow step, the removal and its after-state).
 //!
@@ -124,18 +124,18 @@ fn s06_section_1_the_title_bar_carries_no_window_menu_button() {
 // ---------------------------------------------------------------------------
 
 /// S06 §2's geometry: the changed region of the single click is the band
-/// **(12,23)-(254,93)**, and the page holds **four rows** at the default
+/// **(12,23)-(256,93)**, and the page holds **four rows** at the default
 /// pitch (S01 §4.2: "the captured list shows four rows at 13 px pitch").
 ///
-/// The band is 242 x 70 px; the four rows take 52 px of it, and the rest of
+/// The band is 244 x 70 px; the four rows take 52 px of it, and the rest of
 /// the band below the fourth row is list background (the bottom bar is drawn
 /// over its lower part, S01 §4).
 #[test]
 fn s06_section_2_the_list_band_is_the_settled_rect_and_the_page_is_four_rows() {
     // The band's corners, as the spec's bbox names them.
     assert_eq!((LIST_LEFT, LIST_TOP), (12, 23));
-    assert_eq!((LIST_RIGHT, LIST_BOTTOM), (254, 93));
-    assert_eq!(list_area(), Rect::new(12, 23, 242, 70));
+    assert_eq!((LIST_RIGHT, LIST_BOTTOM), (256, 93));
+    assert_eq!(list_area(), Rect::new(12, 23, 244, 70));
     // The client the band lives in (S06 scope; S01 §1).
     assert_eq!(PLAYLIST_WINDOW_SIZE, (275, 116));
     // The row pitch and the page it makes.
@@ -145,9 +145,9 @@ fn s06_section_2_the_list_band_is_the_settled_rect_and_the_page_is_four_rows() {
     // The four row bands of the page, top to bottom.
     // Winamp 2.95 selects y 23..=34, 35..=47, 48..=60 (measured 2026-10-31): the
     // band cuts the first row.
-    assert_eq!(row_rect(0, ROW_PITCH), Some(Rect::new(12, 23, 242, 12)));
+    assert_eq!(row_rect(0, ROW_PITCH), Some(Rect::new(12, 23, 244, 12)));
     for (row, top) in [(1, 35), (2, 48), (3, 61)] {
-        assert_eq!(row_rect(row, ROW_PITCH), Some(Rect::new(12, top, 242, 13)));
+        assert_eq!(row_rect(row, ROW_PITCH), Some(Rect::new(12, top, 244, 13)));
     }
     // The fifth row is not on the page: below the fourth row is background.
     assert_eq!(row_rect(4, ROW_PITCH), None);
@@ -160,7 +160,7 @@ fn s06_section_2_the_list_band_is_the_settled_rect_and_the_page_is_four_rows() {
 }
 
 /// S06 §2: a single posted click at **(60,28)** selects the first visible
-/// row (**2918 px**, bbox (12,23)-(254,93); reproduced three times).
+/// row (**2918 px**, bbox (12,23)-(256,93); reproduced three times).
 ///
 /// Exactly one row is selected, and the click leaves the row order alone
 /// (S06 §2: "Row order is unchanged by the single click").
@@ -195,7 +195,7 @@ fn s06_section_2_the_settled_click_selects_exactly_one_row() {
 }
 
 /// S06 §2's drawn band: the single click paints **one row band** at
-/// x ≈ 12-254, y ≈ 23-34 inside the settled band (the spec's bbox), in the
+/// x ≈ 12-255, y ≈ 23-34 inside the settled band (the spec's bbox), in the
 /// skin's own selection colour (0,0,198).
 ///
 /// The changed pixels are exactly the first row's band: the click reaches
@@ -210,7 +210,7 @@ fn s06_section_2_the_click_paints_one_row_band_inside_the_settled_rect() {
     let after = render_playlist_window(&skin, &window, &[], true);
 
     let differing = differing_pixels(&before, &after);
-    // Every changed pixel lies inside the spec's band (12,23)-(254,93).
+    // Every changed pixel lies inside the spec's band (12,23)-(256,93).
     for (x, y) in &differing {
         assert!(
             in_list_area(*x, *y),
@@ -228,7 +228,7 @@ fn s06_section_2_the_click_paints_one_row_band_inside_the_settled_rect() {
 }
 
 /// S06 §2: SEL (second real click at **(74,92)**) selects **all visible
-/// rows** (click2-vs-click1 **12203 px**, bbox (12,23)-(254,93); after-vs-
+/// rows** (click2-vs-click1 **12203 px**, bbox (12,23)-(256,93); after-vs-
 /// before **13591 px**).
 ///
 /// "All" is the visible page: the rows below the page are not selected.
@@ -253,7 +253,7 @@ fn s06_section_2_sel_selects_exactly_the_visible_rows() {
     assert!(!window.selected_ids().contains(&EntryId(60)));
 }
 
-/// S06 §2: after SEL every visible row of the band (12,23)-(254,93) wears
+/// S06 §2: after SEL every visible row of the band (12,23)-(256,93) wears
 /// the selection colour, not only the clicked one.
 #[test]
 fn s06_section_2_sel_highlights_every_visible_row() {
@@ -535,7 +535,7 @@ fn s06_section_4_the_misc_popup_carries_the_two_settled_rows() {
 // ---------------------------------------------------------------------------
 
 /// S06 §5: REM removes the selected entry on the action click (**3475 px**,
-/// bounds (12,23)-(254,93)), with **no menu choice required** (§5.2).
+/// bounds (12,23)-(256,93)), with **no menu choice required** (§5.2).
 ///
 /// The after-state (§5.4) is the renumbering after the removal, with no
 /// selection left: the list is one entry shorter, the rows below the removed
