@@ -267,6 +267,11 @@ pub struct ResidentConfig {
     /// Absolute path of the resident helper binary (for example the symphonia
     /// resident next to `rustamp.exe`).
     pub helper: PathBuf,
+    /// The arguments that make the helper a resident, if it needs any.
+    pub helper_args: Vec<String>,
+    /// The extensions this helper serves, when they are not
+    /// [`RESIDENT_EXTENSIONS`].
+    pub extensions: Option<Vec<&'static str>>,
     /// Ring-capacity hint sent with `DecoderOpen`.
     pub prefetch_frames: u32,
     /// Per-`read` bound; a wedged resident fails the track after this.
@@ -286,12 +291,26 @@ impl ResidentConfig {
     pub fn new(helper: PathBuf) -> Self {
         ResidentConfig {
             helper,
+            helper_args: Vec::new(),
+            extensions: None,
             prefetch_frames: DEFAULT_PREFETCH_FRAMES,
             read_timeout: DEFAULT_READ_TIMEOUT,
             seek_timeout: DEFAULT_SEEK_TIMEOUT,
             liveness: DEFAULT_RESIDENT_LIVENESS,
             restarts: DEFAULT_RESIDENT_RESTARTS,
         }
+    }
+
+    /// Start the helper with `args`.
+    pub fn with_helper_args(mut self, args: Vec<String>) -> Self {
+        self.helper_args = args;
+        self
+    }
+
+    /// Serve `extensions` instead of [`RESIDENT_EXTENSIONS`].
+    pub fn with_extensions(mut self, extensions: Vec<&'static str>) -> Self {
+        self.extensions = Some(extensions);
+        self
     }
 
     /// Override the ring-capacity hint (must stay above zero; zero is
@@ -867,8 +886,9 @@ impl ResidentReopen for ProcessReopen {
     fn reopen(&mut self) -> CoreResult<Box<dyn Decoder>> {
         use rustamp_mediahost::decoder::DecoderProcess;
 
-        let process = DecoderProcess::spawn(
+        let process = DecoderProcess::spawn_with_args(
             &self.config.helper,
+            &self.config.helper_args,
             self.location.clone(),
             self.config.prefetch_frames,
             self.config.liveness,
@@ -914,12 +934,15 @@ impl DecoderFactory for ResidentFactory {
     }
 
     fn extensions(&self) -> &[&str] {
-        RESIDENT_EXTENSIONS
+        self.config
+            .extensions
+            .as_deref()
+            .unwrap_or(RESIDENT_EXTENSIONS)
     }
 
     fn probe(&self, hint: &ProbeHint<'_>) -> Confidence {
         match hint.extension {
-            Some(ext) if RESIDENT_EXTENSIONS.contains(&ext) => Confidence::EXTENSION,
+            Some(ext) if self.extensions().contains(&ext) => Confidence::EXTENSION,
             _ => Confidence::NONE,
         }
     }
@@ -944,8 +967,9 @@ impl DecoderFactory for ResidentFactory {
                     "resident prefetch_frames must be above zero".into(),
                 ));
             }
-            let process = DecoderProcess::spawn(
+            let process = DecoderProcess::spawn_with_args(
                 &self.config.helper,
+                &self.config.helper_args,
                 location.clone(),
                 self.config.prefetch_frames,
                 self.config.liveness,

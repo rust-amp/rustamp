@@ -38,6 +38,7 @@ pub mod host_services;
 pub mod host_window;
 #[cfg(any(windows, test))]
 pub mod input;
+pub mod input_resident;
 pub mod ipc;
 pub mod loader;
 pub mod message_loop;

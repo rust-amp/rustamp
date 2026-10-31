@@ -611,9 +611,21 @@ impl DecoderProcess {
         prefetch_frames: u32,
         liveness: crate::control::Liveness,
     ) -> Result<Self> {
+        Self::spawn_with_args(executable, &[], location, prefetch_frames, liveness)
+    }
+
+    /// [`Self::spawn`] for a binary that is a resident only with `args`.
+    pub fn spawn_with_args(
+        executable: &std::path::Path,
+        args: &[String],
+        location: MediaLocationWire,
+        prefetch_frames: u32,
+        liveness: crate::control::Liveness,
+    ) -> Result<Self> {
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         let mut child = Command::new(executable)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

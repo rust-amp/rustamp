@@ -378,6 +378,8 @@ pub struct App {
     /// Control-thread output-open diagnostics, including later engine reopens.
     output_notes: std::sync::mpsc::Receiver<String>,
     registry: DecoderRegistry,
+    /// The decoders without the input plug-ins (see [`App::install_plugin_inputs`]).
+    builtin_registry: DecoderRegistry,
 
     /// The virtual clock, when the null output is in use (`--null` headless or
     /// `--no-audio` windowed).
@@ -821,6 +823,7 @@ impl App {
             control_channel: false,
             output_choice: options.output,
             output_notes: output.notes,
+            builtin_registry: registry.clone(),
             registry,
             clock: output.clock,
             started: Instant::now(),
@@ -2857,6 +2860,7 @@ impl App {
             self.request_plugin_load(&path, kind);
         }
         self.install_plugin_dsp();
+        self.install_plugin_inputs();
     }
 
     /// Asks the host for the plug-ins the user has switched on, once per
@@ -3607,6 +3611,38 @@ impl App {
     pub(crate) fn disable_dsp(&mut self) {
         self.bypassed_dsp = None;
         self.dsp_install_pending = false;
+    }
+
+    /// Makes the input plug-ins the user switched on decoders of the player.
+    ///
+    /// The built-in decoders stay first, and a tie breaks by registration (RFC
+    /// 0013), so a plug-in plays what the player cannot decode itself.
+    pub(crate) fn install_plugin_inputs(&mut self) {
+        let inputs: Vec<PathBuf> = self
+            .enabled_plugins()
+            .into_iter()
+            .filter(|(_, kind)| *kind == PluginKind::Input)
+            .map(|(path, _)| path)
+            .collect();
+        let mut registry = self.builtin_registry.clone();
+        if !inputs.is_empty() {
+            match crate::supervise::find_plugin_host() {
+                Some(helper) => {
+                    let approvals = self.plugin_approvals_path();
+                    for dll in inputs {
+                        match crate::plugin_input::factory(helper.clone(), &dll, &approvals) {
+                            Ok(factory) => registry.register(factory),
+                            Err(problem) => self.note(problem),
+                        }
+                    }
+                }
+                None => self.note(
+                    "input plug-ins cannot play: the plug-in host binary was not found".to_owned(),
+                ),
+            }
+        }
+        self.registry = registry.clone();
+        self.engine.set_registry(registry);
     }
 
     /// Puts the DSP plug-in the user switched on into the audio path, or takes

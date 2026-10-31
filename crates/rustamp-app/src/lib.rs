@@ -152,6 +152,8 @@ mod output;
 pub mod playlist_tags;
 pub mod playlist_window;
 pub mod plugin_approval;
+#[cfg(windows)]
+pub mod plugin_input;
 pub mod plugin_inventory;
 pub mod region;
 pub mod routing;

@@ -143,6 +143,12 @@ fn run() -> i32 {
         if std::env::args_os().any(|arg| arg == rustamp_plughost::dsp_resident::MODE_ARG) {
             return rustamp_plughost::dsp_resident::run();
         }
+        if std::env::args_os().any(|arg| arg == rustamp_plughost::input_resident::MODE_ARG) {
+            return rustamp_plughost::input_resident::run();
+        }
+        if std::env::args_os().any(|arg| arg == rustamp_plughost::input_resident::EXTENSIONS_ARG) {
+            return rustamp_plughost::input_resident::print_extensions();
+        }
         run_windows()
     }
     #[cfg(not(windows))]

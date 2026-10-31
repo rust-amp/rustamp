@@ -857,6 +857,9 @@ impl App {
                         if let Err(error) = self.save_config() {
                             self.note(format!("preferences: {error}"));
                         }
+                        if kind == PluginKind::Input {
+                            self.install_plugin_inputs();
+                        }
                         if on {
                             // Switching a plug-in on asks the plugin host to
                             // load it: the choice has to reach the host, not

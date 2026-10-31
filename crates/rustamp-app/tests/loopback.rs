@@ -852,18 +852,32 @@ fn measured_level_through(
     track: &std::path::Path,
     hz: f64,
     eq: &[rustamp_core::command::Command],
-    mut chain: rustamp_app::dsp::DspChain,
+    chain: rustamp_app::dsp::DspChain,
 ) -> f64 {
+    let (mono, rate) = recorded(
+        track,
+        eq,
+        chain,
+        rustamp_decoders::default_registry(),
+        EQ_TONE_SECONDS,
+    );
+    level_of(&mono, rate, hz)
+}
+
+/// Plays `track` into the cable and returns the first channel of what came out,
+/// from the moment it started, and its rate.
+fn recorded(
+    track: &std::path::Path,
+    eq: &[rustamp_core::command::Command],
+    mut chain: rustamp_app::dsp::DspChain,
+    registry: rustamp_core::audio::DecoderRegistry,
+    seconds: f64,
+) -> (Vec<f32>, u32) {
     // A natural end closes a cpal output (see the test above), so every
     // measurement has its own engine.
     let output = Box::new(CpalOutput::with_device_name(CABLE_MATCH));
-    let mut engine = Engine::new(
-        rustamp_decoders::default_registry(),
-        output,
-        EventBus::new(),
-        EngineConfig::default(),
-    )
-    .expect("the playback endpoint of the cable");
+    let mut engine = Engine::new(registry, output, EventBus::new(), EngineConfig::default())
+        .expect("the playback endpoint of the cable");
     assert!(is_cable_device(engine.output_name()));
     let granted = engine.device_spec();
     for command in eq {
@@ -896,7 +910,7 @@ fn measured_level_through(
         assert!(start.elapsed() < DEADLINE, "the tone never finished");
         std::thread::sleep(PUMP_INTERVAL);
     }
-    let wanted = mark + (f64::from(rate) * (EQ_TONE_SECONDS + TAIL.as_secs_f64())) as usize;
+    let wanted = mark + (f64::from(rate) * (seconds + TAIL.as_secs_f64())) as usize;
     let start = Instant::now();
     while recorded_frames(&recording, channels) < wanted {
         assert!(start.elapsed() < DEADLINE, "the capture stalled");
@@ -912,6 +926,18 @@ fn measured_level_through(
         .skip(mark)
         .map(|frame| frame[0])
         .collect();
+    assert_eq!(
+        engine
+            .last_error()
+            .filter(|error| error.kind != ErrorKind::Output),
+        None,
+        "the track failed"
+    );
+    (mono, rate)
+}
+
+/// The median amplitude of the tone at `hz` in the windows that hold it.
+fn level_of(mono: &[f32], rate: u32, hz: f64) -> f64 {
     let window = (f64::from(rate) * EQ_WINDOW_SECONDS).round() as usize;
     let mut levels: Vec<f64> = mono
         .chunks_exact(window)
@@ -921,9 +947,8 @@ fn measured_level_through(
         .collect();
     assert!(
         levels.len() >= 5,
-        "only {} windows hold the {hz} Hz tone (engine error {:?})",
-        levels.len(),
-        engine.last_error()
+        "only {} windows hold the {hz} Hz tone",
+        levels.len()
     );
     levels.sort_by(f64::total_cmp);
     levels[levels.len() / 2]
@@ -1071,4 +1096,104 @@ fn the_cable_carries_what_a_dsp_plugin_does() {
         changed.abs() >= 0.05,
         "the Optilab plug-in left the level at {changed:+.3} dB"
     );
+}
+
+// ----- a classic input plug-in, measured on the cable -----
+
+/// A one-pattern ProTracker module: a looping square wave on the first channel.
+fn tiny_module() -> Vec<u8> {
+    const SAMPLE_BYTES: usize = 2048;
+    let mut bytes = vec![0u8; 20];
+    bytes[..4].copy_from_slice(b"tone");
+    for sample in 0..31 {
+        let mut header = [0u8; 30];
+        if sample == 0 {
+            header[22..24].copy_from_slice(&((SAMPLE_BYTES / 2) as u16).to_be_bytes());
+            header[25] = 64;
+            header[28..30].copy_from_slice(&((SAMPLE_BYTES / 2) as u16).to_be_bytes());
+        }
+        bytes.extend_from_slice(&header);
+    }
+    bytes.push(1);
+    bytes.push(127);
+    bytes.extend_from_slice(&[0u8; 128]);
+    bytes.extend_from_slice(b"M.K.");
+    let mut pattern = vec![0u8; 64 * 4 * 4];
+    // Row 0, channel 0: sample 1 at period 428.
+    pattern[..4].copy_from_slice(&[0x01, 0xAC, 0x10, 0x00]);
+    bytes.extend_from_slice(&pattern);
+    bytes.extend((0..SAMPLE_BYTES).map(|index| if index % 64 < 32 { 80u8 } else { 176u8 }));
+    bytes
+}
+
+/// A classic input plug-in plays through the player: what it decodes reaches the
+/// device at the level the built-in decoder gives the same file, and a format
+/// the player has no decoder for plays at all.
+#[test]
+#[ignore = "VM-only: runs real input plug-ins and needs the VB-Audio Virtual Cable"]
+fn the_cable_carries_what_an_input_plugin_decodes() {
+    use rustamp_app::dsp::DspChain;
+    use rustamp_app::plugin_input::factory;
+    use rustamp_core::audio::DecoderRegistry;
+
+    rustamp_app::window::require_test_vm();
+    let dir = tempfile::tempdir().unwrap();
+    let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
+    let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
+        .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
+    let only = |dll: &std::path::Path| {
+        let mut registry = DecoderRegistry::new();
+        registry.register(
+            factory(helper.clone(), dll, &approved(dir.path(), dll))
+                .expect("the plug-in's factory"),
+        );
+        registry
+    };
+
+    // in_wave and in_flac, against the built-in decoders.
+    let hz = 1000.0;
+    let wave = dir.path().join("tone.wav");
+    write_tone(&wave, hz, EQ_TONE_SECONDS);
+    let flac = fixture();
+    for (dll, track, hz, seconds) in [
+        ("in_wave.dll", wave.as_path(), hz, EQ_TONE_SECONDS),
+        ("in_flac.dll", flac.as_path(), TONE_HZ, FIXTURE_SECONDS),
+    ] {
+        let dll = plugins.join("w566").join(dll);
+        let builtin = recorded(
+            track,
+            &[],
+            DspChain::default(),
+            rustamp_decoders::default_registry(),
+            seconds,
+        );
+        let through = recorded(track, &[], DspChain::default(), only(&dll), seconds);
+        let difference = decibels(
+            level_of(&through.0, through.1, hz),
+            level_of(&builtin.0, builtin.1, hz),
+        );
+        println!(
+            "{}: {difference:+.2} dB against the built-in decoder",
+            dll.display()
+        );
+        assert!(
+            difference.abs() <= 1.0,
+            "{} played at {difference:+.2} dB",
+            dll.display()
+        );
+    }
+
+    // in_openmpt plays a format the player has no decoder for.
+    let module = dir.path().join("tone.mod");
+    std::fs::write(&module, tiny_module()).unwrap();
+    let dll = plugins
+        .join("libopenmpt")
+        .join("Winamp2")
+        .join("in_openmpt.dll");
+    let (mono, _) = recorded(&module, &[], DspChain::default(), only(&dll), 1.0);
+    let peak = mono
+        .iter()
+        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    println!("in_openmpt: peak {peak:.4}");
+    assert!(peak > 0.01, "in_openmpt played silence (peak {peak})");
 }

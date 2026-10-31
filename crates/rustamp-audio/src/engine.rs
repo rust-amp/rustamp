@@ -612,6 +612,11 @@ impl Engine {
         self.dsp = dsp;
     }
 
+    /// Replaces the decoders the next run opens its tracks with.
+    pub fn set_registry(&mut self, registry: DecoderRegistry) {
+        self.registry = registry;
+    }
+
     /// Replace the play queue. Entries must be re-openable (paths or URLs).
     ///
     /// The traversal order follows the queue: a new queue invalidates the
