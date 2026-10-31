@@ -29,17 +29,16 @@
 //! app cannot keep the stages: it keeps the recipes and builds a fresh chain
 //! whenever one is installed.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustamp_core::audio::DspStage;
-use rustamp_core::error::ErrorInfo;
+use rustamp_core::audio::{AudioSpec, DspStage};
+use rustamp_core::error::{ErrorInfo, Result};
 
 /// The app's DSP chain: the stages the app installs in the engine, in order.
 ///
 /// The chain is empty until a stage can be built for it. A classic DSP
-/// plug-in runs in the 32-bit plug-in host, and the host has no message that
-/// could carry a block of audio to the engine's decode thread, so the app has
-/// no engine-side stage for a plug-in yet (RFC 0020 Q6 is open).
+/// plug-in runs in a 32-bit helper process, see [`classic_dsp_chain`].
 #[derive(Clone, Default)]
 pub struct DspChain {
     /// How to build each stage, in order.
@@ -76,6 +75,60 @@ impl DspChain {
         self.names = stages.iter().map(|stage| stage.name().to_owned()).collect();
         stages
     }
+}
+
+/// The classic DSP plug-in as a stage: it runs in a helper process, which starts
+/// when the first track is prepared, so a player that plays nothing runs none.
+struct ClassicDspStage {
+    config: rustamp_audio::resident::DspResidentConfig,
+    chain: Option<Box<dyn DspStage>>,
+}
+
+impl DspStage for ClassicDspStage {
+    fn name(&self) -> &str {
+        rustamp_plughost::dsp_resident::STAGE_ID
+    }
+
+    fn prepare(&mut self, spec: AudioSpec) -> Result<()> {
+        if self.chain.is_none() {
+            self.chain = Some(self.config.open(spec)?);
+        }
+        self.chain.as_mut().expect("opened above").prepare(spec)
+    }
+
+    fn process(&mut self, buf: &mut [f32]) -> Result<()> {
+        match &mut self.chain {
+            Some(chain) => chain.process(buf),
+            None => Ok(()),
+        }
+    }
+
+    fn reset(&mut self) {
+        if let Some(chain) = &mut self.chain {
+            chain.reset();
+        }
+    }
+
+    fn latency_frames(&self) -> u32 {
+        self.chain
+            .as_ref()
+            .map_or(0, |chain| chain.latency_frames())
+    }
+}
+
+/// The chain that runs the classic DSP plug-in `dll` through `helper`, the
+/// 32-bit plug-in host.
+pub fn classic_dsp_chain(helper: PathBuf, dll: &Path, approvals: &Path) -> DspChain {
+    let stage = rustamp_plughost::dsp_resident::stage(dll, approvals);
+    DspChain::default().with_stage(move || {
+        let config =
+            rustamp_audio::resident::DspResidentConfig::new(helper.clone(), vec![stage.clone()])
+                .with_helper_args(vec![rustamp_plughost::dsp_resident::MODE_ARG.to_owned()]);
+        Box::new(ClassicDspStage {
+            config,
+            chain: None,
+        })
+    })
 }
 
 /// A DSP stage the engine bypassed after it failed.

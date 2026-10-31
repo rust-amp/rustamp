@@ -844,6 +844,16 @@ fn write_tone(path: &std::path::Path, hz: f64, seconds: f64) {
 /// The median of the windows that hold the tone: the onset and the end straddle
 /// a window, and they must not move the level.
 fn measured_level(track: &std::path::Path, hz: f64, eq: &[rustamp_core::command::Command]) -> f64 {
+    measured_level_through(track, hz, eq, rustamp_app::dsp::DspChain::default())
+}
+
+/// [`measured_level`] with `chain` in the audio path.
+fn measured_level_through(
+    track: &std::path::Path,
+    hz: f64,
+    eq: &[rustamp_core::command::Command],
+    mut chain: rustamp_app::dsp::DspChain,
+) -> f64 {
     // A natural end closes a cpal output (see the test above), so every
     // measurement has its own engine.
     let output = Box::new(CpalOutput::with_device_name(CABLE_MATCH));
@@ -859,6 +869,7 @@ fn measured_level(track: &std::path::Path, hz: f64, eq: &[rustamp_core::command:
     for command in eq {
         engine.apply(command).expect("applying the equalizer");
     }
+    engine.set_dsp_chain(chain.build());
 
     let host = cpal::default_host();
     let capture = find_input_device(&host, CABLE_MATCH);
@@ -993,5 +1004,71 @@ fn the_cable_carries_what_the_equalizer_says() {
         (decibels(preamp, flat) + 6.0).abs() <= TOLERANCE_DB,
         "a -6 dB preamp gave {:+.2} dB",
         decibels(preamp, flat)
+    );
+}
+
+// ----- a classic DSP plug-in, measured on the cable -----
+
+/// The approval store for exactly `dll`, in `dir`.
+fn approved(dir: &std::path::Path, dll: &std::path::Path) -> PathBuf {
+    let bytes = std::fs::read(dll).expect("reading the plug-in");
+    let name = dll.file_name().unwrap().to_string_lossy().into_owned();
+    let mut store = rustamp_plughost::approval::ApprovalStore::new();
+    store.approve_bytes(&name, &bytes).expect("the approval");
+    let path = dir.join(format!("{name}.toml"));
+    std::fs::write(&path, store.to_toml_string()).unwrap();
+    path
+}
+
+fn beside_the_test(file: &str) -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    exe.ancestors()
+        .skip(1)
+        .take(3)
+        .map(|dir| dir.join(file))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "REFUSING LOUDLY: {file} is not staged beside {}",
+                exe.display()
+            )
+        })
+}
+
+/// A classic DSP plug-in in the player's audio path changes what reaches the
+/// device. Our own fixture doubles every sample, so the answer is exact: +6 dB.
+/// The third-party plug-ins' results are their own, so those must only differ
+/// from the plain tone in a way the recording shows.
+#[test]
+#[ignore = "VM-only: runs real DSP plug-ins and needs the VB-Audio Virtual Cable"]
+fn the_cable_carries_what_a_dsp_plugin_does() {
+    use rustamp_app::dsp::classic_dsp_chain;
+
+    rustamp_app::window::require_test_vm();
+    let dir = tempfile::tempdir().unwrap();
+    let hz = 1000.0;
+    let track = dir.path().join("tone.wav");
+    write_tone(&track, hz, EQ_TONE_SECONDS);
+    let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
+    let plain = measured_level(&track, hz, &[]);
+
+    let fixture = beside_the_test("dsp_rustamp_fixture.dll");
+    let chain = classic_dsp_chain(helper.clone(), &fixture, &approved(dir.path(), &fixture));
+    let doubled = decibels(measured_level_through(&track, hz, &[], chain), plain);
+    println!("dsp_rustamp_fixture: {doubled:+.2} dB");
+    assert!(
+        (doubled - 6.02).abs() <= 1.0,
+        "the fixture doubles every sample, the cable shows {doubled:+.2} dB"
+    );
+
+    let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
+        .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
+    let optilab = plugins.join("dsp").join("dsp_optilab_core.dll");
+    let chain = classic_dsp_chain(helper, &optilab, &approved(dir.path(), &optilab));
+    let changed = decibels(measured_level_through(&track, hz, &[], chain), plain);
+    println!("dsp_optilab_core: {changed:+.2} dB");
+    assert!(
+        changed.abs() >= 0.05,
+        "the Optilab plug-in left the level at {changed:+.3} dB"
     );
 }

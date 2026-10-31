@@ -31,6 +31,7 @@ mod commands;
 pub mod control;
 pub mod dialog_watchdog;
 pub mod dsp;
+pub mod dsp_resident;
 pub mod fault;
 pub mod handoff;
 pub mod host_services;

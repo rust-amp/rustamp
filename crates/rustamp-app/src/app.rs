@@ -557,6 +557,8 @@ pub struct App {
     /// The app remembers it so the preferences page does not claim that a
     /// DSP is running while the engine runs without it.
     bypassed_dsp: Option<crate::dsp::BypassedDsp>,
+    /// Whether the installed chain is the switched-on DSP plug-in's.
+    plugin_dsp_installed: bool,
     /// Whether the app's DSP chain still waits for its installation.
     ///
     /// A live run owns the chain, so an install during a run waits for the
@@ -874,6 +876,7 @@ impl App {
             last_error: None,
             location_refusal: None,
             dsp_chain: crate::dsp::DspChain::default(),
+            plugin_dsp_installed: false,
             bypassed_dsp: None,
             dsp_install_pending: false,
             host: HostStateLink::detached(),
@@ -2853,6 +2856,7 @@ impl App {
         for (path, kind) in self.enabled_plugins() {
             self.request_plugin_load(&path, kind);
         }
+        self.install_plugin_dsp();
     }
 
     /// Asks the host for the plug-ins the user has switched on, once per
@@ -3603,6 +3607,43 @@ impl App {
     pub(crate) fn disable_dsp(&mut self) {
         self.bypassed_dsp = None;
         self.dsp_install_pending = false;
+    }
+
+    /// Puts the DSP plug-in the user switched on into the audio path, or takes
+    /// the plug-in that was there out of it. Only one DSP module is active at a
+    /// time (S09 section 6.3), so the first switched-on plug-in is the one.
+    ///
+    /// A chain the caller installed by itself stays while no plug-in is on.
+    /// Returns whether a plug-in's chain is in place.
+    pub(crate) fn install_plugin_dsp(&mut self) -> bool {
+        let dll = self
+            .enabled_plugins()
+            .into_iter()
+            .find(|(_, kind)| *kind == PluginKind::Dsp)
+            .map(|(path, _)| path);
+        let helper = crate::supervise::find_plugin_host();
+        match (dll, helper) {
+            (Some(dll), Some(helper)) => {
+                let approvals = self.plugin_approvals_path();
+                self.plugin_dsp_installed = true;
+                self.install_dsp_chain(crate::dsp::classic_dsp_chain(helper, &dll, &approvals));
+                true
+            }
+            (Some(dll), None) => {
+                self.note(format!(
+                    "{} cannot process audio: the plug-in host binary was not found",
+                    dll.display()
+                ));
+                false
+            }
+            (None, _) => {
+                if self.plugin_dsp_installed {
+                    self.plugin_dsp_installed = false;
+                    self.install_dsp_chain(crate::dsp::DspChain::default());
+                }
+                false
+            }
+        }
     }
 
     /// Makes an [`Event::Error`] reach the user and leaves the transport in a

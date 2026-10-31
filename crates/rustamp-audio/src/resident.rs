@@ -1505,6 +1505,8 @@ pub struct DspResidentConfig {
     /// Absolute path of the resident helper binary (for example
     /// `rustamp-dsphost-stages` next to `rustamp.exe`).
     pub helper: PathBuf,
+    /// The arguments that make the helper a resident, if it needs any.
+    pub helper_args: Vec<String>,
     /// The ordered stage list every configure sends (`DspConfigure`).
     pub stages: Vec<DspStageDesc>,
     /// Capacity of the player-created in-ring, in frames.
@@ -1520,10 +1522,17 @@ impl DspResidentConfig {
     pub fn new(helper: PathBuf, stages: Vec<DspStageDesc>) -> Self {
         DspResidentConfig {
             helper,
+            helper_args: Vec::new(),
             stages,
             ring_frames: DEFAULT_DSP_RING_FRAMES,
             block_timeout: DEFAULT_DSP_BLOCK_TIMEOUT,
         }
+    }
+
+    /// Start the helper with `args`.
+    pub fn with_helper_args(mut self, args: Vec<String>) -> Self {
+        self.helper_args = args;
+        self
     }
 
     /// Override the in-ring capacity (zero is rejected loudly at open).
@@ -1567,8 +1576,9 @@ impl DspResidentConfig {
                 ));
             }
             let wire = wire_spec(spec)?;
-            let process = DspProcess::spawn(
+            let process = DspProcess::spawn_with_args(
                 &self.helper,
+                &self.helper_args,
                 wire,
                 self.stages.clone(),
                 self.ring_frames,

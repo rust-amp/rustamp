@@ -874,7 +874,8 @@ impl App {
                                 // never does this by itself (see
                                 // `crate::dsp`).
                                 let bypassed = self.dsp_bypass().is_some();
-                                let installed = self.reenable_dsp_chain();
+                                let installed =
+                                    self.install_plugin_dsp() || self.reenable_dsp_chain();
                                 let names = self.dsp_chain_stage_names().join(", ");
                                 if !names.is_empty() {
                                     let again = if bypassed { " again" } else { "" };
@@ -906,6 +907,7 @@ impl App {
                                 // stage is out of the chain, so the page must
                                 // stop naming it.
                                 self.disable_dsp();
+                                self.install_plugin_dsp();
                             }
                         }
                     }

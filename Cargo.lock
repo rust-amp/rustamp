@@ -2225,6 +2225,7 @@ name = "rustamp-plughost"
 version = "1.1.1"
 dependencies = [
  "rustamp-ipc",
+ "rustamp-mediahost",
  "rustamp-plugin-abi",
  "rustamp-proto",
  "windows",
