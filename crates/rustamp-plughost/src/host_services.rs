@@ -49,6 +49,12 @@ pub const IPC_GETPLAYLISTTITLEW: u32 = 213;
 /// is called as a function when it is not 0 (see [`crate::embed_frame`]). The 2.95
 /// answer of S10 (1) stays for the player's own window.
 pub const IPC_GET_EMBEDIF: u32 = 505;
+/// IPC ids that answer with a string pointer the host has no string for: the
+/// skin directory, a playlist file, title and wide file (S10 §8.2). The host has
+/// no playlist or skin of its own, and "1", the answer for an unknown id, would
+/// be read as a string at address 1: `out_disk` and `vis_avs` do, and both test
+/// for null. So does the 2.95 contract of 211.
+pub const IPC_STRINGS_WITHOUT_ANSWER: [u32; 4] = [201, 211, 212, 214];
 
 /// What the generic call is asked about (S21 §3 and §5.1).
 const MSG_REGISTER_FACTORY: i32 = 10;
@@ -649,6 +655,9 @@ fn next_random() -> u32 {
 ///
 /// Only for requests sent by code inside this process: the caller decides.
 pub fn ipc_answer(id: u32, wparam: usize) -> Option<usize> {
+    if IPC_STRINGS_WITHOUT_ANSWER.contains(&id) {
+        return Some(0);
+    }
     Some(match id {
         IPC_GET_API_SERVICE => service_manager() as usize,
         IPC_GET_EMBEDIF => crate::embed_frame::embed_function(),
@@ -1006,6 +1015,13 @@ mod tests {
             assert_eq!(ipc_answer(id, 0), None, "{id}");
         }
         assert_ne!(ipc_answer(IPC_GET_API_SERVICE, 0), None);
+    }
+
+    #[test]
+    fn a_string_the_host_does_not_have_is_null_and_never_one() {
+        for id in IPC_STRINGS_WITHOUT_ANSWER {
+            assert_eq!(ipc_answer(id, 0), Some(0), "{id}");
+        }
     }
 
     #[test]
