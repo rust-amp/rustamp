@@ -171,6 +171,7 @@ mod tests {
         assert_eq!(frame_size(50, 50, 40, 60), DEFAULT_SIZE);
     }
 
+    #[cfg(target_pointer_width = "32")]
     #[test]
     fn the_head_of_the_block_has_the_layout_the_plugins_read() {
         assert_eq!(core::mem::offset_of!(EmbedState, frame), 0);
