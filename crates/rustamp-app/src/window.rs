@@ -1664,7 +1664,7 @@ impl Windowed {
         }
         #[cfg(windows)]
         {
-            let owner = self.raw_main_window();
+            let owner = self.raw_eq_window();
             let eq_outer = self
                 .eq_window
                 .as_ref()

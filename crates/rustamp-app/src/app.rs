@@ -3675,14 +3675,8 @@ impl App {
             }
             C::ToggleWindow(WindowId::Main) => self.main_visible = !self.main_visible,
             C::ShowMainWindow => self.show_main_window(),
-            C::ToggleWindow(WindowId::Equalizer) => {
-                self.note(
-                    "Equalizer window toggled (the render state drives the OS window); \
-                     the presets submenu contents and load/save semantics are not \
-                     implemented yet (S07 §12 O12, S04)"
-                        .to_string(),
-                );
-            }
+            // The render state drives the OS window.
+            C::ToggleWindow(WindowId::Equalizer) => {}
             C::ToggleWindow(WindowId::Playlist) => {
                 // The UI machine flipped `playlist_open`; the presenter
                 // creates or drops the playlist editor's OS window to match.
@@ -5083,10 +5077,9 @@ mod tests {
     #[test]
     fn a_window_that_does_not_exist_is_noted_not_an_error() {
         let (mut app, _dir) = app_with_file(None);
-        app.submit(Command::ToggleWindow(WindowId::Equalizer))
-            .unwrap();
+        app.submit(Command::ToggleWindow(WindowId::Video)).unwrap();
         let notes = app.drain_notes();
-        assert!(notes.iter().any(|n| n.contains("Equalizer")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("Video")), "{notes:?}");
         assert!(!app.quit(), "an unimplemented window must not quit the app");
     }
 
@@ -6796,14 +6789,16 @@ mod tests {
     }
 
     #[test]
-    fn toggling_the_equalizer_window_is_noted_and_flips_the_flag() {
+    fn toggling_the_equalizer_window_flips_the_flag_without_a_message() {
         let (mut app, _dir) = app_with_file(None);
         assert!(!app.eq_open());
         app.submit(Command::ToggleWindow(WindowId::Equalizer))
             .unwrap();
         assert!(app.eq_open());
-        let notes = app.drain_notes();
-        assert!(notes.iter().any(|n| n.contains("Equalizer")), "{notes:?}");
+        assert!(
+            app.drain_notes().is_empty(),
+            "the window exists: no message"
+        );
         assert!(!app.quit(), "toggling the EQ window must not quit the app");
     }
 
