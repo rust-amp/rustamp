@@ -563,6 +563,8 @@ pub struct App {
     plugin_output_name: Option<String>,
     /// A change of output plug-in that waits for playback to stop.
     plugin_output_pending: bool,
+    /// Whether the installed chain is one a caller of the app gave it.
+    caller_dsp_chain: bool,
     /// Whether the installed chain is the switched-on DSP plug-in's.
     plugin_dsp_installed: bool,
     /// Whether the app's DSP chain still waits for its installation.
@@ -885,6 +887,7 @@ impl App {
             dsp_chain: crate::dsp::DspChain::default(),
             plugin_output_name: None,
             plugin_output_pending: false,
+            caller_dsp_chain: false,
             plugin_dsp_installed: false,
             bypassed_dsp: None,
             dsp_install_pending: false,
@@ -3563,6 +3566,7 @@ impl App {
     /// install waits for the run to end in that case (see
     /// [`App::pump`]).
     pub fn install_dsp_chain(&mut self, chain: crate::dsp::DspChain) {
+        self.caller_dsp_chain = !chain.is_empty();
         self.dsp_chain = chain;
         self.install_dsp_chain_now();
     }
@@ -3707,9 +3711,12 @@ impl App {
     /// the plug-in that was there out of it. Only one DSP module is active at a
     /// time (S09 section 6.3), so the first switched-on plug-in is the one.
     ///
-    /// A chain the caller installed by itself stays while no plug-in is on.
+    /// A chain the caller installed by itself stays, plug-in or not.
     /// Returns whether a plug-in's chain is in place.
     pub(crate) fn install_plugin_dsp(&mut self) -> bool {
+        if self.caller_dsp_chain {
+            return false;
+        }
         let dll = self
             .enabled_plugins()
             .into_iter()
@@ -3720,7 +3727,8 @@ impl App {
             (Some(dll), Some(helper)) => {
                 let approvals = self.plugin_approvals_path();
                 self.plugin_dsp_installed = true;
-                self.install_dsp_chain(crate::dsp::classic_dsp_chain(helper, &dll, &approvals));
+                self.dsp_chain = crate::dsp::classic_dsp_chain(helper, &dll, &approvals);
+                self.install_dsp_chain_now();
                 true
             }
             (Some(dll), None) => {
@@ -3733,7 +3741,8 @@ impl App {
             (None, _) => {
                 if self.plugin_dsp_installed {
                     self.plugin_dsp_installed = false;
-                    self.install_dsp_chain(crate::dsp::DspChain::default());
+                    self.dsp_chain = crate::dsp::DspChain::default();
+                    self.install_dsp_chain_now();
                 }
                 false
             }

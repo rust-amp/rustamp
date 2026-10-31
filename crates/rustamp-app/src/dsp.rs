@@ -64,6 +64,11 @@ impl DspChain {
         self
     }
 
+    /// Whether the chain has no stages.
+    pub fn is_empty(&self) -> bool {
+        self.recipes.is_empty()
+    }
+
     /// The names of the stages of the last chain the app built, in order.
     pub fn stage_names(&self) -> Vec<&str> {
         self.names.iter().map(String::as_str).collect()
