@@ -247,30 +247,30 @@ impl DialogKind {
 }
 
 /// Client size of the About box. Own choice (see the module docs).
-pub const ABOUT_CLIENT_SIZE: (u32, u32) = (260, 110);
+pub const ABOUT_CLIENT_SIZE: (u32, u32) = (280, 90);
 /// Client size of the file-info box. Own choice (see the module docs).
-pub const FILE_INFO_CLIENT_SIZE: (u32, u32) = (300, 140);
+pub const FILE_INFO_CLIENT_SIZE: (u32, u32) = (420, 90);
 /// Client size of the extended-info box: a count line, the entry the tags
 /// belong to and the tag fields. Own choice (see the module docs).
-pub const EXTENDED_INFO_CLIENT_SIZE: (u32, u32) = (320, 190);
+pub const EXTENDED_INFO_CLIENT_SIZE: (u32, u32) = (400, 250);
 /// Client size of the jump-to-time box. Own choice (see the module docs).
-pub const JUMP_CLIENT_SIZE: (u32, u32) = (220, 90);
+pub const JUMP_CLIENT_SIZE: (u32, u32) = (260, 76);
 /// Client size of the jump-to-file box: a search field plus
 /// [`JUMP_FILE_ROWS`] result rows. Own choice (see the module docs).
-pub const JUMP_FILE_CLIENT_SIZE: (u32, u32) = (300, 190);
+pub const JUMP_FILE_CLIENT_SIZE: (u32, u32) = (420, 228);
 /// How many result rows the jump-to-file box shows at once.
 pub const JUMP_FILE_ROWS: usize = 10;
 /// The longest search text the jump-to-file box keeps.
 pub const MAX_JUMP_FILE_LEN: usize = 40;
 /// Client size of the load-playlist dialog. Own choice (see the module docs).
-pub const LOAD_PLAYLIST_CLIENT_SIZE: (u32, u32) = (300, 100);
+pub const LOAD_PLAYLIST_CLIENT_SIZE: (u32, u32) = (420, 100);
 /// Client size of each open-media dialog. Own choice: the same box shape as
 /// the load-playlist dialog (no spec fixes dialog geometry, S04 open).
-pub const OPEN_MEDIA_CLIENT_SIZE: (u32, u32) = (300, 100);
+pub const OPEN_MEDIA_CLIENT_SIZE: (u32, u32) = (420, 108);
 /// Client size of the skin browser. Own choice: room for the title strip plus
 /// the browser rows (built-in plus at most one file row, see
 /// [`skin_entries`]).
-pub const SKIN_BROWSER_CLIENT_SIZE: (u32, u32) = (300, 140);
+pub const SKIN_BROWSER_CLIENT_SIZE: (u32, u32) = (360, 180);
 /// Client size of the preferences frame. Own choice: room for the title strip
 /// plus the page name (see the module docs; no spec fixes dialog geometry,
 /// S04 open).
@@ -1288,7 +1288,7 @@ pub fn extended_info_lines(info: &ExtendedInfo) -> Vec<String> {
 pub const EDIT_ENTRY_TITLE: &str = "Edit playlist entry";
 /// Client size of the edit-entry dialog: the nine field lines, the hint line
 /// and the title strip. Own choice (no spec fixes dialog geometry, S04 open).
-pub const EDIT_ENTRY_CLIENT_SIZE: (u32, u32) = (320, 150);
+pub const EDIT_ENTRY_CLIENT_SIZE: (u32, u32) = (400, 200);
 /// The hint the edit-entry dialog shows when every field is valid. Own
 /// choice.
 pub const EDIT_ENTRY_HINT: &str = "Tab moves between the fields, Enter saves, Escape cancels.";
@@ -2113,47 +2113,155 @@ pub fn playlist_load_summary_lines(path: &Path, loaded: usize, skips: &[String])
 /// see [`skin_browser_visible_rows`].
 pub fn render_dialog(kind: DialogKind, skin: &Skin, body: &[&str]) -> Image {
     let (width, height) = kind.client_size();
-    let mut canvas = Image::filled(width, height, [0x18, 0x18, 0x20, 0xff]);
-    // Title strip: a lighter band with the title text.
-    canvas.fill_rect(
-        rustamp_gfx::Rect::new(0, 0, width, TITLE_STRIP_HEIGHT),
-        [0x3a, 0x3a, 0x4a, 0xff],
-    );
-    let font = text_font(skin);
-    if let Some(font) = font.as_ref() {
-        font.render_text(&mut canvas, TEXT_PAD, 3, &kind.title().to_ascii_lowercase());
-        let mut y = BODY_TOP;
-        for line in body {
-            // The line's band has to fit into the client area; a line that
-            // would cross the bottom is left out instead of being cut off.
-            if y + TEXT_LINE_PX > height as i32 {
-                break;
-            }
-            // A line with characters the bitmap font does not have goes to a
-            // real font, whole, so its letters match each other.
-            let band = rustamp_gfx::Rect::new(
-                TEXT_PAD,
-                y - 3,
-                width.saturating_sub(TEXT_PAD as u32),
-                TEXT_LINE_PX as u32 + 2,
-            );
-            if crate::render::bitmap_can_draw(line)
-                || crate::render::draw_system_text(&mut canvas, band, 0, line, [0xff; 3]).is_none()
-            {
-                font.render_text(&mut canvas, TEXT_PAD, y, &line.to_ascii_lowercase());
-            }
-            y += TEXT_LINE_PX;
+    let style = skin.pledit();
+    let opaque = |colour: [u8; 3]| [colour[0], colour[1], colour[2], 255];
+    let mut canvas = Image::filled(width, height, opaque(style.normal_bg));
+    crate::chrome::draw_title_bar(&mut canvas, skin, kind.title(), true);
+    let mut y = BODY_TOP;
+    let last = body.len().saturating_sub(1);
+    for (index, line) in body.iter().enumerate() {
+        // The line's band has to fit into the client area; a line that does
+        // not is not drawn (see above).
+        if y + TEXT_LINE_PX > height as i32 {
+            break;
         }
+        let band = rustamp_gfx::Rect::new(0, y, width, TEXT_LINE_PX as u32);
+        // A selected row (the app marks it `> `) wears the skin's selection.
+        let (text, selected) = match line.strip_prefix("> ") {
+            Some(rest) => (rest, true),
+            None => (line.strip_prefix("  ").unwrap_or(line), false),
+        };
+        if selected {
+            canvas.fill_rect(
+                rustamp_gfx::Rect::new(
+                    TEXT_PAD - 2,
+                    y,
+                    width - 2 * (TEXT_PAD as u32 - 2),
+                    TEXT_LINE_PX as u32,
+                ),
+                opaque(style.selected_bg),
+            );
+        }
+        let is_input = is_input_line(kind, index);
+        if is_input {
+            draw_input_field(&mut canvas, band, text, style.normal, style.normal_bg);
+        } else {
+            let colour = if selected || (index == 0 && !is_list_footer(kind, index, last)) {
+                style.current
+            } else {
+                style.normal
+            };
+            draw_dialog_text(&mut canvas, skin, band, TEXT_PAD, text, colour);
+        }
+        y += TEXT_LINE_PX;
     }
+    draw_frame(&mut canvas, style.normal);
     canvas
 }
 
+/// Whether the body line at `index` is the entry field of `kind`.
+fn is_input_line(kind: DialogKind, index: usize) -> bool {
+    match kind {
+        DialogKind::Jump(JumpTarget::File) => index == 0,
+        DialogKind::Jump(JumpTarget::Time) => index == 1,
+        _ => false,
+    }
+}
+
+/// Whether the line at `index` closes a list instead of heading the dialog.
+fn is_list_footer(kind: DialogKind, index: usize, last: usize) -> bool {
+    matches!(kind, DialogKind::Jump(JumpTarget::File)) && index == last
+}
+
+/// The size of the dialogs' real font (own choice: the list's own size).
+const DIALOG_FONT_SIZE: u32 = 13;
+
+fn dialog_font() -> crate::playlist_font::SystemFont<'static> {
+    crate::playlist_font::SystemFont {
+        family: crate::playlist_font::DEFAULT_FAMILY,
+        size: DIALOG_FONT_SIZE,
+        bold: false,
+        italic: false,
+    }
+}
+
+/// One line of text in the dialogs' real font. A host without any font falls
+/// back to the skin's bitmap font.
+fn draw_dialog_text(
+    canvas: &mut Image,
+    skin: &Skin,
+    band: rustamp_gfx::Rect,
+    x: i32,
+    text: &str,
+    colour: [u8; 3],
+) {
+    let width = band
+        .width
+        .saturating_sub((x - band.x).max(0) as u32 + TEXT_PAD as u32);
+    match crate::playlist_font::render(dialog_font(), text, width.max(1), band.height, colour) {
+        Some(scratch) => canvas.blit_alpha(&scratch, scratch.bounds(), x, band.y),
+        None => {
+            if let Some(font) = text_font(skin) {
+                font.render_text(canvas, x, band.y + 3, &text.to_ascii_lowercase());
+            }
+        }
+    }
+}
+
+/// An entry field: a sunken box with the typed text and a caret. The label an
+/// app line carries (`Search: `) is left out: the box says what it is.
+fn draw_input_field(
+    canvas: &mut Image,
+    band: rustamp_gfx::Rect,
+    line: &str,
+    ink: [u8; 3],
+    background: [u8; 3],
+) {
+    let text = line.split_once(": ").map_or(line, |(_, typed)| typed);
+    let inner_width = band.width - 2 * TEXT_PAD as u32;
+    let frame = rustamp_gfx::Rect::new(TEXT_PAD, band.y, inner_width, band.height);
+    canvas.fill_rect(frame, [ink[0], ink[1], ink[2], 255]);
+    canvas.fill_rect(
+        rustamp_gfx::Rect::new(frame.x + 1, frame.y + 1, frame.width - 2, frame.height - 2),
+        [background[0] / 2, background[1] / 2, background[2] / 2, 255],
+    );
+    let text_x = frame.x + 3;
+    let font = dialog_font();
+    let shown = crate::playlist_font::text_width(font, text).unwrap_or(0);
+    if let Some(scratch) = crate::playlist_font::render(
+        font,
+        text,
+        (inner_width - 8).max(1),
+        band.height.saturating_sub(1),
+        ink,
+    ) {
+        canvas.blit_alpha(&scratch, scratch.bounds(), text_x, frame.y + 1);
+    }
+    let caret = text_x + shown.min(inner_width - 8) as i32 + 1;
+    canvas.fill_rect(
+        rustamp_gfx::Rect::new(caret, frame.y + 2, 1, frame.height - 4),
+        [ink[0], ink[1], ink[2], 255],
+    );
+}
+
+/// A one-pixel frame in the skin's text colour, darkened, so the borderless
+/// window has an edge on any background.
+fn draw_frame(canvas: &mut Image, colour: [u8; 3]) {
+    let edge = [colour[0] / 2, colour[1] / 2, colour[2] / 2, 255];
+    let (width, height) = (canvas.width(), canvas.height());
+    let top = crate::chrome::TITLE_BAR_HEIGHT as i32;
+    let body = height - crate::chrome::TITLE_BAR_HEIGHT;
+    canvas.fill_rect(rustamp_gfx::Rect::new(0, top, 1, body), edge);
+    canvas.fill_rect(rustamp_gfx::Rect::new(width as i32 - 1, top, 1, body), edge);
+    canvas.fill_rect(rustamp_gfx::Rect::new(0, height as i32 - 1, width, 1), edge);
+}
+
 /// Height of the title strip in a dialog frame. Own choice.
-pub const TITLE_STRIP_HEIGHT: u32 = 16;
+pub const TITLE_STRIP_HEIGHT: u32 = crate::chrome::TITLE_BAR_HEIGHT;
 /// Text padding in a dialog frame. Own choice.
 pub const TEXT_PAD: i32 = 8;
 /// Line advance for dialog body text. Own choice.
-pub const TEXT_LINE_PX: i32 = 12;
+pub const TEXT_LINE_PX: i32 = 16;
 /// The top of the first body row in a dialog frame: below the title strip
 /// and the text pad.
 pub const BODY_TOP: i32 = TITLE_STRIP_HEIGHT as i32 + TEXT_PAD;
@@ -2660,11 +2768,11 @@ mod tests {
         assert_eq!(manager.skin_scroll(), 11);
         // A shorter client area shows fewer rows.
         manager.set_skin_client_height(80);
-        assert_eq!(manager.skin_visible_rows(), 4);
-        assert_eq!(manager.skin_visible_range(&entries), 11..15);
+        assert_eq!(manager.skin_visible_rows(), 3);
+        assert_eq!(manager.skin_visible_range(&entries), 11..14);
         // A taller one shows the whole list, so the window is back at the top.
         manager.set_skin_client_height(400);
-        assert_eq!(manager.skin_visible_rows(), 31);
+        assert_eq!(manager.skin_visible_rows(), 23);
         assert_eq!(manager.skin_scroll(), 0);
         assert_eq!(manager.skin_visible_range(&entries), 0..20);
     }
@@ -2710,7 +2818,8 @@ mod tests {
             SKIN_BROWSER_CLIENT_SIZE,
             "the frame is the client area"
         );
-        let background = Some([0x18, 0x18, 0x20, 255]);
+        let bg = skin.pledit().normal_bg;
+        let background = Some([bg[0], bg[1], bg[2], 255]);
         // The first row is drawn, so the check below is about the tenth.
         let mut drawn = false;
         for y in BODY_TOP..(BODY_TOP + TEXT_LINE_PX) {
@@ -2723,8 +2832,8 @@ mod tests {
         assert!(drawn, "the first row is on the frame");
         // The band of the tenth row crosses the bottom of the client area, so
         // that row is not drawn at all.
-        for y in (BODY_TOP + 9 * TEXT_LINE_PX)..frame.height() as i32 {
-            for x in 0..frame.width() as i32 {
+        for y in (BODY_TOP + 9 * TEXT_LINE_PX)..frame.height() as i32 - 1 {
+            for x in 1..frame.width() as i32 - 1 {
                 assert_eq!(frame.pixel(x, y), background, "{x},{y}");
             }
         }

@@ -4,9 +4,9 @@
 //! Every classic window of this player is **borderless**: its title bar is
 //! drawn from the skin, so a native caption would be a second title bar with
 //! the wrong buttons, the wrong height and the wrong colours (see
-//! [`rustamp_ui::shell`]). The **media library** is not one of them: it has
-//! a native title bar, a system font and its own chrome, so it is an
-//! ordinary window of the operating system - decorated and resizable.
+//! [`rustamp_ui::shell`]). The **media library** is drawn in its own modern
+//! style below that bar, but it wears the skinned title bar of
+//! [`rustamp_ui::chrome`] like every other window, and it can be resized.
 //!
 //! The attributes still come from the shared shell
 //! ([`rustamp_ui::shell::skinned_window_attributes`]): it is the only place
@@ -26,9 +26,8 @@ use winit::window::WindowAttributes;
 
 /// Whether a modern window carries the native frame.
 ///
-/// Always `true`: the window is not skinned, so its title bar is the
-/// operating system's.
-pub const MODERN_DECORATIONS: bool = true;
+/// Always `false`: every window of the player wears the skin's title bar.
+pub const MODERN_DECORATIONS: bool = false;
 
 /// Whether a modern window can be resized by the user.
 ///
@@ -60,12 +59,12 @@ mod tests {
     /// **classic** windows, which are borderless, so a window that is not
     /// skinned must say so itself.
     #[test]
-    fn a_modern_window_has_the_native_frame_and_can_be_resized() {
+    fn a_modern_window_has_no_native_frame_and_can_be_resized() {
         let attributes =
             modern_window_attributes("Rustamp Library", (800, 480), TaskbarRole::Secondary);
         assert!(
-            attributes.decorations,
-            "the media library is not skinned: its title bar is the operating system's"
+            !attributes.decorations,
+            "the media library wears the skinned title bar"
         );
         assert!(
             attributes.resizable,

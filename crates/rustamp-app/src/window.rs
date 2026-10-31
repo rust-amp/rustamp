@@ -532,6 +532,8 @@ struct Windowed {
     dialog_id: Option<WindowId>,
     /// Which dialog the OS window above shows (`None` while it is closed).
     dialog_kind: Option<DialogKind>,
+    /// The pointer over the dialog window, in client coordinates.
+    dialog_cursor: (i32, i32),
     /// No fresh key press reached the dialog window yet.
     dialog_awaits_press: bool,
     /// The media library window: a **modern** window (native title bar,
@@ -646,6 +648,7 @@ impl Windowed {
             dialog_surface: None,
             dialog_id: None,
             dialog_kind: None,
+            dialog_cursor: (0, 0),
             dialog_awaits_press: false,
             library_window: None,
             library_surface: None,
@@ -1402,7 +1405,13 @@ impl Windowed {
         let Some(surface) = self.library_surface.as_mut() else {
             return;
         };
-        let image = self.app.render_library();
+        let window = self.library_window.as_ref();
+        let size = window.map_or((1, 1), |window| {
+            let size = window.inner_size();
+            (size.width.max(1), size.height.max(1))
+        });
+        let focused = window.is_some_and(|window| window.has_focus());
+        let image = self.app.render_library_window(size, focused);
         let (Some(width), Some(height)) = (
             NonZeroU32::new(image.width()),
             NonZeroU32::new(image.height()),
@@ -1554,7 +1563,7 @@ impl Windowed {
                 .window
                 .as_ref()
                 .and_then(|window| window.outer_position().ok());
-            self.show_context_menu(menu, origin, self.cursor);
+            self.show_context_menu(self.raw_main_window(), menu, origin, self.cursor);
         }
         if self.app.take_pending_playlist_context().is_some() {
             let menu = rustamp_ui::menu::native_playlist_entry_menu();
@@ -1562,7 +1571,12 @@ impl Windowed {
                 .playlist_window
                 .as_ref()
                 .and_then(|window| window.outer_position().ok());
-            self.show_context_menu(menu, origin, self.playlist_cursor);
+            self.show_context_menu(
+                self.raw_playlist_window(),
+                menu,
+                origin,
+                self.playlist_cursor,
+            );
         }
     }
 
@@ -1570,6 +1584,7 @@ impl Windowed {
     /// chosen row.
     fn show_context_menu(
         &mut self,
+        owner: isize,
         menu: rustamp_ui::menu::NativeMainMenu,
         origin: Option<PhysicalPosition<i32>>,
         cursor: (i32, i32),
@@ -1580,7 +1595,7 @@ impl Windowed {
                 return;
             };
             let point = (origin.x + cursor.0, origin.y + cursor.1);
-            match rustamp_platform::show_popup_menu(self.raw_main_window(), &menu.rows, point) {
+            match rustamp_platform::show_popup_menu(owner, &menu.rows, point) {
                 Ok(None) => {}
                 Ok(Some(id)) => {
                     if let Some(choice) = menu.choice_for_id(id)
@@ -1593,7 +1608,7 @@ impl Windowed {
             }
         }
         #[cfg(not(windows))]
-        let _ = (menu, origin, cursor);
+        let _ = (owner, menu, origin, cursor);
     }
 
     /// Shows the S04 §7 MISC popup; choices use the existing menu dispatch.
@@ -1613,8 +1628,11 @@ impl Windowed {
             let menu = rustamp_ui::menu::native_playlist_misc_menu();
             let scale = self.app.playlist_scale() as i32;
             let height = self.app.playlist_frame_size().1 as i32;
+            // The menu's owner is the window it opens from. Another owner takes
+            // the activation, and the system paints a native caption over its
+            // skinned title bar, which nothing repaints while the menu is up.
             match rustamp_platform::show_popup_menu(
-                self.raw_main_window(),
+                self.raw_playlist_window(),
                 &menu.rows,
                 (origin.x + 110 * scale, origin.y + height - 24 * scale),
             ) {
@@ -2424,6 +2442,24 @@ impl Windowed {
                 }
                 self.sync_dialog_window(event_loop);
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.dialog_cursor = (position.x as i32, position.y as i32);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.dialog_cursor;
+                if let (Some(window), Some(kind)) = (self.dialog_window.clone(), self.dialog_kind) {
+                    if rustamp_ui::chrome::hits_close(window.inner_size().width, x, y) {
+                        self.app.close_dialog(kind);
+                        self.sync_dialog_window(event_loop);
+                    } else if rustamp_ui::chrome::hits_title_bar(y) {
+                        let _ = window.drag_window();
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => self.paint_dialog(),
             WindowEvent::Resized(size) => {
                 if let Some(kind) = self.dialog_kind {
@@ -2530,6 +2566,7 @@ impl Windowed {
             return;
         }
         let (width, height) = self.app.library_client_size();
+        let height = height + rustamp_ui::chrome::TITLE_BAR_HEIGHT;
         let title = self.app.library_title();
         // The window has to fit the screen, or its own close button lies
         // outside it. The room kept for the frame and the taskbar is our choice.
@@ -2592,24 +2629,19 @@ impl Windowed {
             }
             WindowEvent::RedrawRequested => self.paint_library(),
             WindowEvent::Resized(size) => {
-                if let Err(error) = self
-                    .app
-                    .library_resize((size.width.max(1), size.height.max(1)))
-                {
+                if let Err(error) = self.app.library_resize(library_body_size(size)) {
                     eprintln!("rustamp: the library resize failed: {error}");
                 }
                 self.request_library_redraw();
             }
+            WindowEvent::Focused(_) => self.request_library_redraw(),
             WindowEvent::ScaleFactorChanged { .. } => {
                 // A DPI change moves the window to another monitor: the
                 // client area follows it, and the number of rows the view
                 // shows has to follow the client area.
                 if let Some(window) = &self.library_window {
                     let size = window.inner_size();
-                    if let Err(error) = self
-                        .app
-                        .library_resize((size.width.max(1), size.height.max(1)))
-                    {
+                    if let Err(error) = self.app.library_resize(library_body_size(size)) {
                         eprintln!("rustamp: the library resize failed: {error}");
                     }
                 }
@@ -2617,6 +2649,12 @@ impl Windowed {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.library_cursor = (position.x as i32, position.y as i32);
+                if let Some(window) = &self.library_window {
+                    let edge = resize_edge(window.inner_size(), self.library_cursor);
+                    window.set_cursor(edge.map_or(winit::window::CursorIcon::Default, |edge| {
+                        winit::window::CursorIcon::from(edge)
+                    }));
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -2624,6 +2662,25 @@ impl Windowed {
                 ..
             } => {
                 let (x, y) = self.library_cursor;
+                if let Some(window) = self.library_window.clone() {
+                    let size = window.inner_size();
+                    if rustamp_ui::chrome::hits_close(size.width, x, y) {
+                        if let Err(error) = self.app.close_library_window() {
+                            eprintln!("rustamp: library close failed: {error}");
+                        }
+                        self.sync_library_window(event_loop);
+                        return;
+                    }
+                    if let Some(edge) = resize_edge(size, (x, y)) {
+                        let _ = window.drag_resize_window(edge);
+                        return;
+                    }
+                    if rustamp_ui::chrome::hits_title_bar(y) {
+                        let _ = window.drag_window();
+                        return;
+                    }
+                }
+                let y = y - rustamp_ui::chrome::TITLE_BAR_HEIGHT as i32;
                 if let Err(error) = self.app.library_click(x, y) {
                     eprintln!("rustamp: library pointer input failed: {error}");
                 }
@@ -3696,6 +3753,41 @@ fn map_modifiers(state: ModifiersState) -> Modifiers {
 /// `Shift`+`Tab` that went to the global path would never come back.
 /// `Ctrl`+`Tab` stays global: it is the "switch to the next window" row
 /// (S03 §1 id 40063).
+/// The media library's own part of a window of `size`: all but the title bar.
+fn library_body_size(size: PhysicalSize<u32>) -> (u32, u32) {
+    (
+        size.width.max(1),
+        size.height
+            .saturating_sub(rustamp_ui::chrome::TITLE_BAR_HEIGHT)
+            .max(1),
+    )
+}
+
+/// The edge of a borderless resizable window a press at `(x, y)` resizes: the
+/// sides and the bottom, in a band of a few pixels (own choice). The top belongs
+/// to the title bar.
+fn resize_edge(
+    size: PhysicalSize<u32>,
+    (x, y): (i32, i32),
+) -> Option<winit::window::ResizeDirection> {
+    use winit::window::ResizeDirection as Edge;
+    const BAND: i32 = 5;
+    if y < rustamp_ui::chrome::TITLE_BAR_HEIGHT as i32 {
+        return None;
+    }
+    let left = x < BAND;
+    let right = x >= size.width as i32 - BAND;
+    let bottom = y >= size.height as i32 - BAND;
+    match (left, right, bottom) {
+        (true, _, true) => Some(Edge::SouthWest),
+        (_, true, true) => Some(Edge::SouthEast),
+        (true, _, false) => Some(Edge::West),
+        (_, true, false) => Some(Edge::East),
+        (_, _, true) => Some(Edge::South),
+        _ => None,
+    }
+}
+
 /// A wheel event as whole notches; a touchpad's small step still counts as one.
 fn wheel_notches(delta: winit::event::MouseScrollDelta) -> i32 {
     let amount = match delta {

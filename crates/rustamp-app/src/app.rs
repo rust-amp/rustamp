@@ -3374,6 +3374,22 @@ impl App {
         }
     }
 
+    /// The media library with the skinned title bar over it. `size` is the
+    /// whole window.
+    pub fn render_library_window(&mut self, size: (u32, u32), focused: bool) -> Image {
+        let body = self.render_library();
+        let mut frame = Image::new(size.0, size.1);
+        frame.blit_rect(
+            &body,
+            body.bounds(),
+            0,
+            rustamp_ui::chrome::TITLE_BAR_HEIGHT as i32,
+        );
+        let title = self.library_title();
+        rustamp_ui::chrome::draw_title_bar(&mut frame, self.skin.skin(), &title, focused);
+        frame
+    }
+
     /// Whether the marquee scrolls by itself (S02 §3).
     pub(crate) fn marquee_autoscroll(&self) -> bool {
         self.ui.autoscroll()
@@ -7669,10 +7685,11 @@ mod tests {
             "the frame is the client area"
         );
         // The band of the tenth row crosses the bottom, so it is not drawn.
-        let background = Some([0x18, 0x18, 0x20, 255]);
+        let bg = app.skin.skin().pledit().normal_bg;
+        let background = Some([bg[0], bg[1], bg[2], 255]);
         let last_row = BODY_TOP + 9 * TEXT_LINE_PX;
-        for y in last_row..frame.height() as i32 {
-            for x in 0..frame.width() as i32 {
+        for y in last_row..frame.height() as i32 - 1 {
+            for x in 1..frame.width() as i32 - 1 {
                 assert_eq!(frame.pixel(x, y), background, "{x},{y}");
             }
         }

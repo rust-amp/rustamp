@@ -77,6 +77,7 @@
 #![forbid(unsafe_code)]
 
 pub mod behaviour;
+pub mod chrome;
 pub mod cursor;
 pub mod dialogs;
 pub mod docking;
