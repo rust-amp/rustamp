@@ -163,7 +163,7 @@ fn the_playlist_title_format_follows_the_dialog_and_survives_a_restart() {
     let loaded = load(Some(&path)).expect("load");
     assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
     assert_eq!(
-        loaded.playlist_title_format,
+        loaded.app_ui.playlist_title_format,
         Some(rustamp_app::title_format::TitleFormatSetting::new(
             true,
             "[%artist% - ]%title%"
@@ -174,6 +174,7 @@ fn the_playlist_title_format_follows_the_dialog_and_survives_a_restart() {
     // dialog, and the rows are formatted from the start.
     let mut restarted = app_with(loaded.config, None);
     let setting = loaded
+        .app_ui
         .playlist_title_format
         .expect("the file names a format");
     restarted

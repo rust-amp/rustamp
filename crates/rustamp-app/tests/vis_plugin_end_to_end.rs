@@ -284,7 +284,7 @@ fn the_player_runs(
     std::fs::write(
         &config,
         format!(
-            "[plugins]\nplugin_dir = '{}'\n",
+            "version = 2\n[plugins]\nplugin_dir = '{}'\nenabled = ['{plugin}']\n",
             plugins.display().to_string().replace('\\', "/")
         ),
     )

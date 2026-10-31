@@ -39,7 +39,8 @@ mod plugins;
 
 pub use plugins::{
     APPROVALS_FILE, EnableRefused, MAX_PLUGIN_BYTES, PluginEntry, PluginScan, PluginStatus,
-    kind_name, scan, set_enabled,
+    enabled_from_off_list, forget_file, keep_one_output, kind_name, scan, set_enabled,
+    use_own_output,
 };
 
 use rustamp_core::command::{Command, PrefsPage};

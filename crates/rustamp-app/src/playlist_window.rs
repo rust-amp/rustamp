@@ -2057,12 +2057,12 @@ mod tests {
         app.save_config().expect("the config is written");
 
         let loaded = crate::config::load(Some(&path)).expect("the config loads");
-        assert_eq!(loaded.playlist_font_size, Some(14));
+        assert_eq!(loaded.app_ui.playlist_font_size, Some(14));
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
 
         // A new player built from that file comes up with the same size.
         let mut restarted = test_app();
-        restarted.set_playlist_font_size(loaded.playlist_font_size);
+        restarted.set_playlist_font_size(loaded.app_ui.playlist_font_size);
         assert_eq!(restarted.playlist().font_size().size(), 14);
         assert_eq!(restarted.playlist_font_size(), Some(14));
     }
@@ -2173,7 +2173,7 @@ mod tests {
 
         let loaded = crate::config::load(Some(&path)).expect("the config loads");
         assert_eq!(
-            loaded.playlist_title_format,
+            loaded.app_ui.playlist_title_format,
             Some(crate::title_format::TitleFormatSetting::new(
                 true,
                 "%filename%"
@@ -2184,6 +2184,7 @@ mod tests {
         // A new player built from that file comes up with the same format.
         let mut restarted = test_app();
         let setting = loaded
+            .app_ui
             .playlist_title_format
             .expect("the file names a format");
         restarted

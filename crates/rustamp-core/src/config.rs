@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::{EqState, WindowId};
 
 /// Current config schema version.
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Root configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,8 +217,9 @@ pub struct PluginsConfig {
     pub vis_plugin: Option<String>,
     /// Selected visualization preset.
     pub vis_preset: Option<String>,
-    /// Plugin file names that must not be loaded.
-    pub disabled: Vec<String>,
+    /// Plugin file names the user switched on (RFC 0022). Only an approved
+    /// image of a listed file runs; approving a plug-in does not list it.
+    pub enabled: Vec<String>,
     /// Which module of the active DSP library runs (S09 section 6.3).
     pub dsp_module: u32,
 }
@@ -335,7 +336,7 @@ mod tests {
                 plugin_dir: Some(PathBuf::from("custom/plugins")),
                 vis_plugin: Some("vis_milk2.dll".into()),
                 vis_preset: Some("preset_1.milk".into()),
-                disabled: vec!["vis_x.dll".into(), "bad_dsp.dll".into()],
+                enabled: vec!["vis_x.dll".into(), "bad_dsp.dll".into()],
                 dsp_module: 1,
             },
         }
@@ -407,7 +408,7 @@ mod tests {
             c.plugins.vis_preset, d.plugins.vis_preset,
             "plugins.vis_preset"
         );
-        assert_ne!(c.plugins.disabled, d.plugins.disabled, "plugins.disabled");
+        assert_ne!(c.plugins.enabled, d.plugins.enabled, "plugins.enabled");
     }
 
     #[test]
@@ -489,10 +490,7 @@ mod tests {
             c.plugins.vis_preset, back.plugins.vis_preset,
             "plugins.vis_preset"
         );
-        assert_eq!(
-            c.plugins.disabled, back.plugins.disabled,
-            "plugins.disabled"
-        );
+        assert_eq!(c.plugins.enabled, back.plugins.enabled, "plugins.enabled");
 
         assert_eq!(c, back, "the whole configuration survives the round trip");
     }

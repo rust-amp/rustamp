@@ -1,23 +1,23 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
-//! `rustamp --approve-plugin <file>`: the operator's way to put a plug-in on the
-//! allowlist.
+//! Putting a plug-in on the allowlist: `rustamp --approve-plugin <file>`, and the
+//! `Approve...` button of the Preferences' plug-in pages.
 //!
 //! The approval store (`plugins-approved.toml`, beside the configuration file)
 //! is the one thing standing between a DLL on the disk and its code running in
 //! the plug-in host, and **nothing in the player ever writes it on its own**
-//! (see `rustamp_prefs::plugins`). Until now an operator had to write the
-//! entries by hand. This command is that act made usable, and nothing more:
+//! (see `rustamp_prefs::plugins`). Both ways are the same act:
 //!
-//! * it is an explicit command line, never a UI step and never a consequence of
-//!   another action;
+//! * it is an explicit act of the user, never a consequence of another action;
 //! * it reads the file as bytes, runs the same passive PE preflight the host
 //!   runs, and records **the exact image** (SHA-256, size, machine); a changed
 //!   file is a new, unapproved image again;
-//! * it prints what it approved, so the operator sees the hash, and it does
-//!   **not** run, map or load the file.
+//! * it shows the hash, and it does **not** run, map or load the file;
+//! * it switches nothing on: that is a second act on the plug-in pages.
 //!
 //! Approving is a decision that this code will run on the user's machine, with
-//! the user's rights. The command says so in its output.
+//! the user's rights. The command's output and the button's warning say so. The
+//! button records the bytes the warning was written for ([`PendingApproval`]), so
+//! a file swapped while the warning is open is not what gets approved.
 
 use std::path::{Path, PathBuf};
 
@@ -72,8 +72,54 @@ pub fn store_path_for(config: &Path) -> PathBuf {
         .join(rustamp_prefs::APPROVALS_FILE)
 }
 
-/// Records `file` in the store at `store`.
-pub fn approve_file(store: &Path, file: &Path) -> Result<Approved, ApproveError> {
+/// An approval the user has not answered yet: the image the warning names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApproval {
+    /// The plug-in's file name.
+    pub name: String,
+    /// The image as it was read for the warning.
+    bytes: Vec<u8>,
+    /// SHA-256 of the image, lowercase hex.
+    sha256: String,
+}
+
+impl PendingApproval {
+    /// Reads `file` and checks that it is an image the host could load.
+    pub fn read(file: &Path) -> Result<Self, ApproveError> {
+        let (name, bytes) = read_image(file)?;
+        let sha256 = ApprovalStore::new()
+            .approve_bytes(&name, &bytes)
+            .map_err(|error| ApproveError::Store(format!("{name}: {error}")))?
+            .sha256;
+        Ok(Self {
+            name,
+            bytes,
+            sha256,
+        })
+    }
+
+    /// The warning the user answers.
+    pub fn warning(&self) -> String {
+        format!(
+            "{name} is a program. If you approve it and switch it on, it runs on this computer \
+             with your rights, and it can do what you can do: read and change your files, or use \
+             the network.\n\nApprove it only if you trust where it came from.\n\n\
+             Size: {size} bytes\nSHA-256: {sha256}\n\n\
+             Only this exact file is approved. Approving does not switch it on.\n\n\
+             Approve {name}?",
+            name = self.name,
+            size = self.bytes.len(),
+            sha256 = self.sha256,
+        )
+    }
+
+    /// Records the image the warning named in the store at `store`.
+    pub fn approve(&self, store: &Path) -> Result<Approved, ApproveError> {
+        record_image(store, &self.name, &self.bytes)
+    }
+}
+
+fn read_image(file: &Path) -> Result<(String, Vec<u8>), ApproveError> {
     let bytes =
         std::fs::read(file).map_err(|error| ApproveError::Read(file.to_path_buf(), error))?;
     let name = file
@@ -81,11 +127,21 @@ pub fn approve_file(store: &Path, file: &Path) -> Result<Approved, ApproveError>
         .and_then(|name| name.to_str())
         .ok_or_else(|| ApproveError::NoName(file.to_path_buf()))?
         .to_string();
+    Ok((name, bytes))
+}
+
+/// Records `file` in the store at `store`.
+pub fn approve_file(store: &Path, file: &Path) -> Result<Approved, ApproveError> {
+    let (name, bytes) = read_image(file)?;
+    record_image(store, &name, &bytes)
+}
+
+fn record_image(store: &Path, name: &str, bytes: &[u8]) -> Result<Approved, ApproveError> {
     let mut approvals = ApprovalStore::open_or_empty(store)
         .map_err(|error| ApproveError::Store(format!("{}: {error}", store.display())))?;
     let before = approvals.len();
     let entry = approvals
-        .approve_bytes(&name, &bytes)
+        .approve_bytes(name, bytes)
         .map_err(|error| ApproveError::Store(format!("{name}: {error}")))?;
     if let Some(dir) = store.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)
@@ -96,7 +152,7 @@ pub fn approve_file(store: &Path, file: &Path) -> Result<Approved, ApproveError>
         .map_err(|error| ApproveError::Store(format!("{}: {error}", store.display())))?;
     Ok(Approved {
         store: store.to_path_buf(),
-        name,
+        name: name.to_string(),
         sha256: entry.sha256,
         size: entry.size,
         already_approved: approvals.len() == before,
@@ -108,8 +164,8 @@ pub fn report(approved: &Approved) -> String {
     format!(
         "approved {} ({} bytes, sha256 {}){}\n\
          in {}\n\
-         This image may now run inside the plug-in host with your rights. A changed \
-         file is not covered; approve it again.",
+         This image may now run inside the plug-in host with your rights once you switch \
+         it on in Preferences. A changed file is not covered; approve it again.",
         approved.name,
         approved.size,
         approved.sha256,
@@ -191,6 +247,38 @@ mod tests {
         let error = approve_file(&store, &junk).expect_err("the preflight must refuse it");
         assert!(matches!(error, ApproveError::Store(_)), "{error}");
         assert!(!store.exists(), "a refusal writes no store");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_warning_names_the_image_and_says_it_is_code_that_is_not_switched_on() {
+        let pending = PendingApproval {
+            name: "out_x.dll".to_string(),
+            bytes: vec![0; 1234],
+            sha256: "cd".repeat(32),
+        };
+        let text = pending.warning();
+        assert!(
+            text.contains("out_x.dll") && text.contains("1234 bytes"),
+            "{text}"
+        );
+        assert!(text.contains(&"cd".repeat(32)), "{text}");
+        assert!(text.contains("with your rights"), "{text}");
+        assert!(text.contains("does not switch it on"), "{text}");
+    }
+
+    #[test]
+    fn a_broken_store_is_not_overwritten_by_an_approval() {
+        let dir = temp_dir("broken");
+        let store = dir.join(rustamp_prefs::APPROVALS_FILE);
+        std::fs::write(&store, "not a store").unwrap();
+        let pending = PendingApproval {
+            name: "out_x.dll".to_string(),
+            bytes: vec![0; 16],
+            sha256: "cd".repeat(32),
+        };
+        assert!(pending.approve(&store).is_err());
+        assert_eq!(std::fs::read_to_string(&store).unwrap(), "not a store");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

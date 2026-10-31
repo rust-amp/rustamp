@@ -310,6 +310,7 @@ fn switching_the_dsp_off_and_on_again_installs_the_chain_again() {
 
     let mut config = Config::default();
     config.plugins.plugin_dir = Some(plugins.clone());
+    config.plugins.enabled = vec!["dsp_fake.dll".to_string()];
     let options = AppOptions {
         config,
         skin: skin::load(&SkinChoice::Builtin),
@@ -349,7 +350,10 @@ fn switching_the_dsp_off_and_on_again_installs_the_chain_again() {
     let index = dsp_rows
         .iter()
         .find(|(_, text)| text.contains("dsp_fake.dll"))
-        .and_then(|(id, _)| *id)
+        .and_then(|(id, _)| match id {
+            rustamp_platform::RowId::Plugin(id) => Some(*id),
+            _ => None,
+        })
         .expect("the DSP plug-in is listed");
 
     // Switching the DSP off forgets the bypass: the stage is out of the
@@ -398,6 +402,7 @@ fn switching_a_dsp_plugin_puts_it_in_the_audio_path_and_out_again() {
         .unwrap();
     let mut config = Config::default();
     config.plugins.plugin_dir = Some(plugins);
+    config.plugins.enabled = vec!["dsp_fake.dll".to_string()];
     let options = AppOptions {
         config,
         skin: skin::load(&SkinChoice::Builtin),

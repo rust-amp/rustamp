@@ -260,11 +260,10 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     // The playlist editor's runtime font size is the app's own setting (see
     // `config::PLAYLIST_FONT_SIZE_KEY`); it is restored after the app is
     // built, so it wins over the skin's size.
-    let playlist_font_size = loaded.playlist_font_size;
+    let app_ui = loaded.app_ui;
     // The playlist's title format is the app's own setting as well (see
     // `config::PLAYLIST_TITLE_FORMAT_KEY`). A format string that cannot be
     // used is reported, and the rows keep their plain text.
-    let playlist_title_format = loaded.playlist_title_format;
     let config = loaded.config;
 
     // ----- skin -----
@@ -292,8 +291,10 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     // enter a single-threaded apartment when it creates the window. See
     // `output::create_output`.
     let mut app = App::new(options)?;
-    app.set_playlist_font_size(playlist_font_size);
-    if let Some(setting) = playlist_title_format
+    app.set_playlist_font_size(app_ui.playlist_font_size);
+    app.set_vis_mode(app_ui.vis_mode);
+    app.set_skins_dir_from_load(app_ui.skins_dir);
+    if let Some(setting) = app_ui.playlist_title_format
         && let Err(reason) = app.set_playlist_title_format(setting.enabled, &setting.format)
     {
         app.note(format!("the playlist title format is not used: {reason}"));

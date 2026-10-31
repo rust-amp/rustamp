@@ -45,7 +45,8 @@
 use super::plugin_pages;
 use crate::prefs_dialog::{
     Item, LibraryRootRow, OUTPUT_MODE_CHOICES, PageLists, PluginListState, PluginRow, PrefsNode,
-    PrefsSettings, REPLAYGAIN_CHOICES, RootListState, SkinListState, TREE, page_items,
+    PrefsSettings, REPLAYGAIN_CHOICES, RootListState, RowId, SkinListState, TREE, VIS_MODE_CHOICES,
+    page_items, snap_distance_text,
 };
 
 // ---------------------------------------------------------------------------
@@ -141,8 +142,8 @@ fn random_settings(rng: &mut Rng) -> PrefsSettings {
             node: pages[rng.index(pages.len())],
             // Every third row is an information row: it has no id.
             id: match rng.index(3) {
-                0 => None,
-                _ => Some(rng.index(8)),
+                0 => RowId::Info,
+                _ => RowId::Plugin(rng.index(8)),
             },
             text: random_row_text(rng),
         })
@@ -166,6 +167,10 @@ fn random_settings(rng: &mut Rng) -> PrefsSettings {
         playlist_title_format_text: format!("%title% {}", rng.index(100)),
         replaygain: REPLAYGAIN_CHOICES[rng.index(REPLAYGAIN_CHOICES.len())],
         output_mode: OUTPUT_MODE_CHOICES[rng.index(OUTPUT_MODE_CHOICES.len())],
+        // A row that does not exist as well: the list must show a mode anyway.
+        vis_mode_row: rng.index(VIS_MODE_CHOICES.len() + 2),
+        snap_distance_text: snap_distance_text(rng.index(1_100) as u32),
+        skins_dir_text: format!(r"C:\skins {}", rng.index(10)),
         skins,
         skin_selected,
         plugins,
@@ -174,6 +179,7 @@ fn random_settings(rng: &mut Rng) -> PrefsSettings {
         // part of the lists the model owns, so it stays empty here.
         winamp_ini_report: None,
         file_types_report: None,
+        plugins_report: None,
     }
 }
 
@@ -365,7 +371,7 @@ fn a_list_of_one_page_is_never_the_list_of_another_page() {
             .iter()
             .map(|page| PluginRow {
                 node: *page,
-                id: Some(7),
+                id: RowId::Plugin(7),
                 text: same.clone(),
             })
             .collect();
@@ -588,7 +594,7 @@ fn nothing_panics() {
         for page in plugin_pages() {
             let state = PluginListState::of(&settings, page);
             assert!(
-                state.id(usize::MAX).is_none(),
+                state.id(usize::MAX) == RowId::Info,
                 "seed {seed}: a plug-in that does not exist has no id"
             );
         }
