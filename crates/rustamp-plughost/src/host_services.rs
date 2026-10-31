@@ -77,7 +77,13 @@ pub const LANGUAGE_SERVICE_ID: [u8; 16] = [
 /// the host has nothing to offer for them, but the plug-in calls what it gets
 /// unchecked from user actions (help, web links), so it gets a service that
 /// answers every message with "not understood" (S21 addendum 1, notes 6).
-pub const NULL_SERVICE_IDS: [[u8; 16]; 2] = [
+///
+/// The Winamp 5.66 input plug-ins look up two more
+/// (AEFBF8BE-E0AA-4318-8CC1-4353410B64DC and 000CF46E-4DF6-4A43-BBE7-40E7A3EA02ED),
+/// call the first in `play` without a null check, and take "not understood" for
+/// an answer (static reading of `in_wave.dll` and `in_flac.dll`, owner's approval
+/// of 2026-10-31; see `docs/spec-requests/2026-10-31-host-measurements.md`).
+pub const NULL_SERVICE_IDS: [[u8; 16]; 4] = [
     [
         0x71, 0x67, 0xB9, 0x23, 0xD7, 0x09, 0xD3, 0x46, 0x9A, 0xE2, 0x20, 0xDC, 0xEA, 0x6C, 0x86,
         0xEA,
@@ -85,6 +91,14 @@ pub const NULL_SERVICE_IDS: [[u8; 16]; 2] = [
     [
         0xB6, 0xA1, 0xB7, 0x57, 0x0E, 0x70, 0xFF, 0x44, 0x9C, 0xB0, 0x70, 0xB9, 0x2B, 0xAF, 0x39,
         0x59,
+    ],
+    [
+        0xBE, 0xF8, 0xFB, 0xAE, 0xAA, 0xE0, 0x18, 0x43, 0x8C, 0xC1, 0x43, 0x53, 0x41, 0x0B, 0x64,
+        0xDC,
+    ],
+    [
+        0x6E, 0xF4, 0x0C, 0x00, 0xF6, 0x4D, 0x43, 0x4A, 0xBB, 0xE7, 0x40, 0xE7, 0xA3, 0xEA, 0x02,
+        0xED,
     ],
 ];
 

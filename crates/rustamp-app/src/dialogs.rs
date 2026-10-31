@@ -860,6 +860,9 @@ impl App {
                         if kind == PluginKind::Input {
                             self.install_plugin_inputs();
                         }
+                        if kind == PluginKind::Output {
+                            self.install_plugin_output();
+                        }
                         if on {
                             // Switching a plug-in on asks the plugin host to
                             // load it: the choice has to reach the host, not

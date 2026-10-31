@@ -529,9 +529,9 @@ fn plugin_page(caption: &'static str, hint: &'static str) -> Vec<Item> {
 const PLUGIN_HINT: &str = "Only approved plug-ins can be switched on. \
     The plug-ins you switch on are loaded when the plugin host starts.";
 
-/// The output page: an output plug-in loads, and the player does not play
-/// through it yet, which the page says rather than looking as if it did.
-const OUTPUT_PLUGIN_HINT: &str = "Output plug-ins load and can be configured. The player itself     plays through its own output (Setup), not through them.";
+/// The output page: one output plays at a time.
+const OUTPUT_PLUGIN_HINT: &str = "The player plays through the first output plug-in that is \
+    switched on, and through its own output (Setup) when none is.";
 
 /// What the report line shows when no import has run yet.
 ///

@@ -869,16 +869,33 @@ fn measured_level_through(
 fn recorded(
     track: &std::path::Path,
     eq: &[rustamp_core::command::Command],
+    chain: rustamp_app::dsp::DspChain,
+    registry: rustamp_core::audio::DecoderRegistry,
+    seconds: f64,
+) -> (Vec<f32>, u32) {
+    recorded_through(
+        Box::new(CpalOutput::with_device_name(CABLE_MATCH)),
+        track,
+        eq,
+        chain,
+        registry,
+        seconds,
+    )
+}
+
+/// [`recorded`], played through `output`.
+fn recorded_through(
+    output: Box<dyn rustamp_core::audio::OutputDevice>,
+    track: &std::path::Path,
+    eq: &[rustamp_core::command::Command],
     mut chain: rustamp_app::dsp::DspChain,
     registry: rustamp_core::audio::DecoderRegistry,
     seconds: f64,
 ) -> (Vec<f32>, u32) {
     // A natural end closes a cpal output (see the test above), so every
     // measurement has its own engine.
-    let output = Box::new(CpalOutput::with_device_name(CABLE_MATCH));
     let mut engine = Engine::new(registry, output, EventBus::new(), EngineConfig::default())
         .expect("the playback endpoint of the cable");
-    assert!(is_cable_device(engine.output_name()));
     let granted = engine.device_spec();
     for command in eq {
         engine.apply(command).expect("applying the equalizer");
@@ -1150,13 +1167,11 @@ fn tiny_module() -> Vec<u8> {
     bytes
 }
 
-/// The Winamp 5.66 input plug-ins ask for Winamp 5 services the host does not
-/// have yet (`docs/spec-requests/2026-10-31-s21-input-services.md`), so this
-/// records what each one does and pins the part that must hold regardless: a
-/// plug-in that dies dies in its helper, and the player plays on.
+/// The Winamp 5.66 input plug-ins play through the player, at the level the
+/// built-in decoder gives the same file.
 #[test]
 #[ignore = "VM-only: runs real input plug-ins and needs the VB-Audio Virtual Cable"]
-fn a_failing_input_plugin_leaves_the_player_playing() {
+fn the_cable_carries_what_the_winamp5_input_plugins_decode() {
     use rustamp_app::dsp::DspChain;
     use rustamp_app::plugin_input::factory;
     use rustamp_core::audio::DecoderRegistry;
@@ -1183,44 +1198,38 @@ fn a_failing_input_plugin_leaves_the_player_playing() {
         registry
     };
 
-    // What each plug-in does with a file the built-in decoder plays.
     let wave = dir.path().join("tone.wav");
     write_tone(&wave, 1000.0, EQ_TONE_SECONDS);
     let flac = fixture();
     let vorbis = flac.with_extension("ogg");
-    for (dll, track, seconds) in [
-        ("in_wave.dll", wave.as_path(), EQ_TONE_SECONDS),
-        ("in_flac.dll", flac.as_path(), FIXTURE_SECONDS),
-        ("in_vorbis.dll", vorbis.as_path(), FIXTURE_SECONDS),
+    for (dll, track, hz, seconds) in [
+        ("in_wave.dll", wave.as_path(), 1000.0, EQ_TONE_SECONDS),
+        ("in_flac.dll", flac.as_path(), TONE_HZ, FIXTURE_SECONDS),
+        ("in_vorbis.dll", vorbis.as_path(), TONE_HZ, FIXTURE_SECONDS),
     ] {
         let dll = plugins.join("w566").join(dll);
-        let registry = only(&dll);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recorded(track, &[], DspChain::default(), registry, seconds)
-        }));
-        measurement(&match outcome {
-            Ok((mono, rate)) => {
-                // The first moments can hold what the cable still carried.
-                let settled = mono.get(rate as usize / 2..).unwrap_or(&[]);
-                let peak = settled.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
-                format!("{}: track ended, later peak {peak:.4}", dll.display())
-            }
-            Err(_) => format!("{}: the track failed", dll.display()),
-        });
+        let builtin = recorded(
+            track,
+            &[],
+            DspChain::default(),
+            rustamp_decoders::default_registry(),
+            seconds,
+        );
+        let through = recorded(track, &[], DspChain::default(), only(&dll), seconds);
+        let difference = decibels(
+            level_of(&through.0, through.1, hz),
+            level_of(&builtin.0, builtin.1, hz),
+        );
+        measurement(&format!(
+            "{}: {difference:+.2} dB against the built-in decoder",
+            dll.display()
+        ));
+        assert!(
+            difference.abs() <= 1.0,
+            "{} played at {difference:+.2} dB",
+            dll.display()
+        );
     }
-
-    // Whatever they did happened in their helpers: the player still plays.
-    let (mono, rate) = recorded(
-        &wave,
-        &[],
-        DspChain::default(),
-        rustamp_decoders::default_registry(),
-        EQ_TONE_SECONDS,
-    );
-    assert!(
-        level_of(&mono, rate, 1000.0) > 0.01,
-        "the player stopped playing"
-    );
 }
 
 /// `in_openmpt` plays a format the player has no decoder for.
@@ -1232,7 +1241,7 @@ fn the_cable_carries_a_module_through_in_openmpt() {
     use rustamp_core::audio::DecoderRegistry;
 
     rustamp_app::window::require_test_vm();
-    // SAFETY: as in `a_failing_input_plugin_leaves_the_player_playing`.
+    // SAFETY: as in `the_cable_carries_what_the_winamp5_input_plugins_decode`.
     unsafe {
         std::env::set_var(
             "RUSTAMP_HOST_TRACE",
@@ -1263,4 +1272,72 @@ fn the_cable_carries_a_module_through_in_openmpt() {
         .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
     measurement(&format!("in_openmpt: peak {peak:.4}"));
     assert!(peak > 0.01, "in_openmpt played silence (peak {peak})");
+}
+
+/// `dsp_sps` from the Winamp 5.66 installer runs in the audio path. Its default
+/// preset may leave a tone alone, so this pins that the tone survives it.
+#[test]
+#[ignore = "VM-only: runs a real DSP plug-in and needs the VB-Audio Virtual Cable"]
+fn the_cable_carries_a_tone_through_dsp_sps() {
+    use rustamp_app::dsp::classic_dsp_chain;
+
+    rustamp_app::window::require_test_vm();
+    let dir = tempfile::tempdir().unwrap();
+    let hz = 1000.0;
+    let track = dir.path().join("tone.wav");
+    write_tone(&track, hz, EQ_TONE_SECONDS);
+    let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
+    let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
+        .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
+    let dll = plugins.join("w566").join("dsp_sps.dll");
+    let plain = measured_level(&track, hz, &[]);
+    let chain = classic_dsp_chain(helper, &dll, &approved(dir.path(), &dll));
+    let through = decibels(measured_level_through(&track, hz, &[], chain), plain);
+    measurement(&format!("dsp_sps: {through:+.2} dB"));
+    assert!(through.abs() <= 24.0, "dsp_sps: {through:+.2} dB");
+}
+
+/// The output plug-ins play what the engine renders. `out_wave` plays to the
+/// default device, which in the VM is the cable; `out_disk` writes a file.
+#[test]
+#[ignore = "VM-only: runs real output plug-ins and needs the VB-Audio Virtual Cable"]
+fn the_output_plugins_play_what_the_engine_renders() {
+    use rustamp_app::dsp::DspChain;
+    use rustamp_app::plugin_output::PluginOutput;
+
+    rustamp_app::window::require_test_vm();
+    // SAFETY: as in `the_cable_carries_what_the_winamp5_input_plugins_decode`.
+    unsafe {
+        std::env::set_var(
+            "RUSTAMP_HOST_TRACE",
+            r"C:\rustamp\out\gui-session\output-trace.txt",
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let hz = 1000.0;
+    let track = dir.path().join("tone.wav");
+    write_tone(&track, hz, EQ_TONE_SECONDS);
+    let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
+    let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
+        .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
+
+    let dll = plugins.join("w566").join("out_wave.dll");
+    let plain = measured_level(&track, hz, &[]);
+    let (mono, rate) = recorded_through(
+        Box::new(PluginOutput::new(
+            helper.clone(),
+            &dll,
+            &approved(dir.path(), &dll),
+        )),
+        &track,
+        &[],
+        DspChain::default(),
+        rustamp_decoders::default_registry(),
+        EQ_TONE_SECONDS + 1.0,
+    );
+    let through = decibels(level_of(&mono, rate, hz), plain);
+    measurement(&format!(
+        "out_wave: {through:+.2} dB against the direct output"
+    ));
+    assert!(through.abs() <= 3.0, "out_wave: {through:+.2} dB");
 }

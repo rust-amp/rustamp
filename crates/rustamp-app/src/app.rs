@@ -559,6 +559,10 @@ pub struct App {
     /// The app remembers it so the preferences page does not claim that a
     /// DSP is running while the engine runs without it.
     bypassed_dsp: Option<crate::dsp::BypassedDsp>,
+    /// The output plug-in the engine plays through, by its device name.
+    plugin_output_name: Option<String>,
+    /// A change of output plug-in that waits for playback to stop.
+    plugin_output_pending: bool,
     /// Whether the installed chain is the switched-on DSP plug-in's.
     plugin_dsp_installed: bool,
     /// Whether the app's DSP chain still waits for its installation.
@@ -879,6 +883,8 @@ impl App {
             last_error: None,
             location_refusal: None,
             dsp_chain: crate::dsp::DspChain::default(),
+            plugin_output_name: None,
+            plugin_output_pending: false,
             plugin_dsp_installed: false,
             bypassed_dsp: None,
             dsp_install_pending: false,
@@ -1044,6 +1050,10 @@ impl App {
             self.config.audio.device.as_deref(),
             self.config.audio.output_mode,
         );
+        let mut output = output;
+        if let Some(device) = self.plugin_output_device() {
+            output.device = device;
+        }
         let queue = self.engine.queue().to_vec();
         let current_index = self.engine.current_index();
         let volume = self.engine.volume();
@@ -2861,6 +2871,7 @@ impl App {
         }
         self.install_plugin_dsp();
         self.install_plugin_inputs();
+        self.install_plugin_output();
     }
 
     /// Asks the host for the plug-ins the user has switched on, once per
@@ -3611,6 +3622,53 @@ impl App {
     pub(crate) fn disable_dsp(&mut self) {
         self.bypassed_dsp = None;
         self.dsp_install_pending = false;
+    }
+
+    /// The output plug-in the player plays through: the first one switched on
+    /// (only one output is active, S09 section 4), when the player plays at all.
+    #[cfg(windows)]
+    fn plugin_output_device(&self) -> Option<Box<dyn rustamp_core::audio::OutputDevice>> {
+        if self.output_choice != OutputChoice::Default {
+            return None;
+        }
+        let dll = self
+            .enabled_plugins()
+            .into_iter()
+            .find(|(_, kind)| *kind == PluginKind::Output)
+            .map(|(path, _)| path)?;
+        let helper = crate::supervise::find_plugin_host()?;
+        Some(Box::new(crate::plugin_output::PluginOutput::new(
+            helper,
+            &dll,
+            &self.plugin_approvals_path(),
+        )))
+    }
+
+    #[cfg(not(windows))]
+    fn plugin_output_device(&self) -> Option<Box<dyn rustamp_core::audio::OutputDevice>> {
+        None
+    }
+
+    /// Moves the audio to the output plug-in the user switched on, or back to
+    /// the player's own output. A running track keeps its output, so the change
+    /// waits for a stop.
+    pub(crate) fn install_plugin_output(&mut self) {
+        let wanted = self
+            .plugin_output_device()
+            .map(|device| device.name().to_owned());
+        if wanted == self.plugin_output_name {
+            return;
+        }
+        if self.engine.transport() != TransportState::Stopped {
+            self.note("the output changes when playback has stopped".to_owned());
+            self.plugin_output_pending = true;
+            return;
+        }
+        self.plugin_output_pending = false;
+        self.plugin_output_name = wanted;
+        if let Err(error) = self.recreate_engine() {
+            self.note(format!("the output could not be changed: {error}"));
+        }
     }
 
     /// Makes the input plug-ins the user switched on decoders of the player.

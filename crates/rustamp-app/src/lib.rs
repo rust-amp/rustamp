@@ -155,6 +155,8 @@ pub mod plugin_approval;
 #[cfg(windows)]
 pub mod plugin_input;
 pub mod plugin_inventory;
+#[cfg(windows)]
+pub mod plugin_output;
 pub mod region;
 pub mod routing;
 pub mod skin;

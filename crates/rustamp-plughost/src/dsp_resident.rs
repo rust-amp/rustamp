@@ -28,6 +28,17 @@ pub const MODE_ARG: &str = "--dsp-resident";
 /// The identifier of the one stage this resident serves.
 pub const STAGE_ID: &str = "classic-dsp";
 
+/// The identifier of the stage that hands the blocks to an output plug-in.
+pub const OUTPUT_STAGE_ID: &str = "classic-output";
+
+/// The stage that plays through the output plug-in `dll`.
+pub fn output_stage(dll: &std::path::Path, approvals: &std::path::Path) -> DspStageDesc {
+    DspStageDesc {
+        id: OUTPUT_STAGE_ID.to_owned(),
+        ..stage(dll, approvals)
+    }
+}
+
 /// The stage that names `dll`, approved by the store at `approvals`.
 pub fn stage(dll: &std::path::Path, approvals: &std::path::Path) -> DspStageDesc {
     DspStageDesc {
@@ -59,7 +70,7 @@ mod imp {
     use rustamp_mediahost::{MediaHostError, Result};
     use rustamp_proto::host::{DspStageDesc, PcmSpecWire};
 
-    use super::{STAGE_ID, parse_stage};
+    use super::{OUTPUT_STAGE_ID, STAGE_ID, parse_stage};
     use crate::approval::ApprovalStore;
     use crate::host_window::HostWindow;
     use crate::ipc::IpcSurface;
@@ -103,7 +114,7 @@ mod imp {
                     stages.len()
                 )));
             };
-            if stage.id != STAGE_ID {
+            if stage.id != STAGE_ID && stage.id != OUTPUT_STAGE_ID {
                 return Err(MediaHostError::OperationFailed(format!(
                     "unknown stage {:?}",
                     stage.id
@@ -126,6 +137,18 @@ mod imp {
                 .recv()
                 .map_err(|_| MediaHostError::OperationFailed("the host window is gone".to_owned()))?
                 .map_err(MediaHostError::OperationFailed)?;
+            if stage.id == OUTPUT_STAGE_ID {
+                // SAFETY: the main thread keeps the plug-in alive (`SharedPlugin`).
+                let module = unsafe { &*plugin.0 }.output_module_ptr().ok_or_else(|| {
+                    MediaHostError::OperationFailed("this is not an output plug-in".to_owned())
+                })?;
+                return Ok(Box::new(OutputChain {
+                    module,
+                    spec,
+                    opened: false,
+                    bytes: Vec::new(),
+                }));
+            }
             Ok(Box::new(ClassicChain {
                 plugin,
                 channels: usize::from(spec.channels),
@@ -184,6 +207,107 @@ mod imp {
 
         fn reset(&mut self) {
             self.queue.clear();
+        }
+    }
+
+    /// Hands every block to an output plug-in and passes it on unchanged: the
+    /// player waits for the block's return, which is the plug-in's `can_write`
+    /// reaching back (see `rustamp_app::plugin_output`).
+    struct OutputChain {
+        module: *mut rustamp_plugin_abi::output::OutModule,
+        spec: PcmSpecWire,
+        opened: bool,
+        bytes: Vec<u8>,
+    }
+    // SAFETY: the module lives in the plug-in's static data, and only this
+    // thread drives its audio calls, as the decode thread of an input plug-in
+    // does (S09 section 3.7).
+    unsafe impl Send for OutputChain {}
+
+    /// The most the plug-in takes at once (S09 section 4.1).
+    const OUTPUT_WRITE_BYTES: usize = 8192;
+
+    impl OutputChain {
+        fn open(&mut self) -> Result<()> {
+            // SAFETY: a live module; the callbacks run on this thread.
+            let module = unsafe { &*self.module };
+            let open = module.open.ok_or_else(|| {
+                MediaHostError::OperationFailed("the output plug-in cannot open".to_owned())
+            })?;
+            let rate = self.spec.sample_rate_hz as i32;
+            let channels = i32::from(self.spec.channels);
+            // SAFETY: the plug-in's own callback; -1 asks for its default
+            // buffer and prebuffer (S09 section 4.2).
+            let latency = unsafe { open(rate, channels, 16, -1, -1) };
+            if latency < 0 {
+                return Err(MediaHostError::OperationFailed(format!(
+                    "the output plug-in refused {rate} Hz, {channels} channels"
+                )));
+            }
+            if let Some(set_volume) = module.set_volume {
+                // SAFETY: as above. The engine applies the player's volume.
+                unsafe { set_volume(255) };
+            }
+            self.opened = true;
+            Ok(())
+        }
+    }
+
+    impl ResidentChain for OutputChain {
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+
+        fn process(&mut self, buf: &mut [f32]) -> Result<()> {
+            if !self.opened {
+                self.open()?;
+            }
+            // SAFETY: a live module; the callbacks run on this thread.
+            let module = unsafe { &*self.module };
+            let (Some(can_write), Some(write)) = (module.can_write, module.write) else {
+                return Err(MediaHostError::OperationFailed(
+                    "the output plug-in cannot write".to_owned(),
+                ));
+            };
+            self.bytes.clear();
+            for sample in buf.iter() {
+                let value = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                self.bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let frame = usize::from(self.spec.channels) * 2;
+            for chunk in self.bytes.chunks_mut(OUTPUT_WRITE_BYTES / frame * frame) {
+                // SAFETY: the plug-in's own callback.
+                while (unsafe { can_write() } as usize) < chunk.len() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                // SAFETY: `chunk` is readable for its length for this call.
+                unsafe { write(chunk.as_mut_ptr().cast(), chunk.len() as i32) };
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            // SAFETY: a live module; the callbacks run on this thread.
+            let module = unsafe { &*self.module };
+            if self.opened
+                && let Some(flush) = module.flush
+            {
+                // SAFETY: the plug-in's own callback; the clock starts over.
+                unsafe { flush(0) };
+            }
+        }
+    }
+
+    impl Drop for OutputChain {
+        fn drop(&mut self) {
+            if self.opened {
+                // SAFETY: a live module: the main thread drops the plug-in only
+                // after the serve thread has ended.
+                if let Some(close) = unsafe { (*self.module).close } {
+                    // SAFETY: the plug-in's own callback.
+                    unsafe { close() };
+                }
+            }
         }
     }
 
