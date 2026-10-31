@@ -273,11 +273,14 @@ mod imp {
         get_written_ms: Some(out_written_ms),
     }));
 
+    /// What a plug-in says of the file it plays: its title and length.
+    type FileInfo = (Option<String>, Option<u64>);
+
     /// What the serve thread asks of the plug-in's UI thread.
     enum Request {
         Play {
             path: PathBuf,
-            reply: Sender<std::result::Result<(Option<String>, Option<u64>), String>>,
+            reply: Sender<std::result::Result<FileInfo, String>>,
         },
         Seek {
             to_ms: u64,
