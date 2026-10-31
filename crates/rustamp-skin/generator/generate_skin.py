@@ -777,6 +777,27 @@ def generate_rust_pledit():
 
         draw_string(c, "playlist", 45, base_y + 7, fg=fg, bg=bg)
 
+        # The window buttons in the right corner: shade at window x 254, close
+        # at window x 264, both at y 3 (the corner starts at window x 250).
+        for offset in (4, 14):
+            c.fill_rect(153 + offset, base_y + 3, 9, 9, (45, 48, 55))
+            c.bevel_raised(153 + offset, base_y + 3, 9, 9, light=(80, 85, 95), shadow=(12, 13, 15))
+        c.hline(153 + 6, base_y + 8, 5, fg)
+        for d in range(5):
+            c.set(153 + 16 + d, base_y + 5 + d, (255, 107, 43))
+            c.set(153 + 20 - d, base_y + 5 + d, (255, 107, 43))
+
+    # The pressed window buttons: close, collapse, expand.
+    for bx, by, symbol in [(52, 42, "close"), (62, 42, "shade"), (150, 42, "shade")]:
+        c.fill_rect(bx, by, 9, 9, (24, 25, 29))
+        c.bevel_sunken(bx, by, 9, 9, shadow=(8, 9, 10), light=(70, 74, 82))
+        if symbol == "close":
+            for d in range(5):
+                c.set(bx + 2 + d, by + 2 + d, (255, 107, 43))
+                c.set(bx + 6 - d, by + 2 + d, (255, 107, 43))
+        else:
+            c.hline(bx + 2, by + 5, 5, (255, 200, 160))
+
     # Left rail at (0, 42, 12, 29)
     c.fill_rect(0, 42, 12, 29, (28, 30, 35))
     c.bevel_raised(0, 42, 12, 29, light=(55, 58, 65), shadow=(10, 11, 13))

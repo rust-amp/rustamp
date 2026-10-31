@@ -106,6 +106,18 @@ pub fn value_for_thumb_y(y: i32) -> u8 {
     (((y - THUMB_TOP_Y) * 63 + 25) / (THUMB_BOTTOM_Y - THUMB_TOP_Y)).clamp(0, 63) as u8
 }
 
+/// How far a band or preamp key moves its slider, in saved units. **Own choice:**
+/// S07 §9 leaves the step open and names one saved unit as its first candidate.
+pub const KEY_STEP: u8 = 2;
+
+/// The band the letter key `letter` lowers (S03 §3: `Q` the first, `P` the last).
+fn lowered_band(letter: u8) -> Option<u8> {
+    b"QWERTYUIOP"
+        .iter()
+        .position(|key| *key == letter)
+        .map(|band| band as u8)
+}
+
 /// A saved value `0..=63` as a gain in dB, clamped to ±12.
 ///
 /// Anchors from spec S09 (audited) and S01 §3:
@@ -655,14 +667,45 @@ impl EqualizerWindow {
         commands
     }
 
+    /// Whether a key press belongs to this window's own table (S03 §3) and not
+    /// to the keys it shares with the main window.
+    pub fn owns_key(key: Key, modifiers: Modifiers) -> bool {
+        if modifiers != Modifiers::NONE {
+            return false;
+        }
+        match key {
+            Key::Letter(letter) => {
+                let letter = letter.to_ascii_uppercase();
+                letter == b'N' || letter == b'A' || letter == b'S' || lowered_band(letter).is_some()
+            }
+            Key::Digit(_) | Key::Grave | Key::Tab => true,
+            _ => false,
+        }
+    }
+
     /// A key press. `N` toggles EQ enabled, `A` toggles autoloading, `S` opens
     /// the presets menu (S03 §3 via S07 §1; plain keys only — modified forms
-    /// are unmeasured). Band/preamp steps are open (S07 §9) and stay unwired.
+    /// are unmeasured). `1`…`0` raise a band and `Q`…`P` lower it, `` ` `` raises
+    /// the preamp and `Tab` lowers it (S03 §3). The step is [`KEY_STEP`].
     pub fn key_down(&mut self, key: Key, modifiers: Modifiers) -> Vec<Command> {
         if modifiers != Modifiers::NONE {
             return Vec::new();
         }
+        if let Key::Letter(letter) = key
+            && let Some(band) = lowered_band(letter.to_ascii_uppercase())
+        {
+            return self.step_slider(EqSlider::Band(band), false);
+        }
         match key {
+            // S03 §3: `1` is the first band and `0` the last.
+            Key::Digit(digit) => {
+                let band = if digit == 0 { 9 } else { digit - 1 };
+                self.step_slider(EqSlider::Band(band), true)
+            }
+            // The direction of these two is unresolved (S03 §3): they follow
+            // the bands' keys, raising with the key beside `1`.
+            Key::Grave => self.step_slider(EqSlider::Preamp, true),
+            Key::Tab => self.step_slider(EqSlider::Preamp, false),
             Key::Letter(b'N' | b'n') => {
                 let enabled = !self.state.enabled;
                 self.state.enabled = enabled;
@@ -678,6 +721,34 @@ impl EqualizerWindow {
                 Vec::new()
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Moves `slider` by [`KEY_STEP`] and commits the value. A smaller saved
+    /// value is a higher gain.
+    fn step_slider(&mut self, slider: EqSlider, raise: bool) -> Vec<Command> {
+        let step = |value: u8| {
+            if raise {
+                value.saturating_sub(KEY_STEP)
+            } else {
+                value.saturating_add(KEY_STEP).min(MAX_VALUE)
+            }
+        };
+        match slider {
+            EqSlider::Preamp => {
+                self.state.preamp = step(self.state.preamp);
+                vec![Command::SetPreamp(saved_to_gain_db(self.state.preamp))]
+            }
+            EqSlider::Band(band) => match self.state.bands.get_mut(band as usize) {
+                Some(value) => {
+                    *value = step(*value);
+                    vec![Command::SetBand {
+                        band,
+                        gain_db: saved_to_gain_db(*value),
+                    }]
+                }
+                None => Vec::new(),
+            },
         }
     }
 
@@ -900,6 +971,58 @@ mod tests {
         let commands = window.mouse_move(22, 75);
         assert_eq!(commands.len(), 1);
         let _ = window.mouse_up(22, 75);
+    }
+
+    #[test]
+    fn the_band_keys_move_the_band_they_name() {
+        let mut eq = EqualizerWindow::new();
+        let flat = eq.state().bands[0];
+        let raised = eq.key_down(Key::Digit(1), Modifiers::NONE);
+        assert!(
+            matches!(raised.as_slice(), [Command::SetBand { band: 0, gain_db }] if *gain_db > 0.0)
+        );
+        assert_eq!(eq.state().bands[0], flat - KEY_STEP);
+        eq.key_down(Key::Letter(b'Q'), Modifiers::NONE);
+        assert_eq!(eq.state().bands[0], flat, "the matching keys cancel out");
+
+        let lowered = eq.key_down(Key::Letter(b'P'), Modifiers::NONE);
+        assert!(
+            matches!(lowered.as_slice(), [Command::SetBand { band: 9, gain_db }] if *gain_db < 0.0)
+        );
+        let raised = eq.key_down(Key::Digit(0), Modifiers::NONE);
+        assert!(matches!(
+            raised.as_slice(),
+            [Command::SetBand { band: 9, .. }]
+        ));
+    }
+
+    #[test]
+    fn the_preamp_keys_move_the_preamp_and_stop_at_the_ends() {
+        let mut eq = EqualizerWindow::new();
+        let flat = eq.state().preamp;
+        eq.key_down(Key::Grave, Modifiers::NONE);
+        assert_eq!(eq.state().preamp, flat - KEY_STEP);
+        for _ in 0..64 {
+            eq.key_down(Key::Tab, Modifiers::NONE);
+        }
+        assert_eq!(eq.state().preamp, MAX_VALUE);
+    }
+
+    #[test]
+    fn the_window_owns_its_table_and_nothing_else() {
+        assert!(EqualizerWindow::owns_key(
+            Key::Letter(b'Q'),
+            Modifiers::NONE
+        ));
+        assert!(EqualizerWindow::owns_key(Key::Digit(5), Modifiers::NONE));
+        assert!(!EqualizerWindow::owns_key(
+            Key::Letter(b'X'),
+            Modifiers::NONE
+        ));
+        assert!(!EqualizerWindow::owns_key(
+            Key::Letter(b'Q'),
+            Modifiers::CTRL
+        ));
     }
 
     #[test]

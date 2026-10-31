@@ -265,6 +265,10 @@ fn status_text(note: &str) -> Option<String> {
     note.contains("not implemented").then(|| note.to_string())
 }
 
+/// How far the equalizer window's pan keys move the balance (own choice: S07 §9
+/// leaves it open).
+const PAN_STEP: i8 = 4;
+
 fn event_windows(event: &Event) -> WindowDirty {
     match event {
         // The highlighted row and the rows' labels.
@@ -481,6 +485,8 @@ pub struct App {
     pub(crate) pending_playlist_misc_menu: bool,
     /// A context menu of the main window waiting for the presenter's tick.
     pub(crate) pending_context_menu: Option<crate::menu::ContextMenu>,
+    /// The "Load an EQ preset" file dialog waits for the presenter's tick.
+    pending_eq_file: bool,
     /// A right click on a playlist entry waiting for the presenter: the
     /// request for the playlist's **context menu** (S03 §5).
     ///
@@ -849,6 +855,7 @@ impl App {
             pending_eq_menu: false,
             pending_playlist_misc_menu: false,
             pending_context_menu: None,
+            pending_eq_file: false,
             pending_playlist_context: None,
             request_save_playlist: false,
             request_html_playlist: false,
@@ -3087,9 +3094,54 @@ impl App {
     /// `N`/`A` toggles, `S` opens the presets menu; band/preamp steps are
     /// open per S07 §9 and stay unwired).
     pub fn eq_key_down(&mut self, key: Key, modifiers: Modifiers) -> Result<Vec<Command>> {
-        let commands = self.eq.key_down(key, modifiers);
-        self.forward_eq(&commands)?;
-        Ok(commands)
+        // The rows S03 §3 gives this window a meaning of its own for.
+        let own = match (key, modifiers) {
+            // Pan: the step is open (S07 §9), this is the volume keys' step.
+            (Key::Left, Modifiers::NONE) => Some(self.pan_command(false)),
+            (Key::Right, Modifiers::NONE) => Some(self.pan_command(true)),
+            // "Close the equalizer", where the main window's row quits.
+            (Key::F(4), Modifiers::CTRL) => Some(Command::ToggleWindow(WindowId::Equalizer)),
+            _ => None,
+        };
+        if let Some(command) = own {
+            self.submit(command.clone())?;
+            return Ok(vec![command]);
+        }
+        if key == Key::Letter(b'S') && modifiers == Modifiers::CTRL {
+            self.pending_eq_file = true;
+            return Ok(Vec::new());
+        }
+        if rustamp_ui::EqualizerWindow::owns_key(key, modifiers) {
+            let commands = self.eq.key_down(key, modifiers);
+            self.forward_eq(&commands)?;
+            return Ok(commands);
+        }
+        // Everything else is what the key does anywhere in the player (S03 §3
+        // lists the shared rows with this window's).
+        Ok(match self.key_down(key, modifiers)? {
+            Some(ShortcutOutcome::Commands(commands)) => commands,
+            _ => Vec::new(),
+        })
+    }
+
+    /// `SetBalance` one step to the left or the right, clamped to the range.
+    fn pan_command(&self, right: bool) -> Command {
+        let current = self.engine.state().balance;
+        Command::SetBalance(if right {
+            current.saturating_add(PAN_STEP)
+        } else {
+            current.saturating_sub(PAN_STEP).max(-127)
+        })
+    }
+
+    /// A right-button press on the equalizer window: its context menu (S03 §5).
+    pub fn eq_right_down(&mut self) {
+        self.pending_context_menu = Some(crate::menu::ContextMenu::Equalizer);
+    }
+
+    /// Takes the request for the "Load an EQ preset" file dialog (S03 §3).
+    pub fn take_eq_file_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_eq_file)
     }
 
     /// Sends equalizer-produced commands into the channel and processes them.
@@ -6649,6 +6701,45 @@ mod tests {
             assert_eq!(app.take_context_menu(), Some(menu), "{widget:?}");
             assert!(app.native_context_menu(menu).choices.len() >= 2);
         }
+    }
+
+    #[test]
+    fn the_equalizer_window_passes_the_shared_keys_on() {
+        let (mut app, _dir) = app_with_file(None);
+        let commands = app.eq_key_down(Key::Letter(b'V'), Modifiers::NONE).unwrap();
+        assert_eq!(commands, vec![Command::Stop]);
+
+        app.submit(Command::ToggleWindow(WindowId::Equalizer))
+            .unwrap();
+        assert!(app.eq_open());
+        app.eq_key_down(Key::F(4), Modifiers::CTRL).unwrap();
+        assert!(!app.eq_open(), "Ctrl+F4 closes the equalizer");
+        assert!(!app.quit(), "and not the player");
+    }
+
+    #[test]
+    fn the_equalizer_keys_reach_the_engine_and_add_up() {
+        let (mut app, _dir) = app_with_file(None);
+        for _ in 0..4 {
+            app.eq_key_down(Key::Digit(1), Modifiers::NONE).unwrap();
+        }
+        let gain = app.engine().state().eq.bands[0];
+        assert!(gain > 2.0, "four steps up are well above flat: {gain}");
+        app.eq_key_down(Key::Right, Modifiers::NONE).unwrap();
+        assert_eq!(app.engine().state().balance, PAN_STEP);
+    }
+
+    #[test]
+    fn a_right_click_on_the_equalizer_offers_its_two_switches() {
+        let (mut app, _dir) = app_with_file(None);
+        app.eq_right_down();
+        let kind = app.take_context_menu().expect("the menu is asked for");
+        let menu = app.native_context_menu(kind);
+        assert_eq!(menu.choices.len(), 2);
+        let auto = app.engine().state().eq.auto;
+        app.activate_menu_choice(rustamp_ui::menu::MenuChoice::EqAutoload)
+            .unwrap();
+        assert_ne!(app.engine().state().eq.auto, auto);
     }
 
     #[test]

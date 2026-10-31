@@ -42,6 +42,8 @@ pub enum ContextMenu {
     Time,
     /// The seek bar's menu.
     Seek,
+    /// The equalizer window's menu.
+    Equalizer,
 }
 
 /// What activating one menu leaf did.
@@ -142,6 +144,10 @@ impl App {
             ContextMenu::Title => rustamp_ui::menu::native_title_menu(self.marquee_autoscroll()),
             ContextMenu::Time => rustamp_ui::menu::native_time_menu(self.state().time_remaining),
             ContextMenu::Seek => rustamp_ui::menu::native_seek_menu(),
+            ContextMenu::Equalizer => {
+                let eq = self.eq_state();
+                rustamp_ui::menu::native_equalizer_menu(eq.enabled, eq.auto)
+            }
         }
     }
 
@@ -210,6 +216,14 @@ impl App {
             rustamp_ui::menu::MenuChoice::NoAction { .. } => Ok(None),
             rustamp_ui::menu::MenuChoice::PlaylistKey { action, .. } => {
                 self.dispatch_playlist_action(action)?;
+                Ok(None)
+            }
+            rustamp_ui::menu::MenuChoice::EqEnabled => {
+                self.eq_key_down(rustamp_ui::Key::Letter(b'N'), rustamp_ui::Modifiers::NONE)?;
+                Ok(None)
+            }
+            rustamp_ui::menu::MenuChoice::EqAutoload => {
+                self.eq_key_down(rustamp_ui::Key::Letter(b'A'), rustamp_ui::Modifiers::NONE)?;
                 Ok(None)
             }
             rustamp_ui::menu::MenuChoice::ToggleAutoscroll => {

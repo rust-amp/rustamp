@@ -1294,6 +1294,9 @@ impl Windowed {
             Err(error) => eprintln!("rustamp: equalizer shortcut dispatch failed: {error}"),
         }
         self.sync_window_state();
+        // A shared key can change what the other windows show.
+        self.request_redraw();
+        self.request_playlist_redraw();
         self.request_redraw_eq();
     }
 
@@ -1534,6 +1537,24 @@ impl Windowed {
             eprintln!("rustamp: a native popup menu is only implemented on Windows");
         }
     }
+    /// Shows the "Load an EQ preset" dialog (S03 §3 `Ctrl+S`), from the tick.
+    fn drain_eq_file(&mut self) {
+        if !self.app.take_eq_file_request() {
+            return;
+        }
+        #[cfg(windows)]
+        match rustamp_platform::pick_eqf_file(self.raw_eq_window(), "Load EQ preset") {
+            Ok(None) => {}
+            Ok(Some(path)) => {
+                if let Err(error) = self.app.load_eq_file(&path) {
+                    eprintln!("rustamp: EQ preset not loaded: {error}");
+                }
+                self.request_redraw_eq();
+            }
+            Err(error) => eprintln!("rustamp: no file dialog: {error}"),
+        }
+    }
+
     /// Shows the load-playlist dialog the app asked for (S06 §4), from the tick
     /// because it is modal, and loads what the user chose.
     fn drain_playlist_pick(&mut self) {
@@ -1559,11 +1580,18 @@ impl Windowed {
     fn drain_context_menus(&mut self) {
         if let Some(kind) = self.app.take_context_menu() {
             let menu = self.app.native_context_menu(kind);
-            let origin = self
-                .window
-                .as_ref()
-                .and_then(|window| window.outer_position().ok());
-            self.show_context_menu(self.raw_main_window(), menu, origin, self.cursor);
+            let (owner, window, cursor) = if kind == crate::menu::ContextMenu::Equalizer {
+                (
+                    self.raw_eq_window(),
+                    self.eq_window.as_ref(),
+                    self.eq_cursor,
+                )
+            } else {
+                (self.raw_main_window(), self.window.as_ref(), self.cursor)
+            };
+            let origin = window.and_then(|window| window.outer_position().ok());
+            self.show_context_menu(owner, menu, origin, cursor);
+            self.request_redraw_eq();
         }
         if self.app.take_pending_playlist_context().is_some() {
             let menu = rustamp_ui::menu::native_playlist_entry_menu();
@@ -3500,6 +3528,7 @@ impl ApplicationHandler for Windowed {
         #[cfg(windows)]
         self.drain_tray();
         self.drain_context_menus();
+        self.drain_eq_file();
         self.drain_playlist_pick();
         // A `--no-audio` run has no device pulling on its own thread, so the
         // virtual clock is driven here, once per frame, exactly as
@@ -3667,6 +3696,11 @@ impl Windowed {
             WindowEvent::KeyboardInput {
                 is_synthetic: true, ..
             } => {}
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => self.app.eq_right_down(),
             WindowEvent::KeyboardInput { event, .. } => self.eq_key_event(&event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {

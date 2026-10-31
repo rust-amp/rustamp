@@ -20,7 +20,7 @@ pub const TITLE_BAR_HEIGHT: u32 = 20;
 
 /// How much of the right corner sprite is drawn: the part with the close
 /// button, without the shade button, which these windows do not have.
-const RIGHT_END_WIDTH: u32 = 14;
+const RIGHT_END_WIDTH: u32 = 12;
 
 /// The close button: the 9 x 9 cell the editor's is, from the right edge.
 const CLOSE_FROM_RIGHT: i32 = 11;
@@ -126,14 +126,6 @@ pub fn draw_title_bar(canvas: &mut Image, skin: &Skin, title: &str, focused: boo
         }
     }
     let colour = if focused { style.current } else { style.normal };
-    // The cross: not every skin draws a button into this cell, and a window
-    // without a native caption needs a visible way to close it.
-    let ink = [colour[0], colour[1], colour[2], 255];
-    let left = width as i32 - CLOSE_FROM_RIGHT;
-    for step in 1..CLOSE_SIZE - 1 {
-        canvas.set_pixel(left + step, CLOSE_TOP + step, ink);
-        canvas.set_pixel(left + CLOSE_SIZE - 1 - step, CLOSE_TOP + step, ink);
-    }
     if let Some(text) = playlist_font::render(font, title, text_width.max(1), 14, colour) {
         canvas.blit_alpha(&text, text.bounds(), plate_x + PLATE_PAD as i32, 3);
     }

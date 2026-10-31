@@ -802,6 +802,10 @@ pub enum MenuChoice {
     },
     /// The title menu's "Autoscroll songname" row (S02 §3, id 40189).
     ToggleAutoscroll,
+    /// The equalizer menu's "enabled" row (S03 §3, id 40244).
+    EqEnabled,
+    /// The equalizer menu's "autoloading" row (S03 §3, id 40245).
+    EqAutoload,
     /// The Options popup's Time elapsed / Time remaining rows: sets the
     /// reading (`true` = remaining) instead of toggling it, so choosing the
     /// row that is already on keeps it on (S04 §4.2: the check moves between
@@ -818,6 +822,8 @@ impl MenuChoice {
             | MenuChoice::PlaylistKey { label, .. }
             | MenuChoice::UnavailableCommand { label, .. } => label,
             MenuChoice::ToggleAutoscroll => "Autoscroll songname",
+            MenuChoice::EqEnabled => "Equalizer enabled",
+            MenuChoice::EqAutoload => "Autoloading",
             MenuChoice::Exit => "Exit",
             MenuChoice::SetTimeRemaining(false) => "Time elapsed",
             MenuChoice::SetTimeRemaining(true) => "Time remaining",
@@ -1240,6 +1246,20 @@ pub fn native_time_menu(remaining: bool) -> NativeMainMenu {
             remaining,
             MenuChoice::SetTimeRemaining(true),
         )),
+    ])
+}
+
+/// The equalizer window's context menu: S03 §5 names its two rows ("enabled,
+/// autoloading"); their wording is ours.
+pub fn native_equalizer_menu(enabled: bool, auto: bool) -> NativeMainMenu {
+    context_menu(&[
+        Some((
+            "Equalizer enabled",
+            Some("N"),
+            enabled,
+            MenuChoice::EqEnabled,
+        )),
+        Some(("Autoloading", Some("A"), auto, MenuChoice::EqAutoload)),
     ])
 }
 
