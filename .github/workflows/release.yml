@@ -1,7 +1,7 @@
 name: Release
 
-# Builds the portable release zip with the same command the maintainers use
-# locally (`cargo xtask package --release --zip`). Triggered by a version tag
+# Builds the portable release zip and the installer with the same command the
+# maintainers use locally (`cargo xtask package --release --zip --installer`). Triggered by a version tag
 # or by hand; a tag also creates a DRAFT GitHub release so nothing is published
 # without a human pressing the button.
 
@@ -35,18 +35,28 @@ jobs:
       - name: Test (headless)
         run: cargo test --workspace --all-features
 
-      - name: Package
-        run: cargo xtask package --release --zip
+      # Portable NSIS for the installer, pinned by hash; nothing is installed.
+      - name: Fetch NSIS
+        shell: bash
+        run: |
+          curl -fsSL -o nsis.zip "https://sourceforge.net/projects/nsis/files/NSIS%203/3.13/nsis-3.13.zip/download"
+          echo "ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8  nsis.zip" | sha256sum -c -
+          unzip -q nsis.zip -d "$RUNNER_TEMP"
+          echo "MAKENSIS=$(cygpath -w "$RUNNER_TEMP/nsis-3.13/makensis.exe")" >> "$GITHUB_ENV"
 
-      - name: Collect archive
+      - name: Package
+        run: cargo xtask package --release --zip --installer
+
+      - name: Collect archive and installer
         id: collect
         shell: bash
         run: |
           mkdir -p dist
-          find target/package -maxdepth 1 -name 'rustamp-*.zip*' \
+          find target/package -maxdepth 1 \( -name 'rustamp-*.zip*' -o -name 'rustamp-*-setup.exe*' \) \
             -exec cp {} dist/ \;
           ls -l dist
           test -n "$(ls dist/*.zip 2>/dev/null)"
+          test -n "$(ls dist/*-setup.exe 2>/dev/null)"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

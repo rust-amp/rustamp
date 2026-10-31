@@ -25,6 +25,11 @@
 //! - Host: rustamp-plughost32.exe, LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY.md
 //!   (permissive closure inventory only, no GPL/copyleft), manifest.json.
 //! - Portable ZIP archive beside the output directory with a .sha256 checksum file.
+//! - With `--installer`: an NSIS installer (`xtask/installer/rustamp.nsi`) beside the ZIP,
+//!   also with a .sha256 checksum file.
+//!
+//! With `SIGNTOOL_CERT_FILE` or `SIGNTOOL_CERT_THUMBPRINT` set, every shipped EXE and the
+//! installer are signed and verified with signtool; otherwise the run says it is unsigned.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,6 +52,8 @@ const DECHOST_TARGET: &str = "x86_64-pc-windows-msvc";
 const DSPHOST_CRATE: &str = "rustamp-dsphost";
 const DSPHOST_BIN: &str = "rustamp-dsphost-stages";
 const DSPHOST_TARGET: &str = "x86_64-pc-windows-msvc";
+
+const NSIS_SCRIPT: &str = "xtask/installer/rustamp.nsi";
 
 pub use rustamp_ipc::PROTOCOL_VERSION;
 pub const CONFIG_VERSION: u32 = 1;
@@ -208,6 +215,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
+    let signing = Signing::from_env(|name| std::env::var(name).ok())?;
+    if let Some(file) = &parsed.sign_file {
+        // The hook NSIS calls for the uninstaller it generates.
+        let signing = signing.ok_or("--sign-file needs a configured certificate")?;
+        return signing.sign_and_verify(file);
+    }
+
     let root = rustamp_testkit::workspace_root();
     let build_player = !parsed.host_only;
     let build_host = !parsed.player_only;
@@ -236,6 +250,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .parent()
         .unwrap_or(&out_dir)
         .join(format!("{zip_name}.sha256"));
+    let installer_path = out_dir
+        .parent()
+        .unwrap_or(&out_dir)
+        .join(format!("{archive_stem}-setup.exe"));
 
     if parsed.dry_run || parsed.check {
         println!("xtask package: dry run (no files written)");
@@ -246,6 +264,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         println!("  output dir:     {}", out_dir.display());
         println!("  portable zip:   {}", zip_path.display());
         println!("  checksum file:  {}", checksum_path.display());
+        if parsed.installer {
+            println!("  installer:      {}", installer_path.display());
+        }
+        match &signing {
+            Some(_) => println!("  signing:        signtool (certificate configured)"),
+            None => println!("  signing:        none (no certificate configured)"),
+        }
         if parsed.player_only {
             println!("  scope: player only");
         } else if parsed.host_only {
@@ -330,11 +355,27 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 audit_zip_archive(&zip_path, &meta)?;
                 println!("  existing zip archive: OK (format and checksum match)");
             }
+            if parsed.installer {
+                audit_installer(&installer_path)?;
+                println!("  existing installer: OK (PE file and checksum match)");
+            }
         }
         return Ok(());
     }
 
     let profile = if parsed.release { "release" } else { "debug" };
+
+    // Before the long builds: a missing tool should not cost a release build.
+    let makensis = if parsed.installer {
+        Some(find_makensis()?)
+    } else {
+        None
+    };
+    if signing.is_none() {
+        println!(
+            "xtask package: UNSIGNED build: no SIGNTOOL_CERT_FILE or SIGNTOOL_CERT_THUMBPRINT set"
+        );
+    }
 
     // Never silently retain old CRT DLLs, wrong-side licences or a stale host.
     // Refuse rather than delete somebody else's output.
@@ -529,6 +570,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // The staged copies are what ships: inspect them too, not only the build outputs.
     inspect_imports(&staged_binaries(&out_dir, build_player, build_host))?;
     audit_package_layout(&out_dir, profile, build_player, build_host, &meta)?;
+    if let Some(signing) = &signing {
+        for (file, _) in staged_binaries(&out_dir, build_player, build_host) {
+            signing.sign_and_verify(&file)?;
+        }
+    }
 
     println!(
         "xtask package: manifest -> {}",
@@ -545,6 +591,27 @@ pub fn run(args: &[String]) -> Result<(), String> {
         println!("xtask package: checksum -> {}", checksum_path.display());
     }
 
+    if let Some(makensis) = &makensis {
+        println!("xtask package: installer -> {}", installer_path.display());
+        run_status(&mut makensis_command(
+            makensis,
+            &root,
+            &out_dir,
+            &installer_path,
+            &meta,
+            signing.is_some(),
+        )?)?;
+        if let Some(signing) = &signing {
+            signing.sign_and_verify(&installer_path)?;
+        }
+        write_checksum_file(&installer_path, &sha256_path(&installer_path))?;
+        audit_installer(&installer_path)?;
+        println!(
+            "xtask package: checksum -> {}",
+            sha256_path(&installer_path).display()
+        );
+    }
+
     println!("xtask package: done ({})", manifest_items.join(" + "));
     Ok(())
 }
@@ -557,6 +624,8 @@ struct PackageArgsParsed {
     host_only: bool,
     check: bool,
     zip: bool,
+    installer: bool,
+    sign_file: Option<PathBuf>,
     out: Option<PathBuf>,
     help: bool,
 }
@@ -569,6 +638,8 @@ fn parse_args(args: &[String]) -> Result<PackageArgs, String> {
         host_only: false,
         check: false,
         zip: true,
+        installer: false,
+        sign_file: None,
         out: None,
         help: false,
     };
@@ -585,6 +656,12 @@ fn parse_args(args: &[String]) -> Result<PackageArgs, String> {
             "--host-only" | "--host_only" | "--hostonly" => parsed.host_only = true,
             "--zip" => parsed.zip = true,
             "--no-zip" | "--nozip" => parsed.zip = false,
+            "--installer" => parsed.installer = true,
+            "--sign-file" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| format!("{a} needs a value"))?;
+                parsed.sign_file = Some(PathBuf::from(v));
+            }
             "--out" | "--output" | "--dir" | "--directory" | "--destination" | "--dest" => {
                 i += 1;
                 let v = args.get(i).ok_or_else(|| format!("{a} needs a value"))?;
@@ -606,6 +683,9 @@ fn parse_args(args: &[String]) -> Result<PackageArgs, String> {
 
     if parsed.player_only && parsed.host_only {
         return Err("--player-only and --host-only are mutually exclusive".to_string());
+    }
+    if parsed.installer && (parsed.player_only || parsed.host_only || !parsed.release) {
+        return Err("--installer needs the full release package".to_string());
     }
     Ok(parsed)
 }
@@ -629,8 +709,13 @@ fn print_help() {
          --host-only             package only the permissive plugin host\n  \
          --zip                   produce portable ZIP and checksum (default: true)\n  \
          --no-zip                skip producing portable ZIP archive\n  \
+         --installer             also build the NSIS installer and its checksum\n                          \
+         (needs makensis on PATH or in MAKENSIS)\n  \
          --out <dir>             empty output directory (default: target/package/<release-id>)\n  \
-         -h, --help              show this help"
+         -h, --help              show this help\n\n\
+         signing: set SIGNTOOL_CERT_FILE (with SIGNTOOL_CERT_PASSWORD) or\n\
+         SIGNTOOL_CERT_THUMBPRINT; optional SIGNTOOL_TIMESTAMP_URL and SIGNTOOL_PATH.\n\
+         Without a certificate the build says it is unsigned and goes on."
     );
 }
 
@@ -692,6 +777,148 @@ fn artifact_command(
         cmd.arg("--release");
     }
     cmd
+}
+
+/// The certificate settings for signtool, read from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Signing {
+    signtool: String,
+    /// The arguments that name the certificate.
+    certificate: Vec<String>,
+    timestamp_url: Option<String>,
+}
+
+impl Signing {
+    /// `None` means no certificate is configured. A password without a
+    /// certificate file is a mistake, not an unsigned build.
+    fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
+        let password = get("SIGNTOOL_CERT_PASSWORD");
+        let certificate = match (get("SIGNTOOL_CERT_FILE"), get("SIGNTOOL_CERT_THUMBPRINT")) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "set SIGNTOOL_CERT_FILE or SIGNTOOL_CERT_THUMBPRINT, not both".to_string(),
+                );
+            }
+            (Some(file), None) => {
+                let mut args = vec!["/f".to_string(), file];
+                if let Some(password) = password {
+                    args.extend(["/p".to_string(), password]);
+                }
+                args
+            }
+            (None, Some(thumbprint)) if password.is_none() => {
+                vec!["/sha1".to_string(), thumbprint]
+            }
+            (None, None) if password.is_none() => return Ok(None),
+            (None, _) => {
+                return Err("SIGNTOOL_CERT_PASSWORD needs SIGNTOOL_CERT_FILE".to_string());
+            }
+        };
+        Ok(Some(Self {
+            signtool: get("SIGNTOOL_PATH").unwrap_or_else(|| "signtool".to_string()),
+            certificate,
+            timestamp_url: get("SIGNTOOL_TIMESTAMP_URL"),
+        }))
+    }
+
+    fn sign_args(&self, file: &Path) -> Vec<String> {
+        let mut args = vec!["sign".to_string(), "/fd".to_string(), "SHA256".to_string()];
+        args.extend(self.certificate.iter().cloned());
+        if let Some(url) = &self.timestamp_url {
+            args.extend([
+                "/tr".to_string(),
+                url.clone(),
+                "/td".to_string(),
+                "SHA256".to_string(),
+            ]);
+        }
+        args.push(file.display().to_string());
+        args
+    }
+
+    fn sign_and_verify(&self, file: &Path) -> Result<(), String> {
+        // Not `run_status`: its error text would print a password argument.
+        let sign = no_window_command(&self.signtool)
+            .args(self.sign_args(file))
+            .status()
+            .map_err(|e| format!("could not start {}: {e}", self.signtool))?;
+        if !sign.success() {
+            return Err(format!("signtool could not sign {}", file.display()));
+        }
+        let verify = no_window_command(&self.signtool)
+            .args(["verify", "/pa"])
+            .arg(file)
+            .status()
+            .map_err(|e| format!("could not start {}: {e}", self.signtool))?;
+        if !verify.success() {
+            return Err(format!("signtool could not verify {}", file.display()));
+        }
+        println!("xtask package: signed and verified {}", file.display());
+        Ok(())
+    }
+}
+
+/// `MAKENSIS`, else `makensis` on PATH; proved by asking it for its version.
+fn find_makensis() -> Result<PathBuf, String> {
+    let tool = std::env::var_os("MAKENSIS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("makensis"));
+    let found = no_window_command(&tool)
+        .arg("/VERSION")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if found {
+        Ok(tool)
+    } else {
+        Err(format!(
+            "--installer needs NSIS: {} did not run. Put makensis on PATH or set MAKENSIS \
+             (portable zip: https://sourceforge.net/projects/nsis/files/NSIS%203/)",
+            tool.display()
+        ))
+    }
+}
+
+fn makensis_command(
+    makensis: &Path,
+    root: &Path,
+    out_dir: &Path,
+    installer: &Path,
+    meta: &ReleaseMetadata,
+    signed: bool,
+) -> Result<Command, String> {
+    let mut cmd = no_window_command(makensis);
+    cmd.args(["/V2", "/WX"]);
+    cmd.arg(format!("/DVERSION={}", meta.product_version));
+    cmd.arg(format!("/DPLAYER_DIR={}", out_dir.join("player").display()));
+    cmd.arg(format!("/DHOST_DIR={}", out_dir.join("host").display()));
+    cmd.arg(format!("/DOUTFILE={}", installer.display()));
+    if signed {
+        let xtask = std::env::current_exe().map_err(|e| format!("own path: {e}"))?;
+        cmd.arg(format!("/DSIGN_UNINSTALLER={}", xtask.display()));
+    }
+    cmd.arg(root.join(NSIS_SCRIPT));
+    Ok(cmd)
+}
+
+/// Offline: the file is a PE image and its checksum file matches. Nothing is run.
+fn audit_installer(installer: &Path) -> Result<(), String> {
+    let bytes =
+        fs::read(installer).map_err(|e| format!("read installer {}: {e}", installer.display()))?;
+    if !bytes.starts_with(b"MZ") {
+        return Err(format!("{} is not a PE file", installer.display()));
+    }
+    let checksum_path = sha256_path(installer);
+    let content = fs::read_to_string(&checksum_path)
+        .map_err(|e| format!("read checksum {}: {e}", checksum_path.display()))?;
+    if content.split_whitespace().next() != Some(Sha256::digest_hex(&bytes).as_str()) {
+        return Err(format!("checksum mismatch for {}", installer.display()));
+    }
+    Ok(())
+}
+
+fn sha256_path(file: &Path) -> PathBuf {
+    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    file.with_file_name(format!("{name}.sha256"))
 }
 
 fn copy_file(src: &Path, dst: &Path) -> Result<(), String> {
@@ -1073,8 +1300,12 @@ Use Windows 10/11 x64 (WOW64 is needed for the 32-bit helper). Package policy:
 packaged EXEs use the static MSVC CRT, so no VC++ redistributable installation or
 app-local CRT DLLs are needed. Windows system DLLs are still required. {imports}
 
-Portable distribution: unzip the archive to any directory. No installer,
-no registry keys, and no system services are used. To uninstall, delete the folder.
+Zip: unzip the archive to any directory; no registry keys or services are used.
+To remove it, delete the folder.
+Installer (`*-setup.exe`): installs for the current user, without administrator
+rights, into %LOCALAPPDATA%\Programs\Rustamp with a Start menu shortcut. Close
+Rustamp before upgrading. Remove it through Windows' installed apps. Both keep
+your settings in %APPDATA%\Rustamp, and files you added to the folder stay.
 
 Open PowerShell in the folder containing rustamp.exe, then run:
 
@@ -1105,8 +1336,27 @@ No configuration file is needed initially. It reads %APPDATA%\Rustamp\rustamp.to
 (or the RUSTAMP_CONFIG override); settings and volume are saved on clean exit.
 The helper binaries (rustamp-plughost32.exe, rustamp-dechost-symphonia.exe,
 rustamp-dsphost-stages.exe) are internal background processes, not user entry points.
-This folder is a portable release (not an installer or a signed release).
-No automatic updates: download updates manually from GitHub releases.
+No automatic updates: download new versions from
+https://gitlab.com/rustamp/rustamp/-/releases
+
+## MilkDrop
+
+Rustamp ships no plug-ins and no MilkDrop data, because their licence is not
+clearly free. To use MilkDrop 2, take these from your own Winamp 5 installation:
+
+1. Beside rustamp.exe, create a folder named `Plugins` and copy `vis_milk2.dll`
+   and the whole `Milkdrop2` folder from Winamp's `Plugins` into it. It must hold
+   `Milkdrop2\data\*.fx` (eight files: MilkDrop does not start properly without
+   them) and `Milkdrop2\presets\*.milk` (without presets it only draws its
+   default). Keep `Milkdrop2\textures` too.
+2. MilkDrop also needs a `d3dx9` library: install Microsoft's DirectX End-User
+   Runtime, or put `d3dx9_31.dll` beside `vis_milk2.dll`. Copy Winamp's
+   `Microsoft.VC90.CRT` folder beside rustamp.exe as well.
+3. Approve that exact file: `.\rustamp.exe --approve-plugin "<path to vis_milk2.dll>"`,
+   switch it on under Preferences, Plug-ins, Visualization, restart Rustamp, then
+   start it with Ctrl+Shift+K.
+
+When the data or the presets are missing, the player says so and names the folder.
 "#,
         release_id = meta.release_id,
         imports = if meta.imports_verified {
@@ -1132,9 +1382,9 @@ fn readme(profile: &str, player: bool, host: bool, meta: &ReleaseMetadata) -> St
 
 Rustamp is a clean-room audio player for 64-bit Windows.
 
-This package is a **portable ZIP release published on GitHub**. It requires no
-installer, creates no registry keys, installs no background services, and makes
-no automatic network connections.
+This package is a **portable ZIP release**. It requires no installer, creates no
+registry keys, installs no background services, and makes no automatic network
+connections. A separate installer (`*-setup.exe`) is published next to it.
 
 ## 1. Quick Start
 
@@ -1170,8 +1420,8 @@ Get-FileHash -Path .\{release_id}.zip -Algorithm SHA256
 ## 3. Important User Disclosures (G5 & G6)
 
 ### Unsigned Binaries (G5)
-- Binaries in this release are **not code-signed** with a commercial Authenticode certificate.
-- Windows Defender SmartScreen will show:
+- Binaries are code-signed only when the build had a certificate; a build without one says so and the files show no Digital Signatures tab.
+- For an unsigned file, Windows Defender SmartScreen will show:
   *"Windows protected your PC — Microsoft Defender SmartScreen prevented an unrecognized app from starting."*
 - To proceed: Click **"More info"**, then select **"Run anyway"**.
 - Web browsers may flag the download as unrecognized. Verify the SHA-256 hash to ensure integrity.
@@ -1392,7 +1642,13 @@ fn player_third_party_notices(root: &Path, meta: &ReleaseMetadata) -> Result<Str
          3. This notice may not be removed or altered from any source distribution.\n\n\
          ---\n\n\
          ## 6. Complete Cargo Dependency Inventory\n\n\
-         {inventory}\n",
+         {inventory}\n\n\
+         ---\n\n\
+         ## 7. Installer\n\n\
+         The Windows installer (`*-setup.exe`) and its `uninstall.exe` are built with NSIS\n\
+         (https://nsis.sourceforge.io), Copyright (C) 1999-2026 Contributors, under the\n\
+         zlib/libpng license; its LZMA module is under the Common Public License 1.0 with\n\
+         the NSIS linking exception.\n",
         release_id = meta.release_id,
         commit = meta.commit,
         version = meta.product_version,
@@ -1631,9 +1887,15 @@ fn check_runtime_contract(root: &Path) -> Result<(), String> {
         }
     }
     let guide = quickstart("release", true, true, &dummy_meta);
-    if !["--skin", "--no-audio", "--null", "static MSVC CRT"]
-        .iter()
-        .all(|required| guide.contains(required))
+    if ![
+        "--skin",
+        "--no-audio",
+        "--null",
+        "static MSVC CRT",
+        "Milkdrop2",
+    ]
+    .iter()
+    .all(|required| guide.contains(required))
     {
         return Err("quickstart runtime/CLI contract failed".to_string());
     }
@@ -2785,6 +3047,124 @@ mod tests {
         assert!(parse_args(&["--player-only".to_string(), "--host-only".to_string()]).is_err());
         let no_zip = parse_args(&["--no-zip".to_string()]).expect("no-zip parses");
         assert!(!no_zip.zip);
+    }
+
+    #[test]
+    fn installer_option_needs_the_full_release_package() {
+        let args = |list: &[&str]| -> Vec<String> { list.iter().map(|a| a.to_string()).collect() };
+        assert!(
+            parse_args(&args(&["--release", "--installer"]))
+                .unwrap()
+                .installer
+        );
+        for partial in ["--player-only", "--host-only", "--debug"] {
+            assert!(parse_args(&args(&["--installer", partial])).is_err());
+        }
+    }
+
+    /// The script lists its files by hand: every file `xtask package` stages
+    /// beside the player must be installed and removed again.
+    #[test]
+    fn nsis_script_installs_and_removes_the_packaged_files() {
+        let script = include_str!("../installer/rustamp.nsi");
+        for file in [
+            "rustamp.exe",
+            "rustamp-dechost-symphonia.exe",
+            "rustamp-dsphost-stages.exe",
+            "rustamp-plughost32.exe",
+            "LICENSE",
+            "PLUGIN-EXCEPTION.md",
+            "THIRD_PARTY.md",
+            "QUICKSTART.md",
+            "manifest.json",
+        ] {
+            assert!(
+                script.contains(&format!("File \"${{PLAYER_DIR}}\\{file}\"")),
+                "{file} is not installed"
+            );
+            assert!(
+                script.contains(&format!("Delete \"$INSTDIR\\{file}\"")),
+                "{file} is not removed"
+            );
+        }
+        for file in ["LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY.md"] {
+            assert!(script.contains(&format!("File \"${{HOST_DIR}}\\{file}\"")));
+            assert!(script.contains(&format!("Delete \"$INSTDIR\\licenses\\plughost\\{file}\"")));
+        }
+    }
+
+    #[test]
+    fn signing_follows_the_environment() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        assert_eq!(Signing::from_env(env(&[])).unwrap(), None);
+        assert!(Signing::from_env(env(&[("SIGNTOOL_CERT_PASSWORD", "x")])).is_err());
+        assert!(
+            Signing::from_env(env(&[
+                ("SIGNTOOL_CERT_FILE", "a.pfx"),
+                ("SIGNTOOL_CERT_THUMBPRINT", "ab"),
+            ]))
+            .is_err()
+        );
+
+        let file = Signing::from_env(env(&[
+            ("SIGNTOOL_CERT_FILE", "a.pfx"),
+            ("SIGNTOOL_CERT_PASSWORD", "x"),
+            ("SIGNTOOL_TIMESTAMP_URL", "http://ts"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(file.signtool, "signtool");
+        assert_eq!(
+            file.sign_args(Path::new("r.exe")),
+            [
+                "sign",
+                "/fd",
+                "SHA256",
+                "/f",
+                "a.pfx",
+                "/p",
+                "x",
+                "/tr",
+                "http://ts",
+                "/td",
+                "SHA256",
+                "r.exe"
+            ]
+        );
+
+        let store = Signing::from_env(env(&[("SIGNTOOL_CERT_THUMBPRINT", "ab")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.sign_args(Path::new("r.exe")),
+            ["sign", "/fd", "SHA256", "/sha1", "ab", "r.exe"]
+        );
+    }
+
+    #[test]
+    fn installer_audit_checks_the_image_and_the_checksum() {
+        let dir =
+            std::env::temp_dir().join(format!("rustamp-installer-audit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let installer = dir.join("setup.exe");
+        fs::write(&installer, b"MZ fixture, not executable").unwrap();
+        assert!(audit_installer(&installer).is_err(), "no checksum file");
+        write_checksum_file(&installer, &sha256_path(&installer)).unwrap();
+        assert!(audit_installer(&installer).is_ok());
+        fs::write(&installer, b"MZ changed").unwrap();
+        assert!(audit_installer(&installer).is_err(), "stale checksum");
+        fs::write(&installer, b"not a PE").unwrap();
+        write_checksum_file(&installer, &sha256_path(&installer)).unwrap();
+        assert!(audit_installer(&installer).is_err(), "not a PE file");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

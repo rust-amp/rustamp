@@ -88,6 +88,10 @@ in the local cargo registry.
   - **Section 6(d) / Section 6(c) Source offer**: Rustamp provides a complete, machine-readable copy of the corresponding source code for `libprojectM 4.1.8` at release SHA-256 `f72135e8b8e5fd807f908537255b41ac7ba4830309265e830cb756535487239e`, including all build scripts, CMake configurations, and the clean-room wrapper source in `crates/rustamp-vis`.
   - **Reverse engineering & debugging**: Modification and reverse engineering of the library for debugging such modifications are explicitly permitted under the terms of LGPL-2.1.
 
+## Build tools
+
+- **NSIS 3.13** ([nsis.sourceforge.io](https://nsis.sourceforge.io), portable `nsis-3.13.zip`, SHA-256 `ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8`): builds the Windows installer from `xtask/installer/rustamp.nsi`. Not in the repository; the installer and uninstaller carry its stub. zlib/libpng license; the LZMA module is under the Common Public License 1.0 with the NSIS linking exception.
+
 
 ## Cargo dependencies: purposes and consumers
 
