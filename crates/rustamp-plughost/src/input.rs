@@ -448,7 +448,7 @@ mod path_tests {
 
     #[test]
     fn a_wide_module_gets_a_wide_path_and_a_classic_one_ansi() {
-        let path = Path::new(r"C:.wav");
+        let path = Path::new(r"C:\a.wav");
         assert_eq!(
             path_argument(0xFF00_0101_u32 as c_int, path),
             b"C\0:\0\\\0a\0.\0w\0a\0v\0\0\0".as_slice()
