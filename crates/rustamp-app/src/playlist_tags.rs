@@ -81,6 +81,22 @@ impl TagReader {
         Self::with_reader(|path| rustamp_meta::read_tags(path).ok())
     }
 
+    /// A reader that also opens the file with `registry` when its tags name no
+    /// length, so the row can show one. Opening decodes no audio to speak of,
+    /// and it happens on the worker, for the rows the playlist shows.
+    pub fn with_length(registry: rustamp_core::audio::DecoderRegistry) -> Self {
+        Self::with_reader(move |path| {
+            let mut tags = rustamp_meta::read_tags(path).ok().unwrap_or_default();
+            if tags.duration_ms.is_none()
+                && let Ok(decoder) =
+                    registry.open(rustamp_core::audio::MediaSource::Path(path.to_path_buf()))
+            {
+                tags.duration_ms = decoder.duration().map(|length| length.as_millis() as u64);
+            }
+            Some(tags)
+        })
+    }
+
     /// A reader that asks `read` for the tags of a file.
     pub fn with_reader(read: impl Fn(&Path) -> Option<TrackMetadata> + Send + 'static) -> Self {
         let (jobs, requests) = mpsc::channel();

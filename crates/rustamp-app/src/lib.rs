@@ -408,6 +408,7 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
                 // run reached the windowed path without a device.
                 println!("rustamp: output null (windowed; silent, no audio device)");
             }
+            app.restore_session_playlist();
             apply_startup(&mut app, plays, added)?;
             window::run(app)
         }

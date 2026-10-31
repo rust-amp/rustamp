@@ -755,10 +755,8 @@ impl App {
                 }
             }
             if rows.len() == before {
-                rows.push(info(format!(
-                    "No plug-ins of this type in {}",
-                    scan.dir.display()
-                )));
+                rows.push(info("No plug-ins of this type.".to_string()));
+                rows.push(info(format!("Folder: {}", scan.dir.display())));
             }
         }
         rows

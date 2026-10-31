@@ -50,6 +50,9 @@ const MARQUEE_STEP_MS: u64 = 200;
 /// The marquee advances this many pixels per step (S02 §3).
 const MARQUEE_STEP_PX: i32 = 5;
 
+/// How long a message stays in the marquee (own choice).
+const STATUS_MS: u64 = 6_000;
+
 /// The pause-blink period in milliseconds (S02 §4: about 2.60 s).
 const BLINK_PERIOD_MS: u64 = 2600;
 
@@ -105,6 +108,8 @@ pub struct MainWindow {
     drag: Option<Widget>,
     drag_last_x: Option<i32>,
     autoscroll: bool,
+    /// A message the marquee shows until the given time instead of the title.
+    status: Option<(String, u64)>,
     scroll_base_ms: u64,
     manual_offset: i32,
     blink_base_ms: Option<u64>,
@@ -147,6 +152,7 @@ impl MainWindow {
             drag: None,
             drag_last_x: None,
             autoscroll: true,
+            status: None,
             scroll_base_ms: 0,
             manual_offset: 0,
             blink_base_ms: None,
@@ -258,6 +264,17 @@ impl MainWindow {
         }
     }
 
+    /// Shows `text` in the marquee for [`STATUS_MS`] instead of the title.
+    ///
+    /// This is how a message reaches the user who has no console: the classic
+    /// window has no status line, and the skinned window hides the system's
+    /// title bar. **Own choice** (S02 §3 lists what the marquee shows and has
+    /// no such state); a held control's hint still wins.
+    pub fn flash_status(&mut self, text: impl Into<String>, now_ms: u64) {
+        self.status = Some((text.into(), now_ms + STATUS_MS));
+        self.scroll_base_ms = now_ms;
+    }
+
     /// Sets the stream status the title carries (`[Connecting]`,
     /// `[Buffer: 22%]`, ...), or clears it when no transfer has one. The
     /// marquee follows on the next tick.
@@ -269,6 +286,9 @@ impl MainWindow {
     /// program name. The status sits between the position and the name:
     /// `1. [Buffer: 22%] stream.mp3`.
     fn shown_title(&self) -> String {
+        if let Some((status, _)) = &self.status {
+            return status.clone();
+        }
         let Some(title) = self.track_title.as_deref() else {
             return PROGRAM_NAME.to_string();
         };
@@ -739,19 +759,25 @@ impl MainWindow {
     }
 
     fn update_marquee(&mut self, now_ms: u64) {
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|(_, until)| now_ms >= *until)
+        {
+            self.status = None;
+        }
         let hint = self.hint();
         let is_hint = hint.is_some();
         let text = hint.unwrap_or_else(|| self.shown_title());
-        let cells = text.chars().count();
-        let fits = cells as u32 * MARQUEE_CELL_WIDTH <= self.layout.marquee.width;
+        let fits = crate::render::marquee_text_width(&text) <= self.layout.marquee.width;
         if is_hint || fits {
             self.state.title = text;
             self.state.marquee_offset = 0;
             return;
         }
-        let period_px = (cells + MARQUEE_SEPARATOR_CELLS) as i32 * MARQUEE_CELL_WIDTH as i32;
+        let period_px = marquee_period_px(&text);
         let offset = if self.autoscroll {
-            self.auto_offset_for(cells, now_ms)
+            self.auto_offset_for(period_px, now_ms)
         } else {
             self.manual_offset % period_px
         };
@@ -759,9 +785,9 @@ impl MainWindow {
         self.state.marquee_offset = offset;
     }
 
-    /// The autoscroll offset in pixels for a title of `cells` characters.
-    fn auto_offset_for(&self, cells: usize, now_ms: u64) -> i32 {
-        let period_px = (cells + MARQUEE_SEPARATOR_CELLS) as i32 * MARQUEE_CELL_WIDTH as i32;
+    /// The autoscroll offset in pixels for a title that repeats every
+    /// `period_px` pixels.
+    fn auto_offset_for(&self, period_px: i32, now_ms: u64) -> i32 {
         let elapsed = now_ms.saturating_sub(self.scroll_base_ms);
         let steps = (elapsed / MARQUEE_STEP_MS) as i32;
         (steps * MARQUEE_STEP_PX) % period_px
@@ -769,11 +795,20 @@ impl MainWindow {
 
     fn auto_offset(&self, now_ms: u64) -> i32 {
         let text = self.logical_title();
-        let cells = text.chars().count();
-        if cells as u32 * MARQUEE_CELL_WIDTH <= self.layout.marquee.width {
+        if crate::render::marquee_text_width(&text) <= self.layout.marquee.width {
             return 0;
         }
-        self.auto_offset_for(cells, now_ms)
+        self.auto_offset_for(marquee_period_px(&text), now_ms)
+    }
+}
+
+/// How many pixels the marquee scrolls until `text` starts over: the text and
+/// its separator, measured in the font they are drawn in.
+fn marquee_period_px(text: &str) -> i32 {
+    if crate::render::bitmap_can_draw(text) {
+        (text.chars().count() + MARQUEE_SEPARATOR_CELLS) as i32 * MARQUEE_CELL_WIDTH as i32
+    } else {
+        crate::render::marquee_text_width(&format!("{text}{MARQUEE_SEPARATOR}")) as i32
     }
 }
 
@@ -1453,6 +1488,17 @@ mod tests {
     }
 
     // ----- a track that cannot be seeked (S19) -----
+
+    #[test]
+    fn a_message_takes_over_the_marquee_for_a_while() {
+        let mut machine = MainWindow::new();
+        load_track(&mut machine, "T1", 200_000, 0);
+        machine.flash_status("cannot play x", 0);
+        machine.refresh(1);
+        assert_eq!(machine.state().title, "cannot play x");
+        machine.refresh(STATUS_MS);
+        assert_ne!(machine.state().title, "cannot play x", "the title is back");
+    }
 
     #[test]
     fn the_position_thumb_follows_the_track_unless_it_is_held() {

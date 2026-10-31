@@ -246,6 +246,25 @@ struct LibraryFrame {
 /// which already covers every event that reaches them. The playlist and the
 /// dialog have no such comparison (their models are far larger than a frame),
 /// so their frames are marked here, where the event is applied.
+/// What the marquee says for a note, if the note is for the user.
+///
+/// An entry that would not open is named by its file: the marquee is narrow,
+/// and the full path is in the note.
+fn status_text(note: &str) -> Option<String> {
+    if let Some(error) = note.strip_prefix("error: ") {
+        let Some(rest) = error.strip_prefix(rustamp_audio::decode::CANNOT_PLAY) else {
+            return Some(error.to_string());
+        };
+        let (path, reason) = rest.split_once(": ").unwrap_or((rest, ""));
+        let name = std::path::Path::new(path).file_name().map_or_else(
+            || path.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        return Some(format!("cannot play {name}: {reason}"));
+    }
+    note.contains("not implemented").then(|| note.to_string())
+}
+
 fn event_windows(event: &Event) -> WindowDirty {
     match event {
         // The highlighted row and the rows' labels.
@@ -460,6 +479,8 @@ pub struct App {
     pub(crate) pending_eq_menu: bool,
     /// The playlist MISC popup awaits the presenter's modal-menu drain.
     pub(crate) pending_playlist_misc_menu: bool,
+    /// A context menu of the main window waiting for the presenter's tick.
+    pub(crate) pending_context_menu: Option<crate::menu::ContextMenu>,
     /// A right click on a playlist entry waiting for the presenter: the
     /// request for the playlist's **context menu** (S03 §5).
     ///
@@ -688,6 +709,7 @@ impl App {
         // changes it: the app keeps the number, because its report about a
         // fade names the ring the fade is realised in (see `crate::fade_note`).
         let ring_frames = cfg.ring_frames;
+        let tag_registry = registry.clone();
         let mut engine = Engine::new(registry.clone(), output.device, bus.clone(), cfg)?;
         // `Engine::new` initialises its gain from the config but reports
         // `volume: 255, balance: 0` in `PlayerState` (an engine-side
@@ -826,6 +848,7 @@ impl App {
             pending_clutter_menu: None,
             pending_eq_menu: false,
             pending_playlist_misc_menu: false,
+            pending_context_menu: None,
             pending_playlist_context: None,
             request_save_playlist: false,
             request_html_playlist: false,
@@ -845,7 +868,7 @@ impl App {
             pending_winamp_ini_import: false,
             winamp_ini_import: None,
             title_format: None,
-            playlist_tags: crate::playlist_tags::TagReader::new(),
+            playlist_tags: crate::playlist_tags::TagReader::with_length(tag_registry),
             stream: crate::stream_status::StreamStatus::default(),
         };
         app.shuffle = app.config.playlist.shuffle;
@@ -2331,7 +2354,9 @@ impl App {
             // memory already, so the row can show them without reading the
             // file (see `crate::playlist_tags`).
             if let (Some(id), Some(metadata)) = (id, metadata) {
-                self.playlist_tags.remember(id, metadata.as_ref().clone());
+                let mut known = metadata.as_ref().clone();
+                known.duration_ms = known.duration_ms.or(*duration_ms);
+                self.playlist_tags.remember(id, known);
             }
             let normalised = Event::TrackChanged {
                 id,
@@ -2953,22 +2978,23 @@ impl App {
     /// A right-button press at window-relative `(x, y)` (S03 §5).
     ///
     /// The EQ and PL buttons toggle their window ("menu" grade); the long
-    /// title, the time display and the seek bar have their own context menus,
-    /// whose contents are S04's and unmeasured, so they are noted and open
-    /// nothing; anywhere else opens the main-menu popup ("Right-click the main
-    /// window: main-menu popup", verified).
+    /// title, the time display and the seek bar have their own context menus
+    /// (see [`crate::menu::ContextMenu`]); anywhere else opens the main-menu
+    /// popup ("Right-click the main window: main-menu popup", verified).
     pub fn mouse_right_down(&mut self, x: i32, y: i32) -> Result<Vec<Command>> {
         let command = match rustamp_ui::hit_test(&self.layout, x, y) {
             Some(rustamp_ui::Widget::EqToggle) => Command::ToggleWindow(WindowId::Equalizer),
             Some(rustamp_ui::Widget::PlaylistToggle) => Command::ToggleWindow(WindowId::Playlist),
-            Some(
-                widget @ (rustamp_ui::Widget::Marquee
-                | rustamp_ui::Widget::TimeDisplay
-                | rustamp_ui::Widget::PositionSlider),
-            ) => {
-                self.note(format!(
-                    "right-click on {widget:?}: its context menu's contents are unmeasured (S04)"
-                ));
+            Some(rustamp_ui::Widget::Marquee) => {
+                self.pending_context_menu = Some(crate::menu::ContextMenu::Title);
+                return Ok(Vec::new());
+            }
+            Some(rustamp_ui::Widget::TimeDisplay) => {
+                self.pending_context_menu = Some(crate::menu::ContextMenu::Time);
+                return Ok(Vec::new());
+            }
+            Some(rustamp_ui::Widget::PositionSlider) => {
+                self.pending_context_menu = Some(crate::menu::ContextMenu::Seek);
                 return Ok(Vec::new());
             }
             _ => Command::OpenMainMenu,
@@ -2995,6 +3021,9 @@ impl App {
             self.pump()?;
             return Ok(None);
         };
+        if action == ShortcutAction::ToggleMinibrowser {
+            self.note("Minibrowser is not implemented yet".to_string());
+        }
         Ok(Some(self.dispatch_shared_shortcut(action)?))
     }
 
@@ -3334,9 +3363,41 @@ impl App {
     }
 
     pub(crate) fn note(&mut self, message: String) {
+        // A failure and a command that does nothing are what the user needs
+        // to see; the rest of the notes are diagnostics.
+        if let Some(status) = status_text(&message) {
+            let now = self.now_ms();
+            self.ui.flash_status(status, now);
+        }
         if self.notes.len() < MAX_NOTES {
             self.notes.push(message);
         }
+    }
+
+    /// Whether the marquee scrolls by itself (S02 §3).
+    pub(crate) fn marquee_autoscroll(&self) -> bool {
+        self.ui.autoscroll()
+    }
+
+    /// Flips the marquee's autoscroll (S02 §3, id 40189).
+    pub(crate) fn toggle_marquee_autoscroll(&mut self) {
+        let on = !self.ui.autoscroll();
+        let now = self.now_ms();
+        self.ui.set_autoscroll(on, now);
+    }
+
+    /// Mouse-wheel notches over the main window: the volume, like the Up and
+    /// Down keys (own choice: S03 §5 has no wheel row).
+    pub fn main_wheel(&mut self, notches: i32) -> Result<()> {
+        let action = if notches > 0 {
+            ShortcutAction::VolumeUp
+        } else {
+            ShortcutAction::VolumeDown
+        };
+        for _ in 0..notches.unsigned_abs() {
+            self.dispatch_shared_shortcut(action)?;
+        }
+        Ok(())
     }
 
     /// Synchronizes the equalizer window machine's state from the authoritative
@@ -3917,6 +3978,38 @@ impl App {
 
         self.last_playlist_report = Some(report.clone());
         Ok(report)
+    }
+
+    /// Where the playlist of a session lives: `playlist.m3u8` beside the
+    /// configuration file (own choice; no spec covers it).
+    fn session_playlist_path(&self) -> Option<PathBuf> {
+        Some(self.config_path.as_ref()?.parent()?.join("playlist.m3u8"))
+    }
+
+    /// Keeps the playlist for the next start. An empty playlist leaves no file.
+    pub fn save_session_playlist(&mut self) {
+        let Some(path) = self.session_playlist_path() else {
+            return;
+        };
+        if self.engine.queue().is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else if let Err(error) = self.write_queue_playlist(&path) {
+            eprintln!("rustamp: the playlist was not saved: {error}");
+        }
+    }
+
+    /// Brings the last session's playlist back, unless the command line already
+    /// filled the playlist. Nothing starts playing.
+    pub fn restore_session_playlist(&mut self) {
+        if !self.engine.queue().is_empty() {
+            return;
+        }
+        let Some(path) = self.session_playlist_path().filter(|path| path.is_file()) else {
+            return;
+        };
+        if let Err(error) = self.load_playlist_file(&path, false) {
+            self.note(format!("the last playlist was not restored: {error}"));
+        }
     }
 
     /// Writes the current queue to `path` as an M3U, PLS or XSPF playlist, in
@@ -6508,6 +6601,58 @@ mod tests {
         assert!(app.dialog_key(Key::Backspace, Modifiers::NONE));
         assert!(app.dialog_key(Key::Escape, Modifiers::NONE));
         assert!(app.dialog_open_kind().is_none());
+    }
+
+    #[test]
+    fn the_playlist_comes_back_after_a_restart_without_playing() {
+        let (mut app, dir) = app_with_file(None);
+        let config = dir.path().join("rustamp.toml");
+        app.set_config_path(Some(config.clone()));
+        app.submit(Command::AddItems {
+            items: vec![
+                MediaLocation::File(track(&dir, "one.mp3")),
+                MediaLocation::File(track(&dir, "two.mp3")),
+            ],
+            at: None,
+            play: false,
+        })
+        .unwrap();
+        app.save_session_playlist();
+
+        let (mut next, _other) = app_with_file(None);
+        next.set_config_path(Some(config));
+        next.restore_session_playlist();
+        assert_eq!(next.engine().queue().len(), 2);
+        assert_eq!(next.engine().transport(), TransportState::Stopped);
+    }
+
+    #[test]
+    fn a_right_click_asks_for_the_menu_of_what_it_hit() {
+        use crate::menu::ContextMenu;
+        let (mut app, _dir) = app_with_file(None);
+        for (widget, menu) in [
+            (Widget::Marquee, ContextMenu::Title),
+            (Widget::TimeDisplay, ContextMenu::Time),
+            (Widget::PositionSlider, ContextMenu::Seek),
+        ] {
+            let (x, y) = widget_centre(widget);
+            app.mouse_right_down(x, y).unwrap();
+            assert_eq!(app.take_context_menu(), Some(menu), "{widget:?}");
+            assert!(app.native_context_menu(menu).choices.len() >= 2);
+        }
+    }
+
+    #[test]
+    fn the_marquee_says_what_failed_by_the_file_name() {
+        assert_eq!(
+            status_text(r"error: cannot play C:\Music\dead.mp3: unsupported format").as_deref(),
+            Some("cannot play dead.mp3: unsupported format")
+        );
+        assert_eq!(
+            status_text("Minibrowser is not implemented yet").as_deref(),
+            Some("Minibrowser is not implemented yet")
+        );
+        assert_eq!(status_text("skin loaded"), None);
     }
 
     #[test]

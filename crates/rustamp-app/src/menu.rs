@@ -33,6 +33,17 @@ pub enum ClutterMenu {
     Visualization,
 }
 
+/// Which context menu of the main window is waiting to be shown (S03 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenu {
+    /// The long title's menu.
+    Title,
+    /// The time display's menu.
+    Time,
+    /// The seek bar's menu.
+    Seek,
+}
+
 /// What activating one menu leaf did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuOutcome {
@@ -120,6 +131,20 @@ impl App {
         }
     }
 
+    /// Takes the pending context-menu request, if any.
+    pub fn take_context_menu(&mut self) -> Option<ContextMenu> {
+        self.pending_context_menu.take()
+    }
+
+    /// The native popup tree for `menu`, with live check marks.
+    pub fn native_context_menu(&self, menu: ContextMenu) -> rustamp_ui::menu::NativeMainMenu {
+        match menu {
+            ContextMenu::Title => rustamp_ui::menu::native_title_menu(self.marquee_autoscroll()),
+            ContextMenu::Time => rustamp_ui::menu::native_time_menu(self.state().time_remaining),
+            ContextMenu::Seek => rustamp_ui::menu::native_seek_menu(),
+        }
+    }
+
     /// Closes the main-menu popup, if open. The presenter drops the OS window
     /// for this state.
     pub fn close_main_menu(&mut self) {
@@ -176,7 +201,21 @@ impl App {
                 self.submit(command.clone())?;
                 Ok(Some(MenuOutcome::Commands(vec![command])))
             }
+            rustamp_ui::menu::MenuChoice::NoAction {
+                label: "Minibrowser",
+            } => {
+                self.note("Minibrowser is not implemented yet".to_string());
+                Ok(Some(MenuOutcome::Noted))
+            }
             rustamp_ui::menu::MenuChoice::NoAction { .. } => Ok(None),
+            rustamp_ui::menu::MenuChoice::PlaylistKey { action, .. } => {
+                self.dispatch_playlist_action(action)?;
+                Ok(None)
+            }
+            rustamp_ui::menu::MenuChoice::ToggleAutoscroll => {
+                self.toggle_marquee_autoscroll();
+                Ok(None)
+            }
             // The playlist MISC popup's "Generate HTML playlist" row is the
             // editor's `Ctrl+Alt+G` row: the same command id (S03 §2
             // `40292`), so the menu does what the key does. The app records

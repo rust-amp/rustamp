@@ -194,8 +194,13 @@ fn render_1x(state: &MainWindowState, skin: &Skin, layout: &MainWindowLayout) ->
     draw_time(&mut canvas, &sheets, skin, layout, state);
     draw_indicators(&mut canvas, &sheets, skin, layout, state);
     draw_marquee(&mut canvas, &sheets, layout, state);
-    draw_text_field(&mut canvas, &sheets, layout.kbps, state.kbps);
-    draw_text_field(&mut canvas, &sheets, layout.khz, state.khz);
+    draw_text_field(&mut canvas, &sheets, layout.kbps, state.kbps.map(kbps_text));
+    draw_text_field(
+        &mut canvas,
+        &sheets,
+        layout.khz,
+        state.khz.map(|khz| khz.to_string()),
+    );
 
     crate::visualization::draw_visualization(
         &mut canvas,
@@ -784,43 +789,106 @@ fn text_font(sheets: &Sheets) -> Option<BitmapFont> {
     Some(BitmapFont::new(image, glyphs, None, 0))
 }
 
-/// `text` in the characters the `text.bmp` font can draw, one for one, so the
-/// text keeps its length.
+/// Whether the `text.bmp` font can draw `text` as it reads.
 ///
 /// The classic font has no lowercase: lowercase letters select the uppercase
-/// glyphs (S01 §2.2), and a capital selects the same one. An accented Latin
-/// letter loses its accent unless the font has it (Å, Ö, Ä), and anything else
-/// without a glyph shows as `?`, because a blank cell would read as a space.
-pub(crate) fn text_font_chars(text: &str) -> String {
-    text.chars()
-        .map(|ch| {
-            let ch = match ch {
-                'å' => 'Å',
-                'ö' => 'Ö',
-                'ä' => 'Ä',
-                'à' | 'á' | 'â' | 'ã' | 'æ' | 'À' | 'Á' | 'Â' | 'Ã' | 'Æ' => 'a',
-                'ç' | 'Ç' => 'c',
-                'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => 'e',
-                'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' => 'i',
-                'ñ' | 'Ñ' => 'n',
-                'ò' | 'ó' | 'ô' | 'õ' | 'ø' | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ø' => 'o',
-                'ß' => 's',
-                'ù' | 'ú' | 'û' | 'ü' | 'Ù' | 'Ú' | 'Û' | 'Ü' => 'u',
-                'ý' | 'ÿ' | 'Ý' => 'y',
-                other => other.to_ascii_lowercase(),
-            };
-            if webamp::TEXT_GLYPHS.iter().any(|(glyph, _, _)| *glyph == ch) {
-                ch
-            } else {
-                '?'
+/// glyphs (S01 §2.2), and a capital selects the same one. The Å, Ö and Ä cells
+/// are not relied on, because a skin may leave them empty. Text with any other
+/// character goes to a real font (see [`draw_system_text`]).
+pub(crate) fn bitmap_can_draw(text: &str) -> bool {
+    text.chars().all(|ch| {
+        ch.is_ascii()
+            && webamp::TEXT_GLYPHS
+                .iter()
+                .any(|(glyph, _, _)| *glyph == ch.to_ascii_lowercase())
+    })
+}
+
+/// The size of the real font in the bitmap font's places (own choice): the
+/// largest one the marquee's band and a dialog's line hold.
+const SYSTEM_TEXT_SIZE: u32 = 11;
+
+/// The real font in the bitmap font's places.
+fn system_text_font() -> crate::playlist_font::SystemFont<'static> {
+    crate::playlist_font::SystemFont {
+        family: crate::playlist_font::DEFAULT_FAMILY,
+        size: SYSTEM_TEXT_SIZE,
+        bold: false,
+        italic: false,
+    }
+}
+
+/// Draws `text` in a real font inside `band`, starting `x` pixels into it
+/// (negative while the text scrolls), in `colour`. `None` when the host has no
+/// font at all.
+pub(crate) fn draw_system_text(
+    canvas: &mut Image,
+    band: Rect,
+    x: i32,
+    text: &str,
+    colour: [u8; 3],
+) -> Option<()> {
+    let font = system_text_font();
+    let width = crate::playlist_font::text_width(font, text)?;
+    let scratch = crate::playlist_font::render(font, text, width.max(1), band.height, colour)?;
+    let skipped = (-x).max(0);
+    let shown = (width as i32 - skipped).clamp(0, band.width as i32 - x.max(0));
+    if shown > 0 {
+        let visible = Rect::new(skipped, 0, shown as u32, band.height);
+        canvas.blit_alpha(&scratch, visible, band.x + x.max(0), band.y);
+    }
+    Some(())
+}
+
+/// The pixel width `text` takes in the marquee: 5 px a cell in the bitmap font
+/// (S02 §3), its real width in the real font.
+pub(crate) fn marquee_text_width(text: &str) -> u32 {
+    let cells = text.chars().count() as u32 * 5;
+    if bitmap_can_draw(text) {
+        return cells;
+    }
+    crate::playlist_font::text_width(system_text_font(), text).unwrap_or(cells)
+}
+
+/// The bitrate as the three cells of the numeral field (S02 §5) hold it: a rate
+/// of four digits is shortened to `1k4` (own choice; S02 only shows three-digit
+/// rates, and cutting a digit off would show a wrong number).
+fn kbps_text(kbps: u32) -> String {
+    if kbps < 1000 {
+        kbps.to_string()
+    } else {
+        format!("{}k{}", (kbps / 1000).min(9), (kbps % 1000) / 100)
+    }
+}
+
+/// The ink colour of the skin's `text.bmp`: the first pixel of the `a` cell
+/// that differs from the blank cell. Text in a real font wears it, so it looks
+/// like the skin's own text.
+fn text_ink(sheets: &Sheets) -> [u8; 3] {
+    let fallback = [0xff; 3];
+    let Some(sheet) = sheets.get(Sheet::Text) else {
+        return fallback;
+    };
+    let (cell_w, cell_h) = webamp::TEXT_CELL;
+    let blank = webamp::TEXT_GLYPHS
+        .iter()
+        .find(|(glyph, _, _)| *glyph == ' ')
+        .and_then(|(_, col, row)| sheet.pixel((col * cell_w) as i32, (row * cell_h) as i32));
+    for y in 0..cell_h as i32 {
+        for x in 0..cell_w as i32 {
+            if let Some(pixel) = sheet.pixel(x, y)
+                && Some(pixel) != blank
+            {
+                return [pixel[0], pixel[1], pixel[2]];
             }
-        })
-        .collect()
+        }
+    }
+    fallback
 }
 
 /// Renders `text` into a `field`-sized scratch buffer and composites it, so the
 /// text cannot spill outside the field.
-fn draw_text_field(canvas: &mut Image, sheets: &Sheets, field: Rect, text: Option<u32>) {
+fn draw_text_field(canvas: &mut Image, sheets: &Sheets, field: Rect, text: Option<String>) {
     let Some(text) = text else {
         return;
     };
@@ -828,7 +896,7 @@ fn draw_text_field(canvas: &mut Image, sheets: &Sheets, field: Rect, text: Optio
         return;
     };
     let mut scratch = Image::new(field.width, field.height);
-    font.render_text(&mut scratch, 0, 0, &text.to_string());
+    font.render_text(&mut scratch, 0, 0, &text);
     canvas.blit_alpha(&scratch, scratch.bounds(), field.x, field.y);
 }
 
@@ -838,6 +906,21 @@ fn draw_marquee(
     layout: &MainWindowLayout,
     state: &MainWindowState,
 ) {
+    // Characters the bitmap font does not have: the whole title goes to a real
+    // font, in a band taller than the 6 px row, because no character of that
+    // kind can be read at 6 px. The marquee's black panel has the room.
+    if !bitmap_can_draw(&state.title) {
+        let band = Rect::new(
+            layout.marquee.x,
+            layout.marquee.y - 4,
+            layout.marquee.width,
+            layout.marquee.height + 8,
+        );
+        let colour = text_ink(sheets);
+        if draw_system_text(canvas, band, -state.marquee_offset, &state.title, colour).is_some() {
+            return;
+        }
+    }
     let Some(font) = text_font(sheets) else {
         return;
     };
@@ -847,7 +930,7 @@ fn draw_marquee(
         &mut scratch,
         -state.marquee_offset,
         0,
-        &text_font_chars(&state.title),
+        &state.title.to_ascii_lowercase(),
     );
     canvas.blit_alpha(
         &scratch,
@@ -861,12 +944,19 @@ fn draw_marquee(
 mod tests {
 
     #[test]
-    fn the_text_font_draws_every_character_of_a_title() {
-        assert_eq!(text_font_chars("Jump To File"), "jump to file");
-        assert_eq!(text_font_chars("Ünïcödé"), "unicÖde");
-        assert_eq!(text_font_chars("Åäö"), "ÅÄÖ");
-        assert_eq!(text_font_chars("日本語"), "???");
-        assert_eq!(text_font_chars(r"a:\b-c.wav"), r"a:\b-c.wav");
+    fn only_what_the_bitmap_font_has_stays_with_the_bitmap_font() {
+        assert!(bitmap_can_draw("Jump To File"));
+        assert!(bitmap_can_draw(r"a:\b-c.wav (1:00)"));
+        assert!(!bitmap_can_draw("Ünïcödé"));
+        assert!(!bitmap_can_draw("日本語"));
+        assert!(!bitmap_can_draw("Åäö"));
+    }
+
+    #[test]
+    fn a_bitrate_of_four_digits_fits_the_three_cells() {
+        assert_eq!(kbps_text(192), "192");
+        assert_eq!(kbps_text(999), "999");
+        assert_eq!(kbps_text(1411), "1k4");
     }
 
     use super::*;

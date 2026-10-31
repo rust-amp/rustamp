@@ -792,6 +792,16 @@ pub enum MenuChoice {
         /// The public command id recorded by S03.
         command_id: u32,
     },
+    /// A row of the playlist entry's context menu: the same action its key
+    /// runs.
+    PlaylistKey {
+        /// The row's label.
+        label: &'static str,
+        /// The action to dispatch.
+        action: crate::playlist::PlaylistKeyAction,
+    },
+    /// The title menu's "Autoscroll songname" row (S02 §3, id 40189).
+    ToggleAutoscroll,
     /// The Options popup's Time elapsed / Time remaining rows: sets the
     /// reading (`true` = remaining) instead of toggling it, so choosing the
     /// row that is already on keeps it on (S04 §4.2: the check moves between
@@ -805,7 +815,9 @@ impl MenuChoice {
         match self {
             MenuChoice::Action { label, .. }
             | MenuChoice::NoAction { label }
+            | MenuChoice::PlaylistKey { label, .. }
             | MenuChoice::UnavailableCommand { label, .. } => label,
+            MenuChoice::ToggleAutoscroll => "Autoscroll songname",
             MenuChoice::Exit => "Exit",
             MenuChoice::SetTimeRemaining(false) => "Time elapsed",
             MenuChoice::SetTimeRemaining(true) => "Time remaining",
@@ -1151,6 +1163,154 @@ pub fn native_playlist_misc_menu() -> NativeMainMenu {
     }
     NativeMainMenu { rows, choices }
 }
+/// One row of a small context menu: the label, the key hint, the check mark
+/// and what it runs. `None` is a separator.
+type ContextRow = Option<(&'static str, Option<&'static str>, bool, MenuChoice)>;
+
+/// Builds a native menu from its rows, with local 1-based ids.
+fn context_menu(rows: &[ContextRow]) -> NativeMainMenu {
+    let mut menu = NativeMainMenu {
+        rows: Vec::new(),
+        choices: Vec::new(),
+    };
+    for row in rows {
+        match row {
+            None => menu.rows.push(PopupRow::Separator),
+            Some((label, accelerator, checked, choice)) => {
+                menu.choices.push(*choice);
+                menu.rows.push(PopupRow::Entry {
+                    id: menu.choices.len() as u32,
+                    label: (*label).to_string(),
+                    accelerator: accelerator.map(str::to_string),
+                    checked: *checked,
+                    enabled: true,
+                });
+            }
+        }
+    }
+    menu
+}
+
+/// The long title's context menu. S03 §5 names its four rows (verified); their
+/// labels and order past that are our choice, because S04 never opened it.
+pub fn native_title_menu(autoscroll: bool) -> NativeMainMenu {
+    let action = |label, action| MenuChoice::Action { label, action };
+    context_menu(&[
+        Some((
+            "File info...",
+            Some("Alt+3"),
+            false,
+            action("File info...", ShortcutAction::ViewFileInfo),
+        )),
+        Some((
+            "Jump to file",
+            Some("J"),
+            false,
+            action("Jump to file", ShortcutAction::JumpToFile),
+        )),
+        Some((
+            "Jump to time",
+            Some("Ctrl+J"),
+            false,
+            action("Jump to time", ShortcutAction::JumpToTime),
+        )),
+        None,
+        Some((
+            "Autoscroll songname",
+            None,
+            autoscroll,
+            MenuChoice::ToggleAutoscroll,
+        )),
+    ])
+}
+
+/// The time display's context menu (S03 §5, "elapsed/remaining menu"): the same
+/// two rows as the Options popup (S04 §4.2).
+pub fn native_time_menu(remaining: bool) -> NativeMainMenu {
+    context_menu(&[
+        Some((
+            "Time elapsed",
+            Some("Ctrl+T"),
+            !remaining,
+            MenuChoice::SetTimeRemaining(false),
+        )),
+        Some((
+            "Time remaining",
+            Some("Ctrl+T"),
+            remaining,
+            MenuChoice::SetTimeRemaining(true),
+        )),
+    ])
+}
+
+/// The seek bar's context menu. S03 §5 names the menu and not its rows, so the
+/// rows are our choice: the three seek commands S03 §1 has.
+pub fn native_seek_menu() -> NativeMainMenu {
+    let action = |label, action| MenuChoice::Action { label, action };
+    context_menu(&[
+        Some((
+            "Back 5 seconds",
+            Some("Left"),
+            false,
+            action("Back 5 seconds", ShortcutAction::Rewind5s),
+        )),
+        Some((
+            "Forward 5 seconds",
+            Some("Right"),
+            false,
+            action("Forward 5 seconds", ShortcutAction::Forward5s),
+        )),
+        None,
+        Some((
+            "Jump to time",
+            Some("Ctrl+J"),
+            false,
+            action("Jump to time", ShortcutAction::JumpToTime),
+        )),
+    ])
+}
+
+/// A playlist entry's context menu. S03 §5 names the menu and not its rows, so
+/// the rows are our choice: what the editor's keys do to the selection.
+pub fn native_playlist_entry_menu() -> NativeMainMenu {
+    use crate::playlist::PlaylistKeyAction as Key;
+    let key = |label, action| MenuChoice::PlaylistKey { label, action };
+    context_menu(&[
+        Some((
+            "Play item",
+            Some("Enter"),
+            false,
+            key("Play item", Key::PlaySelected),
+        )),
+        Some((
+            "Read extended info",
+            Some("Ctrl+Alt+E"),
+            false,
+            key("Read extended info", Key::ReadExtendedInfo),
+        )),
+        None,
+        Some((
+            "Remove from list",
+            Some("Del"),
+            false,
+            key("Remove from list", Key::Delete),
+        )),
+        Some((
+            "Crop selection",
+            Some("Ctrl+Del"),
+            false,
+            key("Crop selection", Key::Crop),
+        )),
+        None,
+        Some((
+            "Select all",
+            Some("Ctrl+A"),
+            false,
+            key("Select all", Key::SelectAll),
+        )),
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------

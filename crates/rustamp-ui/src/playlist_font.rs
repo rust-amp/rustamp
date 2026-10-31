@@ -224,7 +224,40 @@ struct FaceKey {
 struct Fonts {
     database: fontdb::Database,
     loaded: HashMap<FaceKey, Option<FontArc>>,
+    /// The faces of [`FALLBACK_FAMILIES`] that were needed so far, by position
+    /// in that list. A face is only loaded when a character asks for it: the
+    /// CJK fonts are tens of megabytes.
+    fallbacks: Vec<Option<Option<FontArc>>>,
 }
+
+/// The installed families asked for a character the requested font does not
+/// have, in this order: Latin and Greek first, then Japanese, Chinese and
+/// Korean (own choice; S17 §5 says nothing about missing characters). Windows
+/// has the first groups, and the last names are what other systems carry.
+const FALLBACK_FAMILIES: &[&str] = &[
+    "Segoe UI",
+    "Arial Unicode MS",
+    "Yu Gothic",
+    "Meiryo",
+    "MS Gothic",
+    "Microsoft YaHei",
+    "SimSun",
+    "Microsoft JhengHei",
+    "Malgun Gothic",
+    "Segoe UI Symbol",
+    "Noto Sans CJK JP",
+    "Noto Sans CJK SC",
+    "Source Han Sans",
+    "WenQuanYi Micro Hei",
+    "DejaVu Sans",
+];
+
+/// The coverage from which a pixel of the requested font counts as ink.
+const INK_COVERAGE: f32 = 0.5;
+
+/// The same for a fallback font: the thin strokes of a CJK character at list
+/// size break apart at [`INK_COVERAGE`].
+const FALLBACK_INK_COVERAGE: f32 = 0.3;
 
 /// The name the host knows the family by, or `None` when it has no such
 /// family.
@@ -243,6 +276,91 @@ fn known_family(database: &fontdb::Database, family: &str) -> Option<String> {
         .next()
 }
 
+/// The fonts of the host, read once.
+fn fonts() -> &'static Mutex<Fonts> {
+    static FONTS: OnceLock<Mutex<Fonts>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        Mutex::new(Fonts {
+            database,
+            loaded: HashMap::new(),
+            fallbacks: vec![None; FALLBACK_FAMILIES.len()],
+        })
+    })
+}
+
+/// Whether `face` lacks `ch`. A control character is never drawn.
+fn lacks(face: &FontArc, ch: char) -> bool {
+    !ch.is_control() && face.glyph_id(ch).0 == 0
+}
+
+/// The fallback face that has the most of `text`, stopping at the first that
+/// has all of it, with the number of characters it lacks.
+fn best_fallback(text: &str) -> Option<(FontArc, usize)> {
+    let mut fonts = fonts().lock().ok()?;
+    let mut best: Option<(FontArc, usize)> = None;
+    for (index, family) in FALLBACK_FAMILIES.iter().enumerate() {
+        if fonts.fallbacks[index].is_none() {
+            let face = fonts
+                .database
+                .query(&fontdb::Query {
+                    families: &[fontdb::Family::Name(family)],
+                    ..Default::default()
+                })
+                .and_then(|id| {
+                    fonts.database.with_face_data(id, |bytes, index| {
+                        FontVec::try_from_vec_and_index(bytes.to_vec(), index)
+                            .ok()
+                            .map(FontArc::new)
+                    })
+                })
+                .flatten();
+            fonts.fallbacks[index] = Some(face);
+        }
+        if let Some(Some(face)) = &fonts.fallbacks[index] {
+            let missing = text.chars().filter(|ch| lacks(face, *ch)).count();
+            if best.as_ref().is_none_or(|(_, least)| missing < *least) {
+                best = Some((face.clone(), missing));
+            }
+            if missing == 0 {
+                break;
+            }
+        }
+    }
+    best
+}
+
+/// The one face that draws all of `text`, and whether it is a fallback.
+///
+/// A text changes its font as a whole: if the requested font lacks one
+/// character, every character comes from the fallback, so a title does not
+/// mix two fonts. A text no font covers completely takes the face that covers
+/// most of it.
+fn face_for_text(primary: &FontArc, text: &str) -> (FontArc, bool) {
+    let missing = text.chars().filter(|ch| lacks(primary, *ch)).count();
+    if missing == 0 {
+        return (primary.clone(), false);
+    }
+    match best_fallback(text) {
+        Some((face, least)) if least < missing => (face, true),
+        _ => (primary.clone(), false),
+    }
+}
+
+/// The face for one character of a text drawn in `chosen`. Only a character
+/// `chosen` lacks goes elsewhere, because the alternative is an empty box: this
+/// is the last resort for a text no installed font covers completely.
+fn face_for_char(chosen: &FontArc, ch: char) -> (FontArc, bool) {
+    if !lacks(chosen, ch) {
+        return (chosen.clone(), false);
+    }
+    match best_fallback(&ch.to_string()) {
+        Some((face, 0)) => (face, true),
+        _ => (chosen.clone(), false),
+    }
+}
+
 /// The face for the request, or `None` when the host has no font at all.
 ///
 /// The chain is the requested family, then the built-in default family, then
@@ -250,16 +368,7 @@ fn known_family(database: &fontdb::Database, family: &str) -> Option<String> {
 /// installed" *not determined*; falling back to a real font instead of
 /// drawing nothing is this implementation's own choice.
 fn font(request: SystemFont<'_>) -> Option<FontArc> {
-    static FONTS: OnceLock<Mutex<Fonts>> = OnceLock::new();
-    let fonts = FONTS.get_or_init(|| {
-        let mut database = fontdb::Database::new();
-        database.load_system_fonts();
-        Mutex::new(Fonts {
-            database,
-            loaded: HashMap::new(),
-        })
-    });
-    let mut fonts = fonts.lock().ok()?;
+    let mut fonts = fonts().lock().ok()?;
     let key = FaceKey {
         family: request.family.to_string(),
         bold: request.bold,
@@ -307,17 +416,31 @@ fn font(request: SystemFont<'_>) -> Option<FontArc> {
 /// so it is the place where a caret behind the text belongs. It is `None`
 /// when the host has no font at all.
 pub(crate) fn text_width(request: SystemFont<'_>, text: &str) -> Option<u32> {
-    let face = font(request)?;
-    let scaled = face.as_scaled(PxScale::from(request.size as f32));
+    text_width_as_part_of(request, text, text)
+}
+
+/// [`text_width`] for a part of `whole`, in the font `whole` is drawn in.
+pub(crate) fn text_width_as_part_of(
+    request: SystemFont<'_>,
+    whole: &str,
+    text: &str,
+) -> Option<u32> {
+    let (chosen, _) = face_for_text(&font(request)?, whole);
+    let scale = PxScale::from(request.size as f32);
     let mut x = 0.0;
     let mut previous = None;
     for ch in text.chars() {
+        let (face, other) = face_for_char(&chosen, ch);
+        let scaled = face.as_scaled(scale);
         let id = scaled.glyph_id(ch);
-        if let Some(previous) = previous {
+        // Kerning only holds between two glyphs of one face.
+        if let Some(previous) = previous
+            && !other
+        {
             x += scaled.kern(previous, id);
         }
         x += scaled.h_advance(id);
-        previous = Some(id);
+        previous = (!other).then_some(id);
     }
     Some(x.ceil() as u32)
 }
@@ -335,31 +458,67 @@ pub(crate) fn render(
     height: u32,
     colour: [u8; 3],
 ) -> Option<Image> {
-    let face = font(request)?;
-    let scaled = face.as_scaled(PxScale::from(request.size as f32));
+    render_as_part_of(request, text, text, width, height, colour)
+}
+
+/// [`render`] for a part of `whole`, in the font `whole` is drawn in, so the
+/// parts of one row (its name and its length) never differ.
+pub(crate) fn render_as_part_of(
+    request: SystemFont<'_>,
+    whole: &str,
+    text: &str,
+    width: u32,
+    height: u32,
+    colour: [u8; 3],
+) -> Option<Image> {
+    let primary = font(request)?;
+    let (chosen, fallback) = face_for_text(&primary, whole);
+    let scale = PxScale::from(request.size as f32);
+    // The baseline stays the requested font's, whichever font draws the text,
+    // so a row does not jump up or down between its neighbours.
+    let baseline = primary.as_scaled(scale).ascent();
+    let ink = [colour[0], colour[1], colour[2], 255];
     let mut image = Image::new(width, height);
     let mut x = 0.0;
     let mut previous = None;
     for ch in text.chars() {
+        let (face, other) = face_for_char(&chosen, ch);
+        let scaled = face.as_scaled(scale);
         let id = scaled.glyph_id(ch);
-        if let Some(previous) = previous {
+        if let Some(previous) = previous
+            && !other
+        {
             x += scaled.kern(previous, id);
         }
-        let glyph = id.with_scale_and_position(scaled.scale(), point(x, scaled.ascent()));
+        let glyph = id.with_scale_and_position(scale, point(x, baseline));
         if let Some(outline) = face.outline_glyph(glyph) {
             let bounds = outline.px_bounds();
+            let threshold = if fallback || other {
+                FALLBACK_INK_COVERAGE
+            } else {
+                INK_COVERAGE
+            };
+            // A dot or a colon can be smaller than one pixel and spread over
+            // several without reaching the threshold in any: its strongest
+            // pixel is inked, so no glyph vanishes from the row.
+            let mut inked = false;
+            let mut strongest = (0.0, 0, 0);
             outline.draw(|gx, gy, coverage| {
-                if coverage >= 0.5 {
-                    image.set_pixel(
-                        bounds.min.x as i32 + gx as i32,
-                        bounds.min.y as i32 + gy as i32,
-                        [colour[0], colour[1], colour[2], 255],
-                    );
+                let px = bounds.min.x as i32 + gx as i32;
+                let py = bounds.min.y as i32 + gy as i32;
+                if coverage >= threshold {
+                    image.set_pixel(px, py, ink);
+                    inked = true;
+                } else if coverage > strongest.0 {
+                    strongest = (coverage, px, py);
                 }
             });
+            if !inked && strongest.0 > 0.0 {
+                image.set_pixel(strongest.1, strongest.2, ink);
+            }
         }
         x += scaled.h_advance(id);
-        previous = Some(id);
+        previous = (!other).then_some(id);
         if x >= width as f32 {
             break;
         }
@@ -380,6 +539,65 @@ mod tests {
             bold,
             italic,
         }
+    }
+
+    #[test]
+    fn a_text_changes_its_font_as_a_whole() {
+        let primary = font(request("Arial", 13, false, false)).unwrap();
+        let (_, fallback) = face_for_text(&primary, "plain.mp3");
+        assert!(!fallback, "a text the font has stays in it");
+
+        let (face, fallback) = face_for_text(&primary, "\u{65E5}\u{672C}.mp3");
+        assert!(fallback, "the font has no CJK");
+        for ch in "\u{65E5}\u{672C}.mp3".chars() {
+            assert!(!lacks(&face, ch), "{ch} comes from the one face");
+        }
+        // The Latin part really is drawn by that face, not by the request's.
+        let part = |whole: &str| {
+            render_as_part_of(
+                request("Arial", 13, false, false),
+                whole,
+                ".mp3",
+                40,
+                16,
+                [255; 3],
+            )
+            .unwrap()
+        };
+        assert_ne!(
+            part(".mp3").as_rgba(),
+            part("\u{65E5}\u{672C}.mp3").as_rgba(),
+            "the extension changes its font with the title"
+        );
+    }
+
+    #[test]
+    fn a_character_the_font_lacks_comes_from_a_fallback_font() {
+        // Arial has no kana. Without the fallback the row shows its empty box
+        // or nothing; the fallback draws the character with real strokes.
+        let ink = |text: &str| {
+            let image = render(request("Arial", 13, false, false), text, 40, 16, [255; 3]).unwrap();
+            image.as_rgba().chunks(4).filter(|p| p[3] != 0).count()
+        };
+        let notdef = ink("\u{10FFFF}");
+        assert!(
+            ink("\u{65E5}") > notdef,
+            "a CJK character has strokes of its own"
+        );
+        assert!(
+            ink("\u{D55C}") > notdef,
+            "a Korean character has strokes of its own"
+        );
+    }
+
+    #[test]
+    fn a_dot_and_a_colon_never_vanish_from_a_row() {
+        let ink = |text: &str| {
+            let image = render(request("Arial", 13, false, false), text, 40, 16, [255; 3]).unwrap();
+            image.as_rgba().chunks(4).filter(|p| p[3] != 0).count()
+        };
+        assert!(ink(".") > 0);
+        assert!(ink(":") > 0);
     }
 
     #[test]

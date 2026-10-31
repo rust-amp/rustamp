@@ -262,6 +262,25 @@ impl PlaybackOrder {
         self.set_repeat(!self.repeat);
     }
 
+    /// Whether [`next_index`](Self::next_index) would find a track, without
+    /// moving anything.
+    pub fn has_next(&self) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        let Some(current) = self.current_index else {
+            return true;
+        };
+        if self.repeat {
+            return true;
+        }
+        if self.shuffle {
+            self.shuffle_pos + 1 < self.shuffle_plan.len()
+        } else {
+            current + 1 < self.len
+        }
+    }
+
     /// Advance to the next track in the active playback order.
     /// Returns `Some(index)` of the new track, or `None` if the queue ends.
     pub fn next_index(&mut self) -> Option<usize> {

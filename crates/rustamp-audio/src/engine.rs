@@ -679,6 +679,7 @@ impl Engine {
     /// playlist edit, so the run's bookkeeping moves with it.
     pub fn set_current_index(&mut self, index: Option<u32>) {
         self.sync_order_to_queue();
+        let had_current = self.current.is_some();
         self.current = index.filter(|&i| (i as usize) < self.queue.len());
         self.order()
             .set_current_index(self.current.map(|i| i as usize));
@@ -689,6 +690,20 @@ impl Engine {
                 last.0 = current;
             }
             self.send(DecodeMsg::CurrentMoved(current));
+        }
+        // The current entry is gone: nothing of it may stay on display.
+        if self.current.is_none() && had_current && self.transport == TransportState::Stopped {
+            self.duration_ms = None;
+            self.duration_frames = None;
+            self.metadata = TrackMetadata::default();
+            self.stream = None;
+            self.bus.publish(Event::TrackChanged {
+                id: None,
+                index: None,
+                metadata: None,
+                duration_ms: None,
+            });
+            self.bus.publish(Event::StreamInfoChanged(None));
         }
     }
 
@@ -1234,7 +1249,7 @@ impl Engine {
     /// windows) are ignored.
     pub fn apply(&mut self, command: &Command) -> Result<()> {
         match command {
-            Command::Play => self.play(),
+            Command::Play => self.play_or_restart(),
             Command::Pause => self.pause(),
             Command::TogglePause => {
                 if self.transport == TransportState::Playing {
@@ -1328,6 +1343,21 @@ impl Engine {
                 Ok(())
             }
             TransportState::Stopped => self.start_run(),
+        }
+    }
+
+    /// What `Command::Play` means: [`Engine::play`], and a player that is already
+    /// playing starts the track over (S03 §5: "Click the play button: play /
+    /// restart"). A running fade-out is only cancelled.
+    fn play_or_restart(&mut self) -> Result<()> {
+        match self.current {
+            Some(current)
+                if self.transport == TransportState::Playing
+                    && self.pending_fade_stop.is_none() =>
+            {
+                self.play_index(current)
+            }
+            _ => self.play(),
         }
     }
 
@@ -1480,6 +1510,12 @@ impl Engine {
             if let Some(target) = next {
                 return self.move_or_play(target as u32);
             }
+            return Ok(());
+        }
+        // A paused player at the end of the list stays where it is: ending the
+        // run here would only show when the user resumes, as a stop instead of
+        // the music they asked for.
+        if self.transport == TransportState::Paused && !self.order().has_next() {
             return Ok(());
         }
         self.send(DecodeMsg::Next);

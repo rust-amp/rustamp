@@ -163,6 +163,26 @@ pub fn pick_eqf_file(raw_owner: isize, title: &str) -> Result<Option<PathBuf>, F
         .next())
 }
 
+/// The file types the load-playlist dialog offers.
+pub const PLAYLIST_OPEN_FILTERS: &[(&str, &str)] = &[
+    ("Playlists", "*.m3u;*.m3u8;*.pls;*.xspf"),
+    ("All files", "*.*"),
+];
+
+/// Shows the file-open dialog for one playlist file (S06 §4: LIST OPTS opens a
+/// `#32770` dialog titled `Load Playlist`).
+///
+/// Returns `None` when the user cancelled. Same contract as
+/// [`pick_media_files`]: call on the UI thread.
+pub fn pick_playlist_file(
+    raw_owner: isize,
+    title: &str,
+) -> Result<Option<PathBuf>, FileDialogError> {
+    Ok(pick_files(raw_owner, title, PLAYLIST_OPEN_FILTERS, false)?
+        .into_iter()
+        .next())
+}
+
 /// The file types the Winamp configuration import dialog offers.
 ///
 /// Own choice: the `.ini` files first, `All files` last so a file the user

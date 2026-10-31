@@ -113,8 +113,9 @@ fn an_approved_plugin_can_be_switched_off_and_on_and_the_choice_survives_a_resta
     assert!(other_text.contains("not approved") && other_text.ends_with("off"));
     // Other pages have nothing and say so.
     let output = rows(&app, PrefsNode::Output);
-    assert_eq!(output.len(), 1);
+    assert_eq!(output.len(), 2, "the sentence and the folder");
     assert_eq!(output[0].0, None, "an information row has no id");
+    assert_eq!(output[1].0, None, "an information row has no id");
 
     // The unapproved plug-in cannot be switched on: nothing changes.
     app.apply_prefs_action(PrefsAction::TogglePlugin(other.unwrap()));

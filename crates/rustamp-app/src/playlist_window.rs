@@ -571,7 +571,7 @@ impl App {
     /// The shared rows (S03 §1/§4) go through the main window's machine, so
     /// the prediction and the command set are the same wherever the key was
     /// pressed ([`App::dispatch_shared_shortcut`]).
-    fn dispatch_playlist_action(
+    pub(crate) fn dispatch_playlist_action(
         &mut self,
         action: PlaylistKeyAction,
     ) -> Result<Option<ShortcutOutcome>> {
@@ -917,8 +917,18 @@ impl App {
             }
             None => format!("{id:?}"),
         };
+        // The renderer right-aligns what follows the tab.
+        let length = self
+            .playlist_tags
+            .metadata(id)
+            .and_then(|tags| tags.duration_ms)
+            .filter(|_| !plain.is_empty())
+            .map_or_else(String::new, |ms| {
+                let seconds = ms / 1000;
+                format!("\t{}:{:02}", seconds / 60, seconds % 60)
+            });
         if !format.is_enabled() {
-            return plain;
+            return format!("{plain}{length}");
         }
         let Some(track) = source else {
             // A row the queue does not know has no fields: it keeps the
@@ -926,7 +936,20 @@ impl App {
             return plain;
         };
         let fields = crate::title_format::row_fields(track, self.playlist_tags.metadata(id));
-        format.row_text(&plain, &fields)
+        format!("{}{length}", format.row_text(&plain, &fields))
+    }
+
+    /// Mouse-wheel notches over the playlist editor: three rows a notch (own
+    /// choice: S06 §3 only measures the arrows, which page).
+    pub fn playlist_wheel(&mut self, notches: i32) {
+        let (width, height) = self.playlist_logical_size();
+        self.playlist.set_size(width, height);
+        self.sync_playlist_entries();
+        let target = self
+            .playlist
+            .first_visible()
+            .saturating_add_signed(-(notches as isize) * 3);
+        self.playlist.scroll_to(target);
     }
 
     /// Which focus variant the playlist frame renders with.

@@ -2121,12 +2121,7 @@ pub fn render_dialog(kind: DialogKind, skin: &Skin, body: &[&str]) -> Image {
     );
     let font = text_font(skin);
     if let Some(font) = font.as_ref() {
-        font.render_text(
-            &mut canvas,
-            TEXT_PAD,
-            3,
-            &crate::render::text_font_chars(kind.title()),
-        );
+        font.render_text(&mut canvas, TEXT_PAD, 3, &kind.title().to_ascii_lowercase());
         let mut y = BODY_TOP;
         for line in body {
             // The line's band has to fit into the client area; a line that
@@ -2134,12 +2129,19 @@ pub fn render_dialog(kind: DialogKind, skin: &Skin, body: &[&str]) -> Image {
             if y + TEXT_LINE_PX > height as i32 {
                 break;
             }
-            font.render_text(
-                &mut canvas,
+            // A line with characters the bitmap font does not have goes to a
+            // real font, whole, so its letters match each other.
+            let band = rustamp_gfx::Rect::new(
                 TEXT_PAD,
-                y,
-                &crate::render::text_font_chars(line),
+                y - 3,
+                width.saturating_sub(TEXT_PAD as u32),
+                TEXT_LINE_PX as u32 + 2,
             );
+            if crate::render::bitmap_can_draw(line)
+                || crate::render::draw_system_text(&mut canvas, band, 0, line, [0xff; 3]).is_none()
+            {
+                font.render_text(&mut canvas, TEXT_PAD, y, &line.to_ascii_lowercase());
+            }
             y += TEXT_LINE_PX;
         }
     }

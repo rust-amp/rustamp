@@ -745,6 +745,9 @@ fn playlist_font_mask(mut image: Image) -> Option<BitmapFont> {
     Some(BitmapFont::new(image, glyphs, None, 0))
 }
 
+/// The room kept between a row's text and its length (own choice).
+const LENGTH_GAP: u32 = 4;
+
 /// Paints the visible rows: the selection band first, then the labels.
 ///
 /// The selected row's colour is the **skin's** `SelectedBG` from
@@ -784,19 +787,49 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
         if selected_ids.contains(id) {
             canvas.fill_rect(rect, selected);
         }
-        let text = labels.get(i).map(String::as_str).unwrap_or("");
-        if text.is_empty() {
+        let label = labels.get(i).map(String::as_str).unwrap_or("");
+        if label.is_empty() {
             continue;
         }
+        // What follows a tab is the entry's length, at the row's right edge.
+        let (text, length) = match label.split_once('\t') {
+            Some((text, length)) => (text, Some(length)),
+            None => (label, None),
+        };
+        let length_width = length
+            .and_then(|length| crate::playlist_font::text_width_as_part_of(request, label, length))
+            .unwrap_or(0);
+        let text_width = rect
+            .width
+            .saturating_sub(length_width + LENGTH_GAP * u32::from(length_width > 0));
         let colour = if window.current() == Some(*id) {
             style.current
         } else {
             style.normal
         };
-        if let Some(scratch) =
-            crate::playlist_font::render(request, text, rect.width, rect.height, colour)
-        {
+        // The name and the length are one row and one font.
+        if let Some(scratch) = crate::playlist_font::render_as_part_of(
+            request,
+            label,
+            text,
+            text_width,
+            rect.height,
+            colour,
+        ) {
             canvas.blit_alpha(&scratch, scratch.bounds(), rect.x, rect.y);
+            if let Some(length) = length
+                && let Some(scratch) = crate::playlist_font::render_as_part_of(
+                    request,
+                    label,
+                    length,
+                    length_width,
+                    rect.height,
+                    colour,
+                )
+            {
+                let x = rect.x + (rect.width - length_width) as i32;
+                canvas.blit_alpha(&scratch, scratch.bounds(), x, rect.y);
+            }
         } else if let Some(font) = font.as_ref() {
             // Scratch-clipped like the main-window marquee, so text cannot
             // spill past the row or into the scrollbar.

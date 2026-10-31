@@ -214,6 +214,8 @@ enum DialogRoute {
     /// A folder is not a file, so the file-open dialog cannot ask for one;
     /// the shell has its own dialog for it.
     NativeDirectoryPicker,
+    /// The standard file-open dialog, for one playlist file.
+    NativePlaylistPicker,
     /// The preferences dialog: a real Windows dialog (tree of pages, group
     /// boxes, check boxes) opened on `page`.
     NativePreferences { page: PrefsPage },
@@ -229,8 +231,9 @@ impl DialogRoute {
     /// and the shell's folder dialog for exactly the second. Asking the
     /// user to type a path into a window of ours instead is the defect.
     /// A location/URL entry is not a file-open dialog, and everything else
-    /// (About, file info, jump, the skin browser, load playlist)
-    /// is the player's own face with no OS equivalent.
+    /// (About, file info, jump, the skin browser)
+    /// is the player's own face with no OS equivalent. Load playlist is a
+    /// native file dialog as well (S06 §4 measured a `#32770`).
     fn for_dialog(kind: DialogKind) -> Self {
         match kind {
             DialogKind::OpenMedia {
@@ -241,6 +244,7 @@ impl DialogRoute {
                 kind: OpenMediaKind::Directory,
                 ..
             } => DialogRoute::NativeDirectoryPicker,
+            DialogKind::LoadPlaylist => DialogRoute::NativePlaylistPicker,
             DialogKind::Preferences(page) => DialogRoute::NativePreferences { page },
             _ => DialogRoute::OwnWindow,
         }
@@ -438,6 +442,7 @@ pub fn run(app: App) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(error) = presenter.app.save_config() {
             eprintln!("rustamp: {error}");
         }
+        presenter.app.save_session_playlist();
     }
     run_res.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
@@ -556,6 +561,10 @@ struct Windowed {
     /// The preferences page the app asked for, opened from the tick for the
     /// same reason as the file pick (never from inside a window procedure).
     pending_prefs: Option<PrefsPage>,
+    /// The load-playlist dialog waits for the tick.
+    pending_playlist_pick: bool,
+    /// Whether the main window is minimized; the other windows go with it.
+    main_minimized: bool,
     /// The native preferences dialog while it is open.
     #[cfg(windows)]
     prefs_window: Option<rustamp_platform::PrefsWindow>,
@@ -643,6 +652,8 @@ impl Windowed {
             applied_library_title: None,
             pending_media_pick: None,
             pending_prefs: None,
+            pending_playlist_pick: false,
+            main_minimized: false,
             #[cfg(windows)]
             prefs_window: None,
             cursor: (0, 0),
@@ -1008,6 +1019,26 @@ impl Windowed {
                 window.set_outer_position(target);
             }
             self.app.set_window_position(id, geometry.x, geometry.y);
+        }
+    }
+
+    /// The equalizer and the playlist editor go away with a minimized main
+    /// window and come back with it (own choice: they have no taskbar entry of
+    /// their own, and S05 does not measure it).
+    fn follow_main_minimized(&mut self) {
+        let minimized = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.is_minimized() == Some(true));
+        if minimized == self.main_minimized {
+            return;
+        }
+        self.main_minimized = minimized;
+        for window in [self.eq_window.as_ref(), self.playlist_window.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            window.set_visible(!minimized);
         }
     }
 
@@ -1494,6 +1525,77 @@ impl Windowed {
             eprintln!("rustamp: a native popup menu is only implemented on Windows");
         }
     }
+    /// Shows the load-playlist dialog the app asked for (S06 §4), from the tick
+    /// because it is modal, and loads what the user chose.
+    fn drain_playlist_pick(&mut self) {
+        if !std::mem::take(&mut self.pending_playlist_pick) {
+            return;
+        }
+        #[cfg(windows)]
+        match rustamp_platform::pick_playlist_file(
+            self.raw_main_window(),
+            DialogKind::LoadPlaylist.title(),
+        ) {
+            Ok(Some(path)) => {
+                // A failure is reported by the load itself.
+                let _ = self.app.load_playlist_file(&path, true);
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("rustamp: no load-playlist dialog: {error}"),
+        }
+    }
+
+    /// Shows a pending context menu at the pointer: the main window's title,
+    /// time and seek menus and the playlist entry's (S03 §5).
+    fn drain_context_menus(&mut self) {
+        if let Some(kind) = self.app.take_context_menu() {
+            let menu = self.app.native_context_menu(kind);
+            let origin = self
+                .window
+                .as_ref()
+                .and_then(|window| window.outer_position().ok());
+            self.show_context_menu(menu, origin, self.cursor);
+        }
+        if self.app.take_pending_playlist_context().is_some() {
+            let menu = rustamp_ui::menu::native_playlist_entry_menu();
+            let origin = self
+                .playlist_window
+                .as_ref()
+                .and_then(|window| window.outer_position().ok());
+            self.show_context_menu(menu, origin, self.playlist_cursor);
+        }
+    }
+
+    /// Shows `menu` at `cursor` inside the window at `origin` and runs the
+    /// chosen row.
+    fn show_context_menu(
+        &mut self,
+        menu: rustamp_ui::menu::NativeMainMenu,
+        origin: Option<PhysicalPosition<i32>>,
+        cursor: (i32, i32),
+    ) {
+        #[cfg(windows)]
+        {
+            let Some(origin) = origin else {
+                return;
+            };
+            let point = (origin.x + cursor.0, origin.y + cursor.1);
+            match rustamp_platform::show_popup_menu(self.raw_main_window(), &menu.rows, point) {
+                Ok(None) => {}
+                Ok(Some(id)) => {
+                    if let Some(choice) = menu.choice_for_id(id)
+                        && let Err(error) = self.app.activate_menu_choice(choice)
+                    {
+                        eprintln!("rustamp: menu item failed: {error}");
+                    }
+                }
+                Err(error) => eprintln!("rustamp: no context menu: {error}"),
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (menu, origin, cursor);
+    }
+
     /// Shows the S04 §7 MISC popup; choices use the existing menu dispatch.
     /// Placement at the opening point is our choice, not a measured position.
     fn drain_playlist_misc_menu(&mut self) {
@@ -2120,6 +2222,11 @@ impl Windowed {
                 self.pending_media_pick = Some(kind);
                 true
             }
+            DialogRoute::NativePlaylistPicker => {
+                self.app.close_dialog(kind);
+                self.pending_playlist_pick = true;
+                true
+            }
             DialogRoute::NativePreferences { page } => {
                 self.app.close_dialog(kind);
                 self.pending_prefs = Some(page);
@@ -2424,11 +2531,20 @@ impl Windowed {
         }
         let (width, height) = self.app.library_client_size();
         let title = self.app.library_title();
+        // The window has to fit the screen, or its own close button lies
+        // outside it. The room kept for the frame and the taskbar is our choice.
+        let screen = event_loop
+            .primary_monitor()
+            .map(|monitor| monitor.size())
+            .map_or((u32::MAX, u32::MAX), |size| (size.width, size.height));
+        let width = width.min(screen.0.saturating_sub(32));
+        let height = height.min(screen.1.saturating_sub(96));
         let attributes = crate::modern_shell::modern_window_attributes(
             &title,
             (width, height),
             TaskbarRole::Secondary,
-        );
+        )
+        .with_position(PhysicalPosition::new(8, 32));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -2525,6 +2641,11 @@ impl Windowed {
                 }
                 self.request_library_redraw();
             }
+            // A key still held when the window takes the focus is reported as
+            // a press; it was meant for the window it was pressed in.
+            WindowEvent::KeyboardInput {
+                is_synthetic: true, ..
+            } => {}
             WindowEvent::KeyboardInput { event, .. } => self.library_key_event(&event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             _ => {}
@@ -2538,6 +2659,15 @@ impl Windowed {
     /// text never reaches the list.
     fn library_key_event(&mut self, event: &KeyEvent) {
         if event.state != ElementState::Pressed {
+            return;
+        }
+        // `Alt+L` closes the window it opened (the toggle of the main window).
+        if self.modifiers.alt_key()
+            && let Some(Key::Letter(b'L')) = map_key(event)
+        {
+            if let Err(error) = self.app.key_down(Key::Letter(b'L'), Modifiers::ALT) {
+                eprintln!("rustamp: shortcut dispatch failed: {error}");
+            }
             return;
         }
         if let Some(text) = &event.text
@@ -2715,6 +2845,15 @@ impl Windowed {
                 }
                 self.request_playlist_redraw();
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.app.playlist_wheel(wheel_notches(delta));
+                self.request_playlist_redraw();
+            }
+            // A key still held when the window takes the focus is reported as
+            // a press; it was meant for the window it was pressed in.
+            WindowEvent::KeyboardInput {
+                is_synthetic: true, ..
+            } => {}
             WindowEvent::KeyboardInput { event, .. } => self.playlist_key_event(&event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
@@ -3151,6 +3290,7 @@ impl ApplicationHandler for Windowed {
             WindowEvent::DroppedFile(path) => self.drop_file(path),
             WindowEvent::RedrawRequested => self.paint(),
             WindowEvent::Resized(size) => {
+                self.follow_main_minimized();
                 let (width, height) = self.app.frame_size();
                 if size.width < width || size.height < height {
                     // Never settle below the layout (the DPI-change floor).
@@ -3189,6 +3329,17 @@ impl ApplicationHandler for Windowed {
                 }
                 self.request_redraw();
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Err(error) = self.app.main_wheel(wheel_notches(delta)) {
+                    eprintln!("rustamp: the volume change failed: {error}");
+                }
+                self.request_redraw();
+            }
+            // A key still held when the window takes the focus is reported as
+            // a press; it was meant for the window it was pressed in.
+            WindowEvent::KeyboardInput {
+                is_synthetic: true, ..
+            } => {}
             WindowEvent::KeyboardInput { event, .. } => self.key_event(&event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
@@ -3291,18 +3442,8 @@ impl ApplicationHandler for Windowed {
         self.submit_hotkeys(take_pending_hotkeys());
         #[cfg(windows)]
         self.drain_tray();
-        // A playlist right click already selected its row and recorded the
-        // request for the playlist's context menu (S03 §5). TODO(S04): the
-        // menu — its rows, wording and enabled states — is S04's and is not
-        // invented here; the request is taken once so it cannot leak into a
-        // later tick, and only the diagnostics see it until then.
-        if let Some(request) = self.app.take_pending_playlist_context() {
-            tracing::debug!(
-                row = request.row,
-                entry = request.entry.0,
-                "playlist context menu requested (blocked on S04)"
-            );
-        }
+        self.drain_context_menus();
+        self.drain_playlist_pick();
         // A `--no-audio` run has no device pulling on its own thread, so the
         // virtual clock is driven here, once per frame, exactly as
         // `run_headless` drives it headless. With a real device this is a
@@ -3464,6 +3605,11 @@ impl Windowed {
                 }
                 self.request_redraw_eq();
             }
+            // A key still held when the window takes the focus is reported as
+            // a press; it was meant for the window it was pressed in.
+            WindowEvent::KeyboardInput {
+                is_synthetic: true, ..
+            } => {}
             WindowEvent::KeyboardInput { event, .. } => self.eq_key_event(&event),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
@@ -3550,6 +3696,21 @@ fn map_modifiers(state: ModifiersState) -> Modifiers {
 /// `Shift`+`Tab` that went to the global path would never come back.
 /// `Ctrl`+`Tab` stays global: it is the "switch to the next window" row
 /// (S03 §1 id 40063).
+/// A wheel event as whole notches; a touchpad's small step still counts as one.
+fn wheel_notches(delta: winit::event::MouseScrollDelta) -> i32 {
+    let amount = match delta {
+        winit::event::MouseScrollDelta::LineDelta(_, lines) => lines,
+        winit::event::MouseScrollDelta::PixelDelta(pixels) => pixels.y as f32 / 120.0,
+    };
+    if amount == 0.0 {
+        0
+    } else if amount.abs() < 1.0 {
+        amount.signum() as i32
+    } else {
+        amount.round() as i32
+    }
+}
+
 fn dialog_owns_key(key: Key, modifiers: Modifiers) -> bool {
     key == Key::Tab && !modifiers.ctrl() && !modifiers.alt()
 }
@@ -4768,7 +4929,6 @@ mod tests {
             },
             DialogKind::About,
             DialogKind::FileInfo,
-            DialogKind::LoadPlaylist,
             DialogKind::SkinBrowser,
         ] {
             assert_eq!(

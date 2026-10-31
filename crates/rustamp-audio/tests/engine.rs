@@ -2695,3 +2695,40 @@ fn a_list_of_dead_entries_ends_even_with_repeat_on() {
         .count();
     assert_eq!(errors, 2, "each entry is reported once");
 }
+
+#[test]
+fn play_while_playing_restarts_the_track() {
+    // S03 §5: "Click the play button: play / restart".
+    let mut h = Harness::new(&[LONG_A, LONG_B]);
+    h.engine.play().unwrap();
+    assert!(h.wait_track(0));
+    assert!(h.seek_and_settle(20_000));
+    h.engine.apply(&Command::Play).unwrap();
+    assert!(h.wait_pumping(
+        |e| e.transport() == TransportState::Playing && e.position_frames() < 20_000,
+        WAIT
+    ));
+    assert_eq!(h.engine.current_index(), Some(0));
+}
+
+#[test]
+fn next_on_the_last_entry_of_a_paused_list_changes_nothing() {
+    let mut h = Harness::new(&[LONG_A]);
+    h.engine.play().unwrap();
+    assert!(h.wait_track(0));
+    h.engine.pause().unwrap();
+    h.engine.next_track().unwrap();
+    assert!(
+        !h.wait_idle(|e| e.end_of_stream().is_some(), Duration::from_millis(100)),
+        "the run does not end behind the pause"
+    );
+    h.engine.play().unwrap();
+    assert!(
+        !h.wait_idle(
+            |e| e.transport() == TransportState::Stopped,
+            Duration::from_millis(100)
+        ),
+        "the resume plays on instead of stopping"
+    );
+    assert_eq!(h.engine.current_index(), Some(0));
+}
