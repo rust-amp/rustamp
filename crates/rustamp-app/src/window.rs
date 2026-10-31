@@ -3933,9 +3933,48 @@ fn map_key(event: &KeyEvent) -> Option<Key> {
         }
     }
     match event.physical_key {
-        PhysicalKey::Code(code) => map_key_code(code),
+        PhysicalKey::Code(code) => map_key_code(code).or_else(|| physical_letter(code)),
         PhysicalKey::Unidentified(_) => None,
     }
+}
+
+/// The letter a key stands for when its logical key is not one.
+///
+/// On a German layout `Ctrl`+`Alt` is `AltGr`, so `Ctrl`+`Alt`+`I` reports no
+/// character and `Ctrl`+`Alt`+`E` reports the euro sign. Without this, none of
+/// S03's `Ctrl`+`Alt` letter chords would reach the shortcut table there. A
+/// layout without Latin letters gets its shortcuts the same way.
+fn physical_letter(code: KeyCode) -> Option<Key> {
+    let letter = match code {
+        KeyCode::KeyA => 'A',
+        KeyCode::KeyB => 'B',
+        KeyCode::KeyC => 'C',
+        KeyCode::KeyD => 'D',
+        KeyCode::KeyE => 'E',
+        KeyCode::KeyF => 'F',
+        KeyCode::KeyG => 'G',
+        KeyCode::KeyH => 'H',
+        KeyCode::KeyI => 'I',
+        KeyCode::KeyJ => 'J',
+        KeyCode::KeyK => 'K',
+        KeyCode::KeyL => 'L',
+        KeyCode::KeyM => 'M',
+        KeyCode::KeyN => 'N',
+        KeyCode::KeyO => 'O',
+        KeyCode::KeyP => 'P',
+        KeyCode::KeyQ => 'Q',
+        KeyCode::KeyR => 'R',
+        KeyCode::KeyS => 'S',
+        KeyCode::KeyT => 'T',
+        KeyCode::KeyU => 'U',
+        KeyCode::KeyV => 'V',
+        KeyCode::KeyW => 'W',
+        KeyCode::KeyX => 'X',
+        KeyCode::KeyY => 'Y',
+        KeyCode::KeyZ => 'Z',
+        _ => return None,
+    };
+    Key::letter(letter)
 }
 
 /// The `WM_COMMAND` seam of the classic windows that are not the main one.
@@ -4206,6 +4245,13 @@ mod window_probe;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_letter_key_is_its_letter_when_the_layout_gives_none() {
+        assert_eq!(physical_letter(KeyCode::KeyI), Key::letter('I'));
+        assert_eq!(physical_letter(KeyCode::KeyZ), Key::letter('Z'));
+        assert_eq!(physical_letter(KeyCode::Digit1), None);
+    }
+
     /// The three classic windows carry the ABI classes of S09 §1 (S01 §1 names
     /// them); the dialog does not. Pinned here because a window's class cannot
     /// be read back without opening one, and the capture harness finds the
