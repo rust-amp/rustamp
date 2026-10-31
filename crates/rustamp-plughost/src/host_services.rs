@@ -45,13 +45,9 @@ pub const IPC_GET_D3DX9: u32 = 3044;
 /// IPC id: the wide title of a playlist position, as a pointer to a wide string
 /// that stays valid for the call; asked every frame by MilkDrop.
 pub const IPC_GETPLAYLISTTITLEW: u32 = 213;
-/// IPC id 505: asks for a function that embeds a window in the host (the
-/// answer is called as a function when it is not 0). **Not in S21**: found when
-/// MilkDrop ran past its start-up checks (it called the answer 1 of the 2.95
-/// surface as a function and faulted at address 1). The host has no embedding
-/// service, so the answer is **0**, "none": own choice, a reading of what a
-/// plug-in that tests the answer does. The 2.95 answer of S10 (1) stays for the
-/// player's own window.
+/// IPC id 505: asks for a function that embeds a window in the host; the answer
+/// is called as a function when it is not 0 (see [`crate::embed_frame`]). The 2.95
+/// answer of S10 (1) stays for the player's own window.
 pub const IPC_GET_EMBEDIF: u32 = 505;
 
 /// What the generic call is asked about (S21 §3 and §5.1).
@@ -655,7 +651,7 @@ fn next_random() -> u32 {
 pub fn ipc_answer(id: u32, wparam: usize) -> Option<usize> {
     Some(match id {
         IPC_GET_API_SERVICE => service_manager() as usize,
-        IPC_GET_EMBEDIF => 0,
+        IPC_GET_EMBEDIF => crate::embed_frame::embed_function(),
         IPC_GETINIFILE => paths().file_ansi.as_ptr() as usize,
         IPC_GETINIDIRECTORY => paths().directory_ansi.as_ptr() as usize,
         IPC_GETINIFILEW => paths().file_wide.as_ptr() as usize,
@@ -1013,9 +1009,12 @@ mod tests {
     }
 
     #[test]
-    fn the_embedding_request_is_answered_with_none_not_with_one() {
-        // A plug-in that gets 1 calls address 1; "no embedding" is 0.
-        assert_eq!(ipc_answer(IPC_GET_EMBEDIF, 0), Some(0));
+    fn the_embedding_request_is_answered_with_the_function() {
+        // A plug-in that gets 1 calls address 1.
+        assert_eq!(
+            ipc_answer(IPC_GET_EMBEDIF, 0),
+            Some(crate::embed_frame::embed_function())
+        );
     }
 
     #[test]
