@@ -212,6 +212,12 @@ impl App {
                 self.submit(command.clone())?;
                 Ok(Some(MenuOutcome::Commands(vec![command])))
             }
+            rustamp_ui::menu::MenuChoice::NoAction { label: "MilkDrop" } => {
+                // The player's own MilkDrop: see `crate::milkdrop_window`.
+                let command = Command::ToggleWindow(crate::milkdrop_window::MILKDROP_WINDOW_ID);
+                self.submit(command.clone())?;
+                Ok(Some(MenuOutcome::Commands(vec![command])))
+            }
             rustamp_ui::menu::MenuChoice::NoAction {
                 label: "Minibrowser",
             } => {

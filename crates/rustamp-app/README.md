@@ -18,8 +18,9 @@ rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <path>]
 The `/`-switches are the reference switches of `specs/S13-command-line.md`:
 `/CLASS=` is the window class the single-instance check looks for, `/CONFIG=`
 the configuration file to use instead of the default, `/BOOKMARK` adds a path
-as a bookmark rather than playing it, `/ADD` enqueues a path rather than
-playing it (the `Enqueue` verb of S13 §3), and `/INSTALL`, `/UNREG`, `/NOREG`
+as a bookmark rather than playing it, `/ADD` appends a path to the list (the
+`Enqueue` verb of S13 §3): a running instance only appends and starts nothing,
+a first start then plays the list from its first entry, and `/INSTALL`, `/UNREG`, `/NOREG`
 and `/ONLYINSTALL` drive the shell registration (the verbs a drop from
 Explorer offers). An unknown `/`-token is a file argument, as in the spec. The
 `--`-switches are Rustamp's own test and convenience aids.

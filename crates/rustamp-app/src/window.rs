@@ -98,6 +98,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
+mod milkdrop;
+
 use crate::app::{App, WindowDirty};
 use crate::clipboard::Clipboard;
 use crate::cursor::{CursorAction, SkinCursors, cursor_action};
@@ -544,6 +546,8 @@ struct Windowed {
     /// resizable, and it is not part of the docked stack.
     library_window: Option<Arc<Window>>,
     library_surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// The player's own MilkDrop window (`window/milkdrop.rs`).
+    milkdrop: milkdrop::MilkdropPresenter,
     /// The library window's caption last applied.
     ///
     /// The caption carries the scan's progress, so it changes while a scan
@@ -652,6 +656,7 @@ impl Windowed {
             dialog_awaits_press: false,
             library_window: None,
             library_surface: None,
+            milkdrop: milkdrop::MilkdropPresenter::default(),
             applied_library_title: None,
             pending_media_pick: None,
             pending_prefs: None,
@@ -869,6 +874,7 @@ impl Windowed {
             Some(CoreWindowId::Equalizer) => self.eq_window.as_ref(),
             Some(CoreWindowId::Playlist) => self.playlist_window.as_ref(),
             Some(CoreWindowId::Gen(_)) => self.library_window.as_ref(),
+            Some(CoreWindowId::Vis) => self.milkdrop.window.as_ref(),
             _ => None,
         };
         if let Some(window) = window {
@@ -3366,6 +3372,15 @@ impl ApplicationHandler for Windowed {
             self.library_event(event_loop, event);
             return;
         }
+        if self
+            .milkdrop
+            .window
+            .as_ref()
+            .is_some_and(|window| window.id() == id)
+        {
+            self.milkdrop_event(event_loop, event);
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.app.request_quit();
@@ -3583,6 +3598,8 @@ impl ApplicationHandler for Windowed {
         self.sync_library_window(event_loop);
         // Its caption carries the scan's progress.
         self.sync_library_title();
+        // The player's own MilkDrop follows its model and paints new frames.
+        self.sync_milkdrop_window(event_loop);
         self.apply_docking_positions();
         // The frame of this tick, painted here rather than asked for: see
         // [`Windowed::present_frames`].

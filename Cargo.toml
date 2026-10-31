@@ -79,6 +79,11 @@ lofty = "0.25"
 winit = "0.30"
 softbuffer = "0.4"
 rubato = "5"
+# Native MilkDrop: the engine, the GPU API it renders with, and what it needs from us.
+lactea = "=0.2.2"
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
+pollster = "0.4"
+walkdir = "2"
 
 # A release build is what users run, so it is optimised for the audio path:
 # one codegen unit so LLVM can inline across crates, thin LTO so the link

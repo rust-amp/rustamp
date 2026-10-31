@@ -20,7 +20,8 @@
 //! Release layout ships:
 //! - Root: manifest.json (schema 3), QUICKSTART.md, README.md, THIRD_PARTY.md.
 //! - Player: rustamp.exe, residents, bundled host, LICENSE, PLUGIN-EXCEPTION.md,
-//!   THIRD_PARTY.md (with GPL source offer, static CRT terms, webamp MIT, symphonia MPL),
+//!   THIRD_PARTY.md (with GPL source offer, static CRT terms, webamp MIT, symphonia MPL,
+//!   lactea MIT/Apache-2.0 and its Nullsoft BSD-3-Clause notice),
 //!   manifest.json, QUICKSTART.md.
 //! - Host: rustamp-plughost32.exe, LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY.md
 //!   (permissive closure inventory only, no GPL/copyleft), manifest.json.
@@ -469,7 +470,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         )?;
 
         // Ship player-side third-party notices (GPL source offer, static CRT terms,
-        // webamp MIT, Symphonia MPL-2.0, permissive licenses, dependency inventory).
+        // webamp MIT, Symphonia MPL-2.0, lactea with its Nullsoft BSD-3-Clause notice,
+        // permissive licenses, dependency inventory).
         let player_notices = player_third_party_notices(&root, &meta)?;
         fs::write(dir.join("THIRD_PARTY.md"), player_notices)
             .map_err(|e| format!("write player THIRD_PARTY.md: {e}"))?;
@@ -1500,8 +1502,10 @@ fn ensure_trailing_newline(text: &str) -> String {
 /// 2. Static Microsoft MSVC CRT redistribution terms.
 /// 3. Webamp classic skin tables MIT attribution.
 /// 4. Symphonia MPL-2.0 notice, source availability, and full license text.
-/// 5. Canonical permissive open source licenses (MIT, Apache-2.0, BSD-2/3, ISC, Zlib).
-/// 6. Complete Cargo.lock license inventory from the repository records.
+/// 5. Lactea 0.2.2 notice and the Nullsoft BSD-3-Clause notice of its copied
+///    MilkDrop 2 files.
+/// 6. Canonical permissive open source licenses (MIT, Apache-2.0, BSD-2/3, ISC, Zlib).
+/// 7. Complete Cargo.lock license inventory from the repository records.
 fn player_third_party_notices(root: &Path, meta: &ReleaseMetadata) -> Result<String, String> {
     let inventory = extract_cargo_inventory(root)?;
     let mut out = String::new();
@@ -1566,7 +1570,36 @@ fn player_third_party_notices(root: &Path, meta: &ReleaseMetadata) -> Result<Str
          {mpl}\
          ```\n\n\
          ---\n\n\
-         ## 5. Permissive Open Source License Texts\n\n\
+         ## 5. MilkDrop Engine: Lactea 0.2.2 (MIT OR Apache-2.0 and BSD-3-Clause)\n\n\
+         The player's own MilkDrop visualizer (`rustamp-milkdrop`) is built on the Lactea\n\
+         engine, version 0.2.2 (https://github.com/M0Rf30/lactea, crates.io), used with the\n\
+         owner's approval. Lactea is licensed under MIT OR Apache-2.0 (its MIT text is in\n\
+         section 6). Eighteen `lactea-render` source files and the MilkDrop 2 `include.fx`\n\
+         copied into `lactea-hlsl` carry the additional Nullsoft BSD-3-Clause notice, which\n\
+         must ship with the player and follows verbatim:\n\n\
+         ```text\n\
+         Copyright 2005-2013 Nullsoft, Inc.\n\
+         All rights reserved.\n\n\
+         Redistribution and use in source and binary forms, with or without modification,\n\
+         are permitted provided that the following conditions are met:\n\n\
+           * Redistributions of source code must retain the above copyright notice,\n\
+             this list of conditions and the following disclaimer.\n\n\
+           * Redistributions in binary form must reproduce the above copyright notice,\n\
+             this list of conditions and the following disclaimer in the documentation\n\
+             and/or other materials provided with the distribution.\n\n\
+           * Neither the name of Nullsoft nor the names of its contributors may be used to\n\
+             endorse or promote products derived from this software without specific prior written permission.\n\n\
+         THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\" AND ANY EXPRESS OR\n\
+         IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND\n\
+         FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR\n\
+         CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL\n\
+         DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,\n\
+         DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER\n\
+         IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT\n\
+         OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n\
+         ```\n\n\
+         ---\n\n\
+         ## 6. Permissive Open Source License Texts\n\n\
          ### The MIT License\n\n\
          Permission is hereby granted, free of charge, to any person obtaining a copy\n\
          of this software and associated documentation files (the \"Software\"), to deal\n\
@@ -1641,10 +1674,10 @@ fn player_third_party_notices(root: &Path, meta: &ReleaseMetadata) -> Result<Str
             be misrepresented as being the original software.\n\
          3. This notice may not be removed or altered from any source distribution.\n\n\
          ---\n\n\
-         ## 6. Complete Cargo Dependency Inventory\n\n\
+         ## 7. Complete Cargo Dependency Inventory\n\n\
          {inventory}\n\n\
          ---\n\n\
-         ## 7. Installer\n\n\
+         ## 8. Installer\n\n\
          The Windows installer (`*-setup.exe`) and its `uninstall.exe` are built with NSIS\n\
          (https://nsis.sourceforge.io), Copyright (C) 1999-2026 Contributors, under the\n\
          zlib/libpng license; its LZMA module is under the Common Public License 1.0 with\n\

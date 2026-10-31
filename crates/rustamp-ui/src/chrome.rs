@@ -33,6 +33,10 @@ const TITLE_FONT_SIZE: u32 = 13;
 /// The padding of the title's plate, on each side of the text.
 const PLATE_PAD: u32 = 8;
 
+/// The margin of a message, and the height of its lines.
+const MESSAGE_MARGIN: i32 = 12;
+const MESSAGE_LINE: u32 = 16;
+
 /// Whether `(x, y)` lies on the close button of a window `width` pixels wide.
 /// The button takes a little more than its cell, so it is easy to hit.
 pub fn hits_close(width: u32, x: i32, y: i32) -> bool {
@@ -132,6 +136,52 @@ pub fn draw_title_bar(canvas: &mut Image, skin: &Skin, title: &str, focused: boo
     }
 }
 
+/// Draws `text` across `canvas` from `top` down, wrapped to the canvas: what a
+/// window of ours says when it has nothing else to show.
+pub fn draw_message(canvas: &mut Image, skin: &Skin, text: &str, top: i32) {
+    let font = SystemFont {
+        family: playlist_font::DEFAULT_FAMILY,
+        size: TITLE_FONT_SIZE,
+        bold: false,
+        italic: false,
+    };
+    let colour = skin.pledit().normal;
+    let room = canvas.width().saturating_sub(2 * MESSAGE_MARGIN as u32);
+    let measure = |line: &str| playlist_font::text_width(font, line).unwrap_or(0);
+    for (row, line) in wrap(text, room, measure).iter().enumerate() {
+        let width = measure(line).max(1);
+        if let Some(image) =
+            playlist_font::render(font, line, width, MESSAGE_LINE, colour, [0, 0, 0])
+        {
+            let y = top + row as i32 * MESSAGE_LINE as i32;
+            canvas.blit_alpha(&image, image.bounds(), MESSAGE_MARGIN, y);
+        }
+    }
+}
+
+/// Breaks `text` into lines no wider than `room`, at spaces. A single word wider
+/// than that keeps a line of its own.
+fn wrap(text: &str, room: u32, measure: impl Fn(&str) -> u32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if measure(&candidate) <= room || line.is_empty() {
+            line = candidate;
+        } else {
+            lines.push(std::mem::replace(&mut line, word.to_owned()));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 fn pledit_sheet(skin: &Skin) -> Option<Image> {
     let raster = skin.sheet(Sheet::Pledit)?;
     Image::from_rgba(raster.width(), raster.height(), raster.as_rgba().to_vec()).ok()
@@ -146,6 +196,18 @@ mod tests {
         assert!(hits_close(400, 393, 7));
         assert!(!hits_close(400, 300, 7));
         assert!(!hits_close(400, 393, 15));
+    }
+
+    #[test]
+    fn a_message_is_wrapped_at_spaces_to_the_room() {
+        let by_length = |line: &str| line.len() as u32;
+        assert_eq!(wrap("one two three", 7, by_length), ["one two", "three"]);
+        assert_eq!(wrap("  ", 7, by_length), Vec::<String>::new());
+        assert_eq!(
+            wrap("a incrediblylongword b", 5, by_length),
+            ["a", "incrediblylongword", "b"],
+            "a word that does not fit keeps a line of its own"
+        );
     }
 
     #[test]
