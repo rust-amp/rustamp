@@ -799,3 +799,199 @@ fn the_cable_carries_the_fixture_tone() {
     assert_eq!(engine.last_error(), Some(&expected_flush_error));
     assert_eq!(engine.transport(), TransportState::Stopped);
 }
+
+// ----- the equalizer, measured on the cable -----
+
+/// The tone's amplitude in the generated file: leaves room for a 12 dB boost.
+const EQ_TONE_AMPLITUDE: f64 = 0.05;
+
+/// How long each generated tone plays.
+const EQ_TONE_SECONDS: f64 = 1.0;
+
+/// Analysis window for the equalizer: whole cycles of every band's centre.
+const EQ_WINDOW_SECONDS: f64 = 0.1;
+
+/// Writes `seconds` of a sine at `hz` as a 16-bit stereo WAV file.
+fn write_tone(path: &std::path::Path, hz: f64, seconds: f64) {
+    const RATE: u32 = 44_100;
+    let frames = (f64::from(RATE) * seconds) as u32;
+    let data_len = frames * 4;
+    let mut bytes = Vec::with_capacity(44 + data_len as usize);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&RATE.to_le_bytes());
+    bytes.extend_from_slice(&(RATE * 4).to_le_bytes());
+    bytes.extend_from_slice(&4u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_len.to_le_bytes());
+    for frame in 0..frames {
+        let phase = 2.0 * std::f64::consts::PI * hz * f64::from(frame) / f64::from(RATE);
+        let sample = (phase.sin() * EQ_TONE_AMPLITUDE * 32767.0) as i16;
+        bytes.extend_from_slice(&sample.to_le_bytes());
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    std::fs::write(path, bytes).expect("writing the generated tone");
+}
+
+/// Plays `track` into the cable with `eq` applied and returns the median
+/// amplitude of the tone at `hz` in the recording, on the first channel.
+///
+/// The median of the windows that hold the tone: the onset and the end straddle
+/// a window, and they must not move the level.
+fn measured_level(track: &std::path::Path, hz: f64, eq: &[rustamp_core::command::Command]) -> f64 {
+    // A natural end closes a cpal output (see the test above), so every
+    // measurement has its own engine.
+    let output = Box::new(CpalOutput::with_device_name(CABLE_MATCH));
+    let mut engine = Engine::new(
+        rustamp_decoders::default_registry(),
+        output,
+        EventBus::new(),
+        EngineConfig::default(),
+    )
+    .expect("the playback endpoint of the cable");
+    assert!(is_cable_device(engine.output_name()));
+    let granted = engine.device_spec();
+    for command in eq {
+        engine.apply(command).expect("applying the equalizer");
+    }
+
+    let host = cpal::default_host();
+    let capture = find_input_device(&host, CABLE_MATCH);
+    let (config, format) = pick_capture_config(&capture, granted.sample_rate);
+    let rate = config.sample_rate;
+    let channels = usize::from(config.channels);
+    let recording = Arc::new(Mutex::new(Recording::default()));
+    let stream = start_capture(&capture, config, format, &recording);
+    let pre_roll = (f64::from(rate) * PRE_ROLL.as_secs_f64()) as usize;
+    let start = Instant::now();
+    while recorded_frames(&recording, channels) < pre_roll {
+        assert!(start.elapsed() < DEADLINE, "the capture is not running");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    let mark = recorded_frames(&recording, channels);
+
+    engine.set_queue(vec![TrackSource::path(track.to_path_buf())]);
+    engine
+        .play_index(0)
+        .expect("starting playback on the cable");
+    let start = Instant::now();
+    while engine.transport() != TransportState::Stopped {
+        engine.poll().expect("polling the engine");
+        assert!(start.elapsed() < DEADLINE, "the tone never finished");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    let wanted = mark + (f64::from(rate) * (EQ_TONE_SECONDS + TAIL.as_secs_f64())) as usize;
+    let start = Instant::now();
+    while recorded_frames(&recording, channels) < wanted {
+        assert!(start.elapsed() < DEADLINE, "the capture stalled");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    drop(stream);
+
+    let recording = std::mem::take(&mut *recording.lock().expect("the capture lock"));
+    assert_eq!(recording.fatal_error, None, "the capture failed");
+    let mono: Vec<f32> = recording
+        .samples
+        .chunks_exact(channels)
+        .skip(mark)
+        .map(|frame| frame[0])
+        .collect();
+    let window = (f64::from(rate) * EQ_WINDOW_SECONDS).round() as usize;
+    let mut levels: Vec<f64> = mono
+        .chunks_exact(window)
+        .map(|chunk| tone_in_window(chunk, f64::from(rate), hz))
+        .filter(|(amplitude, ratio)| *ratio >= MIN_TONE_RATIO && *amplitude > 0.001)
+        .map(|(amplitude, _)| amplitude)
+        .collect();
+    assert!(
+        levels.len() >= 5,
+        "only {} windows hold the {hz} Hz tone (engine error {:?})",
+        levels.len(),
+        engine.last_error()
+    );
+    levels.sort_by(f64::total_cmp);
+    levels[levels.len() / 2]
+}
+
+fn decibels(level: f64, reference: f64) -> f64 {
+    20.0 * (level / reference).log10()
+}
+
+/// The equalizer changes what reaches the device: every band lifts its own
+/// centre by what it says, leaves a far tone alone, and the switch and the
+/// preamp do what they say. The tolerance covers the shared-mode path, and the
+/// comparison is a ratio, so the endpoint volume does not enter it.
+#[test]
+#[ignore = "VM-only: needs the VB-Audio Virtual Cable; run inside the headless test VM"]
+fn the_cable_carries_what_the_equalizer_says() {
+    use rustamp_core::command::Command;
+    use rustamp_dsp::eq::BAND_CENTERS_HZ;
+
+    rustamp_app::window::require_test_vm();
+    const TOLERANCE_DB: f64 = 1.0;
+    let dir = tempfile::tempdir().unwrap();
+    let on = Command::SetEqEnabled(true);
+    let mut results = Vec::new();
+
+    for (band, &hz) in BAND_CENTERS_HZ.iter().enumerate() {
+        let track = dir.path().join(format!("band{band}.wav"));
+        write_tone(&track, hz, EQ_TONE_SECONDS);
+        let flat = measured_level(&track, hz, std::slice::from_ref(&on));
+        for gain_db in [12.0f32, -12.0] {
+            let set = Command::SetBand {
+                band: band as u8,
+                gain_db,
+            };
+            let level = measured_level(&track, hz, &[on.clone(), set]);
+            results.push((band, hz, gain_db, decibels(level, flat)));
+        }
+    }
+    let report = results
+        .iter()
+        .map(|(band, hz, want, got)| format!("band {band} ({hz} Hz) {want:+} dB: {got:+.2} dB"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    println!("{report}");
+    for (_, _, want, got) in &results {
+        assert!(
+            (f64::from(*want) - got).abs() <= TOLERANCE_DB,
+            "a band does not give what it says:\n{report}"
+        );
+    }
+
+    // A band far from the tone leaves it alone, and so does a switched-off
+    // equalizer, however its bands stand.
+    let hz = 1000.0;
+    let track = dir.path().join("far.wav");
+    write_tone(&track, hz, EQ_TONE_SECONDS);
+    let flat = measured_level(&track, hz, std::slice::from_ref(&on));
+    let boost = |band: u8| Command::SetBand {
+        band,
+        gain_db: 12.0,
+    };
+    let far = measured_level(&track, hz, &[on.clone(), boost(0)]);
+    assert!(
+        decibels(far, flat).abs() <= TOLERANCE_DB / 2.0,
+        "60 Hz moved a 1 kHz tone by {:+.2} dB",
+        decibels(far, flat)
+    );
+    let off = measured_level(&track, hz, &[boost(4), Command::SetEqEnabled(false)]);
+    assert!(
+        decibels(off, flat).abs() <= TOLERANCE_DB / 2.0,
+        "a switched-off equalizer moved the tone by {:+.2} dB",
+        decibels(off, flat)
+    );
+
+    // The preamp moves everything.
+    let preamp = measured_level(&track, hz, &[on.clone(), Command::SetPreamp(-6.0)]);
+    assert!(
+        (decibels(preamp, flat) + 6.0).abs() <= TOLERANCE_DB,
+        "a -6 dB preamp gave {:+.2} dB",
+        decibels(preamp, flat)
+    );
+}

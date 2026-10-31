@@ -271,12 +271,13 @@ impl PluginRegistry {
     /// Read the allowlist from `path`, or an empty one when no path was given.
     ///
     /// `None` means the operator named no store: the result approves nothing,
-    /// which is the safe default, not an error. A path that cannot be read or
+    /// which is the safe default, not an error. So does a file that does not
+    /// exist yet, which is every fresh install. A file that cannot be read or
     /// parsed yields [`Self::unavailable`] — never a silent empty allowlist.
     pub fn from_store_path(path: Option<&Path>) -> Self {
         match path {
             None => Self::new(ApprovalStore::new()),
-            Some(path) => match ApprovalStore::load_from_file(path) {
+            Some(path) => match ApprovalStore::open_or_empty(path) {
                 Ok(store) => Self::new(store),
                 Err(error) => {
                     Self::unavailable(format!("{} could not be read: {error}", path.display()))
