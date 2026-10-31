@@ -1214,8 +1214,36 @@ fn the_cable_carries_what_an_input_plugin_decodes() {
             dll.display()
         );
     }
+}
 
-    // in_openmpt plays a format the player has no decoder for.
+/// `in_openmpt` plays a format the player has no decoder for.
+#[test]
+#[ignore = "VM-only: runs a real input plug-in and needs the VB-Audio Virtual Cable"]
+fn the_cable_carries_a_module_through_in_openmpt() {
+    use rustamp_app::dsp::DspChain;
+    use rustamp_app::plugin_input::factory;
+    use rustamp_core::audio::DecoderRegistry;
+
+    rustamp_app::window::require_test_vm();
+    // SAFETY: as in `the_cable_carries_what_an_input_plugin_decodes`.
+    unsafe {
+        std::env::set_var(
+            "RUSTAMP_HOST_TRACE",
+            r"C:\rustamp\out\gui-session\input-trace.txt",
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
+    let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
+        .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
+    let only = |dll: &std::path::Path| {
+        let mut registry = DecoderRegistry::new();
+        registry.register(
+            factory(helper.clone(), dll, &approved(dir.path(), dll))
+                .expect("the plug-in's factory"),
+        );
+        registry
+    };
     let module = dir.path().join("tone.mod");
     std::fs::write(&module, tiny_module()).unwrap();
     let dll = plugins

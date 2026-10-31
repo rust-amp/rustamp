@@ -374,6 +374,11 @@ mod windows_filter {
             None => len,
         };
         write_stderr(&buffer[..len]);
+        // A helper's standard error goes nowhere, and a trace that was asked
+        // for must not end in a silent `->` line.
+        if let Ok(line) = std::str::from_utf8(&buffer[..len]) {
+            super::trace_event(line.trim_end());
+        }
         // The supervisor reads this exit code and knows that the host caught a
         // plugin fault (see `crate::restart`).
         let _ = unsafe { TerminateProcess(GetCurrentProcess(), PLUGIN_FAULT_EXIT_CODE) };
