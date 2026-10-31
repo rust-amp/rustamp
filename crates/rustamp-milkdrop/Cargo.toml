@@ -1,6 +1,6 @@
 [package]
 name = "rustamp-milkdrop"
-description = "Rustamp: Native MilkDrop 2 port (butterchurn-derived): presets, expression engine, warp/comp shaders and blending on wgpu."
+description = "Rustamp: the player's own MilkDrop visualizer: preset discovery and selection, the audio feed and a render worker around the lactea engine on wgpu."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,3 +10,16 @@ rust-version.workspace = true
 
 [dependencies]
 rustamp-core.workspace = true
+lactea.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+walkdir.workspace = true
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+# Textures presets name from their folder. The same crate the media library
+# uses for its artwork, with the two formats presets add.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "tga"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+png.workspace = true

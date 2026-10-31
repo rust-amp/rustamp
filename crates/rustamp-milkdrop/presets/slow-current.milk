@@ -1,0 +1,40 @@
+[preset00]
+MILKDROP_PRESET_VERSION=201
+PSVERSION=0
+fRating=3
+fDecay=0.98
+fGammaAdj=1.3
+fVideoEchoZoom=1.01
+fVideoEchoAlpha=0.35
+nVideoEchoOrientation=1
+nWaveMode=6
+bAdditiveWaves=0
+fWaveAlpha=0.7
+fWaveScale=1.0
+fWarpAmount=1.4
+fWarpScale=0.8
+fWarpAnimSpeed=0.5
+zoom=1.0
+sx=1.002
+sy=0.998
+wave_r=0.2
+wave_g=0.6
+wave_b=0.9
+wave_x=0.5
+wave_y=0.5
+wavecode_0_enabled=1
+wavecode_0_samples=256
+wavecode_0_bSpectrum=1
+wavecode_0_bAdditive=1
+wavecode_0_scaling=0.8
+wavecode_0_smoothing=0.5
+wavecode_0_r=0.9
+wavecode_0_g=0.5
+wavecode_0_b=0.2
+wavecode_0_a=0.8
+wave_0_per_point1=x = sample;
+wave_0_per_point2=y = 0.2 + 0.4*value1;
+per_frame_1=wave_x = 0.5 + 0.2*sin(time*0.21);
+per_frame_2=wave_y = 0.5 + 0.2*cos(time*0.27);
+per_frame_3=decay = 0.975 + 0.01*sin(time*0.13);
+per_pixel_1=sx = sx + 0.01*sin(y*6 + time*0.5)*mid_att;

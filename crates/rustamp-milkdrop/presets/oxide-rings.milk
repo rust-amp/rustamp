@@ -1,0 +1,53 @@
+[preset00]
+MILKDROP_PRESET_VERSION=201
+PSVERSION=0
+fRating=3
+fDecay=0.975
+fGammaAdj=1.4
+nWaveMode=0
+bAdditiveWaves=1
+bMaximizeWaveColor=1
+fWaveAlpha=0.8
+fWaveScale=1.1
+zoom=0.995
+rot=0.004
+wave_r=0.4
+wave_g=0.8
+wave_b=0.7
+wave_x=0.5
+wave_y=0.5
+ob_size=0.01
+ob_r=0.55
+ob_g=0.25
+ob_b=0.1
+ob_a=0.35
+per_frame_init_1=phase = 0;
+per_frame_1=phase = phase + 0.01 + 0.04*mid_att;
+per_frame_2=wave_r = 0.5 + 0.5*sin(phase);
+per_frame_3=wave_g = 0.5 + 0.5*sin(phase*1.31 + 2);
+per_frame_4=wave_b = 0.5 + 0.5*sin(phase*0.77 + 4);
+per_frame_5=q1 = bass_att;
+per_pixel_1=dx = 0.006*sin(ang*3 + time)*q1;
+per_pixel_2=dy = 0.006*cos(ang*3 - time)*q1;
+shapecode_0_enabled=1
+shapecode_0_sides=6
+shapecode_0_additive=1
+shapecode_0_thickOutline=1
+shapecode_0_x=0.5
+shapecode_0_y=0.5
+shapecode_0_rad=0.12
+shapecode_0_ang=0
+shapecode_0_r=0.9
+shapecode_0_g=0.4
+shapecode_0_b=0.1
+shapecode_0_a=0.5
+shapecode_0_r2=0.1
+shapecode_0_g2=0.2
+shapecode_0_b2=0.4
+shapecode_0_a2=0
+shapecode_0_border_r=1
+shapecode_0_border_g=0.7
+shapecode_0_border_b=0.3
+shapecode_0_border_a=0.8
+shape_0_per_frame1=rad = 0.08 + 0.12*bass_att;
+shape_0_per_frame2=ang = time*0.4;
