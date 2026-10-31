@@ -24,12 +24,12 @@ fn decode(bytes: &[u8]) -> Message {
 const HOSTING_VARIANT_COUNT: usize = 13;
 
 #[test]
-fn protocol_version_is_six() {
-    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 6);
+fn protocol_version_is_seven() {
+    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 7);
     assert_eq!(
         rustamp_ipc::Message::hello(),
         rustamp_ipc::Message::Hello {
-            protocol_version: 6,
+            protocol_version: 7,
             pid: std::process::id(),
         }
     );
@@ -388,10 +388,12 @@ fn total_message_variant_count() {
     // Pre-0006: 15 variants (0..14)
     // Hosting block: 13 variants (15..27) - RFC 0006's twelve plus RFC
     // 0015's DspResetAck beside DspReset, which moved DspError to 27
-    // Total: 28 variants (0..27)
+    // The track plug-ins read: NowPlaying at 28
+    // RFC 0024: EmbedSkin at 29, OutputClock at 30
+    // Total: 31 variants (0..30)
     let all_indices: std::collections::BTreeSet<u8> = [
         Message::Hello {
-            protocol_version: 6,
+            protocol_version: 7,
             pid: 0,
         },
         Message::Ping(0),
@@ -484,12 +486,41 @@ fn total_message_variant_count() {
         Message::DspError {
             message: "x".into(),
         },
+        Message::NowPlaying {
+            position: 0,
+            title: "x".into(),
+            file: "x".into(),
+        },
+        Message::EmbedSkin {
+            width: 0,
+            height: 0,
+            rgba: vec![],
+        },
+        Message::OutputClock { played_ms: 0 },
     ]
     .iter()
     .map(|msg| encode(msg)[0])
     .collect();
 
-    assert_eq!(all_indices.len(), 28, "exactly 28 variants (0..27)");
+    assert_eq!(all_indices.len(), 31, "exactly 31 variants (0..30)");
     assert_eq!(all_indices.iter().next(), Some(&0x00));
-    assert_eq!(all_indices.iter().next_back(), Some(&0x1b));
+    assert_eq!(all_indices.iter().next_back(), Some(&0x1e));
+}
+
+#[test]
+fn the_output_clock_round_trips() {
+    let message = Message::OutputClock { played_ms: 90_061 };
+    let bytes = rustamp_ipc::encode(&message).unwrap();
+    assert_eq!(rustamp_ipc::decode(&bytes).unwrap(), message);
+}
+
+#[test]
+fn the_embed_skin_round_trips() {
+    let message = Message::EmbedSkin {
+        width: 2,
+        height: 1,
+        rgba: vec![1, 2, 3, 255, 4, 5, 6, 255],
+    };
+    let bytes = rustamp_ipc::encode(&message).unwrap();
+    assert_eq!(rustamp_ipc::decode(&bytes).unwrap(), message);
 }

@@ -43,6 +43,8 @@ pub mod input_resident;
 pub mod ipc;
 pub mod loader;
 pub mod message_loop;
+#[cfg(any(windows, test))]
+pub mod os_version;
 pub mod pe_preflight;
 pub mod plugin_commands;
 pub mod registry;

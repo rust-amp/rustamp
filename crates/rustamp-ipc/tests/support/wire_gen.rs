@@ -24,8 +24,8 @@ use rustamp_proto::meta::TrackMetadata;
 use rustamp_proto::playlist::{EntryId, MediaLocation, SortKey};
 use rustamp_proto::state::{EqState, PlayerState, StreamInfo, TransportState, WindowId};
 
-/// The number of [`Message`] variants (declaration indices `0..=27`).
-pub const MESSAGE_VARIANT_COUNT: u8 = 29;
+/// The number of [`Message`] variants (declaration indices `0..=30`).
+pub const MESSAGE_VARIANT_COUNT: u8 = 31;
 
 /// The number of [`Command`] variants (declaration indices `0..=65`).
 pub const COMMAND_VARIANT_COUNT: u8 = 66;
@@ -670,6 +670,20 @@ pub fn message_variant(index: u8, rng: &mut Rng) -> Option<(&'static str, Messag
                 position: rng.u32(),
                 title: rng.text(),
                 file: rng.text(),
+            },
+        ),
+        29 => (
+            "EmbedSkin",
+            Message::EmbedSkin {
+                width: rng.u32(),
+                height: rng.u32(),
+                rgba: rng.vec_of(32, |rng| rng.u8()),
+            },
+        ),
+        30 => (
+            "OutputClock",
+            Message::OutputClock {
+                played_ms: rng.u64(),
             },
         ),
         _ => return None,

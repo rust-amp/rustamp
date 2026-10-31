@@ -71,6 +71,18 @@ pub trait ResidentChain: Send {
     fn process(&mut self, buf: &mut [f32]) -> Result<()>;
     /// Clear internal state (filter history, look-ahead); rings untouched.
     fn reset(&mut self);
+    /// A message for the chain's own use: the player's [`ControlSender`] sends
+    /// `NowPlaying` and `CommandToHost` here, in order with the blocks. Nothing
+    /// answers it, and a chain with no use for it ignores it.
+    ///
+    /// [`ControlSender`]: crate::control::ControlSender
+    fn note(&mut self, _message: &Message) {}
+    /// What the chain's output has played by its own clock, in milliseconds; it
+    /// never falls. `None` for a chain that is no output or has no clock. Asked
+    /// between blocks and while idle, and the player hears of every change.
+    fn played_ms(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// Opens one DSP chain in the host process for a validated spec and stage list.
@@ -121,8 +133,12 @@ impl Transition {
 /// stage state but never touches rings, so there is nothing to transition).
 /// The acknowledgement is not sent here: `poll_commands` and the post-EOS
 /// idle loop send it after applying the reset (RFC 0015).
-fn command(message: Message) -> Result<Option<Transition>> {
+fn command(message: Message, chain: &mut dyn ResidentChain) -> Result<Option<Transition>> {
     match message {
+        Message::NowPlaying { .. } | Message::CommandToHost(_) => {
+            chain.note(&message);
+            Ok(None)
+        }
         Message::DspConfigure { spec, stages } => {
             Ok(Some(Transition::Reconfigure { spec, stages }))
         }
@@ -170,7 +186,7 @@ fn poll_commands(peer: &ControlPeer, chain: &mut dyn ResidentChain) -> Result<Op
                 peer.send(Message::DspResetAck)?;
             }
             message => {
-                if let Some(transition) = command(message)? {
+                if let Some(transition) = command(message, chain)? {
                     return Ok(Some(transition));
                 }
             }
@@ -215,9 +231,19 @@ fn pump<R: MappedRegion>(
 ) -> Result<PumpOut> {
     let channels = usize::from(spec.channels);
     let mut block = vec![0.0; BLOCK_FRAMES * channels];
+    let clock_sender = peer.sender();
+    let mut last_clock = None;
     loop {
         if let Some(transition) = poll_commands(peer, chain)? {
             return Ok(transition.into_pump());
+        }
+        let clock = chain.played_ms();
+        if clock != last_clock
+            && let Some(played_ms) = clock
+            // A full queue only delays the news: the next round sends a newer one.
+            && clock_sender.send(Message::OutputClock { played_ms }).is_ok()
+        {
+            last_clock = clock;
         }
         // Lossless wait with nonterminal control checks, including idle reset.
         // Death/shutdown/reconfigure still close and signal both rings.
@@ -248,7 +274,7 @@ fn pump<R: MappedRegion>(
                 Ok(written) => offset += written,
                 Err(RingError::Closed) => {
                     peer.check()?;
-                    if let Some(transition) = command(wait_command(peer)?)? {
+                    if let Some(transition) = command(wait_command(peer)?, chain)? {
                         return Ok(transition.into_pump());
                     }
                 }
@@ -312,7 +338,7 @@ fn serve_inner<F: PcmRings>(
                         }
                     }
                 }
-                message => match command(message)? {
+                message => match command(message, chain.as_mut())? {
                     Some(Transition::Reconfigure { spec: next, stages }) => {
                         chain = open_chain(resident, next, &stages)?;
                         spec = next;
@@ -376,7 +402,7 @@ fn serve_inner<F: PcmRings>(
                         "player refused back-ring: {reason:?}"
                     )));
                 }
-                message => match command(message)? {
+                message => match command(message, chain.as_mut())? {
                     Some(Transition::Reconfigure { spec: next, stages }) => {
                         input.close();
                         back.close();
@@ -428,7 +454,7 @@ fn serve_inner<F: PcmRings>(
                             chain.reset();
                             peer.send(Message::DspResetAck)?;
                         }
-                        message => match command(message)? {
+                        message => match command(message, chain.as_mut())? {
                             Some(Transition::Reconfigure { spec: next, stages }) => {
                                 chain = open_chain(resident, next, &stages)?;
                                 spec = next;
@@ -502,6 +528,16 @@ impl<F: PcmRings> DspSession<F> {
     /// Current stream specification.
     pub fn spec(&self) -> PcmSpecWire {
         self.spec
+    }
+
+    /// A sender for messages to the resident's chain ([`ResidentChain::note`]).
+    pub fn control_sender(&self) -> crate::control::ControlSender {
+        self.peer.sender()
+    }
+
+    /// What the resident's output has played ([`ResidentChain::played_ms`]).
+    pub fn output_clock(&self) -> crate::control::OutputClock {
+        self.peer.output_clock()
     }
 
     /// Chain latency in frames, as reported by `DspReady`.
@@ -1043,6 +1079,18 @@ impl DspProcess {
         }
     }
 
+    /// A sender for messages to the resident's chain ([`ResidentChain::note`]),
+    /// which stays usable after the process has moved into its owner.
+    pub fn control_sender(&self) -> crate::control::ControlSender {
+        self.session.as_ref().unwrap().control_sender()
+    }
+
+    /// What the resident's output has played, readable after the process has
+    /// moved into its owner.
+    pub fn output_clock(&self) -> crate::control::OutputClock {
+        self.session.as_ref().unwrap().output_clock()
+    }
+
     /// DSP worker session; never use from the device callback.
     pub fn session(&mut self) -> &mut DspSession<crate::pcm::NamedPcmRings> {
         self.session.as_mut().unwrap()
@@ -1065,10 +1113,19 @@ impl DspProcess {
     }
 }
 
+/// How long a helper gets to end by itself after `Shutdown`: a plug-in finishes
+/// its work in `close` and `quit` (the disk writer completes its file there).
+#[cfg(windows)]
+const EXIT_WAIT: Duration = Duration::from_secs(3);
+
 #[cfg(windows)]
 impl Drop for DspProcess {
     fn drop(&mut self) {
         self.session.take();
+        let deadline = Instant::now() + EXIT_WAIT;
+        while Instant::now() < deadline && matches!(self.child.try_wait(), Ok(None)) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

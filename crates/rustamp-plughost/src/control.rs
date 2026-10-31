@@ -176,6 +176,15 @@ pub enum ControlInbound {
         /// The track's path or URL.
         file: String,
     },
+    /// The sheet embed frames draw from; empty pixels when the skin has none.
+    EmbedSkin {
+        /// Width of the sheet in pixels.
+        width: u32,
+        /// Height of the sheet in pixels.
+        height: u32,
+        /// The pixels, 8-bit RGBA, top row first.
+        rgba: Vec<u8>,
+    },
     /// A ping from the parent with its token. The UI thread answers with Pong
     /// when it pumps messages, so a hung UI will not answer and trip the supervisor's timeout.
     Ping(u64),
@@ -285,6 +294,18 @@ pub fn handle_message_inbound(
             });
             ControlStep::Continue
         }
+        Message::EmbedSkin {
+            width,
+            height,
+            rgba,
+        } => {
+            on_event(ControlInbound::EmbedSkin {
+                width,
+                height,
+                rgba,
+            });
+            ControlStep::Continue
+        }
         Message::CommandToHost(Command::ConfigureVisPlugin) => {
             on_event(ControlInbound::ConfigureVis);
             ControlStep::Continue
@@ -368,6 +389,7 @@ pub fn apply_plugin_request(
         // (it needs the registry mutably, or it keeps the frame).
         ControlInbound::State(_)
         | ControlInbound::NowPlaying { .. }
+        | ControlInbound::EmbedSkin { .. }
         | ControlInbound::Ping(_)
         | ControlInbound::Load { .. }
         | ControlInbound::ToggleVis

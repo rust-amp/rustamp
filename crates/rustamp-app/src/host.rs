@@ -370,6 +370,8 @@ pub struct HostStateLink {
     transport: Option<Box<dyn Transport>>,
     last_sent: Option<PlayerState>,
     last_now_playing: Option<(u32, String, String)>,
+    /// The skin generation whose sheet the host has.
+    last_embed_skin: Option<u64>,
     /// What the plug-ins asked for, for the app to carry out.
     plugin_commands: Vec<rustamp_core::command::Command>,
     last_send: Instant,
@@ -395,6 +397,7 @@ impl HostStateLink {
             transport: None,
             last_sent: None,
             last_now_playing: None,
+            last_embed_skin: None,
             plugin_commands: Vec::new(),
             last_send: Instant::now(),
             greeting: None,
@@ -430,6 +433,7 @@ impl HostStateLink {
         self.transport = Some(Box::new(transport));
         self.last_sent = None;
         self.last_now_playing = None;
+        self.last_embed_skin = None;
         self.reset_liveness();
         self.inventory.clear();
         self.generation = self.generation.wrapping_add(1);
@@ -456,6 +460,7 @@ impl HostStateLink {
         self.transport = None;
         self.last_sent = None;
         self.last_now_playing = None;
+        self.last_embed_skin = None;
         self.reset_liveness();
         self.inventory.clear();
     }
@@ -691,6 +696,27 @@ impl HostStateLink {
         }
     }
 
+    /// Hands the host the sheet its embed frames draw from, when the skin
+    /// `generation` is new to it. Best-effort like [`Self::publish`].
+    pub fn publish_embed_skin(
+        &mut self,
+        generation: u64,
+        sheet: impl FnOnce() -> (u32, u32, Vec<u8>),
+    ) {
+        if self.transport.is_none() || self.last_embed_skin == Some(generation) {
+            return;
+        }
+        let (width, height, rgba) = sheet();
+        let message = Message::EmbedSkin {
+            width,
+            height,
+            rgba,
+        };
+        if self.send(&message).is_ok() {
+            self.last_embed_skin = Some(generation);
+        }
+    }
+
     /// What the plug-ins asked for since the last call.
     pub fn take_plugin_commands(&mut self) -> Vec<rustamp_core::command::Command> {
         std::mem::take(&mut self.plugin_commands)
@@ -913,6 +939,53 @@ mod tests {
             }
         }
         assert_eq!(received, Some(frame));
+    }
+
+    #[test]
+    fn the_skin_sheet_goes_out_once_per_generation() {
+        let mut link = HostStateLink::detached();
+        // No host: no sheet is built and nothing is sent.
+        link.publish_embed_skin(1, || panic!("a detached link builds no sheet"));
+
+        let (app_end, mut host_end) = rustamp_ipc::MemoryTransport::pair();
+        link.attach(app_end);
+        let mut built = 0;
+        let sheet = || {
+            built += 1;
+            (2u32, 1u32, vec![1, 2, 3, 255, 4, 5, 6, 255])
+        };
+        link.publish_embed_skin(1, sheet);
+        assert_eq!(built, 1, "the host's first skin is built");
+        // The same generation is not built a second time.
+        link.publish_embed_skin(1, || panic!("the same generation is not rebuilt"));
+        let mut sheets = Vec::new();
+        while let Ok(Some(message)) = host_end.try_recv() {
+            if let Message::EmbedSkin {
+                width,
+                height,
+                rgba,
+            } = message
+            {
+                sheets.push((width, height, rgba));
+            }
+        }
+        assert_eq!(sheets, vec![(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 255])]);
+
+        // A new skin is a new sheet, and the host hears of it once.
+        link.publish_embed_skin(2, || (1, 1, vec![9, 8, 7, 255]));
+        link.publish_embed_skin(2, || panic!("the second generation is sent once"));
+        let mut sheets = Vec::new();
+        while let Ok(Some(message)) = host_end.try_recv() {
+            if let Message::EmbedSkin {
+                width,
+                height,
+                rgba,
+            } = message
+            {
+                sheets.push((width, height, rgba));
+            }
+        }
+        assert_eq!(sheets, vec![(1, 1, vec![9, 8, 7, 255])]);
     }
 
     fn headless_app(volume: u8) -> App {

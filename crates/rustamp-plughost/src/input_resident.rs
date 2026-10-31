@@ -63,7 +63,7 @@ pub fn parse_extensions(output: &str) -> Vec<String> {
 }
 
 /// The value after `mode` and the store on the command line.
-fn parse_args(args: &[String], mode: &str) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn parse_args(args: &[String], mode: &str) -> Option<(PathBuf, PathBuf)> {
     let dll = args.iter().position(|arg| arg == mode)?;
     let store = args.iter().position(|arg| arg == APPROVALS_ARG)?;
     Some((
@@ -123,6 +123,7 @@ mod imp {
     use rustamp_plugin_abi::output::OutModule;
     use rustamp_proto::host::{MediaLocationWire, PcmSpecWire};
     use rustamp_proto::meta::TrackMetadata;
+    use rustamp_proto::state::{PlayerState, TransportState};
 
     use super::{EXTENSIONS_ARG, MODE_ARG, parse_args, samples_of};
     use crate::approval::ApprovalStore;
@@ -207,13 +208,14 @@ mod imp {
         });
         0
     }
+    /// The bytes the queue still has room for. A plug-in compares the answer
+    /// with the block it wants to write, and a fixed answer below that block
+    /// would keep it waiting for ever.
     unsafe extern "C" fn out_can_write() -> c_int {
         with_capture(|capture| {
-            if capture.queue.len() < queue_limit(capture) {
-                65_536
-            } else {
-                0
-            }
+            let free = queue_limit(capture).saturating_sub(capture.queue.len());
+            let bytes = capture.spec.map_or(2, |spec| (spec.2.max(8) / 8) as usize);
+            (free * bytes).min(c_int::MAX as usize) as c_int
         })
     }
     unsafe extern "C" fn out_is_playing() -> c_int {
@@ -273,8 +275,9 @@ mod imp {
         get_written_ms: Some(out_written_ms),
     }));
 
-    /// What a plug-in says of the file it plays: its title and length.
-    type FileInfo = (Option<String>, Option<u64>);
+    /// What a plug-in says of the file it plays: its title, its length and
+    /// whether it can seek in it.
+    type FileInfo = (Option<String>, Option<u64>, bool);
 
     /// What the serve thread asks of the plug-in's UI thread.
     enum Request {
@@ -306,7 +309,7 @@ mod imp {
             self.requests
                 .send(Request::Play { path, reply })
                 .map_err(|_| gone())?;
-            let (title, duration_ms) = answer
+            let (title, duration_ms, seekable) = answer
                 .recv()
                 .map_err(|_| gone())?
                 .map_err(MediaHostError::OperationFailed)?;
@@ -337,7 +340,7 @@ mod imp {
                         channels: spec.1.clamp(1, 255) as u16 as _,
                     },
                     duration_ms,
-                    seekable: true,
+                    seekable,
                     metadata: TrackMetadata {
                         title,
                         ..TrackMetadata::default()
@@ -425,7 +428,33 @@ mod imp {
             .map_err(|error| format!("{} could not be loaded: {error:?}", dll.display()))
     }
 
-    fn answer(request: Request, plugin: &LoadedPlugin) {
+    /// The plug-in's own file as the current track: `in_msx` reads it back
+    /// through the playlist IPCs. The process serves one track, so it is the
+    /// first and only entry of the playlist the plug-in can see.
+    fn announce_own_file(window: &HostWindow, plugin: &LoadedPlugin, path: &Path) {
+        let file = path.display().to_string();
+        let title = plugin
+            .input_file_info(path)
+            .ok()
+            .and_then(|(title, _)| title)
+            .or_else(|| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| file.clone());
+        let state = PlayerState {
+            transport: TransportState::Playing,
+            current_index: Some(0),
+            playlist_len: 1,
+            ..PlayerState::default()
+        };
+        if window.apply_player_state(&state).is_err() {
+            crate::fault::trace_event("the playlist position could not be set");
+        }
+        crate::plugin_commands::announce_track(window, 0, &title, &file);
+    }
+
+    fn answer(request: Request, plugin: &LoadedPlugin, window: &HostWindow) {
         match request {
             Request::Play { path, reply } => {
                 let result = (|| {
@@ -441,6 +470,7 @@ mod imp {
                         crate::handoff::hand_off_output(input, CAPTURE_MODULE.0.get(), 255, 0)
                             .map_err(|error| format!("{error:?}"))?;
                     }
+                    announce_own_file(window, plugin, &path);
                     plugin
                         .input_play(&path)
                         .map_err(|error| format!("{error:?}"))?;
@@ -448,7 +478,10 @@ mod imp {
                     let (title, known) = plugin.input_file_info(&path).unwrap_or((None, None));
                     let length = plugin.input_length_ms().unwrap_or(-1);
                     let length = u64::try_from(length).ok().filter(|ms| *ms > 0);
-                    Ok((title, length.or(known)))
+                    // SAFETY: the module lives in the mapped plug-in's static
+                    // data; the plug-in sets the member when it opens a file.
+                    let seekable = unsafe { (*input).seekable } != 0;
+                    Ok((title, length.or(known), seekable))
                 })();
                 let _ = reply.send(result);
             }
@@ -471,7 +504,7 @@ mod imp {
     ) {
         while !done.load(Ordering::Acquire) {
             while let Ok(request) = requests.try_recv() {
-                answer(request, plugin);
+                answer(request, plugin, window);
             }
             if !crate::message_loop::pump_bounded(window, 64) {
                 break;

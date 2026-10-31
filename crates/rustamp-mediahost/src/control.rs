@@ -6,6 +6,7 @@
 //! the process owner must close the pipes (kill/reap the child) on failure.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -64,11 +65,49 @@ impl State {
     }
 }
 
+/// Sends messages on a control connection from any thread, without waiting: the
+/// way the player reaches a resident that another owner drives. A full queue or
+/// an ended connection is an error here and the owner's to diagnose.
+#[derive(Clone)]
+pub struct ControlSender(mpsc::SyncSender<Outgoing>);
+
+impl ControlSender {
+    /// Queues `message`.
+    pub fn send(&self, message: Message) -> Result<()> {
+        self.0
+            .try_send(Outgoing::Message(Box::new(message)))
+            .map_err(|_| MediaHostError::Disconnected("control writer unavailable".into()))
+    }
+}
+
+/// What a resident's output plug-in has played, as it last reported it.
+#[derive(Clone)]
+pub struct OutputClock(Arc<AtomicU64>);
+
+impl OutputClock {
+    /// The value before the first report.
+    const NO_REPORT: u64 = u64::MAX;
+
+    fn new() -> Self {
+        OutputClock(Arc::new(AtomicU64::new(Self::NO_REPORT)))
+    }
+
+    fn store(&self, played_ms: u64) {
+        self.0.store(played_ms, Ordering::Release);
+    }
+
+    /// The last report in milliseconds; `None` before the first one.
+    pub fn played_ms(&self) -> Option<u64> {
+        Some(self.0.load(Ordering::Acquire)).filter(|ms| *ms != Self::NO_REPORT)
+    }
+}
+
 /// One supervised control connection. All methods are off-render-thread only.
 pub struct ControlPeer {
     outgoing: mpsc::SyncSender<Outgoing>,
     incoming: mpsc::Receiver<Message>,
     state: Arc<Mutex<State>>,
+    output_clock: OutputClock,
     stop: mpsc::Sender<()>,
     monitor: Option<thread::JoinHandle<()>>,
 }
@@ -122,6 +161,8 @@ impl ControlPeer {
             }
         });
         let monitor_state = state.clone();
+        let output_clock = OutputClock::new();
+        let monitor_clock = output_clock.clone();
         let monitor_tx = outgoing.clone();
         // Queue Hello before publishing this connection to the caller. Doing
         // this inside the monitor would race an immediate DecoderOpen send.
@@ -183,6 +224,9 @@ impl ControlPeer {
                             next_ping = Instant::now() + policy.interval;
                         }
                     }
+                    Ok(Ok(Message::OutputClock { played_ms })) => {
+                        monitor_clock.store(played_ms);
+                    }
                     Ok(Ok(Message::DecoderError { message })) => {
                         fail(format!("resident decoder failed: {message}"));
                         break;
@@ -226,6 +270,7 @@ impl ControlPeer {
             outgoing,
             incoming,
             state,
+            output_clock,
             stop,
             monitor: Some(monitor),
         })
@@ -248,6 +293,16 @@ impl ControlPeer {
     /// if publication fails, remote EOF/liveness still closes the rings.
     pub(crate) fn release_abort(&self) {
         self.state.lock().unwrap().abort = None;
+    }
+
+    /// What the peer's output plug-in reports it has played.
+    pub fn output_clock(&self) -> OutputClock {
+        self.output_clock.clone()
+    }
+
+    /// A sender for this connection that other threads can keep.
+    pub fn sender(&self) -> ControlSender {
+        ControlSender(self.outgoing.clone())
     }
 
     /// Check the sticky failure reason; a dead host is never ordinary EOS.

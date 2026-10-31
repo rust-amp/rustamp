@@ -963,15 +963,24 @@ fn recorded_through(
     (mono, rate)
 }
 
-/// The median amplitude of the tone at `hz` in the windows that hold it.
-fn level_of(mono: &[f32], rate: u32, hz: f64) -> f64 {
+/// The amplitudes of the tone at `hz` in the windows that hold it.
+fn tone_levels(mono: &[f32], rate: u32, hz: f64) -> Vec<f64> {
     let window = (f64::from(rate) * EQ_WINDOW_SECONDS).round() as usize;
-    let mut levels: Vec<f64> = mono
-        .chunks_exact(window)
+    mono.chunks_exact(window)
         .map(|chunk| tone_in_window(chunk, f64::from(rate), hz))
         .filter(|(amplitude, ratio)| *ratio >= MIN_TONE_RATIO && *amplitude > 0.001)
         .map(|(amplitude, _)| amplitude)
-        .collect();
+        .collect()
+}
+
+/// How many windows hold the tone at `hz`.
+fn windows_holding(mono: &[f32], rate: u32, hz: f64) -> usize {
+    tone_levels(mono, rate, hz).len()
+}
+
+/// The median amplitude of the tone at `hz` in the windows that hold it.
+fn level_of(mono: &[f32], rate: u32, hz: f64) -> f64 {
+    let mut levels = tone_levels(mono, rate, hz);
     assert!(
         levels.len() >= 5,
         "only {} windows hold the {hz} Hz tone",
@@ -1119,7 +1128,13 @@ fn the_cable_carries_what_a_dsp_plugin_does() {
     let plain = measured_level(&track, hz, &[]);
 
     let fixture = beside_the_test("dsp_rustamp_fixture.dll");
-    let chain = classic_dsp_chain(helper.clone(), &fixture, &approved(dir.path(), &fixture));
+    let chain = classic_dsp_chain(
+        helper.clone(),
+        &fixture,
+        &approved(dir.path(), &fixture),
+        0,
+        Default::default(),
+    );
     let doubled = decibels(measured_level_through(&track, hz, &[], chain), plain);
     measurement(&format!("dsp_rustamp_fixture: {doubled:+.2} dB"));
     assert!(
@@ -1130,7 +1145,13 @@ fn the_cable_carries_what_a_dsp_plugin_does() {
     let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
         .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
     let optilab = plugins.join("dsp").join("dsp_optilab_core.dll");
-    let chain = classic_dsp_chain(helper, &optilab, &approved(dir.path(), &optilab));
+    let chain = classic_dsp_chain(
+        helper,
+        &optilab,
+        &approved(dir.path(), &optilab),
+        0,
+        Default::default(),
+    );
     let changed = decibels(measured_level_through(&track, hz, &[], chain), plain);
     measurement(&format!("dsp_optilab_core: {changed:+.2} dB"));
     assert!(
@@ -1291,7 +1312,13 @@ fn the_cable_carries_a_tone_through_dsp_sps() {
         .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
     let dll = plugins.join("w566").join("dsp_sps.dll");
     let plain = measured_level(&track, hz, &[]);
-    let chain = classic_dsp_chain(helper, &dll, &approved(dir.path(), &dll));
+    let chain = classic_dsp_chain(
+        helper,
+        &dll,
+        &approved(dir.path(), &dll),
+        0,
+        Default::default(),
+    );
     let through = decibels(measured_level_through(&track, hz, &[], chain), plain);
     measurement(&format!("dsp_sps: {through:+.2} dB"));
     assert!(through.abs() <= 24.0, "dsp_sps: {through:+.2} dB");
@@ -1329,12 +1356,18 @@ fn the_output_plugins_play_what_the_engine_renders() {
     let attempt = || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             recorded_through(
-                Box::new(PluginOutput::new(helper.clone(), &dll, &approvals)),
+                Box::new(PluginOutput::new(
+                    helper.clone(),
+                    &dll,
+                    &approvals,
+                    Default::default(),
+                )),
                 &track,
                 &[],
                 DspChain::default(),
                 rustamp_decoders::default_registry(),
-                EQ_TONE_SECONDS + 1.0,
+                // The plug-in's buffer delays the start of the tone.
+                EQ_TONE_SECONDS + 3.0,
             )
         }))
     };
@@ -1342,6 +1375,11 @@ fn the_output_plugins_play_what_the_engine_renders() {
         .or_else(|_| attempt())
         .or_else(|_| attempt())
         .expect("the recording through out_wave");
+    // The whole tone, not only enough of it for a level: a clock that counts
+    // blocks handed over ends the track while the plug-in holds its end.
+    let held = windows_holding(&mono, rate, hz);
+    measurement(&format!("out_wave: {held} windows hold the tone"));
+    assert!(held >= 8, "only {held} of 9 windows hold the {hz} Hz tone");
     let through = decibels(level_of(&mono, rate, hz), plain);
     measurement(&format!(
         "out_wave: {through:+.2} dB against the direct output"
@@ -1376,7 +1414,12 @@ fn out_disk_writes_what_the_engine_renders() {
     {
         let mut engine = Engine::new(
             rustamp_decoders::default_registry(),
-            Box::new(PluginOutput::new(helper, &dll, &approvals)),
+            Box::new(PluginOutput::new(
+                helper,
+                &dll,
+                &approvals,
+                Default::default(),
+            )),
             EventBus::new(),
             EngineConfig::default(),
         )
@@ -1398,8 +1441,25 @@ fn out_disk_writes_what_the_engine_renders() {
     // The helper closes the file when it ends.
     std::thread::sleep(Duration::from_secs(2));
 
-    // Where the plug-in writes is its own setting, so look where it can be.
-    fn newest_wav(
+    let found = wavs_written_since(started, &[track.as_path()]);
+    measurement(&format!("out_disk wrote: {found:?}"));
+    let written = found.first().expect("out_disk wrote no file");
+    let bytes = std::fs::metadata(written).unwrap().len();
+    measurement(&format!("out_disk: {} is {bytes} bytes", written.display()));
+    // A second of 44.1 kHz stereo at 16 bits, give or take the pacing.
+    assert!(
+        bytes > 150_000,
+        "{} holds only {bytes} bytes",
+        written.display()
+    );
+}
+
+/// The `.wav` files an output plug-in wrote since `since`, under the places it
+/// may choose: its own setting decides where it writes, so these are looked for.
+/// The inputs are left out by name, so a plug-in that copies rather than writes
+/// is not mistaken for one that wrote.
+fn wavs_written_since(since: std::time::SystemTime, sources: &[&std::path::Path]) -> Vec<PathBuf> {
+    fn walk(
         dir: &std::path::Path,
         since: std::time::SystemTime,
         depth: u32,
@@ -1413,15 +1473,12 @@ fn out_disk_writes_what_the_engine_renders() {
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
                 if depth > 0 {
-                    newest_wav(&path, since, depth - 1, found);
+                    walk(&path, since, depth - 1, found);
                 }
             } else if path
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
                 && meta.modified().is_ok_and(|time| time >= since)
-                && path
-                    .file_name()
-                    .is_none_or(|name| name != "written tone.wav")
             {
                 found.push(path);
             }
@@ -1429,18 +1486,351 @@ fn out_disk_writes_what_the_engine_renders() {
     }
     let mut found = Vec::new();
     for root in [r"C:\", r"C:\rustamp", r"C:\Users\rustamp"] {
-        newest_wav(std::path::Path::new(root), started, 4, &mut found);
+        walk(std::path::Path::new(root), since, 4, &mut found);
     }
+    found.retain(|path| {
+        !sources
+            .iter()
+            .any(|source| path.file_name() == source.file_name())
+    });
     found.sort();
     found.dedup();
+    found
+}
+
+/// Polls `engine` for at most `seconds`, and stops early when the transport
+/// reaches `Stopped` as long as `until_stop` asks for it.
+fn pump_engine(engine: &mut Engine, seconds: f64, until_stop: bool) {
+    let start = Instant::now();
+    let limit = Duration::from_secs_f64(seconds);
+    while start.elapsed() < limit {
+        engine.poll().expect("polling the engine");
+        if until_stop && engine.transport() == TransportState::Stopped {
+            return;
+        }
+        assert!(start.elapsed() < DEADLINE, "the engine did not answer");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+}
+
+/// A player closes a plug-in's file for one track and opens it for the next: the
+/// disk writer names its file after the track it was opened for, and writes the
+/// finished length into the header when it closes. Two tracks therefore leave two
+/// finalized files, each named after its own title.
+#[test]
+#[ignore = "VM-only: runs a real output plug-in"]
+fn out_disk_names_a_file_per_track_and_finalizes_it() {
+    use rustamp_app::dsp::NowPlaying;
+    use rustamp_app::plugin_output::PluginOutput;
+
+    rustamp_app::window::require_test_vm();
+    // SAFETY: as in `the_cable_carries_what_the_winamp5_input_plugins_decode`.
+    unsafe {
+        std::env::set_var(
+            "RUSTAMP_HOST_TRACE",
+            r"C:\rustamp\out\gui-session\out-disk-tracks-trace.txt",
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first tone.wav");
+    let second = dir.path().join("second tone.wav");
+    write_tone(&first, 700.0, EQ_TONE_SECONDS);
+    write_tone(&second, 1300.0, EQ_TONE_SECONDS);
+    let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
+    let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
+        .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
+    let dll = plugins.join("w566").join("out_disk.dll");
+    let approvals = approved(dir.path(), &dll);
+    let started = std::time::SystemTime::now();
+    let now_playing = Arc::new(NowPlaying::default());
+    {
+        let mut engine = Engine::new(
+            rustamp_decoders::default_registry(),
+            Box::new(PluginOutput::new(
+                helper,
+                &dll,
+                &approvals,
+                Arc::clone(&now_playing),
+            )),
+            EventBus::new(),
+            EngineConfig::default(),
+        )
+        .expect("the output plug-in");
+        engine.set_queue(vec![
+            TrackSource::path(first.clone()),
+            TrackSource::path(second.clone()),
+        ]);
+        for (index, (title, path)) in [
+            (0u32, ("first track", &first)),
+            (1, ("second track", &second)),
+        ]
+        .into_iter()
+        {
+            // The plug-in reads the track when it is opened, so the player names
+            // it first.
+            now_playing.publish(index, title, &path.display().to_string());
+            engine.play_index(index).expect("playing through out_disk");
+            pump_engine(&mut engine, DEADLINE.as_secs_f64(), true);
+            assert_eq!(
+                engine.transport(),
+                TransportState::Stopped,
+                "track {index} never finished"
+            );
+            measurement(&format!(
+                "out_disk: {title} played {} frames",
+                engine.played_frames()
+            ));
+        }
+    }
+    // The helper closes the last file when it ends.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let found = wavs_written_since(started, &[first.as_path(), second.as_path()]);
     measurement(&format!("out_disk wrote: {found:?}"));
-    let written = found.first().expect("out_disk wrote no file");
-    let bytes = std::fs::metadata(written).unwrap().len();
-    measurement(&format!("out_disk: {} is {bytes} bytes", written.display()));
-    // A second of 44.1 kHz stereo at 16 bits, give or take the pacing.
+    let named = |title: &str| {
+        found.iter().find(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .to_lowercase()
+                    .contains(&title.to_lowercase())
+            })
+        })
+    };
+    let first_file = named("first track").unwrap_or_else(|| {
+        panic!("no file named after the first track among {found:?}");
+    });
+    let second_file = named("second track").unwrap_or_else(|| {
+        panic!("no file named after the second track among {found:?}");
+    });
+    assert_ne!(
+        first_file, second_file,
+        "one file for both tracks: the plug-in was never reopened"
+    );
+    for file in [first_file, second_file] {
+        let bytes = std::fs::read(file).expect("reading what out_disk wrote");
+        assert!(bytes.len() > 100_000, "{} is nearly empty", file.display());
+        assert_eq!(&bytes[..4], b"RIFF", "{} has no header", file.display());
+        // The header's chunk size is the finished file's: the plug-in wrote the
+        // length when it closed, not when it opened.
+        let declared = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8;
+        assert_eq!(
+            declared,
+            bytes.len(),
+            "{} was not finalized: its header says {declared} bytes",
+            file.display()
+        );
+    }
+}
+
+/// A pause reaches the output plug-in of the audio path: `out_wave` stops
+/// writing while the player is paused, so the cable holds a silent stretch
+/// between two stretches of the tone.
+#[test]
+#[ignore = "VM-only: runs a real output plug-in and needs the VB-Audio Virtual Cable"]
+fn a_pause_reaches_out_wave() {
+    use rustamp_app::dsp::NowPlaying;
+    use rustamp_app::plugin_output::PluginOutput;
+
+    rustamp_app::window::require_test_vm();
+    // SAFETY: as in `the_cable_carries_what_the_winamp5_input_plugins_decode`.
+    unsafe {
+        std::env::set_var(
+            "RUSTAMP_HOST_TRACE",
+            r"C:\rustamp\out\gui-session\pause-trace.txt",
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let hz = 1000.0;
+    let track = dir.path().join("tone.wav");
+    write_tone(&track, hz, 6.0);
+    let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
+    let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
+        .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
+    let dll = plugins.join("w566").join("out_wave.dll");
+    let approvals = approved(dir.path(), &dll);
+    let now_playing = Arc::new(NowPlaying::default());
+    now_playing.publish(0, "tone", &track.display().to_string());
+
+    let mut engine = Engine::new(
+        rustamp_decoders::default_registry(),
+        Box::new(PluginOutput::new(
+            helper,
+            &dll,
+            &approvals,
+            Arc::clone(&now_playing),
+        )),
+        EventBus::new(),
+        EngineConfig::default(),
+    )
+    .expect("the output plug-in");
+    let granted = engine.device_spec();
+    let host = cpal::default_host();
+    let capture = find_input_device(&host, CABLE_MATCH);
+    let (config, format) = pick_capture_config(&capture, granted.sample_rate);
+    let rate = config.sample_rate;
+    let channels = usize::from(config.channels);
+    let recording = Arc::new(Mutex::new(Recording::default()));
+    let stream = start_capture(&capture, config, format, &recording);
+    let pre_roll = (f64::from(rate) * PRE_ROLL.as_secs_f64()) as usize;
+    let start = Instant::now();
+    while recorded_frames(&recording, channels) < pre_roll {
+        assert!(start.elapsed() < DEADLINE, "the capture is not running");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    let mark = recorded_frames(&recording, channels);
+
+    engine.set_queue(vec![TrackSource::path(track.clone())]);
+    engine.play_index(0).expect("playing through out_wave");
+    // The tone, then a pause of two seconds, then the rest of the track.
+    pump_engine(&mut engine, 1.5, false);
+    engine.pause().expect("pausing the cable output");
+    measurement("out_wave: paused");
+    pump_engine(&mut engine, 2.0, false);
+    engine.play().expect("resuming the cable output");
+    pump_engine(&mut engine, 4.0, true);
+    assert_eq!(
+        engine.transport(),
+        TransportState::Stopped,
+        "the track never finished"
+    );
+
+    // The capture keeps running past the end, as `recorded_through` does.
+    let wanted = mark + (f64::from(rate) * (6.0 + TAIL.as_secs_f64())) as usize;
+    let start = Instant::now();
+    while recorded_frames(&recording, channels) < wanted {
+        assert!(start.elapsed() < DEADLINE, "the capture stalled");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    drop(stream);
+    let recording = std::mem::take(&mut *recording.lock().expect("the capture lock"));
+    assert_eq!(recording.fatal_error, None, "the capture failed");
+    let mono: Vec<f32> = recording
+        .samples
+        .chunks_exact(channels)
+        .skip(mark)
+        .map(|frame| frame[0])
+        .collect();
+
+    let window = (f64::from(rate) * EQ_WINDOW_SECONDS).round() as usize;
+    let tonal: Vec<bool> = mono
+        .chunks_exact(window)
+        .map(|chunk| {
+            let (amplitude, ratio) = tone_in_window(chunk, f64::from(rate), hz);
+            ratio >= MIN_TONE_RATIO && amplitude > 0.001
+        })
+        .collect();
+    let first = tonal
+        .iter()
+        .position(|tonal| *tonal)
+        .expect("no tone before the pause");
+    let gap_start = tonal[first..]
+        .iter()
+        .position(|tonal| !*tonal)
+        .map(|at| first + at)
+        .expect("the tone never stopped: the pause did not reach out_wave");
+    let gap = tonal[gap_start..]
+        .iter()
+        .take_while(|tonal| !**tonal)
+        .count();
+    let after = tonal[gap_start + gap..].iter().any(|tonal| *tonal);
+    measurement(&format!(
+        "out_wave: the tone stops for {gap} windows and {}",
+        if after {
+            "comes back"
+        } else {
+            "never comes back"
+        }
+    ));
     assert!(
-        bytes > 150_000,
-        "{} holds only {bytes} bytes",
-        written.display()
+        gap >= 10,
+        "the plug-in stopped for only {gap} windows of {EQ_WINDOW_SECONDS} s"
+    );
+    assert!(after, "the tone never came back after the pause");
+}
+
+/// A DSP plug-in's dialog runs in the helper that processes its audio, because a
+/// dialog changes the instance it belongs to: the request reaches the live
+/// helper, the plug-in's own `config` runs there (it writes the host's trace),
+/// and the audio keeps flowing while the dialog is open, as the dialog holds the
+/// helper's main thread and not the thread that serves the blocks.
+#[test]
+#[ignore = "VM-only: runs a real DSP plug-in and opens its dialog"]
+fn the_dsp_dialog_opens_in_the_running_helper() {
+    use std::sync::Arc;
+
+    use rustamp_app::dsp::{NowPlaying, classic_dsp_chain};
+
+    rustamp_app::window::require_test_vm();
+    let trace = PathBuf::from(r"C:\rustamp\out\gui-session\dsp-dialog-trace.txt");
+    let _ = std::fs::create_dir_all(r"C:\rustamp\out\gui-session");
+    let _ = std::fs::remove_file(&trace);
+    // SAFETY: as in `the_cable_carries_what_the_winamp5_input_plugins_decode`.
+    unsafe { std::env::set_var("RUSTAMP_HOST_TRACE", &trace) };
+
+    let dir = tempfile::tempdir().unwrap();
+    let track = dir.path().join("tone.wav");
+    write_tone(&track, 1000.0, 8.0);
+    let helper = rustamp_app::supervise::find_plugin_host().expect("the staged plug-in host");
+    let plugins = std::env::var_os("RUSTAMP_TESTPLUGINS")
+        .map_or_else(|| PathBuf::from(r"C:\rustamp\testplugins"), PathBuf::from);
+    let dll = plugins.join("w566").join("dsp_sps.dll");
+    let approvals = approved(dir.path(), &dll);
+    let now_playing = Arc::new(NowPlaying::default());
+    now_playing.publish(0, "tone", &track.display().to_string());
+
+    let mut chain = classic_dsp_chain(helper, &dll, &approvals, 0, Arc::clone(&now_playing));
+    let mut engine = Engine::new(
+        rustamp_decoders::default_registry(),
+        Box::new(CpalOutput::with_device_name(CABLE_MATCH)),
+        EventBus::new(),
+        EngineConfig::default(),
+    )
+    .expect("the cable as the output");
+    engine.set_dsp_chain(chain.build());
+    engine.set_queue(vec![TrackSource::path(track.clone())]);
+    engine
+        .play_index(0)
+        .expect("playing through the DSP helper");
+
+    // The helper loads the plug-in for the first block; after a second of audio
+    // it is the instance the whole chain is served from.
+    let start = Instant::now();
+    while engine.played_frames() < 44_100 {
+        engine.poll().expect("polling the engine");
+        assert!(start.elapsed() < DEADLINE, "the DSP path never started");
+        std::thread::sleep(PUMP_INTERVAL);
+    }
+    assert!(
+        chain.configure_running(&dll),
+        "no live helper of this plug-in to configure"
+    );
+
+    // The helper's trace shows the plug-in's own `config` call: the dialog ran
+    // there and not in this process.
+    let start = Instant::now();
+    let mut watched = 0usize;
+    let asked = loop {
+        let said = std::fs::read_to_string(&trace).unwrap_or_default();
+        let now = said.matches("-> config").count();
+        if now > 0 && now != watched {
+            break true;
+        }
+        watched = watched.max(now);
+        if start.elapsed() >= DEADLINE {
+            break false;
+        }
+        std::thread::sleep(PUMP_INTERVAL);
+    };
+    // The blocks keep coming while the dialog holds the helper's main thread.
+    let before = engine.played_frames();
+    pump_engine(&mut engine, 2.0, false);
+    let after = engine.played_frames();
+    measurement(&format!(
+        "dsp_sps: {asked} dialog call, {before} -> {after} frames while it is open"
+    ));
+    assert!(asked, "the plug-in's config never ran in the helper");
+    assert!(
+        after > before,
+        "the audio stopped while the dialog was open: {before} -> {after} frames"
     );
 }

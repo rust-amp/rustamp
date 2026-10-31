@@ -8,35 +8,107 @@
 //! `can_write` slows it down.
 //!
 //! The thread also keeps to real time, because a plug-in that writes to a file
-//! takes everything at once, and the engine's clock is this device's clock. So
-//! the disk writer takes as long as the music does. Own choice: it is what the
-//! position display and the end of a track need.
+//! takes everything at once. So the disk writer takes as long as the music does.
 //!
-//! Limits: a pause stops the blocks and leaves what the plug-in already holds to
-//! play out, because the channel carries blocks and a reset only.
+//! The engine's clock is what the plug-in has played ([`PlayClock`]): a track has
+//! not ended while the plug-in still holds its end, and a buffer that delays the
+//! start delays the clock. Blocks handed over are the bound of that clock from
+//! above; a plug-in without a clock, or with one that stands still, falls back on
+//! them, so it cannot hold the player for longer than [`CLOCK_SLACK`].
+//!
+//! The thread also carries the player's news to the helper, in order with the
+//! blocks: the track before the first block, because the disk writer reads the
+//! title when it is opened, and a pause and resume, which reach the plug-in's own
+//! `pause`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustamp_audio::resident::DspResidentConfig;
 use rustamp_core::audio::{AudioSpec, DspStage, OutputDevice, OutputFormat, RenderFn};
 use rustamp_core::error::{Error, Result};
+use rustamp_ipc::Message;
 use rustamp_plughost::dsp_resident::{MODE_ARG, output_stage};
+use rustamp_proto::command::Command;
+
+use crate::dsp::{HelperLink, NowPlaying};
 
 /// Frames handed over at once: the classic block.
 const BLOCK_FRAMES: usize = 576;
 /// How far ahead of real time the thread may run: the plug-in's buffer fills
 /// first, so a stutter of the helper does not reach the output at once.
 const AHEAD: Duration = Duration::from_millis(250);
+/// Bounds the wait for the player to name the track before the first block.
+const TRACK_WAIT: Duration = Duration::from_secs(1);
+/// How far the clock may fall behind the blocks handed over: more than any
+/// plug-in's buffer in the test set (2 s), and what a clock that stands still
+/// costs at the end of a track.
+const CLOCK_SLACK: Duration = Duration::from_secs(10);
+
+/// The device's clock: what the plug-in reports it has played, bounded by what
+/// it was given.
+#[derive(Debug)]
+struct PlayClock {
+    sample_rate: u32,
+    /// Frames handed over, since the last flush as far as they count.
+    handed: u64,
+    /// The clock's value and the plug-in's report at the last flush: what was
+    /// flushed is not played, and never will be.
+    base: u64,
+    base_ms: u64,
+    /// The largest answer so far: the clock never runs back.
+    last: u64,
+}
+
+impl PlayClock {
+    fn new(sample_rate: u32) -> Self {
+        PlayClock {
+            sample_rate,
+            handed: 0,
+            base: 0,
+            base_ms: 0,
+            last: 0,
+        }
+    }
+
+    fn handed_over(&mut self, frames: u64) {
+        self.handed += frames;
+    }
+
+    /// The buffer of the plug-in is gone: what it held does not count, played or
+    /// handed.
+    fn flushed(&mut self, report_ms: Option<u64>) {
+        let now = self.played(report_ms);
+        self.base = now;
+        self.base_ms = report_ms.unwrap_or(0);
+        self.handed = now;
+    }
+
+    fn played(&mut self, report_ms: Option<u64>) -> u64 {
+        let played = match report_ms {
+            // No report yet: a plug-in without a clock plays what it is given.
+            None => self.handed,
+            Some(ms) => {
+                let since = ms.saturating_sub(self.base_ms) * u64::from(self.sample_rate) / 1000;
+                let slack = CLOCK_SLACK.as_secs() * u64::from(self.sample_rate);
+                (self.base + since)
+                    .max(self.handed.saturating_sub(slack))
+                    .min(self.handed)
+            }
+        };
+        self.last = self.last.max(played);
+        self.last
+    }
+}
 
 #[derive(Default)]
 struct Shared {
     running: AtomicBool,
     paused: AtomicBool,
     flush: AtomicBool,
-    played: AtomicU64,
+    clock: Mutex<Option<PlayClock>>,
     error: Mutex<Option<String>>,
 }
 
@@ -44,15 +116,23 @@ struct Shared {
 pub struct PluginOutput {
     name: String,
     config: DspResidentConfig,
+    now_playing: Arc<NowPlaying>,
     spec: Option<AudioSpec>,
     stage: Option<Box<dyn DspStage>>,
+    link: Option<HelperLink>,
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PluginOutput {
     /// The device for the plug-in `dll`, approved by the store at `approvals`.
-    pub fn new(helper: PathBuf, dll: &Path, approvals: &Path) -> Self {
+    /// `now_playing` is where the player names the track.
+    pub fn new(
+        helper: PathBuf,
+        dll: &Path,
+        approvals: &Path,
+        now_playing: Arc<NowPlaying>,
+    ) -> Self {
         let name = dll.file_name().map_or_else(
             || "output plug-in".to_owned(),
             |file| file.to_string_lossy().into_owned(),
@@ -65,8 +145,10 @@ impl PluginOutput {
         PluginOutput {
             name,
             config,
+            now_playing,
             spec: None,
             stage: None,
+            link: None,
             shared: Arc::new(Shared::default()),
             thread: None,
         }
@@ -78,20 +160,82 @@ impl PluginOutput {
             let _ = thread.join();
         }
     }
+
+    fn report_ms(&self) -> Option<u64> {
+        self.link.as_ref().and_then(HelperLink::played_ms)
+    }
 }
 
-fn pump(mut stage: Box<dyn DspStage>, mut render: RenderFn, spec: AudioSpec, shared: &Shared) {
+/// What the pump thread needs of the helper besides the stage.
+struct PumpLink<'a> {
+    now_playing: &'a NowPlaying,
+    link: Option<&'a HelperLink>,
+}
+
+impl PumpLink<'_> {
+    fn send(&self, message: Message) {
+        if let Some(link) = self.link {
+            link.send(message);
+        }
+    }
+
+    fn send_track(&self, seen: &mut u64) {
+        if let Some(message) = self.now_playing.message_since(seen) {
+            self.send(message);
+        }
+    }
+
+    fn report_ms(&self) -> Option<u64> {
+        self.link.and_then(HelperLink::played_ms)
+    }
+}
+
+fn pump(
+    mut stage: Box<dyn DspStage>,
+    mut render: RenderFn,
+    spec: AudioSpec,
+    shared: &Shared,
+    link: &PumpLink<'_>,
+) {
     let channels = usize::from(spec.channels);
     let mut block = vec![0.0f32; BLOCK_FRAMES * channels];
     let mut started = Instant::now();
     let mut paced = 0u64;
+    let mut paused = false;
+    let mut seen_track = 0;
+
+    // The plug-in may read the title when it is opened, with the first block.
+    let wait_from = Instant::now();
+    while !link.now_playing.has_track()
+        && wait_from.elapsed() < TRACK_WAIT
+        && shared.running.load(Ordering::Acquire)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
     while shared.running.load(Ordering::Acquire) {
+        link.send_track(&mut seen_track);
         if shared.flush.swap(false, Ordering::AcqRel) {
             stage.reset();
+            if let Ok(mut clock) = shared.clock.lock()
+                && let Some(clock) = clock.as_mut()
+            {
+                clock.flushed(link.report_ms());
+            }
             started = Instant::now();
             paced = 0;
         }
-        if shared.paused.load(Ordering::Acquire) {
+        let wanted_pause = shared.paused.load(Ordering::Acquire);
+        if wanted_pause != paused {
+            paused = wanted_pause;
+            // The helper's plug-in has one module, so the id means nothing here.
+            link.send(Message::CommandToHost(if paused {
+                Command::PausePlugin { plugin_id: 0 }
+            } else {
+                Command::UnpausePlugin { plugin_id: 0 }
+            }));
+        }
+        if paused {
             std::thread::sleep(Duration::from_millis(5));
             started = Instant::now();
             paced = 0;
@@ -110,9 +254,11 @@ fn pump(mut stage: Box<dyn DspStage>, mut render: RenderFn, spec: AudioSpec, sha
             return;
         }
         paced += BLOCK_FRAMES as u64;
-        shared
-            .played
-            .fetch_add(BLOCK_FRAMES as u64, Ordering::AcqRel);
+        if let Ok(mut clock) = shared.clock.lock()
+            && let Some(clock) = clock.as_mut()
+        {
+            clock.handed_over(BLOCK_FRAMES as u64);
+        }
     }
 }
 
@@ -122,9 +268,10 @@ impl OutputDevice for PluginOutput {
     }
 
     fn open(&mut self, spec: AudioSpec) -> Result<OutputFormat> {
-        let mut stage = self.config.open(spec)?;
+        let (mut stage, link) = crate::dsp::open_helper(&self.config, spec)?;
         stage.prepare(spec)?;
         self.stage = Some(stage);
+        self.link = Some(link);
         self.spec = Some(spec);
         Ok(OutputFormat {
             spec,
@@ -136,10 +283,19 @@ impl OutputDevice for PluginOutput {
         let (Some(stage), Some(spec)) = (self.stage.take(), self.spec) else {
             return Err(Error::Output(format!("{}: not open", self.name)));
         };
+        if let Ok(mut clock) = self.shared.clock.lock() {
+            *clock = Some(PlayClock::new(spec.sample_rate));
+        }
         self.shared.running.store(true, Ordering::Release);
         let shared = Arc::clone(&self.shared);
+        let now_playing = Arc::clone(&self.now_playing);
+        let link = self.link.clone();
         self.thread = Some(std::thread::spawn(move || {
-            pump(stage, render, spec, &shared);
+            let link = PumpLink {
+                now_playing: &now_playing,
+                link: link.as_ref(),
+            };
+            pump(stage, render, spec, &shared, &link);
         }));
         Ok(())
     }
@@ -164,7 +320,13 @@ impl OutputDevice for PluginOutput {
     }
 
     fn played_frames(&self) -> u64 {
-        self.shared.played.load(Ordering::Acquire)
+        let report = self.report_ms();
+        self.shared
+            .clock
+            .lock()
+            .ok()
+            .and_then(|mut clock| clock.as_mut().map(|clock| clock.played(report)))
+            .unwrap_or(0)
     }
 
     fn stream_error(&self) -> Option<Error> {
@@ -176,6 +338,7 @@ impl OutputDevice for PluginOutput {
     fn close(&mut self) -> Result<()> {
         self.stop_thread();
         self.stage = None;
+        self.link = None;
         Ok(())
     }
 }
@@ -190,6 +353,7 @@ impl Drop for PluginOutput {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
 
     /// Counts what reaches the plug-in, and fails when told to.
     struct Stage {
@@ -222,9 +386,11 @@ mod tests {
             PathBuf::from("host.exe"),
             Path::new(r"C:\Plugins\out_x.dll"),
             Path::new(r"C:\a.toml"),
+            Arc::default(),
         );
         device.stage = Some(Box::new(stage));
         device.spec = Some(AudioSpec::new(44_100, 2));
+        device.now_playing.publish(0, "title", "file");
         device
     }
 
@@ -294,5 +460,141 @@ mod tests {
         device.start(Box::new(|buf| buf.fill(0.0))).unwrap();
         assert!(wait(|| device.stream_error().is_some()));
         device.close().unwrap();
+    }
+
+    /// Runs the pump with a recording link until `script` is done with it.
+    fn run_pump(
+        now_playing: Arc<NowPlaying>,
+        script: impl FnOnce(&Shared, &mpsc::Receiver<Message>, &Arc<AtomicUsize>),
+    ) {
+        let (sent, heard) = mpsc::channel();
+        let shared = Arc::new(Shared::default());
+        shared.running.store(true, Ordering::Release);
+        let frames = Arc::new(AtomicUsize::new(0));
+        let stage = Box::new(Stage {
+            frames: Arc::clone(&frames),
+            resets: Arc::default(),
+            fail: false,
+        });
+        let thread = {
+            let shared = Arc::clone(&shared);
+            let now_playing = Arc::clone(&now_playing);
+            std::thread::spawn(move || {
+                let link = HelperLink::recording(sent);
+                pump(
+                    stage,
+                    Box::new(|buf| buf.fill(0.0)),
+                    AudioSpec::new(44_100, 2),
+                    &shared,
+                    &PumpLink {
+                        now_playing: &now_playing,
+                        link: Some(&link),
+                    },
+                );
+            })
+        };
+        script(&shared, &heard, &frames);
+        shared.running.store(false, Ordering::Release);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn the_track_goes_out_before_the_first_block_and_again_when_it_changes() {
+        let now_playing = Arc::new(NowPlaying::default());
+        let publisher = Arc::clone(&now_playing);
+        run_pump(now_playing, |_, heard, frames| {
+            // Nothing is played before the player names the track.
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(frames.load(Ordering::SeqCst), 0);
+            publisher.publish(2, "first", "a.mp3");
+            let first = heard.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                first,
+                Message::NowPlaying {
+                    position: 2,
+                    title: "first".to_owned(),
+                    file: "a.mp3".to_owned()
+                }
+            );
+            // Named again unchanged: no news.
+            publisher.publish(2, "first", "a.mp3");
+            publisher.publish(3, "second", "b.mp3");
+            let second = heard.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(second, Message::NowPlaying { position: 3, .. }));
+        });
+    }
+
+    #[test]
+    fn a_pause_and_a_resume_reach_the_plugin_once_each() {
+        let now_playing = Arc::new(NowPlaying::default());
+        now_playing.publish(0, "title", "file");
+        run_pump(now_playing, |shared, heard, _| {
+            assert!(matches!(
+                heard.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Message::NowPlaying { .. }
+            ));
+            shared.paused.store(true, Ordering::Release);
+            assert_eq!(
+                heard.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Message::CommandToHost(Command::PausePlugin { plugin_id: 0 })
+            );
+            assert!(heard.recv_timeout(Duration::from_millis(50)).is_err());
+            shared.paused.store(false, Ordering::Release);
+            assert_eq!(
+                heard.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Message::CommandToHost(Command::UnpausePlugin { plugin_id: 0 })
+            );
+        });
+    }
+
+    const RATE: u32 = 44_100;
+
+    #[test]
+    fn the_clock_is_what_the_plugin_played_not_what_it_was_given() {
+        let mut clock = PlayClock::new(RATE);
+        // Two seconds handed over, the plug-in still prebuffering.
+        clock.handed_over(2 * u64::from(RATE));
+        assert_eq!(clock.played(Some(0)), 0);
+        // It has played half a second of them.
+        assert_eq!(clock.played(Some(500)), u64::from(RATE) / 2);
+        // The track's end is reached when the plug-in says so.
+        assert_eq!(clock.played(Some(2000)), 2 * u64::from(RATE));
+    }
+
+    #[test]
+    fn the_clock_of_a_plugin_that_reports_nothing_is_what_it_was_given() {
+        let mut clock = PlayClock::new(RATE);
+        clock.handed_over(1000);
+        assert_eq!(clock.played(None), 1000);
+    }
+
+    #[test]
+    fn a_plugin_that_takes_everything_at_once_cannot_run_ahead_of_the_blocks() {
+        // The disk writer's clock can stand beyond what the pacing allowed.
+        let mut clock = PlayClock::new(RATE);
+        clock.handed_over(u64::from(RATE));
+        assert_eq!(clock.played(Some(5000)), u64::from(RATE));
+    }
+
+    #[test]
+    fn a_clock_that_stands_still_cannot_hold_the_track_for_ever() {
+        let mut clock = PlayClock::new(RATE);
+        let slack = CLOCK_SLACK.as_secs() * u64::from(RATE);
+        clock.handed_over(slack + 500);
+        assert_eq!(clock.played(Some(0)), 500);
+    }
+
+    #[test]
+    fn a_flush_forgets_what_was_handed_and_the_clock_never_runs_back() {
+        let mut clock = PlayClock::new(RATE);
+        clock.handed_over(2 * u64::from(RATE));
+        assert_eq!(clock.played(Some(1000)), u64::from(RATE));
+        // A Stop or a seek: a second the plug-in held is gone.
+        clock.flushed(Some(1000));
+        assert_eq!(clock.played(Some(1000)), u64::from(RATE));
+        clock.handed_over(u64::from(RATE));
+        assert_eq!(clock.played(Some(1500)), u64::from(RATE) * 3 / 2);
+        // A report from before does not take it back.
+        assert_eq!(clock.played(Some(1000)), u64::from(RATE) * 3 / 2);
     }
 }

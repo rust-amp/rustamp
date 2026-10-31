@@ -17,8 +17,14 @@ const ASK_WAIT: Duration = Duration::from_secs(10);
 
 /// What `dll` plays, asked of the helper: the 64-bit player cannot map it.
 fn extensions_of(helper: &Path, dll: &Path, approvals: &Path) -> Result<Vec<String>, String> {
+    let output = ask_helper(helper, &extensions_args(dll, approvals), ASK_WAIT)?;
+    Ok(parse_extensions(&output))
+}
+
+/// What a short-lived mode of the helper prints, within `wait`.
+pub(crate) fn ask_helper(helper: &Path, args: &[String], wait: Duration) -> Result<String, String> {
     let mut child = Command::new(helper)
-        .args(extensions_args(dll, approvals))
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -36,7 +42,7 @@ fn extensions_of(helper: &Path, dll: &Path, approvals: &Path) -> Result<Vec<Stri
         let _ = stderr.read_to_string(&mut err);
         let _ = done.send((out, err));
     });
-    let Ok((out, err)) = finished.recv_timeout(ASK_WAIT) else {
+    let Ok((out, err)) = finished.recv_timeout(wait) else {
         let _ = child.kill();
         let _ = child.wait();
         return Err("it did not answer in time".to_owned());
@@ -47,7 +53,7 @@ fn extensions_of(helper: &Path, dll: &Path, approvals: &Path) -> Result<Vec<Stri
     if !status.success() {
         return Err(err.trim().to_owned());
     }
-    Ok(parse_extensions(&out))
+    Ok(out)
 }
 
 /// The factory that plays what `dll` claims through a resident per track.
