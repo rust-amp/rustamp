@@ -71,7 +71,7 @@
 //! | §2 the class name is case-sensitive | the class half of the instance key is not case-folded | matches | `rustamp-platform/src/single_instance.rs` |
 //! | §1 `/CONFIG=<path>` is the configuration file to use instead of the default | [`Args::config`] replaces the resolved default | matches | `cli.rs`, `lib.rs` |
 //! | §1 `/BOOKMARK <path>` adds the path as a bookmark rather than playing it | [`Args::bookmark`] carries the path; the run adds it and does not play it | matches (see the note below) | `cli.rs`, `lib.rs` |
-//! | §1 `/ADD <path>` enqueues the path instead of playing it — the `Enqueue` verb of §3, which the reference registers with the command line `"%s" /ADD "%%1"` (second audit pass, 2026-10-20) | [`Args::enqueue`] carries the path; the run adds it to the playlist and does not play it | matches | `cli.rs`, `lib.rs` |
+//! | §1 `/ADD <path>` appends the path — the `Enqueue` verb of §3, which the reference registers with the command line `"%s" /ADD "%%1"`. A running instance only appends; a first start then plays the list from its first entry | [`Args::enqueue`] carries the path; a first start adds it and plays, [`forward_request`] hands it to a running instance as added | matches | `cli.rs`, `lib.rs` |
 //! | §1 `/INSTALL` is the installer association step | [`RegistrationFlags::install`] | matches | `rustamp-platform/src/shell_registration.rs` |
 //! | §1 `/UNREG` removes the shell registration | [`RegistrationFlags::unreg`] | matches | `rustamp-platform/src/shell_registration.rs` |
 //! | §1 `/NOREG` skips the registration step | [`RegistrationFlags::noreg`] | matches | `rustamp-platform/src/shell_registration.rs` |
@@ -93,9 +93,9 @@
 //!
 //! The note on `/ADD`: the reference registers its `Enqueue` shell verb with
 //! the command line `"%s" /ADD "%%1"` (S13 §3), so the verb **is** the switch.
-//! Rustamp's own `--enqueue` asks the same thing about the file argument, and
-//! both spellings end in one [`Enqueue`] value, so the verb and the switch ask
-//! for the same thing in the same words and cannot drift apart.
+//! Rustamp's own `--enqueue` asks about the file argument, and both spellings
+//! end in one [`Enqueue`] value. They differ on a first start, where `/ADD` plays
+//! the list and `--enqueue` stays silent: that is what it is for.
 //!
 //! The open questions of S13 §5 stay open here: the in-window drop rule
 //! (§5.1), the drop of a folder (§5.2), `/BOOKMARK` without a path (§5.3),
@@ -152,20 +152,19 @@ pub enum Bookmark {
 
 /// What the command line asks to be enqueued instead of played.
 ///
-/// S13 §1: `/ADD <path>` enqueues the path instead of playing it — the
-/// `Enqueue` verb of §3, which the reference registers with the command line
-/// `"%s" /ADD "%%1"`. Rustamp's own `--enqueue` asks the same thing about the
-/// file argument, so both spellings end in this one value: the shell's verb
-/// and the reference's switch ask for the same thing in the same words.
+/// S13 §1: `/ADD <path>` appends the path — the `Enqueue` verb of §3, which the
+/// reference registers with the command line `"%s" /ADD "%%1"`. Rustamp's own
+/// `--enqueue` asks about the file argument, so both spellings end in this one
+/// value. Only `/ADD` plays the list on a first start.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Enqueue {
     /// Nothing is enqueued.
     #[default]
     None,
-    /// The media argument is enqueued instead of played (`--enqueue`).
+    /// The media argument is added and nothing plays (`--enqueue`).
     Argument,
-    /// This media is enqueued instead of played (`/ADD <path>`). The path is
-    /// read by [`media_argument`], so it may be an `http://` URL.
+    /// This media is added (`/ADD <path>`); a first start then plays the list.
+    /// The path is read by [`media_argument`], so it may be an `http://` URL.
     Location(MediaLocation),
     /// `/ADD` without a path.
     ///
@@ -247,7 +246,7 @@ pub struct Args {
     /// switch for this; the alternative was a debug window in the menu, and a
     /// console that the notes already go to is the smaller change.
     pub console: bool,
-    /// What is enqueued instead of played (`--enqueue`, `/ADD <path>`).
+    /// What is enqueued (`--enqueue`, `/ADD <path>`).
     pub enqueue: Enqueue,
     /// The window class the single-instance check looks for (`/CLASS=`).
     pub class: Option<String>,
@@ -332,7 +331,8 @@ usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <
   /CLASS=<name>     the window class the single-instance check looks for
   /CONFIG=<path>    the configuration file to use instead of the default
   /BOOKMARK <path>  add the path as a bookmark rather than playing it
-  /ADD <path>       add the path to the playlist instead of playing it
+  /ADD <path>       add the path to the playlist; a first start then plays the list,
+                    a running instance only adds
   /INSTALL          write the shell registration
   /UNREG            remove the shell registration
   /NOREG            skip the registration step
@@ -645,7 +645,7 @@ pub fn forward_request(args: &Args) -> ForwardRequest {
         );
     }
     // The enqueued media (S13 §1): `/ADD <path>` names its own media and
-    // `--enqueue` names the media argument. Both are added and not played. A
+    // `--enqueue` names the media argument. A running instance only adds both. A
     // `/ADD` without a path is left open by S13 §5.3, so it is reported
     // rather than guessed.
     let (file, enqueued) = match &args.enqueue {
@@ -1204,8 +1204,8 @@ mod tests {
 
     #[test]
     fn an_added_path_is_not_the_file_that_is_played() {
-        // The path of `/ADD` is enqueued; it is not the file the player
-        // loads and plays.
+        // The path of `/ADD` is added to the list; it does not replace the list
+        // the way the file argument does.
         let args = parse_args(&["/ADD", "C:/music/a.mp3"]).unwrap();
         assert_eq!(args.media, None);
     }
