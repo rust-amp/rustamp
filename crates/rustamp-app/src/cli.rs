@@ -327,7 +327,8 @@ usage: rustamp [<file|url>] [--null] [--no-audio] [--volume <0..=255>] [--skin <
   -h, --help        print this help
   --approve-plugin  put the exact image of each plug-in on the allowlist
                     (plugins-approved.toml beside the configuration file) and exit; the
-                    plug-in then may run inside the plug-in host. Nothing is run.
+                    plug-in then may run inside the plug-in host once it is switched on in
+                    Preferences. Nothing is run.
 
   /CLASS=<name>     the window class the single-instance check looks for
   /CONFIG=<path>    the configuration file to use instead of the default

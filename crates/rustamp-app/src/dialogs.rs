@@ -108,7 +108,7 @@ use rustamp_core::command::{Command, JumpTarget, OpenMediaKind, PrefsPage};
 use rustamp_core::meta::TrackMetadata;
 use rustamp_gfx::Image;
 use rustamp_meta::TagField;
-use rustamp_platform::{Bind, PluginRow, PrefsAction, PrefsNode, PrefsSettings};
+use rustamp_platform::{Bind, PluginRow, PrefsAction, PrefsNode, PrefsSettings, RowId};
 use rustamp_plugin_abi::PluginKind;
 use rustamp_prefs::page_name;
 use rustamp_ui::{
@@ -721,6 +721,7 @@ impl App {
             library_roots: self.library_roots(),
             winamp_ini_report: self.winamp_ini_report(),
             file_types_report: self.file_types_report.clone(),
+            plugins_report: self.plugins_report.clone(),
         }
     }
 
@@ -739,9 +740,22 @@ impl App {
         for node in PLUGIN_NODES {
             let info = |text: String| PluginRow {
                 node,
-                id: None,
+                id: RowId::Info,
                 text,
             };
+            // The Output page's first row is the choice that needs no plug-in.
+            if node == PrefsNode::Output {
+                let state = if self.active_output_file().is_some() {
+                    "off"
+                } else {
+                    "on"
+                };
+                rows.push(PluginRow {
+                    node,
+                    id: RowId::OwnOutput,
+                    text: format!("The player's own output - {state}"),
+                });
+            }
             if let Some(problem) = &scan.dir_problem {
                 rows.push(info(format!("Plug-in folder unreadable: {problem}")));
             }
@@ -764,7 +778,7 @@ impl App {
                 if plugin_node_for(entry.kind) == node {
                     rows.push(PluginRow {
                         node,
-                        id: Some(index),
+                        id: RowId::Plugin(index),
                         text: entry.row_text(config),
                     });
                 }
@@ -821,12 +835,13 @@ impl App {
                 if self.config().audio.output_mode == mode {
                     return;
                 }
-                // The device is opened when the player starts, so the mode is
-                // saved now and applied at the next start/device creation.
                 self.set_output_mode(mode);
                 if let Err(error) = self.save_config() {
                     self.note(format!("preferences: {error}"));
                 }
+                // The device opens with the mode, so it is opened again now or,
+                // when a run owns it, when playback has stopped.
+                self.change_output();
             }
             PrefsAction::LoadSkin(row) => {
                 let Some(entry) = self.browser_entries().into_iter().nth(row) else {
@@ -850,6 +865,7 @@ impl App {
                 // they are read before the scan is borrowed again.
                 let path = entry.path.clone();
                 let kind = entry.kind;
+                let file = entry.file.clone();
                 match self.set_plugin_enabled(index, on) {
                     Ok(()) => {
                         // Saved at once: the choice must not wait for a clean
@@ -870,7 +886,8 @@ impl App {
                             // plug-in gets this far: the approval gate in
                             // `set_plugin_enabled` refuses the rest, so the
                             // host is never asked for an unapproved image.
-                            self.request_plugin_load(&path, kind);
+                            self.plugins_report = Some(format!("{file} is on."));
+                            self.ask_host_to_load(&path, kind);
                             if kind == PluginKind::Dsp {
                                 // The manual recovery from a bypass: the
                                 // engine's policy is that a bypass lasts
@@ -903,6 +920,9 @@ impl App {
                             // plug-in stays loaded in the host until the host
                             // is replaced. Saying so beats a switch that
                             // looks as if it stopped something.
+                            self.plugins_report = Some(format!(
+                                "{file} is off. It stays loaded until the plugin host restarts."
+                            ));
                             self.note(format!(
                                 "the plugin host has no unload request: {} stays loaded until \
                                  the host restarts",
@@ -917,10 +937,71 @@ impl App {
                             }
                         }
                     }
-                    Err(refused) => self.note(format!("preferences: {refused}")),
+                    Err(refused) => {
+                        self.plugins_report = Some(refused.to_string());
+                        self.note(format!("preferences: {refused}"));
+                    }
                 }
             }
-            PrefsAction::RescanPlugins => self.rescan_plugins(),
+            PrefsAction::ApprovePlugin(index) => {
+                let Some(entry) = self.plugin_scan().entries.get(index) else {
+                    return;
+                };
+                let file = entry.file.clone();
+                match &entry.status {
+                    rustamp_prefs::PluginStatus::Approved => {
+                        self.plugins_report = Some(format!("{file} is already approved."));
+                    }
+                    rustamp_prefs::PluginStatus::Refused(reason) => {
+                        self.plugins_report = Some(format!("{file} cannot be approved: {reason}"));
+                    }
+                    rustamp_prefs::PluginStatus::NotApproved => {
+                        match crate::plugin_approval::PendingApproval::read(&entry.path) {
+                            // The warning needs an owner window: the presenter
+                            // asks, from the tick.
+                            Ok(pending) => self.pending_plugin_approval = Some(pending),
+                            Err(error) => {
+                                self.plugins_report =
+                                    Some(format!("{file} cannot be approved: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+            PrefsAction::SelectOutput(None) => {
+                rustamp_prefs::use_own_output(&mut self.config_mut().plugins);
+                if let Err(error) = self.save_config() {
+                    self.note(format!("preferences: {error}"));
+                }
+                self.install_plugin_output();
+                self.plugins_report = Some(self.output_text());
+            }
+            PrefsAction::SelectOutput(Some(index)) => {
+                let Some(entry) = self.plugin_scan().entries.get(index) else {
+                    return;
+                };
+                let path = entry.path.clone();
+                let kind = entry.kind;
+                match self.set_plugin_enabled(index, true) {
+                    Ok(()) => {
+                        if let Err(error) = self.save_config() {
+                            self.note(format!("preferences: {error}"));
+                        }
+                        self.install_plugin_output();
+                        self.plugins_report = Some(self.output_text());
+                        // Configure talks to the plug-in in the host.
+                        self.ask_host_to_load(&path, kind);
+                    }
+                    Err(refused) => {
+                        self.plugins_report = Some(refused.to_string());
+                        self.note(format!("preferences: {refused}"));
+                    }
+                }
+            }
+            PrefsAction::RescanPlugins => {
+                self.rescan_plugins();
+                self.plugins_report = None;
+            }
             PrefsAction::ConfigurePlugin(index) => self.configure_plugin_at(index),
             PrefsAction::AddLibraryRoot => {
                 // The dialog does not pick the folder itself: the presenter

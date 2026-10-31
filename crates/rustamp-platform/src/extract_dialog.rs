@@ -97,6 +97,20 @@ pub fn ask_yes_no_cancel(
     Err(FileDialogError::Unsupported)
 }
 
+/// Warns the user and asks for a yes. `No` is the default button, and without a
+/// native dialog the answer is no.
+#[cfg(windows)]
+pub fn confirm_warning(raw_owner: isize, title: &str, text: &str) -> bool {
+    win32::confirm_warning(raw_owner, title, text)
+}
+
+/// Warns the user and asks for a yes. `No` is the default button, and without a
+/// native dialog the answer is no.
+#[cfg(not(windows))]
+pub fn confirm_warning(_raw_owner: isize, _title: &str, _text: &str) -> bool {
+    false
+}
+
 #[cfg(windows)]
 mod win32 {
     use std::cell::RefCell;
@@ -111,10 +125,11 @@ mod win32 {
     use windows::Win32::UI::WindowsAndMessaging::{
         CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetMessageW, GetWindowTextW, HMENU, IDC_ARROW, IDNO, IDYES, IsDialogMessageW, LoadCursorW,
-        MB_ICONQUESTION, MB_YESNOCANCEL, MSG, MessageBoxW, PostQuitMessage, RegisterClassExW,
-        SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-        SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-        WM_DESTROY, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+        MB_DEFBUTTON2, MB_ICONQUESTION, MB_ICONWARNING, MB_YESNO, MB_YESNOCANCEL, MSG, MessageBoxW,
+        PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+        SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
+        WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
     };
     use windows::core::{PCWSTR, w};
 
@@ -525,6 +540,24 @@ mod win32 {
 
         let answer = STATE.with(|state| state.borrow_mut().take());
         Ok(answer.and_then(|inner| inner.answer))
+    }
+
+    /// Warns the user and asks for a yes; the safe answer is the default button.
+    pub fn confirm_warning(raw_owner: isize, title: &str, text: &str) -> bool {
+        let owner = HWND(raw_owner as *mut c_void);
+        let text = wide(text);
+        let title = wide(title);
+        // SAFETY: the strings are NUL-terminated and outlive the call; the
+        // owner is the player's own window.
+        let answer = unsafe {
+            MessageBoxW(
+                Some(owner),
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            )
+        };
+        answer.0 == IDYES.0
     }
 
     /// Asks the user a yes/no question.

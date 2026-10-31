@@ -1916,6 +1916,30 @@ impl Windowed {
         eprintln!("rustamp: a native save dialog is only implemented on Windows");
     }
 
+    /// Shows the warning of an approval the Preferences asked for and hands the
+    /// user's answer back. A message box runs its own modal loop, so it is opened
+    /// from the tick and never from a window procedure.
+    fn drain_plugin_approval(&mut self) {
+        let Some(pending) = self.app.take_plugin_approval_request() else {
+            return;
+        };
+        #[cfg(windows)]
+        let owner = self
+            .prefs_window
+            .as_ref()
+            .filter(|window| window.is_open())
+            .map(|window| window.raw_handle())
+            .unwrap_or_else(|| self.raw_main_window());
+        #[cfg(not(windows))]
+        let owner = 0;
+        let approved = rustamp_platform::confirm_warning(
+            owner,
+            "Approve a plug-in: this is code that runs on your computer",
+            &pending.warning(),
+        );
+        self.app.finish_plugin_approval(pending, approved);
+    }
+
     /// Shows the native dialog for a Winamp configuration file and imports
     /// it (S12).
     ///
@@ -3595,6 +3619,7 @@ impl ApplicationHandler for Windowed {
         self.drain_eq_menu();
         self.drain_media_pick();
         self.drain_winamp_ini_import();
+        self.drain_plugin_approval();
         self.drain_save_playlist();
         self.drain_html_playlist();
         self.drain_prefs();

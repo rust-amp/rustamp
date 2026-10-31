@@ -38,7 +38,7 @@
 //! | `ui.playlist_title_format` | the playlist's row text | written when the user set one; a format that cannot be read is reported and the plain text stays |
 //! | `eq.state` | `App::with_registry` → `Engine::set_eq` | written |
 //! | `plugins.plugin_dir` | `App::plugin_dir` → `rustamp_prefs::scan` | written |
-//! | `plugins.disabled` | `App::set_plugin_enabled` → `rustamp_prefs::set_enabled` | written |
+//! | `plugins.enabled` | `App::set_plugin_enabled` → `rustamp_prefs::set_enabled` | written |
 //! | `playlist.shuffle` | `App::with_registry` → `Engine::set_shuffle` (S15) | written |
 //! | `playlist.repeat` | `App::with_registry` → `Engine::set_repeat` (S15) | written |
 //! | `audio.output` | — the backend comes from the command line | **preserved** |
@@ -87,6 +87,15 @@
 //! A comment that documents a setting travels with that setting. A comment
 //! that stands on its own — above a setting the app owns, or at the end of
 //! the file — is not kept: the app rewrites the file it owns.
+//!
+//! # The migration from schema 1
+//!
+//! Schema 1 kept an off-list (`plugins.disabled`): every approved plug-in that
+//! was not on it ran. Schema 2 keeps an explicit `plugins.enabled` (RFC 0022).
+//! A file without a version or with version 1 is migrated when it is loaded:
+//! `enabled` becomes the approval store's names minus the off-list, with one
+//! output, so what ran before runs after the upgrade. The first save writes
+//! schema 2 and drops `plugins.disabled`.
 //!
 //! A missing config file is **not** an error (it means "use defaults").
 //! A malformed config file **fails loudly** with an explicit error rather than
@@ -169,8 +178,11 @@ const OWNED_PATHS: &[&[&str]] = &[
     &["playlist", "shuffle"],
     &["playlist", "repeat"],
     &["plugins", "plugin_dir"],
-    &["plugins", "disabled"],
+    &["plugins", "enabled"],
 ];
+
+/// Schema 1's off-list: migrated when loaded, so a save does not keep it.
+const MIGRATED_PATH: [&str; 2] = ["plugins", "disabled"];
 
 /// Whether the app owns the setting at `path`.
 ///
@@ -178,13 +190,14 @@ const OWNED_PATHS: &[&[&str]] = &[
 /// equalizer's state is one table, so every key inside it belongs to the
 /// app.
 fn owns(path: &[String]) -> bool {
-    OWNED_PATHS.iter().any(|owned| {
-        owned.len() <= path.len()
-            && owned
-                .iter()
-                .zip(path.iter())
-                .all(|(name, part)| *name == part.as_str())
-    })
+    path == MIGRATED_PATH
+        || OWNED_PATHS.iter().any(|owned| {
+            owned.len() <= path.len()
+                && owned
+                    .iter()
+                    .zip(path.iter())
+                    .all(|(name, part)| *name == part.as_str())
+        })
 }
 
 /// Whether the app owns the setting at `path` in the file `previous`.
@@ -414,8 +427,9 @@ pub fn ignored_fields_in_toml(val: &toml::Value) -> Vec<String> {
     if let Some(plugins) = table.get("plugins").and_then(toml::Value::as_table) {
         for key in plugins.keys() {
             let reason = match key.as_str() {
-                // The plug-in pages edit and save these two.
-                "plugin_dir" | "disabled" => None,
+                // The plug-in pages edit and save the first two; the third is
+                // schema 1's off-list, which the load migrates.
+                "plugin_dir" | "enabled" | "disabled" => None,
                 "vis_plugin" => Some("visualization plugin loading is not supported yet"),
                 "vis_preset" => Some("visualization preset is not supported yet"),
                 _ => Some("unrecognized plugins setting"),
@@ -451,17 +465,57 @@ fn parse_text(text: &str, path: Option<&Path>) -> Result<ParsedFile, ConfigError
             .unwrap_or_else(|| PathBuf::from("<memory>")),
         error: e.to_string(),
     })?;
-    let config: Config = toml::from_str(text).map_err(|e| ConfigError::Malformed {
+    let mut config: Config = toml::from_str(text).map_err(|e| ConfigError::Malformed {
         path: path
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("<memory>")),
         error: e.to_string(),
     })?;
-    let warnings = ignored_fields_in_toml(&toml_val);
+    let mut warnings = ignored_fields_in_toml(&toml_val);
+    migrate_plugin_list(&mut config, &toml_val, path, &mut warnings);
+    rustamp_prefs::keep_one_output(&mut config.plugins);
     let ui = toml_val.get("ui").and_then(toml::Value::as_table);
     let playlist_font_size = ui.and_then(playlist_font_size_in_toml);
     let playlist_title_format = ui.and_then(title_format_in_toml);
     Ok((config, warnings, playlist_font_size, playlist_title_format))
+}
+
+/// Turns schema 1's off-list into the explicit list of schema 2 (see the module
+/// docs). A store that cannot be read approves nothing, so nothing is carried
+/// over as on, and the user is told.
+fn migrate_plugin_list(
+    config: &mut Config,
+    file: &toml::Value,
+    path: Option<&Path>,
+    warnings: &mut Vec<String>,
+) {
+    let version = file.get("version").and_then(toml::Value::as_integer);
+    if version.is_some_and(|version| version >= 2) {
+        return;
+    }
+    config.version = rustamp_core::config::CONFIG_VERSION;
+    let off_list: Vec<&str> = file
+        .get("plugins")
+        .and_then(|plugins| plugins.get("disabled"))
+        .and_then(toml::Value::as_array)
+        .map(|list| list.iter().filter_map(toml::Value::as_str).collect())
+        .unwrap_or_default();
+    let Some(path) = path else {
+        return;
+    };
+    let store_path = crate::plugin_approval::store_path_for(path);
+    match rustamp_plughost::ApprovalStore::open_or_empty(&store_path) {
+        Ok(store) => {
+            config.plugins.enabled = rustamp_prefs::enabled_from_off_list(
+                store.entries().iter().map(|entry| entry.name.as_str()),
+                &off_list,
+            );
+        }
+        Err(error) => warnings.push(format!(
+            "no plug-in was carried over as switched on, because {} could not be read: {error}",
+            store_path.display()
+        )),
+    }
 }
 
 /// The playlist font size a `[ui]` table names, when it names a usable one.
@@ -687,8 +741,8 @@ pub fn serialize_honest(
     eq.insert("state".into(), eq_state);
     root.insert("eq".into(), toml::Value::Table(eq));
 
-    // The plug-in pages edit the plug-in folder and the off-list, so those two
-    // are persisted (and only when set, to keep a default file small).
+    // The plug-in pages edit the plug-in folder and the enabled list, so those
+    // two are persisted (and only when set, to keep a default file small).
     let mut plugins = toml::Table::new();
     if let Some(dir) = &config.plugins.plugin_dir {
         plugins.insert(
@@ -696,13 +750,13 @@ pub fn serialize_honest(
             toml::Value::String(dir.to_string_lossy().into_owned()),
         );
     }
-    if !config.plugins.disabled.is_empty() {
+    if !config.plugins.enabled.is_empty() {
         plugins.insert(
-            "disabled".into(),
+            "enabled".into(),
             toml::Value::Array(
                 config
                     .plugins
-                    .disabled
+                    .enabled
                     .iter()
                     .cloned()
                     .map(toml::Value::String)
@@ -963,7 +1017,7 @@ mod tests {
                 plugin_dir: Some(PathBuf::from("plugins")),
                 vis_plugin: Some("vis_milk2.dll".into()),
                 vis_preset: Some("preset_1.milk".into()),
-                disabled: vec!["bad.dll".into()],
+                enabled: vec!["bad.dll".into()],
             },
         }
     }
@@ -1029,7 +1083,7 @@ mod tests {
             c.plugins.vis_preset, d.plugins.vis_preset,
             "plugins.vis_preset"
         );
-        assert_ne!(c.plugins.disabled, d.plugins.disabled, "plugins.disabled");
+        assert_ne!(c.plugins.enabled, d.plugins.enabled, "plugins.enabled");
     }
 
     /// The value at `path` in a TOML document, when the document has one.
@@ -1237,8 +1291,8 @@ mod tests {
             "plugins.plugin_dir"
         );
         assert_eq!(
-            loaded.config.plugins.disabled, config.plugins.disabled,
-            "plugins.disabled"
+            loaded.config.plugins.enabled, config.plugins.enabled,
+            "plugins.enabled"
         );
 
         // Every window keeps every field, including its size.
@@ -1382,8 +1436,8 @@ mod tests {
             "plugins.plugin_dir"
         );
         assert_eq!(
-            back.plugins.disabled, config.plugins.disabled,
-            "plugins.disabled"
+            back.plugins.enabled, config.plugins.enabled,
+            "plugins.enabled"
         );
 
         let document = toml::from_str::<toml::Value>(&text).expect("valid TOML");
@@ -1562,7 +1616,7 @@ mod tests {
         config.audio.fadeout_ms = 900;
         config.playlist.shuffle = true;
         config.playlist.repeat = true;
-        config.plugins.disabled = vec!["bad_plugin.dll".into()];
+        config.plugins.enabled = vec!["bad_plugin.dll".into()];
 
         let serialized = serialize_honest(&config, None, None).expect("serialize honest");
 

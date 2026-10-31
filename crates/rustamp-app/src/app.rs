@@ -561,8 +561,12 @@ pub struct App {
     bypassed_dsp: Option<crate::dsp::BypassedDsp>,
     /// The output plug-in the engine plays through, by its device name.
     plugin_output_name: Option<String>,
-    /// A change of output plug-in that waits for playback to stop.
-    plugin_output_pending: bool,
+    /// A change of the output (plug-in or mode) that waits for playback to stop.
+    output_change_pending: bool,
+    /// An approval that waits for the user's answer, for the presenter's warning.
+    pub(crate) pending_plugin_approval: Option<crate::plugin_approval::PendingApproval>,
+    /// The running host read its allowlist before the last approval.
+    host_allowlist_stale: bool,
     /// Whether the installed chain is one a caller of the app gave it.
     caller_dsp_chain: bool,
     /// Whether the installed chain is the switched-on DSP plug-in's.
@@ -586,6 +590,8 @@ pub struct App {
     config_path: Option<PathBuf>,
     /// What the file-types page's last action did.
     pub(crate) file_types_report: Option<String>,
+    /// What the plug-in pages' last action did, for their report line.
+    pub(crate) plugins_report: Option<String>,
     /// The bookmarks (see [`crate::bookmarks`]).
     pub(crate) bookmarks: crate::bookmarks::Bookmarks,
     /// A Winamp configuration import waiting for the presenter's file dialog
@@ -820,6 +826,7 @@ impl App {
             plugin_startup_loaded: false,
             config_path: None,
             file_types_report: None,
+            plugins_report: None,
             bookmarks: crate::bookmarks::Bookmarks::default(),
             bus,
             events,
@@ -886,7 +893,9 @@ impl App {
             location_refusal: None,
             dsp_chain: crate::dsp::DspChain::default(),
             plugin_output_name: None,
-            plugin_output_pending: false,
+            output_change_pending: false,
+            pending_plugin_approval: None,
+            host_allowlist_stale: false,
             caller_dsp_chain: false,
             plugin_dsp_installed: false,
             bypassed_dsp: None,
@@ -1252,10 +1261,10 @@ impl App {
                 ..PlaylistConfig::default()
             },
             plugins: PluginsConfig {
-                // What the plug-in pages edit: the folder and the off-list.
+                // What the plug-in pages edit: the folder and the enabled list.
                 // The rest stays unpersisted (see `config::serialize_honest`).
                 plugin_dir: self.config.plugins.plugin_dir.clone(),
-                disabled: self.config.plugins.disabled.clone(),
+                enabled: self.config.plugins.enabled.clone(),
                 ..PluginsConfig::default()
             },
         }
@@ -1872,6 +1881,10 @@ impl App {
         // ends, so an install during the run would be dropped then.
         if self.dsp_install_pending && self.engine.transport() == TransportState::Stopped {
             self.install_dsp_chain_now();
+        }
+        // The output (a plug-in or the mode) changed while a run was live.
+        if self.output_change_pending && self.engine.transport() == TransportState::Stopped {
+            self.change_output();
         }
 
         // The skins folder is read when the skin list is asked for; an entry
@@ -2653,9 +2666,12 @@ impl App {
         };
         let (file, kind) = (entry.file.clone(), entry.kind);
         let Some(plugin) = self.loaded_plugin_for_file(&file, kind) else {
-            self.note(format!(
-                "{file} is not loaded in the plugin host (switch it on first), or the host                  reported several {kind:?} plug-ins and none of them names it"
-            ));
+            let text = format!(
+                "{file} is not loaded in the plugin host: switch it on first. If it is on, the \
+                 host reported several plug-ins of this kind and none of them names it."
+            );
+            self.plugins_report = Some(text.clone());
+            self.note(text);
             return;
         };
         let (plugin_id, kind) = (plugin.plugin_id, plugin.kind);
@@ -2732,10 +2748,12 @@ impl App {
             // The host refused this file, so it is not loaded: a later
             // request for it may try again.
             self.plugin_requests.remove(&failure.path);
-            self.note(format!(
+            let text = format!(
                 "the plugin host could not load {}: {}",
                 failure.path, failure.message
-            ));
+            );
+            self.plugins_report = Some(text.clone());
+            self.note(text);
         }
         outcome
     }
@@ -2847,8 +2865,8 @@ impl App {
     /// The plug-ins the user has switched on, in the scan's order.
     ///
     /// "Switched on" means what the plug-in pages show as "on": the
-    /// approval store approved the exact image **and** the file is not on
-    /// the disabled list ([`rustamp_prefs::PluginEntry::is_enabled`]). A
+    /// approval store approved the exact image **and** the file is on the
+    /// enabled list ([`rustamp_prefs::PluginEntry::is_enabled`]). A
     /// plug-in that is not approved is off whatever the list says, and the
     /// host would refuse it anyway.
     ///
@@ -3643,8 +3661,8 @@ impl App {
         self.dsp_install_pending = false;
     }
 
-    /// The output plug-in the player plays through: the first one switched on
-    /// (only one output is active, S09 section 4), when the player plays at all.
+    /// The output plug-in the player plays through: the one switched on (only
+    /// one output is active, S09 section 4), when the player plays at all.
     #[cfg(windows)]
     fn plugin_output_device(&self) -> Option<Box<dyn rustamp_core::audio::OutputDevice>> {
         if self.output_choice != OutputChoice::Default {
@@ -3668,26 +3686,132 @@ impl App {
         None
     }
 
-    /// Moves the audio to the output plug-in the user switched on, or back to
-    /// the player's own output. A running track keeps its output, so the change
-    /// waits for a stop.
+    /// Moves the audio to the output plug-in the user chose, or back to the
+    /// player's own output.
     pub(crate) fn install_plugin_output(&mut self) {
         let wanted = self
             .plugin_output_device()
             .map(|device| device.name().to_owned());
-        if wanted == self.plugin_output_name {
-            return;
+        if wanted != self.plugin_output_name {
+            self.change_output();
         }
+    }
+
+    /// Opens the output the settings name. A running track keeps its output, so
+    /// the change waits for a stop: [`App::pump`] calls this again then.
+    pub(crate) fn change_output(&mut self) {
         if self.engine.transport() != TransportState::Stopped {
-            self.note("the output changes when playback has stopped".to_owned());
-            self.plugin_output_pending = true;
+            if !self.output_change_pending {
+                self.note("the output changes when playback has stopped".to_owned());
+            }
+            self.output_change_pending = true;
+            self.plugins_report = Some(self.output_text());
             return;
         }
-        self.plugin_output_pending = false;
-        self.plugin_output_name = wanted;
-        if let Err(error) = self.recreate_engine() {
-            self.note(format!("the output could not be changed: {error}"));
+        self.output_change_pending = false;
+        self.plugin_output_name = self
+            .plugin_output_device()
+            .map(|device| device.name().to_owned());
+        match self.recreate_engine() {
+            Ok(()) => {
+                // The new engine starts without a chain.
+                self.install_dsp_chain_now();
+                self.plugins_report = Some(self.output_text());
+            }
+            Err(error) => {
+                let text = format!("the output could not be changed: {error}");
+                self.plugins_report = Some(text.clone());
+                self.note(text);
+            }
         }
+    }
+
+    /// What the Output page says about the output.
+    pub(crate) fn output_text(&self) -> String {
+        if self.output_change_pending {
+            return "The output changes when playback has stopped.".to_string();
+        }
+        match (&self.plugin_output_name, self.active_output_file()) {
+            (Some(name), _) => format!("The player plays through {name}."),
+            (None, Some(file)) => format!(
+                "{file} cannot play: the plug-in host was not found, or this run has no sound \
+                 output. The player's own output stays in use."
+            ),
+            (None, None) => "The player plays through its own output.".to_string(),
+        }
+    }
+
+    /// The file of the output plug-in that is switched on.
+    pub(crate) fn active_output_file(&self) -> Option<String> {
+        self.plugin_scan
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.kind == PluginKind::Output && entry.is_enabled(&self.config.plugins)
+            })
+            .map(|entry| entry.file.clone())
+    }
+
+    /// Takes the approval waiting for the user's answer, for the presenter's
+    /// warning.
+    pub fn take_plugin_approval_request(
+        &mut self,
+    ) -> Option<crate::plugin_approval::PendingApproval> {
+        self.pending_plugin_approval.take()
+    }
+
+    /// The user answered the warning. Yes records the image the warning named,
+    /// and nothing else: the plug-in stays off until the user switches it on.
+    ///
+    /// A file that was on the enabled list under an older image goes off the
+    /// list, because approving never makes anything run. The running host read
+    /// its allowlist when it started, so it is replaced when the next plug-in is
+    /// switched on (see [`App::ask_host_to_load`]).
+    pub fn finish_plugin_approval(
+        &mut self,
+        pending: crate::plugin_approval::PendingApproval,
+        approved: bool,
+    ) {
+        if !approved {
+            self.plugins_report = Some(format!("{} was not approved.", pending.name));
+            return;
+        }
+        match pending.approve(&self.plugin_approvals_path()) {
+            Ok(_) => {
+                rustamp_prefs::forget_file(&mut self.config.plugins, &pending.name);
+                if let Err(error) = self.save_config() {
+                    self.note(format!("preferences: {error}"));
+                }
+                self.host_allowlist_stale = true;
+                self.rescan_plugins();
+                self.plugins_report = Some(format!(
+                    "{} is approved and stays off until you switch it on.",
+                    pending.name
+                ));
+            }
+            Err(error) => {
+                let text = format!("{} was not approved: {error}", pending.name);
+                self.plugins_report = Some(text.clone());
+                self.note(text);
+            }
+        }
+    }
+
+    /// Asks the host for a plug-in the user just switched on.
+    ///
+    /// A host started before the last approval would refuse the plug-in, because
+    /// it reads its allowlist once. That host is replaced instead, and the new
+    /// one is asked for everything that is on (see [`App::pump`]).
+    pub(crate) fn ask_host_to_load(&mut self, path: &Path, kind: PluginKind) {
+        if std::mem::take(&mut self.host_allowlist_stale)
+            && let Some(supervisor) = self.host_supervisor.as_mut()
+        {
+            supervisor.stop(&mut self.host);
+            supervisor.resume();
+            self.note("the plugin host restarts to read the new approval".to_owned());
+            return;
+        }
+        self.request_plugin_load(path, kind);
     }
 
     /// Makes the input plug-ins the user switched on decoders of the player.
@@ -6033,9 +6157,7 @@ mod tests {
         let (app_end, mut host_end) = MemoryTransport::pair();
         app.attach_host(app_end);
         scan_with_one_plugin(&mut app);
-        // The plug-in is switched off, so the page's toggle switches it on.
-        app.config.plugins.disabled = vec!["gen_one.dll".to_string()];
-
+        // An approved plug-in is off until the page's toggle switches it on.
         app.apply_prefs_action(PrefsAction::TogglePlugin(0));
 
         // Exactly one request crossed the channel, and it names the file the
@@ -6046,7 +6168,7 @@ mod tests {
             vec![("C:\\plugins\\gen_one.dll".to_string(), PluginKind::General)]
         );
         // The choice is saved as well: the plug-in stays on after a restart.
-        assert!(app.config.plugins.disabled.is_empty());
+        assert_eq!(app.config.plugins.enabled, ["gen_one.dll"]);
     }
 
     #[test]
@@ -6059,8 +6181,9 @@ mod tests {
         app.attach_host(app_end);
         scan_with_one_plugin(&mut app);
 
-        // The plug-in is on (approved and not on the disabled list), so the
-        // page's toggle switches it off.
+        // The plug-in is on (approved and on the enabled list), so the page's
+        // toggle switches it off.
+        app.config.plugins.enabled = vec!["gen_one.dll".to_string()];
         app.apply_prefs_action(PrefsAction::TogglePlugin(0));
 
         // Nothing was loaded: a plug-in that is switched off is not asked
@@ -6082,7 +6205,6 @@ mod tests {
         let (mut app, _dir) = app_with_file(None);
         assert!(!app.host_attached());
         scan_with_one_plugin(&mut app);
-        app.config.plugins.disabled = vec!["gen_one.dll".to_string()];
 
         app.apply_prefs_action(PrefsAction::TogglePlugin(0));
 
@@ -6105,7 +6227,6 @@ mod tests {
         let (app_end, mut host_end) = MemoryTransport::pair();
         app.attach_host(app_end);
         scan_with_one_plugin(&mut app);
-        app.config.plugins.disabled = vec!["gen_one.dll".to_string()];
 
         app.apply_prefs_action(PrefsAction::TogglePlugin(0));
 
@@ -6201,6 +6322,80 @@ mod tests {
         );
     }
 
+    // ----- the output change that waits for playback to stop -----
+
+    #[test]
+    fn an_output_change_during_playback_is_applied_when_playback_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = track(&dir, "track1_44100.tst");
+        let (mut app, _dir) = app_with_file(Some(file));
+        // The null output run wants no plug-in, so this name is a change.
+        app.plugin_output_name = Some("out_x.dll".to_string());
+        app.submit(Command::Play).unwrap();
+        app.pump().unwrap();
+        assert_ne!(app.engine.transport(), TransportState::Stopped);
+
+        app.install_plugin_output();
+        assert!(app.output_change_pending, "the run keeps its output");
+        assert_eq!(app.plugin_output_name.as_deref(), Some("out_x.dll"));
+        assert!(app.output_text().contains("when playback has stopped"));
+        // A later pump during the run changes nothing.
+        app.pump().unwrap();
+        assert!(app.output_change_pending);
+
+        app.submit(Command::Stop).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.output_change_pending && std::time::Instant::now() < deadline {
+            app.pump().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.output_change_pending, "the stop applied the change");
+        assert_eq!(app.plugin_output_name, None);
+        assert_eq!(app.engine.transport(), TransportState::Stopped);
+        // The queue survives the new engine.
+        assert_eq!(app.engine.queue().len(), 1);
+    }
+
+    #[test]
+    fn a_new_output_mode_opens_the_device_again_when_nothing_plays() {
+        use rustamp_platform::PrefsAction;
+        let (mut app, _dir) = app_with_file(None);
+        app.apply_prefs_action(PrefsAction::SetOutputMode(
+            rustamp_core::config::OutputMode::Exclusive,
+        ));
+        assert!(!app.output_change_pending);
+        assert_eq!(
+            app.config.audio.output_mode,
+            rustamp_core::config::OutputMode::Exclusive
+        );
+    }
+
+    #[test]
+    fn switching_on_after_an_approval_replaces_a_host_that_read_the_old_allowlist() {
+        use rustamp_platform::PrefsAction;
+        let (mut app, _dir) = app_with_file(None);
+        scan_with_one_plugin(&mut app);
+        app.manage_host(crate::supervise::Supervisor::new(
+            crate::supervise::ProcessBackend::with_path(PathBuf::from("no-such-host.exe")),
+        ));
+        app.host_allowlist_stale = true;
+
+        app.apply_prefs_action(PrefsAction::TogglePlugin(0));
+
+        assert!(!app.host_allowlist_stale);
+        let notes = app.drain_notes();
+        assert!(
+            notes.iter().any(|note| note.contains("restarts")),
+            "{notes:?}"
+        );
+        // The new host is asked for it after the attach, so nothing was refused
+        // for a missing channel.
+        assert!(
+            !notes.iter().any(|note| note.contains("no plugin host")),
+            "{notes:?}"
+        );
+    }
+
     // ----- the startup load (the enabled plug-ins, once per host) -----
 
     #[test]
@@ -6215,6 +6410,7 @@ mod tests {
                 approved_entry("in_two.dll", PluginKind::Input),
             ],
         );
+        app.config.plugins.enabled = vec!["in_two.dll".to_string(), "gen_one.dll".to_string()];
         let (app_end, mut host_end) = MemoryTransport::pair();
         app.attach_host(app_end);
 
@@ -6244,8 +6440,8 @@ mod tests {
                 approved_entry("in_two.dll", PluginKind::Input),
             ],
         );
-        // The user switched the second one off: it stays off.
-        app.config.plugins.disabled = vec!["in_two.dll".to_string()];
+        // The user switched only the first one on: the second stays off.
+        app.config.plugins.enabled = vec!["gen_one.dll".to_string()];
         let (app_end, mut host_end) = MemoryTransport::pair();
         app.attach_host(app_end);
 
@@ -6282,6 +6478,7 @@ mod tests {
             &mut app,
             vec![approved_entry("gen_one.dll", PluginKind::General)],
         );
+        app.config.plugins.enabled = vec!["gen_one.dll".to_string()];
         assert!(!app.host_attached());
 
         app.load_enabled_plugins();
@@ -6305,6 +6502,7 @@ mod tests {
             &mut app,
             vec![approved_entry("gen_one.dll", PluginKind::General)],
         );
+        app.config.plugins.enabled = vec!["gen_one.dll".to_string()];
         let (app_end, mut host_end) = MemoryTransport::pair();
         app.attach_host(app_end);
 
@@ -6327,6 +6525,7 @@ mod tests {
             &mut app,
             vec![approved_entry("gen_one.dll", PluginKind::General)],
         );
+        app.config.plugins.enabled = vec!["gen_one.dll".to_string()];
 
         let (first_end, mut first_host) = MemoryTransport::pair();
         app.attach_host(first_end);
@@ -6354,6 +6553,7 @@ mod tests {
             &mut app,
             vec![approved_entry("gen_one.dll", PluginKind::General)],
         );
+        app.config.plugins.enabled = vec!["gen_one.dll".to_string()];
         let (app_end, mut host_end) = MemoryTransport::pair();
         app.attach_host(app_end);
         app.pump().unwrap();
@@ -6419,6 +6619,7 @@ mod tests {
 
         let (mut app, _config) = app_with_file(None);
         app.config.plugins.plugin_dir = Some(dir.path().to_path_buf());
+        app.config.plugins.enabled = vec!["gen_one.dll".to_string()];
         app.set_config_path(Some(dir.path().join("rustamp.toml")));
 
         let (app_end, mut host_end) = MemoryTransport::pair();

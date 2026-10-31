@@ -43,8 +43,17 @@
 //! when it has nothing to list.
 //!
 //! The player's id behind a row is part of that state as well, so that the
-//! "switch on / off" button always names the plug-in of the row that is on
-//! screen.
+//! buttons always name the plug-in of the row that is on screen.
+//!
+//! # Approving, switching on, and the one output
+//!
+//! A plug-in is code that runs on the machine. `Approve...` asks the player to
+//! ask the user, with that warning, whether the exact image may run; it switches
+//! nothing on. Switching on is a second, explicit act. The Output page has no
+//! on/off switch: its first row is the player's own output, and `Use this output`
+//! makes the selected row the one output ([`PrefsAction::SelectOutput`]). A line
+//! under the buttons says what the last action did
+//! ([`PrefsSettings::plugins_report`]).
 //!
 //! The selection is the user's row, and it is part of the state as well: the
 //! "switch on / off" button acts on the row that is on screen. A plug-in
@@ -422,6 +431,16 @@ pub enum Item {
         /// Placement.
         rect: Rect,
     },
+    /// Makes the selected row the one output ([`PrefsAction::SelectOutput`]).
+    OutputUse {
+        /// Placement.
+        rect: Rect,
+    },
+    /// Asks to approve the selected plug-in ([`PrefsAction::ApprovePlugin`]).
+    PluginApprove {
+        /// Placement.
+        rect: Rect,
+    },
     /// Opens the configuration dialog of the selected plug-in
     /// ([`PrefsAction::ConfigurePlugin`]).
     PluginConfigure {
@@ -496,10 +515,12 @@ fn note_page(group: &'static str, text: &'static str) -> Vec<Item> {
     ]
 }
 
-/// The layout every plug-in page shares: the caption, a hint, the list and the
-/// two buttons under it.
-fn plugin_page(caption: &'static str, hint: &'static str) -> Vec<Item> {
+/// The layout every plug-in page shares: the caption, a hint, the list, the
+/// buttons under it and the line that says what the last action did. `switch`
+/// is the page's way to turn a plug-in on.
+fn plugin_page(caption: &'static str, hint: &'static str, switch: Item) -> Vec<Item> {
     let w = PAGE_SIZE.0;
+    let half = (w - 28) / 2;
     vec![
         Item::Group {
             text: caption,
@@ -510,28 +531,39 @@ fn plugin_page(caption: &'static str, hint: &'static str) -> Vec<Item> {
             rect: rect(12, 20, w - 24, 56),
         },
         Item::PluginList {
-            rect: rect(10, 80, w - 20, 158),
+            rect: rect(10, 78, w - 20, 98),
         },
-        Item::PluginToggle {
-            rect: rect(10, 246, 104, 26),
+        Item::PluginApprove {
+            rect: rect(10, 180, half, 24),
         },
+        switch,
         Item::PluginConfigure {
-            rect: rect(118, 246, 78, 26),
+            rect: rect(10, 208, half, 24),
         },
         Item::PluginRescan {
-            rect: rect(200, 246, w - 210, 26),
+            rect: rect(18 + half, 208, half, 24),
+        },
+        Item::Report {
+            rect: rect(12, 236, w - 24, 42),
         },
     ]
 }
 
-/// Hint under every plug-in page's caption. The approval gate and the fact
-/// that nothing is loaded at startup yet are stated, not implied.
-const PLUGIN_HINT: &str = "Only approved plug-ins can be switched on. \
-    The plug-ins you switch on are loaded when the plugin host starts.";
+/// Where a plug-in page's second button of the first row sits.
+const fn switch_rect() -> Rect {
+    let half = (PAGE_SIZE.0 - 28) / 2;
+    rect(18 + half, 180, half, 24)
+}
+
+/// Hint under every plug-in page's caption: what a plug-in is, and that approving
+/// and switching on are two acts.
+const PLUGIN_HINT: &str = "A plug-in is code that runs on this computer with your rights. \
+    Approve only plug-ins you trust, then switch them on. Approving alone runs nothing.";
 
 /// The output page: one output plays at a time.
-const OUTPUT_PLUGIN_HINT: &str = "The player plays through the first output plug-in that is \
-    switched on, and through its own output (Setup) when none is.";
+const OUTPUT_PLUGIN_HINT: &str = "One output plays at a time. A plug-in is code that runs on \
+    this computer with your rights: approve only what you trust, then use it. A change applies \
+    when playback has stopped.";
 
 /// What the report line shows when no import has run yet.
 ///
@@ -542,6 +574,9 @@ const NO_REPORT: &str = "Nothing imported yet.";
 /// What `node`'s page contains.
 pub fn page_items(node: PrefsNode) -> Vec<Item> {
     let w = PAGE_SIZE.0;
+    let toggle = || Item::PluginToggle {
+        rect: switch_rect(),
+    };
     match node {
         // The audio settings live on the Setup page: it is the page for the
         // device, and both settings are about how the player sounds. The
@@ -667,11 +702,19 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
         PrefsNode::PlugIns => {
             note_page("Plug-ins", "Choose a plug-in type in the list on the left.")
         }
-        PrefsNode::Input => plugin_page("Input plug-ins", PLUGIN_HINT),
-        PrefsNode::Output => plugin_page("Output plug-ins", OUTPUT_PLUGIN_HINT),
-        PrefsNode::PlugInVisualization => plugin_page("Visualization plug-ins", PLUGIN_HINT),
-        PrefsNode::DspEffect => plugin_page("DSP/Effect plug-ins", PLUGIN_HINT),
-        PrefsNode::GeneralPurpose => plugin_page("General purpose plug-ins", PLUGIN_HINT),
+        PrefsNode::Input => plugin_page("Input plug-ins", PLUGIN_HINT, toggle()),
+        PrefsNode::Output => plugin_page(
+            "Output plug-ins",
+            OUTPUT_PLUGIN_HINT,
+            Item::OutputUse {
+                rect: switch_rect(),
+            },
+        ),
+        PrefsNode::PlugInVisualization => {
+            plugin_page("Visualization plug-ins", PLUGIN_HINT, toggle())
+        }
+        PrefsNode::DspEffect => plugin_page("DSP/Effect plug-ins", PLUGIN_HINT, toggle()),
+        PrefsNode::GeneralPurpose => plugin_page("General purpose plug-ins", PLUGIN_HINT, toggle()),
         PrefsNode::Skins => vec![
             Item::Group {
                 text: "Select skin",
@@ -725,15 +768,25 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
     }
 }
 
+/// What a row of a plug-in page's list stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowId {
+    /// An information row (such as "no plug-ins found"), which the buttons
+    /// ignore.
+    Info,
+    /// The plug-in with the player's id, echoed back in the row's actions.
+    Plugin(usize),
+    /// The player's own output, on the Output page.
+    OwnOutput,
+}
+
 /// One row of a plug-in page's list, prepared by the player.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginRow {
     /// The page whose list shows this row.
     pub node: PrefsNode,
-    /// The player's id for the plug-in, echoed back in
-    /// [`PrefsAction::TogglePlugin`]. `None` for an information row (such as
-    /// "no plug-ins found"), which the toggle button ignores.
-    pub id: Option<usize>,
+    /// What the row stands for.
+    pub id: RowId,
     /// The row text.
     pub text: String,
 }
@@ -818,6 +871,8 @@ pub struct PrefsSettings {
     pub winamp_ini_report: Option<String>,
     /// What the file-types page's last action did, for its report line.
     pub file_types_report: Option<String>,
+    /// What the plug-in pages' last action did, for their report line.
+    pub plugins_report: Option<String>,
 }
 
 impl PrefsSettings {
@@ -853,6 +908,15 @@ impl PrefsSettings {
         }
     }
 
+    /// The text of `node`'s report line.
+    pub fn report(&self, node: PrefsNode) -> &str {
+        match node {
+            PrefsNode::FileTypes => self.file_types_report.as_deref().unwrap_or(""),
+            PrefsNode::Import => self.winamp_ini_report.as_deref().unwrap_or(NO_REPORT),
+            _ => self.plugins_report.as_deref().unwrap_or(""),
+        }
+    }
+
     /// The media library's root in the row `row` of the library's list.
     ///
     /// `None` for a row that does not exist: the row is the one the user
@@ -880,8 +944,8 @@ impl PrefsSettings {
 pub(crate) struct PluginListState {
     /// The page the rows belong to; `None` when no page was shown yet.
     node: Option<PrefsNode>,
-    /// The player's id behind each row.
-    ids: Vec<Option<usize>>,
+    /// What each row stands for.
+    ids: Vec<RowId>,
     /// The text of each row.
     texts: Vec<String>,
     /// The row the user picked.
@@ -901,7 +965,7 @@ pub(crate) struct PluginListUpdate {
 impl PluginListState {
     /// The rows `node`'s list shows, with the player's id behind each.
     pub(crate) fn of(settings: &PrefsSettings, node: PrefsNode) -> Self {
-        let (ids, texts): (Vec<Option<usize>>, Vec<String>) = settings
+        let (ids, texts): (Vec<RowId>, Vec<String>) = settings
             .plugin_rows(node)
             .map(|row| (row.id, row.text.clone()))
             .unzip();
@@ -929,9 +993,10 @@ impl PluginListState {
         &self.texts
     }
 
-    /// The player's id behind the row `row`, if that row has one.
-    pub(crate) fn id(&self, row: usize) -> Option<usize> {
-        self.ids.get(row).copied().flatten()
+    /// What the row `row` stands for; a row that does not exist is an
+    /// information row.
+    pub(crate) fn id(&self, row: usize) -> RowId {
+        self.ids.get(row).copied().unwrap_or(RowId::Info)
     }
 
     /// Whether a list that shows these rows already shows `state`.
@@ -1319,6 +1384,12 @@ pub enum PrefsAction {
     /// The toggle button was pressed with this plug-in selected
     /// ([`PluginRow::id`]).
     TogglePlugin(usize),
+    /// The approve button was pressed with this plug-in selected. The player
+    /// asks the user first; approving switches nothing on.
+    ApprovePlugin(usize),
+    /// The one output was chosen: this plug-in, or `None` for the player's own
+    /// output.
+    SelectOutput(Option<usize>),
     /// The plug-in folder should be read again.
     RescanPlugins,
     /// Opens the configuration dialog of the plug-in of the selected row
@@ -1391,8 +1462,8 @@ mod win32 {
     use windows::core::{PCWSTR, PWSTR};
 
     use super::{
-        Bind, ComboBind, Item, NO_REPORT, PageLists, PrefsAction, PrefsError, PrefsNode,
-        PrefsSettings, Rect, TREE, TextBind, page_items,
+        Bind, ComboBind, Item, PageLists, PrefsAction, PrefsError, PrefsNode, PrefsSettings, Rect,
+        RowId, TREE, TextBind, page_items,
     };
 
     const CLASS_NAME: &str = "RustampPreferences";
@@ -1411,6 +1482,8 @@ mod win32 {
     const ID_PLUGIN_CONFIGURE: u16 = 68;
     const ID_REGISTER: u16 = 69;
     const ID_UNREGISTER: u16 = 70;
+    const ID_PLUGIN_APPROVE: u16 = 71;
+    const ID_OUTPUT_USE: u16 = 72;
     /// Scrollable width (unscaled pixels) of a plug-in row.
     const PLUGIN_ROW_EXTENT: i32 = 900;
     /// Scrollable width (unscaled pixels) of a library root.
@@ -1795,11 +1868,7 @@ mod win32 {
                 .ok()
                 .and_then(|g| g.as_ref().map(|i| i.node))
         });
-        let wanted = if node == Some(PrefsNode::FileTypes) {
-            settings.file_types_report.as_deref().unwrap_or("")
-        } else {
-            settings.winamp_ini_report.as_deref().unwrap_or(NO_REPORT)
-        };
+        let wanted = node.map_or("", |node| settings.report(node));
         let unchanged = STATE.with(|state| {
             state
                 .try_borrow()
@@ -2211,6 +2280,36 @@ mod win32 {
                         page.push(c);
                     }
                 }
+                Item::OutputUse { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Use this output",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_OUTPUT_USE,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
+                Item::PluginApprove { rect } => {
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        "Approve...",
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        ID_PLUGIN_APPROVE,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
                 Item::PluginConfigure { rect } => {
                     if let Ok(c) = child(
                         hwnd,
@@ -2588,6 +2687,21 @@ mod win32 {
         });
     }
 
+    /// What the row selected in the plug-in list stands for.
+    fn picked_plugin_row() -> Option<RowId> {
+        STATE.with(|state| {
+            let guard = state.try_borrow().ok()?;
+            let inner = guard.as_ref()?;
+            let list = inner.plugin_list?;
+            // SAFETY: querying our own list box.
+            let row =
+                unsafe { SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))) }.0;
+            usize::try_from(row)
+                .ok()
+                .map(|row| inner.lists.plugins().id(row))
+        })
+    }
+
     // SAFETY: Windows calls this with OS-provided values only; pointers in
     // `lparam` are valid for the matching notification and read as such.
     unsafe extern "system" fn wnd_proc(
@@ -2647,45 +2761,32 @@ mod win32 {
                     push_action(PrefsAction::ImportWinampIni);
                     return LRESULT(0);
                 }
-                if id == ID_PLUGIN_CONFIGURE && code == BN_CLICKED {
-                    // The same selection as the toggle: an information row or
-                    // no selection configures nothing.
-                    let picked = STATE.with(|state| {
-                        let guard = state.try_borrow().ok()?;
-                        let inner = guard.as_ref()?;
-                        let list = inner.plugin_list?;
-                        // SAFETY: querying our own list box.
-                        let row = unsafe {
-                            SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)))
+                if code == BN_CLICKED
+                    && matches!(
+                        id,
+                        ID_PLUGIN_CONFIGURE | ID_PLUGIN_TOGGLE | ID_PLUGIN_APPROVE | ID_OUTPUT_USE
+                    )
+                {
+                    // What the selected row stands for; an information row or
+                    // no selection does nothing.
+                    let action = picked_plugin_row().and_then(|row| match (id, row) {
+                        (ID_OUTPUT_USE, RowId::OwnOutput) => Some(PrefsAction::SelectOutput(None)),
+                        (ID_OUTPUT_USE, RowId::Plugin(plugin)) => {
+                            Some(PrefsAction::SelectOutput(Some(plugin)))
                         }
-                        .0;
-                        usize::try_from(row)
-                            .ok()
-                            .and_then(|row| inner.lists.plugins().id(row))
-                    });
-                    if let Some(plugin) = picked {
-                        push_action(PrefsAction::ConfigurePlugin(plugin));
-                    }
-                    return LRESULT(0);
-                }
-                if id == ID_PLUGIN_TOGGLE && code == BN_CLICKED {
-                    // The id behind the selected row; an information row or no
-                    // selection toggles nothing.
-                    let picked = STATE.with(|state| {
-                        let guard = state.try_borrow().ok()?;
-                        let inner = guard.as_ref()?;
-                        let list = inner.plugin_list?;
-                        // SAFETY: querying our own list box.
-                        let row = unsafe {
-                            SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)))
+                        (ID_PLUGIN_CONFIGURE, RowId::Plugin(plugin)) => {
+                            Some(PrefsAction::ConfigurePlugin(plugin))
                         }
-                        .0;
-                        usize::try_from(row)
-                            .ok()
-                            .and_then(|row| inner.lists.plugins().id(row))
+                        (ID_PLUGIN_TOGGLE, RowId::Plugin(plugin)) => {
+                            Some(PrefsAction::TogglePlugin(plugin))
+                        }
+                        (ID_PLUGIN_APPROVE, RowId::Plugin(plugin)) => {
+                            Some(PrefsAction::ApprovePlugin(plugin))
+                        }
+                        _ => None,
                     });
-                    if let Some(plugin) = picked {
-                        push_action(PrefsAction::TogglePlugin(plugin));
+                    if let Some(action) = action {
+                        push_action(action);
                     }
                     return LRESULT(0);
                 }
@@ -2893,6 +2994,8 @@ mod tests {
                     | Item::SkinList { rect }
                     | Item::PluginList { rect }
                     | Item::PluginToggle { rect }
+                    | Item::OutputUse { rect }
+                    | Item::PluginApprove { rect }
                     | Item::PluginConfigure { rect }
                     | Item::PluginRescan { rect }
                     | Item::LibraryRoots { rect }
@@ -3134,7 +3237,7 @@ mod tests {
     }
 
     #[test]
-    fn every_plugin_page_has_a_list_a_toggle_and_a_rescan_button() {
+    fn every_plugin_page_has_a_list_a_switch_an_approve_and_a_rescan_button() {
         for node in [
             PrefsNode::Input,
             PrefsNode::Output,
@@ -3150,8 +3253,24 @@ mod tests {
                 "{node:?}"
             );
             assert_eq!(
-                count(|i| matches!(i, Item::PluginToggle { .. })),
+                count(|i| matches!(i, Item::PluginApprove { .. })),
                 1,
+                "{node:?}"
+            );
+            assert_eq!(count(|i| matches!(i, Item::Report { .. })), 1, "{node:?}");
+            let (toggles, uses) = if node == PrefsNode::Output {
+                (0, 1)
+            } else {
+                (1, 0)
+            };
+            assert_eq!(
+                count(|i| matches!(i, Item::PluginToggle { .. })),
+                toggles,
+                "{node:?}"
+            );
+            assert_eq!(
+                count(|i| matches!(i, Item::OutputUse { .. })),
+                uses,
                 "{node:?}"
             );
             assert_eq!(
@@ -3168,13 +3287,25 @@ mod tests {
     }
 
     #[test]
-    fn the_plugin_hint_states_the_approval_gate_and_the_startup_load() {
-        let hint = PLUGIN_HINT;
-        assert!(hint.contains("approved"), "{hint}");
-        assert!(
-            hint.contains("loaded when the plugin host starts"),
-            "{hint}"
-        );
+    fn the_plugin_hints_warn_that_a_plugin_is_code_and_that_approving_runs_nothing() {
+        for hint in [PLUGIN_HINT, OUTPUT_PLUGIN_HINT] {
+            assert!(hint.contains("code that runs on"), "{hint}");
+            assert!(hint.contains("your rights"), "{hint}");
+        }
+        assert!(PLUGIN_HINT.contains("Approving alone runs nothing"));
+        assert!(OUTPUT_PLUGIN_HINT.contains("when playback has stopped"));
+    }
+
+    #[test]
+    fn each_page_reads_its_own_report() {
+        let settings = PrefsSettings {
+            file_types_report: Some("types".into()),
+            plugins_report: Some("plugins".into()),
+            ..PrefsSettings::default()
+        };
+        assert_eq!(settings.report(PrefsNode::FileTypes), "types");
+        assert_eq!(settings.report(PrefsNode::Output), "plugins");
+        assert_eq!(settings.report(PrefsNode::Import), NO_REPORT);
     }
 
     #[test]
@@ -3186,9 +3317,9 @@ mod tests {
         };
         let settings = PrefsSettings {
             plugins: vec![
-                row(PrefsNode::Input, Some(0), "in_a"),
-                row(PrefsNode::GeneralPurpose, Some(1), "gen_a"),
-                row(PrefsNode::Input, None, "note"),
+                row(PrefsNode::Input, RowId::Plugin(0), "in_a"),
+                row(PrefsNode::GeneralPurpose, RowId::Plugin(1), "gen_a"),
+                row(PrefsNode::Input, RowId::Info, "note"),
             ],
             ..PrefsSettings::default()
         };
@@ -3220,7 +3351,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, node)| PluginRow {
                     node: *node,
-                    id: Some(index),
+                    id: RowId::Plugin(index),
                     text: format!("{node:?} plug-in"),
                 })
                 .collect(),
@@ -3249,7 +3380,7 @@ mod tests {
         let settings = settings_with_plugin_rows();
         for node in plugin_pages() {
             let state = PluginListState::of(&settings, node);
-            let rows: Vec<(Option<usize>, String)> = settings
+            let rows: Vec<(RowId, String)> = settings
                 .plugin_rows(node)
                 .map(|row| (row.id, row.text.clone()))
                 .collect();
@@ -3273,7 +3404,7 @@ mod tests {
                 .iter()
                 .map(|node| PluginRow {
                     node: *node,
-                    id: None,
+                    id: RowId::Info,
                     text: same.to_string(),
                 })
                 .collect(),
@@ -3328,8 +3459,8 @@ mod tests {
         let pages = plugin_pages();
         for (index, node) in pages.iter().enumerate() {
             let state = PluginListState::of(&settings, *node);
-            assert_eq!(state.id(0), Some(index), "{node:?}: the first row");
-            assert_eq!(state.id(pages.len()), None, "{node:?}: no such row");
+            assert_eq!(state.id(0), RowId::Plugin(index), "{node:?}: the first row");
+            assert_eq!(state.id(pages.len()), RowId::Info, "{node:?}: no such row");
         }
     }
 

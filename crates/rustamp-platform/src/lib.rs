@@ -55,7 +55,9 @@ pub use displays::{
     display_changes, dpi_at,
 };
 pub use dpi::{DpiAwareness, DpiError, WindowChrome, init_dpi_awareness, outer_size_for_client};
-pub use extract_dialog::{ExtractSettings, ask_extract_settings, ask_yes_no_cancel};
+pub use extract_dialog::{
+    ExtractSettings, ask_extract_settings, ask_yes_no_cancel, confirm_warning,
+};
 pub use file_dialog::{
     CANCELLED_HRESULT, DIRECTORY_DIALOG_OPTIONS, EQF_FILTERS, FileDialogError, HTML_SAVE_FILTERS,
     INI_FILTERS, MEDIA_FILTERS, PLAYLIST_SAVE_FILTERS, directory_dialog_options, directory_result,
@@ -72,7 +74,7 @@ pub use popup_menu::{PopupMenuError, PopupRow, item_text, show_popup_menu};
 #[cfg(windows)]
 pub use prefs_dialog::PrefsWindow;
 pub use prefs_dialog::{
-    Bind, LibraryRootRow, PluginRow, PrefsAction, PrefsError, PrefsNode, PrefsSettings,
+    Bind, LibraryRootRow, PluginRow, PrefsAction, PrefsError, PrefsNode, PrefsSettings, RowId,
     TREE as PREFS_TREE, TextBind, library_root_text,
 };
 pub use shell_registration::{

@@ -1,7 +1,7 @@
 // Rustamp is licensed GPL-3.0-or-later with an additional permission; see PLUGIN-EXCEPTION.md.
 //! The plug-in pages' model: which classic plug-in DLLs sit in the plug-in
 //! directory, what the approval store says about each, and which of them the
-//! user has switched off.
+//! user has switched on.
 //!
 //! Everything here is headless and **executes nothing**. A scan reads each DLL
 //! as bytes, runs the passive PE preflight and compares the image against the
@@ -14,6 +14,11 @@
 //!   the store is opened read-only, and a DLL is [`PluginStatus::Approved`] only
 //!   when its whole-image SHA-256, size and machine match an entry the operator
 //!   put there.
+//! * **Approval does not switch anything on.** A plug-in runs only when it is
+//!   approved **and** its file is on [`PluginsConfig::enabled`], and only the
+//!   user's explicit switch ([`set_enabled`]) puts it there.
+//! * **One output plug-in at most.** Switching an output on takes every other
+//!   output off the list; no output on the list means the player's own output.
 //! * **A plug-in that is not approved cannot be enabled** ([`set_enabled`]
 //!   refuses), so the UI cannot lead to a load the host would refuse anyway.
 //! * **A broken store approves nothing.** An unreadable or malformed store is
@@ -79,11 +84,10 @@ pub struct PluginEntry {
 }
 
 impl PluginEntry {
-    /// Whether the plug-in is switched on: approved **and** not on the
-    /// disabled list. Anything that is not approved is off, whatever the list
-    /// says.
+    /// Whether the plug-in is switched on: approved **and** on the enabled
+    /// list. Anything that is not approved is off, whatever the list says.
     pub fn is_enabled(&self, config: &PluginsConfig) -> bool {
-        self.status == PluginStatus::Approved && !is_disabled(config, &self.file)
+        self.status == PluginStatus::Approved && is_listed(config, &self.file)
     }
 
     /// Whether the user may switch this plug-in on.
@@ -259,7 +263,7 @@ impl std::fmt::Display for EnableRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} cannot be enabled: {} (only plug-ins listed in {APPROVALS_FILE} may run)",
+            "{} cannot be switched on: {} (approve it first)",
             self.file,
             self.status.label()
         )
@@ -268,15 +272,20 @@ impl std::fmt::Display for EnableRefused {
 
 impl std::error::Error for EnableRefused {}
 
-fn is_disabled(config: &PluginsConfig, file: &str) -> bool {
-    config.disabled.iter().any(|f| f.eq_ignore_ascii_case(file))
+fn is_listed(config: &PluginsConfig, file: &str) -> bool {
+    config.enabled.iter().any(|f| f.eq_ignore_ascii_case(file))
+}
+
+fn is_output_file(file: &str) -> bool {
+    PluginKind::from_path(Path::new(file)) == Some(PluginKind::Output)
 }
 
 /// Switches `entry` on or off in `config`.
 ///
 /// Turning **off** always works. Turning **on** is refused unless the approval
 /// gate approved the image: the list cannot be used to talk the host into a
-/// load it would refuse.
+/// load it would refuse. An output plug-in that is switched on replaces the
+/// output that was on.
 pub fn set_enabled(
     config: &mut PluginsConfig,
     entry: &PluginEntry,
@@ -289,13 +298,59 @@ pub fn set_enabled(
                 status: entry.status.clone(),
             });
         }
-        config
-            .disabled
-            .retain(|f| !f.eq_ignore_ascii_case(&entry.file));
-    } else if !is_disabled(config, &entry.file) {
-        config.disabled.push(entry.file.clone());
+        if entry.kind == PluginKind::Output {
+            use_own_output(config);
+        }
+        if !is_listed(config, &entry.file) {
+            config.enabled.push(entry.file.clone());
+        }
+    } else {
+        forget_file(config, &entry.file);
     }
     Ok(())
+}
+
+/// Takes `file` off the enabled list.
+pub fn forget_file(config: &mut PluginsConfig, file: &str) {
+    config.enabled.retain(|f| !f.eq_ignore_ascii_case(file));
+}
+
+/// Takes every output plug-in off the enabled list: the player plays through
+/// its own output.
+pub fn use_own_output(config: &mut PluginsConfig) {
+    config.enabled.retain(|f| !is_output_file(f));
+}
+
+/// Keeps the first output plug-in of a hand-edited list and drops the others.
+pub fn keep_one_output(config: &mut PluginsConfig) {
+    let mut seen = false;
+    config
+        .enabled
+        .retain(|f| !is_output_file(f) || !std::mem::replace(&mut seen, true));
+}
+
+/// The enabled list a schema 1 file means.
+///
+/// Schema 1 had an off-list: every approved plug-in that was not on it ran, and
+/// of several outputs the first by file name played. The migration writes that
+/// state down as an explicit list, from the names in the approval store, so an
+/// upgrade changes nothing the user set up.
+pub fn enabled_from_off_list<'a>(
+    approved: impl Iterator<Item = &'a str>,
+    off_list: &[&str],
+) -> Vec<String> {
+    let mut names: Vec<String> = approved
+        .filter(|name| !off_list.iter().any(|off| off.eq_ignore_ascii_case(name)))
+        .map(str::to_string)
+        .collect();
+    names.sort_by_cached_key(|name| name.to_ascii_lowercase());
+    names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    let mut config = PluginsConfig {
+        enabled: names,
+        ..PluginsConfig::default()
+    };
+    keep_one_output(&mut config);
+    config.enabled
 }
 
 #[cfg(test)]
@@ -398,7 +453,7 @@ mod tests {
         let refused = set_enabled(&mut config, entry, true).unwrap_err();
         assert_eq!(refused.status, PluginStatus::NotApproved);
         assert!(!entry.is_enabled(&config));
-        assert!(config.disabled.is_empty(), "a refusal changes nothing");
+        assert!(config.enabled.is_empty(), "a refusal changes nothing");
     }
 
     #[test]
@@ -421,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn an_approved_plugin_toggles_through_the_disabled_list() {
+    fn an_approved_plugin_toggles_through_the_enabled_list() {
         let scratch = Scratch::new();
         let image = fake_dll(GENERAL_EXPORT, 1);
         scratch.put("gen_one.dll", &image);
@@ -433,16 +488,76 @@ mod tests {
         assert_eq!(entry.kind, PluginKind::General);
 
         let mut config = PluginsConfig::default();
-        assert!(entry.is_enabled(&config), "approved plug-ins start on");
-        set_enabled(&mut config, entry, false).unwrap();
-        assert_eq!(config.disabled, vec!["gen_one.dll".to_string()]);
-        assert!(!entry.is_enabled(&config));
-        // Switching off twice does not duplicate the entry.
-        set_enabled(&mut config, entry, false).unwrap();
-        assert_eq!(config.disabled.len(), 1);
+        assert!(!entry.is_enabled(&config), "approval switches nothing on");
         set_enabled(&mut config, entry, true).unwrap();
-        assert!(config.disabled.is_empty());
+        assert_eq!(config.enabled, vec!["gen_one.dll".to_string()]);
         assert!(entry.is_enabled(&config));
+        // Switching on twice does not duplicate the entry.
+        set_enabled(&mut config, entry, true).unwrap();
+        assert_eq!(config.enabled.len(), 1);
+        set_enabled(&mut config, entry, false).unwrap();
+        assert!(config.enabled.is_empty());
+        assert!(!entry.is_enabled(&config));
+    }
+
+    fn approved(file: &str, kind: PluginKind) -> PluginEntry {
+        PluginEntry {
+            file: file.into(),
+            path: PathBuf::from(file),
+            kind,
+            size: 1,
+            status: PluginStatus::Approved,
+        }
+    }
+
+    #[test]
+    fn switching_an_output_on_replaces_the_output_that_was_on_and_nothing_else() {
+        let one = approved("out_one.dll", PluginKind::Output);
+        let two = approved("out_two.dll", PluginKind::Output);
+        let general = approved("gen_x.dll", PluginKind::General);
+        let mut config = PluginsConfig::default();
+        set_enabled(&mut config, &general, true).unwrap();
+        set_enabled(&mut config, &one, true).unwrap();
+        set_enabled(&mut config, &two, true).unwrap();
+        assert!(two.is_enabled(&config) && !one.is_enabled(&config));
+        assert!(general.is_enabled(&config));
+
+        use_own_output(&mut config);
+        assert!(!two.is_enabled(&config));
+        assert_eq!(config.enabled, vec!["gen_x.dll".to_string()]);
+    }
+
+    #[test]
+    fn a_hand_edited_list_keeps_its_first_output() {
+        let mut config = PluginsConfig {
+            enabled: vec!["out_b.dll".into(), "in_a.dll".into(), "OUT_a.dll".into()],
+            ..PluginsConfig::default()
+        };
+        keep_one_output(&mut config);
+        assert_eq!(
+            config.enabled,
+            vec!["out_b.dll".to_string(), "in_a.dll".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_off_list_of_schema_1_becomes_the_same_state_as_an_explicit_list() {
+        let list = enabled_from_off_list(
+            [
+                "out_z.dll",
+                "in_b.dll",
+                "out_a.dll",
+                "gen_off.dll",
+                "IN_B.dll",
+            ]
+            .into_iter(),
+            &["GEN_OFF.dll"],
+        );
+        // Sorted like the scan: the first output is the one that played.
+        assert_eq!(list, ["in_b.dll", "out_a.dll"]);
+        // An output that was off leaves the next one playing.
+        let list = enabled_from_off_list(["out_z.dll", "out_a.dll"].into_iter(), &["out_a.dll"]);
+        assert_eq!(list, ["out_z.dll"]);
     }
 
     #[test]
@@ -500,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn a_not_approved_entry_is_always_off_even_when_not_listed_as_disabled() {
+    fn a_not_approved_entry_is_always_off_even_when_listed_as_enabled() {
         let entry = PluginEntry {
             file: "dsp_x.dll".into(),
             path: PathBuf::from("dsp_x.dll"),
@@ -508,7 +623,10 @@ mod tests {
             size: 2048,
             status: PluginStatus::NotApproved,
         };
-        let config = PluginsConfig::default();
+        let config = PluginsConfig {
+            enabled: vec!["dsp_x.dll".into()],
+            ..PluginsConfig::default()
+        };
         assert!(!entry.is_enabled(&config));
         let text = entry.row_text(&config);
         assert!(
@@ -522,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_names_match_regardless_of_case() {
+    fn enabled_names_match_regardless_of_case() {
         let entry = PluginEntry {
             file: "In_Two.DLL".into(),
             path: PathBuf::from("In_Two.DLL"),
@@ -531,9 +649,9 @@ mod tests {
             status: PluginStatus::Approved,
         };
         let config = PluginsConfig {
-            disabled: vec!["in_two.dll".into()],
+            enabled: vec!["in_two.dll".into()],
             ..PluginsConfig::default()
         };
-        assert!(!entry.is_enabled(&config));
+        assert!(entry.is_enabled(&config));
     }
 }

@@ -139,7 +139,7 @@ fn config_round_trip_honours_all_supported_fields() {
     config.eq.state.preamp = 5.0;
     config.eq.state.bands = [1.5, 2.5, 3.5, 4.5, 5.5, -1.5, -2.5, -3.5, -4.5, -5.5];
     config.plugins.plugin_dir = Some(PathBuf::from("plugins"));
-    config.plugins.disabled = vec!["bad.dll".to_string()];
+    config.plugins.enabled = vec!["bad.dll".to_string()];
 
     // The playlist editor's font size is the app's own setting outside the
     // configuration tree; it is written only when the user chose one.
@@ -194,9 +194,9 @@ fn config_round_trip_honours_all_supported_fields() {
         "plugins.plugin_dir"
     );
     assert_eq!(
-        loaded.config.plugins.disabled,
+        loaded.config.plugins.enabled,
         vec!["bad.dll".to_string()],
-        "plugins.disabled"
+        "plugins.enabled"
     );
 
     // Every window keeps every field, including its size.
@@ -256,7 +256,7 @@ fn an_ignored_field_is_not_advertised() {
     config.plugins.plugin_dir = Some(PathBuf::from("plugins"));
     config.plugins.vis_plugin = Some("vis_milk2.dll".to_string());
     config.plugins.vis_preset = Some("preset.milk".to_string());
-    config.plugins.disabled = vec!["bad.dll".to_string()];
+    config.plugins.enabled = vec!["bad.dll".to_string()];
 
     let serialized = serialize_honest(&config, None, None).expect("serialize honest config");
 
@@ -832,7 +832,7 @@ fn the_honest_list_and_the_warning_list_stay_consistent() {
     config.playlist.shuffle = true;
     config.playlist.repeat = true;
     config.plugins.plugin_dir = Some(PathBuf::from("plugins"));
-    config.plugins.disabled = vec!["bad.dll".to_string()];
+    config.plugins.enabled = vec!["bad.dll".to_string()];
 
     let serialized = serialize_honest(&config, Some(18), None).expect("serialize honest config");
     let value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
