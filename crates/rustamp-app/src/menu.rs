@@ -108,6 +108,7 @@ impl App {
     /// Alt+F and the window-menu button). The presenter creates the OS window
     /// for this state; opening twice keeps it open.
     pub fn open_main_menu(&mut self) {
+        self.refresh_bookmarks();
         self.main_menu_open = true;
     }
 
@@ -174,7 +175,11 @@ impl App {
     /// The presenter shows it and routes the chosen id back through
     /// [`App::activate_menu_choice`].
     pub fn native_main_menu(&self) -> rustamp_ui::menu::NativeMainMenu {
-        rustamp_ui::menu::native_main_menu(self.state(), &self.menu_flags())
+        rustamp_ui::menu::native_main_menu(
+            self.state(),
+            &self.menu_flags(),
+            &self.bookmark_menu_labels(),
+        )
     }
 
     /// Runs what one chosen native-menu entry means.
@@ -224,6 +229,10 @@ impl App {
             }
             rustamp_ui::menu::MenuChoice::EqAutoload => {
                 self.eq_key_down(rustamp_ui::Key::Letter(b'A'), rustamp_ui::Modifiers::NONE)?;
+                Ok(None)
+            }
+            rustamp_ui::menu::MenuChoice::Bookmark(index) => {
+                self.play_bookmark(index);
                 Ok(None)
             }
             rustamp_ui::menu::MenuChoice::ToggleAutoscroll => {

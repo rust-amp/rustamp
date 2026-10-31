@@ -210,10 +210,7 @@ pub struct ForwardRequest {
     /// A media to add to the playlist **without** playing it, if any: a file
     /// path or a URL.
     ///
-    /// `/BOOKMARK <path>` (S13 §1) and `--enqueue` both land here: the
-    /// reference adds a bookmark, and Rustamp has no bookmark store yet
-    /// (RFC 0005 O12), so the media is added to the playlist instead —
-    /// added rather than played, which is what S13 §1 settles.
+    /// `/ADD <path>` and `--enqueue` land here.
     pub added: Option<MediaLocation>,
     /// The volume to apply (`0..=255`), if any.
     pub volume: Option<u8>,

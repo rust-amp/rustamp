@@ -123,6 +123,7 @@
 #![deny(unsafe_code)]
 
 pub mod app;
+pub mod bookmarks;
 pub mod cli;
 pub mod clipboard;
 pub mod config;
@@ -205,26 +206,13 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ----- what the command line asks for -----
-    // `/BOOKMARK <path>` adds the path and does not play it (S13 §1), and
-    // `/ADD <path>` enqueues a path the same way. The bookmark store does
-    // not exist yet (RFC 0005 O12), so the path is added to the playlist
-    // and the run says so.
+    // `/BOOKMARK <path>` bookmarks the path and does not play it (S13 §1); the
+    // store opens with the configuration, below. `/ADD <path>` enqueues a path.
     let mut added: Vec<MediaLocation> = Vec::new();
-    let mut bookmarked = false;
-    match &args.bookmark {
-        Some(cli::Bookmark::Location(location)) => {
-            added.push(location.clone());
-            bookmarked = true;
-            eprintln!(
-                "rustamp: the bookmark store does not exist yet (RFC 0005 O12): {} was added to \
-                 the playlist instead",
-                location.to_display_string()
-            );
-        }
-        Some(cli::Bookmark::WithoutPath) => eprintln!(
+    if let Some(cli::Bookmark::WithoutPath) = &args.bookmark {
+        eprintln!(
             "rustamp: /BOOKMARK without a path is not defined (S13 §5.3); nothing was bookmarked"
-        ),
-        None => {}
+        );
     }
     // The enqueued media (S13 §1): `/ADD <path>` names its own media and
     // `--enqueue` names the media argument. The media is **added** to the
@@ -308,13 +296,10 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     for warning in &loaded.warnings {
         app.note(warning.clone());
     }
-    if bookmarked {
-        app.note(
-            "the bookmark store does not exist yet (RFC 0005 O12): the path was added to the \
-             playlist instead"
-                .to_owned(),
-        );
-    } // Start the plugin host when it is resolvable (see `crate::supervise`):
+    if let Some(cli::Bookmark::Location(location)) = &args.bookmark {
+        app.add_bookmark(location.clone(), None);
+    }
+    // Start the plugin host when it is resolvable (see `crate::supervise`):
     // best-effort by contract, so a missing binary only means the player runs
     // detached — it never fails startup and never opens a window. The host
     // reads the operator's approval decisions from the store beside the
@@ -378,7 +363,7 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
             // The headless loop plays the queue to its end. When the command
             // line only asked for an item to be added (`--enqueue`, `/ADD`,
             // `/BOOKMARK`), nothing plays and the loop would wait forever.
-            let only_added = !added.is_empty() && !plays;
+            let only_added = (!added.is_empty() || args.bookmark.is_some()) && !plays;
             apply_startup(&mut app, plays, added)?;
             if only_added {
                 // Nothing plays, so the headless loop never runs: the notes
@@ -417,8 +402,7 @@ pub fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Applies what the command line asked the player to do.
 ///
-/// The items that are only **added** come first (a bookmark, an enqueued
-/// file), then the playback of the file argument (S02 §1: a file given on the
+/// The items that are only **added** come first (an enqueued file), then the playback of the file argument (S02 §1: a file given on the
 /// command line starts playing it).
 fn apply_startup(
     app: &mut App,

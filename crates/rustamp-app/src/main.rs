@@ -216,6 +216,22 @@ fn run_player(
 
 /// Hands the second launch's command line to the running instance and exits.
 fn forward(key: &str, args: &cli::Args) -> ExitCode {
+    // A bookmark does not travel: the store is a file, and the running instance
+    // reads it before it shows it.
+    if let Some(cli::Bookmark::Location(location)) = &args.bookmark {
+        let added = args
+            .resolved_config_path()
+            .ok_or_else(|| "there is no configuration folder for the store".to_owned())
+            .and_then(|config| {
+                rustamp_app::bookmarks::add_to_store(
+                    rustamp_app::bookmarks::store_path(&config),
+                    location.clone(),
+                )
+            });
+        if let Err(problem) = added {
+            eprintln!("rustamp: nothing was bookmarked: {problem}");
+        }
+    }
     let request = cli::forward_request(args);
     // The running instance's output mode, skin and `--seconds` were fixed at
     // its start-up; report each one we cannot apply rather than drop it.

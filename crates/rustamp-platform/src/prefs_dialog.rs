@@ -458,6 +458,17 @@ pub enum Item {
         /// Placement.
         rect: Rect,
     },
+    /// Registers the player with the shell
+    /// ([`PrefsAction::RegisterFileTypes`]).
+    RegisterButton {
+        /// Placement.
+        rect: Rect,
+    },
+    /// Removes that registration ([`PrefsAction::UnregisterFileTypes`]).
+    UnregisterButton {
+        /// Placement.
+        rect: Rect,
+    },
     /// The report of the last import
     /// ([`PrefsSettings::winamp_ini_report`]).
     ///
@@ -558,10 +569,27 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
                 rect: rect(12, 188, w - 24, 48),
             },
         ],
-        PrefsNode::FileTypes => note_page(
-            "File types",
-            "Associating file types with Rustamp is not available yet.",
-        ),
+        PrefsNode::FileTypes => vec![
+            Item::Group {
+                text: "File types",
+                rect: rect(0, 0, w, 240),
+            },
+            Item::Label {
+                text: "Registers Rustamp for your Windows account: the Play and Enqueue verbs, and \
+                       the audio and playlist file types. Windows decides the default app itself, \
+                       under Settings > Apps > Default apps.",
+                rect: rect(12, 18, w - 24, 84),
+            },
+            Item::RegisterButton {
+                rect: rect(12, 108, (w - 32) / 2, 26),
+            },
+            Item::UnregisterButton {
+                rect: rect(20 + (w - 32) / 2, 108, (w - 32) / 2, 26),
+            },
+            Item::Report {
+                rect: rect(12, 144, w - 24, 84),
+            },
+        ],
         PrefsNode::Options => vec![
             Item::Group {
                 text: "Windows",
@@ -685,7 +713,11 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
                 rect: rect(12, 144, w - 24, 84),
             },
         ],
-        PrefsNode::Bookmarks => note_page("Bookmarks", "Bookmarks are not available yet."),
+        PrefsNode::Bookmarks => note_page(
+            "Bookmarks",
+            "Alt+I bookmarks the current track, and in the playlist the selected entries. \
+             Ctrl+Alt+I edits the bookmarks. The main menu's Bookmarks row lists them.",
+        ),
     }
 }
 
@@ -780,6 +812,8 @@ pub struct PrefsSettings {
     /// `None` when no import has run yet: the page then says so instead of
     /// showing a report.
     pub winamp_ini_report: Option<String>,
+    /// What the file-types page's last action did, for its report line.
+    pub file_types_report: Option<String>,
 }
 
 impl PrefsSettings {
@@ -1300,6 +1334,10 @@ pub enum PrefsAction {
     /// The player asks the user for the file itself; the dialog only says
     /// that the file was asked for.
     ImportWinampIni,
+    /// The player should register itself with the shell (S13 §1 `/INSTALL`).
+    RegisterFileTypes,
+    /// The player should remove that registration (S13 §1 `/UNREG`).
+    UnregisterFileTypes,
 }
 
 /// Why the dialog could not be opened.
@@ -1367,6 +1405,8 @@ mod win32 {
     const ID_LIBRARY_REMOVE: u16 = 66;
     const ID_IMPORT: u16 = 67;
     const ID_PLUGIN_CONFIGURE: u16 = 68;
+    const ID_REGISTER: u16 = 69;
+    const ID_UNREGISTER: u16 = 70;
     /// Scrollable width (unscaled pixels) of a plug-in row.
     const PLUGIN_ROW_EXTENT: i32 = 900;
     /// Scrollable width (unscaled pixels) of a library root.
@@ -1745,7 +1785,17 @@ mod win32 {
     /// The text is set only when it changed: the settings are pushed every
     /// tick, and a text that is set again and again flickers.
     fn set_report(control: HWND, settings: &PrefsSettings) {
-        let wanted = settings.winamp_ini_report.as_deref().unwrap_or(NO_REPORT);
+        let node = STATE.with(|state| {
+            state
+                .try_borrow()
+                .ok()
+                .and_then(|g| g.as_ref().map(|i| i.node))
+        });
+        let wanted = if node == Some(PrefsNode::FileTypes) {
+            settings.file_types_report.as_deref().unwrap_or("")
+        } else {
+            settings.winamp_ini_report.as_deref().unwrap_or(NO_REPORT)
+        };
         let unchanged = STATE.with(|state| {
             state
                 .try_borrow()
@@ -2266,6 +2316,26 @@ mod win32 {
                         page.push(c);
                     }
                 }
+                Item::RegisterButton { rect } | Item::UnregisterButton { rect } => {
+                    let (text, id) = if matches!(item, Item::RegisterButton { .. }) {
+                        ("Register Rustamp", ID_REGISTER)
+                    } else {
+                        ("Remove registration", ID_UNREGISTER)
+                    };
+                    if let Ok(c) = child(
+                        hwnd,
+                        windows::core::w!("BUTTON"),
+                        text,
+                        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON,
+                        0,
+                        shift(rect),
+                        id,
+                        dpi,
+                        font,
+                    ) {
+                        page.push(c);
+                    }
+                }
                 Item::Report { rect } => {
                     if let Ok(c) = child(
                         hwnd,
@@ -2559,6 +2629,14 @@ mod win32 {
                     }
                     return LRESULT(0);
                 }
+                if id == ID_REGISTER && code == BN_CLICKED {
+                    push_action(PrefsAction::RegisterFileTypes);
+                    return LRESULT(0);
+                }
+                if id == ID_UNREGISTER && code == BN_CLICKED {
+                    push_action(PrefsAction::UnregisterFileTypes);
+                    return LRESULT(0);
+                }
                 if id == ID_IMPORT && code == BN_CLICKED {
                     // The dialog does not read the file itself: the player
                     // asks the user for it, from the tick.
@@ -2817,6 +2895,8 @@ mod tests {
                     | Item::LibraryAdd { rect }
                     | Item::LibraryRemove { rect }
                     | Item::ImportButton { rect }
+                    | Item::RegisterButton { rect }
+                    | Item::UnregisterButton { rect }
                     | Item::Report { rect } => vec![rect],
                     Item::Combo { label, list, .. } => vec![label, list],
                     Item::TextField { label, field, .. } => vec![label, field],
@@ -3558,6 +3638,28 @@ mod tests {
             .expect("the import button");
         assert_eq!(button.x, 12);
         assert_eq!(button.w, PAGE_SIZE.0 - 24);
+    }
+
+    /// The file-types page offers both directions and reports the result.
+    #[test]
+    fn the_file_types_page_registers_and_removes() {
+        let items = page_items(PrefsNode::FileTypes);
+        let count = |f: fn(&Item) -> bool| items.iter().filter(|i| f(i)).count();
+        assert_eq!(count(|i| matches!(i, Item::RegisterButton { .. })), 1);
+        assert_eq!(count(|i| matches!(i, Item::UnregisterButton { .. })), 1);
+        assert_eq!(count(|i| matches!(i, Item::Report { .. })), 1);
+    }
+
+    /// No page tells the user that a feature does not exist.
+    #[test]
+    fn no_page_says_a_feature_is_missing() {
+        for entry in TREE {
+            for item in page_items(entry.node) {
+                if let Item::Label { text, .. } = item {
+                    assert!(!text.contains("not available"), "{:?}: {text}", entry.node);
+                }
+            }
+        }
     }
 
     /// The page says what it imports and that the file is only read.

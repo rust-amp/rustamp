@@ -161,6 +161,9 @@ pub enum DialogKind {
     EditEntry,
     /// A jump box (S03 "Jump to file/time", ids 40194/40193).
     Jump(JumpTarget),
+    /// The bookmark editor (S03 §1 id 40320): the jump-to-file search box over
+    /// the bookmarks.
+    Bookmarks,
     /// The load-playlist dialog (S06 §4 LIST OPTS, RFC 0010
     /// `Command::OpenPlaylist`).
     LoadPlaylist,
@@ -203,6 +206,8 @@ impl DialogKind {
             // and no spec fixes dialog titles (S04 open).
             DialogKind::EditEntry => EDIT_ENTRY_TITLE,
             DialogKind::Jump(JumpTarget::File) => "Jump to file",
+            // Own choice: S03 §1 gives the row's id and chord, not a title.
+            DialogKind::Bookmarks => "Bookmarks",
             DialogKind::Jump(JumpTarget::Time) => "Jump to time",
             DialogKind::LoadPlaylist => crate::playlist::LOAD_DIALOG_TITLE,
             // The files face reuses the settled ADD title (S06 §4, shared so
@@ -237,7 +242,7 @@ impl DialogKind {
             DialogKind::ExtendedInfo => EXTENDED_INFO_CLIENT_SIZE,
             DialogKind::EditEntry => EDIT_ENTRY_CLIENT_SIZE,
             DialogKind::Jump(JumpTarget::Time) => JUMP_CLIENT_SIZE,
-            DialogKind::Jump(JumpTarget::File) => JUMP_FILE_CLIENT_SIZE,
+            DialogKind::Jump(JumpTarget::File) | DialogKind::Bookmarks => JUMP_FILE_CLIENT_SIZE,
             DialogKind::LoadPlaylist => LOAD_PLAYLIST_CLIENT_SIZE,
             DialogKind::OpenMedia { .. } => OPEN_MEDIA_CLIENT_SIZE,
             DialogKind::SkinBrowser => SKIN_BROWSER_CLIENT_SIZE,
@@ -288,6 +293,7 @@ pub fn dialog_for_command(command: &Command) -> Option<DialogKind> {
         Command::OpenAbout => Some(DialogKind::About),
         Command::OpenFileInfo => Some(DialogKind::FileInfo),
         Command::OpenJump { target } => Some(DialogKind::Jump(*target)),
+        Command::OpenBookmarkEditor => Some(DialogKind::Bookmarks),
         Command::OpenPlaylist => Some(DialogKind::LoadPlaylist),
         // The `play` flag rides along untouched: confirming the dialog emits
         // `AddItems` with this same value (RFC 0005 §5.2; the `false` of the
@@ -319,6 +325,7 @@ pub fn opening_command(dialog: DialogKind) -> Option<Command> {
         DialogKind::About => Some(Command::OpenAbout),
         DialogKind::FileInfo => Some(Command::OpenFileInfo),
         DialogKind::Jump(target) => Some(Command::OpenJump { target }),
+        DialogKind::Bookmarks => Some(Command::OpenBookmarkEditor),
         DialogKind::LoadPlaylist => Some(Command::OpenPlaylist),
         DialogKind::OpenMedia { kind, play } => Some(Command::OpenMedia { kind, play }),
         DialogKind::SkinBrowser => Some(Command::OpenSkinBrowser),
@@ -568,8 +575,22 @@ impl DialogManager {
         self.jump_index = 0;
     }
 
+    /// Keeps the search list's selection on a row after the list got shorter.
+    pub fn clamp_jump_index(&mut self) {
+        self.jump_index = self.jump_index.min(self.jump_rows.saturating_sub(1));
+    }
+
+    /// Whether the open dialog is a search box over a list: jump to file or
+    /// the bookmark editor.
+    fn is_search_list(&self) -> bool {
+        matches!(
+            self.open,
+            Some(DialogKind::Jump(JumpTarget::File) | DialogKind::Bookmarks)
+        )
+    }
+
     fn jump_limit(&self) -> usize {
-        if self.open == Some(DialogKind::Jump(JumpTarget::File)) {
+        if self.is_search_list() {
             MAX_JUMP_FILE_LEN
         } else {
             MAX_JUMP_LEN
@@ -662,7 +683,7 @@ impl DialogManager {
                 if matches!(self.open, Some(DialogKind::OpenMedia { .. })) {
                     self.push_media_char(letter as char);
                     true
-                } else if self.open == Some(DialogKind::Jump(JumpTarget::File)) {
+                } else if self.is_search_list() {
                     self.push_jump_char(letter as char);
                     true
                 } else {
@@ -673,7 +694,7 @@ impl DialogManager {
                 if matches!(self.open, Some(DialogKind::OpenMedia { .. })) {
                     self.push_media_char(' ');
                     true
-                } else if self.open == Some(DialogKind::Jump(JumpTarget::File)) {
+                } else if self.is_search_list() {
                     self.push_jump_char(' ');
                     true
                 } else {
@@ -685,7 +706,7 @@ impl DialogManager {
                     self.select_prev_skin();
                     true
                 }
-                Some(DialogKind::Jump(JumpTarget::File)) => {
+                Some(DialogKind::Jump(JumpTarget::File) | DialogKind::Bookmarks) => {
                     self.jump_index = self.jump_index.saturating_sub(1);
                     true
                 }
@@ -696,7 +717,7 @@ impl DialogManager {
                     self.select_next_skin();
                     true
                 }
-                Some(DialogKind::Jump(JumpTarget::File)) => {
+                Some(DialogKind::Jump(JumpTarget::File) | DialogKind::Bookmarks) => {
                     self.jump_index = self.jump_index.saturating_add(1);
                     if self.jump_rows > 0 {
                         self.jump_index = self.jump_index.min(self.jump_rows - 1);
@@ -782,7 +803,7 @@ impl DialogManager {
                     self.push_jump_char(ch);
                     typed = true;
                 }
-                Some(DialogKind::Jump(JumpTarget::File)) => {
+                Some(DialogKind::Jump(JumpTarget::File) | DialogKind::Bookmarks) => {
                     self.push_jump_char(ch);
                     typed = true;
                 }
@@ -2162,7 +2183,7 @@ pub fn render_dialog(kind: DialogKind, skin: &Skin, body: &[&str]) -> Image {
 /// Whether the body line at `index` is the entry field of `kind`.
 fn is_input_line(kind: DialogKind, index: usize) -> bool {
     match kind {
-        DialogKind::Jump(JumpTarget::File) => index == 0,
+        DialogKind::Jump(JumpTarget::File) | DialogKind::Bookmarks => index == 0,
         DialogKind::Jump(JumpTarget::Time) => index == 1,
         _ => false,
     }
@@ -2170,7 +2191,10 @@ fn is_input_line(kind: DialogKind, index: usize) -> bool {
 
 /// Whether the line at `index` closes a list instead of heading the dialog.
 fn is_list_footer(kind: DialogKind, index: usize, last: usize) -> bool {
-    matches!(kind, DialogKind::Jump(JumpTarget::File)) && index == last
+    matches!(
+        kind,
+        DialogKind::Jump(JumpTarget::File) | DialogKind::Bookmarks
+    ) && index == last
 }
 
 /// The size of the dialogs' real font (own choice: the list's own size).

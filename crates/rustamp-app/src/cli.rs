@@ -86,11 +86,10 @@
 //! | §3 the two verbs per directory | `Play` and `Enqueue` | matches | `rustamp-platform/src/shell_registration.rs` |
 //! | §3 the one verb of a skin archive | `install` | matches | `rustamp-platform/src/shell_registration.rs` |
 //!
-//! The note on `/BOOKMARK`: the reference adds a **bookmark**, and Rustamp has
-//! no bookmark store yet (RFC 0005 O12). The path is therefore added to the
-//! playlist **without starting playback** — added rather than played, which is
-//! what S13 §1 settles — and the run says that the bookmark store does not
-//! exist yet.
+//! The note on `/BOOKMARK`: the path goes into the bookmark store
+//! ([`crate::bookmarks`]) and is not played, as S13 §1 settles. A second launch
+//! writes the store itself, because the running player reads it before it
+//! shows it.
 //!
 //! The note on `/ADD`: the reference registers its `Enqueue` shell verb with
 //! the command line `"%s" /ADD "%%1"` (S13 §3), so the verb **is** the switch.
@@ -637,20 +636,14 @@ pub fn forward_request(args: &Args) -> ForwardRequest {
             "--seconds is ignored: it is a start-up test aid on the running instance".to_owned(),
         );
     }
-    // The bookmark: a media that is added and not played (S13 §1). A bookmark
-    // without a path is left open by S13 §5.3, so it is reported rather than
-    // guessed.
-    let mut added = match &args.bookmark {
-        Some(Bookmark::Location(location)) => Some(location.clone()),
-        Some(Bookmark::WithoutPath) => {
-            refusals.push(
-                "/BOOKMARK without a path is not defined (S13 §5.3); nothing was bookmarked"
-                    .to_owned(),
-            );
-            None
-        }
-        None => None,
-    };
+    // A bookmark with a path does not travel: this launch writes the store
+    // ([`crate::bookmarks`]). One without a path is left open by S13 §5.3, so it
+    // is reported rather than guessed.
+    if let Some(Bookmark::WithoutPath) = &args.bookmark {
+        refusals.push(
+            "/BOOKMARK without a path is not defined (S13 §5.3); nothing was bookmarked".to_owned(),
+        );
+    }
     // The enqueued media (S13 §1): `/ADD <path>` names its own media and
     // `--enqueue` names the media argument. Both are added and not played. A
     // `/ADD` without a path is left open by S13 §5.3, so it is reported
@@ -666,22 +659,11 @@ pub fn forward_request(args: &Args) -> ForwardRequest {
             (args.media.clone(), None)
         }
     };
-    // Only one media can travel that way, so the enqueued one wins and the
-    // bookmark is reported.
-    if let Some(enqueued) = enqueued {
-        if let Some(bookmark) = added.take() {
-            refusals.push(format!(
-                "/BOOKMARK {} was not forwarded: only one path can be added without playing it",
-                bookmark.to_display_string()
-            ));
-        }
-        added = Some(enqueued);
-    }
     // The frame carries a location: a path or a URL. A URL this build cannot
     // read is reported instead of being handed over (see
     // [`forwarded_location`]).
     let file = forwarded_location(file, &mut refusals);
-    let added = forwarded_location(added, &mut refusals);
+    let added = forwarded_location(enqueued, &mut refusals);
     ForwardRequest {
         file,
         added,

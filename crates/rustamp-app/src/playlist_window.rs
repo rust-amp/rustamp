@@ -735,13 +735,10 @@ impl App {
                 Ok(Some(ShortcutOutcome::Commands(vec![command])))
             }
             PlaylistKeyAction::BookmarkSelection => {
-                // S03 §2's row bookmarks the *selected* item(s); the app's
-                // bookmark command bookmarks the current track and the
-                // bookmark store does not exist yet (RFC 0005 O12), so the
-                // row is routed to it.
-                let command = Command::AddBookmark;
-                self.submit(command.clone())?;
-                Ok(Some(ShortcutOutcome::Commands(vec![command])))
+                // S03 §2's row bookmarks the *selected* item(s), where the
+                // main window's bookmarks the current track.
+                self.bookmark_selection();
+                Ok(Some(ShortcutOutcome::Commands(Vec::new())))
             }
             // ----- the HTML playlist (S03 §2 `40292`) -----
             // The document goes where the user says, so the app records the
@@ -2697,10 +2694,7 @@ mod tests {
         let outcome = app
             .playlist_key_down(Key::Letter(b'I'), Modifiers::ALT)
             .expect("Alt+I applies");
-        assert_eq!(
-            outcome,
-            Some(ShortcutOutcome::Commands(vec![Command::AddBookmark]))
-        );
+        assert_eq!(outcome, Some(ShortcutOutcome::Commands(Vec::new())));
     }
 
     #[test]

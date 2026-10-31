@@ -806,6 +806,9 @@ pub enum MenuChoice {
     EqEnabled,
     /// The equalizer menu's "autoloading" row (S03 §3, id 40245).
     EqAutoload,
+    /// A bookmark of the `Bookmarks` submenu, by its place in the store: plays
+    /// it.
+    Bookmark(usize),
     /// The Options popup's Time elapsed / Time remaining rows: sets the
     /// reading (`true` = remaining) instead of toggling it, so choosing the
     /// row that is already on keeps it on (S04 §4.2: the check moves between
@@ -821,6 +824,7 @@ impl MenuChoice {
             | MenuChoice::NoAction { label }
             | MenuChoice::PlaylistKey { label, .. }
             | MenuChoice::UnavailableCommand { label, .. } => label,
+            MenuChoice::Bookmark(_) => "Bookmark",
             MenuChoice::ToggleAutoscroll => "Autoscroll songname",
             MenuChoice::EqEnabled => "Equalizer enabled",
             MenuChoice::EqAutoload => "Autoloading",
@@ -896,7 +900,13 @@ impl NativeMainMenu {
 /// already carries (S04 §9 never opened one). They are now reachable: the
 /// self-drawn popup could only note that a submenu was deferred, because it
 /// had no way to draw one.
-pub fn native_main_menu(state: &MainWindowState, flags: &MenuFlags) -> NativeMainMenu {
+///
+/// `bookmarks` are the labels the `Bookmarks` submenu lists under its two rows.
+pub fn native_main_menu(
+    state: &MainWindowState,
+    flags: &MenuFlags,
+    bookmarks: &[String],
+) -> NativeMainMenu {
     let mut rows = Vec::with_capacity(MAIN_MENU_ROWS);
     let mut choices = Vec::new();
     for row in MAIN_MENU.iter() {
@@ -922,6 +932,19 @@ pub fn native_main_menu(state: &MainWindowState, flags: &MenuFlags) -> NativeMai
                         checked: check_state(entry.check, state, flags),
                         enabled: true,
                     });
+                }
+                if id == SubmenuId::Bookmarks && !bookmarks.is_empty() {
+                    entries.push(PopupRow::Separator);
+                    for (index, label) in bookmarks.iter().enumerate() {
+                        choices.push(MenuChoice::Bookmark(index));
+                        entries.push(PopupRow::Entry {
+                            id: choices.len() as u32,
+                            label: label.clone(),
+                            accelerator: None,
+                            checked: false,
+                            enabled: true,
+                        });
+                    }
                 }
                 rows.push(PopupRow::Submenu {
                     label: item.label.to_string(),
@@ -952,7 +975,9 @@ pub fn native_main_menu(state: &MainWindowState, flags: &MenuFlags) -> NativeMai
                     label: item.label.to_string(),
                     accelerator: item.shortcut.map(str::to_string),
                     checked: check_state(item.check, state, flags),
-                    enabled: true,
+                    // The row is measured (S04 §2) and the player has no
+                    // browser to open, so it is greyed rather than dead.
+                    enabled: item.label != "Minibrowser",
                 });
             }
         }

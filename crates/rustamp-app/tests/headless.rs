@@ -309,10 +309,9 @@ fn an_enqueued_file_is_added_and_not_played() {
 }
 
 #[test]
-fn a_bookmark_is_added_and_not_played() {
+fn a_bookmark_is_stored_and_not_played() {
     // S13 §1: `/BOOKMARK <path>` adds the path as a bookmark rather than
-    // playing it. The bookmark store does not exist yet, so the path is
-    // added to the playlist and the run says so.
+    // playing it.
     let fixture = fixture();
     let dir = tempfile::tempdir().unwrap();
     let mut command = binary();
@@ -330,10 +329,8 @@ fn a_bookmark_is_added_and_not_played() {
         !stdout.contains("playing"),
         "a bookmark must not start the playback:\n{stdout}"
     );
-    assert!(
-        stderr.contains("bookmark store does not exist"),
-        "stderr:\n{stderr}"
-    );
+    let store = std::fs::read_to_string(dir.path().join("bookmarks.m3u8")).expect("the store");
+    assert!(store.contains("sine.flac"), "store:\n{store}");
 }
 
 #[test]

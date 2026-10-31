@@ -143,6 +143,9 @@ impl App {
     /// implemented dialog (the caller keeps its existing note path then).
     pub fn open_dialog_for(&mut self, command: &Command) -> Option<DialogKind> {
         let dialog = dialog_for_command(command)?;
+        if dialog == DialogKind::Bookmarks {
+            self.refresh_bookmarks();
+        }
         self.dialogs.open(dialog);
         // A new dialog starts without a reason: the refusal of the previous
         // location entry belonged to the dialog that showed it.
@@ -205,6 +208,9 @@ impl App {
     fn sync_jump_rows(&mut self) {
         if self.dialog_is_open(DialogKind::Jump(JumpTarget::File)) {
             let rows = self.jump_file_matches().len();
+            self.dialogs.set_jump_rows(rows);
+        } else if self.dialog_is_open(DialogKind::Bookmarks) {
+            let rows = self.bookmark_matches().len();
             self.dialogs.set_jump_rows(rows);
         }
     }
@@ -320,6 +326,12 @@ impl App {
         if self.edit_entry_session().is_some() {
             return self.edit_entry_key(key, modifiers);
         }
+        if key == Key::Delete && self.dialog_is_open(DialogKind::Bookmarks) {
+            self.remove_selected_bookmark();
+            self.sync_jump_rows();
+            self.dialogs.clamp_jump_index();
+            return true;
+        }
         let is_load_playlist = self.dialog_is_open(DialogKind::LoadPlaylist);
         if is_load_playlist {
             match key {
@@ -353,6 +365,8 @@ impl App {
             Key::Enter => {
                 if self.dialog_is_open(DialogKind::Jump(JumpTarget::File)) {
                     self.confirm_jump_file();
+                } else if self.dialog_is_open(DialogKind::Bookmarks) {
+                    self.confirm_bookmark_editor();
                 } else if is_load_playlist {
                     if self.confirm_load_playlist() {
                         self.dialogs.close_any();
@@ -706,6 +720,7 @@ impl App {
             plugins: self.plugin_rows(),
             library_roots: self.library_roots(),
             winamp_ini_report: self.winamp_ini_report(),
+            file_types_report: self.file_types_report.clone(),
         }
     }
 
@@ -919,12 +934,37 @@ impl App {
                 let setting = self.playlist_title_format();
                 self.apply_title_format(setting.enabled, &format);
             }
+            PrefsAction::RegisterFileTypes => self.register_file_types(),
+            PrefsAction::UnregisterFileTypes => self.unregister_file_types(),
             PrefsAction::ImportWinampIni => {
                 // The dialog does not pick the file itself: the presenter
                 // asks the user for it, from the tick.
                 self.request_winamp_ini_import();
             }
         }
+    }
+
+    /// The file-types page's Register button (S13 §1 `/INSTALL`).
+    fn register_file_types(&mut self) {
+        let result = std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|exe| {
+                rustamp_platform::shell_registration::install(&exe)
+                    .map_err(|error| error.to_string())
+            });
+        self.file_types_report = Some(match result {
+            Ok(()) => "Rustamp is registered for your account.".to_string(),
+            Err(error) => format!("The registration failed: {error}"),
+        });
+    }
+
+    /// The file-types page's Remove button (S13 §1 `/UNREG`).
+    fn unregister_file_types(&mut self) {
+        let result = rustamp_platform::shell_registration::uninstall();
+        self.file_types_report = Some(match result {
+            Ok(()) => "The registration was removed.".to_string(),
+            Err(error) => format!("The registration could not be removed: {error}"),
+        });
     }
 
     /// Applies the playlist's title format and saves it.
@@ -976,6 +1016,7 @@ impl App {
                 self.dialogs.jump_text().to_string(),
             ],
             DialogKind::Jump(JumpTarget::File) => self.jump_file_lines(),
+            DialogKind::Bookmarks => self.bookmark_editor_lines(),
             // Prompt plus the staged pick or typed field, then the one-line hint.
             DialogKind::LoadPlaylist => self.load_playlist_lines(),
             // Kind-specific faces with plain own-choice prompts (the

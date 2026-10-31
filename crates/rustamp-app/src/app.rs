@@ -574,6 +574,10 @@ pub struct App {
     host_supervisor: Option<Supervisor>,
     /// Where configuration is persisted on clean exit, if known.
     config_path: Option<PathBuf>,
+    /// What the file-types page's last action did.
+    pub(crate) file_types_report: Option<String>,
+    /// The bookmarks (see [`crate::bookmarks`]).
+    pub(crate) bookmarks: crate::bookmarks::Bookmarks,
     /// A Winamp configuration import waiting for the presenter's file dialog
     /// (see [`crate::winamp_ini`]).
     pending_winamp_ini_import: bool,
@@ -805,6 +809,8 @@ impl App {
             plugin_requests: HashSet::new(),
             plugin_startup_loaded: false,
             config_path: None,
+            file_types_report: None,
+            bookmarks: crate::bookmarks::Bookmarks::default(),
             bus,
             events,
             commands,
@@ -1135,6 +1141,7 @@ impl App {
 
     /// Sets the path where configuration will be persisted on exit.
     pub fn set_config_path(&mut self, path: Option<PathBuf>) {
+        self.open_bookmarks(path.as_deref());
         self.config_path = path;
         self.load_eq_user_presets();
         self.load_eq_auto_rules();
@@ -3825,6 +3832,7 @@ impl App {
             | C::OpenFileInfo
             | C::OpenJump { .. }
             | C::OpenPlaylist
+            | C::OpenBookmarkEditor
             | C::OpenMedia { .. }
             | C::OpenPrefs
             | C::OpenPrefsPage(_)
@@ -3835,11 +3843,7 @@ impl App {
                 // `play` flag carried through untouched (RFC 0005 O5).
                 self.open_dialog_for(command);
             }
-            C::OpenBookmarkEditor | C::AddBookmark => {
-                self.note(format!(
-                    "{command:?} needs a dialog that is not implemented yet"
-                ));
-            }
+            C::AddBookmark => self.bookmark_current(),
             // The main-menu popup (S04): the app owns the open state, the
             // presenter hosts the OS window for it.
             C::OpenMainMenu => self.open_main_menu(),
@@ -7132,17 +7136,65 @@ mod tests {
     }
 
     #[test]
-    fn the_remaining_dialog_commands_still_record_their_note() {
-        // Only the bookmarks stay unimplemented (About, file info, jump, load
-        // playlist, the open-media faces, the skin browser and preferences
-        // open real windows now; the main menu opens its popup, covered in
-        // `menu.rs`).
-        let (mut app, _dir) = app_with_file(None);
+    fn the_bookmark_commands_add_list_play_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _dir) = app_with_file(Some(track(&dir, "track1_44100.tst")));
+        app.submit(Command::Play).unwrap();
         app.submit(Command::AddBookmark).unwrap();
-        let notes = app.drain_notes();
-        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(app.bookmark_menu_labels().len(), 1);
+        assert!(
+            app.drain_notes()
+                .iter()
+                .all(|n| !n.contains("not implemented"))
+        );
+
+        // Adding again changes nothing, and the menu lists it under its rows.
+        app.submit(Command::AddBookmark).unwrap();
+        let menu = app.native_main_menu();
+        let bookmark = (1..=menu.choices.len() as u32)
+            .find(|id| {
+                matches!(
+                    menu.choice_for_id(*id),
+                    Some(rustamp_ui::menu::MenuChoice::Bookmark(0))
+                )
+            })
+            .expect("the bookmark is a row of the menu");
+        assert_eq!(
+            menu.choices
+                .iter()
+                .filter(|c| matches!(c, rustamp_ui::menu::MenuChoice::Bookmark(_)))
+                .count(),
+            1
+        );
+
+        // The menu row plays it: it joins the end of the playlist.
+        let before = app.engine().queue().len();
+        app.activate_menu_choice(menu.choice_for_id(bookmark).unwrap())
+            .unwrap();
+        app.pump().unwrap();
+        assert_eq!(app.engine().queue().len(), before + 1);
+
+        // The editor lists it, and Delete removes it.
+        app.submit(Command::OpenBookmarkEditor).unwrap();
+        assert_eq!(
+            app.dialog_open_kind(),
+            Some(rustamp_ui::DialogKind::Bookmarks)
+        );
+        assert_eq!(app.bookmark_matches(), vec![0]);
+        assert!(app.dialog_key(rustamp_ui::Key::Delete, rustamp_ui::Modifiers::NONE));
+        assert!(app.bookmark_menu_labels().is_empty());
+        assert!(app.dialog_key(rustamp_ui::Key::Escape, rustamp_ui::Modifiers::NONE));
         assert!(app.dialog_open_kind().is_none());
-        assert!(!app.main_menu_is_open());
+    }
+
+    #[test]
+    fn a_menu_label_escapes_the_mnemonic_marker() {
+        let (mut app, _dir) = app_with_file(None);
+        app.add_bookmark(
+            rustamp_core::playlist::MediaLocation::Url("http://example.test/".to_string()),
+            Some("Rock & Roll".to_string()),
+        );
+        assert_eq!(app.bookmark_menu_labels(), vec!["Rock && Roll".to_string()]);
     }
 
     #[test]
