@@ -180,6 +180,12 @@
 //! See [`crate::fade_budget`] for the rule and for what it accepts in
 //! exchange (a ramp that outlasts the audio ends above zero).
 //!
+//! # The crossfade (own choice; S18 §7, item 9)
+//!
+//! [`EngineConfig::crossfade_ms`] overlaps the end of a track with the start of
+//! the next; `0`, the default, leaves the gapless seam as it is. See
+//! [`crate::crossfade`] for the mix point and the rules.
+//!
 //! # Restarting with a non-empty ring (A8)
 //!
 //! A stopped run leaves its buffered audio in the ring. When a run starts with
@@ -244,7 +250,7 @@
 //!
 //! # Not in this milestone
 //!
-//! out_ds-style fades and prebuffering (S18), crossfade, the S08
+//! out_ds-style fades and prebuffering (S18), the S08
 //! vis derivation, and the playlist model (the engine only holds a queue of
 //! re-openable sources and reports indices). See the task card and the report
 //! for task card A1.
@@ -271,6 +277,7 @@ use rustamp_dsp::{EqControl, Equalizer, FadeControl, Limiter, LimiterControl};
 use rustamp_playlist::PlaybackOrder;
 use rustamp_playlist::rng::DEFAULT_SEED;
 
+use crate::crossfade::MAX_CROSSFADE_MS;
 use crate::decode::{Config, DecodeMsg, DecodeOut, DecodeThread, TrackSource, spawn};
 use crate::fade_budget::{FadeBudget, FadeBuffer, FadeNote};
 use crate::replaygain::{IntoReplayGainValue, ReplayGainControl, ReplayGainMode};
@@ -321,6 +328,9 @@ pub struct EngineConfig {
     /// so the player setting and the engine agree until the application
     /// passes its configured value in. A duration of `0` stops at once.
     pub fade_ms: u32,
+    /// Duration of the crossfade between two tracks, in milliseconds, clamped
+    /// to [`MAX_CROSSFADE_MS`]. `0` (the default) is the gapless seam.
+    pub crossfade_ms: u32,
 }
 
 impl Default for EngineConfig {
@@ -334,6 +344,7 @@ impl Default for EngineConfig {
             balance: 0,
             position_interval: Duration::from_millis(200),
             fade_ms: AudioConfig::default().fadeout_ms,
+            crossfade_ms: AudioConfig::default().crossfade_ms,
         }
     }
 }
@@ -1237,6 +1248,24 @@ impl Engine {
     /// The ReplayGain control block, shared with the decode thread.
     pub fn replaygain_control(&self) -> Arc<ReplayGainControl> {
         Arc::clone(&self.replaygain_control)
+    }
+
+    /// The crossfade duration in milliseconds; `0` is the gapless seam.
+    pub fn crossfade_ms(&self) -> u32 {
+        self.cfg.crossfade_ms.min(MAX_CROSSFADE_MS)
+    }
+
+    /// Set the crossfade duration in milliseconds (clamped to
+    /// [`MAX_CROSSFADE_MS`]).
+    ///
+    /// A live run follows at once: the next end of a track fades with the new
+    /// duration, as far as it can still hold that much of the track back.
+    /// Because [`PlayerState`] has no field for it (and there is no
+    /// [`Command`] for it), the setting remains engine-side, like the limiter
+    /// switch.
+    pub fn set_crossfade_ms(&mut self, ms: u32) {
+        self.cfg.crossfade_ms = ms.min(MAX_CROSSFADE_MS);
+        self.send(DecodeMsg::SetCrossfade(self.cfg.crossfade_ms));
     }
 
     /// Whether "stop after current track" is armed (RFC 0005 O8).
@@ -2362,6 +2391,8 @@ impl Engine {
             replay_gain: Arc::clone(&self.replaygain_control),
             start_epoch,
             order: Arc::clone(&self.order),
+            crossfade_ms: self.crossfade_ms(),
+            limiter: Arc::clone(&self.limiter_control),
         };
         // The equalizer runs first, on the decoded PCM (see the module docs).
         // A fresh stage per run starts from clean filter history; the shared

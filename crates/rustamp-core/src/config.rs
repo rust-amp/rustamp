@@ -87,6 +87,8 @@ pub struct AudioConfig {
     pub buffer_ms: u32,
     /// Fade-out duration for `StopWithFadeout`, in ms.
     pub fadeout_ms: u32,
+    /// Crossfade between two tracks, in ms; `0` is the gapless seam (RFC 0023).
+    pub crossfade_ms: u32,
     /// Gapless playback.
     pub gapless: bool,
     /// ReplayGain mode.
@@ -105,6 +107,7 @@ impl Default for AudioConfig {
             output_mode: OutputMode::Shared,
             buffer_ms: 200,
             fadeout_ms: 500,
+            crossfade_ms: 0,
             gapless: true,
             replaygain: ReplayGainMode::Off,
             volume: 200,
@@ -243,6 +246,7 @@ mod tests {
                 output_mode: OutputMode::Exclusive,
                 buffer_ms: 350,
                 fadeout_ms: 800,
+                crossfade_ms: 2500,
                 gapless: false,
                 replaygain: ReplayGainMode::Track,
                 volume: 77,
@@ -356,6 +360,10 @@ mod tests {
         );
         assert_ne!(c.audio.buffer_ms, d.audio.buffer_ms, "audio.buffer_ms");
         assert_ne!(c.audio.fadeout_ms, d.audio.fadeout_ms, "audio.fadeout_ms");
+        assert_ne!(
+            c.audio.crossfade_ms, d.audio.crossfade_ms,
+            "audio.crossfade_ms"
+        );
         assert_ne!(c.audio.gapless, d.audio.gapless, "audio.gapless");
         assert_ne!(c.audio.replaygain, d.audio.replaygain, "audio.replaygain");
         assert_ne!(c.audio.volume, d.audio.volume, "audio.volume");
@@ -418,6 +426,10 @@ mod tests {
         assert_eq!(
             c.audio.fadeout_ms, back.audio.fadeout_ms,
             "audio.fadeout_ms"
+        );
+        assert_eq!(
+            c.audio.crossfade_ms, back.audio.crossfade_ms,
+            "audio.crossfade_ms"
         );
         assert_eq!(c.audio.gapless, back.audio.gapless, "audio.gapless");
         assert_eq!(

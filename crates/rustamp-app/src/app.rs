@@ -723,6 +723,7 @@ impl App {
             // agree by accident — the configured value must be handed over
             // explicitly, or a file that asks for a different fade is ignored.
             fade_ms: options.config.audio.fadeout_ms,
+            crossfade_ms: options.config.audio.crossfade_ms,
             ..EngineConfig::default()
         };
         // The ring is the app's own configuration and the engine never
@@ -1075,6 +1076,7 @@ impl App {
             // The fade-out duration is a configuration setting, not a runtime
             // one: the new engine runs the configured fade as well.
             fade_ms: self.config.audio.fadeout_ms,
+            crossfade_ms: self.config.audio.crossfade_ms,
             ..EngineConfig::default()
         };
         let mut new_engine =
@@ -1147,6 +1149,19 @@ impl App {
     pub fn set_replaygain_mode(&mut self, mode: rustamp_core::config::ReplayGainMode) {
         self.engine
             .set_replaygain_mode(replaygain_mode_to_audio(mode));
+    }
+
+    /// The crossfade duration in milliseconds; `0` is the gapless seam.
+    pub fn crossfade_ms(&self) -> u32 {
+        self.engine.crossfade_ms()
+    }
+
+    /// Sets the crossfade duration, on the engine at once and in the saved
+    /// configuration. The engine clamps it, and the clamped value is the one
+    /// that is saved.
+    pub fn set_crossfade_ms(&mut self, ms: u32) {
+        self.engine.set_crossfade_ms(ms);
+        self.config.audio.crossfade_ms = self.engine.crossfade_ms();
     }
 
     /// Remembers the requested output mode for the next device creation.
@@ -5463,6 +5478,21 @@ mod tests {
         assert!(app.engine().repeat(), "the engine still repeats");
         assert!(app.state().shuffle, "the shuffle button is still lit");
         assert!(app.state().repeat, "the repeat button is still lit");
+    }
+
+    /// The crossfade duration is the configured one, and the setter reaches the
+    /// engine at once and the configuration a save writes.
+    #[test]
+    fn the_crossfade_setting_reaches_the_engine_and_the_saved_configuration() {
+        let mut config = Config::default();
+        config.audio.crossfade_ms = 2000;
+        let (mut app, _dir) = app_with_config(config, None, None);
+        assert_eq!(app.crossfade_ms(), 2000);
+        assert_eq!(app.engine().crossfade_ms(), 2000);
+
+        app.set_crossfade_ms(3000);
+        assert_eq!(app.engine().crossfade_ms(), 3000);
+        assert_eq!(app.current_config().audio.crossfade_ms, 3000);
     }
 
     /// The fade-out duration is the configured one: the engine ramps the
