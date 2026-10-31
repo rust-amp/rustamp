@@ -25,10 +25,12 @@ use std::time::{Duration, Instant};
 mod child_windows;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const WM_KEYDOWN: u32 = 0x0100;
 const WM_COMMAND: u32 = 0x0111;
 
 #[link(name = "user32")]
 unsafe extern "system" {
+    fn FindWindowW(class: *const u16, title: *const u16) -> *mut std::ffi::c_void;
     fn PostMessageW(hwnd: *mut std::ffi::c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
 }
 
@@ -367,6 +369,32 @@ fn the_player_runs(
             15,
         );
         note(&mut report, &out, "screenshot taken".to_string());
+        // The track's title reached the host's window, and the host's window
+        // passes a plug-in's key on to the player.
+        let told = wait_for(Duration::from_secs(10), || {
+            std::fs::read_to_string(&trace)
+                .unwrap_or_default()
+                .contains("now playing: 1. ")
+        });
+        assert!(told, "the host never heard the title: {}", tail(&trace, 6));
+        let text: Vec<u16> = "1. tone - Winamp".encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a terminated string; posting a key to the host's own window.
+        unsafe {
+            let host = FindWindowW(std::ptr::null(), text.as_ptr());
+            assert!(!host.is_null(), "no host window with the track's title");
+            PostMessageW(host, WM_KEYDOWN, b'V' as usize, 0);
+        }
+        let stopped = wait_for(Duration::from_secs(10), || {
+            std::fs::read_to_string(&stderr_path)
+                .unwrap_or_default()
+                .contains("a plug-in asked for Stop")
+        });
+        note(
+            &mut report,
+            &out,
+            format!("the key stopped the player: {stopped}"),
+        );
+        assert!(stopped, "player said: {}", tail(&stderr_path, 6));
         if preset_frame.is_some() {
             // The picture: the frame sits at the top left of the screen, and a
             // scope's line is white on black.

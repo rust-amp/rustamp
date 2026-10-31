@@ -2695,6 +2695,15 @@ impl App {
     /// raised — [`App::pump`] ignores the outcome, so state publishing can
     /// neither fail playback nor block it.
     pub fn publish_host_state(&mut self) -> PublishOutcome {
+        if let Some(index) = self.engine.current_index()
+            && let Some(source) = self.engine.queue().get(index as usize)
+        {
+            let file = source.display();
+            let title = self
+                .entry_name(index as usize)
+                .unwrap_or_else(|| file.clone());
+            self.host.publish_now_playing(index, &title, &file);
+        }
         let state = self.host_player_state();
         self.host.publish(&state)
     }
@@ -2709,6 +2718,12 @@ impl App {
     /// supervisor replaces the host on its next step.
     pub fn poll_host(&mut self) -> PollOutcome {
         let outcome = self.host.poll();
+        for command in self.host.take_plugin_commands() {
+            self.note(format!("a plug-in asked for {command:?}"));
+            if let Err(error) = self.submit(command) {
+                self.note(format!("a plug-in's request failed: {error}"));
+            }
+        }
         // A load the host refused is the user's news. The host reports it on
         // its own stderr, which the windowed player never shows, so the note
         // is the only place the user learns about it.

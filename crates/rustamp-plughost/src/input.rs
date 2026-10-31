@@ -344,6 +344,11 @@ pub(crate) fn call_seek(module: *mut InModule, time_ms: c_int) -> Result<(), Inp
     Ok(())
 }
 
+/// `text` in the system's ANSI code page, NUL-terminated.
+pub(crate) fn ansi_text(text: &str) -> Vec<u8> {
+    ansi_path(Path::new(text))
+}
+
 /// The bits of an input module's version that say its calls take wide paths
 /// (S09 §3.2).
 const WIDE_PATH_FLAG: c_int = 0x0F00_0000;

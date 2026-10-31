@@ -38,7 +38,9 @@ use crate::shm::{RingDirection, RingExpect, RingKind, RingRefuseReason};
 ///   carrier — `Message` itself is unchanged. A v4 peer cannot decode the
 ///   appended variants, so the same rule applies: a clean `Hello` rejection
 ///   instead of a postcard decode error.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// * `6`: adds [`Message::NowPlaying`], the track plug-ins read from the main
+///   window.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Wire form of [`VisFrame`] (flat vectors, `channel-major`: all samples of
 /// channel 0, then channel 1). Each vector has `VIS_CHANNELS * VIS_SAMPLES` values.
@@ -265,6 +267,15 @@ pub enum Message {
     DspError {
         /// Error description.
         message: String,
+    },
+    /// M: what plays now, for the plug-ins that ask the main window.
+    NowPlaying {
+        /// The track's place in the playlist, from 0.
+        position: u32,
+        /// The track's display title.
+        title: String,
+        /// The track's path or URL.
+        file: String,
     },
 }
 

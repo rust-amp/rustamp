@@ -501,17 +501,17 @@ fn every_plugin_request_round_trips_for_every_plugin_kind() {
 }
 
 #[test]
-fn the_protocol_version_is_five() {
+fn the_protocol_version_is_six() {
     // RFC 0005 took the protocol to 2; RFC 0006 appended its hosting messages
     // and took it to 3; RFC 0015's DspResetAck takes it to 4; RFC 0020's
     // plug-in requests take it to 5, because a v4 peer would mis-decode the
     // appended variants (the project rule is a clean Hello rejection rather
     // than a decode error).
-    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 5);
+    assert_eq!(rustamp_ipc::PROTOCOL_VERSION, 6);
     assert_eq!(
         rustamp_ipc::Message::hello(),
         rustamp_ipc::Message::Hello {
-            protocol_version: 5,
+            protocol_version: 6,
             pid: std::process::id(),
         }
     );

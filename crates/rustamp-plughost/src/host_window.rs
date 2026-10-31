@@ -208,6 +208,21 @@ impl HostWindow {
     pub const CLASS_NAME: &'static str = HOST_WINDOW_CLASS;
 
     /// Return the raw window handle without exposing the owned surface.
+    pub fn set_title(&self, title: &str) {
+        use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+        use windows::core::PCWSTR;
+        let text: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: our own window; the text lives through the call. A title
+        // that could not be set leaves the previous one.
+        let _ = unsafe {
+            SetWindowTextW(
+                windows::Win32::Foundation::HWND(self.hwnd_raw() as *mut _),
+                PCWSTR(text.as_ptr()),
+            )
+        };
+    }
+
+    /// The window's raw handle.
     pub fn hwnd_raw(&self) -> usize {
         #[cfg(windows)]
         {
@@ -417,6 +432,19 @@ unsafe fn handle_window_message(
             wparam.0, lparam.0
         ));
     }
+    // What a plug-in wants of the player goes to the player. The window still
+    // answers below.
+    match msg {
+        windows::Win32::UI::WindowsAndMessaging::WM_COMMAND => {
+            crate::plugin_commands::note_window_command((wparam.0 & 0xFFFF) as u32);
+            return LRESULT(0);
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN => {
+            crate::plugin_commands::note_key(wparam.0 as u32);
+            return LRESULT(0);
+        }
+        _ => {}
+    }
     match msg {
         WM_NCCREATE => {
             let cs = lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW;
@@ -451,6 +479,7 @@ unsafe fn handle_window_message(
             // Classic IPC carries its id in LPARAM. Reinterpret WPARAM through
             // isize so the -666 sentinel remains signed on either pointer width.
             let ipc_id = lparam.0 as u32;
+            crate::plugin_commands::note_ipc(ipc_id, wparam.0 as isize);
             // S21: a plug-in's own code asks for the 5.x start-up answers (the
             // service manager, the settings paths, the random generators). They
             // go to **every sender in this window's process and beyond**: MilkDrop

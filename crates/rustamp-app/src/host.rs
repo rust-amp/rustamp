@@ -369,6 +369,9 @@ pub enum CommandOutcome {
 pub struct HostStateLink {
     transport: Option<Box<dyn Transport>>,
     last_sent: Option<PlayerState>,
+    last_now_playing: Option<(u32, String, String)>,
+    /// What the plug-ins asked for, for the app to carry out.
+    plugin_commands: Vec<rustamp_core::command::Command>,
     last_send: Instant,
     greeting: Option<HostGreeting>,
     hello_sent: bool,
@@ -391,6 +394,8 @@ impl HostStateLink {
         HostStateLink {
             transport: None,
             last_sent: None,
+            last_now_playing: None,
+            plugin_commands: Vec::new(),
             last_send: Instant::now(),
             greeting: None,
             hello_sent: false,
@@ -424,6 +429,7 @@ impl HostStateLink {
     pub fn attach(&mut self, transport: impl Transport + 'static) {
         self.transport = Some(Box::new(transport));
         self.last_sent = None;
+        self.last_now_playing = None;
         self.reset_liveness();
         self.inventory.clear();
         self.generation = self.generation.wrapping_add(1);
@@ -449,6 +455,7 @@ impl HostStateLink {
     pub fn detach(&mut self) {
         self.transport = None;
         self.last_sent = None;
+        self.last_now_playing = None;
         self.reset_liveness();
         self.inventory.clear();
     }
@@ -642,6 +649,7 @@ impl HostStateLink {
                 self.pending_pong = None;
             }
             Message::Pong(_) => {}
+            Message::CommandFromPlugin(command) => self.plugin_commands.push(command),
             Message::PluginLoaded {
                 plugin_id,
                 name,
@@ -664,6 +672,28 @@ impl HostStateLink {
             Some(transport) => transport.send(message),
             None => Err(IpcError::Closed),
         }
+    }
+
+    /// Tells the host what plays, when that changed. Best-effort like
+    /// [`Self::publish`]: a dead link is the next poll's to find.
+    pub fn publish_now_playing(&mut self, position: u32, title: &str, file: &str) {
+        let now = (position, title.to_owned(), file.to_owned());
+        if self.transport.is_none() || self.last_now_playing.as_ref() == Some(&now) {
+            return;
+        }
+        let message = Message::NowPlaying {
+            position,
+            title: now.1.clone(),
+            file: now.2.clone(),
+        };
+        if self.send(&message).is_ok() {
+            self.last_now_playing = Some(now);
+        }
+    }
+
+    /// What the plug-ins asked for since the last call.
+    pub fn take_plugin_commands(&mut self) -> Vec<rustamp_core::command::Command> {
+        std::mem::take(&mut self.plugin_commands)
     }
 
     /// Publish `state` when the cadence rules say so (see the module docs).
@@ -702,6 +732,8 @@ impl HostStateLink {
                 // with it.
                 self.transport = None;
                 self.last_sent = None;
+                self.last_now_playing = None;
+                self.last_now_playing = None;
                 self.inventory.clear();
                 PublishOutcome::HostGone
             }

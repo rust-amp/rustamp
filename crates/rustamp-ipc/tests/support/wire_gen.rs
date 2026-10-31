@@ -25,7 +25,7 @@ use rustamp_proto::playlist::{EntryId, MediaLocation, SortKey};
 use rustamp_proto::state::{EqState, PlayerState, StreamInfo, TransportState, WindowId};
 
 /// The number of [`Message`] variants (declaration indices `0..=27`).
-pub const MESSAGE_VARIANT_COUNT: u8 = 28;
+pub const MESSAGE_VARIANT_COUNT: u8 = 29;
 
 /// The number of [`Command`] variants (declaration indices `0..=65`).
 pub const COMMAND_VARIANT_COUNT: u8 = 66;
@@ -662,6 +662,14 @@ pub fn message_variant(index: u8, rng: &mut Rng) -> Option<(&'static str, Messag
             "DspError",
             Message::DspError {
                 message: rng.text(),
+            },
+        ),
+        28 => (
+            "NowPlaying",
+            Message::NowPlaying {
+                position: rng.u32(),
+                title: rng.text(),
+                file: rng.text(),
             },
         ),
         _ => return None,

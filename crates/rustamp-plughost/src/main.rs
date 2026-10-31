@@ -363,6 +363,17 @@ fn run_ui_loop(
                     latest_state = Some(state);
                     budget -= 1;
                 }
+                Ok(ControlInbound::NowPlaying {
+                    position,
+                    title,
+                    file,
+                }) => {
+                    let text =
+                        rustamp_plughost::plugin_commands::set_now_playing(position, &title, &file);
+                    rustamp_plughost::fault::trace_event(&format!("now playing: {text}"));
+                    window.set_title(&text);
+                    budget -= 1;
+                }
                 Ok(ControlInbound::Ping(token)) => {
                     // Finding 6: Pong is generated here when UI pumps, confirming UI liveness.
                     let _ = outbox_tx.try_send(Message::Pong(token));
@@ -481,6 +492,10 @@ fn run_ui_loop(
         // its caller. The player owns the playlist, so the host advances
         // nothing itself; the report goes to stderr, which the supervisor
         // inherits, because stdout is the frame stream.
+        // What the plug-ins asked for is the player's to carry out.
+        for command in rustamp_plughost::plugin_commands::take() {
+            let _ = outbox_tx.try_send(Message::CommandFromPlugin(command));
+        }
         let ended = rustamp_plughost::handoff::take_end_of_track();
         if ended > 0 {
             eprintln!(

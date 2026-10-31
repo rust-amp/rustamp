@@ -44,6 +44,7 @@ pub mod ipc;
 pub mod loader;
 pub mod message_loop;
 pub mod pe_preflight;
+pub mod plugin_commands;
 pub mod registry;
 pub mod restart;
 pub mod side_by_side;

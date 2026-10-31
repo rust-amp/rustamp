@@ -49,12 +49,17 @@ pub const IPC_GETPLAYLISTTITLEW: u32 = 213;
 /// is called as a function when it is not 0 (see [`crate::embed_frame`]). The 2.95
 /// answer of S10 (1) stays for the player's own window.
 pub const IPC_GET_EMBEDIF: u32 = 505;
-/// IPC ids that answer with a string pointer the host has no string for: the
-/// skin directory, a playlist file, title and wide file (S10 §8.2). The host has
-/// no playlist or skin of its own, and "1", the answer for an unknown id, would
-/// be read as a string at address 1: `out_disk` and `vis_avs` do, and both test
-/// for null. So does the 2.95 contract of 211.
-pub const IPC_STRINGS_WITHOUT_ANSWER: [u32; 4] = [201, 211, 212, 214];
+/// IPC id 201: the skin directory (S10 §8.2). The host has no skin of its own,
+/// and "1", the answer for an unknown id, would be read as a string at address 1.
+/// `vis_avs` does, and tests for null.
+pub const IPC_GETSKIN: u32 = 201;
+/// IPC ids of the playlist's strings (S10 §8.2): `index` in, a pointer out, null
+/// when the host does not know the entry (see [`crate::plugin_commands`]).
+pub const IPC_GETPLAYLISTFILE: u32 = 211;
+/// See [`IPC_GETPLAYLISTFILE`].
+pub const IPC_GETPLAYLISTTITLE: u32 = 212;
+/// See [`IPC_GETPLAYLISTFILE`].
+pub const IPC_GETPLAYLISTFILEW: u32 = 214;
 
 /// What the generic call is asked about (S21 §3 and §5.1).
 const MSG_REGISTER_FACTORY: i32 = 10;
@@ -655,11 +660,15 @@ fn next_random() -> u32 {
 ///
 /// Only for requests sent by code inside this process: the caller decides.
 pub fn ipc_answer(id: u32, wparam: usize) -> Option<usize> {
-    if IPC_STRINGS_WITHOUT_ANSWER.contains(&id) {
-        return Some(0);
-    }
     Some(match id {
+        IPC_GETSKIN => 0,
+        IPC_GETPLAYLISTFILE => crate::plugin_commands::file_ansi(wparam),
+        IPC_GETPLAYLISTTITLE => crate::plugin_commands::title_ansi(wparam),
+        IPC_GETPLAYLISTFILEW => crate::plugin_commands::file_wide(wparam),
         IPC_GET_API_SERVICE => service_manager() as usize,
+        // With a state block as its parameter the request is the call itself
+        // (S10 §13).
+        IPC_GET_EMBEDIF if wparam != 0 => crate::embed_frame::embed_now(wparam),
         IPC_GET_EMBEDIF => crate::embed_frame::embed_function(),
         IPC_GETINIFILE => paths().file_ansi.as_ptr() as usize,
         IPC_GETINIDIRECTORY => paths().directory_ansi.as_ptr() as usize,
@@ -667,7 +676,9 @@ pub fn ipc_answer(id: u32, wparam: usize) -> Option<usize> {
         IPC_GETINIDIRECTORYW => paths().base_wide.as_ptr() as usize,
         IPC_GETPLUGINDIRECTORYW => paths().directory_wide.as_ptr() as usize,
         IPC_GET_D3DX9 => 0,
-        IPC_GETPLAYLISTTITLEW => EMPTY_WIDE.0.as_ptr() as usize,
+        IPC_GETPLAYLISTTITLEW => {
+            crate::plugin_commands::title_wide(wparam).unwrap_or(EMPTY_WIDE.0.as_ptr() as usize)
+        }
         IPC_GET_RANDFUNC => {
             if wparam == 1 {
                 random_float as extern "C" fn() -> f32 as usize
@@ -1019,8 +1030,14 @@ mod tests {
 
     #[test]
     fn a_string_the_host_does_not_have_is_null_and_never_one() {
-        for id in IPC_STRINGS_WITHOUT_ANSWER {
-            assert_eq!(ipc_answer(id, 0), Some(0), "{id}");
+        // Index past any real playlist: no test sets a track there.
+        for id in [
+            IPC_GETSKIN,
+            IPC_GETPLAYLISTFILE,
+            IPC_GETPLAYLISTTITLE,
+            IPC_GETPLAYLISTFILEW,
+        ] {
+            assert_eq!(ipc_answer(id, 999_999), Some(0), "{id}");
         }
     }
 

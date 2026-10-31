@@ -167,6 +167,15 @@ pub fn send_hello(transport: &mut dyn Transport) -> ControlStep {
 pub enum ControlInbound {
     /// Player state snapshot update.
     State(PlayerState),
+    /// What plays now.
+    NowPlaying {
+        /// The track's place in the playlist.
+        position: u32,
+        /// The track's title.
+        title: String,
+        /// The track's path or URL.
+        file: String,
+    },
     /// A ping from the parent with its token. The UI thread answers with Pong
     /// when it pumps messages, so a hung UI will not answer and trip the supervisor's timeout.
     Ping(u64),
@@ -264,6 +273,18 @@ pub fn handle_message_inbound(
             on_event(ControlInbound::Load { path, kind });
             ControlStep::Continue
         }
+        Message::NowPlaying {
+            position,
+            title,
+            file,
+        } => {
+            on_event(ControlInbound::NowPlaying {
+                position,
+                title,
+                file,
+            });
+            ControlStep::Continue
+        }
         Message::CommandToHost(Command::ConfigureVisPlugin) => {
             on_event(ControlInbound::ConfigureVis);
             ControlStep::Continue
@@ -346,6 +367,7 @@ pub fn apply_plugin_request(
         // Not plug-in requests of this function: the UI loop acts on them itself
         // (it needs the registry mutably, or it keeps the frame).
         ControlInbound::State(_)
+        | ControlInbound::NowPlaying { .. }
         | ControlInbound::Ping(_)
         | ControlInbound::Load { .. }
         | ControlInbound::ToggleVis

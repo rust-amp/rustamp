@@ -58,6 +58,21 @@ pub fn embed_function() -> usize {
     0
 }
 
+/// IPC 505's other form: the parameter is the state block, and the answer the
+/// frame.
+#[cfg(windows)]
+pub fn embed_now(state: usize) -> usize {
+    // SAFETY: the plug-in passes its own block, as for the function it can ask
+    // for instead.
+    unsafe { embed_window(state as *mut EmbedState) }
+}
+
+/// See the Windows form.
+#[cfg(not(windows))]
+pub fn embed_now(_state: usize) -> usize {
+    0
+}
+
 #[cfg(windows)]
 unsafe extern "system" fn frame_proc(
     window: windows::Win32::Foundation::HWND,
@@ -67,9 +82,19 @@ unsafe extern "system" fn frame_proc(
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, GW_CHILD, GetClientRect, GetWindow, MoveWindow, WM_CREATE, WM_PARENTNOTIFY,
-        WM_SIZE,
+        DefWindowProcW, GW_CHILD, GetClientRect, GetWindow, MoveWindow, SendMessageW, WM_CLOSE,
+        WM_CREATE, WM_PARENTNOTIFY, WM_SIZE,
     };
+    // The plug-in decides what closing means: `vis_avs` stops and destroys the
+    // frame itself. A frame without a child closes as any window does.
+    if message == WM_CLOSE {
+        // SAFETY: our own window.
+        if let Ok(child) = unsafe { GetWindow(window, GW_CHILD) } {
+            // SAFETY: the plug-in's child of our own window.
+            unsafe { SendMessageW(child, WM_CLOSE, None, None) };
+            return windows::Win32::Foundation::LRESULT(0);
+        }
+    }
     // A plug-in creates its window after the frame, at a size of its own: the
     // birth of the child is the frame's first chance to fit it.
     let child_born = message == WM_PARENTNOTIFY && (wparam.0 & 0xFFFF) as u32 == WM_CREATE;
