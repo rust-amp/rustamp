@@ -1357,6 +1357,13 @@ fn out_disk_writes_what_the_engine_renders() {
     use rustamp_app::plugin_output::PluginOutput;
 
     rustamp_app::window::require_test_vm();
+    // SAFETY: as in `the_cable_carries_what_the_winamp5_input_plugins_decode`.
+    unsafe {
+        std::env::set_var(
+            "RUSTAMP_HOST_TRACE",
+            r"C:\rustamp\out\gui-session\out-disk-trace.txt",
+        );
+    }
     let dir = tempfile::tempdir().unwrap();
     let track = dir.path().join("written tone.wav");
     write_tone(&track, 1000.0, EQ_TONE_SECONDS);
@@ -1382,6 +1389,11 @@ fn out_disk_writes_what_the_engine_renders() {
             assert!(start.elapsed() < DEADLINE, "the track never finished");
             std::thread::sleep(PUMP_INTERVAL);
         }
+        measurement(&format!(
+            "out_disk: played {} frames, last error {:?}",
+            engine.played_frames(),
+            engine.last_error()
+        ));
     }
     // The helper closes the file when it ends.
     std::thread::sleep(Duration::from_secs(2));
@@ -1407,20 +1419,12 @@ fn out_disk_writes_what_the_engine_renders() {
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
                 && meta.modified().is_ok_and(|time| time >= since)
-                && path != track_path_guard(&path)
+                && path
+                    .file_name()
+                    .is_none_or(|name| name != "written tone.wav")
             {
                 found.push(path);
             }
-        }
-    }
-    fn track_path_guard(path: &std::path::Path) -> PathBuf {
-        if path
-            .file_name()
-            .is_some_and(|name| name == "written tone.wav")
-        {
-            path.to_path_buf()
-        } else {
-            PathBuf::new()
         }
     }
     let mut found = Vec::new();
