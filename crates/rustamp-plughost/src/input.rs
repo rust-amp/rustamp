@@ -344,6 +344,27 @@ pub(crate) fn call_seek(module: *mut InModule, time_ms: c_int) -> Result<(), Inp
     Ok(())
 }
 
+/// Whether a module of this version returns a status from `init` (S09 §3.2).
+pub(crate) fn init_reports_status(version: c_int) -> bool {
+    version as u32 & 0xF000_0000 == 0xF000_0000
+}
+
+/// The bit rate the plug-in last reported; 0 for none. The plug-in passes -1 to
+/// leave a value as it is (S09 §3.1 offset 0x90).
+static LAST_BITRATE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub(crate) fn note_bitrate(kbps: c_int) {
+    if kbps >= 0 {
+        LAST_BITRATE.store(kbps, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The bit rate the plug-in reported, if it reported one.
+pub fn reported_bitrate() -> Option<u32> {
+    let kbps = LAST_BITRATE.load(std::sync::atomic::Ordering::Relaxed);
+    u32::try_from(kbps).ok().filter(|kbps| *kbps > 0)
+}
+
 /// The title and the length an input plug-in reads from a file (S09 §3.1 offset
 /// 0x2C), without playing it. Either can be missing.
 pub(crate) fn call_get_file_info(
@@ -526,6 +547,24 @@ fn ansi_path(path: &Path) -> Vec<u8> {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    #[test]
+    fn the_init_status_is_read_from_the_modules_that_say_they_return_one() {
+        assert!(init_reports_status(0xFF00_0101_u32 as c_int));
+        assert!(init_reports_status(0xF000_0100_u32 as c_int));
+        assert!(!init_reports_status(0x0F00_0100));
+        assert!(!init_reports_status(0x100));
+    }
+
+    #[test]
+    fn a_reported_bitrate_stays_until_the_next_one() {
+        note_bitrate(320);
+        assert_eq!(reported_bitrate(), Some(320));
+        note_bitrate(-1);
+        assert_eq!(reported_bitrate(), Some(320));
+        note_bitrate(0);
+        assert_eq!(reported_bitrate(), None);
+    }
 
     #[test]
     fn a_wide_module_gets_a_wide_path_and_a_classic_one_ansi() {

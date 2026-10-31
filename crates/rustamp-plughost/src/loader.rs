@@ -273,11 +273,12 @@ unsafe extern "C" fn host_dsp_process(
 #[cfg(windows)]
 /// Host callback: `set_info(...)` (S09 §3.1 offset 0x90 line 114). Set after init returns (S09 §3.5 line 155).
 unsafe extern "C" fn host_set_info(
-    _bitrate_kbps: core::ffi::c_int,
+    bitrate_kbps: core::ffi::c_int,
     _sample_rate_khz: core::ffi::c_int,
     _channels: core::ffi::c_int,
     _synched: core::ffi::c_int,
 ) {
+    crate::input::note_bitrate(bitrate_kbps);
 }
 
 // ---------------------------------------------------------------------------
@@ -2047,7 +2048,21 @@ unsafe fn load_input_module(
     if let Some(init_fn) = unsafe { (*module_ptr).init } {
         init_called = true;
         let _scope = plugin_call_scope(&identity, "init");
-        unsafe { init_fn() };
+        if crate::input::init_reports_status(unsafe { (*module_ptr).version }) {
+            // S09 §3.2: with this flag `init` returns a status, which is the
+            // only difference from the ABI's `void` declaration under cdecl.
+            let init_status: unsafe extern "C" fn() -> core::ffi::c_int =
+                unsafe { core::mem::transmute(init_fn) };
+            let code = unsafe { init_status() };
+            if code != 0 {
+                return Err(PluginLoadError::InitFailed {
+                    kind: PluginKind::Input,
+                    code,
+                });
+            }
+        } else {
+            unsafe { init_fn() };
+        }
     }
 
     // S09 §3.5 line 155: set_info is set to host's own function after init returns.

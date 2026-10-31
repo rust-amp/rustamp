@@ -358,6 +358,10 @@ mod imp {
             self.info.clone()
         }
 
+        fn stats(&self) -> (u64, Option<u32>) {
+            (0, crate::input::reported_bitrate())
+        }
+
         fn read(&mut self, out: &mut [f32]) -> Result<usize> {
             let channels = usize::from(self.info.spec.channels).max(1);
             let deadline = Instant::now() + READ_WAIT;
