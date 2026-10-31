@@ -64,8 +64,9 @@ rustamp [/CLASS=<name>] [/CONFIG=<path>] [/BOOKMARK <path>] [/ADD <path>]
         [/INSTALL] [/UNREG] [/NOREG] [/ONLYINSTALL]
 ```
 
-- A file path or an `http(s)://` URL starts playback. `--enqueue` / `/ADD` adds
-  without playing.
+- A file path or an `http(s)://` URL starts playback. `--enqueue` adds without
+  playing; `/ADD` appends to the list the way the reference does it: a running
+  player only appends, a first start then plays the list from its first entry.
 - `Ctrl+L` opens a URL, `L` opens files, `Shift+L` a folder, the same as in Winamp.
 - `--skin` takes a folder, `.wsz` or `.zip`; the default is the Rust-themed
   skin, and `--skin lookalike` selects the classic look-alike.
