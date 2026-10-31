@@ -325,6 +325,9 @@ fn the_player_runs(plugin: &str, companions: &[&str], title_part: &str, shot: &s
             tail(&trace, 25).replace(" | ", "\r\n")
         ),
     );
+    // The tests of this file overwrite one report: each keeps its own evidence.
+    let _ = std::fs::copy(&trace, out.join(format!("{plugin}.trace.txt")));
+    let _ = std::fs::copy(&stderr_path, out.join(format!("{plugin}.stderr.txt")));
     // The whole tree goes: the player and the host it started.
     let _ = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
