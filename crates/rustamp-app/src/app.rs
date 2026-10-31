@@ -2821,6 +2821,9 @@ impl App {
             ));
             return;
         }
+        if let Some(problem) = crate::milkdrop_data::missing_data_note(path) {
+            self.note(problem);
+        }
         match self.host.load_plugin(path, kind) {
             CommandOutcome::Sent => self.note(format!(
                 "the plugin host was asked to load {}",

@@ -147,6 +147,7 @@ pub mod library_extract;
 mod library_recovery;
 pub mod library_window;
 pub mod menu;
+mod milkdrop_data;
 pub mod modern_shell;
 mod output;
 pub mod playlist_tags;
