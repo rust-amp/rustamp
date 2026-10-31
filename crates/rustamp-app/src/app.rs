@@ -3599,7 +3599,7 @@ impl App {
     }
 
     /// The names of the stages the app's DSP chain has, in order.
-    pub(crate) fn dsp_chain_stage_names(&self) -> Vec<&str> {
+    pub fn dsp_chain_stage_names(&self) -> Vec<&str> {
         self.dsp_chain.stage_names()
     }
 

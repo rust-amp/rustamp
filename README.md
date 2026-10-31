@@ -3,7 +3,7 @@
 Rustamp is a media player that looks, feels and works like **Winamp 2.95**, on a
 modern backend written in Rust.
 
-![version](https://img.shields.io/badge/version-1.1.1-blue)
+![version](https://img.shields.io/badge/version-1.2.0-blue)
 
 - **Look and feel:** the classic Main, Equalizer and Playlist windows, with
   docking, windowshade, double-size, the original keyboard shortcuts and
@@ -25,7 +25,7 @@ modern backend written in Rust.
 
 ## Status
 
-Version **1.1.1** plays music and supports classic skins and plugins. The
+Version **1.2.0** plays music and supports classic skins and plugins. The
 following capabilities and verification still have limitations:
 
 | Works | Not yet |
@@ -47,8 +47,8 @@ a portable zip and a `.sha256` file next to it:
 
 ```powershell
 # verify, then unzip anywhere and run rustamp.exe
-(Get-FileHash .\rustamp-1.1.1+*.zip -Algorithm SHA256).Hash
-Get-Content .\rustamp-1.1.1+*.zip.sha256
+(Get-FileHash .\rustamp-1.2.0+*.zip -Algorithm SHA256).Hash
+Get-Content .\rustamp-1.2.0+*.zip.sha256
 ```
 
 The zip bundles the 64-bit player, its helper processes, the 32-bit plugin host,

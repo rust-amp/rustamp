@@ -529,6 +529,10 @@ fn plugin_page(caption: &'static str, hint: &'static str) -> Vec<Item> {
 const PLUGIN_HINT: &str = "Only approved plug-ins can be switched on. \
     The plug-ins you switch on are loaded when the plugin host starts.";
 
+/// The output page: an output plug-in loads, and the player does not play
+/// through it yet, which the page says rather than looking as if it did.
+const OUTPUT_PLUGIN_HINT: &str = "Output plug-ins load and can be configured. The player itself     plays through its own output (Setup), not through them.";
+
 /// What the report line shows when no import has run yet.
 ///
 /// The dialog's own wording: the player pushes a report as soon as an
@@ -664,7 +668,7 @@ pub fn page_items(node: PrefsNode) -> Vec<Item> {
             note_page("Plug-ins", "Choose a plug-in type in the list on the left.")
         }
         PrefsNode::Input => plugin_page("Input plug-ins", PLUGIN_HINT),
-        PrefsNode::Output => plugin_page("Output plug-ins", PLUGIN_HINT),
+        PrefsNode::Output => plugin_page("Output plug-ins", OUTPUT_PLUGIN_HINT),
         PrefsNode::PlugInVisualization => plugin_page("Visualization plug-ins", PLUGIN_HINT),
         PrefsNode::DspEffect => plugin_page("DSP/Effect plug-ins", PLUGIN_HINT),
         PrefsNode::GeneralPurpose => plugin_page("General purpose plug-ins", PLUGIN_HINT),

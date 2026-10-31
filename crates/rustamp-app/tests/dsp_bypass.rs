@@ -378,6 +378,53 @@ fn switching_the_dsp_off_and_on_again_installs_the_chain_again() {
     );
 }
 
+/// A switched-on DSP plug-in is in the audio path, and leaves it when it is
+/// switched off. The helper starts with the first track, so nothing runs here.
+#[test]
+fn switching_a_dsp_plugin_puts_it_in_the_audio_path_and_out_again() {
+    if rustamp_app::supervise::find_plugin_host().is_none() {
+        // The i686 host is not built here: the player says so, covered by VM runs.
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let plugins = dir.path().join("Plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let image = fake_dll(b"winampDSPGetHeader2 ", 2);
+    std::fs::write(plugins.join("dsp_fake.dll"), &image).unwrap();
+    let mut store = rustamp_plughost::ApprovalStore::new();
+    store.approve_bytes("dsp_fake.dll", &image).unwrap();
+    store
+        .save_to_file(&dir.path().join(rustamp_prefs::APPROVALS_FILE))
+        .unwrap();
+    let mut config = Config::default();
+    config.plugins.plugin_dir = Some(plugins);
+    let options = AppOptions {
+        config,
+        skin: skin::load(&SkinChoice::Builtin),
+        output: OutputChoice::Null,
+        volume: 200,
+        media: None,
+        seconds: None,
+    };
+    let mut app = App::new(options).expect("build headless app");
+    app.set_config_path(Some(dir.path().join("rustamp.toml")));
+    app.apply_prefs_action(PrefsAction::RescanPlugins);
+    let row = app
+        .plugin_scan()
+        .entries
+        .iter()
+        .position(|entry| entry.kind == rustamp_plugin_abi::PluginKind::Dsp)
+        .expect("the fake plug-in is listed");
+
+    // An approved plug-in starts switched on: off, then on again.
+    app.apply_prefs_action(PrefsAction::TogglePlugin(row));
+    assert!(app.dsp_chain_stage_names().is_empty());
+    app.apply_prefs_action(PrefsAction::TogglePlugin(row));
+    assert_eq!(app.dsp_chain_stage_names(), ["classic-dsp"]);
+    app.apply_prefs_action(PrefsAction::TogglePlugin(row));
+    assert!(app.dsp_chain_stage_names().is_empty());
+}
+
 /// A synthetic PE32 DLL exporting `export` (never given to an OS loader).
 fn fake_dll(export: &[u8], tweak: u8) -> Vec<u8> {
     let mut bytes = vec![0; 0x600];
