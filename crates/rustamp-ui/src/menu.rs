@@ -1159,6 +1159,16 @@ pub fn native_visualization_menu() -> NativeMainMenu {
         Some("Ctrl+K"),
         false,
     );
+    rows.push(PopupRow::Separator);
+    // The player's own visualizer needs no plug-in: an own choice, like the
+    // `Library` row, with no S03 command of its own.
+    push_leaf(
+        &mut rows,
+        &mut choices,
+        MenuChoice::NoAction { label: "MilkDrop" },
+        Some("Alt+D"),
+        false,
+    );
     NativeMainMenu { rows, choices }
 }
 
@@ -2161,9 +2171,11 @@ mod clutter_popup_tests {
                 "Start/Stop plug-in",
                 "Configure plug-in...",
                 "Select plug-in...",
+                "-",
+                "MilkDrop",
             ]
         );
-        assert_eq!(menu.choices.len(), 4);
+        assert_eq!(menu.choices.len(), 5);
         let accelerators: Vec<_> = menu
             .rows
             .iter()
@@ -2174,7 +2186,13 @@ mod clutter_popup_tests {
             .collect();
         assert_eq!(
             accelerators,
-            [None, Some("Ctrl+Shift+K"), Some("Alt+K"), Some("Ctrl+K")]
+            [
+                None,
+                Some("Ctrl+Shift+K"),
+                Some("Alt+K"),
+                Some("Ctrl+K"),
+                Some("Alt+D"),
+            ]
         );
         assert!(menu.rows.iter().all(|row| !matches!(
             row,

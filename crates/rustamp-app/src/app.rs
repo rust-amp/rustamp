@@ -449,6 +449,9 @@ pub struct App {
     /// The media library: the app's index, its view and the background scan
     /// (see `library_window.rs`). The OS window lives in `window.rs`.
     pub(crate) library_window: crate::library_window::LibraryWindow,
+    /// The player's own MilkDrop (see `milkdrop_window.rs`). The OS window lives
+    /// in `window/milkdrop.rs`.
+    milkdrop_window: crate::milkdrop_window::MilkdropWindow,
     /// The settings of the last playlist extraction: the path template and
     /// the target directory.
     ///
@@ -858,6 +861,7 @@ impl App {
             playlist_double_size: false,
             playlist_resized_in_double_size: false,
             library_window: crate::library_window::LibraryWindow::default(),
+            milkdrop_window: crate::milkdrop_window::MilkdropWindow::default(),
             last_extract_settings: rustamp_platform::ExtractSettings {
                 template: crate::library_extract::DEFAULT_TEMPLATE.to_owned(),
                 directory: PathBuf::new(),
@@ -1663,8 +1667,8 @@ impl App {
     /// The main window counts while it is shown ([`App::main_visible`]); the
     /// equalizer and the playlist editor count while their open flags say so.
     /// A closed or hidden window cannot take focus, and windows the app does
-    /// not have (`Vis`, `Video`, every `Gen` window but the media library)
-    /// report closed.
+    /// not have (`Video`, every `Gen` window but the media library) report
+    /// closed.
     pub fn window_open(&self, window: WindowId) -> bool {
         match window {
             WindowId::Main => self.main_visible,
@@ -1673,7 +1677,8 @@ impl App {
             WindowId::Gen(id) if id == crate::library_window::LIBRARY_WINDOW_NUMBER => {
                 self.library_open()
             }
-            WindowId::Vis | WindowId::Gen(_) | WindowId::Video => false,
+            WindowId::Vis => self.milkdrop_window.is_open(),
+            WindowId::Gen(_) | WindowId::Video => false,
         }
     }
 
@@ -2186,6 +2191,9 @@ impl App {
     /// is an offline validation invariant that the live path cannot reach
     /// (RFC 0014 §4.5), and noting a rejected frame must not halt playback.
     fn pump_visualization(&mut self, now_ms: u64) {
+        for note in self.milkdrop_window.take_notes() {
+            self.note(format!("MilkDrop: {note}"));
+        }
         let frame = self.engine.take_vis_frame();
         if std::mem::take(&mut self.vis_discontinuity) {
             // A batch straddling a known boundary is ambiguous. Even a valid
@@ -2208,6 +2216,7 @@ impl App {
                 );
             }
             let source_rate_hz = self.engine.source_spec().map_or(0, |s| s.sample_rate);
+            self.milkdrop_window.feed(&frame, source_rate_hz);
             if let Err(error) = self.ui.push_vis_frame(&frame, source_rate_hz, now_ms) {
                 self.note(error.to_string());
             }
@@ -3083,6 +3092,12 @@ impl App {
             self.submit(command.clone())?;
             return Ok(Some(ShortcutOutcome::Commands(vec![command])));
         }
+        // `Alt+D` opens the player's own MilkDrop: see `crate::milkdrop_window`.
+        if key == Key::Letter(b'D') && modifiers == Modifiers::ALT {
+            let command = Command::ToggleWindow(crate::milkdrop_window::MILKDROP_WINDOW_ID);
+            self.submit(command.clone())?;
+            return Ok(Some(ShortcutOutcome::Commands(vec![command])));
+        }
         let Some(action) = lookup(ShortcutWindow::Main, key, modifiers) else {
             self.pump()?;
             return Ok(None);
@@ -3499,6 +3514,41 @@ impl App {
         let title = self.library_title();
         rustamp_ui::chrome::draw_title_bar(&mut frame, self.skin.skin(), &title, focused);
         frame
+    }
+
+    /// The player's own MilkDrop window. `size` is the whole window.
+    pub fn render_milkdrop_window(&mut self, size: (u32, u32), focused: bool) -> Image {
+        let generation = self.skin_generation();
+        self.milkdrop_window
+            .render(size, focused, self.skin.skin(), generation)
+    }
+
+    /// The model of the player's own MilkDrop window.
+    pub fn milkdrop_window(&self) -> &crate::milkdrop_window::MilkdropWindow {
+        &self.milkdrop_window
+    }
+
+    /// The model of the player's own MilkDrop window, to change it.
+    pub fn milkdrop_window_mut(&mut self) -> &mut crate::milkdrop_window::MilkdropWindow {
+        &mut self.milkdrop_window
+    }
+
+    /// Opens or closes the player's own MilkDrop.
+    fn toggle_milkdrop_window(&mut self) {
+        if self.milkdrop_window.is_open() {
+            self.close_milkdrop_window();
+            return;
+        }
+        let (settings, notes) = crate::milkdrop_window::read_settings(self.config_path());
+        for note in notes {
+            self.note(note);
+        }
+        self.milkdrop_window.open(settings);
+    }
+
+    /// Closes the player's own MilkDrop; the session stops with it.
+    pub fn close_milkdrop_window(&mut self) {
+        self.milkdrop_window.close();
     }
 
     /// Whether the marquee scrolls by itself (S02 §3).
@@ -3918,6 +3968,9 @@ impl App {
                 // The media library: the app owns the index and the view, the
                 // presenter creates or drops the OS window to match.
                 self.toggle_library();
+            }
+            C::ToggleWindow(window) if *window == crate::milkdrop_window::MILKDROP_WINDOW_ID => {
+                self.toggle_milkdrop_window();
             }
             C::ToggleWindow(window) => {
                 self.note(format!(

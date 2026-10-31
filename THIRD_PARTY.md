@@ -19,8 +19,44 @@ tree). The license is the one each crate declares in its published
 GPL-3.0-or-later. None of them is in the dependency closure of a permissive
 Rustamp crate: they enter through `rustamp-audio`, which is GPL-3.0-or-later.
 
-Projects we expect to draw from: DeaDBeeF (zlib / GPL / LGPL), webamp (MIT), butterchurn (MIT; port source for rustamp-milkdrop), WDL/EEL2 (zlib), libopenmpt (BSD-3-Clause), projectM 4.1.8 (LGPL-2.1-or-later; selected native library bundled player-only with classic wrapper in rustamp-vis).
+Projects we expect to draw from: DeaDBeeF (zlib / GPL / LGPL), webamp (MIT), butterchurn (MIT), WDL/EEL2 (zlib), libopenmpt (BSD-3-Clause), projectM 4.1.8 (LGPL-2.1-or-later; selected native library bundled player-only with classic wrapper in rustamp-vis), lactea 0.2.2 (MIT OR Apache-2.0 plus the Nullsoft BSD-3-Clause files; the engine of rustamp-milkdrop, see below).
 
+## MilkDrop engine: lactea 0.2.2
+
+- **Component**: `lactea` 0.2.2, pinned `=0.2.2` in the workspace, with the whole family at the same version: `lactea-abi`, `lactea-audio`, `lactea-eel`, `lactea-hlsl`, `lactea-preset` and `lactea-render`.
+- **Source**: [M0Rf30/lactea](https://github.com/M0Rf30/lactea) on crates.io; `Cargo.lock` checksum `d688a1bd5dd4651a5ff778c70536f0a47a18cbef71aad7980b7bf1eb7dd2b172`.
+- **Declared license**: `MIT OR Apache-2.0` (`LICENSE-MIT`, `LICENSE-APACHE`). In addition, 18 `lactea-render` source files carry the SPDX header `(MIT OR Apache-2.0) AND BSD-3-Clause`, and `lactea-hlsl/src/include.fx` is copied verbatim from MilkDrop 2's `include.fx` under the Nullsoft BSD-3-Clause notice.
+- **Copyright holders**: Gianluca Boiano ("Gianluca Boiano" in the source headers, 2026) for the crate; Copyright 2005-2013 Nullsoft, Inc. for the copied MilkDrop 2 material.
+- **Used in**: `crates/rustamp-milkdrop`, the player's own visualizer; compiled into `rustamp.exe` through the workspace crates, with no separate shipped file.
+- **Status**: used with the owner's approval (2026-10-31) for use and for shipping.
+- **Notices that must ship**: the MIT and Apache-2.0 notices of the crate, and the following Nullsoft BSD-3-Clause notice, taken verbatim from `lactea-hlsl`'s `THIRD_PARTY_NOTICES.md`:
+
+```text
+Copyright 2005-2013 Nullsoft, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+  * Neither the name of Nullsoft nor the names of its contributors may be used to
+    endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
+IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
 
 Not bundled: the original Winamp base skin. It is distributed separately as an optional download, and it is used in tests.
 
@@ -98,14 +134,14 @@ replacement for license texts, source-offer obligations or an artifact review.
 
 | Direct dependency | Purpose | Direct workspace consumers (including dev dependencies) |
 |---|---|---|
-| `thiserror` | Error definitions | core, gfx, ipc, mediahost, output, platform, skin, ui |
+| `thiserror` | Error definitions | core, gfx, ipc, mediahost, milkdrop, output, platform, skin, ui |
 | `serde` | Serializable state and wire types | app, core, ipc, plugin-abi, proto |
 | `serde_json` | The local control channel's one-JSON-object-per-line format (`--control`) | app, testkit |
 | `postcard` | Wire serialization | ipc; proto (dev) |
-| `crossbeam-channel` | Cross-thread channels | core, ipc |
+| `crossbeam-channel` | Cross-thread channels | core, ipc, milkdrop |
 | `toml` | Config serialization and I/O | app; core (dev) |
-| `png` | Golden-image I/O | testkit |
-| `tempfile` | Temporary files: the temporary file of the atomic tag write, and the test files of the crates below | meta; app, audio, decoders, skin, testkit (dev) |
+| `png` | Golden-image I/O; the PNGs of the offscreen GPU render test | testkit; milkdrop (dev) |
+| `tempfile` | Temporary files: the temporary file of the atomic tag write, and the test files of the crates below | meta; app, audio, decoders, milkdrop, skin, testkit (dev) |
 | `windows` | Windows API bindings | app, ipc, platform, plughost, xtask (Windows only) |
 | `rtrb` | Lock-free audio ring | audio |
 | `cpal` | Cross-platform audio output; loopback capture | output; app (dev) |
@@ -128,7 +164,11 @@ replacement for license texts, source-offer obligations or an artifact review.
 | `hound` | WAV test fixtures | decoders (dev) |
 | `rcgen` | The certificates of the local TLS server of the `https://` tests | decoders (dev) |
 | `rusqlite` | SQLite-backed media library index | library; app (dev, the test that writes a row whose path the file system refuses to name) |
-| `image` | Cover-art decoding for the media library's artwork cache (JPEG and PNG only) | library |
+| `image` | Cover-art decoding for the media library's artwork cache (JPEG and PNG only); the preset-folder textures of the visualizer | library; milkdrop |
+| `lactea` | MilkDrop engine: preset parsing and evaluation, HLSL-to-WGSL translation and the wgpu frame pipeline of the player's own visualizer | milkdrop |
+| `wgpu` | GPU API of the MilkDrop engine: adapter and device selection, textures, readback | milkdrop |
+| `pollster` | Blocking on wgpu's futures while the MilkDrop worker starts and resizes | milkdrop |
+| `walkdir` | Recursive preset discovery | milkdrop |
 
 Consumer names omit the `rustamp-` prefix, except `xtask`. Other entries below
 are transitives supporting these dependencies, including non-Windows targets,
@@ -137,7 +177,7 @@ is not in this lockfile and is deliberately not recorded as already used.
 
 ## Complete Cargo.lock license inventory
 
-Snapshot: 2026-10-28, **377 external package versions**, all from crates.io.
+Snapshot: 2026-10-31, **426 external package versions**, all from crates.io.
 `Cargo.lock` records names/versions/sources/checksums, **not licenses**; licenses
 below are the exact cached package-manifest declarations returned by
 `cargo metadata --offline --locked --all-features --format-version 1`.
@@ -168,6 +208,16 @@ lock through another build dependency.
 channel (`--control`); its transitives `itoa` (MIT OR Apache-2.0) and `zmij`
 (MIT) are the integer and float formatting of that format. All three are
 permissive and enter the GPL player, not a protected closure.
+The `lactea` family (`lactea` and its `lactea-abi`, `lactea-audio`,
+`lactea-eel`, `lactea-hlsl`, `lactea-preset` and `lactea-render` crates, all
+0.2.2, MIT OR Apache-2.0) and the wgpu 30 family it renders with (`wgpu`,
+`wgpu-core`, `wgpu-hal`, `wgpu-types`, `naga` and their support crates,
+MIT OR Apache-2.0 or Apache-2.0) are the visualizer of `rustamp-milkdrop`.
+Their copied MilkDrop 2 files carry the additional Nullsoft BSD-3-Clause
+notice above. All are permissive and enter the GPL player, not a protected
+closure. The `lactea` direct dependencies `gif`, `pollster` and `walkdir` are
+permissive as well; `image`'s new `tga`/`bmp` decoders use the already
+inventoried `zune-jpeg`, `fdeflate`/`zopfli` and `weezl` crates.
 
 Regenerate the marked block with
 `python .github/scripts/license-audit.py --inventory`, review the lock/manifest
@@ -184,13 +234,16 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `adler2` | `2.0.1` | `0BSD OR MIT OR Apache-2.0` | `crates.io` |
 | `ahash` | `0.8.12` | `MIT OR Apache-2.0` | `crates.io` |
 | `aho-corasick` | `1.1.5` | `Unlicense OR MIT` | `crates.io` |
+| `allocator-api2` | `0.2.21` | `MIT OR Apache-2.0` | `crates.io` |
 | `alsa` | `0.11.0` | `Apache-2.0/MIT` | `crates.io` |
 | `alsa-sys` | `0.4.0` | `MIT` | `crates.io` |
 | `android-activity` | `0.6.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `android-properties` | `0.2.2` | `MIT` | `crates.io` |
+| `android_system_properties` | `0.1.6` | `MIT OR Apache-2.0` | `crates.io` |
 | `arrayref` | `0.3.9` | `BSD-2-Clause` | `crates.io` |
 | `arrayvec` | `0.7.8` | `MIT OR Apache-2.0` | `crates.io` |
 | `as-raw-xcb-connection` | `1.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `ash` | `0.38.0+1.3.281` | `MIT OR Apache-2.0` | `crates.io` |
 | `asn1-rs` | `0.7.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `asn1-rs-derive` | `0.6.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `asn1-rs-impl` | `0.2.0` | `MIT/Apache-2.0` | `crates.io` |
@@ -203,6 +256,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `autocfg` | `1.5.1` | `Apache-2.0 OR MIT` | `crates.io` |
 | `aws-lc-rs` | `1.18.2` | `ISC AND (Apache-2.0 OR ISC)` | `crates.io` |
 | `aws-lc-sys` | `0.46.0` | `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)` | `crates.io` |
+| `bit-set` | `0.10.0` | `Apache-2.0 OR MIT` | `crates.io` |
 | `bit-vec` | `0.9.1` | `Apache-2.0 OR MIT` | `crates.io` |
 | `bitflags` | `1.3.2` | `MIT/Apache-2.0` | `crates.io` |
 | `bitflags` | `2.13.2` | `MIT OR Apache-2.0` | `crates.io` |
@@ -221,6 +275,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `cfg_aliases` | `0.2.2` | `MIT` | `crates.io` |
 | `cmake` | `0.1.58` | `MIT OR Apache-2.0` | `crates.io` |
 | `cobs` | `0.3.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `codespan-reporting` | `0.13.1` | `Apache-2.0` | `crates.io` |
 | `combine` | `4.6.8` | `MIT` | `crates.io` |
 | `concurrent-queue` | `2.5.0` | `Apache-2.0 OR MIT` | `crates.io` |
 | `core-foundation` | `0.10.1` | `MIT OR Apache-2.0` | `crates.io` |
@@ -235,6 +290,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `critical-section` | `1.2.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `crossbeam-channel` | `0.5.17` | `MIT OR Apache-2.0` | `crates.io` |
 | `crossbeam-utils` | `0.8.23` | `MIT OR Apache-2.0` | `crates.io` |
+| `crunchy` | `0.2.4` | `MIT` | `crates.io` |
 | `ctor` | `0.10.1` | `Apache-2.0 OR MIT` | `crates.io` |
 | `cursor-icon` | `1.2.0` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
 | `dasp_sample` | `0.11.0` | `MIT OR Apache-2.0` | `crates.io` |
@@ -245,6 +301,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `dispatch2` | `0.3.1` | `Zlib OR Apache-2.0 OR MIT` | `crates.io` |
 | `displaydoc` | `0.2.7` | `MIT OR Apache-2.0` | `crates.io` |
 | `dlib` | `0.5.3` | `MIT` | `crates.io` |
+| `document-features` | `0.2.12` | `MIT OR Apache-2.0` | `crates.io` |
 | `downcast-rs` | `1.2.1` | `MIT/Apache-2.0` | `crates.io` |
 | `dpi` | `0.1.2` | `Apache-2.0 AND MIT` | `crates.io` |
 | `drm` | `0.14.1` | `MIT` | `crates.io` |
@@ -266,6 +323,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `fdeflate` | `0.3.7` | `MIT OR Apache-2.0` | `crates.io` |
 | `find-msvc-tools` | `0.1.14` | `MIT OR Apache-2.0` | `crates.io` |
 | `flate2` | `1.1.10` | `MIT OR Apache-2.0` | `crates.io` |
+| `foldhash` | `0.2.0` | `Zlib` | `crates.io` |
 | `fontdb` | `0.24.0` | `MIT` | `crates.io` |
 | `foreign-types` | `0.5.0` | `MIT/Apache-2.0` | `crates.io` |
 | `foreign-types-macros` | `0.2.4` | `MIT/Apache-2.0` | `crates.io` |
@@ -278,8 +336,12 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `getrandom` | `0.2.17` | `MIT OR Apache-2.0` | `crates.io` |
 | `getrandom` | `0.3.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `getrandom` | `0.4.3` | `MIT OR Apache-2.0` | `crates.io` |
+| `gif` | `0.14.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `gpu-allocator` | `0.28.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `half` | `2.7.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `hash32` | `0.2.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `hashbrown` | `0.14.5` | `MIT OR Apache-2.0` | `crates.io` |
+| `hashbrown` | `0.16.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `hashbrown` | `0.17.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `hashlink` | `0.9.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `heapless` | `0.7.17` | `MIT OR Apache-2.0` | `crates.io` |
@@ -295,14 +357,23 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `jni-sys-macros` | `0.4.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `jobserver` | `0.1.35` | `MIT OR Apache-2.0` | `crates.io` |
 | `js-sys` | `0.3.106` | `MIT OR Apache-2.0` | `crates.io` |
+| `lactea` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `lactea-abi` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `lactea-audio` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `lactea-eel` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `lactea-hlsl` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `lactea-preset` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
+| `lactea-render` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `lazy_static` | `1.5.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `libc` | `0.2.190` | `MIT OR Apache-2.0` | `crates.io` |
 | `libloading` | `0.8.9` | `ISC` | `crates.io` |
+| `libm` | `0.2.16` | `MIT` | `crates.io` |
 | `libredox` | `0.1.25` | `MIT` | `crates.io` |
 | `libsqlite3-sys` | `0.30.1` | `MIT` | `crates.io` |
 | `linux-raw-sys` | `0.12.1` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `linux-raw-sys` | `0.4.15` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
 | `linux-raw-sys` | `0.9.4` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `crates.io` |
+| `litrs` | `1.0.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `lock_api` | `0.4.14` | `MIT OR Apache-2.0` | `crates.io` |
 | `lofty` | `0.25.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `lofty_attr` | `0.13.0` | `MIT OR Apache-2.0` | `crates.io` |
@@ -316,6 +387,8 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `miniz_oxide` | `0.9.1` | `MIT OR Zlib OR Apache-2.0` | `crates.io` |
 | `moxcms` | `0.8.1` | `BSD-3-Clause OR Apache-2.0` | `crates.io` |
 | `multiversion_no_op` | `1.0.0` | `Apache-2.0 OR MIT` | `crates.io` |
+| `naga` | `30.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `naga-types` | `30.0.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `ndk` | `0.9.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `ndk-context` | `0.1.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `ndk-sys` | `0.6.0+11769913` | `MIT OR Apache-2.0` | `crates.io` |
@@ -351,6 +424,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `objc2-io-surface` | `0.3.2` | `Zlib OR Apache-2.0 OR MIT` | `crates.io` |
 | `objc2-link-presentation` | `0.2.2` | `MIT` | `crates.io` |
 | `objc2-metal` | `0.2.2` | `MIT` | `crates.io` |
+| `objc2-metal` | `0.3.2` | `Zlib OR Apache-2.0 OR MIT` | `crates.io` |
 | `objc2-quartz-core` | `0.2.2` | `MIT` | `crates.io` |
 | `objc2-quartz-core` | `0.3.2` | `Zlib OR Apache-2.0 OR MIT` | `crates.io` |
 | `objc2-symbols` | `0.2.2` | `MIT` | `crates.io` |
@@ -363,7 +437,10 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `openssl-probe` | `0.2.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `opus-rs` | `0.1.37` | `BSD-3-Clause` | `crates.io` |
 | `orbclient` | `0.3.55` | `MIT` | `crates.io` |
+| `ordered-float` | `5.5.1` | `MIT` | `crates.io` |
 | `owned_ttf_parser` | `0.25.1` | `Apache-2.0` | `crates.io` |
+| `parking_lot` | `0.12.5` | `MIT OR Apache-2.0` | `crates.io` |
+| `parking_lot_core` | `0.9.12` | `MIT OR Apache-2.0` | `crates.io` |
 | `paste` | `1.0.15` | `MIT OR Apache-2.0` | `crates.io` |
 | `percent-encoding` | `2.3.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `pin-project` | `1.1.13` | `Apache-2.0 OR MIT` | `crates.io` |
@@ -373,17 +450,25 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `plain` | `0.2.3` | `MIT/Apache-2.0` | `crates.io` |
 | `png` | `0.18.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `polling` | `3.11.0` | `Apache-2.0 OR MIT` | `crates.io` |
+| `pollster` | `0.4.0` | `Apache-2.0/MIT` | `crates.io` |
+| `pollster` | `1.0.1` | `Apache-2.0/MIT` | `crates.io` |
+| `portable-atomic` | `1.15.0` | `Apache-2.0 OR MIT` | `crates.io` |
+| `portable-atomic-util` | `0.2.8` | `Apache-2.0 OR MIT` | `crates.io` |
 | `postcard` | `1.1.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `powerfmt` | `0.2.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `presser` | `0.3.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `primal-check` | `0.3.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `proc-macro-crate` | `3.5.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `proc-macro2` | `1.0.107` | `MIT OR Apache-2.0` | `crates.io` |
+| `profiling` | `1.0.18` | `MIT OR Apache-2.0` | `crates.io` |
 | `pxfm` | `0.1.30` | `BSD-3-Clause OR Apache-2.0` | `crates.io` |
 | `quick-xml` | `0.41.0` | `MIT` | `crates.io` |
 | `quote` | `1.0.47` | `MIT OR Apache-2.0` | `crates.io` |
 | `r-efi` | `5.3.0` | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | `crates.io` |
 | `r-efi` | `6.0.0` | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | `crates.io` |
+| `range-alloc` | `0.1.5` | `MIT OR Apache-2.0` | `crates.io` |
 | `raw-window-handle` | `0.6.2` | `MIT OR Apache-2.0 OR Zlib` | `crates.io` |
+| `raw-window-metal` | `1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `rcgen` | `0.14.10` | `MIT OR Apache-2.0` | `crates.io` |
 | `realfft` | `3.5.0` | `MIT` | `crates.io` |
 | `redox_syscall` | `0.4.1` | `MIT` | `crates.io` |
@@ -391,10 +476,12 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `redox_syscall` | `0.9.4` | `MIT` | `crates.io` |
 | `regex-automata` | `0.4.18` | `MIT OR Apache-2.0` | `crates.io` |
 | `regex-syntax` | `0.8.11` | `MIT OR Apache-2.0` | `crates.io` |
+| `renderdoc-sys` | `1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `ring` | `0.17.14` | `Apache-2.0 AND ISC` | `crates.io` |
 | `rtrb` | `0.4.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `rubato` | `5.0.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `rusqlite` | `0.32.1` | `MIT` | `crates.io` |
+| `rustc-hash` | `1.1.0` | `Apache-2.0/MIT` | `crates.io` |
 | `rustc_version` | `0.4.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `rustfft` | `6.4.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `rusticata-macros` | `4.1.0` | `MIT/Apache-2.0` | `crates.io` |
@@ -432,7 +519,9 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `smol_str` | `0.2.2` | `MIT OR Apache-2.0` | `crates.io` |
 | `softbuffer` | `0.4.8` | `MIT OR Apache-2.0` | `crates.io` |
 | `spin` | `0.9.9` | `MIT` | `crates.io` |
+| `spirv` | `0.4.0+sdk-1.4.341.0` | `Apache-2.0` | `crates.io` |
 | `stable_deref_trait` | `1.2.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `static_assertions` | `1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `strength_reduce` | `0.2.4` | `MIT OR Apache-2.0` | `crates.io` |
 | `strict-num` | `0.1.1` | `MIT` | `crates.io` |
 | `subtle` | `2.6.1` | `BSD-3-Clause` | `crates.io` |
@@ -456,6 +545,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `syn` | `3.0.9` | `MIT OR Apache-2.0` | `crates.io` |
 | `synstructure` | `0.13.2` | `MIT` | `crates.io` |
 | `tempfile` | `3.27.0` | `MIT OR Apache-2.0` | `crates.io` |
+| `termcolor` | `1.4.1` | `Unlicense OR MIT` | `crates.io` |
 | `thiserror` | `1.0.69` | `MIT OR Apache-2.0` | `crates.io` |
 | `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | `crates.io` |
 | `thiserror-impl` | `1.0.69` | `MIT OR Apache-2.0` | `crates.io` |
@@ -484,6 +574,7 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `typed-path` | `0.12.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `unicode-ident` | `1.0.27` | `(MIT OR Apache-2.0) AND Unicode-3.0` | `crates.io` |
 | `unicode-segmentation` | `1.13.3` | `MIT OR Apache-2.0` | `crates.io` |
+| `unicode-width` | `0.2.3` | `MIT OR Apache-2.0` | `crates.io` |
 | `untrusted` | `0.9.0` | `ISC` | `crates.io` |
 | `vcpkg` | `0.2.15` | `MIT/Apache-2.0` | `crates.io` |
 | `version_check` | `0.9.5` | `MIT/Apache-2.0` | `crates.io` |
@@ -509,6 +600,14 @@ as a blanket permissive requirement for the GPL player or other platforms.
 | `web-sys` | `0.3.106` | `MIT OR Apache-2.0` | `crates.io` |
 | `web-time` | `1.1.0` | `MIT OR Apache-2.0` | `crates.io` |
 | `webpki-root-certs` | `1.0.10` | `CDLA-Permissive-2.0` | `crates.io` |
+| `weezl` | `0.1.12` | `MIT OR Apache-2.0` | `crates.io` |
+| `wgpu` | `30.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `wgpu-core` | `30.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `wgpu-core-deps-apple` | `30.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `wgpu-core-deps-windows-linux-android` | `30.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `wgpu-hal` | `30.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `wgpu-naga-bridge` | `30.0.1` | `MIT OR Apache-2.0` | `crates.io` |
+| `wgpu-types` | `30.0.1` | `MIT OR Apache-2.0` | `crates.io` |
 | `winapi-util` | `0.1.11` | `Unlicense OR MIT` | `crates.io` |
 | `windowfunctions` | `0.1.1` | `MIT` | `crates.io` |
 | `windows` | `0.62.2` | `MIT OR Apache-2.0` | `crates.io` |

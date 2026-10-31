@@ -41,6 +41,9 @@ const SILENCE: [f32; 2 * 256] = [0.0; 2 * 256];
 /// How many notes wait before the oldest is dropped: nobody may be reading them.
 const MAX_NOTES: usize = 64;
 
+/// No graphics API at all, as on a machine without a graphics adapter.
+pub const NO_BACKENDS: wgpu::Backends = wgpu::Backends::empty();
+
 /// What a session is started with.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -263,7 +266,15 @@ fn run_guarded(settings: Settings, receiver: &Receiver<Message>, shared: &Shared
             Status::Failed(format!("the renderer stopped unexpectedly: {what}"))
         }
     };
-    lock(shared).status = stopped;
+    let mut guard = lock(shared);
+    // The window shows the status; a note makes the reason visible in the
+    // player's diagnostics as well.
+    if let Status::NoGpu(message) | Status::NoPresets(message) | Status::Failed(message) = &stopped
+    {
+        guard.note(message.clone());
+    }
+    guard.status = stopped;
+    drop(guard);
     // The session stays: the window shows the status until it is closed.
     while !matches!(receiver.recv(), Ok(Message::Quit) | Err(_)) {}
 }
@@ -520,7 +531,7 @@ mod tests {
     #[test]
     fn a_machine_without_a_graphics_adapter_gets_a_message_and_no_crash() {
         let session = Session::start(Settings {
-            backends: wgpu::Backends::empty(),
+            backends: NO_BACKENDS,
             ..Settings::default()
         });
         let status = wait_for(&session, |status| *status != Status::Starting);
@@ -552,7 +563,7 @@ mod tests {
     #[test]
     fn a_full_audio_queue_never_blocks_the_caller() {
         let session = Session::start(Settings {
-            backends: wgpu::Backends::empty(),
+            backends: NO_BACKENDS,
             ..Settings::default()
         });
         let frame = VisFrame::default();

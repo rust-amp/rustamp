@@ -66,15 +66,19 @@ fn play(
 fn lit_pixels(frame: &RenderedFrame) -> usize {
     frame
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[..3].iter().any(|channel| *channel > 16))
         .count()
 }
 
 fn changed_pixels(a: &RenderedFrame, b: &RenderedFrame) -> usize {
     a.rgba
-        .chunks_exact(4)
-        .zip(b.rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.rgba.as_chunks::<4>().0)
         .filter(|(a, b)| a[..3] != b[..3])
         .count()
 }
@@ -92,7 +96,9 @@ fn keep(frame: &RenderedFrame, name: &str) {
     // The alpha a preset leaves behind says nothing: the window ignores it.
     let opaque: Vec<u8> = frame
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
         .collect();
     writer.write_image_data(&opaque).unwrap();
@@ -165,6 +171,69 @@ fn the_built_in_presets_render(settings: Settings, name: &str) {
         seen.iter().collect::<std::collections::HashSet<_>>().len(),
         3,
         "next walked through all of them: {seen:?}"
+    );
+}
+
+/// A preset's own HLSL in `warp_1` and `comp_1` must be translated and used. A
+/// note that a shader "was replaced" is the engine's silent fallback to its
+/// built-in shader, so the picture would not be the one the preset asks for.
+#[test]
+#[ignore = "needs a graphics adapter (the software one will do); opens no window"]
+fn a_presets_own_hlsl_shaders_are_not_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = [
+        "MILKDROP_PRESET_VERSION=201",
+        "PSVERSION_WARP=2",
+        "PSVERSION_COMP=2",
+        "fDecay=0.94",
+        "fGammaAdj=1.4",
+        "fVideoEchoAlpha=0.0",
+        "nWaveMode=2",
+        "fWaveAlpha=0.8",
+        "fWaveScale=1.0",
+        "wave_r=1.0",
+        "wave_g=0.6",
+        "wave_b=0.2",
+        "warp_1=`shader_body",
+        "warp_2={",
+        "warp_3=    float2 uv2 = uv;",
+        "warp_4=    uv2.x += 0.01 * sin(time);",
+        "warp_5=    float3 col = tex2D(sampler_main, uv2).xyz;",
+        "warp_6=    ret = col;",
+        "warp_7=}`",
+        "comp_1=`shader_body",
+        "comp_2={",
+        "comp_3=    float3 col = tex2D(sampler_main, uv).xyz;",
+        "comp_4=    ret = col * 0.95;",
+        "comp_5=}`",
+    ];
+    std::fs::write(
+        dir.path().join("own-hlsl.milk"),
+        format!("[preset00]\n{}\n", lines.join("\n")),
+    )
+    .unwrap();
+    let session = Session::start(Settings {
+        preset_folder: Some(dir.path().to_path_buf()),
+        preset_seconds: 0.0,
+        ..software()
+    });
+    assert_eq!(wait_running(&session), "own-hlsl");
+    let mut n = 0;
+    let frame = play(&session, 1.5, &mut n, 0.8);
+    let notes = session.take_notes();
+    println!("{notes:?}");
+    let replaced: Vec<&String> = notes
+        .iter()
+        .filter(|note| note.contains("was replaced"))
+        .collect();
+    assert!(
+        replaced.is_empty(),
+        "the preset's own HLSL was not used: {replaced:?}"
+    );
+    assert!(
+        lit_pixels(&frame) > 200,
+        "the preset drew nothing: {} lit pixels",
+        lit_pixels(&frame)
     );
 }
 
