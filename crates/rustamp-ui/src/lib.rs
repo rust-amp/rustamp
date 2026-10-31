@@ -188,7 +188,8 @@ pub use playlist::{
     playlist_key_binding, unimplemented_playlist_row,
 };
 pub use playlist_font::{
-    FONT_SIZE_STEP, MAX_FONT_SIZE, MIN_FONT_SIZE, PlaylistFontSize, skin_font_size,
+    FONT_SIZE_STEP, MAX_FONT_SIZE, MIN_FONT_SIZE, PlaylistFontSize, draw_all_text_in,
+    skin_font_size,
 };
 pub use playlist_window::{
     BOTTOM_BAR_RECT, BUTTON_SRC_Y, CLOSE_BUTTON_RECT, LIST_BOTTOM, LIST_LEFT, LIST_OPTS_SRC_X,
