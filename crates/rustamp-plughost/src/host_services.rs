@@ -57,8 +57,7 @@ pub const IPC_GETSKIN: u32 = 201;
 /// or do. "1", the answer for an id nobody knows, would be taken for a handle or a
 /// state (`gen_win7shell` asks for ratings, `gen_thinger` for a skin bitmap), so
 /// these answer 0. The list is what free plug-ins' sources ask for, by the numbers
-/// of their own headers, and `docs/spec-requests/2026-10-31-host-measurements.md`
-/// says where it comes from.
+/// of their own headers.
 pub const IPC_KNOWN_WITHOUT_ANSWER: [u32; 29] = [
     100, 103, 120, 129, 200, 202, 241, 243, 245, 246, 247, 248, 249, 280, 362, 364, 503, 606, 611,
     628, 631, 633, 635, 638, 639, 640, 3002, 3004, 3010,
@@ -98,8 +97,7 @@ pub const LANGUAGE_SERVICE_ID: [u8; 16] = [
 /// The Winamp 5.66 input plug-ins look up two more
 /// (AEFBF8BE-E0AA-4318-8CC1-4353410B64DC and 000CF46E-4DF6-4A43-BBE7-40E7A3EA02ED),
 /// call the first in `play` without a null check, and take "not understood" for
-/// an answer (static reading of `in_wave.dll` and `in_flac.dll`, owner's approval
-/// of 2026-10-31; see `docs/spec-requests/2026-10-31-host-measurements.md`).
+/// an answer.
 pub const NULL_SERVICE_IDS: [[u8; 16]; 4] = [
     [
         0x71, 0x67, 0xB9, 0x23, 0xD7, 0x09, 0xD3, 0x46, 0x9A, 0xE2, 0x20, 0xDC, 0xEA, 0x6C, 0x86,

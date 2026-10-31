@@ -5,8 +5,7 @@
 //! window as a child of the frame. `vis_avs` has no other way to get a window:
 //! without a frame its child window has no parent and cannot be created.
 //!
-//! The block's layout is what `vis_avs.dll` reads and writes (static reading, the
-//! owner's approval of 2026-10-31): the frame at 0, flags at 4, the placement as
+//! The block's layout: the frame at 0, flags at 4, the placement as
 //! left, top, right, bottom at 8.
 //!
 //! Own choice: the frame is a plain system window, not yet the skin's `gen.bmp`
