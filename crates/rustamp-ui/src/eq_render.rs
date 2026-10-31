@@ -63,8 +63,7 @@ use rustamp_skin::{Sheet, Skin};
 
 use crate::docking::{WindowKind, window_size};
 use crate::equalizer::{
-    EqSlider, EqWidget, EqualizerLayout, EqualizerState, FLAT_VALUE, MAX_VALUE, TRACK_HEIGHT,
-    TRACK_WIDTH,
+    EqSlider, EqWidget, EqualizerLayout, EqualizerState, MAX_VALUE, TRACK_HEIGHT, TRACK_WIDTH,
 };
 use crate::layout::SHADE_HEIGHT;
 
@@ -156,7 +155,7 @@ fn auto_sheet_rect(state: &EqualizerState) -> Rect {
 }
 
 /// The number of track sprites the sheet's atlas holds (13 per row band).
-const TRACK_SPRITE_COUNT: i32 = 26;
+const TRACK_SPRITE_COUNT: i32 = 28;
 /// The atlas' first track column (S01 §3.1: the atlas starts at x = 13).
 const TRACK_ATLAS_X: i32 = 13;
 /// The distance between two track columns in the sheet.
@@ -165,8 +164,6 @@ const TRACK_CELL_PITCH: i32 = 15;
 const TRACK_CUT_ROW: i32 = 164;
 /// The row band of the most boost half of the value range.
 const TRACK_BOOST_ROW: i32 = 229;
-/// The curve's row at the flat value: the graph's centre row.
-const CURVE_FLAT_ROW: i32 = 9;
 /// The curve's row at the ends of the value range (the graph has 19 rows).
 const CURVE_MAX_ROW: i32 = 18;
 /// The graph's margin, in pixels, that the curve keeps on each side.
@@ -174,25 +171,25 @@ const CURVE_MAX_ROW: i32 = 18;
 /// The measured reference capture draws the flat curve from the graph's
 /// second to its second-to-last column.
 const GRAPH_MARGIN: i32 = 2;
+/// How many pixels apart the curve's control points are.
+const CURVE_BAND_PITCH: i32 = 12;
 
 /// The track sprite's index in the sheet's own colour order, 0 = the most cut
 /// value and 25 the most boost one.
 ///
-/// **Own choice:** the sheet's 26 sprites in their own order, the highest
-/// value first. The two anchors S01 §3.1 gives hold: value 0 is the red body
-/// (the ramp's row 0) and value 63 the green one (row 18). The flat value 31
-/// lands on the first sprite of the boost band, which is the one the
-/// measured reference capture draws.
+/// The sheet's 28 sprites in their own order, the highest value first. The law
+/// is measured against Winamp 2.95 for every odd value (2026-10-31), by which of
+/// the atlas's sprites it draws.
 fn track_sprite_index(value: u8) -> i32 {
     let value = i32::from(value.min(MAX_VALUE));
-    ((i32::from(MAX_VALUE) - value) * (TRACK_SPRITE_COUNT - 1) + 31) / i32::from(MAX_VALUE)
+    (((i32::from(MAX_VALUE) - value) + 1) * TRACK_SPRITE_COUNT / 64).min(TRACK_SPRITE_COUNT - 1)
 }
 
 /// The `eqmain.bmp` track sprite for a saved value.
 ///
 /// The sheet's slider atlas (S01 §3.1: (13,164,209,129), never blitted as a
-/// whole) holds 26 complete track sprites: 13 columns in the row band at
-/// y = 164 and 13 in the band at y = 229, the columns 15 px apart. Each
+/// whole) holds 28 complete track sprites: 14 columns in the row band at
+/// y = 164 and 14 in the band at y = 229, the columns 15 px apart. Each
 /// sprite is 14 x 63 px and carries the groove, the coloured body, its bright
 /// core and the end caps.
 fn track_sheet_rect(value: u8) -> Rect {
@@ -216,30 +213,17 @@ fn track_sheet_rect(value: u8) -> Rect {
 /// value 63 row 18 (green). The intermediate rows are a nearest-row
 /// rounding, shared by the preamp strip and the curve.
 fn colour_scale_row(value: u8) -> i32 {
-    (i32::from(value.min(MAX_VALUE)) * 18 + 31) / 63
+    curve_row(value)
 }
 
-/// The curve's row for a saved value.
-///
-/// The flat anchor lies on the graph's centre row: the measured reference
-/// capture draws the flat curve there, and S01 §3.1's measured range is
-/// rows 7..=9.
+/// The curve's row for a saved value, measured against Winamp 2.95 (2026-10-31).
 fn curve_row(value: u8) -> i32 {
-    let value = i32::from(value.min(MAX_VALUE));
-    let flat = i32::from(FLAT_VALUE);
-    if value <= flat {
-        (value * CURVE_FLAT_ROW + flat / 2) / flat
-    } else {
-        CURVE_FLAT_ROW + ((value - flat) * (CURVE_MAX_ROW - CURVE_FLAT_ROW) + 16) / 32
-    }
+    i32::from(value.min(MAX_VALUE)) * 19 / 64
 }
 
 /// The graph's control point x for band `band`.
-///
-/// The ten control points are spread evenly over the graph's inner width.
-fn curve_x(band: usize, graph: Rect) -> i32 {
-    let last = graph.width as i32 - GRAPH_MARGIN - 1;
-    GRAPH_MARGIN + (band as i32 * (last - GRAPH_MARGIN)) / 9
+fn curve_x(band: usize, _graph: Rect) -> i32 {
+    GRAPH_MARGIN + band as i32 * CURVE_BAND_PITCH
 }
 
 /// Sample the colour scale, never paste its vertical strip as graph artwork
@@ -260,18 +244,42 @@ fn draw_graph(canvas: &mut Image, sheets: &EqSheets, state: &EqualizerState, gra
         graph.y + CURVE_MAX_ROW - colour_scale_row(state.preamp),
     );
 
-    // Own choice: the ten control points spread evenly over the graph's
-    // inner width, not by log-frequency or a DSP filter response; no preamp
-    // addition.
-    for band in 0..9 {
+    // The ten control points, twelve pixels apart, joined by a Catmull-Rom
+    // curve whose row is floored at each column: this reproduces Winamp 2.95's
+    // curve but for one column of 109 in the measured state (2026-10-31).
+    let rows: Vec<f32> = state
+        .bands
+        .iter()
+        .map(|value| f32::from((*value).min(MAX_VALUE)) * 19.0 / 64.0)
+        .collect();
+    let mut previous = None;
+    for x in curve_x(0, graph)..=curve_x(9, graph) {
+        let position = (x - GRAPH_MARGIN) as f32 / CURVE_BAND_PITCH as f32;
+        let segment = (position as usize).min(8);
+        let row = catmull_rom(&rows, segment, position - segment as f32).floor() as i32;
+        let row = row.clamp(0, graph.height as i32 - 1);
         draw_graph_segment(
             canvas,
             sheets,
             graph,
-            (curve_x(band, graph), curve_row(state.bands[band])),
-            (curve_x(band + 1, graph), curve_row(state.bands[band + 1])),
+            (x, previous.unwrap_or(row)),
+            (x, row),
         );
+        previous = Some(row);
     }
+}
+
+/// The Catmull-Rom curve through `rows`, `t` of the way along segment `index`;
+/// the ends repeat the outermost control point.
+fn catmull_rom(rows: &[f32], index: usize, t: f32) -> f32 {
+    let p0 = rows[index.saturating_sub(1)];
+    let p1 = rows[index];
+    let p2 = rows[index + 1];
+    let p3 = rows[(index + 2).min(rows.len() - 1)];
+    0.5 * (2.0 * p1
+        + (p2 - p0) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t
+        + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t * t * t)
 }
 
 /// Integer Bresenham rasterization: one-pixel, 8-connected segments without
@@ -475,7 +483,7 @@ mod tests {
         // measured reference capture draws.
         assert_eq!(track_sheet_rect(63), Rect::new(13, 164, 14, 63));
         assert_eq!(track_sheet_rect(31), Rect::new(13, 229, 14, 63));
-        assert_eq!(track_sheet_rect(0), Rect::new(193, 229, 14, 63));
+        assert_eq!(track_sheet_rect(0), Rect::new(208, 229, 14, 63));
         // Every sprite is inside the atlas and the value order is monotone.
         let mut previous = i32::MAX;
         for value in 0..=MAX_VALUE {

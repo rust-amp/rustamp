@@ -2174,7 +2174,7 @@ fn is_list_footer(kind: DialogKind, index: usize, last: usize) -> bool {
 }
 
 /// The size of the dialogs' real font (own choice: the list's own size).
-const DIALOG_FONT_SIZE: u32 = 13;
+const DIALOG_FONT_SIZE: u32 = 15;
 
 fn dialog_font() -> crate::playlist_font::SystemFont<'static> {
     crate::playlist_font::SystemFont {
@@ -2198,7 +2198,15 @@ fn draw_dialog_text(
     let width = band
         .width
         .saturating_sub((x - band.x).max(0) as u32 + TEXT_PAD as u32);
-    match crate::playlist_font::render(dialog_font(), text, width.max(1), band.height, colour) {
+    let under = crate::render::under_text(canvas, x, band.y + 1);
+    match crate::playlist_font::render(
+        dialog_font(),
+        text,
+        width.max(1),
+        band.height,
+        colour,
+        under,
+    ) {
         Some(scratch) => canvas.blit_alpha(&scratch, scratch.bounds(), x, band.y),
         None => {
             if let Some(font) = text_font(skin) {
@@ -2234,6 +2242,7 @@ fn draw_input_field(
         (inner_width - 8).max(1),
         band.height.saturating_sub(1),
         ink,
+        [background[0] / 2, background[1] / 2, background[2] / 2],
     ) {
         canvas.blit_alpha(&scratch, scratch.bounds(), text_x, frame.y + 1);
     }

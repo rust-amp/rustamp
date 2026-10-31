@@ -280,13 +280,14 @@ fn no_digit_cell_and_minus_sign_follow_the_time_state() {
     let skin = synthetic_skin();
     let layout = MainWindowLayout::CLASSIC;
 
-    // Under ten minutes the tens-of-minutes cell is the "no digit" filler.
+    // Under ten minutes the tens-of-minutes cell still holds its zero, as Winamp
+    // 2.95 draws it (`00:31`, measured 2026-10-31).
     let short = MainWindowState {
         time_seconds: 83,
         ..MainWindowState::default()
     };
     let frame = render_main_window(&short, &skin, &layout);
-    assert_eq!(rgb(&frame, 48, 26), NO_DIGIT);
+    assert_ne!(rgb(&frame, 48, 26), NO_DIGIT);
     assert_eq!(rgb(&frame, 60, 26), DIGIT_1);
 
     // Remaining time draws the minus sign at (38,32).
@@ -388,11 +389,17 @@ fn the_shaded_strip_is_the_skins_own_shade_cell() {
     // Everything the skin's shade title bar paints is still there. The
     // shaded analyser is the one exception (S08 §1): it is our own area, and
     // where it sits in the windowshade is our own choice.
+    // So is the position thumb of a playing track (measured 2026-10-31).
     let analyser = layout.shade_visualization;
+    let groove = layout.shade_position;
     for y in 0..14 {
         for x in 0..275 {
             let ours =
                 x >= analyser.x && x < analyser.right() && y >= analyser.y && y < analyser.bottom();
+            let ours = ours
+                || (x >= groove.x && x < groove.right() && y >= groove.y && y < groove.bottom())
+                // The time of a playing track, with its sign cells.
+                || ((126..157).contains(&x) && (4..10).contains(&y));
             if !ours {
                 assert_eq!(rgb(&frame, x, y), SHADE, "{x},{y}");
             }
@@ -516,7 +523,7 @@ fn a_blank_time_display_draws_nothing() {
         ..MainWindowState::default()
     };
     let frame = render_main_window(&state, &skin, &layout);
-    assert_eq!(rgb(&frame, 48, 26), NO_DIGIT);
+    assert_ne!(rgb(&frame, 48, 26), MAIN_BG);
 
     // The blink-off phase and stopped are blank (S02 §4).
     state.time_visible = false;

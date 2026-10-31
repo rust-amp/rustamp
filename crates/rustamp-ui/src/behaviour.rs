@@ -388,6 +388,7 @@ impl MainWindow {
             Event::StreamInfoChanged(info) => self.stream = *info,
             Event::VolumeChanged { volume, balance } => {
                 self.state.volume = volume_percent(*volume);
+                self.state.volume_core = *volume;
                 self.state.balance = balance_percent(*balance);
             }
             Event::ModesChanged { shuffle, repeat } => {
@@ -519,6 +520,7 @@ impl MainWindow {
                 self.reset_visualization();
                 if self.state.transport != TransportState::Stopped {
                     self.position_ms = clamp_position(*to_ms, self.duration_ms);
+                    self.follow_position();
                 }
             }
             Command::SeekRelative { delta_ms } => {
@@ -526,9 +528,13 @@ impl MainWindow {
                 if self.state.transport != TransportState::Stopped {
                     let target = (self.position_ms as i64 + delta_ms).max(0) as u64;
                     self.position_ms = clamp_position(target, self.duration_ms);
+                    self.follow_position();
                 }
             }
-            Command::SetVolume(volume) => self.state.volume = volume_percent(*volume),
+            Command::SetVolume(volume) => {
+                self.state.volume = volume_percent(*volume);
+                self.state.volume_core = *volume;
+            }
             Command::SetBalance(balance) => self.state.balance = balance_percent(*balance),
             Command::ToggleShuffle => self.state.shuffle = !self.state.shuffle,
             Command::SetShuffle(on) => self.state.shuffle = *on,
@@ -617,19 +623,30 @@ impl MainWindow {
         if self.held == Some(Widget::PositionSlider) || !self.state.seekable {
             return;
         }
-        self.state.position = match self.duration_ms {
-            Some(duration) if duration > 0 => {
-                (u128::from(self.position_ms.min(duration)) * 100 / u128::from(duration)) as u8
-            }
-            _ => 0,
-        };
+        let shown = self.position_ms.min(self.duration_ms.unwrap_or(0));
+        let duration = self.duration_ms.filter(|duration| *duration > 0);
+        self.state.position = duration.map_or(0, |duration| {
+            (u128::from(shown) * 100 / u128::from(duration)) as u8
+        });
+        let travel = u128::from(self.layout.position_travel());
+        self.state.position_px =
+            duration.map(|duration| (u128::from(shown) * travel / u128::from(duration)) as u32);
     }
 
     fn set_slider(&mut self, widget: Widget, x: i32) {
         let percent = self.slider_percent(widget, x);
         match widget {
-            Widget::PositionSlider => self.state.position = percent,
-            Widget::VolumeSlider => self.state.volume = percent,
+            Widget::PositionSlider => {
+                self.state.position = percent;
+                self.state.position_px = None;
+            }
+            // S07 §5: five core units per pixel, from the thumb's left edge.
+            Widget::VolumeSlider => {
+                let track = self.layout.volume_track;
+                let left = (x - VOLUME_THUMB_SIZE.0 as i32 / 2).clamp(track.x, track.x + 51);
+                self.state.volume_core = (5 * (left - track.x)) as u8;
+                self.state.volume = volume_percent(self.state.volume_core);
+            }
             Widget::BalanceSlider => self.state.balance = percent,
             _ => {}
         }
@@ -643,7 +660,10 @@ impl MainWindow {
     /// suggested.
     fn widget_enabled(&self, widget: Widget) -> bool {
         match widget {
-            Widget::PositionSlider => self.state.seekable,
+            // Nothing to seek in while stopped: the bar is not drawn either.
+            Widget::PositionSlider => {
+                self.state.seekable && self.state.transport != TransportState::Stopped
+            }
             _ => true,
         }
     }
@@ -686,7 +706,7 @@ impl MainWindow {
                     to_ms: (u128::from(duration) * u128::from(self.state.position) / 100) as u64,
                 })
             }
-            Widget::VolumeSlider => Some(Command::SetVolume(core_volume(self.state.volume))),
+            Widget::VolumeSlider => Some(Command::SetVolume(self.state.volume_core)),
             Widget::BalanceSlider => Some(Command::SetBalance(core_balance(self.state.balance))),
             _ => None,
         }
@@ -839,12 +859,14 @@ fn sample_rate_khz(hz: u32) -> u32 {
 
 /// A core volume (`0..=255`) as the display percentage (`0..=100`).
 pub fn volume_percent(volume: u8) -> u8 {
-    ((u32::from(volume) * 100 + 127) / 255).min(100) as u8
+    // S07 §5: the display percentage is floored.
+    (u32::from(volume) * 100 / 255).min(100) as u8
 }
 
 /// A display percentage (`0..=100`) as a core volume (`0..=255`).
 pub fn core_volume(percent: u8) -> u8 {
-    ((u32::from(percent.min(100)) * 255 + 50) / 100).min(255) as u8
+    // Rounded up: the floored percentage of the result is `percent` again.
+    (u32::from(percent.min(100)) * 255).div_ceil(100).min(255) as u8
 }
 
 /// A core balance (`-127..=127`) as the display percentage (50 is centred).
@@ -1245,7 +1267,7 @@ mod tests {
             (Widget::ClutterD, "ENABLE DOUBLESIZE MODE"),
             (Widget::ClutterV, "VISUALIZATION MENU"),
             (Widget::PositionSlider, "SEEK TO: 1:40/3:20 (50%)"),
-            (Widget::VolumeSlider, "VOLUME: 49%"),
+            (Widget::VolumeSlider, "VOLUME: 52%"),
             (Widget::BalanceSlider, "BALANCE: CENTER"),
         ];
         for (widget, hint) in expected {
@@ -1311,7 +1333,7 @@ mod tests {
         assert!(machine.state().time_visible);
         assert_eq!(
             machine.state().time_cells(),
-            [None, Some(1), Some(2), Some(3)]
+            [Some(0), Some(1), Some(2), Some(3)]
         );
 
         // Clicking the display toggles to remaining (S02 §4).
@@ -1320,14 +1342,14 @@ mod tests {
         // 200 - 83 = 117 s -> 1:57.
         assert_eq!(
             machine.state().time_cells(),
-            [None, Some(1), Some(5), Some(7)]
+            [Some(0), Some(1), Some(5), Some(7)]
         );
         click(&mut machine, Widget::TimeDisplay, 0);
         assert!(!machine.state().time_remaining);
     }
 
     #[test]
-    fn the_leading_no_digit_rule_switches_at_ten_minutes() {
+    fn the_time_keeps_its_leading_zero_under_ten_minutes() {
         let mut machine = MainWindow::new();
         playing(&mut machine, 0);
         load_track(&mut machine, "T1", 20 * 60 * 1000, 0);
@@ -1341,7 +1363,7 @@ mod tests {
         );
         assert_eq!(
             machine.state().time_cells(),
-            [None, Some(9), Some(5), Some(9)]
+            [Some(0), Some(9), Some(5), Some(9)]
         );
 
         machine.handle_event(
@@ -1451,7 +1473,7 @@ mod tests {
         // The elapsed time is known and counts.
         assert_eq!(
             machine.state().time_cells(),
-            [None, Some(1), Some(2), Some(3)]
+            [Some(0), Some(1), Some(2), Some(3)]
         );
 
         // The remaining time is not: the display shows the placeholder (no
@@ -1476,14 +1498,14 @@ mod tests {
         assert!(!machine.state().duration_unknown);
         assert_eq!(
             machine.state().time_cells(),
-            [None, Some(1), Some(2), Some(3)]
+            [Some(0), Some(1), Some(2), Some(3)]
         );
 
         // The remaining time of a track with a length is unchanged.
         machine.toggle_time_remaining(0);
         assert_eq!(
             machine.state().time_cells(),
-            [None, Some(1), Some(5), Some(7)]
+            [Some(0), Some(1), Some(5), Some(7)]
         );
     }
 

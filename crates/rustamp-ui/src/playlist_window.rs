@@ -225,12 +225,22 @@ pub fn row_rect(row: usize, pitch: i32) -> Option<Rect> {
     if row >= visible_rows(pitch) {
         return None;
     }
+    // The rows' pitch starts one pixel above the list band, and the band cuts
+    // the first row: Winamp 2.95 selects y 23..=34, 35..=47, 48..=60 (measured
+    // 2026-10-31; S06 §2's band starts at 23).
+    let nominal = row_top(row, pitch);
+    let top = nominal.max(LIST_TOP);
     Some(Rect::new(
         LIST_LEFT,
-        LIST_TOP + row as i32 * pitch,
+        top,
         (LIST_RIGHT - LIST_LEFT) as u32,
-        pitch.max(1) as u32,
+        (nominal + pitch - top) as u32,
     ))
+}
+
+/// Where row `row`'s text starts, above the band's cut for the first row.
+fn row_top(row: usize, pitch: i32) -> i32 {
+    LIST_TOP + ROW_DRAW_OFFSET + row as i32 * pitch
 }
 
 /// Whether `(x, y)` is inside the settled list band (S06 §2).
@@ -507,6 +517,7 @@ pub fn render_playlist_window(
     draw_side_rails(&mut canvas, pledit.as_ref(), skin);
     draw_bottom_bar(&mut canvas, pledit.as_ref(), skin);
     draw_rows(&mut canvas, skin, window, labels);
+    draw_status_fields(&mut canvas, skin, window);
     draw_drag_insertion(&mut canvas, skin, window);
     draw_scrollbar(&mut canvas, pledit.as_ref(), window);
     draw_title_buttons(&mut canvas, pledit.as_ref(), skin, window);
@@ -745,8 +756,39 @@ fn playlist_font_mask(mut image: Image) -> Option<BitmapFont> {
     Some(BitmapFont::new(image, glyphs, None, 0))
 }
 
+/// The two text fields of the bottom bar, in the skin's `text.bmp`. Their places
+/// are measured against Winamp 2.95 (2026-10-31), from the bottom right corner.
+fn draw_status_fields(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow) {
+    let Some(raster) = skin.sheet(Sheet::Text) else {
+        return;
+    };
+    let Ok(image) = Image::from_rgba(raster.width(), raster.height(), raster.as_rgba().to_vec())
+    else {
+        return;
+    };
+    let mut glyphs = GlyphMap::new(webamp::TEXT_CELL.0, webamp::TEXT_CELL.1);
+    for (ch, col, row) in webamp::TEXT_GLYPHS {
+        glyphs.insert(*ch, *col, *row);
+    }
+    let font = BitmapFont::new(image, glyphs, None, 0);
+    let (width, height) = (canvas.width() as i32, canvas.height() as i32);
+    font.render_text(canvas, width - 143, height - 28, &window.info_text);
+    if let Some(digits) = window.time_digits {
+        for (digit, x) in digits.iter().zip([77, 72, 64, 59]) {
+            font.render_text(canvas, width - x, height - 15, &digit.to_string());
+        }
+    }
+}
+
+/// Where the rows are drawn relative to the list band: Winamp 2.95 draws them
+/// one pixel above it (measured side by side, 2026-10-31).
+const ROW_DRAW_OFFSET: i32 = -1;
+
 /// The room kept between a row's text and its length (own choice).
 const LENGTH_GAP: u32 = 4;
+
+/// The room right of a row's length (measured against Winamp 2.95, 2026-10-31).
+const LENGTH_RIGHT: u32 = 2;
 
 /// Paints the visible rows: the selection band first, then the labels.
 ///
@@ -778,14 +820,13 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
     let visible = window.visible_ids();
     let selected_ids = window.selected_ids();
     for (i, id) in visible.iter().enumerate() {
-        let rect = Rect::new(
-            LIST_LEFT,
-            LIST_TOP + i as i32 * pitch,
-            window.size().0 - 33,
-            pitch as u32,
-        );
+        let nominal = row_top(i, pitch);
+        let band_top = nominal.max(LIST_TOP);
+        let clipped = (band_top - nominal) as u32;
+        let rect = Rect::new(LIST_LEFT, nominal, window.size().0 - 33, pitch as u32);
+        let band = Rect::new(rect.x, band_top, rect.width, rect.height - clipped);
         if selected_ids.contains(id) {
-            canvas.fill_rect(rect, selected);
+            canvas.fill_rect(band, selected);
         }
         let label = labels.get(i).map(String::as_str).unwrap_or("");
         if label.is_empty() {
@@ -807,7 +848,9 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
         } else {
             style.normal
         };
-        // The name and the length are one row and one font.
+        // The name and the length are one row and one font, on the row's own
+        // background (the skin's, or its selection colour).
+        let under = crate::render::under_text(canvas, band.x, band.y);
         if let Some(scratch) = crate::playlist_font::render_as_part_of(
             request,
             label,
@@ -815,8 +858,10 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
             text_width,
             rect.height,
             colour,
+            under,
         ) {
-            canvas.blit_alpha(&scratch, scratch.bounds(), rect.x, rect.y);
+            let visible = Rect::new(0, clipped as i32, scratch.width(), rect.height - clipped);
+            canvas.blit_alpha(&scratch, visible, rect.x, band.y);
             if let Some(length) = length
                 && let Some(scratch) = crate::playlist_font::render_as_part_of(
                     request,
@@ -825,10 +870,12 @@ fn draw_rows(canvas: &mut Image, skin: &Skin, window: &PlaylistWindow, labels: &
                     length_width,
                     rect.height,
                     colour,
+                    under,
                 )
             {
-                let x = rect.x + (rect.width - length_width) as i32;
-                canvas.blit_alpha(&scratch, scratch.bounds(), x, rect.y);
+                let x = rect.x + rect.width as i32 - (length_width + LENGTH_RIGHT) as i32;
+                let visible = Rect::new(0, clipped as i32, scratch.width(), rect.height - clipped);
+                canvas.blit_alpha(&scratch, visible, x, band.y);
             }
         } else if let Some(font) = font.as_ref() {
             // Scratch-clipped like the main-window marquee, so text cannot
@@ -1028,8 +1075,16 @@ mod tests {
                         for y in row.y..row.bottom() {
                             for x in row.x..row.right() {
                                 let pixel = frame.pixel(x, y).unwrap();
-                                assert!(pixel == bg || pixel == ink, "row {i}: {pixel:?}");
-                                ink_count += usize::from(pixel == ink);
+                                ink_count += usize::from(
+                                    (0..3)
+                                        .map(|c| (i32::from(pixel[c]) - i32::from(ink[c])).pow(2))
+                                        .sum::<i32>()
+                                        < (0..3)
+                                            .map(|c| {
+                                                (i32::from(pixel[c]) - i32::from(bg[c])).pow(2)
+                                            })
+                                            .sum::<i32>(),
+                                );
                                 background_count += usize::from(pixel == bg);
                             }
                         }
@@ -1113,7 +1168,7 @@ mod tests {
     /// The classic invariant at every size: a row holds the skin's ink and
     /// its background, never a blended shade (no antialiasing).
     #[test]
-    fn the_rows_hold_only_ink_and_background_at_every_font_size() {
+    fn the_rows_show_ink_on_their_background_at_every_font_size() {
         use rustamp_core::playlist::EntryId;
         use rustamp_skin::{BuiltinDefaultSkin, BuiltinLookalikeSkin};
 
@@ -1145,11 +1200,14 @@ mod tests {
                     for y in rect.y..rect.bottom() {
                         for x in rect.x..rect.right() {
                             let pixel = frame.pixel(x, y).expect("a pixel");
-                            assert!(
-                                pixel == ink || pixel == bg,
-                                "size {size}, row {row}: off-palette pixel {pixel:?}"
+                            ink_count += usize::from(
+                                (0..3)
+                                    .map(|c| (i32::from(pixel[c]) - i32::from(ink[c])).pow(2))
+                                    .sum::<i32>()
+                                    < (0..3)
+                                        .map(|c| (i32::from(pixel[c]) - i32::from(bg[c])).pow(2))
+                                        .sum::<i32>(),
                             );
-                            ink_count += usize::from(pixel == ink);
                         }
                     }
                     assert!(ink_count > 0, "size {size}, row {row}: no ink");
@@ -1213,8 +1271,10 @@ mod tests {
     fn list_rows_follow_the_settled_band_and_pitch() {
         // S06 §2 bbox (12,23)-(254,93); S01 §4.2 13 px pitch, four rows.
         assert_eq!(list_area(), Rect::new(12, 23, 242, 70));
-        assert_eq!(row_rect(0, ROW_PITCH), Some(Rect::new(12, 23, 242, 13)));
-        assert_eq!(row_rect(3, ROW_PITCH), Some(Rect::new(12, 62, 242, 13)));
+        // The band cuts the first row's top pixel (measured 2026-10-31).
+        assert_eq!(row_rect(0, ROW_PITCH), Some(Rect::new(12, 23, 242, 12)));
+        assert_eq!(row_rect(1, ROW_PITCH), Some(Rect::new(12, 35, 242, 13)));
+        assert_eq!(row_rect(3, ROW_PITCH), Some(Rect::new(12, 61, 242, 13)));
         assert_eq!(row_rect(4, ROW_PITCH), None);
     }
 

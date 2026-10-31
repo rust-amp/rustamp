@@ -95,15 +95,20 @@ pub const TRACK_LEFT_OFFSET: i32 = -1;
 /// ~0.81 px per unit; the interpolation between them is the natural reading,
 /// not a separate measurement.
 pub fn thumb_y_for_value(value: u8) -> i32 {
+    // Measured against Winamp 2.95 for every odd value (2026-10-31).
     let value = value.min(MAX_VALUE) as i32;
-    THUMB_TOP_Y + (value * (THUMB_BOTTOM_Y - THUMB_TOP_Y) + 31) / 63
+    THUMB_TOP_Y + (value * 13 + 12) / 16
 }
 
 /// Saved value `0..=63` for a thumb top-left y (the inverse of
 /// [`thumb_y_for_value`], clamped to the travel).
 pub fn value_for_thumb_y(y: i32) -> u8 {
     let y = y.clamp(THUMB_TOP_Y, THUMB_BOTTOM_Y);
-    (((y - THUMB_TOP_Y) * 63 + 25) / (THUMB_BOTTOM_Y - THUMB_TOP_Y)).clamp(0, 63) as u8
+    if y == THUMB_BOTTOM_Y {
+        return MAX_VALUE;
+    }
+    // The smallest value whose thumb sits at `y`.
+    ((((y - THUMB_TOP_Y) * 16 - 12).max(0) + 12) / 13).clamp(0, 63) as u8
 }
 
 /// How far a band or preamp key moves its slider, in saved units. **Own choice:**
@@ -818,9 +823,13 @@ mod tests {
 
     #[test]
     fn thumb_y_round_trips_through_the_inverse() {
-        for value in [0, 1, 15, 31, 46, 62, 63] {
+        for value in 0..=MAX_VALUE {
             let y = thumb_y_for_value(value);
-            assert_eq!(value_for_thumb_y(y), value, "value {value} at y {y}");
+            assert_eq!(
+                thumb_y_for_value(value_for_thumb_y(y)),
+                y,
+                "value {value} at y {y}"
+            );
         }
         assert_eq!(value_for_thumb_y(0), 0);
         assert_eq!(value_for_thumb_y(1000), 63);

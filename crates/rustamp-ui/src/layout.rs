@@ -189,7 +189,7 @@ impl MainWindowLayout {
         play_indicator: Rect::new(26, 28, 9, 9),
         decoder_indicator: Rect::new(24, 28, 3, 9),
         visualization: Rect::new(24, 43, 76, 16),
-        shade_visualization: Rect::new(188, 5, 38, 5),
+        shade_visualization: Rect::new(79, 5, 38, 5),
         stereo: Rect::new(239, 41, 29, 12),
         mono: Rect::new(212, 41, 27, 12),
         marquee: Rect::new(111, 27, 154, 6),
@@ -234,6 +234,38 @@ impl MainWindowLayout {
             self.position_thumb.y,
             self.position_thumb.width,
             self.position_thumb.height,
+        )
+    }
+
+    /// The position thumb `offset` pixels into its travel.
+    pub fn position_thumb_at_px(&self, offset: u32) -> Rect {
+        let travel = self.position_track.width - self.position_thumb.width;
+        Rect::new(
+            self.position_track.x + offset.min(travel) as i32,
+            self.position_thumb.y,
+            self.position_thumb.width,
+            self.position_thumb.height,
+        )
+    }
+
+    /// How many pixels the position thumb can travel.
+    pub fn position_travel(&self) -> u32 {
+        self.position_track.width - self.position_thumb.width
+    }
+
+    /// The volume thumb for a core volume (S07 §5: `v = 5 x (thumb_left - 107)`).
+    /// A state whose percentage says something else was set directly and is
+    /// drawn from the percentage.
+    pub fn volume_thumb_for_core(&self, core: u8, percent: u8) -> Rect {
+        let thumb = self.volume_thumb_at(percent);
+        if u32::from(core) * 100 / 255 != u32::from(percent) {
+            return thumb;
+        }
+        Rect::new(
+            self.volume_track.x + i32::from(core) / 5,
+            thumb.y,
+            thumb.width,
+            thumb.height,
         )
     }
 
@@ -362,7 +394,7 @@ mod tests {
         // normal window and 38 x 5 px in the shaded one - but not where it
         // sits (open question 13): the places are our own choice.
         assert_eq!(l.visualization, Rect::new(24, 43, 76, 16));
-        assert_eq!(l.shade_visualization, Rect::new(188, 5, 38, 5));
+        assert_eq!(l.shade_visualization, Rect::new(79, 5, 38, 5));
         // S02 §7 window buttons: the sheet cells are verified, the window
         // positions are provisional (webamp cross-check).
         assert_eq!(l.window_button(WindowButton::Menu), Rect::new(6, 3, 9, 9));

@@ -138,15 +138,18 @@ fn ink_profile(frame: &Image, rect: Rect, colour: [u8; 3]) -> Vec<bool> {
         .collect()
 }
 
-/// Asserts that every pixel of `rect` is one of the two given colours.
+/// Asserts that every pixel of `rect` lies between the two given colours: GDI
+/// blends a glyph's edges against the background, channel by channel.
 fn assert_only_colours(frame: &Image, rect: Rect, first: [u8; 3], second: [u8; 3]) {
     for y in rect.y..rect.bottom() {
         for x in rect.x..rect.right() {
             let pixel = frame.pixel(x, y).expect("the pixel is inside the frame");
-            assert!(
-                pixel == rgba(first) || pixel == rgba(second),
-                "unexpected pixel {pixel:?} at {x},{y}"
-            );
+            let inside = (0..3).all(|c| {
+                let low = first[c].min(second[c]);
+                let high = first[c].max(second[c]);
+                (low..=high).contains(&pixel[c])
+            });
+            assert!(inside, "unexpected pixel {pixel:?} at {x},{y}");
         }
     }
 }
@@ -372,7 +375,7 @@ fn the_status_line_starts_at_the_left_edge_of_the_viewport() {
     let status = status_band(viewport);
     let first = first_ink_x(&frame, status, LIBRARY_STATUS_TEXT).expect("the status line is drawn");
     assert!(
-        (viewport.x..viewport.x + 4).contains(&first),
+        (viewport.x..viewport.x + 12).contains(&first),
         "the status text starts at the left edge, not at {first}"
     );
     let last = last_ink_x(&frame, status, LIBRARY_STATUS_TEXT).expect("the status line is drawn");

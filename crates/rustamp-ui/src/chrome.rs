@@ -28,7 +28,7 @@ const CLOSE_TOP: i32 = 3;
 const CLOSE_SIZE: i32 = 9;
 
 /// The size of the title's real font (own choice: what the strip holds).
-const TITLE_FONT_SIZE: u32 = 12;
+const TITLE_FONT_SIZE: u32 = 13;
 
 /// The padding of the title's plate, on each side of the text.
 const PLATE_PAD: u32 = 8;
@@ -126,7 +126,8 @@ pub fn draw_title_bar(canvas: &mut Image, skin: &Skin, title: &str, focused: boo
         }
     }
     let colour = if focused { style.current } else { style.normal };
-    if let Some(text) = playlist_font::render(font, title, text_width.max(1), 14, colour) {
+    let under = crate::render::under_text(canvas, plate_x + 2, 9);
+    if let Some(text) = playlist_font::render(font, title, text_width.max(1), 14, colour, under) {
         canvas.blit_alpha(&text, text.bounds(), plate_x + PLATE_PAD as i32, 3);
     }
 }

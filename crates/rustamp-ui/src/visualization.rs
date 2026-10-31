@@ -410,8 +410,25 @@ pub fn draw_visualization(
     geometry: Geometry,
     state: &VisState,
     colors: &[[u8; 3]; 24],
+    running: bool,
 ) {
-    if !has_content(state, geometry) {
+    // While a track is open the area is the analyser's, silent or not: its
+    // background comes from `viscolor.txt` and not from `main.bmp` (measured
+    // against Winamp 2.95, 2026-10-31).
+    let open = running && state.mode != VisMode::Off;
+    if !open && !has_content(state, geometry) {
+        return;
+    }
+    // The shaded area of a silent track: Winamp's floor of peak marks, three
+    // pixels in every four, on the bottom row (same measurement).
+    if open && geometry == Geometry::Shaded && !has_content(state, geometry) {
+        let bottom = area.y + i32::from(geometry.rows()) - 1;
+        for x in 0..area.width as i32 - 1 {
+            if x % 4 != 3 {
+                let [r, g, b] = colors[slots::PEAK];
+                canvas.set_pixel(area.x + x, bottom, [r, g, b, 255]);
+            }
+        }
         return;
     }
     let color = |slot: usize| {
@@ -426,7 +443,9 @@ pub fn draw_visualization(
     let bar_width = (width / bands as u32).saturating_sub(BAR_GAP);
     // Fixed-size scratch makes even a changed layout safe: clip, never spill.
     let mut image = Image::filled(width, u32::from(rows), color(slots::BACKGROUND));
-    for y in (0..i32::from(rows)).step_by(2) {
+    // The grid's rows start at the area's second one (measured 2026-10-31).
+    let first_row = i32::from(geometry == Geometry::Normal);
+    for y in (first_row..i32::from(rows)).step_by(2) {
         for x in (0..width as i32).step_by(2) {
             image.set_pixel(x, y, color(slots::GRID));
         }
@@ -666,11 +685,15 @@ mod tests {
         state.bars[0] = 16;
         state.peaks[0] = 16;
         state.bars[9] = 1;
-        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette, false);
         assert_eq!(image.pixel(3, 4), Some([23, 0, 0, 255]), "peak marker");
         assert_eq!(image.pixel(3, 5), Some([3, 0, 0, 255]), "bar row 14");
         assert_eq!(image.pixel(3, 19), Some([17, 0, 0, 255]), "bar row 0");
-        assert_eq!(image.pixel(9, 19), Some([0, 0, 0, 255]), "one-column gap");
+        assert_eq!(
+            image.pixel(9, 19),
+            Some([slots::GRID as u8, 0, 0, 255]),
+            "one-column gap"
+        );
         assert_eq!(
             image.pixel(75, 19),
             Some([17, 0, 0, 255]),
@@ -692,6 +715,7 @@ mod tests {
             Geometry::Normal,
             &state,
             &palette,
+            false,
         );
         assert_eq!(image.pixel(98, 29), Some([23, 0, 0, 255]));
         assert_eq!(image.pixel(99, 29), Some(sentinel));
@@ -708,7 +732,7 @@ mod tests {
         for band in 0..5 {
             state.bars[band] = 5;
         }
-        draw_visualization(&mut image, area, Geometry::Shaded, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Shaded, &state, &palette, false);
         // The first band starts at the left edge and shows the whole ramp.
         for row in 0..SHADED_ROWS {
             let y = i32::from(SHADED_ROWS - 1 - row);
@@ -721,7 +745,7 @@ mod tests {
         }
         // The peak marker sits on the top row of its band.
         state.peaks[0] = 5;
-        draw_visualization(&mut image, area, Geometry::Shaded, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Shaded, &state, &palette, false);
         assert_eq!(image.pixel(0, 0), Some([23, 0, 0, 255]));
         // The fifth band starts at 30 and the sixth has no place: the last
         // pixel of the area shows the grid, not a bar.
@@ -742,7 +766,7 @@ mod tests {
         let mut image = Image::new(76, 16);
         let mut state = VisState::default();
         state.bars[0] = 16;
-        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette, false);
         for row in 0..SPECTRUM_ROWS {
             let y = i32::from(SPECTRUM_ROWS - 1 - row);
             assert_eq!(
@@ -769,7 +793,7 @@ mod tests {
         for (column, row) in state.scope.iter_mut().enumerate().take(16) {
             *row = column as u8;
         }
-        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette, false);
         for (column, row) in state.scope.iter().enumerate().take(16) {
             let distance = (*row as i32 - 7).abs().min((*row as i32 - 8).abs());
             let expected = slots::OSCILLOSCOPE_FIRST as u8 + distance.min(4) as u8;
@@ -797,7 +821,7 @@ mod tests {
         for (column, row) in state.scope.iter_mut().enumerate().take(38) {
             *row = (column % 5) as u8;
         }
-        draw_visualization(&mut image, area, Geometry::Shaded, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Shaded, &state, &palette, false);
         for column in 0..38usize {
             let row = (column % 5) as u8;
             // The centre line of five rows is row 2.
@@ -820,7 +844,7 @@ mod tests {
             mode: VisMode::Scope,
             ..VisState::default()
         };
-        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette, false);
         assert!(
             !image.as_rgba().as_chunks::<4>().0.iter().any(|p| {
                 (slots::OSCILLOSCOPE_FIRST as u8..=slots::OSCILLOSCOPE_LAST as u8).contains(&p[0])
@@ -830,17 +854,17 @@ mod tests {
         state.input = VisInput::Fresh;
         state.scope[0] = 0;
         state.scope[1] = 15;
-        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette, false);
         assert_eq!(image.pixel(1, 7), Some([18, 0, 0, 255]));
         state.mode = VisMode::ScopeDots;
-        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette);
+        draw_visualization(&mut image, area, Geometry::Normal, &state, &palette, false);
         assert_eq!(image.pixel(1, 7), Some([0, 0, 0, 255]));
         assert_eq!(image.pixel(1, 15), Some([22, 0, 0, 255]));
         state.mode = VisMode::Off;
         // The "off" mode paints nothing at all: the area keeps the skin's own
         // art (measured 2026-10-21), so a fresh canvas stays untouched.
         let mut fresh = Image::filled(76, 16, [1, 2, 3, 255]);
-        draw_visualization(&mut fresh, area, Geometry::Normal, &state, &palette);
+        draw_visualization(&mut fresh, area, Geometry::Normal, &state, &palette, false);
         assert!(
             fresh
                 .as_rgba()

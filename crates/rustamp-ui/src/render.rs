@@ -208,9 +208,43 @@ fn render_1x(state: &MainWindowState, skin: &Skin, layout: &MainWindowLayout) ->
         Geometry::Normal,
         &state.visualization,
         skin.viscolors(),
+        state.transport != TransportState::Stopped,
     );
 
     canvas
+}
+
+/// Where the blank cell left of the elapsed time sits.
+const TIME_SIGN_CELL: (i32, i32) = (36, 26);
+
+/// The four digit cells of the shaded window's time, in `text.bmp`'s font, and
+/// their row (measured against Winamp 2.95, 2026-10-31).
+const SHADE_TIME_CELLS: [i32; 4] = [134, 139, 147, 152];
+const SHADE_TIME_Y: i32 = 4;
+
+/// The shaded window's two narrow text cells left of the time, three pixels of
+/// a `text.bmp` cell each: the first stays blank, the second is the sign of a
+/// remaining time (measured against Winamp 2.95, 2026-10-31).
+const SHADE_BLANK_CELL_X: i32 = 126;
+const SHADE_SIGN_CELL_X: i32 = 130;
+const SHADE_SIGN_CELL_WIDTH: u32 = 3;
+
+/// The shaded position thumb's first column inside the groove, and its travel:
+/// the groove's first column never carries it (same measurement).
+const SHADE_THUMB_START: i32 = 1;
+const SHADE_THUMB_TRAVEL: i32 = 12;
+
+/// The shaded position thumb at `percent`: where it sits inside the groove, and
+/// its cell. The skin draws three thumbs, leaning towards the groove's ends
+/// (measured over a 300 s track against Winamp 2.95, 2026-10-31).
+fn shade_thumb(percent: u8) -> (i32, &'static str) {
+    let step = i32::from(percent.min(100)) * SHADE_THUMB_TRAVEL / 100;
+    let cell = match step {
+        ..=4 => "MAIN_SHADE_POSITION_THUMB_LEFT",
+        5..=7 => "MAIN_SHADE_POSITION_THUMB",
+        _ => "MAIN_SHADE_POSITION_THUMB_RIGHT",
+    };
+    (SHADE_THUMB_START + step, cell)
 }
 
 fn draw_shade(
@@ -230,9 +264,10 @@ fn draw_shade(
     // `MAIN_SHADE_POSITION_*` cells live in the 9 x 9 window-button area
     // that 2.95 never reads (S01 §2.4, open question 1), so blitting them
     // would only cover the skin's own art with the leftovers of a button
-    // cell. The groove stays the seek target of the strip (see
-    // `MainWindowLayout::shade_position`); the renderer draws no thumb over
-    // it, because the skin carries no thumb sprite for it.
+    // cell. That capture was of a stopped player. While a track plays or is
+    // paused 2.95 does draw a thumb on the groove (measured 2026-10-31), the
+    // cell the sheet keeps for it; the groove is the strip's seek target (see
+    // `MainWindowLayout::shade_position`).
     let title = if state.title_bar_focused {
         "MAIN_SHADE_BACKGROUND_SELECTED"
     } else {
@@ -254,7 +289,39 @@ fn draw_shade(
         Geometry::Shaded,
         &state.visualization,
         skin.viscolors(),
+        // A paused track has no floor of peak marks (measured 2026-10-31).
+        state.transport == TransportState::Playing,
     );
+    if state.track_loaded && state.transport != TransportState::Stopped {
+        let track = layout.shade_position;
+        blit_named(
+            canvas,
+            sheets,
+            skin,
+            "MAIN_SHADE_POSITION_BACKGROUND",
+            track.x,
+            track.y,
+        );
+        let (offset, cell) = shade_thumb(state.position);
+        blit_named(canvas, sheets, skin, cell, track.x + offset, track.y);
+    }
+    if state.transport != TransportState::Stopped {
+        let minus = state.time_remaining && state.time_visible;
+        blit_shade_sign_cell(canvas, sheets, ' ', SHADE_BLANK_CELL_X);
+        let sign = if minus { '-' } else { ' ' };
+        blit_shade_sign_cell(canvas, sheets, sign, SHADE_SIGN_CELL_X);
+    }
+    if state.transport != TransportState::Stopped
+        && let Some(font) = text_font(sheets)
+    {
+        // The pause blink's dark phase is blank cells, not the strip's art
+        // (measured against Winamp 2.95, 2026-10-31).
+        for (cell, x) in state.time_cells().iter().zip(SHADE_TIME_CELLS) {
+            let shown = cell.filter(|_| state.time_visible);
+            let text = shown.map_or_else(|| " ".to_owned(), |digit| digit.to_string());
+            font.render_text(canvas, x, SHADE_TIME_Y, &text);
+        }
+    }
     if state.pressed_window_button == Some(WindowButton::Shade) {
         let rect = layout.window_button(WindowButton::Shade);
         blit_named(
@@ -519,7 +586,8 @@ fn draw_position(
     // own `main.bmp` shows through the whole track band (16,72)-(263,81).
     // Only a loaded track gets the track and the thumb; a track that cannot
     // be seeked keeps the disabled look below.
-    if !state.track_loaded {
+    // The same while stopped with a track loaded (measured 2026-10-31).
+    if !state.track_loaded || state.transport == TransportState::Stopped {
         return;
     }
     blit_named(
@@ -530,7 +598,10 @@ fn draw_position(
         layout.position_track.x,
         layout.position_track.y,
     );
-    let thumb = layout.position_thumb_at(state.position);
+    let thumb = match state.position_px {
+        Some(offset) => layout.position_thumb_at_px(offset),
+        None => layout.position_thumb_at(state.position),
+    };
     if state.seekable {
         let thumb_sprite = if state.position_thumb_pressed {
             "MAIN_POSITION_SLIDER_THUMB_SELECTED"
@@ -619,7 +690,7 @@ fn draw_volume(
         layout.volume_track.x,
         layout.volume_track.y,
     );
-    let thumb = layout.volume_thumb_at(state.volume);
+    let thumb = layout.volume_thumb_for_core(state.volume_core, state.volume);
     let name = if state.pressed_widget == Some(Widget::VolumeSlider) {
         "MAIN_VOLUME_THUMB_SELECTED"
     } else {
@@ -708,6 +779,17 @@ fn draw_time(
                 layout.minus_sign.y,
             );
         }
+    } else if !state.shows_time_placeholder() {
+        // Elapsed time: the sign's place holds the blank digit cell, whose
+        // background differs from `main.bmp`'s (measured 2026-10-31).
+        blit_named(
+            canvas,
+            sheets,
+            skin,
+            blank,
+            TIME_SIGN_CELL.0,
+            TIME_SIGN_CELL.1,
+        );
     }
 }
 
@@ -723,19 +805,28 @@ fn draw_indicators(
         TransportState::Paused => "MAIN_PAUSED_INDICATOR",
         TransportState::Stopped => "MAIN_STOPPED_INDICATOR",
     };
-    let decoder = if state.decoder_active() {
-        "MAIN_WORKING_INDICATOR"
+    // Winamp 2.95 lights the decoder strip only while playing. Paused and
+    // stopped it holds the blank cell of the same sheet, not the "not working"
+    // sprite (measured 2026-10-31).
+    if state.decoder_active() {
+        blit_named(
+            canvas,
+            sheets,
+            skin,
+            "MAIN_WORKING_INDICATOR",
+            layout.decoder_indicator.x,
+            layout.decoder_indicator.y,
+        );
     } else {
-        "MAIN_NOT_WORKING_INDICATOR"
-    };
-    blit_named(
-        canvas,
-        sheets,
-        skin,
-        decoder,
-        layout.decoder_indicator.x,
-        layout.decoder_indicator.y,
-    );
+        blit_region(
+            canvas,
+            sheets,
+            Sheet::Playpaus,
+            Rect::new(27, 0, 3, 9),
+            layout.decoder_indicator.x,
+            layout.decoder_indicator.y,
+        );
+    }
     // S01's decoder and transport footprints share x26. The complete 9x9
     // transport cell must win that column (S02 §1), not be overwritten by
     // the decoder strip's rightmost pixel.
@@ -782,11 +873,37 @@ fn draw_indicators(
 /// ambiguity, not a verified fact.
 fn text_font(sheets: &Sheets) -> Option<BitmapFont> {
     let image = sheets.get(Sheet::Text)?.clone();
+    Some(BitmapFont::new(image, text_glyphs(), None, 0))
+}
+
+fn text_glyphs() -> GlyphMap {
     let mut glyphs = GlyphMap::new(webamp::TEXT_CELL.0, webamp::TEXT_CELL.1);
     for (ch, col, row) in webamp::TEXT_GLYPHS {
         glyphs.insert(*ch, *col, *row);
     }
-    Some(BitmapFont::new(image, glyphs, None, 0))
+    glyphs
+}
+
+/// Draws the left part of `ch`'s `text.bmp` cell at `x` on the shaded time's row.
+fn blit_shade_sign_cell(canvas: &mut Image, sheets: &Sheets, ch: char, x: i32) {
+    let (Some(text), Some((col, row))) = (sheets.get(Sheet::Text), text_glyphs().cell(ch)) else {
+        return;
+    };
+    let (width, height) = webamp::TEXT_CELL;
+    let cell = Rect::new(
+        (col * width) as i32,
+        (row * height) as i32,
+        SHADE_SIGN_CELL_WIDTH,
+        height,
+    );
+    canvas.blit_rect(text, cell, x, SHADE_TIME_Y);
+}
+
+/// The skin's colour at `(x, y)`: what a text drawn there is blended against.
+pub(crate) fn under_text(canvas: &Image, x: i32, y: i32) -> [u8; 3] {
+    canvas
+        .pixel(x, y)
+        .map_or([0; 3], |pixel| [pixel[0], pixel[1], pixel[2]])
 }
 
 /// Whether the `text.bmp` font can draw `text` as it reads.
@@ -806,7 +923,7 @@ pub(crate) fn bitmap_can_draw(text: &str) -> bool {
 
 /// The size of the real font in the bitmap font's places (own choice): the
 /// largest one the marquee's band and a dialog's line hold.
-const SYSTEM_TEXT_SIZE: u32 = 11;
+const SYSTEM_TEXT_SIZE: u32 = 13;
 
 /// The real font in the bitmap font's places.
 fn system_text_font() -> crate::playlist_font::SystemFont<'static> {
@@ -830,7 +947,9 @@ pub(crate) fn draw_system_text(
 ) -> Option<()> {
     let font = system_text_font();
     let width = crate::playlist_font::text_width(font, text)?;
-    let scratch = crate::playlist_font::render(font, text, width.max(1), band.height, colour)?;
+    let under = under_text(canvas, band.x, band.y + band.height as i32 / 2);
+    let scratch =
+        crate::playlist_font::render(font, text, width.max(1), band.height, colour, under)?;
     let skipped = (-x).max(0);
     let shown = (width as i32 - skipped).clamp(0, band.width as i32 - x.max(0));
     if shown > 0 {
@@ -850,14 +969,14 @@ pub(crate) fn marquee_text_width(text: &str) -> u32 {
     crate::playlist_font::text_width(system_text_font(), text).unwrap_or(cells)
 }
 
-/// The bitrate as the three cells of the numeral field (S02 §5) hold it: a rate
-/// of four digits is shortened to `1k4` (own choice; S02 only shows three-digit
-/// rates, and cutting a digit off would show a wrong number).
+/// The bitrate as the three cells of the numeral field (S02 §5) hold it. A rate
+/// of four digits shows its hundreds and an `H`: 1411 kbps is `14H`, as Winamp
+/// 2.95 shows it (measured side by side, 2026-10-31).
 fn kbps_text(kbps: u32) -> String {
     if kbps < 1000 {
         kbps.to_string()
     } else {
-        format!("{}k{}", (kbps / 1000).min(9), (kbps % 1000) / 100)
+        format!("{}h", (kbps / 100).min(99))
     }
 }
 
@@ -942,6 +1061,25 @@ fn draw_marquee(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_shaded_thumb_follows_winamps_measured_steps() {
+        use super::shade_thumb;
+        const LEFT: &str = "MAIN_SHADE_POSITION_THUMB_LEFT";
+        const CENTRE: &str = "MAIN_SHADE_POSITION_THUMB";
+        const RIGHT: &str = "MAIN_SHADE_POSITION_THUMB_RIGHT";
+        for (percent, offset, cell) in [
+            (0, 1, LEFT),
+            (8, 1, LEFT),
+            (10, 2, LEFT),
+            (41, 5, LEFT),
+            (43, 6, CENTRE),
+            (66, 8, CENTRE),
+            (68, 9, RIGHT),
+            (100, 13, RIGHT),
+        ] {
+            assert_eq!(shade_thumb(percent), (offset, cell), "{percent}%");
+        }
+    }
 
     #[test]
     fn only_what_the_bitmap_font_has_stays_with_the_bitmap_font() {
@@ -956,7 +1094,7 @@ mod tests {
     fn a_bitrate_of_four_digits_fits_the_three_cells() {
         assert_eq!(kbps_text(192), "192");
         assert_eq!(kbps_text(999), "999");
-        assert_eq!(kbps_text(1411), "1k4");
+        assert_eq!(kbps_text(1411), "14h");
     }
 
     use super::*;

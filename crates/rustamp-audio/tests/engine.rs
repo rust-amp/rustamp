@@ -2732,3 +2732,23 @@ fn next_on_the_last_entry_of_a_paused_list_changes_nothing() {
     );
     assert_eq!(h.engine.current_index(), Some(0));
 }
+
+#[test]
+fn relative_seeks_add_up_while_paused() {
+    let mut h = Harness::new(&[LONG_A]);
+    h.engine.play().unwrap();
+    assert!(h.wait_track(0));
+    h.engine.pause().unwrap();
+    h.engine
+        .apply(&Command::SeekRelative { delta_ms: 100 })
+        .unwrap();
+    h.engine
+        .apply(&Command::SeekRelative { delta_ms: 100 })
+        .unwrap();
+    h.engine.play().unwrap();
+    let start = 200 * u64::from(SPEC.sample_rate) / 1000;
+    assert!(
+        h.wait_pumping(|e| e.position_frames() >= start, WAIT),
+        "the two steps are 200 ms together"
+    );
+}

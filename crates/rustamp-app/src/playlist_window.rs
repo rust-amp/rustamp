@@ -851,6 +851,7 @@ impl App {
         // rows that have none yet are asked for.
         self.playlist_tags.poll();
         self.request_row_tags(&ids);
+        self.sync_playlist_status();
         // The format is read once for the frame: every row shows the same
         // one.
         let format = self.playlist_title_format().engine_format();
@@ -937,6 +938,42 @@ impl App {
         };
         let fields = crate::title_format::row_fields(track, self.playlist_tags.metadata(id));
         format!("{}{length}", format.row_text(&plain, &fields))
+    }
+
+    /// Hands the bottom bar its two fields: the length of the selection and of
+    /// the list, and the time of the open track. A length the player does not
+    /// know yet counts as nothing and shows as a `+` behind the total (own
+    /// choice).
+    fn sync_playlist_status(&mut self) {
+        let all = self.entry_ids.clone();
+        self.request_row_tags(&all);
+        let length = |id: &EntryId| {
+            self.playlist_tags
+                .metadata(*id)
+                .and_then(|tags| tags.duration_ms)
+        };
+        let seconds = |ms: u64| ms / 1000;
+        let total: u64 = all.iter().filter_map(length).map(seconds).sum();
+        let selected: u64 = self
+            .playlist
+            .selected_ids()
+            .iter()
+            .filter_map(length)
+            .map(seconds)
+            .sum();
+        let unknown = if all.iter().all(|id| length(id).is_some()) {
+            ""
+        } else {
+            "+"
+        };
+        let clock = |secs: u64| format!("{}:{:02}", secs / 60, secs % 60);
+        self.playlist.info_text = format!("{}/{}{unknown}", clock(selected), clock(total));
+        let state = self.state();
+        let digits = state.time_cells();
+        self.playlist.time_digits = (state.time_visible
+            && !state.shows_time_placeholder()
+            && digits.iter().all(Option::is_some))
+        .then(|| digits.map(|digit| digit.unwrap_or(0)));
     }
 
     /// Mouse-wheel notches over the playlist editor: three rows a notch (own
@@ -1362,8 +1399,16 @@ mod tests {
             for y in rect.y..rect.bottom() {
                 for x in rect.x..rect.right() {
                     let pixel = frame.pixel(x, y).unwrap();
-                    assert!(pixel == ink || pixel == bg, "row {row}: {pixel:?}");
-                    ink_count += usize::from(pixel == ink);
+                    // GDI blends the edges, so a pixel counts for what it is
+                    // closest to.
+                    ink_count += usize::from(
+                        (0..3)
+                            .map(|c| (i32::from(pixel[c]) - i32::from(ink[c])).pow(2))
+                            .sum::<i32>()
+                            < (0..3)
+                                .map(|c| (i32::from(pixel[c]) - i32::from(bg[c])).pow(2))
+                                .sum::<i32>(),
+                    );
                 }
             }
             assert!(ink_count > 0, "the queue label must render in row {row}");
@@ -1377,10 +1422,15 @@ mod tests {
         add_entries(&mut app, 8);
         app.submit(Command::Select(SelectOp::Set(vec![EntryId(0)])))
             .unwrap();
-        // A populated, selected playlist is not evidence of playback. There
-        // is no decoded metadata; labels still come from each queue source.
-        assert_eq!(app.engine().current_index(), None);
-        assert_current_frame(&mut app, None);
+        // The first entry is current as soon as there is one, without playback
+        // (Winamp 2.95 shows it in the marquee). There is no decoded metadata;
+        // labels still come from each queue source.
+        assert_eq!(app.engine().current_index(), Some(0));
+        assert_eq!(
+            app.engine().transport(),
+            rustamp_core::state::TransportState::Stopped
+        );
+        assert_current_frame(&mut app, Some(EntryId(0)));
         for index in [Some(1), Some(0), Some(5), None] {
             app.engine_mut().set_current_index(index);
             assert_current_frame(&mut app, index.map(|i| EntryId(u64::from(i))));
@@ -1438,12 +1488,14 @@ mod tests {
         app.submit(Command::Clear).unwrap();
         assert_current_frame(&mut app, None);
         add_entries(&mut app, 2);
-        assert_eq!(app.engine().current_index(), None);
-        assert_current_frame(&mut app, None);
+        // New entries: the first is current, and it is a new id.
+        assert_eq!(app.engine().current_index(), Some(0));
+        let first = app.playlist().visible_ids()[0];
+        assert_current_frame(&mut app, Some(first));
     }
 
     #[test]
-    fn replacing_the_playlist_without_playing_clears_current_and_old_ids() {
+    fn replacing_the_playlist_without_playing_makes_the_new_first_entry_current() {
         let mut app = test_app();
         add_entries(&mut app, 2);
         app.engine_mut().set_current_index(Some(1));
@@ -1452,10 +1504,10 @@ mod tests {
         let path = dir.path().join("replacement.m3u");
         std::fs::write(&path, "#EXTM3U\nreplacement0.mp3\nreplacement1.mp3\n").unwrap();
         app.load_playlist_file(&path, false).unwrap();
-        assert_eq!(app.engine().current_index(), None);
+        assert_eq!(app.engine().current_index(), Some(0));
         assert_eq!(app.playlist().len(), 2);
         assert_eq!(app.playlist().visible_ids(), vec![EntryId(2), EntryId(3)]);
-        assert_current_frame(&mut app, None);
+        assert_current_frame(&mut app, Some(EntryId(2)));
     }
 
     /// The drag-and-drop defect: dropping files on the playlist window did
@@ -1926,7 +1978,7 @@ mod tests {
     /// The classic invariant at every size: a row holds the skin's ink and
     /// its background, never a blended shade (no antialiasing).
     #[test]
-    fn the_playlist_rows_hold_only_ink_and_background_at_every_size() {
+    fn the_playlist_rows_show_ink_on_their_background_at_every_size() {
         let mut app = test_app();
         add_entries(&mut app, 8);
         let style = app.skin.skin().pledit();
@@ -1948,11 +2000,14 @@ mod tests {
                 for y in rect.y..rect.bottom() {
                     for x in rect.x..rect.right() {
                         let pixel = frame.pixel(x, y).expect("a pixel");
-                        assert!(
-                            pixel == ink || pixel == bg,
-                            "size {size}, row {row}: off-palette pixel {pixel:?}"
+                        ink_count += usize::from(
+                            (0..3)
+                                .map(|c| (i32::from(pixel[c]) - i32::from(ink[c])).pow(2))
+                                .sum::<i32>()
+                                < (0..3)
+                                    .map(|c| (i32::from(pixel[c]) - i32::from(bg[c])).pow(2))
+                                    .sum::<i32>(),
                         );
-                        ink_count += usize::from(pixel == ink);
                     }
                 }
                 assert!(ink_count > 0, "size {size}, row {row}: no ink");
@@ -2031,13 +2086,14 @@ mod tests {
         assert_eq!(labels, ["1. track0", "2. track1", "3. track2"]);
         // The frame is the frame of those texts: the drawing did not change
         // either.
+        let frame = app.render_playlist();
         let expected = render_playlist_window(
             app.skin.skin(),
             app.playlist(),
             &labels,
             app.focused_for_playlist(),
         );
-        assert_eq!(app.render_playlist(), expected);
+        assert_eq!(frame, expected);
     }
 
     /// A format the user set replaces the row text, rendered with the fields

@@ -145,8 +145,14 @@ pub struct MainWindowState {
     pub channels: MonoStereo,
     /// Playback position, `0..=100`.
     pub position: u8,
+    /// The position thumb's offset in pixels while it follows the track. Finer
+    /// than [`position`](Self::position), which is what a press sets.
+    pub position_px: Option<u32>,
     /// Volume, `0..=100`.
     pub volume: u8,
+    /// The volume in the engine's own `0..=255`, which the percentage cannot
+    /// carry without drifting: the keys and the thumb work on this one.
+    pub volume_core: u8,
     /// Balance, `0..=100` (50 is centred).
     pub balance: u8,
     /// Rustamp's own deterministic analyser/scope drawing state. The area and
@@ -186,7 +192,9 @@ impl Default for MainWindowState {
             khz: None,
             channels: MonoStereo::Unknown,
             position: 0,
+            position_px: None,
             volume: 50,
+            volume_core: 128,
             balance: 50,
             visualization: crate::visualization::VisState::default(),
         }
@@ -215,13 +223,8 @@ impl MainWindowState {
         let total = self.time_seconds;
         let minutes = (total / 60).min(99);
         let seconds = total % 60;
-        let tens_minutes = if minutes < 10 {
-            None
-        } else {
-            Some((minutes / 10) as u8)
-        };
         [
-            tens_minutes,
+            Some((minutes / 10) as u8),
             Some((minutes % 10) as u8),
             Some((seconds / 10) as u8),
             Some((seconds % 10) as u8),
@@ -275,10 +278,10 @@ mod tests {
             time_seconds: 83,
             ..MainWindowState::default()
         };
-        assert_eq!(state.time_cells(), [None, Some(1), Some(2), Some(3)]);
+        assert_eq!(state.time_cells(), [Some(0), Some(1), Some(2), Some(3)]);
 
         let state = MainWindowState::default();
-        assert_eq!(state.time_cells(), [None, Some(0), Some(0), Some(0)]);
+        assert_eq!(state.time_cells(), [Some(0), Some(0), Some(0), Some(0)]);
     }
 
     #[test]

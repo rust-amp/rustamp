@@ -235,6 +235,7 @@ struct Fonts {
 /// Korean (own choice; S17 §5 says nothing about missing characters). Windows
 /// has the first groups, and the last names are what other systems carry.
 const FALLBACK_FAMILIES: &[&str] = &[
+    DEFAULT_FAMILY,
     "Segoe UI",
     "Arial Unicode MS",
     "Yu Gothic",
@@ -419,12 +420,27 @@ pub(crate) fn text_width(request: SystemFont<'_>, text: &str) -> Option<u32> {
     text_width_as_part_of(request, text, text)
 }
 
+/// The request as GDI takes it.
+fn gdi_font(request: SystemFont<'_>) -> rustamp_platform::gdi_text::GdiFont<'_> {
+    rustamp_platform::gdi_text::GdiFont {
+        family: request.family,
+        size: request.size,
+        bold: request.bold,
+        italic: request.italic,
+    }
+}
+
 /// [`text_width`] for a part of `whole`, in the font `whole` is drawn in.
 pub(crate) fn text_width_as_part_of(
     request: SystemFont<'_>,
     whole: &str,
     text: &str,
 ) -> Option<u32> {
+    if let Some(width) =
+        rustamp_platform::gdi_text::text_width(gdi_font(request), FALLBACK_FAMILIES, whole, text)
+    {
+        return Some(width);
+    }
     let (chosen, _) = face_for_text(&font(request)?, whole);
     let scale = PxScale::from(request.size as f32);
     let mut x = 0.0;
@@ -446,8 +462,8 @@ pub(crate) fn text_width_as_part_of(
 }
 
 /// Render using the requested installed family, falling back to Arial/sans.
-/// Quantize coverage to a 1-bit mask before compositing: playlist rows must
-/// contain only the skin's foreground and background, never blended shades.
+/// `background` is the colour under the text, which GDI blends the glyphs'
+/// edges against. Without GDI, coverage is quantized to a 1-bit mask.
 /// The size is the skin's when its `Font=` line names one and the measured
 /// 13 px row pitch otherwise; the baseline is our choice within that pitch.
 /// This is not a claim of GDI-identical hinting or kerning.
@@ -457,8 +473,9 @@ pub(crate) fn render(
     width: u32,
     height: u32,
     colour: [u8; 3],
+    background: [u8; 3],
 ) -> Option<Image> {
-    render_as_part_of(request, text, text, width, height, colour)
+    render_as_part_of(request, text, text, width, height, colour, background)
 }
 
 /// [`render`] for a part of `whole`, in the font `whole` is drawn in, so the
@@ -470,7 +487,22 @@ pub(crate) fn render_as_part_of(
     width: u32,
     height: u32,
     colour: [u8; 3],
+    background: [u8; 3],
 ) -> Option<Image> {
+    // GDI where there is one (see `rustamp_platform::gdi_text`), the outlines
+    // of the installed fonts elsewhere.
+    if let Some(rgba) = rustamp_platform::gdi_text::render_text(
+        gdi_font(request),
+        FALLBACK_FAMILIES,
+        whole,
+        text,
+        width,
+        height,
+        colour,
+        background,
+    ) {
+        return Image::from_rgba(width, height, rgba).ok();
+    }
     let primary = font(request)?;
     let (chosen, fallback) = face_for_text(&primary, whole);
     let scale = PxScale::from(request.size as f32);
@@ -561,6 +593,7 @@ mod tests {
                 40,
                 16,
                 [255; 3],
+                [0; 3],
             )
             .unwrap()
         };
@@ -576,7 +609,15 @@ mod tests {
         // Arial has no kana. Without the fallback the row shows its empty box
         // or nothing; the fallback draws the character with real strokes.
         let ink = |text: &str| {
-            let image = render(request("Arial", 13, false, false), text, 40, 16, [255; 3]).unwrap();
+            let image = render(
+                request("Arial", 13, false, false),
+                text,
+                40,
+                16,
+                [255; 3],
+                [0; 3],
+            )
+            .unwrap();
             image.as_rgba().chunks(4).filter(|p| p[3] != 0).count()
         };
         let notdef = ink("\u{10FFFF}");
@@ -593,7 +634,15 @@ mod tests {
     #[test]
     fn a_dot_and_a_colon_never_vanish_from_a_row() {
         let ink = |text: &str| {
-            let image = render(request("Arial", 13, false, false), text, 40, 16, [255; 3]).unwrap();
+            let image = render(
+                request("Arial", 13, false, false),
+                text,
+                40,
+                16,
+                [255; 3],
+                [0; 3],
+            )
+            .unwrap();
             image.as_rgba().chunks(4).filter(|p| p[3] != 0).count()
         };
         assert!(ink(".") > 0);
@@ -602,7 +651,6 @@ mod tests {
 
     #[test]
     fn system_font_pixels_are_exact_ink_or_transparent() {
-        let ink = [INK[0], INK[1], INK[2], 255];
         for family in ["Arial", "Courier New", "Rustamp missing family fallback"] {
             for (size, bold, italic) in [
                 (13, false, false),
@@ -617,18 +665,26 @@ mod tests {
                         120,
                         size * 2,
                         INK,
+                        [0; 3],
                     )
                     .expect("Windows has an installed Arial fallback");
+                    // GDI smooths with the user's own setting, so the ink has
+                    // shades; a pixel is the text or it is transparent.
                     assert!(
                         image
                             .as_rgba()
                             .as_chunks::<4>()
                             .0
                             .iter()
-                            .all(|p| *p == ink || *p == [0; 4])
+                            .all(|p| p[3] == 255 || *p == [0, 0, 0, 0])
                     );
                     assert_eq!(
-                        image.as_rgba().as_chunks::<4>().0.contains(&ink),
+                        image
+                            .as_rgba()
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .any(|p| p[3] == 255),
                         !text.is_empty()
                     );
                 }
@@ -646,6 +702,7 @@ mod tests {
             120,
             26,
             INK,
+            [0; 3],
         )
         .expect("the host has a font at all");
         let fallback = render(
@@ -654,6 +711,7 @@ mod tests {
             120,
             26,
             INK,
+            [0; 3],
         )
         .expect("the host has a font at all");
         assert_eq!(unknown, fallback);
@@ -663,10 +721,24 @@ mod tests {
     /// write `Font=arial`.
     #[test]
     fn a_family_is_matched_without_regard_to_case() {
-        let lower = render(request("arial", 13, false, false), "Case", 120, 26, INK)
-            .expect("the host has a font at all");
-        let exact = render(request("Arial", 13, false, false), "Case", 120, 26, INK)
-            .expect("the host has a font at all");
+        let lower = render(
+            request("arial", 13, false, false),
+            "Case",
+            120,
+            26,
+            INK,
+            [0; 3],
+        )
+        .expect("the host has a font at all");
+        let exact = render(
+            request("Arial", 13, false, false),
+            "Case",
+            120,
+            26,
+            INK,
+            [0; 3],
+        )
+        .expect("the host has a font at all");
         assert_eq!(lower, exact);
     }
 
@@ -704,6 +776,7 @@ mod tests {
             120,
             26,
             INK,
+            [0; 3],
         )
         .expect("the host has a font at all");
         let heavy = render(
@@ -712,6 +785,7 @@ mod tests {
             120,
             26,
             INK,
+            [0; 3],
         )
         .expect("the host has a font at all");
         assert_ne!(plain, heavy, "the bold face must draw different glyphs");

@@ -689,8 +689,9 @@ fn draw_text(frame: &mut Image, text: &str, band: Rect, colour: [u8; 3]) {
     if text.is_empty() || band.is_empty() {
         return;
     }
+    let under = crate::render::under_text(frame, band.x, band.y);
     let Some(scratch) =
-        crate::playlist_font::render(LIBRARY_FONT, text, band.width, band.height, colour)
+        crate::playlist_font::render(LIBRARY_FONT, text, band.width, band.height, colour, under)
     else {
         return;
     };

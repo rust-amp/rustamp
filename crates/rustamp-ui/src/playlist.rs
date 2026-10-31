@@ -1041,6 +1041,10 @@ pub fn range_ids(entries: &[EntryId], anchor: usize, target: usize) -> Vec<Entry
 /// ([`PlaylistWindow::visible_rows`]), starting at the scroll offset.
 #[derive(Debug, Clone, Default)]
 pub struct PlaylistWindow {
+    /// The info field: the length of the selection and of the list.
+    pub info_text: String,
+    /// The time field's four digits while a track is open.
+    pub time_digits: Option<[u8; 4]>,
     /// Render the skin's 275x14 playlist windowshade band (S01 §1/§4).
     pub windowshade: bool,
     /// Held title button, overlaid from pledit.bmp; bottom buttons have no
@@ -1161,7 +1165,8 @@ impl PlaylistWindow {
         if !self.contains_list_point(x, y) {
             return None;
         }
-        let row = ((y - 23) / self.row_pitch()) as usize;
+        // The rows' pitch starts one pixel above the band (see `row_rect`).
+        let row = ((y - 22) / self.row_pitch()) as usize;
         (row < self.visible_rows()).then_some(row)
     }
 

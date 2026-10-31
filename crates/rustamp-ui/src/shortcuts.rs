@@ -29,7 +29,7 @@ use rustamp_core::state::WindowId;
 // (RFC 0008).
 use rustamp_core::command::{JumpTarget, OpenMediaKind, PrefsPage};
 
-use crate::behaviour::{MainWindow, core_volume};
+use crate::behaviour::MainWindow;
 
 /// The seek step of the `Left`/`Right`/`Num7`/`Num9` keys in milliseconds
 /// (S03 §1: "Rewind 5 seconds" / "Forward 5 seconds").
@@ -1076,7 +1076,7 @@ impl MainWindow {
     /// `SetVolume` one [`VOLUME_STEP`] above or below the current volume,
     /// clamped to `0..=255`.
     fn volume_command(&self, up: bool) -> Command {
-        let current = core_volume(self.state().volume);
+        let current = self.state().volume_core;
         let next = if up {
             current.saturating_add(VOLUME_STEP)
         } else {
@@ -1089,6 +1089,7 @@ impl MainWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::behaviour::core_volume;
     use rustamp_core::state::TransportState;
 
     const M: ShortcutWindow = ShortcutWindow::Main;
@@ -1788,6 +1789,7 @@ mod tests {
     fn machine_with_volume(percent: u8) -> MainWindow {
         MainWindow::from_state(crate::state::MainWindowState {
             volume: percent,
+            volume_core: core_volume(percent),
             ..Default::default()
         })
     }
@@ -1832,10 +1834,10 @@ mod tests {
             cmds(&mut bottom, Key::Down, Modifiers::NONE),
             vec![Command::SetVolume(0)]
         );
-        // 99% is core volume 252: +4 would be 256, so the press lands on 255
-        // (a partial step of 3).
+        // 99% is core volume 253: +4 would be 257, so the press lands on 255
+        // (a partial step of 2).
         let mut near_top = machine_with_volume(99);
-        assert_eq!(core_volume(99), 252);
+        assert_eq!(core_volume(99), 253);
         assert_eq!(
             cmds(&mut near_top, Key::Up, Modifiers::NONE),
             vec![Command::SetVolume(255)]
@@ -1850,12 +1852,8 @@ mod tests {
     }
 
     #[test]
-    fn repeated_presses_drift_because_the_machine_holds_a_percentage() {
-        // Exposed by the RFC 0005 §8 measurement, not fixed here: the machine's
-        // volume is the S02 display percentage, so `core_volume` re-quantises
-        // between presses and the emitted deltas are 4, 5, 5, 3 ... instead of
-        // exactly 4 each. Each press still applies the step to the core value it
-        // reads; the state it reads is rounded. Reported as an open point.
+    fn repeated_presses_step_by_exactly_four() {
+        // Measured against Winamp 2.95: ten presses take 200 to 160.
         let mut m = machine_with_volume(0);
         let emitted: Vec<Command> = (0..4)
             .map(|_| cmds(&mut m, Key::Up, Modifiers::NONE))
@@ -1865,9 +1863,9 @@ mod tests {
             emitted,
             vec![
                 Command::SetVolume(4),
-                Command::SetVolume(9),
-                Command::SetVolume(14),
-                Command::SetVolume(17),
+                Command::SetVolume(8),
+                Command::SetVolume(12),
+                Command::SetVolume(16),
             ]
         );
     }

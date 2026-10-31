@@ -35,6 +35,7 @@ pub mod displays;
 pub mod dpi;
 pub mod extract_dialog;
 pub mod file_dialog;
+pub mod gdi_text;
 pub mod hotkeys;
 pub mod popup_menu;
 pub mod prefs_dialog;

@@ -143,7 +143,10 @@ fn s06_section_2_the_list_band_is_the_settled_rect_and_the_page_is_four_rows() {
     assert_eq!(visible_rows(ROW_PITCH), 4);
     assert_eq!(VISIBLE_ROWS, 4);
     // The four row bands of the page, top to bottom.
-    for (row, top) in [(0, 23), (1, 36), (2, 49), (3, 62)] {
+    // Winamp 2.95 selects y 23..=34, 35..=47, 48..=60 (measured 2026-10-31): the
+    // band cuts the first row.
+    assert_eq!(row_rect(0, ROW_PITCH), Some(Rect::new(12, 23, 242, 12)));
+    for (row, top) in [(1, 35), (2, 48), (3, 61)] {
         assert_eq!(row_rect(row, ROW_PITCH), Some(Rect::new(12, top, 242, 13)));
     }
     // The fifth row is not on the page: below the fourth row is background.

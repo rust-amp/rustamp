@@ -947,6 +947,8 @@ impl Windowed {
                     return;
                 }
             };
+            // The window opens without the focus, and only a change is reported.
+            self.app.set_eq_focused(window.has_focus());
             self.eq_id = Some(window.id());
             let context = match softbuffer::Context::new(Arc::clone(&window)) {
                 Ok(context) => context,

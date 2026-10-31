@@ -1988,7 +1988,19 @@ impl App {
         };
         let before = known(&self.playlist_tags);
         self.playlist_tags.poll();
-        known(&self.playlist_tags) != before
+        let changed = known(&self.playlist_tags) != before;
+        if changed && self.engine.transport() == TransportState::Stopped {
+            // The stopped player's marquee shows the length as soon as it is
+            // known.
+            let index = self.engine.current_index();
+            self.handle_event(&Event::TrackChanged {
+                id: None,
+                index,
+                metadata: None,
+                duration_ms: None,
+            });
+        }
+        changed
     }
 
     /// Applies `command` to the classic window `window`.
@@ -2365,11 +2377,14 @@ impl App {
                 known.duration_ms = known.duration_ms.or(*duration_ms);
                 self.playlist_tags.remember(id, known);
             }
+            let known_length = id
+                .and_then(|id| self.playlist_tags.metadata(id))
+                .and_then(|tags| tags.duration_ms);
             let normalised = Event::TrackChanged {
                 id,
                 index: *index,
                 metadata: self.metadata_with_name(*index, metadata.as_deref()),
-                duration_ms: *duration_ms,
+                duration_ms: duration_ms.or(known_length),
             };
             self.ui.handle_event(&normalised, self.now_ms());
             return;
@@ -4030,6 +4045,9 @@ impl App {
         self.clear_entries();
         self.engine.set_queue(queue);
         self.sync_entry_ids();
+        if !play {
+            self.engine.select_first_if_none();
+        }
 
         if play && !report.entries.is_empty() {
             let _ = self.ensure_engine_ready();
@@ -4205,6 +4223,9 @@ impl App {
         }
         self.engine.set_queue(queue);
         self.sync_entry_ids();
+        if !play {
+            self.engine.select_first_if_none();
+        }
         if let Some(at) = at
             && at < first_new
         {
@@ -5198,7 +5219,7 @@ mod tests {
         assert_eq!(state.kbps, Some(192));
         assert_eq!(state.khz, Some(44));
         assert_eq!(state.title, "1. Hello (3:20)");
-        assert_eq!(state.time_cells(), [None, Some(1), Some(2), Some(3)]);
+        assert_eq!(state.time_cells(), [Some(0), Some(1), Some(2), Some(3)]);
     }
 
     #[test]

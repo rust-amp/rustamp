@@ -342,6 +342,8 @@ impl Default for EngineConfig {
 #[derive(Debug, Clone, Copy)]
 struct PendingSeek {
     seq: u32,
+    /// Where the seek goes, in milliseconds inside the track.
+    target_ms: u64,
 }
 
 /// A run that started with a previous run's audio still in the ring, waiting
@@ -829,6 +831,13 @@ impl Engine {
 
     /// Position inside the current track, in milliseconds.
     pub fn position_ms(&self) -> u64 {
+        // A seek while paused only reaches the clock on the resume, but it has
+        // happened for whoever looks: Winamp 2.95 shows it at once.
+        if self.transport == TransportState::Paused
+            && let Some(pending) = self.pending_seek
+        {
+            return pending.target_ms;
+        }
         if self.device.sample_rate == 0 {
             return 0;
         }
@@ -1264,10 +1273,15 @@ impl Engine {
             Command::Prev => self.prev_track(),
             Command::Seek { to_ms } => self.seek_ms(*to_ms),
             Command::SeekRelative { delta_ms } => {
+                // A seek that still waits for the device (a paused one) is
+                // where the next step starts: the clock has not moved yet.
+                let base = self
+                    .pending_seek
+                    .map_or_else(|| self.position_ms(), |pending| pending.target_ms);
                 let target = if *delta_ms < 0 {
-                    self.position_ms().saturating_sub(delta_ms.unsigned_abs())
+                    base.saturating_sub(delta_ms.unsigned_abs())
                 } else {
-                    self.position_ms().saturating_add(*delta_ms as u64)
+                    base.saturating_add(*delta_ms as u64)
                 };
                 self.seek_ms(target)
             }
@@ -1532,6 +1546,18 @@ impl Engine {
         Ok(())
     }
 
+    /// Makes the first entry current when a stopped player has none, so the
+    /// marquee shows it (measured against Winamp 2.95, 2026-10-31).
+    pub fn select_first_if_none(&mut self) {
+        if self.transport == TransportState::Stopped
+            && self.current.is_none()
+            && !self.queue.is_empty()
+        {
+            self.order().set_current_index(Some(0));
+            self.move_while_stopped(0);
+        }
+    }
+
     /// Make `target` the current entry of a stopped player and say so.
     fn move_while_stopped(&mut self, target: u32) {
         self.current = Some(target);
@@ -1658,7 +1684,12 @@ impl Engine {
             return Ok(());
         }
         let to = self.device.duration_of(frames);
-        self.pending_seek = Some(PendingSeek { seq });
+        let target_ms = if self.device.sample_rate == 0 {
+            0
+        } else {
+            frames.saturating_mul(1000) / u64::from(self.device.sample_rate)
+        };
+        self.pending_seek = Some(PendingSeek { seq, target_ms });
         self.send(DecodeMsg::Seek {
             to,
             track_frames: frames,
@@ -2278,7 +2309,10 @@ impl Engine {
         // that. A speculative entry for the track the run starts on would
         // duplicate it and shift every count by one.
         self.track_starts.clear();
-        self.pending_seek = start_at.map(|(_, seq)| PendingSeek { seq });
+        self.pending_seek = start_at.map(|(frames, seq)| PendingSeek {
+            seq,
+            target_ms: frames.saturating_mul(1000) / u64::from(self.device.sample_rate.max(1)),
+        });
         self.sync.set_written(0);
         // Reset the consumer-side counter alongside written so the invariant
         // consumed <= written holds for the new run. The render callback will
