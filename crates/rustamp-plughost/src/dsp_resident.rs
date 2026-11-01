@@ -385,6 +385,10 @@ mod imp {
     /// The most the plug-in takes at once (S09 section 4.1).
     const OUTPUT_WRITE_BYTES: usize = 8192;
 
+    /// How long one block may wait for the plug-in to take any of it before the
+    /// write is given up as failed. Longer than any buffer the host asks for.
+    const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
     impl OutputChain {
         fn open(&mut self) -> Result<()> {
             // SAFETY: a live module; the callbacks run on this thread.
@@ -514,13 +518,37 @@ mod imp {
                 self.bytes.extend_from_slice(&value.to_le_bytes());
             }
             let frame = usize::from(self.spec.channels) * 2;
-            for chunk in self.bytes.chunks_mut(OUTPUT_WRITE_BYTES / frame * frame) {
+            // The plug-in says how many bytes it takes *right now*; that is what
+            // it gets, in whole frames. Asking for a fixed 8192 first and waiting
+            // until they fit is how a plug-in with a smaller buffer or a coarser
+            // free-space answer stalls the whole audio path: `out_wave` stopped
+            // after about a second and `out_disk` never took a block at all
+            // ("resident DSP read timed out").
+            let started = std::time::Instant::now();
+            let mut written = 0usize;
+            while written < self.bytes.len() {
                 // SAFETY: the plug-in's own callback.
-                while (unsafe { can_write() } as usize) < chunk.len() {
-                    std::thread::sleep(Duration::from_millis(5));
+                let free = unsafe { can_write() } as usize;
+                if free == 0 {
+                    if started.elapsed() >= WRITE_WAIT {
+                        return Err(MediaHostError::OperationFailed(format!(
+                            "the output plug-in takes no audio for {} ms",
+                            WRITE_WAIT.as_millis()
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
                 }
-                // SAFETY: `chunk` is readable for its length for this call.
-                unsafe { write(chunk.as_mut_ptr().cast(), chunk.len() as i32) };
+                let take =
+                    free.min(self.bytes.len() - written).min(OUTPUT_WRITE_BYTES) / frame * frame;
+                if take == 0 {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                // SAFETY: `take` bytes from `written` on are readable for this
+                // call, and the ABI allows the plug-in to touch them.
+                unsafe { write(self.bytes.as_mut_ptr().add(written).cast(), take as i32) };
+                written += take;
             }
             Ok(())
         }
