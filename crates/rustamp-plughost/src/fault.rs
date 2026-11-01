@@ -124,6 +124,10 @@ pub struct FaultScope {
     call: &'static str,
 }
 
+/// A trace line has been written: the fault filter, which must not touch the
+/// heap of a process that may have faulted inside it, adds to the trace only then.
+static TRACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Appends one line to the file named by `RUSTAMP_HOST_TRACE`, if that
 /// variable is set; does nothing otherwise.
 ///
@@ -135,6 +139,7 @@ pub fn trace_event(line: &str) {
     let Some(path) = std::env::var_os("RUSTAMP_HOST_TRACE") else {
         return;
     };
+    TRACING.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -376,7 +381,9 @@ mod windows_filter {
         write_stderr(&buffer[..len]);
         // A helper's standard error goes nowhere, and a trace that was asked
         // for must not end in a silent `->` line.
-        if let Ok(line) = std::str::from_utf8(&buffer[..len]) {
+        if super::TRACING.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(line) = std::str::from_utf8(&buffer[..len])
+        {
             super::trace_event(line.trim_end());
         }
         // The supervisor reads this exit code and knows that the host caught a

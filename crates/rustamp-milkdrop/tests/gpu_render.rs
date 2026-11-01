@@ -219,7 +219,13 @@ fn a_presets_own_hlsl_shaders_are_not_replaced() {
     });
     assert_eq!(wait_running(&session), "own-hlsl");
     let mut n = 0;
-    let frame = play(&session, 1.5, &mut n, 0.8);
+    // How fast the picture builds up depends on the load of a software adapter,
+    // so the preset gets time; one that draws nothing still fails.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut frame = play(&session, 1.5, &mut n, 0.8);
+    while lit_pixels(&frame) <= 200 && Instant::now() < deadline {
+        frame = play(&session, 0.5, &mut n, 0.8);
+    }
     let notes = session.take_notes();
     println!("{notes:?}");
     let replaced: Vec<&String> = notes

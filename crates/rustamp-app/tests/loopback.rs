@@ -976,6 +976,26 @@ fn recorded_through(
     (mono, rate)
 }
 
+/// Runs a recording again when the capture of a loaded VM overran, which says
+/// nothing about what is measured. Any other failure stands.
+fn retrying_an_overrun<T>(mut recording: impl FnMut() -> T) -> T {
+    let mut attempts = 3;
+    loop {
+        attempts -= 1;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut recording)) {
+            Ok(result) => return result,
+            Err(panic) => {
+                let overrun = panic
+                    .downcast_ref::<String>()
+                    .is_some_and(|text| text.contains("the capture failed"));
+                if !overrun || attempts == 0 {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }
+    }
+}
+
 /// The amplitudes of the tone at `hz` in the windows that hold it.
 fn tone_levels(mono: &[f32], rate: u32, hz: f64) -> Vec<f64> {
     let window = (f64::from(rate) * EQ_WINDOW_SECONDS).round() as usize;
@@ -1378,14 +1398,17 @@ fn the_cable_carries_what_the_winamp5_input_plugins_decode() {
         ("in_vorbis.dll", vorbis.as_path(), TONE_HZ, FIXTURE_SECONDS),
     ] {
         let dll = plugins.join("w566").join(dll);
-        let builtin = recorded(
-            track,
-            &[],
-            DspChain::default(),
-            rustamp_decoders::default_registry(),
-            seconds,
-        );
-        let through = recorded(track, &[], DspChain::default(), only(&dll), seconds);
+        let builtin = retrying_an_overrun(|| {
+            recorded(
+                track,
+                &[],
+                DspChain::default(),
+                rustamp_decoders::default_registry(),
+                seconds,
+            )
+        });
+        let through =
+            retrying_an_overrun(|| recorded(track, &[], DspChain::default(), only(&dll), seconds));
         let difference = decibels(
             level_of(&through.0, through.1, hz),
             level_of(&builtin.0, builtin.1, hz),
@@ -1500,30 +1523,22 @@ fn the_output_plugins_play_what_the_engine_renders() {
     let dll = plugins.join("w566").join("out_wave.dll");
     let plain = measured_level(&track, hz, &[]);
     let approvals = approved(dir.path(), &dll);
-    // The capture of a loaded VM can overrun, which says nothing about the
-    // plug-in, so a failed recording gets two more attempts.
-    let attempt = || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recorded_through(
-                Box::new(PluginOutput::new(
-                    helper.clone(),
-                    &dll,
-                    &approvals,
-                    Default::default(),
-                )),
-                &track,
-                &[],
-                DspChain::default(),
-                rustamp_decoders::default_registry(),
-                // The plug-in's buffer delays the start of the tone.
-                EQ_TONE_SECONDS + 3.0,
-            )
-        }))
-    };
-    let (mono, rate) = attempt()
-        .or_else(|_| attempt())
-        .or_else(|_| attempt())
-        .expect("the recording through out_wave");
+    let (mono, rate) = retrying_an_overrun(|| {
+        recorded_through(
+            Box::new(PluginOutput::new(
+                helper.clone(),
+                &dll,
+                &approvals,
+                Default::default(),
+            )),
+            &track,
+            &[],
+            DspChain::default(),
+            rustamp_decoders::default_registry(),
+            // The plug-in's buffer delays the start of the tone.
+            EQ_TONE_SECONDS + 3.0,
+        )
+    });
     // The whole tone, not only enough of it for a level: a clock that counts
     // blocks handed over ends the track while the plug-in holds its end.
     let held = windows_holding(&mono, rate, hz);
@@ -1872,7 +1887,17 @@ fn a_pause_reaches_out_wave() {
     // leaves a silence the cable can see.
     pump_engine(&mut engine, 4.0, false);
     engine.play().expect("resuming the cable output");
+    measurement(&format!(
+        "out_wave after the resume: {:?}, last error {:?}",
+        engine.transport(),
+        engine.last_error()
+    ));
     pump_engine(&mut engine, 8.0, true);
+    measurement(&format!(
+        "out_wave after the pump: {:?}, last error {:?}",
+        engine.transport(),
+        engine.last_error()
+    ));
     assert_eq!(
         engine.transport(),
         TransportState::Stopped,
@@ -1907,6 +1932,11 @@ fn a_pause_reaches_out_wave() {
             ratio >= MIN_TONE_RATIO && amplitude > 0.001
         })
         .collect();
+    let pattern: String = tonal
+        .iter()
+        .map(|tonal| if *tonal { '#' } else { '.' })
+        .collect();
+    measurement(&format!("out_wave with a pause: {pattern}"));
     let first = tonal
         .iter()
         .position(|tonal| *tonal)

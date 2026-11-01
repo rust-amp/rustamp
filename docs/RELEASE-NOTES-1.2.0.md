@@ -1,8 +1,8 @@
 # Rustamp 1.2.0
 
 Rustamp is a Windows music player with a classic skin interface. This release
-turns the classic plug-in support into something you can rely on, adds a
-MilkDrop window of our own, and ships an installer next to the portable zip.
+turns the classic plug-in support into something you can rely on, runs MilkDrop
+2.25c through it, and ships an installer next to the portable zip.
 
 ## Classic plug-ins
 
@@ -12,11 +12,9 @@ MilkDrop window of our own, and ships an installer next to the portable zip.
   - The audio helpers are told which track plays, and a pause reaches the output
     plug-in, not only the engine.
   - An output plug-in's own clock reports how much of a track it has played, so
-    the end of a track is not cut off when the plug-in still holds audio.
-    **Known limitation, measured in the test VM:** three cases still fail - with
-    out_wave and out_disk the engine does not reach the end of the track, and
-    only part of the tone arrives (loopback: 9 of 12 cases pass; the three
-    end-of-track cases fail, see docs/HANDOFF.md).
+    the end of a track is not cut off when the plug-in still holds audio. In the
+    test VM `out_wave` plays a whole tone to the virtual cable, a four-second
+    pause is four seconds of silence, and the tone comes back after it.
   - A DSP plug-in's configuration dialog opens in the instance that actually
     processes the audio, and a DSP library's second and later modules can be
     chosen and are kept in the configuration.
@@ -73,19 +71,20 @@ says it is unsigned.
   their keys in the cases the manual GUI pass found.
 - Text and goldens draw a bundled public-domain face instead of an installed
   font, so the rendering tests do not depend on the machine.
+- After a seek forward, a track ends where it ends instead of playing silence for
+  as long as the seek skipped, and after a seek back its end is no longer cut off.
+- A plug-in's own path has no `\\?\` prefix and arrives in the system's code page,
+  so a plug-in in a folder with non-ASCII letters still finds its data.
 
 ## Known limitations
 
-- **Output plug-ins do not reach the end of a track yet.** With `out_wave` and
-  `out_disk` the engine stays in `Playing` and part of the tone never arrives
-  (three of the twelve `loopback` cases; the rest pass). The player's own
-  output, every input plug-in, the DSP path, AVS and MilkDrop 2 are unaffected.
 - The player's own MilkDrop window is built but not part of this release (see
   above and `docs/HANDOFF.md`).
 - The binaries are unsigned; Windows SmartScreen may warn on first start.
 - There is no auto-update.
 - Real-hardware audio and GPU rendering are not verified; the acceptance runs
   use the test VM's virtual cable and software adapters.
-- <!-- VM: remaining measured differences, filled in after the acceptance run -->
+- The installer ran silently in the test VM (install, a start of the installed
+  player, uninstall); its wizard pages have not been walked through by hand.
 
 

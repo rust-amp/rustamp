@@ -258,6 +258,8 @@ mod imp {
                     file: None,
                     paused: false,
                     clock: PlayedClock::default(),
+                    blocks: 0,
+                    last_silent: None,
                 }));
             }
             Ok(Box::new(ClassicChain {
@@ -357,6 +359,9 @@ mod imp {
         file: Option<String>,
         paused: bool,
         clock: PlayedClock,
+        /// Blocks seen, and whether the last one was silent: for the trace.
+        blocks: u64,
+        last_silent: Option<bool>,
     }
     // SAFETY: the module lives in the plug-in's static data, and only this
     // thread drives its audio calls, as the decode thread of an input plug-in
@@ -471,21 +476,30 @@ mod imp {
             }
         }
 
-        /// Drops what the plug-in still holds, so a pause is heard at once.
-        /// The plug-in's own `pause` does not stop a buffer it already plays
-        /// (`out_wave` opens with two seconds), and a player that keeps sounding
-        /// after the pause is what a listener calls broken.
-        fn drop_buffered(&mut self) {
-            if !self.opened {
+        /// Says in the trace where sound and silence change in what the plug-in
+        /// is given, and how its clocks stand: a gap at the device is either in
+        /// these blocks or behind them.
+        fn trace_block(&mut self, buf: &[f32]) {
+            let silent = buf.iter().all(|sample| *sample == 0.0);
+            self.blocks += 1;
+            if self.last_silent == Some(silent) && !self.blocks.is_multiple_of(50) {
                 return;
             }
-            // SAFETY: a live module; the callback runs on the thread that writes.
-            if let Some(flush) = unsafe { (*self.module).flush } {
-                // SAFETY: the plug-in's own callback; 0 restarts its clock at
-                // the current position, which the host does not read for an
-                // output.
-                unsafe { flush(0) };
-            }
+            self.last_silent = Some(silent);
+            // SAFETY: a live module; the callbacks run on the thread that writes.
+            let module = unsafe { &*self.module };
+            // SAFETY: the plug-in's own callbacks.
+            let call = |callback: Option<unsafe extern "C" fn() -> i32>| {
+                callback.map(|callback| unsafe { callback() })
+            };
+            crate::fault::trace_event(&format!(
+                "output chain: block {} silent {silent}: can_write {:?} playing {:?} played {:?} written {:?}",
+                self.blocks,
+                call(module.can_write),
+                call(module.is_playing),
+                call(module.get_played_ms),
+                call(module.get_written_ms),
+            ));
         }
 
         /// A new file closes the plug-in for the old one. The main thread takes
@@ -519,6 +533,14 @@ mod imp {
 
         fn process(&mut self, buf: &mut [f32]) -> Result<()> {
             self.take_next_track();
+            // The player sends no block while it is paused, so a block is its
+            // resume. The note says the same on the control channel, but it can
+            // arrive after the block, and a paused plug-in takes nothing: waiting
+            // here for room would keep the note from being read at all.
+            if self.paused {
+                crate::fault::trace_event("output chain: a block ends the pause");
+                self.set_paused(false);
+            }
             if !self.opened {
                 self.open()?;
             }
@@ -529,6 +551,7 @@ mod imp {
                     "the output plug-in cannot write".to_owned(),
                 ));
             };
+            self.trace_block(buf);
             self.bytes.clear();
             for sample in buf.iter() {
                 let value = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
@@ -611,11 +634,7 @@ mod imp {
                         self.played_ms()
                     ));
                     self.set_paused(true);
-                    // A paused plug-in that keeps playing its buffer is heard as
-                    // a player that ignores the pause: `out_wave` opens with two
-                    // seconds and does exactly that. The pause therefore drops
-                    // what it holds, so the cable is silent from the command on.
-                    self.drop_buffered();
+                    crate::fault::trace_event("output chain: the plug-in is paused");
                     TransportState::Paused
                 }
                 Message::CommandToHost(Command::UnpausePlugin { .. }) => {
@@ -623,7 +642,10 @@ mod imp {
                         "output chain: unpause at played {:?}",
                         self.played_ms()
                     ));
-                    self.set_paused(false);
+                    // A block may have ended the pause already.
+                    if self.paused {
+                        self.set_paused(false);
+                    }
                     TransportState::Playing
                 }
                 _ => return,

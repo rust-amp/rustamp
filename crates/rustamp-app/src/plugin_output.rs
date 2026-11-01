@@ -124,6 +124,8 @@ pub struct PluginOutput {
     spec: Option<AudioSpec>,
     stage: Option<Box<dyn DspStage>>,
     link: Option<HelperLink>,
+    /// The generation of the track the helper was told about when it opened.
+    seen_track: u64,
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -153,6 +155,7 @@ impl PluginOutput {
             spec: None,
             stage: None,
             link: None,
+            seen_track: 0,
             shared: Arc::new(Shared::default()),
             thread: None,
         }
@@ -200,13 +203,14 @@ fn pump(
     spec: AudioSpec,
     shared: &Shared,
     link: &PumpLink<'_>,
+    mut seen_track: u64,
 ) {
     let channels = usize::from(spec.channels);
     let mut block = vec![0.0f32; BLOCK_FRAMES * channels];
     let mut started = Instant::now();
     let mut paced = 0u64;
     let mut paused = false;
-    let mut seen_track = 0;
+    let mut opened = false;
 
     // The plug-in may read the title when it is opened, with the first block.
     let wait_from = Instant::now();
@@ -232,6 +236,7 @@ fn pump(
         let wanted_pause = shared.paused.load(Ordering::Acquire);
         if wanted_pause != paused {
             paused = wanted_pause;
+            rustamp_audio::trace_end(&format!("output: paused {paused} goes to the helper"));
             // The helper's plug-in has one module, so the id means nothing here.
             link.send(Message::CommandToHost(if paused {
                 Command::PausePlugin { plugin_id: 0 }
@@ -260,12 +265,21 @@ fn pump(
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
+            rustamp_audio::trace_end(&format!("output: the block failed: {error}"));
             if let Ok(mut slot) = shared.error.lock() {
                 *slot = Some(error.to_string());
             }
             return;
         }
         paced += BLOCK_FRAMES as u64;
+        if !opened {
+            // The first block opens the plug-in, which takes as long as it takes.
+            // Real time starts here: catching that time up would pull blocks out
+            // of a ring the decoder has only begun to fill, and hand the plug-in
+            // silence in the middle of the track.
+            opened = true;
+            started = Instant::now();
+        }
         if let Ok(mut clock) = shared.clock.lock()
             && let Some(clock) = clock.as_mut()
         {
@@ -284,11 +298,10 @@ impl OutputDevice for PluginOutput {
         stage.prepare(spec)?;
         // A plug-in may name the file it writes after the track it plays and
         // asks the host for the title as it *opens* (`out_disk` does): the track
-        // therefore goes to the helper before the first block, not with it. The
-        // pump sends it again with the first block, which the chain treats as
-        // the same track and ignores.
-        let mut seen = 0;
-        if let Some(message) = self.now_playing.message_since(&mut seen) {
+        // therefore goes to the helper before the first block, not with it. A new
+        // helper knows no track yet, and the pump goes on from what it was told.
+        self.seen_track = 0;
+        if let Some(message) = self.now_playing.message_since(&mut self.seen_track) {
             link.send(message);
         }
         self.stage = Some(stage);
@@ -311,12 +324,13 @@ impl OutputDevice for PluginOutput {
         let shared = Arc::clone(&self.shared);
         let now_playing = Arc::clone(&self.now_playing);
         let link = self.link.clone();
+        let seen_track = self.seen_track;
         self.thread = Some(std::thread::spawn(move || {
             let link = PumpLink {
                 now_playing: &now_playing,
                 link: link.as_ref(),
             };
-            pump(stage, render, spec, &shared, &link);
+            pump(stage, render, spec, &shared, &link, seen_track);
         }));
         Ok(())
     }
@@ -462,6 +476,51 @@ mod tests {
         );
     }
 
+    /// Takes its time over the first block, as a plug-in does that opens with it.
+    struct SlowOpen {
+        frames: Arc<AtomicUsize>,
+        open: Duration,
+    }
+
+    impl DspStage for SlowOpen {
+        fn name(&self) -> &str {
+            "slow open"
+        }
+        fn prepare(&mut self, _spec: AudioSpec) -> Result<()> {
+            Ok(())
+        }
+        fn process(&mut self, buf: &mut [f32]) -> Result<()> {
+            if self.frames.fetch_add(buf.len() / 2, Ordering::SeqCst) == 0 {
+                std::thread::sleep(self.open);
+            }
+            Ok(())
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn the_time_a_plugin_takes_to_open_is_not_caught_up() {
+        let frames = Arc::new(AtomicUsize::new(0));
+        let mut device = device(Stage {
+            frames: Arc::default(),
+            resets: Arc::default(),
+            fail: false,
+        });
+        device.stage = Some(Box::new(SlowOpen {
+            frames: Arc::clone(&frames),
+            open: Duration::from_millis(600),
+        }));
+        device.start(Box::new(|buf| buf.fill(0.0))).unwrap();
+        assert!(wait(|| frames.load(Ordering::SeqCst) > 0));
+        std::thread::sleep(Duration::from_millis(650));
+        device.close().unwrap();
+        // 50 ms after the open, plus the lead and a block in the slowest case;
+        // catching up would have handed over 600 ms more.
+        let limit = (AHEAD + Duration::from_millis(250)).as_secs_f64() * 44_100.0;
+        let handed = frames.load(Ordering::SeqCst) as f64;
+        assert!(handed <= limit, "{handed} frames, limit {limit}");
+    }
+
     #[test]
     fn a_pause_stops_the_blocks_and_a_flush_reaches_the_plugin() {
         let frames = Arc::new(AtomicUsize::new(0));
@@ -525,6 +584,7 @@ mod tests {
                         now_playing: &now_playing,
                         link: Some(&link),
                     },
+                    0,
                 );
             })
         };

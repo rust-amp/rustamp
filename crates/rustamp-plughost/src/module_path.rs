@@ -26,7 +26,7 @@ static MAPPED: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 pub fn note(base: usize, path: &Path) {
     if let Ok(mut mapped) = MAPPED.lock() {
         mapped.retain(|(known, _)| *known != base);
-        mapped.push((base, path.to_path_buf()));
+        mapped.push((base, plain_path(path)));
     }
 }
 
@@ -65,11 +65,17 @@ fn write_wide(text: &[u16], buffer: &mut [u16]) -> Option<u32> {
     Some(text.len() as u32)
 }
 
-/// What the wide answer turned into a narrow one for the same path. The plug-in's
-/// paths are the ones the host was given, and the host's own names are ASCII, so
-/// a byte per character is the honest narrow form.
-fn narrow(text: &[u16]) -> Vec<u8> {
-    text.iter().map(|unit| *unit as u8).collect()
+/// The path as the system would name a loaded module: canonicalizing gave the host
+/// the extended-length form, which a plug-in's own string handling does not expect.
+fn plain_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{share}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn write_narrow(text: &[u8], buffer: &mut [u8]) -> Option<u32> {
@@ -115,8 +121,8 @@ fn answer_wide(path: &Path, buffer: &mut [u16]) -> Option<u32> {
 }
 
 fn answer_narrow(path: &Path, buffer: &mut [u8]) -> Option<u32> {
-    let text = narrow(&path.to_string_lossy().encode_utf16().collect::<Vec<u16>>());
-    write_narrow(&text, buffer)
+    let text = crate::input::ansi_text(&path.to_string_lossy());
+    write_narrow(text.strip_suffix(&[0]).unwrap_or(&text), buffer)
 }
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -225,6 +231,22 @@ mod tests {
         assert_eq!(path_for(0x2000_0000usize as *mut c_void), None);
         forget(base);
         assert_eq!(path_for(base as *mut c_void), None);
+    }
+
+    #[test]
+    fn a_plugin_hears_its_path_without_the_extended_prefix() {
+        assert_eq!(
+            plain_path(Path::new(r"\\?\C:\plugins\vis_chavs.dll")),
+            PathBuf::from(r"C:\plugins\vis_chavs.dll")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\server\share\vis.dll")),
+            PathBuf::from(r"\\server\share\vis.dll")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"C:\plugins\vis.dll")),
+            PathBuf::from(r"C:\plugins\vis.dll")
+        );
     }
 
     #[test]

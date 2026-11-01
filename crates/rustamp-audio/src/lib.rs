@@ -56,7 +56,7 @@
 /// pause at the boundary, a queue that goes on), and a run that never ends has
 /// to be readable from the outside: this is what the cable tests switch on to
 /// say which path a track took.
-pub(crate) fn trace_end(line: &str) {
+pub fn trace_end(line: &str) {
     if std::env::var_os("RUSTAMP_DECODE_TRACE").is_some() {
         eprintln!("rustamp-audio: {line}");
     }

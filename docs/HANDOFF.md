@@ -49,6 +49,42 @@
 > VM tests carry `#[ignore]` with that reason, and the release notes say so. The
 > next session starts there: the open question is why the tick stops with that
 > window open, not whether the engine renders.
+>
+> **The cable group is settled (2026-11-01): 12 of 12.** The notes on it further
+> down in this file describe the search and are superseded by this paragraph.
+> Three causes, each read from a per-block trace (`output chain: block ...` in
+> `RUSTAMP_HOST_TRACE`):
+>
+> 1. **The tone had holes before it reached the plug-in.** `plugin_output::pump`
+>    started its real-time clock before the first block, and that block opens the
+>    plug-in, which takes up to 1.3 s. The pump then caught that time up in one
+>    burst, out of a ring the decoder had only begun to fill, so the plug-in was
+>    given silence in the middle of the track (the pattern
+>    `####..........###`). Real time now starts after the first block.
+> 2. **The same holes made the pause case read wrongly.** It takes the first gap
+>    in the tone for the pause, so a hole read as "out_wave's `pause` does not stop
+>    what it holds", and the host flushed the plug-in on pause. With the holes
+>    gone `pause` stops at once (40 of 40 windows of a 4 s pause), so the flush
+>    is gone: it also lost up to a quarter second of music per pause.
+> 3. **The resume raced the block.** The unpause goes over the control channel and
+>    the next block over the ring, and when the block won, the helper waited 5 s
+>    in `can_write` of a plug-in that was still paused, without reading the
+>    channel, and failed. The player sends no block while paused, so a block now
+>    ends the pause. This race is why the group flipped between runs.
+>
+> The natural end compared `played_frames` with a place on the timeline, which a
+> seek moves apart (`Engine::timeline_frames` is the right clock now, with
+> `a_forward_seek_does_not_delay_the_natural_end`). The earlier conclusions "a
+> pending backlog" and "a lead in front of real time" no longer apply.
+>
+> **Final acceptance (2026-11-01):** `loopback` 12 of 12 in two consecutive
+> `-Reset` runs; the whole `--ignored` suite passed 170 of 171 binaries, and the
+> one failure (`gpu_render`, a threshold after a fixed 1.5 s on the loaded software
+> adapter) passed 7 of 7 once the case waits for the picture. The local gate:
+> 190 suites, 3977 passed, 0 failed, 74 ignored. `package-setup.exe` installed
+> silently on the `base-provisioned` snapshot (files, shortcut, registry), the
+> installed player played a tone with `--null`, and the uninstall left only the
+> user's own file and `%APPDATA%\Rustamp`.
 
 Status as of **2026-10-15**, after the second session (OpenCode orchestrator): lanes A (audio engine), C (skin/gfx), D (main window and its behaviour), E (playlist I/O), G (shared-memory rings) and L (licensing split) are integrated on `main`; S01, S02, S03 and S17 are audited. This document is everything a new agent needs to continue the work. Read it completely before you do anything.
 

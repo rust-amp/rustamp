@@ -293,6 +293,25 @@ fn seek_is_frame_accurate_and_plays_the_right_audio() {
     );
 }
 
+/// The end of a run is a place on the timeline. The device's own count knows
+/// nothing of the seek, so comparing with it would keep the run alive for as long
+/// as the seek jumped over.
+#[test]
+fn a_forward_seek_does_not_delay_the_natural_end() {
+    let mut h = Harness::new(&["track1_200000.tst"]);
+    h.engine.play_index(0).unwrap();
+    assert!(h.wait_track(0));
+    assert!(h.seek_and_settle(190_000));
+    assert!(
+        h.wait_until(
+            |engine| engine.transport() == TransportState::Stopped,
+            30_000
+        ),
+        "the run did not end within the 10000 frames that were left, at {}",
+        h.engine.position_frames()
+    );
+}
+
 #[test]
 fn seek_before_play_starts_at_the_target() {
     let mut h = Harness::new(&[TRACK_A]);

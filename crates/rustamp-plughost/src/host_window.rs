@@ -207,7 +207,6 @@ impl HostWindow {
     /// Class name the ABI fixes (S09 sections 1, 8).
     pub const CLASS_NAME: &'static str = HOST_WINDOW_CLASS;
 
-    /// Return the raw window handle without exposing the owned surface.
     /// Sends the plug-ins an event, the way a player does: to its own main window,
     /// where a plug-in that wants it has subclassed the procedure.
     pub fn notify_plugins(&self, parameter: usize, ipc_id: u32) {
@@ -240,7 +239,7 @@ impl HostWindow {
         };
     }
 
-    /// The window's raw handle.
+    /// Return the raw window handle without exposing the owned surface.
     pub fn hwnd_raw(&self) -> usize {
         #[cfg(windows)]
         {
@@ -450,8 +449,8 @@ unsafe fn handle_window_message(
             wparam.0, lparam.0
         ));
     }
-    // What a plug-in wants of the player goes to the player. The window still
-    // answers below.
+    // What a plug-in wants of the player goes to the player; the window itself
+    // has nothing to do with these.
     match msg {
         windows::Win32::UI::WindowsAndMessaging::WM_COMMAND => {
             crate::plugin_commands::note_window_command((wparam.0 & 0xFFFF) as u32);

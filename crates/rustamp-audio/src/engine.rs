@@ -1840,7 +1840,9 @@ impl Engine {
         {
             let (written, consumed) = self.sync.counters();
             let ring_done = written >= end && consumed >= end;
-            let drained = self.output.played_frames() >= end;
+            // `end` is a place on the timeline, and a seek moves the timeline away
+            // from the device's own count.
+            let drained = self.timeline_frames() >= end;
             if ring_done || drained {
                 let drain = self.output.drain_time().min(END_DRAIN_GRACE);
                 let since = *self
@@ -1848,11 +1850,12 @@ impl Engine {
                     .get_or_insert_with(std::time::Instant::now);
                 // The ring being empty is not the end of the sound: the device
                 // still holds part of the run. When its clock says what has been
-                // *heard*, that is the answer. When it only mirrors its input (a
-                // classic output plug-in buffers up to two seconds and answers
-                // with the write position), only the drain time is.
+                // *heard*, that is the answer, unless it stands still. When it
+                // only mirrors its input (a classic output plug-in buffers up to
+                // two seconds and answers with the write position), only the
+                // drain time is.
                 let done = if self.output.reports_played_position() {
-                    drained && (ring_done || since.elapsed() >= END_DRAIN_GRACE)
+                    (ring_done && drained) || since.elapsed() >= END_DRAIN_GRACE
                 } else {
                     since.elapsed() >= drain
                 };
@@ -1863,6 +1866,9 @@ impl Engine {
             } else {
                 self.end_drain_since = None;
             }
+        } else {
+            // A pause or a revoked end: the wait starts over from the next end.
+            self.end_drain_since = None;
         }
         self.publish_position(false);
         Ok(())

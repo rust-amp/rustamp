@@ -2847,8 +2847,8 @@ impl App {
     }
 
     /// Chooses which module of the active DSP library runs, and puts it in the
-    /// audio path. The caller saves the configuration, as for the plug-ins' off
-    /// list. A library without that module runs its first.
+    /// audio path. The caller saves the configuration, as for the plug-ins'
+    /// enabled list. A library without that module runs its first.
     pub fn set_dsp_module(&mut self, module: u32) {
         if self.config.plugins.dsp_module != module {
             self.config.plugins.dsp_module = module;
@@ -4297,7 +4297,6 @@ impl App {
                 // stops after one or two paints, so the picture never arrives
                 // (docs/HANDOFF.md, 2026-11-01). MilkDrop 2 itself runs in the
                 // plug-in host, which is the visualization this release ships.
-                let _ = window;
                 self.note(
                     "the player's own MilkDrop window is not part of this release; \
                      MilkDrop 2 runs as a plug-in (Visualization > Start/Stop plug-in)"

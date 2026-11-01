@@ -212,8 +212,7 @@ fn the_player_starts_chavs_with_a_classic_preset() {
 }
 
 /// A preset as AVS keeps it in `vis_avs.dat`: the list clears every frame and
-/// holds one SuperScope, whose per-frame code is `frame`. (The format is in the
-/// BSD-licensed AVS source, `r_list.cpp` and `r_sscope.cpp`.)
+/// holds one SuperScope, whose per-frame code is `frame`.
 fn superscope_preset(frame: &str) -> Vec<u8> {
     const SUPERSCOPE: u32 = 36;
     let mut scope = vec![1u8];

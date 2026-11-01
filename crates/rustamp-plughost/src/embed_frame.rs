@@ -401,11 +401,17 @@ pub fn set_skin(width: u32, height: u32, rgba: Vec<u8>) {
         *skin = sheet;
     }
     #[cfg(windows)]
-    if let Ok(frames) = FRAMES.lock() {
+    {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::Graphics::Gdi::InvalidateRect;
-        for frame in frames.iter() {
-            let window = HWND(*frame as *mut _);
+        // A copy: changing a frame runs the plug-in's code in its child, and a
+        // plug-in that closes the frame there comes back for the list.
+        let frames = FRAMES
+            .lock()
+            .map(|frames| frames.clone())
+            .unwrap_or_default();
+        for frame in frames {
+            let window = HWND(frame as *mut _);
             // A frame opened before the sheet existed still wears the system
             // frame; it takes the skinned kind now, before it repaints.
             if have_sheet {

@@ -25,7 +25,7 @@
 //! | `audio.volume` | `App::with_registry` → `Engine::set_volume` | written |
 //! | `audio.balance` | `App::with_registry` → `Engine::set_balance` | written |
 //! | `audio.fadeout_ms` | `App::with_registry` → `EngineConfig::fade_ms` | written |
-//! | `audio.crossfade_ms` | `App::with_registry` ÔåÆ `EngineConfig::crossfade_ms` | written |
+//! | `audio.crossfade_ms` | `App::with_registry` → `EngineConfig::crossfade_ms` | written |
 //! | `audio.output_mode` | `App::change_output` → `output::create_output` (RFC 0019) | written; a running track keeps its device until it stops |
 //! | `audio.device` | `output::create_output` → `selection::plan`/`resolve` | written |
 //! | `audio.replaygain` | `App::with_registry` → `Engine::set_replaygain_mode` | written |

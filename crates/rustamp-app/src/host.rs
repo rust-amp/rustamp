@@ -759,7 +759,7 @@ impl HostStateLink {
                 self.transport = None;
                 self.last_sent = None;
                 self.last_now_playing = None;
-                self.last_now_playing = None;
+                self.last_embed_skin = None;
                 self.inventory.clear();
                 PublishOutcome::HostGone
             }

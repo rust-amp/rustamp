@@ -1096,6 +1096,18 @@ impl LoadedPlugin {
         }
     }
 
+    /// What the input plugin reads from a file without playing it: its title and
+    /// length (S09 §3.1 offset 0x2C).
+    #[cfg(any(windows, test))]
+    pub fn input_file_info(
+        &self,
+        path: &Path,
+    ) -> Result<(Option<String>, Option<u64>), InputError> {
+        let module = self.input_module()?;
+        let _scope = plugin_call_scope(&self.identity, "get_file_info");
+        Ok(crate::input::call_get_file_info(module, path))
+    }
+
     /// Start playback of `path` through the input plugin (S09 §3.5 step 3).
     ///
     /// The host hands the plugin the path as an ANSI string and reports the
@@ -1109,19 +1121,6 @@ impl LoadedPlugin {
     /// §3.7). The output plugin the plugin will drive is handed over before
     /// this call, by [`crate::registry::PluginRegistry::play_input`]
     /// (S09 §3.5 step 2, §3.7).
-    #[cfg(any(windows, test))]
-    /// What the input plugin reads from a file without playing it: its title and
-    /// length (S09 §3.1 offset 0x2C).
-    pub fn input_file_info(
-        &self,
-        path: &Path,
-    ) -> Result<(Option<String>, Option<u64>), InputError> {
-        let module = self.input_module()?;
-        let _scope = plugin_call_scope(&self.identity, "get_file_info");
-        Ok(crate::input::call_get_file_info(module, path))
-    }
-
-    /// Start the input plugin's playback (S09 §3.1 offset 0x38).
     #[cfg(any(windows, test))]
     pub fn input_play(&self, path: &Path) -> Result<(), InputError> {
         if !self.initialized {
