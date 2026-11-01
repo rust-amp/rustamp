@@ -1911,15 +1911,26 @@ fn a_pause_reaches_out_wave() {
         .iter()
         .position(|tonal| *tonal)
         .expect("no tone before the pause");
-    let gap_start = tonal[first..]
-        .iter()
-        .position(|tonal| !*tonal)
-        .map(|at| first + at)
-        .expect("the tone never stopped: the pause did not reach out_wave");
-    let gap = tonal[gap_start..]
-        .iter()
-        .take_while(|tonal| !**tonal)
-        .count();
+    // The longest run of silence after the tone started, and whether the tone
+    // comes back after it. The gap does not begin at the pause command: an
+    // output plug-in plays what it already holds (`out_wave` opens with a
+    // two-second buffer), so the silence follows the pause by up to that buffer.
+    let mut best = (0usize, 0usize);
+    let mut at = first;
+    while at < tonal.len() {
+        if tonal[at] {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < tonal.len() && !tonal[at] {
+            at += 1;
+        }
+        if at - start > best.0 {
+            best = (at - start, start);
+        }
+    }
+    let (gap, gap_start) = best;
     let after = tonal[gap_start + gap..].iter().any(|tonal| *tonal);
     measurement(&format!(
         "out_wave: the tone stops for {gap} windows and {}",
