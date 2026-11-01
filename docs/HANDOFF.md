@@ -86,6 +86,26 @@ Status as of **2026-10-15**, after the second session (OpenCode orchestrator): l
 >    the natural-end block never runs.
 > 3. `the_output_plugins_play_what_the_engine_renders`: `played 44254` for a
 >    one-second tone, 4 of 9 windows hold it. The device clock counts two
+>
+> **Root cause found (2026-11-01, third instrumented run, `RUSTAMP_DECODE_TRACE`):**
+> the engine and the decoder are **not** the problem. The trace shows
+> `decode: end_stream at timeline 44100` and `engine: end reported at 44100` -
+> the end is reported and received. What stalls is the **helper's output stage**:
+>
+> - `out_disk` answers `output error: out_disk.dll: dsp error: resident DSP read
+>   timed out` with `played 0`: the plug-in never takes a block at all. It asks
+>   the host for the title when it opens (IPC 212 answered `0x0` in the trace) and
+>   names its file after it; the track is published, but the `NowPlaying` message
+>   travels with the first block, i.e. after the resident has opened the output.
+> - `out_wave` hands over ~1.2 s of a 6 s tone and then blocks: the resident
+>   stops returning blocks while the plug-in's buffer is still being consumed.
+>   That is why the pause case never reaches its end (the ring never drains) and
+>   why the one-second tone loses its tail.
+>
+> So the next session works in `dsp_resident.rs`/`handoff.rs`: (a) send the track
+> before the output is opened, not with the first block, and (b) find why the
+> write loop stops taking blocks (`can_write` never frees?). The engine-side
+> drain attempts of this session are withdrawn again for that reason.
 >    seconds of handed-over audio, so it is not a play position; the drain added
 >    in `a067473` waits for a clock that is already past the end.
 >
